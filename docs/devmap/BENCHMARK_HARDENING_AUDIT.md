@@ -58,6 +58,9 @@ Build-owned collections and the SQLite connection remain to be destroyed;
 their individual cleanup costs are **unverified**. Timing those owners is the
 next focused probe before considering a cleanup optimization.
 
+**Superseded 2026-10-07:** the owners were timed and the interval removed; see
+"Build-cost follow-up (2026-10-07)" below.
+
 ## Source attribution and extractor limits
 
 **Verified:** the historical ledger contains 162,590 physical entries, of which
@@ -428,14 +431,116 @@ stalled readers, hosted-provider behavior and every language construct remain
 unverified. Passing a finite stress test cannot establish complete confidence
 in all future workloads.
 
+## Build-cost follow-up (2026-10-07)
+
+Task `ft-fb65f8b052aa02ed607803b7c81c3302`. Every number below was taken on a
+macOS arm64 host (18 cores) that other sessions were loading: the 1-minute load
+average is recorded per sample and ranged 18–45. Every comparison is therefore
+interleaved, counterbalanced, and reported as n/min/median/max; a difference
+inside the median spread is reported as no difference. Raw records, binary
+hashes and patches are in
+`benchmarks/results/competition/20261007-build-cost/`.
+
+### Per-edit latency against CodeGraph (reproduced)
+
+`benchmarks/competition_bench.py --mode edit-latency --repeat 18`. The corpus was
+DevCouncil at `c3907784`, with a fresh clone per arm. DevMap ran at HEAD
+(`43d89cb1…`) and CodeGraph at the pinned v1.6.0. A third arm, DevMap B, carried
+the teardown change below. Rounds follow a rotated Latin square, so each arm
+held each position six times, and the executed order equalled the plan in all
+18 rounds. A sample is timed only when the post-edit search found the edit, and
+all 108 were.
+
+| Arm | Edit min / median / max (ms) | Restore min / median / max (ms) |
+|---|---:|---:|
+| DevMap HEAD | 1282 / 1419 / 4701 | 1217 / 1448 / 3928 |
+| DevMap B (teardown change) | 1044 / 1413 / 2505 | 1088 / 1434 / 2694 |
+| CodeGraph v1.6.0 | 623 / 786 / 1715 | 644 / 759 / 2203 |
+
+The gap holds. A DevMap edit costs about 1.8x a CodeGraph sync at the median,
+in line with the earlier 2.3x (802.8 vs ~340 ms), which was measured on a quiet
+host and must not be merged with these numbers. On whole-edit time,
+DevMap B is indistinguishable from HEAD at the median. The focused A/B below is
+what resolves the teardown.
+
+The caller check in the same run used the seeded ground truth
+(`benchmarks/ground_truth.py`): 48 cross-file caller-to-callee pairs across
+Python, Go, Rust and TypeScript, written by the generator rather than any tool.
+DevMap, DevMap B and CodeGraph each scored 48/48. Names in that fixture are
+unique, so the set proves the scorer works. It does not yet distinguish one
+tool from another.
+
+### The interval after the JSON line (attributed and removed)
+
+A probe patch (`patches/teardown-probe.patch`, never committed) timestamped
+each owner's drop after the JSON line, over nine one-file edits on a frozen
+DevCouncil tree. Min and median of the steps:
+
+| Owner | min | median |
+|---|---:|---:|
+| `ResolutionResult` | 48 ms | 149 ms |
+| `Vec<Extraction>` | 14 ms | 45 ms |
+| `Resolver` (symbol/type indexes) | 12 ms | 37 ms |
+| `Store` (SQLite close, WAL checkpoint) | 1 ms | 15 ms |
+| runtime shutdown + process exit | 14 ms | 17 ms |
+| `AnalysisSummary`, discovery report, manifest, progress, presentation | <0.5 ms each | |
+
+The interval was deallocation: freeing heap graphs one allocation at a time
+just before exit. The four heap owners hold no file, lock, thread or effectful
+`Drop`, so `devmap build` now forgets them once its output is written, and the
+OS reclaims them at exit (`rust/devmap-cli/src/main.rs`, end of the build arm).
+The store still drops normally, because closing it releases its locks and
+checkpoints the WAL.
+
+`benchmarks/teardown_ab.py` ran 20 ABBA rounds of one-file incremental builds
+with both binaries on one store, timing the JSON line to the process exit:
+
+| Binary | JSON line → exit, min / median / max (ms) | Whole build, min / median (ms) |
+|---|---:|---:|
+| HEAD | 75.6 / 85.7 / 220.0 | 1193 / 1417 |
+| B (teardown change) | 11.9 / 15.1 / 44.7 | 1188 / 1466 |
+
+Teardown no longer bounds the interval. The 12–15 ms that remain are the store
+close plus runtime shutdown and exit, and they are treated as irreducible here.
+Whole-build time does not move outside the noise. The saving is about 70 ms for
+a caller that waits on the exit. A caller that reads the line saves nothing.
+
+### Cold-build cost of `idx_unresolved_rows_callee`
+
+`Store::open` re-creates every declared index on each writable open, so a
+dropped index cannot survive into a CLI build. The B binary is therefore HEAD
+with the index removed from its schema (`patches/no-callee-index.patch`).
+`benchmarks/cold_build_ab.py` ran 12 ABBA rounds of `devmap build --full` into a
+new store. Both arms built identical counts (1,310 files, 15,885 symbols,
+57,193 edges, 163,126 unresolved calls), and after every build the index was
+checked present in A and absent in B.
+
+| | with index | without |
+|---|---:|---:|
+| `persist:write` unresolved part, min / median | 378 / 505 ms | 263 / 445 ms |
+| `persist:write`, min / median | 906 / 1353 ms | 814 / 1238 ms |
+| whole cold build, min / median | 2.89 / 4.94 s | 2.93 / 4.78 s |
+| store | 151,650,304 B | 148,815,872 B |
+
+The index costs about 60–115 ms of a cold persist and 2.83 MB of store. That
+is inside whole-build noise, against 5.0 ms saved per `impact` call at p50. The
+same figures are recorded beside the index in `schema.rs` (`MIGRATION_V23_TO_V24`).
+
+### B3
+
+Recorded in `DIVERGENCES.md` (B3) rather than here. The range and payload
+relations are differential, at 5 rows for a one-file edit at any corpus size.
+The `generation_id`-keyed relations are re-written in full: 6n + 1 rows on the
+fixture, and 40,156 for DevCouncil's generation 4131.
+
 ## Remaining acceptance gates
 
 | Work still needed | Evidence required before claiming it closed |
 |---|---|
 | Binding coverage and private Rust values | A format-level distinction between unavailable facts and examined unbound sites; cold, cached and unchanged-upgrade cases for private file-level values and anonymous scopes. Existing public/export behavior must remain separate. |
 | SQL and PowerShell | Dialect/source-checked fixtures and explicit parser/provider availability. SQL object references need a defined relationship to source-file imports; fallback extraction cannot be relabeled complete. No new parser dependency was authorized or added. |
-| Latency optimization | Measure the remaining teardown owners and candidate extraction/resolution/persistence work, then prove invalidation and result equivalence before narrowing work. The current measurements do not prove removable work. |
-| Broader comparison | Counterbalanced runs with more repetitions, matched actual provider capabilities and independent caller/definition ground truth. Expand persistent mutation convergence beyond the current separate DevMap soak. |
+| Latency optimization | **Teardown closed 2026-10-07** (below). Still open: candidate extraction/resolution/persistence work. Nothing was narrowed, so no invalidation contract or equivalence test was owed; any narrowing still needs both, on DevCouncil and MarkDev. |
+| Broader comparison | **Partly closed 2026-10-07** (below): counterbalanced, interleaved per-edit rounds with recorded order, position and load, plus a generator-derived caller ground truth. Still open: a ground truth that discriminates between tools (the seeded set has unique names and every arm scores 48/48), more than one edit shape, CBM (no verified interface), and mutation convergence beyond the DevMap soak. |
 | Durability and portability | **Partly closed 2026-10-07** — see "Crash consistency" below: process death mid-persist and a lost un-fsynced WAL tail are tested on macOS/APFS. Still open: torn or reordered writes below the filesystem, physical power loss, other filesystems and native runs on other operating systems. |
 
 ### Crash consistency (2026-10-07)

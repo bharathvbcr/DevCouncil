@@ -1,0 +1,458 @@
+[
+  {
+    "round": 0,
+    "position": 0,
+    "arm": "a",
+    "load": [
+      30.068359375,
+      33.404296875,
+      42.16455078125
+    ],
+    "wall_s": 2.8851638339983765,
+    "persist_write_s": 0.962203208,
+    "persist_unresolved_s": 0.391594916,
+    "persist_commit_s": 0.112617458,
+    "files": 1310,
+    "symbols": 15885,
+    "edges": 57193,
+    "unresolved_calls": 163126,
+    "store_bytes": 151650304
+  },
+  {
+    "round": 0,
+    "position": 1,
+    "arm": "b",
+    "load": [
+      30.068359375,
+      33.404296875,
+      42.16455078125
+    ],
+    "wall_s": 2.999250791996019,
+    "persist_write_s": 0.839419916,
+    "persist_unresolved_s": 0.278700083,
+    "persist_commit_s": 0.106533167,
+    "files": 1310,
+    "symbols": 15885,
+    "edges": 57193,
+    "unresolved_calls": 163126,
+    "store_bytes": 148815872
+  },
+  {
+    "round": 1,
+    "position": 0,
+    "arm": "b",
+    "load": [
+      33.265625,
+      34.01171875,
+      42.32763671875
+    ],
+    "wall_s": 3.0435401659997297,
+    "persist_write_s": 0.857784875,
+    "persist_unresolved_s": 0.267929042,
+    "persist_commit_s": 0.136670917,
+    "files": 1310,
+    "symbols": 15885,
+    "edges": 57193,
+    "unresolved_calls": 163126,
+    "store_bytes": 148815872
+  },
+  {
+    "round": 1,
+    "position": 1,
+    "arm": "a",
+    "load": [
+      31.962890625,
+      33.72900390625,
+      42.17919921875
+    ],
+    "wall_s": 2.9843452499990235,
+    "persist_write_s": 0.926270916,
+    "persist_unresolved_s": 0.379550167,
+    "persist_commit_s": 0.087544833,
+    "files": 1310,
+    "symbols": 15885,
+    "edges": 57193,
+    "unresolved_calls": 163126,
+    "store_bytes": 151650304
+  },
+  {
+    "round": 2,
+    "position": 0,
+    "arm": "b",
+    "load": [
+      31.962890625,
+      33.72900390625,
+      42.17919921875
+    ],
+    "wall_s": 2.931639250004082,
+    "persist_write_s": 0.814166917,
+    "persist_unresolved_s": 0.262539417,
+    "persist_commit_s": 0.096259166,
+    "files": 1310,
+    "symbols": 15885,
+    "edges": 57193,
+    "unresolved_calls": 163126,
+    "store_bytes": 148815872
+  },
+  {
+    "round": 2,
+    "position": 1,
+    "arm": "a",
+    "load": [
+      32.0458984375,
+      33.716796875,
+      42.125
+    ],
+    "wall_s": 3.1352042079961393,
+    "persist_write_s": 0.90637225,
+    "persist_unresolved_s": 0.378075667,
+    "persist_commit_s": 0.101587042,
+    "files": 1310,
+    "symbols": 15885,
+    "edges": 57193,
+    "unresolved_calls": 163126,
+    "store_bytes": 151650304
+  },
+  {
+    "round": 3,
+    "position": 0,
+    "arm": "a",
+    "load": [
+      32.0458984375,
+      33.716796875,
+      42.125
+    ],
+    "wall_s": 3.2038188750011614,
+    "persist_write_s": 1.030832292,
+    "persist_unresolved_s": 0.3941405,
+    "persist_commit_s": 0.093784291,
+    "files": 1310,
+    "symbols": 15885,
+    "edges": 57193,
+    "unresolved_calls": 163126,
+    "store_bytes": 151650304
+  },
+  {
+    "round": 3,
+    "position": 1,
+    "arm": "b",
+    "load": [
+      33.5634765625,
+      34.00341796875,
+      42.1767578125
+    ],
+    "wall_s": 4.5224092080025,
+    "persist_write_s": 1.336716875,
+    "persist_unresolved_s": 0.561596375,
+    "persist_commit_s": 0.10843475,
+    "files": 1310,
+    "symbols": 15885,
+    "edges": 57193,
+    "unresolved_calls": 163126,
+    "store_bytes": 148815872
+  },
+  {
+    "round": 4,
+    "position": 0,
+    "arm": "a",
+    "load": [
+      32.23681640625,
+      33.720703125,
+      42.02880859375
+    ],
+    "wall_s": 5.456718750006985,
+    "persist_write_s": 1.664968042,
+    "persist_unresolved_s": 0.504466875,
+    "persist_commit_s": 0.61841725,
+    "files": 1310,
+    "symbols": 15885,
+    "edges": 57193,
+    "unresolved_calls": 163126,
+    "store_bytes": 151650304
+  },
+  {
+    "round": 4,
+    "position": 1,
+    "arm": "b",
+    "load": [
+      32.2177734375,
+      33.69189453125,
+      41.9697265625
+    ],
+    "wall_s": 12.484861541997816,
+    "persist_write_s": 3.851817625,
+    "persist_unresolved_s": 1.50096475,
+    "persist_commit_s": 0.472452167,
+    "files": 1310,
+    "symbols": 15885,
+    "edges": 57193,
+    "unresolved_calls": 163126,
+    "store_bytes": 148815872
+  },
+  {
+    "round": 5,
+    "position": 0,
+    "arm": "b",
+    "load": [
+      36.46337890625,
+      34.58203125,
+      42.1435546875
+    ],
+    "wall_s": 12.964995875001478,
+    "persist_write_s": 4.543785,
+    "persist_unresolved_s": 1.616810334,
+    "persist_commit_s": 0.444183208,
+    "files": 1310,
+    "symbols": 15885,
+    "edges": 57193,
+    "unresolved_calls": 163126,
+    "store_bytes": 148815872
+  },
+  {
+    "round": 5,
+    "position": 1,
+    "arm": "a",
+    "load": [
+      38.8388671875,
+      35.15478515625,
+      42.25830078125
+    ],
+    "wall_s": 6.901072166998347,
+    "persist_write_s": 2.099782584,
+    "persist_unresolved_s": 0.981411083,
+    "persist_commit_s": 0.168722167,
+    "files": 1310,
+    "symbols": 15885,
+    "edges": 57193,
+    "unresolved_calls": 163126,
+    "store_bytes": 151650304
+  },
+  {
+    "round": 6,
+    "position": 0,
+    "arm": "b",
+    "load": [
+      41.4541015625,
+      35.8525390625,
+      42.42333984375
+    ],
+    "wall_s": 5.202163791997009,
+    "persist_write_s": 1.269029166,
+    "persist_unresolved_s": 0.56694475,
+    "persist_commit_s": 0.110755458,
+    "files": 1310,
+    "symbols": 15885,
+    "edges": 57193,
+    "unresolved_calls": 163126,
+    "store_bytes": 148815872
+  },
+  {
+    "round": 6,
+    "position": 1,
+    "arm": "a",
+    "load": [
+      40.69677734375,
+      35.78857421875,
+      42.36181640625
+    ],
+    "wall_s": 7.966479833004996,
+    "persist_write_s": 2.213844209,
+    "persist_unresolved_s": 0.795030333,
+    "persist_commit_s": 0.177839875,
+    "files": 1310,
+    "symbols": 15885,
+    "edges": 57193,
+    "unresolved_calls": 163126,
+    "store_bytes": 151650304
+  },
+  {
+    "round": 7,
+    "position": 0,
+    "arm": "a",
+    "load": [
+      41.76171875,
+      36.0908203125,
+      42.4296875
+    ],
+    "wall_s": 7.768212792005215,
+    "persist_write_s": 2.198966125,
+    "persist_unresolved_s": 1.017920542,
+    "persist_commit_s": 0.167938875,
+    "files": 1310,
+    "symbols": 15885,
+    "edges": 57193,
+    "unresolved_calls": 163126,
+    "store_bytes": 151650304
+  },
+  {
+    "round": 7,
+    "position": 1,
+    "arm": "b",
+    "load": [
+      43.19775390625,
+      36.5947265625,
+      42.53466796875
+    ],
+    "wall_s": 4.961294667002221,
+    "persist_write_s": 1.206520334,
+    "persist_unresolved_s": 0.394756875,
+    "persist_commit_s": 0.14892375,
+    "files": 1310,
+    "symbols": 15885,
+    "edges": 57193,
+    "unresolved_calls": 163126,
+    "store_bytes": 148815872
+  },
+  {
+    "round": 8,
+    "position": 0,
+    "arm": "a",
+    "load": [
+      42.62109375,
+      36.58447265625,
+      42.49609375
+    ],
+    "wall_s": 4.698180124993087,
+    "persist_write_s": 1.6390829999999998,
+    "persist_unresolved_s": 0.807756625,
+    "persist_commit_s": 0.132642167,
+    "files": 1310,
+    "symbols": 15885,
+    "edges": 57193,
+    "unresolved_calls": 163126,
+    "store_bytes": 151650304
+  },
+  {
+    "round": 8,
+    "position": 1,
+    "arm": "b",
+    "load": [
+      42.2509765625,
+      36.60791015625,
+      42.4697265625
+    ],
+    "wall_s": 4.598464499998954,
+    "persist_write_s": 1.125241667,
+    "persist_unresolved_s": 0.370499416,
+    "persist_commit_s": 0.113964959,
+    "files": 1310,
+    "symbols": 15885,
+    "edges": 57193,
+    "unresolved_calls": 163126,
+    "store_bytes": 148815872
+  },
+  {
+    "round": 9,
+    "position": 0,
+    "arm": "b",
+    "load": [
+      41.669921875,
+      36.5810546875,
+      42.42578125
+    ],
+    "wall_s": 5.395028708997415,
+    "persist_write_s": 1.6013031660000001,
+    "persist_unresolved_s": 0.494771083,
+    "persist_commit_s": 0.135151209,
+    "files": 1310,
+    "symbols": 15885,
+    "edges": 57193,
+    "unresolved_calls": 163126,
+    "store_bytes": 148815872
+  },
+  {
+    "round": 9,
+    "position": 1,
+    "arm": "a",
+    "load": [
+      41.2958984375,
+      36.587890625,
+      42.3935546875
+    ],
+    "wall_s": 5.174056083000323,
+    "persist_write_s": 1.613794875,
+    "persist_unresolved_s": 0.660205458,
+    "persist_commit_s": 0.212190041,
+    "files": 1310,
+    "symbols": 15885,
+    "edges": 57193,
+    "unresolved_calls": 163126,
+    "store_bytes": 151650304
+  },
+  {
+    "round": 10,
+    "position": 0,
+    "arm": "b",
+    "load": [
+      41.43212890625,
+      36.6943359375,
+      42.39697265625
+    ],
+    "wall_s": 8.124503209000977,
+    "persist_write_s": 2.309254875,
+    "persist_unresolved_s": 0.902256417,
+    "persist_commit_s": 0.163756167,
+    "files": 1310,
+    "symbols": 15885,
+    "edges": 57193,
+    "unresolved_calls": 163126,
+    "store_bytes": 148815872
+  },
+  {
+    "round": 10,
+    "position": 1,
+    "arm": "a",
+    "load": [
+      42.3583984375,
+      36.96484375,
+      42.458984375
+    ],
+    "wall_s": 5.3146765409983345,
+    "persist_write_s": 1.069145667,
+    "persist_unresolved_s": 0.50609125,
+    "persist_commit_s": 0.100214208,
+    "files": 1310,
+    "symbols": 15885,
+    "edges": 57193,
+    "unresolved_calls": 163126,
+    "store_bytes": 151650304
+  },
+  {
+    "round": 11,
+    "position": 0,
+    "arm": "a",
+    "load": [
+      43.77099609375,
+      37.34716796875,
+      42.5615234375
+    ],
+    "wall_s": 4.256039624997356,
+    "persist_write_s": 1.091925625,
+    "persist_unresolved_s": 0.45622475,
+    "persist_commit_s": 0.104969125,
+    "files": 1310,
+    "symbols": 15885,
+    "edges": 57193,
+    "unresolved_calls": 163126,
+    "store_bytes": 151650304
+  },
+  {
+    "round": 11,
+    "position": 1,
+    "arm": "b",
+    "load": [
+      44.509765625,
+      37.60693359375,
+      42.62255859375
+    ],
+    "wall_s": 3.5391176659977646,
+    "persist_write_s": 0.936639875,
+    "persist_unresolved_s": 0.313452,
+    "persist_commit_s": 0.09475825,
+    "files": 1310,
+    "symbols": 15885,
+    "edges": 57193,
+    "unresolved_calls": 163126,
+    "store_bytes": 148815872
+  }
+]

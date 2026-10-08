@@ -1,0 +1,12 @@
+{
+  "devmap": "/private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil/69398020-02b2-41ba-b896-b1fe31a8cb0a/scratchpad/bin/devmap-A-head",
+  "devmap_b": "/private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil/69398020-02b2-41ba-b896-b1fe31a8cb0a/scratchpad/bin/devmap-B-forget",
+  "codegraph": "/Users/bharath/Code/devtools/DevCouncil/.devcouncil/benchmarks/20260914-v0.2.2/tools/codegraph/x/codegraph-darwin-arm64/bin/codegraph",
+  "repositories": [
+    {
+      "name": "devcouncil",
+      "path": "/Users/bharath/Code/devtools/DevCouncil",
+      "revision": "c3907784"
+    }
+  ]
+}

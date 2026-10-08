@@ -1,0 +1,131 @@
+{
+  "binaries": {
+    "a": {
+      "path": "/private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil/69398020-02b2-41ba-b896-b1fe31a8cb0a/scratchpad/bin/devmap-A-head",
+      "sha256": "43d89cb13ecc600cc167afd6d4aa4d68a801e2c33f08f2dda7600cd678b527ae"
+    },
+    "b": {
+      "path": "/private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil/69398020-02b2-41ba-b896-b1fe31a8cb0a/scratchpad/bin/devmap-B-forget",
+      "sha256": "0cdc40ba9040eab565b378abc07817035bd43bd1424901b48709c03b02daf4c2"
+    }
+  },
+  "corpus": "/private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil/69398020-02b2-41ba-b896-b1fe31a8cb0a/scratchpad/corpus/devcouncil",
+  "edit_file": "benchmarks/analyze.py",
+  "rounds": 20,
+  "schedule": [
+    [
+      "a",
+      "b"
+    ],
+    [
+      "b",
+      "a"
+    ],
+    [
+      "b",
+      "a"
+    ],
+    [
+      "a",
+      "b"
+    ],
+    [
+      "a",
+      "b"
+    ],
+    [
+      "b",
+      "a"
+    ],
+    [
+      "b",
+      "a"
+    ],
+    [
+      "a",
+      "b"
+    ],
+    [
+      "a",
+      "b"
+    ],
+    [
+      "b",
+      "a"
+    ],
+    [
+      "b",
+      "a"
+    ],
+    [
+      "a",
+      "b"
+    ],
+    [
+      "a",
+      "b"
+    ],
+    [
+      "b",
+      "a"
+    ],
+    [
+      "b",
+      "a"
+    ],
+    [
+      "a",
+      "b"
+    ],
+    [
+      "a",
+      "b"
+    ],
+    [
+      "b",
+      "a"
+    ],
+    [
+      "b",
+      "a"
+    ],
+    [
+      "a",
+      "b"
+    ]
+  ],
+  "arms": {
+    "a": {
+      "line_to_exit_ms": {
+        "n": 20,
+        "min": 75.61054200050421,
+        "median": 85.68206200288842,
+        "max": 220.02016699843807
+      },
+      "total_ms": {
+        "n": 20,
+        "min": 1193.367916996067,
+        "median": 1417.4903340026503,
+        "max": 3561.256916997081
+      }
+    },
+    "b": {
+      "line_to_exit_ms": {
+        "n": 20,
+        "min": 11.902040998393204,
+        "median": 15.120604501134949,
+        "max": 44.708333000016864
+      },
+      "total_ms": {
+        "n": 20,
+        "min": 1188.1370409973897,
+        "median": 1465.5880829996022,
+        "max": 3215.3658749957685
+      }
+    }
+  },
+  "load_1m_range": [
+    18.1630859375,
+    30.6533203125
+  ]
+}

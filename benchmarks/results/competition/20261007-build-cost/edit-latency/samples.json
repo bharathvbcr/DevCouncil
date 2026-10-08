@@ -1,0 +1,1514 @@
+[
+  {
+    "arm": "devmap",
+    "scenario": "edit",
+    "round": 0,
+    "position": 0,
+    "wall_ms": 1796.0511249984847,
+    "verified": true,
+    "loadavg": [
+      30.19921875,
+      43.29248046875,
+      48.22314453125
+    ],
+    "measurement_id": 77
+  },
+  {
+    "arm": "devmap",
+    "scenario": "restore",
+    "round": 0,
+    "position": 0,
+    "wall_ms": 1393.362167000305,
+    "verified": true,
+    "loadavg": [
+      30.19921875,
+      43.29248046875,
+      48.22314453125
+    ],
+    "measurement_id": 79
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "edit",
+    "round": 0,
+    "position": 1,
+    "wall_ms": 1044.4686250048107,
+    "verified": true,
+    "loadavg": [
+      29.78271484375,
+      42.98876953125,
+      48.0869140625
+    ],
+    "measurement_id": 81
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "restore",
+    "round": 0,
+    "position": 1,
+    "wall_ms": 1279.9278750026133,
+    "verified": true,
+    "loadavg": [
+      29.78271484375,
+      42.98876953125,
+      48.0869140625
+    ],
+    "measurement_id": 83
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "edit",
+    "round": 0,
+    "position": 2,
+    "wall_ms": 656.6444999989471,
+    "verified": true,
+    "loadavg": [
+      29.78271484375,
+      42.98876953125,
+      48.0869140625
+    ],
+    "measurement_id": 85
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "restore",
+    "round": 0,
+    "position": 2,
+    "wall_ms": 724.3747920001624,
+    "verified": true,
+    "loadavg": [
+      29.78271484375,
+      42.98876953125,
+      48.0869140625
+    ],
+    "measurement_id": 87
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "edit",
+    "round": 1,
+    "position": 0,
+    "wall_ms": 1199.987667001551,
+    "verified": true,
+    "loadavg": [
+      29.78271484375,
+      42.98876953125,
+      48.0869140625
+    ],
+    "measurement_id": 89
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "restore",
+    "round": 1,
+    "position": 0,
+    "wall_ms": 1225.6872920042952,
+    "verified": true,
+    "loadavg": [
+      29.78271484375,
+      42.98876953125,
+      48.0869140625
+    ],
+    "measurement_id": 91
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "edit",
+    "round": 1,
+    "position": 1,
+    "wall_ms": 782.438166999782,
+    "verified": true,
+    "loadavg": [
+      28.3583984375,
+      42.47412109375,
+      47.875
+    ],
+    "measurement_id": 93
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "restore",
+    "round": 1,
+    "position": 1,
+    "wall_ms": 686.6085000001476,
+    "verified": true,
+    "loadavg": [
+      28.3583984375,
+      42.47412109375,
+      47.875
+    ],
+    "measurement_id": 95
+  },
+  {
+    "arm": "devmap",
+    "scenario": "edit",
+    "round": 1,
+    "position": 2,
+    "wall_ms": 1299.3816250018426,
+    "verified": true,
+    "loadavg": [
+      28.3583984375,
+      42.47412109375,
+      47.875
+    ],
+    "measurement_id": 97
+  },
+  {
+    "arm": "devmap",
+    "scenario": "restore",
+    "round": 1,
+    "position": 2,
+    "wall_ms": 1271.5407910000067,
+    "verified": true,
+    "loadavg": [
+      28.3583984375,
+      42.47412109375,
+      47.875
+    ],
+    "measurement_id": 99
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "edit",
+    "round": 2,
+    "position": 0,
+    "wall_ms": 683.9772500024992,
+    "verified": true,
+    "loadavg": [
+      27.28857421875,
+      42.017578125,
+      47.68212890625
+    ],
+    "measurement_id": 101
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "restore",
+    "round": 2,
+    "position": 0,
+    "wall_ms": 674.1542499948991,
+    "verified": true,
+    "loadavg": [
+      27.28857421875,
+      42.017578125,
+      47.68212890625
+    ],
+    "measurement_id": 103
+  },
+  {
+    "arm": "devmap",
+    "scenario": "edit",
+    "round": 2,
+    "position": 1,
+    "wall_ms": 1421.804332996544,
+    "verified": true,
+    "loadavg": [
+      27.28857421875,
+      42.017578125,
+      47.68212890625
+    ],
+    "measurement_id": 105
+  },
+  {
+    "arm": "devmap",
+    "scenario": "restore",
+    "round": 2,
+    "position": 1,
+    "wall_ms": 1269.9203330048476,
+    "verified": true,
+    "loadavg": [
+      27.28857421875,
+      42.017578125,
+      47.68212890625
+    ],
+    "measurement_id": 107
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "edit",
+    "round": 2,
+    "position": 2,
+    "wall_ms": 1236.765583002125,
+    "verified": true,
+    "loadavg": [
+      25.66357421875,
+      41.43603515625,
+      47.443359375
+    ],
+    "measurement_id": 109
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "restore",
+    "round": 2,
+    "position": 2,
+    "wall_ms": 1106.0682919996907,
+    "verified": true,
+    "loadavg": [
+      25.66357421875,
+      41.43603515625,
+      47.443359375
+    ],
+    "measurement_id": 111
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "edit",
+    "round": 3,
+    "position": 0,
+    "wall_ms": 679.4069169991417,
+    "verified": true,
+    "loadavg": [
+      25.66357421875,
+      41.43603515625,
+      47.443359375
+    ],
+    "measurement_id": 113
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "restore",
+    "round": 3,
+    "position": 0,
+    "wall_ms": 699.5104169982369,
+    "verified": true,
+    "loadavg": [
+      25.66357421875,
+      41.43603515625,
+      47.443359375
+    ],
+    "measurement_id": 115
+  },
+  {
+    "arm": "devmap",
+    "scenario": "edit",
+    "round": 3,
+    "position": 1,
+    "wall_ms": 1281.7667499984964,
+    "verified": true,
+    "loadavg": [
+      25.66357421875,
+      41.43603515625,
+      47.443359375
+    ],
+    "measurement_id": 117
+  },
+  {
+    "arm": "devmap",
+    "scenario": "restore",
+    "round": 3,
+    "position": 1,
+    "wall_ms": 1249.6502919966588,
+    "verified": true,
+    "loadavg": [
+      25.66357421875,
+      41.43603515625,
+      47.443359375
+    ],
+    "measurement_id": 119
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "edit",
+    "round": 3,
+    "position": 2,
+    "wall_ms": 1205.7143749989336,
+    "verified": true,
+    "loadavg": [
+      24.3291015625,
+      40.8974609375,
+      47.2177734375
+    ],
+    "measurement_id": 121
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "restore",
+    "round": 3,
+    "position": 2,
+    "wall_ms": 1208.876374999818,
+    "verified": true,
+    "loadavg": [
+      24.3291015625,
+      40.8974609375,
+      47.2177734375
+    ],
+    "measurement_id": 123
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "edit",
+    "round": 4,
+    "position": 0,
+    "wall_ms": 1209.3852089965367,
+    "verified": true,
+    "loadavg": [
+      24.3291015625,
+      40.8974609375,
+      47.2177734375
+    ],
+    "measurement_id": 125
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "restore",
+    "round": 4,
+    "position": 0,
+    "wall_ms": 1088.2977500004927,
+    "verified": true,
+    "loadavg": [
+      24.3291015625,
+      40.8974609375,
+      47.2177734375
+    ],
+    "measurement_id": 127
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "edit",
+    "round": 4,
+    "position": 1,
+    "wall_ms": 659.294792007131,
+    "verified": true,
+    "loadavg": [
+      23.181640625,
+      40.38427734375,
+      46.99951171875
+    ],
+    "measurement_id": 129
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "restore",
+    "round": 4,
+    "position": 1,
+    "wall_ms": 720.789999999397,
+    "verified": true,
+    "loadavg": [
+      23.181640625,
+      40.38427734375,
+      46.99951171875
+    ],
+    "measurement_id": 131
+  },
+  {
+    "arm": "devmap",
+    "scenario": "edit",
+    "round": 4,
+    "position": 2,
+    "wall_ms": 1444.144041997788,
+    "verified": true,
+    "loadavg": [
+      23.181640625,
+      40.38427734375,
+      46.99951171875
+    ],
+    "measurement_id": 133
+  },
+  {
+    "arm": "devmap",
+    "scenario": "restore",
+    "round": 4,
+    "position": 2,
+    "wall_ms": 1397.2316250001313,
+    "verified": true,
+    "loadavg": [
+      23.181640625,
+      40.38427734375,
+      46.99951171875
+    ],
+    "measurement_id": 135
+  },
+  {
+    "arm": "devmap",
+    "scenario": "edit",
+    "round": 5,
+    "position": 0,
+    "wall_ms": 1309.3760420015315,
+    "verified": true,
+    "loadavg": [
+      22.4462890625,
+      39.94580078125,
+      46.80615234375
+    ],
+    "measurement_id": 137
+  },
+  {
+    "arm": "devmap",
+    "scenario": "restore",
+    "round": 5,
+    "position": 0,
+    "wall_ms": 1401.1586669948883,
+    "verified": true,
+    "loadavg": [
+      22.4462890625,
+      39.94580078125,
+      46.80615234375
+    ],
+    "measurement_id": 139
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "edit",
+    "round": 5,
+    "position": 1,
+    "wall_ms": 1469.9901249987306,
+    "verified": true,
+    "loadavg": [
+      22.4462890625,
+      39.94580078125,
+      46.80615234375
+    ],
+    "measurement_id": 141
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "restore",
+    "round": 5,
+    "position": 1,
+    "wall_ms": 1373.2697079976788,
+    "verified": true,
+    "loadavg": [
+      22.4462890625,
+      39.94580078125,
+      46.80615234375
+    ],
+    "measurement_id": 143
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "edit",
+    "round": 5,
+    "position": 2,
+    "wall_ms": 752.9531250038417,
+    "verified": true,
+    "loadavg": [
+      24.892578125,
+      40.162109375,
+      46.84228515625
+    ],
+    "measurement_id": 145
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "restore",
+    "round": 5,
+    "position": 2,
+    "wall_ms": 749.6318339981372,
+    "verified": true,
+    "loadavg": [
+      24.892578125,
+      40.162109375,
+      46.84228515625
+    ],
+    "measurement_id": 147
+  },
+  {
+    "arm": "devmap",
+    "scenario": "edit",
+    "round": 6,
+    "position": 0,
+    "wall_ms": 1378.590416003135,
+    "verified": true,
+    "loadavg": [
+      24.892578125,
+      40.162109375,
+      46.84228515625
+    ],
+    "measurement_id": 149
+  },
+  {
+    "arm": "devmap",
+    "scenario": "restore",
+    "round": 6,
+    "position": 0,
+    "wall_ms": 1484.9910830016597,
+    "verified": true,
+    "loadavg": [
+      24.892578125,
+      40.162109375,
+      46.84228515625
+    ],
+    "measurement_id": 151
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "edit",
+    "round": 6,
+    "position": 1,
+    "wall_ms": 1454.6402920022956,
+    "verified": true,
+    "loadavg": [
+      23.93994140625,
+      39.7109375,
+      46.6435546875
+    ],
+    "measurement_id": 153
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "restore",
+    "round": 6,
+    "position": 1,
+    "wall_ms": 1670.8560410042992,
+    "verified": true,
+    "loadavg": [
+      23.93994140625,
+      39.7109375,
+      46.6435546875
+    ],
+    "measurement_id": 155
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "edit",
+    "round": 6,
+    "position": 2,
+    "wall_ms": 883.6257090006256,
+    "verified": true,
+    "loadavg": [
+      23.0634765625,
+      39.26708984375,
+      46.4462890625
+    ],
+    "measurement_id": 157
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "restore",
+    "round": 6,
+    "position": 2,
+    "wall_ms": 882.6847919990541,
+    "verified": true,
+    "loadavg": [
+      23.0634765625,
+      39.26708984375,
+      46.4462890625
+    ],
+    "measurement_id": 159
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "edit",
+    "round": 7,
+    "position": 0,
+    "wall_ms": 1706.7436249999446,
+    "verified": true,
+    "loadavg": [
+      23.0634765625,
+      39.26708984375,
+      46.4462890625
+    ],
+    "measurement_id": 161
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "restore",
+    "round": 7,
+    "position": 0,
+    "wall_ms": 1654.4027910058503,
+    "verified": true,
+    "loadavg": [
+      23.0634765625,
+      39.26708984375,
+      46.4462890625
+    ],
+    "measurement_id": 163
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "edit",
+    "round": 7,
+    "position": 1,
+    "wall_ms": 929.577667004196,
+    "verified": true,
+    "loadavg": [
+      22.41748046875,
+      38.86376953125,
+      46.26171875
+    ],
+    "measurement_id": 165
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "restore",
+    "round": 7,
+    "position": 1,
+    "wall_ms": 799.0898339994601,
+    "verified": true,
+    "loadavg": [
+      22.41748046875,
+      38.86376953125,
+      46.26171875
+    ],
+    "measurement_id": 167
+  },
+  {
+    "arm": "devmap",
+    "scenario": "edit",
+    "round": 7,
+    "position": 2,
+    "wall_ms": 1372.6758749980945,
+    "verified": true,
+    "loadavg": [
+      22.41748046875,
+      38.86376953125,
+      46.26171875
+    ],
+    "measurement_id": 169
+  },
+  {
+    "arm": "devmap",
+    "scenario": "restore",
+    "round": 7,
+    "position": 2,
+    "wall_ms": 1446.8317079954431,
+    "verified": true,
+    "loadavg": [
+      22.41748046875,
+      38.86376953125,
+      46.26171875
+    ],
+    "measurement_id": 171
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "edit",
+    "round": 8,
+    "position": 0,
+    "wall_ms": 1000.5736669991165,
+    "verified": true,
+    "loadavg": [
+      21.5830078125,
+      38.41748046875,
+      46.060546875
+    ],
+    "measurement_id": 173
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "restore",
+    "round": 8,
+    "position": 0,
+    "wall_ms": 830.5398750017048,
+    "verified": true,
+    "loadavg": [
+      21.5830078125,
+      38.41748046875,
+      46.060546875
+    ],
+    "measurement_id": 175
+  },
+  {
+    "arm": "devmap",
+    "scenario": "edit",
+    "round": 8,
+    "position": 1,
+    "wall_ms": 1532.195583997236,
+    "verified": true,
+    "loadavg": [
+      21.5830078125,
+      38.41748046875,
+      46.060546875
+    ],
+    "measurement_id": 177
+  },
+  {
+    "arm": "devmap",
+    "scenario": "restore",
+    "round": 8,
+    "position": 1,
+    "wall_ms": 1449.8762090006494,
+    "verified": true,
+    "loadavg": [
+      21.5830078125,
+      38.41748046875,
+      46.060546875
+    ],
+    "measurement_id": 179
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "edit",
+    "round": 8,
+    "position": 2,
+    "wall_ms": 2306.0322910023388,
+    "verified": true,
+    "loadavg": [
+      20.8154296875,
+      37.978515625,
+      45.86083984375
+    ],
+    "measurement_id": 181
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "restore",
+    "round": 8,
+    "position": 2,
+    "wall_ms": 2694.21916599822,
+    "verified": true,
+    "loadavg": [
+      20.8154296875,
+      37.978515625,
+      45.86083984375
+    ],
+    "measurement_id": 183
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "edit",
+    "round": 9,
+    "position": 0,
+    "wall_ms": 1714.849707997928,
+    "verified": true,
+    "loadavg": [
+      23.15234375,
+      38.177734375,
+      45.884765625
+    ],
+    "measurement_id": 185
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "restore",
+    "round": 9,
+    "position": 0,
+    "wall_ms": 2202.8648749983404,
+    "verified": true,
+    "loadavg": [
+      23.15234375,
+      38.177734375,
+      45.884765625
+    ],
+    "measurement_id": 187
+  },
+  {
+    "arm": "devmap",
+    "scenario": "edit",
+    "round": 9,
+    "position": 1,
+    "wall_ms": 4701.343791006366,
+    "verified": true,
+    "loadavg": [
+      26.58349609375,
+      38.63916015625,
+      46.00244140625
+    ],
+    "measurement_id": 189
+  },
+  {
+    "arm": "devmap",
+    "scenario": "restore",
+    "round": 9,
+    "position": 1,
+    "wall_ms": 3928.0692499960423,
+    "verified": true,
+    "loadavg": [
+      26.58349609375,
+      38.63916015625,
+      46.00244140625
+    ],
+    "measurement_id": 191
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "edit",
+    "round": 9,
+    "position": 2,
+    "wall_ms": 2505.2625829994213,
+    "verified": true,
+    "loadavg": [
+      27.49755859375,
+      38.62841796875,
+      45.955078125
+    ],
+    "measurement_id": 193
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "restore",
+    "round": 9,
+    "position": 2,
+    "wall_ms": 2247.8066670009866,
+    "verified": true,
+    "loadavg": [
+      27.49755859375,
+      38.62841796875,
+      45.955078125
+    ],
+    "measurement_id": 195
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "edit",
+    "round": 10,
+    "position": 0,
+    "wall_ms": 2004.4976669960306,
+    "verified": true,
+    "loadavg": [
+      27.69775390625,
+      38.48486328125,
+      45.861328125
+    ],
+    "measurement_id": 197
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "restore",
+    "round": 10,
+    "position": 0,
+    "wall_ms": 1517.0136669985368,
+    "verified": true,
+    "loadavg": [
+      27.69775390625,
+      38.48486328125,
+      45.861328125
+    ],
+    "measurement_id": 199
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "edit",
+    "round": 10,
+    "position": 1,
+    "wall_ms": 1168.1805829939549,
+    "verified": true,
+    "loadavg": [
+      30.9248046875,
+      38.974609375,
+      45.99072265625
+    ],
+    "measurement_id": 201
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "restore",
+    "round": 10,
+    "position": 1,
+    "wall_ms": 833.2715830038069,
+    "verified": true,
+    "loadavg": [
+      30.9248046875,
+      38.974609375,
+      45.99072265625
+    ],
+    "measurement_id": 203
+  },
+  {
+    "arm": "devmap",
+    "scenario": "edit",
+    "round": 10,
+    "position": 2,
+    "wall_ms": 1460.7012499982375,
+    "verified": true,
+    "loadavg": [
+      29.8896484375,
+      38.6259765625,
+      45.82666015625
+    ],
+    "measurement_id": 205
+  },
+  {
+    "arm": "devmap",
+    "scenario": "restore",
+    "round": 10,
+    "position": 2,
+    "wall_ms": 1527.4756660001003,
+    "verified": true,
+    "loadavg": [
+      29.8896484375,
+      38.6259765625,
+      45.82666015625
+    ],
+    "measurement_id": 207
+  },
+  {
+    "arm": "devmap",
+    "scenario": "edit",
+    "round": 11,
+    "position": 0,
+    "wall_ms": 1595.5106249966775,
+    "verified": true,
+    "loadavg": [
+      29.8896484375,
+      38.6259765625,
+      45.82666015625
+    ],
+    "measurement_id": 209
+  },
+  {
+    "arm": "devmap",
+    "scenario": "restore",
+    "round": 11,
+    "position": 0,
+    "wall_ms": 1574.6713330008788,
+    "verified": true,
+    "loadavg": [
+      29.8896484375,
+      38.6259765625,
+      45.82666015625
+    ],
+    "measurement_id": 211
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "edit",
+    "round": 11,
+    "position": 1,
+    "wall_ms": 1566.227292001713,
+    "verified": true,
+    "loadavg": [
+      29.498046875,
+      38.3994140625,
+      45.70458984375
+    ],
+    "measurement_id": 213
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "restore",
+    "round": 11,
+    "position": 1,
+    "wall_ms": 1361.0848329990404,
+    "verified": true,
+    "loadavg": [
+      29.498046875,
+      38.3994140625,
+      45.70458984375
+    ],
+    "measurement_id": 215
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "edit",
+    "round": 11,
+    "position": 2,
+    "wall_ms": 790.1750829987577,
+    "verified": true,
+    "loadavg": [
+      29.498046875,
+      38.3994140625,
+      45.70458984375
+    ],
+    "measurement_id": 217
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "restore",
+    "round": 11,
+    "position": 2,
+    "wall_ms": 767.9891670049983,
+    "verified": true,
+    "loadavg": [
+      29.498046875,
+      38.3994140625,
+      45.70458984375
+    ],
+    "measurement_id": 219
+  },
+  {
+    "arm": "devmap",
+    "scenario": "edit",
+    "round": 12,
+    "position": 0,
+    "wall_ms": 1373.9862500005984,
+    "verified": true,
+    "loadavg": [
+      28.0166015625,
+      37.9443359375,
+      45.5009765625
+    ],
+    "measurement_id": 221
+  },
+  {
+    "arm": "devmap",
+    "scenario": "restore",
+    "round": 12,
+    "position": 0,
+    "wall_ms": 1502.3157080067904,
+    "verified": true,
+    "loadavg": [
+      28.0166015625,
+      37.9443359375,
+      45.5009765625
+    ],
+    "measurement_id": 223
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "edit",
+    "round": 12,
+    "position": 1,
+    "wall_ms": 1344.5491249949555,
+    "verified": true,
+    "loadavg": [
+      28.0166015625,
+      37.9443359375,
+      45.5009765625
+    ],
+    "measurement_id": 225
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "restore",
+    "round": 12,
+    "position": 1,
+    "wall_ms": 1493.7614160007797,
+    "verified": true,
+    "loadavg": [
+      28.0166015625,
+      37.9443359375,
+      45.5009765625
+    ],
+    "measurement_id": 227
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "edit",
+    "round": 12,
+    "position": 2,
+    "wall_ms": 840.2419999983977,
+    "verified": true,
+    "loadavg": [
+      26.89404296875,
+      37.54638671875,
+      45.31591796875
+    ],
+    "measurement_id": 229
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "restore",
+    "round": 12,
+    "position": 2,
+    "wall_ms": 948.0056249958579,
+    "verified": true,
+    "loadavg": [
+      26.89404296875,
+      37.54638671875,
+      45.31591796875
+    ],
+    "measurement_id": 231
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "edit",
+    "round": 13,
+    "position": 0,
+    "wall_ms": 1943.4250829945086,
+    "verified": true,
+    "loadavg": [
+      26.89404296875,
+      37.54638671875,
+      45.31591796875
+    ],
+    "measurement_id": 233
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "restore",
+    "round": 13,
+    "position": 0,
+    "wall_ms": 1706.3674999953946,
+    "verified": true,
+    "loadavg": [
+      26.89404296875,
+      37.54638671875,
+      45.31591796875
+    ],
+    "measurement_id": 235
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "edit",
+    "round": 13,
+    "position": 1,
+    "wall_ms": 884.8026250052499,
+    "verified": true,
+    "loadavg": [
+      28.904296875,
+      37.7861328125,
+      45.35498046875
+    ],
+    "measurement_id": 237
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "restore",
+    "round": 13,
+    "position": 1,
+    "wall_ms": 813.5856250009965,
+    "verified": true,
+    "loadavg": [
+      28.904296875,
+      37.7861328125,
+      45.35498046875
+    ],
+    "measurement_id": 239
+  },
+  {
+    "arm": "devmap",
+    "scenario": "edit",
+    "round": 13,
+    "position": 2,
+    "wall_ms": 1325.1558330011903,
+    "verified": true,
+    "loadavg": [
+      27.63037109375,
+      37.37451171875,
+      45.1650390625
+    ],
+    "measurement_id": 241
+  },
+  {
+    "arm": "devmap",
+    "scenario": "restore",
+    "round": 13,
+    "position": 2,
+    "wall_ms": 1217.0729580029729,
+    "verified": true,
+    "loadavg": [
+      27.63037109375,
+      37.37451171875,
+      45.1650390625
+    ],
+    "measurement_id": 243
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "edit",
+    "round": 14,
+    "position": 0,
+    "wall_ms": 748.0392500001471,
+    "verified": true,
+    "loadavg": [
+      27.63037109375,
+      37.37451171875,
+      45.1650390625
+    ],
+    "measurement_id": 245
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "restore",
+    "round": 14,
+    "position": 0,
+    "wall_ms": 718.7421250055195,
+    "verified": true,
+    "loadavg": [
+      27.63037109375,
+      37.37451171875,
+      45.1650390625
+    ],
+    "measurement_id": 247
+  },
+  {
+    "arm": "devmap",
+    "scenario": "edit",
+    "round": 14,
+    "position": 1,
+    "wall_ms": 1415.3567499961355,
+    "verified": true,
+    "loadavg": [
+      27.63037109375,
+      37.37451171875,
+      45.1650390625
+    ],
+    "measurement_id": 249
+  },
+  {
+    "arm": "devmap",
+    "scenario": "restore",
+    "round": 14,
+    "position": 1,
+    "wall_ms": 1486.0141249955632,
+    "verified": true,
+    "loadavg": [
+      27.63037109375,
+      37.37451171875,
+      45.1650390625
+    ],
+    "measurement_id": 251
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "edit",
+    "round": 14,
+    "position": 2,
+    "wall_ms": 1370.2613749992452,
+    "verified": true,
+    "loadavg": [
+      27.17919921875,
+      37.119140625,
+      45.029296875
+    ],
+    "measurement_id": 253
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "restore",
+    "round": 14,
+    "position": 2,
+    "wall_ms": 1230.8665829987149,
+    "verified": true,
+    "loadavg": [
+      27.17919921875,
+      37.119140625,
+      45.029296875
+    ],
+    "measurement_id": 255
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "edit",
+    "round": 15,
+    "position": 0,
+    "wall_ms": 777.5291660000221,
+    "verified": true,
+    "loadavg": [
+      25.64306640625,
+      36.63525390625,
+      44.81201171875
+    ],
+    "measurement_id": 257
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "restore",
+    "round": 15,
+    "position": 0,
+    "wall_ms": 786.1716250044992,
+    "verified": true,
+    "loadavg": [
+      25.64306640625,
+      36.63525390625,
+      44.81201171875
+    ],
+    "measurement_id": 259
+  },
+  {
+    "arm": "devmap",
+    "scenario": "edit",
+    "round": 15,
+    "position": 1,
+    "wall_ms": 1356.8162500014296,
+    "verified": true,
+    "loadavg": [
+      25.64306640625,
+      36.63525390625,
+      44.81201171875
+    ],
+    "measurement_id": 261
+  },
+  {
+    "arm": "devmap",
+    "scenario": "restore",
+    "round": 15,
+    "position": 1,
+    "wall_ms": 1393.8870839992887,
+    "verified": true,
+    "loadavg": [
+      25.64306640625,
+      36.63525390625,
+      44.81201171875
+    ],
+    "measurement_id": 263
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "edit",
+    "round": 15,
+    "position": 2,
+    "wall_ms": 1372.0085829991149,
+    "verified": true,
+    "loadavg": [
+      25.64306640625,
+      36.63525390625,
+      44.81201171875
+    ],
+    "measurement_id": 265
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "restore",
+    "round": 15,
+    "position": 2,
+    "wall_ms": 1750.096832998679,
+    "verified": true,
+    "loadavg": [
+      25.64306640625,
+      36.63525390625,
+      44.81201171875
+    ],
+    "measurement_id": 267
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "edit",
+    "round": 16,
+    "position": 0,
+    "wall_ms": 1774.307375002536,
+    "verified": true,
+    "loadavg": [
+      24.71044921875,
+      36.25927734375,
+      44.63134765625
+    ],
+    "measurement_id": 269
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "restore",
+    "round": 16,
+    "position": 0,
+    "wall_ms": 1850.7506250025472,
+    "verified": true,
+    "loadavg": [
+      24.71044921875,
+      36.25927734375,
+      44.63134765625
+    ],
+    "measurement_id": 271
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "edit",
+    "round": 16,
+    "position": 1,
+    "wall_ms": 793.9195419967291,
+    "verified": true,
+    "loadavg": [
+      28.3369140625,
+      36.8193359375,
+      44.77978515625
+    ],
+    "measurement_id": 273
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "restore",
+    "round": 16,
+    "position": 1,
+    "wall_ms": 750.6402090002666,
+    "verified": true,
+    "loadavg": [
+      28.3369140625,
+      36.8193359375,
+      44.77978515625
+    ],
+    "measurement_id": 275
+  },
+  {
+    "arm": "devmap",
+    "scenario": "edit",
+    "round": 16,
+    "position": 2,
+    "wall_ms": 3430.966083004023,
+    "verified": true,
+    "loadavg": [
+      28.3369140625,
+      36.8193359375,
+      44.77978515625
+    ],
+    "measurement_id": 277
+  },
+  {
+    "arm": "devmap",
+    "scenario": "restore",
+    "round": 16,
+    "position": 2,
+    "wall_ms": 1645.1591670047492,
+    "verified": true,
+    "loadavg": [
+      28.3369140625,
+      36.8193359375,
+      44.77978515625
+    ],
+    "measurement_id": 279
+  },
+  {
+    "arm": "devmap",
+    "scenario": "edit",
+    "round": 17,
+    "position": 0,
+    "wall_ms": 1645.9172920003766,
+    "verified": true,
+    "loadavg": [
+      32.8740234375,
+      37.619140625,
+      45.01513671875
+    ],
+    "measurement_id": 281
+  },
+  {
+    "arm": "devmap",
+    "scenario": "restore",
+    "round": 17,
+    "position": 0,
+    "wall_ms": 1570.2581250006915,
+    "verified": true,
+    "loadavg": [
+      32.8740234375,
+      37.619140625,
+      45.01513671875
+    ],
+    "measurement_id": 283
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "edit",
+    "round": 17,
+    "position": 1,
+    "wall_ms": 1191.9037499974365,
+    "verified": true,
+    "loadavg": [
+      32.0830078125,
+      37.3759765625,
+      44.8857421875
+    ],
+    "measurement_id": 285
+  },
+  {
+    "arm": "devmap_b",
+    "scenario": "restore",
+    "round": 17,
+    "position": 1,
+    "wall_ms": 1232.6085419990704,
+    "verified": true,
+    "loadavg": [
+      32.0830078125,
+      37.3759765625,
+      44.8857421875
+    ],
+    "measurement_id": 287
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "edit",
+    "round": 17,
+    "position": 2,
+    "wall_ms": 622.8907090044231,
+    "verified": true,
+    "loadavg": [
+      32.0830078125,
+      37.3759765625,
+      44.8857421875
+    ],
+    "measurement_id": 289
+  },
+  {
+    "arm": "codegraph",
+    "scenario": "restore",
+    "round": 17,
+    "position": 2,
+    "wall_ms": 643.9275829980033,
+    "verified": true,
+    "loadavg": [
+      32.0830078125,
+      37.3759765625,
+      44.8857421875
+    ],
+    "measurement_id": 291
+  }
+]

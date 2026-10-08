@@ -266,7 +266,12 @@ fn b3_measure_one_file_edit(n: usize) -> B3WriteSet {
     {
         let (resolution, analysis) = resolve(&files);
         let store = Store::open(&db).unwrap();
-        assert_eq!(store.save_generation(&files, &resolution, &analysis).unwrap(), 1);
+        assert_eq!(
+            store
+                .save_generation(&files, &resolution, &analysis)
+                .unwrap(),
+            1
+        );
     }
     let payloads_before = count("SELECT COUNT(*) FROM file_payloads");
     let gen1_edges = count("SELECT COUNT(*) FROM edge_rows WHERE valid_from = 1");
@@ -296,7 +301,11 @@ fn b3_measure_one_file_edit(n: usize) -> B3WriteSet {
         store.list_generation_paths(2).unwrap().len()
     };
 
-    let at_two = |table: &str| count(&format!("SELECT COUNT(*) FROM {table} WHERE generation_id = 2"));
+    let at_two = |table: &str| {
+        count(&format!(
+            "SELECT COUNT(*) FROM {table} WHERE generation_id = 2"
+        ))
+    };
     let set = B3WriteSet {
         nodes: at_two("generation_nodes"),
         file_rows: at_two("generation_file_rows"),
@@ -345,7 +354,10 @@ fn b3_one_file_edit_write_set_is_differential_for_ranges_and_o_repo_for_generati
     for (n, set) in [(200i64, small), (500i64, large)] {
         // Membership stays complete: an incremental generation is the whole tree.
         assert_eq!(set.members as i64, n);
-        assert!(set.gen1_edges >= n, "fixture must carry its cross-file calls: {set:?}");
+        assert!(
+            set.gen1_edges >= n,
+            "fixture must carry its cross-file calls: {set:?}"
+        );
         // The differential half: one payload for the edited file, and the two
         // edges the retargeted call closed and opened (the call and its import).
         assert_eq!(set.payloads_added, 1, "{set:?}");

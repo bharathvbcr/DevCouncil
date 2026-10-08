@@ -44,10 +44,8 @@ use devmap_store::Store;
 fn temp_root(name: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!(
-        "devmap-crash-{name}-{}-{seq}",
-        std::process::id()
-    ));
+    let root =
+        std::env::temp_dir().join(format!("devmap-crash-{name}-{}-{seq}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).expect("create fixture root");
     root
@@ -238,7 +236,10 @@ fn a_build_killed_mid_persist_leaves_a_whole_generation() {
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
-        assert!(announced, "round {round}: the build never announced persistence");
+        assert!(
+            announced,
+            "round {round}: the build never announced persistence"
+        );
         std::thread::sleep(Duration::from_millis(*delay));
         child.kill().expect("SIGKILL the build");
         let status = wait_bounded(&mut child, Duration::from_secs(10));
@@ -270,7 +271,10 @@ fn a_build_killed_mid_persist_leaves_a_whole_generation() {
     build(&cold, &root, true);
     let recovered = latest_answers(&db);
     let fresh = latest_answers(&cold);
-    assert!(!fresh.1.is_empty(), "the comparison must have edges to compare");
+    assert!(
+        !fresh.1.is_empty(),
+        "the comparison must have edges to compare"
+    );
     assert_eq!(recovered.0, fresh.0, "nodes differ from a cold build");
     assert_eq!(recovered.1, fresh.1, "edges differ from a cold build");
     let _ = fs::remove_dir_all(&root);
@@ -282,9 +286,7 @@ fn generation_inputs(n: usize, shift: usize) -> Vec<Extraction> {
             let next = (i + shift) % n;
             extract_file(
                 &format!("src/m{i}.py"),
-                &format!(
-                    "from src.m{next} import f{next}\n\ndef f{i}():\n    return f{next}()\n"
-                ),
+                &format!("from src.m{next} import f{next}\n\ndef f{i}():\n    return f{next}()\n"),
             )
         })
         .collect()
@@ -295,7 +297,9 @@ fn save(store: &Store, files: &[Extraction]) -> u32 {
     resolver.index_extractions(files);
     let resolution = resolver.resolve_all(files).unwrap();
     let analysis = analyze(files, &resolution);
-    store.save_generation(files, &resolution, &analysis).unwrap()
+    store
+        .save_generation(files, &resolution, &analysis)
+        .unwrap()
 }
 
 const WAL_HEADER: usize = 32;
@@ -388,10 +392,9 @@ fn a_lost_wal_tail_loses_whole_generations_never_half_of_one() {
             &[1, 2]
         };
         let db_copy = copy.join("devmap.sqlite");
-        let generation = std::panic::catch_unwind(|| {
-            assert_whole_generation(&db_copy, FILES, allowed)
-        })
-        .unwrap_or_else(|_| panic!("cut {index} at byte {cut} ({what}) did not recover"));
+        let generation =
+            std::panic::catch_unwind(|| assert_whole_generation(&db_copy, FILES, allowed))
+                .unwrap_or_else(|_| panic!("cut {index} at byte {cut} ({what}) did not recover"));
         *seen.entry(generation).or_insert(0usize) += 1;
     }
     eprintln!(

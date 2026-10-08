@@ -1,0 +1,1399 @@
+{
+  "mode": "edit-latency",
+  "repeat": 18,
+  "seed": 20261007,
+  "arms": [
+    "devmap",
+    "devmap_b",
+    "codegraph"
+  ],
+  "skipped_arms": [
+    "cbm"
+  ],
+  "repositories": [
+    {
+      "name": "devcouncil",
+      "planned_orders": [
+        [
+          "devmap",
+          "devmap_b",
+          "codegraph"
+        ],
+        [
+          "devmap_b",
+          "codegraph",
+          "devmap"
+        ],
+        [
+          "codegraph",
+          "devmap",
+          "devmap_b"
+        ],
+        [
+          "codegraph",
+          "devmap",
+          "devmap_b"
+        ],
+        [
+          "devmap_b",
+          "codegraph",
+          "devmap"
+        ],
+        [
+          "devmap",
+          "devmap_b",
+          "codegraph"
+        ],
+        [
+          "devmap",
+          "devmap_b",
+          "codegraph"
+        ],
+        [
+          "devmap_b",
+          "codegraph",
+          "devmap"
+        ],
+        [
+          "codegraph",
+          "devmap",
+          "devmap_b"
+        ],
+        [
+          "codegraph",
+          "devmap",
+          "devmap_b"
+        ],
+        [
+          "devmap_b",
+          "codegraph",
+          "devmap"
+        ],
+        [
+          "devmap",
+          "devmap_b",
+          "codegraph"
+        ],
+        [
+          "devmap",
+          "devmap_b",
+          "codegraph"
+        ],
+        [
+          "devmap_b",
+          "codegraph",
+          "devmap"
+        ],
+        [
+          "codegraph",
+          "devmap",
+          "devmap_b"
+        ],
+        [
+          "codegraph",
+          "devmap",
+          "devmap_b"
+        ],
+        [
+          "devmap_b",
+          "codegraph",
+          "devmap"
+        ],
+        [
+          "devmap",
+          "devmap_b",
+          "codegraph"
+        ]
+      ],
+      "executed_orders": [
+        [
+          "devmap",
+          "devmap_b",
+          "codegraph"
+        ],
+        [
+          "devmap_b",
+          "codegraph",
+          "devmap"
+        ],
+        [
+          "codegraph",
+          "devmap",
+          "devmap_b"
+        ],
+        [
+          "codegraph",
+          "devmap",
+          "devmap_b"
+        ],
+        [
+          "devmap_b",
+          "codegraph",
+          "devmap"
+        ],
+        [
+          "devmap",
+          "devmap_b",
+          "codegraph"
+        ],
+        [
+          "devmap",
+          "devmap_b",
+          "codegraph"
+        ],
+        [
+          "devmap_b",
+          "codegraph",
+          "devmap"
+        ],
+        [
+          "codegraph",
+          "devmap",
+          "devmap_b"
+        ],
+        [
+          "codegraph",
+          "devmap",
+          "devmap_b"
+        ],
+        [
+          "devmap_b",
+          "codegraph",
+          "devmap"
+        ],
+        [
+          "devmap",
+          "devmap_b",
+          "codegraph"
+        ],
+        [
+          "devmap",
+          "devmap_b",
+          "codegraph"
+        ],
+        [
+          "devmap_b",
+          "codegraph",
+          "devmap"
+        ],
+        [
+          "codegraph",
+          "devmap",
+          "devmap_b"
+        ],
+        [
+          "codegraph",
+          "devmap",
+          "devmap_b"
+        ],
+        [
+          "devmap_b",
+          "codegraph",
+          "devmap"
+        ],
+        [
+          "devmap",
+          "devmap_b",
+          "codegraph"
+        ]
+      ],
+      "source_verification": {
+        "devmap": "unchanged",
+        "devmap_b": "unchanged",
+        "codegraph": "unchanged"
+      },
+      "callers": [
+        {
+          "arm": "devmap",
+          "status": "measured",
+          "symbols": 24,
+          "unverified_symbols": 0,
+          "capped_answers": 0,
+          "expected": 48,
+          "returned": 48,
+          "true_positives": 48,
+          "precision": 1.0,
+          "recall": 1.0,
+          "per_symbol": [
+            {
+              "symbol": "gt_go_leaf_0",
+              "incomplete": false,
+              "native": "00002-devmap-callers-gt_go_leaf_0.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 3,
+              "returned": 3,
+              "true_positives": 3,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_go_leaf_1",
+              "incomplete": false,
+              "native": "00003-devmap-callers-gt_go_leaf_1.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 6,
+              "returned": 6,
+              "true_positives": 6,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_go_leaf_2",
+              "incomplete": false,
+              "native": "00004-devmap-callers-gt_go_leaf_2.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_go_leaf_3",
+              "incomplete": false,
+              "native": "00005-devmap-callers-gt_go_leaf_3.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 0,
+              "returned": 0,
+              "true_positives": 0,
+              "precision": null,
+              "recall": null,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_go_leaf_4",
+              "incomplete": false,
+              "native": "00006-devmap-callers-gt_go_leaf_4.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_go_leaf_5",
+              "incomplete": false,
+              "native": "00007-devmap-callers-gt_go_leaf_5.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_python_leaf_0",
+              "incomplete": false,
+              "native": "00008-devmap-callers-gt_python_leaf_0.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 2,
+              "returned": 2,
+              "true_positives": 2,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_python_leaf_1",
+              "incomplete": false,
+              "native": "00009-devmap-callers-gt_python_leaf_1.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_python_leaf_2",
+              "incomplete": false,
+              "native": "00010-devmap-callers-gt_python_leaf_2.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 2,
+              "returned": 2,
+              "true_positives": 2,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_python_leaf_3",
+              "incomplete": false,
+              "native": "00011-devmap-callers-gt_python_leaf_3.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 2,
+              "returned": 2,
+              "true_positives": 2,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_python_leaf_4",
+              "incomplete": false,
+              "native": "00012-devmap-callers-gt_python_leaf_4.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 2,
+              "returned": 2,
+              "true_positives": 2,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_python_leaf_5",
+              "incomplete": false,
+              "native": "00013-devmap-callers-gt_python_leaf_5.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 3,
+              "returned": 3,
+              "true_positives": 3,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_rust_leaf_0",
+              "incomplete": false,
+              "native": "00014-devmap-callers-gt_rust_leaf_0.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 2,
+              "returned": 2,
+              "true_positives": 2,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_rust_leaf_1",
+              "incomplete": false,
+              "native": "00015-devmap-callers-gt_rust_leaf_1.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_rust_leaf_2",
+              "incomplete": false,
+              "native": "00016-devmap-callers-gt_rust_leaf_2.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 3,
+              "returned": 3,
+              "true_positives": 3,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_rust_leaf_3",
+              "incomplete": false,
+              "native": "00017-devmap-callers-gt_rust_leaf_3.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_rust_leaf_4",
+              "incomplete": false,
+              "native": "00018-devmap-callers-gt_rust_leaf_4.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 2,
+              "returned": 2,
+              "true_positives": 2,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_rust_leaf_5",
+              "incomplete": false,
+              "native": "00019-devmap-callers-gt_rust_leaf_5.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 3,
+              "returned": 3,
+              "true_positives": 3,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_typescript_leaf_0",
+              "incomplete": false,
+              "native": "00020-devmap-callers-gt_typescript_leaf_0.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 7,
+              "returned": 7,
+              "true_positives": 7,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_typescript_leaf_1",
+              "incomplete": false,
+              "native": "00021-devmap-callers-gt_typescript_leaf_1.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 2,
+              "returned": 2,
+              "true_positives": 2,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_typescript_leaf_2",
+              "incomplete": false,
+              "native": "00022-devmap-callers-gt_typescript_leaf_2.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_typescript_leaf_3",
+              "incomplete": false,
+              "native": "00023-devmap-callers-gt_typescript_leaf_3.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_typescript_leaf_4",
+              "incomplete": false,
+              "native": "00024-devmap-callers-gt_typescript_leaf_4.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 0,
+              "returned": 0,
+              "true_positives": 0,
+              "precision": null,
+              "recall": null,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_typescript_leaf_5",
+              "incomplete": false,
+              "native": "00025-devmap-callers-gt_typescript_leaf_5.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            }
+          ]
+        },
+        {
+          "arm": "devmap_b",
+          "status": "measured",
+          "symbols": 24,
+          "unverified_symbols": 0,
+          "capped_answers": 0,
+          "expected": 48,
+          "returned": 48,
+          "true_positives": 48,
+          "precision": 1.0,
+          "recall": 1.0,
+          "per_symbol": [
+            {
+              "symbol": "gt_go_leaf_0",
+              "incomplete": false,
+              "native": "00028-devmap_b-callers-gt_go_leaf_0.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 3,
+              "returned": 3,
+              "true_positives": 3,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_go_leaf_1",
+              "incomplete": false,
+              "native": "00029-devmap_b-callers-gt_go_leaf_1.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 6,
+              "returned": 6,
+              "true_positives": 6,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_go_leaf_2",
+              "incomplete": false,
+              "native": "00030-devmap_b-callers-gt_go_leaf_2.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_go_leaf_3",
+              "incomplete": false,
+              "native": "00031-devmap_b-callers-gt_go_leaf_3.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 0,
+              "returned": 0,
+              "true_positives": 0,
+              "precision": null,
+              "recall": null,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_go_leaf_4",
+              "incomplete": false,
+              "native": "00032-devmap_b-callers-gt_go_leaf_4.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_go_leaf_5",
+              "incomplete": false,
+              "native": "00033-devmap_b-callers-gt_go_leaf_5.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_python_leaf_0",
+              "incomplete": false,
+              "native": "00034-devmap_b-callers-gt_python_leaf_0.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 2,
+              "returned": 2,
+              "true_positives": 2,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_python_leaf_1",
+              "incomplete": false,
+              "native": "00035-devmap_b-callers-gt_python_leaf_1.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_python_leaf_2",
+              "incomplete": false,
+              "native": "00036-devmap_b-callers-gt_python_leaf_2.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 2,
+              "returned": 2,
+              "true_positives": 2,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_python_leaf_3",
+              "incomplete": false,
+              "native": "00037-devmap_b-callers-gt_python_leaf_3.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 2,
+              "returned": 2,
+              "true_positives": 2,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_python_leaf_4",
+              "incomplete": false,
+              "native": "00038-devmap_b-callers-gt_python_leaf_4.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 2,
+              "returned": 2,
+              "true_positives": 2,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_python_leaf_5",
+              "incomplete": false,
+              "native": "00039-devmap_b-callers-gt_python_leaf_5.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 3,
+              "returned": 3,
+              "true_positives": 3,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_rust_leaf_0",
+              "incomplete": false,
+              "native": "00040-devmap_b-callers-gt_rust_leaf_0.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 2,
+              "returned": 2,
+              "true_positives": 2,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_rust_leaf_1",
+              "incomplete": false,
+              "native": "00041-devmap_b-callers-gt_rust_leaf_1.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_rust_leaf_2",
+              "incomplete": false,
+              "native": "00042-devmap_b-callers-gt_rust_leaf_2.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 3,
+              "returned": 3,
+              "true_positives": 3,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_rust_leaf_3",
+              "incomplete": false,
+              "native": "00043-devmap_b-callers-gt_rust_leaf_3.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_rust_leaf_4",
+              "incomplete": false,
+              "native": "00044-devmap_b-callers-gt_rust_leaf_4.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 2,
+              "returned": 2,
+              "true_positives": 2,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_rust_leaf_5",
+              "incomplete": false,
+              "native": "00045-devmap_b-callers-gt_rust_leaf_5.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 3,
+              "returned": 3,
+              "true_positives": 3,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_typescript_leaf_0",
+              "incomplete": false,
+              "native": "00046-devmap_b-callers-gt_typescript_leaf_0.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 7,
+              "returned": 7,
+              "true_positives": 7,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_typescript_leaf_1",
+              "incomplete": false,
+              "native": "00047-devmap_b-callers-gt_typescript_leaf_1.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 2,
+              "returned": 2,
+              "true_positives": 2,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_typescript_leaf_2",
+              "incomplete": false,
+              "native": "00048-devmap_b-callers-gt_typescript_leaf_2.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_typescript_leaf_3",
+              "incomplete": false,
+              "native": "00049-devmap_b-callers-gt_typescript_leaf_3.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_typescript_leaf_4",
+              "incomplete": false,
+              "native": "00050-devmap_b-callers-gt_typescript_leaf_4.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 0,
+              "returned": 0,
+              "true_positives": 0,
+              "precision": null,
+              "recall": null,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_typescript_leaf_5",
+              "incomplete": false,
+              "native": "00051-devmap_b-callers-gt_typescript_leaf_5.stdout",
+              "non_call_edges": 0,
+              "unresolved_namesake_sites": 0,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            }
+          ]
+        },
+        {
+          "arm": "codegraph",
+          "status": "measured",
+          "symbols": 24,
+          "unverified_symbols": 0,
+          "capped_answers": 0,
+          "expected": 48,
+          "returned": 48,
+          "true_positives": 48,
+          "precision": 1.0,
+          "recall": 1.0,
+          "per_symbol": [
+            {
+              "symbol": "gt_go_leaf_0",
+              "incomplete": false,
+              "native": "00053-codegraph-callers-gt_go_leaf_0.stdout",
+              "non_function_rows": 0,
+              "expected": 3,
+              "returned": 3,
+              "true_positives": 3,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_go_leaf_1",
+              "incomplete": false,
+              "native": "00054-codegraph-callers-gt_go_leaf_1.stdout",
+              "non_function_rows": 0,
+              "expected": 6,
+              "returned": 6,
+              "true_positives": 6,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_go_leaf_2",
+              "incomplete": false,
+              "native": "00055-codegraph-callers-gt_go_leaf_2.stdout",
+              "non_function_rows": 0,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_go_leaf_3",
+              "incomplete": false,
+              "native": "00056-codegraph-callers-gt_go_leaf_3.stdout",
+              "non_function_rows": 0,
+              "expected": 0,
+              "returned": 0,
+              "true_positives": 0,
+              "precision": null,
+              "recall": null,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_go_leaf_4",
+              "incomplete": false,
+              "native": "00057-codegraph-callers-gt_go_leaf_4.stdout",
+              "non_function_rows": 0,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_go_leaf_5",
+              "incomplete": false,
+              "native": "00058-codegraph-callers-gt_go_leaf_5.stdout",
+              "non_function_rows": 0,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_python_leaf_0",
+              "incomplete": false,
+              "native": "00059-codegraph-callers-gt_python_leaf_0.stdout",
+              "non_function_rows": 2,
+              "expected": 2,
+              "returned": 2,
+              "true_positives": 2,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_python_leaf_1",
+              "incomplete": false,
+              "native": "00060-codegraph-callers-gt_python_leaf_1.stdout",
+              "non_function_rows": 1,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_python_leaf_2",
+              "incomplete": false,
+              "native": "00061-codegraph-callers-gt_python_leaf_2.stdout",
+              "non_function_rows": 2,
+              "expected": 2,
+              "returned": 2,
+              "true_positives": 2,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_python_leaf_3",
+              "incomplete": false,
+              "native": "00062-codegraph-callers-gt_python_leaf_3.stdout",
+              "non_function_rows": 2,
+              "expected": 2,
+              "returned": 2,
+              "true_positives": 2,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_python_leaf_4",
+              "incomplete": false,
+              "native": "00063-codegraph-callers-gt_python_leaf_4.stdout",
+              "non_function_rows": 1,
+              "expected": 2,
+              "returned": 2,
+              "true_positives": 2,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_python_leaf_5",
+              "incomplete": false,
+              "native": "00064-codegraph-callers-gt_python_leaf_5.stdout",
+              "non_function_rows": 2,
+              "expected": 3,
+              "returned": 3,
+              "true_positives": 3,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_rust_leaf_0",
+              "incomplete": false,
+              "native": "00065-codegraph-callers-gt_rust_leaf_0.stdout",
+              "non_function_rows": 2,
+              "expected": 2,
+              "returned": 2,
+              "true_positives": 2,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_rust_leaf_1",
+              "incomplete": false,
+              "native": "00066-codegraph-callers-gt_rust_leaf_1.stdout",
+              "non_function_rows": 1,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_rust_leaf_2",
+              "incomplete": false,
+              "native": "00067-codegraph-callers-gt_rust_leaf_2.stdout",
+              "non_function_rows": 2,
+              "expected": 3,
+              "returned": 3,
+              "true_positives": 3,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_rust_leaf_3",
+              "incomplete": false,
+              "native": "00068-codegraph-callers-gt_rust_leaf_3.stdout",
+              "non_function_rows": 1,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_rust_leaf_4",
+              "incomplete": false,
+              "native": "00069-codegraph-callers-gt_rust_leaf_4.stdout",
+              "non_function_rows": 2,
+              "expected": 2,
+              "returned": 2,
+              "true_positives": 2,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_rust_leaf_5",
+              "incomplete": false,
+              "native": "00070-codegraph-callers-gt_rust_leaf_5.stdout",
+              "non_function_rows": 3,
+              "expected": 3,
+              "returned": 3,
+              "true_positives": 3,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_typescript_leaf_0",
+              "incomplete": false,
+              "native": "00071-codegraph-callers-gt_typescript_leaf_0.stdout",
+              "non_function_rows": 5,
+              "expected": 7,
+              "returned": 7,
+              "true_positives": 7,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_typescript_leaf_1",
+              "incomplete": false,
+              "native": "00072-codegraph-callers-gt_typescript_leaf_1.stdout",
+              "non_function_rows": 1,
+              "expected": 2,
+              "returned": 2,
+              "true_positives": 2,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_typescript_leaf_2",
+              "incomplete": false,
+              "native": "00073-codegraph-callers-gt_typescript_leaf_2.stdout",
+              "non_function_rows": 1,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_typescript_leaf_3",
+              "incomplete": false,
+              "native": "00074-codegraph-callers-gt_typescript_leaf_3.stdout",
+              "non_function_rows": 1,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_typescript_leaf_4",
+              "incomplete": false,
+              "native": "00075-codegraph-callers-gt_typescript_leaf_4.stdout",
+              "non_function_rows": 0,
+              "expected": 0,
+              "returned": 0,
+              "true_positives": 0,
+              "precision": null,
+              "recall": null,
+              "missed": [],
+              "extra": []
+            },
+            {
+              "symbol": "gt_typescript_leaf_5",
+              "incomplete": false,
+              "native": "00076-codegraph-callers-gt_typescript_leaf_5.stdout",
+              "non_function_rows": 1,
+              "expected": 1,
+              "returned": 1,
+              "true_positives": 1,
+              "precision": 1.0,
+              "recall": 1.0,
+              "missed": [],
+              "extra": []
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "codegraph/edit": {
+      "n": 18,
+      "min_ms": 622.8907090044231,
+      "median_ms": 786.3066249992698,
+      "max_ms": 1714.849707997928,
+      "failed": 0,
+      "by_position": {
+        "0": {
+          "n": 6,
+          "min_ms": 679.4069169991417,
+          "median_ms": 762.7842080000846,
+          "max_ms": 1714.849707997928
+        },
+        "1": {
+          "n": 6,
+          "min_ms": 659.294792007131,
+          "median_ms": 839.3610835009895,
+          "max_ms": 1168.1805829939549
+        },
+        "2": {
+          "n": 6,
+          "min_ms": 622.8907090044231,
+          "median_ms": 771.5641040012997,
+          "max_ms": 883.6257090006256
+        }
+      }
+    },
+    "codegraph/restore": {
+      "n": 18,
+      "min_ms": 643.9275829980033,
+      "median_ms": 759.3146880026325,
+      "max_ms": 2202.8648749983404,
+      "failed": 0,
+      "by_position": {
+        "0": {
+          "n": 6,
+          "min_ms": 674.1542499948991,
+          "median_ms": 752.4568750050094,
+          "max_ms": 2202.8648749983404
+        },
+        "1": {
+          "n": 6,
+          "min_ms": 686.6085000001476,
+          "median_ms": 774.8650214998634,
+          "max_ms": 833.2715830038069
+        },
+        "2": {
+          "n": 6,
+          "min_ms": 643.9275829980033,
+          "median_ms": 758.8105005015677,
+          "max_ms": 948.0056249958579
+        }
+      }
+    },
+    "devmap/edit": {
+      "n": 18,
+      "min_ms": 1281.7667499984964,
+      "median_ms": 1418.5805414963397,
+      "max_ms": 4701.343791006366,
+      "failed": 0,
+      "by_position": {
+        "0": {
+          "n": 6,
+          "min_ms": 1309.3760420015315,
+          "median_ms": 1487.0505204999063,
+          "max_ms": 1796.0511249984847
+        },
+        "1": {
+          "n": 6,
+          "min_ms": 1281.7667499984964,
+          "median_ms": 1418.5805414963397,
+          "max_ms": 4701.343791006366
+        },
+        "2": {
+          "n": 6,
+          "min_ms": 1299.3816250018426,
+          "median_ms": 1408.4099584979413,
+          "max_ms": 3430.966083004023
+        }
+      }
+    },
+    "devmap/restore": {
+      "n": 18,
+      "min_ms": 1217.0729580029729,
+      "median_ms": 1448.3539584980463,
+      "max_ms": 3928.0692499960423,
+      "failed": 0,
+      "by_position": {
+        "0": {
+          "n": 6,
+          "min_ms": 1393.362167000305,
+          "median_ms": 1493.653395504225,
+          "max_ms": 1574.6713330008788
+        },
+        "1": {
+          "n": 6,
+          "min_ms": 1249.6502919966588,
+          "median_ms": 1421.881646499969,
+          "max_ms": 3928.0692499960423
+        },
+        "2": {
+          "n": 6,
+          "min_ms": 1217.0729580029729,
+          "median_ms": 1422.0316664977872,
+          "max_ms": 1645.1591670047492
+        }
+      }
+    },
+    "devmap_b/edit": {
+      "n": 18,
+      "min_ms": 1044.4686250048107,
+      "median_ms": 1413.3244375007052,
+      "max_ms": 2505.2625829994213,
+      "failed": 0,
+      "by_position": {
+        "0": {
+          "n": 6,
+          "min_ms": 1199.987667001551,
+          "median_ms": 1740.5255000012403,
+          "max_ms": 2004.4976669960306
+        },
+        "1": {
+          "n": 6,
+          "min_ms": 1044.4686250048107,
+          "median_ms": 1399.5947084986256,
+          "max_ms": 1566.227292001713
+        },
+        "2": {
+          "n": 6,
+          "min_ms": 1205.7143749989336,
+          "median_ms": 1371.13497899918,
+          "max_ms": 2505.2625829994213
+        }
+      }
+    },
+    "devmap_b/restore": {
+      "n": 18,
+      "min_ms": 1088.2977500004927,
+      "median_ms": 1433.5155619992292,
+      "max_ms": 2694.21916599822,
+      "failed": 0,
+      "by_position": {
+        "0": {
+          "n": 6,
+          "min_ms": 1088.2977500004927,
+          "median_ms": 1585.7082290021935,
+          "max_ms": 1850.7506250025472
+        },
+        "1": {
+          "n": 6,
+          "min_ms": 1232.6085419990704,
+          "median_ms": 1367.1772704983596,
+          "max_ms": 1670.8560410042992
+        },
+        "2": {
+          "n": 6,
+          "min_ms": 1106.0682919996907,
+          "median_ms": 1490.481707998697,
+          "max_ms": 2694.21916599822
+        }
+      }
+    }
+  }
+}

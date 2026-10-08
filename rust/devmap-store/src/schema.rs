@@ -1306,8 +1306,19 @@ pub const MIGRATION_V22_TO_V23: &str = "";
 /// interleaved rounds of five `impact` calls: min 36.50 ms → 11.74 ms, p50
 /// 37.77 ms → 12.69 ms, so 7.55 ms → 2.54 ms per call at p50; a second run gave
 /// 8.55 ms → 3.00 ms. The index adds 2.4 MB (1.6%) to the file and took 42 to
-/// 88 ms to build over the existing rows. What it costs a cold build — one more
-/// b-tree insertion per ledger row — was not re-measured.
+/// 88 ms to build over the existing rows.
+///
+/// What it costs a cold build, measured 2026-10-07 with
+/// `benchmarks/cold_build_ab.py`: two release binaries differing only in this
+/// statement (the patch is under
+/// `benchmarks/results/competition/20261007-build-cost/patches/`), real
+/// `devmap build --full` of a frozen DevCouncil tree (1,310 files, 163,126
+/// unresolved calls) into a new store, 12 ABBA rounds, identical counts on
+/// both arms. With the index → without: `persist:write`'s unresolved part min
+/// 378 → 263 ms, median 505 → 445 ms; `persist:write` min 906 → 814 ms; the
+/// whole build min 2.89 → 2.93 s, inside the noise (1-minute load 30–45 on 18
+/// cores). So the index costs about 60–115 ms of a cold persist and 2.83 MB of
+/// store, against 5.0 ms saved on every `impact` call at p50.
 pub const MIGRATION_V23_TO_V24: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_unresolved_rows_callee
     ON unresolved_rows(callee_name);
