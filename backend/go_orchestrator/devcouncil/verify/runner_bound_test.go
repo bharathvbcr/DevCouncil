@@ -1,3 +1,5 @@
+//go:build unix
+
 package verify
 
 import (
@@ -49,14 +51,19 @@ func waitGone(t *testing.T, pid int) {
 func TestARunawayCommandIsKilledWithEverythingItStarted(t *testing.T) {
 	root := t.TempDir()
 	pidFile := filepath.Join(root, "child.pid")
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	// Two seconds, not a few hundred milliseconds: the shell must fork its
+	// child and write the pid file before the deadline fires, and under load
+	// startup alone can take longer than a tight deadline. The assertion is
+	// about what the kill reaches, not how quickly it comes.
+	const deadline = 2 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), deadline)
 	defer cancel()
 
 	start := time.Now()
-	out := runWithin(t, 15*time.Second, DefaultRunCommand(ctx, root),
+	out := runWithin(t, 20*time.Second, DefaultRunCommand(ctx, root),
 		"sleep 60 & echo $! > "+pidFile+"; wait")
-	if elapsed := time.Since(start); elapsed > 10*time.Second {
-		t.Fatalf("returned after %s; the deadline was 300ms", elapsed)
+	if elapsed := time.Since(start); elapsed > 15*time.Second {
+		t.Fatalf("returned after %s; the deadline was %s", elapsed, deadline)
 	}
 	if !out.TimedOut || out.ExitCode != -1 {
 		t.Fatalf("outcome = %+v, want TimedOut with exit -1", out)
@@ -78,9 +85,9 @@ func TestARunawayCommandIsKilledWithEverythingItStarted(t *testing.T) {
 
 func TestACancelledVerificationStopsTheCommandItIsRunning(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	time.AfterFunc(200*time.Millisecond, cancel)
+	time.AfterFunc(time.Second, cancel)
 
-	out := runWithin(t, 15*time.Second, DefaultRunCommand(ctx, t.TempDir()), "sleep 60")
+	out := runWithin(t, 20*time.Second, DefaultRunCommand(ctx, t.TempDir()), "sleep 60")
 	if !out.TimedOut || out.ExitCode != -1 {
 		t.Fatalf("outcome = %+v, want a stopped command with exit -1", out)
 	}

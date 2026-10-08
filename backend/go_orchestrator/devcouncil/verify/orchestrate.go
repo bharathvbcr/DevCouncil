@@ -480,7 +480,7 @@ func VerifyTask(ctx context.Context, root string, client *store.Client, taskID, 
 		// The verdict is returned with the error so a caller can show it, but
 		// as an error: the gates and the task loop read the store, and a run
 		// the store never recorded must not be acted on as if it had been.
-		return result, gaps, fmt.Errorf("verification ran but was not recorded: %w", persistErr)
+		return result, gaps, fmt.Errorf("its result was not recorded in the store: %w", persistErr)
 	}
 	return result, gaps, nil
 }

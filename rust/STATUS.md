@@ -135,8 +135,8 @@ A passing test is not evidence until it has been shown it can fail.
 ## 3. Changes made during the port
 
 Four, all forced by the move. Everything else was byte-identical to MANVI.
-(As of 2026-10-07 the four have converged too: all six shared `dc-*` crates
-diff clean against MANVI's copy; see the note under the header.)
+(The four no longer differ anywhere: MANVI's `dc-*` entries are symlinks to
+these crates, so there is one copy. See [§6](#6-one-owner-manvi-symlinks).)
 
 1. **`dc-glob` fixture path.** The CPython `fnmatch` parity fixture lives once,
    at `testdata/fnmatch-parity.tsv` in the repository root. `dc-glob` and the Go
