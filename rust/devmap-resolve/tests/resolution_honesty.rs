@@ -56,7 +56,7 @@ fn entitled(resolution: &Resolution) -> Confidence {
         | Resolution::Structural { .. } => Confidence::DETERMINISTIC,
         // One declaration of the name and nothing tying it to this file:
         // the same rung whether the name is an identifier or a selector.
-        Resolution::UniqueGlobal { .. } | Resolution::UniqueSelector { .. } => Confidence::HIGH,
+        Resolution::UniqueGlobal { .. } | Resolution::UniqueNamespaced { .. } => Confidence::HIGH,
         Resolution::LanguageServer { .. } => Confidence::HIGH,
         Resolution::AmbiguousGlobal { .. }
         | Resolution::LanguageServerDispatch { .. }

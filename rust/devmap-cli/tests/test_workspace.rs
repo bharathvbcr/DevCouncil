@@ -242,3 +242,80 @@ fn shared_symbol_names_alone_do_not_make_a_link() {
     );
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// A host that dispatches a sibling repository's kernel by name — ojas and
+/// qd-metal with tessl's — is a cross-repository candidate naming both ends.
+/// A string matching a shader helper is not, a name two libraries declare is
+/// not, and a host's own kernel stays inside its own graph.
+#[test]
+fn a_kernel_name_another_repo_declares_is_a_link_candidate() {
+    use devmap_query::workspace::LinkKind;
+    let base = scratch("kernels");
+    let kernels = base.join("tessl");
+    let host = base.join("ojas");
+    let other = base.join("mlx");
+    build_repo(
+        &kernels,
+        &[(
+            "kernels/rows.metal",
+            "inline float twice(float x) { return x * 2.0f; }\n\
+             kernel void shared_name(device float *o [[buffer(0)]]) { o[0] = 0.0f; }\n\
+             #define ROWS(NAME, D) kernel void NAME(device float *o [[buffer(0)]]) { o[0] = twice(D); }\n\
+             ROWS(rows_h256, 256.0f)\n",
+        )],
+    );
+    build_repo(
+        &other,
+        &[(
+            "kernels/other.metal",
+            "kernel void shared_name(device float *o [[buffer(0)]]) { o[0] = 1.0f; }\n",
+        )],
+    );
+    build_repo(
+        &host,
+        &[
+            (
+                "src/gpu.rs",
+                "const ROWS: &str = \"rows_h256\";\n\
+                 pub fn attn(rt: &Runtime) { let p = rt.pipeline(ROWS); }\n\
+                 pub fn own(rt: &Runtime) { let p = rt.pipeline(\"host_own\"); }\n\
+                 pub fn helper(rt: &Runtime) { let p = rt.pipeline(\"twice\"); }\n\
+                 pub fn ambiguous(rt: &Runtime) { let p = rt.pipeline(\"shared_name\"); }\n",
+            ),
+            (
+                "kernels/own.metal",
+                "kernel void host_own(device float *o [[buffer(0)]]) { o[0] = 2.0f; }\n",
+            ),
+        ],
+    );
+
+    let workspace = registry(&[("tessl", &kernels), ("ojas", &host), ("mlx", &other)]);
+    let links: Vec<_> = link_candidates(&workspace)
+        .unwrap()
+        .into_iter()
+        .filter(|link| link.kind == LinkKind::EntryName)
+        .collect();
+    assert_eq!(links.len(), 1, "{links:?}");
+    let link = &links[0];
+    assert_eq!(link.from_repo, "ojas");
+    assert_eq!(link.to_repo, "tessl");
+    assert_eq!(link.module_specifier, "rows_h256");
+    assert_eq!(link.from_symbol.as_deref(), Some("src/gpu.rs::ROWS"));
+    assert_eq!(
+        link.to_symbol.as_deref(),
+        Some("kernels/rows.metal::rows_h256")
+    );
+    assert!(
+        link.evidence.contains("kernels/rows.metal"),
+        "{}",
+        link.evidence
+    );
+
+    // An import candidate written before kinds existed still reads as one.
+    let legacy: devmap_query::workspace::LinkCandidate = serde_json::from_value(serde_json::json!({
+        "from_repo": "a", "from_file": "f", "module_specifier": "m", "to_repo": "b", "evidence": "e"
+    }))
+    .unwrap();
+    assert_eq!(legacy.kind, LinkKind::Import);
+    let _ = std::fs::remove_dir_all(&base);
+}

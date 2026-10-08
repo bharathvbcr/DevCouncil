@@ -534,6 +534,39 @@ fn extract_treesitter_before_deadline(
                         over_budget("walking the syntax tree"),
                     );
                 }
+                // After the walk, because a stamped function is a declaration
+                // the walk could not see: it exists only in a macro's
+                // expansion. Its overrun is caught by the check below, the one
+                // every phase between here and assembly shares.
+                if is_c_family_grammar(lang) {
+                    crate::cmacro::stamp_macro_instantiations(
+                        root,
+                        source,
+                        lang,
+                        &file_symbol_name,
+                        is_metal_path(path),
+                        &mut symbols,
+                        &mut calls,
+                        &mut references,
+                        &mut wiring,
+                        deadline,
+                    );
+                }
+                if !crate::entry_names::collect(
+                    root,
+                    source,
+                    lang,
+                    &file_symbol_name,
+                    &mut references,
+                    deadline,
+                ) {
+                    return refused_extraction(
+                        path,
+                        lang,
+                        source,
+                        over_budget("reading name strings"),
+                    );
+                }
 
                 let (go_interface_methods, go_method_params, go_member_names) = if lang == "go" {
                     let (interface_methods, method_params, mut member_names) =
@@ -858,7 +891,7 @@ fn push_children_reversed<'tree>(node: Node<'tree>, worklist: &mut Vec<Node<'tre
 }
 
 /// [`push_children`] over named children only.
-fn push_named_children<'tree>(node: Node<'tree>, worklist: &mut Vec<Node<'tree>>) {
+pub(crate) fn push_named_children<'tree>(node: Node<'tree>, worklist: &mut Vec<Node<'tree>>) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         worklist.push(child);
@@ -3331,7 +3364,7 @@ fn generic_declaration_name(node: Node, source: &str) -> Option<String> {
 /// declaration's *leading* tokens are read, within a bounded window, so a
 /// `kernel`-typed parameter or an address space further along the signature can
 /// never promote an ordinary helper to an entry point.
-fn metal_shader_entry_reason_of(node: Node, source: &str) -> Option<&'static str> {
+pub(crate) fn metal_shader_entry_reason_of(node: Node, source: &str) -> Option<&'static str> {
     const HEAD_WINDOW: usize = 256;
     let start = node.start_byte();
     let end = node.end_byte().min(start + HEAD_WINDOW);
@@ -5540,7 +5573,7 @@ pub(crate) fn c_family_declaration(
 /// delegates, target/action and protocol conformance all invoke methods that no
 /// call expression in the corpus mentions. Metal's shader qualifiers are handled
 /// by `metal_shader_entry_reason_of`, which already owns that rule.
-fn c_family_entry_point_reason(
+pub(crate) fn c_family_entry_point_reason(
     node: Node,
     source: &str,
     path: &str,
@@ -5727,7 +5760,26 @@ thread_local! {
 /// this rule: a missing edge is one more finding a reader sees, never a hidden
 /// one. No function-like macro in any corpus measured here comes within two
 /// orders of magnitude of it.
-const C_MACRO_BODY_MAX_BYTES: usize = 64 * 1024;
+pub(crate) const C_MACRO_BODY_MAX_BYTES: usize = 64 * 1024;
+
+/// Parse a C-family fragment that exists only in memory — a macro body, or a
+/// macro invocation's expansion — with `lang`'s grammar, on this thread's
+/// reused probe parser.
+pub(crate) fn parse_c_probe(lang: &str, text: &str) -> Option<tree_sitter::Tree> {
+    let (grammar, language) = grammar_for(lang)?;
+    C_MACRO_PROBE_PARSER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.as_ref().is_none_or(|(held, _)| *held != grammar) {
+            let mut parser = Parser::new();
+            if parser.set_language(&language).is_err() {
+                return None;
+            }
+            *slot = Some((grammar, parser));
+        }
+        slot.as_mut()
+            .and_then(|(_, parser)| parser.parse(text, None))
+    })
+}
 
 /// Most probe-tree nodes one macro body is walked for.
 const C_MACRO_PROBE_MAX_NODES: usize = 50_000;
@@ -5785,9 +5837,6 @@ fn extract_c_macro_body_calls(
             }
         }
     }
-    let Some((grammar, language)) = grammar_for(lang) else {
-        return;
-    };
     let body = raw
         .replace("\\\r\n", "\n")
         .replace("\\\n", "\n")
@@ -5797,19 +5846,7 @@ fn extract_c_macro_body_calls(
         body.clone(),
         format!("void {C_MACRO_PROBE}() {{\n{body}\n}}\n"),
     ] {
-        let parsed = C_MACRO_PROBE_PARSER.with(|cell| {
-            let mut slot = cell.borrow_mut();
-            if slot.as_ref().is_none_or(|(held, _)| *held != grammar) {
-                let mut parser = Parser::new();
-                if parser.set_language(&language).is_err() {
-                    return None;
-                }
-                *slot = Some((grammar, parser));
-            }
-            slot.as_mut()
-                .and_then(|(_, parser)| parser.parse(&probe, None))
-        });
-        let Some(tree) = parsed else {
+        let Some(tree) = parse_c_probe(lang, &probe) else {
             continue;
         };
         collect_c_probe_calls(tree.root_node(), &probe, &parameters, &mut found);
@@ -7814,7 +7851,7 @@ fn is_r_binding_target(node: Node) -> bool {
     }
 }
 
-fn is_user_ident(name: &str) -> bool {
+pub(crate) fn is_user_ident(name: &str) -> bool {
     let Some(first) = name.chars().next() else {
         return false;
     };
@@ -8315,7 +8352,7 @@ fn walk_overran() -> bool {
 /// checking nothing. Either one means the result is not a complete read of the
 /// file, and a check that could not run must never report what a check that ran
 /// and passed reports.
-fn extraction_overran(deadline: std::time::Instant) -> bool {
+pub(crate) fn extraction_overran(deadline: std::time::Instant) -> bool {
     walk_overran() || std::time::Instant::now() >= deadline
 }
 

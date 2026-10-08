@@ -158,7 +158,7 @@ fn a_global_stylesheet_rule_answers_a_component_that_names_it() {
     assert!(
         matches!(
             edge.resolution.as_deref(),
-            Some(Resolution::UniqueSelector { .. })
+            Some(Resolution::UniqueNamespaced { .. })
         ),
         "the evidence must say it was the only declaration: {:?}",
         edge.resolution

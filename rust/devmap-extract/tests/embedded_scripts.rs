@@ -828,9 +828,12 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // extraction-recall and metal-kernels both stamped 75 on payloads that
     // are not this one.
     //
-    // v76 is v73, v74 and v75 together.
+    // v76 is v73, v74 and the literal half of v75 together.
+    //
+    // v77 adds macro-stamped C-family functions (Metal kernels stamped by a
+    // `KERNEL(name, …)` table) and `EntryName` string references.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "76",
+        EXTRACTION_SCHEMA_VERSION, "77",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

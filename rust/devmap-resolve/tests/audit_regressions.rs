@@ -60,7 +60,7 @@ fn entitled_confidence(resolution: &Resolution) -> Confidence {
         // A markup or stylesheet identity declared in exactly one file, reached
         // from another. Same evidence, same tier: one declaration of the name,
         // nothing tying it to this file.
-        Resolution::UniqueSelector { .. } => Confidence::HIGH,
+        Resolution::UniqueNamespaced { .. } => Confidence::HIGH,
         Resolution::LanguageServer { .. } => Confidence::HIGH,
         Resolution::AmbiguousGlobal { .. } => Confidence::SPECULATIVE,
         Resolution::LanguageServerDispatch { .. } => Confidence::SPECULATIVE,
@@ -184,7 +184,7 @@ fn every_edge_confidence_matches_the_evidence_it_names() {
             Resolution::ReceiverType { .. } => "ReceiverType",
             Resolution::LanguageServer { .. } => "LanguageServer",
             Resolution::UniqueGlobal { .. } => "UniqueGlobal",
-            Resolution::UniqueSelector { .. } => "UniqueSelector",
+            Resolution::UniqueNamespaced { .. } => "UniqueNamespaced",
             Resolution::AmbiguousGlobal { .. } => "AmbiguousGlobal",
             Resolution::LanguageServerDispatch { .. } => "LanguageServerDispatch",
             Resolution::Unresolved { .. } => "Unresolved",

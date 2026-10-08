@@ -239,6 +239,16 @@ pub struct Resolver {
     /// coarser answer. Kept apart, the only thing that can answer a selector is
     /// a markup or stylesheet declaration.
     selector_symbols: BTreeMap<String, Vec<SelectorDeclaration>>,
+    /// Entry points a runtime dispatches by name — Metal `kernel`, `vertex` and
+    /// `fragment` functions, plain or stamped by a macro — by bare name, to the
+    /// files that declare them, deduplicated and sorted.
+    ///
+    /// The only thing that can answer a [`ReferenceKind::EntryName`], and kept
+    /// out of `symbol_index` for the reason `selector_symbols` is: a string
+    /// naming `"reduce"` is not a reference to every `fn reduce`, and only a
+    /// declaration the runtime itself looks up by name is a target a string can
+    /// mean.
+    entry_names: BTreeMap<String, Vec<String>>,
     /// Every indexed file, grouped by its parent directory, each group sorted.
     ///
     /// Three call sites answered "which files sit directly in this directory"
@@ -570,6 +580,7 @@ impl Resolver {
             symbol_index: BTreeMap::new(),
             file_symbols: BTreeMap::new(),
             selector_symbols: BTreeMap::new(),
+            entry_names: BTreeMap::new(),
             files_by_dir: BTreeMap::new(),
             py_files_by_name: BTreeMap::new(),
             path_module_bindings: BTreeMap::new(),
@@ -2246,6 +2257,7 @@ impl Resolver {
         self.symbol_index.clear();
         self.file_symbols.clear();
         self.selector_symbols.clear();
+        self.entry_names.clear();
         self.files_by_dir.clear();
         self.py_files_by_name.clear();
         self.path_module_bindings.clear();
@@ -2404,6 +2416,7 @@ impl Resolver {
                 file_syms.push(sym.name.clone());
             }
             self.file_symbols.insert(ext.file_path.clone(), file_syms);
+            self.index_entry_names(ext);
             for (scope, local) in &ext.scope_locals {
                 self.scope_locals
                     .insert((ext.file_path.clone(), scope.clone(), local.clone()));
@@ -4242,6 +4255,16 @@ impl Resolver {
                         if let Some(edge) = self.resolve_selector_reference(ext, reference) {
                             edges.push(edge);
                         }
+                        continue;
+                    }
+                    // A string naming a runtime entry point, answered from
+                    // `entry_names` and by nothing else — and silent when that
+                    // finds nothing, because an identifier-shaped string is
+                    // almost always a key, a label or a message. Recording each
+                    // as a failed code attribution would bury the defect tier
+                    // under literals no declaration was ever meant to answer.
+                    if reference.kind == ReferenceKind::EntryName {
+                        edges.extend(self.resolve_entry_name_reference(ext, reference));
                         continue;
                     }
                     if let Some(edge) = self.resolve_name_reference(ext, family, reference) {
@@ -7123,7 +7146,7 @@ impl Resolver {
             let target = declaring[0].file.clone();
             (
                 target.clone(),
-                Resolution::UniqueSelector {
+                Resolution::UniqueNamespaced {
                     target_symbol: reference.name.clone(),
                     target_file: target,
                 },
@@ -7132,6 +7155,93 @@ impl Resolver {
             return None;
         };
         Some(self.reference_edge(ext, &target_file, &reference.name, reference, resolution))
+    }
+
+    /// Every Metal shader entry point `ext` declares, into `entry_names`. See
+    /// [`Extraction::metal_entry_points`] — a shader's private helper, which the
+    /// host can never look up, is never a target.
+    fn index_entry_names(&mut self, ext: &Extraction) {
+        for symbol in ext.metal_entry_points() {
+            let declaring = self.entry_names.entry(symbol.name.clone()).or_default();
+            if let Err(at) = declaring.binary_search(&ext.file_path) {
+                declaring.insert(at, ext.file_path.clone());
+            }
+        }
+    }
+
+    /// Resolve one [`ReferenceKind::EntryName`] against runtime entry points
+    /// only.
+    ///
+    /// One rung: **exactly one file declares an entry point of that name.** A
+    /// runtime library is built from every shader source together, and two
+    /// files declaring one name would not link, so two candidates mean the
+    /// index holds two libraries — a tuning copy beside the real kernels, say —
+    /// and which one this string loads is not in the source. That is no edge,
+    /// as it is for a selector two components scope.
+    ///
+    /// **Who names it.** A string inside a function is that function's. One in
+    /// a `const` or `static` initializer (`assigned_to` names the item) is
+    /// dispatched by whatever reads the item: when the item is itself a symbol
+    /// — a `pub const` — it is the source, and the reads already edge to it;
+    /// when it is not — a private const, which the extractor does not emit —
+    /// each function in this file that reads it is a source, since a private
+    /// item has no reader anywhere else. A string nothing narrower owns stays
+    /// with the file.
+    fn resolve_entry_name_reference(
+        &self,
+        ext: &Extraction,
+        reference: &ExtractedReference,
+    ) -> Vec<ResolvedEdge> {
+        let Some([target_file]) = self.entry_names.get(&reference.name).map(Vec::as_slice) else {
+            return Vec::new();
+        };
+        let edge = |source: &ExtractedReference| {
+            let resolution = Resolution::UniqueNamespaced {
+                target_symbol: reference.name.clone(),
+                target_file: target_file.clone(),
+            };
+            self.reference_edge(ext, target_file, &reference.name, source, resolution)
+        };
+        let item = reference
+            .assigned_to
+            .as_deref()
+            .filter(|_| reference.enclosing_symbol.is_none());
+        let Some(item) = item else {
+            return vec![edge(reference)];
+        };
+        let item_symbol = format!("{}::{item}", ext.file_path);
+        if ext
+            .symbols
+            .iter()
+            .any(|symbol| symbol.qualified_name == item_symbol)
+        {
+            let mut owned = reference.clone();
+            owned.enclosing_symbol = Some(item_symbol);
+            return vec![edge(&owned)];
+        }
+        let mut readers: Vec<&str> = ext
+            .references
+            .iter()
+            .filter(|read| {
+                read.kind == ReferenceKind::Name
+                    && read.name == item
+                    && matches!(read.receiver_expr.as_deref(), None | Some("Self"))
+            })
+            .filter_map(|read| read.enclosing_symbol.as_deref())
+            .collect();
+        readers.sort_unstable();
+        readers.dedup();
+        if readers.is_empty() {
+            return vec![edge(reference)];
+        }
+        readers
+            .into_iter()
+            .map(|reader| {
+                let mut owned = reference.clone();
+                owned.enclosing_symbol = Some(reader.to_string());
+                edge(&owned)
+            })
+            .collect()
     }
 
     /// Whether a selector may reach a declaration in *another* file at all.

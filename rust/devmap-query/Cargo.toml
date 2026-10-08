@@ -274,6 +274,10 @@ name = "a_wrapped_callback_is_a_function"
 required-features = ["parse"]
 
 [[test]]
+name = "a_kernel_is_reached_from_its_host_by_name"
+required-features = ["parse"]
+
+[[test]]
 name = "a_walk_names_only_the_gaps_it_touches"
 required-features = ["parse"]
 

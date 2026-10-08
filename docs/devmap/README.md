@@ -844,13 +844,17 @@ sibling service.
 ```bash
 devmap workspace add ../other-service
 devmap workspace search Handler     # every registered repository at once
-devmap workspace links              # cross-repo import candidates
+devmap workspace links              # cross-repo import and kernel-name candidates
 ```
 
 Cross-repository edges are *candidates with evidence*, never name matches. Two
 repositories routinely declare the same `New`, `Client` or `get`, and joining on
 the name would manufacture edges at a scale that makes the graph worse rather
-than larger.
+than larger. Two relations qualify: an import of a module another repository
+declares (`kind: import`), and a string naming a Metal entry point exactly one
+file in another repository declares (`kind: entry_name`, with `from_symbol` and
+`to_symbol`) — a host dispatching a sibling crate's kernel, as ojas and
+qd-metal do with tessl's.
 
 ## Languages
 
@@ -899,6 +903,34 @@ guesses:
   reader follows, so it can prove a name is used and cannot prove one is not.
   Both kinds are therefore exempt from dead-symbol analysis; Svelte's own
   compiler reports unused selectors from inside the compilation that knows.
+
+### GPU kernels and the hosts that name them
+
+A Metal kernel has no call site: the host looks it up by name —
+`rt.pipeline("mlp_silu")`, `makeFunction(name:)`, `newFunctionWithName:` — so its
+blast radius is only graphable through that string.
+
+- **Every kernel is a symbol.** A `kernel`, `vertex` or `fragment` function is a
+  `Function` with a runtime-entry annotation, including one stamped by a macro
+  the same file defines: `ROWS_KERNEL(flash_attn_rows_h256_r16_g32, 256, 16, 32)`
+  is expanded the way the preprocessor does it and indexed at the invocation's
+  line, calling the macro, so a macro edit reaches every kernel it stamps.
+- **A host's name string is an `EntryName` reference.** Any identifier-shaped
+  string literal in Rust, Swift, Objective-C, C, C++, CUDA or Python, owned by
+  its function — or, at the top level, by whatever reads the constant it
+  initializes. It resolves only against Metal entry points, never against an
+  ordinary function of the same name, and only when exactly one file declares
+  that name.
+- **Metal is reported as Metal.** It is parsed by the C++ grammar, and
+  `resolution_rate` gives it its own row rather than folding it into `cpp`.
+
+Limits, stated because each is a place the extractor abstains:
+
+- A macro defined in an included header is not expanded, so a kernel it stamps
+  stays unnamed. None of tessl, ojas or Lappi-decision does this; MLX does, and
+  also names its kernels through `[[host_name("…")]]`, which is not read.
+- A name assembled at run time (`format!("rows_h{d}")`) names nothing, and a
+  name declared by two shader files links to neither.
 
 A file whose language has no grammar still contributes a node, plus any symbols
 that tier can recover — labelled `RegexFallback` and never mixed in with parsed

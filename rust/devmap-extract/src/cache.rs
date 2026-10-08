@@ -553,12 +553,23 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// v75 records string literals and, for a Rust module-level const, the uses
 /// of that const. A cached row without them answers "no writer" for a
 /// string-keyed protocol. The extraction-recall lane stamped `"75"` on a
-/// payload that did not yet include v73, and the metal-kernels lane stamped
-/// the same number on the kernel payload. Neither row is this payload.
+/// payload that did not yet include v73. The metal-kernels lane stamped the
+/// same number on the kernel payload below. Neither row is this payload.
 ///
-/// v76 is v73, v74 and v75 together. A row stamped 73, 74 or 75 lacks at
-/// least one of them, so none of those identities may be served warm.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "76";
+/// v76 is v73, v74 and the literal half of v75 together, without the kernel
+/// producers. A row stamped 76 lacks those producers.
+///
+/// v77 adds them: a C-family function stamped by one of its file's own
+/// function-like macros (`ROWS_KERNEL(flash_attn_rows_h256_r16_g32, 256, 16,
+/// 32)`) is a `Function` symbol at the invocation, with the shader-entry
+/// annotation its expansion earns and a call to the macro; and every
+/// identifier-shaped string literal in a Metal host language (Rust, Swift,
+/// Objective-C, C, C++, CUDA, Python) is an `EntryName` reference, bound to
+/// the top-level constant it initializes when it is outside a function, which
+/// the resolver joins to a Metal entry point of that name. Served warm, a row
+/// without them leaves every macro-stamped kernel unsearchable and every
+/// `pipeline("…")` host unlinked.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "77";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
