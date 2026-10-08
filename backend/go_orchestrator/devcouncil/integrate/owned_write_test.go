@@ -10,27 +10,29 @@ import (
 // `.codex/config.toml` is the user's Codex configuration. `integrate codex
 // --apply` replaced it with a one-line comment, deleting every
 // `[mcp_servers.*]` table the user had, and registered nothing in exchange.
+// It now gains DevCouncil's server, and every byte that was there survives.
 func TestApplyKeepsAnExistingCodexConfigByteForByte(t *testing.T) {
+	bin := devmapForTest(t)
 	root := t.TempDir()
 	path := filepath.Join(root, ".codex", "config.toml")
 	mustMkdirAll(t, filepath.Dir(path))
-	prior := "model = \"o3\"\n\n[mcp_servers.mine]\ncommand = \"/opt/mine\"\nargs = [\"serve\"]\n"
+	prior := "# mine\nmodel = \"o3\"\n\n[mcp_servers.mine]\ncommand = \"/opt/mine\"\nargs = [\"serve\"]\n"
 	if err := os.WriteFile(path, []byte(prior), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// A DevMap that does nothing: this test is about what the Go adapter
-	// writes, and must not reach a real `devmap` on PATH or the user's home.
-	_, runErr := Run(Options{Root: root, Host: "codex", Mode: ModeApply, DevmapBin: trueBinary(t)})
+	receipt := apply(t, bin, root, "codex")
 	got, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != prior {
-		t.Fatalf("apply rewrote the user's Codex config (err=%v):\n--- before\n%s--- after\n%s", runErr, prior, got)
+	if !strings.HasPrefix(string(got), prior) {
+		t.Fatalf("apply rewrote the user's Codex config:\n--- before\n%s--- after\n%s", prior, got)
 	}
-	// Kept intact by a refusal, which must then be a failure the caller sees.
-	if runErr == nil {
-		t.Fatal("apply reported success without registering anything in the existing config")
+	if !strings.Contains(string(got), "[mcp_servers.devcouncil]") || !strings.Contains(string(got), fakeSelf) {
+		t.Fatalf("no DevCouncil server registered:\n%s", got)
+	}
+	if receipt.Files[".codex/config.toml"] != "wrote" {
+		t.Fatalf("receipt does not record the write: %v", receipt.Files)
 	}
 }
 
@@ -101,15 +103,4 @@ func TestCursorRuleReplacesOnlyARuleDevCouncilWrote(t *testing.T) {
 			}
 		})
 	}
-}
-
-func trueBinary(t *testing.T) string {
-	t.Helper()
-	for _, candidate := range []string{"/usr/bin/true", "/bin/true"} {
-		if _, err := os.Stat(candidate); err == nil {
-			return candidate
-		}
-	}
-	t.Skip("no `true` binary to stand in for devmap")
-	return ""
 }

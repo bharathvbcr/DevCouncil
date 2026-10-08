@@ -989,11 +989,44 @@ func assertShape[T any](command string, items []T) error {
 // complete. Callers that have nothing to say about stderr ignore it; the ones
 // that do run it through readNotices.
 func (c *Client) decode(ctx context.Context, into any, timeout time.Duration, args ...string) (said, error) {
+	out, err := c.invoke(ctx, timeout, nil, args...)
+	if err != nil {
+		return said{}, err
+	}
+	if out.runErr != nil {
+		return said{}, out.failure(args[0])
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(out.stdout), into); err != nil {
+		return said{}, fmt.Errorf("devmap %s returned unparseable output: %w", args[0], err)
+	}
+	return out.stderr, nil
+}
+
+// invocation is one finished run: its bounded stdout, its notices, and how it
+// exited. A non-zero exit is carried rather than returned, because some
+// commands (`integrate --check`) answer with a report *and* a failing status.
+type invocation struct {
+	stdout []byte
+	stderr said
+	runErr error
+}
+
+// failure names a non-zero exit with the most useful text the run produced.
+func (o invocation) failure(command string) error {
+	detail := bytes.TrimSpace(o.stderr.text)
+	if len(detail) == 0 {
+		detail = bytes.TrimSpace(o.stdout)
+	}
+	return fmt.Errorf("devmap %s failed: %w (%s)", command, o.runErr, detail)
+}
+
+// invoke runs one bounded `devmap --json …`, with stdin when given.
+func (c *Client) invoke(ctx context.Context, timeout time.Duration, stdin []byte, args ...string) (invocation, error) {
 	if c.Binary == "" {
-		return said{}, errors.New("no devmap binary configured")
+		return invocation{}, errors.New("no devmap binary configured")
 	}
 	if c.Root == "" {
-		return said{}, errors.New("no repository root configured")
+		return invocation{}, errors.New("no repository root configured")
 	}
 	if timeout <= 0 {
 		timeout = 30 * time.Second
@@ -1006,6 +1039,9 @@ func (c *Client) decode(ctx context.Context, into any, timeout time.Duration, ar
 	// See proc.ConfigureGroup: the deadline must reach the whole group.
 	proc.ConfigureGroup(cmd)
 	cmd.Dir = c.Root
+	if stdin != nil {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
 	outLimit, errLimit := c.maxOutput, c.maxStderr
 	if outLimit <= 0 {
 		outLimit = defaultMaxOutput
@@ -1040,7 +1076,7 @@ func (c *Client) decode(ctx context.Context, into any, timeout time.Duration, ar
 	// a partial answer read out of one would be worse than the timeout.
 	runErr, timedOut := proc.RunBounded(ctx, cmd.Run)
 	if timedOut {
-		return said{}, fmt.Errorf("devmap %s did not return within %s (the process could not be started or reaped): %w",
+		return invocation{}, fmt.Errorf("devmap %s did not return within %s (the process could not be started or reaped): %w",
 			args[0], timeout, ctx.Err())
 	}
 	// Checked before runErr, and this order is the fix. Breaking the pipe is
@@ -1048,18 +1084,12 @@ func (c *Client) decode(ctx context.Context, into any, timeout time.Duration, ar
 	// reporting that as "devmap status failed: signal: broken pipe" would send
 	// an operator to look at the wrong thing entirely.
 	if stdout.truncated {
-		return said{}, fmt.Errorf("devmap %s produced more than %d bytes and was stopped; "+
+		return invocation{}, fmt.Errorf("devmap %s produced more than %d bytes and was stopped; "+
 			"a partial answer is not a short one", args[0], outLimit)
 	}
-	if runErr != nil {
-		detail := bytes.TrimSpace(stderr.Bytes())
-		if len(detail) == 0 {
-			detail = bytes.TrimSpace(stdout.Bytes())
-		}
-		return said{}, fmt.Errorf("devmap %s failed: %w (%s)", args[0], runErr, detail)
-	}
-	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), into); err != nil {
-		return said{}, fmt.Errorf("devmap %s returned unparseable output: %w", args[0], err)
-	}
-	return said{text: stderr.Bytes(), truncated: stderr.truncated, limit: errLimit}, nil
+	return invocation{
+		stdout: stdout.Bytes(),
+		stderr: said{text: stderr.Bytes(), truncated: stderr.truncated, limit: errLimit},
+		runErr: runErr,
+	}, nil
 }

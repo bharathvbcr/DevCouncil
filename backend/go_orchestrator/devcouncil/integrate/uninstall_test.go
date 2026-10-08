@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -185,25 +186,26 @@ func TestUninstallRefusesUnparsableSettings(t *testing.T) {
 	}
 }
 
-// integrate cursor --apply must not put a hook config back.
-func TestIntegrateCursorWritesNoHooksFile(t *testing.T) {
+// integrate cursor --apply must not put a DevCouncil hook back. DevMap
+// writes its own marker-owned `.cursor/hooks.json`; nothing in it may be a
+// DevCouncil lifecycle hook, which are retired.
+func TestIntegrateCursorWritesNoDevCouncilHook(t *testing.T) {
+	bin := devmapForTest(t)
 	root := t.TempDir()
-	repo, err := os.OpenRoot(root)
-	if err != nil {
-		t.Fatalf("OpenRoot: %v", err)
-	}
-	defer repo.Close()
-	receipt := &Receipt{Host: "cursor", Mode: string(ModeApply), Files: map[string]string{}}
-	if err := integrateCursor(repo, root, "/bin/true", ModeApply, receipt); err != nil {
-		t.Fatalf("integrateCursor: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(root, ".cursor", "hooks.json")); !os.IsNotExist(err) {
-		t.Fatalf("integrate wrote .cursor/hooks.json (stat err %v)", err)
-	}
-	if _, present := receipt.Files[".cursor/hooks.json"]; present {
-		t.Fatalf("receipt still claims a hooks file: %#v", receipt.Files)
-	}
+	receipt := apply(t, bin, root, "cursor")
 	if receipt.Files[".cursor/mcp.json"] != "wrote" {
 		t.Fatalf("mcp.json not written: %#v", receipt.Files)
+	}
+	body, err := os.ReadFile(filepath.Join(root, ".cursor", "hooks.json"))
+	if os.IsNotExist(err) {
+		return
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, retired := range []string{"devcouncil hook", "dev hook", fakeSelf} {
+		if strings.Contains(string(body), retired) {
+			t.Fatalf(".cursor/hooks.json carries a DevCouncil hook (%q):\n%s", retired, body)
+		}
 	}
 }

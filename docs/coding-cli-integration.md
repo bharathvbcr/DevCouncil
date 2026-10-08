@@ -8,9 +8,10 @@ reloaded or trusted them. [Documentation index](README.md)
 ## Standalone DevMap
 
 Both native installers accept `cursor`, `claude`, `codex`, `antigravity`,
-`opencode` and `warp`. The source authority is the Rust `Host` enum and Go
-`integrate.Hosts`; unknown names and the legacy `gemini` / `aider` targets are
-refused by these adapters. This is the repository's adapter set, not a claim
+`opencode` and `warp`. The one source is the Rust `Host` enum; `devcouncil
+integrate` hands every host name to `devmap integrate`, which refuses unknown
+names with the list, and the Go host itself answers the legacy `gemini` /
+`aider` targets with where they went. This is the repository's adapter set, not a claim
 about every host's current capabilities.
 
 From the target repository:
@@ -88,27 +89,23 @@ devcouncil integrate cursor --apply
 devcouncil integrate cursor --check
 ```
 
-The Go adapter merges the `devcouncil` server and invokes DevMap integration
-when a usable binary is found. Inspect `spawned` and `notes`; a Go receipt alone
-is not proof that every DevMap asset is installed. The `devmap` entry in
-`.cursor/mcp.json` and `.mcp.json` is written only by `devmap integrate`,
-which pins it with `--root` and, for Claude, withholds it from both
-`~/.claude.json` and `.mcp.json` while the enabled Dev Map plugin registers
-the server. `--check` spawns nothing, so it does not examine DevMap assets;
-run `devmap integrate <host> --check` for those.
+`devcouncil integrate <host>` runs `devmap integrate <host> --servers-stdin`
+and passes it the `devcouncil` server: this binary by absolute path, `mcp`, and
+`DEVCOUNCIL_PROJECT_ROOT`. DevMap writes that entry into the host's project
+document in the host's own shape, beside its own `devmap` entry, and reports
+every file it examined; the Go receipt is that report. It needs a `devmap`
+(`--devmap-bin`, `DEVMAP_BIN`, or one on `PATH` outside the repository) and
+refuses without one. `--check` asks DevMap too, so it covers DevMap's assets.
+See [the ownership decision](architecture.md#host-integration-and-skill-installation-one-owner).
 
-| Host | Go-owned configuration |
+| Host | Where the `devcouncil` server is registered |
 |---|---|
-| Cursor | The `devcouncil` entry in `.cursor/mcp.json`, and `.cursor/rules/devcouncil.mdc` |
-| Claude | The `devcouncil` entry in `.mcp.json` |
-| Codex | A comment-only project `.codex/config.toml` adapter; this does not register the Go host's task server |
+| Cursor | `.cursor/mcp.json`; Go also writes `.cursor/rules/devcouncil.mdc` |
+| Claude | `.mcp.json` |
+| Codex | Project `.codex/config.toml` (`[mcp_servers.devcouncil]`, read for trusted projects); every other byte of the file is kept |
 | Antigravity | `.agents/mcp_config.json` |
 | OpenCode | `opencode.json` |
 | Warp | `.devcouncil/integrations/warp-mcp.json` |
-
-Codex's DevMap registration is implemented in the Rust integrator. Do not
-confuse that with complete Go-host task MCP setup for Codex. Use the host's
-current documented MCP setup for any additional manual registration.
 
 The Go host serves checkout, renew/release lease, next task, diff, gaps,
 verification and write-policy checks. It does not serve arbitrary file-edit
@@ -123,8 +120,9 @@ ordinary editor writes, and `--write-gate` is no longer supported.
 
 Use `devcouncil skills list` and `devcouncil skills scaffold --dry-run` to inspect
 the Go host's engineering skills. Embedded instructions can retain migration
-limits; they are guidance, not a permissions mechanism. DevMap integration
-installs its own navigation skills through the existing managed installer.
+limits; they are guidance, not a permissions mechanism. Both skill sets go
+through one installer: `devcouncil skills scaffold` hands its library to
+`devmap skills install --library-stdin`, which owns `.devcouncil-skills.json`.
 
 Reload the host after updating a binary or configuration. For Codex hook
 assets, the generated receipt calls out the host trust step; changing a hook

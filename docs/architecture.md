@@ -34,7 +34,41 @@ flowchart TD
 ```
 
 The diagram describes implemented interfaces, not a claim that every consumer
-uses every edge. Manvi owns its agent loop and provider orchestration. GitPulse
+uses every edge.
+
+### Host integration and skill installation: one owner
+
+**Decision (2026-10-08, owner): `devmap integrate` and `devmap skills install`
+own host integration and skill installation; the Go host delegates.**
+
+- **Host list and per-host documents.** The Rust `integrate::Host` enum is the
+  only host list, and `Host::project_document` in
+  [`rust/devmap-cli/src/integrate.rs`](../rust/devmap-cli/src/integrate.rs)
+  is the only table of where each host keeps its project MCP servers and how
+  that document is shaped (JSON container, OpenCode's argv entries, Codex's
+  TOML). `devcouncil integrate <host>` sends its own `devcouncil` server to
+  `devmap integrate <host> --servers-stdin` as JSON
+  (`{"servers": [{name, command, args, env, cwd}]}`), and DevMap writes it
+  through that table beside its own entry. Codex's project
+  `.codex/config.toml` is merged without rewriting any byte outside the
+  `[mcp_servers.devcouncil]` table, or refused.
+- **Skill receipt.** `.devcouncil-skills.json` and its lock have one writer,
+  [`rust/devmap-cli/src/skills.rs`](../rust/devmap-cli/src/skills.rs).
+  `devcouncil skills scaffold` loads its embedded domain-skill library and sends
+  it to `devmap skills install --library-stdin`; Go no longer contains an
+  installer. The receipt bytes are pinned by `the_receipt_format_is_pinned`.
+- **What stays in Go.** DevCouncil's own facts: which host names it retired and
+  why, what its server runs, and the one file it owns outright —
+  `.cursor/rules/devcouncil.mdc`, replaced only when the copy on disk is one
+  DevCouncil wrote.
+- **Consequences.** `devcouncil integrate` and `devcouncil skills scaffold`
+  need a `devmap` (`--devmap-bin`, `DEVMAP_BIN`, or `PATH` outside the
+  repository) and refuse without one rather than reporting a partial install.
+  `devcouncil integrate --check` now asks DevMap and reports per-file drift.
+
+Before this, both languages carried a host list, a per-host document table and
+an installer for the same receipt, kept in step by Go tests that parsed the
+Rust source. The decision removes the second copies instead of pinning them. Manvi owns its agent loop and provider orchestration. GitPulse
 composes Manvi with selected DevCouncil components; those consumers have their
 own versions and qualification requirements.
 

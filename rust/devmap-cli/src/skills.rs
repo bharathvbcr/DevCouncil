@@ -1,8 +1,12 @@
-//! Install the five embedded DevMap skills into host skill directories.
+//! Install skills into host skill directories: DevMap's five embedded ones, or
+//! a library a caller passes on stdin.
 //!
-//! Port of the DevMap-only path of `src/devcouncil/skills/registry.py`
-//! `scaffold_skills`: receipt, unowned-file refusal, byte bounds, lock timeout.
-//! Domain skills stay with DevCouncil's installer until Phase 4.
+//! This is the one writer of `.devcouncil-skills.json` and its lock. DevCouncil's
+//! Go host used to carry a second installer writing the same receipt; it now
+//! hands its embedded domain-skill library to `devmap skills install
+//! --library-stdin`, so the receipt has one format because it has one author.
+//! Receipt, unowned-file refusal, byte bounds and the lock timeout are ported
+//! from the retired Python `scaffold_skills`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -45,10 +49,97 @@ pub struct SkillInstallReport {
     pub check_ok: bool,
 }
 
+/// Bound on a `--library-stdin` document: the 8 MiB batch bound plus room for
+/// JSON escaping.
+pub const MAX_LIBRARY_BYTES: usize = 2 * MAX_BATCH_BYTES;
+const MAX_SKILLS: usize = 256;
+
+/// One skill to install as `<destination>/<name>/SKILL.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Skill {
+    pub name: String,
+    pub content: Vec<u8>,
+}
+
+/// Parse `{"skills": [{"name": "...", "content": "..."}]}`.
+///
+/// Names and sizes are validated by the installer, before anything is
+/// written; this only refuses a document it cannot read as a library.
+pub fn parse_library(bytes: &[u8]) -> anyhow::Result<Vec<Skill>> {
+    if bytes.len() > MAX_LIBRARY_BYTES {
+        bail!("skill library exceeds {MAX_LIBRARY_BYTES} bytes");
+    }
+    let document: Value =
+        serde_json::from_slice(bytes).map_err(|err| anyhow!("skill library is not JSON: {err}"))?;
+    let object = document
+        .as_object()
+        .ok_or_else(|| anyhow!("skill library must be a JSON object"))?;
+    if let Some(key) = object.keys().find(|key| key.as_str() != "skills") {
+        bail!("skill library: unknown key {key:?}");
+    }
+    let entries = object
+        .get("skills")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("skill library needs a `skills` array"))?;
+    entries
+        .iter()
+        .map(|entry| {
+            let fields = entry
+                .as_object()
+                .ok_or_else(|| anyhow!("each skill must be a JSON object"))?;
+            if let Some(key) = fields
+                .keys()
+                .find(|key| !matches!(key.as_str(), "name" | "content"))
+            {
+                bail!("skill: unknown key {key:?}");
+            }
+            let text = |key: &str| {
+                fields
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("skill needs a string `{key}`"))
+            };
+            Ok(Skill {
+                name: text("name")?.to_string(),
+                content: text("content")?.as_bytes().to_vec(),
+            })
+        })
+        .collect()
+}
+
 /// Install the five embedded DevMap skills under each destination.
 pub fn install_devmap_skills(
     project_root: &Path,
     destinations: &[&str],
+    dry_run: bool,
+    check: bool,
+) -> anyhow::Result<SkillInstallReport> {
+    let skills: Vec<Skill> = PLUGIN_SKILLS
+        .iter()
+        .map(|(name, body)| {
+            let mut text = (*body).to_string();
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+            Skill {
+                name: (*name).to_string(),
+                content: text.into_bytes(),
+            }
+        })
+        .collect();
+    install_skills(project_root, destinations, &skills, dry_run, check)
+}
+
+/// Install `skills` under each destination, all or nothing.
+///
+/// Every name, path and size is checked, and every destination planned, before
+/// the first write: several agent hosts share one corpus, and a run that
+/// upgrades one host and then refuses the next leaves them disagreeing about
+/// what the guidance says.
+pub fn install_skills(
+    project_root: &Path,
+    destinations: &[&str],
+    skills: &[Skill],
     dry_run: bool,
     check: bool,
 ) -> anyhow::Result<SkillInstallReport> {
@@ -64,21 +155,20 @@ pub fn install_devmap_skills(
     if destinations.is_empty() || destinations.len() > MAX_DESTINATIONS {
         bail!("Skill install limit: 1–{MAX_DESTINATIONS} destinations");
     }
-    if PLUGIN_SKILLS.len() > 256 {
-        bail!("Skill install limit: at most 256 skills");
+    if skills.len() > MAX_SKILLS {
+        bail!("Skill install limit: at most {MAX_SKILLS} skills");
     }
 
     let mut rendered: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::new();
     for rel in destinations {
         validate_relative(&root, rel)?;
     }
-    for (name, body) in PLUGIN_SKILLS {
+    let mut names = std::collections::BTreeSet::new();
+    for Skill { name, content } in skills {
         validate_skill_name(name)?;
-        let mut text = (*body).to_string();
-        if !text.ends_with('\n') {
-            text.push('\n');
+        if !names.insert(name.as_str()) {
+            bail!("Conflicting duplicate skill name: {name}");
         }
-        let content = text.into_bytes();
         if content.len() > SKILL_FILE_LIMIT {
             bail!("{name}: skill exceeds byte limit");
         }
@@ -146,7 +236,8 @@ pub fn install_devmap_skills(
 }
 
 fn validate_skill_name(name: &str) -> anyhow::Result<()> {
-    let ok = name.len() <= 64
+    let ok = !name.is_empty()
+        && name.len() <= 64
         && name.chars().enumerate().all(|(i, c)| match (i, c) {
             (0, c) => c.is_ascii_lowercase() || c.is_ascii_digit(),
             (_, c) => c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-',
@@ -523,5 +614,416 @@ mod tests {
             "{err}"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Library installs (`--library-stdin`) -----------------------------
+    //
+    // Ported from DevCouncil's Go installer (`devcouncil/skills/delivery_test.go`),
+    // retired when it began handing its library here. The through-line is that
+    // a refusal happens before any destination is touched.
+
+    const HOSTS: &[&str] = &[".claude/skills", ".cursor/skills", ".agents/skills"];
+
+    fn example(name: &str, body: &str) -> Skill {
+        Skill {
+            name: name.into(),
+            content: format!("---\nname: {name}\ndescription: Example workflow\n---\n{body}\n")
+                .into_bytes(),
+        }
+    }
+
+    fn entries(root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_library_document_is_read_strictly() {
+        let library = parse_library(br#"{"skills":[{"name":"a","content":"x\n"}]}"#).unwrap();
+        assert_eq!(
+            library,
+            [Skill {
+                name: "a".into(),
+                content: b"x\n".to_vec()
+            }]
+        );
+        for bad in [
+            "{",
+            "[]",
+            "{}",
+            r#"{"skills":[],"more":1}"#,
+            r#"{"skills":[{"name":"a"}]}"#,
+            r#"{"skills":[{"name":"a","content":1}]}"#,
+            r#"{"skills":[{"name":"a","content":"x","extra":1}]}"#,
+        ] {
+            assert!(parse_library(bad.as_bytes()).is_err(), "accepted {bad}");
+        }
+        let oversized = vec![b' '; MAX_LIBRARY_BYTES + 1];
+        assert!(parse_library(&oversized).is_err());
+    }
+
+    #[test]
+    fn unsafe_names_fail_before_any_write() {
+        for name in [
+            "../escape",
+            "/absolute",
+            "a/b",
+            "a\\b",
+            "..",
+            "",
+            "CON",
+            "con",
+            "lpt1",
+            &"a".repeat(65),
+        ] {
+            let root = scratch("unsafe-name");
+            // A valid skill first, so a refusal cannot be "nothing to install".
+            let err = install_skills(
+                &root,
+                HOSTS,
+                &[example("example", "Original"), example(name, "Original")],
+                false,
+                false,
+            );
+            assert!(err.is_err(), "accepted unsafe skill name {name:?}");
+            assert!(entries(&root).is_empty(), "wrote before refusing {name:?}");
+            fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    #[test]
+    fn destinations_stay_inside_the_repository() {
+        for dest in [
+            "../escape",
+            "/absolute",
+            "C:\\escape",
+            "a/../../escape",
+            "a\\..\\escape",
+        ] {
+            let root = scratch("unsafe-dest");
+            assert!(
+                install_skills(&root, &[dest], &[example("example", "x")], false, false).is_err(),
+                "accepted destination {dest:?}"
+            );
+            assert!(entries(&root).is_empty(), "wrote before refusing {dest:?}");
+            fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    #[test]
+    fn conflicting_duplicates_fail_before_any_write() {
+        let root = scratch("duplicate");
+        let err = install_skills(
+            &root,
+            HOSTS,
+            &[
+                example("example", "Original"),
+                example("example", "Different"),
+            ],
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("duplicate"), "{err}");
+        assert!(entries(&root).is_empty());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A user edit in one host directory is not overwritten, and does not cost
+    /// the other hosts a half-applied upgrade.
+    #[test]
+    fn a_managed_upgrade_preserves_user_edits_and_preflights_every_destination() {
+        let root = scratch("upgrade");
+        install_skills(
+            &root,
+            HOSTS,
+            &[example("example", "Original")],
+            false,
+            false,
+        )
+        .unwrap();
+        let edited = root.join(".cursor/skills/example/SKILL.md");
+        fs::write(&edited, "user edit\n").unwrap();
+        let err = install_skills(
+            &root,
+            HOSTS,
+            &[example("example", "Upgraded")],
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unmanaged or locally modified"),
+            "{err}"
+        );
+        assert_eq!(fs::read_to_string(&edited).unwrap(), "user edit\n");
+        for host in [".claude/skills", ".agents/skills"] {
+            let body = fs::read_to_string(root.join(host).join("example/SKILL.md")).unwrap();
+            assert!(
+                body.contains("Original"),
+                "{host} was upgraded before the refusal"
+            );
+        }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn concurrent_installs_converge_without_partial_files() {
+        let root = scratch("concurrent");
+        let chosen: Vec<Skill> = (0..20u8)
+            .map(|i| example(&format!("example-{}", (b'a' + i) as char), "Original"))
+            .collect();
+        let written: usize = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..36)
+                .map(|_| {
+                    scope.spawn(|| {
+                        install_skills(&root, HOSTS, &chosen, false, false)
+                            .unwrap()
+                            .written
+                            .len()
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|w| w.join().unwrap()).sum()
+        });
+        // 20 skills x 3 hosts, each written exactly once across every caller.
+        assert_eq!(written, 60);
+        let again = install_skills(&root, HOSTS, &chosen, false, false).unwrap();
+        assert!(again.written.is_empty(), "a converged tree reported work");
+        let mut installed = 0;
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.file_name().unwrap() == "SKILL.md" {
+                    installed += 1;
+                } else {
+                    assert!(
+                        !path.to_string_lossy().ends_with(".tmp"),
+                        "left a partial file: {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        assert_eq!(installed, 60);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_destination_does_not_redirect_installation() {
+        let base = scratch("symlink");
+        let outside = base.join("outside");
+        let root = base.join("repo");
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".agents")).unwrap();
+        let err =
+            install_skills(&root, HOSTS, &[example("example", "x")], false, false).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(entries(&outside).is_empty(), "followed the link");
+        assert!(
+            !root.join(".claude").exists(),
+            "a refused install wrote another host"
+        );
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn an_oversized_existing_skill_is_refused_by_its_size() {
+        let root = scratch("oversized");
+        let target = root.join(".agents/skills/example/SKILL.md");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::File::create(&target)
+            .unwrap()
+            .set_len(8 * 1024 * 1024)
+            .unwrap();
+        let err =
+            install_skills(&root, HOSTS, &[example("example", "x")], false, false).unwrap_err();
+        assert!(err.to_string().contains("limit"), "{err}");
+        assert!(
+            !root.join(".claude").exists(),
+            "a refused install wrote another host"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A receipt that cannot be read is not a receipt saying "we own these".
+    #[test]
+    fn a_corrupt_receipt_is_not_permission_to_overwrite() {
+        for raw in [
+            "{broken",
+            "[]",
+            r#"{"schema":2,"files":{}}"#,
+            r#"{"schema":true,"files":{}}"#,
+            r#"{"schema":1,"files":{"x":1}}"#,
+        ] {
+            let root = scratch("corrupt-receipt");
+            fs::write(root.join(RECEIPT_REL), raw).unwrap();
+            let err =
+                install_skills(&root, HOSTS, &[example("example", "x")], false, false).unwrap_err();
+            assert!(err.to_string().contains("receipt"), "{raw}: {err}");
+            assert_eq!(
+                entries(&root),
+                [RECEIPT_REL],
+                "{raw}: wrote past a corrupt receipt"
+            );
+            fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// A write that fails partway leaves a tree the next run can finish: no
+    /// receipt claiming files that are not there, and no abandoned lock.
+    #[cfg(unix)]
+    #[test]
+    fn a_partial_io_failure_is_visible_recoverable_and_releases_the_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores the mode bits this injection depends on
+        }
+        let root = scratch("partial");
+        let blocked = root.join(".cursor/skills");
+        fs::create_dir_all(&blocked).unwrap();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o500)).unwrap();
+        let result = install_skills(&root, HOSTS, &[example("example", "x")], false, false);
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            result.is_err(),
+            "an unwritable destination reported success"
+        );
+        assert!(
+            !root.join(LOCK_REL).exists(),
+            "the lock outlived the failure"
+        );
+        assert!(
+            !root.join(RECEIPT_REL).exists(),
+            "a failed install wrote a receipt"
+        );
+
+        let recovered =
+            install_skills(&root, HOSTS, &[example("example", "x")], false, false).unwrap();
+        assert_eq!(
+            recovered.written.len(),
+            1,
+            "recovery should finish only the unwritten host"
+        );
+        let again = install_skills(&root, HOSTS, &[example("example", "x")], false, false).unwrap();
+        assert!(again.written.is_empty(), "recovery did not converge");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The wait is bounded *and* real: a lock refused instantly would pass an
+    /// "it errors" assertion while stealing every concurrent install.
+    #[test]
+    fn a_busy_lock_is_waited_out_within_its_bound_and_not_stolen() {
+        let root = scratch("busy");
+        fs::create_dir(root.join(LOCK_REL)).unwrap();
+        let start = Instant::now();
+        let err =
+            install_skills(&root, HOSTS, &[example("example", "x")], false, false).unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(err.to_string().contains("busy"), "{err}");
+        assert!(elapsed >= LOCK_TIMEOUT, "gave up after {elapsed:?}");
+        assert!(elapsed <= LOCK_TIMEOUT * 4, "waited {elapsed:?}");
+        assert_eq!(
+            entries(&root),
+            [LOCK_REL],
+            "stole the lock or wrote past it"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A held lock does not block a read-only plan: `--dry-run` and `--check`
+    /// answer questions and write nothing.
+    #[test]
+    fn a_dry_run_does_not_wait_on_a_held_lock() {
+        let root = scratch("dry-lock");
+        fs::create_dir(root.join(LOCK_REL)).unwrap();
+        let start = Instant::now();
+        let report = install_skills(&root, HOSTS, &[example("example", "x")], true, false).unwrap();
+        assert!(
+            start.elapsed() < LOCK_TIMEOUT,
+            "a dry run waited on the lock"
+        );
+        assert_eq!(report.differing.len(), 3);
+        assert_eq!(entries(&root), [LOCK_REL]);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// `.devcouncil/` is how DevCouncil's tooling decides a project opted in;
+    /// installing skills must not create it.
+    #[test]
+    fn an_install_does_not_create_a_state_marker() {
+        let root = scratch("marker");
+        install_skills(&root, HOSTS, &[example("example", "x")], false, false).unwrap();
+        assert!(!root.join(".devcouncil").exists());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The receipt's bytes, pinned. This file is the one shared format between
+    /// every installer that has ever written it, so a change here is a format
+    /// change and must be made on purpose.
+    #[test]
+    fn the_receipt_format_is_pinned() {
+        let root = scratch("receipt-format");
+        install_skills(
+            &root,
+            &[".agents/skills"],
+            &[example("a", "x")],
+            false,
+            false,
+        )
+        .unwrap();
+        let digest = sha256_hex(&example("a", "x").content);
+        assert_eq!(
+            fs::read_to_string(root.join(RECEIPT_REL)).unwrap(),
+            format!(
+                "{{\n  \"files\": {{\n    \".agents/skills/a/SKILL.md\": \"{digest}\"\n  }},\n  \"schema\": 1\n}}"
+            )
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A receipt the retired Go installer wrote — same keys, a trailing
+    /// newline, and entries for skills this run does not install — is read as
+    /// ownership, and its other entries survive the next write.
+    #[test]
+    fn a_receipt_written_by_the_retired_go_installer_is_honoured() {
+        let root = scratch("go-receipt");
+        let old = example("a", "old");
+        let target = root.join(".agents/skills/a/SKILL.md");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, &old.content).unwrap();
+        let other = "f".repeat(64);
+        fs::write(
+            root.join(RECEIPT_REL),
+            format!(
+                "{{\n  \"files\": {{\n    \".agents/skills/a/SKILL.md\": \"{}\",\n    \
+                 \".claude/skills/other/SKILL.md\": \"{other}\"\n  }},\n  \"schema\": 1\n}}\n",
+                sha256_hex(&old.content)
+            ),
+        )
+        .unwrap();
+        let report = install_skills(
+            &root,
+            &[".agents/skills"],
+            &[example("a", "new")],
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(report.written, [target.canonicalize().unwrap()]);
+        let receipt: Value =
+            serde_json::from_slice(&fs::read(root.join(RECEIPT_REL)).unwrap()).unwrap();
+        assert_eq!(receipt["files"][".claude/skills/other/SKILL.md"], other);
+        fs::remove_dir_all(&root).ok();
     }
 }

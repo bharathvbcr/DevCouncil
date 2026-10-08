@@ -1,9 +1,10 @@
 // `devcouncil skills scaffold` exit-code contracts.
 //
 // Ported from the retired `tests/unit/test_devmap_skill_delivery.py`, which
-// drove these through the Python Typer app deleted in 3286db5. The library-level
-// contracts live in devcouncil/skills/delivery_test.go; what is here is what a
-// caller reads without parsing the payload: the exit code.
+// drove these through the Python Typer app deleted in 3286db5. The installer's
+// contracts live in rust/devmap-cli/src/skills.rs, which this command hands its
+// library to; what is here is what a caller reads without parsing the payload:
+// the exit code. A devmap binary is required (testsupport.Devmap).
 package main
 
 import (
@@ -13,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/skills"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
 
 func skillFiles(t *testing.T, root string) []string {
@@ -41,6 +42,7 @@ func skillFiles(t *testing.T, root string) []string {
 // --check must distinguish "not installed" from "installed", and must not
 // become an install by running.
 func TestSkillsScaffoldCheckReportsMissingAndNeverWrites(t *testing.T) {
+	t.Setenv("DEVMAP_BIN", testsupport.Devmap(t))
 	root := t.TempDir()
 	args := []string{"skills", "scaffold", "--project-root", root, "--skill", "core-engineering"}
 
@@ -60,9 +62,21 @@ func TestSkillsScaffoldCheckReportsMissingAndNeverWrites(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("install exited %d: %s", code, stdout.String())
 	}
+	// One SKILL.md per DevMap default destination, plus the receipt.
 	installed := skillFiles(t, root)
-	if len(installed) != len(skills.DefaultDestinations)+1 {
-		t.Fatalf("want one SKILL.md per host plus the receipt, got %v", installed)
+	receipts, copies := 0, 0
+	for _, rel := range installed {
+		switch {
+		case rel == ".devcouncil-skills.json":
+			receipts++
+		case filepath.Base(rel) == "SKILL.md" && filepath.Base(filepath.Dir(rel)) == "core-engineering":
+			copies++
+		default:
+			t.Fatalf("install wrote an unexpected file %s", rel)
+		}
+	}
+	if receipts != 1 || copies < 2 {
+		t.Fatalf("want the receipt and a copy per host, got %v", installed)
 	}
 	stamps := map[string]time.Time{}
 	for _, rel := range installed {

@@ -63,42 +63,6 @@ func TestCursorRuleNamesNoRetiredCommand(t *testing.T) {
 	}
 }
 
-// `--destination` is relative to the project; the absolute root belongs on
-// `--project-root`. Getting that backwards is refused by devmap, and integrate
-// then reported success while installing nothing.
-func TestSkillInstallNamesTheProjectRootNotTheDestination(t *testing.T) {
-	args := skillInstallArgs("/repos/thing", "cursor")
-	if len(args) < 2 || args[0] != "--project-root" || args[1] != "/repos/thing" {
-		t.Fatalf("the repository must be passed as --project-root: %v", args)
-	}
-	for i, a := range args {
-		if a == "--destination" {
-			if i+1 >= len(args) {
-				t.Fatalf("--destination without a value: %v", args)
-			}
-			if strings.HasPrefix(args[i+1], "/") {
-				t.Fatalf("--destination must be project-relative, got %q", args[i+1])
-			}
-		}
-	}
-}
-
-func TestSkillInstallPicksTheHostsSkillDirectory(t *testing.T) {
-	cursor := strings.Join(skillInstallArgs("/r", "cursor"), " ")
-	if !strings.Contains(cursor, "--destination .cursor/skills") {
-		t.Fatalf("cursor: %s", cursor)
-	}
-	claude := strings.Join(skillInstallArgs("/r", "claude"), " ")
-	if !strings.Contains(claude, "--destination .claude/skills") {
-		t.Fatalf("claude: %s", claude)
-	}
-	// An unmapped host takes DevMap's own defaults rather than a guess.
-	other := skillInstallArgs("/r", "codex")
-	if len(other) != 2 {
-		t.Fatalf("an unmapped host must name no destination: %v", other)
-	}
-}
-
 func TestCursorRuleIsAValidAlwaysAppliedMdc(t *testing.T) {
 	if !strings.HasPrefix(cursorRule, "---\n") {
 		t.Fatal("an .mdc rule opens with front matter")

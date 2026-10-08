@@ -3,19 +3,16 @@ package integrate
 import (
 	"context"
 	"crypto/rand"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"slices"
 	"strings"
-	"time"
 
-	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/devmap"
 )
 
 // Mode is apply / check / dry-run.
@@ -27,14 +24,18 @@ const (
 	ModeDryRun Mode = "dry-run"
 )
 
-// Hosts this command will configure.
+// Host integration is owned by `devmap integrate`.
 //
-// Matches the Rust `integrate::Host` set exactly. Two lists that disagree is
-// how `devcouncil integrate <host> --apply` came to succeed for a name
-// `devmap integrate <host>` then refused.
-var Hosts = []string{
-	"cursor", "claude", "codex", "opencode", "warp", "antigravity",
-}
+// The host list, each host's project document and its shape, DevMap's own
+// entry, the `devcouncil` server entry, guides and skills are all written by
+// the Rust integrator (`rust/devmap-cli/src/integrate.rs`). This package used
+// to keep a second host list and a second per-host document table for the
+// `devcouncil` entry, pinned to the Rust ones by tests that parsed the Rust
+// source. It now passes that entry over `--servers-stdin` and writes only the
+// one file that is DevCouncil's own: the Cursor rule.
+//
+// What stays here is what only DevCouncil knows: which names it retired and
+// why, and what its own server runs.
 
 // Names this command used to accept, and what to do instead.
 //
@@ -58,7 +59,7 @@ type Options struct {
 	Root      string
 	Host      string
 	Mode      Mode
-	DevmapBin string
+	DevmapBin string // explicit devmap; used or refused, never replaced
 	SelfBin   string // path to this devcouncil binary
 }
 
@@ -68,7 +69,7 @@ type Receipt struct {
 	Backups     map[string]string `json:"backups,omitempty"`      // original relative path -> recoverable backup
 	Host        string            `json:"host"`
 	Mode        string            `json:"mode"`
-	Files       map[string]string `json:"files"` // rel path -> action (wrote|unchanged|would_write|missing)
+	Files       map[string]string `json:"files"` // path -> wrote|unchanged|would_write|drift|not_ours
 	Spawned     []string          `json:"spawned,omitempty"`
 	Notes       []string          `json:"notes,omitempty"`
 }
@@ -112,17 +113,18 @@ Engineering skills live under ` + "`.cursor/skills/`" + ` and ` + "`.claude/skil
 `
 
 // Run configures one host.
+//
+// `devmap integrate <host> --servers-stdin` validates the host, writes every
+// host document — DevMap's entry and DevCouncil's — and reports per file. A
+// host it refuses is refused before anything is written, here included. No
+// devmap to run is a refusal too: the documents are DevMap's to write, so a
+// receipt without it would describe an installation that did not happen.
 func Run(opts Options) (*Receipt, error) {
 	root, err := filepath.Abs(opts.Root)
 	if err != nil {
 		return nil, err
 	}
 	host := strings.ToLower(opts.Host)
-	// Validate before anything is written or spawned. Until this existed the
-	// unknown-host path fell through to a note on an otherwise ordinary
-	// receipt, so `integrate banana --apply` exited 0, reported success, and
-	// spawned `devmap integrate banana` on the way. A host this command cannot
-	// configure is a refusal, not a receipt.
 	if err := checkHost(host); err != nil {
 		return nil, err
 	}
@@ -130,217 +132,136 @@ func Run(opts Options) (*Receipt, error) {
 	if mode == "" {
 		mode = ModeCheck
 	}
+	installMode, err := mode.install()
+	if err != nil {
+		return nil, err
+	}
 	selfBin := opts.SelfBin
 	if selfBin == "" {
-		selfBin, _ = os.Executable()
-	}
-	// `runnable` is the program this process is willing to spawn, and PATH
-	// discovery refuses any candidate whose canonical location is inside the
-	// repository: running repository content is what that refusal prevents.
-	// An explicit --devmap-bin stays an operator's choice, used or refused.
-	// Nothing here writes a `devmap` server entry; the spawned
-	// `devmap integrate` owns that.
-	runnable := opts.DevmapBin
-	if runnable == "" {
-		if discovered, err := proc.LookPathOutside("devmap", root); err == nil {
-			runnable = discovered
+		if selfBin, err = os.Executable(); err != nil {
+			return nil, fmt.Errorf("cannot name this devcouncil binary for the MCP entry: %w", err)
 		}
 	}
-
-	receipt := &Receipt{Host: host, Mode: string(mode), Files: map[string]string{}}
-
-	// Every host config below is repository content: a clone owns `.mcp.json`,
-	// `.cursor/` and `.codex/`, and a tracked symlink there would otherwise
-	// aim a read or a write outside the checkout. Reads and writes go through
-	// this root and the package's own no-follow helpers, which is the
-	// containment `integrate uninstall` has always used.
-	repo, err := os.OpenRoot(root)
+	// PATH discovery refuses any candidate inside the repository: running
+	// repository content is what that refusal prevents. An explicit binary
+	// stays an operator's choice, used or refused.
+	runnable, err := devmap.ResolveOutside(opts.DevmapBin, root)
 	if err != nil {
-		return receipt, err
-	}
-	defer func() { _ = repo.Close() }()
-
-	switch host {
-	case "cursor":
-		if err := integrateCursor(repo, root, selfBin, mode, receipt); err != nil {
-			return receipt, err
-		}
-	case "claude":
-		if err := integrateClaude(repo, root, selfBin, mode, receipt); err != nil {
-			return receipt, err
-		}
-	case "codex":
-		if err := integrateCodex(repo, mode, receipt); err != nil {
-			return receipt, err
-		}
-	default:
-		// Every remaining name in `Hosts` writes a server document. An
-		// unsupported one never reaches here — `checkHost` refused it before
-		// anything was opened — so a stub receipt would now be unreachable
-		// rather than merely unhelpful.
-		doc, known := hostMcpDocs[host]
-		if !known {
-			return receipt, fmt.Errorf("host %q is advertised but has no adapter", host)
-		}
-		if err := integrateServerDoc(repo, doc, root, mode, receipt); err != nil {
-			return receipt, err
-		}
+		return nil, fmt.Errorf("%w; host documents, guides and skills are written by "+
+			"`devmap integrate`, so nothing was configured", err)
 	}
 
-	// Compose DevMap assets rather than reimplementing them.
-	if mode == ModeCheck {
-		// A check runs nothing, so it never saw DevMap's half. Saying so keeps
-		// a clean receipt from reading as a clean DevMap installation.
-		receipt.Notes = append(receipt.Notes, fmt.Sprintf(
-			"devmap assets not examined: --check runs nothing, and the devmap server entry, "+
-				"guides and skills belong to DevMap; run `devmap integrate %s --check`", host))
+	report, err := devmap.New(runnable, root).Integrate(context.Background(), host, installMode,
+		[]devmap.Server{devcouncilServer(selfBin, root)})
+	if err != nil {
+		// No receipt: DevMap reported nothing this command could vouch for,
+		// and an empty one reads as a result. Its refusal names the reason —
+		// an unknown host, for one, with the list of the ones it takes.
+		return nil, err
 	}
-	if mode == ModeApply || mode == ModeDryRun {
-		if runnable == "" {
-			receipt.Notes = append(receipt.Notes,
-				"devmap assets skipped: no devmap outside the repository was found on PATH. "+
-					"Repository build outputs are not run implicitly; pass --devmap-bin to choose one.")
-			return receipt, nil
-		}
-		args := []string{"integrate", host}
-		if mode == ModeDryRun {
-			args = append(args, "--dry-run")
-		}
-		out, err := runDevmap(runnable, args, root)
-		receipt.Spawned = append(receipt.Spawned, "devmap "+strings.Join(args, " "))
+	receipt := &Receipt{Host: host, Mode: string(mode), Files: map[string]string{}}
+	receipt.Spawned = append(receipt.Spawned, fmt.Sprintf("devmap integrate %s --servers-stdin (%s)", host, mode))
+	foldReport(receipt, root, mode, report)
+
+	if host == "cursor" {
+		// Every host config is repository content, and a tracked symlink in
+		// `.cursor/` would otherwise aim the rule's read or write outside the
+		// checkout. It goes through this root and the package's no-follow
+		// helpers, the containment `integrate uninstall` has always used.
+		repo, err := os.OpenRoot(root)
 		if err != nil {
-			receipt.Notes = append(receipt.Notes, fmt.Sprintf("devmap integrate: %v (%s)", err, truncate(out, 400)))
+			return receipt, err
 		}
-		skillArgs := append([]string{"skills", "install"}, skillInstallArgs(root, host)...)
-		if mode == ModeDryRun {
-			skillArgs = append(skillArgs, "--dry-run")
-		}
-		sout, serr := runDevmap(runnable, skillArgs, root)
-		receipt.Spawned = append(receipt.Spawned, "devmap "+strings.Join(skillArgs, " "))
-		if serr != nil {
-			receipt.Notes = append(receipt.Notes, fmt.Sprintf("devmap skills install: %v (%s)", serr, truncate(sout, 400)))
+		defer func() { _ = repo.Close() }()
+		if err := writeCursorRule(repo, mode, receipt); err != nil {
+			return receipt, err
 		}
 	}
 	return receipt, nil
 }
 
-// checkHost accepts only a host with an adapter, and explains the rest.
+// devcouncilServer is DevCouncil's own MCP entry: this binary by absolute
+// path, so a host runs the build that configured it rather than whichever
+// wins on PATH, scoped to the repository it was configured for.
+func devcouncilServer(selfBin, root string) devmap.Server {
+	return devmap.Server{
+		Name:    "devcouncil",
+		Command: selfBin,
+		Args:    []string{"mcp"},
+		Env:     map[string]string{"DEVCOUNCIL_PROJECT_ROOT": root},
+		// Written only for hosts that honour it; DevMap's table decides.
+		Cwd: root,
+	}
+}
+
+func (m Mode) install() (devmap.InstallMode, error) {
+	switch m {
+	case ModeApply:
+		return devmap.InstallApply, nil
+	case ModeCheck:
+		return devmap.InstallCheck, nil
+	case ModeDryRun:
+		return devmap.InstallDryRun, nil
+	}
+	return "", fmt.Errorf("unknown mode %q", m)
+}
+
+// foldReport records DevMap's per-file outcomes in the receipt, in this
+// command's vocabulary, with paths inside the repository made relative.
+func foldReport(receipt *Receipt, root string, mode Mode, report *devmap.IntegrateReport) {
+	action := func(changed bool) string {
+		if !changed {
+			return "unchanged"
+		}
+		switch mode {
+		case ModeApply:
+			return "wrote"
+		case ModeDryRun:
+			return "would_write"
+		}
+		return "drift"
+	}
+	rel := func(p string) string { return devmap.RelativeTo(root, p) }
+	for _, guide := range report.Guides {
+		switch guide.Disposition {
+		case "not_ours":
+			receipt.Files[rel(guide.Path)] = "not_ours"
+		case "unchanged":
+			receipt.Files[rel(guide.Path)] = "unchanged"
+		default:
+			receipt.Files[rel(guide.Path)] = action(true)
+		}
+	}
+	for _, written := range report.SkillsWritten {
+		receipt.Files[rel(written)] = action(true)
+	}
+	for _, differing := range report.SkillsDiffering {
+		receipt.Files[rel(differing)] = action(true)
+	}
+	for _, group := range [][]devmap.Asset{report.GlobalMCP, report.ProjectMCP, report.Hooks, report.Servers} {
+		for _, asset := range group {
+			key := rel(asset.Path)
+			// One file can carry two entries (DevMap's and ours); a change to
+			// either is a change to the file.
+			if receipt.Files[key] == "" || asset.Changed {
+				receipt.Files[key] = action(asset.Changed)
+			}
+		}
+	}
+	receipt.Notes = append(receipt.Notes, report.Notes...)
+}
+
+// checkHost refuses an empty or retired name with its explanation. Every other
+// name goes to `devmap integrate`, which owns the list and refuses the rest
+// with it.
 func checkHost(host string) error {
 	if host == "" {
-		return fmt.Errorf("no host given; expected one of: %s", strings.Join(Hosts, ", "))
-	}
-	if slices.Contains(Hosts, host) {
-		return nil
+		return errors.New("no host given; `devmap integrate --help` lists the hosts")
 	}
 	if reason, retired := retiredHosts[host]; retired {
 		return fmt.Errorf("host %q is no longer configured here: %s", host, reason)
 	}
-	return fmt.Errorf("unsupported host %q; expected one of: %s", host, strings.Join(Hosts, ", "))
-}
-
-// devmapAssetBudget bounds one composed DevMap invocation. A skill install on
-// a cold cache is the slow case; anything past this is a hang, not work.
-const devmapAssetBudget = 5 * time.Minute
-
-// runDevmap spawns one composed DevMap command under the shared process bound,
-// so a child that never exits cannot hold `integrate` open forever.
-func runDevmap(binary string, args []string, dir string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), devmapAssetBudget)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, binary, args...)
-	proc.ConfigureGroup(cmd)
-	cmd.Dir = dir
-	cmd.WaitDelay = 2 * time.Second
-	var out []byte
-	runErr, timedOut := proc.RunBoundedWithCleanup(ctx, func() error {
-		var err error
-		out, err = cmd.CombinedOutput()
-		return err
-	})
-	if timedOut {
-		// The abandoned goroutine may still be writing `out`; do not read it.
-		return "", fmt.Errorf("timed out after %s", devmapAssetBudget)
-	}
-	return string(out), runErr
-}
-
-// hostSkillDirs maps a host to the skill layout it reads. A host absent here
-// gets DevMap's own defaults (`.claude/skills`, `.cursor/skills`,
-// `.agents/skills`) rather than a guess.
-var hostSkillDirs = map[string][]string{
-	"cursor":      {".cursor/skills"},
-	"claude":      {".claude/skills"},
-	"antigravity": {".agents/skills"},
-}
-
-// skillInstallArgs names the repository and, where the host has one, its skill
-// directory.
-//
-// `--destination` is a layout root *relative to the project*, not a project
-// root: passing the absolute repository path there — which is what this did —
-// is refused by name, and `integrate --apply` then reported success with a note
-// nobody reads while installing no skills at all.
-func skillInstallArgs(root, host string) []string {
-	args := []string{"--project-root", root}
-	for _, dir := range hostSkillDirs[host] {
-		args = append(args, "--destination", dir)
-	}
-	return args
-}
-
-// The `devmap` entry in `.cursor/mcp.json` and `.mcp.json` is not written
-// here. `devmap integrate <host>`, which Run composes, owns it: it pins the entry
-// with `--root`, and for Claude withholds it while the enabled Dev Map plugin
-// registers the same server. Writing an unpinned copy here undid both on every
-// run, so `--check` reported drift forever and, beside the plugin, Claude Code
-// could load devmap twice.
-func integrateCursor(repo *os.Root, root, selfBin string, mode Mode, receipt *Receipt) error {
-	mcp := map[string]any{
-		"mcpServers": map[string]any{
-			"devcouncil": map[string]any{
-				"type":    "stdio",
-				"command": selfBin,
-				"args":    []string{"mcp"},
-				"env": map[string]string{
-					"DEVCOUNCIL_PROJECT_ROOT": root,
-				},
-			},
-		},
-	}
-
-	if err := planWrite(repo, ".cursor/mcp.json", mustJSON(mcp), mode, receipt, mergeMCPJSON); err != nil {
-		return err
-	}
-	if err := writeCursorRule(repo, mode, receipt); err != nil {
-		return err
-	}
-	// No .cursor/hooks.json: DevCouncil lifecycle hooks are retired, and an
-	// empty stub is still a hook config the host parses and dispatches from.
-	// `devcouncil integrate uninstall --target hooks` removes any left over.
-	receipt.Notes = append(receipt.Notes, "hooks not written: DevCouncil host hooks are retired (MCP-first)")
 	return nil
-}
-
-func integrateClaude(repo *os.Root, root, selfBin string, mode Mode, receipt *Receipt) error {
-	mcp := map[string]any{
-		"mcpServers": map[string]any{
-			"devcouncil": map[string]any{
-				"command": selfBin,
-				"args":    []string{"mcp"},
-				"env":     map[string]string{"DEVCOUNCIL_PROJECT_ROOT": root},
-			},
-		},
-	}
-	return planWrite(repo, ".mcp.json", mustJSON(mcp), mode, receipt, mergeMCPJSON)
-}
-
-// integrateCodex creates the Codex project config only where none exists.
-// `.codex/config.toml` is the user's file and this package has no TOML merge,
-// so an existing one is refused by planWrite rather than replaced — which is
-// what deleted every `[mcp_servers.*]` table in it.
-func integrateCodex(repo *os.Root, mode Mode, receipt *Receipt) error {
-	body := []byte("# Managed by devcouncil integrate codex\n")
-	return planWrite(repo, ".codex/config.toml", body, mode, receipt, nil)
 }
 
 const cursorRuleRel = ".cursor/rules/devcouncil.mdc"
@@ -390,6 +311,13 @@ func replaceOwned(owns func(existing []byte) bool) mergeFunc {
 	}
 }
 
+// mergeFunc folds the generated document into what is already on disk.
+//
+// A nil mergeFunc means the file may only be created: planWrite refuses to
+// replace an existing file without one. A file this command owns outright
+// passes replaceOwned, which says how to recognise it.
+type mergeFunc func(existing, generated []byte) ([]byte, error)
+
 // planWrite inspects and rewrites one host config named *relative to the
 // repository root*.
 //
@@ -400,147 +328,6 @@ func replaceOwned(owns func(existing []byte) bool) mergeFunc {
 // the read must not follow a link out of the checkout (which would copy an
 // outside file's contents into the merged result) and the write must not
 // land outside it.
-// hostMcpDoc says where one host keeps its server list and how that document
-// is shaped.
-//
-// Three hosts, three shapes: Antigravity nests servers under `mcpServers`,
-// OpenCode under `mcp`, and Warp's file *is* the server map. Declaring the
-// shape once is what lets these share `planWrite` instead of becoming three
-// near-copies. The Rust integrator holds the same table for the `devmap`
-// entry it owns in these files; `TestHostDocumentsMatchTheRustIntegrator`
-// pins the two together.
-type hostMcpDoc struct {
-	rel string
-	// container is the key the server map lives under. Empty means the
-	// document root is the map itself.
-	container string
-	// preamble is established when the file is created and never overwritten.
-	preamble map[string]any
-	// argvForm says entries name the program as one argv array rather than a
-	// command plus a separate args list.
-	argvForm bool
-}
-
-// hostMcpDocs are the hosts whose server document this package writes.
-//
-// Cursor and Claude are absent on purpose: their files are handled by the
-// adapters above, which also write a rule (Cursor) and leave the `devmap`
-// entry to `devmap integrate`.
-var hostMcpDocs = map[string]hostMcpDoc{
-	"antigravity": {rel: ".agents/mcp_config.json", container: "mcpServers"},
-	"opencode": {
-		rel:       "opencode.json",
-		container: "mcp",
-		// OpenCode validates against this schema. A file created without it
-		// loses editor completion for every other key in the user's config.
-		preamble: map[string]any{"$schema": "https://opencode.ai/config.json"},
-		argvForm: true,
-	},
-	"warp": {rel: ".devcouncil/integrations/warp-mcp.json"},
-}
-
-// integrateServerDoc registers the DevCouncil MCP server in one host's project
-// document.
-//
-// Every other key survives. `opencode.json` sits at the repository root and is
-// a *user's* configuration that happens to hold a server list — losing an
-// unrelated key there is a bug even when the server entry comes out right.
-func integrateServerDoc(repo *os.Root, doc hostMcpDoc, root string, mode Mode, receipt *Receipt) error {
-	generated := map[string]any{}
-	for key, value := range doc.preamble {
-		generated[key] = value
-	}
-	entry := devcouncilEntry(doc, root)
-	if doc.container == "" {
-		generated[mcpServerName] = entry
-	} else {
-		generated[doc.container] = map[string]any{mcpServerName: entry}
-	}
-	return planWrite(repo, doc.rel, mustJSON(generated), mode, receipt, mergeServerMap(doc))
-}
-
-// mcpServerName is the key DevCouncil's own server is registered under.
-const mcpServerName = "devcouncil"
-
-// devcouncilEntry is the server entry in this host's spelling.
-func devcouncilEntry(doc hostMcpDoc, root string) map[string]any {
-	if doc.argvForm {
-		return map[string]any{
-			"type":        "local",
-			"command":     []any{"devcouncil", "mcp-server"},
-			"environment": map[string]any{"DEVCOUNCIL_PROJECT_ROOT": root},
-			"enabled":     true,
-			"timeout":     10000,
-		}
-	}
-	entry := map[string]any{
-		"command": "devcouncil",
-		"args":    []any{"mcp-server"},
-		"env":     map[string]any{"DEVCOUNCIL_PROJECT_ROOT": root},
-	}
-	if doc.container == "mcpServers" {
-		// Antigravity resolves relative paths against its own working
-		// directory, not the project's.
-		entry["cwd"] = root
-	}
-	return entry
-}
-
-// mergeServerMap folds our entry into the host's document, container and all.
-func mergeServerMap(doc hostMcpDoc) mergeFunc {
-	return func(existing, generated []byte) ([]byte, error) {
-		if err := refuseJSONComments(existing); err != nil {
-			return nil, err
-		}
-		var cur, gen map[string]any
-		if err := json.Unmarshal(existing, &cur); err != nil {
-			// Refuse rather than replace: an unparseable config is far more
-			// likely to be a file worth keeping than one worth overwriting.
-			return nil, fmt.Errorf("not JSON (%w); refuse to overwrite a host config this command cannot read", err)
-		}
-		if err := json.Unmarshal(generated, &gen); err != nil {
-			return nil, err
-		}
-		if cur == nil {
-			cur = map[string]any{}
-		}
-		for key, value := range gen {
-			if key == doc.container {
-				continue
-			}
-			// Preamble keys are established, never overwritten: the user may
-			// have pinned a different schema revision on purpose.
-			if _, present := cur[key]; !present {
-				cur[key] = value
-			}
-		}
-		if doc.container == "" {
-			cur[mcpServerName] = gen[mcpServerName]
-			return mustJSON(cur), nil
-		}
-		servers, ok := cur[doc.container].(map[string]any)
-		if !ok {
-			if cur[doc.container] != nil {
-				return nil, fmt.Errorf("%q is not a JSON object", doc.container)
-			}
-			servers = map[string]any{}
-			cur[doc.container] = servers
-		}
-		genServers, _ := gen[doc.container].(map[string]any)
-		for name, value := range genServers {
-			servers[name] = value
-		}
-		return mustJSON(cur), nil
-	}
-}
-
-// mergeFunc folds the generated document into what is already on disk.
-//
-// A nil mergeFunc means the file may only be created: planWrite refuses to
-// replace an existing file without one. A file this command owns outright
-// passes replaceOwned, which says how to recognise it.
-type mergeFunc func(existing, generated []byte) ([]byte, error)
-
 func planWrite(repo *os.Root, rel string, content []byte, mode Mode, receipt *Receipt, merge mergeFunc) error {
 	existing, _, err := readHookFile(repo, rel)
 	exists := err == nil
@@ -610,56 +397,4 @@ func writeRooted(repo *os.Root, rel string, content []byte, perm os.FileMode) er
 		return errors.Join(err, repo.Remove(tmp))
 	}
 	return nil
-}
-
-// refuseJSONComments stops a merge before it drops comments: encoding/json
-// cannot round-trip them, so a config carrying them would silently lose them.
-func refuseJSONComments(data []byte) error {
-	trimmed := strings.TrimSpace(string(data))
-	if strings.Contains(trimmed, "//") || strings.Contains(trimmed, "/*") {
-		// Heuristic: real JSON strings can contain //; try parse first.
-		var probe any
-		if err := json.Unmarshal(data, &probe); err != nil {
-			return fmt.Errorf("refusing to rewrite JSON-with-comments (parse failed: %v)", err)
-		}
-	}
-	return nil
-}
-
-func mergeMCPJSON(existing, generated []byte) ([]byte, error) {
-	if err := refuseJSONComments(existing); err != nil {
-		return nil, err
-	}
-	var cur, gen map[string]any
-	if err := json.Unmarshal(existing, &cur); err != nil {
-		return nil, fmt.Errorf("existing mcp.json: %w", err)
-	}
-	if err := json.Unmarshal(generated, &gen); err != nil {
-		return nil, err
-	}
-	curServers, _ := cur["mcpServers"].(map[string]any)
-	if curServers == nil {
-		curServers = map[string]any{}
-		cur["mcpServers"] = curServers
-	}
-	genServers, _ := gen["mcpServers"].(map[string]any)
-	for k, v := range genServers {
-		curServers[k] = v
-	}
-	return mustJSON(cur), nil
-}
-
-func mustJSON(v any) []byte {
-	b, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return []byte("{}\n")
-	}
-	return append(b, '\n')
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "…"
 }
