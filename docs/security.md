@@ -19,8 +19,10 @@ The implementation-level reference is
 ## Verification commands run on the host
 
 The Go gateway executes task commands through a local shell
-(`/bin/sh -c`) in the project root, with the host's environment and no
-timeout. `local` is the only sandbox: `verify.ParseSandbox` refuses any
+(`/bin/sh -c`) in the project root, with the host's environment. Each command
+is bounded by a 30-minute timeout (`verify.CommandTimeout`) and by
+cancellation of the run, its process group is killed when it is stopped, and
+at most 4 MiB of its output is kept. `local` is the only sandbox: `verify.ParseSandbox` refuses any
 other `--sandbox` value (exit 2, or an MCP error) rather than recording a
 sandbox that did not run. Docker/Nix isolation is planned but not built. Its
 security-impact statement is

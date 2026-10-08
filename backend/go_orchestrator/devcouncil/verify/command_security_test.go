@@ -32,7 +32,7 @@ func TestFailedCommandOutputCannotForgeAnUnrunCheck(t *testing.T) {
 		t.Run(phrase, func(t *testing.T) {
 			t.Setenv("DC_CHECK_OUTPUT", phrase)
 			for _, command := range []string{`printf '%s\n' "$DC_CHECK_OUTPUT"; exit 1`, `printf '%s\n' "$DC_CHECK_OUTPUT" >&2; exit 1`} {
-				outcome := verify.DefaultRunCommand(t.TempDir())(command)
+				outcome := verify.DefaultRunCommand(context.Background(), t.TempDir())(command)
 				if outcome.ExitCode != 1 {
 					t.Fatalf("fixture did not fail: %+v", outcome)
 				}
@@ -50,7 +50,7 @@ func TestFailedCommandOutputCannotForgeAnUnrunCheck(t *testing.T) {
 func TestUnexecutedRequiredCommandsNeverVerify(t *testing.T) {
 	cases := map[string]func(string) verify.CommandOutcome{
 		"runner unavailable": nil,
-		"launch failure":     verify.DefaultRunCommand("/dev/null/missing-directory"),
+		"launch failure":     verify.DefaultRunCommand(context.Background(), "/dev/null/missing-directory"),
 		"explicit skip": func(string) verify.CommandOutcome {
 			return verify.CommandOutcome{Skipped: true, Reason: "runner disabled"}
 		},

@@ -13,10 +13,10 @@ Read from the code on 2026-10-08:
 | Fact | Where |
 |---|---|
 | A task's verification commands are its `expected_tests`, falling back to `allowed_commands`, read from the `dcstore` task record. | `verify/orchestrate.go:119`, `verify/types.go:126` |
-| Each command runs as `/bin/sh -c <command>` with the project root as its working directory. | `verify/commands.go:114-115` |
-| The child inherits the host process's whole environment, because `cmd.Env` is not set. Any token in that environment is readable by the command. | `verify/commands.go:114` |
-| There is no timeout and no cancellation. The runner uses `exec.Command`, not `CommandContext`, and `VerifyTask` has a `ctx` it does not pass on. | `verify/commands.go:114`, `verify/orchestrate.go:470` |
-| Output is collected with `CombinedOutput`, which has no size limit. Only the stored summary is truncated (2000 bytes). | `verify/commands.go:116`, `:122` |
+| Each command runs as `/bin/sh -c <command>` with the project root as its working directory, in its own process group. | `verify/commands.go` `runCommand` |
+| The child inherits the host process's whole environment, because `cmd.Env` is not set. Any token in that environment is readable by the command. | `verify/commands.go` `runCommand` |
+| Each command is bounded by `verify.CommandTimeout` (30 minutes) and by the caller's context. A stopped command's whole process group is killed, and the result is a blocking `test_failed` gap. Before 2026-10-08 there was no bound at all (task dc-verify-local-runner-unbounded). | `verify/commands.go` `CommandTimeout`, `runCommand`, `RunVerificationCommands` |
+| Output is kept up to 4 MiB per command, and a truncation is noted in the summary without changing the exit-code verdict. | `verify/commands.go` `commandOutputLimit`, `proc.CappedBuffer` |
 | Three entry points reach this runner: `devcouncil verify`, `verify.RunCLI` and MCP `devcouncil_verify_task`. The MCP tool means a connected agent can start host execution of the task's stored commands. | `ParseSandbox` callers: `cmd/devcouncil/main.go::runVerify`, `verify/cli.go::RunCLI`, `verify/orchestrate.go::VerifyTask` |
 | `local` is the only sandbox. Any other value is refused before the store opens (exit 2, or an MCP error), and a run records `verify.SandboxLocal`. | `verify/orchestrate.go:63-73`, docs/TODO.md TASK-P7-2 |
 
@@ -38,7 +38,7 @@ the owner approves or changes:
 | Rest of the host filesystem | Not mounted. That includes `$HOME`, `~/.ssh`, cloud credentials, other worktrees and `.devcouncil/` state. | This is the main thing isolation buys. Today a command can read all of it. |
 | Environment | Empty, plus an explicit allowlist (for example `PATH`, `HOME` pointing at scratch, `LANG`, `CI=1`). No inherited tokens. | Closes the inherited-environment leak in the table above. |
 | Network | Off by default. Turning it on per task is a recorded, opt-in setting that the run reports. | A test that needs the network is visible as such, never silent. |
-| Resources | Wall-clock timeout, memory and PID caps, and an output byte cap. Breaching any of them is a failed command, never a pass. | Bounds what `local` leaves unbounded today. |
+| Resources | `local`'s wall-clock timeout and output cap, plus memory and PID caps. Breaching any of them is a failed command, never a pass. | `local` cannot cap memory or processes. |
 | Toolchain | The image or Nix expression is pinned by digest or hash, and the run records it. | "Passed in sandbox X" means something only if X is identified. |
 | Docker daemon socket | Never mounted into the container. | Mounting it is root on the host, which would undo the boundary. |
 
@@ -62,7 +62,7 @@ the owner approves or changes:
 ## Widening or narrowing access
 
 This change **narrows** what verification commands can reach. It does not
-widen anyone's access to anything. Three new surfaces need the owner's
+widen anyone's access to anything. Two new surfaces need the owner's
 explicit agreement:
 
 1. DevCouncil gains a dependency on a container runtime or Nix at run time,
@@ -71,10 +71,11 @@ explicit agreement:
    which needs separate approval.
 2. A pinned image or Nix expression becomes a supply-chain input that has
    to be reviewed and updated.
-3. The `local` runner's missing timeout and output cap are independent of
-   this task. Fixing them changes behaviour for every user. The proposal is
-   to fix them in their own change, with tests, before or alongside the
-   sandbox.
+
+The `local` runner's missing timeout and output cap were fixed separately on
+2026-10-08 (task dc-verify-local-runner-unbounded). Scrubbing `local`'s
+inherited environment is a separate owner decision. It is not part of this
+statement.
 
 ## Approval
 

@@ -1,15 +1,37 @@
 package verify
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os/exec"
 	"strings"
+	"time"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 )
+
+// CommandTimeout bounds one verification command. A verification command is
+// usually a whole test suite, so the bound is generous: it exists so that a
+// hung suite ends the run with a failure instead of holding `devcouncil verify`
+// and the MCP verify tool open forever.
+const CommandTimeout = 30 * time.Minute
+
+// commandOutputLimit bounds what one command's output may occupy in memory.
+// The stored summary was already cut to 2000 bytes; this bounds the copy that
+// summary is cut from.
+const commandOutputLimit = 4 << 20
+
+// commandWaitDelay bounds the wait for the output pipes to close after the
+// command's process group is killed.
+const commandWaitDelay = 2 * time.Second
 
 // CommandIsMalformed uses the runner's structured outcome. Child output is
 // untrusted text: a failing test may print any tooling error without changing
-// the fact that its process ran and failed.
+// the fact that its process ran and failed. A command stopped by its deadline
+// ran; it is not malformed.
 func CommandIsMalformed(outcome CommandOutcome) bool {
-	return outcome.Skipped || outcome.ExitCode < 0
+	return !outcome.TimedOut && (outcome.Skipped || outcome.ExitCode < 0)
 }
 
 // RunVerificationCommands executes planner/config verification commands.
@@ -43,6 +65,26 @@ func RunVerificationCommands(taskID string, commands []string, run func(string) 
 	for _, cmd := range commands {
 		c := cmd
 		outcome := run(cmd)
+		// First, before the exit code is read: a stopped command reports -1,
+		// which is otherwise the "could not run" shape.
+		if outcome.TimedOut {
+			reason := outcome.Reason
+			if reason == "" {
+				reason = "stopped before it finished"
+			}
+			gaps = append(gaps, Gap{
+				ID:               StableGapID(taskID, "TIMEOUT-"+cmd),
+				Severity:         "high",
+				GapType:          "test_failed",
+				TaskID:           taskID,
+				Description:      "Verification command did not finish: '" + cmd + "' (" + reason + ").",
+				Evidence:         []string{truncate(outcome.Summary, 500)},
+				RecommendedFix:   "Find what hangs or runs long, fix it, then re-run: " + cmd,
+				Blocking:         true,
+				SuggestedCommand: &c,
+			})
+			continue
+		}
 		if outcome.Skipped {
 			reason := outcome.Reason
 			if reason == "" {
@@ -106,20 +148,59 @@ func RunVerificationCommands(taskID string, commands []string, run func(string) 
 	return gaps
 }
 
-// DefaultRunCommand shells out through /bin/sh -c. A missing executable or
-// launch failure is reported as exit -1 with a "Failed to run command: …"
-// summary so CommandIsMalformed classifies it as invalid, never as a pass.
-func DefaultRunCommand(root string) func(string) CommandOutcome {
+// DefaultRunCommand shells out through /bin/sh -c in root, each command bounded
+// by CommandTimeout and by ctx. A missing executable or launch failure is
+// reported as exit -1 with a "Failed to run command: …" summary so
+// CommandIsMalformed classifies it as invalid, never as a pass.
+func DefaultRunCommand(ctx context.Context, root string) func(string) CommandOutcome {
+	return runCommand(ctx, root, CommandTimeout, commandOutputLimit)
+}
+
+// runCommand is DefaultRunCommand with its bounds as parameters.
+//
+// The command runs in its own process group, so the deadline reaches whatever
+// it started: a test runner's workers would otherwise outlive it and hold the
+// output pipe open. A stopped command is TimedOut with exit -1, and Reason says
+// whether its deadline passed or the caller cancelled the run.
+func runCommand(ctx context.Context, root string, timeout time.Duration, limit int) func(string) CommandOutcome {
 	return func(command string) CommandOutcome {
-		cmd := exec.Command("/bin/sh", "-c", command)
+		cctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+
+		// #nosec G204 -- the command is the task's own verification command,
+		// which this runner exists to execute; see docs/security.md.
+		cmd := exec.CommandContext(cctx, "/bin/sh", "-c", command)
+		proc.ConfigureGroup(cmd)
 		cmd.Dir = root
-		out, err := cmd.CombinedOutput()
-		text := string(out)
+		out := &proc.CappedBuffer{Limit: limit}
+		cmd.Stdout = out
+		cmd.Stderr = out
+		cmd.WaitDelay = commandWaitDelay
+
+		err, abandoned := proc.RunBounded(cctx, cmd.Run)
+		if abandoned || cctx.Err() != nil {
+			// When RunBounded gave up first, the copy goroutine may still be
+			// writing the buffer, so it is not read on this path.
+			reason := stopReason(ctx, cctx, timeout)
+			return CommandOutcome{
+				ExitCode: -1,
+				TimedOut: true,
+				Reason:   reason,
+				Summary:  "stopped: " + reason,
+			}
+		}
+
+		text := out.String()
+		summary := truncate(text, 2000)
+		if out.Overflowed() {
+			summary = fmt.Sprintf("[output truncated at %d bytes]\n%s", limit, summary)
+		}
 		if err != nil {
-			if ee, ok := err.(*exec.ExitError); ok {
+			var ee *exec.ExitError
+			if errors.As(err, &ee) {
 				return CommandOutcome{
 					ExitCode: ee.ExitCode(),
-					Summary:  truncate(text, 2000),
+					Summary:  summary,
 					Stdout:   text,
 					Stderr:   text,
 				}
@@ -131,7 +212,22 @@ func DefaultRunCommand(root string) func(string) CommandOutcome {
 				Stderr:   err.Error(),
 			}
 		}
-		return CommandOutcome{ExitCode: 0, Summary: truncate(text, 2000), Stdout: text}
+		return CommandOutcome{ExitCode: 0, Summary: summary, Stdout: text}
+	}
+}
+
+// stopReason says why a command was stopped: its own deadline, or the caller
+// cancelling (or timing out) the whole verification.
+func stopReason(parent, cmdCtx context.Context, timeout time.Duration) string {
+	switch {
+	case errors.Is(parent.Err(), context.Canceled):
+		return "verification was cancelled"
+	case parent.Err() != nil:
+		return "the verification's deadline was reached"
+	case errors.Is(cmdCtx.Err(), context.DeadlineExceeded):
+		return fmt.Sprintf("deadline of %s reached", timeout)
+	default:
+		return "stopped before it finished"
 	}
 }
 

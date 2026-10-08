@@ -467,15 +467,21 @@ func VerifyTask(ctx context.Context, root string, client *store.Client, taskID, 
 		DiffContent:     diff,
 		DiffEmpty:       empty,
 		WorkPresent:     !empty,
-		RunCommand:      DefaultRunCommand(root),
+		RunCommand:      DefaultRunCommand(ctx, root),
 		Rigor:           RigorClient(root),
 		CoveragePath:    coveragePath,
 		Lappi:           LappiAsker(),
 	}
 	gaps, meta := Run(ctx, in)
 	result := ToMCP(taskID, gaps, meta)
-	_ = Persist(ctx, client, taskID, gaps, meta, result.Status)
+	persistErr := Persist(ctx, client, taskID, gaps, meta, result.Status)
 	writeBlockedCorrection(root, taskID, &result, gaps)
+	if persistErr != nil {
+		// The verdict is returned with the error so a caller can show it, but
+		// as an error: the gates and the task loop read the store, and a run
+		// the store never recorded must not be acted on as if it had been.
+		return result, gaps, fmt.Errorf("verification ran but was not recorded: %w", persistErr)
+	}
 	return result, gaps, nil
 }
 
