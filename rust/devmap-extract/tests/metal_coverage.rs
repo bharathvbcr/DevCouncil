@@ -442,6 +442,7 @@ TWO(two_way)
 kernel void host(device float *x [[buffer(0)]]) {
     STEP(inside_a_body);
 }
+static const int table[] = { STEP(in_an_initializer), 0 };
 ";
     let extraction = extract_file("kernels/refused.metal", source);
     let functions: Vec<&str> = extraction
@@ -450,7 +451,7 @@ kernel void host(device float *x [[buffer(0)]]) {
         .filter(|symbol| symbol.kind == SymbolKind::Function)
         .map(|symbol| symbol.name.as_str())
         .collect();
-    for refused in ["fixed_name", "two_way", "inside_a_body"] {
+    for refused in ["fixed_name", "two_way", "inside_a_body", "in_an_initializer"] {
         assert!(!functions.contains(&refused), "{refused}: {functions:?}");
     }
     assert!(functions.contains(&"host"), "{functions:?}");

@@ -342,7 +342,12 @@ fn macro_definition(node: Node, source: &str) -> Option<MacroDefinition> {
 
 /// Whether the invocation at `start..end` sits where a declaration can: at
 /// file scope or inside a namespace, never inside a function body, a type's
-/// member list, or another directive.
+/// member list, an initializer or another declaration, or a directive.
+///
+/// The initializer case is the one that costs: a generated `parser.c` holds
+/// thousands of `ACTIONS(n)` invocations inside one file-scope array, none of
+/// which can declare a function, and each would otherwise be expanded and
+/// parsed.
 fn at_declaration_scope(root: Node, start: usize, end: usize) -> bool {
     let Some(mut node) = root.descendant_for_byte_range(start, end) else {
         return false;
@@ -352,6 +357,8 @@ fn at_declaration_scope(root: Node, start: usize, end: usize) -> bool {
             node.kind(),
             "compound_statement"
                 | "field_declaration_list"
+                | "initializer_list"
+                | "declaration"
                 | "preproc_function_def"
                 | "preproc_def"
                 | "preproc_arg"
