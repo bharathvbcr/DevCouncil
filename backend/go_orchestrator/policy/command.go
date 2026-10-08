@@ -240,28 +240,66 @@ func (g CommandGate) evaluateSingleCommand(command string, task *dc.Task, depth 
 		}
 	}
 
-	// The unreadable rungs (IsUnreadableRule) are collected rather than
-	// returned on the spot, so a hard refusal found later in the clause — in a
-	// substitution span, say — still outranks them. The first one found is the
-	// one reported, in the order below.
-	var unreadable, softInner, warnDecision *Decision
-	noteUnreadable := func(d Decision) {
-		if unreadable == nil {
-			unreadable = &d
-		}
+	var f clauseFindings
+	g.noteOpaqueConstructs(&f, raw, normalized, taskID)
+	if d, hard := g.judgeSubstitutions(&f, raw, normalized, task, taskID, depth); hard {
+		return d
+	}
+	g.noteDirectoryChanges(&f, normalized, taskID)
+	if d, found := f.verdict(); found {
+		return d
 	}
 
-	// A live substitution or a heredoc carries code this ladder cannot read:
-	// an allowlist entry matched against the surrounding line never judged
-	// what `sh -c` would actually execute inside it. Substitution contents are
-	// extracted and run through this same gate — so `echo $(date)` is judged
-	// as both echo and date — and anything the scanner cannot bound is refused
-	// outright rather than guessed at. A heredoc body is expanded data with no
-	// reliable static end, so it has no extraction path and is refused. (Its
-	// lines are still judged: the chain splitter breaks on unquoted newlines,
-	// so each body line reaches this ladder as a clause of its own.)
+	return g.matchAllowlists(raw, normalized, task, taskID)
+}
+
+// clauseFindings collects the refusals and warnings one clause's rungs find
+// before the allowlists are consulted.
+//
+// The unreadable rungs (IsUnreadableRule) are collected rather than returned
+// on the spot, so a hard refusal found later in the clause — in a
+// substitution span, say — still outranks them. The first one found is the
+// one reported, in the order evaluateSingleCommand runs the rungs.
+type clauseFindings struct {
+	unreadable, softInner, warnDecision *Decision
+}
+
+func (f *clauseFindings) noteUnreadable(d Decision) {
+	if f.unreadable == nil {
+		f.unreadable = &d
+	}
+}
+
+// verdict reports the most important finding, if there is one: an unreadable
+// construct, then a soft refusal from inside a substitution, then a warning.
+func (f *clauseFindings) verdict() (Decision, bool) {
+	if f.unreadable != nil {
+		return *f.unreadable, true
+	}
+	if f.softInner != nil {
+		return *f.softInner, true
+	}
+	if f.warnDecision != nil {
+		return *f.warnDecision, true
+	}
+	return Decision{}, false
+}
+
+// noteOpaqueConstructs notes the constructs whose meaning is not in the text
+// being judged: a heredoc and a re-parsing command word.
+//
+// A live substitution or a heredoc carries code this ladder cannot read:
+// an allowlist entry matched against the surrounding line never judged
+// what `sh -c` would actually execute inside it. Substitution contents are
+// extracted and run through this same gate — so `echo $(date)` is judged
+// as both echo and date — and anything the scanner cannot bound is refused
+// outright rather than guessed at. A heredoc body is expanded data with no
+// reliable static end, so it has no extraction path and is refused. (Its
+// lines are still judged: the chain splitter breaks on unquoted newlines,
+// so each body line reaches this ladder as a clause of its own.)
+func (g CommandGate) noteOpaqueConstructs(f *clauseFindings, raw, normalized, taskID string) {
 	if hasHeredoc(raw) {
-		noteUnreadable(g.noteHardRules(deny(RuleCommandHeredoc,
+		f.noteUnreadable(g.noteHardRules(deny(RuleCommandHeredoc,
 			"Heredocs carry expanded data with no statically checkable end and are not allowed; "+
 				"write the content to a file instead.", normalized, taskID)))
 	}
@@ -270,20 +308,26 @@ func (g CommandGate) evaluateSingleCommand(command string, task *dc.Task, depth 
 	// runs before the substitution rung so that `eval $(...)` is named as the
 	// re-parse it is rather than as the substitution it also contains.
 	if word, isReparse := reparsingCommandWord(raw); isReparse {
-		noteUnreadable(g.noteHardRules(deny(RuleCommandReparse,
+		f.noteUnreadable(g.noteHardRules(deny(RuleCommandReparse,
 			"`"+word+"` re-parses its argument as shell code after expansion, so nothing in this "+
 				"line — the allowlist match, the git-safety rules, or the redirection targets — "+
 				"describes what would actually run; write the commands out directly instead.",
 			normalized, taskID)))
 	}
+}
+
+// judgeSubstitutions runs every live substitution span in raw through this
+// same gate, one level deeper. A hard refusal from inside a span is returned
+// with hard=true, to be reported at once; everything else is noted in f.
+func (g CommandGate) judgeSubstitutions(f *clauseFindings, raw, normalized string, task *dc.Task, taskID string, depth int) (Decision, bool) {
 	spans, subErr := liveSubstitutions(raw)
 	switch {
 	case subErr != nil:
-		noteUnreadable(g.noteHardRules(deny(RuleCommandSubstitution,
+		f.noteUnreadable(g.noteHardRules(deny(RuleCommandSubstitution,
 			"Command substitution could not be analysed to its end and is not allowed; "+
 				"rewrite without $(), backticks, <() or >().", normalized, taskID)))
 	case len(spans) > 0 && depth >= maxSubstitutionDepth:
-		noteUnreadable(g.noteHardRules(deny(RuleCommandSubstitution,
+		f.noteUnreadable(g.noteHardRules(deny(RuleCommandSubstitution,
 			"Command substitution nested beyond the analysis limit is not allowed; "+
 				"run the inner commands separately.", normalized, taskID)))
 	case len(spans) > 0:
@@ -305,26 +349,31 @@ func (g CommandGate) evaluateSingleCommand(command string, task *dc.Task, depth 
 				d.Target = normalized
 				switch {
 				case IsUnreadableRule(d.Rule):
-					noteUnreadable(d)
+					f.noteUnreadable(d)
 				case d.Severity == Hard:
-					return d
-				case softInner == nil:
-					softInner = &d
+					return d, true
+				case f.softInner == nil:
+					f.softInner = &d
 				}
 				continue
 			}
-			if d.Action == Warn && warnDecision == nil {
-				warnDecision = &d
+			if d.Action == Warn && f.warnDecision == nil {
+				f.warnDecision = &d
 			}
 		}
 	}
+	return Decision{}, false
+}
 
+// noteDirectoryChanges notes a clause that moves where its relative paths
+// resolve: a cd/pushd/popd, or git's own directory options.
+func (g CommandGate) noteDirectoryChanges(f *clauseFindings, normalized, taskID string) {
 	// A directory change is refused, not waved through. It used to be allowed
 	// on the ground that it "cannot write" — true of the cd itself, and beside
 	// the point, because it decides where every relative path *after* it
 	// writes. See RuleCommandDirectoryChange.
 	if cdSegmentRe.MatchString(normalized) {
-		noteUnreadable(g.noteHardRules(deny(RuleCommandDirectoryChange,
+		f.noteUnreadable(g.noteHardRules(deny(RuleCommandDirectoryChange,
 			"Changing the working directory is not allowed: every relative path in this command "+
 				"would then resolve somewhere other than where the gate judged it. Use paths "+
 				"relative to the repository root instead.", normalized, taskID)))
@@ -335,22 +384,17 @@ func (g CommandGate) evaluateSingleCommand(command string, task *dc.Task, depth 
 	// `--work-tree` split the two apart. A rung that refuses `cd` while these
 	// pass is a rung that refuses one spelling of the problem.
 	if opt, moved := gitDirectoryEscape(normalized); moved {
-		noteUnreadable(g.noteHardRules(deny(RuleCommandDirectoryChange,
+		f.noteUnreadable(g.noteHardRules(deny(RuleCommandDirectoryChange,
 			"`git "+opt+"` runs against a working tree other than the one this gate judges for, "+
 				"so nothing it does was examined. Run git from the repository root instead.",
 			normalized, taskID)))
 	}
+}
 
-	if unreadable != nil {
-		return *unreadable
-	}
-	if softInner != nil {
-		return *softInner
-	}
-	if warnDecision != nil {
-		return *warnDecision
-	}
-
+// matchAllowlists is the last stage of evaluateSingleCommand: the lists a
+// clause that nothing above refused is allowed by, in order, and the refusal
+// when none admits it.
+func (g CommandGate) matchAllowlists(raw, normalized string, task *dc.Task, taskID string) Decision {
 	if matcherOf(g.Matcher).any(NoTaskAllowedCommands, normalized) {
 		return g.finish(allow("Bootstrap or read-only command allowed.", normalized, taskID), normalized, taskID)
 	}
@@ -1173,74 +1217,6 @@ func shellDequote(s string) string {
 	return b.String()
 }
 
-// RedirectTargets returns every file this command line would write that the
-// gate can find in its text: the targets of output redirections (>, >>, >|,
-// &>, >& and their fd-prefixed forms), and the files the line's commands write
-// through their arguments — sed -i, tee, cp and mv; see argumentWriteTargets.
-// Input redirections (<) are reads, which this ladder does not gate, and a
-// heredoc introducer (<<) is not a path at all; neither is returned.
-//
-// The name predates the argument half. Both halves answer one question — which
-// files does this line change — and they share one dedupe, one stream-device
-// exemption and one bound, because the caller judges the combined list as one
-// set of writes.
-//
-// The second return value reports whether a target could not be resolved to a
-// literal path — it carries an expansion ($HOME, ${VAR}, ~, a substitution)
-// whose value only the shell knows, or it sits inside a construct this scanner
-// could not read to its end. A target the gate cannot name is a write it
-// cannot judge, so the caller must treat that as a refusal rather than skip
-// the check.
-//
-// Matching strips trailing redirections so patterns like "dev map *" stay
-// single-clause, which is exactly why the executed form has to be re-read
-// here: the string that matched is not the string that runs.
-//
-// Command substitutions are descended into rather than skipped. Their contents
-// are recursed through the policy ladder, and that ladder has no redirect rung
-// of its own — the rung lives above it, in the caller of this function — so a
-// substitution the scanner stepped over was a write nothing ever judged:
-// `echo $(git diff > ~/.ssh/authorized_keys)` was allowed while the same
-// redirect on its own was a hard denial. Backticks and <( … ) happened to be
-// caught before, by the scanner not recognising them at all and stumbling onto
-// the `>` inside; they are now found the same principled way as $( … ), so the
-// three cannot diverge again.
-func RedirectTargets(command string) ([]string, bool, error) {
-	targets, opaque, err := redirectTargets(command, 0)
-	if err != nil {
-		return nil, false, err
-	}
-	// Deduplicated, and bounded. Both are about what the caller does with this
-	// list: it puts every entry through the write gate, so the length of the
-	// list is a multiplier on the cost of judging one command line.
-	//
-	// `a > f && a > f && …` names one file however many times it is repeated,
-	// and re-judging it once per clause turned a 360 KiB command line into
-	// eight seconds of gate time — the same verdict, twenty thousand times.
-	// Distinctness is the honest unit anyway: the question the gate answers is
-	// "may this file be written", and it has one answer per file.
-	seen := make(map[string]struct{}, len(targets))
-	distinct := make([]string, 0, len(targets))
-	for _, target := range targets {
-		if _, dup := seen[target]; dup {
-			continue
-		}
-		// A stream device is not a file the command writes; see IsStreamDevice.
-		if IsStreamDevice(target) {
-			continue
-		}
-		if len(distinct) >= maxRedirectTargets {
-			// Past the cap the enumeration is incomplete, and incomplete is
-			// exactly what opacity means — the caller refuses rather than
-			// judging a prefix of the writes and calling it the whole set.
-			return distinct, true, nil
-		}
-		seen[target] = struct{}{}
-		distinct = append(distinct, target)
-	}
-	return distinct, opaque, nil
-}
-
 // clipForReason bounds model-authored text quoted into a decision's Reason,
 // which travels into logs, transcripts and the TUI. Cut on a rune boundary.
 func clipForReason(s string) string {
@@ -1253,748 +1229,6 @@ func clipForReason(s string) string {
 		cut--
 	}
 	return s[:cut] + "…"
-}
-
-// streamDevices are the device paths a redirection writes to without creating
-// or changing any file: a sink that keeps nothing, or a stream the command
-// already owns.
-var streamDevices = map[string]bool{
-	"/dev/null":   true,
-	"/dev/zero":   true,
-	"/dev/stdout": true,
-	"/dev/stderr": true,
-	"/dev/tty":    true,
-}
-
-// IsStreamDevice reports whether a redirection target is a stream rather than a
-// file, so that it is not a write for the write gate to judge.
-//
-// It used to be judged as one, and refused as path.outside_root — a hard,
-// ungrantable denial for `ls 2>/dev/null` and `cmd >/dev/null 2>&1`, which
-// appear in nearly every shell line an agent writes, while the same command
-// without the redirect ran. A redirect into /dev/fd/N writes to a descriptor
-// that is either inherited from the caller or was opened by an earlier
-// redirection on the same line, and that earlier redirection is itself a target
-// judged here.
-//
-// The match is exact after cleaning, which is how the kernel resolves the path
-// too: `/dev//null` is the sink, while `/dev/null.txt`, `/dev/fd/2x` and
-// `/dev/fd/../../etc/passwd` are ordinary paths and are judged as the writes
-// they are.
-func IsStreamDevice(target string) bool {
-	if !strings.HasPrefix(target, "/dev/") {
-		return false
-	}
-	cleaned := path.Clean(target)
-	if streamDevices[cleaned] {
-		return true
-	}
-	fd, ok := strings.CutPrefix(cleaned, "/dev/fd/")
-	if !ok || fd == "" || len(fd) > 4 {
-		return false
-	}
-	for _, r := range fd {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return true
-}
-
-// maxRedirectTargets bounds how many distinct files one command line may be
-// judged to write.
-//
-// It is a backstop rather than a tuning knob. A real command redirects into a
-// handful of files; a line naming more than this is not a command someone
-// wrote, and enumerating it without limit hands an unbounded amount of gate
-// work to whoever composed the string. Exceeding it is reported as an
-// incomplete enumeration, so the caller fails closed instead of judging the
-// first sixty-four writes and ignoring the rest.
-const maxRedirectTargets = 64
-
-func redirectTargets(command string, depth int) ([]string, bool, error) {
-	// Exhausting the bound reports opacity, not an error. Both mean "there may
-	// be a write in here that I did not resolve", but they travel differently:
-	// opacity becomes a recorded command.substitution denial the run log counts
-	// and Report() can account for, while an error unwinds past the decision
-	// entirely and is refused by whoever catches it, if anyone does. It is also
-	// the answer this function already gives for the other unresolvable target
-	// — `> $VAR` — and one predicate should not have two spellings of "I could
-	// not look". What must never happen is the third answer: an unsearched span
-	// reported as "no targets", which is how "approved" comes to mean
-	// "unexamined".
-	if depth > maxSubstitutionDepth {
-		return nil, true, nil
-	}
-	var targets []string
-	opaque := false
-
-	runes := []rune(command)
-	n := len(runes)
-	quote := rune(0)
-	i := 0
-	// masked is this command line as the argument scan below reads it: every
-	// substitution span this loop descends into is replaced by
-	// substitutionPlaceholder (processSubstitutionPlaceholder for <( … ) and
-	// >( … )), every output redirection this loop reads is
-	// replaced by a space, and every unquoted ( or ) — subshell syntax, never
-	// part of a word — becomes a space. What is left is the line's own words,
-	// split into clauses by the same splitter the ladder uses, with nothing in
-	// it that this loop has already accounted for. The spans themselves are
-	// scanned by descend, which runs this whole function, argument scan
-	// included, on their text.
-	var masked strings.Builder
-	readTarget := func(start int) (string, int, error) {
-		j := start
-		for j < n && runes[j] == ' ' {
-			j++
-		}
-		if j >= n {
-			return "", 0, fmt.Errorf("redirection with no target")
-		}
-		if runes[j] == '&' || (runes[j] >= '0' && runes[j] <= '9') && j+1 < n && runes[j+1] == '&' {
-			// >&N / &N — dup to a descriptor, not a path.
-			for j < n && runes[j] != ' ' {
-				j++
-			}
-			return "", j, nil
-		}
-		var b strings.Builder
-		q := rune(0)
-		for j < n {
-			r := runes[j]
-			if q == 0 && r == '\\' && j+1 < n {
-				b.WriteRune(runes[j+1])
-				j += 2
-				continue
-			}
-			if q == 0 && (r == '\'' || r == '"') {
-				q = r
-				j++
-				continue
-			}
-			if q != 0 && r == q {
-				q = 0
-				j++
-				continue
-			}
-			// A backtick closes a legacy substitution; it is never part of the
-			// path. Without it `echo `cat > f`` yielded the target "f`", and
-			// the gate then judged a filename the shell never opens — which
-			// took a write to .env past the secret rung as ".env`".
-			//
-			// Live inside double quotes as well as unquoted, which is the half
-			// this originally missed: sh expands `…` within "…", and only a
-			// single quote makes a backtick literal. While it was guarded on
-			// the unquoted state alone, `>"` followed by a backtick pair read
-			// as a filename spelled with backticks in it, so the gate judged
-			// "`>0`" while the shell ran the substitution and opened `0` — a
-			// write the enumeration never reported. Found by
-			// FuzzRedirectTargetsSeesInsideEverySubstitution.
-			if (q == 0 || q == '"') && r == '`' {
-				break
-			}
-			if q == 0 && (r == ' ' || r == '\n' || r == '\t' || r == ';' || r == '|' || r == '&' ||
-				r == '(' || r == ')') {
-				break
-			}
-			b.WriteRune(r)
-			j++
-		}
-		return b.String(), j, nil
-	}
-	// descend judges the redirections inside a substitution as the writes they
-	// are. Its findings merge into this command's, because sh performs them
-	// whether or not the surrounding line has a redirect of its own.
-	descend := func(inner string) error {
-		innerTargets, innerOpaque, err := redirectTargets(inner, depth+1)
-		if err != nil {
-			return err
-		}
-		targets = append(targets, innerTargets...)
-		opaque = opaque || innerOpaque
-		return nil
-	}
-	for i < n {
-		if next, nq, handled := shellQuoteStep(runes, i, quote); handled {
-			masked.WriteString(string(runes[i:next]))
-			quote = nq
-			i = next
-			continue
-		}
-		r := runes[i]
-		switch {
-		case r == '`':
-			text, next, err := scanBacktickSpan(runes, i)
-			if err != nil {
-				return nil, false, err
-			}
-			if err := descend(text); err != nil {
-				return nil, false, err
-			}
-			masked.WriteString(substitutionPlaceholder)
-			i = next
-		case r == '$' && i+2 < n && runes[i+1] == '(' && runes[i+2] == '(':
-			inner, next, ok := scanArithmetic(runes, i)
-			if !ok {
-				return nil, false, fmt.Errorf("unterminated arithmetic expansion")
-			}
-			// The inner text is NOT scanned as a redirect context. Inside
-			// arithmetic `>` and `<` are comparison operators: `echo $((3 > 2))`
-			// writes no file, and reading that `>` as a redirection invents a
-			// write to a file named 2. What is real in here is a nested command
-			// substitution — an ordinary command, whose redirections write
-			// ordinary files — so those are extracted and descended into, and
-			// nothing else is.
-			nested, err := liveSubstitutions(inner)
-			if err != nil {
-				return nil, false, err
-			}
-			for _, span := range nested {
-				if err := descend(span); err != nil {
-					return nil, false, err
-				}
-			}
-			masked.WriteString(substitutionPlaceholder)
-			i = next
-		case r == '$' && i+1 < n && runes[i+1] == '(':
-			text, next, err := scanParenSpan(runes, i+1)
-			if err != nil {
-				return nil, false, err
-			}
-			if err := descend(text); err != nil {
-				return nil, false, err
-			}
-			masked.WriteString(substitutionPlaceholder)
-			i = next
-		case quote == 0 && (r == '<' || r == '>') && i+1 < n && runes[i+1] == '(':
-			// Process substitution: the code inside runs, and its redirections
-			// write files, exactly like $( … ) — but only unquoted. Inside
-			// double quotes it is literal text, which is why this carries the
-			// same guard as its counterpart in liveSubstitutions; see the note
-			// there for the measurements.
-			text, next, err := scanParenSpan(runes, i+1)
-			if err != nil {
-				return nil, false, err
-			}
-			if err := descend(text); err != nil {
-				return nil, false, err
-			}
-			// Unlike $( … ), the word this leaves behind is not computed
-			// text: sh replaces it with a /dev/fd path to the pipe, which is
-			// a stream rather than a file. `tee >(gzip > out.gz) f` writes
-			// out.gz inside the span and f outside it, and nothing else.
-			masked.WriteString(processSubstitutionPlaceholder)
-			i = next
-		case quote != 0:
-			// Only the "…" state reaches here. The substitutions above still
-			// execute inside it; a bare > does not — it is literal text.
-			masked.WriteRune(r)
-			i++
-		case r == '<' && i+1 < n && runes[i+1] == '<':
-			// Heredoc introducer or herestring; not an output path.
-			masked.WriteString("<<")
-			i += 2
-		case r == '>' || (r >= '0' && r <= '9' && i+1 < n && runes[i+1] == '>'):
-			fdStart := i
-			for i < n && runes[i] >= '0' && runes[i] <= '9' {
-				i++
-			}
-			if i >= n || runes[i] != '>' {
-				masked.WriteRune(runes[fdStart])
-				i = fdStart + 1
-				continue
-			}
-			// sh reads leading digits as a descriptor only when they are the
-			// whole word before the operator: `tee a2>f` writes a2 and f. This
-			// scan has always read the 2 as a descriptor, which is harmless
-			// for the redirect target, but the argument scan must still see
-			// the word a2.
-			if fdStart > 0 && !strings.ContainsRune(" \t\n\r;|&()", runes[fdStart-1]) {
-				masked.WriteString(string(runes[fdStart:i]))
-			}
-			masked.WriteRune(' ')
-			i++                           // consume '>'
-			if i < n && runes[i] == '>' { // append form >>
-				i++
-			} else if i < n && runes[i] == '|' {
-				// >| is > with noclobber overridden. It names a path exactly
-				// as > does; read as an unresolvable target it reported
-				// opacity, which refused the command for the wrong reason and
-				// — because the refusal never reached the write gate — let the
-				// path itself go unjudged.
-				i++
-			} else if i < n && runes[i] == '&' { // >&N duplicates descriptors
-				i++
-				for i < n && runes[i] >= '0' && runes[i] <= '9' {
-					i++
-				}
-				continue
-			}
-			target, next, err := readTarget(i)
-			if err != nil {
-				return nil, false, err
-			}
-			if unresolvableWord(target) {
-				opaque = true
-			} else if target != "" {
-				targets = append(targets, target)
-			} else {
-				opaque = true
-			}
-			i = next
-		case r == '(' || r == ')':
-			// Unquoted, a parenthesis is subshell or grouping syntax and
-			// never part of a word: `(tee f)` runs tee on f, not on "f)".
-			masked.WriteRune(' ')
-			i++
-		default:
-			masked.WriteRune(r)
-			i++
-		}
-	}
-
-	// The files the line writes through its commands' arguments rather than
-	// through an operator. They are the same writes — `sed -i … f`, `tee f`,
-	// `cp a f` and `echo x > f` all leave f changed — and a rung that judged
-	// only the operator spelling refused the redirect and passed the other
-	// four. See argumentWriteTargets for which commands and why.
-	argTargets, argOpaque := argumentWriteTargets(masked.String())
-	targets = append(targets, argTargets...)
-	opaque = opaque || argOpaque
-	// Reconciled against liveSubstitutions before this function answers, because
-	// the two scan one string against one grammar and have never fully agreed
-	// about what that grammar is. Only this half knew `<<` introduces a
-	// heredoc; only that half knew a backtick stays live inside double quotes;
-	// neither had process substitution right in quotes; and they still tokenise
-	// a backslash differently inside a substitution span. Every one of those
-	// ended the same way — this half answered "these are the writes, and I am
-	// sure" about a line its sibling read differently — and that is the answer
-	// EvaluateRedirects turns straight into an allow.
-	//
-	// Four instances were found in four runs, so the instances are not the
-	// thing to fix. The disagreement itself is the condition: if the sibling
-	// scanner cannot read this line, or finds a span that resolves to a write
-	// this scan did not reach, the enumeration is not complete and says so.
-	//
-	// It reports opacity rather than adopting the other scanner's targets on
-	// purpose. When two lexers disagree about a string, which one is right is
-	// exactly what is not known here, and stating a target under this scan's
-	// authority that this scan did not derive would be a guess wearing a
-	// result's clothes. Opacity is already this function's word for "there may
-	// be a write in here that I did not resolve", and it is what the caller
-	// fails closed on.
-	//
-	// The direction is deliberate: this only ever *adds* opacity, and opacity
-	// is a denial. It also runs after the scan rather than before it, because
-	// containment is a claim about the targets this scan produced and there are
-	// none to compare against until it has finished.
-	if spans, subErr := liveSubstitutions(command); subErr != nil {
-		opaque = true
-	} else {
-		have := make(map[string]struct{}, len(targets))
-		for _, target := range targets {
-			have[target] = struct{}{}
-		}
-	reconcile:
-		for _, span := range spans {
-			// depth+1 so this shares the recursion bound with descend rather
-			// than adding a second, independent one. Past the bound the call
-			// returns opacity immediately, which is both the fail-closed answer
-			// and what stops this walk.
-			spanTargets, spanOpaque, spanErr := redirectTargets(span, depth+1)
-			if spanErr != nil || spanOpaque {
-				opaque = true
-				break
-			}
-			for _, target := range spanTargets {
-				if _, ok := have[target]; !ok {
-					opaque = true
-					break reconcile
-				}
-			}
-		}
-	}
-
-	return targets, opaque, nil
-}
-
-// substitutionPlaceholder stands in for a substitution span in the text the
-// argument scan reads. It carries a `$`, so an operand built from a
-// substitution — `cp a $(pick)`, `tee "$(date).log"` — reads as the
-// unresolvable word it is, exactly as `> $(pick)` does.
-const substitutionPlaceholder = "$()"
-
-// processSubstitutionPlaceholder stands in for a <( … ) or >( … ) span in the
-// text the argument scan reads. sh replaces the span with a path to a pipe
-// under /dev/fd, which IsStreamDevice exempts, so a command writing to it —
-// `tee >(gzip > out.gz)` — names no file beyond what the span itself writes.
-const processSubstitutionPlaceholder = "/dev/fd/63"
-
-// unresolvableWord reports whether a write target names a path only the shell
-// can compute: it carries a parameter expansion ($HOME, ${X}, or a
-// substitution's placeholder) or a tilde. One predicate for redirection targets
-// and argument operands, so the two cannot disagree about what is nameable.
-func unresolvableWord(word string) bool {
-	return strings.ContainsAny(word, "$~")
-}
-
-// argumentWriteTargets returns the files the commands in line write through
-// their arguments, and whether any of those files could not be named.
-//
-// line is the masked text redirectTargets builds: substitutions, output
-// redirections and subshell parentheses are already gone, so each clause is the
-// command's own words. Clauses are split by SplitCommandChain and words by
-// shellWords — the ladder's own splitters, not a second reading of the grammar.
-//
-// The commands are the ones that write a file named in their arguments as
-// their ordinary purpose:
-//
-//   - sed with -i/-I/--in-place in any spelling writes every file operand, and
-//     a backup beside each when a suffix is given. Without in-place it writes
-//     nothing. The script (the first operand, unless -e/-f supplied it) is not
-//     a file.
-//   - tee writes every file operand.
-//   - cp writes its destination — or DIR/basename(source) for each source when
-//     the destination is a directory: named by -t/--target-directory, written
-//     with a trailing slash, or implied by more than one source.
-//   - mv writes the same paths as cp, and changes every source too: it removes
-//     it.
-//
-// A destination given without a trailing slash is judged as the path written,
-// even though an existing directory there would receive DIR/basename instead;
-// the filesystem is not consulted. An operand only the shell can resolve
-// reports opacity, as an unresolvable redirection target does. A glob is
-// judged as the literal path, as a glob in a redirection target is.
-func argumentWriteTargets(line string) ([]string, bool) {
-	var targets []string
-	opaque := false
-	for _, clause := range SplitCommandChain(line) {
-		words := shellWords(clause)
-		at := argumentCommandWord(words)
-		if at < 0 {
-			continue
-		}
-		var args []shellWord
-		for k := at + 1; k < len(words); k++ {
-			// Input redirections are still in the text (only output ones were
-			// masked); `tee < in f` reads in and writes f.
-			if !words[k].quotedHead {
-				if operand, isRedirect := redirectionPrefix(words[k].text); isRedirect {
-					if operand {
-						k++
-					}
-					continue
-				}
-			}
-			args = append(args, words[k])
-		}
-		var written []string
-		var unresolved bool
-		switch path.Base(words[at].text) {
-		case "sed":
-			written, unresolved = sedWrites(args)
-		case "tee":
-			written, unresolved = teeWrites(args)
-		case "cp":
-			written, unresolved = copyWrites(args, false)
-		case "mv":
-			written, unresolved = copyWrites(args, true)
-		}
-		targets = append(targets, written...)
-		opaque = opaque || unresolved
-	}
-	return targets, opaque
-}
-
-// argumentWrappers run the command named by the following words. Stepped over
-// when looking for the command word, like command/builtin in
-// reparsingCommandWord. A wrapper followed by an option stops the search: its
-// options may take arguments, and guessing which word is the command would
-// name a write that does not happen or miss one that does.
-var argumentWrappers = map[string]bool{
-	"command": true, "builtin": true, "exec": true, "env": true,
-	"sudo": true, "nohup": true, "time": true,
-}
-
-// shellReservedPrefixes are the reserved words that may stand before a simple
-// command in a clause the chain splitter produced: `if tee f; then …`,
-// `then tee f`, `{ tee f; }`, `! tee f`.
-var shellReservedPrefixes = map[string]bool{
-	"if": true, "then": true, "else": true, "elif": true, "do": true,
-	"while": true, "until": true, "!": true, "{": true,
-}
-
-// argumentCommandWord returns the index of the word sh would run in one
-// clause, or -1. Assignments and redirections before it are stepped over as in
-// reparsingCommandWord; so are reserved words and argumentWrappers.
-func argumentCommandWord(words []shellWord) int {
-	for i := 0; i < len(words); i++ {
-		word := words[i]
-		if word.quotedHead {
-			return i
-		}
-		if isAssignmentWord(word.text) || shellReservedPrefixes[word.text] {
-			continue
-		}
-		if operand, isRedirect := redirectionPrefix(word.text); isRedirect {
-			if operand {
-				i++
-			}
-			continue
-		}
-		if argumentWrappers[word.text] {
-			if i+1 < len(words) && strings.HasPrefix(words[i+1].text, "-") {
-				return -1
-			}
-			continue
-		}
-		return i
-	}
-	return -1
-}
-
-// sedWrites reads a sed argument list the way GNU sed does — options may
-// follow operands, and -i takes its suffix only attached — with one
-// concession to BSD sed, where -i always takes a suffix: an empty word or one
-// starting with "." after a bare -i is that suffix (macOS writes an empty
-// quoted suffix to mean "no backup", and `sed -i .bak …` to keep one). No sed script begins with ".", and an empty script is no
-// script, so neither reading can mistake a GNU script for it.
-func sedWrites(args []shellWord) ([]string, bool) {
-	inPlace, haveScript, endOfOptions := false, false, false
-	suffix := ""
-	var operands []string
-	for k := 0; k < len(args); k++ {
-		w := args[k].text
-		if endOfOptions || w == "-" || !strings.HasPrefix(w, "-") {
-			operands = append(operands, w)
-			continue
-		}
-		if w == "--" {
-			endOfOptions = true
-			continue
-		}
-		if long, ok := strings.CutPrefix(w, "--"); ok {
-			name, value, hasValue := strings.Cut(long, "=")
-			switch name {
-			case "in-place":
-				inPlace = true
-				if hasValue {
-					suffix = value
-				}
-			case "expression", "file":
-				haveScript = true
-				if !hasValue {
-					k++
-				}
-			case "line-length":
-				if !hasValue {
-					k++
-				}
-			}
-			continue
-		}
-		cluster := w[1:]
-		for c := 0; c < len(cluster); c++ {
-			switch cluster[c] {
-			case 'i', 'I':
-				inPlace = true
-				if rest := cluster[c+1:]; rest != "" {
-					suffix = rest
-				} else if k+1 < len(args) && (args[k+1].text == "" || strings.HasPrefix(args[k+1].text, ".")) {
-					suffix = args[k+1].text
-					k++
-				}
-				c = len(cluster)
-			case 'e', 'f', 'l':
-				// The option's argument is the rest of the cluster, or the
-				// next word when the cluster ends here.
-				if cluster[c] != 'l' {
-					haveScript = true
-				}
-				if c+1 == len(cluster) {
-					k++
-				}
-				c = len(cluster)
-			}
-		}
-	}
-	if !inPlace {
-		return nil, false
-	}
-	if !haveScript && len(operands) > 0 {
-		operands = operands[1:]
-	}
-	var targets []string
-	opaque := suffix != "" && unresolvableWord(suffix)
-	for _, file := range operands {
-		if file == "-" {
-			continue // standard input, which sed refuses to edit in place
-		}
-		if unresolvableWord(file) {
-			opaque = true
-			continue
-		}
-		targets = append(targets, file)
-		if suffix != "" && !opaque {
-			targets = append(targets, sedBackupName(file, suffix))
-		}
-	}
-	return targets, opaque
-}
-
-// sedBackupName is the file sed -i keeps the original in: the name with the
-// suffix appended, or — when the suffix holds `*` — the suffix with each `*`
-// replaced by the file's base name, in the file's directory.
-func sedBackupName(file, suffix string) string {
-	dir, base := path.Split(file)
-	if !strings.Contains(suffix, "*") {
-		return file + suffix
-	}
-	return dir + strings.ReplaceAll(suffix, "*", base)
-}
-
-// teeWrites returns every file operand of tee. Its options take no arguments
-// except --output-error, whose mode is attached with =.
-func teeWrites(args []shellWord) ([]string, bool) {
-	var targets []string
-	opaque, endOfOptions := false, false
-	for _, arg := range args {
-		w := arg.text
-		if !endOfOptions && w == "--" {
-			endOfOptions = true
-			continue
-		}
-		if !endOfOptions && len(w) > 1 && strings.HasPrefix(w, "-") {
-			continue
-		}
-		if w == "-" {
-			continue // standard output, not a file
-		}
-		if unresolvableWord(w) {
-			opaque = true
-			continue
-		}
-		targets = append(targets, w)
-	}
-	return targets, opaque
-}
-
-// copyWrites returns the paths cp (or, with move, mv) writes. Options that take
-// a separate argument are -t/--target-directory and -S/--suffix; the rest are
-// flags or carry their value after =.
-func copyWrites(args []shellWord, move bool) ([]string, bool) {
-	targetDir, haveTargetDir := "", false
-	noTargetDir, endOfOptions := false, false
-	var operands []string
-	for k := 0; k < len(args); k++ {
-		w := args[k].text
-		if endOfOptions || w == "-" || !strings.HasPrefix(w, "-") {
-			operands = append(operands, w)
-			continue
-		}
-		if w == "--" {
-			endOfOptions = true
-			continue
-		}
-		if long, ok := strings.CutPrefix(w, "--"); ok {
-			name, value, hasValue := strings.Cut(long, "=")
-			switch name {
-			case "target-directory":
-				if !hasValue {
-					if k+1 >= len(args) {
-						return nil, false // cp/mv refuse a missing argument and write nothing
-					}
-					k++
-					value = args[k].text
-				}
-				haveTargetDir, targetDir = true, value
-			case "suffix":
-				if !hasValue {
-					k++
-				}
-			case "no-target-directory":
-				noTargetDir = true
-			}
-			continue
-		}
-		cluster := w[1:]
-		for c := 0; c < len(cluster); c++ {
-			switch cluster[c] {
-			case 'T':
-				noTargetDir = true
-			case 't', 'S':
-				value := cluster[c+1:]
-				if value == "" {
-					if k+1 >= len(args) {
-						return nil, false // cp/mv refuse a missing argument and write nothing
-					}
-					k++
-					value = args[k].text
-				}
-				if cluster[c] == 't' {
-					haveTargetDir, targetDir = true, value
-				}
-				c = len(cluster)
-			}
-		}
-	}
-
-	var sources []string
-	dir := ""
-	switch {
-	case haveTargetDir:
-		sources, dir = operands, targetDir
-	case len(operands) < 2:
-		return nil, false // nothing to copy, or nowhere to copy it
-	default:
-		sources = operands[:len(operands)-1]
-		dest := operands[len(operands)-1]
-		if noTargetDir || (len(sources) == 1 && !strings.HasSuffix(dest, "/")) {
-			if unresolvableWord(dest) {
-				return nil, true
-			}
-			targets := []string{dest}
-			if move {
-				return appendResolvable(targets, sources)
-			}
-			return targets, false
-		}
-		dir = dest
-	}
-	if unresolvableWord(dir) {
-		return nil, true
-	}
-	var targets []string
-	opaque := false
-	for _, source := range sources {
-		base := path.Base(source)
-		if unresolvableWord(base) {
-			opaque = true
-			continue
-		}
-		targets = append(targets, strings.TrimRight(dir, "/")+"/"+base)
-	}
-	if move {
-		var moveOpaque bool
-		targets, moveOpaque = appendResolvable(targets, sources)
-		opaque = opaque || moveOpaque
-	}
-	return targets, opaque
-}
-
-// appendResolvable appends each path that can be named and reports whether
-// any could not.
-func appendResolvable(targets, paths []string) ([]string, bool) {
-	opaque := false
-	for _, p := range paths {
-		if unresolvableWord(p) {
-			opaque = true
-			continue
-		}
-		targets = append(targets, p)
-	}
-	return targets, opaque
 }
 
 // devToolDirs are the directory names a repo-local dev CLI is installed under.
