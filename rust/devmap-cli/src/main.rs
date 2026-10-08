@@ -46,6 +46,7 @@ macro_rules! outln {
     };
 }
 
+mod agents;
 mod claude;
 mod digest_cache;
 mod hook;
@@ -2154,7 +2155,7 @@ fn doctor_report(
     let mut digests = crate::digest_cache::BinaryDigests::open_read_only(Some(&state_dir));
     let binaries = inventory_devmap_binaries(&mut digests)?;
     let skew = binaries_skew_warning(&binaries);
-    Ok(serde_json::json!({
+    let mut report = serde_json::json!({
         "schema_version": schema_version,
         "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
         "code_graph_schema_version": CODE_GRAPH_SCHEMA_VERSION,
@@ -2171,7 +2172,32 @@ fn doctor_report(
         "plugin_cleanup_note": plugin_cleanup_note(),
         "stale_server_warning": stale_server_warning(),
         "mcp_registrations": mcp_registration_inventory(),
-    }))
+    });
+    extend_agent_tools(&mut report, root);
+    Ok(report)
+}
+
+/// Add `agent_tools_warning` and `agent_tool_gaps`: the Claude Code agent
+/// definitions a session rooted at `root` loads whose tool grant leaves DevMap
+/// out, so subagents of that type cannot call `devmap_*`. See [`agents`].
+fn extend_agent_tools(value: &mut serde_json::Value, root: &Path) {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    // A relative root is invocation-relative; the warning names files by
+    // absolute path so it points at them wherever it is read.
+    let root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+    let scan = agents::scan(&agents::agent_dirs(home.as_deref(), &root));
+    let gaps: Vec<serde_json::Value> = scan
+        .gaps
+        .iter()
+        .map(|gap| serde_json::json!({"path": gap.path, "reason": gap.reason}))
+        .collect();
+    if let Some(fields) = value.as_object_mut() {
+        fields.insert(
+            "agent_tools_warning".into(),
+            serde_json::json!(agents::warning(&scan)),
+        );
+        fields.insert("agent_tool_gaps".into(), serde_json::json!(gaps));
+    }
 }
 
 /// What the whole binary inventory may spend hashing, shared across every file
@@ -7223,7 +7249,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             let mut digests = crate::digest_cache::BinaryDigests::open(Some(&state_dir));
             let binaries = inventory_devmap_binaries(&mut digests)?;
             let skew = binaries_skew_warning(&binaries);
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "root": root,
                 "state_dir": state_dir,
                 "state_dir_exists": state_dir.is_dir(),
@@ -7244,6 +7270,7 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                 "version": env!("CARGO_PKG_VERSION"),
                 "build": build_identity_json(),
             });
+            extend_agent_tools(&mut payload, &root);
             if cli.json {
                 emit_json(cli, &payload)?;
             } else {

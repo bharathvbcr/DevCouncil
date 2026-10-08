@@ -217,3 +217,164 @@ fn plugin_version_mismatch_is_reported() {
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&cwd);
 }
+
+fn write_agent(dir: &Path, name: &str, frontmatter: &str) -> PathBuf {
+    fs::create_dir_all(dir).unwrap();
+    let path = dir.join(format!("{name}.md"));
+    fs::write(
+        &path,
+        format!("---\nname: {name}\n{frontmatter}---\nDo the work.\n"),
+    )
+    .unwrap();
+    path
+}
+
+/// An agent type with an explicit `tools:` allowlist is handed only what it
+/// names, so a list without DevMap leaves every subagent of that type
+/// navigating by grep. Reported from a real session: `code-editor` and
+/// `code-reader` both had lists like these and neither could call
+/// `devmap_search`.
+#[test]
+fn an_agent_whose_tool_list_excludes_devmap_is_named() {
+    let home = scratch("home-agents");
+    let cwd = scratch("cwd-agents");
+    let user = write_agent(
+        &home.join(".claude/agents"),
+        "code-editor",
+        "tools: Read, Edit, Write, Grep, Glob, Bash\n",
+    );
+    let project = write_agent(
+        &cwd.join(".claude/agents"),
+        "code-reader",
+        "tools:\n  - Read\n  - Grep\n",
+    );
+    let payload = doctor_with_home(&home, &cwd);
+    let warning = payload["agent_tools_warning"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected an agent tools warning, got {payload}"));
+    for path in [&user, &project] {
+        assert!(
+            warning.contains(&path.display().to_string()),
+            "{} not named: {warning}",
+            path.display()
+        );
+    }
+    // The remedy is the exact entries to add, not a pointer to documentation.
+    assert!(warning.contains("mcp__plugin_devmap_devmap"), "{warning}");
+    let gaps = payload["agent_tool_gaps"].as_array().expect("gap list");
+    assert_eq!(gaps.len(), 2, "{payload}");
+    // `devmap paths` is the command the generated agent guide says to run
+    // first, so it carries the same finding.
+    let out = Command::new(devmap_bin())
+        .args(["--json", "paths"])
+        .current_dir(&cwd)
+        .env("HOME", &home)
+        .env_remove("DEVMAP_HOME")
+        .output()
+        .expect("paths runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let paths: Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).lines().next().unwrap())
+            .expect("paths json");
+    assert_eq!(
+        paths["agent_tool_gaps"].as_array().map(Vec::len),
+        Some(2),
+        "{paths}"
+    );
+    assert!(
+        paths["agent_tools_warning"]
+            .as_str()
+            .is_some_and(|w| w.contains(&user.display().to_string())),
+        "{paths}"
+    );
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&cwd);
+}
+
+/// Lists that already reach DevMap — by one tool under any prefix it is served
+/// under, or by a server-level grant — and agents with no list at all, which
+/// inherit every tool, are not warned about.
+#[test]
+fn agents_that_can_reach_devmap_are_not_warned_about() {
+    let home = scratch("home-agents-ok");
+    let cwd = scratch("cwd-agents-ok");
+    let agents = home.join(".claude/agents");
+    write_agent(&agents, "inherits", "model: opus\n");
+    write_agent(
+        &agents,
+        "server-grant",
+        "tools: Read, mcp__plugin_devmap_devmap\n",
+    );
+    write_agent(
+        &agents,
+        "server-glob",
+        "tools: [Read, \"mcp__devmap__*\"]\n",
+    );
+    write_agent(
+        &agents,
+        "one-tool",
+        "tools: Read, Grep,\n  mcp__plugin_gitpulse_gitpulse__devmap_search\n",
+    );
+    let payload = doctor_with_home(&home, &cwd);
+    assert!(payload["agent_tools_warning"].is_null(), "{payload}");
+    assert_eq!(
+        payload["agent_tool_gaps"],
+        serde_json::json!([]),
+        "{payload}"
+    );
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&cwd);
+}
+
+/// Naming a gitpulse tool is not a DevMap grant, though the gitpulse plugin
+/// serves `devmap_*` too. An agent that removes DevMap in `disallowedTools`
+/// excluded it on purpose — a web researcher has no code to navigate — and the
+/// remedy the warning prints says so, so following it clears the warning.
+#[test]
+fn a_gitpulse_grant_is_a_gap_and_a_devmap_denial_is_an_opt_out() {
+    let home = scratch("home-agents-deny");
+    let cwd = scratch("cwd-agents-deny");
+    let agents = home.join(".claude/agents");
+    let gitpulse_only = write_agent(
+        &agents,
+        "gitpulse-only",
+        "tools: Read, mcp__plugin_gitpulse_gitpulse__gitpulse_insights\n",
+    );
+    let researcher = write_agent(&agents, "researcher", "tools: WebFetch, Read\n");
+    let payload = doctor_with_home(&home, &cwd);
+    let warning = payload["agent_tools_warning"].as_str().unwrap_or("");
+    for path in [&gitpulse_only, &researcher] {
+        assert!(
+            warning.contains(&path.display().to_string()),
+            "{} not named: {payload}",
+            path.display()
+        );
+    }
+    let opt_out = warning
+        .split("add `")
+        .nth(1)
+        .and_then(|rest| rest.split('`').next())
+        .unwrap_or_else(|| panic!("no opt-out line in {warning}"))
+        .to_string();
+    write_agent(
+        &agents,
+        "researcher",
+        &format!("tools: WebFetch, Read\n{opt_out}\n"),
+    );
+    let payload = doctor_with_home(&home, &cwd);
+    let warning = payload["agent_tools_warning"].as_str().unwrap_or("");
+    assert!(
+        !warning.contains(&researcher.display().to_string()),
+        "the printed opt-out did not clear it: {opt_out} -> {payload}"
+    );
+    assert!(
+        warning.contains(&gitpulse_only.display().to_string()),
+        "{payload}"
+    );
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&cwd);
+}
