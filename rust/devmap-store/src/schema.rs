@@ -1357,6 +1357,53 @@ CREATE INDEX IF NOT EXISTS idx_generation_literals_value
 
 pub const CURRENT_SCHEMA_VERSION: i32 = 26;
 
+/// The oldest reader schema that can read a store this binary writes.
+///
+/// `user_version` alone forced an exact match on every reader, so each bump —
+/// including v26, which only *added* a table no older reader selects — blinded
+/// every embedding reader (GitPulse links `devmap-store` read-only) until it was
+/// re-vendored. The writer is the only party that knows whether a bump is safe
+/// for an older reader, so the writer says so, in the store, through
+/// [`READER_COMPAT_TABLE`]; [`Store::open_read_only`](crate::Store::open_read_only)
+/// admits a store newer than itself only when this floor reaches down to it.
+///
+/// When raising [`CURRENT_SCHEMA_VERSION`], add a row to
+/// [`SCHEMA_READER_FLOORS`] and set this to its floor:
+///
+/// * **keep the previous floor** when the bump only adds tables, indexes or
+///   nullable columns that older readers never select (v26:
+///   `generation_literals`);
+/// * **raise it to the new version** when the bump changes what an existing
+///   column means, writes a value an older binary would misdecode, or removes
+///   or renames anything an older reader selects. v23 and v25 were exactly
+///   this — version-only bumps that exist so an older binary *refuses* rather
+///   than reconstructing `LanguageServer` rows or `Registers` edges as
+///   something else.
+///
+/// Writers stay exact-match: a binary never migrates or writes a store newer
+/// than itself, whatever this floor says.
+pub const MIN_READER_SCHEMA_VERSION: i32 = 25;
+
+/// `(schema, floor)` for every schema since the floor was introduced, oldest
+/// first. The last row must be `(CURRENT_SCHEMA_VERSION,
+/// MIN_READER_SCHEMA_VERSION)`; a unit test holds that, so bumping the schema
+/// without deciding the new floor fails rather than silently inheriting one.
+pub const SCHEMA_READER_FLOORS: &[(i32, i32)] = &[(26, 25)];
+
+/// Where a writer records [`MIN_READER_SCHEMA_VERSION`].
+///
+/// Added without a `user_version` bump, on purpose: the table is invisible to
+/// every reader that does not look for it, so a schema-26 binary that predates
+/// it reads such a store exactly as before. A store without the row — written
+/// before this table existed — is read with the exact-match rule it always had.
+pub const READER_COMPAT_TABLE: &str = r#"
+CREATE TABLE IF NOT EXISTS reader_compat (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    min_reader_schema INTEGER NOT NULL
+        CHECK (typeof(min_reader_schema) = 'integer' AND min_reader_schema >= 3)
+);
+"#;
+
 /// The `user_version` the Python engine's `index.sqlite` carries — a database
 /// this kernel never wrote and cannot read. Named once, here, so the store's
 /// refusal and the CLI's `status` report the same number for the same file
@@ -1399,6 +1446,9 @@ pub const FRESH_SCHEMA_BATCHES: &[&str] = &[
     // Empty: v25 only stamps `user_version`.
     MIGRATION_V24_TO_V25,
     MIGRATION_V25_TO_V26,
+    // Not a rung: no `user_version` bump. Every writer open creates it — the
+    // fresh path and the ladder alike — so both still land on one schema.
+    READER_COMPAT_TABLE,
 ];
 
 /// Strip SQL line comments so a scan of DDL text cannot read prose as code.

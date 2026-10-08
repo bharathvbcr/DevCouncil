@@ -2064,6 +2064,18 @@ struct StoredPayload<'a> {
     extraction_json: &'a str,
 }
 
+/// Relations the current schema creates that a reader must tolerate *absent*,
+/// and so that `REQUIRED_SCHEMA` deliberately does not name.
+///
+/// `reader_compat` arrived without a `user_version` bump, so a schema-26
+/// store written before it exists lacks it — and a reader cannot create it.
+/// Requiring it would make every such store unreadable by the binaries that
+/// introduced the floor, the opposite of what it is for. Its absence has a
+/// defined meaning instead (exact-match admission), and its *contents* are
+/// validated where they are read (`Store::recorded_reader_floor`), which
+/// refuses a damaged row rather than reading it as absent.
+pub(crate) const OPTIONAL_RELATIONS: &[&str] = &["reader_compat"];
+
 const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
     ("paths", &["id", "path"]),
     (

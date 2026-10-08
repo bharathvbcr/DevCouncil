@@ -250,12 +250,7 @@ impl Store {
             }
             Err(error) => return Err(error),
         };
-        if stamped != CURRENT_SCHEMA_VERSION {
-            return Err(Self::unsupported_schema(
-                &path.display().to_string(),
-                stamped,
-            ));
-        }
+        Self::admit_reader_schema(&conn, &path.display().to_string(), stamped)?;
         Self::configure_connection(&conn)?;
         Self::validate_schema(&conn)?;
         Ok(Self {
@@ -268,6 +263,39 @@ impl Store {
             db_path: Some(path.to_path_buf()),
             read_only: true,
         })
+    }
+
+    /// Whether a read-only open may read a store stamped `stamped`.
+    ///
+    /// The current schema always. An older one never: a reader cannot migrate,
+    /// and the columns it selects may not exist yet. A *newer* one only when
+    /// the writer that stamped it recorded a reader floor at or below this
+    /// binary's schema — the writer is the one party that knows whether its
+    /// bump is safe for an older reader (see [`MIN_READER_SCHEMA_VERSION`]).
+    /// No floor recorded means exact match, which is what every store written
+    /// before the floor existed was read under.
+    ///
+    /// Admission is not the last word: `validate_schema` still runs, so a
+    /// floor that claims compatibility over a store missing a column this
+    /// binary selects is refused there rather than failing a later query.
+    ///
+    /// [`MIN_READER_SCHEMA_VERSION`]: crate::schema::MIN_READER_SCHEMA_VERSION
+    pub(super) fn admit_reader_schema(conn: &Connection, store: &str, stamped: i32) -> Result<()> {
+        if stamped == CURRENT_SCHEMA_VERSION {
+            return Ok(());
+        }
+        if stamped < CURRENT_SCHEMA_VERSION {
+            return Err(Self::unsupported_schema(store, stamped));
+        }
+        match Self::recorded_reader_floor(conn, stamped)? {
+            Some(floor) if floor <= CURRENT_SCHEMA_VERSION => Ok(()),
+            Some(floor) => Err(refusal(format!(
+                "devmap store {store}: schema version {stamped} can be read only by a reader at \
+                 schema {floor} or newer, and this one reads schema {CURRENT_SCHEMA_VERSION}; \
+                 update the binary that embeds devmap-store (re-vendor or rebuild it)"
+            ))),
+            None => Err(Self::unsupported_schema(store, stamped)),
+        }
     }
 
     /// How long [`Store::open`] keeps retrying `SQLITE_PROTOCOL`.

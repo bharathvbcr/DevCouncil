@@ -8,7 +8,8 @@ use crate::schema::{
     MIGRATION_V18_TO_V19, MIGRATION_V19_TO_V20, MIGRATION_V20_TO_V21, MIGRATION_V21_TO_V22,
     MIGRATION_V23_TO_V24, MIGRATION_V25_TO_V26, MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5,
     MIGRATION_V4_TO_V5_EDGE_INDEXES, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8,
-    MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, VALIDITY_RANGE_TABLES,
+    MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, MIN_READER_SCHEMA_VERSION, READER_COMPAT_TABLE,
+    VALIDITY_RANGE_TABLES,
 };
 use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection, Result, TransactionBehavior};
@@ -68,6 +69,67 @@ impl Store {
             conn.execute_batch(&statement)?;
         }
         Ok(())
+    }
+
+    /// Record which reader schemas can read this store
+    /// ([`MIN_READER_SCHEMA_VERSION`]). Run by every writer open, on the fresh
+    /// path and at the end of the ladder, inside the migration transaction.
+    ///
+    /// Overwritten rather than kept: only the binary that stamped the current
+    /// `user_version` knows what its own bump means, and a writer that reached
+    /// this point is exactly that binary — a newer store is refused before it.
+    /// The `WHERE` keeps an already-correct row from dirtying a page on every
+    /// open.
+    pub(super) fn stamp_reader_compat(conn: &Connection) -> Result<()> {
+        conn.execute_batch(READER_COMPAT_TABLE)?;
+        conn.execute(
+            "INSERT INTO reader_compat (singleton, min_reader_schema) VALUES (1, ?1)
+             ON CONFLICT (singleton) DO UPDATE SET min_reader_schema = excluded.min_reader_schema
+             WHERE min_reader_schema IS NOT excluded.min_reader_schema",
+            params![MIN_READER_SCHEMA_VERSION],
+        )?;
+        Ok(())
+    }
+
+    /// The floor a writer recorded in this store, or `None` when it records
+    /// none — a store written before [`READER_COMPAT_TABLE`] existed.
+    ///
+    /// A row that is present but unusable (several rows, a floor below 3, a
+    /// floor above the store's own stamp) is a refusal, never `None`: a missing
+    /// floor means "exact match", which is safe, but a damaged one must not be
+    /// silently treated as missing.
+    pub(super) fn recorded_reader_floor(conn: &Connection, stamped: i32) -> Result<Option<i32>> {
+        if !Self::relation_is_table(conn, "reader_compat")? {
+            return Ok(None);
+        }
+        let floors: Vec<rusqlite::types::Value> = {
+            let mut stmt = conn.prepare("SELECT min_reader_schema FROM reader_compat")?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            rows.collect::<Result<_>>()?
+        };
+        let floor = match floors.as_slice() {
+            [] => return Ok(None),
+            [rusqlite::types::Value::Integer(floor)] => *floor,
+            [other] => {
+                return Err(refusal(format!(
+                    "reader_compat.min_reader_schema is {other:?}, not an integer; refusing a \
+                     floor this binary cannot read"
+                )))
+            }
+            many => {
+                return Err(refusal(format!(
+                    "reader_compat holds {} rows; refusing an ambiguous reader floor",
+                    many.len()
+                )))
+            }
+        };
+        if floor < 3 || floor > i64::from(stamped) {
+            return Err(refusal(format!(
+                "reader_compat.min_reader_schema = {floor} is outside 3..={stamped} for a store \
+                 at schema {stamped}; refusing a floor that cannot be true"
+            )));
+        }
+        Ok(Some(floor as i32))
     }
 
     pub(super) fn validate_schema(conn: &Connection) -> Result<()> {
@@ -296,6 +358,7 @@ impl Store {
             // After v21's drop of the same index, as on the ladder.
             tx.execute_batch(MIGRATION_V23_TO_V24)?;
             tx.execute_batch(MIGRATION_V25_TO_V26)?;
+            Self::stamp_reader_compat(tx)?;
             Self::validate_schema(tx)?;
             tx.execute(
                 &format!("PRAGMA user_version = {}", CURRENT_SCHEMA_VERSION),
@@ -694,6 +757,7 @@ impl Store {
         // A store already at the current version can still be missing an
         // index a later build of the same version added to the fresh schema.
         Self::heal_declared_indexes(conn)?;
+        Self::stamp_reader_compat(conn)?;
         Self::validate_schema(conn)?;
         Ok(())
     }

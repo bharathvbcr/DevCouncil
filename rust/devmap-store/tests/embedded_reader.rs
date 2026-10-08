@@ -81,6 +81,11 @@ fn old_future_and_corrupt_stores_are_refused_without_migration() {
         let temp = Scratch::new();
         drop(Store::open(temp.db()).unwrap());
         let conn = rusqlite::Connection::open(temp.db()).unwrap();
+        // A future store that records no reader floor is one this reader knows
+        // nothing about. (A future store whose writer *declared* this reader
+        // compatible is admitted — tests/reader_floor.rs holds that case,
+        // including that admitting it writes nothing.)
+        conn.execute_batch("DROP TABLE IF EXISTS reader_compat").unwrap();
         conn.pragma_update(None, "user_version", version).unwrap();
         drop(conn);
         let before = fs::read(temp.db()).unwrap();

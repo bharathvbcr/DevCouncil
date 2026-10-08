@@ -135,6 +135,8 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             "migration_ladder",
             "one_symlink_rule",
             "page_size_and_index_contracts",
+            // Store opens and hand-stamped schema rows; no extraction anywhere.
+            "reader_floor",
             "store_hardening_without_grammars",
             "write_breakdown_without_grammars",
         ],

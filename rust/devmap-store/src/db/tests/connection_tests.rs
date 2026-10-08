@@ -230,7 +230,20 @@ fn the_schema_gate_names_every_relation_the_current_schema_creates() {
         // follows from the virtual table and is not this schema's to declare.
         .filter(|name| !name.starts_with("nodes_fts_") || *name == "nodes_fts_map")
         .filter(|name| !required.contains(name.as_str()))
+        // Named, with the reason, beside REQUIRED_SCHEMA — never silently.
+        .filter(|name| !crate::db::OPTIONAL_RELATIONS.contains(&name.as_str()))
         .collect();
+    for optional in crate::db::OPTIONAL_RELATIONS {
+        assert!(
+            actual.iter().any(|name| name == optional),
+            "{optional} is listed optional but the current schema does not create it; \
+             a stale exemption hides nothing until it hides something"
+        );
+        assert!(
+            !required.contains(optional),
+            "{optional} cannot be both required and optional"
+        );
+    }
     assert!(
         missing.is_empty(),
         "{missing:?} exist in the current schema but the gate does not require them; \
