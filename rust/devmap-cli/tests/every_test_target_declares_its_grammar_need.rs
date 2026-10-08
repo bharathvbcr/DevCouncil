@@ -83,6 +83,7 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
     (
         "devmap-query",
         &[
+            "a_nan_floor_is_refused",
             // Exists to run without grammars: GitPulse's shape.
             "a_query_only_build_can_call_a_store_current",
             "artifact_writer_security",
@@ -125,6 +126,7 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             "a_refusal_names_its_reason_not_a_parameter",
             "adversarial_store_without_grammars",
             "embedded_reader",
+            "git_head_validates",
             // Its generation row is written by SQL: a build without grammars
             // writes none.
             "head_stamp_without_grammars",
@@ -132,6 +134,7 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             "managed_write_security",
             "migration_ladder",
             "one_symlink_rule",
+            "page_size_and_index_contracts",
             "store_hardening_without_grammars",
             "write_breakdown_without_grammars",
         ],
