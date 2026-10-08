@@ -27,7 +27,6 @@ by them.
 | GraphML to stdout | Raw export only; incompatible `--json` is rejected before export work |
 | dcstore/dcverify/dcgrep | JSON-only boundaries; checked stdout writes, quiet transport failure |
 | `dev` | Existing symlink to the same Go host |
-| `dcmap` development driver | Existing thin mapcli driver; no parallel presentation implementation or new legacy surface |
 
 DevMap's 37 explicit top-level commands (43 as of 2026-10-07; see the status note above) had an exhaustive presentation policy when this was written.
 Nested workspace, Claude, skills, and integration actions inherit their owner;

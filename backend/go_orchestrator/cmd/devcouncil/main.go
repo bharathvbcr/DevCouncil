@@ -444,8 +444,7 @@ func concat(head []string, extra ...string) []string {
 }
 
 // A full `devmap build --manifest` can take minutes on a large tree; this is
-// a hang bound, not a performance budget. Same duration as mapcli's delegated
-// passthrough.
+// a hang bound, not a performance budget.
 const devmapPassthroughTimeout = 10 * time.Minute
 
 func runDevmap(args []string) int {

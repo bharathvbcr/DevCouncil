@@ -75,4 +75,3 @@ Successor corrections (not scheduled as ports):
 - **SCA:** no DevCouncil successor. GitPulse Insights Health (`src-tauri/src/analyzer/deps.rs`) runs `pip-audit` / `npm audit` / `cargo-audit` / `govulncheck` as a related job when a repo opens — not a verify gate.
 - **GitHub Checks writer:** still none. GitPulse talks to GitHub for PR checkout and reads Dependabot / code scanning; it does not post a Checks API run from `devcouncil verify`.
 - **Thick MCP:** Manvi's native tool registry carries `get_task`, `get_next_actions`, filesystem/patch/exec, git, subagents, and `verify_task` that **does** spawn `dcverify`. That is the Python-host successor, not `devcouncil mcp`.
-- **`dcmap`:** leftover Go `cmd/dcmap` + `internal/mapcli`. Comment says superseded by `devmap` / `manvi map`. `scripts/install.sh` does not install it.

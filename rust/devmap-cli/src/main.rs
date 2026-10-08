@@ -2154,7 +2154,11 @@ fn doctor_report(
     let mut digests = crate::digest_cache::BinaryDigests::open_read_only(Some(&state_dir));
     let binaries = inventory_devmap_binaries(&mut digests)?;
     let skew = binaries_skew_warning(&binaries);
+    let mismatches = doctor_edge_confidence_mismatches(db, schema_version);
     Ok(serde_json::json!({
+        // `null` when nothing was measured; the warning then says why.
+        "edge_confidence_mismatches": mismatches.as_ref().ok(),
+        "edge_confidence_warning": edge_confidence_warning(&mismatches),
         "schema_version": schema_version,
         "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
         "code_graph_schema_version": CODE_GRAPH_SCHEMA_VERSION,
@@ -2172,6 +2176,50 @@ fn doctor_report(
         "stale_server_warning": stale_server_warning(),
         "mcp_registrations": mcp_registration_inventory(),
     }))
+}
+
+/// The edges check `doctor` lost when the Go `dcmap doctor` was retired:
+/// stored edges whose confidence contradicts their recorded resolution kind.
+///
+/// Read through the same SQL owner `status` uses, on a read-only connection,
+/// and only when the stored schema is the one this binary speaks — `Store::open`
+/// migrates, and a probe must not rewrite a store it was only asked to judge.
+/// `Err` carries why nothing was measured — no store, a schema this binary does
+/// not read, no generation, or a read that failed — so the report can say so
+/// instead of failing the whole diagnosis over one check.
+fn doctor_edge_confidence_mismatches(
+    db: &std::path::Path,
+    schema_version: Option<i32>,
+) -> Result<usize, String> {
+    match schema_version {
+        None => return Err("no devmap store at this path".to_string()),
+        Some(version) if version != devmap_store::CURRENT_SCHEMA_VERSION => {
+            return Err(format!(
+                "store schema is {version}, this binary reads {}",
+                devmap_store::CURRENT_SCHEMA_VERSION
+            ))
+        }
+        Some(_) => {}
+    }
+    let store = Store::open_read_only(db).map_err(|error| format!("store unreadable: {error}"))?;
+    store
+        .edge_confidence_mismatches()
+        .map_err(|error| format!("edge read failed: {error}"))?
+        .ok_or_else(|| "the store holds no generation".to_string())
+}
+
+/// Zero is the only passing reading. A count above zero is a store whose
+/// edges no longer agree with their own evidence, and an unmeasured count is
+/// reported as unknown rather than allowed to pass as a clean one.
+fn edge_confidence_warning(mismatches: &Result<usize, String>) -> Option<String> {
+    match mismatches {
+        Ok(0) => None,
+        Ok(count) => Some(format!(
+            "{count} stored edge(s) carry a confidence that contradicts their recorded \
+             resolution kind; rebuild with `devmap build --full`"
+        )),
+        Err(reason) => Some(format!("edge confidence is unknown, not passed: {reason}")),
+    }
 }
 
 /// What the whole binary inventory may spend hashing, shared across every file
