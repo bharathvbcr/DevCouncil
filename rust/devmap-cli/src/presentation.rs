@@ -8,7 +8,8 @@ use std::io::IsTerminal;
 use std::rc::Rc;
 use std::time::Instant;
 
-use super::{progress, ClaudeAction, Cli, Commands};
+use super::{progress, Cli, Commands};
+use crate::commands::claude::ClaudeAction;
 
 thread_local! {
     // The CLI entry future and its synchronous result emitters run on this
@@ -66,57 +67,59 @@ impl Session {
 /// Exhaustive command policy: a new enum variant must make an explicit choice.
 fn profile(command: &Commands) -> Option<(&'static str, &'static str)> {
     Some(match command {
-        Commands::Build { .. }
-        | Commands::Serve { .. }
-        | Commands::Mcp { .. }
-        | Commands::Version { .. }
-        | Commands::Hook { .. } => return None,
-        Commands::Export { out, .. } if out.as_deref() == Some(std::path::Path::new("-")) => {
+        Commands::Build(_)
+        | Commands::Serve(_)
+        | Commands::Mcp(_)
+        | Commands::Version(_)
+        | Commands::Hook(_) => return None,
+        Commands::Export(crate::commands::export::Args { out, .. })
+            if out.as_deref() == Some(std::path::Path::new("-")) =>
+        {
             return None
         }
-        Commands::Claude {
+        Commands::Claude(crate::commands::claude::Args {
             action: ClaudeAction::Hooks { .. } | ClaudeAction::Plugin { dry_run: true, .. },
-        } => return None,
-        Commands::Suspects { .. } => ("Suspects", "Asking what could have caused this"),
-        Commands::Blast { .. } => ("Blast radius", "Following what this change reaches"),
-        Commands::Search { .. } => ("Search", "Looking for the right thread"),
-        Commands::Literals { .. } => ("Literals", "Finding where a string is written"),
-        Commands::Deps { .. } => ("Dependencies", "Following the connections"),
-        Commands::Impact { .. } => ("Impact", "Tracing the ripples"),
-        Commands::Neighbors { .. } => ("Neighbors", "Meeting the neighbors"),
-        Commands::Trace { .. } => ("Call trail", "Following the call trail"),
-        Commands::Dead { .. } => ("Dead-code candidates", "Looking for loose ends"),
-        Commands::Explore { .. } => ("Explore", "Unfolding the map"),
-        Commands::Affected { .. } => ("Affected tests", "Following the test trails"),
-        Commands::Preview { .. } => ("Edit preview", "Trying the next shape"),
-        Commands::Workspace { .. } => ("Workspace", "Connecting your repositories"),
-        Commands::Savings { .. } => ("Savings", "Counting the shortcuts"),
-        Commands::Clones { .. } => ("Similar code", "Finding familiar shapes"),
-        Commands::Manifest { .. } => ("Manifest", "Packing the essentials"),
-        Commands::MapHtml { .. } | Commands::Html { .. } => {
+        }) => return None,
+        Commands::Suspects(_) => ("Suspects", "Asking what could have caused this"),
+        Commands::Blast(_) => ("Blast radius", "Following what this change reaches"),
+        Commands::Search(_) => ("Search", "Looking for the right thread"),
+        Commands::Literals(_) => ("Literals", "Finding where a string is written"),
+        Commands::Deps(_) => ("Dependencies", "Following the connections"),
+        Commands::Impact(_) => ("Impact", "Tracing the ripples"),
+        Commands::Neighbors(_) => ("Neighbors", "Meeting the neighbors"),
+        Commands::Trace(_) => ("Call trail", "Following the call trail"),
+        Commands::Dead(_) => ("Dead-code candidates", "Looking for loose ends"),
+        Commands::Explore(_) => ("Explore", "Unfolding the map"),
+        Commands::Affected(_) => ("Affected tests", "Following the test trails"),
+        Commands::Preview(_) => ("Edit preview", "Trying the next shape"),
+        Commands::Workspace(_) => ("Workspace", "Connecting your repositories"),
+        Commands::Savings(_) => ("Savings", "Counting the shortcuts"),
+        Commands::Clones(_) => ("Similar code", "Finding familiar shapes"),
+        Commands::Manifest(_) => ("Manifest", "Packing the essentials"),
+        Commands::MapHtml(_) | Commands::Html(_) => {
             ("Map visualization", "Giving the graph a view")
         }
-        Commands::Freshness { .. } => ("Freshness", "Checking what changed"),
-        Commands::Status { .. } => ("Status", "Taking the pulse"),
+        Commands::Freshness(_) => ("Freshness", "Checking what changed"),
+        Commands::Status(_) => ("Status", "Taking the pulse"),
         Commands::Doctor => ("Diagnostics", "Checking the moving parts"),
-        Commands::SessionReport { .. } => ("Session report", "Retracing the session"),
-        Commands::GapRecord { .. } => ("Gap recorded", "Writing down what could not be answered"),
-        Commands::Paths { .. } => ("Paths", "Getting our bearings"),
-        Commands::History { .. } => ("Build history", "Turning back the pages"),
-        Commands::Repair { .. } => ("Store repair", "Mending the map"),
-        Commands::Snapshots { .. } => ("Snapshots", "Gathering the snapshots"),
-        Commands::Pdg { .. } => ("Data flow", "Following the data"),
-        Commands::Cypher { .. } => ("Graph query", "Asking the graph"),
-        Commands::Ast { .. } => ("Syntax", "Reading the structure"),
-        Commands::Export { .. } => ("Graph export", "Packing the graph"),
-        Commands::Routes { .. } => ("Routes", "Following the routes"),
-        Commands::ShapeCheck { .. } => ("Shape check", "Checking the fit"),
-        Commands::ApiImpact { .. } => ("API impact", "Tracing the API ripples"),
-        Commands::Claude { .. } => ("Claude integration", "Checking the connections"),
-        Commands::Skills { .. } => ("Skills", "Packing your toolkit"),
-        Commands::Integrate { .. } => ("Host integration", "Connecting your tools"),
-        Commands::Ask { .. } => ("Ask", "Finding symbols by what they do"),
-        Commands::Skeleton { .. } => ("Skeleton", "Listing signatures without bodies"),
+        Commands::SessionReport(_) => ("Session report", "Retracing the session"),
+        Commands::GapRecord(_) => ("Gap recorded", "Writing down what could not be answered"),
+        Commands::Paths(_) => ("Paths", "Getting our bearings"),
+        Commands::History(_) => ("Build history", "Turning back the pages"),
+        Commands::Repair(_) => ("Store repair", "Mending the map"),
+        Commands::Snapshots(_) => ("Snapshots", "Gathering the snapshots"),
+        Commands::Pdg(_) => ("Data flow", "Following the data"),
+        Commands::Cypher(_) => ("Graph query", "Asking the graph"),
+        Commands::Ast(_) => ("Syntax", "Reading the structure"),
+        Commands::Export(_) => ("Graph export", "Packing the graph"),
+        Commands::Routes(_) => ("Routes", "Following the routes"),
+        Commands::ShapeCheck(_) => ("Shape check", "Checking the fit"),
+        Commands::ApiImpact(_) => ("API impact", "Tracing the API ripples"),
+        Commands::Claude(_) => ("Claude integration", "Checking the connections"),
+        Commands::Skills(_) => ("Skills", "Packing your toolkit"),
+        Commands::Integrate(_) => ("Host integration", "Connecting your tools"),
+        Commands::Ask(_) => ("Ask", "Finding symbols by what they do"),
+        Commands::Skeleton(_) => ("Skeleton", "Listing signatures without bodies"),
     })
 }
 
