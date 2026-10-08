@@ -6364,6 +6364,17 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
                     }
                 }
             }
+            // The answer is out and this process exits next. Freeing the build's
+            // heap graph one allocation at a time is what a caller waiting on the
+            // exit was waiting for: a teardown probe on DevCouncil (1,310 files)
+            // timed the drops after the JSON line at `resolution` 48–598 ms,
+            // `extractions` 14–304 ms and the resolver index 12–67 ms (min–max,
+            // nine edits, loaded host), against 1–19 ms for closing the store.
+            // These four own memory and nothing else — no file, lock, thread or
+            // `Drop` with an effect — so the OS reclaims them at exit instead.
+            // The store still drops normally: closing it releases its locks and
+            // checkpoints the WAL. A/B and probe in BENCHMARK_HARDENING_AUDIT.md.
+            std::mem::forget((resolution, resolver, extractions, analysis));
         }
         Commands::Search {
             query,
