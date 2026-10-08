@@ -299,12 +299,18 @@ asserts the set in both directions: nothing outside it may diverge, and
 everything inside it still must — so a crate update that closes one fails the
 test rather than being quietly absorbed into an allowlist.
 
-To re-check the boundary against a corpus larger than the committed one, point
-the test at a sweep:
+To re-check the boundary against a corpus larger than the committed one,
+widen `RECORD_RANGES` in `scripts/encode-sparse.py`, record into a scratch
+directory, and point the test at the result:
 
 ```bash
-DCGREP_WORDPIECE_CONFORMANCE=/path/to/sweep.jsonl cargo test -p dc-grep the_tokeniser
+python3 scripts/encode-sparse.py --record --root . --fixtures /tmp/sweep
+DCGREP_WORDPIECE_CONFORMANCE=/tmp/sweep/wordpiece-conformance.jsonl cargo test -p dc-grep the_tokeniser
 ```
+
+With the override set, the test still requires that nothing outside
+`TABLE_SKEW` diverges. It skips the check that every `TABLE_SKEW` character
+still diverges, because a sweep need not contain them all.
 
 **This is worth reading before you trust a tokenizer you wrote yourself.** The
 first version of ours passed 12 hand-written unit tests and a 4,587-case

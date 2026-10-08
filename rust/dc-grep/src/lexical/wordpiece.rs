@@ -682,8 +682,13 @@ mod tests {
     /// `DCGREP_WORDPIECE_CONFORMANCE` points this at a different corpus. The
     /// committed one is sized to keep `cargo test` fast; a sweep large enough
     /// to be worth running is too large to commit, and a sweep that cannot be
-    /// re-run against this code is a sweep whose result expires. Generate one
-    /// with `scripts/encode-sparse.py --sweep`.
+    /// re-run against this code is a sweep whose result expires. There is no
+    /// separate sweep mode: `scripts/encode-sparse.py --record` is the
+    /// codepoint sweep, over its `RECORD_RANGES`. For a larger one, widen
+    /// those ranges and record somewhere else with `--record --fixtures DIR`,
+    /// then set this variable to `DIR/wordpiece-conformance.jsonl`. The
+    /// vocabulary is still read from this crate's fixtures, so record from
+    /// the same model.
     #[test]
     fn the_tokeniser_reproduces_the_model_s_own() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
