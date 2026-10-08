@@ -268,6 +268,22 @@ fn substring_findings(file: &FileDiff, include_bodies: bool) -> Vec<Finding> {
                 continue;
             }
 
+            if include_bodies
+                && is_c_family_source(&file.path)
+                && let Some((severity, message)) = c_family_placeholder(trimmed)
+            {
+                findings.push(Finding {
+                    gate: "stub_detection",
+                    severity,
+                    strength: Strength::Derived,
+                    path: file.path.clone(),
+                    line: *line_no,
+                    evidence: safe_evidence(content),
+                    message,
+                });
+                continue;
+            }
+
             if let Some(marker) = EMPTY_BODIES
                 .iter()
                 .find(|m| include_bodies && trimmed.contains(**m))
@@ -322,6 +338,77 @@ fn substring_findings(file: &FileDiff, include_bodies: bool) -> Vec<Finding> {
     findings
 }
 
+/// Whether `path` is Java or C#: languages [`stub_ast`] does not parse, whose
+/// placeholders are a thrown exception and whose methods are declared with no
+/// keyword to anchor on.
+fn is_c_family_source(path: &str) -> bool {
+    path.ends_with(".java") || path.ends_with(".cs")
+}
+
+/// Phrases that make a thrown exception's message a placeholder, whatever the
+/// exception type. "not supported yet" is the body NetBeans generates.
+const PLACEHOLDER_MESSAGES: &[&str] = &[
+    "not implemented",
+    "not yet implemented",
+    "unimplemented",
+    "implement me",
+    "not supported yet",
+    "todo",
+];
+
+/// The placeholder a lowercased Java or C# line throws, if any.
+///
+/// `NotImplementedException` (C#'s generated stub body, and Apache Commons')
+/// has no other use, so throwing it blocks; so does any exception whose message
+/// says the code is unfinished. A *bare* `UnsupportedOperationException` is
+/// only advisory: it is the commonest Java placeholder and also how an
+/// immutable collection refuses a mutator, and one line cannot tell them
+/// apart. One with any other message is a deliberate refusal and is not
+/// reported. `NotSupportedException` is never reported — it is how a read-only
+/// stream refuses a write.
+fn c_family_placeholder(lowered: &str) -> Option<(Severity, String)> {
+    let thrown = &lowered[lowered.find("throw new ")? + "throw new ".len()..];
+    let open = thrown.find('(')?;
+    let ty = thrown[..open].trim();
+    let ty = ty.rsplit('.').next().unwrap_or(ty);
+    let args = &thrown[open + 1..];
+    let args = args[..args.rfind(')').unwrap_or(args.len())].trim();
+    if ty == "notimplementedexception" {
+        return Some((
+            Severity::Blocking,
+            "added code whose body throws `NotImplementedException`; the task is not implemented"
+                .to_string(),
+        ));
+    }
+    if let Some(phrase) = PLACEHOLDER_MESSAGES.iter().find(|p| contains_word(args, p)) {
+        return Some((
+            Severity::Blocking,
+            format!(
+                "added code throws an exception saying `{phrase}`; the task is not implemented"
+            ),
+        ));
+    }
+    (ty == "unsupportedoperationexception" && args.is_empty()).then(|| {
+        (
+            Severity::Advisory,
+            "added code throws a bare `UnsupportedOperationException`: a placeholder, or a \
+             deliberate refusal such as an immutable collection's mutator — the line cannot \
+             tell which"
+                .to_string(),
+        )
+    })
+}
+
+/// Whether `phrase` occurs in `text` with no letter or digit on either side,
+/// so `todo` matches `"TODO: wire it"` and not `"todoList is empty"`.
+fn contains_word(text: &str, phrase: &str) -> bool {
+    text.match_indices(phrase).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + phrase.len()..].chars().next();
+        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+    })
+}
+
 /// Honours `allow-stub: <reason>` declarations.
 ///
 /// A finding is covered when the marker is on its own line or in the run of
@@ -333,8 +420,14 @@ fn substring_findings(file: &FileDiff, include_bodies: bool) -> Vec<Finding> {
 ///
 /// `lines` is the post-change file when known; otherwise the diff's added
 /// lines stand in for it, so only a marker the diff added can cover a finding.
+///
+/// Then the declaration audit: every marker the diff adds that covers no
+/// finding is reported on its own, advisory under [`GATE_STUB_ALLOWED`]. The
+/// author has said the code beneath it is a stub, which is the strongest
+/// evidence of one there is, and a body the gate does not recognise — a
+/// constant return, a no-op — is exactly where nothing else would say so.
 fn apply_allow_stub(
-    findings: &mut [Finding],
+    findings: &mut Vec<Finding>,
     scopes: &[Scope],
     file: &FileDiff,
     lines: Option<&[&str]>,
@@ -350,8 +443,9 @@ fn apply_allow_stub(
             None => added.get(&n).copied(),
         }
     };
-    // The marker on `start`, or in the annotation lines directly above it.
-    let declared_at = |start: u32| -> Option<String> {
+    // The marker on `start`, or in the annotation lines directly above it,
+    // with the line it is on.
+    let declared_at = |start: u32| -> Option<(u32, String)> {
         let mut n = start;
         let mut first = true;
         while let Some(text) = line_at(n) {
@@ -360,13 +454,15 @@ fn apply_allow_stub(
                 return None;
             }
             if let Some(r) = allow_stub_reason(trimmed) {
-                return Some(r);
+                return Some((n, r));
             }
             first = false;
             n = n.checked_sub(1).filter(|m| *m >= 1)?;
         }
         None
     };
+    let c_family = is_c_family_source(&file.path);
+    let mut covering: HashSet<u32> = HashSet::new();
     for (finding, scope) in findings.iter_mut().zip(scopes) {
         if finding.gate == "secret_scan" {
             continue;
@@ -374,9 +470,13 @@ fn apply_allow_stub(
         // A marker on the function covers a placeholder in its body.
         let enclosing = match scope {
             Scope::Known(line) => *line,
-            Scope::Infer => inferred_function_line(finding.line, &line_at),
+            Scope::Infer => inferred_function_line(finding.line, &line_at, c_family),
         };
-        let reason = declared_at(finding.line).or_else(|| enclosing.and_then(declared_at));
+        let declared = declared_at(finding.line).or_else(|| enclosing.and_then(declared_at));
+        let reason = declared.map(|(marker_line, r)| {
+            covering.insert(marker_line);
+            r
+        });
         match reason {
             Some(r) if !r.is_empty() => {
                 finding.message = format!("stub allowed: {r} (was: {})", finding.message);
@@ -393,6 +493,55 @@ fn apply_allow_stub(
             None => {}
         }
     }
+
+    // Prose is where a marker is written about, not used.
+    if [".md", ".rst", ".txt"]
+        .iter()
+        .any(|ext| file.path.ends_with(ext))
+    {
+        return;
+    }
+    for (line_no, content) in &file.added_lines {
+        if covering.contains(line_no) {
+            continue;
+        }
+        let Some(reason) = declared_allow_stub(content) else {
+            continue;
+        };
+        let message = if reason.is_empty() {
+            format!(
+                "added an {ALLOW_STUB_MARKER} declaration with no reason over code no stub check \
+                 recognised; review what it declares"
+            )
+        } else {
+            format!(
+                "stub declared: {reason} (an {ALLOW_STUB_MARKER} declaration over code no stub \
+                 check recognised; review what it declares)"
+            )
+        };
+        findings.push(Finding {
+            gate: GATE_STUB_ALLOWED,
+            severity: Severity::Advisory,
+            strength: Strength::Derived,
+            path: file.path.clone(),
+            line: *line_no,
+            evidence: safe_evidence(content),
+            message,
+        });
+    }
+}
+
+/// The reason an allow-stub marker written as a comment gives, or `None` for a
+/// line where the marker is not in a comment — the constant that spells it, a
+/// test string quoting it.
+fn declared_allow_stub(line: &str) -> Option<String> {
+    let at = line.to_ascii_lowercase().find(ALLOW_STUB_MARKER)?;
+    let before = line[..at].trim_end();
+    ["//", "#", "/*", "*", "--", "<!--"]
+        .iter()
+        .any(|opener| before.ends_with(opener))
+        .then(|| allow_stub_reason(line.trim()))
+        .flatten()
 }
 
 /// Where a finding's enclosing function is, for [`apply_allow_stub`].
@@ -415,7 +564,14 @@ const MAX_SCOPE_SEARCH_LINES: u32 = 400;
 /// code that follows it: a placeholder at the function's own depth is not in
 /// its body. A line that cannot be read ends the search, so with no working
 /// tree only the diff's own contiguous added lines are considered.
-fn inferred_function_line<'a>(line: u32, line_at: &dyn Fn(u32) -> Option<&'a str>) -> Option<u32> {
+///
+/// `c_family` also recognises Java and C# method declarations, which have no
+/// keyword; see [`declares_c_family_method`].
+fn inferred_function_line<'a>(
+    line: u32,
+    line_at: &dyn Fn(u32) -> Option<&'a str>,
+    c_family: bool,
+) -> Option<u32> {
     let indent = |s: &str| s.len() - s.trim_start().len();
     let own = indent(line_at(line)?);
     let mut n = line;
@@ -425,7 +581,10 @@ fn inferred_function_line<'a>(line: u32, line_at: &dyn Fn(u32) -> Option<&'a str
         if text.trim().is_empty() {
             continue;
         }
-        if indent(text) < own && declares_function(text.trim()) {
+        let trimmed = text.trim();
+        if indent(text) < own
+            && (declares_function(trimmed) || c_family && declares_c_family_method(trimmed))
+        {
             return Some(n);
         }
     }
@@ -455,6 +614,85 @@ fn declares_function(trimmed: &str) -> bool {
         words.next();
     }
     matches!(words.next(), Some("fn" | "def" | "func" | "function"))
+}
+
+/// Whether a trimmed Java or C# line opens a method or constructor.
+///
+/// These declare a method as `[annotations] [modifiers] [type] name(params)`,
+/// so the shape is: something before a `(`, ending in a bare identifier, with
+/// at least one word before that identifier, and not a statement. A statement
+/// gives itself away by its first word (`return`, `throw`, `if`, `new`, …),
+/// by an `=` before the parenthesis, by a qualified callee (`log.info(`), or
+/// by ending in `;` — which also excludes an abstract or interface method,
+/// which has no body to hold a placeholder.
+fn declares_c_family_method(trimmed: &str) -> bool {
+    const STATEMENT_WORDS: &[&str] = &[
+        "if",
+        "else",
+        "for",
+        "foreach",
+        "while",
+        "do",
+        "switch",
+        "case",
+        "catch",
+        "try",
+        "finally",
+        "using",
+        "lock",
+        "return",
+        "throw",
+        "new",
+        "await",
+        "yield",
+        "var",
+        "fixed",
+        "checked",
+        "unchecked",
+        "synchronized",
+        "assert",
+        "goto",
+        "break",
+        "continue",
+        "when",
+        "typeof",
+        "sizeof",
+        "nameof",
+        "default",
+        "}",
+    ];
+    if trimmed.ends_with(';') {
+        return false;
+    }
+    let Some(open) = trimmed.find('(') else {
+        return false;
+    };
+    let head = &trimmed[..open];
+    if head.contains('=') {
+        return false;
+    }
+    // Annotations (`@Override`) and attributes (`[HttpGet]`) on the same line
+    // precede the declaration rather than being part of it.
+    let words: Vec<&str> = head
+        .split_whitespace()
+        .filter(|w| !w.starts_with('@') && !w.starts_with('['))
+        .collect();
+    let is_identifier = |w: &str| {
+        w.starts_with(|c: char| c.is_alphabetic() || c == '_')
+            && w.chars().all(|c| c.is_alphanumeric() || c == '_')
+    };
+    match words[..] {
+        [first, .., name] => is_identifier(name) && !STATEMENT_WORDS.contains(&first),
+        // A constructor with no modifier, `Pricing(Catalog c) {`: one
+        // capitalised name whose parameter list closes on the line. A call
+        // statement of that shape would end in `;`, refused above.
+        [name] => {
+            is_identifier(name)
+                && name.starts_with(char::is_uppercase)
+                && trimmed.trim_end_matches('{').trim_end().ends_with(')')
+        }
+        [] => false,
+    }
 }
 
 /// A line that sits between a declaration and what it annotates.

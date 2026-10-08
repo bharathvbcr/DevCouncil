@@ -963,3 +963,213 @@ new file mode 100644
 +pub fn persist(bytes: &[u8]) -> usize {
 +    todo!()
 +}
+
+### case: java-unsupported-operation-saying-not-implemented
+### secret_scan: clean
+### stub_detection: blocking
+### stub_allowed: clean
+### assert_free_test: clean
+### skipped_test: clean
+### substance: unjudged
+### note: Java has no fn/def keyword and no parser here, so this is the
+###   substring path. The message says what the body is; it blocks.
+diff --git a/src/main/java/shop/Pricing.java b/src/main/java/shop/Pricing.java
+--- a/src/main/java/shop/Pricing.java
++++ b/src/main/java/shop/Pricing.java
+@@ -10,0 +11,3 @@
++    public BigDecimal price(Order order) {
++        throw new UnsupportedOperationException("Not implemented yet");
++    }
+
+### case: csharp-not-implemented-exception
+### secret_scan: clean
+### stub_detection: blocking
+### stub_allowed: clean
+### assert_free_test: clean
+### skipped_test: clean
+### substance: unjudged
+### note: The body Visual Studio generates for an unimplemented member. The
+###   type has no other use, so the throw alone is a placeholder.
+diff --git a/src/Shop/OrderService.cs b/src/Shop/OrderService.cs
+--- a/src/Shop/OrderService.cs
++++ b/src/Shop/OrderService.cs
+@@ -20,0 +21,4 @@
++        public async Task<Order> LoadAsync(Guid id)
++        {
++            throw new NotImplementedException();
++        }
+
+### case: csharp-expression-bodied-not-implemented
+### secret_scan: clean
+### stub_detection: blocking
+### stub_allowed: clean
+### assert_free_test: clean
+### skipped_test: clean
+### substance: unjudged
+diff --git a/src/Shop/Cart.cs b/src/Shop/Cart.cs
+--- a/src/Shop/Cart.cs
++++ b/src/Shop/Cart.cs
+@@ -8,0 +9 @@
++        public decimal Total => throw new NotImplementedException();
+
+### case: java-bare-unsupported-operation-is-advisory
+### secret_scan: clean
+### stub_detection: advisory
+### stub_allowed: clean
+### assert_free_test: clean
+### skipped_test: clean
+### substance: unjudged
+### note: A bare UnsupportedOperationException is the commonest Java
+###   placeholder, and also how an immutable collection refuses a mutator (the
+###   next case). One line of text cannot tell the two apart, so it is reported
+###   and does not block.
+diff --git a/src/main/java/shop/Refunds.java b/src/main/java/shop/Refunds.java
+--- a/src/main/java/shop/Refunds.java
++++ b/src/main/java/shop/Refunds.java
+@@ -30,0 +31,3 @@
++    public Refund issue(Order order, Money amount) {
++        throw new UnsupportedOperationException();
++    }
+
+### case: java-immutable-collection-refusal-is-advisory-not-blocking
+### secret_scan: clean
+### stub_detection: advisory
+### stub_allowed: clean
+### assert_free_test: clean
+### skipped_test: clean
+### substance: unjudged
+### note: Correct code, not a stub. The gate cannot know that from the line, and
+###   this case holds it to advisory: a gate that blocked here would block
+###   every hand-written immutable view.
+diff --git a/src/main/java/shop/FrozenList.java b/src/main/java/shop/FrozenList.java
+--- a/src/main/java/shop/FrozenList.java
++++ b/src/main/java/shop/FrozenList.java
+@@ -40,0 +41,4 @@
++    @Override
++    public boolean add(E e) {
++        throw new UnsupportedOperationException();
++    }
+
+### case: java-allow-stub-above-the-method-covers-its-body
+### secret_scan: clean
+### stub_detection: clean
+### stub_allowed: advisory
+### assert_free_test: clean
+### skipped_test: clean
+### substance: unjudged
+### note: The marker is on the method, the placeholder in its body. Finding the
+###   method needs Java's declaration syntax, which has no keyword to anchor on.
+diff --git a/src/main/java/shop/Tax.java b/src/main/java/shop/Tax.java
+--- a/src/main/java/shop/Tax.java
++++ b/src/main/java/shop/Tax.java
+@@ -10,0 +11,4 @@
++    // allow-stub: the tax service contract lands in TASK-12
++    public BigDecimal taxFor(Order order) {
++        throw new UnsupportedOperationException("not implemented");
++    }
+
+### case: java-allow-stub-covers-a-todo-through-an-annotation
+### secret_scan: clean
+### stub_detection: clean
+### stub_allowed: advisory
+### assert_free_test: clean
+### skipped_test: clean
+### substance: unjudged
+### note: The TODO is found either way; what this case measures is attribution.
+###   The marker sits above `@Override` above the method, and covers the
+###   comment only if the method line is recognised as a declaration.
+diff --git a/src/main/java/shop/Jobs.java b/src/main/java/shop/Jobs.java
+--- a/src/main/java/shop/Jobs.java
++++ b/src/main/java/shop/Jobs.java
+@@ -20,0 +21,6 @@
++    // allow-stub: the retry policy is decided in TASK-31
++    @Override
++    public void retry(Job job) {
++        // TODO: backoff
++        queue.add(job);
++    }
+
+### case: csharp-allow-stub-on-another-method-does-not-cover
+### secret_scan: clean
+### stub_detection: blocking
+### stub_allowed: advisory
+### assert_free_test: clean
+### skipped_test: clean
+### substance: unjudged
+### note: The marker belongs to CacheSize. The placeholder is in LoadAsync,
+###   whose own declaration is the nearest one above it, so it still blocks.
+###   The marker covers no finding and is reported on its own by the
+###   declaration audit, so a reviewer sees every intentional stub declared.
+diff --git a/src/Shop/Store.cs b/src/Shop/Store.cs
+--- a/src/Shop/Store.cs
++++ b/src/Shop/Store.cs
+@@ -10,0 +11,9 @@
++        // allow-stub: caching arrives with the Redis task
++        public int CacheSize() {
++            return 0;
++        }
++
++        public async Task<Order> LoadAsync(Guid id)
++        {
++            throw new NotImplementedException();
++        }
+
+### case: csharp-not-supported-and-caught-not-implemented-are-clean
+### secret_scan: clean
+### stub_detection: clean
+### stub_allowed: clean
+### assert_free_test: clean
+### skipped_test: clean
+### substance: unjudged
+### note: NotSupportedException is how a read-only stream refuses a write, and
+###   catching NotImplementedException is handling one, not writing one.
+diff --git a/src/Shop/ReadOnlyStream.cs b/src/Shop/ReadOnlyStream.cs
+--- a/src/Shop/ReadOnlyStream.cs
++++ b/src/Shop/ReadOnlyStream.cs
+@@ -10,0 +11,8 @@
++        public override void Write(byte[] buffer, int offset, int count)
++        {
++            throw new NotSupportedException("the stream is read-only");
++        }
++        public void Probe()
++        {
++            try { feature.Run(); } catch (NotImplementedException) { disabled = true; }
++        }
+
+### case: java-ordinary-throw-is-clean
+### secret_scan: clean
+### stub_detection: clean
+### stub_allowed: clean
+### assert_free_test: clean
+### skipped_test: clean
+### substance: unjudged
+diff --git a/src/main/java/shop/Money.java b/src/main/java/shop/Money.java
+--- a/src/main/java/shop/Money.java
++++ b/src/main/java/shop/Money.java
+@@ -10,0 +11,6 @@
++    public Money minus(Money other) {
++        if (other.cents > cents) {
++            throw new IllegalArgumentException("amount must not go negative");
++        }
++        return new Money(cents - other.cents);
++    }
+
+### case: allow-stub-declaration-with-no-stub-is-audited
+### secret_scan: clean
+### stub_detection: clean
+### stub_allowed: advisory
+### assert_free_test: clean
+### skipped_test: clean
+### substance: unjudged
+### note: The retired Python detector reported every added allow-stub marker,
+###   whether or not anything was found beneath it, so a reviewer saw each
+###   declared stub. A marker over a body the gate cannot recognise is the case
+###   that matters: the author has said it is a stub.
+diff --git a/src/billing.go b/src/billing.go
+--- a/src/billing.go
++++ b/src/billing.go
+@@ -10,0 +11,4 @@
++// allow-stub: returns a fixed rate until the FX feed exists
++func Rate(from, to string) float64 {
++	return 1.0
++}

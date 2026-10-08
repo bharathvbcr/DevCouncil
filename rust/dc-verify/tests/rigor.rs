@@ -531,3 +531,179 @@ fn a_file_the_gate_does_not_measure_is_recorded_rather_than_dropped() {
     assert!(report.is_clean());
     assert!(report.unmeasured.is_empty());
 }
+
+/// Java and C# placeholders on the substring path, and the lines that look
+/// like them and are not. Each row is (line, expected severity or `None`).
+#[test]
+fn java_and_csharp_placeholder_throws_are_graded_by_what_they_say() {
+    let rows: &[(&str, &str, Option<Severity>)] = &[
+        (
+            "A.cs",
+            "throw new NotImplementedException();",
+            Some(Severity::Blocking),
+        ),
+        (
+            "A.cs",
+            "throw new System.NotImplementedException();",
+            Some(Severity::Blocking),
+        ),
+        (
+            "A.java",
+            "throw new NotImplementedException(\"later\");",
+            Some(Severity::Blocking),
+        ),
+        (
+            "A.java",
+            "throw new UnsupportedOperationException(\"Not supported yet.\");",
+            Some(Severity::Blocking),
+        ),
+        (
+            "A.java",
+            "throw new IllegalStateException(\"TODO: wire the client\");",
+            Some(Severity::Blocking),
+        ),
+        (
+            "A.java",
+            "throw new UnsupportedOperationException();",
+            Some(Severity::Advisory),
+        ),
+        (
+            "A.java",
+            "throw new UnsupportedOperationException(\"list is immutable\");",
+            None,
+        ),
+        (
+            "A.java",
+            "throw new IllegalStateException(\"todoList is empty\");",
+            None,
+        ),
+        ("A.cs", "throw new NotSupportedException();", None),
+        (
+            "A.cs",
+            "catch (NotImplementedException) { disabled = true; }",
+            None,
+        ),
+        // Other languages keep their own rules: JavaScript's placeholder is
+        // `throw new Error("not implemented")`, handled by the parser.
+        ("a.go", "throw new NotImplementedException();", None),
+    ];
+    for (path, line, want) in rows {
+        let findings = detect_stubs(&[diff_of(path, &[(5, line)])]);
+        let got = findings
+            .iter()
+            .find(|f| f.gate == "stub_detection")
+            .map(|f| f.severity);
+        assert_eq!(got, *want, "{path}: {line:?} -> {findings:?}");
+        if let Some(f) = findings.first() {
+            assert_eq!(
+                f.strength,
+                Strength::Derived,
+                "a line match is never proven"
+            );
+        }
+    }
+}
+
+/// The marker above a Java or C# method covers a placeholder in its body, and
+/// the statements that look like declarations do not stand in for one.
+#[test]
+fn an_allow_stub_marker_finds_its_java_or_csharp_method() {
+    let covered = |path: &str, header: &[&str]| {
+        let mut lines: Vec<(u32, String)> = vec![(10, "    // allow-stub: lands in TASK-9".into())];
+        for (i, h) in header.iter().enumerate() {
+            lines.push((11 + i as u32, format!("    {h}")));
+        }
+        let body = 11 + header.len() as u32;
+        lines.push((body, "        throw new NotImplementedException();".into()));
+        let lines: Vec<(u32, &str)> = lines.iter().map(|(n, s)| (*n, s.as_str())).collect();
+        let findings = detect_stubs(&[diff_of(path, &lines)]);
+        let f = findings
+            .iter()
+            .find(|f| f.line == body)
+            .unwrap_or_else(|| panic!("no finding on the body: {findings:?}"));
+        f.gate == GATE_STUB_ALLOWED
+    };
+    for header in [
+        &["public BigDecimal price(Order order) {"][..],
+        &["@Override", "public void retry(Job job) {"],
+        &[
+            "[HttpGet] public async Task<IActionResult> Get(Guid id)",
+            "{",
+        ],
+        &["public Dictionary<string, int> Counts()", "{"],
+        &["<T> List<T> copy(List<T> xs) {"],
+        &["Pricing(Catalog catalog) {"],
+    ] {
+        assert!(covered("Svc.cs", header), "{header:?} was not recognised");
+    }
+    // Statements: the marker is not on a method, so it covers nothing.
+    for header in [
+        &["if (ready(order)) {"][..],
+        &["return compute(order,"],
+        &["var task = Load(id);", "{"],
+        &["log.info(\"x\"); {"],
+        &["synchronized (lock) {"],
+        &["new Thread(() -> {"],
+        &["} else if (x) {"],
+    ] {
+        assert!(
+            !covered("Svc.java", header),
+            "{header:?} was taken for a method"
+        );
+    }
+}
+
+/// The declaration audit: an added marker that covers no finding is reported
+/// on its own, and a marker that does cover one is not reported twice.
+#[test]
+fn every_added_allow_stub_declaration_is_reported_once() {
+    let lone = diff_of(
+        "src/rate.go",
+        &[
+            (1, "// allow-stub: a fixed rate until the FX feed exists"),
+            (2, "func Rate() float64 {"),
+            (3, "\treturn 1.0"),
+            (4, "}"),
+        ],
+    );
+    let findings = detect_stubs(&[lone]);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].gate, GATE_STUB_ALLOWED);
+    assert_eq!(findings[0].severity, Severity::Advisory);
+    assert_eq!(findings[0].line, 1);
+    assert!(
+        findings[0]
+            .message
+            .contains("a fixed rate until the FX feed exists")
+    );
+
+    let covering = diff_of(
+        "src/store.rs",
+        &[
+            (1, "// allow-stub: storage lands next"),
+            (2, "pub fn persist() -> usize {"),
+            (3, "    todo!()"),
+            (4, "}"),
+        ],
+    );
+    let findings = detect_stubs(&[covering]);
+    assert_eq!(
+        findings.len(),
+        1,
+        "covered marker reported twice: {findings:?}"
+    );
+    assert_eq!(findings[0].line, 3);
+
+    // The marker as data — the constant that spells it, a doc page about it —
+    // is not a declaration.
+    for (path, line) in [
+        (
+            "src/rigor.rs",
+            "pub const ALLOW_STUB_MARKER: &str = \"allow-stub\";",
+        ),
+        ("docs/stubs.md", "# allow-stub: how to declare a stub"),
+    ] {
+        let findings = detect_stubs(&[diff_of(path, &[(1, line)])]);
+        assert!(findings.is_empty(), "{path}: {findings:?}");
+    }
+}
