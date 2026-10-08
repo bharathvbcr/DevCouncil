@@ -287,7 +287,7 @@ fn stale_targets_expired_notices_and_invalid_settings_are_never_delivered() {
 fn schema_six_migration_is_atomic_and_keeps_old_notices_without_enabling_delivery() {
     let (s, _) = fixture();
     let id = ready(&s, "p");
-    s.connection().execute_batch("DROP TABLE work_decisions; DROP TABLE work_notification_deliveries; DROP TABLE work_notification_settings; DROP INDEX work_attention_delivery_time; UPDATE work_meta SET version=6; CREATE TABLE work_notification_deliveries(conflict TEXT);").unwrap();
+    s.connection().execute_batch("DROP TABLE work_item_links; DROP INDEX work_items_archive; DROP INDEX work_items_completed; ALTER TABLE work_items DROP COLUMN archived; ALTER TABLE work_items DROP COLUMN completed_at; DROP TABLE work_decisions; DROP TABLE work_notification_deliveries; DROP TABLE work_notification_settings; DROP INDEX work_attention_delivery_time; UPDATE work_meta SET version=6; CREATE TABLE work_notification_deliveries(conflict TEXT);").unwrap();
     assert_eq!(
         s.workbench_request("notifications.settings.get", r#"{"id":"profile"}"#)
             .unwrap_err()

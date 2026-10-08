@@ -654,7 +654,7 @@ fn schema_three_upgrade_is_atomic_and_does_not_enqueue_existing_tasks() {
     let before = call(&store, "items.get", r#"{"id":"t"}"#);
     store
         .connection()
-        .execute_batch("DROP TABLE work_decisions; DROP TABLE work_notification_deliveries; DROP TABLE work_notification_settings; DROP TABLE work_attention; DROP TABLE work_run_inputs; DROP TABLE work_runs; DROP TABLE work_automation; UPDATE work_meta SET version=3 WHERE id=1;")
+        .execute_batch("DROP TABLE work_item_links; DROP INDEX work_items_archive; DROP INDEX work_items_completed; ALTER TABLE work_items DROP COLUMN archived; ALTER TABLE work_items DROP COLUMN completed_at; DROP TABLE work_decisions; DROP TABLE work_notification_deliveries; DROP TABLE work_notification_settings; DROP TABLE work_attention; DROP TABLE work_run_inputs; DROP TABLE work_runs; DROP TABLE work_automation; UPDATE work_meta SET version=3 WHERE id=1;")
         .unwrap();
     // The queue table already exists: creation must roll the settings table back.
     assert_eq!(

@@ -402,7 +402,7 @@ fn schema_seven_upgrade_is_atomic_and_keeps_runs_and_settings() {
     let (s, _) = fixture();
     let run = call(&s, "runs.get", r#"{"id":"run"}"#);
     let settings = call(&s, "notifications.settings.get", r#"{"id":"profile"}"#);
-    s.connection().execute_batch("DROP TABLE work_decisions; UPDATE work_meta SET version=7; CREATE INDEX work_decisions_run_state ON work_runs(id);").unwrap();
+    s.connection().execute_batch("DROP TABLE work_item_links; DROP INDEX work_items_archive; DROP INDEX work_items_completed; ALTER TABLE work_items DROP COLUMN archived; ALTER TABLE work_items DROP COLUMN completed_at; DROP TABLE work_decisions; UPDATE work_meta SET version=7; CREATE INDEX work_decisions_run_state ON work_runs(id);").unwrap();
     assert_eq!(
         s.workbench_request("decisions.list", r#"{"run_id":"run"}"#)
             .unwrap_err()

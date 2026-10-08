@@ -801,7 +801,7 @@ fn schema_four_upgrade_rolls_back_on_conflict_and_preserves_existing_tasks() {
     // the run table and indexes created before discovering that conflict.
     store
         .connection()
-        .execute_batch("DROP TABLE work_decisions; DROP TABLE work_notification_deliveries; DROP TABLE work_notification_settings; DROP TABLE work_attention; DROP TABLE work_runs; UPDATE work_meta SET version=4 WHERE id=1")
+        .execute_batch("DROP TABLE work_item_links; DROP INDEX work_items_archive; DROP INDEX work_items_completed; ALTER TABLE work_items DROP COLUMN archived; ALTER TABLE work_items DROP COLUMN completed_at; DROP TABLE work_decisions; DROP TABLE work_notification_deliveries; DROP TABLE work_notification_settings; DROP TABLE work_attention; DROP TABLE work_runs; UPDATE work_meta SET version=4 WHERE id=1")
         .unwrap();
     assert_eq!(
         request(&store, "runs.list", "{}").unwrap_err().code,
@@ -824,7 +824,7 @@ fn schema_four_upgrade_rolls_back_on_conflict_and_preserves_existing_tasks() {
             .query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r
                 .get::<_, i64>(0))
             .unwrap(),
-        10
+        11
     );
 }
 
@@ -1237,4 +1237,54 @@ fn racing_preparations_never_exceed_a_raised_limit() {
     );
     drop(reopened);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_run_keeps_the_model_it_was_launched_with_and_refuses_malformed_choices() {
+    let (store, _) = fixture();
+    let chosen = PREPARE.replace(
+        r#""head_oid":null"#,
+        r#""head_oid":null,"model_choice":{"model":"opus","effort":"high"}"#,
+    );
+    call(&store, "runs.prepare", &chosen);
+    let run = call(&store, "runs.get", r#"{"id":"run"}"#);
+    assert_eq!(text(&store, &run, "$.item.model_choice.model"), "opus");
+    assert_eq!(text(&store, &run, "$.item.model_choice.effort"), "high");
+    // The listing carries it too, so a history row can say what each attempt ran on.
+    let listed = call(&store, "runs.list", r#"{"task_id":"t"}"#);
+    assert_eq!(
+        text(&store, &listed, "$.items[0].model_choice.model"),
+        "opus"
+    );
+
+    // No choice is recorded as null, not as the host's current default.
+    call(&store, "runs.prepare", &in_worktree("plain"));
+    let run = call(&store, "runs.get", r#"{"id":"run-plain"}"#);
+    let kind: String = store
+        .connection()
+        .query_row("SELECT json_type(?1,'$.item.model_choice')", [&run], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(kind, "null");
+
+    for (n, bad) in [
+        r#""model_choice":"opus""#,
+        r#""model_choice":{"model":""}"#,
+        r#""model_choice":{"model":7}"#,
+        r#""model_choice":{"Model":"opus"}"#,
+        r#""model_choice":{"model":"opus\u0007"}"#,
+        r#""model_choice":{"a":"1","b":"1","c":"1","d":"1","e":"1","f":"1","g":"1","h":"1","i":"1"}"#,
+    ]
+    .iter()
+    .enumerate()
+    {
+        let input = in_worktree(&format!("bad{n}"))
+            .replace(r#""head_oid":null"#, &format!(r#""head_oid":null,{bad}"#));
+        assert_eq!(
+            request(&store, "runs.prepare", &input).unwrap_err().code,
+            "invalid_input",
+            "{bad}"
+        );
+    }
 }
