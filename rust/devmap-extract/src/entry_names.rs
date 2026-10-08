@@ -39,7 +39,10 @@ const MAX_NODES: usize = 2_000_000;
 /// holds. A grammar absent here is not a host language this pass reads.
 fn literal_shape(lang: &str) -> Option<(&'static [&'static str], &'static [&'static str])> {
     Some(match lang {
-        "rust" => (&["string_literal", "raw_string_literal"], &["string_content"]),
+        "rust" => (
+            &["string_literal", "raw_string_literal"],
+            &["string_content"],
+        ),
         "swift" => (&["line_string_literal"], &["line_str_text"]),
         "c" | "cpp" | "objc" | "cuda" => (
             &["string_literal", "raw_string_literal"],
@@ -118,7 +121,7 @@ pub(crate) fn collect(
     while let Some((node, context)) = stack.pop() {
         visited += 1;
         if visited > MAX_NODES
-            || (visited % 4_096 == 0 && crate::treesitter::extraction_overran(deadline))
+            || (visited.is_multiple_of(4_096) && crate::treesitter::extraction_overran(deadline))
         {
             return false;
         }
@@ -193,7 +196,9 @@ fn identifier_text(node: Node, source: &str, contents: &[&str]) -> Option<String
             .bytes()
             .next()
             .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
-        && text.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
     identifier.then(|| text.to_string())
 }
 

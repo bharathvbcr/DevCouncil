@@ -3291,9 +3291,8 @@ fn entry_name_links(
         if reference.kind != ReferenceKind::EntryName {
             continue;
         }
-        let Some([(to_repo, to_file, to_symbol)]) = entry_points
-            .get(reference.name.as_str())
-            .map(Vec::as_slice)
+        let Some([(to_repo, to_file, to_symbol)]) =
+            entry_points.get(reference.name.as_str()).map(Vec::as_slice)
         else {
             continue;
         };

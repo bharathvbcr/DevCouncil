@@ -5685,7 +5685,8 @@ pub(crate) fn parse_c_probe(lang: &str, text: &str) -> Option<tree_sitter::Tree>
             }
             *slot = Some((grammar, parser));
         }
-        slot.as_mut().and_then(|(_, parser)| parser.parse(text, None))
+        slot.as_mut()
+            .and_then(|(_, parser)| parser.parse(text, None))
     })
 }
 

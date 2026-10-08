@@ -350,7 +350,12 @@ fn a_macro_stamped_kernel_is_a_symbol_at_its_invocation() {
         .symbols
         .iter()
         .filter(|symbol| symbol.kind == SymbolKind::Function)
-        .map(|symbol| (symbol.name.clone(), line_of(STAMPED, symbol.span.start_byte)))
+        .map(|symbol| {
+            (
+                symbol.name.clone(),
+                line_of(STAMPED, symbol.span.start_byte),
+            )
+        })
         .collect();
     for (name, line) in [
         ("plain_scale", 8),
@@ -365,7 +370,10 @@ fn a_macro_stamped_kernel_is_a_symbol_at_its_invocation() {
         );
     }
     // The macro parameter that names the stamped function is not a function.
-    assert!(!stamped.iter().any(|(name, _)| name == "NAME"), "{stamped:?}");
+    assert!(
+        !stamped.iter().any(|(name, _)| name == "NAME"),
+        "{stamped:?}"
+    );
 
     let entries: Vec<&str> = extraction
         .wiring
@@ -451,7 +459,12 @@ static const int table[] = { STEP(in_an_initializer), 0 };
         .filter(|symbol| symbol.kind == SymbolKind::Function)
         .map(|symbol| symbol.name.as_str())
         .collect();
-    for refused in ["fixed_name", "two_way", "inside_a_body", "in_an_initializer"] {
+    for refused in [
+        "fixed_name",
+        "two_way",
+        "inside_a_body",
+        "in_an_initializer",
+    ] {
         assert!(!functions.contains(&refused), "{refused}: {functions:?}");
     }
     assert!(functions.contains(&"host"), "{functions:?}");
@@ -511,7 +524,13 @@ fn entry_names(path: &str, source: &str) -> Vec<(String, Option<String>, Option<
         .references
         .into_iter()
         .filter(|reference| reference.kind == ReferenceKind::EntryName)
-        .map(|reference| (reference.name, reference.enclosing_symbol, reference.assigned_to))
+        .map(|reference| {
+            (
+                reference.name,
+                reference.enclosing_symbol,
+                reference.assigned_to,
+            )
+        })
         .collect();
     found.sort();
     found.dedup();

@@ -210,7 +210,10 @@ fn a_kernel_named_in_a_dispatch_table_reaches_the_dispatching_function() {
     let store = store();
     assert_eq!(
         reached(&store, "kernels/stamped_kernels.metal::rows_h512_r32", 2),
-        vec!["src/host.rs::rows".to_string(), "src/host.rs::rows_for".to_string()],
+        vec![
+            "src/host.rs::rows".to_string(),
+            "src/host.rs::rows_for".to_string()
+        ],
         "the table row names the kernel, and the function that reads the table calls it"
     );
 }
@@ -246,14 +249,38 @@ fn a_kernel_named_by_a_constant_reaches_the_function_that_reads_it() {
 fn every_host_language_reaches_the_kernels_it_names() {
     let store = store();
     for (kernel, direct, via_const) in [
-        ("swift", "App/Renderer.swift::buildDirect", "App/Renderer.swift::buildFromConst"),
-        ("objc", "App/Renderer.m::buildDirect", "App/Renderer.m::buildFromConst"),
-        ("cpp", "src/renderer.cpp::buildDirect", "src/renderer.cpp::buildFromConst"),
-        ("py", "tools/run.py::build_direct", "tools/run.py::build_from_const"),
+        (
+            "swift",
+            "App/Renderer.swift::buildDirect",
+            "App/Renderer.swift::buildFromConst",
+        ),
+        (
+            "objc",
+            "App/Renderer.m::buildDirect",
+            "App/Renderer.m::buildFromConst",
+        ),
+        (
+            "cpp",
+            "src/renderer.cpp::buildDirect",
+            "src/renderer.cpp::buildFromConst",
+        ),
+        (
+            "py",
+            "tools/run.py::build_direct",
+            "tools/run.py::build_from_const",
+        ),
     ] {
-        let reached_direct = reached(&store, &format!("kernels/tune/tune.metal::{kernel}_kernel"), 1);
+        let reached_direct = reached(
+            &store,
+            &format!("kernels/tune/tune.metal::{kernel}_kernel"),
+            1,
+        );
         assert_eq!(reached_direct, vec![direct.to_string()], "{kernel} direct");
-        let reached_const = reached(&store, &format!("kernels/tune/tune.metal::{kernel}_const"), 2);
+        let reached_const = reached(
+            &store,
+            &format!("kernels/tune/tune.metal::{kernel}_const"),
+            2,
+        );
         assert!(
             reached_const.contains(&via_const.to_string()),
             "{kernel} const must reach {via_const}: {reached_const:?}"
@@ -320,7 +347,9 @@ fn kernel_name_edges_survive_the_stored_form_of_every_file() {
             .unwrap()
             .edges
             .into_iter()
-            .filter(|edge| edge.target_file.ends_with(".metal") && !edge.source_file.ends_with(".metal"))
+            .filter(|edge| {
+                edge.target_file.ends_with(".metal") && !edge.source_file.ends_with(".metal")
+            })
             .map(|edge| (edge.source_symbol, edge.target_symbol))
             .collect();
         edges.sort();

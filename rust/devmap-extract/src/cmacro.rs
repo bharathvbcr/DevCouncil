@@ -108,7 +108,9 @@ pub(crate) fn stamp_macro_instantiations(
     // is the same name at every use and is refused (see the module docs).
     let body_identifiers: BTreeSet<&str> = macros
         .values()
-        .flat_map(|definition| identifiers(&definition.body).map(|(start, end)| &definition.body[start..end]))
+        .flat_map(|definition| {
+            identifiers(&definition.body).map(|(start, end)| &definition.body[start..end])
+        })
         .collect();
     let mut declared: BTreeSet<String> = symbols
         .iter()
@@ -477,7 +479,9 @@ fn identifiers(text: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
                 b'/' if bytes.get(at + 1) == Some(&b'*') => {
                     line_start = false;
                     at += 2;
-                    while at < bytes.len() && !(bytes[at] == b'*' && bytes.get(at + 1) == Some(&b'/')) {
+                    while at < bytes.len()
+                        && !(bytes[at] == b'*' && bytes.get(at + 1) == Some(&b'/'))
+                    {
                         at += 1;
                     }
                     at = (at + 2).min(bytes.len());
@@ -489,7 +493,8 @@ fn identifiers(text: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
                 _ if byte.is_ascii_alphabetic() || byte == b'_' => {
                     line_start = false;
                     let start = at;
-                    while at < bytes.len() && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_')
+                    while at < bytes.len()
+                        && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_')
                     {
                         at += 1;
                     }
@@ -498,7 +503,9 @@ fn identifiers(text: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
                 _ if byte.is_ascii_digit() => {
                     // A number's suffix (`1.0f`, `0x1Fu`) is not an identifier.
                     line_start = false;
-                    while at < bytes.len() && (bytes[at].is_ascii_alphanumeric() || matches!(bytes[at], b'_' | b'.')) {
+                    while at < bytes.len()
+                        && (bytes[at].is_ascii_alphanumeric() || matches!(bytes[at], b'_' | b'.'))
+                    {
                         at += 1;
                     }
                 }
@@ -525,7 +532,11 @@ fn substitute(definition: &MacroDefinition, arguments: &[String]) -> Option<Stri
             bound.insert(parameter, argument.clone());
         }
         bound.insert(
-            definition.parameters.last().map(String::as_str).unwrap_or("__VA_ARGS__"),
+            definition
+                .parameters
+                .last()
+                .map(String::as_str)
+                .unwrap_or("__VA_ARGS__"),
             arguments[fixed..].join(", "),
         );
     } else {
@@ -776,8 +787,16 @@ mod tests {
         let (arguments, close) = invocation_arguments(text, 1).unwrap();
         assert_eq!(arguments, args(&["a", "f(b, c)", "\"x,y\"", "','"]));
         assert_eq!(close, text.len() - 1);
-        assert_eq!(invocation_arguments("K (a", 1), None, "an unclosed list is no invocation");
-        assert_eq!(invocation_arguments("K + 1", 1), None, "a name with no ( is no invocation");
+        assert_eq!(
+            invocation_arguments("K (a", 1),
+            None,
+            "an unclosed list is no invocation"
+        );
+        assert_eq!(
+            invocation_arguments("K + 1", 1),
+            None,
+            "a name with no ( is no invocation"
+        );
     }
 
     #[test]
@@ -790,8 +809,14 @@ mod tests {
     #[test]
     fn rescan_expands_nested_macros_and_never_a_macro_inside_itself() {
         let mut macros = BTreeMap::new();
-        macros.insert("OUTER".to_string(), definition(&["N"], false, "INNER(N, float)"));
-        macros.insert("INNER".to_string(), definition(&["N", "T"], false, "T N(T x) { return OUTER(x); }"));
+        macros.insert(
+            "OUTER".to_string(),
+            definition(&["N"], false, "INNER(N, float)"),
+        );
+        macros.insert(
+            "INNER".to_string(),
+            definition(&["N", "T"], false, "T N(T x) { return OUTER(x); }"),
+        );
         let mut active = vec!["OUTER".to_string()];
         let substituted = substitute(&macros["OUTER"], &args(&["k"])).unwrap();
         assert_eq!(
@@ -803,8 +828,14 @@ mod tests {
     #[test]
     fn unbounded_self_growth_is_refused_not_followed() {
         let mut macros = BTreeMap::new();
-        macros.insert("A".to_string(), definition(&["x"], false, "B(x x x x x x x x)"));
-        macros.insert("B".to_string(), definition(&["x"], false, "A(x x x x x x x x)"));
+        macros.insert(
+            "A".to_string(),
+            definition(&["x"], false, "B(x x x x x x x x)"),
+        );
+        macros.insert(
+            "B".to_string(),
+            definition(&["x"], false, "A(x x x x x x x x)"),
+        );
         let mut active = vec![];
         // A -> B -> A is stopped by `active`, so this terminates with A left
         // unexpanded rather than recursing.

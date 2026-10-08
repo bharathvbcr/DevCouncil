@@ -301,8 +301,15 @@ fn a_kernel_name_another_repo_declares_is_a_link_candidate() {
     assert_eq!(link.to_repo, "tessl");
     assert_eq!(link.module_specifier, "rows_h256");
     assert_eq!(link.from_symbol.as_deref(), Some("src/gpu.rs::ROWS"));
-    assert_eq!(link.to_symbol.as_deref(), Some("kernels/rows.metal::rows_h256"));
-    assert!(link.evidence.contains("kernels/rows.metal"), "{}", link.evidence);
+    assert_eq!(
+        link.to_symbol.as_deref(),
+        Some("kernels/rows.metal::rows_h256")
+    );
+    assert!(
+        link.evidence.contains("kernels/rows.metal"),
+        "{}",
+        link.evidence
+    );
 
     // An import candidate written before kinds existed still reads as one.
     let legacy: devmap_query::workspace::LinkCandidate = serde_json::from_value(serde_json::json!({

@@ -7010,11 +7010,7 @@ impl Resolver {
         ext: &Extraction,
         reference: &ExtractedReference,
     ) -> Vec<ResolvedEdge> {
-        let Some([target_file]) = self
-            .entry_names
-            .get(&reference.name)
-            .map(Vec::as_slice)
-        else {
+        let Some([target_file]) = self.entry_names.get(&reference.name).map(Vec::as_slice) else {
             return Vec::new();
         };
         let edge = |source: &ExtractedReference| {
