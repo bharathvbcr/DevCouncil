@@ -891,6 +891,7 @@ const TOOLS: &[(&str, &str)] = &[
     ("devmap_clones", "clones"),
     ("devmap_preview", "preview"),
     ("devmap_explore", "explore"),
+    ("devmap_literals", "literals"),
     ("devmap_affected_tests", "affected"),
     ("devmap_suspects", "suspects"),
     ("devmap_blast", "blast"),
@@ -1059,6 +1060,59 @@ fn scope_languages_prop(ranking: &str) -> Value {
     })
 }
 
+/// Symbol kinds a name query may keep. Case is folded later; the schema
+/// accepts the spelling a caller types.
+fn scope_kinds_prop() -> Value {
+    json!({
+        "type": "array",
+        "items": {"type": "string", "minLength": 1, "maxLength": 64},
+        "minItems": 1,
+        "maxItems": devmap_query::MAX_SCOPE_KINDS,
+        "description": "Restrict the name query to these symbol kinds (`function`, `struct`, \
+    `method`). Matched ignoring case and echoed in canonical spelling. One unknown entry refuses \
+    the call and lists the known kinds. Combined with paths and languages, a symbol must pass all \
+    three. total counts only matches that pass."
+    })
+}
+
+fn singular_filter_prop(description: &str) -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4096,
+        "description": description
+    })
+}
+
+/// Fold `path` / `language` / `kind` into the plural lists serde knows.
+fn fold_name_query_aliases(object: &mut Map<String, Value>) -> Result<(), String> {
+    fold_one_alias(object, "path", "paths")?;
+    fold_one_alias(object, "language", "languages")?;
+    fold_one_alias(object, "kind", "kinds")?;
+    Ok(())
+}
+
+fn fold_one_alias(object: &mut Map<String, Value>, singular: &str, plural: &str) -> Result<(), String> {
+    let Some(value) = object.remove(singular) else {
+        return Ok(());
+    };
+    let Value::String(text) = value else {
+        return Err(format!("{singular} must be a string"));
+    };
+    match object.get_mut(plural) {
+        None => {
+            object.insert(plural.to_string(), Value::Array(vec![Value::String(text)]));
+        }
+        Some(Value::Array(items)) => {
+            if !items.iter().any(|item| item.as_str() == Some(text.as_str())) {
+                items.push(Value::String(text));
+            }
+        }
+        Some(_) => return Err(format!("{plural} must be an array of strings")),
+    }
+    Ok(())
+}
+
 /// The description and input schema for one command tag.
 ///
 /// The single owner of both. `tool_specs` publishes what this returns and
@@ -1075,8 +1129,10 @@ not exist'. When resolution_rate is null the rate was not recorded; that is not 
             json!({"type": "object", "properties": {}, "additionalProperties": false}),
         ),
         "search" => (
-            "Find symbols by name across the indexed repository. Returns ranked hits with \
-file and line, budgeted to a token cap.",
+            "Find symbols by name. This does not find string literals; use devmap_literals \
+for a value such as an event action, IPC command or config key. Pass path, language and kind \
+(or paths, languages and kinds) to narrow a common name such as record or run. The answer's \
+scope echoes the filters that were applied, and total counts only matches that pass them.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1085,10 +1141,15 @@ file and line, budgeted to a token cap.",
                     "budget": budget_prop(2000),
                     "semantic": {"type": "boolean", "default": false,
                         "description": "Rank by name similarity instead of FTS prefix matching."},
-                    "paths": scope_paths_prop(
-                        "a `semantic: true` search (refused on keyword search)"),
-                    "languages": scope_languages_prop(
-                        "a `semantic: true` search (refused on keyword search)")
+                    "path": singular_filter_prop(
+                        "One repository-relative path prefix. Same as a single entry of paths."),
+                    "paths": scope_paths_prop("the name query"),
+                    "language": singular_filter_prop(
+                        "One language, as the index labels it. Same as a single entry of languages."),
+                    "languages": scope_languages_prop("the name query"),
+                    "kind": singular_filter_prop(
+                        "One symbol kind, ignoring case (function, struct). Same as a single entry of kinds."),
+                    "kinds": scope_kinds_prop()
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -1312,12 +1373,21 @@ writes nothing.",
             }),
         ),
         "explore" => (
-            "Definitions matching a query, each with its source, its callers, its callees and a layered blast radius — the whole neighbourhood in one call. Prefer this over search followed by dependencies and impact: it is one round trip, and the budget division across the four parts is reported in `budget`, so a thin edge list is attributable to the allowance rather than mistaken for a symbol nothing calls.",
+            "Definitions matching a name, each with its source, its callers, its callees and a layered blast radius — the whole neighbourhood in one call. Pass path, language and kind (or paths, languages and kinds) to narrow a common name. scope echoes the filters, and definitions.total counts only matches that pass them. Name search does not find string literals; use devmap_literals for those. Prefer this over search followed by dependencies and impact: it is one round trip, and the budget division across the four parts is reported in `budget`.",
             json!({
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "maxLength": 4096,
                         "description": "Symbol name or fragment to explore around."},
+                    "path": singular_filter_prop(
+                        "One repository-relative path prefix. Same as a single entry of paths."),
+                    "paths": scope_paths_prop("the name query"),
+                    "language": singular_filter_prop(
+                        "One language, as the index labels it. Same as a single entry of languages."),
+                    "languages": scope_languages_prop("the name query"),
+                    "kind": singular_filter_prop(
+                        "One symbol kind, ignoring case. Same as a single entry of kinds."),
+                    "kinds": scope_kinds_prop(),
                     // Bound and default both read from the parser's own
                     // constants: 20 is `protocol::default_explore_limit`, and
                     // the maximum is the value `validate_request` refuses above.
@@ -1444,6 +1514,26 @@ matches it with parameters normalised (`/users/:id` matches `/users/42`)."},
                 "additionalProperties": false
             }),
         ),
+        "literals" => (
+            "Where a string constant is written. Matches the literal text, not a symbol name. \
+Prefix by default, so session. matches session.spawn; pass exact for equality. Comparison is \
+case-sensitive. Each site is the file, the 1-based line, the value, and the enclosing \
+qualified symbol. A Rust module-level const's value is also reported at each use of that \
+const. Budgeted: read shown, hidden and total. walk_incomplete means the page cap cut the \
+read before the budget did.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "minLength": 1, "maxLength": 4096,
+                        "description": "The literal text. A prefix unless exact is true."},
+                    "exact": {"type": "boolean", "default": false,
+                        "description": "Require equality instead of a prefix."},
+                    "budget": budget_prop(2000)
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        ),
         other => unreachable!("command tag {other} has no schema"),
     };
     (description, with_repo_scope_args(schema))
@@ -1543,9 +1633,9 @@ fn budgeted_envelope(items: &str) -> Value {
 fn with_scope_output(mut schema: Value) -> Value {
     schema["properties"]["scope"] = json!({
         "type": "object",
-        "description": "Present only when `paths` or `languages` was given: the prefixes and \
-    languages applied, `files` and `symbols` in scope, and `corpus_files` / `corpus_symbols` the \
-    whole index held. `total` counts matches within the scope."
+        "description": "Present when a path, language or kind filter was applied: the prefixes, \
+    languages and kinds, `files` and `symbols` in that scope, and `corpus_files` / \
+    `corpus_symbols` for the whole index. `total` counts only matches that pass the filters."
     });
     schema
 }
@@ -1773,7 +1863,10 @@ a partial corpus is a lower bound, not a clean bill. Candidate list to verify, n
         an empty layer means 'we stopped looking', not 'nothing is there'."},
                 "budget": {"type": "object",
                     "description": "How the token budget was divided across definitions, edges \
-        and blast radius. A thin answer is attributable to the division rather than to the graph."}
+        and blast radius. A thin answer is attributable to the division rather than to the graph."},
+                "scope": {"type": "object",
+                    "description": "Present when a path, language or kind filter was applied. \
+        definitions.total counts only matches that pass it."}
             },
             "required": ["query", "definitions", "limit", "blast_radius", "budget"],
             "additionalProperties": true
@@ -1934,6 +2027,29 @@ a partial corpus is a lower bound, not a clean bill. Candidate list to verify, n
                     "description": "True when a LIMIT above the server ceiling was cut to it."}
             },
             "required": ["ok", "rows", "shown", "total", "truncated", "limit_applied"],
+            "additionalProperties": true
+        }),
+        "literals" => json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "exact": {"type": "boolean",
+                    "description": "True when the match was equality rather than a prefix."},
+                "items": {"type": "array",
+                    "description": "Sites: file_path, line (1-based), value, qualified_name and \
+        symbol_name of the enclosing symbol. qualified_name is empty outside every symbol."},
+                "shown": {"type": "integer"},
+                "hidden": {"type": "integer"},
+                "total": {"type": "integer",
+                    "description": "Every site that matched, before the budget and the page cap."},
+                "truncated": {"type": "boolean"},
+                "tokens_used": {"type": "integer"},
+                "walk_incomplete": {"type": "string",
+                    "description": "Set when the page cap cut the read, so hidden includes sites \
+        this page never loaded, or when no generation was available."}
+            },
+            "required": ["query", "exact", "items", "shown", "hidden", "total", "truncated",
+                "tokens_used"],
             "additionalProperties": true
         }),
         other => unreachable!("command tag {other} has no output schema"),
@@ -2245,6 +2361,14 @@ pub fn to_ipc_command(name: &str, arguments: Option<&Value>) -> Result<IpcComman
 
     if let Err(reason) = take_repo_scope_args(&mut object) {
         return Err(RpcError::tool_input(codes::INVALID_PARAMS, reason));
+    }
+
+    // Singular aliases fold after the schema check, which has to see them as
+    // declared properties, and before serde, which only knows the plural lists.
+    if matches!(cmd, "search" | "explore") {
+        if let Err(reason) = fold_name_query_aliases(&mut object) {
+            return Err(RpcError::tool_input(codes::INVALID_PARAMS, reason));
+        }
     }
 
     object.insert("cmd".to_string(), Value::String(cmd.to_string()));

@@ -5,7 +5,7 @@ use tracing::{info, warn};
 
 use devmap_analyze::{analyze_with_discovery, DiscoveryCoverage};
 use devmap_extract::{
-    collect_go_modules, collect_sources_with_report, content_hash, extract_file,
+    collect_project_manifests, collect_sources_with_report, content_hash, extract_file,
     is_indexable_source, DiscoverySkipReason, MAX_SOURCE_BYTES,
 };
 use devmap_resolve::Resolver;
@@ -1211,9 +1211,12 @@ impl Daemon {
         let discovery = DiscoveryCoverage::refused(refusals.len());
         extractions.sort_by(|left, right| left.file_path.cmp(&right.file_path));
         let mut resolver = Resolver::new();
-        match collect_go_modules(&self.root) {
-            Ok(modules) => resolver.index_go_modules(&modules),
-            Err(error) => warn!("go.mod collection failed for {:?}: {error}", self.root),
+        match collect_project_manifests(&self.root) {
+            Ok(manifests) => resolver.index_project_manifests(&manifests),
+            Err(error) => warn!(
+                "project manifest collection failed for {:?}: {error}",
+                self.root
+            ),
         }
         resolver.index_extractions(&extractions);
         // After `index_extractions`, which resets the set this extends.
@@ -4249,6 +4252,98 @@ mod tests {
         let daemon = Daemon::new(store, root.clone());
         assert_eq!(daemon.drain_pending_batch().unwrap(), 1);
         (root, daemon)
+    }
+
+    /// The daemon resolves through tsconfig `paths`, and a config-only edit
+    /// moves the edge on the next drain.
+    ///
+    /// The CLI build has its own test (`devmap-cli/tests/tsconfig_path_mapping.rs`);
+    /// this is the other caller of `collect_project_manifests`. `legacy/` holds
+    /// a namesake, so only the mapping — not the unique-global rung — can pick
+    /// the target, and the second drain is handed the config path alone, so it
+    /// runs the carry-forward branch rather than a whole-tree build.
+    #[test]
+    fn a_drain_resolves_through_tsconfig_and_follows_a_config_only_edit() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "devmap-daemon-tsconfig-{}-{stamp}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        for dir in ["core/src", "legacy/src", "app"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let config = |target: &str| {
+            format!(r#"{{ "compilerOptions": {{ "paths": {{ "@core/*": ["{target}"] }} }} }}"#)
+        };
+        fs::write(root.join("tsconfig.json"), config("./core/src/*")).unwrap();
+        fs::write(
+            root.join("core/src/util.ts"),
+            "export function coreHelper(): number { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("legacy/src/util.ts"),
+            "export function coreHelper(): number { return 2; }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("app/main.ts"),
+            "import { coreHelper } from \"@core/util\";\n\
+             export function run(): number { return coreHelper(); }\n",
+        )
+        .unwrap();
+
+        let calls_from_run = |daemon: &Daemon| -> Vec<String> {
+            let mut targets: Vec<String> = daemon
+                .store
+                .latest_edges_for_test()
+                .unwrap()
+                .into_iter()
+                .filter(|edge| edge.starts_with("app/main.ts::run>") && edge.contains("coreHelper"))
+                .map(|edge| {
+                    edge.trim_start_matches("app/main.ts::run>")
+                        .split(':')
+                        .next()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect();
+            targets.sort();
+            targets.dedup();
+            targets
+        };
+
+        let store = Store::open_in_memory().unwrap();
+        let paths: Vec<String> = [
+            "tsconfig.json",
+            "core/src/util.ts",
+            "legacy/src/util.ts",
+            "app/main.ts",
+        ]
+        .iter()
+        .map(|path| root.join(path).display().to_string())
+        .collect();
+        store.enqueue_pending_paths(&paths).unwrap();
+        let daemon = Daemon::new(store, root.clone());
+        daemon.drain_pending_batch().unwrap();
+        assert_eq!(calls_from_run(&daemon), vec!["core/src/util.ts"]);
+
+        fs::write(root.join("tsconfig.json"), config("./legacy/src/*")).unwrap();
+        daemon
+            .store
+            .enqueue_pending_paths(&[root.join("tsconfig.json").display().to_string()])
+            .unwrap();
+        daemon.drain_pending_batch().unwrap();
+        assert_eq!(
+            calls_from_run(&daemon),
+            vec!["legacy/src/util.ts"],
+            "a config-only edit must move the edge on the next drain"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// A watcher batch the store would not take must not leave `status` fresh.

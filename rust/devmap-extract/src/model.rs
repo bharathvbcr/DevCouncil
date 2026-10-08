@@ -1499,6 +1499,27 @@ pub struct Extraction {
     pub local_bindings: Vec<LocalBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_code: Option<String>,
+    /// String literals in this file, each with the symbol that encloses it.
+    ///
+    /// Empty on an extraction cached before literals were indexed. A const
+    /// whose value is a string also contributes a site at each use of that
+    /// const, so the reader is a site even when the literal is written once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub literals: Vec<ExtractedLiteral>,
+}
+
+/// One string literal and the symbol whose span contains it.
+///
+/// `enclosing_qualified_name` is empty when the literal sits outside every
+/// symbol (a module-level private const has no graph symbol of its own).
+/// `line` is 1-based. `value` is the decoded text, never the quoted source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtractedLiteral {
+    pub value: String,
+    pub start_byte: usize,
+    pub line: u32,
+    pub enclosing_qualified_name: String,
+    pub enclosing_name: String,
 }
 
 /// A lexical binding at a specific use site. `scope` is absent for an

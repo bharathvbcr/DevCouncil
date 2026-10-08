@@ -4,22 +4,22 @@
   "_tolerance_permille": 10,
   "fixtures": {
     "barrel_reexport": {
-      "python": 500
+      "python": 1000
     },
     "cfml_app": {
-      "cfml": 0
+      "cfml": null
     },
     "go_app": {
-      "go": 600
+      "go": 1000
     },
     "java_same_package": {
-      "java": 777
+      "java": 1000
     },
     "liveness_truth": {
       "python": 1000
     },
     "override_dispatch": {
-      "python": 571
+      "python": 1000
     },
     "python_app": {
       "python": 1000

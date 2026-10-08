@@ -78,6 +78,38 @@ SQL object references are not automatically source-file imports. One PowerShell
 file still uses a pattern fallback because no linked grammar exists. Those
 warnings remain. No dependency was added.
 
+**Reproduced 2026-10-08** (`rust/devmap-extract/tests/sql_check_constraint_parse.rs`):
+the 23 error ranges are exactly 13 column `CHECK`s whose expression calls a
+function (`CHECK(json_valid(body))`; `CHECK(revision>0)` parses cleanly) plus
+10 SQLite-only statements the linked grammar does not know — trigger bodies
+(`BEGIN … END`, `RAISE(ABORT, …)`) and `CREATE VIRTUAL TABLE … USING fts5(…)`.
+A function-call `CHECK` is confined: the error is the `CHECK(...)` text and no
+declaration is lost. The SQLite-dialect ranges are not: of the 25 tables and
+views the files write, `work_items_fts` (the FTS5 table) and `work_events` (the
+table written after a trigger the parser could not close) are not extracted.
+Indexes and triggers are not symbols in this extractor at all. The test pins
+both counts and both lost names, so a grammar change in either direction fails
+it. Repairing either gap is a grammar change; no parser dependency is
+authorised, so they stay recorded here.
+
+**SQL imports — decision 2026-10-08: `sql` stays `blind_to: ["imports"]`.**
+`devmap status` already states it per file (`import_blind`, reason "`sql` has
+no import extractor in this build"), and the resolution rate lists `imports` in
+the language's `blind_to`. A defined object-reference ↔ file relationship would
+need a table → declaring-file index and an extractor for the references a
+query makes (`FROM`, `JOIN`, `INSERT INTO`, `REFERENCES`, trigger targets);
+the files that matter here are loaded by Rust through `include_str!`, which no
+SQL-side import could express either. Not built.
+
+**PowerShell — decision 2026-10-08: pattern recovery stays, labelled as such.**
+A PowerShell grammar is a new dependency and needs the owner's approval; none
+was given. `scripts/install.ps1` is listed under `pattern_recovered` in
+`devmap status` ("no linked tree-sitter grammar for powershell; 2
+declaration(s) recovered by pattern"), its extraction carries
+`ParseOutcome::Fallback`, and DIVERGENCES.md X34/X37 record the tier. A grammar
+would buy calls and imports for `.ps1`; one installer script does not justify
+the dependency today.
+
 Remaining work includes typed-receiver propagation, package-level function
 variables/closures, platform-conditioned target selection, SQL dialect/client
 include contracts, a PowerShell parser, anonymous-scope negative binding coverage, Go callback type annotations and
@@ -85,6 +117,70 @@ factory-result inference, and source-wide ground truth. Five
 selected caller pairs or ten synthetic definition cases cannot close these
 gaps. Evidence/confidence scoring and incomplete-answer disclosures remain
 separate from the number of returned matches.
+
+Package-level function variables, closures and platform-conditioned targets
+were reproduced on 2026-10-08 with one fixture each
+(`rust/devmap-resolve/tests/function_values_and_platform_targets.rs`); what is
+resolved and what is a known limit is recorded in DIVERGENCES.md, "Known
+limits: function values and platform targets".
+
+### JavaScript resolution: classified, two classes fixed (2026-10-08)
+
+**Why the 1,705 JavaScript sites went unresolved** (generation 4144, this
+repository; 16 JS files: scripts, test probes and fixtures):
+
+| Class | Sites | Cause |
+|---|---|---|
+| `uninferred_receiver` | 837 | 827 name a member no JS/TS file declares — `includes` 77, `push` 67, `length` 51, `slice` 34, … (476 calls, 351 property reads); 10 have a JS/TS namesake (`seen.add`, `child.stdin.write`, …) |
+| `external` | 616 | `node:` imports and `node:test` / `node:assert` (`it`, `equal`, `join` on an imported `path`) |
+| `host_global` | 198 | `process.*`, `console.*`, `JSON.*` |
+| `builtin` | 39 | language builtins |
+| `no_namesake` | 10 | all 10 are `node:fs` / `node:child_process` / `node:url` functions bound by a destructured CommonJS `require` the extractor did not read |
+| `local_binding` | 3 | `resolve` of an enclosing `new Promise((resolve) => …)` |
+| `unresolved` | 2 | `resolve` from a nested callback; `original` in a probe |
+
+Net was `resolved / (resolved + unresolved − explained)` = 196 / 1,038 = 188‰:
+the 827 namesake-free members sat in the denominator although no edge could
+ever bind them. Two classes were fixable, and both are fixed with tests that
+fail on the old kernel:
+
+1. **A member no symbol of the family declares** is now `no_namesake`
+   (`a_receiver_member_nothing_declares.rs`), the evidence the bare-name ladder
+   already used. Classification only: no edge moves.
+2. **CommonJS `require`** binds what it declares (`commonjs_require_bindings.rs`):
+   `const { a, b: c } = require(m)` and `const x = require(m)`. On a local module
+   this adds edges; on this repository every `require` names a Node builtin, so
+   it moved 30 rows to `external` and added no edge.
+
+**Before / after, `devmap build --full` + `devmap status --json`**, on frozen
+snapshots (`git archive`): DevCouncil at 58bcc215, MarkDev at 20dec7a. Before
+is the main build c3907784, after is 58bcc215; each ran on its own copy.
+
+| Corpus / language | gross ‰ before → after | net ‰ before → after | resolved | unresolved | explained before → after |
+|---|---|---|---|---|---|
+| DevCouncil total | 198 → 198 | 308 → 517 | 40,731 | 163,981 | 72,642 → 125,983 |
+| javascript | 103 → 103 | 188 → 928 | 196 | 1,705 | 863 → 1,690 |
+| rust | 202 → 202 | 283 → 476 | 31,420 | 124,002 | 44,715 → 89,521 |
+| go | 189 → 189 | 460 → 699 | 7,100 | 30,307 | 21,998 → 27,261 |
+| python | 203 → 203 | 383 → 859 | 1,657 | 6,499 | 3,831 → 6,228 |
+| c | 287 → 287 | 490 → 557 | 184 | 455 | 264 → 309 |
+| cpp | 93 → 93 | 478 → 550 | 11 | 107 | 95 → 98 |
+| shell / sql / html | unchanged | 655 / 0 / 1000, unchanged | | | |
+| MarkDev total | 285 → 285 | 510 → 770 | 21,453 | 53,724 | 33,183 → 47,324 |
+| swift | 313 → 313 | 607 → 772 | 17,905 | 39,145 | 27,598 → 33,864 |
+| rust | 188 → 188 | 267 → 687 | 2,335 | 10,028 | 3,633 → 8,969 |
+| python | 198 → 198 | 292 → 949 | 1,067 | 4,311 | 1,731 → 4,254 |
+| javascript | 0 → 0 | 0 → no rate | 0 | 22 | 6 → 22 |
+
+**Read the gross column.** Edges are identical on both corpora (57,505 and
+35,498), gross is unchanged in every language, and the dead lists are
+identical row for row (27 and 5). Every net gain is the reclassification: a
+site that could never bind leaves the denominator. MarkDev's 22 JavaScript
+sites now all have no namesake, so its net rate has no denominator — the same
+shape `cfml_app` has in `resolution_baseline.json`. Labelled precision is
+unchanged: `labelled_corpus_precision.rs` reports precision 1.000 on every
+fixture with claims and dead recall 10 / 10. The residual JavaScript
+`uninferred_receiver` rows (10) are the real type-inference limit.
 
 ## Clean release provenance
 
@@ -538,7 +634,7 @@ fixture, and 40,156 for DevCouncil's generation 4131.
 | Work still needed | Evidence required before claiming it closed |
 |---|---|
 | Binding coverage and private Rust values | A format-level distinction between unavailable facts and examined unbound sites; cold, cached and unchanged-upgrade cases for private file-level values and anonymous scopes. Existing public/export behavior must remain separate. |
-| SQL and PowerShell | Dialect/source-checked fixtures and explicit parser/provider availability. SQL object references need a defined relationship to source-file imports; fallback extraction cannot be relabeled complete. No new parser dependency was authorized or added. |
+| SQL and PowerShell | Dialect/source-checked fixtures and explicit parser/provider availability. SQL object references need a defined relationship to source-file imports; fallback extraction cannot be relabeled complete. No new parser dependency was authorized or added. **2026-10-08:** the `CHECK(json_valid(body))` gap and the SQLite-dialect gap are reproduced and pinned (`sql_check_constraint_parse.rs`); `sql` stays explicitly import-blind and PowerShell stays pattern-recovered, both by recorded decision (see "Source attribution and extractor limits"). |
 | Latency optimization | **Teardown closed 2026-10-07** (below). Still open: candidate extraction/resolution/persistence work. Nothing was narrowed, so no invalidation contract or equivalence test was owed; any narrowing still needs both, on DevCouncil and MarkDev. |
 | Broader comparison | **Partly closed 2026-10-07** (below): counterbalanced, interleaved per-edit rounds with recorded order, position and load, plus a generator-derived caller ground truth. Still open: a ground truth that discriminates between tools (the seeded set has unique names and every arm scores 48/48), more than one edit shape, CBM (no verified interface), and mutation convergence beyond the DevMap soak. |
 | Durability and portability | **Partly closed 2026-10-07** — see "Crash consistency" below: process death mid-persist and a lost un-fsynced WAL tail are tested on macOS/APFS. Still open: torn or reordered writes below the filesystem, physical power loss, other filesystems and native runs on other operating systems. |

@@ -95,7 +95,21 @@ impl<'a> StoreQueryEngine<'a> {
     }
 
     pub fn search(&self, req: Request<String>) -> anyhow::Result<Response<SymbolHit>> {
-        if req.query.trim().is_empty() {
+        self.search_filtered(req, None)
+    }
+
+    /// [`Self::search`] over the files and kinds `filter` admits.
+    ///
+    /// `None` is the whole repository, and that path still reads the unfiltered
+    /// full-text page. A set filter is applied in SQL before the page is cut,
+    /// so `total` counts only matches that pass it and `scope` echoes the
+    /// filter. A prefix, language or kind that names nothing indexed is refused.
+    pub fn search_filtered(
+        &self,
+        req: Request<String>,
+        filter: Option<&crate::scope::NameQueryFilter>,
+    ) -> anyhow::Result<Response<SymbolHit>> {
+        if req.query.trim().is_empty() && filter.is_none() {
             return Ok(self.finish(budget_take(Vec::new(), req.token_budget, |_| 0)));
         }
         let page = search_page_size(req.token_budget);
@@ -114,7 +128,7 @@ impl<'a> StoreQueryEngine<'a> {
         // That trade is about fan-outs. This is a count, one limited select and
         // one row — so the exact answer is affordable here, and an exact answer
         // beats a disclosed approximation whenever it can be had.
-        let Some(snapshot) = self.store.search_page(&req.query, pool)? else {
+        let Some(snapshot) = self.keyword_page(&req.query, pool, filter)? else {
             return Ok(self.unavailable(ResolutionAvailability::Unavailable {
                 reason: "no persisted generation is available".to_string(),
             }));
@@ -127,6 +141,9 @@ impl<'a> StoreQueryEngine<'a> {
         // resolved separately could describe a different corpus from the one
         // that was searched.
         let coverage_gap = search_coverage_gap(analysis_status_gap(snapshot.analysis.as_ref()));
+        let scope = snapshot.narrowing.as_ref().map(|narrowing| {
+            scope_report_from_narrowing(narrowing, snapshot.analysis.as_ref())
+        });
         let query = req.query.to_lowercase();
         // Rank, then truncate — R7, and the reason the pool above is wider than
         // the page below. The store cuts its page with `ORDER BY bm25(...)` and
@@ -180,7 +197,43 @@ impl<'a> StoreQueryEngine<'a> {
             ranked_over_a_sample,
             devmap_analyze::combine_reasons(coverage_gap, empty_result_gap(total, &req.query)),
         );
+        response.scope = scope;
         Ok(self.finish(response))
+    }
+
+    /// One keyword page, pinned to the generation the filter was checked against.
+    ///
+    /// No filter calls [`Store::search_page`], whose SQL stays the unfiltered
+    /// plan. A filter resolves path and language against that generation's
+    /// files, then asks the store for a page whose count and rows both already
+    /// satisfy it.
+    fn keyword_page(
+        &self,
+        query: &str,
+        pool: usize,
+        filter: Option<&crate::scope::NameQueryFilter>,
+    ) -> anyhow::Result<Option<devmap_store::SearchPage>> {
+        let Some(filter) = filter else {
+            return Ok(self.store.search_page(query, pool)?);
+        };
+        let Some((generation, root, files)) = self.store.latest_scope_inputs()? else {
+            return Ok(None);
+        };
+        let (paths, languages) = match filter.symbol_scope()? {
+            Some(scope) => {
+                let resolved = scope.resolve(&files, root.as_deref())?;
+                (resolved.report.paths, resolved.report.languages)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+        let narrowing = devmap_store::KeywordNarrowing {
+            paths,
+            languages,
+            kinds: filter.kinds().to_vec(),
+        };
+        Ok(self
+            .store
+            .search_page_in(generation, query, pool, Some(&narrowing))?)
     }
 
     pub fn dependencies(&self, req: Request<String>) -> anyhow::Result<Response<ResolvedEdge>> {
@@ -1277,8 +1330,24 @@ impl<'a> StoreQueryEngine<'a> {
         min_confidence: f32,
         max_depth: usize,
     ) -> anyhow::Result<ExploreReport> {
+        self.explore_filtered(query, limit, token_budget, min_confidence, max_depth, None)
+    }
+
+    /// [`Self::explore`] over the files and kinds `filter` admits.
+    ///
+    /// `definitions.total` is the filtered match count. `scope` echoes the
+    /// filter, and is absent when the caller narrowed nothing.
+    pub fn explore_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        token_budget: u32,
+        min_confidence: f32,
+        max_depth: usize,
+        filter: Option<&crate::scope::NameQueryFilter>,
+    ) -> anyhow::Result<ExploreReport> {
         self.read_composed(
-            || self.explore_once(query, limit, token_budget, min_confidence, max_depth),
+            || self.explore_once(query, limit, token_budget, min_confidence, max_depth, filter),
             |report, note| {
                 qualify_response(&mut report.definitions, note);
                 qualify_response(&mut report.blast_radius.layers, note);
@@ -1297,6 +1366,7 @@ impl<'a> StoreQueryEngine<'a> {
         token_budget: u32,
         min_confidence: f32,
         max_depth: usize,
+        filter: Option<&crate::scope::NameQueryFilter>,
     ) -> anyhow::Result<ExploreReport> {
         // Refused here, before the empty-report shapes below can absorb it: a
         // threshold no comparison can evaluate is a bad request, not a
@@ -1316,6 +1386,7 @@ impl<'a> StoreQueryEngine<'a> {
                 total_impacted: 0,
             },
             budget,
+            scope: None,
         };
         if query.trim().is_empty() {
             return Ok(empty("explore requires a non-empty query".to_string()));
@@ -1323,10 +1394,13 @@ impl<'a> StoreQueryEngine<'a> {
 
         let page = budget_page_size(budget.definitions);
         let pool = search_rank_pool_size(budget.definitions);
-        let Some(snapshot) = self.store.search_page(query, pool)? else {
+        let Some(snapshot) = self.keyword_page(query, pool, filter)? else {
             return Ok(empty("no persisted generation is available".to_string()));
         };
         let total = snapshot.total;
+        let scope = snapshot.narrowing.as_ref().map(|narrowing| {
+            scope_report_from_narrowing(narrowing, snapshot.analysis.as_ref())
+        });
         let coverage_gap = devmap_analyze::combine_reasons(
             search_coverage_gap(analysis_status_gap(snapshot.analysis.as_ref())),
             ranking_coverage_gap(total, pool),
@@ -1459,6 +1533,7 @@ impl<'a> StoreQueryEngine<'a> {
             limit: u32::try_from(limit).unwrap_or(u32::MAX),
             blast_radius,
             budget,
+            scope,
         })
     }
 
@@ -1986,15 +2061,172 @@ impl<'a> StoreQueryEngine<'a> {
         token_budget: u32,
         scope: Option<&crate::scope::SymbolScope>,
     ) -> anyhow::Result<Response<SymbolHit>> {
+        self.search_semantic_filtered(query, token_budget, scope, &[])
+    }
+
+    /// [`Self::search_semantic_scoped`] further restricted to `kinds`.
+    ///
+    /// Kinds are retained before scoring, so `total` counts only matches of
+    /// those kinds. A kind that labels nothing in the already path- and
+    /// language-scoped rows is refused. Kind-only, with no [`SymbolScope`],
+    /// still sets `scope`.
+    pub fn search_semantic_filtered(
+        &self,
+        query: &str,
+        token_budget: u32,
+        scope: Option<&crate::scope::SymbolScope>,
+        kinds: &[String],
+    ) -> anyhow::Result<Response<SymbolHit>> {
         self.cancel.check()?;
-        let Some((snapshot, resolved)) = self.ranking_corpus(scope)? else {
+        let Some((mut snapshot, resolved)) = self.ranking_corpus(scope)? else {
             return Ok(self.unavailable(ResolutionAvailability::Unavailable {
                 reason: "no persisted generation is available".to_string(),
             }));
         };
+        let mut report = resolved.map(|resolved| resolved.report);
+        if !kinds.is_empty() {
+            let present: BTreeSet<String> =
+                snapshot.rows.iter().map(|row| row.kind.clone()).collect();
+            let missing: Vec<String> = kinds
+                .iter()
+                .filter(|kind| !present.contains(kind.as_str()))
+                .cloned()
+                .collect();
+            if !missing.is_empty() {
+                anyhow::bail!(crate::scope::missing_kind_message(
+                    &missing,
+                    &present,
+                    scope.is_some()
+                ));
+            }
+            let loaded = snapshot.rows.len();
+            let loaded_paths = snapshot
+                .rows
+                .iter()
+                .map(|row| row.path.as_str())
+                .collect::<BTreeSet<_>>()
+                .len();
+            snapshot
+                .rows
+                .retain(|row| kinds.iter().any(|kind| kind == &row.kind));
+            let kind_symbols = u32::try_from(snapshot.rows.len()).unwrap_or(u32::MAX);
+            snapshot.total = kind_symbols;
+            let kind_files = snapshot
+                .rows
+                .iter()
+                .map(|row| row.path.as_str())
+                .collect::<BTreeSet<_>>()
+                .len();
+            let mut built = report.unwrap_or_else(|| crate::scope::ScopeReport {
+                paths: Vec::new(),
+                languages: Vec::new(),
+                kinds: Vec::new(),
+                files: 0,
+                symbols: 0,
+                corpus_files: 0,
+                corpus_symbols: 0,
+                related_tests_outside_scope: 0,
+            });
+            built.kinds = kinds.to_vec();
+            built.symbols = kind_symbols;
+            if scope.is_none() {
+                built.files = u32::try_from(kind_files).unwrap_or(u32::MAX);
+                built.corpus_files = match snapshot.analysis.as_ref() {
+                    Some(disclosure) if disclosure.total_files > 0 => {
+                        u32::try_from(disclosure.total_files).unwrap_or(u32::MAX)
+                    }
+                    _ => u32::try_from(loaded_paths).unwrap_or(u32::MAX),
+                };
+                built.corpus_symbols = match snapshot.analysis.as_ref() {
+                    Some(disclosure) if disclosure.total_symbols > 0 => {
+                        u32::try_from(disclosure.total_symbols).unwrap_or(u32::MAX)
+                    }
+                    _ => u32::try_from(loaded).unwrap_or(u32::MAX),
+                };
+            } else if let Some(disclosure) = snapshot.analysis.as_ref() {
+                if disclosure.total_files > 0 {
+                    built.corpus_files =
+                        u32::try_from(disclosure.total_files).unwrap_or(u32::MAX);
+                }
+                if disclosure.total_symbols > 0 {
+                    built.corpus_symbols =
+                        u32::try_from(disclosure.total_symbols).unwrap_or(u32::MAX);
+                }
+            }
+            report = Some(built);
+        }
         let mut response = self.search_semantic_over(query, token_budget, snapshot)?;
-        response.scope = resolved.map(|resolved| resolved.report);
+        response.scope = report;
         Ok(response)
+    }
+
+    /// Sites where a string value is written.
+    ///
+    /// `exact` is equality. Otherwise `query` is a case-sensitive prefix, so
+    /// `session.` matches `session.spawn`. A Rust module-level const's value
+    /// is also reported at each use of that const. `shown + hidden == total`.
+    /// `walk_incomplete` is set when no generation exists, or when the page
+    /// cap cut the read before the budget did.
+    pub fn literals(
+        &self,
+        query: &str,
+        exact: bool,
+        token_budget: u32,
+    ) -> anyhow::Result<LiteralReport> {
+        if query.trim().is_empty() {
+            anyhow::bail!("literals requires a non-empty query");
+        }
+        let Some(page) = self.store.search_literals(query, exact, LITERAL_PAGE_CAP)? else {
+            return Ok(LiteralReport {
+                query: query.to_string(),
+                exact,
+                items: Vec::new(),
+                shown: 0,
+                hidden: 0,
+                total: 0,
+                truncated: false,
+                tokens_used: 0,
+                walk_incomplete: Some("no persisted generation is available".to_string()),
+            });
+        };
+        let fetched = page.rows.len();
+        let mut items = Vec::new();
+        let mut tokens_used = 0u32;
+        for row in page.rows {
+            let site = LiteralSite {
+                file_path: row.file_path,
+                line: row.line,
+                value: row.value,
+                qualified_name: row.qualified_name,
+                symbol_name: row.symbol_name,
+            };
+            let cost = literal_site_tokens(&site);
+            if cost > token_budget.saturating_sub(tokens_used) {
+                break;
+            }
+            tokens_used += cost;
+            items.push(site);
+        }
+        let shown = u32::try_from(items.len()).unwrap_or(u32::MAX);
+        let total = page.total;
+        let hidden = total.saturating_sub(shown);
+        let walk_incomplete = (shown == u32::try_from(fetched).unwrap_or(u32::MAX) && total > shown)
+            .then(|| {
+                format!(
+                    "literal page cap of {LITERAL_PAGE_CAP} cut the read; {total} sites match and {fetched} were loaded"
+                )
+            });
+        Ok(LiteralReport {
+            query: query.to_string(),
+            exact,
+            items,
+            shown,
+            hidden,
+            total,
+            truncated: hidden > 0,
+            tokens_used,
+            walk_incomplete,
+        })
     }
 
     /// The symbol rows a ranking runs over: the whole latest generation, or
@@ -5939,6 +6171,46 @@ fn cap_source_span(source_span: String, token_budget: u32) -> (String, Option<u3
     let mut capped = source_span;
     capped.truncate(end);
     (capped, Some(omitted))
+}
+
+/// Rows loaded for one literal query before the token budget is applied.
+const LITERAL_PAGE_CAP: usize = 1000;
+
+fn scope_report_from_narrowing(
+    narrowing: &devmap_store::SearchNarrowing,
+    analysis: Option<&devmap_analyze::AnalysisDisclosure>,
+) -> crate::scope::ScopeReport {
+    let corpus_files = match analysis {
+        Some(disclosure) if disclosure.total_files > 0 => {
+            u32::try_from(disclosure.total_files).unwrap_or(u32::MAX)
+        }
+        _ => narrowing.corpus_files,
+    };
+    let corpus_symbols = match analysis {
+        Some(disclosure) if disclosure.total_symbols > 0 => {
+            u32::try_from(disclosure.total_symbols).unwrap_or(u32::MAX)
+        }
+        _ => narrowing.corpus_symbols,
+    };
+    crate::scope::ScopeReport {
+        paths: narrowing.paths.clone(),
+        languages: narrowing.languages.clone(),
+        kinds: narrowing.kinds.clone(),
+        files: narrowing.files,
+        symbols: narrowing.symbols,
+        corpus_files,
+        corpus_symbols,
+        related_tests_outside_scope: 0,
+    }
+}
+
+fn literal_site_tokens(site: &LiteralSite) -> u32 {
+    let bytes = site.file_path.len()
+        + site.value.len()
+        + site.qualified_name.len()
+        + site.symbol_name.len()
+        + 8;
+    u32::try_from(bytes / 4).unwrap_or(u32::MAX).max(1)
 }
 
 pub fn budget_take<T, F>(items: Vec<T>, token_budget: u32, cost_of: F) -> Response<T>

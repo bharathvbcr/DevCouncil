@@ -62,7 +62,7 @@ mod session;
 mod sha256;
 mod skills;
 
-use devmap_extract::collect_go_modules;
+use devmap_extract::collect_project_manifests;
 use devmap_query::freshness::{self, FreshnessDigests, InventoryLimits, InventorySource};
 use devmap_query::{
     generate_code_graph_encodings, generate_manifest_with_edges, resolve_manifest_output,
@@ -741,15 +741,18 @@ enum Commands {
         #[arg(long)]
         semantic: bool,
         /// Rank only files under this repository-relative path prefix
-        /// (repeatable). Needs `--semantic`: keyword search ranks a page the
-        /// full-text index already cut, so a scope is refused there. A prefix
-        /// matching no indexed file is refused.
+        /// (repeatable). Applied before the page is cut, for keyword and
+        /// `--semantic` search. A prefix matching no indexed file is refused.
         #[arg(long = "path", value_name = "PREFIX")]
         paths: Vec<String>,
         /// Rank only files in this language, as the index labels it
-        /// (repeatable; `typescript` and `tsx` are distinct). Needs `--semantic`.
+        /// (repeatable; `typescript` and `tsx` are distinct).
         #[arg(long = "language", value_name = "LANGUAGE")]
         languages: Vec<String>,
+        /// Keep only symbols of this kind (repeatable). `function` and
+        /// `Function` are the same kind. An unknown kind is refused.
+        #[arg(long = "kind", value_name = "KIND")]
+        kinds: Vec<String>,
     },
     /// Plain-language find over names, docstrings, and the call graph.
     ///
@@ -988,6 +991,30 @@ enum Commands {
         depth: usize,
         #[arg(long, default_value_t = 0.0)]
         min_confidence: f32,
+        /// Definitions under this repository-relative path prefix (repeatable).
+        /// A prefix matching no indexed file is refused.
+        #[arg(long = "path", value_name = "PREFIX")]
+        paths: Vec<String>,
+        /// Definitions in this language, as the index labels it (repeatable).
+        #[arg(long = "language", value_name = "LANGUAGE")]
+        languages: Vec<String>,
+        /// Definitions of this kind (repeatable). Case is ignored.
+        #[arg(long = "kind", value_name = "KIND")]
+        kinds: Vec<String>,
+    },
+    /// Where a string constant is written.
+    ///
+    /// Matches the literal text, not a symbol name. A prefix is the default
+    /// (`session.` matches `session.spawn`); `--exact` requires equality.
+    /// Each site names the file, line and enclosing symbol. A Rust
+    /// module-level const's value is also reported at each use of that const.
+    Literals {
+        query: String,
+        /// Require the value to equal the query.
+        #[arg(long)]
+        exact: bool,
+        #[arg(short, long, default_value_t = 2000)]
+        budget: u32,
     },
     /// Test files reachable through the inbound blast radius of some targets.
     ///
@@ -3851,6 +3878,7 @@ fn emit_scope(scope: Option<&devmap_query::ScopeReport>) {
             .iter()
             .map(|language| format!("[{language}]")),
     );
+    named.extend(scope.kinds.iter().map(|kind| format!("kind:{kind}")));
     outln!(
         "scope: {} ({} of {} files, {} of {} symbols)",
         named.join(" "),
@@ -4116,6 +4144,7 @@ fn emit_explore(report: &devmap_query::ExploreReport) {
         emit_unavailable(reason);
         return;
     }
+    emit_scope(report.scope.as_ref());
     for definition in &report.definitions.items {
         outln!(
             "{}:{}-{}  {}  {}",
@@ -4170,6 +4199,23 @@ fn emit_explore(report: &devmap_query::ExploreReport) {
         report.budget.blast_radius
     );
     emit_blast_radius(&report.blast_radius);
+}
+
+fn emit_literals(report: &devmap_query::LiteralReport) {
+    let mode = if report.exact { "exact" } else { "prefix" };
+    outln!("literals {mode} {:?}", report.query);
+    for site in &report.items {
+        let symbol = if site.qualified_name.is_empty() {
+            site.symbol_name.as_str()
+        } else {
+            site.qualified_name.as_str()
+        };
+        outln!("{}:{}  {}  {}", site.file_path, site.line, symbol, site.value);
+    }
+    emit_truncation(report.shown, report.hidden, report.total, report.truncated);
+    if let Some(reason) = &report.walk_incomplete {
+        outln!("warning: {reason}");
+    }
 }
 
 fn emit_affected(report: &devmap_query::AffectedTestsReport) {
@@ -5207,6 +5253,7 @@ fn validate_limits(command: &Commands) -> Result<(), String> {
 
     match command {
         Commands::Search { budget, .. }
+        | Commands::Literals { budget, .. }
         | Commands::Snapshots { budget, .. }
         | Commands::Savings { budget, .. } => check_budget(*budget),
         Commands::Ask {
@@ -6098,10 +6145,11 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             };
 
             let mut resolver = Resolver::new();
-            let go_modules =
-                progress.timed("discovering Go modules", || collect_go_modules(path))?;
+            let manifests = progress.timed("discovering project manifests", || {
+                collect_project_manifests(path)
+            })?;
             progress.timed("resolver:index", || {
-                resolver.index_go_modules(&go_modules);
+                resolver.index_project_manifests(&manifests);
                 resolver.index_extractions(&extractions);
                 // After `index_extractions`, which resets the set this extends.
                 resolver.mark_go_dirs_incomplete(devmap_extract::go_dirs_with_unindexed_files(
@@ -6461,25 +6509,29 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             semantic,
             paths,
             languages,
+            kinds,
         } => {
-            let scope = devmap_query::SymbolScope::new(paths, languages)?;
-            if scope.is_some() && !*semantic {
-                anyhow::bail!(
-                    "--path and --language scope `--semantic` search only; keyword search ranks a \
-                     page the full-text index has already cut from the whole repository"
-                );
-            }
+            let filter = devmap_query::NameQueryFilter::new(paths, languages, kinds)?;
             let store = open_for_read(cli)?;
             let engine = StoreQueryEngine::new(&store);
             let resp = if *semantic {
-                engine.search_semantic_scoped(query, *budget, scope.as_ref())?
+                let scope = filter
+                    .as_ref()
+                    .map(|filter| filter.symbol_scope())
+                    .transpose()?
+                    .flatten();
+                let kinds = filter.as_ref().map(|filter| filter.kinds()).unwrap_or(&[]);
+                engine.search_semantic_filtered(query, *budget, scope.as_ref(), kinds)?
             } else {
-                engine.search(Request {
-                    query: query.clone(),
-                    token_budget: *budget,
-                    min_confidence: 0.0,
-                    max_depth: 1,
-                })?
+                engine.search_filtered(
+                    Request {
+                        query: query.clone(),
+                        token_budget: *budget,
+                        min_confidence: 0.0,
+                        max_depth: 1,
+                    },
+                    filter.as_ref(),
+                )?
             };
             if cli.json {
                 emit_json(cli, &serde_json::to_value(&resp)?)?;
@@ -6761,19 +6813,33 @@ async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyhow::Result<(
             budget,
             depth,
             min_confidence,
+            paths,
+            languages,
+            kinds,
         } => {
+            let filter = devmap_query::NameQueryFilter::new(paths, languages, kinds)?;
             let store = open_for_read(cli)?;
-            let report = StoreQueryEngine::new(&store).explore(
+            let report = StoreQueryEngine::new(&store).explore_filtered(
                 query,
                 *limit,
                 *budget,
                 *min_confidence,
                 *depth,
+                filter.as_ref(),
             )?;
             if cli.json {
                 emit_json(cli, &serde_json::to_value(&report)?)?;
             } else {
                 emit_explore(&report);
+            }
+        }
+        Commands::Literals { query, exact, budget } => {
+            let store = open_for_read(cli)?;
+            let report = StoreQueryEngine::new(&store).literals(query, *exact, *budget)?;
+            if cli.json {
+                emit_json(cli, &serde_json::to_value(&report)?)?;
+            } else {
+                emit_literals(&report);
             }
         }
         Commands::Affected {

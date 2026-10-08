@@ -821,8 +821,16 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // and Go routes; a row without it says no producer ran for either.
     //
     // v73 references the type a Rust struct literal constructs.
+    //
+    // v74 binds the names a CommonJS `require` declares.
+    //
+    // v75 records string literals and the uses of a Rust module-level const.
+    // extraction-recall and metal-kernels both stamped 75 on payloads that
+    // are not this one.
+    //
+    // v76 is v73, v74 and v75 together.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "73",
+        EXTRACTION_SCHEMA_VERSION, "76",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

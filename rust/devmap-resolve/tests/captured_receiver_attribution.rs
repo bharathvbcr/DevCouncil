@@ -4,9 +4,16 @@ use devmap_extract::model::{Extraction, ReferenceKind};
 use devmap_resolve::model::{ResolutionResult, UnresolvedClass, UnresolvedKind};
 use devmap_resolve::Resolver;
 
+/// A TypeScript type that declares the members these fixtures call, so each
+/// call has a namesake the receiver *could* be. Without one a member nothing
+/// declares is `NoNamesake` whatever the receiver is, and the tests below
+/// could no longer tell an unattributed capture from an explained one.
+const NAMESAKES: &str = "export class Numberish {\n    toFixed() { return ''; }\n    remote() { return 0; }\n    get() { return 0; }\n}\n";
+
 fn resolve(extraction: &Extraction) -> ResolutionResult {
+    let namesakes = extract_file("src/namesakes.ts", NAMESAKES);
     let mut resolver = Resolver::new();
-    resolver.index_extractions(std::slice::from_ref(extraction));
+    resolver.index_extractions(&[extraction.clone(), namesakes]);
     resolver
         .resolve_all(std::slice::from_ref(extraction))
         .unwrap()

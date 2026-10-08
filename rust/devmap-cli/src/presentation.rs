@@ -80,6 +80,7 @@ fn profile(command: &Commands) -> Option<(&'static str, &'static str)> {
         Commands::Suspects { .. } => ("Suspects", "Asking what could have caused this"),
         Commands::Blast { .. } => ("Blast radius", "Following what this change reaches"),
         Commands::Search { .. } => ("Search", "Looking for the right thread"),
+        Commands::Literals { .. } => ("Literals", "Finding where a string is written"),
         Commands::Deps { .. } => ("Dependencies", "Following the connections"),
         Commands::Impact { .. } => ("Impact", "Tracing the ripples"),
         Commands::Neighbors { .. } => ("Neighbors", "Meeting the neighbors"),

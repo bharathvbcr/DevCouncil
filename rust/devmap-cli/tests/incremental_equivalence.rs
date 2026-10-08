@@ -772,9 +772,12 @@ fn an_unchanged_v50_generation_recomputes_captured_receiver_attribution_after_up
     assert_unchanged_attribution_upgrade(
         "50",
         "src/use.ts",
+        // `Numberish.toFixed` is the namesake that keeps the captured call an
+        // uninferred receiver; with none it would be `no_namesake`.
         "export function outer(Math: number) {\n\
          function inner() { return Math.toFixed(); }\n\
-         return inner();\n}\n",
+         return inner();\n}\n\
+         export class Numberish {\n  toFixed() { return ''; }\n}\n",
         "toFixed",
         "host_global",
         "uninferred_receiver",

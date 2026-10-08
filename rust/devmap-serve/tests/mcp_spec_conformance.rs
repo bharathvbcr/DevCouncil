@@ -581,6 +581,7 @@ async fn every_tool_result_conforms_to_the_output_schema_it_declared() {
             json!({"file": "core.py", "content": "def helper(rows):\n    return 0\n"}),
         ),
         ("devmap_explore", json!({"query": "helper"})),
+        ("devmap_literals", json!({"query": "session."})),
         ("devmap_affected_tests", json!({"targets": ["helper"]})),
         (
             "devmap_cypher",

@@ -759,6 +759,7 @@ fn extract_treesitter_before_deadline(
                     scope_locals: collect_scope_locals(root, source, &file_symbol_name),
                     local_bindings,
                     source_code: Some(source.to_string()),
+                    literals: Vec::new(),
                 };
 
                 // The code inside a template language's `<script>` blocks, in
@@ -795,6 +796,10 @@ fn extract_treesitter_before_deadline(
                 // after one registry lookup for every language whose entry
                 // permits neither `css` nor `html` inside it.
                 crate::markup::merge_markup(&mut extraction, root, source, lang);
+                let (literals, mut notes) =
+                    crate::literals::index_literals(root, source, lang, &extraction.symbols, deadline);
+                extraction.literals = literals;
+                extraction.diagnostics.append(&mut notes);
                 #[cfg(test)]
                 EXTRACTION_FINISH_HOOK.with(|hook| {
                     if let Some(finish) = hook.take() {
@@ -1506,6 +1511,84 @@ fn python_import_bindings(node: Node, source: &str) -> (Vec<String>, Vec<String>
 /// (`{ a, // why\n b }` bound `//` and lost `b`) and an inline `type` modifier
 /// (`{ type Foo, bar }` bound `type` and lost `Foo`). A specifier's `name` and
 /// `alias` fields hold only an identifier or a string, so nothing else is read.
+/// The names a CommonJS `require(...)` binds, in the shape an ES import of the
+/// same meaning records.
+///
+/// `const path = require("node:path")` is `import * as path`: the alias plus a
+/// `*` name. `const { a, b: c } = require("./x")` is `import { a, b as c }`.
+/// Only a `require` that *is* a declarator's value binds anything; a bare
+/// side-effect `require` and `require("./x").member` name no handle for the
+/// module, and inventing one would bind a name the author never wrote.
+fn js_require_bindings(call: Node, source: &str) -> (Option<String>, Vec<String>, Vec<String>) {
+    let unbound = (None, Vec::new(), Vec::new());
+    let Some(declarator) = call
+        .parent()
+        .filter(|parent| parent.kind() == "variable_declarator")
+        .filter(|parent| {
+            parent
+                .child_by_field_name("value")
+                .is_some_and(|value| value.id() == call.id())
+        })
+    else {
+        return unbound;
+    };
+    let Some(pattern) = declarator.child_by_field_name("name") else {
+        return unbound;
+    };
+    match pattern.kind() {
+        "identifier" => {
+            let local = get_node_text(pattern, source);
+            (Some(local.clone()), vec!["*".to_string()], vec![local])
+        }
+        "object_pattern" => {
+            let mut names = Vec::new();
+            let mut locals = Vec::new();
+            let mut cursor = pattern.walk();
+            for property in pattern.named_children(&mut cursor) {
+                let (name, local) = match property.kind() {
+                    "shorthand_property_identifier_pattern" => {
+                        let name = get_node_text(property, source);
+                        (name.clone(), name)
+                    }
+                    // `{ a = fallback }` binds `a`.
+                    "object_assignment_pattern" => {
+                        let Some(left) = property
+                            .child_by_field_name("left")
+                            .filter(|left| left.kind() == "shorthand_property_identifier_pattern")
+                        else {
+                            continue;
+                        };
+                        let name = get_node_text(left, source);
+                        (name.clone(), name)
+                    }
+                    // `{ a: b }` binds `b` to the module's `a`. A nested
+                    // pattern (`{ a: { b } }`) binds a member of a member,
+                    // which no import shape can say.
+                    "pair_pattern" => {
+                        let (Some(key), Some(value)) = (
+                            property.child_by_field_name("key"),
+                            property.child_by_field_name("value"),
+                        ) else {
+                            continue;
+                        };
+                        if key.kind() != "property_identifier" || value.kind() != "identifier" {
+                            continue;
+                        }
+                        (get_node_text(key, source), get_node_text(value, source))
+                    }
+                    _ => continue,
+                };
+                if !name.is_empty() && !local.is_empty() {
+                    names.push(name);
+                    locals.push(local);
+                }
+            }
+            (None, names, locals)
+        }
+        _ => unbound,
+    }
+}
+
 fn js_clause_bindings(clause: Node, source: &str) -> (Vec<String>, Vec<String>) {
     let mut names = Vec::new();
     let mut locals = Vec::new();
@@ -1756,6 +1839,7 @@ fn unparsed_extraction(
         scope_locals: Vec::new(),
         local_bindings: Vec::new(),
         source_code: Some(source.to_string()),
+        literals: Vec::new(),
     }
 }
 
@@ -1963,6 +2047,7 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
         scope_locals: Vec::new(),
         local_bindings: Vec::new(),
         source_code: Some(source.to_string()),
+        literals: Vec::new(),
     }
 }
 
@@ -3961,12 +4046,18 @@ fn extract_node(
                                         .trim_matches('`')
                                         .to_string();
                                     if !mod_spec.is_empty() {
+                                        let (alias, imported_names, local_names) =
+                                            if callee == "require" {
+                                                js_require_bindings(node, source)
+                                            } else {
+                                                (None, vec![], vec![])
+                                            };
                                         imports.push(ExtractedImport {
                                             raw_import: get_node_text(node, source),
                                             module_specifier: mod_spec,
-                                            imported_names: vec![],
-                                            local_names: vec![],
-                                            alias: None,
+                                            imported_names,
+                                            local_names,
+                                            alias,
                                             span: span.clone(),
                                             path_load: None,
                                         });

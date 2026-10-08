@@ -544,7 +544,21 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `struct_expression` had hidden as a declaration. (`a::Name { .. }` already
 /// referenced `Name` through its path segment.) Served warm, a v72 row keeps
 /// every type built only by literal (serde records, config structs) dead.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "73";
+///
+/// v74 binds the names a CommonJS `require` declares: `const x = require(m)`
+/// as a namespace handle, `const { a, b: c } = require(m)` as named imports.
+/// A row without them has a `require` that binds nothing, so every call
+/// through it is unattributed.
+///
+/// v75 records string literals and, for a Rust module-level const, the uses
+/// of that const. A cached row without them answers "no writer" for a
+/// string-keyed protocol. The extraction-recall lane stamped `"75"` on a
+/// payload that did not yet include v73, and the metal-kernels lane stamped
+/// the same number on the kernel payload. Neither row is this payload.
+///
+/// v76 is v73, v74 and v75 together. A row stamped 73, 74 or 75 lacks at
+/// least one of them, so none of those identities may be served warm.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "76";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

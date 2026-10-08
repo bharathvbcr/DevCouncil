@@ -191,10 +191,20 @@ fn a_python_module_import_does_not_make_swift_sdk_names_bare_globals() {
 #[test]
 fn typed_swift_prelude_values_and_local_types_keep_distinct_classifications() {
     for local_type in [false, true] {
-        let mut files = vec![(
-            "Sources/App/main.swift",
-            "func build(_ value: String) {\n    _ = value.lowercased()\n}\n",
-        )];
+        // `Other.lowercased` is a namesake the call could reach, in both
+        // halves: without one, a member nothing declares is `NoNamesake`
+        // whatever its receiver's type is, and the local-type half could not
+        // show the prelude veto at work.
+        let mut files = vec![
+            (
+                "Sources/App/main.swift",
+                "func build(_ value: String) {\n    _ = value.lowercased()\n}\n",
+            ),
+            (
+                "Sources/Other/Other.swift",
+                "struct Other {\n    func lowercased() -> Int { return 1 }\n}\n",
+            ),
+        ];
         if local_type {
             files.push(("Sources/App/Value.swift", "struct String {}\n"));
         }

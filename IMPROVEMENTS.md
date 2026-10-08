@@ -882,6 +882,14 @@ coherent again:
   behaviour back): tsconfig `extends` / project-reference path mapping; generic subsystem
   inference for non-DevCouncil trees; the primary-stack ordering of `languages`; comment
   stripping not skewing dead-symbol detection (moot with tree-sitter, but unpinned).
+  **Covered 2026-10-08** in `rust/devmap-query/tests/retired_python_claims_have_kernel_tests.rs`:
+  `subsystems_on_a_foreign_tree_are_named_by_its_own_directories` (an Express + Django tree
+  through the real Louvain pass), `every_primary_stack_language_is_advertised_in_a_deterministic_order`
+  (the retired Python test pinned primary-stack *coverage*, not a rank; the kernel lists
+  languages by name, R4, and the test pins both), and
+  `a_function_named_only_in_comments_and_strings_stays_dead` (Rust, Python, JS, with a
+  real-call control; red when one comment is turned into a call). The tsconfig gap is
+  covered by `rust/devmap-cli/tests/tsconfig_path_mapping.rs` (end to end through `devmap build`).
 - **Route registrations were already gone before the delete.** `api_routes.map_routes` reads
   a `registers` edge for a route's middleware/registration list, and only
   `codeintel/resolution/frameworks/routes.py` ever produced one — the kernel's

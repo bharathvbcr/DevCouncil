@@ -276,3 +276,15 @@ required-features = ["parse"]
 [[test]]
 name = "a_walk_names_only_the_gaps_it_touches"
 required-features = ["parse"]
+
+[[test]]
+name = "retired_python_claims_have_kernel_tests"
+required-features = ["parse"]
+
+[[test]]
+name = "name_query_filters"
+required-features = ["parse"]
+
+[[test]]
+name = "literal_sites"
+required-features = ["parse"]

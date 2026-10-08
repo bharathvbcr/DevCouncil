@@ -711,7 +711,14 @@ fn store_of(files: &[(&str, &str)], refuse: &[&str]) -> Store {
 fn dead_symbols_computed_over_unattributed_calls_say_so() {
     let store = store_of(
         &[
-            ("lib.py", "def abandoned():\n    return 1\n"),
+            // `Other.mystery_method` is the namesake that makes the call in
+            // `app.py` an unattributed site: a member nothing declares could
+            // hide no edge, and is `no_namesake`.
+            (
+                "lib.py",
+                "def abandoned():\n    return 1\n\n\
+                 class Other:\n    def mystery_method(self):\n        return 2\n",
+            ),
             (
                 "app.py",
                 "def run(thing):\n    return thing.mystery_method()\n",
@@ -1205,7 +1212,13 @@ fn a_non_empty_search_over_a_refused_file_carries_the_same_caveat() {
 fn search_over_a_complete_corpus_claims_nothing() {
     let store = store_of(
         &[
-            ("lib.py", "def helper():\n    return 1\n"),
+            // `Other.mystery_method` keeps the call in `app.py` unattributed;
+            // without a namesake it would be `no_namesake`.
+            (
+                "lib.py",
+                "def helper():\n    return 1\n\n\
+                 class Other:\n    def mystery_method(self):\n        return 2\n",
+            ),
             (
                 "app.py",
                 "def run(thing):\n    return thing.mystery_method()\n",

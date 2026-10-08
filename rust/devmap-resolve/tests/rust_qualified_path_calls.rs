@@ -261,11 +261,19 @@ fn a_std_path_stays_external() {
 
 #[test]
 fn a_local_that_shares_a_crate_name_is_not_a_path() {
-    let (_, result) = resolve(&[(
-        "crates/thing/src/work.rs",
-        "use serde_json::Value;\n\npub fn go() {\n    let serde_json = build();\n    \
-         serde_json.take();\n}\n",
-    )]);
+    // `Holder::take` gives `take` a namesake the local could own; without
+    // one the member is `no_namesake` whatever the receiver is.
+    let (_, result) = resolve(&[
+        (
+            "crates/thing/src/work.rs",
+            "use serde_json::Value;\n\npub fn go() {\n    let serde_json = build();\n    \
+             serde_json.take();\n}\n",
+        ),
+        (
+            "crates/thing/src/holder.rs",
+            "pub struct Holder;\nimpl Holder {\n    pub fn take(&self) {}\n}\n",
+        ),
+    ]);
 
     assert_eq!(
         classes_of(&result, "take"),
