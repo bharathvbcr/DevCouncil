@@ -19,6 +19,20 @@
 //!   a comment or string read as a call. Tree-sitter makes it moot, but nothing
 //!   pinned it: a function named only in comments and string literals must
 //!   still be dead, and a real call must still make it live.
+//!
+//! Each test was proved to discriminate on 2026-10-08 by breaking what it
+//! guards and watching it go red, then restoring:
+//!
+//! * subsystems — `manifest.rs` keyed the area by the community's name
+//!   (`community-N`) instead of its directory: "a two-service tree inferred no
+//!   subsystem". (The DevCouncil-name loop is a guard against a leak, and
+//!   cannot fail on a fixture that never contains those names; the directory
+//!   assertions are the teeth.)
+//! * languages — `languages` collected in arrival order (a `Vec`) instead of a
+//!   `BTreeSet`: "languages are listed by name (R4)"; and `.kt` dropped from
+//!   the language registry: "kotlin is missing".
+//! * comments — one `// orphan_rs();` turned into a real call: red on the
+//!   "named only in comments and strings" assertion.
 
 #![cfg(feature = "parse")]
 

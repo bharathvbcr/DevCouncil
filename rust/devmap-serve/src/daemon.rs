@@ -4254,6 +4254,98 @@ mod tests {
         (root, daemon)
     }
 
+    /// The daemon resolves through tsconfig `paths`, and a config-only edit
+    /// moves the edge on the next drain.
+    ///
+    /// The CLI build has its own test (`devmap-cli/tests/tsconfig_path_mapping.rs`);
+    /// this is the other caller of `collect_project_manifests`. `legacy/` holds
+    /// a namesake, so only the mapping — not the unique-global rung — can pick
+    /// the target, and the second drain is handed the config path alone, so it
+    /// runs the carry-forward branch rather than a whole-tree build.
+    #[test]
+    fn a_drain_resolves_through_tsconfig_and_follows_a_config_only_edit() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "devmap-daemon-tsconfig-{}-{stamp}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        for dir in ["core/src", "legacy/src", "app"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let config = |target: &str| {
+            format!(r#"{{ "compilerOptions": {{ "paths": {{ "@core/*": ["{target}"] }} }} }}"#)
+        };
+        fs::write(root.join("tsconfig.json"), config("./core/src/*")).unwrap();
+        fs::write(
+            root.join("core/src/util.ts"),
+            "export function coreHelper(): number { return 1; }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("legacy/src/util.ts"),
+            "export function coreHelper(): number { return 2; }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("app/main.ts"),
+            "import { coreHelper } from \"@core/util\";\n\
+             export function run(): number { return coreHelper(); }\n",
+        )
+        .unwrap();
+
+        let calls_from_run = |daemon: &Daemon| -> Vec<String> {
+            let mut targets: Vec<String> = daemon
+                .store
+                .latest_edges_for_test()
+                .unwrap()
+                .into_iter()
+                .filter(|edge| edge.starts_with("app/main.ts::run>") && edge.contains("coreHelper"))
+                .map(|edge| {
+                    edge.trim_start_matches("app/main.ts::run>")
+                        .split(':')
+                        .next()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect();
+            targets.sort();
+            targets.dedup();
+            targets
+        };
+
+        let store = Store::open_in_memory().unwrap();
+        let paths: Vec<String> = [
+            "tsconfig.json",
+            "core/src/util.ts",
+            "legacy/src/util.ts",
+            "app/main.ts",
+        ]
+        .iter()
+        .map(|path| root.join(path).display().to_string())
+        .collect();
+        store.enqueue_pending_paths(&paths).unwrap();
+        let daemon = Daemon::new(store, root.clone());
+        daemon.drain_pending_batch().unwrap();
+        assert_eq!(calls_from_run(&daemon), vec!["core/src/util.ts"]);
+
+        fs::write(root.join("tsconfig.json"), config("./legacy/src/*")).unwrap();
+        daemon
+            .store
+            .enqueue_pending_paths(&[root.join("tsconfig.json").display().to_string()])
+            .unwrap();
+        daemon.drain_pending_batch().unwrap();
+        assert_eq!(
+            calls_from_run(&daemon),
+            vec!["legacy/src/util.ts"],
+            "a config-only edit must move the edge on the next drain"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// A watcher batch the store would not take must not leave `status` fresh.
     ///
     /// The pending queue lives in the store, so "this file changed" is normally

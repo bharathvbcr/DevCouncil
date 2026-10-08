@@ -199,6 +199,48 @@ fn paths_inherited_through_extends_and_a_solution_root_bind_the_import() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// An edit to a config alone re-resolves on an ordinary incremental build.
+///
+/// Every `tsconfig*.json` is an indexed, content-hashed file, so changing one
+/// defeats the no-change early return and the build re-collects the configs.
+/// Pinned rather than assumed: if a config edit ever stopped moving the
+/// importer's edge, the graph would keep the old mapping with nothing saying
+/// it is stale.
+#[test]
+fn a_config_only_edit_moves_the_edge_on_an_incremental_build() {
+    let root = fixture("remap");
+    assert!(binds_only(
+        &call_edges(&root),
+        "packages/app/src/main.ts::run",
+        "packages/core/src/util.ts::coreHelper"
+    ));
+    write(
+        &root,
+        "tsconfig.base.json",
+        r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@core/*": ["packages/legacy/src/*"] } } }"#,
+    );
+    let out = Command::new(devmap())
+        .args(["build", "."])
+        .current_dir(&root)
+        .output()
+        .expect("devmap build");
+    assert!(
+        out.status.success(),
+        "incremental build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let edges = call_edges(&root);
+    assert!(
+        binds_only(
+            &edges,
+            "packages/app/src/main.ts::run",
+            "packages/legacy/src/util.ts::coreHelper"
+        ),
+        "the remapped `@core/*` must move the edge without `--full`: {edges:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn a_referenced_app_config_maps_paths_against_the_config_that_wrote_them() {
     let root = fixture("references");
