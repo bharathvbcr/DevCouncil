@@ -293,6 +293,39 @@ python3 benchmarks/competition_bench.py --config comparison.json --out results/c
 python3 -m unittest discover -s benchmarks -p 'test_*bench.py'
 ```
 
+The default campaign runs each tool's whole campaign before starting the next tool's,
+so its timings are neither interleaved nor counterbalanced. For a per-edit
+comparison use `--mode edit-latency`:
+
+```bash
+python3 benchmarks/competition_bench.py --mode edit-latency --config comparison.json \
+    --out results/edit-latency --repeat 6 --seed 20261007
+```
+
+The config takes the same keys, plus an optional `devmap_b` (a second DevMap
+executable timed against `devmap` in the same schedule). An arm left out of the
+config is skipped and listed in `skipped_arms`. Each arm indexes its own clone
+of the same revision, with the seeded fixtures from `ground_truth.py` planted
+in it. Each round, every arm then edits one file, rebuilds, and must find the
+new symbol by search. It then restores the file, rebuilds, and must no longer
+find it.
+
+Arm order follows a rotated Latin square, with every other block reversed (ABBA
+for two arms). `--repeat` must therefore be a multiple of the arm count, between
+2 and 60; anything else is refused rather than run unbalanced. The planned and
+executed orders, each sample's position and the host load average are all
+recorded. `edit-latency.json` reports n, min, median and max per arm and
+scenario, split by position. Only verified samples are timed; failures are
+counted beside them.
+
+The same mode scores each arm's direct-callers answer for every planted leaf
+against `ground_truth.json`, which the generator computes; no tool under test
+produces it. It reports precision, recall, misses and extras per symbol.
+DevMap is queried with `impact --depth 1` and counts `Calls` edges only.
+CodeGraph is queried with `callers --json` and counts `function`/`method` rows
+only; its `file` rows are counted separately. A tool with no verified callers
+interface (CBM, here) is `not_measured`, never zero recall.
+
 The runner installs no tools or providers. Its adapters target the native
 command and response contracts recorded in each run's version/schema artifacts;
 an unknown response is unverified, never an empty successful answer. One cold
