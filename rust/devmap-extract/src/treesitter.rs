@@ -7995,6 +7995,18 @@ fn is_defining_name(node: Node) -> bool {
         if parent.kind() == "generic_type" {
             return false;
         }
+        // Rust's struct literal writes the type it constructs on the `name`
+        // field of `struct_expression`. That is a use: a serde record built
+        // only as `to_string(&FileRecord { .. })` has no other mention, and
+        // reading it as a binding suppressed the Type reference, so the type
+        // was reported dead at 0.9. `Self { .. }` is the same position, and
+        // the resolver reads a Rust `Self` type reference as the enclosing
+        // impl's type. The arm's `Constructor` reference cannot stand in: it
+        // carries the `let` binding only, and the resolver skips that kind as
+        // the duplicate of a call no struct literal has.
+        if parent.kind() == "struct_expression" && field_contains(parent, "name", current) {
+            return false;
+        }
         // The C++ spelling of the same shape, but transparent rather than a
         // verdict: `f<T>(x)` is a use and `template <> struct Tiles<8> {…}` is
         // a declaration, and only the node above the wrapper can tell which.
