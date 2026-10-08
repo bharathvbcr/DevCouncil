@@ -694,3 +694,159 @@ fn deleted_tasks_are_listed_most_recently_deleted_first_until_restored() {
     assert_eq!(ids(&s, &deleted), ["tie", "old"]);
     assert_eq!(json::<i64>(&s, &call(&s, "items.list", "{}"), "$.total"), 2);
 }
+
+/// The parent-chain bound holds for the whole chain, not only the part above
+/// the new parent, and a parent the task already has is never re-checked.
+/// Before, hanging one legal chain under another built a chain past the bound
+/// that nothing refused, and from then on every save of a task in it that
+/// carried its own unchanged links was refused — a task made unsaveable by an
+/// edit to a different task.
+#[test]
+fn the_parent_chain_bound_covers_the_whole_chain_and_never_strands_a_saved_link() {
+    let (s, _) = fixture();
+    let parent = |id: &str, revision: i64, of: &str| {
+        s.workbench_request(
+            "items.put",
+            &format!(
+                r#"{{"id":"{id}","request_id":"{id}-{revision}-{of}","expected_revision":{revision},"title":"Task {id}","repository_ids":["r"],"primary_repository_id":"r","links":[{{"kind":"parent","item_id":"{of}"}}]}}"#
+            ),
+        )
+    };
+    put(&s, "a0", 0, "");
+    put(&s, "b0", 0, "");
+    for i in 1..=200 {
+        parent(&format!("a{i}"), 0, &format!("a{}", i - 1)).unwrap();
+        parent(&format!("b{i}"), 0, &format!("b{}", i - 1)).unwrap();
+    }
+    // a0..a200 above, b0..b200 below: 402 tasks in one chain.
+    let refused = parent("b0", 1, "a200").unwrap_err();
+    assert_eq!(refused.code, "invalid_input", "{}", refused.message);
+    assert!(
+        refused.message.contains("deeper than 256"),
+        "{}",
+        refused.message
+    );
+    // A profile written before the bound covered the whole chain may already
+    // hold that join. Every task in it still saves with its unchanged links.
+    s.connection()
+        .execute_batch(
+            "INSERT INTO work_item_links(item_id,kind,target_id,position) VALUES('b0','parent','a200',0);
+             UPDATE work_items SET body=json_set(body,'$.links',json('[{\"kind\":\"parent\",\"item_id\":\"a200\"}]')) WHERE id='b0';",
+        )
+        .unwrap();
+    parent("b200", 1, "b199").unwrap();
+    parent("b0", 1, "a200").unwrap();
+    // A join that fits is accepted: a0..a100 above d0..d154 is 256 tasks.
+    let fits = (0..=154).fold(None::<String>, |above, i| {
+        let id = format!("d{i}");
+        match &above {
+            None => put(&s, &id, 0, ""),
+            Some(up) => parent(&id, 0, up).unwrap(),
+        };
+        Some(id)
+    });
+    assert_eq!(fits.as_deref(), Some("d154"));
+    parent("d0", 1, "a100").unwrap();
+    // One more task below the deepest is one too many.
+    let refused = parent("d155", 0, "d154").unwrap_err();
+    assert!(
+        refused.message.contains("deeper than 256"),
+        "{}",
+        refused.message
+    );
+}
+
+/// Deleting a workspace clears it from the live tasks it was home to and
+/// leaves already-deleted tasks as their deletion left them: when they were
+/// deleted, and the revision a restore is checked against.
+#[test]
+fn deleting_a_workspace_does_not_restamp_tasks_already_deleted() {
+    let (s, clock) = fixture();
+    call(
+        &s,
+        "workspaces.put",
+        r#"{"id":"w","request_id":"w","expected_revision":0,"name":"W","repository_ids":["r"]}"#,
+    );
+    put(&s, "old", 0, r#","home_workspace_id":"w""#);
+    put(&s, "new", 0, "");
+    put(&s, "live", 0, r#","home_workspace_id":"w""#);
+    clock.store(2000, Ordering::SeqCst);
+    call(
+        &s,
+        "items.delete",
+        r#"{"id":"old","request_id":"d1","expected_revision":1}"#,
+    );
+    clock.store(3000, Ordering::SeqCst);
+    call(
+        &s,
+        "items.delete",
+        r#"{"id":"new","request_id":"d2","expected_revision":1}"#,
+    );
+    clock.store(5000, Ordering::SeqCst);
+    let dropped = call(
+        &s,
+        "workspaces.delete",
+        r#"{"id":"w","request_id":"dw","expected_revision":1}"#,
+    );
+    assert_eq!(json::<i64>(&s, &dropped, "$.affected_item_count"), 1);
+    assert_eq!(
+        json::<String>(&s, &dropped, "$.affected_item_ids[0]"),
+        "live"
+    );
+    let live = get(&s, "live");
+    assert_eq!(json::<i64>(&s, &live, "$.item.revision"), 2);
+    assert_eq!(
+        json::<Option<String>>(&s, &live, "$.item.home_workspace_id"),
+        None
+    );
+
+    let deleted = call(&s, "items.list", r#"{"deleted":true,"order":"updated"}"#);
+    assert_eq!(
+        ids(&s, &deleted),
+        ["new", "old"],
+        "most recently deleted first"
+    );
+    // Restored with the revision its deletion produced, and without the
+    // workspace that was deleted while it was.
+    let back = call(
+        &s,
+        "items.restore",
+        r#"{"id":"old","request_id":"ro","expected_revision":2}"#,
+    );
+    assert_eq!(json::<i64>(&s, &back, "$.item.revision"), 3);
+    assert_eq!(
+        json::<Option<String>>(&s, &back, "$.item.home_workspace_id"),
+        None
+    );
+    let homed: i64 = s
+        .connection()
+        .query_row(
+            "SELECT count(*) FROM work_items WHERE home_workspace_id IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(homed, 0);
+}
+
+/// The migration recovers completion time from the first revision of the
+/// current Done streak, as the live write path records it — not the earliest
+/// clock reading in the streak, which a host with a slower clock can put
+/// before the task was ever Done.
+#[test]
+fn migrated_completion_time_is_the_first_done_revision_whatever_the_clocks() {
+    let (s, clock) = fixture();
+    put(&s, "t", 0, "");
+    clock.store(4000, Ordering::SeqCst);
+    put(&s, "t", 1, r#","status":"done""#);
+    clock.store(3500, Ordering::SeqCst);
+    put(
+        &s,
+        "t",
+        2,
+        r#","status":"done","description":"edited on a slow clock""#,
+    );
+    assert_eq!(json::<i64>(&s, &get(&s, "t"), "$.item.completed_at"), 4000);
+    downgrade_to_v10(&s);
+    assert_eq!(json::<i64>(&s, &get(&s, "t"), "$.item.completed_at"), 4000);
+}
