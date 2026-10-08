@@ -173,20 +173,27 @@ func (g *Gate) EvaluateCommand(command string, task *dc.Task) (policy.Decision, 
 		Root: g.Root,
 	}.EvaluateCommand(command, task)
 
-	// A hard denial is the one outcome that needs nothing further. It is
+	// A hard denial for what the line does needs nothing further. It is
 	// undemotable and ungrantable by construction, so the command cannot run and
 	// its redirections cannot happen; analysing them would only replace a precise
 	// refusal with a vaguer one.
 	//
+	// A hard denial for an unreadable construct is not that. It means the gate
+	// could not read the line, and a host may treat that more gently than a
+	// refusal for what the line does. Stopping here let `cd src && echo x > .env`
+	// come back as a directory change, and a host that softened that would have
+	// written .env having never shown it to the write gate. Those lines still
+	// have their redirections judged, below.
+	//
 	// Every other outcome — allow, warn, and a *soft* denial — must have its
-	// redirections judged, and the soft denial is the case a `Blocked()` test
+	// redirections judged too, and the soft denial is the case a `Blocked()` test
 	// here gets wrong. A command the ladder soft-refuses would skip the rung
 	// entirely; the posture then demotes that refusal, or a grant clears it, and
 	// the write runs having never been shown to the write gate. That turns a
 	// scope rule an operator chose to relax into a way past the credential rules
 	// they did not: `exec > .env`, `false || echo x > .env` and `(echo x > .env)`
 	// all wrote .env, while the same redirect alone was refused as path.secret.
-	if decision.Blocked() && decision.Severity == policy.Hard {
+	if decision.Blocked() && decision.Severity == policy.Hard && !policy.IsUnreadableRule(decision.Rule) {
 		return g.settle(decision, mode, modeOrigin, flags.PolicyCommandMode), nil
 	}
 
@@ -215,6 +222,13 @@ func (g *Gate) EvaluateCommand(command string, task *dc.Task) (policy.Decision, 
 		// here or the run summary undercounts a denial this gate made — a
 		// fail-closed decision that Report() could not account for.
 		return g.record(refusal.Decision), nil
+	}
+	// The redirects were judged and passed. A refusal that remains is only
+	// "the gate could not read this", and the marker is what lets a host tell
+	// that from "the gate forbids this". The ladder does not add it: it does
+	// not judge redirects.
+	if decision.Blocked() && decision.Severity == policy.Hard && policy.IsUnreadableRule(decision.Rule) {
+		decision = policy.WithUnreadableOnly(decision)
 	}
 	return g.settle(decision, mode, modeOrigin, flags.PolicyCommandMode), nil
 }
