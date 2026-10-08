@@ -15,7 +15,7 @@ deleted.
 It reads the model from the Hugging Face cache and never downloads: a fixture
 recorded from whatever a network happened to serve is not a fixture.
 
-What it writes, under doc-v2-mini/:
+What it writes, under doc-v2-mini/ and doc-v3-distill/ (one per model):
 
 * `<doc>.ids.npy` (int64): the model tokenizer's ids with [CLS]/[SEP],
   truncated at 512 — the tokenization the Rust side must reproduce exactly.
@@ -45,11 +45,14 @@ import numpy as np
 import torch
 from transformers import AutoModelForMaskedLM, AutoTokenizer
 
-MODEL = "opensearch-project/opensearch-neural-sparse-encoding-doc-v2-mini"
+# BERT (the default) and DistilBERT: the two layouts the Rust side loads.
+MODELS = {
+    "doc-v2-mini": "opensearch-project/opensearch-neural-sparse-encoding-doc-v2-mini",
+    "doc-v3-distill": "opensearch-project/opensearch-neural-sparse-encoding-doc-v3-distill",
+}
 MAX_TERMS_PER_DOCUMENT = 20_000
 HERE = Path(__file__).resolve().parent
 CORPUS = HERE / "corpus"
-OUT = HERE / "doc-v2-mini"
 SPREAD = [0, 1, 2, 127, 255, 256, 383, 509, 510, 511]
 
 # The script's parity texts, so the header recorded here is the one it wrote.
@@ -87,10 +90,10 @@ def vocabulary(tokenizer) -> list[str]:
     return [t if t is not None else f"[unused_hole_{i}]" for i, t in enumerate(tokens)]
 
 
-def query_weights(tokenizer, size: int) -> list[float]:
+def query_weights(model: str, tokenizer, size: int) -> list[float]:
     from huggingface_hub import hf_hub_download
 
-    path = hf_hub_download(MODEL, "idf.json", local_files_only=True)
+    path = hf_hub_download(model, "idf.json", local_files_only=True)
     with open(path, encoding="utf-8") as handle:
         table = json.load(handle)
     vocab = tokenizer.get_vocab()
@@ -143,21 +146,11 @@ def terms_of(row: torch.Tensor, drop: set[int]) -> list[list[float]]:
     return [[i, w] for i, w in pairs]
 
 
-def main() -> int:
-    torch.manual_seed(0)
-    tokenizer = AutoTokenizer.from_pretrained(MODEL, local_files_only=True)
-    model = AutoModelForMaskedLM.from_pretrained(MODEL, local_files_only=True, dtype=torch.float32)
+def record(model_id: str, out: Path, names: list[str], texts: list[str]) -> None:
+    tokenizer = AutoTokenizer.from_pretrained(model_id, local_files_only=True)
+    model = AutoModelForMaskedLM.from_pretrained(model_id, local_files_only=True, dtype=torch.float32)
     model.eval()
-
-    src = CORPUS / "src"
-    long_text = (src / "long.rs").read_text(encoding="utf-8")
-    (src / "exact512.txt").write_text(exact512(tokenizer, long_text), encoding="utf-8")
-
-    # Sorted, as the script's walk was, so expected.jsonl is in its order.
-    files = sorted(src.iterdir())
-    names = [p.name for p in files]
-    texts = [p.read_text(encoding="utf-8") for p in files]
-    OUT.mkdir(parents=True, exist_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
 
     drop = set(tokenizer.all_special_ids or [])
     drop.discard(tokenizer.unk_token_id)
@@ -169,27 +162,27 @@ def main() -> int:
         n = ids.shape[0]
         positions = np.arange(n) if n <= 128 else np.array([p for p in SPREAD if p < n], dtype=np.int64)
         stack = torch.stack([h[0] for h in hidden]).numpy()[:, positions, :].astype(np.float32)
-        np.save(OUT / f"{name}.ids.npy", ids)
-        np.save(OUT / f"{name}.positions.npy", positions.astype(np.int64))
-        np.save(OUT / f"{name}.hidden.npy", stack)
-        np.save(OUT / f"{name}.pooled.npy", pooled[0].numpy().astype(np.float32))
-        eprint(f"  {name}: {n} tokens, {len(positions)} recorded positions")
+        np.save(out / f"{name}.ids.npy", ids)
+        np.save(out / f"{name}.positions.npy", positions.astype(np.int64))
+        np.save(out / f"{name}.hidden.npy", stack)
+        np.save(out / f"{name}.pooled.npy", pooled[0].numpy().astype(np.float32))
+        eprint(f"  {out.name}/{name}: {n} tokens, {len(positions)} recorded positions")
 
     encoded = tokenizer(texts, padding=True, truncation=True, max_length=512, return_tensors="pt")
     pooled, _ = pooled_of(model, encoded)
-    np.save(OUT / "batch.pooled.npy", pooled.numpy().astype(np.float32))
+    np.save(out / "batch.pooled.npy", pooled.numpy().astype(np.float32))
     lengths = encoded["attention_mask"].sum(dim=1).tolist()
 
     tokens = vocabulary(tokenizer)
     header = {
         "schema": 1,
-        "model": MODEL,
+        "model": model_id,
         "vocabulary": "wordpiece-30522",
         "vocab": tokens,
-        "query_weights": query_weights(tokenizer, len(tokens)),
+        "query_weights": query_weights(model_id, tokenizer, len(tokens)),
         "parity": [{"text": t, "ids": tokenizer(t, add_special_tokens=False)["input_ids"]} for t in PARITY_TEXTS],
     }
-    with open(OUT / "expected.jsonl", "w", encoding="utf-8") as handle:
+    with open(out / "expected.jsonl", "w", encoding="utf-8") as handle:
         handle.write(json.dumps(header, ensure_ascii=False) + "\n")
         for name, row, length in zip(names, pooled, lengths):
             terms = terms_of(row, drop)
@@ -197,8 +190,23 @@ def main() -> int:
                 continue
             handle.write(json.dumps({"path": f"src/{name}", "total_terms": int(length), "terms": terms},
                                     ensure_ascii=False) + "\n")
-    (OUT / "documents.json").write_text(json.dumps(names) + "\n", encoding="utf-8")
-    eprint(f"recorded {len(names)} documents from {MODEL} (torch {torch.__version__})")
+    (out / "documents.json").write_text(json.dumps(names) + "\n", encoding="utf-8")
+    eprint(f"recorded {len(names)} documents from {model_id} (torch {torch.__version__})")
+
+
+def main() -> int:
+    torch.manual_seed(0)
+    src = CORPUS / "src"
+    first = AutoTokenizer.from_pretrained(next(iter(MODELS.values())), local_files_only=True)
+    long_text = (src / "long.txt").read_text(encoding="utf-8")
+    (src / "exact512.txt").write_text(exact512(first, long_text), encoding="utf-8")
+
+    # Sorted, as the script's walk was, so expected.jsonl is in its order.
+    files = sorted(src.iterdir())
+    names = [p.name for p in files]
+    texts = [p.read_text(encoding="utf-8") for p in files]
+    for short, model_id in MODELS.items():
+        record(model_id, HERE / short, names, texts)
     return 0
 
 
