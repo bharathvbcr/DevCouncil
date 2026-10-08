@@ -3280,6 +3280,25 @@ fn rust_entry_name_literal(node: Node, source: &str) -> Option<String> {
     identifier.then(|| text.to_string())
 }
 
+/// The name of the `const` or `static` item whose initializer holds `node`, or
+/// `None` when `node` is not inside one.
+fn rust_enclosing_item_binding(node: Node, source: &str) -> Option<String> {
+    let mut current = node.parent();
+    for _ in 0..64 {
+        let parent = current?;
+        match parent.kind() {
+            "const_item" | "static_item" => {
+                return get_child_text(parent, "name", source).filter(|name| !name.is_empty());
+            }
+            // A body is a scope boundary: a string past it belongs to that
+            // scope's own item, not to an item further out.
+            "function_item" | "closure_expression" | "source_file" => return None,
+            _ => current = parent.parent(),
+        }
+    }
+    None
+}
+
 /// The shader-entry reason for a Metal declaration, read from its own leading
 /// qualifier.
 ///
@@ -4421,16 +4440,23 @@ fn extract_node(
             // the kernels the index holds (see `ReferenceKind::EntryName`).
             "string_literal" | "raw_string_literal" => {
                 if let Some(name) = rust_entry_name_literal(node, source) {
+                    let enclosing_symbol =
+                        enclosing_callable_qualified(node, source, file_symbol_name);
+                    // Outside any function, a name string is a `const` or
+                    // `static` initializer — `const KERNEL: &str = "mlp_silu"`
+                    // — and what dispatches it is whatever reads that item.
+                    // The item is recorded as the binding the string flows
+                    // into, so the resolver can hand the edge to its readers.
+                    let assigned_to = enclosing_symbol
+                        .is_none()
+                        .then(|| rust_enclosing_item_binding(node, source))
+                        .flatten();
                     references.push(ExtractedReference {
                         name,
                         kind: ReferenceKind::EntryName,
                         span,
-                        enclosing_symbol: enclosing_callable_qualified(
-                            node,
-                            source,
-                            file_symbol_name,
-                        ),
-                        assigned_to: None,
+                        enclosing_symbol,
+                        assigned_to,
                         receiver_expr: None,
                     });
                 }

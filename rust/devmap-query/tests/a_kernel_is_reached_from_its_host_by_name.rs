@@ -33,6 +33,10 @@ kernel void tune_only(device float *out [[buffer(0)]],
 {
     out[gid] = 1.0f;
 }
+
+kernel void const_private(device float *out [[buffer(0)]]) { out[0] = 2.0f; }
+kernel void const_public(device float *out [[buffer(0)]]) { out[0] = 3.0f; }
+kernel void assoc_kernel(device float *out [[buffer(0)]]) { out[0] = 4.0f; }
 ";
 
 const HOST: &str = r#"
@@ -63,6 +67,25 @@ pub fn tuned(rt: &Runtime) {
 
 pub fn label() -> &'static str {
     "twice"
+}
+
+const PRIVATE_KERNEL: &str = "const_private";
+pub const PUBLIC_KERNEL: &str = "const_public";
+
+pub fn via_private(rt: &Runtime) {
+    let p = rt.pipeline(PRIVATE_KERNEL);
+}
+
+pub fn via_public(rt: &Runtime) {
+    let p = rt.pipeline(PUBLIC_KERNEL);
+}
+
+impl Runtime {
+    const ASSOC: &'static str = "assoc_kernel";
+
+    pub fn via_assoc(&self) {
+        let p = self.pipeline(Self::ASSOC);
+    }
 }
 "#;
 
@@ -132,6 +155,31 @@ fn a_kernel_named_in_a_dispatch_table_reaches_the_dispatching_function() {
         reached(&store, "kernels/stamped_kernels.metal::rows_h512_r32", 2),
         vec!["src/host.rs::rows".to_string(), "src/host.rs::rows_for".to_string()],
         "the table row names the kernel, and the function that reads the table calls it"
+    );
+}
+
+/// A name held in a constant reaches the function that dispatches the
+/// constant: directly for a private const (not a symbol of its own), through
+/// the const for a public one, and through `Self::` for an associated const.
+#[test]
+fn a_kernel_named_by_a_constant_reaches_the_function_that_reads_it() {
+    let store = store();
+    assert_eq!(
+        reached(&store, "kernels/tune/tune.metal::const_private", 1),
+        vec!["src/host.rs::via_private".to_string()]
+    );
+    assert_eq!(
+        reached(&store, "kernels/tune/tune.metal::const_public", 1),
+        vec!["src/host.rs::PUBLIC_KERNEL".to_string()]
+    );
+    assert!(
+        reached(&store, "kernels/tune/tune.metal::const_public", 2)
+            .contains(&"src/host.rs::via_public".to_string()),
+        "the public const's readers are one hop further"
+    );
+    assert_eq!(
+        reached(&store, "kernels/tune/tune.metal::assoc_kernel", 1),
+        vec!["src/host.rs::Runtime.via_assoc".to_string()]
     );
 }
 

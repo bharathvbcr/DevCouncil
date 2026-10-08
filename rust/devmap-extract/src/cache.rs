@@ -539,7 +539,9 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Go `HandlesRoute` edge out of the graph with nothing to say the producer
 /// exists.
 ///
-/// v73: a C-family function stamped by one of its file's own function-like
+/// v75 (73 and 74 are claimed by the unmerged struct-literal and
+/// extraction-recall lanes, so this lane takes a number neither uses): a
+/// C-family function stamped by one of its file's own function-like
 /// macros (`ROWS_KERNEL(flash_attn_rows_h256_r16_g32, 256, 16, 32)`) is a
 /// `Function` symbol at the invocation, with the shader-entry annotation its
 /// expansion earns and a call to the macro; and every identifier-shaped Rust
@@ -547,7 +549,7 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Metal entry point of that name. A v72 row has neither: served warm, every
 /// macro-stamped kernel would stay unsearchable and every `pipeline("…")` host
 /// unlinked, with nothing to say the producers exist.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "73";
+pub const EXTRACTION_SCHEMA_VERSION: &str = "75";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
