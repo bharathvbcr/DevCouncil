@@ -293,8 +293,8 @@ fn classify_scope_precision_and_recall_on_the_hand_labelled_corpus() {
 }
 
 // Pinned from the run recorded in rust/STATUS.md.
-const SCOPE_TP: usize = 11;
-const SCOPE_FP: usize = 1;
-const SCOPE_FN: usize = 1;
-const SCOPE_TN: usize = 17;
+const SCOPE_TP: usize = 14;
+const SCOPE_FP: usize = 0;
+const SCOPE_FN: usize = 0;
+const SCOPE_TN: usize = 22;
 const SCOPE_REFUSED: usize = 0;

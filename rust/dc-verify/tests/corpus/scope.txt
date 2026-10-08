@@ -293,3 +293,38 @@ diff --git a/src/calc.go b/src/calc.go
 @@ -1,1 +1,2 @@
  package calc
 +var x = 1
+
+### case: copy-from-an-unplanned-path
+### planned: src/b.go
+### in: src/b.go
+### in: legacy/a.go
+### note: a copy leaves its source as it was; only the destination changed,
+###   so the source must not be reported
+diff --git a/legacy/a.go b/src/b.go
+similarity index 90%
+copy from legacy/a.go
+copy to src/b.go
+--- a/legacy/a.go
++++ b/src/b.go
+@@ -1,2 +1,2 @@
+ package calc
+-func a() {}
++func b() {}
+
+### case: rename-within-a-planned-tree
+### planned: src/**
+### in: src/a.go
+### in: src/sub/a.go
+diff --git a/src/a.go b/src/sub/a.go
+similarity index 100%
+rename from src/a.go
+rename to src/sub/a.go
+
+### case: rename-between-two-unplanned-paths
+### planned: src/calc.go
+### orphan: tools/gen.go
+### orphan: scripts/gen.go
+diff --git a/tools/gen.go b/scripts/gen.go
+similarity index 100%
+rename from tools/gen.go
+rename to scripts/gen.go

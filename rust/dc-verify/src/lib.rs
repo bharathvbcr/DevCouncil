@@ -418,17 +418,29 @@ impl ScopeReport {
 /// Classifies changed files against planned-file globs.
 ///
 /// `planned` entries are fnmatch patterns in the Python dialect, matched with
-/// `dc_glob` so this agrees with the Go write gate exactly.
+/// `dc_glob` so this agrees with the Go write gate exactly — which normalises
+/// the entry as well as the path, so `./a` and `a` in a plan name one file.
+///
+/// A rename changes two paths. The one it renames away from is judged too:
+/// its content left it, and a plan naming only the destination did not
+/// authorise moving a file out of somewhere it never mentioned.
 pub fn classify_scope(files: &[FileDiff], planned: &[String]) -> ScopeReport {
     let mut report = ScopeReport::default();
     let mut matched_planned = vec![false; planned.len()];
+    let patterns: Vec<String> = planned.iter().map(|p| normalize_candidate(p)).collect();
 
-    for file in files {
-        let candidate = normalize_candidate(&file.path);
+    let changed = files.iter().flat_map(|file| {
+        let source = match (file.status, &file.old_path) {
+            (ChangeStatus::Renamed, Some(old)) if *old != file.path => Some(old.as_str()),
+            _ => None,
+        };
+        std::iter::once(file.path.as_str()).chain(source)
+    });
+    for path in changed {
+        let candidate = normalize_candidate(path);
         let mut hit = false;
-        for (i, pattern) in planned.iter().enumerate() {
-            let pattern = pattern.replace('\\', "/");
-            if candidate == pattern || dc_glob::matches(&pattern, &candidate) {
+        for (i, pattern) in patterns.iter().enumerate() {
+            if candidate == *pattern || dc_glob::matches(pattern, &candidate) {
                 matched_planned[i] = true;
                 hit = true;
             }
@@ -591,6 +603,45 @@ diff --git a/x.txt b/x.txt
     #[test]
     fn an_empty_diff_is_genuinely_empty() {
         assert_eq!(parse_unified("").expect("parse"), vec![]);
+    }
+
+    #[test]
+    fn a_rename_out_of_an_unplanned_path_is_an_orphan() {
+        // The plan named only the destination. The source left the tree,
+        // which is a change to a path the plan never named.
+        let diff = "\
+diff --git a/legacy/old.go b/src/new.go
+similarity index 90%
+rename from legacy/old.go
+rename to src/new.go
+--- a/legacy/old.go
++++ b/src/new.go
+@@ -1,2 +1,2 @@
+ package calc
+-func old() {}
++func renamed() {}
+";
+        let files = parse_unified(diff).expect("parse");
+        let report = classify_scope(&files, &["src/new.go".to_string()]);
+        assert_eq!(report.orphans, vec!["legacy/old.go"]);
+        assert_eq!(report.in_scope, vec!["src/new.go"]);
+
+        let both = ["legacy/old.go".to_string(), "src/new.go".to_string()];
+        let report = classify_scope(&files, &both);
+        assert!(report.is_clean(), "{report:?}");
+        assert!(report.untouched_planned.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn a_planned_entry_is_normalised_like_the_changed_path() {
+        // The Go write gate normalises both sides; a `./` or `\\` in the
+        // plan names the same file.
+        let files = parse_unified(SAMPLE).expect("parse");
+        for entry in ["./src/calc.go", "src\\calc.go", "././src/*.go"] {
+            let report = classify_scope(&files, &[entry.to_string()]);
+            assert_eq!(report.in_scope, vec!["src/calc.go"], "{entry}");
+            assert!(report.untouched_planned.is_empty(), "{entry}");
+        }
     }
 
     #[test]
