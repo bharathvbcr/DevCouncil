@@ -13,6 +13,10 @@ license = "Apache-2.0"
 publish = false
 description = "Offline doc-side sparse encoder for dcgrep, on tessl. Apple silicon only."
 
+# An offline, Apple-silicon-only helper; a GitHub Release must not ship it.
+[package.metadata.dist]
+dist = false
+
 # dc-grep stays inference-free. This crate is the only place a model is loaded,
 # and it is not a member of the dc-grep workspace.
 [dependencies]
