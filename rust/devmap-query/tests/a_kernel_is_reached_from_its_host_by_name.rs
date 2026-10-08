@@ -306,6 +306,34 @@ fn only_a_unique_entry_point_is_a_target() {
     );
 }
 
+/// Every kernel-name edge a fresh extraction yields survives the reduction the
+/// store keeps — what an incremental build and the daemon resolve unchanged
+/// files from. The kernel index reads stored wiring and symbols, and the host
+/// side reads stored `EntryName` references with their constant bindings.
+#[test]
+fn kernel_name_edges_survive_the_stored_form_of_every_file() {
+    fn kernel_edges(extractions: &[Extraction]) -> Vec<(String, String)> {
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(extractions);
+        let mut edges: Vec<(String, String)> = resolver
+            .resolve_all(extractions)
+            .unwrap()
+            .edges
+            .into_iter()
+            .filter(|edge| edge.target_file.ends_with(".metal") && !edge.source_file.ends_with(".metal"))
+            .map(|edge| (edge.source_symbol, edge.target_symbol))
+            .collect();
+        edges.sort();
+        edges.dedup();
+        edges
+    }
+    let fresh = extractions();
+    let stored: Vec<Extraction> = fresh.iter().map(Extraction::for_durable_store).collect();
+    let expected = kernel_edges(&fresh);
+    assert!(expected.len() >= 15, "{expected:?}");
+    assert_eq!(kernel_edges(&stored), expected);
+}
+
 /// A literal that names no kernel is not filed as a failed attribution.
 #[test]
 fn an_unmatched_name_string_is_not_an_unresolved_reference() {
