@@ -748,8 +748,10 @@ pub fn scan_secrets(files: &[FileDiff]) -> Vec<Finding> {
                 findings.push(Finding {
                     gate: "secret_scan",
                     severity: Severity::Blocking,
-                    // A vendor prefix, a length floor and a character-class
-                    // test. That identifies the *shape* of a credential; it is
+                    // A vendor prefix and a length floor, or a literal in a
+                    // credential's context — a named key, a URL's userinfo, an
+                    // authorization header. That identifies the *shape* of a
+                    // credential; it is
                     // not a proof that the token authenticates anything, and a
                     // fixture key, a rotated key and a live key are
                     // indistinguishable here. It blocks anyway — the cost of
