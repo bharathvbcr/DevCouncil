@@ -436,4 +436,54 @@ in all future workloads.
 | SQL and PowerShell | Dialect/source-checked fixtures and explicit parser/provider availability. SQL object references need a defined relationship to source-file imports; fallback extraction cannot be relabeled complete. No new parser dependency was authorized or added. |
 | Latency optimization | Measure the remaining teardown owners and candidate extraction/resolution/persistence work, then prove invalidation and result equivalence before narrowing work. The current measurements do not prove removable work. |
 | Broader comparison | Counterbalanced runs with more repetitions, matched actual provider capabilities and independent caller/definition ground truth. Expand persistent mutation convergence beyond the current separate DevMap soak. |
-| Durability and portability | Controlled crash/power-loss scenarios, multiple filesystems and native operating-system runs. The local kill/restart test does not simulate physical power failure. |
+| Durability and portability | **Partly closed 2026-10-07** — see "Crash consistency" below: process death mid-persist and a lost un-fsynced WAL tail are tested on macOS/APFS. Still open: torn or reordered writes below the filesystem, physical power loss, other filesystems and native runs on other operating systems. |
+
+### Crash consistency (2026-10-07)
+
+`rust/devmap-cli/tests/crash_consistency.rs` holds two tests.
+
+- `a_build_killed_mid_persist_leaves_a_whole_generation` builds a 1,200-file
+  corpus, rewrites every file, starts `devmap build`, and sends `SIGKILL` 0, 2,
+  5, 10, 20, 40, 80 or 160 ms after the build prints `[4/5] persisting`. Every
+  round checks five things. The child died by the signal. `Store::open`
+  succeeds and `PRAGMA integrity_check` is `ok`. The latest generation is
+  either the previous one or the new one, and it holds all 1,200 source files.
+  The next build succeeds without operator action. After the last round, the
+  recovered store's nodes and edges equal a cold `--full` build of the same
+  tree. On the debug build all eight kills landed before the commit; the
+  previous generation survived intact each time.
+- `a_lost_wal_tail_loses_whole_generations_never_half_of_one` simulates losing
+  the WAL tail that `synchronous = NORMAL` does not fsync per commit. Generation
+  1 is checkpointed. Generation 2 lives only in the WAL: 771,208 bytes in 47
+  frames of 16 KiB. The test copies the main file and every WAL prefix. The cuts
+  are no WAL, the header alone, each of the 47 frame boundaries, and a cut
+  through the middle of the committing frame, 50 in all. Each copy opens and
+  passes `integrity_check`. A prefix that includes the commit frame recovers
+  generation 2. Any shorter prefix recovers generation 1, which still holds
+  every file. Only the final frame commits, so a generation is one transaction.
+  Measured: 49 cuts recovered generation 1 and 1 recovered generation 2.
+
+The assertions were checked against deliberate breaks, each made and then
+reverted. Flipping one payload byte of a committed WAL frame left the full
+prefix at generation 1, and the test failed. Halving the main database file
+failed `Store::open` with `database disk image is malformed` in both tests.
+
+**Not proven:**
+- Whether a kill landed inside the write transaction or in the persist
+  stage's setup before it. Both leave the previous generation, and both are
+  recorded as "before the commit".
+- Torn or partially written pages in the main database file.
+- Writes reordered by the device or the filesystem.
+- A lying disk cache.
+- A crash during a checkpoint, which writes the main file.
+
+Those need fault injection below the filesystem, such as a VFS shim or a
+block-device simulator. This suite has neither.
+
+| Platform | Status |
+|---|---|
+| macOS 27.0.1 arm64, APFS (`diskutil info /`) | run |
+| Linux ext4 / xfs / btrfs | not run |
+| Windows NTFS | not run |
+| Network filesystems (NFS, SMB) | not run |
+| Physical power loss | not run |
