@@ -311,7 +311,7 @@ func integrateCursor(repo *os.Root, root, selfBin string, mode Mode, receipt *Re
 	if err := planWrite(repo, ".cursor/mcp.json", mustJSON(mcp), mode, receipt, mergeMCPJSON); err != nil {
 		return err
 	}
-	if err := planWrite(repo, ".cursor/rules/devcouncil.mdc", []byte(cursorRule), mode, receipt, nil); err != nil {
+	if err := writeCursorRule(repo, mode, receipt); err != nil {
 		return err
 	}
 	// No .cursor/hooks.json: DevCouncil lifecycle hooks are retired, and an
@@ -334,9 +334,60 @@ func integrateClaude(repo *os.Root, root, selfBin string, mode Mode, receipt *Re
 	return planWrite(repo, ".mcp.json", mustJSON(mcp), mode, receipt, mergeMCPJSON)
 }
 
+// integrateCodex creates the Codex project config only where none exists.
+// `.codex/config.toml` is the user's file and this package has no TOML merge,
+// so an existing one is refused by planWrite rather than replaced — which is
+// what deleted every `[mcp_servers.*]` table in it.
 func integrateCodex(repo *os.Root, mode Mode, receipt *Receipt) error {
 	body := []byte("# Managed by devcouncil integrate codex\n")
 	return planWrite(repo, ".codex/config.toml", body, mode, receipt, nil)
+}
+
+const cursorRuleRel = ".cursor/rules/devcouncil.mdc"
+
+// writeCursorRule publishes DevCouncil's Cursor rule.
+//
+// The file is ours outright, so it is replaced rather than merged — but only
+// when the copy on disk is one this command wrote. A user's rule that happens
+// to carry the name is refused, not overwritten.
+func writeCursorRule(repo *os.Root, mode Mode, receipt *Receipt) error {
+	return planWrite(repo, cursorRuleRel, []byte(cursorRule), mode, receipt, replaceOwned(isDevCouncilCursorRule))
+}
+
+// isDevCouncilCursorRule recognises every wording of the rule this command has
+// written: frontmatter whose description begins "DevCouncil", and a
+// `# DevCouncil` heading in the body. Both the Python installer's
+// "DevCouncil task loop and navigation" and the current wording carry them.
+func isDevCouncilCursorRule(existing []byte) bool {
+	text := string(existing)
+	rest, ok := strings.CutPrefix(text, "---\n")
+	if !ok {
+		return false
+	}
+	front, body, ok := strings.Cut(rest, "\n---\n")
+	if !ok {
+		return false
+	}
+	described := false
+	for _, line := range strings.Split(front, "\n") {
+		if value, found := strings.CutPrefix(line, "description:"); found {
+			described = strings.HasPrefix(strings.TrimSpace(value), "DevCouncil")
+		}
+	}
+	return described && slices.Contains(strings.Split(body, "\n"), "# DevCouncil")
+}
+
+// replaceOwned is the merge for a file this command owns outright: the
+// generated document replaces what is there, provided `owns` recognises the
+// existing bytes as ours.
+func replaceOwned(owns func(existing []byte) bool) mergeFunc {
+	return func(existing, generated []byte) ([]byte, error) {
+		if !owns(existing) {
+			return nil, errors.New("this command did not write the existing file; " +
+				"refuse to replace it — move it aside to let integrate write its own")
+		}
+		return generated, nil
+	}
 }
 
 // planWrite inspects and rewrites one host config named *relative to the
@@ -438,6 +489,9 @@ func devcouncilEntry(doc hostMcpDoc, root string) map[string]any {
 // mergeServerMap folds our entry into the host's document, container and all.
 func mergeServerMap(doc hostMcpDoc) mergeFunc {
 	return func(existing, generated []byte) ([]byte, error) {
+		if err := refuseJSONComments(existing); err != nil {
+			return nil, err
+		}
 		var cur, gen map[string]any
 		if err := json.Unmarshal(existing, &cur); err != nil {
 			// Refuse rather than replace: an unparseable config is far more
@@ -482,7 +536,9 @@ func mergeServerMap(doc hostMcpDoc) mergeFunc {
 
 // mergeFunc folds the generated document into what is already on disk.
 //
-// A nil mergeFunc means the file is ours outright and is replaced.
+// A nil mergeFunc means the file may only be created: planWrite refuses to
+// replace an existing file without one. A file this command owns outright
+// passes replaceOwned, which says how to recognise it.
 type mergeFunc func(existing, generated []byte) ([]byte, error)
 
 func planWrite(repo *os.Root, rel string, content []byte, mode Mode, receipt *Receipt, merge mergeFunc) error {
@@ -494,12 +550,13 @@ func planWrite(repo *os.Root, rel string, content []byte, mode Mode, receipt *Re
 	// Resolve what would actually land, once, so check and apply cannot
 	// disagree about whether this file needs writing.
 	want := content
+	if exists && merge == nil && string(existing) != string(content) {
+		// Fail closed: a file already on disk is someone's until a merge says
+		// otherwise. Replacing it outright is how `.codex/config.toml` lost
+		// every table in it.
+		return fmt.Errorf("%s: exists and this command has no merge for it; refuse to replace a file it does not own", rel)
+	}
 	if merge != nil && exists {
-		// encoding/json cannot round-trip comments, so a config carrying them
-		// would silently lose them in the merge.
-		if err := refuseJSONComments(existing, rel); err != nil {
-			return err
-		}
 		merged, mergeErr := merge(existing, content)
 		if mergeErr != nil {
 			return fmt.Errorf("%s: %w", rel, mergeErr)
@@ -555,19 +612,24 @@ func writeRooted(repo *os.Root, rel string, content []byte, perm os.FileMode) er
 	return nil
 }
 
-func refuseJSONComments(data []byte, path string) error {
+// refuseJSONComments stops a merge before it drops comments: encoding/json
+// cannot round-trip them, so a config carrying them would silently lose them.
+func refuseJSONComments(data []byte) error {
 	trimmed := strings.TrimSpace(string(data))
 	if strings.Contains(trimmed, "//") || strings.Contains(trimmed, "/*") {
 		// Heuristic: real JSON strings can contain //; try parse first.
 		var probe any
 		if err := json.Unmarshal(data, &probe); err != nil {
-			return fmt.Errorf("%s: refusing to rewrite JSON-with-comments (parse failed: %v)", path, err)
+			return fmt.Errorf("refusing to rewrite JSON-with-comments (parse failed: %v)", err)
 		}
 	}
 	return nil
 }
 
 func mergeMCPJSON(existing, generated []byte) ([]byte, error) {
+	if err := refuseJSONComments(existing); err != nil {
+		return nil, err
+	}
 	var cur, gen map[string]any
 	if err := json.Unmarshal(existing, &cur); err != nil {
 		return nil, fmt.Errorf("existing mcp.json: %w", err)
