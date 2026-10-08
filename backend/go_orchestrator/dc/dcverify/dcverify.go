@@ -801,7 +801,11 @@ type cappedBuffer struct {
 func (c *cappedBuffer) Write(p []byte) (int, error) {
 	remaining := c.limit - c.buf.Len()
 	if remaining <= 0 {
-		c.overflow = true
+		// An empty write dropped nothing. Recording it as overflow is how a
+		// reply that exactly filled the bound was reported truncated.
+		if len(p) > 0 {
+			c.overflow = true
+		}
 		return len(p), nil
 	}
 	if len(p) > remaining {

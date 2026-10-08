@@ -647,11 +647,17 @@ var errCapped = errors.New("output exceeded its bound")
 
 func (c *capped) Write(p []byte) (int, error) {
 	room := c.limit - c.buf.Len()
-	if room > len(p) {
+	// `>=`, not `>`: a write that fills the bound exactly dropped nothing,
+	// and so did an empty write on a buffer that is already full. Both used
+	// to be reported as truncation.
+	if room >= len(p) {
 		return c.buf.Write(p)
 	}
 	if room > 0 {
 		c.buf.Write(p[:room])
+	}
+	if len(p) == 0 {
+		return 0, nil
 	}
 	c.truncated = true
 	if c.hard {

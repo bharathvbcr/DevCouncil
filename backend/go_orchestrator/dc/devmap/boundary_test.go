@@ -202,6 +202,50 @@ func TestStderrIsBoundedAndSaysThatItWas(t *testing.T) {
 	}
 }
 
+// TestAReplyThatExactlyFillsTheBoundIsAnAnswer pins the edge of both bounds.
+//
+// The bound is the most a reply may be, not one byte more than it may be. A
+// stdout reply of exactly the limit used to break the pipe and come back as
+// "produced more than N bytes" — a message that was false about the reply it
+// described — and a stderr stream of exactly the limit was reported truncated
+// when nothing had been dropped. One byte more is still refused and still
+// reported.
+func TestAReplyThatExactlyFillsTheBoundIsAnAnswer(t *testing.T) {
+	reply := healthyStatus + "\n" // the fake's heredoc ends the reply with a newline
+	notice := "one notice line"
+	said := notice + "\n"
+
+	c := fakeSaying(t, map[string]string{"status": healthyStatus}, map[string]string{"status": notice})
+	c.maxOutput = len(reply)
+	c.maxStderr = len(said)
+	var status Status
+	stream, err := c.decode(context.Background(), &status, 30*time.Second, "status")
+	if err != nil {
+		t.Fatalf("a reply of exactly the bound is within it: %v", err)
+	}
+	if status.GenerationID != 3 {
+		t.Fatalf("the reply was not decoded: %+v", status)
+	}
+	if stream.truncated {
+		t.Fatal("a stderr stream of exactly the bound dropped nothing and must not read as truncated")
+	}
+
+	c.maxOutput = len(reply) - 1
+	if _, err := c.decode(context.Background(), &status, 30*time.Second, "status"); err == nil ||
+		!strings.Contains(err.Error(), "more than") {
+		t.Fatalf("one byte past the stdout bound must still be refused and named, got %v", err)
+	}
+	c.maxOutput = len(reply)
+	c.maxStderr = len(said) - 1
+	stream, err = c.decode(context.Background(), &status, 30*time.Second, "status")
+	if err != nil {
+		t.Fatalf("an over-long stderr is advisory and must not fail the command: %v", err)
+	}
+	if !stream.truncated {
+		t.Fatal("one byte past the stderr bound was dropped and must be reported")
+	}
+}
+
 // TestAManifestThatWroteNothingIsNotReportedAsWritten.
 //
 // `manvi map build` printed "wrote <path>" on the strength of an exit code. The
