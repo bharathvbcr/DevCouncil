@@ -11,7 +11,10 @@ analysis. Modules stay independently versioned: a host can update one, or take
 only a subset.
 
 This directory is the source of truth. GitPulse and Manvi carry *vendored
-copies*, and each repo's CI fails if its copy has drifted.
+copies*, and each compares its copy against this directory, not only against
+its own `CHECKSUMS` (see Vendoring). Paths below are relative to the DevCouncil
+repository unless prefixed with another repository's name; a test holds every
+cited DevCouncil path to a file that exists.
 
 ---
 
@@ -19,11 +22,11 @@ copies*, and each repo's CI fails if its copy has drifted.
 
 | Artifact | Canonical owner | Contract here |
 |---|---|---|
-| Policy verdict | **Manvi** — `manvi/policy/decision.go`, `manvi/gate/gate.go` | `verdict.schema.json`, `verdict.cases.json` |
-| Ledger event | **GitPulse** — it owns the resident watcher and the UI | `event.schema.json` |
-| Task + lease store | **Manvi** — `crates/dc-store/src/schema.rs` owns the DDL | `lease.schema.md` |
-| Code graph | **DevCouncil** — `rust/` `devmap` | *(crate API, no wire contract)* |
-| Verification gates | **Manvi** — `crates/dc-verify` | *(binary CLI, no wire contract)* |
+| Policy verdict | **DevCouncil** — `backend/go_orchestrator/policy/decision.go`, `backend/go_orchestrator/gate/gate.go`; Manvi serves it (`manvi serve`) | `verdict.schema.json`, `verdict.cases.json` |
+| Ledger event | **GitPulse** — `GitPulse/src-tauri/src/ledger/mod.rs`; it owns the resident watcher and the UI | `event.schema.json` |
+| Task + lease store | **DevCouncil** — `rust/dc-store/src/schema.rs` owns the DDL; Manvi builds it through a symlink | `lease.schema.md` |
+| Code graph | **DevCouncil** — `rust/devmap-store/src/schema.rs` | *(crate API; the store's compatibility rule is `MIN_READER_SCHEMA_VERSION` there)* |
+| Verification gates | **DevCouncil** — `rust/dc-verify/src/lib.rs`; Manvi runs it | *(binary CLI, no wire contract)* |
 
 Owning an artifact means: the owner's source is authoritative, the owner's
 change lands first, and every consumer's copy is checked against it by a test
@@ -74,7 +77,8 @@ already on disk, in a file that gets backed up, synced, and read by every
 future consumer including ones that do not know to redact. Write-time
 redaction is the only kind that bounds the blast radius.
 
-The credential patterns are Manvi's, in `crates/dc-verify/src/rigor.rs`. They
+The credential patterns are DevCouncil's, in `rust/dc-redact/src/lib.rs` (split out
+of `dc-verify` so a consumer can link the table without the verifier). They
 are reused rather than reimplemented, for the ordinary reason: two copies of a
 secret-detection regex means one of them is out of date and nobody knows which.
 

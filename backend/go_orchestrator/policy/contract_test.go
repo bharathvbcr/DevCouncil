@@ -8,7 +8,8 @@ import (
 	"testing"
 )
 
-// Manvi owns the verdict contract. These tests assert that the shared schema in
+// DevCouncil owns the verdict contract (this package; Manvi serves it over
+// `manvi serve`). These tests assert that the shared schema in
 // contracts/ still describes what this package actually produces.
 //
 // The rule list and the severity map are read from the *source of truth in this
