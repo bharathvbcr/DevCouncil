@@ -37,7 +37,10 @@ func TestRedirectInsideSubstitutionIsFound(t *testing.T) {
 		{`echo $(git diff > out.patch)`, []string{"out.patch"}, false},
 		{"echo `git diff > out.patch`", []string{"out.patch"}, false},
 		{`diff <(sort a > out.patch) b`, []string{"out.patch"}, false},
-		{`tee >(gzip > out.gz) f`, []string{"out.gz"}, false},
+		// tee also writes its own file operand, f: a write through an
+		// argument, which the rung judges alongside the redirect inside the
+		// span. The >( … ) word itself is a /dev/fd pipe, not a file.
+		{`tee >(gzip > out.gz) f`, []string{"out.gz", "f"}, false},
 
 		// Live inside double quotes too — sh executes the substitution there.
 		{`echo "$(git diff > out.patch)"`, []string{"out.patch"}, false},
@@ -90,7 +93,11 @@ func TestSubstitutionRedirectAgreesWithTheSameRedirectAlone(t *testing.T) {
 		"echo `%s`",
 		`echo "$(%s)"`,
 		`diff <(%s) b`,
-		`tee >(%s) f`,
+		// The operand beside the span is a stream so that the only write in
+		// the wrapper is the one under test: with a file there, tee writes
+		// that file too, and the wrapped line rightly reports one more write
+		// than the bare one.
+		`tee >(%s) /dev/null`,
 		`echo $(echo $(%s))`,
 	}
 	for _, in := range inner {
