@@ -1173,3 +1173,57 @@ diff --git a/src/billing.go b/src/billing.go
 +func Rate(from, to string) float64 {
 +	return 1.0
 +}
+
+### case: java-throw-with-its-message-on-the-next-line
+### secret_scan: clean
+### stub_detection: blocking
+### stub_allowed: clean
+### assert_free_test: clean
+### skipped_test: clean
+### substance: unjudged
+### note: The throw is a statement across two lines; its message, not its first
+###   line, says what the body is.
+diff --git a/src/main/java/shop/Quotes.java b/src/main/java/shop/Quotes.java
+--- a/src/main/java/shop/Quotes.java
++++ b/src/main/java/shop/Quotes.java
+@@ -10,0 +11,4 @@
++    public Quote quote(Order order) {
++        throw new UnsupportedOperationException(
++            "not implemented: needs the pricing service");
++    }
+
+### case: csharp-throw-mentioned-in-a-string-is-clean
+### secret_scan: clean
+### stub_detection: clean
+### stub_allowed: clean
+### assert_free_test: clean
+### skipped_test: clean
+### substance: unjudged
+### note: Text about a throw, inside a log message. It does not throw.
+diff --git a/src/Shop/Migration.cs b/src/Shop/Migration.cs
+--- a/src/Shop/Migration.cs
++++ b/src/Shop/Migration.cs
+@@ -10,0 +11,4 @@
++        public void Warn()
++        {
++            log.Info("v1 callers see throw new NotImplementedException() until v2");
++        }
+
+### case: csharp-commented-out-throw-is-a-note-not-a-block
+### secret_scan: clean
+### stub_detection: advisory
+### stub_allowed: clean
+### assert_free_test: clean
+### skipped_test: clean
+### substance: unjudged
+### note: Commented-out code does not throw, so it does not block; it is a
+###   comment carrying a stub word, which the comment-marker rule reports as a
+###   note like any other added `// TODO`.
+diff --git a/src/Shop/Legacy.cs b/src/Shop/Legacy.cs
+--- a/src/Shop/Legacy.cs
++++ b/src/Shop/Legacy.cs
+@@ -10,0 +11,4 @@
++        public void Retire()
++        {
++            // throw new NotImplementedException();
++        }

@@ -259,7 +259,7 @@ fn post_image(file: &FileDiff, source: &dyn Fn(&FileDiff) -> Option<String>) -> 
 fn substring_findings(file: &FileDiff, include_bodies: bool) -> Vec<Finding> {
     let mut findings = Vec::new();
     {
-        for (line_no, content) in &file.added_lines {
+        for (index, (line_no, content)) in file.added_lines.iter().enumerate() {
             let lowered = content.to_ascii_lowercase();
             let trimmed = lowered.trim();
             if trimmed.contains(ALLOW_STUB_MARKER) {
@@ -270,7 +270,8 @@ fn substring_findings(file: &FileDiff, include_bodies: bool) -> Vec<Finding> {
 
             if include_bodies
                 && is_c_family_source(&file.path)
-                && let Some((severity, message)) = c_family_placeholder(trimmed)
+                && let Some((severity, message)) =
+                    c_family_placeholder(&c_family_statement(&file.added_lines, index))
             {
                 findings.push(Finding {
                     gate: "stub_detection",
@@ -345,6 +346,85 @@ fn is_c_family_source(path: &str) -> bool {
     path.ends_with(".java") || path.ends_with(".cs")
 }
 
+/// Most added lines a Java or C# statement is followed across.
+const MAX_STATEMENT_LINES: usize = 8;
+
+/// The lowercased statement starting at `added[index]`: that line, and while
+/// its parentheses stay open, the added lines that directly follow it — so
+/// `throw new UnsupportedOperationException(` with its message on the next
+/// line is judged by the message. Bounded, and stops at a gap in numbering,
+/// where the diff no longer shows what came next.
+fn c_family_statement(added: &[(u32, String)], index: usize) -> String {
+    let mut statement = String::new();
+    let mut depth: i32 = 0;
+    for (offset, (n, line)) in added[index..].iter().enumerate().take(MAX_STATEMENT_LINES) {
+        if offset > 0 && (depth <= 0 || *n != added[index].0 + offset as u32) {
+            break;
+        }
+        let lowered = line.to_ascii_lowercase();
+        depth += paren_balance(&lowered);
+        if offset > 0 {
+            statement.push(' ');
+        }
+        statement.push_str(lowered.trim());
+    }
+    statement
+}
+
+/// Opening minus closing parentheses outside string literals and `//`
+/// comments.
+fn paren_balance(line: &str) -> i32 {
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    let bytes = line.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_string {
+            match b {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'/' if bytes.get(i + 1) == Some(&b'/') => break,
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {}
+        }
+    }
+    depth
+}
+
+/// Whether byte `at` of `line` is code: not inside a string literal, and not
+/// after a `//` comment opener. `log("throw new NotImplementedException()")`
+/// mentions a throw; it does not throw.
+fn is_code_at(line: &str, at: usize) -> bool {
+    let mut in_string = false;
+    let mut escaped = false;
+    let bytes = line.as_bytes();
+    for (i, &b) in bytes[..at].iter().enumerate() {
+        if in_string {
+            match b {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'/' if bytes.get(i + 1) == Some(&b'/') => return false,
+            _ => {}
+        }
+    }
+    !in_string
+}
+
 /// Phrases that make a thrown exception's message a placeholder, whatever the
 /// exception type. "not supported yet" is the body NetBeans generates.
 const PLACEHOLDER_MESSAGES: &[&str] = &[
@@ -367,7 +447,11 @@ const PLACEHOLDER_MESSAGES: &[&str] = &[
 /// reported. `NotSupportedException` is never reported — it is how a read-only
 /// stream refuses a write.
 fn c_family_placeholder(lowered: &str) -> Option<(Severity, String)> {
-    let thrown = &lowered[lowered.find("throw new ")? + "throw new ".len()..];
+    let at = lowered
+        .match_indices("throw new ")
+        .map(|(at, _)| at)
+        .find(|at| is_code_at(lowered, *at))?;
+    let thrown = &lowered[at + "throw new ".len()..];
     let open = thrown.find('(')?;
     let ty = thrown[..open].trim();
     let ty = ty.rsplit('.').next().unwrap_or(ty);

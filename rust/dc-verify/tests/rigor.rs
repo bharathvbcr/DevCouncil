@@ -707,3 +707,43 @@ fn every_added_allow_stub_declaration_is_reported_once() {
         assert!(findings.is_empty(), "{path}: {findings:?}");
     }
 }
+
+/// A throw is judged as a statement, not as a line: its message may sit on
+/// the next line, and the words may be text inside a string or a comment.
+#[test]
+fn a_java_or_csharp_throw_is_read_across_lines_and_not_inside_text() {
+    let multi_line = diff_of(
+        "src/Pricing.java",
+        &[
+            (11, "    public BigDecimal price(Order order) {"),
+            (12, "        throw new UnsupportedOperationException("),
+            (
+                13,
+                "            \"not implemented: needs the pricing service\");",
+            ),
+            (14, "    }"),
+        ],
+    );
+    let findings = detect_stubs(&[multi_line]);
+    let f = findings
+        .iter()
+        .find(|f| f.gate == "stub_detection")
+        .unwrap_or_else(|| panic!("multi-line throw missed: {findings:?}"));
+    assert_eq!(
+        (f.severity, f.line),
+        (Severity::Blocking, 12),
+        "{findings:?}"
+    );
+
+    for line in [
+        "log.info(\"callers see throw new NotImplementedException() until v2\");",
+        "// throw new NotImplementedException();",
+        "var hint = \"throw new UnsupportedOperationException(\\\"todo\\\")\";",
+    ] {
+        let findings = detect_stubs(&[diff_of("src/Svc.cs", &[(5, line)])]);
+        assert!(
+            findings.iter().all(|f| f.severity != Severity::Blocking),
+            "{line:?} is text, not a throw: {findings:?}"
+        );
+    }
+}
