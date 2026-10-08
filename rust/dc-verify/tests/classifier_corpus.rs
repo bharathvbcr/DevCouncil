@@ -136,10 +136,10 @@ fn scan_secrets_precision_and_recall_on_the_tuning_corpus() {
     assert_eq!(
         matrix,
         Matrix {
-            tp: 44,
+            tp: 49,
             fp: 0,
             fn_: 0,
-            tn: 42
+            tn: 51
         },
         "scan_secrets moved on secrets.tsv; update the pinned counts here and the \
          figures in rust/STATUS.md together\n{}",
@@ -171,11 +171,44 @@ fn scan_secrets_precision_and_recall_on_the_held_out_corpus() {
 }
 
 // Pinned after the fixes that followed its first run (precision 0.867,
-// recall 0.650); both figures are in rust/STATUS.md.
+// recall 0.650); both figures are in rust/STATUS.md. Those fixes were made
+// against its misses, so it is tuning data now, and the held-out figure is
+// secrets_holdout_2.tsv's.
 const HOLDOUT_TP: usize = 20;
 const HOLDOUT_FP: usize = 0;
 const HOLDOUT_FN: usize = 0;
 const HOLDOUT_TN: usize = 28;
+
+/// The second held-out corpus, labelled and committed (dd4fa7f5) before any
+/// gate ran over it. Its first run is the gate's generalisation estimate, and
+/// its misses stay pinned as misses: nothing is tuned against this file.
+#[test]
+fn scan_secrets_precision_and_recall_on_the_second_held_out_corpus() {
+    let (matrix, wrong) = measure_secrets(
+        "secrets_holdout_2.tsv",
+        include_str!("corpus/secrets_holdout_2.tsv"),
+    );
+    assert_eq!(
+        matrix,
+        Matrix {
+            tp: HOLDOUT_2_TP,
+            fp: HOLDOUT_2_FP,
+            fn_: HOLDOUT_2_FN,
+            tn: HOLDOUT_2_TN
+        },
+        "scan_secrets moved on secrets_holdout_2.tsv; update the pinned counts \
+         here and the figures in rust/STATUS.md together\n{}",
+        wrong.join("\n")
+    );
+}
+
+// The first run, 2026-10-08: precision 1.000 (18/18), recall 0.900 (18/20).
+// The misses are `curl -u user:password` and Redis's `requirepass <pw>`, two
+// spellings no detector reads.
+const HOLDOUT_2_TP: usize = 18;
+const HOLDOUT_2_FP: usize = 0;
+const HOLDOUT_2_FN: usize = 2;
+const HOLDOUT_2_TN: usize = 26;
 
 /// One scope case: the plan, the change, and the hand label of every path the
 /// change touches.

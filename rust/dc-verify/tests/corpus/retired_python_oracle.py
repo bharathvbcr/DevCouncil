@@ -129,7 +129,7 @@ def measure_scope(path: Path) -> dict[str, int]:
 
 def main() -> None:
     patterns = retired_secret_patterns()
-    for name in ("secrets.tsv", "secrets_holdout.tsv"):
+    for name in ("secrets.tsv", "secrets_holdout.tsv", "secrets_holdout_2.tsv"):
         print(
             report(
                 f"retired secret scan on {name}",
