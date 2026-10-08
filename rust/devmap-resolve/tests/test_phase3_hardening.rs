@@ -844,8 +844,15 @@ fn builtin_names_behind_a_receiver_are_not_classified_as_builtins() {
             "}\n",
         ),
     );
+    // Another package's methods give `len` and `Fatalf` namesakes the values
+    // could own; without them each member is `NoNamesake` whatever its
+    // receiver is, and the uninferred-receiver claim below would be vacuous.
+    let other = extract_file(
+        "lib/other/other.go",
+        "package other\ntype O struct{}\nfunc (o O) len() {}\nfunc (o O) Fatalf(s string) {}\n",
+    );
     let mut resolver = Resolver::new();
-    resolver.index_extractions(std::slice::from_ref(&go));
+    resolver.index_extractions(&[go.clone(), other]);
     let res = resolver.resolve_all(std::slice::from_ref(&go)).unwrap();
 
     for callee in ["len", "Fatalf"] {
@@ -998,6 +1005,13 @@ fn classification_tiers_are_structurally_exclusive() {
              func run(t *testing.T, w *W, xs []string) {\n\
              \t_ = len(xs)\n\t_ = strings.TrimSpace(\"x\")\n\tt.Fatalf(\"b\")\n\
              \tw.Missing()\n\tmysteryFn()\n\txs[0].Weird()\n}\n",
+        ),
+        // A namesake for `Weird` in another package, so `xs[0].Weird()` is a
+        // receiver that could own an indexed method — the uninferred tier —
+        // rather than a member nothing declares.
+        (
+            "lib/other/other.go",
+            "package other\ntype O struct{}\nfunc (o O) Weird() {}\n",
         ),
         (
             "app/b.py",

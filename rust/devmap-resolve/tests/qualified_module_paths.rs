@@ -29,13 +29,37 @@ use devmap_extract::model::Extraction;
 use devmap_resolve::model::ResolutionResult;
 use devmap_resolve::Resolver;
 
+/// Types that declare the members the value-receiver fixtures call, so each
+/// such call has a namesake its receiver *could* own. A member nothing
+/// declares is `NoNamesake` whatever its receiver is, which would leave the
+/// "stays an uninferred receiver" tests unable to tell a value from a path.
+const NAMESAKES: &[(&str, &str)] = &[
+    (
+        "crates/namesakes/src/lib.rs",
+        "pub struct Holder;\nimpl Holder {\n    pub fn unwrap(&self) {}\n    pub fn take(&self) {}\n}\n",
+    ),
+    (
+        "src/namesakes.ts",
+        "export class Numberish {\n    toFixed() { return ''; }\n}\n",
+    ),
+];
+
 fn resolve(files: &[(&str, &str)]) -> (Vec<Extraction>, ResolutionResult) {
     let extractions: Vec<Extraction> = files
         .iter()
         .map(|(path, source)| extract_file(path, source))
         .collect();
+    let indexed: Vec<Extraction> = extractions
+        .iter()
+        .cloned()
+        .chain(
+            NAMESAKES
+                .iter()
+                .map(|(path, source)| extract_file(path, source)),
+        )
+        .collect();
     let mut resolver = Resolver::new();
-    resolver.index_extractions(&extractions);
+    resolver.index_extractions(&indexed);
     let resolution = resolver.resolve_all(&extractions).unwrap();
     (extractions, resolution)
 }

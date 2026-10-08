@@ -160,9 +160,10 @@ class Service:
     );
 }
 
-/// A plain field read stays exactly where it was: recorded, and in the tier
-/// that means "the receiver exists and could not be typed" rather than the tier
-/// that means "probable defect". The row is the evidence that the ladder ran.
+/// A plain field read stays recorded, and never in the tier that means
+/// "probable defect". The row is the evidence that the ladder ran. A field is
+/// not a symbol, so with no indexed symbol named `count` the read is
+/// `no_namesake`: nothing the index holds could be its target.
 #[test]
 fn a_plain_attribute_read_is_still_recorded_and_still_not_a_defect() {
     const FIELD: &str = "\
@@ -182,7 +183,7 @@ class Service:
         .expect("an attribute read the ladder could not attribute is still recorded");
     assert_eq!(
         row.class.label(),
-        "uninferred_receiver",
+        "no_namesake",
         "a field is not a member the ladder can name, and that is a structural \
          limit rather than a defect"
     );

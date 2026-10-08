@@ -2006,6 +2006,18 @@ impl Resolver {
             }
         }
 
+        // No symbol of this family carries the member's name, so there is no
+        // owner for type inference to find: every edge ends at an indexed
+        // symbol, and none could end here. The evidence `bare_name_miss`
+        // stands on, asked of a receiver. Measured at generation 4144: 827 of
+        // the 837 JavaScript `uninferred_receiver` rows (`push`, `includes`,
+        // `length`) named a member no JavaScript or TypeScript file declares.
+        // A namesake in another family is no candidate — `family.admits` is
+        // the same scoping the binding rungs use.
+        if !self.family_declares(family, callee_name) {
+            return UnresolvedClass::NoNamesake;
+        }
+
         // A receiver we could not type. Not a defect — naming its owner needs
         // real type inference — but distinct from a bare-name failure, and by
         // far the larger group.

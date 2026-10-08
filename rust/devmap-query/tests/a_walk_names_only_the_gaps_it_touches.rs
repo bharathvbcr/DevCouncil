@@ -171,11 +171,12 @@ fn ledger_classes(store: &Store, callee: &str) -> Vec<String> {
 #[test]
 fn a_method_no_symbol_is_named_cannot_hide_a_callee() {
     let store = store_with(&[("app.py", APP), ("rows.py", ROWS)], |_| {});
-    // The premise: the sites are in the ledger, unattributed — the class the
-    // walk would otherwise have counted.
+    // The premise: the sites are in the ledger, and the resolver itself files
+    // them as `no_namesake` — the same fact the walk's own namesake test reads
+    // for generations written before the classifier asked it.
     assert_eq!(
         ledger_classes(&store, "count_everything"),
-        vec!["uninferred_receiver".to_string()]
+        vec!["no_namesake".to_string()]
     );
     let engine = StoreQueryEngine::new(&store);
     let trace = engine.trace(request("rows.py::tally", 3)).unwrap();
