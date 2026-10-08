@@ -21,6 +21,7 @@ CLI. [Project overview](../README.md) · [Website](https://devcouncil.vbcr.dev/)
 ## Evidence and operations
 
 - [DevMap comparison](devmap/comparison.md): recorded competitor measurements and limits.
+- [Benchmark plots](../benchmarks/README.md#plots-of-every-recorded-run): every recorded benchmark run as a chart, regenerated from the result JSON.
 - [Repository input and verification boundaries](SECURITY_BOUNDARIES.md): executable selection, filesystem handling and unavailable evidence.
 - [Repository hygiene](repository-hygiene.md): generated state, caches and cleanup ownership.
 - [Security overview](security.md): security documentation and disclosure context.

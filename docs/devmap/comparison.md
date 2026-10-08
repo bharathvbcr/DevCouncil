@@ -29,6 +29,15 @@ The unchanged-refresh margin is the widest and the most load-bearing: it is the
 watcher's common tick, and DevMap stays near-flat as the corpus grows (0.053 s
 at 595 files to 0.141 s at 4,335) while Graphify grows nearly sevenfold.
 
+![Indexing time by tool, v0.2.2, four repositories](../assets/benchmarks/competition-20260914-v0.2.2-indexing.svg)
+
+Bars are the minimum of three repeats, ticks the median, whiskers the maximum,
+on a log axis. Gortex's cold bar is its resident daemon's query-ready gate. The
+same run's footprint:
+
+![Index size on disk, v0.2.2](../assets/benchmarks/competition-v0.2.2-index-size.svg)
+![Peak memory of a cold index, v0.2.2](../assets/benchmarks/competition-v0.2.2-peak-rss.svg)
+
 ## Head-to-head on one corpus
 
 The detailed table uses the 1,098-file DevCouncil corpus, where the correctness
@@ -153,6 +162,9 @@ session — the only controlled way to compare releases on a shared machine.
 | Caller accuracy | **unchanged** — 5/5 in both |
 | Unchanged refresh | **~12% slower** on the smallest corpus (a real regression, ~5 ms) |
 
+![devmap v0.2.1 vs v0.2.2, indexing A/B](../assets/benchmarks/ab-v0.2.1-vs-v0.2.2-indexing.svg)
+![devmap v0.2.1 vs v0.2.2, query A/B](../assets/benchmarks/ab-v0.2.1-vs-v0.2.2-queries.svg)
+
 The query row matters for anyone reading across reports: the raw numbers appear
 to show a 3× query speedup against the previous report, and the controlled A/B
 shows none. The difference was campaign conditions, not the release.
@@ -182,6 +194,7 @@ each semantic check are committed next to the report:
 - [Full report](../../benchmarks/results/competition/20260914-v0.2.2/REPORT.md)
 - [All runs, including prior versions](../../benchmarks/results/competition/README.md)
 - [Benchmark hardening audit](BENCHMARK_HARDENING_AUDIT.md)
+- [Plots of every recorded run](../../benchmarks/README.md#plots-of-every-recorded-run), regenerated from the result JSON
 
 Earlier single-corpus reports remain published with their own measurements:
 [build 48cd3c7](../../benchmarks/results/competition/20260913-48cd3c7/REPORT.md)

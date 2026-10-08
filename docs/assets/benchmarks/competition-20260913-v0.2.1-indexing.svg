@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 444" width="980" height="444" role="img" aria-label="Code-graph tools, indexing: 2026-09-13 v0.2.1 (six tools, one repository)"><title>Code-graph tools, indexing: 2026-09-13 v0.2.1 (six tools, one repository)</title><style>
+.t{fill:#1f2328;font:12px -apple-system,Segoe UI,Helvetica,Arial,sans-serif}
+.m{fill:#59636e;font:11px -apple-system,Segoe UI,Helvetica,Arial,sans-serif}
+.h{fill:#1f2328;font:600 15px -apple-system,Segoe UI,Helvetica,Arial,sans-serif}
+.bg{fill:#ffffff}
+.g{stroke:#d1d9e0;stroke-width:1}
+.ax{stroke:#8c959f;stroke-width:1}
+.w{stroke:#1f2328;stroke-width:1.2;fill:none}
+.k{stroke:#1f2328;stroke-width:2.2}
+@media (prefers-color-scheme: dark){
+.bg{fill:#0d1117}.t,.h{fill:#e6edf3}.m{fill:#9198a1}.g{stroke:#30363d}.ax{stroke:#6e7681}.w{stroke:#e6edf3}.k{stroke:#e6edf3}
+}
+</style><rect class="bg" width="980" height="444"/><g transform="translate(0 0)"><text class="h" x="76" y="26">Code-graph tools, indexing: 2026-09-13 v0.2.1 (six tools, one repository)</text><text class="m" x="76" y="46">Minimum of repeats (bar), median (tick), maximum (whisker); lower is better. Tools do not do identical work.</text><rect x="76.0" y="58" width="10" height="10" rx="2" fill="#2a78d6"/><text class="t" x="90.0" y="67">devmap</text><rect x="147.6" y="58" width="10" height="10" rx="2" fill="#eb6834"/><text class="t" x="161.6" y="67">codegraph</text><rect x="239.0" y="58" width="10" height="10" rx="2" fill="#1baf7a"/><text class="t" x="253.0" y="67">cbm</text><rect x="290.8" y="58" width="10" height="10" rx="2" fill="#eda100"/><text class="t" x="304.8" y="67">gitnexus</text><rect x="375.6" y="58" width="10" height="10" rx="2" fill="#e87ba4"/><text class="t" x="389.6" y="67">graphify</text><rect x="460.4" y="58" width="10" height="10" rx="2" fill="#6250d6"/><text class="t" x="474.4" y="67">gortex</text><line class="g" x1="76" y1="384.0" x2="956.0" y2="384.0"/><text class="m" x="70" y="388.0" text-anchor="end">0.1s</text><line class="g" x1="76" y1="84.0" x2="956.0" y2="84.0"/><text class="m" x="70" y="88.0" text-anchor="end">1s</text><line class="ax" x1="76" y1="384.0" x2="956.0" y2="384.0"/><text class="m" transform="translate(14 234.0) rotate(-90)" text-anchor="middle">seconds (log)</text></g></svg>

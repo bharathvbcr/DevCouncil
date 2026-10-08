@@ -187,6 +187,101 @@ Output: a `results/<timestamp>.json` (raw per-run data, including the
 
 See `tasks.py` for the task suite and each task's hidden checks.
 
+## Plots of every recorded run
+
+Every committed result under `results/` is plotted below, one chart per
+question. The SVGs live in [`docs/assets/benchmarks/`](../docs/assets/benchmarks/)
+and are generated from the result JSON by a standard-library Go program, so a
+plot can always be traced to the file it came from:
+
+```bash
+GOWORK=off go run -C benchmarks/plots . -root "$(git rev-parse --show-toplevel)"
+GOWORK=off go test -C benchmarks/plots .   # loads and renders every committed result
+```
+
+Timing charts use each benchmark's own headline statistic, the **minimum** of
+interleaved repeats, with a tick at the median and a whisker to the maximum.
+Score charts use the mean, as `analyze.py` does. Log axes are labelled. These
+runs were taken on a shared, loaded machine; read ratios, not absolutes.
+
+### Effectiveness: does the gated loop beat the raw agent?
+
+![Hidden-test score per run](../docs/assets/benchmarks/effectiveness-score.svg)
+
+Only the 10 runs that have both a raw-agent arm (A) and a DevCouncil arm (B)
+are scored. Nine files are left out: one run scored 0% on both arms (a broken
+run, not a data point), and eight have no baseline arm (arm B only, including
+`diag/`). The B-only runs still appear in the verdict and cost charts below.
+Run sizes differ (1 to 11 tasks), so the label carries `n`.
+
+![Wall time per task](../docs/assets/benchmarks/effectiveness-wall-time.svg)
+![DevCouncil verdicts per run](../docs/assets/benchmarks/effectiveness-verdicts.svg)
+![Planning cost of arm B](../docs/assets/benchmarks/effectiveness-cost.svg)
+
+### Local monitor: do acceptance checks discriminate?
+
+![Local monitor verdict grid](../docs/assets/benchmarks/local-monitor.svg)
+
+### `dev map` performance over time
+
+![devmap map performance over time](../docs/assets/benchmarks/map-history.svg)
+![devmap on other corpora](../docs/assets/benchmarks/map-scaling.svg)
+![devmap across four repositories](../docs/assets/benchmarks/map-repositories.svg)
+
+All 15 `results/map/` runs are plotted. The history chart holds the 11 runs on
+the real DevCouncil corpus (10 single-repository runs plus DevCouncil's row of
+the 2026-09-13 cross-repository run). The four remaining runs, two on the
+scholarlm repository and two on generated synthetic corpora, are in the scaling
+chart. The corpus and the binary change between runs (the 09-02 runs are
+optimization passes), so the history shows drift, not a clean trend.
+
+### Competitor comparison, run by run
+
+The six `results/competition/` runs, oldest first. The single-repository runs
+time one corpus; the later two cover four repositories. Their one-file edit
+stage is called `edit` in the first four runs and `touch` in the last two.
+Tools do not do identical work; these are descriptive timings, not an accuracy
+ranking (see each run's `REPORT.md`).
+
+| Run | Indexing | Queries |
+|---|---|---|
+| 2026-09-12 52d63a1a | [indexing](../docs/assets/benchmarks/competition-20260912-52d63a1a-indexing.svg) | [queries](../docs/assets/benchmarks/competition-20260912-52d63a1a-queries.svg) |
+| 2026-09-12 expanded | [indexing](../docs/assets/benchmarks/competition-20260912-expanded-indexing.svg) | [queries](../docs/assets/benchmarks/competition-20260912-expanded-queries.svg) |
+| 2026-09-13 build 48cd3c7 | [indexing](../docs/assets/benchmarks/competition-20260913-48cd3c7-indexing.svg) | [queries](../docs/assets/benchmarks/competition-20260913-48cd3c7-queries.svg) |
+| 2026-09-13 v0.2.1 | [indexing](../docs/assets/benchmarks/competition-20260913-v0.2.1-indexing.svg) | [queries](../docs/assets/benchmarks/competition-20260913-v0.2.1-queries.svg) |
+| 2026-09-13 multirepo | [indexing](../docs/assets/benchmarks/competition-20260913-multirepo-indexing.svg) | not measured |
+| 2026-09-14 v0.2.2 | [indexing](../docs/assets/benchmarks/competition-20260914-v0.2.2-indexing.svg) | [A/B queries](../docs/assets/benchmarks/ab-v0.2.1-vs-v0.2.2-queries.svg) |
+
+![devmap in the competition runs, over time](../docs/assets/benchmarks/competition-devmap-drift.svg)
+
+The v0.2.2 run in full, with its footprint and the v0.2.1 → v0.2.2 A/B, is
+plotted in [the DevMap comparison](../docs/devmap/comparison.md).
+
+### Build-cost A/Bs (2026-10-07)
+
+Interleaved A/B runs of HEAD against a one-change variant, from
+`results/competition/20261007-build-cost/`. In the cold-index A/B the variant
+drops the `idx_unresolved_rows_callee` index (`patches/no-callee-index.patch`).
+In the teardown and edit-latency A/Bs it `mem::forget`s the build's resolution,
+resolver, extraction and analysis structures after the JSON line, instead of
+freeing them at exit. The 1-minute host load average was
+30 to 45 during the cold-index A/B and 18 to 31 during the teardown A/B, so read
+the pairs, not the absolute times; interleaving is what makes the pairs
+comparable.
+
+![Cold index, HEAD vs no callee index](../docs/assets/benchmarks/build-cost-cold-index.svg)
+![Process exit, HEAD vs variant](../docs/assets/benchmarks/build-cost-teardown.svg)
+![Edit-to-query latency](../docs/assets/benchmarks/build-cost-edit-latency.svg)
+
+### Not plotted
+
+- The correctness, staleness and semantic-audit results in the competition
+  runs are counts and pass/fail tables, kept as tables in each `REPORT.md`.
+- Gortex's gate logs for the multirepo run and every command's raw
+  stdout/stderr stay as committed evidence only.
+- The Go `testing.B` benchmarks (`backend/go_orchestrator/repomap/bench_test.go`,
+  `.../dc/store/workbench_bench_test.go`) have no stored results to plot.
+
 ## DevMap v0.2.2 competitor comparison: 2026-09-14 UTC
 
 The [v0.2.2 report](results/competition/20260914-v0.2.2/REPORT.md) is the
