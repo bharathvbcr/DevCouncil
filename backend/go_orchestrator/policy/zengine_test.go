@@ -166,9 +166,12 @@ func TestEngineDecisionsEqualGoDecisions(t *testing.T) {
 // path this repository's recent history actually wrote, once on GoMatcher and
 // once on the engine. It also replays the exact pattern questions those
 // decisions asked, on each matcher alone, which is the matching cost with the
-// rest of the ladder (path normalisation's filesystem walk) taken out; and
-// one trivial crossing per decision, the floor under any batching of those
-// questions into a single call.
+// rest of the ladder (path normalisation's filesystem walk) taken out; one
+// trivial crossing per decision; and each decision's questions batched into
+// one crossing — every pattern they asked about, as one case-folded list
+// against the path they share. That batch is a lower bound on any batched
+// opcode: it is a single crossing, and MatchAny stops at the first hit where
+// a real batch would answer every question.
 //
 // Rounds are interleaved and rotate which side goes first, so drift in clock
 // speed or cache state lands on every side; each side reports its fastest
@@ -191,8 +194,11 @@ func BenchmarkDecisionAB(b *testing.B) {
 	// Equal answers first: a faster side that decides differently is not a
 	// candidate. The Go pass records every question the ladder asks.
 	rec := &recordingMatcher{}
+	batches := make([]question, 0, len(paths))
 	for _, p := range paths {
+		first := len(rec.questions)
 		want := gateOn(rec).EvaluateFileChange(p, task, dc.OpModify, false)
+		batches = append(batches, batchOf(b, rec.questions[first:]))
 		if got := engineGate.EvaluateFileChange(p, task, dc.OpModify, false); !reflect.DeepEqual(got, want) {
 			b.Fatalf("%q: engine %+v, go %+v", p, got, want)
 		}
@@ -229,6 +235,13 @@ func BenchmarkDecisionAB(b *testing.B) {
 		{name: "engine-decision", run: decide(engineGate)},
 		{name: "go-questions", run: ask(GoMatcher)},
 		{name: "engine-questions", run: ask(engineMatcher{})},
+		{name: "engine-batched", run: func() {
+			for _, q := range batches {
+				if _, err := (engineMatcher{}).MatchAnyFold(q.patterns, q.name); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}},
 		{name: "engine-one-crossing", run: func() {
 			for range paths {
 				if _, err := (engineMatcher{}).MatchAny(one, "b"); err != nil {
@@ -264,7 +277,27 @@ func BenchmarkDecisionAB(b *testing.B) {
 	b.Logf("per decision: go %.0f ns, engine %.0f ns (%.2fx); its questions alone: go %.0f ns, engine %.0f ns (%.2fx)",
 		per["go-decision"], per["engine-decision"], per["engine-decision"]/per["go-decision"],
 		per["go-questions"], per["engine-questions"], per["engine-questions"]/per["go-questions"])
-	b.Logf("one trivial crossing per decision: %.0f ns", per["engine-one-crossing"])
+	b.Logf("one trivial crossing per decision: %.0f ns; its questions batched into one crossing: %.0f ns (%.2fx go's questions)",
+		per["engine-one-crossing"], per["engine-batched"], per["engine-batched"]/per["go-questions"])
+}
+
+// batchOf folds one decision's questions into a single MatchAnyFold: every
+// pattern they asked, against the one name they all asked about. A decision
+// whose questions named different paths cannot be one MatchAny, and the
+// benchmark says so rather than measuring a batch that is not one.
+func batchOf(tb testing.TB, qs []question) question {
+	tb.Helper()
+	if len(qs) == 0 {
+		return question{name: "", patterns: nil, fold: true}
+	}
+	batch := question{name: qs[0].name, fold: true}
+	for _, q := range qs {
+		if q.name != batch.name {
+			tb.Fatalf("one decision asked about %q and %q; its questions are not one batch", batch.name, q.name)
+		}
+		batch.patterns = append(batch.patterns, q.patterns...)
+	}
+	return batch
 }
 
 type question struct {

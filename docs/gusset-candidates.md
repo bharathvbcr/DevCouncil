@@ -25,10 +25,15 @@ of the two.
 is the committed A/B. It runs the production write gate (hard rules,
 neighbour and same-directory scope on, as the flag defaults have them) over
 `policy/testdata/write_targets.txt`. That file holds the 349 paths this
-repository's last 120 commits actually wrote. The A/B also replays the exact
-pattern questions those decisions asked, on each matcher alone, and times one
-trivial crossing per decision. Rounds are interleaved and rotate which side
-goes first. Each side reports its fastest pass, a min of 105.
+repository's last 120 commits actually wrote. The A/B also has three
+matcher-only sides:
+
+- the exact pattern questions those decisions asked, replayed on each matcher;
+- one trivial crossing per decision;
+- each decision's questions batched into a single crossing.
+
+Rounds are interleaved and rotate which side goes first. Each side reports its
+fastest pass, a min of 105.
 
 ```
 go test -tags gussetengine -run '^$' -bench DecisionAB -benchtime 1x ./policy
@@ -38,15 +43,16 @@ Three runs on 2026-10-08, Apple M5 Pro, Go 1.27.1, ns per write decision:
 
 | side | run 1 | run 2 | run 3 |
 | --- | ---: | ---: | ---: |
-| decision, fnmatch | 57 874 | 58 479 | 57 725 |
-| decision, engine | 95 394 | 97 168 | 89 756 |
-| its 4.99 questions, fnmatch | 11 453 | 11 139 | 11 418 |
-| its 4.99 questions, engine | 26 652 | 24 433 | 29 030 |
-| one trivial crossing | 1 472 | 1 447 | 1 486 |
+| decision, fnmatch | 60 684 | 59 590 | 62 007 |
+| decision, engine | 109 391 | 91 579 | 111 900 |
+| its 4.99 questions, fnmatch | 12 064 | 11 747 | 12 730 |
+| its 4.99 questions, engine | 30 241 | 25 025 | 29 446 |
+| the same questions batched, engine | 17 249 | 17 038 | 18 054 |
+| one trivial crossing | 1 601 | 1 493 | 1 496 |
 
 Most of a decision is neither matcher: path normalisation's `EvalSymlinks`
 walk dominates the Go profile. On the questions themselves, the engine costs
-2.2–2.5× fnmatch.
+2.1–2.5× fnmatch.
 
 The earlier figures ("about 20 µs per crossing, 63 µs against Go's 23 µs per
 write decision") came from the sequential `BenchmarkDecision` this replaces.
@@ -55,18 +61,20 @@ crossing is about 1.5 µs, not 20.
 
 ### Why not batch (option b)
 
-Batching would cut the crossings, and the crossings are not the cost. Five
-questions take 24–29 µs on the engine, of which five crossings account for
-about 7 µs. That leaves 17–22 µs of frame encoding and dc-glob matching, most
-of it in the case-folded secret and protected lists (19 and 24 patterns). That
-remainder alone is more than fnmatch's 11 µs for the same questions. A
-batched call would still pay it, plus one crossing. This is inferred from
-subtracting the crossing floor, and it assumes crossing cost adds; no batched
-opcode was built to measure it directly. Batching would also have had to ask
-the ladder's questions before knowing which rung returns, against
-`EvaluateFileChange`'s order contract. gusset's own guide says the same
-(`gusset/docs/choosing.md`: under ~10 µs of work per call, "don't"), and each
-of these questions is a few µs.
+Measured, and it loses. The batched side sends all of a decision's questions
+across in one crossing, as one case-folded list against the path every
+question names. The A/B refuses to run if a decision's questions name
+different paths. That is a lower bound on any batched opcode. It pays one
+crossing, and MatchAny stops at the first hit, where a real batch would have
+to answer every question. It still costs 17.0–18.1 µs against fnmatch's
+11.7–12.7 µs for the same questions, 1.42–1.45×.
+
+The crossings are not the cost. The cost is frame encoding and dc-glob's
+matching, most of it in the case-folded secret and protected lists (19 and 24
+patterns). A batch would also have to ask the ladder's questions before
+knowing which rung returns, against `EvaluateFileChange`'s order contract.
+gusset's own guide says the same (`gusset/docs/choosing.md`: under ~10 µs of
+work per call, "don't"), and each of these questions is a few µs.
 
 ### What the engine still does
 
