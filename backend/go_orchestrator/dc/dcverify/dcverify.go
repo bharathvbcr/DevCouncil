@@ -296,7 +296,8 @@ type Result struct {
 	OK    bool   `json:"ok"`
 	Error string `json:"error"`
 
-	// Files is how many files the diff touched.
+	// Files is how many paths the diff touched: a rename counts its source
+	// and its destination, both of which scope classification judges.
 	Files int `json:"files"`
 	// InScope and Orphans partition those files against Request.Planned, and
 	// UntouchedPlanned is the planned paths no file matched.

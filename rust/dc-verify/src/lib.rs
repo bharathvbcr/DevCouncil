@@ -415,6 +415,23 @@ impl ScopeReport {
     }
 }
 
+/// Every path a diff changes: each file's path, and a rename's source as well,
+/// because its content left it.
+///
+/// The one definition of what scope classification judges. [`classify_scope`]
+/// classifies exactly these, and the `dcverify` binary reports their count as
+/// `files`, so the host's check that each changed path landed in exactly one
+/// of `in_scope` and `orphans` compares two numbers drawn from the same list.
+pub fn changed_paths(files: &[FileDiff]) -> impl Iterator<Item = &str> {
+    files.iter().flat_map(|file| {
+        let source = match (file.status, &file.old_path) {
+            (ChangeStatus::Renamed, Some(old)) if *old != file.path => Some(old.as_str()),
+            _ => None,
+        };
+        std::iter::once(file.path.as_str()).chain(source)
+    })
+}
+
 /// Classifies changed files against planned-file globs.
 ///
 /// `planned` entries are fnmatch patterns in the Python dialect, matched with
@@ -429,14 +446,7 @@ pub fn classify_scope(files: &[FileDiff], planned: &[String]) -> ScopeReport {
     let mut matched_planned = vec![false; planned.len()];
     let patterns: Vec<String> = planned.iter().map(|p| normalize_candidate(p)).collect();
 
-    let changed = files.iter().flat_map(|file| {
-        let source = match (file.status, &file.old_path) {
-            (ChangeStatus::Renamed, Some(old)) if *old != file.path => Some(old.as_str()),
-            _ => None,
-        };
-        std::iter::once(file.path.as_str()).chain(source)
-    });
-    for path in changed {
+    for path in changed_paths(files) {
         let candidate = normalize_candidate(path);
         let mut hit = false;
         for (i, pattern) in patterns.iter().enumerate() {
@@ -625,6 +635,12 @@ rename to src/new.go
         let report = classify_scope(&files, &["src/new.go".to_string()]);
         assert_eq!(report.orphans, vec!["legacy/old.go"]);
         assert_eq!(report.in_scope, vec!["src/new.go"]);
+        // The binary reports this count as `files`; the host refuses a reply
+        // whose two lists do not add up to it.
+        assert_eq!(
+            changed_paths(&files).count(),
+            report.in_scope.len() + report.orphans.len()
+        );
 
         let both = ["legacy/old.go".to_string(), "src/new.go".to_string()];
         let report = classify_scope(&files, &both);

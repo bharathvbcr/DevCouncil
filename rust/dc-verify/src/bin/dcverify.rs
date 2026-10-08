@@ -232,7 +232,9 @@ fn check(
         "{{\"ok\":true,\"files\":{},\"stub_ast_parsed_files\":{},\"in_scope\":{},\"orphans\":{},\
          \"untouched_planned\":{},\"findings\":{},\"coverage_unmeasured\":{},\"coverage_gaps\":{},\
          \"coverage_skipped_by_type\":{},\"substance\":{}}}",
-        files.len(),
+        // Changed paths, not diff entries: a rename is two, and scope
+        // classification judged both.
+        dc_verify::changed_paths(&files).count(),
         // The skipped- and assert-free-test checks run only on parsed files;
         // the host names them as applied only when this is above zero.
         stubs.parsed_files,
