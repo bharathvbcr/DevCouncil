@@ -74,13 +74,13 @@ pub struct Activity(std::sync::Mutex<Option<std::time::Instant>>);
 
 impl Activity {
     pub fn touch(&self) {
-        let mut slot = self.0.lock().expect("activity mutex poisoned");
+        let mut slot = crate::lock_recover(&self.0);
         *slot = Some(std::time::Instant::now());
     }
 
     /// How long since the last touch; `None` when nothing was ever recorded.
     pub fn idle_for(&self) -> Option<Duration> {
-        let slot = self.0.lock().expect("activity mutex poisoned");
+        let slot = crate::lock_recover(&self.0);
         slot.map(|at| at.elapsed())
     }
 }
@@ -134,7 +134,7 @@ impl UnappliedEdits {
     /// Before binding IPC, mark the startup sweep as unverified. This is not
     /// a fabricated write failure: its zero batches get a distinct description.
     pub fn begin_initial_sweep(&self) {
-        let mut slot = self.0.lock().expect("unapplied-edits mutex poisoned");
+        let mut slot = crate::lock_recover(&self.0);
         if slot.is_none() {
             *slot = Some(Unapplied {
                 revision: Arc::new(()),
@@ -149,7 +149,7 @@ impl UnappliedEdits {
     ///
     /// Never resets the count. Two refusals are more lost coverage than one.
     pub fn record(&self, paths: usize, reason: impl std::fmt::Display) {
-        let mut slot = self.0.lock().expect("unapplied-edits mutex poisoned");
+        let mut slot = crate::lock_recover(&self.0);
         let reason = reason.to_string();
         match slot.as_mut() {
             Some(existing) => {
@@ -172,9 +172,7 @@ impl UnappliedEdits {
     /// Capture the refusals known before discovery starts. Allocation identity
     /// avoids counter overflow and delete/reinsert ABA, including equal counts.
     pub fn sweep_watermark(&self) -> Option<Arc<()>> {
-        self.0
-            .lock()
-            .expect("unapplied-edits mutex poisoned")
+        crate::lock_recover(&self.0)
             .as_ref()
             .map(|record| record.revision.clone())
     }
@@ -183,7 +181,7 @@ impl UnappliedEdits {
     /// A later refusal may name a file already scanned, so it survives even
     /// when the sweep itself succeeds. A normal successful enqueue never clears it.
     pub fn cleared_by_sweep(&self, watermark: Option<Arc<()>>) {
-        let mut slot = self.0.lock().expect("unapplied-edits mutex poisoned");
+        let mut slot = crate::lock_recover(&self.0);
         if let (Some(record), Some(mark)) = (slot.as_ref(), watermark) {
             if Arc::ptr_eq(&record.revision, &mark) {
                 *slot = None;
@@ -192,10 +190,7 @@ impl UnappliedEdits {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0
-            .lock()
-            .expect("unapplied-edits mutex poisoned")
-            .is_none()
+        crate::lock_recover(&self.0).is_none()
     }
 
     /// An owned copy of what is recorded right now.
@@ -206,17 +201,12 @@ impl UnappliedEdits {
     /// `is_fresh` field and the `degraded_reason` field of the same JSON object
     /// — a status that says fresh and then explains why it is not.
     pub fn snapshot(&self) -> Self {
-        Self(std::sync::Mutex::new(
-            self.0
-                .lock()
-                .expect("unapplied-edits mutex poisoned")
-                .clone(),
-        ))
+        Self(std::sync::Mutex::new(crate::lock_recover(&self.0).clone()))
     }
 
     /// How this reads in `status`, or `None` when nothing was lost.
     pub fn describe(&self) -> Option<String> {
-        let slot = self.0.lock().expect("unapplied-edits mutex poisoned");
+        let slot = crate::lock_recover(&self.0);
         let record = slot.as_ref()?;
         if record.batches == 0 {
             return Some(record.reason.clone());
@@ -3287,6 +3277,68 @@ mod tests {
             response.contains("request_too_large"),
             "an oversized request must be refused with a structured error, got: {}",
             response.chars().take(200).collect::<String>()
+        );
+    }
+
+    /// A panic while a shared lock is held must not take every later request
+    /// with it. `record` formats its reason *inside* the critical section, so a
+    /// `Display` that panics there is a real way to poison the unapplied-edits
+    /// lock; `Activity` is poisoned directly. Before `lock_recover`, both were
+    /// `.expect("... poisoned")`, and the request below panicked its handler.
+    #[tokio::test]
+    async fn a_poisoned_state_lock_still_serves_the_next_request() {
+        struct Exploding;
+        impl std::fmt::Display for Exploding {
+            fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                panic!("reason formatting panicked under the unapplied-edits lock")
+            }
+        }
+
+        let state = Arc::new(ServeState::default());
+        state.unapplied.record(3, "the volume is full");
+        let poisoner = Arc::clone(&state);
+        std::thread::spawn(move || {
+            poisoner.unapplied.record(1, Exploding);
+        })
+        .join()
+        .expect_err("fixture precondition: the record panics");
+        let poisoner = Arc::clone(&state);
+        std::thread::spawn(move || {
+            let _held = poisoner.activity.0.lock().unwrap();
+            panic!("worker panicked while holding the activity lock");
+        })
+        .join()
+        .expect_err("fixture precondition: the holder panics");
+        assert!(state.unapplied.0.is_poisoned() && state.activity.0.is_poisoned());
+
+        let (mut client, server) = tokio::io::duplex(16 * 1024);
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let served = Arc::clone(&state);
+        let task =
+            tokio::spawn(async move { handle_stream_with_state(server, store, &served).await });
+        client
+            .write_all(b"{\"version\":1,\"cmd\":\"status\"}\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        task.await
+            .expect("the handler must not panic on a poisoned lock")
+            .unwrap();
+
+        let value: Value = serde_json::from_str(response.trim()).unwrap();
+        assert_eq!(value["ok"], true, "{value}");
+        assert_eq!(value["result"]["is_fresh"], false, "{value}");
+        let reason = value["result"]["degraded_reason"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            reason.contains("the volume is full"),
+            "the record written before the panic must survive recovery: {value}"
+        );
+        assert!(
+            state.activity.idle_for().is_some(),
+            "the request must have touched the recovered activity lock"
         );
     }
 

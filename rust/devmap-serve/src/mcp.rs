@@ -189,9 +189,7 @@ impl StoreSlot {
             client_has_roots, ..
         } = &self.mode
         {
-            if let Ok(mut slot) = client_has_roots.lock() {
-                *slot = has;
-            }
+            *crate::lock_recover(client_has_roots) = has;
         }
     }
 
@@ -199,7 +197,7 @@ impl StoreSlot {
         match &self.mode {
             SlotMode::Resolving {
                 client_has_roots, ..
-            } => client_has_roots.lock().map(|g| *g).unwrap_or(false),
+            } => *crate::lock_recover(client_has_roots),
             SlotMode::Pinned { .. } => false,
         }
     }
@@ -227,15 +225,9 @@ impl StoreSlot {
                     }
                 })
                 .collect();
-            if let Ok(mut slot) = mcp_roots.lock() {
-                *slot = Some(canonical);
-            }
-            if let Ok(mut count) = self.unusable_mcp_roots.lock() {
-                *count = skipped.saturating_add(overflow);
-            }
-            if let Ok(mut err) = roots_error.lock() {
-                *err = None;
-            }
+            *crate::lock_recover(mcp_roots) = Some(canonical);
+            *crate::lock_recover(&self.unusable_mcp_roots) = skipped.saturating_add(overflow);
+            *crate::lock_recover(roots_error) = None;
         }
     }
 
@@ -261,9 +253,7 @@ impl StoreSlot {
             return false;
         }
         if let SlotMode::Resolving { roots_error, .. } = &self.mode {
-            if let Ok(mut err) = roots_error.lock() {
-                *err = Some(message);
-            }
+            *crate::lock_recover(roots_error) = Some(message);
         }
         true
     }
@@ -275,9 +265,7 @@ impl StoreSlot {
         else {
             return false;
         };
-        let Ok(mut last) = last_applied_seq.lock() else {
-            return false;
-        };
+        let mut last = crate::lock_recover(last_applied_seq);
         if seq < *last {
             return false;
         }
@@ -287,9 +275,7 @@ impl StoreSlot {
 
     fn roots_error_message(&self) -> Option<String> {
         match &self.mode {
-            SlotMode::Resolving { roots_error, .. } => {
-                roots_error.lock().ok().and_then(|g| g.clone())
-            }
+            SlotMode::Resolving { roots_error, .. } => crate::lock_recover(roots_error).clone(),
             SlotMode::Pinned { .. } => None,
         }
     }
@@ -309,10 +295,7 @@ impl StoreSlot {
     /// `list_changed` is not confused with the handshake request.
     pub fn next_roots_list_request(&self) -> Value {
         let n = {
-            let mut seq = self
-                .roots_list_seq
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut seq = crate::lock_recover(&self.roots_list_seq);
             *seq = seq.saturating_add(1);
             *seq
         };
@@ -327,10 +310,8 @@ impl StoreSlot {
     /// The path last opened. Unresolved resolving slots return an empty path so
     /// a session log is never derived from `store_path(cwd)`.
     pub fn db_path(&self) -> PathBuf {
-        if let Ok(opened) = self.opened.lock() {
-            if let Some(path) = opened.last_store_path() {
-                return path;
-            }
+        if let Some(path) = crate::lock_recover(&self.opened).last_store_path() {
+            return path;
         }
         match &self.mode {
             SlotMode::Pinned { db_path } => db_path.clone(),
@@ -339,7 +320,7 @@ impl StoreSlot {
     }
 
     fn unusable_root_count(&self) -> usize {
-        self.unusable_mcp_roots.lock().map(|g| *g).unwrap_or(0)
+        *crate::lock_recover(&self.unusable_mcp_roots)
     }
 
     fn resolve_path(&self) -> Result<PathBuf, String> {
@@ -367,10 +348,7 @@ Pass repo_path only when it names this same repository, or run `devmap build` th
                         store.display()
                     ));
                 }
-                let roots = mcp_roots
-                    .lock()
-                    .map_err(|_| "mcp roots mutex was poisoned by an earlier panic".to_string())?
-                    .clone();
+                let roots = crate::lock_recover(mcp_roots).clone();
                 let skipped = self.unusable_root_count();
                 if let Some(err) = self.roots_error_message() {
                     if roots.as_ref().is_none_or(|r| r.is_empty()) {
@@ -423,11 +401,7 @@ with an absolute repository path."
                         };
                     }
                 }
-                let roots = mcp_roots
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.clone())
-                    .unwrap_or_default();
+                let roots = crate::lock_recover(mcp_roots).clone().unwrap_or_default();
                 for root in roots_with_stores(roots.iter()) {
                     let candidate = canonicalize_path(&devmap_extract::paths::store_path(&root));
                     if candidate == store {
@@ -474,7 +448,7 @@ with an absolute repository path."
                 explicit_root,
                 ..
             } => {
-                let roots = mcp_roots.lock().ok().and_then(|g| g.clone());
+                let roots = crate::lock_recover(mcp_roots).clone();
                 let mut candidates = RootResolveInput {
                     mcp_roots: roots,
                     client_cwd: client_cwd.clone(),
@@ -499,10 +473,7 @@ with an absolute repository path."
         let key = devmap_extract::safe_fs::resolve_file_alias(store_path)
             .map_err(|error| format!("unsafe store path: {error}"))?;
         {
-            let mut cache = self
-                .opened
-                .lock()
-                .map_err(|_| "store slot mutex was poisoned by an earlier panic".to_string())?;
+            let mut cache = crate::lock_recover(&self.opened);
             if let Some((store, _)) = cache.get(&key) {
                 return Ok(store);
             }
@@ -514,10 +485,7 @@ with an absolute repository path."
             return Err(explain_absence(store_path));
         }
         let store = Arc::new(open_mcp_store(store_path)?);
-        let mut cache = self
-            .opened
-            .lock()
-            .map_err(|_| "store slot mutex was poisoned by an earlier panic".to_string())?;
+        let mut cache = crate::lock_recover(&self.opened);
         cache.insert(key, Arc::clone(&store), attr);
         Ok(store)
     }
@@ -3136,11 +3104,9 @@ impl Session {
     /// Absent is normal, not an error: a cancellation that loses the race with
     /// completion is exactly the case the specification says to tolerate.
     fn cancel(&self, id: &Value) {
-        if let Ok(mut map) = self.in_flight.lock() {
-            if let Some(request) = map.get_mut(&id.to_string()) {
-                request.cancelled_by_client = true;
-                request.cancel.cancel();
-            }
+        if let Some(request) = crate::lock_recover(&self.in_flight).get_mut(&id.to_string()) {
+            request.cancelled_by_client = true;
+            request.cancel.cancel();
         }
     }
 
@@ -3150,13 +3116,7 @@ impl Session {
     /// request is actually running, so a client that waits for its answers never
     /// meets it however many questions it asks.
     fn register(&self, id: &Value, cancel: devmap_query::Cancel) -> Result<(), String> {
-        let Ok(mut map) = self.in_flight.lock() else {
-            return Err(
-                "the in-flight table was poisoned by an earlier panic, so this session can no \
-longer account for what it is running and cannot promise this request would be cancellable"
-                    .to_string(),
-            );
-        };
+        let mut map = crate::lock_recover(&self.in_flight);
         // Occupied means the client reused an id that has not been answered:
         // "The request ID **MUST NOT** match the ID of any other request the
         // sender has issued and not yet received a response for." Overwriting
@@ -3184,9 +3144,7 @@ answers indistinguishable and would leave the first call uncancellable."
     /// Give back the slot, remembering whether the client asked for silence.
     /// Internal deadlines also cancel the worker, but still owe an error reply.
     fn release(&self, id: &Value) -> bool {
-        self.in_flight
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::lock_recover(&self.in_flight)
             .remove(&id.to_string())
             .is_some_and(|request| request.cancelled_by_client)
     }
@@ -3196,10 +3154,7 @@ impl Drop for Session {
     fn drop(&mut self) {
         // Aborting async request tasks does not abort their blocking workers.
         // Session teardown must tell every abandoned query to stop explicitly.
-        let requests = self
-            .in_flight
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let requests = crate::lock_recover(&self.in_flight);
         for request in requests.values() {
             request.cancel.cancel();
         }
