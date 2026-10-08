@@ -18,10 +18,15 @@ The implementation-level reference is
 
 ## Verification commands run on the host
 
-The Go gateway executes task commands through a local shell in the project
-root. The `--sandbox` flag records the selection; `docker` and `nix` do not
-start isolation. Review task command lists and project configuration before
-running verification, as you would review CI workflow changes.
+The Go gateway executes task commands through a local shell
+(`/bin/sh -c`) in the project root, with the host's environment and no
+timeout. `local` is the only sandbox: `verify.ParseSandbox` refuses any
+other `--sandbox` value (exit 2, or an MCP error) rather than recording a
+sandbox that did not run. Docker/Nix isolation is planned but not built. Its
+security-impact statement is
+[awaiting approval](verify-sandbox-security-impact.md). Review task command
+lists and project configuration before running verification, as you would
+review CI workflow changes.
 
 Installing MCP configuration does not grant universal scope enforcement.
 [Integration](coding-cli-integration.md) documents which settings and hooks
