@@ -616,3 +616,57 @@ fn a_deleted_task_is_restored_with_its_fields_and_history() {
         "invalid_state",
     );
 }
+
+#[test]
+fn deleted_tasks_are_listed_most_recently_deleted_first_until_restored() {
+    let (s, clock) = fixture();
+    call(
+        &s,
+        "workspaces.put",
+        r#"{"id":"w","request_id":"w","expected_revision":0,"name":"W","repository_ids":["r"]}"#,
+    );
+    for (id, at) in [("old", 2000), ("new", 3000), ("tie", 3000)] {
+        put(&s, id, 0, "");
+        clock.store(at, Ordering::SeqCst);
+        call(
+            &s,
+            "items.delete",
+            &format!(r#"{{"id":"{id}","request_id":"del-{id}","expected_revision":1}}"#),
+        );
+    }
+    put(&s, "live", 0, "");
+    let deleted = call(&s, "items.list", r#"{"deleted":true,"order":"updated"}"#);
+    assert_eq!(ids(&s, &deleted), ["tie", "new", "old"]);
+    assert_eq!(json::<i64>(&s, &deleted, "$.total"), 3);
+    assert_eq!(json::<i64>(&s, &deleted, "$.items[0].deleted"), 1);
+    // Paging resumes in the same order with its own cursor.
+    let first = call(
+        &s,
+        "items.list",
+        r#"{"deleted":true,"order":"updated","limit":1}"#,
+    );
+    let cursor: String = json(&s, &first, "$.next_cursor");
+    assert_eq!(cursor, "3:3000:tie");
+    let next = call(
+        &s,
+        "items.list",
+        &format!(r#"{{"deleted":true,"order":"updated","limit":2,"cursor":"{cursor}"}}"#),
+    );
+    assert_eq!(ids(&s, &next), ["new", "old"]);
+    // Scope and search apply to the deleted side as they do to the board.
+    let scoped = call(&s, "items.list", r#"{"workspace_id":"w","deleted":true}"#);
+    assert_eq!(json::<i64>(&s, &scoped, "$.total"), 3);
+    let searched = call(&s, "items.list", r#"{"query":"old","deleted":true}"#);
+    assert_eq!(ids(&s, &searched), ["old"]);
+    // The live board never shows them.
+    assert_eq!(ids(&s, &call(&s, "items.list", "{}")), ["live"]);
+
+    call(
+        &s,
+        "items.restore",
+        r#"{"id":"new","request_id":"back","expected_revision":2}"#,
+    );
+    let deleted = call(&s, "items.list", r#"{"deleted":true,"order":"updated"}"#);
+    assert_eq!(ids(&s, &deleted), ["tie", "old"]);
+    assert_eq!(json::<i64>(&s, &call(&s, "items.list", "{}"), "$.total"), 2);
+}

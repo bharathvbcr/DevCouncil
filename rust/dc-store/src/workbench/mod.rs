@@ -1047,12 +1047,17 @@ enum Order {
     /// Most recently completed first: `completed_at` (0 for a task not
     /// Done), then id, both descending. Cursor `2:`.
     Completed,
+    /// Most recently changed first: `updated_at`, then id, both descending.
+    /// For deleted tasks that is when they were deleted. Cursor `3:`. Not
+    /// indexed: it is meant for the deleted list, not a whole board.
+    Updated,
 }
 impl Order {
     fn cursor(self) -> u8 {
         match self {
             Self::Board => 1,
             Self::Completed => 2,
+            Self::Updated => 3,
         }
     }
     /// The task column the page is keyed and ordered on.
@@ -1060,19 +1065,20 @@ impl Order {
         match self {
             Self::Board => "t.position",
             Self::Completed => "t.completed_at",
+            Self::Updated => "coalesce(json_extract(t.body,'$.updated_at'),0)",
         }
     }
     /// How a row compares with the cursor to come after it.
     fn after(self) -> &'static str {
         match self {
             Self::Board => ">",
-            Self::Completed => "<",
+            Self::Completed | Self::Updated => "<",
         }
     }
     fn direction(self) -> &'static str {
         match self {
             Self::Board => "",
-            Self::Completed => " DESC",
+            Self::Completed | Self::Updated => " DESC",
         }
     }
 }
@@ -1107,7 +1113,7 @@ fn page_in(input: &Input<'_>, order: Order) -> Result<Page> {
             return Err(Error::invalid("invalid cursor"));
         }
         (position, id.to_string())
-    } else if order == Order::Completed {
+    } else if order != Order::Board {
         // Descending: start above every key. Ids are ASCII, so DEL sorts
         // after every one of them.
         (MAX_INTEGER, "\u{7f}".into())
@@ -1273,11 +1279,15 @@ fn list_items(input: &Input<'_>) -> Result<String> {
         "query",
         "archived",
         "order",
+        "deleted",
     ])?;
     let order = match input.text("order", 32)?.as_deref() {
         None | Some("board") => Order::Board,
         Some("completed") => Order::Completed,
-        Some(_) => return Err(Error::invalid("order must be board or completed")),
+        Some("updated") => Order::Updated,
+        Some(_) => {
+            return Err(Error::invalid("order must be board, completed or updated"));
+        }
     };
     let p = page_in(input, order)?;
     // None reads both; the archive and the board each name the side they show.
@@ -1285,6 +1295,8 @@ fn list_items(input: &Input<'_>) -> Result<String> {
         None | Some("null") => None,
         Some(_) => Some(input.boolean("archived", false)?),
     };
+    // Deleted tasks instead of live ones: what a restore is chosen from.
+    let deleted = input.boolean("deleted", false)?;
     let workspace = input.optional_id("workspace_id")?;
     let repo = input.optional_id("repository_id")?;
     if workspace.is_some() && repo.is_some() {
@@ -1317,6 +1329,7 @@ fn list_items(input: &Input<'_>) -> Result<String> {
     let filter = ItemFilter {
         status: status.as_deref(),
         archived,
+        deleted,
     };
     let (query, values) = item_query(
         workspace.as_deref(),
@@ -1329,7 +1342,7 @@ fn list_items(input: &Input<'_>) -> Result<String> {
         return list_scoped_items(input, &query, values, p, order);
     }
     let total = match fts.as_deref() {
-        Some(fts) if repo.is_none() && status.is_none() && archived.is_none() => {
+        Some(fts) if repo.is_none() && status.is_none() && archived.is_none() && !deleted => {
             global_search_total(input.conn, fts)?
         }
         _ => input.conn.query_row(
@@ -1385,6 +1398,8 @@ const CARD_OMITS: &str = "'$.description','$.acceptance_criteria','$.logs','$.ch
 struct ItemFilter<'a> {
     status: Option<&'a str>,
     archived: Option<bool>,
+    /// Read deleted tasks instead of live ones.
+    deleted: bool,
 }
 
 /// Live tasks matching an unscoped, unfiltered search.
@@ -1488,14 +1503,16 @@ fn item_query(
         values.push(rusqlite::types::Value::Text(value.into()));
         format!("?{}", values.len())
     };
-    let mut filters = vec!["t.deleted=0".to_string()];
+    // A literal: one of two program constants, which keeps the board index usable.
+    let deleted = i64::from(filter.deleted);
+    let mut filters = vec![format!("t.deleted={deleted}")];
     let source = if let Some(workspace) = workspace {
         let parameter = bind(workspace);
         // UNION deduplicates home membership and every matching linked repo.
         // CROSS JOIN keeps indexed members as the outer loop: an absent or
         // small workspace must not walk the entire profile's live tasks.
         format!(
-            "(SELECT id FROM work_items WHERE home_workspace_id={parameter} AND deleted=0 UNION SELECT ir.item_id FROM work_workspace_repositories wr CROSS JOIN work_item_repositories ir ON ir.repository_id=wr.repository_id WHERE wr.workspace_id={parameter}) selected CROSS JOIN work_items t ON t.id=selected.id"
+            "(SELECT id FROM work_items WHERE home_workspace_id={parameter} AND deleted={deleted} UNION SELECT ir.item_id FROM work_workspace_repositories wr CROSS JOIN work_item_repositories ir ON ir.repository_id=wr.repository_id WHERE wr.workspace_id={parameter}) selected CROSS JOIN work_items t ON t.id=selected.id"
         )
     } else if let Some(repo) = repo {
         filters.push(format!("selected.repository_id={}", bind(repo)));
