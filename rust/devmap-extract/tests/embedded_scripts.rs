@@ -819,8 +819,10 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     //
     // v72 adds the MCP-parity lane's v67: route middleware (Express and Go)
     // and Go routes; a row without it says no producer ran for either.
+    //
+    // v73 references the type a Rust struct literal constructs.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "72",
+        EXTRACTION_SCHEMA_VERSION, "73",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

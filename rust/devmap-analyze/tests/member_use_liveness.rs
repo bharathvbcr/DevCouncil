@@ -374,3 +374,91 @@ fn rust_uses_that_are_not_ordinary_calls_keep_the_symbol_live() {
         "typing adjacency must not amnesty every method of Adjacency: {reports:?}"
     );
 }
+
+/// Constructing a value is a use of its type.
+///
+/// A serde record, a config struct or a builder is often only ever *built*:
+/// `serde_json::to_string(&FileRecord { .. })` is the one mention of
+/// `FileRecord` outside its declaration. tree-sitter-rust puts that name on the
+/// `name` field of `struct_expression`, and the extractor read every `name`
+/// field as a declaration, so no reference was emitted and the type was
+/// reported dead at 0.9 (Lappi-decision, `own_prose.rs::FileRecord`).
+///
+/// Every constructor spelling is pinned here, not only the two that were red:
+/// tuple structs and enum variants already reached their type through the call
+/// and the path qualifier, and must keep doing so.
+#[test]
+fn a_type_used_only_by_construction_is_live() {
+    let source = concat!(
+        "#[derive(serde::Serialize)]\n",
+        "struct FileRecord<'a> { repo: &'a str, words: usize }\n",
+        "struct Bare { n: u32 }\n",
+        "struct Wrap<T> { t: T }\n",
+        "struct Pair(u32, u32);\n",
+        "enum Braced { Rect { w: u32 } }\n",
+        "enum Tupled { Circle(u32) }\n",
+        "struct Selfy { n: u32 }\n",
+        "impl Selfy {\n",
+        "    fn make() -> u32 { let s = Self { n: 1 }; s.n }\n",
+        "}\n",
+        "struct NeverBuilt { n: u32 }\n",
+        "\n",
+        "fn take<T>(_: T) {}\n",
+        "pub fn write(records: &[(String, usize)]) -> String {\n",
+        "    let mut body = String::new();\n",
+        "    for (repo, w) in records {\n",
+        "        body.push_str(&serde_json::to_string(&FileRecord { repo, words: *w }).unwrap());\n",
+        "    }\n",
+        "    take(Bare { n: 1 });\n",
+        "    take(Wrap::<u32> { t: 1 });\n",
+        "    take(Pair(1, 2));\n",
+        "    take(Braced::Rect { w: 1 });\n",
+        "    take(Tupled::Circle(1));\n",
+        "    body\n",
+        "}\n",
+    );
+    let extractions = vec![extract_file("lib.rs", source)];
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
+    let uses = |source_symbol: &str, target: &str| {
+        resolution.edges.iter().any(|edge| {
+            edge.source_symbol == source_symbol
+                && edge.target_symbol == target
+                && matches!(edge.edge_kind, EdgeKind::References | EdgeKind::Calls)
+        })
+    };
+    for (constructor, user, target) in [
+        ("FileRecord { .. }", "lib.rs::write", "lib.rs::FileRecord"),
+        ("Bare { .. }", "lib.rs::write", "lib.rs::Bare"),
+        ("Wrap::<u32> { .. }", "lib.rs::write", "lib.rs::Wrap"),
+        ("Pair(..)", "lib.rs::write", "lib.rs::Pair"),
+        ("Braced::Rect { .. }", "lib.rs::write", "lib.rs::Braced"),
+        ("Tupled::Circle(..)", "lib.rs::write", "lib.rs::Tupled"),
+        ("Self { .. }", "lib.rs::Selfy.make", "lib.rs::Selfy"),
+    ] {
+        assert!(
+            uses(user, target),
+            "`{constructor}` in {user} is a use of {target}: {:?}",
+            resolution
+                .edges
+                .iter()
+                .filter(|edge| edge.edge_kind != EdgeKind::Contains)
+                .map(|edge| (&edge.source_symbol, &edge.target_symbol, edge.edge_kind))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    let reports = analyze_liveness(&extractions, &resolution);
+    for live in ["FileRecord", "Bare", "Wrap", "Pair", "Braced", "Tupled"] {
+        assert!(
+            !is_reported(&reports, live),
+            "{live} is constructed and must not be dead: {reports:?}"
+        );
+    }
+    assert!(
+        is_reported(&reports, "NeverBuilt"),
+        "a struct nothing constructs or names must still be reported, or a \
+         struct literal has become a blanket amnesty: {reports:?}"
+    );
+}
