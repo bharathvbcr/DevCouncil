@@ -1478,11 +1478,31 @@ fn edited_locations(root: &Path, payload: &Value) -> Vec<(String, u32, u32)> {
     out
 }
 
+/// Ceiling on the edited file the hook reads to place an edit by its text.
+///
+/// This runs on every write tool call, so an unbounded read made a generated
+/// bundle, a lockfile or a data dump cost a whole-file load per edit. Above the
+/// ceiling the file is not read at all: edits that carry their own line range
+/// keep it, and an edit that can only be placed by searching for its text
+/// widens the answer to the whole file — coarser, never missing.
+const MAX_EDIT_LOCATE_BYTES: u64 = 2 * 1024 * 1024;
+
 fn edit_ranges_from_payload(payload: &Value, root: &Path, absolute: &Path) -> Vec<(u32, u32)> {
     let edits = payload
         .get("edits")
         .or_else(|| payload.pointer("/tool_input/edits"))
         .and_then(Value::as_array);
+    let needs_text = match edits {
+        Some(edits) => edits.iter().any(|edit| explicit_edit_range(edit).is_none()),
+        None => payload.pointer("/tool_input/old_string").is_some(),
+    };
+    // Read once per call, bounded, and only when some edit has to be found by
+    // its text. `read_bounded` also refuses a fifo or other non-regular file.
+    let content = if needs_text {
+        devmap_query::stat_memo::read_bounded(absolute, MAX_EDIT_LOCATE_BYTES)
+    } else {
+        None
+    };
     let Some(edits) = edits else {
         // Write with full contents, or Edit with old_string/new_string at top.
         if let Some(old) = payload
@@ -1493,41 +1513,28 @@ fn edit_ranges_from_payload(payload: &Value, root: &Path, absolute: &Path) -> Ve
                 .pointer("/tool_input/new_string")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            return locate_edit_in_file(absolute, old, new)
+            return content
+                .as_deref()
+                .and_then(|content| locate_edit(content, old, new))
                 .into_iter()
                 .collect();
         }
         return Vec::new();
     };
-    let content = fs::read_to_string(absolute).ok();
     let mut ranges = Vec::new();
     for edit in edits {
-        if let Some(range) = edit.get("range") {
-            if let (Some(start), Some(end)) = (
-                range
-                    .get("start_line_number")
-                    .or_else(|| range.get("startLineNumber"))
-                    .and_then(Value::as_u64),
-                range
-                    .get("end_line_number")
-                    .or_else(|| range.get("endLineNumber"))
-                    .and_then(Value::as_u64),
-            ) {
-                let start = start.max(1) as u32;
-                let end = end.max(start as u64) as u32;
-                ranges.push((start, end));
-                continue;
-            }
+        if let Some(range) = explicit_edit_range(edit) {
+            ranges.push(range);
+            continue;
         }
+        let Some(content) = content.as_deref() else {
+            // Over the ceiling or unreadable: this edit cannot be placed, and
+            // an empty answer is what `edited_locations` reads as whole-file.
+            return Vec::new();
+        };
         let old = edit.get("old_string").and_then(Value::as_str).unwrap_or("");
         let new = edit.get("new_string").and_then(Value::as_str).unwrap_or("");
-        if let Some(content) = content.as_deref() {
-            if let Some(found) = lines_covering(content, if new.is_empty() { old } else { new }) {
-                ranges.push(found);
-                continue;
-            }
-        }
-        if let Some(found) = locate_edit_in_file(absolute, old, new) {
+        if let Some(found) = locate_edit(content, old, new) {
             ranges.push(found);
         }
     }
@@ -1535,16 +1542,31 @@ fn edit_ranges_from_payload(payload: &Value, root: &Path, absolute: &Path) -> Ve
     ranges
 }
 
-fn locate_edit_in_file(path: &Path, old: &str, new: &str) -> Option<(u32, u32)> {
-    let content = fs::read_to_string(path).ok()?;
+/// The `(start, end)` lines an edit states itself, in either spelling.
+fn explicit_edit_range(edit: &Value) -> Option<(u32, u32)> {
+    let range = edit.get("range")?;
+    let start = range
+        .get("start_line_number")
+        .or_else(|| range.get("startLineNumber"))
+        .and_then(Value::as_u64)?;
+    let end = range
+        .get("end_line_number")
+        .or_else(|| range.get("endLineNumber"))
+        .and_then(Value::as_u64)?;
+    let start = start.max(1) as u32;
+    let end = end.max(start as u64) as u32;
+    Some((start, end))
+}
+
+fn locate_edit(content: &str, old: &str, new: &str) -> Option<(u32, u32)> {
     // Prefer new_string: afterFileEdit fires after the write.
     if !new.is_empty() {
-        if let Some(range) = lines_covering(&content, new) {
+        if let Some(range) = lines_covering(content, new) {
             return Some(range);
         }
     }
     if !old.is_empty() {
-        return lines_covering(&content, old);
+        return lines_covering(content, old);
     }
     // Whole-file write with empty old_string.
     let last = content.lines().count().max(1) as u32;
@@ -3811,6 +3833,81 @@ mod tests {
                 .as_nanos(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    /// A file past `MAX_EDIT_LOCATE_BYTES` is never read: edits with their own
+    /// range keep it, and one that could only be found by its text widens to
+    /// the whole file. Before the ceiling, the un-ranged edits below each
+    /// re-read the whole file after the first pass missed them, and the needle
+    /// edit was placed by scanning it.
+    #[test]
+    fn an_edit_to_a_file_over_the_read_ceiling_uses_only_its_own_ranges() {
+        let root = scratch("edit-ceiling");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("bundle.js");
+        let mut body = String::from("line one\nneedle_line\n");
+        body.push_str(&"x".repeat(MAX_EDIT_LOCATE_BYTES as usize));
+        fs::write(&path, &body).unwrap();
+        assert!(fs::metadata(&path).unwrap().len() > MAX_EDIT_LOCATE_BYTES);
+
+        let ranged = |start: u64, end: u64| json!({"range": {"start_line_number": start, "end_line_number": end}});
+        let only_ranges = json!({
+            "file_path": path,
+            "edits": [ranged(5, 7), ranged(2, 2)],
+        });
+        let mut misses: Vec<Value> = (0..64)
+            .map(
+                |i| json!({"old_string": format!("absent {i}"), "new_string": format!("gone {i}")}),
+            )
+            .collect();
+        misses.insert(0, ranged(5, 7));
+        misses.push(json!({"old_string": "needle_line", "new_string": "needle_line"}));
+        let with_text = json!({"file_path": path, "edits": misses});
+        let top_level = json!({
+            "file_path": path,
+            "tool_input": {"old_string": "needle_line", "new_string": "needle_line"},
+        });
+
+        // Stated budget: the whole set, three calls, in under 250 ms. Without
+        // reading the file it is a stat per call; with the old re-read per
+        // missed edit it was 65 whole-file reads and scans of 2 MiB each.
+        let started = std::time::Instant::now();
+        let from_ranges = edit_ranges_from_payload(&only_ranges, &root, &path);
+        let from_text = edit_ranges_from_payload(&with_text, &root, &path);
+        let from_top = edit_ranges_from_payload(&top_level, &root, &path);
+        let elapsed = started.elapsed();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(from_ranges, vec![(5, 7), (2, 2)]);
+        assert!(
+            from_text.is_empty(),
+            "an edit that can only be placed by text widens to the whole file: {from_text:?}"
+        );
+        assert!(from_top.is_empty(), "{from_top:?}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "over-ceiling edits took {elapsed:?}"
+        );
+    }
+
+    /// Under the ceiling the one read still places every edit by its text.
+    #[test]
+    fn edits_under_the_read_ceiling_are_placed_by_their_text() {
+        let root = scratch("edit-locate");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("lib.rs");
+        fs::write(&path, "fn a() {}\nfn b() {}\nfn c() {\n    1\n}\n").unwrap();
+        let payload = json!({
+            "file_path": path,
+            "edits": [
+                {"old_string": "fn b() {}", "new_string": ""},
+                {"old_string": "", "new_string": "fn c() {\n    1\n}"},
+                {"range": {"startLineNumber": 9, "endLineNumber": 3}},
+            ],
+        });
+        let ranges = edit_ranges_from_payload(&payload, &root, &path);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(ranges, vec![(2, 2), (3, 5), (9, 9)]);
     }
 
     fn store_bearing(root: &Path) {
