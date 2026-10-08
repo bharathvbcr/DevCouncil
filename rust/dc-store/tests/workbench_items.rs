@@ -134,9 +134,25 @@ fn schema_10_profiles_migrate_with_done_archived_and_completion_recovered_from_h
     let born = get(&s, "born");
     assert_eq!(json::<i64>(&s, &born, "$.item.archived"), 1);
     assert_eq!(json::<i64>(&s, &born, "$.item.completed_at"), 6000);
+    // Every row reads in the shape a schema 11 write gives it, not only the
+    // Done ones: a reader that is not the board (an agent over MCP) must not
+    // see `archived` missing on an open task and have to guess what it means.
     let open = get(&s, "open");
-    assert_eq!(json::<Option<i64>>(&s, &open, "$.item.archived"), None);
-    assert_eq!(json::<Option<i64>>(&s, &open, "$.item.completed_at"), None);
+    assert_eq!(json::<Option<i64>>(&s, &open, "$.item.archived"), Some(0));
+    // Present and null — as a write leaves it — rather than absent.
+    let completed_type: Option<String> = s
+        .connection()
+        .query_row("SELECT json_type(?1,'$.item.completed_at')", [&open], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(completed_type.as_deref(), Some("null"));
+    assert_eq!(json::<String>(&s, &open, "$.item.checklist"), "[]");
+    assert_eq!(json::<String>(&s, &open, "$.item.links"), "[]");
+    for raw in [&streak, &born] {
+        assert_eq!(json::<String>(&s, raw, "$.item.checklist"), "[]");
+        assert_eq!(json::<String>(&s, raw, "$.item.links"), "[]");
+    }
     // The migration restates what each row meant; it spends no revision, so
     // a host holding a revision from before the upgrade can still save.
     let after: i64 = s
