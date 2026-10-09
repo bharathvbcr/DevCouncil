@@ -113,6 +113,8 @@ func TestRepositoryGitConfigProgramsDoNotRunDuringReads(t *testing.T) {
 }
 
 // markerScript writes a script that records each run and exits with status.
+// A filter (status 0) passes stdin through; anything else leaves stdin
+// unread, since an ssh transport holds it open and a reader would wait.
 func markerScript(t *testing.T, status string) (script, marker string) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
@@ -121,7 +123,11 @@ func markerScript(t *testing.T, status string) (script, marker string) {
 	dir := t.TempDir()
 	marker = filepath.Join(dir, "ran")
 	script = filepath.Join(dir, "planted.sh")
-	body := "#!/bin/sh\necho \"$0 $*\" >> \"" + marker + "\"\ncat\nexit " + status + "\n"
+	pass := ""
+	if status == "0" {
+		pass = "cat\n"
+	}
+	body := "#!/bin/sh\necho \"$0 $*\" >> \"" + marker + "\"\n" + pass + "exit " + status + "\n"
 	// #nosec G306 -- an executable stand-in; the execute bit is the point.
 	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
 		t.Fatal(err)

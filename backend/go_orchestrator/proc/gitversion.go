@@ -3,6 +3,7 @@ package proc
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -21,6 +22,9 @@ type GitVersion struct {
 }
 
 func (v GitVersion) String() string {
+	if v.Raw == "" {
+		return "of unrecognised version"
+	}
 	return fmt.Sprintf("%d.%d.%d", v.Major, v.Minor, v.Patch)
 }
 
@@ -100,6 +104,10 @@ var gitVersions sync.Map // gitBinaryKey -> GitVersion
 // it) for its version, once per binary per process. `git version` reads no
 // repository, so it runs nothing a repository names; it gets the same
 // environment as every other git DevCouncil runs all the same.
+//
+// A git that runs but gives no version this can read comes back as the zero
+// GitVersion (Raw empty), which honours nothing — the cautious reading. A
+// git that could not be run at all is an error.
 func DetectGitVersion(ctx context.Context, git string) (GitVersion, error) {
 	info, err := os.Stat(git)
 	if err != nil {
@@ -124,12 +132,16 @@ func DetectGitVersion(ctx context.Context, git string) (GitVersion, error) {
 	if timedOut {
 		return GitVersion{}, fmt.Errorf("%s version did not finish: %w", git, ctx.Err())
 	}
-	if err != nil {
+	var v GitVersion
+	var exit *exec.ExitError
+	switch {
+	case err == nil && !out.Overflowed():
+		if parsed, parseErr := ParseGitVersion(string(out.Bytes())); parseErr == nil {
+			v = parsed
+		}
+	case err == nil, errors.As(err, &exit):
+	default:
 		return GitVersion{}, fmt.Errorf("%s version: %w: %s", git, err, strings.TrimSpace(stderr.String()))
-	}
-	v, err := ParseGitVersion(string(out.Bytes()))
-	if err != nil {
-		return GitVersion{}, err
 	}
 	gitVersions.Store(key, v)
 	return v, nil

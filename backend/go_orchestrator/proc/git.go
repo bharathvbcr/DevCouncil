@@ -74,22 +74,36 @@ func (s *GitSession) Root() string { return s.root }
 // the fetch runs what the repository's config names. This is decision D9 in
 // ft-ff2153d9.
 func (s *GitSession) Command(ctx context.Context, args ...string) (*exec.Cmd, error) {
-	version, err := DetectGitVersion(ctx, s.git)
-	if err != nil {
-		return nil, &exec.Error{Name: "git", Err: err}
-	}
-	guarded := version.HonorsNoLazyFetch()
 	_, sub := splitSubcommand(args)
+	free := filterFree[sub]
+	// The version is asked only when it decides something: a filter-free
+	// read skips the config listing on a git that honours GIT_NO_LAZY_FETCH,
+	// and any other read lists the config anyway and asks the version only
+	// when the listing shows a promisor.
+	honours := false
+	if free {
+		version, err := DetectGitVersion(ctx, s.git)
+		if err != nil {
+			return nil, &exec.Error{Name: "git", Err: err}
+		}
+		honours = version.HonorsNoLazyFetch()
+	}
 	var filters []string
-	if !filterFree[sub] || !guarded {
+	if !honours {
 		config, err := s.repositoryConfig(ctx)
 		if err != nil {
 			return nil, &exec.Error{Name: "git", Err: err}
 		}
-		if config.partialClone && !guarded {
-			return nil, &exec.Error{Name: "git", Err: &LazyFetchUnguardedError{Git: s.git, Version: version, Root: s.root}}
+		if config.partialClone {
+			version, err := DetectGitVersion(ctx, s.git)
+			if err != nil {
+				return nil, &exec.Error{Name: "git", Err: err}
+			}
+			if !version.HonorsNoLazyFetch() {
+				return nil, &exec.Error{Name: "git", Err: &LazyFetchUnguardedError{Git: s.git, Version: version, Root: s.root}}
+			}
 		}
-		if !filterFree[sub] {
+		if !free {
 			filters = config.filters
 		}
 	}

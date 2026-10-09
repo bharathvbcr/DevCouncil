@@ -251,12 +251,16 @@ func TestAGitThatIgnoresNoLazyFetchRefusesOnlyAPartialClone(t *testing.T) {
 	cases := []struct {
 		version string
 		refuse  bool
+		named   string
 	}{
-		{"2.43.0", true},
-		{"2.44.0", true},
-		{"2.43.4", false},
-		{"2.44.1", false},
-		{"2.45.0 (Apple Git-160)", false},
+		{"2.43.0", true, "2.43.0"},
+		{"2.44.0", true, "2.44.0"},
+		{"2.43.4", false, ""},
+		{"2.44.1", false, ""},
+		{"2.45.0 (Apple Git-160)", false, ""},
+		// A version this cannot read is treated as one that does not honour
+		// the variable: the cautious reading.
+		{"unknown", true, "unrecognised version"},
 	}
 	for _, c := range cases {
 		t.Run(c.version, func(t *testing.T) {
@@ -279,7 +283,7 @@ func TestAGitThatIgnoresNoLazyFetchRefusesOnlyAPartialClone(t *testing.T) {
 					if got := errors.As(err, &refused); got != c.refuse {
 						t.Fatalf("git %s, %s, %v: refused = %v (%v), want %v", c.version, promisor[0], args, got, err, c.refuse)
 					}
-					if c.refuse && !strings.Contains(err.Error(), strings.Fields(c.version)[0]) {
+					if c.refuse && !strings.Contains(err.Error(), c.named) {
 						t.Fatalf("the refusal does not name the version: %v", err)
 					}
 				}
@@ -408,5 +412,28 @@ func TestASessionReadsTheConfigOncePerChange(t *testing.T) {
 	}
 	if n := configReads(t, log); n != 4 {
 		t.Fatalf("two one-off reads brought config reads to %d, want 4", n)
+	}
+}
+
+// The version is asked once per git binary per process, however many
+// sessions read with it.
+func TestTheGitVersionIsAskedOncePerBinary(t *testing.T) {
+	root := gitRepo(t)
+	log, _ := countingGit(t)
+	for range 3 {
+		if _, err := runGitCommand(t, root, "rev-parse", "HEAD"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(data), "version\n"); n != 1 {
+		t.Fatalf("three reads asked the version %d times, want 1:\n%s", n, data)
+	}
+	// rev-parse on a git that honours GIT_NO_LAZY_FETCH lists no config.
+	if n := strings.Count(string(data), "config\n"); n != 0 {
+		t.Fatalf("filter-free reads listed the config %d times, want 0", n)
 	}
 }
