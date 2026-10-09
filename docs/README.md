@@ -26,6 +26,7 @@ CLI. [Project overview](../README.md) · [Website](https://devcouncil.vbcr.dev/)
 - [Repository hygiene](repository-hygiene.md): generated state, caches and cleanup ownership.
 - [Security overview](security.md): security documentation and disclosure context.
 - [Verification sandbox security impact](verify-sandbox-security-impact.md): draft, awaiting approval, for Docker/Nix isolation of verification commands.
+- [Analysis reads security impact](git-analysis-security-impact.md): what a repository under analysis can no longer make DevCouncil run, and the owner decisions behind it (ft-ff2153d9).
 - [Model routing boundary](model-routing.md): configure models in the consuming harness.
 - [Rust workspace](../rust/README.md): native engine development and verification.
 - [Native migration follow-ups](PHASE7_LONG_TAIL.md) and [task ledger](TODO.md).

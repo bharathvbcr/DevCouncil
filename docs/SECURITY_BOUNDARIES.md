@@ -63,11 +63,39 @@ includes files pulled in through `include.path`) is set again on the command
 line to the operator's value from system, global or command scope, or to
 empty, and the driver's `required` to the operator's value or `false`. Filters
 only the operator defines, such as a global git-lfs install, keep running. A
-driver name a `-c` argument cannot spell is refused. The read is skipped for
+driver name a `-c` argument cannot spell is refused. The same listing also
+says whether the repository is a partial clone. It is read once per operation
+(`proc.GitSession` in the host): an operation's reads share it, and it is read
+again only when the repository's own config files change. It is skipped for
 `rev-parse`, `rev-list` and `log`, which never pass working-tree files through
-a filter. Submodule worktrees are left as they are: the guards reach the gits
-a diff starts inside them, and a parent's diff was not seen to run a
-submodule's own filter. The write
+a filter, on a git that honours `GIT_NO_LAZY_FETCH`.
+
+Two more ways a read could run what the repository names are closed the same
+way. A partial clone fetches a missing object from its promisor remote on
+demand, and the fetch runs `core.sshCommand`, credential helpers and remote
+helpers; every git DevCouncil runs gets `GIT_NO_LAZY_FETCH=1`, so a missing
+object fails the read loudly — never an empty diff. git honours that variable
+from 2.45.0 and in the CVE-2024-32465 maintenance releases (2.39.4, 2.40.2,
+2.41.1, 2.42.2, 2.43.4, 2.44.1); 2.44.0 does not. A git that does not honour
+it, or whose version cannot be read, still reads an ordinary clone but refuses
+a partial clone's read with an error naming its version; `devmap doctor`
+prints the git version. And asked whether a submodule is dirty, git runs a
+status inside it that runs the submodule's own filters, which the
+superproject's listing never sees: `diff` and `status` carry
+`--ignore-submodules=dirty`, and the host reports dirty submodules with a
+guarded read of each (`proc.GitSession.DirtySubmodules`), its own filters
+neutralized, run by the superproject's git.
+
+A revision a caller supplies is never an option to git. dc-regress resolves
+every revision with `rev-parse --verify --end-of-options <rev>^{commit}` and
+refuses a leading `-` before anything runs, so only an object id reaches
+`diff`, `log`, `show` or `blame`; `devmap_blast` and `devmap_suspects` refuse a
+`since` beginning with `-` before opening the store. Programs DevMap itself
+starts by name — language servers for `--lsp`, `ps` for the stale-server
+check, `rm` in the hook's detached build — are resolved outside the repository
+or run by absolute path, as is the git `dcrelease` and the golden replay run.
+
+The write
 gate already refuses writes under `.git/` in enforce mode; these guards cover a
 `.git/config` that arrived with the repository, advisory and off modes, and
 agents not routed through the gate. Integration separates the two questions
