@@ -279,7 +279,7 @@ mod tests {
     use super::*;
 
     /// The pattern-text walker the compiled matcher replaced, kept as the
-        /// oracle it is held equal to, step budget included.
+    /// oracle it is held equal to, step budget included.
     ///
     /// `*` is handled with a saved-position loop rather than recursion per
     /// character, so a pattern of many stars against a long path stays linear in
@@ -375,7 +375,9 @@ mod tests {
     #[test]
     fn compiled_matches_the_reference_walker() {
         let alphabet = ['a', 'b', '*', '?', '[', ']', '!', '-', '/'];
-        let names = ["", "a", "b", "ab", "ba", "a/b", "[", "]", "-", "!", "aab", "a[b", "abab/b"];
+        let names = [
+            "", "a", "b", "ab", "ba", "a/b", "[", "]", "-", "!", "aab", "a[b", "abab/b",
+        ];
         let mut patterns = vec![String::new()];
         let mut frontier = vec![String::new()];
         for _ in 0..4 {
@@ -393,7 +395,11 @@ mod tests {
         let mut checked = 0usize;
         for p in &patterns {
             for n in names {
-                assert_eq!(try_matches(p, n), reference(p, n), "pattern {p:?} name {n:?}");
+                assert_eq!(
+                    try_matches(p, n),
+                    reference(p, n),
+                    "pattern {p:?} name {n:?}"
+                );
                 checked += 1;
             }
         }
@@ -406,20 +412,36 @@ mod tests {
     #[test]
     fn compiled_backtracking_matches_the_reference() {
         for (pattern, name) in [
-            ("*".to_string() + &"a".repeat(2000) + "b", "a".repeat(16_000)),
+            (
+                "*".to_string() + &"a".repeat(2000) + "b",
+                "a".repeat(16_000),
+            ),
             ("*a".repeat(40) + "*b", "a".repeat(3_000)),
             ("*[a]".repeat(20) + "*b", "a".repeat(2_000) + "b"),
             ("*?*?*[!a]".to_string(), "a".repeat(500) + "b"),
         ] {
-            assert_eq!(try_matches(&pattern, &name), reference(&pattern, &name), "pattern {:.30?}", pattern);
+            assert_eq!(
+                try_matches(&pattern, &name),
+                reference(&pattern, &name),
+                "pattern {:.30?}",
+                pattern
+            );
         }
     }
 
     #[test]
     fn a_compiled_pattern_answers_many_names() {
         let p = Pattern::compile("src/*.[gr][os]").unwrap();
-        for (name, want) in [("src/a.go", true), ("src/b/c.rs", true), ("src/a.py", false)] {
-            assert_eq!(p.try_matches(&Name::new(name).unwrap()), Some(want), "{name}");
+        for (name, want) in [
+            ("src/a.go", true),
+            ("src/b/c.rs", true),
+            ("src/a.py", false),
+        ] {
+            assert_eq!(
+                p.try_matches(&Name::new(name).unwrap()),
+                Some(want),
+                "{name}"
+            );
         }
         assert!(Name::new(&"a".repeat(MAX_UNITS + 1)).is_none());
         assert!(Pattern::compile(&"a".repeat(MAX_UNITS + 1)).is_none());

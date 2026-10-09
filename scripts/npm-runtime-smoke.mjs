@@ -94,7 +94,6 @@ function main() {
   assertNotPacked(metadata, "pyproject.toml");
   assertNotPacked(metadata, "uv.lock");
   assertNotPacked(metadata, "src/devcouncil/cli/main.py");
-  assertNotPacked(metadata, "scripts/build-week-demo.sh");
   assertNotPacked(metadata, "examples/build-week-demo/calc.py");
 
   const prefix = mkdtempSync(path.join(tmpdir(), "devcouncil-npm-smoke-"));

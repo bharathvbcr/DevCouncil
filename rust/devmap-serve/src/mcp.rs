@@ -1060,7 +1060,11 @@ fn fold_name_query_aliases(object: &mut Map<String, Value>) -> Result<(), String
     Ok(())
 }
 
-fn fold_one_alias(object: &mut Map<String, Value>, singular: &str, plural: &str) -> Result<(), String> {
+fn fold_one_alias(
+    object: &mut Map<String, Value>,
+    singular: &str,
+    plural: &str,
+) -> Result<(), String> {
     let Some(value) = object.remove(singular) else {
         return Ok(());
     };
@@ -1072,7 +1076,10 @@ fn fold_one_alias(object: &mut Map<String, Value>, singular: &str, plural: &str)
             object.insert(plural.to_string(), Value::Array(vec![Value::String(text)]));
         }
         Some(Value::Array(items)) => {
-            if !items.iter().any(|item| item.as_str() == Some(text.as_str())) {
+            if !items
+                .iter()
+                .any(|item| item.as_str() == Some(text.as_str()))
+            {
                 items.push(Value::String(text));
             }
         }

@@ -71,11 +71,14 @@ Usage:
   devcouncil ast …                                     # Exec `devmap ast`
 ```
 
-First-time / standalone (no host binary yet):
+`devcouncil install` is the installer. First time (no host binary yet),
+`scripts/install.sh` builds the host into a temporary directory and runs it
+with the same arguments; standalone DevMap without Go is a cargo install:
 
 ```bash
 bash scripts/install.sh --only=devmap
-bash scripts/install.sh --help
+bash scripts/install.sh --help          # devcouncil install --help
+cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked devmap-cli
 ```
 
 There is no `uv` / Python install path.

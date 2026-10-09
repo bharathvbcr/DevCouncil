@@ -194,24 +194,28 @@ cargo test --workspace --exclude dc-glob --exclude dc-grep --exclude dc-store --
 ./verify.sh
 ```
 
-Install all four components (including `devmap`) from this workspace:
+Install all four components (including `devmap`) from this workspace with the
+host's installer (`bash scripts/install.sh analysis` when the host is not on
+PATH yet):
 
 ```bash
-bash scripts/install-components.sh
+devcouncil install analysis
 ```
 
 It builds release, **health-checks every binary before installing any of them**,
 and installs by atomic rename so a running process keeps the inode it started
-with. `PREFIX` chooses the root (default `~/.local`), `PROFILE=debug` builds
-faster, `DRY_RUN=1` builds and checks without installing, and naming components
-installs a subset:
+with. `--prefix` (or `PREFIX`) chooses the root (default `~/.local`),
+`PROFILE=debug` builds faster, `CARGO_TARGET_DIR` is honoured, and naming
+components installs a subset. `--dry-run` prints the plan and builds nothing;
+the old script's build-and-check-without-installing mode (`DRY_RUN=1`) did not
+survive the move into Go:
 
 ```bash
-DRY_RUN=1 bash scripts/install-components.sh
-PREFIX=/usr/local bash scripts/install-components.sh dcstore dcverify
+devcouncil install --dry-run analysis
+devcouncil install dcstore dcverify --prefix /usr/local
 ```
 
-The script warns when an installed component is shadowed by an older copy
+The installer warns when an installed component is shadowed by an older copy
 earlier in `PATH` — the failure mode where every subsequent symptom looks like
 the new build is broken.
 

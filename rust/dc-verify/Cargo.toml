@@ -29,7 +29,7 @@ tree-sitter-c-sharp = { workspace = true }
 [lints]
 workspace = true
 
-# Installed by scripts/install.sh. Disting this package would also ship
+# Installed by `devcouncil install`. Disting this package would also ship
 # the dcjsoncheck helper binary on every GitHub Release.
 [package.metadata.dist]
 dist = false

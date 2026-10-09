@@ -17,4 +17,6 @@ These are Python fixtures for the calculator example, not a product CLI:
 | `examples/build-week-demo/broken_calc.py` | Buggy `sub()` |
 | `examples/build-week-demo/test_calc.py` | Regression checks for `add` / `sub` |
 
-`scripts/build-week-demo.sh` now exits 2 with a retirement message.
+`scripts/build-week-demo.sh` exited 2 with a retirement message until it was
+deleted on 2026-10-08, together with `examples/todo-api/` (a planning goal for
+the same retired flow).

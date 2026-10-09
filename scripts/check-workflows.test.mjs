@@ -74,7 +74,7 @@ describe("check:workflows", () => {
       fileURLToPath(new URL("../.github/workflows/release.yml", import.meta.url)),
       "utf8",
     );
-    const artifactChecks = source.split("\n").filter((line) => line.includes("check-release.mjs --artifacts"));
+    const artifactChecks = source.split("\n").filter((line) => line.includes("./cmd/dcrelease --artifacts"));
     assert.ok(
       artifactChecks.length >= 2,
       "release.yml must run the archive gate before cargo-dist publish and again after the flattened download",

@@ -148,7 +148,7 @@ if (!goBin) {
   missing(
     "devcouncil",
     WIN32
-      ? "Build: go -C backend/go_orchestrator build -o %USERPROFILE%\\.local\\bin\\devcouncil.exe ./cmd/devcouncil\nAlso copy it to %USERPROFILE%\\.local\\bin\\dev.exe (scripts/install.ps1)."
+      ? "Build: go -C backend/go_orchestrator build -o %USERPROFILE%\\.local\\bin\\devcouncil.exe ./cmd/devcouncil\nOr run scripts\\install.ps1, which builds it and runs `devcouncil install host`."
       : "Build: go -C backend/go_orchestrator build -o ~/.local/bin/devcouncil ./cmd/devcouncil\nAlso: ln -sf devcouncil ~/.local/bin/dev"
   );
 }

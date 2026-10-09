@@ -40,14 +40,15 @@ Typer/Click/`uv run` path.
 2. **Rust `devmap`** owns the map engine; a bare `dev map` is `devmap build --manifest`
 3. Retired command names exit 2 from Go (`unknown command`) rather than a Python retirement table
 
-Install: `bash scripts/install.sh` (or `.\scripts\install.ps1` on Windows) builds the Go
-binary into `~/.local/bin` and symlinks/copies it as `dev`. Pass `--only=devmap` or
+Install: `devcouncil install` is the installer. `bash scripts/install.sh` (or
+`.\scripts\install.ps1` on Windows) is its first-time bootstrap: it builds the Go host into
+a temporary directory and runs `devcouncil install` with the same arguments, which installs
+the host into `~/.local/bin` (symlinked/copied as `dev`) and builds, health-checks and
+installs `devmap` / `dcstore` / `dcverify` / `dcgrep`. Pass `--only=devmap` or
 `-Components devmap` for the standalone code-intelligence CLI. If that directory is not on
 `PATH`, the installer prints a note — add it, or invoke `~/.local/bin/devcouncil`
-directly. `bash scripts/install-components.sh` installs `devmap` / `dcstore` /
-`dcverify` / `dcgrep`. There is no `uv run` / `uv tool install` path. After the host
-is on PATH, `devcouncil install --help` is the same catalog (`uninstall` / `disable` /
-`enable` included). Verification gates default to `off`; `devcouncil gate set --mode
+directly. There is no `uv run` / `uv tool install` path. `devcouncil install --help`
+lists the catalog (`uninstall` / `disable` / `enable` included). Verification gates default to `off`; `devcouncil gate set --mode
 advisory|enforce` is a human operator command.
 
 ## Manvi ownership

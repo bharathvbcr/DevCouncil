@@ -169,7 +169,11 @@ fn a_writer_still_refuses_a_newer_store_whatever_its_floor_says() {
         Store::unsupported_schema_versions(&err),
         Some((newer, CURRENT_SCHEMA_VERSION))
     );
-    assert_eq!(user_version(&temp.db()), newer, "the refusal must not write");
+    assert_eq!(
+        user_version(&temp.db()),
+        newer,
+        "the refusal must not write"
+    );
 }
 
 #[test]
@@ -226,7 +230,10 @@ fn a_damaged_floor_fails_closed() {
         ("text", "INSERT INTO reader_compat VALUES (1, 'twenty-six')"),
         ("real", "INSERT INTO reader_compat VALUES (1, 26.5)"),
         ("null", "INSERT INTO reader_compat VALUES (1, NULL)"),
-        ("below the oldest schema", "INSERT INTO reader_compat VALUES (1, 2)"),
+        (
+            "below the oldest schema",
+            "INSERT INTO reader_compat VALUES (1, 2)",
+        ),
         ("negative", "INSERT INTO reader_compat VALUES (1, -1)"),
         (
             "above the store's own stamp",

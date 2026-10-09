@@ -30,25 +30,30 @@ func TestDryRunDevmapDoesNotInvokeRunner(t *testing.T) {
 	}
 }
 
-func TestInstallDevmapFromCheckoutCallsComponentsScript(t *testing.T) {
+func TestInstallDevmapFromCheckoutBuildsChecksAndInstalls(t *testing.T) {
 	src := t.TempDir()
 	if err := osMkdirCheckout(src); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("CARGO_TARGET_DIR", "")
 	cs, err := Resolve([]string{"devmap"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := &fakeRunner{}
+	r := &cargoRunner{t: t, src: src}
 	prefix := t.TempDir()
-	if err := Install(cs, Options{Prefix: prefix, Runner: r, SourceRoot: src}); err != nil {
+	if err := Install(cs, Options{Prefix: prefix, Runner: r, Prober: healthyProber{}, SourceRoot: src, LookPath: noPath}); err != nil {
 		t.Fatal(err)
 	}
-	if len(r.calls) != 1 {
+	if len(r.calls) != 1 || r.calls[0] != "cargo build --release -p devmap-cli --bin devmap" {
 		t.Fatalf("calls=%v", r.calls)
 	}
-	if !strings.Contains(r.calls[0], "install-components.sh") || !strings.Contains(r.calls[0], "devmap") {
-		t.Fatalf("call=%q", r.calls[0])
+	if r.dirs[0] != filepath.Join(src, "rust") {
+		t.Fatalf("cargo ran in %s", r.dirs[0])
+	}
+	got, err := os.ReadFile(filepath.Join(prefix, "bin", rustBinaryName("devmap")))
+	if err != nil || string(got) != "built devmap" {
+		t.Fatalf("installed binary = %q, %v", got, err)
 	}
 	st := LoadState(prefix)
 	if _, ok := st.Installed["devmap"]; !ok {
@@ -116,10 +121,7 @@ func osMkdirCheckout(root string) error {
 	if err := os.WriteFile(filepath.Join(root, "backend", "go_orchestrator", "go.mod"), []byte("module x\n"), 0o644); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Join(root, "scripts"), 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(root, "scripts", "install-components.sh"), []byte("#!/bin/sh\n"), 0o755)
+	return nil
 }
 
 func TestPlannedCommandsStandaloneHasNoGoBuild(t *testing.T) {
@@ -130,10 +132,23 @@ func TestPlannedCommandsStandaloneHasNoGoBuild(t *testing.T) {
 	cs, _ := Resolve([]string{"devmap"})
 	cmds := PlannedCommands(cs, Options{SourceRoot: src, Prefix: "/opt"})
 	joined := strings.Join(cmds, "\n")
-	if strings.Contains(joined, "go ") {
+	// By command word: "cargo build" contains the substring "go build".
+	plansGo := func(cmds []string) bool {
+		for _, cmd := range cmds {
+			if strings.HasPrefix(cmd, "go ") || strings.Contains(cmd, "&& go ") || strings.Contains(cmd, "GOBIN=") {
+				return true
+			}
+		}
+		return false
+	}
+	if plansGo(cmds) {
 		t.Fatalf("standalone planned a go command:\n%s", joined)
 	}
-	if !strings.Contains(joined, "install-components.sh") || !strings.Contains(joined, "devmap") {
+	host, _ := Resolve([]string{"host"})
+	if !plansGo(PlannedCommands(host, Options{SourceRoot: src, Prefix: "/opt"})) {
+		t.Fatal("the go-command check does not recognise the host's own build")
+	}
+	if !strings.Contains(joined, "cargo build --release -p devmap-cli --bin devmap") || !strings.Contains(joined, "health-check") {
 		t.Fatalf("%s", joined)
 	}
 }

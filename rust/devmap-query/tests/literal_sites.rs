@@ -79,8 +79,7 @@ fn a_prefix_reaches_a_const_use_and_a_direct_write() {
     assert!(action("session.command"), "const COMMAND's use: {report:?}");
     assert!(
         report.items.iter().any(|site| {
-            site.value == "session.spawn"
-                && site.qualified_name.contains("spawn_session_inner")
+            site.value == "session.spawn" && site.qualified_name.contains("spawn_session_inner")
         }),
         "direct write: {report:?}"
     );
@@ -92,7 +91,10 @@ fn a_prefix_reaches_a_const_use_and_a_direct_write() {
     let exact = engine.literals("session.spawn", true, 8_000).unwrap();
     assert_eq!(exact.shown + exact.hidden, exact.total);
     assert!(exact.items.iter().all(|site| site.value == "session.spawn"));
-    assert!(exact.items.iter().any(|site| site.qualified_name.contains("spawn_session_inner")));
+    assert!(exact
+        .items
+        .iter()
+        .any(|site| site.qualified_name.contains("spawn_session_inner")));
     assert!(!exact.items.iter().any(|site| site.value.contains("edit")));
 
     let starved = engine.literals("session.", false, 1).unwrap();

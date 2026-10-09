@@ -9,8 +9,8 @@
 // have caught that, because there was no shared constant for it to disagree
 // with. One importable constant is what makes the disagreement unrepresentable.
 //
-// `scripts/check-release.mjs` parses this file with
-// `/^const Version = "([^"]+)"/m`, so the assignment must stay a quoted string
+// The release identity gate (`devcouncil/release`, run as `cmd/dcrelease`)
+// parses this file with `(?m)^const Version = "([^"]+)"`, so the assignment must stay a quoted string
 // literal on one line. It is the Go arm of the release identity check, which
 // compares this against package.json, package-lock.json, the Rust workspace
 // version and the vX.Y.Z tag before any build minutes are spent.

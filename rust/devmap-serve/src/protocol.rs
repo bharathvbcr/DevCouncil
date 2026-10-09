@@ -1417,9 +1417,13 @@ pub(crate) fn dispatch(
                 filter.as_ref(),
             )?)?)
         }
-        IpcCommand::Literals { query, exact, budget } => {
-            Ok(serde_json::to_value(engine.literals(&query, exact, budget)?)?)
-        }
+        IpcCommand::Literals {
+            query,
+            exact,
+            budget,
+        } => Ok(serde_json::to_value(
+            engine.literals(&query, exact, budget)?,
+        )?),
         IpcCommand::Affected {
             targets,
             budget,

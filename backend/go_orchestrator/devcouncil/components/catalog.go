@@ -1,8 +1,9 @@
 // Package components is the install catalog for DevCouncil binaries.
 //
-// Scripts under scripts/ remain the bootstrap (no host binary yet). The
-// `devcouncil install` CLI uses this catalog after the host exists, and the
-// two must agree on names.
+// `devcouncil install` is the one installer and this catalog is its single
+// source of names. scripts/install.sh and scripts/install.ps1 are only
+// bootstraps: they build the host into a temporary directory and run it with
+// their arguments, so they hold no catalog of their own to drift from this.
 package components
 
 import (

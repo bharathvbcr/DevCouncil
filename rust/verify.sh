@@ -104,7 +104,7 @@ cargo run --release --locked -q -p devmap-serve --example worker_recovery_probe
 # this, such a run reported "could not measure peak RSS", which is true and is
 # the wrong reason: the measurement was fine and the binary was not there.
 DEVMAP_BIN="${CARGO_TARGET_DIR:-$(pwd)/target}/release/devmap"
-# Exported so `tools/memory_model_probe.sh` and `tools/soak.sh` measure the same
+# Exported so `tools/memory_model_probe.sh` and the soak (`tools/soak`) measure the same
 # binary these gates did, rather than each resolving it again.
 export DEVMAP_BIN
 
@@ -312,10 +312,18 @@ rsync -a --chmod=u+w ./testdata/ "$SOAK_DIR/" >/dev/null 2>&1
 # Five cycles is a smoke run: the soak asserts the digest returns after every
 # restore and says in its verdict that growth was not measured. The plateau
 # needs 40 cycles or more and is a separate, longer run.
-if ./tools/soak.sh "$SOAK_DIR" 5 2>&1 | tail -2 | grep -q "SOAK SMOKE OK"; then
+# Built first, so a soak that does not compile is not reported as drift. Both
+# the exit status and the verdict line must agree; on failure the soak's own
+# last lines say which check it was.
+cargo build --release --locked -q -p devmap-soak || {
+  echo "GATE FAIL: the soak harness (devmap-soak) did not build"; rm -rf "$SOAK_DIR"; exit 1; }
+SOAK_STATUS=0
+SOAK_OUT=$(cargo run --release --locked -q -p devmap-soak -- "$SOAK_DIR" 5 2>&1) || SOAK_STATUS=$?
+if [ "$SOAK_STATUS" -eq 0 ] && printf '%s\n' "$SOAK_OUT" | tail -2 | grep -q "SOAK SMOKE OK"; then
   echo "incremental equivalence OK (5 cycles, growth not asserted)"
 else
-  echo "GATE FAIL: incremental build drifted from cold"; rm -rf "$SOAK_DIR"; exit 1
+  printf '%s\n' "$SOAK_OUT" | tail -8
+  echo "GATE FAIL: the incremental-equivalence soak failed (exit $SOAK_STATUS)"; rm -rf "$SOAK_DIR"; exit 1
 fi
 rm -rf "$SOAK_DIR"
 

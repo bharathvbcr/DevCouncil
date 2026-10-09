@@ -68,9 +68,9 @@ mod returns;
 // The type a Rust local has where its own binder states it. Walks a parse
 // tree; its one caller is `treesitter::collect_site_bindings`.
 #[cfg(feature = "parse")]
-mod rustlocal;
-#[cfg(feature = "parse")]
 mod literals;
+#[cfg(feature = "parse")]
+mod rustlocal;
 #[cfg(feature = "parse")]
 pub mod treesitter;
 pub mod tsconfig;

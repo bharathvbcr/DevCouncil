@@ -32,6 +32,13 @@ jobs:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
 
+      # check:release runs cmd/dcrelease, a standard-library Go command.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go_orchestrator/go.mod
+          cache-dependency-path: backend/go_orchestrator/go.sum
+
       - name: Release identity
         run: npm run check:release
 

@@ -749,7 +749,7 @@ SELECT m.generation_id      AS generation_id,
 ///
 /// `generation_edges` and `generation_unresolved` keep their names and their
 /// exact column sets as views over the ranges, so all twenty-odd read sites,
-/// `tools/fanout.sql`, `tools/soak.sh`, `verify.sh`'s determinism digest and
+/// `tools/fanout.sql`, the soak's digest (`tools/soak`), `verify.sh`'s determinism digest and
 /// the tests are unchanged. `ordinal` is the row's own id: it is still unique
 /// within a generation, and nothing reads it as a position any more — see
 /// `edge_read_order`, whose final key was the resolver's emission ordinal and

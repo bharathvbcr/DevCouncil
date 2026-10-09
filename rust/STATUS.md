@@ -225,7 +225,9 @@ differential run over real diffs says otherwise.
   `rust/**` is in the analysis-plane trigger paths on purpose: `dc-*` and the
   Go clients live in one repository, so a component change must run the
   client's contract tests.
-- **A build and install path.** [`scripts/install-components.sh`](../scripts/install-components.sh)
+- **A build and install path.** `devcouncil install`
+  ([`components/build.go`](../backend/go_orchestrator/devcouncil/components/build.go);
+  it replaced `scripts/install-components.sh` on 2026-10-08)
   builds all four release, health-checks each **before** installing any, and
   installs by atomic rename. Its `dcstore` check refuses a binary that does not
   report `exclusion_index: verified` — demonstrated against the stale build that

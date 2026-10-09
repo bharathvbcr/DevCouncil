@@ -1,0 +1,29 @@
+[package]
+name = "devmap-soak"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+description = "Sustained-load soak for the devmap kernel: repeated edit, rebuild and query cycles against one store"
+publish = false
+
+[[bin]]
+name = "soak"
+path = "src/main.rs"
+
+[dependencies]
+# Signals to the daemon's process group go through dc-proc's one audited
+# `kill(2)`; this crate keeps the workspace's `unsafe_code = "forbid"`.
+dc-proc = { path = "../../dc-proc" }
+rusqlite.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+# Only for SIGINT/SIGTERM: an interrupted soak must still restore the corpus
+# and stop the daemon it started, as the shell harness's EXIT trap did.
+tokio.workspace = true
+
+[lints]
+workspace = true
+
+# A gate harness, not a product binary: cargo-dist must not ship it.
+[package.metadata.dist]
+dist = false

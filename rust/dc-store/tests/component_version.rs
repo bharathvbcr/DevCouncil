@@ -10,8 +10,8 @@
 //! out, so a release does not have to edit this file; a literal here would be
 //! one more place to forget, which is the defect this test exists to prevent.
 //! That the crate takes its version from the workspace rather than declaring
-//! its own is a separate property, checked once for every crate by
-//! `scripts/check-release.mjs`.
+//! its own is a separate property, checked once for every crate by the
+//! release identity gate (`backend/go_orchestrator/devcouncil/release`).
 
 use std::process::Command;
 

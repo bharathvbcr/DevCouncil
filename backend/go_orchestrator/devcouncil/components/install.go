@@ -41,22 +41,28 @@ Components:
   dcgrep      ignore-aware search
 
 Options:
+  --only NAME         same as a positional name (repeatable)
   --list              print the catalog and exit
   --json              machine-readable list/status
   --prefix DIR        install root (default: $PREFIX or ~/.local)
-  --dry-run           print commands; do not build or copy
+  --dry-run           print the commands; build, check and copy nothing
   --yes               skip uninstall confirmation
   --all               uninstall every catalog component (required when no names)
   -h, --help          this help
 
-Bootstrap (no host binary yet):
-  bash scripts/install.sh --help
-  bash scripts/install.sh --only=devmap
-  bash scripts/install-components.sh --help
+From a checkout, Rust components are built with cargo (PROFILE=release by
+default, or debug), each build is health-checked before any is installed, and
+each binary is copied beside its destination and renamed into place. Outside a
+checkout they come from cargo install --git.
+
+Bootstrap (no host binary yet): bash scripts/install.sh [same arguments], or
+.\scripts\install.ps1 on Windows. Each builds cmd/dcinstall (this command,
+without the Gusset engine the host links) into a temporary directory and runs
+it. Installing the host still needs Gusset checked out beside DevCouncil. Without Go, devmap alone installs with:
+  cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked devmap-cli
 
 There is no uv / Python install path. Components are native Go and Rust
-binaries. cargo install --git and the scripts above are the supported
-first-time routes; this command is for once the host is on PATH.
+binaries.
 
 Examples:
   devcouncil install devmap
@@ -104,7 +110,17 @@ type Options struct {
 	DryRun     bool
 	Yes        bool
 	SourceRoot string
-	Runner     Runner
+	// Profile is the cargo profile for checkout builds: "release" or
+	// "debug". Empty reads $PROFILE, then defaults to release.
+	Profile string
+	Runner  Runner
+	Prober  Prober
+	// LookPath resolves a binary name on PATH for the post-install report.
+	LookPath func(string) (string, error)
+	// CgoEnv builds the Gusset engine in the checkout rooted at its argument
+	// and returns the environment that links the host against it. Unix only;
+	// nil means rust/gusset-engine/cgo-env.sh.
+	CgoEnv func(src string) ([]string, error)
 }
 
 func (o Options) runner() Runner {
@@ -112,6 +128,27 @@ func (o Options) runner() Runner {
 		return o.Runner
 	}
 	return ExecRunner{}
+}
+
+func (o Options) prober() Prober {
+	if o.Prober != nil {
+		return o.Prober
+	}
+	return ExecProber{}
+}
+
+func (o Options) cgoEnv() func(string) ([]string, error) {
+	if o.CgoEnv != nil {
+		return o.CgoEnv
+	}
+	return engineCgoEnv
+}
+
+func (o Options) lookPath() func(string) (string, error) {
+	if o.LookPath != nil {
+		return o.LookPath
+	}
+	return exec.LookPath
 }
 
 func (o Options) prefix() string {
@@ -164,6 +201,10 @@ func PlannedCommands(cs []Component, o Options) []string {
 	if IncludesHost(cs) {
 		if src != "" {
 			out := filepath.Join(prefix, "bin", hostBinaryName())
+			if runtime.GOOS != "windows" {
+				cmds = append(cmds, fmt.Sprintf("bash %s  # build the Gusset engine; its CGO_* lines go to the next command",
+					shellQuote(filepath.Join(src, "rust", "gusset-engine", "cgo-env.sh"))))
+			}
 			cmds = append(cmds, fmt.Sprintf("go -C %s build -o %s ./cmd/devcouncil",
 				shellQuote(filepath.Join(src, "backend", "go_orchestrator")), shellQuote(out)))
 			cmds = append(cmds, fmt.Sprintf("ln -sf %s %s", hostBinaryName(), shellQuote(filepath.Join(prefix, "bin", "dev"))))
@@ -176,8 +217,25 @@ func PlannedCommands(cs []Component, o Options) []string {
 		return cmds
 	}
 	if src != "" {
-		script := filepath.Join(src, "scripts", "install-components.sh")
-		cmds = append(cmds, fmt.Sprintf("PREFIX=%s bash %s %s", shellQuote(prefix), shellQuote(script), strings.Join(rust, " ")))
+		profile, err := o.profile()
+		if err != nil {
+			return append(cmds, err.Error())
+		}
+		cs, err := rustComponents(rust)
+		if err != nil {
+			return append(cmds, err.Error())
+		}
+		workspace := filepath.Join(src, "rust")
+		builtDir := filepath.Join(cargoTargetDir(workspace), profile)
+		for _, c := range cs {
+			cmds = append(cmds, fmt.Sprintf("(cd %s && cargo %s)", shellQuote(workspace), joinQuoted(cargoBuildArgs(c, profile))))
+		}
+		for _, c := range cs {
+			built := filepath.Join(builtDir, rustBinaryName(c.Binary))
+			dest := filepath.Join(prefix, "bin", rustBinaryName(c.Binary))
+			cmds = append(cmds, fmt.Sprintf("health-check %s, then copy it beside %s and rename it into place",
+				shellQuote(built), shellQuote(dest)))
+		}
 		return cmds
 	}
 	for _, id := range rust {
@@ -254,26 +312,30 @@ func Install(cs []Component, o Options) error {
 		return err
 	}
 	src := o.source()
-	run := o.runner()
 	st := LoadState(prefix)
 
 	var firstErr error
+	var names []string
 	if IncludesHost(cs) {
-		if err := installHost(src, prefix, run); err != nil {
+		if err := installHost(src, prefix, o); err != nil {
 			return err
 		}
 		st.Record("host", filepath.Join(bindir, hostBinaryName()))
+		names = append(names, hostBinaryName())
 	}
 
 	rust := RustIDs(cs)
 	if len(rust) > 0 {
-		if err := installRust(src, prefix, rust, run); err != nil {
+		installed, err := installRust(src, prefix, rust, o)
+		// A checkout install that stopped part-way still put these on disk;
+		// the receipt must say so or uninstall cannot find them.
+		for _, id := range installed {
+			st.Record(id, filepath.Join(bindir, rustBinaryName(id)))
+			st.SetDisabled(id, false)
+			names = append(names, rustBinaryName(id))
+		}
+		if err != nil {
 			firstErr = err
-		} else {
-			for _, id := range rust {
-				st.Record(id, filepath.Join(bindir, rustBinaryName(id)))
-				st.SetDisabled(id, false)
-			}
 		}
 	}
 	if err := SaveState(st); err != nil {
@@ -282,17 +344,37 @@ func Install(cs []Component, o Options) error {
 		}
 		return err
 	}
+	for _, note := range resolutionNotes(bindir, names, o.lookPath()) {
+		console.Errorln(note)
+	}
+	if firstErr == nil && IncludesHost(cs) {
+		printLocalModelHint()
+	}
 	return firstErr
 }
 
-func installHost(src, prefix string, run Runner) error {
+func installHost(src, prefix string, o Options) error {
+	run := o.runner()
 	bindir := filepath.Join(prefix, "bin")
 	out := filepath.Join(bindir, hostBinaryName())
 	if src != "" {
 		mod := filepath.Join(src, "backend", "go_orchestrator")
-		if err := run.Run("go", []string{"build", "-o", out, "./cmd/devcouncil"}, mod, nil); err != nil {
+		// On Unix the host links the Gusset engine. A plain go build fails at
+		// link on a fresh clone, and after an engine rebuild relinks the old
+		// archive from Go's cache; cgo-env.sh builds the engine and keys the
+		// cgo flags on the archive's hash. Its own message says what is
+		// missing when the Gusset checkout is not beside DevCouncil.
+		var env []string
+		if runtime.GOOS != "windows" {
+			var err error
+			if env, err = o.cgoEnv()(src); err != nil {
+				return fmt.Errorf("build host: %w", err)
+			}
+		}
+		if err := run.Run("go", []string{"build", "-o", out, "./cmd/devcouncil"}, mod, env); err != nil {
 			return fmt.Errorf("build host: %w", err)
 		}
+		signForMacOS(out, run)
 	} else {
 		if err := run.Run("go", []string{"install", HostGoInstall}, "",
 			[]string{"GOBIN=" + bindir}); err != nil {
@@ -306,7 +388,7 @@ func installDevLink(bindir string) error {
 	if runtime.GOOS == "windows" {
 		src := filepath.Join(bindir, "devcouncil.exe")
 		dest := filepath.Join(bindir, "dev.exe")
-		if err := copyFile(src, dest); err != nil {
+		if err := installAtomic(src, dest); err != nil {
 			return fmt.Errorf("install dev.exe: %w", err)
 		}
 		return nil
@@ -357,36 +439,26 @@ func classifyDevLink(dest string) (devLinkKind, error) {
 	return devLinkForeign, fmt.Errorf("refusing to replace %s (not a symlink to our binary)", dest)
 }
 
-func installRust(src, prefix string, ids []string, run Runner) error {
+// installRust builds from the checkout when there is one, and otherwise
+// installs from the public repository with cargo. It returns the IDs it put
+// on disk, which a failure part-way through can leave non-empty.
+func installRust(src, prefix string, ids []string, o Options) ([]string, error) {
 	if src != "" {
-		script := filepath.Join(src, "scripts", "install-components.sh")
-		if _, err := os.Stat(script); err == nil {
-			args := append([]string{script}, ids...)
-			env := []string{"PREFIX=" + prefix}
-			if err := run.Run("bash", args, src, env); err != nil {
-				return fmt.Errorf("install-components.sh: %w", err)
-			}
-			return nil
-		}
+		return installRustFromCheckout(src, prefix, ids, o)
 	}
+	run := o.runner()
+	var installed []string
 	for _, id := range ids {
 		name, args, err := cargoInstallArgs(id, prefix)
 		if err != nil {
-			return err
+			return installed, err
 		}
 		if err := run.Run(name, args, "", nil); err != nil {
-			return fmt.Errorf("%s: %w", id, err)
+			return installed, fmt.Errorf("%s: %w", id, err)
 		}
+		installed = append(installed, id)
 	}
-	return nil
-}
-
-func copyFile(src, dest string) error {
-	data, err := os.ReadFile(src)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(dest, data, 0o755)
+	return installed, nil
 }
 
 // Uninstall removes binaries we have a receipt for, or that live in $PREFIX/bin

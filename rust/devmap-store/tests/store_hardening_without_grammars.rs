@@ -986,7 +986,8 @@ fn every_migration_step_is_re_entrant_from_every_version() {
 /// Every SQL statement the gate scripts hand-write must parse against the
 /// schema this binary creates.
 ///
-/// `verify.sh` and `tools/*.sh` query the store with `sqlite3` and literal SQL.
+/// `verify.sh` and `tools/*.sh` query the store with `sqlite3` and literal SQL,
+/// and the harnesses under `tools/*/src/` embed it in Rust string literals.
 /// Nothing compiles that SQL and, until this test, nothing ran it outside a
 /// full gate pass -- so a schema change could leave a gate script naming a
 /// column that no longer existed and the tree would still be green through
@@ -1021,7 +1022,9 @@ fn every_sql_statement_the_gate_scripts_embed_parses_against_the_current_schema(
     // tomorrow, and a bare glob stops covering one that is renamed or moved
     // out of `tools/` without anyone noticing the set shrank. So the set is
     // discovered -- `verify.sh` plus every `.sh` under `tools/` -- and then
-    // checked against the files known to carry SQL today.
+    // checked against the files known to carry SQL today. A harness written in
+    // Rust (`tools/<name>/src/*.rs`) is a gate script too: its SQL is a string
+    // literal no compiler checks against the schema either.
     let mut scripts: Vec<std::path::PathBuf> = vec![root.join("verify.sh")];
     let tools = root.join("tools");
     let listing = fs::read_dir(&tools)
@@ -1030,6 +1033,19 @@ fn every_sql_statement_the_gate_scripts_embed_parses_against_the_current_schema(
         let path = entry.expect("a readable directory entry").path();
         if path.extension().is_some_and(|extension| extension == "sh") {
             scripts.push(path);
+        } else if path.join("src").is_dir() {
+            let sources = fs::read_dir(path.join("src")).unwrap_or_else(|error| {
+                panic!("{} is unreadable: {error}", path.join("src").display())
+            });
+            for source in sources {
+                let source = source.expect("a readable directory entry").path();
+                if source
+                    .extension()
+                    .is_some_and(|extension| extension == "rs")
+                {
+                    scripts.push(source);
+                }
+            }
         }
     }
     scripts.sort();
@@ -1051,7 +1067,11 @@ fn every_sql_statement_the_gate_scripts_embed_parses_against_the_current_schema(
     // scripts are meant to be picked up without editing this -- but a rename
     // that moved one of these out of the glob's reach would otherwise take its
     // coverage with it and leave every assertion below still passing.
-    for required in ["verify.sh", "tools/memory_model_probe.sh", "tools/soak.sh"] {
+    for required in [
+        "verify.sh",
+        "tools/memory_model_probe.sh",
+        "tools/soak/src/store.rs",
+    ] {
         assert!(
             sources.iter().any(|(name, _)| name == required),
             "{required} is no longer among the discovered gate scripts {:?}; if it \
@@ -1095,6 +1115,20 @@ fn every_sql_statement_the_gate_scripts_embed_parses_against_the_current_schema(
         "the extractor found {} of {openers} embedded statements, so it is dropping some",
         found.len()
     );
+    // Discovered is not the same as covered: each file known to carry SQL must
+    // contribute a statement, or a literal the extractor cannot see (lower
+    // case, a leading newline) would drop out while the file stayed listed.
+    for required in [
+        "verify.sh",
+        "tools/memory_model_probe.sh",
+        "tools/soak/src/store.rs",
+    ] {
+        assert!(
+            found.iter().any(|(name, _)| name == required),
+            "{required} contributed no embedded SQL statement; if its queries moved, \
+             follow them, and if they changed form, teach the extractor"
+        );
+    }
     // The specific coupling that broke, pinned so a future change that stops
     // reading the ledger from a gate script has to say so here.
     assert!(

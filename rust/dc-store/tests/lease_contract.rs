@@ -79,7 +79,10 @@ fn shape(conn: &Connection, table: &str) -> TableShape {
         .unwrap();
     let indexes = stmt
         .query_map([table], |row| {
-            Ok((row.get::<_, String>(0)?, normalise(&row.get::<_, String>(1)?)))
+            Ok((
+                row.get::<_, String>(0)?,
+                normalise(&row.get::<_, String>(1)?),
+            ))
         })
         .unwrap()
         .collect::<rusqlite::Result<_>>()
@@ -106,7 +109,9 @@ fn drift(document_sql: &str, store: &Connection) -> (Vec<String>, Vec<String>) {
         let want = shape(&documented, table);
         let have = shape(store, table);
         if have.columns.is_empty() {
-            problems.push(format!("{table}: documented, but the store has no such table"));
+            problems.push(format!(
+                "{table}: documented, but the store has no such table"
+            ));
             continue;
         }
         if want.columns != have.columns {
@@ -159,10 +164,15 @@ fn a_drifted_document_is_reported() {
     let sql = sql_blocks(&markdown);
     let (_dir, store) = real_store();
     let dropped_column = sql.replacen("    released_at VARCHAR,\n", "", 1);
-    assert_ne!(dropped_column, sql, "fixture: the column to drop must exist");
+    assert_ne!(
+        dropped_column, sql,
+        "fixture: the column to drop must exist"
+    );
     let (_, problems) = drift(&dropped_column, &store);
     assert!(
-        problems.iter().any(|p| p.starts_with("task_leases: columns differ")),
+        problems
+            .iter()
+            .any(|p| p.starts_with("task_leases: columns differ")),
         "a dropped column must be reported: {problems:?}"
     );
     let dropped_index = sql.replacen(
@@ -173,7 +183,9 @@ fn a_drifted_document_is_reported() {
     assert_ne!(dropped_index, sql, "fixture: the index to drop must exist");
     let (_, problems) = drift(&dropped_index, &store);
     assert!(
-        problems.iter().any(|p| p.starts_with("task_leases: indexes differ")),
+        problems
+            .iter()
+            .any(|p| p.starts_with("task_leases: indexes differ")),
         "a missing index must be reported: {problems:?}"
     );
 }
