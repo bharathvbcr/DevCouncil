@@ -17,6 +17,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -28,6 +29,7 @@ import (
 	"time"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/release"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 )
 
 const usage = "Usage: go -C backend/go_orchestrator run ./cmd/dcrelease [--tag vX.Y.Z [--tag-at-head]] [--artifacts DIR] [--root DIR]"
@@ -78,8 +80,15 @@ func revParse(root, rev string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", "-C", root, "rev-parse", "-q", "--verify", rev+"^{commit}")
-	out, err := cmd.Output()
-	sha := strings.TrimSpace(string(out))
+	proc.ConfigureGroup(cmd)
+	cmd.WaitDelay = 2 * time.Second
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	err, timedOut := proc.RunBounded(ctx, cmd.Run)
+	if timedOut {
+		return "", fmt.Errorf("git rev-parse %s timed out after 30s", rev)
+	}
+	sha := strings.TrimSpace(out.String())
 	var exit *exec.ExitError
 	if err != nil && !(errors.As(err, &exit) && exit.ExitCode() == 1 && sha == "") {
 		return "", fmt.Errorf("git rev-parse %s: %w", rev, err)

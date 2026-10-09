@@ -345,9 +345,16 @@ func printLocalModelHint() {
 	}
 	ctx, cancel := context.WithTimeout(console.Context(), 5*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "sysctl", "-n", "hw.memsize").Output()
-	ram, perr := strconv.ParseUint(strings.TrimSpace(string(out)), 10, 64)
-	if err != nil || perr != nil {
+	cmd := exec.CommandContext(ctx, "sysctl", "-n", "hw.memsize")
+	proc.ConfigureGroup(cmd)
+	cmd.WaitDelay = time.Second
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err, timedOut := proc.RunBounded(ctx, cmd.Run); err != nil || timedOut {
+		return
+	}
+	ram, err := strconv.ParseUint(strings.TrimSpace(out.String()), 10, 64)
+	if err != nil {
 		return
 	}
 	_, lookErr := exec.LookPath("ollama")
