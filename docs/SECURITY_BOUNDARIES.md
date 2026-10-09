@@ -26,7 +26,13 @@ refused, never replaced; otherwise PATH, then `~/.local/bin` only when PATH has
 no candidate at all. A refused PATH candidate is not passed over for the
 fallback, and the fallback is held to the same canonical outside-root check.
 The resolved path is what runs; a client is never left holding a bare name for
-exec to search PATH again. The host's git runners (`get_diff`, repository
+exec to search PATH again. "Inside the repository" means inside its top, not
+inside the root a command was handed: run from `repo/backend`, a planted
+`repo/tools/bin/devmap` is still refused. The top is found without running
+git — the nearest directory above the root holding a `.git` (directory or
+file), else the nearest holding a `.devcouncil` directory, else the root — and
+the walk stops at the nearest `.git`, so a home directory that is itself a
+repository does not swallow `~/.local/bin` for the checkouts beneath it. The host's git runners (`get_diff`, repository
 probing and verification's diff) resolve `git` through `proc.LookPathOutside`
 too.
 
