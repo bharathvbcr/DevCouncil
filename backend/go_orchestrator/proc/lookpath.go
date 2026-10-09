@@ -118,7 +118,9 @@ func ResolveComponent(name, root string, override Override) (string, error) {
 	return outsideRoot(name, candidate, rootDir)
 }
 
-// resolveRoot identifies root, where empty means the working directory.
+// resolveRoot identifies root, where empty means the working directory. A
+// root that does not exist yields nil: it contains no program, and the
+// caller's own command reports the missing root.
 func resolveRoot(root string) (os.FileInfo, error) {
 	if root == "" {
 		var err error
@@ -127,7 +129,11 @@ func resolveRoot(root string) (os.FileInfo, error) {
 			return nil, err
 		}
 	}
-	return os.Stat(root)
+	info, err := os.Stat(root)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	return info, err
 }
 
 // outsideRoot returns candidate's canonical path, refusing it when that lies
@@ -156,8 +162,11 @@ func outsideRoot(name, candidate string, rootDir os.FileInfo) (string, error) {
 
 // within reports whether path, or any directory above it, is dir. Each
 // ancestor is compared by identity; one that cannot be examined is an error,
-// never an answer of "outside".
+// never an answer of "outside". A nil dir is a root that does not exist.
 func within(path string, dir os.FileInfo) (bool, error) {
+	if dir == nil {
+		return false, nil
+	}
 	for current := path; ; {
 		info, err := os.Stat(current)
 		if err != nil {

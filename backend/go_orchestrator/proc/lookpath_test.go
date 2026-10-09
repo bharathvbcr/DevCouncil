@@ -362,3 +362,16 @@ func TestResolveComponentRefusesLocalBinUnderCaseVariantRoot(t *testing.T) {
 		t.Fatalf("resolved %q under a root spelled in another case (err %v)", got, err)
 	}
 }
+
+// A root that does not exist contains nothing; the program is found and the
+// caller's own command reports the missing root.
+func TestLookPathOutsideTreatsMissingRootAsContainingNothing(t *testing.T) {
+	base := t.TempDir()
+	installed := filepath.Join(base, "usr", "bin", "tool-under-test")
+	writeExecutable(t, installed)
+	t.Setenv("PATH", filepath.Dir(installed))
+
+	if _, err := LookPathOutside("tool-under-test", filepath.Join(base, "no-such-repo")); err != nil {
+		t.Fatalf("a missing root refused an installation outside it: %v", err)
+	}
+}

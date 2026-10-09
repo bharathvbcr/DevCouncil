@@ -43,3 +43,15 @@ func TestRepositoryLocalGitIsNotRun(t *testing.T) {
 		t.Fatalf("reason does not name the refusal: %q", state.Reason)
 	}
 }
+
+// A root that does not exist contains no program, so git is still run and
+// says what is wrong: this is not a repository. Resolution must not turn
+// that into "could not run git".
+func TestMissingRootIsNotARepositoryRatherThanNoGit(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "no-such-repo")
+
+	state := devcouncil.ProbeGitRepoState(context.Background(), missing)
+	if state.InRepo == nil || *state.InRepo {
+		t.Fatalf("a missing root read as %+v, want InRepo=false", state)
+	}
+}
