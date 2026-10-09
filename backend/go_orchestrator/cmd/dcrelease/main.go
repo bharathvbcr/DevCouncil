@@ -81,11 +81,18 @@ func parseArgs(argv []string) (args, error) {
 
 // revParse resolves rev to a commit sha, or "" when no such rev exists. A git
 // that cannot run is an error, never an empty answer.
+//
+// The command comes from proc.GitCommand, so the git that answers is found
+// outside the repository and carries the host's guards: a git the checkout
+// carries on PATH could otherwise name any commit as HEAD, and would run with
+// the releaser's authority. --end-of-options keeps rev a revision.
 func revParse(root, rev string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", "-C", root, "rev-parse", "-q", "--verify", rev+"^{commit}")
-	proc.ConfigureGroup(cmd)
+	cmd, err := proc.GitCommand(ctx, root, "rev-parse", "-q", "--verify", "--end-of-options", rev+"^{commit}")
+	if err != nil {
+		return "", fmt.Errorf("git rev-parse %s: %w", rev, err)
+	}
 	cmd.WaitDelay = 2 * time.Second
 	var out bytes.Buffer
 	cmd.Stdout = &out

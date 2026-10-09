@@ -128,6 +128,35 @@ func TestTagAtHeadOutsideAGitCheckoutCouldNotRun(t *testing.T) {
 	}
 }
 
+// The git that answers rev-parse is never one the checkout carries. A
+// planted git on PATH inside the root could otherwise name any commit as
+// HEAD and pass the tag check, and it would run with the releaser's
+// authority. It is refused and never started; the check could not run.
+func TestTagAtHeadNeverRunsAGitInsideTheRoot(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(t.TempDir(), "planted-git-ran")
+	bin := filepath.Join(root, "tools", "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\n: > '" + marker + "'\necho 0123456789abcdef0123456789abcdef01234567\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+
+	code, _, stderr := runArgs("--root", root, "--tag", "v0.2.2", "--tag-at-head")
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatalf("the repository's git ran (exit %d, stderr %q)", code, stderr)
+	}
+	if code != 2 || !strings.Contains(stderr, "inside the repository") {
+		t.Fatalf("exit %d, stderr %q; want could-not-run naming the refusal", code, stderr)
+	}
+}
+
 // Under `go -C` the working directory is the module, so a relative --root
 // would inspect backend/go_orchestrator and report "missing package.json" —
 // a mismatch for the wrong reason. It is a usage error instead.
