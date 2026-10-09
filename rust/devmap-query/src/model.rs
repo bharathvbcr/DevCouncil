@@ -466,6 +466,12 @@ pub struct SymbolHit {
     /// consumers see no new key for top-level symbols.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_indent: Option<String>,
+    /// `"secret_path"` when the file is one of `policy.SecretPathPatterns`.
+    /// The location is reported and the text is not: an empty `source_span` with
+    /// this set was withheld, which is a different answer from a symbol whose
+    /// span is empty or a file that could not be read. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withheld: Option<String>,
     pub score: f32,
 }
 
@@ -569,6 +575,12 @@ pub struct ExploreDefinition {
     /// `source` is the whole span.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_omitted_bytes: Option<u32>,
+    /// `"secret_path"` when the file is one of `policy.SecretPathPatterns`.
+    /// The location is reported and the text is not: an empty `source` with
+    /// this set was withheld, which is a different answer from a symbol whose
+    /// span is empty or a file that could not be read. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withheld: Option<String>,
     pub score: f32,
     /// Inbound edges. A whole [`Response`], so `total` stays exact even when
     /// the budget bought no items — "0 shown of 42" is not "no callers".
@@ -621,9 +633,16 @@ pub struct ExploreReport {
 pub struct LiteralSite {
     pub file_path: String,
     pub line: u32,
+    /// The literal's text, or `secret::WITHHELD_LITERAL_VALUE` when
+    /// `withheld` is set.
     pub value: String,
     pub qualified_name: String,
     pub symbol_name: String,
+    /// `"secret_path"` when the file is one of `policy.SecretPathPatterns`.
+    /// The location is reported and the text is not: `value` is the
+    /// withheld marker, never the string the file writes. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withheld: Option<String>,
 }
 
 /// Where a string value is written.
@@ -795,6 +814,12 @@ pub struct SkeletonSymbol {
     /// silent hole.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature_note: Option<String>,
+    /// `"secret_path"` when the file is one of `policy.SecretPathPatterns`.
+    /// The span is reported and the declaration text is not: `signature` is
+    /// absent and `signature_note` says it was withheld rather than not
+    /// extracted. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withheld: Option<String>,
 }
 
 /// File signatures without bodies, budgeted like every other query envelope.

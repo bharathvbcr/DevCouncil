@@ -151,6 +151,16 @@ fn emit_evidence_pack(pack: &devmap_query::EvidencePack) {
                 continue;
             }
             outln!("");
+            if let Some(withheld) = &unit.hit.withheld {
+                outln!(
+                    "Source {} lines {}-{} ({}): withheld: {withheld}",
+                    file.file_path,
+                    unit.hit.span.0,
+                    unit.hit.span.1,
+                    unit.qualified_name
+                );
+                continue;
+            }
             if let Some(reason) = &unit.hit.source_unavailable_reason {
                 outln!(
                     "Source {} ({}): {reason}",

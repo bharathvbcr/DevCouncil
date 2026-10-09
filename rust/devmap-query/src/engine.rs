@@ -1508,6 +1508,7 @@ impl<'a> StoreQueryEngine<'a> {
                 source: hit.source_span,
                 source_unavailable_reason: hit.source_unavailable_reason,
                 source_omitted_bytes: hit.source_span_omitted_bytes,
+                withheld: hit.withheld,
                 score: hit.score,
                 callers: budget_take(Vec::new(), 0, |_| EDGE_TOKENS),
                 callees: budget_take(Vec::new(), 0, |_| EDGE_TOKENS),
@@ -2035,6 +2036,10 @@ impl<'a> StoreQueryEngine<'a> {
         .ok();
         let line_index = on_disk.as_deref().map(LineIndex::new);
         let lines_from_bytes = line_index.is_none();
+        // A secret file's declarations are its own text, so a skeleton of one
+        // gives the spans and withholds the signatures.
+        let withheld = devmap_extract::secret::is_secret_path(&path)
+            .then(|| devmap_extract::secret::WITHHELD_SECRET_PATH.to_string());
 
         let mut items: Vec<SkeletonSymbol> = extraction
             .symbols
@@ -2048,6 +2053,13 @@ impl<'a> StoreQueryEngine<'a> {
                     ),
                 };
                 let (signature, signature_note) = match &sym.signature {
+                    _ if withheld.is_some() => (
+                        None,
+                        Some(format!(
+                            "withheld: {}",
+                            devmap_extract::secret::WITHHELD_SECRET_PATH
+                        )),
+                    ),
                     Some(text) if !text.is_empty() => (Some(text.clone()), None),
                     _ => (None, Some("not extracted".to_string())),
                 };
@@ -2061,6 +2073,7 @@ impl<'a> StoreQueryEngine<'a> {
                     lines_from_bytes,
                     signature,
                     signature_note,
+                    withheld: withheld.clone(),
                 }
             })
             .collect();
@@ -2247,12 +2260,20 @@ impl<'a> StoreQueryEngine<'a> {
         let mut items = Vec::new();
         let mut tokens_used = 0u32;
         for row in page.rows {
+            // The extractor stores what `literal_value_for` keeps; asked again
+            // here because a store written before that rule still holds the
+            // values until it is rebuilt.
+            let withheld = devmap_extract::secret::is_secret_path(&row.file_path)
+                .then(|| devmap_extract::secret::WITHHELD_SECRET_PATH.to_string());
+            let value =
+                devmap_extract::secret::literal_value_for(&row.file_path, &row.value).into_owned();
             let site = LiteralSite {
                 file_path: row.file_path,
                 line: row.line,
-                value: row.value,
+                value,
                 qualified_name: row.qualified_name,
                 symbol_name: row.symbol_name,
+                withheld,
             };
             let cost = literal_site_tokens(&site);
             if cost > token_budget.saturating_sub(tokens_used) {

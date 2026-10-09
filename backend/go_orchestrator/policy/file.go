@@ -340,23 +340,42 @@ func (g FileGate) EvaluateRead(path string, task *dc.Task) (d Decision) {
 	return allow("Read is allowed.", normalized, taskID)
 }
 
-// ReadRefused reports whether a path would be refused to a reader, without
-// building a decision for it.
+// ReadClass is what a reader is told about one path: allowed, refused because
+// it escapes the root, or refused because its contents are credentials.
+type ReadClass int
+
+const (
+	ReadAllowed ReadClass = iota
+	// ReadOutsideRoot is a path that resolves outside the repository. A caller
+	// filtering a result set treats it as an attack on the read, not as a file
+	// to leave out.
+	ReadOutsideRoot
+	// ReadSecretPath is a path under SecretPathPatterns. A caller filtering a
+	// result set omits its contents and says so, rather than failing the whole
+	// result: one credential file must not make every other file unreadable.
+	ReadSecretPath
+)
+
+// ClassifyRead reports whether a path would be refused to a reader, and why,
+// without building a decision for it.
 //
-// It exists for the callers that filter a result set — a search returning lines
+// It exists for the callers that filter a result set — a diff returning hunks
 // from many files — where the question is asked once per file and a full
 // decision per hit would be recorded noise rather than a record.
 //
-// It uses fnmatch directly, not a Matcher. It returns a bool with nowhere to
-// put an engine error except "refused", and it is asked once per hit of a
-// search; its answer is the one a FileGate with GoMatcher gives, which every
-// Matcher is required to equal.
-func ReadRefused(root, path string) bool {
+// It uses fnmatch directly, not a Matcher. It has nowhere to put an engine
+// error except "refused", and it is asked once per file of a result; its
+// answer is the one a FileGate with GoMatcher gives, which every Matcher is
+// required to equal.
+func ClassifyRead(root, path string) ReadClass {
 	normalized, outside := NormalizeRepoPath(root, path)
 	if outside {
-		return true
+		return ReadOutsideRoot
 	}
-	return fnmatch.MatchAnyFold(SecretPathPatterns, normalized)
+	if fnmatch.MatchAnyFold(SecretPathPatterns, normalized) {
+		return ReadSecretPath
+	}
+	return ReadAllowed
 }
 
 // scopeRemedy closes every unplanned-scope refusal. It used to say "Expand

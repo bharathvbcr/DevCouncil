@@ -569,7 +569,14 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// the resolver joins to a Metal entry point of that name. Served warm, a row
 /// without them leaves every macro-stamped kernel unsearchable and every
 /// `pipeline("…")` host unlinked.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "77";
+///
+/// v78 withholds what a secret file (`policy.SecretPathPatterns`) writes: its
+/// literal values become `secret::WITHHELD_LITERAL_VALUE`, its docstrings are
+/// dropped and its string-made references removed. A v77 row for such a file
+/// holds the credentials themselves, and since a row is reused for as long as
+/// the file is unchanged, it would keep serving them — and keep them in a
+/// store that is copied between worktrees — until someone edited the file.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "78";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

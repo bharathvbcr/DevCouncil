@@ -34,11 +34,16 @@ const (
 )
 
 // DiffFile is one path in a get_diff payload.
+//
+// Withheld names why its hunks are absent from unified_diff; today the only
+// reason is policy.WithheldSecretPath. The file is still listed, so a reader
+// knows it changed without being shown what it holds.
 type DiffFile struct {
 	Path      string `json:"path"`
 	Status    string `json:"status"`
 	Additions int    `json:"additions"`
 	Deletions int    `json:"deletions"`
+	Withheld  string `json:"withheld,omitempty"`
 }
 
 // DiffResult is the Python MCP get_diff success shape.
@@ -292,6 +297,19 @@ func gitDiff(ctx context.Context, root string, paths []string, staged bool) (Dif
 	if combined != "" {
 		combined += "\n"
 	}
+	// Tracked and untracked text alike, and before truncation, so the limit is
+	// spent on what the reader may see.
+	combined, withheldNames := policy.WithholdSecretDiff(combined)
+	withheld := make(map[string]struct{}, len(withheldNames))
+	for _, name := range withheldNames {
+		withheld[name] = struct{}{}
+	}
+	for i := range files {
+		_, named := withheld[files[i].Path]
+		if named || policy.SecretPathSpelling(files[i].Path) {
+			files[i].Withheld = policy.WithheldSecretPath
+		}
+	}
 	unified, truncated := TruncateText(combined, DiffOutputLimit)
 	return DiffResult{
 		OK: true, Files: files, UnifiedDiff: unified, Truncated: truncated, Staged: staged,
@@ -342,9 +360,15 @@ func collectUntracked(root string, paths []string, known map[string]struct{}) (f
 			return nil, "", fmt.Sprintf("untracked diff exceeds %d-file input limit; narrow the requested paths", untrackedFileLimit)
 		}
 		// Git's NUL-delimited names are native file names. Use policy only
-		// for authorization; never reopen its normalized spelling.
-		if policy.ReadRefused(root, rel) {
+		// for authorization; never reopen its normalized spelling. A secret
+		// path is listed but never opened; a path escaping the root fails the
+		// whole read, because that is an attack on it, not a file to skip.
+		switch policy.ClassifyRead(root, rel) {
+		case policy.ReadOutsideRoot:
 			return nil, "", fmt.Sprintf("untracked diff read refused by file policy: %q", rel)
+		case policy.ReadSecretPath:
+			files = append(files, DiffFile{Path: rel, Status: "A", Withheld: policy.WithheldSecretPath})
+			continue
 		}
 		raw, err := readUntrackedFile(held, filepath.FromSlash(rel), remaining)
 		if err != nil {

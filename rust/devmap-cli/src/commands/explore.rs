@@ -77,9 +77,10 @@ fn emit_explore(report: &devmap_query::ExploreReport) {
         );
         // Class A: an unreadable file is reported as unread, never as a symbol
         // whose body happens to be empty.
-        match &definition.source_unavailable_reason {
-            Some(reason) => outln!("  source unavailable: {reason}"),
-            None => {
+        match (&definition.withheld, &definition.source_unavailable_reason) {
+            (Some(withheld), _) => outln!("  source withheld: {withheld}"),
+            (None, Some(reason)) => outln!("  source unavailable: {reason}"),
+            (None, None) => {
                 for line in definition.source.lines() {
                     outln!("  {line}");
                 }

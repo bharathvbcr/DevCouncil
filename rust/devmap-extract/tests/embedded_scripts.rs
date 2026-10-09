@@ -832,8 +832,11 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     //
     // v77 adds macro-stamped C-family functions (Metal kernels stamped by a
     // `KERNEL(name, …)` table) and `EntryName` string references.
+    //
+    // v78 withholds a secret file's literal values, docstrings and string-made
+    // references.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "77",
+        EXTRACTION_SCHEMA_VERSION, "78",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

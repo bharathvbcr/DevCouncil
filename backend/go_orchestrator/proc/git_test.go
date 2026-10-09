@@ -22,14 +22,14 @@ func TestGitArgsPlacesGuards(t *testing.T) {
 		want []string
 	}{
 		{"diff gets both", []string{"diff", "HEAD"},
-			[]string{"diff", "--no-ext-diff", "--no-textconv", "HEAD"}},
+			[]string{"diff", "--no-ext-diff", "--no-textconv", "--no-color", "HEAD"}},
 		{"blame gets textconv only", []string{"blame", "--line-porcelain", "HEAD", "--", "a"},
 			[]string{"blame", "--no-textconv", "--line-porcelain", "HEAD", "--", "a"}},
 		{"log and show", []string{"show", "--name-only", "x"},
-			[]string{"show", "--no-ext-diff", "--no-textconv", "--name-only", "x"}},
+			[]string{"show", "--no-ext-diff", "--no-textconv", "--no-color", "--name-only", "x"}},
 		{"caller globals stay before the subcommand",
 			[]string{"-c", "core.quotePath=false", "-C", "sub", "--no-pager", "diff", "--unified=0"},
-			[]string{"-c", "core.quotePath=false", "-C", "sub", "--no-pager", "diff", "--no-ext-diff", "--no-textconv", "--unified=0"}},
+			[]string{"-c", "core.quotePath=false", "-C", "sub", "--no-pager", "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--unified=0"}},
 		{"a subcommand without guards is unchanged", []string{"ls-files", "-z"}, []string{"ls-files", "-z"}},
 		{"an argument after the subcommand named diff is not a subcommand",
 			[]string{"rev-parse", "diff"}, []string{"rev-parse", "diff"}},

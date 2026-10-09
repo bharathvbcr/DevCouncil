@@ -44,6 +44,7 @@ mod git_metadata;
 pub mod paths;
 pub mod progress;
 pub mod safe_fs;
+pub mod secret;
 /// The bounded subprocess runner, re-exported at the path its callers have
 /// always used by the kernel crates. The implementation lives in `dc-proc`
 /// because nothing in this crate uses it, and `dc-verify` and `dc-regress`
@@ -571,8 +572,21 @@ fn matches_ignore(
     ignored
 }
 
+/// Extracts one file, with the values of a secret file withheld.
+///
+/// Every engine below — refusal, notebook, tree-sitter and its fallbacks —
+/// returns through here, so [`secret::withhold_secret_values`] runs once on
+/// whatever came back, before the extraction reaches the cache, the store or
+/// a query.
 #[cfg(feature = "parse")]
 pub fn extract_file(path: &str, source: &str) -> Extraction {
+    let mut extraction = extract_file_unfiltered(path, source);
+    secret::withhold_secret_values(&mut extraction);
+    extraction
+}
+
+#[cfg(feature = "parse")]
+fn extract_file_unfiltered(path: &str, source: &str) -> Extraction {
     if source.len() as u64 > MAX_SOURCE_BYTES {
         return treesitter::refused_extraction(
             path,
