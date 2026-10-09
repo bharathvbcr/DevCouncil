@@ -326,6 +326,12 @@ impl GitVersion {
     }
 }
 
+/// Wall clock for `git version`. It answers in milliseconds; the bound is
+/// short because the probe runs before the read a caller bounded, and must
+/// not outlast the shortest of those deadlines ([`GIT_HEAD_DEADLINE`]). A
+/// git that stalls here is reported as killed, not waited for.
+pub const GIT_VERSION_DEADLINE: Duration = Duration::from_secs(2);
+
 /// The version of the git at `git` (an absolute path, as [`resolve_outside`]
 /// returns it), asked once per binary per process. A git replaced in place —
 /// a different size or modification time — is asked again. `git version`
@@ -358,7 +364,7 @@ pub fn git_version(git: &Path) -> Result<Option<GitVersion>, Failure> {
     let captured = run_bounded(
         &mut command,
         Bounds {
-            deadline: Duration::from_secs(10),
+            deadline: GIT_VERSION_DEADLINE,
             stdout_cap: 4096,
             stderr_cap: 4096,
         },

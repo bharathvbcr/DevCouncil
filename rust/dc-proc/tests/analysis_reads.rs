@@ -384,3 +384,22 @@ fn the_git_version_is_asked_once_per_binary() {
     let calls = std::fs::read_to_string(&log).unwrap_or_default();
     assert_eq!(calls.matches("version").count(), 1, "{calls}");
 }
+
+/// The version probe runs before the read a caller bounded, so it carries a
+/// bound shorter than any of theirs: a git that stalls on `version` is killed
+/// at [`dc_proc::GIT_VERSION_DEADLINE`], not waited for.
+#[test]
+fn a_git_that_stalls_on_version_is_killed_at_the_probe_deadline() {
+    let base = Scratch::new("stalled-version");
+    let git = base.0.join("bin").join("git");
+    script(&git, "#!/bin/sh\nexec sleep 30\n");
+    let started = std::time::Instant::now();
+    let failure = git_version(&git).expect_err("a stalled git has no version");
+    let elapsed = started.elapsed();
+    assert!(matches!(failure, Failure::Deadline { .. }), "{failure}");
+    assert!(
+        elapsed < dc_proc::GIT_VERSION_DEADLINE + Duration::from_secs(1),
+        "the probe waited {elapsed:?}"
+    );
+    assert!(dc_proc::GIT_VERSION_DEADLINE < dc_proc::GIT_HEAD_DEADLINE);
+}
