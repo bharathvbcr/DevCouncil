@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use devmap_extract::subprocess::{run_bounded, Bounds, Failure};
+use devmap_extract::subprocess::{Bounds, Failure, run_bounded};
 
 /// One directory per call, unique across the tests this binary runs in
 /// parallel. A wall-clock stamp alone is not: macOS reports `SystemTime` at
@@ -221,12 +221,20 @@ fn every_child_process_in_the_kernel_goes_through_the_runner() {
 
 #[test]
 fn the_git_constructor_refuses_prompts_and_optional_locks() {
-    let command = devmap_extract::subprocess::git(std::path::Path::new("/tmp"));
+    let command = devmap_extract::subprocess::git(std::path::Path::new("/tmp"), ["status"])
+        .expect("a git outside /tmp resolves");
     let args: Vec<String> = command
         .get_args()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
-    assert_eq!(args, ["-C", "/tmp"]);
+    assert_eq!(args[..2], ["-C", "/tmp"]);
+    assert_eq!(
+        args[2..],
+        devmap_extract::subprocess::guarded_args(["status"])
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()[..]
+    );
     let envs: Vec<(String, String)> = command
         .get_envs()
         .filter_map(|(key, value)| {
