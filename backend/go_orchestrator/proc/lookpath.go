@@ -136,28 +136,68 @@ func resolveRoot(root string) (os.FileInfo, error) {
 	return info, err
 }
 
-// outsideRoot returns candidate's canonical path, refusing it when that lies
-// inside the directory rootDir identifies or is not a regular file.
+// maxLinkHops bounds the symlink chain outsideRoot follows, matching the
+// limit POSIX systems apply to path resolution.
+const maxLinkHops = 40
+
+// outsideRoot returns candidate's canonical path, refusing it when any name
+// on the way to it is bound inside the directory rootDir identifies, or when
+// it is not a regular file.
+//
+// Every link in candidate's chain is checked, not only where it ends. A
+// repository need not ship a program to choose one: a link it carries,
+// named git and pointing at /usr/bin/true, is a git that exits 0 with no
+// output, and verification would read that as "nothing changed". The
+// binding is repository content even when the bytes it points at are not.
 func outsideRoot(name, candidate string, rootDir os.FileInfo) (string, error) {
-	candidate, err := canonicalAbs(candidate)
+	current, err := filepath.Abs(candidate)
 	if err != nil {
 		return "", err
 	}
-	inside, err := within(candidate, rootDir)
+	for hops := 0; ; hops++ {
+		if hops > maxLinkHops {
+			return "", fmt.Errorf("%s resolves through more than %d links from %s", name, maxLinkHops, candidate)
+		}
+		// The directory that holds a name decides what the name means.
+		holder, err := canonicalAbs(filepath.Dir(current))
+		if err != nil {
+			return "", err
+		}
+		inside, err := within(holder, rootDir)
+		if err != nil {
+			return "", fmt.Errorf("%s resolves through %s, whose location could not be checked: %w", name, current, err)
+		}
+		if inside {
+			return "", fmt.Errorf("%s resolves through %s: %w", name, filepath.Join(holder, filepath.Base(current)), ErrRepositoryLocal)
+		}
+		link, err := os.Lstat(current)
+		if err != nil {
+			return "", err
+		}
+		if link.Mode()&os.ModeSymlink == 0 {
+			break
+		}
+		target, err := os.Readlink(current)
+		if err != nil {
+			return "", err
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(holder, target)
+		}
+		current = target
+	}
+	resolved, err := canonicalAbs(current)
 	if err != nil {
-		return "", fmt.Errorf("%s resolves to %s, whose location could not be checked: %w", name, candidate, err)
+		return "", err
 	}
-	if inside {
-		return "", fmt.Errorf("%s resolves to %s: %w", name, candidate, ErrRepositoryLocal)
-	}
-	info, err := os.Stat(candidate)
+	info, err := os.Stat(resolved)
 	if err != nil {
 		return "", err
 	}
 	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("%s resolves to %s, which is not a regular file", name, candidate)
+		return "", fmt.Errorf("%s resolves to %s, which is not a regular file", name, resolved)
 	}
-	return candidate, nil
+	return resolved, nil
 }
 
 // within reports whether path, or any directory above it, is dir. Each

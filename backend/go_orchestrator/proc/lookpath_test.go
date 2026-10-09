@@ -2,9 +2,12 @@ package proc
 
 import (
 	"errors"
+	"fmt"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -373,5 +376,182 @@ func TestLookPathOutsideTreatsMissingRootAsContainingNothing(t *testing.T) {
 
 	if _, err := LookPathOutside("tool-under-test", filepath.Join(base, "no-such-repo")); err != nil {
 		t.Fatalf("a missing root refused an installation outside it: %v", err)
+	}
+}
+
+func symlinkOrSkip(t *testing.T, target, link string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink fixtures need unix semantics")
+	}
+	if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A link the repository carries chooses the program even when the program
+// lives outside: the chain outside -> repository link -> outside target is
+// refused at the repository's link.
+func TestLookPathOutsideRefusesAChainThroughTheRepository(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "repo")
+	installed := filepath.Join(base, "usr", "bin", "real-tool")
+	writeExecutable(t, installed)
+	symlinkOrSkip(t, installed, filepath.Join(root, "links", "tool-under-test"))
+	symlinkOrSkip(t, filepath.Join(root, "links", "tool-under-test"), filepath.Join(base, "bin", "tool-under-test"))
+	t.Setenv("PATH", filepath.Join(base, "bin"))
+
+	got, err := LookPathOutside("tool-under-test", root)
+	if !errors.Is(err, ErrRepositoryLocal) {
+		t.Fatalf("a chain through a repository link was accepted: %q (err %v)", got, err)
+	}
+}
+
+// A chain that never touches the repository is an ordinary installation —
+// the shape of Homebrew's /opt/homebrew/bin links — and is used by its end.
+func TestLookPathOutsideFollowsAChainOutsideTheRepository(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "repo")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	installed := filepath.Join(base, "Cellar", "tool", "1.0", "bin", "tool-under-test")
+	writeExecutable(t, installed)
+	symlinkOrSkip(t, "../Cellar/tool/1.0/bin/tool-under-test", filepath.Join(base, "bin", "tool-under-test"))
+	t.Setenv("PATH", filepath.Join(base, "bin"))
+
+	got, err := LookPathOutside("tool-under-test", root)
+	if err != nil {
+		t.Fatalf("refused an installation reached by links outside the repository: %v", err)
+	}
+	want, err := filepath.EvalSymlinks(installed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("resolved %q, want %q", got, want)
+	}
+}
+
+// A link loop ends in an error, not a hang.
+func TestLookPathOutsideBoundsALinkLoop(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "repo")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a := filepath.Join(base, "bin", "tool-under-test")
+	b := filepath.Join(base, "loop", "b")
+	symlinkOrSkip(t, b, a)
+	symlinkOrSkip(t, a, b)
+	t.Setenv("PATH", filepath.Join(base, "bin"))
+	if got, err := LookPathOutside("tool-under-test", root); err == nil {
+		t.Fatalf("a link loop resolved to %q", got)
+	}
+}
+
+// TestLookPathOutsideAgainstGeneratedLayouts builds many PATH layouts from a
+// fixed seed and checks each answer against what the layout was built to be,
+// not against the code under test: for every PATH entry the generator records
+// whether the first executable it would yield was placed, or linked, through
+// the repository. The first entry yielding one decides. Stated rather than
+// assumed: exec.LookPath's first match is the candidate.
+func TestLookPathOutsideAgainstGeneratedLayouts(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink fixtures need unix semantics")
+	}
+	const layouts = 300
+	rng := rand.New(rand.NewPCG(20261008, 1))
+	for i := 0; i < layouts; i++ {
+		base := t.TempDir()
+		root := filepath.Join(base, "Repo")
+		outside := filepath.Join(base, "outside")
+		writeExecutable(t, filepath.Join(outside, "real", "tool-under-test"))
+		writeExecutable(t, filepath.Join(root, "build", "tool-under-test"))
+		folds := false
+		if a, err := os.Stat(root); err == nil {
+			if b, err := os.Stat(filepath.Join(base, "REPO")); err == nil && os.SameFile(a, b) {
+				folds = true
+			}
+		}
+
+		type entry struct {
+			dir        string
+			executable bool
+			inside     bool
+		}
+		var entries []entry
+		n := 1 + rng.IntN(4)
+		for j := 0; j < n; j++ {
+			dir := filepath.Join(base, fmt.Sprintf("e%d", j))
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			link := filepath.Join(dir, "tool-under-test")
+			switch kind := rng.IntN(7); kind {
+			case 0: // nothing here
+				entries = append(entries, entry{dir: dir})
+			case 1: // a real program outside
+				writeExecutable(t, link)
+				entries = append(entries, entry{dir: dir, executable: true})
+			case 2: // a link to the outside program
+				symlinkOrSkip(t, filepath.Join(outside, "real", "tool-under-test"), link)
+				entries = append(entries, entry{dir: dir, executable: true})
+			case 3: // a link to the repository's build output
+				symlinkOrSkip(t, filepath.Join(root, "build", "tool-under-test"), link)
+				entries = append(entries, entry{dir: dir, executable: true, inside: true})
+			case 4: // a link to a repository link that points outside
+				repoLink := filepath.Join(root, fmt.Sprintf("l%d", j), "tool-under-test")
+				symlinkOrSkip(t, filepath.Join(outside, "real", "tool-under-test"), repoLink)
+				symlinkOrSkip(t, repoLink, link)
+				entries = append(entries, entry{dir: dir, executable: true, inside: true})
+			case 5: // the repository's directory itself, spelled as built or folded
+				spelled := root
+				if folds && rng.IntN(2) == 0 {
+					spelled = filepath.Join(base, "REPO")
+				}
+				entries = append(entries, entry{dir: filepath.Join(spelled, "build"), executable: true, inside: true})
+			case 6: // a directory link into the repository
+				if err := os.Remove(dir); err != nil {
+					t.Fatal(err)
+				}
+				symlinkOrSkip(t, filepath.Join(root, "build"), dir)
+				entries = append(entries, entry{dir: dir, executable: true, inside: true})
+			}
+		}
+		var dirs []string
+		for _, e := range entries {
+			dirs = append(dirs, e.dir)
+		}
+		t.Setenv("PATH", strings.Join(dirs, string(os.PathListSeparator)))
+
+		got, err := LookPathOutside("tool-under-test", root)
+		var decider *entry
+		for k := range entries {
+			if entries[k].executable {
+				decider = &entries[k]
+				break
+			}
+		}
+		switch {
+		case decider == nil:
+			if !errors.Is(err, exec.ErrNotFound) {
+				t.Fatalf("layout %d (PATH=%v): nothing to find, got %q err %v", i, dirs, got, err)
+			}
+		case decider.inside:
+			if !errors.Is(err, ErrRepositoryLocal) {
+				t.Fatalf("layout %d (PATH=%v): repository content accepted: %q err %v", i, dirs, got, err)
+			}
+		default:
+			if err != nil {
+				t.Fatalf("layout %d (PATH=%v): installation outside refused: %v", i, dirs, err)
+			}
+			if within, _ := filepath.Rel(root, got); !strings.HasPrefix(within, "..") {
+				t.Fatalf("layout %d: accepted %q, which is under the root", i, got)
+			}
+		}
 	}
 }

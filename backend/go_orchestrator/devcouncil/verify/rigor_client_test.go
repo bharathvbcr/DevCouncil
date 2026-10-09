@@ -161,3 +161,34 @@ func TestARepositoryLocalGitDoesNotDescribeTheDiff(t *testing.T) {
 		t.Fatal("a refused git produced a diff instead of an error")
 	}
 }
+
+// TestARepositoryLinkToAnOutsideProgramIsStillTheRepositorysChoice. The
+// repository does not have to ship the program to choose it: a link it
+// carries named git and pointing at /usr/bin/true is a git that exits 0 with
+// no output, which reads as "nothing changed". The binding is repository
+// content even when the bytes are not.
+func TestARepositoryLinkToAnOutsideProgramIsStillTheRepositorysChoice(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks to /usr/bin/true are a unix fixture")
+	}
+	truePath := "/usr/bin/true"
+	if _, err := os.Stat(truePath); err != nil {
+		t.Skipf("no %s here", truePath)
+	}
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(truePath, filepath.Join(root, "bin", "git")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "changed.go"), []byte("package x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", filepath.Join(root, "bin"))
+
+	changed, diff, empty, err := verify.CollectGitState(t.Context(), root)
+	if err == nil {
+		t.Fatalf("a repository-chosen git described the tree: changed=%v diff=%q empty=%v", changed, diff, empty)
+	}
+}
