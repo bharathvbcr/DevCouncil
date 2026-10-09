@@ -29,8 +29,8 @@ use std::io::Write;
 use std::path::PathBuf;
 
 /// Everything an exit from the soak must undo, whichever path it leaves by —
-/// the shell harness's EXIT trap. Idempotent: the normal path and an
-/// interrupt may both run it.
+/// the shell harness's EXIT trap. The normal path and an interrupt may both
+/// run it.
 #[derive(Default)]
 pub struct Cleanup {
     pub corpus: Option<corpus::Corpus>,
@@ -45,27 +45,41 @@ pub struct Cleanup {
 impl Cleanup {
     /// Restore the corpus, stop the daemon, remove what the run created.
     /// False when any of it could not be confirmed.
+    ///
+    /// What succeeds is consumed, so a second run — the interrupt thread
+    /// arriving after the normal path — repeats only what has not yet
+    /// succeeded, and is silent when nothing is left. A restore that fails
+    /// keeps the pristine copy and names it: deleting it would lose the only
+    /// copy of the file the soak was editing.
     pub fn run(&mut self, out: &mut dyn Write) -> bool {
         let mut ok = true;
         if let Some(corpus) = &self.corpus {
-            if let Err(e) = corpus.restore() {
-                let _ = writeln!(
-                    out,
-                    "SOAK FAIL: cannot restore {}: {e}",
-                    corpus.target.display()
-                );
-                ok = false;
+            match corpus.restore() {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&corpus.orig);
+                    self.corpus = None;
+                }
+                Err(e) => {
+                    let _ = writeln!(
+                        out,
+                        "SOAK FAIL: cannot restore {}: {e}; the original is kept at {}",
+                        corpus.target.display(),
+                        corpus.orig.display()
+                    );
+                    ok = false;
+                }
             }
         }
         #[cfg(unix)]
         if let Some(daemon) = &mut self.daemon {
+            // Idempotent on its own: a second stop returns the first verdict.
             ok &= daemon.stop(out);
         }
-        for path in [&self.endpoint, &self.timer_log].into_iter().flatten() {
+        for path in [self.endpoint.take(), self.timer_log.take()]
+            .into_iter()
+            .flatten()
+        {
             let _ = std::fs::remove_file(path);
-        }
-        if let Some(corpus) = &self.corpus {
-            let _ = std::fs::remove_file(&corpus.orig);
         }
         ok
     }

@@ -782,15 +782,19 @@ mod tests {
         // The backgrounded sleep was in the group and got TERM as well; give it
         // a moment to be reaped by init.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while signal_group(leader, Signal::Probe).is_ok() {
-            assert!(
-                Instant::now() < deadline,
-                "a TERMed group is still alive after 5 s"
-            );
+        // Poll for ESRCH itself: while the backgrounded sleep is a zombie
+        // awaiting init, macOS answers the group probe with EPERM, which is
+        // neither "alive" nor "gone".
+        loop {
+            match signal_group(leader, Signal::Probe) {
+                Err(gone) if target_is_gone(&gone) => break,
+                answer => assert!(
+                    Instant::now() < deadline,
+                    "a TERMed group still answers {answer:?} after 5 s"
+                ),
+            }
             thread::sleep(Duration::from_millis(20));
         }
-        let gone = signal_group(leader, Signal::Probe).unwrap_err();
-        assert!(target_is_gone(&gone), "{gone}");
     }
 
     /// 0, 1 and negatives name groups the caller does not own — its own, or

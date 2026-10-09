@@ -159,10 +159,16 @@ impl Daemon {
 
     /// Whether any member of the owned group is still alive — including a
     /// daemon its exited wrapper left reparented.
+    ///
+    /// The probe is definitive only when it says the group is gone. A group
+    /// holding nothing but unreaped zombies answers EPERM on macOS and success
+    /// on Linux, so any other answer is checked by listing the members and
+    /// discarding zombies. A listing that cannot be made counts as running:
+    /// cleanup must never report a stop it did not observe.
     fn group_running(&self) -> bool {
         match self.signals.group(self.leader(), Signal::Probe) {
-            Ok(()) => true,
-            Err(e) => !dc_proc::target_is_gone(&e),
+            Err(e) if dc_proc::target_is_gone(&e) => false,
+            _ => live_members(self.leader()).unwrap_or(true),
         }
     }
 
@@ -246,6 +252,38 @@ impl Drop for Daemon {
             let _ = self.wrapper.wait();
         }
     }
+}
+
+/// Whether the process group `leader` leads has a member that is not a
+/// zombie; `None` when that cannot be determined.
+fn live_members(leader: u32) -> Option<bool> {
+    let out = Command::new("pgrep")
+        .args(["-g", &leader.to_string()])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    match out.status.code() {
+        Some(1) => return Some(false),
+        Some(0) => {}
+        _ => return None,
+    }
+    for pid in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+        pid.parse::<u32>().ok()?;
+        let state = Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        let state = String::from_utf8_lossy(&state.stdout);
+        let state = state.trim();
+        // Gone between the listing and the look is as good as a zombie.
+        if !state.is_empty() && !state.starts_with('Z') {
+            return Some(true);
+        }
+    }
+    Some(false)
 }
 
 /// Wait until `ask_symbol` observes the symbol in `mode` *and* `ask_fresh`
@@ -353,5 +391,20 @@ mod tests {
             out.is_empty(),
             "a refusal is not a timeout and must not be reported as one"
         );
+    }
+
+    /// A group whose only member is an exited, unreaped process holds no
+    /// live work. macOS answers the group probe with EPERM there and Linux
+    /// with success; neither may read as "still running".
+    #[test]
+    fn a_group_holding_only_a_zombie_is_not_running() {
+        let wrapper = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .process_group(0)
+            .spawn()
+            .expect("spawn");
+        thread::sleep(Duration::from_millis(300));
+        let daemon = Daemon::adopt(wrapper, Duration::from_secs(1), Box::new(Os));
+        assert!(!daemon.group_running(), "a zombie-only group read as live");
     }
 }

@@ -204,15 +204,19 @@ mod soak {
             };
             let code = runtime.block_on(async {
                 use tokio::signal::unix::{signal, SignalKind};
-                let (Ok(mut interrupt), Ok(mut terminate)) = (
+                // HUP too: a closed terminal or a dropped ssh session ends
+                // the soak, and the shell harness's EXIT trap ran for it.
+                let (Ok(mut interrupt), Ok(mut terminate), Ok(mut hangup)) = (
                     signal(SignalKind::interrupt()),
                     signal(SignalKind::terminate()),
+                    signal(SignalKind::hangup()),
                 ) else {
                     return None;
                 };
                 tokio::select! {
                     _ = interrupt.recv() => Some(130),
                     _ = terminate.recv() => Some(143),
+                    _ = hangup.recv() => Some(129),
                 }
             });
             if let Some(code) = code {
@@ -262,7 +266,13 @@ mod soak {
             ..Cleanup::default()
         }));
         on_interrupt(Arc::clone(&cleanup));
-        let code = soak(&cfg, time_flag, &corpus, &cleanup, &mut out);
+        // A panic must still clean up. The interrupt thread holds a clone of
+        // `cleanup`, so unwinding never drops it and the daemon's Drop never
+        // runs; catching here is what stops a panic orphaning the daemon.
+        let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            soak(&cfg, time_flag, &corpus, &cleanup, &mut out)
+        }))
+        .unwrap_or(1);
         let mut guard = cleanup
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -347,6 +357,7 @@ mod soak {
                 cfg,
                 time_flag,
                 corpus,
+                cleanup,
                 &store_path,
                 &base_digest,
                 &samples,
@@ -401,6 +412,7 @@ mod soak {
         cfg: &Config,
         time_flag: &str,
         corpus: &Corpus,
+        cleanup: &Arc<Mutex<Cleanup>>,
         store_path: &Path,
         base_digest: &str,
         samples: &Samples,
@@ -411,7 +423,7 @@ mod soak {
         for i in 1..=cfg.cycles {
             let name = format!("_soak_{i}");
             // Perturb, rebuild, then restore and rebuild: the digest must return.
-            if corpus.append_cycle(i).is_err() || !quiet(devmap, &["build", "."]) {
+            if append(cleanup, corpus, i).is_err() || !quiet(devmap, &["build", "."]) {
                 let _ = writeln!(out, "SOAK FAIL: build (dirty) cycle {i}");
                 return true;
             }
@@ -431,7 +443,7 @@ mod soak {
                     return true;
                 }
             }
-            if corpus.restore().is_err() {
+            if restore(cleanup, corpus).is_err() {
                 let _ = writeln!(out, "SOAK FAIL: restore cycle {i}");
                 return true;
             }
@@ -484,6 +496,19 @@ mod soak {
         cleanup
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    // Corpus edits happen under the cleanup lock. An interrupt's cleanup takes
+    // the same lock, restores the corpus and exits still holding it, so no
+    // edit can land after the restore that was meant to undo it.
+    fn append(cleanup: &Arc<Mutex<Cleanup>>, corpus: &Corpus, cycle: u64) -> io::Result<()> {
+        let _held = lock(cleanup);
+        corpus.append_cycle(cycle)
+    }
+
+    fn restore(cleanup: &Arc<Mutex<Cleanup>>, corpus: &Corpus) -> io::Result<()> {
+        let _held = lock(cleanup);
+        corpus.restore()
     }
 
     /// Ok(true) when the soak failed in a way that still reaches the verdict
@@ -608,7 +633,7 @@ mod soak {
             // An OK envelope does not prove the edit was indexed. Keep the
             // edited bytes in place until the exact symbol/file and freshness
             // are observed.
-            if corpus.append_cycle(i).is_err()
+            if append(cleanup, corpus, i).is_err()
                 || !await_symbol(&name, Mode::Present, "present", out)
             {
                 let _ = writeln!(out, "SOAK FAIL: inserted symbol cycle {i}");
@@ -625,7 +650,9 @@ mod soak {
                 fails = true;
                 break;
             }
-            if corpus.restore().is_err() || !await_symbol(&name, Mode::Absent, "absent", out) {
+            if restore(cleanup, corpus).is_err()
+                || !await_symbol(&name, Mode::Absent, "absent", out)
+            {
                 let _ = writeln!(out, "SOAK FAIL: removed symbol cycle {i}");
                 fails = true;
                 break;

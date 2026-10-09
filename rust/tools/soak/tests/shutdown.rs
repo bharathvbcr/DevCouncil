@@ -354,3 +354,38 @@ fn the_group_exists_from_the_moment_of_spawn() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// A clean exit stays clean when cleanup runs again — the interrupt thread
+/// can reach it after the normal path already did. The first run removed the
+/// pristine copy; a second must not then report the restore as failed.
+#[test]
+fn a_second_cleanup_after_a_clean_one_is_still_clean_and_silent() {
+    let dir = scratch("clean-twice");
+    let target = dir.join("main.py");
+    fs::write(&target, "x = 1\n").expect("target");
+    let corpus = Corpus::open(&dir, 2).expect("corpus");
+    corpus.append_cycle(1).expect("edit");
+    let mut cleanup = Cleanup {
+        corpus: Some(corpus.clone()),
+        ..Cleanup::default()
+    };
+    let mut first_out = Vec::new();
+    assert!(
+        cleanup.run(&mut first_out),
+        "{}",
+        String::from_utf8_lossy(&first_out)
+    );
+    let mut second_out = Vec::new();
+    assert!(
+        cleanup.run(&mut second_out),
+        "{}",
+        String::from_utf8_lossy(&second_out)
+    );
+    assert!(
+        second_out.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&second_out)
+    );
+    assert_eq!(fs::read_to_string(&target).expect("target"), "x = 1\n");
+    let _ = fs::remove_dir_all(&dir);
+}
