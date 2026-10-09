@@ -17,6 +17,7 @@ import (
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/skills"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 )
 
 func main() {
@@ -127,25 +128,52 @@ func loadPayload(path string) map[string]any {
 }
 
 func mustRepo() string {
-	dir, err := os.MkdirTemp("", "dc-golden-*")
+	dir, err := seedRepo()
 	if err != nil {
 		panic(err)
 	}
-	run := func(args ...string) {
-		cmd := exec.Command("git", args...)
+	return dir
+}
+
+// seedRepo creates a temporary repository holding one committed file.
+//
+// It writes (init, config, commit), so it cannot go through proc.GitCommand,
+// which builds guarded reads against the repository under analysis. The
+// repository to keep out here is the checkout this tool runs from, not the
+// fresh temporary one, so git is resolved once with proc.LookPathOutside
+// against the working directory: a git the checkout carries on PATH is
+// refused rather than run.
+func seedRepo() (string, error) {
+	git, err := proc.LookPathOutside("git", "")
+	if err != nil {
+		return "", fmt.Errorf("resolving git: %w", err)
+	}
+	dir, err := os.MkdirTemp("", "dc-golden-*")
+	if err != nil {
+		return "", err
+	}
+	run := func(args ...string) error {
+		cmd := exec.Command(git, args...)
 		cmd.Dir = dir
 		if out, err := cmd.CombinedOutput(); err != nil {
-			panic(fmt.Sprintf("%v: %s", err, out))
+			return fmt.Errorf("git %v: %w: %s", args, err, out)
+		}
+		return nil
+	}
+	writeFile(filepath.Join(dir, "src/a.py"), "VALUE = 1\n")
+	for _, args := range [][]string{
+		{"init", "-q"},
+		{"config", "user.email", "g@test"},
+		{"config", "user.name", "g"},
+		{"config", "commit.gpgsign", "false"},
+		{"add", "src/a.py"},
+		{"commit", "-qm", "seed"},
+	} {
+		if err := run(args...); err != nil {
+			return dir, err
 		}
 	}
-	run("init", "-q")
-	run("config", "user.email", "g@test")
-	run("config", "user.name", "g")
-	run("config", "commit.gpgsign", "false")
-	writeFile(filepath.Join(dir, "src/a.py"), "VALUE = 1\n")
-	run("add", "src/a.py")
-	run("commit", "-qm", "seed")
-	return dir
+	return dir, nil
 }
 
 func writeFile(path, body string) {

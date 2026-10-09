@@ -60,7 +60,7 @@ fn doctor_report(
         "stray_state_warning": stray_state_warning(),
         "plugin_warning": plugin_warning(),
         "plugin_cleanup_note": plugin_cleanup_note(),
-        "stale_server_warning": stale_server_warning(),
+        "stale_server_warning": stale_server_warning(root),
         "mcp_registrations": mcp_registration_inventory(),
     });
     extend_agent_tools(&mut report, root);
