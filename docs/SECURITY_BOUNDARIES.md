@@ -40,7 +40,21 @@ changed". A root that does not exist contains nothing, so the command run
 against it reports the missing root itself. The Rust kernels apply the same
 rule to every `git` they run, in `dc_proc::resolve_outside`, which also refuses
 a relative or empty PATH entry (Go's `os/exec` already does; Rust's standard
-library does not). Integration separates the two questions
+library does not).
+
+A trusted `git` can still be told to run programs by the repository's own
+`.git/config`, which can arrive with the repository. Every git read the host
+(`proc.GitCommand`) and the kernels (`dc_proc::git_with_program`) run carries
+the same guards, set on the command line where they outrank every config file:
+`core.fsmonitor=false`, `core.hooksPath` at the null device and
+`log.showSignature=false` before the subcommand, `--no-ext-diff --no-textconv`
+after `diff`, `log` and `show`, and `--no-textconv` after `blame`. A planted
+fsmonitor that answers "nothing changed" could otherwise hide a change as well
+as run. Filter drivers (`filter.<name>.clean`, which `diff` runs and no flag
+disables) are not covered yet; that decision is open in ft-ff2153d9. The write
+gate already refuses writes under `.git/` in enforce mode; these guards cover a
+`.git/config` that arrived with the repository, advisory and off modes, and
+agents not routed through the gate. Integration separates the two questions
 it used to conflate: the name written into a host config is resolved later by
 the host, while the program this process spawns must come from outside the
 repository. When no such program is found, DevMap asset composition is skipped

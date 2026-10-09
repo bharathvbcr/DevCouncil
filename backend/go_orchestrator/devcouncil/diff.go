@@ -499,25 +499,22 @@ type gitOut struct {
 	returnCode int
 }
 
-// runGit runs the git found by proc.LookPathOutside: a git the repository
-// supplies does not get to describe the repository. A refusal comes back as
-// an *exec.Error, like a git that is missing, so callers report that git
-// could not run rather than that root is not a repository.
+// runGit runs a git read built by proc.GitCommand: a git the repository
+// supplies, or a program its .git/config names, does not get to describe the
+// repository. A refusal comes back as an *exec.Error, like a git that is
+// missing, so callers report that git could not run rather than that root is
+// not a repository.
 func runGit(ctx context.Context, root string, args ...string) (gitOut, error) {
-	git, err := proc.LookPathOutside("git", root)
+	cmd, err := proc.GitCommand(ctx, root, args...)
 	if err != nil {
-		err = &exec.Error{Name: "git", Err: err}
 		return gitOut{stderr: err.Error(), returnCode: -1}, err
 	}
-	cmd := exec.CommandContext(ctx, git, args...)
-	cmd.Dir = root
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	// Same bound and group isolation as every other subprocess boundary in
-	// this module: CommandContext alone does not cover a wedged Start, and
-	// killing only the direct child leaves grandchildren holding the pipes.
-	proc.ConfigureGroup(cmd)
+	// Same bound as every other subprocess boundary in this module:
+	// CommandContext alone does not cover a wedged Start. Group isolation,
+	// so killing reaches grandchildren holding the pipes, is GitCommand's.
 	cmd.WaitDelay = 2 * time.Second
 	err, timedOut := proc.RunBounded(ctx, cmd.Run)
 	out := gitOut{stdout: stdout.String(), stderr: stderr.String()}

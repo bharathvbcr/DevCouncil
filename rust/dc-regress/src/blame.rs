@@ -124,15 +124,7 @@ pub fn blame_file_with_program(
     rev: &str,
     path: &str,
 ) -> Result<FileBlame, BlameRefusal> {
-    let mut command = match git_with_program(program, repo) {
-        Ok(command) => command,
-        Err(failure) => {
-            return Err(BlameRefusal::GitUnavailable {
-                reason: failure.to_string(),
-            })
-        }
-    };
-    command.args([
+    let args = [
         "blame",
         "--line-porcelain",
         // Whitespace-only reformatting must not re-attribute a line. Without
@@ -158,7 +150,15 @@ pub fn blame_file_with_program(
         // used because the argument is already after `--`.
         "--",
         path,
-    ]);
+    ];
+    let mut command = match git_with_program(program, repo, args) {
+        Ok(command) => command,
+        Err(failure) => {
+            return Err(BlameRefusal::GitUnavailable {
+                reason: failure.to_string(),
+            })
+        }
+    };
     let captured = match run_bounded(
         &mut command,
         Bounds {

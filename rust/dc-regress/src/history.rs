@@ -142,7 +142,7 @@ pub(crate) fn run_git_with_deadline(
     stdout_cap: usize,
     deadline: Duration,
 ) -> Result<dc_proc::Captured, HistoryRefusal> {
-    let mut command = match git_with_program(program, repo) {
+    let mut command = match git_with_program(program, repo, args) {
         Ok(command) => command,
         Err(failure) => {
             return Err(HistoryRefusal::GitUnavailable {
@@ -150,7 +150,6 @@ pub(crate) fn run_git_with_deadline(
             })
         }
     };
-    command.args(args);
     let captured = match run_bounded(&mut command, bounds_with_deadline(stdout_cap, deadline)) {
         Ok(captured) => captured,
         Err(Failure::Deadline { .. }) => {
