@@ -160,6 +160,118 @@ fn a_notebook_symbol_is_not_capped_as_if_its_file_were_blind() {
     );
 }
 
+/// A Python-kernel notebook that fails to parse, and the Python it would have
+/// called.
+///
+/// The first cell calls `helper`; the second is malformed (`source` is a
+/// number), which fails the whole container — `notebook.rs` will not parse a
+/// concatenation that silently dropped a cell. The engine still names the
+/// kernel, because the kernel was declared and read: this is a Python file
+/// nobody could read, not a file of unknown language.
+const BROKEN_NOTEBOOK: &str = r#"{
+ "cells": [
+  {"cell_type": "code", "execution_count": 1, "metadata": {}, "outputs": [],
+   "source": ["from lib import helper\n", "\n", "\n", "def run():\n", "    return helper()\n"]},
+  {"cell_type": "code", "execution_count": 2, "metadata": {}, "outputs": [], "source": 42}
+ ],
+ "metadata": {"language_info": {"name": "python"}},
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
+"#;
+
+const LIB: &str = "def helper():\n    return 42\n";
+
+/// What the dead-code pass says about `lib.py::helper` over `extractions`.
+fn helper_finding(extractions: &[Extraction]) -> devmap_analyze::DeadSymbolReport {
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(extractions);
+    let resolution = resolver.resolve_all(extractions).unwrap();
+    let outcome =
+        analyze_liveness_with_coverage(extractions, &resolution, DiscoveryCoverage::none());
+    outcome
+        .reports
+        .into_iter()
+        .find(|report| report.file_path == "lib.py" && report.symbol_name.ends_with("helper"))
+        .expect("`helper` has no caller the graph can see, so it must be reported")
+}
+
+/// **R10, the coverage half.** A broken notebook is a hole in the *Python*
+/// corpus, and it caps the Python it could have called.
+///
+/// The join that prices a finding against the holes that bear on it was keyed
+/// by `Extraction::language`, which is `"notebook"` for every `.ipynb`. The
+/// notebook's hole was filed under `"notebook"`, and `language_can_reference`
+/// refuses to let `"notebook"` reach `"python"` — it has no family and no call
+/// extractor of its own — so `helper`, whose only caller is in the notebook
+/// nobody read, published at the confident tier with no caveat: a delete-this
+/// suggestion out of a check that could not run.
+#[test]
+fn a_broken_python_notebook_caps_the_python_symbol_it_calls() {
+    let broken = extract_file("analysis.ipynb", BROKEN_NOTEBOOK);
+    assert!(
+        matches!(&broken.engine, ExtractionEngine::Notebook { kernel_language } if kernel_language == "python"),
+        "fixture assumption: the kernel was read and the engine names it — {:?}",
+        broken.engine
+    );
+    assert!(
+        matches!(broken.parse_outcome, ParseOutcome::Failed { .. }),
+        "fixture assumption: the malformed cell fails the notebook — {:?}",
+        broken.parse_outcome
+    );
+    assert!(
+        broken.calls.is_empty(),
+        "fixture assumption: no call out of the notebook reached the graph"
+    );
+
+    let coverage = extraction_coverage(std::slice::from_ref(&broken));
+    assert_eq!(
+        coverage.blind_by_language.get("python"),
+        Some(&1),
+        "the hole is charged to the kernel's language, not the container's: {coverage:?}"
+    );
+    assert!(
+        !coverage.blind_by_language.contains_key("notebook"),
+        "and not to `notebook`, which nothing can reference: {coverage:?}"
+    );
+
+    // The control: the same Python with no notebook beside it is a complete
+    // corpus, and `helper` reaches the confident tier there.
+    let alone = helper_finding(&[extract_file("lib.py", LIB)]);
+    assert!(
+        (alone.confidence - 0.9).abs() < 1e-6 && alone.exemption_reason.is_none(),
+        "fixture assumption: without the notebook the finding is uncapped — {alone:?}"
+    );
+
+    let capped = helper_finding(&[extract_file("lib.py", LIB), broken]);
+    assert!(
+        capped.confidence < alone.confidence,
+        "a broken notebook that may hold `helper`'s only caller must lower the \
+         finding below the tier a complete corpus earns — {capped:?}"
+    );
+    assert_eq!(
+        capped.exemption_reason.as_deref(),
+        Some(devmap_analyze::COVERAGE_LOSS_REASON),
+        "and say why: {capped:?}"
+    );
+}
+
+/// The other side of the same join: a clean notebook is covered *Python*, so it
+/// counts toward the Python denominator rather than standing outside it.
+#[test]
+fn a_clean_notebook_is_counted_as_covered_python() {
+    let coverage = extraction_coverage(&[notebook()]);
+    assert_eq!(
+        coverage.covered_by_language.get("python"),
+        Some(&1),
+        "a notebook the kernel read is covered in the kernel's language: {coverage:?}"
+    );
+    assert!(
+        !coverage.covered_by_language.contains_key("notebook"),
+        "{coverage:?}"
+    );
+}
+
 /// The OFF direction. A notebook whose kernel this build genuinely cannot parse
 /// must still be charged, or the fix has replaced one unconditional answer with
 /// another.

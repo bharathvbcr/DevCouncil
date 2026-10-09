@@ -1341,7 +1341,7 @@ pub fn extraction_coverage(extractions: &[Extraction]) -> ExtractionCoverage {
     let mut coverage = ExtractionCoverage::default();
     let path_language: HashMap<&str, &str> = extractions
         .iter()
-        .map(|ext| (ext.file_path.as_str(), ext.language.as_str()))
+        .map(|ext| (ext.file_path.as_str(), ext.code_language()))
         .collect();
     for entry in extraction_gaps(extractions) {
         match entry.gap {
@@ -1378,7 +1378,7 @@ pub fn extraction_coverage(extractions: &[Extraction]) -> ExtractionCoverage {
             coverage.files_with_call_extraction += 1;
             *coverage
                 .covered_by_language
-                .entry(ext.language.clone())
+                .entry(ext.code_language().to_string())
                 .or_default() += 1;
         }
     }
@@ -1814,9 +1814,9 @@ pub fn analyze_liveness_with_coverage(
         // percent transient. The reason and the number now agree.
         let cap = |confidence: f32| {
             if file_is_call_blind {
-                coverage.cap_call_blind_file_for(&ext.language, confidence)
+                coverage.cap_call_blind_file_for(ext.code_language(), confidence)
             } else {
-                coverage.cap_for(&ext.language, confidence)
+                coverage.cap_for(ext.code_language(), confidence)
             }
         };
 
@@ -2023,7 +2023,7 @@ pub fn analyze_liveness_with_coverage(
                     // not.
                     exemption_reason: if file_is_call_blind {
                         Some(CALL_BLIND_REASON.to_string())
-                    } else if coverage.is_complete_for(&ext.language) {
+                    } else if coverage.is_complete_for(ext.code_language()) {
                         None
                     } else {
                         Some(COVERAGE_LOSS_REASON.to_string())

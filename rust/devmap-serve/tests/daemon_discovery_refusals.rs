@@ -347,3 +347,163 @@ fn an_incremental_resync_of_a_clean_corpus_stays_clean() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The drain records a manifest it cannot read, and drops it once it can.
+///
+/// Neither half happens through discovery. A config under `node_modules/` is
+/// read by the manifest pass alone, which every drain runs and no watcher
+/// event names — so the incremental branch, which carries the previous
+/// inventory forward minus the paths a batch re-decided, would otherwise never
+/// add the row and, once added, never drop it. Before this the drain resolved
+/// without the mapping and wrote a clean `Ok` over the lost imports.
+#[test]
+#[cfg(unix)]
+fn an_incremental_drain_records_and_then_clears_an_unreadable_manifest() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = scratch("manifest");
+    let base_dir = root.join("node_modules/@acme/base");
+    std::fs::create_dir_all(&base_dir).unwrap();
+    std::fs::create_dir_all(root.join("src/core")).unwrap();
+    std::fs::write(
+        root.join("tsconfig.json"),
+        r#"{ "extends": "@acme/base/tsconfig.json" }"#,
+    )
+    .unwrap();
+    let base = base_dir.join("tsconfig.json");
+    std::fs::write(
+        &base,
+        r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@core/*": ["src/core/*"] } } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/core/util.ts"),
+        "export function util(): number { return 1; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/app.ts"),
+        "import { util } from \"@core/util\";\nexport function main(): number { return util(); }\n",
+    )
+    .unwrap();
+    let db_path = root.join("index.sqlite");
+    // A clean first generation: the base is readable, so nothing is refused.
+    let reader = first_generation_with_a_refusal(&root, &db_path);
+    assert!(
+        reader.latest_discovery_refusals().unwrap().is_empty(),
+        "fixture precondition: a readable tree refuses nothing"
+    );
+
+    let daemon = Daemon::new(Store::open(&db_path).unwrap(), root.clone());
+    let drain_app = || {
+        reader
+            .enqueue_pending_paths(&[root.join("src/app.ts").to_string_lossy().into_owned()])
+            .unwrap();
+        assert!(
+            reader.latest_generation_payload_is_current().unwrap()
+                && reader.latest_generation_head_sha().unwrap().as_deref() == Some("unavailable"),
+            "fixture precondition: the drain takes the incremental branch"
+        );
+        daemon
+            .drain_pending_batch()
+            .expect("the drain must succeed");
+    };
+
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&base).is_ok() {
+        // Root, or a filesystem that ignores mode bits: nothing to measure.
+        return;
+    }
+    drain_app();
+    let locked = reader.latest_discovery_refusals().unwrap();
+    let status = reader.latest_analysis().unwrap().unwrap().status;
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(
+        locked
+            .iter()
+            .map(|refusal| refusal.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["node_modules/@acme/base/tsconfig.json"],
+        "the drain names the manifest it could not read: {locked:?}"
+    );
+    assert!(
+        locked[0].reason.starts_with("unreadable:"),
+        "with the reason: {locked:?}"
+    );
+    assert!(
+        matches!(status, AnalysisStatus::Partial { .. }),
+        "and the analysis it wrote is partial, not clean: {status:?}"
+    );
+
+    drain_app();
+    assert!(
+        reader.latest_discovery_refusals().unwrap().is_empty(),
+        "a repaired manifest leaves the inventory on the next drain — no watcher \
+         event names it, so nothing else ever would"
+    );
+    assert!(
+        matches!(
+            reader.latest_analysis().unwrap().unwrap().status,
+            AnalysisStatus::Ok
+        ),
+        "and the corpus is complete again"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A standing manifest refusal must not defeat the drain's restamp.
+///
+/// The restamp compares this drain's inventory with the stored one. If the
+/// manifest half were computed after that comparison — or worded differently
+/// from what was stored — every drain over a repository with one unreadable
+/// manifest would write a new generation for a tree that had not moved.
+#[test]
+#[cfg(unix)]
+fn a_drain_over_an_unchanged_tree_with_a_standing_manifest_refusal_restamps() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = scratch("manifest-restamp");
+    std::fs::write(root.join("lib.py"), LIB).unwrap();
+    std::fs::create_dir_all(root.join("build/m")).unwrap();
+    let manifest = root.join("build/m/go.mod");
+    std::fs::write(&manifest, "module example.com/m\n").unwrap();
+    std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&manifest).is_ok() {
+        return;
+    }
+    let db_path = root.join("index.sqlite");
+    let reader = Store::open(&db_path).unwrap();
+    let daemon = Daemon::new(Store::open(&db_path).unwrap(), root.clone());
+    let drain = || {
+        reader
+            .enqueue_pending_paths(&[root.join("lib.py").to_string_lossy().into_owned()])
+            .unwrap();
+        daemon
+            .drain_pending_batch()
+            .expect("the drain must succeed");
+    };
+
+    drain();
+    let first = reader.latest_generation_id().unwrap();
+    let refusals = reader.latest_discovery_refusals().unwrap();
+    drain();
+    drain();
+    let after = reader.latest_generation_id().unwrap();
+    std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert_eq!(
+        refusals
+            .iter()
+            .map(|refusal| refusal.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["build/m/go.mod"],
+        "fixture precondition: the first drain records the refusal"
+    );
+    assert_eq!(
+        after, first,
+        "two drains over an unchanged tree must restamp, not write generations"
+    );
+    assert_eq!(reader.latest_discovery_refusals().unwrap(), refusals);
+    let _ = std::fs::remove_dir_all(&root);
+}

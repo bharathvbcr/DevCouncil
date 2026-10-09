@@ -389,7 +389,8 @@ impl Store {
 
     /// Whether the latest generation still describes the working tree.
     ///
-    /// Payload identity, per-file content hashes, and discovery refusals.
+    /// Payload identity, per-file content hashes, and the refusal inventory
+    /// (discovery and the project manifests, through `refusal_inventory`).
     /// Git HEAD is not consulted: it is provenance, restamped by the caller
     /// once this returns true. `false` means a full rebuild (or a drain that
     /// re-reads the tree) is required; an error means the question could not
@@ -412,8 +413,16 @@ impl Store {
                 )))
             }
         };
-        Ok(scanned.matches_file_hashes(&hashes)
-            && crate::discovery_refusals(&scanned.report) == refusals)
+        if !scanned.matches_file_hashes(&hashes) {
+            return Ok(false);
+        }
+        let manifests =
+            devmap_extract::collect_project_manifests(Path::new(&root)).map_err(|error| {
+                refusal(format!(
+                    "project manifests could not be compared to the indexed generation: {error}"
+                ))
+            })?;
+        Ok(crate::refusal_inventory(&scanned.report, &manifests) == refusals)
     }
 
     pub fn latest_generation_payload_is_current(&self) -> Result<bool> {
@@ -968,7 +977,23 @@ generation {latest}; run `devmap status` to re-verify",
                 }),
             ));
         }
-        if crate::discovery_refusals(&scanned.report) != refusals {
+        // The manifests too: the stored inventory holds the ones the resolver
+        // could not read, so a comparison against discovery alone would call
+        // every such generation stale, and miss a manifest that broke or was
+        // repaired while no source moved.
+        let manifests = match devmap_extract::collect_project_manifests(Path::new(&root)) {
+            Ok(manifests) => manifests,
+            Err(error) => {
+                return Ok((
+                    None,
+                    Some(format!(
+                        "source freshness unverified: project manifests could not be read ({error})"
+                    )),
+                    None,
+                ))
+            }
+        };
+        if crate::refusal_inventory(&scanned.report, &manifests) != refusals {
             return Ok((
                 Some(false),
                 Some(

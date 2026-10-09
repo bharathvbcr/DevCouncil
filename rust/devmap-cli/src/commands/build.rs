@@ -290,7 +290,45 @@ pub(crate) fn run(
             ));
         }
     }
-    let refused_count = refused.len();
+    // The build's other walk of the tree, taken here rather than beside
+    // the resolver so the warm path below can compare its refusals too.
+    // A manifest that broke while no source moved is a change in what
+    // this generation could read, and the warm path used to answer
+    // "still current" for it.
+    let manifests = progress.timed("discovering project manifests", || {
+        collect_project_manifests(path)
+    })?;
+    let manifest_refused: Vec<&(String, devmap_extract::model::DiscoverySkipReason)> = manifests
+        .refusals
+        .iter()
+        .filter(|(manifest, _)| !refused.iter().any(|(path, _)| path == manifest))
+        .collect();
+    if !manifest_refused.is_empty() {
+        let shown = manifest_refused.len().min(REFUSAL_SAMPLE);
+        progress.display.diagnostic(format_args!(
+            "  {} project manifest(s) could not be read — the module mappings they \
+             declare are absent from resolution (showing {shown} of {}):",
+            manifest_refused.len(),
+            manifest_refused.len()
+        ));
+        for (path, reason) in manifest_refused.iter().take(REFUSAL_SAMPLE) {
+            progress
+                .display
+                .diagnostic(format_args!("    {path}: {reason:?}"));
+        }
+        if manifest_refused.len() > REFUSAL_SAMPLE {
+            progress.display.diagnostic(format_args!(
+                "    … and {} more",
+                manifest_refused.len() - REFUSAL_SAMPLE
+            ));
+        }
+    }
+    // The inventory, not just its size. `discovery_refused_files` is
+    // `COUNT(*)` over these rows once they are persisted, and the
+    // daemon's drain carries them forward path by path rather than
+    // carrying a number it can only ever raise.
+    let refusal_inventory = devmap_store::refusal_inventory(&scanned.report, &manifests);
+    let refused_count = refusal_inventory.len();
 
     // B3/SC2: if the tree that was just scanned is byte-for-byte the one
     // already committed, the graph it would produce is the graph that is
@@ -325,7 +363,14 @@ pub(crate) fn run(
         && previous.len() == scanned.sources.len()
         && store.latest_generation_payload_is_current()?
     {
-        let unchanged = file_delta.is_unchanged();
+        // The refusals as well as the hashes, which is the proof `status`
+        // and the drain already ask for. Hashes cover only the files that
+        // were read, so a file that became unreadable since the last
+        // generation left them equal: this path answered "still current"
+        // while `status` answered "rebuild required", and the rebuild it
+        // asked for came straight back here.
+        let unchanged =
+            file_delta.is_unchanged() && refusal_inventory == store.latest_discovery_refusals()?;
         if unchanged {
             let file_count = scanned.sources.len();
             progress.stage(
@@ -511,15 +556,9 @@ pub(crate) fn run(
     //
     // `--lsp` is the exception: converting an unresolved call span into
     // an LSP position needs the source bytes, so they are held through
-    // the opt-in pass and dropped immediately after.
-    //
-    // The *report* has to outlive it — `discovery_refusals` below turns
-    // it into the analysis disclosure — so this destructures rather
-    // than dropping the pair, and only the source text goes.
-    let devmap_extract::ScannedTree {
-        sources,
-        report: discovery,
-    } = scanned;
+    // the opt-in pass and dropped immediately after. The report has
+    // already been turned into `refusal_inventory` beside the scan.
+    let devmap_extract::ScannedTree { sources, .. } = scanned;
     let lsp_sources = if *lsp {
         Some(sources)
     } else {
@@ -572,9 +611,6 @@ pub(crate) fn run(
     };
 
     let mut resolver = Resolver::new();
-    let manifests = progress.timed("discovering project manifests", || {
-        collect_project_manifests(path)
-    })?;
     progress.timed("resolver:index", || {
         resolver.index_project_manifests(&manifests);
         resolver.index_extractions(&extractions);
@@ -627,12 +663,8 @@ pub(crate) fn run(
     // only call to a symbol this build is about to call dead. The
     // persisted `AnalysisSummary` carries the degraded status onward, so
     // a later `devmap manifest` reading the store inherits it rather
-    // than recomputing a clean answer.
-    // The inventory, not just its size. `discovery_refused_files` is
-    // `COUNT(*)` over these rows once they are persisted, and the
-    // daemon's drain carries them forward path by path rather than
-    // carrying a number it can only ever raise.
-    let refusal_inventory = devmap_store::discovery_refusals(&discovery);
+    // than recomputing a clean answer. The inventory is the one taken
+    // beside the scan, manifests included.
     let analysis = devmap_analyze::analyze_with_discovery(
         &extractions,
         &resolution,
@@ -886,7 +918,7 @@ pub(crate) fn run(
         ];
         if refused_count > 0 {
             summary.push(format!(
-                "    of which refused by discovery: {refused_count} \
+                "    of which refused: {refused_count} \
                  (recorded as lost coverage, not parsed)"
             ));
         }
