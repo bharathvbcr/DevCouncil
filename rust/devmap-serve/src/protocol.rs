@@ -305,13 +305,7 @@ fn blast_selector<'a>(
                 .to_string(),
         ),
         (Some(since), None) => {
-            if since.trim().is_empty() {
-                return Err(
-                    "`since` must name a revision: an empty one asks about the whole history \
-                     rather than a change"
-                        .to_string(),
-                );
-            }
+            check_since(since)?;
             Ok(BlastSelector::Since(since))
         }
         (None, Some(at)) => {
@@ -322,6 +316,30 @@ fn blast_selector<'a>(
             Ok(BlastSelector::At(at))
         }
     }
+}
+
+/// Refuses a `since` that cannot be a revision, before anything is opened or
+/// run: an empty one asks about the whole history rather than a window, and
+/// one beginning with `-` is an option to git wherever it stands — passed
+/// through, `--ext-diff` ran the repository's `diff.external` program and
+/// `--output=<file>` truncated a file, each answering with an empty, clean
+/// report. dc-regress resolves every revision to an object id as well
+/// (`dc_regress::history::commit_oid`); this is the refusal a caller sees.
+fn check_since(since: &str) -> Result<(), String> {
+    if since.trim().is_empty() {
+        return Err(
+            "`since` must name a revision: it is the last known-good point, and an empty one \
+             asks about the whole history rather than a window"
+                .to_string(),
+        );
+    }
+    if since.starts_with('-') {
+        return Err(format!(
+            "`since` is {since:?}, which begins with '-': git would read it as an option, not \
+             a revision, so it is refused"
+        ));
+    }
+    Ok(())
 }
 
 /// The depth bounds every traversal shares, for the commands that carry no
@@ -852,6 +870,7 @@ pub(crate) fn validate_request(request: &IpcRequest) -> Result<(), String> {
             if since.len() > MAX_QUERY_BYTES {
                 return Err(format!("since exceeds {MAX_QUERY_BYTES} bytes"));
             }
+            check_since(since)?;
             return check_walk_depth(*depth);
         }
         IpcCommand::Blast { since, at, depth } => {
@@ -1441,12 +1460,7 @@ pub(crate) fn dispatch(
             depth,
         } => {
             // Before the store, for the same reason as `Blast` above.
-            if since.trim().is_empty() {
-                anyhow::bail!(
-                    "`since` must name a revision: it is the last known-good point, and an \
-                     empty one asks about the whole history rather than a window"
-                );
-            }
+            check_since(&since).map_err(|error| anyhow::anyhow!(error))?;
             let graph = git_joined_graph(store)?;
             let root = graph.indexed_repo().to_path_buf();
             let until = indexed_head_of(&graph)?;
