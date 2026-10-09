@@ -1,0 +1,13 @@
+[package]
+name = "pkg-named"
+version = "0.1.0"
+edition = "2021"
+
+# C44: the library target's name differs from both the directory and the package
+# (GitPulse: dir src-tauri, package gitpulse, [lib] name gitpulse_lib).
+[lib]
+name = "xlib"
+
+[[bin]]
+name = "xbin"
+path = "src/main.rs"

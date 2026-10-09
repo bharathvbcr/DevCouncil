@@ -1,0 +1,19 @@
+# Dead-code truth for this fixture, read by devmap-cli/tests/dead_tier_eligibility.rs.
+# verdict<TAB>symbol_id<TAB>why
+#   truly_dead            nothing reaches it; must be reported (at 0.9 when the language is eligible)
+#   live                  something reaches it; never above 0.4, never in the confident branch
+#   exported_unreferenced exported but provably module-private and unused; reported at 0.4 exported_unreferenced
+#   exempt                never a dead candidate at any tier
+# Any confident-branch row (>= 0.9, or capped with confident_tier_unproven) not labelled truly_dead is a 0.9-tier false positive.
+truly_dead	apps/web/src/v/deadlocal.ts::neverCalledLocal	V4
+truly_dead	apps/web/src/v/deadlocal.ts::neverCalledArrow	V4
+truly_dead	apps/web/src/v/importtype.tsx::ApiShape	type alias nothing references
+truly_dead	apps/web/src/v/typeofimport.tsx::ApiModule	type alias nothing references
+live	apps/web/src/v/defaults.ts::defaultSleep	V17: destructured default value reference
+live	apps/web/src/v/defaults.ts::repoRoot	V17: destructured default value call
+live	apps/web/src/v/logger.ts::log	spread into logger
+exported_unreferenced	apps/web/src/lib/format.ts::unusedLibFn	exported from an app package (no exports/main/types), uncalled
+exempt	apps/web/src/v/ambient.d.ts::'*.svg'	V18: ambient declare module shim
+exempt	apps/web/src/v/augment.ts::'./logger'	V19: module augmentation
+exempt	apps/web/src/v/augment.ts::LoggerExtras	V19: interface inside a module augmentation
+exempt	apps/web/src/v/augment.ts::Window	V19: declare global augmentation

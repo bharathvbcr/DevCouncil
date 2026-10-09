@@ -1,0 +1,72 @@
+# construct	caller (file::symbol)	callee (file::symbol)	edge kind expected
+C1-jsx-component	apps/web/src/App.tsx::App	apps/web/src/components/PaperList.tsx::PaperList	call(JSX)
+C1-jsx-component	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/components/Button.tsx::Button	call(JSX)
+C1-jsx-component	apps/web/src/main.tsx::<file>	apps/web/src/App.tsx::App	call(JSX, default import)
+C2-jsx-member	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/components/Button.tsx::PartsHeader (Parts.Header)	call(JSX member)
+C3-custom-hook	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/hooks/usePapers.ts::usePapers	call (via @/ alias)
+C4-useCallback	apps/web/src/hooks/usePapers.ts::usePapers(.reload)	apps/web/src/services/api.ts::getPapers	call inside closure
+C4-useMemo	apps/web/src/hooks/usePapers.ts::usePapers	apps/web/src/hooks/usePapers.ts::computeRank	call inside closure
+C5-props-callback	apps/web/src/components/PaperList.tsx::PaperList(.handleSave)	apps/web/src/components/PaperList.tsx::savePaper	call
+C6-context	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/ctx/AuthContext.tsx::useAuth	call
+C6-context	apps/web/src/App.tsx::App	apps/web/src/ctx/AuthContext.tsx::AuthProvider	call(JSX)
+C6-context	apps/web/src/ctx/AuthContext.tsx::AuthProvider	apps/web/src/ctx/AuthContext.tsx::makeAuth	call
+C6-context-provider	apps/web/src/ctx/AuthContext.tsx::AuthProvider	AuthContext (AuthContext.Provider)	reference (not a fabricated call)
+C7-route-lazy	apps/web/src/App.tsx::App/About	apps/web/src/pages/AboutPage.tsx::AboutPage	lazy import reference/call; AboutPage NOT dead
+C8-tsconfig-alias	PaperList	apps/web/src/lib/format.ts::formatTitle	call via @lib/format alias + rename ft
+C9-barrel-named	PaperList	apps/web/src/lib/a.ts::namedA	call via @/lib barrel (index.ts)
+C10-export-star	PaperList	apps/web/src/lib/b.ts::starB	call via export *
+C11-default-as	PaperList	apps/web/src/lib/a.ts::defaultA	call via export {default as aliasDefaultA} (KNOWN ft-32522da4 #5)
+C12-default-import	PaperList	apps/web/src/lib/a.ts::defaultA	call via `import defaultA from '@lib/a'`
+C13-named-alias-reexport	PaperList	apps/web/src/lib/format.ts::formatTitle	call via barrel `export { formatTitle as fmt }`
+C14-namespace-import	PaperList::savePaper	apps/web/src/services/api.ts::postNote	call api.postNote
+C15-dynamic-import	apps/web/src/App.tsx::runHeavy	apps/web/src/pages/heavy.ts::heavyCompute	call m.heavyCompute() after await import()
+C16-class-this	apps/web/src/services/store.ts::MemClient.get	MemClient.norm	this call
+C16-class-new	store.ts::viaConcrete	MemClient.get	typed receiver from `new`
+C16-static	store.ts::viaStatic	MemClient.create	static call
+C17-class-field	store.ts::viaStatic	MemClient.handle	KNOWN ft-32522da4 #6 (field arrow)
+C18-object-literal-method	store.ts::useService	paperService.fetchOne / svcHelper	call; svcHelper live
+C18-object-literal-arrow	store.ts::useService	paperService.remove	call
+C19-interface	store.ts::useClient	Client.get (interface) -> MemClient.get impl	interface dispatch; at least Client.get
+C19-type-import	PaperList	Client	type-only reference, no call edge
+C20-generics	usePapers	format.ts::identity	call `identity<number>(rank)`
+C21-promise-chain	api.ts::loadAll	api.ts::parseBody	reference via .then(parseBody)
+C21-promise-chain	api.ts::loadAll	api.ts::logIt	call inside .then arrow
+C21-async	api.ts::loadAll	api.ts::getPapers	call
+C22-inline-handler	PaperList	api.ts::loadAll	call inside onClick arrow
+C23-api-route	api.ts::getPapers	backend/api/server.go GET /api/papers -> handlePapers	routes/api-impact client link
+C23-api-route	api.ts::postNote	POST /api/notes -> handleNotes	routes/api-impact client link
+C24-vitest	format.test.ts::<file or it-callback>	format.ts::formatTitle	call; `affected formatTitle` lists format.test.ts
+C25-js-jsdoc	PaperList	legacy/jsutil.js::jsDouble	call TS->JS
+C26-case-mismatch	PaperList	lib/casefile.ts::caseHelper	import '../lib/CaseFile' — wrong case: should be flagged unresolved (Linux build fails) or resolved with a warning; never silently fine AND never silently dropped
+C27-workspace-pkg	PaperList	packages/shared/src/index.ts::sharedFormat	call via @acme/shared workspace package
+C28-memo	PaperList	Button.tsx::MemoBadge	call(JSX) to memo-wrapped; MemoBadge.badgeText attributed
+C28-forwardRef	PaperList	Button.tsx::FancyInput	call(JSX) to forwardRef-wrapped; fancyValue live
+DEAD-expected	format.ts::unusedLibFn	—	only true dead symbol among functions
+V1-reexport-alias	v/onlyfmt.ts::useFmtOnly	lib/format.ts::formatTitle	call via barrel `export { formatTitle as fmt }`
+V2-npm-namesake	v/npmcollide.ts::callsNpm	(none)	external import must NOT bind to local lib/format.ts::formatTitle (false edge if it does)
+V3-typed-param	v/typedparam.ts::viaParam	services/store.ts::MemClient.get	receiver typed by parameter annotation
+V3-typed-param	v/typedparam.ts::viaArrowParam	services/store.ts::MemClient.get	receiver typed by parameter annotation (arrow)
+V3-iface-param	v/typedparam.ts::viaIface	Client.get (interface member)	at minimum honest uninferred; ideally interface method symbol + implementers
+V4-dead-unexported	v/deadlocal.ts::neverCalledLocal, neverCalledArrow	—	reported dead (high confidence)
+V5-default-memo-barrel	v/effects.tsx::EffectUser	v/widgets/Card.tsx::Card	JSX via `export default memo(Card)` + `export { default as Card }` and `export { default }` barrel
+V5-default-memo	v/widgets/Card.tsx::Card	cardText	call; Card live
+V6-class-component	v/ClassComp.tsx::Legacy.componentDidMount	Legacy.load	this call; lifecycle methods (render, componentDidMount) exempt from dead
+V7-useEffect	v/effects.tsx::EffectUser	effectLoad	call inside useEffect closure
+V8-exported-arrow-js-ext	v/arrowuser.ts::useArrow	v/arrows.ts::exportedArrow	import specifier './arrows.js' maps to arrows.ts (NodeNext convention)
+V8-ts-ext	v/arrowuser.ts::useArrow	pages/heavy.ts::heavyCompute	import with explicit .ts extension (allowImportingTsExtensions)
+V8-enum	v/arrowuser.ts::useArrow	v/arrows.ts::Mode (reference), modeName (call)	enum symbol + reference
+V9-router-object	v/router.tsx::router (or file)	RoutedPage	JSX in route object; RoutedPage live
+V9-router-lazy	v/router.tsx	v/lazyroute.tsx::Component	lazy route module; Component should not be reported dead with high confidence
+V10-vi-mock	v/api.test.ts	services/api.ts::loadAll	call; affected loadAll includes api.test.ts
+V11-grammar-abstract-field	v/grammar.ts::afterAbstract	beforeHelper, afterHelper	interface with `abstract?: string` must parse Clean; calls after it intact
+V11-grammar-typeof-import	v/grammar2.test.ts::callsHelper	testHelperAfterTypeofImport	`typeof import()` in type args must parse Clean
+V12-typeof-import-alias	v/typeofuser.tsx::TypeofUser	v/typeofimport.tsx::TypeofProvider, useTypeof	top-level `type X = typeof import(...)` must not erase the file symbols
+V13-import-type-member	v/importtypeuser.tsx::ImportTypeUser	v/importtype.tsx::ImportTypeProvider, useImportType	`type X = import('m').Name;` (no type args) in .tsx must not erase following declarations
+V14-import-then-export-list	v/view2user.ts::consumeWorkspace	v/store2.ts::useWorkspace	`import {x} from; export {x};` re-export through a local export list
+V15-object-shorthand-member	v/loggeruser.ts::useLogger	v/logger.ts::getLogs	`{ getLogs }` shorthand property names the function; logger.getLogs() -> getLogs
+V15-object-arrow-member	v/loggeruser.ts::useLogger	v/logger.ts::clearLogs (via logger.clear arrow)	object-literal arrow member
+V15-object-spread-member	v/loggeruser.ts::useLogger	core.log	spread member; honest uninferred acceptable
+V16-lexical-this-arrow	v/lexicalthis.ts::Gateway.open(.connect)	Gateway.buildUrl	`this` inside an arrow nested in a method is the class instance
+V17-default-param-ref	v/defaults.ts::withDeps	defaultSleep (reference), repoRoot (call)	destructured default parameter values; neither reported dead
+V17-default-param-call	v/defaults.ts::withPlain	plainDefault (call)	simple default parameter call
+V18-ambient-module	v/ambient.d.ts	-	`declare module` augmentation must not be a dead candidate

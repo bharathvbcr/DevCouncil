@@ -1,0 +1,15 @@
+# Dead-code truth for this fixture, read by devmap-cli/tests/dead_tier_eligibility.rs.
+# verdict<TAB>symbol_id<TAB>why
+#   truly_dead            nothing reaches it; must be reported (at 0.9 when the language is eligible)
+#   live                  something reaches it; never above 0.4, never in the confident branch
+#   exported_unreferenced exported but provably module-private and unused; reported at 0.4 exported_unreferenced
+#   exempt                never a dead candidate at any tier
+# Any confident-branch row (>= 0.9, or capped with confident_tier_unproven) not labelled truly_dead is a 0.9-tier false positive.
+truly_dead	app/src/main/java/com/fx/app/HabitHistory.kt::unusedPrivateHabitHelper	K31
+live	app/src/main/java/com/fx/app/HabitHistory.kt::HabitHistoryTemplate.matchesHabitHistoryTerm	K30: bound callable reference template::m
+live	app/src/main/java/com/fx/app/HabitHistory.kt::isBlankTerm	K30: bare callable reference ::isBlankTerm
+exported_unreferenced	app/src/main/java/com/fx/app/Registry.kt::Registry.unusedRegistryFn	public in an application module, uncalled
+exported_unreferenced	app/src/main/java/com/fx/app/Screens.kt::UnusedBadge	@Composable nothing composes
+exempt	app/src/main/java/com/fx/app/BootReceiver.kt::BootReceiver	AndroidManifest receiver
+exempt	app/src/main/java/com/fx/app/FxApp.kt::FxApp	AndroidManifest application
+exempt	app/src/main/java/com/fx/app/MainActivity.kt::MainActivity	AndroidManifest activity

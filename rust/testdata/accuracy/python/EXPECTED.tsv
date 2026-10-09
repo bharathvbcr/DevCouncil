@@ -1,0 +1,53 @@
+# construct	kind	source	target	expect
+C01	Imports	lib/pkg/__init__.py	lib/pkg/core.py	edge
+C01	reexport	lib/pkg/sub/deep.py::forms	lib/pkg/core.py::Engine	Calls/References edge via pkg.__init__ re-export
+C02	Calls	lib/pkg/sub/deep.py::forms	lib/pkg/util.py::helper	edge (import pkg.util; pkg.util.helper())
+C03	Calls	lib/pkg/sub/deep.py::forms	lib/pkg/util.py::helper	edge (from pkg import util as u; u.helper())
+C04	Calls	lib/pkg/sub/deep.py::forms	lib/pkg/util.py::helper	edge (from ..util import helper as h)
+C05	Calls	lib/pkg/sub/deep.py::forms	lib/pkg/core.py::Engine.step	edge (E2(1).step())
+C05b	Calls	lib/pkg/sub/deep.py::forms	lib/pkg/core.py::Engine.run	edge
+C06	Calls	scripts/tool.py::main	lib/pkg/util.py::split	edge (sys.path insert of lib); NOT other/dup.py::split
+C07	Calls	lib/pkg/core.py::Engine.__init__	lib/pkg/core.py::Base.__init__	edge (super().__init__)
+C07b	Calls	lib/pkg/core.py::Engine.run	lib/pkg/core.py::Base.run	edge (super().run())
+C07c	Calls	lib/pkg/flows.py::inherited_only	lib/pkg/core.py::Base.quack	edge via MRO; NOT Duck.quack
+C08	References	lib/pkg/flows.py::props	lib/pkg/core.py::Engine.size	property read edge (any kind) or honest miss
+C09	Calls	lib/pkg/flows.py::statics	lib/pkg/core.py::Engine.norm	edge
+C09b	Calls	lib/pkg/flows.py::statics	lib/pkg/core.py::Engine.create	edge
+C09c	Calls	lib/pkg/core.py::Engine.step	lib/pkg/core.py::Engine.norm	edge (self.norm)
+C09d	Calls	lib/pkg/core.py::Engine.create	lib/pkg/core.py::Engine	edge-ish (cls(0)) or honest miss
+C10	Calls	lib/pkg/util.py::wrapper	lib/pkg/util.py::log_call	edge (nested fn in decorator)
+C10b	Calls	lib/pkg/util.py::work	lib/pkg/util.py::helper	edge (decorated fn)
+C10c	Calls	lib/pkg/flows.py::closures	lib/pkg/util.py::work	edge
+C11	Calls	lib/pkg/models.py::build_config	lib/pkg/models.py::Config.validate	edge (dataclass ctor typing)
+C11b	symbol	lib/pkg/models.py::Item.label	-	symbol emitted
+C12	Calls	lib/pkg/flows.py::typed	lib/pkg/core.py::Engine.step	edge ReceiverType (annotation)
+C12b	Calls	lib/pkg/flows.py::constructed	lib/pkg/core.py::Engine.reset	edge
+C12c	Calls	lib/pkg/flows.py::constructed	lib/pkg/core.py::Engine.run	edge (Engine.run overrides Base.run)
+C13	Calls	lib/pkg/util.py::add	lib/pkg/util.py::helper	edge (closure)
+C13b	Calls	lib/pkg/flows.py::lambdas	lib/pkg/util.py::score	edge (lambda body)
+C13c	Calls	lib/pkg/flows.py::closures	lib/pkg/util.py::make_adder	edge
+C14	Calls	lib/pkg/flows.py::duck	lib/pkg/core.py::Base.quack|Duck.quack	NO confident edge; honest unresolved/ambiguous
+C15	References	lib/pkg/flows.py::partials	lib/pkg/util.py::helper	reference edge (partial(helper), apply(helper))
+C15b	Calls	lib/pkg/flows.py::partials	lib/pkg/util.py::apply	edge
+C16	Calls	lib/pkg/numeric.py::total	lib/pkg/numeric.py::filter|select	NO edge (polars chain); unresolved external
+C17	entry	lib/pkg/cli.py::main	-	not dead (console_scripts + click + __main__)
+C17b	entry	lib/pkg/cli.py::sub_cmd	-	not dead (click subcommand)
+C17c	Calls	lib/pkg/cli.py::main	lib/pkg/core.py::Engine.create	edge
+C17d	Calls	lib/pkg/cli.py::main	lib/pkg/core.py::Engine.step	edge (eng = Engine.create(); return type annotated)
+C18	entry	lib/pkg/web.py::list_items	-	not dead; route GET /items
+C18b	Calls	lib/pkg/web.py::list_items	lib/pkg/util.py::helper	edge
+C19	Calls	lib/pkg/core.py::Engine.fetch	lib/pkg/core.py::Engine.load	edge (await self.load())
+C19b	Calls	lib/pkg/flows.py::runner	lib/pkg/core.py::Engine.fetch	edge (await e.fetch())
+C20	Calls	tests/test_core.py::test_split	lib/pkg/util.py::split	ImportScoped edge only; NOT other/dup.py::split (needs pytest pythonpath=lib)
+C20b	Calls	lib/pkg/web.py::list_items	lib/pkg/util.py::helper	NOT other/dup.py::helper
+C21	Calls	lib/pkg/flows.py::with_ctx	lib/pkg/core.py::Engine.__enter__	edge or honest miss (implicit dunder)
+C21b	Calls	lib/pkg/core.py::Engine.__exit__	lib/pkg/core.py::Engine.reset	edge
+C21c	Calls	lib/pkg/core.py::Engine.__call__	lib/pkg/core.py::Engine.step	edge
+C22	Calls	lib/pkg/dyn.py::by_name	lib/pkg/util.py::*	NO edge; honest unresolved
+C22b	Calls	lib/pkg/dyn.py::by_import	lib/pkg/util.py::helper	edge or honest miss; NOT other/dup.py::helper
+C23	entry	tests/conftest.py::engine	-	not dead (fixture used by name)
+C23b	Calls	tests/test_core.py::test_engine	lib/pkg/core.py::Engine.step	edge if fixture return typed; honest miss acceptable
+C23c	entry	tests/conftest.py::unused_fixture	-	dead candidate (truly unused) at reduced confidence acceptable
+C24	entry	tests/test_core.py::test_engine|TestGroup.test_method	-	not dead (pytest discovery)
+C25	dead	other/dup.py::split|helper	-	truly dead (expected in dead list)
+C26	Imports	tests/test_core.py	lib/pkg/util.py	Imports edge via pytest pythonpath

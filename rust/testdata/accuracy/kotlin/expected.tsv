@@ -1,0 +1,58 @@
+# construct	caller	callee	kind(true|false-bait)
+K10	TaskRepository.refresh	TaskRepository.load	true
+K16	TaskRepositoryImpl.load	TaskDao.all	true
+K17	TaskRepositoryImpl.load	TaskApi.fetchRemote	true
+K09	TaskRepositoryImpl.load	LoadResult.Ok	true
+K06	Task.label	String.slugify	true
+K26	GetTasksUseCase.invoke	TaskRepository.load	true
+K08	FxApp.onCreate	Registry.register	true
+K19	FxApp.onCreate	FxApp.onCreate	false-bait
+K19	BootReceiver.onReceive	BootReceiver.rescheduleAll	true
+K07	Clock.create	Clock	true
+K26	MainViewModel.refresh	GetTasksUseCase.invoke	true
+K04	MainViewModel.refresh	MainViewModel.countDone	true
+K09	MainViewModel.describe	MainViewModel.summarize	true
+K01	HomeScreen	Header	true
+K02	HomeScreen	MainViewModel.describe	true
+K01	HomeScreen	Card	true
+K27	HomeScreen	MainViewModel.refresh	true(reference)
+K18	AppNavGraph	HomeScreen	true
+K18	AppNavGraph	SettingsScreen	true
+K01	SettingsScreen	Header	true
+K14	MainActivity(clock init)	Clock.create	true
+K01	MainActivity.onCreate	AppNavGraph	true
+K14	MainActivity.onCreate	MainViewModel.refresh	true
+K13	MainActivity.onCreate	Task	true
+K11	MainActivity.onCreate	Task.complete	true
+K05	MainActivity.onCreate	Task.isOverdue	true
+K05	MainActivity.onCreate	String.slugify	true
+K06	MainActivity.onCreate	Task.label	true(reference)
+K15	MainActivity.onCreate	formatDuration	true
+K25	MainActivity.onCreate	Int.every	true
+K24	MainActivity.onCreate	castOrNull	true
+K07	MainActivity.onCreate	Clock.elapsed	true
+K11	MainActivity.onCreate	MainActivity.log	true
+K12	MainActivity.onCreate	buildPage	true
+K12	MainActivity.onCreate	Page.section	true
+K23	MainActivity.onCreate	LegacyMath.twice	true
+K12	buildPage	Page	true
+K03	RepoModule.provideRepo	TaskRepositoryImpl	true
+K03	RepoModule.provideApi	buildApi	true
+K10	Greeter.greet	Greeter.hello	true
+K10	greetAll	Greeter.greet	true
+K13	greetAll	English	true
+K28	greetAll	English.hello	true
+K28	greetAll	Door.hello	true(cast)
+K23	LegacyMath.callKotlin	Registry.register	true
+K20	ClockTest.elapsedCountsFromStart	Clock.create	true
+K20	ClockTest.elapsedCountsFromStart	Clock.elapsed	true
+K21	HeaderUiTest.showsTitle	Header	true
+K22	build.gradle.kts(app)	versionCodeFor	true
+# dead expectations
+DEAD	Registry.unusedRegistryFn	truly-dead
+DEAD	UnusedBadge	truly-dead(@Composable)
+LIVE	BootReceiver	manifest-declared
+LIVE	FxApp	manifest+@HiltAndroidApp
+LIVE	MainActivity	manifest+@AndroidEntryPoint
+LIVE	RepoModule.provideRepo	@Provides
+LIVE	TaskDao.clear	@Dao generated impl (interface member)

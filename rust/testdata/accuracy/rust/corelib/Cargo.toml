@@ -1,0 +1,12 @@
+[package]
+name = "corelib"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[features]
+default = []
+fast = []
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }

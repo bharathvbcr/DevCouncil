@@ -1,0 +1,16 @@
+# XcodeGen spec (the ChronosFlow layout): Shared/ is compiled into BOTH targets.
+name: Demo
+targets:
+  AppTarget:
+    type: application
+    platform: iOS
+    sources: [AppTarget, Shared]
+    dependencies:
+      - package: CoreKit
+  WidgetTarget:
+    type: app-extension
+    platform: iOS
+    sources: [WidgetTarget, Shared]
+packages:
+  CoreKit:
+    path: CoreKit

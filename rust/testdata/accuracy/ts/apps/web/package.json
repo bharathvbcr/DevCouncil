@@ -1,0 +1,1 @@
+{ "name": "@acme/web", "version": "1.0.0", "dependencies": { "@acme/shared": "workspace:*", "react": "18.3.1", "react-router-dom": "6.26.0" }, "devDependencies": { "vitest": "2.1.0" } }

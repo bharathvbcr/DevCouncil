@@ -1,0 +1,18 @@
+# Dead-code truth for this fixture, read by devmap-cli/tests/dead_tier_eligibility.rs.
+# verdict<TAB>symbol_id<TAB>why
+#   truly_dead            nothing reaches it; must be reported (at 0.9 when the language is eligible)
+#   live                  something reaches it; never above 0.4, never in the confident branch
+#   exported_unreferenced exported but provably module-private and unused; reported at 0.4 exported_unreferenced
+#   exempt                never a dead candidate at any tier
+# Any confident-branch row (>= 0.9, or capped with confident_tier_unproven) not labelled truly_dead is a 0.9-tier false positive.
+truly_dead	corelib/src/deadprobe.rs::truly_dead_c99	C41
+live	corelib/src/probes2.rs::shadow_a_c48	C48: let-pattern shadowing its own initializer's callee
+live	corelib/src/probes2.rs::shadow_b_c48	C48: called inside a closure in the pattern's initializer
+live	corelib/src/probes2.rs::shadow_c_c48	C48
+live	tauri_like/src/commands.rs::cmd_private_c39	C39: #[tauri::command] registered in generate_handler!
+live	corelib/src/deadprobe.rs::Hidden.via_deref_c41	C41
+live	corelib/src/deadprobe.rs::Hidden.via_question_c41	C41
+live	corelib/src/deadprobe.rs::Hidden.via_closure_c41	C41
+exempt	corelib/src/guards.rs::with_guard_c50.Guard	C50: function-local RAII guard
+exempt	corelib/src/guards.rs::with_guard_c50.Guard.drop	C50: Drop runs it
+exempt	corelib/src/guards.rs::inner_extern_c51.abs	C51: inner extern declaration

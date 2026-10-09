@@ -1,0 +1,64 @@
+# Written before devmap was run. caller<TAB>expected callee(s)<TAB>construct<TAB>note
+# "|" separates acceptable targets (trait decl or impl); "!" prefix = must NOT be an edge.
+c01_caller	Dog.speak_c01|Speak.speak_c01	C01 trait static dispatch	receiver typed by &Dog param
+c02_caller	Speak.render_c02|Render.render_c02|Sq.render_c02+Ci.render_c02	C02 dyn Trait	trait decl, or fan-out to both impls
+c02b_caller	Render.render_c02|Sq.render_c02+Ci.render_c02	C02 Box<dyn> in closure	
+c03_caller	Render.area_c03|Sq.area_c03+Ci.area_c03	C03 generic bound T: Render	
+c04_caller	Describe.describe_c04|blanket impl describe_c04	C04 blanket impl on i32 literal	
+c05_caller	Wrapper.new_c05,Wrapper.get_c05	C05 generic impl	
+c06_caller	Counter.new_c06,Counter.incr_c06	C06 assoc fn + method + UFCS	
+c07_caller	make_c07,Render.render_c02	C07 impl Trait return	
+c08_caller	Inner.inner_c08	C08 Deref + auto-ref	
+c09_caller	apply_c09,helper_c09,helper_c09b(ref)	C09 closure arg + fn item arg	
+c10_caller	Item.keep_c10,Item.score_c10,Item.score_c10b(ref)	C10 iterator chains	closure params typed by slice element
+c11_caller	parse_c11,Config.validate_c11	C11 ? propagation	
+c12_caller	helper_c12,twice_c12(macro),log_c12(macro)->emit_c12	C12 macro_rules!	emit_c12 is called only in the macro body
+c13_caller	fmt_c13,calc_c13,Named.name_c13	C13 println!/assert_eq!/vec!/format! args	
+c14_caller	Signals.recv_c14,handle_c14,tick_c14	C14 tokio::select!	
+c15_caller	Manual.clone;!Manual.clone for d.clone()	C15 derive	d.clone() must not bind to Manual.clone
+c16_caller	fetch_c16,Client.get_c16	C16 async/.await	
+Client.get_c16	fetch_c16	C16	
+c17_caller(app)	cross_c17(x2),Circle.new_c17,Circle.radius_c17	C17 cross-crate	
+c18_caller(app)	reexported_c18,renamed_src_c18b,dist_c19	C18 pub use chains	
+c01_cross(app)	Dog.speak_c01|Speak.speak_c01	C17 cross-crate trait method	
+c02_cross(app)	Render.render_c02|impls	C17 cross-crate dyn	
+shapes_entry_c19	area_c19	C19 mod.rs layout	
+geo_entry_c19	dist_c19	C19 geo.rs+geo/ layout	
+c20_caller	algo_c20,fast_impl.gated_c20b	C20 cfg/feature	
+t_c21	target_c21	C21 #[test]	t_c21 not dead
+t2_c21	only_tested_c21b	C21 #[tokio::test]	t2_c21 not dead
+it_c21(app/tests)	target_c21	C21 integration test	not dead
+it2_c21(app/tests)	fetch_c16	C21	not dead
+build.rs main	gen_c22	C22 build.rs	main/gen_c22 not dead
+c23_caller	abs(extern decl)	C23 FFI	exported_c23 not dead (#[no_mangle])
+c24_caller	init_c24(ref),FPTR_C24/helper_c24	C24 const/static	REG_C24,LIMIT_C24 referenced
+c25_caller	Shape.new_c25,Shape.area_c25	C25 enum impl	Shape::Circle(..) not a fn edge
+c26_caller	V.add,Table.index,Res.drop,Meters.from,MyErr.from	C26 operator traits	all implicit; expect honest miss
+Engine.other_c28	Engine.helper_c28	C28 Self::	
+Engine.run_c28	Engine.other_c28	C28 self.	
+c29_caller	hook_target_c29(ref)	C29 fn-pointer field	(h.cb_c29)(1) unresolvable: honest miss expected
+Service.c30_caller	Store.save_c30	C30 typed field receiver	
+c34_caller	Store.save_c30	C34 &T param receiver	
+c32_caller	Wrapper.new_c05,Wrapper.get_c05,parse_as_c32	C32 turbofish	
+outer_c33	inner_c33	C33 nested fn	
+c36_caller	Bag.push_c36(x2)	C36 Rc<RefCell>/Arc<Mutex> deref	
+c37_caller	Item.score_c10,Item.score_c10b	C37 if-let / for pattern receivers	
+c35_caller	Factory.create_c35|Dog.create_c35	C35 T::assoc fn	
+c27_caller	Template.tmpl_c27	C27 trait default method	
+Template.tmpl_c27	Template.hook_c27|Concrete.hook_c27	C27 self in default body	
+c31_caller	StrExt.ext_c31|str impl ext_c31	C31 extension trait on str	
+c38_caller	work_c38(call in closure),work_c38(ref)	C38 thread::spawn closure / fn item	
+tauri main	cmd_c39,cmd_async_c39(ref in generate_handler!)	C39 tauri commands	cmd_* not dead
+cmd_c39	helper_c39	C39	
+Payload(serde attr)	default_c40,ser_c40	C40 serde attribute fn strings	not dead
+# added after first run (dead-code probes) -- expectations written before the rebuild
+deadprobe_entry	via_deref_c41,via_question_c41,via_closure_c41,act_c41,alpha.twin_c42,make_hidden_c41,call_hidden_c41(macro)	C41	only truly_dead_c99 and beta.twin_c42 dead
+tauri main	cmd_private_c39	C39	private tauri command not dead
+# second addition (after corpus sample, before rebuild)
+probes2.spawn	(none: std Command::spawn)	C43	!probes2.spawn self-edge
+Command.spawn_ext_c43	(none: std Command::spawn)	C43	!probes2.spawn
+c45_caller	Gauge.level_c45(x2)	C45	!level_c45 (free fn) Calls or References
+c46_caller	make_outcome_c46,try_outcome_c46,sub.nested_outcome_c46,Outcome.read_c46(x4)	C46 free-fn return typing	
+libnamed main	run_c44,Thing.make_c44,Thing.value_c44,only_from_bin_c44	C44 [lib] name	
+it_c44	Thing.make_c44,Thing.value_c44,only_from_bin_c44	C44	
+c48_caller	shadow_a_c48,shadow_b_c48,shadow_c_c48	C48 let-pattern shadowing its own initializer's callee	all three private fns must stay live
