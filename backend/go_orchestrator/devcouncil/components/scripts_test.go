@@ -34,7 +34,7 @@ func repoRoot(t *testing.T) string {
 	}
 }
 
-// fakeGo is a `go` whose `build -o OUT` writes a host that prints
+// fakeGo is a `go` whose `build -o OUT` writes an installer that prints
 // DEVCOUNCIL_ROOT and then each argument on its own line, and exits with
 // $FAKE_HOST_EXIT. It records its own arguments in $FAKE_GO_LOG.
 const fakeGo = `#!/bin/sh
@@ -97,7 +97,7 @@ func TestBootstrapBuildsTheHostFromThisCheckoutAndHandsItEveryArgument(t *testin
 	}
 	gotGo := strings.Join(r.goArgs, " ")
 	if !strings.HasPrefix(gotGo, "-C "+filepath.Join(root, "backend", "go_orchestrator")+" build -o ") ||
-		!strings.HasSuffix(gotGo, " ./cmd/devcouncil") {
+		!strings.HasSuffix(gotGo, " ./cmd/dcinstall") {
 		t.Fatalf("go %s", gotGo)
 	}
 }

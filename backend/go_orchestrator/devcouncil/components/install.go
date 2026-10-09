@@ -56,8 +56,9 @@ each binary is copied beside its destination and renamed into place. Outside a
 checkout they come from cargo install --git.
 
 Bootstrap (no host binary yet): bash scripts/install.sh [same arguments], or
-.\scripts\install.ps1 on Windows. Each builds this host into a temporary
-directory and runs this command. Without Go, devmap alone installs with:
+.\scripts\install.ps1 on Windows. Each builds cmd/dcinstall (this command,
+without the Gusset engine the host links) into a temporary directory and runs
+it. Installing the host still needs Gusset checked out beside DevCouncil. Without Go, devmap alone installs with:
   cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked devmap-cli
 
 There is no uv / Python install path. Components are native Go and Rust

@@ -1,11 +1,12 @@
 #!/usr/bin/env sh
 # First-time bootstrap for DevCouncil.
 #
-# `devcouncil install` is the installer. This script only gets a host binary
-# to run it: it builds the Go host from this checkout into a temporary
-# directory and runs `devcouncil install` with the same arguments —
-# `devcouncil uninstall` when --uninstall is among them. Every preset, flag
-# and health check belongs to that command; `--help` prints them.
+# `devcouncil install` is the installer. This script only gets it running on
+# a machine with no host yet: it builds cmd/dcinstall — the same install code,
+# without the Gusset engine the host links — into a temporary directory and
+# runs it with the same arguments (uninstall when --uninstall is among them).
+# Every preset, flag and health check belongs to that command; `--help`
+# prints them.
 #
 #   bash scripts/install.sh                          # host + every analysis binary
 #   bash scripts/install.sh --only=devmap            # one component, no host
@@ -48,8 +49,10 @@ trap 'rm -rf "$tmp"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-go -C "$repo_root/backend/go_orchestrator" build -o "$tmp/devcouncil" ./cmd/devcouncil
+# dcinstall is `devcouncil install` without what the host links, so a first
+# install — devmap alone, above all — needs Go but not the Gusset checkout.
+go -C "$repo_root/backend/go_orchestrator" build -o "$tmp/dcinstall" ./cmd/dcinstall
 
 status=0
-DEVCOUNCIL_ROOT="$repo_root" "$tmp/devcouncil" "$verb" "$@" || status=$?
+DEVCOUNCIL_ROOT="$repo_root" "$tmp/dcinstall" "$verb" "$@" || status=$?
 exit "$status"

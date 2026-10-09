@@ -1,9 +1,9 @@
 # First-time bootstrap for DevCouncil on Windows.
 #
-# `devcouncil install` is the installer. This script only gets a host binary
-# to run it: it builds the Go host from this checkout into a temporary
-# directory and runs `devcouncil install` (or `devcouncil uninstall` with
-# -Uninstall), translating these parameters to its flags. Every preset and
+# `devcouncil install` is the installer. This script only gets it running on
+# a machine with no host yet: it builds cmd/dcinstall — the same install code
+# the host runs — into a temporary directory and runs it with install (or
+# uninstall with -Uninstall), translating these parameters to its flags. Every preset and
 # health check belongs to that command; -Help prints them.
 #
 #   .\scripts\install.ps1                          # host + every analysis binary
@@ -39,8 +39,9 @@ if ($Help) { $argv += "--help" }
 if ($List) { $argv += "--list" }
 if ($HostOnly) { $argv += "host" }
 $argv += $Components
-if ($All) { $argv += "--all" }
-if ($Yes) { $argv += "--yes" }
+# --all and --yes are uninstall's; install refuses flags it does not know.
+if ($Uninstall -and $All) { $argv += "--all" }
+if ($Uninstall -and $Yes) { $argv += "--yes" }
 # DRY_RUN=1 is how the scripts this replaced were asked to touch nothing.
 if ($DryRun -or ($env:DRY_RUN -and $env:DRY_RUN -ne "0")) { $argv += "--dry-run" }
 if ($Prefix) { $argv += @("--prefix", $Prefix) }
@@ -49,8 +50,8 @@ $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("devcouncil-bootstrap-" + [g
 New-Item -ItemType Directory -Path $tmp | Out-Null
 $code = 1
 try {
-    $hostExe = Join-Path $tmp "devcouncil.exe"
-    go -C (Join-Path $RepoRoot "backend\go_orchestrator") build -o $hostExe ./cmd/devcouncil
+    $hostExe = Join-Path $tmp "dcinstall.exe"
+    go -C (Join-Path $RepoRoot "backend\go_orchestrator") build -o $hostExe ./cmd/dcinstall
     if ($LASTEXITCODE -ne 0) {
         $code = $LASTEXITCODE
     } else {

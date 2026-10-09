@@ -15,6 +15,7 @@ import (
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/console"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/components"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/gatescfg"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/integrate"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/mcp"
@@ -72,8 +73,8 @@ var commands = map[string]func(args []string) int{
 	"skills":       runSkills,
 	"verify":       runVerify,
 	"grep":         runGrep,
-	"install":      runInstall,
-	"uninstall":    runUninstall,
+	"install":      components.RunInstall,
+	"uninstall":    components.RunUninstall,
 	"disable":      runDisable,
 	"enable":       runEnable,
 	"gate":         runGate,
