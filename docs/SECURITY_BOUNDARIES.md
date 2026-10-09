@@ -51,7 +51,17 @@ the same guards, set on the command line where they outrank every config file:
 after `diff`, `log` and `show`, and `--no-textconv` after `blame`. A planted
 fsmonitor that answers "nothing changed" could otherwise hide a change as well
 as run. Filter drivers (`filter.<name>.clean`, which `diff` runs and no flag
-disables) are not covered yet; that decision is open in ft-ff2153d9. The write
+disables) are handled by reading the repository's filter config first: every
+setting the repository's own scope gives a driver (local or worktree, which
+includes files pulled in through `include.path`) is set again on the command
+line to the operator's value from system, global or command scope, or to
+empty, and the driver's `required` to the operator's value or `false`. Filters
+only the operator defines, such as a global git-lfs install, keep running. A
+driver name a `-c` argument cannot spell is refused. The read is skipped for
+`rev-parse`, `rev-list` and `log`, which never pass working-tree files through
+a filter. Submodule worktrees are left as they are: the guards reach the gits
+a diff starts inside them, and a parent's diff was not seen to run a
+submodule's own filter. The write
 gate already refuses writes under `.git/` in enforce mode; these guards cover a
 `.git/config` that arrived with the repository, advisory and off modes, and
 agents not routed through the gate. Integration separates the two questions

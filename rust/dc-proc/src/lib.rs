@@ -190,10 +190,21 @@ where
     S: AsRef<OsStr>,
 {
     let resolved = resolve_outside(program, std::env::var_os("PATH").as_deref(), root)?;
+    let args: Vec<std::ffi::OsString> = args
+        .into_iter()
+        .map(|a| a.as_ref().to_os_string())
+        .collect();
+    let subcommand = args.get(subcommand_index(&args)).and_then(|s| s.to_str());
+    let filters = if subcommand.is_some_and(|s| FILTER_FREE.contains(&s)) {
+        Vec::new()
+    } else {
+        repository_filter_overrides(&resolved, root)?
+    };
     let mut command = Command::new(resolved);
     command
         .arg("-C")
         .arg(root)
+        .args(filters)
         .args(guarded_args(args))
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0");
@@ -220,8 +231,9 @@ where
 /// stay in place; the subcommand is the first argument that is not one. The
 /// Go host's `proc.GitArgs` applies the same rule.
 ///
-/// Not covered: filter drivers (`filter.<name>.clean` runs on `diff`, and no
-/// flag disables it) — tracked in ft-ff2153d9 for the owner's decision.
+/// Filter drivers need the repository's config read first, because no flag
+/// disables them; [`git_with_program`] does that with
+/// `repository_filter_overrides`.
 pub fn guarded_args<I, S>(args: I) -> Vec<std::ffi::OsString>
 where
     I: IntoIterator<Item = S>,
@@ -243,14 +255,7 @@ where
     .into_iter()
     .map(std::ffi::OsString::from)
     .collect();
-    let mut i = 0;
-    while i < args.len() && args[i].as_encoded_bytes().starts_with(b"-") {
-        if args[i] == "-c" || args[i] == "-C" {
-            i += 1;
-        }
-        i += 1;
-    }
-    let i = i.min(args.len());
+    let i = subcommand_index(&args);
     out.extend_from_slice(&args[..i]);
     if let Some(sub) = args.get(i) {
         out.push(sub.clone());
@@ -263,6 +268,157 @@ where
         out.extend_from_slice(&args[i + 1..]);
     }
     out
+}
+
+/// The index of the subcommand in `args`: the first argument that is not a
+/// global option (`-c k=v` and `-C dir` take a value). `args.len()` when there
+/// is none.
+fn subcommand_index(args: &[std::ffi::OsString]) -> usize {
+    let mut i = 0;
+    while i < args.len() && args[i].as_encoded_bytes().starts_with(b"-") {
+        if args[i] == "-c" || args[i] == "-C" {
+            i += 1;
+        }
+        i += 1;
+    }
+    i.min(args.len())
+}
+
+/// Read subcommands that never pass a working-tree file through a filter
+/// driver, so [`git_with_program`] skips reading the filter config for them —
+/// which keeps `rev-parse HEAD` on every hook and churn's `log` at one spawn.
+/// Listed this way round on purpose: a subcommand added later gets the
+/// filter read until someone shows it cannot need one. The Go host's
+/// `proc.filterFree` is the same list.
+const FILTER_FREE: &[&str] = &["rev-parse", "rev-list", "log"];
+
+/// The filter listing read before each git read is bounded; one that does not
+/// fit is refused, because a truncated listing could omit a driver.
+const FILTER_CONFIG_LIMIT: usize = 1 << 20;
+
+/// `-c` arguments that neutralize every filter driver the repository itself
+/// defines. The Go host's `proc.repositoryFilterOverrides` applies the same
+/// rule; see [`filter_overrides`] for it.
+///
+/// `filter.<name>.clean` runs on `diff`, and no flag turns filters off, so the
+/// repository's config is read first (reading config runs nothing). A root
+/// git cannot enter has no repository config to neutralize; the read that
+/// follows reports the root itself.
+fn repository_filter_overrides(git: &Path, root: &Path) -> Result<Vec<String>, Failure> {
+    let program = git.display().to_string();
+    let mut command = Command::new(git);
+    command
+        .arg("-C")
+        .arg(root)
+        .args(["config", "--show-scope", "-z", "--get-regexp", "^filter\\."])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    let captured = run_bounded(
+        &mut command,
+        Bounds {
+            deadline: Duration::from_secs(10),
+            stdout_cap: FILTER_CONFIG_LIMIT,
+            stderr_cap: 4096,
+        },
+    )?;
+    let refuse = |message: String| Failure::Spawn {
+        program: program.clone(),
+        error: std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+    };
+    match captured.status.code() {
+        Some(0) => {}
+        // 1: no filter defined anywhere. 128: git cannot enter root, so there
+        // is no repository config.
+        Some(1 | 128) => return Ok(Vec::new()),
+        _ => {
+            return Err(refuse(format!(
+                "reading the repository's filter config exited {:?}: {}",
+                captured.status.code(),
+                captured.stderr_trimmed()
+            )));
+        }
+    }
+    if captured.stdout_truncated {
+        return Err(refuse(format!(
+            "the repository's filter config exceeds {FILTER_CONFIG_LIMIT} bytes; refusing to read \
+             with filters it could not check"
+        )));
+    }
+    filter_overrides(&captured.stdout).map_err(refuse)
+}
+
+/// Turns `git config --show-scope -z --get-regexp ^filter\.` output
+/// (`scope NUL key [LF value] NUL`, repeated) into `-c` arguments.
+///
+/// A driver any repository-scoped entry touches — scope `local` or
+/// `worktree`, which includes values pulled in through `include.path` from a
+/// tracked file — has each setting the repository gave it set again: to the
+/// operator's own value when `system`, `global` or `command` scope defines one
+/// (a repository that redefines git-lfs's filter gets git-lfs's back), else to
+/// empty. Only those settings: git treats an empty `process` as configured,
+/// so blanking one the repository never set would stop the operator's `clean`
+/// from running. Its `required` is always set, to the operator's value or
+/// `false`, so a blanked filter is skipped rather than failing the read.
+/// Drivers only the operator defines, such as a global git-lfs install, are
+/// left alone. A driver name a `-c` argument cannot spell (one containing
+/// `=`) is refused rather than left running. This is the owner's decision
+/// recorded in ft-ff2153d9.
+pub fn filter_overrides(listing: &[u8]) -> Result<Vec<String>, String> {
+    use std::collections::{BTreeSet, HashMap, HashSet};
+    let mut operator: HashMap<String, Option<String>> = HashMap::new();
+    let mut repository: BTreeSet<String> = BTreeSet::new();
+    let mut repository_keys: HashSet<String> = HashSet::new();
+    let fields: Vec<&[u8]> = listing.split(|b| *b == 0).collect();
+    for pair in fields.chunks(2) {
+        let [scope, entry] = pair else { continue };
+        let entry = String::from_utf8_lossy(entry);
+        let (key, value) = match entry.split_once('\n') {
+            Some((key, value)) => (key.to_string(), Some(value.to_string())),
+            None => (entry.to_string(), None),
+        };
+        let Some(rest) = key.strip_prefix("filter.") else {
+            continue;
+        };
+        let Some(dot) = rest.rfind('.') else { continue };
+        if dot == 0 {
+            continue;
+        }
+        let name = &rest[..dot];
+        match *scope {
+            b"local" | b"worktree" => {
+                repository.insert(name.to_string());
+                repository_keys.insert(key.clone());
+            }
+            // system, global and command: the operator's own settings, listed
+            // in precedence order, so the last one wins.
+            _ => {
+                operator.insert(key.clone(), value);
+            }
+        }
+    }
+    let mut args = Vec::new();
+    for name in &repository {
+        if name.contains('=') {
+            return Err(format!(
+                "the repository defines filter {name:?}, whose name a -c argument cannot spell; \
+                 refusing to read with it"
+            ));
+        }
+        for var in ["clean", "smudge", "process", "required"] {
+            let key = format!("filter.{name}.{var}");
+            if var != "required" && !repository_keys.contains(&key) {
+                continue;
+            }
+            args.push("-c".to_string());
+            args.push(match operator.get(&key) {
+                Some(Some(value)) => format!("{key}={value}"),
+                Some(None) => key,
+                None if var == "required" => format!("{key}=false"),
+                None => format!("{key}="),
+            });
+        }
+    }
+    Ok(args)
 }
 
 /// The program a command against `root` runs, as an absolute path.
@@ -942,6 +1098,208 @@ mod tests {
             expected.extend(want.iter().map(|s| s.to_string()));
             assert_eq!(got, expected, "input {input:?}");
         }
+    }
+
+    #[test]
+    fn filter_overrides_parses_listings() {
+        fn entry(scope: &str, kv: &str) -> String {
+            format!("{scope}\0{kv}\0")
+        }
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        type Case = (&'static str, String, Result<Vec<String>, ()>);
+        let cases: Vec<Case> = vec![
+            ("empty", String::new(), Ok(vec![])),
+            (
+                "operator only is left alone",
+                entry("global", "filter.lfs.clean\ngit-lfs clean -- %f")
+                    + &entry("global", "filter.lfs.required\ntrue"),
+                Ok(vec![]),
+            ),
+            (
+                "repository driver blanked, required false",
+                entry("local", "filter.x.clean\n/evil"),
+                Ok(s(&[
+                    "-c",
+                    "filter.x.clean=",
+                    "-c",
+                    "filter.x.required=false",
+                ])),
+            ),
+            (
+                "worktree scope",
+                entry("worktree", "filter.x.process\n/evil"),
+                Ok(s(&[
+                    "-c",
+                    "filter.x.process=",
+                    "-c",
+                    "filter.x.required=false",
+                ])),
+            ),
+            (
+                "operator value restored, last wins",
+                entry("system", "filter.lfs.clean\nold")
+                    + &entry("global", "filter.lfs.clean\ngit-lfs clean -- %f")
+                    + &entry("global", "filter.lfs.required\ntrue")
+                    + &entry("local", "filter.lfs.clean\n/evil"),
+                Ok(s(&[
+                    "-c",
+                    "filter.lfs.clean=git-lfs clean -- %f",
+                    "-c",
+                    "filter.lfs.required=true",
+                ])),
+            ),
+            (
+                "command scope is the operator's",
+                entry("local", "filter.x.smudge\n/evil")
+                    + &entry("command", "filter.x.smudge\ncat"),
+                Ok(s(&[
+                    "-c",
+                    "filter.x.smudge=cat",
+                    "-c",
+                    "filter.x.required=false",
+                ])),
+            ),
+            (
+                "valueless operator key stays valueless",
+                entry("global", "filter.x.required") + &entry("local", "filter.x.clean\n/evil"),
+                Ok(s(&["-c", "filter.x.clean=", "-c", "filter.x.required"])),
+            ),
+            (
+                "dotted name",
+                entry("local", "filter.a.b.clean\n/evil"),
+                Ok(s(&[
+                    "-c",
+                    "filter.a.b.clean=",
+                    "-c",
+                    "filter.a.b.required=false",
+                ])),
+            ),
+            (
+                "sorted",
+                entry("local", "filter.z.clean\n1") + &entry("local", "filter.a.clean\n2"),
+                Ok(s(&[
+                    "-c",
+                    "filter.a.clean=",
+                    "-c",
+                    "filter.a.required=false",
+                    "-c",
+                    "filter.z.clean=",
+                    "-c",
+                    "filter.z.required=false",
+                ])),
+            ),
+            (
+                "unspellable name refused",
+                entry("local", "filter.we=ird.clean\n/evil"),
+                Err(()),
+            ),
+            (
+                "truncated trailing record ignored",
+                entry("local", "filter.x.clean\n/evil") + "local",
+                Ok(s(&[
+                    "-c",
+                    "filter.x.clean=",
+                    "-c",
+                    "filter.x.required=false",
+                ])),
+            ),
+            (
+                "non-driver keys ignored",
+                entry("local", "filter.\n/evil") + &entry("local", "filters.x.clean\n1"),
+                Ok(vec![]),
+            ),
+        ];
+        for (name, listing, want) in cases {
+            let got = filter_overrides(listing.as_bytes()).map_err(|_| ());
+            assert_eq!(got, want, "{name}");
+        }
+    }
+
+    /// A working-tree diff through the seam does not run a filter the
+    /// repository's own config defines, even marked required, and the diff
+    /// is still the true one. Kernel reads today never diff the working tree,
+    /// so this is the path a future one would take.
+    #[cfg(unix)]
+    #[test]
+    fn a_working_tree_diff_does_not_run_the_repository_s_filter() {
+        let base = Scratch::new("filter");
+        let root = base.0.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = base.0.join("ran");
+        let script = plant(&base.0.join("bin"), "filter.sh", 0o755);
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho ran >> '{}'\ncat\n", marker.display()),
+        )
+        .unwrap();
+        let setup = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["-c", "user.email=a@example.test", "-c", "user.name=a"])
+                .args(args)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        setup(&["init", "-q"]);
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        setup(&["add", "a.txt"]);
+        setup(&["commit", "-qm", "base"]);
+        std::fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
+        setup(&["config", "filter.planted.clean", script.to_str().unwrap()]);
+        setup(&["config", "filter.planted.required", "true"]);
+        std::fs::write(root.join(".git/info/attributes"), "* filter=planted\n").unwrap();
+
+        let mut command = git_with_program(OsStr::new("git"), &root, ["diff", "HEAD"]).unwrap();
+        let captured = run_bounded(
+            &mut command,
+            Bounds {
+                deadline: Duration::from_secs(10),
+                stdout_cap: 1 << 20,
+                stderr_cap: 4096,
+            },
+        )
+        .unwrap();
+        assert!(!marker.exists(), "the repository's filter ran");
+        assert!(captured.status.success(), "{}", captured.stderr_trimmed());
+        assert!(
+            captured.stdout_lossy().contains("+two"),
+            "{}",
+            captured.stdout_lossy()
+        );
+    }
+
+    /// A filter listing too large to read whole is refused: a truncated one
+    /// could omit the driver that matters.
+    #[cfg(unix)]
+    #[test]
+    fn a_filter_listing_past_the_cap_is_refused() {
+        let base = Scratch::new("filter-flood");
+        let flood = FILTER_CONFIG_LIMIT + 1024;
+        let git = plant(&base.0.join("bin"), "git", 0o755);
+        std::fs::write(
+            &git,
+            format!("#!/bin/sh\nhead -c {flood} /dev/zero | tr '\\0' a\n"),
+        )
+        .unwrap();
+
+        let (kind, message) = match git_with_program(git.as_os_str(), &base.0, ["ls-files"]) {
+            Err(Failure::Spawn { error, .. }) => (error.kind(), error.to_string()),
+            other => panic!(
+                "a flooded filter listing was accepted: {:?}",
+                other.map(|_| ())
+            ),
+        };
+        assert_eq!(kind, ErrorKind::InvalidData);
+        assert!(message.contains("exceeds"), "{message}");
+        // A filter-free subcommand never asks, so the same git still runs.
+        assert!(git_with_program(git.as_os_str(), &base.0, ["rev-parse", "HEAD"]).is_ok());
     }
 
     /// A fresh directory under the system temp dir, removed on drop.

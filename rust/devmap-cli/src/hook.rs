@@ -2193,6 +2193,54 @@ fn shell_single_quote(text: &str) -> String {
 /// do it; see [`OwnedLock`].
 pub const OWNED_LOCK_ENV: &str = "DEVMAP_HOOK_OWNED_LOCK";
 
+/// The unix half of [`spawn_detached_with_cleanup`]: `executable args…` under
+/// `/bin/sh -c` in a new session, the shell removing `lock_dir` when the
+/// child exits.
+#[cfg(unix)]
+fn detached_shell_command(
+    executable: &Path,
+    args: &[&OsStr],
+    lock_dir: &Path,
+) -> anyhow::Result<Command> {
+    let exe = executable
+        .to_str()
+        .ok_or_else(|| anyhow!("executable path is not UTF-8"))?;
+    let lock = lock_dir
+        .to_str()
+        .ok_or_else(|| anyhow!("lock path is not UTF-8"))?;
+    let mut quoted = Vec::with_capacity(args.len());
+    for arg in args {
+        let arg = arg
+            .to_str()
+            .ok_or_else(|| anyhow!("argument is not UTF-8"))?;
+        quoted.push(shell_single_quote(arg));
+    }
+    // The lock directory is held for the child's lifetime so concurrent
+    // hooks coalesce onto one build. The shell removes it when the child
+    // exits.
+    let script = format!(
+        "{} {}; status=$?; rm -rf {}; exit $status",
+        shell_single_quote(exe),
+        quoted.join(" "),
+        shell_single_quote(lock)
+    );
+    // By absolute path: a bare `sh` is looked up on PATH, and the hook runs
+    // in the agent's environment, where a PATH entry can name a directory
+    // inside the repository.
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c").arg(script);
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(cmd)
+}
+
 /// Spawn `executable args…` detached, holding `lock_dir` for its lifetime.
 ///
 /// unix runs it under `sh -c` in a new session, and the shell removes the lock
@@ -2207,42 +2255,7 @@ fn spawn_detached_with_cleanup(
     lock_dir: &Path,
 ) -> anyhow::Result<()> {
     #[cfg(unix)]
-    let mut cmd = {
-        let exe = executable
-            .to_str()
-            .ok_or_else(|| anyhow!("executable path is not UTF-8"))?;
-        let lock = lock_dir
-            .to_str()
-            .ok_or_else(|| anyhow!("lock path is not UTF-8"))?;
-        let mut quoted = Vec::with_capacity(args.len());
-        for arg in args {
-            let arg = arg
-                .to_str()
-                .ok_or_else(|| anyhow!("argument is not UTF-8"))?;
-            quoted.push(shell_single_quote(arg));
-        }
-        // The lock directory is held for the child's lifetime so concurrent
-        // hooks coalesce onto one build. The shell removes it when the child
-        // exits.
-        let script = format!(
-            "{} {}; status=$?; rm -rf {}; exit $status",
-            shell_single_quote(exe),
-            quoted.join(" "),
-            shell_single_quote(lock)
-        );
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(script);
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        cmd
-    };
+    let mut cmd = detached_shell_command(executable, args, lock_dir)?;
     #[cfg(windows)]
     let mut cmd = {
         use std::os::windows::process::CommandExt;
@@ -2330,6 +2343,21 @@ pub fn shell_command(executable: &Path, event: HookEvent) -> anyhow::Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The detached build's shell is named by absolute path. A bare `sh` is
+    /// searched for on PATH, and the hook runs in the agent's environment,
+    /// where a PATH entry can name a directory inside the repository.
+    #[cfg(unix)]
+    #[test]
+    fn the_detached_build_shell_is_not_found_on_path() {
+        let cmd = detached_shell_command(
+            Path::new("/opt/devmap/bin/devmap"),
+            &[OsStr::new("build")],
+            Path::new("/tmp/devmap-lock"),
+        )
+        .unwrap();
+        assert_eq!(cmd.get_program(), OsStr::new("/bin/sh"));
+    }
     use serde_json::json;
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};

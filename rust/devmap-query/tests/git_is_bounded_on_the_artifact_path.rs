@@ -61,7 +61,12 @@ fn a_stalled_git_cannot_hold_the_head_digest() {
 #[test]
 fn a_listing_past_the_cap_is_refused_rather_than_fingerprinted() {
     let flood = GIT_LS_FILES_OUTPUT_CAP + (1 << 20);
-    let (dir, git) = fake_git(&format!("head -c {flood} /dev/zero | tr '\\0' a"));
+    // The read path asks `git -C root config ...` for the repository's filter
+    // drivers before ls-files; answer it as a repository with none does
+    // (exit 1), so the flood reaches the listing this test is about.
+    let (dir, git) = fake_git(&format!(
+        "case \"$3\" in config) exit 1;; esac\nhead -c {flood} /dev/zero | tr '\\0' a"
+    ));
     let inventory =
         freshness::inventory_with_program(git.as_os_str(), &dir, InventoryLimits::default());
     match &inventory.source {

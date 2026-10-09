@@ -79,7 +79,9 @@ func plantConfigPrograms(t *testing.T, root string) (marker string) {
 	runGit(t, root, "config", "diff.planted.textconv", script)
 	runGit(t, root, "config", "log.showSignature", "true")
 	runGit(t, root, "config", "gpg.program", script)
-	write(t, root, ".git/info/attributes", "* diff=planted\n")
+	runGit(t, root, "config", "filter.planted.clean", script)
+	runGit(t, root, "config", "filter.planted.required", "true")
+	write(t, root, ".git/info/attributes", "* diff=planted filter=planted\n")
 	return marker
 }
 

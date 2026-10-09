@@ -103,10 +103,12 @@ fn planted(label: &str) -> Planted {
         ("diff.planted.textconv", script),
         ("log.showSignature", "true"),
         ("gpg.program", script),
+        ("filter.planted.clean", script),
+        ("filter.planted.required", "true"),
     ] {
         git(&root, &["config", key, value]);
     }
-    std::fs::write(root.join(".git/info/attributes"), "* diff=planted\n").unwrap();
+    std::fs::write(root.join(".git/info/attributes"), "* diff=planted filter=planted\n").unwrap();
     Planted { root, marker }
 }
 
