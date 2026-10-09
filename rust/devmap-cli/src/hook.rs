@@ -2194,8 +2194,8 @@ fn shell_single_quote(text: &str) -> String {
 pub const OWNED_LOCK_ENV: &str = "DEVMAP_HOOK_OWNED_LOCK";
 
 /// The unix half of [`spawn_detached_with_cleanup`]: `executable args…` under
-/// `/bin/sh -c` in a new session, the shell removing `lock_dir` when the
-/// child exits.
+/// `/bin/sh -c` in a new session, the shell removing `lock_dir` with `/bin/rm`
+/// when the child exits. Neither program is looked up on PATH.
 #[cfg(unix)]
 fn detached_shell_command(
     executable: &Path,
@@ -2217,9 +2217,10 @@ fn detached_shell_command(
     }
     // The lock directory is held for the child's lifetime so concurrent
     // hooks coalesce onto one build. The shell removes it when the child
-    // exits.
+    // exits, with `/bin/rm` by absolute path for the reason `/bin/sh` is
+    // below: the shell searches the inherited PATH for a bare `rm`.
     let script = format!(
-        "{} {}; status=$?; rm -rf {}; exit $status",
+        "{} {}; status=$?; /bin/rm -rf {}; exit $status",
         shell_single_quote(exe),
         quoted.join(" "),
         shell_single_quote(lock)
@@ -2357,6 +2358,54 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cmd.get_program(), OsStr::new("/bin/sh"));
+    }
+
+    /// The shell's cleanup runs no program found on PATH either. A planted
+    /// `rm` first on PATH — one that records it ran and removes nothing —
+    /// is never started, and the lock is still removed.
+    #[cfg(unix)]
+    #[test]
+    fn the_detached_build_cleanup_does_not_run_paths_rm() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!(
+            "devmap-hook-rm-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let planted_dir = base.join("repo").join("tools").join("bin");
+        fs::create_dir_all(&planted_dir).unwrap();
+        let marker = base.join("planted-rm-ran");
+        let planted = planted_dir.join("rm");
+        fs::write(
+            &planted,
+            format!("#!/bin/sh\n: > '{}'\nexit 0\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&planted, fs::Permissions::from_mode(0o755)).unwrap();
+        let lock = base.join("lock");
+        fs::create_dir_all(&lock).unwrap();
+
+        let mut cmd = detached_shell_command(
+            Path::new("/bin/sh"),
+            &[OsStr::new("-c"), OsStr::new("exit 0")],
+            &lock,
+        )
+        .unwrap();
+        cmd.env("PATH", &planted_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let status = cmd.status().unwrap();
+
+        let planted_ran = marker.exists();
+        let lock_left = lock.exists();
+        let _ = fs::remove_dir_all(&base);
+        assert!(status.success(), "the detached shell failed: {status}");
+        assert!(!planted_ran, "the cleanup ran the rm found on PATH");
+        assert!(!lock_left, "the cleanup did not remove the lock");
     }
     use serde_json::json;
     use std::thread;
