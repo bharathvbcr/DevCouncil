@@ -299,3 +299,256 @@ fn status_counts_stored_edges_whose_confidence_contradicts_their_evidence() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Whether `chmod 000` on `path` actually refuses this process — root and
+/// some filesystems read straight through it, and a fixture that cannot make
+/// a file unreadable proves nothing about one that is.
+#[cfg(unix)]
+fn lock(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    std::fs::File::open(path).is_err()
+}
+
+#[cfg(unix)]
+fn unlock(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+/// The rows of one `coverage_gaps.discovery_refused` listing, as `(path, reason)`.
+fn refused_rows(status: &serde_json::Value) -> Vec<(String, String)> {
+    status["coverage_gaps"]["discovery_refused"]["paths"]
+        .as_array()
+        .unwrap_or_else(|| panic!("discovery_refused.paths is an array: {status}"))
+        .iter()
+        .map(|row| {
+            (
+                row["path"].as_str().unwrap_or_default().to_string(),
+                row["reason"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// An unreadable root `go.mod` is listed by `status`, with its path and reason.
+///
+/// **A characterization, not a regression test.** The audit inferred this case
+/// was silent from `gomod.rs`'s `let Ok(source) = fs::read_to_string(path) else
+/// { continue; }`, and for a `go.mod` in the walked tree it is not: `go.mod`
+/// detects as `config`, discovery admits it as source, and discovery's own read
+/// refuses it. This passed against the unmodified kernel and pins that; the
+/// manifests discovery never reaches are the next test.
+#[test]
+#[cfg(unix)]
+fn status_lists_an_unreadable_go_mod() {
+    let root = fixture("gomod");
+    std::fs::write(root.join("go.mod"), "module example.com/m\n\ngo 1.22\n").unwrap();
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    std::fs::write(
+        root.join("lib/lib.go"),
+        "package lib\n\nfunc Helper() int { return 1 }\n",
+    )
+    .unwrap();
+    if !lock(&root.join("go.mod")) {
+        return;
+    }
+
+    json(&root, &["--json", "build", "."]);
+    let status = json(&root, &["--json", "status"]);
+    let rows = refused_rows(&status);
+    unlock(&root.join("go.mod"));
+    assert!(
+        rows.iter()
+            .any(|(path, reason)| path == "go.mod" && reason.contains("unreadable")),
+        "an unreadable go.mod is named with its reason: {status}"
+    );
+    assert!(
+        status["degraded_reason"].is_string(),
+        "and the analysis says it is partial: {status}"
+    );
+}
+
+/// A manifest the resolver reads and discovery never walks is listed too, and
+/// leaves the list once it can be read again.
+///
+/// Failed against the unmodified kernel: `extends` into `node_modules/` is
+/// read by the config reader alone, which dropped a read failure exactly as it
+/// dropped a config with no `paths`. `status` reported every gap at zero and no
+/// degraded reason for a generation whose imports had lost their mapping.
+#[test]
+#[cfg(unix)]
+fn status_lists_an_unreadable_manifest_discovery_never_walks() {
+    let root = fixture("tsextends");
+    let base_dir = root.join("node_modules/@acme/base");
+    std::fs::create_dir_all(&base_dir).unwrap();
+    std::fs::create_dir_all(root.join("src/core")).unwrap();
+    std::fs::write(
+        root.join("tsconfig.json"),
+        r#"{ "extends": "@acme/base/tsconfig.json" }"#,
+    )
+    .unwrap();
+    let base = base_dir.join("tsconfig.json");
+    std::fs::write(
+        &base,
+        r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@core/*": ["src/core/*"] } } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/core/util.ts"),
+        "export function util(): number { return 1; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/app.ts"),
+        "import { util } from \"@core/util\";\nexport function main(): number { return util(); }\n",
+    )
+    .unwrap();
+    if !lock(&base) {
+        return;
+    }
+
+    let build = json(&root, &["--json", "build", "."]);
+    let status = json(&root, &["--json", "status"]);
+    unlock(&base);
+    assert_eq!(
+        refused_rows(&status),
+        vec![(
+            "node_modules/@acme/base/tsconfig.json".to_string(),
+            "unreadable: Permission denied (os error 13)".to_string()
+        )],
+        "the config the chain could not read is named with its reason: {status}"
+    );
+    assert_eq!(
+        build["discovery_refused_files"], 1,
+        "the build result counts what the inventory holds: {build}"
+    );
+    assert!(
+        status["degraded_reason"].is_string(),
+        "a lost module mapping is a partial analysis, not a clean one: {status}"
+    );
+    assert_eq!(
+        status["is_fresh"], true,
+        "and the generation is current — `status` computes the same inventory the \
+         build stored, or every such generation would read as permanent drift: {status}"
+    );
+
+    // Repaired with no source change: the warm path must not answer "still
+    // current" for a generation that names a refusal the tree no longer has.
+    let rebuild = json(&root, &["--json", "build", "."]);
+    assert_ne!(
+        rebuild["unchanged"], true,
+        "a repaired manifest changes what the generation could read: {rebuild}"
+    );
+    let status = json(&root, &["--json", "status"]);
+    assert!(
+        refused_rows(&status).is_empty(),
+        "a repaired manifest leaves the inventory: {status}"
+    );
+    assert_eq!(status["is_fresh"], true, "{status}");
+}
+
+/// A file that became unreadable while nothing else moved is a new refusal,
+/// and the warm path records it.
+///
+/// Failed against the unmodified kernel, measured: the second build printed
+/// "No source changes; generation #1 still current", `status` answered "source
+/// discovery refusals differ from the indexed generation; rebuild required",
+/// and the rebuild it asked for took the same warm path back. The hashes cover
+/// only files that were read, so an unreadable newcomer left them equal.
+#[test]
+#[cfg(unix)]
+fn a_new_refusal_with_no_source_change_is_not_still_current() {
+    let root = fixture("warm");
+    std::fs::write(root.join("a.py"), "def a():\n    return 1\n").unwrap();
+    json(&root, &["--json", "build", "."]);
+    std::fs::write(root.join("b.py"), "def b():\n    return 2\n").unwrap();
+    if !lock(&root.join("b.py")) {
+        return;
+    }
+
+    let rebuild = json(&root, &["--json", "build", "."]);
+    let status = json(&root, &["--json", "status"]);
+    unlock(&root.join("b.py"));
+    assert_ne!(
+        rebuild["unchanged"], true,
+        "a new refusal is a change in what the generation could read: {rebuild}"
+    );
+    assert!(
+        refused_rows(&status).iter().any(|(path, _)| path == "b.py"),
+        "the refusal reaches the inventory: {status}"
+    );
+    assert_eq!(status["is_fresh"], true, "{status}");
+}
+
+/// A standing manifest refusal must not make every build cold.
+///
+/// The warm path now walks the manifests and compares the whole inventory. A
+/// comparison that disagreed with itself — two wordings for one failure, an
+/// order the store does not read back in — would send every watcher tick down
+/// the full resolve and analyse, and nothing about the answer would look
+/// wrong. Two builds of an unchanged tree with a refusal in it: the second is
+/// the warm one, and `status` agrees it is current.
+#[test]
+#[cfg(unix)]
+fn a_standing_manifest_refusal_keeps_the_warm_path_warm() {
+    let root = fixture("warm-standing");
+    std::fs::write(root.join("a.py"), "def a():\n    return 1\n").unwrap();
+    std::fs::create_dir_all(root.join("build/m")).unwrap();
+    std::fs::write(root.join("build/m/go.mod"), "module example.com/m\n").unwrap();
+    if !lock(&root.join("build/m/go.mod")) {
+        return;
+    }
+    let first = json(&root, &["--json", "build", "."]);
+    let second = json(&root, &["--json", "build", "."]);
+    let status = json(&root, &["--json", "status"]);
+    unlock(&root.join("build/m/go.mod"));
+    assert_eq!(
+        first["discovery_refused_files"], 1,
+        "fixture precondition: the refusal is recorded: {first}"
+    );
+    assert_eq!(
+        second["unchanged"], true,
+        "an unchanged tree with an unchanged refusal is still current: {second}"
+    );
+    assert_eq!(
+        second["discovery_refused_files"], 1,
+        "and the warm path reports the refusal it re-measured: {second}"
+    );
+    assert_eq!(status["is_fresh"], true, "{status}");
+}
+
+/// Many refusals: the listing is a capped sample and says so.
+#[test]
+#[cfg(unix)]
+fn many_manifest_refusals_are_counted_in_full_and_sampled_honestly() {
+    const MANY: usize = 120;
+    let root = fixture("many");
+    std::fs::write(root.join("a.py"), "def a():\n    return 1\n").unwrap();
+    let mut locked = Vec::new();
+    for index in 0..MANY {
+        let dir = root.join(format!("build/m{index:03}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("go.mod");
+        std::fs::write(&manifest, format!("module example.com/m{index}\n")).unwrap();
+        if !lock(&manifest) {
+            return;
+        }
+        locked.push(manifest);
+    }
+    let build = json(&root, &["--json", "build", "."]);
+    let status = json(&root, &["--json", "status"]);
+    for manifest in &locked {
+        unlock(manifest);
+    }
+    assert_eq!(build["discovery_refused_files"], MANY, "{build}");
+    let refused = &status["coverage_gaps"]["discovery_refused"];
+    assert_eq!(refused["total"], MANY, "every refusal counted: {refused}");
+    assert_eq!(
+        refused["shown"],
+        devmap_store::COVERAGE_GAP_SAMPLE,
+        "a sample, at the cap: {refused}"
+    );
+    assert_eq!(refused["truncated"], true, "and it says so: {refused}");
+    assert_eq!(status["is_fresh"], true, "{status}");
+}

@@ -255,6 +255,154 @@ fn go_module_discovery_still_fails_on_a_root_it_cannot_open() {
     );
 }
 
+/// A manifest the walk reaches and cannot read is a refusal, not a module
+/// that is not there.
+///
+/// The directory case above steps over a subtree and leaves the disclosure to
+/// discovery. A *file* is different: the walk opened the directory, found the
+/// `go.mod`, and `let Ok(source) = fs::read_to_string(path) else { continue; }`
+/// dropped it — so its module prefix left import resolution and nothing
+/// anywhere recorded that it had been there.
+#[test]
+fn an_unreadable_go_mod_is_recorded_with_its_path_and_reason() {
+    use devmap_extract::model::DiscoverySkipReason;
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = scratch("gomodfile");
+    fs::create_dir_all(root.join("svc")).unwrap();
+    fs::create_dir_all(root.join("locked")).unwrap();
+    fs::write(root.join("svc/go.mod"), "module example.com/svc\n").unwrap();
+    fs::write(root.join("locked/go.mod"), "module example.com/locked\n").unwrap();
+    fs::set_permissions(
+        root.join("locked/go.mod"),
+        fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    let _restore = Unreadable(root.join("locked/go.mod"));
+    if !restriction_holds(root.join("locked/go.mod")) {
+        return;
+    }
+
+    let manifests = devmap_extract::collect_project_manifests(&root).unwrap();
+    assert_eq!(
+        manifests
+            .go_modules
+            .iter()
+            .map(|module| module.prefix.as_str())
+            .collect::<Vec<_>>(),
+        vec!["example.com/svc"],
+        "the readable module is still found: {manifests:?}"
+    );
+    assert_eq!(
+        manifests.refusals.len(),
+        1,
+        "the unreadable one is recorded, once: {manifests:?}"
+    );
+    let (path, reason) = &manifests.refusals[0];
+    assert_eq!(path, "locked/go.mod");
+    assert!(
+        matches!(reason, DiscoverySkipReason::Unreadable { reason } if reason.contains("denied")),
+        "the reason is the read error, in discovery's wording: {reason:?}"
+    );
+    assert!(
+        reason.is_refusal(),
+        "and it is coverage loss, by the one rule that decides: {reason:?}"
+    );
+    assert!(manifests.examined.contains("locked/go.mod"));
+    assert!(
+        !manifests.repaired("locked/go.mod"),
+        "a manifest still refused has not been repaired"
+    );
+}
+
+/// The case discovery cannot cover at all: an `extends` target under
+/// `node_modules/`, which discovery never walks and the config reader reads
+/// anyway.
+///
+/// Reproduced through the binary before this was written: `tsconfig.json`
+/// extending `@acme/base/tsconfig.json` with the base `chmod 000` built a
+/// generation whose `status` reported every coverage gap at zero and no
+/// degraded reason, while the `paths` the base declared were simply gone.
+#[test]
+fn an_unreadable_extends_target_outside_discovery_is_recorded() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = scratch("tsextends");
+    let base_dir = root.join("node_modules/@acme/base");
+    fs::create_dir_all(&base_dir).unwrap();
+    fs::write(
+        root.join("tsconfig.json"),
+        r#"{ "extends": "@acme/base/tsconfig.json" }"#,
+    )
+    .unwrap();
+    let base = base_dir.join("tsconfig.json");
+    fs::write(
+        &base,
+        r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@core/*": ["src/core/*"] } } }"#,
+    )
+    .unwrap();
+    let readable = devmap_extract::collect_project_manifests(&root).unwrap();
+    assert!(
+        !readable.ts_projects.is_empty() && readable.refusals.is_empty(),
+        "fixture assumption: readable, the base supplies the mapping — {readable:?}"
+    );
+
+    for locked in [base.clone(), root.join("node_modules/@acme")] {
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let restore = Unreadable(locked.clone());
+        if !restriction_holds(&locked) {
+            return;
+        }
+        let manifests = devmap_extract::collect_project_manifests(&root).unwrap();
+        assert!(
+            manifests.ts_projects.is_empty(),
+            "fixture assumption: with the base unreadable no mapping survives — {manifests:?}"
+        );
+        assert_eq!(
+            manifests
+                .refusals
+                .iter()
+                .map(|(path, reason)| (path.as_str(), reason.is_refusal()))
+                .collect::<Vec<_>>(),
+            vec![("node_modules/@acme/base/tsconfig.json", true)],
+            "`{}` locked: the config the chain could not read is named, where it \
+             used to vanish exactly like a config that declares no `paths` — \
+             {manifests:?}",
+            locked.display()
+        );
+        assert!(
+            !devmap_extract::is_indexable_source("node_modules/@acme/base/tsconfig.json"),
+            "fixture assumption: discovery never walks this path, so no other pass records it"
+        );
+        drop(restore);
+    }
+
+    // Repaired, it leaves: and `repaired` says so for the path only this pass
+    // reads, not for the root config discovery owns the verdict on.
+    let repaired = devmap_extract::collect_project_manifests(&root).unwrap();
+    assert!(repaired.refusals.is_empty(), "{repaired:?}");
+    assert!(repaired.repaired("node_modules/@acme/base/tsconfig.json"));
+    assert!(
+        !repaired.repaired("tsconfig.json"),
+        "discovery walks the root config and keeps the verdict on it"
+    );
+}
+
+/// A config that is simply not there is still not a refusal: an `extends`
+/// naming a package nobody installed is "nothing there", and charging it
+/// would leave every checkout without `node_modules` permanently degraded.
+#[test]
+fn a_missing_extends_target_is_not_a_refusal() {
+    let root = scratch("tsmissing");
+    fs::write(
+        root.join("tsconfig.json"),
+        r#"{ "extends": "@acme/base/tsconfig.json", "references": [{ "path": "./pkg" }] }"#,
+    )
+    .unwrap();
+    let manifests = devmap_extract::collect_project_manifests(&root).unwrap();
+    assert!(manifests.refusals.is_empty(), "{manifests:?}");
+}
+
 /// Whether the mode bits just set actually refuse this process.
 ///
 /// Root, and filesystems that ignore mode bits, read through `0o000` and write
@@ -295,4 +443,331 @@ fn restriction_holds(path: impl AsRef<std::path::Path>) -> bool {
         );
     }
     refused
+}
+
+// --- The manifest pass under hostile trees -----------------------------------
+//
+// The manifest pass is the build's third walk of the tree, and the only one
+// that did not ask the repository's containment rule anything: it read with
+// `fs::read_to_string`, which follows every link it meets. Each row below is a
+// shape a real checkout arrives in — `npm link`, a pnpm workspace, a dangling
+// link left by a deleted package, an editor's lock symlink loop — and each must
+// end in one of two answers: read (the bytes are the repository's), or refused
+// with a reason. Never read from somewhere else, never silently dropped, never
+// a hang.
+
+/// A directory beside the root, not under it, for the far end of a link.
+fn outside_of(root: &std::path::Path, name: &str) -> PathBuf {
+    let outside = root.with_file_name(format!(
+        "{}-{name}",
+        root.file_name().and_then(|n| n.to_str()).unwrap_or("root")
+    ));
+    let _ = fs::remove_dir_all(&outside);
+    fs::create_dir_all(&outside).unwrap();
+    outside
+}
+
+const BASE_CONFIG: &str =
+    r#"{ "compilerOptions": { "baseUrl": ".", "paths": { "@core/*": ["src/core/*"] } } }"#;
+
+/// A root `tsconfig.json` extending `@acme/base/tsconfig.json`, with the
+/// package directory left for the caller to build.
+fn ts_root(name: &str) -> PathBuf {
+    let root = scratch(name);
+    fs::create_dir_all(root.join("node_modules/@acme")).unwrap();
+    fs::write(
+        root.join("tsconfig.json"),
+        r#"{ "extends": "@acme/base/tsconfig.json" }"#,
+    )
+    .unwrap();
+    root
+}
+
+fn refused_paths(manifests: &devmap_extract::ProjectManifests) -> Vec<&str> {
+    assert!(
+        manifests
+            .refusals
+            .iter()
+            .all(|(_, reason)| reason.is_refusal()),
+        "every manifest refusal is coverage loss by the one rule: {manifests:?}"
+    );
+    manifests
+        .refusals
+        .iter()
+        .map(|(path, _)| path.as_str())
+        .collect()
+}
+
+#[test]
+fn a_go_mod_linked_out_of_the_repository_is_refused_not_read() {
+    let root = scratch("gomod-escape");
+    let outside = outside_of(&root, "gomod-escape-out");
+    fs::write(outside.join("go.mod"), "module evil.example/x\n").unwrap();
+    fs::create_dir_all(root.join("svc")).unwrap();
+    std::os::unix::fs::symlink(outside.join("go.mod"), root.join("svc/go.mod")).unwrap();
+
+    let manifests = devmap_extract::collect_project_manifests(&root).unwrap();
+    assert!(
+        manifests.go_modules.is_empty(),
+        "a module the repository does not contain must not reach import \
+         resolution: {manifests:?}"
+    );
+    assert_eq!(refused_paths(&manifests), vec!["svc/go.mod"]);
+    let _ = fs::remove_dir_all(&outside);
+}
+
+#[test]
+fn an_extends_target_linked_out_of_the_repository_is_refused_not_read() {
+    // Both shapes: the config file itself a link, and an ancestor directory a
+    // link (`npm link`), which a check on the final component cannot see.
+    for linked_directory in [false, true] {
+        let root = ts_root(if linked_directory {
+            "ts-escape-dir"
+        } else {
+            "ts-escape-file"
+        });
+        let outside = outside_of(&root, "out");
+        fs::write(outside.join("tsconfig.json"), BASE_CONFIG).unwrap();
+        if linked_directory {
+            std::os::unix::fs::symlink(&outside, root.join("node_modules/@acme/base")).unwrap();
+        } else {
+            fs::create_dir_all(root.join("node_modules/@acme/base")).unwrap();
+            std::os::unix::fs::symlink(
+                outside.join("tsconfig.json"),
+                root.join("node_modules/@acme/base/tsconfig.json"),
+            )
+            .unwrap();
+        }
+        let manifests = devmap_extract::collect_project_manifests(&root).unwrap();
+        assert!(
+            manifests.ts_projects.is_empty(),
+            "linked_directory={linked_directory}: a mapping read from outside the \
+             repository must not govern its files — {manifests:?}"
+        );
+        assert_eq!(
+            refused_paths(&manifests),
+            vec!["node_modules/@acme/base/tsconfig.json"],
+            "linked_directory={linked_directory}"
+        );
+        let _ = fs::remove_dir_all(&outside);
+    }
+}
+
+/// The OFF direction, and the shape most repositories that link a package at
+/// all are in: a pnpm / yarn workspace links `node_modules/@acme/base` to a
+/// package inside the same repository. Those bytes are the repository's.
+#[test]
+fn an_extends_target_linked_inside_the_repository_is_read() {
+    let root = ts_root("ts-workspace-link");
+    fs::create_dir_all(root.join("packages/base")).unwrap();
+    fs::write(root.join("packages/base/tsconfig.json"), BASE_CONFIG).unwrap();
+    std::os::unix::fs::symlink("../../packages/base", root.join("node_modules/@acme/base"))
+        .unwrap();
+    let manifests = devmap_extract::collect_project_manifests(&root).unwrap();
+    assert!(
+        refused_paths(&manifests).is_empty(),
+        "a workspace link is not a refusal: {manifests:?}"
+    );
+    // `packages/base` governs itself too; the claim is about the root.
+    assert!(
+        manifests
+            .ts_projects
+            .iter()
+            .any(|project| project.dir.is_empty() && !project.mappings.is_empty()),
+        "and its mapping governs the root: {manifests:?}"
+    );
+}
+
+#[test]
+fn a_dangling_or_looping_manifest_link_is_refused_not_passed_over() {
+    // An `extends` target that dangles, and one in a link loop.
+    for shape in ["dangling", "loop"] {
+        let root = ts_root(&format!("ts-{shape}"));
+        let base = root.join("node_modules/@acme/base");
+        fs::create_dir_all(&base).unwrap();
+        if shape == "dangling" {
+            std::os::unix::fs::symlink(base.join("gone.json"), base.join("tsconfig.json")).unwrap();
+        } else {
+            std::os::unix::fs::symlink(base.join("other.json"), base.join("tsconfig.json"))
+                .unwrap();
+            std::os::unix::fs::symlink(base.join("tsconfig.json"), base.join("other.json"))
+                .unwrap();
+        }
+        let manifests = devmap_extract::collect_project_manifests(&root).unwrap();
+        assert_eq!(
+            refused_paths(&manifests),
+            vec!["node_modules/@acme/base/tsconfig.json"],
+            "{shape}: a link that names nothing readable is a refusal, as discovery \
+             makes it for source — {manifests:?}"
+        );
+    }
+
+    // A `go.mod` that dangles, in a directory discovery does not walk.
+    let root = scratch("gomod-dangling");
+    fs::create_dir_all(root.join("build")).unwrap();
+    std::os::unix::fs::symlink(root.join("build/nowhere"), root.join("build/go.mod")).unwrap();
+    let manifests = devmap_extract::collect_project_manifests(&root).unwrap();
+    assert_eq!(
+        refused_paths(&manifests),
+        vec!["build/go.mod"],
+        "{manifests:?}"
+    );
+}
+
+#[test]
+fn a_manifest_that_is_not_utf8_is_refused_with_the_decode_error() {
+    let root = ts_root("ts-not-utf8");
+    fs::create_dir_all(root.join("node_modules/@acme/base")).unwrap();
+    fs::write(
+        root.join("node_modules/@acme/base/tsconfig.json"),
+        b"{ \"compilerOptions\": { \"baseUrl\": \"caf\xe9\" } }",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("dist")).unwrap();
+    fs::write(root.join("dist/go.mod"), b"module example.com/caf\xe9\n").unwrap();
+    let manifests = devmap_extract::collect_project_manifests(&root).unwrap();
+    assert_eq!(
+        refused_paths(&manifests),
+        vec!["dist/go.mod", "node_modules/@acme/base/tsconfig.json"],
+        "sorted by path, both named: {manifests:?}"
+    );
+    for (_, reason) in &manifests.refusals {
+        assert!(
+            reason.to_string().to_ascii_lowercase().contains("utf-8"),
+            "the reason says what was wrong with the bytes: {reason}"
+        );
+    }
+}
+
+/// Past the ceiling is an ordinary skip, exactly as discovery's `Oversized` is
+/// — charging it would leave every repository with a generated mega-config
+/// permanently partial.
+#[test]
+fn an_oversized_manifest_is_skipped_not_refused() {
+    let root = ts_root("ts-oversized");
+    fs::create_dir_all(root.join("node_modules/@acme/base")).unwrap();
+    let mut huge = String::from("{ \"compilerOptions\": {} ");
+    huge.push_str(&" ".repeat(devmap_extract::tsconfig::MAX_CONFIG_BYTES as usize + 1));
+    huge.push('}');
+    fs::write(root.join("node_modules/@acme/base/tsconfig.json"), huge).unwrap();
+    let manifests = devmap_extract::collect_project_manifests(&root).unwrap();
+    assert!(refused_paths(&manifests).is_empty(), "{manifests:?}");
+}
+
+/// A cycle through an unreadable member: the unreadable config is named once,
+/// and the cycle still terminates.
+#[test]
+#[cfg(unix)]
+fn an_extends_cycle_through_an_unreadable_member_names_it_once() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = scratch("ts-cycle");
+    fs::write(root.join("tsconfig.json"), r#"{ "extends": "./a.json" }"#).unwrap();
+    fs::write(root.join("a.json"), r#"{ "extends": "./b.json" }"#).unwrap();
+    fs::write(root.join("b.json"), r#"{ "extends": "./a.json" }"#).unwrap();
+    fs::set_permissions(root.join("b.json"), fs::Permissions::from_mode(0o000)).unwrap();
+    let _restore = Unreadable(root.join("b.json"));
+    if !restriction_holds(root.join("b.json")) {
+        return;
+    }
+    let manifests = devmap_extract::collect_project_manifests(&root).unwrap();
+    assert_eq!(refused_paths(&manifests), vec!["b.json"], "{manifests:?}");
+}
+
+/// A FIFO wherever a manifest is expected must not hang the pass. Run in a
+/// bounded child: a hang here is the failure, and an in-process test would
+/// hang the suite instead of failing it.
+#[test]
+fn a_fifo_manifest_cannot_block_the_manifest_pass() {
+    use devmap_extract::subprocess::{run_bounded, Bounds};
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child.args(["--ignored", "--exact", "fifo_manifest_child", "--nocapture"]);
+    let result = run_bounded(
+        &mut child,
+        Bounds {
+            deadline: std::time::Duration::from_secs(10),
+            stdout_cap: 16384,
+            stderr_cap: 16384,
+        },
+    )
+    .expect("the manifest pass must finish within the deadline");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
+#[ignore = "bounded child of a_fifo_manifest_cannot_block_the_manifest_pass"]
+fn fifo_manifest_child() {
+    let root = ts_root("ts-fifo");
+    fs::create_dir_all(root.join("node_modules/@acme/base")).unwrap();
+    fs::create_dir_all(root.join("svc")).unwrap();
+    for fifo in [
+        root.join("node_modules/@acme/base/tsconfig.json"),
+        root.join("svc/go.mod"),
+        root.join("svc/tsconfig.json"),
+    ] {
+        let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+    // A link to a FIFO survives both of the walk's own filters — its entry is
+    // a symlink — and so is the shape that reaches `read_manifest` itself.
+    fs::create_dir_all(root.join("build")).unwrap();
+    std::os::unix::fs::symlink(root.join("svc/go.mod"), root.join("build/go.mod")).unwrap();
+    let manifests = devmap_extract::collect_project_manifests(&root).unwrap();
+    assert!(manifests.go_modules.is_empty() && manifests.ts_projects.is_empty());
+    assert!(
+        manifests.examined.contains("build/go.mod"),
+        "fixture assumption: the linked FIFO reached the read decision — {manifests:?}"
+    );
+    // Not a source and not a hole — discovery steps over a FIFO without a
+    // word, as `CandidateKind::Other`, and so does this pass.
+    assert!(refused_paths(&manifests).is_empty(), "{manifests:?}");
+}
+
+/// The manifest walk runs in parallel, and its answer is compared across
+/// builds: the same tree must produce the same `ProjectManifests`, field for
+/// field, however the threads interleave. Repeated over a tree wide enough
+/// that the walk's workers genuinely race.
+#[test]
+#[cfg(unix)]
+fn the_parallel_manifest_walk_is_deterministic() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = scratch("deterministic");
+    let mut locked = Vec::new();
+    for index in 0..200 {
+        let dir = root.join(format!("mods/m{index:03}/sub"));
+        fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("go.mod");
+        fs::write(&manifest, format!("module example.com/m{index}\n")).unwrap();
+        if index % 17 == 0 {
+            fs::set_permissions(&manifest, fs::Permissions::from_mode(0o000)).unwrap();
+            locked.push(Unreadable(manifest));
+        }
+    }
+    for index in 0..100 {
+        let dir = root.join(format!("web/p{index:03}"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("tsconfig.json"),
+            format!(r#"{{ "compilerOptions": {{ "paths": {{ "@p{index}/*": ["./src/*"] }} }} }}"#),
+        )
+        .unwrap();
+    }
+    if locked.iter().any(|lock| !restriction_holds(&lock.0)) {
+        return;
+    }
+    let first = devmap_extract::collect_project_manifests(&root).unwrap();
+    assert_eq!(first.go_modules.len(), 200 - locked.len());
+    assert_eq!(first.refusals.len(), locked.len());
+    assert_eq!(first.ts_projects.len(), 100);
+    assert_eq!(first.examined.len(), 300);
+    for round in 0..25 {
+        assert_eq!(
+            devmap_extract::collect_project_manifests(&root).unwrap(),
+            first,
+            "round {round}: the same tree produced a different answer"
+        );
+    }
 }

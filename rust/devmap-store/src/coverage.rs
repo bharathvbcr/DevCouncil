@@ -16,10 +16,17 @@
 //! previous generation's verdicts forward. A count cannot be maintained — see
 //! `schema::COVERAGE_GAPS_TABLE` for what carrying one instead cost.
 
+use std::collections::BTreeMap;
+
 use devmap_analyze::ExtractionGap;
 use devmap_extract::model::DiscoveryReport;
+use devmap_extract::ProjectManifests;
 
 /// The stored `gap` value for a path discovery refused before extraction.
+///
+/// Also the label of a project manifest the resolver could not read, which is
+/// the same hole met by the build's other walk of the tree: see
+/// [`refusal_inventory`].
 ///
 /// Not an [`ExtractionGap`] variant: those two are decided by looking at an
 /// `Extraction`, and a refused path has none. Kept in the same table because
@@ -152,6 +159,60 @@ pub fn discovery_refusals(report: &DiscoveryReport) -> Vec<DiscoveryRefusal> {
         .collect()
 }
 
+/// The whole refusal inventory for one tree: what discovery refused, and the
+/// project manifests the resolver reads beside source that could not be read.
+///
+/// One owner, because the inventory is *compared* as well as written: `status`
+/// and the warm paths of `build` and the drain each decide "still current" by
+/// testing the tree's inventory against the stored one. Every one of them must
+/// compute it the same way, or a manifest refusal reads as permanent drift to
+/// the sites that leave it out and as no change to the ones that include it.
+///
+/// A manifest is a file this indexer was meant to read and could not, which is
+/// the definition [`DiscoverySkipReason::is_refusal`] draws, and it caps the
+/// dead-code pass for the same reason: a `go.mod` or `tsconfig.json` that was
+/// never read takes its module mapping with it, so the imports that resolved
+/// through it — and the callers they carried — are absent from the graph.
+///
+/// Sorted by path, which is the order the store reads the rows back in, and
+/// deduplicated by path with discovery's verdict standing: a root `go.mod` both
+/// passes refuse is one row.
+///
+/// [`DiscoverySkipReason::is_refusal`]: devmap_extract::model::DiscoverySkipReason::is_refusal
+pub fn refusal_inventory(
+    report: &DiscoveryReport,
+    manifests: &ProjectManifests,
+) -> Vec<DiscoveryRefusal> {
+    let mut inventory: BTreeMap<String, String> = discovery_refusals(report)
+        .into_iter()
+        .map(|refusal| (refusal.path, refusal.reason))
+        .collect();
+    add_manifest_refusals(&mut inventory, manifests);
+    inventory
+        .into_iter()
+        .map(|(path, reason)| DiscoveryRefusal { path, reason })
+        .collect()
+}
+
+/// Add the manifest pass's refusals to an inventory by path, leaving any
+/// verdict already in it standing.
+///
+/// The half of [`refusal_inventory`] the incremental drain needs on its own: it
+/// has no discovery report to start from, only the previous generation's rows
+/// carried forward and the batch it re-read.
+pub fn add_manifest_refusals(
+    inventory: &mut BTreeMap<String, String>,
+    manifests: &ProjectManifests,
+) {
+    for (path, reason) in &manifests.refusals {
+        if reason.is_refusal() {
+            inventory
+                .entry(path.clone())
+                .or_insert_with(|| reason.to_string());
+        }
+    }
+}
+
 #[cfg(test)]
 mod write_read_symmetry {
     use super::*;
@@ -205,5 +266,119 @@ mod write_read_symmetry {
     fn an_unknown_gap_label_has_no_slot() {
         let mut gaps = CoverageGaps::default();
         assert!(gaps.slot("not_a_gap_kind").is_none());
+    }
+}
+
+#[cfg(test)]
+mod refusal_inventory_rules {
+    use super::*;
+    use devmap_extract::model::DiscoverySkipReason;
+
+    fn unreadable(reason: &str) -> DiscoverySkipReason {
+        DiscoverySkipReason::Unreadable {
+            reason: reason.to_string(),
+        }
+    }
+
+    fn manifests(refusals: Vec<(&str, DiscoverySkipReason)>) -> ProjectManifests {
+        ProjectManifests {
+            examined: refusals.iter().map(|(path, _)| path.to_string()).collect(),
+            refusals: refusals
+                .into_iter()
+                .map(|(path, reason)| (path.to_string(), reason))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The inventory is compared as well as written, so its shape is part of
+    /// its meaning: one row per path, by path, discovery's verdict standing,
+    /// and nothing that is not coverage loss.
+    #[test]
+    fn one_row_per_path_in_path_order_with_discovery_standing() {
+        let report = DiscoveryReport {
+            yielded_paths: vec!["a.py".into()],
+            skipped_paths: vec![
+                ("z.py".into(), unreadable("discovery said z")),
+                ("go.mod".into(), unreadable("discovery said go.mod")),
+                ("README.md".into(), DiscoverySkipReason::NonSource),
+            ],
+        };
+        let manifests = manifests(vec![
+            ("go.mod", unreadable("manifest said go.mod")),
+            (
+                "node_modules/b/tsconfig.json",
+                unreadable("manifest said b"),
+            ),
+            // Never produced today, and refused here if it ever is: a skip that
+            // is not coverage loss must not become a row because the manifest
+            // pass, rather than discovery, met it.
+            (
+                "huge/tsconfig.json",
+                DiscoverySkipReason::Oversized { bytes: 2, limit: 1 },
+            ),
+        ]);
+        let inventory = refusal_inventory(&report, &manifests);
+        assert_eq!(
+            inventory
+                .iter()
+                .map(|row| (row.path.as_str(), row.reason.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("go.mod", "unreadable: discovery said go.mod"),
+                (
+                    "node_modules/b/tsconfig.json",
+                    "unreadable: manifest said b"
+                ),
+                ("z.py", "unreadable: discovery said z"),
+            ]
+        );
+    }
+
+    /// Order-independent: the same facts in any order are the same inventory,
+    /// or the warm paths that compare it would see drift that is not there.
+    #[test]
+    fn the_inventory_does_not_depend_on_the_order_facts_arrive_in() {
+        let skipped = vec![
+            ("b.py".to_string(), unreadable("b")),
+            ("a.py".to_string(), unreadable("a")),
+        ];
+        let mut reversed = skipped.clone();
+        reversed.reverse();
+        let manifest_rows = vec![("m/go.mod", unreadable("m")), ("c/go.mod", unreadable("c"))];
+        let mut manifest_reversed = manifest_rows.clone();
+        manifest_reversed.reverse();
+        let one = refusal_inventory(
+            &DiscoveryReport {
+                skipped_paths: skipped,
+                ..Default::default()
+            },
+            &manifests(manifest_rows),
+        );
+        let two = refusal_inventory(
+            &DiscoveryReport {
+                skipped_paths: reversed,
+                ..Default::default()
+            },
+            &manifests(manifest_reversed),
+        );
+        assert_eq!(one, two);
+        assert!(one.windows(2).all(|pair| pair[0].path < pair[1].path));
+    }
+
+    /// The drain's half adds without overriding what the batch decided.
+    #[test]
+    fn adding_manifest_refusals_never_overrides_a_verdict_already_held() {
+        let mut inventory: BTreeMap<String, String> =
+            [("go.mod".to_string(), "unreadable: batch".to_string())].into();
+        add_manifest_refusals(
+            &mut inventory,
+            &manifests(vec![
+                ("go.mod", unreadable("manifest")),
+                ("x/go.mod", unreadable("x")),
+            ]),
+        );
+        assert_eq!(inventory["go.mod"], "unreadable: batch");
+        assert_eq!(inventory["x/go.mod"], "unreadable: x");
     }
 }

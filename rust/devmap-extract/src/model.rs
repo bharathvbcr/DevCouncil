@@ -1735,6 +1735,12 @@ impl Extraction {
         capabilities_of(&self.language, &self.engine)
     }
 
+    /// The language this file's declarations and calls are written in. See
+    /// [`code_language_of`].
+    pub fn code_language(&self) -> &str {
+        code_language_of(&self.language, &self.engine)
+    }
+
     /// Whether a grammar read this file and no call extractor exists for its
     /// language — every symbol in it is uncalled and calls nothing *by
     /// construction*. See [`is_call_blind`].
@@ -1788,11 +1794,25 @@ pub fn capabilities_of(
     language: &str,
     engine: &ExtractionEngine,
 ) -> crate::languages::Capabilities {
+    crate::languages::capabilities_for_language(code_language_of(language, engine))
+}
+
+/// The language the code in a file read by `engine` under `language` is
+/// written in: the kernel's for a notebook, `language` for everything else.
+///
+/// `language` names the container, and for an `.ipynb` the container is not
+/// the code. The capability question was the first to learn that (R10); the
+/// coverage join kept asking the container. It keyed its per-language hole and
+/// coverage counts by `language`, so a Python-kernel notebook that failed to
+/// parse was charged to `"notebook"`, and `language_can_reference("notebook",
+/// "python")` is false — a notebook has no family and no call extractor of its
+/// own. The hole it left could hide a caller of any Python symbol it called and
+/// capped none of them. One owner for "which language is this code", so the
+/// next site that needs the answer cannot read the container by mistake.
+pub fn code_language_of<'a>(language: &'a str, engine: &'a ExtractionEngine) -> &'a str {
     match engine {
-        ExtractionEngine::Notebook { kernel_language } => {
-            crate::languages::capabilities_for_language(kernel_language)
-        }
-        _ => crate::languages::capabilities_for_language(language),
+        ExtractionEngine::Notebook { kernel_language } => kernel_language,
+        _ => language,
     }
 }
 

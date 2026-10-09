@@ -26,6 +26,10 @@ re-checked against source in this pass (R1–R7, R10–R13, R15, M1–M4, M6, M7
 no mark. Commits naming them exist (`1680505b`, `8239876a`, `c42faed4`), but this pass did not
 verify them. Rows were checked by reading source and tests; no test was executed in this pass.
 
+**Update 2026-10-08:** R10, M3 and M4 are now closed — each remaining item below is pinned by a
+test that was executed. R10's fails against the unmodified join; M3's and M4's pin behaviour
+that already existed, and each was shown to fail with the rule it pins removed.
+
 | Item | State | Note |
 |---|---|---|
 | W0.1 capability registry | **landed, exceeded** | 4-bit `Capabilities` bitset + 37-file probe corpus with bidirectional verification. Better than specified. |
@@ -340,7 +344,7 @@ W2.3's point was that agents should be able to ask for deterministic-only edges.
 
 **Severity: medium (live flag/behavior disagreement).**
 
-**Partly closed.**
+**Closed (2026-10-08).**
 - **Fixed in `e4ca3def` (2026-09-06).** `Extraction::capabilities()` resolves a notebook from
   `ExtractionEngine::Notebook { kernel_language }` (`rust/devmap-extract/src/model.rs:1543-1604`).
   The four charge sites named below now ask the extraction rather than the language string:
@@ -354,6 +358,15 @@ W2.3's point was that agents should be able to ask for deterministic-only edges.
   `capabilities_for_language("notebook")` (`:816`), which is `NONE`, and `language_family`
   (`:826`) has no notebook arm. So a notebook's coverage and holes never reach Python
   findings. No test covers a broken notebook beside a Python symbol it calls.
+- **Closed 2026-10-08.** The join keys by `Extraction::code_language()` — the kernel for
+  `ExtractionEngine::Notebook { kernel_language }`, `language` otherwise — through one owner,
+  `devmap_extract::model::code_language_of`, which `capabilities_of` now also reads. The
+  dead-code cap sites (`cap_for`, `cap_call_blind_file_for`, `is_complete_for`) ask the same
+  owner. Pinned by `a_broken_python_notebook_caps_the_python_symbol_it_calls` and
+  `a_clean_notebook_is_counted_as_covered_python` in `a_notebook_is_not_call_blind.rs`; against
+  the unmodified join, `helper` published at 0.9 with no caveat. A notebook with no readable
+  kernel (`Unavailable { requested_language: "notebook" }`) has no language to resolve through
+  and still charges only `"notebook"`.
 
 `NON_REGISTRY_CAPABILITIES` lists `("notebook", Capabilities::NONE)` with the comment "its
 capabilities are that grammar's, resolved per file rather than declared here"
@@ -492,8 +505,8 @@ so a new **table** missing from the gate is invisible to it by construction.
 |---|---|---|
 | M1 | `not_parsed_files` is in `blind_files()` but not `is_complete()`, so 500 vendored bundles alone leave the corpus "complete", and adding one `.proto` suddenly makes it ~50% blind. It is also absent from `degraded_reason()`, so the printed reason will size the hole differently from what `cap` charged. **Closed** `65ad91b3` (2026-09-06). `not_parsed_files` was removed from the cap's numerator, not added to `is_complete()`. `is_complete()` is now `blind_files() == 0` (`rust/devmap-analyze/src/liveness.rs:464`), `blind_files` leaves out `not_parsed_files` (`:534-570`), and `degraded_reason` names the same four counters (`:502`). Pinned by `tests/extraction_coverage_liveness.rs:576` `a_skipped_file_is_counted_apart_and_does_not_degrade_the_corpus`. | `liveness.rs:348`, `:368`, `:385` |
 | M2 | The ladder flattens for `blind_share ∈ [10.8%, 12.3%]`: branch 1/2 (`cap(0.4)`) and branch 3 (`cap(0.9)`) return identical numbers — the collapse the grading exists to undo, relocated to a narrow window. `the_cap_is_monotone_at_every_blind_share` checks non-decreasing, not separation. **Closed as accepted** `65ad91b3` (2026-09-06). The window is bounded and pinned, not removed, because removing it would mean replacing `min` with a multiplicative degrade. Pinned by `rust/devmap-analyze/tests/coverage_cap_is_graded.rs:414` `the_ladder_flattens_only_inside_a_narrow_stated_window`, which requires the window to start at about 10.8% and to be contiguous. | `liveness.rs:484` |
-| M3 | `lib.rs:109-117` caps `cluster.confidence` but leaves `cluster.reason` saying "reached by nothing outside the component" with no coverage caveat. The single-symbol path swaps in `COVERAGE_LOSS_REASON` for exactly this. **Closed in code, not pinned.** Since `65ad91b3` (2026-09-06), a degraded corpus appends a coverage caveat to `cluster.reason` (`rust/devmap-analyze/src/lib.rs:126-138`). No test asserts the caveat: rg for its text over `devmap-analyze/tests`, `devmap-query` and `devmap-cli` finds only the source. **Remaining:** a test. | `lib.rs:109` |
-| M4 | `unwired_candidates` skips edges from `TestFile` sources but not `Vendored` or `GeneratedFile`, so a vendored blob importing a module marks it wired. Pre-existing; the widened `is_wiring_evidence` enlarges the surface. **Closed in code, not pinned.** Since `1680505b` (2026-09-06), `non_authoring_importers` covers `TestFile`, `Vendored` and `GeneratedFile` sources (`rust/devmap-query/src/code_graph.rs:495-506`, applied at `:532`). No test was found in which a vendored or generated importer leaves a module unwired; the commit added no such test, and rg over `devmap-query/tests` and `devmap-cli/tests` found none. **Remaining:** a test. | `code_graph.rs:413` |
+| M3 | `lib.rs:109-117` caps `cluster.confidence` but leaves `cluster.reason` saying "reached by nothing outside the component" with no coverage caveat. The single-symbol path swaps in `COVERAGE_LOSS_REASON` for exactly this. **Closed in code, not pinned.** Since `65ad91b3` (2026-09-06), a degraded corpus appends a coverage caveat to `cluster.reason` (`rust/devmap-analyze/src/lib.rs:126-138`). No test asserts the caveat: rg for its text over `devmap-analyze/tests`, `devmap-query` and `devmap-cli` finds only the source. **Closed 2026-10-08:** pinned in both directions by `a_degraded_corpus_qualifies_the_cluster_reason_and_a_complete_one_does_not` (`devmap-analyze/tests/dead_clusters.rs`). | `lib.rs:109` |
+| M4 | `unwired_candidates` skips edges from `TestFile` sources but not `Vendored` or `GeneratedFile`, so a vendored blob importing a module marks it wired. Pre-existing; the widened `is_wiring_evidence` enlarges the surface. **Closed in code, not pinned.** Since `1680505b` (2026-09-06), `non_authoring_importers` covers `TestFile`, `Vendored` and `GeneratedFile` sources (`rust/devmap-query/src/code_graph.rs:495-506`, applied at `:532`). No test was found in which a vendored or generated importer leaves a module unwired; the commit added no such test, and rg over `devmap-query/tests` and `devmap-cli/tests` found none. **Closed 2026-10-08:** pinned by `a_vendored_or_generated_importer_leaves_the_module_unwired` (`devmap-query/tests/file_liveness_characterization.rs`), with a production importer as the control. | `code_graph.rs:413` |
 | M5 | `only_source_files_are_charged_as_import_blind` asserts a bare `excluded == 2` on a five-file fixture — it verifies a count, not that the two files are the C# and Swift ones its message names. | `unwired_excludes_prose_on_its_own_grounds.rs:152` |
 | M6 | `candidate_total` is written (`db.rs:2919`, `:2947`) and read only by `tools/fanout.sql` / `.sh`. Defensible for an offline metric, but no compiled code fails if the write regresses. **Closed** `7dfa20f4` (2026-09-06). A compiled test now fails if the write regresses: `rust/devmap-cli/tests/test_fanout_metric.rs:139` builds a real store, runs `rust/tools/fanout.sql`, and asserts `candidates == 13` (the sum of `candidate_total`, `:236`) and `pre_v16 == 0` (`:240`). The write has one owner, `rust/devmap-store/src/edge_index.rs:112` `ambiguous_candidate_total`. | — |
 | M7 | `MIGRATION_V16_TO_V17` creates the view without `IF NOT EXISTS` while `CREATE_SCHEMA_V3` uses it. Harmless given the `already_split` probe, but asymmetric. **Closed** `65ad91b3` (2026-09-06). The view is now `CREATE VIEW IF NOT EXISTS generation_files` (`rust/devmap-store/src/schema.rs:711`). | `schema.rs:687`, `:93` |

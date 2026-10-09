@@ -1099,6 +1099,16 @@ impl Daemon {
                 self.root
             );
         }
+        // The manifest pass, once, ahead of both branches: its refusals belong
+        // to the inventory each branch builds and to the restamp comparisons
+        // that inventory is tested in, and the resolver below indexes the same
+        // walk. Fatal, as `devmap build` already treats it — this used to warn
+        // and resolve without the tree's module mappings, writing every import
+        // they carry as `External` and recording nothing about why. Unlike
+        // discovery, which charges an unreadable `CACHEDIR.TAG` as a refusal
+        // and carries on, the manifest pass fails on one, so such a tree now
+        // fails the drain where it used to drain without its mappings.
+        let manifests = collect_project_manifests(&self.root)?;
         // A moved HEAD used to force a full re-extraction because carry-forward
         // would mix two checkouts. That is required when the tree actually
         // changed — a checkout the watcher missed is exactly B5 — and wasted
@@ -1141,9 +1151,14 @@ impl Daemon {
                 .latest_discovery_refusals()?
                 .into_iter()
                 .filter(|refusal| !affected.contains(&refusal.path))
+                // A manifest only the manifest pass reads is re-decided by
+                // every pass, never by the watcher, so its old row goes once
+                // the pass above has read it.
+                .filter(|refusal| !manifests.repaired(&refusal.path))
                 .map(|refusal| (refusal.path, refusal.reason))
                 .collect();
             inventory.extend(refused.clone());
+            devmap_store::add_manifest_refusals(&mut inventory, &manifests);
             (carried, false, inventory)
         } else {
             let scanned = if payload_is_current && head_moved {
@@ -1151,7 +1166,8 @@ impl Daemon {
                 let hashes = self.store.latest_file_hashes()?;
                 let stored_refusals = self.store.latest_discovery_refusals()?;
                 if scanned.matches_file_hashes(&hashes)
-                    && devmap_store::discovery_refusals(&scanned.report) == stored_refusals
+                    && devmap_store::refusal_inventory(&scanned.report, &manifests)
+                        == stored_refusals
                 {
                     self.store.restamp_latest_head(&head.sha)?;
                     self.store.clear_claimed_pending_paths(&succeeded)?;
@@ -1178,7 +1194,7 @@ impl Daemon {
             (
                 whole_tree,
                 true,
-                devmap_store::discovery_refusals(&report)
+                devmap_store::refusal_inventory(&report, &manifests)
                     .into_iter()
                     .map(|refusal| (refusal.path, refusal.reason))
                     .collect(),
@@ -1211,13 +1227,7 @@ impl Daemon {
         let discovery = DiscoveryCoverage::refused(refusals.len());
         extractions.sort_by(|left, right| left.file_path.cmp(&right.file_path));
         let mut resolver = Resolver::new();
-        match collect_project_manifests(&self.root) {
-            Ok(manifests) => resolver.index_project_manifests(&manifests),
-            Err(error) => warn!(
-                "project manifest collection failed for {:?}: {error}",
-                self.root
-            ),
-        }
+        resolver.index_project_manifests(&manifests);
         resolver.index_extractions(&extractions);
         // After `index_extractions`, which resets the set this extends.
         resolver.mark_go_dirs_incomplete(devmap_extract::go_dirs_with_unindexed_files(

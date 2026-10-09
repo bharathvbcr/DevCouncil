@@ -176,19 +176,10 @@ fn a_cluster_verdict_stays_below_the_confident_tier() {
 /// A degraded corpus caps the cluster verdict too.
 #[test]
 fn coverage_loss_caps_a_cluster_finding() {
-    let (mut extractions, _) = resolve(&[("orphan.py", ABANDONED)]);
+    let (extractions, _) = resolve(&[("orphan.py", ABANDONED)]);
     // Same-language coverage hole. An HCL call-blind file cannot reference
     // Python, so language-scoped completeness would leave the cluster uncapped.
-    let mut hole = extract_file("lost.py", "def never_seen():\n    return 0\n");
-    hole.parse_outcome = ParseOutcome::Fallback {
-        reason: "forced pattern recovery for cluster coverage fixture".to_string(),
-    };
-    hole.engine = ExtractionEngine::RegexFallback {
-        requested_language: "python".to_string(),
-    };
-    hole.imports.clear();
-    hole.calls.clear();
-    extractions.push(hole);
+    let extractions = with_a_same_language_hole(extractions);
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
     let resolution = resolver.resolve_all(&extractions).unwrap();
@@ -205,6 +196,72 @@ fn coverage_loss_caps_a_cluster_finding() {
             "a corpus with unread calls must not publish a cluster at the tier \
              a complete corpus would: {cluster:?}"
         );
+    }
+}
+
+/// A pattern-recovered Python file beside `orphan.py`: a same-language hole
+/// that could hide a call into the cluster.
+fn with_a_same_language_hole(mut extractions: Vec<Extraction>) -> Vec<Extraction> {
+    let mut hole = extract_file("lost.py", "def never_seen():\n    return 0\n");
+    hole.parse_outcome = ParseOutcome::Fallback {
+        reason: "forced pattern recovery for cluster coverage fixture".to_string(),
+    };
+    hole.engine = ExtractionEngine::RegexFallback {
+        requested_language: "python".to_string(),
+    };
+    hole.imports.clear();
+    hole.calls.clear();
+    extractions.push(hole);
+    extractions
+}
+
+/// The suffix `analyze_with_discovery` appends to a cluster reason when the
+/// corpus was not read in full.
+const DEGRADED_CLUSTER_CAVEAT: &str =
+    "one missed call edge into this component makes the whole finding wrong";
+
+/// A degraded corpus says so in the cluster's reason, not only in its number.
+///
+/// `coverage_loss_caps_a_cluster_finding` pins the confidence; this pins the
+/// prose that has to move with it. The reason reads "reached by nothing outside
+/// the component", an absolute claim, and a reader taking it at face value
+/// beside a demoted confidence saw no caveat at all until the suffix existed.
+/// Both directions: a complete corpus must not carry the caveat, or it stops
+/// meaning anything.
+#[test]
+fn a_degraded_corpus_qualifies_the_cluster_reason_and_a_complete_one_does_not() {
+    let (complete, _) = resolve(&[("orphan.py", ABANDONED)]);
+    let degraded = with_a_same_language_hole(complete.clone());
+
+    for (extractions, expect_caveat) in [(complete, false), (degraded, true)] {
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(&extractions);
+        let resolution = resolver.resolve_all(&extractions).unwrap();
+        let summary = analyze(&extractions, &resolution);
+        assert_eq!(
+            matches!(summary.status, AnalysisStatus::Partial { .. }),
+            expect_caveat,
+            "fixture assumption: the corpus is {} — {:?}",
+            if expect_caveat {
+                "degraded"
+            } else {
+                "complete"
+            },
+            summary.status
+        );
+        assert!(
+            !summary.dead_clusters.clusters.is_empty(),
+            "the cluster is found either way: {:?}",
+            summary.dead_clusters
+        );
+        for cluster in &summary.dead_clusters.clusters {
+            assert_eq!(
+                cluster.reason.contains(DEGRADED_CLUSTER_CAVEAT),
+                expect_caveat,
+                "a cluster reason must carry the coverage caveat exactly when \
+                 call extraction missed a file: {cluster:?}"
+            );
+        }
     }
 }
 
