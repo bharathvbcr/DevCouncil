@@ -46,12 +46,13 @@
     "pack:check": "npm pack --dry-run",
     "smoke:package": "node scripts/npm-runtime-smoke.mjs",
     "smoke:registry": "node scripts/npm-registry-smoke.mjs",
-    "check:release": "node scripts/check-release.mjs",
+    "check:release": "go -C backend/go_orchestrator run ./cmd/dcrelease",
+    "test:release": "go -C backend/go_orchestrator test ./devcouncil/release ./cmd/dcrelease -count=1",
     "check:workflows": "node scripts/check-workflows.mjs",
     "agents:sync": "node scripts/sync-agent-defs.mjs",
     "agents:check": "node scripts/sync-agent-defs.mjs --check",
     "agents:prefixes": "node scripts/mcp-served-tools.mjs",
-    "test:scripts": "node --test scripts/check-release.test.mjs scripts/check-workflows.test.mjs scripts/sync-agent-defs.test.mjs",
+    "test:scripts": "node --test scripts/check-workflows.test.mjs scripts/sync-agent-defs.test.mjs",
     "ci:local": "node scripts/ci-local.mjs"
   },
   "engines": {

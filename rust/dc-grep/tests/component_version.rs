@@ -9,7 +9,8 @@
 //! The expected string is built from `CARGO_PKG_VERSION` rather than spelled
 //! out, so a release does not have to edit this file. That the crate takes its
 //! version from the workspace rather than declaring its own is a separate
-//! property, checked once for every crate by `scripts/check-release.mjs`.
+//! property, checked once for every crate by the release identity gate
+//! (`backend/go_orchestrator/devcouncil/release`).
 
 use std::process::Command;
 

@@ -6,12 +6,13 @@
  */
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { tagNamesHead } from "./check-release.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const GO_MODULE = path.join(REPO_ROOT, "backend", "go_orchestrator");
 
 /**
  * @param {string} label
@@ -111,7 +112,7 @@ function ensureGussetEngine() {
 function gofmtClean() {
   console.log("\n== gofmt ==");
   const result = spawnSync("gofmt", ["-l", "."], {
-    cwd: path.join(REPO_ROOT, "backend", "go_orchestrator"),
+    cwd: GO_MODULE,
     encoding: "utf8",
     shell: false,
   });
@@ -128,82 +129,49 @@ function gofmtClean() {
 }
 
 /**
- * Resolve a git rev to a commit sha, or null when it does not exist.
- * A git that cannot run at all is exit 2, never a pass.
- * @param {string} rev
- * @returns {string | null}
- */
-function revParse(rev) {
-  const result = spawnSync("git", ["rev-parse", "-q", "--verify", `${rev}^{commit}`], {
-    cwd: REPO_ROOT,
-    encoding: "utf8",
-    shell: false,
-  });
-  if (result.error) {
-    console.error(`FAIL: git rev-parse could not run: ${result.error.message}`);
-    process.exit(2);
-  }
-  // Exit 1 with no output is "no such rev", which is a legitimate answer.
-  const sha = (result.stdout || "").trim();
-  return sha === "" ? null : sha;
-}
-
-/**
  * The tag path, which `release.yml` takes on a push and which nothing here
- * exercised before: on a tag push CI runs `check-release.mjs --tag <ref>`,
- * while the bare form below is only ever the pull_request path.
+ * exercised before: on a tag push CI runs `cmd/dcrelease --tag <ref>`, while
+ * the bare form below is only ever the pull_request path.
  *
- * It also checks the one release invariant CI *structurally cannot* see.
- * `release.yml` publishes `docs/releases/<tag>.md` from the tagged commit, so
- * if the tag is behind the notes, the stale notes ship and every gate passes
- * on them — they are internally consistent at that commit. The only place to
- * catch it is here, before the push.
+ * `--tag-at-head` also checks the one release invariant CI *structurally
+ * cannot* see. `release.yml` publishes `docs/releases/<tag>.md` from the
+ * tagged commit, so if the tag is behind the notes, the stale notes ship and
+ * every gate passes on them — they are internally consistent at that commit.
+ * The only place to catch it is here, before the push.
  */
-function releaseTagAgrees() {
-  console.log("\n== release tag ==");
+function releaseTagAgrees(dcrelease) {
   const pkgPath = path.join(REPO_ROOT, "package.json");
   const version = JSON.parse(readFileSync(pkgPath, "utf8")).version;
   if (typeof version !== "string" || version === "") {
     console.error(`FAIL: no version in ${pkgPath}`);
     process.exit(2);
   }
-  const tag = `v${version}`;
-  const headSha = revParse("HEAD");
-  if (!headSha) {
-    console.error("FAIL: could not resolve HEAD");
-    process.exit(2);
-  }
-  const verdict = tagNamesHead({ tag, tagSha: revParse(`refs/tags/${tag}`), headSha });
-  if (!verdict.ok) {
-    console.error(`FAIL: ${verdict.reason}`);
-    process.exit(1);
-  }
-  console.log(`OK: ${tag} would publish the notes at HEAD`);
-  run("release identity (tag path)", process.execPath, [
-    "scripts/check-release.mjs",
-    "--tag",
-    tag,
-  ]);
+  run("release identity (tag path)", dcrelease, ["--tag", `v${version}`, "--tag-at-head"]);
 }
 
 function main() {
-  run("script tests", process.execPath, [
-    "--test",
-    "scripts/check-release.test.mjs",
-    "scripts/check-workflows.test.mjs",
-  ]);
-  run("release identity", process.execPath, ["scripts/check-release.mjs"]);
-  releaseTagAgrees();
+  run("script tests", process.execPath, ["--test", "scripts/check-workflows.test.mjs"]);
+  run("release gate tests", "go", ["test", "./devcouncil/release", "./cmd/dcrelease", "-count=1"], {
+    cwd: GO_MODULE,
+  });
+  // Built, not `go run`: `go run` reports every non-zero exit as 1, and this
+  // gate's 2 ("could not run") must not read as a mismatch.
+  const binDir = mkdtempSync(path.join(tmpdir(), "devcouncil-dcrelease-"));
+  process.on("exit", () => rmSync(binDir, { recursive: true, force: true }));
+  const dcrelease = path.join(binDir, process.platform === "win32" ? "dcrelease.exe" : "dcrelease");
+  run("build dcrelease", "go", ["build", "-o", dcrelease, "./cmd/dcrelease"], { cwd: GO_MODULE });
+  run("release identity", dcrelease, []);
+  releaseTagAgrees(dcrelease);
   run("workflow lint", process.execPath, ["scripts/check-workflows.mjs"]);
   run("npm pack", "npm", ["run", "pack:check"]);
   run("npm runtime smoke", process.execPath, ["scripts/npm-runtime-smoke.mjs"]);
   gofmtClean();
   ensureGussetEngine();
   run("go host tests", "go", ["test", "./cmd/devcouncil", "-count=1"], {
-    cwd: path.join(REPO_ROOT, "backend", "go_orchestrator"),
+    cwd: GO_MODULE,
   });
   run("go orchestrator tests", "go", ["test", "./...", "-count=1"], {
-    cwd: path.join(REPO_ROOT, "backend", "go_orchestrator"),
+    cwd: GO_MODULE,
   });
   run("rust verify --quick", "bash", ["./verify.sh", "--quick"], {
     cwd: path.join(REPO_ROOT, "rust"),

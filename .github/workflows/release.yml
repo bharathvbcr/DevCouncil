@@ -58,15 +58,24 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: "20"
+      # The gate is cmd/dcrelease, a standard-library Go command: it needs Go
+      # but not the Gusset checkout the host binary links.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go_orchestrator/go.mod
+          cache-dependency-path: backend/go_orchestrator/go.sum
       - name: Script tests
-        run: node --test scripts/check-release.test.mjs scripts/check-workflows.test.mjs
+        run: |
+          set -euo pipefail
+          node --test scripts/check-workflows.test.mjs
+          go -C backend/go_orchestrator test ./devcouncil/release ./cmd/dcrelease -count=1
       - name: Release identity
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "push" ]; then
-            node scripts/check-release.mjs --tag "${{ github.ref_name }}"
+            go -C backend/go_orchestrator run ./cmd/dcrelease --tag "${{ github.ref_name }}"
           else
-            node scripts/check-release.mjs
+            go -C backend/go_orchestrator run ./cmd/dcrelease
           fi
 
   # Run 'dist plan' (or host) to determine what tasks we need to do
@@ -261,9 +270,10 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-go@v5
         with:
-          node-version: "20"
+          go-version-file: backend/go_orchestrator/go.mod
+          cache-dependency-path: backend/go_orchestrator/go.sum
       - name: Install cached dist
         uses: actions/download-artifact@v8
         with:
@@ -281,7 +291,7 @@ jobs:
         # Must run before `dist host --steps=release`. A missing Windows zip
         # used to be noticed only at `gh release create`, after cargo-dist
         # had already opened the GitHub Release.
-        run: node scripts/check-release.mjs --artifacts target/distrib
+        run: go -C backend/go_orchestrator run ./cmd/dcrelease --artifacts target/distrib
       - id: host
         shell: bash
         run: |
@@ -309,7 +319,7 @@ jobs:
       - name: Require every declared target
         # Second look, after the flattened download. A missing zip must
         # fail the release loudly — never publish a partial set of platforms.
-        run: node scripts/check-release.mjs --artifacts artifacts
+        run: go -C backend/go_orchestrator run ./cmd/dcrelease --artifacts artifacts
       - name: Publish GitHub Release notes and archives
         # Notes come from docs/releases/vX.Y.Z.md via --notes-file. They must
         # not travel through GITHUB_ENV (48 KB cap). cargo-dist's
