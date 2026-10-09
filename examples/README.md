@@ -5,8 +5,7 @@ report snippets when documenting or judging DevCouncil.
 
 | Path | Role | How to run |
 | :--- | :--- | :--- |
-| [`build-week-demo/`](build-week-demo/) | Provider-free red→green evidence gate (no API keys) | `bash scripts/build-week-demo.sh` or `npm run demo:build-week` |
-| [`todo-api/`](todo-api/) | Planning goal text only (not a runnable app) | Use `build-week-demo` for a real evidence-gate run |
+| [`build-week-demo/`](build-week-demo/) | Calculator fixture files (`calc.py`, `broken_calc.py`, `test_calc.py`); the red→green demo that drove them was retired with the Python package | Not a product CLI; see [docs/archive/build-week-demo.md](../docs/archive/build-week-demo.md) |
 
 ## Documentation smoke (checkout)
 
