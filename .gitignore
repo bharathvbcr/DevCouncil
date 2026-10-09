@@ -366,6 +366,40 @@ target-*/
 DerivedData/
 
 # =============================================================================
+# Additional generated / local-only files
+# =============================================================================
+coverage/
+*.tsbuildinfo
+*.test
+.gocache/
+go.work.sum
+libgusset.a
+.fleet/
+.history/
+cmake-build-*/
+
+# Literal directory created when a hook fails to expand ${CLAUDE_PROJECT_DIR}
+/${CLAUDE_PROJECT_DIR}/
+
+# Swift / Xcode (Apple-platform shells)
+.build/
+.swiftpm/
+*.dSYM/
+xcuserdata/
+*.xcuserstate
+
+# Profiler and timing output
+perf.data
+perf.data.*
+*.cpuprofile
+cargo-timing*.html
+
+# Secret-bearing files that are never committed
+credentials.json
+service-account*.json
+*.tfvars
+
+# =============================================================================
 # Local personal / marketing drafts (keep on disk, do not push)
 # =============================================================================
 /RESUME_PORTFOLIO_POINTS_2026.md
