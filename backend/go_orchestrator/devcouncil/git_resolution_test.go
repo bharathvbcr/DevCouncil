@@ -111,3 +111,94 @@ func TestRepositoryGitConfigProgramsDoNotRunDuringReads(t *testing.T) {
 		t.Fatalf("verification lost the change: changed=%v empty=%v err=%v diff=%q", changed, empty, err, diff)
 	}
 }
+
+// markerScript writes a script that records each run and exits with status.
+func markerScript(t *testing.T, status string) (script, marker string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("the planted programs are shell scripts")
+	}
+	dir := t.TempDir()
+	marker = filepath.Join(dir, "ran")
+	script = filepath.Join(dir, "planted.sh")
+	body := "#!/bin/sh\necho \"$0 $*\" >> \"" + marker + "\"\ncat\nexit " + status + "\n"
+	// #nosec G306 -- an executable stand-in; the execute bit is the point.
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return script, marker
+}
+
+// A submodule's own filter driver does not run during get_diff or verify's
+// git state, and the dirty submodule is still reported by both.
+func TestASubmoduleFilterDoesNotRunDuringGetDiffOrVerify(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip(err)
+	}
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	root := newRepo(t)
+	src := newRepo(t)
+	runGit(t, root, "-c", "protocol.file.allow=always", "submodule", "add", "-q", src, "sub")
+	runGit(t, root, "commit", "-qm", "sub")
+	sub := filepath.Join(root, "sub")
+	script, marker := markerScript(t, "0")
+	runGit(t, sub, "config", "filter.planted.clean", script)
+	runGit(t, sub, "config", "filter.planted.required", "true")
+	write(t, filepath.Join(root, ".git", "modules", "sub"), "info/attributes", "* filter=planted\n")
+	// Same size as the committed content, so git must hash it to compare.
+	write(t, sub, "src/a.py", "VALUE = 2\n")
+
+	got, err := devcouncil.GetDiff(context.Background(), root, devcouncil.GetDiffArgs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dr := mustDiff(t, got)
+	changed, _, empty, err := verify.CollectGitState(context.Background(), root)
+	if ran, readErr := os.ReadFile(marker); readErr == nil {
+		t.Fatalf("the submodule's filter ran during reads:\n%s", ran)
+	}
+	if !dr.OK || len(dr.Files) != 1 || dr.Files[0] != (devcouncil.DiffFile{Path: "sub", Status: "M"}) {
+		t.Fatalf("get_diff did not report the dirty submodule: %+v", dr)
+	}
+	if err != nil || empty || len(changed) != 1 || changed[0] != "sub" {
+		t.Fatalf("verification did not report the dirty submodule: changed=%v empty=%v err=%v", changed, empty, err)
+	}
+}
+
+// In a partial clone a read whose objects are missing fails loudly: git does
+// not fetch them — the fetch runs what the repository's config names — and
+// the failure is not read as an empty diff.
+func TestAPartialCloneReadFailsLoudlyRatherThanFetching(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip(err)
+	}
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	src := newRepo(t)
+	runGit(t, src, "config", "uploadpack.allowFilter", "true")
+	root := filepath.Join(t.TempDir(), "clone")
+	runGit(t, filepath.Dir(root), "clone", "-q", "--no-checkout", "--filter=blob:none", "file://"+src, root)
+	runGit(t, root, "read-tree", "HEAD")
+	script, marker := markerScript(t, "1")
+	runGit(t, root, "config", "remote.origin.url", "ssh://example.invalid/repo.git")
+	runGit(t, root, "config", "core.sshCommand", script)
+	runGit(t, root, "config", "credential.helper", script)
+
+	changed, diff, empty, err := verify.CollectGitState(context.Background(), root)
+	if ran, readErr := os.ReadFile(marker); readErr == nil {
+		t.Fatalf("verification fetched from the promisor remote and ran:\n%s", ran)
+	}
+	if err == nil {
+		t.Fatalf("a read missing its objects answered: changed=%v empty=%v diff=%q", changed, empty, diff)
+	}
+	got, getErr := devcouncil.GetDiff(context.Background(), root, devcouncil.GetDiffArgs{})
+	if ran, readErr := os.ReadFile(marker); readErr == nil {
+		t.Fatalf("get_diff fetched from the promisor remote and ran:\n%s", ran)
+	}
+	if getErr == nil {
+		if dr := mustDiff(t, got); dr.OK {
+			t.Fatalf("get_diff answered without the objects it needed: %+v", dr)
+		}
+	}
+}

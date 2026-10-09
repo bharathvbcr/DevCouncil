@@ -21,15 +21,17 @@ func TestGitArgsPlacesGuards(t *testing.T) {
 		in   []string
 		want []string
 	}{
-		{"diff gets both", []string{"diff", "HEAD"},
-			[]string{"diff", "--no-ext-diff", "--no-textconv", "HEAD"}},
+		{"diff gets both, and leaves submodule working trees unread", []string{"diff", "HEAD"},
+			[]string{"diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty", "HEAD"}},
+		{"status leaves submodule working trees unread", []string{"status", "--porcelain"},
+			[]string{"status", "--ignore-submodules=dirty", "--porcelain"}},
 		{"blame gets textconv only", []string{"blame", "--line-porcelain", "HEAD", "--", "a"},
 			[]string{"blame", "--no-textconv", "--line-porcelain", "HEAD", "--", "a"}},
 		{"log and show", []string{"show", "--name-only", "x"},
 			[]string{"show", "--no-ext-diff", "--no-textconv", "--name-only", "x"}},
 		{"caller globals stay before the subcommand",
 			[]string{"-c", "core.quotePath=false", "-C", "sub", "--no-pager", "diff", "--unified=0"},
-			[]string{"-c", "core.quotePath=false", "-C", "sub", "--no-pager", "diff", "--no-ext-diff", "--no-textconv", "--unified=0"}},
+			[]string{"-c", "core.quotePath=false", "-C", "sub", "--no-pager", "diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty", "--unified=0"}},
 		{"a subcommand without guards is unchanged", []string{"ls-files", "-z"}, []string{"ls-files", "-z"}},
 		{"an argument after the subcommand named diff is not a subcommand",
 			[]string{"rev-parse", "diff"}, []string{"rev-parse", "diff"}},
@@ -58,7 +60,7 @@ func TestGitArgsDoesNotAliasItsInput(t *testing.T) {
 
 // gitRepo is a one-commit repository with a.txt modified, isolated from the
 // machine's system and global config.
-func gitRepo(t *testing.T) string {
+func gitRepo(t testing.TB) string {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("the planted programs are shell scripts")
@@ -87,7 +89,7 @@ func gitRepo(t *testing.T) string {
 	return root
 }
 
-func gitRun(t *testing.T, root string, args ...string) {
+func gitRun(t testing.TB, root string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = root

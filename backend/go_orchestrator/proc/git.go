@@ -7,39 +7,116 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
-// GitCommand builds a git read against root: the git LookPathOutside finds,
-// run in root in its own process group, with the guards GitArgs adds. Both of the host's git runners
-// build their commands here, so which git runs and with which guards has one
-// owner. Capping output and classifying failures stay with the runners.
+// GitCommand builds one git read against root: NewGitSession and
+// GitSession.Command in one call, for a caller that makes a single read. An
+// operation that makes several reads of one root holds a GitSession instead,
+// so the repository's config is read once rather than once per read.
 //
-// A git that cannot be resolved is returned as an *exec.Error, the type a
-// missing git produces, so callers report that git could not run.
+// A git that cannot be resolved, or a read that is refused, is returned as an
+// *exec.Error, the type a missing git produces, so callers report that git
+// could not run.
 func GitCommand(ctx context.Context, root string, args ...string) (*exec.Cmd, error) {
+	session, err := NewGitSession(root)
+	if err != nil {
+		return nil, err
+	}
+	return session.Command(ctx, args...)
+}
+
+// GitSession is one operation's git reads against one root: the git
+// LookPathOutside finds, its version, and the repository config the guards
+// are computed from. Both of the host's git runners build their commands
+// here, so which git runs and with which guards has one owner. Capping output
+// and classifying failures stay with the runners.
+//
+// The config is read once per session and read again only when the
+// repository's own config files change (their identity, size and mtime are
+// compared before each read). A session lives as long as one operation —
+// a get_diff, a verify's git state — and no longer: a value pulled in through
+// include.path from another file is not watched, so a session must not
+// outlive the operation it was made for.
+type GitSession struct {
+	root string
+	git  string
+
+	mu       sync.Mutex
+	config   *repositoryConfig
+	stamp    configStamp
+	stampSet bool
+}
+
+// NewGitSession resolves git for reads against root.
+func NewGitSession(root string) (*GitSession, error) {
 	git, err := LookPathOutside("git", root)
 	if err != nil {
 		return nil, &exec.Error{Name: "git", Err: err}
 	}
+	return &GitSession{root: root, git: git}, nil
+}
+
+// Root is the directory the session reads.
+func (s *GitSession) Root() string { return s.root }
+
+// Command builds a git read: run in the session's root in its own process
+// group, with the guards GitArgs adds, the repository's filter drivers
+// neutralized (readRepositoryConfig), and no lazy fetch.
+//
+// A git that does not honour GIT_NO_LAZY_FETCH may still read an ordinary
+// clone; in a partial clone the read is refused with a
+// *LazyFetchUnguardedError, because a missing object would be fetched and
+// the fetch runs what the repository's config names. This is decision D9 in
+// ft-ff2153d9.
+func (s *GitSession) Command(ctx context.Context, args ...string) (*exec.Cmd, error) {
+	version, err := DetectGitVersion(ctx, s.git)
+	if err != nil {
+		return nil, &exec.Error{Name: "git", Err: err}
+	}
+	guarded := version.HonorsNoLazyFetch()
+	_, sub := splitSubcommand(args)
 	var filters []string
-	if _, sub := splitSubcommand(args); !filterFree[sub] {
-		filters, err = repositoryFilterOverrides(ctx, git, root)
+	if !filterFree[sub] || !guarded {
+		config, err := s.repositoryConfig(ctx)
 		if err != nil {
 			return nil, &exec.Error{Name: "git", Err: err}
 		}
+		if config.partialClone && !guarded {
+			return nil, &exec.Error{Name: "git", Err: &LazyFetchUnguardedError{Git: s.git, Version: version, Root: s.root}}
+		}
+		if !filterFree[sub] {
+			filters = config.filters
+		}
 	}
-	cmd := exec.CommandContext(ctx, git, append(filters, GitArgs(args)...)...)
+	cmd := exec.CommandContext(ctx, s.git, append(filters, GitArgs(args)...)...)
 	// Group isolation, as at every subprocess boundary in this module: a
 	// deadline must reach the hooks, helpers and pagers git itself starts.
 	ConfigureGroup(cmd)
-	cmd.Dir = root
-	// No terminal prompt, and no optional index lock: a read must never
-	// block on a credential prompt or leave index.lock in someone's checkout.
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0")
+	cmd.Dir = s.root
+	cmd.Env = gitEnv()
 	return cmd, nil
+}
+
+// repositoryConfig is the repository's config, read once and kept while the
+// repository's own config files are unchanged.
+func (s *GitSession) repositoryConfig(ctx context.Context) (*repositoryConfig, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stamp, stampOK := stampRepositoryConfig(s.root)
+	if s.config != nil && stampOK && s.stampSet && stamp == s.stamp {
+		return s.config, nil
+	}
+	config, err := readRepositoryConfig(ctx, s.git, s.root)
+	if err != nil {
+		return nil, err
+	}
+	s.config, s.stamp, s.stampSet = config, stamp, stampOK
+	return config, nil
 }
 
 // GitArgs returns args with the guards every DevCouncil git read carries.
@@ -56,13 +133,19 @@ func GitCommand(ctx context.Context, root string, args ...string) (*exec.Cmd, er
 //   - before the subcommand: core.fsmonitor=false, core.hooksPath at the null
 //     device (no hook can be found there), log.showSignature=false;
 //   - after diff, log or show: --no-ext-diff --no-textconv;
-//   - after blame: --no-textconv.
+//   - after blame: --no-textconv;
+//   - after diff and status: --ignore-submodules=dirty. Asked whether a
+//     submodule's working tree is dirty, git runs status inside it, and that
+//     status runs the submodule's own filter drivers and fsmonitor, which
+//     the superproject's config listing never sees. A submodule whose
+//     checked-out commit moved is still reported; GitSession.DirtySubmodules
+//     reports working-tree dirtiness with a guarded read of each submodule.
 //
 // Global options the caller passes before its subcommand (`-c k=v`, `-C dir`)
 // are kept in place; the subcommand is the first argument that is not one.
 //
 // Filter drivers need the repository's config read first, because no flag
-// disables them; GitCommand does that with repositoryFilterOverrides.
+// disables them; GitSession.Command does that with readRepositoryConfig.
 func GitArgs(args []string) []string {
 	out := make([]string, 0, len(args)+12)
 	out = append(out,
@@ -104,22 +187,37 @@ func splitSubcommand(args []string) (int, string) {
 var filterFree = map[string]bool{"rev-parse": true, "rev-list": true, "log": true}
 
 var subcommandGuards = map[string][]string{
-	"diff":  {"--no-ext-diff", "--no-textconv"},
-	"log":   {"--no-ext-diff", "--no-textconv"},
-	"show":  {"--no-ext-diff", "--no-textconv"},
-	"blame": {"--no-textconv"},
+	"diff":   {"--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty"},
+	"log":    {"--no-ext-diff", "--no-textconv"},
+	"show":   {"--no-ext-diff", "--no-textconv"},
+	"blame":  {"--no-textconv"},
+	"status": {"--ignore-submodules=dirty"},
 }
 
 // filterVars are the settings that make a filter driver run a program, plus
 // required, which turns a filter that cannot run into a failed read.
 var filterVars = []string{"clean", "smudge", "process", "required"}
 
-// filterConfigLimit bounds the filter listing read before each git read. A
+// filterConfigLimit bounds the config listing read before a git read. A
 // listing that does not fit is refused: a truncated one could omit a driver.
 const filterConfigLimit = 1 << 20
 
-// repositoryFilterOverrides returns -c arguments that neutralize every filter
-// driver the repository itself defines.
+// repositoryConfigPattern selects what one `git config` listing must carry:
+// every filter driver setting, and the settings that make the repository a
+// partial clone, so detecting one costs no extra spawn. Keys are matched in
+// git's canonical form, section and variable lowercased.
+const repositoryConfigPattern = `^(filter\.|extensions\.partialclone$|remote\..*\.(promisor|partialclonefilter)$)`
+
+// repositoryConfig is what the guards need from the repository's config.
+type repositoryConfig struct {
+	// filters are -c arguments neutralizing the repository's filter drivers.
+	filters []string
+	// partialClone: a promisor remote may supply missing objects on demand.
+	partialClone bool
+}
+
+// readRepositoryConfig lists the repository's filter and partial-clone
+// config once, with scopes.
 //
 // filter.<name>.clean runs on diff, and no flag turns filters off, so the
 // repository's config is read first (reading config runs nothing). A driver
@@ -138,12 +236,12 @@ const filterConfigLimit = 1 << 20
 // A driver name a -c argument cannot spell (one containing "=") is refused
 // rather than left running. A root git cannot enter has no repository config
 // to neutralize; git reports the root itself.
-func repositoryFilterOverrides(ctx context.Context, git, root string) ([]string, error) {
+func readRepositoryConfig(ctx context.Context, git, root string) (*repositoryConfig, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, git, "-C", root, "config", "--show-scope", "-z", "--get-regexp", `^filter\.`)
+	cmd := exec.CommandContext(ctx, git, "-C", root, "config", "--show-scope", "-z", "--get-regexp", repositoryConfigPattern)
 	ConfigureGroup(cmd)
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0")
+	cmd.Env = gitEnv()
 	out := &CappedBuffer{Limit: filterConfigLimit}
 	var stderr bytes.Buffer
 	cmd.Stdout = out
@@ -151,21 +249,111 @@ func repositoryFilterOverrides(ctx context.Context, git, root string) ([]string,
 	cmd.WaitDelay = 2 * time.Second
 	err, timedOut := RunBounded(ctx, cmd.Run)
 	if timedOut {
-		return nil, fmt.Errorf("reading the repository's filter config did not finish: %w", ctx.Err())
+		return nil, fmt.Errorf("reading the repository's config did not finish: %w", ctx.Err())
 	}
 	if err != nil {
 		var exit *exec.ExitError
 		if errors.As(err, &exit) && (exit.ExitCode() == 1 || exit.ExitCode() == 128) {
-			// 1: no filter defined anywhere. 128: git cannot enter root,
-			// so there is no repository config; the read reports it.
-			return nil, nil
+			// 1: nothing matched anywhere. 128: git cannot enter root, so
+			// there is no repository config; the read reports it.
+			return &repositoryConfig{}, nil
 		}
-		return nil, fmt.Errorf("reading the repository's filter config: %w: %s", err, strings.TrimSpace(stderr.String()))
+		return nil, fmt.Errorf("reading the repository's config: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
 	if out.Overflowed() {
 		return nil, fmt.Errorf("the repository's filter config exceeds %d bytes; refusing to read with filters it could not check", filterConfigLimit)
 	}
-	return filterOverrides(out.Bytes())
+	filters, err := filterOverrides(out.Bytes())
+	if err != nil {
+		return nil, err
+	}
+	return &repositoryConfig{filters: filters, partialClone: isPartialClone(out.Bytes())}, nil
+}
+
+// isPartialClone reads the same listing for the settings that let a
+// promisor remote supply missing objects: extensions.partialClone, a
+// remote's promisor flag, or a remote's partial-clone filter. Any scope
+// counts; a promisor configured globally fetches just the same.
+func isPartialClone(listing []byte) bool {
+	fields := bytes.Split(listing, []byte{0})
+	for i := 0; i+1 < len(fields); i += 2 {
+		key, value, hasValue := strings.Cut(string(fields[i+1]), "\n")
+		switch {
+		case key == "extensions.partialclone":
+			if strings.TrimSpace(value) != "" {
+				return true
+			}
+		case strings.HasPrefix(key, "remote.") && strings.HasSuffix(key, ".promisor"):
+			if !hasValue || gitBool(value) {
+				return true
+			}
+		case strings.HasPrefix(key, "remote.") && strings.HasSuffix(key, ".partialclonefilter"):
+			if strings.TrimSpace(value) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// gitBool reads a config boolean as git does. A value git would reject
+// counts as true: an unreadable promisor flag is not evidence of no promisor.
+func gitBool(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "false", "no", "off", "0", "":
+		return false
+	}
+	return true
+}
+
+// configStamp identifies the repository's own config files as they are now:
+// the common config and the worktree's config.worktree.
+type configStamp [2]fileStamp
+
+type fileStamp struct {
+	exists     bool
+	dev, ino   uint64
+	size       int64
+	mtime      int64
+	statFailed bool
+}
+
+// stampRepositoryConfig finds root's git directory without running git — a
+// .git directory, or a .git file naming one, and its commondir — and stamps
+// the config files in it. ok is false when root is not a checkout's top
+// (a subdirectory, a bare repository): then nothing is cached.
+func stampRepositoryConfig(root string) (configStamp, bool) {
+	gitDir := filepath.Join(root, ".git")
+	info, err := os.Stat(gitDir)
+	if err != nil {
+		return configStamp{}, false
+	}
+	if !info.IsDir() {
+		data, err := os.ReadFile(gitDir)
+		if err != nil {
+			return configStamp{}, false
+		}
+		target, ok := strings.CutPrefix(strings.TrimSpace(string(data)), "gitdir: ")
+		if !ok {
+			return configStamp{}, false
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(root, target)
+		}
+		gitDir = target
+	}
+	commonDir := gitDir
+	if data, err := os.ReadFile(filepath.Join(gitDir, "commondir")); err == nil {
+		common := strings.TrimSpace(string(data))
+		if !filepath.IsAbs(common) {
+			common = filepath.Join(gitDir, common)
+		}
+		commonDir = common
+	}
+	return configStamp{
+		stampFile(filepath.Join(commonDir, "config")),
+		stampFile(filepath.Join(gitDir, "config.worktree")),
+	}, true
 }
 
 // filterOverrides turns `git config --show-scope -z --get-regexp ^filter\.`
