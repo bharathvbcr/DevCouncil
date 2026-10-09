@@ -499,8 +499,17 @@ type gitOut struct {
 	returnCode int
 }
 
+// runGit runs the git found by proc.LookPathOutside: a git the repository
+// supplies does not get to describe the repository. A refusal comes back as
+// an *exec.Error, like a git that is missing, so callers report that git
+// could not run rather than that root is not a repository.
 func runGit(ctx context.Context, root string, args ...string) (gitOut, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
+	git, err := proc.LookPathOutside("git", root)
+	if err != nil {
+		err = &exec.Error{Name: "git", Err: err}
+		return gitOut{stderr: err.Error(), returnCode: -1}, err
+	}
+	cmd := exec.CommandContext(ctx, git, args...)
 	cmd.Dir = root
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

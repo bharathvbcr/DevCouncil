@@ -323,10 +323,17 @@ func CollectGitState(ctx context.Context, root string) (changed []string, diff s
 	return changed, diff, empty, nil
 }
 
+// runGit runs the git found by proc.LookPathOutside. The diff verification
+// judges comes from git, and a git the repository supplies could report any
+// diff it likes, including none.
 func runGit(ctx context.Context, root string, args ...string) ([]byte, error) {
+	git, err := proc.LookPathOutside("git", root)
+	if err != nil {
+		return nil, &exec.Error{Name: "git", Err: err}
+	}
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := exec.CommandContext(ctx, git, args...)
 	cmd.Dir = root
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

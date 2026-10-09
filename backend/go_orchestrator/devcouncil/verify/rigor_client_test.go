@@ -133,3 +133,31 @@ func TestAMissingOverrideIsStillTheVerifierThatRuns(t *testing.T) {
 		t.Fatalf("a broken override was not kept as the verifier: %+v", client)
 	}
 }
+
+// TestARepositoryLocalGitDoesNotDescribeTheDiff. The diff verification
+// judges comes from git; a git the repository supplies could report any diff
+// it likes, including none.
+func TestARepositoryLocalGitDoesNotDescribeTheDiff(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the planted git is a shell script")
+	}
+	root := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "ran")
+	if err := os.MkdirAll(filepath.Join(root, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// #nosec G306 -- an executable stand-in; the execute bit is the point.
+	if err := os.WriteFile(filepath.Join(root, "bin", "git"), []byte("#!/bin/sh\n: > \"$PLANTED_GIT_MARKER\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PLANTED_GIT_MARKER", marker)
+	t.Setenv("PATH", filepath.Join(root, "bin"))
+
+	_, _, _, err := verify.CollectGitState(t.Context(), root)
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Fatal("the repository's git ran")
+	}
+	if err == nil {
+		t.Fatal("a refused git produced a diff instead of an error")
+	}
+}

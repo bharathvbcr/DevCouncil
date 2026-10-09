@@ -26,7 +26,9 @@ refused, never replaced; otherwise PATH, then `~/.local/bin` only when PATH has
 no candidate at all. A refused PATH candidate is not passed over for the
 fallback, and the fallback is held to the same canonical outside-root check.
 The resolved path is what runs; a client is never left holding a bare name for
-exec to search PATH again. Integration separates the two questions
+exec to search PATH again. The host's git runners (`get_diff`, repository
+probing and verification's diff) resolve `git` through `proc.LookPathOutside`
+too. Integration separates the two questions
 it used to conflate: the name written into a host config is resolved later by
 the host, while the program this process spawns must come from outside the
 repository. When no such program is found, DevMap asset composition is skipped
