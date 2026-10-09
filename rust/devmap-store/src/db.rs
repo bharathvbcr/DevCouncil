@@ -177,9 +177,8 @@ pub const MAX_PENDING_ATTEMPTS: u32 = 5;
 fn run_git_head_with_deadline(program: &str, root: &Path) -> anyhow::Result<String> {
     use devmap_extract::subprocess::{git_with_program, run_bounded, Bounds, Failure};
 
-    let mut command = git_with_program(std::ffi::OsStr::new(program), root)
+    let mut command = git_with_program(std::ffi::OsStr::new(program), root, ["rev-parse", "HEAD"])
         .map_err(|failure| anyhow::anyhow!("{failure}"))?;
-    command.args(["rev-parse", "HEAD"]);
     let bounds = Bounds {
         deadline: GIT_HEAD_DEADLINE,
         stdout_cap: 4096,

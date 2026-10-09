@@ -69,6 +69,7 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             // answers from a handed graph. Verified with
             // `cargo check -p dc-regress --no-default-features --all-targets`.
             "owners_and_test_signal",
+            "repository_git_config",
         ],
     ),
     (
@@ -93,6 +94,7 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             "git_is_bounded_on_the_artifact_path",
             "guide_write_security",
             "host_artifact_provider",
+            "repository_git_config",
             // `stat_key` and `read_bounded` are std plus one `O_NONBLOCK`
             // flag; nothing in this target reaches a grammar. Verified with
             // `cargo check -p devmap-query --no-default-features

@@ -172,24 +172,97 @@ impl std::error::Error for Failure {}
 /// and not a spawn failure, no terminal prompt, and no optional index locks
 /// (a read must never leave `index.lock` behind in someone's checkout).
 ///
-/// The `git` it runs is found by [`resolve_outside`]: the repository under
-/// analysis does not get to supply the program that describes it.
-///
-/// Subcommand and flags are the caller's to add.
-pub fn git(root: &Path) -> Result<Command, Failure> {
-    git_with_program(OsStr::new("git"), root)
+/// The `git` it runs is found by [`resolve_outside`], and the arguments carry
+/// [`guarded_args`]: neither the repository's files nor its `.git/config`
+/// choose a program this read runs.
+pub fn git<I, S>(root: &Path, args: I) -> Result<Command, Failure>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    git_with_program(OsStr::new("git"), root, args)
 }
 
 /// [`git`] with the program named, so a test can stand a script in for it.
-pub fn git_with_program(program: &OsStr, root: &Path) -> Result<Command, Failure> {
+pub fn git_with_program<I, S>(program: &OsStr, root: &Path, args: I) -> Result<Command, Failure>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let resolved = resolve_outside(program, std::env::var_os("PATH").as_deref(), root)?;
     let mut command = Command::new(resolved);
     command
         .arg("-C")
         .arg(root)
+        .args(guarded_args(args))
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0");
     Ok(command)
+}
+
+/// `args` with the guards every kernel git read carries.
+///
+/// A repository's own `.git/config` can name programs git runs during an
+/// ordinary read, and a `.git/config` can arrive with the repository.
+/// Verified against git 2.54: `core.fsmonitor` runs on `diff` and
+/// `ls-files`, `diff.external` on `diff`, a diff driver's `textconv` on
+/// `blame`, and `gpg.program` on `log` through `log.showSignature` when a
+/// commit carries a signature header. A planted fsmonitor that answers
+/// "nothing changed" also hides changes from the read. The guards switch
+/// each of those off from the command line, which outranks every config file:
+///
+/// * before the subcommand: `core.fsmonitor=false`, `core.hooksPath` at the
+///   null device (no hook can be found there), `log.showSignature=false`;
+/// * after `diff`, `log` or `show`: `--no-ext-diff --no-textconv`;
+/// * after `blame`: `--no-textconv`.
+///
+/// Global options the caller puts before its subcommand (`-c k=v`, `-C dir`)
+/// stay in place; the subcommand is the first argument that is not one. The
+/// Go host's `proc.GitArgs` applies the same rule.
+///
+/// Not covered: filter drivers (`filter.<name>.clean` runs on `diff`, and no
+/// flag disables it) — tracked in ft-ff2153d9 for the owner's decision.
+pub fn guarded_args<I, S>(args: I) -> Vec<std::ffi::OsString>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let args: Vec<std::ffi::OsString> = args
+        .into_iter()
+        .map(|a| a.as_ref().to_os_string())
+        .collect();
+    let mut out: Vec<std::ffi::OsString> = [
+        "-c".to_string(),
+        "core.fsmonitor=false".to_string(),
+        "-c".to_string(),
+        format!("core.hooksPath={NULL_DEVICE}"),
+        "-c".to_string(),
+        "log.showSignature=false".to_string(),
+    ]
+    .into_iter()
+    .map(std::ffi::OsString::from)
+    .collect();
+    let mut i = 0;
+    while i < args.len() && args[i].as_encoded_bytes().starts_with(b"-") {
+        if args[i] == "-c" || args[i] == "-C" {
+            i += 1;
+        }
+        i += 1;
+    }
+    let i = i.min(args.len());
+    out.extend_from_slice(&args[..i]);
+    if let Some(sub) = args.get(i) {
+        out.push(sub.clone());
+        let guards: &[&str] = match sub.to_str() {
+            Some("diff" | "log" | "show") => &["--no-ext-diff", "--no-textconv"],
+            Some("blame") => &["--no-textconv"],
+            _ => &[],
+        };
+        out.extend(guards.iter().map(std::ffi::OsString::from));
+        out.extend_from_slice(&args[i + 1..]);
+    }
+    out
 }
 
 /// The program a command against `root` runs, as an absolute path.
@@ -736,6 +809,73 @@ fn drain(pipe: Option<impl Read>, cap: usize) -> Drained {
 mod tests {
     use super::*;
     use std::io::ErrorKind;
+
+    #[test]
+    fn guarded_args_places_each_guard() {
+        let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        let global = vec![
+            "-c".to_string(),
+            "core.fsmonitor=false".to_string(),
+            "-c".to_string(),
+            format!("core.hooksPath={null}"),
+            "-c".to_string(),
+            "log.showSignature=false".to_string(),
+        ];
+        let cases: &[(&[&str], &[&str])] = &[
+            (
+                &["diff", "HEAD"],
+                &["diff", "--no-ext-diff", "--no-textconv", "HEAD"],
+            ),
+            (
+                &["blame", "-w", "HEAD"],
+                &["blame", "--no-textconv", "-w", "HEAD"],
+            ),
+            (
+                &["show", "x"],
+                &["show", "--no-ext-diff", "--no-textconv", "x"],
+            ),
+            (
+                &["log", "-z"],
+                &["log", "--no-ext-diff", "--no-textconv", "-z"],
+            ),
+            (
+                &[
+                    "-c",
+                    "core.quotePath=false",
+                    "-C",
+                    "sub",
+                    "--no-pager",
+                    "diff",
+                    "-U0",
+                ],
+                &[
+                    "-c",
+                    "core.quotePath=false",
+                    "-C",
+                    "sub",
+                    "--no-pager",
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "-U0",
+                ],
+            ),
+            (&["ls-files", "-z"], &["ls-files", "-z"]),
+            (&["rev-parse", "diff"], &["rev-parse", "diff"]),
+            (&["-c"], &["-c"]),
+            (&["--version"], &["--version"]),
+            (&[], &[]),
+        ];
+        for (input, want) in cases {
+            let got: Vec<String> = guarded_args(input.iter())
+                .into_iter()
+                .map(|a| a.into_string().unwrap())
+                .collect();
+            let mut expected = global.clone();
+            expected.extend(want.iter().map(|s| s.to_string()));
+            assert_eq!(got, expected, "input {input:?}");
+        }
+    }
 
     /// A fresh directory under the system temp dir, removed on drop.
     struct Scratch(PathBuf);
