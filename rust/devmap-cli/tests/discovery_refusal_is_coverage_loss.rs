@@ -9,8 +9,9 @@
 //! artifacts, the dead-code tier, the build result and `status` must all agree
 //! that the corpus was not read in full.
 //!
-//! Phase 1: `Oversized` is a default ignore (1 MiB ceiling), not a refusal —
-//! fixtures and generated blobs must not leave `status` permanently `partial`.
+//! `Oversized` (the 1 MiB ceiling) is not a refusal: it has its own
+//! `over_limit` coverage category, which degrades the graph only when the file
+//! could hold calls — see `over_limit_files_are_listed_not_lost.rs`.
 //! Genuine refusals remain `Unreadable` / escape / dangling-link shapes. The
 //! measured consequence below uses an unreadable `app.py` that is `helper`'s
 //! only caller: without that file, "nothing calls helper" is not a fact this
@@ -338,8 +339,8 @@ fn a_refusal_is_stable_across_rebuilds_and_a_readable_file_is_re_extracted() {
 }
 
 /// The rule that decides which skips are coverage loss has exactly one
-/// spelling. `NonSource` and `Oversized` are ordinary skips (fixtures /
-/// ceiling), not holes charged against the graph.
+/// spelling. `NonSource` is the ordinary skip and `Oversized` its own
+/// `over_limit` category; neither is a discovery refusal.
 ///
 /// The CLI, the daemon and the report all ask `DiscoverySkipReason::is_refusal`.
 /// A second copy of the predicate is how the CLI and the daemon came to
@@ -372,7 +373,7 @@ fn only_genuine_refusals_are_charged_against_coverage() {
             limit: devmap_extract::MAX_SOURCE_BYTES,
         }
         .is_refusal(),
-        "Oversized is a default ignore (1 MiB ceiling), not coverage loss"
+        "Oversized is its own over_limit category, not a discovery refusal"
     );
 
     // And the charge reaches the analysis: an unmeasured discovery contributes

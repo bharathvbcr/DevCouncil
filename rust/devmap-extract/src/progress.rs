@@ -113,7 +113,9 @@ pub struct FileDelta {
     /// Not folded into `removed`, though both lose the file's rows: "deleted"
     /// and "skipped: over limit" call for opposite responses, and reporting a
     /// 1.7 MB generated client as removed told a reader the callers it held
-    /// were gone from the code rather than from the index.
+    /// were gone from the code rather than from the index. Serialized under the
+    /// name `status.delta` uses, so the two surfaces spell one fact one way.
+    #[serde(rename = "skipped_over_limit")]
     pub over_limit: usize,
     pub unchanged: usize,
 }

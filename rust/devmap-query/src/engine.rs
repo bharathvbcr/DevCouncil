@@ -1197,11 +1197,32 @@ impl<'a> StoreQueryEngine<'a> {
             // honest answer is "I looked: nothing" — while its callers, found
             // through the containment edge on the other side, answered fine.
             // The other side of the index is the existence check: a symbol it
-            // names is indexed. A call-blind target is not a leaf — nothing
-            // looked for its calls — so it keeps the refusal below.
-            if call_blind.reason().is_none()
-                && !indexed_traversal_starts(index, target, !reverse, 0.0, &self.cancel)?.is_empty()
-            {
+            // names is indexed.
+            //
+            // "I looked: nothing" is only true where the looking was whole, so
+            // the refusal below stands for a call-blind target (nothing looked
+            // for its calls), for a file-shaped target, and for a symbol whose
+            // file did not parse `Clean` — a call inside an error region is
+            // one extraction never saw.
+            let is_symbol = !matches!(
+                crate::query_match::classify(target),
+                crate::query_match::StartQuery::Path(_) | crate::query_match::StartQuery::Nothing
+            );
+            let indexed_in = if is_symbol && call_blind.reason().is_none() {
+                indexed_traversal_starts(index, target, !reverse, 0.0, &self.cancel)?
+            } else {
+                Vec::new()
+            };
+            let files: BTreeSet<&str> = indexed_in.iter().map(|(_, file)| file.as_str()).collect();
+            // The files `call_blind` already read, when the target named its
+            // file; a bare name is resolved to files only now, and read once.
+            let checked = if files.iter().all(|file| call_blind.clean.contains(*file)) {
+                call_blind.clean.clone()
+            } else {
+                self.call_blind_starts(files.iter().copied())?.clean
+            };
+            let read_whole = !files.is_empty() && files.iter().all(|file| checked.contains(*file));
+            if read_whole {
                 let (edges, rungs) = crate::rung::narrow(Vec::new(), min_rung);
                 let mut response = budget_take(edges, req.token_budget, |_| EDGE_TOKENS);
                 response.rungs = Some(rungs);
@@ -1370,6 +1391,12 @@ impl<'a> StoreQueryEngine<'a> {
             let Some(file) = self.store.latest_file(path)? else {
                 continue;
             };
+            if matches!(
+                file.parse_outcome,
+                devmap_extract::model::ParseOutcome::Clean
+            ) {
+                starts.clean.insert(file.path.clone());
+            }
             if devmap_extract::model::is_call_blind(
                 &file.language,
                 &file.engine,

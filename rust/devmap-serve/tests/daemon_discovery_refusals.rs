@@ -7,7 +7,7 @@
 //! hold the only call to a symbol the report is about to call dead.
 //!
 //! Oversized sources are *not* in that set: `DiscoverySkipReason::Oversized`
-//! is an ordinary skip (the 1 MiB ceiling), pinned by
+//! is its own `over_limit` category (the 1 MiB ceiling), not a refusal, pinned by
 //! `oversized_skip_is_not_a_coverage_refusal`. These fixtures therefore use an
 //! escaping symlink — the same refusal class `one_symlink_rule_end_to_end`
 //! holds the cold walk and the drain to.

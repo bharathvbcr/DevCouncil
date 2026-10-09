@@ -64,6 +64,10 @@ pub(super) struct CallBlindStarts {
     pub(super) checked: usize,
     /// Distinct start files the bound left unread.
     pub(super) unchecked: usize,
+    /// Checked start files whose stored parse was `Clean`. Read from the same
+    /// row the call-blind verdict is, so the leaf answer in `traverse_walked`
+    /// costs no second store read per target.
+    pub(super) clean: BTreeSet<String>,
 }
 
 impl CallBlindStarts {

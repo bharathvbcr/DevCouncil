@@ -116,7 +116,10 @@ fn the_cli_and_the_daemon_answer_impact_alike_after_a_file_crosses_the_limit() {
     }
 
     let build = json(&cli, &["--json", "build", "."]);
-    assert_eq!(build["file_progress"]["delta"]["over_limit"], 1, "{build}");
+    assert_eq!(
+        build["file_progress"]["delta"]["skipped_over_limit"], 1,
+        "{build}"
+    );
 
     let store_path = devmap_extract::paths::store_path(&daemon_root);
     let daemon = Daemon::new(Store::open(&store_path).unwrap(), daemon_root.clone());

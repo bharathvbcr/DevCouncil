@@ -222,7 +222,10 @@ fn a_file_crossing_the_limit_is_reported_as_skipped_not_removed() {
 
     let build = json(&root, &["--json", "build", "."]);
     assert_eq!(build["file_progress"]["delta"]["removed"], 0, "{build}");
-    assert_eq!(build["file_progress"]["delta"]["over_limit"], 1, "{build}");
+    assert_eq!(
+        build["file_progress"]["delta"]["skipped_over_limit"], 1,
+        "{build}"
+    );
 
     // The human summary of the same build shape.
     std::fs::write(root.join("gen.py"), caller_of_at_least(848_958)).unwrap();
