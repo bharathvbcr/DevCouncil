@@ -85,7 +85,8 @@ fn old_future_and_corrupt_stores_are_refused_without_migration() {
         // nothing about. (A future store whose writer *declared* this reader
         // compatible is admitted — tests/reader_floor.rs holds that case,
         // including that admitting it writes nothing.)
-        conn.execute_batch("DROP TABLE IF EXISTS reader_compat").unwrap();
+        conn.execute_batch("DROP TABLE IF EXISTS reader_compat")
+            .unwrap();
         conn.pragma_update(None, "user_version", version).unwrap();
         drop(conn);
         let before = fs::read(temp.db()).unwrap();

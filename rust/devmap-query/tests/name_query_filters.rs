@@ -12,23 +12,30 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "devmap-name-filter-{name}-{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("devmap-name-filter-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir.canonicalize().unwrap()
 }
 
 fn filter(paths: &[&str], languages: &[&str], kinds: &[&str]) -> NameQueryFilter {
-    let owned = |values: &[&str]| values.iter().map(|value| (*value).to_string()).collect::<Vec<_>>();
+    let owned = |values: &[&str]| {
+        values
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>()
+    };
     NameQueryFilter::new(&owned(paths), &owned(languages), &owned(kinds))
         .unwrap()
         .expect("a non-empty filter")
 }
 
-fn names(engine: &StoreQueryEngine, query: &str, narrowing: Option<&NameQueryFilter>) -> (u32, BTreeSet<(String, String)>) {
+fn names(
+    engine: &StoreQueryEngine,
+    query: &str,
+    narrowing: Option<&NameQueryFilter>,
+) -> (u32, BTreeSet<(String, String)>) {
     let response = engine
         .search_filtered(
             Request {
@@ -51,12 +58,20 @@ fn names(engine: &StoreQueryEngine, query: &str, narrowing: Option<&NameQueryFil
         assert_eq!(scope.languages, expected.languages());
         assert_eq!(scope.kinds, expected.kinds());
     } else {
-        assert!(response.scope.is_none(), "an unfiltered search echoes no scope");
+        assert!(
+            response.scope.is_none(),
+            "an unfiltered search echoes no scope"
+        );
     }
     let found = response
         .items
         .iter()
-        .map(|hit| (hit.file_path.clone(), format!("{}:{}", hit.kind, hit.symbol_name)))
+        .map(|hit| {
+            (
+                hit.file_path.clone(),
+                format!("{}:{}", hit.kind, hit.symbol_name),
+            )
+        })
         .collect();
     (response.total, found)
 }
@@ -69,7 +84,10 @@ fn each_filter_selects_exactly_the_namesakes_that_pass_it() {
     let files = [
         ("left/a.py", "def record():\n    return 1\n"),
         ("right/b.py", "def record():\n    return 2\n"),
-        ("left/a.go", "package left\n\nfunc record() int { return 1 }\n"),
+        (
+            "left/a.go",
+            "package left\n\nfunc record() int { return 1 }\n",
+        ),
         (
             "right/b.go",
             "package right\n\ntype record struct { n int }\n\nfunc record() int { return 2 }\n",
@@ -177,7 +195,10 @@ fn each_filter_selects_exactly_the_namesakes_that_pass_it() {
             Some(&left),
         )
         .unwrap();
-    assert_eq!(starved.total, 2, "a small budget still counts the filtered set");
+    assert_eq!(
+        starved.total, 2,
+        "a small budget still counts the filtered set"
+    );
     assert_eq!(starved.shown + starved.hidden, starved.total);
     assert!(starved.hidden > 0, "budget 1 cannot show both definitions");
 

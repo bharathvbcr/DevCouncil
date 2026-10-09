@@ -829,8 +829,13 @@ fn extract_treesitter_before_deadline(
                 // after one registry lookup for every language whose entry
                 // permits neither `css` nor `html` inside it.
                 crate::markup::merge_markup(&mut extraction, root, source, lang);
-                let (literals, mut notes) =
-                    crate::literals::index_literals(root, source, lang, &extraction.symbols, deadline);
+                let (literals, mut notes) = crate::literals::index_literals(
+                    root,
+                    source,
+                    lang,
+                    &extraction.symbols,
+                    deadline,
+                );
                 extraction.literals = literals;
                 extraction.diagnostics.append(&mut notes);
                 #[cfg(test)]
