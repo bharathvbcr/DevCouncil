@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -283,6 +284,50 @@ func resolutionNotes(bindir string, names []string, lookPath func(string) (strin
 		}
 	}
 	return notes
+}
+
+// engineCgoEnv runs the checkout's rust/gusset-engine/cgo-env.sh — the one
+// owner of building the engine and of the flags that link it — and returns
+// the KEY=VALUE lines it prints. Its progress and errors go to stderr.
+func engineCgoEnv(src string) ([]string, error) {
+	script := filepath.Join(src, "rust", "gusset-engine", "cgo-env.sh")
+	ctx, cancel := context.WithTimeout(console.Context(), 20*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "bash", script)
+	proc.ConfigureGroup(cmd)
+	cmd.Dir = src
+	cmd.Stderr = console.Stderr()
+	cmd.WaitDelay = 2 * time.Second
+	var out proc.CappedBuffer
+	out.Limit = 64 << 10
+	cmd.Stdout = &out
+	runErr, timedOut := proc.RunBoundedWithCleanup(ctx, cmd.Run)
+	switch {
+	case timedOut:
+		return nil, fmt.Errorf("%s timed out after 20m", script)
+	case runErr != nil:
+		return nil, fmt.Errorf("%s: %w", script, runErr)
+	case out.Overflowed():
+		return nil, fmt.Errorf("%s printed more than %d bytes", script, out.Limit)
+	}
+	return parseCgoEnv(out.String())
+}
+
+// parseCgoEnv reads cgo-env.sh's KEY=VALUE lines. Anything else is refused:
+// a line this cannot read is a flag the link would silently go without.
+func parseCgoEnv(text string) ([]string, error) {
+	var env []string
+	for _, line := range strings.Split(strings.TrimSpace(text), "\n") {
+		key, _, ok := strings.Cut(line, "=")
+		if !ok || key == "" || strings.ContainsAny(key, " \t") {
+			return nil, fmt.Errorf("cgo-env.sh printed %q, not KEY=VALUE", line)
+		}
+		env = append(env, line)
+	}
+	if !slices.ContainsFunc(env, func(kv string) bool { return strings.HasPrefix(kv, "CGO_LDFLAGS=") }) {
+		return nil, fmt.Errorf("cgo-env.sh printed no CGO_LDFLAGS")
+	}
+	return env, nil
 }
 
 // samePath reports whether two paths name one file. A prefix reached through

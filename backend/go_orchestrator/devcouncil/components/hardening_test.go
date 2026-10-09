@@ -222,7 +222,9 @@ func TestInstallSavesHostReceiptIfRustFails(t *testing.T) {
 	}
 	r := &failingRunner{failSubstr: "cargo build"}
 	prefix := t.TempDir()
-	err = Install(cs, Options{Prefix: prefix, Runner: r, SourceRoot: src})
+	// The fake checkout has no Gusset engine to build; stand in for it.
+	engine := func(string) ([]string, error) { return []string{"CGO_LDFLAGS=-L/engine"}, nil }
+	err = Install(cs, Options{Prefix: prefix, Runner: r, SourceRoot: src, CgoEnv: engine})
 	if err == nil {
 		t.Fatal("expected rust failure")
 	}

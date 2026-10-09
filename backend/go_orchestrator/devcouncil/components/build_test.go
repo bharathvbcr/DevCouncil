@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -298,5 +299,79 @@ func TestAPartialInstallRecordsWhatItPutOnDisk(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(filepath.Join(prefix, "bin", rustBinaryName("dcstore"))); string(got) != "built dcstore" {
 		t.Fatalf("dcstore = %q", got)
+	}
+}
+
+// envRunner records the environment each command was given.
+type envRunner struct {
+	calls []string
+	envs  [][]string
+}
+
+func (r *envRunner) Run(name string, args []string, dir string, env []string) error {
+	r.calls = append(r.calls, name+" "+strings.Join(args, " "))
+	r.envs = append(r.envs, env)
+	return nil
+}
+
+// The host links the Gusset engine on Unix. Building it from a checkout must
+// first build that engine and link it with the flags cgo-env.sh prints —
+// a plain `go build` fails at link on a fresh clone, or relinks a stale
+// archive from Go's cache.
+func TestTheHostIsBuiltWithTheEnginesCgoEnvironment(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the host links Gusset only on Unix")
+	}
+	src := checkout(t)
+	r := &envRunner{}
+	var asked string
+	cs, _ := Resolve([]string{"host"})
+	err := Install(cs, Options{
+		Prefix: t.TempDir(), SourceRoot: src, Runner: r, LookPath: noPath,
+		CgoEnv: func(root string) ([]string, error) {
+			asked = root
+			return []string{"CGO_ENABLED=1", "CGO_LDFLAGS=-L/engine", "CGO_CFLAGS=-O2 -DDEVCOUNCIL_GUSSET_ENGINE_SHA256=ab"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if asked != src {
+		t.Fatalf("cgo environment asked for %q, want the checkout %q", asked, src)
+	}
+	i := slices.IndexFunc(r.calls, func(c string) bool { return strings.HasPrefix(c, "go build") })
+	if i < 0 || !slices.Contains(r.envs[i], "CGO_LDFLAGS=-L/engine") {
+		t.Fatalf("calls %v, envs %v", r.calls, r.envs)
+	}
+}
+
+func TestAHostWhoseEngineCannotBeBuiltIsNotBuiltAtAll(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the host links Gusset only on Unix")
+	}
+	src := checkout(t)
+	r := &envRunner{}
+	cs, _ := Resolve([]string{"host"})
+	err := Install(cs, Options{
+		Prefix: t.TempDir(), SourceRoot: src, Runner: r, LookPath: noPath,
+		CgoEnv: func(string) ([]string, error) { return nil, errors.New("gusset is not checked out next to DevCouncil") },
+	})
+	if err == nil || !strings.Contains(err.Error(), "gusset is not checked out") {
+		t.Fatalf("err = %v", err)
+	}
+	if len(r.calls) != 0 {
+		t.Fatalf("built anyway: %v", r.calls)
+	}
+}
+
+func TestCgoEnvOutputIsReadStrictly(t *testing.T) {
+	env, err := parseCgoEnv("CGO_ENABLED=1\nCGO_LDFLAGS=-L/a b\nCGO_CFLAGS=-O2 -g -DX=1\n")
+	if err != nil || len(env) != 3 || env[1] != "CGO_LDFLAGS=-L/a b" {
+		t.Fatalf("env %q, err %v", env, err)
+	}
+	for _, bad := range []string{"", "CGO_ENABLED=1\n", "CGO_LDFLAGS=-L/a\nexport X", "CGO_LDFLAGS=-L/a\n=v"} {
+		if _, err := parseCgoEnv(bad); err == nil {
+			t.Fatalf("%q accepted", bad)
+		}
 	}
 }

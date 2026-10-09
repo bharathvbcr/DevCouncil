@@ -117,6 +117,10 @@ type Options struct {
 	Prober  Prober
 	// LookPath resolves a binary name on PATH for the post-install report.
 	LookPath func(string) (string, error)
+	// CgoEnv builds the Gusset engine in the checkout rooted at its argument
+	// and returns the environment that links the host against it. Unix only;
+	// nil means rust/gusset-engine/cgo-env.sh.
+	CgoEnv func(src string) ([]string, error)
 }
 
 func (o Options) runner() Runner {
@@ -131,6 +135,13 @@ func (o Options) prober() Prober {
 		return o.Prober
 	}
 	return ExecProber{}
+}
+
+func (o Options) cgoEnv() func(string) ([]string, error) {
+	if o.CgoEnv != nil {
+		return o.CgoEnv
+	}
+	return engineCgoEnv
 }
 
 func (o Options) lookPath() func(string) (string, error) {
@@ -190,6 +201,10 @@ func PlannedCommands(cs []Component, o Options) []string {
 	if IncludesHost(cs) {
 		if src != "" {
 			out := filepath.Join(prefix, "bin", hostBinaryName())
+			if runtime.GOOS != "windows" {
+				cmds = append(cmds, fmt.Sprintf("bash %s  # build the Gusset engine; its CGO_* lines go to the next command",
+					shellQuote(filepath.Join(src, "rust", "gusset-engine", "cgo-env.sh"))))
+			}
 			cmds = append(cmds, fmt.Sprintf("go -C %s build -o %s ./cmd/devcouncil",
 				shellQuote(filepath.Join(src, "backend", "go_orchestrator")), shellQuote(out)))
 			cmds = append(cmds, fmt.Sprintf("ln -sf %s %s", hostBinaryName(), shellQuote(filepath.Join(prefix, "bin", "dev"))))
@@ -297,13 +312,12 @@ func Install(cs []Component, o Options) error {
 		return err
 	}
 	src := o.source()
-	run := o.runner()
 	st := LoadState(prefix)
 
 	var firstErr error
 	var names []string
 	if IncludesHost(cs) {
-		if err := installHost(src, prefix, run); err != nil {
+		if err := installHost(src, prefix, o); err != nil {
 			return err
 		}
 		st.Record("host", filepath.Join(bindir, hostBinaryName()))
@@ -339,12 +353,25 @@ func Install(cs []Component, o Options) error {
 	return firstErr
 }
 
-func installHost(src, prefix string, run Runner) error {
+func installHost(src, prefix string, o Options) error {
+	run := o.runner()
 	bindir := filepath.Join(prefix, "bin")
 	out := filepath.Join(bindir, hostBinaryName())
 	if src != "" {
 		mod := filepath.Join(src, "backend", "go_orchestrator")
-		if err := run.Run("go", []string{"build", "-o", out, "./cmd/devcouncil"}, mod, nil); err != nil {
+		// On Unix the host links the Gusset engine. A plain go build fails at
+		// link on a fresh clone, and after an engine rebuild relinks the old
+		// archive from Go's cache; cgo-env.sh builds the engine and keys the
+		// cgo flags on the archive's hash. Its own message says what is
+		// missing when the Gusset checkout is not beside DevCouncil.
+		var env []string
+		if runtime.GOOS != "windows" {
+			var err error
+			if env, err = o.cgoEnv()(src); err != nil {
+				return fmt.Errorf("build host: %w", err)
+			}
+		}
+		if err := run.Run("go", []string{"build", "-o", out, "./cmd/devcouncil"}, mod, env); err != nil {
 			return fmt.Errorf("build host: %w", err)
 		}
 		signForMacOS(out, run)
