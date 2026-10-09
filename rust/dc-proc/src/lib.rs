@@ -217,8 +217,12 @@ where
         let config = repository_config(&resolved, root)?;
         if config.partial_clone {
             let version = git_version(&resolved)?;
-            if !version.as_ref().is_some_and(GitVersion::honors_no_lazy_fetch) {
-                let version = version.map_or_else(|| "of unrecognised version".to_string(), |v| v.to_string());
+            if !version
+                .as_ref()
+                .is_some_and(GitVersion::honors_no_lazy_fetch)
+            {
+                let version = version
+                    .map_or_else(|| "of unrecognised version".to_string(), |v| v.to_string());
                 return Err(Failure::Refused {
                     program: resolved.display().to_string(),
                     reason: format!(
@@ -660,8 +664,11 @@ pub fn filter_overrides(listing: &[u8]) -> Result<Vec<String>, String> {
 ///   directory this process happens to run in, which is usually the
 ///   repository. Go's `os/exec` refuses the same thing (`exec.ErrDot`); Rust's
 ///   standard library does not, so it is refused here.
-/// * a candidate whose canonical location is inside `root` is refused: the
-///   repository's own files are input to analysis, not programs to trust.
+/// * a candidate whose canonical location is inside the repository `root` is
+///   in is refused: the repository's own files are input to analysis, not
+///   programs to trust. The boundary is the repository's top, not `root`
+///   itself ([`repository_top`]): run against `repo/backend`, a program at
+///   `repo/tools/bin` is as much repository content.
 ///   Containment is decided by identity — device and inode of each directory
 ///   above the candidate against `root`'s — not by comparing names, because a
 ///   filesystem that folds case or Unicode normalization (APFS, NTFS) gives
@@ -689,6 +696,13 @@ pub fn resolve_outside(
         return std::path::absolute(named)
             .map_err(|error| refuse(error.kind(), format!("{name}: {error}")));
     }
+    let boundary = repository_top(root).map_err(|error| {
+        refuse(
+            error.kind(),
+            format!("finding the repository around {}: {error}", root.display()),
+        )
+    })?;
+    let root = boundary.as_path();
     let entries = path_var.map(std::env::split_paths).into_iter().flatten();
     for entry in entries {
         for candidate in executable_names(&entry, program) {
@@ -729,6 +743,47 @@ pub fn resolve_outside(
         std::io::ErrorKind::NotFound,
         format!("{name} is not on PATH"),
     ))
+}
+
+/// The top of the repository `root` is in, found from the filesystem alone —
+/// no git runs to answer it, because the git that would answer is one of the
+/// programs being resolved. The Go host's `proc.repositoryTop` is the same
+/// rule.
+///
+/// The walk goes up from `root` and stops at the nearest directory holding a
+/// `.git` (a directory, or the file a worktree or submodule has); that is the
+/// top. With no `.git` above, the nearest directory holding a `.devcouncil`
+/// directory is the top, and with neither, `root` itself. The walk stops at
+/// the nearest `.git` on purpose: a home directory that is itself a
+/// repository must not make every repository beneath it swallow
+/// `~/.local/bin`. A marker that cannot be examined is an error, never
+/// "absent", which would shrink the boundary. A `root` that does not exist is
+/// returned as given: it contains nothing.
+pub fn repository_top(root: &Path) -> std::io::Result<PathBuf> {
+    let start = match std::fs::canonicalize(root) {
+        Ok(start) => start,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(root.to_path_buf()),
+        Err(error) => return Err(error),
+    };
+    let mut devcouncil = None;
+    let mut current = Some(start.as_path());
+    while let Some(dir) = current {
+        match std::fs::symlink_metadata(dir.join(".git")) {
+            Ok(_) => return Ok(dir.to_path_buf()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if devcouncil.is_none() {
+            match std::fs::metadata(dir.join(".devcouncil")) {
+                Ok(meta) if meta.is_dir() => devcouncil = Some(dir.to_path_buf()),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        current = dir.parent();
+    }
+    Ok(devcouncil.unwrap_or(start))
 }
 
 /// The file names `program` may have in `dir`: itself, and on Windows each
@@ -1607,6 +1662,53 @@ mod tests {
         let (kind, message) = refusal(resolve_outside(OsStr::new("git"), Some(&path), &root));
         assert_eq!(kind, ErrorKind::PermissionDenied);
         assert!(message.contains("inside the repository"), "{message}");
+    }
+
+    /// The boundary is the repository's top, not the root a read was handed:
+    /// run against `repo/backend`, a git planted at `repo/tools/bin` is still
+    /// the repository's. The top is the nearest `.git` (directory or file),
+    /// else the nearest `.devcouncil` directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_git_elsewhere_in_the_repository_is_refused_from_a_subdirectory() {
+        for marker in [".git/", ".git", ".devcouncil/"] {
+            let base = Scratch::new("subdir");
+            let repo = base.0.join("repo");
+            let sub = repo.join("backend");
+            std::fs::create_dir_all(&sub).unwrap();
+            match marker.strip_suffix('/') {
+                Some(dir) => std::fs::create_dir_all(repo.join(dir)).unwrap(),
+                None => std::fs::write(repo.join(marker), "gitdir: elsewhere\n").unwrap(),
+            }
+            plant(&repo.join("tools/bin"), "git", 0o755);
+            let path =
+                std::env::join_paths([repo.join("tools/bin"), PathBuf::from("/usr/bin")]).unwrap();
+
+            let (kind, message) = refusal(resolve_outside(OsStr::new("git"), Some(&path), &sub));
+            assert_eq!(kind, ErrorKind::PermissionDenied, "{marker}: {message}");
+            assert!(
+                message.contains("inside the repository"),
+                "{marker}: {message}"
+            );
+            assert_eq!(repository_top(&sub).unwrap(), repo, "{marker}");
+        }
+    }
+
+    /// With no marker above it, a root is its own boundary, and a program
+    /// beside it — outside it — still resolves.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_with_no_repository_above_it_is_its_own_boundary() {
+        let base = Scratch::new("no-marker");
+        let root = base.0.join("plain");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = plant(&base.0.join("bin"), "git", 0o755);
+        let path = std::env::join_paths([base.0.join("bin")]).unwrap();
+        assert_eq!(repository_top(&root).unwrap(), root);
+        assert_eq!(
+            resolve_outside(OsStr::new("git"), Some(&path), &root).unwrap(),
+            outside
+        );
     }
 
     #[cfg(unix)]
