@@ -18,8 +18,15 @@ allows an operator to choose a local build. PATH discovery rejects candidates
 whose canonical location is inside the repository, including aliases and
 relative PATH entries.
 
-That rejection has one owner, `proc.LookPathOutside`, shared by the navigation
-adapter and by `devcouncil integrate`. Integration separates the two questions
+That rejection has one owner, `proc.LookPathOutside`. The host's component
+clients — `dcstore`, `devmap` (the `dev map` passthrough, `integrate` and skill
+scaffolding), `dcverify` and `dcgrep` — find their program through one
+resolver over it, `proc.ResolveComponent`: an explicit override is used or
+refused, never replaced; otherwise PATH, then `~/.local/bin` only when PATH has
+no candidate at all. A refused PATH candidate is not passed over for the
+fallback, and the fallback is held to the same canonical outside-root check.
+The resolved path is what runs; a client is never left holding a bare name for
+exec to search PATH again. Integration separates the two questions
 it used to conflate: the name written into a host config is resolved later by
 the host, while the program this process spawns must come from outside the
 repository. When no such program is found, DevMap asset composition is skipped

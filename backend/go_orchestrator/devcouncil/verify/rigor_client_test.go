@@ -110,9 +110,26 @@ func TestTheEnvironmentOverrideWins(t *testing.T) {
 // the common state, since dcverify is an optional component.
 func TestNoVerifierAnywhereIsNilRatherThanAGuess(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
+	// ~/.local/bin is a rung of component discovery, so an absent
+	// component is absent there too.
+	t.Setenv("HOME", t.TempDir())
 	t.Setenv(dcverify.BinaryEnv, "")
 
 	if client := verify.RigorClient(t.TempDir()); client != nil {
 		t.Fatalf("RigorClient invented a verifier: %+v", client)
+	}
+}
+
+// TestAMissingOverrideIsStillTheVerifierThatRuns. A named verifier that does
+// not exist is a configured verifier that is broken: running it fails as a
+// blocking gap. Returning nil would turn the operator's misconfiguration into
+// a skip that reads like dcverify was never installed.
+func TestAMissingOverrideIsStillTheVerifierThatRuns(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "no-such-dcverify")
+	t.Setenv(dcverify.BinaryEnv, missing)
+
+	client := verify.RigorClient(t.TempDir())
+	if client == nil || client.Binary != missing {
+		t.Fatalf("a broken override was not kept as the verifier: %+v", client)
 	}
 }

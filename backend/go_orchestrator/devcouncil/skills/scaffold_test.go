@@ -130,6 +130,9 @@ func TestScaffoldCheckNamesWhatIsMissing(t *testing.T) {
 func TestScaffoldWithoutDevmapRefuses(t *testing.T) {
 	t.Setenv("DEVMAP_BIN", "")
 	t.Setenv("PATH", t.TempDir())
+	// ~/.local/bin is a rung of component discovery, so an absent
+	// component is absent there too.
+	t.Setenv("HOME", t.TempDir())
 	root := t.TempDir()
 	if _, err := skills.Scaffold(skills.Options{Root: root, Skills: []skills.Skill{coreEngineering(t)}}); err == nil {
 		t.Fatal("installed without an installer")

@@ -38,6 +38,9 @@ func TestDispatchGrepIsNotAnUnknownCommand(t *testing.T) {
 func TestDispatchGrepMissingBinaryIsAnErrorNotAnEmptyResult(t *testing.T) {
 	t.Setenv(dcgrep.BinaryEnv, "")
 	t.Setenv("PATH", t.TempDir())
+	// ~/.local/bin is a rung of component discovery, so an absent
+	// component is absent there too.
+	t.Setenv("HOME", t.TempDir())
 	stdout, restoreOut := swapStdout(t)
 	stderr, restoreErr := swapStderr(t)
 	code := dispatch([]string{"grep", "--json", "needle", "--project-root", t.TempDir()})
@@ -51,6 +54,27 @@ func TestDispatchGrepMissingBinaryIsAnErrorNotAnEmptyResult(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "dcgrep") {
 		t.Fatalf("stderr does not name the missing binary: %s", stderr.String())
+	}
+}
+
+// A dcgrep the repository carries does not decide what the repository
+// contains, and the refusal is not reported as a missing install.
+func TestDispatchGrepRefusesRepositoryLocalBinary(t *testing.T) {
+	root := t.TempDir()
+	plantExecutable(t, filepath.Join(root, "bin"), "dcgrep")
+	t.Setenv(dcgrep.BinaryEnv, "")
+	t.Setenv("PATH", filepath.Join(root, "bin"))
+	t.Setenv("HOME", t.TempDir())
+	stdout, restoreOut := swapStdout(t)
+	stderr, restoreErr := swapStderr(t)
+	code := dispatch([]string{"grep", "--json", "needle", "--project-root", root})
+	restoreErr()
+	restoreOut()
+	if code != 1 {
+		t.Fatalf("exit %d, want 1 stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "inside the repository") {
+		t.Fatalf("stderr does not name the refusal: %s", stderr.String())
 	}
 }
 
