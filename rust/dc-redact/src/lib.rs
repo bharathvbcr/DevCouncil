@@ -1068,14 +1068,16 @@ fn redact(token: &str, keep: usize) -> String {
 mod redaction_tests {
     use super::*;
 
+    /// A GitHub classic token shape, split so that no source line is one (see
+    /// `no_line_of_this_file_is_itself_a_vendor_token`).
+    const GITHUB_TOKEN: &str = concat!("ghp_", "0123456789abcdefghijklmnopqrstuvwxyzA");
+
     #[test]
     fn redacts_a_credential_in_an_argv_line() {
-        let argv = r#"["git","push","https://x-access-token:ghp_0123456789abcdefghijklmnopqrstuvwxyzA@github.com/o/r"]"#;
-        let out = redact_secrets(argv);
-        assert!(
-            !out.contains("ghp_0123456789abcdefghijklmnopqrstuvwxyzA"),
-            "{out}"
-        );
+        let argv =
+            format!(r#"["git","push","https://x-access-token:{GITHUB_TOKEN}@github.com/o/r"]"#);
+        let out = redact_secrets(&argv);
+        assert!(!out.contains(GITHUB_TOKEN), "{out}");
         assert!(
             out.contains("ghp_"),
             "the shape is still identifiable: {out}"
@@ -1097,7 +1099,7 @@ mod redaction_tests {
 
     #[test]
     fn redacts_every_occurrence_not_just_the_first() {
-        let key = "ghp_0123456789abcdefghijklmnopqrstuvwxyzA";
+        let key = GITHUB_TOKEN;
         let text = format!("{key} and again {key}");
         let out = redact_secrets(&text);
         assert!(!out.contains(key), "a repeated key survived: {out}");
@@ -1105,7 +1107,7 @@ mod redaction_tests {
 
     #[test]
     fn contains_secret_agrees_with_redaction() {
-        let key = "ghp_0123456789abcdefghijklmnopqrstuvwxyzA";
+        let key = GITHUB_TOKEN;
         assert!(contains_secret(key));
         assert!(!contains_secret("cargo build --release"));
         assert_ne!(redact_secrets(key), key);
@@ -1238,9 +1240,12 @@ mod redaction_tests {
             assert_eq!(find_secret(line), None, "{line}");
         }
         for line in [
-            r#"aws_access_key_id = "AKIAIOSFODNN7EXAMPLE""#,
+            concat!(r#"aws_access_key_id = "AKIA"#, r#"IOSFODNN7EXAMPLE""#),
             r#"aws_secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY""#,
-            r#"WEBHOOK = "https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX""#,
+            concat!(
+                r#"WEBHOOK = "https://hooks.slack.com/services/"#,
+                r#"T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX""#
+            ),
             "postgres://app:hunter2@prod-db.internal:5432/app",
             "amqp://app:z9@mq:5672/",
         ] {
@@ -1285,7 +1290,7 @@ mod redaction_tests {
             "Authorization: Basic dXNlcjpwYXNzd29yZA==",
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w",
             "api_key: ${API_KEY:?missing}",
-            "-----BEGIN RSA PRIVATE KEY-----",
+            concat!("-----BEGIN RSA PRIVATE", " KEY-----"),
             "mysql -u root -p\"S3cretRootPw\" db | sshpass -p Tr0ub4dor3x ssh h",
         ];
         for line in lines {
@@ -1414,9 +1419,42 @@ mod redaction_tests {
 
     #[test]
     fn redaction_output_carries_no_secret_of_its_own() {
-        let key = "ghp_0123456789abcdefghijklmnopqrstuvwxyzA";
+        let key = GITHUB_TOKEN;
         let once = redact_secrets(key);
         assert_eq!(redact_secrets(&once), once);
         assert!(!contains_secret(&once));
+    }
+
+    /// This file is pushed to GitHub, whose push protection refuses a commit
+    /// that carries a vendor-issued token shape, a vendor's documented
+    /// placeholder included: it blocked Slack's `T00000000/B00000000/XXXX…`
+    /// example in the test above, and every repository that vendors this
+    /// crate inherits the block. So a vendor-prefixed fixture is written split
+    /// with `concat!`, and no single source line matches [`SECRET_PATTERNS`]:
+    /// the value under test is still a token, the text of the file is not.
+    ///
+    /// The context patterns (a password assigned to a named key, a URL's
+    /// inline password) are not held to this; push protection matches vendor
+    /// formats, and those fixtures read best whole.
+    ///
+    /// Only line numbers are reported, never the line, so a failure cannot
+    /// itself print a token.
+    #[test]
+    fn no_line_of_this_file_is_itself_a_vendor_token() {
+        let offenders: Vec<usize> = include_str!("lib.rs")
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                SECRET_PATTERNS
+                    .iter()
+                    .any(|p| p.spans(line).next().is_some())
+            })
+            .map(|(i, _)| i + 1)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "rust/dc-redact/src/lib.rs lines {offenders:?} carry a vendor token as written; \
+             split each fixture with concat! so the source line does not"
+        );
     }
 }
