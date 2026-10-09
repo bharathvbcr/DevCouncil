@@ -124,7 +124,14 @@ pub fn blame_file_with_program(
     rev: &str,
     path: &str,
 ) -> Result<FileBlame, BlameRefusal> {
-    let mut command = git_with_program(program, repo);
+    let mut command = match git_with_program(program, repo) {
+        Ok(command) => command,
+        Err(failure) => {
+            return Err(BlameRefusal::GitUnavailable {
+                reason: failure.to_string(),
+            })
+        }
+    };
     command.args([
         "blame",
         "--line-porcelain",

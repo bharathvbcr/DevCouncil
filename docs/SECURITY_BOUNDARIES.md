@@ -28,7 +28,19 @@ fallback, and the fallback is held to the same canonical outside-root check.
 The resolved path is what runs; a client is never left holding a bare name for
 exec to search PATH again. The host's git runners (`get_diff`, repository
 probing and verification's diff) resolve `git` through `proc.LookPathOutside`
-too. Integration separates the two questions
+too.
+
+Containment is decided by identity, not spelling: directories are compared by
+file identity, because a filesystem that folds case or Unicode normalization
+(APFS, NTFS) gives one directory many names. Every link on the way to a
+program is checked, not only where the chain ends: a link the repository
+carries, such as `bin/git -> /usr/bin/true`, chooses the program even though
+the bytes live outside, and a `true` standing in for git reads as "nothing
+changed". A root that does not exist contains nothing, so the command run
+against it reports the missing root itself. The Rust kernels apply the same
+rule to every `git` they run, in `dc_proc::resolve_outside`, which also refuses
+a relative or empty PATH entry (Go's `os/exec` already does; Rust's standard
+library does not). Integration separates the two questions
 it used to conflate: the name written into a host config is resolved later by
 the host, while the program this process spawns must come from outside the
 repository. When no such program is found, DevMap asset composition is skipped

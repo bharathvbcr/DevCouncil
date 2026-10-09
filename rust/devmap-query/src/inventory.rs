@@ -770,7 +770,10 @@ pub fn churn(root: &Path) -> FileChurn {
 /// [`churn`] with the program named, so a test can stand a script in for it.
 #[doc(hidden)]
 pub fn churn_with_program(program: &OsStr, root: &Path) -> FileChurn {
-    let mut command = devmap_extract::subprocess::git_with_program(program, root);
+    let mut command = match devmap_extract::subprocess::git_with_program(program, root) {
+        Ok(command) => command,
+        Err(failure) => return FileChurn::unavailable(format!("could not run git log: {failure}")),
+    };
     command.args([
         "log",
         &format!("--since={CHURN_SINCE}"),
