@@ -290,3 +290,20 @@ fn the_two_header_tables_agree_extension_by_extension() {
         );
     }
 }
+
+/// C has no labelled fixture, so it has not earned the confident tier: its
+/// would-be 0.9 row is published at 0.4 with the token naming the language.
+/// The rest of this file asks whether a row *reached* the confident branch;
+/// this is the one place that pins what an unlisted language publishes.
+#[test]
+fn an_unlisted_language_publishes_its_confident_rows_below_the_act_on_tier() {
+    assert!(!confident_tier_eligible("c"), "C has no fixture proving it");
+    let reports = reports(&[("unit.c", "static int unusedC(void) { return 1; }\n")]);
+    let row = report_for(&reports, "unusedC").expect("the uncalled static is reported");
+    assert!(earned_confident_tier(row), "{row:?}");
+    assert_eq!(row.confidence, UNPROVEN_TIER_CONFIDENCE, "{row:?}");
+    assert_eq!(
+        row.exemption_reason.as_deref(),
+        Some(confident_tier_unproven_reason("c").as_str())
+    );
+}

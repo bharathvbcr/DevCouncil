@@ -17,4 +17,25 @@ declared.
 The per-edge gates (precision, honest-miss, recall ratchet) and the corpus
 `record.json` belong to the accuracy-harness card (S1) and are not here yet;
 when `record.json` exists, the eligibility test also binds each listed language
-to its corpus 0.9-tier false-positive rate.
+to its corpus 0.9-tier false-positive rate. The shape it reads — anything else
+in the file is ignored, and a listed corpus/language missing these fields
+fails the test rather than passing it:
+
+```json
+{
+  "corpora": [
+    {
+      "name": "scholarlm",
+      "languages": {
+        "go": { "dead_fp_by_tier": { "0.9": { "false_positive": 0, "rows": 21 } } }
+      }
+    }
+  ]
+}
+```
+
+A listed language must have `false_positive * 20 <= rows` (at most 5%) on
+every corpus that measured it.
+
+Until then, **listing rests on these fixtures alone**, and some languages rest
+on very few confident rows (see `CONFIDENT_TIER_ELIGIBLE`'s documentation).

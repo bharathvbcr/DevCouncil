@@ -2211,8 +2211,16 @@ fn symbol_exemption_index(
                 // which exists for unexported names only. The standard-library
                 // interfaces are listed by name and arity because `fmt` calls
                 // `String()` and the corpus never does.
+                // Only where the package is module-private: in any other
+                // package an exported method is spared for being exported, and
+                // filing it under an interface would shrink the `excluded`
+                // count of symbols never examined for their visibility.
                 .or_else(|| {
-                    if ext.language != "go" || sym.kind != SymbolKind::Method || !sym.is_exported {
+                    if ext.language != "go"
+                        || sym.kind != SymbolKind::Method
+                        || !sym.is_exported
+                        || go_module_private_proof(ext).is_none()
+                    {
                         return None;
                     }
                     let params = *go_param_counts.get(sym.qualified_name.as_str())?;

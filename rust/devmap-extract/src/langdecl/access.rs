@@ -18,7 +18,7 @@
 use tree_sitter::Node;
 
 use crate::langdecl::Declaration;
-use crate::model::WiringKind;
+use crate::model::{SymbolKind, WiringKind};
 use crate::treesitter::{bounded_parent, get_node_text};
 
 /// Why a `protected` member is exempt.
@@ -150,7 +150,11 @@ pub(crate) fn exemption(
     if lang == "csharp" && declaration.name == "Main" && has(&words, "static") {
         return Some((WiringKind::RuntimeEntryPoint, "C# program entry point"));
     }
-    if lang == "csharp" && has(&words, "partial") && !has(&words, "public") {
+    if lang == "csharp"
+        && declaration.declared_kind == SymbolKind::Function
+        && has(&words, "partial")
+        && !has(&words, "public")
+    {
         return Some((
             WiringKind::StructuralExempt,
             "C# partial method — its other half, often generated, may be the caller",
