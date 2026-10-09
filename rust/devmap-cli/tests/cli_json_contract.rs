@@ -469,6 +469,23 @@ fn doctor_json_names_schemas_grammar_count_and_store_path() {
         grammar_count >= 30,
         "this binary links dozens of grammars: {payload}"
     );
+    // The git the kernels run, and its version, which decides whether a
+    // partial clone can be read (ft-ff2153d9, D9).
+    let installed = std::process::Command::new("git")
+        .arg("version")
+        .output()
+        .expect("git version");
+    let installed = dc_proc_version(&String::from_utf8_lossy(&installed.stdout));
+    assert_eq!(
+        payload["git"]["version"],
+        serde_json::json!(installed),
+        "{payload}"
+    );
+    assert!(payload["git"]["path"].is_string(), "{payload}");
+    assert!(
+        payload["git"]["honors_no_lazy_fetch"].is_boolean(),
+        "{payload}"
+    );
     let store_path = payload["store_path"]
         .as_str()
         .unwrap_or_else(|| panic!("store_path must be a string: {payload}"));
@@ -545,4 +562,26 @@ fn status_exposes_a_versioned_reader_contract_and_distinguishes_schema_direction
     assert_eq!(ready["schema_relation"], "current", "{ready}");
     assert_eq!(ready["reader_ready"], true, "{ready}");
     assert_eq!(ready["query_ready"], true, "{ready}");
+}
+
+/// `git version 2.54.0 (Apple Git-157)` -> `2.54.0`, the form doctor reports.
+fn dc_proc_version(line: &str) -> String {
+    let number = line
+        .trim()
+        .strip_prefix("git version ")
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_default();
+    let mut parts: Vec<&str> = number.split('.').take(3).collect();
+    while parts.len() < 3 {
+        parts.push("0");
+    }
+    parts
+        .iter()
+        .map(|p| {
+            p.parse::<u32>()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|_| "0".into())
+        })
+        .collect::<Vec<_>>()
+        .join(".")
 }
