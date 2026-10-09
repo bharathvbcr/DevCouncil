@@ -36,6 +36,13 @@ for arg do
   fi
 done
 
+# DRY_RUN=1 is how the scripts this replaced were asked to touch nothing.
+# Dropping it would turn a rehearsal into a real install.
+case "${DRY_RUN:-}" in
+  ''|0) ;;
+  *) set -- "$@" --dry-run ;;
+esac
+
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 trap 'exit 130' INT

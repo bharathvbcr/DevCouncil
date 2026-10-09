@@ -161,3 +161,19 @@ func TestBootstrapLeavesNoTemporaryHostBehind(t *testing.T) {
 		t.Fatalf("bootstrap left %v in TMPDIR", entries)
 	}
 }
+
+// DRY_RUN=1 was how the old scripts were asked to touch nothing. A bootstrap
+// that dropped it would turn a rehearsal into a real install, so it becomes
+// --dry-run; an empty or "0" value asks for nothing.
+func TestBootstrapHonoursTheOldDryRunVariable(t *testing.T) {
+	r := runBootstrap(t, []string{"DRY_RUN=1"}, "devmap")
+	if r.code != 0 || !strings.HasSuffix(r.out, "\ninstall\ndevmap\n--dry-run\n") {
+		t.Fatalf("exit %d, host saw:\n%s", r.code, r.out)
+	}
+	for _, off := range []string{"DRY_RUN=", "DRY_RUN=0"} {
+		r := runBootstrap(t, []string{off}, "devmap")
+		if r.code != 0 || strings.Contains(r.out, "--dry-run") {
+			t.Fatalf("%s: exit %d, host saw:\n%s", off, r.code, r.out)
+		}
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -244,7 +245,7 @@ func TestMissingArchivesDoesNotTreatACappedSampleAsComplete(t *testing.T) {
 
 func TestMissingArchivesRequiresTheWindowsMsvcZipByName(t *testing.T) {
 	// So a missing grammar build cannot ship.
-	if !contains(RequiredArchives, "devmap-cli-x86_64-pc-windows-msvc.zip") {
+	if !slices.Contains(RequiredArchives, "devmap-cli-x86_64-pc-windows-msvc.zip") {
 		t.Fatal("Windows zip is not required")
 	}
 }
@@ -587,4 +588,26 @@ func TestThisRepositoryOnlyDistablesTheCLIPackage(t *testing.T) {
 func TestThisRepositoryIsConsistent(t *testing.T) {
 	result := Inspect(DefaultSources(repoRoot(t)), Options{})
 	mustEqual(t, result.Errors, []string(nil))
+}
+
+func TestLiteralStringMembersAndTargetsAreNotSkipped(t *testing.T) {
+	// TOML literal strings are as valid as basic ones. A member the parser
+	// skipped would escape both the inheritance and the dist checks.
+	source := "[workspace]\nmembers = ['dc-store', \"dc-verify\", 'tools/soak']\n\n[workspace.package]\nversion = \"0.2.0\"\n"
+	mustEqual(t, ParseWorkspaceMembers(source), []string{"dc-store", "dc-verify", "tools/soak"})
+	mustEqual(t, ParseDistWorkspaceTargets("[dist]\ntargets = ['x86_64-unknown-linux-gnu', \"aarch64-apple-darwin\"]\n"),
+		[]string{"x86_64-unknown-linux-gnu", "aarch64-apple-darwin"})
+	// A quote of one kind inside a string of the other is part of the value.
+	mustEqual(t, ParseWorkspaceMembers("[workspace]\nmembers = [\"it's\", 'say \"hi\"']\n"), []string{"it's", `say "hi"`})
+}
+
+func TestAMemberTheParserCannotReadFailsClosed(t *testing.T) {
+	// Anything in the array that is not a string — a bare word, a table — is
+	// a member the gate cannot see, which must not read as "all members fine".
+	root := scratchTree(t, defaultTree())
+	write(t, filepath.Join(root, "rust", "Cargo.toml"),
+		"[workspace]\nmembers = [\"devmap-cli\", devmap-store]\n\n[workspace.package]\nversion = \"0.2.0\"\n")
+	if errs := Inspect(DefaultSources(root), Options{}).Errors; !anyContains(errs, "members", "devmap-store") {
+		t.Fatalf("errors: %v", errs)
+	}
 }

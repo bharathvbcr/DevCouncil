@@ -112,10 +112,6 @@ impl Daemon {
         self.wrapper.id()
     }
 
-    pub fn serve_pid(&self) -> Option<u32> {
-        self.serve_pid
-    }
-
     /// Look once for the daemon: the wrapper's only child. Identity comes from
     /// the child of this soak's own wrapper; matching the newest `devmap` can
     /// instead sample an unrelated daemon.

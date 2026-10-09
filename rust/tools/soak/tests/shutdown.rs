@@ -228,10 +228,15 @@ fn exit_cleanup_escalates_and_is_idempotent() {
     corpus.append_cycle(1).expect("edit");
     let endpoint = f.dir.join("socket");
     fs::write(&endpoint, "").expect("endpoint");
+    // The timer's report sits inside the corpus; an interrupted run used to
+    // leave it there.
+    let timer_log = f.dir.join(".soak_time.1");
+    fs::write(&timer_log, "real 0.01\n").expect("timer log");
     let mut cleanup = Cleanup {
         corpus: Some(corpus.clone()),
         daemon: f.daemon.take(),
         endpoint: Some(endpoint.clone()),
+        timer_log: Some(timer_log.clone()),
     };
     let mut out = Vec::new();
     let first = cleanup.run(&mut out);
@@ -239,7 +244,7 @@ fn exit_cleanup_escalates_and_is_idempotent() {
     assert!(!first, "an escalated shutdown is not a clean exit");
     assert_eq!(first, second, "a second cleanup changed the verdict");
     assert!(
-        !endpoint.exists() && !corpus.orig.exists(),
+        !endpoint.exists() && !corpus.orig.exists() && !timer_log.exists(),
         "cleanup left its files"
     );
     assert_eq!(

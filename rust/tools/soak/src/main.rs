@@ -326,6 +326,7 @@ mod soak {
             }
         };
         let timeout_log = cfg.root.join(format!(".soak_time.{}", std::process::id()));
+        lock(cleanup).timer_log = Some(timeout_log.clone());
         let mut fails = if cfg.daemon {
             match drive_daemon(
                 cfg,

@@ -254,28 +254,16 @@ func healthCheck(id, bin string, p Prober) error {
 // and on the platforms where it does not, it rewrites the file underneath
 // that process. A rename within one filesystem swaps the directory entry, so
 // anything already running keeps the inode it started with and the next
-// exec gets the new binary whole.
+// exec gets the new binary whole. writeAtomicFile is the package's one
+// owner of that discipline: a temporary name of its own (two installers
+// racing on one destination each rename a whole binary rather than one
+// stealing the other's half-written copy), synced before the rename.
 func installAtomic(src, dest string) error {
 	data, err := os.ReadFile(src)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-		return err
-	}
-	tmp := dest + ".new"
-	if err := os.WriteFile(tmp, data, 0o755); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmp, 0o755); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, dest); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return writeAtomicFile(dest, data, 0o755)
 }
 
 // resolutionNotes says, for each installed binary, whether PATH finds the
@@ -290,11 +278,24 @@ func resolutionNotes(bindir string, names []string, lookPath func(string) (strin
 		switch {
 		case err != nil:
 			notes = append(notes, fmt.Sprintf("note: %s is not on PATH — add %s to PATH", name, bindir))
-		case filepath.Clean(found) != filepath.Clean(want):
+		case !samePath(found, want):
 			notes = append(notes, fmt.Sprintf("warning: %s resolves to %s, not %s — an earlier PATH entry shadows this install", name, found, want))
 		}
 	}
 	return notes
+}
+
+// samePath reports whether two paths name one file. A prefix reached through
+// a symlink (macOS's /tmp is /private/tmp) is the directory PATH names by its
+// real path, and reporting that as shadowing sends the operator after a
+// problem that does not exist. Paths that cannot be examined compare as text.
+func samePath(a, b string) bool {
+	if filepath.Clean(a) == filepath.Clean(b) {
+		return true
+	}
+	ai, aerr := os.Stat(a)
+	bi, berr := os.Stat(b)
+	return aerr == nil && berr == nil && os.SameFile(ai, bi)
 }
 
 // signForMacOS ad-hoc signs a freshly built host. A missing or failing

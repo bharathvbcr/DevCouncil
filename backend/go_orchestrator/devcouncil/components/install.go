@@ -217,8 +217,8 @@ func PlannedCommands(cs []Component, o Options) []string {
 		for _, c := range cs {
 			built := filepath.Join(builtDir, rustBinaryName(c.Binary))
 			dest := filepath.Join(prefix, "bin", rustBinaryName(c.Binary))
-			cmds = append(cmds, fmt.Sprintf("health-check %s, then copy to %s and rename over %s",
-				shellQuote(built), shellQuote(dest+".new"), shellQuote(dest)))
+			cmds = append(cmds, fmt.Sprintf("health-check %s, then copy it beside %s and rename it into place",
+				shellQuote(built), shellQuote(dest)))
 		}
 		return cmds
 	}

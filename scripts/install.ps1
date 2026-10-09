@@ -41,7 +41,8 @@ if ($HostOnly) { $argv += "host" }
 $argv += $Components
 if ($All) { $argv += "--all" }
 if ($Yes) { $argv += "--yes" }
-if ($DryRun) { $argv += "--dry-run" }
+# DRY_RUN=1 is how the scripts this replaced were asked to touch nothing.
+if ($DryRun -or ($env:DRY_RUN -and $env:DRY_RUN -ne "0")) { $argv += "--dry-run" }
 if ($Prefix) { $argv += @("--prefix", $Prefix) }
 
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("devcouncil-bootstrap-" + [guid]::NewGuid())

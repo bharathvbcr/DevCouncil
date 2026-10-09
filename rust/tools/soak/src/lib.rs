@@ -37,6 +37,9 @@ pub struct Cleanup {
     #[cfg(unix)]
     pub daemon: Option<daemon::Daemon>,
     pub endpoint: Option<PathBuf>,
+    /// The `/usr/bin/time` report. It is written inside the corpus, so a run
+    /// that leaves it behind changes the tree the next run measures.
+    pub timer_log: Option<PathBuf>,
 }
 
 impl Cleanup {
@@ -58,8 +61,8 @@ impl Cleanup {
         if let Some(daemon) = &mut self.daemon {
             ok &= daemon.stop(out);
         }
-        if let Some(endpoint) = &self.endpoint {
-            let _ = std::fs::remove_file(endpoint);
+        for path in [&self.endpoint, &self.timer_log].into_iter().flatten() {
+            let _ = std::fs::remove_file(path);
         }
         if let Some(corpus) = &self.corpus {
             let _ = std::fs::remove_file(&corpus.orig);

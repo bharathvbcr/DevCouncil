@@ -26,6 +26,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -63,11 +64,10 @@ var (
 	versionFieldRe  = regexp.MustCompile(`(?m)^version\s*=\s*"([^"]*)"`)
 	sourceFieldRe   = regexp.MustCompile(`(?m)^source\s*=`)
 	goVersionRe     = regexp.MustCompile(`(?m)^const Version = "([^"]+)"`)
-	distTargetsRe   = regexp.MustCompile(`targets\s*=\s*\[((?s:.*?))\]`)
-	quotedRe        = regexp.MustCompile(`"([^"]+)"`)
+	distTargetsRe   = regexp.MustCompile(`targets\s*=\s*\[`)
 	distFlagRe      = regexp.MustCompile(`^dist\s*=\s*(true|false)\b`)
 	workspaceHdrRe  = regexp.MustCompile(`(?m)^\[workspace\]`)
-	membersRe       = regexp.MustCompile(`members\s*=\s*\[((?s:.*?))\]`)
+	membersRe       = regexp.MustCompile(`members\s*=\s*\[`)
 	inheritsRe      = regexp.MustCompile(`(?m)^[ \t]*version\.workspace[ \t]*=[ \t]*true[ \t\r]*$`)
 	notesNameRe     = regexp.MustCompile(`^v(.+)\.md$`)
 	ghCreateRe      = regexp.MustCompile(`(?m)^[ \t]*gh release create\b`)
@@ -239,21 +239,73 @@ func ParseNpmVersion(source string) (string, error) {
 	return version, nil
 }
 
-// ParseDistWorkspaceTargets lists the targets in dist-workspace.toml.
-func ParseDistWorkspaceTargets(source string) []string {
-	m := distTargetsRe.FindStringSubmatch(source)
-	if m == nil {
-		return nil
+// stringArray reads the TOML array of strings that opens at source[0] (just
+// past its `[`): basic strings ("…", with \" and \\ escapes) and literal
+// strings ('…'), separated by commas, with comments and newlines between
+// them. The array ends at the first `]` outside a string. Every element that
+// is not a string comes back in unreadable, so a caller can refuse rather than
+// silently check fewer entries than the file declares.
+func stringArray(source string) (values, unreadable []string) {
+	i := 0
+	for i < len(source) {
+		switch c := source[i]; {
+		case c == ']':
+			return values, unreadable
+		case c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == ',':
+			i++
+		case c == '#':
+			for i < len(source) && source[i] != '\n' {
+				i++
+			}
+		case c == '"' || c == '\'':
+			var b strings.Builder
+			j := i + 1
+			closed := false
+			for j < len(source) {
+				ch := source[j]
+				if ch == c {
+					closed = true
+					j++
+					break
+				}
+				if c == '"' && ch == '\\' && j+1 < len(source) {
+					b.WriteByte(source[j+1])
+					j += 2
+					continue
+				}
+				b.WriteByte(ch)
+				j++
+			}
+			if !closed {
+				return values, append(unreadable, strings.TrimSpace(source[i:]))
+			}
+			values = append(values, b.String())
+			i = j
+		default:
+			j := i
+			for j < len(source) && !strings.ContainsRune(",]\n", rune(source[j])) {
+				j++
+			}
+			unreadable = append(unreadable, strings.TrimSpace(source[i:j]))
+			i = j
+		}
 	}
-	return quotedStrings(m[1])
+	// No closing bracket: the array runs off the end of the file.
+	return values, append(unreadable, "(unterminated array)")
 }
 
-func quotedStrings(s string) []string {
-	var out []string
-	for _, q := range quotedRe.FindAllStringSubmatch(s, -1) {
-		out = append(out, q[1])
+// ParseDistWorkspaceTargets lists the targets in dist-workspace.toml.
+func ParseDistWorkspaceTargets(source string) []string {
+	targets, _ := distWorkspaceTargets(source)
+	return targets
+}
+
+func distWorkspaceTargets(source string) (targets, unreadable []string) {
+	loc := distTargetsRe.FindStringIndex(source)
+	if loc == nil {
+		return nil, nil
 	}
-	return out
+	return stringArray(source[loc[1]:])
 }
 
 // PackageIsDistable reports whether cargo-dist would package a binary crate:
@@ -279,19 +331,26 @@ func PackageIsDistable(source string) bool {
 // ParseWorkspaceMembers is the `[workspace] members` list, in declaration
 // order.
 func ParseWorkspaceMembers(source string) []string {
+	members, _ := workspaceMembers(source)
+	return members
+}
+
+// workspaceMembers is ParseWorkspaceMembers plus every array element it could
+// not read as a string.
+func workspaceMembers(source string) (members, unreadable []string) {
 	hdr := workspaceHdrRe.FindStringIndex(source)
 	if hdr == nil {
-		return nil
+		return nil, nil
 	}
 	body := source[hdr[1]:]
 	if next := nextSectionRe.FindStringIndex(body); next != nil {
 		body = body[:next[0]]
 	}
-	m := membersRe.FindStringSubmatch(body)
-	if m == nil {
-		return nil
+	loc := membersRe.FindStringIndex(body)
+	if loc == nil {
+		return nil, nil
 	}
-	return quotedStrings(m[1])
+	return stringArray(body[loc[1]:])
 }
 
 func readText(path string) (string, bool) {
@@ -776,15 +835,6 @@ func archiveFor(target string) string {
 	return DistPackage + "-" + target + ".tar.xz"
 }
 
-func contains(list []string, s string) bool {
-	for _, v := range list {
-		if v == s {
-			return true
-		}
-	}
-	return false
-}
-
 // Inspect runs the gate.
 func Inspect(src Sources, opts Options) Result {
 	var errs []string
@@ -878,7 +928,10 @@ func Inspect(src Sources, opts Options) Result {
 	}
 
 	if haveCargoToml {
-		members := ParseWorkspaceMembers(cargoToml)
+		members, unreadable := workspaceMembers(cargoToml)
+		for _, entry := range unreadable {
+			errs = append(errs, fmt.Sprintf("rust/Cargo.toml [workspace] members has an entry this gate cannot read: %s", entry))
+		}
 		if len(members) == 0 {
 			errs = append(errs, "rust/Cargo.toml declares no workspace members")
 		} else {
@@ -916,7 +969,10 @@ func Inspect(src Sources, opts Options) Result {
 	}
 
 	if distToml, ok := readText(src.DistWorkspacePath); ok && src.DistWorkspacePath != "" {
-		targets := ParseDistWorkspaceTargets(distToml)
+		targets, unreadable := distWorkspaceTargets(distToml)
+		for _, entry := range unreadable {
+			errs = append(errs, fmt.Sprintf("dist-workspace.toml targets has an entry this gate cannot read: %s", entry))
+		}
 		if len(targets) == 0 {
 			errs = append(errs, "dist-workspace.toml declares no targets")
 		} else {
@@ -924,12 +980,12 @@ func Inspect(src Sources, opts Options) Result {
 			for _, target := range targets {
 				archive := archiveFor(target)
 				declared = append(declared, archive)
-				if !contains(RequiredArchives, archive) {
+				if !slices.Contains(RequiredArchives, archive) {
 					errs = append(errs, fmt.Sprintf("dist-workspace.toml target %s (%s) is missing from REQUIRED_ARCHIVES", target, archive))
 				}
 			}
 			for _, req := range RequiredArchives {
-				if !contains(declared, req) {
+				if !slices.Contains(declared, req) {
 					errs = append(errs, fmt.Sprintf("REQUIRED_ARCHIVES entry %s is not declared in dist-workspace.toml", req))
 				}
 			}
