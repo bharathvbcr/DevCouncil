@@ -672,6 +672,7 @@ fn build_history_separates_confident_ambiguous_and_unmeasured_values() {
             confidence: 0.9,
             is_exempt: false,
             exemption_reason: None,
+            evidence: None,
         },
         DeadSymbolReport {
             symbol_name: "ambiguous".into(),
@@ -679,6 +680,7 @@ fn build_history_separates_confident_ambiguous_and_unmeasured_values() {
             confidence: 0.4,
             is_exempt: false,
             exemption_reason: Some("only_ambiguous_callers".into()),
+            evidence: None,
         },
         DeadSymbolReport {
             symbol_name: "namesake".into(),
@@ -691,6 +693,7 @@ fn build_history_separates_confident_ambiguous_and_unmeasured_values() {
                  (matched by name across the whole corpus; the ledger records no target file)"
                     .into(),
             ),
+            evidence: None,
         },
         DeadSymbolReport {
             symbol_name: "exempt".into(),
@@ -698,6 +701,7 @@ fn build_history_separates_confident_ambiguous_and_unmeasured_values() {
             confidence: 0.3,
             is_exempt: true,
             exemption_reason: Some("exported".into()),
+            evidence: None,
         },
     ];
 

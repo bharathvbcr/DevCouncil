@@ -1096,10 +1096,12 @@ impl Store {
             let ordinal = u32::try_from(ordinal).map_err(|_| {
                 refusal("dead-symbol row count exceeds SQLite generation ordinal capacity")
             })?;
+            let evidence = dead.evidence.as_ref();
             tx.execute(
                 "INSERT INTO generation_dead_symbols
-                 (generation_id, ordinal, file_path, symbol_name, confidence, is_exempt, exemption_reason)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (generation_id, ordinal, file_path, symbol_name, confidence, is_exempt,
+                  exemption_reason, evidence_sites, evidence_path, evidence_byte)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     gen_id,
                     ordinal,
@@ -1107,7 +1109,10 @@ impl Store {
                     dead.symbol_name,
                     confidence_millis(dead.confidence) as f64 / 1000.0,
                     dead.is_exempt as i32,
-                    dead.exemption_reason
+                    dead.exemption_reason,
+                    evidence.map(|evidence| evidence.sites),
+                    evidence.and_then(|evidence| evidence.first_path.as_deref()),
+                    evidence.and_then(|evidence| evidence.first_byte),
                 ],
             )?;
         }

@@ -569,7 +569,16 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// the resolver joins to a Metal entry point of that name. Served warm, a row
 /// without them leaves every macro-stamped kernel unsearchable and every
 /// `pipeline("…")` host unlinked.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "77";
+///
+/// v78 is the dead-policy card's extractor half: cgo `//export` and
+/// `//go:linkname` functions and `#[tauri::command]` functions are runtime
+/// entry points; every symbol inside a TypeScript `declare module` / `declare
+/// global` block or a `.d.ts` file is structurally exempt; a destructuring
+/// default (`{ sleep = defaultSleep }`) is a use, not a parameter binding; a
+/// Swift custom-operator use is a call and a standard-operator overload is
+/// exempt; and a Swift `Type.member` value carries its receiver. A v77 row
+/// keeps every one of those symbols looking uncalled.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "78";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

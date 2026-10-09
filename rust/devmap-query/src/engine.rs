@@ -1890,7 +1890,10 @@ impl<'a> StoreQueryEngine<'a> {
                 reason: "no persisted generation is available".to_string(),
             }));
         };
-        let mut response = budget_take(page.rows, token_budget, |_| DEAD_SYMBOL_TOKENS);
+        let mut rows = page.rows;
+        self.locate_dead_evidence(&mut rows)?;
+        let mut response = budget_take(rows, token_budget, |_| DEAD_SYMBOL_TOKENS);
+        response.excluded = Some(page.excluded);
         // `budget_take` counts the page it was handed, and the page is now a
         // bounded read — so the generation-wide count has to be restored as the
         // denominator, exactly as `explore` does for definitions. Without this
@@ -1923,6 +1926,44 @@ impl<'a> StoreQueryEngine<'a> {
             }
         }
         Ok(self.finish(response))
+    }
+
+    /// Turn each unconfirmed row's first-site byte into a line, so a reader
+    /// can jump to it.
+    ///
+    /// Against the file on disk, the way `skeleton` converts spans: the index
+    /// keeps no line table. Bounded by the page — each distinct path is read
+    /// once — and a file that cannot be read leaves `first_line` empty rather
+    /// than guessing, while `first_path` and `first_byte` still say where.
+    fn locate_dead_evidence(
+        &self,
+        rows: &mut [devmap_analyze::DeadSymbolReport],
+    ) -> anyhow::Result<()> {
+        if rows
+            .iter()
+            .all(|row| row.evidence.as_ref().and_then(|e| e.first_byte).is_none())
+        {
+            return Ok(());
+        }
+        let source_root = self.store.latest_repo_root()?;
+        let mut indexes: BTreeMap<String, Option<LineIndex>> = BTreeMap::new();
+        for evidence in rows.iter_mut().filter_map(|row| row.evidence.as_mut()) {
+            let (Some(path), Some(byte)) = (evidence.first_path.as_ref(), evidence.first_byte)
+            else {
+                continue;
+            };
+            let index = indexes.entry(path.clone()).or_insert_with(|| {
+                devmap_extract::safe_fs::read_repo_source(
+                    source_root.as_deref().map(Path::new),
+                    path,
+                    devmap_extract::MAX_SOURCE_BYTES,
+                )
+                .ok()
+                .map(|source| LineIndex::new(&source))
+            });
+            evidence.first_line = index.as_ref().map(|index| index.line_at(byte as usize));
+        }
+        Ok(())
     }
 
     /// Duplicate bodies in the latest generation.
@@ -2987,6 +3028,7 @@ impl<'a> StoreQueryEngine<'a> {
             dead_clusters: None,
             dead_clusters_truncated: 0,
             dead_clusters_incomplete: None,
+            excluded: None,
             unresolved_namesakes: None,
             scope: None,
         };

@@ -28,11 +28,15 @@ pub use graph_intel::{
     IMPORT_CYCLE_CAP,
 };
 pub use liveness::{
-    analyze_liveness, analyze_liveness_with_coverage, exempt_symbol_names, extraction_coverage,
-    extraction_gaps, language_can_reference, DiscoveryCoverage, ExtractionCoverage, ExtractionGap,
-    ExtractionGapEntry, LivenessOutcome, CALL_BLIND_REASON, COVERAGE_LOSS_CONFIDENCE_CAP,
-    COVERAGE_LOSS_REASON, GO_BUILD_VARIANT_REASON, GO_VALUE_MENTION_REASON,
-    HIGHEST_DEGRADED_CONFIDENCE, UNRESOLVED_NAMESAKE_REASON,
+    analyze_liveness, analyze_liveness_with_coverage, confident_tier_eligible,
+    confident_tier_unproven_reason, earned_confident_tier, exempt_symbol_names, exemption_token,
+    extraction_coverage, extraction_gaps, language_can_reference, DiscoveryCoverage,
+    ExtractionCoverage, ExtractionGap, ExtractionGapEntry, LivenessOutcome, CALL_BLIND_REASON,
+    CONFIDENT_TIER_ELIGIBLE, CONFIDENT_TIER_UNPROVEN, COVERAGE_LOSS_CONFIDENCE_CAP,
+    COVERAGE_LOSS_REASON, EXPORTED_NOT_EXAMINED_REASON, EXPORTED_UNREFERENCED, FILE_EXEMPT_REASON,
+    GO_BUILD_VARIANT_REASON, GO_STD_INTERFACE_REASON, GO_VALUE_MENTION_REASON,
+    HIGHEST_DEGRADED_CONFIDENCE, UNPROVEN_TIER_CONFIDENCE, UNRESOLVED_NAMESAKE_REASON,
+    VISIBILITY_TOKENS,
 };
 pub use model::*;
 pub use pdg::*;

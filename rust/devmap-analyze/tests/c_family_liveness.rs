@@ -42,7 +42,7 @@ fn assert_control_is_reported(reports: &[DeadSymbolReport], control: &str) {
         panic!("control {control} must be reported dead, or this test proves nothing: {reports:?}")
     });
     assert!(
-        !found.is_exempt && found.confidence > 0.8,
+        earned_confident_tier(found),
         "control {control} must be a confident finding: {found:?}"
     );
 }
@@ -67,7 +67,7 @@ fn an_unused_c_family_function_is_reported_and_a_used_one_is_not() {
     let unused = report_for(&reports, "unusedHelperCpp")
         .expect("an uncalled C++ function must be a dead-code candidate");
     assert!(
-        !unused.is_exempt && unused.confidence > 0.8,
+        earned_confident_tier(unused),
         "an uncalled, unexported C++ function is a confident finding: {unused:?}"
     );
 
@@ -113,7 +113,7 @@ fn every_c_family_language_can_report_dead_code() {
         let found = report_for(&reports, dead)
             .unwrap_or_else(|| panic!("{path}: {dead} must be a candidate; got {reports:?}"));
         assert!(
-            !found.is_exempt && found.confidence > 0.8,
+            earned_confident_tier(found),
             "{path}: {dead} is uncalled and unexported: {found:?}"
         );
         assert!(

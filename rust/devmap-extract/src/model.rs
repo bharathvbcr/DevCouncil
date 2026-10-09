@@ -1261,6 +1261,21 @@ pub enum WiringKind {
     /// property of the language, and putting a second path-shaped rule beside
     /// the table is how the two come to disagree about `.tf`.
     DirectoryUnit,
+    /// A manifest proving that the package or module rooted at its directory
+    /// has no consumer outside the corpus.
+    ///
+    /// Emitted on the manifest itself — a `package.json` that publishes no
+    /// entry point (no `exports`, `main`, `module`, `types`, `typings`,
+    /// `browser` or `bin`), or a Gradle build script applying
+    /// `com.android.application` — and read by liveness for every source file
+    /// whose nearest manifest of that kind is this one. An export in such a
+    /// package proves nothing about callers outside the corpus, so an uncalled
+    /// one is an `exported_unreferenced` candidate at the unconfirmed tier.
+    ///
+    /// Not a liveness exemption of any kind, for the file or its symbols: it
+    /// is a fact about who *can* call, which only ever widens what is
+    /// examined.
+    ModulePrivateScope,
 }
 
 /// Whether a file can be the subject of a liveness verdict at all, and if not,

@@ -254,6 +254,7 @@ fn dead_symbol_candidates_rank_by_confidence_before_truncating() {
             confidence: 0.4,
             is_exempt: false,
             exemption_reason: Some("only_ambiguous_callers".to_string()),
+            evidence: None,
         })
         .collect();
     dead_symbols.extend((0..5).map(|i| DeadSymbolReport {
@@ -264,6 +265,7 @@ fn dead_symbol_candidates_rank_by_confidence_before_truncating() {
         confidence: 0.9,
         is_exempt: false,
         exemption_reason: None,
+        evidence: None,
     }));
     // An exempt finding must stay out of the list and out of both histograms.
     dead_symbols.push(DeadSymbolReport {
@@ -272,6 +274,7 @@ fn dead_symbol_candidates_rank_by_confidence_before_truncating() {
         confidence: 0.3,
         is_exempt: true,
         exemption_reason: Some("Exported or exempt".to_string()),
+        evidence: None,
     });
 
     let analysis = AnalysisSummary {

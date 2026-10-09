@@ -14,5 +14,5 @@ live	corelib/src/deadprobe.rs::Hidden.via_deref_c41	C41
 live	corelib/src/deadprobe.rs::Hidden.via_question_c41	C41
 live	corelib/src/deadprobe.rs::Hidden.via_closure_c41	C41
 exempt	corelib/src/guards.rs::with_guard_c50.Guard	C50: function-local RAII guard
-exempt	corelib/src/guards.rs::with_guard_c50.Guard.drop	C50: Drop runs it
+exempt	corelib/src/guards.rs::Guard.drop	C50: Drop runs it (a trait-impl method; keyed by its type, not under the function)
 exempt	corelib/src/guards.rs::inner_extern_c51.abs	C51: inner extern declaration

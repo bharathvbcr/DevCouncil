@@ -40,7 +40,10 @@ fn emit_dead(resp: &devmap_query::Response<devmap_analyze::DeadSymbolReport>) {
         }
     }
     if !unconfirmed.is_empty() {
-        outln!("unconfirmed (ambiguous callers, namesake evidence, or coverage-capped):");
+        outln!(
+            "unconfirmed (ambiguous callers, namesake evidence, coverage-capped, an unproven \
+             confident tier, or exported but module-private):"
+        );
         for row in &unconfirmed {
             emit_dead_row(row);
         }
@@ -52,7 +55,51 @@ fn emit_dead(resp: &devmap_query::Response<devmap_analyze::DeadSymbolReport>) {
     if let Some(reason) = resp.walk_incomplete.as_ref() {
         outln!("\nwalk incomplete: {reason}");
     }
+    for line in excluded_lines(resp.excluded.as_ref()) {
+        outln!("{line}");
+    }
     emit_dead_clusters(resp);
+}
+
+/// The population the list never examined, one line per language.
+///
+/// Printed on every answer, an empty one included: "no candidates" over a
+/// corpus whose every uncalled symbol was exported is not a clean bill of
+/// health, and the reader must be able to see which of the two it is.
+fn excluded_lines(excluded: Option<&devmap_analyze::ExcludedPopulation>) -> Vec<String> {
+    let Some(excluded) = excluded else {
+        return vec!["\nnot examined: not reported for this answer".to_string()];
+    };
+    if excluded.languages.is_empty() {
+        return vec!["\nnot examined: none — every uncalled symbol was examined".to_string()];
+    }
+    let mut lines = vec![format!(
+        "\nnot examined ({} uncalled symbol(s) spared by visibility, {} by a recorded reason):",
+        excluded.not_examined, excluded.exempt
+    )];
+    for language in &excluded.languages {
+        let reasons: Vec<String> = language
+            .by_reason
+            .iter()
+            .filter(|(token, _)| !devmap_analyze::VISIBILITY_TOKENS.contains(&token.as_str()))
+            .map(|(token, count)| format!("{token} {count}"))
+            .collect();
+        let name = if language.language.is_empty() {
+            "unknown-language"
+        } else {
+            language.language.as_str()
+        };
+        let mut line = format!("  {}: {} exported", name, language.not_examined);
+        if !reasons.is_empty() {
+            line.push_str(&format!(
+                "; {} exempt ({})",
+                language.exempt,
+                reasons.join(", ")
+            ));
+        }
+        lines.push(line);
+    }
+    lines
 }
 
 fn emit_dead_row(row: &devmap_analyze::DeadSymbolReport) {
@@ -69,6 +116,32 @@ fn emit_dead_row(row: &devmap_analyze::DeadSymbolReport) {
             row.file_path,
             row.symbol_name
         ),
+    }
+    if let Some(line) = row.evidence.as_ref().map(evidence_line) {
+        outln!("{line}");
+    }
+}
+
+/// The one jump a reader makes before trusting an unconfirmed row.
+fn evidence_line(evidence: &devmap_analyze::DeadEvidence) -> String {
+    match (
+        &evidence.first_path,
+        evidence.first_line,
+        evidence.first_byte,
+    ) {
+        (Some(path), Some(line), _) => format!(
+            "        {} unbound site(s) name it; first at {path}:{line}",
+            evidence.sites
+        ),
+        (Some(path), None, Some(byte)) => format!(
+            "        {} unbound site(s) name it; first at {path} byte {byte}",
+            evidence.sites
+        ),
+        (Some(path), None, None) => format!(
+            "        {} unbound site(s) name it; first in {path}",
+            evidence.sites
+        ),
+        (None, _, _) => "        no unbound site names it".to_string(),
     }
 }
 
@@ -196,6 +269,7 @@ mod tests {
                 dead_clusters: clusters,
                 dead_clusters_truncated: 0,
                 dead_clusters_incomplete: incomplete.map(str::to_string),
+                excluded: None,
                 unresolved_namesakes: None,
                 scope: None,
             }

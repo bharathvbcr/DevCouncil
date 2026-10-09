@@ -203,6 +203,17 @@ pub struct Response<T> {
     /// them would report a complete dead-symbol list as partial.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dead_clusters_incomplete: Option<String>,
+    /// The symbols a dead-code answer never examined. Set by `dead_symbols`
+    /// alone, as `dead_clusters` is.
+    ///
+    /// `total: 0` over a Swift app whose every declaration is `internal` and a
+    /// corpus with no dead code were the same answer — DevType's 5,401 symbols
+    /// produced exactly that. Per language, this counts the uncalled symbols
+    /// spared for their visibility and those spared by a recorded reason, by
+    /// reason token, so a zero can be told apart from an exempted corpus.
+    /// `None` only on a query that is not about dead code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excluded: Option<devmap_analyze::ExcludedPopulation>,
     /// Call sites the resolver could **not** bind whose callee has the target's
     /// name — the candidates an edge walk cannot show. Set by `impact` alone.
     ///

@@ -158,6 +158,12 @@ fn seed_current_store(db_path: &Path) {
 /// traceable to a line of `schema.rs`.
 fn reduce_one_rung(conn: &Connection, from_version: i32) {
     let sql: &str = match from_version {
+        // MIGRATION_V26_TO_V27: the three dead-row evidence columns.
+        27 => {
+            "ALTER TABLE generation_dead_symbols DROP COLUMN evidence_byte;
+             ALTER TABLE generation_dead_symbols DROP COLUMN evidence_path;
+             ALTER TABLE generation_dead_symbols DROP COLUMN evidence_sites;"
+        }
         // MIGRATION_V25_TO_V26: the literal-site table and its value index.
         // Additive, so the reduction is the table; the index goes with it.
         26 => "DROP TABLE generation_literals;",

@@ -1274,8 +1274,14 @@ underneath the answer.",
         ),
         "dead" => (
             "Dead-symbol candidates with per-row confidence — not one flat delete list. \
-High confidence (above the degraded ceiling) means no inbound evidence after the call walk; \
-`only_ambiguous_callers` and unresolved-namesake rows sit at 0.4 (unconfirmed). \
+0.9 means no inbound evidence after the call walk *and* a language that has earned the confident \
+tier against its labelled fixture; any other language's would-be 0.9 row is published at 0.4 with \
+a reason starting `confident_tier_unproven`. `only_ambiguous_callers`, unresolved-namesake and \
+`exported_unreferenced` (an export the manifest proves module-private) rows sit at 0.4 \
+(unconfirmed); each 0.4 row's `evidence` counts the unbound sites naming it and gives the first \
+`first_path`/`first_line` to check. `excluded` counts, per language, the uncalled symbols never \
+examined — spared by visibility (`not_examined`) or by a recorded reason (`exempt`, `by_reason`) — \
+so a short list over a mostly-exported corpus is not read as no dead code. \
 `NoNamesake` sites are explained gaps in the unresolved ledger, not dead findings. \
 Read `walk_incomplete` before treating an empty or short list as complete; a partial \
 corpus caps findings below the confident tier. `items` comes from a one-hop inbound join, which \
@@ -1716,8 +1722,10 @@ re-ranked by personalized PageRank over call edges. Read `truncated` and `walk_i
         "dead" => {
             let mut schema = budgeted_envelope(
                 "Dead-symbol reports with per-row confidence and reason: confident vs unconfirmed \
-(`only_ambiguous_callers`, unresolved namesake, coverage-capped). Read `walk_incomplete` — \
-a partial corpus is a lower bound, not a clean bill. Candidate list to verify, not a delete list.",
+(`only_ambiguous_callers`, unresolved namesake, coverage-capped, `confident_tier_unproven`, \
+`exported_unreferenced`); unconfirmed rows carry `evidence`. Read `walk_incomplete` and \
+`excluded` — a partial corpus is a lower bound, and an exempted one is not a clean bill. \
+Candidate list to verify, not a delete list.",
             );
             // Declared, not required: all three are `skip_serializing_if` on
             // `devmap_query::Response`, and their *absence* is itself the
@@ -1737,6 +1745,15 @@ a partial corpus is a lower bound, not a clean bill. Candidate list to verify, n
                     json!({"type": "integer",
                         "description": "Clusters found but not listed because of the producer's \
         cluster cap. Separate from `hidden`, which counts what the token budget trimmed from `items`."}),
+                );
+                properties.insert(
+                    "excluded".into(),
+                    json!({"type": "object",
+                        "description": "Uncalled symbols the dead list never examined, for this \
+        generation: `not_examined` (spared by visibility — an export or a language default, not \
+        evidence), `exempt` (spared by a recorded reason), and `languages`, one entry per language \
+        with both counts and `by_reason` keyed by reason token. Absent only on an answer that is not \
+        about dead code."}),
                 );
                 properties.insert(
                     "dead_clusters_incomplete".into(),

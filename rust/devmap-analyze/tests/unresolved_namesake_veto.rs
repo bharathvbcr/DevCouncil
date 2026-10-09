@@ -140,6 +140,42 @@ fn a_bare_unresolved_call_naming_the_symbol_vetoes_it() {
     assert_eq!(finding(&reports, "render").confidence, 0.4);
 }
 
+/// A site the enclosing scope also binds by the symbol's name vetoes it too.
+///
+/// `LocalBinding` was on the other side of this line until 2026-10-09, on the
+/// theory that a call to a name the scope declares is always the local value.
+/// The audit measured that theory wrong exactly where it cost a deletion:
+/// `let (n, shadow_b) = (1, opt.and_then(|p| shadow_b(p)))` (Rust C48) calls
+/// the *function* inside the initializer of the pattern that binds the name,
+/// `{ cwd = repoRoot() }` calls it while binding `cwd`, and a Go function-local
+/// `type entry` shadowed by `for _, entry := range` lost its only reference the
+/// same way — each published dead at 0.9, each live. The scope does bind the
+/// name; the classifier cannot see which binding a given site reached, so it
+/// is evidence of the same strength as `Unresolved`.
+#[test]
+fn a_local_binding_naming_the_symbol_vetoes_it() {
+    let reports = analyze_with_ledger(
+        &corpus(),
+        vec![row(
+            "render",
+            UnresolvedKind::Call,
+            UnresolvedClass::LocalBinding,
+        )],
+    );
+    let render = finding(&reports, "render");
+    assert_eq!(render.confidence, 0.4);
+    assert_eq!(
+        render.exemption_reason.as_deref(),
+        Some(UNRESOLVED_NAMESAKE_REASON)
+    );
+    let evidence = render
+        .evidence
+        .as_ref()
+        .expect("an unconfirmed row carries its site evidence");
+    assert_eq!(evidence.sites, 1, "{evidence:?}");
+    assert_eq!(evidence.first_path.as_deref(), Some("caller.py"));
+}
+
 /// An unbound route handler is the strongest case of all.
 ///
 /// `HandlesRoute` is what tells liveness a handler is reached from outside the
@@ -161,12 +197,13 @@ fn an_unbound_route_handler_naming_the_symbol_vetoes_it() {
 
 /// The inverse guard, class by class.
 ///
-/// Each of these four classes carries evidence that the site meant something
-/// other than the corpus symbol. If any of them vetoed, the ledger's largest
-/// tiers would suppress findings wholesale: on this repository `LocalBinding`
-/// and `External` alone account for the bulk of unresolved rows, so admitting
-/// them would quietly retire dead-code detection while every test that only
-/// checks the ON direction kept passing.
+/// Each of these classes carries evidence that the site meant something other
+/// than the corpus symbol. If any of them vetoed, the ledger's largest tiers
+/// would suppress findings wholesale — `External` alone accounts for a large
+/// share of unresolved rows — and dead-code detection would quietly retire
+/// while every test that only checks the ON direction kept passing.
+/// `LocalBinding` left this list on 2026-10-09; see
+/// `a_local_binding_naming_the_symbol_vetoes_it`.
 #[test]
 fn classes_with_affirmative_evidence_do_not_veto() {
     for (label, class) in [
@@ -178,9 +215,6 @@ fn classes_with_affirmative_evidence_do_not_veto() {
                 environment: "node".to_string(),
             },
         ),
-        // The enclosing symbol declares the name itself — a parameter or a
-        // local closure. The ladder failing here is the correct outcome.
-        ("local_binding", UnresolvedClass::LocalBinding),
         // Bound by an import naming no indexed file; the import is the
         // evidence. A repo-relative specifier is filed under `Unresolved`
         // instead, precisely so this class stays import-proven.

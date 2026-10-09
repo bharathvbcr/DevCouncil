@@ -166,6 +166,47 @@ pub struct ProjectManifests {
     /// directory the default index excludes — and those had no record
     /// anywhere.
     pub refusals: Vec<(String, DiscoverySkipReason)>,
+    /// Every `Cargo.toml` package this pass read, with the names a `use` may
+    /// spell its library by.
+    ///
+    /// A crate's directory name is not its name. GitPulse's library lives in
+    /// `src-tauri`, is packaged as `gitpulse` and built as `[lib] name =
+    /// "gitpulse_lib"`, so `use gitpulse_lib::…` named an in-repo crate the
+    /// resolver only knew by its directory and filed every such import
+    /// `External` — "expected, not worth acting on" — about code it indexes.
+    pub rust_crates: Vec<RustCrateManifest>,
+}
+
+/// One `Cargo.toml` package: the directory it governs and the crate names its
+/// library answers to — `[package] name` with `-` read as `_`, and `[lib]
+/// name` when set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RustCrateManifest {
+    /// Repo-relative directory holding the `Cargo.toml`; empty at the root.
+    pub dir: String,
+    pub names: Vec<String>,
+}
+
+/// The library names a `Cargo.toml` declares, or `None` when it declares no
+/// package (a virtual workspace manifest) or does not parse.
+pub fn parse_cargo_crate_names(source: &str) -> Option<Vec<String>> {
+    let manifest: toml::Table = source.parse().ok()?;
+    let package = manifest.get("package")?.as_table()?;
+    let mut names = Vec::new();
+    if let Some(name) = package.get("name").and_then(toml::Value::as_str) {
+        names.push(name.replace('-', "_"));
+    }
+    if let Some(name) = manifest
+        .get("lib")
+        .and_then(toml::Value::as_table)
+        .and_then(|lib| lib.get("name"))
+        .and_then(toml::Value::as_str)
+    {
+        names.push(name.replace('-', "_"));
+    }
+    names.sort();
+    names.dedup();
+    (!names.is_empty()).then_some(names)
 }
 
 impl ProjectManifests {
@@ -189,6 +230,7 @@ impl ProjectManifests {
 #[derive(Default)]
 struct Found {
     modules: Vec<GoModule>,
+    rust_crates: Vec<RustCrateManifest>,
     ts_configs: Vec<String>,
     examined: BTreeSet<String>,
     refusals: Vec<(String, DiscoverySkipReason)>,
@@ -208,7 +250,8 @@ fn visit_manifest_entry(root: &Path, entry: &ignore::DirEntry, found: &std::sync
         return;
     };
     let is_go_mod = file_name == "go.mod";
-    if !is_go_mod && !crate::tsconfig::is_ts_config_name(file_name) {
+    let is_cargo_toml = file_name == "Cargo.toml";
+    if !is_go_mod && !is_cargo_toml && !crate::tsconfig::is_ts_config_name(file_name) {
         return;
     }
     // A link is a candidate whatever it points at. `is_file()` follows it and
@@ -226,6 +269,27 @@ fn visit_manifest_entry(root: &Path, entry: &ignore::DirEntry, found: &std::sync
         return;
     };
     let rel_str = rel_str.replace('\\', "/");
+    if is_cargo_toml {
+        let read = read_manifest(root, &rel_str, crate::MAX_SOURCE_BYTES);
+        let mut found = crate::recover_lock(found);
+        found.examined.insert(rel_str.clone());
+        match read {
+            ManifestRead::Read(source) => {
+                if let Some(names) = parse_cargo_crate_names(&source) {
+                    let dir = rel_str
+                        .rsplit_once('/')
+                        .map(|(dir, _)| dir.to_string())
+                        .unwrap_or_default();
+                    found.rust_crates.push(RustCrateManifest { dir, names });
+                }
+            }
+            ManifestRead::Absent | ManifestRead::Skipped => {}
+            ManifestRead::Refused(reason) => found
+                .refusals
+                .push((rel_str, DiscoverySkipReason::Unreadable { reason })),
+        }
+        return;
+    }
     if !is_go_mod {
         crate::recover_lock(found).ts_configs.push(rel_str);
         return;
@@ -324,6 +388,7 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
     });
     let Found {
         mut modules,
+        mut rust_crates,
         mut ts_configs,
         mut examined,
         mut refusals,
@@ -346,6 +411,7 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
             .then_with(|| left.dir.cmp(&right.dir))
     });
     ts_configs.sort();
+    rust_crates.sort_by(|left, right| left.dir.cmp(&right.dir));
     let ts = crate::tsconfig::build_ts_projects(root, &ts_configs);
     examined.extend(ts.examined);
     refusals.extend(
@@ -359,6 +425,7 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
         ts_projects: ts.projects,
         examined,
         refusals,
+        rust_crates,
     })
 }
 

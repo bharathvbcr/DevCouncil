@@ -854,6 +854,13 @@ pub struct DeadPage {
     /// "66 of 80,000" into "66 of 66", which is the flattering reading of a
     /// list that was cut off.
     pub total_non_exempt: usize,
+    /// Every exempt row of the same generation, counted per language and
+    /// reason token: the population the list above never examined.
+    ///
+    /// Read in the same snapshot as the rows, for the reason `analysis` is: a
+    /// disclosure from one generation beside findings from another describes
+    /// neither.
+    pub excluded: devmap_analyze::model::ExcludedPopulation,
 }
 
 /// One consistent snapshot of a search: the matching rows, the count they were
@@ -2242,6 +2249,9 @@ const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
             "confidence",
             "is_exempt",
             "exemption_reason",
+            "evidence_sites",
+            "evidence_path",
+            "evidence_byte",
         ],
     ),
     (
