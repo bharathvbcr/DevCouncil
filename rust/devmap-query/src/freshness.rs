@@ -207,7 +207,10 @@ pub const GIT_LS_FILES_OUTPUT_CAP: usize = 64 * 1024 * 1024;
 /// [`git_head`] with the program named, so a test can stand a script in for it.
 #[doc(hidden)]
 pub fn git_head_with_program(program: &OsStr, root: &Path) -> String {
-    let mut command = subprocess::git_with_program(program, root);
+    let Ok(mut command) = subprocess::git_with_program(program, root) else {
+        // No git this process may run against root: "cannot be answered".
+        return String::new();
+    };
     command.args(["rev-parse", "HEAD"]);
     let bounds = Bounds {
         deadline: GIT_HEAD_DEADLINE,
@@ -279,7 +282,8 @@ pub(crate) fn ls_files(
     root: &Path,
     flags: &[&str],
 ) -> Result<Vec<String>, String> {
-    let mut command = subprocess::git_with_program(program, root);
+    let mut command = subprocess::git_with_program(program, root)
+        .map_err(|failure| format!("git ls-files {}: {failure}", flags.join(" ")))?;
     command.arg("ls-files").arg("-z").args(flags);
     let bounds = Bounds {
         deadline: GIT_LS_FILES_DEADLINE,

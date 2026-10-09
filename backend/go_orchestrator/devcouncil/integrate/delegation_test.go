@@ -139,6 +139,9 @@ func TestDryRunAndCheckWriteNothing(t *testing.T) {
 func TestNoDevmapIsARefusalNotASuccess(t *testing.T) {
 	t.Setenv("DEVMAP_BIN", "")
 	t.Setenv("PATH", t.TempDir())
+	// ~/.local/bin is a rung of component discovery, so an absent
+	// component is absent there too.
+	t.Setenv("HOME", t.TempDir())
 	root := t.TempDir()
 	receipt, err := Run(Options{Root: root, Host: "cursor", Mode: ModeApply, SelfBin: fakeSelf})
 	if err == nil || !strings.Contains(err.Error(), "nothing was configured") {

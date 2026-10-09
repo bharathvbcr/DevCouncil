@@ -66,7 +66,7 @@
 use std::ffi::OsStr;
 use std::fmt;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -172,20 +172,220 @@ impl std::error::Error for Failure {}
 /// and not a spawn failure, no terminal prompt, and no optional index locks
 /// (a read must never leave `index.lock` behind in someone's checkout).
 ///
+/// The `git` it runs is found by [`resolve_outside`]: the repository under
+/// analysis does not get to supply the program that describes it.
+///
 /// Subcommand and flags are the caller's to add.
-pub fn git(root: &Path) -> Command {
+pub fn git(root: &Path) -> Result<Command, Failure> {
     git_with_program(OsStr::new("git"), root)
 }
 
 /// [`git`] with the program named, so a test can stand a script in for it.
-pub fn git_with_program(program: &OsStr, root: &Path) -> Command {
-    let mut command = Command::new(program);
+pub fn git_with_program(program: &OsStr, root: &Path) -> Result<Command, Failure> {
+    let resolved = resolve_outside(program, std::env::var_os("PATH").as_deref(), root)?;
+    let mut command = Command::new(resolved);
     command
         .arg("-C")
         .arg(root)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0");
-    command
+    Ok(command)
+}
+
+/// The program a command against `root` runs, as an absolute path.
+///
+/// A `program` with a directory in it is the caller's explicit choice and is
+/// used as named, made absolute so the file is the same one wherever the
+/// child runs. A bare name is searched for along `path_var` (the `PATH`
+/// value), in order, and the first entry holding an executable of that name
+/// decides:
+///
+/// * an entry that is empty or relative is refused. It names whatever
+///   directory this process happens to run in, which is usually the
+///   repository. Go's `os/exec` refuses the same thing (`exec.ErrDot`); Rust's
+///   standard library does not, so it is refused here.
+/// * a candidate whose canonical location is inside `root` is refused: the
+///   repository's own files are input to analysis, not programs to trust.
+///   Containment is decided by identity — device and inode of each directory
+///   above the candidate against `root`'s — not by comparing names, because a
+///   filesystem that folds case or Unicode normalization (APFS, NTFS) gives
+///   one directory many spellings. A `root` that does not exist contains
+///   nothing, so git still reports the missing root itself. A directory that
+///   cannot be examined is an error, never an answer of "outside".
+///
+/// A refusal or a program found nowhere is a [`Failure::Spawn`]: nothing ran,
+/// and every caller already reports that as "git could not run".
+pub fn resolve_outside(
+    program: &OsStr,
+    path_var: Option<&OsStr>,
+    root: &Path,
+) -> Result<PathBuf, Failure> {
+    let name = program.to_string_lossy().into_owned();
+    let refuse = |kind: std::io::ErrorKind, message: String| Failure::Spawn {
+        program: name.clone(),
+        error: std::io::Error::new(kind, message),
+    };
+    let named = Path::new(program);
+    if named
+        .parent()
+        .is_some_and(|dir| !dir.as_os_str().is_empty())
+    {
+        return std::path::absolute(named)
+            .map_err(|error| refuse(error.kind(), format!("{name}: {error}")));
+    }
+    let entries = path_var.map(std::env::split_paths).into_iter().flatten();
+    for entry in entries {
+        for candidate in executable_names(&entry, program) {
+            if !is_executable(&candidate) {
+                continue;
+            }
+            if entry.as_os_str().is_empty() || entry.is_relative() {
+                return Err(refuse(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "{name} resolves to {} through the relative PATH entry {:?}, which names \
+                         whatever directory this process runs in",
+                        candidate.display(),
+                        entry
+                    ),
+                ));
+            }
+            return match follow_outside(&candidate, root) {
+                Ok(Ok(resolved)) => Ok(resolved),
+                Ok(Err(bound)) => Err(refuse(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "{name} resolves through {}, which is inside the repository under analysis",
+                        bound.display()
+                    ),
+                )),
+                Err(error) => Err(refuse(
+                    error.kind(),
+                    format!(
+                        "{name} resolves through {}, whose location could not be checked: {error}",
+                        candidate.display()
+                    ),
+                )),
+            };
+        }
+    }
+    Err(refuse(
+        std::io::ErrorKind::NotFound,
+        format!("{name} is not on PATH"),
+    ))
+}
+
+/// The file names `program` may have in `dir`: itself, and on Windows each
+/// `PATHEXT` extension when it has none of its own.
+fn executable_names(dir: &Path, program: &OsStr) -> Vec<PathBuf> {
+    let mut names = vec![dir.join(program)];
+    if cfg!(windows) && Path::new(program).extension().is_none() {
+        let pathext = std::env::var_os("PATHEXT")
+            .unwrap_or_else(|| std::ffi::OsString::from(".COM;.EXE;.BAT;.CMD"));
+        for ext in pathext
+            .to_string_lossy()
+            .split(';')
+            .filter(|e| !e.is_empty())
+        {
+            let mut file = program.to_os_string();
+            file.push(ext);
+            names.push(dir.join(file));
+        }
+    }
+    names
+}
+
+fn is_executable(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// The symlink chain [`follow_outside`] follows, bounded as POSIX path
+/// resolution is.
+const MAX_LINK_HOPS: usize = 40;
+
+/// Follows `candidate`'s symlink chain to its canonical end, or names the
+/// first link on the way that is bound inside `root` (the inner `Err`).
+///
+/// Every link is checked, not only where the chain ends. A repository need
+/// not ship a program to choose one: a link it carries, named `git` and
+/// pointing at `/usr/bin/true`, is a git that exits 0 with no output, which
+/// reads as "nothing changed". The binding is repository content even when
+/// the bytes it points at are not.
+fn follow_outside(candidate: &Path, root: &Path) -> std::io::Result<Result<PathBuf, PathBuf>> {
+    let mut current = candidate.to_path_buf();
+    for _ in 0..=MAX_LINK_HOPS {
+        let parent = current.parent().unwrap_or_else(|| Path::new("/"));
+        // The directory that holds a name decides what the name means.
+        let holder = std::fs::canonicalize(parent)?;
+        if contained_in(&holder, root)? {
+            return Ok(Err(holder.join(current.file_name().unwrap_or_default())));
+        }
+        if !std::fs::symlink_metadata(&current)?
+            .file_type()
+            .is_symlink()
+        {
+            return std::fs::canonicalize(&current).map(Ok);
+        }
+        let target = std::fs::read_link(&current)?;
+        current = if target.is_absolute() {
+            target
+        } else {
+            holder.join(target)
+        };
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "more than {MAX_LINK_HOPS} links from {}",
+            candidate.display()
+        ),
+    ))
+}
+
+/// Whether `path` (canonical) is `root` or lies beneath it, by identity.
+fn contained_in(path: &Path, root: &Path) -> std::io::Result<bool> {
+    let root_meta = match std::fs::metadata(root) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let root_id = (root_meta.dev(), root_meta.ino());
+        let mut current = Some(path);
+        while let Some(dir) = current {
+            let meta = std::fs::metadata(dir)?;
+            if (meta.dev(), meta.ino()) == root_id {
+                return Ok(true);
+            }
+            current = dir.parent();
+        }
+        Ok(false)
+    }
+    #[cfg(not(unix))]
+    {
+        // `canonicalize` on Windows asks the handle for its final path, which
+        // carries the on-disk spelling, so two canonical paths compare by
+        // identity component by component.
+        let _ = root_meta;
+        let root = std::fs::canonicalize(root)?;
+        Ok(path.starts_with(&root))
+    }
 }
 
 /// Linux can briefly retain a writer inherited by another concurrent fork
@@ -603,6 +803,277 @@ fn drain(pipe: Option<impl Read>, cap: usize) -> Drained {
 mod tests {
     use super::*;
     use std::io::ErrorKind;
+
+    /// A fresh directory under the system temp dir, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(label: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("dc-proc-{label}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(std::fs::canonicalize(&dir).unwrap())
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn plant(dir: &Path, name: &str, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    fn refusal(result: Result<PathBuf, Failure>) -> (ErrorKind, String) {
+        match result {
+            Err(Failure::Spawn { error, .. }) => (error.kind(), error.to_string()),
+            other => panic!("expected a spawn refusal, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_installed_git_outside_the_repository_is_used_by_its_canonical_path() {
+        let base = Scratch::new("outside");
+        let root = base.0.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let installed = plant(&base.0.join("usr").join("bin"), "git", 0o755);
+        let path = base.0.join("usr").join("bin");
+
+        let got = resolve_outside(OsStr::new("git"), Some(path.as_os_str()), &root).unwrap();
+        assert_eq!(got, std::fs::canonicalize(installed).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_git_inside_the_repository_is_refused_not_run() {
+        let base = Scratch::new("inside");
+        let root = base.0.join("repo");
+        plant(&root.join("bin"), "git", 0o755);
+        let path = std::env::join_paths([root.join("bin"), PathBuf::from("/usr/bin")]).unwrap();
+
+        let (kind, message) = refusal(resolve_outside(OsStr::new("git"), Some(&path), &root));
+        assert_eq!(kind, ErrorKind::PermissionDenied);
+        assert!(message.contains("inside the repository"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_into_the_repository_is_still_the_repository() {
+        let base = Scratch::new("symlink");
+        let root = base.0.join("repo");
+        let planted = plant(&root.join("target"), "git", 0o755);
+        let bin = base.0.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink(&planted, bin.join("git")).unwrap();
+
+        let (_, message) = refusal(resolve_outside(
+            OsStr::new("git"),
+            Some(bin.as_os_str()),
+            &root,
+        ));
+        assert!(message.contains("inside the repository"), "{message}");
+    }
+
+    /// A relative entry names whatever directory the process runs in. It is
+    /// refused when it holds the program, whichever directory that is.
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_path_entry_is_refused() {
+        let base = Scratch::new("relative");
+        let elsewhere = base.0.join("elsewhere");
+        plant(&elsewhere.join("bin"), "git", 0o755);
+        let root = base.0.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        // A relative spelling of `elsewhere/bin`, from this process's cwd.
+        let cwd = std::env::current_dir().unwrap();
+        let mut relative = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative.push("..");
+        }
+        relative.push(elsewhere.join("bin").strip_prefix("/").unwrap());
+
+        let (kind, message) = refusal(resolve_outside(
+            OsStr::new("git"),
+            Some(relative.as_os_str()),
+            &root,
+        ));
+        assert_eq!(kind, ErrorKind::PermissionDenied);
+        assert!(message.contains("relative PATH entry"), "{message}");
+    }
+
+    /// Identity, not spelling: on a filesystem that folds case, `REPO/bin`
+    /// is `Repo/bin`. Skipped where the filesystem keeps them apart.
+    #[cfg(unix)]
+    #[test]
+    fn a_case_variant_spelling_of_the_repository_is_the_repository() {
+        let base = Scratch::new("case");
+        let root = base.0.join("Repo");
+        plant(&root.join("bin"), "git", 0o755);
+        let alias = base.0.join("REPO");
+        let same = std::fs::metadata(&alias).is_ok_and(|m| {
+            use std::os::unix::fs::MetadataExt;
+            let r = std::fs::metadata(&root).unwrap();
+            (m.dev(), m.ino()) == (r.dev(), r.ino())
+        });
+        if !same {
+            return;
+        }
+        let entry = alias.join("bin");
+        let (_, message) = refusal(resolve_outside(
+            OsStr::new("git"),
+            Some(entry.as_os_str()),
+            &root,
+        ));
+        assert!(message.contains("inside the repository"), "{message}");
+    }
+
+    /// The `bin/git -> /usr/bin/true` attack: the target is outside, the
+    /// choice is the repository's.
+    #[cfg(unix)]
+    #[test]
+    fn a_repository_link_to_an_outside_program_is_refused() {
+        let base = Scratch::new("true-link");
+        let root = base.0.join("repo");
+        let outside = plant(&base.0.join("usr").join("bin"), "true", 0o755);
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("bin").join("git")).unwrap();
+        let chain = base.0.join("bin");
+        std::fs::create_dir_all(&chain).unwrap();
+        std::os::unix::fs::symlink(root.join("bin").join("git"), chain.join("git")).unwrap();
+
+        for entry in [root.join("bin"), chain] {
+            let (_, message) = refusal(resolve_outside(
+                OsStr::new("git"),
+                Some(entry.as_os_str()),
+                &root,
+            ));
+            assert!(message.contains("inside the repository"), "{message}");
+        }
+    }
+
+    /// Homebrew's shape: `bin/git -> ../Cellar/git/x/bin/git`, all outside.
+    #[cfg(unix)]
+    #[test]
+    fn a_chain_that_stays_outside_resolves_to_its_end() {
+        let base = Scratch::new("cellar");
+        let root = base.0.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let installed = plant(
+            &base.0.join("Cellar").join("git").join("2.0").join("bin"),
+            "git",
+            0o755,
+        );
+        std::fs::create_dir_all(base.0.join("bin")).unwrap();
+        std::os::unix::fs::symlink("../Cellar/git/2.0/bin/git", base.0.join("bin").join("git"))
+            .unwrap();
+
+        let got = resolve_outside(
+            OsStr::new("git"),
+            Some(base.0.join("bin").as_os_str()),
+            &root,
+        )
+        .unwrap();
+        assert_eq!(got, std::fs::canonicalize(installed).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_loop_is_an_error_not_a_hang() {
+        let base = Scratch::new("loop");
+        let root = base.0.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(base.0.join("bin")).unwrap();
+        let a = base.0.join("bin").join("git");
+        let b = base.0.join("b");
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        // A looping link is not an executable to `metadata`, so it is passed
+        // over and the search ends in "not found" rather than spinning.
+        let (kind, _) = refusal(resolve_outside(
+            OsStr::new("git"),
+            Some(base.0.join("bin").as_os_str()),
+            &root,
+        ));
+        assert_eq!(kind, ErrorKind::NotFound);
+        // And the chain walk itself is bounded when called on one directly.
+        assert!(follow_outside(&a, &root).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_without_the_execute_bit_is_passed_over() {
+        let base = Scratch::new("noexec");
+        let root = base.0.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        plant(&base.0.join("first"), "git", 0o644);
+        let installed = plant(&base.0.join("second"), "git", 0o755);
+        let path = std::env::join_paths([base.0.join("first"), base.0.join("second")]).unwrap();
+
+        let got = resolve_outside(OsStr::new("git"), Some(&path), &root).unwrap();
+        assert_eq!(got, std::fs::canonicalize(installed).unwrap());
+    }
+
+    #[test]
+    fn a_git_found_nowhere_is_not_found() {
+        let base = Scratch::new("nowhere");
+        let (kind, _) = refusal(resolve_outside(
+            OsStr::new("git"),
+            Some(base.0.as_os_str()),
+            &base.0,
+        ));
+        assert_eq!(kind, ErrorKind::NotFound);
+        let (kind, _) = refusal(resolve_outside(OsStr::new("git"), None, &base.0));
+        assert_eq!(kind, ErrorKind::NotFound);
+    }
+
+    /// A root that does not exist contains nothing, so git is still found and
+    /// reports the missing root itself, as `git`'s `-C root` contract says.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_root_leaves_the_error_to_git() {
+        let base = Scratch::new("missing-root");
+        let installed = plant(&base.0.join("bin"), "git", 0o755);
+        let missing = base.0.join("no-such-repo");
+
+        let got = resolve_outside(
+            OsStr::new("git"),
+            Some(base.0.join("bin").as_os_str()),
+            &missing,
+        )
+        .unwrap();
+        assert_eq!(got, std::fs::canonicalize(installed).unwrap());
+    }
+
+    /// An explicit program — a path, not a name — is the caller's choice, used
+    /// as named even inside the repository, and made absolute.
+    #[cfg(unix)]
+    #[test]
+    fn an_explicit_program_is_used_as_named() {
+        let base = Scratch::new("explicit");
+        let root = base.0.join("repo");
+        let stand_in = plant(&root.join("bin"), "git", 0o755);
+
+        let got = resolve_outside(stand_in.as_os_str(), Some(OsStr::new("")), &root).unwrap();
+        assert_eq!(got, stand_in);
+        let got = resolve_outside(OsStr::new("some/dir/git"), None, &root).unwrap();
+        assert!(
+            got.is_absolute() && got.ends_with("some/dir/git"),
+            "{}",
+            got.display()
+        );
+    }
 
     #[test]
     fn a_transient_executable_writer_retries_without_duplicating_a_child() {

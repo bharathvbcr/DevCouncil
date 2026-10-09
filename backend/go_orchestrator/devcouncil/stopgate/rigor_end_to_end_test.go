@@ -193,6 +193,9 @@ func TestAHostWithNoVerifierSaysSoRatherThanVerifyingClean(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", onlyGit)
+	// ~/.local/bin is a rung of component discovery, so an absent
+	// component is absent there too.
+	t.Setenv("HOME", t.TempDir())
 	t.Setenv(dcverify.BinaryEnv, "")
 
 	out := stopgate.Run(context.Background(), stopgate.Input{

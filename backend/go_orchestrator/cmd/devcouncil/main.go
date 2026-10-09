@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -247,15 +248,23 @@ func runMCP() int {
 }
 
 // openStore returns the task-store client, or nil when the project has no
-// state database.
+// state database or no dcstore it may run.
+//
+// The binary is resolved here, to a path, and never left as the bare name:
+// exec would search PATH for a bare name again, with none of the checks that
+// keep a dcstore inside the repository from owning its task store. A
+// database without a binary is said out loud, because the callers report a
+// nil client as state that is unavailable, which alone would be false.
 func openStore(root string) *store.Client {
 	db := filepath.Join(root, ".devcouncil", "state.sqlite")
 	if _, err := os.Stat(db); err != nil {
 		return nil
 	}
-	bin, _ := lookPath("dcstore")
-	if bin == "" {
-		bin = "dcstore"
+	bin, err := proc.ResolveComponent("dcstore", root, proc.Override{})
+	if err != nil {
+		console.Errorf("devcouncil: %s exists but no dcstore can run against it: %v; "+
+			"install it with `devcouncil install dcstore`\n", db, err)
+		return nil
 	}
 	return store.New(bin, db)
 }
@@ -299,32 +308,6 @@ func openGate(root string) (*gate.Gate, error) {
 	// The gate's Matcher stays nil: fnmatch decides every pattern question
 	// (docs/gusset-candidates.md).
 	return gate.New(regFlags, root, subsystems)
-}
-
-func lookPath(name string) (string, error) {
-	return execLookPath(name)
-}
-
-// separated so tests can stub; default uses os/exec.
-var execLookPath = func(name string) (string, error) {
-	return lookPathImpl(name)
-}
-
-func lookPathImpl(name string) (string, error) {
-	path := os.Getenv("PATH")
-	for _, dir := range filepath.SplitList(path) {
-		p := filepath.Join(dir, name)
-		if st, err := os.Stat(p); err == nil && !st.IsDir() {
-			return p, nil
-		}
-	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		p := filepath.Join(home, ".local", "bin", name)
-		if st, err := os.Stat(p); err == nil && !st.IsDir() {
-			return p, nil
-		}
-	}
-	return "", fmt.Errorf("%s not found", name)
 }
 
 func astArgs(rest []string) []string {
@@ -448,7 +431,7 @@ func concat(head []string, extra ...string) []string {
 const devmapPassthroughTimeout = 10 * time.Minute
 
 func runDevmap(args []string) int {
-	bin, err := resolveDevmap()
+	bin, err := resolveDevmap(devmapRoot(args))
 	if err != nil {
 		console.Errorln(err)
 		return 1
@@ -482,24 +465,34 @@ func runDevmap(args []string) int {
 	return 0
 }
 
-// resolveDevmap honours DEVMAP_BIN when set: used or refused, never replaced
-// by a PATH lookup. An empty value is unset.
-func resolveDevmap() (string, error) {
-	if bin := strings.TrimSpace(os.Getenv("DEVMAP_BIN")); bin != "" {
-		info, err := os.Stat(bin)
-		if err != nil {
-			return "", fmt.Errorf("DEVMAP_BIN names %s: %w (an explicit override is used or refused, never replaced)", bin, err)
+// devmapRoot is the repository a `dev map` invocation is about: the value of
+// devmap's own --root flag, else "" for the working directory, which is what
+// devmap analyzes without one. Arguments after `--` are not flags.
+func devmapRoot(args []string) string {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			break
 		}
-		if info.IsDir() {
-			return "", fmt.Errorf("DEVMAP_BIN names %s, which is a directory (an explicit override is used or refused, never replaced)", bin)
+		if name, val, eq := equalsFlag(a); eq && name == "--root" {
+			return val
 		}
-		return bin, nil
+		if a == "--root" && i+1 < len(args) {
+			return args[i+1]
+		}
 	}
-	found, err := lookPath("devmap")
-	if err != nil {
+	return ""
+}
+
+// resolveDevmap honours DEVMAP_BIN when set: used or refused, never replaced
+// by a PATH lookup. An empty value is unset. A devmap inside root — the
+// repository the invocation analyzes — is refused.
+func resolveDevmap(root string) (string, error) {
+	found, err := proc.ResolveComponent("devmap", root, proc.EnvOverride("DEVMAP_BIN"))
+	if errors.Is(err, exec.ErrNotFound) {
 		return "", fmt.Errorf("devmap binary not found on PATH or ~/.local/bin; build rust/ and install the `devmap` binary")
 	}
-	return found, nil
+	return found, err
 }
 
 func runIntegrate(args []string) int {

@@ -25,7 +25,7 @@ package verify
 
 import (
 	"context"
-	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -47,14 +47,25 @@ import (
 // proc.LookPathOutside: repository contents are input to verification, and a
 // build output or vendored script that happens to be named dcverify must not
 // become the program that decides whether that repository's diff is clean.
+//
+// An operator who names a path in MANVI_VERIFY_BINARY means it, including a
+// path inside the repository — which is how this is developed and tested. A
+// named path that does not exist is still handed to the client, so running
+// it fails as a configured verifier that is broken (a blocking gap) rather
+// than reading as one that was never installed (a skip).
 func RigorClient(root string) *dcverify.Client {
-	if override := strings.TrimSpace(os.Getenv(dcverify.BinaryEnv)); override != "" {
-		// An operator who names a path means it, including a path inside the
-		// repository — which is how this is developed and tested.
-		return dcverify.New(override, root)
-	}
-	binary, err := proc.LookPathOutside("dcverify", root)
+	override := proc.EnvOverride(dcverify.BinaryEnv)
+	binary, err := proc.ResolveComponent("dcverify", root, override)
 	if err != nil {
+		if override.Path != "" {
+			// Absolute for the same reason the resolver makes it so: the
+			// path that fails is the one the operator named, wherever the
+			// client runs.
+			if abs, absErr := filepath.Abs(override.Path); absErr == nil {
+				return dcverify.New(abs, root)
+			}
+			return dcverify.New(override.Path, root)
+		}
 		return nil
 	}
 	return dcverify.New(binary, root)

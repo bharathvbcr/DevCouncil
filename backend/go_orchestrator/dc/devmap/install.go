@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -202,32 +201,24 @@ func predatesFlag(err error, stderr []byte) error {
 	return err
 }
 
-// ResolveOutside names the devmap an installing command runs.
+// ResolveOutside names the devmap an installing command runs, through
+// proc.ResolveComponent.
 //
 // An explicit path — the caller's flag, else DEVMAP_BIN — is used or refused,
-// never replaced by a PATH lookup. Otherwise PATH is searched, refusing any
-// candidate whose canonical location is inside root: an install writes host
-// configuration, and running a binary the repository supplied to do it is
-// running repository content.
+// never replaced by a search. Otherwise PATH and then ~/.local/bin are
+// searched, refusing any candidate whose canonical location is inside root: an
+// install writes host configuration, and running a binary the repository
+// supplied to do it is running repository content.
 func ResolveOutside(explicit, root string) (string, error) {
-	if explicit == "" {
-		explicit = strings.TrimSpace(os.Getenv("DEVMAP_BIN"))
-	}
+	override := proc.EnvOverride("DEVMAP_BIN")
 	if explicit != "" {
-		info, err := os.Stat(explicit)
-		if err != nil {
-			return "", fmt.Errorf("devmap binary %s: %w (an explicit binary is used or refused, never replaced)", explicit, err)
-		}
-		if info.IsDir() {
-			return "", fmt.Errorf("devmap binary %s is a directory (an explicit binary is used or refused, never replaced)", explicit)
-		}
-		return explicit, nil
+		override = proc.Override{Path: explicit, Source: "--devmap-bin"}
 	}
-	found, err := proc.LookPathOutside("devmap", root)
-	if err != nil {
-		return "", fmt.Errorf("no devmap outside the repository was found on PATH (%w); pass --devmap-bin or set DEVMAP_BIN", err)
+	found, err := proc.ResolveComponent("devmap", root, override)
+	if err != nil && override.Path == "" {
+		return "", fmt.Errorf("no devmap outside the repository was found on PATH or ~/.local/bin (%w); pass --devmap-bin or set DEVMAP_BIN", err)
 	}
-	return found, nil
+	return found, err
 }
 
 // RelativeTo names a path DevMap reported relative to root when it lies

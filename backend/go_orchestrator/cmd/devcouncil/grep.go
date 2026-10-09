@@ -2,7 +2,7 @@ package main
 
 import (
 	"errors"
-	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 
@@ -78,9 +78,13 @@ func runGrep(args []string) int {
 		return 2
 	}
 
-	client := grepClient(root)
-	if client == nil {
-		console.Errorln(grepMissingBinary)
+	client, err := grepClient(root)
+	if err != nil {
+		if errors.Is(err, exec.ErrNotFound) {
+			console.Errorln(grepMissingBinary)
+		} else {
+			console.Errorf("dcgrep: %v\n", err)
+		}
 		return 1
 	}
 	result, err := client.Search(console.Context(), req)
@@ -118,13 +122,12 @@ func runGrep(args []string) int {
 
 const grepMissingBinary = "no dcgrep binary; install with `devcouncil install dcgrep`, or set " + dcgrep.BinaryEnv
 
-func grepClient(root string) *dcgrep.Client {
-	if override := strings.TrimSpace(os.Getenv(dcgrep.BinaryEnv)); override != "" {
-		return dcgrep.New(override, root)
-	}
-	binary, err := proc.LookPathOutside("dcgrep", root)
+// grepClient resolves dcgrep through proc.ResolveComponent. A searcher the
+// repository supplies does not decide what the repository contains.
+func grepClient(root string) (*dcgrep.Client, error) {
+	binary, err := proc.ResolveComponent("dcgrep", root, proc.EnvOverride(dcgrep.BinaryEnv))
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	return dcgrep.New(binary, root)
+	return dcgrep.New(binary, root), nil
 }
