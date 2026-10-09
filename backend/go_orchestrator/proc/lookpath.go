@@ -20,14 +20,17 @@ var ErrRepositoryLocal = errors.New("candidate is inside the repository under an
 // Repository contents are input to analysis. They do not authorize executing a
 // discovered program, so a build output, a vendored helper, or anything a
 // relative PATH entry resolves to inside the checkout is refused by identity
-// rather than by spelling: both sides are canonicalized first, so a PATH
-// symlink or an alternate root spelling cannot smuggle repository content in
-// as an implicitly trusted installation.
+// rather than by spelling. Symlinks are resolved first, and containment is
+// then decided by comparing directories with os.SameFile, not their names:
+// a filesystem that folds case or Unicode normalization (macOS APFS, Windows
+// NTFS) gives one directory many spellings, and a PATH entry or root spelled
+// another way must not smuggle repository content in as an implicitly
+// trusted installation.
 //
 // An empty `root` means the current working directory, which is the root a
 // command without an explicit `--project-root` is already operating on.
 func LookPathOutside(name, root string) (string, error) {
-	canonicalRoot, err := resolveRoot(root)
+	rootDir, err := resolveRoot(root)
 	if err != nil {
 		return "", err
 	}
@@ -35,7 +38,7 @@ func LookPathOutside(name, root string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return outsideRoot(name, candidate, canonicalRoot)
+	return outsideRoot(name, candidate, rootDir)
 }
 
 // Override is an operator's explicit path for a component, and the flag or
@@ -108,37 +111,37 @@ func ResolveComponent(name, root string, override Override) (string, error) {
 		}
 		return "", localErr
 	}
-	canonicalRoot, err := resolveRoot(root)
+	rootDir, err := resolveRoot(root)
 	if err != nil {
 		return "", err
 	}
-	return outsideRoot(name, candidate, canonicalRoot)
+	return outsideRoot(name, candidate, rootDir)
 }
 
-// resolveRoot canonicalizes root, where empty means the working directory.
-func resolveRoot(root string) (string, error) {
+// resolveRoot identifies root, where empty means the working directory.
+func resolveRoot(root string) (os.FileInfo, error) {
 	if root == "" {
 		var err error
 		root, err = os.Getwd()
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 	}
-	return canonicalAbs(root)
+	return os.Stat(root)
 }
 
 // outsideRoot returns candidate's canonical path, refusing it when that lies
-// inside canonicalRoot or is not a regular file.
-func outsideRoot(name, candidate, canonicalRoot string) (string, error) {
+// inside the directory rootDir identifies or is not a regular file.
+func outsideRoot(name, candidate string, rootDir os.FileInfo) (string, error) {
 	candidate, err := canonicalAbs(candidate)
 	if err != nil {
 		return "", err
 	}
-	relative, err := filepath.Rel(canonicalRoot, candidate)
+	inside, err := within(candidate, rootDir)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("%s resolves to %s, whose location could not be checked: %w", name, candidate, err)
 	}
-	if relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+	if inside {
 		return "", fmt.Errorf("%s resolves to %s: %w", name, candidate, ErrRepositoryLocal)
 	}
 	info, err := os.Stat(candidate)
@@ -149,6 +152,26 @@ func outsideRoot(name, candidate, canonicalRoot string) (string, error) {
 		return "", fmt.Errorf("%s resolves to %s, which is not a regular file", name, candidate)
 	}
 	return candidate, nil
+}
+
+// within reports whether path, or any directory above it, is dir. Each
+// ancestor is compared by identity; one that cannot be examined is an error,
+// never an answer of "outside".
+func within(path string, dir os.FileInfo) (bool, error) {
+	for current := path; ; {
+		info, err := os.Stat(current)
+		if err != nil {
+			return false, err
+		}
+		if os.SameFile(info, dir) {
+			return true, nil
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return false, nil
+		}
+		current = parent
+	}
 }
 
 func canonicalAbs(path string) (string, error) {

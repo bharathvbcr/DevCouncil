@@ -285,3 +285,80 @@ func TestResolveComponentOverrideIsMadeAbsolute(t *testing.T) {
 		t.Fatalf("resolved %q, want the file that was checked, %q", gotReal, wantReal)
 	}
 }
+
+// sameDirOrSkip skips when alias does not name dir on this filesystem, so the
+// spelling tests below run where the filesystem folds spellings (macOS APFS,
+// Windows NTFS) and are skipped where it does not.
+func sameDirOrSkip(t *testing.T, dir, alias string) {
+	t.Helper()
+	a, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.Stat(alias)
+	if err != nil || !os.SameFile(a, b) {
+		t.Skipf("%s does not name %s on this filesystem", alias, dir)
+	}
+}
+
+// Containment is a question about identity, not spelling. On a filesystem
+// that ignores case, a PATH entry that spells the repository in another case
+// names the same directory, and a program in it is still repository content.
+func TestLookPathOutsideRefusesCaseVariantOfRoot(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "Repo")
+	writeExecutable(t, filepath.Join(root, "bin", "tool-under-test"))
+	for _, alias := range []string{"REPO", "repo"} {
+		sameDirOrSkip(t, root, filepath.Join(base, alias))
+		t.Setenv("PATH", filepath.Join(base, alias, "bin"))
+		got, err := LookPathOutside("tool-under-test", root)
+		if !errors.Is(err, ErrRepositoryLocal) {
+			t.Fatalf("PATH spelled %s let repository content through: %q (err %v)", alias, got, err)
+		}
+	}
+}
+
+// The same holds for Unicode normalization: APFS treats a composed and a
+// decomposed name as one directory.
+func TestLookPathOutsideRefusesNormalizationVariantOfRoot(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "café")
+	writeExecutable(t, filepath.Join(root, "bin", "tool-under-test"))
+	alias := filepath.Join(base, "café")
+	sameDirOrSkip(t, root, alias)
+	t.Setenv("PATH", filepath.Join(alias, "bin"))
+
+	got, err := LookPathOutside("tool-under-test", root)
+	if !errors.Is(err, ErrRepositoryLocal) {
+		t.Fatalf("a decomposed spelling let repository content through: %q (err %v)", got, err)
+	}
+}
+
+// The root's spelling can differ too: --project-root typed in another case
+// is the same repository.
+func TestLookPathOutsideRefusesCaseVariantOfRootArgument(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "Repo")
+	writeExecutable(t, filepath.Join(root, "bin", "tool-under-test"))
+	alias := filepath.Join(base, "rEPO")
+	sameDirOrSkip(t, root, alias)
+	t.Setenv("PATH", filepath.Join(root, "bin"))
+
+	got, err := LookPathOutside("tool-under-test", alias)
+	if !errors.Is(err, ErrRepositoryLocal) {
+		t.Fatalf("a root spelled in another case let repository content through: %q (err %v)", got, err)
+	}
+}
+
+// The ~/.local/bin rung is held to the same identity check.
+func TestResolveComponentRefusesLocalBinUnderCaseVariantRoot(t *testing.T) {
+	_, home := componentFixture(t)
+	writeExecutable(t, filepath.Join(home, ".local", "bin", "tool-under-test"))
+	alias := filepath.Join(filepath.Dir(home), strings.ToUpper(filepath.Base(home)))
+	sameDirOrSkip(t, home, alias)
+
+	got, err := ResolveComponent("tool-under-test", alias, Override{})
+	if !errors.Is(err, ErrRepositoryLocal) {
+		t.Fatalf("resolved %q under a root spelled in another case (err %v)", got, err)
+	}
+}
