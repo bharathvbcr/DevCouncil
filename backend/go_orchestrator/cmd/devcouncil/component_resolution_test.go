@@ -156,3 +156,47 @@ func TestRepositoryLocalDevmapIsNotRun(t *testing.T) {
 		t.Fatalf("stderr = %q, want the refusal named", stderr.String())
 	}
 }
+
+// `dev map --root R` asks about R, so R is the repository a devmap must be
+// outside of — not the directory the command happens to run in. From $HOME,
+// using the working directory would refuse ~/.local/bin/devmap as
+// repository content.
+func TestDevmapRootFlagChoosesTheRepository(t *testing.T) {
+	for _, spelling := range []string{"separate", "equals"} {
+		t.Run(spelling, func(t *testing.T) {
+			if runtime.GOOS == "windows" {
+				t.Skip("the fake devmap is a shell script")
+			}
+			home := t.TempDir()
+			repo := t.TempDir()
+			argvFile := filepath.Join(t.TempDir(), "argv")
+			script := "#!/bin/sh\n: > \"$DEVMAP_ARGV_FILE\"\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> \"$DEVMAP_ARGV_FILE\"; done\n"
+			if err := os.MkdirAll(filepath.Join(home, ".local", "bin"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			// #nosec G306 -- an executable stand-in; the execute bit is the point.
+			if err := os.WriteFile(filepath.Join(home, ".local", "bin", "devmap"), []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("DEVMAP_ARGV_FILE", argvFile)
+			t.Setenv("DEVMAP_BIN", "")
+			t.Setenv("HOME", home)
+			t.Setenv("PATH", t.TempDir())
+			t.Chdir(home)
+
+			args := []string{"map", "--root", repo, "status"}
+			if spelling == "equals" {
+				args = []string{"map", "--root=" + repo, "status"}
+			}
+			stderr, restore := swapStderr(t)
+			code := dispatch(args)
+			restore()
+			if code != 0 {
+				t.Fatalf("exit %d, stderr = %q", code, stderr.String())
+			}
+			if _, err := os.Stat(argvFile); err != nil {
+				t.Fatalf("devmap did not run: %v", err)
+			}
+		})
+	}
+}

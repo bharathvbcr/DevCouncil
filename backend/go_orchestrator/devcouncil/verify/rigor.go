@@ -25,6 +25,7 @@ package verify
 
 import (
 	"context"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -57,6 +58,12 @@ func RigorClient(root string) *dcverify.Client {
 	binary, err := proc.ResolveComponent("dcverify", root, override)
 	if err != nil {
 		if override.Path != "" {
+			// Absolute for the same reason the resolver makes it so: the
+			// path that fails is the one the operator named, wherever the
+			// client runs.
+			if abs, absErr := filepath.Abs(override.Path); absErr == nil {
+				return dcverify.New(abs, root)
+			}
 			return dcverify.New(override.Path, root)
 		}
 		return nil

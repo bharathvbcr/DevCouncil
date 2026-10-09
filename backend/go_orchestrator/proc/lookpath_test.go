@@ -253,3 +253,35 @@ func TestResolveComponentRefusesRelativePATHEntry(t *testing.T) {
 		t.Fatalf("a relative-entry refusal read as not found: %v", err)
 	}
 }
+
+// What was checked is what runs. A relative override is resolved against
+// the working directory once, here, and handed on absolute: a client that
+// runs in the repository root would otherwise execute a different file from
+// the one that was checked.
+func TestResolveComponentOverrideIsMadeAbsolute(t *testing.T) {
+	root, _ := componentFixture(t)
+	cwd := t.TempDir()
+	checked := filepath.Join(cwd, "bin", "tool-under-test")
+	writeExecutable(t, checked)
+	writeExecutable(t, filepath.Join(root, "bin", "tool-under-test"))
+	t.Chdir(cwd)
+
+	got, err := ResolveComponent("tool-under-test", root, Override{Path: "bin/tool-under-test", Source: "TOOL_BIN"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(got) {
+		t.Fatalf("override handed on relative: %q", got)
+	}
+	gotReal, err := filepath.EvalSymlinks(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantReal, err := filepath.EvalSymlinks(checked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotReal != wantReal {
+		t.Fatalf("resolved %q, want the file that was checked, %q", gotReal, wantReal)
+	}
+}

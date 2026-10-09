@@ -429,7 +429,7 @@ func concat(head []string, extra ...string) []string {
 const devmapPassthroughTimeout = 10 * time.Minute
 
 func runDevmap(args []string) int {
-	bin, err := resolveDevmap()
+	bin, err := resolveDevmap(devmapRoot(args))
 	if err != nil {
 		console.Errorln(err)
 		return 1
@@ -463,12 +463,30 @@ func runDevmap(args []string) int {
 	return 0
 }
 
+// devmapRoot is the repository a `dev map` invocation is about: the value of
+// devmap's own --root flag, else "" for the working directory, which is what
+// devmap analyzes without one. Arguments after `--` are not flags.
+func devmapRoot(args []string) string {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			break
+		}
+		if name, val, eq := equalsFlag(a); eq && name == "--root" {
+			return val
+		}
+		if a == "--root" && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
 // resolveDevmap honours DEVMAP_BIN when set: used or refused, never replaced
-// by a PATH lookup. An empty value is unset. The passthrough has no
-// --project-root of its own, so a devmap inside the working directory is the
-// one refused.
-func resolveDevmap() (string, error) {
-	found, err := proc.ResolveComponent("devmap", "", proc.EnvOverride("DEVMAP_BIN"))
+// by a PATH lookup. An empty value is unset. A devmap inside root — the
+// repository the invocation analyzes — is refused.
+func resolveDevmap(root string) (string, error) {
+	found, err := proc.ResolveComponent("devmap", root, proc.EnvOverride("DEVMAP_BIN"))
 	if errors.Is(err, exec.ErrNotFound) {
 		return "", fmt.Errorf("devmap binary not found on PATH or ~/.local/bin; build rust/ and install the `devmap` binary")
 	}

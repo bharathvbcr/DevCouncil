@@ -58,7 +58,10 @@ func EnvOverride(env string) Override {
 //
 //  1. An override is used or refused, never replaced by a search. It may name
 //     a path inside root: setting it is a deliberate act by someone with a
-//     shell, not something repository contents can arrange.
+//     shell, not something repository contents can arrange. It is made
+//     absolute against the working directory before it is checked, and
+//     handed on absolute, so a client that runs in another directory runs
+//     the file that was checked.
 //  2. PATH, through LookPathOutside.
 //  3. ~/.local/bin, where `devcouncil install` puts components, searched only
 //     when PATH has no candidate at all, and held to the same canonical
@@ -71,7 +74,12 @@ func EnvOverride(env string) Override {
 // errors.Is(err, ErrRepositoryLocal) or exec.ErrDot.
 func ResolveComponent(name, root string, override Override) (string, error) {
 	if override.Path != "" {
-		info, err := os.Stat(override.Path)
+		path, err := filepath.Abs(override.Path)
+		if err != nil {
+			return "", fmt.Errorf("%s names %s: %w (an explicit path is used or refused, never replaced)",
+				override.Source, override.Path, err)
+		}
+		info, err := os.Stat(path)
 		if err != nil {
 			return "", fmt.Errorf("%s names %s: %w (an explicit path is used or refused, never replaced)",
 				override.Source, override.Path, err)
@@ -80,7 +88,7 @@ func ResolveComponent(name, root string, override Override) (string, error) {
 			return "", fmt.Errorf("%s names %s, which is a directory (an explicit path is used or refused, never replaced)",
 				override.Source, override.Path)
 		}
-		return override.Path, nil
+		return path, nil
 	}
 	found, err := LookPathOutside(name, root)
 	if err == nil || !errors.Is(err, exec.ErrNotFound) {
