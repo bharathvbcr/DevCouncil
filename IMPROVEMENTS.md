@@ -8,9 +8,10 @@
 > Python package, no `uv` path and no pytest lane: `dev`/`devcouncil` is the Go
 > host (`backend/go_orchestrator`) and the map engine is the Rust workspace
 > (`rust/`). The only `.py` files still tracked are benchmark and repo scripts,
-> parser fixtures under `rust/testdata/`, a demo under `examples/`, and two
-> stdlib-only harness tests for `rust/tools/soak.sh` that CI runs with plain
-> `python3` (`tests/unit/README.md`, `.github/workflows/ci.yml:76-77`). Every
+> parser fixtures under `rust/testdata/`, and a demo under `examples/`; the two
+> stdlib-only harness tests for `rust/tools/soak.sh` that CI ran with plain
+> `python3` were replaced on 2026-10-08 by the Rust soak (`rust/tools/soak`)
+> and its `cargo test` suite, and `tests/unit/` was removed. Every
 > Python module path, `uv`/`pytest`/`dev …` command and Python test named in the
 > entries below is the historical record of what was true on that entry's date,
 > not something to run. Entries are kept as written; corrections are added

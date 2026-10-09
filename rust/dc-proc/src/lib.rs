@@ -453,16 +453,8 @@ fn kill_and_reap(
 /// group cannot be signalled at all the direct child is killed the old way,
 /// because "the group call failed" must never come out as "nothing was killed".
 #[cfg(unix)]
-#[allow(unsafe_code, reason = "one audited libc::kill on a group we lead")]
 fn kill_descendants(child: &mut std::process::Child) {
-    let Ok(leader) = i32::try_from(child.id()) else {
-        let _ = child.kill();
-        return;
-    };
-    // SAFETY: `kill` names a process group led by a child we started and
-    // delivers a signal to it; it reads and writes none of our memory.
-    let signalled = unsafe { libc::kill(-leader, libc::SIGKILL) } == 0;
-    if !signalled {
+    if signal_group(child.id(), Signal::Kill).is_err() {
         let _ = child.kill();
     }
 }
@@ -477,6 +469,81 @@ fn kill_descendants(child: &mut std::process::Child) {
 #[cfg(not(unix))]
 fn kill_descendants(child: &mut std::process::Child) {
     let _ = child.kill();
+}
+
+/// A signal this module will deliver for a caller that owns the target.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signal {
+    /// `SIGTERM`: ask the target to shut down.
+    Terminate,
+    /// `SIGKILL`: end it.
+    Kill,
+    /// Signal 0: deliver nothing, only ask whether the target exists and may
+    /// be signalled. `Ok` means it does; `ESRCH` means it does not.
+    Probe,
+}
+
+/// Deliver `signal` to one process.
+///
+/// For a process the caller started, or one it can name with certainty — a
+/// harness that owns a daemon's process group, not a pid read from a file.
+#[cfg(unix)]
+pub fn signal_process(pid: u32, signal: Signal) -> std::io::Result<()> {
+    let pid =
+        i32::try_from(pid).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    if pid <= 0 {
+        // 0 and negatives name groups, not one process.
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    raw_kill(pid, signal)
+}
+
+/// Deliver `signal` to the process group `leader` leads — every member,
+/// including descendants that outlived the leader.
+///
+/// For a group the caller created, as [`spawn_session`] and
+/// `Command::process_group(0)` do: the leader's pid is the group id, and the
+/// id cannot be reused while any member lives.
+#[cfg(unix)]
+pub fn signal_group(leader: u32, signal: Signal) -> std::io::Result<()> {
+    let leader = i32::try_from(leader)
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    if leader <= 1 {
+        // 0 is the caller's own group and 1 would name init's.
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    raw_kill(-leader, signal)
+}
+
+/// Whether a signal failed because its target no longer exists (`ESRCH`) —
+/// the answer a [`Signal::Probe`] gives for a process or group that is gone.
+#[cfg(unix)]
+pub fn target_is_gone(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ESRCH)
+}
+
+/// The one `kill(2)` in the workspace. Every signal goes through here so the
+/// audited surface stays one call.
+#[cfg(unix)]
+#[allow(
+    unsafe_code,
+    reason = "one audited libc::kill, reached only through signal_process and signal_group"
+)]
+fn raw_kill(target: i32, signal: Signal) -> std::io::Result<()> {
+    let signal = match signal {
+        Signal::Terminate => libc::SIGTERM,
+        Signal::Kill => libc::SIGKILL,
+        Signal::Probe => 0,
+    };
+    // SAFETY: `kill` delivers a signal to the named process or group; it reads
+    // and writes none of our memory. `target` was range-checked by the caller:
+    // a positive pid, or a negated group leader above 1.
+    if unsafe { libc::kill(target, signal) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 struct Drained {
@@ -694,5 +761,57 @@ mod tests {
         let drained = drain(scripted(vec![Ok(b"whole")]), 1 << 20);
         assert_eq!(drained.bytes, b"whole");
         assert!(!drained.truncated);
+    }
+
+    /// The signal API reaches a whole group the caller created, including a
+    /// descendant, and reports the group gone once it is.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_is_probed_terminated_and_then_reported_gone() {
+        use std::os::unix::process::CommandExt;
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30 & wait"])
+            .process_group(0)
+            .spawn()
+            .expect("sh spawns");
+        let leader = child.id();
+        signal_group(leader, Signal::Probe).expect("a live group answers the probe");
+        signal_process(leader, Signal::Probe).expect("its leader answers too");
+        signal_group(leader, Signal::Terminate).expect("the group takes TERM");
+        let _ = child.wait();
+        // The backgrounded sleep was in the group and got TERM as well; give it
+        // a moment to be reaped by init.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while signal_group(leader, Signal::Probe).is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "a TERMed group is still alive after 5 s"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let gone = signal_group(leader, Signal::Probe).unwrap_err();
+        assert!(target_is_gone(&gone), "{gone}");
+    }
+
+    /// 0, 1 and negatives name groups the caller does not own — its own, or
+    /// init's — and are refused before any signal is sent.
+    #[cfg(unix)]
+    #[test]
+    fn signals_refuse_targets_that_name_someone_elses_group() {
+        for pid in [0, 1] {
+            assert_eq!(
+                signal_group(pid, Signal::Probe).unwrap_err().kind(),
+                ErrorKind::InvalidInput,
+                "group {pid}"
+            );
+        }
+        assert_eq!(
+            signal_process(0, Signal::Probe).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            signal_process(u32::MAX, Signal::Probe).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
     }
 }
