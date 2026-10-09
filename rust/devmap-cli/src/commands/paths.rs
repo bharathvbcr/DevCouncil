@@ -62,7 +62,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         "stray_state_warning": stray_state_warning(),
         "plugin_warning": plugin_warning(),
         "plugin_cleanup_note": plugin_cleanup_note(),
-        "stale_server_warning": stale_server_warning(),
+        "stale_server_warning": stale_server_warning(&root),
         "version": env!("CARGO_PKG_VERSION"),
         "build": build_identity_json(),
     });
