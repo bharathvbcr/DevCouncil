@@ -242,6 +242,13 @@ impl<'a> StoreQueryEngine<'a> {
             ranked_over_a_sample,
             devmap_analyze::combine_reasons(coverage_gap, empty_result_gap(total, &req.query)),
         );
+        if total == 0 {
+            if let Some(reason) =
+                self.outside_index_reason(filter.map_or(&[][..], |filter| filter.paths()))?
+            {
+                response.resolution = ResolutionAvailability::Unavailable { reason };
+            }
+        }
         response.scope = scope;
         Ok(self.finish(response))
     }
@@ -1183,6 +1190,34 @@ impl<'a> StoreQueryEngine<'a> {
                     None => coverage_gap,
                 }
             };
+            // An indexed symbol with no edge on this side is a leaf, not a
+            // miss. `neighbors seed_for_repeat` answered its callees
+            // `Unavailable: no indexed traversal start` for a function the
+            // store holds and that calls nothing — "I could not look" where the
+            // honest answer is "I looked: nothing" — while its callers, found
+            // through the containment edge on the other side, answered fine.
+            // The other side of the index is the existence check: a symbol it
+            // names is indexed. A call-blind target is not a leaf — nothing
+            // looked for its calls — so it keeps the refusal below.
+            if call_blind.reason().is_none()
+                && !indexed_traversal_starts(index, target, !reverse, 0.0, &self.cancel)?.is_empty()
+            {
+                let (edges, rungs) = crate::rung::narrow(Vec::new(), min_rung);
+                let mut response = budget_take(edges, req.token_budget, |_| EDGE_TOKENS);
+                response.rungs = Some(rungs);
+                response.walk_incomplete = coverage_gap.clone();
+                let bands = band_budget.map(|budget| {
+                    blast_radius_from_edges(
+                        &[],
+                        &[],
+                        reverse,
+                        req.max_depth.min(MAX_TRAVERSAL_DEPTH),
+                        budget,
+                        coverage_gap.clone(),
+                    )
+                });
+                return Ok((response, bands));
+            }
             let reason = match call_blind.reason() {
                 Some(blind) => format!("{target} has no indexed traversal start: {blind}"),
                 None => format!("{target} has no indexed traversal start"),
@@ -1456,6 +1491,18 @@ impl<'a> StoreQueryEngine<'a> {
             .narrowing
             .as_ref()
             .map(|narrowing| scope_report_from_narrowing(narrowing, snapshot.analysis.as_ref()));
+        // No definition, over a generation with holes in it: the name may be
+        // declared where nothing was indexed. See `outside_index_reason`.
+        if total == 0 {
+            if let Some(reason) =
+                self.outside_index_reason(filter.map_or(&[][..], |filter| filter.paths()))?
+            {
+                return Ok(ExploreReport {
+                    scope,
+                    ..empty(reason)
+                });
+            }
+        }
         let coverage_gap = devmap_analyze::combine_reasons(
             search_coverage_gap(analysis_status_gap(snapshot.analysis.as_ref())),
             ranking_coverage_gap(total, pool),

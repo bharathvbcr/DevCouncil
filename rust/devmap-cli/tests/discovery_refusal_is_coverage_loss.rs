@@ -205,7 +205,16 @@ fn a_refused_file_degrades_the_graph_and_demotes_the_findings_it_could_not_check
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Phase 1: an oversized source is a default ignore, not coverage loss.
+/// An oversized source is not a discovery refusal — but when it is the only
+/// caller of `helper`, it is not silent either.
+///
+/// This test used to assert `degraded_reason: null` for exactly this fixture,
+/// which is the audit's `big` finding (2026-10-09) stated as a requirement:
+/// `helper`'s only caller was never read, and `status` called the graph whole.
+/// The half worth keeping is that the ceiling is not a *refusal*; the half that
+/// was wrong is that a skipped file which can hold calls costs nothing. Vendored
+/// and call-free over-limit files still cost nothing — see
+/// `over_limit_files_are_listed_not_lost.rs`.
 #[test]
 fn an_oversized_source_is_not_a_discovery_refusal() {
     let root = fixture("oversized-ignore");
@@ -214,7 +223,7 @@ fn an_oversized_source_is_not_a_discovery_refusal() {
     let build = json(&root, &["--json", "build", "."]);
     assert_eq!(
         build["discovery_refused_files"], 0,
-        "the 1 MiB ceiling is a default ignore — it must not charge coverage: {build}"
+        "the 1 MiB ceiling is not a refusal: {build}"
     );
     assert_eq!(
         build["files_indexed"], 1,
@@ -223,9 +232,17 @@ fn an_oversized_source_is_not_a_discovery_refusal() {
 
     let status = json(&root, &["--json", "status"]);
     assert_eq!(
-        status["degraded_reason"],
-        serde_json::Value::Null,
-        "oversized fixtures must not leave status permanently partial: {status}"
+        status["coverage_gaps"]["over_limit"]["total"], 1,
+        "the skipped file is listed in its own bucket: {status}"
+    );
+    assert_eq!(
+        status["coverage_gaps"]["discovery_refused"]["total"], 0,
+        "and not as a refusal: {status}"
+    );
+    let degraded = status["degraded_reason"].as_str().unwrap_or("");
+    assert!(
+        degraded.contains("exceeding the source size limit"),
+        "a skipped Python file can hold calls, so the graph says it is partial: {status}"
     );
 
     let _ = std::fs::remove_dir_all(&root);

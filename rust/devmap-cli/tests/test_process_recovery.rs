@@ -60,8 +60,12 @@ fn process_death_restart_replays_durable_pending_work_and_reclaims_the_endpoint(
     let db = root.join(".devcouncil/codeintel/index.sqlite");
     let socket = devmap_serve::default_ipc_path_for(&root);
     let pending = "recover.py".to_string();
-    fs::write(root.join(&pending), vec![b'x'; 1024 * 1024 + 1])
-        .expect("create temporarily oversized source");
+    // A pending row the first daemon must fail on, retryably, so it is still
+    // queued when the process dies. This was an oversized file; an over-limit
+    // path is now settled in one drain (dropped and listed, never retried), so
+    // the failure is bytes that are not UTF-8 — a read the drain refuses and
+    // retries, on every platform, while the file is still there.
+    fs::write(root.join(&pending), [0xff, 0xfe, 0x00, 0x80]).expect("create pending source");
     Store::open(&db)
         .expect("open store")
         .enqueue_pending_paths(std::slice::from_ref(&pending))

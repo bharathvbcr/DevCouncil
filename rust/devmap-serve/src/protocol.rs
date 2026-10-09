@@ -1122,6 +1122,23 @@ pub fn coverage_gaps_json(status: &StoreStatus) -> serde_json::Value {
             })).collect::<Vec<_>>(),
         })
     };
+    let over_limit = {
+        let gap = &status.coverage_gaps.over_limit;
+        json!({
+            "total": gap.total,
+            "shown": gap.shown.len(),
+            "truncated": gap.truncated(),
+            "paths": gap.shown.iter().map(|row| {
+                let sizes = devmap_extract::DiscoverySkipReason::parse_over_limit(&row.reason);
+                json!({
+                    "path": row.path,
+                    "reason": row.reason,
+                    "bytes": sizes.map(|(bytes, _)| bytes),
+                    "limit": sizes.map(|(_, limit)| limit),
+                })
+            }).collect::<Vec<_>>(),
+        })
+    };
     json!({
         "discovery_refused": sample(&status.coverage_gaps.discovery_refused),
         "parse_failed": sample(&status.coverage_gaps.parse_failed),
@@ -1138,6 +1155,30 @@ pub fn coverage_gaps_json(status: &StoreStatus) -> serde_json::Value {
         // path is listed so that absence is a stated decision rather than an
         // empty answer indistinguishable from a file with no dependencies.
         "not_parsed": sample(&status.coverage_gaps.not_parsed),
+        // Read by a grammar, with ERROR/MISSING nodes: the reason names the
+        // byte ranges lost, because error recovery can swallow everything
+        // after the fault and "parsed" alone hid that.
+        "partial_parse": sample(&status.coverage_gaps.partial_parse),
+        // Skipped for size: never retried, never a refusal, and listed with
+        // the two numbers that explain it. A row whose stored wording does
+        // not parse carries `null` for both rather than an invented zero.
+        "over_limit": over_limit,
+    })
+}
+
+/// A source delta as both `status` surfaces render it.
+///
+/// One owner, like [`coverage_gaps_json`]: the CLI and the daemon each spelled
+/// this object out, and a field added to one would have left the other
+/// describing the same tree differently. `over_limit` is apart from `removed`
+/// because a file that grew past the size limit is not a deletion.
+pub fn source_delta_json(delta: &devmap_store::SourceTreeDelta) -> serde_json::Value {
+    json!({
+        "added": delta.added,
+        "changed": delta.changed,
+        "removed": delta.removed,
+        "skipped_over_limit": delta.over_limit,
+        "sample_paths": delta.sample_paths,
     })
 }
 
@@ -1203,12 +1244,7 @@ pub(crate) fn dispatch(
                 "source_freshness": status.source_freshness,
                 "analyzer_freshness": status.analyzer_freshness,
                 "degraded_reason": daemon_degraded_reason(&status, unapplied),
-                "delta": status.source_delta.as_ref().map(|delta| json!({
-                    "added": delta.added,
-                    "changed": delta.changed,
-                    "removed": delta.removed,
-                    "sample_paths": delta.sample_paths,
-                })),
+                "delta": status.source_delta.as_ref().map(source_delta_json),
                 "quarantined_count": status.quarantined_count,
                 // The paths behind the three numbers `degraded_reason` states.
                 // Without them "1 refused by discovery" is a fact an operator

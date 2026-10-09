@@ -354,12 +354,7 @@ pub(crate) fn store_status_fields(
         "analyzer_freshness": status.analyzer_freshness,
         "db_path": status.db_path,
         "degraded_reason": degraded_reason,
-        "delta": status.source_delta.as_ref().map(|delta| serde_json::json!({
-            "added": delta.added,
-            "changed": delta.changed,
-            "removed": delta.removed,
-            "sample_paths": delta.sample_paths,
-        })),
+        "delta": status.source_delta.as_ref().map(devmap_serve::source_delta_json),
         "quarantined_count": status.quarantined_count,
         // K1(g): naming the stuck paths is what makes a degraded status
         // actionable — "64 path(s) exceeded the retry threshold" told an

@@ -9,6 +9,14 @@ pub struct DeadSymbolReport {
     pub exemption_reason: Option<String>,
 }
 
+/// One source file discovery skipped for exceeding the size ceiling.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct OverLimitFile {
+    pub path: String,
+    pub bytes: u64,
+    pub limit: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommunityReport {
     pub community_id: u32,
@@ -102,6 +110,21 @@ pub struct AnalysisSummary {
     /// before this field existed, which is the honest reading of them.
     #[serde(default)]
     pub discovery_refused_files: Option<usize>,
+    /// Source files skipped for exceeding the size ceiling, by path.
+    ///
+    /// Persisted for the reason `discovery_refused_files` is — a skipped file
+    /// has no rows, so nothing derived from the graph can name it — and as a
+    /// list rather than a count because `repo_map.json` is read by agents
+    /// deciding what to trust, and "3 files were not read" without the three
+    /// paths is not something they can act on.
+    ///
+    /// Not part of `discovery_refused_files`: an over-limit file is not a
+    /// refusal (see `DiscoverySkipReason::over_limit`), and only the ones that
+    /// could hold calls cap the dead-code pass.
+    ///
+    /// `None` means not recorded, as for `discovery_refused_files`.
+    #[serde(default)]
+    pub over_limit_files: Option<Vec<OverLimitFile>>,
     /// How much of what the resolver tried to attribute, it attributed —
     /// corpus-wide and per language. See [`crate::resolution_rate`].
     ///

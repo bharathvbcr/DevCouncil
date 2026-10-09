@@ -280,6 +280,13 @@ fn k1_enqueue_under_root_normalizes_dedups_and_refuses_escapes() {
 /// `attempts = 5` on this repository's store: a path under a *previous*
 /// location of the checkout, a directory, a file over `MAX_SOURCE_BYTES` (a
 /// 30 MB vendored `parser.c`), and a file that is not an indexable source.
+///
+/// The over-limit file is the one shape that changed sides. It was stuck
+/// because the drain *failed* on it; the drain now settles it in one attempt —
+/// rows dropped, verdict listed as `over_limit` — so the row is work a drain
+/// can do, and dropping it here would leave that verdict out of the inventory
+/// `status` compares. `over_limit_daemon_agrees_with_build.rs` pins that it
+/// drains without a retry.
 #[test]
 fn k1_reconcile_drops_rows_no_retry_could_ever_process() {
     let dir = tmp_dir("k1-reconcile");
@@ -312,7 +319,10 @@ fn k1_reconcile_drops_rows_no_retry_could_ever_process() {
         .iter()
         .map(|(path, _)| path.as_str())
         .collect();
-    assert!(dropped.contains(&"huge.c"), "oversized: {dropped:?}");
+    assert!(
+        !dropped.contains(&"huge.c"),
+        "an over-limit file is settled by the drain, not dropped: {dropped:?}"
+    );
     assert!(dropped.contains(&"logo.png"), "non-source: {dropped:?}");
     assert!(
         dropped.contains(&"gone.py"),
@@ -326,8 +336,12 @@ fn k1_reconcile_drops_rows_no_retry_could_ever_process() {
     let remaining = store.get_pending_paths().unwrap();
     assert_eq!(
         remaining,
-        vec!["src/a.py".to_string(), "src".to_string()],
-        "both paths remain in durable enqueue order"
+        vec![
+            "src/a.py".to_string(),
+            "src".to_string(),
+            "huge.c".to_string()
+        ],
+        "the processable paths remain in durable enqueue order"
     );
     let _ = fs::remove_dir_all(&dir);
 }

@@ -76,6 +76,7 @@ fn the_refusal_count_is_derived_from_the_inventory_and_never_carried() {
             &with_one,
             GenerationWriteOpts {
                 discovery_refusals: Some(vec![refusal("app.py")]),
+                over_limit: None,
                 ..Default::default()
             },
         )
@@ -113,6 +114,7 @@ fn the_refusal_count_is_derived_from_the_inventory_and_never_carried() {
             &with_none,
             GenerationWriteOpts {
                 discovery_refusals: Some(Vec::new()),
+                over_limit: None,
                 ..Default::default()
             },
         )
@@ -212,6 +214,7 @@ fn status_names_the_paths_behind_every_coverage_number() {
             &analysis,
             GenerationWriteOpts {
                 discovery_refusals: Some(vec![refusal("vendor/parser.c")]),
+                over_limit: None,
                 ..Default::default()
             },
         )

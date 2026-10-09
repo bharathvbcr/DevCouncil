@@ -293,6 +293,7 @@ fn b3_measure_one_file_edit(n: usize) -> B3WriteSet {
                     build_started: None,
                     repo_root: None,
                     discovery_refusals: None,
+                    over_limit: None,
                     verify_every_row: false,
                 },
             )

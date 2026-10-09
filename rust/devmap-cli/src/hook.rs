@@ -857,7 +857,13 @@ const LOSSY_COVERAGE_BUCKETS: &[&str] = &[
     "discovery_refused",
     "import_blind",
     "not_parsed",
+    // Skipped for exceeding the source size limit: nothing in the file was
+    // read, so whatever it declared or called is absent from every answer.
+    "over_limit",
     "parse_failed",
+    // Parsed, with ERROR/MISSING regions whose contents never reached the
+    // graph — declarations included.
+    "partial_parse",
 ];
 
 /// Render `devmap status` output as one clause an agent can act on.

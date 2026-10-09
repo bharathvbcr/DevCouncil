@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
-use devmap_analyze::{analyze_with_discovery, DiscoveryCoverage};
+use devmap_analyze::analyze_with_discovery;
 use devmap_extract::{
     collect_project_manifests, collect_sources_with_report, content_hash, extract_file,
     is_indexable_source, DiscoverySkipReason, MAX_SOURCE_BYTES,
@@ -287,6 +287,15 @@ struct PendingDelta {
     /// reason because `devmap status` names the paths and an operator reading
     /// one has to be able to tell a correct refusal from a broken one.
     refused: std::collections::BTreeMap<String, String>,
+    /// Source files this delta found over `MAX_SOURCE_BYTES`, each with its
+    /// `DiscoverySkipReason::Oversized` wording.
+    ///
+    /// A structural skip, decided once by `candidate_kind`'s size and never
+    /// retried: no retry shrinks a file. The path's rows are also in
+    /// `deleted`, because a cold build of the same tree writes none — the rule
+    /// `devmap build` follows — and the verdict lands in the generation's
+    /// `over_limit` inventory rather than in `refused`, which it is not.
+    over_limit: std::collections::BTreeMap<String, String>,
 }
 
 /// Default bounded lifetime for an idle daemon, in seconds.
@@ -545,6 +554,18 @@ impl Daemon {
                 pending.insert(path.clone());
             }
         }
+        // An over-limit file whose verdict the stored generation does not
+        // already hold — new at that size, or grown since — is queued once, so
+        // the drain records it. The drain applies the same rule this sweep
+        // states below and settles it in one attempt; without the queue entry
+        // `status` would compare a tree listing the file against a generation
+        // that does not, and read stale for as long as the daemon ran.
+        let stored_over_limit = self.store.latest_discovery_inventory()?.over_limit;
+        for row in devmap_store::over_limit_inventory(&discovery) {
+            if !stored_over_limit.contains(&row) {
+                pending.insert(row.path);
+            }
+        }
         for (path, reason) in discovery.skipped_paths {
             match reason {
                 DiscoverySkipReason::NonSource => {}
@@ -563,22 +584,25 @@ impl Daemon {
                          the repository root, so it is absent from the graph and is NOT queued"
                     );
                 }
-                DiscoverySkipReason::Oversized { .. } | DiscoverySkipReason::Unreadable { .. } => {
-                    // K1(c): reported as a refusal, not queued as work.
-                    //
-                    // Queuing these was self-defeating: the drain applies the
-                    // *same* size and readability limits, so an oversized file
-                    // enqueued here was guaranteed to fail every attempt until
-                    // it quarantined, and then to sit in the queue forever
-                    // holding `is_fresh` at false. The 30 MB vendored
-                    // `parser.c` measured on this repository is exactly that —
-                    // it is over `MAX_SOURCE_BYTES` and no retry will shrink
-                    // it. A refusal is a fact about coverage, and the build
-                    // path already prints it; it is not pending work.
-                    //
-                    // A file that later becomes readable or shrinks is picked
-                    // up by the watcher event that changes it, or by the next
-                    // connect-time sweep.
+                DiscoverySkipReason::Oversized { .. } => {
+                    // Never queued as *retryable* work: no retry shrinks a
+                    // file. K1(c) found the 30 MB vendored `parser.c` queued
+                    // here failing every attempt until it quarantined and held
+                    // `is_fresh` at false. The drain now settles an over-limit
+                    // path structurally — rows dropped, verdict listed — so the
+                    // one queue entry above, for a verdict the generation does
+                    // not yet hold, costs one drain and is never retried.
+                    info!(
+                        "connect-time sweep: {path:?} is over the source size limit ({reason}); \
+                         it is absent from the graph and listed as over_limit"
+                    );
+                }
+                DiscoverySkipReason::Unreadable { .. } => {
+                    // K1(c): reported as a refusal, not queued as work. The
+                    // drain applies the same readability check, so a path
+                    // enqueued here fails every attempt until it quarantines.
+                    // A file that later becomes readable is picked up by the
+                    // watcher event that changes it, or by the next sweep.
                     warn!(
                         "connect-time sweep refused {path:?} ({reason:?}); it is absent from \
                          the graph and is NOT queued — no retry can change the outcome"
@@ -691,6 +715,29 @@ impl Daemon {
                 delta.affected.insert(relative);
                 return Ok(delta);
             }
+            // Over the size limit: a structural skip, by the same rule the
+            // connect-time sweep and the cold walk apply. This used to fall
+            // through to `read_stable_source`, which bailed with an ordinary
+            // retryable error — so one regenerated 1.7 MB client was retried
+            // at 1, 2, 4, 8 and 16 seconds, quarantined, and held `is_fresh`
+            // at false until somebody ran `devmap repair --pending`, while the
+            // CLI build of the same tree dropped the rows and called itself
+            // fresh. Both now drop the rows and list the file.
+            devmap_extract::CandidateKind::File { bytes } if bytes > MAX_SOURCE_BYTES => {
+                let relative = stored_path(root, &candidate)?;
+                let reason = DiscoverySkipReason::Oversized {
+                    bytes,
+                    limit: MAX_SOURCE_BYTES,
+                };
+                info!(
+                    "changed source {relative:?} is skipped: {reason}; removing its rows, as a \
+                     full build of this tree would, and listing it as over the limit"
+                );
+                delta.affected.insert(relative.clone());
+                delta.deleted.insert(relative.clone());
+                delta.over_limit.insert(relative, reason.to_string());
+                return Ok(delta);
+            }
             devmap_extract::CandidateKind::File { .. }
             | devmap_extract::CandidateKind::Directory
             | devmap_extract::CandidateKind::Other
@@ -742,6 +789,14 @@ impl Daemon {
                 discovery
                     .refusals()
                     .map(|(path, reason)| (at_root(path), reason.to_string())),
+            );
+            // Over-limit files under the directory are neither sources nor
+            // refusals: the loop below drops any rows they had, exactly as the
+            // single-file branch does, and they are listed here.
+            delta.over_limit.extend(
+                devmap_store::over_limit_inventory(&discovery)
+                    .into_iter()
+                    .map(|row| (at_root(&row.path), row.reason)),
             );
             // Only the refusals that are about *this attempt* keep their rows.
             // A containment refusal says the path is not the repository's, and
@@ -975,6 +1030,9 @@ impl Daemon {
         // map, so a file named by several events in one batch is one refusal.
         let mut refused: std::collections::BTreeMap<String, String> =
             std::collections::BTreeMap::new();
+        // And the ones it found over the size limit — a separate inventory.
+        let mut over_limit: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
         // Keyed by path, because two queue entries can cover one file: a
         // directory and a file inside it arrive together in a single watcher
         // batch, and a whole-tree rescan sits beside whatever per-path events
@@ -1035,6 +1093,7 @@ impl Daemon {
                     affected.extend(delta.affected);
                     deleted.extend(delta.deleted);
                     refused.extend(delta.refused);
+                    over_limit.extend(delta.over_limit);
                     for extraction in delta.fresh {
                         fresh.insert(extraction.file_path.clone(), extraction);
                     }
@@ -1104,10 +1163,10 @@ impl Daemon {
         // that inventory is tested in, and the resolver below indexes the same
         // walk. Fatal, as `devmap build` already treats it — this used to warn
         // and resolve without the tree's module mappings, writing every import
-        // they carry as `External` and recording nothing about why. Unlike
-        // discovery, which charges an unreadable `CACHEDIR.TAG` as a refusal
-        // and carries on, the manifest pass fails on one, so such a tree now
-        // fails the drain where it used to drain without its mappings.
+        // they carry as `External` and recording nothing about why. Only a
+        // failure about the pass as a whole is fatal; an unreadable
+        // `CACHEDIR.TAG` is charged as a refusal of its directory, as discovery
+        // charges it, so it costs the inventory a row and not the drain.
         let manifests = collect_project_manifests(&self.root)?;
         // A moved HEAD used to force a full re-extraction because carry-forward
         // would mix two checkouts. That is required when the tree actually
@@ -1131,7 +1190,7 @@ impl Daemon {
         // re-extraction, and a refusal this batch met vanished into a larger
         // carried number instead of raising it. A count cannot be maintained,
         // only replaced; a set of paths can.
-        let (mut extractions, full_rebuild, refusals) = if payload_is_current && !head_moved {
+        let (mut extractions, full_rebuild, inventory) = if payload_is_current && !head_moved {
             let mut carried: Vec<_> = previous
                 .into_iter()
                 .filter(|extraction| !affected.contains(&extraction.file_path))
@@ -1146,9 +1205,9 @@ impl Daemon {
             // dropped and this batch's answer stands in its place — which is
             // how a repaired file leaves the inventory on the very drain that
             // reads it.
-            let mut inventory: std::collections::BTreeMap<String, String> = self
-                .store
-                .latest_discovery_refusals()?
+            let stored = self.store.latest_discovery_inventory()?;
+            let mut inventory: std::collections::BTreeMap<String, String> = stored
+                .refusals
                 .into_iter()
                 .filter(|refusal| !affected.contains(&refusal.path))
                 // A manifest only the manifest pass reads is re-decided by
@@ -1159,15 +1218,32 @@ impl Daemon {
                 .collect();
             inventory.extend(refused.clone());
             devmap_store::add_manifest_refusals(&mut inventory, &manifests);
-            (carried, false, inventory)
+            // The over-limit half by the same rule: carried minus every path
+            // this batch re-decided, plus what it found over the limit — so a
+            // file that shrank back leaves the list on the drain that reads it.
+            let mut carried_over_limit: std::collections::BTreeMap<String, String> = stored
+                .over_limit
+                .into_iter()
+                .filter(|row| !affected.contains(&row.path))
+                .map(|row| (row.path, row.reason))
+                .collect();
+            carried_over_limit.extend(over_limit.clone());
+            let row = |(path, reason)| devmap_store::DiscoveryRefusal { path, reason };
+            (
+                carried,
+                false,
+                devmap_store::DiscoveryInventory {
+                    refusals: inventory.into_iter().map(row).collect(),
+                    over_limit: carried_over_limit.into_iter().map(row).collect(),
+                },
+            )
         } else {
             let scanned = if payload_is_current && head_moved {
                 let scanned = devmap_extract::scan_tree(&self.root)?;
                 let hashes = self.store.latest_file_hashes()?;
-                let stored_refusals = self.store.latest_discovery_refusals()?;
+                let stored = self.store.latest_discovery_inventory()?;
                 if scanned.matches_file_hashes(&hashes)
-                    && devmap_store::refusal_inventory(&scanned.report, &manifests)
-                        == stored_refusals
+                    && devmap_store::DiscoveryInventory::of(&scanned.report, &manifests) == stored
                 {
                     self.store.restamp_latest_head(&head.sha)?;
                     self.store.clear_claimed_pending_paths(&succeeded)?;
@@ -1194,16 +1270,9 @@ impl Daemon {
             (
                 whole_tree,
                 true,
-                devmap_store::refusal_inventory(&report, &manifests)
-                    .into_iter()
-                    .map(|refusal| (refusal.path, refusal.reason))
-                    .collect(),
+                devmap_store::DiscoveryInventory::of(&report, &manifests),
             )
         };
-        let refusals: Vec<devmap_store::DiscoveryRefusal> = refusals
-            .into_iter()
-            .map(|(path, reason)| devmap_store::DiscoveryRefusal { path, reason })
-            .collect();
         // Prefer the CLI's identical-tree restamp before resolve/analyze: a
         // batch whose bytes still match the latest generation (touch,
         // rewrite-same-content, empty HEAD move already handled above) must not
@@ -1217,14 +1286,14 @@ impl Daemon {
                 .collect();
             let stored_hashes = self.store.latest_file_hashes()?;
             if batch_hashes == stored_hashes
-                && refusals == self.store.latest_discovery_refusals()?
+                && inventory == self.store.latest_discovery_inventory()?
             {
                 self.store.restamp_latest_head(&head.sha)?;
                 self.store.clear_claimed_pending_paths(&succeeded)?;
                 return Ok(succeeded.len());
             }
         }
-        let discovery = DiscoveryCoverage::refused(refusals.len());
+        let discovery = inventory.coverage();
         extractions.sort_by(|left, right| left.file_path.cmp(&right.file_path));
         let mut resolver = Resolver::new();
         resolver.index_project_manifests(&manifests);
@@ -1266,7 +1335,8 @@ impl Daemon {
                 // Always `Some` on this path: both branches above produced a
                 // complete inventory for the tree, so the drain has measured
                 // discovery even when it did not re-walk it.
-                discovery_refusals: Some(refusals),
+                discovery_refusals: Some(inventory.refusals),
+                over_limit: Some(inventory.over_limit),
                 // The daemon is the most frequent writer there is, and the
                 // scoping exists for exactly its shape: an edit batch that
                 // changes a handful of files. A full rebuild takes the
@@ -2584,11 +2654,10 @@ mod tests {
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("devmap-batch-isolation-{stamp}"));
         fs::create_dir_all(&dir).unwrap();
-        fs::write(
-            dir.join("a_poison.py"),
-            vec![b'x'; (MAX_SOURCE_BYTES + 1) as usize],
-        )
-        .unwrap();
+        // Poisoned by bytes that are not UTF-8: a read the drain refuses and
+        // retries. This was an oversized file, which is now a structural skip
+        // settled in one drain rather than a failure, so it poisons nothing.
+        fs::write(dir.join("a_poison.py"), [0xff, 0xfe, 0x00, 0x80]).unwrap();
         fs::write(dir.join("b_good.py"), "def healthy():\n    return 1\n").unwrap();
 
         let store = Store::open(dir.join("index.sqlite")).unwrap();

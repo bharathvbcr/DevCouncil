@@ -1002,10 +1002,14 @@ impl Store {
             if !full_rewrite {
                 let mut stmt = tx.prepare(
                     "SELECT gap, path, reason FROM generation_coverage_gaps
-                     WHERE generation_id = ?1 AND gap != ?2",
+                     WHERE generation_id = ?1 AND gap NOT IN (?2, ?3)",
                 )?;
                 let rows = stmt.query_map(
-                    params![prev, crate::coverage::GAP_DISCOVERY_REFUSED],
+                    params![
+                        prev,
+                        crate::coverage::GAP_DISCOVERY_REFUSED,
+                        crate::coverage::GAP_OVER_LIMIT
+                    ],
                     |row| {
                         Ok((
                             row.get::<_, String>(0)?,
@@ -1071,6 +1075,34 @@ impl Store {
         // inventory cannot name is a graph degraded for a file nobody can look
         // at, and a summary claiming none while rows exist is the over-claim
         // this whole inventory exists to end.
+        // Over-limit rows, whole, with the same two-halves guard. Compared by
+        // path set and with "not measured" read as empty: a writer that did not
+        // walk the tree passes neither, and one that did passes both.
+        let over_limit_paths: std::collections::BTreeSet<&str> = opts
+            .over_limit
+            .iter()
+            .flatten()
+            .map(|row| row.path.as_str())
+            .collect();
+        let analysed_over_limit: std::collections::BTreeSet<&str> = analysis
+            .over_limit_files
+            .iter()
+            .flatten()
+            .map(|file| file.path.as_str())
+            .collect();
+        if over_limit_paths != analysed_over_limit {
+            return Err(refusal(format!(
+                "generation would store over-limit rows for {over_limit_paths:?} but its \
+                 analysis records {analysed_over_limit:?}; the two must be one measurement"
+            )));
+        }
+        for row in opts.over_limit.iter().flatten() {
+            gap_rows.push((
+                crate::coverage::GAP_OVER_LIMIT.to_string(),
+                row.path.clone(),
+                row.reason.clone(),
+            ));
+        }
         if measured_refusals != analysis.discovery_refused_files {
             return Err(refusal(format!(
                 "generation would store {measured_refusals:?} discovery refusal(s) but its \
