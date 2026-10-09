@@ -1,5 +1,12 @@
 package components
 
+// scripts/install.sh is a bootstrap: it builds the host and hands its
+// arguments to `devcouncil install`. What it decides on its own — that Go is
+// required, that --uninstall picks the verb, that the checkout is named, that
+// the host's exit status is its own — is tested here against a stand-in `go`.
+// What the installer does with the arguments is tested where it is decided:
+// install_test.go, build_test.go and cmd/devcouncil/install_test.go.
+
 import (
 	"os"
 	"os/exec"
@@ -27,181 +34,130 @@ func repoRoot(t *testing.T) string {
 	}
 }
 
-func TestInstallScriptsHelp(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("posix scripts")
-	}
-	root := repoRoot(t)
-	for _, name := range []string{"install.sh", "install-components.sh"} {
-		path := filepath.Join(root, "scripts", name)
-		out, err := exec.Command("bash", path, "--help").CombinedOutput()
-		if err != nil {
-			t.Fatalf("%s --help: %v\n%s", name, err, out)
-		}
-		text := string(out)
-		if !strings.Contains(text, "Usage") && !strings.Contains(text, "usage") {
-			t.Fatalf("%s --help missing usage:\n%s", name, text)
-		}
-		if name == "install.sh" && !strings.Contains(text, "--only") {
-			t.Fatalf("install.sh --help must document --only:\n%s", text)
-		}
-		if name == "install-components.sh" && !strings.Contains(text, "devmap") {
-			t.Fatalf("install-components.sh --help must name devmap:\n%s", text)
-		}
-	}
+// fakeGo is a `go` whose `build -o OUT` writes a host that prints
+// DEVCOUNCIL_ROOT and then each argument on its own line, and exits with
+// $FAKE_HOST_EXIT. It records its own arguments in $FAKE_GO_LOG.
+const fakeGo = `#!/bin/sh
+printf '%s\n' "$@" > "$FAKE_GO_LOG"
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = -o ]; then out="$2"; fi
+  shift
+done
+[ -n "$out" ] || exit 9
+cat > "$out" <<'HOST'
+#!/bin/sh
+printf 'root=%s\n' "$DEVCOUNCIL_ROOT"
+printf '%s\n' "$@"
+exit "${FAKE_HOST_EXIT:-0}"
+HOST
+chmod +x "$out"
+`
+
+type bootstrapRun struct {
+	code   int
+	out    string
+	goArgs []string
 }
 
-func TestInstallShUnknownComponent(t *testing.T) {
+func runBootstrap(t *testing.T, env []string, args ...string) bootstrapRun {
+	t.Helper()
 	if runtime.GOOS == "windows" {
-		t.Skip("posix scripts")
+		t.Skip("posix bootstrap")
 	}
 	root := repoRoot(t)
-	cmd := exec.Command("bash", filepath.Join(root, "scripts", "install.sh"), "uv")
-	out, err := cmd.CombinedOutput()
-	if err == nil {
-		t.Fatalf("uv should be unknown:\n%s", out)
-	}
-	if !strings.Contains(string(out), "unknown") {
-		t.Fatalf("stderr=%s", out)
-	}
-}
-
-func TestInstallShUninstallRequiresName(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("posix scripts")
-	}
-	root := repoRoot(t)
-	prefix := t.TempDir()
-	cmd := exec.Command("bash", filepath.Join(root, "scripts", "install.sh"), "--uninstall", "--yes")
-	cmd.Env = append(os.Environ(), "PREFIX="+prefix)
-	out, err := cmd.CombinedOutput()
-	if err == nil {
-		t.Fatalf("uninstall with no names should refuse:\n%s", out)
-	}
-}
-
-func TestInstallShUninstallAllDryRunNamesRustBinaries(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("posix scripts")
-	}
-	root := repoRoot(t)
-	prefix := t.TempDir()
-	cmd := exec.Command("bash", filepath.Join(root, "scripts", "install.sh"), "--uninstall", "--all", "--dry-run", "--yes")
-	cmd.Env = append(os.Environ(), "PREFIX="+prefix)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("%v\n%s", err, out)
-	}
-	text := string(out)
-	for _, name := range []string{"devcouncil", "devmap", "dcstore", "dcverify", "dcgrep"} {
-		if !strings.Contains(text, name) {
-			t.Fatalf("--all dry-run missing %s:\n%s", name, text)
-		}
-	}
-}
-
-func TestInstallShUninstallMixesAllWithNames(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("posix scripts")
-	}
-	root := repoRoot(t)
-	cmd := exec.Command("bash", filepath.Join(root, "scripts", "install.sh"), "--uninstall", "--all", "dcgrep", "--yes")
-	out, err := cmd.CombinedOutput()
-	if err == nil {
-		t.Fatalf("mix should refuse:\n%s", out)
-	}
-}
-
-func TestInstallComponentsUninstallRequiresName(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("posix scripts")
-	}
-	root := repoRoot(t)
-	prefix := t.TempDir()
-	cmd := exec.Command("bash", filepath.Join(root, "scripts", "install-components.sh"), "--uninstall", "--yes")
-	cmd.Env = append(os.Environ(), "PREFIX="+prefix)
-	out, err := cmd.CombinedOutput()
-	if err == nil {
-		t.Fatalf("empty uninstall should refuse:\n%s", out)
-	}
-}
-
-func TestInstallShUninstallDryRunDoesNotDelete(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("posix scripts")
-	}
-	root := repoRoot(t)
-	prefix := t.TempDir()
-	bindir := filepath.Join(prefix, "bin")
-	if err := os.MkdirAll(bindir, 0o755); err != nil {
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "go"), []byte(fakeGo), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	planted := filepath.Join(bindir, "devmap")
-	if err := os.WriteFile(planted, []byte("keep"), 0o755); err != nil {
+	log := filepath.Join(t.TempDir(), "go.args")
+	cmd := exec.Command("sh", append([]string{filepath.Join(root, "scripts", "install.sh")}, args...)...)
+	cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"), "FAKE_GO_LOG="+log)
+	cmd.Env = append(cmd.Env, env...)
+	out, err := cmd.CombinedOutput()
+	code := 0
+	if exit, ok := err.(*exec.ExitError); ok {
+		code = exit.ExitCode()
+	} else if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command("bash", filepath.Join(root, "scripts", "install.sh"), "--uninstall", "devmap", "--dry-run", "--yes")
-	cmd.Env = append(os.Environ(), "PREFIX="+prefix)
+	logged, _ := os.ReadFile(log)
+	return bootstrapRun{code: code, out: string(out), goArgs: strings.Fields(string(logged))}
+}
+
+func TestBootstrapBuildsTheHostFromThisCheckoutAndHandsItEveryArgument(t *testing.T) {
+	root := repoRoot(t)
+	r := runBootstrap(t, nil, "--only=devmap", "--prefix", "/x y", "--dry-run")
+	if r.code != 0 {
+		t.Fatalf("exit %d:\n%s", r.code, r.out)
+	}
+	want := "root=" + root + "\ninstall\n--only=devmap\n--prefix\n/x y\n--dry-run\n"
+	if r.out != want {
+		t.Fatalf("host saw:\n%s\nwant:\n%s", r.out, want)
+	}
+	gotGo := strings.Join(r.goArgs, " ")
+	if !strings.HasPrefix(gotGo, "-C "+filepath.Join(root, "backend", "go_orchestrator")+" build -o ") ||
+		!strings.HasSuffix(gotGo, " ./cmd/devcouncil") {
+		t.Fatalf("go %s", gotGo)
+	}
+}
+
+func TestBootstrapUninstallPicksTheVerbWhereverItAppears(t *testing.T) {
+	for _, args := range [][]string{
+		{"--uninstall", "dcgrep", "--yes"},
+		{"dcgrep", "--uninstall", "--yes"},
+	} {
+		r := runBootstrap(t, nil, args...)
+		if r.code != 0 || !strings.HasSuffix(r.out, "\nuninstall\ndcgrep\n--yes\n") {
+			t.Fatalf("%v: exit %d, host saw:\n%s", args, r.code, r.out)
+		}
+	}
+}
+
+func TestBootstrapPassesHelpThroughToTheOneHelpText(t *testing.T) {
+	r := runBootstrap(t, nil, "--help")
+	if r.code != 0 || !strings.HasSuffix(r.out, "\ninstall\n--help\n") {
+		t.Fatalf("exit %d, host saw:\n%s", r.code, r.out)
+	}
+}
+
+func TestBootstrapExitsWithTheHostsStatus(t *testing.T) {
+	r := runBootstrap(t, []string{"FAKE_HOST_EXIT=3"}, "uv")
+	if r.code != 3 {
+		t.Fatalf("exit %d, want the host's 3:\n%s", r.code, r.out)
+	}
+}
+
+func TestBootstrapWithoutGoSaysSoAndNamesTheCargoRoute(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("posix bootstrap")
+	}
+	root := repoRoot(t)
+	// An empty PATH: `command -v go` is a shell builtin and must fail before
+	// the script needs any external tool.
+	cmd := exec.Command("/bin/sh", filepath.Join(root, "scripts", "install.sh"), "devmap")
+	cmd.Env = []string{"PATH=" + t.TempDir()}
 	out, err := cmd.CombinedOutput()
+	exit, ok := err.(*exec.ExitError)
+	if !ok || exit.ExitCode() != 1 {
+		t.Fatalf("err = %v:\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "go is required") || !strings.Contains(string(out), "cargo install --git") {
+		t.Fatalf("output:\n%s", out)
+	}
+}
+
+func TestBootstrapLeavesNoTemporaryHostBehind(t *testing.T) {
+	tmp := t.TempDir()
+	r := runBootstrap(t, []string{"TMPDIR=" + tmp}, "host")
+	if r.code != 0 {
+		t.Fatalf("exit %d:\n%s", r.code, r.out)
+	}
+	entries, err := os.ReadDir(tmp)
 	if err != nil {
-		t.Fatalf("%v\n%s", err, out)
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(planted); err != nil {
-		t.Fatalf("dry-run deleted %s: %v", planted, err)
-	}
-}
-
-func TestInstallComponentsDisableValidatesName(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("posix scripts")
-	}
-	root := repoRoot(t)
-	prefix := t.TempDir()
-	script := filepath.Join(root, "scripts", "install-components.sh")
-	cmd := exec.Command("bash", script, "--disable", "uv")
-	cmd.Env = append(os.Environ(), "PREFIX="+prefix)
-	out, err := cmd.CombinedOutput()
-	if err == nil {
-		t.Fatalf("disable uv should fail:\n%s", out)
-	}
-
-	cmd = exec.Command("bash", script, "--disable")
-	cmd.Env = append(os.Environ(), "PREFIX="+prefix)
-	out, err = cmd.CombinedOutput()
-	if err == nil {
-		t.Fatalf("disable without a name should fail:\n%s", out)
-	}
-}
-
-func TestInstallShDryRunDoesNotClaimInstalled(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("posix scripts")
-	}
-	root := repoRoot(t)
-	prefix := t.TempDir()
-	cmd := exec.Command("bash", filepath.Join(root, "scripts", "install.sh"), "--all", "--dry-run")
-	cmd.Env = append(os.Environ(), "PREFIX="+prefix)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("%v\n%s", err, out)
-	}
-	text := string(out)
-	if strings.Contains(text, "installed "+prefix) {
-		t.Fatalf("dry-run claimed an install:\n%s", text)
-	}
-	if _, err := os.Stat(filepath.Join(prefix, "bin", "devcouncil")); err == nil {
-		t.Fatal("dry-run wrote the host binary")
-	}
-}
-
-func TestInstallShPrefixRequiresDirectory(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("posix scripts")
-	}
-	root := repoRoot(t)
-	cmd := exec.Command("bash", filepath.Join(root, "scripts", "install.sh"), "--prefix")
-	out, err := cmd.CombinedOutput()
-	if err == nil {
-		t.Fatalf("--prefix without a directory should fail:\n%s", out)
+	if len(entries) != 0 {
+		t.Fatalf("bootstrap left %v in TMPDIR", entries)
 	}
 }

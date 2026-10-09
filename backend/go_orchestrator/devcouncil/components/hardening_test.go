@@ -185,8 +185,8 @@ func TestRemoteCargoHonorsPrefixRoot(t *testing.T) {
 	if !strings.Contains(joined, prefix) {
 		t.Fatalf("remote cargo missing prefix %q:\n%s", prefix, joined)
 	}
-	if strings.Contains(joined, "install-components.sh") {
-		t.Fatalf("bogus SourceRoot still planned a checkout script:\n%s", joined)
+	if strings.Contains(joined, "cargo build") {
+		t.Fatalf("bogus SourceRoot still planned a checkout build:\n%s", joined)
 	}
 }
 
@@ -220,7 +220,7 @@ func TestInstallSavesHostReceiptIfRustFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := &failingRunner{failSubstr: "install-components.sh"}
+	r := &failingRunner{failSubstr: "cargo build"}
 	prefix := t.TempDir()
 	err = Install(cs, Options{Prefix: prefix, Runner: r, SourceRoot: src})
 	if err == nil {

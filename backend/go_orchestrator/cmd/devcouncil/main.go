@@ -139,9 +139,10 @@ Usage:
 Presentation: --progress auto|always|never (default: auto). JSON stays on stdout.
 NO_COLOR removes color; TERM=dumb and non-UTF-8 locales use simpler output.
 
-First-time / standalone (no host yet):
-  bash scripts/install.sh --only=devmap
-  bash scripts/install.sh --help
+First-time (no host yet): bash scripts/install.sh [install args…] builds this
+host into a temporary directory and runs ` + "`devcouncil install`" + ` with the same
+arguments. Standalone devmap without Go:
+  cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked devmap-cli
 
 Hosts: the ones ` + "`devmap integrate --help`" + ` lists; DevMap owns the host table.
 `)

@@ -93,7 +93,22 @@ func parseInstallArgs(args []string) (list, jsonOut, dry bool, prefix string, na
 				return false, false, false, "", nil, false, fmt.Errorf("--prefix needs a directory")
 			}
 			prefix = args[i]
+		case "--only":
+			// The bootstrap scripts' spelling of a positional name.
+			i++
+			if i >= len(args) || args[i] == "" {
+				return false, false, false, "", nil, false, fmt.Errorf("--only needs a component name")
+			}
+			names = append(names, args[i])
 		default:
+			if strings.HasPrefix(args[i], "--only=") {
+				only := strings.TrimPrefix(args[i], "--only=")
+				if only == "" {
+					return false, false, false, "", nil, false, fmt.Errorf("--only needs a component name")
+				}
+				names = append(names, only)
+				continue
+			}
 			if strings.HasPrefix(args[i], "--prefix=") {
 				prefix = strings.TrimPrefix(args[i], "--prefix=")
 				if prefix == "" {

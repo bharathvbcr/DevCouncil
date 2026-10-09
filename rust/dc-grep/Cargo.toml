@@ -63,7 +63,7 @@ unicode-properties = "0.1"
 [lints]
 workspace = true
 
-# Installed by scripts/install.sh. Disting this package would compile
+# Installed by `devcouncil install`. Disting this package would compile
 # tgrep-core for every cargo-dist target, including Windows MSVC, and a
 # grammar/C failure there would drop the whole GitHub Release.
 [package.metadata.dist]

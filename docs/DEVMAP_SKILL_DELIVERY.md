@@ -7,7 +7,7 @@ it does not by itself install these workflow files in every agent host.
 ## Install and verify
 
 Use the existing DevCouncil CLI from an environment containing this version.
-From a source checkout, install the Go binary (`bash scripts/install.sh`) and
+From a source checkout, install the Go binary (`bash scripts/install.sh host`) and
 run from the DevCouncil repository root. The target repository must already exist.
 
 ```bash

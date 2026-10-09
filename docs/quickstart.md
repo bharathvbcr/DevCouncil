@@ -38,7 +38,12 @@ export PATH="$HOME/.local/bin:$PATH"
 devmap --version
 ```
 
-Use `bash scripts/install.sh --help` for subsets, prefix selection and dry runs.
+The scripts are bootstraps: each builds the Go host into a temporary directory
+and runs `devcouncil install` with the same arguments, so
+`bash scripts/install.sh --help` prints that command's presets, prefix
+selection and `--dry-run`. Once the host is on PATH, run `devcouncil install`
+directly. Without Go, install DevMap alone with
+`cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked devmap-cli`.
 The scripts build source. `npm install -g devcouncil` installs a lightweight
 launcher that resolves native executables; it does **not** replace this build or
 bundle the Rust suite. There is no current Python/uv install path.

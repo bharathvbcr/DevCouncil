@@ -159,10 +159,14 @@ devmap status --json
 devmap explore MyFunction --json
 ```
 
-Git and Rust/Cargo are required. To include the Go host and full analysis suite,
-run `bash scripts/install.sh`; the host needs the toolchain declared in
-[`go.mod`](backend/go_orchestrator/go.mod), currently Go 1.26.6. On Windows use
-`.\scripts\install.ps1 -Components devmap`, or omit `-Components` for the suite.
+Git, Rust/Cargo and Go are required: `scripts/install.sh` builds the Go host
+into a temporary directory and runs `devcouncil install` with your arguments,
+and that command is the installer (`--help` lists presets and flags). Omit
+`--only=devmap` for the Go host and full analysis suite. The host needs the
+toolchain declared in [`go.mod`](backend/go_orchestrator/go.mod), currently Go
+1.26.6. Without Go, `cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked devmap-cli`
+installs DevMap alone. On Windows use `.\scripts\install.ps1 -Components devmap`,
+or omit `-Components` for the suite.
 The npm package is a lightweight launcher for native binaries, not a bundled
 runtime. [Complete installation guide](docs/quickstart.md).
 
