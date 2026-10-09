@@ -1115,6 +1115,20 @@ fn every_sql_statement_the_gate_scripts_embed_parses_against_the_current_schema(
         "the extractor found {} of {openers} embedded statements, so it is dropping some",
         found.len()
     );
+    // Discovered is not the same as covered: each file known to carry SQL must
+    // contribute a statement, or a literal the extractor cannot see (lower
+    // case, a leading newline) would drop out while the file stayed listed.
+    for required in [
+        "verify.sh",
+        "tools/memory_model_probe.sh",
+        "tools/soak/src/store.rs",
+    ] {
+        assert!(
+            found.iter().any(|(name, _)| name == required),
+            "{required} contributed no embedded SQL statement; if its queries moved, \
+             follow them, and if they changed form, teach the extractor"
+        );
+    }
     // The specific coupling that broke, pinned so a future change that stops
     // reading the ledger from a gate script has to say so here.
     assert!(

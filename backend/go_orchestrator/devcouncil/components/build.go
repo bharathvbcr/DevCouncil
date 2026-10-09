@@ -128,12 +128,24 @@ func installRustFromCheckout(src, prefix string, ids []string, o Options) ([]str
 		}
 	}
 	builtDir := filepath.Join(cargoTargetDir(workspace), profile)
+	// Check a private copy and install that copy. The target directory is
+	// shared: a second cargo build landing between a check of target/ and a
+	// copy out of it would install bytes nobody checked.
+	stage, err := os.MkdirTemp("", "devcouncil-stage-")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(stage)
 	for _, c := range cs {
 		built := filepath.Join(builtDir, rustBinaryName(c.Binary))
 		if _, err := os.Stat(built); err != nil {
 			return nil, fmt.Errorf("expected %s to exist after the build: %w", built, err)
 		}
-		if err := healthCheck(c.ID, built, o.prober()); err != nil {
+		staged := filepath.Join(stage, rustBinaryName(c.Binary))
+		if err := installAtomic(built, staged); err != nil {
+			return nil, fmt.Errorf("stage %s: %w", c.ID, err)
+		}
+		if err := healthCheck(c.ID, staged, o.prober()); err != nil {
 			return nil, err
 		}
 		console.Errorf("  %s: healthy\n", c.ID)
@@ -142,7 +154,7 @@ func installRustFromCheckout(src, prefix string, ids []string, o Options) ([]str
 	installed := make([]string, 0, len(cs))
 	for _, c := range cs {
 		dest := filepath.Join(bindir, rustBinaryName(c.Binary))
-		if err := installAtomic(filepath.Join(builtDir, rustBinaryName(c.Binary)), dest); err != nil {
+		if err := installAtomic(filepath.Join(stage, rustBinaryName(c.Binary)), dest); err != nil {
 			return installed, fmt.Errorf("install %s: %w", c.ID, err)
 		}
 		console.Errorf("installed %s -> %s\n", c.ID, dest)

@@ -127,3 +127,13 @@ func TestTagAtHeadOutsideAGitCheckoutCouldNotRun(t *testing.T) {
 		t.Fatalf("exit %d, stderr %q", code, stderr)
 	}
 }
+
+// Under `go -C` the working directory is the module, so a relative --root
+// would inspect backend/go_orchestrator and report "missing package.json" —
+// a mismatch for the wrong reason. It is a usage error instead.
+func TestARelativeRootIsAUsageError(t *testing.T) {
+	code, _, stderr := runArgs("--root", ".")
+	if code != 2 || !strings.Contains(stderr, "--root must be an absolute path") {
+		t.Fatalf("exit %d, stderr %q", code, stderr)
+	}
+}

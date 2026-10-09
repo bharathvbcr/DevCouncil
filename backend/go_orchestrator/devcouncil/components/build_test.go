@@ -375,3 +375,37 @@ func TestCgoEnvOutputIsReadStrictly(t *testing.T) {
 		}
 	}
 }
+
+// tamperingProber answers healthy, then rewrites the build output it was
+// asked about — a second cargo build landing between check and install.
+type tamperingProber struct {
+	target string
+	seen   []string
+}
+
+func (p *tamperingProber) Probe(bin string, args []string) ([]byte, error) {
+	p.seen = append(p.seen, bin)
+	out, err := healthyProber{}.Probe(bin, args)
+	_ = os.WriteFile(p.target, []byte("tampered"), 0o755)
+	return out, err
+}
+
+func TestTheInstalledBytesAreTheBytesThatWereChecked(t *testing.T) {
+	src := checkout(t)
+	built := filepath.Join(src, "rust", "target", "release", rustBinaryName("devmap"))
+	p := &tamperingProber{target: built}
+	cs, _ := Resolve([]string{"devmap"})
+	prefix := t.TempDir()
+	if err := Install(cs, Options{Prefix: prefix, SourceRoot: src, Runner: &cargoRunner{t: t, src: src}, Prober: p, LookPath: noPath}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(filepath.Join(prefix, "bin", rustBinaryName("devmap")))
+	if string(got) != "built devmap" {
+		t.Fatalf("installed %q: not the bytes the health check ran", got)
+	}
+	for _, bin := range p.seen {
+		if bin == built {
+			t.Fatalf("the check ran the shared build output %s, not a private copy", bin)
+		}
+	}
+}

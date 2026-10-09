@@ -71,6 +71,11 @@ func parseArgs(argv []string) (args, error) {
 	if out.tagAtHead && out.tag == "" {
 		return args{}, errors.New("--tag-at-head needs --tag")
 	}
+	// `go -C` has already moved the working directory into the module, so a
+	// relative root names a directory the caller did not mean.
+	if out.root != "" && !filepath.IsAbs(out.root) {
+		return args{}, fmt.Errorf("--root must be an absolute path, got %q (under go -C the working directory is the Go module)", out.root)
+	}
 	return out, nil
 }
 
