@@ -45,9 +45,8 @@ fn names(engine: &StoreQueryEngine, query: &str, narrowing: Option<&NameQueryFil
         response.total,
         "shown + hidden must be the filtered total"
     );
-    if narrowing.is_some() {
+    if let Some(expected) = narrowing {
         let scope = response.scope.as_ref().expect("a filter is echoed");
-        let expected = narrowing.unwrap();
         assert_eq!(scope.paths, expected.paths());
         assert_eq!(scope.languages, expected.languages());
         assert_eq!(scope.kinds, expected.kinds());
