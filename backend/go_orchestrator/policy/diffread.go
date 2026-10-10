@@ -37,6 +37,17 @@ func SecretPathSpelling(name string) bool {
 	return fnmatch.MatchAnyFold(SecretPathPatterns, strings.TrimPrefix(settled, "./"))
 }
 
+// WithheldUnreadable is the rule WithholdDiff reports for a section it removed
+// because its names could not be read, and for text no section owned.
+const WithheldUnreadable = "unreadable_diff"
+
+// WithheldDiff is one name WithholdDiff left out of a diff, and the rule that
+// left it out.
+type WithheldDiff struct {
+	Path string
+	Rule string
+}
+
 // WithholdSecretDiff removes from a unified diff every file section that
 // touches a path under SecretPathPatterns, and returns the names it withheld.
 //
@@ -45,6 +56,27 @@ func SecretPathSpelling(name string) bool {
 // to Lappi. Filtering the text — rather than asking git to leave the paths out
 // — means the decision is made about the bytes actually returned, so a file
 // that became modified between two git invocations cannot slip through.
+//
+// It is WithholdDiff with the secret-path rule alone; a caller with a second
+// reason to refuse a name (a file's link count, say, which no spelling shows)
+// calls WithholdDiff with its own judgement instead of filtering the result a
+// second time.
+func WithholdSecretDiff(diff string) (string, []string) {
+	kept, withheld := WithholdDiff(diff, func(name string) string {
+		if SecretPathSpelling(name) {
+			return WithheldSecretPath
+		}
+		return ""
+	})
+	var names []string
+	for _, w := range withheld {
+		names = append(names, w.Path)
+	}
+	return kept, names
+}
+
+// WithholdDiff removes from a unified diff every file section one of whose
+// names refuse answers with a rule, and returns what it withheld and why.
 //
 // A section's names come from its "---"/"+++" lines and its rename and copy
 // lines, which git C-quotes whenever a name is unusual. Every hunk is preceded
@@ -56,24 +88,31 @@ func SecretPathSpelling(name string) bool {
 // output was once exactly that, and copying it through returned every secret.
 // A section is removed whole, header included, so what remains is still a diff
 // a parser accepts.
-func WithholdSecretDiff(diff string) (string, []string) {
+//
+// refuse is asked once per name as git wrote it and, for a "---"/"+++" name,
+// once more without git's one-segment prefix. It must fail closed: an answer
+// of "" means the name may be read.
+func WithholdDiff(diff string, refuse func(name string) string) (string, []WithheldDiff) {
 	if diff == "" {
 		return diff, nil
 	}
 	lines := strings.SplitAfter(diff, "\n")
 	var out strings.Builder
 	out.Grow(len(diff))
-	var withheld []string
+	var withheld []WithheldDiff
 	seen := map[string]struct{}{}
+	note := func(name, rule string) {
+		if _, dup := seen[name]; !dup {
+			seen[name] = struct{}{}
+			withheld = append(withheld, WithheldDiff{Path: name, Rule: rule})
+		}
+	}
 	for i := 0; i < len(lines); {
 		if !isDiffSectionStart(lines[i]) {
 			// Only reachable before the first section: a section runs to the
 			// next header or the end.
 			if strings.TrimSpace(lines[i]) != "" {
-				if _, dup := seen[UnattributedDiffText]; !dup {
-					seen[UnattributedDiffText] = struct{}{}
-					withheld = append(withheld, UnattributedDiffText)
-				}
+				note(UnattributedDiffText, WithheldUnreadable)
 			} else {
 				out.WriteString(lines[i])
 			}
@@ -85,18 +124,19 @@ func WithholdSecretDiff(diff string) (string, []string) {
 			end++
 		}
 		names, hasContent, readable := diffSectionNames(lines[i:end])
-		secret := false
+		rule := ""
 		for _, name := range names {
-			if SecretPathSpelling(name) {
-				secret = true
+			if r := refuse(name); r != "" {
+				rule = r
+				break
 			}
 		}
-		if secret || (hasContent && !readable) {
+		if rule == "" && hasContent && !readable {
+			rule = WithheldUnreadable
+		}
+		if rule != "" {
 			for _, name := range names {
-				if _, dup := seen[name]; !dup {
-					seen[name] = struct{}{}
-					withheld = append(withheld, name)
-				}
+				note(name, rule)
 			}
 		} else {
 			for _, line := range lines[i:end] {
