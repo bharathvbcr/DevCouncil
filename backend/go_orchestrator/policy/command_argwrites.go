@@ -6,7 +6,10 @@ import (
 )
 
 // argumentWriteTargets returns the files the commands in line write through
-// their arguments, and whether any of those files could not be named.
+// their arguments, whether any of those files could not be named, and — when
+// the line has a command that writes files its text never names (git apply,
+// patch with no file operand, xargs or find running a writer) — a reason a
+// caller with a task scope bound must refuse it for. See command_filewrites.go.
 //
 // line is the masked text redirectTargets builds: substitutions, output
 // redirections and subshell parentheses are already gone, so each clause is the
@@ -26,6 +29,9 @@ import (
 //     with a trailing slash, or implied by more than one source.
 //   - mv writes the same paths as cp, and changes every source too: it removes
 //     it.
+//   - rm, truncate and touch write every file operand; install, ln and rsync
+//     name their destination like cp; patch writes its file operand (or -o's
+//     output); dd writes of=; perl -i rewrites its file operands like sed -i.
 //   - pytest writes the report, temporary and cache locations its options name;
 //     see pytestWrites.
 //
@@ -34,9 +40,8 @@ import (
 // the filesystem is not consulted. An operand only the shell can resolve
 // reports opacity, as an unresolvable redirection target does. A glob is
 // judged as the literal path, as a glob in a redirection target is.
-func argumentWriteTargets(line string) ([]string, bool) {
-	var targets []string
-	opaque := false
+func argumentWriteTargets(line string) (targets []string, opaque bool, unjudged string) {
+	var all argWrites
 	for _, clause := range SplitCommandChain(line) {
 		words := shellWords(clause)
 		at := argumentCommandWord(words)
@@ -57,24 +62,9 @@ func argumentWriteTargets(line string) ([]string, bool) {
 			}
 			args = append(args, words[k])
 		}
-		var written []string
-		var unresolved bool
-		switch path.Base(words[at].text) {
-		case "sed":
-			written, unresolved = sedWrites(args)
-		case "tee":
-			written, unresolved = teeWrites(args)
-		case "cp":
-			written, unresolved = copyWrites(args, false)
-		case "mv":
-			written, unresolved = copyWrites(args, true)
-		default:
-			written, unresolved = pytestWrites(words, at, args)
-		}
-		targets = append(targets, written...)
-		opaque = opaque || unresolved
+		all.merge(commandWrites(words, at, args, 0))
 	}
-	return targets, opaque
+	return all.targets, all.opaque, all.unjudged
 }
 
 // argumentWrappers run the command named by the following words. Stepped over
@@ -310,11 +300,21 @@ func copyWrites(args []shellWord, move bool) ([]string, bool) {
 		}
 	}
 
+	return copyTargets(operands, haveTargetDir, targetDir, noTargetDir, move, false)
+}
+
+// copyTargets names what cp (or, with move, mv) writes once the options are
+// read: the destination, or DIR/basename(source) for each source when the
+// destination is a directory. With lone — ln, which links one operand into the
+// current directory — a single operand is a source with no destination.
+func copyTargets(operands []string, haveTargetDir bool, targetDir string, noTargetDir, move, lone bool) ([]string, bool) {
 	var sources []string
 	dir := ""
 	switch {
 	case haveTargetDir:
 		sources, dir = operands, targetDir
+	case lone && len(operands) == 1:
+		sources, dir = operands, "."
 	case len(operands) < 2:
 		return nil, false // nothing to copy, or nowhere to copy it
 	default:

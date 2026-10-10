@@ -39,9 +39,31 @@ import (
 // the `>` inside; they are now found the same principled way as $( … ), so the
 // three cannot diverge again.
 func RedirectTargets(command string) ([]string, bool, error) {
-	targets, opaque, err := redirectTargets(command, 0)
+	set, err := RedirectWrites(command)
+	return set.Targets, set.Opaque, err
+}
+
+// RedirectSet is everything RedirectTargets knows about a command line's
+// writes.
+type RedirectSet struct {
+	// Targets are the distinct files written, bounded by maxRedirectTargets.
+	Targets []string
+	// Opaque reports a write this scan could not name or enumerate.
+	Opaque bool
+	// Unjudged, when set, says why the line writes files its text does not
+	// name (git apply, patch with no file operand, xargs or find running a
+	// writer). It is not Opaque: with no task scope there is no fence for such
+	// a write to get past, so only a caller that has a scope bound refuses.
+	Unjudged string
+}
+
+// RedirectWrites is RedirectTargets with the scope-dependent half reported
+// beside the targets, so the one caller that knows whether a scope is bound
+// can decide what Unjudged means.
+func RedirectWrites(command string) (RedirectSet, error) {
+	targets, opaque, unjudged, err := redirectTargets(command, 0)
 	if err != nil {
-		return nil, false, err
+		return RedirectSet{}, err
 	}
 	// Deduplicated, and bounded. Both are about what the caller does with this
 	// list: it puts every entry through the write gate, so the length of the
@@ -66,12 +88,12 @@ func RedirectTargets(command string) ([]string, bool, error) {
 			// Past the cap the enumeration is incomplete, and incomplete is
 			// exactly what opacity means — the caller refuses rather than
 			// judging a prefix of the writes and calling it the whole set.
-			return distinct, true, nil
+			return RedirectSet{Targets: distinct, Opaque: true, Unjudged: unjudged}, nil
 		}
 		seen[target] = struct{}{}
 		distinct = append(distinct, target)
 	}
-	return distinct, opaque, nil
+	return RedirectSet{Targets: distinct, Opaque: opaque, Unjudged: unjudged}, nil
 }
 
 // streamDevices are the device paths a redirection writes to without creating
@@ -131,7 +153,7 @@ func IsStreamDevice(target string) bool {
 // first sixty-four writes and ignoring the rest.
 const maxRedirectTargets = 64
 
-func redirectTargets(command string, depth int) ([]string, bool, error) {
+func redirectTargets(command string, depth int) ([]string, bool, string, error) {
 	// Exhausting the bound reports opacity, not an error. Both mean "there may
 	// be a write in here that I did not resolve", but they travel differently:
 	// opacity becomes a recorded command.substitution denial the run log counts
@@ -143,15 +165,15 @@ func redirectTargets(command string, depth int) ([]string, bool, error) {
 	// reported as "no targets", which is how "approved" comes to mean
 	// "unexamined".
 	if depth > maxSubstitutionDepth {
-		return nil, true, nil
+		return nil, true, "", nil
 	}
 	s := redirectScan{runes: []rune(command), depth: depth}
 	if err := s.scanOperators(); err != nil {
-		return nil, false, err
+		return nil, false, "", err
 	}
 	s.addArgumentWrites()
 	s.reconcileWithSubstitutions(command)
-	return s.targets, s.opaque, nil
+	return s.targets, s.opaque, s.unjudged, nil
 }
 
 // redirectScan is one command line's walk in redirectTargets: the line, the
@@ -160,8 +182,9 @@ type redirectScan struct {
 	runes []rune
 	depth int
 
-	targets []string
-	opaque  bool
+	targets  []string
+	opaque   bool
+	unjudged string
 
 	// masked is this command line as the argument scan reads it: every
 	// substitution span scanOperators descends into is replaced by
@@ -236,12 +259,13 @@ func (s *redirectScan) scanOperators() error {
 // are. Its findings merge into this command's, because sh performs them
 // whether or not the surrounding line has a redirect of its own.
 func (s *redirectScan) descend(inner string) error {
-	innerTargets, innerOpaque, err := redirectTargets(inner, s.depth+1)
+	innerTargets, innerOpaque, innerUnjudged, err := redirectTargets(inner, s.depth+1)
 	if err != nil {
 		return err
 	}
 	s.targets = append(s.targets, innerTargets...)
 	s.opaque = s.opaque || innerOpaque
+	s.noteUnjudged(innerUnjudged)
 	return nil
 }
 
@@ -445,9 +469,17 @@ func readRedirectTarget(runes []rune, start int) (string, int, error) {
 // redirect and passed the other four. See argumentWriteTargets for which
 // commands and why.
 func (s *redirectScan) addArgumentWrites() {
-	argTargets, argOpaque := argumentWriteTargets(s.masked.String())
+	argTargets, argOpaque, argUnjudged := argumentWriteTargets(s.masked.String())
 	s.targets = append(s.targets, argTargets...)
 	s.opaque = s.opaque || argOpaque
+	s.noteUnjudged(argUnjudged)
+}
+
+// noteUnjudged keeps the first reason a line writes files it does not name.
+func (s *redirectScan) noteUnjudged(reason string) {
+	if s.unjudged == "" {
+		s.unjudged = reason
+	}
 }
 
 // reconcileWithSubstitutions is the last stage: the scan's targets are
@@ -493,7 +525,8 @@ func (s *redirectScan) reconcileWithSubstitutions(command string) {
 		// than adding a second, independent one. Past the bound the call
 		// returns opacity immediately, which is both the fail-closed answer
 		// and what stops this walk.
-		spanTargets, spanOpaque, spanErr := redirectTargets(span, s.depth+1)
+		spanTargets, spanOpaque, spanUnjudged, spanErr := redirectTargets(span, s.depth+1)
+		s.noteUnjudged(spanUnjudged)
 		if spanErr != nil || spanOpaque {
 			s.opaque = true
 			return

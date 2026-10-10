@@ -69,7 +69,7 @@ func secretOperandViolation(clause, root string) string {
 	// files and sed -i's targets change a file without printing it; the write
 	// rungs judge them under path.secret, and calling them a read would both
 	// misname the refusal and displace the write rule that is the right one.
-	writtenList, _ := argumentWriteTargets(clause)
+	writtenList, _, _ := argumentWriteTargets(clause)
 	written := make(map[string]bool, len(writtenList))
 	for _, w := range writtenList {
 		written[w] = true
