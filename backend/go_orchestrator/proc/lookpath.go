@@ -15,7 +15,16 @@ import (
 var ErrRepositoryLocal = errors.New("candidate is inside the repository under analysis")
 
 // LookPathOutside resolves `name` on PATH and refuses any candidate whose
-// canonical location is inside `root`.
+// canonical location is inside the repository `root` is in.
+//
+// The boundary is the repository's top, not `root` itself: a command run from
+// repo/backend analyzes the whole checkout, and a program planted at
+// repo/tools/bin is as much repository content as one under repo/backend.
+// The top is found without running git (see repositoryTop): the nearest
+// directory above `root` holding a `.git`, else the nearest holding a
+// `.devcouncil` directory, else `root`. The walk stops at the nearest `.git`,
+// so a home directory that is itself a repository does not swallow
+// ~/.local/bin for every checkout beneath it.
 //
 // Repository contents are input to analysis. They do not authorize executing a
 // discovered program, so a build output, a vendored helper, or anything a
@@ -65,10 +74,11 @@ func EnvOverride(env string) Override {
 //     absolute against the working directory before it is checked, and
 //     handed on absolute, so a client that runs in another directory runs
 //     the file that was checked.
-//  2. PATH, through LookPathOutside.
+//  2. PATH, through LookPathOutside, refusing anything inside the repository
+//     root is in — its top, not root itself.
 //  3. ~/.local/bin, where `devcouncil install` puts components, searched only
 //     when PATH has no candidate at all, and held to the same canonical
-//     outside-root check. A PATH candidate that was refused stays refused: a
+//     outside-the-repository check. A PATH candidate that was refused stays refused: a
 //     refusal that fell through to another rung would hide that something in
 //     the repository is on PATH.
 //
@@ -118,8 +128,9 @@ func ResolveComponent(name, root string, override Override) (string, error) {
 	return outsideRoot(name, candidate, rootDir)
 }
 
-// resolveRoot identifies root, where empty means the working directory. A
-// root that does not exist yields nil: it contains no program, and the
+// resolveRoot identifies the containment boundary for root, where empty means
+// the working directory: the repository root sits in, as repositoryTop finds
+// it. A root that does not exist yields nil: it contains no program, and the
 // caller's own command reports the missing root.
 func resolveRoot(root string) (os.FileInfo, error) {
 	if root == "" {
@@ -129,11 +140,63 @@ func resolveRoot(root string) (os.FileInfo, error) {
 			return nil, err
 		}
 	}
-	info, err := os.Stat(root)
+	start, err := canonicalAbs(root)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
 	}
-	return info, err
+	if err != nil {
+		return nil, err
+	}
+	top, err := repositoryTop(start)
+	if err != nil {
+		return nil, err
+	}
+	return os.Stat(top)
+}
+
+// repositoryTop returns the top of the repository dir is in, found from the
+// filesystem alone — no git runs to answer it, because the git that would
+// answer is one of the programs being resolved.
+//
+// The walk goes up from dir and stops at the nearest directory holding a
+// `.git` (a directory, or the file a worktree or submodule has); that
+// directory is the top. With no `.git` above dir, the nearest directory
+// holding a `.devcouncil` directory is the top, and with neither, dir itself.
+// A `.devcouncil` below the nearest `.git` lies inside it, so the top is the
+// outer of the two; one above the nearest `.git` is not consulted, and
+// neither is any outer `.git`. Stopping there is deliberate: a home directory
+// that is itself a repository (a dotfiles checkout) must not make every
+// repository under it reach up and swallow ~/.local/bin.
+//
+// A marker that cannot be examined is an error, never an answer of "absent":
+// answering "absent" would shrink the boundary.
+func repositoryTop(dir string) (string, error) {
+	devcouncil := ""
+	for current := dir; ; {
+		if _, err := os.Lstat(filepath.Join(current, ".git")); err == nil {
+			return current, nil
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return "", fmt.Errorf("finding the repository around %s: %w", dir, err)
+		}
+		if devcouncil == "" {
+			info, err := os.Stat(filepath.Join(current, ".devcouncil"))
+			switch {
+			case err == nil && info.IsDir():
+				devcouncil = current
+			case err != nil && !errors.Is(err, fs.ErrNotExist):
+				return "", fmt.Errorf("finding the repository around %s: %w", dir, err)
+			}
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+		current = parent
+	}
+	if devcouncil != "" {
+		return devcouncil, nil
+	}
+	return dir, nil
 }
 
 // maxLinkHops bounds the symlink chain outsideRoot follows, matching the

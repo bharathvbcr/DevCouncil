@@ -151,6 +151,10 @@ pub enum Failure {
         program: String,
         error: std::io::Error,
     },
+    /// The read was refused before anything ran, for the reason given — a
+    /// git that does not honour `GIT_NO_LAZY_FETCH` asked to read a partial
+    /// clone, see [`git_with_program`].
+    Refused { program: String, reason: String },
 }
 
 impl fmt::Display for Failure {
@@ -161,6 +165,7 @@ impl fmt::Display for Failure {
                 write!(f, "{program} exceeded {deadline:?} and was killed")
             }
             Failure::Wait { program, error } => write!(f, "cannot wait for {program}: {error}"),
+            Failure::Refused { program, reason } => write!(f, "refused to run {program}: {reason}"),
         }
     }
 }
@@ -195,20 +200,185 @@ where
         .map(|a| a.as_ref().to_os_string())
         .collect();
     let subcommand = args.get(subcommand_index(&args)).and_then(|s| s.to_str());
-    let filters = if subcommand.is_some_and(|s| FILTER_FREE.contains(&s)) {
-        Vec::new()
+    let filter_free = subcommand.is_some_and(|s| FILTER_FREE.contains(&s));
+    // Decision D9 in ft-ff2153d9: a git that does not honour
+    // GIT_NO_LAZY_FETCH may read an ordinary clone, and refuses a partial
+    // clone's read. The version is asked only when it decides something: a
+    // filter-free read skips the config listing on a git that honours the
+    // variable, and any other read lists the config anyway and asks the
+    // version only when the listing shows a promisor.
+    let mut filters = Vec::new();
+    let honours = if filter_free {
+        git_version(&resolved)?.is_some_and(|v| v.honors_no_lazy_fetch())
     } else {
-        repository_filter_overrides(&resolved, root)?
+        false
     };
+    if !honours {
+        let config = repository_config(&resolved, root)?;
+        if config.partial_clone {
+            let version = git_version(&resolved)?;
+            if !version
+                .as_ref()
+                .is_some_and(GitVersion::honors_no_lazy_fetch)
+            {
+                let version = version
+                    .map_or_else(|| "of unrecognised version".to_string(), |v| v.to_string());
+                return Err(Failure::Refused {
+                    program: resolved.display().to_string(),
+                    reason: format!(
+                        "{} is a partial clone, and git {version} does not honour \
+                         GIT_NO_LAZY_FETCH, so a read could fetch missing objects from its \
+                         promisor remote and run the programs that fetch runs; upgrade git to \
+                         2.45.0 or later, or to a maintenance release carrying the CVE-2024-32465 \
+                         fix (2.39.4, 2.40.2, 2.41.1, 2.42.2, 2.43.4, 2.44.1)",
+                        root.display()
+                    ),
+                });
+            }
+        }
+        if !filter_free {
+            filters = config.filters;
+        }
+    }
     let mut command = Command::new(resolved);
     command
         .arg("-C")
         .arg(root)
         .args(filters)
-        .args(guarded_args(args))
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0");
+        .args(guarded_args(args));
+    git_env(&mut command);
     Ok(command)
+}
+
+/// The environment every git the kernel runs gets: no terminal prompt, no
+/// optional index lock (a read must never leave `index.lock` behind in
+/// someone's checkout), and no lazy fetch from a promisor remote, so a missing
+/// object fails the read loudly instead of being fetched — the fetch runs
+/// what the repository's config names (`core.sshCommand`, credential helpers,
+/// remote helpers). The Go host's `proc.gitEnv` is the same list.
+fn git_env(command: &mut Command) {
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_NO_LAZY_FETCH", "1");
+}
+
+/// The version a git binary reports, reduced to the numbers that decide what
+/// it honours.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitVersion {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+    /// The whole `git version` line.
+    pub raw: String,
+}
+
+impl fmt::Display for GitVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+impl GitVersion {
+    /// Reads `git version 2.54.0 (Apple Git-157)`, `git version
+    /// 2.39.5.windows.1` and the like. Only the leading numbers count; a
+    /// missing patch level is zero.
+    pub fn parse(line: &str) -> Option<GitVersion> {
+        let line = line.trim();
+        let rest = line.strip_prefix("git version ")?;
+        let number = rest.split_whitespace().next()?;
+        let mut parts = number.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        Some(GitVersion {
+            major,
+            minor,
+            patch,
+            raw: line.to_string(),
+        })
+    }
+
+    /// Whether this git refuses to fetch a missing object from a promisor
+    /// remote when `GIT_NO_LAZY_FETCH=1`.
+    ///
+    /// Checked against git's source rather than recalled (ft-ff2153d9): the
+    /// variable is read in `environment.c` from v2.45.0, and in
+    /// `promisor-remote.c` in the CVE-2024-32465 maintenance releases
+    /// v2.39.4, v2.40.2, v2.41.1, v2.42.2, v2.43.4 and v2.44.1. v2.44.0 does
+    /// not read it. The Go host's `proc.GitVersion.HonorsNoLazyFetch` is the
+    /// same rule.
+    pub fn honors_no_lazy_fetch(&self) -> bool {
+        if (self.major, self.minor) >= (2, 45) {
+            return true;
+        }
+        let backport = match (self.major, self.minor) {
+            (2, 39) => 4,
+            (2, 40) => 2,
+            (2, 41) => 1,
+            (2, 42) => 2,
+            (2, 43) => 4,
+            (2, 44) => 1,
+            _ => return false,
+        };
+        self.patch >= backport
+    }
+}
+
+/// Wall clock for `git version`. It answers in milliseconds; the bound is
+/// short because the probe runs before the read a caller bounded, and must
+/// not outlast the shortest of those deadlines ([`GIT_HEAD_DEADLINE`]). A
+/// git that stalls here is reported as killed, not waited for.
+pub const GIT_VERSION_DEADLINE: Duration = Duration::from_secs(2);
+
+/// The version of the git at `git` (an absolute path, as [`resolve_outside`]
+/// returns it), asked once per binary per process. A git replaced in place —
+/// a different size or modification time — is asked again. `git version`
+/// reads no repository, so it runs nothing a repository names.
+///
+/// `None` is a git that ran and gave no version this can read; callers treat
+/// it as one that does not honour `GIT_NO_LAZY_FETCH`, the cautious reading.
+/// A git that could not be run at all is a [`Failure`].
+pub fn git_version(git: &Path) -> Result<Option<GitVersion>, Failure> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Key = (PathBuf, u64, Option<std::time::SystemTime>);
+    static VERSIONS: OnceLock<Mutex<HashMap<Key, Option<GitVersion>>>> = OnceLock::new();
+    let meta = std::fs::metadata(git).map_err(|error| Failure::Spawn {
+        program: git.display().to_string(),
+        error,
+    })?;
+    let key: Key = (git.to_path_buf(), meta.len(), meta.modified().ok());
+    let versions = VERSIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(version) = versions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+    {
+        return Ok(version.clone());
+    }
+    let mut command = Command::new(git);
+    command.arg("version").current_dir(std::env::temp_dir());
+    git_env(&mut command);
+    let captured = run_bounded(
+        &mut command,
+        Bounds {
+            deadline: GIT_VERSION_DEADLINE,
+            stdout_cap: 4096,
+            stderr_cap: 4096,
+        },
+    )?;
+    let version = if captured.status.success() && !captured.stdout_truncated {
+        GitVersion::parse(&captured.stdout_lossy())
+    } else {
+        None
+    };
+    versions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key, version.clone());
+    Ok(version)
 }
 
 /// `args` with the guards every kernel git read carries.
@@ -225,7 +395,14 @@ where
 /// * before the subcommand: `core.fsmonitor=false`, `core.hooksPath` at the
 ///   null device (no hook can be found there), `log.showSignature=false`;
 /// * after `diff`, `log` or `show`: `--no-ext-diff --no-textconv`;
-/// * after `blame`: `--no-textconv`.
+/// * after `blame`: `--no-textconv`;
+/// * after `diff` and `status`: `--ignore-submodules=dirty`. Asked whether a
+///   submodule's working tree is dirty, git runs status inside it, and that
+///   status runs the submodule's own filter drivers and fsmonitor, which the
+///   superproject's config listing never sees. A submodule whose checked-out
+///   commit moved is still reported. No kernel read compares a working tree
+///   today; the Go host, which does, reports dirty submodules with a guarded
+///   read of each (`proc.GitSession.DirtySubmodules`).
 ///
 /// Global options the caller puts before its subcommand (`-c k=v`, `-C dir`)
 /// stay in place; the subcommand is the first argument that is not one. The
@@ -233,7 +410,7 @@ where
 ///
 /// Filter drivers need the repository's config read first, because no flag
 /// disables them; [`git_with_program`] does that with
-/// `repository_filter_overrides`.
+/// `repository_config`.
 pub fn guarded_args<I, S>(args: I) -> Vec<std::ffi::OsString>
 where
     I: IntoIterator<Item = S>,
@@ -260,8 +437,14 @@ where
     if let Some(sub) = args.get(i) {
         out.push(sub.clone());
         let guards: &[&str] = match sub.to_str() {
-            Some("diff" | "log" | "show") => &["--no-ext-diff", "--no-textconv"],
+            Some("diff") => &[
+                "--no-ext-diff",
+                "--no-textconv",
+                "--ignore-submodules=dirty",
+            ],
+            Some("log" | "show") => &["--no-ext-diff", "--no-textconv"],
             Some("blame") => &["--no-textconv"],
+            Some("status") => &["--ignore-submodules=dirty"],
             _ => &[],
         };
         out.extend(guards.iter().map(std::ffi::OsString::from));
@@ -292,27 +475,45 @@ fn subcommand_index(args: &[std::ffi::OsString]) -> usize {
 /// `proc.filterFree` is the same list.
 const FILTER_FREE: &[&str] = &["rev-parse", "rev-list", "log"];
 
-/// The filter listing read before each git read is bounded; one that does not
+/// The config listing read before a git read is bounded; one that does not
 /// fit is refused, because a truncated listing could omit a driver.
 const FILTER_CONFIG_LIMIT: usize = 1 << 20;
 
-/// `-c` arguments that neutralize every filter driver the repository itself
-/// defines. The Go host's `proc.repositoryFilterOverrides` applies the same
-/// rule; see [`filter_overrides`] for it.
+/// What one `git config` listing must carry: every filter driver setting, and
+/// the settings that make the repository a partial clone, so detecting one
+/// costs no extra spawn. Keys are matched in git's canonical form, section
+/// and variable lowercased. The Go host's `proc.repositoryConfigPattern` is
+/// the same pattern.
+const REPOSITORY_CONFIG_PATTERN: &str =
+    "^(filter\\.|extensions\\.partialclone$|remote\\..*\\.(promisor|partialclonefilter)$)";
+
+/// What the guards need from the repository's config.
+struct RepositoryConfig {
+    /// `-c` arguments neutralizing the repository's filter drivers.
+    filters: Vec<String>,
+    /// A promisor remote may supply missing objects on demand.
+    partial_clone: bool,
+}
+
+/// The repository's filter and partial-clone config, listed once with
+/// scopes. The Go host's `proc.readRepositoryConfig` applies the same rule;
+/// see [`filter_overrides`] for it.
 ///
 /// `filter.<name>.clean` runs on `diff`, and no flag turns filters off, so the
 /// repository's config is read first (reading config runs nothing). A root
 /// git cannot enter has no repository config to neutralize; the read that
 /// follows reports the root itself.
-fn repository_filter_overrides(git: &Path, root: &Path) -> Result<Vec<String>, Failure> {
+fn repository_config(git: &Path, root: &Path) -> Result<RepositoryConfig, Failure> {
     let program = git.display().to_string();
     let mut command = Command::new(git);
-    command
-        .arg("-C")
-        .arg(root)
-        .args(["config", "--show-scope", "-z", "--get-regexp", "^filter\\."])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0");
+    command.arg("-C").arg(root).args([
+        "config",
+        "--show-scope",
+        "-z",
+        "--get-regexp",
+        REPOSITORY_CONFIG_PATTERN,
+    ]);
+    git_env(&mut command);
     let captured = run_bounded(
         &mut command,
         Bounds {
@@ -327,12 +528,17 @@ fn repository_filter_overrides(git: &Path, root: &Path) -> Result<Vec<String>, F
     };
     match captured.status.code() {
         Some(0) => {}
-        // 1: no filter defined anywhere. 128: git cannot enter root, so there
+        // 1: nothing matched anywhere. 128: git cannot enter root, so there
         // is no repository config.
-        Some(1 | 128) => return Ok(Vec::new()),
+        Some(1 | 128) => {
+            return Ok(RepositoryConfig {
+                filters: Vec::new(),
+                partial_clone: false,
+            })
+        }
         _ => {
             return Err(refuse(format!(
-                "reading the repository's filter config exited {:?}: {}",
+                "reading the repository's config exited {:?}: {}",
                 captured.status.code(),
                 captured.stderr_trimmed()
             )));
@@ -344,7 +550,38 @@ fn repository_filter_overrides(git: &Path, root: &Path) -> Result<Vec<String>, F
              with filters it could not check"
         )));
     }
-    filter_overrides(&captured.stdout).map_err(refuse)
+    Ok(RepositoryConfig {
+        filters: filter_overrides(&captured.stdout).map_err(refuse)?,
+        partial_clone: is_partial_clone(&captured.stdout),
+    })
+}
+
+/// Whether a `--show-scope -z` listing names a promisor:
+/// `extensions.partialclone`, a remote's `promisor` flag, or a remote's
+/// `partialclonefilter`. Any scope counts; a promisor configured globally
+/// fetches just the same. A flag git would not read as false counts as true:
+/// an unreadable promisor flag is not evidence of no promisor.
+pub fn is_partial_clone(listing: &[u8]) -> bool {
+    let fields: Vec<&[u8]> = listing.split(|b| *b == 0).collect();
+    fields.chunks(2).any(|pair| {
+        let [_, entry] = pair else { return false };
+        let entry = String::from_utf8_lossy(entry);
+        let (key, value) = match entry.split_once('\n') {
+            Some((key, value)) => (key, Some(value.trim())),
+            None => (entry.as_ref(), None),
+        };
+        let remote = key.starts_with("remote.");
+        if key == "extensions.partialclone" || (remote && key.ends_with(".partialclonefilter")) {
+            value.is_some_and(|v| !v.is_empty())
+        } else if remote && key.ends_with(".promisor") {
+            !matches!(
+                value.map(str::to_ascii_lowercase).as_deref(),
+                Some("false" | "no" | "off" | "0" | "")
+            )
+        } else {
+            false
+        }
+    })
 }
 
 /// Turns `git config --show-scope -z --get-regexp ^filter\.` output
@@ -433,8 +670,11 @@ pub fn filter_overrides(listing: &[u8]) -> Result<Vec<String>, String> {
 ///   directory this process happens to run in, which is usually the
 ///   repository. Go's `os/exec` refuses the same thing (`exec.ErrDot`); Rust's
 ///   standard library does not, so it is refused here.
-/// * a candidate whose canonical location is inside `root` is refused: the
-///   repository's own files are input to analysis, not programs to trust.
+/// * a candidate whose canonical location is inside the repository `root` is
+///   in is refused: the repository's own files are input to analysis, not
+///   programs to trust. The boundary is the repository's top, not `root`
+///   itself ([`repository_top`]): run against `repo/backend`, a program at
+///   `repo/tools/bin` is as much repository content.
 ///   Containment is decided by identity — device and inode of each directory
 ///   above the candidate against `root`'s — not by comparing names, because a
 ///   filesystem that folds case or Unicode normalization (APFS, NTFS) gives
@@ -462,6 +702,13 @@ pub fn resolve_outside(
         return std::path::absolute(named)
             .map_err(|error| refuse(error.kind(), format!("{name}: {error}")));
     }
+    let boundary = repository_top(root).map_err(|error| {
+        refuse(
+            error.kind(),
+            format!("finding the repository around {}: {error}", root.display()),
+        )
+    })?;
+    let root = boundary.as_path();
     let entries = path_var.map(std::env::split_paths).into_iter().flatten();
     for entry in entries {
         for candidate in executable_names(&entry, program) {
@@ -502,6 +749,47 @@ pub fn resolve_outside(
         std::io::ErrorKind::NotFound,
         format!("{name} is not on PATH"),
     ))
+}
+
+/// The top of the repository `root` is in, found from the filesystem alone —
+/// no git runs to answer it, because the git that would answer is one of the
+/// programs being resolved. The Go host's `proc.repositoryTop` is the same
+/// rule.
+///
+/// The walk goes up from `root` and stops at the nearest directory holding a
+/// `.git` (a directory, or the file a worktree or submodule has); that is the
+/// top. With no `.git` above, the nearest directory holding a `.devcouncil`
+/// directory is the top, and with neither, `root` itself. The walk stops at
+/// the nearest `.git` on purpose: a home directory that is itself a
+/// repository must not make every repository beneath it swallow
+/// `~/.local/bin`. A marker that cannot be examined is an error, never
+/// "absent", which would shrink the boundary. A `root` that does not exist is
+/// returned as given: it contains nothing.
+pub fn repository_top(root: &Path) -> std::io::Result<PathBuf> {
+    let start = match std::fs::canonicalize(root) {
+        Ok(start) => start,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(root.to_path_buf()),
+        Err(error) => return Err(error),
+    };
+    let mut devcouncil = None;
+    let mut current = Some(start.as_path());
+    while let Some(dir) = current {
+        match std::fs::symlink_metadata(dir.join(".git")) {
+            Ok(_) => return Ok(dir.to_path_buf()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if devcouncil.is_none() {
+            match std::fs::metadata(dir.join(".devcouncil")) {
+                Ok(meta) if meta.is_dir() => devcouncil = Some(dir.to_path_buf()),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        current = dir.parent();
+    }
+    Ok(devcouncil.unwrap_or(start))
 }
 
 /// The file names `program` may have in `dir`: itself, and on Windows each
@@ -1047,7 +1335,17 @@ mod tests {
         let cases: &[(&[&str], &[&str])] = &[
             (
                 &["diff", "HEAD"],
-                &["diff", "--no-ext-diff", "--no-textconv", "HEAD"],
+                &[
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--ignore-submodules=dirty",
+                    "HEAD",
+                ],
+            ),
+            (
+                &["status", "--porcelain"],
+                &["status", "--ignore-submodules=dirty", "--porcelain"],
             ),
             (
                 &["blame", "-w", "HEAD"],
@@ -1080,6 +1378,7 @@ mod tests {
                     "diff",
                     "--no-ext-diff",
                     "--no-textconv",
+                    "--ignore-submodules=dirty",
                     "-U0",
                 ],
             ),
@@ -1283,9 +1582,13 @@ mod tests {
         let base = Scratch::new("filter-flood");
         let flood = FILTER_CONFIG_LIMIT + 1024;
         let git = plant(&base.0.join("bin"), "git", 0o755);
+        // A modern version, so a filter-free read needs no config listing.
         std::fs::write(
             &git,
-            format!("#!/bin/sh\nhead -c {flood} /dev/zero | tr '\\0' a\n"),
+            format!(
+                "#!/bin/sh\n[ \"$1\" = version ] && {{ echo 'git version 2.54.0'; exit 0; }}\n\
+                 head -c {flood} /dev/zero | tr '\\0' a\n"
+            ),
         )
         .unwrap();
 
@@ -1298,7 +1601,8 @@ mod tests {
         };
         assert_eq!(kind, ErrorKind::InvalidData);
         assert!(message.contains("exceeds"), "{message}");
-        // A filter-free subcommand never asks, so the same git still runs.
+        // A filter-free subcommand on a git that honours GIT_NO_LAZY_FETCH
+        // never asks, so the same git still runs.
         assert!(git_with_program(git.as_os_str(), &base.0, ["rev-parse", "HEAD"]).is_ok());
     }
 
@@ -1364,6 +1668,53 @@ mod tests {
         let (kind, message) = refusal(resolve_outside(OsStr::new("git"), Some(&path), &root));
         assert_eq!(kind, ErrorKind::PermissionDenied);
         assert!(message.contains("inside the repository"), "{message}");
+    }
+
+    /// The boundary is the repository's top, not the root a read was handed:
+    /// run against `repo/backend`, a git planted at `repo/tools/bin` is still
+    /// the repository's. The top is the nearest `.git` (directory or file),
+    /// else the nearest `.devcouncil` directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_git_elsewhere_in_the_repository_is_refused_from_a_subdirectory() {
+        for marker in [".git/", ".git", ".devcouncil/"] {
+            let base = Scratch::new("subdir");
+            let repo = base.0.join("repo");
+            let sub = repo.join("backend");
+            std::fs::create_dir_all(&sub).unwrap();
+            match marker.strip_suffix('/') {
+                Some(dir) => std::fs::create_dir_all(repo.join(dir)).unwrap(),
+                None => std::fs::write(repo.join(marker), "gitdir: elsewhere\n").unwrap(),
+            }
+            plant(&repo.join("tools/bin"), "git", 0o755);
+            let path =
+                std::env::join_paths([repo.join("tools/bin"), PathBuf::from("/usr/bin")]).unwrap();
+
+            let (kind, message) = refusal(resolve_outside(OsStr::new("git"), Some(&path), &sub));
+            assert_eq!(kind, ErrorKind::PermissionDenied, "{marker}: {message}");
+            assert!(
+                message.contains("inside the repository"),
+                "{marker}: {message}"
+            );
+            assert_eq!(repository_top(&sub).unwrap(), repo, "{marker}");
+        }
+    }
+
+    /// With no marker above it, a root is its own boundary, and a program
+    /// beside it — outside it — still resolves.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_with_no_repository_above_it_is_its_own_boundary() {
+        let base = Scratch::new("no-marker");
+        let root = base.0.join("plain");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = plant(&base.0.join("bin"), "git", 0o755);
+        let path = std::env::join_paths([base.0.join("bin")]).unwrap();
+        assert_eq!(repository_top(&root).unwrap(), root);
+        assert_eq!(
+            resolve_outside(OsStr::new("git"), Some(&path), &root).unwrap(),
+            outside
+        );
     }
 
     #[cfg(unix)]

@@ -70,7 +70,11 @@ type GitRepoState struct {
 func ProbeGitRepoState(ctx context.Context, root string) GitRepoState {
 	ctx, cancel := context.WithTimeout(ctx, RepoStateTimeout)
 	defer cancel()
-	out, err := runGit(ctx, root, "rev-parse", "--is-inside-work-tree")
+	git, err := proc.NewGitSession(root)
+	if err != nil {
+		return GitRepoState{Reason: fmt.Sprintf("could not run git: %v", err)}
+	}
+	out, err := runGit(ctx, git, "rev-parse", "--is-inside-work-tree")
 	if err != nil {
 		if isTimeout(err) || out.returnCode == 124 {
 			return GitRepoState{Reason: timeoutReason(err, out)}
@@ -203,15 +207,21 @@ func gitDiff(ctx context.Context, root string, paths []string, staged bool) (Dif
 	ctx, cancel := context.WithTimeout(ctx, DiffTimeout)
 	defer cancel()
 
-	diffOut, err := runGit(ctx, root, diffArgs...)
+	// One session for every read of this operation, so the repository's
+	// config is read once rather than once per read.
+	git, err := proc.NewGitSession(root)
+	if err != nil {
+		return DiffResult{OK: false, Files: []DiffFile{}, Staged: staged, Error: err.Error()}, nil
+	}
+	diffOut, err := runGit(ctx, git, diffArgs...)
 	if err != nil && !isGitFail(err, diffOut) {
 		return DiffResult{OK: false, Files: []DiffFile{}, Staged: staged, Error: err.Error()}, nil
 	}
-	numOut, err := runGit(ctx, root, numstatArgs...)
+	numOut, err := runGit(ctx, git, numstatArgs...)
 	if err != nil && !isGitFail(err, numOut) {
 		return DiffResult{OK: false, Files: []DiffFile{}, Staged: staged, Error: err.Error()}, nil
 	}
-	nameOut, err := runGit(ctx, root, namestatusArgs...)
+	nameOut, err := runGit(ctx, git, namestatusArgs...)
 	if err != nil && !isGitFail(err, nameOut) {
 		return DiffResult{OK: false, Files: []DiffFile{}, Staged: staged, Error: err.Error()}, nil
 	}
@@ -278,7 +288,21 @@ func gitDiff(ctx context.Context, root string, paths []string, staged bool) (Dif
 		for _, f := range files {
 			known[f.Path] = struct{}{}
 		}
-		uFiles, uDiff, uErr := collectUntracked(root, paths, known)
+		// The diff reads pass --ignore-submodules=dirty, so git runs no status
+		// inside a submodule; a guarded read of each one reports the dirty
+		// ones, as `M` with no line counts, which is how git listed them.
+		dirty, err := git.DirtySubmodules(ctx, paths...)
+		if err != nil {
+			return DiffResult{OK: false, Files: []DiffFile{}, Staged: staged, Error: err.Error()}, nil
+		}
+		for _, path := range dirty {
+			path = strings.ReplaceAll(path, "\\", "/")
+			if _, ok := known[path]; !ok {
+				files = append(files, DiffFile{Path: path, Status: "M"})
+				known[path] = struct{}{}
+			}
+		}
+		uFiles, uDiff, uErr := collectUntracked(git, root, paths, known)
 		if uErr != "" {
 			return DiffResult{OK: false, Files: []DiffFile{}, Staged: staged, Error: uErr}, nil
 		}
@@ -298,7 +322,7 @@ func gitDiff(ctx context.Context, root string, paths []string, staged bool) (Dif
 	}, nil
 }
 
-func collectUntracked(root string, paths []string, known map[string]struct{}) (files []DiffFile, unified string, failure string) {
+func collectUntracked(git *proc.GitSession, root string, paths []string, known map[string]struct{}) (files []DiffFile, unified string, failure string) {
 	held, err := os.OpenRoot(root)
 	if err != nil {
 		return nil, "", err.Error()
@@ -315,7 +339,7 @@ func collectUntracked(root string, paths []string, known map[string]struct{}) (f
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), DiffTimeout)
 	defer cancel()
-	out, err := runGit(ctx, root, args...)
+	out, err := runGit(ctx, git, args...)
 	if err != nil && out.returnCode == 0 {
 		return nil, "", err.Error()
 	}
@@ -499,13 +523,13 @@ type gitOut struct {
 	returnCode int
 }
 
-// runGit runs a git read built by proc.GitCommand: a git the repository
-// supplies, or a program its .git/config names, does not get to describe the
-// repository. A refusal comes back as an *exec.Error, like a git that is
-// missing, so callers report that git could not run rather than that root is
-// not a repository.
-func runGit(ctx context.Context, root string, args ...string) (gitOut, error) {
-	cmd, err := proc.GitCommand(ctx, root, args...)
+// runGit runs a git read built by the operation's proc.GitSession: a git the
+// repository supplies, or a program its .git/config names, does not get to
+// describe the repository. A refusal comes back as an *exec.Error, like a git
+// that is missing, so callers report that git could not run rather than that
+// root is not a repository.
+func runGit(ctx context.Context, git *proc.GitSession, args ...string) (gitOut, error) {
+	cmd, err := git.Command(ctx, args...)
 	if err != nil {
 		return gitOut{stderr: err.Error(), returnCode: -1}, err
 	}

@@ -198,104 +198,6 @@ fn diagnostics_stay_inside_their_own_budget() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// A stale-server check that could not run must not answer like one that ran
-/// and found nothing.
-///
-/// Both halves of this were reported as `None` — the same value a completed
-/// clean scan returns — so anything looking for a warning string read "no stale
-/// servers" out of a check that never produced a process list. `ps` is shimmed
-/// because a failing process table is not something a test may arrange on the
-/// real one.
-///
-/// There is no fan-out left to cap here: `etime=` is elapsed time parsed in
-/// process, where this once asked for a local-time `lstart=` and spawned a
-/// `date` per matching line. A long list is now string parsing, so this fixture
-/// prints three hundred rows to show that length alone is not a problem.
-#[test]
-fn a_stale_server_check_that_could_not_run_says_so() {
-    for (label, script, expected) in [
-        (
-            "nonzero exit",
-            "#!/bin/sh\necho 'ps: unsupported option' >&2\nexit 1\n",
-            "exited with 1",
-        ),
-        ("not on PATH", "", "could not be read"),
-    ] {
-        let root = std::env::temp_dir().join(format!(
-            "devmap-psfail-{}-{}",
-            std::process::id(),
-            NEXT_SCRATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        fs::create_dir_all(root.join("bin")).unwrap();
-        fs::create_dir_all(root.join("home")).unwrap();
-        if !script.is_empty() {
-            let ps = root.join("bin/ps");
-            fs::write(&ps, script).unwrap();
-            fs::set_permissions(&ps, fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let warning = paths_field(&root, "stale_server_warning");
-        let warning = warning
-            .as_str()
-            .unwrap_or_else(|| panic!("{label}: expected a reading, got {warning}"));
-        assert!(
-            warning.contains("unavailable"),
-            "{label}: a check that did not run must say so: {warning}"
-        );
-        assert!(
-            warning.contains(expected),
-            "{label}: the reason must name what happened: {warning}"
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-}
-
-/// A process list long enough to have been a fan-out problem is now just lines.
-#[test]
-fn a_long_process_list_is_examined_whole() {
-    let root = std::env::temp_dir().join(format!(
-        "devmap-pslong-{}-{}",
-        std::process::id(),
-        NEXT_SCRATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    fs::create_dir_all(root.join("bin")).unwrap();
-    fs::create_dir_all(root.join("home")).unwrap();
-    let ps = root.join("bin/ps");
-    // `etime` of 99 days, so every row predates any binary mtime and all three
-    // hundred must appear in the answer.
-    fs::write(
-        &ps,
-        "#!/bin/sh\ni=0\nwhile [ $i -lt 300 ]; do\n  echo \"$((1000+i)) 99-00:00:01 /usr/local/bin/devmap mcp\"\n  i=$((i+1))\ndone\n",
-    )
-    .unwrap();
-    fs::set_permissions(&ps, fs::Permissions::from_mode(0o755)).unwrap();
-
-    let warning = paths_field(&root, "stale_server_warning");
-    let warning = warning
-        .as_str()
-        .unwrap_or_else(|| panic!("expected a stale-server reading, got {warning}"));
-    assert!(
-        warning.contains("started before the installed binary's mtime"),
-        "{warning}"
-    );
-    // Every line reached, so no coverage caveat belongs in the answer.
-    assert!(
-        !warning.contains("capped") && !warning.contains("incomplete"),
-        "nothing caps this scan any more: {warning}"
-    );
-    // The shim's pids run 1000..1299, so the answer must name them rather than
-    // only counting them.
-    assert!(
-        warning.contains("1000"),
-        "the pids must be listed: {warning}"
-    );
-    assert!(
-        warning.contains("1299"),
-        "the last pid must be listed: {warning}"
-    );
-    fs::remove_dir_all(root).unwrap();
-}
-
 /// Distinct scratch names without a clock: nanosecond stamps collide when cargo
 /// runs these in parallel on macOS, because the spawn is faster than the clock
 /// is fine.
@@ -326,4 +228,35 @@ fn paths_field(root: &std::path::Path, field: &str) -> serde_json::Value {
     );
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     payload[field].clone()
+}
+
+/// The stale-server check reads the process table with the system's `ps`,
+/// never one found on PATH. `paths` is what the agent guide tells every agent
+/// to run first, in the agent's environment, where a PATH entry can name a
+/// directory inside the repository; a `ps` planted there must not start.
+#[test]
+fn the_stale_server_check_never_runs_a_ps_found_on_path() {
+    let root = std::env::temp_dir().join(format!(
+        "devmap-psplant-{}-{}",
+        std::process::id(),
+        NEXT_SCRATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    fs::create_dir_all(root.join("bin")).unwrap();
+    fs::create_dir_all(root.join("home")).unwrap();
+    let marker = root.join("planted-ps-ran");
+    let ps = root.join("bin/ps");
+    fs::write(
+        &ps,
+        format!("#!/bin/sh\n: > '{}'\nexit 0\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&ps, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let warning = paths_field(&root, "stale_server_warning");
+    let planted_ran = marker.exists();
+    fs::remove_dir_all(&root).unwrap();
+    assert!(
+        !planted_ran,
+        "paths ran the ps found on PATH (stale_server_warning: {warning})"
+    );
 }

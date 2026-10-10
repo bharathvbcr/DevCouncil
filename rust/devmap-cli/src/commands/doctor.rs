@@ -60,11 +60,63 @@ fn doctor_report(
         "stray_state_warning": stray_state_warning(),
         "plugin_warning": plugin_warning(),
         "plugin_cleanup_note": plugin_cleanup_note(),
-        "stale_server_warning": stale_server_warning(),
+        "stale_server_warning": stale_server_warning(root),
         "mcp_registrations": mcp_registration_inventory(),
+        "git": git_report(root),
     });
     extend_agent_tools(&mut report, root);
     Ok(report)
+}
+
+/// The git the kernels would run against `root`: where it was found, its
+/// version, and whether it honours `GIT_NO_LAZY_FETCH`. A git that does not
+/// honour it still reads ordinary clones, and refuses to read a partial
+/// clone (ft-ff2153d9, D9), so the version is what explains such a refusal.
+/// Asking `git version` runs nothing the repository names.
+fn git_report(root: &Path) -> serde_json::Value {
+    use devmap_extract::subprocess::{git_version, resolve_outside};
+    let path_var = std::env::var_os("PATH");
+    let unavailable = |path: Option<&Path>, error: String| {
+        serde_json::json!({
+            "path": path.map(|p| p.display().to_string()),
+            "version": null,
+            "raw_version": null,
+            "honors_no_lazy_fetch": null,
+            "warning": null,
+            "error": error,
+        })
+    };
+    let git = match resolve_outside(std::ffi::OsStr::new("git"), path_var.as_deref(), root) {
+        Ok(git) => git,
+        Err(failure) => return unavailable(None, failure.to_string()),
+    };
+    match git_version(&git) {
+        Ok(Some(version)) => {
+            let honours = version.honors_no_lazy_fetch();
+            let warning = (!honours).then(|| {
+                format!(
+                    "git {version} does not honour GIT_NO_LAZY_FETCH: reads of a partial clone \
+                     are refused rather than risk a lazy fetch. Upgrade to 2.45.0 or later, or to \
+                     a maintenance release with the CVE-2024-32465 fix (2.39.4, 2.40.2, 2.41.1, \
+                     2.42.2, 2.43.4, 2.44.1)"
+                )
+            });
+            serde_json::json!({
+                "path": git.display().to_string(),
+                "version": version.to_string(),
+                "raw_version": version.raw,
+                "honors_no_lazy_fetch": honours,
+                "warning": warning,
+                "error": null,
+            })
+        }
+        Ok(None) => unavailable(
+            Some(&git),
+            "git ran but reported no version this can read; reads of a partial clone are refused"
+                .to_string(),
+        ),
+        Err(failure) => unavailable(Some(&git), failure.to_string()),
+    }
 }
 
 /// Add `agent_tools_warning` and `agent_tool_gaps`: the Claude Code agent

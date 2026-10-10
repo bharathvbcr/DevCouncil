@@ -6,7 +6,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -285,50 +287,81 @@ func ToCLITask(taskID string, gaps []Gap, meta runMeta) TaskCLIResult {
 }
 
 // CollectGitState probes the working tree for changed files and unified diff.
+//
+// Every read goes through one proc.GitSession, so the repository's config is
+// read once for the operation. A read that fails is reported, never read as
+// "nothing changed": the one failure that has a meaning of its own is a
+// repository with no HEAD yet, which lists its untracked files instead. A
+// missing object in a partial clone — git no longer fetches one on demand —
+// is an error like any other.
 func CollectGitState(ctx context.Context, root string) (changed []string, diff string, empty bool, err error) {
-	nameOut, err := runGit(ctx, root, "diff", "HEAD", "--name-only", "-z")
+	git, err := proc.NewGitSession(root)
 	if err != nil {
-		// Fall back to unstaged + untracked listing when HEAD is missing.
-		nameOut, err = runGit(ctx, root, "ls-files", "--others", "--exclude-standard", "-z")
+		return nil, "", true, err
+	}
+	nameOut, err := runGit(ctx, git, "diff", "HEAD", "--name-only", "-z")
+	headless := false
+	if err != nil {
+		if !hasNoHead(ctx, git) {
+			return nil, "", true, err
+		}
+		headless, nameOut = true, nil
+	}
+	seen := map[string]struct{}{}
+	add := func(listing []byte) {
+		for _, p := range strings.Split(string(listing), "\x00") {
+			p = strings.TrimSpace(strings.ReplaceAll(p, "\\", "/"))
+			if p == "" {
+				continue
+			}
+			if _, ok := seen[p]; !ok {
+				changed = append(changed, p)
+				seen[p] = struct{}{}
+			}
+		}
+	}
+	add(nameOut)
+	untracked, err := runGit(ctx, git, "ls-files", "--others", "--exclude-standard", "-z")
+	if err != nil {
+		return nil, "", true, err
+	}
+	add(untracked)
+	// The diff reads pass --ignore-submodules=dirty, so git does not run a
+	// status inside each submodule; dirtiness comes from a guarded read of
+	// each one, and a dirty submodule is a changed path as it was before.
+	dirty, err := git.DirtySubmodules(ctx)
+	if err != nil {
+		return nil, "", true, err
+	}
+	add([]byte(strings.Join(dirty, "\x00")))
+	if !headless {
+		diffBytes, err := runGit(ctx, git, "diff", "HEAD")
 		if err != nil {
 			return nil, "", true, err
 		}
+		diff = string(diffBytes)
 	}
-	for _, p := range strings.Split(string(nameOut), "\x00") {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			changed = append(changed, strings.ReplaceAll(p, "\\", "/"))
-		}
-	}
-	// Also include untracked.
-	untracked, _ := runGit(ctx, root, "ls-files", "--others", "--exclude-standard", "-z")
-	seen := make(map[string]struct{}, len(changed))
-	for _, c := range changed {
-		seen[c] = struct{}{}
-	}
-	for _, p := range strings.Split(string(untracked), "\x00") {
-		p = strings.TrimSpace(strings.ReplaceAll(p, "\\", "/"))
-		if p == "" {
-			continue
-		}
-		if _, ok := seen[p]; !ok {
-			changed = append(changed, p)
-			seen[p] = struct{}{}
-		}
-	}
-	diffBytes, _ := runGit(ctx, root, "diff", "HEAD")
-	diff = string(diffBytes)
 	empty = len(changed) == 0 && strings.TrimSpace(diff) == ""
 	return changed, diff, empty, nil
 }
 
-// runGit runs a git read built by proc.GitCommand. The diff verification
-// judges comes from git, and a git the repository supplies — or a program its
-// .git/config names — could report any diff it likes, including none.
-func runGit(ctx context.Context, root string, args ...string) ([]byte, error) {
+// hasNoHead reports whether the repository has no HEAD commit yet: git ran
+// and answered that HEAD does not resolve. A git that could not run, or was
+// refused, is not that answer.
+func hasNoHead(ctx context.Context, git *proc.GitSession) bool {
+	_, err := runGit(ctx, git, "rev-parse", "--verify", "--quiet", "HEAD")
+	var exit *exec.ExitError
+	return errors.As(err, &exit)
+}
+
+// runGit runs a git read built by the operation's proc.GitSession. The diff
+// verification judges comes from git, and a git the repository supplies — or
+// a program its .git/config names — could report any diff it likes,
+// including none.
+func runGit(ctx context.Context, git *proc.GitSession, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	cmd, err := proc.GitCommand(ctx, root, args...)
+	cmd, err := git.Command(ctx, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -337,19 +370,21 @@ func runGit(ctx context.Context, root string, args ...string) ([]byte, error) {
 	cmd.Stderr = &stderr
 	// Match the module-wide subprocess contract: RunBounded so a wedged Start
 	// cannot outlive the caller's deadline. Group isolation, so a timeout
-	// reaches grandchildren, is proc.GitCommand's (see proc.ConfigureGroup).
+	// reaches grandchildren, is proc.GitSession's (see proc.ConfigureGroup).
 	cmd.WaitDelay = 2 * time.Second
 	err, timedOut := proc.RunBounded(ctx, cmd.Run)
 	if timedOut {
 		return nil, fmt.Errorf("git %v did not return within the deadline: %w", args, ctx.Err())
 	}
 	if err != nil {
-		if len(stdout.Bytes()) > 0 {
-			return stdout.Bytes(), err
+		var exit *exec.ExitError
+		if errors.As(err, &exit) {
+			if detail := strings.TrimSpace(stderr.String()); detail != "" {
+				return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, detail)
+			}
 		}
 		return nil, err
 	}
-	_ = stderr
 	return stdout.Bytes(), nil
 }
 

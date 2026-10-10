@@ -915,7 +915,15 @@ fn parse_etime(text: &str) -> Option<std::time::Duration> {
     ))
 }
 
-pub(crate) fn stale_server_warning() -> Option<String> {
+/// Where the stale-server check looks for `ps`: the system's own directories,
+/// never the caller's PATH. `devmap paths` runs in the agent's environment,
+/// where a PATH entry can name a directory inside the repository, and a `ps`
+/// planted there would both run and choose the answer — an empty listing
+/// reads as "no stale servers".
+#[cfg(unix)]
+const PROCESS_INVENTORY_PATH: &str = "/bin:/usr/bin";
+
+pub(crate) fn stale_server_warning(root: &Path) -> Option<String> {
     // A tail expression, not `return None`: on Windows this arm *is* the whole
     // body, so the `return` was `clippy::needless_return` on the one platform
     // that compiles it — and `-D warnings` failed the build there on a line no
@@ -923,6 +931,7 @@ pub(crate) fn stale_server_warning() -> Option<String> {
     // "nothing is stale"; the check reads `ps`, which Windows does not have.
     #[cfg(not(unix))]
     {
+        let _ = root;
         None
     }
     #[cfg(unix)]
@@ -936,104 +945,145 @@ pub(crate) fn stale_server_warning() -> Option<String> {
         let Ok(bin_mtime) = meta.modified() else {
             return None;
         };
-        let mut command = std::process::Command::new("ps");
-        // `etime=` (elapsed), not `lstart=` (a local-time wall clock). Two
-        // reasons, both load-bearing:
-        //
-        // 1. `lstart` had to be turned into an instant, and that was done by
-        //    spawning `date -j -f ...` **once per matching line**. The line
-        //    count is the number of running DevMap MCP servers, which is
-        //    unbounded and grows with exactly the thing this tool is for:
-        //    measured 2026-09-12 on this machine, 67 matches meant 67 child
-        //    processes and 2.3-2.8 s inside a function whose own `ps` call is
-        //    budgeted at 500 ms. Each spawn was individually bounded and the
-        //    fan-out was not, so `devmap paths` got slower the more DevMap
-        //    sessions were open.
-        // 2. `date -j -f` is BSD-only. On Linux that child failed, and the
-        //    whole check returned "unavailable" — so it never worked in CI or
-        //    on any Linux host, and said so in a way nothing asserted.
-        //
-        // Elapsed time needs no timezone and no subprocess.
-        command.args(["-axo", "pid=,etime=,command="]);
-        // A deadline is a ceiling, not a cost: `run_bounded` returns the moment
-        // the child exits, so a wider bound is free in the common case and only
-        // widens the worst one.
-        //
-        // 500 ms was not a ceiling here, it was a coin flip. Measured
-        // 2026-09-12 on a developer machine running several agent sessions:
-        // `ps -axo` costs 0.40-0.52 s against 1,900 processes, so the check
-        // lost its own race about a third of the time on a release build and
-        // every time on a debug one — reporting "unavailable" while a genuinely
-        // stale MCP server went unmentioned. A check that usually cannot run is
-        // worse than no check, because its answer reads the same as a clean one
-        // to anything that only looks for a warning string.
-        //
-        // 4 s is ~8x the measured worst case, in the same spirit as the
-        // wall-clock budgets in verify.sh, which are set at ~2.5x measured and
-        // documented as catching a real regression rather than a busy machine.
-        let output = match devmap_extract::subprocess::run_bounded(&mut command,
-            devmap_extract::subprocess::Bounds { deadline: std::time::Duration::from_secs(4), stdout_cap: 4 * 1024 * 1024, stderr_cap: 4096 }) {
+        stale_servers_along(root, PROCESS_INVENTORY_PATH, bin_mtime)
+    }
+}
+
+/// The stale-server reading with `ps` found along `path_var` by
+/// `dc_proc::resolve_outside`, which also refuses an empty or relative entry
+/// and a candidate inside `root`. A `ps` that cannot be found or is refused
+/// is a check that could not run, and says so.
+#[cfg(unix)]
+fn stale_servers_along(
+    root: &Path,
+    path_var: &str,
+    bin_mtime: std::time::SystemTime,
+) -> Option<String> {
+    let ps = match devmap_extract::subprocess::resolve_outside(
+        std::ffi::OsStr::new("ps"),
+        Some(std::ffi::OsStr::new(path_var)),
+        root,
+    ) {
+        Ok(ps) => ps,
+        Err(failure) => {
+            return Some(format!(
+                "stale-server check unavailable: process inventory could not be read: {failure}"
+            ))
+        }
+    };
+    let mut command = std::process::Command::new(ps);
+    // `etime=` (elapsed), not `lstart=` (a local-time wall clock). Two
+    // reasons, both load-bearing:
+    //
+    // 1. `lstart` had to be turned into an instant, and that was done by
+    //    spawning `date -j -f ...` **once per matching line**. The line
+    //    count is the number of running DevMap MCP servers, which is
+    //    unbounded and grows with exactly the thing this tool is for:
+    //    measured 2026-09-12 on this machine, 67 matches meant 67 child
+    //    processes and 2.3-2.8 s inside a function whose own `ps` call is
+    //    budgeted at 500 ms. Each spawn was individually bounded and the
+    //    fan-out was not, so `devmap paths` got slower the more DevMap
+    //    sessions were open.
+    // 2. `date -j -f` is BSD-only. On Linux that child failed, and the
+    //    whole check returned "unavailable" — so it never worked in CI or
+    //    on any Linux host, and said so in a way nothing asserted.
+    //
+    // Elapsed time needs no timezone and no subprocess.
+    command.args(["-axo", "pid=,etime=,command="]);
+    // A deadline is a ceiling, not a cost: `run_bounded` returns the moment
+    // the child exits, so a wider bound is free in the common case and only
+    // widens the worst one.
+    //
+    // 500 ms was not a ceiling here, it was a coin flip. Measured
+    // 2026-09-12 on a developer machine running several agent sessions:
+    // `ps -axo` costs 0.40-0.52 s against 1,900 processes, so the check
+    // lost its own race about a third of the time on a release build and
+    // every time on a debug one — reporting "unavailable" while a genuinely
+    // stale MCP server went unmentioned. A check that usually cannot run is
+    // worse than no check, because its answer reads the same as a clean one
+    // to anything that only looks for a warning string.
+    //
+    // 4 s is ~8x the measured worst case, in the same spirit as the
+    // wall-clock budgets in verify.sh, which are set at ~2.5x measured and
+    // documented as catching a real regression rather than a busy machine.
+    let output =
+        match devmap_extract::subprocess::run_bounded(
+            &mut command,
+            devmap_extract::subprocess::Bounds {
+                deadline: std::time::Duration::from_secs(4),
+                stdout_cap: 4 * 1024 * 1024,
+                stderr_cap: 4096,
+            },
+        ) {
             Ok(output) if !output.stdout_truncated && !output.stderr_truncated => output,
             // Two different unavailabilities, and they were reported as one. A
-            // `ps` that is not on `PATH` never ran; saying it "did not complete
-            // within its bounds" sends the reader looking for a slow machine.
-            Ok(_) => return Some("stale-server check unavailable: process inventory did not complete within its time/output bounds".into()),
-            Err(failure) => return Some(format!("stale-server check unavailable: process inventory could not be read: {failure}")),
+            // `ps` that never ran is not one that ran slowly; saying it "did not
+            // complete within its bounds" sends the reader looking for a slow
+            // machine.
+            Ok(_) => return Some(
+                "stale-server check unavailable: process inventory did not complete within its \
+                 time/output bounds"
+                    .into(),
+            ),
+            Err(failure) => {
+                return Some(format!(
+                "stale-server check unavailable: process inventory could not be read: {failure}"
+            ))
+            }
         };
-        // The same conflation one line down from where it was just fixed: a `ps`
-        // that exited nonzero told the caller `None`, which is the answer a
-        // completed clean scan gives. Anything looking for a warning string read
-        // "no stale servers" out of a check that never produced a process list.
-        if !output.status.success() {
-            return Some(format!(
-                "stale-server check unavailable: process inventory exited with {}",
-                output
-                    .status
-                    .code()
-                    .map(|code| code.to_string())
-                    .unwrap_or_else(|| "a signal".to_string())
-            ));
-        }
-        let text = String::from_utf8_lossy(&output.stdout);
-        // No per-line child process here any more: `etime=` is elapsed time
-        // that `parse_etime` reads in process, where this used to ask `ps` for a
-        // local-time `lstart=` and then spawn a `date` per matching line to turn
-        // it into an instant. That fan-out was the cost worth bounding, and
-        // removing it beats capping it.
-        let mut stale = Vec::new();
-        for line in text.lines() {
-            let line = line.trim();
-            if !line.contains("devmap") || !line.contains("mcp") {
-                continue;
-            }
-            // `ps -axo pid=,etime=,command=` — `1-02:03:04`, `02:03:04`, `03:04`.
-            let mut parts = line.split_whitespace();
-            let Some(pid) = parts.next() else {
-                continue;
-            };
-            let Some(etime) = parts.next() else {
-                continue;
-            };
-            let Some(elapsed) = parse_etime(etime) else {
-                continue;
-            };
-            let Some(started_at) = std::time::SystemTime::now().checked_sub(elapsed) else {
-                continue;
-            };
-            if started_at < bin_mtime {
-                stale.push(pid.to_string());
-            }
-        }
-        if stale.is_empty() {
-            // Every line was examined, so an empty list is a real answer.
-            return None;
-        }
-        Some(format!(
-            "devmap mcp process(es) started before the installed binary's mtime: pid {}; \
-             restart hosts so they pick up the current binary",
-            stale.join(", ")
-        ))
+    // The same conflation one line down from where it was just fixed: a `ps`
+    // that exited nonzero told the caller `None`, which is the answer a
+    // completed clean scan gives. Anything looking for a warning string read
+    // "no stale servers" out of a check that never produced a process list.
+    if !output.status.success() {
+        return Some(format!(
+            "stale-server check unavailable: process inventory exited with {}",
+            output
+                .status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "a signal".to_string())
+        ));
     }
+    let text = String::from_utf8_lossy(&output.stdout);
+    // No per-line child process here any more: `etime=` is elapsed time
+    // that `parse_etime` reads in process, where this used to ask `ps` for a
+    // local-time `lstart=` and then spawn a `date` per matching line to turn
+    // it into an instant. That fan-out was the cost worth bounding, and
+    // removing it beats capping it.
+    let mut stale = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.contains("devmap") || !line.contains("mcp") {
+            continue;
+        }
+        // `ps -axo pid=,etime=,command=` — `1-02:03:04`, `02:03:04`, `03:04`.
+        let mut parts = line.split_whitespace();
+        let Some(pid) = parts.next() else {
+            continue;
+        };
+        let Some(etime) = parts.next() else {
+            continue;
+        };
+        let Some(elapsed) = parse_etime(etime) else {
+            continue;
+        };
+        let Some(started_at) = std::time::SystemTime::now().checked_sub(elapsed) else {
+            continue;
+        };
+        if started_at < bin_mtime {
+            stale.push(pid.to_string());
+        }
+    }
+    if stale.is_empty() {
+        // Every line was examined, so an empty list is a real answer.
+        return None;
+    }
+    Some(format!(
+        "devmap mcp process(es) started before the installed binary's mtime: pid {}; \
+         restart hosts so they pick up the current binary",
+        stale.join(", ")
+    ))
 }
 
 #[cfg(test)]
@@ -1220,5 +1270,144 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(2),
             "passive inspection waited for the hung program"
         );
+    }
+
+    /// A scratch repository root and, beside it, a directory holding a `ps`
+    /// stand-in with `script` (none when empty). The stand-in is found by
+    /// passing that directory as the search path, never through PATH: the
+    /// check does not read PATH any more.
+    #[cfg(unix)]
+    fn ps_fixture(label: &str, script: &str) -> (PathBuf, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "devmap-ps-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let root = base.join("repo");
+        let bin = base.join("system-bin");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        if !script.is_empty() {
+            let ps = bin.join("ps");
+            std::fs::write(&ps, script).unwrap();
+            std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        (base, root, bin)
+    }
+
+    /// A stale-server check that could not run must not answer like one that
+    /// ran and found nothing: a `ps` that exits nonzero, or that is not there,
+    /// is reported as unavailable with its reason, never as `None`.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_server_check_that_could_not_run_says_so() {
+        for (label, script, expected) in [
+            (
+                "nonzero exit",
+                "#!/bin/sh\necho 'ps: unsupported option' >&2\nexit 1\n",
+                "exited with 1",
+            ),
+            ("not found", "", "could not be read"),
+        ] {
+            let (base, root, bin) = ps_fixture("fail", script);
+            let warning =
+                stale_servers_along(&root, bin.to_str().unwrap(), std::time::SystemTime::now());
+            std::fs::remove_dir_all(&base).unwrap();
+            let warning =
+                warning.unwrap_or_else(|| panic!("{label}: a check that did not run read clean"));
+            assert!(
+                warning.contains("unavailable"),
+                "{label}: a check that did not run must say so: {warning}"
+            );
+            assert!(
+                warning.contains(expected),
+                "{label}: the reason must name what happened: {warning}"
+            );
+        }
+    }
+
+    /// A process list long enough to have been a fan-out problem is now just
+    /// lines: all three hundred rows are examined and named.
+    #[cfg(unix)]
+    #[test]
+    fn a_long_process_list_is_examined_whole() {
+        // `etime` of 99 days, so every row predates the binary mtime given.
+        let (base, root, bin) = ps_fixture(
+            "long",
+            "#!/bin/sh\ni=0\nwhile [ $i -lt 300 ]; do\n  echo \"$((1000+i)) 99-00:00:01 /usr/local/bin/devmap mcp\"\n  i=$((i+1))\ndone\n",
+        );
+        let warning =
+            stale_servers_along(&root, bin.to_str().unwrap(), std::time::SystemTime::now());
+        std::fs::remove_dir_all(&base).unwrap();
+        let warning = warning.expect("expected a stale-server reading");
+        assert!(
+            warning.contains("started before the installed binary's mtime"),
+            "{warning}"
+        );
+        assert!(
+            !warning.contains("capped") && !warning.contains("incomplete"),
+            "nothing caps this scan any more: {warning}"
+        );
+        assert!(
+            warning.contains("1000"),
+            "the pids must be listed: {warning}"
+        );
+        assert!(
+            warning.contains("1299"),
+            "the last pid must be listed: {warning}"
+        );
+    }
+
+    /// The search path the check is given is held to `resolve_outside`'s
+    /// rules: a `ps` inside the repository, or behind a relative entry, is
+    /// refused and never run, and the check says it could not run.
+    #[cfg(unix)]
+    #[test]
+    fn a_ps_inside_the_repository_is_refused_not_run() {
+        let (base, root, _) = ps_fixture("inside", "");
+        let marker = base.join("planted-ps-ran");
+        let planted_dir = root.join("tools").join("bin");
+        std::fs::create_dir_all(&planted_dir).unwrap();
+        let planted = planted_dir.join("ps");
+        std::fs::write(&planted, format!("#!/bin/sh\n: > '{}'\n", marker.display())).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let inside = stale_servers_along(
+            &root,
+            planted_dir.to_str().unwrap(),
+            std::time::SystemTime::now(),
+        );
+        let relative = stale_servers_along(&root, "tools/bin", std::time::SystemTime::now());
+        let ran = marker.exists();
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(!ran, "a ps inside the repository ran");
+        for (label, warning) in [("inside", inside), ("relative", relative)] {
+            let warning = warning.unwrap_or_else(|| panic!("{label}: a refused ps read clean"));
+            assert!(
+                warning.contains("unavailable") && warning.contains("could not be read"),
+                "{label}: {warning}"
+            );
+        }
+    }
+
+    /// The system search path is fixed, so the check finds a real `ps` with
+    /// nothing from the caller's environment.
+    #[cfg(unix)]
+    #[test]
+    fn the_system_ps_is_found_without_path() {
+        let (base, root, _) = ps_fixture("system", "");
+        let found = devmap_extract::subprocess::resolve_outside(
+            std::ffi::OsStr::new("ps"),
+            Some(std::ffi::OsStr::new(PROCESS_INVENTORY_PATH)),
+            &root,
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+        let found =
+            found.unwrap_or_else(|failure| panic!("no ps in {PROCESS_INVENTORY_PATH}: {failure}"));
+        assert!(found.is_absolute(), "{}", found.display());
     }
 }

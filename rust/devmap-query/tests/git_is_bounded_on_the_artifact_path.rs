@@ -34,7 +34,16 @@ fn fake_git(body: &str) -> (PathBuf, PathBuf) {
         std::env::temp_dir().join(format!("devmap-fakegit-{}-{sequence}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("git");
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    // It answers `version` as a current git does, so the read under test is
+    // the one the body describes: the runner asks a git's version before a
+    // filter-free read (ft-ff2153d9, D9).
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = version ] && {{ echo 'git version 2.54.0'; exit 0; }}\n{body}\n"
+        ),
+    )
+    .unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     (dir, path)
 }

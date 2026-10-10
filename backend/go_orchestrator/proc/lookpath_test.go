@@ -555,3 +555,151 @@ func TestLookPathOutsideAgainstGeneratedLayouts(t *testing.T) {
 		}
 	}
 }
+
+// repositoryWithSubdirectory returns a repository top marked by marker (".git"
+// as a directory, ".git" as a worktree's file, or ".devcouncil"), its backend
+// subdirectory, and a planted executable at tools/bin under the top.
+func repositoryWithSubdirectory(t *testing.T, marker string, markerIsFile bool) (top, sub, planted string) {
+	t.Helper()
+	top = filepath.Join(t.TempDir(), "repo")
+	sub = filepath.Join(top, "backend")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if markerIsFile {
+		if err := os.WriteFile(filepath.Join(top, marker), []byte("gitdir: /elsewhere\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	} else if err := os.Mkdir(filepath.Join(top, marker), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	planted = filepath.Join(top, "tools", "bin", "tool-under-test")
+	writeExecutable(t, planted)
+	return top, sub, planted
+}
+
+// Running from a subdirectory of the repository does not move the boundary to
+// that subdirectory: the repository is the whole checkout, so a program the
+// checkout carries beside it is still repository content. Root is given both
+// explicitly and as the working directory a command without --project-root
+// runs in.
+func TestLookPathOutsideRefusesRepositoryContentAboveASubdirectoryRoot(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		marker       string
+		markerIsFile bool
+	}{
+		{"git directory", ".git", false},
+		{"worktree git file", ".git", true},
+		{"devcouncil without git", ".devcouncil", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, sub, planted := repositoryWithSubdirectory(t, tc.marker, tc.markerIsFile)
+			t.Setenv("PATH", filepath.Dir(planted))
+			t.Chdir(sub)
+			for _, root := range []string{sub, ""} {
+				got, err := LookPathOutside("tool-under-test", root)
+				if !errors.Is(err, ErrRepositoryLocal) {
+					t.Fatalf("root %q: accepted repository content above the root: %q (err %v)", root, got, err)
+				}
+				got, err = ResolveComponent("tool-under-test", root, Override{})
+				if !errors.Is(err, ErrRepositoryLocal) {
+					t.Fatalf("root %q: ResolveComponent accepted repository content above the root: %q (err %v)", root, got, err)
+				}
+			}
+		})
+	}
+}
+
+// A .devcouncil below the nearest .git lies inside that checkout, so the
+// boundary is the outer of the two.
+func TestLookPathOutsideBoundaryIsTheOuterOfGitAndDevCouncil(t *testing.T) {
+	top, sub, planted := repositoryWithSubdirectory(t, ".git", false)
+	if err := os.Mkdir(filepath.Join(sub, ".devcouncil"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	inner := filepath.Join(sub, "pkg")
+	if err := os.Mkdir(inner, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", filepath.Dir(planted))
+
+	got, err := LookPathOutside("tool-under-test", inner)
+	if !errors.Is(err, ErrRepositoryLocal) {
+		t.Fatalf("a nested .devcouncil narrowed the boundary below %s: %q (err %v)", top, got, err)
+	}
+}
+
+// homeWithDotfilesRepository builds a home directory that is itself a git
+// repository (a dotfiles checkout), holding an installed component in
+// ~/.local/bin, and an empty PATH.
+func homeWithDotfilesRepository(t *testing.T) (home, installed string) {
+	t.Helper()
+	base := t.TempDir()
+	home = filepath.Join(base, "home")
+	for _, dir := range []string{filepath.Join(home, ".git"), filepath.Join(base, "empty")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	installed = filepath.Join(home, ".local", "bin", "tool-under-test")
+	writeExecutable(t, installed)
+	t.Setenv("PATH", filepath.Join(base, "empty"))
+	t.Setenv("HOME", home)
+	return home, installed
+}
+
+// The walk stops at the nearest .git. A repository inside a home directory
+// that is itself a dotfiles repository is the inner checkout, so the
+// installation in ~/.local/bin — outside it — still resolves, and a
+// .devcouncil above that .git does not widen the boundary past it either.
+func TestResolveComponentBoundaryStopsAtTheNearestGit(t *testing.T) {
+	home, installed := homeWithDotfilesRepository(t)
+	if err := os.Mkdir(filepath.Join(home, ".devcouncil"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	repo := filepath.Join(home, "Code", "repo")
+	sub := filepath.Join(repo, "backend")
+	for _, dir := range []string{filepath.Join(repo, ".git"), sub} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want, err := filepath.EvalSymlinks(installed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, root := range []string{repo, sub} {
+		got, err := ResolveComponent("tool-under-test", root, Override{})
+		if err != nil {
+			t.Fatalf("root %s: an outer repository swallowed ~/.local/bin: %v", root, err)
+		}
+		if got != want {
+			t.Fatalf("root %s: resolved %q, want %q", root, got, want)
+		}
+	}
+}
+
+// An installation outside the repository still resolves when the root is a
+// subdirectory of it.
+func TestLookPathOutsideAcceptsInstallationOutsideFromASubdirectory(t *testing.T) {
+	top, sub, _ := repositoryWithSubdirectory(t, ".git", false)
+	installed := filepath.Join(filepath.Dir(top), "usr", "bin", "tool-under-test")
+	writeExecutable(t, installed)
+	t.Setenv("PATH", filepath.Dir(installed))
+	t.Chdir(sub)
+
+	want, err := filepath.EvalSymlinks(installed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, root := range []string{sub, ""} {
+		got, err := LookPathOutside("tool-under-test", root)
+		if err != nil {
+			t.Fatalf("root %q: refused an installation outside the repository: %v", root, err)
+		}
+		if got != want {
+			t.Fatalf("root %q: resolved %q, want %q", root, got, want)
+		}
+	}
+}
