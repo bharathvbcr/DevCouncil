@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use dc_proc::{git_version, git_with_program, run_bounded, Bounds, Captured, Failure, GitVersion};
+use dc_proc::{Bounds, Captured, Failure, GitVersion, git_version, git_with_program, run_bounded};
 
 struct Scratch(PathBuf);
 
