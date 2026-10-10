@@ -17,3 +17,33 @@ exempt	apps/web/src/v/ambient.d.ts::'*.svg'	V18: ambient declare module shim
 exempt	apps/web/src/v/augment.ts::'./logger'	V19: module augmentation
 exempt	apps/web/src/v/augment.ts::LoggerExtras	V19: interface inside a module augmentation
 exempt	apps/web/src/v/augment.ts::Window	V19: declare global augmentation
+# Labelled 2026-10-10 from source references, so every reported row is scored (the 0.4 record).
+exported_unreferenced	apps/web/src/App.tsx::runHeavy	nothing in the fixture references it
+exported_unreferenced	apps/web/src/v/ClassComp.tsx::Legacy	nothing in the fixture references it
+exported_unreferenced	apps/web/src/v/effects.tsx::EffectUser	nothing in the fixture references it
+exported_unreferenced	apps/web/src/v/importtypeuser.tsx::ImportTypeUser	nothing in the fixture references it
+exported_unreferenced	apps/web/src/v/router.tsx::router	nothing in the fixture references it
+exported_unreferenced	apps/web/src/v/typeofuser.tsx::TypeofUser	nothing in the fixture references it
+exported_unreferenced	apps/web/src/services/store.ts::useClient	nothing in the fixture references it
+exported_unreferenced	apps/web/src/services/store.ts::useService	nothing in the fixture references it
+exported_unreferenced	apps/web/src/services/store.ts::viaConcrete	nothing in the fixture references it
+exported_unreferenced	apps/web/src/services/store.ts::viaStatic	nothing in the fixture references it
+exported_unreferenced	apps/web/src/v/arrowuser.ts::useArrow	nothing in the fixture references it
+exported_unreferenced	apps/web/src/v/deadlocal.ts::liveEntry	nothing in the fixture references it
+exported_unreferenced	apps/web/src/v/defaults.ts::withDeps	nothing in the fixture references it
+exported_unreferenced	apps/web/src/v/defaults.ts::withPlain	nothing in the fixture references it
+exported_unreferenced	apps/web/src/v/grammar.ts::afterAbstract	nothing in the fixture references it
+exported_unreferenced	apps/web/src/v/lexicalthis.ts::Gateway	nothing in the fixture references it
+exported_unreferenced	apps/web/src/v/lexicalthis.ts::Gateway.open	nothing in the fixture references it
+exported_unreferenced	apps/web/src/v/loggeruser.ts::useLogger	nothing in the fixture references it
+exported_unreferenced	apps/web/src/v/npmcollide.ts::callsNpm	nothing in the fixture references it
+exported_unreferenced	apps/web/src/v/onlyfmt.ts::useFmtOnly	nothing in the fixture references it
+exported_unreferenced	apps/web/src/v/typedparam.ts::viaArrowParam	nothing in the fixture references it
+exported_unreferenced	apps/web/src/v/typedparam.ts::viaIface	nothing in the fixture references it
+exported_unreferenced	apps/web/src/v/typedparam.ts::viaParam	nothing in the fixture references it
+exported_unreferenced	apps/web/src/v/view2user.ts::consumeWorkspace	nothing in the fixture references it
+live	apps/web/src/pages/AboutPage.tsx::AboutPage	default export loaded by lazy(() => import(...)) (App.tsx:5)
+live	apps/web/src/v/lazyroute.tsx::Component	React Router lazy route renders the module Component export (router.tsx:4)
+live	apps/web/src/services/store.ts::fetchOne	useService calls paperService.fetchOne (store.ts:16)
+live	apps/web/src/v/lexicalthis.ts::Gateway.buildUrl	this.buildUrl(p) inside connect (lexicalthis.ts:4)
+live	apps/web/src/v/store2.ts::useWorkspace	re-exported by view2.ts, called by consumeWorkspace (view2user.ts:2)

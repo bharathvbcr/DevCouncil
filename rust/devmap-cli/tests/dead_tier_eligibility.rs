@@ -23,6 +23,13 @@
 //! symbols are reported, `live` ones never above 0.4, `exempt` ones never
 //! reported, and `exported_unreferenced` ones at 0.4 with that token. And the
 //! `excluded` disclosure is checked against the exempt rows the store holds.
+//!
+//! Every reported row must be labelled, so the unconfirmed tier is scored too:
+//! `testdata/accuracy/dead_unconfirmed_record.tsv` records, per language, the
+//! 0.4 rows and how many of them are `live` or `exempt` (false positives). The
+//! 0.4 tier has no gate — it is "unconfirmed" by contract — but its rate is
+//! recorded, and a change that moves it fails here until the record is updated
+//! in the same change.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -185,17 +192,20 @@ impl LanguageScore {
     }
 }
 
+/// Per language: `(corpus, false_positive, rows)` for each corpus that measured it.
+type CorpusRates = BTreeMap<String, Vec<(String, u64, u64)>>;
+
 /// Corpus 0.9-tier false-positive counts from the accuracy harness's record,
 /// by language, when the record exists.
 ///
 /// Shape read: `{"corpora": [{"name": …, "languages": {"<lang>": {"dead_fp_by_tier":
 /// {"0.9": {"false_positive": n, "rows": m}}}}}]}`.
-fn corpus_record() -> Option<BTreeMap<String, Vec<(String, u64, u64)>>> {
+fn corpus_record() -> Option<CorpusRates> {
     let path = accuracy_root().join("record.json");
     let raw = std::fs::read_to_string(&path).ok()?;
     let record: serde_json::Value = serde_json::from_str(&raw)
         .unwrap_or_else(|e| panic!("{} is not JSON: {e}", path.display()));
-    let mut by_language: BTreeMap<String, Vec<(String, u64, u64)>> = BTreeMap::new();
+    let mut by_language: CorpusRates = BTreeMap::new();
     for corpus in record["corpora"].as_array().into_iter().flatten() {
         let name = corpus["name"].as_str().unwrap_or("?").to_string();
         for (language, entry) in corpus["languages"].as_object().into_iter().flatten() {
@@ -216,6 +226,37 @@ fn corpus_record() -> Option<BTreeMap<String, Vec<(String, u64, u64)>>> {
     Some(by_language)
 }
 
+/// The committed 0.4-tier record: language → `(rows, false_positive)`.
+fn unconfirmed_record() -> BTreeMap<String, (u64, u64)> {
+    let path = accuracy_root().join("dead_unconfirmed_record.tsv");
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let mut out = BTreeMap::new();
+    for line in raw.lines() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        let [language, rows, false_positive] = fields.as_slice() else {
+            panic!(
+                "{}: want language<TAB>rows<TAB>false_positive, got {line:?}",
+                path.display()
+            );
+        };
+        let parse = |field: &str| {
+            field
+                .parse::<u64>()
+                .unwrap_or_else(|e| panic!("{}: {field:?} in {line:?}: {e}", path.display()))
+        };
+        assert!(
+            out.insert(language.to_string(), (parse(rows), parse(false_positive)))
+                .is_none(),
+            "{}: {language} recorded twice",
+            path.display()
+        );
+    }
+    out
+}
+
 #[test]
 fn the_confident_tier_is_listed_exactly_for_the_languages_their_fixtures_prove() {
     let mut fixtures: Vec<PathBuf> = std::fs::read_dir(accuracy_root())
@@ -231,6 +272,7 @@ fn the_confident_tier_is_listed_exactly_for_the_languages_their_fixtures_prove()
     );
 
     let mut scores: BTreeMap<&'static str, LanguageScore> = BTreeMap::new();
+    let mut unconfirmed: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     let mut violations: Vec<String> = Vec::new();
 
     for fixture in &fixtures {
@@ -265,6 +307,22 @@ fn the_confident_tier_is_listed_exactly_for_the_languages_their_fixtures_prove()
                      CONFIDENT_TIER_ELIGIBLE",
                     confidence(row)
                 ));
+            }
+            match truth.get(&id) {
+                None => violations.push(format!(
+                    "{name}: {id} is reported ({:.2}, {}) but not labelled in dead.tsv — \
+                     label it, or the tier records score a sample",
+                    confidence(row),
+                    reason(row)
+                )),
+                Some(verdict) if confidence(row) <= UNCONFIRMED_CEILING + 1e-6 => {
+                    let tally = unconfirmed.entry(language.to_string()).or_default();
+                    tally.0 += 1;
+                    if matches!(verdict, Verdict::Live | Verdict::Exempt) {
+                        tally.1 += 1;
+                    }
+                }
+                Some(_) => {}
             }
             reported.insert(id, row);
         }
@@ -344,6 +402,19 @@ fn the_confident_tier_is_listed_exactly_for_the_languages_their_fixtures_prove()
         }
 
         check_excluded(&name, &built, &mut violations);
+    }
+
+    let recorded = unconfirmed_record();
+    if recorded != unconfirmed {
+        let measured: Vec<String> = unconfirmed
+            .iter()
+            .map(|(language, (rows, fp))| format!("{language}\t{rows}\t{fp}"))
+            .collect();
+        violations.push(format!(
+            "the 0.4-tier record {recorded:?} no longer matches the fixtures; measured \
+             (language, rows, false_positive):\n{}",
+            measured.join("\n")
+        ));
     }
 
     let record = corpus_record();

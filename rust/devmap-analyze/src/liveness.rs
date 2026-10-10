@@ -1701,7 +1701,17 @@ fn attach_site_evidence(
     }
 
     // Per slot: how many sites, and the smallest `(path, enclosing, callee)`.
-    let mut found: Vec<(u32, Option<(&str, &str, &str)>)> = vec![(0, None); pending.len()];
+    type Site<'a> = (&'a str, &'a str, &'a str);
+    let mut found: Vec<(u32, Option<Site>)> = vec![(0, None); pending.len()];
+    fn record<'a>(entry: &mut (u32, Option<Site<'a>>), site: Site<'a>) {
+        entry.0 = entry.0.saturating_add(1);
+        if entry
+            .1
+            .is_none_or(|best| (site.0, site.1) < (best.0, best.1))
+        {
+            entry.1 = Some(site);
+        }
+    }
 
     for edge in resolution
         .edges
@@ -1728,14 +1738,7 @@ fn attach_site_evidence(
                 edge.source_symbol.as_str(),
                 member,
             );
-            let entry = &mut found[slot];
-            entry.0 = entry.0.saturating_add(1);
-            if entry
-                .1
-                .map_or(true, |best| (site.0, site.1) < (best.0, best.1))
-            {
-                entry.1 = Some(site);
-            }
+            record(&mut found[slot], site);
         }
     }
     for row in resolution
@@ -1752,14 +1755,7 @@ fn attach_site_evidence(
                 row.source_symbol.as_str(),
                 row.callee_name.as_str(),
             );
-            let entry = &mut found[slot];
-            entry.0 = entry.0.saturating_add(1);
-            if entry
-                .1
-                .map_or(true, |best| (site.0, site.1) < (best.0, best.1))
-            {
-                entry.1 = Some(site);
-            }
+            record(&mut found[slot], site);
         }
     }
 

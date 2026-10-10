@@ -13,3 +13,18 @@ exported_unreferenced	app/src/main/java/com/fx/app/Screens.kt::UnusedBadge	@Comp
 exempt	app/src/main/java/com/fx/app/BootReceiver.kt::BootReceiver	AndroidManifest receiver
 exempt	app/src/main/java/com/fx/app/FxApp.kt::FxApp	AndroidManifest application
 exempt	app/src/main/java/com/fx/app/MainActivity.kt::MainActivity	AndroidManifest activity
+# Labelled 2026-10-10 from source references, so every reported row is scored (the 0.4 record).
+exported_unreferenced	app/src/main/java/com/fx/app/Greeter.kt::Door.hello	no call site; greetAll calls English.hello
+live	app/src/main/java/com/fx/app/Greeter.kt::Greeter.greet	greetAll calls g.greet() (Greeter.kt:18)
+exported_unreferenced	app/src/main/java/com/fx/app/Greeter.kt::greetAll	nothing calls it
+exported_unreferenced	app/src/main/java/com/fx/app/HabitHistory.kt::HabitHistoryTemplate	nothing constructs it
+exported_unreferenced	app/src/main/java/com/fx/app/HabitHistory.kt::HabitHistoryTemplate.matchesAll	nothing calls it
+exported_unreferenced	app/src/main/java/com/fx/app/HabitHistory.kt::dropBlank	nothing calls it
+live	app/src/main/java/com/fx/app/MainViewModel.kt::MainViewModel.describe	HomeScreen calls vm.describe (Screens.kt:18)
+live	app/src/main/java/com/fx/app/Registry.kt::Clock.create	MainActivity.kt:22, ClockTest.kt:10
+live	app/src/main/java/com/fx/app/Registry.kt::Clock.elapsed	MainActivity.kt:39, ClockTest.kt:11
+live	app/src/main/java/com/fx/app/Registry.kt::Registry	FxApp.kt:11, LegacyMath.java:6
+live	app/src/main/java/com/fx/app/Registry.kt::Registry.register	FxApp.kt:11, LegacyMath.java:6
+live	app/src/main/java/com/fx/legacy/LegacyMath.java::LegacyMath	MainActivity.kt:15 import, :41 LegacyMath.twice
+exported_unreferenced	app/src/main/java/com/fx/legacy/LegacyMath.java::LegacyMath.callKotlin	nothing calls it
+live	app/src/main/java/com/fx/legacy/LegacyMath.java::LegacyMath.twice	MainActivity.kt:41
