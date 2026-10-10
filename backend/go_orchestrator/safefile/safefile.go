@@ -133,8 +133,8 @@ func noFollowParent(root *os.Root, name string) (*os.Root, string, error) {
 	return parent, parts[len(parts)-1], nil
 }
 
-// WriteAtomic writes content through OpenNoFollow into a sibling temp file
-// and renames it onto path. A symlink at the temp name is refused rather than
+// WriteAtomic writes content through OpenNoFollow into a sibling temp file,
+// fsyncs it, renames it onto path and fsyncs the directory (a no-op on Windows). A symlink at the temp name is refused rather than
 // followed; truncation is never requested of OpenNoFollow.
 //
 // It does NOT contain the parent. `filepath.Dir(path)` is resolved by the
@@ -169,6 +169,11 @@ func WriteAtomic(path string, content []byte, perm fs.FileMode) error {
 	if _, err := f.Write(content); err != nil {
 		return errors.Join(err, f.Close(), os.Remove(tmpName))
 	}
+	// The bytes are on disk before the name is published: without the sync a
+	// crash after the rename can leave the target present and empty.
+	if err := syncFile(f); err != nil {
+		return errors.Join(err, f.Close(), os.Remove(tmpName))
+	}
 	if err := f.Close(); err != nil {
 		_ = os.Remove(tmpName)
 		return err
@@ -181,5 +186,14 @@ func WriteAtomic(path string, content []byte, perm fs.FileMode) error {
 		_ = os.Remove(tmpName)
 		return err
 	}
-	return nil
+	// The rename is the commit point; the directory sync is what makes the new
+	// name survive a crash. A failure here is returned, though the file is
+	// already in place.
+	return syncDir(dir)
 }
+
+// syncFile and syncDir are variables so a test can make a durability step fail.
+var (
+	syncFile = func(f *os.File) error { return f.Sync() }
+	syncDir  = syncDirectory
+)
