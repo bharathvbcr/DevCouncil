@@ -4,8 +4,8 @@
 //! parse, 1 recovered by pattern (no calls extracted), 1 refused by discovery
 //! and never read at all" — and no surface anywhere carried a path. On this
 //! repository a real refusal is an escaping symlink (or an unreadable /
-//! non-UTF-8 path); oversized sources are an ordinary skip under the 1 MiB
-//! ceiling (`DiscoverySkipReason::Oversized::is_refusal` is false), so they
+//! non-UTF-8 path); oversized sources are their own `over_limit` bucket under
+//! the 1 MiB ceiling (`DiscoverySkipReason::Oversized::is_refusal` is false), so they
 //! must not be used as the refusal fixture here.
 //!
 //! Each list is capped at `devmap_store::COVERAGE_GAP_SAMPLE` and carries

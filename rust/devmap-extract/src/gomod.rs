@@ -235,11 +235,20 @@ fn visit_manifest_entry(root: &Path, entry: &ignore::DirEntry, found: &std::sync
     let mut found = crate::recover_lock(found);
     found.examined.insert(rel_str.clone());
     match read {
-        ManifestRead::Read(source) => {
-            if let Some(module) = parse_go_mod(&rel_str, &source) {
-                found.modules.push(module);
-            }
-        }
+        // A `go.mod` that reads and names no module is as lost as one that
+        // cannot be read: its prefix is what maps every import under it, and
+        // dropping it without a record filed those imports `External` with
+        // nothing saying why.
+        ManifestRead::Read(source) => match parse_go_mod(&rel_str, &source) {
+            Some(module) => found.modules.push(module),
+            None => found.refusals.push((
+                rel_str,
+                DiscoverySkipReason::Unreadable {
+                    reason: "could not be parsed: no `module` directive names a module path"
+                        .to_string(),
+                },
+            )),
+        },
         ManifestRead::Absent | ManifestRead::Skipped => {}
         // The error's own text, as discovery records the same failure, so a
         // `go.mod` both passes refuse is one row with one reason.
@@ -253,11 +262,15 @@ fn visit_manifest_entry(root: &Path, entry: &ignore::DirEntry, found: &std::sync
 /// is already the second walk of it on the build path.
 pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests> {
     let walk_root = root.to_path_buf();
-    let marker_error = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let marker_error_writer = std::sync::Arc::clone(&marker_error);
-    let walker = ignore::WalkBuilder::new(root)
-        .hidden(false)
-        .git_ignore(true)
+    let marker_errors = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::<
+        String,
+        String,
+    >::new()));
+    let marker_error_writer = std::sync::Arc::clone(&marker_errors);
+    // The same rule sources as discovery, from the same owner: a manifest the
+    // cold walk skips must not be read by this one, or a `.ignore`d `go.mod`
+    // would map modules for sources the graph never holds.
+    let walker = crate::walk_builder(root)
         .filter_entry(move |entry| {
             if entry.path() == walk_root || !entry.file_type().is_some_and(|kind| kind.is_dir()) {
                 return true;
@@ -267,17 +280,23 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
                 Err(error) => {
                     // Let the walk report a directory it cannot open through
                     // the below-root refusal path below. Discovery already
-                    // accounts for that hole; an unreadable marker inside an
-                    // otherwise readable directory still fails this pass.
+                    // accounts for that hole.
                     if fs::read_dir(entry.path()).is_err() {
                         return true;
                     }
-                    crate::recover_lock(&marker_error_writer).get_or_insert_with(|| {
-                        format!(
-                            "cannot examine {}/CACHEDIR.TAG: {error}",
-                            entry.path().display()
-                        )
-                    });
+                    // An unreadable marker inside a readable directory is the
+                    // directory refused, as discovery refuses it — not the
+                    // whole pass failed. Failing it here failed every daemon
+                    // drain of the tree, while `devmap build`'s discovery had
+                    // already recorded the same directory and carried on.
+                    // Worded as discovery words it, so the two passes' rows
+                    // for one directory are one row.
+                    if let Ok(relative) = entry.path().strip_prefix(&walk_root) {
+                        crate::recover_lock(&marker_error_writer).insert(
+                            relative.to_string_lossy().replace('\\', "/"),
+                            format!("CACHEDIR.TAG could not be examined: {error}"),
+                        );
+                    }
                     false
                 }
             }
@@ -334,9 +353,11 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
     if let Some(error) = fatal {
         return Err(error.into());
     }
-    if let Some(reason) = crate::recover_lock(&marker_error).take() {
-        anyhow::bail!("{reason}");
-    }
+    refusals.extend(
+        std::mem::take(&mut *crate::recover_lock(&marker_errors))
+            .into_iter()
+            .map(|(path, reason)| (path, DiscoverySkipReason::Unreadable { reason })),
+    );
     modules.sort_by(|left, right| {
         right
             .prefix

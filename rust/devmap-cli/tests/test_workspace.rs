@@ -44,6 +44,7 @@ fn build_repo(root: &Path, files: &[(&str, &str)]) {
                 build_started: None,
                 repo_root: Some(root.to_string_lossy().into_owned()),
                 discovery_refusals: None,
+                over_limit: None,
                 verify_every_row: false,
             },
         )
@@ -156,7 +157,7 @@ fn an_import_of_another_repos_go_module_is_a_link_candidate() {
     );
 
     let workspace = registry(&[("svca", &a), ("libb", &b)]);
-    let links = link_candidates(&workspace).unwrap();
+    let links = link_candidates(&workspace).unwrap().links;
 
     let link = links
         .iter()
@@ -200,7 +201,7 @@ fn a_python_path_load_is_not_a_cross_repo_link() {
     build_repo(&b, &[("scripts/__init__.py", "")]);
 
     let workspace = registry(&[("svca", &a), ("libb", &b)]);
-    let links = link_candidates(&workspace).unwrap();
+    let links = link_candidates(&workspace).unwrap().links;
     assert!(
         links.is_empty(),
         "a path load was reported as a cross-repo link: {links:?}"
@@ -235,7 +236,7 @@ fn shared_symbol_names_alone_do_not_make_a_link() {
     );
 
     let workspace = registry(&[("svca", &a), ("libb", &b)]);
-    let links = link_candidates(&workspace).unwrap();
+    let links = link_candidates(&workspace).unwrap().links;
     assert!(
         links.is_empty(),
         "a shared symbol name was reported as a cross-repo link: {links:?}"
@@ -292,6 +293,7 @@ fn a_kernel_name_another_repo_declares_is_a_link_candidate() {
     let workspace = registry(&[("tessl", &kernels), ("ojas", &host), ("mlx", &other)]);
     let links: Vec<_> = link_candidates(&workspace)
         .unwrap()
+        .links
         .into_iter()
         .filter(|link| link.kind == LinkKind::EntryName)
         .collect();
@@ -317,5 +319,45 @@ fn a_kernel_name_another_repo_declares_is_a_link_candidate() {
     }))
     .unwrap();
     assert_eq!(legacy.kind, LinkKind::Import);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// What `link_candidates` could not examine is part of its answer.
+///
+/// A repository with no store, and a provider whose `go.mod` names no module,
+/// were each an `if let Ok` / `let .. else continue` that dropped the error:
+/// the first contributed no imports and the second provided no module, and
+/// the answer read exactly like a workspace with no links between them.
+#[test]
+fn link_candidates_record_what_they_could_not_examine() {
+    let base = scratch("link-gaps");
+    let built = base.join("built");
+    let unbuilt = base.join("unbuilt");
+    build_repo(&built, &[("main.py", "def main():\n    return 1\n")]);
+    std::fs::create_dir_all(&unbuilt).unwrap();
+    std::fs::write(unbuilt.join("go.mod"), "go 1.22\n").unwrap();
+
+    let workspace = registry(&[("built", &built), ("unbuilt", &unbuilt)]);
+    let answer = link_candidates(&workspace).unwrap();
+    let gaps: Vec<(&str, &str)> = answer
+        .coverage_gaps
+        .iter()
+        .map(|gap| (gap.repo.as_str(), gap.reason.as_str()))
+        .collect();
+    assert!(
+        gaps.iter()
+            .any(|(repo, reason)| *repo == "unbuilt" && reason.starts_with("no store at")),
+        "a repository whose store is missing is a gap, not an empty repository: {gaps:?}"
+    );
+    assert!(
+        gaps.iter().any(|(repo, reason)| *repo == "unbuilt"
+            && reason.contains("go.mod")
+            && reason.contains("could not be parsed")),
+        "a go.mod that names no module is a gap in what the provider declares: {gaps:?}"
+    );
+    assert!(
+        gaps.iter().all(|(repo, _)| *repo != "built"),
+        "a repository read in full contributes no gap: {gaps:?}"
+    );
     let _ = std::fs::remove_dir_all(&base);
 }

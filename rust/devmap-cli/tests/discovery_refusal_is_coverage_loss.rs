@@ -9,8 +9,9 @@
 //! artifacts, the dead-code tier, the build result and `status` must all agree
 //! that the corpus was not read in full.
 //!
-//! Phase 1: `Oversized` is a default ignore (1 MiB ceiling), not a refusal —
-//! fixtures and generated blobs must not leave `status` permanently `partial`.
+//! `Oversized` (the 1 MiB ceiling) is not a refusal: it has its own
+//! `over_limit` coverage category, which degrades the graph only when the file
+//! could hold calls — see `over_limit_files_are_listed_not_lost.rs`.
 //! Genuine refusals remain `Unreadable` / escape / dangling-link shapes. The
 //! measured consequence below uses an unreadable `app.py` that is `helper`'s
 //! only caller: without that file, "nothing calls helper" is not a fact this
@@ -205,7 +206,16 @@ fn a_refused_file_degrades_the_graph_and_demotes_the_findings_it_could_not_check
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Phase 1: an oversized source is a default ignore, not coverage loss.
+/// An oversized source is not a discovery refusal — but when it is the only
+/// caller of `helper`, it is not silent either.
+///
+/// This test used to assert `degraded_reason: null` for exactly this fixture,
+/// which is the audit's `big` finding (2026-10-09) stated as a requirement:
+/// `helper`'s only caller was never read, and `status` called the graph whole.
+/// The half worth keeping is that the ceiling is not a *refusal*; the half that
+/// was wrong is that a skipped file which can hold calls costs nothing. Vendored
+/// and call-free over-limit files still cost nothing — see
+/// `over_limit_files_are_listed_not_lost.rs`.
 #[test]
 fn an_oversized_source_is_not_a_discovery_refusal() {
     let root = fixture("oversized-ignore");
@@ -214,7 +224,7 @@ fn an_oversized_source_is_not_a_discovery_refusal() {
     let build = json(&root, &["--json", "build", "."]);
     assert_eq!(
         build["discovery_refused_files"], 0,
-        "the 1 MiB ceiling is a default ignore — it must not charge coverage: {build}"
+        "the 1 MiB ceiling is not a refusal: {build}"
     );
     assert_eq!(
         build["files_indexed"], 1,
@@ -223,9 +233,17 @@ fn an_oversized_source_is_not_a_discovery_refusal() {
 
     let status = json(&root, &["--json", "status"]);
     assert_eq!(
-        status["degraded_reason"],
-        serde_json::Value::Null,
-        "oversized fixtures must not leave status permanently partial: {status}"
+        status["coverage_gaps"]["over_limit"]["total"], 1,
+        "the skipped file is listed in its own bucket: {status}"
+    );
+    assert_eq!(
+        status["coverage_gaps"]["discovery_refused"]["total"], 0,
+        "and not as a refusal: {status}"
+    );
+    let degraded = status["degraded_reason"].as_str().unwrap_or("");
+    assert!(
+        degraded.contains("exceeding the source size limit"),
+        "a skipped Python file can hold calls, so the graph says it is partial: {status}"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -321,8 +339,8 @@ fn a_refusal_is_stable_across_rebuilds_and_a_readable_file_is_re_extracted() {
 }
 
 /// The rule that decides which skips are coverage loss has exactly one
-/// spelling. `NonSource` and `Oversized` are ordinary skips (fixtures /
-/// ceiling), not holes charged against the graph.
+/// spelling. `NonSource` is the ordinary skip and `Oversized` its own
+/// `over_limit` category; neither is a discovery refusal.
 ///
 /// The CLI, the daemon and the report all ask `DiscoverySkipReason::is_refusal`.
 /// A second copy of the predicate is how the CLI and the daemon came to
@@ -355,7 +373,7 @@ fn only_genuine_refusals_are_charged_against_coverage() {
             limit: devmap_extract::MAX_SOURCE_BYTES,
         }
         .is_refusal(),
-        "Oversized is a default ignore (1 MiB ceiling), not coverage loss"
+        "Oversized is its own over_limit category, not a discovery refusal"
     );
 
     // And the charge reaches the analysis: an unmeasured discovery contributes

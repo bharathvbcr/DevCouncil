@@ -63,6 +63,7 @@ fn deletion_reconciliation_removes_live_nodes() {
                 build_started: None,
                 repo_root: None,
                 discovery_refusals: None,
+                over_limit: None,
                 verify_every_row: false,
             },
         )
@@ -1321,6 +1322,7 @@ fn body_signatures_survive_an_incremental_carry_forward() {
                 build_started: None,
                 repo_root: None,
                 discovery_refusals: None,
+                over_limit: None,
                 verify_every_row: false,
             },
         )
@@ -1546,6 +1548,7 @@ fn s2_build_history_counts_the_whole_generation_not_the_written_slice() {
                 build_started: None,
                 repo_root: None,
                 discovery_refusals: None,
+                over_limit: None,
                 verify_every_row: false,
             },
             "warm-head",
@@ -1873,6 +1876,7 @@ fn the_stored_parse_failure_rule_matches_the_canonical_classifier() {
                 build_started: None,
                 repo_root: None,
                 discovery_refusals: None,
+                over_limit: None,
                 verify_every_row: false,
             },
         )

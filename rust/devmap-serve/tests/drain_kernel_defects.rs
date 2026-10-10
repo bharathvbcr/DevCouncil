@@ -178,11 +178,16 @@ fn k1_default_drain_batch_is_a_bound_not_a_budget() {
 /// K1(c): a discovery refusal is a coverage fact, not pending work.
 ///
 /// The connect-time sweep enqueued every `Oversized` and `Unreadable` refusal
-/// "to preserve failure as durable work" — but the drain applies the *same*
+/// "to preserve failure as durable work" — but the drain applied the *same*
 /// limits, so those rows were guaranteed to fail every attempt, quarantine, and
 /// then sit in the queue forever holding `is_fresh` at false. The 30 MB
 /// vendored `parser.c` found stuck on this repository is the case exactly: it
 /// is over `MAX_SOURCE_BYTES`, and no number of retries will shrink it.
+///
+/// The invariant is that nothing in the queue fails forever. For an over-limit
+/// file that now holds by the drain settling it — rows dropped, verdict listed
+/// — so the sweep queues it once, when the stored generation does not already
+/// list it, and one drain leaves the queue empty with nothing quarantined.
 #[test]
 fn k1_connect_time_sweep_does_not_queue_refusals_it_can_never_process() {
     let dir = tmp_dir("k1-refusals");
@@ -203,8 +208,85 @@ fn k1_connect_time_sweep_does_not_queue_refusals_it_can_never_process() {
     let pending = store.get_pending_paths().unwrap();
     assert_eq!(
         pending,
-        vec!["good.py".to_string()],
+        vec!["good.py".to_string(), "vendored.c".to_string()],
         "only work a drain can actually do belongs in the queue"
     );
+    let daemon = Daemon::new(
+        Store::open(dir.join("devmap.sqlite")).unwrap(),
+        root.clone(),
+    );
+    daemon
+        .drain_pending_batch()
+        .expect("both paths drain in one attempt");
+    let status = store.status("").unwrap();
+    assert_eq!(status.pending_count, 0, "nothing is left to retry");
+    assert_eq!(status.quarantined_count, 0, "nothing was charged a retry");
+    assert_eq!(
+        store
+            .latest_discovery_inventory()
+            .unwrap()
+            .over_limit
+            .iter()
+            .map(|row| row.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["vendored.c"],
+        "the over-limit file is listed, not lost"
+    );
+    daemon.reconcile_connect_time().expect("second sweep");
+    assert!(
+        store.get_pending_paths().unwrap().is_empty(),
+        "a verdict the generation already holds is not queued again"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// An unreadable `CACHEDIR.TAG` does not fail a drain.
+///
+/// Discovery charged the directory as a refusal and carried on, while the
+/// manifest pass — which the drain runs on every batch — bailed on the same
+/// marker, so every drain of such a tree failed until the marker was fixed.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_cache_marker_does_not_fail_a_drain() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp_dir("unreadable-marker");
+    let root = dir.join("repo");
+    fs::create_dir_all(root.join("cache")).unwrap();
+    fs::write(root.join("app.py"), "def app():\n    return 1\n").unwrap();
+    fs::write(
+        root.join("cache/CACHEDIR.TAG"),
+        devmap_extract::CACHEDIR_TAG_SIGNATURE,
+    )
+    .unwrap();
+    let marker = root.join("cache/CACHEDIR.TAG");
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&marker).is_ok() {
+        // Permissions do not bind for this user (root): nothing to stage.
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    }
+
+    let store = Store::open(dir.join("devmap.sqlite")).unwrap();
+    store
+        .enqueue_pending_paths(&["app.py".to_string()])
+        .unwrap();
+    let daemon = Daemon::new(
+        Store::open(dir.join("devmap.sqlite")).unwrap(),
+        root.clone(),
+    );
+    daemon
+        .drain_pending_batch()
+        .expect("an unreadable cache marker must not fail the drain");
+    assert_eq!(store.status("").unwrap().pending_count, 0);
+    assert!(
+        store
+            .latest_discovery_refusals()
+            .unwrap()
+            .iter()
+            .any(|refusal| refusal.path == "cache" && refusal.reason.contains("CACHEDIR.TAG")),
+        "the directory it guards is charged as a refusal instead: {:?}",
+        store.latest_discovery_refusals().unwrap()
+    );
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).unwrap();
     let _ = fs::remove_dir_all(&dir);
 }

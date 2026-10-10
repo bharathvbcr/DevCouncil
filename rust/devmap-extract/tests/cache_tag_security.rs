@@ -62,10 +62,19 @@ fn fifo_cache_marker_child() {
         cache.tagged_ancestor(&root, "pkg/main.py"),
         CacheVerdict::Unreadable { .. }
     ));
-    assert!(devmap_extract::collect_go_modules(&root)
-        .unwrap_err()
-        .to_string()
-        .contains("CACHEDIR.TAG"));
+    // The manifest pass refuses the directory and carries on, as discovery
+    // does. It used to fail outright here, and with it every daemon drain of
+    // the tree; the marker still costs the subtree — nothing under it is read.
+    let manifests = devmap_extract::collect_project_manifests(&root)
+        .expect("an unexamined marker refuses its directory, not the whole pass");
+    assert!(
+        manifests
+            .refusals
+            .iter()
+            .any(|(path, reason)| path == "pkg" && reason.to_string().contains("CACHEDIR.TAG")),
+        "the unexamined marker must be reported: {:?}",
+        manifests.refusals
+    );
     fs::remove_dir_all(root).unwrap();
 }
 

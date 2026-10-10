@@ -404,22 +404,17 @@ fn min_confidence_filters_both_directions_of_one_answer() {
     );
 }
 
-/// An indexed symbol with no outbound edges reports its callees `Unavailable`.
+/// An indexed symbol with no outbound edges reports its callees `Available`
+/// and empty — "I looked: nothing", the answer a leaf file already gave.
 ///
 /// `helper` is in the store and calls nothing. `trace` builds its start set
-/// from edges that have the target on the *source* side, finds none, and
-/// returns `Unavailable: … has no indexed traversal start` — "I could not
-/// look" for a symbol the store knows about and could answer for.
-///
-/// This errs in the safe direction, so it is characterised rather than filed
-/// as a break. It is still an inconsistency worth seeing: an indexed *file*
-/// with no callers answers `Available` with an empty list, and the same
-/// underlying situation ("nothing found") reaches the caller two different
-/// ways depending on the target's shape. `dev map query`'s callee column is
-/// blank for exactly the leaf symbols where "calls nothing" is the useful
-/// answer.
+/// from edges that have the target on the *source* side, found none, and
+/// returned `Unavailable: … has no indexed traversal start` — "I could not
+/// look" for a symbol the store knows about and could answer for. This test
+/// characterised that asymmetry and asked to be retired once fixed; it now
+/// pins the fix (merged audit item, 2026-10-09: `neighbors seed_for_repeat`).
 #[test]
-fn a_leaf_symbol_reports_unavailable_callees_where_a_leaf_file_reports_empty() {
+fn a_leaf_symbol_reports_empty_callees_as_a_leaf_file_does() {
     let store = simple();
     let engine = StoreQueryEngine::new(&store);
 
@@ -428,18 +423,32 @@ fn a_leaf_symbol_reports_unavailable_callees_where_a_leaf_file_reports_empty() {
         .unwrap();
     assert!(
         store.latest_symbol_names_by_file().unwrap()["core.py"].contains("helper"),
-        "the fixture must actually index `helper`, or 'unavailable for an \
-         indexed symbol' is not what is being observed"
+        "the fixture must actually index `helper`, or 'an indexed leaf' is not \
+         what is being observed"
     );
     assert!(
         matches!(
             symbol[0].callees.resolution,
+            ResolutionAvailability::Available
+        ) && symbol[0].callees.total == 0,
+        "an indexed leaf symbol's callees are an empty Available answer, got {:?} \
+         with total {}",
+        symbol[0].callees.resolution,
+        symbol[0].callees.total
+    );
+
+    // A name nothing indexes still refuses: "nothing found" for a symbol that
+    // does not exist would be the opposite lie.
+    let missing = engine
+        .neighbors(&["core.py::no_such_symbol".to_string()], 2000, 0.0, 1)
+        .unwrap();
+    assert!(
+        matches!(
+            missing[0].callees.resolution,
             ResolutionAvailability::Unavailable { .. }
         ),
-        "an indexed leaf symbol now answers {:?} for its callees; if that is \
-         the intended fix, it is the honest one and this test should be \
-         retired",
-        symbol[0].callees.resolution
+        "an unindexed name must not answer an empty Available: {:?}",
+        missing[0].callees.resolution
     );
 
     // The file-shaped equivalent of "nothing found" is a confident empty.
@@ -451,7 +460,7 @@ fn a_leaf_symbol_reports_unavailable_callees_where_a_leaf_file_reports_empty() {
             file[0].callers.resolution,
             ResolutionAvailability::Available
         ) && file[0].callers.items.is_empty(),
-        "the file-shaped half of this asymmetry changed: {:?}",
+        "the file-shaped half changed: {:?}",
         file[0].callers.resolution
     );
 }

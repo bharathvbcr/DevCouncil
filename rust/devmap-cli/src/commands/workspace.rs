@@ -182,7 +182,10 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         }
         WorkspaceAction::Links => {
             let workspace = devmap_query::workspace::Workspace::load(&root)?;
-            let links = devmap_query::link_candidates(&workspace)?;
+            let devmap_query::workspace::LinkCandidates {
+                links,
+                coverage_gaps,
+            } = devmap_query::link_candidates(&workspace)?;
             if cli.json {
                 // An object, not a bare array: the count and the set of
                 // repositories considered are part of the answer, and a
@@ -193,6 +196,10 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
                     &serde_json::json!({
                         "links": links,
                         "count": links.len(),
+                        // What could not be examined. Never empty by
+                        // omission: a store that would not open was skipped
+                        // without a word, and the answer read as complete.
+                        "coverage_gaps": coverage_gaps,
                         "repos_considered": workspace
                             .repos
                             .iter()
@@ -223,6 +230,9 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
                     }
                 }
                 outln!("{} candidate link(s)", links.len());
+                for gap in &coverage_gaps {
+                    outln!("  not examined: {} — {}", gap.repo, gap.reason);
+                }
             }
         }
     }

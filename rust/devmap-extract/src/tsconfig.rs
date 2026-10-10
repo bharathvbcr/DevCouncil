@@ -207,9 +207,15 @@ struct RawConfig {
     references: Vec<String>,
 }
 
-fn parse_raw(rel_path: &str, source: &str) -> Option<RawConfig> {
-    let value: Value = serde_json::from_str(&strip_jsonc(source)).ok()?;
-    let object = value.as_object()?;
+/// Parse one config, or say why it could not be: a config this pass read and
+/// could not parse takes its `paths` with it exactly as an unreadable one does,
+/// and was dropped without a record.
+fn parse_raw(rel_path: &str, source: &str) -> Result<RawConfig, String> {
+    let value: Value = serde_json::from_str(&strip_jsonc(source))
+        .map_err(|error| format!("could not be parsed as JSON: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "could not be parsed: the top level is not a JSON object".to_string())?;
     let dir = parent_dir(rel_path).to_string();
     let extends = match object.get("extends") {
         Some(Value::String(one)) => vec![one.clone()],
@@ -257,7 +263,7 @@ fn parse_raw(rel_path: &str, source: &str) -> Option<RawConfig> {
                 .collect()
         })
         .unwrap_or_default();
-    Some(RawConfig {
+    Ok(RawConfig {
         extends,
         base_url,
         paths,
@@ -319,7 +325,14 @@ impl Reader<'_> {
                 None
             }
         };
-        let raw = source.and_then(|source| parse_raw(rel_path, &source));
+        let raw = match source.map(|source| parse_raw(rel_path, &source)) {
+            Some(Ok(raw)) => Some(raw),
+            Some(Err(reason)) => {
+                self.unreadable.insert(rel_path.to_string(), reason);
+                None
+            }
+            None => None,
+        };
         self.cache.insert(rel_path.to_string(), raw.clone());
         raw
     }

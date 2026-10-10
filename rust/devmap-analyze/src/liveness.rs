@@ -385,6 +385,29 @@ pub struct ExtractionCoverage {
     /// Files whose calls were extracted, keyed by language — the per-language
     /// half of [`Self::files_with_call_extraction`].
     pub covered_by_language: BTreeMap<String, usize>,
+    /// Source files discovery skipped for exceeding the size ceiling whose
+    /// language extracts calls and which are not vendored.
+    ///
+    /// The ones that can hold a caller, and so the only ones charged: a
+    /// 30 MB vendored `parser.c` cannot call this repository's code, and a
+    /// `.json` blob has no calls to miss, so neither demotes a finding — which
+    /// is the "permanently partial" trap that made `Oversized` an ordinary skip
+    /// in the first place. A 1.7 MB generated `gen.py` calling `helper` forty
+    /// thousand times is exactly a caller, and was invisible.
+    ///
+    /// Also entered in [`Self::blind_by_language`] under its language, so the
+    /// language-scoped cap sees it; counted here for the aggregate fallback
+    /// and for `degraded_reason`'s sentence.
+    pub over_limit_files: usize,
+    /// Files a grammar read with `ERROR`/`MISSING` nodes in the tree that are
+    /// charged: in a call-extracting language and not vendored.
+    ///
+    /// Entered in [`Self::blind_by_language`] and kept out of
+    /// [`Self::covered_by_language`]. A hole in a file whose calls were never
+    /// looked for is already charged as `call_blind`, and a vendored file
+    /// cannot hold a caller; both are still *listed* in the `partial_parse`
+    /// inventory, which `extraction_gaps` derives without this filter.
+    pub partial_parse_files: usize,
 }
 
 /// What discovery refused, for the analysis that cannot see it.
@@ -392,7 +415,7 @@ pub struct ExtractionCoverage {
 /// A separate type rather than a bare `usize` so a caller cannot pass the wrong
 /// count positionally, and so the one place that means "no discovery step ran"
 /// is spelled [`DiscoveryCoverage::none`] rather than `0`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiscoveryCoverage {
     /// `None` means no discovery result is being reported — which is **not**
     /// the same as a discovery step that ran and refused nothing. Keeping the
@@ -400,6 +423,10 @@ pub struct DiscoveryCoverage {
     /// summary that records `0` for the first case tells a later reader the
     /// tree was fully walked when nobody walked it.
     refused_files: Option<usize>,
+    /// Source files skipped for exceeding the size ceiling, sorted by path.
+    /// Meaningful only beside a measured `refused_files`: the same walk
+    /// produces both.
+    over_limit: Vec<crate::model::OverLimitFile>,
 }
 
 impl DiscoveryCoverage {
@@ -411,6 +438,7 @@ impl DiscoveryCoverage {
     pub fn none() -> Self {
         Self {
             refused_files: None,
+            over_limit: Vec::new(),
         }
     }
 
@@ -419,7 +447,42 @@ impl DiscoveryCoverage {
     pub fn refused(refused_files: usize) -> Self {
         Self {
             refused_files: Some(refused_files),
+            over_limit: Vec::new(),
         }
+    }
+
+    /// The same measurement, with the files the walk skipped for size.
+    ///
+    /// Sorted and de-duplicated by path here, so two callers handing the same
+    /// facts in different orders persist the same summary.
+    pub fn with_over_limit(mut self, mut files: Vec<crate::model::OverLimitFile>) -> Self {
+        files.sort();
+        files.dedup_by(|left, right| left.path == right.path);
+        self.over_limit = files;
+        self
+    }
+
+    /// The over-limit files as persisted: `None` when discovery was not
+    /// measured, for the reason [`Self::refused_files`] gives.
+    pub fn over_limit_files(&self) -> Option<Vec<crate::model::OverLimitFile>> {
+        self.refused_files.map(|_| self.over_limit.clone())
+    }
+
+    /// The over-limit files that can hide a caller, with their language.
+    ///
+    /// A call-extracting language — by the same capability bit
+    /// `extraction_coverage` counts covered files from, so the two sides of
+    /// the share describe one partition — and not vendored, by
+    /// `devmap_extract::wiring::is_vendored_path`, the predicate liveness
+    /// already exempts vendored symbols by.
+    pub fn charged_over_limit(&self) -> impl Iterator<Item = (&str, &'static str)> {
+        self.over_limit.iter().filter_map(|file| {
+            let language = devmap_extract::detect_language(std::path::Path::new(&file.path));
+            let calls = devmap_extract::languages::capabilities_for_language(language)
+                .contains(Capability::Calls);
+            (calls && !devmap_extract::wiring::is_vendored_path(&file.path))
+                .then_some((file.path.as_str(), language))
+        })
     }
 
     /// The measurement, or `None` when none was taken. Persisted verbatim so a
@@ -523,6 +586,22 @@ impl ExtractionCoverage {
                 self.call_blind_files
             ));
         }
+        // Its own clause for the same reason: the fix is to split or shrink
+        // the file (or accept the hole), not to re-run anything.
+        if self.partial_parse_files > 0 {
+            reason.push_str(&format!(
+                "; {} file(s) parsed with ERROR/MISSING regions, so declarations and calls \
+                 inside those regions are absent",
+                self.partial_parse_files
+            ));
+        }
+        if self.over_limit_files > 0 {
+            reason.push_str(&format!(
+                "; {} source file(s) that can hold calls were skipped for exceeding the \
+                 source size limit, so any caller in them is absent from the graph",
+                self.over_limit_files
+            ));
+        }
         Some(reason)
     }
 
@@ -547,7 +626,8 @@ impl ExtractionCoverage {
             .parse_failed_files
             .saturating_add(self.pattern_recovered_files)
             .saturating_add(self.call_blind_files)
-            .saturating_add(self.discovery_refused_files);
+            .saturating_add(self.discovery_refused_files)
+            .saturating_add(self.over_limit_files);
         if self.blind_by_language.is_empty() && self.covered_by_language.is_empty() {
             return aggregate;
         }
@@ -1004,6 +1084,17 @@ pub enum ExtractionGap {
     /// exists because that exact silence, for a file discovery dropped, cost a
     /// `helper()` a confident delete verdict.
     NotParsed,
+    /// A grammar read the file and its tree holds `ERROR` or `MISSING` nodes.
+    ///
+    /// Not `ParseFailed` — the file contributed a `File` node and whatever was
+    /// declared outside the damage — and not clean either: tree-sitter's error
+    /// recovery can swallow everything after the fault. A `.tsx` holding
+    /// `type R<T> = import('m').Ref<T>;` loses every later declaration
+    /// (ScholarLM's `AuthContext.tsx` lost `AuthProvider` and `useAuth`), and a
+    /// Kotlin `suspend { … }` lambda opens an error region that swallows the
+    /// rest of the file. None of that appeared in any coverage inventory, so a
+    /// caller inside the damage was a caller nobody could know was missing.
+    PartialParse,
 }
 
 impl ExtractionGap {
@@ -1021,6 +1112,7 @@ impl ExtractionGap {
         ExtractionGap::CallBlind,
         ExtractionGap::ImportBlind,
         ExtractionGap::NotParsed,
+        ExtractionGap::PartialParse,
     ];
 
     /// The stored spelling, and the one a consumer reads back. One owner, so a
@@ -1033,6 +1125,7 @@ impl ExtractionGap {
             ExtractionGap::CallBlind => "call_blind",
             ExtractionGap::ImportBlind => "import_blind",
             ExtractionGap::NotParsed => "not_parsed",
+            ExtractionGap::PartialParse => "partial_parse",
         }
     }
 }
@@ -1298,6 +1391,13 @@ pub fn extraction_gaps(extractions: &[Extraction]) -> Vec<ExtractionGapEntry> {
             // whose declarations nobody looked for.
             (ExtractionGap::NotParsed, reason.clone())
         } else if a_grammar_read_this_file(ext) {
+            if let ParseOutcome::Partial { error_ranges } = &ext.parse_outcome {
+                gaps.push(ExtractionGapEntry {
+                    path: ext.file_path.clone(),
+                    gap: ExtractionGap::PartialParse,
+                    reason: partial_parse_reason(error_ranges),
+                });
+            }
             // A clean parse in a language this build has no extractor for.
             // Both bits are asked independently: HCL is call-blind *and*
             // import-blind, Java only the second, and collapsing them would
@@ -1330,6 +1430,86 @@ pub fn extraction_gaps(extractions: &[Extraction]) -> Vec<ExtractionGapEntry> {
     gaps
 }
 
+/// Whether a partial parse can have erased a declaration, and with it the
+/// calls inside it: some error region of nonzero width lies outside every
+/// declaration the extractor still found.
+///
+/// **A policy line, stated as one.** Every partial file is *listed* in the
+/// `partial_parse` inventory; this decides which are *charged* against the
+/// dead-code ceiling. The shapes it separates, measured:
+///
+/// * A `.tsx` holding `type R<T> = import('m').Ref<T>;` — the region runs from
+///   the alias past where `AuthProvider` and `useAuth` should start. Outside
+///   every surviving declaration: charged.
+/// * Kotlin `suspend { … }` — the region swallows the rest of the file and no
+///   declaration survives: charged.
+/// * `&raw` in valid Rust — tree-sitter-rust 0.23.3 reads a variable named
+///   `raw` after `&` as raw-borrow syntax and marks four bytes inside a
+///   function body that was otherwise parsed. Inside a surviving declaration,
+///   which the dead pass already exempts when a range overlaps it: listed, not
+///   charged. Most of this repository's partial files were this shape, and
+///   charging them took every Rust finding out of the confident tier.
+/// * A zero-width `MISSING` token: nothing was consumed: not charged.
+///
+/// The `File` symbol is not a declaration here — its span is the whole file,
+/// which would contain every region.
+fn partial_parse_erased_source(ext: &Extraction) -> bool {
+    let ParseOutcome::Partial { error_ranges } = &ext.parse_outcome else {
+        return false;
+    };
+    error_ranges.iter().any(|range| {
+        range.end_byte > range.start_byte
+            && !ext.symbols.iter().any(|symbol| {
+                symbol.kind != SymbolKind::File
+                    && symbol.span.start_byte <= range.start_byte
+                    && range.end_byte <= symbol.span.end_byte
+            })
+    })
+}
+
+/// Most merged error regions a `partial_parse` reason spells out.
+const PARTIAL_PARSE_RANGE_SAMPLE: usize = 8;
+
+/// The byte ranges a partial parse lost, merged and stated.
+///
+/// Merged first because tree-sitter reports nested and overlapping regions —
+/// an `ERROR` spanning the file and a `MISSING` token inside it — and summing
+/// those would claim more bytes lost than the file holds. Both numbers are
+/// given when the list is cut: a sample presented as the whole is how a hole
+/// comes to look smaller than it is.
+fn partial_parse_reason(error_ranges: &[TextRange]) -> String {
+    let mut ranges: Vec<(usize, usize)> = error_ranges
+        .iter()
+        .map(|range| (range.start_byte, range.end_byte.max(range.start_byte)))
+        .collect();
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some((_, last_end)) if start <= *last_end => *last_end = (*last_end).max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    let lost: usize = merged.iter().map(|(start, end)| end - start).sum();
+    let shown: Vec<String> = merged
+        .iter()
+        .take(PARTIAL_PARSE_RANGE_SAMPLE)
+        .map(|(start, end)| format!("{start}..{end}"))
+        .collect();
+    let more = merged.len().saturating_sub(shown.len());
+    format!(
+        "the tree holds ERROR/MISSING nodes over {} region(s), {lost} byte(s) lost: {}{} — \
+         declarations and calls inside them are absent from the graph",
+        merged.len(),
+        shown.join(", "),
+        if more > 0 {
+            format!(", and {more} more region(s)")
+        } else {
+            String::new()
+        }
+    )
+}
+
 /// Count the files whose calls were never extracted.
 ///
 /// One owner for the question, shared with `code_graph.rs`, which needs the
@@ -1343,6 +1523,22 @@ pub fn extraction_coverage(extractions: &[Extraction]) -> ExtractionCoverage {
         .iter()
         .map(|ext| (ext.file_path.as_str(), ext.code_language()))
         .collect();
+    // Partially parsed files whose language extracts calls: charged as blind,
+    // and so not counted as covered below — one side of the partition each.
+    // Not vendored ones, by the rule over-limit files are charged by: a
+    // vendored grammar's `parser.c` cannot call this repository's code. And
+    // only those whose damage can have erased something — see
+    // `partial_parse_erased_source`.
+    let partial_with_calls: HashSet<&str> = extractions
+        .iter()
+        .filter(|ext| {
+            a_grammar_read_this_file(ext)
+                && ext.capabilities().contains(Capability::Calls)
+                && !devmap_extract::wiring::is_vendored_path(&ext.file_path)
+                && partial_parse_erased_source(ext)
+        })
+        .map(|ext| ext.file_path.as_str())
+        .collect();
     for entry in extraction_gaps(extractions) {
         match entry.gap {
             ExtractionGap::ParseFailed => coverage.parse_failed_files += 1,
@@ -1350,14 +1546,28 @@ pub fn extraction_coverage(extractions: &[Extraction]) -> ExtractionCoverage {
             ExtractionGap::CallBlind => coverage.call_blind_files += 1,
             ExtractionGap::ImportBlind => coverage.import_blind_files += 1,
             ExtractionGap::NotParsed => coverage.not_parsed_files += 1,
+            ExtractionGap::PartialParse => {
+                if partial_with_calls.contains(entry.path.as_str()) {
+                    coverage.partial_parse_files += 1;
+                }
+            }
         }
         // ImportBlind and NotParsed stay out of the capping numerator — same
         // policy as `blind_files` before language scoping. The rest feed the
         // per-language map that `cap_for` reads.
-        if matches!(
-            entry.gap,
-            ExtractionGap::ParseFailed | ExtractionGap::PatternRecovered | ExtractionGap::CallBlind
-        ) {
+        // A partial parse is charged where its language extracts calls: a
+        // call-blind language is already charged as `CallBlind`, and charging
+        // the same file twice would double its weight in the share.
+        let charged_partial = entry.gap == ExtractionGap::PartialParse
+            && partial_with_calls.contains(entry.path.as_str());
+        if charged_partial
+            || matches!(
+                entry.gap,
+                ExtractionGap::ParseFailed
+                    | ExtractionGap::PatternRecovered
+                    | ExtractionGap::CallBlind
+            )
+        {
             let lang = path_language
                 .get(entry.path.as_str())
                 .copied()
@@ -1374,7 +1584,10 @@ pub fn extraction_coverage(extractions: &[Extraction]) -> ExtractionCoverage {
     // fold every `.md` and `.json` into the covered side and flatter the share
     // — the denominator is files whose calls were *looked for*, not files seen.
     for ext in extractions {
-        if a_grammar_read_this_file(ext) && ext.capabilities().contains(Capability::Calls) {
+        if a_grammar_read_this_file(ext)
+            && ext.capabilities().contains(Capability::Calls)
+            && !partial_with_calls.contains(ext.file_path.as_str())
+        {
             coverage.files_with_call_extraction += 1;
             *coverage
                 .covered_by_language
@@ -1751,6 +1964,16 @@ pub fn analyze_liveness_with_coverage(
     // file discovery never read may hold the only call to a symbol here, so a
     // refusal has to reach `coverage.cap()` the same way a parse failure does.
     coverage.discovery_refused_files = discovery.charged();
+    // An over-limit file is charged by language, like a parse failure: it has
+    // a path, so it has a language, and a 2 MB generated Go client must not
+    // demote a Python finding.
+    for (_, language) in discovery.charged_over_limit() {
+        coverage.over_limit_files += 1;
+        *coverage
+            .blind_by_language
+            .entry(language.to_string())
+            .or_default() += 1;
+    }
     // Computed once for the whole corpus: the join is name-only, so it has no
     // per-file component to recompute.
     let unresolved_names = unresolved_namesake_names(resolution);
@@ -2091,6 +2314,63 @@ mod tests {
             declaration_hash: None,
             return_type: None,
         }
+    }
+
+    /// A partial parse is listed wherever it is, and charged only where it can
+    /// hide a caller: a call-extracting language, outside a vendored tree. The
+    /// reason names the merged byte ranges lost, overlap counted once.
+    #[test]
+    fn partial_parses_are_listed_everywhere_and_charged_where_they_can_hide_a_caller() {
+        let partial = |path: &str, ranges: &[(usize, usize)]| {
+            let mut ext = devmap_extract::extract_file(path, "def x(): pass\n");
+            ext.file_path = path.to_string();
+            ext.parse_outcome = ParseOutcome::Partial {
+                error_ranges: ranges
+                    .iter()
+                    .map(|(start_byte, end_byte)| TextRange {
+                        start_byte: *start_byte,
+                        end_byte: *end_byte,
+                    })
+                    .collect(),
+            };
+            ext
+        };
+        // `def x(): pass` spans bytes 0..13: a region inside it is the `&raw`
+        // shape — the declaration survived — and a zero-width one consumed
+        // nothing. Both are listed and neither is charged.
+        let corpus = vec![
+            partial("src/app.py", &[(10, 50), (20, 30), (60, 64)]),
+            partial("src/inner.py", &[(4, 8), (11, 11)]),
+            partial("vendor/lib/x.py", &[(20, 40)]),
+        ];
+        let listed: Vec<(String, String)> = extraction_gaps(&corpus)
+            .into_iter()
+            .filter(|entry| entry.gap == ExtractionGap::PartialParse)
+            .map(|entry| (entry.path, entry.reason))
+            .collect();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/app.py", "src/inner.py", "vendor/lib/x.py"],
+            "every partial file is listed"
+        );
+        assert!(
+            listed[0]
+                .1
+                .contains("2 region(s), 44 byte(s) lost: 10..50, 60..64"),
+            "nested ranges are merged before they are summed: {}",
+            listed[0].1
+        );
+        let coverage = extraction_coverage(&corpus);
+        assert_eq!(
+            coverage.partial_parse_files, 1,
+            "only the file whose damage lies outside every surviving declaration, \
+             outside a vendored tree, is charged"
+        );
+        assert_eq!(coverage.blind_by_language.get("python"), Some(&1));
+        assert!(!coverage.is_complete());
     }
 
     fn extraction(symbols: Vec<ExtractedSymbol>, error: Option<(usize, usize)>) -> Extraction {

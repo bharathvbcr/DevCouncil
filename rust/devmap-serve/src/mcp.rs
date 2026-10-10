@@ -1650,7 +1650,10 @@ fn describe_output(cmd: &str) -> Value {
                 "coverage_gaps": {"type": "object",
                     "description": "The paths behind `degraded_reason`'s three numbers — \
         `discovery_refused`, `parse_failed` and `pattern_recovered` — plus `call_blind`, \
-        `import_blind` and `not_parsed`, which are not failures and do not degrade the index: \
+        `import_blind` and `not_parsed`, which are not failures and do not degrade the index; \
+        `over_limit` (source files skipped for exceeding the size limit, with `bytes` and \
+        `limit`) and `partial_parse` (files whose tree holds ERROR/MISSING nodes, with the byte \
+        ranges lost), which degrade it only where the file could hold calls: \
         each a capped listing with its own `total`, `shown` and `truncated`. A file named here \
         is absent from the graph or contributes no call edges, so an empty answer about it \
         means 'not examined'."},

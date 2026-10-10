@@ -1049,6 +1049,7 @@ fn test_incremental_store() -> anyhow::Result<()> {
         build_started: None,
         repo_root: None,
         discovery_refusals: None,
+        over_limit: None,
         verify_every_row: false,
     };
 

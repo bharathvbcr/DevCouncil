@@ -290,6 +290,31 @@ pub(crate) fn run(
             ));
         }
     }
+    // Over-limit files, listed apart from the refusals: not coverage loss in
+    // the refusal sense, and never retried, but absent from the graph all the
+    // same — and a file that grew past the limit used to show up only as a
+    // `-1` in the change count, read by everyone as a deletion.
+    let over_limit: Vec<(&String, u64, u64)> = scanned.report.over_limit().collect();
+    if !over_limit.is_empty() {
+        let shown = over_limit.len().min(REFUSAL_SAMPLE);
+        progress.display.diagnostic(format_args!(
+            "  skipped {} source file(s) over the size limit — these are absent from \
+             the graph (showing {shown} of {}):",
+            over_limit.len(),
+            over_limit.len()
+        ));
+        for (path, bytes, limit) in over_limit.iter().take(REFUSAL_SAMPLE) {
+            progress
+                .display
+                .diagnostic(format_args!("    {path}: {bytes} bytes (limit {limit})"));
+        }
+        if over_limit.len() > REFUSAL_SAMPLE {
+            progress.display.diagnostic(format_args!(
+                "    … and {} more",
+                over_limit.len() - REFUSAL_SAMPLE
+            ));
+        }
+    }
     // The build's other walk of the tree, taken here rather than beside
     // the resolver so the warm path below can compare its refusals too.
     // A manifest that broke while no source moved is a change in what
@@ -327,8 +352,9 @@ pub(crate) fn run(
     // `COUNT(*)` over these rows once they are persisted, and the
     // daemon's drain carries them forward path by path rather than
     // carrying a number it can only ever raise.
-    let refusal_inventory = devmap_store::refusal_inventory(&scanned.report, &manifests);
-    let refused_count = refusal_inventory.len();
+    let discovery_inventory = devmap_store::DiscoveryInventory::of(&scanned.report, &manifests);
+    let refused_count = discovery_inventory.refusals.len();
+    let over_limit_files = discovery_inventory.over_limit_files();
 
     // B3/SC2: if the tree that was just scanned is byte-for-byte the one
     // already committed, the graph it would produce is the graph that is
@@ -369,8 +395,8 @@ pub(crate) fn run(
         // generation left them equal: this path answered "still current"
         // while `status` answered "rebuild required", and the rebuild it
         // asked for came straight back here.
-        let unchanged =
-            file_delta.is_unchanged() && refusal_inventory == store.latest_discovery_refusals()?;
+        let unchanged = file_delta.is_unchanged()
+            && discovery_inventory == store.latest_discovery_inventory()?;
         if unchanged {
             let file_count = scanned.sources.len();
             progress.stage(
@@ -473,6 +499,7 @@ pub(crate) fn run(
                         // re-asked discovery the same question, and the
                         // answer is part of what it proved.
                         "discovery_refused_files": refused_count,
+                        "over_limit_files": over_limit_files,
                         "generation": generation,
                         "reclaim": reclaim_note(&vacuum),
                         "timings": progress.timings_json(),
@@ -557,7 +584,7 @@ pub(crate) fn run(
     // `--lsp` is the exception: converting an unresolved call span into
     // an LSP position needs the source bytes, so they are held through
     // the opt-in pass and dropped immediately after. The report has
-    // already been turned into `refusal_inventory` beside the scan.
+    // already been turned into `discovery_inventory` beside the scan.
     let devmap_extract::ScannedTree { sources, .. } = scanned;
     let lsp_sources = if *lsp {
         Some(sources)
@@ -668,7 +695,7 @@ pub(crate) fn run(
     let analysis = devmap_analyze::analyze_with_discovery(
         &extractions,
         &resolution,
-        devmap_analyze::DiscoveryCoverage::refused(refusal_inventory.len()),
+        discovery_inventory.coverage(),
     );
 
     let opts = GenerationWriteOpts {
@@ -691,7 +718,8 @@ pub(crate) fn run(
             .ok()
             .map(|root| root.to_string_lossy().into_owned()),
         build_started: Some(build_started),
-        discovery_refusals: Some(refusal_inventory),
+        discovery_refusals: Some(discovery_inventory.refusals),
+        over_limit: Some(discovery_inventory.over_limit),
         verify_every_row: *verify_rows,
     };
     let head_sha = current_git_head(path).unwrap_or_else(|_| "unavailable".to_string());
@@ -849,6 +877,9 @@ pub(crate) fn run(
                 // readable, a parse failure by a grammar, and an operator
                 // reading one total cannot tell which they have.
                 "discovery_refused_files": refused_count,
+                // Path, bytes and limit for each: what the graph is missing
+                // and why, which a count alone cannot tell an agent.
+                "over_limit_files": over_limit_files,
                 "symbols": analysis.total_symbols,
                 "edges": analysis.total_edges,
                 "dead_candidates": analysis.dead_symbols.iter().filter(|d| !d.is_exempt).count(),
@@ -908,10 +939,15 @@ pub(crate) fn run(
                 progress::duration(progress.started_at.elapsed().as_secs_f64())
             ),
             format!(
-                "  Changes: +{} ~{} -{} · {} unchanged · {} cached",
+                "  Changes: +{} ~{} -{}{} · {} unchanged · {} cached",
                 file_delta.added,
                 file_delta.changed,
                 file_delta.removed,
+                if file_delta.over_limit > 0 {
+                    format!(" · {} skipped: over limit", file_delta.over_limit)
+                } else {
+                    String::new()
+                },
                 file_delta.unchanged,
                 extraction_snapshot.cache_hits
             ),
@@ -920,6 +956,13 @@ pub(crate) fn run(
             summary.push(format!(
                 "    of which refused: {refused_count} \
                  (recorded as lost coverage, not parsed)"
+            ));
+        }
+        if !over_limit_files.is_empty() {
+            summary.push(format!(
+                "  Skipped: {} source file(s) over the size limit (listed in \
+                 status coverage_gaps.over_limit, not parsed)",
+                over_limit_files.len()
             ));
         }
         if !cli.verbose && (unattributed_calls > 0 || uninferred_receiver_calls > 0) {

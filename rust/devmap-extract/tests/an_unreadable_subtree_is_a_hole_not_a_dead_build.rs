@@ -639,9 +639,9 @@ fn a_manifest_that_is_not_utf8_is_refused_with_the_decode_error() {
     }
 }
 
-/// Past the ceiling is an ordinary skip, exactly as discovery's `Oversized` is
-/// — charging it would leave every repository with a generated mega-config
-/// permanently partial.
+/// Past the ceiling is skipped, not refused — discovery's `Oversized` is not a
+/// refusal either — and charging a manifest would leave every repository with
+/// a generated mega-config permanently partial.
 #[test]
 fn an_oversized_manifest_is_skipped_not_refused() {
     let root = ts_root("ts-oversized");

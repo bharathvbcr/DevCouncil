@@ -366,14 +366,12 @@ fn classify_pending_entry(
     match devmap_extract::candidate_kind(root, &absolute) {
         // The whole-subtree rescan the drain expands.
         devmap_extract::CandidateKind::Directory => Ok(()),
-        devmap_extract::CandidateKind::File { bytes } => {
-            if bytes > devmap_extract::MAX_SOURCE_BYTES {
-                return Err(devmap_extract::DiscoverySkipReason::Oversized {
-                    bytes,
-                    limit: devmap_extract::MAX_SOURCE_BYTES,
-                }
-                .to_string());
-            }
+        // An over-limit source is processable, in one attempt: the drain drops
+        // its rows and lists it as over the limit, which is the state a cold
+        // build of the tree reaches. Dropping the queue row here instead left a
+        // file that grew past the limit with its stale rows in the graph and
+        // its verdict missing from the inventory `status` compares.
+        devmap_extract::CandidateKind::File { .. } => {
             if !devmap_extract::is_indexable_source(canonical) {
                 return Err(devmap_extract::DiscoverySkipReason::NonSource.to_string());
             }
@@ -702,6 +700,11 @@ pub struct SourceTreeDelta {
     pub added: usize,
     pub changed: usize,
     pub removed: usize,
+    /// Paths skipped for exceeding the source size limit that the generation
+    /// does not record that way: an indexed file that grew past the limit, or
+    /// an over-limit file the generation never listed. Never counted in
+    /// `removed` — see `FileDelta::over_limit`.
+    pub over_limit: usize,
     pub sample_paths: Vec<String>,
 }
 
@@ -1358,6 +1361,13 @@ pub struct GenerationWriteOpts {
     /// own working directory and every span read from elsewhere comes back
     /// empty. `None` stays NULL — "root unknown", never a wrong root.
     pub repo_root: Option<String>,
+    /// Every source file discovery skipped for exceeding the size limit,
+    /// stored under `coverage::GAP_OVER_LIMIT`.
+    ///
+    /// Whole, like `discovery_refusals`, and `None` likewise means "not
+    /// measured". `save_generation_with_metadata` refuses a generation whose
+    /// rows name different paths than the analysis's `over_limit_files`.
+    pub over_limit: Option<Vec<DiscoveryRefusal>>,
     /// Every path discovery refused for this generation, with its verdict.
     ///
     /// The whole inventory, not a delta: the generation stores what it could

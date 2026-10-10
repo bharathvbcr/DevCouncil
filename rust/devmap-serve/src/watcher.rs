@@ -8,7 +8,8 @@ use std::time::{Duration, Instant, SystemTime};
 use tracing::warn;
 
 use devmap_extract::{
-    git_metadata, ignore_rule_files, is_gitignored_reporting, is_ignored_path, is_indexable_source,
+    git_metadata, ignore_rule_files, is_gitignored_reporting, is_ignore_rule_file, is_ignored_path,
+    is_indexable_source,
 };
 
 const MAX_IGNORE_CACHE_ENTRIES: usize = 8_192;
@@ -96,9 +97,16 @@ impl IgnoreVerdictCache {
         Ok(ignored)
     }
 
+    /// Clear every verdict when a rule file the walk reads changes.
+    ///
+    /// Which files those are is `devmap_extract::is_ignore_rule_file`'s
+    /// answer, beside the walk configuration it describes. Spelled here as
+    /// "`.gitignore` or `info/exclude`", an edit to `.ignore` never
+    /// re-evaluated anything. The global excludes file lives outside the
+    /// watched tree, so no event names it; the per-lookup rule stamps catch
+    /// an edit to it instead.
     fn observe_rule_event(&mut self, path: &Path) -> bool {
-        let is_rule = path.file_name().is_some_and(|name| name == ".gitignore")
-            || path.ends_with("info/exclude");
+        let is_rule = is_ignore_rule_file(path);
         if is_rule {
             self.entries.clear();
             // The diagnostics describe the file that just changed, so they are
@@ -730,7 +738,10 @@ mod tests {
                 .as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        // A git repository, because `.gitignore` is git's: the cold walk
+        // applies it only inside one (`require_git`), and a fixture outside
+        // one asserts a watcher verdict the walk does not share.
+        std::fs::create_dir_all(root.join(".git")).unwrap();
         root.canonicalize().unwrap()
     }
 
@@ -1695,7 +1706,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::write(root.join(".gitignore"), "ignored.py\n").unwrap();
         let ignored = root.join("ignored.py");
         std::fs::write(&ignored, "def ignored(): pass\n").unwrap();
@@ -1718,6 +1729,69 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// The audit's `.ignore` flap, at the watcher: `.ignore` lists `x.ts`, so
+    /// an event creating `x.ts` is not enqueued — the cold walk excludes it,
+    /// and admitting it here is what put it in the graph after every drain and
+    /// out again after every build.
+    #[test]
+    fn an_ignore_file_excludes_a_path_from_the_watcher_as_from_the_walk() {
+        let root = scratch_root("dot-ignore");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".ignore"), "x.ts\n").unwrap();
+        std::fs::write(root.join("x.ts"), "export const x = 1;\n").unwrap();
+        let mut cache = IgnoreVerdictCache::default();
+        let created = notify::Event::new(EventKind::Create(notify::event::CreateKind::File))
+            .add_path(root.join("x.ts"));
+        assert!(
+            watch_event_paths(&root, created, &mut cache).is_empty(),
+            "a path `.ignore` names must not be enqueued"
+        );
+        let (walked, _) = devmap_extract::collect_sources_with_report(&root).unwrap();
+        assert!(
+            walked.iter().all(|(path, _)| path != "x.ts"),
+            "precondition: the cold walk excludes it too: {walked:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Editing `.ignore` invalidates the cached verdict and re-evaluates it.
+    ///
+    /// `observe_rule_event` cleared the cache only for `.gitignore` and
+    /// `info/exclude`, so an edit to `.ignore` never re-evaluated anything.
+    #[test]
+    fn editing_an_ignore_file_re_evaluates_the_cached_verdict() {
+        let root = scratch_root("dot-ignore-edit");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let rules = root.join(".ignore");
+        std::fs::write(&rules, "x.ts\n").unwrap();
+        let candidate = root.join("x.ts");
+        std::fs::write(&candidate, "export const x = 1;\n").unwrap();
+
+        let mut cache = IgnoreVerdictCache::default();
+        assert!(cache.is_ignored(&root, &candidate, false).unwrap());
+        assert!(cache.is_ignored(&root, &candidate, false).unwrap());
+        assert_eq!(cache.rebuild_count(), 1, "unchanged rules are reused");
+
+        std::fs::write(&rules, "other.ts\n").unwrap();
+        let edit = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+            .add_path(rules.clone());
+        assert_eq!(
+            watch_event_paths(&root, edit, &mut cache),
+            whole_tree_rescan(&root),
+            "a rule edit can expose files without touching them, so it rescans"
+        );
+        assert!(
+            !cache.is_ignored(&root, &candidate, false).unwrap(),
+            "the edited rules no longer exclude x.ts"
+        );
+        assert_eq!(
+            cache.rebuild_count(),
+            2,
+            "the `.ignore` event must have invalidated the cached verdict"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Ignore-rule stamps must reflect the rule files on disk.
     ///
     /// `rule_stamps` was replaceable with `Ok(vec![])` and `stamp_rule`'s
@@ -1735,9 +1809,11 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
         let rules = root.join(".gitignore");
         std::fs::write(&rules, "build/\n").unwrap();
+        // Stamps name canonical paths; macOS `temp_dir()` is a symlink.
+        let stamped_rules = root.canonicalize().unwrap().join(".gitignore");
         let probe = root.join("src.py");
         std::fs::write(&probe, "x\n").unwrap();
 
@@ -1765,8 +1841,14 @@ mod tests {
         // walk can still proceed.
         std::fs::remove_file(&rules).unwrap();
         let removed = IgnoreVerdictCache::rule_stamps(&root, &probe, false).unwrap();
+        // The deleted file's own stamp: the others include whatever rule files
+        // this machine really has, such as its global excludes file.
         assert!(
-            removed.iter().all(|stamp| stamp.len.is_none()),
+            removed
+                .iter()
+                .filter(|stamp| stamp.path == stamped_rules)
+                .all(|stamp| stamp.len.is_none())
+                && removed.iter().any(|stamp| stamp.path == stamped_rules),
             "a deleted rule file must stamp as absent: {removed:?}"
         );
         assert_ne!(
@@ -1787,6 +1869,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(root.join(".devcouncil/codeintel")).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::write(root.join(".gitignore"), "ignored.py\n").unwrap();
         let (tx, rx) = mpsc::channel();
         let handle = start_file_watcher(&root, move |paths| tx.send(paths).unwrap()).unwrap();

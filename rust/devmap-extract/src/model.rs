@@ -562,9 +562,12 @@ impl DiscoverySkipReason {
         match self {
             // NonSource: README, build cache, default index excludes.
             // Oversized: past the 1 MiB ceiling. Charging every fixture /
-            // vendored grammar as coverage loss left repositories permanently
-            // `partial`; extraction can never succeed on these bytes, so they
-            // are an ordinary skip — not a hole in the graph.
+            // vendored grammar as a *refusal* left repositories permanently
+            // `partial`, so it is not one — but it is not silent either. It is
+            // its own coverage category ([`Self::over_limit`]): always listed,
+            // and charged to the dead-code pass only where the file could have
+            // held calls. Folding it back into "an ordinary skip" is how a
+            // 1.7 MB generated caller vanished with `status` reporting fresh.
             DiscoverySkipReason::NonSource | DiscoverySkipReason::Oversized { .. } => false,
             DiscoverySkipReason::NonUtf8Path | DiscoverySkipReason::Unreadable { .. } => true,
             // A refusal, not an ordinary pass-over: unlike a symlink to a file
@@ -576,13 +579,45 @@ impl DiscoverySkipReason {
         }
     }
 
+    /// The size verdict, when this skip is the source ceiling.
+    ///
+    /// The third class beside "ordinary skip" and "refusal": a file this
+    /// indexer was pointed at and will not read *by policy*. Not a refusal —
+    /// see [`Self::is_refusal`] — and never retried, because no retry shrinks a
+    /// file; but every surface lists it, because the graph is missing whatever
+    /// it declared or called.
+    pub fn over_limit(&self) -> Option<(u64, u64)> {
+        match self {
+            DiscoverySkipReason::Oversized { bytes, limit } => Some((*bytes, *limit)),
+            _ => None,
+        }
+    }
+
+    /// Read `(bytes, limit)` back out of an `Oversized` verdict's own
+    /// [`Display`] wording.
+    ///
+    /// The store keeps a coverage row as `(path, reason)` text, and a status
+    /// surface owes its reader the two numbers as numbers. This is the inverse
+    /// of the `Display` arm above, kept beside it so the two cannot drift;
+    /// `the_oversized_wording_round_trips` pins it. `None` for any other text,
+    /// which a caller reports as "not stated" rather than as zero.
+    ///
+    /// [`Display`]: std::fmt::Display
+    pub fn parse_over_limit(reason: &str) -> Option<(u64, u64)> {
+        let (bytes, rest) = reason.split_once(" bytes exceeds the ")?;
+        let (limit, _) = rest.split_once(" byte source ceiling")?;
+        Some((bytes.parse().ok()?, limit.parse().ok()?))
+    }
+
     /// Does this refusal say the path is not the repository's at all?
     ///
     /// The distinction decides what happens to rows a previous generation
-    /// wrote for the path. `Oversized` and `Unreadable` are about *this
-    /// attempt*: the file may shrink, or regain `+r`, and until it does its
-    /// last good extraction is the best description of it the graph has, so the
-    /// rows are kept. `EscapesRoot` is about the path itself — the bytes belong
+    /// wrote for the path. `Unreadable` is about *this attempt*: the file may
+    /// regain `+r`, and until it does its last good extraction is the best
+    /// description of it the graph has, so the rows are kept. (`Oversized` is
+    /// not a refusal at all: its rows are dropped, by the build and the drain
+    /// alike, because a cold build of the same tree writes none — see
+    /// [`Self::over_limit`].) `EscapesRoot` is about the path itself — the bytes belong
     /// to somebody else's directory — and a `devmap build` writes no rows for
     /// it, so a drain that kept them would leave the graph claiming symbols the
     /// build path had already stopped claiming, which is the disagreement
@@ -603,6 +638,19 @@ impl DiscoveryReport {
     /// How many files discovery was meant to read and could not.
     pub fn refused_count(&self) -> usize {
         self.refusals().count()
+    }
+
+    /// Source files skipped for exceeding the size ceiling, with
+    /// `(bytes, limit)`, in discovery order.
+    ///
+    /// Not among [`Self::refusals`] — see [`DiscoverySkipReason::over_limit`]
+    /// for why it is a category of its own.
+    pub fn over_limit(&self) -> impl Iterator<Item = (&String, u64, u64)> {
+        self.skipped_paths.iter().filter_map(|(path, reason)| {
+            reason
+                .over_limit()
+                .map(|(bytes, limit)| (path, bytes, limit))
+        })
     }
 }
 
@@ -1858,6 +1906,35 @@ pub fn is_call_blind(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stored wording of an over-limit verdict yields its numbers back.
+    ///
+    /// `status` reports `bytes` and `limit` from a row that holds only the
+    /// `Display` text, so a change to that text that the parser missed would
+    /// turn every listed size into "not stated" without failing anything else.
+    #[test]
+    fn the_oversized_wording_round_trips() {
+        let reason = DiscoverySkipReason::Oversized {
+            bytes: 1_708_958,
+            limit: 1_048_576,
+        };
+        assert_eq!(
+            DiscoverySkipReason::parse_over_limit(&reason.to_string()),
+            Some((1_708_958, 1_048_576))
+        );
+        assert_eq!(reason.over_limit(), Some((1_708_958, 1_048_576)));
+        assert_eq!(
+            DiscoverySkipReason::parse_over_limit(
+                &DiscoverySkipReason::Unreadable {
+                    reason: "1 bytes exceeds the 2 byte source ceiling".into()
+                }
+                .to_string()
+            ),
+            None,
+            "only the verdict's own wording parses, not a reason that quotes it"
+        );
+        assert_eq!(DiscoverySkipReason::NonSource.over_limit(), None);
+    }
 
     /// Confidence survives the SQLite round-trip exactly.
     ///

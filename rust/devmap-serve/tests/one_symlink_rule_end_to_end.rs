@@ -78,6 +78,7 @@ fn cold_build(root: &Path, db_path: &Path) -> Store {
             &analysis,
             devmap_store::GenerationWriteOpts {
                 discovery_refusals: Some(refusals),
+                over_limit: None,
                 ..Default::default()
             },
             // The stamp the daemon's own HEAD reading produces outside a git

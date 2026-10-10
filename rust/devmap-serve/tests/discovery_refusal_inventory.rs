@@ -9,8 +9,8 @@
 //! 1. once the refused file is repaired — made readable, a dangling symlink
 //!    pointed at a real file — the count stays high until a full re-extraction
 //!    or a `devmap build` re-measures. The corpus is complete and the kernel
-//!    goes on reporting a hole in it; (Oversized is a default ignore, not a
-//!    refusal inventory row — Phase 1.)
+//!    goes on reporting a hole in it; (Oversized is not a refusal row; it
+//!    has its own `over_limit` inventory.)
 //! 2. a refusal this batch met is only *counted* when it exceeds the carried
 //!    number, so a new refusal in a repository whose last full walk refused two
 //!    files disappears into the two. That one is an over-claim: coverage is
@@ -79,6 +79,7 @@ fn cold_build(root: &Path, db_path: &Path) -> Store {
             &analysis,
             devmap_store::GenerationWriteOpts {
                 discovery_refusals: Some(refusals),
+                over_limit: None,
                 ..Default::default()
             },
             // The stamp the daemon's own HEAD reading produces outside a git
