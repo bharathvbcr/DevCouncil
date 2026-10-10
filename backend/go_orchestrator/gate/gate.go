@@ -198,7 +198,7 @@ func (g *Gate) EvaluateCommand(command string, task *dc.Task) (policy.Decision, 
 		return g.settle(decision, mode, modeOrigin, flags.PolicyCommandMode), nil
 	}
 
-	refusal, err := EvaluateRedirects(command, taskIDOf(task), func(target string) (policy.Decision, error) {
+	refusal, err := EvaluateRedirects(command, taskIDOf(task), task != nil, func(target string) (policy.Decision, error) {
 		// Through EvaluateWrite, not the bare ladder: a redirect target must be
 		// judged by exactly what a direct write to the same path faces, ledger
 		// and file-mode posture included, or the two surfaces contradict each
@@ -295,8 +295,18 @@ type RedirectRefusal struct {
 // demotion: a target that survived the file gate's own mode has been judged as
 // the write it is, and demoting it a second time under a command flag would let
 // the harness contradict how it treats a direct write to the same path.
-func EvaluateRedirects(command, taskID string, evalWrite WriteEvaluator) (RedirectRefusal, error) {
-	targets, opaque, err := policy.RedirectTargets(command)
+//
+// scopeBound reports whether the caller judges writes against a task's
+// declared scope. Only then does a write the command line does not name — git
+// apply, patch with no file operand, xargs or find running a writer — matter:
+// the file gate cannot be asked about a path nobody can state, so the command
+// is refused rather than run past a fence it cannot be checked against. With no
+// scope bound there is no fence, and such a command is left to the rest of the
+// ladder as before. The refusal reuses command.substitution, the rung's word
+// for a write it cannot judge, so no new rule enters the contract.
+func EvaluateRedirects(command, taskID string, scopeBound bool, evalWrite WriteEvaluator) (RedirectRefusal, error) {
+	set, err := policy.RedirectWrites(command)
+	targets, opaque := set.Targets, set.Opaque
 	if err != nil {
 		return RedirectRefusal{}, err
 	}
@@ -324,6 +334,20 @@ func EvaluateRedirects(command, taskID string, evalWrite WriteEvaluator) (Redire
 				target, written.Reason)
 			return RedirectRefusal{Decision: written, Refused: true, FromTarget: true}, nil
 		}
+	}
+	if scopeBound && set.Unjudged != "" {
+		return RedirectRefusal{
+			Decision: policy.Decision{
+				Action:   policy.Deny,
+				Rule:     policy.RuleCommandSubstitution,
+				Severity: policy.SeverityOf(policy.RuleCommandSubstitution),
+				Reason: "This task has a declared scope, and this command writes files its text does not name (" +
+					set.Unjudged + "), so they cannot be checked against the scope before it runs.",
+				Target: command,
+				TaskID: taskID,
+			},
+			Refused: true,
+		}, nil
 	}
 	return RedirectRefusal{}, nil
 }

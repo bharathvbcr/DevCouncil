@@ -34,7 +34,7 @@ func TestEvaluateRedirectsJudgesArgumentWrites(t *testing.T) {
 		"true && echo $(tee -a docs/other.md)",
 	} {
 		var asked []string
-		refusal, err := EvaluateRedirects(command, "TASK-1", refuseOther(&asked))
+		refusal, err := EvaluateRedirects(command, "TASK-1", true, refuseOther(&asked))
 		if err != nil {
 			t.Fatalf("EvaluateRedirects(%q): %v", command, err)
 		}
@@ -56,7 +56,7 @@ func TestEvaluateRedirectsJudgesArgumentWrites(t *testing.T) {
 		"mv a docs/other.md",
 		"sed -i s/a/b/ src/*.go",
 	} {
-		refusal, err := EvaluateRedirects(command, "TASK-1", allowAll)
+		refusal, err := EvaluateRedirects(command, "TASK-1", true, allowAll)
 		if err != nil {
 			t.Fatalf("EvaluateRedirects(%q): %v", command, err)
 		}
@@ -68,7 +68,7 @@ func TestEvaluateRedirectsJudgesArgumentWrites(t *testing.T) {
 	// An operand only the shell can resolve is refused the way `> $VAR` is,
 	// without the evaluator being asked to judge a path nobody can name.
 	var asked []string
-	refusal, err := EvaluateRedirects(`sed -i s/a/b/ "$F"`, "TASK-1", refuseOther(&asked))
+	refusal, err := EvaluateRedirects(`sed -i s/a/b/ "$F"`, "TASK-1", true, refuseOther(&asked))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -106,6 +106,16 @@ var hiddenWriteCorpus = []string{
 	`printf x > src/calc.go && mv src/calc.go .env`,
 	`printf x > src/calc.go; cp -t . src/calc.go; mv calc.go .env`,
 	`echo $(echo hi | tee .env)`,
+	// The remaining commands that write a file they are given: each used to
+	// reach .env with the command allowed, because only the five above were
+	// read for the files they write.
+	`touch .env`,
+	`touch src/calc.go .env`,
+	`truncate -s 1 .env`,
+	`dd if=/dev/null of=.env 2>/dev/null`,
+	`install /dev/null .env`,
+	`printf x > src/calc.go && install src/calc.go .env`,
+	`echo $(touch .env)`,
 }
 
 // TestCommandVerdictIsNeverLooserThanTheWritesItPerforms is the invariant.
