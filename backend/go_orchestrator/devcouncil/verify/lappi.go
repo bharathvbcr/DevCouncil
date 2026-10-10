@@ -27,6 +27,7 @@ import (
 	"strings"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/lappi"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/policy"
 )
 
 // LappiAdvisoryPrefix is the gap-type prefix every Lappi gap carries.
@@ -54,8 +55,15 @@ func LappiAsker() *lappi.Asker {
 // runLappi asks about the run's diff and returns the advisory gaps it earned.
 // gaps is the run's account so far; it is read to record the run's own
 // decision and is never modified.
+//
+// Lappi is a model, so it is shown the diff get_diff would show an agent: no
+// section touching a secret path, by the same policy.WithholdSecretDiff rule.
 func runLappi(ctx context.Context, in Input, taskID string, gaps []Gap) []Gap {
-	if in.Lappi == nil || in.DiffEmpty || strings.TrimSpace(in.DiffContent) == "" {
+	if in.Lappi == nil || in.DiffEmpty {
+		return nil
+	}
+	diff, _ := policy.WithholdSecretDiff(in.DiffContent)
+	if strings.TrimSpace(diff) == "" {
 		return nil
 	}
 	normalized := NormalizeGaps(append([]Gap(nil), gaps...))
@@ -66,7 +74,7 @@ func runLappi(ctx context.Context, in Input, taskID string, gaps []Gap) []Gap {
 			blocking++
 		}
 	}
-	outcome := in.Lappi.Run(ctx, in.DiffContent, lappi.AppChoice{Status: status, BlockingGaps: blocking})
+	outcome := in.Lappi.Run(ctx, diff, lappi.AppChoice{Status: status, BlockingGaps: blocking})
 	return lappiAdvisoryGaps(taskID, outcome.Decisions)
 }
 

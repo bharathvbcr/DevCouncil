@@ -95,6 +95,82 @@ impl Store {
         Ok(tx.last_insert_rowid())
     }
 
+    /// Replaces every value a secret file holds in the store, in every
+    /// retained generation and in every stored payload, with the withheld
+    /// marker.
+    ///
+    /// Extraction already withholds a secret file's values, so a store built
+    /// from scratch never holds one. This is for the rows that did not come
+    /// from that extraction: a previous generation's rows carried forward for
+    /// an unchanged file, a cache row served back, and the generations a store
+    /// written before the rule still retains — which is the store `devmap`
+    /// copies between worktrees. Asked once per build, inside its write
+    /// transaction, so no committed generation holds a secret file's value.
+    ///
+    /// Inserted then deleted rather than updated in place: `value` is in the
+    /// key, and two values at one site collapse to one marker row.
+    #[cfg(feature = "parse")]
+    fn scrub_secret_values(tx: &Connection) -> Result<()> {
+        use devmap_extract::secret::{
+            is_secret_path, withhold_secret_values_json, WITHHELD_LITERAL_VALUE,
+        };
+        let secret_ids: Vec<(i64, String)> = {
+            let mut stmt = tx.prepare("SELECT id, path FROM paths")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut ids = Vec::new();
+            for row in rows {
+                let (id, path) = row?;
+                if is_secret_path(&path) {
+                    ids.push((id, path));
+                }
+            }
+            ids
+        };
+        let mut withhold = tx.prepare(
+            "INSERT OR IGNORE INTO generation_literals
+                (generation_id, file_id, line, span_start, value, qualified_name, symbol_name)
+             SELECT generation_id, file_id, line, span_start, ?2, qualified_name, symbol_name
+               FROM generation_literals
+              WHERE generation_id IN (SELECT id FROM generations)
+                AND file_id = ?1 AND value <> ?2",
+        )?;
+        // `generation_id IN (…)` leads with the key's first column, so each
+        // secret file costs an index probe per retained generation rather than
+        // a scan of every literal in the store.
+        let mut drop_values = tx.prepare(
+            "DELETE FROM generation_literals
+              WHERE generation_id IN (SELECT id FROM generations)
+                AND file_id = ?1 AND value <> ?2",
+        )?;
+        let mut payloads =
+            tx.prepare("SELECT payload_id, extraction_json FROM file_payloads WHERE file_id = ?1")?;
+        let mut rewrite =
+            tx.prepare("UPDATE file_payloads SET extraction_json = ?2 WHERE payload_id = ?1")?;
+        for (id, path) in secret_ids {
+            withhold.execute(params![id, WITHHELD_LITERAL_VALUE])?;
+            drop_values.execute(params![id, WITHHELD_LITERAL_VALUE])?;
+            let rows = payloads
+                .query_map(params![id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>>>()?;
+            for (payload_id, json) in rows {
+                let mut payload: serde_json::Value =
+                    serde_json::from_str(&json).map_err(|error| {
+                        refusal(format!(
+                            "stored extraction payload {payload_id} for {path} is invalid: {error}"
+                        ))
+                    })?;
+                if withhold_secret_values_json(&path, &mut payload) {
+                    rewrite.execute(params![payload_id, payload.to_string()])?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Generation-scoped FTS rowid: high 32 bits = generation, low 32 = ordinal.
     pub(super) fn fts_rowid(gen_id: u32, node_ord: u32) -> i64 {
         ((gen_id as i64) << 32) | (node_ord as i64)
@@ -1645,6 +1721,7 @@ impl Store {
                 }
             }
         }
+        Self::scrub_secret_values(&tx)?;
         let page_count: i64 = tx.query_row("PRAGMA page_count", [], |row| row.get(0))?;
         let page_size: i64 = tx.query_row("PRAGMA page_size", [], |row| row.get(0))?;
         let build_ms = opts

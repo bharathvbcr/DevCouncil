@@ -54,18 +54,18 @@ func TestSecretPathsAreNotReadable(t *testing.T) {
 	}
 }
 
-// ReadRefused is the predicate the result-filtering callers use, and it has to
+// ClassifyRead is the predicate the result-filtering callers use, and it has to
 // agree with the rung. Two answers to "may this be read" is the defect the
 // substitution scanners already had once.
-func TestReadRefusedAgreesWithTheRung(t *testing.T) {
+func TestClassifyReadAgreesWithTheRung(t *testing.T) {
 	g := FileGate{Root: "/repo", HardRules: true}
 	for _, path := range []string{
 		".env", "sub/.env", "secrets/x", "id_rsa", "src/calc.go", "README.md", "a/b/c.go",
 	} {
 		rung := g.EvaluateRead(path, nil).Blocked()
-		pred := ReadRefused("/repo", path)
+		pred := ClassifyRead("/repo", path) != ReadAllowed
 		if rung != pred {
-			t.Errorf("%q: rung says blocked=%v, ReadRefused says %v", path, rung, pred)
+			t.Errorf("%q: rung says blocked=%v, ClassifyRead refuses=%v", path, rung, pred)
 		}
 	}
 }

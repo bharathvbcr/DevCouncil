@@ -53,10 +53,11 @@ A trusted `git` can still be told to run programs by the repository's own
 (`proc.GitCommand`) and the kernels (`dc_proc::git_with_program`) run carries
 the same guards, set on the command line where they outrank every config file:
 `core.fsmonitor=false`, `core.hooksPath` at the null device and
-`log.showSignature=false` before the subcommand, `--no-ext-diff --no-textconv`
-after `diff`, `log` and `show`, and `--no-textconv` after `blame`. A planted
-fsmonitor that answers "nothing changed" could otherwise hide a change as well
-as run. Filter drivers (`filter.<name>.clean`, which `diff` runs and no flag
+`log.showSignature=false` before the subcommand, `--no-ext-diff --no-textconv
+--no-color` after `diff`, `log` and `show`, and `--no-textconv` after `blame`.
+A planted fsmonitor that answers "nothing changed" could otherwise hide a
+change as well as run, and `color.ui`/`color.diff=always` colors output even
+into a pipe, which hides every section header from a reader parsing it. Filter drivers (`filter.<name>.clean`, which `diff` runs and no flag
 disables) are handled by reading the repository's filter config first: every
 setting the repository's own scope gives a driver (local or worktree, which
 includes files pulled in through `include.path`) is set again on the command
@@ -231,6 +232,41 @@ back by `getElementById` cannot disagree.
 
 The human-readable CLI reports absent scan coverage as unreported rather than
 as complete, matching how the library reads the same field.
+
+## Read-side withholding
+
+The write gate's `SecretPathPatterns` (`policy/file.go`) also bound what the
+read tools hand back, because a secret that enters a model's context cannot be
+redacted afterwards.
+
+- **`devcouncil_get_diff`.** Tracked and untracked hunks for a path under
+  `SecretPathPatterns` are withheld: the section is removed from
+  `unified_diff` and the file stays in `files` with `"withheld":
+  "secret_path"`. An untracked secret file is listed and never opened; it no
+  longer fails the whole result. A path that escapes the root still does. The
+  rule is `policy.WithholdSecretDiff`, applied to the text actually returned,
+  before truncation; a section with hunks whose names cannot be read is
+  withheld too, and so is any text before the first section header, which
+  git never writes.
+- **Verify.** Lappi, a model, is shown the diff through the same rule.
+  `dcverify` still reads the whole diff — it is a local scanner and its secret
+  gate exists to see credentials — but a gap built from a finding on a secret
+  path carries `withheld: secret_path` in place of the quoted line.
+- **`dcgrep`.** `search`, `files` and `rank` refuse a target whose canonical
+  path is, or lies inside, a `.git` or `.devcouncil` component below the root
+  (case-folded; a worktree's `.git` file and a symlink into either included).
+  The walk's own exclusions only reach names below the target.
+- **DevMap.** `dc_glob::secret_paths` carries the same list (a test fails
+  when it drifts from the Go one). Extraction withholds a secret file's
+  literal values, docstrings and string-made references before they reach
+  the cache or the store, and any literal shaped like a `dc_redact`
+  credential is stored redacted wherever it appears. Each generation write
+  scrubs `generation_literals` and `file_payloads` rows for secret paths, so
+  a store written before this is cleaned on its next build. `literals`,
+  `search`, `ask` (with `--evidence`), `explore` and `skeleton` mark such
+  items `withheld: secret_path` and return no source for them. A store that
+  has not been rebuilt still matches a `literals` prefix against its stored
+  values, so the match count can be probed until the next build.
 
 ## Verification
 

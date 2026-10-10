@@ -1782,6 +1782,11 @@ impl Extraction {
                     ReferenceKind::Call | ReferenceKind::Constructor | ReferenceKind::JsxTag
                 )
         });
+        // Every durable copy — the extraction cache and the generation's
+        // payload — passes through here, so a secret file's values are
+        // withheld at rest even when this extraction came from a cache row
+        // older than the rule.
+        crate::secret::withhold_secret_values(&mut durable);
         durable
     }
 }

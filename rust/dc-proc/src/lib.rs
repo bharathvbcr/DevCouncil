@@ -394,7 +394,7 @@ pub fn git_version(git: &Path) -> Result<Option<GitVersion>, Failure> {
 ///
 /// * before the subcommand: `core.fsmonitor=false`, `core.hooksPath` at the
 ///   null device (no hook can be found there), `log.showSignature=false`;
-/// * after `diff`, `log` or `show`: `--no-ext-diff --no-textconv`;
+/// * after `diff`, `log` or `show`: `--no-ext-diff --no-textconv --no-color`;
 /// * after `blame`: `--no-textconv`;
 /// * after `diff` and `status`: `--ignore-submodules=dirty`. Asked whether a
 ///   submodule's working tree is dirty, git runs status inside it, and that
@@ -403,6 +403,10 @@ pub fn git_version(git: &Path) -> Result<Option<GitVersion>, Failure> {
 ///   commit moved is still reported. No kernel read compares a working tree
 ///   today; the Go host, which does, reports dirty submodules with a guarded
 ///   read of each (`proc.GitSession.DirtySubmodules`).
+///
+/// `--no-color` runs no program but closes the same kind of hole: `color.ui`
+/// or `color.diff` set to `always` colors output even into a pipe, and a
+/// reader recognizing `diff --git` or `@@` lines then recognizes none.
 ///
 /// Global options the caller puts before its subcommand (`-c k=v`, `-C dir`)
 /// stay in place; the subcommand is the first argument that is not one. The
@@ -440,9 +444,10 @@ where
             Some("diff") => &[
                 "--no-ext-diff",
                 "--no-textconv",
+                "--no-color",
                 "--ignore-submodules=dirty",
             ],
-            Some("log" | "show") => &["--no-ext-diff", "--no-textconv"],
+            Some("log" | "show") => &["--no-ext-diff", "--no-textconv", "--no-color"],
             Some("blame") => &["--no-textconv"],
             Some("status") => &["--ignore-submodules=dirty"],
             _ => &[],
@@ -1339,6 +1344,7 @@ mod tests {
                     "diff",
                     "--no-ext-diff",
                     "--no-textconv",
+                    "--no-color",
                     "--ignore-submodules=dirty",
                     "HEAD",
                 ],
@@ -1353,11 +1359,11 @@ mod tests {
             ),
             (
                 &["show", "x"],
-                &["show", "--no-ext-diff", "--no-textconv", "x"],
+                &["show", "--no-ext-diff", "--no-textconv", "--no-color", "x"],
             ),
             (
                 &["log", "-z"],
-                &["log", "--no-ext-diff", "--no-textconv", "-z"],
+                &["log", "--no-ext-diff", "--no-textconv", "--no-color", "-z"],
             ),
             (
                 &[
@@ -1378,6 +1384,7 @@ mod tests {
                     "diff",
                     "--no-ext-diff",
                     "--no-textconv",
+                    "--no-color",
                     "--ignore-submodules=dirty",
                     "-U0",
                 ],

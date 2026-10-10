@@ -15,6 +15,10 @@
 //! under shell-style globbing. Every DevCouncil path rule is written in the
 //! Python dialect.
 
+mod secret_paths;
+
+pub use secret_paths::{SECRET_PATH_PATTERNS, is_secret_path};
+
 /// Longest pattern or name, in Unicode scalar values, matched exactly.
 ///
 /// Past this, [`matches`] returns false without walking. `dc-verify` uses that

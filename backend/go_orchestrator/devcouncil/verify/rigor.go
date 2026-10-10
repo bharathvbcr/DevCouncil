@@ -30,6 +30,7 @@ import (
 	"strings"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/dcverify"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/policy"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 )
 
@@ -278,6 +279,14 @@ func gapsFromFindings(taskID string, findings []dcverify.Finding) []Gap {
 		}
 
 		line := f.Line
+		evidence := f.Evidence
+		if policy.SecretPathSpelling(f.Path) {
+			// dcverify reads the whole diff, secret paths included: it is a
+			// local scanner, and the secret gate exists to see credentials.
+			// What it quotes back is a line of that file, and a gap reaches the
+			// agent, so the quote stops here.
+			evidence = "withheld: " + policy.WithheldSecretPath
+		}
 		gaps = append(gaps, Gap{
 			// The identity carries gate, path and line, so two findings in one
 			// file stay two gaps rather than collapsing into one in
@@ -287,7 +296,7 @@ func gapsFromFindings(taskID string, findings []dcverify.Finding) []Gap {
 			GapType:        gapType,
 			TaskID:         taskID,
 			Description:    f.Message,
-			Evidence:       []string{f.Path + ":" + itoa(line) + ": " + f.Evidence},
+			Evidence:       []string{f.Path + ":" + itoa(line) + ": " + evidence},
 			RecommendedFix: fix,
 			Blocking:       f.Blocking(),
 			File:           filePtr(f.Path),

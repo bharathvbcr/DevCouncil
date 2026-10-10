@@ -3440,6 +3440,7 @@ mod tests {
                     lines_from_bytes: false,
                     signature: Some(format!("def f{i}():")),
                     signature_note: None,
+                    withheld: None,
                 })
                 .collect(),
             shown: 80,
@@ -3478,6 +3479,7 @@ mod tests {
                     lines_from_bytes: false,
                     signature: Some("def weird(a=\"x\\\"y\",\n  b=1):".into()),
                     signature_note: None,
+                    withheld: None,
                 },
                 devmap_query::SkeletonSymbol {
                     qualified_name: "a.py::bare".into(),
@@ -3489,6 +3491,7 @@ mod tests {
                     lines_from_bytes: false,
                     signature: None,
                     signature_note: Some("not extracted".into()),
+                    withheld: None,
                 },
             ],
             shown: 2,

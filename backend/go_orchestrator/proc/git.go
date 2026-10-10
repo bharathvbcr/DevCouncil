@@ -146,7 +146,7 @@ func (s *GitSession) repositoryConfig(ctx context.Context) (*repositoryConfig, e
 //
 //   - before the subcommand: core.fsmonitor=false, core.hooksPath at the null
 //     device (no hook can be found there), log.showSignature=false;
-//   - after diff, log or show: --no-ext-diff --no-textconv;
+//   - after diff, log or show: --no-ext-diff --no-textconv --no-color;
 //   - after blame: --no-textconv;
 //   - after diff and status: --ignore-submodules=dirty. Asked whether a
 //     submodule's working tree is dirty, git runs status inside it, and that
@@ -154,6 +154,11 @@ func (s *GitSession) repositoryConfig(ctx context.Context) (*repositoryConfig, e
 //     the superproject's config listing never sees. A submodule whose
 //     checked-out commit moved is still reported; GitSession.DirtySubmodules
 //     reports working-tree dirtiness with a guarded read of each submodule.
+//
+// --no-color is not about running a program, but it is the same kind of hole:
+// color.ui or color.diff set to "always" colors output even into a pipe, and a
+// reader that recognizes "diff --git" or "@@" lines — the secret-path filter on
+// every diff an agent or model is shown, among others — then recognizes none.
 //
 // Global options the caller passes before its subcommand (`-c k=v`, `-C dir`)
 // are kept in place; the subcommand is the first argument that is not one.
@@ -201,9 +206,9 @@ func splitSubcommand(args []string) (int, string) {
 var filterFree = map[string]bool{"rev-parse": true, "rev-list": true, "log": true}
 
 var subcommandGuards = map[string][]string{
-	"diff":   {"--no-ext-diff", "--no-textconv", "--ignore-submodules=dirty"},
-	"log":    {"--no-ext-diff", "--no-textconv"},
-	"show":   {"--no-ext-diff", "--no-textconv"},
+	"diff":   {"--no-ext-diff", "--no-textconv", "--no-color", "--ignore-submodules=dirty"},
+	"log":    {"--no-ext-diff", "--no-textconv", "--no-color"},
+	"show":   {"--no-ext-diff", "--no-textconv", "--no-color"},
 	"blame":  {"--no-textconv"},
 	"status": {"--ignore-submodules=dirty"},
 }

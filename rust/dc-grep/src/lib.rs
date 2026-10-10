@@ -753,6 +753,26 @@ fn resolve_roots(root: &Path, requested: &str) -> Result<(PathBuf, PathBuf), Str
             "path {requested:?} resolves outside the repository and this tool reads only inside it"
         ));
     }
+    // `ALWAYS_EXCLUDED` is applied by the walk as override globs relative to
+    // the walk's target, so it can only exclude what lies *under* the target.
+    // A target that is itself `.git` (or `src/../.git`, or a symlink to it, or
+    // a worktree's `.git` file) was walked from the inside and every byte of it
+    // returned. The canonical target is judged here instead, component by
+    // component below the root, and case-folded because `.GIT` is `.git` on
+    // APFS and NTFS.
+    if let Ok(below) = target.strip_prefix(&root)
+        && let Some(name) = below.components().find_map(|part| {
+            let part = part.as_os_str().to_str()?;
+            ALWAYS_EXCLUDED
+                .iter()
+                .find(|excluded| part.eq_ignore_ascii_case(excluded))
+        })
+    {
+        return Err(format!(
+            "path {requested:?} resolves into `{name}`, the repository's own machinery or the \
+             harness's state, which this tool never reads"
+        ));
+    }
     Ok((root, target))
 }
 
