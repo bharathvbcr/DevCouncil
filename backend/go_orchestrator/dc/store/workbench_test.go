@@ -200,3 +200,42 @@ func TestWorkbenchCompactionRunsThroughTheHostClientAndKeepsReceipts(t *testing.
 		t.Fatal("a one-second replay window was accepted")
 	}
 }
+
+func TestWorkbenchUpgradeAndScanGuardAreTypedAndTravelThroughTheHostClient(t *testing.T) {
+	c := client(t)
+	t.Cleanup(c.Close)
+	call := func(method, input string) json.RawMessage {
+		t.Helper()
+		result, err := c.Workbench(t.Context(), method, json.RawMessage(input))
+		if err != nil {
+			t.Fatalf("%s: %v", method, err)
+		}
+		return result
+	}
+	// A profile this call creates is already current: nothing to upgrade, no backup.
+	var upgrade struct {
+		Item struct {
+			Upgraded bool    `json:"upgraded"`
+			Backup   *string `json:"backup"`
+		} `json:"item"`
+	}
+	if err := json.Unmarshal(call("store.upgrade", `{}`), &upgrade); err != nil || upgrade.Item.Upgraded || upgrade.Item.Backup != nil {
+		t.Fatalf("a current profile reported an upgrade: %+v %v", upgrade, err)
+	}
+	call("repositories.put", `{"request_id":"r","id":"r1","expected_revision":0,"name":"Manvi","identity_key":"local:r1"}`)
+	var events struct {
+		Latest int64 `json:"latest_sequence"`
+	}
+	if err := json.Unmarshal(call("events.list", `{}`), &events); err != nil || events.Latest <= 0 {
+		t.Fatalf("events.list has no high-water mark: %+v %v", events, err)
+	}
+	task := func(id string, scan int64) string {
+		return fmt.Sprintf(`{"request_id":"%s","id":"%s","expected_revision":0,"title":"%s","repository_ids":["r1"],"primary_repository_id":"r1","scan_sequence":%d}`, id, id, id, scan)
+	}
+	call("items.put", task("first", events.Latest))
+	_, err := c.Workbench(t.Context(), "items.put", json.RawMessage(task("second", events.Latest)))
+	var refusal *WorkbenchError
+	if !errors.As(err, &refusal) || refusal.Code != "board_changed" {
+		t.Fatalf("a stale scan was not a typed board_changed refusal: %v", err)
+	}
+}

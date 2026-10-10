@@ -658,10 +658,7 @@ fn schema_three_upgrade_is_atomic_and_does_not_enqueue_existing_tasks() {
         .unwrap();
     // The queue table already exists: creation must roll the settings table back.
     assert_eq!(
-        store
-            .workbench_request("automation.get", r#"{"id":"profile"}"#)
-            .unwrap_err()
-            .code,
+        store.upgrade_workbench_profile().unwrap_err().code,
         "store_error"
     );
     assert_eq!(
@@ -687,6 +684,7 @@ fn schema_three_upgrade_is_atomic_and_does_not_enqueue_existing_tasks() {
         .connection()
         .execute_batch("DROP TABLE work_enhancement_queue;")
         .unwrap();
+    store.upgrade_workbench_profile().unwrap();
     assert_eq!(call(&store, "items.get", r#"{"id":"t"}"#), before);
     assert_eq!(count(&store), 0);
     assert_eq!(

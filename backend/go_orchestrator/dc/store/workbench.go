@@ -33,7 +33,7 @@ func WorkbenchMethods() []string {
 		"enhancements.claim", "enhancements.recover", "enhancements.revise",
 		"automation.get", "automation.put", "automation.list", "automation.prepare",
 		"runs.prepare", "runs.claim", "runs.started", "runs.protocol", "runs.finish", "runs.cancel", "runs.get", "runs.list",
-		"store.compact",
+		"store.compact", "store.upgrade",
 	}
 }
 
@@ -75,9 +75,9 @@ func (c *Client) Workbench(ctx context.Context, method string, input json.RawMes
 	if listing != (wire.Items != nil) {
 		return nil, errors.New("store: work returned a different result shape than requested")
 	}
-	// store.compact is maintenance, not a mutation: it commits no event of its
-	// own, so its reply carries the newest sequence only as a cursor (0 when empty).
-	if !listing && !strings.HasSuffix(method, ".get") && method != "store.compact" {
+	// store.compact and store.upgrade are maintenance, not mutations: they commit
+	// no event of their own, so their replies carry no event sequence.
+	if !listing && !strings.HasSuffix(method, ".get") && method != "store.compact" && method != "store.upgrade" {
 		if wire.Sequence == nil || *wire.Sequence <= 0 {
 			return nil, errors.New("store: work mutation has no committed event sequence")
 		}

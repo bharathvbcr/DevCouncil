@@ -436,6 +436,7 @@ fn schema_twelve_upgrades_eleven_and_refuses_what_is_newer() {
         .execute_batch("UPDATE work_meta SET version=11 WHERE id=1")
         .unwrap();
     // An upgrade spends no revision and keeps every existing proposal's shape.
+    s.upgrade_workbench_profile().unwrap();
     let t = call(&s, "items.get", r#"{"id":"t"}"#);
     assert_eq!(json::<i64>(&s, &t, "$.item.revision"), 1);
     let version = || -> i64 {

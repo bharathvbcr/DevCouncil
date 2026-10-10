@@ -289,9 +289,7 @@ fn schema_six_migration_is_atomic_and_keeps_old_notices_without_enabling_deliver
     let id = ready(&s, "p");
     s.connection().execute_batch("DROP TABLE work_item_links; DROP INDEX work_items_archive; DROP INDEX work_items_completed; ALTER TABLE work_items DROP COLUMN archived; ALTER TABLE work_items DROP COLUMN completed_at; DROP TABLE work_decisions; DROP TABLE work_notification_deliveries; DROP TABLE work_notification_settings; DROP INDEX work_attention_delivery_time; UPDATE work_meta SET version=6; CREATE TABLE work_notification_deliveries(conflict TEXT);").unwrap();
     assert_eq!(
-        s.workbench_request("notifications.settings.get", r#"{"id":"profile"}"#)
-            .unwrap_err()
-            .code,
+        s.upgrade_workbench_profile().unwrap_err().code,
         "store_error"
     );
     assert_eq!(
@@ -313,6 +311,7 @@ fn schema_six_migration_is_atomic_and_keeps_old_notices_without_enabling_deliver
     s.connection()
         .execute_batch("DROP TABLE work_notification_deliveries;")
         .unwrap();
+    s.upgrade_workbench_profile().unwrap();
     let settings = call(&s, "notifications.settings.get", r#"{"id":"profile"}"#);
     assert_eq!(num(&s, &settings, "$.item.enabled"), 0);
     assert_eq!(num(&s, &settings, "$.item.updated_at"), 0);
