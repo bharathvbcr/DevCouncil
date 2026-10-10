@@ -41,3 +41,19 @@ and live runs, event protection, per-pass bound, parameter refusal).
 `dc/store/workbench_test.go` covers the host client. `BenchmarkWorkbenchProfile` in
 `dc/store/workbench_bench_test.go` seeds 10,000 tasks with full history, measures
 `items.list`/search/history/edit, then runs one compaction pass and checks its counts.
+
+## Measured (Apple M5 Pro, one run, `-benchtime=20x`, machine under other load)
+
+Command, from `backend/go_orchestrator`:
+`go test ./dc/store/ -run '^$' -bench '^BenchmarkWorkbenchProfile$' -benchtime=20x -count=1 -timeout=60m -v`
+
+Fixture: 10,000 tasks x 10 revisions, 100 repositories, 100,110 events and receipts
+(seed 7m31s through the real host client). Per call, mean / p95:
+global list 3.32 / 3.79 ms; workspace 8.29 / 9.31 ms; repository 1.90 / 2.33 ms;
+search 10.2 / 12.95 ms; history 0.59 / 0.79 ms; edit 2.16 / 2.83 ms.
+One `store.compact {"keep_revisions":1,"limit":100000}` pass deleted 90,021 revisions
+(eligible 90,021, not truncated) in 2.94 s; receipts and events were all fresh so none
+were eligible. The 100,000-task stress variant (`BenchmarkWorkbenchProfileStress`) was
+not run. List and search latency is independent of history size here, so retention is
+about disk growth and history paging, not list latency at this scale (inferred from the
+unchanged query plans, not separately measured on a compacted fixture).
