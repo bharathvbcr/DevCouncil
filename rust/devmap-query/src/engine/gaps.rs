@@ -30,7 +30,7 @@ pub(super) fn file_edge_coverage_gap(outcome: &ParseOutcome) -> Option<String> {
              the pattern scanner extracts no calls and no imports at all, so an empty or short \
              list here is not evidence the file has no dependencies"
         )),
-        ParseOutcome::Partial { error_ranges } => Some(format!(
+        ParseOutcome::Partial { error_ranges, .. } => Some(format!(
             "this file parsed with {} error range(s); a call or import inside an error region \
              is invisible to extraction, so this list is a lower bound",
             error_ranges.len()

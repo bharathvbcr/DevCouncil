@@ -967,8 +967,33 @@ fn parse_outcome_of(root: Node, source: &str, is_metal: bool, is_python: bool) -
     if error_ranges.is_empty() {
         ParseOutcome::Clean
     } else {
-        ParseOutcome::Partial { error_ranges }
+        let nameless_ranges = error_ranges
+            .iter()
+            .filter(|range| range_is_nameless(source, range))
+            .cloned()
+            .collect();
+        ParseOutcome::Partial {
+            error_ranges,
+            nameless_ranges,
+        }
     }
+}
+
+/// Whether an error region of nonzero width holds no identifier character.
+///
+/// ASCII letters, digits, `_` and `$` count, and so does every non-ASCII byte,
+/// since an identifier may be spelled in any script. A range that does not lie
+/// on the source is not nameless: what cannot be read is assumed to hold a name.
+fn range_is_nameless(source: &str, range: &TextRange) -> bool {
+    range.end_byte > range.start_byte
+        && source
+            .as_bytes()
+            .get(range.start_byte..range.end_byte)
+            .is_some_and(|bytes| {
+                !bytes
+                    .iter()
+                    .any(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || !b.is_ascii())
+            })
 }
 
 /// Metal declaration qualifiers that the C++ grammar has no production for.
@@ -10216,6 +10241,108 @@ mod tests {
         );
     }
 
+    /// An error region holding no identifier character is recorded as
+    /// nameless; one holding a name, or a zero-width one, is not.
+    ///
+    /// The two nameless shapes are the ones measured: the `>()` tree-sitter-
+    /// typescript strands after a `typeof import(…)` type argument, and the
+    /// lone `}` the CUDA preprocessor scanner leaves behind a macro whose body
+    /// line ends in a comment. `abstract?:` holds a name and stays charged
+    /// wherever it lies outside a declaration.
+    #[test]
+    fn error_regions_without_a_name_are_recorded_as_nameless() {
+        let outcome = |path: &str, lang: &str, source: &str| {
+            let ParseOutcome::Partial {
+                error_ranges,
+                nameless_ranges,
+            } = extract_treesitter(path, lang, source).parse_outcome
+            else {
+                panic!("{path} must parse partially");
+            };
+            let text = |ranges: &[TextRange]| -> Vec<String> {
+                ranges
+                    .iter()
+                    .map(|range| source[range.start_byte..range.end_byte].to_string())
+                    .collect()
+            };
+            (text(&error_ranges), text(&nameless_ranges))
+        };
+
+        let (errors, nameless) = outcome(
+            "a.test.ts",
+            "typescript",
+            "vi.mock('m', async (o) => ({\n  ...(await o<typeof import('m')>()),\n}));\n\
+             function after(): number { return 2; }\n",
+        );
+        assert_eq!(errors, vec![">()"]);
+        assert_eq!(nameless, vec![">()"]);
+
+        let (errors, nameless) = outcome(
+            "k.cu",
+            "cuda",
+            "#define STAMP(NAME) \\\n  __global__ void NAME(float *p) { \\\n    \
+             f(p); /* g(p) */ \\\n    f(p); \\\n  }\n__device__ void f(float *p) {}\n",
+        );
+        assert!(errors.contains(&"}".to_string()), "{errors:?}");
+        assert_eq!(
+            nameless,
+            vec!["}"],
+            "only the brace is nameless: {errors:?}"
+        );
+
+        let (errors, nameless) = outcome(
+            "p.ts",
+            "typescript",
+            "export interface Paper {\n  title: string;\n  abstract?: string;\n}\n",
+        );
+        assert_eq!(errors, vec!["abstract?:"]);
+        assert!(
+            nameless.is_empty(),
+            "a keyword is spelled in letters: {nameless:?}"
+        );
+
+        assert!(
+            range_is_nameless(
+                "a)}",
+                &TextRange {
+                    start_byte: 1,
+                    end_byte: 3
+                }
+            ),
+            "punctuation alone is nameless"
+        );
+        assert!(
+            !range_is_nameless(
+                "a)}",
+                &TextRange {
+                    start_byte: 1,
+                    end_byte: 1
+                }
+            ),
+            "a zero-width region is not listed: it consumed nothing, and is not charged anyway"
+        );
+        assert!(
+            !range_is_nameless(
+                "})",
+                &TextRange {
+                    start_byte: 0,
+                    end_byte: 9
+                }
+            ),
+            "a range off the end of the source cannot be read, so it is not nameless"
+        );
+        assert!(
+            !range_is_nameless(
+                "(é)",
+                &TextRange {
+                    start_byte: 0,
+                    end_byte: 4
+                }
+            ),
+            "a non-ASCII byte may spell an identifier"
+        );
+    }
+
     /// A real syntax error must never be reported as a clean parse.
     ///
     /// `is_benign_jsx_ampersand` suppresses a known upstream grammar
@@ -10242,7 +10369,7 @@ mod tests {
         // Genuinely broken source must stay Partial, with ranges recorded.
         let broken = extract_treesitter("bad.tsx", "tsx", "export function A( {\n");
         match &broken.parse_outcome {
-            ParseOutcome::Partial { error_ranges } => {
+            ParseOutcome::Partial { error_ranges, .. } => {
                 assert!(
                     !error_ranges.is_empty(),
                     "a partial parse must record ranges"

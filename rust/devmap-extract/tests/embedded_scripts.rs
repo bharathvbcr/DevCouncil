@@ -451,7 +451,7 @@ fn a_script_block_that_does_not_parse_makes_the_file_partial() {
     let extraction = extract_file("Broken.svelte", source);
 
     match &extraction.parse_outcome {
-        ParseOutcome::Partial { error_ranges } => {
+        ParseOutcome::Partial { error_ranges, .. } => {
             assert!(
                 !error_ranges.is_empty(),
                 "a Partial outcome must name the bytes that were not understood"
@@ -633,7 +633,7 @@ fn regions_past_the_cap_are_counted_and_their_range_recorded() {
         extraction.diagnostics
     );
     match &extraction.parse_outcome {
-        ParseOutcome::Partial { error_ranges } => {
+        ParseOutcome::Partial { error_ranges, .. } => {
             assert!(
                 error_ranges
                     .iter()
@@ -836,8 +836,10 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // v78 was stamped twice: once for withholding a secret file's literal
     // values, docstrings and string-made references, once for the dead-policy
     // card's extractor fixes. v79 carries both.
+    //
+    // v80 records which error regions hold no name.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "79",
+        EXTRACTION_SCHEMA_VERSION, "80",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

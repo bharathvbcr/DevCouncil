@@ -29,7 +29,7 @@ CREATE TABLE after_check (id INTEGER PRIMARY KEY);
 fn error_texts<'a>(extraction: &Extraction, source: &'a str) -> Vec<&'a str> {
     match &extraction.parse_outcome {
         ParseOutcome::Clean => Vec::new(),
-        ParseOutcome::Partial { error_ranges } => error_ranges
+        ParseOutcome::Partial { error_ranges, .. } => error_ranges
             .iter()
             .map(|range| &source[range.start_byte..range.end_byte])
             .collect(),

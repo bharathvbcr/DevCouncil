@@ -18,7 +18,7 @@ const REALISTIC: &str = include_str!("data/realistic.metal");
 fn outcome(extraction: &Extraction) -> String {
     match &extraction.parse_outcome {
         ParseOutcome::Clean => "Clean".to_string(),
-        ParseOutcome::Partial { error_ranges } => format!("Partial({})", error_ranges.len()),
+        ParseOutcome::Partial { error_ranges, .. } => format!("Partial({})", error_ranges.len()),
         ParseOutcome::Failed { .. } => "Failed".to_string(),
         // Tier-2 pattern recovery. Metal is routed onto the C++ grammar, so it
         // should never reach this arm; naming it here rather than matching `_`

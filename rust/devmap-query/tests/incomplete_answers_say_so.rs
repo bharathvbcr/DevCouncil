@@ -907,6 +907,7 @@ fn dependencies_over_a_degraded_parse_say_the_edge_list_is_a_lower_bound() {
         },
         ParseOutcome::Partial {
             error_ranges: Vec::new(),
+            nameless_ranges: Vec::new(),
         },
     ] {
         let mut extractions = vec![

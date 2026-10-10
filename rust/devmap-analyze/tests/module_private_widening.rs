@@ -100,7 +100,9 @@ fn an_uncalled_export_under_internal_or_in_package_main_is_an_unconfirmed_candid
 #[test]
 fn an_export_anywhere_else_is_spared_and_counted_as_not_examined() {
     let reports = corpus();
-    for symbol in ["DeadUtil", "Sink.Log"] {
+    // `Logger` too: an exported interface nothing names is spared by its
+    // visibility, not because `FileSink` happens to implement it.
+    for symbol in ["DeadUtil", "Sink.Log", "Logger"] {
         let row = report_for(&reports, symbol);
         assert!(row.is_exempt, "{symbol}: {row:?}");
         assert_eq!(
@@ -144,7 +146,8 @@ fn the_excluded_population_partitions_the_exempt_rows() {
         exempt.len() as u64,
         "{population:?}"
     );
+    // The three spared by visibility: `DeadUtil`, `Sink.Log` and `Logger`.
     let go = &population.languages[0];
-    assert_eq!(go.by_reason.get("exported"), Some(&2), "{go:?}");
-    assert_eq!(go.not_examined, 2, "{go:?}");
+    assert_eq!(go.by_reason.get("exported"), Some(&3), "{go:?}");
+    assert_eq!(go.not_examined, 3, "{go:?}");
 }

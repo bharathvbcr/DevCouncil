@@ -659,6 +659,13 @@ pub enum ParseOutcome {
     Clean,
     Partial {
         error_ranges: Vec<TextRange>,
+        /// The subset of `error_ranges` of nonzero width whose bytes hold no
+        /// identifier character — a stray `}` or `>()`. Such a region cannot
+        /// have consumed a declaration or a callee, since both need a name.
+        /// A region this list does not name is treated as able to hide one,
+        /// so a producer that cannot tell leaves it out.
+        #[serde(default)]
+        nameless_ranges: Vec<TextRange>,
     },
     Failed {
         reason: String,

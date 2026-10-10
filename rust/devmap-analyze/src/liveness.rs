@@ -1890,7 +1890,7 @@ pub fn extraction_gaps(extractions: &[Extraction]) -> Vec<ExtractionGapEntry> {
             // whose declarations nobody looked for.
             (ExtractionGap::NotParsed, reason.clone())
         } else if a_grammar_read_this_file(ext) {
-            if let ParseOutcome::Partial { error_ranges } = &ext.parse_outcome {
+            if let ParseOutcome::Partial { error_ranges, .. } = &ext.parse_outcome {
                 gaps.push(ExtractionGapEntry {
                     path: ext.file_path.clone(),
                     gap: ExtractionGap::PartialParse,
@@ -1930,8 +1930,8 @@ pub fn extraction_gaps(extractions: &[Extraction]) -> Vec<ExtractionGapEntry> {
 }
 
 /// Whether a partial parse can have erased a declaration, and with it the
-/// calls inside it: some error region of nonzero width lies outside every
-/// declaration the extractor still found.
+/// calls inside it: some error region of nonzero width that holds a name lies
+/// outside every declaration the extractor still found.
 ///
 /// **A policy line, stated as one.** Every partial file is *listed* in the
 /// `partial_parse` inventory; this decides which are *charged* against the
@@ -1949,15 +1949,27 @@ pub fn extraction_gaps(extractions: &[Extraction]) -> Vec<ExtractionGapEntry> {
 ///   charged. Most of this repository's partial files were this shape, and
 ///   charging them took every Rust finding out of the confident tier.
 /// * A zero-width `MISSING` token: nothing was consumed: not charged.
+/// * A region holding no identifier character, which the extractor lists as
+///   `nameless_ranges` — the `>()` tree-sitter-typescript strands after
+///   `importOriginal<typeof import('m')>()`, or the lone `}` the CUDA
+///   preprocessor scanner leaves behind a macro whose body line ends in a
+///   comment. A declaration and a callee both need a name, so neither can be
+///   inside: listed, not charged. Charging that `>()` took every TypeScript
+///   finding of a 27-file fixture out of the confident tier.
 ///
 /// The `File` symbol is not a declaration here — its span is the whole file,
 /// which would contain every region.
 fn partial_parse_erased_source(ext: &Extraction) -> bool {
-    let ParseOutcome::Partial { error_ranges } = &ext.parse_outcome else {
+    let ParseOutcome::Partial {
+        error_ranges,
+        nameless_ranges,
+    } = &ext.parse_outcome
+    else {
         return false;
     };
     error_ranges.iter().any(|range| {
         range.end_byte > range.start_byte
+            && !nameless_ranges.contains(range)
             && !ext.symbols.iter().any(|symbol| {
                 symbol.kind != SymbolKind::File
                     && symbol.span.start_byte <= range.start_byte
@@ -2690,7 +2702,7 @@ pub fn analyze_liveness_with_coverage(
         let mut overlaps_by_identity: HashMap<&str, bool> = HashMap::new();
         for sym in &ext.symbols {
             let overlaps = match &ext.parse_outcome {
-                ParseOutcome::Partial { error_ranges } => error_ranges.iter().any(|range| {
+                ParseOutcome::Partial { error_ranges, .. } => error_ranges.iter().any(|range| {
                     sym.span.start_byte < range.end_byte && range.start_byte < sym.span.end_byte
                 }),
                 ParseOutcome::Clean
@@ -2914,31 +2926,40 @@ mod tests {
     }
 
     /// A partial parse is listed wherever it is, and charged only where it can
-    /// hide a caller: a call-extracting language, outside a vendored tree. The
-    /// reason names the merged byte ranges lost, overlap counted once.
+    /// hide a caller: a call-extracting language, outside a vendored tree, a
+    /// region that holds a name. The reason names the merged byte ranges lost,
+    /// overlap counted once.
     #[test]
     fn partial_parses_are_listed_everywhere_and_charged_where_they_can_hide_a_caller() {
-        let partial = |path: &str, ranges: &[(usize, usize)]| {
+        let ranges = |ranges: &[(usize, usize)]| -> Vec<TextRange> {
+            ranges
+                .iter()
+                .map(|(start_byte, end_byte)| TextRange {
+                    start_byte: *start_byte,
+                    end_byte: *end_byte,
+                })
+                .collect()
+        };
+        let partial = |path: &str, errors: &[(usize, usize)], nameless: &[(usize, usize)]| {
             let mut ext = devmap_extract::extract_file(path, "def x(): pass\n");
             ext.file_path = path.to_string();
             ext.parse_outcome = ParseOutcome::Partial {
-                error_ranges: ranges
-                    .iter()
-                    .map(|(start_byte, end_byte)| TextRange {
-                        start_byte: *start_byte,
-                        end_byte: *end_byte,
-                    })
-                    .collect(),
+                error_ranges: ranges(errors),
+                nameless_ranges: ranges(nameless),
             };
             ext
         };
         // `def x(): pass` spans bytes 0..13: a region inside it is the `&raw`
         // shape — the declaration survived — and a zero-width one consumed
-        // nothing. Both are listed and neither is charged.
+        // nothing. Both are listed and neither is charged. Nor is a region
+        // outside it that the extractor found holds no name (a stray `}`); a
+        // second region beside it that does hold one is charged.
         let corpus = vec![
-            partial("src/app.py", &[(10, 50), (20, 30), (60, 64)]),
-            partial("src/inner.py", &[(4, 8), (11, 11)]),
-            partial("vendor/lib/x.py", &[(20, 40)]),
+            partial("src/app.py", &[(10, 50), (20, 30), (60, 64)], &[]),
+            partial("src/inner.py", &[(4, 8), (11, 11)], &[]),
+            partial("vendor/lib/x.py", &[(20, 40)], &[]),
+            partial("src/stray.py", &[(20, 21)], &[(20, 21)]),
+            partial("src/both.py", &[(20, 21), (30, 40)], &[(20, 21)]),
         ];
         let listed: Vec<(String, String)> = extraction_gaps(&corpus)
             .into_iter()
@@ -2950,7 +2971,13 @@ mod tests {
                 .iter()
                 .map(|(path, _)| path.as_str())
                 .collect::<Vec<_>>(),
-            vec!["src/app.py", "src/inner.py", "vendor/lib/x.py"],
+            vec![
+                "src/app.py",
+                "src/inner.py",
+                "vendor/lib/x.py",
+                "src/stray.py",
+                "src/both.py"
+            ],
             "every partial file is listed"
         );
         assert!(
@@ -2962,11 +2989,11 @@ mod tests {
         );
         let coverage = extraction_coverage(&corpus);
         assert_eq!(
-            coverage.partial_parse_files, 1,
-            "only the file whose damage lies outside every surviving declaration, \
-             outside a vendored tree, is charged"
+            coverage.partial_parse_files, 2,
+            "only the files with a region that holds a name and lies outside every \
+             surviving declaration, outside a vendored tree, are charged"
         );
-        assert_eq!(coverage.blind_by_language.get("python"), Some(&1));
+        assert_eq!(coverage.blind_by_language.get("python"), Some(&2));
         assert!(!coverage.is_complete());
     }
 
@@ -2980,6 +3007,7 @@ mod tests {
                     start_byte,
                     end_byte,
                 }],
+                nameless_ranges: Vec::new(),
             },
             None => ParseOutcome::Clean,
         };

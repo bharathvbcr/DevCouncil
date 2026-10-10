@@ -285,7 +285,7 @@ fn assert_invariants(label: &str, path: &str, source: &str, extraction: &Extract
 
     match &extraction.parse_outcome {
         ParseOutcome::Clean => {}
-        ParseOutcome::Partial { error_ranges } => {
+        ParseOutcome::Partial { error_ranges, .. } => {
             assert!(
                 !error_ranges.is_empty(),
                 "{label}: `Partial` with no error ranges is `Clean` wearing a \

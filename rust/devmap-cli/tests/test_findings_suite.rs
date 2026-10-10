@@ -426,7 +426,8 @@ fn test_x7_cache_admits_only_clean_partial() {
     assert!(!cache_admits(&ParseOutcome::Failed { reason: "x".into() }));
     assert!(cache_admits(&ParseOutcome::Clean));
     assert!(cache_admits(&ParseOutcome::Partial {
-        error_ranges: vec![]
+        error_ranges: vec![],
+        nameless_ranges: vec![],
     }));
 }
 
