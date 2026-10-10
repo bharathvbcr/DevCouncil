@@ -144,3 +144,46 @@ fn a_current_profile_takes_no_backup_and_a_fresh_one_is_created_for_a_read() {
         .count();
     assert_eq!(backups, 0);
 }
+
+#[test]
+fn store_upgrade_reports_what_it_did_and_a_refusing_host_cannot_run_it() {
+    let (_dir, path) = profile();
+    let mut refusing = Store::open(&path).unwrap();
+    refusing.refuse_workbench_upgrades();
+    assert_eq!(
+        refusing
+            .workbench_request("store.upgrade", "{}")
+            .unwrap_err()
+            .code,
+        "schema_upgrade_required"
+    );
+    assert_eq!(version(&path), 11);
+
+    let store = Store::open(&path).unwrap();
+    let reply = store.workbench_request("store.upgrade", "{}").unwrap();
+    let field = |p: &str| -> String {
+        store
+            .connection()
+            .query_row(
+                "SELECT CAST(json_extract(?1,?2) AS TEXT)",
+                [&reply, p],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(field("$.item.from"), "11");
+    assert_eq!(field("$.item.upgraded"), "1");
+    assert!(
+        field("$.item.backup").ends_with(".pre-schema-11.bak"),
+        "{reply}"
+    );
+    // Again: already current, nothing to do.
+    let again = store.workbench_request("store.upgrade", "{}").unwrap();
+    let upgraded: i64 = store
+        .connection()
+        .query_row("SELECT json_extract(?1,'$.item.upgraded')", [&again], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(upgraded, 0);
+}

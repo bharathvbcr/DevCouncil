@@ -710,7 +710,7 @@ fn deleting_a_task_keeps_its_run_history_and_snapshots_available() {
     call(
         &store,
         "items.delete",
-        r#"{"id":"t","request_id":"delete","expected_revision":1}"#,
+        r#"{"id":"t","request_id":"delete","expected_revision":1,"even_if_running":true}"#,
     );
     let history = call(&store, "runs.list", r#"{"task_id":"t","limit":1}"#);
     assert_eq!(number(&store, &history, "$.total"), 1);
@@ -1288,4 +1288,63 @@ fn a_run_keeps_the_model_it_was_launched_with_and_refuses_malformed_choices() {
             "{bad}"
         );
     }
+}
+
+#[test]
+fn deleting_a_task_is_refused_while_a_run_may_still_be_working_on_it() {
+    let (store, clock) = fixture();
+    call(&store, "runs.prepare", PREPARE);
+    let delete = r#"{"id":"t","request_id":"del","expected_revision":1}"#;
+    let refused = request(&store, "items.delete", delete).unwrap_err();
+    assert_eq!(refused.code, "task_in_use", "{refused}");
+    // The task is untouched, and the refusal left no receipt behind.
+    assert_eq!(
+        number(
+            &store,
+            &call(&store, "items.get", r#"{"id":"t"}"#),
+            "$.item.revision"
+        ),
+        1
+    );
+    // The explicit override is the only way past it.
+    let forced =
+        r#"{"id":"t","request_id":"del-forced","expected_revision":1,"even_if_running":true}"#;
+    call(&store, "items.delete", forced);
+    // A prepared run that expired no longer holds the task.
+    let (store, clock2) = fixture();
+    let _ = clock;
+    call(&store, "runs.prepare", PREPARE);
+    clock2.store(1000 + 10_000_000, Ordering::SeqCst);
+    call(
+        &store,
+        "items.delete",
+        r#"{"id":"t","request_id":"del-late","expected_revision":1}"#,
+    );
+}
+
+#[test]
+fn a_task_creation_decided_from_a_stale_scan_is_refused() {
+    let (store, _) = fixture();
+    let latest = |s: &Store| number(s, &call(s, "events.list", "{}"), "$.latest_sequence");
+    let new_task = |id: &str, scan: i64| {
+        format!(
+            r#"{{"id":"{id}","request_id":"{id}","expected_revision":0,"title":"{id}","repository_ids":["r"],"primary_repository_id":"r","scan_sequence":{scan}}}"#
+        )
+    };
+    let scanned = latest(&store);
+    assert!(scanned > 0);
+    call(&store, "items.put", &new_task("fresh", scanned));
+    // Another writer's change since the scan: the same scan no longer stands.
+    let refused = request(&store, "items.put", &new_task("late", scanned)).unwrap_err();
+    assert_eq!(refused.code, "board_changed", "{refused}");
+    call(&store, "items.put", &new_task("late", latest(&store)));
+    // The guard applies to creation only; editing with a stale scan is not a
+    // related-task decision.
+    call(
+        &store,
+        "items.put",
+        &format!(
+            r#"{{"id":"late","request_id":"edit","expected_revision":1,"title":"late edited","repository_ids":["r"],"primary_repository_id":"r","scan_sequence":{scanned}}}"#
+        ),
+    );
 }
