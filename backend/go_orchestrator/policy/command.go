@@ -238,6 +238,12 @@ func (g CommandGate) evaluateSingleCommand(command string, task *dc.Task, depth 
 		if d, fired := gitSafety(normalized, taskID); fired && d.Action == Deny {
 			return d
 		}
+		// What a read-only command is told to do, which the allowlist entry
+		// that admits it never read. Hard and ahead of the allowlists for the
+		// same reason git safety is: no lease, grant or posture negotiates it.
+		if reason := readOnlyArgumentViolation(normalized, g.Root); reason != "" {
+			return g.noteHardRules(deny(RuleCommandBypassFlag, reason, normalized, taskID))
+		}
 	}
 
 	var f clauseFindings
