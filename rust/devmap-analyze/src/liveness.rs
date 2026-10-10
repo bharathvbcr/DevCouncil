@@ -1094,23 +1094,21 @@ pub const COVERAGE_LOSS_REASON: &str =
 /// silent miss that bypassed the namesake veto — and `CLAUDE.md` tells agents
 /// that tier is the one to act on.
 ///
-/// **What listing rests on today, stated so nobody reads more into it.** Each
-/// language below has zero confident-tier false positives on its committed
-/// fixture after the veto holes were closed (2026-10-09). The fixture counts
-/// are small — Rust, Swift and Kotlin have one confident row each — and the
-/// corpus record (`testdata/accuracy/record.json`, written by the accuracy
-/// harness) does not exist yet. When it does, the binding test also requires
-/// each listed language to be at or under 5% on every corpus it measured, and
-/// a language that is not comes off this list in the same change.
-pub const CONFIDENT_TIER_ELIGIBLE: &[&str] = &[
-    "go",
-    "kotlin",
-    "python",
-    "rust",
-    "swift",
-    "tsx",
-    "typescript",
-];
+/// **What listing rests on today, stated so nobody reads more into it.**
+/// (2026-10-10.) Each listed language has zero confident-tier false positives
+/// on its committed fixture *and* at most 5% on every corpus of the record
+/// (`testdata/accuracy/record.json`: 21 local repositories, each row labelled
+/// from source). Measured there: Go 0/17 (all from one corpus), TypeScript
+/// 0/29, TSX 0/14, Kotlin 0/9 (2 unsure), Rust 0/3. Swift has **no** corpus
+/// row at all — on every corpus measured its examined population is `private`
+/// members that something reaches — so its listing rests on one fixture row.
+///
+/// Python is off the list: 17 of 58 corpus rows were false (string dispatch,
+/// an aliased import, module constants read from other files, calls through
+/// a Protocol), causes the L-Python and interface-dispatch cards own. It comes
+/// back when the record says so.
+pub const CONFIDENT_TIER_ELIGIBLE: &[&str] =
+    &["go", "kotlin", "rust", "swift", "tsx", "typescript"];
 
 /// Whether `language` may publish dead rows in the confident tier.
 pub fn confident_tier_eligible(language: &str) -> bool {
@@ -1163,6 +1161,211 @@ fn exported_unreferenced_reason(proof: &str) -> String {
         "{EXPORTED_UNREFERENCED}: exported, but {proof}, and nothing in the corpus reaches it — \
          unconfirmed until this language's entry-point model is proven"
     )
+}
+
+/// The machine token a row starts with when its class inherits from a type the
+/// corpus does not declare.
+pub const EXTERNAL_SUPERTYPE: &str = "external_supertype";
+
+/// The machine token a row starts with when it is a member of an object literal.
+pub const OBJECT_LITERAL_MEMBER: &str = "object_literal_member";
+
+/// Languages where a subclass overrides a base method with no keyword saying so.
+///
+/// Kotlin, Java, Swift, C# and Scala require `override` (or `@Override`), and
+/// the extractor already exempts what carries it; a method there without one
+/// cannot be what a base class calls. Python and TypeScript/JavaScript say
+/// nothing at the override, so an uncalled method on a subclass of a library
+/// type may be exactly what the library calls — CodeMirror's `WidgetType.toDOM`,
+/// `HTMLParser.handle_starttag`, watchdog's `on_any_event`. The 2026-10-10
+/// corpus record measured those as confident false positives in both languages.
+fn overrides_without_keyword(language: &str) -> bool {
+    matches!(language, "python" | "typescript" | "tsx" | "javascript")
+}
+
+/// Supertypes that call no subclass method by name, so inheriting from one is
+/// no evidence that an uncalled method is reached.
+///
+/// `object`, the abstract-base and generic markers, enums and record shapes
+/// (pydantic's `BaseModel` among them: it calls decorated validators and
+/// named hooks, never a plain method a model adds), and exception types (by name, including a library's `HTTPException` or a
+/// `ValidationError`): none of them dispatches to a method a subclass adds.
+/// Dunder hooks are already outside the population (leading underscore).
+///
+/// For Swift, the value-semantics and marker protocols whose requirements are
+/// operators or compiler-synthesised members (`Equatable`, `Hashable`,
+/// `Codable`, `Sendable`, `Identifiable`, …) and `NSObject` itself: conforming
+/// to one says nothing about who calls the type's other members.
+fn supertype_dispatches_nothing(name: &str) -> bool {
+    matches!(
+        name,
+        "object"
+            | "ABC"
+            | "Generic"
+            | "Enum"
+            | "IntEnum"
+            | "StrEnum"
+            | "Flag"
+            | "NamedTuple"
+            | "TypedDict"
+            | "BaseModel"
+            | "NSObject"
+            | "Equatable"
+            | "Hashable"
+            | "Comparable"
+            | "Codable"
+            | "Encodable"
+            | "Decodable"
+            | "Sendable"
+            | "Identifiable"
+            | "CaseIterable"
+            | "RawRepresentable"
+            | "ObservableObject"
+            | "AnyObject"
+    ) || name.ends_with("Error")
+        || name.ends_with("Exception")
+}
+
+/// `(file, declaring type)` → the first supertype it names that the corpus does
+/// not declare, for the languages [`overrides_without_keyword`] covers.
+///
+/// A supertype is in the corpus when a resolved `Extends` edge from the type
+/// names it ([`supertypes_by_type`]); a heritage reference with no such edge
+/// is a library type, or one this build could not find — either way something
+/// outside the graph may call the type's methods. A base whose contract the
+/// wiring registry knows (`known_dispatch_contract`: `autograd.Function`,
+/// `nn.Module`, `HTMLElement`, React class components) is not counted: its
+/// dispatched methods are exempt by name and the rest stay ordinary candidates.
+fn external_supertypes<'e>(
+    extractions: &'e [Extraction],
+    supertypes: &HashMap<(&str, &str), Vec<(&str, &str)>>,
+) -> HashMap<(&'e str, &'e str), &'e str> {
+    let mut out = HashMap::new();
+    for ext in extractions {
+        // Swift is tracked for the conformance half: a framework calls a
+        // protocol requirement's witness by name (`swift_member_may_witness`).
+        if !overrides_without_keyword(ext.code_language()) && ext.code_language() != "swift" {
+            continue;
+        }
+        // A dotted base arrives as one `Heritage` reference per segment over
+        // one span, innermost first (`Function`, `autograd`, `torch`), so the
+        // written base is the segments reversed; the bare name is the first.
+        let mut bases: Vec<(&str, usize, Vec<&str>)> = Vec::new();
+        for reference in &ext.references {
+            // `implements` names an interface, which has no code to call with.
+            if reference.kind != ReferenceKind::Heritage {
+                continue;
+            }
+            let Some(declarer) = reference
+                .enclosing_symbol
+                .as_deref()
+                .and_then(|owner| owner.rsplit("::").next())
+            else {
+                continue;
+            };
+            let start = reference.span.start_byte;
+            match bases
+                .iter_mut()
+                .find(|(owner, at, _)| *owner == declarer && *at == start)
+            {
+                Some((_, _, segments)) => segments.push(reference.name.as_str()),
+                None => bases.push((declarer, start, vec![reference.name.as_str()])),
+            }
+        }
+        for (declarer, _, segments) in bases {
+            let base = segments[0].rsplit('.').next().unwrap_or(segments[0]);
+            if base.is_empty() || supertype_dispatches_nothing(base) {
+                continue;
+            }
+            let written: Vec<&str> = segments.iter().rev().copied().collect();
+            if devmap_extract::wiring::known_dispatch_contract(&written.join(".")) {
+                continue;
+            }
+            let in_corpus = supertypes
+                .get(&(ext.file_path.as_str(), declarer))
+                .is_some_and(|supers| supers.iter().any(|(_, name)| *name == base));
+            if !in_corpus {
+                out.entry((ext.file_path.as_str(), declarer))
+                    .or_insert(segments[0]);
+            }
+        }
+    }
+    out
+}
+
+/// The external supertype `declaring_type` inherits from, directly or through
+/// in-corpus ancestors, walked as [`reached_through_a_supertype`] walks them.
+fn external_supertype_of<'e>(
+    file: &str,
+    declaring_type: &str,
+    supertypes: &HashMap<(&str, &str), Vec<(&str, &str)>>,
+    external: &HashMap<(&'e str, &'e str), &'e str>,
+) -> Option<&'e str> {
+    let mut frontier = vec![(file, declaring_type)];
+    let mut seen: HashSet<(&str, &str)> = HashSet::new();
+    for _ in 0..HERITAGE_WALK_MAX_DEPTH {
+        let mut next = Vec::new();
+        for key in frontier {
+            if !seen.insert(key) {
+                continue;
+            }
+            if let Some(base) = external.get(&key) {
+                return Some(base);
+            }
+            next.extend(supertypes.get(&key).into_iter().flatten().copied());
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    None
+}
+
+/// Why an uncalled method that would otherwise be confident is unconfirmed:
+/// something outside the call graph dispatches to it by name.
+///
+/// * **`object_literal_member`** — a TypeScript/JavaScript method declared in
+///   an object literal (`{ startState() {…}, token() {…} }`,
+///   `components={{ pre() {…} }}`) is reached through the object, by key, by
+///   whatever the object is handed to. The extractor parents it on the file,
+///   which is how it is told from a class method.
+/// * **`external_supertype`** — a method on a class whose supertype chain
+///   reaches a type the corpus does not declare, in a language where an
+///   override is not marked.
+///
+/// Visible at 0.4 with the reason, never exempt: either can also be dead, and
+/// the reader is told which check to make.
+fn unconfirmed_dispatch_reason(
+    ext: &Extraction,
+    sym: &ExtractedSymbol,
+    identity: &str,
+    supertypes: &HashMap<(&str, &str), Vec<(&str, &str)>>,
+    external: &HashMap<(&str, &str), &str>,
+) -> Option<String> {
+    let language = ext.code_language();
+    if sym.kind != SymbolKind::Method || !overrides_without_keyword(language) {
+        return None;
+    }
+    if matches!(language, "typescript" | "tsx" | "javascript")
+        && sym
+            .parent_symbol
+            .as_deref()
+            .is_none_or(|parent| parent == ext.file_path)
+    {
+        return Some(format!(
+            "{OBJECT_LITERAL_MEMBER}: a method of an object literal, reached through the object \
+             by key wherever the object is passed — no call names it, which is not evidence \
+             nothing calls it"
+        ));
+    }
+    let (declaring_type, _) = identity.rsplit_once('.')?;
+    let base = external_supertype_of(&ext.file_path, declaring_type, supertypes, external)?;
+    Some(format!(
+        "{EXTERNAL_SUPERTYPE}: its class inherits from `{base}`, which the corpus does not \
+         declare, and a base class calls a subclass's methods by name — no call names it, \
+         which is not evidence nothing calls it"
+    ))
 }
 
 /// Why an uncalled symbol was not examined at all: it is exported.
@@ -1608,19 +1811,57 @@ type ManifestScopes<'a> = HashMap<&'static str, Vec<(&'a str, Option<&'a str>)>>
 /// [`devmap_extract::wiring::module_manifest_family`].
 fn manifest_scopes(extractions: &[Extraction]) -> ManifestScopes<'_> {
     let mut scopes: ManifestScopes<'_> = HashMap::new();
+    let indexed: HashSet<&str> = extractions
+        .iter()
+        .map(|ext| ext.file_path.as_str())
+        .collect();
     for ext in extractions {
         let Some(family) = devmap_extract::wiring::module_manifest_family(&ext.file_path) else {
             continue;
         };
-        let proof = ext
+        // A Swift package proves privacy per executable target: the package
+        // directory itself is a scope that proves nothing (so a library target
+        // beside the executable is not widened), and each executable target's
+        // directory, deeper and so nearer, carries the proof.
+        if family == "swiftpm" {
+            let entry = scopes.entry(family).or_default();
+            entry.push((parent_dir(&ext.file_path), None));
+            for annotation in &ext.wiring {
+                if annotation.kind == WiringKind::ModulePrivateScope {
+                    entry.push((
+                        annotation.target_symbol.as_str(),
+                        Some(annotation.details.as_str()),
+                    ));
+                }
+            }
+            continue;
+        }
+        let mut proof = ext
             .wiring
             .iter()
             .find(|annotation| annotation.kind == WiringKind::ModulePrivateScope)
             .map(|annotation| annotation.details.as_str());
-        scopes
-            .entry(family)
-            .or_default()
-            .push((parent_dir(&ext.file_path), proof));
+        // A `Cargo.toml` with no `[lib]` still gets one when `src/lib.rs`
+        // exists — Cargo discovers it — and the manifest cannot see that file.
+        if family == "cargo" {
+            let dir = parent_dir(&ext.file_path);
+            let lib = if dir.is_empty() {
+                "src/lib.rs".to_string()
+            } else {
+                format!("{dir}/src/lib.rs")
+            };
+            if indexed.contains(lib.as_str()) {
+                proof = None;
+            }
+        }
+        // `App.xcodeproj/project.pbxproj` scopes the directory holding the
+        // project bundle, not the bundle itself.
+        let dir = if family == "xcode" {
+            parent_dir(parent_dir(&ext.file_path))
+        } else {
+            parent_dir(&ext.file_path)
+        };
+        scopes.entry(family).or_default().push((dir, proof));
     }
     scopes
 }
@@ -1632,12 +1873,22 @@ fn nearest_manifest_proof<'a>(
     family: &str,
     path: &str,
 ) -> Option<&'a str> {
+    nearest_manifest(scopes, family, path).flatten()
+}
+
+/// The nearest manifest of `family` above `path`: `None` when there is none,
+/// `Some(proof)` — itself possibly `None` — when there is.
+fn nearest_manifest<'a>(
+    scopes: &ManifestScopes<'a>,
+    family: &str,
+    path: &str,
+) -> Option<Option<&'a str>> {
     scopes
         .get(family)?
         .iter()
         .filter(|(dir, _)| dir.is_empty() || path.starts_with(&format!("{dir}/")))
         .max_by_key(|(dir, _)| dir.len())
-        .and_then(|(_, proof)| *proof)
+        .map(|(_, proof)| *proof)
 }
 
 /// Why an exported symbol is nonetheless private to its module, or `None` when
@@ -1656,18 +1907,80 @@ fn nearest_manifest_proof<'a>(
 ///   once Android components (by supertype), DI and serialization annotations,
 ///   `override`s and `@Preview` are entry points.
 ///
-/// Swift and Rust are not here yet: Swift waits on framework-protocol
-/// conformance exemptions, Rust on binary-crate detection.
-fn module_private_proof<'a>(ext: &Extraction, scopes: &ManifestScopes<'a>) -> Option<&'a str> {
+/// * **Rust** — an item written `pub(crate)`, `pub(super)`, `pub(self)` or
+///   `pub(in path)`, which the language confines to its crate (a per-symbol
+///   annotation from the extractor); and every `pub` item of a package whose
+///   `Cargo.toml` declares no library target and which has no `src/lib.rs`.
+///   Trait-impl methods, `#[no_mangle]`/`extern "C"`, `#[tauri::command]` and
+///   the binary entry points are exempt before this point.
+///
+/// * **Swift** — an internal symbol of an `executableTarget` in `Package.swift`,
+///   or of an Xcode project whose every product is an application, extension
+///   or test bundle; a file inside a Swift package is judged by the package
+///   alone. Withheld — left not examined — when its type conforms to a
+///   protocol the corpus does not declare ([`swift_member_may_witness`]): a
+///   framework calls a requirement's witness by name, and an internal member
+///   can be one. `@objc`, `@IBAction`, `override`, `@main` and the runtime
+///   supertypes are exempt before this point.
+fn module_private_proof<'a>(
+    ext: &'a Extraction,
+    sym: &ExtractedSymbol,
+    scopes: &ManifestScopes<'a>,
+    external_bases: &HashMap<(&str, &str), &str>,
+    supertypes: &HashMap<(&str, &str), Vec<(&str, &str)>>,
+) -> Option<&'a str> {
     if let Some(proof) = go_module_private_proof(ext) {
         return Some(proof);
     }
     let family = match ext.code_language() {
         "typescript" | "tsx" | "javascript" => "js",
         "kotlin" | "java" => "gradle",
+        "rust" => {
+            if let Some(annotation) = ext.wiring.iter().find(|annotation| {
+                annotation.kind == WiringKind::ModulePrivateScope
+                    && annotation.target_symbol == sym.qualified_name
+            }) {
+                return Some(annotation.details.as_str());
+            }
+            "cargo"
+        }
+        "swift" => {
+            if swift_member_may_witness(ext, sym, external_bases, supertypes) {
+                return None;
+            }
+            if let Some(proof) = nearest_manifest(scopes, "swiftpm", &ext.file_path) {
+                return proof;
+            }
+            "xcode"
+        }
         _ => return None,
     };
     nearest_manifest_proof(scopes, family, &ext.file_path)
+}
+
+/// Whether a Swift member may be the witness of a requirement of a protocol the
+/// corpus does not declare.
+///
+/// `extension Controller: NSTableViewDelegate { func tableViewSelectionDidChange… }`
+/// and `struct Badge: ViewModifier { func body… }` are called by AppKit and
+/// SwiftUI by requirement name. Which members are requirements is in the SDK,
+/// not the corpus, so every member of a conforming type is withheld; the
+/// marker protocols [`supertype_dispatches_nothing`] lists do not count.
+fn swift_member_may_witness(
+    ext: &Extraction,
+    sym: &ExtractedSymbol,
+    external_bases: &HashMap<(&str, &str), &str>,
+    supertypes: &HashMap<(&str, &str), Vec<(&str, &str)>>,
+) -> bool {
+    let Some(owner) = sym
+        .parent_symbol
+        .as_deref()
+        .filter(|parent| *parent != ext.file_path)
+        .and_then(|parent| parent.rsplit("::").next())
+    else {
+        return false;
+    };
+    external_supertype_of(&ext.file_path, owner, supertypes, external_bases).is_some()
 }
 
 /// Fill in the site evidence of every unconfirmed row in one pass.
@@ -2460,7 +2773,72 @@ fn symbol_exemption_index(
             }
         }
     }
+    exempt_android_manifest_components(extractions, &mut index);
     index
+}
+
+/// Exempt every Kotlin/Java class an `AndroidManifest.xml` registers.
+///
+/// The framework instantiates a registered component by name, so nothing in the
+/// corpus constructs it. The supertype rule (`android_component_supertype_reason`)
+/// already catches a component that extends `Activity` or `Service` directly;
+/// this catches one whose base is the app's own (`class Settings : BaseScreen()`)
+/// and is the model the Kotlin widening was waiting on.
+///
+/// Joined by simple class name (after the last `.` or `$`) within the
+/// manifest's Gradle module — the directory above its `src/<variant>/` — so a
+/// namesake in another module is not spared. A more specific reason already in
+/// the index is kept.
+fn exempt_android_manifest_components(
+    extractions: &[Extraction],
+    index: &mut HashMap<(String, String), String>,
+) {
+    let mut manifests: Vec<(&str, HashMap<&str, &str>)> = Vec::new();
+    for ext in extractions {
+        if ext.file_path.rsplit('/').next() != Some("AndroidManifest.xml") {
+            continue;
+        }
+        let module = match ext.file_path.find("/src/") {
+            Some(at) => &ext.file_path[..at],
+            None if ext.file_path.starts_with("src/") => "",
+            None => parent_dir(&ext.file_path),
+        };
+        let components: HashMap<&str, &str> = ext
+            .wiring
+            .iter()
+            .filter(|w| w.kind == WiringKind::ConfigEntryPoint)
+            .filter_map(|w| {
+                let simple = w.target_symbol.rsplit(['.', '$']).next()?;
+                (!simple.is_empty()).then_some((simple, w.details.as_str()))
+            })
+            .collect();
+        if !components.is_empty() {
+            manifests.push((module, components));
+        }
+    }
+    if manifests.is_empty() {
+        return;
+    }
+    for ext in extractions {
+        if !matches!(ext.code_language(), "kotlin" | "java") {
+            continue;
+        }
+        for (module, components) in &manifests {
+            if !module.is_empty() && !ext.file_path.starts_with(&format!("{module}/")) {
+                continue;
+            }
+            for sym in &ext.symbols {
+                if sym.kind != SymbolKind::Class {
+                    continue;
+                }
+                if let Some(details) = components.get(sym.name.as_str()) {
+                    index
+                        .entry((ext.file_path.clone(), sym.qualified_name.clone()))
+                        .or_insert_with(|| (*details).to_string());
+                }
+            }
+        }
+    }
 }
 
 /// The qualified names the single-symbol pass would never call dead.
@@ -2537,6 +2915,8 @@ pub fn analyze_liveness_with_coverage(
     // proportional to the rows that need it rather than to the corpus.
     let mut pending: Vec<(usize, &str, &ExtractedSymbol)> = Vec::new();
     let scopes = manifest_scopes(extractions);
+    let supertypes = supertypes_by_type(resolution);
+    let external_bases = external_supertypes(extractions, &supertypes);
 
     for ext in extractions {
         // X6: Parse-failed files must NEVER be reported as confirmed dead code
@@ -2752,6 +3132,11 @@ pub fn analyze_liveness_with_coverage(
             let unspared = !is_file_exempt && symbol_exemption.is_none() && !overlaps_parse_error;
             let identity = dead_symbol_identity(sym, &ext.file_path);
             let language = ext.code_language();
+            let dispatch_reason = (!is_called && !is_exported && unspared)
+                .then(|| {
+                    unconfirmed_dispatch_reason(ext, sym, &identity, &supertypes, &external_bases)
+                })
+                .flatten();
 
             if !is_called && is_ambiguously_called && !is_exported && unspared {
                 pending.push((reports.len(), ext.file_path.as_str(), sym));
@@ -2785,6 +3170,19 @@ pub fn analyze_liveness_with_coverage(
                     confidence: cap(0.4),
                     is_exempt: false,
                     exemption_reason: Some(UNRESOLVED_NAMESAKE_REASON.to_string()),
+                    evidence: Some(DeadEvidence::none()),
+                });
+            } else if let Some(reason) = dispatch_reason {
+                // Something outside the graph dispatches to it by name — a
+                // library base class, or whatever an object literal is handed
+                // to. Same tier as the namesake veto, its own reason.
+                pending.push((reports.len(), ext.file_path.as_str(), sym));
+                reports.push(DeadSymbolReport {
+                    symbol_name: identity,
+                    file_path: ext.file_path.clone(),
+                    confidence: cap(0.4),
+                    is_exempt: false,
+                    exemption_reason: Some(reason),
                     evidence: Some(DeadEvidence::none()),
                 });
             } else if !is_called && !is_exported && unspared {
@@ -2832,7 +3230,7 @@ pub fn analyze_liveness_with_coverage(
                     });
                 }
             } else if let Some(proof) = (!is_called && is_exported && unspared)
-                .then(|| module_private_proof(ext, &scopes))
+                .then(|| module_private_proof(ext, sym, &scopes, &external_bases, &supertypes))
                 .flatten()
             {
                 // An export the manifest proves module-private. The keyword

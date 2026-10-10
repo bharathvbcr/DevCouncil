@@ -47,3 +47,8 @@ live	apps/web/src/v/lazyroute.tsx::Component	React Router lazy route renders the
 live	apps/web/src/services/store.ts::fetchOne	useService calls paperService.fetchOne (store.ts:16)
 live	apps/web/src/v/lexicalthis.ts::Gateway.buildUrl	this.buildUrl(p) inside connect (lexicalthis.ts:4)
 live	apps/web/src/v/store2.ts::useWorkspace	re-exported by view2.ts, called by consumeWorkspace (view2user.ts:2)
+# Second pass (2026-10-10): V20 methods a library calls by name.
+live	apps/web/src/v/external.ts::GhostWidget.toDOM	V20: CodeMirror calls toDOM on the WidgetType it is handed
+live	apps/web/src/v/external.ts::startState	V20: StreamLanguage calls the parser object's startState
+live	apps/web/src/v/external.ts::token	V20: StreamLanguage calls the parser object's token
+exported_unreferenced	apps/web/src/v/external.ts::makeEditor	nothing calls it

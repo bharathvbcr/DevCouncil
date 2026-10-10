@@ -138,8 +138,10 @@ fn an_unread_constant_is_still_reported() {
     let reports = corpus();
     let unused = finding(&reports, "pkg/ledger.py", "UNUSED_CONSTANT")
         .unwrap_or_else(|| panic!("nothing reads UNUSED_CONSTANT: {reports:?}"));
+    // The confident branch, not the published 0.9: Python is off
+    // `CONFIDENT_TIER_ELIGIBLE` and publishes it at 0.4 `confident_tier_unproven`.
     assert!(
-        unused.confidence >= 0.9,
+        earned_confident_tier(unused),
         "no edge names it anywhere in a fully parsed corpus: {unused:?}"
     );
     assert!(

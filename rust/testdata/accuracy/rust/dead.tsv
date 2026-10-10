@@ -16,3 +16,8 @@ live	corelib/src/deadprobe.rs::Hidden.via_closure_c41	C41
 exempt	corelib/src/guards.rs::with_guard_c50.Guard	C50: function-local RAII guard
 exempt	corelib/src/guards.rs::with_guard_c50.Guard.drop	C50: Drop runs it (a trait-impl method, keyed under its function like the type)
 exempt	corelib/src/guards.rs::inner_extern_c51.abs	C51: inner extern declaration
+# Second pass (2026-10-10): C52 restricted visibility, C53 binary-only package, C54 rustc script.
+exported_unreferenced	corelib/src/visibility.rs::crate_private_unused_c52	C52: pub(crate), nothing calls it
+exported_unreferenced	corelib/src/visibility.rs::super_private_unused_c52	C52: pub(super), nothing calls it
+exported_unreferenced	binonly/src/util.rs::unused_c53	C53: pub in a package with no library target, nothing calls it
+exempt	scripts/stub_c54.rs::main	C54: fn main of a script compiled with rustc

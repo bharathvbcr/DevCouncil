@@ -696,15 +696,27 @@ subsystems whose functions only call each other.
 - **The confident tier (0.9) is earned per language.** A row reaches it only
   when nothing names the symbol *and* its language is in
   `devmap_analyze::CONFIDENT_TIER_ELIGIBLE` — a table a test binds to the
-  labelled fixtures under `rust/testdata/accuracy/`, so a language is listed
-  exactly when its fixture shows no confident-tier false positive. Today that is
-  Go, Kotlin, Python, Rust, Swift, TypeScript and TSX. Any other language's
+  labelled fixtures under `rust/testdata/accuracy/` and to the labelled corpus
+  record beside them (`record.json`), so a language is listed exactly when its
+  fixture shows no confident-tier false positive and every corpus shows at most
+  5%. Today that is Go, Kotlin, Rust, Swift, TypeScript and TSX; Python came off
+  on 2026-10-10 (17 of 58 corpus rows false). Swift has no corpus row and rests
+  on its fixture alone. Any other language's
   would-be confident row is published at 0.4 with a reason starting
   `confident_tier_unproven`, naming the language.
 - **0.4 is unconfirmed by contract**: `only_ambiguous_callers`, an unresolved
-  namesake, `confident_tier_unproven`, or `exported_unreferenced` — an export
-  the manifest proves module-private (Go `internal/` packages and `package
-  main`) with nothing reaching it. Every such row carries `evidence`: how many
+  namesake, `confident_tier_unproven`, `external_supertype` (a Python or
+  TypeScript method on a class whose supertype chain reaches a library type,
+  which may call it by name), `object_literal_member` (a method of a
+  TypeScript/JavaScript object literal, reached through the object), or
+  `exported_unreferenced` — an export the manifest or the language proves
+  module-private, with nothing reaching it: Go `internal/` packages and
+  `package main`; a TS/JS package whose `package.json` publishes no entry
+  point; a Gradle module applying `com.android.application` (components the
+  `AndroidManifest.xml` registers are entry points); a Rust `pub(crate)` /
+  `pub(super)` / `pub(in …)` item or a package with no library target; a Swift
+  `executableTarget` or an app-only Xcode project (members of a type that
+  conforms to a framework protocol are withheld as possible witnesses). Every such row carries `evidence`: how many
   unbound sites name the symbol and the first one as `first_path` /
   `first_line`, so it can be checked in one jump.
 - **`excluded` says what was never examined.** Per language, the uncalled

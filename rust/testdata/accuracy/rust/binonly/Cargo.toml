@@ -1,0 +1,6 @@
+# C53 (added for the dead-policy card, second pass): a package with no library
+# target. Nothing can link against a binary, so its `pub` items are module-private.
+[package]
+name = "binonly"
+version = "0.1.0"
+edition = "2021"

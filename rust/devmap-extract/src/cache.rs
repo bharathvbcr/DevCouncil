@@ -597,7 +597,17 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// empty, which charges every such region against the dead-code ceiling —
 /// a lone `}` would keep a whole language out of the confident tier until
 /// the file was edited.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "80";
+///
+/// v81 is the dead-policy card's second pass: a Rust method of a type declared
+/// inside a function is keyed under that function (`with_guard.Guard.drop`,
+/// not `Guard.drop`); a Kotlin callable reference (`template::m`, `Type::m`)
+/// carries its receiver; a Rust `fn main` outside every `src/` tree is an entry
+/// point; a Rust `pub(crate)`/`pub(super)`/`pub(in …)` item carries a
+/// `ModulePrivateScope` annotation; `AndroidManifest.xml` and `project.pbxproj`
+/// are indexed, the first with an entry point per registered component; and a
+/// `Package.swift` carries a `ModulePrivateScope` per executable target. A v80
+/// row keeps the old Rust keys and lacks every one of those facts.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "81";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

@@ -11,3 +11,11 @@ live	spm/Sources/Core/PrivateReach.swift::Meter.privDouble	P4: function referenc
 live	spm/Sources/Core/PrivateReach.swift::Meter.privBump	P2
 live	spm/Sources/Core/PrivateReach.swift::Meter.privLabel	P5
 live	spm/Sources/Core/PrivateReach.swift::Pinger.pingTwice	P6
+# Second pass (2026-10-10): P5 cross-module private namesake, P6 framework witness; DemoMain is an executableTarget.
+exported_unreferenced	spm/Sources/DemoMain/DemoApp.swift::Theme	nothing in DemoMain references it (the xcode Themes are other modules)
+exported_unreferenced	spm/Sources/DemoMain/DemoApp.swift::Theme.accent	nothing in DemoMain calls it
+exported_unreferenced	spm/Sources/DemoMain/Dial.swift::Dial	nothing constructs it
+exported_unreferenced	spm/Sources/DemoMain/Dial.swift::Dial.updateDrag	nothing calls it
+exported_unreferenced	spm/Sources/DemoMain/Dial.swift::DemoStyle	nothing applies it
+live	spm/Sources/DemoMain/Dial.swift::Dial.forwardSpan	P5: updateDrag calls it with implicit self (Dial.swift:7)
+exempt	spm/Sources/DemoMain/Dial.swift::DemoStyle.body	P6: ViewModifier requirement, called by SwiftUI

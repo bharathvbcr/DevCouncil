@@ -693,8 +693,14 @@ pub fn rust_path_declares_main(path: &str) -> bool {
         return true;
     }
     let dirs: Vec<&str> = norm.split('/').rev().skip(1).collect();
+    // Outside every `src/` tree a file cannot be one of Cargo's auto-discovered
+    // modules, so a file-scope `fn main` there is a crate root: a `[[bin]]` with
+    // an explicit `path`, or a script compiled with `rustc` directly. LiquiTask's
+    // `scripts/semantic-sidecar-stub.rs`, built by `rustc -O` from a shell
+    // script, was published dead at 0.9 because only the Cargo layouts counted.
     dirs.iter()
         .any(|dir| matches!(*dir, "bin" | "examples" | "benches" | "tests"))
+        || !dirs.contains(&"src")
 }
 
 /// Go declarations the runtime or toolchain calls with no source-level caller.
@@ -718,14 +724,18 @@ pub fn go_runtime_entry_reason(
 }
 
 /// The manifest kinds that scope module privacy, by file name: `"js"` for a
-/// `package.json`, `"gradle"` for a Gradle build script. `None` for anything
-/// else. Liveness assigns each source file to its nearest manifest of the kind
+/// `package.json`, `"gradle"` for a Gradle build script, `"cargo"` for a
+/// `Cargo.toml`, `"swiftpm"` for a `Package.swift`, `"xcode"` for an Xcode
+/// `project.pbxproj`. `None` for anything else. Liveness assigns each source file to its nearest manifest of the kind
 /// its language is built by, so a library nested inside an application keeps
 /// its own verdict.
 pub fn module_manifest_family(path: &str) -> Option<&'static str> {
     match path.rsplit('/').next().unwrap_or(path) {
         "package.json" => Some("js"),
         "build.gradle" | "build.gradle.kts" => Some("gradle"),
+        "Cargo.toml" => Some("cargo"),
+        "Package.swift" => Some("swiftpm"),
+        "project.pbxproj" => Some("xcode"),
         _ => None,
     }
 }
@@ -739,6 +749,12 @@ pub fn module_manifest_family(path: &str) -> Option<&'static str> {
 /// * A Gradle script applying `com.android.application` builds an APK, which
 ///   nothing links against. `apply false` on the line (a root script declaring
 ///   the plugin version for its modules) does not apply it.
+/// * A `Cargo.toml` with a `[package]` and no `[lib]` declares no library
+///   target here. Cargo still auto-discovers `src/lib.rs`, which this file
+///   cannot see, so liveness withdraws the proof when that file is indexed.
+///   A `[workspace]`-only root has no `[package]` and proves nothing.
+///   `publish = false` is deliberately *not* proof: a path or git dependency
+///   from another repository links an unpublished crate just as well.
 ///
 /// A manifest this cannot parse is answered `None`: widening on no evidence is
 /// the one direction this must not err in.
@@ -762,8 +778,176 @@ pub fn module_private_scope_reason(path: &str, source: &str) -> Option<&'static 
                 "its Gradle module applies `com.android.application`, and nothing links against \
                  an application",
             ),
+        // A Swift package proves privacy per target, not per package: see
+        // `swiftpm_executable_target_dirs`.
+        "swiftpm" => None,
+        "xcode" => xcode_builds_only_apps(source).then_some(XCODE_APP_PROOF),
+        "cargo" => {
+            let manifest: toml::Table = source.parse().ok()?;
+            (manifest.contains_key("package") && !manifest.contains_key("lib")).then_some(
+                "its Cargo package has no library target, so it builds only binaries, and \
+                 nothing links against a binary",
+            )
+        }
         _ => None,
     }
+}
+
+/// Why an internal symbol of a Swift executable target has no caller outside it.
+pub const SWIFTPM_EXECUTABLE_PROOF: &str =
+    "its SwiftPM target is an `executableTarget`, and no module can import an executable";
+
+/// Why an internal symbol of an app-only Xcode project has no caller outside it.
+pub const XCODE_APP_PROOF: &str = "its Xcode project builds only applications, extensions and \
+     test bundles, and no module links against an application";
+
+/// The source directories of the `.executableTarget`s a `Package.swift`
+/// declares, relative to the package directory: the `path:` argument when
+/// given, `Sources/<name>` otherwise.
+///
+/// A text scan of the manifest, which is Swift code: each `.executableTarget(`
+/// call is read up to its matching `)` for a `name:` and an optional `path:`
+/// string literal. A target whose name is not a literal is skipped, which errs
+/// toward not widening.
+pub fn swiftpm_executable_target_dirs(source: &str) -> Vec<String> {
+    let literal_after = |args: &str, label: &str| -> Option<String> {
+        let at = args.find(&format!("{label}:"))? + label.len() + 1;
+        let rest = args[at..].trim_start().strip_prefix('"')?;
+        Some(rest[..rest.find('"')?].to_string()).filter(|value| !value.is_empty())
+    };
+    let mut dirs = Vec::new();
+    let mut rest = source;
+    while let Some(at) = rest.find(".executableTarget(") {
+        let args_start = at + ".executableTarget(".len();
+        let mut depth = 1usize;
+        let mut end = None;
+        for (offset, ch) in rest[args_start..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(args_start + offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else { break };
+        let args = &rest[args_start..end];
+        if let Some(name) = literal_after(args, "name") {
+            dirs.push(
+                literal_after(args, "path")
+                    .map(|path| path.trim_end_matches('/').to_string())
+                    .unwrap_or_else(|| format!("Sources/{name}")),
+            );
+        }
+        rest = &rest[end..];
+    }
+    dirs
+}
+
+/// Whether every product an Xcode project builds is an application, an app
+/// extension or a test bundle — nothing another module can link against.
+///
+/// One framework, library, bundle or tool product and the answer is no: mapping
+/// files to targets through the project's group tree is not approximated, so a
+/// mixed project proves nothing for any of its files.
+pub fn xcode_builds_only_apps(source: &str) -> bool {
+    let mut any = false;
+    for line in source.lines() {
+        let Some(value) = line.trim().strip_prefix("productType = ") else {
+            continue;
+        };
+        let value = value.trim_end_matches(';').trim_matches('"');
+        let app_like = value.starts_with("com.apple.product-type.application")
+            || value.starts_with("com.apple.product-type.app-extension")
+            || value.starts_with("com.apple.product-type.extensionkit-extension")
+            || value.starts_with("com.apple.product-type.watchkit")
+            || value.starts_with("com.apple.product-type.bundle.unit-test")
+            || value.starts_with("com.apple.product-type.bundle.ui-testing");
+        if !app_like {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
+/// The component classes an `AndroidManifest.xml` registers, as written and
+/// with a leading-`.` or bare name expanded against the manifest's `package`.
+///
+/// Read from the `android:name` of `<application>`, `<activity>`, `<service>`,
+/// `<receiver>` and `<provider>`, and the `android:targetActivity` of an
+/// `<activity-alias>` — never from `<action>`, `<category>` or `<meta-data>`,
+/// whose `android:name` is an intent or key string, not a class. Comments are
+/// removed first. A manifest that names no `package` (AGP 7+ reads the Gradle
+/// `namespace`) keeps the leading `.`; liveness joins by the simple name
+/// within the manifest's module, so the package is not needed for the join.
+///
+/// No XML parser: a manifest is attribute-only for these tags, and an
+/// unreadable one yields fewer names, which errs toward reporting.
+pub fn android_manifest_components(source: &str) -> Vec<String> {
+    let mut text = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(start) = rest.find("<!--") {
+        text.push_str(&rest[..start]);
+        rest = match rest[start..].find("-->") {
+            Some(end) => &rest[start + end + 3..],
+            None => "",
+        };
+    }
+    text.push_str(rest);
+
+    let attribute = |tag: &str, name: &str| -> Option<String> {
+        let needle = format!("{name}=");
+        let at = tag.find(&needle)? + needle.len();
+        let quote = tag[at..]
+            .chars()
+            .next()
+            .filter(|c| *c == '"' || *c == '\'')?;
+        let value = &tag[at + 1..];
+        let end = value.find(quote)?;
+        Some(value[..end].trim().to_string()).filter(|v| !v.is_empty())
+    };
+    let mut package: Option<String> = None;
+    let mut names: Vec<String> = Vec::new();
+    let mut cursor = text.as_str();
+    while let Some(open) = cursor.find('<') {
+        let after = &cursor[open + 1..];
+        let Some(close) = after.find('>') else { break };
+        let tag = &after[..close];
+        cursor = &after[close + 1..];
+        let element = tag
+            .split(|c: char| c.is_whitespace() || c == '/')
+            .next()
+            .unwrap_or("");
+        let value = match element {
+            "manifest" => {
+                package = attribute(tag, "package");
+                continue;
+            }
+            "application" | "activity" | "service" | "receiver" | "provider" => {
+                attribute(tag, "android:name")
+            }
+            "activity-alias" => attribute(tag, "android:targetActivity"),
+            _ => continue,
+        };
+        if let Some(value) = value {
+            names.push(value);
+        }
+    }
+    names
+        .into_iter()
+        .map(
+            |name| match (&package, name.starts_with('.'), name.contains('.')) {
+                (Some(package), true, _) => format!("{package}{name}"),
+                (Some(package), false, false) => format!("{package}.{name}"),
+                _ => name,
+            },
+        )
+        .collect()
 }
 
 /// Android component supertypes: a class extending one is instantiated by the
@@ -1022,6 +1206,31 @@ pub fn python_base_dispatch_reason(base: &str, method: &str) -> Option<&'static 
             .then_some("torch nn.Module.forward invoked by `Module.__call__`");
     }
     None
+}
+
+/// Whether the dispatch contract of an out-of-corpus base class is known here —
+/// which of a subclass's methods the base calls — so the subclass's *other*
+/// methods are ordinary dead-code candidates.
+///
+/// The bases [`python_base_dispatch_reason`] and [`js_lifecycle_hook_reason`]
+/// already encode: `torch.autograd.Function` and `torch.nn.Module`; the custom
+/// element and React class-component lifecycles. Liveness caps the uncalled
+/// methods of a class whose base is outside the corpus (`external_supertype`)
+/// unless this answers yes, because for an unknown base nothing says which
+/// methods it calls. `written` is the base as written (`torch.autograd.Function`,
+/// `React.Component`, `HTMLElement`).
+pub fn known_dispatch_contract(written: &str) -> bool {
+    let written = written.trim();
+    written.ends_with("autograd.Function")
+        || written.ends_with("nn.Module")
+        || matches!(
+            written,
+            "HTMLElement"
+                | "Component"
+                | "PureComponent"
+                | "React.Component"
+                | "React.PureComponent"
+        )
 }
 
 /// Class methods a JS/TS framework calls on the instance's behalf.
@@ -1420,6 +1629,37 @@ pub fn extract_wiring_annotations(path: &str, source: &str) -> Vec<WiringAnnotat
             target_symbol: path.to_string(),
             details: reason.to_string(),
         });
+    }
+
+    // Each executable target of a Swift package proves its own directory; the
+    // target is that directory, relative to the repository.
+    if path.rsplit('/').next() == Some("Package.swift") {
+        let package_dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
+        for dir in swiftpm_executable_target_dirs(source) {
+            annotations.push(WiringAnnotation {
+                kind: WiringKind::ModulePrivateScope,
+                target_symbol: if package_dir.is_empty() {
+                    dir
+                } else {
+                    format!("{package_dir}/{dir}")
+                },
+                details: SWIFTPM_EXECUTABLE_PROOF.to_string(),
+            });
+        }
+    }
+
+    // The framework instantiates what the manifest registers, by name. The
+    // target is the class as the manifest spells it (no `::`, so it can never
+    // equal a symbol's `qualified_name`); liveness joins it by simple name
+    // within the manifest's module.
+    if path.rsplit('/').next() == Some("AndroidManifest.xml") {
+        for component in android_manifest_components(source) {
+            annotations.push(WiringAnnotation {
+                kind: WiringKind::ConfigEntryPoint,
+                target_symbol: component,
+                details: format!("registered as an Android component in {path}"),
+            });
+        }
     }
 
     if is_vendored_path(path) {
@@ -2191,10 +2431,20 @@ mod tests {
             "examples/demo.rs",
             "benches/bench.rs",
             "tests/integration.rs",
+            // Outside every `src/` tree: a `[[bin]] path = …` target or a
+            // script compiled with `rustc` (LiquiTask's sidecar stub).
+            "scripts/semantic-sidecar-stub.rs",
+            "tools/gen.rs",
+            "stub.rs",
         ] {
             assert!(rust_path_declares_main(path), "{path} may declare main");
         }
-        for path in ["src/lib.rs", "src/binary/thing.rs", "src/example.rs"] {
+        for path in [
+            "src/lib.rs",
+            "src/binary/thing.rs",
+            "src/example.rs",
+            "crates/app/src/scripts/helper.rs",
+        ] {
             assert!(
                 !rust_path_declares_main(path),
                 "{path} must not declare main"
@@ -2232,6 +2482,100 @@ mod tests {
         assert!(module_private_scope_reason("build.gradle.kts", root).is_none());
         assert!(module_private_scope_reason("core/build.gradle.kts", library).is_none());
         assert!(module_private_scope_reason("app/src/Main.kt", android_app).is_none());
+
+        // Cargo: a `[package]` with no `[lib]` builds only binaries; a library,
+        // a workspace-only root and an unparseable manifest prove nothing.
+        // `publish = false` is not proof (path/git dependencies link it).
+        let bin_only = "[package]\nname = \"tool\"\nversion = \"0.1.0\"\n";
+        let library = "[package]\nname = \"kit\"\n\n[lib]\npath = \"src/kit.rs\"\n";
+        let unpublished = "[package]\nname = \"kit\"\npublish = false\n\n[lib]\n";
+        let workspace = "[workspace]\nmembers = [\"a\"]\n";
+        assert!(module_private_scope_reason("tool/Cargo.toml", bin_only).is_some());
+        assert!(module_private_scope_reason("kit/Cargo.toml", library).is_none());
+        assert!(module_private_scope_reason("kit/Cargo.toml", unpublished).is_none());
+        assert!(module_private_scope_reason("Cargo.toml", workspace).is_none());
+        assert!(module_private_scope_reason("Cargo.toml", "[package").is_none());
+
+        // Xcode: proof only when every product is an app, extension or test.
+        let apps = "productType = \"com.apple.product-type.application\";\n\
+                    productType = \"com.apple.product-type.app-extension\";\n\
+                    productType = \"com.apple.product-type.bundle.unit-test\";\n";
+        let mixed = "productType = \"com.apple.product-type.application\";\n\
+                     productType = \"com.apple.product-type.framework\";\n";
+        assert!(module_private_scope_reason("App.xcodeproj/project.pbxproj", apps).is_some());
+        assert!(module_private_scope_reason("App.xcodeproj/project.pbxproj", mixed).is_none());
+        assert!(module_private_scope_reason("App.xcodeproj/project.pbxproj", "{}").is_none());
+        // A Swift package proves privacy per target, never for the package.
+        assert!(module_private_scope_reason("Package.swift", "let p = 1").is_none());
+    }
+
+    #[test]
+    fn swiftpm_executable_targets_name_their_source_directories() {
+        let manifest = r#"
+let package = Package(
+    name: "Demo",
+    targets: [
+        .target(name: "Core"),
+        .executableTarget(name: "Tool", dependencies: ["Core", .product(name: "X", package: "x")]),
+        .executableTarget(
+            name: "Server",
+            path: "Apps/Server/"
+        ),
+        .testTarget(name: "CoreTests", dependencies: ["Core"]),
+    ]
+)
+"#;
+        assert_eq!(
+            swiftpm_executable_target_dirs(manifest),
+            vec!["Sources/Tool".to_string(), "Apps/Server".to_string()]
+        );
+        assert!(swiftpm_executable_target_dirs("let package = Package(name: \"L\")").is_empty());
+        // A non-literal name is skipped rather than guessed.
+        assert!(swiftpm_executable_target_dirs(".executableTarget(name: toolName)").is_empty());
+    }
+
+    #[test]
+    fn android_manifest_components_are_read_from_component_tags_only() {
+        let manifest = r#"<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.fx.app">
+    <!-- <activity android:name=".Retired" /> -->
+    <application android:name=".FxApp">
+        <activity android:name=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <meta-data android:name="key" android:value="v" />
+        </activity>
+        <activity-alias android:name=".Launcher" android:targetActivity=".MainActivity" />
+        <service android:name="SyncService" />
+        <receiver android:name="com.other.BootReceiver" />
+        <provider android:name='.data.Provider' />
+    </application>
+</manifest>"#;
+        assert_eq!(
+            android_manifest_components(manifest),
+            vec![
+                "com.fx.app.FxApp",
+                "com.fx.app.MainActivity",
+                "com.fx.app.MainActivity",
+                "com.fx.app.SyncService",
+                "com.other.BootReceiver",
+                "com.fx.app.data.Provider",
+            ]
+        );
+        // No `package` (AGP reads the Gradle namespace): the leading dot stays,
+        // and liveness joins by the simple name.
+        assert_eq!(
+            android_manifest_components(
+                "<manifest><application android:name=\".App\"/></manifest>"
+            ),
+            vec![".App"]
+        );
+        let annotations = extract_wiring_annotations("app/src/main/AndroidManifest.xml", manifest);
+        assert!(annotations.iter().any(
+            |a| a.kind == WiringKind::ConfigEntryPoint && a.target_symbol == "com.fx.app.FxApp"
+        ));
     }
 
     #[test]

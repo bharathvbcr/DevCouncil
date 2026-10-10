@@ -1,0 +1,1091 @@
+{
+ "about": "Corpus record for the dead-code confident tier, read by devmap-cli/tests/dead_tier_eligibility.rs. Each corpus is a `git archive` of the named commit, built with the binary named in `built_from`; `rows` are the dead rows whose evidence reached the confident branch (published at 0.9, coverage-capped below it, or capped with confident_tier_unproven), each labelled from source by `rg -uu -w` and reading: dead_true (nothing reaches it), dead_false (a path:line reaches it), unsure (excluded from `rows`, listed). A listed language must have false_positive*20 <= rows on every corpus.",
+ "built_from": "devmap 0.2.4 built from the tree committed with this file (parent 8f80b0e2): devmap 0.2.4 (store schema 27, code graph schema 2, build 8f80b0e2ffdc-dirty)",
+ "measured": "2026-10-10",
+ "corpora": [
+  {
+   "name": "AcademiaTrack",
+   "commit": "be7e844207ca4dd8a06a21706eac26100d937c74",
+   "languages": {
+    "python": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 1,
+       "rows": 3
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": [
+      {
+       "symbol": "semantic_layer/cache/base.py::BaseSemanticCache.update_threshold",
+       "published": "0.4",
+       "verdict": "dead_false",
+       "evidence": "semantic_layer/threshold_tuner.py:93 self.cache.update_threshold(smoothed) - direct call through SemanticCache-typed receiver; Faiss/Chroma subclass BaseSemanticCache and neither overrides it (only def is base.py:136), so the call resolves to this method"
+      },
+      {
+       "symbol": "semantic_layer/cache/chroma_cache.py::ChromaSemanticCache.delete_by_model_version",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "rg -uu -n -w delete_by_model_version: 5 hits = this def (chroma_cache.py:196), Protocol stub base.py:120, unrelated FaissSemanticCache def faiss_cache.py:242, and two test calls on FaissSemanticCache instances (test_semantic_fixes.py:76 receiver built at :71; test_semantic_stress.py:344 receiver from cache() helper typed FaissSemanticCache at :32). The Chroma test (test_semantic_fixes.py:58) never calls it. No runtime caller; only static Protocol conformance for create_cache() -> SemanticCache (orchestrator.py:54-57)"
+      },
+      {
+       "symbol": "semantic_layer/compressor/rag_compressor.py::logger",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "rg -uu -n -w logger semantic_layer/compressor/rag_compressor.py: 1 hit (line 15 declaration). Repo-wide 46 hits are other modules' own module-level logger vars; no importer pulls logger from rag_compressor (compressor/__init__.py and all 'rag_compressor import' sites import only RagChunk/RagSemanticCompressor/CompressedContext)"
+      }
+     ]
+    },
+    "tsx": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 2
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": [
+      {
+       "symbol": "components/ApplicationList.tsx::ApplicationList.handleLongPress",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'handleLongPress' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/AcademiaTrack/repo: 1 hit, the declaration (component-local useCallback const) components/ApplicationList.tsx:82"
+      },
+      {
+       "symbol": "components/BulkOperationsModal.tsx::BulkUpdates",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'BulkUpdates' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/AcademiaTrack/repo: 1 hit, the declaration (non-exported type alias) components/BulkOperationsModal.tsx:19"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "Chronicle",
+   "commit": "fa784171b5ce01e52f6558941b3ca5c80c33f406",
+   "languages": {
+    "kotlin": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 2,
+     "labelled_rows": [
+      {
+       "symbol": "chronicle-android/app/src/main/java/com/chronicle/app/MindMapScreen.kt::Offset.times",
+       "published": "0.9",
+       "verdict": "unsure",
+       "evidence": "spot-check 2026-10-10: operator `*` uses on Offset (MindMapScreen.kt:489) are invisible to rg; the verdict that Compose's member Offset.times shadows this private extension rests on upstream library source outside the corpus."
+      },
+      {
+       "symbol": "chronicle-android/app/src/main/java/com/chronicle/app/MindMapScreen.kt::Offset.div",
+       "published": "0.9",
+       "verdict": "unsure",
+       "evidence": "spot-check 2026-10-10: as Offset.times — operator `/` uses are invisible to rg and the shadowing verdict rests on upstream source."
+      }
+     ]
+    },
+    "python": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 26
+      }
+     },
+     "unsure": 1,
+     "labelled_rows": [
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/entries.py::fill_text",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w fill_text <root>: 1 hit (entries.py:199 declaration). No getattr on entries module, no star imports in repo, no string reference"
+      },
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/journal.py::log",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "rg -uu -n -w log journal.py: 1 hit (line 22 log = logging.getLogger(\"chronicle.journal\")); repo-wide 475 -w hits are unrelated (entry type \"log\", shell .log files, other modules' own log vars); no 'journal import ... log', no 'journal.log' patch string, no star import"
+      },
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/llm/rate_limit.py::CLOUD_LLM_PATHS",
+       "published": "0.4",
+       "verdict": "unsure",
+       "evidence": "rg -uu -n -w CLOUD_LLM_PATHS: 3 hits = declaration rate_limit.py:18, re-export import llm/__init__.py:21, and __all__ entry llm/__init__.py:26. Ruled out in-repo: no reader, no star import of chronicle_pipeline.llm, no llm.CLOUD_LLM_PATHS attribute access. Not settled: it is deliberately exported as public API via __all__, which the evidence rule counts as possible reach"
+      },
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/models.py::GraphNode",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "rg -uu -n -w GraphNode -g '*.py' (plus toml/cfg/json/yaml/sh): 1 hit (models.py:123). Other 61 repo-wide hits are unrelated same-named types in TS (frontend/src/api/types.ts), Kotlin (BrainModels.kt) and Rust; models.py has no __all__ and nothing iterates it (Graph.nodes is list[dict], not list[GraphNode])"
+      },
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/models.py::GraphEdge",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "rg -uu -n -w GraphEdge -g '*.py': 1 hit (models.py:137). Other 24 hits are unrelated Rust (server/src/models.rs:136), Kotlin and TS types; Graph.edges is list[dict]"
+      },
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/models.py::Graph",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "rg -uu -n -w Graph <root>: 14 hits - models.py:146 declaration; the rest are prose/comments/strings ('Graph + insights', 'Chronicle Graph v1' schema titles, brain/graph.py:1 docstring, api/recall.py:39 description, cutover_kb.py:377 comment, Rust comment brain.rs:447)"
+      },
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/models.py::EnrichFile",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w EnrichFile <root>: 1 hit (models.py:163 declaration)"
+      },
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/models.py::TagsFile",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w TagsFile <root>: 1 hit (models.py:181 declaration)"
+      },
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/models.py::Insight",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "rg -uu -n -w Insight <root>: 3 hits = models.py:189 declaration and two JSON schema \"title\" strings (contract/insight.schema.json:4 in chronicle-pc and chronicle-android)"
+      },
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/models.py::CurationOp",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "rg -uu -n -w CurationOp -g '*.py': 1 hit (models.py:204). Other 50 repo-wide hits are unrelated Kotlin (BrainModels.kt:92), Rust (server/src/models.rs, curation.rs) and TS types"
+      },
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/notes.py::MOOD_LABELS",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w MOOD_LABELS <root>: 1 hit (notes.py:25 declaration); prefix search 'MOOD_' finds only unrelated MOOD_MSG (Rust) and MOOD_FACES (TS/Kotlin); no getattr on notes"
+      },
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/ollama.py::NUM_CTX_RECALL",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w NUM_CTX_RECALL <root>: 1 hit (ollama.py:26); prefix search 'NUM_CTX_' finds no other file, so no f-string/getattr dispatch"
+      },
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/ollama.py::NUM_CTX_ASK",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w NUM_CTX_ASK <root>: 1 hit (ollama.py:27); prefix 'NUM_CTX_' only in ollama.py"
+      },
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/ollama.py::NUM_CTX_RESUME",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w NUM_CTX_RESUME <root>: 1 hit (ollama.py:28); prefix 'NUM_CTX_' only in ollama.py"
+      },
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/ollama.py::NUM_CTX_ENRICH",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w NUM_CTX_ENRICH <root>: 1 hit (ollama.py:29); prefix 'NUM_CTX_' only in ollama.py"
+      },
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/ollama.py::NUM_CTX_BRAIN",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w NUM_CTX_BRAIN <root>: 1 hit (ollama.py:30); prefix 'NUM_CTX_' only in ollama.py"
+      },
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/path_map.py::same_suffix_peers",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w same_suffix_peers <root>: 1 hit (path_map.py:234 declaration); the only getattr on path_map (tests/test_wire_dead_code.py:130) names machine_exclude_dirs"
+      },
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/rag.py::log",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "rg -uu -n -w log rag.py: 1 hit (line 15 log = logging.getLogger(\"chronicle.rag\")); tests patch chronicle_pipeline.rag.llm.* and rag.build_retrieval_context but never rag.log; 475 repo-wide -w hits are unrelated (entry type \"log\", HTML recall-log, other modules' vars)"
+      },
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/rag.py::ASK_TOP_K",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w ASK_TOP_K <root>: 1 hit (rag.py:22); prefix '_TOP_K' elsewhere only matches unrelated DEFAULT_TOP_K (llm/ollama_provider.py:28)"
+      },
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/rag.py::RESUME_TOP_K",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w RESUME_TOP_K <root>: 1 hit (rag.py:23); prefix '_TOP_K' elsewhere only unrelated DEFAULT_TOP_K"
+      },
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/tls_certs.py::TlsError",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w TlsError <root>: 1 hit (tls_certs.py:35 class declaration); never raised, caught or imported"
+      },
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/tls_certs.py::read_meta",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w read_meta <root>: 1 hit (tls_certs.py:169 declaration); no decorator, no getattr on tls_certs"
+      },
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/url_allowlist.py::DEFAULT_GROK_BASE",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "rg -uu -n -w DEFAULT_GROK_BASE: 10 hits - url_allowlist.py:10 declaration (only hit in that file); the rest are an unrelated same-named constant llm/grok_provider.py:18 (used there and imported by llm/factory.py:11 from .grok_provider) and Kotlin CloudLlmClient.DEFAULT_GROK_BASE"
+      },
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/url_allowlist.py::DEFAULT_OLLAMA_BASE",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w DEFAULT_OLLAMA_BASE <root>: 1 hit (url_allowlist.py:11 declaration)"
+      },
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/vault_layout.py::MIN_SUPPORTED_LAYOUT_VERSION",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w MIN_SUPPORTED_LAYOUT_VERSION <root>: 1 hit (vault_layout.py:9 declaration)"
+      },
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/vault_paths.py::LEGACY_IMG",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w LEGACY_IMG <root>: 1 hit (vault_paths.py:21); prefix search finds only unrelated LEGACY_IMG_RE (Rust server/src/media.rs:11) and LEGACY_KB_NOTES/LEGACY_ID_RE"
+      },
+      {
+       "symbol": "chronicle-pc/pipeline/chronicle_pipeline/vault_paths.py::LEGACY_AUDIO",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w LEGACY_AUDIO <root>: 1 hit (vault_paths.py:22); prefix search finds only unrelated LEGACY_AUDIO_RE (Rust server/src/media.rs:12)"
+      }
+     ]
+    },
+    "rust": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 2
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": [
+      {
+       "symbol": "chronicle-pc/server/src/index_store.rs::EmbedFn",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'EmbedFn' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/Chronicle/repo -> 1 hit: the type alias declaration index_store.rs:120; a type alias has no trait/Drop/fn-pointer/macro route and no use exists in any crate (Embedder.f at :124 spells the dyn Fn type inline instead)"
+      },
+      {
+       "symbol": "chronicle-pc/server/src/media.rs::MediaRef",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'MediaRef' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/Chronicle/repo -> 1 hit: the declaration media.rs:124 (#[derive(serde::Deserialize)] struct MediaRef(pub String)); the derive generates an impl but nothing names MediaRef as a deserialization target anywhere (validate_media_ref_list at :126 works on serde_json Value)"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "ChronosFlow",
+   "commit": "b7a23d41c02e4e8cb88a9c6e4c96dc2c1ed2cdc4",
+   "languages": {
+    "kotlin": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 9
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": [
+      {
+       "symbol": "feature/daydial/src/main/java/com/ChronosFlow/VBCR/feature/daydial/ChronosDial.kt::windowContainsSegment",
+       "published": "0.66",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'windowContainsSegment' <corpus_root> -> 1 hit, the declaration feature/daydial/src/main/java/com/ChronosFlow/VBCR/feature/daydial/ChronosDial.kt:1091 (private top-level fun returning Boolean; no annotation, not @Composable, not override/operator; private so no Java/other-file caller; no callable reference or string mention)"
+      },
+      {
+       "symbol": "feature/habits/src/main/java/com/ChronosFlow/VBCR/feature/habits/HabitFormSheet.kt::habitRecurrenceSectionSubtitle",
+       "published": "0.66",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'habitRecurrenceSectionSubtitle' <corpus_root> -> 1 hit, the declaration feature/habits/src/main/java/com/ChronosFlow/VBCR/feature/habits/HabitFormSheet.kt:1343 (private top-level fun returning String; no annotation, not @Composable, not override/operator; private so no Java/other-file caller; no callable reference or string mention)"
+      },
+      {
+       "symbol": "feature/habits/src/main/java/com/ChronosFlow/VBCR/feature/habits/HabitFormSheet.kt::habitWindowSectionSubtitle",
+       "published": "0.66",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'habitWindowSectionSubtitle' <corpus_root> -> 1 hit, the declaration feature/habits/src/main/java/com/ChronosFlow/VBCR/feature/habits/HabitFormSheet.kt:1373 (private top-level fun returning String; no annotation, not @Composable, not override/operator; private so no Java/other-file caller; no callable reference or string mention)"
+      },
+      {
+       "symbol": "feature/habits/src/main/java/com/ChronosFlow/VBCR/feature/habits/HabitFormSheet.kt::habitEffortSectionSubtitle",
+       "published": "0.66",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'habitEffortSectionSubtitle' <corpus_root> -> 1 hit, the declaration feature/habits/src/main/java/com/ChronosFlow/VBCR/feature/habits/HabitFormSheet.kt:1403 (private top-level fun returning String; no annotation, not @Composable, not override/operator; private so no Java/other-file caller; no callable reference or string mention)"
+      },
+      {
+       "symbol": "feature/habits/src/main/java/com/ChronosFlow/VBCR/feature/habits/HabitFormSheet.kt::habitLaunchSectionSubtitle",
+       "published": "0.66",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'habitLaunchSectionSubtitle' <corpus_root> -> 1 hit, the declaration feature/habits/src/main/java/com/ChronosFlow/VBCR/feature/habits/HabitFormSheet.kt:2394 (private top-level fun returning String; no annotation, not @Composable, not override/operator; private so no Java/other-file caller; no callable reference or string mention)"
+      },
+      {
+       "symbol": "feature/medication/src/main/java/com/ChronosFlow/VBCR/feature/medication/MedicationFormSheet.kt::medicationDoseSectionSubtitle",
+       "published": "0.66",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'medicationDoseSectionSubtitle' <corpus_root> -> 1 hit, the declaration feature/medication/src/main/java/com/ChronosFlow/VBCR/feature/medication/MedicationFormSheet.kt:1588 (private top-level fun returning String; no annotation, not @Composable, not override/operator; private so no Java/other-file caller; no callable reference or string mention)"
+      },
+      {
+       "symbol": "feature/medication/src/main/java/com/ChronosFlow/VBCR/feature/medication/MedicationFormSheet.kt::medicationReminderSectionSubtitle",
+       "published": "0.66",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'medicationReminderSectionSubtitle' <corpus_root> -> 1 hit, the declaration feature/medication/src/main/java/com/ChronosFlow/VBCR/feature/medication/MedicationFormSheet.kt:1617 (private top-level fun returning String; no annotation, not @Composable, not override/operator; private so no Java/other-file caller; no callable reference or string mention)"
+      },
+      {
+       "symbol": "feature/tasks/src/main/java/com/ChronosFlow/VBCR/feature/tasks/TaskFormSheet.kt::taskScheduleSectionSubtitle",
+       "published": "0.66",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'taskScheduleSectionSubtitle' <corpus_root> -> 1 hit, the declaration feature/tasks/src/main/java/com/ChronosFlow/VBCR/feature/tasks/TaskFormSheet.kt:3427 (private top-level fun returning String; no annotation, not @Composable, not override/operator; private so no Java/other-file caller; no callable reference or string mention)"
+      },
+      {
+       "symbol": "feature/tasks/src/main/java/com/ChronosFlow/VBCR/feature/tasks/TaskFormSheet.kt::taskChecklistSectionSubtitle",
+       "published": "0.66",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'taskChecklistSectionSubtitle' <corpus_root> -> 1 hit, the declaration feature/tasks/src/main/java/com/ChronosFlow/VBCR/feature/tasks/TaskFormSheet.kt:3465 (private top-level fun returning String; no annotation, not @Composable, not override/operator; private so no Java/other-file caller; no callable reference or string mention)"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "DevCouncil",
+   "commit": "acb5e3b9b8d05d58437cd8710259f9b76a619b70",
+   "languages": {
+    "python": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 4
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": [
+      {
+       "symbol": "benchmarks/results/competition/20260912-52d63a1a/summarize.py::iteration",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "rg -uu -n -w iteration summarize.py: 1 hit (line 13 'stage,tool,target,iteration=match.groups()' - assigned by tuple unpacking, never read). Repo-wide 823 -w hits are unrelated prose/loop vars in other files; no file imports summarize.py (rg 'import summarize|from summarize' finds only an unrelated 'from run_bench import summarize')"
+      },
+      {
+       "symbol": "benchmarks/results/competition/20260912-52d63a1a/write_report.py::audit",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "rg -uu -n -w audit write_report.py: 5 hits - line 11 assignment audit=json.loads(...); lines 62,72,86,101 are the word 'audit' inside report prose string literals, not the variable. Script is run standalone; nothing imports it"
+      },
+      {
+       "symbol": "benchmarks/results/competition/20260912-expanded/write_report.py::PLAN",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "rg -uu -n -w PLAN write_report.py: 1 hit (line 5 PLAN=json.loads(...plan.json) - assigned, never read). Repo-wide 181 hits are PLAN.md mentions and other scripts; nothing imports this write_report.py"
+      },
+      {
+       "symbol": "benchmarks/results/competition/20261007-build-cost/patches/teardown_probe_driver.py::out_rest",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w out_rest <root>: 1 hit (teardown_probe_driver.py:28 'out_rest, err = p.communicate()' - assigned, never read)"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "DevPrism",
+   "commit": "af20d777393e95127404b5611275f67e9f81f130",
+   "languages": {
+    "python": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 1
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": [
+      {
+       "symbol": "docs/semantic-layer-reference/cache.py::SemanticCache.report_false_positive",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w report_false_positive <root>: 1 hit (docs/semantic-layer-reference/cache.py:251 declaration); plain method, no decorator, no string dispatch"
+      }
+     ]
+    },
+    "rust": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 1
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": [
+      {
+       "symbol": "apps/desktop/src-tauri/src/mcp/stress.rs::DocFixture.notes_intact",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'notes_intact' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/DevPrism/repo -> 1 hit: the declaration stress.rs:616 inside the inherent impl DocFixture (stress.rs:576; the only trait impl is Drop at :569, which defines drop); sibling helpers master_intact/sentinel_untouched are used by the tests but notes_intact is never called, passed as fn value, or named in a macro"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "LiquiTask",
+   "commit": "fd2015e99d7bf415fe9f5922c6a9426885b91bde",
+   "languages": {
+    "go": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 17
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": [
+      {
+       "symbol": "liquitask-agentd/internal/agent/sandbox_linux.go::linuxSandboxBindRoots",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'linuxSandboxBindRoots' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 1 hit: the declaration sandbox_linux.go:72 (file is //go:build linux; no caller under any tag, incl. _test.go); since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+      },
+      {
+       "symbol": "liquitask-agentd/internal/agent/sandbox_profile.go::findGitDir",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'findGitDir' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 1 hit: the declaration sandbox_profile.go:106; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+      },
+      {
+       "symbol": "liquitask-agentd/internal/daemon/gc.go::Daemon.gcLoop",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'gcLoop' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 2 hits: doc comment gc.go:14 and declaration gc.go:16; no d.gcLoop call or method value (go d.gcLoop would match -w); since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+      },
+      {
+       "symbol": "liquitask-agentd/internal/daemon/health.go::Daemon.listenHealth",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'listenHealth' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 2 hits: doc comment health.go:40 and declaration health.go:42; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+      },
+      {
+       "symbol": "liquitask-agentd/internal/daemon/health.go::Daemon.serveHealth",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'serveHealth' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 3 hits: comments health.go:51 (healthHandler extracted from serveHealth) and health.go:131, declaration health.go:146; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+      },
+      {
+       "symbol": "liquitask-agentd/internal/execenv/git.go::detectGitRepo",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'detectGitRepo' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 2 hits: doc comment git.go:14 and declaration git.go:16; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+      },
+      {
+       "symbol": "liquitask-agentd/internal/execenv/git.go::fetchOrigin",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'fetchOrigin' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 2 hits: doc comment git.go:34 and declaration git.go:35; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+      },
+      {
+       "symbol": "liquitask-agentd/internal/execenv/git.go::getRemoteDefaultBranch",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getRemoteDefaultBranch' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 37 hits: execenv/git.go:44 comment and :46 declaration; the other 35 are all in package repocache (daemon/repocache/cache.go and cache_test.go), which declares its own unrelated getRemoteDefaultBranch at cache.go:711 and calls that one (cache.go:575, cache_test.go:373 etc.); package execenv has no caller; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+      },
+      {
+       "symbol": "liquitask-agentd/internal/execenv/git.go::setupGitWorktree",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'setupGitWorktree' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 2 hits: doc comment git.go:76 and declaration git.go:77; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+      },
+      {
+       "symbol": "liquitask-agentd/internal/execenv/git.go::removeGitWorktree",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'removeGitWorktree' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 2 hits: doc comment git.go:101 and declaration git.go:102; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+      },
+      {
+       "symbol": "liquitask-agentd/internal/execenv/git.go::excludeFromGit",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'excludeFromGit' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 6 hits: execenv/git.go:120 comment and :121 declaration; cache.go:503,543 call and cache.go:922,923 declare the unrelated same-named excludeFromGit in package repocache; package execenv has no caller; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+      },
+      {
+       "symbol": "liquitask-agentd/internal/execenv/server_snapshot_provider.go::snapshotVariantEnabled",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'snapshotVariantEnabled' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 1 hit: the declaration server_snapshot_provider.go:141; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+      },
+      {
+       "symbol": "liquitask-agentd/internal/rpc/rpc.go::Server.reply",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'reply' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 101 hits: rpc.go:218 is the declaration; the method is unexported so only package rpc can reach it, and rpc.go:218 is the only hit under internal/rpc; the other 100 hits are in other packages (execenv, agent, daemon: the word reply in prompts/comments, reply.md, reply_instructions) and cannot call it; rg -uu -n -t go '\\breply\\(' over liquitask-agentd -> 1 hit (the declaration) and rg -t go for \\.reply\\b -> 0 hits, so no s.reply call or method value (rpc.go calls s.replyClient directly at :186,:192,:200); since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+      },
+      {
+       "symbol": "liquitask-agentd/internal/runner/queue.go::queueLengthForAgent",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'queueLengthForAgent' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 1 hit: the declaration queue.go:249; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+      },
+      {
+       "symbol": "liquitask-agentd/internal/runner/reservation.go::scopeReservation.checkOverlap",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'checkOverlap' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 5 hits: reservation.go:350 declaration; the other 4 are the unrelated TypeScript method checkOverlap in src/services/agents/agentReservationService.ts:81,117,150,172; no Go caller; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+      },
+      {
+       "symbol": "liquitask-agentd/internal/runner/reservation.go::reservationPathsLabel",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'reservationPathsLabel' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 1 hit: the declaration reservation.go:362; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+      },
+      {
+       "symbol": "liquitask-agentd/internal/runner/runner.go::Manager.emitResult",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'emitResult' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 1 hit: the declaration runner.go:1197; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+      }
+     ]
+    },
+    "python": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 4
+      }
+     },
+     "unsure": 1,
+     "labelled_rows": [
+      {
+       "symbol": "semantic_layer/backends/llamacpp.py::LlamaCppBackend",
+       "published": "0.4",
+       "verdict": "unsure",
+       "evidence": "rg -uu -n -w LlamaCppBackend: 5 hits = declaration llamacpp.py:8, re-export import backends/__init__.py:4 and __all__ entry :10, docstring example_usage.py:6, commented-out line example_usage.py:32. Ruled out in-repo: never instantiated, no star import, no backend registry/string dispatch (rg -i llamacpp finds nothing else). Not settled: deliberately exported via __all__ and documented as the swap-in backend, so external/public-API use cannot be ruled out"
+      },
+      {
+       "symbol": "semantic_layer/cache.py::ThresholdCalibrator.auto_tune",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w auto_tune <root>: 2 hits = cache.py:64 declaration and semantic_layer/ARCHITECTURE.md:154 documentation prose"
+      },
+      {
+       "symbol": "semantic_layer/embedder.py::Embedder.reset_singleton",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w reset_singleton <root>: 1 hit (embedder.py:65 declaration; docstring says 'primarily for tests' but no test or fixture calls it)"
+      },
+      {
+       "symbol": "semantic_layer/ood.py::OODDetector.is_ood",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "rg -uu -n -w is_ood: 13 hits - ood.py:51 declaration; orchestrator.py:33 is an unrelated dataclass field, :158/:163/:235 a local variable, :159 metrics.is_ood attribute assignment; the rest are Rust (src-tauri). rg 'is_ood\\(' finds only the def. The orchestrator uses self.ood.score() (orchestrator.py:156) instead"
+      },
+      {
+       "symbol": "semantic_layer/orchestrator.py::SemanticOrchestrator.invalidate_stale_docs",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w invalidate_stale_docs <root>: 2 hits = orchestrator.py:257 declaration and semantic_layer/ARCHITECTURE.md:355 documentation prose"
+      }
+     ]
+    },
+    "typescript": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 23
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": [
+      {
+       "symbol": "src/services/agents/agentDispatchService.ts::AgentDispatchService.isDispatching",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'isDispatching' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/agents/agentDispatchService.ts:78; no string/bracket use possible since -w matches strings too"
+      },
+      {
+       "symbol": "src/services/agents/agentMcpService.ts::AgentMcpService.getPendingPermissionsForRun",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getPendingPermissionsForRun' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/agents/agentMcpService.ts:239"
+      },
+      {
+       "symbol": "src/services/agents/agentReservationService.ts::AgentReservationService.getReservationForRun",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getReservationForRun' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/agents/agentReservationService.ts:63"
+      },
+      {
+       "symbol": "src/services/agents/agentRunService.ts::AgentRunService.hasActiveRuns",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'hasActiveRuns' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/agents/agentRunService.ts:833"
+      },
+      {
+       "symbol": "src/services/agents/agentRunService.ts::AgentRunService.commitWorktree",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'commitWorktree' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/agents/agentRunService.ts:1462"
+      },
+      {
+       "symbol": "src/services/agents/agentScopeService.ts::AgentScopeService.hasScopeForRun",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'hasScopeForRun' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/agents/agentScopeService.ts:212"
+      },
+      {
+       "symbol": "src/services/agents/devcouncilService.ts::DevCouncilService.isCliAvailable",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'isCliAvailable' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/agents/devcouncilService.ts:83"
+      },
+      {
+       "symbol": "src/services/agents/devcouncilService.ts::DevCouncilService.install",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'install' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 111 hits in 39 files (ts 21, tsx 14, go 36, rs 19, md 13, py 4, txt 2, Dockerfile 2); only TS/TSX can reach a TS method: of those 35, one is the declaration src/services/agents/devcouncilService.ts:109, four are an unrelated local const `install` (devcouncilService.ts:163-166), the rest are comments, JSX text, and strings (\"npm install -g ...\", busy===\"install\" in DevCouncilPanel.tsx); no `.install(` call, destructure or bracket key; every devcouncilService.* call site (DevCouncilPanel.tsx, agentRunService.ts, devcouncilWorkspaceSync.ts, TaskEvidencePanel.tsx) calls other methods (installLocal, init, getStatus, ...); go/rs/md/py/txt/Dockerfile hits are other-language code and prose"
+      },
+      {
+       "symbol": "src/services/agents/devcouncilService.ts::DevCouncilService.clearCaches",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'clearCaches' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/agents/devcouncilService.ts:297"
+      },
+      {
+       "symbol": "src/services/agents/sessionDiscoveryService.ts::SessionDiscoveryService.getAdoptable",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getAdoptable' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/agents/sessionDiscoveryService.ts:239"
+      },
+      {
+       "symbol": "src/services/aiService.ts::AiService.parseTaskFromText",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'parseTaskFromText' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/aiService.ts:1454"
+      },
+      {
+       "symbol": "src/services/aiService.ts::AiService.suggestAssignment",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'suggestAssignment' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/aiService.ts:2023"
+      },
+      {
+       "symbol": "src/services/aiService.ts::AiService.clearOrganizeCache",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'clearOrganizeCache' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/aiService.ts:2235"
+      },
+      {
+       "symbol": "src/services/autoOrganizeService.ts::AutoOrganizeService.getHistory",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getHistory' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/autoOrganizeService.ts:659"
+      },
+      {
+       "symbol": "src/services/exportService.ts::ExportService.getSanitisedColumns",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getSanitisedColumns' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/exportService.ts:222"
+      },
+      {
+       "symbol": "src/services/exportService.ts::ExportService.exportToMarkdown",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'exportToMarkdown' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/exportService.ts:227"
+      },
+      {
+       "symbol": "src/services/notificationService.ts::NotificationService.reloadPreferences",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'reloadPreferences' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/notificationService.ts:55"
+      },
+      {
+       "symbol": "src/services/notificationService.ts::NotificationService.getPreferences",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getPreferences' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/notificationService.ts:59"
+      },
+      {
+       "symbol": "src/services/notificationService.ts::NotificationService.scheduleAllReminders",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'scheduleAllReminders' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/notificationService.ts:273"
+      },
+      {
+       "symbol": "src/services/semanticLayerService.ts::SemanticLayerService.getLastCacheEntryId",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getLastCacheEntryId' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/semanticLayerService.ts:142"
+      },
+      {
+       "symbol": "src/services/semanticLayerService.ts::SemanticLayerService.recordFeedback",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'recordFeedback' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/semanticLayerService.ts:326"
+      },
+      {
+       "symbol": "src/services/taskCleanupService.ts::TaskCleanupService.categorizeTasks",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'categorizeTasks' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 11 hits; declaration src/services/taskCleanupService.ts:493; every other hit is the unrelated AiService.categorizeTasks (decl src/services/aiService.ts:1647, calls via aiService.* incl. taskCleanupService.ts:505, autoOrganizeService.ts:330, BulkAIOperationsModal.tsx:128) or test mocks of aiService; no taskCleanupService.categorizeTasks call or destructure exists"
+      },
+      {
+       "symbol": "src/services/taskCleanupService.ts::TaskCleanupService.clusterTasks",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'clusterTasks' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 25 hits; declaration src/services/taskCleanupService.ts:596; others are the unrelated AiService.clusterTasks (decl aiService.ts:1700, calls via aiService.* at taskCleanupService.ts:608, autoOrganizeService.ts:276, AIReorganizeModal.tsx:71) and aiService test mocks, plus unrelated local const clusterTasks (taskCleanupService.ts:650-679, scripts/rust-migration-oracle/services/cleanup.cjs:583+); no taskCleanupService.clusterTasks call"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "Manvi",
+   "commit": "b689a82a96f62b1429b55187577ce2c5b4a749f7",
+   "languages": {
+    "python": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 6,
+       "rows": 6
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": [
+      {
+       "symbol": "bench/mh/rpc.py::_ImportBan.find_spec",
+       "published": "0.4",
+       "verdict": "dead_false",
+       "evidence": "bench/mh/rpc.py:748 sys.meta_path.insert(0, _ImportBan(names)) - framework hook: the import system calls find_spec on every meta_path finder"
+      },
+      {
+       "symbol": "bench/mh/rpc.py::_ProxyLoader.create_module",
+       "published": "0.4",
+       "verdict": "dead_false",
+       "evidence": "bench/mh/rpc.py:861 importlib.util.spec_from_loader(name, _ProxyLoader(...)) returned from _CheckerFinder.find_spec (registered at rpc.py:897 on sys.meta_path) - framework hook: importlib calls loader.create_module"
+      },
+      {
+       "symbol": "bench/mh/rpc.py::_ProxyLoader.exec_module",
+       "published": "0.4",
+       "verdict": "dead_false",
+       "evidence": "bench/mh/rpc.py:861 _ProxyLoader passed as the spec's loader, finder registered at rpc.py:897 - framework hook: importlib calls loader.exec_module after create_module"
+      },
+      {
+       "symbol": "bench/mh/rpc.py::_CheckerFinder.find_spec",
+       "published": "0.4",
+       "verdict": "dead_false",
+       "evidence": "bench/mh/rpc.py:897 sys.meta_path.insert(0, _CheckerFinder(ep)) - framework hook: the import system calls find_spec on every meta_path finder"
+      },
+      {
+       "symbol": "bench/tasks/json_patch/setup/patch.py::PatchError",
+       "published": "0.4",
+       "verdict": "dead_false",
+       "evidence": "bench/tasks/json_patch/hidden_test.py:2 from patch import PatchError and :18 except PatchError - import by module name at run time: the harness copies setup/ into the sandbox (bench/mh/bench.py:224 setup_dir, :248 shutil.copytree(self.setup_dir, dest)), so patch resolves to this starter file in the fresh sandbox until the candidate replaces it (selftest.py:125-153 overlays reference/ instead); setup/test_patch.py:1 also imports from patch; SPEC.md:6 requires the class. Same-named class in reference/patch.py is the solution copy"
+      },
+      {
+       "symbol": "bench/tasks/state_machine_fuzz/setup/proto.py::ProtocolError",
+       "published": "0.4",
+       "verdict": "dead_false",
+       "evidence": "bench/tasks/state_machine_fuzz/hidden_test.py:3 from proto import Parser, ProtocolError and :15 default exc=ProtocolError - import by module name at run time: sandbox materialised by copytree(setup_dir) (bench/mh/bench.py:248), so proto resolves to this starter file until the candidate replaces it (selftest.py overlays reference/ instead); SPEC.md:8 requires the class. reference/proto.py is a same-named solution copy; rpc.py:362 is an unrelated docstring"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "Meridian",
+   "commit": "0b16935a607acefba430b80ace12fbb8752b429a",
+   "languages": {
+    "python": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 3,
+       "rows": 3
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": [
+      {
+       "symbol": "tools/semantic_layer/semantic_layer/cache.py::_FaissIndex.rebuild",
+       "published": "0.4",
+       "verdict": "dead_false",
+       "evidence": "tools/semantic_layer/semantic_layer/cache.py:218 self._index.rebuild(matrix) (also :197, :215) - call through _VectorIndex Protocol; self._index = _FaissIndex(...) if _HAS_FAISS at cache.py:104"
+      },
+      {
+       "symbol": "tools/semantic_layer/semantic_layer/cache.py::_NumpyIndex.rebuild",
+       "published": "0.4",
+       "verdict": "dead_false",
+       "evidence": "tools/semantic_layer/semantic_layer/cache.py:218 self._index.rebuild(matrix) (also :197, :215) - call through _VectorIndex Protocol; self._index = ... else _NumpyIndex() at cache.py:104"
+      },
+      {
+       "symbol": "tools/semantic_layer/semantic_layer/pipeline.py::SemanticPipeline.cache",
+       "published": "0.4",
+       "verdict": "dead_false",
+       "evidence": "tools/semantic_layer/semantic_layer/benchmark.py:152 'cache: SemanticCache = pipe.cache' - property access on SemanticPipeline built at benchmark.py:147"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "SalEdge",
+   "commit": "3eafbd4c26bf0e38217b8ae33a8e12dbab336e36",
+   "languages": {
+    "python": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 4
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": [
+      {
+       "symbol": "semantic_layer/backends/llamacpp.py::logger",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "rg -uu -n -w logger semantic_layer/backends/llamacpp.py: 1 hit (line 12 declaration); repo-wide 27 hits are other modules' own logger vars and their uses; nothing imports logger from backends.llamacpp"
+      },
+      {
+       "symbol": "semantic_layer/backends/ollama.py::logger",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "rg -uu -n -w logger semantic_layer/backends/ollama.py: 1 hit (line 12 declaration); repo-wide 27 hits are other modules' own logger vars; nothing imports logger from backends.ollama"
+      },
+      {
+       "symbol": "semantic_layer/compressor.py::SemanticCompressor.chunk_text",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w chunk_text <root>: 4 hits = compressor.py:115 declaration and :133/:134/:138, a local variable named chunk_text inside the method itself; no '.chunk_text(' anywhere"
+      },
+      {
+       "symbol": "semantic_layer/metrics.py::_Histogram.to_prometheus_lines",
+       "published": "0.4",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w to_prometheus_lines <root>: 1 hit (metrics.py:66 declaration); to_prometheus_text (metrics.py:178) calls only to_prometheus_line (singular) on counters/threshold"
+      }
+     ]
+    },
+    "tsx": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 2
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": [
+      {
+       "symbol": "components/DashboardPage.tsx::DashboardPage.handleExport",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'handleExport' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/SalEdge/repo: 6 hits; declaration components/DashboardPage.tsx:781; others are unrelated component-local handleExport in components/ReportsPage.tsx:271/481 and components/PurchasePage.tsx:917/969/972"
+      },
+      {
+       "symbol": "components/DashboardPage.tsx::DashboardPage.TabButton",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "spot-check 2026-10-10: both <TabButton> uses (DashboardPage.tsx:847-848) sit inside a JSX comment {/* ... */}; nothing else names it. The labelling pass read the commented-out use as a call."
+      }
+     ]
+    },
+    "typescript": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 1
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": [
+      {
+       "symbol": "utils/api.ts::isUploadPath",
+       "published": "0.9",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'isUploadPath' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/SalEdge/repo: 1 hit, the declaration utils/api.ts:121"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "scholarlm",
+   "commit": "a2cc182d82dd76d3f15396a3606de96acaef8b2a",
+   "languages": {
+    "python": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 7,
+       "rows": 7
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": [
+      {
+       "symbol": "backend/python_sidecar/routers/request_bounds.py::MAX_PDF_DOWNLOAD_BYTES",
+       "published": "0.4",
+       "verdict": "dead_false",
+       "evidence": "backend/python_sidecar/routers/compute_router.py:17 imported from routers.request_bounds and used at :295, :304, :309 - direct reference (download size bound)"
+      },
+      {
+       "symbol": "backend/python_sidecar/services/gemini_service.py::GeminiService.embed_with_usage",
+       "published": "0.4",
+       "verdict": "dead_false",
+       "evidence": "backend/python_sidecar/services/llm_runtime.py:1172 (\"embed_with_usage\", \"embed\") passed to _invoke_embedding_method on self._default_gemini - string dispatch by method name (comment at :1166 says it prefers the usage-carrying variant); tests patch it by name (tests/test_grpc_server_repo_additional.py:216)"
+      },
+      {
+       "symbol": "backend/python_sidecar/services/genai_native_config.py::prepare_schema_for_provider",
+       "published": "0.4",
+       "verdict": "dead_false",
+       "evidence": "backend/python_sidecar/services/gemini_service.py:29 imported as _prepare_schema_for_provider, called at gemini_service.py:1927, :2417, :2712, :3190 - direct call via import alias"
+      },
+      {
+       "symbol": "backend/python_sidecar/services/local_llm_service.py::local_llm_service",
+       "published": "0.4",
+       "verdict": "dead_false",
+       "evidence": "backend/python_sidecar/services/manuscript_llm.py:25 import, returned at :35 and :40 - direct reference (singleton returned by manuscript_llm selector)"
+      },
+      {
+       "symbol": "backend/python_sidecar/services/log_redaction.py::QUERY_PREVIEW_CHARS",
+       "published": "0.4",
+       "verdict": "dead_false",
+       "evidence": "backend/python_sidecar/tests/test_log_and_response_redaction.py:10 import and :72 'assert len(preview) <= QUERY_PREVIEW_CHARS' - test reference (no production reader; only log_redaction.py:11 declaration in that file)"
+      },
+      {
+       "symbol": "backend/python_sidecar/services/turbovec_service.py::turbovec_searcher",
+       "published": "0.4",
+       "verdict": "dead_false",
+       "evidence": "backend/python_sidecar/routers/ml_router.py:31 import and :252 'await turbovec_searcher.search(' - direct call on module singleton"
+      },
+      {
+       "symbol": "backend/python_sidecar/services/vertex_entailment.py::BACKEND_VERTEX",
+       "published": "0.4",
+       "verdict": "dead_false",
+       "evidence": "backend/python_sidecar/services/entailment_service.py:797 'from services.vertex_entailment import BACKEND_VERTEX, model_id' and :807 '\"backend\": BACKEND_VERTEX' - direct reference (also :649, :702)"
+      }
+     ]
+    },
+    "tsx": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 10
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": [
+      {
+       "symbol": "frontend/components/AdminPanel.tsx::AdminPanel.getFilteredFeatures",
+       "published": "0.66",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getFilteredFeatures' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 3 hits; declaration (component-local const) frontend/components/AdminPanel.tsx:588; other two are an unrelated local getFilteredFeatures in frontend/components/admin/FlagsTab.tsx:125/132"
+      },
+      {
+       "symbol": "frontend/components/ExtractTableChatModal.tsx::ExtractTableChatModal.handleRemovePaper",
+       "published": "0.66",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'handleRemovePaper' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 1 hit, the declaration (component-local const) frontend/components/ExtractTableChatModal.tsx:98"
+      },
+      {
+       "symbol": "frontend/components/QualityModeSelector.tsx::QualityModeSelector.getModeStyles",
+       "published": "0.66",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getModeStyles' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 1 hit, the declaration (component-local const) frontend/components/QualityModeSelector.tsx:94"
+      },
+      {
+       "symbol": "frontend/components/ResearchCopilot.tsx::ResearchCopilot.handleRunTool",
+       "published": "0.66",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'handleRunTool' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 2 hits; declaration (component-local const) frontend/components/ResearchCopilot.tsx:163 and a prose mention in docs/archive/completed/plans/2026-09-10-devmap-liveness.md:61"
+      },
+      {
+       "symbol": "frontend/components/ResearchTimeline.tsx::YearData",
+       "published": "0.66",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'YearData' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 1 hit, the declaration (non-exported interface) frontend/components/ResearchTimeline.tsx:11"
+      },
+      {
+       "symbol": "frontend/components/SourceCard.tsx::SummarySkeleton",
+       "published": "0.66",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'SummarySkeleton' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 1 hit, the declaration (non-exported module const, no <SummarySkeleton JSX) frontend/components/SourceCard.tsx:189"
+      },
+      {
+       "symbol": "frontend/components/SourceCard.tsx::SourceCardComponent.handleCardClick",
+       "published": "0.66",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'handleCardClick' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 1 hit, the declaration (component-local const) frontend/components/SourceCard.tsx:398"
+      },
+      {
+       "symbol": "frontend/components/SystematicReview/SystematicReviewPage.tsx::SystematicReviewPage.handleIncludePaper",
+       "published": "0.66",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'handleIncludePaper' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 1 hit, the declaration (component-local useCallback const) frontend/components/SystematicReview/SystematicReviewPage.tsx:144"
+      },
+      {
+       "symbol": "frontend/components/TableResultsView.tsx::TableResultsView.handleLoadTemplate",
+       "published": "0.66",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'handleLoadTemplate' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 1 hit, the declaration (component-local useCallback const) frontend/components/TableResultsView.tsx:214"
+      },
+      {
+       "symbol": "frontend/components/TableResultsView.tsx::TableResultsView.handleDeleteTemplate",
+       "published": "0.66",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'handleDeleteTemplate' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 1 hit, the declaration (component-local useCallback const) frontend/components/TableResultsView.tsx:219"
+      }
+     ]
+    },
+    "typescript": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 5
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": [
+      {
+       "symbol": "frontend/services/apiProxy.ts::ProxyPostOptions",
+       "published": "0.66",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'ProxyPostOptions' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 1 hit, the declaration (non-exported interface) frontend/services/apiProxy.ts:182"
+      },
+      {
+       "symbol": "frontend/services/citationFormatterService.ts::CitationFormatterServiceImpl.formatEntryRemoteFirst",
+       "published": "0.66",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'formatEntryRemoteFirst' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 2 hits, the declaration frontend/services/citationFormatterService.ts:571 and the optional interface member declaration frontend/services/types.ts:347; no call (incl. ?.() or bracket) anywhere"
+      },
+      {
+       "symbol": "frontend/services/draftQuestionsService.ts::DraftQuestionsServiceClass.getQuestions",
+       "published": "0.66",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getQuestions' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 1 hit, the declaration frontend/services/draftQuestionsService.ts:540"
+      },
+      {
+       "symbol": "frontend/services/gemini/documentText.ts::decodeAudioData",
+       "published": "0.66",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'decodeAudioData' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 1 hit, the declaration (module-local function) frontend/services/gemini/documentText.ts:69; no AudioContext.decodeAudioData use either"
+      },
+      {
+       "symbol": "frontend/services/retractedPaperService.ts::RetractedPaperServiceClass.clearCache",
+       "published": "0.66",
+       "verdict": "dead_true",
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'clearCache' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 13 hits; declaration frontend/services/retractedPaperService.ts:420; others are unrelated same-named symbols: ResearchClient.clearCache (researchClient.ts:75, called researchClient.ts:147 and its test), exported functions clearCache in extractionCacheService.ts:168 and cacheService.ts:334 (and their tests), and a doc line; no retractedPaperService.clearCache call"
+      }
+     ]
+    }
+   }
+  }
+ ]
+}

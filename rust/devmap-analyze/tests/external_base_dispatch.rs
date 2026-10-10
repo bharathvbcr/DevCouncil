@@ -65,10 +65,12 @@ fn report_for<'a>(reports: &'a [DeadSymbolReport], symbol: &str) -> &'a DeadSymb
         .unwrap_or_else(|| panic!("no dead-symbol row for {symbol:?}; rows present: {reports:#?}"))
 }
 
-/// `confidently dead` is the tier whose contract is "safe to act on": the same
-/// predicate `test_hardening` uses, so both files mean one thing by it.
+/// `confidently dead`: the evidence reached the tier whose contract is "safe to
+/// act on" — [`earned_confident_tier`], so a language that has not earned the
+/// tier yet (Python, since the 2026-10-10 corpus record) still answers for its
+/// evidence rather than for the table.
 fn confidently_dead(report: &DeadSymbolReport) -> bool {
-    !report.is_exempt && report.confidence >= 0.9
+    earned_confident_tier(report)
 }
 
 const AUTOGRAD: &str = "import torch\n\
@@ -115,7 +117,12 @@ fn a_torch_autograd_method_is_not_reported_actionably_dead() {
 /// `helper_nobody_calls` sits on the *same class*, inside the same framework
 /// subclass, and is genuinely dead. A rule keyed on the class rather than on
 /// the method would exempt it, which is precisely how `dead_symbols` becomes a
-/// list that never says anything.
+/// list that never says anything — so it must stay reported, never exempt.
+///
+/// Since 2026-10-10 an uncalled method of a class whose base the corpus does
+/// not declare is published at 0.4 `external_supertype` — unless the base's
+/// contract is known, as autograd's is. So this stays *confident*: knowing the
+/// contract is exactly what lets the other methods be judged.
 #[test]
 fn an_ordinary_method_on_the_same_framework_class_stays_actionable() {
     let (extractions, resolution) = resolve(&[("fused_ce.py", AUTOGRAD)]);

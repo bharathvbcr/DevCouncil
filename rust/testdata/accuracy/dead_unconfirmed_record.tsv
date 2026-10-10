@@ -6,9 +6,9 @@
 # language	rows	false_positive
 go	4	2
 java	3	2
-kotlin	13	6
-python	7	5
-rust	4	4
-swift	4	4
+kotlin	17	8
+python	30	6
+rust	7	4
+swift	9	4
 tsx	8	2
-typescript	23	4
+typescript	27	7

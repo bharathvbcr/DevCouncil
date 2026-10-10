@@ -27,8 +27,8 @@
 //! consequences at the charge sites rather than at the extractor.
 
 use devmap_analyze::{
-    analyze_liveness_with_coverage, extraction_coverage, extraction_gaps, DiscoveryCoverage,
-    ExtractionGap,
+    analyze_liveness_with_coverage, earned_confident_tier, extraction_coverage, extraction_gaps,
+    DiscoveryCoverage, ExtractionGap, CALL_BLIND_REASON, COVERAGE_LOSS_REASON,
 };
 use devmap_extract::extract_file;
 use devmap_extract::languages::Capability;
@@ -149,13 +149,17 @@ fn a_notebook_symbol_is_not_capped_as_if_its_file_were_blind() {
         .iter()
         .find(|report| report.symbol_name == "unreferenced")
         .unwrap_or_else(|| panic!("`unreferenced` must be reported: {:?}", outcome.reports));
+    // Evidence, not the published number: Python is off
+    // `CONFIDENT_TIER_ELIGIBLE`, so the confident branch publishes at 0.4 with
+    // `confident_tier_unproven`.
     assert!(
-        (unreferenced.confidence - 0.9).abs() < 1e-6,
+        earned_confident_tier(unreferenced),
         "a complete corpus of one clean notebook must reach the confident tier: \
          {unreferenced:?}"
     );
-    assert_eq!(
-        unreferenced.exemption_reason, None,
+    let reason = unreferenced.exemption_reason.as_deref().unwrap_or_default();
+    assert!(
+        reason != CALL_BLIND_REASON && reason != COVERAGE_LOSS_REASON,
         "and carry no blindness caveat at all: {unreferenced:?}"
     );
 }
@@ -239,13 +243,13 @@ fn a_broken_python_notebook_caps_the_python_symbol_it_calls() {
     // corpus, and `helper` reaches the confident tier there.
     let alone = helper_finding(&[extract_file("lib.py", LIB)]);
     assert!(
-        (alone.confidence - 0.9).abs() < 1e-6 && alone.exemption_reason.is_none(),
+        earned_confident_tier(&alone),
         "fixture assumption: without the notebook the finding is uncapped — {alone:?}"
     );
 
     let capped = helper_finding(&[extract_file("lib.py", LIB), broken]);
     assert!(
-        capped.confidence < alone.confidence,
+        !earned_confident_tier(&capped),
         "a broken notebook that may hold `helper`'s only caller must lower the \
          finding below the tier a complete corpus earns — {capped:?}"
     );

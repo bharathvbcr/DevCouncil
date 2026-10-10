@@ -26,9 +26,9 @@
 //! satisfies for free.
 
 use devmap_analyze::{
-    analyze, analyze_liveness_with_coverage, dead_clusters, DeadSymbolReport, DiscoveryCoverage,
-    ExtractionCoverage, CALL_BLIND_REASON, COVERAGE_LOSS_CONFIDENCE_CAP, COVERAGE_LOSS_REASON,
-    HIGHEST_DEGRADED_CONFIDENCE,
+    analyze, analyze_liveness_with_coverage, dead_clusters, earned_confident_tier,
+    DeadSymbolReport, DiscoveryCoverage, ExtractionCoverage, CALL_BLIND_REASON,
+    COVERAGE_LOSS_CONFIDENCE_CAP, COVERAGE_LOSS_REASON, HIGHEST_DEGRADED_CONFIDENCE,
 };
 use devmap_extract::extract_file;
 use devmap_extract::model::{Extraction, ExtractionEngine, ParseOutcome, SymbolKind};
@@ -241,12 +241,12 @@ fn the_minimum_charge_keeps_the_ladder_it_was_added_to_protect() {
     let clean = q1_pair();
     let (clean_reports, clean_coverage) = liveness(&clean, DiscoveryCoverage::none());
     assert!(clean_coverage.is_complete(), "{clean_coverage:?}");
+    // The confident branch, not the published 0.9: Python is off
+    // `CONFIDENT_TIER_ELIGIBLE`, so it publishes at 0.4 `confident_tier_unproven`.
+    let dangling = finding(&clean_reports, "lib.py", "dangling");
     assert!(
-        close(
-            finding(&clean_reports, "lib.py", "dangling").confidence,
-            0.9
-        ),
-        "a clean corpus must still reach the confident tier"
+        earned_confident_tier(dangling),
+        "a clean corpus must still reach the confident tier: {dangling:?}"
     );
 }
 

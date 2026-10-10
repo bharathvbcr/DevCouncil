@@ -96,14 +96,16 @@ fn a_fully_read_corpus_reports_ok_and_keeps_the_confident_tier() {
 
     let dangling = finding(&summary, "lib.py", "dangling")
         .expect("a symbol nothing calls must still be reported");
-    assert!(!dangling.is_exempt);
-    assert_eq!(
-        dangling.confidence, 0.9,
+    // The confident branch, not the published 0.9: Python is off
+    // `CONFIDENT_TIER_ELIGIBLE` and publishes it at 0.4 `confident_tier_unproven`.
+    assert!(
+        earned_confident_tier(dangling),
         "a complete scan must still reach the confident tier, or the cap has \
-         replaced dead-code detection rather than qualified it"
+         replaced dead-code detection rather than qualified it: {dangling:?}"
     );
-    assert_eq!(
-        dangling.exemption_reason, None,
+    assert_ne!(
+        dangling.exemption_reason.as_deref(),
+        Some(COVERAGE_LOSS_REASON),
         "a complete scan carries no coverage caveat: {dangling:?}"
     );
 }
@@ -207,12 +209,10 @@ fn a_prose_file_with_no_grammar_is_not_lost_coverage() {
         "a README must not degrade the graph: {:?}",
         summary.status
     );
-    assert_eq!(
-        finding(&summary, "lib.py", "dangling")
-            .expect("still reported")
-            .confidence,
-        0.9,
-        "and must not cap the confident tier"
+    let dangling = finding(&summary, "lib.py", "dangling").expect("still reported");
+    assert!(
+        earned_confident_tier(dangling),
+        "and must not cap the confident tier: {dangling:?}"
     );
 }
 
@@ -470,9 +470,9 @@ fn prose_and_data_files_are_not_call_blind() {
         .iter()
         .find(|r| r.file_path == "lib.py" && r.symbol_name == "dangling")
         .expect("the uncalled symbol must still be reported");
-    assert_eq!(
-        dangling.confidence, 0.9,
-        "adding a README must not demote a finding about Python"
+    assert!(
+        earned_confident_tier(dangling),
+        "adding a README must not demote a finding about Python: {dangling:?}"
     );
 }
 
@@ -691,9 +691,8 @@ fn a_powershell_recovery_does_not_cap_python_findings() {
 
     let summary = summarize(&extractions);
     let dangling = finding(&summary, "lib.py", "dangling").expect("still reported");
-    assert_eq!(
-        dangling.confidence, 0.9,
+    assert!(
+        earned_confident_tier(dangling),
         "a .ps1 must not demote a Python orphan: {dangling:?}"
     );
-    assert_eq!(dangling.exemption_reason, None);
 }

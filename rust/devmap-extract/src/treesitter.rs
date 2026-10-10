@@ -597,6 +597,9 @@ fn extract_treesitter_before_deadline(
                 if matches!(lang, "typescript" | "tsx") {
                     ts_ambient_exemptions(path, root, &symbols, &mut wiring);
                 }
+                if lang == "rust" {
+                    rust_crate_private_scopes(root, source, &symbols, &mut wiring);
+                }
                 if extraction_overran(deadline) {
                     // Labelled by what actually ran for *this* language. The
                     // block above is gated on `lang == "go"`, so naming it
@@ -2597,6 +2600,38 @@ fn member_access_receiver(node: Node, source: &str) -> Option<String> {
         let text = receiver_identity(target, source, 0);
         return (!text.is_empty()).then_some(text);
     }
+    // Kotlin's callable references have no fields. `Type::m` is a
+    // `callable_reference` whose receiver type is the first named child;
+    // `template::m` — a bound reference on a value — parses as a fieldless
+    // `navigation_expression` joined by `::`. Either way the member is the last
+    // named child. Without the receiver the member arrived as a bare name, which
+    // never matches an extension keyed `Type.m` and which the resolver declines
+    // silently, so the namesake veto never saw it: ChronosFlow's
+    // `matchesHabitHistoryTerm`, reached only as `template::matchesHabitHistoryTerm`
+    // inside a lambda, was published dead. An unbound `::f` has no receiver.
+    // Only `::` is read here; a `.` member read is a property access, not a
+    // callable reference.
+    let kotlin_reference = parent.kind() == "callable_reference"
+        || (parent.kind() == "navigation_expression"
+            && parent.child_by_field_name("target").is_none()
+            && node
+                .prev_sibling()
+                .is_some_and(|operator| operator.kind() == "::"));
+    if kotlin_reference {
+        let mut cursor = parent.walk();
+        let named: Vec<Node> = parent.named_children(&mut cursor).collect();
+        let [receiver @ .., member] = named.as_slice() else {
+            return None;
+        };
+        if member.id() != node.id() {
+            return None;
+        }
+        let receiver = receiver
+            .iter()
+            .rfind(|child| child.kind() != "type_modifiers")?;
+        let text = receiver_identity(*receiver, source, 0);
+        return (!text.is_empty()).then_some(text);
+    }
     // The grammars spell the same shape several ways: `attribute` in Python,
     // `member_expression` in JS/TS, `selector_expression` in Go, Rust's
     // `field_expression` (`self.field`) and `scoped_identifier` (`Self::f`).
@@ -3323,6 +3358,53 @@ fn ts_ambient_exemptions(
                 kind: WiringKind::StructuralExempt,
                 target_symbol: symbol.qualified_name.clone(),
                 details: TS_AMBIENT_REASON.to_string(),
+            });
+        }
+    }
+}
+
+/// Why a Rust item written `pub(crate)`, `pub(super)`, `pub(self)` or
+/// `pub(in path)` cannot be called from outside its crate.
+pub const RUST_CRATE_PRIVATE_PROOF: &str = "its restricted `pub(…)` visibility confines it to its \
+     own crate, so nothing outside the corpus can call it";
+
+/// Mark every Rust item whose visibility is restricted to its crate.
+///
+/// The extractor answers `is_exported` from the `pub` keyword, so `pub(crate)`
+/// reads as exported and the item was never examined — yet the language itself
+/// proves no other crate can name it, the same proof Go's `internal/` gives.
+/// Emitted per symbol as [`WiringKind::ModulePrivateScope`]; liveness widens
+/// it into the unconfirmed tier as `exported_unreferenced`, never above.
+///
+/// Joined by span start: an item's symbol span starts where its node does,
+/// visibility included (attributes are sibling nodes).
+fn rust_crate_private_scopes(
+    root: Node,
+    source: &str,
+    symbols: &[ExtractedSymbol],
+    wiring: &mut Vec<WiringAnnotation>,
+) {
+    let mut restricted: HashSet<usize> = HashSet::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        if node.children(&mut cursor).any(|child| {
+            child.kind() == "visibility_modifier"
+                && get_node_text(child, source).starts_with("pub(")
+        }) {
+            restricted.insert(node.start_byte());
+        }
+        push_children(node, &mut stack);
+    }
+    if restricted.is_empty() {
+        return;
+    }
+    for symbol in symbols {
+        if symbol.is_exported && restricted.contains(&symbol.span.start_byte) {
+            wiring.push(WiringAnnotation {
+                kind: WiringKind::ModulePrivateScope,
+                target_symbol: symbol.qualified_name.clone(),
+                details: RUST_CRATE_PRIVATE_PROOF.to_string(),
             });
         }
     }

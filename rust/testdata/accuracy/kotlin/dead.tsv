@@ -28,3 +28,8 @@ live	app/src/main/java/com/fx/app/Registry.kt::Registry.register	FxApp.kt:11, Le
 live	app/src/main/java/com/fx/legacy/LegacyMath.java::LegacyMath	MainActivity.kt:15 import, :41 LegacyMath.twice
 exported_unreferenced	app/src/main/java/com/fx/legacy/LegacyMath.java::LegacyMath.callKotlin	nothing calls it
 live	app/src/main/java/com/fx/legacy/LegacyMath.java::LegacyMath.twice	MainActivity.kt:41
+# Second pass (2026-10-10): K32 extension reached by a bound reference in a lambda; K33 manifest component with an in-corpus base.
+live	app/src/main/java/com/fx/app/HabitFilter.kt::FilterTemplate.matchesFilterTerm	K32: template::matchesFilterTerm in filterTemplates (HabitFilter.kt:13)
+exported_unreferenced	app/src/main/java/com/fx/app/HabitFilter.kt::filterTemplates	nothing calls it
+exported_unreferenced	app/src/main/java/com/fx/app/SettingsScreen.kt::BaseScreen.show	nothing calls it and nothing overrides it
+exempt	app/src/main/java/com/fx/app/SettingsScreen.kt::SettingsScreen	K33: registered in AndroidManifest.xml (activity .SettingsScreen)
