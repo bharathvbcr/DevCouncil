@@ -11,8 +11,9 @@ than a snapshot. Source only — no `.git`, `node_modules`, `target` or `.build`
 exactly when its fixture rows that reach the confident branch are all labelled
 `truly_dead` and every examined `truly_dead` marker of that language reaches it.
 Rows added for the dead-policy card (Go `W1`–`W5`, Rust `C50`/`C51`, TypeScript
-`V19`, Kotlin `K30`/`K31`, Python `replay.py`) are marked as such where they are
-declared.
+`V19`, Kotlin `K30`/`K31`, Python `replay.py`; second pass: Rust `C52`–`C54`,
+Kotlin `K32`/`K33`, Swift `P5`/`P6`, TypeScript `V20`, Python `handlers.py`)
+are marked as such where they are declared.
 
 Every row `dead` reports on a fixture must be labelled in its `dead.tsv`; the
 test fails on an unlabelled one, because an unlabelled row is a row nobody

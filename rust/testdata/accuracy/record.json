@@ -1,6 +1,6 @@
 {
  "about": "Corpus record for the dead-code confident tier, read by devmap-cli/tests/dead_tier_eligibility.rs. Each corpus is a `git archive` of the named commit, built with the binary named in `built_from`; `rows` are the dead rows whose evidence reached the confident branch (published at 0.9, coverage-capped below it, or capped with confident_tier_unproven), each labelled from source by `rg -uu -w` and reading: dead_true (nothing reaches it), dead_false (a path:line reaches it), unsure (excluded from `rows`, listed). A listed language must have false_positive*20 <= rows on every corpus.",
- "built_from": "devmap 0.2.4 built from the tree committed with this file (parent 8f80b0e2): devmap 0.2.4 (store schema 27, code graph schema 2, build 8f80b0e2ffdc-dirty)",
+ "built_from": "devmap 0.2.4 (store schema 27, code graph schema 2, build 4fb915fe7a73) — a clean release build of commit 4fb915fe, the commit before the one that last wrote this file (no code changed between them)",
  "measured": "2026-10-10",
  "corpora": [
   {
@@ -49,13 +49,13 @@
        "symbol": "components/ApplicationList.tsx::ApplicationList.handleLongPress",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'handleLongPress' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/AcademiaTrack/repo: 1 hit, the declaration (component-local useCallback const) components/ApplicationList.tsx:82"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'handleLongPress' : 1 hit, the declaration (component-local useCallback const) components/ApplicationList.tsx:82"
       },
       {
        "symbol": "components/BulkOperationsModal.tsx::BulkUpdates",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'BulkUpdates' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/AcademiaTrack/repo: 1 hit, the declaration (non-exported type alias) components/BulkOperationsModal.tsx:19"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'BulkUpdates' : 1 hit, the declaration (non-exported type alias) components/BulkOperationsModal.tsx:19"
       }
      ]
     }
@@ -274,13 +274,13 @@
        "symbol": "chronicle-pc/server/src/index_store.rs::EmbedFn",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'EmbedFn' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/Chronicle/repo -> 1 hit: the type alias declaration index_store.rs:120; a type alias has no trait/Drop/fn-pointer/macro route and no use exists in any crate (Embedder.f at :124 spells the dyn Fn type inline instead)"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'EmbedFn'  -> 1 hit: the type alias declaration index_store.rs:120; a type alias has no trait/Drop/fn-pointer/macro route and no use exists in any crate (Embedder.f at :124 spells the dyn Fn type inline instead)"
       },
       {
        "symbol": "chronicle-pc/server/src/media.rs::MediaRef",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'MediaRef' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/Chronicle/repo -> 1 hit: the declaration media.rs:124 (#[derive(serde::Deserialize)] struct MediaRef(pub String)); the derive generates an impl but nothing names MediaRef as a deserialization target anywhere (validate_media_ref_list at :126 works on serde_json Value)"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'MediaRef'  -> 1 hit: the declaration media.rs:124 (#[derive(serde::Deserialize)] struct MediaRef(pub String)); the derive generates an impl but nothing names MediaRef as a deserialization target anywhere (validate_media_ref_list at :126 works on serde_json Value)"
       }
      ]
     }
@@ -432,7 +432,7 @@
        "symbol": "apps/desktop/src-tauri/src/mcp/stress.rs::DocFixture.notes_intact",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'notes_intact' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/DevPrism/repo -> 1 hit: the declaration stress.rs:616 inside the inherent impl DocFixture (stress.rs:576; the only trait impl is Drop at :569, which defines drop); sibling helpers master_intact/sentinel_untouched are used by the tests but notes_intact is never called, passed as fn value, or named in a macro"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'notes_intact'  -> 1 hit: the declaration stress.rs:616 inside the inherent impl DocFixture (stress.rs:576; the only trait impl is Drop at :569, which defines drop); sibling helpers master_intact/sentinel_untouched are used by the tests but notes_intact is never called, passed as fn value, or named in a macro"
       }
      ]
     }
@@ -455,103 +455,103 @@
        "symbol": "liquitask-agentd/internal/agent/sandbox_linux.go::linuxSandboxBindRoots",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'linuxSandboxBindRoots' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 1 hit: the declaration sandbox_linux.go:72 (file is //go:build linux; no caller under any tag, incl. _test.go); since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'linuxSandboxBindRoots'  -> 1 hit: the declaration sandbox_linux.go:72 (file is //go:build linux; no caller under any tag, incl. _test.go); since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
       },
       {
        "symbol": "liquitask-agentd/internal/agent/sandbox_profile.go::findGitDir",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'findGitDir' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 1 hit: the declaration sandbox_profile.go:106; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'findGitDir'  -> 1 hit: the declaration sandbox_profile.go:106; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
       },
       {
        "symbol": "liquitask-agentd/internal/daemon/gc.go::Daemon.gcLoop",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'gcLoop' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 2 hits: doc comment gc.go:14 and declaration gc.go:16; no d.gcLoop call or method value (go d.gcLoop would match -w); since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'gcLoop'  -> 2 hits: doc comment gc.go:14 and declaration gc.go:16; no d.gcLoop call or method value (go d.gcLoop would match -w); since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
       },
       {
        "symbol": "liquitask-agentd/internal/daemon/health.go::Daemon.listenHealth",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'listenHealth' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 2 hits: doc comment health.go:40 and declaration health.go:42; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'listenHealth'  -> 2 hits: doc comment health.go:40 and declaration health.go:42; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
       },
       {
        "symbol": "liquitask-agentd/internal/daemon/health.go::Daemon.serveHealth",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'serveHealth' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 3 hits: comments health.go:51 (healthHandler extracted from serveHealth) and health.go:131, declaration health.go:146; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'serveHealth'  -> 3 hits: comments health.go:51 (healthHandler extracted from serveHealth) and health.go:131, declaration health.go:146; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
       },
       {
        "symbol": "liquitask-agentd/internal/execenv/git.go::detectGitRepo",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'detectGitRepo' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 2 hits: doc comment git.go:14 and declaration git.go:16; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'detectGitRepo'  -> 2 hits: doc comment git.go:14 and declaration git.go:16; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
       },
       {
        "symbol": "liquitask-agentd/internal/execenv/git.go::fetchOrigin",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'fetchOrigin' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 2 hits: doc comment git.go:34 and declaration git.go:35; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'fetchOrigin'  -> 2 hits: doc comment git.go:34 and declaration git.go:35; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
       },
       {
        "symbol": "liquitask-agentd/internal/execenv/git.go::getRemoteDefaultBranch",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getRemoteDefaultBranch' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 37 hits: execenv/git.go:44 comment and :46 declaration; the other 35 are all in package repocache (daemon/repocache/cache.go and cache_test.go), which declares its own unrelated getRemoteDefaultBranch at cache.go:711 and calls that one (cache.go:575, cache_test.go:373 etc.); package execenv has no caller; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getRemoteDefaultBranch'  -> 37 hits: execenv/git.go:44 comment and :46 declaration; the other 35 are all in package repocache (daemon/repocache/cache.go and cache_test.go), which declares its own unrelated getRemoteDefaultBranch at cache.go:711 and calls that one (cache.go:575, cache_test.go:373 etc.); package execenv has no caller; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
       },
       {
        "symbol": "liquitask-agentd/internal/execenv/git.go::setupGitWorktree",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'setupGitWorktree' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 2 hits: doc comment git.go:76 and declaration git.go:77; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'setupGitWorktree'  -> 2 hits: doc comment git.go:76 and declaration git.go:77; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
       },
       {
        "symbol": "liquitask-agentd/internal/execenv/git.go::removeGitWorktree",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'removeGitWorktree' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 2 hits: doc comment git.go:101 and declaration git.go:102; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'removeGitWorktree'  -> 2 hits: doc comment git.go:101 and declaration git.go:102; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
       },
       {
        "symbol": "liquitask-agentd/internal/execenv/git.go::excludeFromGit",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'excludeFromGit' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 6 hits: execenv/git.go:120 comment and :121 declaration; cache.go:503,543 call and cache.go:922,923 declare the unrelated same-named excludeFromGit in package repocache; package execenv has no caller; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'excludeFromGit'  -> 6 hits: execenv/git.go:120 comment and :121 declaration; cache.go:503,543 call and cache.go:922,923 declare the unrelated same-named excludeFromGit in package repocache; package execenv has no caller; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
       },
       {
        "symbol": "liquitask-agentd/internal/execenv/server_snapshot_provider.go::snapshotVariantEnabled",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'snapshotVariantEnabled' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 1 hit: the declaration server_snapshot_provider.go:141; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'snapshotVariantEnabled'  -> 1 hit: the declaration server_snapshot_provider.go:141; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
       },
       {
        "symbol": "liquitask-agentd/internal/rpc/rpc.go::Server.reply",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'reply' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 101 hits: rpc.go:218 is the declaration; the method is unexported so only package rpc can reach it, and rpc.go:218 is the only hit under internal/rpc; the other 100 hits are in other packages (execenv, agent, daemon: the word reply in prompts/comments, reply.md, reply_instructions) and cannot call it; rg -uu -n -t go '\\breply\\(' over liquitask-agentd -> 1 hit (the declaration) and rg -t go for \\.reply\\b -> 0 hits, so no s.reply call or method value (rpc.go calls s.replyClient directly at :186,:192,:200); since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'reply'  -> 101 hits: rpc.go:218 is the declaration; the method is unexported so only package rpc can reach it, and rpc.go:218 is the only hit under internal/rpc; the other 100 hits are in other packages (execenv, agent, daemon: the word reply in prompts/comments, reply.md, reply_instructions) and cannot call it; rg -uu -n -t go '\\breply\\(' over liquitask-agentd -> 1 hit (the declaration) and rg -t go for \\.reply\\b -> 0 hits, so no s.reply call or method value (rpc.go calls s.replyClient directly at :186,:192,:200); since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
       },
       {
        "symbol": "liquitask-agentd/internal/runner/queue.go::queueLengthForAgent",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'queueLengthForAgent' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 1 hit: the declaration queue.go:249; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'queueLengthForAgent'  -> 1 hit: the declaration queue.go:249; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
       },
       {
        "symbol": "liquitask-agentd/internal/runner/reservation.go::scopeReservation.checkOverlap",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'checkOverlap' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 5 hits: reservation.go:350 declaration; the other 4 are the unrelated TypeScript method checkOverlap in src/services/agents/agentReservationService.ts:81,117,150,172; no Go caller; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'checkOverlap'  -> 5 hits: reservation.go:350 declaration; the other 4 are the unrelated TypeScript method checkOverlap in src/services/agents/agentReservationService.ts:81,117,150,172; no Go caller; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
       },
       {
        "symbol": "liquitask-agentd/internal/runner/reservation.go::reservationPathsLabel",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'reservationPathsLabel' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 1 hit: the declaration reservation.go:362; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'reservationPathsLabel'  -> 1 hit: the declaration reservation.go:362; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
       },
       {
        "symbol": "liquitask-agentd/internal/runner/runner.go::Manager.emitResult",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'emitResult' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo -> 1 hit: the declaration runner.go:1197; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'emitResult'  -> 1 hit: the declaration runner.go:1197; since no hit is a reference, no interface declares the name, there is no method value or callback, and rg -uu -t go 'MethodByName|go:linkname|^//export' over the repo -> 0 hits (no reflection/linkname/export route)"
       }
      ]
     },
@@ -609,139 +609,139 @@
        "symbol": "src/services/agents/agentDispatchService.ts::AgentDispatchService.isDispatching",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'isDispatching' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/agents/agentDispatchService.ts:78; no string/bracket use possible since -w matches strings too"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'isDispatching' : 1 hit, the declaration src/services/agents/agentDispatchService.ts:78; no string/bracket use possible since -w matches strings too"
       },
       {
        "symbol": "src/services/agents/agentMcpService.ts::AgentMcpService.getPendingPermissionsForRun",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getPendingPermissionsForRun' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/agents/agentMcpService.ts:239"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getPendingPermissionsForRun' : 1 hit, the declaration src/services/agents/agentMcpService.ts:239"
       },
       {
        "symbol": "src/services/agents/agentReservationService.ts::AgentReservationService.getReservationForRun",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getReservationForRun' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/agents/agentReservationService.ts:63"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getReservationForRun' : 1 hit, the declaration src/services/agents/agentReservationService.ts:63"
       },
       {
        "symbol": "src/services/agents/agentRunService.ts::AgentRunService.hasActiveRuns",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'hasActiveRuns' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/agents/agentRunService.ts:833"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'hasActiveRuns' : 1 hit, the declaration src/services/agents/agentRunService.ts:833"
       },
       {
        "symbol": "src/services/agents/agentRunService.ts::AgentRunService.commitWorktree",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'commitWorktree' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/agents/agentRunService.ts:1462"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'commitWorktree' : 1 hit, the declaration src/services/agents/agentRunService.ts:1462"
       },
       {
        "symbol": "src/services/agents/agentScopeService.ts::AgentScopeService.hasScopeForRun",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'hasScopeForRun' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/agents/agentScopeService.ts:212"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'hasScopeForRun' : 1 hit, the declaration src/services/agents/agentScopeService.ts:212"
       },
       {
        "symbol": "src/services/agents/devcouncilService.ts::DevCouncilService.isCliAvailable",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'isCliAvailable' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/agents/devcouncilService.ts:83"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'isCliAvailable' : 1 hit, the declaration src/services/agents/devcouncilService.ts:83"
       },
       {
        "symbol": "src/services/agents/devcouncilService.ts::DevCouncilService.install",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'install' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 111 hits in 39 files (ts 21, tsx 14, go 36, rs 19, md 13, py 4, txt 2, Dockerfile 2); only TS/TSX can reach a TS method: of those 35, one is the declaration src/services/agents/devcouncilService.ts:109, four are an unrelated local const `install` (devcouncilService.ts:163-166), the rest are comments, JSX text, and strings (\"npm install -g ...\", busy===\"install\" in DevCouncilPanel.tsx); no `.install(` call, destructure or bracket key; every devcouncilService.* call site (DevCouncilPanel.tsx, agentRunService.ts, devcouncilWorkspaceSync.ts, TaskEvidencePanel.tsx) calls other methods (installLocal, init, getStatus, ...); go/rs/md/py/txt/Dockerfile hits are other-language code and prose"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'install' : 111 hits in 39 files (ts 21, tsx 14, go 36, rs 19, md 13, py 4, txt 2, Dockerfile 2); only TS/TSX can reach a TS method: of those 35, one is the declaration src/services/agents/devcouncilService.ts:109, four are an unrelated local const `install` (devcouncilService.ts:163-166), the rest are comments, JSX text, and strings (\"npm install -g ...\", busy===\"install\" in DevCouncilPanel.tsx); no `.install(` call, destructure or bracket key; every devcouncilService.* call site (DevCouncilPanel.tsx, agentRunService.ts, devcouncilWorkspaceSync.ts, TaskEvidencePanel.tsx) calls other methods (installLocal, init, getStatus, ...); go/rs/md/py/txt/Dockerfile hits are other-language code and prose"
       },
       {
        "symbol": "src/services/agents/devcouncilService.ts::DevCouncilService.clearCaches",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'clearCaches' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/agents/devcouncilService.ts:297"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'clearCaches' : 1 hit, the declaration src/services/agents/devcouncilService.ts:297"
       },
       {
        "symbol": "src/services/agents/sessionDiscoveryService.ts::SessionDiscoveryService.getAdoptable",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getAdoptable' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/agents/sessionDiscoveryService.ts:239"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getAdoptable' : 1 hit, the declaration src/services/agents/sessionDiscoveryService.ts:239"
       },
       {
        "symbol": "src/services/aiService.ts::AiService.parseTaskFromText",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'parseTaskFromText' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/aiService.ts:1454"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'parseTaskFromText' : 1 hit, the declaration src/services/aiService.ts:1454"
       },
       {
        "symbol": "src/services/aiService.ts::AiService.suggestAssignment",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'suggestAssignment' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/aiService.ts:2023"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'suggestAssignment' : 1 hit, the declaration src/services/aiService.ts:2023"
       },
       {
        "symbol": "src/services/aiService.ts::AiService.clearOrganizeCache",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'clearOrganizeCache' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/aiService.ts:2235"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'clearOrganizeCache' : 1 hit, the declaration src/services/aiService.ts:2235"
       },
       {
        "symbol": "src/services/autoOrganizeService.ts::AutoOrganizeService.getHistory",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getHistory' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/autoOrganizeService.ts:659"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getHistory' : 1 hit, the declaration src/services/autoOrganizeService.ts:659"
       },
       {
        "symbol": "src/services/exportService.ts::ExportService.getSanitisedColumns",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getSanitisedColumns' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/exportService.ts:222"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getSanitisedColumns' : 1 hit, the declaration src/services/exportService.ts:222"
       },
       {
        "symbol": "src/services/exportService.ts::ExportService.exportToMarkdown",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'exportToMarkdown' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/exportService.ts:227"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'exportToMarkdown' : 1 hit, the declaration src/services/exportService.ts:227"
       },
       {
        "symbol": "src/services/notificationService.ts::NotificationService.reloadPreferences",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'reloadPreferences' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/notificationService.ts:55"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'reloadPreferences' : 1 hit, the declaration src/services/notificationService.ts:55"
       },
       {
        "symbol": "src/services/notificationService.ts::NotificationService.getPreferences",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getPreferences' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/notificationService.ts:59"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getPreferences' : 1 hit, the declaration src/services/notificationService.ts:59"
       },
       {
        "symbol": "src/services/notificationService.ts::NotificationService.scheduleAllReminders",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'scheduleAllReminders' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/notificationService.ts:273"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'scheduleAllReminders' : 1 hit, the declaration src/services/notificationService.ts:273"
       },
       {
        "symbol": "src/services/semanticLayerService.ts::SemanticLayerService.getLastCacheEntryId",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getLastCacheEntryId' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/semanticLayerService.ts:142"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getLastCacheEntryId' : 1 hit, the declaration src/services/semanticLayerService.ts:142"
       },
       {
        "symbol": "src/services/semanticLayerService.ts::SemanticLayerService.recordFeedback",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'recordFeedback' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 1 hit, the declaration src/services/semanticLayerService.ts:326"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'recordFeedback' : 1 hit, the declaration src/services/semanticLayerService.ts:326"
       },
       {
        "symbol": "src/services/taskCleanupService.ts::TaskCleanupService.categorizeTasks",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'categorizeTasks' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 11 hits; declaration src/services/taskCleanupService.ts:493; every other hit is the unrelated AiService.categorizeTasks (decl src/services/aiService.ts:1647, calls via aiService.* incl. taskCleanupService.ts:505, autoOrganizeService.ts:330, BulkAIOperationsModal.tsx:128) or test mocks of aiService; no taskCleanupService.categorizeTasks call or destructure exists"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'categorizeTasks' : 11 hits; declaration src/services/taskCleanupService.ts:493; every other hit is the unrelated AiService.categorizeTasks (decl src/services/aiService.ts:1647, calls via aiService.* incl. taskCleanupService.ts:505, autoOrganizeService.ts:330, BulkAIOperationsModal.tsx:128) or test mocks of aiService; no taskCleanupService.categorizeTasks call or destructure exists"
       },
       {
        "symbol": "src/services/taskCleanupService.ts::TaskCleanupService.clusterTasks",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'clusterTasks' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/LiquiTask/repo: 25 hits; declaration src/services/taskCleanupService.ts:596; others are the unrelated AiService.clusterTasks (decl aiService.ts:1700, calls via aiService.* at taskCleanupService.ts:608, autoOrganizeService.ts:276, AIReorganizeModal.tsx:71) and aiService test mocks, plus unrelated local const clusterTasks (taskCleanupService.ts:650-679, scripts/rust-migration-oracle/services/cleanup.cjs:583+); no taskCleanupService.clusterTasks call"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'clusterTasks' : 25 hits; declaration src/services/taskCleanupService.ts:596; others are the unrelated AiService.clusterTasks (decl aiService.ts:1700, calls via aiService.* at taskCleanupService.ts:608, autoOrganizeService.ts:276, AIReorganizeModal.tsx:71) and aiService test mocks, plus unrelated local const clusterTasks (taskCleanupService.ts:650-679, scripts/rust-migration-oracle/services/cleanup.cjs:583+); no taskCleanupService.clusterTasks call"
       }
      ]
     }
@@ -887,7 +887,7 @@
        "symbol": "components/DashboardPage.tsx::DashboardPage.handleExport",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'handleExport' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/SalEdge/repo: 6 hits; declaration components/DashboardPage.tsx:781; others are unrelated component-local handleExport in components/ReportsPage.tsx:271/481 and components/PurchasePage.tsx:917/969/972"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'handleExport' : 6 hits; declaration components/DashboardPage.tsx:781; others are unrelated component-local handleExport in components/ReportsPage.tsx:271/481 and components/PurchasePage.tsx:917/969/972"
       },
       {
        "symbol": "components/DashboardPage.tsx::DashboardPage.TabButton",
@@ -910,7 +910,7 @@
        "symbol": "utils/api.ts::isUploadPath",
        "published": "0.9",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'isUploadPath' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/SalEdge/repo: 1 hit, the declaration utils/api.ts:121"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'isUploadPath' : 1 hit, the declaration utils/api.ts:121"
       }
      ]
     }
@@ -986,61 +986,61 @@
        "symbol": "frontend/components/AdminPanel.tsx::AdminPanel.getFilteredFeatures",
        "published": "0.66",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getFilteredFeatures' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 3 hits; declaration (component-local const) frontend/components/AdminPanel.tsx:588; other two are an unrelated local getFilteredFeatures in frontend/components/admin/FlagsTab.tsx:125/132"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getFilteredFeatures' : 3 hits; declaration (component-local const) frontend/components/AdminPanel.tsx:588; other two are an unrelated local getFilteredFeatures in frontend/components/admin/FlagsTab.tsx:125/132"
       },
       {
        "symbol": "frontend/components/ExtractTableChatModal.tsx::ExtractTableChatModal.handleRemovePaper",
        "published": "0.66",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'handleRemovePaper' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 1 hit, the declaration (component-local const) frontend/components/ExtractTableChatModal.tsx:98"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'handleRemovePaper' : 1 hit, the declaration (component-local const) frontend/components/ExtractTableChatModal.tsx:98"
       },
       {
        "symbol": "frontend/components/QualityModeSelector.tsx::QualityModeSelector.getModeStyles",
        "published": "0.66",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getModeStyles' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 1 hit, the declaration (component-local const) frontend/components/QualityModeSelector.tsx:94"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getModeStyles' : 1 hit, the declaration (component-local const) frontend/components/QualityModeSelector.tsx:94"
       },
       {
        "symbol": "frontend/components/ResearchCopilot.tsx::ResearchCopilot.handleRunTool",
        "published": "0.66",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'handleRunTool' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 2 hits; declaration (component-local const) frontend/components/ResearchCopilot.tsx:163 and a prose mention in docs/archive/completed/plans/2026-09-10-devmap-liveness.md:61"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'handleRunTool' : 2 hits; declaration (component-local const) frontend/components/ResearchCopilot.tsx:163 and a prose mention in docs/archive/completed/plans/2026-09-10-devmap-liveness.md:61"
       },
       {
        "symbol": "frontend/components/ResearchTimeline.tsx::YearData",
        "published": "0.66",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'YearData' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 1 hit, the declaration (non-exported interface) frontend/components/ResearchTimeline.tsx:11"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'YearData' : 1 hit, the declaration (non-exported interface) frontend/components/ResearchTimeline.tsx:11"
       },
       {
        "symbol": "frontend/components/SourceCard.tsx::SummarySkeleton",
        "published": "0.66",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'SummarySkeleton' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 1 hit, the declaration (non-exported module const, no <SummarySkeleton JSX) frontend/components/SourceCard.tsx:189"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'SummarySkeleton' : 1 hit, the declaration (non-exported module const, no <SummarySkeleton JSX) frontend/components/SourceCard.tsx:189"
       },
       {
        "symbol": "frontend/components/SourceCard.tsx::SourceCardComponent.handleCardClick",
        "published": "0.66",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'handleCardClick' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 1 hit, the declaration (component-local const) frontend/components/SourceCard.tsx:398"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'handleCardClick' : 1 hit, the declaration (component-local const) frontend/components/SourceCard.tsx:398"
       },
       {
        "symbol": "frontend/components/SystematicReview/SystematicReviewPage.tsx::SystematicReviewPage.handleIncludePaper",
        "published": "0.66",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'handleIncludePaper' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 1 hit, the declaration (component-local useCallback const) frontend/components/SystematicReview/SystematicReviewPage.tsx:144"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'handleIncludePaper' : 1 hit, the declaration (component-local useCallback const) frontend/components/SystematicReview/SystematicReviewPage.tsx:144"
       },
       {
        "symbol": "frontend/components/TableResultsView.tsx::TableResultsView.handleLoadTemplate",
        "published": "0.66",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'handleLoadTemplate' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 1 hit, the declaration (component-local useCallback const) frontend/components/TableResultsView.tsx:214"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'handleLoadTemplate' : 1 hit, the declaration (component-local useCallback const) frontend/components/TableResultsView.tsx:214"
       },
       {
        "symbol": "frontend/components/TableResultsView.tsx::TableResultsView.handleDeleteTemplate",
        "published": "0.66",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'handleDeleteTemplate' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 1 hit, the declaration (component-local useCallback const) frontend/components/TableResultsView.tsx:219"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'handleDeleteTemplate' : 1 hit, the declaration (component-local useCallback const) frontend/components/TableResultsView.tsx:219"
       }
      ]
     },
@@ -1057,31 +1057,31 @@
        "symbol": "frontend/services/apiProxy.ts::ProxyPostOptions",
        "published": "0.66",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'ProxyPostOptions' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 1 hit, the declaration (non-exported interface) frontend/services/apiProxy.ts:182"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'ProxyPostOptions' : 1 hit, the declaration (non-exported interface) frontend/services/apiProxy.ts:182"
       },
       {
        "symbol": "frontend/services/citationFormatterService.ts::CitationFormatterServiceImpl.formatEntryRemoteFirst",
        "published": "0.66",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'formatEntryRemoteFirst' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 2 hits, the declaration frontend/services/citationFormatterService.ts:571 and the optional interface member declaration frontend/services/types.ts:347; no call (incl. ?.() or bracket) anywhere"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'formatEntryRemoteFirst' : 2 hits, the declaration frontend/services/citationFormatterService.ts:571 and the optional interface member declaration frontend/services/types.ts:347; no call (incl. ?.() or bracket) anywhere"
       },
       {
        "symbol": "frontend/services/draftQuestionsService.ts::DraftQuestionsServiceClass.getQuestions",
        "published": "0.66",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getQuestions' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 1 hit, the declaration frontend/services/draftQuestionsService.ts:540"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'getQuestions' : 1 hit, the declaration frontend/services/draftQuestionsService.ts:540"
       },
       {
        "symbol": "frontend/services/gemini/documentText.ts::decodeAudioData",
        "published": "0.66",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'decodeAudioData' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 1 hit, the declaration (module-local function) frontend/services/gemini/documentText.ts:69; no AudioContext.decodeAudioData use either"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'decodeAudioData' : 1 hit, the declaration (module-local function) frontend/services/gemini/documentText.ts:69; no AudioContext.decodeAudioData use either"
       },
       {
        "symbol": "frontend/services/retractedPaperService.ts::RetractedPaperServiceClass.clearCache",
        "published": "0.66",
        "verdict": "dead_true",
-       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'clearCache' /private/tmp/claude-501/-Users-bharath-Code-devtools-DevCouncil--gitpulse-worktrees-devmap-dead-is-wrong-in-every-language-d-a213c7c1/a213c7c1-4f02-40ad-976d-32d473d6f751/scratchpad/corpus/scholarlm/repo: 13 hits; declaration frontend/services/retractedPaperService.ts:420; others are unrelated same-named symbols: ResearchClient.clearCache (researchClient.ts:75, called researchClient.ts:147 and its test), exported functions clearCache in extractionCacheService.ts:168 and cacheService.ts:334 (and their tests), and a doc line; no retractedPaperService.clearCache call"
+       "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'clearCache' : 13 hits; declaration frontend/services/retractedPaperService.ts:420; others are unrelated same-named symbols: ResearchClient.clearCache (researchClient.ts:75, called researchClient.ts:147 and its test), exported functions clearCache in extractionCacheService.ts:168 and cacheService.ts:334 (and their tests), and a doc line; no retractedPaperService.clearCache call"
       }
      ]
     }

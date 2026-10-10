@@ -707,7 +707,9 @@ subsystems whose functions only call each other.
 - **0.4 is unconfirmed by contract**: `only_ambiguous_callers`, an unresolved
   namesake, `confident_tier_unproven`, `external_supertype` (a Python or
   TypeScript method on a class whose supertype chain reaches a library type,
-  which may call it by name), `object_literal_member` (a method of a
+  which may call it by name — unless the wiring registry knows that base's
+  contract, as it does `autograd.Function`, `nn.Module`, `HTMLElement` and
+  React class components), `object_literal_member` (a method of a
   TypeScript/JavaScript object literal, reached through the object), or
   `exported_unreferenced` — an export the manifest or the language proves
   module-private, with nothing reaching it: Go `internal/` packages and
