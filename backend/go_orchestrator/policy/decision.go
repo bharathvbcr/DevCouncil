@@ -125,6 +125,15 @@ const (
 	// the read and redacting known values are different controls; this is the
 	// first one.
 	RuleSecretRead RuleID = "path.secret_read"
+	// RuleCommandSecretRead is the same refusal for a shell command: an
+	// operand or an input redirection that names a path under
+	// SecretPathPatterns. `cat .env` was allowed, demoted by the posture, while
+	// read_file of the same path was refused; the shell reached bytes the file
+	// tools were forbidden. It is Hard so no lease, grant or posture but yolo
+	// negotiates it, and it is judged on the words of the clause, so what it
+	// cannot see (a script on disk, an interpreter's own argument) stays the
+	// documented boundary of every rung that reads the line.
+	RuleCommandSecretRead RuleID = "command.secret_read"
 
 	// RulePathEngineUnavailable and RuleCommandEngineUnavailable refuse a
 	// write, read or command because the pattern engine the gate was given
@@ -168,6 +177,7 @@ var severities = map[RuleID]Severity{
 	RuleCommandTooLong:           Hard,
 	RuleCommandDirectoryChange:   Hard,
 	RuleSecretRead:               Hard,
+	RuleCommandSecretRead:        Hard,
 	RulePathEngineUnavailable:    Hard,
 	RuleCommandEngineUnavailable: Hard,
 }
@@ -224,7 +234,8 @@ var subjects = map[RuleID]Subject{
 	RuleCommandTooLong:         SubjectCommand,
 	RuleCommandDirectoryChange: SubjectCommand,
 
-	RuleSecretRead: SubjectPath,
+	RuleSecretRead:        SubjectPath,
+	RuleCommandSecretRead: SubjectCommand,
 
 	RulePathEngineUnavailable:    SubjectPath,
 	RuleCommandEngineUnavailable: SubjectCommand,
