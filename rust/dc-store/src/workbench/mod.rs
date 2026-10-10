@@ -128,6 +128,20 @@ impl Entity {
 }
 
 impl Store {
+    /// Brings the workbench profile to this build's schema, taking the online
+    /// backup first. The explicit path for the host that owns the profile (the
+    /// desktop app, at startup): a read never upgrades, and a handle that
+    /// called [`Store::refuse_workbench_upgrades`] refuses this too.
+    pub fn upgrade_workbench_profile(&self) -> Result<()> {
+        if !self.workbench_upgrades {
+            return Err(Error {
+                code: "schema_upgrade_required",
+                message: "this host does not upgrade a shared workbench profile".into(),
+            });
+        }
+        ensure_schema(&self.conn, true)
+    }
+
     /// Shared CLI/served boundary for the workbench. The Go host supplies a
     /// distinct profile database; no task operation reads or changes repo leases.
     pub fn workbench_request(&self, method: &str, raw: &str) -> Result<String> {
@@ -203,7 +217,9 @@ impl Store {
                 message: format!("unknown workbench method {method}"),
             });
         }
-        ensure_schema(&self.conn)?;
+        // Reads never upgrade a profile; a write upgrades it only when this
+        // handle may, and only after an online backup.
+        ensure_schema(&self.conn, writing && self.workbench_upgrades)?;
         let behavior = if writing {
             TransactionBehavior::Immediate
         } else {
@@ -255,7 +271,39 @@ impl Store {
     }
 }
 
-fn ensure_schema(conn: &Connection) -> Result<()> {
+/// Copies the profile to `<profile>.pre-schema-<version>.bak` with SQLite's
+/// own `VACUUM INTO` before the first migration step, so an upgrade — which
+/// older hosts cannot undo by refusing the profile — can be rolled back by
+/// restoring the copy. An in-memory profile has nothing to lose. A backup that
+/// cannot be made refuses the upgrade; one already made for this version (an
+/// earlier, interrupted upgrade) is kept, not overwritten.
+fn backup_before_upgrade(conn: &Connection, version: i64) -> Result<()> {
+    let Some(path) = conn.path().filter(|path| !path.is_empty()) else {
+        return Ok(());
+    };
+    let backup = std::path::PathBuf::from(format!("{path}.pre-schema-{version}.bak"));
+    if backup.exists() {
+        return Ok(());
+    }
+    let fail = |detail: String| Error {
+        code: "backup_failed",
+        message: format!(
+            "the workbench profile is at schema {version} and cannot be upgraded to {WORKBENCH_SCHEMA} \
+             because its backup {} could not be written: {detail}",
+            backup.display()
+        ),
+    };
+    let partial = backup.with_extension("bak.partial");
+    let _ = std::fs::remove_file(&partial);
+    let target = partial
+        .to_str()
+        .ok_or_else(|| fail("the path is not UTF-8".into()))?;
+    conn.execute("VACUUM INTO ?1", [target])
+        .map_err(|error| fail(error.to_string()))?;
+    std::fs::rename(&partial, &backup).map_err(|error| fail(error.to_string()))
+}
+
+fn ensure_schema(conn: &Connection, may_upgrade: bool) -> Result<()> {
     conn.pragma_update(None, "foreign_keys", true)?;
     let foreign_keys: bool = conn.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
     if !foreign_keys {
@@ -269,6 +317,9 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
         [],
         |r| r.get(0),
     )?;
+    // A profile this call creates holds nothing to protect and has nothing to
+    // refuse: it is built and brought to the current schema whoever asked.
+    let mut created = false;
     if !exists {
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
         let exists: bool = conn.query_row(
@@ -278,11 +329,24 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
         )?;
         if !exists {
             conn.execute_batch(SCHEMA)?;
+            created = true;
         }
         tx.commit()?;
     }
     let mut version: i64 =
         conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
+    if version < WORKBENCH_SCHEMA && !created {
+        if !may_upgrade {
+            return Err(Error {
+                code: "schema_upgrade_required",
+                message: format!(
+                    "workbench schema {version} must be upgraded to {WORKBENCH_SCHEMA} before this request, \
+                     and this host does not upgrade a shared profile; open the desktop app once to upgrade it"
+                ),
+            });
+        }
+        backup_before_upgrade(conn, version)?;
+    }
     if version == 1 {
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
         version = conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;

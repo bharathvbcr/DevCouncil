@@ -127,6 +127,7 @@ fn schema_10_profiles_migrate_with_done_archived_and_completion_recovered_from_h
         .unwrap();
 
     clock.store(9000, Ordering::SeqCst);
+    s.upgrade_workbench_profile().unwrap();
     let streak = get(&s, "streak");
     assert_eq!(version(&s), 12);
     assert_eq!(json::<i64>(&s, &streak, "$.item.archived"), 1);
@@ -848,5 +849,6 @@ fn migrated_completion_time_is_the_first_done_revision_whatever_the_clocks() {
     );
     assert_eq!(json::<i64>(&s, &get(&s, "t"), "$.item.completed_at"), 4000);
     downgrade_to_v10(&s);
+    s.upgrade_workbench_profile().unwrap();
     assert_eq!(json::<i64>(&s, &get(&s, "t"), "$.item.completed_at"), 4000);
 }

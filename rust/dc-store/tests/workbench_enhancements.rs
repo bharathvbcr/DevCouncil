@@ -423,6 +423,7 @@ fn v1_migration_preserves_existing_data_and_refuses_partial_or_future_schemas() 
     s.connection()
         .execute_batch("DROP TABLE work_item_links; DROP INDEX work_items_archive; DROP INDEX work_items_completed; ALTER TABLE work_items DROP COLUMN archived; ALTER TABLE work_items DROP COLUMN completed_at; DROP TABLE work_decisions; DROP TABLE work_notification_deliveries; DROP TABLE work_notification_settings; DROP TABLE work_attention; DROP TABLE work_run_inputs; DROP TABLE work_runs; DROP TABLE work_enhancements; DROP TABLE work_enhancement_queue; DROP TABLE work_automation; UPDATE work_meta SET version=1 WHERE id=1;")
         .unwrap();
+    s.upgrade_workbench_profile().unwrap();
     assert_eq!(call(&s, "items.get", r#"{"id":"t"}"#), before);
     ready(&s, "migrated");
     assert_eq!(
@@ -443,7 +444,10 @@ fn v1_migration_preserves_existing_data_and_refuses_partial_or_future_schemas() 
         .unwrap();
     // A preexisting table with an old version is inconsistent, never a migration
     // success. The version cannot advance while schema creation failed.
-    refuse(&s, "items.get", r#"{"id":"t"}"#, "store_error");
+    assert_eq!(
+        s.upgrade_workbench_profile().unwrap_err().code,
+        "store_error"
+    );
     assert_eq!(
         s.connection()
             .query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r

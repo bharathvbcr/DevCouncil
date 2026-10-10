@@ -334,6 +334,8 @@ fn schema_upgrade_preserves_existing_history_without_replaying_old_banners() {
     ready(&s, "old");
     let events = call(&s, "events.list", "{}");
     s.connection().execute_batch("DROP TABLE work_item_links; DROP INDEX work_items_archive; DROP INDEX work_items_completed; ALTER TABLE work_items DROP COLUMN archived; ALTER TABLE work_items DROP COLUMN completed_at; DROP TABLE work_decisions; DROP TABLE work_notification_deliveries; DROP TABLE work_notification_settings; DROP TABLE work_attention; DELETE FROM work_revisions WHERE entity_type='attention'; UPDATE work_meta SET version=5;").unwrap();
+    // A read no longer upgrades an older profile; the owning host does it.
+    s.upgrade_workbench_profile().unwrap();
     assert_eq!(number(&s, &call(&s, "attention.list", "{}"), "$.total"), 0);
     assert_eq!(call(&s, "events.list", "{}"), events);
     assert_eq!(

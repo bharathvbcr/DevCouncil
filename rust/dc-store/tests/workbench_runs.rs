@@ -804,7 +804,7 @@ fn schema_four_upgrade_rolls_back_on_conflict_and_preserves_existing_tasks() {
         .execute_batch("DROP TABLE work_item_links; DROP INDEX work_items_archive; DROP INDEX work_items_completed; ALTER TABLE work_items DROP COLUMN archived; ALTER TABLE work_items DROP COLUMN completed_at; DROP TABLE work_decisions; DROP TABLE work_notification_deliveries; DROP TABLE work_notification_settings; DROP TABLE work_attention; DROP TABLE work_runs; UPDATE work_meta SET version=4 WHERE id=1")
         .unwrap();
     assert_eq!(
-        request(&store, "runs.list", "{}").unwrap_err().code,
+        store.upgrade_workbench_profile().unwrap_err().code,
         "store_error"
     );
     let state: (i64,i64) = store.connection().query_row("SELECT version,(SELECT count(*) FROM sqlite_master WHERE name='work_runs') FROM work_meta WHERE id=1",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
@@ -813,6 +813,7 @@ fn schema_four_upgrade_rolls_back_on_conflict_and_preserves_existing_tasks() {
         .connection()
         .execute_batch("DROP TABLE work_run_inputs")
         .unwrap();
+    store.upgrade_workbench_profile().unwrap();
     assert_eq!(call(&store, "items.get", r#"{"id":"t"}"#), task);
     assert_eq!(
         number(&store, &call(&store, "runs.list", "{}"), "$.total"),
