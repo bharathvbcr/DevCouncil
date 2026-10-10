@@ -164,7 +164,7 @@ def fn(((:
     assert_eq!(bad_ext.language, "python");
     assert!(matches!(
         bad_ext.parse_outcome,
-        ParseOutcome::Partial { ref error_ranges } if !error_ranges.is_empty()
+        ParseOutcome::Partial { ref error_ranges, .. } if !error_ranges.is_empty()
     ));
     assert!(!bad_ext.symbols.iter().any(|s| s.name == "fn"));
 }

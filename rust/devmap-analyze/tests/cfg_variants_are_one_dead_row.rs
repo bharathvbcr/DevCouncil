@@ -90,6 +90,7 @@ fn a_variant_overlapping_a_parse_error_exempts_the_identity() {
             start_byte: at,
             end_byte: at + 1,
         }],
+        nameless_ranges: Vec::new(),
     };
     let extractions = vec![ext];
     let mut resolver = Resolver::new();

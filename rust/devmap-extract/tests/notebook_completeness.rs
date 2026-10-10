@@ -230,7 +230,7 @@ fn notebook_imports_errors_and_lexical_bindings_use_raw_offsets() {
 
     let broken = raw.replace("def run(callback):", "def run(:");
     let extraction = extract_file("errors.ipynb", &broken);
-    let ParseOutcome::Partial { error_ranges } = extraction.parse_outcome else {
+    let ParseOutcome::Partial { error_ranges, .. } = extraction.parse_outcome else {
         panic!("fixture must parse Partial");
     };
     assert!(!error_ranges.is_empty());

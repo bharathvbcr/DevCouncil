@@ -591,7 +591,13 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 ///
 /// v79 is both v78 payloads together, under a number neither lane stamped: a
 /// row stamped 78 by either lane lacks the other's half.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "79";
+///
+/// v80 records `ParseOutcome::Partial::nameless_ranges`, the error regions
+/// that hold no identifier character. A v79 row reads back with that list
+/// empty, which charges every such region against the dead-code ceiling —
+/// a lone `}` would keep a whole language out of the confident tier until
+/// the file was edited.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "80";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

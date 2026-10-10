@@ -31,7 +31,7 @@ fn probe(label: &str, path: &str, lang: &str, source: &str, budget: Duration) {
     let ratio = elapsed.as_secs_f64() / budget.as_secs_f64();
     let outcome = match &extraction.parse_outcome {
         devmap_extract::model::ParseOutcome::Clean => "Clean".to_string(),
-        devmap_extract::model::ParseOutcome::Partial { error_ranges } => {
+        devmap_extract::model::ParseOutcome::Partial { error_ranges, .. } => {
             format!("Partial({} ranges)", error_ranges.len())
         }
         devmap_extract::model::ParseOutcome::Failed { .. } => "Failed".to_string(),

@@ -170,7 +170,7 @@ fn assert_invariants(label: &str, path: &str, source: &str, extraction: &Extract
     // A declaration list that was cut must say so, and bytes nobody read must
     // reach the outcome — `for_durable_store` clears diagnostics, so a
     // disclosure that lives only there does not survive to the store.
-    if let ParseOutcome::Partial { error_ranges } = &extraction.parse_outcome {
+    if let ParseOutcome::Partial { error_ranges, .. } = &extraction.parse_outcome {
         for range in error_ranges {
             assert!(
                 range.end_byte <= source.len(),
@@ -549,7 +549,7 @@ fn bytes_left_unread_reach_the_parse_outcome() {
     );
     let extraction = extract_file("big.svelte", &source);
     match &extraction.parse_outcome {
-        ParseOutcome::Partial { error_ranges } => {
+        ParseOutcome::Partial { error_ranges, .. } => {
             assert!(
                 !error_ranges.is_empty(),
                 "a Partial outcome must carry the ranges that make it partial"

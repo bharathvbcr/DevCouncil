@@ -168,7 +168,9 @@ fn test_x5_error_tree_is_partial_not_clean() {
     let bad_code = "function broken( { let x = ; ";
     let ext = extract_file("src/broken.ts", bad_code);
     match ext.parse_outcome {
-        ParseOutcome::Partial { ref error_ranges } => {
+        ParseOutcome::Partial {
+            ref error_ranges, ..
+        } => {
             assert!(
                 !error_ranges.is_empty(),
                 "ERROR tree must yield non-empty error_ranges"
