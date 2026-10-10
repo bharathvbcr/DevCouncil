@@ -26,6 +26,8 @@ import (
 //     with a trailing slash, or implied by more than one source.
 //   - mv writes the same paths as cp, and changes every source too: it removes
 //     it.
+//   - pytest writes the report, temporary and cache locations its options name;
+//     see pytestWrites.
 //
 // A destination given without a trailing slash is judged as the path written,
 // even though an existing directory there would receive DIR/basename instead;
@@ -66,6 +68,8 @@ func argumentWriteTargets(line string) ([]string, bool) {
 			written, unresolved = copyWrites(args, false)
 		case "mv":
 			written, unresolved = copyWrites(args, true)
+		default:
+			written, unresolved = pytestWrites(words, at, args)
 		}
 		targets = append(targets, written...)
 		opaque = opaque || unresolved
