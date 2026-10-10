@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -159,4 +160,43 @@ func FuzzWorkbenchNeverAcceptsPartialOrFailedChildOutput(f *testing.F) {
 			t.Fatal("unvalidated work result accepted")
 		}
 	})
+}
+
+func TestWorkbenchCompactionRunsThroughTheHostClientAndKeepsReceipts(t *testing.T) {
+	c := client(t)
+	t.Cleanup(c.Close)
+	call := func(method, input string) json.RawMessage {
+		t.Helper()
+		result, err := c.Workbench(t.Context(), method, json.RawMessage(input))
+		if err != nil {
+			t.Fatalf("%s: %v", method, err)
+		}
+		return result
+	}
+	// An empty profile has no event to report a sequence for; the reply is still valid.
+	call("store.compact", `{}`)
+	call("repositories.put", `{"request_id":"r","id":"r1","expected_revision":0,"name":"Manvi","identity_key":"local:r1"}`)
+	input := `{"request_id":"t","id":"t1","expected_revision":0,"title":"Task","repository_ids":["r1"],"primary_repository_id":"r1"}`
+	receipt := call("items.put", input)
+	for rev := 1; rev <= 6; rev++ {
+		call("items.put", fmt.Sprintf(`{"request_id":"t-%d","id":"t1","expected_revision":%d,"title":"Task %d","repository_ids":["r1"],"primary_repository_id":"r1"}`, rev, rev, rev))
+	}
+	report := call("store.compact", `{"keep_revisions":2}`)
+	var wire struct {
+		Item struct {
+			Revisions struct{ Deleted, Eligible int } `json:"revisions"`
+		} `json:"item"`
+	}
+	if err := json.Unmarshal(report, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if wire.Item.Revisions.Deleted != 5 {
+		t.Fatalf("compaction report: %s", report)
+	}
+	if replay := call("items.put", input); !bytes.Equal(receipt, replay) {
+		t.Fatal("a retry inside the window lost its original receipt")
+	}
+	if _, err := c.Workbench(t.Context(), "store.compact", json.RawMessage(`{"receipt_window_seconds":1}`)); err == nil {
+		t.Fatal("a one-second replay window was accepted")
+	}
 }
