@@ -1,0 +1,13 @@
+# Dead-code truth for this fixture, read by devmap-cli/tests/dead_tier_eligibility.rs.
+# verdict<TAB>symbol_id<TAB>why
+#   truly_dead            nothing reaches it; must be reported (at 0.9 when the language is eligible)
+#   live                  something reaches it; never above 0.4, never in the confident branch
+#   exported_unreferenced exported but provably module-private and unused; reported at 0.4 exported_unreferenced
+#   exempt                never a dead candidate at any tier
+# Any confident-branch row (>= 0.9, or capped with confident_tier_unproven) not labelled truly_dead is a 0.9-tier false positive.
+truly_dead	spm/Sources/Core/PrivateReach.swift::Meter.privTrulyDead	P11
+live	spm/Sources/Core/PrivateReach.swift::Meter.<+>	P1: custom operator use a <+> b
+live	spm/Sources/Core/PrivateReach.swift::Meter.privDouble	P4: function reference map(Meter.privDouble)
+live	spm/Sources/Core/PrivateReach.swift::Meter.privBump	P2
+live	spm/Sources/Core/PrivateReach.swift::Meter.privLabel	P5
+live	spm/Sources/Core/PrivateReach.swift::Pinger.pingTwice	P6

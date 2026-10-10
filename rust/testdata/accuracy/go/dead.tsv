@@ -1,0 +1,17 @@
+# Dead-code truth for this fixture, read by devmap-cli/tests/dead_tier_eligibility.rs.
+# verdict<TAB>symbol_id<TAB>why
+#   truly_dead            nothing reaches it; must be reported (at 0.9 when the language is eligible)
+#   live                  something reaches it; never above 0.4, never in the confident branch
+#   exported_unreferenced exported but provably module-private and unused; reported at 0.4 exported_unreferenced
+#   exempt                never a dead candidate at any tier
+# Any confident-branch row (>= 0.9, or capped with confident_tier_unproven) not labelled truly_dead is a 0.9-tier false positive.
+truly_dead	app/svc/probes.go::deadPriv	P6: unexported, uncalled
+truly_dead	app/svc/probes.go::fast.unusedM	P7: unexported method, uncalled
+live	app/svc/probes2.go::shadowedLocalTypeUser.entry	Q2b: function-local type used in its function
+live	app/svc/probes2.go::twinLocalTypeUser.entry	Q2c: same-named twin local type, used in its function
+exported_unreferenced	app/internal/secret/widen.go::ValidateChunks	W1: exported under internal/, uncalled
+exported_unreferenced	app/main.go::StampSectionRescoredAt	W5: exported in package main, uncalled
+exempt	app/internal/secret/widen.go::FileSink.Log09	W2: implements the in-repo store.Logger interface
+exempt	app/internal/secret/cgo_export.go::SecretCallback	W3: //export to C
+exempt	app/internal/secret/linkname.go::LinkedClock	W4: go:linkname
+exempt	app/main.go::nopLogger.Log09	C09: implements store.Logger, reached through interface dispatch

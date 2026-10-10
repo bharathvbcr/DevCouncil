@@ -471,7 +471,7 @@ diagnostics with the panel state and its existing rotating logs.
 | `devmap trace <a> <b>` | A path between two symbols |
 | `devmap neighbors <targets…>` | Callers and callees for several targets at once |
 | `devmap affected <targets…>` | Files holding tests the change reaches, nearest first — test-path files, and runner-invoked tests (`#[test]`, pytest `test_*`, JUnit `@Test`) beside the code |
-| `devmap dead` | Dead-symbol candidates: confident vs unconfirmed, each with reason |
+| `devmap dead` | Dead-symbol candidates: confident vs unconfirmed, each with reason and site evidence, plus what was never examined |
 | `devmap clones` | Duplicated and structurally similar bodies |
 | `devmap preview --file f --content -` | What an *unsaved* edit would break |
 | `devmap savings` | What the index cost against reading the files |
@@ -690,6 +690,28 @@ server validates its own answers against the schema it published before emitting
 `AmbiguousGlobal` fan-out — out of the walk; an unknown rung is refused.
 `devmap_dead_symbols` carries `dead_clusters`, the component pass that finds
 subsystems whose functions only call each other.
+
+### Reading a dead answer
+
+- **The confident tier (0.9) is earned per language.** A row reaches it only
+  when nothing names the symbol *and* its language is in
+  `devmap_analyze::CONFIDENT_TIER_ELIGIBLE` — a table a test binds to the
+  labelled fixtures under `rust/testdata/accuracy/`, so a language is listed
+  exactly when its fixture shows no confident-tier false positive. Today that is
+  Go, Kotlin, Python, Rust, Swift, TypeScript and TSX. Any other language's
+  would-be confident row is published at 0.4 with a reason starting
+  `confident_tier_unproven`, naming the language.
+- **0.4 is unconfirmed by contract**: `only_ambiguous_callers`, an unresolved
+  namesake, `confident_tier_unproven`, or `exported_unreferenced` — an export
+  the manifest proves module-private (Go `internal/` packages and `package
+  main`) with nothing reaching it. Every such row carries `evidence`: how many
+  unbound sites name the symbol and the first one as `first_path` /
+  `first_line`, so it can be checked in one jump.
+- **`excluded` says what was never examined.** Per language, the uncalled
+  symbols spared for their visibility (`not_examined`) and those spared by a
+  recorded reason (`exempt`, broken down by token in `by_reason`). A short or
+  empty list over a corpus whose symbols are mostly exported is not a clean
+  bill of health, and `excluded` is how to tell the two apart.
 
 Two CLI views stay CLI-only, by decision rather than omission: `devmap pdg`
 reads one Python file from disk rather than the index, and its sinks are a

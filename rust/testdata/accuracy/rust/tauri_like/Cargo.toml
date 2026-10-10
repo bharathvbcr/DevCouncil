@@ -1,0 +1,9 @@
+[package]
+name = "tauri_like"
+version = "0.1.0"
+edition = "2021"
+
+# Parse-only fixture (C39): not a workspace member, never compiled here.
+[dependencies]
+tauri = "2"
+serde = { version = "1", features = ["derive"] }

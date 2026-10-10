@@ -87,7 +87,7 @@ use rayon::prelude::*;
 
 pub use gomod::{
     collect_go_modules, collect_project_manifests, git_worktree_root, go_dirs_with_unindexed_files,
-    parse_go_mod, GoModule, ProjectManifests,
+    parse_cargo_crate_names, parse_go_mod, GoModule, ProjectManifests, RustCrateManifest,
 };
 pub use languages::{
     declared_language_ids, detect_language, is_default_index_excluded, is_ignored_path,

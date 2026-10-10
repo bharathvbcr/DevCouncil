@@ -563,14 +563,21 @@ fn kotlin_entry_points_are_read_from_annotations_and_modifiers() {
     let extraction = extract_file(
         "E.kt",
         "@Composable\nfun Screen() {}\n\
+         @Preview\n@Composable\nfun ScreenPreview() { Screen() }\n\
          class MyActivity { override fun onCreate() {} }\n\
          external fun jni(): Int\n\
          fun main() {}\n\
          fun ordinary() {}\n",
     );
+    // A composable is called by another composable — an ordinary call — so
+    // the annotation alone exempts nothing. A preview is rendered by tooling.
+    assert_eq!(exemption(&extraction, "E.kt::Screen"), None);
     assert_eq!(
-        exemption(&extraction, "E.kt::Screen").map(|(_, why)| why),
-        Some("invoked by the Jetpack Compose runtime".to_string())
+        exemption(&extraction, "E.kt::ScreenPreview").map(|(_, why)| why),
+        Some(
+            "rendered by the Compose preview tooling, which no code in the corpus calls"
+                .to_string()
+        )
     );
     assert_eq!(
         exemption(&extraction, "E.kt::MyActivity.onCreate").map(|(_, why)| why),
@@ -1185,4 +1192,114 @@ fn a_private_member_does_not_make_its_enclosing_declaration_private() {
         !hidden.2,
         "a modifier on the declaration itself is still evidence: {hidden:?}"
     );
+}
+
+// ------------------------------------------------- Java and C# visibility
+
+/// C# defaults a class or struct member to `private`; the header scan read the
+/// absence of a keyword as "exported", so an uncalled default-private member
+/// was exempt and never reported. An explicit interface implementation has no
+/// modifier by rule and stays visible, and a top-level type defaults to
+/// `internal` — the assembly — which is visible too.
+#[test]
+fn a_csharp_member_with_no_access_modifier_is_private() {
+    let extraction = extract_file(
+        "K.cs",
+        "public class K {\n\
+             void Hidden() {}\n\
+             public void Shown() {}\n\
+             internal void Assembly() {}\n\
+             void IFoo.Bar() {}\n\
+             static void Main() {}\n\
+         }\n\
+         class TopLevel {}\n\
+         public interface IFoo { void Bar(); }\n",
+    );
+    assert!(
+        !exported(&extraction, "K.cs::K.Hidden"),
+        "default-private member"
+    );
+    assert!(exported(&extraction, "K.cs::K.Shown"));
+    assert!(
+        exported(&extraction, "K.cs::K.Assembly"),
+        "internal is the assembly"
+    );
+    assert!(
+        exported(&extraction, "K.cs::TopLevel"),
+        "a top-level type defaults to internal"
+    );
+    assert!(
+        exported(&extraction, "K.cs::IFoo.Bar"),
+        "interface members are public"
+    );
+    assert_eq!(
+        exemption(&extraction, "K.cs::K.Main").map(|(kind, _)| kind),
+        Some(WiringKind::RuntimeEntryPoint),
+        "a default-private static Main is still the program entry point"
+    );
+}
+
+/// `protected` on a member of a public, non-sealed type is an extension point
+/// subclasses outside the corpus may call or override: exempt, with the reason
+/// stated. On a sealed/final type no outside subclass can exist, and C#'s
+/// `private protected` is assembly-only, so those stay candidates.
+#[test]
+fn a_protected_member_of_an_extensible_public_type_is_exempt() {
+    let java = extract_file(
+        "Base.java",
+        "public abstract class Base { protected void onEvent() {} }\n\
+         final class Leaf { protected void sealedHook() {} }\n",
+    );
+    assert_eq!(
+        exemption(&java, "Base.java::Base.onEvent").map(|(kind, _)| kind),
+        Some(WiringKind::StructuralExempt)
+    );
+    assert!(!exported(&java, "Base.java::Base.onEvent"));
+    assert_eq!(exemption(&java, "Base.java::Leaf.sealedHook"), None);
+
+    let csharp = extract_file(
+        "B.cs",
+        "public class B { protected void OnEvent() {} private protected void Inner() {} }\n\
+         public sealed class S { protected void Q() {} }\n",
+    );
+    assert_eq!(
+        exemption(&csharp, "B.cs::B.OnEvent").map(|(kind, _)| kind),
+        Some(WiringKind::StructuralExempt)
+    );
+    assert_eq!(exemption(&csharp, "B.cs::B.Inner"), None);
+    assert_eq!(exemption(&csharp, "B.cs::S.Q"), None);
+}
+
+/// Ruby visibility is a method call, not a keyword: a bare `private`, a
+/// `private def`, and `private :name` all hide a method the header scan called
+/// public.
+#[test]
+fn ruby_private_sections_and_symbols_are_not_exported() {
+    let extraction = extract_file(
+        "c.rb",
+        "class C\n\
+           def pub; end\n\
+           private\n\
+           def unused_priv; end\n\
+           public\n\
+           def again; end\n\
+           private def inline_priv; end\n\
+           def named; end\n\
+           private :named\n\
+         end\n",
+    );
+    assert!(exported(&extraction, "c.rb::C.pub"));
+    assert!(
+        !exported(&extraction, "c.rb::C.unused_priv"),
+        "after a bare `private`"
+    );
+    assert!(
+        exported(&extraction, "c.rb::C.again"),
+        "`public` restores the default"
+    );
+    assert!(
+        !exported(&extraction, "c.rb::C.inline_priv"),
+        "`private def`"
+    );
+    assert!(!exported(&extraction, "c.rb::C.named"), "`private :named`");
 }

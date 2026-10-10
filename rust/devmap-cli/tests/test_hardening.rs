@@ -663,7 +663,7 @@ fn test_runtime_entry_points_are_exempt_without_exempting_their_file() {
 
         let confidently_dead = |name: &str| {
             analysis.dead_symbols.iter().any(|report| {
-                report.symbol_name == name && !report.is_exempt && report.confidence >= 0.9
+                report.symbol_name == name && devmap_analyze::earned_confident_tier(report)
             })
         };
 
@@ -735,7 +735,7 @@ fn a_template_call_keeps_its_callee_out_of_the_confident_dead_tier() {
         let analysis = analyze(std::slice::from_ref(&ext), &resolution);
         let confidently_dead = |name: &str| {
             analysis.dead_symbols.iter().any(|report| {
-                report.symbol_name == name && !report.is_exempt && report.confidence >= 0.9
+                report.symbol_name == name && devmap_analyze::earned_confident_tier(report)
             })
         };
         assert!(
@@ -792,7 +792,7 @@ fn a_macro_body_call_and_a_qualified_scope_keep_their_targets_out_of_the_confide
     let analysis = analyze(std::slice::from_ref(&ext), &resolution);
     let confidently_dead = |name: &str| {
         analysis.dead_symbols.iter().any(|report| {
-            report.symbol_name == name && !report.is_exempt && report.confidence >= 0.9
+            report.symbol_name == name && devmap_analyze::earned_confident_tier(report)
         })
     };
     for live in ["dev_plain", "macro_only_helper", "Plain"] {

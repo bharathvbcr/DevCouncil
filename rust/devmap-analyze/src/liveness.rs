@@ -221,6 +221,29 @@ fn go_value_mentioned_names(
     mentions
 }
 
+/// Exported interface method specs anywhere in the corpus, by `(method, arity)`.
+///
+/// The corpus-wide counterpart of [`go_interface_specs_by_package`]. An
+/// exported method name is not qualified by its package, so a type in one
+/// package satisfies an interface declared in any other. Read only for
+/// exported Go methods; see the arm in [`symbol_exemption_index`].
+fn go_exported_interface_specs(extractions: &[Extraction]) -> HashMap<(&str, usize), &str> {
+    let mut specs: HashMap<(&str, usize), &str> = HashMap::new();
+    for ext in extractions {
+        if ext.language != "go" {
+            continue;
+        }
+        for spec in &ext.go_interface_methods {
+            if spec.method.starts_with(|c: char| c.is_uppercase()) {
+                specs
+                    .entry((spec.method.as_str(), spec.param_count))
+                    .or_insert(spec.interface_name.as_str());
+            }
+        }
+    }
+    specs
+}
+
 /// Symbol identities that exist in a Go package only as mutually exclusive
 /// build variants, keyed by `(package, identity)`.
 ///
@@ -1048,6 +1071,229 @@ pub const COVERAGE_LOSS_CONFIDENCE_CAP: f32 = 0.35;
 pub const COVERAGE_LOSS_REASON: &str =
     "no inbound call edges, but call extraction did not cover every file — not evidence of death";
 
+/// Languages whose confident (0.9) dead tier has been earned by measurement.
+///
+/// **Set by a check, not by assignment.** `devmap-cli/tests/dead_tier_eligibility.rs`
+/// builds every labelled fixture under `testdata/accuracy/` and fails if a
+/// language is listed here while any of its confident-branch rows is not
+/// labelled `truly_dead`, and fails if a language whose fixture is clean — at
+/// least one confident row, no false one, every examined truly-dead marker
+/// found — is *not* listed. So the table cannot rot in either direction: a
+/// regression that puts one false row in a listed language's confident tier
+/// fails CI, and a fix that earns a language the tier fails CI until it is
+/// listed.
+///
+/// Labels are [`Extraction::code_language`] values, so `typescript` and `tsx`
+/// are earned separately — they are separate grammars with separate extractors.
+///
+/// A language not listed here never publishes a row at 0.9. Its confident
+/// rows are capped at [`UNPROVEN_TIER_CONFIDENCE`] carrying
+/// [`confident_tier_unproven_reason`], which names the language. The audit of
+/// 2026-10-09 measured the confident tier wrong in every language but Python
+/// (Go 2/2, TypeScript 13/28, Rust 1/1, Swift 1/1, Kotlin 2/11), each through a
+/// silent miss that bypassed the namesake veto — and `CLAUDE.md` tells agents
+/// that tier is the one to act on.
+///
+/// **What listing rests on today, stated so nobody reads more into it.** Each
+/// language below has zero confident-tier false positives on its committed
+/// fixture after the veto holes were closed (2026-10-09). The fixture counts
+/// are small — Rust, Swift and Kotlin have one confident row each — and the
+/// corpus record (`testdata/accuracy/record.json`, written by the accuracy
+/// harness) does not exist yet. When it does, the binding test also requires
+/// each listed language to be at or under 5% on every corpus it measured, and
+/// a language that is not comes off this list in the same change.
+pub const CONFIDENT_TIER_ELIGIBLE: &[&str] = &[
+    "go",
+    "kotlin",
+    "python",
+    "rust",
+    "swift",
+    "tsx",
+    "typescript",
+];
+
+/// Whether `language` may publish dead rows in the confident tier.
+pub fn confident_tier_eligible(language: &str) -> bool {
+    CONFIDENT_TIER_ELIGIBLE.contains(&language)
+}
+
+/// The machine token every row capped by [`CONFIDENT_TIER_ELIGIBLE`] starts with.
+pub const CONFIDENT_TIER_UNPROVEN: &str = "confident_tier_unproven";
+
+/// Where a confident row of an unlisted language lands: the unconfirmed tier,
+/// beside `only_ambiguous_callers`, so it stays visible and is never acted on.
+pub const UNPROVEN_TIER_CONFIDENCE: f32 = 0.4;
+
+/// Reason carried by a confident row whose language has not earned the tier.
+///
+/// Same shape as [`CALL_BLIND_REASON`] and the coverage cap: the evidence for
+/// death is the same "no inbound edge" it always was, and the reason says why
+/// that evidence is not yet trusted for this language.
+pub fn confident_tier_unproven_reason(language: &str) -> String {
+    format!(
+        "{CONFIDENT_TIER_UNPROVEN}: no inbound edge names this symbol, but the {language} \
+         confident tier has not been proven against its labelled fixture — capped below the \
+         act-on tier until CONFIDENT_TIER_ELIGIBLE lists {language}"
+    )
+}
+
+/// Whether a dead row's evidence earned the confident tier: it was published
+/// there, or it carries [`CONFIDENT_TIER_UNPROVEN`] because its language has not
+/// earned the tier yet.
+///
+/// The one question a caller asking "did the analysis call this confidently
+/// dead?" means. Reading `confidence >= 0.9` alone answers a different one —
+/// "is this language listed?" — and a check that a C function *reached* the
+/// confident branch would start failing, or worse passing, for that reason.
+pub fn earned_confident_tier(report: &DeadSymbolReport) -> bool {
+    !report.is_exempt
+        && (report.confidence > HIGHEST_DEGRADED_CONFIDENCE
+            || report
+                .exemption_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with(CONFIDENT_TIER_UNPROVEN)))
+}
+
+/// The machine token an `exported_unreferenced` row starts with.
+pub const EXPORTED_UNREFERENCED: &str = "exported_unreferenced";
+
+/// Reason carried by an exported symbol the manifest proves module-private.
+fn exported_unreferenced_reason(proof: &str) -> String {
+    format!(
+        "{EXPORTED_UNREFERENCED}: exported, but {proof}, and nothing in the corpus reaches it — \
+         unconfirmed until this language's entry-point model is proven"
+    )
+}
+
+/// Why an uncalled symbol was not examined at all: it is exported.
+///
+/// The visibility, not any evidence, keeps it off the list. Counted per
+/// language in the `excluded` disclosure, because a `dead` answer of zero over
+/// a corpus whose every uncalled symbol is exported is not a finding.
+pub const EXPORTED_NOT_EXAMINED_REASON: &str =
+    "exported — not examined: its visibility, not any evidence, keeps it off the dead list";
+
+/// Why an uncalled, unexported symbol was exempted with its file when the file
+/// carried no more specific reason.
+pub const FILE_EXEMPT_REASON: &str =
+    "exempt with its file — the file is outside the dead-code population";
+
+/// The stable token for a stored exemption reason, for counting.
+///
+/// Reasons are sentences, and several embed a name (`implements interface
+/// \`Reader\``), so counting by the raw string would split one cause across as
+/// many rows as it has names. This is the one owner of the mapping, read by the
+/// `excluded` disclosure; a reason this does not recognise is a wiring
+/// annotation's details — a runtime entry point, a framework hook, a test or
+/// generated file — and is counted as `wiring`.
+pub fn exemption_token(reason: &str) -> &'static str {
+    // The second spelling is the fallback generations before 2026-10-09
+    // stored for the same case, so an old store still counts it.
+    if reason == EXPORTED_NOT_EXAMINED_REASON || reason == "Exported or exempt" {
+        "exported"
+    } else if reason == "Member of an exported type — public interface" {
+        "exported_owner"
+    } else if reason.starts_with("Overrides a method reached through") {
+        "heritage_override"
+    } else if reason.starts_with("implements interface `") {
+        "interface_implementation"
+    } else if reason == GO_STD_INTERFACE_REASON {
+        "std_interface_implementation"
+    } else if reason == "Declared in a C-family header — public interface" {
+        "c_header"
+    } else if reason == GO_BUILD_VARIANT_REASON {
+        "go_build_variant"
+    } else if reason == GO_VALUE_MENTION_REASON {
+        "go_value_mention"
+    } else if reason == "Symbol overlaps a tree-sitter parse error" {
+        "parse_error_overlap"
+    } else if reason == FILE_EXEMPT_REASON {
+        "file_exempt"
+    } else if reason.ends_with("excluded from dead code candidates") {
+        "not_parsed"
+    } else {
+        "wiring"
+    }
+}
+
+/// Exempt-reason tokens that are visibility rather than evidence.
+///
+/// What the `excluded` disclosure sums as "not examined": nothing reached these
+/// symbols; a keyword or a language default kept them off the list.
+pub const VISIBILITY_TOKENS: &[&str] = &["exported", "exported_owner"];
+
+/// Why an exported Go method is exempt when a standard-library interface could
+/// dispatch to it.
+pub const GO_STD_INTERFACE_REASON: &str =
+    "satisfies a standard-library interface by name and arity (fmt.Stringer, error, io.Reader, \
+     http.Handler, json.Marshaler, sort.Interface, …); calls reach it through the interface";
+
+/// `(method, parameter count)` of the standard-library interfaces a type in a
+/// module-private package most often satisfies without a single in-corpus call.
+///
+/// Only consulted when widening exported Go symbols into the unconfirmed tier,
+/// where it errs toward withholding: a `String()` on an `internal/` type is
+/// called by `fmt`, never by the corpus.
+const GO_STD_INTERFACE_METHODS: &[(&str, usize)] = &[
+    ("String", 0),
+    ("GoString", 0),
+    ("Error", 0),
+    ("Unwrap", 0),
+    ("Is", 1),
+    ("As", 1),
+    ("Format", 2),
+    ("Read", 1),
+    ("Write", 1),
+    ("Close", 0),
+    ("Seek", 2),
+    ("ReadFrom", 1),
+    ("WriteTo", 1),
+    ("ServeHTTP", 2),
+    ("RoundTrip", 1),
+    ("MarshalJSON", 0),
+    ("UnmarshalJSON", 1),
+    ("MarshalText", 0),
+    ("UnmarshalText", 1),
+    ("MarshalYAML", 0),
+    ("UnmarshalYAML", 1),
+    ("MarshalBinary", 0),
+    ("UnmarshalBinary", 1),
+    ("Scan", 1),
+    ("Value", 0),
+    ("Len", 0),
+    ("Less", 2),
+    ("Swap", 2),
+    ("Lock", 0),
+    ("Unlock", 0),
+];
+
+/// Whether a Go file's package is provably private to its module.
+///
+/// Go's own rules, nothing inferred: an `internal/` directory is importable
+/// only from the tree rooted at its parent, and nothing can import `package
+/// main`. Either way an exported name proves nothing about callers outside the
+/// corpus, so an uncalled one is a candidate — at the unconfirmed tier, until
+/// Go's interface dispatch is modelled.
+fn go_module_private_proof(ext: &Extraction) -> Option<&'static str> {
+    if ext.language != "go" {
+        return None;
+    }
+    if ext.go_package.as_deref() == Some("main") {
+        return Some("nothing can import Go `package main`");
+    }
+    let dir = parent_dir(&ext.file_path);
+    if dir == "internal"
+        || dir.starts_with("internal/")
+        || dir.contains("/internal/")
+        || dir.ends_with("/internal")
+    {
+        return Some(
+            "Go permits importing an `internal/` package only from inside its parent tree",
+        );
+    }
+    None
+}
+
 /// Which kind of hole one file leaves in call coverage.
 ///
 /// The two are not interchangeable and are never folded into one number: a
@@ -1282,11 +1528,25 @@ pub const UNRESOLVED_NAMESAKE_REASON: &str =
 /// act on" — is the unattributed tier silently manufacturing confident
 /// findings.
 ///
-/// **Only two classes qualify for the veto, not every non-builtin.** Classes
+/// **Three classes qualify for the veto, not every non-builtin.** Classes
 /// with affirmative evidence that the site meant something else — `Builtin`,
-/// `HostGlobal`, `LocalBinding`, `External`, `NoNamesake`, `ModulePath` — must
-/// not veto. What is left is the two tiers where the resolver admits it does
-/// not know: `UninferredReceiver` and `Unresolved`.
+/// `HostGlobal`, `External`, `NoNamesake`, `ModulePath` — must not veto. What is
+/// left is the three the ledger itself calls unattributed
+/// ([`UNATTRIBUTED_LABELS`]): `UninferredReceiver`, `Unresolved`, and
+/// `LocalBinding`.
+///
+/// `LocalBinding` joined on 2026-10-09. It was excluded on the theory that a
+/// call to a name the enclosing scope binds is a callback, never a symbol —
+/// and the audit measured the theory wrong in exactly the shapes where it
+/// mattered: `let (n, shadow_b) = (1, opt.and_then(|p| shadow_b(p)))` (Rust
+/// C48) calls the *function* inside the initializer of the pattern that binds
+/// the name, `{ cwd = repoRoot() }` (a TypeScript destructured default) calls
+/// it while binding `cwd`, and a Go function-local `type entry` shadowed by a
+/// later `for _, entry := range` loses its only reference the same way. Each
+/// was published at 0.9 and each was live. The classifier is right that the
+/// scope binds the name; it cannot see *which* of the name's bindings a given
+/// site reached, so the honest reading is the one the other two classes get:
+/// "the resolver could not prove which", not "nothing calls this".
 ///
 /// `Route` joins `Call` and `Reference` as an admitted kind because a route
 /// handler that failed to bind is the strongest version of this case: the
@@ -1298,23 +1558,262 @@ pub(crate) fn unresolved_namesake_names(resolution: &ResolutionResult) -> HashSe
     resolution
         .unresolved
         .iter()
-        .filter(|row| {
-            matches!(
-                row.kind,
-                UnresolvedKind::Call | UnresolvedKind::Reference | UnresolvedKind::Route
-            ) && matches!(
-                row.class,
-                UnresolvedClass::UninferredReceiver | UnresolvedClass::Unresolved
-            ) && match &row.resolution {
-                Resolution::Unresolved { reason } => {
-                    reason != "implicit receiver method is overridden by an indexed subtype"
-                }
-                _ => true,
-            }
-        })
+        .filter(|row| is_namesake_veto_row(row))
         .map(|row| row.callee_name.as_str())
         .filter(|name| !name.is_empty())
         .collect()
+}
+
+/// The one predicate for "this ledger row may be a call to a symbol of its
+/// name", shared by the veto and by the site evidence an unconfirmed row
+/// carries — so the count a reader sees is the count that demoted the row.
+fn is_namesake_veto_row(row: &UnresolvedReference) -> bool {
+    matches!(
+        row.kind,
+        UnresolvedKind::Call | UnresolvedKind::Reference | UnresolvedKind::Route
+    ) && matches!(
+        row.class,
+        UnresolvedClass::UninferredReceiver
+            | UnresolvedClass::Unresolved
+            | UnresolvedClass::LocalBinding
+    ) && match &row.resolution {
+        Resolution::Unresolved { reason } => {
+            reason != "implicit receiver method is overridden by an indexed subtype"
+        }
+        _ => true,
+    }
+}
+
+/// Whether a resolved edge is one candidate of several rather than a binding.
+///
+/// Shared by the liveness join and the site evidence, so an edge counted as an
+/// ambiguous caller is exactly an edge that made the row `only_ambiguous_callers`.
+fn is_ambiguous_edge(edge: &ResolvedEdge) -> bool {
+    !matches!(
+        edge.edge_kind,
+        EdgeKind::Contains | EdgeKind::Defines | EdgeKind::MemberOf
+    ) && matches!(
+        edge.resolution.as_deref(),
+        Some(Resolution::AmbiguousGlobal { .. }) | Some(Resolution::LanguageServerDispatch { .. })
+    )
+}
+
+/// The manifests that scope module privacy, keyed by manifest family, each as
+/// `(directory, proof)` — `proof` is `None` for a manifest that publishes its
+/// package (a library), which is what stops a library nested in an application
+/// from inheriting the application's verdict.
+type ManifestScopes<'a> = HashMap<&'static str, Vec<(&'a str, Option<&'a str>)>>;
+
+/// Every module manifest in the corpus, by family. See
+/// [`devmap_extract::wiring::module_manifest_family`].
+fn manifest_scopes(extractions: &[Extraction]) -> ManifestScopes<'_> {
+    let mut scopes: ManifestScopes<'_> = HashMap::new();
+    for ext in extractions {
+        let Some(family) = devmap_extract::wiring::module_manifest_family(&ext.file_path) else {
+            continue;
+        };
+        let proof = ext
+            .wiring
+            .iter()
+            .find(|annotation| annotation.kind == WiringKind::ModulePrivateScope)
+            .map(|annotation| annotation.details.as_str());
+        scopes
+            .entry(family)
+            .or_default()
+            .push((parent_dir(&ext.file_path), proof));
+    }
+    scopes
+}
+
+/// The proof the nearest manifest of `family` above `path` gives, if it gives
+/// one. The nearest wins, by directory depth.
+fn nearest_manifest_proof<'a>(
+    scopes: &ManifestScopes<'a>,
+    family: &str,
+    path: &str,
+) -> Option<&'a str> {
+    scopes
+        .get(family)?
+        .iter()
+        .filter(|(dir, _)| dir.is_empty() || path.starts_with(&format!("{dir}/")))
+        .max_by_key(|(dir, _)| dir.len())
+        .and_then(|(_, proof)| *proof)
+}
+
+/// Why an exported symbol is nonetheless private to its module, or `None` when
+/// nothing in the manifest or the language proves it.
+///
+/// The one owner of the widening. A language enters here only once its
+/// entry-point model is in place, because before that the population this
+/// opens is mostly framework callbacks (measured on Swift: about 15 of 26
+/// hidden internal-uncalled symbols):
+///
+/// * **Go** — `internal/` and `package main`, by the language's own import rule.
+/// * **TypeScript / JavaScript** — a package whose `package.json` publishes no
+///   entry point; framework lifecycle methods and JSX uses are already edges or
+///   exemptions.
+/// * **Kotlin / Java** — a Gradle module applying `com.android.application`,
+///   once Android components (by supertype), DI and serialization annotations,
+///   `override`s and `@Preview` are entry points.
+///
+/// Swift and Rust are not here yet: Swift waits on framework-protocol
+/// conformance exemptions, Rust on binary-crate detection.
+fn module_private_proof<'a>(ext: &Extraction, scopes: &ManifestScopes<'a>) -> Option<&'a str> {
+    if let Some(proof) = go_module_private_proof(ext) {
+        return Some(proof);
+    }
+    let family = match ext.code_language() {
+        "typescript" | "tsx" | "javascript" => "js",
+        "kotlin" | "java" => "gradle",
+        _ => return None,
+    };
+    nearest_manifest_proof(scopes, family, &ext.file_path)
+}
+
+/// Fill in the site evidence of every unconfirmed row in one pass.
+///
+/// `sites` counts the ambiguous edges into the symbol and the unattributed
+/// ledger rows naming it — the two kinds of evidence that put a row below the
+/// confident tier. The first site is the lexically smallest `(path, enclosing
+/// symbol)`, located to a byte by the call or reference that produced it, so a
+/// reader can jump straight to it and the choice is stable across builds.
+fn attach_site_evidence(
+    extractions: &[Extraction],
+    resolution: &ResolutionResult,
+    reports: &mut [DeadSymbolReport],
+    pending: &[(usize, &str, &ExtractedSymbol)],
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let mut by_target: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+    let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (slot, (_, file, sym)) in pending.iter().enumerate() {
+        by_target
+            .entry((file, sym.qualified_name.as_str()))
+            .or_default()
+            .push(slot);
+        by_target
+            .entry((file, sym.name.as_str()))
+            .or_default()
+            .push(slot);
+        by_name.entry(sym.name.as_str()).or_default().push(slot);
+    }
+
+    // Per slot: how many sites, and the smallest `(path, enclosing, callee)`.
+    let mut found: Vec<(u32, Option<(&str, &str, &str)>)> = vec![(0, None); pending.len()];
+
+    for edge in resolution
+        .edges
+        .iter()
+        .filter(|edge| is_ambiguous_edge(edge))
+    {
+        let short = edge
+            .target_symbol
+            .rsplit("::")
+            .next()
+            .unwrap_or(edge.target_symbol.as_str());
+        let member = short.rsplit('.').next().unwrap_or(short);
+        let mut slots: Vec<usize> = Vec::new();
+        for form in [edge.target_symbol.as_str(), short, member] {
+            if let Some(hit) = by_target.get(&(edge.target_file.as_str(), form)) {
+                slots.extend(hit.iter().copied());
+            }
+        }
+        slots.sort_unstable();
+        slots.dedup();
+        for slot in slots {
+            let site = (
+                edge.source_file.as_str(),
+                edge.source_symbol.as_str(),
+                member,
+            );
+            let entry = &mut found[slot];
+            entry.0 = entry.0.saturating_add(1);
+            if entry
+                .1
+                .map_or(true, |best| (site.0, site.1) < (best.0, best.1))
+            {
+                entry.1 = Some(site);
+            }
+        }
+    }
+    for row in resolution
+        .unresolved
+        .iter()
+        .filter(|row| is_namesake_veto_row(row))
+    {
+        let Some(slots) = by_name.get(row.callee_name.as_str()) else {
+            continue;
+        };
+        for &slot in slots {
+            let site = (
+                row.source_file.as_str(),
+                row.source_symbol.as_str(),
+                row.callee_name.as_str(),
+            );
+            let entry = &mut found[slot];
+            entry.0 = entry.0.saturating_add(1);
+            if entry
+                .1
+                .map_or(true, |best| (site.0, site.1) < (best.0, best.1))
+            {
+                entry.1 = Some(site);
+            }
+        }
+    }
+
+    let by_path: HashMap<&str, &Extraction> = extractions
+        .iter()
+        .map(|ext| (ext.file_path.as_str(), ext))
+        .collect();
+    for (slot, (index, _, _)) in pending.iter().enumerate() {
+        let (sites, first) = found[slot];
+        let Some(report) = reports.get_mut(*index) else {
+            continue;
+        };
+        let first_byte = first.and_then(|(path, enclosing, callee)| {
+            site_byte(by_path.get(path).copied()?, enclosing, callee)
+        });
+        report.evidence = Some(DeadEvidence {
+            sites,
+            first_path: first.map(|(path, _, _)| path.to_string()),
+            first_byte,
+            first_line: None,
+        });
+    }
+}
+
+/// The byte offset of the first site in `enclosing` that names `callee`: a
+/// call, else a reference, else the enclosing symbol's own start.
+fn site_byte(ext: &Extraction, enclosing: &str, callee: &str) -> Option<u32> {
+    let call = ext
+        .calls
+        .iter()
+        .filter(|call| {
+            call.callee_name == callee && call.caller_symbol.as_deref() == Some(enclosing)
+        })
+        .map(|call| call.span.start_byte)
+        .min();
+    let reference = || {
+        ext.references
+            .iter()
+            .filter(|reference| {
+                reference.name == callee && reference.enclosing_symbol.as_deref() == Some(enclosing)
+            })
+            .map(|reference| reference.span.start_byte)
+            .min()
+    };
+    let declaration = || {
+        ext.symbols
+            .iter()
+            .filter(|sym| sym.qualified_name == enclosing)
+            .map(|sym| sym.span.start_byte)
+            .min()
+    };
+    call.or_else(reference)
+        .or_else(declaration)
+        .and_then(|byte| u32::try_from(byte).ok())
 }
 
 /// Reason carried by a finding the call-blind cap demoted.
@@ -1632,11 +2131,7 @@ fn called_and_ambiguous_symbols(resolution: &ResolutionResult) -> CallIndex {
         // An ambiguous or explicitly unresolved edge is evidence that a
         // symbol may be called, not proof that any one candidate is called.
         // Do not turn speculative resolution into a false liveness negative.
-        if matches!(
-            edge.resolution.as_deref(),
-            Some(Resolution::AmbiguousGlobal { .. })
-                | Some(Resolution::LanguageServerDispatch { .. })
-        ) {
+        if is_ambiguous_edge(edge) {
             ambiguous_symbols.insert((edge.target_file.clone(), edge.target_symbol.clone()));
             if let Some(short_name) = edge.target_symbol.rsplit("::").next() {
                 ambiguous_symbols.insert((edge.target_file.clone(), short_name.to_string()));
@@ -1733,6 +2228,7 @@ fn symbol_exemption_index(
     let c_header_exports = c_header_exported_names(extractions);
     let go_build_variants = go_build_variant_identities(extractions);
     let go_value_mentions = go_value_mentioned_names(extractions);
+    let go_exported_specs = go_exported_interface_specs(extractions);
 
     // The one annotation kind whose target lives in a *different* file from the
     // one that carries it: `[project.scripts] cli = "pkg.mod:func"` is written
@@ -1770,14 +2266,21 @@ fn symbol_exemption_index(
             .map(|w| (w.target_symbol.as_str(), w.details.as_str()))
             .collect();
 
+        // Read by the corpus-wide exported-interface arm below; empty for
+        // every other language, which never reaches it.
+        let go_param_counts = if ext.language == "go" {
+            ext.go_method_param_counts()
+        } else {
+            BTreeMap::new()
+        };
+
         // Cross-file half of the Go interface exemption. Extraction closes the
         // same-file case as a wiring annotation; the package-wide join can only
         // happen here, where every file is in scope.
         let go_interface_exemptions: HashMap<&str, String> = go_package_key(ext)
             .and_then(|key| go_interface_specs.get(&key))
             .map(|specs| {
-                let param_counts = ext.go_method_param_counts();
-                go_interface_method_matches(&ext.symbols, &param_counts, specs.iter().copied())
+                go_interface_method_matches(&ext.symbols, &go_param_counts, specs.iter().copied())
                     .into_iter()
                     .map(|(symbol, interface_name)| {
                         (
@@ -1910,6 +2413,38 @@ fn symbol_exemption_index(
                                 files.iter().any(|file| *file != ext.file_path.as_str())
                             }))
                     .then(|| GO_VALUE_MENTION_REASON.to_string())
+                })
+                // An exported Go method whose shape some interface declares.
+                //
+                // Exported methods never needed this while every exported Go
+                // name was exempt for being exported. Widening a module-private
+                // package into the unconfirmed tier makes them candidates, and
+                // an exported method is satisfiable from *any* package — so the
+                // join is corpus-wide, unlike the package-scoped one above,
+                // which exists for unexported names only. The standard-library
+                // interfaces are listed by name and arity because `fmt` calls
+                // `String()` and the corpus never does.
+                // Only where the package is module-private: in any other
+                // package an exported method is spared for being exported, and
+                // filing it under an interface would shrink the `excluded`
+                // count of symbols never examined for their visibility.
+                .or_else(|| {
+                    if ext.language != "go"
+                        || sym.kind != SymbolKind::Method
+                        || !sym.is_exported
+                        || go_module_private_proof(ext).is_none()
+                    {
+                        return None;
+                    }
+                    let params = *go_param_counts.get(sym.qualified_name.as_str())?;
+                    go_exported_specs
+                        .get(&(sym.name.as_str(), params))
+                        .map(|interface_name| go_interface_exemption_reason(interface_name))
+                        .or_else(|| {
+                            GO_STD_INTERFACE_METHODS
+                                .contains(&(sym.name.as_str(), params))
+                                .then(|| GO_STD_INTERFACE_REASON.to_string())
+                        })
                 });
 
             if let Some(reason) = reason {
@@ -1989,6 +2524,11 @@ pub fn analyze_liveness_with_coverage(
         symbol_exemption_index(extractions, resolution, &called_symbols, &ambiguous_symbols);
 
     let mut reports = Vec::new();
+    // Unconfirmed rows awaiting their site evidence, by report index. Filled
+    // in one pass over the edges and the ledger after the loop, so the cost is
+    // proportional to the rows that need it rather than to the corpus.
+    let mut pending: Vec<(usize, &str, &ExtractedSymbol)> = Vec::new();
+    let scopes = manifest_scopes(extractions);
 
     for ext in extractions {
         // X6: Parse-failed files must NEVER be reported as confirmed dead code
@@ -2075,10 +2615,19 @@ pub fn analyze_liveness_with_coverage(
         // population is outside every liveness verdict", and leaving one
         // surface to rediscover that the day a YAML grammar is linked is how
         // the three surfaces disagreed in the first place.
-        let is_file_exempt = is_parse_failed
-            || matches!(ext.file_liveness(), FileLiveness::NotCode { .. })
-            || file_wiring.iter().any(|w| {
-                matches!(
+        let exempting_wiring = file_wiring.iter().copied().find(|w| {
+            // A Go `main.go` or a Rust `main.rs` is a binary's entry *file*,
+            // and the language's entry *function* is already exempt by
+            // name at symbol level (`go_runtime_entry_reason`, the Rust
+            // `main` attribute rule). Exempting the whole file on top of
+            // that spared every other function in it: an uncalled helper
+            // in `main.go` was never reported while the same helper in the
+            // package's next file was. The rule this list states — a
+            // file-level claim is not a claim about the symbols in it —
+            // applies, so for these two the annotation stays a claim about
+            // the file.
+            (w.kind == WiringKind::ScriptEntry && !matches!(ext.language.as_str(), "go" | "rust"))
+                || matches!(
                     w.kind,
                     WiringKind::Vendored
                         | WiringKind::TestFile
@@ -2089,7 +2638,6 @@ pub fn analyze_liveness_with_coverage(
                         // the file and its symbols.
                         | WiringKind::Fixture
                         | WiringKind::GeneratedFile
-                        | WiringKind::ScriptEntry
                         | WiringKind::StructuralExempt
                         | WiringKind::FrameworkDecorator
                         | WiringKind::Launcher
@@ -2100,7 +2648,10 @@ pub fn analyze_liveness_with_coverage(
                         // the question was reported as dead on every build.
                         | WiringKind::AllowUnwired
                 )
-            });
+        });
+        let is_file_exempt = is_parse_failed
+            || matches!(ext.file_liveness(), FileLiveness::NotCode { .. })
+            || exempting_wiring.is_some();
 
         // Per-symbol exemptions: a runtime, framework, or harness reaches the
         // symbol without an explicit call site, or the language forbids the
@@ -2121,7 +2672,11 @@ pub fn analyze_liveness_with_coverage(
         } else if is_parse_failed {
             Some("Parse failed — excluded from dead code candidates".to_string())
         } else {
-            file_wiring.first().map(|w| w.details.clone())
+            // From the annotation that exempted the file, never merely the
+            // first one it carries: a Go `main.go`'s `ScriptEntry` no longer
+            // exempts its symbols, and naming it as their reason would say it
+            // did.
+            exempting_wiring.map(|w| w.details.clone())
         };
 
         // One report per graph identity. Two `#[cfg]` variants of one method —
@@ -2183,25 +2738,26 @@ pub fn analyze_liveness_with_coverage(
                 .get(&(ext.file_path.clone(), sym.qualified_name.clone()))
                 .map(String::as_str);
 
-            if !is_called
-                && is_ambiguously_called
-                && !is_exported
-                && !is_file_exempt
-                && symbol_exemption.is_none()
-                && !overlaps_parse_error
-            {
+            // Nothing else spares it: not its file, not a recorded exemption,
+            // not a parse error over its span. Every report branch below
+            // requires this; the exempt branch is what is left.
+            let unspared = !is_file_exempt && symbol_exemption.is_none() && !overlaps_parse_error;
+            let identity = dead_symbol_identity(sym, &ext.file_path);
+            let language = ext.code_language();
+
+            if !is_called && is_ambiguously_called && !is_exported && unspared {
+                pending.push((reports.len(), ext.file_path.as_str(), sym));
                 reports.push(DeadSymbolReport {
-                    symbol_name: dead_symbol_identity(sym, &ext.file_path),
+                    symbol_name: identity,
                     file_path: ext.file_path.clone(),
                     confidence: cap(0.4),
                     is_exempt: false,
                     exemption_reason: Some("only_ambiguous_callers".to_string()),
+                    evidence: Some(DeadEvidence::none()),
                 });
             } else if !is_called
                 && !is_exported
-                && !is_file_exempt
-                && symbol_exemption.is_none()
-                && !overlaps_parse_error
+                && unspared
                 && unresolved_names.contains(sym.name.as_str())
             {
                 // The defect ledger, read at last. Same tier as
@@ -2214,47 +2770,79 @@ pub fn analyze_liveness_with_coverage(
                 // Placed after the ambiguity branch so a symbol with both keeps
                 // the older, more specific token rather than silently changing
                 // what those tests observe.
+                pending.push((reports.len(), ext.file_path.as_str(), sym));
                 reports.push(DeadSymbolReport {
-                    symbol_name: dead_symbol_identity(sym, &ext.file_path),
+                    symbol_name: identity,
                     file_path: ext.file_path.clone(),
                     confidence: cap(0.4),
                     is_exempt: false,
                     exemption_reason: Some(UNRESOLVED_NAMESAKE_REASON.to_string()),
+                    evidence: Some(DeadEvidence::none()),
                 });
-            } else if !is_called
-                && !is_exported
-                && !is_file_exempt
-                && symbol_exemption.is_none()
-                && !overlaps_parse_error
-            {
+            } else if !is_called && !is_exported && unspared {
                 // The corpus-level half of X6. A confident finding here means
                 // "no edge in the whole generation names this symbol" — which
                 // is only evidence when every file got to contribute its edges.
                 // While it did not, the finding stays visible (hiding it would
                 // be its own lie) but must not reach the tier `CLAUDE.md` tells
                 // agents to act on.
+                let confidence = cap(0.9);
+                if confidence > HIGHEST_DEGRADED_CONFIDENCE && !confident_tier_eligible(language) {
+                    // The evidence earned the confident tier and the language
+                    // has not. Only a row that would otherwise publish there is
+                    // touched: a coverage-capped row already says why it is
+                    // unconfirmed, and its graded confidence is the ranking
+                    // the coverage curve exists to keep.
+                    reports.push(DeadSymbolReport {
+                        symbol_name: identity,
+                        file_path: ext.file_path.clone(),
+                        confidence: UNPROVEN_TIER_CONFIDENCE,
+                        is_exempt: false,
+                        exemption_reason: Some(confident_tier_unproven_reason(language)),
+                        evidence: Some(DeadEvidence::none()),
+                    });
+                } else {
+                    reports.push(DeadSymbolReport {
+                        symbol_name: identity,
+                        file_path: ext.file_path.clone(),
+                        confidence,
+                        is_exempt: false,
+                        // Most specific reason wins, matching the exempt branch
+                        // below. A symbol in a call-blind file is not merely
+                        // downstream of somebody else's coverage hole — its own
+                        // file is the hole, and the reader's next move differs:
+                        // corpus loss invites a re-index, a missing extractor
+                        // does not.
+                        exemption_reason: if file_is_call_blind {
+                            Some(CALL_BLIND_REASON.to_string())
+                        } else if coverage.is_complete_for(language) {
+                            None
+                        } else {
+                            Some(COVERAGE_LOSS_REASON.to_string())
+                        },
+                        evidence: None,
+                    });
+                }
+            } else if let Some(proof) = (!is_called && is_exported && unspared)
+                .then(|| module_private_proof(ext, &scopes))
+                .flatten()
+            {
+                // An export the manifest proves module-private. The keyword
+                // that kept it off the list is not evidence of a caller, but
+                // the language's entry-point model is not proven either, so it
+                // enters at the unconfirmed tier and never above it.
+                pending.push((reports.len(), ext.file_path.as_str(), sym));
                 reports.push(DeadSymbolReport {
-                    symbol_name: dead_symbol_identity(sym, &ext.file_path),
+                    symbol_name: identity,
                     file_path: ext.file_path.clone(),
-                    confidence: cap(0.9),
+                    confidence: cap(UNPROVEN_TIER_CONFIDENCE),
                     is_exempt: false,
-                    // Most specific reason wins, matching the exempt branch
-                    // below. A symbol in a call-blind file is not merely
-                    // downstream of somebody else's coverage hole — its own
-                    // file is the hole, and the reader's next move differs:
-                    // corpus loss invites a re-index, a missing extractor does
-                    // not.
-                    exemption_reason: if file_is_call_blind {
-                        Some(CALL_BLIND_REASON.to_string())
-                    } else if coverage.is_complete_for(ext.code_language()) {
-                        None
-                    } else {
-                        Some(COVERAGE_LOSS_REASON.to_string())
-                    },
+                    exemption_reason: Some(exported_unreferenced_reason(proof)),
+                    evidence: Some(DeadEvidence::none()),
                 });
             } else if !is_called {
                 reports.push(DeadSymbolReport {
-                    symbol_name: dead_symbol_identity(sym, &ext.file_path),
+                    symbol_name: identity,
                     file_path: ext.file_path.clone(),
                     confidence: 0.3,
                     is_exempt: true,
@@ -2266,12 +2854,21 @@ pub fn analyze_liveness_with_coverage(
                         symbol_exemption
                             .map(str::to_string)
                             .or_else(|| file_reason.clone())
-                            .or_else(|| Some("Exported or exempt".to_string()))
+                            .or_else(|| {
+                                Some(if is_exported {
+                                    EXPORTED_NOT_EXAMINED_REASON.to_string()
+                                } else {
+                                    FILE_EXEMPT_REASON.to_string()
+                                })
+                            })
                     },
+                    evidence: None,
                 });
             }
         }
     }
+
+    attach_site_evidence(extractions, resolution, &mut reports, &pending);
 
     LivenessOutcome { reports, coverage }
 }

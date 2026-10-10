@@ -45,6 +45,7 @@ impl<'a> QueryEngine<'a> {
                 dead_clusters: None,
                 dead_clusters_truncated: 0,
                 dead_clusters_incomplete: None,
+                excluded: None,
                 unresolved_namesakes: None,
                 scope: None,
             };

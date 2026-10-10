@@ -1,0 +1,81 @@
+# construct	caller (file::symbol)	expected callee (file::symbol)	note
+C09	spm/Sources/Core/Person.swift::Person	spm/Sources/Core/Person.swift::Person.validateAge	call in init body (init is not a symbol, attributes to type)
+C11	spm/Sources/Core/Person.swift::Person	spm/Sources/Core/Person.swift::Person.formatDisplay	computed property body
+C10	spm/Sources/Core/Person.swift::Person.make	spm/Sources/Core/Person.swift::Person	Person(...) constructor
+C10	spm/Sources/Core/Person.swift::Person.defaultPerson	spm/Sources/Core/Person.swift::Person.make	Self.make
+C10	spm/Sources/Core/Person.swift::Registry.shared	spm/Sources/Core/Person.swift::PersonStore	ctor inside class func
+C34	spm/Sources/Core/Person.swift::Registry.register	spm/Sources/Core/Person.swift::PersonStore.save	typed stored property receiver
+C34	spm/Sources/Core/Person.swift::Registry.register	spm/Sources/Core/Person.swift::PersonStore.audit	self.store receiver
+C32	spm/Sources/Core/Person.swift::Registry.register	spm/Sources/Core/Person.swift::Registry.notifyAll	implicit self
+C08	spm/Sources/Core/PersonExtensions.swift::Person.greeting	spm/Sources/Core/PersonExtensions.swift::Person.fullName	extension member, implicit self
+C08	spm/Sources/Core/PersonExtensions.swift::Person.fullName	(symbol)	extension method owned by Person
+C18	spm/Sources/Core/PersonExtensions.swift::addVectors	spm/Sources/Core/PersonExtensions.swift::Vec2.+	operator overload use
+C07	spm/Sources/Core/Protocols.swift::Greeter.hello	spm/Sources/Core/Protocols.swift::English.greet|French.greet	protocol requirement dispatch from default impl
+C07	spm/Sources/Core/Protocols.swift::greetAll	spm/Sources/Core/Protocols.swift::Greeter.hello	conformer instance calls protocol-extension default
+C07	spm/Sources/Core/Protocols.swift::greetAll	spm/Sources/Core/Protocols.swift::French.greet|English.greet	existential dispatch
+C17	spm/Sources/Core/Protocols.swift::loudest	spm/Sources/Core/Protocols.swift::English.greet|French.greet	generic constrained $0
+C17	spm/Sources/Core/Protocols.swift::anyGreeter	spm/Sources/Core/Protocols.swift::English	some return ctor
+C17	spm/Sources/Core/Protocols.swift::boxed	spm/Sources/Core/Protocols.swift::Box	Box<Int>(...)
+C17	spm/Sources/Core/Protocols.swift::boxed	spm/Sources/Core/Protocols.swift::Box.get	receiver typed by generic ctor
+C20	spm/Sources/Core/Protocols.swift::Engine.run	spm/Sources/DemoMain/DemoApp.swift::AppDelegate.engineDidFinish	delegate?.m() -> conformer
+C13	spm/Sources/Core/Concurrency.swift::Coordinator.start	spm/Sources/Core/Concurrency.swift::Fetcher.fetch	try await static
+C14	spm/Sources/Core/Concurrency.swift::Coordinator.start	spm/Sources/Core/Concurrency.swift::Cache.put	actor method via property typed by initializer
+C14	spm/Sources/Core/Concurrency.swift::Coordinator.start	spm/Sources/Core/Concurrency.swift::Cache.get	actor
+C13	spm/Sources/Core/Concurrency.swift::Coordinator.start	spm/Sources/Core/Concurrency.swift::Coordinator.compute	async let
+C13	spm/Sources/Core/Concurrency.swift::Coordinator.start	spm/Sources/Core/Concurrency.swift::Coordinator.refresh	Task { self.refresh() }
+C12	spm/Sources/Core/Concurrency.swift::Coordinator.start	spm/Sources/Core/Concurrency.swift::Coordinator.retry	trailing closure call
+C12	spm/Sources/Core/Concurrency.swift::Coordinator.start	spm/Sources/Core/Concurrency.swift::Coordinator.log	call inside closure
+C12	spm/Sources/Core/Concurrency.swift::Coordinator.start	spm/Sources/Core/Concurrency.swift::transform	free fn in map closure
+C30	spm/Sources/Core/Concurrency.swift::Job.finish	NOT spm/Sources/Core/Concurrency.swift::onDone	closure property call must not bind to free function
+C16	spm/Sources/Core/Shapes.swift::totalArea	spm/Sources/Core/Shapes.swift::Shape.area	annotated, chained, return-chain (3 sites)
+C16	spm/Sources/Core/Shapes.swift::totalArea	spm/Sources/Core/Shapes.swift::Shape.unit	static
+C05	spm/Sources/Core/Shapes.swift::Settings	spm/Sources/Core/Shapes.swift::Clamped	@Clamped attribute use
+C06	spm/Sources/Core/Shapes.swift::builtList	spm/Sources/Core/Shapes.swift::makeList	call with trailing closure
+C06	spm/Sources/Core/Shapes.swift::ListBuilder.buildBlock	(not dead)	compiler-invoked
+C19	spm/Sources/Core/Notes.swift::Watcher	spm/Sources/Core/Notes.swift::Watcher.onNote	#selector reference (from init)
+C15	spm/Sources/Core/Notes.swift::Watcher	spm/Sources/Core/Notes.swift::Watcher.handle	sink closure self?.handle
+C15	spm/Sources/Core/Notes.swift::Watcher	spm/Sources/Core/Notes.swift::Watcher.onPublisher	sink closure
+C03	spm/Sources/DemoUI/Views.swift::RootView	spm/Sources/DemoUI/Views.swift::CounterModel.increment	@State model = CounterModel()
+C04	spm/Sources/DemoUI/Views.swift::RootView	spm/Sources/DemoUI/Views.swift::ListVM.load	@StateObject
+C01	spm/Sources/DemoUI/Views.swift::RootView	spm/Sources/DemoUI/Views.swift::HeaderView	view composition
+C02	spm/Sources/DemoUI/Views.swift::RootView	spm/Sources/DemoUI/Views.swift::ToggleRow	view composition with $binding
+C01	spm/Sources/DemoUI/Views.swift::RootView	spm/Sources/DemoUI/Views.swift::RootView.badge	implicit self helper inside ViewBuilder
+C24	spm/Sources/DemoUI/Views.swift::RootView	spm/Sources/Core/Person.swift::Person.make	cross-module via import Core
+C24	spm/Sources/DemoUI/Views.swift::RootView	spm/Sources/Core/PersonExtensions.swift::Person.fullName	return-type chain across module
+C04	spm/Sources/DemoUI/Views.swift::ToggleRow	spm/Sources/DemoUI/Views.swift::ListVM.load	@ObservedObject var vm: ListVM
+C03	spm/Sources/DemoUI/Views.swift::EnvReader	spm/Sources/DemoUI/Views.swift::CounterModel.increment	@Environment(CounterModel.self)
+C26	spm/Sources/DemoUI/Views.swift (file / #Preview)	spm/Sources/DemoUI/Views.swift::RootView	#Preview macro body
+C26	spm/Sources/DemoUI/Items.swift::seed	spm/Sources/DemoUI/Items.swift::Item.rename	@Model class, typed by ctor
+C21	spm/Sources/DemoMain/DemoApp.swift::DemoApp	spm/Sources/DemoMain/DemoApp.swift::MainView	@main App body
+C24	spm/Sources/DemoMain/DemoApp.swift::MainView	spm/Sources/Core/Protocols.swift::greetAll	cross-module free function
+C20	spm/Sources/DemoMain/DemoApp.swift::AppDelegate.applicationDidFinishLaunching	spm/Sources/Core/Protocols.swift::Engine.run	typed by initializer, cross-module
+C22	spm/Tests/CoreTests/CoreTests.swift::PersonTests.testGreeting	spm/Sources/Core/PersonExtensions.swift::Person.greeting	XCTest
+C23	spm/Tests/CoreTests/CoreTests.swift::VecSuite.adds	spm/Sources/Core/PersonExtensions.swift::addVectors	Swift Testing
+C23	spm/Tests/CoreTests/CoreTests.swift::VecSuite.scales	spm/Sources/Core/PersonExtensions.swift::Vec2.scaled	call inside #expect macro
+DEAD-TRUE	spm/Sources/Core/Person.swift::PersonStore.unusedStoreHelper	-	truly dead
+DEAD-TRUE	spm/Sources/Core/Concurrency.swift::onDone	-	truly dead (C30)
+DEAD-TRUE	spm/Tests/CoreTests/CoreTests.swift::PersonTests.helperNotATest	-	truly dead
+LIVE	DemoApp, AppDelegate.applicationDidFinishLaunching, AppDelegate.engineDidFinish, Watcher.onNote, ListBuilder.buildBlock, Clamped, RootView(#Preview), VecSuite.adds/scales, Item	-	must not be dead
+X1	xcode/ios/AppTarget/Home.swift::Home.render	xcode/ios/CoreKit/Sources/CoreKit/Engine.swift::CoreKitEngine.run	local SPM package import
+X2	xcode/ios/AppTarget/Home.swift::Home.render	xcode/ios/AppTarget/Theme.swift::Theme.accent	own-target type (not Widget, not CoreKit)
+X3	xcode/ios/AppTarget/Home.swift::Home.render	xcode/ios/Shared/Formatter.swift::sharedFormat	same Xcode target, different folder
+X4	xcode/ios/WidgetTarget/WidgetView.swift::WidgetView.render	xcode/ios/WidgetTarget/Theme.swift::Theme.accent	own-target type
+X5	xcode/ios/WidgetTarget/WidgetView.swift::WidgetView.render	xcode/ios/Shared/Formatter.swift::sharedFormat	shared folder
+X6	xcode/ios/Shared/Formatter.swift::sharedFormat	AppTarget Theme.accent AND WidgetTarget Theme.accent	file compiled into two targets
+P1	spm/Sources/Core/PrivateReach.swift::Holder.drive	Meter.<+>	custom operator use; must not be dead
+P2	Holder.drive	Meter.privBump	annotated local `let m: Meter = .zero`
+P3	Holder.drive	Meter.privOptional	optional property typed by annotation `var maybe: Meter?`
+P4	Holder.drive	Meter.privDouble	function reference passed by name
+P5	Holder.drive	Meter.privLabel	call in string interpolation
+P6	Holder.drive	Pinger.pingTwice	protocol-extension default on a conformer value
+P7	Pinger.pingTwice	LocalPinger.ping	requirement dispatch
+P8	Holder	Holder.privObserved	didSet observer
+P9	Holder	Holder.privCompute	lazy var initializer
+P10	Holder.drive	Holder.privStatic	Self. static
+P11	-	Meter.privTrulyDead	TRUE DEAD, must be in dead list
+X7	xcode/ios/AppTarget/Home2.swift::makeTheme	xcode/ios/AppTarget/Theme.swift::Theme	ctor of own-module type that shadows an imported same-name type
+M1	micro/Sources/M/A.swift::plusRight|minusRight|mulRight|plusBoth	b2|b4|b5|b8 as Calls	right operand of + - * is recorded as References, not Calls
+M2	micro/Sources/M/B.swift::freeDot|freeDotCall|freeEnumCase|Host.methodDot	Gauge.bump / Kind.area	annotated local `let g: Gauge = ...` must type the receiver
+M3	micro/Sources/M/B.swift::multiDecl	Gauge.bump x2	receiver must be `g`, not `a.bump() + g`
+M4	micro/Sources/M/C.swift::usesLocal|usesClosure	Beta.run (NOT Alpha.run)	param `s: Alpha` in another function must not type local/closure `s`
+M5	micro/Sources/M/A.swift::ctorChain	Meter.bump	`Meter(v: 1).bump()` receiver typed by constructor

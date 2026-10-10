@@ -1,0 +1,5 @@
+[workspace]
+resolver = "2"
+members = ["corelib", "app", "libnamed"]
+# tauri_like is parse-only (depends on tauri); it is deliberately not a member.
+exclude = ["tauri_like"]
