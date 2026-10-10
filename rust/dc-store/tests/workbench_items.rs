@@ -128,7 +128,7 @@ fn schema_10_profiles_migrate_with_done_archived_and_completion_recovered_from_h
 
     clock.store(9000, Ordering::SeqCst);
     let streak = get(&s, "streak");
-    assert_eq!(version(&s), 11);
+    assert_eq!(version(&s), 12);
     assert_eq!(json::<i64>(&s, &streak, "$.item.archived"), 1);
     assert_eq!(json::<i64>(&s, &streak, "$.item.completed_at"), 4000);
     let born = get(&s, "born");
@@ -192,7 +192,7 @@ fn schema_10_profiles_migrate_with_done_archived_and_completion_recovered_from_h
 fn a_profile_newer_than_this_build_is_refused() {
     let (s, _) = fixture();
     s.connection()
-        .execute_batch("UPDATE work_meta SET version=12 WHERE id=1")
+        .execute_batch("UPDATE work_meta SET version=13 WHERE id=1")
         .unwrap();
     refuse(&s, "items.list", "{}", "schema_unsupported");
 }
