@@ -713,7 +713,36 @@ func (c *Client) Available(ctx context.Context) (*Status, error) {
 }
 
 // Status reads the index's self-report.
+//
+// Inside a call scope (WithCall) the first read is remembered for the rest of
+// that call, so Available and the freshness check a query makes after it are
+// one process instead of two or three. Outside a scope every call is a process.
 func (c *Client) Status(ctx context.Context) (*Status, error) {
+	m, ok := ctx.Value(callKey{}).(*callMemo)
+	if !ok {
+		return c.readStatus(ctx)
+	}
+	select {
+	case m.slot <- struct{}{}:
+		defer func() { <-m.slot }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	if m.client == c && m.status != nil {
+		cached := *m.status
+		return &cached, nil
+	}
+	status, err := c.readStatus(ctx)
+	if err != nil {
+		return nil, err
+	}
+	m.client, m.status = c, status
+	cached := *status
+	return &cached, nil
+}
+
+// readStatus is one `devmap status` process.
+func (c *Client) readStatus(ctx context.Context) (*Status, error) {
 	var status Status
 	if _, err := c.decode(ctx, &status, c.Timeout, "status"); err != nil {
 		return nil, err
