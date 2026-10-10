@@ -143,4 +143,24 @@ func benchmarkWorkbenchProfile(b *testing.B, tasks, revisions int) {
 	if expected := tasks*revisions + repositories + 10 + revision - revisions; events.Total != expected {
 		b.Fatalf("edits did not commit once each: %d events; expected %d", events.Total, expected)
 	}
+	// Retention: one bounded pass over the whole fixture. Receipts and events are
+	// fresh, so only superseded revisions are eligible; the report carries both
+	// the deleted and the eligible counts, and the history must shrink to the bound.
+	compacted := time.Now()
+	report := call("store.compact", json.RawMessage(`{"keep_revisions":1,"limit":100000}`))
+	var reported struct {
+		Item struct {
+			Revisions struct {
+				Deleted, Eligible int
+				Truncated         bool
+			} `json:"revisions"`
+		} `json:"item"`
+	}
+	if err := json.Unmarshal(report, &reported); err != nil {
+		b.Fatal(err)
+	}
+	b.Logf("Compaction: %s; %s", time.Since(compacted), report)
+	if want := tasks*(revisions-1) + (revision - revisions); reported.Item.Revisions.Deleted != want || reported.Item.Revisions.Truncated {
+		b.Fatalf("compaction deleted %d revisions; expected %d", reported.Item.Revisions.Deleted, want)
+	}
 }
