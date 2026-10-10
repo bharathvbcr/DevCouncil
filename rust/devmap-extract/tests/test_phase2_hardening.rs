@@ -683,6 +683,102 @@ func plain() string { return "p" }
     }
 }
 
+/// A Rust type declared inside a function keys its methods under that function.
+///
+/// The struct was already `with_guard.Guard` (`scoped_qualified_name`), but its
+/// `impl` methods were keyed by the bare type — `Guard.drop`, parented on a
+/// `Guard` the graph does not hold — so a module-level `Guard` with its own
+/// `drop` in the same file shared the local one's identity, and calls made
+/// inside the local `drop` were attributed to whichever node won. Before the
+/// fix this test saw `lib.rs::Guard.drop x2` and the local method parented on
+/// `lib.rs::Guard`. The dead-policy card's guard fixture (C50) is the shape.
+#[test]
+fn function_local_impl_methods_are_keyed_under_their_function() {
+    let ext = extract_file(
+        "lib.rs",
+        r#"
+pub struct Guard;
+impl Drop for Guard {
+    fn drop(&mut self) {}
+}
+
+pub struct Outer;
+
+pub fn with_guard() -> u8 {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) { release(); }
+    }
+    impl Outer {
+        fn added_locally(&self) {}
+    }
+    trait Local {
+        fn local_method(&self);
+    }
+    let _g = Guard;
+    50
+}
+
+fn release() {}
+"#,
+    );
+
+    let mut seen = std::collections::BTreeMap::new();
+    for symbol in &ext.symbols {
+        *seen.entry(symbol.qualified_name.as_str()).or_insert(0usize) += 1;
+    }
+    let duplicates: Vec<_> = seen.iter().filter(|(_, count)| **count > 1).collect();
+    assert!(
+        duplicates.is_empty(),
+        "duplicate identities: {duplicates:?}"
+    );
+
+    let parent_of = |qualified: &str| {
+        ext.symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == qualified)
+            .unwrap_or_else(|| {
+                let names: Vec<_> = ext.symbols.iter().map(|s| &s.qualified_name).collect();
+                panic!("no symbol {qualified}; have {names:?}")
+            })
+            .parent_symbol
+            .clone()
+    };
+    // The local type and its method share one prefix, so the method's parent
+    // is a node the graph holds.
+    assert!(seen.contains_key("lib.rs::with_guard.Guard"));
+    assert_eq!(
+        parent_of("lib.rs::with_guard.Guard.drop").as_deref(),
+        Some("lib.rs::with_guard.Guard")
+    );
+    assert_eq!(
+        parent_of("lib.rs::with_guard.Local.local_method").as_deref(),
+        Some("lib.rs::with_guard.Local")
+    );
+    // Controls: the module-level type keeps its key, and an impl of a
+    // module-level type written inside a function still belongs to that type.
+    assert_eq!(
+        parent_of("lib.rs::Guard.drop").as_deref(),
+        Some("lib.rs::Guard")
+    );
+    assert_eq!(
+        parent_of("lib.rs::Outer.added_locally").as_deref(),
+        Some("lib.rs::Outer")
+    );
+
+    // A call inside the local method is attributed to the same key the method
+    // was emitted under, or the edge would dangle.
+    let release = ext
+        .references
+        .iter()
+        .find(|reference| reference.kind == ReferenceKind::Call && reference.name == "release")
+        .expect("the call to release() is extracted");
+    assert_eq!(
+        release.enclosing_symbol.as_deref(),
+        Some("lib.rs::with_guard.Guard.drop")
+    );
+}
+
 /// A call target that is not a name records no callee at all.
 ///
 /// SC26 found five call shapes that recorded a whole *expression* where a callee

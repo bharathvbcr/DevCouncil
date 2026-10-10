@@ -2679,11 +2679,12 @@ fn enclosing_type_name(node: Node, source: &str) -> Option<String> {
     let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         match parent.kind() {
-            "class_definition"
-            | "class_declaration"
-            | "abstract_class_declaration"
-            | "trait_item" => {
+            "class_definition" | "class_declaration" | "abstract_class_declaration" => {
                 return get_child_text(parent, "name", source);
+            }
+            "trait_item" => {
+                let name = get_child_text(parent, "name", source)?;
+                return Some(rust_function_local_type(parent, source, &name).unwrap_or(name));
             }
             // An impl's methods belong to the TYPE, including in
             // `impl Trait for Type` (SC11).
@@ -2709,7 +2710,8 @@ fn enclosing_type_name(node: Node, source: &str) -> Option<String> {
                     .child_by_field_name("type")
                     .or_else(|| parent.child_by_field_name("trait"))?;
                 let text = get_node_text(owner, source);
-                return Some(text.split('<').next().unwrap_or(&text).trim().to_string());
+                let bare = text.split('<').next().unwrap_or(&text).trim().to_string();
+                return Some(rust_function_local_type(parent, source, &bare).unwrap_or(bare));
             }
             // A nested function is not a class method merely because a class
             // occurs farther up the ancestor chain. Rust spells the same node
@@ -2724,6 +2726,50 @@ fn enclosing_type_name(node: Node, source: &str) -> Option<String> {
             | "method_definition"
             | "function_item"
             | "closure_expression" => return None,
+            _ => ancestor = bounded_parent(parent),
+        }
+    }
+    None
+}
+
+/// The owner name of a Rust type declared inside a function body, keyed under
+/// that function: `with_guard.Guard` for `fn with_guard() { struct Guard; impl
+/// Drop for Guard { fn drop(..) } }`.
+///
+/// The struct itself is already keyed that way (`scoped_qualified_name`), so
+/// its methods must be too, or the method's `parent_symbol` names a type the
+/// graph does not hold and a module-level `Guard::drop` in the same file shares
+/// the local one's identity. A qualified name is the join key; this is the one
+/// place a method's owner is computed, so the symbol emitters and the call
+/// attribution in `enclosing_callable_qualified` move together.
+///
+/// `item` is the `impl_item` or `trait_item`. Only a type declared in a block
+/// of the same function counts: `impl Display for Outer` written inside a
+/// function still implements the module-level `Outer`, and keying it under the
+/// function would sever it from that type. `None` keeps the bare name.
+fn rust_function_local_type(item: Node, source: &str, bare: &str) -> Option<String> {
+    let mut ancestor = bounded_parent(item);
+    while let Some(parent) = ancestor {
+        match parent.kind() {
+            "block" => {
+                let mut cursor = parent.walk();
+                let declared = parent.named_children(&mut cursor).any(|child| {
+                    matches!(
+                        child.kind(),
+                        "struct_item" | "enum_item" | "union_item" | "trait_item"
+                    ) && get_child_text(child, "name", source).as_deref() == Some(bare)
+                });
+                if declared {
+                    // An empty file prefix yields `::scope`; the callers add
+                    // the file themselves, exactly as for a bare type name.
+                    let scope = enclosing_callable_qualified(item, source, "")?;
+                    return Some(format!("{}.{bare}", scope.trim_start_matches("::")));
+                }
+                ancestor = bounded_parent(parent);
+            }
+            "function_item" | "closure_expression" | "source_file" | "declaration_list" => {
+                return None
+            }
             _ => ancestor = bounded_parent(parent),
         }
     }
