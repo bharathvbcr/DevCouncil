@@ -327,6 +327,7 @@ func TestEveryReaderTheCheckNamesHasARemedy(t *testing.T) {
 	for _, reader := range []string{
 		"GitPulse vendored crates", "devmap (PATH)", "dcstore (PATH)", "gitpulse-mcp (PATH)",
 		"GitPulse.app (its bundled gitpulse-mcp)", "Manvi pin (scripts/module-pins.txt)", "Jarvis pin (upstream.lock.json)",
+		"GitPulse copy of Manvi's serve contract",
 	} {
 		if got := remedy(reader, "/gp"); strings.Contains(got, "names no remedy") {
 			t.Fatalf("%s has no remedy", reader)

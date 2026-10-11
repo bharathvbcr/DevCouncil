@@ -279,6 +279,8 @@ func remedy(reader, gitpulse string) string {
 		return fmt.Sprintf("devcouncil install %s; if it still lags, an earlier PATH entry shadows the install (see the PATH notes above)", name)
 	case strings.HasPrefix(reader, "Manvi pin"):
 		return "bump Manvi's DevCouncil pin in scripts/module-pins.txt — a commit in Manvi: report the delta and ask before bumping"
+	case strings.Contains(reader, "serve contract"):
+		return fmt.Sprintf("copy Manvi's contracts/serve.ops.schema.json over %s's copy and update GitPulse's Rust side to it — a commit in GitPulse: ask first", gitpulse)
 	case strings.HasPrefix(reader, "Jarvis pin"):
 		return "bump Jarvis's DevCouncil pin in upstream.lock.json and go.mod — a commit in Jarvis: report the delta and ask before bumping"
 	}
