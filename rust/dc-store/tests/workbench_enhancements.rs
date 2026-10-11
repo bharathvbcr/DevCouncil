@@ -431,7 +431,7 @@ fn v1_migration_preserves_existing_data_and_refuses_partial_or_future_schemas() 
             .query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r
                 .get::<_, i64>(0))
             .unwrap(),
-        12
+        13
     );
     s.connection()
         .execute_batch("UPDATE work_meta SET version=999 WHERE id=1")
