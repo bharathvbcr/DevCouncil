@@ -134,3 +134,24 @@ func TestSecretPathFoldFixtureHeldByGo(t *testing.T) {
 		t.Fatalf("only %d rows loaded", checked)
 	}
 }
+
+// An entry whose change this gate does not know lends nothing: with the
+// subsystem rung and the same-directory rung both, a sibling of a mis-spelled
+// read-only entry is not writable.
+func TestUnknownAllowedChangeLendsNoScope(t *testing.T) {
+	root := t.TempDir()
+	gate := FileGate{Root: root, HardRules: true, AllowNeighbors: true, AllowSameDir: true}
+	for _, change := range []dc.AllowedChange{"read-only", "readonly", "READ_ONLY", "bogus"} {
+		task := &dc.Task{ID: "T", PlannedFiles: []dc.PlannedFile{{Path: "src/protected.go", AllowedChange: change}}}
+		d := gate.EvaluateFileChange("src/sibling.go", task, dc.OpWrite, false)
+		if d.Action != Deny {
+			t.Errorf("%q lent its directory: sibling write = %s/%s", change, d.Action, d.Rule)
+		}
+	}
+	for _, change := range []dc.AllowedChange{dc.ChangeCreate, dc.ChangeModify, dc.ChangeDelete} {
+		task := &dc.Task{ID: "T", PlannedFiles: []dc.PlannedFile{{Path: "src/planned.go", AllowedChange: change}}}
+		if d := gate.EvaluateFileChange("src/sibling.go", task, dc.OpWrite, false); d.Action == Deny {
+			t.Errorf("%q must keep lending its directory: %s/%s", change, d.Action, d.Rule)
+		}
+	}
+}

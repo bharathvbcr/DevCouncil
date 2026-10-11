@@ -8,6 +8,7 @@ package dc
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 )
 
 // AllowedChange is what a task's plan permits for one planned file.
@@ -19,6 +20,20 @@ const (
 	ChangeDelete   AllowedChange = "delete"
 	ChangeReadOnly AllowedChange = "read_only"
 )
+
+// Valid reports whether c is one of the four changes a plan can permit. An
+// unrecognised value is not "no restriction": the scope rungs compare against
+// exact names, so `read-only` or `READ_ONLY` would stop being read_only while
+// still lending its siblings as writable. Anything outside the set is refused
+// where it enters (UnmarshalJSON, the store's append) instead of being carried
+// into a gate that has no word for it.
+func (c AllowedChange) Valid() bool {
+	switch c {
+	case ChangeCreate, ChangeModify, ChangeDelete, ChangeReadOnly:
+		return true
+	}
+	return false
+}
 
 // Operation is what a tool call is attempting.
 type Operation string
@@ -64,6 +79,10 @@ func (p *PlannedFile) UnmarshalJSON(data []byte) error {
 	*p = PlannedFile(decoded)
 	if p.AllowedChange == "" {
 		p.AllowedChange = ChangeModify
+	}
+	if !p.AllowedChange.Valid() {
+		return fmt.Errorf("planned file %q: allowed_change %q is not one of create, modify, delete, read_only",
+			p.Path, string(p.AllowedChange))
 	}
 	return nil
 }

@@ -275,6 +275,18 @@ func (g FileGate) EvaluateFileChange(path string, task *dc.Task, op dc.Operation
 	return g.noteHardRules(allow("File change is allowed.", normalized, task.ID))
 }
 
+// lendsScope reports whether a planned entry may lend its neighbourhood to the
+// unplanned-scope rungs. An allow-list, not "anything but read_only": an entry
+// whose change is not one this gate knows must lend nothing, since the only
+// reading that never widens is the one where an unknown word grants nothing.
+func lendsScope(pf dc.PlannedFile) bool {
+	switch pf.AllowedChange {
+	case dc.ChangeCreate, dc.ChangeModify, dc.ChangeDelete:
+		return true
+	}
+	return false
+}
+
 // operationRefusal reports whether a planned entry forbids the operation being
 // attempted, and the denial that says so.
 //
@@ -437,7 +449,7 @@ func (g FileGate) unplannedDecision(path string, task *dc.Task) Decision {
 		// A read-only entry says "look at this, do not change it". Lending its
 		// subsystem as writable would turn that into a permission over every
 		// file beside it, which is the opposite of what it declares.
-		if pf.AllowedChange == dc.ChangeReadOnly {
+		if !lendsScope(pf) {
 			continue
 		}
 		area, ok := g.Subsystems.AreaForPath(normalizeSlashes(pf.Path))
@@ -550,7 +562,7 @@ func (g FileGate) sameDirDecision(path string, task *dc.Task, base Decision) Dec
 	}
 
 	for _, pf := range task.PlannedFiles {
-		if pf.AllowedChange == dc.ChangeReadOnly {
+		if !lendsScope(pf) {
 			continue
 		}
 		plannedDir, ok := scopeDir(pf.Path)

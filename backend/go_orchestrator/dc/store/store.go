@@ -429,6 +429,9 @@ func (c *Client) AppendPlannedFiles(ctx context.Context, taskID, token string, a
 		if change == dc.ChangeReadOnly {
 			return nil, fmt.Errorf("store: %q cannot be appended read-only; appended scope only ever widens", path)
 		}
+		if !change.Valid() {
+			return nil, fmt.Errorf("store: %q has allowed_change %q, which is not one of create, modify, delete", path, string(change))
+		}
 		wanted = append(wanted, dc.PlannedFile{Path: path, AllowedChange: change})
 	}
 	if len(wanted) == 0 {

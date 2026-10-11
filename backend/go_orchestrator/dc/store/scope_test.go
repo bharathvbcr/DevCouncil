@@ -274,3 +274,13 @@ func TestConcurrentWideningsAreNeverSilentlyLost(t *testing.T) {
 			len(succeeded), writers, maxScopeAppendAttempts, refusals)
 	}
 }
+
+func TestAppendPlannedFilesRefusesAnUnknownAllowedChange(t *testing.T) {
+	c := &Client{}
+	for _, bad := range []dc.AllowedChange{"read-only", "readonly", "READ_ONLY", "bogus"} {
+		_, err := c.AppendPlannedFiles(context.Background(), "T", "tok", []dc.PlannedFile{{Path: "a.go", AllowedChange: bad}})
+		if err == nil || !strings.Contains(err.Error(), "allowed_change") {
+			t.Errorf("%q: err = %v, want an allowed_change refusal before any store call", bad, err)
+		}
+	}
+}
