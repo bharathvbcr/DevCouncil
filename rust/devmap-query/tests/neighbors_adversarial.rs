@@ -903,6 +903,42 @@ fn extreme_budgets_and_depths_neither_overflow_nor_lie() {
     }
 }
 
+/// The generations an answer names: generation k has exactly one caller symbol,
+/// `run_k`, so every `run_<k>` an answer mentions is a generation it was read
+/// from.
+fn generations_named(answers: &[Neighbors]) -> Vec<usize> {
+    let mut seen: Vec<usize> = Vec::new();
+    for entry in answers {
+        for side in [&entry.callers, &entry.callees] {
+            for edge in &side.items {
+                for symbol in [&edge.source_symbol, &edge.target_symbol] {
+                    if let Some(tail) = symbol.rsplit("::run_").next() {
+                        if tail != symbol.as_str() {
+                            if let Ok(k) = tail.parse::<usize>() {
+                                if !seen.contains(&k) {
+                                    seen.push(k);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    seen
+}
+
+/// Whether some direction of the answer says the index moved while it was read.
+fn names_the_move(answers: &[Neighbors]) -> bool {
+    answers.iter().any(|entry| {
+        [&entry.callers, &entry.callees].iter().any(|side| {
+            side.walk_incomplete
+                .as_deref()
+                .is_some_and(|note| note.contains("generation"))
+        })
+    })
+}
+
 /// A composed answer is not guaranteed to come from one generation.
 ///
 /// Each target's `impact` reads the process-wide edge cache keyed on the
@@ -919,6 +955,7 @@ fn extreme_budgets_and_depths_neither_overflow_nor_lie() {
 #[test]
 fn a_composed_read_racing_a_commit_never_straddles_silently() {
     const GENERATIONS: usize = 12;
+    const READERS: usize = 4;
     let store = Arc::new(Store::open_in_memory().unwrap());
 
     // Generation k has exactly one caller symbol, `run_k`, so any answer that
@@ -945,67 +982,75 @@ fn a_composed_read_racing_a_commit_never_straddles_silently() {
     };
     commit(&store, 0);
 
+    // The overlap is made, not hoped for. A writer that commits on its own
+    // clock overlaps the readers only if the scheduler lets it, and a loaded
+    // host does not: the old version asserted that overlap happened and failed
+    // ("the readers never overlapped the writer") for reasons unrelated to what
+    // it tests. Here the writer commits generation k only once k composed reads
+    // have completed and a reader is *inside* a read, so every commit lands
+    // while a read is in flight and the run holds at least one completed read
+    // per generation however the machine is loaded.
     let stop = Arc::new(AtomicUsize::new(0));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let inflight = Arc::new(AtomicUsize::new(0));
+    let alive = Arc::new(AtomicUsize::new(READERS));
     let writer = {
         let store = Arc::clone(&store);
         let stop = Arc::clone(&stop);
+        let reads = Arc::clone(&reads);
+        let inflight = Arc::clone(&inflight);
+        let alive = Arc::clone(&alive);
         std::thread::spawn(move || {
             for k in 1..GENERATIONS {
+                // A reader that died (panicked) ends the wait, so a failure in
+                // a reader is reported rather than hung on.
+                while (reads.load(Ordering::SeqCst) < k || inflight.load(Ordering::SeqCst) == 0)
+                    && alive.load(Ordering::SeqCst) > 0
+                {
+                    std::thread::yield_now();
+                }
                 commit(&store, k);
                 stop.store(k, Ordering::SeqCst);
-                std::thread::yield_now();
             }
         })
     };
 
-    let reads = Arc::new(AtomicUsize::new(0));
     let mixed = Arc::new(AtomicUsize::new(0));
     let undisclosed = Arc::new(AtomicUsize::new(0));
-    let readers: Vec<_> = (0..4)
+    let readers: Vec<_> = (0..READERS)
         .map(|_| {
             let store = Arc::clone(&store);
             let stop = Arc::clone(&stop);
             let reads = Arc::clone(&reads);
+            let inflight = Arc::clone(&inflight);
+            let alive = Arc::clone(&alive);
             let mixed = Arc::clone(&mixed);
             let undisclosed = Arc::clone(&undisclosed);
             std::thread::spawn(move || {
+                // Decrements on exit, panic included.
+                struct Exit(Arc<AtomicUsize>);
+                impl Drop for Exit {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, Ordering::SeqCst);
+                    }
+                }
+                let _exit = Exit(alive);
                 let engine = StoreQueryEngine::new(&store);
                 let targets = vec!["core.py::helper".to_string(), "caller.py".to_string()];
                 while stop.load(Ordering::SeqCst) < GENERATIONS - 1 {
-                    let answer = engine.neighbors(&targets, 20_000, 0.0, 2).unwrap();
+                    inflight.fetch_add(1, Ordering::SeqCst);
+                    let answer = engine.neighbors(&targets, 20_000, 0.0, 2);
+                    inflight.fetch_sub(1, Ordering::SeqCst);
+                    let answer = answer.unwrap();
                     reads.fetch_add(1, Ordering::SeqCst);
-                    let mut seen: Vec<usize> = Vec::new();
-                    for entry in &answer {
-                        assert_entry_invariants(entry, 20_000);
-                        for side in [&entry.callers, &entry.callees] {
-                            for edge in &side.items {
-                                for symbol in [&edge.source_symbol, &edge.target_symbol] {
-                                    if let Some(tail) = symbol.rsplit("::run_").next() {
-                                        if tail != symbol.as_str() {
-                                            if let Ok(k) = tail.parse::<usize>() {
-                                                if !seen.contains(&k) {
-                                                    seen.push(k);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    let seen = generations_named(&answer);
                     if seen.len() > 1 {
                         mixed.fetch_add(1, Ordering::SeqCst);
                         // A straddle is tolerable; a *silent* straddle is not.
                         // The composition retries once and, if the index moves
                         // again, marks every direction — so a caller can always
                         // tell a mixed answer from a coherent one.
-                        let disclosed = answer.iter().any(|entry| {
-                            [&entry.callers, &entry.callees].iter().any(|side| {
-                                side.walk_incomplete
-                                    .as_deref()
-                                    .is_some_and(|note| note.contains("generation"))
-                            })
-                        });
+                        let disclosed = names_the_move(&answer);
                         if !disclosed {
                             undisclosed.fetch_add(1, Ordering::SeqCst);
                         }
@@ -1023,8 +1068,8 @@ fn a_composed_read_racing_a_commit_never_straddles_silently() {
     assert!(
         reads.load(Ordering::SeqCst) >= GENERATIONS,
         "only {} composed reads completed against {GENERATIONS} generations; \
-         the readers never overlapped the writer, so this test asserted nothing \
-         about a race",
+         the writer waits for a completed read before every commit, so a reader \
+         stopped early",
         reads.load(Ordering::SeqCst)
     );
     assert_eq!(
@@ -1046,6 +1091,63 @@ fn a_composed_read_racing_a_commit_never_straddles_silently() {
          coherent one.",
         undisclosed.load(Ordering::SeqCst),
         reads.load(Ordering::SeqCst)
+    );
+}
+
+/// The check above must be able to fail. A reader that reads two relations
+/// without one snapshot — here, two composed reads with a commit between them,
+/// standing for the halves of one answer — names two generations and says
+/// nothing, and that is exactly what the racing test counts as undisclosed.
+/// Deterministic: no thread, no timing. (The engine's own retry-and-disclose
+/// is pinned the same way, with a commit landing mid-read, by
+/// `a_composed_read_retries_once_and_keeps_all_existing_qualifications`.)
+#[test]
+fn a_reader_without_one_snapshot_is_caught_as_an_undisclosed_straddle() {
+    let store = Store::open_in_memory().unwrap();
+    let commit = |k: usize| {
+        let caller =
+            format!("from core import helper\n\n\ndef run_{k}(rows):\n    return helper(rows)\n");
+        let extractions = vec![
+            extract_file("core.py", CORE),
+            extract_file("caller.py", &caller),
+        ];
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(&extractions);
+        let resolution = resolver.resolve_all(&extractions).unwrap();
+        let analysis = devmap_analyze::analyze(&extractions, &resolution);
+        store
+            .save_generation_with_opts(
+                &extractions,
+                &resolution,
+                &analysis,
+                GenerationWriteOpts::default(),
+            )
+            .unwrap();
+    };
+    let targets = vec!["core.py::helper".to_string(), "caller.py".to_string()];
+    commit(0);
+    let first = StoreQueryEngine::new(&store)
+        .neighbors(&targets, 20_000, 0.0, 2)
+        .unwrap();
+    commit(1);
+    let second = StoreQueryEngine::new(&store)
+        .neighbors(&targets, 20_000, 0.0, 2)
+        .unwrap();
+
+    // One snapshot each: coherent, and says so by naming one generation.
+    assert_eq!(generations_named(&first), vec![0]);
+    assert_eq!(generations_named(&second), vec![1]);
+    assert!(!names_the_move(&first) && !names_the_move(&second));
+
+    // Both halves taken as one answer: two generations, nothing disclosed.
+    let torn: Vec<Neighbors> = first.into_iter().chain(second).collect();
+    assert!(
+        generations_named(&torn).len() > 1,
+        "the torn answer names one generation"
+    );
+    assert!(
+        !names_the_move(&torn),
+        "nothing disclosed the straddle, which is what the racing test counts as a failure"
     );
 }
 
