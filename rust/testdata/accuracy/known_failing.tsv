@@ -82,44 +82,14 @@ rust	rs.c02b	miss	ft-e3f7d1b1	Box<dyn> in closure | today: absent today, recorde
 rust	rs.c03	miss	ft-e3f7d1b1	generic bound T: Render | today: absent today, recorded as an honest unresolved row
 rust	rs.c04	miss	ft-f9665721	blanket impl on i32 literal | today: absent today, recorded as an honest unresolved row
 rust	rs.c07b	miss	ft-e3f7d1b1	receiver is the impl Trait return | today: absent today, recorded as an honest unresolved row
-rust	rs.c08	miss	ft-f9665721	Deref + auto-ref | today: absent today, recorded as an honest unresolved row
-rust	rs.c10a	miss	ft-f9665721	iterator chains; closure params typed by slice element | today: absent today, recorded as an honest unresolved row
-rust	rs.c10b	miss	ft-f9665721	 | today: absent today, recorded as an honest unresolved row
-rust	rs.c10c	miss	ft-f9665721	reference | today: absent today, recorded as an honest unresolved row
-rust	rs.c11b	miss	ft-f9665721	 | today: absent today, recorded as an honest unresolved row
-rust	rs.c12b	silent_miss	ft-f9665721	emit_c12 is called only in the macro body | today: no ledger row names {"emit_c12"}
-rust	rs.c15	false_edge	ft-f9665721	d.clone() on a derived Clone must not bind to Manual.clone | today: forbidden HIGH edge to ["corelib/src/lib.rs::Manual.clone"]
 rust	rs.c17e	miss	ft-e3f7d1b1	cross-crate dyn | today: absent today, recorded as an honest unresolved row
 rust	rs.c18c	miss	ft-837a6f05	 | today: absent today, recorded as an honest unresolved row
-rust	rs.c20b	miss	ft-f9665721	 | today: absent today, recorded as an honest unresolved row
 rust	rs.c24b	silent_miss	ft-f9665721	 | today: no ledger row names {"helper_c24"}
-rust	rs.c26a	silent_miss	ft-f9665721	operator/Drop/From trait use is implicit; honest miss expected | today: no ledger row names {"add"}
-rust	rs.c26b	silent_miss	ft-f9665721	operator/Drop/From trait use is implicit; honest miss expected | today: no ledger row names {"index"}
-rust	rs.c26c	silent_miss	ft-f9665721	operator/Drop/From trait use is implicit; honest miss expected | today: no ledger row names {"drop"}
-rust	rs.c26d	silent_miss	ft-f9665721	operator/Drop/From trait use is implicit; honest miss expected | today: no ledger row names {"from"}
 rust	rs.c26e	silent_miss	ft-f9665721	operator/Drop/From trait use is implicit; honest miss expected | today: no ledger row names {"from"}
 rust	rs.c27a	miss	ft-e3f7d1b1	trait default method | today: absent today, recorded as an honest unresolved row
 rust	rs.c27b	miss	ft-e3f7d1b1	self in default body | today: absent today, recorded as an honest unresolved row
-rust	rs.c31	miss	ft-f9665721	extension trait on str | today: absent today, recorded as an honest unresolved row
-rust	rs.c32b	miss	ft-f9665721	 | today: absent today, recorded as an honest unresolved row
 rust	rs.c35	miss	ft-e3f7d1b1	T::assoc fn | today: absent today, recorded as an honest unresolved row
-rust	rs.c36	miss	ft-f9665721	Rc<RefCell>/Arc<Mutex> deref | today: absent today, recorded as an honest unresolved row
-rust	rs.c37a	miss	ft-f9665721	if-let / for pattern receivers | today: absent today, recorded as an honest unresolved row
-rust	rs.c39a	silent_miss	ft-f9665721	generate_handler! commands | today: no ledger row names {"cmd_c39"}
-rust	rs.c39b	silent_miss	ft-f9665721	 | today: no ledger row names {"cmd_async_c39"}
-rust	rs.c39c	silent_miss	ft-f9665721	 | today: no ledger row names {"cmd_private_c39"}
-rust	rs.c40a	silent_miss	ft-f9665721	serde attribute fn strings | today: no ledger row names {"default_c40"}
-rust	rs.c40b	silent_miss	ft-f9665721	 | today: no ledger row names {"ser_c40"}
-rust	rs.c41a	miss	ft-f9665721	dead-code probes | today: absent today, recorded as an honest unresolved row
-rust	rs.c41b	miss	ft-f9665721	 | today: absent today, recorded as an honest unresolved row
-rust	rs.c41c	miss	ft-f9665721	 | today: absent today, recorded as an honest unresolved row
 rust	rs.c41d	miss	ft-f9665721	 | today: absent today, recorded as an honest unresolved row
-rust	rs.c41f	silent_miss	ft-f9665721	macro-body call | today: no ledger row names {"via_macro_body_c41"}
-rust	rs.c43b	false_edge	ft-f9665721	std Command::spawn must not bind to the free fn | today: forbidden HIGH edge to ["corelib/src/probes2.rs::spawn"]
-rust	rs.c45	false_edge	ft-f9665721	method call level() must not bind to the free fn | today: forbidden HIGH edge to ["corelib/src/probes2.rs::level_c45"]
-rust	rs.c45b	false_edge	ft-f9665721	 | today: HIGH edge to the wrong namesake ["corelib/src/probes2.rs::level_c45"]
-rust	rs.c46c	miss	ft-f9665721	 | today: absent today, recorded as an honest unresolved row
-rust	rs.c48b	miss	ft-f9665721	 | today: absent today, recorded as an honest unresolved row
 swift	sw.C07	silent_miss	ft-e3f7d1b1	protocol requirement dispatch from default impl | today: no ledger row names {"greet"}
 swift	sw.C07b	miss	ft-e3f7d1b1	conformer instance calls protocol-extension default | today: absent today, recorded as an honest unresolved row
 swift	sw.C17	miss	ft-e3f7d1b1	generic constrained $0 | today: absent today, recorded as an honest unresolved row

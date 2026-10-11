@@ -544,6 +544,12 @@ pub struct Resolver {
     /// binds this name. Nothing here claims to know the value's *type*, so it
     /// can never feed dispatch, and no confidently-wrong edge can come out of it.
     scope_locals: BTreeSet<(String, String, String)>,
+    /// Per Rust file, the names of the inline `mod name { … }` blocks it
+    /// declares. See `Extraction::rust_inline_modules`.
+    rust_inline_modules: BTreeMap<String, BTreeSet<String>>,
+    /// Rust type name → the type it `Deref`s to; `None` when two indexed
+    /// `impl Deref` blocks disagree about a type of that name.
+    rust_deref_targets: BTreeMap<String, Option<String>>,
     /// Slash-separated components in the deepest path this resolver indexed.
     ///
     /// The module ladders in [`Self::resolve_import_path`] walk a specifier
@@ -627,6 +633,8 @@ impl Resolver {
             swift_module_files: BTreeMap::new(),
             swift_module_symbols: BTreeMap::new(),
             scope_locals: BTreeSet::new(),
+            rust_inline_modules: BTreeMap::new(),
+            rust_deref_targets: BTreeMap::new(),
             max_indexed_path_depth: 0,
             unique_basename: BTreeMap::new(),
         }
@@ -1356,6 +1364,19 @@ impl Resolver {
         name: &str,
         binding: Option<&devmap_extract::model::LocalBinding>,
     ) -> Option<String> {
+        // `rc.borrow_mut().m()`, `m.lock().unwrap().m()`: the method the
+        // wrapper's guard hands out is the wrapped value's own, so the guard
+        // chain is typed by what the root holds.
+        if let Some(root) = Self::rust_wrapper_chain_root(name) {
+            if self.family_of_file(file) == Some(LangFamily::Rust) {
+                return self.receiver_type_for(
+                    file,
+                    scope,
+                    root,
+                    binding.filter(|b| b.name == root),
+                );
+            }
+        }
         if let Some((root, field)) = Self::one_hop_field(name) {
             let root_binding = binding.filter(|b| b.name == root);
             let owner = self
@@ -1441,6 +1462,244 @@ impl Resolver {
             // A Go package-level value is in scope in every file of its
             // package, with no import between them.
             .or_else(|| self.module_value_type(file, name))
+            // A Rust call's own value, used as a receiver: `make().run()`,
+            // `open(p)?.read()`. Last, because a name this file binds is a
+            // value and every rung above has already looked for it.
+            .or_else(|| self.rust_call_value_type(file, scope, name))
+    }
+
+    /// The method `method` of `class_type`, or — in Rust, when the type
+    /// declares no such method — of the type it `Deref`s to, through at most
+    /// [`Self::RUST_DEREF_HOPS`] hops. The type that declared it comes back
+    /// with the declaration.
+    ///
+    /// A type that declares the name itself, even ambiguously, ends the walk:
+    /// auto-deref only reaches the target when the receiver's own type has no
+    /// such method, and an ambiguity is the answer, not a reason to look
+    /// further.
+    #[allow(clippy::too_many_arguments)]
+    fn receiver_method_through_deref(
+        &self,
+        ext: &Extraction,
+        family: LangFamily,
+        scope: Option<&str>,
+        receiver: &str,
+        binding: Option<&LocalBinding>,
+        class_type: &str,
+        method: &str,
+    ) -> Option<(&(String, String), String)> {
+        let mut class_type = class_type.to_string();
+        for _ in 0..=Self::RUST_DEREF_HOPS {
+            let key = (family, class_type.clone(), method.to_string());
+            if let Some(hits) = self.type_methods.get(&key) {
+                return self
+                    .receiver_type_method(ext, scope, receiver, binding, &class_type, hits)
+                    .map(|hit| (hit, class_type));
+            }
+            if family != LangFamily::Rust {
+                return None;
+            }
+            class_type = self.rust_deref_targets.get(&class_type)?.clone()?;
+        }
+        None
+    }
+
+    /// How many `Deref` hops a method lookup follows.
+    const RUST_DEREF_HOPS: usize = 4;
+
+    /// `x` for the guard chains `x.borrow`, `x.borrow_mut`, `x.lock.unwrap`,
+    /// `x.lock.expect`, `x.read.unwrap`, `x.write.unwrap` (and `expect`) the
+    /// extractor spells a receiver `x.lock().unwrap()` as. A field that happens
+    /// to share one of those names would be read the same way, which is why the
+    /// root's type must still declare the method called on the result.
+    fn rust_wrapper_chain_root(receiver: &str) -> Option<&str> {
+        let (root, chain) = receiver.split_once('.')?;
+        matches!(
+            chain,
+            "borrow"
+                | "borrow_mut"
+                | "lock.unwrap"
+                | "lock.expect"
+                | "read.unwrap"
+                | "read.expect"
+                | "write.unwrap"
+                | "write.expect"
+        )
+        .then_some(root)
+        .filter(|root| Self::is_plain_ident(root))
+    }
+
+    /// The types a Rust literal can have, as its receiver text spells it:
+    /// a string literal is `str` (or `String` for a method both answer), a
+    /// suffixed number is its suffix, an unsuffixed one any integer (or float)
+    /// type, `true`/`false` a `bool`, a quoted character a `char`. Anything else
+    /// is no literal.
+    fn rust_literal_types(receiver: &str) -> &'static [&'static str] {
+        const INTS: &[&str] = &[
+            "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
+        ];
+        const FLOATS: &[&str] = &["f32", "f64"];
+        let text = receiver.trim();
+        if text.starts_with('"') || text.starts_with("r\"") || text.starts_with("r#") {
+            return &["str", "String"];
+        }
+        if text.starts_with('\'') {
+            return &["char"];
+        }
+        if matches!(text, "true" | "false") {
+            return &["bool"];
+        }
+        if !text.starts_with(|ch: char| ch.is_ascii_digit()) {
+            return &[];
+        }
+        for ty in INTS.iter().chain(FLOATS) {
+            if text.ends_with(ty) {
+                return std::slice::from_ref(ty);
+            }
+        }
+        if text.contains('.') || (text.contains('e') && !text.starts_with("0x")) {
+            FLOATS
+        } else {
+            INTS
+        }
+    }
+
+    /// The type of a Rust call's value spelled as a receiver.
+    ///
+    /// The extractor names a call receiver by the call's callee (`make().run()`
+    /// → `make`, `m::make().run()` → `m.make`) and keeps the text of anything
+    /// it cannot reduce (`open(p)?.read()` → `open(p)?`). None of those can be
+    /// a binding — the caller has already established that — so the written
+    /// name is a function and its declared return type, unwrapped as far as a
+    /// `?` unwraps it, is the receiver's type.
+    ///
+    /// Refuses a scope that binds the name itself, and any callee that does not
+    /// resolve to exactly one function.
+    fn rust_call_value_type(
+        &self,
+        file: &str,
+        scope: Option<&str>,
+        receiver: &str,
+    ) -> Option<String> {
+        if self.family_of_file(file)? != LangFamily::Rust {
+            return None;
+        }
+        let (callee, unwrapped) = Self::rust_call_receiver_shape(receiver)?;
+        if !callee.contains("::")
+            && scope.is_some_and(|scope| self.scope_declares_local(file, scope, &callee))
+        {
+            return None;
+        }
+        let (callee_file, callee_identity) = self.rust_called_function(file, scope, &callee)?;
+        self.rust_function_value_type(file, &callee_file, &callee_identity, unwrapped)
+    }
+
+    /// `(callee path, unwrapped)` for a receiver that can only be a call's
+    /// value: `f`, `m.f` or `a::b.f` (the extractor's callee identity, with the
+    /// module joined by `.`), or `f(..)?` / `m::f(..)?` (raw text under a `?`).
+    /// The callee comes back as a `::` path.
+    fn rust_call_receiver_shape(receiver: &str) -> Option<(String, bool)> {
+        let (body, unwrapped) = match receiver.strip_suffix('?') {
+            Some(body) => (body, true),
+            None => (receiver, false),
+        };
+        let callee = if body.ends_with(')') {
+            let mut depth = 0usize;
+            let mut open = None;
+            for (index, ch) in body.char_indices().rev() {
+                match ch {
+                    ')' => depth += 1,
+                    '(' => {
+                        depth = depth.checked_sub(1)?;
+                        if depth == 0 {
+                            open = Some(index);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            &body[..open?]
+        } else if unwrapped {
+            // `x?.m()` on a value: nothing here says it is a call.
+            return None;
+        } else {
+            body
+        };
+        let path = match callee.rsplit_once('.') {
+            Some((module, name)) if !module.contains('.') => format!("{module}::{name}"),
+            Some(_) => return None,
+            None => callee.to_string(),
+        };
+        (!path.is_empty() && path.split("::").all(Self::is_plain_ident))
+            .then_some((path, unwrapped))
+    }
+
+    /// The one Rust function a call path names: a bare name this file declares
+    /// or imports, `module::f` for a module the file's own path rules place, or
+    /// `Type::f` for the one associated function a type declares.
+    fn rust_called_function(
+        &self,
+        file: &str,
+        scope: Option<&str>,
+        path: &str,
+    ) -> Option<(String, String)> {
+        let Some((module, name)) = path.rsplit_once("::") else {
+            let found = self
+                .lookup_in_package(file, path)
+                .filter(|(found_file, found)| {
+                    self.symbol_kind_in(found_file, found) == Some(SymbolKind::Function)
+                })
+                .or_else(|| {
+                    let (target, declared) = self.import_bindings.get(file)?.get(path)?;
+                    let (target, declared) = self.declaring_site(target, declared);
+                    self.lookup_in_package(&target, &declared)
+                })?;
+            return Some(found);
+        };
+        let _ = scope;
+        if self.names_inline_modules_only(file, module) {
+            return self
+                .lookup_in_package(file, name)
+                .filter(|(found_file, found)| {
+                    self.symbol_kind_in(found_file, found) == Some(SymbolKind::Function)
+                });
+        }
+        if let RustModulePlace::Unique(module_file) = self.rust_exact_module(file, module) {
+            let (decl_file, decl_name) = self.declaring_site(&module_file, name);
+            return self
+                .lookup_in_package(&decl_file, &decl_name)
+                .filter(|(found_file, found)| {
+                    self.symbol_kind_in(found_file, found) == Some(SymbolKind::Function)
+                });
+        }
+        let owner = module.rsplit("::").next()?;
+        if owner.starts_with(|ch: char| ch.is_ascii_uppercase()) {
+            return self.unique_type_method(LangFamily::Rust, owner, name);
+        }
+        None
+    }
+
+    /// The nominal type a call to the function `(callee_file, callee)` yields
+    /// at a call site in `file`, or `None` unless it names one indexed type.
+    fn rust_function_value_type(
+        &self,
+        file: &str,
+        callee_file: &str,
+        callee: &str,
+        unwrapped: bool,
+    ) -> Option<String> {
+        let written = self
+            .return_types
+            .get(&(callee_file.to_string(), callee.to_string()))?;
+        let value = devmap_extract::rustsig::value_type(written, unwrapped)?;
+        let mut nominal = Self::admissible_nominal_type(value)?;
+        if nominal == "Self" {
+            nominal = self.declaring_type_of(callee_file, callee)?.to_string();
+        }
+        (self.unique_indexed_type(LangFamily::Rust, &nominal)
+            || self.names_one_type_in_both(file, callee_file, &nominal))
+        .then_some(nominal)
     }
 
     /// The type a Rust binding has according to a **function header** in the
@@ -1487,6 +1746,24 @@ impl Resolver {
             Some(call) => (call, true),
             None => (shape.strip_suffix("()")?, false),
         };
+        // `f()?` / `m::f()?` — a free function's value, not an associated
+        // function's. The last path segment before the name is a module (or
+        // absent) rather than a capitalised type.
+        let names_a_type = call
+            .rsplit_once("::")
+            .is_some_and(|(owner, _)| {
+                owner
+                    .rsplit("::")
+                    .next()
+                    .is_some_and(|last| last.starts_with(|ch: char| ch.is_ascii_uppercase()))
+            });
+        if !names_a_type {
+            if !call.contains("::") && scope.is_some_and(|scope| self.scope_declares_local(file, scope, call)) {
+                return None;
+            }
+            let (callee_file, callee) = self.rust_called_function(file, scope, call)?;
+            return self.rust_function_value_type(file, &callee_file, &callee, unwrapped);
+        }
         let (written_type, function) = call.split_once("::")?;
         if !Self::is_plain_ident(written_type) || !Self::is_plain_ident(function) {
             return None;
@@ -2324,6 +2601,8 @@ impl Resolver {
         self.swift_module_files.clear();
         self.swift_module_symbols.clear();
         self.scope_locals.clear();
+        self.rust_inline_modules.clear();
+        self.rust_deref_targets.clear();
         self.max_indexed_path_depth = extractions
             .iter()
             .map(|ext| ext.file_path.split('/').count())
@@ -2451,6 +2730,22 @@ impl Resolver {
             for (scope, local) in &ext.scope_locals {
                 self.scope_locals
                     .insert((ext.file_path.clone(), scope.clone(), local.clone()));
+            }
+            for (owner, target) in &ext.rust_deref_targets {
+                self.rust_deref_targets
+                    .entry(owner.clone())
+                    .and_modify(|known| {
+                        if known.as_deref() != Some(target.as_str()) {
+                            *known = None;
+                        }
+                    })
+                    .or_insert_with(|| Some(target.clone()));
+            }
+            if !ext.rust_inline_modules.is_empty() {
+                self.rust_inline_modules.insert(
+                    ext.file_path.clone(),
+                    ext.rust_inline_modules.iter().cloned().collect(),
+                );
             }
             if let Some(pkg) = ext.go_package.as_deref().filter(|pkg| !pkg.is_empty()) {
                 self.go_package_by_file
@@ -3662,7 +3957,12 @@ impl Resolver {
                 }
 
                 // Resolve calls using Resolution Ladder (SameFile -> ImportScoped -> UniqueGlobal -> AmbiguousGlobal)
-                for call in &ext.calls {
+                let explicit_calls = ext.calls.len();
+                for (call_index, call) in ext.calls.iter().chain(&ext.rust_implicit_calls).enumerate() {
+                    // An implicit call is a candidate: when no rung binds it
+                    // it is dropped, not recorded (see
+                    // `Extraction::rust_implicit_calls`).
+                    let implicit_candidate = call_index >= explicit_calls;
                     // The resolution is the *only* record of what was found:
                     // it names the target file and symbol, and
                     // `Resolution::confidence` scores it. A parallel
@@ -3728,23 +4028,47 @@ impl Resolver {
                             )
                             .filter(|_| family.admits(family))
                         {
-                            let key = (family, class_type.clone(), call.callee_name.clone());
-                            if let Some((target_f, target_symbol)) =
-                                self.type_methods.get(&key).and_then(|hits| {
-                                    self.receiver_type_method(
-                                        ext,
-                                        call.caller_symbol.as_deref(),
-                                        recv,
-                                        site_binding,
-                                        &class_type,
-                                        hits,
-                                    )
-                                })
+                            if let Some(((target_f, target_symbol), receiver_type)) = self
+                                .receiver_method_through_deref(
+                                    ext,
+                                    family,
+                                    call.caller_symbol.as_deref(),
+                                    recv,
+                                    site_binding,
+                                    &class_type,
+                                    &call.callee_name,
+                                )
                             {
                                 resolution = Some(Arc::new(Resolution::ReceiverType {
                                     target_symbol: target_symbol.clone(),
                                     target_file: target_f.clone(),
-                                    receiver_type: class_type.clone(),
+                                    receiver_type,
+                                }));
+                            }
+                        }
+                    }
+
+                    // 1a. A Rust literal receiver: `"abc".ext()`, `5u8.double()`.
+                    // The literal states its type, so the method is the one an
+                    // extension trait implements for that primitive — and only
+                    // when exactly one declaration answers across every type the
+                    // literal can be.
+                    if resolution.is_none() && family == LangFamily::Rust {
+                        if let Some(recv) = call.receiver_expr.as_deref() {
+                            let mut answers: Vec<(&(String, String), &str)> = Vec::new();
+                            for candidate in Self::rust_literal_types(recv) {
+                                let key = (family, candidate.to_string(), call.callee_name.clone());
+                                for hit in self.type_methods.get(&key).into_iter().flatten() {
+                                    answers.push((hit, candidate));
+                                }
+                            }
+                            answers.sort();
+                            answers.dedup_by(|a, b| a.0 == b.0);
+                            if let [((target_f, target_symbol), receiver_type)] = answers.as_slice() {
+                                resolution = Some(Arc::new(Resolution::ReceiverType {
+                                    target_symbol: target_symbol.clone(),
+                                    target_file: target_f.clone(),
+                                    receiver_type: receiver_type.to_string(),
                                 }));
                             }
                         }
@@ -3953,7 +4277,8 @@ impl Resolver {
                                 target_symbol: self.qualified_for(&ext.file_path, &call.callee_name), target_file: ext.file_path.clone(),
                             }));
                         } else if family == LangFamily::Rust
-                            && self.symbol_kind_in(&ext.file_path, &call.callee_name) == Some(SymbolKind::Function) {
+                            && self.symbol_kind_in(&ext.file_path, &call.callee_name) == Some(SymbolKind::Function)
+                            && !self.rust_self_is_a_value(&ext.file_path, call.caller_symbol.as_deref(), call.receiver_expr.as_deref()) {
                             // Rust reaches a **free function** through a `self`
                             // receiver, which no other family here does.
                             //
@@ -4074,6 +4399,7 @@ impl Resolver {
                                     .import_bindings
                                     .get(&ext.file_path)
                                     .is_some_and(|bindings| bindings.contains_key(recv));
+                            if !self.rust_self_is_a_value(&ext.file_path, call.caller_symbol.as_deref(), Some(recv)) {
                             if let Some(found) = self.rust_qualified_call(
                                 &ext.file_path,
                                 recv,
@@ -4081,6 +4407,7 @@ impl Resolver {
                                 bare_root_is_free,
                             ) {
                                 resolution = Some(Arc::new(found));
+                            }
                             }
                         }
                     }
@@ -4271,7 +4598,7 @@ impl Resolver {
                             }
                         }
                     }
-                    if !emitted {
+                    if !emitted && !implicit_candidate {
                         // D17 / R5: a call the ladder could not resolve is recorded,
                         // never dropped. Silence here is indistinguishable from
                         // "there was no call", which is the failure R5 forbids.
@@ -5207,6 +5534,24 @@ impl Resolver {
         if !Self::is_plain_ident(callee) {
             return None;
         }
+        // `fast_impl::gated()` beside `mod fast_impl { pub fn gated() }`: the
+        // module is this file, and its items are filed under the file's own
+        // namespace, so the path names a function this file declares. Only a
+        // module the extractor saw declared inline qualifies — a crate or a
+        // sibling file spelled the same way is not this file's function.
+        if (bare_root_is_free || !Self::is_plain_ident(receiver))
+            && self.names_inline_modules_only(file, receiver)
+        {
+            if self.symbol_kind_in(file, callee) != Some(SymbolKind::Function)
+                || !self.declared_at_file_level(file, callee)
+            {
+                return None;
+            }
+            return Some(Resolution::SameFile {
+                target_symbol: self.qualified_for(file, callee),
+                target_file: file.to_string(),
+            });
+        }
         let bare_crate = bare_root_is_free
             && Self::is_plain_ident(receiver)
             && matches!(self.rust_path_root(file, receiver), RustPathRoot::Crate(_));
@@ -5265,6 +5610,19 @@ impl Resolver {
             target_file: target_file.clone(),
             receiver_type: type_name,
         })
+    }
+
+    /// Whether every segment of the Rust path `receiver` (a leading `self::`
+    /// allowed) is an inline module `file` declares.
+    fn names_inline_modules_only(&self, file: &str, receiver: &str) -> bool {
+        let Some(modules) = self.rust_inline_modules.get(file) else {
+            return false;
+        };
+        let path = receiver.strip_prefix("self::").unwrap_or(receiver);
+        !path.is_empty()
+            && path
+                .split("::")
+                .all(|segment| Self::is_plain_ident(segment) && modules.contains(segment))
     }
 
     /// The file and name that actually declare `name` as `file` exposes it.
@@ -5397,6 +5755,27 @@ impl Resolver {
     /// matching it against this file's symbols by bare name is a guess.
     fn receiver_is_self(receiver: &str) -> bool {
         matches!(receiver, "self" | "this" | "cls" | "$this" | "me" | "Self")
+    }
+
+    /// Whether a Rust `self` receiver written inside `caller` is the method's
+    /// `self` value rather than the `self::` module path.
+    ///
+    /// The extractor reduces `self.f()` and `self::f()` to the same receiver
+    /// text, so the caller decides: only a function owned by a type can have a
+    /// `self` parameter, and there `self.f()` is a method call on a value, which
+    /// no free function can answer (`self.spawn()` inside
+    /// `impl SpawnExt for Command` is std's `Command::spawn`, not this file's
+    /// `spawn`). A free-function caller can only have written the path.
+    fn rust_self_is_a_value(
+        &self,
+        file: &str,
+        caller: Option<&str>,
+        receiver: Option<&str>,
+    ) -> bool {
+        receiver == Some("self")
+            && caller
+                .and_then(|caller| self.symbol_parents.get(&(file.to_string(), caller.to_string())))
+                .is_some_and(|parent| parent != file)
     }
 
     /// How far the supertype walk may climb.
@@ -6620,18 +6999,16 @@ impl Resolver {
             receiver,
             binding,
         ) {
-            let key = (family, class_type.clone(), name.to_string());
-            if let Some((target_file, target_symbol)) =
-                self.type_methods.get(&key).and_then(|hits| {
-                    self.receiver_type_method(
-                        ext,
-                        reference.enclosing_symbol.as_deref(),
-                        receiver,
-                        binding,
-                        &class_type,
-                        hits,
-                    )
-                })
+            if let Some(((target_file, target_symbol), receiver_type)) = self
+                .receiver_method_through_deref(
+                    ext,
+                    family,
+                    reference.enclosing_symbol.as_deref(),
+                    receiver,
+                    binding,
+                    &class_type,
+                    name,
+                )
             {
                 return Some(self.reference_edge(
                     ext,
@@ -6641,9 +7018,78 @@ impl Resolver {
                     Resolution::ReceiverType {
                         target_symbol: self.qualified_for(target_file, target_symbol),
                         target_file: target_file.clone(),
-                        receiver_type: class_type.clone(),
+                        receiver_type,
                     },
                 ));
+            }
+        }
+
+        // A Rust associated function or method named as a value by its type:
+        // `.map(Item::score)`. The receiver is the type itself, written at the
+        // use site, so there is no binding to type — the call ladder's rung 2d
+        // reads it the same way. Corroborated by this file (declared here or
+        // imported here), never by the name existing somewhere in the corpus.
+        if family == LangFamily::Rust
+            && Self::is_plain_ident(receiver)
+            && !Self::receiver_is_self(receiver)
+            && receiver.starts_with(|ch: char| ch.is_ascii_uppercase())
+            && binding.is_none()
+        {
+            let key = (family, receiver.to_string(), name.to_string());
+            if let Some((target_file, target_symbol)) = self
+                .type_methods
+                .get(&key)
+                .and_then(|hits| self.type_method_target(&ext.file_path, receiver, hits))
+            {
+                return Some(self.reference_edge(
+                    ext,
+                    target_file,
+                    target_symbol,
+                    reference,
+                    Resolution::ReceiverType {
+                        target_symbol: self.qualified_for(target_file, target_symbol),
+                        target_file: target_file.to_string(),
+                        receiver_type: receiver.to_string(),
+                    },
+                ));
+            }
+        }
+
+        // A Rust function named as a value through a module path:
+        // `commands::run` in `generate_handler![..]`, `.map(util::helper)`. The
+        // call ladder's rung 2d' places the module the same way and binds only
+        // a function in the one file that path names. A bare first segment is a
+        // module only when nothing here binds that name.
+        if family == LangFamily::Rust && !Self::receiver_is_self(receiver) {
+            let bare_root_is_free = !Self::is_plain_ident(receiver)
+                || (binding.is_none()
+                    && !self.root_is_a_value(
+                        &ext.file_path,
+                        reference
+                            .enclosing_symbol
+                            .as_deref()
+                            .unwrap_or(&ext.file_path),
+                        receiver,
+                        None,
+                    )
+                    && !self
+                        .import_bindings
+                        .get(&ext.file_path)
+                        .is_some_and(|bindings| bindings.contains_key(receiver)));
+            if bare_root_is_free {
+                if let Some(found) =
+                    self.rust_qualified_call(&ext.file_path, receiver, name, true)
+                {
+                    if let Some((target_file, target_symbol)) = found.target() {
+                        return Some(self.reference_edge(
+                            ext,
+                            target_file,
+                            target_symbol,
+                            reference,
+                            found.clone(),
+                        ));
+                    }
+                }
             }
         }
 

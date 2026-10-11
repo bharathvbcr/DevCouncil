@@ -15,9 +15,9 @@
     "present": 30
   },
   "rust": {
-    "known_failing": 43,
-    "positive_rows": 105,
-    "present": 65
+    "known_failing": 13,
+    "positive_rows": 106,
+    "present": 93
   },
   "swift": {
     "known_failing": 24,

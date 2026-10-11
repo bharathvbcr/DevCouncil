@@ -47,6 +47,7 @@ rs.c14a	C14	corelib/src/asyncs.rs::c14_caller	corelib/src/asyncs.rs::Signals.rec
 rs.c14b	C14	corelib/src/asyncs.rs::c14_caller	corelib/src/asyncs.rs::handle_c14	edge	must		
 rs.c14c	C14	corelib/src/asyncs.rs::c14_caller	corelib/src/asyncs.rs::tick_c14	edge	must		
 rs.c15	C15	corelib/src/lib.rs::c15_caller	corelib/src/lib.rs::Manual.clone	forbid	must		d.clone() on a derived Clone must not bind to Manual.clone
+rs.c15m	C15	corelib/src/lib.rs::c15m_caller	corelib/src/lib.rs::Manual.clone	edge	must		m.clone() on a manual Clone impl binds Manual.clone
 rs.c16a	C16	corelib/src/asyncs.rs::c16_caller	corelib/src/asyncs.rs::fetch_c16	edge	must		async/.await
 rs.c16b	C16	corelib/src/asyncs.rs::c16_caller	corelib/src/asyncs.rs::Client.get_c16	edge	must		
 rs.c16c	C16	corelib/src/asyncs.rs::Client.get_c16	corelib/src/asyncs.rs::fetch_c16	edge	must		

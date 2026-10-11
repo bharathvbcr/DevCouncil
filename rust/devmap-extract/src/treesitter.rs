@@ -704,6 +704,15 @@ fn extract_treesitter_before_deadline(
                         b.span.start_byte,
                     ))
                 });
+                if lang == "rust" {
+                    rust_expand_local_macros(
+                        root,
+                        source,
+                        &file_symbol_name,
+                        &mut calls,
+                        &mut references,
+                    );
+                }
                 references.sort_by(|a, b| {
                     (a.span.start_byte, a.span.end_byte, &a.name).cmp(&(
                         b.span.start_byte,
@@ -730,12 +739,26 @@ fn extract_treesitter_before_deadline(
                 crate::clonesig::stamp_declaration_hashes(&mut symbols, root, source);
                 crate::returns::stamp_return_types(&mut symbols, root, source);
 
+                let rust_implicit_calls = if lang == "rust" {
+                    rust_collect_implicit_calls(root, source, &file_symbol_name)
+                } else {
+                    Vec::new()
+                };
+                // The implicit calls name receivers the resolver types from the
+                // same site bindings an explicit call's receiver does.
+                let binding_calls: std::borrow::Cow<[ExtractedCall]> = if rust_implicit_calls.is_empty() {
+                    std::borrow::Cow::Borrowed(&calls)
+                } else {
+                    std::borrow::Cow::Owned(
+                        calls.iter().chain(&rust_implicit_calls).cloned().collect(),
+                    )
+                };
                 let local_bindings = collect_site_bindings(
                     root,
                     source,
                     lang,
                     &file_symbol_name,
-                    &calls,
+                    &binding_calls,
                     &references,
                     &imports,
                 );
@@ -763,6 +786,11 @@ fn extract_treesitter_before_deadline(
                     );
                 }
 
+                let (rust_inline_modules, rust_deref_targets) = if lang == "rust" {
+                    collect_rust_item_facts(root, source)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
                 // Bound rather than returned: the embedded-script merge below
                 // still has to run, and it mutates this value in place.
                 let mut extraction = Extraction {
@@ -793,6 +821,9 @@ fn extract_treesitter_before_deadline(
                     // reused rather than every callable's subtree being walked
                     // a second time.
                     scope_locals: collect_scope_locals(root, source, &file_symbol_name),
+                    rust_inline_modules,
+                    rust_deref_targets,
+                    rust_implicit_calls,
                     local_bindings,
                     source_code: Some(source.to_string()),
                     literals: Vec::new(),
@@ -1903,6 +1934,9 @@ fn unparsed_extraction(
         go_method_params: Vec::new(),
         go_member_names: None,
         scope_locals: Vec::new(),
+        rust_inline_modules: Vec::new(),
+        rust_deref_targets: Vec::new(),
+        rust_implicit_calls: Vec::new(),
         local_bindings: Vec::new(),
         source_code: Some(source.to_string()),
         literals: Vec::new(),
@@ -2111,6 +2145,9 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
         go_method_params: Vec::new(),
         go_member_names: None,
         scope_locals: Vec::new(),
+        rust_inline_modules: Vec::new(),
+        rust_deref_targets: Vec::new(),
+        rust_implicit_calls: Vec::new(),
         local_bindings: Vec::new(),
         source_code: Some(source.to_string()),
         literals: Vec::new(),
@@ -2772,7 +2809,20 @@ fn rust_attribute_callback_refs(
         "skip_serializing_if",
         "skip_deserializing_if",
     ];
-    let enclosing = enclosing_callable_qualified(node, source, file_symbol_name);
+    // A field's attribute belongs to the type that declares the field: the
+    // derive reads `#[serde(default = "f")]` when it expands the struct, so the
+    // struct is what uses `f`. A callable ancestor still wins.
+    let enclosing = enclosing_callable_qualified(node, source, file_symbol_name).or_else(|| {
+        let mut ancestor = bounded_parent(node);
+        while let Some(parent) = ancestor {
+            if matches!(parent.kind(), "struct_item" | "enum_item" | "union_item") {
+                return get_child_text(parent, "name", source)
+                    .map(|name| format!("{file_symbol_name}::{name}"));
+            }
+            ancestor = bounded_parent(parent);
+        }
+        None
+    });
     let mut stack = vec![node];
     while let Some(current) = stack.pop() {
         if current.kind() == "token_tree" {
@@ -4367,6 +4417,19 @@ fn extract_node(
             // list, so a declarative macro body contributes no fabricated call.
             "macro_invocation" => {
                 let caller = enclosing_callable_qualified(node, source, file_symbol_name);
+                // `tauri::generate_handler![a::cmd, cmd2]` hands each listed
+                // function to the IPC dispatcher: a use by name, with no call
+                // expression anywhere.
+                for (name, receiver_expr) in rust_handler_list(node, source) {
+                    references.push(ExtractedReference {
+                        name,
+                        kind: ReferenceKind::Name,
+                        span: span.clone(),
+                        enclosing_symbol: caller.clone(),
+                        assigned_to: None,
+                        receiver_expr,
+                    });
+                }
                 for (callee_name, receiver_expr) in rust_macro_calls(node, source, file_symbol_name)
                     .into_iter()
                     .map(|(callee_name, receiver_expr)| {
@@ -6346,7 +6409,16 @@ fn split_call_target_inner(
         // becomes the receiver, matching how `x.method()` already splits.
         "scoped_identifier" => {
             let name = get_child_text(function_node, "name", source);
-            let path = get_child_text(function_node, "path", source);
+            // `Wrapper::<u8>::new()`: the type arguments are not part of the
+            // type's name, exactly as they are not part of a callee's.
+            let path = function_node.child_by_field_name("path").map(|path| {
+                match (path.kind(), path.child_by_field_name("type")) {
+                    ("generic_type" | "generic_type_with_turbofish", Some(bare)) => {
+                        get_node_text(bare, source)
+                    }
+                    _ => get_node_text(path, source),
+                }
+            });
             match (name, path) {
                 (Some(name), path) if !name.is_empty() => (name, path),
                 _ => (get_node_text(function_node, source), None),
@@ -6507,6 +6579,287 @@ fn rust_macro_calls(
     found.sort();
     found.dedup();
     found
+}
+
+/// Most implicit calls one file records.
+const MAX_IMPLICIT_CALLS: usize = 20_000;
+
+/// The operator, index, drop and `into` calls a Rust file makes without writing
+/// one, as candidates (see `Extraction::rust_implicit_calls`).
+///
+/// Each is attached only to an operand whose type the syntax or a binding
+/// states: a constructor expression (`V(1)`, `V { .. }`, `T::new()`), a unit
+/// struct value, or a plain local (the resolver types it from its binding).
+/// Literals and casts are numbers and never qualify.
+fn rust_collect_implicit_calls(root: Node, source: &str, file_symbol_name: &str) -> Vec<ExtractedCall> {
+    let mut calls = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if walk_deadline_passed() || calls.len() >= MAX_IMPLICIT_CALLS {
+            break;
+        }
+        let candidate: Option<(&str, Option<String>)> = match node.kind() {
+            "binary_expression" | "compound_assignment_expr" => {
+                let op = node
+                    .child_by_field_name("operator")
+                    .map(|op| get_node_text(op, source));
+                let callee = match op.as_deref() {
+                    Some("+") => Some("add"),
+                    Some("-") => Some("sub"),
+                    Some("*") => Some("mul"),
+                    Some("/") => Some("div"),
+                    Some("%") => Some("rem"),
+                    Some("&") => Some("bitand"),
+                    Some("|") => Some("bitor"),
+                    Some("^") => Some("bitxor"),
+                    Some("<<") => Some("shl"),
+                    Some(">>") => Some("shr"),
+                    Some("+=") => Some("add_assign"),
+                    Some("-=") => Some("sub_assign"),
+                    Some("*=") => Some("mul_assign"),
+                    Some("/=") => Some("div_assign"),
+                    _ => None,
+                };
+                callee.map(|callee| {
+                    (
+                        callee,
+                        node.child_by_field_name("left")
+                            .and_then(|left| rust_typed_operand(left, source)),
+                    )
+                })
+            }
+            "index_expression" => Some((
+                "index",
+                node.named_child(0)
+                    .filter(|value| matches!(value.kind(), "identifier" | "field_expression"))
+                    .map(|value| receiver_identity(value, source, 0)),
+            )),
+            "let_declaration" => rust_let_implicit_call(node, source),
+            _ => None,
+        };
+        if let Some((callee, Some(receiver))) = candidate {
+            calls.push(ExtractedCall {
+                caller_symbol: enclosing_callable_qualified(node, source, file_symbol_name),
+                callee_name: callee.to_string(),
+                receiver_expr: Some(receiver),
+                span: node_span(node),
+            });
+        }
+        push_named_children(node, &mut stack);
+    }
+    calls.sort_by_key(|call| call.span.start_byte);
+    calls
+}
+
+/// The receiver text for an operand whose type is stated: see
+/// [`rust_collect_implicit_calls`].
+fn rust_typed_operand(operand: Node, source: &str) -> Option<String> {
+    match operand.kind() {
+        "parenthesized_expression" | "reference_expression" => operand
+            .child_by_field_name("value")
+            .or_else(|| operand.named_child(0))
+            .and_then(|inner| rust_typed_operand(inner, source)),
+        "identifier" => Some(get_node_text(operand, source)),
+        "struct_expression" => rust_type_name(operand.child_by_field_name("name")?, source, 0),
+        "call_expression" => {
+            let function = operand.child_by_field_name("function")?;
+            let named = match function.kind() {
+                "identifier" => get_node_text(function, source),
+                "scoped_identifier" => get_node_text(function.child_by_field_name("path")?, source)
+                    .rsplit("::")
+                    .next()?
+                    .to_string(),
+                _ => return None,
+            };
+            named
+                .starts_with(|c: char| c.is_ascii_uppercase())
+                .then(|| receiver_identity(operand, source, 0))
+        }
+        _ => None,
+    }
+}
+
+/// `drop` for `let g = <constructed value>;` and `from` for `let m: T =
+/// x.into();`.
+fn rust_let_implicit_call(node: Node, source: &str) -> Option<(&'static str, Option<String>)> {
+    let value = node.child_by_field_name("value")?;
+    if let Some(ty) = node.child_by_field_name("type") {
+        if value.kind() == "call_expression" {
+            let function = value.child_by_field_name("function")?;
+            let is_into = function.kind() == "field_expression"
+                && get_child_text(function, "field", source).as_deref() == Some("into")
+                && value
+                    .child_by_field_name("arguments")
+                    .is_some_and(|arguments| arguments.named_child_count() == 0);
+            if is_into {
+                return Some(("from", rust_type_name(ty, source, 0)));
+            }
+        }
+        return None;
+    }
+    let receiver = match value.kind() {
+        "identifier" => get_node_text(value, source)
+            .starts_with(|c: char| c.is_ascii_uppercase())
+            .then(|| get_node_text(value, source)),
+        "struct_expression" | "call_expression" => rust_typed_operand(value, source),
+        _ => None,
+    };
+    Some(("drop", receiver))
+}
+
+/// Most calls one file's `macro_rules!` expansions may add.
+const MAX_MACRO_EXPANSION_CALLS: usize = 10_000;
+
+/// Give each invocation of a `macro_rules!` macro this file defines the calls
+/// that macro's rules make.
+///
+/// `log!("x")` with `macro_rules! log { ($m:expr) => { $crate::emit($m) } }`
+/// calls `emit`, and the only place that call is written is the rule's body,
+/// which the grammar parses as a loose token tree and which belongs to no
+/// function. Read as the token stream it is (the same scan a macro argument
+/// the grammar cannot parse gets), every call on a rule's right-hand side is
+/// attributed to the callable that invokes the macro. Textual, and stated as
+/// such: a call whose callee is built from a macro variable is not a plain
+/// identifier and is not read, and a macro this file does not define (it comes
+/// from `use`, or another crate) is not expanded — that is the import
+/// resolver's question.
+///
+/// An invocation inside a macro definition is not expanded, so a macro that
+/// invokes itself cannot grow the result, and the total is bounded.
+fn rust_expand_local_macros(
+    root: Node,
+    source: &str,
+    file_symbol_name: &str,
+    calls: &mut Vec<ExtractedCall>,
+    references: &mut Vec<ExtractedReference>,
+) {
+    let mut bodies: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
+    let mut invocations = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if walk_deadline_passed() {
+            return;
+        }
+        match node.kind() {
+            "macro_definition" => {
+                if let Some(name) = get_child_text(node, "name", source) {
+                    let mut found = Vec::new();
+                    let mut cursor = node.walk();
+                    for rule in node
+                        .named_children(&mut cursor)
+                        .filter(|child| child.kind() == "macro_rule")
+                    {
+                        let Some(right) = rule.child_by_field_name("right") else {
+                            continue;
+                        };
+                        let text = get_node_text(right, source);
+                        let inner = text
+                            .strip_prefix(['(', '[', '{'])
+                            .and_then(|rest| rest.strip_suffix([')', ']', '}']))
+                            .unwrap_or(&text);
+                        // `$crate` is the defining crate's root, which is `crate`
+                        // to every caller in this file.
+                        found.extend(scan_rust_token_tree_calls(&inner.replace("$crate", "crate")));
+                    }
+                    found.sort();
+                    found.dedup();
+                    bodies.insert(name, found);
+                }
+                // The rules' own invocations are the macro's, not a caller's.
+                continue;
+            }
+            "macro_invocation" => invocations.push(node),
+            _ => {}
+        }
+        push_named_children(node, &mut stack);
+    }
+    let mut added = 0usize;
+    for node in invocations {
+        let Some(name) = node
+            .child_by_field_name("macro")
+            .map(|name| get_node_text(name, source))
+        else {
+            continue;
+        };
+        let Some(body) = bodies.get(&name) else {
+            continue;
+        };
+        let caller = enclosing_callable_qualified(node, source, file_symbol_name);
+        for (callee_name, receiver_expr) in body {
+            added += 1;
+            if added > MAX_MACRO_EXPANSION_CALLS {
+                return;
+            }
+            let receiver_expr = receiver_expr.clone();
+            let span = node_span(node);
+            references.push(extracted_reference(
+                node,
+                source,
+                file_symbol_name,
+                callee_name.clone(),
+                ReferenceKind::Call,
+                None,
+            ));
+            calls.push(ExtractedCall {
+                caller_symbol: caller.clone(),
+                callee_name: callee_name.clone(),
+                receiver_expr,
+                span,
+            });
+        }
+    }
+}
+
+/// The functions a `generate_handler![ .. ]` invocation lists, as `(name,
+/// path receiver)`: `commands::cmd` is `("cmd", Some("commands"))`, a bare `cmd`
+/// has no receiver.
+///
+/// Only that macro, matched on its last path segment (`generate_handler!` or
+/// `tauri::generate_handler!`). The list is comma separated paths, each
+/// optionally preceded by `#[cfg(..)]`; an item that is not a plain path is
+/// skipped rather than guessed at.
+fn rust_handler_list(node: Node, source: &str) -> Vec<(String, Option<String>)> {
+    let Some(macro_name) = node.child_by_field_name("macro") else {
+        return Vec::new();
+    };
+    let macro_name = get_node_text(macro_name, source);
+    if macro_name.rsplit("::").next().map(str::trim) != Some("generate_handler") {
+        return Vec::new();
+    }
+    let mut cursor = node.walk();
+    let Some(tokens) = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "token_tree")
+    else {
+        return Vec::new();
+    };
+    let text = get_node_text(tokens, source);
+    let Some(inner) = text
+        .strip_prefix(['(', '[', '{'])
+        .and_then(|rest| rest.strip_suffix([')', ']', '}']))
+    else {
+        return Vec::new();
+    };
+    let mut listed = Vec::new();
+    for item in inner.split(',') {
+        let mut item = item.trim();
+        while let Some(rest) = item.strip_prefix("#[") {
+            let Some(close) = rest.find(']') else {
+                item = "";
+                break;
+            };
+            item = rest[close + 1..].trim_start();
+        }
+        if item.is_empty() || !item.split("::").all(is_user_ident) {
+            continue;
+        }
+        let (receiver, name) = match item.rsplit_once("::") {
+            Some((receiver, name)) => (Some(receiver.to_string()), name),
+            None => (None, item),
+        };
+        listed.push((name.to_string(), receiver));
+    }
+    listed
 }
 
 /// Strip a token tree's outer delimiter pair, if it has one worth probing.
@@ -6703,7 +7056,14 @@ fn scan_rust_token_tree_calls(source: &str) -> Vec<(String, Option<String>)> {
                 pending_callee = Some(ident);
                 after_dot = false;
             } else if after_path {
-                pending_receiver = pending_callee.take();
+                // The whole path before the name, as a call written outside a
+                // macro records it: `crate::macros::emit` has the receiver
+                // `crate::macros`, not its last segment.
+                pending_receiver = match (pending_receiver.take(), pending_callee.take()) {
+                    (Some(path), Some(segment)) => Some(format!("{path}::{segment}")),
+                    (None, segment) => segment,
+                    (path, None) => path,
+                };
                 pending_callee = Some(ident);
                 after_path = false;
             } else {
@@ -7093,6 +7453,55 @@ fn rust_absorb_inline_super(node: Node, receiver: Option<String>) -> Option<Stri
         return Some(segments.join("::"));
     }
     Some(format!("self::{}", segments.join("::")))
+}
+
+/// The inline `mod name { … }` blocks and the `impl Deref for T { type Target
+/// = U; }` pairs of a Rust file, each sorted and deduplicated.
+///
+/// A `mod name;` declaration has no body and names a file, so it is not an
+/// inline module. The walk is an explicit worklist, bounded by the same
+/// deadline every other whole-tree pass here honours.
+fn collect_rust_item_facts(root: Node, source: &str) -> (Vec<String>, Vec<(String, String)>) {
+    let mut modules = BTreeSet::new();
+    let mut derefs = BTreeSet::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if walk_deadline_passed() {
+            break;
+        }
+        match node.kind() {
+            "mod_item" if node.child_by_field_name("body").is_some() => {
+                if let Some(name) = get_child_text(node, "name", source) {
+                    modules.insert(name);
+                }
+            }
+            "impl_item" => {
+                if let Some(pair) = rust_deref_impl(node, source) {
+                    derefs.insert(pair);
+                }
+            }
+            _ => {}
+        }
+        push_named_children(node, &mut stack);
+    }
+    (modules.into_iter().collect(), derefs.into_iter().collect())
+}
+
+/// `(Guard, Inner)` for `impl Deref for Guard { type Target = Inner; .. }`.
+fn rust_deref_impl(node: Node, source: &str) -> Option<(String, String)> {
+    let trait_name = get_node_text(node.child_by_field_name("trait")?, source);
+    if trait_name.rsplit("::").next()?.trim() != "Deref" {
+        return None;
+    }
+    let owner = rust_type_name(node.child_by_field_name("type")?, source, 0)?;
+    let body = node.child_by_field_name("body")?;
+    let mut cursor = body.walk();
+    let target = body
+        .named_children(&mut cursor)
+        .filter(|item| item.kind() == "type_item")
+        .find(|item| get_child_text(*item, "name", source).as_deref() == Some("Target"))?;
+    let target = rust_type_name(target.child_by_field_name("type")?, source, 0)?;
+    Some((owner, target))
 }
 
 fn rust_inline_module_depth(node: Node) -> usize {
@@ -7852,6 +8261,7 @@ fn maybe_push_name_reference(
         || is_defining_name(node)
         || is_inside_import_or_export(node)
         || is_call_callee(node)
+        || rust_macro_member_name(node, lang)
     {
         return;
     }
@@ -7905,6 +8315,23 @@ fn maybe_push_name_reference(
         // `cfg.enabled` from a bare local named `enabled`.
         receiver_expr: member_access_receiver(node, source),
     });
+}
+
+/// Whether `node` is the member name of a `recv.name` written inside a macro's
+/// token tree.
+///
+/// A macro argument is an unstructured `token_tree`, so `assert_eq!(g.level(), 1)`
+/// reaches here as the loose tokens `g` `.` `level` and a `( )` group. The
+/// identifier after the dot names something `g` owns, never a file-level item,
+/// yet as a bare `Name` it bound to the free `fn level` beside it (`References`,
+/// 1.0, `SameFile`) and kept that function alive. The method call itself is
+/// recovered, with its receiver, by `rust_macro_calls`; a field read has no
+/// graph node to reference.
+fn rust_macro_member_name(node: Node, lang: &str) -> bool {
+    lang == "rust"
+        && node.kind() == "identifier"
+        && bounded_parent(node).is_some_and(|parent| parent.kind() == "token_tree")
+        && node.prev_sibling().is_some_and(|prev| prev.kind() == ".")
 }
 
 /// Grammar keys with a language-specific arm in `extract_node`.
@@ -10044,7 +10471,32 @@ fn rust_let_bound_from_value(mut node: Node, source: &str) -> Option<String> {
 fn rust_use_is_in_same_name_initializer(node: Node, source: &str, name: &str) -> bool {
     let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
-        if is_callable_node(parent) {
+        // A closure is part of the initializer it is written in, so a *call* of
+        // the name walks through it: `let (n, f) = (1, opt.and_then(|p| f(p)))`
+        // calls the outer item `f` from inside the closure. A closure that
+        // binds the name itself (`|f| f()`) shadows it, and a name used as a
+        // value or receiver (`let w = spawn(move || w.run())`) is an earlier
+        // *local* the closure captured, not an item, so it still stops here.
+        if parent.kind() == "closure_expression" {
+            let shadowed = parent
+                .child_by_field_name("parameters")
+                .is_some_and(|parameters| rust_pattern_binds(parameters, source, name));
+            // The use is either the call node or its callee identifier,
+            // depending on which span the extractor recorded.
+            let callee_is_name = |call: Node| {
+                call.kind() == "call_expression"
+                    && call.child_by_field_name("function").is_some_and(|function| {
+                        function.kind() == "identifier" && get_node_text(function, source) == name
+                    })
+            };
+            let called = callee_is_name(node)
+                || (node.kind() == "identifier"
+                    && get_node_text(node, source) == name
+                    && bounded_parent(node).is_some_and(callee_is_name));
+            if shadowed || !called {
+                return false;
+            }
+        } else if is_callable_node(parent) {
             return false;
         }
         if matches!(parent.kind(), "let_declaration" | "let_condition") {

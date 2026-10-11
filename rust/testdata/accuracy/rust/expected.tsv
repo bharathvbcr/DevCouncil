@@ -15,7 +15,8 @@ c11_caller	parse_c11,Config.validate_c11	C11 ? propagation
 c12_caller	helper_c12,twice_c12(macro),log_c12(macro)->emit_c12	C12 macro_rules!	emit_c12 is called only in the macro body
 c13_caller	fmt_c13,calc_c13,Named.name_c13	C13 println!/assert_eq!/vec!/format! args	
 c14_caller	Signals.recv_c14,handle_c14,tick_c14	C14 tokio::select!	
-c15_caller	Manual.clone;!Manual.clone for d.clone()	C15 derive	d.clone() must not bind to Manual.clone
+c15_caller	!Manual.clone for d.clone()	C15 derive	d.clone() must not bind to Manual.clone
+c15m_caller	Manual.clone	C15 derive	m.clone() on a manual impl
 c16_caller	fetch_c16,Client.get_c16	C16 async/.await	
 Client.get_c16	fetch_c16	C16	
 c17_caller(app)	cross_c17(x2),Circle.new_c17,Circle.radius_c17	C17 cross-crate	

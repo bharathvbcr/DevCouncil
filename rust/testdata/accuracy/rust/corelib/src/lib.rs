@@ -161,11 +161,18 @@ impl Clone for Manual {
     }
 }
 
-pub fn c15_caller(d: &Derived, m: &Manual) -> u8 {
+pub fn c15_caller(d: &Derived) -> u8 {
     let d2 = d.clone(); // derived: must NOT bind to Manual::clone
-    let m2 = m.clone(); // manual impl: Manual::clone
     let d3 = Derived::default(); // derived: no user symbol
-    d2.a + m2.a + d3.a
+    d2.a + d3.a
+}
+
+// The manual impl is called from its own caller: an edge row names caller and
+// callee, so one function holding both calls could not tell a right edge from a
+// wrong one.
+pub fn c15m_caller(m: &Manual) -> u8 {
+    let m2 = m.clone(); // manual impl: Manual::clone
+    m2.a
 }
 
 // ---------------------------------------------------------------- C20 cfg / feature gated
