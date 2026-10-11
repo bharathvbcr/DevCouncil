@@ -24,11 +24,13 @@ dc-grep = { path = "../dc-grep" }
 serde_json = "1"
 
 # The BERT kernels (LayerNorm, erf-GELU, head-dim 32 attention, segment sparse
-# max) are what tessl main builds. The `feat/bert-sparse-encoder` worktree they
-# were written in is gone; this path is tessl's main checkout. Do not copy the
-# kernels into this crate.
+# max) and the safetensors loader live in tessl's src/bert.rs and
+# src/safetensors.rs. Published tessl 0.2.0 has neither, so this pins a git
+# revision that has both; it moves to a crates.io version when tessl 0.3.0 is
+# published. Do not copy the kernels into this crate, and do not use a path
+# dependency: no CI runner has a sibling tessl checkout.
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
-tessl = { path = "../../../../research/tessl" }
+tessl = { git = "https://github.com/bharathvbcr/tessl", rev = "de4747a25d7edf22d3c3f44b1991b7ef7f446651" }
 
 [lints.rust]
 unsafe_code = "forbid"

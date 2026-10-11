@@ -313,9 +313,15 @@ pub fn prepare_frame(registry: &Registry, input: &[u8]) -> Result<Vec<u8>, Strin
         return Ok(id.to_le_bytes().to_vec());
     }
     let set = Arc::new(PreparedSet {
-        patterns: patterns.into_iter().map(dc_glob::Pattern::compile).collect(),
+        patterns: patterns
+            .into_iter()
+            .map(dc_glob::Pattern::compile)
+            .collect(),
     });
-    let mut inner = registry.inner.write().unwrap_or_else(PoisonError::into_inner);
+    let mut inner = registry
+        .inner
+        .write()
+        .unwrap_or_else(PoisonError::into_inner);
     if let Some(&id) = inner.by_content.get(input) {
         return Ok(id.to_le_bytes().to_vec());
     }
@@ -610,7 +616,12 @@ mod tests {
                 let id = prepare(&reg, list);
                 let got = match_prepared_frame(&reg, &asks(name, name, &[(id, 0)]), ok).unwrap();
                 let want = match_any_frame(&any_frame(name, list), ok).unwrap();
-                assert_eq!(got, want, "name {:.20?} list {list:?}", String::from_utf8_lossy(name));
+                assert_eq!(
+                    got,
+                    want,
+                    "name {:.20?} list {list:?}",
+                    String::from_utf8_lossy(name)
+                );
             }
         }
     }
@@ -622,7 +633,11 @@ mod tests {
         let planned = prepare(&reg, &[b"Keys/*"]);
         let got = match_prepared_frame(
             &reg,
-            &asks(b"Keys/ID.PEM", b"keys/id.pem", &[(secret, 0), (secret, 1), (planned, 0), (planned, 1)]),
+            &asks(
+                b"Keys/ID.PEM",
+                b"keys/id.pem",
+                &[(secret, 0), (secret, 1), (planned, 0), (planned, 1)],
+            ),
             ok,
         )
         .unwrap();
@@ -665,17 +680,23 @@ mod tests {
     fn match_prepared_refuses_what_it_cannot_answer() {
         let reg = Registry::new();
         let id = prepare(&reg, &[b"*"]);
-        let unknown = match_prepared_frame(&reg, &asks(b"a", b"a", &[(id + 1, 0)]), ok).unwrap_err();
+        let unknown =
+            match_prepared_frame(&reg, &asks(b"a", b"a", &[(id + 1, 0)]), ok).unwrap_err();
         assert!(unknown.contains("never prepared"), "{unknown}");
         let selector = match_prepared_frame(&reg, &asks(b"a", b"a", &[(id, 2)]), ok).unwrap_err();
         assert!(selector.contains("selector"), "{selector}");
         let framed = asks(b"a", b"a", &[(id, 0), (id, 1)]);
         for cut in 0..framed.len() {
-            assert!(match_prepared_frame(&reg, &framed[..cut], ok).is_err(), "prefix of {cut} bytes");
+            assert!(
+                match_prepared_frame(&reg, &framed[..cut], ok).is_err(),
+                "prefix of {cut} bytes"
+            );
         }
         let mut long = framed.clone();
         long.push(0);
-        assert!(match_prepared_frame(&reg, &long, ok).unwrap_err().contains("does not equal"));
+        assert!(match_prepared_frame(&reg, &long, ok)
+            .unwrap_err()
+            .contains("does not equal"));
         let bad = match_prepared_frame(&reg, &asks(b"\xff", b"a", &[(id, 0)]), ok).unwrap_err();
         assert!(bad.contains("UTF-8"), "{bad}");
     }
@@ -689,7 +710,10 @@ mod tests {
         put(&mut framed, b"\xff");
         assert!(prepare_frame(&reg, &framed).unwrap_err().contains("UTF-8"));
         for cut in 0..framed.len() - 1 {
-            assert!(prepare_frame(&reg, &framed[..cut]).is_err(), "prefix of {cut} bytes");
+            assert!(
+                prepare_frame(&reg, &framed[..cut]).is_err(),
+                "prefix of {cut} bytes"
+            );
         }
         let mut over = Vec::new();
         over.extend_from_slice(&((MAX_PATTERNS + 1) as u32).to_le_bytes());

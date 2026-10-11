@@ -28,6 +28,7 @@ on:
       - ".github/actions/setup-rust/**"
       - "rust-toolchain.toml"
       - "rust/gusset-engine/**"
+      - "rust/dc-sparse-encode/**"
       - "backend/go_orchestrator/gussetfn/**"
       - "backend/go_orchestrator/policy/**"
       - "backend/go_orchestrator/fnmatch/**"
@@ -50,6 +51,7 @@ on:
       - ".github/actions/setup-rust/**"
       - "rust-toolchain.toml"
       - "rust/gusset-engine/**"
+      - "rust/dc-sparse-encode/**"
       - "backend/go_orchestrator/gussetfn/**"
       - "backend/go_orchestrator/policy/**"
       - "backend/go_orchestrator/fnmatch/**"
@@ -273,6 +275,8 @@ jobs:
           cache-dependency-path: backend/go_orchestrator/go.mod
       - name: Set up Gusset
         uses: ./.github/actions/setup-gusset
+      - name: Format the standalone gusset-engine workspace
+        run: cargo fmt --manifest-path rust/gusset-engine/Cargo.toml -- --check
       - name: Install musl-gcc
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build, inspect and self-test the static host
@@ -301,3 +305,21 @@ jobs:
             echo "::error::gusset-check passed a static build with no unwind table; it cannot see a dead panic firewall"
             exit 1
           fi
+
+  # dc-sparse-encode is a workspace of its own (tessl is Apple-silicon only and
+  # compiles Metal 4 shaders), so `cargo test --workspace` never builds it and
+  # nothing tested its fp32 oracle. This job does, on the one runner family
+  # that can. ci-test.sh prints NOT RUN, exit 0, only for a missing Metal
+  # toolchain, a pre-26 SDK or no Metal device; every other failure fails.
+  sparse-encode:
+    name: dc-sparse-encode (macos-15)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          workspaces: rust/dc-sparse-encode
+      - name: Test
+        run: bash dc-sparse-encode/ci-test.sh

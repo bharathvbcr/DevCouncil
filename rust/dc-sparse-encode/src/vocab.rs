@@ -143,7 +143,9 @@ pub fn snapshot(model_id: &str) -> Result<PathBuf, String> {
     })?;
     let hash = hash.trim();
     if hash.is_empty() || hash.contains('/') || hash.contains("..") {
-        return Err(format!("refs/main for {model_id} is not a snapshot id ({hash:?})"));
+        return Err(format!(
+            "refs/main for {model_id} is not a snapshot id ({hash:?})"
+        ));
     }
     let snap = repo.join("snapshots").join(hash);
     if !snap.join("config.json").is_file() {
@@ -168,7 +170,10 @@ pub fn read_vocab(path: &Path) -> Result<Vec<String>, String> {
     let mut seen = HashMap::<&str, usize>::new();
     for (i, token) in tokens.iter().enumerate() {
         if token.is_empty() {
-            return Err(format!("vocabulary {} has an empty token at id {i}", path.display()));
+            return Err(format!(
+                "vocabulary {} has an empty token at id {i}",
+                path.display()
+            ));
         }
         if let Some(first) = seen.insert(token.as_str(), i) {
             return Err(format!(
@@ -206,8 +211,13 @@ pub fn query_weights(idf: Option<&Path>, tokens: &[String]) -> Result<Vec<f64>, 
         return Ok(vec![1.0; tokens.len()]);
     }
     let file = File::open(path).map_err(|err| format!("idf {}: {err}", path.display()))?;
-    let table: HashMap<String, f64> = serde_json::from_reader(BufReader::new(file))
-        .map_err(|err| format!("idf {} is not a token-to-weight object: {err}", path.display()))?;
+    let table: HashMap<String, f64> =
+        serde_json::from_reader(BufReader::new(file)).map_err(|err| {
+            format!(
+                "idf {} is not a token-to-weight object: {err}",
+                path.display()
+            )
+        })?;
     let index = lookup(tokens);
     let mut weights = vec![0.0; tokens.len()];
     for (token, weight) in table {
@@ -230,12 +240,7 @@ pub fn densify(vocab: &HashMap<String, u32>) -> Result<Vec<String>, String> {
     if vocab.is_empty() {
         return Err("vocabulary is empty".into());
     }
-    let size = vocab
-        .values()
-        .copied()
-        .max()
-        .ok_or("vocabulary is empty")? as usize
-        + 1;
+    let size = vocab.values().copied().max().ok_or("vocabulary is empty")? as usize + 1;
     let mut tokens: Vec<Option<String>> = vec![None; size];
     for (token, id) in vocab {
         let slot = tokens

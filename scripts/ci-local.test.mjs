@@ -153,3 +153,50 @@ describe("rust/gusset-engine/check-pin.sh (used by rust/verify.sh)", () => {
     }
   });
 });
+
+describe("rust/dc-sparse-encode/ci-test.sh", () => {
+  const script = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "rust", "dc-sparse-encode", "ci-test.sh");
+  const run = (env) =>
+    spawnSync("bash", [script], {
+      encoding: "utf8",
+      env: { ...process.env, PATH: `/usr/bin:/bin:${process.env.PATH}`, ...env },
+    });
+  const ok = { DC_SPARSE_METAL_PROBE: "true", DC_SPARSE_SDK_VERSION: "echo 26.1", DC_SPARSE_GPU_PROBE: "echo 'Metal Support: Metal 4'" };
+
+  it("prints NOT RUN, and exits 0, when the Metal toolchain is absent", () => {
+    const r = run({ ...ok, DC_SPARSE_METAL_PROBE: "false" });
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /^NOT RUN: dc-sparse-encode tests: no Metal toolchain/m);
+  });
+
+  it("prints NOT RUN for an SDK older than 26 and for a runner with no Metal device", () => {
+    const sdk = run({ ...ok, DC_SPARSE_SDK_VERSION: "echo 15.5" });
+    assert.equal(sdk.status, 0);
+    assert.match(sdk.stdout, /NOT RUN: .*SDK 15\.5/);
+    const gpu = run({ ...ok, DC_SPARSE_GPU_PROBE: "echo 'no display'" });
+    assert.equal(gpu.status, 0);
+    assert.match(gpu.stdout, /NOT RUN: .*no Metal-capable device/);
+  });
+
+  it("fails, not NOT RUN, when the SDK version cannot be read", () => {
+    const r = run({ ...ok, DC_SPARSE_SDK_VERSION: "echo unreadable" });
+    assert.equal(r.status, 2);
+    assert.doesNotMatch(r.stdout, /NOT RUN/);
+  });
+
+  it("runs the locked tests once every probe passes, and a failure there fails", () => {
+    const fake = mkdtempSync(path.join(tmpdir(), "fake-cargo-"));
+    try {
+      writeFileSync(path.join(fake, "cargo"), '#!/bin/sh\necho "cargo $*"\nexit "${FAKE_CARGO_EXIT:-0}"\n', { mode: 0o755 });
+      const base = { ...ok, PATH: `${fake}:/usr/bin:/bin` };
+      const pass = run(base);
+      assert.equal(pass.status, 0);
+      assert.match(pass.stdout, /cargo test --locked/);
+      assert.doesNotMatch(pass.stdout, /NOT RUN/);
+      const fail = run({ ...base, FAKE_CARGO_EXIT: "101" });
+      assert.notEqual(fail.status, 0);
+    } finally {
+      rmSync(fake, { recursive: true, force: true });
+    }
+  });
+});

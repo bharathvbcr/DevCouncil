@@ -12,7 +12,7 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use dc_grep::{IndexRequest, build_index};
-use dc_sparse_encode::{document_ids, encode_repository, lookup, read_vocab, Loaded};
+use dc_sparse_encode::{Loaded, document_ids, encode_repository, lookup, read_vocab};
 
 const MODELS: &[(&str, &str)] = &[
     (
@@ -38,7 +38,8 @@ fn fixtures() -> PathBuf {
 #[test]
 fn the_tessl_forward_matches_the_torch_fixtures() {
     let tokens = read_vocab(
-        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../dc-grep/tests/fixtures/wordpiece-vocab.txt"),
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../dc-grep/tests/fixtures/wordpiece-vocab.txt"),
     )
     .unwrap();
     let vocab = lookup(&tokens);
@@ -116,7 +117,11 @@ fn the_encoder_jsonl_imports_through_dcgrep() {
         built.lexical_model.as_deref(),
         Some("opensearch-project/opensearch-neural-sparse-encoding-doc-v2-mini")
     );
-    assert_eq!(built.lexical_files, 4, "unmatched {}", built.lexical_unmatched);
+    assert_eq!(
+        built.lexical_files, 4,
+        "unmatched {}",
+        built.lexical_unmatched
+    );
     assert_eq!(built.lexical_unmatched, 0);
 }
 
@@ -156,7 +161,8 @@ fn assert_pooled(got: &[f32], want: &[f32], what: &str) {
     assert!(
         worst <= POOLED_ABS,
         "{what}: max |rust-torch| = {worst} at vocab {at} (rust {}, torch {}), bound {POOLED_ABS}",
-        got[at], want[at]
+        got[at],
+        want[at]
     );
 }
 
@@ -198,6 +204,8 @@ fn assert_hidden(
     assert!(
         worst <= HIDDEN_ABS,
         "{what}: max |hidden rust-torch| = {worst} at layer {} position {} dim {}, bound {HIDDEN_ABS}",
-        where_.0, where_.1, where_.2
+        where_.0,
+        where_.1,
+        where_.2
     );
 }

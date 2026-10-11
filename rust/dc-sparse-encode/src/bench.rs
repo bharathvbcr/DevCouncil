@@ -72,8 +72,8 @@ pub fn run(model_id: &str, files: &[std::path::PathBuf], repeats: usize) -> Resu
     let mut texts = Vec::with_capacity(files.len());
     for path in files {
         let bytes = std::fs::read(path).map_err(|err| format!("{}: {err}", path.display()))?;
-        let text = String::from_utf8(bytes)
-            .map_err(|_| format!("{} is not utf-8", path.display()))?;
+        let text =
+            String::from_utf8(bytes).map_err(|_| format!("{} is not utf-8", path.display()))?;
         texts.push(text);
     }
 
@@ -115,7 +115,9 @@ pub fn run(model_id: &str, files: &[std::path::PathBuf], repeats: usize) -> Resu
         for side in pair {
             match side {
                 Side::Rust => rust_seconds.push(time_rust(&loaded, &texts)?),
-                Side::Torch => torch_seconds.push(time_torch(&mut stdin, &mut reader, &mut child, &texts)?),
+                Side::Torch => {
+                    torch_seconds.push(time_torch(&mut stdin, &mut reader, &mut child, &texts)?)
+                }
             }
         }
     }
@@ -154,11 +156,14 @@ fn time_torch(
 ) -> Result<f64, String> {
     let blob = texts.join("\0");
     let bytes = blob.as_bytes();
-    writeln!(stdin, "ENCODE {}", bytes.len()).map_err(|err| format!("torch oracle stdin: {err}"))?;
+    writeln!(stdin, "ENCODE {}", bytes.len())
+        .map_err(|err| format!("torch oracle stdin: {err}"))?;
     stdin
         .write_all(bytes)
         .map_err(|err| format!("torch oracle stdin: {err}"))?;
-    stdin.flush().map_err(|err| format!("torch oracle stdin: {err}"))?;
+    stdin
+        .flush()
+        .map_err(|err| format!("torch oracle stdin: {err}"))?;
     let mut line = String::new();
     let read = reader
         .read_line(&mut line)

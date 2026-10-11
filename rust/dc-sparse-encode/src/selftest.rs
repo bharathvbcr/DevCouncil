@@ -51,9 +51,10 @@ pub fn self_test() -> Result<(), String> {
 
     let specials = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"];
     let drop = crate::post::special_drop(&specials.map(str::to_string).to_vec());
-    let drop_ok = drop.as_ref().ok().filter(|set| {
-        set.len() == 4 && !set.contains(&1) && set.contains(&0) && set.contains(&2)
-    });
+    let drop_ok = drop
+        .as_ref()
+        .ok()
+        .filter(|set| set.len() == 4 && !set.contains(&1) && set.contains(&0) && set.contains(&2));
     check(
         "special ids drop everything but [UNK]",
         drop_ok.is_some(),
@@ -92,7 +93,11 @@ pub fn self_test() -> Result<(), String> {
         format!("{found:?}"),
     );
     let capped = walk(&room, 1)?;
-    check("walk honours its own ceiling", capped.len() == 1, format!("{}", capped.len()));
+    check(
+        "walk honours its own ceiling",
+        capped.len() == 1,
+        format!("{}", capped.len()),
+    );
     let _ = std::fs::remove_dir_all(&room);
 
     match end_to_end() {
@@ -193,7 +198,10 @@ fn end_to_end() -> Result<(), String> {
         });
     }
     if docs.len() != 2 {
-        return Err(format!("the encoding should hold both documents, found {}", docs.len()));
+        return Err(format!(
+            "the encoding should hold both documents, found {}",
+            docs.len()
+        ));
     }
     jsonl::write_lines(&out, &header, &docs)?;
     println!("  ok    the encoding holds both documents");
@@ -215,7 +223,10 @@ fn end_to_end() -> Result<(), String> {
     }
     println!("  ok    it publishes a learned index");
     if built.lexical_model.as_deref() != Some("self-test") {
-        return Err(format!("lexical_model is {:?}, want self-test", built.lexical_model));
+        return Err(format!(
+            "lexical_model is {:?}, want self-test",
+            built.lexical_model
+        ));
     }
     println!("  ok    it attributes the weights to this producer");
     if built.lexical_files != 2 || built.lexical_unmatched != 0 {
@@ -249,7 +260,11 @@ fn end_to_end() -> Result<(), String> {
         Err(err) if err.contains("disagrees") => {
             println!("  ok    a tokenizer disagreement refuses the build");
         }
-        Err(err) => return Err(format!("a disagreement refused for the wrong reason: {err}")),
+        Err(err) => {
+            return Err(format!(
+                "a disagreement refused for the wrong reason: {err}"
+            ));
+        }
         Ok(_) => return Err("a tokenizer disagreement was accepted".into()),
     }
 

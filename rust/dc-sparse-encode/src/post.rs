@@ -196,6 +196,9 @@ mod tests {
         assert_eq!(kept.len(), MAX_TERMS_PER_DOCUMENT);
         assert!(kept.windows(2).all(|pair| pair[0].0 < pair[1].0));
         assert_eq!(kept[0].0, 10); // 0..9 rounded away or lost the cutoff
-        assert_eq!(*kept.last().unwrap(), (20_009, round4(f64::from(20_009.0 * 0.001))));
+        assert_eq!(
+            *kept.last().unwrap(),
+            (20_009, round4(f64::from(20_009.0 * 0.001)))
+        );
     }
 }
