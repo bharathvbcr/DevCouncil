@@ -597,7 +597,15 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// empty, which charges every such region against the dead-code ceiling —
 /// a lone `}` would keep a whole language out of the confident tier until
 /// the file was edited.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "81";
+///
+/// v81 records the Rust facts the receiver and path rules read (inline modules,
+/// `Deref` targets, implicit operator/drop/from candidates, `generate_handler!`
+/// lists, `macro_rules!` expansions). v82 records a Go file's declarations,
+/// local scopes and call receivers as structured facts (`go_facts`), the input
+/// of the resolver's Go type evaluator. Two lanes each stamped 81 on these
+/// different payloads; the later one is 82, so no two extractions share a
+/// version.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "82";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

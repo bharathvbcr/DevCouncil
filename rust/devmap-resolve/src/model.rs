@@ -158,6 +158,16 @@ pub enum ResolutionKind {
     /// Confidence is [`Confidence::SPECULATIVE`], excluded from default walks
     /// the same way [`Self::AmbiguousGlobal`] is.
     LanguageServerDispatch,
+    /// A call through an interface (or protocol, or trait) bound to every
+    /// in-repo type that implements the method it names.
+    ///
+    /// Each candidate is a possible runtime target — evidence from the type
+    /// system, unlike a name collision — so it earns an edge where an
+    /// [`Self::AmbiguousGlobal`] candidate does, at [`Confidence::LOW`]: inside
+    /// the default walk, below `min_rung: high`. The edge carries the interface
+    /// method as `via`. The number of candidates bounds its precision, not its
+    /// correctness: with one implementer it is a call in fact.
+    Dispatch,
     Unresolved,
     Structural,
 }
@@ -165,7 +175,7 @@ pub enum ResolutionKind {
 impl ResolutionKind {
     /// Every kind, in declaration order. What [`Self::from_label`] searches and
     /// what a table generated from the enum (the store's SQL check) iterates.
-    pub const ALL: [ResolutionKind; 10] = [
+    pub const ALL: [ResolutionKind; 11] = [
         ResolutionKind::SameFile,
         ResolutionKind::SamePackage,
         ResolutionKind::ImportScoped,
@@ -174,6 +184,7 @@ impl ResolutionKind {
         ResolutionKind::UniqueGlobal,
         ResolutionKind::AmbiguousGlobal,
         ResolutionKind::LanguageServerDispatch,
+        ResolutionKind::Dispatch,
         ResolutionKind::Unresolved,
         ResolutionKind::Structural,
     ];
@@ -203,6 +214,7 @@ impl ResolutionKind {
             | ResolutionKind::ReceiverType
             | ResolutionKind::Structural => Confidence::DETERMINISTIC,
             ResolutionKind::LanguageServer | ResolutionKind::UniqueGlobal => Confidence::HIGH,
+            ResolutionKind::Dispatch => Confidence::LOW,
             ResolutionKind::AmbiguousGlobal
             | ResolutionKind::LanguageServerDispatch
             | ResolutionKind::Unresolved => Confidence::SPECULATIVE,
@@ -221,6 +233,7 @@ impl ResolutionKind {
             ResolutionKind::UniqueGlobal => "UniqueGlobal",
             ResolutionKind::AmbiguousGlobal => "AmbiguousGlobal",
             ResolutionKind::LanguageServerDispatch => "LanguageServerDispatch",
+            ResolutionKind::Dispatch => "Dispatch",
             ResolutionKind::Unresolved => "Unresolved",
             ResolutionKind::Structural => "Structural",
         }
@@ -341,6 +354,14 @@ pub enum Resolution {
         server: String,
         server_version: String,
     },
+    /// See [`ResolutionKind::Dispatch`]. `via_*` name the interface method the
+    /// call was written against; `candidates` are the implementing methods, one
+    /// edge each.
+    Dispatch {
+        candidates: Arc<[(String, String)]>, // shared immutable (file_path, symbol_name)
+        via_file: String,
+        via_symbol: String,
+    },
     Unresolved {
         reason: String,
     },
@@ -399,6 +420,7 @@ impl Resolution {
             Resolution::UniqueGlobal { .. } => ResolutionKind::UniqueGlobal,
             Resolution::AmbiguousGlobal { .. } => ResolutionKind::AmbiguousGlobal,
             Resolution::LanguageServerDispatch { .. } => ResolutionKind::LanguageServerDispatch,
+            Resolution::Dispatch { .. } => ResolutionKind::Dispatch,
             Resolution::Unresolved { .. } => ResolutionKind::Unresolved,
             Resolution::Structural { .. } => ResolutionKind::Structural,
             // The same rung as UniqueGlobal: one declaration of the name in the
@@ -414,6 +436,21 @@ impl Resolution {
     /// the payload.
     pub fn confidence(&self) -> Confidence {
         self.kind().confidence()
+    }
+
+    /// Whether this resolution is one candidate of several rather than a
+    /// binding: an ambiguous name match, a language server's candidate set, or
+    /// an interface call with more than one implementer.
+    ///
+    /// The one owner of the question liveness and cluster passes ask before
+    /// letting an edge count as *reaching* its target. A dispatch with exactly
+    /// one implementer is a call in fact, so it is not in this set.
+    pub fn is_unproven_candidate_set(&self) -> bool {
+        match self {
+            Resolution::AmbiguousGlobal { .. } | Resolution::LanguageServerDispatch { .. } => true,
+            Resolution::Dispatch { candidates, .. } => candidates.len() > 1,
+            _ => false,
+        }
     }
 
     /// The single `(file, symbol)` this resolution names, or `None` for the two
@@ -465,6 +502,7 @@ impl Resolution {
             // Several targets, or none: neither can answer "which one".
             Resolution::AmbiguousGlobal { .. }
             | Resolution::LanguageServerDispatch { .. }
+            | Resolution::Dispatch { .. }
             | Resolution::Unresolved { .. } => None,
         }
     }
@@ -626,6 +664,17 @@ pub enum UnresolvedClass {
     /// or resolution bug. A member no symbol of the family declares is
     /// [`NoNamesake`] instead: there is no owner for inference to find.
     UninferredReceiver,
+    /// A method call whose receiver **was** typed — an indexed type, with every
+    /// package it embeds from read in full — and that type declares, embeds and
+    /// is promoted no member of that name.
+    ///
+    /// Not [`UninferredReceiver`]: that class says the receiver's type is the
+    /// unknown, which sends a reader after type inference. Here the type is
+    /// known, so the miss is about the *member* — generated code, a method added
+    /// by a build-tagged file the index did not hold, or a call the program
+    /// does not compile. Unexplained, like the three classes that may hide an
+    /// edge.
+    UnresolvedMember,
     /// A call or reference that failed every ladder rung, and **no indexed
     /// symbol that could be its target carries that name**: for a bare name,
     /// no symbol anywhere; for a member on a receiver, no symbol of the
@@ -674,6 +723,7 @@ impl UnresolvedClass {
             UnresolvedClass::LocalBinding => "local_binding",
             UnresolvedClass::External { .. } => "external",
             UnresolvedClass::UninferredReceiver => "uninferred_receiver",
+            UnresolvedClass::UnresolvedMember => "unresolved_member",
             UnresolvedClass::NoNamesake => "no_namesake",
             UnresolvedClass::ModulePath => "module_path",
             UnresolvedClass::Unresolved => "unresolved",
@@ -702,7 +752,12 @@ impl UnresolvedClass {
 
 /// The persisted [`UnresolvedClass::label`]s of the classes that are not
 /// [`UnresolvedClass::is_explained`] — the sites that may hide an edge.
-pub const UNATTRIBUTED_LABELS: &[&str] = &["local_binding", "uninferred_receiver", "unresolved"];
+pub const UNATTRIBUTED_LABELS: &[&str] = &[
+    "local_binding",
+    "uninferred_receiver",
+    "unresolved_member",
+    "unresolved",
+];
 
 #[cfg(test)]
 mod unattributed_label_tests {
@@ -720,6 +775,7 @@ mod unattributed_label_tests {
                 module: "react".into(),
             },
             UnresolvedClass::UninferredReceiver,
+            UnresolvedClass::UnresolvedMember,
             UnresolvedClass::NoNamesake,
             UnresolvedClass::ModulePath,
             UnresolvedClass::Unresolved,
@@ -733,6 +789,7 @@ mod unattributed_label_tests {
                 | UnresolvedClass::LocalBinding
                 | UnresolvedClass::External { .. }
                 | UnresolvedClass::UninferredReceiver
+                | UnresolvedClass::UnresolvedMember
                 | UnresolvedClass::NoNamesake
                 | UnresolvedClass::ModulePath
                 | UnresolvedClass::Unresolved => {}

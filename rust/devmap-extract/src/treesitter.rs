@@ -817,6 +817,8 @@ fn extract_treesitter_before_deadline(
                     go_interface_methods,
                     go_method_params,
                     go_member_names,
+                    go_facts: (lang == "go")
+                        .then(|| crate::gofacts::extract(root, source, &file_symbol_name)),
                     // After `walk_tree`, so the per-scope cache it warmed is
                     // reused rather than every callable's subtree being walked
                     // a second time.
@@ -1933,6 +1935,7 @@ fn unparsed_extraction(
         go_interface_methods: Vec::new(),
         go_method_params: Vec::new(),
         go_member_names: None,
+        go_facts: None,
         scope_locals: Vec::new(),
         rust_inline_modules: Vec::new(),
         rust_deref_targets: Vec::new(),
@@ -2144,6 +2147,7 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
         go_interface_methods: Vec::new(),
         go_method_params: Vec::new(),
         go_member_names: None,
+        go_facts: None,
         scope_locals: Vec::new(),
         rust_inline_modules: Vec::new(),
         rust_deref_targets: Vec::new(),
@@ -3276,6 +3280,10 @@ fn go_interface_method_exemptions(
         });
     }
 }
+
+/// Why a Go interface's method requirement is never a dead-code candidate.
+pub const GO_INTERFACE_REQUIREMENT_REASON: &str = "Go interface method requirement — it \
+     declares what an implementer must provide, so no caller of its own is expected";
 
 /// Why an ambient TypeScript declaration is never a dead-code candidate.
 pub const TS_AMBIENT_REASON: &str = "ambient TypeScript declaration (`declare module`, `declare \
@@ -4826,10 +4834,21 @@ fn extract_node(
                     node
                 };
                 if let Some(n) = get_child_text(node_to_check, "name", source) {
+                    let qualified_name = scoped_qualified_name(node, source, file_symbol_name, &n);
+                    // An interface is an interface, not a struct: its method
+                    // requirements are symbols a call through the interface can
+                    // name, and what a dispatch edge's `via` points at.
+                    let interface = node_to_check
+                        .child_by_field_name("type")
+                        .filter(|ty| ty.kind() == "interface_type");
                     symbols.push(ExtractedSymbol {
                         name: n.clone(),
-                        qualified_name: scoped_qualified_name(node, source, file_symbol_name, &n),
-                        kind: SymbolKind::Struct,
+                        qualified_name: qualified_name.clone(),
+                        kind: if interface.is_some() {
+                            SymbolKind::Interface
+                        } else {
+                            SymbolKind::Struct
+                        },
                         span,
                         is_exported: n.chars().next().is_some_and(|c| c.is_uppercase()),
                         docstring: None,
@@ -4839,6 +4858,36 @@ fn extract_node(
                         declaration_hash: None,
                         return_type: None,
                     });
+                    if let Some(interface) = interface {
+                        let mut cursor = interface.walk();
+                        for member in interface.named_children(&mut cursor) {
+                            if member.kind() != "method_elem" {
+                                continue;
+                            }
+                            let Some(method) = get_child_text(member, "name", source) else {
+                                continue;
+                            };
+                            let method_qualified = format!("{qualified_name}.{method}");
+                            wiring.push(WiringAnnotation {
+                                kind: WiringKind::StructuralExempt,
+                                target_symbol: method_qualified.clone(),
+                                details: GO_INTERFACE_REQUIREMENT_REASON.to_string(),
+                            });
+                            symbols.push(ExtractedSymbol {
+                                name: method.clone(),
+                                qualified_name: method_qualified,
+                                kind: SymbolKind::Method,
+                                span: node_span(member),
+                                is_exported: method.chars().next().is_some_and(|c| c.is_uppercase()),
+                                docstring: None,
+                                signature: None,
+                                parent_symbol: Some(qualified_name.clone()),
+                                body_signature: None,
+                                declaration_hash: None,
+                                return_type: None,
+                            });
+                        }
+                    }
                 }
             }
             // `const P, Q = 1, 2` declares two constants. `name` is a repeated
@@ -4901,9 +4950,21 @@ fn extract_node(
                     });
                 }
             }
-            "call_expression" | "composite_literal" => {
+            "call_expression" | "composite_literal" | "type_conversion_expression" => {
                 let callee_node = if kind == "call_expression" {
                     node.child_by_field_name("function")
+                } else if kind == "type_conversion_expression" {
+                    // `pkg.New[int](3)`: one explicit type argument followed by
+                    // value arguments parses as a conversion to the generic
+                    // *type* `pkg.New[int]`, not as a call, because `f[T](x)`
+                    // is also how a type is converted. The grammar cannot tell
+                    // them apart and neither can the extractor: it names the
+                    // callee and the resolver, which knows whether that name
+                    // is a function or a type, decides. A conversion to a
+                    // non-generic type is a plain `call_expression` already.
+                    node.child_by_field_name("type")
+                        .filter(|ty| ty.kind() == "generic_type")
+                        .and_then(|ty| ty.child_by_field_name("type"))
                 } else {
                     // `composite_literal` declares `type` as a required field
                     // (tree-sitter-go node-types.json), so this cannot be None
@@ -8064,6 +8125,12 @@ fn go_type_name(node: Node, source: &str, depth: usize) -> Option<String> {
             let text = get_node_text(node, source);
             text.rsplit('.').next().map(str::to_string)
         }),
+        // `Box[T]`, `*Box[T]`, `pkg.Box[int]`: the type arguments are not part
+        // of the type's name, so a method declared on `(b *Box[T])` is `Box`'s
+        // and a value typed `Box[int]` is a `Box`.
+        "generic_type" => node
+            .child_by_field_name("type")
+            .and_then(|inner| go_type_name(inner, source, depth + 1)),
         _ => None,
     }
 }
@@ -11840,7 +11907,10 @@ mod tests {
                 &[
                     (SymbolKind::File, "f.go", true),
                     (SymbolKind::Struct, "f.go::Client", true),
-                    (SymbolKind::Struct, "f.go::Runner", true),
+                    // An interface is an `Interface`, and each method it
+                    // requires is a symbol a call through it can name.
+                    (SymbolKind::Interface, "f.go::Runner", true),
+                    (SymbolKind::Method, "f.go::Runner.Run", true),
                     (SymbolKind::Method, "f.go::Client.Run", true),
                     (SymbolKind::Function, "f.go::New", true),
                     (SymbolKind::Function, "f.go::helper", false),

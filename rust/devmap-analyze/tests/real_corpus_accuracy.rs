@@ -842,15 +842,13 @@ fn the_scorer_measures_structure_without_labels_and_scores_labels_when_given() {
     let go = &scored["go"];
     assert_eq!(go["confident_edge_precision"]["correct"], 1);
     assert_eq!(go["recall"]["total"], 2);
+    // `Caller03` (`var s store.Store; s.PtrGet03()`) was a recorded miss until the
+    // Go type evaluator typed a `var x pkg.T`; both labelled edges are now present.
     assert_eq!(
-        go["recall"]["present"], 1,
-        "Caller03 is a known miss today: {go}"
+        go["recall"]["present"], 2,
+        "Caller03 binds through the typed receiver: {go}"
     );
-    assert_eq!(go["honest_miss"]["absent"], 1);
-    assert_eq!(
-        go["honest_miss"]["recorded"], 1,
-        "the miss is an uninferred_receiver ledger row: {go}"
-    );
+    assert_eq!(go["honest_miss"]["absent"], 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

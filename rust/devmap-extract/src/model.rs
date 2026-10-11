@@ -1561,6 +1561,12 @@ pub struct Extraction {
     /// answer: this file declares no such name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub go_member_names: Option<Vec<String>>,
+    /// Go declarations, local scopes and call receivers as structured facts, the
+    /// input the resolver's Go type evaluator reads. `None` for a non-Go file or
+    /// an extraction cached before it existed — the evaluator then abstains
+    /// rather than read absence as "no declarations".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub go_facts: Option<crate::gofacts::GoFacts>,
     /// `(qualified scope, local name)` for every value a callable binds itself:
     /// parameters, `let`/`:=`/`=` targets, loop variables, `with … as` handles.
     ///

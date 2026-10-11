@@ -58,6 +58,8 @@ fn entitled(resolution: &Resolution) -> Confidence {
         // the same rung whether the name is an identifier or a selector.
         Resolution::UniqueGlobal { .. } | Resolution::UniqueNamespaced { .. } => Confidence::HIGH,
         Resolution::LanguageServer { .. } => Confidence::HIGH,
+        // Interface dispatch: each candidate is a possible runtime target.
+        Resolution::Dispatch { .. } => Confidence::LOW,
         Resolution::AmbiguousGlobal { .. }
         | Resolution::LanguageServerDispatch { .. }
         | Resolution::Unresolved { .. } => Confidence::SPECULATIVE,

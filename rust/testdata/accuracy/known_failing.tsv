@@ -5,29 +5,6 @@
 # The set only shrinks: accuracy_fixtures.rs fails when a listed row starts passing and when
 # a passing row is not listed. Fixing a row means deleting its line (DEVMAP_ACCURACY_BLESS=1
 # does it); adding a line needs an owning card and a reason.
-go	go.C03	miss	ft-e221de3c	edge | today: absent today, recorded as an honest unresolved row
-go	go.C06	miss	ft-e221de3c	edge-or-reference | today: absent today, recorded as an honest unresolved row
-go	go.C07	miss	ft-e3f7d1b1	edge (interface method) or fan-out to FileReader.Read07+MemReader.Read07; FileReader.Read07/MemReader.Read07 must not be dead | today: absent today, recorded as an honest unresolved row
-go	go.C08a	miss	ft-e221de3c	edge (known gap ft-32522da4) | today: absent today, recorded as an honest unresolved row
-go	go.C08b	miss	ft-e221de3c	edge (known gap ft-32522da4) | today: absent today, recorded as an honest unresolved row
-go	go.C09	miss	ft-e3f7d1b1	edge (promoted from embedded interface) | today: absent today, recorded as an honest unresolved row
-go	go.C10d	miss	ft-e221de3c	edge (generic type method on bx := NewBox10[int](3)) | today: absent today, recorded as an honest unresolved row
-go	go.C10e	silent_miss	ft-e221de3c	edge (known gap: one explicit type arg) | today: no ledger row names {"NewBox10"}
-go	go.C15	miss	ft-e3f7d1b1	edge (field-typed interface receiver); SQLRepo.Find15 not dead | today: absent today, recorded as an honest unresolved row
-go	go.C16	miss	ft-e221de3c	edge (known gap: range var) | today: absent today, recorded as an honest unresolved row
-go	go.C17a	miss	ft-e221de3c	edge (type switch binding) | today: absent today, recorded as an honest unresolved row
-go	go.C17b	miss	ft-e221de3c	edge | today: absent today, recorded as an honest unresolved row
-go	go.C18	miss	ft-e221de3c	edge (errors.As var) | today: absent today, recorded as an honest unresolved row
-go	go.C20b	miss	ft-e221de3c	edge | today: absent today, recorded as an honest unresolved row
-go	go.C24a	miss	ft-e221de3c	edge (map elem of field) | today: absent today, recorded as an honest unresolved row
-go	go.C24b	miss	ft-e221de3c	edge (slice elem of param) | today: absent today, recorded as an honest unresolved row
-go	go.C26	miss	ft-e221de3c	edge (chained) | today: absent today, recorded as an honest unresolved row
-go	go.P4	miss	ft-e221de3c	edge (multi-return ctor) | today: absent today, recorded as an honest unresolved row
-go	go.P5	miss	ft-e221de3c	edge or not-dead (unexported interface dispatch) | today: absent today, recorded as an honest unresolved row
-go	go.Q1	miss	ft-e221de3c	edge (local from method-call result) | today: absent today, recorded as an honest unresolved row
-go	go.Q3	false_edge	ft-e221de3c	edge; NO self-edge Holder.Rebuild->Holder.Rebuild | today: HIGH edge to the wrong namesake ["app/svc/probes2.go::Holder.Rebuild"]
-go	go.Q3.noself	false_edge	ft-e221de3c	no self-edge | today: forbidden HIGH edge to ["app/svc/probes2.go::Holder.Rebuild"]
-go	go.Q4	false_edge	ft-e221de3c	builtin delete is not a self-call | today: forbidden HIGH edge to ["app/svc/probes2.go::cache.delete"]
 kotlin	kt.K02	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
 kotlin	kt.K05b	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
 kotlin	kt.K06	silent_miss	ft-0720fe1d	 | today: no ledger row names {"slugify"}

@@ -66,10 +66,10 @@ go.P2	P2	app/svc/probes.go::varDeclCaller	app/svc/probes.go::counter.inc	edge	mu
 go.P3a	P3a	app/svc/probes.go::goDeferMethods	app/store/store.go::Store.Close29	edge	must		edge (defer typed method)
 go.P3b	P3b	app/svc/probes.go::goDeferMethods	app/store/store.go::Store.MethodValue05	edge	must		edge (go typed method)
 go.P4	P4	app/svc/probes.go::multiReturnCaller	app/store/store.go::Store.ElemGet24	edge	must		edge (multi-return ctor)
-go.P5	P5	app/svc/probes.go::useRunner	app/svc/probes.go::fast.run	edge	must		edge or not-dead (unexported interface dispatch)
+go.P5	P5	app/svc/probes.go::useRunner	app/svc/probes.go::runner.run|app/svc/probes.go::fast.run	edge	must		edge to the interface method runner.run or dispatch to fast.run (same shape as C07: the interface method is a symbol)
 go.P10	P10	app/svc/probes.go::callbackCaller	app/store/store.go::Store.MethodValue05	edge	must		reference
 go.Q1	Q1	app/svc/probes2.go::methodReturnCaller	app/store/store.go::Store.ElemGet24	edge	must		edge (local from method-call result)
 go.Q3	Q3	app/svc/probes2.go::Holder.Rebuild	app/svc/probes2.go::Rebuild	edge	must		edge; NO self-edge Holder.Rebuild->Holder.Rebuild
 go.Q3.noself	Q3	app/svc/probes2.go::Holder.Rebuild	app/svc/probes2.go::Holder.Rebuild	forbid	must		no self-edge
 go.Q4	Q4	app/svc/probes2.go::cache.delete	app/svc/probes2.go::cache.delete	forbid	must		builtin delete is not a self-call
-go.Q5	Q5	app/svc/probes2.go::writer.clear	-	forbid	must		bytes.Buffer is external
+go.Q5	Q5	app/svc/probes2.go::writer.clear	app/svc/probes2.go::Buffer.Reset	forbid	must		bytes.Buffer is external: no HIGH edge to the in-repo namesake Buffer.Reset

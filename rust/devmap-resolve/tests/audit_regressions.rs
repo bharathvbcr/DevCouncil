@@ -64,6 +64,8 @@ fn entitled_confidence(resolution: &Resolution) -> Confidence {
         Resolution::LanguageServer { .. } => Confidence::HIGH,
         Resolution::AmbiguousGlobal { .. } => Confidence::SPECULATIVE,
         Resolution::LanguageServerDispatch { .. } => Confidence::SPECULATIVE,
+        // Interface dispatch: a type-system candidate, below every binding.
+        Resolution::Dispatch { .. } => Confidence::LOW,
         Resolution::Unresolved { .. } => Confidence::SPECULATIVE,
     }
 }
@@ -187,6 +189,7 @@ fn every_edge_confidence_matches_the_evidence_it_names() {
             Resolution::UniqueNamespaced { .. } => "UniqueNamespaced",
             Resolution::AmbiguousGlobal { .. } => "AmbiguousGlobal",
             Resolution::LanguageServerDispatch { .. } => "LanguageServerDispatch",
+            Resolution::Dispatch { .. } => "Dispatch",
             Resolution::Unresolved { .. } => "Unresolved",
             Resolution::Structural { .. } => "Structural",
         };
