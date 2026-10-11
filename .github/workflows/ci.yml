@@ -67,6 +67,12 @@ jobs:
           test -z "$(gofmt -l cmd/devcouncil)"
           go test ./cmd/devcouncil -count=1
 
+      # benchmarks/plots is its own Go module with its own tests; no other
+      # workflow ran them.
+      - name: Benchmark plots tests
+        working-directory: benchmarks/plots
+        run: go test ./... -count=1
+
       - name: Package smoke
         run: |
           npm pack --dry-run

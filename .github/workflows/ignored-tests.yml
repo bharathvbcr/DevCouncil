@@ -1,0 +1,106 @@
+name: ignored tests
+
+# Tests marked #[ignore] run nowhere by default, and `cargo test` reports them
+# as their own count rather than a pass, so they were easy to forget: six had no
+# runner at all. This workflow is that runner, weekly and by hand. Every job
+# checks its prerequisites first and FAILS when one is missing; none skips.
+#
+# Not here: devmap-resolve's real_corpus_resolution needs a checkout of the
+# MarkDev repository at a pinned commit, which this workflow cannot clone with
+# the repository's token. It stays an owner-run measurement
+# (DEVMAP_MARKDEV_ROOT; see the test's header).
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  self-contained:
+    name: soak, ledger and workbench stress
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          workspaces: rust
+      - name: Daemon storm soak (minutes-long)
+        run: cargo test --locked -p devmap-cli --test daemon_storm_soak -- --ignored --nocapture
+      - name: Ledger at four hundred thousand rows
+        run: cargo test --locked -p devmap-store --test ledger_write -- --ignored --nocapture
+      - name: Workbench search profile (100,000 tasks)
+        run: cargo test --locked -p dc-store --lib stress_search_profile -- --ignored --nocapture
+
+  browser:
+    name: tooltip inertness in a real browser
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          workspaces: rust
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+      # Playwright is installed outside the repository, at a pinned version, so
+      # no browser package enters a dependency graph this repository ships.
+      - name: Provision Playwright and Chromium
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/playwright"
+          mkdir -p "$tools"
+          npm install --prefix "$tools" --no-audit --no-fund playwright@1.55.0
+          "$tools/node_modules/.bin/playwright" install --with-deps chromium
+          browser="$(node -e "console.log(require('$tools/node_modules/playwright').chromium.executablePath())")"
+          test -x "$browser" || { echo "::error::Chromium was not installed at $browser"; exit 1; }
+          {
+            echo "DEVMAP_BROWSER_NODE=$(command -v node)"
+            echo "DEVMAP_PLAYWRIGHT_MODULE=$tools/node_modules/playwright"
+            echo "DEVMAP_BROWSER_EXECUTABLE=$browser"
+            echo "DEVMAP_TOOLTIP_FIXTURE_DIR=$RUNNER_TEMP/tooltip-fixture"
+          } >> "$GITHUB_ENV"
+      - name: Tooltip regression
+        working-directory: rust
+        run: cargo test --locked -p devmap-query --test tooltip_security -- --ignored --nocapture
+
+  claude-plugin:
+    name: emitted plugin passes `claude plugin validate --strict`
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          workspaces: rust
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+      - name: Install the claude CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global --no-audit --no-fund @anthropic-ai/claude-code
+          command -v claude || { echo "::error::the claude CLI is not on PATH after install"; exit 1; }
+          claude --version
+      - name: Validate the emitted bundle
+        working-directory: rust
+        run: cargo test --locked -p devmap-cli --test claude_integration -- --ignored --nocapture

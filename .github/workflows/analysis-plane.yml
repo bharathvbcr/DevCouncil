@@ -190,6 +190,14 @@ jobs:
         working-directory: backend/go_orchestrator
         run: go test ./... -count=1 -race
 
+      # Known vulnerabilities in the module graph this host builds with. The
+      # tool is installed at a pinned version, not `latest`.
+      - name: Vulnerability scan
+        working-directory: backend/go_orchestrator
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
       # The live-contract tests are the only check that the field names this
       # module decodes are the ones devmap emits. If they skipped, the step
       # above was green without ever having spoken to the producer, so the skip
@@ -244,3 +252,14 @@ jobs:
       - name: Test
         working-directory: backend/go_orchestrator
         run: go test ./... -count=1
+
+  # Known advisories in the Cargo.lock the kernel and the dc-* crates ship with.
+  supply-chain:
+    name: cargo advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: rust/Cargo.toml
+          command: check advisories

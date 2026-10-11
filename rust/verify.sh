@@ -13,6 +13,9 @@ for a in "$@"; do
   esac
 done
 
+# Gates that were not run, printed again at the end: "green" must not read
+# the same whether a gate ran or was skipped.
+NOT_RUN=()
 step() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 now_ns() {
   local value
@@ -98,7 +101,11 @@ fi
 step "3/9 tests"
 cargo test --workspace
 
-if [ "$QUICK" -eq 1 ]; then echo "quick mode: skipping determinism/perf/mutants"; exit 0; fi
+if [ "$QUICK" -eq 1 ]; then
+  echo "NOT RUN (quick mode): determinism, memory ceiling, growth plateau, incremental equivalence, mutation testing"
+  printf '\n\033[1mQUICK GATES GREEN; the full gate suite was NOT RUN\033[0m\n'
+  exit 0
+fi
 
 step "release worker panic recovery (executable, not test profile)"
 cargo run --release --locked -q -p devmap-serve --example worker_recovery_probe
@@ -342,7 +349,12 @@ if [ "$MUTANTS" -eq 1 ]; then
   cargo mutants -p devmap-resolve -p devmap-analyze --timeout 60 || {
     echo "Missed mutants above = tests that cannot fail. See INTEGRITY.md §Vacuous tests."; exit 1; }
 else
-  echo "skipped (pass --mutants to run)"
+  echo "NOT RUN: mutation testing (pass --mutants to run it; .github/workflows/mutants.yml runs it weekly)"
+  NOT_RUN+=("mutation testing")
 fi
 
-printf '\n\033[1mALL GATES GREEN\033[0m\n'
+if [ "${#NOT_RUN[@]}" -gt 0 ]; then
+  printf '\n\033[1mGATES GREEN, but NOT RUN: %s\033[0m\n' "${NOT_RUN[*]}"
+else
+  printf '\n\033[1mALL GATES GREEN\033[0m\n'
+fi
