@@ -89,6 +89,8 @@ mod reexported_module_surfaces;
 mod resolution_honesty;
 mod resolution_kind_is_one_owner;
 #[cfg(feature = "parse")]
+mod rust_accuracy_core;
+#[cfg(feature = "parse")]
 mod rust_module_paths;
 #[cfg(feature = "parse")]
 mod rust_qualified_path_calls;

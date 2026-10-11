@@ -1578,6 +1578,38 @@ pub struct Extraction {
     /// payload.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scope_locals: Vec<(String, String)>,
+    /// The name of every inline `mod name { … }` block a Rust file declares, at
+    /// any nesting. Sorted and deduplicated; empty for every other language.
+    ///
+    /// The extractor files an inline module's items under the file's own
+    /// namespace, so `fast_impl::gated()` written beside `mod fast_impl { pub fn
+    /// gated() }` names a function this file declares — but nothing in the
+    /// symbol table says `fast_impl` is a module of *this file* rather than a
+    /// crate or a sibling file, and binding a path by its last segment alone
+    /// would hand `tokio::spawn()` to any local `spawn`. This is the fact that
+    /// tells the two apart.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rust_inline_modules: Vec<String>,
+    /// `(type, target)` for every `impl Deref for type { type Target = target; }`
+    /// a Rust file declares, both reduced to their bare names. Sorted and
+    /// deduplicated; empty for every other language.
+    ///
+    /// A method call the receiver's own type does not declare is looked up on
+    /// the type it dereferences to — `guard.inner()` through `Deref<Target =
+    /// Inner>` — and the symbol table has no record that `Guard` derefs at all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rust_deref_targets: Vec<(String, String)>,
+    /// Calls Rust makes without writing one: `a + b` is `a.add(b)`, `t[i]` is
+    /// `t.index(i)`, `let g = Guard::new();` runs `Guard::drop` at the end of
+    /// the scope, `let m: Meters = x.into();` calls `Meters::from`. Empty for
+    /// every other language.
+    ///
+    /// Kept apart from `calls` because they are candidates, not statements: an
+    /// `a + b` on integers is the overwhelmingly common case and names no
+    /// symbol, so a candidate that binds to nothing is dropped rather than
+    /// recorded as an unresolved call. One that binds is a real edge.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rust_implicit_calls: Vec<ExtractedCall>,
     /// Locally bound names at exact call/reference start offsets. Unlike graph
     /// caller identities, these distinguish unnamed callbacks and captures.
     /// Sorted and deduplicated; persists after source text is stripped.
