@@ -37,31 +37,67 @@
 /// malformed input.
 const MAX_DEPTH: usize = 32;
 
+/// The whitespace JSON allows between tokens, and the only whitespace this
+/// store trims anywhere — validation, storage and the compare-and-swap all use
+/// this one definition. Rust's `str::trim` strips every Unicode space (a
+/// non-breaking space, a form feed), SQLite's `trim()` only U+0020 and Go's
+/// `bytes.TrimSpace` something in between; a value padded with a character one
+/// of them strips and another does not was stored, then unreadable, or could
+/// never be swapped.
+pub const JSON_WS: [char; 4] = [' ', '\t', '\n', '\r'];
+
+/// Trims JSON whitespace — and only that — from both ends.
+pub fn trim_ws(text: &str) -> &str {
+    text.trim_matches(JSON_WS)
+}
+
 /// Reports whether `text` is exactly one well-formed JSON array — no trailing
 /// bytes, no second value, nothing after the closing bracket.
 pub fn is_array(text: &str) -> bool {
     check_array(text).is_ok()
 }
 
-/// Like [`is_array`], but names what is wrong so a refusal can say why.
+/// Like [`is_array`], but names what is wrong so a refusal can say why. The
+/// bytes are validated exactly as given: padding is only legal where JSON
+/// allows it, so a caller that trimmed first with a wider definition cannot
+/// make an invalid column look valid.
 pub fn check_array(text: &str) -> Result<(), String> {
+    check_top(text, b'[')
+}
+
+/// Exactly one well-formed JSON object.
+pub fn check_object(text: &str) -> Result<(), String> {
+    check_top(text, b'{')
+}
+
+/// Exactly one well-formed JSON object or array.
+pub fn check_container(text: &str) -> Result<(), String> {
+    match text.trim_start_matches(JSON_WS).as_bytes().first() {
+        Some(b'{') => check_top(text, b'{'),
+        Some(b'[') => check_top(text, b'['),
+        Some(c) => Err(format!("it starts with {:?}, not '{{' or '['", *c as char)),
+        None => Err("it is empty".to_string()),
+    }
+}
+
+fn check_top(text: &str, open: u8) -> Result<(), String> {
     let mut scanner = Scanner {
         bytes: text.as_bytes(),
         pos: 0,
     };
     scanner.skip_ws();
-    if scanner.peek() != Some(b'[') {
+    if scanner.peek() != Some(open) {
         return Err(match scanner.peek() {
             None => "it is empty".to_string(),
-            Some(c) => format!("it starts with {:?}, not '['", c as char),
+            Some(c) => format!("it starts with {:?}, not {:?}", c as char, open as char),
         });
     }
     scanner.value(0)?;
     scanner.skip_ws();
     if scanner.pos != scanner.bytes.len() {
-        // The injection case: the array closed and something else followed.
+        // The injection case: the value closed and something else followed.
         return Err(format!(
-            "the array ends at byte {} and {} more byte(s) follow it",
+            "the value ends at byte {} and {} more byte(s) follow it",
             scanner.pos,
             scanner.bytes.len() - scanner.pos
         ));
@@ -281,6 +317,26 @@ mod tests {
             !is_array(injected),
             "the shape check's exact blind spot is still accepted"
         );
+    }
+
+    #[test]
+    fn only_json_whitespace_is_trimmed_or_tolerated() {
+        assert_eq!(trim_ws(" \t\r\n[]\n "), "[]");
+        for padded in ["\u{a0}[]", "[]\u{a0}", "\x0c[]", "[]\x0c", "\u{2003}[]"] {
+            assert_eq!(trim_ws(padded), padded, "{padded:?} was trimmed");
+            assert!(check_array(padded).is_err(), "{padded:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn object_and_container_checks_scan_the_whole_value() {
+        assert!(check_object(r#"{"a":[1,{"b":null}]}"#).is_ok());
+        assert!(check_object("{").is_err());
+        assert!(check_object("[]").is_err());
+        assert!(check_container("[]").is_ok() && check_container("{}").is_ok());
+        assert!(check_container("{").is_err());
+        assert!(check_container("1").is_err());
+        assert!(check_container(r#"[]}],"gaps":[],"x":[{"q":0"#).is_err());
     }
 
     #[test]

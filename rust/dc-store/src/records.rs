@@ -9,6 +9,20 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{Result, StoreError};
 
+/// Refuses a value bound for a column the store later embeds *raw* into its
+/// replies. A shape check (leading `{`, trailing `]`) lets text through that
+/// closes its container early and splices keys beside it; only a full scan of
+/// the grammar proves the text is one value and nothing else.
+fn require_json(
+    field: &str,
+    text: &str,
+    check: fn(&str) -> std::result::Result<(), String>,
+) -> Result<()> {
+    check(text).map_err(|why| StoreError::BadScope {
+        reason: format!("{field} is not well-formed JSON: {why}"),
+    })
+}
+
 /// Ceiling on one evidence/gaps list reply. Far past any honest task, short of
 /// a reply that would flood the Go client's `maxOutput` budget.
 pub const MAX_LIST_ROWS: usize = 10_000;
@@ -195,11 +209,11 @@ pub fn evidence_append(
             reason: "evidence type is empty".into(),
         });
     }
-    if !data_json.trim_start().starts_with('{') && !data_json.trim_start().starts_with('[') {
-        return Err(StoreError::BadScope {
-            reason: "evidence data_json must be a JSON object or array".into(),
-        });
-    }
+    require_json(
+        "evidence data_json (an object or array)",
+        data_json,
+        crate::json::check_container,
+    )?;
     conn.execute(
         "INSERT INTO evidence (type, task_id, requirement_id, acceptance_criterion_id, data_json)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -267,6 +281,11 @@ pub fn gap_upsert(conn: &Connection, gap: &GapRow) -> Result<()> {
             reason: "gap id is required".into(),
         });
     }
+    require_json(
+        "gap evidence_json (an array)",
+        &gap.evidence_json,
+        crate::json::check_array,
+    )?;
     let tx = conn.unchecked_transaction()?;
     if let Some(task_id) = gap
         .task_id
@@ -343,6 +362,13 @@ pub fn gaps_replace(conn: &Connection, task_id: &str, gaps: &[GapRow]) -> Result
         return Err(StoreError::BadScope {
             reason: "task_id is required to replace gaps".into(),
         });
+    }
+    for gap in gaps {
+        require_json(
+            "gap evidence_json (an array)",
+            &gap.evidence_json,
+            crate::json::check_array,
+        )?;
     }
     let tx = conn.unchecked_transaction()?;
 
@@ -578,6 +604,16 @@ pub fn run_record(conn: &Connection, run: &VerificationRun) -> Result<()> {
             reason: "verification run id and task_id are required".into(),
         });
     }
+    require_json(
+        "run environment_json (an object)",
+        &run.environment_json,
+        crate::json::check_object,
+    )?;
+    require_json(
+        "run commands_json (an array)",
+        &run.commands_json,
+        crate::json::check_array,
+    )?;
     conn.execute(
         "INSERT INTO verification_runs
             (id, task_id, sandbox, environment_json, commands_json, status, started_at, finished_at)
