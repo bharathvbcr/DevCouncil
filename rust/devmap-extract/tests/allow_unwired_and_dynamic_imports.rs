@@ -1,13 +1,7 @@
 //! W3.3 — the two rules the Python wiring module held and the kernel did not.
 //!
-//! `src/devcouncil/indexing/wiring.py` and `devmap-extract/src/wiring.rs`
-//! implement overlapping entry-root, test-path and exemption rules in two
-//! languages. Duplicated logic, not dead logic — five Python modules still
-//! import it — so the two can and will disagree about whether a file is an
-//! entry root.
-//!
-//! The Python side held two things the kernel lacked, and both are real
-//! false-positive protection:
+//! `devmap-extract/src/wiring.rs` ported two rules from the Python wiring
+//! module (deleted since), and both are real false-positive protection:
 //!
 //! * **`devcouncil: allow-unwired`** — an explicit author declaration that a
 //!   file is intentionally unwired. The kernel ignored it, so it reported files
@@ -29,28 +23,29 @@ fn kinds(path: &str, source: &str) -> Vec<WiringKind> {
         .collect()
 }
 
-/// The marker must be spelled the same in both implementations.
+/// The marker is a spelling the repository's own files depend on.
 ///
-/// A kernel that spells it differently ignores it — silently, and only for the
-/// files that use it, which is the hardest kind of divergence to notice.
+/// This used to compare against the Python constant in a file that is gone,
+/// printed "skipping" and passed, so it could not fail. It now pins the literal
+/// and reads a file in this repository that carries the marker. The file must
+/// exist: a checkout without it fails here rather than reporting a check that
+/// never ran.
 #[test]
-fn the_marker_is_spelled_exactly_as_python_spells_it() {
-    let python = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../src/devcouncil/indexing/wiring.py"
-    ));
-    let Ok(python) = python else {
-        // The Rust workspace is vendored on its own in some checkouts.
-        eprintln!("skipping parity check: wiring.py not present");
-        return;
-    };
-    let line = python
-        .lines()
-        .find(|line| line.starts_with("ALLOW_UNWIRED ="))
-        .expect("wiring.py defines ALLOW_UNWIRED");
+fn the_marker_is_spelled_as_the_repositorys_own_files_spell_it() {
+    assert_eq!(ALLOW_UNWIRED, "devcouncil: allow-unwired");
+    let carrier = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../backend/go_orchestrator/testsupport/childwire.go");
+    let source = std::fs::read_to_string(&carrier)
+        .unwrap_or_else(|err| panic!("{} must carry the marker: {err}", carrier.display()));
     assert!(
-        line.contains(ALLOW_UNWIRED),
-        "the kernel spells the marker {ALLOW_UNWIRED:?}, Python spells it {line:?}"
+        source.contains(&format!("// {ALLOW_UNWIRED}")),
+        "{} no longer spells the marker {ALLOW_UNWIRED:?}",
+        carrier.display()
+    );
+    assert!(
+        kinds("backend/go_orchestrator/testsupport/childwire.go", &source)
+            .contains(&WiringKind::AllowUnwired),
+        "the kernel does not read the marker the repository writes"
     );
 }
 

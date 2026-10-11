@@ -92,7 +92,6 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             "artifact_writer_security",
             "artifacts_sidecar_adversarial",
             "documentation_visibility",
-            "freshness_parity",
             "git_is_bounded_on_the_artifact_path",
             "guide_write_security",
             "host_artifact_provider",
