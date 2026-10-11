@@ -147,6 +147,29 @@ pub struct IntegrateReport {
     pub check_ok: bool,
 }
 
+impl IntegrateReport {
+    /// Every path this report says an apply has already changed on disk.
+    fn written_paths(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = self
+            .guides
+            .iter()
+            .filter(|g| g.changed())
+            .map(|g| g.path.clone())
+            .collect();
+        paths.extend(self.skills_written.iter().cloned());
+        paths.extend(
+            self.global_mcp
+                .iter()
+                .chain(&self.project_mcp)
+                .chain(&self.hooks)
+                .chain(&self.servers)
+                .filter(|m| m.changed)
+                .map(|m| m.path.clone()),
+        );
+        paths
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpMergeOutcome {
     pub path: PathBuf,
@@ -156,6 +179,14 @@ pub struct McpMergeOutcome {
 }
 
 /// Apply (or check / dry-run) DevMap host assets for one repository.
+///
+/// An apply is planned in full before it writes: every document, guide and
+/// skill destination is examined by the same code in its read-only mode, so a
+/// document that refuses (JSON with comments, an unparseable TOML, a layout the
+/// editor cannot change without loss) stops the run with nothing written. A
+/// failure after that point — a full disk, a file that changed underneath — is
+/// reported with the list of what had already been written, because the
+/// receipt of a half-applied install is the only way to put it back.
 #[allow(clippy::too_many_arguments)]
 pub fn integrate(
     host: Host,
@@ -169,6 +200,70 @@ pub fn integrate(
     dry_run: bool,
     check: bool,
 ) -> anyhow::Result<IntegrateReport> {
+    let writes = !dry_run && !check;
+    if writes {
+        integrate(
+            host,
+            project_root,
+            executable,
+            map,
+            map_rel,
+            graph_rel,
+            store_rel,
+            servers,
+            true,
+            false,
+        )
+        .context("nothing was written: the plan was refused")?;
+    }
+    let mut report = IntegrateReport::default();
+    match integrate_into(
+        host,
+        project_root,
+        executable,
+        map,
+        map_rel,
+        graph_rel,
+        store_rel,
+        servers,
+        dry_run,
+        check,
+        &mut report,
+    ) {
+        Ok(()) => Ok(report),
+        Err(err) if writes => {
+            let written = report.written_paths();
+            if written.is_empty() {
+                Err(err)
+            } else {
+                Err(err.context(format!(
+                    "apply stopped part-way; already written: {}",
+                    written
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )))
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn integrate_into(
+    host: Host,
+    project_root: &Path,
+    executable: &Path,
+    map: &Value,
+    map_rel: &str,
+    graph_rel: &str,
+    store_rel: &str,
+    servers: &[ServerSpec],
+    dry_run: bool,
+    check: bool,
+    report: &mut IntegrateReport,
+) -> anyhow::Result<()> {
     let root = project_root
         .canonicalize()
         .with_context(|| format!("project root {}", project_root.display()))?;
@@ -179,8 +274,6 @@ pub fn integrate(
     for spec in servers {
         register_server(host, &root, spec, true)?;
     }
-
-    let mut report = IntegrateReport::default();
 
     if dry_run || check {
         // Guides: compare without writing.
@@ -378,7 +471,7 @@ pub fn integrate(
         .any(|m| m.changed);
     report.check_ok = !(guides_dirty || skills_dirty || mcp_dirty || !skills_check_ok);
 
-    Ok(report)
+    Ok(())
 }
 
 fn global_mcp_paths(host: Host) -> anyhow::Result<Vec<PathBuf>> {

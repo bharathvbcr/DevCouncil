@@ -279,3 +279,45 @@ fn servers_on_stdin_are_registered_reported_and_checked() {
     std::fs::remove_dir_all(&fresh).ok();
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// A document devmap will not rewrite must stop an apply before it writes
+/// anything. A refused Cursor apply (JSONC `~/.cursor/mcp.json`) used to have
+/// already written the guides, the skills and their receipt, and then printed
+/// no receipt of any of it.
+#[test]
+fn a_refused_document_stops_an_apply_before_it_writes_anything() {
+    let root = scratch("preflight");
+    let home = scratch("preflight-home");
+    std::fs::create_dir_all(home.join(".cursor")).unwrap();
+    let jsonc = "// my servers\n{\"mcpServers\":{}}\n";
+    std::fs::write(home.join(".cursor/mcp.json"), jsonc).unwrap();
+    let root_arg = root.to_str().unwrap();
+
+    let apply = devmap(
+        &["--json", "integrate", "cursor", "--project-root", root_arg],
+        b"",
+        &home,
+    );
+    assert_ne!(apply.status, Some(0), "{}", apply.stdout);
+    assert!(
+        apply.stdout.contains("mcp.json") || apply.stderr.contains("mcp.json"),
+        "the refusal must name the file:\n{}\n{}",
+        apply.stdout,
+        apply.stderr
+    );
+    let written: Vec<_> = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(
+        written.is_empty(),
+        "a refused apply left files behind: {written:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join(".cursor/mcp.json")).unwrap(),
+        jsonc,
+        "the user's document was touched"
+    );
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
