@@ -89,3 +89,64 @@ fn a_clean_store_still_opens_and_schema_sql_is_untrusted() {
         assert_eq!(trusted, 0, "schema SQL may call side-effecting functions");
     }
 }
+
+/// The core views, as the store a fresh open builds defines them.
+fn core_views() -> Vec<(String, String)> {
+    let dir = scratch("views-source");
+    let path = dir.join("devmap.sqlite");
+    drop(Store::open(&path).expect("fresh store"));
+    let conn = rusqlite::Connection::open(&path).expect("plain connection");
+    let mut stmt = conn
+        .prepare("SELECT name, sql FROM sqlite_schema WHERE type = 'view' ORDER BY name")
+        .unwrap();
+    let views = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(!views.is_empty(), "the schema declares no views to guard");
+    views
+}
+
+/// Replaces a view's SQL in a store that otherwise opens: same name, same
+/// columns, and so the column gate reads it as the view it expects.
+fn store_with_view(label: &str, name: &str, sql: &str) -> std::path::PathBuf {
+    tampered_store(label, &format!("DROP VIEW \"{name}\"; {sql}"))
+}
+
+fn assert_view_refused(result: Result<Store>, what: &str) {
+    match result {
+        Ok(_) => panic!("{what}: a store that redefines a core view was opened"),
+        Err(error) => assert!(
+            error.to_string().contains("view"),
+            "{what}: refused, but not for the view: {error}"
+        ),
+    }
+}
+
+#[test]
+fn a_store_that_redefines_a_core_view_is_refused_by_every_open() {
+    for (name, sql) in core_views() {
+        // Same columns, no rows: the answer a reader gets is silently empty.
+        let path = store_with_view(&format!("view-{name}"), &name, &format!("{sql} LIMIT 0"));
+        assert_view_refused(Store::open(&path), &format!("{name}: open"));
+        assert_view_refused(
+            Store::open_read_only(&path),
+            &format!("{name}: open_read_only"),
+        );
+        assert!(
+            Store::open_existing(&path).is_err(),
+            "{name}: open_existing"
+        );
+    }
+}
+
+#[test]
+fn only_whitespace_differences_in_a_view_are_tolerated() {
+    for (name, sql) in core_views() {
+        let reflowed = sql.split_whitespace().collect::<Vec<_>>().join("\n  ");
+        let path = store_with_view(&format!("ws-{name}"), &name, &reflowed);
+        Store::open(&path)
+            .unwrap_or_else(|e| panic!("{name}: whitespace-only change refused: {e}"));
+    }
+}
