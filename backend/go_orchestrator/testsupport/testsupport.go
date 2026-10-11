@@ -39,6 +39,7 @@
 package testsupport
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -50,6 +51,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 )
 
 // AllowSkipEnv opts a run into skipping when a toolchain is missing.
@@ -240,9 +243,20 @@ func cargoBin(t testing.TB, crate, binary string) string {
 		}
 		defer unlock()
 
-		cmd := exec.Command("cargo", "build", "-p", crate, "--bin", binary)
+		ctx, cancel := context.WithTimeout(context.Background(), cargoBuildBound)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "cargo", "build", "-p", crate, "--bin", binary)
+		proc.ConfigureGroup(cmd)
 		cmd.Dir = crates
-		b.log, b.err = cmd.CombinedOutput()
+		log := &proc.CappedBuffer{Limit: cargoLogLimit}
+		cmd.Stdout, cmd.Stderr = log, log
+		cmd.WaitDelay = 5 * time.Second
+		runErr, timedOut := proc.RunBounded(ctx, cmd.Run)
+		if timedOut {
+			b.err = fmt.Errorf("cargo build did not return within %s", cargoBuildBound)
+			return
+		}
+		b.log, b.err = log.Bytes(), runErr
 		if b.err != nil {
 			return
 		}
@@ -260,6 +274,13 @@ func cargoBin(t testing.TB, crate, binary string) string {
 	}
 	return b.path
 }
+
+// cargoBuildBound is how long one `cargo build` of a test binary may take,
+// and cargoLogLimit how much of its output is kept for the failure message.
+const (
+	cargoBuildBound = 20 * time.Minute
+	cargoLogLimit   = 1 << 20
+)
 
 // buildLockName is the lock file guarding the build-and-copy critical section.
 const buildLockName = ".devcouncil-testbin.lock"

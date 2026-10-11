@@ -37,6 +37,9 @@ import (
 // failure being looked for and not a slow machine.
 const ChildBound = 60 * time.Second
 
+// childOutputLimit bounds what one child invocation may write to stdout.
+const childOutputLimit = 16 << 20
+
 // RunChild runs one binary to completion under ChildBound and returns its
 // stdout and exit status.
 //
@@ -61,9 +64,22 @@ func RunChild(t testing.TB, binary string, args []string, stdin string) ([]byte,
 	// does not unblock Wait while anything holds the stdout pipe.
 	cmd.WaitDelay = 2 * time.Second
 
+	// Capped during the copy, and the wait bounded so a Start that never
+	// returns is still the deadline's. A reply that does not fit is a failed
+	// test, never a truncated reply judged as the whole of it.
+	stdout := &proc.CappedBuffer{Limit: childOutputLimit}
+	cmd.Stdout = stdout
 	start := time.Now()
-	out, err := cmd.Output()
+	err, timedOut := proc.RunBounded(ctx, cmd.Run)
 	elapsed := time.Since(start)
+	if timedOut {
+		t.Fatalf("%s %v did not return within %s; a boundary call that never "+
+			"returns is a turn that never ends", filepath.Base(binary), args, ChildBound)
+	}
+	if stdout.Overflowed() {
+		t.Fatalf("%s %v wrote more than %d bytes to stdout", filepath.Base(binary), args, childOutputLimit)
+	}
+	out := stdout.Bytes()
 
 	var exitErr *exec.ExitError
 	switch {

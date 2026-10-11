@@ -257,6 +257,9 @@ func replayGetDiffCases(golden, repo string, out, errw io.Writer) int {
 // fresh temporary one, so git is resolved once with proc.LookPathOutside
 // against the working directory: a git the checkout carries on PATH is
 // refused rather than run.
+// gitOutputLimit bounds what a seeding git command may say.
+const gitOutputLimit = 64 << 10
+
 func seedRepo() (string, error) {
 	git, err := proc.LookPathOutside("git", "")
 	if err != nil {
@@ -273,8 +276,17 @@ func seedRepo() (string, error) {
 		// The deadline must reach whatever git starts, not only git.
 		proc.ConfigureGroup(cmd)
 		cmd.Dir = dir
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("git %v: %w: %s", args, err, out)
+		// Capped output and a bound that covers Start, like every other child:
+		// git's chatter is only ever read for the failure message.
+		out := &proc.CappedBuffer{Limit: gitOutputLimit}
+		cmd.Stdout, cmd.Stderr = out, out
+		cmd.WaitDelay = time.Second
+		runErr, timedOut := proc.RunBounded(ctx, cmd.Run)
+		if timedOut {
+			return fmt.Errorf("git %v: did not return within %s", args, gitBudget)
+		}
+		if runErr != nil {
+			return fmt.Errorf("git %v: %w: %s", args, runErr, out.Bytes())
 		}
 		return nil
 	}
