@@ -37,6 +37,14 @@ The environment scrub does not hide files: a command can still read
 lists and project configuration before running verification, as you would
 review CI workflow changes.
 
+The MCP host bounds each call. `devcouncil_verify_task` may run for
+`verify.CommandTimeout` plus two minutes; every other tool gets 60 seconds.
+`DEVCOUNCIL_MCP_CALL_TIMEOUT_MS` (milliseconds) replaces both, and the
+timeout reply names it. `notifications/cancelled` stops the call it names and
+its process group, a call that is cancelled is not answered, and closing stdin
+cancels every running call before the host exits. A verification cut short by
+its budget is still recorded, with its timeout gap.
+
 Installing MCP configuration does not grant universal scope enforcement.
 [Integration](coding-cli-integration.md) documents which settings and hooks
 are written; the [task loop](hero-loop.md) describes the verification contract.

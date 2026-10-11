@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,17 +14,26 @@ import (
 	"time"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/verify"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/version"
 )
 
 const (
 	maxFrameBytes     = 4 * 1024 * 1024
 	maxInFlight       = 32
+	maxBatchMembers   = 64
 	defaultCallBudget = 60 * time.Second
-	callBudgetEnv     = "DEVCOUNCIL_MCP_CALL_TIMEOUT_MS"
-	watchdogTick      = 100 * time.Millisecond
-	slotPoll          = 2 * time.Millisecond
-	maxResponseBytes  = 4 * 1024 * 1024
+	// verifyCallBudget is what devcouncil_verify_task gets unless
+	// callBudgetEnv says otherwise: one verification command may legitimately
+	// run for verify.CommandTimeout, so the call that hosts it must outlive it.
+	// The 60 s default it used to share with every other tool cut a suite short
+	// and, because the run was written on the expired context, lost its record.
+	verifyCallBudget = verify.CommandTimeout + 2*time.Minute
+	verifyToolName   = "devcouncil_verify_task"
+	callBudgetEnv    = "DEVCOUNCIL_MCP_CALL_TIMEOUT_MS"
+	slotPoll         = 2 * time.Millisecond
+	maxResponseBytes = 4 * 1024 * 1024
+	drainGrace       = 5 * time.Second
 )
 
 // Server is a hand-rolled JSON-RPC MCP stdio server.
@@ -36,20 +46,37 @@ type Server struct {
 	inFlight atomic.Int32
 	broken   atomic.Bool
 	outMu    sync.Mutex
+
+	callsMu sync.Mutex
+	calls   map[string]*call
 }
 
+// call is one request that has been accepted and not yet answered.
+type call struct {
+	cancel context.CancelFunc
+	// answered is claimed by whoever replies first: the handler, or the
+	// deadline. Exactly one reply is ever written for a call.
+	answered atomic.Bool
+	// abandoned marks a call the client cancelled, which is never answered
+	// (MCP: a receiver does not respond to a request it was told to abandon).
+	abandoned atomic.Bool
+}
+
+// rpcRequest is a request that passed validation: it has an id, a version of
+// "2.0" and a string method.
 type rpcRequest struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id"`
-	Method  string          `json:"method"`
-	Params  json.RawMessage `json:"params"`
+	ID     json.RawMessage
+	Method string
+	Params json.RawMessage
 }
 
 type rpcResponse struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id,omitempty"`
-	Result  any             `json:"result,omitempty"`
-	Error   *rpcError       `json:"error,omitempty"`
+	JSONRPC string `json:"jsonrpc"`
+	// ID is never omitted: a nil RawMessage marshals as null, which is what
+	// JSON-RPC asks for when the request's id could not be read.
+	ID     json.RawMessage `json:"id"`
+	Result any             `json:"result,omitempty"`
+	Error  *rpcError       `json:"error,omitempty"`
 }
 
 type rpcError struct {
@@ -63,19 +90,39 @@ type toolsCallParams struct {
 	Arguments map[string]any `json:"arguments"`
 }
 
-func callBudget() time.Duration {
+// budgetFromEnv reads DEVCOUNCIL_MCP_CALL_TIMEOUT_MS: milliseconds, applied to
+// every tool call when set to a positive integer.
+func budgetFromEnv() (time.Duration, bool) {
 	if raw := os.Getenv(callBudgetEnv); raw != "" {
 		var ms int64
 		if _, err := fmt.Sscanf(raw, "%d", &ms); err == nil && ms > 0 {
-			return time.Duration(ms) * time.Millisecond
+			return time.Duration(ms) * time.Millisecond, true
+		}
+	}
+	return 0, false
+}
+
+// callBudgetFor is how long a request may run before the host answers it with a
+// timeout and cancels what it started.
+func callBudgetFor(method string, params json.RawMessage) time.Duration {
+	if d, ok := budgetFromEnv(); ok {
+		return d
+	}
+	if method == "tools/call" {
+		var p struct {
+			Name string `json:"name"`
+		}
+		if json.Unmarshal(params, &p) == nil && p.Name == verifyToolName {
+			return verifyCallBudget
 		}
 	}
 	return defaultCallBudget
 }
 
-// Serve runs until stdin closes or the stdout pipe breaks.
-// Both stdin and any child stderr must be drained by the caller; this loop
-// reads stdin to EOF and never leaves a half-read frame buffering forever.
+// Serve runs until stdin closes or the stdout pipe breaks. When it stops it
+// cancels every call still running before it waits for them, so what a call
+// started (a verification command and its process group) is stopped by
+// the time Serve returns, not left behind with PPID 1.
 func (s *Server) Serve() error {
 	if s.In == nil {
 		s.In = os.Stdin
@@ -86,112 +133,340 @@ func (s *Server) Serve() error {
 	if s.Err == nil {
 		s.Err = os.Stderr
 	}
+	root, stop := context.WithCancel(context.Background())
+	defer stop()
+	finish := func(err error) error {
+		stop()
+		s.drainInFlight()
+		return err
+	}
 	reader := bufio.NewReaderSize(s.In, 64*1024)
-	pending := &sync.Map{} // id-string -> *pendingCall
-	go s.watchdog(pending)
 
 	for {
 		if s.broken.Load() {
-			s.drainInFlight()
-			return io.ErrClosedPipe
+			return finish(io.ErrClosedPipe)
 		}
 		line, err := readFrame(reader, maxFrameBytes)
 		if err == io.EOF {
-			s.drainInFlight()
-			return nil
+			return finish(nil)
 		}
 		if err != nil {
 			fmt.Fprintf(s.Err, "devcouncil-mcp: frame error: %v\n", err)
 			if err == errFrameTooLarge {
+				// The frame was discarded unread, so its id is unknowable.
+				_ = s.send(errResult(nil, -32600, err.Error()+"; the frame was discarded"))
 				continue
 			}
-			s.drainInFlight()
-			return err
+			return finish(err)
 		}
-		if len(bytes.TrimSpace(line)) == 0 {
+		frame := bytes.TrimSpace(line)
+		if len(frame) == 0 {
 			continue
 		}
-		var req rpcRequest
-		if err := json.Unmarshal(line, &req); err != nil {
-			_ = s.send(rpcResponse{
-				JSONRPC: "2.0",
-				ID:      nil,
-				Error:   &rpcError{Code: -32700, Message: "parse error"},
-			})
-			continue
-		}
-		if req.Method == "notifications/initialized" || req.Method == "notifications/cancelled" {
-			continue
-		}
-		if len(req.ID) == 0 || string(req.ID) == "null" {
-			continue // notification
-		}
-
-		for s.inFlight.Load() >= maxInFlight {
-			if s.broken.Load() {
-				return io.ErrClosedPipe
+		if frame[0] == '[' {
+			if !s.startBatch(root, frame) {
+				return finish(io.ErrClosedPipe)
 			}
-			time.Sleep(slotPoll)
+			continue
 		}
-		s.inFlight.Add(1)
-		answered := &atomic.Bool{}
-		idKey := string(req.ID)
-		deadline := time.Now().Add(callBudget())
-		pending.Store(idKey, &pendingCall{
-			deadline: deadline,
-			answered: answered,
-			timeout: rpcResponse{
-				JSONRPC: "2.0",
-				ID:      req.ID,
-				Error:   &rpcError{Code: -32000, Message: "request timed out"},
-			},
-		})
-		go func(req rpcRequest) {
-			defer s.inFlight.Add(-1)
-			defer pending.Delete(string(req.ID))
-			resp := s.handle(req)
-			if answered.CompareAndSwap(false, true) {
-				_ = s.send(resp)
-			}
-		}(req)
+		req, resp := s.decode(frame)
+		if resp != nil {
+			_ = s.send(*resp)
+			continue
+		}
+		if req != nil && !s.startCall(root, req) {
+			return finish(io.ErrClosedPipe)
+		}
 	}
 }
 
-type pendingCall struct {
-	deadline time.Time
-	answered *atomic.Bool
-	timeout  rpcResponse
+// decode validates one frame and says what to do with it. It returns a
+// request to run, or an immediate response, or neither (a notification, or a
+// frame nothing is owed for). JSON-RPC 2.0 §4: a frame with an "id" member is a
+// request and is owed exactly one response carrying that id, however wrong the
+// rest of it is; one without is a notification and is never answered.
+func (s *Server) decode(frame []byte) (*rpcRequest, *rpcResponse) {
+	if !json.Valid(frame) {
+		r := errResult(nil, -32700, "parse error")
+		return nil, &r
+	}
+	if frame[0] != '{' {
+		r := errResult(nil, -32600, "a request must be an object or a batch array")
+		return nil, &r
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(frame, &obj); err != nil {
+		r := errResult(nil, -32600, "a request must be an object or a batch array")
+		return nil, &r
+	}
+	rawID, hasID := obj["id"]
+	respond := func(code int, msg string) (*rpcRequest, *rpcResponse) {
+		if !hasID {
+			return nil, nil
+		}
+		r := errResult(rawID, code, msg)
+		return nil, &r
+	}
+	if hasID {
+		if fault := idFault(rawID); fault != "" {
+			return respond(-32600, "a request id must be a string or an integer and must not be null; this one is "+fault)
+		}
+	}
+	_, hasMethod := obj["method"]
+	if !hasMethod && (obj["result"] != nil || obj["error"] != nil) {
+		return nil, nil // a response to a request we never send
+	}
+	var version string
+	if json.Unmarshal(obj["jsonrpc"], &version) != nil || version != "2.0" {
+		return respond(-32600, `jsonrpc must be "2.0"`)
+	}
+	var method string
+	if json.Unmarshal(obj["method"], &method) != nil {
+		return respond(-32600, "request has no string 'method'")
+	}
+	params := obj["params"]
+
+	if !hasID {
+		if method == "notifications/cancelled" {
+			var p struct {
+				RequestID json.RawMessage `json:"requestId"`
+			}
+			if json.Unmarshal(params, &p) == nil && len(p.RequestID) > 0 {
+				s.cancelCall(string(compactID(p.RequestID)))
+			}
+		}
+		// Every other notification, and any request method sent without an id,
+		// is dropped: running a tool whose result cannot be returned is work
+		// nobody can see.
+		return nil, nil
+	}
+	return &rpcRequest{ID: rawID, Method: method, Params: params}, nil
 }
 
-func (s *Server) watchdog(pending *sync.Map) {
-	for {
-		time.Sleep(watchdogTick)
+// idFault says why raw is not a legal MCP request id, or "" when it is: a
+// string or an integer, never null or a fractional number.
+func idFault(raw json.RawMessage) string {
+	var v any
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if dec.Decode(&v) != nil {
+		return "unreadable"
+	}
+	switch id := v.(type) {
+	case string:
+		return ""
+	case json.Number:
+		if _, err := id.Int64(); err == nil {
+			return ""
+		}
+		return "a fractional number"
+	case nil:
+		return "null"
+	default:
+		return "not a string or an integer"
+	}
+}
+
+func compactID(raw json.RawMessage) json.RawMessage {
+	var b bytes.Buffer
+	if json.Compact(&b, raw) != nil {
+		return raw
+	}
+	return b.Bytes()
+}
+
+func (s *Server) register(key string, c *call) bool {
+	s.callsMu.Lock()
+	defer s.callsMu.Unlock()
+	if s.calls == nil {
+		s.calls = map[string]*call{}
+	}
+	if _, dup := s.calls[key]; dup {
+		return false
+	}
+	s.calls[key] = c
+	return true
+}
+
+func (s *Server) release(key string) {
+	s.callsMu.Lock()
+	delete(s.calls, key)
+	s.callsMu.Unlock()
+}
+
+// cancelCall stops the in-flight call named by a notifications/cancelled. A
+// call that already finished, or never existed, is nothing to cancel.
+func (s *Server) cancelCall(key string) {
+	s.callsMu.Lock()
+	c := s.calls[key]
+	s.callsMu.Unlock()
+	if c != nil {
+		c.abandoned.Store(true)
+		c.cancel()
+	}
+}
+
+// acquireSlot waits for room under maxInFlight, which is the host's
+// back-pressure on a client that pipelines without waiting. It reports false if
+// the output pipe broke while waiting.
+func (s *Server) acquireSlot() bool {
+	for s.inFlight.Load() >= maxInFlight {
 		if s.broken.Load() {
-			return
+			return false
 		}
-		now := time.Now()
-		pending.Range(func(key, value any) bool {
-			pc := value.(*pendingCall)
-			if now.After(pc.deadline) && pc.answered.CompareAndSwap(false, true) {
-				_ = s.send(pc.timeout)
-				pending.Delete(key)
-			}
-			return true
-		})
+		time.Sleep(slotPoll)
 	}
+	s.inFlight.Add(1)
+	return true
 }
 
+func timeoutResponse(id json.RawMessage, budget time.Duration) rpcResponse {
+	return errResult(id, -32000, fmt.Sprintf("request timed out after %s; set %s (milliseconds) to change the budget", budget, callBudgetEnv))
+}
+
+// startCall runs one request in its own goroutine under its own budget. It
+// reports false if the output pipe broke.
+func (s *Server) startCall(root context.Context, req *rpcRequest) bool {
+	key := string(compactID(req.ID))
+	budget := callBudgetFor(req.Method, req.Params)
+	ctx, cancel := context.WithTimeout(root, budget)
+	c := &call{cancel: cancel}
+	// A duplicate id is refused, not allowed to replace the call it collides
+	// with: two calls under one key would leave the first unreachable by a
+	// cancellation and let the second's cleanup erase it.
+	if !s.register(key, c) {
+		cancel()
+		_ = s.send(errResult(req.ID, -32600, "a request with this id is already in flight; ids must be unique until answered"))
+		return true
+	}
+	if !s.acquireSlot() {
+		s.release(key)
+		cancel()
+		return false
+	}
+	timer := time.AfterFunc(budget, func() {
+		if c.answered.CompareAndSwap(false, true) && !c.abandoned.Load() {
+			_ = s.send(timeoutResponse(req.ID, budget))
+		}
+		cancel()
+	})
+	go func() {
+		defer s.inFlight.Add(-1)
+		defer s.release(key)
+		defer timer.Stop()
+		defer cancel()
+		resp := s.handle(ctx, *req)
+		if c.answered.CompareAndSwap(false, true) && !c.abandoned.Load() {
+			_ = s.send(resp)
+		}
+	}()
+	return true
+}
+
+// startBatch answers a JSON-RPC batch with one array holding a response per
+// request in it (none for a notification, and nothing at all when every member
+// was one). Members run in order, sharing one deadline: the longest budget any
+// member would have had, so a batch cannot multiply the per-call bound.
+func (s *Server) startBatch(root context.Context, frame []byte) bool {
+	var items []json.RawMessage
+	if err := json.Unmarshal(frame, &items); err != nil {
+		_ = s.send(errResult(nil, -32700, "parse error"))
+		return true
+	}
+	if len(items) == 0 {
+		_ = s.send(errResult(nil, -32600, "a batch must contain at least one request"))
+		return true
+	}
+	if len(items) > maxBatchMembers {
+		_ = s.send(errResult(nil, -32600, fmt.Sprintf("a batch may hold at most %d requests; send fewer", maxBatchMembers)))
+		return true
+	}
+	if !s.acquireSlot() {
+		return false
+	}
+	go func() {
+		defer s.inFlight.Add(-1)
+		var budget time.Duration
+		type member struct {
+			req  *rpcRequest
+			resp *rpcResponse
+		}
+		members := make([]member, len(items))
+		for i, raw := range items {
+			item := bytes.TrimSpace(raw)
+			if len(item) > 0 && item[0] == '[' {
+				r := errResult(nil, -32600, "a batch member must be a request object; batches do not nest")
+				members[i].resp = &r
+				continue
+			}
+			members[i].req, members[i].resp = s.decode(item)
+			if members[i].req != nil {
+				if b := callBudgetFor(members[i].req.Method, members[i].req.Params); b > budget {
+					budget = b
+				}
+			}
+		}
+		if budget == 0 {
+			budget = defaultCallBudget
+		}
+		ctx, cancel := context.WithTimeout(root, budget)
+		defer cancel()
+		var out []rpcResponse
+		for _, m := range members {
+			switch {
+			case m.resp != nil:
+				out = append(out, *m.resp)
+			case m.req != nil:
+				if r := s.runBatchMember(ctx, m.req, budget); r != nil {
+					out = append(out, *r)
+				}
+			}
+		}
+		if len(out) > 0 {
+			s.sendBatch(out)
+		}
+	}()
+	return true
+}
+
+func (s *Server) runBatchMember(ctx context.Context, req *rpcRequest, budget time.Duration) *rpcResponse {
+	key := string(compactID(req.ID))
+	memberCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	c := &call{cancel: cancel}
+	if !s.register(key, c) {
+		r := errResult(req.ID, -32600, "a request with this id is already in flight; ids must be unique until answered")
+		return &r
+	}
+	defer s.release(key)
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		r := timeoutResponse(req.ID, budget)
+		return &r
+	}
+	resp := s.handle(memberCtx, *req)
+	if c.abandoned.Load() {
+		return nil
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) && resp.Error == nil {
+		// The shared deadline passed while this member ran; what it returned
+		// is a partial answer, so it is reported as the timeout it was.
+		r := timeoutResponse(req.ID, budget)
+		return &r
+	}
+	return &resp
+}
+
+// drainInFlight waits, bounded, for the calls cancelled at shutdown to finish
+// unwinding: their runners kill the process group they started before they
+// return.
 func (s *Server) drainInFlight() {
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(drainGrace)
 	for s.inFlight.Load() > 0 && time.Now().Before(deadline) {
 		time.Sleep(slotPoll)
 	}
 }
 
 func (s *Server) send(resp rpcResponse) bool {
-	if s.broken.Load() {
-		return false
-	}
 	data, err := json.Marshal(resp)
 	if err != nil {
 		data = []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"response could not be serialized"}}`)
@@ -211,6 +486,23 @@ func (s *Server) send(resp rpcResponse) bool {
 		}
 		data, _ = json.Marshal(trunc)
 	}
+	return s.write(data)
+}
+
+// sendBatch writes a batch answer. One that passes the response cap is refused
+// whole: a cut array would silently drop answers its client is waiting for.
+func (s *Server) sendBatch(out []rpcResponse) bool {
+	data, err := json.Marshal(out)
+	if err != nil || len(data) > maxResponseBytes {
+		return s.send(errResult(nil, -32603, fmt.Sprintf("this batch's answers passed %d bytes; send fewer requests per batch", maxResponseBytes)))
+	}
+	return s.write(data)
+}
+
+func (s *Server) write(data []byte) bool {
+	if s.broken.Load() {
+		return false
+	}
 	s.outMu.Lock()
 	defer s.outMu.Unlock()
 	if _, err := s.Out.Write(append(data, '\n')); err != nil {
@@ -220,7 +512,7 @@ func (s *Server) send(resp rpcResponse) bool {
 	return true
 }
 
-func (s *Server) handle(req rpcRequest) rpcResponse {
+func (s *Server) handle(ctx context.Context, req rpcRequest) rpcResponse {
 	switch req.Method {
 	case "initialize":
 		return okResult(req.ID, map[string]any{
@@ -231,12 +523,14 @@ func (s *Server) handle(req rpcRequest) rpcResponse {
 			// 0.1.0 from the first release through 0.2.3.
 			"serverInfo": map[string]any{"name": "devcouncil", "version": version.Version},
 		})
-	case "ping":
+	case "ping", "notifications/initialized", "notifications/cancelled", "notifications/roots/list_changed":
+		// A notification method that arrives with an id is a request, and a
+		// request is owed a response; the empty result is devmap's answer too.
 		return okResult(req.ID, map[string]any{})
 	case "tools/list":
 		return okResult(req.ID, s.listTools())
 	case "tools/call":
-		return s.callTool(req)
+		return s.callTool(ctx, req)
 	default:
 		return errResult(req.ID, -32601, "method not found")
 	}
@@ -258,7 +552,7 @@ func (s *Server) listTools() map[string]any {
 	return map[string]any{"tools": tools}
 }
 
-func (s *Server) callTool(req rpcRequest) rpcResponse {
+func (s *Server) callTool(ctx context.Context, req rpcRequest) rpcResponse {
 	var params toolsCallParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		return errResult(req.ID, -32602, "invalid params")
@@ -266,8 +560,6 @@ func (s *Server) callTool(req rpcRequest) rpcResponse {
 	if params.Arguments == nil {
 		params.Arguments = map[string]any{}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), callBudget())
-	defer cancel()
 	payload, err := s.Registry.Call(ctx, params.Name, params.Arguments)
 	if err != nil {
 		return okResult(req.ID, map[string]any{

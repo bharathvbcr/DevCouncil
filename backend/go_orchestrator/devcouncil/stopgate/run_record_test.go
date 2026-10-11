@@ -3,9 +3,9 @@ package stopgate_test
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
-	"os/exec"
 	"testing"
 	"time"
 
