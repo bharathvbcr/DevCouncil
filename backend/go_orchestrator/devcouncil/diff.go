@@ -200,14 +200,17 @@ func gitDiff(ctx context.Context, root string, paths []string, staged bool) (Dif
 		numstatArgs = append(numstatArgs, "--cached")
 		namestatusArgs = append(namestatusArgs, "--cached")
 	}
-	if len(paths) > 0 {
-		diffArgs = append(diffArgs, "--")
-		diffArgs = append(diffArgs, paths...)
-		numstatArgs = append(numstatArgs, "--")
-		numstatArgs = append(numstatArgs, paths...)
-		namestatusArgs = append(namestatusArgs, "--")
-		namestatusArgs = append(namestatusArgs, paths...)
+	if len(paths) == 0 {
+		// The whole tree, less what DevCouncil's own tools wrote: a state
+		// database is not a hunk an agent can read or should be told to revert.
+		paths = []string{"."}
+		for _, dir := range policy.ToolStateDirs {
+			paths = append(paths, ":(top,exclude)"+dir)
+		}
 	}
+	diffArgs = append(append(diffArgs, "--"), paths...)
+	numstatArgs = append(append(numstatArgs, "--"), paths...)
+	namestatusArgs = append(append(namestatusArgs, "--"), paths...)
 
 	ctx, cancel := context.WithTimeout(ctx, DiffTimeout)
 	defer cancel()
@@ -374,7 +377,7 @@ func collectUntracked(git *proc.GitSession, root string, paths []string, known m
 	var fragments []string
 	remaining := int64(untrackedInputLimit)
 	for _, rel := range strings.Split(out.stdout, "\x00") {
-		if rel == "" {
+		if rel == "" || policy.IsToolState(rel) {
 			continue
 		}
 		if _, ok := known[rel]; ok {

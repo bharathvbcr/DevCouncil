@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/policy"
 	"sort"
 	"strings"
 
@@ -415,10 +416,14 @@ func (r *Registry) callPolicyCheck(ctx context.Context, args map[string]any) any
 		return map[string]any{"ok": false, "error": err.Error(), "code": "policy_error"}
 	}
 	return map[string]any{
-		"ok":       true,
-		"path":     path,
-		"allowed":  !d.Blocked(),
-		"decision": d,
+		"ok":      true,
+		"path":    path,
+		"allowed": !d.Blocked(),
+		// True when the write is allowed here but verification will raise the
+		// path as an unplanned file: it is lent by a planned file's
+		// neighbourhood, or its scope refusal was demoted by the posture.
+		"would_block_verification": policy.WouldBlockVerification(d, task) && !(op == dc.OpCreate && verify.IsTestPath(path)),
+		"decision":                 d,
 	}
 }
 

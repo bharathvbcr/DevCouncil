@@ -98,8 +98,10 @@ var RestrictedPathPatterns = []string{
 	// including any added later.
 	".git",
 	".devcouncil",
+	".devmap",
 	".git/*",
 	".devcouncil/*",
+	".devmap/*",
 	".claude/*",
 	".claude/**",
 	".codex/*",
@@ -115,6 +117,29 @@ var RestrictedPathPatterns = []string{
 	".agents/*",
 	".agents/**",
 	"opencode.json",
+}
+
+// ToolStateDirs are the directories DevCouncil's own tools write state into:
+// the task store, config and correction manifests under .devcouncil, and the
+// code graph and repo map under .devmap. They are a subset of
+// RestrictedPathPatterns — the write policy refuses an agent's write there — and
+// the same list is what verification leaves out of the diff it judges: a file
+// the harness wrote is not work the agent did, and blaming it told an obedient
+// agent to revert (that is, delete) the task store.
+var ToolStateDirs = []string{".devcouncil", ".devmap"}
+
+// IsToolState reports whether a repository-relative path is inside a directory
+// a DevCouncil tool owns. Folded and slash-normalised like the restricted rung,
+// because that is the rung it must agree with.
+func IsToolState(path string) bool {
+	cleaned := strings.TrimPrefix(normalizeSlashes(strings.TrimSpace(path)), "./")
+	folded := fnmatch.Fold(cleaned)
+	for _, dir := range ToolStateDirs {
+		if folded == dir || strings.HasPrefix(folded, dir+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // SubsystemMap answers the two questions the neighbour rule needs. It is an
@@ -1032,3 +1057,30 @@ func matchesRestricted(mt matching, path string) bool {
 }
 
 func normalizeSlashes(p string) string { return strings.ReplaceAll(p, `\`, "/") }
+
+// WouldBlockVerification reports whether a write this decision lets through
+// will be raised as an unplanned file by verification. Verification judges the
+// exact planned set; the write policy also lends a planned file's subsystem,
+// neighbours and directory, and a posture can demote an unplanned refusal, so a
+// write can be allowed here and blocked there. The answer is the same
+// question verification asks — is the path one the task plans — asked of the
+// path the decision names, so the two verdicts have one definition of scope.
+// A refused write never reaches verification.
+func WouldBlockVerification(d Decision, task *dc.Task) bool {
+	if d.Blocked() || task == nil || d.Target == "" {
+		return false
+	}
+	return !PlansPath(task, d.Target)
+}
+
+// PlansPath reports whether the task's planned files name path exactly, which
+// is the set verification's orphan check compares the changed files with.
+func PlansPath(task *dc.Task, path string) bool {
+	want := strings.TrimPrefix(normalizeSlashes(path), "./")
+	for _, pf := range task.PlannedFiles {
+		if strings.TrimPrefix(normalizeSlashes(pf.Path), "./") == want {
+			return true
+		}
+	}
+	return false
+}

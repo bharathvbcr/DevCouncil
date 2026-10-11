@@ -1,6 +1,7 @@
 package verify
 
 import (
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/policy"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -75,7 +76,7 @@ func DetectOrphanDiffGaps(taskID string, planned []dc.PlannedFile, changed []str
 	}
 	var gaps []Gap
 	for _, cf := range changed {
-		if _, ok := plannedSet[cf]; ok {
+		if _, ok := plannedSet[cf]; ok || policy.IsToolState(cf) {
 			continue
 		}
 		_, isAdded := orphanAdded[cf]
@@ -141,17 +142,53 @@ func DetectDependencyRiskGaps(taskID string, planned []dc.PlannedFile, changed [
 	return gaps
 }
 
+// IsTestPath is isTestPath for callers outside the package: the preflight asks
+// it to say whether an unplanned new file would be advisory or blocking.
+func IsTestPath(path string) bool { return isTestPath(path) }
+
+// isTestPath reports whether a path names a test file. It is the Go reading of
+// the one rule protocols/test-paths/v1.json pins (devmap-query's is_test_path):
+// a directory that is exactly a test directory, or a file carrying a test
+// affix. The affixes are not bare substrings — `contest` and `testing_utils`
+// are not tests — and the camel-case arm reads the original casing, so
+// FooTest.java is a test and Latest.java is not. An unplanned *.spec.ts,
+// spec/ or e2e/ file is therefore the advisory orphan gap an unplanned test
+// file is, not a blocking one.
 func isTestPath(path string) bool {
 	norm := strings.ReplaceAll(path, "\\", "/")
-	base := filepath.Base(norm)
-	if strings.HasPrefix(base, "test_") || strings.HasSuffix(base, "_test.go") ||
-		strings.HasSuffix(base, "_test.py") || strings.HasSuffix(base, ".test.ts") ||
-		strings.HasSuffix(base, ".test.js") || strings.HasSuffix(base, "_spec.rb") {
+	dir, name := "", norm
+	if i := strings.LastIndexByte(norm, '/'); i >= 0 {
+		dir, name = norm[:i], norm[i+1:]
+		for _, segment := range strings.Split(dir, "/") {
+			switch strings.ToLower(segment) {
+			case "test", "tests", "spec", "specs", "__tests__", "testing", "e2e", "testdata":
+				return true
+			}
+		}
+	}
+	return isTestFileName(name)
+}
+
+func isTestFileName(name string) bool {
+	lowered := strings.ToLower(name)
+	stem, _, _ := strings.Cut(name, ".")
+	loweredStem, _, _ := strings.Cut(lowered, ".")
+	for _, prefix := range []string{"test_", "spec_"} {
+		if strings.HasPrefix(lowered, prefix) {
+			return true
+		}
+	}
+	for _, infix := range []string{".test.", ".spec.", "_test.", "_spec.", "-test.", "-spec."} {
+		if strings.Contains(lowered, infix) {
+			return true
+		}
+	}
+	switch loweredStem {
+	case "test", "tests", "spec", "specs":
 		return true
 	}
-	parts := strings.Split(norm, "/")
-	for _, p := range parts {
-		if p == "tests" || p == "test" || p == "__tests__" || p == "testdata" {
+	for _, suffix := range []string{"Test", "Tests", "Spec", "Specs"} {
+		if strings.HasSuffix(stem, suffix) {
 			return true
 		}
 	}
