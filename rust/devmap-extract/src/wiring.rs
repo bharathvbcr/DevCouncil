@@ -1348,6 +1348,9 @@ const ENTRY_POINT_CANDIDATES: usize = 4;
 pub fn config_entry_point_symbols(path: &str, source: &str) -> Vec<WiringAnnotation> {
     let normalized = normalize_path(path);
     let name = normalized.rsplit('/').next().unwrap_or(&normalized);
+    if name == "AndroidManifest.xml" {
+        return android_component_entry_points(&normalized, source);
+    }
     if name != "pyproject.toml" {
         return Vec::new();
     }
@@ -1393,6 +1396,46 @@ pub fn config_entry_point_symbols(path: &str, source: &str) -> Vec<WiringAnnotat
         }
     }
     annotations
+}
+
+/// Prefix of a [`WiringKind::ConfigEntryPoint`] target that names an Android
+/// component rather than a `file::symbol`: `android-component:<module dir>|<name>`.
+///
+/// A manifest names a class by its package-qualified name (or `.Name`, relative
+/// to a namespace the Gradle script declares), never by file, so the join to a
+/// symbol is made where the class's own `package` header is known: the
+/// analysis pass reads this target against each Kotlin or Java class's package
+/// and the module directory the manifest governs.
+pub const ANDROID_COMPONENT_TARGET_PREFIX: &str = "android-component:";
+
+/// The components an `AndroidManifest.xml` declares, as entry-point claims.
+/// A manifest the reader cannot read makes no claim here; the extraction
+/// records the failure itself.
+fn android_component_entry_points(path: &str, source: &str) -> Vec<WiringAnnotation> {
+    let Ok(components) = crate::androidmanifest::parse_components(source) else {
+        return Vec::new();
+    };
+    // The module is the directory above `src/`: `app/src/main/AndroidManifest.xml`
+    // governs `app/`.
+    let module = path
+        .split_once("/src/")
+        .map(|(module, _)| module)
+        .or_else(|| path.strip_prefix("src/").map(|_| ""))
+        .unwrap_or_default();
+    components
+        .into_iter()
+        .map(|component| WiringAnnotation {
+            kind: WiringKind::ConfigEntryPoint,
+            target_symbol: format!(
+                "{ANDROID_COMPONENT_TARGET_PREFIX}{module}|{}",
+                component.name
+            ),
+            details: format!(
+                "declared as an Android <{}> component by {path}: {}",
+                component.tag, component.name
+            ),
+        })
+        .collect()
 }
 
 fn is_language_main(path: &str, source: &str) -> bool {

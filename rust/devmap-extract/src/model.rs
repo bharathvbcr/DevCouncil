@@ -943,6 +943,15 @@ impl ExtractedImport {
     }
 }
 
+/// A lambda body and the expression its implicit `this` is. See
+/// [`Extraction::scope_receivers`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopeReceiver {
+    pub body_start: usize,
+    pub body_end: usize,
+    pub receiver: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractedCall {
     pub caller_symbol: Option<String>,
@@ -1522,6 +1531,19 @@ pub struct Extraction {
     /// so G20 stars and package-level import edges survive reload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub go_package: Option<String>,
+    /// Kotlin/Java `package` header. Two files with the same clause share one
+    /// unqualified namespace — across source sets too, which is why a test in
+    /// `src/test` reaches a `src/main` class with no import. Kept on the
+    /// extraction (not derived from the path) because a package need not match
+    /// its directory, and a durable reload strips `source_code`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jvm_package: Option<String>,
+    /// Kotlin lambdas whose implicit `this` is a written expression:
+    /// `editor.apply { .. }`, `x.run { .. }`, `with(x) { .. }`. A bare call
+    /// inside one is first a member of that receiver, and only then a function
+    /// in scope — which the call alone cannot say.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope_receivers: Vec<ScopeReceiver>,
     /// Whether a Go file carries a build constraint — a `//go:build` or
     /// `// +build` directive, or an implicit `_GOOS`/`_GOARCH` filename suffix.
     /// Always false for non-Go files.
@@ -1668,6 +1690,16 @@ pub struct LocalBinding {
 }
 
 impl Extraction {
+    /// The implicit-`this` expression of the innermost scope-function lambda
+    /// containing `byte`, if any.
+    pub fn scope_receiver_at(&self, byte: usize) -> Option<&str> {
+        self.scope_receivers
+            .iter()
+            .filter(|scope| scope.body_start <= byte && byte < scope.body_end)
+            .min_by_key(|scope| scope.body_end - scope.body_start)
+            .map(|scope| scope.receiver.as_str())
+    }
+
     pub fn local_binding_at(&self, start_byte: usize, name: &str) -> Option<&LocalBinding> {
         self.local_bindings
             .binary_search_by(|binding| {

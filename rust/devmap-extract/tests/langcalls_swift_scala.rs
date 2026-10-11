@@ -474,6 +474,39 @@ fn scala_extracts_def_method_and_apply_calls() {
     assert_eq!(extracted.binding("Service"), Some("s"));
 }
 
+/// Pinned refusal (ft-6c5d9e9e): tree-sitter-scala gives a nullary `def`
+/// call and a `val` read the same bare `identifier`, so `def entry = helper`
+/// cannot be told from `val entry = helper` without the enclosing template's
+/// member table, which is resolution and not extraction. The extractor
+/// therefore records **no call** for the paren-less form — the shape is
+/// call-blind, listed as such in `docs/devmap/DIVERGENCES.md` — and the name
+/// still reaches the graph as a reference, so the callee is not reported dead.
+/// The parenthesised form is unambiguous and is recorded.
+#[test]
+fn scala_a_parenless_nullary_def_call_is_refused_not_guessed() {
+    let source = "object A {\n  def helper = 1\n  def entry = helper\n  def viaParens = helper()\n  val cached = helper\n}\n";
+    let extracted = extract("A.scala", "scala", source);
+    let from_entry = extracted
+        .calls
+        .iter()
+        .filter(|call| call.callee_name == "helper")
+        .filter(|call| call.caller_symbol.as_deref() == Some("A.scala::A.entry"))
+        .count();
+    assert_eq!(
+        from_entry,
+        0,
+        "a bare name could be a val read: {:?}",
+        extracted.callees()
+    );
+    let from_parens = extracted
+        .calls
+        .iter()
+        .filter(|call| call.callee_name == "helper")
+        .filter(|call| call.caller_symbol.as_deref() == Some("A.scala::A.viaParens"))
+        .count();
+    assert_eq!(from_parens, 1, "`helper()` is unambiguously a call");
+}
+
 #[test]
 fn scala_attributes_object_methods_to_the_qualified_symbol_the_emitter_names() {
     let extracted = extract("r.scala", "scala", SCALA_REGISTRY);

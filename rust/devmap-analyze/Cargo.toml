@@ -44,6 +44,10 @@ parse = [
 # build. Nothing changes with default features on, where `parse` is enabled.
 
 [[test]]
+name = "android_manifest_components"
+required-features = ["parse"]
+
+[[test]]
 name = "c_family_liveness"
 required-features = ["parse"]
 

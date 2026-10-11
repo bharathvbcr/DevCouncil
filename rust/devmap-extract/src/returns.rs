@@ -79,6 +79,26 @@ fn is_callable(kind: &str) -> bool {
     )
 }
 
+/// A Kotlin function's return type: the unnamed type node right after the
+/// parameter list (`fun create(): Clock`). The grammar gives it no field, and a
+/// receiver type (`fun Task.label()`) comes *before* the name, so position
+/// after the parameters is what tells them apart.
+fn kotlin_return(callable: Node) -> Option<Node> {
+    if callable.kind() != "function_declaration" {
+        return None;
+    }
+    let mut cursor = callable.walk();
+    let mut after_parameters = false;
+    for child in callable.named_children(&mut cursor) {
+        if child.kind() == "function_value_parameters" {
+            after_parameters = true;
+        } else if after_parameters {
+            return matches!(child.kind(), "user_type" | "nullable_type").then_some(child);
+        }
+    }
+    None
+}
+
 /// The written return type of `callable`, trimmed, or `None`.
 ///
 /// Grammar fields, as declared by each grammar's `node-types.json`: Go
@@ -92,7 +112,8 @@ fn written_return(callable: Node, source: &str) -> Option<String> {
                 .then(|| callable.child_by_field_name("type"))
                 .flatten()
         })
-        .or_else(|| swift_return(callable))?;
+        .or_else(|| swift_return(callable))
+        .or_else(|| kotlin_return(callable))?;
     let node = if node.kind() == "parameter_list" {
         // Go's parenthesised result list. One unnamed result is a type in
         // parentheses; anything more — `(T, error)` — is a tuple the caller

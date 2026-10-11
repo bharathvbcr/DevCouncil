@@ -630,7 +630,21 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// edge), and scope-aware Swift locals (`swiftscope`). A v85 row lacks them, so
 /// the requirement would keep looking undeclared and the call unattributed from
 /// a warm cache. The Swift lane carried no stamp of its own, so it is 86.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "86";
+///
+/// v87 is the Kotlin accuracy payload: a Kotlin parameter, typed local and
+/// primary-constructor `val` carry a `Type` reference (so a receiver written
+/// through them is typed), a Kotlin/Java file records its `package` header, a
+/// Kotlin file records its scope-function lambdas, a callable reference, a
+/// `super.m()` and an explicit-type-argument call are calls, a Kotlin function
+/// carries its written return type and an extension property is a symbol; an
+/// `AndroidManifest.xml` is an indexed config whose components are entry
+/// points; a Ruby `attr_*` / `define_method` is a method symbol and an
+/// `include` / `prepend` is heritage. A v86 row has none of these, which
+/// leaves every receiver through a constructor property or a parameter
+/// untyped, and every manifest-only class a dead-code candidate, until the
+/// file is edited. The Kotlin lane stamped 82 on this payload; it landed after
+/// the others, so it is 87.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "87";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

@@ -599,7 +599,32 @@ class Point < Struct.new(:px, :py)
 end
 "#;
     let extraction = devmap_extract::extract_file("a.rb", source);
-    assert_eq!(callees_from(&extraction, "a.rb::Err.to_s"), vec!["real"]);
+    // The attributes and `define_method` the class declares are *symbols* now
+    // (`langdecl::ruby::attribute_symbols`), so a send of one is recorded and
+    // binds to its own declaration — refusing it would leave the declaration
+    // callerless. What stays refused is every name that still has no
+    // declaration: an alias, a delegator, a `delegate`, and anything a
+    // singleton class or a `Struct` superclass defines.
+    let sent = callees_from(&extraction, "a.rb::Err.to_s");
+    assert_eq!(
+        sent,
+        vec!["acc", "made", "plain_attr", "priv", "real", "reason"]
+    );
+    for refused in ["aliased", "kw_alias", "forwarded", "railsy"] {
+        assert!(
+            !sent.iter().any(|name| name == refused),
+            "{refused} has no declaration to bind and must stay refused"
+        );
+    }
+    for declared in ["reason", "acc", "plain_attr", "priv", "made"] {
+        assert!(
+            extraction
+                .symbols
+                .iter()
+                .any(|symbol| symbol.qualified_name == format!("a.rb::Err.{declared}")),
+            "{declared} is declared by its macro"
+        );
+    }
     assert!(callees_from(&extraction, "a.rb::build").is_empty());
     assert!(callees_from(&extraction, "a.rb::Point.norm").is_empty());
     assert_no_orphaned_callers(&extraction);

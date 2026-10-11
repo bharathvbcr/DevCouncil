@@ -856,8 +856,11 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     //
     // v86 records Swift protocol requirements as symbols and scope-aware Swift
     // locals.
+    //
+    // v87 is the Kotlin accuracy payload (typed parameters and properties, scope
+    // functions, `package` headers, Android manifests, Ruby attributes).
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "86",
+        EXTRACTION_SCHEMA_VERSION, "87",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

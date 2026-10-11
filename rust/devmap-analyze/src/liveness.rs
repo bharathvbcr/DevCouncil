@@ -2294,6 +2294,43 @@ fn called_and_ambiguous_symbols(resolution: &ResolutionResult) -> CallIndex {
 /// The `.or_else` precedence of the original chain is preserved exactly, because
 /// the reason string is a machine token in three tests: symbol wiring, heritage
 /// override, Go interface, C header, exported owner, Go build variant.
+/// Why a Kotlin or Java class is live: an Android manifest declares it as a
+/// component. Matched on the class's package-qualified name, inside the module
+/// directory the manifest governs; a name written `.Name` is relative to the
+/// module's namespace, which only the build script knows, so it matches on its
+/// suffix.
+fn android_component_reason(
+    ext: &Extraction,
+    sym: &ExtractedSymbol,
+    components: &[(&str, &str, &str)],
+) -> Option<String> {
+    if components.is_empty()
+        || !matches!(ext.language.as_str(), "kotlin" | "java")
+        || sym.kind != SymbolKind::Class
+        || sym
+            .parent_symbol
+            .as_deref()
+            .is_some_and(|parent| parent != ext.file_path)
+    {
+        return None;
+    }
+    let package = ext.jvm_package.as_deref()?;
+    let qualified = format!("{package}.{}", sym.name);
+    components.iter().find_map(|(module, name, details)| {
+        let in_module = module.is_empty()
+            || ext
+                .file_path
+                .strip_prefix(module)
+                .is_some_and(|rest| rest.starts_with('/'));
+        let names_it = if name.starts_with('.') {
+            qualified.ends_with(name)
+        } else {
+            qualified == *name
+        };
+        (in_module && names_it).then(|| (*details).to_string())
+    })
+}
+
 fn symbol_exemption_index(
     extractions: &[Extraction],
     resolution: &ResolutionResult,
@@ -2323,6 +2360,19 @@ fn symbol_exemption_index(
         .flat_map(|ext| ext.wiring.iter())
         .filter(|w| w.kind == WiringKind::ConfigEntryPoint)
         .map(|w| (w.target_symbol.as_str(), w.details.as_str()))
+        .collect();
+
+    // The Android half of the same declaration: a manifest names a class by
+    // package-qualified name, so the join is made here, where each class's own
+    // `package` header is known. `(module dir, name as written, why)`.
+    let android_components: Vec<(&str, &str, &str)> = config_entry_points
+        .iter()
+        .filter_map(|(target, details)| {
+            let (module, name) = target
+                .strip_prefix(devmap_extract::wiring::ANDROID_COMPONENT_TARGET_PREFIX)?
+                .split_once('|')?;
+            Some((module, name, *details))
+        })
         .collect();
 
     let mut index: HashMap<(String, String), String> = HashMap::new();
@@ -2414,6 +2464,7 @@ fn symbol_exemption_index(
                         .get(sym.qualified_name.as_str())
                         .map(|details| (*details).to_string())
                 })
+                .or_else(|| android_component_reason(ext, sym, &android_components))
                 .or(heritage)
                 .or_else(|| {
                     go_interface_exemptions

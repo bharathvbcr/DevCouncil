@@ -265,7 +265,6 @@ fn a_local_inside_a_function_is_not_a_field() {
             "a.swift",
             "struct S {\n    func f() {\n        let lease: Lease = x\n    }\n}\n",
         ),
-        ("a.kt", "fun f() {\n    val lease: Lease = x\n}\n"),
     ] {
         let owners: Vec<_> = field_types(path, source)
             .into_iter()
@@ -275,6 +274,27 @@ fn a_local_inside_a_function_is_not_a_field() {
             owners.is_empty(),
             "{path}: a function's local is not a member of the enclosing type, got {owners:?}"
         );
+    }
+}
+
+/// A Kotlin typed local is the *function's* binding, never a member of the
+/// class around it: the reader owns it under the function's own identity so a
+/// receiver written through it is typed, and the owner is not a type.
+#[test]
+fn a_kotlin_local_is_typed_in_its_functions_scope_not_its_classes() {
+    for (source, owner) in [
+        ("fun f() {\n    val lease: Lease = x\n}\n", "a.kt::f"),
+        (
+            "class S {\n    fun f() {\n        val lease: Lease = x\n    }\n}\n",
+            "a.kt::S.f",
+        ),
+    ] {
+        let owners: Vec<_> = field_types("a.kt", source)
+            .into_iter()
+            .filter(|(_, name, _)| name == "lease")
+            .map(|(_, _, owner)| owner)
+            .collect();
+        assert_eq!(owners, vec![owner.to_string()], "{source}");
     }
 }
 

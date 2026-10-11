@@ -5,37 +5,6 @@
 # The set only shrinks: accuracy_fixtures.rs fails when a listed row starts passing and when
 # a passing row is not listed. Fixing a row means deleting its line (DEVMAP_ACCURACY_BLESS=1
 # does it); adding a line needs an owning card and a reason.
-kotlin	kt.K02	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
-kotlin	kt.K03	miss	ft-0720fe1d	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
-kotlin	kt.K03b	miss	ft-0720fe1d	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
-kotlin	kt.K05b	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
-kotlin	kt.K06	silent_miss	ft-0720fe1d	 | today: no ledger row names {"slugify"}
-kotlin	kt.K06b	silent_miss	ft-0720fe1d	reference to a property | today: no ledger row names {"label"}
-kotlin	kt.K07b	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
-kotlin	kt.K08	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
-kotlin	kt.K09	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
-kotlin	kt.K10c	miss	ft-e3f7d1b1	 | today: absent today, recorded as an honest unresolved row
-kotlin	kt.K14	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
-kotlin	kt.K15	miss	ft-0720fe1d	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
-kotlin	kt.K16	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
-kotlin	kt.K17	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
-kotlin	kt.K19	false_edge	ft-0720fe1d	false-bait | today: forbidden HIGH edge to ["app/src/main/java/com/fx/app/FxApp.kt::FxApp.onCreate"]
-kotlin	kt.K20	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
-kotlin	kt.K20b	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
-kotlin	kt.K23	miss	ft-837a6f05	 | today: ledger rows exist but only in explained classes: [("twice", "external")]
-kotlin	kt.K23b	silent_miss	ft-837a6f05	 | today: ledger rows exist but only in explained classes: [("register", "no_namesake")]
-kotlin	kt.K24	silent_miss	ft-0720fe1d	 | today: no ledger row names {"castOrNull"}
-kotlin	kt.K25	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
-kotlin	kt.K26	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
-kotlin	kt.K26b	silent_miss	ft-0720fe1d	 | today: no ledger row names {"invoke"}
-kotlin	kt.K27	silent_miss	ft-0720fe1d	reference | today: no ledger row names {"refresh"}
-kotlin	kt.K28b	miss	ft-e3f7d1b1	cast receiver | today: absent today, recorded as an honest unresolved row
-kotlin-gaps	kg.K27	silent_miss	ft-0720fe1d	callable reference vm::onEvent | today: no ledger row names {"onEvent"}
-kotlin-gaps	kg.K29	silent_miss	ft-0720fe1d	operator fun invoke through op(2) | today: no ledger row names {"invoke"}
-kotlin-gaps	kg.K30	silent_miss	ft-0720fe1d	import alias: fmt(3) is gaps.util.format | today: ledger rows exist but only in explained classes: [("fmt", "no_namesake")]
-kotlin-gaps	kg.K31	false_edge	ft-0720fe1d	super.go() reaches the base method | today: HIGH edge to the wrong namesake ["src/main/kotlin/gaps/Events.kt::Child.go"]
-kotlin-gaps	kg.K31b	false_edge	ft-0720fe1d	super.go() is not a self-reference | today: forbidden HIGH edge to ["src/main/kotlin/gaps/Events.kt::Child.go"]
-kotlin-gaps	kg.K33	miss	ft-0720fe1d	nested class constructor Res.Ok(1) | today: absent today, recorded as an honest unresolved row
 python	py.C22b	miss	ft-c666ba7c	edge or honest miss; NOT other/dup.py::helper | today: absent today, recorded as an honest unresolved row
 python	py.C23b	miss	ft-c666ba7c	edge if fixture return typed; honest miss acceptable | today: absent today, recorded as an honest unresolved row
 rust	rs.c02	miss	ft-e3f7d1b1	dyn Trait: trait decl or fan-out to both impls | today: absent today, recorded as an honest unresolved row
