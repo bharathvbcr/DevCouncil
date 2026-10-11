@@ -98,6 +98,7 @@ mod powershell_stays_pattern_recovered;
 mod python_path_loads;
 #[cfg(feature = "parse")]
 mod python_path_loads_under_stress;
+mod python_source_roots_collect;
 #[cfg(feature = "parse")]
 mod receiver_is_an_identity;
 mod reliability_source_reads;

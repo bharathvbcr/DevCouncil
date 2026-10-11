@@ -70,6 +70,8 @@ mod parallel_determinism;
 #[cfg(feature = "parse")]
 mod primary_languages;
 #[cfg(feature = "parse")]
+mod python_class_identity;
+#[cfg(feature = "parse")]
 mod python_module_constants;
 #[cfg(feature = "parse")]
 mod python_modules_loaded_by_path;

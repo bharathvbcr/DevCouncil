@@ -1564,10 +1564,20 @@ fn an_untyped_local_binding_is_classified_by_its_scope() {
             .clone()
     };
 
-    assert_eq!(
-        class_of("cls", "::Message.from_dict"),
-        UnresolvedClass::LocalBinding,
-        "`cls` is this classmethod's own first parameter"
+    // `cls(raw)` was a `LocalBinding` row; `cls` is the class the method is
+    // written in, so it is now an edge to that class and no row at all.
+    assert!(
+        !res.unresolved
+            .iter()
+            .any(|u| u.callee_name == "cls" && u.source_symbol.ends_with("::Message.from_dict")),
+        "`cls(..)` in a classmethod constructs its own class and is no longer unresolved"
+    );
+    assert!(
+        res.edges
+            .iter()
+            .any(|edge| edge.source_symbol.ends_with("::Message.from_dict")
+                && edge.target_symbol.ends_with("::Message")),
+        "`cls(..)` binds the enclosing class"
     );
     assert_eq!(
         class_of("next_gap_id", "::detect"),

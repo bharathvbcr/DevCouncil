@@ -837,9 +837,11 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // values, docstrings and string-made references, once for the dead-policy
     // card's extractor fixes. v79 carries both.
     //
-    // v80 records which error regions hold no name.
+    // v80 records which error regions hold no name; v82 the implicit
+    // `__enter__` of a Python `with Class(..)` (v81 is reserved for a sibling
+    // lane's binding payload).
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "80",
+        EXTRACTION_SCHEMA_VERSION, "82",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

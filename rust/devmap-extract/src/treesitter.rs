@@ -3861,6 +3861,37 @@ fn extract_node(
                     }
                 }
             }
+            // `with Engine(1) as eng:` calls `Engine.__enter__` with no call
+            // syntax anywhere. Recorded as that call, against the class the
+            // statement names, so the resolver can bind it (or say it could
+            // not). Only a capitalised identifier is read as a class: the
+            // result of an arbitrary function (`with open(p):`) has no type
+            // this extractor knows, and a row per such statement would bury
+            // the ledger in questions nothing can answer.
+            "with_item" => {
+                let constructed = node
+                    .child_by_field_name("value")
+                    .map(|value| {
+                        if value.kind() == "as_pattern" {
+                            value.named_child(0).unwrap_or(value)
+                        } else {
+                            value
+                        }
+                    })
+                    .filter(|expression| expression.kind() == "call")
+                    .and_then(|call| call.child_by_field_name("function"))
+                    .filter(|function| function.kind() == "identifier")
+                    .map(|function| get_node_text(function, source))
+                    .filter(|name| name.chars().next().is_some_and(char::is_uppercase));
+                if let Some(class_name) = constructed {
+                    calls.push(ExtractedCall {
+                        caller_symbol: enclosing_callable_qualified(node, source, file_symbol_name),
+                        callee_name: "__enter__".to_string(),
+                        receiver_expr: Some(class_name),
+                        span,
+                    });
+                }
+            }
             _ => {}
         },
         "javascript" | "typescript" | "tsx" => match kind {

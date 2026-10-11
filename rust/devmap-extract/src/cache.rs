@@ -597,7 +597,11 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// empty, which charges every such region against the dead-code ceiling —
 /// a lone `}` would keep a whole language out of the confident tier until
 /// the file was edited.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "80";
+///
+/// v82 records the implicit `__enter__` call of a Python `with Class(...)`
+/// statement. A v81 row has no such call, so the context manager's `__enter__`
+/// would keep looking uncalled until the file was edited.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "82";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

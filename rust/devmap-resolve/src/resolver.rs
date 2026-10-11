@@ -11,6 +11,8 @@ use crate::model::*;
 use devmap_extract::tsconfig::TsProject;
 use devmap_extract::{GoModule, ProjectManifests};
 
+mod pytypes;
+
 /// One package-level declaration, as [`Resolver::go_package_symbols`] holds it:
 /// the file that declares it, its qualified name, and its kind.
 type PackageDecl = (String, String, SymbolKind);
@@ -310,6 +312,15 @@ pub struct Resolver {
     /// [`Self::index_project_manifests`], which a caller runs before
     /// [`Self::index_extractions`]; that one builds `rust_crate_roots` from it.
     rust_manifest_crates: Vec<devmap_extract::RustCrateManifest>,
+    /// The Python source roots each manifest declares, deepest directory
+    /// first. Set by [`Self::index_project_manifests`]; read by
+    /// [`Self::python_root_candidates`].
+    python_manifest_roots: Vec<devmap_extract::pyproject::PythonSourceRoots>,
+    /// Top-level Python package name → the directories that hold a package of
+    /// that name (`<dir>/<name>/__init__.py` indexed, `<dir>/__init__.py`
+    /// not). The no-manifest fallback: a name held by exactly one directory
+    /// is importable from it.
+    py_package_parents: BTreeMap<String, BTreeSet<String>>,
     /// `(file, qualified name)` → the header a Rust function was declared
     /// with. Read by the rungs that type a binding from a return type or a
     /// closure parameter; see `devmap_extract::rustsig`.
@@ -593,6 +604,8 @@ impl Resolver {
             py_search_dirs: BTreeMap::new(),
             rust_crate_roots: BTreeMap::new(),
             rust_manifest_crates: Vec::new(),
+            python_manifest_roots: Vec::new(),
+            py_package_parents: BTreeMap::new(),
             rust_signatures: BTreeMap::new(),
             reexport_chains: BTreeMap::new(),
             receiver_types: BTreeMap::new(),
@@ -1123,6 +1136,14 @@ impl Resolver {
     pub fn index_project_manifests(&mut self, manifests: &ProjectManifests) {
         self.index_go_modules(&manifests.go_modules);
         self.rust_manifest_crates = manifests.rust_crates.clone();
+        let mut python_roots = manifests.python_roots.clone();
+        // Deepest first: the nearest manifest's roots are probed first.
+        python_roots.sort_by(|left, right| {
+            Self::dir_depth(&right.dir)
+                .cmp(&Self::dir_depth(&left.dir))
+                .then_with(|| left.dir.cmp(&right.dir))
+        });
+        self.python_manifest_roots = python_roots;
         let mut projects = manifests.ts_projects.clone();
         // Deepest first, whatever order arrived: the nearest config governs.
         projects.sort_by(|left, right| {
@@ -2569,6 +2590,24 @@ impl Resolver {
                 .push(path.clone());
         }
         self.py_files_by_name = py_files_by_name;
+        let mut py_package_parents: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for path in self.file_symbols.keys() {
+            let Some(package_dir) = path.strip_suffix("/__init__.py") else {
+                continue;
+            };
+            let parent = Self::parent_dir(package_dir);
+            let is_top_level = !self
+                .file_symbols
+                .contains_key(&format!("{parent}/__init__.py"))
+                && !(parent.is_empty() && self.file_symbols.contains_key("__init__.py"));
+            if let (true, Some(name)) = (is_top_level, package_dir.rsplit('/').next()) {
+                py_package_parents
+                    .entry(name.to_string())
+                    .or_default()
+                    .insert(parent);
+            }
+        }
+        self.py_package_parents = py_package_parents;
 
         // Which crate each indexed `src/lib.rs` or `src/main.rs` is the root
         // of, keyed by the name a `use` would spell. Built here for the same
@@ -3088,7 +3127,15 @@ impl Resolver {
                     })
                     .map(|(path, kind, _, _)| (path, kind))
                     .collect();
-                if types.len() == 1 {
+                // Python says which class a name is — this file's own `class`
+                // statement, else the import that bound it — so a name more
+                // than one file declares still types the receiver; the lookup
+                // at the call restricts to that class's file.
+                let python_names_one_class = family == LangFamily::Python
+                    && self
+                        .python_class_named(&ext.file_path, &reference.name)
+                        .is_some();
+                if types.len() == 1 || python_names_one_class {
                     if let Some(scope) = reference.enclosing_symbol.as_deref() {
                         Self::bind_receiver(
                             &mut self.scoped_receiver_types,
@@ -3690,6 +3737,25 @@ impl Resolver {
                                 target_symbol,
                                 target_file: ext.file_path.clone(),
                             }));
+                        } else if let Some((class_file, identity)) = (family == LangFamily::Python
+                            && call.callee_name == "cls")
+                            .then_some(call.caller_symbol.as_deref())
+                            .flatten()
+                            .and_then(|caller| self.python_cls_target(&ext.file_path, caller))
+                        {
+                            // `cls(...)` inside a method constructs the class
+                            // the method is written in. `cls` is a parameter,
+                            // so the local-binding arm below would otherwise
+                            // claim it.
+                            resolution = Some(Arc::new(Resolution::ReceiverType {
+                                receiver_type: identity
+                                    .rsplit("::")
+                                    .next()
+                                    .unwrap_or(&identity)
+                                    .to_string(),
+                                target_symbol: identity,
+                                target_file: class_file,
+                            }));
                         } else if ext
                             .local_binding_at(call.span.start_byte, &call.callee_name)
                             .is_some()
@@ -3728,9 +3794,33 @@ impl Resolver {
                             )
                             .filter(|_| family.admits(family))
                         {
+                            // Python names its class: the file's own `class`
+                            // statement, else the import that bound it. A flat
+                            // `type_methods` hit in another file's namesake is
+                            // not that class, and an alias is not its key.
+                            let python_class = (family == LangFamily::Python)
+                                .then(|| {
+                                    self.python_method_on(
+                                        &ext.file_path,
+                                        &class_type,
+                                        &call.callee_name,
+                                    )
+                                })
+                                .and_then(Result::ok);
+                            let class_is_known = python_class.is_some();
+                            if let Some(Some(found)) = python_class {
+                                resolution = Some(Arc::new(Resolution::ReceiverType {
+                                    target_symbol: found.symbol,
+                                    target_file: found.file,
+                                    receiver_type: found.declaring_type,
+                                }));
+                            }
                             let key = (family, class_type.clone(), call.callee_name.clone());
-                            if let Some((target_f, target_symbol)) =
-                                self.type_methods.get(&key).and_then(|hits| {
+                            if let Some((target_f, target_symbol)) = self
+                                .type_methods
+                                .get(&key)
+                                .filter(|_| !class_is_known)
+                                .and_then(|hits| {
                                     self.receiver_type_method(
                                         ext,
                                         call.caller_symbol.as_deref(),
@@ -4043,6 +4133,39 @@ impl Resolver {
                                     }
                                 }
                             }
+                        }
+                    }
+
+                    // 2d''. Python: a class written at the call — `Engine(1).quack()`,
+                    // `E2.create()` — through the alias or inheritance 2d cannot
+                    // see — and `super().m()`, which names the enclosing class's
+                    // bases. A local of the same name shadows the class.
+                    if resolution.is_none() && family == LangFamily::Python {
+                        let found = match call.receiver_expr.as_deref() {
+                            Some("super" | "super()") => call.caller_symbol.as_deref().and_then(
+                                |caller| {
+                                    self.python_super_method(&ext.file_path, caller, &call.callee_name)
+                                },
+                            ),
+                            Some(recv)
+                                if Self::is_plain_ident(recv)
+                                    && ext.local_binding_at(call.span.start_byte, recv).is_none()
+                                    && !call.caller_symbol.as_deref().is_some_and(|scope| {
+                                        self.scope_declares_local(&ext.file_path, scope, recv)
+                                    }) =>
+                            {
+                                self.python_method_on(&ext.file_path, recv, &call.callee_name)
+                                    .ok()
+                                    .flatten()
+                            }
+                            _ => None,
+                        };
+                        if let Some(found) = found {
+                            resolution = Some(Arc::new(Resolution::ReceiverType {
+                                target_symbol: found.symbol,
+                                target_file: found.file,
+                                receiver_type: found.declaring_type,
+                            }));
                         }
                     }
 
@@ -5559,7 +5682,33 @@ impl Resolver {
                 return None;
             }
         }
-        let mut frontier = vec![enclosing.clone()];
+        let (target_file, target_symbol, receiver_type) =
+            self.supertype_method(family, vec![enclosing.clone()], method)?;
+        Some(self.implicit_receiver_unique(
+            family,
+            &enclosing,
+            method,
+            target_file,
+            target_symbol,
+            receiver_type,
+        ))
+    }
+
+    /// The one method `method` that `frontier`'s types, or the nearest of their
+    /// declared supertypes, declare — breadth-first, so an inherited method is
+    /// found at the level it is first declared.
+    ///
+    /// Abstains on every ambiguity: a type that declares the name twice, a level
+    /// where two supertypes declare it, and a type name two files declare. The
+    /// language's own MRO might pick one; this resolver has no MRO, and a guess
+    /// at DETERMINISTIC is the one answer it must not give. Returns `(file,
+    /// symbol, declaring type)`.
+    fn supertype_method(
+        &self,
+        family: LangFamily,
+        mut frontier: Vec<String>,
+        method: &str,
+    ) -> Option<(String, String, String)> {
         let mut visited: BTreeSet<String> = BTreeSet::new();
         for _ in 0..Self::HERITAGE_WALK_MAX_DEPTH {
             let mut found: BTreeSet<(String, String, String)> = BTreeSet::new();
@@ -5587,22 +5736,8 @@ impl Resolver {
                 }
             }
             match found.len() {
-                1 => {
-                    let (target_file, target_symbol, receiver_type) =
-                        found.into_iter().next().expect("len 1");
-                    return Some(self.implicit_receiver_unique(
-                        family,
-                        &enclosing,
-                        method,
-                        target_file,
-                        target_symbol,
-                        receiver_type,
-                    ));
-                }
+                1 => return found.into_iter().next(),
                 0 => {}
-                // Two supertypes at one level declare the name. The language's
-                // own MRO might pick one; this resolver has no MRO, and a guess
-                // at DETERMINISTIC is the one answer it must not give.
                 _ => return None,
             }
             if next.is_empty() {
@@ -6614,12 +6749,39 @@ impl Resolver {
             ext.local_binding_at(reference.span.start_byte, root)
                 .or_else(|| ext.local_binding_at(reference.span.start_byte, receiver))
         };
-        if let Some(class_type) = self.receiver_type_for(
+        let receiver_type = self.receiver_type_for(
             &ext.file_path,
             reference.enclosing_symbol.as_deref(),
             receiver,
             binding,
-        ) {
+        );
+        // Python: a property read (`Engine(1).size`) or attribute of a class
+        // written at the reference, or of a typed receiver, through the file's
+        // own class identity and the declared bases — the call ladder's rule.
+        let python_class = (family == LangFamily::Python)
+            .then(|| {
+                receiver_type.clone().or_else(|| {
+                    (binding.is_none() && Self::is_plain_ident(receiver))
+                        .then(|| receiver.to_string())
+                })
+            })
+            .flatten()
+            .and_then(|written| self.python_method_on(&ext.file_path, &written, name).ok());
+        let class_is_known = python_class.is_some();
+        if let Some(Some(found)) = python_class {
+            return Some(self.reference_edge(
+                ext,
+                &found.file,
+                &found.symbol,
+                reference,
+                Resolution::ReceiverType {
+                    target_symbol: found.symbol.clone(),
+                    target_file: found.file.clone(),
+                    receiver_type: found.declaring_type,
+                },
+            ));
+        }
+        if let Some(class_type) = receiver_type.filter(|_| !class_is_known) {
             let key = (family, class_type.clone(), name.to_string());
             if let Some((target_file, target_symbol)) =
                 self.type_methods.get(&key).and_then(|hits| {
@@ -7428,6 +7590,37 @@ impl Resolver {
         }
     }
 
+    /// Where an absolute Python import `py_path` (`pkg/util`) may live, beyond
+    /// the repository root and `src/`: the source roots of every manifest
+    /// governing `current_file`, nearest manifest first, and failing those the
+    /// one directory that holds a top-level package of that name. Each root
+    /// yields the module file and the package `__init__.py`.
+    fn python_root_candidates(&self, current_file: &str, py_path: &str) -> Vec<String> {
+        let mut roots: Vec<&str> = self
+            .python_manifest_roots
+            .iter()
+            .filter(|set| set.dir.is_empty() || current_file.starts_with(&format!("{}/", set.dir)))
+            .flat_map(|set| set.roots.iter().map(String::as_str))
+            .collect();
+        let first = py_path.split('/').next().unwrap_or(py_path);
+        if let Some(parents) = self.py_package_parents.get(first) {
+            // Held by two directories, it names neither: abstain.
+            if parents.len() == 1 {
+                roots.extend(parents.iter().map(String::as_str));
+            }
+        }
+        roots
+            .into_iter()
+            .filter(|root| !root.is_empty())
+            .flat_map(|root| {
+                [
+                    format!("{root}/{py_path}.py"),
+                    format!("{root}/{py_path}/__init__.py"),
+                ]
+            })
+            .collect()
+    }
+
     fn resolve_import_path(
         &self,
         current_file: &str,
@@ -7530,6 +7723,13 @@ impl Resolver {
                 py_path = py_path.replace('.', "/");
             }
 
+            if dots == 0 {
+                for cand in self.python_root_candidates(current_file, &py_path) {
+                    if self.file_symbols.contains_key(&cand) {
+                        return Some(cand);
+                    }
+                }
+            }
             let candidates = [
                 format!("{}.py", py_path),
                 format!("{}/__init__.py", py_path),

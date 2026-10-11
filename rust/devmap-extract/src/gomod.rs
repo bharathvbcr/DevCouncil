@@ -175,6 +175,9 @@ pub struct ProjectManifests {
     /// resolver only knew by its directory and filed every such import
     /// `External` — "expected, not worth acting on" — about code it indexes.
     pub rust_crates: Vec<RustCrateManifest>,
+    /// The Python source roots each `pyproject.toml` / `setup.cfg` declares
+    /// (see [`crate::pyproject`]), one entry per manifest that declares any.
+    pub python_roots: Vec<crate::pyproject::PythonSourceRoots>,
 }
 
 /// One `Cargo.toml` package: the directory it governs and the crate names its
@@ -231,6 +234,7 @@ impl ProjectManifests {
 struct Found {
     modules: Vec<GoModule>,
     rust_crates: Vec<RustCrateManifest>,
+    python_roots: Vec<crate::pyproject::PythonSourceRoots>,
     ts_configs: Vec<String>,
     examined: BTreeSet<String>,
     refusals: Vec<(String, DiscoverySkipReason)>,
@@ -251,7 +255,12 @@ fn visit_manifest_entry(root: &Path, entry: &ignore::DirEntry, found: &std::sync
     };
     let is_go_mod = file_name == "go.mod";
     let is_cargo_toml = file_name == "Cargo.toml";
-    if !is_go_mod && !is_cargo_toml && !crate::tsconfig::is_ts_config_name(file_name) {
+    let is_python_manifest = file_name == "pyproject.toml" || file_name == "setup.cfg";
+    if !is_go_mod
+        && !is_cargo_toml
+        && !is_python_manifest
+        && !crate::tsconfig::is_ts_config_name(file_name)
+    {
         return;
     }
     // A link is a candidate whatever it points at. `is_file()` follows it and
@@ -269,6 +278,10 @@ fn visit_manifest_entry(root: &Path, entry: &ignore::DirEntry, found: &std::sync
         return;
     };
     let rel_str = rel_str.replace('\\', "/");
+    if is_python_manifest {
+        visit_python_manifest(root, &rel_str, found);
+        return;
+    }
     if is_cargo_toml {
         let read = read_manifest(root, &rel_str, crate::MAX_SOURCE_BYTES);
         let mut found = crate::recover_lock(found);
@@ -319,6 +332,66 @@ fn visit_manifest_entry(root: &Path, entry: &ignore::DirEntry, found: &std::sync
         ManifestRead::Refused(reason) => found
             .refusals
             .push((rel_str, DiscoverySkipReason::Unreadable { reason })),
+    }
+}
+
+/// Read one `pyproject.toml` or `setup.cfg` for the source roots it declares.
+///
+/// A manifest that does not parse, or names a root outside the repository or
+/// one that is not a directory, is a refusal row — the same record a `go.mod`
+/// gets — so "this project declares no roots" and "this project's roots could
+/// not be read" are different answers downstream.
+fn visit_python_manifest(root: &Path, rel_str: &str, found: &std::sync::Mutex<Found>) {
+    let read = read_manifest(root, rel_str, crate::MAX_SOURCE_BYTES);
+    let dir = rel_str
+        .rsplit_once('/')
+        .map(|(dir, _)| dir.to_string())
+        .unwrap_or_default();
+    let mut found = crate::recover_lock(found);
+    found.examined.insert(rel_str.to_string());
+    let refuse = |found: &mut Found, reason: String| {
+        found.refusals.push((
+            rel_str.to_string(),
+            DiscoverySkipReason::Unreadable { reason },
+        ));
+    };
+    match read {
+        ManifestRead::Read(source) => {
+            let parsed = if rel_str.ends_with("setup.cfg") {
+                crate::pyproject::parse_setup_cfg_roots(&dir, &source)
+            } else {
+                crate::pyproject::parse_pyproject_roots(&dir, &source)
+            };
+            match parsed {
+                Ok(mut declared) => {
+                    // A root the manifest names that is not a directory on
+                    // disk is dropped from the set and reported: the resolver
+                    // would otherwise probe a path that cannot hold a module.
+                    let missing: Vec<String> = declared
+                        .roots
+                        .iter()
+                        .filter(|path| !root.join(path.as_str()).is_dir())
+                        .cloned()
+                        .collect();
+                    if !missing.is_empty() {
+                        declared.roots.retain(|path| !missing.contains(path));
+                        refuse(
+                            &mut found,
+                            format!(
+                                "names Python source root(s) that are not directories: {}",
+                                missing.join(", ")
+                            ),
+                        );
+                    }
+                    if !declared.roots.is_empty() {
+                        found.python_roots.push(declared);
+                    }
+                }
+                Err(reason) => refuse(&mut found, reason),
+            }
+        }
+        ManifestRead::Absent | ManifestRead::Skipped => {}
+        ManifestRead::Refused(reason) => refuse(&mut found, reason),
     }
 }
 
@@ -408,6 +481,7 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
     let Found {
         mut modules,
         mut rust_crates,
+        mut python_roots,
         mut ts_configs,
         mut examined,
         mut refusals,
@@ -433,6 +507,11 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
     });
     ts_configs.sort();
     rust_crates.sort_by(|left, right| left.dir.cmp(&right.dir));
+    python_roots.sort_by(|left, right| {
+        left.dir
+            .cmp(&right.dir)
+            .then_with(|| left.roots.cmp(&right.roots))
+    });
     let ts = crate::tsconfig::build_ts_projects(root, &ts_configs);
     examined.extend(ts.examined);
     refusals.extend(
@@ -447,6 +526,7 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
         examined,
         refusals,
         rust_crates,
+        python_roots,
     })
 }
 

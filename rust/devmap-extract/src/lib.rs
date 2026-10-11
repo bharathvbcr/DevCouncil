@@ -70,6 +70,7 @@ mod returns;
 // tree; its one caller is `treesitter::collect_site_bindings`.
 #[cfg(feature = "parse")]
 mod literals;
+pub mod pyproject;
 #[cfg(feature = "parse")]
 mod rustlocal;
 #[cfg(feature = "parse")]
