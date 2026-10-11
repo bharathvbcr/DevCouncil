@@ -1155,7 +1155,7 @@ fn is_executable_source(path: &str) -> bool {
         ".sh", ".bash", ".zsh", ".ps1", ".pl", ".lua",
     ];
     // A test file's own lines are not the thing coverage is asking about.
-    if path.ends_with("_test.go") || path.ends_with("_test.py") || path.contains("/tests/") {
+    if dc_glob::is_test_path(path) {
         return false;
     }
     EXECUTABLE.iter().any(|ext| path.ends_with(ext))
@@ -1167,4 +1167,44 @@ fn truncate(text: &str, n: usize) -> String {
     }
     let cut: String = text.chars().take(n).collect();
     format!("{cut}…")
+}
+
+#[cfg(test)]
+mod test_path_conformance {
+    use super::is_executable_source;
+
+    /// A test file's own lines are not what coverage asks about, and "is a test
+    /// file" is the shared rule: a row of the fixture that executes is
+    /// measurable exactly when the fixture says it is not a test.
+    #[test]
+    fn executable_test_files_are_exempt_exactly_as_the_shared_fixture_says() {
+        let rows =
+            dc_glob::parse_test_path_rows(include_str!("../../../protocols/test-paths/v1.json"))
+                .expect("fixture");
+        let mut checked = 0;
+        let mut wrong = Vec::new();
+        for (path, is_test) in rows {
+            // The fixture's rows without an executable extension say nothing
+            // about this predicate.
+            let probe = if path.contains('.') {
+                path.clone()
+            } else {
+                continue;
+            };
+            let executable = [
+                ".go", ".py", ".ts", ".js", ".rb", ".java", ".rs", ".cs", ".scala",
+            ]
+            .iter()
+            .any(|ext| probe.ends_with(ext));
+            if !executable {
+                continue;
+            }
+            checked += 1;
+            if is_executable_source(&probe) == is_test {
+                wrong.push(format!("{probe} (test={is_test})"));
+            }
+        }
+        assert!(checked >= 15, "only {checked} rows reached the predicate");
+        assert!(wrong.is_empty(), "{wrong:?}");
+    }
 }

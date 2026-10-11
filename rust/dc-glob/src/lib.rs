@@ -16,8 +16,10 @@
 //! Python dialect.
 
 mod secret_paths;
+mod test_paths;
 
 pub use secret_paths::{SECRET_PATH_PATTERNS, is_secret_path};
+pub use test_paths::{in_test_directory, is_test_file_name, is_test_path, parse_test_path_rows};
 
 /// Longest pattern or name, in Unicode scalar values, matched exactly.
 ///

@@ -1,50 +1,50 @@
 use crate::model::*;
 
+/// Whether `path` is a test file for liveness.
+///
+/// The rule is `dc_glob::is_test_path`, the one implementation held to
+/// `protocols/test-paths/v1.json`. Liveness adds two things the shared rule does
+/// not say, and both are exemptions rather than a second rule:
+///
+/// * `conftest.py` and the Android `androidTest` directory, which pytest and
+///   Gradle give a meaning no path affix carries;
+/// * a dotfile is not a test for sitting in a test directory. The JVM layout
+///   used to `return true` outright, ahead of that guard, so the rule held for
+///   `tests/.eslintrc` and not for `app/src/test/.eslintrc` — the same file, one
+///   directory layout apart — and every dotfile a JVM project keeps beside its
+///   tests was annotated `TestFile`, exempting the whole file from liveness. A
+///   dotfile named like a test (`tests/.eslintrc.test.js`) still is one.
 pub fn is_test_path(path: &str) -> bool {
     let norm = path.replace('\\', "/");
-    let norm_lower = norm.to_lowercase();
     let name = norm.rsplit('/').next().unwrap_or(&norm);
-    let name_lower = name.to_lowercase();
-
-    let parts: Vec<&str> = norm_lower.split('/').collect();
-    let mut in_test_dir = parts.iter().rev().skip(1).any(|p| {
-        *p == "tests" || *p == "test" || *p == "__tests__" || *p == "spec" || *p == "androidtest"
-    });
-
-    // The Android / JVM layout, which contributes to the *directory* verdict
-    // and does not stand in for it. This used to `return true` outright, ahead
-    // of the `!name.starts_with('.')` guard below, so the rule the kernel
-    // published held for `tests/.eslintrc` and not for `app/src/test/.eslintrc`
-    // — the same file, one directory layout apart. Every dotfile a JVM project
-    // keeps beside its tests was annotated `TestFile`, which exempts the whole
-    // file from liveness.
-    //
-    // Kept as a branch rather than deleted even though the segment table above
-    // already answers `test` and `androidtest`: it mirrors
-    // `devcouncil.indexing.wiring.is_test_path`, which the parity module pins,
-    // and it is what keeps the JVM layout working if that table ever narrows.
-    if norm_lower.contains("/src/test/") || norm_lower.contains("/src/androidtest/") {
-        in_test_dir = true;
+    // A file with no extension that is merely named `test` is not an affix
+    // match: the JVM branch answers for the directory a file sits in, and
+    // `app/src/test` — a file — was once exempted from liveness as one.
+    let bare_name = !name.contains('.')
+        && matches!(
+            name.to_lowercase().as_str(),
+            "test" | "tests" | "spec" | "specs" | "androidtest"
+        );
+    if (!bare_name && dc_glob::is_test_file_name(name)) || name.eq_ignore_ascii_case("conftest.py")
+    {
+        return true;
     }
-
-    let looks_like_test = name_lower.starts_with("test_")
-        || name_lower == "conftest.py"
-        || name_lower.ends_with("_test.py")
-        || name_lower.ends_with("_test.go")
-        || name_lower.ends_with(".test.js")
-        || name_lower.ends_with(".test.ts")
-        || name_lower.ends_with(".test.jsx")
-        || name_lower.ends_with(".test.tsx")
-        || name_lower.ends_with(".spec.js")
-        || name_lower.ends_with(".spec.ts")
-        || name_lower.ends_with(".spec.jsx")
-        || name_lower.ends_with(".spec.tsx")
-        || name_lower.ends_with("_spec.rb")
-        || name.ends_with("Tests.swift")
-        || name.ends_with("Test.kt")
-        || name.ends_with("Tests.kt");
-
-    looks_like_test || (in_test_dir && !name.starts_with('.'))
+    if name.starts_with('.') {
+        return false;
+    }
+    // `testdata` is the shared rule's, and liveness answers it with its own
+    // fixture rule (`is_fixture_path`) and its own exemption reason, so it is
+    // left out here and the two never claim one file twice.
+    let directories: Vec<&str> = norm.split('/').collect();
+    let directories = &directories[..directories.len().saturating_sub(1)];
+    let outside_fixtures = directories
+        .iter()
+        .filter(|segment| !segment.eq_ignore_ascii_case("testdata"))
+        .fold(String::new(), |acc, segment| acc + segment + "/");
+    dc_glob::in_test_directory(&(outside_fixtures + name))
+        || directories
+            .iter()
+            .any(|segment| segment.eq_ignore_ascii_case("androidtest"))
 }
 
 /// Suffixes a minifier writes, and a human does not.
@@ -2906,5 +2906,26 @@ u = \"pkg.b:run [fast]\"
         assert!(annotations
             .iter()
             .any(|a| a.target_symbol == "pkg/mod0.py::main"));
+    }
+}
+
+#[cfg(test)]
+mod test_path_conformance {
+    use super::{is_fixture_path, is_test_path};
+
+    /// Held to the one rule every implementation shares.
+    #[test]
+    fn is_test_path_agrees_with_every_row_of_the_shared_fixture() {
+        let rows =
+            dc_glob::parse_test_path_rows(include_str!("../../../protocols/test-paths/v1.json"))
+                .expect("fixture");
+        let wrong: Vec<_> = rows
+            .iter()
+            // Liveness exempts a fixture directory under its own reason, so a
+            // row the shared rule calls a test is held to "test or fixture".
+            .filter(|(path, expected)| (is_test_path(path) || is_fixture_path(path)) != *expected)
+            .map(|(path, expected)| format!("{path} (expected {expected})"))
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:?}");
     }
 }

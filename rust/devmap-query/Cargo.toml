@@ -8,6 +8,9 @@ description = "Query engine and code-graph artifact writers for the DevCouncil k
 
 [dependencies]
 devmap-extract = { path = "../devmap-extract", default-features = false }
+# The one is_test_path; a path dependency inside this workspace, already
+# linked through devmap-extract.
+dc-glob = { path = "../dc-glob" }
 devmap-resolve = { path = "../devmap-resolve", default-features = false }
 devmap-analyze = { path = "../devmap-analyze", default-features = false }
 devmap-store = { path = "../devmap-store", default-features = false }
@@ -26,7 +29,6 @@ libc.workspace = true
 # Already a workspace dependency built for devmap-store, so no new crate enters
 # the tree — the same reasoning devmap-serve records for its own dev use.
 rusqlite.workspace = true
-
 [features]
 default = ["parse"]
 # Forwards the parsing frontend. Off, this crate builds without tree-sitter
