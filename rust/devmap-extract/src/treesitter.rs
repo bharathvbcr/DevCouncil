@@ -11455,7 +11455,10 @@ mod tests {
                 &[
                     (SymbolKind::File, "f.go", true),
                     (SymbolKind::Struct, "f.go::Client", true),
-                    (SymbolKind::Struct, "f.go::Runner", true),
+                    // An interface is an `Interface`, and each method it
+                    // requires is a symbol a call through it can name.
+                    (SymbolKind::Interface, "f.go::Runner", true),
+                    (SymbolKind::Method, "f.go::Runner.Run", true),
                     (SymbolKind::Method, "f.go::Client.Run", true),
                     (SymbolKind::Function, "f.go::New", true),
                     (SymbolKind::Function, "f.go::helper", false),

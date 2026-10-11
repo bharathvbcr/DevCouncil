@@ -382,6 +382,10 @@ func NewRecord(inner llm.Provider) string {
         .filter(|edge| {
             edge.source_symbol == "llm/replay/replay.go::NewRecord"
                 && edge.target_symbol == "llm/replay/replay.go::Provider.Name"
+                // `replay.Provider` does satisfy `llm.Provider`, so it is a
+                // legitimate interface-dispatch candidate (LOW). What must never
+                // happen is a *binding* — a name-based typed receiver.
+                && !matches!(edge.resolution.as_deref(), Some(Resolution::Dispatch { .. }))
         })
         .collect();
     assert!(
