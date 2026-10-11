@@ -46,6 +46,10 @@ Options:
   --json              machine-readable list/status
   --prefix DIR        install root (default: $PREFIX or ~/.local)
   --dry-run           print the commands; build, check and copy nothing
+  --gitpulse DIR      GitPulse checkout for the schema-consumer check
+                      (default: $DEVCOUNCIL_GITPULSE_ROOT, then ../GitPulse)
+  --strict-consumers  fail the install when a schema consumer is stale or
+                      unverifiable, or the check could not run
   --yes               skip uninstall confirmation
   --all               uninstall every catalog component (required when no names)
   -h, --help          this help
@@ -54,6 +58,14 @@ From a checkout, Rust components are built with cargo (PROFILE=release by
 default, or debug), each build is health-checked before any is installed, and
 each binary is copied beside its destination and renamed into place. Outside a
 checkout they come from cargo install --git.
+
+After a checkout install, the apps that read DevCouncil's schemas (GitPulse,
+Manvi, Jarvis) are asked whether they carry this checkout's numbers, through
+GitPulse's scripts/check-schema-parity.mjs run with node. Each lagging reader
+is printed with its remedy. The install still succeeds unless
+--strict-consumers is given. When GitPulse or node cannot be found, or the
+check fails, times out or prints something unreadable, the report says the
+consumers were NOT checked and why.
 
 Bootstrap (no host binary yet): bash scripts/install.sh [same arguments], or
 .\scripts\install.ps1 on Windows. Each builds cmd/dcinstall (this command,

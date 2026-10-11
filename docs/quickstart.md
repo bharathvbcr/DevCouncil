@@ -46,6 +46,31 @@ and runs `devcouncil install` with the same arguments, so
 selection and `--dry-run`. Once the host is on PATH, run `devcouncil install`
 directly. Without Go, install DevMap alone with
 `cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked devmap-cli`.
+After installing from a checkout, the installer checks the schema consumers.
+DevCouncil owns the devmap store, dc-store and workbench schemas, and GitPulse,
+Manvi and Jarvis each read them through binaries or pins that can fall behind.
+The installer finds a GitPulse checkout (`--gitpulse DIR`, then
+`$DEVCOUNCIL_GITPULSE_ROOT`, then `../GitPulse`) and runs its
+`scripts/check-schema-parity.mjs --json` with node, pointed at this checkout.
+The run is bounded at two minutes with output capped at 1 MiB. It prints
+every reader's verdict (`match`, `stale`, `unverifiable` or `absent`) and lists
+each stale or unverifiable reader under `FOLLOW-UP` with its remedy:
+
+- GitPulse's `gitpulse-mcp`: `bun run mcp:install`.
+- GitPulse.app: rebuild and reinstall the app.
+- GitPulse's vendored crates: re-vendor.
+- `devmap` or `dcstore` on PATH: reinstall, or fix PATH shadowing.
+- Manvi's or Jarvis's pin: bump the pin. That is a commit in that repository,
+  so report the delta and ask first.
+
+The install's exit status does not change: an owner does not refuse to install
+because a consumer lags. `--strict-consumers` makes a stale or unverifiable
+reader fail the install, and so does a check that could not run. It refuses
+`--dry-run`. If GitPulse or node is missing, or the check fails, times out or
+prints something unreadable, the installer prints
+`schema consumers: NOT CHECKED — <why>`, never a pass. With `--json`, the
+receipt carries the same report as `consumers`.
+
 The scripts build source. `npm install -g devcouncil` installs a lightweight
 launcher that resolves native executables; it does **not** replace this build or
 bundle the Rust suite. There is no current Python/uv install path.

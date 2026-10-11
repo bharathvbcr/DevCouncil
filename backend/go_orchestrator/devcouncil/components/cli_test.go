@@ -42,26 +42,26 @@ func swapStdout(t *testing.T) (*bytes.Buffer, func()) { return swapWriter(t, &os
 func swapStderr(t *testing.T) (*bytes.Buffer, func()) { return swapWriter(t, &os.Stderr) }
 
 func TestParseInstallArgsKeepsTheOldScriptsSpellings(t *testing.T) {
-	_, _, _, _, names, _, err := parseInstallArgs([]string{"--host-only", "-y", "--yes", "--", "devmap", "--prefix"})
+	a, err := parseInstallArgs([]string{"--host-only", "-y", "--yes", "--", "devmap", "--prefix"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	// --yes is accepted and means nothing to install; after -- every word is a name.
-	if !reflect.DeepEqual(names, []string{"host", "devmap", "--prefix"}) {
-		t.Fatalf("names=%v", names)
+	if !reflect.DeepEqual(a.names, []string{"host", "devmap", "--prefix"}) {
+		t.Fatalf("names=%v", a.names)
 	}
 }
 
 func TestParseInstallArgsTakesOnlyAsAPositionalName(t *testing.T) {
-	_, _, _, _, names, _, err := parseInstallArgs([]string{"--only", "devmap", "--only=dcgrep", "dcstore"})
+	a, err := parseInstallArgs([]string{"--only", "devmap", "--only=dcgrep", "dcstore"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(names, []string{"devmap", "dcgrep", "dcstore"}) {
-		t.Fatalf("names=%v", names)
+	if !reflect.DeepEqual(a.names, []string{"devmap", "dcgrep", "dcstore"}) {
+		t.Fatalf("names=%v", a.names)
 	}
-	for _, argv := range [][]string{{"--only"}, {"--only="}, {"--prefix"}, {"--prefix="}, {"--bogus"}} {
-		if _, _, _, _, _, _, err := parseInstallArgs(argv); err == nil {
+	for _, argv := range [][]string{{"--only"}, {"--only="}, {"--prefix"}, {"--prefix="}, {"--bogus"}, {"--gitpulse"}, {"--gitpulse="}} {
+		if _, err := parseInstallArgs(argv); err == nil {
 			t.Fatalf("%v accepted", argv)
 		}
 	}

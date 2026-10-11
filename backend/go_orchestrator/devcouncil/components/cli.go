@@ -14,14 +14,26 @@ import (
 )
 
 func RunInstall(args []string) int {
-	list, jsonOut, dry, prefix, names, help, err := parseInstallArgs(args)
+	return runInstall(args, Options{})
+}
+
+// runInstall is RunInstall with the seams Options carries; tests fill them.
+func runInstall(args []string, base Options) int {
+	a, err := parseInstallArgs(args)
 	if err != nil {
 		console.Errorln(err)
 		return 2
 	}
-	if help {
+	list, jsonOut, dry, names := a.list, a.jsonOut, a.dry, a.names
+	if a.help {
 		console.Print(HelpText)
 		return 0
+	}
+	if a.strictConsumers && dry {
+		// A rehearsal installs nothing, so there is no install for the
+		// consumers to lag behind; refusing beats a verdict on nothing.
+		console.Errorln("--strict-consumers judges a real install; --dry-run installs nothing")
+		return 2
 	}
 	if list {
 		if jsonOut {
@@ -44,11 +56,24 @@ func RunInstall(args []string) int {
 		console.Errorln(err)
 		return 2
 	}
-	opts := Options{Prefix: prefix, DryRun: dry}
+	opts := base
+	opts.Prefix, opts.DryRun = a.prefix, dry
 	var installErr error
 	// A dry-run plan is already structured; do not print shell commands into JSON.
 	if !jsonOut || !dry {
 		installErr = Install(cs, opts)
+	}
+	var consumers ConsumerReport
+	switch {
+	case dry:
+		consumers = notChecked("", "dry run: nothing was installed")
+	case installErr != nil:
+		consumers = notChecked("", "the install failed")
+	default:
+		consumers = CheckConsumers(opts.source(), a.gitpulse, opts)
+	}
+	if !jsonOut {
+		PrintConsumerReport(consumers)
 	}
 	if jsonOut {
 		ids := make([]string, 0, len(cs))
@@ -56,12 +81,13 @@ func RunInstall(args []string) int {
 			ids = append(ids, c.ID)
 		}
 		receipt := struct {
-			OK         bool     `json:"ok"`
-			DryRun     bool     `json:"dry_run"`
-			Components []string `json:"components"`
-			Commands   []string `json:"commands,omitempty"`
-			Error      string   `json:"error,omitempty"`
-		}{OK: installErr == nil, DryRun: dry, Components: ids}
+			OK         bool            `json:"ok"`
+			DryRun     bool            `json:"dry_run"`
+			Components []string        `json:"components"`
+			Commands   []string        `json:"commands,omitempty"`
+			Error      string          `json:"error,omitempty"`
+			Consumers  *ConsumerReport `json:"consumers"`
+		}{OK: installErr == nil, DryRun: dry, Components: ids, Consumers: &consumers}
 		if dry {
 			receipt.Commands = PlannedCommands(cs, opts)
 		}
@@ -77,65 +103,99 @@ func RunInstall(args []string) int {
 		console.Errorf("install: %v\n", installErr)
 		return 1
 	}
-
+	// The owner installs even when a consumer lags: refusing to install
+	// itself would not bring the consumer up. --strict-consumers is for
+	// callers that want the lag, or an unexamined consumer, to fail the run.
+	if a.strictConsumers && !consumers.Passed() {
+		console.Errorln("install: --strict-consumers: the schema consumers did not all report a match (see the consumers report)")
+		return 1
+	}
 	return 0
 }
 
-func parseInstallArgs(args []string) (list, jsonOut, dry bool, prefix string, names []string, help bool, err error) {
+// installArgs is what `devcouncil install` was asked to do.
+type installArgs struct {
+	list, jsonOut, dry, help bool
+	prefix                   string
+	names                    []string
+	// gitpulse is the GitPulse checkout whose schema-parity check runs after
+	// the install; empty means GitPulseRootEnv, then the sibling checkout.
+	gitpulse string
+	// strictConsumers fails the install when a consumer lags or was not checked.
+	strictConsumers bool
+}
+
+func parseInstallArgs(args []string) (installArgs, error) {
+	var a installArgs
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "-h", "--help":
-			help = true
+			a.help = true
 		case "--list":
-			list = true
+			a.list = true
 		case "--json":
-			jsonOut = true
+			a.jsonOut = true
 		case "--dry-run":
-			dry = true
+			a.dry = true
 		case "--yes", "-y":
 			// Confirmation is an uninstall question; the scripts this replaced
 			// accepted it everywhere.
 		case "--host-only":
-			names = append(names, "host")
+			a.names = append(a.names, "host")
+		case "--strict-consumers":
+			a.strictConsumers = true
 		case "--":
-			names = append(names, args[i+1:]...)
-			return list, jsonOut, dry, prefix, names, help, nil
+			a.names = append(a.names, args[i+1:]...)
+			return a, nil
 		case "--prefix":
 			i++
 			if i >= len(args) {
-				return false, false, false, "", nil, false, fmt.Errorf("--prefix needs a directory")
+				return installArgs{}, fmt.Errorf("--prefix needs a directory")
 			}
-			prefix = args[i]
+			a.prefix = args[i]
+		case "--gitpulse":
+			i++
+			if i >= len(args) || args[i] == "" {
+				return installArgs{}, fmt.Errorf("--gitpulse needs a directory")
+			}
+			a.gitpulse = args[i]
 		case "--only":
 			// The bootstrap scripts' spelling of a positional name.
 			i++
 			if i >= len(args) || args[i] == "" {
-				return false, false, false, "", nil, false, fmt.Errorf("--only needs a component name")
+				return installArgs{}, fmt.Errorf("--only needs a component name")
 			}
-			names = append(names, args[i])
+			a.names = append(a.names, args[i])
 		default:
 			if strings.HasPrefix(args[i], "--only=") {
 				only := strings.TrimPrefix(args[i], "--only=")
 				if only == "" {
-					return false, false, false, "", nil, false, fmt.Errorf("--only needs a component name")
+					return installArgs{}, fmt.Errorf("--only needs a component name")
 				}
-				names = append(names, only)
+				a.names = append(a.names, only)
 				continue
 			}
 			if strings.HasPrefix(args[i], "--prefix=") {
-				prefix = strings.TrimPrefix(args[i], "--prefix=")
-				if prefix == "" {
-					return false, false, false, "", nil, false, fmt.Errorf("--prefix needs a directory")
+				a.prefix = strings.TrimPrefix(args[i], "--prefix=")
+				if a.prefix == "" {
+					return installArgs{}, fmt.Errorf("--prefix needs a directory")
+				}
+				continue
+			}
+			if strings.HasPrefix(args[i], "--gitpulse=") {
+				a.gitpulse = strings.TrimPrefix(args[i], "--gitpulse=")
+				if a.gitpulse == "" {
+					return installArgs{}, fmt.Errorf("--gitpulse needs a directory")
 				}
 				continue
 			}
 			if strings.HasPrefix(args[i], "-") {
-				return false, false, false, "", nil, false, fmt.Errorf("unknown flag: %s", args[i])
+				return installArgs{}, fmt.Errorf("unknown flag: %s", args[i])
 			}
-			names = append(names, args[i])
+			a.names = append(a.names, args[i])
 		}
 	}
-	return list, jsonOut, dry, prefix, names, help, nil
+	return a, nil
 }
 
 func RunUninstall(args []string) int {

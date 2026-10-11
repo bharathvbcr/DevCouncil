@@ -170,6 +170,15 @@ at `../gusset`, at the revision pinned in
 (`npm run ci:local` and `rust/verify.sh` fail on any other revision). Without Go, `cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked devmap-cli`
 installs DevMap alone. On Windows use `.\scripts\install.ps1 -Components devmap`,
 or omit `-Components` for the suite.
+
+After a checkout install, the installer asks the apps that read DevCouncil's
+schemas (GitPulse, Manvi, Jarvis) whether they carry this checkout's numbers.
+It does this by running GitPulse's `scripts/check-schema-parity.mjs` with node,
+from `--gitpulse DIR`, `$DEVCOUNCIL_GITPULSE_ROOT` or a sibling `../GitPulse`.
+Each stale or unverifiable reader is printed under `FOLLOW-UP` with its
+remedy, and the install still succeeds. Pass `--strict-consumers` to fail it
+instead, including when the check could not run. Without GitPulse or node, the
+report says `schema consumers: NOT CHECKED` and why.
 The npm package is a lightweight launcher for native binaries, not a bundled
 runtime. [Complete installation guide](docs/quickstart.md).
 
