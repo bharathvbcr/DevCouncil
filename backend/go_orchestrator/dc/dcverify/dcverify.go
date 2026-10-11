@@ -320,6 +320,14 @@ type Result struct {
 	// no count, which reads as zero: it parsed nothing.
 	StubASTParsedFiles int `json:"stub_ast_parsed_files"`
 
+	// StubASTDegraded lists changed files, as "path: reason", that the stub
+	// checks could not analyse from the syntax tree (a syntax error, a source
+	// too large, a parse past its time budget) and read with the weaker line
+	// checks instead. A file listed here has not had the examination an
+	// unlisted one has, so the host reports the run degraded. An older
+	// verifier sends none, which reads as no degradation reported.
+	StubASTDegraded []string `json:"stub_ast_degraded"`
+
 	// The coverage arrays as they arrive. Callers read Coverage instead, which
 	// carries the same data with the measured/unmeasured distinction that makes
 	// it safe to act on; these stay unexported-by-intent behind that accessor.
@@ -346,6 +354,7 @@ type wireResult struct {
 	CoverageGaps          []CoverageGap `json:"coverage_gaps"`
 	CoverageSkippedByType []string      `json:"coverage_skipped_by_type"`
 	StubASTParsedFiles    int           `json:"stub_ast_parsed_files"`
+	StubASTDegraded       []string      `json:"stub_ast_degraded"`
 	// A pointer so its ABSENCE is detectable. A verifier built before the
 	// substance gate existed emits no `substance` key, which decodes into a
 	// zero value — nought added lines, judged false — and that is
@@ -447,6 +456,7 @@ func (c *Client) Check(ctx context.Context, req Request) (*Result, error) {
 		UntouchedPlanned:      wire.UntouchedPlanned,
 		Findings:              wire.Findings,
 		StubASTParsedFiles:    wire.StubASTParsedFiles,
+		StubASTDegraded:       wire.StubASTDegraded,
 		coverageGaps:          wire.CoverageGaps,
 		coverageUnmeasured:    wire.CoverageUnmeasured,
 		coverageSkippedByType: wire.CoverageSkippedByType,

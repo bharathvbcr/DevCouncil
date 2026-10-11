@@ -55,7 +55,7 @@ func TestPersistKeepsEveryGapField(t *testing.T) {
 		}
 	}
 
-	if err := Persist(ctx, client, gap.TaskID, []Gap{gap}, runMeta{Sandbox: SandboxLocal}, "failed"); err != nil {
+	if err := Persist(ctx, client, gap.TaskID, []Gap{gap}, runMeta{Sandbox: SandboxLocal, GateMode: "enforce"}, "failed"); err != nil {
 		t.Fatalf("Persist: %v", err)
 	}
 	rows, _, err := client.Gaps(ctx, gap.TaskID)

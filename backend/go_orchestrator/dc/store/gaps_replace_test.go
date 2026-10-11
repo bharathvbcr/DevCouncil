@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -224,5 +225,71 @@ func TestGapsReplaceClearsWhatItReplaces(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].ID != second.ID {
 		t.Fatalf("gaps = %+v, want only the replacement set", got)
+	}
+}
+
+// A replacement that fails part-way must leave the previous set in place. The
+// old spelling — gaps-clear, then one gap-upsert per gap — emptied the task
+// first, so a failure at the Nth gap left a partial set that
+// devcouncil_get_gaps served as authoritative.
+func TestGapsReplaceFailingAtTheNthGapKeepsThePreviousSet(t *testing.T) {
+	c := client(t)
+	ctx := context.Background()
+	row := func(id, task string) GapRow {
+		return GapRow{ID: id, Severity: "high", GapType: "test_failed", TaskID: task,
+			Description: "d " + id, RecommendedFix: "f", Blocking: true, EvidenceJSON: []byte(`[]`)}
+	}
+	if err := c.GapsReplace(ctx, "OTHER", []GapRow{row("TAKEN", "OTHER")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.GapsReplace(ctx, "T1", []GapRow{row("OLD-1", "T1"), row("OLD-2", "T1")}); err != nil {
+		t.Fatal(err)
+	}
+	// The third gap collides with another task's row: the Nth write fails.
+	err := c.GapsReplace(ctx, "T1", []GapRow{row("NEW-1", "T1"), row("NEW-2", "T1"), row("TAKEN", "T1")})
+	if err == nil {
+		t.Fatal("a colliding gap must fail the replacement")
+	}
+	got, _, err := c.Gaps(ctx, "T1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]bool{}
+	for _, g := range got {
+		ids[g.ID] = true
+	}
+	if len(got) != 2 || !ids["OLD-1"] || !ids["OLD-2"] {
+		t.Fatalf("the previous set was not preserved: %+v", got)
+	}
+}
+
+func TestGapsReplaceRefusesAnOverLimitSetBeforeSendingIt(t *testing.T) {
+	c := client(t)
+	many := make([]GapRow, MaxGapsPerReplace+1)
+	for i := range many {
+		many[i] = GapRow{ID: fmt.Sprintf("G%d", i), GapType: "x", Description: "d", TaskID: "T1"}
+	}
+	err := c.GapsReplace(context.Background(), "T1", many)
+	if err == nil || !strings.Contains(err.Error(), "limit") {
+		t.Fatalf("err = %v, want a loud over-limit refusal", err)
+	}
+}
+
+// Awkward bytes survive the wire: newlines, a colon-and-digit lookalike frame,
+// multibyte text, and a NUL (which argv cannot carry) becomes U+FFFD.
+func TestGapsReplaceCarriesAwkwardText(t *testing.T) {
+	c := client(t)
+	ctx := context.Background()
+	desc := "line1\n3:abc\n\U0001F600 tail\x00end"
+	if err := c.GapsReplace(ctx, "T1", []GapRow{{ID: "G1", Severity: "low", GapType: "test_failed",
+		TaskID: "T1", Description: desc, EvidenceJSON: []byte(`["exit code 1: x"]`)}}); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := c.Gaps(ctx, "T1")
+	if err != nil || len(got) != 1 {
+		t.Fatalf("gaps=%+v err=%v", got, err)
+	}
+	if want := strings.ReplaceAll(desc, "\x00", "�"); got[0].Description != want {
+		t.Fatalf("description = %q, want %q", got[0].Description, want)
 	}
 }

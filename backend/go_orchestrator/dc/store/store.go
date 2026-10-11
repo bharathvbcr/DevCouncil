@@ -862,73 +862,116 @@ func (c *Client) GapHistory(ctx context.Context, taskID string) ([]GapHistoryRow
 	return out.History, out.Truncated, nil
 }
 
-// GapsReplace clears a task's gaps then upserts the replacement set.
+// MaxGapsPerReplace is the most gaps one replacement may carry. It mirrors
+// dc_store::records::MAX_GAPS_PER_REPLACE, which enforces it; the client checks
+// first so an over-limit set fails before it is encoded and sent.
+const MaxGapsPerReplace = 500
+
+// GapsReplace replaces a task's gaps in one store transaction: the whole new
+// set is stored or the previous set is left exactly as it was.
+//
+// It used to clear the task and then upsert each gap in turn, so a failure or
+// a kill part-way left the task with no gaps or a partial set, which
+// devcouncil_get_gaps then served as authoritative.
 func (c *Client) GapsReplace(ctx context.Context, taskID string, gaps []GapRow) error {
+	return c.RecordVerification(ctx, nil, taskID, gaps)
+}
+
+// RecordVerification commits a verification run (when run is non-nil) and the
+// task's replacement gap set as one transaction: a run is never stored with a
+// status and no gaps, and a failed commit leaves the previous gaps in place.
+// A set over MaxGapsPerReplace is refused.
+//
+// This needs a dcstore that knows `gaps-replace`; an older one answers
+// "unknown command", which is returned as an error rather than answered by
+// falling back to the non-transactional path this replaced.
+func (c *Client) RecordVerification(ctx context.Context, run *VerificationRun, taskID string, gaps []GapRow) error {
 	if taskID == "" {
 		return fmt.Errorf("gaps-replace requires task_id")
 	}
-	out, err := c.run(ctx, "gaps-clear", "--task", taskID)
+	if len(gaps) > MaxGapsPerReplace {
+		return fmt.Errorf("gaps-replace refused: %d gaps exceeds the limit of %d", len(gaps), MaxGapsPerReplace)
+	}
+	if run != nil && run.TaskID != taskID {
+		return fmt.Errorf("gaps-replace refused: run %s belongs to task %q, not %q", run.ID, run.TaskID, taskID)
+	}
+	out, err := c.run(ctx, "gaps-replace", "--task", taskID, "--wire", encodeVerificationWire(run, gaps))
 	if err != nil {
 		return err
 	}
 	if !out.OK {
-		return fmt.Errorf("gaps-clear refused: %s", out.Error)
-	}
-	for _, g := range gaps {
-		args := []string{
-			"gap-upsert",
-			"--id", g.ID,
-			"--severity", g.Severity,
-			"--gap-type", g.GapType,
-			"--description", g.Description,
-			"--recommended-fix", g.RecommendedFix,
-			"--task", taskID,
-			"--evidence", string(g.EvidenceJSON),
-		}
-		if g.Blocking {
-			args = append(args, "--blocking", "true")
-		} else {
-			args = append(args, "--blocking", "false")
-		}
-		// Absent fields are omitted rather than sent empty: dcstore stores
-		// `--requirement-id ""` as an empty string, not NULL, and an empty id
-		// would read back as a gap about a criterion that has no name.
-		for _, opt := range []struct {
-			flag  string
-			value *string
-		}{
-			{"--requirement-id", g.RequirementID},
-			{"--acceptance-criterion-id", g.AcceptanceCriterionID},
-			{"--expected-verification-method", g.ExpectedVerificationMethod},
-			{"--file", g.File},
-			{"--suggested-command", g.SuggestedCommand},
-			{"--stdout-path", g.StdoutPath},
-			{"--stderr-path", g.StderrPath},
-		} {
-			if opt.value != nil && *opt.value != "" {
-				args = append(args, opt.flag, *opt.value)
-			}
-		}
-		if g.Line != nil {
-			args = append(args, "--line", strconv.Itoa(*g.Line))
-		}
-		if strings.TrimSpace(string(g.EvidenceJSON)) == "" {
-			// replace the empty evidence flag value
-			for i := 0; i < len(args)-1; i++ {
-				if args[i] == "--evidence" {
-					args[i+1] = "[]"
-				}
-			}
-		}
-		out, err := c.run(ctx, args...)
-		if err != nil {
-			return err
-		}
-		if !out.OK {
-			return fmt.Errorf("gap-upsert refused: %s", out.Error)
-		}
+		return fmt.Errorf("gaps-replace refused: %s", out.Error)
 	}
 	return nil
+}
+
+// encodeVerificationWire writes the framing dc_store::commit_wire documents:
+// every field is "<byte length>:<bytes>" and an absent optional is "-".
+func encodeVerificationWire(run *VerificationRun, gaps []GapRow) string {
+	var w strings.Builder
+	field := func(s string) {
+		// argv cannot carry NUL and the store reads UTF-8: both are replaced
+		// rather than refused, because a command's output tail is arbitrary.
+		s = strings.ToValidUTF8(strings.ReplaceAll(s, "\x00", "\uFFFD"), "\uFFFD")
+		w.WriteString(strconv.Itoa(len(s)))
+		w.WriteByte(':')
+		w.WriteString(s)
+	}
+	optional := func(s *string) {
+		if s == nil || *s == "" {
+			w.WriteByte('-')
+			return
+		}
+		field(*s)
+	}
+	field("DCVC1")
+	if run == nil {
+		field("N")
+	} else {
+		field("R")
+		for _, v := range []string{run.ID, run.TaskID, run.Sandbox, orDefault(run.EnvironmentJSON, "{}"), orDefault(run.CommandsJSON, "[]"), run.Status, run.StartedAt} {
+			field(v)
+		}
+		finished := run.FinishedAt
+		optional(&finished)
+	}
+	field(strconv.Itoa(len(gaps)))
+	for _, g := range gaps {
+		field(g.ID)
+		field(g.Severity)
+		field(g.GapType)
+		field(g.Description)
+		field(orDefault(strings.TrimSpace(string(g.EvidenceJSON)), "[]"))
+		field(g.RecommendedFix)
+		if g.Blocking {
+			field("1")
+		} else {
+			field("0")
+		}
+		// Absent fields are omitted rather than sent empty: an empty string is
+		// stored as such, not NULL, and an empty id would read back as a gap
+		// about a criterion that has no name.
+		optional(g.RequirementID)
+		optional(g.File)
+		if g.Line != nil {
+			field(strconv.Itoa(*g.Line))
+		} else {
+			w.WriteByte('-')
+		}
+		optional(g.SuggestedCommand)
+		optional(g.AcceptanceCriterionID)
+		optional(g.ExpectedVerificationMethod)
+		optional(g.StdoutPath)
+		optional(g.StderrPath)
+	}
+	return w.String()
+}
+
+func orDefault(s, fallback string) string {
+	if s == "" {
+		return fallback
+	}
+	return s
 }
 
 // RunRecord upserts a verification run.

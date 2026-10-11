@@ -231,7 +231,7 @@ fn check(
     Ok(format!(
         "{{\"ok\":true,\"files\":{},\"stub_ast_parsed_files\":{},\"in_scope\":{},\"orphans\":{},\
          \"untouched_planned\":{},\"findings\":{},\"coverage_unmeasured\":{},\"coverage_gaps\":{},\
-         \"coverage_skipped_by_type\":{},\"substance\":{}}}",
+         \"coverage_skipped_by_type\":{},\"substance\":{},\"stub_ast_degraded\":{}}}",
         // Changed paths, not diff entries: a rename is two, and scope
         // classification judged both.
         dc_verify::changed_paths(&files).count(),
@@ -249,6 +249,16 @@ fn check(
         // like a file that was measured and clean.
         string_array(&coverage.skipped_by_type),
         substance_object(&substance),
+        // Files the tree could not analyse, which took the weaker substring
+        // checks. Additive: a host that does not read it sees the reply it
+        // always did.
+        string_array(
+            &stubs
+                .unparsed
+                .iter()
+                .map(|u| format!("{}: {}", u.path, u.reason))
+                .collect::<Vec<_>>()
+        ),
     ))
 }
 

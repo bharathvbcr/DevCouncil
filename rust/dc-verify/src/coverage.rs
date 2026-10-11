@@ -89,7 +89,7 @@ pub fn parse_with_root(
         });
     }
     if trimmed.starts_with("mode:") {
-        parse_go(raw)
+        parse_go(raw, root)
     } else if trimmed.starts_with("TN:") || trimmed.starts_with("SF:") {
         parse_lcov(raw, root)
     } else {
@@ -107,7 +107,8 @@ pub fn parse_with_root(
 /// numStmts count`. A block with a non-zero count means every line it spans
 /// executed; the intersection asks about individual lines, so the block is
 /// expanded.
-fn parse_go(raw: &str) -> Result<Vec<FileCoverage>, CoverageError> {
+fn parse_go(raw: &str, root: Option<&std::path::Path>) -> Result<Vec<FileCoverage>, CoverageError> {
+    let modules = root.map(go_modules).unwrap_or_default();
     let mut covered: BTreeMap<String, Vec<u32>> = BTreeMap::new();
     let mut seen_any = false;
     let mut materialised: u64 = 0;
@@ -166,9 +167,10 @@ fn parse_go(raw: &str) -> Result<Vec<FileCoverage>, CoverageError> {
         }
 
         seen_any = true;
-        // The path is module-qualified; the diff is repo-relative. Both are
-        // recorded so the intersection matches whichever form the diff carries.
-        let entry = covered.entry(normalise_go_path(path)).or_default();
+        // The path is module-qualified; the diff is repo-relative.
+        let entry = covered
+            .entry(normalise_go_path(path, &modules))
+            .or_default();
         if count > 0 {
             // Counted before the lines are pushed, not after: the point of the
             // bound is that the allocation never happens, so checking it once
@@ -196,16 +198,128 @@ fn parse_go(raw: &str) -> Result<Vec<FileCoverage>, CoverageError> {
     Ok(finish(covered))
 }
 
-/// Strips a Go coverprofile's module prefix down to a repo-relative path.
+/// A Go module found under the repository root: its import path and the
+/// directory holding its `go.mod`, repo-relative with `/` separators ("" for
+/// the root module).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoModule {
+    pub path: String,
+    pub dir: String,
+}
+
+/// Directories never searched for a `go.mod`: they hold other projects' modules
+/// or build output, and a module declared there is not this repository's.
+const SKIPPED_DIRS: &[&str] = &["vendor", "node_modules", "target", "testdata"];
+const MAX_MODULE_DEPTH: usize = 8;
+const MAX_MODULE_DIRS: usize = 5_000;
+const MAX_GO_MOD_BYTES: u64 = 64 * 1024;
+
+/// Finds the Go modules under `root` by reading each `go.mod`'s `module` line.
 ///
-/// A profile records `manvi/gate/gate.go` where the diff says
-/// `gate/gate.go`: the first segment is the module name, not a
-/// directory. Only the leading segment is dropped, and only when what remains
-/// still looks like a path, so a genuinely relative entry is left alone.
-fn normalise_go_path(path: &str) -> String {
-    match path.split_once('/') {
-        Some((_module, rest)) if rest.contains('/') || rest.ends_with(".go") => rest.to_string(),
-        _ => path.to_string(),
+/// Bounded in depth and in directories visited, and it never follows a
+/// symlink, so a crafted tree cannot turn reading a coverage profile into a
+/// walk of the machine. A `go.mod` it cannot read or parse is skipped: the
+/// files that module would have claimed then report unmeasured, which is the
+/// visible outcome.
+pub fn go_modules(root: &std::path::Path) -> Vec<GoModule> {
+    let mut found = Vec::new();
+    let mut visited = 0usize;
+    let mut stack: Vec<(std::path::PathBuf, Vec<String>)> = vec![(root.to_path_buf(), Vec::new())];
+    while let Some((dir, rel)) = stack.pop() {
+        visited += 1;
+        if visited > MAX_MODULE_DIRS {
+            break;
+        }
+        if let Some(path) = read_module_path(&dir.join("go.mod")) {
+            found.push(GoModule {
+                path,
+                dir: rel.join("/"),
+            });
+        }
+        if rel.len() >= MAX_MODULE_DEPTH {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !kind.is_dir() || name.starts_with('.') || SKIPPED_DIRS.contains(&name.as_str()) {
+                continue;
+            }
+            let mut next = rel.clone();
+            next.push(name);
+            stack.push((entry.path(), next));
+        }
+    }
+    found
+}
+
+fn read_module_path(go_mod: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    let meta = std::fs::symlink_metadata(go_mod).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    std::fs::File::open(go_mod)
+        .ok()?
+        .take(MAX_GO_MOD_BYTES)
+        .read_to_string(&mut text)
+        .ok()?;
+    text.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("module")?;
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let name = rest.trim().trim_matches('"');
+        (!name.is_empty()).then(|| name.to_string())
+    })
+}
+
+/// Maps a Go coverprofile path to the repo-relative path the diff uses.
+///
+/// A profile records `<module>/<package>/<file>.go`. With the repository's
+/// modules known, the longest module path that prefixes the entry is replaced
+/// by that module's directory, so `github.com/x/y/pkg/a.go` in the root module
+/// `github.com/x/y` is `pkg/a.go`, and in a module `github.com/x/y/sub` living
+/// in `sub/` it is `sub/pkg/a.go`. An entry no module claims is kept verbatim —
+/// it then matches nothing and is reported unmeasured, rather than being
+/// guessed into some other file's coverage.
+///
+/// With no module information at all (no root, or no `go.mod` under it) the
+/// first segment is dropped as before: a one-segment module name is the only
+/// shape that guess is right for, and a wrong guess is also reported
+/// unmeasured.
+fn normalise_go_path(path: &str, modules: &[GoModule]) -> String {
+    if modules.is_empty() {
+        return match path.split_once('/') {
+            Some((_module, rest)) if rest.contains('/') || rest.ends_with(".go") => {
+                rest.to_string()
+            }
+            _ => path.to_string(),
+        };
+    }
+    let best = modules
+        .iter()
+        .filter(|m| {
+            path.strip_prefix(m.path.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+        })
+        .max_by_key(|m| m.path.len());
+    match best {
+        Some(m) => {
+            let rest = &path[m.path.len() + 1..];
+            if m.dir.is_empty() {
+                rest.to_string()
+            } else {
+                format!("{}/{rest}", m.dir)
+            }
+        }
+        None => path.to_string(),
     }
 }
 

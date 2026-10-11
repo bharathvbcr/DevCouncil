@@ -74,6 +74,10 @@ func TestCommandSecurityKeepsSuccessfulAndDisabledControls(t *testing.T) {
 	for _, mode := range []string{"enforce", "advisory", "off"} {
 		in := verificationInput(func(string) verify.CommandOutcome { return verify.CommandOutcome{ExitCode: 0} })
 		in.GateMode = mode
+		// This control is about commands, not the rigor scanners: opt out of
+		// them explicitly, because an enforce run without dcverify is degraded
+		// (see TestEnforceWithoutDcverifyIsDegradedNotVerified).
+		in.AllowNoRigor = true
 		gaps, meta := verify.Run(context.Background(), in)
 		result := verify.ToMCP(in.Task.ID, gaps, meta)
 		if result.Passed != (mode != "off") || result.VerificationSkipped != (mode == "off") {

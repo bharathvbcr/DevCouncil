@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 )
@@ -40,13 +41,70 @@ func CommandIsMalformed(outcome CommandOutcome) bool {
 // Invariant: a command that could not run yields invalid_verification_command
 // or skipped_verification_command — never a silent pass.
 func RunVerificationCommands(taskID string, commands []string, run func(string) CommandOutcome) []Gap {
+	gaps, _ := runVerificationCommands(taskID, commands, run)
+	return gaps
+}
+
+// CommandRecord is the evidence one verification command leaves behind: what
+// ran, how it ended and how long it took, with a bounded tail of its output.
+// It is what the stored run's commands_json carries, so a run that executed
+// `go vet ./...` and `false` is distinguishable from one that executed nothing.
+type CommandRecord struct {
+	Command    string `json:"command"`
+	ExitCode   int    `json:"exit_code"`
+	DurationMS int64  `json:"duration_ms"`
+	TimedOut   bool   `json:"timed_out,omitempty"`
+	// Skipped marks a command that did not run (no runner, or refused).
+	Skipped bool   `json:"skipped,omitempty"`
+	Reason  string `json:"reason,omitempty"`
+	Tail    string `json:"output_tail,omitempty"`
+}
+
+// commandTailLimit bounds the output kept per command record.
+const commandTailLimit = 2000
+
+func commandRecord(cmd string, outcome CommandOutcome, took time.Duration) CommandRecord {
+	tail := outcome.Summary
+	if tail == "" {
+		tail = strings.TrimSpace(outcome.Stderr)
+	}
+	if tail == "" {
+		tail = strings.TrimSpace(outcome.Stdout)
+	}
+	return CommandRecord{
+		Command:    cmd,
+		ExitCode:   outcome.ExitCode,
+		DurationMS: took.Milliseconds(),
+		TimedOut:   outcome.TimedOut,
+		Skipped:    outcome.Skipped,
+		Reason:     outcome.Reason,
+		Tail:       truncateTail(tail, commandTailLimit),
+	}
+}
+
+// truncateTail keeps the end of s: the last lines of a failing run are the
+// ones that name the failure.
+func truncateTail(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	cut := len(s) - limit
+	for cut < len(s) && !utf8.RuneStart(s[cut]) {
+		cut++
+	}
+	return s[cut:]
+}
+
+func runVerificationCommands(taskID string, commands []string, run func(string) CommandOutcome) ([]Gap, []CommandRecord) {
 	if len(commands) == 0 {
-		return nil
+		return nil, nil
 	}
 	if run == nil {
 		var gaps []Gap
+		records := make([]CommandRecord, 0, len(commands))
 		for _, cmd := range commands {
 			c := cmd
+			records = append(records, CommandRecord{Command: cmd, ExitCode: -1, Skipped: true, Reason: "command runner unavailable"})
 			gaps = append(gaps, Gap{
 				ID:       StableGapID(taskID, "SKIP-"+cmd),
 				Severity: "low",
@@ -60,12 +118,15 @@ func RunVerificationCommands(taskID string, commands []string, run func(string) 
 				SuggestedCommand: &c,
 			})
 		}
-		return gaps
+		return gaps, records
 	}
 	var gaps []Gap
+	records := make([]CommandRecord, 0, len(commands))
 	for _, cmd := range commands {
 		c := cmd
+		began := time.Now()
 		outcome := run(cmd)
+		records = append(records, commandRecord(cmd, outcome, time.Since(began)))
 		// First, before the exit code is read: a stopped command reports -1,
 		// which is otherwise the "could not run" shape.
 		if outcome.TimedOut {
@@ -140,13 +201,13 @@ func RunVerificationCommands(taskID string, commands []string, run func(string) 
 			GapType:          "test_failed",
 			TaskID:           taskID,
 			Description:      "Verification command failed: '" + cmd + "'.",
-			Evidence:         []string{truncate(summary, 500)},
+			Evidence:         []string{"exit code " + itoa(outcome.ExitCode) + ": " + truncate(summary, 500)},
 			RecommendedFix:   "Fix the failing check, then re-run: " + cmd,
 			Blocking:         true,
 			SuggestedCommand: &c,
 		})
 	}
-	return gaps
+	return gaps, records
 }
 
 // DefaultRunCommand shells out through /bin/sh -c in root, each command bounded

@@ -1,13 +1,13 @@
 package verify
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -100,7 +100,6 @@ func Run(ctx context.Context, in Input) (gaps []Gap, meta runMeta) {
 		meta.Difficulty = "easy"
 	}
 	meta.DiffEmpty = in.DiffEmpty
-
 	taskID := ""
 	var planned []dc.PlannedFile
 	if in.Task != nil {
@@ -123,6 +122,9 @@ func Run(ctx context.Context, in Input) (gaps []Gap, meta runMeta) {
 	gaps = append(gaps, DetectPlannedFileGaps(taskID, planned, in.ChangedFiles)...)
 	gaps = append(gaps, DetectOrphanDiffGaps(taskID, planned, in.ChangedFiles, nil)...)
 	gaps = append(gaps, DetectDependencyRiskGaps(taskID, planned, in.ChangedFiles)...)
+	if in.GitErr != nil {
+		gaps = append(gaps, gitStateGap(taskID, in.GitErr))
+	}
 
 	commands := in.Commands
 	if len(commands) == 0 && in.Task != nil {
@@ -131,8 +133,9 @@ func Run(ctx context.Context, in Input) (gaps []Gap, meta runMeta) {
 			commands = in.Task.AllowedCommands
 		}
 	}
-	commandGaps := RunVerificationCommands(taskID, commands, in.RunCommand)
+	commandGaps, commandRecords := runVerificationCommands(taskID, commands, in.RunCommand)
 	gaps = append(gaps, commandGaps...)
+	meta.Commands = commandRecords
 
 	// Each claimed acceptance criterion, dispatched on its verification
 	// method. Commands count as passing only if at least one ran and none
@@ -154,6 +157,12 @@ func Run(ctx context.Context, in Input) (gaps []Gap, meta runMeta) {
 	meta.RigorSkippedReason = rigor.skippedReason
 	meta.CoverageMeasured = rigor.coverageMeasured
 	meta.CoverageSkippedReason = rigor.coverageSkippedReason
+	meta.DegradedReasons = append(meta.DegradedReasons, rigor.degradedReasons...)
+	if rigor.unavailable && !in.AllowNoRigor && modeEnforces(in.GateMode) {
+		// The secret and stub scans never ran. In enforce that is not a pass;
+		// the operator opts out explicitly, or installs dcverify.
+		meta.DegradedReasons = append(meta.DegradedReasons, rigor.skippedReason)
+	}
 
 	// Lappi, admission only: it may append advisory, non-blocking gaps and
 	// nothing else (verify/lappi.go). Nil in.Lappi — the default — skips it.
@@ -183,6 +192,87 @@ type runMeta struct {
 	// was introduced to remove.
 	RigorApplied       []string
 	RigorSkippedReason string
+	// DegradedReasons are checks that could not run and did not become a
+	// blocking gap. A run with any is "degraded": never passed.
+	DegradedReasons []string
+	// Commands is what each verification command did, for the stored run.
+	Commands   []CommandRecord
+	StartedAt  time.Time
+	FinishedAt time.Time
+}
+
+// gitStateGap reports that the git reads verification judges failed. Blocking
+// and hard-safety (gating.IsHardSafetyGap): an advisory mode must not turn
+// "git could not be read" into a pass on a diff nobody looked at.
+func gitStateGap(taskID string, err error) Gap {
+	return Gap{
+		ID:       StableGapID(taskID, "GITSTATE"),
+		Severity: "high",
+		GapType:  "rigor_check_unavailable",
+		TaskID:   taskID,
+		Description: "The working tree's changes could not be read from git, so the diff-based gates " +
+			"(scope, stub detection, secret scanning, coverage) did not examine this change: " + err.Error(),
+		Evidence:       []string{"git: " + err.Error()},
+		RecommendedFix: "Make git readable in the project root (is it a repository, is git installed and on PATH?), then re-verify.",
+		Blocking:       true,
+	}
+}
+
+func modeEnforces(gateMode string) bool {
+	return strings.TrimSpace(strings.ToLower(gateMode)) == "enforce"
+}
+
+func modeAdvisory(gateMode string) bool {
+	mode := strings.TrimSpace(strings.ToLower(gateMode))
+	return mode == "advisory" || mode == "warn"
+}
+
+// DemoteForMode returns gaps as the gate mode treats them: under advisory the
+// demotable ones lose Blocking, and under a skipped mode none block. Every
+// surface that lists gaps (blocking_gaps, next_actions, advisory_actions, the
+// stored rows) reads this, so the verdict and what it lists cannot disagree —
+// StatusFromGaps used to demote for the verdict only while the lists still
+// said blocking:true. The input is not modified.
+func DemoteForMode(gaps []Gap, gateMode string) []Gap {
+	skipped := verificationSkipped(gateMode)
+	advisory := modeAdvisory(gateMode)
+	out := make([]Gap, len(gaps))
+	copy(out, gaps)
+	for i := range out {
+		if !out[i].Blocking {
+			continue
+		}
+		if skipped || (advisory && gating.MayDemote(out[i].GapType, true)) {
+			out[i].Blocking = false
+		}
+	}
+	return out
+}
+
+// Verdict is the status a run earns: StatusFromGaps, then "degraded" when the
+// run is clean only because something did not run or its failure was demoted.
+//
+// Degraded is a distinct outcome and never passed: a failing expected command
+// demoted by advisory mode is a failing command, and an enforce run whose
+// secret and stub scans never executed has not examined the diff. Manvi
+// already treats degraded as never-passed.
+func Verdict(gaps []Gap, meta runMeta) (status string, passed bool, reasons []string) {
+	status, passed = StatusFromGaps(gaps, meta.GateMode)
+	if status != "verified" {
+		return status, passed, nil
+	}
+	reasons = append(reasons, meta.DegradedReasons...)
+	if modeAdvisory(meta.GateMode) {
+		for _, g := range gaps {
+			if g.Blocking && g.GapType == "test_failed" {
+				reasons = append(reasons, "expected verification command failed (demoted by advisory mode): "+g.Description)
+			}
+		}
+	}
+	if len(reasons) > 0 {
+		return "degraded", false, reasons
+	}
+	return status, passed, nil
 }
 
 // StatusFromGaps maps gaps to blocked/verified under gate_mode.
@@ -220,8 +310,9 @@ func verificationSkipped(gateMode string) bool {
 
 // ToMCP builds the leased verify_task payload.
 func ToMCP(taskID string, gaps []Gap, meta runMeta) MCPResult {
-	status, passed := StatusFromGaps(gaps, meta.GateMode)
+	status, passed, reasons := Verdict(gaps, meta)
 	skipped := verificationSkipped(meta.GateMode)
+	gaps = DemoteForMode(gaps, meta.GateMode)
 	blocking, advisory := SplitNextActions(gaps)
 	blockingGaps := make([]Gap, 0)
 	for _, g := range gaps {
@@ -254,6 +345,7 @@ func ToMCP(taskID string, gaps []Gap, meta runMeta) MCPResult {
 		Sandbox:               meta.Sandbox,
 		RigorApplied:          rigor,
 		RigorSkippedReason:    meta.RigorSkippedReason,
+		DegradedReasons:       reasons,
 		BlockingGaps:          blockingGaps,
 		NextActions:           blocking,
 		AdvisoryActions:       advisory,
@@ -263,8 +355,9 @@ func ToMCP(taskID string, gaps []Gap, meta runMeta) MCPResult {
 
 // ToCLITask builds one CLI task entry.
 func ToCLITask(taskID string, gaps []Gap, meta runMeta) TaskCLIResult {
-	status, _ := StatusFromGaps(gaps, meta.GateMode)
+	status, _, reasons := Verdict(gaps, meta)
 	skipped := verificationSkipped(meta.GateMode)
+	gaps = DemoteForMode(gaps, meta.GateMode)
 	blocking, advisory := SplitNextActions(gaps)
 	blockingCount := 0
 	for _, g := range gaps {
@@ -294,6 +387,7 @@ func ToCLITask(taskID string, gaps []Gap, meta runMeta) TaskCLIResult {
 		VerificationSkipped:   skipped,
 		RigorApplied:          rigor,
 		RigorSkippedReason:    meta.RigorSkippedReason,
+		DegradedReasons:       reasons,
 		GapCount:              len(gaps),
 		BlockingGapCount:      blockingCount,
 		Gaps:                  gaps,
@@ -315,7 +409,7 @@ func CollectGitState(ctx context.Context, root string) (changed []string, diff s
 	if err != nil {
 		return nil, "", true, err
 	}
-	nameOut, err := runGit(ctx, git, "diff", "HEAD", "--name-only", "-z")
+	nameOut, err := runGit(ctx, git, gitListingLimit, "diff", "HEAD", "--name-only", "-z")
 	headless := false
 	if err != nil {
 		if !hasNoHead(ctx, git) {
@@ -337,7 +431,7 @@ func CollectGitState(ctx context.Context, root string) (changed []string, diff s
 		}
 	}
 	add(nameOut)
-	untracked, err := runGit(ctx, git, "ls-files", "--others", "--exclude-standard", "-z")
+	untracked, err := runGit(ctx, git, gitListingLimit, "ls-files", "--others", "--exclude-standard", "-z")
 	if err != nil {
 		return nil, "", true, err
 	}
@@ -351,7 +445,7 @@ func CollectGitState(ctx context.Context, root string) (changed []string, diff s
 	}
 	add([]byte(strings.Join(dirty, "\x00")))
 	if !headless {
-		diffBytes, err := runGit(ctx, git, "diff", "HEAD")
+		diffBytes, err := runGit(ctx, git, gitDiffLimit, "-c", "core.quotePath=false", "diff", "HEAD")
 		if err != nil {
 			return nil, "", true, err
 		}
@@ -365,43 +459,38 @@ func CollectGitState(ctx context.Context, root string) (changed []string, diff s
 // and answered that HEAD does not resolve. A git that could not run, or was
 // refused, is not that answer.
 func hasNoHead(ctx context.Context, git *proc.GitSession) bool {
-	_, err := runGit(ctx, git, "rev-parse", "--verify", "--quiet", "HEAD")
+	_, err := runGit(ctx, git, 1<<10, "rev-parse", "--verify", "--quiet", "HEAD")
 	var exit *exec.ExitError
 	return errors.As(err, &exit)
 }
 
-// runGit runs a git read built by the operation's proc.GitSession. The diff
+// Output caps for the git reads verification judges. The diff is what the
+// stub and secret scanners read, so a diff that does not fit is refused rather
+// than scored on its first bytes: a scan of part of a change must never read
+// as a scan of the change.
+const (
+	gitDiffLimit    = 32 << 20
+	gitListingLimit = 8 << 20
+)
+
+// ErrGitOutputTruncated is returned when a git read exceeded its output cap.
+var ErrGitOutputTruncated = errors.New("git output exceeded the verification cap")
+
+// runGit runs a git read through the shared proc.GitSession runner. The diff
 // verification judges comes from git, and a git the repository supplies — or
 // a program its .git/config names — could report any diff it likes,
 // including none.
-func runGit(ctx context.Context, git *proc.GitSession, args ...string) ([]byte, error) {
+func runGit(ctx context.Context, git *proc.GitSession, limit int, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	cmd, err := git.Command(ctx, args...)
+	res, err := git.Run(ctx, limit, args...)
 	if err != nil {
 		return nil, err
 	}
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	// Match the module-wide subprocess contract: RunBounded so a wedged Start
-	// cannot outlive the caller's deadline. Group isolation, so a timeout
-	// reaches grandchildren, is proc.GitSession's (see proc.ConfigureGroup).
-	cmd.WaitDelay = 2 * time.Second
-	err, timedOut := proc.RunBounded(ctx, cmd.Run)
-	if timedOut {
-		return nil, fmt.Errorf("git %v did not return within the deadline: %w", args, ctx.Err())
+	if res.Truncated {
+		return nil, fmt.Errorf("git %s: %w (%d bytes kept)", strings.Join(args, " "), ErrGitOutputTruncated, limit)
 	}
-	if err != nil {
-		var exit *exec.ExitError
-		if errors.As(err, &exit) {
-			if detail := strings.TrimSpace(stderr.String()); detail != "" {
-				return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, detail)
-			}
-		}
-		return nil, err
-	}
-	return stdout.Bytes(), nil
+	return res.Stdout, nil
 }
 
 // persistBound bounds the store writes that record a run.
@@ -412,15 +501,37 @@ const persistBound = 30 * time.Second
 // It runs detached from ctx's cancellation, under its own bound. A run that was
 // cut short — the host's per-call budget, a cancelled request — is exactly the
 // run whose record matters, and writing it on the expired ctx lost it.
+//
+// The run carries its evidence: each command with exit code, duration and an
+// output tail, the run's real start and end, and the rigor account. Gaps are
+// stored as the gate mode treats them (DemoteForMode), so a skipped run does
+// not leave blocking rows behind for get_gaps to report.
 func Persist(ctx context.Context, client *store.Client, taskID string, gaps []Gap, meta runMeta, status string) error {
 	if client == nil {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), persistBound)
 	defer cancel()
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	runID := "run-" + taskID + "-" + shortHash(now+status)
-	env, _ := json.Marshal(map[string]any{
+	started, finished := meta.StartedAt, meta.FinishedAt
+	if started.IsZero() {
+		started = time.Now().UTC()
+	}
+	if finished.Before(started) {
+		finished = started
+	}
+	stored := DemoteForMode(gaps, meta.GateMode)
+	blocking := 0
+	for _, g := range stored {
+		if g.Blocking {
+			blocking++
+		}
+	}
+	runID := "run-" + taskID + "-" + shortHash(started.Format(time.RFC3339Nano)+status)
+	rigorApplied := meta.RigorApplied
+	if rigorApplied == nil {
+		rigorApplied = []string{}
+	}
+	env, err := json.Marshal(map[string]any{
 		"gate_mode":               meta.GateMode,
 		"difficulty":              meta.Difficulty,
 		"diff_empty":              meta.DiffEmpty,
@@ -430,28 +541,42 @@ func Persist(ctx context.Context, client *store.Client, taskID string, gaps []Ga
 		// Names only, never values: which variables the commands were allowed
 		// beyond the base list, and which the repository asked for and was
 		// refused.
-		"env_scrub":         "allowlist",
-		"env_allow_extra":   nonNil(meta.Env.Extra),
-		"env_allow_refused": nonNil(meta.Env.Refused),
-		"env_allow_error":   meta.Env.Err,
-		"gate_mode_origin":  meta.GateOrigin,
-		"gate_mode_error":   meta.GateError,
+		"env_scrub":            "allowlist",
+		"env_allow_extra":      nonNil(meta.Env.Extra),
+		"env_allow_refused":    nonNil(meta.Env.Refused),
+		"env_allow_error":      meta.Env.Err,
+		"gate_mode_origin":     meta.GateOrigin,
+		"gate_mode_error":      meta.GateError,
+		"rigor_applied":        rigorApplied,
+		"rigor_skipped_reason": meta.RigorSkippedReason,
+		"degraded_reasons":     meta.DegradedReasons,
+		"gap_count":            len(stored),
+		"blocking_gap_count":   blocking,
 	})
-	cmds, _ := json.Marshal([]string{})
-	if err := client.RunRecord(ctx, store.VerificationRun{
+	if err != nil {
+		return fmt.Errorf("run-record: %w", err)
+	}
+	records := meta.Commands
+	if records == nil {
+		records = []CommandRecord{}
+	}
+	cmds, err := json.Marshal(records)
+	if err != nil {
+		return fmt.Errorf("run-record: %w", err)
+	}
+	// One transaction: the run is never stored with a status and no gaps, and
+	// a failure leaves the task's previous gaps in place.
+	if err := client.RecordVerification(ctx, &store.VerificationRun{
 		ID:              runID,
 		TaskID:          taskID,
 		Sandbox:         meta.Sandbox,
 		EnvironmentJSON: string(env),
 		CommandsJSON:    string(cmds),
 		Status:          status,
-		StartedAt:       now,
-		FinishedAt:      now,
-	}); err != nil {
-		return fmt.Errorf("run-record: %w", err)
-	}
-	if err := client.GapsReplace(ctx, taskID, toStoreGaps(gaps)); err != nil {
-		return fmt.Errorf("gaps-replace: %w", err)
+		StartedAt:       started.Format(time.RFC3339Nano),
+		FinishedAt:      finished.Format(time.RFC3339Nano),
+	}, taskID, toStoreGaps(stored)); err != nil {
+		return fmt.Errorf("verification-record: %w", err)
 	}
 	return nil
 }
@@ -520,10 +645,12 @@ func VerifyTask(ctx context.Context, root string, client *store.Client, taskID s
 	if task == nil {
 		return MCPResult{}, nil, fmt.Errorf("task %s not found", taskID)
 	}
-	changed, diff, empty, err := CollectGitState(ctx, root)
-	if err != nil {
-		// Not a git repo / git missing: treat as empty work with an explicit skip,
-		// never as a pass.
+	changed, diff, empty, gitErr := CollectGitState(ctx, root)
+	if gitErr != nil {
+		// Not a git repo, git missing or refused, or a read past its cap: the
+		// diff-based gates have nothing to judge, and Run reports that as a
+		// blocking rigor_check_unavailable gap rather than judging an empty
+		// diff as a clean one.
 		changed, diff, empty = nil, "", true
 	}
 	// Read only when the task claims criteria, so a task without any costs no
@@ -551,12 +678,16 @@ func VerifyTask(ctx context.Context, root string, client *store.Client, taskID s
 		DiffContent:     diff,
 		DiffEmpty:       empty,
 		WorkPresent:     !empty,
+		GitErr:          gitErr,
+		AllowNoRigor:    allowNoRigor(),
 		RunCommand:      RunCommandWithEnv(ctx, root, envPolicy),
 		Rigor:           RigorClient(root),
 		CoveragePath:    coveragePath,
 		Lappi:           LappiAsker(),
 	}
+	began := time.Now().UTC()
 	gaps, meta := Run(ctx, in)
+	meta.StartedAt, meta.FinishedAt = began, time.Now().UTC()
 	result := ToMCP(taskID, gaps, meta)
 	persistErr := Persist(ctx, client, taskID, gaps, meta, result.Status)
 	writeBlockedCorrection(root, taskID, &result, gaps)
@@ -569,11 +700,25 @@ func VerifyTask(ctx context.Context, root string, client *store.Client, taskID s
 	return result, gaps, nil
 }
 
+// AllowNoRigorEnv is the explicit opt-out for an enforce run without dcverify:
+// set to 1, true or yes, a run whose secret and stub scans cannot run is not
+// degraded for that alone. It exists for repositories that have chosen to
+// verify without the rigor component; the report still says rigor was skipped.
+const AllowNoRigorEnv = "DEVCOUNCIL_ALLOW_NO_DCVERIFY"
+
+func allowNoRigor() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(AllowNoRigorEnv))) {
+	case "1", "true", "yes":
+		return true
+	}
+	return false
+}
+
 // writeBlockedCorrection persists a repair brief when a check ran and
 // blocked. A write failure must not hide the verify result — gaps are already
 // in the store. A skipped or passing verify writes nothing.
 func writeBlockedCorrection(root, taskID string, result *MCPResult, gaps []Gap) {
-	if result == nil || result.Passed || result.VerificationSkipped {
+	if result == nil || result.Passed || result.VerificationSkipped || result.Status == "degraded" {
 		return
 	}
 	if root == "" || taskID == "" {

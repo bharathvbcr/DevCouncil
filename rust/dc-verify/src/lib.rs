@@ -123,6 +123,10 @@ pub fn parse_unified(diff: &str) -> Result<Vec<FileDiff>, ParseError> {
     // '+' line.
     let mut in_hunk = false;
     let mut pending_rename_from: Option<String> = None;
+    // Where the previous hunk of the current file ended in the new file. Git
+    // emits a file's hunks in order and apart; a header that starts before the
+    // last one ended is not something git produces.
+    let mut prev_hunk_end: u64 = 0;
     let mut saw_content_before_any_file = false;
     let total_lines = diff.lines().count();
 
@@ -148,6 +152,7 @@ pub fn parse_unified(diff: &str) -> Result<Vec<FileDiff>, ParseError> {
                 files.push(done);
             }
             pending_rename_from = None;
+            prev_hunk_end = 0;
             let path = git_header_path(rest).ok_or_else(|| ParseError {
                 line_number: lineno,
                 line: raw.to_string(),
@@ -176,13 +181,13 @@ pub fn parse_unified(diff: &str) -> Result<Vec<FileDiff>, ParseError> {
 
         if !in_hunk {
             if let Some(rest) = raw.strip_prefix("rename from ") {
-                pending_rename_from = Some(strip_prefix_marker(rest));
+                pending_rename_from = Some(unquote_path(rest));
                 continue;
             }
             if let Some(rest) = raw.strip_prefix("rename to ") {
                 file.status = ChangeStatus::Renamed;
                 file.old_path = pending_rename_from.take();
-                file.path = strip_prefix_marker(rest);
+                file.path = unquote_path(rest);
                 continue;
             }
             if raw.starts_with("new file mode") {
@@ -217,6 +222,14 @@ pub fn parse_unified(diff: &str) -> Result<Vec<FileDiff>, ParseError> {
                 line: raw.to_string(),
                 reason: "malformed hunk header",
             })?;
+            if u64::from(hunk.new_start) < prev_hunk_end {
+                return Err(ParseError {
+                    line_number: lineno,
+                    line: raw.to_string(),
+                    reason: "hunk overlaps the previous hunk of the same file",
+                });
+            }
+            prev_hunk_end = u64::from(hunk.new_start) + u64::from(hunk.new_count);
             new_line = hunk.new_start;
             new_remaining = hunk.new_count;
             old_remaining = hunk.old_count;
@@ -306,6 +319,8 @@ pub fn parse_unified(diff: &str) -> Result<Vec<FileDiff>, ParseError> {
     // would tell the orphan check that nothing changed, which is a clean scope
     // report over content nobody parsed. This is the same rule as the
     // malformed-hunk case, applied to the one path that previously escaped it.
+    reject_impossible(&files)?;
+
     if files.is_empty() && saw_content_before_any_file {
         return Err(ParseError {
             line_number: 1,
@@ -370,30 +385,165 @@ fn bump_line(line: u32, lineno: usize, raw: &str) -> Result<u32, ParseError> {
     })
 }
 
-/// Extracts the post-change path from a `diff --git a/x b/y` header.
+/// Refuses structure git never produces, so a hand-made diff cannot be scored
+/// as if it were one: a deleted file that gains lines, and one path appearing
+/// twice (a file listed in two sections, or a rename onto a path the diff also
+/// changes). Each is a parse error, which every caller reports as a check that
+/// could not run rather than as a verdict on the change.
+fn reject_impossible(files: &[FileDiff]) -> Result<(), ParseError> {
+    let mut seen = std::collections::HashSet::new();
+    for file in files {
+        if file.status == ChangeStatus::Deleted && !file.added_lines.is_empty() {
+            return Err(ParseError {
+                line_number: 0,
+                line: file.path.clone(),
+                reason: "a deleted file carries added lines",
+            });
+        }
+    }
+    for path in changed_paths(files) {
+        if !seen.insert(path) {
+            return Err(ParseError {
+                line_number: 0,
+                line: path.to_string(),
+                reason: "one path appears more than once in the diff",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Decodes a git C-quoted path (`"caf\303\251.go"`, `"tab\tname"`), which git
+/// writes whenever a name holds a control character, a quote, a backslash or —
+/// unless `core.quotePath=false` — a non-ASCII byte. A path that is not quoted
+/// is returned unchanged. Escapes are `\a \b \f \n \r \t \v \\ \"` and one to
+/// three octal digits for a raw byte; the bytes are read as UTF-8, lossily.
+fn unquote_path(raw: &str) -> String {
+    let raw = raw.trim_end_matches(['\r']);
+    let Some(body) = raw.strip_prefix('"') else {
+        return raw.split('\t').next().unwrap_or(raw).trim().to_string();
+    };
+    let bytes = body.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => break,
+            b'\\' if i + 1 < bytes.len() => {
+                i += 1;
+                match bytes[i] {
+                    b'a' => out.push(7),
+                    b'b' => out.push(8),
+                    b'f' => out.push(12),
+                    b'n' => out.push(b'\n'),
+                    b'r' => out.push(b'\r'),
+                    b't' => out.push(b'\t'),
+                    b'v' => out.push(11),
+                    d @ b'0'..=b'7' => {
+                        let mut value = u32::from(d - b'0');
+                        let mut digits = 1;
+                        while digits < 3
+                            && i + 1 < bytes.len()
+                            && (b'0'..=b'7').contains(&bytes[i + 1])
+                        {
+                            i += 1;
+                            value = value * 8 + u32::from(bytes[i] - b'0');
+                            digits += 1;
+                        }
+                        out.push((value & 0xff) as u8);
+                    }
+                    other => out.push(other),
+                }
+                i += 1;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Where the quoted token starting at `s[0]` ends, as the index one past its
+/// closing quote. `None` when `s` does not start with a quote or never closes.
+fn quoted_token_end(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'"') {
+        return None;
+    }
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return Some(i + 1),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Extracts the post-change path from the `a/x b/y` part of a `diff --git`
+/// header.
+///
+/// Quote-aware: a quoted token is read to its closing quote, so a name holding
+/// ` b/` or a space cannot be split in the middle. Unquoted, the two names are
+/// equal for anything that is not a rename (`a/P b/P`), which fixes where the
+/// split is even when `P` itself contains ` b/`; renames, whose two names can
+/// differ, are corrected by the `rename to` line that follows.
 fn git_header_path(rest: &str) -> Option<String> {
-    // Paths containing spaces make this ambiguous in general; git quotes those,
-    // and the b/ marker is the reliable anchor.
+    if let Some(end) = quoted_token_end(rest) {
+        // `"a/..." <b>`: the second name is everything after the separator.
+        let second = rest[end..].strip_prefix(' ')?;
+        return Some(strip_marker(&unquote_path(second)));
+    }
+    if rest.ends_with('"') {
+        // `a/P "b/..."`: the last token is quoted; find where it opens.
+        let mut from = 0;
+        while let Some(at) = rest[from..].find(" \"") {
+            let open = from + at + 1;
+            if quoted_token_end(&rest[open..]) == Some(rest.len() - open) {
+                return Some(strip_marker(&unquote_path(&rest[open..])));
+            }
+            from = open;
+        }
+        return None;
+    }
+    // Both unquoted. `a/P b/P` is 5 bytes of markers around two copies of P.
+    if let Some(inner) = rest.len().checked_sub(5)
+        && inner % 2 == 0
+    {
+        let half = inner / 2;
+        if let Some(name) = rest.get(2..2 + half)
+            && rest.starts_with("a/")
+            && rest.get(2 + half..) == Some(&format!(" b/{name}")[..])
+        {
+            return Some(name.to_string());
+        }
+    }
     if let Some(pos) = rest.rfind(" b/") {
-        return Some(rest[pos + 3..].trim_matches('"').to_string());
+        return Some(rest[pos + 3..].to_string());
     }
     let mut parts = rest.split_whitespace();
     let _a = parts.next()?;
     let b = parts.next()?;
-    Some(strip_prefix_marker(b))
+    Some(strip_marker(b))
 }
 
-/// Strips git's a/ or b/ prefix and any surrounding quotes, and drops a
-/// trailing tab-separated timestamp that plain `diff -u` appends.
-fn strip_prefix_marker(path: &str) -> String {
-    let path = path.split('\t').next().unwrap_or(path).trim();
-    let path = path.trim_matches('"');
+/// Drops git's a/ or b/ prefix.
+fn strip_marker(path: &str) -> String {
     for marker in ["a/", "b/"] {
         if let Some(rest) = path.strip_prefix(marker) {
             return rest.to_string();
         }
     }
     path.to_string()
+}
+
+/// Strips git's a/ or b/ prefix and any C-quoting from a `---` / `+++` path,
+/// and drops a trailing tab-separated timestamp that plain `diff -u` appends.
+fn strip_prefix_marker(path: &str) -> String {
+    strip_marker(&unquote_path(path))
 }
 
 /// The result of checking changed files against a task's declared scope.

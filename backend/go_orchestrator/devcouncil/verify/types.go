@@ -54,28 +54,31 @@ type NextAction struct {
 
 // MCPResult is the leased verify_task success payload (golden mcp/verify).
 type MCPResult struct {
-	OK                    bool         `json:"ok"`
-	TaskID                string       `json:"task_id"`
-	Passed                bool         `json:"passed"`
-	Status                string       `json:"status"`
-	GateMode              string       `json:"gate_mode"`
-	GateModeOrigin        string       `json:"gate_mode_origin,omitempty"`
-	GateModeError         string       `json:"gate_mode_error,omitempty"`
-	Difficulty            string       `json:"difficulty"`
-	DiffEmpty             bool         `json:"diff_empty"`
-	CoverageMeasured      bool         `json:"coverage_measured"`
-	CoverageSkippedReason string       `json:"coverage_skipped_reason,omitempty"`
-	CompilerActive        bool         `json:"compiler_active"`
-	VerificationMode      string       `json:"verification_mode"`
-	VerificationSkipped   bool         `json:"verification_skipped"`
-	Sandbox               string       `json:"sandbox"`
-	RigorApplied          []string     `json:"rigor_applied"`
-	RigorSkippedReason    string       `json:"rigor_skipped_reason,omitempty"`
-	BlockingGaps          []Gap        `json:"blocking_gaps"`
-	NextActions           []NextAction `json:"next_actions"`
-	AdvisoryActions       []NextAction `json:"advisory_actions"`
-	AllowedNextTools      []string     `json:"allowed_next_tools"`
-	CorrectionPath        string       `json:"correction_path,omitempty"`
+	OK                    bool     `json:"ok"`
+	TaskID                string   `json:"task_id"`
+	Passed                bool     `json:"passed"`
+	Status                string   `json:"status"`
+	GateMode              string   `json:"gate_mode"`
+	GateModeOrigin        string   `json:"gate_mode_origin,omitempty"`
+	GateModeError         string   `json:"gate_mode_error,omitempty"`
+	Difficulty            string   `json:"difficulty"`
+	DiffEmpty             bool     `json:"diff_empty"`
+	CoverageMeasured      bool     `json:"coverage_measured"`
+	CoverageSkippedReason string   `json:"coverage_skipped_reason,omitempty"`
+	CompilerActive        bool     `json:"compiler_active"`
+	VerificationMode      string   `json:"verification_mode"`
+	VerificationSkipped   bool     `json:"verification_skipped"`
+	Sandbox               string   `json:"sandbox"`
+	RigorApplied          []string `json:"rigor_applied"`
+	RigorSkippedReason    string   `json:"rigor_skipped_reason,omitempty"`
+	// DegradedReasons names the checks that could not run or failed without
+	// blocking when Status is "degraded". Degraded is never passed.
+	DegradedReasons  []string     `json:"degraded_reasons,omitempty"`
+	BlockingGaps     []Gap        `json:"blocking_gaps"`
+	NextActions      []NextAction `json:"next_actions"`
+	AdvisoryActions  []NextAction `json:"advisory_actions"`
+	AllowedNextTools []string     `json:"allowed_next_tools"`
+	CorrectionPath   string       `json:"correction_path,omitempty"`
 }
 
 // TaskCLIResult is one task entry inside the CLI verify --json envelope.
@@ -94,6 +97,7 @@ type TaskCLIResult struct {
 	VerificationSkipped   bool         `json:"verification_skipped"`
 	RigorApplied          []string     `json:"rigor_applied"`
 	RigorSkippedReason    string       `json:"rigor_skipped_reason,omitempty"`
+	DegradedReasons       []string     `json:"degraded_reasons,omitempty"`
 	GapCount              int          `json:"gap_count"`
 	BlockingGapCount      int          `json:"blocking_gap_count"`
 	Gaps                  []Gap        `json:"gaps"`
@@ -103,13 +107,15 @@ type TaskCLIResult struct {
 
 // CLIResult is the `dev verify --json` / `devcouncil verify --json` envelope.
 type CLIResult struct {
-	OK                           bool            `json:"ok"`
-	GateMode                     string          `json:"gate_mode"`
-	GateModeOrigin               string          `json:"gate_mode_origin,omitempty"`
-	GateModeError                string          `json:"gate_mode_error,omitempty"`
-	ProcessedTasks               int             `json:"processed_tasks"`
-	VerifiedTasks                int             `json:"verified_tasks"`
-	BlockedTasks                 int             `json:"blocked_tasks"`
+	OK             bool   `json:"ok"`
+	GateMode       string `json:"gate_mode"`
+	GateModeOrigin string `json:"gate_mode_origin,omitempty"`
+	GateModeError  string `json:"gate_mode_error,omitempty"`
+	ProcessedTasks int    `json:"processed_tasks"`
+	VerifiedTasks  int    `json:"verified_tasks"`
+	BlockedTasks   int    `json:"blocked_tasks"`
+	// DegradedTasks counts tasks whose gates did not all run: never verified.
+	DegradedTasks                int             `json:"degraded_tasks,omitempty"`
 	CompletedWithoutVerification int             `json:"completed_without_verification"`
 	TotalGaps                    int             `json:"total_gaps"`
 	Tasks                        []TaskCLIResult `json:"tasks"`
@@ -176,6 +182,16 @@ type Input struct {
 	// change. Empty means the coverage gate does not run; the findings gates
 	// still do.
 	CoveragePath string
+
+	// GitErr is set when the git reads that produce ChangedFiles and
+	// DiffContent failed. Run reports it as a blocking rigor_check_unavailable
+	// gap: the gates below would otherwise judge an empty diff, which reads as
+	// a clean one.
+	GitErr error
+	// AllowNoRigor is the explicit opt-out for enforce mode without dcverify.
+	// Without it, a run whose secret and stub scans never ran is degraded, not
+	// verified.
+	AllowNoRigor bool
 
 	// Lappi asks the Lappi agent about each changed file and records the
 	// exchange, as DEVCOUNCIL_LAPPI_ASK / DEVCOUNCIL_LAPPI_COLLECT say. Nil

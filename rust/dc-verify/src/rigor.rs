@@ -161,6 +161,19 @@ pub struct StubReport {
     /// placeholders and not counted, because no test check reads it, and a
     /// report with zero here ran neither check and must not say it did.
     pub parsed_files: usize,
+    /// Files in a language [`stub_ast`] parses, whose source was known, that
+    /// the tree did not analyse — a syntax error, a source too large, a parse
+    /// past its budget. They took the substring checks, which see less: a
+    /// report that lists nothing here and one that lists a file are not the
+    /// same report, and the host marks the run degraded for each entry.
+    pub unparsed: Vec<UnparsedFile>,
+}
+
+/// One file the tree could not analyse, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnparsedFile {
+    pub path: String,
+    pub reason: &'static str,
 }
 
 /// [`detect_stubs_with`], also reporting how many files the test-rigor checks
@@ -171,6 +184,7 @@ pub fn detect_stubs_report(
 ) -> StubReport {
     let mut findings = Vec::new();
     let mut parsed_files = 0;
+    let mut unparsed = Vec::new();
     for file in files {
         let post_image = post_image(file, source);
         let lines: Option<Vec<&str>> = post_image.as_deref().map(|s| s.lines().collect());
@@ -178,7 +192,16 @@ pub fn detect_stubs_report(
         let ast = match (lang, post_image.as_deref()) {
             (Some(lang), Some(src)) => {
                 let added: HashSet<u32> = file.added_lines.iter().map(|(n, _)| *n).collect();
-                stub_ast::analyze(lang, src, &added)
+                match stub_ast::analyze_outcome(lang, src, &added) {
+                    Ok(found) => Some(found),
+                    Err(why) => {
+                        unparsed.push(UnparsedFile {
+                            path: file.path.clone(),
+                            reason: why.as_str(),
+                        });
+                        None
+                    }
+                }
             }
             _ => None,
         };
@@ -222,6 +245,7 @@ pub fn detect_stubs_report(
     StubReport {
         findings,
         parsed_files,
+        unparsed,
     }
 }
 
@@ -318,6 +342,22 @@ fn substring_findings(file: &FileDiff, include_bodies: bool) -> Vec<Finding> {
                 continue;
             }
 
+            if include_bodies
+                && let Some((severity, message)) =
+                    placeholder_call(&file.path, &c_family_statement(&file.added_lines, index))
+            {
+                findings.push(Finding {
+                    gate: "stub_detection",
+                    severity,
+                    strength: Strength::Derived,
+                    path: file.path.clone(),
+                    line: *line_no,
+                    evidence: safe_evidence(content),
+                    message,
+                });
+                continue;
+            }
+
             // Comment markers are advisory. A TODO in a new file is often a
             // legitimate note about future work, and blocking on it would make
             // the gate something people route around.
@@ -343,6 +383,84 @@ fn substring_findings(file: &FileDiff, include_bodies: bool) -> Vec<Finding> {
         }
     }
     findings
+}
+
+/// Languages whose placeholder is `throw new T(message)` and which have no
+/// grammar here, or whose grammar is the fallback's second chance: the
+/// statement is judged by [`thrown_placeholder`], the verdict the tree-based
+/// check shares, so the two readings agree on the wording.
+fn throws_new_source(path: &str) -> bool {
+    let ext = path.rsplit_once('.').map_or("", |(_, e)| e);
+    matches!(
+        ext,
+        "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts" | "php" | "kt" | "kts"
+    )
+}
+
+/// The placeholder a lowercased statement is, in the languages the fallback
+/// reads: a `todo!(…)` / `unimplemented!(…)` macro with arguments (the exact
+/// no-argument spellings are `EMPTY_BODIES`), a Go or Rust `panic` whose message
+/// opens with a placeholder phrase, Kotlin's `TODO(…)`, and a thrown exception
+/// saying the code is unfinished.
+///
+/// Code position only: the match must not be inside a string literal or after
+/// a `//` comment opener, so a log line quoting `todo!("x")` is not a stub.
+fn placeholder_call(path: &str, statement: &str) -> Option<(Severity, String)> {
+    let word_start = |at: usize| {
+        !statement[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+    };
+    for name in ["todo!(", "unimplemented!("] {
+        if statement
+            .match_indices(name)
+            .any(|(at, _)| is_code_at(statement, at) && word_start(at))
+        {
+            return Some((
+                Severity::Blocking,
+                format!("added code whose body is `{name}…)`; the task is not implemented"),
+            ));
+        }
+    }
+    for name in ["panic!(", "panic("] {
+        for (at, _) in statement.match_indices(name) {
+            if !is_code_at(statement, at) || !word_start(at) {
+                continue;
+            }
+            let args = statement[at + name.len()..].trim_start();
+            let Some(message) = args.strip_prefix('"') else {
+                continue;
+            };
+            if let Some(phrase) = PLACEHOLDER_MESSAGES.iter().find(|p| {
+                message.starts_with(**p)
+                    && !message[p.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(char::is_alphanumeric)
+            }) {
+                return Some((
+                    Severity::Blocking,
+                    format!("added code panics saying `{phrase}`; the task is not implemented"),
+                ));
+            }
+        }
+    }
+    let kotlin = path.ends_with(".kt") || path.ends_with(".kts");
+    if kotlin
+        && statement
+            .match_indices("todo(")
+            .any(|(at, _)| is_code_at(statement, at) && word_start(at))
+    {
+        return Some((
+            Severity::Blocking,
+            "added code whose body is Kotlin's `TODO(…)`; the task is not implemented".to_string(),
+        ));
+    }
+    if throws_new_source(path) {
+        return c_family_placeholder(statement);
+    }
+    None
 }
 
 /// Whether `path` is Java or C#: languages whose placeholders are a thrown

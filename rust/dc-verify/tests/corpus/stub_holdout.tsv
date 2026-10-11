@@ -1,0 +1,72 @@
+# Held-out stub corpus for the substring fallback and the tree path.
+#
+# Written after the AST detector and before the fallback was extended to read
+# macros and thrown errors with arguments, and labelled by a rule fixed in
+# advance of running either path on it (the same discipline as
+# secrets_holdout*.tsv): a row is `stub` when its line, read as code, is a
+# placeholder body whose only effect is to signal that the work is not done
+# (a todo!/unimplemented! macro, a panic or thrown error whose message says
+# not implemented / todo / implement me, Kotlin's TODO, Ruby's or Python's
+# NotImplementedError, C#'s NotImplementedException, Scala's ???, Dart's
+# UnimplementedError, Swift's fatalError("not implemented")). It is `clean`
+# when the same text is quoted, commented, an identifier, prose, or a real
+# error that merely resembles one. Comment markers (a bare TODO note) are not
+# part of this rule: they are advisory and measured elsewhere.
+#
+# It is deliberately not tuned to pass. Languages the fallback does not read
+# (Swift, Scala, Dart, C) are in it on purpose: a recall figure that excluded
+# them would describe the cases the gate was written for.
+#
+# Columns, TAB-separated: label (stub|clean), path, note, content.
+# Measured by tests/stub_holdout.rs; the counts are quoted in rust/STATUS.md.
+stub	src/lib.rs	rust todo with message	    todo!("handle the retry case")
+stub	src/lib.rs	rust todo with format args	    todo!("support {}", kind)
+stub	src/lib.rs	rust unimplemented with message	        unimplemented!("streaming")
+stub	src/lib.rs	rust bare todo	    todo!()
+stub	src/lib.rs	rust panic placeholder	    panic!("not implemented")
+stub	src/lib.rs	rust unimplemented bare	    unimplemented!()
+stub	pkg/store.go	go panic not implemented		panic("not implemented")
+stub	pkg/store.go	go panic todo prefix		panic("TODO: wire the store")
+stub	pkg/store.go	go panic unimplemented		panic("unimplemented")
+stub	web/api.js	js throw not implemented	  throw new Error('Not implemented');
+stub	web/api.js	js throw todo	  throw new Error("TODO");
+stub	web/api.ts	ts throw not yet implemented	  throw new Error(`not yet implemented`);
+stub	web/api.tsx	tsx throw implement me	  throw new Error("implement me")
+stub	app/Main.kt	kotlin TODO with message	    TODO("write the parser")
+stub	app/Main.kt	kotlin TODO bare	    TODO()
+stub	app/Foo.php	php throw not implemented	    throw new \Exception("Not implemented");
+stub	lib/foo.rb	ruby raise NotImplementedError	    raise NotImplementedError
+stub	lib/foo.py	python raise NotImplementedError	    raise NotImplementedError("subclass must implement")
+stub	src/Svc.java	java throw not implemented	        throw new UnsupportedOperationException("Not implemented yet");
+stub	src/Svc.cs	csharp NotImplementedException	        throw new NotImplementedException();
+stub	src/impl.swift	swift fatalError not implemented	        fatalError("not implemented")
+stub	src/impl.scala	scala triple question mark	  def run(): Unit = ???
+stub	lib/impl.dart	dart UnimplementedError	    throw UnimplementedError();
+stub	src/impl.c	c abort with not implemented	    assert(0 && "not implemented");
+stub	web/api.js	js throw todo, multiword	  throw new Error("TODO: finish pagination");
+stub	web/api.mjs	mjs throw unimplemented	  throw new Error("unimplemented");
+clean	src/lib.rs	todo! quoted in a log line	    log::info!("the todo!(x) macro is banned here");
+clean	src/lib.rs	todo! inside a line comment	    // replace the old todo!("x") with the real call
+clean	src/lib.rs	unimplemented in a doc string	    /// Calls unimplemented!("x") when the feature is off in tests.
+clean	src/lib.rs	panic on a real invariant	    panic!("queue invariant violated: len {}", len)
+clean	src/lib.rs	identifier containing todo	    let todo_items = load_items();
+clean	pkg/store.go	go panic on a real error		panic("index out of range")
+clean	pkg/store.go	go panic whose text only starts like todo		panic("todolist corrupted")
+clean	pkg/store.go	go string mentioning not implemented		msg := "feature X is not implemented on windows"
+clean	web/api.js	js throw validation error	  throw new Error('invalid argument: ' + name);
+clean	web/api.js	js throw with todo only in a variable	  throw new Error(todoListError);
+clean	web/api.ts	ts console.log quoting a throw	  console.log("throw new Error('not implemented') was removed");
+clean	app/Main.kt	kotlin function named todoList	    val items = todoList("inbox")
+clean	app/Main.kt	kotlin real exception	    throw IllegalStateException("closed")
+clean	lib/foo.rb	ruby raise argument error	    raise ArgumentError, "bad input"
+clean	lib/foo.py	python raise value error	    raise ValueError("bad input")
+clean	src/Svc.java	java real refusal	        throw new UnsupportedOperationException("immutable view");
+clean	src/Svc.cs	csharp argument exception	        throw new ArgumentNullException(nameof(x));
+clean	src/impl.swift	swift fatalError on invariant	        fatalError("unreachable state")
+clean	src/impl.scala	scala questions in a string	  val q = "what is ???"
+clean	lib/impl.dart	dart real error	    throw StateError('closed');
+clean	src/impl.c	c assert on invariant	    assert(len > 0 && "len must be positive");
+clean	README.md	prose mentioning todo	This is not implemented in the CLI; see the roadmap.
+clean	src/lib.rs	a normal function body	    let total = items.iter().sum::<u32>();
+clean	pkg/store.go	a normal go statement		return s.items[key], nil
+clean	web/api.js	a normal js statement	  return fetchJson(url, { method: 'POST' });

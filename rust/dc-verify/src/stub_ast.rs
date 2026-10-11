@@ -102,21 +102,104 @@ pub struct AstFinding {
     pub message: String,
 }
 
+/// The longest one parse may run. `ts_parser_parse` has no cost bound of its
+/// own: a one-line 100 KB Python file took 16 s inside it and was then thrown
+/// away for its syntax errors. The same bound `devmap-extract` puts on a parse.
+pub const PARSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Why a file was not analysed by the tree. Each one sends the file to the
+/// substring checks, and each is reported so the fallback is never silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unparsed {
+    /// Larger than [`MAX_SOURCE_BYTES`].
+    TooLarge,
+    /// The grammar could not be loaded or the parser returned no tree.
+    NoTree,
+    /// The parse ran past [`PARSE_BUDGET`] and was cancelled.
+    OverBudget,
+    /// The tree has syntax errors, so a construct in it could be misread.
+    SyntaxError,
+}
+
+impl Unparsed {
+    /// The reason as it is reported to the host.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Unparsed::TooLarge => "source too large to parse",
+            Unparsed::NoTree => "parser produced no tree",
+            Unparsed::OverBudget => "parse exceeded its time budget",
+            Unparsed::SyntaxError => "syntax error",
+        }
+    }
+}
+
 /// Parses `source` and reports the stubs and weak tests the diff introduced.
 ///
 /// `added` holds the 1-based post-change line numbers the diff added. `None`
 /// means the file was not analysed — too large, unparseable, or carrying a
 /// syntax error — and the caller must fall back rather than read it as clean.
+/// [`analyze_outcome`] says which.
 pub fn analyze(lang: Lang, source: &str, added: &HashSet<u32>) -> Option<Vec<AstFinding>> {
+    analyze_outcome(lang, source, added).ok()
+}
+
+/// [`analyze`], naming why a file was not analysed.
+pub fn analyze_outcome(
+    lang: Lang,
+    source: &str,
+    added: &HashSet<u32>,
+) -> Result<Vec<AstFinding>, Unparsed> {
+    analyze_within(lang, source, added, PARSE_BUDGET)
+}
+
+/// [`analyze_outcome`] with the parse budget as a parameter.
+pub fn analyze_within(
+    lang: Lang,
+    source: &str,
+    added: &HashSet<u32>,
+    budget: std::time::Duration,
+) -> Result<Vec<AstFinding>, Unparsed> {
     if source.len() > MAX_SOURCE_BYTES {
-        return None;
+        return Err(Unparsed::TooLarge);
     }
     let mut parser = Parser::new();
-    parser.set_language(&lang.grammar()).ok()?;
-    let tree = parser.parse(source, None)?;
+    parser
+        .set_language(&lang.grammar())
+        .map_err(|_| Unparsed::NoTree)?;
+    let deadline = std::time::Instant::now() + budget;
+    let mut over_budget = false;
+    let tree = {
+        // Polled by tree-sitter during the parse; returning true cancels it.
+        let mut cancel = |_: &tree_sitter::ParseState| -> bool {
+            if std::time::Instant::now() >= deadline {
+                over_budget = true;
+                return true;
+            }
+            false
+        };
+        let options = tree_sitter::ParseOptions::new().progress_callback(&mut cancel);
+        let bytes = source.as_bytes();
+        parser.parse_with_options(
+            &mut |offset: usize, _| {
+                if offset < bytes.len() {
+                    &bytes[offset..]
+                } else {
+                    &[][..]
+                }
+            },
+            None,
+            Some(options),
+        )
+    };
+    // A cancelled parse can hand back a partial tree describing a prefix of the
+    // file; it is never read.
+    if over_budget {
+        return Err(Unparsed::OverBudget);
+    }
+    let tree = tree.ok_or(Unparsed::NoTree)?;
     let root = tree.root_node();
     if root.has_error() {
-        return None;
+        return Err(Unparsed::SyntaxError);
     }
     let mut walker = Walker {
         lang,
@@ -134,7 +217,7 @@ pub fn analyze(lang: Lang, source: &str, added: &HashSet<u32>) -> Option<Vec<Ast
         .out
         .sort_by(|a, b| a.line.cmp(&b.line).then(a.gate.cmp(b.gate)));
     walker.out.dedup();
-    Some(walker.out)
+    Ok(walker.out)
 }
 
 struct Walker<'a> {

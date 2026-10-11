@@ -289,3 +289,40 @@ fn a_large_but_honest_profile_still_parses() {
     assert_eq!(files.len(), 1);
     assert!(files[0].covered_lines.len() > 80_000);
 }
+
+/// A real module path is several segments (`github.com/x/y`), and a module can
+/// live in a subdirectory of the repository. Dropping one leading segment only
+/// ever matched a one-segment module name, so every other Go profile landed in
+/// `coverage_unmeasured`.
+#[test]
+fn go_profile_paths_map_through_the_module_root() {
+    let base = std::env::temp_dir().join(format!("dcv-gomod-{}", std::process::id()));
+    let repo = base.join("repo");
+    std::fs::create_dir_all(repo.join("tools/sub/pkg")).unwrap();
+    std::fs::write(repo.join("go.mod"), "module github.com/x/y\n\ngo 1.22\n").unwrap();
+    std::fs::write(
+        repo.join("tools/sub/go.mod"),
+        "module github.com/x/y/tools/sub\n",
+    )
+    .unwrap();
+
+    let profile = "mode: set\n\
+github.com/x/y/pkg/a.go:3.1,4.2 1 1\n\
+github.com/x/y/tools/sub/pkg/b.go:5.1,6.2 1 1\n\
+github.com/other/mod/c.go:1.1,2.2 1 1\n";
+    let parsed = dc_verify::coverage::parse_with_root(profile, Some(&repo)).expect("must parse");
+    let paths: Vec<&str> = parsed.iter().map(|f| f.path.as_str()).collect();
+    assert!(
+        paths.contains(&"pkg/a.go"),
+        "root module not mapped: {paths:?}"
+    );
+    assert!(
+        paths.contains(&"tools/sub/pkg/b.go"),
+        "the subdirectory module (the longer path) must win and map to its directory: {paths:?}"
+    );
+    assert!(
+        paths.contains(&"github.com/other/mod/c.go"),
+        "an entry no module claims stays verbatim, so it is reported unmeasured: {paths:?}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}

@@ -31,6 +31,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+pub mod commit_wire;
 pub mod json;
 pub mod records;
 pub mod schema;
@@ -1045,6 +1046,17 @@ impl Store {
     /// Replaces every gap for a task. See [`records::gaps_replace`].
     pub fn gaps_replace(&self, task_id: &str, gaps: &[records::GapRow]) -> Result<()> {
         records::gaps_replace(&self.conn, task_id, gaps)
+    }
+
+    /// Commits a verification run and its gaps as one transaction. See
+    /// [`records::verification_commit`].
+    pub fn verification_commit(
+        &self,
+        run: Option<&records::VerificationRun>,
+        task_id: &str,
+        gaps: &[records::GapRow],
+    ) -> Result<()> {
+        records::verification_commit(&self.conn, run, task_id, gaps)
     }
 
     /// Records a verification run. See [`records::run_record`].

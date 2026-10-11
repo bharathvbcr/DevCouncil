@@ -201,6 +201,34 @@ the Python they resemble, and in one case they are clearly worse.
 | **Lease mutual exclusion** | `storage/native.py`, same partial unique index | `dc-store`, same index, plus `verify_exclusion_index` reading `PRAGMA index_list` to refuse a database whose index is only *named* right | **Parity, plus one real hardening.** The value is that a Go/Rust plane can share the file — proven by the interop tests. |
 | **Repository search** | Python-side helpers | `dc-grep`, ripgrep's linked engine, results as JSON | Additive; no Python equivalent was replaced. |
 
+**Stub gate, measured 2026-10-10** (`tests/stub_measurement.rs`, `tests/stub_holdout.rs`,
+`tests/corpus/retired_python_oracle.py`; a case is positive for a gate when
+`cases.txt` expects anything but `clean`, flagged on a finding of any severity,
+because the retired detector had no severity). On the 70-case `cases.txt`
+(tuning data, written with the implementation):
+
+| Gate | Tree path (new-file diffs) | Substring fallback, now | Substring fallback, before | Retired Python `stub_detector.py` (`3286db5e^`) |
+|---|---|---|---|---|
+| `stub_detection` | tp 26 fp 0 fn 0 tn 44 (1.000 / 1.000) | tp 23 fp 4 fn 3 tn 40 (P 0.852, R 0.885) | tp 21 fp 4 fn 5 tn 40 (P 0.840, R 0.808) | tp 17 fp 9 fn 9 tn 35 (P 0.654, R 0.654) |
+| `assert_free_test` | tp 2 fp 0 fn 0 tn 68 | tp 0 fn 2 (R 0.000) | same | tp 0 fn 2 (R 0.000) |
+| `skipped_test` | tp 4 fp 0 fn 0 tn 66 | tp 0 fn 4 (R 0.000) | same | tp 2 fp 0 fn 2 tn 66 (P 1.000, R 0.500) |
+
+Every file without a usable post-image takes the fallback, so its numbers are the
+ones that apply to a modified file the host cannot read, to a syntax error, and
+to every language without a grammar here; it has no reading of tests at all. The
+fallback now also reads `todo!(…)`/`unimplemented!(…)` with arguments, a Rust or
+Go `panic` whose message opens with a placeholder phrase, Kotlin's `TODO(…)`, and
+`throw new T(…)` in JS/TS/PHP/Kotlin through `thrown_placeholder`; a changed file
+in a grammar language that the tree could not analyse (syntax error, too large,
+parse past its 2 s budget) is reported in `stub_ast_degraded`, which the Go host
+turns into a degraded run. *Held-out corpus* `tests/corpus/stub_holdout.tsv` (51
+rows, 26 stub), labelled by the rule in its header before the fallback was
+extended: fallback precision **1.000 (22/22)**, recall **0.846 (22/26)**; the
+four misses are Swift `fatalError("not implemented")`, Scala `???`, Dart
+`UnimplementedError` and a C `assert(0 && "not implemented")`, languages the
+fallback does not read. The corpus was written by the implementer, not a second
+labeller, and is small; treat both figures as samples, not field rates.
+
 **Consequence:** the honest first cutover is **`dc-store`**, because interop is
 proven and the semantics are identical. `dc-verify`'s rigor gates should be
 treated as a *second opinion* alongside Python's, not a replacement, until a
@@ -251,9 +279,11 @@ differential run over real diffs says otherwise.
 - **The execution plane is not a component.** MANVI's `gate`, `policy`, `grants`,
   `agent`, `llm`, `session`, `tools` and `ui` are the *harness*, not components,
   and are not candidates for porting into this repository.
-- **No differential run** of these gates against DevCouncil's Python equivalents
-  over real diffs. §4's verdicts are from reading both implementations, not from
-  measurement — which is why §4 says do not cut over stub detection.
+- **No differential run over real diffs.** The stub gate now has a differential
+  against the retired `stub_detector.py` on the hand-labelled corpus (§4), where
+  the Rust tree path is exact and the Python detector is not; there is still no
+  run over real repository diffs, so §4 keeps its "second opinion" caution for
+  the fallback path, whose recall on tests is zero.
 - **Windows is unproven for `dc-store`.** `dc-glob`, `dc-verify` and `dc-grep`
   were confirmed to `cargo check` for `x86_64-pc-windows-msvc` locally;
   `dc-store` compiles SQLite from source and could not be cross-checked from
