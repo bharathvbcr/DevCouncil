@@ -146,6 +146,34 @@ pub(super) fn write_human(message: std::fmt::Arguments<'_>) -> bool {
     true
 }
 
+/// Whether a terminal or a bidirectional renderer would act on `c`: a control
+/// character, or a bidirectional override or isolate. Newline is text structure
+/// and is not one.
+pub(super) fn is_terminal_unsafe(c: char) -> bool {
+    c != '\n'
+        && (c.is_control()
+            || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+}
+
+/// `text` with each character [`is_terminal_unsafe`] written as `\uXXXX`, or
+/// `None` when it needs no change. Tab is kept: tab-separated output is a
+/// format, and a terminal gives it no meaning beyond spacing.
+pub(super) fn escape_for_pipe(text: &str) -> Option<String> {
+    let unsafe_char = |c: char| c != '\t' && is_terminal_unsafe(c);
+    if !text.chars().any(unsafe_char) {
+        return None;
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        if unsafe_char(c) {
+            out.push_str(&format!("\\u{:04x}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
+}
+
 /// Bounded formatting even if one result contains a very long source line.
 struct HumanText {
     buffer: String,
@@ -156,9 +184,9 @@ struct HumanText {
 impl HumanText {
     fn flush(&mut self) {
         if self.color {
-            super::write_stdout_raw(format_args!("{}", progress::accent_numbers(&self.buffer)));
+            super::write_stdout_styled(format_args!("{}", progress::accent_numbers(&self.buffer)));
         } else {
-            super::write_stdout_raw(format_args!("{}", self.buffer));
+            super::write_stdout_styled(format_args!("{}", self.buffer));
         }
         self.buffer.clear();
     }
@@ -167,10 +195,7 @@ impl HumanText {
 impl Write for HumanText {
     fn write_str(&mut self, text: &str) -> std::fmt::Result {
         for c in text.chars() {
-            if c != '\n'
-                && (c.is_control()
-                    || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
-            {
+            if is_terminal_unsafe(c) {
                 self.buffer.extend(c.escape_default());
             } else if self.ascii && !c.is_ascii() {
                 self.buffer.extend(c.escape_unicode());

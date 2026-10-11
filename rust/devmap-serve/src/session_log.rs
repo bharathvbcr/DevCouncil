@@ -189,31 +189,36 @@ fn mark_queried(db_path: &Path, session_id: &str) -> std::io::Result<()> {
 /// can be removed. Every error is swallowed — pruning is housekeeping, and
 /// housekeeping must never fail the call that triggered it.
 pub fn prune_oldest(dir: &Path, prefix: &str, cap: usize) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    if let Ok(pinned) = devmap_extract::safe_fs::PinnedDir::open(dir, false) {
+        prune_oldest_in(&pinned, prefix, cap);
+    }
+}
+
+/// [`prune_oldest`] over a directory already pinned by `safe_fs`: removal is
+/// by name relative to the pinned handle, so a link swapped in afterwards
+/// cannot redirect a delete, and a linked directory is never pinned at all.
+pub fn prune_oldest_in(dir: &devmap_extract::safe_fs::PinnedDir, prefix: &str, cap: usize) {
+    let Ok(entries) = std::fs::read_dir(dir.path()) else {
         return;
     };
-    let mut markers: Vec<(SystemTime, PathBuf)> = Vec::new();
+    let mut markers: Vec<(SystemTime, std::ffi::OsString)> = Vec::new();
     for entry in entries.take(MAX_PRUNE_SCAN).flatten() {
-        let path = entry.path();
-        let eligible = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(prefix));
-        if !eligible {
+        let name = entry.file_name();
+        if !name.to_str().is_some_and(|name| name.starts_with(prefix)) {
             continue;
         }
         let modified = entry
             .metadata()
             .and_then(|meta| meta.modified())
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        markers.push((modified, path));
+        markers.push((modified, name));
     }
     if markers.len() <= cap {
         return;
     }
     markers.sort_by_key(|left| std::cmp::Reverse(left.0));
-    for (_, path) in markers.into_iter().skip(cap) {
-        let _ = std::fs::remove_file(path);
+    for (_, name) in markers.into_iter().skip(cap) {
+        let _ = dir.remove_child(&name);
     }
 }
 

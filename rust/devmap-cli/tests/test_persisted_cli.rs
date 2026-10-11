@@ -352,10 +352,17 @@ fn generation_build_does_not_write_a_disposable_copy_of_every_extraction() {
     fs::write(root.join("src/one.py"), "def first(): return 1\n").unwrap();
     let db = root.join("index.sqlite");
     drop(devmap_store::Store::open(&db).unwrap());
-    {
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.execute_batch("CREATE TRIGGER refuse_disposable_extractions BEFORE INSERT ON extraction_cache BEGIN SELECT RAISE(ABORT, 'generation builds must persist extraction payloads once'); END;").unwrap();
-    }
+    // Observed by row count. A trigger that aborts the insert would say the
+    // same thing, but a store carrying a trigger is refused at open, since a
+    // shipped store's triggers are somebody else's SQL.
+    let persisted_copies = || -> i64 {
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row("SELECT count(*) FROM extraction_cache", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    };
     staleness_query(&root, &["build", "."]);
     fs::write(root.join("src/two.py"), "def second(): return 2\n").unwrap();
     let next = staleness_query(&root, &["build", "."]);
@@ -366,5 +373,10 @@ fn generation_build_does_not_write_a_disposable_copy_of_every_extraction() {
     );
     assert_eq!(staleness_query(&root, &["search", "first"])["total"], 1);
     assert_eq!(staleness_query(&root, &["search", "second"])["total"], 1);
+    assert_eq!(
+        persisted_copies(),
+        0,
+        "generation builds must persist extraction payloads once"
+    );
     fs::remove_dir_all(root).unwrap();
 }

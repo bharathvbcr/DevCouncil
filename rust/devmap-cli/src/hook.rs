@@ -1764,21 +1764,21 @@ enum Claim {
 
 /// Claim the session's one directive, atomically.
 ///
-/// `create_new` is the whole mechanism: it is a single atomic syscall, so
+/// Exclusive creation is the whole mechanism: it is a single atomic syscall, so
 /// exactly one member of a concurrent burst wins. A parallel fan-out of reads
 /// emits one directive rather than one per call, without a lock to reclaim or
 /// a pid to interpret.
 fn claim_once(dir: &Path, name: &str) -> Claim {
-    if fs::create_dir_all(dir).is_err() {
+    use devmap_extract::safe_fs::{Access, Creation, PinnedDir};
+    // Through the pinned directory, not the path: a linked `hooks` component,
+    // or a linked ancestor, is refused, so neither the marker nor the pruning
+    // below can reach into a directory the link points at.
+    let Ok(pinned) = PinnedDir::open(dir, true) else {
         return Claim::Skip;
-    }
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(dir.join(name))
-    {
+    };
+    match pinned.open_file(std::ffi::OsStr::new(name), Access::Append, Creation::New) {
         Ok(_) => {
-            session_log::prune_oldest(dir, MARKER_PREFIX, MAX_PRE_TOOL_MARKERS);
+            session_log::prune_oldest_in(&pinned, MARKER_PREFIX, MAX_PRE_TOOL_MARKERS);
             Claim::First
         }
         Err(_) => Claim::Skip,
@@ -3809,6 +3809,42 @@ mod tests {
         // fails, which is the branch under test.
         fs::write(&blocked, b"x").unwrap();
         assert_eq!(claim_once(&blocked, "nav.x.0"), Claim::Skip);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `.devcouncil/codeintel/hooks` linked at a directory the repository's
+    /// owner never meant to hand over. The marker claim must not create a file
+    /// there, and the pruning that follows a claim must not delete from it: a
+    /// hostile checkout could otherwise aim both at the victim's `nav.*` files.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_marker_directory_receives_no_write_and_loses_no_file() {
+        let root = scratch("pretool-linked");
+        let victim = root.join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        for index in 0..70 {
+            fs::write(victim.join(format!("{MARKER_PREFIX}old{index}.x")), b"keep").unwrap();
+        }
+        let linked = root.join("hooks");
+        std::os::unix::fs::symlink(&victim, &linked).unwrap();
+
+        assert_eq!(claim_once(&linked, "nav.s1.0"), Claim::Skip);
+        assert!(
+            !victim.join("nav.s1.0").exists(),
+            "a marker was created through the link"
+        );
+        session_log::prune_oldest(&linked, MARKER_PREFIX, 4);
+        assert_eq!(
+            fs::read_dir(&victim).unwrap().count(),
+            70,
+            "pruning reached through the link"
+        );
+
+        // A link in an ancestor is refused the same way.
+        let outer = root.join("outer");
+        std::os::unix::fs::symlink(&root, &outer).unwrap();
+        assert_eq!(claim_once(&outer.join("victim"), "nav.s2.0"), Claim::Skip);
+        assert!(!victim.join("nav.s2.0").exists());
         let _ = fs::remove_dir_all(&root);
     }
 

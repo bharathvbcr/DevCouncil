@@ -136,10 +136,10 @@ fn scan_secrets_precision_and_recall_on_the_tuning_corpus() {
     assert_eq!(
         matrix,
         Matrix {
-            tp: 49,
+            tp: 69,
             fp: 0,
             fn_: 0,
-            tn: 51
+            tn: 61
         },
         "scan_secrets moved on secrets.tsv; update the pinned counts here and the \
          figures in rust/STATUS.md together\n{}",
@@ -203,11 +203,12 @@ fn scan_secrets_precision_and_recall_on_the_second_held_out_corpus() {
 }
 
 // The first run, 2026-10-08: precision 1.000 (18/18), recall 0.900 (18/20).
-// The misses are `curl -u user:password` and Redis's `requirepass <pw>`, two
-// spellings no detector reads.
-const HOLDOUT_2_TP: usize = 18;
+// The misses were `curl -u user:password` and Redis's `requirepass <pw>`, two
+// spellings no detector read. The `curl -u` detector (2026-10-10) closed the
+// first, moving this to 19/20; `requirepass <pw>` is still a miss.
+const HOLDOUT_2_TP: usize = 19;
 const HOLDOUT_2_FP: usize = 0;
-const HOLDOUT_2_FN: usize = 2;
+const HOLDOUT_2_FN: usize = 1;
 const HOLDOUT_2_TN: usize = 26;
 
 /// One scope case: the plan, the change, and the hand label of every path the
