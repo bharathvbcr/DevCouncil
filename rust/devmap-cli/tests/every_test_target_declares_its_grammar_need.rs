@@ -189,6 +189,32 @@ fn gated_targets(manifest: &str) -> BTreeSet<String> {
     gated
 }
 
+/// Modules of a crate's one consolidated target (`tests/it.rs`) declared
+/// `#[cfg(feature = "parse")]`, and every module it declares.
+///
+/// The consolidation moved the classification from `[[test]]` entries into
+/// `cfg` lines, so this reads them: a `mod x;` directly under that attribute is
+/// gated, any other `mod x;` is not.
+fn consolidated_modules(it_rs: &str) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut gated = BTreeSet::new();
+    let mut all = BTreeSet::new();
+    let mut previous_is_parse_gate = false;
+    for line in it_rs.lines() {
+        let line = line.trim();
+        if let Some(name) = line
+            .strip_prefix("mod ")
+            .and_then(|rest| rest.strip_suffix(';'))
+        {
+            all.insert(name.to_string());
+            if previous_is_parse_gate {
+                gated.insert(name.to_string());
+            }
+        }
+        previous_is_parse_gate = line == "#[cfg(feature = \"parse\")]";
+    }
+    (gated, all)
+}
+
 #[test]
 fn every_integration_test_is_classified_against_the_parse_feature() {
     let root = workspace_root();
@@ -199,15 +225,32 @@ fn every_integration_test_is_classified_against_the_parse_feature() {
         let crate_dir = root.join(crate_name);
         let manifest = std::fs::read_to_string(crate_dir.join("Cargo.toml"))
             .unwrap_or_else(|error| panic!("{crate_name}/Cargo.toml unreadable: {error}"));
-        let gated = gated_targets(&manifest);
+        let mut gated = gated_targets(&manifest);
         let safe: BTreeSet<String> = safe.iter().map(|name| name.to_string()).collect();
+        // A crate with a consolidated target keeps its classification in the
+        // `mod` lines of tests/it.rs. `it` itself is the harness, not a file to
+        // classify, and a file that appears there is a module, not a target.
+        let consolidated = std::fs::read_to_string(crate_dir.join("tests/it.rs")).ok();
+        if let Some(it_rs) = &consolidated {
+            let (gated_modules, all_modules) = consolidated_modules(it_rs);
+            // A parse that found no module would make this vacuous.
+            assert!(
+                all_modules.len() > 10,
+                "{crate_name}: tests/it.rs declares only {} modules; the parse is broken",
+                all_modules.len()
+            );
+            gated.extend(gated_modules);
+            gated.remove("it");
+        }
 
         let mut files = BTreeSet::new();
         for entry in std::fs::read_dir(crate_dir.join("tests"))
             .unwrap_or_else(|error| panic!("{crate_name}/tests unreadable: {error}"))
         {
             let path = entry.expect("a readable directory entry").path();
-            if path.extension().is_some_and(|ext| ext == "rs") {
+            if path.extension().is_some_and(|ext| ext == "rs")
+                && path.file_stem().is_some_and(|stem| stem != "it")
+            {
                 files.insert(
                     path.file_stem()
                         .expect("a .rs file has a stem")

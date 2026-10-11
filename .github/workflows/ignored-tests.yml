@@ -38,7 +38,7 @@ jobs:
           cache-on-failure: true
           workspaces: rust
       - name: Daemon storm soak (minutes-long)
-        run: cargo test --locked -p devmap-cli --test daemon_storm_soak -- --ignored --nocapture
+        run: cargo test --locked -p devmap-cli --test it -- daemon_storm_soak:: --ignored --nocapture
       - name: Ledger at four hundred thousand rows
         run: cargo test --locked -p devmap-store --test ledger_write -- --ignored --nocapture
       - name: Workbench search profile (100,000 tasks)
@@ -78,7 +78,7 @@ jobs:
           } >> "$GITHUB_ENV"
       - name: Tooltip regression
         working-directory: rust
-        run: cargo test --locked -p devmap-query --test tooltip_security -- --ignored --nocapture
+        run: cargo test --locked -p devmap-query --test it -- tooltip_security:: --ignored --nocapture
 
   claude-plugin:
     name: emitted plugin passes `claude plugin validate --strict`
@@ -103,4 +103,4 @@ jobs:
           claude --version
       - name: Validate the emitted bundle
         working-directory: rust
-        run: cargo test --locked -p devmap-cli --test claude_integration -- --ignored --nocapture
+        run: cargo test --locked -p devmap-cli --test it -- claude_integration:: --ignored --nocapture

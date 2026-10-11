@@ -16,10 +16,20 @@ categories = [
     "parser-implementations",
 ]
 build = "build.rs"
+autotests = false
 
 [[bin]]
 name = "devmap"
 path = "src/main.rs"
+
+[[test]]
+name = "it"
+
+[[test]]
+name = "global_excludes_bind_the_daemon"
+
+[[test]]
+name = "test_time_scale"
 
 [dependencies]
 devmap-extract = { path = "../devmap-extract" }
