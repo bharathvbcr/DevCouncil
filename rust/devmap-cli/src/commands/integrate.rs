@@ -31,6 +31,18 @@ pub(crate) struct Args {
     /// DevCouncil passes its own server this way.
     #[arg(long)]
     pub(crate) servers_stdin: bool,
+    /// Take back what an apply registered instead of registering: remove
+    /// `devmap` and the servers named on stdin from the host documents named by
+    /// `--only-path`, leaving every other entry, key and comment. Guides,
+    /// skills and hook files are not touched; the report names them. `--check`
+    /// exits non-zero while anything is still registered; `--dry-run` reports
+    /// without writing.
+    #[arg(long, requires = "only_path")]
+    pub(crate) remove: bool,
+    /// A host document `--remove` may open. Repeatable; one apply's receipt
+    /// names them. A document not listed is never read.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) only_path: Vec<PathBuf>,
 }
 
 pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
@@ -41,7 +53,20 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         check,
         binary,
         servers_stdin,
+        remove,
+        only_path,
     } = args;
+    if *remove {
+        return run_remove(
+            cli,
+            *host,
+            project_root,
+            *dry_run,
+            *check,
+            *servers_stdin,
+            only_path,
+        );
+    }
     run_integrate(
         cli,
         *host,
@@ -51,6 +76,62 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         binary.as_deref(),
         *servers_stdin,
     )
+}
+
+/// `integrate HOST --remove`: see [`integrate::remove_registered`].
+fn run_remove(
+    cli: &Cli,
+    host: integrate::Host,
+    project_root: &Path,
+    dry_run: bool,
+    check: bool,
+    servers_stdin: bool,
+    only: &[PathBuf],
+) -> anyhow::Result<()> {
+    let mut names = vec![crate::claude::MCP_SERVER_NAME.to_string()];
+    if servers_stdin {
+        let bytes = hook::read_stdin_limited(integrate::MAX_SERVER_REQUEST_BYTES)?;
+        names.extend(
+            integrate::parse_server_request(&bytes)?
+                .into_iter()
+                .map(|spec| spec.name),
+        );
+    }
+    let removals = integrate::remove_registered(host, project_root, &names, only, dry_run, check)?;
+    // Still registered after this run: only a run that wrote nothing leaves
+    // entries behind it found.
+    let pending = (dry_run || check) && removals.iter().any(|r| !r.removed.is_empty());
+    let retained = "guides, skills, hook and plugin files are not removed by --remove: \
+        AGENTS.md and CLAUDE.md are shared by every host, and the skill receipt \
+        (.devcouncil-skills.json) lists what to delete by hand";
+    if cli.json {
+        emit_json(
+            cli,
+            &serde_json::json!({
+                "host": host.as_str(),
+                "removed": removals.iter().map(|r| serde_json::json!({
+                    "path": r.path.display().to_string(),
+                    "servers": r.removed,
+                    "deleted": r.deleted,
+                    "note": r.note,
+                })).collect::<Vec<_>>(),
+                "notes": [retained],
+                "dry_run": dry_run,
+                "check": check,
+                "check_ok": !pending,
+            }),
+        )?;
+    } else {
+        outln!("integrate {} --remove:", host.as_str());
+        for r in &removals {
+            outln!("  {}: {:?} {}", r.path.display(), r.removed, r.note);
+        }
+        outln!("  note: {retained}");
+    }
+    if check && pending {
+        anyhow::bail!("integrate --remove --check: servers are still registered");
+    }
+    Ok(())
 }
 
 fn run_integrate(

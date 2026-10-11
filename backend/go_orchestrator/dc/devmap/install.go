@@ -74,6 +74,22 @@ type IntegrateReport struct {
 	CheckOK         bool     `json:"check_ok"`
 }
 
+// RemovedDocument is one host document `devmap integrate --remove` examined.
+type RemovedDocument struct {
+	Path    string   `json:"path"`
+	Servers []string `json:"servers"`
+	Deleted bool     `json:"deleted"`
+	Note    string   `json:"note"`
+}
+
+// RemoveReport is what `devmap --json integrate --remove` reports.
+type RemoveReport struct {
+	Host    string            `json:"host"`
+	Removed []RemovedDocument `json:"removed"`
+	Notes   []string          `json:"notes"`
+	CheckOK bool              `json:"check_ok"`
+}
+
 // SkillsReport is what `devmap --json skills install` reports.
 type SkillsReport struct {
 	Written   []string `json:"written"`
@@ -111,6 +127,36 @@ func (c *Client) Integrate(ctx context.Context, host string, mode InstallMode, s
 		return nil, err
 	}
 	var report IntegrateReport
+	if err := c.install(ctx, &report, mode, stdin, args...); err != nil {
+		return nil, err
+	}
+	return &report, nil
+}
+
+// RemoveServers runs `devmap integrate <host> --remove`: it takes `devmap` and
+// `servers` back out of the host documents named in `only`, and only those.
+// `only` is the receipt of the apply that wrote them; an empty list is refused
+// by devmap rather than read as "everywhere". Under InstallCheck a document
+// that still holds a server is an answer (CheckOK false), not a failure.
+func (c *Client) RemoveServers(ctx context.Context, host string, mode InstallMode, servers []Server, only []string) (*RemoveReport, error) {
+	args := []string{"integrate", host, "--project-root", c.Root, "--remove"}
+	for _, path := range only {
+		args = append(args, "--only-path", path)
+	}
+	var stdin []byte
+	if len(servers) > 0 {
+		encoded, err := json.Marshal(map[string]any{"servers": servers})
+		if err != nil {
+			return nil, err
+		}
+		stdin = encoded
+		args = append(args, "--servers-stdin")
+	}
+	args, err := withMode(args, mode)
+	if err != nil {
+		return nil, err
+	}
+	var report RemoveReport
 	if err := c.install(ctx, &report, mode, stdin, args...); err != nil {
 		return nil, err
 	}
@@ -155,17 +201,50 @@ func withMode(args []string, mode InstallMode) ([]string, error) {
 	return nil, fmt.Errorf("unknown install mode %q", mode)
 }
 
+// Reported is DevMap reporting that it could not do the work — a document it
+// will not rewrite, an unknown host, a malformed request — as opposed to
+// reporting on a tree that differs. It is the CLI's error envelope, and
+// Message is DevMap's own text, which names the file at fault.
+type Reported struct {
+	Command string
+	Message string
+}
+
+func (r *Reported) Error() string {
+	return fmt.Sprintf("devmap %s refused: %s", r.Command, r.Message)
+}
+
 // install runs one installing command and decodes its report.
 //
-// The report is the first JSON document on stdout. A failing `--json` run
-// follows it with the CLI's error envelope, so the rest is not parsed.
+// The report is the first JSON document on stdout, and it is a report only if
+// it carries `check_ok`. A failing `--json` run that wrote no report prints the
+// CLI's error envelope instead, which has no such field; decoding it as a
+// report made every refusal read as a tree that differs (CheckOK defaults to
+// false) and dropped the reason. Such a document is a *Reported, in every mode.
+// When a report was printed first, the envelope after it is not parsed.
 func (c *Client) install(ctx context.Context, into any, mode InstallMode, stdin []byte, args ...string) error {
 	out, err := c.invoke(ctx, installBudget, stdin, args...)
 	if err != nil {
 		return err
 	}
 	command := strings.Join(args[:2], " ")
-	decodeErr := json.NewDecoder(bytes.NewReader(out.stdout)).Decode(into)
+	var first map[string]json.RawMessage
+	decodeErr := json.NewDecoder(bytes.NewReader(out.stdout)).Decode(&first)
+	_, isReport := first["check_ok"]
+	if decodeErr == nil && !isReport {
+		if raw, ok := first["error"]; ok {
+			var message string
+			if json.Unmarshal(raw, &message) != nil {
+				message = string(raw)
+			}
+			return &Reported{Command: command, Message: message}
+		}
+	}
+	if decodeErr == nil && isReport {
+		decodeErr = json.NewDecoder(bytes.NewReader(out.stdout)).Decode(into)
+	} else if decodeErr == nil {
+		decodeErr = fmt.Errorf("no check_ok field: not a report")
+	}
 	if out.runErr != nil {
 		if mode == InstallCheck && decodeErr == nil && reportsDrift(into) {
 			return nil
@@ -185,6 +264,8 @@ func reportsDrift(report any) bool {
 	case *IntegrateReport:
 		return !r.CheckOK
 	case *SkillsReport:
+		return !r.CheckOK
+	case *RemoveReport:
 		return !r.CheckOK
 	}
 	return false

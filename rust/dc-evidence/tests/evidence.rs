@@ -668,6 +668,53 @@ fn human_control_returned_tracks_intervention_status() {
 }
 
 #[test]
+fn human_control_returned_follows_the_latest_intervention() {
+    let mut contract: Value = serde_json::from_slice(CONTRACT).unwrap();
+    contract["criteria"] = json!([{
+        "id": "handoff",
+        "fact": "human_control_returned",
+        "required": true,
+        "predicate": {"op": "equals", "value": true}
+    }]);
+    let contract = serde_json::to_vec(&contract).unwrap();
+    let mut expected = expected();
+    expected.contract_sha256 = sha256(&contract);
+    let verdict_with = |interventions: Value| {
+        let bundle = edit_bundle(|b| {
+            b["contract_sha256"] = json!(expected.contract_sha256);
+            b["interventions"] = interventions.clone();
+            b["human_actions"] = json!([]);
+        });
+        verify(&contract, &bundle, &expected, &inputs())
+            .unwrap()
+            .verdict
+    };
+    let step = |id: &str, sequence: u64, status: &str| json!({"id": id, "sequence": sequence, "reason_code": "approval_pending", "status": status});
+    // A returned intervention must not mask a later one that is still open.
+    assert_eq!(
+        verdict_with(json!([
+            step("i1", 1, "returned"),
+            step("i2", 2, "requested")
+        ])),
+        Verdict::Failed
+    );
+    assert_eq!(
+        verdict_with(json!([
+            step("i1", 1, "returned"),
+            step("i2", 2, "abandoned")
+        ])),
+        Verdict::Failed
+    );
+    assert_eq!(
+        verdict_with(json!([
+            step("i1", 1, "requested"),
+            step("i2", 2, "returned")
+        ])),
+        Verdict::Passed
+    );
+}
+
+#[test]
 fn outcome_and_side_record_shape_is_validated() {
     let missing_outcome_id = edit_bundle(|b| b["outcome"] = json!({"kind": "success"}));
     assert!(parse_bundle(&missing_outcome_id).is_err());

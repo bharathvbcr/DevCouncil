@@ -1,0 +1,27 @@
+{
+  "contract": "devmap-stdio/v1",
+  "about": "What `devmap --json` writes on stdout for the commands DevCouncil's Go host (backend/go_orchestrator/dc/devmap) drives. Each entry names the fields a consumer may rely on and their JSON types; a producer may add fields, never remove or retype these. A command that fails without producing a report writes the `error_envelope` instead, which has no `check_ok`: a consumer tells the two apart by that field and must never decode an envelope as a report. Replayed against the live binary by TestTheLiveStdioContractReplay (dc/devmap/stdio_contract_test.go), which CI runs with devmap built from this tree. Stdout carries the data; stderr is prose and is not part of the contract.",
+  "documents": {
+    "integrate_report": {
+      "command": "devmap --json integrate HOST --project-root ROOT [--check|--dry-run] [--servers-stdin]",
+      "stdin": "{\"servers\":[{\"name\",\"command\",\"args\"?,\"env\"?,\"cwd\"?}]} when --servers-stdin",
+      "required": {"host": "string", "guides": "array", "skills_written": "array", "skills_differing": "array", "global_mcp": "array", "project_mcp": "array", "hooks": "array", "servers": "array", "notes": "array", "dry_run": "boolean", "check": "boolean", "check_ok": "boolean"},
+      "exit": "0 when applied or current; non-zero under --check when check_ok is false, the report still printed first"
+    },
+    "remove_report": {
+      "command": "devmap --json integrate HOST --project-root ROOT --remove --only-path DOC... [--check|--dry-run] [--servers-stdin]",
+      "required": {"host": "string", "removed": "array", "notes": "array", "dry_run": "boolean", "check": "boolean", "check_ok": "boolean"},
+      "exit": "0 unless a document is refused; under --check non-zero while a server is still registered"
+    },
+    "build_result": {
+      "command": "devmap --json build .",
+      "required": {"generation_id": "number", "files_indexed": "number", "symbols": "number", "edges": "number", "discovery_refused_files": "number", "discovery_refusals": "object", "over_limit_files": "array"},
+      "nested": {"discovery_refusals": {"total": "number", "shown": "number", "items": "array"}}
+    },
+    "error_envelope": {
+      "command": "any devmap --json command that fails before producing a report",
+      "required": {"error": "string"},
+      "absent": ["check_ok"]
+    }
+  }
+}

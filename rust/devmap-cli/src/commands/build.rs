@@ -94,6 +94,22 @@ pub(crate) struct Args {
     pub(crate) inventory: InventoryFlags,
 }
 
+/// The refusals by name, as data. `total` is the whole inventory and `shown`
+/// how many items follow: the list is a sample capped at [`REFUSAL_SAMPLE`],
+/// never presented as the set. A consumer reads this, not the prose on stderr.
+fn refusals_json(inventory: &devmap_store::DiscoveryInventory) -> serde_json::Value {
+    serde_json::json!({
+        "total": inventory.refusals.len(),
+        "shown": inventory.refusals.len().min(REFUSAL_SAMPLE),
+        "items": inventory
+            .refusals
+            .iter()
+            .take(REFUSAL_SAMPLE)
+            .map(|r| serde_json::json!({"path": r.path, "reason": r.reason}))
+            .collect::<Vec<_>>(),
+    })
+}
+
 pub(crate) fn run(
     cli: &Cli,
     progress: Option<&ProgressReporter>,
@@ -258,6 +274,10 @@ pub(crate) fn run(
     })?;
     let scan_snapshot = scan_progress.snapshot();
     progress.display.detail("checking content hashes");
+    // Under `--json` none of the three listings below is printed: the same
+    // facts are in the result as data (`discovery_refusals`, `over_limit_files`)
+    // and a consumer must not have to recover them from prose, least of all
+    // from a Rust `Debug` rendering. They are for the person at a terminal.
     // Report what discovery refused. A file dropped for being oversized
     // or unreadable used to vanish with no record: `repo_map.json` would
     // say five files while two more existed, and nothing distinguished
@@ -267,7 +287,7 @@ pub(crate) fn run(
     // the same verdict, and it cannot do that against a copy of the rule.
     let refused: Vec<&(String, devmap_extract::model::DiscoverySkipReason)> =
         scanned.report.refusals().collect();
-    if !refused.is_empty() {
+    if !refused.is_empty() && !cli.json {
         // Both numbers in the header. A bare list of twenty under a
         // count of two hundred is a capped sample presented as the set,
         // which is the one thing this codebase never lets a report do.
@@ -295,7 +315,7 @@ pub(crate) fn run(
     // same — and a file that grew past the limit used to show up only as a
     // `-1` in the change count, read by everyone as a deletion.
     let over_limit: Vec<(&String, u64, u64)> = scanned.report.over_limit().collect();
-    if !over_limit.is_empty() {
+    if !over_limit.is_empty() && !cli.json {
         let shown = over_limit.len().min(REFUSAL_SAMPLE);
         progress.display.diagnostic(format_args!(
             "  skipped {} source file(s) over the size limit — these are absent from \
@@ -328,7 +348,7 @@ pub(crate) fn run(
         .iter()
         .filter(|(manifest, _)| !refused.iter().any(|(path, _)| path == manifest))
         .collect();
-    if !manifest_refused.is_empty() {
+    if !manifest_refused.is_empty() && !cli.json {
         let shown = manifest_refused.len().min(REFUSAL_SAMPLE);
         progress.display.diagnostic(format_args!(
             "  {} project manifest(s) could not be read — the module mappings they \
@@ -354,6 +374,7 @@ pub(crate) fn run(
     // carrying a number it can only ever raise.
     let discovery_inventory = devmap_store::DiscoveryInventory::of(&scanned.report, &manifests);
     let refused_count = discovery_inventory.refusals.len();
+    let refusals_doc = refusals_json(&discovery_inventory);
     let over_limit_files = discovery_inventory.over_limit_files();
 
     // B3/SC2: if the tree that was just scanned is byte-for-byte the one
@@ -491,24 +512,25 @@ pub(crate) fn run(
                 emit_json(
                     cli,
                     &serde_json::json!({
-                        "unchanged": true,
-                        "file_progress": { "scan": scan_snapshot, "extraction": null, "delta": file_delta },
-                        "files": file_count,
-                        // Recomputed by this scan, not carried over: a
-                        // build that proves nothing changed has just
-                        // re-asked discovery the same question, and the
-                        // answer is part of what it proved.
-                        "discovery_refused_files": refused_count,
-                        "over_limit_files": over_limit_files,
-                        "generation": generation,
-                        "reclaim": reclaim_note(&vacuum),
-                        "timings": progress.timings_json(),
-                        "progress_output": progress.display.output_json(),
-                        // `null` when `--manifest` was not asked for,
-                        // never an empty object: a caller must be able
-                        // to tell "not requested" from "wrote nothing".
-                        "manifest": manifest.as_ref().map(|manifest| &manifest.json),
-                    }),
+                            "unchanged": true,
+                            "file_progress": { "scan": scan_snapshot, "extraction": null, "delta": file_delta },
+                            "files": file_count,
+                            // Recomputed by this scan, not carried over: a
+                            // build that proves nothing changed has just
+                            // re-asked discovery the same question, and the
+                            // answer is part of what it proved.
+                            "discovery_refused_files": refused_count,
+                    "discovery_refusals": refusals_doc,
+                            "over_limit_files": over_limit_files,
+                            "generation": generation,
+                            "reclaim": reclaim_note(&vacuum),
+                            "timings": progress.timings_json(),
+                            "progress_output": progress.display.output_json(),
+                            // `null` when `--manifest` was not asked for,
+                            // never an empty object: a caller must be able
+                            // to tell "not requested" from "wrote nothing".
+                            "manifest": manifest.as_ref().map(|manifest| &manifest.json),
+                        }),
                 )?;
             } else {
                 progress.display.summary(
@@ -877,6 +899,7 @@ pub(crate) fn run(
                 // readable, a parse failure by a grammar, and an operator
                 // reading one total cannot tell which they have.
                 "discovery_refused_files": refused_count,
+                "discovery_refusals": refusals_doc,
                 // Path, bytes and limit for each: what the graph is missing
                 // and why, which a count alone cannot tell an agent.
                 "over_limit_files": over_limit_files,

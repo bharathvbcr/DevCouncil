@@ -250,31 +250,18 @@ func TestBuildAndManifest(t *testing.T) {
 	}
 }
 
-func TestReadNoticesClassification(t *testing.T) {
-	sampleStderr := `
-discovery refused 3 file(s)
-  src/large.bin: Oversized { size: 10000000 }
-  src/bad.utf8: NotUTF8
-  ... and 1 more
-unclassified error from downstream
-`
-	n := readNotices(said{text: []byte(sampleStderr)})
-	if n.Refused != 3 {
-		t.Errorf("Refused = %d, want 3", n.Refused)
+func TestReadNoticesCarriesEveryStderrLineAndParsesNone(t *testing.T) {
+	// The wording the producer used to print for refusals is no longer
+	// understood, on purpose: it is prose, and the data is in the result.
+	n := readNotices(said{text: []byte("\ndiscovery refused 3 file(s)\n  src/large.bin: Oversized\nunclassified error from downstream\n")})
+	if n.Refused != 0 || len(n.Refusals) != 0 {
+		t.Errorf("stderr prose was parsed into counts: Refused=%d Refusals=%v", n.Refused, n.Refusals)
 	}
-	if len(n.Refusals) != 2 {
-		t.Errorf("len(Refusals) = %d, want 2", len(n.Refusals))
-	}
-	if len(n.Unrecognised) != 1 || n.Unrecognised[0] != "unclassified error from downstream" {
-		t.Errorf("Unrecognised = %v, want ['unclassified error from downstream']", n.Unrecognised)
+	if len(n.Unrecognised) != 3 {
+		t.Errorf("Unrecognised = %v, want all three non-empty lines", n.Unrecognised)
 	}
 	if n.Clean() {
-		t.Error("notices with refusals and unrecognised lines must not be Clean()")
-	}
-
-	degraded := n.Degraded()
-	if len(degraded) != 2 {
-		t.Fatalf("len(degraded) = %d, want 2 (%v)", len(degraded), degraded)
+		t.Error("notices carrying lines must not be Clean()")
 	}
 
 	// Test Merge
@@ -284,23 +271,18 @@ unclassified error from downstream
 		Unrecognised: []string{"warning"},
 	}
 	n.Merge(other)
-	if n.Refused != 5 {
-		t.Errorf("merged Refused = %d, want 5", n.Refused)
-	}
-	if len(n.Refusals) != 3 {
-		t.Errorf("merged len(Refusals) = %d, want 3", len(n.Refusals))
+	if n.Refused != 2 || len(n.Refusals) != 1 || len(n.Unrecognised) != 4 {
+		t.Errorf("merge did not conserve: Refused=%d Refusals=%d Unrecognised=%d", n.Refused, len(n.Refusals), len(n.Unrecognised))
 	}
 }
 
-// refusedStderr is recorded verbatim from devmap 0.1.0 (DevCouncil 6bc0eff)
-// building a fixture holding one oversized source and one that is not UTF-8.
-//
-// It is pasted rather than paraphrased on purpose. This is the producer's text,
-// not a format this repository chose, and a test written against a tidied-up
-// version of it would pass while the real thing went unparsed.
-const refusedStderr = "  discovery refused 2 file(s) — these are absent from the graph:\n" +
-	"    big.py: Oversized { bytes: 1800000, limit: 1048576 }\n" +
-	`    blob.py: Unreadable { reason: "stream did not contain valid UTF-8" }`
+// refusedBuild is the shape of `devmap --json build` when discovery refused two
+// files: the counts, and the refusals by name as data. `reason` is the
+// producer's Display wording.
+const refusedBuild = `{"files_indexed":3,"symbols":5,"edges":5,"discovery_refused_files":2,` +
+	`"discovery_refusals":{"total":2,"shown":2,"items":[` +
+	`{"path":"big.py","reason":"1800000 bytes exceeds the 1048576 byte source ceiling"},` +
+	`{"path":"blob.py","reason":"unreadable: stream did not contain valid UTF-8"}]}}`
 
 // TestABuildReportsWhatItRefused is the regression on the build path.
 //
@@ -311,9 +293,7 @@ const refusedStderr = "  discovery refused 2 file(s) — these are absent from t
 // about either of them returns the same empty answer as code that does not
 // exist.
 func TestABuildReportsWhatItRefused(t *testing.T) {
-	c := fakeSaying(t,
-		map[string]string{"build": `{"files_indexed":3,"symbols":5,"edges":5}`},
-		map[string]string{"build": refusedStderr})
+	c := fake(t, map[string]string{"build": refusedBuild})
 
 	report, err := c.Build(context.Background(), 0)
 	if err != nil {
@@ -332,12 +312,10 @@ func TestABuildReportsWhatItRefused(t *testing.T) {
 	for _, refusal := range report.Refusals {
 		byPath[refusal.Path] = refusal.Reason
 	}
-	if got := byPath["big.py"]; !strings.Contains(got, "Oversized") {
+	if got := byPath["big.py"]; !strings.Contains(got, "ceiling") {
 		t.Errorf("big.py reason = %q, want it to name the refusal", got)
 	}
-	if got := byPath["blob.py"]; !strings.Contains(got, "Unreadable") {
-		// Split at the first ": " rather than the last: the reason carries one
-		// of its own inside `Unreadable { reason: "..." }`.
+	if got := byPath["blob.py"]; !strings.Contains(got, "UTF-8") {
 		t.Errorf("blob.py reason = %q, want it to name the refusal", got)
 	}
 
@@ -380,34 +358,53 @@ func TestARewordedNoticeIsCarriedNotDropped(t *testing.T) {
 // refusals and summarises the rest. Counting the printed lines would
 // under-report exactly when there is most to report.
 func TestTheRefusalCountIsTheProducersTotal(t *testing.T) {
-	var sb strings.Builder
-	sb.WriteString("  discovery refused 25 file(s) — these are absent from the graph:\n")
+	var items []string
 	for i := 0; i < 20; i++ {
-		fmt.Fprintf(&sb, "    vendor/blob%d.py: Unreadable { reason: \"stream did not contain valid UTF-8\" }\n", i)
+		items = append(items, fmt.Sprintf(`{"path":"vendor/blob%d.py","reason":"unreadable"}`, i))
 	}
-	sb.WriteString("    … and 5 more")
-
-	c := fakeSaying(t,
-		map[string]string{"build": `{"files_indexed":100}`},
-		map[string]string{"build": sb.String()})
+	c := fake(t, map[string]string{"build": `{"files_indexed":100,"discovery_refused_files":25,` +
+		`"discovery_refusals":{"total":25,"shown":20,"items":[` + strings.Join(items, ",") + `]}}`})
 
 	report, err := c.Build(context.Background(), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if report.Refused != 25 {
-		t.Errorf("Refused = %d, want the producer's total of 25, not the %d it printed",
+		t.Errorf("Refused = %d, want the producer's total of 25, not the %d it named",
 			report.Refused, len(report.Refusals))
 	}
 	if len(report.Refusals) != 20 {
-		t.Errorf("named %d refusals, want the 20 devmap printed", len(report.Refusals))
+		t.Errorf("named %d refusals, want the 20 devmap named", len(report.Refusals))
 	}
 	if len(report.Unrecognised) != 0 {
-		t.Errorf("the summary line was treated as unreadable: %v", report.Unrecognised)
+		t.Errorf("a well-formed result left unread lines: %v", report.Unrecognised)
 	}
 	// The one line must still carry the whole number, not the tenth it names.
 	if line := report.Degraded()[0]; !strings.Contains(line, "25 file(s)") || !strings.Contains(line, "and 15 more") {
 		t.Errorf("degraded line hides the total: %q", line)
+	}
+}
+
+// TestACountWithoutNamesIsAnOldDevmapNotACleanBuild: a result that counts
+// refused files but carries no `discovery_refusals` is from a devmap that
+// predates the field, and must not read as one that refused nothing.
+func TestACountWithoutNamesIsAnOldDevmapNotACleanBuild(t *testing.T) {
+	c := fake(t, map[string]string{"build": `{"files_indexed":3,"discovery_refused_files":4}`})
+	report, err := c.Build(context.Background(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Clean() || !strings.Contains(strings.Join(report.Degraded(), " "), "predates") {
+		t.Fatalf("an unnamed refusal count was read as clean: %v", report.Degraded())
+	}
+	// A total that disagrees with the count is a changed contract.
+	c = fake(t, map[string]string{"build": `{"discovery_refused_files":4,"discovery_refusals":{"total":1,"shown":0,"items":[]}}`})
+	report, err = c.Build(context.Background(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Clean() {
+		t.Fatal("disagreeing refusal totals were read as clean")
 	}
 }
 
@@ -418,8 +415,8 @@ func TestManifestNoticesJoinTheBuildsOwn(t *testing.T) {
 	mapPath := filepath.Join(dir, "repo_map.json")
 	graphPath := filepath.Join(dir, "code_graph.json")
 	c := fakeSaying(t,
-		map[string]string{"build": `{"files_indexed":3}`, "manifest": `{"generation_id":3,"output":"x"}`, "status": healthyStatus},
-		map[string]string{"build": refusedStderr, "manifest": "  discovery refused 1 file(s) — these are absent from the graph:\n    late.py: Oversized { bytes: 2, limit: 1 }"},
+		map[string]string{"build": refusedBuild, "manifest": `{"generation_id":3,"output":"x"}`, "status": healthyStatus},
+		map[string]string{"manifest": "warning: something the manifest said"},
 		mapPath, graphPath)
 
 	ctx := context.Background()
@@ -434,11 +431,11 @@ func TestManifestNoticesJoinTheBuildsOwn(t *testing.T) {
 	// Manifest now answers with a ManifestReport — the notices plus the
 	// generation it rendered — so the notices half is what merges.
 	report.Merge(notices.Notices)
-	if report.Refused != 3 {
-		t.Errorf("Refused = %d, want 3 across both commands", report.Refused)
+	if report.Refused != 2 || len(report.Refusals) != 2 {
+		t.Errorf("Refused=%d named=%d, want the build's 2", report.Refused, len(report.Refusals))
 	}
-	if len(report.Refusals) != 3 {
-		t.Errorf("named %d refusals, want 3", len(report.Refusals))
+	if len(report.Unrecognised) != 1 || !strings.Contains(report.Unrecognised[0], "manifest said") {
+		t.Errorf("the manifest's own notice was dropped in the fold: %v", report.Unrecognised)
 	}
 }
 

@@ -29,7 +29,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -585,52 +584,61 @@ func describe(n Notices, disagreements []string, adopted []Adoption) []string {
 	return out
 }
 
-// refusalHeader matches the line devmap prints before naming what it refused.
-var refusalHeader = regexp.MustCompile(`discovery refused (\d+) file\(s\)`)
-
-// refusalMore matches the line that stands in for the refusals it did not name.
-var refusalMore = regexp.MustCompile(`^(?:…|\.\.\.) and \d+ more$`)
-
 // readNotices classifies what a command wrote to stderr.
 //
-// An entry is split at its first ": " rather than its last, because the reason
-// is a Rust debug rendering that contains one of its own
-// (`Unreadable { reason: "..." }`) while a path containing ": " would be
-// pathological. A line that is neither a header, an entry beneath one, nor the
-// producer's own summary of the entries it did not print is unrecognised, and
-// unrecognised lines survive into the report rather than being dropped.
+// stderr is prose for a person, not a contract, so nothing is parsed out of it:
+// the files discovery refused arrive as data in the build result
+// (`discovery_refusals`, read by refusalsOf) and `devmap --json` prints no
+// listing of them. What is left on stderr under `--json` is by definition
+// something this build was not told to expect, and every such line survives
+// into the report rather than being dropped.
 func readNotices(stream said) Notices {
 	n := Notices{StreamTruncated: stream.truncated, StreamLimit: stream.limit}
-	inRefusals := false
 	for _, raw := range strings.Split(string(stream.text), "\n") {
-		line := strings.TrimRight(raw, "\r")
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
+		if line := strings.TrimSpace(strings.TrimRight(raw, "\r")); line != "" {
+			n.note(line)
+		}
+	}
+	return n
+}
+
+// refusalsOf reads the refusals a build result carries as data.
+//
+// `discovery_refusals` is `{total, shown, items: [{path, reason}]}`: total is
+// the producer's own count and items a capped sample, so the two are carried
+// separately and never one derived from the other. A result that counts refused
+// files but does not name them is from a devmap that predates the field, and
+// that is said rather than read as "nothing was refused".
+func refusalsOf(stats map[string]any) Notices {
+	var n Notices
+	refusedFiles, _ := stats["discovery_refused_files"].(float64)
+	doc, present := stats["discovery_refusals"].(map[string]any)
+	if !present {
+		if refusedFiles > 0 {
+			n.note(fmt.Sprintf("devmap reported %d refused file(s) without naming them: "+
+				"this devmap predates `discovery_refusals`; install the one built from this release", int(refusedFiles)))
+		}
+		return n
+	}
+	total, ok := doc["total"].(float64)
+	if !ok {
+		n.note("devmap's discovery_refusals carries no numeric total; it was not read")
+		return n
+	}
+	n.Refused = int(total)
+	if total != refusedFiles {
+		n.note(fmt.Sprintf("devmap reported %d refused file(s) but named a total of %d", int(refusedFiles), int(total)))
+	}
+	items, _ := doc["items"].([]any)
+	for _, raw := range items {
+		item, _ := raw.(map[string]any)
+		path, pathOK := item["path"].(string)
+		reason, _ := item["reason"].(string)
+		if !pathOK {
+			n.note("devmap named a refusal without a path; it was not read")
 			continue
 		}
-		if m := refusalHeader.FindStringSubmatch(trimmed); m != nil {
-			count, err := strconv.Atoi(m[1])
-			if err != nil {
-				// A header whose count will not parse is a changed contract,
-				// not an absence of refusals.
-				n.note(trimmed)
-				continue
-			}
-			n.Refused += count
-			inRefusals = true
-			continue
-		}
-		if inRefusals && line != trimmed {
-			if refusalMore.MatchString(trimmed) {
-				continue
-			}
-			if path, reason, ok := strings.Cut(trimmed, ": "); ok {
-				n.Refusals = append(n.Refusals, Refusal{Path: path, Reason: reason})
-				continue
-			}
-		}
-		inRefusals = false
-		n.note(trimmed)
+		n.Refusals = append(n.Refusals, Refusal{Path: path, Reason: reason})
 	}
 	return n
 }
@@ -810,6 +818,7 @@ func (c *Client) Build(ctx context.Context, timeout time.Duration) (*BuildReport
 		return nil, err
 	}
 	report := &BuildReport{Stats: stats, Notices: readNotices(stream)}
+	report.Notices.Merge(refusalsOf(stats))
 	c.checkAgainstIndex(ctx, report)
 	return report, nil
 }

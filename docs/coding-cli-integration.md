@@ -107,6 +107,38 @@ See [the ownership decision](architecture.md#host-integration-and-skill-installa
 | OpenCode | `opencode.json` |
 | Warp | `.devcouncil/integrations/warp-mcp.json` |
 
+### Check exit codes, receipts and the way back
+
+`integrate <host>` defaults to `--check`; pass one of `--apply`, `--check` or
+`--dry-run` (two different ones exit 2). `--check` exits `0` when everything
+is current, `1` when a file differs or is missing (the receipt names which),
+and `3` when DevMap reported an error and the tree was not checked — a
+document it will not rewrite, such as JSON with comments in
+`~/.cursor/mcp.json`, is reported with its path, never as drift.
+
+An `--apply` is planned in full before it writes, so a refusing document stops
+it with nothing written. An owned file the user edited since (the Cursor rule)
+is saved as `<file>.devcouncil-backup-<id>` before it is replaced, and the
+receipt lists the backup. The user-level `~/.codex/config.toml` is edited by
+appending or replacing only the `[mcp_servers.devmap]` block: every comment and
+other line stays.
+
+A successful apply records what it wrote in
+`.devcouncil-integrate-<host>.json` at the repository root. The way back is:
+
+```bash
+devcouncil integrate cursor --remove            # check: exit 1 while still registered
+devcouncil integrate cursor --remove --apply    # take it back
+```
+
+It removes `devmap` and `devcouncil` from exactly the documents that receipt
+names (user-level ones included), deletes DevCouncil's Cursor rule (saving any
+edits), leaves every other server, key and comment, and then deletes the
+receipt. Without a receipt it refuses. Guides (`AGENTS.md`, `CLAUDE.md`),
+skills and hook files are not removed: the guides are shared by every host,
+and `.devcouncil-skills.json` lists the skills. Standalone, the same undo is
+`devmap integrate <host> --remove --only-path DOC [--servers-stdin]`.
+
 The Go host serves checkout, renew/release lease, next task, diff, gaps,
 verification and write-policy checks. It does not serve arbitrary file-edit
 or shell tools. Tasks require initialized state and a consuming agent that

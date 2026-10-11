@@ -74,6 +74,21 @@ type Receipt struct {
 	Notes       []string          `json:"notes,omitempty"`
 }
 
+// Drifted lists, sorted, the files a check found missing or different. A file
+// is current only when it is "unchanged" (or not ours to manage): any other
+// word is a state that --apply would change, and a state this command does not
+// recognise must not read as current.
+func (r *Receipt) Drifted() []string {
+	var files []string
+	for path, state := range r.Files {
+		if state != "unchanged" && state != "not_ours" {
+			files = append(files, path)
+		}
+	}
+	slices.Sort(files)
+	return files
+}
+
 // cursorRule is deliberately split in two registers.
 //
 // Code navigation stays directive: an agent that guesses where a symbol lives
@@ -163,18 +178,24 @@ func Run(opts Options) (*Receipt, error) {
 	receipt.Spawned = append(receipt.Spawned, fmt.Sprintf("devmap integrate %s --servers-stdin (%s)", host, mode))
 	foldReport(receipt, root, mode, report)
 
+	// Every host config is repository content, and a tracked symlink in
+	// `.cursor/` would otherwise aim the rule's read or write outside the
+	// checkout. Everything below goes through this root and the package's
+	// no-follow helpers, the containment `integrate uninstall` has always used.
+	repo, err := os.OpenRoot(root)
+	if err != nil {
+		return receipt, err
+	}
+	defer func() { _ = repo.Close() }()
 	if host == "cursor" {
-		// Every host config is repository content, and a tracked symlink in
-		// `.cursor/` would otherwise aim the rule's read or write outside the
-		// checkout. It goes through this root and the package's no-follow
-		// helpers, the containment `integrate uninstall` has always used.
-		repo, err := os.OpenRoot(root)
-		if err != nil {
-			return receipt, err
-		}
-		defer func() { _ = repo.Close() }()
 		if err := writeCursorRule(repo, mode, receipt); err != nil {
 			return receipt, err
+		}
+	}
+	if mode == ModeApply {
+		if err := recordReceipt(repo, host, receipt); err != nil {
+			return receipt, fmt.Errorf("the apply succeeded but its receipt could not be recorded, "+
+				"so `integrate %s --remove` will refuse: %w", host, err)
 		}
 	}
 	return receipt, nil
@@ -375,6 +396,20 @@ func planWrite(repo *os.Root, rel string, content []byte, mode Mode, receipt *Re
 				return fmt.Errorf("%s: %w", rel, err)
 			}
 		}
+		// A file that exists and is about to change may carry lines its owner
+		// added after this command wrote it; recognising it as ours is not
+		// permission to lose them. The original is kept beside it and named in
+		// the receipt.
+		if exists && string(existing) != string(want) {
+			backup, err := backupBeside(repo, rel, existing)
+			if err != nil {
+				return err
+			}
+			if receipt.Backups == nil {
+				receipt.Backups = map[string]string{}
+			}
+			receipt.Backups[rel] = backup
+		}
 		if err := writeRooted(repo, rel, want, 0o644); err != nil {
 			return fmt.Errorf("%s: %w", rel, err)
 		}
@@ -382,6 +417,16 @@ func planWrite(repo *os.Root, rel string, content []byte, mode Mode, receipt *Re
 		return nil
 	}
 	return fmt.Errorf("unknown mode %q", mode)
+}
+
+// backupBeside saves `content` next to `rel` under a name that cannot collide,
+// and returns that name relative to the repository.
+func backupBeside(repo *os.Root, rel string, content []byte) (string, error) {
+	backup := rel + ".devcouncil-backup-" + rand.Text()
+	if err := writeHookExclusive(repo, backup, content, 0o644); err != nil {
+		return "", fmt.Errorf("%s: backing up before changing it: %w", rel, err)
+	}
+	return backup, nil
 }
 
 // writeRooted publishes `content` at `rel` inside `repo` atomically, through

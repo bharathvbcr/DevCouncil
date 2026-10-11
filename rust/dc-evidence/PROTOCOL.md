@@ -97,7 +97,7 @@ text — observation keys with the same name cannot override them):
 |---|---|
 | `outcome.id` | Bundle `outcome.id` when present; missing outcome is incomplete |
 | `outcome.kind` | Bundle `outcome.kind` (`success` or `business`) |
-| `human_control_returned` | Always present boolean: true iff any `interventions[].status` is `returned` |
+| `human_control_returned` | Always present boolean: true iff the intervention with the highest `sequence` is `returned` (every one, if several share that sequence); false when there are none, so an earlier returned intervention never masks a later open one |
 
 Contracts that expect a business outcome such as member-not-found assert
 `outcome.id` equals `not_found` (and typically `outcome.kind` equals `business`).

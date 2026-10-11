@@ -533,6 +533,14 @@ func TestRecordsPassTheRustChecker(t *testing.T) {
 		checkDecisionLine(t, line)
 	}
 	bin := os.Getenv("QD_CALLER_RECORDS_BIN")
+	if bin == "" && os.Getenv("DEVCOUNCIL_REQUIRE_CROSSCHECK") != "" {
+		// The only check of Go-written decision records against the Rust
+		// checker. Where a job promises it (CI, once it builds a pinned
+		// qd-caller-records), a missing binary is a failure: a skip there would
+		// read as a pass.
+		t.Fatal("DEVCOUNCIL_REQUIRE_CROSSCHECK is set but QD_CALLER_RECORDS_BIN is not: " +
+			"the Go records were never checked against the Rust checker")
+	}
 	if bin == "" {
 		t.Log("cross-check NOT RUN: QD_CALLER_RECORDS_BIN is unset (build Lappi-decision's qd-caller-records and point it here)")
 		t.Skip("cross-check NOT RUN")

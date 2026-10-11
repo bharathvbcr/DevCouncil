@@ -166,6 +166,14 @@ jobs:
         working-directory: backend/go_orchestrator
         run: go test ./... -count=1
 
+      # The golden corpus is the regression record for the Go host's get_diff
+      # results, embedded skills and tool list. The driver is a plain program,
+      # not a test, so nothing ran it and it rotted (it asserted 17 skills for
+      # the commits after the library had 18). Its exit status is the gate.
+      - name: Golden replay
+        working-directory: backend/go_orchestrator
+        run: go run ./cmd/devcouncil-golden-replay
+
       # A separate step, not a flag on the one above, so the fast signal still
       # arrives first and a race is attributed to the race detector rather than
       # read as a flaky test.

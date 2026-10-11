@@ -250,15 +250,11 @@ func FuzzDevmapNoticesNeverSilentlyDropALine(f *testing.F) {
 			t.Fatal("merging dropped the truncation flag")
 		}
 
-		// The conservation property, differentially. A line the classifier does
-		// not recognise must survive into the report verbatim, or — once the
-		// retention cap is reached — be counted. The exclusions below are the
-		// two shapes that are recognised by design and legitimately add nothing
-		// on their own: a refusal header naming zero files, and the producer's
-		// stand-in for the entries it did not print, which only matches beneath
-		// a header it did not have here.
+		// The conservation property, differentially. stderr is prose and nothing
+		// is recognised in it, so *every* line must survive into the report
+		// verbatim or, once the retention cap is reached, be counted.
 		line := strings.TrimSpace(extra)
-		if line == "" || strings.Contains(line, "discovery refused") || refusalMore.MatchString(line) {
+		if line == "" {
 			return
 		}
 		// One line, because the claim is about one line. A multi-line value is
