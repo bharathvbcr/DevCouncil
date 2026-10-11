@@ -1,5 +1,6 @@
 // Every byte this binary puts on stdout goes through `write_stdout`: it ends
-// quietly on a closed pipe and escapes control characters on a terminal.
+// quietly on a closed pipe and escapes control characters on a terminal and in
+// piped or JSON output alike.
 // `print!`/`println!` do neither, and panic on `EPIPE`.
 #![deny(clippy::print_stdout)]
 
@@ -30,18 +31,58 @@ fn write_stdout(message: std::fmt::Arguments<'_>) {
     }
 }
 
+/// Stdout for everything that is not already escaped text: piped output, JSON
+/// and exports. Control and bidirectional characters are written as `\uXXXX`
+/// (valid inside a JSON string, and readable in text), so a repository file or
+/// symbol named with a terminal escape cannot act on whatever reads the pipe.
 fn write_stdout_raw(message: std::fmt::Arguments<'_>) {
     use std::io::Write;
-    if let Err(error) = std::io::stdout().lock().write_fmt(message) {
-        if error.kind() == std::io::ErrorKind::BrokenPipe {
-            std::process::exit(0);
-        }
-        // A diagnostic sink may itself be gone; the failure exit still survives.
-        let display = progress::Display::new(ProgressMode::Never, false, false);
-        display.diagnostic(format_args!("DevMap could not write stdout: {error}"));
-        display.finish("");
-        std::process::exit(1);
+    struct Escaping<W: Write> {
+        out: W,
+        error: Option<std::io::Error>,
     }
+    impl<W: Write> std::fmt::Write for Escaping<W> {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            let result = match presentation::escape_for_pipe(text) {
+                Some(escaped) => self.out.write_all(escaped.as_bytes()),
+                None => self.out.write_all(text.as_bytes()),
+            };
+            result.map_err(|error| {
+                self.error = Some(error);
+                std::fmt::Error
+            })
+        }
+    }
+    let mut writer = Escaping {
+        out: std::io::stdout().lock(),
+        error: None,
+    };
+    if std::fmt::write(&mut writer, message).is_err() {
+        let error = writer
+            .error
+            .unwrap_or_else(|| std::io::Error::other("a Display implementation failed"));
+        stdout_failed(&error);
+    }
+}
+
+/// Stdout for text already escaped by [`presentation`], which may carry the
+/// styling sequences the terminal path adds itself.
+fn write_stdout_styled(message: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    if let Err(error) = std::io::stdout().lock().write_fmt(message) {
+        stdout_failed(&error);
+    }
+}
+
+fn stdout_failed(error: &std::io::Error) -> ! {
+    if error.kind() == std::io::ErrorKind::BrokenPipe {
+        std::process::exit(0);
+    }
+    // A diagnostic sink may itself be gone; the failure exit still survives.
+    let display = progress::Display::new(ProgressMode::Never, false, false);
+    display.diagnostic(format_args!("DevMap could not write stdout: {error}"));
+    display.finish("");
+    std::process::exit(1);
 }
 
 macro_rules! outln {

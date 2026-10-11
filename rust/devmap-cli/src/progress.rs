@@ -133,12 +133,20 @@ impl Display {
     /// Redirected stdout keeps the compact, unstyled report even with a live stderr.
     pub(super) fn summary(&self, heading: &str, rows: &[String]) {
         let width = terminal_width(false);
-        let output = if self.live && std::io::stdout().is_terminal() && width > 1 {
-            summary_card(heading, rows, width, color_enabled(), ascii_output())
+        // Result rows can carry repository text; neither rendering below
+        // escapes it, and the card's own styling is added around the rows.
+        let rows: Vec<String> = rows
+            .iter()
+            .map(|row| crate::presentation::escape_for_pipe(row).unwrap_or_else(|| row.clone()))
+            .collect();
+        let rows = rows.as_slice();
+        if self.live && std::io::stdout().is_terminal() && width > 1 {
+            // Rows are escaped above; the card adds its own styling sequences.
+            let card = summary_card(heading, rows, width, color_enabled(), ascii_output());
+            super::write_stdout_styled(format_args!("{card}"));
         } else {
-            format!("{}\n", rows.join("\n"))
-        };
-        super::write_stdout_raw(format_args!("{output}"));
+            super::write_stdout_raw(format_args!("{}\n", rows.join("\n")));
+        }
     }
     pub(super) fn new(mode: ProgressMode, json: bool, verbose: bool) -> Self {
         let is_terminal = std::io::stderr().is_terminal();
