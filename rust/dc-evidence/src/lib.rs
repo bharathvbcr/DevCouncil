@@ -383,11 +383,22 @@ fn resolve_fact(bundle: &Bundle, latest: Option<&Observation>, fact: &str) -> Op
     }
 }
 
+/// True only when the most recent intervention was handed back.
+///
+/// "Most recent" is the highest `sequence`. An earlier returned intervention
+/// must not mask a later one that is still requested or was abandoned, or a run
+/// that took control away again after a hand-back would read as human-safe.
+/// Interventions sharing the highest sequence cannot be ordered, so every one of
+/// them must be returned (fail closed). No interventions is false.
 fn human_control_returned(bundle: &Bundle) -> bool {
+    let Some(latest) = bundle.interventions.iter().map(|i| i.sequence).max() else {
+        return false;
+    };
     bundle
         .interventions
         .iter()
-        .any(|i| matches!(i.status, InterventionStatus::Returned))
+        .filter(|i| i.sequence == latest)
+        .all(|i| matches!(i.status, InterventionStatus::Returned))
 }
 
 fn validate_journal(bundle: &Bundle, report: &mut Report) -> Result<(), Error> {
