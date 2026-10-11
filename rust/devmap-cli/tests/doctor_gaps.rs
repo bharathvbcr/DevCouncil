@@ -218,6 +218,14 @@ fn plugin_version_mismatch_is_reported() {
     let _ = fs::remove_dir_all(&cwd);
 }
 
+/// Whether `text` names `path`, whichever separators either side uses. The
+/// tests build agent paths as `home.join(".claude/agents")`, which is mixed on
+/// Windows, while the report prints the path it scanned with one separator.
+fn names_path(text: &str, path: &Path) -> bool {
+    let unify = |s: &str| s.replace('\\', "/");
+    unify(text).contains(&unify(&path.display().to_string()))
+}
+
 fn write_agent(dir: &Path, name: &str, frontmatter: &str) -> PathBuf {
     fs::create_dir_all(dir).unwrap();
     let path = dir.join(format!("{name}.md"));
@@ -254,7 +262,7 @@ fn an_agent_whose_tool_list_excludes_devmap_is_named() {
         .unwrap_or_else(|| panic!("expected an agent tools warning, got {payload}"));
     for path in [&user, &project] {
         assert!(
-            warning.contains(&path.display().to_string()),
+            names_path(warning, path),
             "{} not named: {warning}",
             path.display()
         );
@@ -349,7 +357,7 @@ fn a_gitpulse_grant_is_a_gap_and_a_devmap_denial_is_an_opt_out() {
     let warning = payload["agent_tools_warning"].as_str().unwrap_or("");
     for path in [&gitpulse_only, &researcher] {
         assert!(
-            warning.contains(&path.display().to_string()),
+            names_path(warning, path),
             "{} not named: {payload}",
             path.display()
         );

@@ -388,14 +388,35 @@ fn scaffold_plan(
     Ok((plan, hashes))
 }
 
+/// Whether a failed `create_dir` of the lock means another installer holds it.
+///
+/// `AlreadyExists` everywhere. On Windows a directory its holder has just
+/// removed stays delete-pending until the last handle closes, and creating it
+/// in that window fails with `PermissionDenied` ("Access is denied", os error
+/// 5), not `AlreadyExists`. Treating that as fatal made 36 concurrent
+/// installers fail with a spurious error; it is retried until the deadline,
+/// after which the real error is returned.
+fn lock_is_contended(err: &std::io::Error, windows: bool) -> bool {
+    match err.kind() {
+        std::io::ErrorKind::AlreadyExists => true,
+        std::io::ErrorKind::PermissionDenied => windows,
+        _ => false,
+    }
+}
+
 fn acquire_lock(lock: &Path) -> anyhow::Result<()> {
     let deadline = Instant::now() + LOCK_TIMEOUT;
     loop {
         match fs::create_dir(lock) {
             Ok(()) => return Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(err) if lock_is_contended(&err, cfg!(windows)) => {
                 if Instant::now() >= deadline {
-                    bail!("Skill installer is busy: {}", lock.display());
+                    // A refusal that is not "someone holds it" keeps its own
+                    // error, so a read-only root is not reported as busy.
+                    if err.kind() == std::io::ErrorKind::AlreadyExists {
+                        bail!("Skill installer is busy: {}", lock.display());
+                    }
+                    return Err(err.into());
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -592,6 +613,26 @@ mod tests {
             "{err}"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_delete_pending_lock_is_contended_on_windows_only() {
+        use std::io::{Error, ErrorKind};
+        let denied = Error::from(ErrorKind::PermissionDenied);
+        assert!(lock_is_contended(
+            &Error::from(ErrorKind::AlreadyExists),
+            false
+        ));
+        assert!(lock_is_contended(
+            &Error::from(ErrorKind::AlreadyExists),
+            true
+        ));
+        assert!(lock_is_contended(&denied, true));
+        assert!(
+            !lock_is_contended(&denied, false),
+            "a refusal on Unix is a real permission error, not contention"
+        );
+        assert!(!lock_is_contended(&Error::from(ErrorKind::NotFound), true));
     }
 
     #[test]
