@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil"
-	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/version"
 )
 
 const (
@@ -32,6 +31,12 @@ type Server struct {
 	In       io.Reader
 	Out      io.Writer
 	Err      io.Writer
+
+	// DefaultProtocol is what an `initialize` that names no supported
+	// revision is answered with: "legacy" (the default, the newest handshake
+	// revision), "modern" (refuse with the supported list) or one handshake
+	// revision. Empty reads DEVCOUNCIL_MCP_PROTOCOL_DEFAULT. See protocol.go.
+	DefaultProtocol string
 
 	inFlight atomic.Int32
 	broken   atomic.Bool
@@ -221,16 +226,22 @@ func (s *Server) send(resp rpcResponse) bool {
 }
 
 func (s *Server) handle(req rpcRequest) rpcResponse {
+	modern, refusal := eraOf(req)
+	if refusal != nil {
+		return rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: refusal}
+	}
+	if modern {
+		return s.modernHandle(req)
+	}
+	return s.legacyHandle(req)
+}
+
+func (s *Server) legacyHandle(req rpcRequest) rpcResponse {
 	switch req.Method {
 	case "initialize":
-		return okResult(req.ID, map[string]any{
-			"protocolVersion": "2024-11-05",
-			"capabilities":    map[string]any{"tools": map[string]any{}},
-			// `version.Version`, never a literal: this field is how a host
-			// reports which DevCouncil answered it, and a literal here held
-			// 0.1.0 from the first release through 0.2.3.
-			"serverInfo": map[string]any{"name": "devcouncil", "version": version.Version},
-		})
+		return s.handleInitialize(req)
+	case "server/discover":
+		return s.discoverResult(req)
 	case "ping":
 		return okResult(req.ID, map[string]any{})
 	case "tools/list":

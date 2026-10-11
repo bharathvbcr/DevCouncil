@@ -1,0 +1,57 @@
+{
+  "contract": "mcp-negotiation/v1",
+  "about": "Conformance transcript for MCP protocol-version negotiation over stdio. Every case is one request and the facts about its response that DevCouncil's Go server (devcouncil mcp) and DevMap's Rust server (devmap mcp) must both satisfy. `expect` maps a dotted path into the JSON-RPC response to the required value; `error_code` is the required JSON-RPC error code. Replayed by backend/go_orchestrator/devcouncil/mcp/protocol_test.go.",
+  "cases": [
+    {
+      "name": "legacy client asking for the oldest revision is served it",
+      "request": {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}},
+      "expect": {"result.protocolVersion": "2024-11-05"}
+    },
+    {
+      "name": "legacy client asking for a middle revision is served it",
+      "request": {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}}},
+      "expect": {"result.protocolVersion": "2025-06-18"}
+    },
+    {
+      "name": "legacy client asking for the newest handshake revision is served it",
+      "request": {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}}},
+      "expect": {"result.protocolVersion": "2025-11-25"}
+    },
+    {
+      "name": "an unknown revision is counter-offered the newest handshake revision",
+      "request": {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "1999-01-01", "capabilities": {}}},
+      "expect": {"result.protocolVersion": "2025-11-25"}
+    },
+    {
+      "name": "an initialize with no revision is counter-offered the newest handshake revision",
+      "request": {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+      "expect": {"result.protocolVersion": "2025-11-25"}
+    },
+    {
+      "name": "server/discover lists the modern revision",
+      "request": {"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {}},
+      "expect": {"result.supportedVersions.0": "2026-07-28"}
+    },
+    {
+      "name": "a modern request declaring an unsupported revision is refused with the supported list",
+      "request": {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "1900-01-01", "io.modelcontextprotocol/clientCapabilities": {}}}},
+      "error_code": -32022,
+      "expect": {"error.data.supported.0": "2026-07-28", "error.data.requested": "1900-01-01"}
+    },
+    {
+      "name": "a modern request without clientCapabilities is malformed",
+      "request": {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}},
+      "error_code": -32602
+    },
+    {
+      "name": "initialize under a modern envelope is not a method",
+      "request": {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {}}}},
+      "error_code": -32601
+    },
+    {
+      "name": "a modern tools/list is served statelessly",
+      "request": {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {}}}},
+      "expect": {"result.resultType": "complete"}
+    }
+  ]
+}
