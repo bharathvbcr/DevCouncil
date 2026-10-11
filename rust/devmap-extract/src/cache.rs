@@ -644,7 +644,13 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// untyped, and every manifest-only class a dead-code candidate, until the
 /// file is edited. The Kotlin lane stamped 82 on this payload; it landed after
 /// the others, so it is 87.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "87";
+///
+/// v88 types a Rust parameter, local or field written `dyn Trait` / `impl
+/// Trait` (bare, behind a reference, or in a `Box`/`Rc`/`Arc`) by its one named
+/// trait, so a method call on it reaches the trait's declaration. A v87 row
+/// leaves such a binding untyped, so the call would stay an unattributed miss
+/// from a warm cache until the file was edited.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "88";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

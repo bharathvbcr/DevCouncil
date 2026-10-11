@@ -1895,8 +1895,59 @@ impl Resolver {
             nominal = self.declaring_type_of(callee_file, callee)?.to_string();
         }
         (self.unique_indexed_type(LangFamily::Rust, &nominal)
+            || self.unique_indexed_trait(&nominal)
             || self.names_one_type_in_both(file, callee_file, &nominal))
         .then_some(nominal)
+    }
+
+    /// A Rust receiver typed `T`, where `T` is a generic parameter of the
+    /// calling fn: the one trait that bounds it (`fn f<T: Render>(t: &T)`), so
+    /// the call reaches that trait's declaration of the method. A generic with
+    /// no usable bound, or several, is no type at all — `None`, rather than
+    /// letting a struct elsewhere that happens to be called `T` answer.
+    /// Any other type, and every other family, passes through unchanged.
+    fn rust_generic_receiver_type(
+        &self,
+        file: &str,
+        family: LangFamily,
+        caller: Option<&str>,
+        ty: String,
+    ) -> Option<String> {
+        use devmap_extract::rustsig::{generic_param, parse_header, GenericParam};
+        if family != LangFamily::Rust {
+            return Some(ty);
+        }
+        let Some(header) = caller
+            .and_then(|caller| self.rust_signatures.get(&(file.to_string(), caller.to_string())))
+            .and_then(|signature| parse_header(signature))
+        else {
+            return Some(ty);
+        };
+        match generic_param(&header, &ty) {
+            GenericParam::NotDeclared => Some(ty),
+            GenericParam::OneTrait(bound) => Some(bound.to_string()),
+            GenericParam::Other => None,
+        }
+    }
+
+    /// Whether exactly one indexed Rust declaration of this name exists and it
+    /// is a trait: what `-> impl Render` / `-> Box<dyn Render>` names. A name
+    /// that is a trait in one crate and a struct in another is not one.
+    fn unique_indexed_trait(&self, name: &str) -> bool {
+        let mut rust = self.symbol_index.get(name).into_iter().flatten().filter(
+            |(_, kind, candidate_family, _)| {
+                LangFamily::Rust.admits(*candidate_family)
+                    && matches!(
+                        kind,
+                        SymbolKind::Class
+                            | SymbolKind::Struct
+                            | SymbolKind::Enum
+                            | SymbolKind::Interface
+                            | SymbolKind::Trait
+                    )
+            },
+        );
+        matches!((rust.next(), rust.next()), (Some((_, SymbolKind::Trait, _, _)), None))
     }
 
     /// The type a Rust binding has according to a **function header** in the
@@ -2064,6 +2115,16 @@ impl Resolver {
         // are transparent. `Vec<Service>` is still refused here, exactly as
         // before, because `Vec` is not in that list.
         s = devmap_extract::deref::strip_deref_transparent(s);
+        // A Rust trait object or opaque type, `dyn Render` / `impl Render`: the
+        // value is "some Render", so the trait is the type a method on it is
+        // looked up in — which reaches the trait's declaration of the method,
+        // never an impl's (see `protocol_dispatch`). Only one named bound
+        // qualifies; auto traits and lifetimes add nothing a method can come
+        // from, but `dyn A + B` names two traits and is refused.
+        let s = match s.strip_prefix("dyn ").or_else(|| s.strip_prefix("impl ")) {
+            Some(bounds) => devmap_extract::rustsig::single_trait_bound(bounds)?,
+            None => s,
+        };
         if s.is_empty()
             || s.contains('<')
             || s.contains('>')
@@ -4756,6 +4817,14 @@ impl Resolver {
                                 site_binding,
                             )
                             .filter(|_| family.admits(family))
+                            .and_then(|ty| {
+                                self.rust_generic_receiver_type(
+                                    &ext.file_path,
+                                    family,
+                                    call.caller_symbol.as_deref(),
+                                    ty,
+                                )
+                            })
                         {
                             // Python names its class: the file's own `class`
                             // statement, else the import that bound it. A flat
@@ -4792,8 +4861,10 @@ impl Resolver {
                                 .filter(|_| !class_is_known);
                             // Swift: a method the type does not write is the one
                             // a protocol extension or base class supplies.
+                            // Rust: a method the impl does not write is the
+                            // default body of a trait the type implements.
                             let inherited = (own.is_none()
-                                && family == LangFamily::Swift
+                                && matches!(family, LangFamily::Swift | LangFamily::Rust)
                                 && !self.type_methods.contains_key(&key))
                             .then(|| self.inherited_method(family, &class_type, &call.callee_name))
                             .flatten();
@@ -4805,9 +4876,11 @@ impl Resolver {
                                 })
                             {
                                 resolution = Some(match family {
-                                    // A receiver typed by a protocol is a call
-                                    // through it: see `protocol_dispatch`.
-                                    LangFamily::Swift => self
+                                    // A receiver typed by a protocol (Swift) or a
+                                    // trait (Rust: `dyn T`, `impl T`, a `T`
+                                    // bound) is a call through it: see
+                                    // `protocol_dispatch`.
+                                    LangFamily::Swift | LangFamily::Rust => self
                                         .protocol_dispatch(family, &class_type, &call.callee_name)
                                         .map(|(direct, targets)| {
                                             self.dispatch_through_interface(
@@ -4850,6 +4923,35 @@ impl Resolver {
                                         receiver_type: receiver_type.clone(),
                                     })
                                 }));
+                            }
+                        }
+                    }
+
+                    // 1a. A Rust path through a generic parameter: `T::create()`
+                    // inside `fn f<T: Factory>()` names `Factory::create`, the
+                    // one declaration the bound states. Which impl runs is the
+                    // caller's choice of `T`, so each one is a dispatch candidate.
+                    if resolution.is_none() && family == LangFamily::Rust {
+                        if let Some(bound) = call
+                            .receiver_expr
+                            .as_deref()
+                            .filter(|recv| Self::is_plain_ident(recv))
+                            .and_then(|recv| {
+                                self.rust_generic_receiver_type(
+                                    &ext.file_path,
+                                    family,
+                                    call.caller_symbol.as_deref(),
+                                    recv.to_string(),
+                                )
+                                .filter(|bound| bound != recv)
+                            })
+                        {
+                            if let Some((direct, targets)) =
+                                self.protocol_dispatch(family, &bound, &call.callee_name)
+                            {
+                                resolution = Some(self.dispatch_through_interface(
+                                    ext, call, &mut edges, &bound, direct, targets,
+                                ));
                             }
                         }
                     }
@@ -4921,7 +5023,9 @@ impl Resolver {
                                     // Inside a protocol extension `self` is any
                                     // conformer: `greet()` written in `extension
                                     // Greeter` is a call through the protocol.
-                                    let through_protocol = (family == LangFamily::Swift)
+                                    // A Rust trait's default body is the same:
+                                    // `self.hook()` there is any implementor's.
+                                    let through_protocol = matches!(family, LangFamily::Swift | LangFamily::Rust)
                                         .then(|| self.self_type_at(&ext.file_path, family, caller))
                                         .flatten()
                                         .and_then(|own| {
@@ -7976,7 +8080,8 @@ impl Resolver {
     }
 
     /// Swift: the protocol method `method` of `protocol`, and the in-repo
-    /// conformers' declarations of it.
+    /// conformers' declarations of it. Rust: the same for a trait and its
+    /// `impl Trait for Type` implementors.
     ///
     /// `None` unless `protocol` is one indexed protocol declaration that
     /// declares `method` exactly once. The conformers are the protocol's
@@ -7995,7 +8100,7 @@ impl Resolver {
             let mut kinds = hits
                 .iter()
                 .filter(|(_, _, candidate, _)| family.admits(*candidate));
-            kinds.all(|(_, kind, _, _)| *kind == SymbolKind::Interface)
+            kinds.all(|(_, kind, _, _)| matches!(kind, SymbolKind::Interface | SymbolKind::Trait))
         });
         if !is_protocol || !self.type_name_is_identifiable(family, protocol) {
             return None;

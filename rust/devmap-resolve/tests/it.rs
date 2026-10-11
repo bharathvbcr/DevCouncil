@@ -111,6 +111,8 @@ mod rust_qualified_super_calls;
 #[cfg(feature = "parse")]
 mod rust_self_type;
 #[cfg(feature = "parse")]
+mod rust_trait_dispatch;
+#[cfg(feature = "parse")]
 mod same_file_type_position;
 #[cfg(feature = "parse")]
 mod self_in_a_type_is_that_type;

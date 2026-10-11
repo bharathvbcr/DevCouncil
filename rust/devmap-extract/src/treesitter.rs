@@ -7682,6 +7682,8 @@ fn rust_type_name_is_reachable(node: Node) -> bool {
         "reference_type"
             | "pointer_type"
             | "generic_type"
+            | "dynamic_type"
+            | "abstract_type"
             | "type_identifier"
             | "scoped_type_identifier"
     )
@@ -7697,6 +7699,19 @@ pub(crate) fn rust_type_name(node: Node, source: &str, depth: usize) -> Option<S
             .and_then(|inner| rust_type_name(inner, source, depth + 1)),
         "generic_type" => rust_generic_identity_node(node, source)
             .and_then(|inner| rust_type_name(inner, source, depth + 1)),
+        // `dyn Render` / `impl Render`: a value of some type implementing
+        // `Render`, so the trait is where a method on it is declared. Only a
+        // single named bound: `dyn A + Send` is a `bounded_type` and stays
+        // unnamed rather than being read as one of its traits.
+        "dynamic_type" | "abstract_type" => node
+            .child_by_field_name("trait")
+            .filter(|bound| {
+                matches!(
+                    bound.kind(),
+                    "type_identifier" | "scoped_type_identifier" | "generic_type"
+                )
+            })
+            .and_then(|bound| rust_type_name(bound, source, depth + 1)),
         "type_identifier" | "scoped_type_identifier" => {
             let text = get_node_text(node, source);
             let bare = text.rsplit("::").next().unwrap_or(&text);

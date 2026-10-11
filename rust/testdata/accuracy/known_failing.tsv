@@ -7,16 +7,7 @@
 # does it); adding a line needs an owning card and a reason.
 python	py.C22b	miss	ft-c666ba7c	edge or honest miss; NOT other/dup.py::helper | today: absent today, recorded as an honest unresolved row
 python	py.C23b	miss	ft-c666ba7c	edge if fixture return typed; honest miss acceptable | today: absent today, recorded as an honest unresolved row
-rust	rs.c02	miss	ft-e3f7d1b1	dyn Trait: trait decl or fan-out to both impls | today: absent today, recorded as an honest unresolved row
-rust	rs.c02b	miss	ft-e3f7d1b1	Box<dyn> in closure | today: absent today, recorded as an honest unresolved row
-rust	rs.c03	miss	ft-e3f7d1b1	generic bound T: Render | today: absent today, recorded as an honest unresolved row
 rust	rs.c04	miss	ft-f9665721	blanket impl on i32 literal | today: absent today, recorded as an honest unresolved row
-rust	rs.c07b	miss	ft-e3f7d1b1	receiver is the impl Trait return | today: absent today, recorded as an honest unresolved row
-rust	rs.c17e	miss	ft-e3f7d1b1	cross-crate dyn | today: absent today, recorded as an honest unresolved row
 rust	rs.c18c	miss	ft-837a6f05	 | today: absent today, recorded as an honest unresolved row
 rust	rs.c24b	silent_miss	ft-f9665721	 | today: no ledger row names {"helper_c24"}
 rust	rs.c26e	silent_miss	ft-f9665721	operator/Drop/From trait use is implicit; honest miss expected | today: no ledger row names {"from"}
-rust	rs.c27a	miss	ft-e3f7d1b1	trait default method | today: absent today, recorded as an honest unresolved row
-rust	rs.c27b	miss	ft-e3f7d1b1	self in default body | today: absent today, recorded as an honest unresolved row
-rust	rs.c35	miss	ft-e3f7d1b1	T::assoc fn | today: absent today, recorded as an honest unresolved row
-rust	rs.c41d	miss	ft-f9665721	 | today: absent today, recorded as an honest unresolved row
