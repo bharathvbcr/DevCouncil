@@ -104,3 +104,40 @@ func TestCursorRuleReplacesOnlyARuleDevCouncilWrote(t *testing.T) {
 		})
 	}
 }
+
+// An owned file the user has since edited is still "ours" by its markers, so it
+// is replaced — but the lines they added must be recoverable. The replacement
+// leaves a backup and says so in the receipt.
+func TestReplacingADriftedOwnedFileLeavesARecoverableBackup(t *testing.T) {
+	rel := ".cursor/rules/devcouncil.mdc"
+	root := t.TempDir()
+	mustMkdirAll(t, filepath.Join(root, ".cursor", "rules"))
+	edited := cursorRule + "\nAlso: always run the linter first.\n"
+	if err := os.WriteFile(filepath.Join(root, rel), []byte(edited), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	receipt := &Receipt{Files: map[string]string{}}
+	if err := writeCursorRule(mustOpenRoot(t, root), ModeApply, receipt); err != nil {
+		t.Fatal(err)
+	}
+	backup := receipt.Backups[rel]
+	if backup == "" {
+		t.Fatalf("the user's edit was overwritten with no backup; receipt=%+v", receipt)
+	}
+	saved, err := os.ReadFile(filepath.Join(root, backup))
+	if err != nil || string(saved) != edited {
+		t.Fatalf("backup %s does not hold the edited rule (err %v):\n%s", backup, err, saved)
+	}
+	if got, _ := os.ReadFile(filepath.Join(root, rel)); string(got) != cursorRule {
+		t.Fatalf("rule not brought current")
+	}
+
+	// A rule that is already current needs no backup, and neither does a fresh one.
+	again := &Receipt{Files: map[string]string{}}
+	if err := writeCursorRule(mustOpenRoot(t, root), ModeApply, again); err != nil {
+		t.Fatal(err)
+	}
+	if len(again.Backups) != 0 {
+		t.Fatalf("backed up a file that did not change: %v", again.Backups)
+	}
+}

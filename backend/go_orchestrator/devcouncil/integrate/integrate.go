@@ -390,6 +390,20 @@ func planWrite(repo *os.Root, rel string, content []byte, mode Mode, receipt *Re
 				return fmt.Errorf("%s: %w", rel, err)
 			}
 		}
+		// A file that exists and is about to change may carry lines its owner
+		// added after this command wrote it; recognising it as ours is not
+		// permission to lose them. The original is kept beside it and named in
+		// the receipt.
+		if exists && string(existing) != string(want) {
+			backup := rel + ".devcouncil-backup-" + rand.Text()
+			if err := writeHookExclusive(repo, backup, existing, 0o644); err != nil {
+				return fmt.Errorf("%s: backing up before replacing it: %w", rel, err)
+			}
+			if receipt.Backups == nil {
+				receipt.Backups = map[string]string{}
+			}
+			receipt.Backups[rel] = backup
+		}
 		if err := writeRooted(repo, rel, want, 0o644); err != nil {
 			return fmt.Errorf("%s: %w", rel, err)
 		}
