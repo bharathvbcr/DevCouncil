@@ -46,6 +46,7 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             "global_excludes_are_one_rule",
             "ignore_rule_tolerance",
             "one_ignore_owner",
+            "python_source_roots_collect",
             "reliability_source_reads",
             "safe_fs_controls",
             "the_bounded_runner_under_hostile_children",

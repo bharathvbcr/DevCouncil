@@ -36,36 +36,8 @@ kotlin-gaps	kg.K30	silent_miss	ft-0720fe1d	import alias: fmt(3) is gaps.util.for
 kotlin-gaps	kg.K31	false_edge	ft-0720fe1d	super.go() reaches the base method | today: HIGH edge to the wrong namesake ["src/main/kotlin/gaps/Events.kt::Child.go"]
 kotlin-gaps	kg.K31b	false_edge	ft-0720fe1d	super.go() is not a self-reference | today: forbidden HIGH edge to ["src/main/kotlin/gaps/Events.kt::Child.go"]
 kotlin-gaps	kg.K33	miss	ft-0720fe1d	nested class constructor Res.Ok(1) | today: absent today, recorded as an honest unresolved row
-python	py.C05	miss	ft-c666ba7c	edge (E2(1).step()) | today: absent today, recorded as an honest unresolved row
-python	py.C05b	miss	ft-c666ba7c	edge | today: absent today, recorded as an honest unresolved row
-python	py.C07	miss	ft-c666ba7c	edge (super().__init__) | today: absent today, recorded as an honest unresolved row
-python	py.C07b	miss	ft-c666ba7c	edge (super().run()) | today: absent today, recorded as an honest unresolved row
-python	py.C07c	miss	ft-c666ba7c	edge via MRO; NOT Duck.quack | today: absent today, recorded as an honest unresolved row
-python	py.C08	miss	ft-c666ba7c	property read edge (any kind) or honest miss | today: absent today, recorded as an honest unresolved row
-python	py.C09	miss	ft-c666ba7c	edge | today: absent today, recorded as an honest unresolved row
-python	py.C09b	miss	ft-c666ba7c	edge | today: absent today, recorded as an honest unresolved row
-python	py.C09d	silent_miss	ft-c666ba7c	edge-ish (cls(0)) or honest miss | today: no ledger row names {"Engine"}
-python	py.C10c	miss	ft-837a6f05	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
-python	py.C13b	miss	ft-837a6f05	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
-python	py.C13c	miss	ft-837a6f05	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
-python	py.C15	silent_miss	ft-c666ba7c	reference edge (partial(helper), apply(helper)) | today: no ledger row names {"helper"}
-python	py.C15b	miss	ft-837a6f05	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
-python	py.C17c	miss	ft-c666ba7c	edge | today: absent today, recorded as an honest unresolved row
-python	py.C18b	miss	ft-837a6f05	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
-python	py.C20	miss	ft-837a6f05	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
-python	py.C20b	miss	ft-837a6f05	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
-python	py.C21	silent_miss	ft-c666ba7c	edge or honest miss (implicit dunder) | today: no ledger row names {"__enter__"}
 python	py.C22b	miss	ft-c666ba7c	edge or honest miss; NOT other/dup.py::helper | today: absent today, recorded as an honest unresolved row
 python	py.C23b	miss	ft-c666ba7c	edge if fixture return typed; honest miss acceptable | today: absent today, recorded as an honest unresolved row
-python	py.C26	miss	ft-837a6f05	Imports edge via pytest pythonpath | today: absent today, recorded as an honest unresolved row
-python-hatch	pr.hatch.edge	miss	ft-837a6f05	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
-python-hatch	pr.hatch.import	miss	ft-837a6f05	Imports edge via the source root | today: no unattributed ledger row in the importing file
-python-nomanifest	pr.nomanifest.edge	miss	ft-837a6f05	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
-python-nomanifest	pr.nomanifest.import	miss	ft-837a6f05	Imports edge via the source root | today: no unattributed ledger row in the importing file
-python-ruff	pr.ruff.edge	miss	ft-837a6f05	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
-python-ruff	pr.ruff.import	miss	ft-837a6f05	Imports edge via the source root | today: no unattributed ledger row in the importing file
-python-setupcfg	pr.setupcfg.edge	miss	ft-837a6f05	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
-python-setupcfg	pr.setupcfg.import	miss	ft-837a6f05	Imports edge via the source root | today: no unattributed ledger row in the importing file
 rust	rs.c02	miss	ft-e3f7d1b1	dyn Trait: trait decl or fan-out to both impls | today: absent today, recorded as an honest unresolved row
 rust	rs.c02b	miss	ft-e3f7d1b1	Box<dyn> in closure | today: absent today, recorded as an honest unresolved row
 rust	rs.c03	miss	ft-e3f7d1b1	generic bound T: Render | today: absent today, recorded as an honest unresolved row

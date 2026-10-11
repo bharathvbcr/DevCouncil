@@ -619,7 +619,12 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// another function's same-named parameter, would still be bound to a project
 /// namesake from a warm cache. The resolver lane stamped 81 on this payload; it
 /// landed after the Rust, Go and TypeScript lanes, so it is 84.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "84";
+///
+/// v85 records the implicit `__enter__` call of a Python `with Class(...)`
+/// statement. A v84 row has no such call, so the context manager's `__enter__`
+/// would keep looking uncalled until the file was edited. The Python lane
+/// stamped 82 on this payload; it landed after the others, so it is 85.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "85";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

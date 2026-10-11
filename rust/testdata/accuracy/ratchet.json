@@ -10,9 +10,9 @@
     "present": 26
   },
   "python": {
-    "known_failing": 30,
+    "known_failing": 2,
     "positive_rows": 49,
-    "present": 19
+    "present": 47
   },
   "rust": {
     "known_failing": 13,
