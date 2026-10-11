@@ -20,6 +20,8 @@
 //! * **The message names the language and the delta.** "Resolution dropped" is
 //!   not actionable; "rust: 235 -> 71 permille" is.
 
+mod common;
+
 use devmap_extract::extract_file;
 use devmap_resolve::Resolver;
 use std::collections::BTreeMap;
@@ -91,6 +93,24 @@ fn measure() -> BTreeMap<String, BTreeMap<String, Option<u32>>> {
             .collect();
         out.insert(
             dir.file_name().unwrap().to_string_lossy().into_owned(),
+            by_language,
+        );
+    }
+
+    // The accuracy fixtures: multi-file trees with manifests, measured through
+    // the product's own build path. Keyed `accuracy/<dir>` so a golden fixture
+    // and an accuracy fixture can never share a name.
+    for dir in common::fixture_dirs() {
+        let built = common::build(&dir);
+        let by_language = built
+            .analysis
+            .resolution_rate
+            .by_language
+            .iter()
+            .map(|(language, row)| (language.clone(), row.net_permille))
+            .collect();
+        out.insert(
+            format!("accuracy/{}", dir.file_name().unwrap().to_string_lossy()),
             by_language,
         );
     }

@@ -1,0 +1,23 @@
+# Normalized expected edges. Hand-written ground truth: each row was derived from the
+# fixture's original audit labels (written before DevMap ran) and the language's own
+# semantics, never from DevMap's output. Read by devmap-analyze/tests/accuracy_fixtures.rs.
+#
+# Columns (tab separated):
+#   id        unique within the fixture (<lang>.<construct>)
+#   construct the audit's construct label
+#   caller    symbol id `<file>::<qualified name>`; a bare path means the file node
+#   callee    symbol id(s). `a|b` = any one satisfies; `a&b` = all must be present
+#   kind      edge   = a Calls/References/Instantiates/Extends/Implements/... edge, any tier
+#             import = an Imports edge between the two files
+#             forbid = NO edge of any kind at confidence >= 0.9 may join caller and callee
+#   level     must   = a correct resolver has this edge
+#             should = the audit accepted an honest miss or an alternative here
+#   ledger    optional `a|b` bare names a ledger row may carry when the expected callee's
+#             own name is not the name written at the call site
+#   note      what the row proves
+#
+# Dead-code truth lives beside this file in dead.tsv; failures that exist today live in
+# known_failing.tsv (keyed by the card that owns the fix).
+pr.ruff.edge	S4	tests/test_util.py::test_split	python/rootpkg/util.py::split	edge	must		import-scoped edge to the manifest-declared source root
+pr.ruff.dup	S4	tests/test_util.py::test_split	other/dup.py::split	forbid	must		the namesake outside the source root must not bind
+pr.ruff.import	S4	tests/test_util.py	python/rootpkg/util.py	import	must		Imports edge via the source root

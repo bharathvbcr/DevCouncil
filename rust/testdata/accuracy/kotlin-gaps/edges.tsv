@@ -1,0 +1,30 @@
+# Normalized expected edges. Hand-written ground truth: each row was derived from the
+# fixture's original audit labels (written before DevMap ran) and the language's own
+# semantics, never from DevMap's output. Read by devmap-analyze/tests/accuracy_fixtures.rs.
+#
+# Columns (tab separated):
+#   id        unique within the fixture (<lang>.<construct>)
+#   construct the audit's construct label
+#   caller    symbol id `<file>::<qualified name>`; a bare path means the file node
+#   callee    symbol id(s). `a|b` = any one satisfies; `a&b` = all must be present
+#   kind      edge   = a Calls/References/Instantiates/Extends/Implements/... edge, any tier
+#             import = an Imports edge between the two files
+#             forbid = NO edge of any kind at confidence >= 0.9 may join caller and callee
+#   level     must   = a correct resolver has this edge
+#             should = the audit accepted an honest miss or an alternative here
+#   ledger    optional `a|b` bare names a ledger row may carry when the expected callee's
+#             own name is not the name written at the call site
+#   note      what the row proves
+#
+# Dead-code truth lives beside this file in dead.tsv; failures that exist today live in
+# known_failing.tsv (keyed by the card that owns the fix).
+kg.S2a	S2	src/main/kotlin/gaps/Events.kt::runWith	src/main/kotlin/gaps/Events.kt::Widget.onStart	forbid	must		a function-typed parameter call is a local binding, not Widget.onStart
+kg.S2b	S2	src/main/kotlin/gaps/Events.kt::save	src/main/kotlin/gaps/Events.kt::Prefs.putBoolean	forbid	must		putBoolean inside Editor.apply{} is the external editor, not the project namesake
+kg.K27	K27	src/main/kotlin/gaps/Events.kt::wire	src/main/kotlin/gaps/Events.kt::Vm.onEvent	edge	must		callable reference vm::onEvent
+kg.K27b	K27	src/main/kotlin/gaps/Events.kt::wire	src/main/kotlin/gaps/Events.kt::register	edge	must		call with a callable-reference argument
+kg.K29	K29	src/main/kotlin/gaps/Events.kt::callOp	src/main/kotlin/gaps/Events.kt::Op.invoke	edge	should	invoke	operator fun invoke through op(2)
+kg.K30	K30	src/main/kotlin/gaps/Events.kt::useAlias	src/main/kotlin/gaps/util/Fmt.kt::format	edge	must	fmt|format	import alias: fmt(3) is gaps.util.format
+kg.K31	K31	src/main/kotlin/gaps/Events.kt::Child.go	src/main/kotlin/gaps/Events.kt::Base.go	edge	must	go	super.go() reaches the base method
+kg.K31b	K31	src/main/kotlin/gaps/Events.kt::Child.go	src/main/kotlin/gaps/Events.kt::Child.go	forbid	must		super.go() is not a self-reference
+kg.K32	K32	src/main/kotlin/gaps/Events.kt::useFactory	src/main/kotlin/gaps/Events.kt::Factory.build	edge	must		companion object call
+kg.K33	K33	src/main/kotlin/gaps/Events.kt::mk	src/main/kotlin/gaps/Events.kt::Res.Ok	edge	must	Ok	nested class constructor Res.Ok(1)

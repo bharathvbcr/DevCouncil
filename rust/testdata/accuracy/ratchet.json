@@ -1,0 +1,32 @@
+{
+  "go": {
+    "known_failing": 23,
+    "positive_rows": 51,
+    "present": 30
+  },
+  "kotlin": {
+    "known_failing": 30,
+    "positive_rows": 55,
+    "present": 29
+  },
+  "python": {
+    "known_failing": 19,
+    "positive_rows": 49,
+    "present": 30
+  },
+  "rust": {
+    "known_failing": 43,
+    "positive_rows": 105,
+    "present": 65
+  },
+  "swift": {
+    "known_failing": 24,
+    "positive_rows": 79,
+    "present": 58
+  },
+  "typescript": {
+    "known_failing": 12,
+    "positive_rows": 70,
+    "present": 59
+  }
+}

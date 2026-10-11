@@ -3,6 +3,46 @@
   "_null_means": "The language extracts calls but this fixture contains no call site, so no rate was attempted. Not zero: a baseline of null and a current of 0 are different facts, and the test refuses to read either as the other.",
   "_tolerance_permille": 10,
   "fixtures": {
+    "accuracy/go": {
+      "go": 795
+    },
+    "accuracy/kotlin": {
+      "java": null,
+      "kotlin": 795
+    },
+    "accuracy/kotlin-gaps": {
+      "kotlin": 882
+    },
+    "accuracy/python": {
+      "python": 696
+    },
+    "accuracy/python-hatch": {
+      "python": 500
+    },
+    "accuracy/python-nomanifest": {
+      "python": 500
+    },
+    "accuracy/python-ruff": {
+      "python": 500
+    },
+    "accuracy/python-setupcfg": {
+      "python": 500
+    },
+    "accuracy/rust": {
+      "rust": 815
+    },
+    "accuracy/rust-rootcrate": {
+      "rust": 714
+    },
+    "accuracy/swift": {
+      "swift": 884
+    },
+    "accuracy/ts": {
+      "go": 1000,
+      "javascript": null,
+      "tsx": 934,
+      "typescript": 840
+    },
     "barrel_reexport": {
       "python": 1000
     },

@@ -1,0 +1,91 @@
+# Normalized expected edges. Hand-written ground truth: each row was derived from the
+# fixture's original audit labels (written before DevMap ran) and the language's own
+# semantics, never from DevMap's output. Read by devmap-analyze/tests/accuracy_fixtures.rs.
+#
+# Columns (tab separated):
+#   id        unique within the fixture (<lang>.<construct>)
+#   construct the audit's construct label
+#   caller    symbol id `<file>::<qualified name>`; a bare path means the file node
+#   callee    symbol id(s). `a|b` = any one satisfies; `a&b` = all must be present
+#   kind      edge   = a Calls/References/Instantiates/Extends/Implements/... edge, any tier
+#             import = an Imports edge between the two files
+#             forbid = NO edge of any kind at confidence >= 0.9 may join caller and callee
+#   level     must   = a correct resolver has this edge
+#             should = the audit accepted an honest miss or an alternative here
+#   ledger    optional `a|b` bare names a ledger row may carry when the expected callee's
+#             own name is not the name written at the call site
+#   note      what the row proves
+#
+# Dead-code truth lives beside this file in dead.tsv; failures that exist today live in
+# known_failing.tsv (keyed by the card that owns the fix).
+ts.C1a	C1a	apps/web/src/App.tsx::App	apps/web/src/components/PaperList.tsx::PaperList	edge	must		JSX call
+ts.C1b	C1b	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/components/Button.tsx::Button	edge	must		JSX call
+ts.C1c	C1c	apps/web/src/main.tsx	apps/web/src/App.tsx::App	edge	must		JSX, default import; caller is the file
+ts.C2	C2	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/components/Button.tsx::Parts|apps/web/src/components/Button.tsx::headerText	edge	must	Header	JSX member <Parts.Header>
+ts.C3	C3	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/hooks/usePapers.ts::usePapers	edge	must		via @/ alias
+ts.C4a	C4a	apps/web/src/hooks/usePapers.ts::usePapers.reload	apps/web/src/services/api.ts::getPapers	edge	must		call inside useCallback closure
+ts.C4b	C4b	apps/web/src/hooks/usePapers.ts::usePapers	apps/web/src/hooks/usePapers.ts::computeRank	edge	must		call inside useMemo closure
+ts.C5	C5	apps/web/src/components/PaperList.tsx::PaperList.handleSave	apps/web/src/components/PaperList.tsx::savePaper	edge	must		
+ts.C6a	C6a	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/ctx/AuthContext.tsx::useAuth	edge	must		
+ts.C6b	C6b	apps/web/src/App.tsx::App	apps/web/src/ctx/AuthContext.tsx::AuthProvider	edge	must		JSX
+ts.C6c	C6c	apps/web/src/ctx/AuthContext.tsx::AuthProvider	apps/web/src/ctx/AuthContext.tsx::makeAuth	edge	must		
+ts.C6d	C6d	apps/web/src/ctx/AuthContext.tsx::AuthProvider	apps/web/src/ctx/AuthContext.tsx::AuthContext	edge	must		reference, not a fabricated call
+ts.C7	C7	apps/web/src/App.tsx::App	apps/web/src/pages/AboutPage.tsx::AboutPage	edge	must		lazy import; AboutPage not dead
+ts.C8	C8	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/lib/format.ts::formatTitle	edge	must		@lib/format alias with rename
+ts.C9	C9	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/lib/a.ts::namedA	edge	must		via @/lib barrel
+ts.C10	C10	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/lib/b.ts::starB	edge	must		export *
+ts.C11	C11	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/lib/a.ts::defaultA	edge	must		export { default as aliasDefaultA }
+ts.C12	C12	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/lib/a.ts::defaultA	edge	must		default import via @lib/a
+ts.C13	C13	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/lib/format.ts::formatTitle	edge	must		barrel export { formatTitle as fmt }
+ts.C14	C14	apps/web/src/components/PaperList.tsx::savePaper	apps/web/src/services/api.ts::postNote	edge	must		namespace import api.postNote
+ts.C15	C15	apps/web/src/App.tsx::runHeavy	apps/web/src/pages/heavy.ts::heavyCompute	edge	must		m.heavyCompute() after await import()
+ts.C16a	C16a	apps/web/src/services/store.ts::MemClient.get	apps/web/src/services/store.ts::MemClient.norm	edge	must		this call
+ts.C16b	C16b	apps/web/src/services/store.ts::viaConcrete	apps/web/src/services/store.ts::MemClient.get	edge	must		receiver typed by new
+ts.C16c	C16c	apps/web/src/services/store.ts::viaStatic	apps/web/src/services/store.ts::MemClient.create	edge	must		static call
+ts.C17	C17	apps/web/src/services/store.ts::viaStatic	apps/web/src/services/store.ts::MemClient.handle	edge	must		class-field arrow member
+ts.C18a	C18a	apps/web/src/services/store.ts::useService	apps/web/src/services/store.ts::fetchOne|apps/web/src/services/store.ts::paperService	edge	must		object-literal method call
+ts.C18b	C18b	apps/web/src/services/store.ts::useService	apps/web/src/services/store.ts::svcHelper	edge	must		svcHelper is live
+ts.C18c	C18c	apps/web/src/services/store.ts::useService	apps/web/src/services/store.ts::paperService	edge	must		object-literal arrow member remove
+ts.C19a	C19a	apps/web/src/services/store.ts::useClient	apps/web/src/services/store.ts::MemClient.get|apps/web/src/services/store.ts::Client	edge	must	get	interface dispatch; at least the interface
+ts.C19b	C19b	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/services/store.ts::Client	edge	must		type-only reference
+ts.C20	C20	apps/web/src/hooks/usePapers.ts::usePapers	apps/web/src/lib/format.ts::identity	edge	must		identity<number>(rank)
+ts.C21a	C21a	apps/web/src/services/api.ts::loadAll	apps/web/src/services/api.ts::parseBody	edge	must		.then(parseBody) reference
+ts.C21b	C21b	apps/web/src/services/api.ts::loadAll	apps/web/src/services/api.ts::logIt	edge	must		call inside .then arrow
+ts.C21c	C21c	apps/web/src/services/api.ts::loadAll	apps/web/src/services/api.ts::getPapers	edge	must		await
+ts.C22	C22	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/services/api.ts::loadAll	edge	must		call inside onClick arrow
+ts.C24	C24	apps/web/src/lib/format.test.ts	apps/web/src/lib/format.ts::formatTitle	edge	must		vitest call at file level
+ts.C25	C25	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/legacy/jsutil.js::jsDouble	edge	must		TS to JS
+ts.C26	C26	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/lib/casefile.ts::caseHelper	edge	should	caseHelper	import '../lib/CaseFile' wrong case: resolved with warning or flagged unresolved; never silent
+ts.C27	C27	apps/web/src/components/PaperList.tsx::PaperList	packages/shared/src/index.ts::sharedFormat	edge	must		@acme/shared workspace package
+ts.C28a	C28a	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/components/Button.tsx::MemoBadge	edge	must		JSX to memo-wrapped
+ts.C28b	C28b	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/components/Button.tsx::FancyInput	edge	must		JSX to forwardRef-wrapped
+ts.V1	V1	apps/web/src/v/onlyfmt.ts::useFmtOnly	apps/web/src/lib/format.ts::formatTitle	edge	must		barrel export { formatTitle as fmt }
+ts.V2	V2	apps/web/src/v/npmcollide.ts::callsNpm	apps/web/src/lib/format.ts::formatTitle	forbid	must		external npm import must not bind to the local namesake
+ts.V3a	V3a	apps/web/src/v/typedparam.ts::viaParam	apps/web/src/services/store.ts::MemClient.get	edge	must		receiver typed by parameter annotation
+ts.V3b	V3b	apps/web/src/v/typedparam.ts::viaArrowParam	apps/web/src/services/store.ts::MemClient.get	edge	must		receiver typed by arrow parameter annotation
+ts.V3c	V3c	apps/web/src/v/typedparam.ts::viaIface	apps/web/src/services/store.ts::Client	edge	should	get	interface param; honest uninferred at minimum
+ts.V5a	V5a	apps/web/src/v/effects.tsx::EffectUser	apps/web/src/v/widgets/Card.tsx::Card	edge	must		export default memo(Card) + barrel
+ts.V5b	V5b	apps/web/src/v/widgets/Card.tsx::Card	apps/web/src/v/widgets/Card.tsx::cardText	edge	must		
+ts.V6	V6	apps/web/src/v/ClassComp.tsx::Legacy.componentDidMount	apps/web/src/v/ClassComp.tsx::Legacy.load	edge	must		this call
+ts.V7	V7	apps/web/src/v/effects.tsx::EffectUser	apps/web/src/v/effects.tsx::effectLoad	edge	must		call inside useEffect closure
+ts.V8a	V8a	apps/web/src/v/arrowuser.ts::useArrow	apps/web/src/v/arrows.ts::exportedArrow	edge	must		'./arrows.js' maps to arrows.ts
+ts.V8b	V8b	apps/web/src/v/arrowuser.ts::useArrow	apps/web/src/pages/heavy.ts::heavyCompute	edge	must		explicit .ts extension import
+ts.V8c	V8c	apps/web/src/v/arrowuser.ts::useArrow	apps/web/src/v/arrows.ts::Mode	edge	must		enum reference
+ts.V8d	V8d	apps/web/src/v/arrowuser.ts::useArrow	apps/web/src/v/arrows.ts::modeName	edge	must		call
+ts.V9a	V9a	apps/web/src/v/router.tsx::router	apps/web/src/v/router.tsx::RoutedPage	edge	must		JSX in route object
+ts.V9b	V9b	apps/web/src/v/router.tsx	apps/web/src/v/lazyroute.tsx::Component	edge	should		lazy route module; caller is the file
+ts.V10	V10	apps/web/src/v/api.test.ts	apps/web/src/services/api.ts::loadAll	edge	must		call in test; affected loadAll lists api.test.ts
+ts.V11a	V11a	apps/web/src/v/grammar.ts::afterAbstract	apps/web/src/v/grammar.ts::beforeHelper	edge	must		calls after interface with abstract? field
+ts.V11b	V11b	apps/web/src/v/grammar.ts::afterAbstract	apps/web/src/v/grammar.ts::afterHelper	edge	must		
+ts.V11c	V11c	apps/web/src/v/grammar2.test.ts::callsHelper	apps/web/src/v/grammar2.test.ts::testHelperAfterTypeofImport	edge	must		typeof import() in type args
+ts.V12a	V12a	apps/web/src/v/typeofuser.tsx::TypeofUser	apps/web/src/v/typeofimport.tsx::TypeofProvider	edge	must		top-level type X = typeof import() must not erase file symbols
+ts.V12b	V12b	apps/web/src/v/typeofuser.tsx::TypeofUser	apps/web/src/v/typeofimport.tsx::useTypeof	edge	must		
+ts.V13a	V13a	apps/web/src/v/importtypeuser.tsx::ImportTypeUser	apps/web/src/v/importtype.tsx::ImportTypeProvider	edge	must		type X = import('m').Name in .tsx must not erase later declarations
+ts.V13b	V13b	apps/web/src/v/importtypeuser.tsx::ImportTypeUser	apps/web/src/v/importtype.tsx::useImportType	edge	must		
+ts.V14	V14	apps/web/src/v/view2user.ts::consumeWorkspace	apps/web/src/v/store2.ts::useWorkspace	edge	must		import {x} from; export {x}
+ts.V15a	V15a	apps/web/src/v/loggeruser.ts::useLogger	apps/web/src/v/logger.ts::getLogs	edge	must		shorthand property
+ts.V15b	V15b	apps/web/src/v/loggeruser.ts::useLogger	apps/web/src/v/logger.ts::clearLogs	edge	must		object-literal arrow member
+ts.V16	V16	apps/web/src/v/lexicalthis.ts::Gateway.open.connect	apps/web/src/v/lexicalthis.ts::Gateway.buildUrl	edge	must		this inside arrow nested in a method
+ts.V17a	V17a	apps/web/src/v/defaults.ts::withDeps	apps/web/src/v/defaults.ts::defaultSleep	edge	must		destructured default parameter reference
+ts.V17b	V17b	apps/web/src/v/defaults.ts::withDeps	apps/web/src/v/defaults.ts::repoRoot	edge	must		destructured default parameter call
+ts.V17c	V17c	apps/web/src/v/defaults.ts::withPlain	apps/web/src/v/defaults.ts::plainDefault	edge	must		simple default parameter call

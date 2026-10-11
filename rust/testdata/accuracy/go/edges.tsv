@@ -1,0 +1,75 @@
+# Normalized expected edges. Hand-written ground truth: each row was derived from the
+# fixture's original audit labels (written before DevMap ran) and the language's own
+# semantics, never from DevMap's output. Read by devmap-analyze/tests/accuracy_fixtures.rs.
+#
+# Columns (tab separated):
+#   id        unique within the fixture (<lang>.<construct>)
+#   construct the audit's construct label
+#   caller    symbol id `<file>::<qualified name>`; a bare path means the file node
+#   callee    symbol id(s). `a|b` = any one satisfies; `a&b` = all must be present
+#   kind      edge   = a Calls/References/Instantiates/Extends/Implements/... edge, any tier
+#             import = an Imports edge between the two files
+#             forbid = NO edge of any kind at confidence >= 0.9 may join caller and callee
+#   level     must   = a correct resolver has this edge
+#             should = the audit accepted an honest miss or an alternative here
+#   ledger    optional `a|b` bare names a ledger row may carry when the expected callee's
+#             own name is not the name written at the call site
+#   note      what the row proves
+#
+# Dead-code truth lives beside this file in dead.tsv; failures that exist today live in
+# known_failing.tsv (keyed by the card that owns the fix).
+go.C01	C01	app/svc/svc.go::Caller01	app/util/util.go::Target01	edge	must		edge
+go.C02	C02	app/util/util.go::Target02b	app/util/util2.go::Target02	edge	must		edge
+go.C03	C03	app/svc/svc.go::Caller03	app/store/store.go::Store.PtrGet03	edge	must		edge
+go.C04	C04	app/svc/svc.go::Caller04	app/store/store.go::Store.ValGet04	edge	must		edge
+go.C05	C05	app/svc/svc.go::Caller05	app/store/store.go::Store.MethodValue05	edge	must		edge-or-reference
+go.C06	C06	app/svc/svc.go::Caller06	app/store/store.go::Store.MethodExpr06	edge	must		edge-or-reference
+go.C07	C07	app/svc/svc.go::Caller07	app/store/store.go::Reader.Read07|app/store/store.go::FileReader.Read07+app/store/store.go::MemReader.Read07	edge	must		edge (interface method) or fan-out to FileReader.Read07+MemReader.Read07; FileReader.Read07/MemReader.Read07 must not be dead
+go.C08a	C08a	app/svc/svc.go::Caller08	app/store/store.go::Base.Promoted08	edge	must		edge (known gap ft-32522da4)
+go.C08b	C08b	app/svc/svc.go::Caller08	app/store/store.go::Base.PtrPromoted08	edge	must		edge (known gap ft-32522da4)
+go.C09	C09	app/svc/svc.go::Service.Caller09	app/store/store.go::Logger.Log09	edge	must		edge (promoted from embedded interface)
+go.C10a	C10a	app/svc/svc.go::Caller10	app/store/generic.go::Sum10	edge	must		edge
+go.C10b	C10b	app/svc/svc.go::Caller10	app/store/generic.go::Zero10	edge	must		edge (known gap: one explicit type arg)
+go.C10c	C10c	app/svc/svc.go::Caller10	app/store/generic.go::Pair10	edge	must		edge
+go.C10d	C10d	app/svc/svc.go::Caller10	app/store/generic.go::Box.Get10	edge	must		edge (generic type method on bx := NewBox10[int](3))
+go.C10e	C10e	app/svc/svc.go::Caller10	app/store/generic.go::NewBox10	edge	must		edge (known gap: one explicit type arg)
+go.C11	C11	app/svc/svc.go::Caller11	app/svc/svc.go::helper11	edge	must		edge (func literal in go stmt attributed to enclosing fn)
+go.C12a	C12a	app/svc/svc.go::Caller12	app/svc/svc.go::worker12	edge	must		edge
+go.C12b	C12b	app/svc/svc.go::Caller12	app/svc/svc.go::cleanup12	edge	must		edge
+go.C13	C13	app/main.go::init	app/main.go::initOnly13	edge	must		edge; init and main not in dead
+go.C14a	C14a	app/web/web.go::Routes	app/web/web.go::handleIndex14	edge	must		reference; not dead
+go.C14b	C14b	app/web/web.go::Routes	app/web/web.go::Handler.ServeItems14	edge	must		reference; not dead
+go.C14c	C14c	app/web/web.go::Routes	app/web/web.go::handleWrapped14	edge	must		reference; not dead
+go.C14d	C14d	app/web/web.go::Routes	app/web/web.go::inline14	edge	must		edge
+go.C15	C15	app/svc/svc.go::Service.Caller15	app/svc/svc.go::Repo.Find15	edge	must		edge (field-typed interface receiver); SQLRepo.Find15 not dead
+go.C15b	C15b	app/svc/svc.go::Service.Caller15	app/store/store.go::Store.PtrGet03	edge	must		edge (field-typed concrete receiver)
+go.C16	C16	app/svc/svc.go::Caller16	app/store/store.go::Store.RangeGet16	edge	must		edge (known gap: range var)
+go.C17a	C17a	app/svc/svc.go::Caller17	app/store/store.go::Circle.Area17	edge	must		edge (type switch binding)
+go.C17b	C17b	app/svc/svc.go::Caller17	app/store/store.go::Square.Side17	edge	must		edge
+go.C18	C18	app/svc/svc.go::Caller18	app/store/store.go::PathErr.Detail18	edge	must		edge (errors.As var)
+go.C19	C19	app/svc/svc.go::Caller19	app/internal/secret/secret.go::Target19	edge	must		edge
+go.C20a	C20a	app/svc/svc.go::Caller20	libmod/lib.go::LibTarget20	edge	must		edge (replace/go.work module)
+go.C20b	C20b	app/svc/svc.go::Caller20	libmod/lib.go::LibType20.LibMethod20	edge	must		edge
+go.C21	C21	app/svc/svc_test.go::TestCaller01Table	app/svc/svc.go::Caller01	edge	must		edge; affected Caller01 includes svc_test.go
+go.C22a	C22a	app/cgox/cgox.go::Caller22	app/cgox/cgox.go::goSide22	edge	must		edge
+go.C23a	C23a	app/gen/gen.go::Use23	app/gen/color_string.go::Color.String	edge	must		edge
+go.C23b	C23b	app/gen/gen.go::Use23	app/gen/color_string.go::GeneratedHelper23	edge	must		edge
+go.C24a	C24a	app/svc/svc.go::Service.Caller24	app/store/store.go::Store.ElemGet24	edge	must		edge (map elem of field)
+go.C24b	C24b	app/svc/svc.go::Service.Caller24	app/store/store.go::Store.ElemGet24	edge	must		edge (slice elem of param)
+go.C25	C25	app/svc/svc.go::Caller25	app/store/store.go::Store.Ctor25	edge	must		edge (ctor return type)
+go.C26	C26	app/svc/svc.go::Caller26	app/store/store.go::Store.Ctor25	edge	must		edge (chained)
+go.C28	C28	app/svc/svc.go::Caller28	app/util/util.go::Target28	edge	must		edge (aliased import)
+go.C29	C29	app/svc/svc.go::Caller29	app/store/store.go::Store.Close29	edge	must		edge
+go.C29.other	C29	app/svc/svc.go::Caller29	app/store/store.go::Other.Close29	forbid	must		must not bind the namesake
+go.P1	P1	app/svc/probes.go::ParamCaller	app/store/store.go::Store.PtrGet03	edge	must		edge (typed param)
+go.P2	P2	app/svc/probes.go::varDeclCaller	app/svc/probes.go::counter.inc	edge	must		edge (same-package var decl)
+go.P3a	P3a	app/svc/probes.go::goDeferMethods	app/store/store.go::Store.Close29	edge	must		edge (defer typed method)
+go.P3b	P3b	app/svc/probes.go::goDeferMethods	app/store/store.go::Store.MethodValue05	edge	must		edge (go typed method)
+go.P4	P4	app/svc/probes.go::multiReturnCaller	app/store/store.go::Store.ElemGet24	edge	must		edge (multi-return ctor)
+go.P5	P5	app/svc/probes.go::useRunner	app/svc/probes.go::fast.run	edge	must		edge or not-dead (unexported interface dispatch)
+go.P10	P10	app/svc/probes.go::callbackCaller	app/store/store.go::Store.MethodValue05	edge	must		reference
+go.Q1	Q1	app/svc/probes2.go::methodReturnCaller	app/store/store.go::Store.ElemGet24	edge	must		edge (local from method-call result)
+go.Q3	Q3	app/svc/probes2.go::Holder.Rebuild	app/svc/probes2.go::Rebuild	edge	must		edge; NO self-edge Holder.Rebuild->Holder.Rebuild
+go.Q3.noself	Q3	app/svc/probes2.go::Holder.Rebuild	app/svc/probes2.go::Holder.Rebuild	forbid	must		no self-edge
+go.Q4	Q4	app/svc/probes2.go::cache.delete	app/svc/probes2.go::cache.delete	forbid	must		builtin delete is not a self-call
+go.Q5	Q5	app/svc/probes2.go::writer.clear	-	forbid	must		bytes.Buffer is external

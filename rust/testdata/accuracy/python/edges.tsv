@@ -1,0 +1,68 @@
+# Normalized expected edges. Hand-written ground truth: each row was derived from the
+# fixture's original audit labels (written before DevMap ran) and the language's own
+# semantics, never from DevMap's output. Read by devmap-analyze/tests/accuracy_fixtures.rs.
+#
+# Columns (tab separated):
+#   id        unique within the fixture (<lang>.<construct>)
+#   construct the audit's construct label
+#   caller    symbol id `<file>::<qualified name>`; a bare path means the file node
+#   callee    symbol id(s). `a|b` = any one satisfies; `a&b` = all must be present
+#   kind      edge   = a Calls/References/Instantiates/Extends/Implements/... edge, any tier
+#             import = an Imports edge between the two files
+#             forbid = NO edge of any kind at confidence >= 0.9 may join caller and callee
+#   level     must   = a correct resolver has this edge
+#             should = the audit accepted an honest miss or an alternative here
+#   ledger    optional `a|b` bare names a ledger row may carry when the expected callee's
+#             own name is not the name written at the call site
+#   note      what the row proves
+#
+# Dead-code truth lives beside this file in dead.tsv; failures that exist today live in
+# known_failing.tsv (keyed by the card that owns the fix).
+py.C01	C01	lib/pkg/__init__.py	lib/pkg/core.py	import	must		edge
+py.C01b	C01	lib/pkg/sub/deep.py::forms	lib/pkg/core.py::Engine	edge	must		Calls/References edge via pkg.__init__ re-export
+py.C02	C02	lib/pkg/sub/deep.py::forms	lib/pkg/util.py::helper	edge	must		edge (import pkg.util; pkg.util.helper())
+py.C03	C03	lib/pkg/sub/deep.py::forms	lib/pkg/util.py::helper	edge	must		edge (from pkg import util as u; u.helper())
+py.C04	C04	lib/pkg/sub/deep.py::forms	lib/pkg/util.py::helper	edge	must		edge (from ..util import helper as h)
+py.C05	C05	lib/pkg/sub/deep.py::forms	lib/pkg/core.py::Engine.step	edge	must		edge (E2(1).step())
+py.C05b	C05b	lib/pkg/sub/deep.py::forms	lib/pkg/core.py::Engine.run	edge	must		edge
+py.C06	C06	scripts/tool.py::main	lib/pkg/util.py::split	edge	must		edge (sys.path insert of lib); NOT other/dup.py::split
+py.C06.not	C06	scripts/tool.py::main	other/dup.py::split	forbid	must		namesake must not bind
+py.C07	C07	lib/pkg/core.py::Engine.__init__	lib/pkg/core.py::Base.__init__	edge	must		edge (super().__init__)
+py.C07b	C07b	lib/pkg/core.py::Engine.run	lib/pkg/core.py::Base.run	edge	must		edge (super().run())
+py.C07c	C07c	lib/pkg/flows.py::inherited_only	lib/pkg/core.py::Base.quack	edge	must		edge via MRO; NOT Duck.quack
+py.C07c.not	C07c	lib/pkg/flows.py::inherited_only	lib/pkg/core.py::Duck.quack	forbid	must		namesake must not bind
+py.C08	C08	lib/pkg/flows.py::props	lib/pkg/core.py::Engine.size	edge	should		property read edge (any kind) or honest miss
+py.C09	C09	lib/pkg/flows.py::statics	lib/pkg/core.py::Engine.norm	edge	must		edge
+py.C09b	C09b	lib/pkg/flows.py::statics	lib/pkg/core.py::Engine.create	edge	must		edge
+py.C09c	C09c	lib/pkg/core.py::Engine.step	lib/pkg/core.py::Engine.norm	edge	must		edge (self.norm)
+py.C09d	C09d	lib/pkg/core.py::Engine.create	lib/pkg/core.py::Engine	edge	should		edge-ish (cls(0)) or honest miss
+py.C10	C10	lib/pkg/util.py::traced.wrapper	lib/pkg/util.py::log_call	edge	must		edge (nested fn in decorator)
+py.C10b	C10b	lib/pkg/util.py::work	lib/pkg/util.py::helper	edge	must		edge (decorated fn)
+py.C10c	C10c	lib/pkg/flows.py::closures	lib/pkg/util.py::work	edge	must		edge
+py.C11	C11	lib/pkg/models.py::build_config	lib/pkg/models.py::Config.validate	edge	must		edge (dataclass ctor typing)
+py.C12	C12	lib/pkg/flows.py::typed	lib/pkg/core.py::Engine.step	edge	must		edge ReceiverType (annotation)
+py.C12b	C12b	lib/pkg/flows.py::constructed	lib/pkg/core.py::Engine.reset	edge	must		edge
+py.C12c	C12c	lib/pkg/flows.py::constructed	lib/pkg/core.py::Engine.run	edge	must		edge (Engine.run overrides Base.run)
+py.C13	C13	lib/pkg/util.py::make_adder.add	lib/pkg/util.py::helper	edge	must		edge (closure)
+py.C13b	C13b	lib/pkg/flows.py::lambdas	lib/pkg/util.py::score	edge	must		edge (lambda body)
+py.C13c	C13c	lib/pkg/flows.py::closures	lib/pkg/util.py::make_adder	edge	must		edge
+py.C14	C14	lib/pkg/flows.py::duck	lib/pkg/core.py::Base.quack|lib/pkg/core.py::Duck.quack	forbid	must		NO confident edge; honest unresolved/ambiguous
+py.C15	C15	lib/pkg/flows.py::partials	lib/pkg/util.py::helper	edge	must		reference edge (partial(helper), apply(helper))
+py.C15b	C15b	lib/pkg/flows.py::partials	lib/pkg/util.py::apply	edge	must		edge
+py.C16	C16	lib/pkg/numeric.py::total	lib/pkg/numeric.py::filter|lib/pkg/numeric.py::select	forbid	must		NO edge (polars chain); unresolved external
+py.C17c	C17c	lib/pkg/cli.py::main	lib/pkg/core.py::Engine.create	edge	must		edge
+py.C17d	C17d	lib/pkg/cli.py::main	lib/pkg/core.py::Engine.step	edge	must		edge (eng = Engine.create(); return type annotated)
+py.C18b	C18b	lib/pkg/web.py::list_items	lib/pkg/util.py::helper	edge	must		edge
+py.C19	C19	lib/pkg/core.py::Engine.fetch	lib/pkg/core.py::Engine.load	edge	must		edge (await self.load())
+py.C19b	C19b	lib/pkg/flows.py::runner	lib/pkg/core.py::Engine.fetch	edge	must		edge (await e.fetch())
+py.C20	C20	tests/test_core.py::test_split	lib/pkg/util.py::split	edge	must		ImportScoped edge only; NOT other/dup.py::split (needs pytest pythonpath=lib)
+py.C20.not	C20	tests/test_core.py::test_split	other/dup.py::split	forbid	must		namesake must not bind
+py.C20b	C20b	lib/pkg/web.py::list_items	lib/pkg/util.py::helper	edge	must		NOT other/dup.py::helper
+py.C20b.not	C20b	lib/pkg/web.py::list_items	other/dup.py::helper	forbid	must		namesake must not bind
+py.C21	C21	lib/pkg/flows.py::with_ctx	lib/pkg/core.py::Engine.__enter__	edge	should		edge or honest miss (implicit dunder)
+py.C21b	C21b	lib/pkg/core.py::Engine.__exit__	lib/pkg/core.py::Engine.reset	edge	must		edge
+py.C21c	C21c	lib/pkg/core.py::Engine.__call__	lib/pkg/core.py::Engine.step	edge	must		edge
+py.C22b	C22b	lib/pkg/dyn.py::by_import	lib/pkg/util.py::helper	edge	should		edge or honest miss; NOT other/dup.py::helper
+py.C22b.not	C22b	lib/pkg/dyn.py::by_import	other/dup.py::helper	forbid	must		namesake must not bind
+py.C23b	C23b	tests/test_core.py::test_engine	lib/pkg/core.py::Engine.step	edge	should		edge if fixture return typed; honest miss acceptable
+py.C26	C26	tests/test_core.py	lib/pkg/util.py	import	must		Imports edge via pytest pythonpath

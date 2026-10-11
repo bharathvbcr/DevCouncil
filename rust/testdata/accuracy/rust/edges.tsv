@@ -1,0 +1,127 @@
+# Normalized expected edges. Hand-written ground truth: each row was derived from the
+# fixture's original audit labels (written before DevMap ran) and the language's own
+# semantics, never from DevMap's output. Read by devmap-analyze/tests/accuracy_fixtures.rs.
+#
+# Columns (tab separated):
+#   id        unique within the fixture (<lang>.<construct>)
+#   construct the audit's construct label
+#   caller    symbol id `<file>::<qualified name>`; a bare path means the file node
+#   callee    symbol id(s). `a|b` = any one satisfies; `a&b` = all must be present
+#   kind      edge   = a Calls/References/Instantiates/Extends/Implements/... edge, any tier
+#             import = an Imports edge between the two files
+#             forbid = NO edge of any kind at confidence >= 0.9 may join caller and callee
+#   level     must   = a correct resolver has this edge
+#             should = the audit accepted an honest miss or an alternative here
+#   ledger    optional `a|b` bare names a ledger row may carry when the expected callee's
+#             own name is not the name written at the call site
+#   note      what the row proves
+#
+# Dead-code truth lives beside this file in dead.tsv; failures that exist today live in
+# known_failing.tsv (keyed by the card that owns the fix).
+rs.c01	C01	corelib/src/traits.rs::c01_caller	corelib/src/traits.rs::Dog.speak_c01|corelib/src/traits.rs::Speak.speak_c01	edge	must		receiver typed by &Dog param
+rs.c02	C02	corelib/src/traits.rs::c02_caller	corelib/src/traits.rs::Render.render_c02|corelib/src/traits.rs::Sq.render_c02&corelib/src/traits.rs::Ci.render_c02	edge	must		dyn Trait: trait decl or fan-out to both impls
+rs.c02b	C02	corelib/src/traits.rs::c02b_caller	corelib/src/traits.rs::Render.render_c02|corelib/src/traits.rs::Sq.render_c02&corelib/src/traits.rs::Ci.render_c02	edge	must		Box<dyn> in closure
+rs.c03	C03	corelib/src/traits.rs::c03_caller	corelib/src/traits.rs::Render.area_c03|corelib/src/traits.rs::Sq.area_c03&corelib/src/traits.rs::Ci.area_c03	edge	must		generic bound T: Render
+rs.c04	C04	corelib/src/lib.rs::c04_caller	corelib/src/lib.rs::Describe.describe_c04|corelib/src/lib.rs::T.describe_c04	edge	must		blanket impl on i32 literal
+rs.c05a	C05	corelib/src/lib.rs::c05_caller	corelib/src/lib.rs::Wrapper.new_c05	edge	must		generic impl
+rs.c05b	C05	corelib/src/lib.rs::c05_caller	corelib/src/lib.rs::Wrapper.get_c05	edge	must		
+rs.c06a	C06	corelib/src/lib.rs::c06_caller	corelib/src/lib.rs::Counter.new_c06	edge	must		assoc fn
+rs.c06b	C06	corelib/src/lib.rs::c06_caller	corelib/src/lib.rs::Counter.incr_c06	edge	must		method + UFCS
+rs.c07a	C07	corelib/src/traits.rs::c07_caller	corelib/src/traits.rs::make_c07	edge	must		impl Trait return
+rs.c07b	C07	corelib/src/traits.rs::c07_caller	corelib/src/traits.rs::Render.render_c02|corelib/src/traits.rs::Sq.render_c02&corelib/src/traits.rs::Ci.render_c02	edge	should		receiver is the impl Trait return
+rs.c08	C08	corelib/src/lib.rs::c08_caller	corelib/src/lib.rs::Inner.inner_c08	edge	must		Deref + auto-ref
+rs.c09a	C09	corelib/src/lib.rs::c09_caller	corelib/src/lib.rs::apply_c09	edge	must		closure arg
+rs.c09b	C09	corelib/src/lib.rs::c09_caller	corelib/src/lib.rs::helper_c09	edge	must		
+rs.c09c	C09	corelib/src/lib.rs::c09_caller	corelib/src/lib.rs::helper_c09b	edge	must		fn item reference
+rs.c10a	C10	corelib/src/lib.rs::c10_caller	corelib/src/lib.rs::Item.keep_c10	edge	must		iterator chains; closure params typed by slice element
+rs.c10b	C10	corelib/src/lib.rs::c10_caller	corelib/src/lib.rs::Item.score_c10	edge	must		
+rs.c10c	C10	corelib/src/lib.rs::c10_caller	corelib/src/lib.rs::Item.score_c10b	edge	must		reference
+rs.c11a	C11	corelib/src/lib.rs::c11_caller	corelib/src/lib.rs::parse_c11	edge	must		? propagation
+rs.c11b	C11	corelib/src/lib.rs::c11_caller	corelib/src/lib.rs::Config.validate_c11	edge	must		
+rs.c12a	C12	corelib/src/macros.rs::c12_caller	corelib/src/macros.rs::helper_c12	edge	must		macro_rules!
+rs.c12b	C12	corelib/src/macros.rs::c12_caller	corelib/src/macros.rs::emit_c12	edge	should		emit_c12 is called only in the macro body
+rs.c13a	C13	corelib/src/macros.rs::c13_caller	corelib/src/macros.rs::fmt_c13	edge	must		println!/assert_eq!/vec!/format! args
+rs.c13b	C13	corelib/src/macros.rs::c13_caller	corelib/src/macros.rs::calc_c13	edge	must		
+rs.c13c	C13	corelib/src/macros.rs::c13_caller	corelib/src/macros.rs::Named.name_c13	edge	must		
+rs.c14a	C14	corelib/src/asyncs.rs::c14_caller	corelib/src/asyncs.rs::Signals.recv_c14	edge	must		tokio::select!
+rs.c14b	C14	corelib/src/asyncs.rs::c14_caller	corelib/src/asyncs.rs::handle_c14	edge	must		
+rs.c14c	C14	corelib/src/asyncs.rs::c14_caller	corelib/src/asyncs.rs::tick_c14	edge	must		
+rs.c15	C15	corelib/src/lib.rs::c15_caller	corelib/src/lib.rs::Manual.clone	forbid	must		d.clone() on a derived Clone must not bind to Manual.clone
+rs.c16a	C16	corelib/src/asyncs.rs::c16_caller	corelib/src/asyncs.rs::fetch_c16	edge	must		async/.await
+rs.c16b	C16	corelib/src/asyncs.rs::c16_caller	corelib/src/asyncs.rs::Client.get_c16	edge	must		
+rs.c16c	C16	corelib/src/asyncs.rs::Client.get_c16	corelib/src/asyncs.rs::fetch_c16	edge	must		
+rs.c17a	C17	app/src/main.rs::c17_caller	corelib/src/util.rs::cross_c17	edge	must		cross-crate
+rs.c17b	C17	app/src/main.rs::c17_caller	corelib/src/shapes/circle.rs::Circle.new_c17	edge	must		
+rs.c17c	C17	app/src/main.rs::c17_caller	corelib/src/shapes/circle.rs::Circle.radius_c17	edge	must		
+rs.c18a	C18	app/src/main.rs::c18_caller	corelib/src/shapes/circle.rs::reexported_c18	edge	must		pub use chains
+rs.c18b	C18	app/src/main.rs::c18_caller	corelib/src/util.rs::renamed_src_c18b	edge	must		
+rs.c18c	C18	app/src/main.rs::c18_caller	corelib/src/geo/point.rs::dist_c19	edge	must		
+rs.c17d	C17	app/src/main.rs::c01_cross	corelib/src/traits.rs::Dog.speak_c01|corelib/src/traits.rs::Speak.speak_c01	edge	must		cross-crate trait method
+rs.c17e	C17	app/src/main.rs::c02_cross	corelib/src/traits.rs::Render.render_c02|corelib/src/traits.rs::Sq.render_c02&corelib/src/traits.rs::Ci.render_c02	edge	must		cross-crate dyn
+rs.c19a	C19	corelib/src/shapes/mod.rs::shapes_entry_c19	corelib/src/shapes/circle.rs::area_c19	edge	must		mod.rs layout
+rs.c19b	C19	corelib/src/geo.rs::geo_entry_c19	corelib/src/geo/point.rs::dist_c19	edge	must		geo.rs + geo/ layout
+rs.c20a	C20	corelib/src/lib.rs::c20_caller	corelib/src/lib.rs::algo_c20	edge	must		cfg/feature
+rs.c20b	C20	corelib/src/lib.rs::c20_caller	corelib/src/lib.rs::gated_c20b	edge	must		
+rs.c21a	C21	corelib/src/lib.rs::t_c21	corelib/src/lib.rs::target_c21	edge	must		#[test]
+rs.c21b	C21	corelib/src/lib.rs::t2_c21	corelib/src/lib.rs::only_tested_c21b	edge	must		#[tokio::test]
+rs.c21c	C21	app/tests/integration.rs::it_c21	corelib/src/lib.rs::target_c21	edge	must		integration test
+rs.c21d	C21	app/tests/integration.rs::it2_c21	corelib/src/asyncs.rs::fetch_c16	edge	must		
+rs.c22	C22	corelib/build.rs::main	corelib/build.rs::gen_c22	edge	must		build.rs
+rs.c23	C23	corelib/src/ffi.rs::c23_caller	corelib/src/ffi.rs::abs	edge	must		FFI extern decl
+rs.c24a	C24	corelib/src/lib.rs::c24_caller	corelib/src/lib.rs::init_c24	edge	must		const/static reference
+rs.c24b	C24	corelib/src/lib.rs::c24_caller	corelib/src/lib.rs::helper_c24	edge	must		
+rs.c24c	C24	corelib/src/lib.rs::c24_caller	corelib/src/lib.rs::FPTR_C24	edge	must		
+rs.c25a	C25	corelib/src/lib.rs::c25_caller	corelib/src/lib.rs::Shape.new_c25	edge	must		enum impl
+rs.c25b	C25	corelib/src/lib.rs::c25_caller	corelib/src/lib.rs::Shape.area_c25	edge	must		
+rs.c26a	C26	corelib/src/ops.rs::c26_caller	corelib/src/ops.rs::V.add	edge	should		operator/Drop/From trait use is implicit; honest miss expected
+rs.c26b	C26	corelib/src/ops.rs::c26_caller	corelib/src/ops.rs::Table.index	edge	should		operator/Drop/From trait use is implicit; honest miss expected
+rs.c26c	C26	corelib/src/ops.rs::c26_caller	corelib/src/ops.rs::Res.drop	edge	should		operator/Drop/From trait use is implicit; honest miss expected
+rs.c26d	C26	corelib/src/ops.rs::c26_caller	corelib/src/ops.rs::Meters.from	edge	should		operator/Drop/From trait use is implicit; honest miss expected
+rs.c26e	C26	corelib/src/ops.rs::c26_caller	corelib/src/ops.rs::MyErr.from	edge	should		operator/Drop/From trait use is implicit; honest miss expected
+rs.c28a	C28	corelib/src/lib.rs::Engine.other_c28	corelib/src/lib.rs::Engine.helper_c28	edge	must		Self::
+rs.c28b	C28	corelib/src/lib.rs::Engine.run_c28	corelib/src/lib.rs::Engine.other_c28	edge	must		self.
+rs.c29	C29	corelib/src/lib.rs::c29_caller	corelib/src/lib.rs::hook_target_c29	edge	must		fn-pointer field reference
+rs.c30	C30	corelib/src/lib.rs::Service.c30_caller	corelib/src/lib.rs::Store.save_c30	edge	must		typed field receiver
+rs.c34	C34	corelib/src/lib.rs::c34_caller	corelib/src/lib.rs::Store.save_c30	edge	must		&T param receiver
+rs.c32a	C32	corelib/src/lib.rs::c32_caller	corelib/src/lib.rs::Wrapper.new_c05	edge	must		turbofish
+rs.c32b	C32	corelib/src/lib.rs::c32_caller	corelib/src/lib.rs::Wrapper.get_c05	edge	must		
+rs.c32c	C32	corelib/src/lib.rs::c32_caller	corelib/src/lib.rs::parse_as_c32	edge	must		
+rs.c33	C33	corelib/src/lib.rs::outer_c33	corelib/src/lib.rs::outer_c33.inner_c33	edge	must		nested fn
+rs.c36	C36	corelib/src/lib.rs::c36_caller	corelib/src/lib.rs::Bag.push_c36	edge	must		Rc<RefCell>/Arc<Mutex> deref
+rs.c37a	C37	corelib/src/lib.rs::c37_caller	corelib/src/lib.rs::Item.score_c10	edge	must		if-let / for pattern receivers
+rs.c37b	C37	corelib/src/lib.rs::c37_caller	corelib/src/lib.rs::Item.score_c10b	edge	must		
+rs.c35	C35	corelib/src/traits.rs::c35_caller	corelib/src/traits.rs::Factory.create_c35|corelib/src/traits.rs::Dog.create_c35	edge	must		T::assoc fn
+rs.c27a	C27	corelib/src/traits.rs::c27_caller	corelib/src/traits.rs::Template.tmpl_c27	edge	must		trait default method
+rs.c27b	C27	corelib/src/traits.rs::Template.tmpl_c27	corelib/src/traits.rs::Template.hook_c27|corelib/src/traits.rs::Concrete.hook_c27	edge	must		self in default body
+rs.c31	C31	corelib/src/traits.rs::c31_caller	corelib/src/traits.rs::StrExt.ext_c31|corelib/src/traits.rs::str.ext_c31	edge	must		extension trait on str
+rs.c38a	C38	corelib/src/asyncs.rs::c38_caller	corelib/src/asyncs.rs::work_c38	edge	must		thread::spawn closure / fn item
+rs.c39a	C39	tauri_like/src/main.rs::main	tauri_like/src/commands.rs::cmd_c39	edge	must		generate_handler! commands
+rs.c39b	C39	tauri_like/src/main.rs::main	tauri_like/src/commands.rs::cmd_async_c39	edge	must		
+rs.c39c	C39	tauri_like/src/main.rs::main	tauri_like/src/commands.rs::cmd_private_c39	edge	must		
+rs.c39d	C39	tauri_like/src/commands.rs::cmd_c39	tauri_like/src/commands.rs::helper_c39	edge	must		
+rs.c40a	C40	tauri_like/src/commands.rs::Payload	tauri_like/src/commands.rs::default_c40	edge	must		serde attribute fn strings
+rs.c40b	C40	tauri_like/src/commands.rs::Payload	tauri_like/src/commands.rs::ser_c40	edge	must		
+rs.c41a	C41	corelib/src/deadprobe.rs::deadprobe_entry	corelib/src/deadprobe.rs::Hidden.via_deref_c41	edge	must		dead-code probes
+rs.c41b	C41	corelib/src/deadprobe.rs::deadprobe_entry	corelib/src/deadprobe.rs::Hidden.via_question_c41	edge	must		
+rs.c41c	C41	corelib/src/deadprobe.rs::deadprobe_entry	corelib/src/deadprobe.rs::Hidden.via_closure_c41	edge	must		
+rs.c41d	C41	corelib/src/deadprobe.rs::deadprobe_entry	corelib/src/deadprobe.rs::Act.act_c41|corelib/src/deadprobe.rs::Impl1.act_c41	edge	must		
+rs.c41e	C41	corelib/src/deadprobe.rs::deadprobe_entry	corelib/src/deadprobe.rs::make_hidden_c41	edge	must		
+rs.c41f	C41	corelib/src/deadprobe.rs::deadprobe_entry	corelib/src/deadprobe.rs::via_macro_body_c41	edge	should		macro-body call
+rs.c43a	C43	corelib/src/probes2.rs::spawn	corelib/src/probes2.rs::spawn	forbid	must		std Command::spawn is not a self-edge
+rs.c43b	C43	corelib/src/probes2.rs::Command.spawn_ext_c43	corelib/src/probes2.rs::spawn	forbid	must		std Command::spawn must not bind to the free fn
+rs.c45	C45	corelib/src/probes2.rs::c45_caller	corelib/src/probes2.rs::level_c45	forbid	must		method call level() must not bind to the free fn
+rs.c45b	C45	corelib/src/probes2.rs::c45_caller	corelib/src/probes2.rs::Gauge.level_c45	edge	must		
+rs.c46a	C46	corelib/src/probes2.rs::c46_caller	corelib/src/probes2.rs::make_outcome_c46	edge	must		free-fn return typing
+rs.c46b	C46	corelib/src/probes2.rs::c46_caller	corelib/src/probes2.rs::try_outcome_c46	edge	must		
+rs.c46c	C46	corelib/src/probes2.rs::c46_caller	corelib/src/probes2.rs::nested_outcome_c46	edge	must		
+rs.c46d	C46	corelib/src/probes2.rs::c46_caller	corelib/src/probes2.rs::Outcome.read_c46	edge	must		
+rs.c44a	C44	libnamed/src/main.rs::main	libnamed/src/lib.rs::run_c44	edge	must		[lib] name
+rs.c44b	C44	libnamed/src/main.rs::main	libnamed/src/engine.rs::Thing.make_c44	edge	must		
+rs.c44c	C44	libnamed/src/main.rs::main	libnamed/src/engine.rs::Thing.value_c44	edge	must		
+rs.c44d	C44	libnamed/src/main.rs::main	libnamed/src/engine.rs::only_from_bin_c44	edge	must		
+rs.c44e	C44	libnamed/tests/it.rs::it_c44	libnamed/src/engine.rs::Thing.make_c44	edge	must		
+rs.c44f	C44	libnamed/tests/it.rs::it_c44	libnamed/src/engine.rs::Thing.value_c44	edge	must		
+rs.c44g	C44	libnamed/tests/it.rs::it_c44	libnamed/src/engine.rs::only_from_bin_c44	edge	must		
+rs.c48a	C48	corelib/src/probes2.rs::c48_caller	corelib/src/probes2.rs::shadow_a_c48	edge	must		let-pattern shadowing its own initializer callee
+rs.c48b	C48	corelib/src/probes2.rs::c48_caller	corelib/src/probes2.rs::shadow_b_c48	edge	must		
+rs.c48c	C48	corelib/src/probes2.rs::c48_caller	corelib/src/probes2.rs::shadow_c_c48	edge	must		
