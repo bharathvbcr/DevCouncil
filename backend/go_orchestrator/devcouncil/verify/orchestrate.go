@@ -530,7 +530,9 @@ func Persist(ctx context.Context, client *store.Client, taskID string, gaps []Ga
 	if err != nil {
 		return fmt.Errorf("run-record: %w", err)
 	}
-	if err := client.RunRecord(ctx, store.VerificationRun{
+	// One transaction: the run is never stored with a status and no gaps, and
+	// a failure leaves the task's previous gaps in place.
+	if err := client.RecordVerification(ctx, &store.VerificationRun{
 		ID:              runID,
 		TaskID:          taskID,
 		Sandbox:         meta.Sandbox,
@@ -539,11 +541,8 @@ func Persist(ctx context.Context, client *store.Client, taskID string, gaps []Ga
 		Status:          status,
 		StartedAt:       started.Format(time.RFC3339Nano),
 		FinishedAt:      finished.Format(time.RFC3339Nano),
-	}); err != nil {
-		return fmt.Errorf("run-record: %w", err)
-	}
-	if err := client.GapsReplace(ctx, taskID, toStoreGaps(stored)); err != nil {
-		return fmt.Errorf("gaps-replace: %w", err)
+	}, taskID, toStoreGaps(stored)); err != nil {
+		return fmt.Errorf("verification-record: %w", err)
 	}
 	return nil
 }

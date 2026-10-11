@@ -13,7 +13,8 @@ import (
 )
 
 // storeThatCannotRecordRuns is the real dcstore behind a wrapper that refuses
-// one command, run-record, and passes every other command through. The task
+// the commands that record a run (gaps-replace, which commits the run with its
+// gaps, and run-record), and passes every other command through. The task
 // reads, gap writes and schema setup all reach the real store; only the
 // verification run cannot be recorded.
 //
@@ -28,7 +29,7 @@ func storeThatCannotRecordRuns(t *testing.T) *store.Client {
 	wrapper := filepath.Join(dir, "dcstore")
 	script := "#!/bin/sh\n" +
 		"if [ \"$3\" = serve ]; then echo '{\"ok\":false,\"error\":\"unknown command: serve\"}'; exit 2; fi\n" +
-		"if [ \"$3\" = run-record ]; then echo 'run-record refused by the test wrapper' >&2; exit 1; fi\n" +
+		"if [ \"$3\" = gaps-replace ] || [ \"$3\" = run-record ]; then echo 'run recording refused by the test wrapper' >&2; exit 1; fi\n" +
 		"exec '" + real + "' \"$@\"\n"
 	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
