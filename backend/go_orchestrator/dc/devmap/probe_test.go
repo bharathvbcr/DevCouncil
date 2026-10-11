@@ -191,3 +191,48 @@ func TestBuildRefusesAnOldBinaryBeforeBuilding(t *testing.T) {
 		t.Fatalf("the refusal must precede the build's own work, took %s", elapsed)
 	}
 }
+
+// A caller's cancellation says nothing about the binary. The probe ran under the
+// caller's context and cached whatever came back, so one cancelled request made
+// every later Probe in a long-lived host (Manvi serve) fail for a minute with
+// "presumed hung" about a binary that was never asked.
+func TestACallersCancelIsNotTheBinarysVerdict(t *testing.T) {
+	dir := t.TempDir()
+	bin, _ := countingDevmap(t, dir, "usage: devmap manifest [OPTIONS]\n      --graph-output <PATH>")
+	c := New(bin, dir)
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	_ = c.Probe(cancelled)
+
+	if err := c.Probe(context.Background()); err != nil {
+		t.Fatalf("a live probe after a cancelled one failed: %v", err)
+	}
+}
+
+func TestACancelMidProbeDoesNotPoisonTheNextProbe(t *testing.T) {
+	dir := t.TempDir()
+	script := "#!/bin/sh\nsleep 1\necho '      --graph-output <PATH>'\n"
+	c := New(writeBinary(t, dir, "devmap", script), dir)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(100*time.Millisecond, cancel)
+	_ = c.Probe(ctx)
+
+	if err := c.Probe(context.Background()); err != nil {
+		t.Fatalf("probe after a mid-probe cancel failed: %v", err)
+	}
+}
+
+// "Presumed hung" is a claim about the binary, so it is made only when the
+// probe's own deadline fired.
+func TestPresumedHungNamesOnlyTheProbesOwnDeadline(t *testing.T) {
+	dir := t.TempDir()
+	c := New(writeBinary(t, dir, "devmap", "#!/bin/sh\nsleep 30\n"), dir)
+	c.probeTimeout = 300 * time.Millisecond
+
+	err := c.Probe(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "presumed hung") {
+		t.Fatalf("a binary that never answers must be presumed hung, got %v", err)
+	}
+}

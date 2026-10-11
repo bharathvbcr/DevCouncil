@@ -9,6 +9,7 @@ import (
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/gatescfg"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/verify"
 )
 
 const DefaultLeaseTTL = 15 * time.Minute
@@ -61,6 +62,12 @@ func AppliedSkillNames() []string {
 type LeaseService struct {
 	Store    *store.Client
 	LeaseTTL time.Duration
+	// Root is the project whose .devcouncil/config.yaml names the gate mode.
+	// The mode is read from it on every call, never once per process.
+	Root string
+	// GateMode, when set, pins the mode and Root is not consulted. It is for a
+	// caller that has already decided (a test, an embedder); leave it empty to
+	// follow the config.
 	GateMode string
 }
 
@@ -71,12 +78,37 @@ func (s *LeaseService) ttl() time.Duration {
 	return s.LeaseTTL
 }
 
-func (s *LeaseService) gateMode() string {
-	if s.GateMode == "" {
-		return gatescfg.ModeOff
+// GateState resolves the gate mode for this call: the pinned GateMode if one
+// was set, otherwise the config under Root as it is now. A config that is
+// present but unreadable resolves to enforce with origin invalid.
+func (s *LeaseService) GateState() verify.GateState {
+	if s.GateMode != "" {
+		mode, origin := gatescfg.Normalize(s.GateMode)
+		state := verify.GateState{Mode: mode, Origin: origin}
+		if origin == gatescfg.OriginInvalid {
+			state.Error = fmt.Sprintf("unknown gate mode %q (want off, advisory, or enforce)", s.GateMode)
+		}
+		return state
 	}
-	mode, _ := gatescfg.Normalize(s.GateMode)
-	return mode
+	if s.Root == "" {
+		return verify.GateState{Mode: gatescfg.ModeOff, Origin: gatescfg.OriginDefault}
+	}
+	snap := gatescfg.Resolve(s.Root)
+	return verify.GateState{
+		Mode: snap.VerificationMode, Origin: snap.VerificationOrigin,
+		ConfigPath: snap.ConfigPath, Error: snap.Error,
+	}
+}
+
+// withGateConfigError adds the gate fields to a payload when the config was
+// bad. A healthy config adds nothing, so existing payload shapes are unchanged.
+func withGateConfigError(payload map[string]any, state verify.GateState) map[string]any {
+	if state.Origin == gatescfg.OriginInvalid {
+		payload["gate_mode"] = state.Mode
+		payload["gate_mode_origin"] = state.Origin
+		payload["gate_mode_error"] = state.Error
+	}
+	return payload
 }
 
 // Checkout acquires a lease and returns the Python MCP checkout payload shape.
@@ -135,12 +167,13 @@ func (s *LeaseService) Checkout(ctx context.Context, taskID, clientID, agent str
 	if expected == nil {
 		expected = []string{}
 	}
-	return map[string]any{
+	gate := s.GateState()
+	return withGateConfigError(map[string]any{
 		"ok":                 true,
 		"task_id":            taskID,
 		"lease_token":        lease.Token,
 		"expires_at":         lease.ExpiresAt,
-		"gate_mode":          s.gateMode(),
+		"gate_mode":          gate.Mode,
 		"status":             status,
 		"planned_files":      planned,
 		"allowed_commands":   allowedCmds,
@@ -149,7 +182,7 @@ func (s *LeaseService) Checkout(ctx context.Context, taskID, clientID, agent str
 		"applied_skills":     AppliedSkillNames(),
 		"prompt":             "",
 		"semantic_context":   nil,
-	}
+	}, gate)
 }
 
 // Renew extends a lease; expired returns the Python renew/verify shape.

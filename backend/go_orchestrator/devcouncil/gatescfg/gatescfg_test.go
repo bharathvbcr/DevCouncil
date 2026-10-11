@@ -104,10 +104,13 @@ func TestSetVerificationModePatchesExisting(t *testing.T) {
 	}
 }
 
-func TestNormalizeUnknownIsOffInvalid(t *testing.T) {
+// D8 (2026-10-09): an unrecognised mode is a bad config, and a bad config
+// fails closed. The earlier expectation, off/invalid, let a typo such as
+// `enforced` switch the gate off without a word.
+func TestNormalizeUnknownIsEnforceInvalid(t *testing.T) {
 	mode, origin := Normalize("yolo")
-	if mode != ModeOff || origin != OriginInvalid {
-		t.Fatalf("Normalize(yolo) = %s/%s, want off/invalid", mode, origin)
+	if mode != ModeEnforce || origin != OriginInvalid {
+		t.Fatalf("Normalize(yolo) = %s/%s, want enforce/invalid", mode, origin)
 	}
 }
 
@@ -121,8 +124,11 @@ func TestLoadBrokenYAMLIsPresentInvalid(t *testing.T) {
 		t.Fatal(err)
 	}
 	snap := Load(root)
-	if snap.VerificationMode != ModeOff {
-		t.Fatalf("broken YAML must not enforce: %+v", snap)
+	if snap.VerificationMode != ModeEnforce {
+		t.Fatalf("broken YAML must fail closed: %+v", snap)
+	}
+	if snap.Error == "" {
+		t.Fatalf("broken YAML must carry its error: %+v", snap)
 	}
 	if !snap.ConfigPresent {
 		t.Fatal("broken file must not look like a missing file")
@@ -188,4 +194,83 @@ func TestSetVerificationModeCreatesStub(t *testing.T) {
 		t.Fatalf("%s", body)
 	}
 	_ = snap
+}
+
+func writeCfg(t *testing.T, root, body string) string {
+	t.Helper()
+	dir := filepath.Join(root, ".devcouncil")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestMissingConfigIsTheOnlyDefault(t *testing.T) {
+	snap := Resolve(t.TempDir())
+	if snap.VerificationMode != ModeOff || snap.VerificationOrigin != OriginDefault || snap.Error != "" {
+		t.Fatalf("missing config = %+v, want off/default with no error", snap)
+	}
+}
+
+func TestUnreadableConfigFailsClosed(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads chmod-000 files")
+	}
+	root := t.TempDir()
+	path := writeCfg(t, root, "gates:\n  mode: off\n")
+	if err := os.Chmod(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+	for _, snap := range []Snapshot{Load(root), Resolve(root)} {
+		if snap.VerificationMode != ModeEnforce || snap.VerificationOrigin != OriginInvalid {
+			t.Fatalf("unreadable config = %+v, want enforce/invalid", snap)
+		}
+		if snap.Error == "" || !snap.ConfigPresent {
+			t.Fatalf("unreadable config must report its error and presence: %+v", snap)
+		}
+	}
+}
+
+func TestScalarGatesAndUnknownModeFailClosed(t *testing.T) {
+	for name, body := range map[string]string{
+		"scalar gates": "gates: off\n",
+		"typo mode":    "gates:\n  mode: enforced\n",
+	} {
+		root := t.TempDir()
+		writeCfg(t, root, body)
+		snap := Resolve(root)
+		if snap.VerificationMode != ModeEnforce || snap.VerificationOrigin != OriginInvalid || snap.Error == "" {
+			t.Errorf("%s = %+v, want enforce/invalid with an error", name, snap)
+		}
+	}
+}
+
+// Resolve is read per call, so `gate set` reaches a host that is already
+// running, and chmod-ing a file that was read fine a moment ago is noticed.
+func TestResolveFollowsTheFileWithoutRestart(t *testing.T) {
+	root := t.TempDir()
+	path := writeCfg(t, root, "gates:\n  mode: off\n")
+	if got := Resolve(root).VerificationMode; got != ModeOff {
+		t.Fatalf("first resolve = %s, want off", got)
+	}
+	if err := SetVerificationMode(path, "enforce"); err != nil {
+		t.Fatal(err)
+	}
+	if got := Resolve(root).VerificationMode; got != ModeEnforce {
+		t.Fatalf("after gate set = %s, want enforce", got)
+	}
+	if os.Geteuid() != 0 {
+		if err := os.Chmod(path, 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+		if got := Resolve(root); got.VerificationOrigin != OriginInvalid {
+			t.Fatalf("after chmod 000 a cached read was served: %+v", got)
+		}
+	}
 }

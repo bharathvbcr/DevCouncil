@@ -68,6 +68,9 @@ type Client struct {
 	// this process knowing.
 	probeErr error
 	probedAt time.Time
+	// probing is non-nil while a probe is running, and closes when it has
+	// recorded its verdict. Concurrent callers share the one probe.
+	probing chan struct{}
 	// probeTimeout bounds one probe. It is a field for the same reason
 	// maxOutput is: tests drive it instead of waiting out seconds.
 	probeTimeout time.Duration
@@ -118,23 +121,44 @@ func New(binary, root string) *Client {
 // in DevCouncil's client the equivalent condition cost 123 seconds per call,
 // once per call, forever — here it costs one bounded probe, then immediate
 // errors, then one retry a minute later to notice a repaired install.
+//
+// The probe runs under its own deadline, detached from the caller's context,
+// and its verdict is cached whatever happens to the caller. A caller that is
+// cancelled stops waiting and gets its own context error back — uncached,
+// because a caller's cancellation says nothing about the binary — while the
+// probe finishes for whoever asks next. Before this, one cancelled request
+// cached "presumed hung" for a minute in a long-lived host.
 func (c *Client) Probe(ctx context.Context) error {
 	c.probeMu.Lock()
-	defer c.probeMu.Unlock()
-
-	now := time.Now()
-	if !c.probedAt.IsZero() {
-		if c.probeErr == nil {
-			return nil
-		}
-		if now.Sub(c.probedAt) < probeCooldown {
-			return c.probeErr
+	if !c.probedAt.IsZero() && c.probing == nil {
+		if c.probeErr == nil || time.Since(c.probedAt) < probeCooldown {
+			err := c.probeErr
+			c.probeMu.Unlock()
+			return err
 		}
 	}
+	if c.probing == nil {
+		done := make(chan struct{})
+		c.probing = done
+		go func() {
+			err := c.runProbe(context.WithoutCancel(ctx))
+			c.probeMu.Lock()
+			c.probeErr, c.probedAt, c.probing = err, time.Now(), nil
+			c.probeMu.Unlock()
+			close(done)
+		}()
+	}
+	done := c.probing
+	c.probeMu.Unlock()
 
-	c.probeErr = c.runProbe(ctx)
-	c.probedAt = now
-	return c.probeErr
+	select {
+	case <-done:
+		c.probeMu.Lock()
+		defer c.probeMu.Unlock()
+		return c.probeErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // runProbe executes one capability question against the binary.

@@ -32,6 +32,11 @@ type Input struct {
 	Store    *store.Client
 	TaskID   string
 	GateMode string
+	// GateOrigin, GateConfigPath and GateConfigError say where GateMode came
+	// from; see verify.GateState. Empty when the caller pinned the mode.
+	GateOrigin      string
+	GateConfigPath  string
+	GateConfigError string
 	// Sandbox is the isolation requested; empty means local. Anything
 	// verify.ParseSandbox refuses produces a skipped decision.
 	Sandbox string
@@ -96,7 +101,9 @@ func Run(ctx context.Context, in Input) Outcome {
 	}
 	// Passed through as asked. VerifyTask refuses an isolation it cannot
 	// provide, which lands below as a skipped, non-allowing decision.
-	mcp, gaps, err := verify.VerifyTask(ctx, in.Root, in.Store, in.TaskID, gateMode, in.Sandbox, in.CoveragePath)
+	mcp, gaps, err := verify.VerifyTask(ctx, in.Root, in.Store, in.TaskID, verify.GateState{
+		Mode: gateMode, Origin: in.GateOrigin, ConfigPath: in.GateConfigPath, Error: in.GateConfigError,
+	}, in.Sandbox, in.CoveragePath)
 	if err != nil {
 		return Outcome{Decision: Result{
 			OK: false, Allow: false, Skipped: true,
