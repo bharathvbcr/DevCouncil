@@ -863,8 +863,11 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // v88 is the dead-policy lane's payload (Rust/Kotlin/Swift keys, receivers
     // and module-privacy scopes, `project.pbxproj`, and a qualified JS/TS base
     // as one Heritage reference per segment).
+    //
+    // v89 types a Rust `dyn Trait` / `impl Trait` binding by its trait, and
+    // records a literal Python `importlib.import_module` as a module handle.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "88",
+        EXTRACTION_SCHEMA_VERSION, "89",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

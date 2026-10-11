@@ -10,14 +10,14 @@
     "present": 55
   },
   "python": {
-    "known_failing": 2,
+    "known_failing": 1,
     "positive_rows": 49,
-    "present": 47
+    "present": 48
   },
   "rust": {
-    "known_failing": 13,
+    "known_failing": 3,
     "positive_rows": 106,
-    "present": 93
+    "present": 103
   },
   "swift": {
     "known_failing": 0,

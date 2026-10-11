@@ -338,6 +338,10 @@ pub struct Resolver {
     /// `<file>::<exported name>` -> the file that declares it, for
     /// `export { x } from './m'`. See `compute_reexport_chains`.
     reexport_chains: BTreeMap<String, String>,
+    /// Rust: `<file>` -> the module files its `pub use m::*;` globs name. A
+    /// module path segment that is no child of a file may be a module one of
+    /// these publishes (see `rust_module_through_globs`).
+    rust_module_globs: BTreeMap<String, Vec<String>>,
     /// `<file>` -> the local binding its `export default` publishes. What an
     /// importer's `import X from` and a barrel's `export { default } from` ask
     /// for by the name `default`; see `default_binding`.
@@ -648,6 +652,7 @@ impl Resolver {
             rust_signatures: BTreeMap::new(),
             unexported_symbols: BTreeSet::new(),
             reexport_chains: BTreeMap::new(),
+            rust_module_globs: BTreeMap::new(),
             default_exports: BTreeMap::new(),
             receiver_types: BTreeMap::new(),
             scoped_receiver_types: BTreeMap::new(),
@@ -1895,8 +1900,65 @@ impl Resolver {
             nominal = self.declaring_type_of(callee_file, callee)?.to_string();
         }
         (self.unique_indexed_type(LangFamily::Rust, &nominal)
+            || self.unique_indexed_trait(&nominal)
             || self.names_one_type_in_both(file, callee_file, &nominal))
         .then_some(nominal)
+    }
+
+    /// A Rust receiver typed `T`, where `T` is a generic parameter of the
+    /// calling fn: the one trait that bounds it (`fn f<T: Render>(t: &T)`), so
+    /// the call reaches that trait's declaration of the method. A generic with
+    /// no usable bound, or several, is no type at all — `None`, rather than
+    /// letting a struct elsewhere that happens to be called `T` answer.
+    /// Any other type, and every other family, passes through unchanged.
+    fn rust_generic_receiver_type(
+        &self,
+        file: &str,
+        family: LangFamily,
+        caller: Option<&str>,
+        ty: String,
+    ) -> Option<String> {
+        use devmap_extract::rustsig::{generic_param, parse_header, GenericParam};
+        if family != LangFamily::Rust {
+            return Some(ty);
+        }
+        let Some(header) = caller
+            .and_then(|caller| {
+                self.rust_signatures
+                    .get(&(file.to_string(), caller.to_string()))
+            })
+            .and_then(|signature| parse_header(signature))
+        else {
+            return Some(ty);
+        };
+        match generic_param(&header, &ty) {
+            GenericParam::NotDeclared => Some(ty),
+            GenericParam::OneTrait(bound) => Some(bound.to_string()),
+            GenericParam::Other => None,
+        }
+    }
+
+    /// Whether exactly one indexed Rust declaration of this name exists and it
+    /// is a trait: what `-> impl Render` / `-> Box<dyn Render>` names. A name
+    /// that is a trait in one crate and a struct in another is not one.
+    fn unique_indexed_trait(&self, name: &str) -> bool {
+        let mut rust = self.symbol_index.get(name).into_iter().flatten().filter(
+            |(_, kind, candidate_family, _)| {
+                LangFamily::Rust.admits(*candidate_family)
+                    && matches!(
+                        kind,
+                        SymbolKind::Class
+                            | SymbolKind::Struct
+                            | SymbolKind::Enum
+                            | SymbolKind::Interface
+                            | SymbolKind::Trait
+                    )
+            },
+        );
+        matches!(
+            (rust.next(), rust.next()),
+            (Some((_, SymbolKind::Trait, _, _)), None)
+        )
     }
 
     /// The type a Rust binding has according to a **function header** in the
@@ -2064,6 +2126,16 @@ impl Resolver {
         // are transparent. `Vec<Service>` is still refused here, exactly as
         // before, because `Vec` is not in that list.
         s = devmap_extract::deref::strip_deref_transparent(s);
+        // A Rust trait object or opaque type, `dyn Render` / `impl Render`: the
+        // value is "some Render", so the trait is the type a method on it is
+        // looked up in — which reaches the trait's declaration of the method,
+        // never an impl's (see `protocol_dispatch`). Only one named bound
+        // qualifies; auto traits and lifetimes add nothing a method can come
+        // from, but `dyn A + B` names two traits and is refused.
+        let s = match s.strip_prefix("dyn ").or_else(|| s.strip_prefix("impl ")) {
+            Some(bounds) => devmap_extract::rustsig::single_trait_bound(bounds)?,
+            None => s,
+        };
         if s.is_empty()
             || s.contains('<')
             || s.contains('>')
@@ -2826,6 +2898,7 @@ impl Resolver {
         self.rust_signatures.clear();
         self.unexported_symbols.clear();
         self.reexport_chains.clear();
+        self.rust_module_globs.clear();
         self.default_exports.clear();
         self.receiver_types.clear();
         self.scoped_receiver_types.clear();
@@ -3306,6 +3379,7 @@ impl Resolver {
             })
             .collect();
         self.reexport_chains = self.compute_reexport_chains(extractions);
+        self.rust_module_globs = self.compute_rust_module_globs(extractions);
 
         // Pass two resolves aliases and receiver hints against the complete
         // universe built above.
@@ -3406,11 +3480,7 @@ impl Resolver {
                 // file edge, which the resolution pass emits.
                 if let Some(load) = &imp.path_load {
                     if let Some(local) = imp.alias.as_ref() {
-                        if let Some(target) = self.resolve_path_load(
-                            &ext.file_path,
-                            &imp.module_specifier,
-                            load.anchor_up,
-                        ) {
+                        if let Some(target) = self.resolve_loaded_module(ext, imp, load) {
                             file_path_modules.insert((load.scope.clone(), local.clone()), target);
                         }
                     }
@@ -4222,6 +4292,34 @@ impl Resolver {
         }
     }
 
+    /// Every Rust `pub use m::*;` as `(file, the one module file m names)`.
+    fn compute_rust_module_globs(
+        &self,
+        extractions: &[Extraction],
+    ) -> BTreeMap<String, Vec<String>> {
+        let mut globs: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for ext in extractions
+            .iter()
+            .filter(|ext| LangFamily::from_lang(&ext.language) == LangFamily::Rust)
+        {
+            for export in ext
+                .exports
+                .iter()
+                .filter(|export| export.exported_name == "*")
+            {
+                let Some(specifier) = export.module_specifier.as_deref() else {
+                    continue;
+                };
+                if let Some(target) =
+                    self.resolve_import_path(&ext.file_path, &ext.language, specifier)
+                {
+                    globs.entry(ext.file_path.clone()).or_default().push(target);
+                }
+            }
+        }
+        globs
+    }
+
     fn compute_reexport_chains(&self, extractions: &[Extraction]) -> BTreeMap<String, String> {
         // One hop per re-export, keyed by the re-exporting file's own name for
         // the symbol.
@@ -4449,11 +4547,7 @@ impl Resolver {
                     let targets = match &imp.path_load {
                         // A `sys.path` entry is not an import of anything.
                         Some(load) if load.kind == PathLoadKind::SearchDirectory => continue,
-                        Some(load) => match self.resolve_path_load(
-                            &ext.file_path,
-                            &imp.module_specifier,
-                            load.anchor_up,
-                        ) {
+                        Some(load) => match self.resolve_loaded_module(ext, imp, load) {
                             // Already linked: neither a second edge nor a
                             // spurious "resolved to nothing" row.
                             Some(target) if !path_loaded.insert(target.clone()) => continue,
@@ -4768,6 +4862,14 @@ impl Resolver {
                                 site_binding,
                             )
                             .filter(|_| family.admits(family))
+                            .and_then(|ty| {
+                                self.rust_generic_receiver_type(
+                                    &ext.file_path,
+                                    family,
+                                    call.caller_symbol.as_deref(),
+                                    ty,
+                                )
+                            })
                         {
                             // Python names its class: the file's own `class`
                             // statement, else the import that bound it. A flat
@@ -4804,8 +4906,10 @@ impl Resolver {
                                 .filter(|_| !class_is_known);
                             // Swift: a method the type does not write is the one
                             // a protocol extension or base class supplies.
+                            // Rust: a method the impl does not write is the
+                            // default body of a trait the type implements.
                             let inherited = (own.is_none()
-                                && family == LangFamily::Swift
+                                && matches!(family, LangFamily::Swift | LangFamily::Rust)
                                 && !self.type_methods.contains_key(&key))
                             .then(|| self.inherited_method(family, &class_type, &call.callee_name))
                             .flatten();
@@ -4817,9 +4921,11 @@ impl Resolver {
                                 })
                             {
                                 resolution = Some(match family {
-                                    // A receiver typed by a protocol is a call
-                                    // through it: see `protocol_dispatch`.
-                                    LangFamily::Swift => self
+                                    // A receiver typed by a protocol (Swift) or a
+                                    // trait (Rust: `dyn T`, `impl T`, a `T`
+                                    // bound) is a call through it: see
+                                    // `protocol_dispatch`.
+                                    LangFamily::Swift | LangFamily::Rust => self
                                         .protocol_dispatch(family, &class_type, &call.callee_name)
                                         .map(|(direct, targets)| {
                                             self.dispatch_through_interface(
@@ -4862,6 +4968,35 @@ impl Resolver {
                                         receiver_type: receiver_type.clone(),
                                     })
                                 }));
+                            }
+                        }
+                    }
+
+                    // 1a. A Rust path through a generic parameter: `T::create()`
+                    // inside `fn f<T: Factory>()` names `Factory::create`, the
+                    // one declaration the bound states. Which impl runs is the
+                    // caller's choice of `T`, so each one is a dispatch candidate.
+                    if resolution.is_none() && family == LangFamily::Rust {
+                        if let Some(bound) = call
+                            .receiver_expr
+                            .as_deref()
+                            .filter(|recv| Self::is_plain_ident(recv))
+                            .and_then(|recv| {
+                                self.rust_generic_receiver_type(
+                                    &ext.file_path,
+                                    family,
+                                    call.caller_symbol.as_deref(),
+                                    recv.to_string(),
+                                )
+                                .filter(|bound| bound != recv)
+                            })
+                        {
+                            if let Some((direct, targets)) =
+                                self.protocol_dispatch(family, &bound, &call.callee_name)
+                            {
+                                resolution = Some(self.dispatch_through_interface(
+                                    ext, call, &mut edges, &bound, direct, targets,
+                                ));
                             }
                         }
                     }
@@ -4933,7 +5068,9 @@ impl Resolver {
                                     // Inside a protocol extension `self` is any
                                     // conformer: `greet()` written in `extension
                                     // Greeter` is a call through the protocol.
-                                    let through_protocol = (family == LangFamily::Swift)
+                                    // A Rust trait's default body is the same:
+                                    // `self.hook()` there is any implementor's.
+                                    let through_protocol = matches!(family, LangFamily::Swift | LangFamily::Rust)
                                         .then(|| self.self_type_at(&ext.file_path, family, caller))
                                         .flatten()
                                         .and_then(|own| {
@@ -6565,6 +6702,36 @@ impl Resolver {
         self.consider_indexed(found, format!("{joined}/mod.rs"));
     }
 
+    /// The module file `tail` names below the one crate root in `roots`, when
+    /// a segment is not a child module of the file before it but a module that
+    /// file's glob re-export publishes: `pub use geo::*;` in `lib.rs` makes
+    /// `crate::point` mean `geo`'s `mod point`. Each segment must name exactly
+    /// one file, so a module two globs bring in is no answer. Empty on any
+    /// doubt.
+    fn rust_module_through_globs(&self, roots: &[String], tail: &str) -> Vec<String> {
+        let [root] = roots else {
+            return Vec::new();
+        };
+        let mut current = root.clone();
+        for segment in tail.split("::") {
+            let mut next = Vec::new();
+            self.consider_module_rel(&mut next, &Self::rust_call_base(&current), segment);
+            // A name the file itself declares shadows anything a glob brings.
+            if next.is_empty() && self.symbol_kind_in(&current, segment).is_none() {
+                for glob in self.rust_module_globs.get(&current).into_iter().flatten() {
+                    self.consider_module_rel(&mut next, &Self::rust_call_base(glob), segment);
+                }
+            }
+            next.sort();
+            next.dedup();
+            let [only] = next.as_slice() else {
+                return Vec::new();
+            };
+            current = only.clone();
+        }
+        vec![current]
+    }
+
     /// Indexed files the whole path names, with no segment popped.
     ///
     /// `resolve_import_path` walks a `use` by dropping a trailing type name
@@ -6588,6 +6755,11 @@ impl Resolver {
         }
         if let Some(tail) = path.strip_prefix("crate::") {
             self.consider_module_rel(&mut found, &Self::rust_crate_src_root(file), tail);
+            if found.is_empty() {
+                let mut roots = Vec::new();
+                self.consider_crate_root_files(&mut roots, &Self::rust_crate_src_root(file));
+                found = self.rust_module_through_globs(&roots, tail);
+            }
             return found;
         }
         if let Some(tail) = path.strip_prefix("self::") {
@@ -6616,6 +6788,11 @@ impl Resolver {
             RustPathRoot::Crate(src_root) => {
                 if let Some((_, tail)) = path.split_once("::") {
                     self.consider_module_rel(&mut found, &src_root, tail);
+                    if found.is_empty() {
+                        let mut roots = Vec::new();
+                        self.consider_indexed(&mut roots, format!("{src_root}/lib.rs"));
+                        found = self.rust_module_through_globs(&roots, tail);
+                    }
                 } else {
                     // A crate *name* is the library target. A package with
                     // both `lib.rs` and `main.rs` is not ambiguous to an
@@ -7988,7 +8165,8 @@ impl Resolver {
     }
 
     /// Swift: the protocol method `method` of `protocol`, and the in-repo
-    /// conformers' declarations of it.
+    /// conformers' declarations of it. Rust: the same for a trait and its
+    /// `impl Trait for Type` implementors.
     ///
     /// `None` unless `protocol` is one indexed protocol declaration that
     /// declares `method` exactly once. The conformers are the protocol's
@@ -8007,7 +8185,7 @@ impl Resolver {
             let mut kinds = hits
                 .iter()
                 .filter(|(_, _, candidate, _)| family.admits(*candidate));
-            kinds.all(|(_, kind, _, _)| *kind == SymbolKind::Interface)
+            kinds.all(|(_, kind, _, _)| matches!(kind, SymbolKind::Interface | SymbolKind::Trait))
         });
         if !is_protocol || !self.type_name_is_identifiable(family, protocol) {
             return None;
@@ -8517,6 +8695,28 @@ impl Resolver {
             }
         }
         Vec::new()
+    }
+
+    /// The one indexed file a Python module handle's load names: by path
+    /// ([`Self::resolve_path_load`]), or — for `importlib.import_module` with a
+    /// literal — by module name, exactly as `import <name>` here would resolve
+    /// it, and only when that names one file.
+    fn resolve_loaded_module(
+        &self,
+        ext: &Extraction,
+        imp: &ExtractedImport,
+        load: &devmap_extract::model::PathLoad,
+    ) -> Option<String> {
+        if load.kind == PathLoadKind::ModuleName {
+            let mut targets = self.resolve_import_targets_or_search_dirs(ext, imp);
+            targets.sort();
+            targets.dedup();
+            return match targets.as_slice() {
+                [only] => Some(only.clone()),
+                _ => None,
+            };
+        }
+        self.resolve_path_load(&ext.file_path, &imp.module_specifier, load.anchor_up)
     }
 
     /// The indexed file a Python path load names, or `None`.

@@ -249,3 +249,54 @@ fn a_glob_import_binds_the_modules_whole_surface() {
          its evidence entitles it to"
     );
 }
+
+/// `pub use geo::*;` in the crate root republishes `geo`'s child module
+/// `point`, so `crate::point::dist()` names `src/geo/point.rs::dist` — the one
+/// file the glob makes `point` mean. A name two globs bring in means nothing.
+#[test]
+fn a_module_a_glob_reexports_is_a_path_segment() {
+    let lib =
+        "pub mod geo;\npub use geo::*;\n\npub fn caller() -> f64 {\n    crate::point::dist()\n}\n";
+    let (_, result) = resolve(&[
+        ("src/lib.rs", lib),
+        ("src/geo.rs", "pub mod point;\n"),
+        ("src/geo/point.rs", "pub fn dist() -> f64 {\n    1.0\n}\n"),
+    ]);
+    assert!(
+        result
+            .edges
+            .iter()
+            .any(|e| e.source_symbol == "src/lib.rs::caller"
+                && e.target_symbol == "src/geo/point.rs::dist"),
+        "{:?}",
+        result
+            .edges
+            .iter()
+            .map(|e| (&e.source_symbol, &e.target_symbol))
+            .collect::<Vec<_>>()
+    );
+
+    let lib = "pub mod geo;\npub mod geo2;\npub use geo::*;\npub use geo2::*;\n\n\
+pub fn caller() -> f64 {\n    crate::point::dist()\n}\n";
+    let (_, result) = resolve(&[
+        ("src/lib.rs", lib),
+        ("src/geo.rs", "pub mod point;\n"),
+        ("src/geo/point.rs", "pub fn dist() -> f64 {\n    1.0\n}\n"),
+        ("src/geo2.rs", "pub mod point;\n"),
+        ("src/geo2/point.rs", "pub fn dist() -> f64 {\n    2.0\n}\n"),
+    ]);
+    assert!(
+        !result
+            .edges
+            .iter()
+            .any(|e| e.source_symbol == "src/lib.rs::caller"
+                && e.target_symbol.ends_with("point.rs::dist")
+                && e.confidence.to_millis() >= 900),
+        "two globs publish `point`: {:?}",
+        result
+            .edges
+            .iter()
+            .map(|e| (&e.source_symbol, &e.target_symbol))
+            .collect::<Vec<_>>()
+    );
+}

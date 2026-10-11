@@ -78,6 +78,8 @@ mod primary_languages;
 #[cfg(feature = "parse")]
 mod python_class_identity;
 #[cfg(feature = "parse")]
+mod python_import_module_literal;
+#[cfg(feature = "parse")]
 mod python_module_constants;
 #[cfg(feature = "parse")]
 mod python_modules_loaded_by_path;
@@ -110,6 +112,8 @@ mod rust_qualified_path_calls;
 mod rust_qualified_super_calls;
 #[cfg(feature = "parse")]
 mod rust_self_type;
+#[cfg(feature = "parse")]
+mod rust_trait_dispatch;
 #[cfg(feature = "parse")]
 mod same_file_type_position;
 #[cfg(feature = "parse")]

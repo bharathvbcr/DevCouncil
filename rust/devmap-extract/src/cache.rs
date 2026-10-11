@@ -657,7 +657,17 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// innermost first, as Python's dotted bases already were. A v87 row keeps the
 /// old Rust keys and lacks every one of those facts. It landed after the
 /// Kotlin lane, so it is 88.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "88";
+///
+/// v89 types a Rust parameter, local or field written `dyn Trait` / `impl
+/// Trait` (bare, behind a reference, or in a `Box`/`Rc`/`Arc`) by its one named
+/// trait, so a method call on it reaches the trait's declaration. A v88 row
+/// leaves such a binding untyped, so the call would stay an unattributed miss
+/// from a warm cache until the file was edited. It also records a Python
+/// `importlib.import_module("pkg.mod")` with a literal name as a scoped module
+/// handle (`PathLoadKind::ModuleName`), which a v88 row lacks, so `mod.f()`
+/// through it would stay unresolved. The resolver-accuracy lane stamped 88
+/// on this payload; it landed after the dead-policy lane, so it is 89.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "89";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
