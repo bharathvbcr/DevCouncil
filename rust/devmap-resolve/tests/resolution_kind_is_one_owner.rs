@@ -53,6 +53,11 @@ fn every_variant() -> Vec<Resolution> {
             server: "rust-analyzer".to_string(),
             server_version: "0.0.0".to_string(),
         },
+        Resolution::Dispatch {
+            candidates: vec![(file.clone(), symbol.clone())].into(),
+            via_file: file.clone(),
+            via_symbol: symbol.clone(),
+        },
         Resolution::Unresolved {
             reason: "no declaration".to_string(),
         },
@@ -122,6 +127,7 @@ fn a_resolution_scores_exactly_what_its_kind_scores() {
         ResolutionKind::LanguageServerDispatch.confidence(),
         Confidence::SPECULATIVE
     );
+    assert_eq!(ResolutionKind::Dispatch.confidence(), Confidence::LOW);
     assert_eq!(
         ResolutionKind::Unresolved.confidence(),
         Confidence::SPECULATIVE

@@ -576,18 +576,16 @@ mod build {
                             results: self.result_types(child, 0),
                         });
                     }
-                    "type_elem" => {
+                    "type_elem" if child.named_child_count() == 1 => {
                         // One named type is an embedded interface; a union or a
                         // `~T` term is a type-set constraint and adds no method.
-                        if child.named_child_count() == 1 {
-                            if let Some(only) = child.named_child(0) {
-                                if matches!(
-                                    only.kind(),
-                                    "type_identifier" | "qualified_type" | "generic_type"
-                                ) {
-                                    embeds.push(self.ty(only, 0));
-                                }
-                            }
+                        if let Some(only) = child.named_child(0).filter(|only| {
+                            matches!(
+                                only.kind(),
+                                "type_identifier" | "qualified_type" | "generic_type"
+                            )
+                        }) {
+                            embeds.push(self.ty(only, 0));
                         }
                     }
                     _ => {}
