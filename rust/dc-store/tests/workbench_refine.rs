@@ -446,10 +446,10 @@ fn schema_twelve_upgrades_eleven_and_refuses_what_is_newer() {
     };
     // The rung is a hard fence: the stored version is the one a build that
     // knows only schema 11 compares with `!=` and refuses.
-    assert_eq!(version(), 12);
-    assert_eq!(dc_store::workbench::WORKBENCH_SCHEMA, 12);
+    assert_eq!(version(), 13);
+    assert_eq!(dc_store::workbench::WORKBENCH_SCHEMA, 13);
     s.connection()
-        .execute_batch("UPDATE work_meta SET version=13 WHERE id=1")
+        .execute_batch("UPDATE work_meta SET version=14 WHERE id=1")
         .unwrap();
     refuse(&s, "enhancements.list", "{}", "schema_unsupported");
 }

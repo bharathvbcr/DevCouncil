@@ -27,7 +27,7 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// version is refused, so every host sharing a profile must be built at the
 /// same one; `dcstore --version` reports it so a host can check that before
 /// handing a profile to a store it did not build.
-pub const WORKBENCH_SCHEMA: i64 = 12;
+pub const WORKBENCH_SCHEMA: i64 = 13;
 const MAX_INTEGER: i64 = 9_007_199_254_740_990;
 // Reserve envelope/cursor space within a 2 MiB response. The collector stops
 // fetching rows at this bound, including for full revision and event documents.
@@ -401,6 +401,14 @@ fn migrate_step(conn: &Connection, from: i64) -> Result<()> {
             // hosts must refuse this profile.
             conn.execute("UPDATE work_meta SET version=12 WHERE id=1", [])?;
         }
+        12 => {
+            // A request's receipt keeps its sequence instead of a copy of the
+            // response, and a retry rebuilds the response from the event. A
+            // schema 12 host would replay that short receipt verbatim as the
+            // response, so older hosts must refuse this profile. Receipts
+            // already stored in full keep replaying as written.
+            conn.execute("UPDATE work_meta SET version=13 WHERE id=1", [])?;
+        }
         other => {
             return Err(Error {
                 code: "schema_unsupported",
@@ -701,7 +709,7 @@ fn receipt_response(conn: &Connection, response: &str) -> Result<String> {
 /// fails loudly rather than answering a retry with something else.
 fn replay_response(conn: &Connection, stored: &str) -> Result<String> {
     let marked: bool = conn.query_row(
-        "SELECT json_extract(?1,'$.replay')='event'",
+        "SELECT coalesce(json_extract(?1,'$.replay')='event',0)",
         [stored],
         |r| r.get(0),
     )?;

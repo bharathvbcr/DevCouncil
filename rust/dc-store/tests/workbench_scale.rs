@@ -207,3 +207,55 @@ fn a_new_profile_reclaims_pages_when_retention_frees_them() {
         "{report}"
     );
 }
+
+fn stored_version(s: &Store) -> i64 {
+    s.connection()
+        .query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// A build that knows schema 12 replays whatever a receipt stores as the
+/// response and refuses any profile whose version is not 12. A short receipt
+/// replayed that way would answer a retry with a response that has no record
+/// in it, so every profile the new code writes short receipts into must carry
+/// a version that build refuses.
+#[test]
+fn a_profile_holding_short_receipts_is_stamped_past_what_schema_twelve_accepts() {
+    let s = store_with_task(1);
+    let stored: String = s
+        .connection()
+        .query_row(
+            "SELECT response FROM work_requests WHERE id='put-0'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(json::<Option<String>>(&s, &stored, "$.replay").is_some());
+    assert!(json::<Option<String>>(&s, &stored, "$.item").is_none());
+    assert_eq!(dc_store::workbench::WORKBENCH_SCHEMA, 13);
+    assert_ne!(
+        stored_version(&s),
+        12,
+        "a schema 12 host would replay the short receipt as a response"
+    );
+}
+
+#[test]
+fn an_upgraded_schema_twelve_profile_still_replays_its_full_receipts() {
+    let s = store_with_task(1);
+    let raw = r#"{"id":"t","request_id":"put-0","expected_revision":0,"title":"Task 0","repository_ids":["r0"],"primary_repository_id":"r0"}"#;
+    let original = call(&s, "items.put", raw);
+    // Rewrite the receipt as schema 12 stored it: the whole response.
+    s.connection()
+        .execute(
+            "UPDATE work_requests SET response=?1 WHERE id='put-0'",
+            [&original],
+        )
+        .unwrap();
+    s.connection()
+        .execute_batch("UPDATE work_meta SET version=12 WHERE id=1")
+        .unwrap();
+    s.upgrade_workbench_profile().unwrap();
+    assert_eq!(stored_version(&s), 13);
+    assert_eq!(call(&s, "items.put", raw), original);
+}

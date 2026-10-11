@@ -825,7 +825,7 @@ fn schema_four_upgrade_rolls_back_on_conflict_and_preserves_existing_tasks() {
             .query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r
                 .get::<_, i64>(0))
             .unwrap(),
-        12
+        13
     );
 }
 
