@@ -80,5 +80,8 @@ unchanged query plans, not separately measured on a compacted fixture).
   so existing profiles report `incremental:false` and keep their size until that is run.
 - Measured by `cargo test -p dc-store --release --test workbench_scale_bench -- --ignored --nocapture`
   (5,000 repositories, one task with 5,000 4 KB revisions, Apple silicon, min of 5):
-  find by identity 34.8 ms / 23 requests before, 0.05 ms / 1 after; last revision 115.6 ms /
-  25 requests before, 0.21 ms / 1 after; receipt 77 bytes instead of body plus envelope.
+  find by identity 17-35 ms / 23 requests before, 0.04-0.05 ms / 1 after; last revision
+  53-116 ms / 25 requests before, 0.21 ms / 1 after (two runs, machine under other load);
+  receipt 77 bytes instead of body plus envelope; reopening the 71 MiB profile and
+  answering one find 0.78 ms, so the MCP binary's per-call reopen is not the bottleneck
+  and was left alone.

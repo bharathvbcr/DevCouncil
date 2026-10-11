@@ -130,6 +130,14 @@ fn registry_and_history_lookups_at_5k_by_5k() {
     let events_page = min_of_five(|| {
         call(&s, "events.list", r#"{"limit":200}"#);
     });
+    let reopen = min_of_five(|| {
+        let again = Store::open(&db).unwrap();
+        call(
+            &again,
+            "repositories.get",
+            &format!(r#"{{"identity_key":"{identity}"}}"#),
+        );
+    });
     let size = std::fs::metadata(&db).unwrap().len();
     println!(
         "find by identity   (5k repos):     before {find_before:?} in {requests_before} requests, after {find_after:?} in 1"
@@ -141,5 +149,6 @@ fn registry_and_history_lookups_at_5k_by_5k() {
     println!(
         "average receipt response after: {receipt_bytes} bytes (a 4000-byte body plus envelope before)"
     );
+    println!("reopen the profile and answer one find (what an MCP call pays): {reopen:?}");
     println!("profile file: {} MiB", size / (1024 * 1024));
 }
