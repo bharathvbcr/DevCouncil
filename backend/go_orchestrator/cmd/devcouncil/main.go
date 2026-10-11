@@ -127,6 +127,9 @@ Usage:
   devcouncil hook status|disable [--project-root DIR] [--client HOST]
   devcouncil integrate HOST [--apply|--check|--dry-run] [--project-root DIR] [--devmap-bin PATH]
                                    default --check: exits 1 if a file differs or is missing, 3 if devmap refused
+  devcouncil integrate HOST --remove [--apply|--check|--dry-run]
+                                   take back what the last --apply registered, following its receipt
+                                   (.devcouncil-integrate-HOST.json); default --check
   devcouncil integrations …        Alias of integrate
   devcouncil integrate uninstall --target hooks [--dry-run] [--project-root DIR]
   devcouncil skills list
@@ -512,6 +515,7 @@ func runIntegrate(args []string) int {
 		return 0
 	}
 	opts := integrate.Options{Host: args[0], Mode: integrate.ModeCheck}
+	remove := false
 	modeSet := false
 	setMode := func(mode integrate.Mode) bool {
 		if modeSet && opts.Mode != mode {
@@ -526,6 +530,8 @@ func runIntegrate(args []string) int {
 		case "--help", "-h":
 			usage()
 			return 0
+		case "--remove":
+			remove = true
 		case "--apply":
 			if !setMode(integrate.ModeApply) {
 				return 2
@@ -577,6 +583,9 @@ func runIntegrate(args []string) int {
 	opts.Root = root
 	self, _ := os.Executable()
 	opts.SelfBin = self
+	if remove {
+		return runIntegrateRemove(opts)
+	}
 	receipt, err := integrate.Run(opts)
 	if err != nil {
 		console.Errorf("integrate: %v\n", err)
@@ -608,6 +617,36 @@ func runIntegrate(args []string) int {
 		if drifted := receipt.Drifted(); len(drifted) > 0 {
 			console.Errorf("integrate --check: %d file(s) differ from the expected installation: %s\n",
 				len(drifted), strings.Join(drifted, ", "))
+			return 1
+		}
+	}
+	return 0
+}
+
+// runIntegrateRemove undoes an apply from its receipt. Like every mutating
+// integrate mode it defaults to --check; `--remove --apply` writes. A check
+// exits 1 while anything is still registered.
+func runIntegrateRemove(opts integrate.Options) int {
+	receipt, err := integrate.Remove(integrate.RemoveOptions{
+		Root: opts.Root, Host: opts.Host, Mode: opts.Mode, DevmapBin: opts.DevmapBin, SelfBin: opts.SelfBin,
+	})
+	if receipt != nil {
+		if writeErr := console.JSON(receipt); writeErr != nil {
+			console.Errorln(writeErr)
+			return 1
+		}
+	}
+	if err != nil {
+		console.Errorf("integrate --remove: %v\n", err)
+		var reported *devmap.Reported
+		if errors.As(err, &reported) {
+			return exitDevmapRefused
+		}
+		return 1
+	}
+	if opts.Mode == integrate.ModeCheck {
+		if present := receipt.Present(); len(present) > 0 {
+			console.Errorf("integrate --remove --check: still registered in: %s\n", strings.Join(present, ", "))
 			return 1
 		}
 	}

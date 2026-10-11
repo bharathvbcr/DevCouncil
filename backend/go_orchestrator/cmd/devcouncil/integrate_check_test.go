@@ -108,3 +108,43 @@ func TestIntegrateHelpExitsZeroAndConflictingModesAreRefused(t *testing.T) {
 		t.Fatalf("a repeated mode flag was refused: %s", stderr)
 	}
 }
+
+// The way back: --remove follows the apply's receipt, defaults to a check, and
+// leaves the user's own configuration alone.
+func TestIntegrateRemoveUndoesAnApplyThroughTheCLI(t *testing.T) {
+	home, repo := integrateEnv(t)
+	userConfig := "# my codex config\nmodel = \"o5\"   # trailing comment\n"
+	codexConfig := filepath.Join(home, ".codex", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(codexConfig), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(codexConfig, []byte(userConfig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code, stdout, stderr := runDispatch(t, "integrate", "codex", "--apply", "--project-root", repo); code != 0 {
+		t.Fatalf("apply: exit %d\nstdout=%s\nstderr=%s", code, stdout, stderr)
+	}
+	registered, _ := os.ReadFile(codexConfig)
+	if !strings.Contains(string(registered), "[mcp_servers.devmap]") || !strings.HasPrefix(string(registered), userConfig) {
+		t.Fatalf("apply did not register beside the user's lines:\n%s", registered)
+	}
+
+	// Default is a check: nothing is removed and the exit says it is still there.
+	if code, stdout, stderr := runDispatch(t, "integrate", "codex", "--remove", "--project-root", repo); code != 1 {
+		t.Fatalf("bare --remove: exit %d, want 1 (still registered)\nstdout=%s\nstderr=%s", code, stdout, stderr)
+	}
+	if got, _ := os.ReadFile(codexConfig); string(got) != string(registered) {
+		t.Fatal("a check removed something")
+	}
+
+	if code, stdout, stderr := runDispatch(t, "integrate", "codex", "--remove", "--apply", "--project-root", repo); code != 0 {
+		t.Fatalf("remove: exit %d\nstdout=%s\nstderr=%s", code, stdout, stderr)
+	}
+	if got, _ := os.ReadFile(codexConfig); string(got) != userConfig {
+		t.Fatalf("the user's config did not come back byte for byte:\n%s", got)
+	}
+	// The receipt is spent: a second remove has nothing to follow.
+	if code, _, stderr := runDispatch(t, "integrate", "codex", "--remove", "--apply", "--project-root", repo); code != 1 || !strings.Contains(stderr, "no apply receipt") {
+		t.Fatalf("second remove: exit %d, stderr=%q", code, stderr)
+	}
+}

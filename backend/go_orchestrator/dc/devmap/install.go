@@ -74,6 +74,22 @@ type IntegrateReport struct {
 	CheckOK         bool     `json:"check_ok"`
 }
 
+// RemovedDocument is one host document `devmap integrate --remove` examined.
+type RemovedDocument struct {
+	Path    string   `json:"path"`
+	Servers []string `json:"servers"`
+	Deleted bool     `json:"deleted"`
+	Note    string   `json:"note"`
+}
+
+// RemoveReport is what `devmap --json integrate --remove` reports.
+type RemoveReport struct {
+	Host    string            `json:"host"`
+	Removed []RemovedDocument `json:"removed"`
+	Notes   []string          `json:"notes"`
+	CheckOK bool              `json:"check_ok"`
+}
+
 // SkillsReport is what `devmap --json skills install` reports.
 type SkillsReport struct {
 	Written   []string `json:"written"`
@@ -111,6 +127,36 @@ func (c *Client) Integrate(ctx context.Context, host string, mode InstallMode, s
 		return nil, err
 	}
 	var report IntegrateReport
+	if err := c.install(ctx, &report, mode, stdin, args...); err != nil {
+		return nil, err
+	}
+	return &report, nil
+}
+
+// RemoveServers runs `devmap integrate <host> --remove`: it takes `devmap` and
+// `servers` back out of the host documents named in `only`, and only those.
+// `only` is the receipt of the apply that wrote them; an empty list is refused
+// by devmap rather than read as "everywhere". Under InstallCheck a document
+// that still holds a server is an answer (CheckOK false), not a failure.
+func (c *Client) RemoveServers(ctx context.Context, host string, mode InstallMode, servers []Server, only []string) (*RemoveReport, error) {
+	args := []string{"integrate", host, "--project-root", c.Root, "--remove"}
+	for _, path := range only {
+		args = append(args, "--only-path", path)
+	}
+	var stdin []byte
+	if len(servers) > 0 {
+		encoded, err := json.Marshal(map[string]any{"servers": servers})
+		if err != nil {
+			return nil, err
+		}
+		stdin = encoded
+		args = append(args, "--servers-stdin")
+	}
+	args, err := withMode(args, mode)
+	if err != nil {
+		return nil, err
+	}
+	var report RemoveReport
 	if err := c.install(ctx, &report, mode, stdin, args...); err != nil {
 		return nil, err
 	}
@@ -218,6 +264,8 @@ func reportsDrift(report any) bool {
 	case *IntegrateReport:
 		return !r.CheckOK
 	case *SkillsReport:
+		return !r.CheckOK
+	case *RemoveReport:
 		return !r.CheckOK
 	}
 	return false
