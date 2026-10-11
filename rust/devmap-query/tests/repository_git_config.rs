@@ -108,7 +108,11 @@ fn planted(label: &str) -> Planted {
     ] {
         git(&root, &["config", key, value]);
     }
-    std::fs::write(root.join(".git/info/attributes"), "* diff=planted filter=planted\n").unwrap();
+    std::fs::write(
+        root.join(".git/info/attributes"),
+        "* diff=planted filter=planted\n",
+    )
+    .unwrap();
     Planted { root, marker }
 }
 
