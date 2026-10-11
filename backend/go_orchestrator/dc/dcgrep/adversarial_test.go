@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 )
 
 // This boundary is the store's and the devmap's third sibling: one fork/exec
@@ -202,7 +204,7 @@ func TestAvailableRequiresAPositiveIdentification(t *testing.T) {
 }
 
 // TestTheOutputCapStopsAFloodWithoutKillingAWellBehavedChild pins both halves
-// of cappedBuffer.
+// of proc.CappedBuffer.
 //
 // The cap has to hold, or one runaway child allocates until the process dies.
 // And the writer has to report a complete write while dropping bytes, or
@@ -211,13 +213,13 @@ func TestAvailableRequiresAPositiveIdentification(t *testing.T) {
 // reported as a failure. That exact defect is already in this repository's
 // hardening ledger, from limitWriter.
 func TestTheOutputCapStopsAFloodWithoutKillingAWellBehavedChild(t *testing.T) {
-	buf := &cappedBuffer{limit: 10}
+	buf := &proc.CappedBuffer{Limit: 10}
 
 	n, err := buf.Write([]byte("12345"))
 	if n != 5 || err != nil {
 		t.Fatalf("a write under the cap must pass through: n=%d err=%v", n, err)
 	}
-	if buf.overflow {
+	if buf.Overflowed() {
 		t.Fatal("nothing was dropped yet")
 	}
 
@@ -227,19 +229,19 @@ func TestTheOutputCapStopsAFloodWithoutKillingAWellBehavedChild(t *testing.T) {
 	if n != 9 || err != nil {
 		t.Fatalf("a straddling write must report complete: n=%d err=%v", n, err)
 	}
-	if !buf.overflow {
+	if !buf.Overflowed() {
 		t.Fatal("dropping bytes must be recorded")
 	}
-	if buf.buf.Len() != 10 {
-		t.Fatalf("the cap must hold, buffered %d bytes", buf.buf.Len())
+	if buf.Len() != 10 {
+		t.Fatalf("the cap must hold, buffered %d bytes", buf.Len())
 	}
 
 	n, err = buf.Write([]byte("more"))
 	if n != 4 || err != nil {
 		t.Fatalf("a write past a full buffer must still report complete: n=%d err=%v", n, err)
 	}
-	if buf.buf.Len() != 10 {
-		t.Fatalf("the cap must keep holding, buffered %d bytes", buf.buf.Len())
+	if buf.Len() != 10 {
+		t.Fatalf("the cap must keep holding, buffered %d bytes", buf.Len())
 	}
 }
 

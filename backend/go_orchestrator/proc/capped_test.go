@@ -1,6 +1,12 @@
 package proc
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+)
 
 func TestCappedBufferHoldsTheCapAndReportsFullWrites(t *testing.T) {
 	b := &CappedBuffer{Limit: 10}
@@ -44,5 +50,40 @@ func TestCappedBufferAtExactlyTheLimitIsNotAnOverflow(t *testing.T) {
 	_, _ = b.Write([]byte("e"))
 	if !b.Overflowed() {
 		t.Fatal("one byte past the limit is dropped and must be recorded")
+	}
+}
+
+// proc.CappedBuffer is the one output cap. A local copy is how the empty-write
+// overflow defect reached four packages with two different semantics, so a
+// second writer type that tracks an overflow/truncation flag is refused here.
+func TestNoPackageKeepsItsOwnCappedBuffer(t *testing.T) {
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := regexp.MustCompile(`(?m)^type (cappedBuffer|capped|limitWriter|limitedWriter)\s+struct`)
+	var offenders []string
+	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if m := local.FindString(string(body)); m != "" {
+			rel, _ := filepath.Rel(root, path)
+			offenders = append(offenders, rel+": "+m)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(offenders) > 0 {
+		t.Fatalf("use proc.CappedBuffer instead of a local copy:\n  %s", strings.Join(offenders, "\n  "))
 	}
 }

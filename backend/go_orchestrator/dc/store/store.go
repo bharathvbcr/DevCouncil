@@ -652,31 +652,6 @@ const maxOutput = 8 << 20
 // reply.
 var errOversize = errors.New("output exceeded the maximum a store reply may be")
 
-// cappedBuffer collects up to a limit and then records that it stopped, so an
-// overrun is a reported condition rather than a silently truncated document
-// that might still parse as valid JSON.
-type cappedBuffer struct {
-	buf      bytes.Buffer
-	limit    int
-	overflow bool
-}
-
-func (b *cappedBuffer) Write(p []byte) (int, error) {
-	if remaining := b.limit - b.buf.Len(); remaining > 0 {
-		if len(p) > remaining {
-			b.buf.Write(p[:remaining])
-			b.overflow = true
-		} else {
-			b.buf.Write(p)
-		}
-	} else if len(p) > 0 {
-		b.overflow = true
-	}
-	// Always report a full write: returning short would make the copier treat
-	// this as an I/O failure and mask the real diagnostic.
-	return len(p), nil
-}
-
 // EvidenceRow is one persisted evidence record.
 type EvidenceRow struct {
 	ID                    int64           `json:"id"`
@@ -1126,8 +1101,8 @@ func (c *Client) run(ctx context.Context, args ...string) (*response, error) {
 func (c *Client) runOneShot(ctx context.Context, command string, args []string) (*response, error) {
 	full := append([]string{"--db", c.DB}, args...)
 	cmd := exec.CommandContext(ctx, c.Binary, full...)
-	stdout := &cappedBuffer{limit: maxOutput}
-	stderr := &cappedBuffer{limit: 64 << 10}
+	stdout := &proc.CappedBuffer{Limit: maxOutput}
+	stderr := &proc.CappedBuffer{Limit: 64 << 10}
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 
@@ -1158,7 +1133,7 @@ func (c *Client) runOneShot(ctx context.Context, command string, args []string) 
 		return nil, fmt.Errorf("store: %s did not return within %s (the process could not be started or reaped): %w",
 			command, c.timeout(), ctx.Err())
 	}
-	return decodeReply(command, stdout.buf.Bytes(), stdout.overflow, stderr.buf.Bytes(), runErr)
+	return decodeReply(command, stdout.Bytes(), stdout.Overflowed(), stderr.Bytes(), runErr)
 }
 
 // decodeReply turns one invocation's raw streams into either a reply or a

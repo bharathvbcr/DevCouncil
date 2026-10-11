@@ -179,7 +179,7 @@ func (c *Client) runProbe(ctx context.Context) error {
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	out := &capped{limit: maxProbeOutput, hard: true}
+	out := &stopAtCap{proc.CappedBuffer{Limit: maxProbeOutput}}
 	cmd := exec.CommandContext(probeCtx, c.Binary, "--json", "manifest", "--help")
 	proc.ConfigureGroup(cmd)
 	cmd.Stdout = out
@@ -644,55 +644,33 @@ const defaultMaxOutput = 64 << 20
 // it stands.
 const defaultMaxStderr = 4 << 20
 
-// capped is an io.Writer that retains at most limit bytes.
+// stopAtCap is a proc.CappedBuffer for the stream that carries the answer.
 //
-// It exists because the bound it replaces was checked after cmd.Run() returned
-// — which is after os/exec has copied the whole of the child's stdout into
-// memory. A guard that reports the flood once the harness has already taken it
-// is not a guard, and stderr had none at all.
+// The bound it replaces was checked after cmd.Run() returned — which is after
+// os/exec has copied the whole of the child's stdout into memory. A guard that
+// reports the flood once the harness has already taken it is not a guard.
 //
 // Overflow behaviour differs by stream and the difference is deliberate. stdout
 // carries the answer, so exceeding the bound errors: that stops io.Copy, which
 // closes the pipe and ends the producer, and a truncated JSON document must
 // never be parsed as a short one. stderr carries the notices, which are
-// advisory, so it truncates and records that it did — failing a build over its
-// commentary would be the tail wagging the dog, but a notices report built from
-// a cut-off stream must not read like one built from the whole of it.
-type capped struct {
-	buf       bytes.Buffer
-	limit     int
-	hard      bool
-	truncated bool
-}
+// advisory, so it is a plain proc.CappedBuffer that truncates and records that
+// it did — failing a build over its commentary would be the tail wagging the
+// dog, but a notices report built from a cut-off stream must not read like one
+// built from the whole of it.
+type stopAtCap struct{ proc.CappedBuffer }
 
 // errCapped marks the write that stopped a stream, so decode can name the bound
 // rather than reporting whatever exec made of the broken pipe.
 var errCapped = errors.New("output exceeded its bound")
 
-func (c *capped) Write(p []byte) (int, error) {
-	room := c.limit - c.buf.Len()
-	// `>=`, not `>`: a write that fills the bound exactly dropped nothing,
-	// and so did an empty write on a buffer that is already full. Both used
-	// to be reported as truncation.
-	if room >= len(p) {
-		return c.buf.Write(p)
-	}
-	if room > 0 {
-		c.buf.Write(p[:room])
-	}
-	if len(p) == 0 {
-		return 0, nil
-	}
-	c.truncated = true
-	if c.hard {
+func (c *stopAtCap) Write(p []byte) (int, error) {
+	n, _ := c.CappedBuffer.Write(p)
+	if c.Overflowed() {
 		return 0, errCapped
 	}
-	// Soft cap: the bytes are accepted and dropped, so the producer runs to its
-	// own end rather than dying on a broken pipe mid-answer.
-	return len(p), nil
+	return n, nil
 }
-
-func (c *capped) Bytes() []byte { return c.buf.Bytes() }
 
 // said is what a command wrote to stderr, together with whether that is all of
 // it. The two travel as one value because a caller that can read the text but
@@ -1102,8 +1080,8 @@ func (c *Client) invoke(ctx context.Context, timeout time.Duration, stdin []byte
 	if errLimit <= 0 {
 		errLimit = defaultMaxStderr
 	}
-	stdout := &capped{limit: outLimit, hard: true}
-	stderr := &capped{limit: errLimit}
+	stdout := &stopAtCap{proc.CappedBuffer{Limit: outLimit}}
+	stderr := &proc.CappedBuffer{Limit: errLimit}
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	// The same bound as every other subprocess boundary here: killing the
@@ -1136,13 +1114,13 @@ func (c *Client) invoke(ctx context.Context, timeout time.Duration, stdin []byte
 	// how the flood is stopped, so exec reports it as the command failing — and
 	// reporting that as "devmap status failed: signal: broken pipe" would send
 	// an operator to look at the wrong thing entirely.
-	if stdout.truncated {
+	if stdout.Overflowed() {
 		return invocation{}, fmt.Errorf("devmap %s produced more than %d bytes and was stopped; "+
 			"a partial answer is not a short one", args[0], outLimit)
 	}
 	return invocation{
 		stdout: stdout.Bytes(),
-		stderr: said{text: stderr.Bytes(), truncated: stderr.truncated, limit: errLimit},
+		stderr: said{text: stderr.Bytes(), truncated: stderr.Overflowed(), limit: errLimit},
 		runErr: runErr,
 	}, nil
 }

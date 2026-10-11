@@ -12,9 +12,8 @@ import "bytes"
 // command that ran fine into a failure.
 //
 // It lives beside RunBounded for the same reason ConfigureGroup does: bounding
-// a child's output is the same lesson at the same seam. dc/store, dc/dcgrep,
-// dc/dcverify and dc/devmap still carry their own copies; new call sites use
-// this one.
+// a child's output is the same lesson at the same seam. It is the only output
+// cap: TestNoPackageKeepsItsOwnCappedBuffer refuses a local copy.
 type CappedBuffer struct {
 	Limit    int
 	buf      bytes.Buffer

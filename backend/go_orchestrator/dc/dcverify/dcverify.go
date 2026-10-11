@@ -520,8 +520,8 @@ func (c *Client) run(ctx context.Context, args []string, stdin string, out any) 
 	// later appeared and held the pipe open past the deadline.
 	proc.ConfigureGroup(cmd)
 	cmd.Stdin = strings.NewReader(stdin)
-	stdout := &cappedBuffer{limit: c.outputBound()}
-	stderr := &cappedBuffer{limit: c.stderrBound()}
+	stdout := &proc.CappedBuffer{Limit: c.outputBound()}
+	stderr := &proc.CappedBuffer{Limit: c.stderrBound()}
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	cmd.WaitDelay = waitDelay
@@ -532,7 +532,7 @@ func (c *Client) run(ctx context.Context, args []string, stdin string, out any) 
 		// still be written. Nothing below reads them on this path.
 		return fmt.Errorf("verifier timed out after %s", timeout)
 	}
-	if stdout.overflow {
+	if stdout.Overflowed() {
 		// Refused rather than decoded from the prefix. A truncated reply can
 		// still be valid JSON — the findings array simply ends early — and
 		// accepting it would report a capped sample of the gates' findings as
@@ -540,11 +540,11 @@ func (c *Client) run(ctx context.Context, args []string, stdin string, out any) 
 		return fmt.Errorf("verifier produced more than %d bytes", c.outputBound())
 	}
 
-	if err := json.Unmarshal(bytes.TrimSpace(stdout.buf.Bytes()), out); err != nil {
+	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), out); err != nil {
 		if runErr != nil {
-			return fmt.Errorf("verifier failed: %w (stderr: %s)", runErr, bytes.TrimSpace(stderr.buf.Bytes()))
+			return fmt.Errorf("verifier failed: %w (stderr: %s)", runErr, bytes.TrimSpace(stderr.Bytes()))
 		}
-		return fmt.Errorf("verifier returned unparseable output: %w (%q)", err, stdout.buf.String())
+		return fmt.Errorf("verifier returned unparseable output: %w (%q)", err, stdout.String())
 	}
 	// The OK flag is the only thing separating a real clean answer from a reply
 	// that decoded into a zero value — `null` and `{}` both unmarshal without
@@ -796,35 +796,4 @@ func (c *Client) stderrBound() int {
 		return maxStderr
 	}
 	return c.maxStderr
-}
-
-// cappedBuffer forwards at most limit bytes and records that it stopped.
-//
-// Capped during the copy rather than checked after it: a child gone rogue on a
-// large diff would otherwise allocate the whole reply before the bound was ever
-// consulted. The write is reported as complete so io.Copy does not turn a cap
-// into io.ErrShortWrite, close the pipe, and hand the child a SIGPIPE — which
-// is how a check that ran fine comes back as a failure.
-type cappedBuffer struct {
-	buf      bytes.Buffer
-	limit    int
-	overflow bool
-}
-
-func (c *cappedBuffer) Write(p []byte) (int, error) {
-	remaining := c.limit - c.buf.Len()
-	if remaining <= 0 {
-		// An empty write dropped nothing. Recording it as overflow is how a
-		// reply that exactly filled the bound was reported truncated.
-		if len(p) > 0 {
-			c.overflow = true
-		}
-		return len(p), nil
-	}
-	if len(p) > remaining {
-		c.buf.Write(p[:remaining])
-		c.overflow = true
-		return len(p), nil
-	}
-	return c.buf.Write(p)
 }

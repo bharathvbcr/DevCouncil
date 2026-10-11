@@ -243,8 +243,8 @@ func (c *Client) run(ctx context.Context, command string, req any, out any) erro
 	if command == "files" {
 		replyBound = c.listOutputBound()
 	}
-	stdout := &cappedBuffer{limit: replyBound}
-	stderr := &cappedBuffer{limit: c.stderrBound()}
+	stdout := &proc.CappedBuffer{Limit: replyBound}
+	stderr := &proc.CappedBuffer{Limit: c.stderrBound()}
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	cmd.WaitDelay = waitDelay
@@ -255,18 +255,18 @@ func (c *Client) run(ctx context.Context, command string, req any, out any) erro
 		// still be written. Nothing below reads them on this path.
 		return fmt.Errorf("searcher timed out after %s", timeout)
 	}
-	if stdout.overflow {
+	if stdout.Overflowed() {
 		// Refused rather than decoded from the prefix. A truncated reply can
 		// still be valid JSON — the match array simply ends early — and
 		// accepting it would report a capped sample as the whole result.
 		return fmt.Errorf("searcher produced more than %d bytes", replyBound)
 	}
 
-	if err := json.Unmarshal(bytes.TrimSpace(stdout.buf.Bytes()), out); err != nil {
+	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), out); err != nil {
 		if runErr != nil {
-			return fmt.Errorf("searcher failed: %w (stderr: %s)", runErr, bytes.TrimSpace(stderr.buf.Bytes()))
+			return fmt.Errorf("searcher failed: %w (stderr: %s)", runErr, bytes.TrimSpace(stderr.Bytes()))
 		}
-		return fmt.Errorf("searcher returned unparseable output: %w (%q)", err, stdout.buf.String())
+		return fmt.Errorf("searcher returned unparseable output: %w (%q)", err, stdout.String())
 	}
 	// The OK flag is the only thing separating a real empty answer from a
 	// reply that decoded into a zero value — `null` and `[]` both unmarshal
@@ -687,7 +687,7 @@ func (c *Client) Available(ctx context.Context) error {
 	// #nosec G204 -- the configured binary and a literal subcommand.
 	cmd := exec.CommandContext(ctx, c.Binary, "health")
 	proc.ConfigureGroup(cmd)
-	stdout := &cappedBuffer{limit: c.stderrBound()}
+	stdout := &proc.CappedBuffer{Limit: c.stderrBound()}
 	cmd.Stdout = stdout
 	cmd.WaitDelay = waitDelay
 	if runErr, timedOut := proc.RunBounded(ctx, cmd.Run); timedOut {
@@ -701,7 +701,7 @@ func (c *Client) Available(ctx context.Context) error {
 		Searcher      string `json:"searcher"`
 		SchemaVersion int    `json:"schema_version"`
 	}
-	if err := json.Unmarshal(bytes.TrimSpace(stdout.buf.Bytes()), &health); err != nil {
+	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &health); err != nil {
 		return fmt.Errorf("unparseable health reply: %w", err)
 	}
 	if !health.OK || health.Searcher != identity {
@@ -737,35 +737,4 @@ func (c *Client) stderrBound() int {
 		return maxStderr
 	}
 	return c.maxStderr
-}
-
-// cappedBuffer forwards at most limit bytes and records that it stopped.
-//
-// Capped during the copy rather than checked after it: a child gone rogue on a
-// large repository would otherwise allocate the whole reply before the bound
-// was ever consulted. The write is reported as complete so io.Copy does not
-// turn a cap into io.ErrShortWrite, close the pipe, and hand the child a
-// SIGPIPE — which is how a search that ran fine comes back as a failure.
-type cappedBuffer struct {
-	buf      bytes.Buffer
-	limit    int
-	overflow bool
-}
-
-func (c *cappedBuffer) Write(p []byte) (int, error) {
-	remaining := c.limit - c.buf.Len()
-	if remaining <= 0 {
-		// An empty write dropped nothing. Recording it as overflow is how a
-		// reply that exactly filled the bound was reported truncated.
-		if len(p) > 0 {
-			c.overflow = true
-		}
-		return len(p), nil
-	}
-	if len(p) > remaining {
-		c.buf.Write(p[:remaining])
-		c.overflow = true
-		return len(p), nil
-	}
-	return c.buf.Write(p)
 }

@@ -113,7 +113,7 @@ type servedChild struct {
 	stdout *bufio.Reader
 
 	mu     sync.Mutex
-	stderr cappedBuffer
+	stderr proc.CappedBuffer
 
 	closeOnce sync.Once
 }
@@ -178,7 +178,7 @@ func startChild(lifetime context.Context, binary, db string) (*servedChild, erro
 		stdin:  stdin,
 		stdout: bufio.NewReaderSize(stdout, 64<<10),
 	}
-	child.stderr.limit = serveStderrLimit
+	child.stderr.Limit = serveStderrLimit
 	go child.drainStderr(stderr)
 	return child, nil
 }
@@ -226,7 +226,7 @@ func (c *servedChild) drainStderr(r io.Reader) {
 func (c *servedChild) diagnostics() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return strings.TrimSpace(c.stderr.buf.String())
+	return strings.TrimSpace(c.stderr.String())
 }
 
 // close ends the child. Closing stdin is the designed shutdown: the serve loop
