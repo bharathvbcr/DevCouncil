@@ -14,6 +14,19 @@ fnmatch on Windows would pin the wrong answer.
 """
 
 import fnmatch
+import sys
+
+# fnmatch.translate has changed between CPython releases, most visibly in how
+# it drops a backwards range from a set. The fixture is only an authority for
+# the interpreter that wrote it, so the interpreter is pinned: run this with
+# CPython 3.14 (`uv run --python 3.14 scripts/gen-fnmatch-parity.py`), and the
+# header of the fixture records the version that produced it.
+REQUIRED = (3, 14)
+if sys.version_info[:2] != REQUIRED:
+    raise SystemExit(
+        f"gen-fnmatch-parity.py needs CPython {REQUIRED[0]}.{REQUIRED[1]}, "
+        f"this is {sys.version_info[0]}.{sys.version_info[1]}"
+    )
 
 # Every glob shape DevCouncil's policy engine actually uses, plus the character
 # class and edge cases the matchers have to get right.
@@ -110,6 +123,24 @@ EXTRA = [
     ("[a-c-e-g-i]", "h"),
     ("[a-c-e-g-i]", "i"),
     ("[a-c-e-g-i]", "-"),
+    # A backwards range whose start is the "]" that opened the set: CPython's
+    # translate drops the range and, with nothing left but the negation marker,
+    # emits "." — a set that matches any one character.
+    ("[]--!]", "-"),
+    ("[]--!]", "]"),
+    ("[]--!]", "a"),
+    ("[]--!]", "!"),
+    ("[]--!]", "[c"),
+    ("?[]--!]", "[c"),
+    ("?[]--!]", "ac"),
+    ("?[]--!]", "a"),
+    ("[]-a]", "]"),
+    ("[]-a]", "a"),
+    ("[]-a]", "b"),
+    ("[!z-a]", "q"),
+    ("[!z-a]", "!"),
+    ("[--!]", "-"),
+    ("[a--]", "a"),
 ]
 
 
@@ -122,7 +153,8 @@ def emit(pattern: str, name: str) -> None:
 
 def main() -> None:
     print(
-        "# pattern\tname\texpected  — generated from CPython fnmatchcase; "
+        "# pattern\tname\texpected  — generated from CPython "
+        f"{sys.version_info[0]}.{sys.version_info[1]} fnmatchcase; "
         "regenerate with scripts/gen-fnmatch-parity.py"
     )
     for pattern in PATTERNS:

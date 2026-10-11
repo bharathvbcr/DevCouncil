@@ -192,6 +192,17 @@ func (g FileGate) EvaluateFileChange(path string, task *dc.Task, op dc.Operation
 		if !internal && matchesRestricted(mt, normalized) {
 			return deny(RuleRestrictedPath, "Protected repository paths cannot be modified.", normalized, taskID)
 		}
+		// The same two rungs against the name the filesystem stores, for a path
+		// that exists: a spelling the text rules do not fold to the pattern can
+		// still be the file the pattern protects. See onDiskSpelling.
+		if disk, differs := onDiskSpelling(g.Root, normalized); differs {
+			if mt.anyFold(SecretPathPatterns, disk) {
+				return deny(RuleSecretPath, "Path is another name for `"+disk+"`, a secret or credential path, which is never writable.", normalized, taskID)
+			}
+			if !internal && matchesRestricted(mt, disk) {
+				return deny(RuleRestrictedPath, "Path is another name for `"+disk+"`, a protected repository path.", normalized, taskID)
+			}
+		}
 	}
 
 	if task == nil {
@@ -337,6 +348,11 @@ func (g FileGate) EvaluateRead(path string, task *dc.Task) (d Decision) {
 			"Secret and credential paths are not readable. Their contents would enter the model's "+
 				"context, which no later redaction can undo.", normalized, taskID)
 	}
+	if disk, differs := onDiskSpelling(g.Root, normalized); differs && mt.anyFold(SecretPathPatterns, disk) {
+		return deny(RuleSecretRead,
+			"Path is another name for `"+disk+"`, a secret or credential path. Their contents would enter "+
+				"the model's context, which no later redaction can undo.", normalized, taskID)
+	}
 	return allow("Read is allowed.", normalized, taskID)
 }
 
@@ -373,6 +389,9 @@ func ClassifyRead(root, path string) ReadClass {
 		return ReadOutsideRoot
 	}
 	if fnmatch.MatchAnyFold(SecretPathPatterns, normalized) {
+		return ReadSecretPath
+	}
+	if disk, differs := onDiskSpelling(root, normalized); differs && fnmatch.MatchAnyFold(SecretPathPatterns, disk) {
 		return ReadSecretPath
 	}
 	return ReadAllowed
@@ -986,10 +1005,10 @@ func matchesRestricted(mt matching, path string) bool {
 	if mt.anyFold(RestrictedPathPatterns, path) {
 		return true
 	}
-	lower := strings.ToLower(path)
+	lower := fnmatch.Fold(path)
 	for _, pattern := range RestrictedPathPatterns {
 		// Folded here for the same filesystem reason as the glob above.
-		prefix := strings.ToLower(strings.TrimSuffix(strings.Trim(pattern, "*"), "/"))
+		prefix := fnmatch.Fold(strings.TrimSuffix(strings.Trim(pattern, "*"), "/"))
 		if prefix == "" {
 			continue
 		}

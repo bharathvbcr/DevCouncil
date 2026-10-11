@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // fixturePath is the one CPython-generated parity table, resolved from this
@@ -282,5 +284,54 @@ func TestMatchConcurrent(t *testing.T) {
 	case msg := <-errCh:
 		t.Fatal(msg)
 	default:
+	}
+}
+
+// A case-insensitive filesystem compares by Unicode simple case folding, not by
+// unicode.ToLower. Every scalar whose fold orbit holds an ASCII letter must
+// fold to that letter, or a name spelled with it opens a file the secret and
+// restricted patterns never matched.
+func TestFoldCoversEveryASCIIOrbit(t *testing.T) {
+	found := map[rune]rune{}
+	for r := rune(0x80); r <= unicode.MaxRune; r++ {
+		if !unicode.IsPrint(r) && !unicode.IsLetter(r) {
+			continue
+		}
+		for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+			if f < utf8.RuneSelf && unicode.IsLetter(f) {
+				found[r] = unicode.ToLower(f)
+				break
+			}
+		}
+	}
+	if len(found) < 2 {
+		t.Fatalf("enumerated only %d non-ASCII scalars folding to ASCII; the walk is broken", len(found))
+	}
+	for r, want := range found {
+		if got := foldRune(r); got != want {
+			t.Errorf("foldRune(%U %q) = %q, want %q: the filesystem opens %q for it", r, r, got, want, want)
+		}
+	}
+	if found['ſ'] != 's' || found['K'] != 'k' {
+		t.Errorf("the walk did not find the two known orbits: %v", found)
+	}
+}
+
+func TestMatchFoldSeesTheLongSAndKelvinSpellings(t *testing.T) {
+	for _, tc := range []struct{ pattern, name string }{
+		{"id_rsa", "id_rſa"},
+		{"secrets/**", "ſecrets/prod.env"},
+		{"**/secrets/**", "a/ſecrets/new.txt"},
+		{".env", ".ENV"},
+		{"*.key", "x.Key"},
+		{"*.pem", "x.PEM"},
+		{".npmrc", ".npmrc"},
+	} {
+		if !MatchFold(tc.pattern, tc.name) {
+			t.Errorf("MatchFold(%q, %q) = false; the filesystem treats them as one name", tc.pattern, tc.name)
+		}
+	}
+	if MatchFold("id_rsa", "id_rta") {
+		t.Error("folding must not equate unrelated names")
 	}
 }

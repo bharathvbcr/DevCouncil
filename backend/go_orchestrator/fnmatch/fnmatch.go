@@ -151,9 +151,8 @@ func fold(s string) string {
 	rs := []rune(s)
 	changed := false
 	for i, r := range rs {
-		lower := unicode.ToLower(r)
-		if lower != r {
-			rs[i] = lower
+		if folded := foldRune(r); folded != r {
+			rs[i] = folded
 			changed = true
 		}
 	}
@@ -161,6 +160,37 @@ func fold(s string) string {
 		return s
 	}
 	return string(rs)
+}
+
+// foldRune is simple case folding: the one scalar a case-insensitive
+// filesystem would compare r as. unicode.ToLower is not that. APFS and NTFS
+// fold by the Unicode orbit, and two scalars outside ASCII share one with an
+// ASCII letter — U+017F LATIN SMALL LETTER LONG S folds to "s" and U+212A KELVIN
+// SIGN to "k" — so `id_rſa` and `ſecrets/x` name `id_rsa` and `secrets/x` on
+// disk while ToLower left the first as it was and every secret pattern missed
+// it. ToLower already maps the Kelvin sign; the long s is the one it does not.
+//
+// Every other orbit is folded by ToLower, which is enough for the patterns the
+// gates hold (all ASCII) and is what dc-glob does; TestFoldCoversEveryASCIIOrbit
+// walks the whole Unicode range for the scalars whose orbit holds an ASCII
+// letter, so a Unicode revision that adds one fails the test rather than the gate.
+func foldRune(r rune) rune {
+	if r < utf8.RuneSelf {
+		return unicode.ToLower(r)
+	}
+	lower := unicode.ToLower(r)
+	if lower < utf8.RuneSelf {
+		return lower
+	}
+	for f := unicode.SimpleFold(lower); f != lower; f = unicode.SimpleFold(f) {
+		if f < utf8.RuneSelf && f >= 'A' && f <= 'Z' {
+			return unicode.ToLower(f)
+		}
+		if f < utf8.RuneSelf && f >= 'a' && f <= 'z' {
+			return f
+		}
+	}
+	return lower
 }
 
 // matchFrom reports whether text matches pat, and whether the walk finished
@@ -289,16 +319,98 @@ func parseClass(pat []rune, open int) (charClass, int, bool) {
 		return charClass{}, 0, false
 	}
 
-	var singles []rune
+	if indexRune(body, '-', 0) >= 0 {
+		return dashedClass(negated, body), i, true
+	}
+	singles := append([]rune(nil), body...)
 	var ranges [][2]rune
-	for k := 0; k < len(body); {
-		if k+2 < len(body) && body[k+1] == '-' {
-			ranges = append(ranges, [2]rune{body[k], body[k+2]})
-			k += 3
+	return charClass{negated: negated, singles: singles, ranges: ranges}, i, true
+}
+
+// dashedClass reads a set that holds a "-" the way CPython's fnmatch.translate
+// does, which is not the way a regular-expression parser would read the text:
+// translate cuts the set into chunks at each "-" that could be a range
+// operator, drops every range whose start is after its end by merging the two
+// chunks around it — taking BOTH endpoints with it — and only then hands the
+// joined chunks to the regex engine. `[]--!]` therefore loses the range `]`-`-`
+// and with it the `-` and the `!` that followed, leaving a negation marker with
+// no members, which matches any one character. Reading the set directly keeps
+// the `!` and matches only it. The result is read back the way sre reads a set:
+// a hyphen between two characters is a range operator unless the character
+// before it ended a range.
+func dashedClass(negated bool, body []rune) charClass {
+	stuff := body
+	if negated {
+		stuff = append([]rune{'!'}, body...)
+	}
+	k := 1
+	if negated {
+		k = 2
+	}
+	var chunks [][]rune
+	start := 0
+	for {
+		idx := indexRune(stuff, '-', k)
+		if idx < 0 {
+			break
+		}
+		chunks = append(chunks, stuff[start:idx])
+		start = idx + 1
+		k = idx + 3
+	}
+	if chunk := stuff[start:]; len(chunk) > 0 {
+		chunks = append(chunks, chunk)
+	} else {
+		last := len(chunks) - 1
+		chunks[last] = append(append([]rune(nil), chunks[last]...), '-')
+	}
+	for k := len(chunks) - 1; k > 0; k-- {
+		// CPython raises IndexError when a merge empties a chunk that an
+		// earlier pair then reads; such a pair is left as it is here.
+		if len(chunks[k-1]) == 0 || len(chunks[k]) == 0 {
 			continue
 		}
-		singles = append(singles, body[k])
-		k++
+		if chunks[k-1][len(chunks[k-1])-1] > chunks[k][0] {
+			merged := append(append([]rune(nil), chunks[k-1][:len(chunks[k-1])-1]...), chunks[k][1:]...)
+			chunks[k-1] = merged
+			chunks = append(chunks[:k], chunks[k+1:]...)
+		}
 	}
-	return charClass{negated: negated, singles: singles, ranges: ranges}, i, true
+	type token struct {
+		r        rune
+		operator bool
+	}
+	var tokens []token
+	for n, chunk := range chunks {
+		if n > 0 {
+			tokens = append(tokens, token{'-', true})
+		}
+		for _, r := range chunk {
+			tokens = append(tokens, token{r, false})
+		}
+	}
+	class := charClass{}
+	if len(tokens) > 0 && tokens[0].r == '!' && !tokens[0].operator {
+		class.negated = true
+		tokens = tokens[1:]
+	}
+	for t := 0; t < len(tokens); {
+		if t+2 < len(tokens) && tokens[t+1].operator {
+			class.ranges = append(class.ranges, [2]rune{tokens[t].r, tokens[t+2].r})
+			t += 3
+			continue
+		}
+		class.singles = append(class.singles, tokens[t].r)
+		t++
+	}
+	return class
+}
+
+func indexRune(rs []rune, r rune, from int) int {
+	for i := from; i < len(rs); i++ {
+		if rs[i] == r {
+			return i
+		}
+	}
+	return -1
 }
