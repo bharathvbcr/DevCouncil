@@ -1701,7 +1701,8 @@ fn attach_site_evidence(
     }
 
     // Per slot: how many sites, and the smallest `(path, enclosing, callee)`.
-    let mut found: Vec<(u32, Option<(&str, &str, &str)>)> = vec![(0, None); pending.len()];
+    type Site<'a> = (&'a str, &'a str, &'a str);
+    let mut found: Vec<(u32, Option<Site>)> = vec![(0, None); pending.len()];
 
     for edge in resolution
         .edges
@@ -1732,7 +1733,7 @@ fn attach_site_evidence(
             entry.0 = entry.0.saturating_add(1);
             if entry
                 .1
-                .map_or(true, |best| (site.0, site.1) < (best.0, best.1))
+                .is_none_or(|best| (site.0, site.1) < (best.0, best.1))
             {
                 entry.1 = Some(site);
             }
@@ -1756,7 +1757,7 @@ fn attach_site_evidence(
             entry.0 = entry.0.saturating_add(1);
             if entry
                 .1
-                .map_or(true, |best| (site.0, site.1) < (best.0, best.1))
+                .is_none_or(|best| (site.0, site.1) < (best.0, best.1))
             {
                 entry.1 = Some(site);
             }
