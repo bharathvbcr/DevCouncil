@@ -206,9 +206,15 @@ fn servers_on_stdin_are_registered_reported_and_checked() {
     // rewrites them. Creating it first keeps this test about the servers.
     std::fs::create_dir_all(root.join(".devcouncil")).unwrap();
     let root_arg = root.to_str().unwrap();
+    // Absolute on the host: `/opt/...` is rooted but not absolute on Windows.
+    let command = if cfg!(windows) {
+        r"C:\opt\devcouncil\bin\devcouncil"
+    } else {
+        "/opt/devcouncil/bin/devcouncil"
+    };
     let request = serde_json::to_vec(&json!({"servers": [{
         "name": "devcouncil",
-        "command": "/opt/devcouncil/bin/devcouncil",
+        "command": command,
         "args": ["mcp"],
         "env": {"DEVCOUNCIL_PROJECT_ROOT": root_arg},
     }]}))
@@ -244,10 +250,7 @@ fn servers_on_stdin_are_registered_reported_and_checked() {
         &std::fs::read(root.join(".devcouncil/integrations/warp-mcp.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(
-        doc["devcouncil"]["command"],
-        "/opt/devcouncil/bin/devcouncil"
-    );
+    assert_eq!(doc["devcouncil"]["command"], command);
     assert!(
         doc.get("devmap").is_some(),
         "DevMap's own entry is missing: {doc}"

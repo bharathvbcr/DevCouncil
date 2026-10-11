@@ -28,6 +28,8 @@ on:
       - "backend/contracts/**"
       - ".github/workflows/analysis-plane.yml"
       - ".github/actions/setup-gusset/**"
+      - ".github/actions/setup-rust/**"
+      - "rust-toolchain.toml"
   pull_request:
     paths:
       - "rust/**"
@@ -37,10 +39,18 @@ on:
       - "backend/contracts/**"
       - ".github/workflows/analysis-plane.yml"
       - ".github/actions/setup-gusset/**"
+      - ".github/actions/setup-rust/**"
+      - "rust-toolchain.toml"
   workflow_dispatch:
 
 permissions:
   contents: read
+
+# One run per workflow and ref: a newer push supersedes the one in flight.
+# Tag refs are never cancelled, so a release cannot be cut off by a later push.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   rust:
@@ -55,11 +65,10 @@ jobs:
         working-directory: rust
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-on-failure: true
           workspaces: rust
 
       - name: Format
@@ -90,6 +99,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: backend/go_orchestrator/go.mod
+          cache-dependency-path: backend/go_orchestrator/go.mod
       - name: Set up Gusset
         uses: ./.github/actions/setup-gusset
       - name: Build the DevCouncil host
@@ -97,7 +107,7 @@ jobs:
         run: go build -o bin/ ./cmd/devcouncil
 
       - name: Test
-        run: cargo test -p dc-glob -p dc-proc -p dc-redact -p dc-grep -p dc-store -p dc-verify -p dc-evidence
+        run: cargo test -p dc-glob -p dc-proc -p dc-redact -p dc-grep -p dc-store -p dc-verify -p dc-evidence --no-fail-fast
 
   go:
     name: clients (${{ matrix.os }})
@@ -111,9 +121,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: backend/go_orchestrator/go.mod
-      - uses: dtolnay/rust-toolchain@stable
+          cache-dependency-path: backend/go_orchestrator/go.mod
+      - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-on-failure: true
           workspaces: rust
           # devmap is built below from its own workspace; cache both so the
           # tree-sitter grammars are not recompiled on every run.
@@ -186,6 +198,14 @@ jobs:
         working-directory: backend/go_orchestrator
         run: go test ./... -count=1 -race
 
+      # Known vulnerabilities in the module graph this host builds with. The
+      # tool is installed at a pinned version, not `latest`.
+      - name: Vulnerability scan
+        working-directory: backend/go_orchestrator
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
       # The live-contract tests are the only check that the field names this
       # module decodes are the ones devmap emits. If they skipped, the step
       # above was green without ever having spoken to the producer, so the skip
@@ -201,3 +221,53 @@ jobs:
           fi
           echo "$out" | grep -q -- '--- PASS: TestTheLiveContractHolds' || {
             echo "::error::TestTheLiveContractHolds did not run"; exit 1; }
+
+  # The Go host on Windows. Windows-only paths (quoted path handling in hook
+  # cleanup, integrate writes, separators in reported paths) never ran in CI:
+  # the `go` job above is Unix only. Gusset is Unix only, so on Windows the
+  # sibling is checked out for go.mod's replace and the engine is not built;
+  # gussetfn is build-tagged and answers ErrUnsupported there.
+  go-windows:
+    name: clients (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go_orchestrator/go.mod
+          cache-dependency-path: backend/go_orchestrator/go.mod
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          workspaces: rust
+      # testsupport builds dcstore, dcverify and dcgrep out of rust/ and the
+      # tests exec them; the requirements suite also plants a row with sqlite3.
+      - name: Install sqlite3
+        shell: bash
+        run: choco install sqlite --no-progress -y && sqlite3 --version
+      - name: Build devmap
+        working-directory: rust
+        run: cargo build -p devmap-cli --bin devmap
+      - name: Put devmap on PATH
+        shell: bash
+        run: echo "$GITHUB_WORKSPACE/rust/target/debug" >> "$GITHUB_PATH"
+      - name: Set up Gusset
+        uses: ./.github/actions/setup-gusset
+      - name: Vet
+        working-directory: backend/go_orchestrator
+        run: go vet ./...
+      - name: Test
+        working-directory: backend/go_orchestrator
+        run: go test ./... -count=1
+
+  # Known advisories in the Cargo.lock the kernel and the dc-* crates ship with.
+  supply-chain:
+    name: cargo advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: rust/Cargo.toml
+          command: check advisories

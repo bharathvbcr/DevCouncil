@@ -8,9 +8,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use tessl::GpuRuntime;
 use tessl::bert::{BertConfig, BertSparseModel};
 use tessl::safetensors::SafeTensors;
-use tessl::GpuRuntime;
 
 use crate::post::special_drop;
 use crate::vocab::{self, query_weights, read_vocab};

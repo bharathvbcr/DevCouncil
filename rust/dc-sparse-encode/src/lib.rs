@@ -20,12 +20,12 @@ mod vocab;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod model;
 
-pub use bench::{schedule, Side, MIN_REPEATS};
-pub use fileset::{walk, Selection, DEFAULT_MAX_FILES};
-pub use jsonl::{frozen_record_message, DocLine};
-pub use post::{round4, special_drop, terms_of, MAX_TERMS_PER_DOCUMENT};
-pub use tokenize::{document_ids, query_ids, QUERY_CAP};
-pub use vocab::{densify, lookup, parity_texts, read_vocab, snapshot, DEFAULT_MODEL};
+pub use bench::{MIN_REPEATS, Side, schedule};
+pub use fileset::{DEFAULT_MAX_FILES, Selection, walk};
+pub use jsonl::{DocLine, frozen_record_message};
+pub use post::{MAX_TERMS_PER_DOCUMENT, round4, special_drop, terms_of};
+pub use tokenize::{QUERY_CAP, document_ids, query_ids};
+pub use vocab::{DEFAULT_MODEL, densify, lookup, parity_texts, read_vocab, snapshot};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use model::Loaded;
@@ -49,7 +49,9 @@ pub fn encode_repository(
     if batch_size == 0 {
         return Err("--batch-size must be at least 1".into());
     }
-    let root = root.canonicalize().map_err(|err| format!("{}: {err}", root.display()))?;
+    let root = root
+        .canonicalize()
+        .map_err(|err| format!("{}: {err}", root.display()))?;
     if !root.is_dir() {
         return Err(format!("{} is not a directory", root.display()));
     }

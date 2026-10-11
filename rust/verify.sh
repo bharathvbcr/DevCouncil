@@ -13,6 +13,9 @@ for a in "$@"; do
   esac
 done
 
+# Gates that were not run, printed again at the end: "green" must not read
+# the same whether a gate ran or was skipped.
+NOT_RUN=()
 step() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 now_ns() {
   local value
@@ -69,6 +72,12 @@ else
     echo "Check out https://github.com/bharathvbcr/gusset there. CI does this in .github/actions/setup-gusset." >&2
     exit 1
   fi
+  # The sibling must be the revision CI builds; a drifted sibling is a failure,
+  # not a warning (see gusset-engine/check-pin.sh).
+  gusset-engine/check-pin.sh || {
+    echo "GATE FAIL: the Gusset sibling at $gusset_dir is not at the setup-gusset pin." >&2
+    exit 1
+  }
   # Always the incremental build, never "only when missing": that linked
   # whatever archive an older checkout left behind. cgo-env.sh also keys Go's
   # caches on the archive's hash, without which a rebuilt archive is not
@@ -92,7 +101,11 @@ fi
 step "3/9 tests"
 cargo test --workspace
 
-if [ "$QUICK" -eq 1 ]; then echo "quick mode: skipping determinism/perf/mutants"; exit 0; fi
+if [ "$QUICK" -eq 1 ]; then
+  echo "NOT RUN (quick mode): determinism, memory ceiling, growth plateau, incremental equivalence, mutation testing"
+  printf '\n\033[1mQUICK GATES GREEN; the full gate suite was NOT RUN\033[0m\n'
+  exit 0
+fi
 
 step "release worker panic recovery (executable, not test profile)"
 cargo run --release --locked -q -p devmap-serve --example worker_recovery_probe
@@ -336,7 +349,12 @@ if [ "$MUTANTS" -eq 1 ]; then
   cargo mutants -p devmap-resolve -p devmap-analyze --timeout 60 || {
     echo "Missed mutants above = tests that cannot fail. See INTEGRITY.md §Vacuous tests."; exit 1; }
 else
-  echo "skipped (pass --mutants to run)"
+  echo "NOT RUN: mutation testing (pass --mutants to run it; .github/workflows/mutants.yml runs it weekly)"
+  NOT_RUN+=("mutation testing")
 fi
 
-printf '\n\033[1mALL GATES GREEN\033[0m\n'
+if [ "${#NOT_RUN[@]}" -gt 0 ]; then
+  printf '\n\033[1mGATES GREEN, but NOT RUN: %s\033[0m\n' "${NOT_RUN[*]}"
+else
+  printf '\n\033[1mALL GATES GREEN\033[0m\n'
+fi

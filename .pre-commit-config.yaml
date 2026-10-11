@@ -13,14 +13,3 @@ repos:
     -   id: ruff
         args: [ --fix ]
     -   id: ruff-format
-
--   repo: local
-    hooks:
-    -   id: devcouncil-map-freshness
-        name: devcouncil map --if-stale (repo map / code graph freshness)
-        entry: devcouncil map --if-stale
-        language: system
-        pass_filenames: false
-        always_run: true
-        stages: [pre-commit]
-        verbose: false

@@ -1,7 +1,7 @@
 //! Source limits must hold at the actual read, including replacement with a FIFO.
 
 #[cfg(test)]
-mod reliability_source_reads {
+mod source_reads {
     #[test]
     fn ra4_valid_source_at_the_exact_limit_is_retained() {
         let path =

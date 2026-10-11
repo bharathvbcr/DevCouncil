@@ -628,7 +628,10 @@ fn a_paused_terminal_cannot_hold_the_build_or_change_parent_descriptor_flags() {
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // A build held behind paused terminal output never exits, so a long
+    // deadline costs nothing when the invariant is broken and keeps a loaded
+    // runner from reading a slow, unblocked build as a hang.
+    let deadline = Instant::now() + coverage_relaxed(Duration::from_secs(10));
     while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -644,7 +647,7 @@ fn a_paused_terminal_cannot_hold_the_build_or_change_parent_descriptor_flags() {
     fs::remove_dir_all(root).unwrap();
     assert!(
         !blocked,
-        "progress held the build behind paused terminal output for two seconds"
+        "progress held the build behind paused terminal output past its deadline"
     );
     assert!(output.status.success());
     assert_eq!(
@@ -1283,6 +1286,9 @@ fn an_empty_tree_completes_without_inventing_file_progress() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(unix)]
+include!("../../testsupport/timing.rs");
+
 /// Temp roots must be unique per call, not merely per instant. `SystemTime`
 /// resolution on macOS is 1 us, so two tests entering this function in the same
 /// microsecond used to receive the *same* directory; whichever finished first
@@ -1359,6 +1365,18 @@ fn build_progress_is_bounded_complete_and_keeps_json_stdout_clean() {
 #[test]
 fn the_persist_write_phase_reports_what_each_relation_cost() {
     let root = temp_root();
+    // A write of an empty tree takes about 0.6 ms and the stage clock sits
+    // ~15 us outside the span the split closes against, so a 5% bound on it is
+    // a bound on scheduler noise. Enough files make the write a measurable
+    // phase, and the bound a statement about attribution.
+    fs::create_dir_all(root.join("src")).expect("create fixture source dir");
+    for i in 0..300 {
+        fs::write(
+            root.join("src").join(format!("m{i}.py")),
+            format!("def f{i}(x):\n    return x + {i}\n"),
+        )
+        .expect("write fixture file");
+    }
     let db = root.join("index.sqlite");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_devmap"))
         .args(["--json", "--progress", "never", "--db"])

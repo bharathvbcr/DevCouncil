@@ -1,0 +1,29 @@
+# Version and security updates for every ecosystem this repository actually has
+# a manifest for. The earlier implicit "uv in /" job failed every run with
+# dependency_file_not_found because there is no Python manifest at the root;
+# there is no `pip`/`uv` entry here for the same reason.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directories:
+      - "/rust"
+      - "/rust/gusset-engine"
+      - "/rust/dc-sparse-encode"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  - package-ecosystem: gomod
+    directories:
+      - "/backend/go_orchestrator"
+      - "/benchmarks/plots"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  - package-ecosystem: github-actions
+    directories:
+      - "/"
+      - "/.github/actions/setup-gusset"
+      - "/.github/actions/setup-rust"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

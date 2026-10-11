@@ -3268,11 +3268,20 @@ mod tests {
 
     #[test]
     fn a_server_request_is_validated_before_anything_is_written() {
-        let ok = br#"{"servers":[{"name":"devcouncil","command":"/opt/dc","args":["mcp"],
-                      "env":{"DEVCOUNCIL_PROJECT_ROOT":"/repo"},"cwd":"/repo"}]}"#;
-        let specs = parse_server_request(ok).unwrap();
+        // Absolute means a drive on Windows; `/opt/dc` is rooted but not
+        // absolute there, so a fixed Unix path would be refused as relative.
+        let (command, repo) = if cfg!(windows) {
+            (r"C:\opt\dc", r"C:\repo")
+        } else {
+            ("/opt/dc", "/repo")
+        };
+        let ok = serde_json::json!({"servers":[{
+            "name":"devcouncil","command":command,"args":["mcp"],
+            "env":{"DEVCOUNCIL_PROJECT_ROOT":repo},"cwd":repo}]})
+        .to_string();
+        let specs = parse_server_request(ok.as_bytes()).unwrap();
         assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].env["DEVCOUNCIL_PROJECT_ROOT"], "/repo");
+        assert_eq!(specs[0].env["DEVCOUNCIL_PROJECT_ROOT"], repo);
 
         for (label, body) in [
             ("not json", "{".to_string()),
@@ -3337,6 +3346,14 @@ mod tests {
             ),
             ("oversized", " ".repeat(MAX_SERVER_REQUEST_BYTES + 1)),
         ] {
+            // Each case must be refused for its own reason, so the commands
+            // the table treats as absolute are absolute on Windows too.
+            let body = if cfg!(windows) {
+                body.replace("\"/x", r#""C:\\x"#)
+                    .replace("\"/y", r#""C:\\y"#)
+            } else {
+                body
+            };
             assert!(
                 parse_server_request(body.as_bytes()).is_err(),
                 "{label}: accepted {body:?}"

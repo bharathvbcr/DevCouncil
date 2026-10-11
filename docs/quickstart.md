@@ -10,7 +10,9 @@ Prerequisites: Git and a Rust/Cargo toolchain compatible with
 [`rust/Cargo.toml`](../rust/Cargo.toml) and its lockfile. Building the Go host
 also requires the toolchain declared in
 [`backend/go_orchestrator/go.mod`](../backend/go_orchestrator/go.mod)
-(currently Go 1.26.6). Node 18+ is only for the optional npm launcher.
+(currently Go 1.26.9), plus a sibling checkout of
+[Gusset](https://github.com/bharathvbcr/gusset) at `../gusset`, at the revision
+pinned in [`.github/actions/setup-gusset/action.yml`](../.github/actions/setup-gusset/action.yml). Node 18+ is only for the optional npm launcher.
 
 ```bash
 git clone https://github.com/bharathvbcr/DevCouncil.git

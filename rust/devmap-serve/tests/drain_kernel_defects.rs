@@ -16,10 +16,7 @@ use devmap_serve::Daemon;
 use devmap_store::Store;
 
 #[cfg(unix)]
-#[path = "support/restriction.rs"]
-mod restriction;
-#[cfg(unix)]
-use restriction::restriction_holds;
+include!("../../testsupport/restriction.rs");
 
 fn tmp_dir(label: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);

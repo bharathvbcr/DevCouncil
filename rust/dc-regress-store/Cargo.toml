@@ -2,6 +2,7 @@
 name = "dc-regress-store"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Presents a persisted devmap generation through dc-regress's CodeGraph trait, so every host asks the same question of the same graph"

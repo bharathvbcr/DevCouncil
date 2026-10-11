@@ -30,6 +30,12 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+# One run per workflow and ref: a newer push supersedes the one in flight.
+# Tag refs are never cancelled, so a release cannot be cut off by a later push.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
@@ -85,13 +91,14 @@ jobs:
 
     - name: Set up Rust
       if: matrix.language == 'rust'
-      uses: dtolnay/rust-toolchain@stable
+      uses: ./.github/actions/setup-rust
 
     - name: Set up Go
       if: matrix.language == 'go'
       uses: actions/setup-go@v5
       with:
         go-version-file: backend/go_orchestrator/go.mod
+        cache-dependency-path: backend/go_orchestrator/go.mod
 
     # Add any setup steps before running the `github/codeql-action/init` action.
     # This includes steps like installing compilers or runtimes (`actions/setup-node`

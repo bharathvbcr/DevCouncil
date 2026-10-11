@@ -14,7 +14,15 @@ fn names(text: &str, path: &std::path::Path) -> bool {
     if text.contains(&path.display().to_string()) {
         return true;
     }
-    let Ok(canonical) = path.canonicalize() else {
+    // The path may name a file that was deliberately not written, so resolve
+    // the nearest existing ancestor and re-append the rest. On Windows the
+    // report carries the long `\\?\` form where the test holds a short 8.3 one.
+    let canonical = path.canonicalize().or_else(|_| {
+        let parent = path.parent().ok_or(std::io::ErrorKind::NotFound)?;
+        let name = path.file_name().ok_or(std::io::ErrorKind::NotFound)?;
+        parent.canonicalize().map(|p| p.join(name))
+    });
+    let Ok(canonical) = canonical else {
         return false;
     };
     let shown = canonical.display().to_string();

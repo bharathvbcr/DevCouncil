@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use dc_sparse_encode::{
-    frozen_record_message, self_test, walk, DEFAULT_MAX_FILES, DEFAULT_MODEL, MIN_REPEATS,
+    DEFAULT_MAX_FILES, DEFAULT_MODEL, MIN_REPEATS, frozen_record_message, self_test, walk,
 };
 
 fn main() -> ExitCode {
@@ -161,7 +161,10 @@ fn parse(argv: impl Iterator<Item = String>) -> Result<Args, String> {
     Ok(args)
 }
 
-fn need(argv: &mut std::iter::Peekable<impl Iterator<Item = String>>, flag: &str) -> Result<String, String> {
+fn need(
+    argv: &mut std::iter::Peekable<impl Iterator<Item = String>>,
+    flag: &str,
+) -> Result<String, String> {
     argv.next().ok_or_else(|| format!("{flag} needs a value"))
 }
 

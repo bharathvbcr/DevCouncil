@@ -1670,6 +1670,22 @@ fn module_private_proof<'a>(ext: &Extraction, scopes: &ManifestScopes<'a>) -> Op
     nearest_manifest_proof(scopes, family, &ext.file_path)
 }
 
+/// How many ambiguous call sites reach a slot, and the smallest
+/// `(path, enclosing symbol, callee)` among them.
+type NamesakeSites<'a> = (u32, Option<(&'a str, &'a str, &'a str)>);
+
+/// Counts one call site against a slot and keeps the smallest site, so the
+/// reported example does not depend on edge order.
+fn record_namesake_site<'a>(entry: &mut NamesakeSites<'a>, site: (&'a str, &'a str, &'a str)) {
+    entry.0 = entry.0.saturating_add(1);
+    if entry
+        .1
+        .is_none_or(|best| (site.0, site.1) < (best.0, best.1))
+    {
+        entry.1 = Some(site);
+    }
+}
+
 /// Fill in the site evidence of every unconfirmed row in one pass.
 ///
 /// `sites` counts the ambiguous edges into the symbol and the unattributed
@@ -1701,8 +1717,7 @@ fn attach_site_evidence(
     }
 
     // Per slot: how many sites, and the smallest `(path, enclosing, callee)`.
-    type Site<'a> = (&'a str, &'a str, &'a str);
-    let mut found: Vec<(u32, Option<Site>)> = vec![(0, None); pending.len()];
+    let mut found: Vec<NamesakeSites> = vec![(0, None); pending.len()];
 
     for edge in resolution
         .edges
@@ -1729,14 +1744,7 @@ fn attach_site_evidence(
                 edge.source_symbol.as_str(),
                 member,
             );
-            let entry = &mut found[slot];
-            entry.0 = entry.0.saturating_add(1);
-            if entry
-                .1
-                .is_none_or(|best| (site.0, site.1) < (best.0, best.1))
-            {
-                entry.1 = Some(site);
-            }
+            record_namesake_site(&mut found[slot], site);
         }
     }
     for row in resolution
@@ -1753,14 +1761,7 @@ fn attach_site_evidence(
                 row.source_symbol.as_str(),
                 row.callee_name.as_str(),
             );
-            let entry = &mut found[slot];
-            entry.0 = entry.0.saturating_add(1);
-            if entry
-                .1
-                .is_none_or(|best| (site.0, site.1) < (best.0, best.1))
-            {
-                entry.1 = Some(site);
-            }
+            record_namesake_site(&mut found[slot], site);
         }
     }
 

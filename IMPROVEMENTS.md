@@ -710,6 +710,20 @@ Unverified: that the failure was ever reproduced, what actually caused it,
 whether it still occurs at HEAD, and whether the later changes fixed it. No
 cause is recorded in the code or in git history.
 
+**Measured at `40b6bbbf` (2026-10-10, macOS arm64, Rust 1.99.0): not reproduced,
+cause still not demonstrated.** A throwaway test (not committed) ran 1500
+bind, drop, rebind cycles in one process while four threads spawned
+`/usr/bin/true` continuously, to test the one remaining candidate: a forked
+child holding the lock's open file description across `drop`, which would keep
+the `flock` after the parent closes it. With ten CPU hogs running as well:
+0 failures in 1500 cycles, and `a_second_binder_is_refused_while_the_first_holds_the_endpoint`
+passed 5 of 5 alone under the same load. `SafeFile::open` sets `O_CLOEXEC`
+(`devmap-extract/src/safe_fs.rs:750`), so a child can only hold the lock between
+fork and exec. Inferred, not shown: the failures recorded above predate
+`592e3940` and `4cfe50d9` and were fixed by them. Linux and Windows were not
+measured. The test body is unchanged; if it fails in CI, the failure line is the
+first evidence.
+
 ## Dev Map kernel audit, second pass (2026-09-02)
 
 Scope: everything between `dev map` and the store — the Python seam, the kernel's

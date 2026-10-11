@@ -77,11 +77,7 @@ pub fn lines_from_pooled(
         ));
     }
     if texts.len() != paths.len() {
-        return Err(format!(
-            "{} texts for {} paths",
-            texts.len(),
-            paths.len()
-        ));
+        return Err(format!("{} texts for {} paths", texts.len(), paths.len()));
     }
     let drop = special_drop(prepared.tokens)?;
     let mut lines = Vec::new();
@@ -111,8 +107,12 @@ pub fn write_lines(out: &Path, header: &serde_json::Value, docs: &[DocLine]) -> 
     let file = File::create(&staging)
         .map_err(|err| format!("could not write {}: {err}", staging.display()))?;
     let mut handle = BufWriter::new(file);
-    writeln!(handle, "{}", serde_json::to_string(header).map_err(|e| e.to_string())?)
-        .map_err(|err| format!("could not write {}: {err}", staging.display()))?;
+    writeln!(
+        handle,
+        "{}",
+        serde_json::to_string(header).map_err(|e| e.to_string())?
+    )
+    .map_err(|err| format!("could not write {}: {err}", staging.display()))?;
     for doc in docs {
         let terms: Vec<serde_json::Value> = doc
             .terms
@@ -124,8 +124,12 @@ pub fn write_lines(out: &Path, header: &serde_json::Value, docs: &[DocLine]) -> 
             "total_terms": doc.total_terms,
             "terms": terms,
         });
-        writeln!(handle, "{}", serde_json::to_string(&line).map_err(|e| e.to_string())?)
-            .map_err(|err| format!("could not write {}: {err}", staging.display()))?;
+        writeln!(
+            handle,
+            "{}",
+            serde_json::to_string(&line).map_err(|e| e.to_string())?
+        )
+        .map_err(|err| format!("could not write {}: {err}", staging.display()))?;
     }
     handle
         .flush()
@@ -164,5 +168,3 @@ that fixture. Regenerate it, from the local cache and without downloading, with:
 scripts/encode-sparse.py is gone. --record does not rewrite either fixture."
     )
 }
-
-

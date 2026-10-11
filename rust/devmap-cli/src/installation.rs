@@ -1089,6 +1089,7 @@ fn stale_servers_along(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::time::Instant;
 
     /// `ps` elapsed time, in the three shapes it actually prints.

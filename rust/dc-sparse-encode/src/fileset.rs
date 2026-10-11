@@ -52,11 +52,7 @@ pub struct Selection {
     pub via_walk: bool,
 }
 
-pub fn select(
-    root: &Path,
-    max_files: usize,
-    force_walk: bool,
-) -> Result<Selection, String> {
+pub fn select(root: &Path, max_files: usize, force_walk: bool) -> Result<Selection, String> {
     if max_files == 0 {
         return Err("--max-files must be at least 1".into());
     }

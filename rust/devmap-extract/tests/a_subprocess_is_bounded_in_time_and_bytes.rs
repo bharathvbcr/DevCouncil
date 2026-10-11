@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use devmap_extract::subprocess::{Bounds, Failure, run_bounded};
+use devmap_extract::subprocess::{run_bounded, Bounds, Failure};
 
 /// One directory per call, unique across the tests this binary runs in
 /// parallel. A wall-clock stamp alone is not: macOS reports `SystemTime` at

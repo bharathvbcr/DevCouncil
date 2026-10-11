@@ -216,6 +216,11 @@ def main():
         root = Path(scratch)
         source = "def needle():\n    return 42\n\ndef caller():\n    return needle()\n"
         (root / "example.py").write_text(source)
+        # `suspects` and `blast` read git history, so the fixture is a repository.
+        for git_args in (["init", "-q"], ["add", "example.py"],
+                         ["-c", "user.name=stress", "-c", "user.email=stress@example.invalid",
+                          "-c", "commit.gpgsign=false", "commit", "-q", "-m", "fixture"]):
+            subprocess.run(["git", *git_args], cwd=root, check=True, capture_output=True)
         base = [devmap, "--root", str(root)]
         receipt(run([*base, "build", "--manifest", "--json"], root))
         queries = [
@@ -231,6 +236,10 @@ def main():
             ["skills", "install", "--dry-run", "--project-root", str(root)],
             ["integrate", "codex", "--dry-run", "--project-root", str(root)],
             ["repair", "--fts", "--pending", "--page-size"],
+            ["ask", "where is needle defined"], ["skeleton", "example.py"],
+            ["suspects", "needle", "--since", "HEAD"], ["blast", "--since", "HEAD"],
+            ["literals", "needle"], ["version"],
+            ["gap-record", "--tool", "stress", "--gap-id", "stress", "--reason", "stress fixture"],
         ]
         for query in queries:
             receipt(run([*base, *query, "--json", "--progress", "always"], root))

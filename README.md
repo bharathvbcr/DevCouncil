@@ -164,7 +164,10 @@ into a temporary directory and runs `devcouncil install` with your arguments,
 and that command is the installer (`--help` lists presets and flags). Omit
 `--only=devmap` for the Go host and full analysis suite. The host needs the
 toolchain declared in [`go.mod`](backend/go_orchestrator/go.mod), currently Go
-1.26.6. Without Go, `cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked devmap-cli`
+1.26.9, and a sibling checkout of [Gusset](https://github.com/bharathvbcr/gusset)
+at `../gusset`, at the revision pinned in
+[`.github/actions/setup-gusset/action.yml`](.github/actions/setup-gusset/action.yml)
+(`npm run ci:local` and `rust/verify.sh` fail on any other revision). Without Go, `cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked devmap-cli`
 installs DevMap alone. On Windows use `.\scripts\install.ps1 -Components devmap`,
 or omit `-Components` for the suite.
 The npm package is a lightweight launcher for native binaries, not a bundled

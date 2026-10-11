@@ -172,11 +172,11 @@ pub fn source_has_generated_header(source: &str) -> bool {
 /// (`devmap-analyze/src/liveness.rs`) exempts every symbol in a file carrying
 /// one — so a single such line hid a whole file from the dead-code scan.
 ///
-/// `devcouncil.indexing.wiring.is_wiring_decorated` is the spec, and this is
-/// its rule transcribed: split off everything from the first `(`, strip the
+/// The rule, transcribed from the Python `is_wiring_decorated` (deleted since):
+/// split off everything from the first `(`, strip the
 /// leading `@`, trim, lowercase, then split on `.` and whitespace for the
-/// segment set. The hint table itself is unchanged and is pinned equal to the
-/// Python one by `tests/unit/test_wiring_parity_with_kernel.py`.
+/// segment set. The hint table is pinned by this crate's own tests; the Python
+/// parity test that once compared it is deleted.
 pub fn is_wiring_decorator(decorator: &str) -> bool {
     let hints = [
         "app.",
@@ -421,9 +421,10 @@ pub fn has_shebang(source: &str) -> bool {
 
 /// Directory names that hold test data rather than program text.
 ///
-/// Kept apart from [`is_test_path`], which is pinned equal to
-/// `devcouncil.indexing.wiring.is_test_path` by a parity test — widening that
-/// one would break the parity rather than fix the finding.
+/// Kept apart from [`is_test_path`]: widening that one would move every
+/// test-path decision, not just this finding. The Python `is_test_path` it
+/// was once pinned equal to is deleted; the rule is pinned by this crate's own
+/// tests.
 const FIXTURE_DIR_SEGMENTS: &[&str] = &[
     "testdata",
     "test-data",
@@ -1311,8 +1312,8 @@ const ENTRY_POINT_CAP: usize = 512;
 
 /// Module paths one `pkg.mod:attr` target is tried against.
 ///
-/// Pinned equal to `wiring._add_module_file`'s candidate list by
-/// `tests/unit/test_wiring_parity_with_kernel.py`.
+/// Ported from the Python `wiring._add_module_file` candidate list (deleted
+/// since); the Rust tests pin it now.
 const ENTRY_POINT_CANDIDATES: usize = 4;
 
 /// Symbol identities a Python console-script declaration names, with a reason.
@@ -1610,8 +1611,8 @@ pub fn extract_wiring_annotations(path: &str, source: &str) -> Vec<WiringAnnotat
 
 /// The author's explicit "this file is intentionally unwired" declaration.
 ///
-/// One spelling, matching `devcouncil.indexing.wiring.ALLOW_UNWIRED` exactly.
-/// The two are asserted equal by `tests/allow_unwired_and_dynamic_imports.rs`,
+/// One spelling. `tests/allow_unwired_and_dynamic_imports.rs` pins the literal
+/// and checks it against a file in this repository that carries the marker,
 /// because a marker the kernel spells differently is a marker the kernel
 /// ignores — silently, and only for the files that use it.
 pub const ALLOW_UNWIRED: &str = "devcouncil: allow-unwired";
@@ -2424,8 +2425,8 @@ mod tests {
     /// `register` and `@FastAPI_thing` a `fastapi`. Because the annotation this
     /// feeds targets the *file* and `is_file_exempt` exempts every symbol in
     /// the file, one such line hides a whole file from the dead-code scan.
-    /// `devcouncil.indexing.wiring.is_wiring_decorated` is the spec: dotted
-    /// hints match as prefixes, bare hints as whole segments.
+    /// Dotted hints match as prefixes, bare hints as whole segments. (The Python
+    /// `is_wiring_decorated` this was ported from is deleted.)
     #[test]
     fn wiring_decorator_hints_are_prefixes_and_segments_not_substrings() {
         for decorator in [

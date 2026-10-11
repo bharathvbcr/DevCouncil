@@ -32,10 +32,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::os::unix::fs::PermissionsExt;
 
 #[cfg(unix)]
-#[path = "support/restriction.rs"]
-mod restriction;
-#[cfg(unix)]
-use restriction::restriction_holds;
+include!("../../testsupport/restriction.rs");
 
 /// A scratch repository named for the test using it. No `tempfile`
 /// dev-dependency exists in this workspace and this does not add one.

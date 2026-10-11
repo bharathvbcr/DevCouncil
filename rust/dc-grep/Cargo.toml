@@ -4,7 +4,7 @@ version.workspace = true
 edition = "2024"
 license.workspace = true
 description = "Repository search with ripgrep matching and verified tgrep candidate indexing"
-rust-version = "1.89"
+rust-version.workspace = true
 
 # These are ripgrep's own libraries — the same crates BurntSushi/ripgrep builds
 # its binary from — rather than a shell-out to an `rg` on PATH.

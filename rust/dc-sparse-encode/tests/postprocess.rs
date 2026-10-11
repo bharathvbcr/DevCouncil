@@ -28,7 +28,10 @@ fn recorded_ids_match_document_tokenisation_and_pooled_rows_round_to_the_jsonl()
     let vocab_map = lookup(&tokens);
     let drop = special_drop(&tokens).unwrap();
     assert!(drop.contains(&0) && drop.contains(&101) && drop.contains(&102) && drop.contains(&103));
-    assert!(!drop.contains(&100), "[UNK] is a document signal and is kept");
+    assert!(
+        !drop.contains(&100),
+        "[UNK] is a document signal and is kept"
+    );
 
     for model in MODELS {
         let dir = fixtures().join(model);
@@ -40,7 +43,11 @@ fn recorded_ids_match_document_tokenisation_and_pooled_rows_round_to_the_jsonl()
         let header_vocab = header["vocab"].as_array().unwrap();
         assert_eq!(header_vocab.len(), tokens.len());
         for (i, token) in tokens.iter().enumerate() {
-            assert_eq!(header_vocab[i].as_str().unwrap(), token, "{model} vocab id {i}");
+            assert_eq!(
+                header_vocab[i].as_str().unwrap(),
+                token,
+                "{model} vocab id {i}"
+            );
         }
         let parity = header["parity"].as_array().unwrap();
         assert!(!parity.is_empty());
@@ -63,10 +70,9 @@ fn recorded_ids_match_document_tokenisation_and_pooled_rows_round_to_the_jsonl()
             }
             expected_docs.push(serde_json::from_str::<serde_json::Value>(line).unwrap());
         }
-        let names: Vec<String> = serde_json::from_str(
-            &std::fs::read_to_string(dir.join("documents.json")).unwrap(),
-        )
-        .unwrap();
+        let names: Vec<String> =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("documents.json")).unwrap())
+                .unwrap();
         assert_eq!(expected_docs.len(), names.len(), "{model}");
 
         for (i, (name, document)) in names.iter().zip(&expected_docs).enumerate() {

@@ -10,9 +10,19 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  goModToolchain,
+  gussetPin,
+  gussetPinVerdict,
+  localTagState,
+  tagVerdict,
+} from "./ci-local-checks.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const GO_MODULE = path.join(REPO_ROOT, "backend", "go_orchestrator");
+
+/** Steps that could not run. They are listed at the end and never counted as passes. */
+const notRun = [];
 
 /**
  * @param {string} label
@@ -39,29 +49,24 @@ function run(label, command, args, opts = {}) {
 }
 
 /**
- * rust/gusset-engine/Cargo.lock records the Gusset version at the revision
- * setup-gusset pins. A sibling at another revision with another version
- * makes the `--locked` build below fail with "cannot update the lock file",
- * which reads like a stale DevCouncil lock. Measured 2026-09-27: a sibling
- * at Gusset v0.0.2 against the 0.0.1 pin. Say which it is before building.
+ * CI builds Gusset at the revision setup-gusset pins, and
+ * rust/gusset-engine/Cargo.lock records that revision's version. A sibling at
+ * any other revision either fails the `--locked` build below with "cannot
+ * update the lock file" (which reads like a stale DevCouncil lock) or, worse,
+ * builds green here against code CI never sees. Fail before building.
  *
  * @param {string} sibling
  */
-function warnIfGussetOffPin(sibling) {
+function requireGussetAtPin(sibling) {
   const actionPath = path.join(REPO_ROOT, ".github", "actions", "setup-gusset", "action.yml");
-  const pin = existsSync(actionPath)
-    ? /^\s*ref:\s*([0-9a-f]{40})\s*$/m.exec(readFileSync(actionPath, "utf8"))?.[1]
-    : undefined;
+  const pin = existsSync(actionPath) ? gussetPin(readFileSync(actionPath, "utf8")) : undefined;
   const head = spawnSync("git", ["-C", sibling, "rev-parse", "HEAD"], { encoding: "utf8", shell: false });
-  const sha = head.status === 0 ? head.stdout.trim() : "";
-  if (pin && sha && sha !== pin) {
-    console.warn(
-      `WARN: Gusset checkout ${sibling} is at ${sha.slice(0, 12)}, but CI pins ${pin.slice(0, 12)} ` +
-        "(.github/actions/setup-gusset/action.yml). If the --locked build below fails on the " +
-        `gusset entry, check out the pin (git -C ${sibling} checkout ${pin.slice(0, 12)}); ` +
-        "the DevCouncil lock is not what moved.",
-    );
+  const verdict = gussetPinVerdict(pin, head.status === 0 ? head.stdout.trim() : "");
+  if (!verdict.ok) {
+    console.error(`FAIL: ${verdict.message}`);
+    process.exit(1);
   }
+  console.log(`ok: ${verdict.message}`);
 }
 
 /**
@@ -79,7 +84,7 @@ function ensureGussetEngine() {
     );
     process.exit(2);
   }
-  warnIfGussetOffPin(path.dirname(siblingMod));
+  requireGussetAtPin(path.dirname(siblingMod));
   run("gusset engine", "cargo", [
     "build",
     "--release",
@@ -109,9 +114,33 @@ function ensureGussetEngine() {
   process.env.CGO_CFLAGS = `${base ? `${base} ` : ""}-DDEVCOUNCIL_GUSSET_ENGINE_SHA256=${sum}`;
 }
 
+/**
+ * gofmt output differs between Go releases, and CI runs the one go.mod
+ * declares (setup-gusset's neighbours use setup-go with go-version-file). A
+ * newer local gofmt called a file clean that CI then rejected, so resolve the
+ * declared toolchain's own gofmt.
+ */
 function gofmtClean() {
   console.log("\n== gofmt ==");
-  const result = spawnSync("gofmt", ["-l", "."], {
+  const toolchain = goModToolchain(readFileSync(path.join(GO_MODULE, "go.mod"), "utf8"));
+  if (!toolchain) {
+    console.error("FAIL: no go or toolchain line in backend/go_orchestrator/go.mod");
+    process.exit(2);
+  }
+  const root = spawnSync("go", ["env", "GOROOT"], {
+    cwd: GO_MODULE,
+    env: { ...process.env, GOTOOLCHAIN: toolchain },
+    encoding: "utf8",
+    shell: false,
+  });
+  const goroot = root.status === 0 ? root.stdout.trim() : "";
+  if (!goroot) {
+    console.error(`FAIL: could not resolve ${toolchain} (${(root.stderr || "").trim()}); gofmt was not run`);
+    process.exit(2);
+  }
+  const gofmt = path.join(goroot, "bin", process.platform === "win32" ? "gofmt.exe" : "gofmt");
+  console.log(`gofmt from ${toolchain}`);
+  const result = spawnSync(gofmt, ["-l", "."], {
     cwd: GO_MODULE,
     encoding: "utf8",
     shell: false,
@@ -146,11 +175,25 @@ function releaseTagAgrees(dcrelease) {
     console.error(`FAIL: no version in ${pkgPath}`);
     process.exit(2);
   }
-  run("release identity (tag path)", dcrelease, ["--tag", `v${version}`, "--tag-at-head"]);
+  const state = localTagState(REPO_ROOT, version);
+  const verdict = tagVerdict(state);
+  if (verdict === "NOT RUN") {
+    // No local tag: nothing to compare with HEAD. The owner creates and pushes
+    // the tag at the release commit once every workflow is green.
+    console.log(`\n== release identity (tag path) ==\nNOT RUN: no local tag ${state.tag}`);
+    notRun.push(`release identity (tag path): no local tag ${state.tag}`);
+    return;
+  }
+  if (verdict === "FAIL" && state.state === "unknown") {
+    console.error(`FAIL: ${state.reason}`);
+    process.exit(2);
+  }
+  // off-head fails inside dcrelease with the notes-behind-the-tag explanation.
+  run("release identity (tag path)", dcrelease, ["--tag", state.tag, "--tag-at-head"]);
 }
 
 function main() {
-  run("script tests", process.execPath, ["--test", "scripts/check-workflows.test.mjs"]);
+  run("script tests", process.execPath, ["--test", "scripts/check-workflows.test.mjs", "scripts/sync-agent-defs.test.mjs", "scripts/ci-local.test.mjs"]);
   run("release gate tests", "go", ["test", "./devcouncil/release", "./cmd/dcrelease", "-count=1"], {
     cwd: GO_MODULE,
   });
@@ -176,6 +219,11 @@ function main() {
   run("rust verify --quick", "bash", ["./verify.sh", "--quick"], {
     cwd: path.join(REPO_ROOT, "rust"),
   });
+  if (notRun.length > 0) {
+    console.log(`\nOK: ci:local, with ${notRun.length} step(s) NOT RUN:`);
+    for (const line of notRun) console.log(`  - ${line}`);
+    return;
+  }
   console.log("\nOK: ci:local");
 }
 

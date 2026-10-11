@@ -510,6 +510,7 @@ dependencies = [
 [[package]]
 name = "tessl"
 version = "0.2.0"
+source = "git+https://github.com/bharathvbcr/tessl?rev=de4747a25d7edf22d3c3f44b1991b7ef7f446651#de4747a25d7edf22d3c3f44b1991b7ef7f446651"
 dependencies = [
  "block2",
  "dispatch2",

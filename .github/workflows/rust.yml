@@ -12,6 +12,10 @@ on:
   push:
     paths:
       - "rust/devmap-*/**"
+      # Every devmap crate depends on these three.
+      - "rust/dc-proc/**"
+      - "rust/dc-regress/**"
+      - "rust/dc-regress-store/**"
       - "rust/vendor/**"
       - "rust/testdata/**"
       - "rust/tools/**"
@@ -21,13 +25,20 @@ on:
       - "rust/.gitignore"
       - ".github/workflows/rust.yml"
       - ".github/actions/setup-gusset/**"
+      - ".github/actions/setup-rust/**"
+      - "rust-toolchain.toml"
       - "rust/gusset-engine/**"
+      - "rust/dc-sparse-encode/**"
       - "backend/go_orchestrator/gussetfn/**"
       - "backend/go_orchestrator/policy/**"
       - "backend/go_orchestrator/fnmatch/**"
   pull_request:
     paths:
       - "rust/devmap-*/**"
+      # Every devmap crate depends on these three.
+      - "rust/dc-proc/**"
+      - "rust/dc-regress/**"
+      - "rust/dc-regress-store/**"
       - "rust/vendor/**"
       - "rust/testdata/**"
       - "rust/tools/**"
@@ -37,7 +48,10 @@ on:
       - "rust/.gitignore"
       - ".github/workflows/rust.yml"
       - ".github/actions/setup-gusset/**"
+      - ".github/actions/setup-rust/**"
+      - "rust-toolchain.toml"
       - "rust/gusset-engine/**"
+      - "rust/dc-sparse-encode/**"
       - "backend/go_orchestrator/gussetfn/**"
       - "backend/go_orchestrator/policy/**"
       - "backend/go_orchestrator/fnmatch/**"
@@ -58,6 +72,12 @@ env:
   RUST_TEST_THREADS: "2"
   TOKIO_WORKER_THREADS: "2"
 
+# One run per workflow and ref: a newer push supersedes the one in flight.
+# Tag refs are never cancelled, so a release cannot be cut off by a later push.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
   test:
     name: test (${{ matrix.os }})
@@ -70,11 +90,12 @@ jobs:
         os: [ubuntu-latest, macos-15, windows-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
         with:
+          # A failing job still saves its cache; without this the jobs that fail
+          # most never warm one and every rerun rebuilds from nothing.
+          cache-on-failure: true
           workspaces: rust
 
       # Formatting and lints are platform-independent, so one run is enough —
@@ -116,7 +137,7 @@ jobs:
           set -euo pipefail
           suffix=""
           if [[ "$RUNNER_OS" == "Windows" ]]; then suffix=".exe"; fi
-          cargo test -p devmap-cli --test worktree_stress_support -- --nocapture
+          cargo test -p devmap-cli --test it -- worktree_stress_support:: --nocapture
           cargo build -p devmap-cli --example worktree_stress --example ipc_probe
           "target/debug/examples/worktree_stress$suffix" --binary "target/debug/devmap$suffix" --ipc-probe "target/debug/examples/ipc_probe$suffix" --worktrees 2 --fixture-files 4 --rounds 1 --build-workers 2 --output capacity-smoke.json
           "target/debug/examples/worktree_stress$suffix" --binary "target/debug/devmap$suffix" --ipc-probe "target/debug/examples/ipc_probe$suffix" --worktrees 128 --fixture-files 64 --rounds 4 --build-workers 8 --output capacity-native.json
@@ -153,9 +174,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
         with:
+          # A failing job still saves its cache; without this the jobs that fail
+          # most never warm one and every rerun rebuilds from nothing.
+          cache-on-failure: true
           workspaces: rust
       # `dc-verify` is in the loop below, and its json_contract test drives the
       # Go host binary as a real process rather than skipping when it is
@@ -165,6 +189,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: backend/go_orchestrator/go.mod
+          cache-dependency-path: backend/go_orchestrator/go.mod
       - name: Set up Gusset
         uses: ./.github/actions/setup-gusset
       - name: Build the DevCouncil host
@@ -173,7 +198,8 @@ jobs:
       - name: Per-crate feature-off build and test
         run: |
           set -euo pipefail
-          # Every workspace crate, not five of thirteen. The five below were
+          # Every library crate in the workspace, not five of thirteen (only the
+          # devmap-soak harness binary is left out). The five below were
           # the only ones checked, so `devmap-cli`, `devmap-serve` and all the
           # `dc-*` crates — including `dc-proc`, added after this job was
           # written — could lose their feature-off shape with nothing to say
@@ -181,7 +207,7 @@ jobs:
           # pins a green state rather than importing a backlog.
           for crate in devmap-extract devmap-resolve devmap-analyze devmap-store devmap-query \
                        dc-glob dc-proc dc-redact dc-grep dc-store dc-verify dc-evidence \
-                       devmap-serve devmap-cli; do
+                       dc-regress dc-regress-store devmap-serve devmap-cli; do
             echo "::group::$crate"
             cargo check -p "$crate" --no-default-features --all-targets
             cargo test -p "$crate" --no-default-features
@@ -193,11 +219,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
         with:
+          # A failing job still saves its cache; without this the jobs that fail
+          # most never warm one and every rerun rebuilds from nothing.
+          cache-on-failure: true
           workspaces: rust
       - name: Install gate dependencies
         run: sudo apt-get update && sudo apt-get install -y sqlite3 rsync
@@ -205,6 +232,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: backend/go_orchestrator/go.mod
+          cache-dependency-path: backend/go_orchestrator/go.mod
       # verify.sh builds the host. That link needs the sibling checkout and
       # libgusset.a; the script builds the archive when the sibling is already
       # on disk, and fails when it is not.
@@ -233,17 +261,23 @@ jobs:
         working-directory: .
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-rust
         with:
           targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
         with:
+          # A failing job still saves its cache; without this the jobs that fail
+          # most never warm one and every rerun rebuilds from nothing.
+          cache-on-failure: true
           workspaces: rust/gusset-engine
       - uses: actions/setup-go@v5
         with:
           go-version-file: backend/go_orchestrator/go.mod
+          cache-dependency-path: backend/go_orchestrator/go.mod
       - name: Set up Gusset
         uses: ./.github/actions/setup-gusset
+      - name: Format the standalone gusset-engine workspace
+        run: cargo fmt --manifest-path rust/gusset-engine/Cargo.toml -- --check
       - name: Install musl-gcc
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build, inspect and self-test the static host
@@ -273,14 +307,20 @@ jobs:
             exit 1
           fi
 
-  parity:
-    name: release build
-    runs-on: ubuntu-latest
+  # dc-sparse-encode is a workspace of its own (tessl is Apple-silicon only and
+  # compiles Metal 4 shaders), so `cargo test --workspace` never builds it and
+  # nothing tested its fp32 oracle. This job does, on the one runner family
+  # that can. ci-test.sh prints NOT RUN, exit 0, only for a missing Metal
+  # toolchain, a pre-26 SDK or no Metal device; every other failure fails.
+  sparse-encode:
+    name: dc-sparse-encode (macos-15)
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: rust
-      - name: Build release binary
-        run: cargo build --release -p devmap-cli --bin devmap
+          cache-on-failure: true
+          workspaces: rust/dc-sparse-encode
+      - name: Test
+        run: bash dc-sparse-encode/ci-test.sh

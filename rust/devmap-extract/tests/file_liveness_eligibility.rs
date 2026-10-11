@@ -607,8 +607,8 @@ fn a_fixture_directory_is_matched_on_segments_and_not_on_the_filename() {
 
 /// The fixture rule is additive: `is_test_path` is unchanged.
 ///
-/// It is pinned equal to `devcouncil.indexing.wiring.is_test_path` by a parity
-/// test, so widening it would break the parity rather than fix the finding.
+/// Widening it would move every test-path decision rather than fix the finding;
+/// the Python `is_test_path` it was once pinned equal to is deleted.
 #[test]
 fn the_fixture_rule_does_not_widen_the_test_path_rule() {
     for path in [

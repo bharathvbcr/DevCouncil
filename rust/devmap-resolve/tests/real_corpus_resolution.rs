@@ -16,7 +16,7 @@
 //!
 //! ```text
 //! DEVMAP_MARKDEV_ROOT=/path/to/MarkDev \
-//!   cargo test -p devmap-resolve --test real_corpus_resolution -- --ignored --nocapture
+//!   cargo test -p devmap-resolve --test it -- real_corpus_resolution:: --ignored --nocapture
 //! ```
 //!
 //! A checkout at any other commit is refused, not measured: the sample's line

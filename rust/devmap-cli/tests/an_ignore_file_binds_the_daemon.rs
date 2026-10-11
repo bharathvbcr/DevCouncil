@@ -5,6 +5,7 @@
 //! `search skipme` found it, `status` read stale, and the next `devmap build`
 //! dropped it — `Changes: +0 ~0 -1` — until the next edit re-added it.
 
+#[path = "support_ignored/mod.rs"]
 mod support_ignored;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
