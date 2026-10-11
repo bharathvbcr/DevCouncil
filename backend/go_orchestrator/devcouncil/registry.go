@@ -9,7 +9,6 @@ import (
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
-	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/gatescfg"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/stopgate"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/verify"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/gate"
@@ -54,8 +53,7 @@ type Registry struct {
 // NewRegistry builds the MCP registry. Store/Gate may be nil when the project
 // is not initialized; tools then fail closed with not_initialized.
 func NewRegistry(root string, storeClient *store.Client, g *gate.Gate) *Registry {
-	lease := &LeaseService{Store: storeClient}
-	lease.GateMode = gatescfg.Load(root).VerificationMode
+	lease := &LeaseService{Store: storeClient, Root: root}
 	return &Registry{
 		Root:  root,
 		Store: storeClient,
@@ -232,6 +230,15 @@ func (r *Registry) callRelease(ctx context.Context, args map[string]any) any {
 	return r.Lease.Release(ctx, taskID, token)
 }
 
+// GateState is the gate mode as of this call. Every caller that needs the mode
+// asks here, so a `gate set` on disk reaches a host that is already running.
+func (r *Registry) GateState() verify.GateState {
+	if r.Lease != nil {
+		return r.Lease.GateState()
+	}
+	return (&LeaseService{Root: r.Root}).GateState()
+}
+
 func (r *Registry) callNextTask(ctx context.Context, args map[string]any) any {
 	_ = args
 	if r.Store == nil {
@@ -242,13 +249,13 @@ func (r *Registry) callNextTask(ctx context.Context, args map[string]any) any {
 		return map[string]any{"ok": false, "error": err.Error(), "code": "store_error"}
 	}
 	if len(ids) == 0 {
-		return map[string]any{"ok": true, "task": nil}
+		return withGateConfigError(map[string]any{"ok": true, "task": nil}, r.GateState())
 	}
 	task, err := r.Store.Task(ctx, ids[0])
 	if err != nil {
 		return map[string]any{"ok": false, "error": err.Error(), "code": "store_error"}
 	}
-	return map[string]any{"ok": true, "task_id": ids[0], "task": task}
+	return withGateConfigError(map[string]any{"ok": true, "task_id": ids[0], "task": task}, r.GateState())
 }
 
 func (r *Registry) callVerify(ctx context.Context, args map[string]any) any {
@@ -263,15 +270,10 @@ func (r *Registry) callVerify(ctx context.Context, args map[string]any) any {
 	if r.Store == nil {
 		return ErrorPayload{OK: false, Code: "not_initialized", Error: "DevCouncil state is unavailable in this directory."}
 	}
-	gateMode := ""
-	if r.Lease != nil {
-		gateMode = r.Lease.GateMode
-	}
-	if gateMode == "" {
-		gateMode = gatescfg.Load(r.Root).VerificationMode
-	}
+	gate := r.GateState()
 	out := stopgate.Run(ctx, stopgate.Input{
-		Root: r.Root, Store: r.Store, TaskID: taskID, GateMode: gateMode, Sandbox: verify.SandboxLocal,
+		Root: r.Root, Store: r.Store, TaskID: taskID, GateMode: gate.Mode, Sandbox: verify.SandboxLocal,
+		GateOrigin: gate.Origin, GateConfigPath: gate.ConfigPath, GateConfigError: gate.Error,
 	})
 	if out.Decision.Skipped {
 		return ErrorPayload{OK: false, Code: "verify_error", Error: out.Decision.Reason}

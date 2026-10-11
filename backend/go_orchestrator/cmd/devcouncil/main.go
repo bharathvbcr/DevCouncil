@@ -854,20 +854,14 @@ func runVerify(args []string) int {
 	// the gate would load the whole code graph for a run that never asks it a
 	// question.
 	reg := devcouncil.NewRegistry(root, openStore(root), nil)
-	gateMode := ""
-	if reg.Lease != nil {
-		gateMode = reg.Lease.GateMode
-	}
+	gate := reg.GateState()
 	if modeFlag != "" {
 		parsed, err := gatescfg.ParseMode(modeFlag)
 		if err != nil {
 			console.Errorln(err)
 			return 2
 		}
-		gateMode = parsed
+		gate = verify.GateState{Mode: parsed, Origin: "flag"}
 	}
-	if gateMode == "" {
-		gateMode = gatescfg.Load(root).VerificationMode
-	}
-	return verify.RunCLI(console.Context(), root, reg.Store, taskID, gateMode, sandbox, coveragePath, jsonOut)
+	return verify.RunCLI(console.Context(), root, reg.Store, taskID, gate, sandbox, coveragePath, jsonOut)
 }

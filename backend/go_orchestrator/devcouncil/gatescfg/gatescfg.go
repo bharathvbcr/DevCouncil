@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/flags"
 )
@@ -30,11 +31,14 @@ type Snapshot struct {
 	VerificationOrigin string `json:"verification_origin"`
 	ConfigPath         string `json:"config_path"`
 	ConfigPresent      bool   `json:"config_present"`
+	// Error says why the origin is invalid; empty otherwise.
+	Error string `json:"error,omitempty"`
 }
 
 // Normalize maps config spellings onto off|advisory|enforce.
-// Empty, false, 0, none, and off are off. Unknown values are refused by
-// ParseMode; Normalize treats them as off so a typo cannot silently enforce.
+// Empty, false, 0, none, and off are off. An unknown spelling is a bad config,
+// and a bad config fails closed: it resolves to enforce with origin invalid, so
+// a typo such as `enforced` cannot switch the gate off.
 func Normalize(raw string) (mode, origin string) {
 	s := strings.TrimSpace(strings.ToLower(raw))
 	switch s {
@@ -47,7 +51,7 @@ func Normalize(raw string) (mode, origin string) {
 	case "enforce", "true", "1", "yes":
 		return ModeEnforce, OriginConfig
 	default:
-		return ModeOff, OriginInvalid
+		return ModeEnforce, OriginInvalid
 	}
 }
 
@@ -66,7 +70,18 @@ func ParseMode(raw string) (string, error) {
 	}
 }
 
-// Load reads `.devcouncil/config.yaml` under root. Missing file → off, origin default.
+// failClosed marks snap as a bad config: enforce, with the reason.
+func failClosed(snap Snapshot, reason string) Snapshot {
+	snap.VerificationMode = ModeEnforce
+	snap.VerificationOrigin = OriginInvalid
+	snap.Error = reason
+	return snap
+}
+
+// Load reads `.devcouncil/config.yaml` under root, uncached. A missing file is
+// off, origin default, and is the only way to reach the default. A file that is
+// present but cannot be opened or parsed, or that holds a scalar `gates` or an
+// unknown mode, is enforce with origin invalid and the reason in Error.
 func Load(root string) Snapshot {
 	path := filepath.Join(root, ".devcouncil", "config.yaml")
 	snap := Snapshot{
@@ -76,22 +91,26 @@ func Load(root string) Snapshot {
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return snap
+		if os.IsNotExist(err) {
+			return snap
+		}
+		snap.ConfigPresent = true
+		return failClosed(snap, fmt.Sprintf("%s: %v", path, err))
 	}
 	defer func() { _ = f.Close() }()
 	snap.ConfigPresent = true
 	values, err := flags.ParseConfig(f)
 	if err != nil {
-		snap.VerificationOrigin = OriginInvalid
-		return snap
+		return failClosed(snap, fmt.Sprintf("%s: %v", path, err))
 	}
 	if _, scalar := values["gates"]; scalar {
 		// `gates: [` and `gates: off` are scalars, not a mapping with mode.
-		// Treat them as unreadable rather than as "no gates.mode, default off".
-		snap.VerificationOrigin = OriginInvalid
-		return snap
+		return failClosed(snap, path+": gates must be a mapping with a mode key, not a scalar")
 	}
 	snap.VerificationMode, snap.VerificationOrigin = Normalize(values["gates.mode"])
+	if snap.VerificationOrigin == OriginInvalid {
+		snap.Error = fmt.Sprintf("%s: unknown gate mode %q (want off, advisory, or enforce)", path, values["gates.mode"])
+	}
 	// Neither `execution.hook_gate.mode` nor `integrations.<host>.write_gate`
 	// is read. Both named pre-tool-use containment that only DevCouncil's
 	// retired lifecycle hooks ever installed, and `contain` was a mode that
@@ -106,6 +125,55 @@ func Load(root string) Snapshot {
 	// `gate status` print a knob that did nothing, which is the shape of a
 	// setting that reads as enforcement without being any. A key left in an
 	// existing config.yaml is inert and needs no migration.
+	return snap
+}
+
+// fileKey identifies one reading of the config file: a different file (inode),
+// a rewrite (mtime, size) or a chmod (mode) all change it.
+type fileKey struct {
+	mtime int64
+	ino   uint64
+	size  int64
+	mode  os.FileMode
+}
+
+var (
+	resolveMu    sync.Mutex
+	resolveCache = map[string]resolved{}
+)
+
+type resolved struct {
+	key  fileKey
+	snap Snapshot
+}
+
+// Resolve is Load, read per call: it stats the file and re-reads it only when
+// the file changed, so `gate set --mode enforce` reaches a host that is already
+// running without a restart, and a long-lived host does not parse the file on
+// every tool call. It fails closed exactly as Load does.
+func Resolve(root string) Snapshot {
+	path := filepath.Join(root, ".devcouncil", "config.yaml")
+	info, err := os.Stat(path)
+	if err != nil {
+		resolveMu.Lock()
+		delete(resolveCache, path)
+		resolveMu.Unlock()
+		return Load(root)
+	}
+	key := fileKey{mtime: info.ModTime().UnixNano(), ino: inode(info), size: info.Size(), mode: info.Mode()}
+	resolveMu.Lock()
+	if hit, ok := resolveCache[path]; ok && hit.key == key {
+		resolveMu.Unlock()
+		return hit.snap
+	}
+	resolveMu.Unlock()
+	snap := Load(root)
+	resolveMu.Lock()
+	if len(resolveCache) > 64 {
+		resolveCache = map[string]resolved{}
+	}
+	resolveCache[path] = resolved{key: key, snap: snap}
+	resolveMu.Unlock()
 	return snap
 }
 

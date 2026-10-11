@@ -91,6 +91,7 @@ func Run(ctx context.Context, in Input) (gaps []Gap, meta runMeta) {
 	if meta.GateMode == "" {
 		meta.GateMode = "off"
 	}
+	meta.Env = in.EnvPolicy
 	meta.Difficulty = in.Difficulty
 	if meta.Difficulty == "" && in.Task != nil {
 		meta.Difficulty = in.Task.Difficulty
@@ -105,6 +106,14 @@ func Run(ctx context.Context, in Input) (gaps []Gap, meta runMeta) {
 	if in.Task != nil {
 		taskID = in.Task.ID
 		planned = in.Task.PlannedFiles
+	}
+
+	if in.GateOrigin == "invalid" {
+		meta.GateOrigin, meta.GateError = in.GateOrigin, in.GateConfigError
+		gaps = append(gaps, gateConfigGap(taskID, in))
+	}
+	if in.EnvPolicy.Err != "" {
+		gaps = append(gaps, envConfigGap(taskID, in.EnvPolicy.Err))
 	}
 
 	workPresent := in.WorkPresent || (!in.DiffEmpty && len(in.ChangedFiles) > 0)
@@ -158,6 +167,9 @@ func Run(ctx context.Context, in Input) (gaps []Gap, meta runMeta) {
 
 type runMeta struct {
 	Sandbox               string
+	GateOrigin            string
+	GateError             string
+	Env                   EnvPolicy
 	GateMode              string
 	Difficulty            string
 	DiffEmpty             bool
@@ -230,6 +242,8 @@ func ToMCP(taskID string, gaps []Gap, meta runMeta) MCPResult {
 		Passed:                passed,
 		Status:                status,
 		GateMode:              meta.GateMode,
+		GateModeOrigin:        meta.GateOrigin,
+		GateModeError:         meta.GateError,
 		Difficulty:            meta.Difficulty,
 		DiffEmpty:             meta.DiffEmpty,
 		CoverageMeasured:      meta.CoverageMeasured,
@@ -269,6 +283,8 @@ func ToCLITask(taskID string, gaps []Gap, meta runMeta) TaskCLIResult {
 		TaskID:                taskID,
 		Status:                status,
 		GateMode:              meta.GateMode,
+		GateModeOrigin:        meta.GateOrigin,
+		GateModeError:         meta.GateError,
 		Difficulty:            meta.Difficulty,
 		DiffEmpty:             meta.DiffEmpty,
 		CoverageMeasured:      meta.CoverageMeasured,
@@ -388,11 +404,20 @@ func runGit(ctx context.Context, git *proc.GitSession, args ...string) ([]byte, 
 	return stdout.Bytes(), nil
 }
 
+// persistBound bounds the store writes that record a run.
+const persistBound = 30 * time.Second
+
 // Persist writes the verification run and replaces gaps for the task.
+//
+// It runs detached from ctx's cancellation, under its own bound. A run that was
+// cut short — the host's per-call budget, a cancelled request — is exactly the
+// run whose record matters, and writing it on the expired ctx lost it.
 func Persist(ctx context.Context, client *store.Client, taskID string, gaps []Gap, meta runMeta, status string) error {
 	if client == nil {
 		return nil
 	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), persistBound)
+	defer cancel()
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	runID := "run-" + taskID + "-" + shortHash(now+status)
 	env, _ := json.Marshal(map[string]any{
@@ -402,6 +427,15 @@ func Persist(ctx context.Context, client *store.Client, taskID string, gaps []Ga
 		"coverage_measured":       meta.CoverageMeasured,
 		"coverage_skipped_reason": meta.CoverageSkippedReason,
 		"verification_mode":       meta.VerificationMode,
+		// Names only, never values: which variables the commands were allowed
+		// beyond the base list, and which the repository asked for and was
+		// refused.
+		"env_scrub":         "allowlist",
+		"env_allow_extra":   nonNil(meta.Env.Extra),
+		"env_allow_refused": nonNil(meta.Env.Refused),
+		"env_allow_error":   meta.Env.Err,
+		"gate_mode_origin":  meta.GateOrigin,
+		"gate_mode_error":   meta.GateError,
 	})
 	cmds, _ := json.Marshal([]string{})
 	if err := client.RunRecord(ctx, store.VerificationRun{
@@ -449,6 +483,13 @@ func toStoreGaps(gaps []Gap) []store.GapRow {
 	return out
 }
 
+func nonNil(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
+}
+
 func shortHash(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])[:10]
@@ -465,7 +506,7 @@ func shortHash(s string) string {
 //
 // sandbox is refused unless ParseSandbox accepts it, before anything runs or
 // is persisted.
-func VerifyTask(ctx context.Context, root string, client *store.Client, taskID, gateMode, sandbox, coveragePath string) (MCPResult, []Gap, error) {
+func VerifyTask(ctx context.Context, root string, client *store.Client, taskID string, gate GateState, sandbox, coveragePath string) (MCPResult, []Gap, error) {
 	if _, err := ParseSandbox(sandbox); err != nil {
 		return MCPResult{}, nil, err
 	}
@@ -494,18 +535,23 @@ func VerifyTask(ctx context.Context, root string, client *store.Client, taskID, 
 	if len(task.AcceptanceCriterionIDs) > 0 {
 		linked, linkedErr = client.Requirements(ctx, taskID)
 	}
+	envPolicy := LoadEnvPolicy(root)
 	in := Input{
 		Requirements:    linked,
 		RequirementsErr: linkedErr,
 		Root:            root,
 		Task:            task,
-		GateMode:        gateMode,
+		GateMode:        gate.Mode,
+		GateOrigin:      gate.Origin,
+		GateConfigPath:  gate.ConfigPath,
+		GateConfigError: gate.Error,
+		EnvPolicy:       envPolicy,
 		Difficulty:      task.Difficulty,
 		ChangedFiles:    changed,
 		DiffContent:     diff,
 		DiffEmpty:       empty,
 		WorkPresent:     !empty,
-		RunCommand:      DefaultRunCommand(ctx, root),
+		RunCommand:      RunCommandWithEnv(ctx, root, envPolicy),
 		Rigor:           RigorClient(root),
 		CoveragePath:    coveragePath,
 		Lappi:           LappiAsker(),

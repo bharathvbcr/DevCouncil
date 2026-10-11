@@ -82,6 +82,9 @@ func runGateStatus(args []string) int {
 		return 0
 	}
 	console.Printf("verification_mode: %s (%s)\n", snap.VerificationMode, snap.VerificationOrigin)
+	if snap.Error != "" {
+		console.Printf("error:             %s\n", snap.Error)
+	}
 	console.Printf("config:            %s", snap.ConfigPath)
 	if !snap.ConfigPresent {
 		console.Print(" (missing; defaults apply)")

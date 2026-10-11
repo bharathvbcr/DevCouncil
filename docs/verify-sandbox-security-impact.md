@@ -1,10 +1,43 @@
 # Security-impact statement: isolated verification sandbox
 
-**Status: DRAFT, awaiting owner approval.** Nothing below is implemented.
-This statement is the first acceptance criterion of task
-`dc-verify-isolated-sandbox` (ft-7121a94ba987a761beace32a7675461e). Until the
-owner approves it, `verify.ParseSandbox` keeps refusing every value except
-`local`. [Security boundaries](security.md) · [Documentation index](README.md)
+**Status: approved 2026-10-08 by the owner; scope implemented: local env
+scrub.** The container rows below are an approved design, not scheduled.
+Reopen condition for Docker/Nix: a CI job with docker runs the real container
+test. This statement is the first acceptance criterion of task
+`dc-verify-isolated-sandbox` (ft-7121a94ba987a761beace32a7675461e).
+`verify.ParseSandbox` keeps refusing every value except `local`.
+[Security boundaries](security.md) · [Documentation index](README.md)
+
+## Implemented: local environment scrub
+
+`verify/env.go` owns it. Each verification command runs with an allow-listed
+environment instead of the host's:
+
+- **Base list** (`baseEnvAllow`): PATH, HOME, USER, LOGNAME, SHELL, TMPDIR,
+  TMP, TEMP, TZ, TERM, COLORTERM, NO_COLOR, CI, LANG, LANGUAGE, `LC_*`, GOCACHE,
+  GOMODCACHE, GOPATH, GOROOT, GOFLAGS, GOTOOLCHAIN, GOENV, CARGO_HOME,
+  CARGO_TARGET_DIR, RUSTUP_HOME, RUSTUP_TOOLCHAIN, NVM_DIR, NODE_PATH,
+  PYENV_ROOT, VIRTUAL_ENV, JAVA_HOME, XDG_CACHE_HOME, XDG_CONFIG_HOME,
+  XDG_DATA_HOME, XDG_RUNTIME_DIR, DEVELOPER_DIR, SDKROOT. None is a credential.
+- **Per-repo extension**: `verify.env_allow: [NAME, NAME]` in
+  `.devcouncil/config.yaml` (inline list or comma-separated scalar). A block
+  list is an error, not an empty list.
+- **Refusals**: a name that is not a legal variable name, or that contains KEY,
+  SECRET, TOKEN, PASSW, CREDENTIAL, AUTH, PRIVATE or COOKIE, is refused even
+  when listed. `config.yaml` is inside the tree the verified agent edits, so it
+  must not be what hands that agent's judge a credential. A repository that
+  truly needs such a variable has no per-repo route; that is a decision for the
+  owner.
+- **Failure direction**: an unreadable `verify.env_allow` runs the base list
+  alone and adds a blocking `verify_env_config_invalid` gap. Config can only
+  narrow, never widen, beyond the allowlist.
+- **Evidence**: each run records `env_scrub`, `env_allow_extra`,
+  `env_allow_refused` and `env_allow_error` in its environment record. Names
+  only, never values.
+- **Not covered**: HOME is passed, so files under it (`~/.aws`, `~/.ssh`,
+  keychains) stay readable. Only containers would close that, which is why the
+  container design remains approved but parked. The rigor gates and other
+  spawns `verify.Run` makes are unchanged.
 
 ## What runs today
 
@@ -14,7 +47,7 @@ Read from the code on 2026-10-08:
 |---|---|
 | A task's verification commands are its `expected_tests`, falling back to `allowed_commands`, read from the `dcstore` task record. | `verify/orchestrate.go:119`, `verify/types.go:126` |
 | Each command runs as `/bin/sh -c <command>` with the project root as its working directory, in its own process group. | `verify/commands.go` `runCommand` |
-| The child inherits the host process's whole environment, because `cmd.Env` is not set. Any token in that environment is readable by the command. | `verify/commands.go` `runCommand` |
+| Before the scrub, the child inherited the host process's whole environment because `cmd.Env` was not set. It now gets the allow-listed environment described above. | `verify/commands.go` `runCommandWithPolicy`, `verify/env.go` |
 | Each command is bounded by `verify.CommandTimeout` (30 minutes) and by the caller's context. A stopped command's whole process group is killed, and the result is a blocking `test_failed` gap. Before 2026-10-08 there was no bound at all (task dc-verify-local-runner-unbounded). | `verify/commands.go` `CommandTimeout`, `runCommand`, `RunVerificationCommands` |
 | Output is kept up to 4 MiB per command, and a truncation is noted in the summary without changing the exit-code verdict. | `verify/commands.go` `commandOutputLimit`, `proc.CappedBuffer` |
 | Three entry points reach this runner: `devcouncil verify`, `verify.RunCLI` and MCP `devcouncil_verify_task`. The MCP tool means a connected agent can start host execution of the task's stored commands. | `ParseSandbox` callers: `cmd/devcouncil/main.go::runVerify`, `verify/cli.go::RunCLI`, `verify/orchestrate.go::VerifyTask` |
@@ -25,7 +58,7 @@ scope for this statement. They read the diff rather than execute task-supplied
 commands. That claim is inferred from their role and has not been verified by
 reading their spawn code.
 
-## What isolation would promise
+## What isolation would promise (approved design, not scheduled)
 
 A sandbox changes what one verification command can **reach**, not what it
 **proves**. The proposal is that each command runs in a fresh container
@@ -55,9 +88,8 @@ the owner approves or changes:
 - **No silent fallback.** If the requested backend is missing (no Docker
   daemon, no `nix`), the run is refused. It never quietly runs as `local`. A
   run labelled `docker` must have run in Docker.
-- **The `local` sandbox does not change.** It keeps today's behaviour,
-  including the inherited environment, unless the owner decides separately
-  to harden `local` too (see the next section).
+- **The `local` sandbox keeps its host filesystem and network.** Only its
+  environment is scrubbed (see above).
 
 ## Widening or narrowing access
 
@@ -74,11 +106,12 @@ explicit agreement:
 
 The `local` runner's missing timeout and output cap were fixed separately on
 2026-10-08 (task dc-verify-local-runner-unbounded). Scrubbing `local`'s
-inherited environment is a separate owner decision. It is not part of this
-statement.
+inherited environment was approved the same day and is implemented, with the
+extension mechanism and refusals above. The owner is asked to confirm the base
+list and the refusal pattern.
 
 ## Approval
 
-The owner approves, edits or rejects each row of "What isolation would
-promise", and each numbered item above. Implementation starts only after
-that approval is recorded here.
+Approved 2026-10-08 by the owner: every row of "What isolation would promise",
+as drafted, plus the allowlist-only scrub of `local`'s environment. Only the
+scrub is implemented.

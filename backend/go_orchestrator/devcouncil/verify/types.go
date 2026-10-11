@@ -59,6 +59,8 @@ type MCPResult struct {
 	Passed                bool         `json:"passed"`
 	Status                string       `json:"status"`
 	GateMode              string       `json:"gate_mode"`
+	GateModeOrigin        string       `json:"gate_mode_origin,omitempty"`
+	GateModeError         string       `json:"gate_mode_error,omitempty"`
 	Difficulty            string       `json:"difficulty"`
 	DiffEmpty             bool         `json:"diff_empty"`
 	CoverageMeasured      bool         `json:"coverage_measured"`
@@ -81,6 +83,8 @@ type TaskCLIResult struct {
 	TaskID                string       `json:"task_id"`
 	Status                string       `json:"status"`
 	GateMode              string       `json:"gate_mode"`
+	GateModeOrigin        string       `json:"gate_mode_origin,omitempty"`
+	GateModeError         string       `json:"gate_mode_error,omitempty"`
 	Difficulty            string       `json:"difficulty"`
 	DiffEmpty             bool         `json:"diff_empty"`
 	CoverageMeasured      bool         `json:"coverage_measured"`
@@ -101,6 +105,8 @@ type TaskCLIResult struct {
 type CLIResult struct {
 	OK                           bool            `json:"ok"`
 	GateMode                     string          `json:"gate_mode"`
+	GateModeOrigin               string          `json:"gate_mode_origin,omitempty"`
+	GateModeError                string          `json:"gate_mode_error,omitempty"`
 	ProcessedTasks               int             `json:"processed_tasks"`
 	VerifiedTasks                int             `json:"verified_tasks"`
 	BlockedTasks                 int             `json:"blocked_tasks"`
@@ -110,12 +116,41 @@ type CLIResult struct {
 	Error                        string          `json:"error,omitempty"`
 }
 
+// GateState is a resolved gate mode with its provenance. It is what the entry
+// points (VerifyTask, RunCLI, the stop gate) take in place of a bare mode, so
+// that an invalid config reaches the payload instead of being flattened to a
+// mode string on the way.
+type GateState struct {
+	Mode       string
+	Origin     string
+	ConfigPath string
+	Error      string
+}
+
+// GateConfigInvalid is the gap type for a gate config that could not be read.
+const GateConfigInvalid = "gate_config_invalid"
+
+// VerifyEnvConfigInvalid is the gap type for an unreadable verify.env_allow.
+const VerifyEnvConfigInvalid = "verify_env_config_invalid"
+
 // Input is everything orchestration needs from the outside world.
 type Input struct {
 	Root       string
 	Task       *store.Task
 	GateMode   string
 	Difficulty string
+
+	// GateOrigin, GateConfigPath and GateConfigError describe where GateMode
+	// came from. An origin of "invalid" means the config could not be read as
+	// a gate setting, GateMode is the enforce it fell back to, and Run adds a
+	// blocking GateConfigInvalid gap naming the path and the error.
+	GateOrigin      string
+	GateConfigPath  string
+	GateConfigError string
+
+	// EnvPolicy is the environment the verification commands ran with; Run
+	// records it in the evidence and reports an unreadable allowlist as a gap.
+	EnvPolicy EnvPolicy
 
 	// ChangedFiles and DiffContent come from git (or a test double).
 	ChangedFiles []string

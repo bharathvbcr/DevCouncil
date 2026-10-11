@@ -19,14 +19,21 @@ The implementation-level reference is
 ## Verification commands run on the host
 
 The Go gateway executes task commands through a local shell
-(`/bin/sh -c`) in the project root, with the host's environment. Each command
+(`/bin/sh -c`) in the project root, with an allow-listed environment: the
+base list in `verify/env.go` (PATH, HOME, the Go, Cargo, Rustup, Node, Python
+and JVM roots, locale and temp variables) plus names a repository lists in
+`verify.env_allow: [NAME, NAME]` in `.devcouncil/config.yaml`. A name shaped
+like a credential (KEY, SECRET, TOKEN, PASSWORD, CREDENTIAL, AUTH, PRIVATE,
+COOKIE) is refused there, and every admitted and refused name is recorded in
+the run's evidence. Each command
 is bounded by a 30-minute timeout (`verify.CommandTimeout`) and by
 cancellation of the run, its process group is killed when it is stopped, and
 at most 4 MiB of its output is kept. `local` is the only sandbox: `verify.ParseSandbox` refuses any
 other `--sandbox` value (exit 2, or an MCP error) rather than recording a
-sandbox that did not run. Docker/Nix isolation is planned but not built. Its
-security-impact statement is
-[awaiting approval](verify-sandbox-security-impact.md). Review task command
+sandbox that did not run. Docker/Nix isolation is an approved design and is
+not scheduled; see the [security-impact statement](verify-sandbox-security-impact.md).
+The environment scrub does not hide files: a command can still read
+`~/.aws` or `~/.ssh` through HOME. Review task command
 lists and project configuration before running verification, as you would
 review CI workflow changes.
 

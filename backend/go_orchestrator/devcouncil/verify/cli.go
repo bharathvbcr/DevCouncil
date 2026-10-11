@@ -15,7 +15,7 @@ import (
 // coveragePath is empty unless the operator names a profile. The rigor gates
 // that read added lines run regardless; only the diff∩coverage gate needs one,
 // and without it the report says so rather than reporting a diff as exercised.
-func RunCLI(ctx context.Context, root string, client *store.Client, taskID, gateMode, sandbox, coveragePath string, jsonOut bool) int {
+func RunCLI(ctx context.Context, root string, client *store.Client, taskID string, gate GateState, sandbox, coveragePath string, jsonOut bool) int {
 	if client == nil {
 		payload := map[string]any{"ok": false, "error": "DevCouncil state is unavailable in this directory."}
 		writeJSON(payload)
@@ -28,8 +28,8 @@ func RunCLI(ctx context.Context, root string, client *store.Client, taskID, gate
 		writeJSON(map[string]any{"ok": false, "error": err.Error()})
 		return 2
 	}
-	if gateMode == "" {
-		gateMode = "off"
+	if gate.Mode == "" {
+		gate.Mode = "off"
 	}
 
 	var taskIDs []string
@@ -52,7 +52,9 @@ func RunCLI(ctx context.Context, root string, client *store.Client, taskID, gate
 
 	cli := CLIResult{
 		OK:                           true,
-		GateMode:                     gateMode,
+		GateMode:                     gate.Mode,
+		GateModeOrigin:               gateOriginIfInvalid(gate),
+		GateModeError:                gateErrorIfInvalid(gate),
 		ProcessedTasks:               0,
 		VerifiedTasks:                0,
 		BlockedTasks:                 0,
@@ -61,7 +63,7 @@ func RunCLI(ctx context.Context, root string, client *store.Client, taskID, gate
 		Tasks:                        []TaskCLIResult{},
 	}
 	for _, id := range taskIDs {
-		mcp, gaps, err := VerifyTask(ctx, root, client, id, gateMode, sandbox, coveragePath)
+		mcp, gaps, err := VerifyTask(ctx, root, client, id, gate, sandbox, coveragePath)
 		if err != nil {
 			cli.OK = false
 			cli.Error = err.Error()
@@ -71,6 +73,8 @@ func RunCLI(ctx context.Context, root string, client *store.Client, taskID, gate
 		meta := runMeta{
 			Sandbox:               mcp.Sandbox,
 			GateMode:              mcp.GateMode,
+			GateOrigin:            mcp.GateModeOrigin,
+			GateError:             mcp.GateModeError,
 			Difficulty:            mcp.Difficulty,
 			DiffEmpty:             mcp.DiffEmpty,
 			CoverageMeasured:      mcp.CoverageMeasured,
@@ -120,4 +124,20 @@ func writeJSON(v any) bool {
 		return false
 	}
 	return true
+}
+
+// gateOriginIfInvalid is the origin only when it says the config was bad; a
+// healthy origin adds nothing to the envelope.
+func gateOriginIfInvalid(g GateState) string {
+	if g.Origin == "invalid" {
+		return g.Origin
+	}
+	return ""
+}
+
+func gateErrorIfInvalid(g GateState) string {
+	if g.Origin == "invalid" {
+		return g.Error
+	}
+	return ""
 }

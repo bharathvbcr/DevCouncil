@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -153,7 +154,13 @@ func RunVerificationCommands(taskID string, commands []string, run func(string) 
 // reported as exit -1 with a "Failed to run command: …" summary so
 // CommandIsMalformed classifies it as invalid, never as a pass.
 func DefaultRunCommand(ctx context.Context, root string) func(string) CommandOutcome {
-	return runCommand(ctx, root, CommandTimeout, commandOutputLimit)
+	return RunCommandWithEnv(ctx, root, LoadEnvPolicy(root))
+}
+
+// RunCommandWithEnv is DefaultRunCommand with the environment policy already
+// resolved, for a caller that also records the policy (VerifyTask does).
+func RunCommandWithEnv(ctx context.Context, root string, policy EnvPolicy) func(string) CommandOutcome {
+	return runCommandWithPolicy(ctx, root, CommandTimeout, commandOutputLimit, policy)
 }
 
 // runCommand is DefaultRunCommand with its bounds as parameters.
@@ -163,6 +170,10 @@ func DefaultRunCommand(ctx context.Context, root string) func(string) CommandOut
 // output pipe open. A stopped command is TimedOut with exit -1, and Reason says
 // whether its deadline passed or the caller cancelled the run.
 func runCommand(ctx context.Context, root string, timeout time.Duration, limit int) func(string) CommandOutcome {
+	return runCommandWithPolicy(ctx, root, timeout, limit, EnvPolicy{})
+}
+
+func runCommandWithPolicy(ctx context.Context, root string, timeout time.Duration, limit int, policy EnvPolicy) func(string) CommandOutcome {
 	return func(command string) CommandOutcome {
 		cctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
@@ -172,6 +183,9 @@ func runCommand(ctx context.Context, root string, timeout time.Duration, limit i
 		cmd := exec.CommandContext(cctx, "/bin/sh", "-c", command)
 		proc.ConfigureGroup(cmd)
 		cmd.Dir = root
+		// Allowlist, not inherit: a nil Env would hand the command every
+		// secret in the host process (docs/verify-sandbox-security-impact.md).
+		cmd.Env = policy.Environ(os.Environ())
 		out := &proc.CappedBuffer{Limit: limit}
 		cmd.Stdout = out
 		cmd.Stderr = out

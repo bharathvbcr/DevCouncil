@@ -35,6 +35,8 @@ var categoryByGapType = map[string]string{
 	"architecture_check_unavailable":  "review",
 	"rigor_check_unavailable":         "fix_verification",
 	"unsupported_verification_method": "fix_verification",
+	GateConfigInvalid:                 "fix_config",
+	VerifyEnvConfigInvalid:            "fix_config",
 }
 
 func looksLikePath(value string) bool {
@@ -75,6 +77,10 @@ func actionText(g Gap, file *string) string {
 			return "Fix the failing check, then re-run: " + *g.SuggestedCommand
 		}
 		return "Fix the failing verification check, then re-verify."
+	case GateConfigInvalid:
+		return "Fix the gate config named in the gap (gates.mode is off, advisory or enforce), then re-verify."
+	case VerifyEnvConfigInvalid:
+		return "Write verify.env_allow in .devcouncil/config.yaml as an inline list, [NAME, NAME], then re-verify."
 	case "invalid_verification_command":
 		return "Replace the unrunnable verification command with a single runnable command, then re-verify."
 	case "diff_not_exercised":
