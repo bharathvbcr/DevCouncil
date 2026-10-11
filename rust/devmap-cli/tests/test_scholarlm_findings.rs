@@ -47,10 +47,12 @@ fn init_git(root: &Path) {
     assert!(status.success(), "git init failed");
 }
 
+/// A dead row whose evidence reached the confident tier ([`earned_confident_tier`]):
+/// these fixtures are Python, which has not earned the tier since the 2026-10-10
+/// corpus record, so its confident rows publish at 0.4 `confident_tier_unproven`.
 fn confident_dead<'a>(analysis: &'a AnalysisSummary, name: &str) -> Option<&'a DeadSymbolReport> {
     analysis.dead_symbols.iter().find(|report| {
-        !report.is_exempt
-            && report.confidence >= 0.9
+        earned_confident_tier(report)
             && (report.symbol_name == name
                 || report.symbol_name.ends_with(&format!(".{name}"))
                 || report.symbol_name.ends_with(&format!("::{name}")))
@@ -727,7 +729,9 @@ fn typescript_generic_importtype_does_not_swallow_the_export() {
 
 #[test]
 fn persisted_high_confidence_survives_sql_inequality() {
-    let ext = extract_file("dead.py", "def unused():\n    pass\n");
+    // Go, because the row must *publish* at 0.9 for the round trip to mean
+    // anything, and Go is in `CONFIDENT_TIER_ELIGIBLE`.
+    let ext = extract_file("dead.go", "package dead\n\nfunc unused() {}\n");
     let result = resolve(std::slice::from_ref(&ext));
     let analysis = analyze(std::slice::from_ref(&ext), &result);
     assert!(

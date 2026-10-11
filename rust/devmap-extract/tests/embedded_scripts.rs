@@ -859,8 +859,12 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     //
     // v87 is the Kotlin accuracy payload (typed parameters and properties, scope
     // functions, `package` headers, Android manifests, Ruby attributes).
+    //
+    // v88 is the dead-policy lane's payload (Rust/Kotlin/Swift keys, receivers
+    // and module-privacy scopes, `project.pbxproj`, and a qualified JS/TS base
+    // as one Heritage reference per segment).
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "87",
+        EXTRACTION_SCHEMA_VERSION, "88",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

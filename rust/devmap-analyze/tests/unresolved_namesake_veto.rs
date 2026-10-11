@@ -88,12 +88,14 @@ fn finding<'a>(reports: &'a [DeadSymbolReport], symbol: &str) -> &'a DeadSymbolR
 fn with_no_unresolved_sites_the_finding_is_confident() {
     let reports = analyze_with(&corpus());
     let render = finding(&reports, "render");
-    assert!(!render.is_exempt);
-    assert_eq!(
-        render.confidence, 0.9,
-        "an uncalled symbol in a fully-resolved corpus is the confident case"
+    // Evidence, not the published number: Python is off
+    // `CONFIDENT_TIER_ELIGIBLE`, so a confident row publishes at 0.4 with
+    // `confident_tier_unproven` — still the confident branch, which is what
+    // every veto below is measured against.
+    assert!(
+        earned_confident_tier(render),
+        "an uncalled symbol in a fully-resolved corpus is the confident case: {render:?}"
     );
-    assert_eq!(render.exemption_reason, None);
 }
 
 /// The veto: an uninferrable receiver naming `render` demotes it.
@@ -120,9 +122,9 @@ fn an_uninferred_receiver_naming_the_symbol_vetoes_the_confident_tier() {
     // And the veto is scoped to the name, not to the corpus: `other` shares the
     // file and keeps its confident finding.
     let other = finding(&reports, "other");
-    assert_eq!(
-        other.confidence, 0.9,
-        "one unresolved name must not demote every symbol beside it"
+    assert!(
+        earned_confident_tier(other),
+        "one unresolved name must not demote every symbol beside it: {other:?}"
     );
 }
 
@@ -232,12 +234,11 @@ fn classes_with_affirmative_evidence_do_not_veto() {
         let reports =
             analyze_with_ledger(&corpus(), vec![row("render", UnresolvedKind::Call, class)]);
         let render = finding(&reports, "render");
-        assert_eq!(
-            render.confidence, 0.9,
+        assert!(
+            earned_confident_tier(render),
             "{label}: this class explains itself, so it is not evidence that \
-             anything calls `render`; vetoing on it would swallow real findings"
+             anything calls `render`; vetoing on it would swallow real findings: {render:?}"
         );
-        assert_eq!(render.exemption_reason, None, "{label}");
     }
 }
 
@@ -256,7 +257,7 @@ fn an_unresolved_import_specifier_does_not_veto() {
             UnresolvedClass::Unresolved,
         )],
     );
-    assert_eq!(finding(&reports, "render").confidence, 0.9);
+    assert!(earned_confident_tier(finding(&reports, "render")));
 }
 
 /// A different name does not veto.
@@ -273,7 +274,7 @@ fn an_unresolved_site_naming_something_else_does_not_veto() {
             UnresolvedClass::Unresolved,
         )],
     );
-    assert_eq!(finding(&reports, "render").confidence, 0.9);
+    assert!(earned_confident_tier(finding(&reports, "render")));
 }
 
 /// An empty callee name matches nothing.
@@ -288,7 +289,7 @@ fn an_empty_callee_name_is_not_a_namesake() {
         &corpus(),
         vec![row("", UnresolvedKind::Call, UnresolvedClass::Unresolved)],
     );
-    assert_eq!(finding(&reports, "render").confidence, 0.9);
+    assert!(earned_confident_tier(finding(&reports, "render")));
 }
 
 /// The veto reason states the imprecision, in the reason itself.

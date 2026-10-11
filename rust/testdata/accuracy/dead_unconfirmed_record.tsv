@@ -1,0 +1,14 @@
+# 0.4-tier ("unconfirmed") dead rows on these fixtures, per language, scored
+# against each fixture's dead.tsv: false_positive counts rows labelled `live`
+# or `exempt`. Bound by devmap-cli/tests/dead_tier_eligibility.rs, so a change
+# that moves a number fails until this file is updated in the same change.
+# Fixture rows only — these are probe-dense audit fixtures, not a corpus sample.
+# language	rows	false_positive
+go	4	2
+java	1	0
+kotlin	11	3
+python	25	1
+rust	3	0
+swift	8	0
+tsx	7	1
+typescript	25	4

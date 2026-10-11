@@ -1275,9 +1275,11 @@ underneath the answer.",
         "dead" => (
             "Dead-symbol candidates with per-row confidence — not one flat delete list. \
 0.9 means no inbound evidence after the call walk *and* a language that has earned the confident \
-tier against its labelled fixture; any other language's would-be 0.9 row is published at 0.4 with \
-a reason starting `confident_tier_unproven`. `only_ambiguous_callers`, unresolved-namesake and \
-`exported_unreferenced` (an export the manifest proves module-private) rows sit at 0.4 \
+tier against its labelled fixture and corpus record; any other language's would-be 0.9 row is \
+published at 0.4 with a reason starting `confident_tier_unproven`. `only_ambiguous_callers`, \
+unresolved-namesake, `external_supertype` / `object_literal_member` (something outside the graph \
+may call it by name) and `exported_unreferenced` (an export the manifest or the language proves \
+module-private) rows sit at 0.4 \
 (unconfirmed); each 0.4 row's `evidence` counts the unbound sites naming it and gives the first \
 `first_path`/`first_line` to check. `excluded` counts, per language, the uncalled symbols never \
 examined — spared by visibility (`not_examined`) or by a recorded reason (`exempt`, `by_reason`) — \
@@ -1726,7 +1728,8 @@ re-ranked by personalized PageRank over call edges. Read `truncated` and `walk_i
             let mut schema = budgeted_envelope(
                 "Dead-symbol reports with per-row confidence and reason: confident vs unconfirmed \
 (`only_ambiguous_callers`, unresolved namesake, coverage-capped, `confident_tier_unproven`, \
-`exported_unreferenced`); unconfirmed rows carry `evidence`. Read `walk_incomplete` and \
+`external_supertype`, `object_literal_member`, `exported_unreferenced`); unconfirmed rows carry \
+`evidence`. Read `walk_incomplete` and \
 `excluded` — a partial corpus is a lower bound, and an exempted one is not a clean bill. \
 Candidate list to verify, not a delete list.",
             );

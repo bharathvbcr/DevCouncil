@@ -12,6 +12,7 @@ pub mod ffi;
 pub mod deadprobe;
 pub mod probes2;
 pub mod guards;
+pub mod visibility; // C52 restricted visibility
 
 // C18 re-export chains
 pub use shapes::circle::reexported_c18; // plain pub use

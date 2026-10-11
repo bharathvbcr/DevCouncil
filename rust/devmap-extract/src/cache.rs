@@ -644,7 +644,20 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// untyped, and every manifest-only class a dead-code candidate, until the
 /// file is edited. The Kotlin lane stamped 82 on this payload; it landed after
 /// the others, so it is 87.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "87";
+///
+/// v88 is the dead-policy lane's payload, stamped 81 and 82 there: a Rust
+/// method of a type declared inside a function is keyed under that function
+/// (`with_guard.Guard.drop`, not `Guard.drop`); a Kotlin callable reference
+/// (`template::m`, `Type::m`) carries its receiver on the name reference; a
+/// Rust `fn main` outside every `src/` tree is an entry point; a Rust
+/// `pub(crate)`/`pub(super)`/`pub(in …)` item carries a `ModulePrivateScope`
+/// annotation; `project.pbxproj` is indexed; a `Package.swift` carries a
+/// `ModulePrivateScope` per executable target; and a qualified JS/TS base
+/// (`extends React.Component`) is one `Heritage` reference per segment,
+/// innermost first, as Python's dotted bases already were. A v87 row keeps the
+/// old Rust keys and lacks every one of those facts. It landed after the
+/// Kotlin lane, so it is 88.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "88";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

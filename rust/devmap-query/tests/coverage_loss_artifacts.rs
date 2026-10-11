@@ -118,21 +118,37 @@ fn a_fully_read_corpus_reports_ok_and_reaches_the_extracted_tier() {
         .iter()
         .find(|row| row["id"] == "orphan.py::never_called")
         .expect("a symbol nothing calls is still a finding");
-    assert_eq!(
-        orphan["confidence"], "extracted",
+    // The confident branch, read off the published row: Python is off
+    // `CONFIDENT_TIER_ELIGIBLE`, so its confident findings are labelled
+    // `inferred` with a reason starting `confident_tier_unproven` — never a
+    // coverage caveat, which is what this test is about.
+    let confident_branch = |row: &serde_json::Value| {
+        row["confidence"] == "extracted"
+            || row["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with(devmap_analyze::CONFIDENT_TIER_UNPROVEN))
+    };
+    assert!(
+        confident_branch(orphan),
         "a complete scan must still reach the tier CLAUDE.md tells agents to \
          act on, or the fix has disabled dead-code detection: {orphan}"
     );
-    assert_eq!(orphan["reason"], "no inbound call edges and not exported");
+    assert!(
+        !orphan["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("call extraction did not cover"),
+        "a complete scan carries no coverage caveat: {orphan}"
+    );
     assert!(
         !dead.iter().any(|row| row["id"] == "lib.py::helper"),
         "`helper` is called from app.py: {dead:?}"
     );
     // Every finding in a fully read corpus is confident: `orphan.py::never_called`
     // and `app.py::main`, which nothing calls either.
-    assert_eq!(
-        map["liveness_meta"]["dead_symbol"]["by_confidence"]["total"]["extracted"],
-        dead.len(),
+    assert!(
+        dead.iter().all(confident_branch),
+        "every finding in a fully read corpus reaches the confident branch: {dead:?}"
     );
     assert_eq!(
         map["liveness_meta"]["dead_symbol"]["by_confidence"]["total"]["ambiguous"],

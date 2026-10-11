@@ -169,6 +169,26 @@ fn names_under(node: Node, source: &str, out: &mut Vec<String>) {
         if is_modifier_node(node.kind()) || is_type_argument_node(node.kind()) {
             continue;
         }
+        // A JS/TS base is an expression, and `React.Component` arrives as one
+        // `member_expression`. Reduced to `Component` alone, it is the same
+        // reference as `import { Component } from 'some-lib'`, and which
+        // library's contract the class inherits is lost. So it is recorded the
+        // way Python's `attribute` base already is — one reference per segment
+        // over one span, innermost first — and the resolver, which reduces
+        // every heritage name to its last segment, reads the first as before.
+        if node.kind() == "member_expression" {
+            let written = text(node, source);
+            if written.split('.').all(|segment| {
+                let segment = segment.trim();
+                !segment.is_empty()
+                    && segment
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+            }) {
+                out.extend(written.rsplit('.').filter_map(supertype_name));
+                continue;
+            }
+        }
         if is_terminal_type_node(node.kind()) {
             if let Some(name) = supertype_name(text(node, source)) {
                 out.push(name);

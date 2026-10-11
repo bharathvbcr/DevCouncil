@@ -31,9 +31,11 @@ user explicitly asks for that workflow.
 
 Use `dev map dead --json` and read each row's own `confidence`: a 0.9 row has no
 inbound evidence after the call walk *and* its language has earned the confident
-tier against a labelled fixture; a 0.4 row is unconfirmed — including
-`confident_tier_unproven` (a language that has not earned the tier) and
-`exported_unreferenced` (an export the manifest proves module-private). A 0.4 row's
+tier against a labelled fixture and corpus record; a 0.4 row is unconfirmed —
+including `confident_tier_unproven` (a language that has not earned the tier),
+`external_supertype` / `object_literal_member` (something outside the graph may
+call it by name) and `exported_unreferenced` (an export the manifest or the
+language proves module-private). A 0.4 row's
 `evidence` names the unbound sites and the first `path:line`; check it before
 acting. `excluded` counts, per language, the uncalled symbols that were never
 examined — an empty list over a mostly-exported corpus is not "no dead code". If `entry_roots`

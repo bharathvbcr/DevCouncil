@@ -3103,6 +3103,18 @@ impl Resolver {
                             if !file_level {
                                 continue;
                             }
+                            // `private` and `fileprivate` — the two levels Swift's
+                            // `is_exported` answers false for — confine a name to
+                            // its own file, so neither a sibling of the module nor
+                            // an importer can bind it. Indexing one anyway let
+                            // `import ChronosCore` put `DialDrag.swift`'s private
+                            // `forwardSpan` in scope for an app file whose struct
+                            // declares its own, and the struct's method — the real
+                            // target — was published dead (the audit's Swift row).
+                            // Same-file references never consult this index.
+                            if !sym.is_exported {
+                                continue;
+                            }
                             self.swift_module_symbols
                                 .entry((module.clone(), sym.name.clone()))
                                 .or_default()

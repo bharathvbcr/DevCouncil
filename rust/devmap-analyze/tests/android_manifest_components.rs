@@ -93,3 +93,36 @@ fn a_manifest_that_cannot_be_read_is_a_recorded_failure_not_an_empty_one() {
     assert!(!matches!(good.parse_outcome, ParseOutcome::Failed { .. }));
     assert_eq!(good.wiring.len(), 2, "{:?}", good.wiring);
 }
+
+#[test]
+fn a_bare_component_name_is_relative_to_the_namespace() {
+    // `android:name="Sync"`, no leading dot: Android reads it against the
+    // namespace exactly as it reads `.Sync`. A class whose name only ends in
+    // the same letters is not it.
+    let manifest = r#"<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application><service android:name="Sync"/></application>
+</manifest>"#;
+    let extractions = [
+        extract_file("app/src/main/AndroidManifest.xml", manifest),
+        extract_file(
+            "app/src/main/java/com/fx/app/Sync.kt",
+            "package com.fx.app\n\nclass Sync : VendorBase()\n",
+        ),
+        extract_file(
+            "app/src/main/java/com/fx/app/AutoSync.kt",
+            "package com.fx.app\n\nclass AutoSync : VendorBase()\n",
+        ),
+    ];
+    let sync = exemption(&extractions, "app/src/main/java/com/fx/app/Sync.kt", "Sync")
+        .expect("a bare name matches inside the module");
+    assert!(sync.contains("<service>"), "{sync}");
+    let auto = exemption(
+        &extractions,
+        "app/src/main/java/com/fx/app/AutoSync.kt",
+        "AutoSync",
+    );
+    assert!(
+        !auto.is_some_and(|reason| reason.contains("AndroidManifest")),
+        "a suffix that is not a whole name segment does not match"
+    );
+}

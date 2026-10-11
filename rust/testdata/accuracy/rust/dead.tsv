@@ -14,5 +14,16 @@ live	corelib/src/deadprobe.rs::Hidden.via_deref_c41	C41
 live	corelib/src/deadprobe.rs::Hidden.via_question_c41	C41
 live	corelib/src/deadprobe.rs::Hidden.via_closure_c41	C41
 exempt	corelib/src/guards.rs::with_guard_c50.Guard	C50: function-local RAII guard
-exempt	corelib/src/guards.rs::Guard.drop	C50: Drop runs it (a trait-impl method; keyed by its type, not under the function)
+exempt	corelib/src/guards.rs::with_guard_c50.Guard.drop	C50: Drop runs it (a trait-impl method, keyed under its function like the type)
 exempt	corelib/src/guards.rs::inner_extern_c51.abs	C51: inner extern declaration
+# Second pass (2026-10-10): C52 restricted visibility, C53 binary-only package, C54 rustc script.
+exported_unreferenced	corelib/src/visibility.rs::crate_private_unused_c52	C52: pub(crate), nothing calls it
+exported_unreferenced	corelib/src/visibility.rs::super_private_unused_c52	C52: pub(super), nothing calls it
+exported_unreferenced	binonly/src/util.rs::unused_c53	C53: pub in a package with no library target, nothing calls it
+exempt	scripts/stub_c54.rs::main	C54: fn main of a script compiled with rustc
+# Third pass (2026-10-10): C26 operator traits — `+`, `[]`, scope end, `.into()` and `?` call them, so none is a candidate.
+exempt	corelib/src/ops.rs::V.add	C26: `V(1) + V(2)` (ops.rs:42)
+exempt	corelib/src/ops.rs::Table.index	C26: `t[0]` (ops.rs:43)
+exempt	corelib/src/ops.rs::Res.drop	C26: `Res` dropped at the end of c26_caller (ops.rs:44)
+exempt	corelib/src/ops.rs::Meters.from	C26: `5u32.into()` (ops.rs:45)
+exempt	corelib/src/ops.rs::MyErr.from	C26: `?` on a ParseIntError (ops.rs:46)

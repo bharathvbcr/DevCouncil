@@ -846,14 +846,15 @@ fn test_dead_code_detection() {
 
     let analysis = analyze(&[f1, f2, f_test, f_route, f_pb2], &resolution);
 
-    // Python function not called and not exported -> dead (confidence 0.9)
+    // Python function not called and not exported -> confidently dead (the
+    // evidence; Python publishes it at 0.4 `confident_tier_unproven` since it
+    // came off `CONFIDENT_TIER_ELIGIBLE`)
     let dead_sym = analysis
         .dead_symbols
         .iter()
         .find(|l| l.symbol_name == "dead" && l.file_path == "src/f1.py")
         .unwrap();
-    assert!(!dead_sym.is_exempt);
-    assert!(dead_sym.confidence >= 0.9);
+    assert!(earned_confident_tier(dead_sym), "{dead_sym:?}");
 
     // Python function called by another file -> alive
     let alive_sym = analysis

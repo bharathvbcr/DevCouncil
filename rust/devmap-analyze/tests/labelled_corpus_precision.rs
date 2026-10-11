@@ -23,7 +23,7 @@
 //! construction, which measures precision and says nothing about what was
 //! missed.
 
-use devmap_analyze::analyze;
+use devmap_analyze::{analyze, earned_confident_tier};
 use devmap_extract::extract_file;
 use devmap_extract::model::Extraction;
 use devmap_resolve::Resolver;
@@ -133,9 +133,18 @@ fn kernel_verdicts(extractions: &[Extraction]) -> BTreeMap<String, f32> {
         if report.is_exempt {
             continue;
         }
+        // Scored by the tier its *evidence* reached. A language that has not
+        // earned the confident tier publishes such a row at 0.4 with
+        // `confident_tier_unproven` (Python, since the 2026-10-10 corpus
+        // record); the fence is about the evidence, so it still answers here.
+        let confidence = if earned_confident_tier(report) {
+            report.confidence.max(EXTRACTED_FLOOR)
+        } else {
+            report.confidence
+        };
         claimed.insert(
             format!("{}::{}", report.file_path, report.symbol_name),
-            report.confidence,
+            confidence,
         );
     }
     for cluster in &analysis.dead_clusters.clusters {

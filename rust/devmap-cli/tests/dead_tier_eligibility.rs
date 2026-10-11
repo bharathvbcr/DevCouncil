@@ -11,18 +11,29 @@
 //!
 //! * **A confident-branch row** — published at 0.9, or capped to 0.4 carrying
 //!   `confident_tier_unproven` — **not labelled `truly_dead` is a 0.9-tier false
-//!   positive.** A language is *proven* when it has at least one confident row
-//!   and no false one.
+//!   positive.** A language is *proven* by its fixtures when it has at least
+//!   one confident row, no false one, and every `truly_dead` marker of the
+//!   language reported in the confident branch — at the tier the language is
+//!   eligible for, not merely somewhere in the list.
 //! * **Listed ⇔ proven**, for every language a fixture exercises; and a listed
 //!   language no fixture exercises fails, because nothing proved it.
-//! * When `testdata/accuracy/record.json` (the corpus record the accuracy
-//!   harness writes) exists, a listed language must also be at or under 5%
-//!   confident-tier false positives on every corpus it was measured on.
+//! * `testdata/accuracy/record.json`, the labelled corpus record, must exist and
+//!   parse; a listed language must have at least one labelled confident row in
+//!   it, and be at or under 5% confident-tier false positives on every corpus
+//!   it was measured on. A language the record never measured is unproven, not
+//!   clean: a check that could not run does not pass.
 //!
 //! Beside the binding, the truth labels are asserted directly: `truly_dead`
 //! symbols are reported, `live` ones never above 0.4, `exempt` ones never
 //! reported, and `exported_unreferenced` ones at 0.4 with that token. And the
 //! `excluded` disclosure is checked against the exempt rows the store holds.
+//!
+//! Every reported row must be labelled, so the unconfirmed tier is scored too:
+//! `testdata/accuracy/dead_unconfirmed_record.tsv` records, per language, the
+//! 0.4 rows and how many of them are `live` or `exempt` (false positives). The
+//! 0.4 tier has no gate — it is "unconfirmed" by contract — but its rate is
+//! recorded, and a change that moves it fails here until the record is updated
+//! in the same change.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -177,31 +188,51 @@ fn in_confident_branch(row: &serde_json::Value) -> bool {
 struct LanguageScore {
     confident_rows: usize,
     false_positives: Vec<String>,
+    /// `truly_dead` markers reported outside the confident branch: a recall
+    /// loss in the tier agents act on, which precision alone never notices.
+    missed_markers: Vec<String>,
 }
 
 impl LanguageScore {
     fn proven(&self) -> bool {
-        self.confident_rows > 0 && self.false_positives.is_empty()
+        self.confident_rows > 0 && self.false_positives.is_empty() && self.missed_markers.is_empty()
     }
 }
 
-/// Per language: `(corpus, false positives, rows)` for each corpus that has the language.
-type FalsePositivesByLanguage = BTreeMap<String, Vec<(String, u64, u64)>>;
+/// Per language: `(corpus, false_positive, rows)` for each corpus that measured it.
+type CorpusRates = BTreeMap<String, Vec<(String, u64, u64)>>;
 
 /// Corpus 0.9-tier false-positive counts from the accuracy harness's record,
-/// by language, when the record exists.
+/// by language.
 ///
 /// Shape read: `{"corpora": [{"name": …, "languages": {"<lang>": {"dead_fp_by_tier":
-/// {"0.9": {"false_positive": n, "rows": m}}}}}]}`.
-fn corpus_record() -> Option<FalsePositivesByLanguage> {
+/// {"0.9": {"false_positive": n, "rows": m}}}}}]}`. Fails loudly on a missing
+/// file or a missing key: the record is what lets a language publish at 0.9,
+/// and a record that cannot be read must not read as one with nothing wrong.
+fn corpus_record() -> CorpusRates {
     let path = accuracy_root().join("record.json");
-    let raw = std::fs::read_to_string(&path).ok()?;
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "{}: {e} — the corpus record binds CONFIDENT_TIER_ELIGIBLE",
+            path.display()
+        )
+    });
     let record: serde_json::Value = serde_json::from_str(&raw)
         .unwrap_or_else(|e| panic!("{} is not JSON: {e}", path.display()));
-    let mut by_language = FalsePositivesByLanguage::new();
-    for corpus in record["corpora"].as_array().into_iter().flatten() {
-        let name = corpus["name"].as_str().unwrap_or("?").to_string();
-        for (language, entry) in corpus["languages"].as_object().into_iter().flatten() {
+    let corpora = record["corpora"]
+        .as_array()
+        .filter(|corpora| !corpora.is_empty())
+        .unwrap_or_else(|| panic!("{}: no `corpora` array, or it is empty", path.display()));
+    let mut by_language: CorpusRates = BTreeMap::new();
+    for corpus in corpora {
+        let name = corpus["name"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{}: a corpus without a `name`: {corpus}", path.display()))
+            .to_string();
+        let languages = corpus["languages"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{}: {name} has no `languages` object", path.display()));
+        for (language, entry) in languages {
             let tier = &entry["dead_fp_by_tier"]["0.9"];
             let (Some(fp), Some(rows)) = (tier["false_positive"].as_u64(), tier["rows"].as_u64())
             else {
@@ -216,7 +247,38 @@ fn corpus_record() -> Option<FalsePositivesByLanguage> {
                 .push((name.clone(), fp, rows));
         }
     }
-    Some(by_language)
+    by_language
+}
+
+/// The committed 0.4-tier record: language → `(rows, false_positive)`.
+fn unconfirmed_record() -> BTreeMap<String, (u64, u64)> {
+    let path = accuracy_root().join("dead_unconfirmed_record.tsv");
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let mut out = BTreeMap::new();
+    for line in raw.lines() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        let [language, rows, false_positive] = fields.as_slice() else {
+            panic!(
+                "{}: want language<TAB>rows<TAB>false_positive, got {line:?}",
+                path.display()
+            );
+        };
+        let parse = |field: &str| {
+            field
+                .parse::<u64>()
+                .unwrap_or_else(|e| panic!("{}: {field:?} in {line:?}: {e}", path.display()))
+        };
+        assert!(
+            out.insert(language.to_string(), (parse(rows), parse(false_positive)))
+                .is_none(),
+            "{}: {language} recorded twice",
+            path.display()
+        );
+    }
+    out
 }
 
 #[test]
@@ -234,6 +296,7 @@ fn the_confident_tier_is_listed_exactly_for_the_languages_their_fixtures_prove()
     );
 
     let mut scores: BTreeMap<&'static str, LanguageScore> = BTreeMap::new();
+    let mut unconfirmed: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     let mut violations: Vec<String> = Vec::new();
 
     for fixture in &fixtures {
@@ -269,17 +332,43 @@ fn the_confident_tier_is_listed_exactly_for_the_languages_their_fixtures_prove()
                     confidence(row)
                 ));
             }
+            match truth.get(&id) {
+                None => violations.push(format!(
+                    "{name}: {id} is reported ({:.2}, {}) but not labelled in dead.tsv — \
+                     label it, or the tier records score a sample",
+                    confidence(row),
+                    reason(row)
+                )),
+                Some(verdict) if confidence(row) <= UNCONFIRMED_CEILING + 1e-6 => {
+                    let tally = unconfirmed.entry(language.to_string()).or_default();
+                    tally.0 += 1;
+                    if matches!(verdict, Verdict::Live | Verdict::Exempt) {
+                        tally.1 += 1;
+                    }
+                }
+                Some(_) => {}
+            }
             reported.insert(id, row);
         }
 
         for (id, verdict) in &truth {
             let row = reported.get(id);
             match verdict {
-                Verdict::TrulyDead => {
-                    if row.is_none() {
-                        violations.push(format!("{name}: truly dead {id} is not reported"));
-                    }
-                }
+                Verdict::TrulyDead => match row {
+                    None => violations.push(format!("{name}: truly dead {id} is not reported")),
+                    // Found, but outside the confident branch: the language has
+                    // not proven the tier, so a listed one fails below.
+                    Some(row) if !in_confident_branch(row) => scores
+                        .entry(language_of(id.split("::").next().unwrap_or("")))
+                        .or_default()
+                        .missed_markers
+                        .push(format!(
+                            "{name}: {id} ({:.2}, {})",
+                            confidence(row),
+                            reason(row)
+                        )),
+                    Some(_) => {}
+                },
                 Verdict::Live => {
                     if let Some(row) =
                         row.filter(|row| confidence(row) > UNCONFIRMED_CEILING + 1e-6)
@@ -349,24 +438,40 @@ fn the_confident_tier_is_listed_exactly_for_the_languages_their_fixtures_prove()
         check_excluded(&name, &built, &mut violations);
     }
 
+    let recorded = unconfirmed_record();
+    if recorded != unconfirmed {
+        let measured: Vec<String> = unconfirmed
+            .iter()
+            .map(|(language, (rows, fp))| format!("{language}\t{rows}\t{fp}"))
+            .collect();
+        violations.push(format!(
+            "the 0.4-tier record {recorded:?} no longer matches the fixtures; measured \
+             (language, rows, false_positive):\n{}",
+            measured.join("\n")
+        ));
+    }
+
     let record = corpus_record();
     for (language, score) in &scores {
         let listed = CONFIDENT_TIER_ELIGIBLE.contains(language);
-        let corpus_clean = record
-            .as_ref()
-            .and_then(|record| record.get(*language))
-            .map(|corpora| {
-                corpora
-                    .iter()
-                    .all(|(_, fp, rows)| fp.saturating_mul(20) <= *rows)
-            })
-            .unwrap_or(true);
-        let proven = score.proven() && corpus_clean;
+        let corpora = record.get(*language).map(Vec::as_slice).unwrap_or_default();
+        let corpus_rows: u64 = corpora.iter().map(|(_, _, rows)| rows).sum();
+        let corpus_clean = corpora
+            .iter()
+            .all(|(_, fp, rows)| fp.saturating_mul(20) <= *rows);
+        // Measured, not merely unrefuted: zero labelled rows is a check that
+        // never ran, and passing it would list a language on its fixture alone.
+        let proven = score.proven() && corpus_rows > 0 && corpus_clean;
         if listed && !proven {
             violations.push(format!(
                 "{language} is in CONFIDENT_TIER_ELIGIBLE but its record is not clean: \
-                 {} confident row(s), false positives {:?}, corpus within 5%: {corpus_clean}",
-                score.confident_rows, score.false_positives
+                 {} confident fixture row(s), false positives {:?}, truly-dead markers \
+                 outside the confident branch {:?}, {corpus_rows} labelled corpus row(s) \
+                 over {} corpora, every corpus within 5%: {corpus_clean}",
+                score.confident_rows,
+                score.false_positives,
+                score.missed_markers,
+                corpora.len()
             ));
         }
         if !listed && proven {

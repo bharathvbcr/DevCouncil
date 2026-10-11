@@ -752,7 +752,11 @@ pub fn detect_language(path: &Path) -> &'static str {
         || filename == "go.mod"
         || filename == "jsconfig.json"
         || filename == "tsconfig.json"
+        // Read for the components it registers, which the framework
+        // instantiates by name (`androidmanifest::parse_components`).
         || filename == "AndroidManifest.xml"
+        // Read for its product types (`wiring::xcode_builds_only_apps`).
+        || filename == "project.pbxproj"
     {
         return "config";
     }
@@ -1390,6 +1394,7 @@ mod tests {
             "jsconfig.json",
             "tsconfig.json",
             "AndroidManifest.xml",
+            "project.pbxproj",
         ] {
             assert_eq!(
                 detect_language(Path::new(filename)),

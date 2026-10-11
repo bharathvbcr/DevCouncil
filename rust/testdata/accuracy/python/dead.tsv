@@ -33,3 +33,6 @@ live	lib/pkg/core.py::Engine.size	C08: property read in flows.props
 live	lib/pkg/core.py::Base.quack	C07c
 live	lib/pkg/core.py::Base.run	C07b
 live	lib/pkg/core.py::Duck.quack	ducks_used
+# Second pass (2026-10-10): a method a library base class calls by name.
+live	lib/pkg/handlers.py::TextParser.handle_starttag	HTMLParser.feed calls it (handlers.py:14)
+truly_dead	lib/pkg/handlers.py::to_text	nothing calls it

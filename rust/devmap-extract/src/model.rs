@@ -1336,6 +1336,10 @@ pub enum WiringKind {
     /// package proves nothing about callers outside the corpus, so an uncalled
     /// one is an `exported_unreferenced` candidate at the unconfirmed tier.
     ///
+    /// Also emitted on a Rust *symbol* whose visibility is `pub(crate)`,
+    /// `pub(super)`, `pub(self)` or `pub(in path)` (target = its qualified
+    /// name): the language, not a manifest, proves it crate-private.
+    ///
     /// Not a liveness exemption of any kind, for the file or its symbols: it
     /// is a fact about who *can* call, which only ever widens what is
     /// examined.

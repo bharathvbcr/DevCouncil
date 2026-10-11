@@ -696,15 +696,34 @@ subsystems whose functions only call each other.
 - **The confident tier (0.9) is earned per language.** A row reaches it only
   when nothing names the symbol *and* its language is in
   `devmap_analyze::CONFIDENT_TIER_ELIGIBLE` — a table a test binds to the
-  labelled fixtures under `rust/testdata/accuracy/`, so a language is listed
-  exactly when its fixture shows no confident-tier false positive. Today that is
-  Go, Kotlin, Python, Rust, Swift, TypeScript and TSX. Any other language's
+  labelled fixtures under `rust/testdata/accuracy/` and to the labelled corpus
+  record beside them (`record.json`, 20 repositories), so a language is listed
+  exactly when its fixture shows no confident-tier false positive with every
+  truly-dead marker in that tier, and the record holds labelled rows for it with
+  at most 5% false on every corpus. Today that is Go, Kotlin, Rust, TypeScript
+  and TSX. Python came off on 2026-10-10 (17 of 58 corpus rows false); Swift is
+  off because ten corpora measured gave it no confident row to label, so only
+  its fixture had ever tested it. Kotlin's nine corpus rows are all
+  coverage-capped at 0.66. Any other language's
   would-be confident row is published at 0.4 with a reason starting
   `confident_tier_unproven`, naming the language.
 - **0.4 is unconfirmed by contract**: `only_ambiguous_callers`, an unresolved
-  namesake, `confident_tier_unproven`, or `exported_unreferenced` — an export
-  the manifest proves module-private (Go `internal/` packages and `package
-  main`) with nothing reaching it. Every such row carries `evidence`: how many
+  namesake, `confident_tier_unproven`, `external_supertype` (a Python or
+  TypeScript method on a class whose supertype chain reaches a library type,
+  which may call it by name — unless the wiring registry knows that base's
+  contract, as it does `torch.autograd.Function`, `torch.nn.Module`,
+  `HTMLElement` and React's `Component`/`PureComponent` — matched on the base
+  as the file's imports name it, so a `Component` from another library is not
+  React's), `object_literal_member` (a method of a
+  TypeScript/JavaScript object literal, reached through the object), or
+  `exported_unreferenced` — an export the manifest or the language proves
+  module-private, with nothing reaching it: Go `internal/` packages and
+  `package main`; a TS/JS package whose `package.json` publishes no entry
+  point; a Gradle module applying `com.android.application` (components the
+  `AndroidManifest.xml` registers are entry points); a Rust `pub(crate)` /
+  `pub(super)` / `pub(in …)` item or a package with no library target; a Swift
+  `executableTarget` or an app-only Xcode project (members of a type that
+  conforms to a framework protocol are withheld as possible witnesses). Every such row carries `evidence`: how many
   unbound sites name the symbol and the first one as `first_path` /
   `first_line`, so it can be checked in one jump.
 - **`excluded` says what was never examined.** Per language, the uncalled

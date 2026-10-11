@@ -8,5 +8,7 @@
             </intent-filter>
         </activity>
         <receiver android:name="com.fx.app.BootReceiver" android:exported="false" />
+        <!-- K33: registered here, base class is the app's own. -->
+        <activity android:name=".SettingsScreen" android:exported="false" />
     </application>
 </manifest>

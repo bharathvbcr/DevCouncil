@@ -609,6 +609,9 @@ fn extract_treesitter_before_deadline(
                 if matches!(lang, "typescript" | "tsx") {
                     ts_ambient_exemptions(path, root, &symbols, &mut wiring);
                 }
+                if lang == "rust" {
+                    rust_crate_private_scopes(root, source, &symbols, &mut wiring);
+                }
                 if extraction_overran(deadline) {
                     // Labelled by what actually ran for *this* language. The
                     // block above is gated on `lang == "go"`, so naming it
@@ -2910,6 +2913,28 @@ fn member_access_receiver(node: Node, source: &str) -> Option<String> {
         let text = receiver_identity(target, source, 0);
         return (!text.is_empty()).then_some(text);
     }
+    // Kotlin's `callable_reference` has no fields either: `Type::m` names the
+    // receiver type in its first named child and the member in its last.
+    // Without the receiver the member arrived as a bare name, which never
+    // matches an extension keyed `Type.m` and which the resolver declines
+    // silently, so the namesake veto never saw it. An unbound `::f` has no
+    // receiver. (`template::m`, a bound reference on a value, parses as the
+    // fieldless `navigation_expression` below.)
+    if parent.kind() == "callable_reference" {
+        let mut cursor = parent.walk();
+        let named: Vec<Node> = parent.named_children(&mut cursor).collect();
+        let [receiver @ .., member] = named.as_slice() else {
+            return None;
+        };
+        if member.id() != node.id() {
+            return None;
+        }
+        let receiver = receiver
+            .iter()
+            .rfind(|child| child.kind() != "type_modifiers")?;
+        let text = receiver_identity(*receiver, source, 0);
+        return (!text.is_empty()).then_some(text);
+    }
     // Kotlin's `navigation_expression` has no fields: the object is the first
     // named child and the member the last (`task.label`, `a.b.c`).
     if parent.kind() == "navigation_expression" {
@@ -3006,11 +3031,12 @@ fn enclosing_type_name(node: Node, source: &str) -> Option<String> {
     let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         match parent.kind() {
-            "class_definition"
-            | "class_declaration"
-            | "abstract_class_declaration"
-            | "trait_item" => {
+            "class_definition" | "class_declaration" | "abstract_class_declaration" => {
                 return get_child_text(parent, "name", source);
+            }
+            "trait_item" => {
+                let name = get_child_text(parent, "name", source)?;
+                return Some(rust_function_local_type(parent, source, &name).unwrap_or(name));
             }
             // An impl's methods belong to the TYPE, including in
             // `impl Trait for Type` (SC11).
@@ -3036,7 +3062,8 @@ fn enclosing_type_name(node: Node, source: &str) -> Option<String> {
                     .child_by_field_name("type")
                     .or_else(|| parent.child_by_field_name("trait"))?;
                 let text = get_node_text(owner, source);
-                return Some(text.split('<').next().unwrap_or(&text).trim().to_string());
+                let bare = text.split('<').next().unwrap_or(&text).trim().to_string();
+                return Some(rust_function_local_type(parent, source, &bare).unwrap_or(bare));
             }
             // A nested function is not a class method merely because a class
             // occurs farther up the ancestor chain. Rust spells the same node
@@ -3051,6 +3078,50 @@ fn enclosing_type_name(node: Node, source: &str) -> Option<String> {
             | "method_definition"
             | "function_item"
             | "closure_expression" => return None,
+            _ => ancestor = bounded_parent(parent),
+        }
+    }
+    None
+}
+
+/// The owner name of a Rust type declared inside a function body, keyed under
+/// that function: `with_guard.Guard` for `fn with_guard() { struct Guard; impl
+/// Drop for Guard { fn drop(..) } }`.
+///
+/// The struct itself is already keyed that way (`scoped_qualified_name`), so
+/// its methods must be too, or the method's `parent_symbol` names a type the
+/// graph does not hold and a module-level `Guard::drop` in the same file shares
+/// the local one's identity. A qualified name is the join key; this is the one
+/// place a method's owner is computed, so the symbol emitters and the call
+/// attribution in `enclosing_callable_qualified` move together.
+///
+/// `item` is the `impl_item` or `trait_item`. Only a type declared in a block
+/// of the same function counts: `impl Display for Outer` written inside a
+/// function still implements the module-level `Outer`, and keying it under the
+/// function would sever it from that type. `None` keeps the bare name.
+fn rust_function_local_type(item: Node, source: &str, bare: &str) -> Option<String> {
+    let mut ancestor = bounded_parent(item);
+    while let Some(parent) = ancestor {
+        match parent.kind() {
+            "block" => {
+                let mut cursor = parent.walk();
+                let declared = parent.named_children(&mut cursor).any(|child| {
+                    matches!(
+                        child.kind(),
+                        "struct_item" | "enum_item" | "union_item" | "trait_item"
+                    ) && get_child_text(child, "name", source).as_deref() == Some(bare)
+                });
+                if declared {
+                    // An empty file prefix yields `::scope`; the callers add
+                    // the file themselves, exactly as for a bare type name.
+                    let scope = enclosing_callable_qualified(item, source, "")?;
+                    return Some(format!("{}.{bare}", scope.trim_start_matches("::")));
+                }
+                ancestor = bounded_parent(parent);
+            }
+            "function_item" | "closure_expression" | "source_file" | "declaration_list" => {
+                return None
+            }
             _ => ancestor = bounded_parent(parent),
         }
     }
@@ -3621,6 +3692,53 @@ fn ts_ambient_exemptions(
                 kind: WiringKind::StructuralExempt,
                 target_symbol: symbol.qualified_name.clone(),
                 details: TS_AMBIENT_REASON.to_string(),
+            });
+        }
+    }
+}
+
+/// Why a Rust item written `pub(crate)`, `pub(super)`, `pub(self)` or
+/// `pub(in path)` cannot be called from outside its crate.
+pub const RUST_CRATE_PRIVATE_PROOF: &str = "its restricted `pub(…)` visibility confines it to its \
+     own crate, so nothing outside the corpus can call it";
+
+/// Mark every Rust item whose visibility is restricted to its crate.
+///
+/// The extractor answers `is_exported` from the `pub` keyword, so `pub(crate)`
+/// reads as exported and the item was never examined — yet the language itself
+/// proves no other crate can name it, the same proof Go's `internal/` gives.
+/// Emitted per symbol as [`WiringKind::ModulePrivateScope`]; liveness widens
+/// it into the unconfirmed tier as `exported_unreferenced`, never above.
+///
+/// Joined by span start: an item's symbol span starts where its node does,
+/// visibility included (attributes are sibling nodes).
+fn rust_crate_private_scopes(
+    root: Node,
+    source: &str,
+    symbols: &[ExtractedSymbol],
+    wiring: &mut Vec<WiringAnnotation>,
+) {
+    let mut restricted: HashSet<usize> = HashSet::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        if node.children(&mut cursor).any(|child| {
+            child.kind() == "visibility_modifier"
+                && get_node_text(child, source).starts_with("pub(")
+        }) {
+            restricted.insert(node.start_byte());
+        }
+        push_children(node, &mut stack);
+    }
+    if restricted.is_empty() {
+        return;
+    }
+    for symbol in symbols {
+        if symbol.is_exported && restricted.contains(&symbol.span.start_byte) {
+            wiring.push(WiringAnnotation {
+                kind: WiringKind::ModulePrivateScope,
+                target_symbol: symbol.qualified_name.clone(),
+                details: RUST_CRATE_PRIVATE_PROOF.to_string(),
             });
         }
     }
