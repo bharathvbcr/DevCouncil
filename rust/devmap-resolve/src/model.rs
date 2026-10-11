@@ -626,6 +626,17 @@ pub enum UnresolvedClass {
     /// or resolution bug. A member no symbol of the family declares is
     /// [`NoNamesake`] instead: there is no owner for inference to find.
     UninferredReceiver,
+    /// A method call whose receiver **was** typed — an indexed type, with every
+    /// package it embeds from read in full — and that type declares, embeds and
+    /// is promoted no member of that name.
+    ///
+    /// Not [`UninferredReceiver`]: that class says the receiver's type is the
+    /// unknown, which sends a reader after type inference. Here the type is
+    /// known, so the miss is about the *member* — generated code, a method added
+    /// by a build-tagged file the index did not hold, or a call the program
+    /// does not compile. Unexplained, like the three classes that may hide an
+    /// edge.
+    UnresolvedMember,
     /// A call or reference that failed every ladder rung, and **no indexed
     /// symbol that could be its target carries that name**: for a bare name,
     /// no symbol anywhere; for a member on a receiver, no symbol of the
@@ -674,6 +685,7 @@ impl UnresolvedClass {
             UnresolvedClass::LocalBinding => "local_binding",
             UnresolvedClass::External { .. } => "external",
             UnresolvedClass::UninferredReceiver => "uninferred_receiver",
+            UnresolvedClass::UnresolvedMember => "unresolved_member",
             UnresolvedClass::NoNamesake => "no_namesake",
             UnresolvedClass::ModulePath => "module_path",
             UnresolvedClass::Unresolved => "unresolved",
@@ -702,7 +714,12 @@ impl UnresolvedClass {
 
 /// The persisted [`UnresolvedClass::label`]s of the classes that are not
 /// [`UnresolvedClass::is_explained`] — the sites that may hide an edge.
-pub const UNATTRIBUTED_LABELS: &[&str] = &["local_binding", "uninferred_receiver", "unresolved"];
+pub const UNATTRIBUTED_LABELS: &[&str] = &[
+    "local_binding",
+    "uninferred_receiver",
+    "unresolved_member",
+    "unresolved",
+];
 
 #[cfg(test)]
 mod unattributed_label_tests {
@@ -720,6 +737,7 @@ mod unattributed_label_tests {
                 module: "react".into(),
             },
             UnresolvedClass::UninferredReceiver,
+            UnresolvedClass::UnresolvedMember,
             UnresolvedClass::NoNamesake,
             UnresolvedClass::ModulePath,
             UnresolvedClass::Unresolved,
@@ -733,6 +751,7 @@ mod unattributed_label_tests {
                 | UnresolvedClass::LocalBinding
                 | UnresolvedClass::External { .. }
                 | UnresolvedClass::UninferredReceiver
+                | UnresolvedClass::UnresolvedMember
                 | UnresolvedClass::NoNamesake
                 | UnresolvedClass::ModulePath
                 | UnresolvedClass::Unresolved => {}

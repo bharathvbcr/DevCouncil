@@ -2,10 +2,15 @@
 //!
 //! `job.recordReplayEvent(cancelled)` in scholarlm's `WisDevJobCancelHandler`
 //! had no edge: `job` is bound by `job, ok := yoloJobStore.get(jobID)`, and no
-//! receiver rung reads a method's return type. The site sat in the ledger as
+//! receiver rung read a method's return type. The site sat in the ledger as
 //! `uninferred_receiver`, and `devmap impact recordReplayEvent` reported the
 //! method's other caller alone — so an agent asking "what writes the replay
 //! ring?" was told one place when there were two.
+//!
+//! The Go type evaluator now types that receiver from the method's declared
+//! results (see `go_typed_receivers.rs`), so these fixtures reach the job through
+//! a function the index does not hold: the receiver stays untyped, which is the
+//! case this rung exists for.
 //!
 //! Go settles it without the type. The compiler refuses an unexported selector
 //! from outside the declaring package, even through embedding, so `.m` with a
@@ -91,7 +96,7 @@ const HANDLER: &str = "\
 package api
 
 func WisDevJobCancelHandler(id string) {
-\tif job, ok := yoloJobStore.get(id); ok {
+\tif job, ok := lookupJob(id); ok {
 \t\tjob.recordReplayEvent(7)
 \t}
 }

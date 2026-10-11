@@ -853,6 +853,7 @@ pub(crate) fn run(
     let mut local_binding_calls = 0usize;
     let mut external_calls = 0usize;
     let mut uninferred_receiver_calls = 0usize;
+    let mut unresolved_member_calls = 0usize;
     let mut no_namesake_calls = 0usize;
     let mut module_path_calls = 0usize;
     let mut unattributed_calls = 0usize;
@@ -863,6 +864,7 @@ pub(crate) fn run(
             UnresolvedClass::LocalBinding => local_binding_calls += 1,
             UnresolvedClass::External { .. } => external_calls += 1,
             UnresolvedClass::UninferredReceiver => uninferred_receiver_calls += 1,
+            UnresolvedClass::UnresolvedMember => unresolved_member_calls += 1,
             UnresolvedClass::NoNamesake => no_namesake_calls += 1,
             UnresolvedClass::ModulePath => module_path_calls += 1,
             UnresolvedClass::Unresolved => unattributed_calls += 1,
@@ -913,6 +915,7 @@ pub(crate) fn run(
                 "unresolved_local_binding": local_binding_calls,
                 "unresolved_external": external_calls,
                 "unresolved_uninferred_receiver": uninferred_receiver_calls,
+                "unresolved_member": unresolved_member_calls,
                 "unresolved_no_namesake": no_namesake_calls,
                 "unresolved_module_path": module_path_calls,
                 "unresolved_unattributed": unattributed_calls,
@@ -988,8 +991,10 @@ pub(crate) fn run(
                 over_limit_files.len()
             ));
         }
-        if !cli.verbose && (unattributed_calls > 0 || uninferred_receiver_calls > 0) {
-            summary.push(format!("  Unresolved: {unattributed_calls} unattributed, {uninferred_receiver_calls} uninferred receivers (details: --verbose)"));
+        if !cli.verbose
+            && (unattributed_calls > 0 || uninferred_receiver_calls > 0 || unresolved_member_calls > 0)
+        {
+            summary.push(format!("  Unresolved: {unattributed_calls} unattributed, {uninferred_receiver_calls} uninferred receivers, {unresolved_member_calls} unresolved members (details: --verbose)"));
         }
         progress.display.summary("Map ready", &summary);
         progress.display.report_loss();
@@ -1007,6 +1012,7 @@ pub(crate) fn run(
             outln!("    local bindings:     {local_binding_calls}");
             outln!("    external imports:   {external_calls}");
             outln!("    uninferred receiver:{uninferred_receiver_calls}");
+            outln!("    unresolved member:  {unresolved_member_calls}");
             outln!("    no namesake:        {no_namesake_calls}");
             outln!("    module path:        {module_path_calls}");
             outln!("    unattributed:       {unattributed_calls}");
