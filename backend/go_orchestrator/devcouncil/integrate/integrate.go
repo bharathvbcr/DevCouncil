@@ -74,6 +74,21 @@ type Receipt struct {
 	Notes       []string          `json:"notes,omitempty"`
 }
 
+// Drifted lists, sorted, the files a check found missing or different. A file
+// is current only when it is "unchanged" (or not ours to manage): any other
+// word is a state that --apply would change, and a state this command does not
+// recognise must not read as current.
+func (r *Receipt) Drifted() []string {
+	var files []string
+	for path, state := range r.Files {
+		if state != "unchanged" && state != "not_ours" {
+			files = append(files, path)
+		}
+	}
+	slices.Sort(files)
+	return files
+}
+
 // cursorRule is deliberately split in two registers.
 //
 // Code navigation stays directive: an agent that guesses where a symbol lives

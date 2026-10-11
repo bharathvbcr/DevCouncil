@@ -155,17 +155,50 @@ func withMode(args []string, mode InstallMode) ([]string, error) {
 	return nil, fmt.Errorf("unknown install mode %q", mode)
 }
 
+// Reported is DevMap reporting that it could not do the work — a document it
+// will not rewrite, an unknown host, a malformed request — as opposed to
+// reporting on a tree that differs. It is the CLI's error envelope, and
+// Message is DevMap's own text, which names the file at fault.
+type Reported struct {
+	Command string
+	Message string
+}
+
+func (r *Reported) Error() string {
+	return fmt.Sprintf("devmap %s refused: %s", r.Command, r.Message)
+}
+
 // install runs one installing command and decodes its report.
 //
-// The report is the first JSON document on stdout. A failing `--json` run
-// follows it with the CLI's error envelope, so the rest is not parsed.
+// The report is the first JSON document on stdout, and it is a report only if
+// it carries `check_ok`. A failing `--json` run that wrote no report prints the
+// CLI's error envelope instead, which has no such field; decoding it as a
+// report made every refusal read as a tree that differs (CheckOK defaults to
+// false) and dropped the reason. Such a document is a *Reported, in every mode.
+// When a report was printed first, the envelope after it is not parsed.
 func (c *Client) install(ctx context.Context, into any, mode InstallMode, stdin []byte, args ...string) error {
 	out, err := c.invoke(ctx, installBudget, stdin, args...)
 	if err != nil {
 		return err
 	}
 	command := strings.Join(args[:2], " ")
-	decodeErr := json.NewDecoder(bytes.NewReader(out.stdout)).Decode(into)
+	var first map[string]json.RawMessage
+	decodeErr := json.NewDecoder(bytes.NewReader(out.stdout)).Decode(&first)
+	_, isReport := first["check_ok"]
+	if decodeErr == nil && !isReport {
+		if raw, ok := first["error"]; ok {
+			var message string
+			if json.Unmarshal(raw, &message) != nil {
+				message = string(raw)
+			}
+			return &Reported{Command: command, Message: message}
+		}
+	}
+	if decodeErr == nil && isReport {
+		decodeErr = json.NewDecoder(bytes.NewReader(out.stdout)).Decode(into)
+	} else if decodeErr == nil {
+		decodeErr = fmt.Errorf("no check_ok field: not a report")
+	}
 	if out.runErr != nil {
 		if mode == InstallCheck && decodeErr == nil && reportsDrift(into) {
 			return nil

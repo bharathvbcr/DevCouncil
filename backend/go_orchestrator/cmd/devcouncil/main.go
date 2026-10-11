@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/console"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/devmap"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/components"
@@ -125,6 +126,7 @@ Usage:
   devcouncil hook <event>     Retired lifecycle compatibility (silent no-op)
   devcouncil hook status|disable [--project-root DIR] [--client HOST]
   devcouncil integrate HOST [--apply|--check|--dry-run] [--project-root DIR] [--devmap-bin PATH]
+                                   default --check: exits 1 if a file differs or is missing, 3 if devmap refused
   devcouncil integrations …        Alias of integrate
   devcouncil integrate uninstall --target hooks [--dry-run] [--project-root DIR]
   devcouncil skills list
@@ -505,15 +507,37 @@ func runIntegrate(args []string) int {
 	if args[0] == "uninstall" {
 		return runIntegrateUninstall(args[1:])
 	}
+	if args[0] == "--help" || args[0] == "-h" {
+		usage()
+		return 0
+	}
 	opts := integrate.Options{Host: args[0], Mode: integrate.ModeCheck}
+	modeSet := false
+	setMode := func(mode integrate.Mode) bool {
+		if modeSet && opts.Mode != mode {
+			console.Errorf("conflicting modes: --%s and --%s; pass one\n", opts.Mode, mode)
+			return false
+		}
+		opts.Mode, modeSet = mode, true
+		return true
+	}
 	for i := 1; i < len(args); i++ {
 		switch args[i] {
+		case "--help", "-h":
+			usage()
+			return 0
 		case "--apply":
-			opts.Mode = integrate.ModeApply
+			if !setMode(integrate.ModeApply) {
+				return 2
+			}
 		case "--check":
-			opts.Mode = integrate.ModeCheck
+			if !setMode(integrate.ModeCheck) {
+				return 2
+			}
 		case "--dry-run":
-			opts.Mode = integrate.ModeDryRun
+			if !setMode(integrate.ModeDryRun) {
+				return 2
+			}
 		case "--write-gate":
 			// Retired, not merely unsupported. Answered by name rather than
 			// left to "unknown flag" because it appears in existing scripts
@@ -564,6 +588,13 @@ func runIntegrate(args []string) int {
 				console.Errorln(writeErr)
 			}
 		}
+		// DevMap reporting that it could not do the work is not drift: a
+		// script gating on --check must be able to tell "differs" (1) from
+		// "could not be checked" (3).
+		var reported *devmap.Reported
+		if errors.As(err, &reported) {
+			return exitDevmapRefused
+		}
 		return 1
 	}
 	if err := console.JSON(receipt); err != nil {
@@ -573,8 +604,19 @@ func runIntegrate(args []string) int {
 	if opts.Mode == integrate.ModeApply {
 		console.Errorf("%s integration configured (host hooks retired).\n", opts.Host)
 	}
+	if opts.Mode == integrate.ModeCheck {
+		if drifted := receipt.Drifted(); len(drifted) > 0 {
+			console.Errorf("integrate --check: %d file(s) differ from the expected installation: %s\n",
+				len(drifted), strings.Join(drifted, ", "))
+			return 1
+		}
+	}
 	return 0
 }
+
+// Exit codes of `integrate --check`: 0 installed, 1 a file differs or is
+// missing, 2 usage, 3 DevMap reported an error and the tree was not checked.
+const exitDevmapRefused = 3
 
 // runIntegrateUninstall removes host wiring. `--target hooks` is what
 // `dev hook disable` calls: DevCouncil lifecycle hooks are retired, and this is
