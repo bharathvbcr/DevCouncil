@@ -48,6 +48,7 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             "one_ignore_owner",
             "reliability_source_reads",
             "safe_fs_controls",
+            "swift_targets_collect",
             "the_bounded_runner_under_hostile_children",
         ],
     ),

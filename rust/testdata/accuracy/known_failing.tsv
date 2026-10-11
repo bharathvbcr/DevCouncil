@@ -97,30 +97,6 @@ rust	rs.c45	false_edge	ft-f9665721	method call level() must not bind to the free
 rust	rs.c45b	false_edge	ft-f9665721	 | today: HIGH edge to the wrong namesake ["corelib/src/probes2.rs::level_c45"]
 rust	rs.c46c	miss	ft-f9665721	 | today: absent today, recorded as an honest unresolved row
 rust	rs.c48b	miss	ft-f9665721	 | today: absent today, recorded as an honest unresolved row
-swift	sw.C07	silent_miss	ft-e3f7d1b1	protocol requirement dispatch from default impl | today: no ledger row names {"greet"}
-swift	sw.C07b	miss	ft-e3f7d1b1	conformer instance calls protocol-extension default | today: absent today, recorded as an honest unresolved row
-swift	sw.C17	miss	ft-e3f7d1b1	generic constrained $0 | today: absent today, recorded as an honest unresolved row
-swift	sw.C18	silent_miss	ft-8ca270ad	operator overload use | today: no ledger row names {"+"}
-swift	sw.C20	miss	ft-e3f7d1b1	delegate?.m() -> conformer | today: absent today, recorded as an honest unresolved row
-swift	sw.C30.not	false_edge	ft-32522da4	closure property call must not bind to free function | today: forbidden HIGH edge to ["spm/Sources/Core/Concurrency.swift::onDone"]
-swift	sw.M2a	miss	ft-8ca270ad	annotated local types the receiver | today: absent today, recorded as an honest unresolved row
-swift	sw.M2b	miss	ft-8ca270ad	annotated local types the receiver | today: absent today, recorded as an honest unresolved row
-swift	sw.M2c	miss	ft-8ca270ad	annotated local types the receiver | today: absent today, recorded as an honest unresolved row
-swift	sw.M2d	miss	ft-8ca270ad	annotated local enum | today: absent today, recorded as an honest unresolved row
-swift	sw.M4a	false_edge	ft-32522da4	local typed by call result of external() | today: HIGH edge to the wrong namesake ["micro/Sources/M/C.swift::Alpha.run"]
-swift	sw.M4b	false_edge	ft-32522da4	param s: Alpha in another function must not type the local s | today: forbidden HIGH edge to ["micro/Sources/M/C.swift::Alpha.run"]
-swift	sw.M4c	false_edge	ft-32522da4	closure param typed by element type | today: HIGH edge to the wrong namesake ["micro/Sources/M/C.swift::Alpha.run"]
-swift	sw.M4d	false_edge	ft-32522da4	must not bind to Alpha.run | today: forbidden HIGH edge to ["micro/Sources/M/C.swift::Alpha.run"]
-swift	sw.M5	miss	ft-8ca270ad	Meter(v: 1).bump() typed by constructor | today: absent today, recorded as an honest unresolved row
-swift	sw.P2	miss	ft-8ca270ad	annotated local let m: Meter = .zero | today: absent today, recorded as an honest unresolved row
-swift	sw.P4	miss	ft-8ca270ad	function reference passed by name | today: absent today, recorded as an honest unresolved row
-swift	sw.P5	miss	ft-8ca270ad	call in string interpolation | today: absent today, recorded as an honest unresolved row
-swift	sw.P6	miss	ft-8ca270ad	protocol-extension default on a conformer value | today: absent today, recorded as an honest unresolved row
-swift	sw.X2	miss	ft-32522da4	own-target type (not Widget, not CoreKit) | today: absent today, recorded as an honest unresolved row
-swift	sw.X4	miss	ft-32522da4	own-target type | today: absent today, recorded as an honest unresolved row
-swift	sw.X6a	miss	ft-837a6f05	file compiled into the app target | today: absent today, recorded as an honest unresolved row
-swift	sw.X6b	miss	ft-837a6f05	file compiled into the widget target | today: absent today, recorded as an honest unresolved row
-swift	sw.X7	false_edge	ft-32522da4	ctor of own-module type that shadows an imported same-name type | today: HIGH edge to the wrong namesake ["xcode/ios/CoreKit/Sources/CoreKit/Engine.swift::Theme", "xcode/ios/CoreKit/Sources/CoreKit/Engine.swift::Theme"]
 ts	ts.C15	miss	ft-736b0b22	m.heavyCompute() after await import() | today: absent today, recorded as an honest unresolved row
 ts	ts.C17	silent_miss	ft-736b0b22	class-field arrow member | today: ledger rows exist but only in explained classes: [("handle", "no_namesake")]
 ts	ts.C18b	silent_miss	ft-736b0b22	svcHelper is live | today: no ledger row names {"svcHelper"}

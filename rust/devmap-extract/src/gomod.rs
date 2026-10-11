@@ -175,6 +175,10 @@ pub struct ProjectManifests {
     /// resolver only knew by its directory and filed every such import
     /// `External` — "expected, not worth acting on" — about code it indexes.
     pub rust_crates: Vec<RustCrateManifest>,
+    /// The Swift targets `Package.swift` and an XcodeGen `project.yml` declare,
+    /// and the folders each compiles. A folder two targets list belongs to
+    /// both; the path heuristic answers only for a file no manifest claims.
+    pub swift_targets: Vec<crate::swifttargets::SwiftTarget>,
 }
 
 /// One `Cargo.toml` package: the directory it governs and the crate names its
@@ -231,6 +235,7 @@ impl ProjectManifests {
 struct Found {
     modules: Vec<GoModule>,
     rust_crates: Vec<RustCrateManifest>,
+    swift_targets: Vec<crate::swifttargets::SwiftTarget>,
     ts_configs: Vec<String>,
     examined: BTreeSet<String>,
     refusals: Vec<(String, DiscoverySkipReason)>,
@@ -251,7 +256,12 @@ fn visit_manifest_entry(root: &Path, entry: &ignore::DirEntry, found: &std::sync
     };
     let is_go_mod = file_name == "go.mod";
     let is_cargo_toml = file_name == "Cargo.toml";
-    if !is_go_mod && !is_cargo_toml && !crate::tsconfig::is_ts_config_name(file_name) {
+    let is_swift_manifest = crate::swifttargets::is_swift_manifest_name(file_name);
+    if !is_go_mod
+        && !is_cargo_toml
+        && !is_swift_manifest
+        && !crate::tsconfig::is_ts_config_name(file_name)
+    {
         return;
     }
     // A link is a candidate whatever it points at. `is_file()` follows it and
@@ -269,6 +279,29 @@ fn visit_manifest_entry(root: &Path, entry: &ignore::DirEntry, found: &std::sync
         return;
     };
     let rel_str = rel_str.replace('\\', "/");
+    if is_swift_manifest {
+        let read = read_manifest(root, &rel_str, crate::MAX_SOURCE_BYTES);
+        let mut found = crate::recover_lock(found);
+        found.examined.insert(rel_str.clone());
+        match read {
+            ManifestRead::Read(source) => {
+                match crate::swifttargets::parse_swift_manifest(&rel_str, &source) {
+                    Ok(targets) => found.swift_targets.extend(targets),
+                    // A manifest naming targets this reader could not follow is
+                    // a gap, not an empty answer: the files it governs fall back
+                    // to the path heuristic and the inventory says so.
+                    Err(reason) => found
+                        .refusals
+                        .push((rel_str, DiscoverySkipReason::Unreadable { reason })),
+                }
+            }
+            ManifestRead::Absent | ManifestRead::Skipped => {}
+            ManifestRead::Refused(reason) => found
+                .refusals
+                .push((rel_str, DiscoverySkipReason::Unreadable { reason })),
+        }
+        return;
+    }
     if is_cargo_toml {
         let read = read_manifest(root, &rel_str, crate::MAX_SOURCE_BYTES);
         let mut found = crate::recover_lock(found);
@@ -408,6 +441,7 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
     let Found {
         mut modules,
         mut rust_crates,
+        mut swift_targets,
         mut ts_configs,
         mut examined,
         mut refusals,
@@ -433,6 +467,9 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
     });
     ts_configs.sort();
     rust_crates.sort_by(|left, right| left.dir.cmp(&right.dir));
+    swift_targets.sort_by(|left, right| {
+        (&left.name, &left.paths, left.package).cmp(&(&right.name, &right.paths, right.package))
+    });
     let ts = crate::tsconfig::build_ts_projects(root, &ts_configs);
     examined.extend(ts.examined);
     refusals.extend(
@@ -447,6 +484,7 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
         examined,
         refusals,
         rust_crates,
+        swift_targets,
     })
 }
 
