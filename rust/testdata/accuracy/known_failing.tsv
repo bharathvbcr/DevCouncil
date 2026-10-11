@@ -1,0 +1,158 @@
+# Rows that fail today, each keyed by the card that owns the fix.
+# fixture<TAB>row id<TAB>status<TAB>card<TAB>note
+# status: miss (absent, honest ledger row), silent_miss (absent, no unattributed ledger row),
+#         false_edge (a HIGH edge to the wrong symbol or a forbidden one).
+# The set only shrinks: accuracy_fixtures.rs fails when a listed row starts passing and when
+# a passing row is not listed. Fixing a row means deleting its line (DEVMAP_ACCURACY_BLESS=1
+# does it); adding a line needs an owning card and a reason.
+go	go.C03	miss	ft-e221de3c	edge | today: absent today, recorded as an honest unresolved row
+go	go.C06	miss	ft-e221de3c	edge-or-reference | today: absent today, recorded as an honest unresolved row
+go	go.C07	miss	ft-e3f7d1b1	edge (interface method) or fan-out to FileReader.Read07+MemReader.Read07; FileReader.Read07/MemReader.Read07 must not be dead | today: absent today, recorded as an honest unresolved row
+go	go.C08a	miss	ft-e221de3c	edge (known gap ft-32522da4) | today: absent today, recorded as an honest unresolved row
+go	go.C08b	miss	ft-e221de3c	edge (known gap ft-32522da4) | today: absent today, recorded as an honest unresolved row
+go	go.C09	miss	ft-e3f7d1b1	edge (promoted from embedded interface) | today: absent today, recorded as an honest unresolved row
+go	go.C10d	miss	ft-e221de3c	edge (generic type method on bx := NewBox10[int](3)) | today: absent today, recorded as an honest unresolved row
+go	go.C10e	silent_miss	ft-e221de3c	edge (known gap: one explicit type arg) | today: no ledger row names {"NewBox10"}
+go	go.C15	miss	ft-e3f7d1b1	edge (field-typed interface receiver); SQLRepo.Find15 not dead | today: absent today, recorded as an honest unresolved row
+go	go.C16	miss	ft-e221de3c	edge (known gap: range var) | today: absent today, recorded as an honest unresolved row
+go	go.C17a	miss	ft-e221de3c	edge (type switch binding) | today: absent today, recorded as an honest unresolved row
+go	go.C17b	miss	ft-e221de3c	edge | today: absent today, recorded as an honest unresolved row
+go	go.C18	miss	ft-e221de3c	edge (errors.As var) | today: absent today, recorded as an honest unresolved row
+go	go.C20b	miss	ft-e221de3c	edge | today: absent today, recorded as an honest unresolved row
+go	go.C24a	miss	ft-e221de3c	edge (map elem of field) | today: absent today, recorded as an honest unresolved row
+go	go.C24b	miss	ft-e221de3c	edge (slice elem of param) | today: absent today, recorded as an honest unresolved row
+go	go.C26	miss	ft-e221de3c	edge (chained) | today: absent today, recorded as an honest unresolved row
+go	go.P4	miss	ft-e221de3c	edge (multi-return ctor) | today: absent today, recorded as an honest unresolved row
+go	go.P5	miss	ft-e221de3c	edge or not-dead (unexported interface dispatch) | today: absent today, recorded as an honest unresolved row
+go	go.Q1	miss	ft-e221de3c	edge (local from method-call result) | today: absent today, recorded as an honest unresolved row
+go	go.Q3	false_edge	ft-e221de3c	edge; NO self-edge Holder.Rebuild->Holder.Rebuild | today: HIGH edge to the wrong namesake ["app/svc/probes2.go::Holder.Rebuild"]
+go	go.Q3.noself	false_edge	ft-e221de3c	no self-edge | today: forbidden HIGH edge to ["app/svc/probes2.go::Holder.Rebuild"]
+go	go.Q4	false_edge	ft-e221de3c	builtin delete is not a self-call | today: forbidden HIGH edge to ["app/svc/probes2.go::cache.delete"]
+kotlin	kt.K02	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
+kotlin	kt.K05b	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
+kotlin	kt.K06	silent_miss	ft-0720fe1d	 | today: no ledger row names {"slugify"}
+kotlin	kt.K06b	silent_miss	ft-0720fe1d	reference to a property | today: no ledger row names {"label"}
+kotlin	kt.K07b	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
+kotlin	kt.K08	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
+kotlin	kt.K09	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
+kotlin	kt.K10c	miss	ft-e3f7d1b1	 | today: absent today, recorded as an honest unresolved row
+kotlin	kt.K14	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
+kotlin	kt.K16	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
+kotlin	kt.K17	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
+kotlin	kt.K19	false_edge	ft-0720fe1d	false-bait | today: forbidden HIGH edge to ["app/src/main/java/com/fx/app/FxApp.kt::FxApp.onCreate"]
+kotlin	kt.K20	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
+kotlin	kt.K20b	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
+kotlin	kt.K23	silent_miss	ft-837a6f05	 | today: ledger rows exist but only in explained classes: [("twice", "external")]
+kotlin	kt.K23b	silent_miss	ft-837a6f05	 | today: ledger rows exist but only in explained classes: [("register", "no_namesake")]
+kotlin	kt.K24	silent_miss	ft-0720fe1d	 | today: no ledger row names {"castOrNull"}
+kotlin	kt.K25	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
+kotlin	kt.K26	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
+kotlin	kt.K26b	silent_miss	ft-0720fe1d	 | today: no ledger row names {"invoke"}
+kotlin	kt.K27	silent_miss	ft-0720fe1d	reference | today: no ledger row names {"refresh"}
+kotlin	kt.K28b	miss	ft-e3f7d1b1	cast receiver | today: absent today, recorded as an honest unresolved row
+kotlin-gaps	kg.K27	silent_miss	ft-0720fe1d	callable reference vm::onEvent | today: no ledger row names {"onEvent"}
+kotlin-gaps	kg.K29	silent_miss	ft-0720fe1d	operator fun invoke through op(2) | today: no ledger row names {"invoke"}
+kotlin-gaps	kg.K30	silent_miss	ft-0720fe1d	import alias: fmt(3) is gaps.util.format | today: ledger rows exist but only in explained classes: [("fmt", "no_namesake")]
+kotlin-gaps	kg.K31	false_edge	ft-0720fe1d	super.go() reaches the base method | today: HIGH edge to the wrong namesake ["src/main/kotlin/gaps/Events.kt::Child.go"]
+kotlin-gaps	kg.K31b	false_edge	ft-0720fe1d	super.go() is not a self-reference | today: forbidden HIGH edge to ["src/main/kotlin/gaps/Events.kt::Child.go"]
+kotlin-gaps	kg.K33	miss	ft-0720fe1d	nested class constructor Res.Ok(1) | today: absent today, recorded as an honest unresolved row
+kotlin-gaps	kg.S2a	false_edge	ft-32522da4	a function-typed parameter call is a local binding, not Widget.onStart | today: forbidden HIGH edge to ["src/main/kotlin/gaps/Events.kt::Widget.onStart"]
+kotlin-gaps	kg.S2b	false_edge	ft-32522da4	putBoolean inside Editor.apply{} is the external editor, not the project namesake | today: forbidden HIGH edge to ["src/main/kotlin/gaps/Events.kt::Prefs.putBoolean"]
+python	py.C05	miss	ft-c666ba7c	edge (E2(1).step()) | today: absent today, recorded as an honest unresolved row
+python	py.C05b	miss	ft-c666ba7c	edge | today: absent today, recorded as an honest unresolved row
+python	py.C07	miss	ft-c666ba7c	edge (super().__init__) | today: absent today, recorded as an honest unresolved row
+python	py.C07b	miss	ft-c666ba7c	edge (super().run()) | today: absent today, recorded as an honest unresolved row
+python	py.C07c	miss	ft-c666ba7c	edge via MRO; NOT Duck.quack | today: absent today, recorded as an honest unresolved row
+python	py.C08	miss	ft-c666ba7c	property read edge (any kind) or honest miss | today: absent today, recorded as an honest unresolved row
+python	py.C09	miss	ft-c666ba7c	edge | today: absent today, recorded as an honest unresolved row
+python	py.C09b	miss	ft-c666ba7c	edge | today: absent today, recorded as an honest unresolved row
+python	py.C09d	silent_miss	ft-c666ba7c	edge-ish (cls(0)) or honest miss | today: no ledger row names {"Engine"}
+python	py.C15	silent_miss	ft-c666ba7c	reference edge (partial(helper), apply(helper)) | today: no ledger row names {"helper"}
+python	py.C17c	miss	ft-c666ba7c	edge | today: absent today, recorded as an honest unresolved row
+python	py.C21	silent_miss	ft-c666ba7c	edge or honest miss (implicit dunder) | today: no ledger row names {"__enter__"}
+python	py.C22b	miss	ft-c666ba7c	edge or honest miss; NOT other/dup.py::helper | today: absent today, recorded as an honest unresolved row
+python	py.C23b	miss	ft-c666ba7c	edge if fixture return typed; honest miss acceptable | today: absent today, recorded as an honest unresolved row
+python	py.C26	miss	ft-837a6f05	Imports edge via pytest pythonpath | today: absent today, recorded as an honest unresolved row
+python-hatch	pr.hatch.import	silent_miss	ft-837a6f05	Imports edge via the source root | today: no unattributed ledger row in the importing file
+python-nomanifest	pr.nomanifest.import	silent_miss	ft-837a6f05	Imports edge via the source root | today: no unattributed ledger row in the importing file
+python-ruff	pr.ruff.import	silent_miss	ft-837a6f05	Imports edge via the source root | today: no unattributed ledger row in the importing file
+python-setupcfg	pr.setupcfg.import	silent_miss	ft-837a6f05	Imports edge via the source root | today: no unattributed ledger row in the importing file
+rust	rs.c02	miss	ft-e3f7d1b1	dyn Trait: trait decl or fan-out to both impls | today: absent today, recorded as an honest unresolved row
+rust	rs.c02b	miss	ft-e3f7d1b1	Box<dyn> in closure | today: absent today, recorded as an honest unresolved row
+rust	rs.c03	miss	ft-e3f7d1b1	generic bound T: Render | today: absent today, recorded as an honest unresolved row
+rust	rs.c04	miss	ft-f9665721	blanket impl on i32 literal | today: absent today, recorded as an honest unresolved row
+rust	rs.c07b	miss	ft-e3f7d1b1	receiver is the impl Trait return | today: absent today, recorded as an honest unresolved row
+rust	rs.c08	miss	ft-f9665721	Deref + auto-ref | today: absent today, recorded as an honest unresolved row
+rust	rs.c10a	miss	ft-f9665721	iterator chains; closure params typed by slice element | today: absent today, recorded as an honest unresolved row
+rust	rs.c10b	miss	ft-f9665721	 | today: absent today, recorded as an honest unresolved row
+rust	rs.c10c	miss	ft-f9665721	reference | today: absent today, recorded as an honest unresolved row
+rust	rs.c11b	miss	ft-f9665721	 | today: absent today, recorded as an honest unresolved row
+rust	rs.c12b	silent_miss	ft-f9665721	emit_c12 is called only in the macro body | today: no ledger row names {"emit_c12"}
+rust	rs.c15	false_edge	ft-f9665721	d.clone() on a derived Clone must not bind to Manual.clone | today: forbidden HIGH edge to ["corelib/src/lib.rs::Manual.clone"]
+rust	rs.c17e	miss	ft-e3f7d1b1	cross-crate dyn | today: absent today, recorded as an honest unresolved row
+rust	rs.c18c	miss	ft-837a6f05	 | today: absent today, recorded as an honest unresolved row
+rust	rs.c20b	miss	ft-f9665721	 | today: absent today, recorded as an honest unresolved row
+rust	rs.c24b	silent_miss	ft-f9665721	 | today: no ledger row names {"helper_c24"}
+rust	rs.c26a	silent_miss	ft-f9665721	operator/Drop/From trait use is implicit; honest miss expected | today: no ledger row names {"add"}
+rust	rs.c26b	silent_miss	ft-f9665721	operator/Drop/From trait use is implicit; honest miss expected | today: no ledger row names {"index"}
+rust	rs.c26c	silent_miss	ft-f9665721	operator/Drop/From trait use is implicit; honest miss expected | today: no ledger row names {"drop"}
+rust	rs.c26d	silent_miss	ft-f9665721	operator/Drop/From trait use is implicit; honest miss expected | today: no ledger row names {"from"}
+rust	rs.c26e	silent_miss	ft-f9665721	operator/Drop/From trait use is implicit; honest miss expected | today: no ledger row names {"from"}
+rust	rs.c27a	miss	ft-e3f7d1b1	trait default method | today: absent today, recorded as an honest unresolved row
+rust	rs.c27b	miss	ft-e3f7d1b1	self in default body | today: absent today, recorded as an honest unresolved row
+rust	rs.c31	miss	ft-f9665721	extension trait on str | today: absent today, recorded as an honest unresolved row
+rust	rs.c32b	miss	ft-f9665721	 | today: absent today, recorded as an honest unresolved row
+rust	rs.c35	miss	ft-e3f7d1b1	T::assoc fn | today: absent today, recorded as an honest unresolved row
+rust	rs.c36	miss	ft-f9665721	Rc<RefCell>/Arc<Mutex> deref | today: absent today, recorded as an honest unresolved row
+rust	rs.c37a	miss	ft-f9665721	if-let / for pattern receivers | today: absent today, recorded as an honest unresolved row
+rust	rs.c39a	silent_miss	ft-f9665721	generate_handler! commands | today: no ledger row names {"cmd_c39"}
+rust	rs.c39b	silent_miss	ft-f9665721	 | today: no ledger row names {"cmd_async_c39"}
+rust	rs.c39c	silent_miss	ft-f9665721	 | today: no ledger row names {"cmd_private_c39"}
+rust	rs.c40a	silent_miss	ft-f9665721	serde attribute fn strings | today: no ledger row names {"default_c40"}
+rust	rs.c40b	silent_miss	ft-f9665721	 | today: no ledger row names {"ser_c40"}
+rust	rs.c41a	miss	ft-f9665721	dead-code probes | today: absent today, recorded as an honest unresolved row
+rust	rs.c41b	miss	ft-f9665721	 | today: absent today, recorded as an honest unresolved row
+rust	rs.c41c	miss	ft-f9665721	 | today: absent today, recorded as an honest unresolved row
+rust	rs.c41d	miss	ft-f9665721	 | today: absent today, recorded as an honest unresolved row
+rust	rs.c41f	silent_miss	ft-f9665721	macro-body call | today: no ledger row names {"via_macro_body_c41"}
+rust	rs.c43b	false_edge	ft-f9665721	std Command::spawn must not bind to the free fn | today: forbidden HIGH edge to ["corelib/src/probes2.rs::spawn"]
+rust	rs.c45	false_edge	ft-f9665721	method call level() must not bind to the free fn | today: forbidden HIGH edge to ["corelib/src/probes2.rs::level_c45"]
+rust	rs.c45b	false_edge	ft-f9665721	 | today: HIGH edge to the wrong namesake ["corelib/src/probes2.rs::level_c45"]
+rust	rs.c46c	miss	ft-f9665721	 | today: absent today, recorded as an honest unresolved row
+rust	rs.c48b	miss	ft-f9665721	 | today: absent today, recorded as an honest unresolved row
+swift	sw.C07	silent_miss	ft-e3f7d1b1	protocol requirement dispatch from default impl | today: no ledger row names {"greet"}
+swift	sw.C07b	miss	ft-e3f7d1b1	conformer instance calls protocol-extension default | today: absent today, recorded as an honest unresolved row
+swift	sw.C17	miss	ft-e3f7d1b1	generic constrained $0 | today: absent today, recorded as an honest unresolved row
+swift	sw.C18	silent_miss	ft-8ca270ad	operator overload use | today: no ledger row names {"+"}
+swift	sw.C20	miss	ft-e3f7d1b1	delegate?.m() -> conformer | today: absent today, recorded as an honest unresolved row
+swift	sw.C30.not	false_edge	ft-32522da4	closure property call must not bind to free function | today: forbidden HIGH edge to ["spm/Sources/Core/Concurrency.swift::onDone"]
+swift	sw.M2a	miss	ft-8ca270ad	annotated local types the receiver | today: absent today, recorded as an honest unresolved row
+swift	sw.M2b	miss	ft-8ca270ad	annotated local types the receiver | today: absent today, recorded as an honest unresolved row
+swift	sw.M2c	miss	ft-8ca270ad	annotated local types the receiver | today: absent today, recorded as an honest unresolved row
+swift	sw.M2d	miss	ft-8ca270ad	annotated local enum | today: absent today, recorded as an honest unresolved row
+swift	sw.M4a	false_edge	ft-32522da4	local typed by call result of external() | today: HIGH edge to the wrong namesake ["micro/Sources/M/C.swift::Alpha.run"]
+swift	sw.M4b	false_edge	ft-32522da4	param s: Alpha in another function must not type the local s | today: forbidden HIGH edge to ["micro/Sources/M/C.swift::Alpha.run"]
+swift	sw.M4c	false_edge	ft-32522da4	closure param typed by element type | today: HIGH edge to the wrong namesake ["micro/Sources/M/C.swift::Alpha.run"]
+swift	sw.M4d	false_edge	ft-32522da4	must not bind to Alpha.run | today: forbidden HIGH edge to ["micro/Sources/M/C.swift::Alpha.run"]
+swift	sw.M5	miss	ft-8ca270ad	Meter(v: 1).bump() typed by constructor | today: absent today, recorded as an honest unresolved row
+swift	sw.P2	miss	ft-8ca270ad	annotated local let m: Meter = .zero | today: absent today, recorded as an honest unresolved row
+swift	sw.P4	miss	ft-8ca270ad	function reference passed by name | today: absent today, recorded as an honest unresolved row
+swift	sw.P5	miss	ft-8ca270ad	call in string interpolation | today: absent today, recorded as an honest unresolved row
+swift	sw.P6	miss	ft-8ca270ad	protocol-extension default on a conformer value | today: absent today, recorded as an honest unresolved row
+swift	sw.X2	miss	ft-32522da4	own-target type (not Widget, not CoreKit) | today: absent today, recorded as an honest unresolved row
+swift	sw.X4	miss	ft-32522da4	own-target type | today: absent today, recorded as an honest unresolved row
+swift	sw.X6a	miss	ft-837a6f05	file compiled into the app target | today: absent today, recorded as an honest unresolved row
+swift	sw.X6b	miss	ft-837a6f05	file compiled into the widget target | today: absent today, recorded as an honest unresolved row
+swift	sw.X7	false_edge	ft-32522da4	ctor of own-module type that shadows an imported same-name type | today: HIGH edge to the wrong namesake ["xcode/ios/CoreKit/Sources/CoreKit/Engine.swift::Theme", "xcode/ios/CoreKit/Sources/CoreKit/Engine.swift::Theme"]
+ts	ts.C15	miss	ft-736b0b22	m.heavyCompute() after await import() | today: absent today, recorded as an honest unresolved row
+ts	ts.C17	silent_miss	ft-736b0b22	class-field arrow member | today: ledger rows exist but only in explained classes: [("handle", "no_namesake")]
+ts	ts.C18b	silent_miss	ft-736b0b22	svcHelper is live | today: no ledger row names {"svcHelper"}
+ts	ts.C7	silent_miss	ft-736b0b22	lazy import; AboutPage not dead | today: no ledger row names {"AboutPage"}
+ts	ts.V14	miss	ft-736b0b22	import {x} from; export {x} | today: absent today, recorded as an honest unresolved row
+ts	ts.V15b	silent_miss	ft-736b0b22	object-literal arrow member | today: no ledger row names {"clearLogs"}
+ts	ts.V16	miss	ft-736b0b22	this inside arrow nested in a method | today: absent today, recorded as an honest unresolved row
+ts	ts.V2	false_edge	ft-32522da4	external npm import must not bind to the local namesake | today: forbidden HIGH edge to ["apps/web/src/lib/format.ts::formatTitle"]
+ts	ts.V5a	miss	ft-736b0b22	export default memo(Card) + barrel | today: absent today, recorded as an honest unresolved row
+ts	ts.V8c	silent_miss	ft-736b0b22	enum reference | today: no ledger row names {"Mode"}
+ts	ts.V9a	silent_miss	ft-736b0b22	JSX in route object | today: no ledger row names {"RoutedPage"}
+ts	ts.V9b	silent_miss	ft-736b0b22	lazy route module; caller is the file | today: no ledger row names {"Component"}

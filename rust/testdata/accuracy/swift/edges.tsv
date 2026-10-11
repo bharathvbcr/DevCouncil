@@ -1,0 +1,102 @@
+# Normalized expected edges. Hand-written ground truth: each row was derived from the
+# fixture's original audit labels (written before DevMap ran) and the language's own
+# semantics, never from DevMap's output. Read by devmap-analyze/tests/accuracy_fixtures.rs.
+#
+# Columns (tab separated):
+#   id        unique within the fixture (<lang>.<construct>)
+#   construct the audit's construct label
+#   caller    symbol id `<file>::<qualified name>`; a bare path means the file node
+#   callee    symbol id(s). `a|b` = any one satisfies; `a&b` = all must be present
+#   kind      edge   = a Calls/References/Instantiates/Extends/Implements/... edge, any tier
+#             import = an Imports edge between the two files
+#             forbid = NO edge of any kind at confidence >= 0.9 may join caller and callee
+#   level     must   = a correct resolver has this edge
+#             should = the audit accepted an honest miss or an alternative here
+#   ledger    optional `a|b` bare names a ledger row may carry when the expected callee's
+#             own name is not the name written at the call site
+#   note      what the row proves
+#
+# Dead-code truth lives beside this file in dead.tsv; failures that exist today live in
+# known_failing.tsv (keyed by the card that owns the fix).
+sw.C09	C09	spm/Sources/Core/Person.swift::Person	spm/Sources/Core/Person.swift::Person.validateAge	edge	must		call in init body (init is not a symbol, attributes to type)
+sw.C11	C11	spm/Sources/Core/Person.swift::Person	spm/Sources/Core/Person.swift::Person.formatDisplay	edge	must		computed property body
+sw.C10	C10	spm/Sources/Core/Person.swift::Person.make	spm/Sources/Core/Person.swift::Person	edge	must		Person(...) constructor
+sw.C10b	C10	spm/Sources/Core/Person.swift::Person.defaultPerson	spm/Sources/Core/Person.swift::Person.make	edge	must		Self.make
+sw.C10c	C10	spm/Sources/Core/Person.swift::Registry.shared	spm/Sources/Core/Person.swift::PersonStore	edge	must		ctor inside class func
+sw.C34	C34	spm/Sources/Core/Person.swift::Registry.register	spm/Sources/Core/Person.swift::PersonStore.save	edge	must		typed stored property receiver
+sw.C34b	C34	spm/Sources/Core/Person.swift::Registry.register	spm/Sources/Core/Person.swift::PersonStore.audit	edge	must		self.store receiver
+sw.C32	C32	spm/Sources/Core/Person.swift::Registry.register	spm/Sources/Core/Person.swift::Registry.notifyAll	edge	must		implicit self
+sw.C08	C08	spm/Sources/Core/PersonExtensions.swift::Person.greeting	spm/Sources/Core/PersonExtensions.swift::Person.fullName	edge	must		extension member, implicit self
+sw.C18	C18	spm/Sources/Core/PersonExtensions.swift::addVectors	spm/Sources/Core/PersonExtensions.swift::Vec2.+	edge	must		operator overload use
+sw.C07	C07	spm/Sources/Core/Protocols.swift::Greeter.hello	spm/Sources/Core/Protocols.swift::English.greet|spm/Sources/Core/Protocols.swift::French.greet	edge	must		protocol requirement dispatch from default impl
+sw.C07b	C07	spm/Sources/Core/Protocols.swift::greetAll	spm/Sources/Core/Protocols.swift::Greeter.hello	edge	must		conformer instance calls protocol-extension default
+sw.C07c	C07	spm/Sources/Core/Protocols.swift::greetAll	spm/Sources/Core/Protocols.swift::French.greet|spm/Sources/Core/Protocols.swift::English.greet	edge	must		existential dispatch
+sw.C17	C17	spm/Sources/Core/Protocols.swift::loudest	spm/Sources/Core/Protocols.swift::English.greet|spm/Sources/Core/Protocols.swift::French.greet	edge	must		generic constrained $0
+sw.C17b	C17	spm/Sources/Core/Protocols.swift::anyGreeter	spm/Sources/Core/Protocols.swift::English	edge	must		some return ctor
+sw.C17c	C17	spm/Sources/Core/Protocols.swift::boxed	spm/Sources/Core/Protocols.swift::Box	edge	must		Box<Int>(...)
+sw.C17d	C17	spm/Sources/Core/Protocols.swift::boxed	spm/Sources/Core/Protocols.swift::Box.get	edge	must		receiver typed by generic ctor
+sw.C20	C20	spm/Sources/Core/Protocols.swift::Engine.run	spm/Sources/DemoMain/DemoApp.swift::AppDelegate.engineDidFinish	edge	must		delegate?.m() -> conformer
+sw.C13	C13	spm/Sources/Core/Concurrency.swift::Coordinator.start	spm/Sources/Core/Concurrency.swift::Fetcher.fetch	edge	must		try await static
+sw.C14	C14	spm/Sources/Core/Concurrency.swift::Coordinator.start	spm/Sources/Core/Concurrency.swift::Cache.put	edge	must		actor method via property typed by initializer
+sw.C14b	C14	spm/Sources/Core/Concurrency.swift::Coordinator.start	spm/Sources/Core/Concurrency.swift::Cache.get	edge	must		actor
+sw.C13b	C13	spm/Sources/Core/Concurrency.swift::Coordinator.start	spm/Sources/Core/Concurrency.swift::Coordinator.compute	edge	must		async let
+sw.C13c	C13	spm/Sources/Core/Concurrency.swift::Coordinator.start	spm/Sources/Core/Concurrency.swift::Coordinator.refresh	edge	must		Task { self.refresh() }
+sw.C12	C12	spm/Sources/Core/Concurrency.swift::Coordinator.start	spm/Sources/Core/Concurrency.swift::Coordinator.retry	edge	must		trailing closure call
+sw.C12b	C12	spm/Sources/Core/Concurrency.swift::Coordinator.start	spm/Sources/Core/Concurrency.swift::Coordinator.log	edge	must		call inside closure
+sw.C12c	C12	spm/Sources/Core/Concurrency.swift::Coordinator.start	spm/Sources/Core/Concurrency.swift::transform	edge	must		free fn in map closure
+sw.C30.not	C30	spm/Sources/Core/Concurrency.swift::Job.finish	spm/Sources/Core/Concurrency.swift::onDone	forbid	must		closure property call must not bind to free function
+sw.C16	C16	spm/Sources/Core/Shapes.swift::totalArea	spm/Sources/Core/Shapes.swift::Shape.area	edge	must		annotated, chained, return-chain (3 sites)
+sw.C16b	C16	spm/Sources/Core/Shapes.swift::totalArea	spm/Sources/Core/Shapes.swift::Shape.unit	edge	must		static
+sw.C05	C05	spm/Sources/Core/Shapes.swift::Settings	spm/Sources/Core/Shapes.swift::Clamped	edge	must		@Clamped attribute use
+sw.C06	C06	spm/Sources/Core/Shapes.swift::builtList	spm/Sources/Core/Shapes.swift::makeList	edge	must		call with trailing closure
+sw.C19	C19	spm/Sources/Core/Notes.swift::Watcher	spm/Sources/Core/Notes.swift::Watcher.onNote	edge	must		#selector reference (from init)
+sw.C15	C15	spm/Sources/Core/Notes.swift::Watcher	spm/Sources/Core/Notes.swift::Watcher.handle	edge	must		sink closure self?.handle
+sw.C15b	C15	spm/Sources/Core/Notes.swift::Watcher	spm/Sources/Core/Notes.swift::Watcher.onPublisher	edge	must		sink closure
+sw.C03	C03	spm/Sources/DemoUI/Views.swift::RootView	spm/Sources/DemoUI/Views.swift::CounterModel.increment	edge	must		@State model = CounterModel()
+sw.C04	C04	spm/Sources/DemoUI/Views.swift::RootView	spm/Sources/DemoUI/Views.swift::ListVM.load	edge	must		@StateObject
+sw.C01	C01	spm/Sources/DemoUI/Views.swift::RootView	spm/Sources/DemoUI/Views.swift::HeaderView	edge	must		view composition
+sw.C02	C02	spm/Sources/DemoUI/Views.swift::RootView	spm/Sources/DemoUI/Views.swift::ToggleRow	edge	must		view composition with $binding
+sw.C01b	C01	spm/Sources/DemoUI/Views.swift::RootView	spm/Sources/DemoUI/Views.swift::RootView.badge	edge	must		implicit self helper inside ViewBuilder
+sw.C24	C24	spm/Sources/DemoUI/Views.swift::RootView	spm/Sources/Core/Person.swift::Person.make	edge	must		cross-module via import Core
+sw.C24b	C24	spm/Sources/DemoUI/Views.swift::RootView	spm/Sources/Core/PersonExtensions.swift::Person.fullName	edge	must		return-type chain across module
+sw.C04b	C04	spm/Sources/DemoUI/Views.swift::ToggleRow	spm/Sources/DemoUI/Views.swift::ListVM.load	edge	must		@ObservedObject var vm: ListVM
+sw.C03b	C03	spm/Sources/DemoUI/Views.swift::EnvReader	spm/Sources/DemoUI/Views.swift::CounterModel.increment	edge	must		@Environment(CounterModel.self)
+sw.C26	C26	spm/Sources/DemoUI/Items.swift::seed	spm/Sources/DemoUI/Items.swift::Item.rename	edge	must		@Model class, typed by ctor
+sw.C21	C21	spm/Sources/DemoMain/DemoApp.swift::DemoApp	spm/Sources/DemoMain/DemoApp.swift::MainView	edge	must		@main App body
+sw.C24c	C24	spm/Sources/DemoMain/DemoApp.swift::MainView	spm/Sources/Core/Protocols.swift::greetAll	edge	must		cross-module free function
+sw.C20b	C20	spm/Sources/DemoMain/DemoApp.swift::AppDelegate.applicationDidFinishLaunching	spm/Sources/Core/Protocols.swift::Engine.run	edge	must		typed by initializer, cross-module
+sw.C22	C22	spm/Tests/CoreTests/CoreTests.swift::PersonTests.testGreeting	spm/Sources/Core/PersonExtensions.swift::Person.greeting	edge	must		XCTest
+sw.C23	C23	spm/Tests/CoreTests/CoreTests.swift::VecSuite.adds	spm/Sources/Core/PersonExtensions.swift::addVectors	edge	must		Swift Testing
+sw.C23b	C23	spm/Tests/CoreTests/CoreTests.swift::VecSuite.scales	spm/Sources/Core/PersonExtensions.swift::Vec2.scaled	edge	must		call inside #expect macro
+sw.X1	X1	xcode/ios/AppTarget/Home.swift::Home.render	xcode/ios/CoreKit/Sources/CoreKit/Engine.swift::CoreKitEngine.run	edge	must		local SPM package import
+sw.X2	X2	xcode/ios/AppTarget/Home.swift::Home.render	xcode/ios/AppTarget/Theme.swift::Theme.accent	edge	must		own-target type (not Widget, not CoreKit)
+sw.X3	X3	xcode/ios/AppTarget/Home.swift::Home.render	xcode/ios/Shared/Formatter.swift::sharedFormat	edge	must		same Xcode target, different folder
+sw.X4	X4	xcode/ios/WidgetTarget/WidgetView.swift::WidgetView.render	xcode/ios/WidgetTarget/Theme.swift::Theme.accent	edge	must		own-target type
+sw.X5	X5	xcode/ios/WidgetTarget/WidgetView.swift::WidgetView.render	xcode/ios/Shared/Formatter.swift::sharedFormat	edge	must		shared folder
+sw.X7	X7	xcode/ios/AppTarget/Home2.swift::makeTheme	xcode/ios/AppTarget/Theme.swift::Theme	edge	must		ctor of own-module type that shadows an imported same-name type
+sw.M1a	M1	micro/Sources/M/A.swift::plusRight	micro/Sources/M/A.swift::b2	edge	must		right operand of a binary operator is a call
+sw.M1b	M1	micro/Sources/M/A.swift::minusRight	micro/Sources/M/A.swift::b4	edge	must		right operand of a binary operator is a call
+sw.M1c	M1	micro/Sources/M/A.swift::mulRight	micro/Sources/M/A.swift::b5	edge	must		right operand of a binary operator is a call
+sw.M1d	M1	micro/Sources/M/A.swift::plusBoth	micro/Sources/M/A.swift::b8	edge	must		right operand of a binary operator is a call
+sw.M2a	M2	micro/Sources/M/B.swift::freeDot	micro/Sources/M/B.swift::Gauge.bump	edge	must		annotated local types the receiver
+sw.M2b	M2	micro/Sources/M/B.swift::freeDotCall	micro/Sources/M/B.swift::Gauge.bump	edge	must		annotated local types the receiver
+sw.M2c	M2	micro/Sources/M/B.swift::Host.methodDot	micro/Sources/M/B.swift::Gauge.bump	edge	must		annotated local types the receiver
+sw.M2d	M2	micro/Sources/M/B.swift::freeEnumCase	micro/Sources/M/B.swift::Kind.area	edge	must		annotated local enum
+sw.M3	M3	micro/Sources/M/B.swift::multiDecl	micro/Sources/M/B.swift::Gauge.bump	edge	must		receiver is g, not a.bump() + g
+sw.M4a	M4	micro/Sources/M/C.swift::usesLocal	micro/Sources/M/C.swift::Beta.run	edge	must		local typed by call result of external()
+sw.M4b	M4	micro/Sources/M/C.swift::usesLocal	micro/Sources/M/C.swift::Alpha.run	forbid	must		param s: Alpha in another function must not type the local s
+sw.M4c	M4	micro/Sources/M/C.swift::usesClosure	micro/Sources/M/C.swift::Beta.run	edge	must		closure param typed by element type
+sw.M4d	M4	micro/Sources/M/C.swift::usesClosure	micro/Sources/M/C.swift::Alpha.run	forbid	must		must not bind to Alpha.run
+sw.M5	M5	micro/Sources/M/A.swift::ctorChain	micro/Sources/M/A.swift::Meter.bump	edge	must		Meter(v: 1).bump() typed by constructor
+sw.P1	P1	spm/Sources/Core/PrivateReach.swift::Holder.drive	spm/Sources/Core/PrivateReach.swift::Meter.<+>	edge	must		custom operator use
+sw.P2	P2	spm/Sources/Core/PrivateReach.swift::Holder.drive	spm/Sources/Core/PrivateReach.swift::Meter.privBump	edge	must		annotated local let m: Meter = .zero
+sw.P3	P3	spm/Sources/Core/PrivateReach.swift::Holder.drive	spm/Sources/Core/PrivateReach.swift::Meter.privOptional	edge	must		optional property typed by annotation
+sw.P4	P4	spm/Sources/Core/PrivateReach.swift::Holder.drive	spm/Sources/Core/PrivateReach.swift::Meter.privDouble	edge	must		function reference passed by name
+sw.P5	P5	spm/Sources/Core/PrivateReach.swift::Holder.drive	spm/Sources/Core/PrivateReach.swift::Meter.privLabel	edge	must		call in string interpolation
+sw.P6	P6	spm/Sources/Core/PrivateReach.swift::Holder.drive	spm/Sources/Core/PrivateReach.swift::Pinger.pingTwice	edge	must		protocol-extension default on a conformer value
+sw.P10	P10	spm/Sources/Core/PrivateReach.swift::Holder.drive	spm/Sources/Core/PrivateReach.swift::Holder.privStatic	edge	must		Self. static
+sw.P7	P7	spm/Sources/Core/PrivateReach.swift::Pinger.pingTwice	spm/Sources/Core/PrivateReach.swift::LocalPinger.ping	edge	must		requirement dispatch
+sw.P8	P8	spm/Sources/Core/PrivateReach.swift::Holder	spm/Sources/Core/PrivateReach.swift::Holder.privObserved	edge	must		didSet observer
+sw.P9	P9	spm/Sources/Core/PrivateReach.swift::Holder	spm/Sources/Core/PrivateReach.swift::Holder.privCompute	edge	must		lazy var initializer
+sw.X6a	X6	xcode/ios/Shared/Formatter.swift::sharedFormat	xcode/ios/AppTarget/Theme.swift::Theme.accent	edge	must		file compiled into the app target
+sw.X6b	X6	xcode/ios/Shared/Formatter.swift::sharedFormat	xcode/ios/WidgetTarget/Theme.swift::Theme.accent	edge	must		file compiled into the widget target

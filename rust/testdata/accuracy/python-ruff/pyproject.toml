@@ -1,0 +1,6 @@
+[project]
+name = "rootpkg"
+version = "0.1.0"
+
+[tool.ruff]
+src = ["python"]

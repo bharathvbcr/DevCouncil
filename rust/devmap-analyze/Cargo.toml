@@ -83,6 +83,14 @@ name = "liveness_honesty_over_the_hard_shapes"
 required-features = ["parse"]
 
 [[test]]
+name = "accuracy_fixtures"
+required-features = ["parse"]
+
+[[test]]
+name = "real_corpus_accuracy"
+required-features = ["parse"]
+
+[[test]]
 name = "labelled_corpus_precision"
 required-features = ["parse"]
 

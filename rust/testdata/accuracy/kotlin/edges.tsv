@@ -1,0 +1,69 @@
+# Normalized expected edges. Hand-written ground truth: each row was derived from the
+# fixture's original audit labels (written before DevMap ran) and the language's own
+# semantics, never from DevMap's output. Read by devmap-analyze/tests/accuracy_fixtures.rs.
+#
+# Columns (tab separated):
+#   id        unique within the fixture (<lang>.<construct>)
+#   construct the audit's construct label
+#   caller    symbol id `<file>::<qualified name>`; a bare path means the file node
+#   callee    symbol id(s). `a|b` = any one satisfies; `a&b` = all must be present
+#   kind      edge   = a Calls/References/Instantiates/Extends/Implements/... edge, any tier
+#             import = an Imports edge between the two files
+#             forbid = NO edge of any kind at confidence >= 0.9 may join caller and callee
+#   level     must   = a correct resolver has this edge
+#             should = the audit accepted an honest miss or an alternative here
+#   ledger    optional `a|b` bare names a ledger row may carry when the expected callee's
+#             own name is not the name written at the call site
+#   note      what the row proves
+#
+# Dead-code truth lives beside this file in dead.tsv; failures that exist today live in
+# known_failing.tsv (keyed by the card that owns the fix).
+kt.K10	K10	core/src/main/java/com/fx/core/data/TaskRepository.kt::TaskRepository.refresh	core/src/main/java/com/fx/core/data/TaskRepository.kt::TaskRepository.load	edge	must		
+kt.K16	K16	core/src/main/java/com/fx/core/data/TaskRepository.kt::TaskRepositoryImpl.load	core/src/main/java/com/fx/core/data/TaskDao.kt::TaskDao.all	edge	must		
+kt.K17	K17	core/src/main/java/com/fx/core/data/TaskRepository.kt::TaskRepositoryImpl.load	core/src/main/java/com/fx/core/data/TaskApi.kt::TaskApi.fetchRemote	edge	must		
+kt.K09	K09	core/src/main/java/com/fx/core/data/TaskRepository.kt::TaskRepositoryImpl.load	core/src/main/java/com/fx/core/data/Task.kt::LoadResult.Ok	edge	must		
+kt.K26	K26	core/src/main/java/com/fx/core/util/Formatting.kt::GetTasksUseCase.invoke	core/src/main/java/com/fx/core/data/TaskRepository.kt::TaskRepository.load	edge	must		
+kt.K08	K08	app/src/main/java/com/fx/app/FxApp.kt::FxApp.onCreate	app/src/main/java/com/fx/app/Registry.kt::Registry.register	edge	must		
+kt.K19	K19	app/src/main/java/com/fx/app/FxApp.kt::FxApp.onCreate	app/src/main/java/com/fx/app/FxApp.kt::FxApp.onCreate	forbid	must		false-bait
+kt.K19b	K19	app/src/main/java/com/fx/app/BootReceiver.kt::BootReceiver.onReceive	app/src/main/java/com/fx/app/BootReceiver.kt::BootReceiver.rescheduleAll	edge	must		
+kt.K07	K07	app/src/main/java/com/fx/app/Registry.kt::Clock.create	app/src/main/java/com/fx/app/Registry.kt::Clock	edge	must		
+kt.K26b	K26	app/src/main/java/com/fx/app/MainViewModel.kt::MainViewModel.refresh	core/src/main/java/com/fx/core/util/Formatting.kt::GetTasksUseCase.invoke	edge	must		
+kt.K04	K04	app/src/main/java/com/fx/app/MainViewModel.kt::MainViewModel.refresh	app/src/main/java/com/fx/app/MainViewModel.kt::MainViewModel.countDone	edge	must		
+kt.K09b	K09	app/src/main/java/com/fx/app/MainViewModel.kt::MainViewModel.describe	app/src/main/java/com/fx/app/MainViewModel.kt::MainViewModel.summarize	edge	must		
+kt.K01	K01	app/src/main/java/com/fx/app/Screens.kt::HomeScreen	app/src/main/java/com/fx/app/Screens.kt::Header	edge	must		
+kt.K02	K02	app/src/main/java/com/fx/app/Screens.kt::HomeScreen	app/src/main/java/com/fx/app/MainViewModel.kt::MainViewModel.describe	edge	must		
+kt.K01b	K01	app/src/main/java/com/fx/app/Screens.kt::HomeScreen	app/src/main/java/com/fx/app/Screens.kt::Card	edge	must		
+kt.K27	K27	app/src/main/java/com/fx/app/Screens.kt::HomeScreen	app/src/main/java/com/fx/app/MainViewModel.kt::MainViewModel.refresh	edge	must		reference
+kt.K18	K18	app/src/main/java/com/fx/app/Screens.kt::AppNavGraph	app/src/main/java/com/fx/app/Screens.kt::HomeScreen	edge	must		
+kt.K18b	K18	app/src/main/java/com/fx/app/Screens.kt::AppNavGraph	app/src/main/java/com/fx/app/Screens.kt::SettingsScreen	edge	must		
+kt.K01c	K01	app/src/main/java/com/fx/app/Screens.kt::SettingsScreen	app/src/main/java/com/fx/app/Screens.kt::Header	edge	must		
+kt.K14	K14	app/src/main/java/com/fx/app/MainActivity.kt::MainActivity	app/src/main/java/com/fx/app/Registry.kt::Clock.create	edge	must		
+kt.K01d	K01	app/src/main/java/com/fx/app/MainActivity.kt::MainActivity.onCreate	app/src/main/java/com/fx/app/Screens.kt::AppNavGraph	edge	must		
+kt.K14b	K14	app/src/main/java/com/fx/app/MainActivity.kt::MainActivity.onCreate	app/src/main/java/com/fx/app/MainViewModel.kt::MainViewModel.refresh	edge	must		
+kt.K13	K13	app/src/main/java/com/fx/app/MainActivity.kt::MainActivity.onCreate	core/src/main/java/com/fx/core/data/Task.kt::Task	edge	must		
+kt.K11	K11	app/src/main/java/com/fx/app/MainActivity.kt::MainActivity.onCreate	core/src/main/java/com/fx/core/data/Task.kt::Task.complete	edge	must		
+kt.K05	K05	app/src/main/java/com/fx/app/MainActivity.kt::MainActivity.onCreate	core/src/main/java/com/fx/core/util/Formatting.kt::Task.isOverdue	edge	must		
+kt.K05b	K05	app/src/main/java/com/fx/app/MainActivity.kt::MainActivity.onCreate	core/src/main/java/com/fx/core/util/Formatting.kt::String.slugify	edge	must		
+kt.K15	K15	app/src/main/java/com/fx/app/MainActivity.kt::MainActivity.onCreate	core/src/main/java/com/fx/core/util/Formatting.kt::formatDuration	edge	must		
+kt.K25	K25	app/src/main/java/com/fx/app/MainActivity.kt::MainActivity.onCreate	core/src/main/java/com/fx/core/util/Formatting.kt::Int.every	edge	must		
+kt.K24	K24	app/src/main/java/com/fx/app/MainActivity.kt::MainActivity.onCreate	core/src/main/java/com/fx/core/util/Formatting.kt::castOrNull	edge	must		
+kt.K07b	K07	app/src/main/java/com/fx/app/MainActivity.kt::MainActivity.onCreate	app/src/main/java/com/fx/app/Registry.kt::Clock.elapsed	edge	must		
+kt.K11b	K11	app/src/main/java/com/fx/app/MainActivity.kt::MainActivity.onCreate	app/src/main/java/com/fx/app/MainActivity.kt::MainActivity.log	edge	must		
+kt.K12	K12	app/src/main/java/com/fx/app/MainActivity.kt::MainActivity.onCreate	app/src/main/java/com/fx/app/Dsl.kt::buildPage	edge	must		
+kt.K12b	K12	app/src/main/java/com/fx/app/MainActivity.kt::MainActivity.onCreate	app/src/main/java/com/fx/app/Dsl.kt::Page.section	edge	must		
+kt.K23	K23	app/src/main/java/com/fx/app/MainActivity.kt::MainActivity.onCreate	app/src/main/java/com/fx/legacy/LegacyMath.java::LegacyMath.twice	edge	must		
+kt.K12c	K12	app/src/main/java/com/fx/app/Dsl.kt::buildPage	app/src/main/java/com/fx/app/Dsl.kt::Page	edge	must		
+kt.K03	K03	app/src/main/java/com/fx/app/Di.kt::RepoModule.provideRepo	core/src/main/java/com/fx/core/data/TaskRepository.kt::TaskRepositoryImpl	edge	must		
+kt.K03b	K03	app/src/main/java/com/fx/app/Di.kt::RepoModule.provideApi	core/src/main/java/com/fx/core/data/TaskApi.kt::buildApi	edge	must		
+kt.K10b	K10	app/src/main/java/com/fx/app/Greeter.kt::Greeter.greet	app/src/main/java/com/fx/app/Greeter.kt::Greeter.hello	edge	must		
+kt.K10c	K10	app/src/main/java/com/fx/app/Greeter.kt::greetAll	app/src/main/java/com/fx/app/Greeter.kt::Greeter.greet	edge	must		
+kt.K13b	K13	app/src/main/java/com/fx/app/Greeter.kt::greetAll	app/src/main/java/com/fx/app/Greeter.kt::English	edge	must		
+kt.K28	K28	app/src/main/java/com/fx/app/Greeter.kt::greetAll	app/src/main/java/com/fx/app/Greeter.kt::English.hello	edge	must		
+kt.K28b	K28	app/src/main/java/com/fx/app/Greeter.kt::greetAll	app/src/main/java/com/fx/app/Greeter.kt::Door.hello	edge	must		cast receiver
+kt.K23b	K23	app/src/main/java/com/fx/legacy/LegacyMath.java::LegacyMath.callKotlin	app/src/main/java/com/fx/app/Registry.kt::Registry.register	edge	must		
+kt.K20	K20	app/src/test/java/com/fx/app/ClockTest.kt::ClockTest.elapsedCountsFromStart	app/src/main/java/com/fx/app/Registry.kt::Clock.create	edge	must		
+kt.K20b	K20	app/src/test/java/com/fx/app/ClockTest.kt::ClockTest.elapsedCountsFromStart	app/src/main/java/com/fx/app/Registry.kt::Clock.elapsed	edge	must		
+kt.K21	K21	app/src/androidTest/java/com/fx/app/HeaderUiTest.kt::HeaderUiTest.showsTitle	app/src/main/java/com/fx/app/Screens.kt::Header	edge	must		
+kt.K22	K22	app/build.gradle.kts	app/build.gradle.kts::versionCodeFor	edge	must		
+kt.K06	K06	core/src/main/java/com/fx/core/data/Task.kt::Task.label	core/src/main/java/com/fx/core/util/Formatting.kt::String.slugify	edge	must		
+kt.K06b	K06	app/src/main/java/com/fx/app/MainActivity.kt::MainActivity.onCreate	core/src/main/java/com/fx/core/data/Task.kt::Task.label	edge	must		reference to a property
