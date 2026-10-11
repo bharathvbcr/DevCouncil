@@ -3231,6 +3231,10 @@ fn go_interface_method_exemptions(
     }
 }
 
+/// Why a Go interface's method requirement is never a dead-code candidate.
+pub const GO_INTERFACE_REQUIREMENT_REASON: &str = "Go interface method requirement — it \
+     declares what an implementer must provide, so no caller of its own is expected";
+
 /// Why an ambient TypeScript declaration is never a dead-code candidate.
 pub const TS_AMBIENT_REASON: &str = "ambient TypeScript declaration (`declare module`, `declare \
      global`, a module augmentation or a `.d.ts` shim) — it describes a type that lives \
@@ -4767,10 +4771,21 @@ fn extract_node(
                     node
                 };
                 if let Some(n) = get_child_text(node_to_check, "name", source) {
+                    let qualified_name = scoped_qualified_name(node, source, file_symbol_name, &n);
+                    // An interface is an interface, not a struct: its method
+                    // requirements are symbols a call through the interface can
+                    // name, and what a dispatch edge's `via` points at.
+                    let interface = node_to_check
+                        .child_by_field_name("type")
+                        .filter(|ty| ty.kind() == "interface_type");
                     symbols.push(ExtractedSymbol {
                         name: n.clone(),
-                        qualified_name: scoped_qualified_name(node, source, file_symbol_name, &n),
-                        kind: SymbolKind::Struct,
+                        qualified_name: qualified_name.clone(),
+                        kind: if interface.is_some() {
+                            SymbolKind::Interface
+                        } else {
+                            SymbolKind::Struct
+                        },
                         span,
                         is_exported: n.chars().next().is_some_and(|c| c.is_uppercase()),
                         docstring: None,
@@ -4780,6 +4795,36 @@ fn extract_node(
                         declaration_hash: None,
                         return_type: None,
                     });
+                    if let Some(interface) = interface {
+                        let mut cursor = interface.walk();
+                        for member in interface.named_children(&mut cursor) {
+                            if member.kind() != "method_elem" {
+                                continue;
+                            }
+                            let Some(method) = get_child_text(member, "name", source) else {
+                                continue;
+                            };
+                            let method_qualified = format!("{qualified_name}.{method}");
+                            wiring.push(WiringAnnotation {
+                                kind: WiringKind::StructuralExempt,
+                                target_symbol: method_qualified.clone(),
+                                details: GO_INTERFACE_REQUIREMENT_REASON.to_string(),
+                            });
+                            symbols.push(ExtractedSymbol {
+                                name: method.clone(),
+                                qualified_name: method_qualified,
+                                kind: SymbolKind::Method,
+                                span: node_span(member),
+                                is_exported: method.chars().next().is_some_and(|c| c.is_uppercase()),
+                                docstring: None,
+                                signature: None,
+                                parent_symbol: Some(qualified_name.clone()),
+                                body_signature: None,
+                                declaration_hash: None,
+                                return_type: None,
+                            });
+                        }
+                    }
                 }
             }
             // `const P, Q = 1, 2` declares two constants. `name` is a repeated
