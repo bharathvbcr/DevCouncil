@@ -1,9 +1,14 @@
-//! Whether a permission fixture actually took effect for this process.
-//!
-//! Shared by the suites that build an unreadable or unwritable fixture, so the
-//! decision about when such a fixture is inert has one owner.
-
-#![cfg(unix)]
+// Whether a permission fixture actually took effect for this process.
+//
+// The one owner of that decision, for every suite that builds an unreadable or
+// unwritable fixture. It is `include!`d, not a module: the same line works at a
+// test file's top level and inside a test function in src/, and the path is
+// relative to the including file (rust/<crate>/tests or rust/<crate>/src).
+// Callers are `#[cfg(unix)]`: it uses std::os::unix and a mode-bit fixture has
+// no Windows meaning.
+//
+//     #[cfg(unix)]
+//     include!("../../testsupport/restriction.rs");
 
 /// Whether the mode bits just set actually refuse this process.
 ///
@@ -11,7 +16,7 @@
 /// through read-only, and then the condition this test builds cannot exist.
 /// The test says so on stderr and stops rather than failing on its
 /// environment; wherever the restriction holds, every assertion runs.
-pub fn restriction_holds(path: impl AsRef<std::path::Path>) -> bool {
+pub(crate) fn restriction_holds(path: impl AsRef<std::path::Path>) -> bool {
     use std::os::unix::fs::PermissionsExt;
     let path = path.as_ref();
     let Ok(meta) = std::fs::metadata(path) else {

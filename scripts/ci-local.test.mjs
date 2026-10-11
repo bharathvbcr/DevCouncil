@@ -200,3 +200,12 @@ describe("rust/dc-sparse-encode/ci-test.sh", () => {
     }
   });
 });
+
+describe("test-support ownership", () => {
+  it("has exactly one definition of restriction_holds, in rust/testsupport", () => {
+    const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const r = spawnSync("git", ["-C", root, "grep", "-l", "fn restriction_holds", "--", "rust/*.rs"], { encoding: "utf8" });
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(r.stdout.trim().split("\n"), ["rust/testsupport/restriction.rs"]);
+  });
+});
