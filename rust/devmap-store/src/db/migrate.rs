@@ -147,7 +147,34 @@ impl Store {
         Ok(Some(floor as i32))
     }
 
+    /// Refuse a store whose schema carries a trigger.
+    ///
+    /// No version of this schema has ever declared one, so a trigger in
+    /// `sqlite_master` was put there by whoever produced the file. It runs with
+    /// this process's authority on the next write: one survived `devmap build`
+    /// and rewrote what the build stored, another made the build spin. A store
+    /// is derived data; the remedy is the one for any untrusted store, to
+    /// quarantine it and rebuild.
+    pub(super) fn reject_triggers(conn: &Connection) -> Result<()> {
+        let trigger: Option<String> = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match trigger {
+            None => Ok(()),
+            Some(name) => Err(refusal(format!(
+                "the store carries a trigger ({name:?}), which no devmap schema declares; \
+                 refusing to run SQL somebody else put in the file — `dev map doctor --fix` \
+                 quarantines the store and rebuilds it"
+            ))),
+        }
+    }
+
     pub(super) fn validate_schema(conn: &Connection) -> Result<()> {
+        Self::reject_triggers(conn)?;
         for (table, required_columns) in REQUIRED_SCHEMA {
             let object_type: Option<String> = conn
                 .query_row(
