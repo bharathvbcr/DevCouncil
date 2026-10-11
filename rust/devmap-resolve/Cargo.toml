@@ -2,6 +2,7 @@
 name = "devmap-resolve"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Call and import resolution into a defended edge graph"

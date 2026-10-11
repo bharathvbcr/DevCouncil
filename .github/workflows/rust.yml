@@ -12,6 +12,10 @@ on:
   push:
     paths:
       - "rust/devmap-*/**"
+      # Every devmap crate depends on these three.
+      - "rust/dc-proc/**"
+      - "rust/dc-regress/**"
+      - "rust/dc-regress-store/**"
       - "rust/vendor/**"
       - "rust/testdata/**"
       - "rust/tools/**"
@@ -21,6 +25,8 @@ on:
       - "rust/.gitignore"
       - ".github/workflows/rust.yml"
       - ".github/actions/setup-gusset/**"
+      - ".github/actions/setup-rust/**"
+      - "rust-toolchain.toml"
       - "rust/gusset-engine/**"
       - "backend/go_orchestrator/gussetfn/**"
       - "backend/go_orchestrator/policy/**"
@@ -28,6 +34,10 @@ on:
   pull_request:
     paths:
       - "rust/devmap-*/**"
+      # Every devmap crate depends on these three.
+      - "rust/dc-proc/**"
+      - "rust/dc-regress/**"
+      - "rust/dc-regress-store/**"
       - "rust/vendor/**"
       - "rust/testdata/**"
       - "rust/tools/**"
@@ -37,6 +47,8 @@ on:
       - "rust/.gitignore"
       - ".github/workflows/rust.yml"
       - ".github/actions/setup-gusset/**"
+      - ".github/actions/setup-rust/**"
+      - "rust-toolchain.toml"
       - "rust/gusset-engine/**"
       - "backend/go_orchestrator/gussetfn/**"
       - "backend/go_orchestrator/policy/**"
@@ -58,6 +70,12 @@ env:
   RUST_TEST_THREADS: "2"
   TOKIO_WORKER_THREADS: "2"
 
+# One run per workflow and ref: a newer push supersedes the one in flight.
+# Tag refs are never cancelled, so a release cannot be cut off by a later push.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
   test:
     name: test (${{ matrix.os }})
@@ -70,11 +88,12 @@ jobs:
         os: [ubuntu-latest, macos-15, windows-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
         with:
+          # A failing job still saves its cache; without this the jobs that fail
+          # most never warm one and every rerun rebuilds from nothing.
+          cache-on-failure: true
           workspaces: rust
 
       # Formatting and lints are platform-independent, so one run is enough —
@@ -153,9 +172,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
         with:
+          # A failing job still saves its cache; without this the jobs that fail
+          # most never warm one and every rerun rebuilds from nothing.
+          cache-on-failure: true
           workspaces: rust
       # `dc-verify` is in the loop below, and its json_contract test drives the
       # Go host binary as a real process rather than skipping when it is
@@ -165,6 +187,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: backend/go_orchestrator/go.mod
+          cache-dependency-path: backend/go_orchestrator/go.mod
       - name: Set up Gusset
         uses: ./.github/actions/setup-gusset
       - name: Build the DevCouncil host
@@ -193,11 +216,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - uses: ./.github/actions/setup-rust
       - uses: Swatinem/rust-cache@v2
         with:
+          # A failing job still saves its cache; without this the jobs that fail
+          # most never warm one and every rerun rebuilds from nothing.
+          cache-on-failure: true
           workspaces: rust
       - name: Install gate dependencies
         run: sudo apt-get update && sudo apt-get install -y sqlite3 rsync
@@ -205,6 +229,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: backend/go_orchestrator/go.mod
+          cache-dependency-path: backend/go_orchestrator/go.mod
       # verify.sh builds the host. That link needs the sibling checkout and
       # libgusset.a; the script builds the archive when the sibling is already
       # on disk, and fails when it is not.
@@ -233,15 +258,19 @@ jobs:
         working-directory: .
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-rust
         with:
           targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
         with:
+          # A failing job still saves its cache; without this the jobs that fail
+          # most never warm one and every rerun rebuilds from nothing.
+          cache-on-failure: true
           workspaces: rust/gusset-engine
       - uses: actions/setup-go@v5
         with:
           go-version-file: backend/go_orchestrator/go.mod
+          cache-dependency-path: backend/go_orchestrator/go.mod
       - name: Set up Gusset
         uses: ./.github/actions/setup-gusset
       - name: Install musl-gcc
@@ -272,15 +301,3 @@ jobs:
             echo "::error::gusset-check passed a static build with no unwind table; it cannot see a dead panic firewall"
             exit 1
           fi
-
-  parity:
-    name: release build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
-      - name: Build release binary
-        run: cargo build --release -p devmap-cli --bin devmap

@@ -7,6 +7,14 @@ import {
   INSTALL_HINT,
   hasWorkflowLevelPermissions,
   interpret,
+  membersOutOfScope,
+  readWorkflows,
+  structuralFailures,
+  testedPackages,
+  triggerPaths,
+  workflowsMissingConcurrency,
+  workflowsNamingAChannel,
+  workspaceMembers,
   workflowFiles,
   workflowsMissingPermissions,
 } from "./check-workflows.mjs";
@@ -63,7 +71,7 @@ describe("check:workflows", () => {
     // One step per job that compiles the host. Dropping a call site puts
     // `replacement directory ../../../gusset does not exist` back on the tag.
     assert.equal(uses("ci.yml"), 1);
-    assert.equal(uses("analysis-plane.yml"), 2);
+    assert.equal(uses("analysis-plane.yml"), 3);
     // verify.sh gates, embedder shape, and the static musl host.
     assert.equal(uses("rust.yml"), 3);
     assert.equal(uses("codeql.yml"), 1);
@@ -79,5 +87,99 @@ describe("check:workflows", () => {
       artifactChecks.length >= 2,
       "release.yml must run the archive gate before cargo-dist publish and again after the flattened download",
     );
+  });
+
+  it("passes the structural checks on this repository", () => {
+    assert.deepEqual(structuralFailures(fileURLToPath(new URL("..", import.meta.url))), []);
+  });
+
+  describe("workspace scope", () => {
+    const members = [
+      { dir: "devmap-a", name: "devmap-a" },
+      { dir: "dc-b", name: "dc-b" },
+    ];
+    const rust = `on:
+  push:
+    paths:
+      - "rust/devmap-*/**"
+jobs:
+  t:
+    steps:
+      - run: cargo test --workspace --exclude dc-b --no-fail-fast
+`;
+
+    it("flags a member no workflow names or triggers on", () => {
+      const out = membersOutOfScope(members, { "rust.yml": rust });
+      assert.deepEqual(out.map((m) => m.name), ["dc-b"]);
+      assert.equal(out[0].tested, false);
+    });
+
+    it("flags a planted crate that is tested by --workspace but outside every paths filter", () => {
+      const planted = [...members, { dir: "planted", name: "planted" }];
+      const out = membersOutOfScope(planted, { "rust.yml": rust.replace(" --exclude dc-b", " --exclude dc-b") });
+      assert.deepEqual(out.map((m) => m.name).sort(), ["dc-b", "planted"]);
+      assert.equal(out.find((m) => m.name === "planted").tested, true);
+    });
+
+    it("accepts a member another workflow triggers on and names with -p", () => {
+      const analysis = `on:
+  push:
+    paths:
+      - "rust/**"
+jobs:
+  t:
+    steps:
+      - run: cargo test -p dc-b --no-fail-fast
+`;
+      assert.deepEqual(membersOutOfScope(members, { "rust.yml": rust, "analysis-plane.yml": analysis }), []);
+    });
+
+    it("reads -p, a for-loop list, line continuations and ignores comments", () => {
+      const names = ["a", "b", "c", "d"];
+      const yaml = `jobs:
+  t:
+    steps:
+      # cargo test -p d
+      - run: |
+          for crate in a b; do
+            cargo test -p "$crate"
+          done
+          cargo test -p c \
+            --no-fail-fast
+          cargo test -p d --test only_one
+`;
+      assert.deepEqual([...testedPackages(yaml, names)].sort(), ["a", "b", "c"]);
+    });
+
+    it("treats a workflow with no paths filter as covering every path", () => {
+      assert.equal(triggerPaths("on:\n  push:\n    branches: [main]\njobs:\n"), "all");
+    });
+
+    it("lists this repository's real members", () => {
+      const rustDir = fileURLToPath(new URL("../rust", import.meta.url));
+      const names = workspaceMembers(rustDir).map((m) => m.name);
+      assert.ok(names.includes("dc-regress"));
+      assert.ok(names.includes("devmap-soak"));
+    });
+  });
+
+  it("refuses a workflow that names a Rust channel, or has no concurrency group", () => {
+    assert.deepEqual(
+      workflowsNamingAChannel({
+        "a.yml": "jobs:\n  t:\n    steps:\n      - uses: dtolnay/rust-toolchain@stable\n",
+        "b.yml": "jobs:\n  t:\n    steps:\n      - uses: ./.github/actions/setup-rust\n",
+      }),
+      ["a.yml"],
+    );
+    assert.deepEqual(
+      workflowsMissingConcurrency({
+        "a.yml": "on: push\njobs:\n  t: {}\n",
+        "b.yml": "on: push\nconcurrency:\n  group: g\njobs:\n  t: {}\n",
+      }),
+      ["a.yml"],
+    );
+    const real = readWorkflows(fileURLToPath(new URL("../.github/workflows", import.meta.url)));
+    assert.deepEqual(workflowsNamingAChannel(real), []);
+    assert.deepEqual(workflowsMissingConcurrency(real), []);
   });
 });

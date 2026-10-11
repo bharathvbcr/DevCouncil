@@ -2,6 +2,7 @@
 name = "devmap-cli"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "devmap CLI — symbol-level code intelligence for coding agents: tree-sitter code graph, blast radius, dead-code analysis, and an MCP server"

@@ -1,0 +1,16 @@
+# The one owner of the Rust toolchain for rust/, rust/gusset-engine and
+# rust/dc-sparse-encode, locally and in CI. Every workflow installs it through
+# .github/actions/setup-rust, which reads this file; no workflow names a
+# channel. An unpinned `stable` under `-D warnings` broke main when a new
+# release deprecated an API the tree used.
+#
+# Bump deliberately, in its own change: edit `channel`, run
+# `cargo fmt --all -- --check` and the clippy commands from
+# .github/workflows/rust.yml and analysis-plane.yml, fix what the new release
+# flags, then update `rust-version` in rust/Cargo.toml and
+# rust/dc-sparse-encode/Cargo.toml to the same minor. See the release
+# checklist in docs/releases/README.md.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

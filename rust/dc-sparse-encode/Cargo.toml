@@ -8,7 +8,7 @@
 name = "dc-sparse-encode"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.99" # the pin in ../../rust-toolchain.toml
 license = "Apache-2.0"
 publish = false
 description = "Offline doc-side sparse encoder for dcgrep, on tessl. Apple silicon only."

@@ -71,7 +71,7 @@ runs:
     # elsewhere. The MinGW/gnu-target path this replaced could never succeed.
     - name: Rust toolchain
       if: ${{ runner.os != 'Windows' && inputs.build-engine == 'true' }}
-      uses: dtolnay/rust-toolchain@stable
+      uses: ./.github/actions/setup-rust
 
     - name: Build the umbrella staticlib
       if: ${{ runner.os != 'Windows' && inputs.build-engine == 'true' }}
