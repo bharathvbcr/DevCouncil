@@ -339,22 +339,70 @@ pub fn gap_upsert(conn: &Connection, gap: &GapRow) -> Result<()> {
 /// The counter advances on every call, including one with no gaps, which is
 /// what makes a disappearance observable at all.
 pub fn gaps_replace(conn: &Connection, task_id: &str, gaps: &[GapRow]) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    gaps_replace_in(&tx, task_id, gaps)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// The most gaps one replacement may carry. A set past it is refused loudly:
+/// the caller built it from something that is not a verification, and a task
+/// with this many open gaps is not one an agent can act on anyway.
+pub const MAX_GAPS_PER_REPLACE: usize = 500;
+
+/// Rewrites a replacement set to what the table can hold for `task_id`: every
+/// row belongs to the key task, and one row stands for each id.
+///
+/// The DELETE below is keyed on the task, so a row whose `task_id` named some
+/// other task (or none) was inserted outside the set that clears it: the task's
+/// list came back empty, and the next replace failed `UNIQUE constraint failed:
+/// gaps.id` for as long as the stray row lived. Rewriting to the key makes the
+/// row clearable. A duplicate id inside the set collapses to its last
+/// occurrence, in first-seen order — the same result the per-gap upsert path
+/// produced — instead of aborting the whole replacement on the second insert.
+fn normalise_gaps(task_id: &str, gaps: &[GapRow]) -> Result<Vec<GapRow>> {
+    if gaps.len() > MAX_GAPS_PER_REPLACE {
+        return Err(StoreError::BadScope {
+            reason: format!(
+                "{} gaps in one replacement exceeds the limit of {MAX_GAPS_PER_REPLACE}",
+                gaps.len()
+            ),
+        });
+    }
+    let mut out: Vec<GapRow> = Vec::with_capacity(gaps.len());
+    for gap in gaps {
+        if gap.id.trim().is_empty() {
+            return Err(StoreError::BadScope {
+                reason: "gap id is required".into(),
+            });
+        }
+        let mut row = gap.clone();
+        row.task_id = Some(task_id.to_string());
+        match out.iter().position(|seen| seen.id == row.id) {
+            Some(at) => out[at] = row,
+            None => out.push(row),
+        }
+    }
+    Ok(out)
+}
+
+fn gaps_replace_in(tx: &Connection, task_id: &str, gaps: &[GapRow]) -> Result<()> {
     if task_id.trim().is_empty() {
         return Err(StoreError::BadScope {
             reason: "task_id is required to replace gaps".into(),
         });
     }
-    let tx = conn.unchecked_transaction()?;
+    let gaps = normalise_gaps(task_id, gaps)?;
 
     // Advance this task's run counter first, so every sighting below agrees on
     // which run it is recording.
-    let run = advance_run(&tx, task_id)?;
-    for gap in gaps {
-        record_sighting(&tx, task_id, &gap.id, &gap.gap_type, run)?;
+    let run = advance_run(tx, task_id)?;
+    for gap in &gaps {
+        record_sighting(tx, task_id, &gap.id, &gap.gap_type, run)?;
     }
 
     tx.execute("DELETE FROM gaps WHERE task_id = ?1", params![task_id])?;
-    for gap in gaps {
+    for gap in &gaps {
         let blocking: i64 = if gap.blocking { 1 } else { 0 };
         tx.execute(
             "INSERT INTO gaps
@@ -382,6 +430,34 @@ pub fn gaps_replace(conn: &Connection, task_id: &str, gaps: &[GapRow]) -> Result
             ],
         )?;
     }
+    Ok(())
+}
+
+/// Records one verification and its gaps as a single transaction: the run row
+/// (when given) and the replacement gap set commit together or not at all, so
+/// a run is never stored with a status and no gaps, and a failure part-way
+/// leaves the previous gaps intact.
+pub fn verification_commit(
+    conn: &Connection,
+    run: Option<&VerificationRun>,
+    task_id: &str,
+    gaps: &[GapRow],
+) -> Result<()> {
+    if let Some(run) = run
+        && run.task_id != task_id
+    {
+        return Err(StoreError::BadScope {
+            reason: format!(
+                "run {} belongs to task {:?}, not {task_id:?}",
+                run.id, run.task_id
+            ),
+        });
+    }
+    let tx = conn.unchecked_transaction()?;
+    if let Some(run) = run {
+        run_record(&tx, run)?;
+    }
+    gaps_replace_in(&tx, task_id, gaps)?;
     tx.commit()?;
     Ok(())
 }

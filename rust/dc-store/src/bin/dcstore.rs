@@ -176,6 +176,9 @@ const KNOWN_FLAGS: &[&str] = &[
     // above asks for.
     "stdout-path",
     "stderr-path",
+    // `gaps-replace`: one verification (run record and gap set) in the framing
+    // dc_store::commit_wire documents.
+    "wire",
 ];
 
 /// The identity a caller checks to confirm it is talking to this store and not
@@ -813,6 +816,21 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
             ]))
         }
 
+        "gaps-replace" => {
+            let task = required("task")?.to_string();
+            let (run, gaps) = dc_store::commit_wire::decode(required("wire")?)
+                .map_err(|e| Failure::Fatal(format!("--wire: {e}")))?;
+            store
+                .verification_commit(run.as_ref(), &task, &gaps)
+                .map_err(|e| Failure::Fatal(e.to_string()))?;
+            let count = gaps.len().to_string();
+            Ok(object(&[
+                ("ok", &json_bool(true)),
+                ("task_id", &quote(&task)),
+                ("count", &count),
+            ]))
+        }
+
         "gap-upsert" => {
             let blocking = matches!(
                 flag("blocking").unwrap_or("false"),
@@ -901,7 +919,7 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
         }
 
         other => Err(Failure::Fatal(format!(
-            "unknown command {other:?} (acquire, diagnose, release, renew, active, list, task, ready, scope-append, health, serve, evidence-append, evidence-list, gaps, gaps-clear, gap-history, gap-upsert, run-record, handoff, work)"
+            "unknown command {other:?} (acquire, diagnose, release, renew, active, list, task, ready, scope-append, health, serve, evidence-append, evidence-list, gaps, gaps-clear, gaps-replace, gap-history, gap-upsert, run-record, handoff, work)"
         ))),
     }
 }
