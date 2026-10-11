@@ -842,7 +842,7 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // v81 records a Go file's declarations, local scopes and call receivers as
     // structured facts (`go_facts`).
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "81",
+        EXTRACTION_SCHEMA_VERSION, "82",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

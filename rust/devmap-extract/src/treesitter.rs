@@ -552,6 +552,18 @@ fn extract_treesitter_before_deadline(
                         deadline,
                     );
                 }
+                // Ruby defines methods with no `def`: `attr_reader :tap` is the
+                // declaration of `tap`. After the walk, so a `def` of the same
+                // name anywhere in the class has already been emitted and wins.
+                if lang == "ruby" {
+                    let attributes = crate::langdecl::ruby::attribute_symbols(
+                        root,
+                        source,
+                        &file_symbol_name,
+                        &symbols,
+                    );
+                    symbols.extend(attributes);
+                }
                 if !crate::entry_names::collect(
                     root,
                     source,
@@ -785,6 +797,14 @@ fn extract_treesitter_before_deadline(
                     go_package: (lang == "go")
                         .then(|| go_package_name(root, source))
                         .flatten(),
+                    jvm_package: matches!(lang, "kotlin" | "java")
+                        .then(|| jvm_package_name(root, source))
+                        .flatten(),
+                    scope_receivers: if lang == "kotlin" {
+                        crate::langcalls::kotlin::scope_receivers(root, source)
+                    } else {
+                        Vec::new()
+                    },
                     go_build_constrained: lang == "go" && go_build_constrained(path, source),
                     go_interface_methods,
                     go_method_params,
@@ -1848,7 +1868,12 @@ pub(crate) fn refused_extraction(
 /// Shares its body with the refusal path deliberately. Both emit the `File`
 /// node and the wiring annotations and claim nothing else; when that shape was
 /// two copies, one of them was fixed and the other was not.
-fn skipped_extraction(path: &str, lang: &str, source: &str, reason: String) -> Extraction {
+pub(crate) fn skipped_extraction(
+    path: &str,
+    lang: &str,
+    source: &str,
+    reason: String,
+) -> Extraction {
     unparsed_extraction(
         path,
         lang,
@@ -1900,6 +1925,8 @@ fn unparsed_extraction(
         routes: Vec::new(),
         wiring: extract_wiring_annotations(path, source),
         go_package: None,
+        jvm_package: None,
+        scope_receivers: Vec::new(),
         go_build_constrained: false,
         go_interface_methods: Vec::new(),
         go_method_params: Vec::new(),
@@ -2109,6 +2136,8 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
         routes: Vec::new(),
         wiring: extract_wiring_annotations(path, source),
         go_package: None,
+        jvm_package: None,
+        scope_receivers: Vec::new(),
         go_build_constrained: false,
         go_interface_methods: Vec::new(),
         go_method_params: Vec::new(),
@@ -2599,6 +2628,20 @@ fn member_access_receiver(node: Node, source: &str) -> Option<String> {
             bounded_parent(parent).filter(|nav| nav.kind() == "navigation_expression")?;
         let target = navigation.child_by_field_name("target")?;
         let text = receiver_identity(target, source, 0);
+        return (!text.is_empty()).then_some(text);
+    }
+    // Kotlin's `navigation_expression` has no fields: the object is the first
+    // named child and the member the last (`task.label`, `a.b.c`).
+    if parent.kind() == "navigation_expression" {
+        let count = parent.named_child_count();
+        if count < 2
+            || parent
+                .named_child(count - 1)
+                .is_none_or(|member| member.id() != node.id())
+        {
+            return None;
+        }
+        let text = receiver_identity(parent.named_child(0)?, source, 0);
         return (!text.is_empty()).then_some(text);
     }
     // The grammars spell the same shape several ways: `attribute` in Python,
@@ -4815,7 +4858,10 @@ fn extract_node(
                                 qualified_name: method_qualified,
                                 kind: SymbolKind::Method,
                                 span: node_span(member),
-                                is_exported: method.chars().next().is_some_and(|c| c.is_uppercase()),
+                                is_exported: method
+                                    .chars()
+                                    .next()
+                                    .is_some_and(|c| c.is_uppercase()),
                                 docstring: None,
                                 signature: None,
                                 parent_symbol: Some(qualified_name.clone()),
@@ -7726,6 +7772,25 @@ fn go_type_name(node: Node, source: &str, depth: usize) -> Option<String> {
     }
 }
 
+/// The dotted package a Kotlin or Java file declares, if it declares one.
+fn jvm_package_name(root: Node, source: &str) -> Option<String> {
+    let mut cursor = root.walk();
+    let header = root
+        .named_children(&mut cursor)
+        .find(|child| matches!(child.kind(), "package_header" | "package_declaration"))?;
+    let name = header.named_children(&mut header.walk()).find(|child| {
+        matches!(
+            child.kind(),
+            "qualified_identifier" | "scoped_identifier" | "identifier"
+        )
+    })?;
+    let text: String = get_node_text(name, source)
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    (!text.is_empty()).then_some(text)
+}
+
 fn go_package_name(root: Node, source: &str) -> Option<String> {
     let mut package_cursor = root.walk();
     let mut identifier_cursor = root.walk();
@@ -8266,6 +8331,18 @@ fn is_defining_name(node: Node) -> bool {
     // — which is the self-reference shape
     // `c_family_declarations_do_not_reference_themselves` already pins for C.
     if bounded_parent(node).is_some_and(|parent| parent.kind() == "enum_entry") {
+        return true;
+    }
+    // Kotlin names a local (`val clock = …`, `for (item in …)`) in the first
+    // identifier of a `variable_declaration`, and a function parameter in the
+    // first identifier of a `parameter`; neither carries a `name` field, so the
+    // field test below cannot see them and a local was never a local.
+    if bounded_parent(node).is_some_and(|parent| {
+        matches!(parent.kind(), "variable_declaration" | "parameter")
+            && parent
+                .named_child(0)
+                .is_some_and(|first| first.id() == node.id())
+    }) {
         return true;
     }
     // R spells every function declaration as an assignment — `helper <-
@@ -9018,16 +9095,40 @@ fn collect_site_bindings(
                             {
                                 break;
                             }
+                            // Kotlin's `val habit = habit(..)` is the same
+                            // shape: the local is not in scope in its own
+                            // initializer, so the call names the function.
+                            if lang == "kotlin"
+                                && kotlin_use_is_in_same_name_initializer(node, source, name)
+                                && !names.contains(name)
+                            {
+                                break;
+                            }
                             let named_scope = callable_binding_name(scope, source).is_some()
                                 || is_c_family_callable(scope);
                             let scope_name = named_scope
                                 .then(|| {
                                     scope.child(0).and_then(|child| {
-                                        enclosing_callable_qualified(
-                                            child,
-                                            source,
-                                            file_symbol_name,
-                                        )
+                                        // Kotlin names a member `Type.m` and an
+                                        // extension `Receiver.m`, which only the
+                                        // declaration emitter spells; the generic
+                                        // walk would answer `F::m`, so the binding
+                                        // would never meet the type facts keyed by
+                                        // the emitted identity.
+                                        if lang == "kotlin" {
+                                            crate::langcalls::scope::enclosing_emitted_symbol(
+                                                child,
+                                                source,
+                                                lang,
+                                                file_symbol_name,
+                                            )
+                                        } else {
+                                            enclosing_callable_qualified(
+                                                child,
+                                                source,
+                                                file_symbol_name,
+                                            )
+                                        }
                                     })
                                 })
                                 .flatten();
@@ -9685,6 +9786,24 @@ fn is_call_callee(node: Node) -> bool {
             }
         }
     }
+    // Kotlin: the member half of `a.b(..)`. The call record already carries it,
+    // and the walker's own `Name` reference for it was a second row that
+    // resolved on the name alone — `super.go()` inside `Child.go` was read as a
+    // use of `Child.go` itself.
+    if parent.kind() == "navigation_expression"
+        && parent
+            .named_child(parent.named_child_count().saturating_sub(1))
+            .is_some_and(|member| member.id() == node.id())
+        && parent.named_child_count() >= 2
+        && bounded_parent(parent).is_some_and(|grand| {
+            grand.kind() == "call_expression"
+                && grand
+                    .named_child(0)
+                    .is_some_and(|callee| callee.id() == parent.id())
+        })
+    {
+        return true;
+    }
     if matches!(
         parent.kind(),
         "selector_expression" | "member_expression" | "attribute"
@@ -10120,6 +10239,36 @@ fn rust_use_is_in_same_name_initializer(node: Node, source: &str, name: &str) ->
                 .child_by_field_name("pattern")
                 .is_some_and(|pattern| rust_pattern_binds(pattern, source, name));
             return in_value && binds;
+        }
+        ancestor = bounded_parent(parent);
+    }
+    false
+}
+
+/// Whether a use sits in the initializer of a Kotlin `val` / `var` that
+/// declares the same name — a position where that local is not yet in scope.
+fn kotlin_use_is_in_same_name_initializer(node: Node, source: &str, name: &str) -> bool {
+    let mut ancestor = bounded_parent(node);
+    while let Some(parent) = ancestor {
+        if is_callable_node(parent) {
+            return false;
+        }
+        if parent.kind() == "property_declaration" {
+            let declares = parent
+                .named_children(&mut parent.walk())
+                .find(|child| child.kind() == "variable_declaration")
+                .and_then(|declaration| declaration.named_child(0))
+                .is_some_and(|declared| get_node_text(declared, source) == name);
+            // A use inside the declaration's own name or type is not an
+            // initializer use; only what follows the `variable_declaration` is.
+            let in_declaration = parent
+                .named_children(&mut parent.walk())
+                .find(|child| child.kind() == "variable_declaration")
+                .is_some_and(|declaration| {
+                    declaration.start_byte() <= node.start_byte()
+                        && node.end_byte() <= declaration.end_byte()
+                });
+            return declares && !in_declaration;
         }
         ancestor = bounded_parent(parent);
     }

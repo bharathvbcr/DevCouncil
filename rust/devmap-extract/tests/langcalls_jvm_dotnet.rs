@@ -550,7 +550,12 @@ fn kotlin_records_the_call_shapes_its_grammar_produces() {
     // Infix calls. An `infix fun` is a declaration like any other, and a
     // repository defining its own infix DSL would otherwise see every one of
     // those functions as uncalled.
-    assert!(found.contains(&("to", Some("1"))), "infix `to`: {found:?}");
+    // A literal receiver is recorded as the type the literal has, so an
+    // extension declared on `Int` or `String` can be joined to.
+    assert!(
+        found.contains(&("to", Some("Int"))),
+        "infix `to`: {found:?}"
+    );
     assert!(
         found.contains(&("shl", Some("first"))),
         "infix `shl`: {found:?}"
@@ -559,7 +564,7 @@ fn kotlin_records_the_call_shapes_its_grammar_produces() {
     // An extension *call* is receiver-bearing and resolves only if a symbol
     // matches; nothing is invented for it.
     assert!(
-        found.contains(&("shout", Some("\"text\""))),
+        found.contains(&("shout", Some("String"))),
         "extension call: {found:?}"
     );
 
@@ -585,9 +590,18 @@ fn kotlin_refuses_super_so_an_override_does_not_call_itself() {
     // resolution bind it to the override itself at DETERMINISTIC confidence —
     // wrong, and it would make every lifecycle override appear called and so
     // exempt from dead-code analysis.
+    // It is still recorded, but as a call *on `super`*: the resolver reads that
+    // receiver against the enclosing type's supertypes and never the override
+    // itself, so the self-edge cannot form, and the base method gains the
+    // caller it really has. A bare `onCreate` (no receiver) would be the bug.
+    let pairs = targets(&extraction);
     assert!(
-        !found.contains(&"onCreate"),
-        "`super.onCreate` must not become a self-edge: {found:?}"
+        !pairs.contains(&("onCreate", None)),
+        "`super.onCreate` must not become a receiver-less self-edge: {pairs:?}"
+    );
+    assert!(
+        pairs.contains(&("onCreate", Some("super"))),
+        "`super.onCreate` is a call on `super`: {pairs:?}"
     );
 }
 

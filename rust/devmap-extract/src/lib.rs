@@ -2,6 +2,7 @@
 // and its grammars; everything above it — the model types, language detection,
 // go.mod parsing, the ignore rules — does not, and is what a *query* consumer
 // actually uses.
+pub mod androidmanifest;
 pub mod cache;
 pub mod clonesig;
 #[cfg(feature = "parse")]
@@ -16,6 +17,7 @@ pub mod fallback;
 pub mod frameworks;
 pub mod gofacts;
 pub mod gomod;
+pub mod gradle;
 #[cfg(feature = "parse")]
 pub mod heritage;
 #[cfg(feature = "parse")]
@@ -88,7 +90,8 @@ use rayon::prelude::*;
 
 pub use gomod::{
     collect_go_modules, collect_project_manifests, git_worktree_root, go_dirs_with_unindexed_files,
-    parse_cargo_crate_names, parse_go_mod, GoModule, ProjectManifests, RustCrateManifest,
+    parse_cargo_crate_names, parse_go_mod, GoModule, GradleSettings, ProjectManifests,
+    RustCrateManifest,
 };
 pub use languages::{
     declared_language_ids, detect_language, is_default_index_excluded, is_ignored_path,
@@ -707,6 +710,27 @@ fn extract_file_unfiltered(path: &str, source: &str) -> Extraction {
                 MAX_SOURCE_BYTES
             ),
         );
+    }
+    // An Android manifest is data the framework reads, not source: the
+    // components it names are entry points, and a manifest the reader cannot
+    // read is a recorded failure, not "no components" (which would silently
+    // un-exempt every one of them).
+    if androidmanifest::is_android_manifest(path) {
+        return match androidmanifest::parse_components(source) {
+            Ok(_) => treesitter::skipped_extraction(
+                path,
+                "config",
+                source,
+                "not parsed as source: an Android manifest, read for the components it declares"
+                    .to_string(),
+            ),
+            Err(reason) => treesitter::refused_extraction(
+                path,
+                "config",
+                source,
+                format!("AndroidManifest.xml could not be read: {reason}"),
+            ),
+        };
     }
     // Notebooks divert here rather than inside `extract_treesitter`, because
     // what they need is not a different grammar but a different *source*: the

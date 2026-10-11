@@ -65,5 +65,5 @@ kt.K20	K20	app/src/test/java/com/fx/app/ClockTest.kt::ClockTest.elapsedCountsFro
 kt.K20b	K20	app/src/test/java/com/fx/app/ClockTest.kt::ClockTest.elapsedCountsFromStart	app/src/main/java/com/fx/app/Registry.kt::Clock.elapsed	edge	must		
 kt.K21	K21	app/src/androidTest/java/com/fx/app/HeaderUiTest.kt::HeaderUiTest.showsTitle	app/src/main/java/com/fx/app/Screens.kt::Header	edge	must		
 kt.K22	K22	app/build.gradle.kts	app/build.gradle.kts::versionCodeFor	edge	must		
-kt.K06	K06	core/src/main/java/com/fx/core/data/Task.kt::Task.label	core/src/main/java/com/fx/core/util/Formatting.kt::String.slugify	edge	must		
-kt.K06b	K06	app/src/main/java/com/fx/app/MainActivity.kt::MainActivity.onCreate	core/src/main/java/com/fx/core/data/Task.kt::Task.label	edge	must		reference to a property
+kt.K06	K06	core/src/main/java/com/fx/core/util/Formatting.kt::Task.label	core/src/main/java/com/fx/core/util/Formatting.kt::String.slugify	edge	must		
+kt.K06b	K06	app/src/main/java/com/fx/app/MainActivity.kt::MainActivity.onCreate	core/src/main/java/com/fx/core/util/Formatting.kt::Task.label	edge	must		reference to a property

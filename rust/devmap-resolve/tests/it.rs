@@ -60,6 +60,8 @@ mod import_paths_resolve_to_real_files;
 #[cfg(feature = "parse")]
 mod imports_stay_in_the_named_tree;
 #[cfg(feature = "parse")]
+mod kotlin_receivers_and_packages;
+#[cfg(feature = "parse")]
 mod language_server_edges;
 #[cfg(feature = "parse")]
 mod markup_selectors_resolve;
@@ -88,6 +90,8 @@ mod reexported_module_surfaces;
 #[cfg(feature = "parse")]
 mod resolution_honesty;
 mod resolution_kind_is_one_owner;
+#[cfg(feature = "parse")]
+mod ruby_attributes_are_methods;
 #[cfg(feature = "parse")]
 mod rust_module_paths;
 #[cfg(feature = "parse")]

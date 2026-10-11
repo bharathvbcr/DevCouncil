@@ -175,6 +175,18 @@ pub struct ProjectManifests {
     /// resolver only knew by its directory and filed every such import
     /// `External` — "expected, not worth acting on" — about code it indexes.
     pub rust_crates: Vec<RustCrateManifest>,
+    /// Every Gradle settings script this pass read, with the module
+    /// directories its `include` statements name. A module's sources live under
+    /// `<module>/src/<set>/{java,kotlin}`, which no fixed root list can know.
+    pub gradle_modules: Vec<GradleSettings>,
+}
+
+/// One `settings.gradle(.kts)`: the directory it sits in and the module
+/// directories it includes, each repo-relative.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GradleSettings {
+    pub dir: String,
+    pub modules: Vec<String>,
 }
 
 /// One `Cargo.toml` package: the directory it governs and the crate names its
@@ -231,6 +243,7 @@ impl ProjectManifests {
 struct Found {
     modules: Vec<GoModule>,
     rust_crates: Vec<RustCrateManifest>,
+    gradle_modules: Vec<GradleSettings>,
     ts_configs: Vec<String>,
     examined: BTreeSet<String>,
     refusals: Vec<(String, DiscoverySkipReason)>,
@@ -251,7 +264,12 @@ fn visit_manifest_entry(root: &Path, entry: &ignore::DirEntry, found: &std::sync
     };
     let is_go_mod = file_name == "go.mod";
     let is_cargo_toml = file_name == "Cargo.toml";
-    if !is_go_mod && !is_cargo_toml && !crate::tsconfig::is_ts_config_name(file_name) {
+    let is_gradle_settings = crate::gradle::is_gradle_settings(file_name);
+    if !is_go_mod
+        && !is_cargo_toml
+        && !is_gradle_settings
+        && !crate::tsconfig::is_ts_config_name(file_name)
+    {
         return;
     }
     // A link is a candidate whatever it points at. `is_file()` follows it and
@@ -283,6 +301,46 @@ fn visit_manifest_entry(root: &Path, entry: &ignore::DirEntry, found: &std::sync
                     found.rust_crates.push(RustCrateManifest { dir, names });
                 }
             }
+            ManifestRead::Absent | ManifestRead::Skipped => {}
+            ManifestRead::Refused(reason) => found
+                .refusals
+                .push((rel_str, DiscoverySkipReason::Unreadable { reason })),
+        }
+        return;
+    }
+    if is_gradle_settings {
+        let read = read_manifest(root, &rel_str, crate::MAX_SOURCE_BYTES);
+        let mut found = crate::recover_lock(found);
+        found.examined.insert(rel_str.clone());
+        match read {
+            ManifestRead::Read(source) => match crate::gradle::parse_modules(&source) {
+                Ok(modules) => {
+                    let dir = rel_str
+                        .rsplit_once('/')
+                        .map(|(dir, _)| dir.to_string())
+                        .unwrap_or_default();
+                    let modules = modules
+                        .into_iter()
+                        .map(|module| {
+                            if dir.is_empty() {
+                                module
+                            } else {
+                                format!("{dir}/{module}")
+                            }
+                        })
+                        .collect();
+                    found.gradle_modules.push(GradleSettings { dir, modules });
+                }
+                // An include list that cannot be read is not "no modules": every
+                // import into one would be filed external with nothing saying
+                // the settings script was the reason.
+                Err(reason) => found.refusals.push((
+                    rel_str,
+                    DiscoverySkipReason::Unreadable {
+                        reason: format!("could not be parsed: {reason}"),
+                    },
+                )),
+            },
             ManifestRead::Absent | ManifestRead::Skipped => {}
             ManifestRead::Refused(reason) => found
                 .refusals
@@ -408,6 +466,7 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
     let Found {
         mut modules,
         mut rust_crates,
+        mut gradle_modules,
         mut ts_configs,
         mut examined,
         mut refusals,
@@ -433,6 +492,7 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
     });
     ts_configs.sort();
     rust_crates.sort_by(|left, right| left.dir.cmp(&right.dir));
+    gradle_modules.sort_by(|left, right| left.dir.cmp(&right.dir));
     let ts = crate::tsconfig::build_ts_projects(root, &ts_configs);
     examined.extend(ts.examined);
     refusals.extend(
@@ -447,6 +507,7 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
         examined,
         refusals,
         rust_crates,
+        gradle_modules,
     })
 }
 

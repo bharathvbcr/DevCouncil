@@ -5,9 +5,9 @@
     "present": 51
   },
   "kotlin": {
-    "known_failing": 30,
+    "known_failing": 0,
     "positive_rows": 55,
-    "present": 29
+    "present": 55
   },
   "python": {
     "known_failing": 19,
