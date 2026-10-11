@@ -916,6 +916,41 @@ fn merge_toml_server(
         .container
         .ok_or_else(|| anyhow!("{}: a TOML document names its server table", doc.rel))?;
     let text = read_project_doc(path)?.unwrap_or_default();
+    let updated = splice_toml_server(path, &text, container, name, entry)?;
+    let changed = updated.is_some();
+    if let (Some(updated), false) = (updated, dry_run) {
+        devmap_query::write_atomic(path, updated.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(McpMergeOutcome {
+        path: path.to_path_buf(),
+        changed,
+        removed_stale_db: false,
+        note: if changed {
+            format!("{}: registered {name}", doc.rel)
+        } else {
+            format!("{} already current", doc.rel)
+        },
+    })
+}
+
+/// The text of `text` with `[<container>.<name>]` set to `entry`, or `None`
+/// when it already is. Pure: nothing is read or written here.
+///
+/// Every byte outside that table survives. The result is parsed back and
+/// compared with the original plus our entry, so a document whose layout keeps
+/// our table from being found as one block (an inline `mcp_servers = {…}`,
+/// dotted keys) is refused rather than rewritten. This is the one TOML editor:
+/// the project-level and the user-level Codex documents both go through it,
+/// where the user-level one used to parse and re-serialise the whole file and
+/// drop the user's comments.
+fn splice_toml_server(
+    path: &Path,
+    text: &str,
+    container: &str,
+    name: &str,
+    entry: toml::Table,
+) -> anyhow::Result<Option<String>> {
     let parsed: toml::Table = text
         .parse()
         .map_err(|err| anyhow!("{}: not TOML ({err}); refuse to rewrite it", path.display()))?;
@@ -924,14 +959,9 @@ fn merge_toml_server(
         Some(toml::Value::Table(servers)) => servers.get(name),
         Some(_) => bail!("{}: `{container}` is not a table", path.display()),
     };
-    let wanted = toml::Value::Table(entry.clone());
+    let wanted = toml::Value::Table(entry);
     if current == Some(&wanted) {
-        return Ok(McpMergeOutcome {
-            path: path.to_path_buf(),
-            changed: false,
-            removed_stale_db: false,
-            note: format!("{} already current", doc.rel),
-        });
+        return Ok(None);
     }
 
     let mut wrapper = toml::Table::new();
@@ -941,7 +971,7 @@ fn merge_toml_server(
     let block = toml::to_string(&wrapper).map_err(|err| anyhow!("serialize {name}: {err}"))?;
 
     let updated = if current.is_some() {
-        replace_toml_table(&text, container, name, &block).ok_or_else(|| {
+        replace_toml_table(text, container, name, &block).ok_or_else(|| {
             anyhow!(
                 "{}: [{container}.{name}] is not one block this command can replace \
                  (inline table or dotted keys); edit it by hand",
@@ -949,7 +979,7 @@ fn merge_toml_server(
             )
         })?
     } else {
-        let mut out = text.clone();
+        let mut out = text.to_string();
         if !out.is_empty() && !out.ends_with('\n') {
             out.push('\n');
         }
@@ -966,7 +996,7 @@ fn merge_toml_server(
             path.display()
         )
     })?;
-    let mut expected = parsed.clone();
+    let mut expected = parsed;
     if let toml::Value::Table(servers) = expected
         .entry(container.to_string())
         .or_insert_with(|| toml::Value::Table(toml::Table::new()))
@@ -979,17 +1009,7 @@ fn merge_toml_server(
             path.display()
         );
     }
-
-    if !dry_run {
-        devmap_query::write_atomic(path, updated.as_bytes())
-            .with_context(|| format!("writing {}", path.display()))?;
-    }
-    Ok(McpMergeOutcome {
-        path: path.to_path_buf(),
-        changed: true,
-        removed_stale_db: false,
-        note: format!("{}: registered {name}", doc.rel),
-    })
+    Ok(Some(updated))
 }
 
 /// Replace the `[<container>.<name>]` block and its subtables with `block`.
@@ -1708,49 +1728,22 @@ pub fn merge_codex_mcp(
         String::new()
     };
 
-    let mut table: toml::Table = if existing.trim().is_empty() {
-        toml::Table::new()
-    } else {
-        existing
-            .parse()
-            .map_err(|err| anyhow!("{}: not TOML ({err})", path.display()))?
-    };
-
-    let servers = table
-        .entry("mcp_servers")
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-    let servers = servers
-        .as_table_mut()
-        .ok_or_else(|| anyhow!("{}: mcp_servers must be a table", path.display()))?;
-
     let mut entry = toml::Table::new();
     entry.insert("command".into(), toml::Value::String(command.to_string()));
     entry.insert(
         "args".into(),
         toml::Value::Array(vec![toml::Value::String("mcp".into())]),
     );
-    let entry_val = toml::Value::Table(entry);
-
-    let changed = match servers.get("devmap") {
-        Some(existing) if existing == &entry_val => false,
-        _ => {
-            if !read_only {
-                servers.insert("devmap".into(), entry_val);
-            }
-            true
-        }
-    };
-
-    if changed && !read_only {
+    let updated = splice_toml_server(path, &existing, "mcp_servers", "devmap", entry)?;
+    let changed = updated.is_some();
+    if let (Some(updated), false) = (updated, read_only) {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let text = toml::to_string_pretty(&toml::Value::Table(table))
-            .map_err(|err| anyhow!("serialize Codex config: {err}"))?;
         // The JSON configs next door publish through safe_fs; a plain
         // `fs::write` here truncated whatever the name resolved to, link or
         // not, and left a half-written config behind on a failed write.
-        devmap_query::write_atomic(path, text.as_bytes())
+        devmap_query::write_atomic(path, updated.as_bytes())
             .with_context(|| format!("writing {}", path.display()))?;
     }
 
@@ -2512,6 +2505,55 @@ mod tests {
         assert!(text.contains("devmap"));
         assert!(text.contains("other"));
         assert!(text.contains("mcp"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn user_level_codex_merge_keeps_every_original_line() {
+        let dir = scratch("codex-user-bytes");
+        let path = dir.join("config.toml");
+        let original = "# my codex config\nmodel = \"o5\"   # trailing comment\n\n\
+                        [profiles.fast]   # inline\nmodel = \"o5-mini\"\n\n\
+                        [mcp_servers.other]\ncommand = \"x\"   # theirs\nargs = []\n";
+        fs::write(&path, original).unwrap();
+        let outcome = merge_codex_mcp(&path, Path::new("/tmp/fake-devmap"), false).unwrap();
+        assert!(outcome.changed);
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(
+            after.starts_with(original),
+            "every original byte must survive, in place:\n{after}"
+        );
+        let parsed: toml::Table = after.parse().unwrap();
+        assert_eq!(
+            parsed["mcp_servers"]["devmap"]["args"][0].as_str(),
+            Some("mcp")
+        );
+
+        // A second merge is a no-op, byte for byte.
+        let again = merge_codex_mcp(&path, Path::new("/tmp/fake-devmap"), false).unwrap();
+        assert!(!again.changed);
+        assert_eq!(fs::read_to_string(&path).unwrap(), after);
+
+        // A stale devmap entry is replaced in place and the rest kept.
+        let stale = after.replace("/tmp/fake-devmap", "/old/devmap");
+        fs::write(&path, &stale).unwrap();
+        merge_codex_mcp(&path, Path::new("/tmp/fake-devmap"), false).unwrap();
+        let healed = fs::read_to_string(&path).unwrap();
+        assert!(healed.starts_with(original), "{healed}");
+        assert!(!healed.contains("/old/devmap"), "{healed}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn user_level_codex_merge_refuses_a_layout_it_cannot_edit_without_loss() {
+        let dir = scratch("codex-user-inline");
+        let path = dir.join("config.toml");
+        let original =
+            "# keep\nmcp_servers = { devmap = { command = \"old\", args = [\"mcp\"] } }\n";
+        fs::write(&path, original).unwrap();
+        let err = merge_codex_mcp(&path, Path::new("/tmp/fake-devmap"), false).unwrap_err();
+        assert!(err.to_string().contains("edit it by hand"), "{err}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
         let _ = fs::remove_dir_all(&dir);
     }
 
