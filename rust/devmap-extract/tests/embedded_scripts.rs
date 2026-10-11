@@ -838,8 +838,11 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // card's extractor fixes. v79 carries both.
     //
     // v80 records which error regions hold no name.
+    //
+    // v81 records a Go file's declarations, local scopes and call receivers as
+    // structured facts (`go_facts`).
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "80",
+        EXTRACTION_SCHEMA_VERSION, "81",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

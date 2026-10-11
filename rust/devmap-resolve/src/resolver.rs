@@ -8,6 +8,9 @@ use rayon::prelude::*;
 use devmap_extract::model::*;
 
 use crate::model::*;
+
+mod gotypes;
+use gotypes::{GoCall, GoFileIndex, GoModel};
 use devmap_extract::tsconfig::TsProject;
 use devmap_extract::{GoModule, ProjectManifests};
 
@@ -515,6 +518,8 @@ pub struct Resolver {
     /// package here gets no unexported-selector answers at all: one unseen file
     /// could declare the second method or the vetoing field.
     go_package_dirs_unvouched: BTreeSet<String>,
+    /// The Go type model: declarations, signatures and imports by package.
+    go_model: GoModel,
     /// file_path → Swift module name derived from the path.
     ///
     /// A Swift target is one unqualified namespace. Computed from the path
@@ -623,6 +628,7 @@ impl Resolver {
             go_package_methods: BTreeMap::new(),
             go_package_member_vetoes: BTreeSet::new(),
             go_package_dirs_unvouched: BTreeSet::new(),
+            go_model: GoModel::default(),
             swift_module_by_file: BTreeMap::new(),
             swift_module_files: BTreeMap::new(),
             swift_module_symbols: BTreeMap::new(),
@@ -1731,16 +1737,27 @@ impl Resolver {
     /// a symbol whose parent is the caller (or the callee itself, for the
     /// recursive call inside that arrow) is the one case the binding's value
     /// is the extracted function.
+    ///
+    /// A bare name in Go is never a method: a method is reachable only through
+    /// a receiver, so `Rebuild(1)` written inside `func (Holder) Rebuild()`
+    /// names the package function, not the method it sits in, and `delete(m,
+    /// k)` inside `func (c *cache) delete` is the builtin. The caller's own
+    /// identity matches below (a function calling itself), which for a method
+    /// caller used to answer a self-edge at DETERMINISTIC.
     fn local_extracted_callee(
         &self,
         file: &str,
+        family: LangFamily,
         caller: Option<&str>,
         name: &str,
     ) -> Option<String> {
         let caller = caller?;
         let hits = self.symbol_index.get(name)?;
-        let mut candidates = hits.iter().filter_map(|(path, _, _, identity)| {
+        let mut candidates = hits.iter().filter_map(|(path, kind, _, identity)| {
             if path != file {
+                return None;
+            }
+            if family == LangFamily::Go && *kind == SymbolKind::Method {
                 return None;
             }
             let identity = identity.as_ref();
@@ -2320,6 +2337,7 @@ impl Resolver {
         self.go_package_methods.clear();
         self.go_package_member_vetoes.clear();
         self.go_package_dirs_unvouched.clear();
+        self.go_model = GoModel::default();
         self.swift_module_by_file.clear();
         self.swift_module_files.clear();
         self.swift_module_symbols.clear();
@@ -2485,6 +2503,7 @@ impl Resolver {
                             .push((ext.file_path.clone(), sym.qualified_name.clone()));
                     }
                 }
+                self.go_model.index(ext, &dir, pkg);
                 for name in ext.go_member_names.iter().flatten() {
                     self.go_package_member_vetoes.insert((
                         dir.clone(),
@@ -3661,6 +3680,15 @@ impl Resolver {
                     }
                 }
 
+                // The Go type evaluator's per-file tables; `None` for a file
+                // with no extracted Go facts, which leaves its calls to the
+                // name-based ladder below.
+                let go_index = if family == LangFamily::Go {
+                    GoFileIndex::new(ext)
+                } else {
+                    None
+                };
+
                 // Resolve calls using Resolution Ladder (SameFile -> ImportScoped -> UniqueGlobal -> AmbiguousGlobal)
                 for call in &ext.calls {
                     // The resolution is the *only* record of what was found:
@@ -3683,6 +3711,7 @@ impl Resolver {
                     if call.receiver_expr.is_none() {
                         if let Some(target_symbol) = self.local_extracted_callee(
                             &ext.file_path,
+                            family,
                             call.caller_symbol.as_deref(),
                             &call.callee_name,
                         ) {
@@ -3700,8 +3729,55 @@ impl Resolver {
                         }
                     }
 
+                    // 0. A Go receiver whose type the evaluator can state: the
+                    // type is identified (package and name, not a bare name), so
+                    // the method is the one Go's selector rules pick — and a
+                    // type that lives outside the index binds nothing in it.
+                    // What it cannot tell falls through to the rungs below.
+                    let mut go_class: Option<UnresolvedClass> = None;
+                    if resolution.is_none() {
+                        if let Some(index) = &go_index {
+                            match self.go_call(ext, index, call) {
+                                GoCall::Concrete {
+                                    file,
+                                    symbol,
+                                    receiver_type,
+                                } => {
+                                    resolution = Some(Arc::new(Resolution::ReceiverType {
+                                        target_symbol: symbol,
+                                        target_file: file,
+                                        receiver_type,
+                                    }));
+                                }
+                                GoCall::External(module) => {
+                                    resolution = Some(Arc::new(Resolution::Unresolved {
+                                        reason: format!(
+                                            "the receiver's type is declared in {module}, outside the index"
+                                        ),
+                                    }));
+                                    go_class = Some(UnresolvedClass::External { module });
+                                }
+                                GoCall::Absent { receiver_type } => {
+                                    resolution = Some(Arc::new(Resolution::Unresolved {
+                                        reason: format!(
+                                            "the receiver is a {receiver_type}, which declares no member {:?}",
+                                            call.callee_name
+                                        ),
+                                    }));
+                                    go_class = Some(UnresolvedClass::UnresolvedMember);
+                                }
+                                GoCall::Interface { .. } | GoCall::Pass => {}
+                            }
+                        }
+                    }
+
                     // 1. Receiver-based resolution (SameFile / Constructor tracking N6)
-                    if let Some(recv) = &call.receiver_expr {
+                    //
+                    // Not after rung 0: a receiver the Go evaluator typed — as an
+                    // external type, or an indexed one with no such member — has
+                    // its answer, and a bare-name rung overwriting it is the
+                    // false edge rung 0 exists to prevent.
+                    if let Some(recv) = call.receiver_expr.as_ref().filter(|_| resolution.is_none()) {
                         // Prefer the binding scoped to the calling symbol; fall back
                         // to the file-wide map only when it is unambiguous. Poisoned
                         // keys are absent from both maps, so a collision falls
@@ -4275,18 +4351,20 @@ impl Resolver {
                         // D17 / R5: a call the ladder could not resolve is recorded,
                         // never dropped. Silence here is indistinguishable from
                         // "there was no call", which is the failure R5 forbids.
-                        let class = self.classify_unresolved(
-                            &ext.file_path,
-                            family,
-                            &call.callee_name,
-                            call.receiver_expr.as_deref(),
-                            &caller_sym,
-                            UsePosition::value_at(
-                                ext,
-                                call.span.start_byte,
+                        let class = go_class.unwrap_or_else(|| {
+                            self.classify_unresolved(
+                                &ext.file_path,
+                                family,
+                                &call.callee_name,
                                 call.receiver_expr.as_deref(),
-                            ),
-                        );
+                                &caller_sym,
+                                UsePosition::value_at(
+                                    ext,
+                                    call.span.start_byte,
+                                    call.receiver_expr.as_deref(),
+                                ),
+                            )
+                        });
                         unresolved.push(UnresolvedReference {
                             source_file: ext.file_path.clone(),
                             source_symbol: caller_sym,

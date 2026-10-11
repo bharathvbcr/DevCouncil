@@ -673,7 +673,12 @@ pub fn run() {
 }
 
 #[test]
-fn a_name_reassigned_on_one_branch_types_nothing() {
+fn a_go_name_keeps_the_type_its_declaration_gave_it() {
+    // Go fixes a variable's type where it is declared: `p := NewDBLP()` makes
+    // `p` a `*DBLP`, and `p = NewIEEE()` on another branch does not compile. So
+    // reassignment cannot change what `p.Zzsearch()` means — the old fixture
+    // (`p = NewIEEE()`) was not a Go program, and the abstention it asserted was
+    // the name-based ladder's, not the language's.
     let providers = "\
 package search
 
@@ -689,10 +694,10 @@ func (i *IEEE) Zzsearch() {}
     let caller = "\
 package search
 
-func pick(ieee bool) {
+func pick(again bool) {
 	p := NewDBLP()
-	if ieee {
-		p = NewIEEE()
+	if again {
+		p = NewDBLP()
 	}
 	p.Zzsearch()
 }
@@ -705,15 +710,19 @@ func pick(ieee bool) {
         "search/pick.go::pick",
     );
     assert!(
-        !targets.iter().any(|t| t.ends_with("Zzsearch")),
-        "either branch may have run, got {targets:?}"
+        targets.iter().any(|t| t == "search/providers.go::DBLP.Zzsearch"),
+        "got {targets:?}"
+    );
+    assert!(
+        !targets.iter().any(|t| t == "search/providers.go::IEEE.Zzsearch"),
+        "got {targets:?}"
     );
 }
 
 // ---- refusals ----
 
 #[test]
-fn a_go_tuple_result_types_nothing() {
+fn a_go_tuple_result_types_by_position() {
     let caller = "\
 package reg
 
@@ -721,6 +730,7 @@ func Register() {
 	w, err := Open()
 	_ = err
 	w.Zzadd()
+	err.Zzadd()
 }
 ";
     let targets = calls_from(
@@ -730,14 +740,14 @@ func Register() {
         ],
         "reg/register.go::Register",
     );
-    // Whatever else may type `w`, the factory rung must not: `(T, error)`
-    // names no single value. The binding is two-target, so nothing does.
-    assert!(
-        !targets
-            .iter()
-            .any(|t| t == "reg/registry.go::Registry.Zzadd"),
-        "got {targets:?}"
-    );
+    // `(T, error)` names no *single* value, so the factory rung still declines
+    // it; the Go type evaluator reads the declared results by position. `w` is
+    // the first result, and `err` — the second — does not type as a `Registry`.
+    let adds = targets
+        .iter()
+        .filter(|t| *t == "reg/registry.go::Registry.Zzadd")
+        .count();
+    assert_eq!(adds, 1, "only `w.Zzadd()`, not `err.Zzadd()`: {targets:?}");
 }
 
 #[test]

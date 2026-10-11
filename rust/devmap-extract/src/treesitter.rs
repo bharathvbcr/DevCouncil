@@ -789,6 +789,8 @@ fn extract_treesitter_before_deadline(
                     go_interface_methods,
                     go_method_params,
                     go_member_names,
+                    go_facts: (lang == "go")
+                        .then(|| crate::gofacts::extract(root, source, &file_symbol_name)),
                     // After `walk_tree`, so the per-scope cache it warmed is
                     // reused rather than every callable's subtree being walked
                     // a second time.
@@ -1902,6 +1904,7 @@ fn unparsed_extraction(
         go_interface_methods: Vec::new(),
         go_method_params: Vec::new(),
         go_member_names: None,
+        go_facts: None,
         scope_locals: Vec::new(),
         local_bindings: Vec::new(),
         source_code: Some(source.to_string()),
@@ -2110,6 +2113,7 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
         go_interface_methods: Vec::new(),
         go_method_params: Vec::new(),
         go_member_names: None,
+        go_facts: None,
         scope_locals: Vec::new(),
         local_bindings: Vec::new(),
         source_code: Some(source.to_string()),
@@ -4838,9 +4842,21 @@ fn extract_node(
                     });
                 }
             }
-            "call_expression" | "composite_literal" => {
+            "call_expression" | "composite_literal" | "type_conversion_expression" => {
                 let callee_node = if kind == "call_expression" {
                     node.child_by_field_name("function")
+                } else if kind == "type_conversion_expression" {
+                    // `pkg.New[int](3)`: one explicit type argument followed by
+                    // value arguments parses as a conversion to the generic
+                    // *type* `pkg.New[int]`, not as a call, because `f[T](x)`
+                    // is also how a type is converted. The grammar cannot tell
+                    // them apart and neither can the extractor: it names the
+                    // callee and the resolver, which knows whether that name
+                    // is a function or a type, decides. A conversion to a
+                    // non-generic type is a plain `call_expression` already.
+                    node.child_by_field_name("type")
+                        .filter(|ty| ty.kind() == "generic_type")
+                        .and_then(|ty| ty.child_by_field_name("type"))
                 } else {
                     // `composite_literal` declares `type` as a required field
                     // (tree-sitter-go node-types.json), so this cannot be None
@@ -7655,6 +7671,12 @@ fn go_type_name(node: Node, source: &str, depth: usize) -> Option<String> {
             let text = get_node_text(node, source);
             text.rsplit('.').next().map(str::to_string)
         }),
+        // `Box[T]`, `*Box[T]`, `pkg.Box[int]`: the type arguments are not part
+        // of the type's name, so a method declared on `(b *Box[T])` is `Box`'s
+        // and a value typed `Box[int]` is a `Box`.
+        "generic_type" => node
+            .child_by_field_name("type")
+            .and_then(|inner| go_type_name(inner, source, depth + 1)),
         _ => None,
     }
 }

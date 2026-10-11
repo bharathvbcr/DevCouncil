@@ -1,8 +1,8 @@
 {
   "go": {
-    "known_failing": 23,
+    "known_failing": 4,
     "positive_rows": 51,
-    "present": 30
+    "present": 47
   },
   "kotlin": {
     "known_failing": 30,
