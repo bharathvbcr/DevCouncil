@@ -1286,6 +1286,7 @@ fn an_empty_tree_completes_without_inventing_file_progress() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(unix)]
 include!("../../testsupport/timing.rs");
 
 /// Temp roots must be unique per call, not merely per instant. `SystemTime`
