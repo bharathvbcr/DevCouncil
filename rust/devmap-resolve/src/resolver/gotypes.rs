@@ -69,9 +69,14 @@ impl TypeKey {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Ty {
     /// A type the index declares.
-    Named { key: TypeKey, args: Vec<Ty> },
+    Named {
+        key: TypeKey,
+        args: Vec<Ty>,
+    },
     /// A type from a package the index does not hold.
-    External { path: String },
+    External {
+        path: String,
+    },
     /// A predeclared type (`int`, `string`, `error`, `any`).
     Basic(String),
     Ptr(Box<Ty>),
@@ -141,7 +146,6 @@ enum ImportTargetRef {
 #[derive(Clone)]
 struct FunRef<'a> {
     info: &'a FuncInfo,
-    pkg: PkgKey,
     /// The receiver type's arguments, paired with the receiver's parameter
     /// names, for a method on a generic type.
     owner: Vec<(String, Ty)>,
@@ -154,7 +158,6 @@ enum Member<'a> {
     Field(Ty),
     Method {
         info: &'a FuncInfo,
-        pkg: PkgKey,
         owner: Vec<(String, Ty)>,
     },
     Interface {
@@ -198,6 +201,9 @@ pub(super) enum GoCall {
     Pass,
 }
 
+/// Implementers per `(interface, caller is a test file)`; `None` when unbounded.
+type ImplementerCache = HashMap<(TypeKey, bool), Option<Arc<Vec<TypeKey>>>>;
+
 #[derive(Default)]
 pub(super) struct GoModel {
     pkgs: BTreeMap<PkgKey, GoPkg>,
@@ -206,7 +212,7 @@ pub(super) struct GoModel {
     dot_importers: BTreeSet<String>,
     incomplete_dirs: BTreeSet<String>,
     type_method_names: Mutex<HashMap<TypeKey, Arc<BTreeSet<String>>>>,
-    implementers: Mutex<HashMap<(TypeKey, bool), Option<Arc<Vec<TypeKey>>>>>,
+    implementers: Mutex<ImplementerCache>,
 }
 
 impl GoModel {
@@ -487,9 +493,12 @@ impl Resolver {
                             return Ty::Unknown;
                         }
                         if let Some(key) = self.go_pkg_of_file(cx.file) {
-                            if self.go_model.pkgs.get(&key).is_some_and(|pkg| {
-                                pkg.types.contains_key(name.as_str())
-                            }) {
+                            if self
+                                .go_model
+                                .pkgs
+                                .get(&key)
+                                .is_some_and(|pkg| pkg.types.contains_key(name.as_str()))
+                            {
                                 return self.go_named(cx, &key, name, resolved_args(), depth);
                             }
                         }
@@ -624,7 +633,6 @@ impl Resolver {
                             [] => {}
                             [method] => hits.push(Member::Method {
                                 info: method,
-                                pkg: key.pkg.clone(),
                                 owner: method
                                     .func
                                     .recv
@@ -679,7 +687,12 @@ impl Resolver {
                                                 under_info.decl.type_params.clone(),
                                             );
                                             self.go_struct_level(
-                                                fields, &under_cx, &[], name, &mut hits, &mut next,
+                                                fields,
+                                                &under_cx,
+                                                &[],
+                                                name,
+                                                &mut hits,
+                                                &mut next,
                                             );
                                         }
                                     }
@@ -983,7 +996,6 @@ impl Resolver {
             return match (candidates.next(), candidates.next()) {
                 (Some(info), None) => Op::Fun(FunRef {
                     info,
-                    pkg: pkg.clone(),
                     owner: Vec::new(),
                     explicit: Vec::new(),
                 }),
@@ -1111,12 +1123,9 @@ impl Resolver {
             if !matches!(member, Op::Unknown) {
                 return member;
             }
-            if self
-                .go_model
-                .pkgs
-                .get(&pkg)
-                .is_some_and(|go_pkg| go_pkg.types.contains_key(name) || go_pkg.funcs.contains_key(name))
-            {
+            if self.go_model.pkgs.get(&pkg).is_some_and(|go_pkg| {
+                go_pkg.types.contains_key(name) || go_pkg.funcs.contains_key(name)
+            }) {
                 // Declared in this package and not readable (ambiguous, or a
                 // test-only declaration): do not fall to the universe.
                 return Op::Unknown;
@@ -1137,9 +1146,8 @@ impl Resolver {
             Op::Pkg(ImportTargetRef::External(_)) => Op::Unknown,
             Op::Val(ty) | Op::Type(ty) => match self.go_member(&ty, name, cx.file) {
                 Member::Field(field) => Op::Val(field),
-                Member::Method { info, pkg, owner } => Op::Fun(FunRef {
+                Member::Method { info, owner, .. } => Op::Fun(FunRef {
                     info,
-                    pkg,
                     owner,
                     explicit: Vec::new(),
                 }),

@@ -5,10 +5,6 @@
 # The set only shrinks: accuracy_fixtures.rs fails when a listed row starts passing and when
 # a passing row is not listed. Fixing a row means deleting its line (DEVMAP_ACCURACY_BLESS=1
 # does it); adding a line needs an owning card and a reason.
-go	go.C07	miss	ft-e3f7d1b1	edge (interface method) or fan-out to FileReader.Read07+MemReader.Read07; FileReader.Read07/MemReader.Read07 must not be dead | today: absent today, recorded as an honest unresolved row
-go	go.C09	miss	ft-e3f7d1b1	edge (promoted from embedded interface) | today: absent today, recorded as an honest unresolved row
-go	go.C15	miss	ft-e3f7d1b1	edge (field-typed interface receiver); SQLRepo.Find15 not dead | today: absent today, recorded as an honest unresolved row
-go	go.P5	miss	ft-e221de3c	edge or not-dead (unexported interface dispatch) | today: absent today, recorded as an honest unresolved row
 kotlin	kt.K02	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
 kotlin	kt.K05b	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
 kotlin	kt.K06	silent_miss	ft-0720fe1d	 | today: no ledger row names {"slugify"}
