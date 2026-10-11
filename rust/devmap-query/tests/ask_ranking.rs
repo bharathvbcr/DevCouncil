@@ -5,6 +5,8 @@
 //! and a seed set whose only call edges are speculative (empty at the default
 //! floor, with an explicit withheld line).
 
+use crate::common;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -26,7 +28,10 @@ fn store_of(files: &[(&str, &str)]) -> Store {
 fn store_of_extractions(extractions: Vec<Extraction>) -> Store {
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions).unwrap();
+    let mut resolution = resolver.resolve_all(&extractions).unwrap();
+    // Ambiguous sites are ledger-only (S2); the speculative edges these
+    // fixtures exercise come from a language server's dispatch set.
+    common::dispatch_ambiguous_sites(&mut resolution);
     let analysis = devmap_analyze::analyze(&extractions, &resolution);
     let store = Store::open_in_memory().unwrap();
     store
@@ -52,7 +57,7 @@ fn ask(
 
 /// Two `cache_*` seeds that only call an ambiguous `shared` name.
 ///
-/// The resolver records speculative Calls edges from each seed to both
+/// A language-server dispatch set records speculative Calls edges from each seed to both
 /// `shared` definitions. At the deterministic floor those edges are excluded,
 /// so ask must return empty with the withheld line rather than the TF-IDF
 /// seeds.

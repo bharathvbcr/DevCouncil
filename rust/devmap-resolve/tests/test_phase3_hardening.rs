@@ -4,7 +4,7 @@ use devmap_resolve::*;
 
 #[test]
 fn test_g5_no_multicandidate_extracted() {
-    // closes G5
+    // closes G5; S2: the candidates stay visible on the ledger, not as edges.
     let ext1 = extract_file("pkg/a.py", "def process(): pass\n");
     let ext2 = extract_file("pkg/b.py", "def process(): pass\n");
     let caller = extract_file("main.py", "def run(): process()\n");
@@ -13,21 +13,29 @@ fn test_g5_no_multicandidate_extracted() {
     resolver.index_extractions(&[ext1.clone(), ext2.clone(), caller.clone()]);
     let res = resolver.resolve_all(&[ext1, ext2, caller]).unwrap();
 
-    let edge = res
-        .edges
+    assert!(
+        !res.edges.iter().any(|e| e.edge_kind == EdgeKind::Calls),
+        "an ambiguous call must not bind a caller to either candidate"
+    );
+    let row = res
+        .unresolved
         .iter()
-        .find(|e| e.edge_kind == EdgeKind::Calls && e.target_symbol == "pkg/a.py::process")
+        .find(|row| row.callee_name == "process")
         .expect("ambiguous call candidates must remain visible");
-    assert_eq!(edge.confidence, Confidence::SPECULATIVE);
     assert!(matches!(
-        edge.resolution.as_deref(),
-        Some(Resolution::AmbiguousGlobal { .. })
+        &row.resolution,
+        Resolution::AmbiguousGlobal { candidates, .. } if candidates.len() == 2
     ));
+    assert_eq!(row.resolution.confidence(), Confidence::SPECULATIVE);
 }
 
 #[test]
-fn test_g3_stdlib_guard_python_only() {
-    // closes G3
+fn test_g3_builtin_guard_follows_the_family() {
+    // closes G3. Python's `open` is a builtin, so the bare-name rung declines
+    // it and a repository function spelled `open` is not what `open()` calls
+    // (S2: the rule is the family's builtin table, not a six-name Python
+    // list). JavaScript has no builtin `open`, so the same spelling there is
+    // an ordinary unique global.
     let py_file = extract_file("app.py", "def run(): open()\n");
     let py_candidate = extract_file("helpers.py", "def open(): pass\n");
     let js_file = extract_file("app.js", "function run() { open(); }\n");
@@ -233,8 +241,10 @@ fn test_g7_unique_global_resolution_never_crosses_language_families() {
 
 #[test]
 fn test_g5_ambiguous_global_resolution_preserves_all_candidates() {
-    // closes: G5/G6. Ambiguity must fan out honestly or abstain; selecting
-    // the lexicographically first candidate makes the graph confidently wrong.
+    // closes: G5/G6. Ambiguity must abstain; selecting the lexicographically
+    // first candidate makes the graph confidently wrong, and fanning out to
+    // every candidate (before S2) made it wrong three times in four. The
+    // ledger row keeps every candidate.
     let first = extract_file("a.py", "def helper():\n    return 1\n");
     let second = extract_file("b.py", "def helper():\n    return 2\n");
     let caller = extract_file("main.py", "def run():\n    helper()\n");
@@ -242,33 +252,24 @@ fn test_g5_ambiguous_global_resolution_preserves_all_candidates() {
     let mut resolver = Resolver::new();
     resolver.index_extractions(&[first.clone(), second.clone(), caller.clone()]);
     let result = resolver.resolve_all(&[first, second, caller]).unwrap();
-    let candidates: std::collections::BTreeSet<_> = result
-        .edges
+    assert!(
+        !result
+            .edges
+            .iter()
+            .any(|edge| edge.edge_kind == EdgeKind::Calls && edge.source_file == "main.py"),
+        "no edge may name either candidate"
+    );
+    let row = result
+        .unresolved
         .iter()
-        .filter(|edge| {
-            edge.edge_kind == EdgeKind::Calls
-                && edge.source_file == "main.py"
-                && edge.target_symbol == format!("{}::helper", edge.target_file)
-        })
-        .map(|edge| edge.target_file.as_str())
-        .collect();
-
-    assert_eq!(candidates, ["a.py", "b.py"].into_iter().collect());
-    assert!(result
-        .edges
-        .iter()
-        .filter(|edge| {
-            edge.edge_kind == EdgeKind::Calls
-                && edge.source_file == "main.py"
-                && edge.target_symbol == format!("{}::helper", edge.target_file)
-        })
-        .all(|edge| {
-            edge.confidence == Confidence::SPECULATIVE
-                && matches!(
-                    edge.resolution.as_deref(),
-                    Some(Resolution::AmbiguousGlobal { .. })
-                )
-        }));
+        .find(|row| row.source_file == "main.py" && row.callee_name == "helper")
+        .expect("the site is in the ledger");
+    let Resolution::AmbiguousGlobal { candidates, .. } = &row.resolution else {
+        panic!("expected AmbiguousGlobal, got {:?}", row.resolution);
+    };
+    let files: std::collections::BTreeSet<_> =
+        candidates.iter().map(|(file, _)| file.as_str()).collect();
+    assert_eq!(files, ["a.py", "b.py"].into_iter().collect());
 }
 
 #[test]

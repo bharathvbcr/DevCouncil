@@ -630,10 +630,10 @@ fn an_unindexed_relative_import_is_not_called_external() {
     );
 }
 
-/// R-7: an ambiguous call site above the emission ceiling emits no edges —
-/// the ledger carries the complete AmbiguousGlobal candidate list instead.
+/// R-7 / S2: an ambiguous call site emits no edges at any width — the ledger
+/// carries the complete AmbiguousGlobal candidate list instead.
 #[test]
-fn an_ambiguous_fanout_is_capped_and_says_so() {
+fn an_ambiguous_site_is_ledger_only_and_says_so() {
     let mut files: Vec<(String, String)> = (0..40)
         .map(|n| {
             (
@@ -659,7 +659,7 @@ fn an_ambiguous_fanout_is_capped_and_says_so() {
         .collect();
     assert!(
         fanout.is_empty(),
-        "above the ceiling a bare ambiguous call emits zero edges, got {}",
+        "a bare ambiguous call emits zero edges, got {}",
         fanout.len()
     );
     let entry = result
@@ -679,28 +679,28 @@ fn an_ambiguous_fanout_is_capped_and_says_so() {
         "the resolution keeps the complete candidate list"
     );
 
-    // Positive control: a fan-out inside the cap still emits every candidate.
+    // A narrow site is the same: no edges, the full list on the ledger.
     let small = resolve(&[
         ("s0.py", "def few():\n    return 1\n"),
         ("s1.py", "def few():\n    return 1\n"),
         ("c.py", "def go():\n    return few()\n"),
     ]);
-    let small_fanout: Vec<_> = small
-        .edges
-        .iter()
-        .filter(|edge| edge.edge_kind == EdgeKind::Calls && edge.source_symbol == "c.py::go")
-        .collect();
-    assert_eq!(
-        small_fanout.len(),
-        2,
-        "an uncapped site keeps every candidate"
+    assert!(
+        small
+            .edges
+            .iter()
+            .all(|edge| edge.edge_kind != EdgeKind::Calls || edge.source_symbol != "c.py::go"),
+        "a narrow ambiguous site emits no edges"
     );
-    for edge in small_fanout {
-        assert_eq!(
-            edge.details, None,
-            "an in-ceiling fan-out must not claim a truncation"
-        );
-    }
+    let row = small
+        .unresolved
+        .iter()
+        .find(|u| u.callee_name == "few")
+        .expect("the narrow site is in the ledger");
+    assert!(matches!(
+        &row.resolution,
+        Resolution::AmbiguousGlobal { candidates, .. } if candidates.len() == 2
+    ));
 }
 
 /// R-11: the candidate list must not depend on input slice order.
@@ -722,10 +722,10 @@ fn ambiguous_candidates_do_not_depend_on_input_order() {
         resolver
             .resolve_all(exts)
             .unwrap()
-            .edges
+            .unresolved
             .iter()
-            .filter_map(|edge| match edge.resolution.as_deref() {
-                Some(Resolution::AmbiguousGlobal { candidates, .. }) => Some(candidates.to_vec()),
+            .filter_map(|row| match &row.resolution {
+                Resolution::AmbiguousGlobal { candidates, .. } => Some(candidates.to_vec()),
                 _ => None,
             })
             .collect()

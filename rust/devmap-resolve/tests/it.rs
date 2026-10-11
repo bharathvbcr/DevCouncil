@@ -20,6 +20,8 @@ mod a_field_types_its_receiver;
 #[cfg(feature = "parse")]
 mod a_prelude_type_receiver_is_not_a_value;
 #[cfg(feature = "parse")]
+mod a_receiver_call_never_binds_by_bare_name;
+#[cfg(feature = "parse")]
 mod a_receiver_member_nothing_declares;
 #[cfg(feature = "parse")]
 mod adversarial_resolve;
@@ -43,6 +45,8 @@ mod every_site_is_counted_once;
 mod factory_return_types;
 #[cfg(feature = "parse")]
 mod function_values_and_platform_targets;
+#[cfg(feature = "parse")]
+mod global_rung_requires_no_other_evidence;
 #[cfg(feature = "parse")]
 mod go_own_package_receiver;
 #[cfg(feature = "parse")]

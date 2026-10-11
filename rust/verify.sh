@@ -32,10 +32,10 @@ now_ns() {
   fi
 }
 
-step "1/9 format"
+step "1/8 format"
 cargo fmt --all -- --check
 
-step "2/9 clippy (-D warnings)"
+step "2/8 clippy (-D warnings)"
 cargo clippy --workspace --all-targets -- -D warnings
 
 # The host binary gate 3 needs, built the way the workflows build it.
@@ -55,7 +55,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 # builds the archive there; locally this step builds the archive when the
 # sibling is already on disk. A missing sibling fails here, by name, rather
 # than as "replacement directory does not exist" after Go has started.
-step "3/9 tests — host fixture"
+step "3/8 tests — host fixture"
 if [ -n "${DEVCOUNCIL_BIN:-}" ]; then
   echo "DEVCOUNCIL_BIN is set ($DEVCOUNCIL_BIN); not building the host"
 elif ! command -v go >/dev/null 2>&1; then
@@ -98,7 +98,7 @@ else
   ../backend/go_orchestrator/bin/devcouncil gusset-check
 fi
 
-step "3/9 tests"
+step "3/8 tests"
 cargo test --workspace
 
 if [ "$QUICK" -eq 1 ]; then
@@ -110,18 +110,18 @@ fi
 step "release worker panic recovery (executable, not test profile)"
 cargo run --release --locked -q -p devmap-serve --example worker_recovery_probe
 
-# Where `cargo` actually put the release binary. Steps 5 and 8 run it directly
+# Where `cargo` actually put the release binary. Steps 5 and 7 run it directly
 # rather than through `cargo run`, so they have to agree with cargo about the
 # path — and `CARGO_TARGET_DIR` is set by anyone running two lanes against one
 # checkout, which is a layout this repository's own guidance recommends. Before
 # this, such a run reported "could not measure peak RSS", which is true and is
 # the wrong reason: the measurement was fine and the binary was not there.
 DEVMAP_BIN="${CARGO_TARGET_DIR:-$(pwd)/target}/release/devmap"
-# Exported so `tools/memory_model_probe.sh` and the soak (`tools/soak`) measure the same
+# Exported so the soak (`tools/soak`) measures the same
 # binary these gates did, rather than each resolving it again.
 export DEVMAP_BIN
 
-step "4/9 determinism — two clean builds must produce identical graph digests"
+step "4/8 determinism — two clean builds must produce identical graph digests"
 TMP1=$(mktemp -d) ; TMP2=$(mktemp -d)
 trap 'rm -rf "$TMP1" "$TMP2"' EXIT
 cargo run --release -q -p devmap-cli -- --db "$TMP1/a.sqlite" build ./testdata >/dev/null
@@ -141,10 +141,10 @@ D1=$(sqlite3 "$TMP1/a.sqlite" "$DIGEST_SQL" | shasum -a 256 | cut -d' ' -f1)
 D2=$(sqlite3 "$TMP2/b.sqlite" "$DIGEST_SQL" | shasum -a 256 | cut -d' ' -f1)
 [ "$D1" = "$D2" ] && echo "determinism OK ($D1)" || { echo "DETERMINISM FAILURE: $D1 != $D2"; exit 1; }
 
-step "5/9 self-build gates — DevCouncil repo, release"
+step "5/8 self-build gates — DevCouncil repo, release"
 # Peak RSS is measured, not assumed, and an unavailable reading fails this step
 # rather than skipping it. The measurement itself lives in tools/peak_rss.sh so
-# this gate and the memory-model probe in step 6 share one implementation.
+# this gate and the soak share one implementation.
 # shellcheck source=tools/peak_rss.sh
 . tools/peak_rss.sh
 
@@ -202,53 +202,30 @@ RSS_GATE=$(( 2 * 1024*1024*1024 ))
 #
 # Recalibrated 2026-09-11 after AmbiguousGlobal sites stopped emitting capped
 # edge fan-out and instead record one unresolved ledger row with the full
-# candidate list: cold self-build peak is 610 MiB over 851 files (~734 KiB/file)
-# with only 214 fan-out edges. The old 512 KiB base assumed fan-out carried the
-# ambiguity cost; with honest resolve that cost sits in the base again (plus
-# grammar load). 896 KiB/file is ~1.22x the measured rate — enough headroom for
-# allocator noise, not enough to hide a return to multi-GiB SC3 behaviour.
-#
-# The fan-out term has TWO coefficients, not one, and for a while it had the
-# wrong one.
-#
-# `AMBIGUOUS_FANOUT_CAP` bounds how many edges an ambiguous site emits (16); it
-# does not bound the candidate list the `Arc<Resolution>` holds, which is what
-# the memory is proportional to. A single 600 B/edge term was therefore charging
-# the wrong quantity — on a corpus whose ambiguous sites weigh many candidates
-# each it under-counts by the ratio between the two. Measured on this repository
-# 2026-09-06: 59,309 candidates weighed against 38,006 edges emitted, 1.56x, and
-# a corpus with wider ambiguity separates them further. Re-derived by
-# `tools/memory_model_probe.sh` over a seven-shape sweep (fan-out width 16..200,
-# site count 100..400):
-#
-#     fan-out cost = 694 B x emitted_edges + 86 B x candidates
-#
-# fitting every point to 96.1%..103.9%. Both terms are carried here, each with
-# the same 1.5x headroom the single term had: 1050 and 130. `candidates` comes
-# from `generation_edges.candidate_total` (schema v16), which is what made the
-# right denominator derivable from a store at all.
+# Cold self-build peak is bounded per file: 896 KiB/file was ~1.22x the rate
+# measured when this gate was derived (610 MiB over 851 files), enough headroom
+# for allocator noise and not enough to hide a return to multi-GiB SC3
+# behaviour. That figure was measured while an ambiguous site still emitted up
+# to sixteen edges and carried a second, per-candidate term for the shared
+# candidate list. S2 made ambiguity ledger-only: the site emits no edge and its
+# one ledger row carries the candidate list under `ambiguity_evidence_bytes`
+# (pinned by the `ambiguity_budget` tests), so both terms are gone and the
+# per-file base is the whole budget. Re-measure the release self-build and
+# tighten the base if the rate has fallen.
 RSS_BASE_PER_FILE=$(( 896 * 1024 ))
-RSS_PER_FANOUT_EDGE=1050
-RSS_PER_CANDIDATE=130
+RSS_BUDGET=$(( FILE_COUNT * RSS_BASE_PER_FILE ))
 
-# The fan-out is derived from the persisted store, not from the resolver's
-# source, and it fails closed: tools/fanout.sh exits non-zero if any fan-out
-# edge cannot be joined to a node or if its two independent recoveries of the
-# callee name disagree. A budget whose denominator could not be derived must not
-# be reported as a budget that was met.
+# The fan-out metric stays, as a guard that the mechanism stays gone: derived
+# from the persisted store, and failing closed if it cannot be derived.
 FANOUT=$(./tools/fanout.sh "$TMP1/self.sqlite") || {
-  echo "GATE FAIL: could not derive the ambiguity fan-out — refusing to report an underived memory budget as passing"; exit 1; }
+  echo "GATE FAIL: could not derive the ambiguity fan-out metrics"; exit 1; }
 FANOUT_EDGES=$(printf '%s\n' "$FANOUT" | tr ' ' '\n' | awk -F= '$1=="fanout_edges" {print $2; exit}')
-FANOUT_CANDIDATES=$(printf '%s\n' "$FANOUT" | tr ' ' '\n' | awk -F= '$1=="candidates" {print $2; exit}')
 [[ "$FANOUT_EDGES" =~ ^[0-9]+$ ]] || { echo "GATE FAIL: malformed fan-out metrics: $FANOUT"; exit 1; }
-[[ "$FANOUT_CANDIDATES" =~ ^[0-9]+$ ]] || { echo "GATE FAIL: fan-out metrics carry no candidate total: $FANOUT"; exit 1; }
-RSS_BUDGET=$(( FILE_COUNT * RSS_BASE_PER_FILE \
-             + FANOUT_EDGES * RSS_PER_FANOUT_EDGE \
-             + FANOUT_CANDIDATES * RSS_PER_CANDIDATE ))
+echo "$FANOUT"
+[ "$FANOUT_EDGES" -eq 0 ] || { echo "GATE FAIL: ${FANOUT_EDGES} ambiguous fan-out edges; ambiguity is ledger-only"; exit 1; }
 
 echo "build ${MS} ms, db $((BYTES/1024/1024)) MiB (cold), files ${FILE_COUNT}, gate $((GATE/1024/1024)) MiB, peak RSS $((RSS/1024/1024)) MiB"
-echo "$FANOUT"
-echo "rss budget $((RSS_BUDGET/1024/1024)) MiB = ${FILE_COUNT} files x $((RSS_BASE_PER_FILE/1024)) KiB + ${FANOUT_EDGES} fan-out edges x ${RSS_PER_FANOUT_EDGE} B + ${FANOUT_CANDIDATES} candidates x ${RSS_PER_CANDIDATE} B"
+echo "rss budget $((RSS_BUDGET/1024/1024)) MiB = ${FILE_COUNT} files x $((RSS_BASE_PER_FILE/1024)) KiB"
 # Budget re-derived 2026-08-16 when the grammar matrix went from 5 linked
 # languages to 32: the port now parses 22 more grammars and 1,110 files instead
 # of 1,088, so the 5 s budget measured work the build no longer does. Quiet-run
@@ -261,23 +238,9 @@ echo "rss budget $((RSS_BUDGET/1024/1024)) MiB = ${FILE_COUNT} files x $((RSS_BA
 [ "$BYTES" -lt "$GATE" ] || { echo "GATE FAIL: db >= $((GATE/1024/1024)) MiB for ${FILE_COUNT} files"; exit 1; }
 [ "$RSS" -lt "$RSS_GATE" ] || { echo "GATE FAIL: peak RSS $((RSS/1024/1024)) MiB >= $((RSS_GATE/1024/1024)) MiB"; exit 1; }
 [ "$RSS" -lt "$RSS_BUDGET" ] || {
-  echo "GATE FAIL: peak RSS $((RSS/1024/1024)) MiB >= scale-invariant budget $((RSS_BUDGET/1024/1024)) MiB for ${FILE_COUNT} files, ${FANOUT_EDGES} fan-out edges and ${FANOUT_CANDIDATES} candidates"; exit 1; }
+  echo "GATE FAIL: peak RSS $((RSS/1024/1024)) MiB >= scale-invariant budget $((RSS_BUDGET/1024/1024)) MiB for ${FILE_COUNT} files"; exit 1; }
 
-step "6/9 memory-model probe — bound the cost per unit of ambiguity fan-out"
-# The two gates above bound this repository. Neither says anything about the
-# 12,831-file corpus the port is actually run against: an absolute ceiling
-# calibrated on 1.1k files is silent there, and one raised to cover it would
-# stop catching a regression here. A coefficient is the same number at any
-# corpus size, so this probe builds a synthetic corpus whose fan-out is known by
-# construction, subtracts a paired zero-ambiguity control to measure the base
-# term rather than model it, and bounds bytes-per-*candidate* — the quantity the
-# memory actually tracks since `AMBIGUOUS_FANOUT_CAP` decoupled it from emitted
-# edges — plus the model that combines the two terms, plus how the per-candidate
-# cost *moves* when the candidate list doubles, which is the direct test of the
-# shared-`Arc` invariant. It prints exactly what it capped.
-./tools/memory_model_probe.sh || { echo "GATE FAIL: memory-model probe"; exit 1; }
-
-step "7/9 growth gate — repeated builds must plateau"
+step "6/8 growth gate — repeated builds must plateau"
 # SC1/SC7: generations and the extraction cache were both retained forever, so
 # the database grew by O(repository size) on every build. Nothing here caught
 # it because every gate built exactly once into a fresh database. This builds
@@ -315,7 +278,7 @@ LIMIT=$(( S3 + S3 / 20 + 65536 ))
 [ "$S5" -le "$LIMIT" ] || {
   echo "GATE FAIL: store grew from $S3 to $S5 bytes between builds 3 and 5; growth is unbounded"; exit 1; }
 
-step "8/9 incremental-vs-cold equivalence — a rebuild must not drift"
+step "7/8 incremental-vs-cold equivalence — a rebuild must not drift"
 # SC16: the determinism gate compares two *cold* builds and the growth gate
 # compares size, so neither could see an incremental build diverging from a
 # cold one. This runs the real thing: repeated rebuild cycles over one store,
@@ -340,7 +303,7 @@ else
 fi
 rm -rf "$SOAK_DIR"
 
-step "9/9 mutation testing (optional)"
+step "8/8 mutation testing (optional)"
 if [ "$MUTANTS" -eq 1 ]; then
   command -v cargo-mutants >/dev/null || {
     echo "cargo-mutants is not installed; install it explicitly after dependency approval" >&2

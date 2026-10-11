@@ -338,24 +338,30 @@ fn two_crates_of_the_same_name_resolve_to_neither() {
             "use thing::only_here;\n\npub fn go() -> i32 {\n    only_here()\n}\n",
         ),
     ]);
-    // The ambiguity ladder may still fan out on the bare name at low
-    // confidence — that is its job, and it says so in the confidence. What must
-    // not happen is the *import* picking one crate and presenting it as
-    // settled.
-    let named: Vec<(&str, f32)> = resolution
+    // The import names a crate this corpus indexes twice, and the bare name
+    // has two namesakes. Neither the import nor the bare-name rung may pick
+    // one (S2): no edge to either crate, and the call is still reported as an
+    // index gap, not as an external package.
+    let named: Vec<&str> = resolution
         .edges
         .iter()
         .filter(|edge| edge.source_file == "c/user/src/lib.rs")
         .filter(|edge| edge.target_symbol.ends_with("::only_here"))
-        .map(|edge| (edge.target_file.as_str(), edge.confidence.0))
+        .map(|edge| edge.target_file.as_str())
         .collect();
     assert!(
-        !named.is_empty(),
-        "the call is still reported, or this asserts nothing"
+        named.is_empty(),
+        "an ambiguous crate name must not produce an edge; got {named:?}"
     );
+    let row = resolution
+        .unresolved
+        .iter()
+        .find(|row| row.source_file == "c/user/src/lib.rs" && row.callee_name == "only_here")
+        .expect("the call is still reported, or this asserts nothing");
     assert!(
-        named.iter().all(|(_, confidence)| *confidence < 1.0),
-        "an ambiguous crate name must not produce a settled edge; got {named:?}"
+        matches!(row.class, devmap_resolve::model::UnresolvedClass::Unresolved),
+        "an import of an indexed crate is an index gap, got {:?}",
+        row.class
     );
 }
 

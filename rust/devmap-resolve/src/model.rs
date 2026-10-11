@@ -197,7 +197,8 @@ impl ResolutionKind {
     /// - `LanguageServer` — one target a language server named
     ///   ([`Confidence::HIGH`], below every deterministic parse rung).
     /// - `UniqueGlobal` — exactly one declaration of that name in the family.
-    /// - `AmbiguousGlobal` — several matches and no way to choose (G5).
+    /// - `AmbiguousGlobal` — several matches and no way to choose (G5). Carried
+    ///   only by a ledger row, never by an edge (S2).
     /// - `LanguageServerDispatch` — a language-server candidate set, scored
     ///   like `AmbiguousGlobal` so default walks exclude it.
     /// - `Unresolved` — no edge is ever built from this variant. It scores at
@@ -342,6 +343,9 @@ pub enum Resolution {
         target_file: String,
         family: LangFamily,
     },
+    /// Several in-repo namesakes of a bare name and no evidence that picks one.
+    /// Recorded on the site's ledger row with the complete candidate list; no
+    /// edge is ever built from it (S2).
     AmbiguousGlobal {
         candidates: Arc<[(String, String)]>, // shared immutable (file_path, symbol_name)
         family: LangFamily,
@@ -507,20 +511,6 @@ impl Resolution {
         }
     }
 }
-
-/// Most candidates one ambiguous *bare-name* call site may fan out into as
-/// edges.
-///
-/// At or below this ceiling every candidate becomes a `Calls` edge (SC4: do
-/// not collapse the ambiguity). Above it the site emits **no** edges and one
-/// ledger row whose `Resolution::AmbiguousGlobal` still carries the complete
-/// candidate list — a capped sample of a 241-candidate site was still 16
-/// wrong edges per call, and GitPulse measured 71% of all edges as
-/// `AmbiguousGlobal` before receiver calls were barred from this rung.
-///
-/// Receiver calls never reach this rung at all: they resolve only through
-/// receiver evidence, or land in the ledger as External / UninferredReceiver.
-pub const AMBIGUOUS_FANOUT_CAP: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedEdge {

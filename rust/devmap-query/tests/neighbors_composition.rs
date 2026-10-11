@@ -11,6 +11,8 @@
 //! is a regression with a good benchmark. So the load-bearing test here is
 //! equivalence against the calls it replaces, not a timing.
 
+use crate::common;
+
 use devmap_extract::extract_file;
 use devmap_query::cancel::Cancel;
 use devmap_query::{Request, StoreQueryEngine, MAX_NEIGHBOR_TARGETS};
@@ -322,7 +324,8 @@ fn mixed_rung_fixture() -> Store {
     ];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions).unwrap();
+    let mut resolution = resolver.resolve_all(&extractions).unwrap();
+    common::dispatch_ambiguous_sites(&mut resolution);
     let analysis = devmap_analyze::analyze(&extractions, &resolution);
     let store = Store::open_in_memory().unwrap();
     store

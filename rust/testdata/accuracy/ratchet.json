@@ -5,14 +5,14 @@
     "present": 51
   },
   "kotlin": {
-    "known_failing": 30,
+    "known_failing": 31,
     "positive_rows": 55,
-    "present": 29
+    "present": 26
   },
   "python": {
-    "known_failing": 19,
+    "known_failing": 30,
     "positive_rows": 49,
-    "present": 30
+    "present": 19
   },
   "rust": {
     "known_failing": 13,
@@ -20,7 +20,7 @@
     "present": 93
   },
   "swift": {
-    "known_failing": 24,
+    "known_failing": 22,
     "positive_rows": 79,
     "present": 58
   },

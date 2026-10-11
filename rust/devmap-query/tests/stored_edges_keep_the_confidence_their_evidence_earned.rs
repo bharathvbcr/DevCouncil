@@ -21,6 +21,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::common;
+
 use devmap_extract::extract_file;
 use devmap_extract::model::{Confidence, Extraction};
 use devmap_query::resolved_edge_from_stored;
@@ -191,7 +193,11 @@ fn an_ambiguous_edge_does_not_gain_confidence_by_being_stored() {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions).unwrap();
+    let mut resolution = resolver.resolve_all(&extractions).unwrap();
+    // The resolver records an ambiguous bare name on the ledger and emits no
+    // edge for it (S2); a language server's dispatch set is the remaining
+    // speculative producer, so the round trip is exercised on that.
+    common::dispatch_ambiguous_sites(&mut resolution);
     let analysis = devmap_analyze::analyze(&extractions, &resolution);
     let store = Store::open_in_memory().expect("store");
     store

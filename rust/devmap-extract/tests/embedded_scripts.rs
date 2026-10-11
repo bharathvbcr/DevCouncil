@@ -849,8 +849,10 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // v83 records the TypeScript workspace-package map, member-qualified ids for
     // class-field and object-literal members, and `export default` as an export
     // named `default`.
+    //
+    // v84 binds Swift and Kotlin parameters as local bindings.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "83",
+        EXTRACTION_SCHEMA_VERSION, "84",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

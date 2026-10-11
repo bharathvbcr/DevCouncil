@@ -612,7 +612,14 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `export default` as an export named `default`. That lane changed what a
 /// TypeScript file extracts to without stamping a version, so a v82 row would
 /// keep serving the old ids.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "83";
+///
+/// v84 binds a Swift or Kotlin callable's parameters and a closure's parameters
+/// (and the implicit `it` / `$0`) as local bindings of that scope. A v83 row has
+/// none, so a bare call to a function-typed parameter, or a receiver typed by
+/// another function's same-named parameter, would still be bound to a project
+/// namesake from a warm cache. The resolver lane stamped 81 on this payload; it
+/// landed after the Rust, Go and TypeScript lanes, so it is 84.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "84";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

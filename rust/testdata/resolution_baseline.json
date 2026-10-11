@@ -8,25 +8,25 @@
     },
     "accuracy/kotlin": {
       "java": null,
-      "kotlin": 795
+      "kotlin": 725
     },
     "accuracy/kotlin-gaps": {
-      "kotlin": 882
+      "kotlin": 764
     },
     "accuracy/python": {
-      "python": 696
+      "python": 468
     },
     "accuracy/python-hatch": {
-      "python": 500
+      "python": 0
     },
     "accuracy/python-nomanifest": {
-      "python": 500
+      "python": 0
     },
     "accuracy/python-ruff": {
-      "python": 500
+      "python": 0
     },
     "accuracy/python-setupcfg": {
-      "python": 500
+      "python": 0
     },
     "accuracy/rust": {
       "rust": 815
@@ -35,13 +35,13 @@
       "rust": 714
     },
     "accuracy/swift": {
-      "swift": 884
+      "swift": 859
     },
     "accuracy/ts": {
       "go": 1000,
       "javascript": null,
-      "tsx": 934,
-      "typescript": 840
+      "tsx": 907,
+      "typescript": 810
     },
     "barrel_reexport": {
       "python": 1000

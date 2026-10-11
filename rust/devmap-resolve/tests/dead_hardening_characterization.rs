@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use devmap_extract::extract_file;
 use devmap_extract::model::EdgeKind;
-use devmap_resolve::model::{Resolution, UnresolvedClass, AMBIGUOUS_FANOUT_CAP};
+use devmap_resolve::model::{Resolution, UnresolvedClass};
 use devmap_resolve::Resolver;
 
 fn fixture_root() -> PathBuf {
@@ -236,11 +236,12 @@ fn shared_method_name_on_untyped_receiver_never_guesses() {
     );
 }
 
-/// Bare-name AmbiguousGlobal above the emission ceiling emits no edges —
-/// one ledger row carries `candidate_total` instead of N capped edges.
+/// Bare-name AmbiguousGlobal emits no edges at any width — one ledger row
+/// carries the whole candidate list instead of N edges (S2).
 #[test]
-fn bare_name_above_fanout_ceiling_emits_ledger_not_edges() {
-    let mut files: Vec<(String, String)> = (0..(AMBIGUOUS_FANOUT_CAP + 8))
+fn bare_name_with_many_namesakes_emits_ledger_not_edges() {
+    const NAMESAKES: usize = 24;
+    let mut files: Vec<(String, String)> = (0..NAMESAKES)
         .map(|n| {
             (
                 format!("d{n}.py"),
@@ -265,7 +266,7 @@ fn bare_name_above_fanout_ceiling_emits_ledger_not_edges() {
         .collect();
     assert!(
         fanout.is_empty(),
-        "above the ceiling a bare ambiguous call must emit zero edges (got {}); \
+        "a bare ambiguous call must emit zero edges (got {}); \
          the ledger carries candidate_total instead of a capped sample",
         fanout.len()
     );
@@ -278,7 +279,7 @@ fn bare_name_above_fanout_ceiling_emits_ledger_not_edges() {
     match &entry.resolution {
         Resolution::AmbiguousGlobal { candidates, .. } => {
             assert!(
-                candidates.len() > AMBIGUOUS_FANOUT_CAP,
+                candidates.len() == NAMESAKES,
                 "ledger must carry the full candidate list, got {}",
                 candidates.len()
             );

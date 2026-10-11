@@ -997,8 +997,8 @@ fn every_migration_step_is_re_entrant_from_every_version() {
 /// covered without anyone remembering this test exists.
 ///
 /// That is not hypothetical. Schema v22 interned the unresolved ledger's
-/// `reason` into `unresolved_texts`, and
-/// `tools/memory_model_probe.sh` kept counting
+/// `reason` into `unresolved_texts`, and the (since retired, with ambiguous
+/// fan-out) `tools/memory_model_probe.sh` kept counting
 /// `unresolved_rows WHERE reason LIKE 'AmbiguousGlobal%'`. The whole workspace
 /// suite -- 303 binaries -- passed; the breakage surfaced only as a step-6
 /// failure several release builds into a gate run. It surfaced *at all* only
@@ -1069,7 +1069,6 @@ fn every_sql_statement_the_gate_scripts_embed_parses_against_the_current_schema(
     // coverage with it and leave every assertion below still passing.
     for required in [
         "verify.sh",
-        "tools/memory_model_probe.sh",
         "tools/soak/src/store.rs",
     ] {
         assert!(
@@ -1120,7 +1119,6 @@ fn every_sql_statement_the_gate_scripts_embed_parses_against_the_current_schema(
     // case, a leading newline) would drop out while the file stayed listed.
     for required in [
         "verify.sh",
-        "tools/memory_model_probe.sh",
         "tools/soak/src/store.rs",
     ] {
         assert!(
@@ -1129,14 +1127,6 @@ fn every_sql_statement_the_gate_scripts_embed_parses_against_the_current_schema(
              follow them, and if they changed form, teach the extractor"
         );
     }
-    // The specific coupling that broke, pinned so a future change that stops
-    // reading the ledger from a gate script has to say so here.
-    assert!(
-        found.iter().any(|(_, sql)| sql.contains("unresolved_rows")),
-        "no gate script reads the unresolved ledger any more; this test was added \
-         because tools/memory_model_probe.sh does, so confirm that on purpose"
-    );
-
     let dir = tmp_dir("gate-script-sql");
     let db_path = dir.join("index.sqlite");
     Store::open(&db_path).expect("a freshly created store must open");
@@ -1147,17 +1137,6 @@ fn every_sql_statement_the_gate_scripts_embed_parses_against_the_current_schema(
             panic!("{name} embeds SQL the current schema cannot parse: {error}\n{sql}")
         });
     }
-
-    // `fanout.sql` is a whole file rather than a quoted string, and it builds
-    // scratch relations its later statements read, so it is checked by running
-    // it: preparing its statements one at a time would fail on the scratch
-    // relations the earlier ones create. The store is a throwaway.
-    let fanout_path = root.join("tools/fanout.sql");
-    let fanout = fs::read_to_string(&fanout_path)
-        .unwrap_or_else(|error| panic!("{} is unreadable: {error}", fanout_path.display()));
-    conn.execute_batch(&fanout).unwrap_or_else(|error| {
-        panic!("tools/fanout.sql does not run against the current schema: {error}")
-    });
 
     let _ = fs::remove_dir_all(&dir);
 }

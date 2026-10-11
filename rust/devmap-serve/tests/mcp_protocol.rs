@@ -17,6 +17,8 @@
 use std::sync::Arc;
 
 use devmap_serve::mcp::{handle_line, serve_streams, to_ipc_command, tool_specs, StoreSlot};
+mod common;
+
 use devmap_store::Store;
 use serde_json::{json, Value};
 
@@ -826,9 +828,10 @@ fn impact_accepts_layers_and_forwards_it() {
 }
 
 /// A corpus whose call graph holds both rungs: `helper` calls `shared`, which
-/// two files define and nothing imports, so the resolver records the call as an
-/// `AmbiguousGlobal` fan-out to both; `main` calls `helper` in its own file,
-/// which is deterministic.
+/// two files define and nothing imports, so the resolver records the call on
+/// the ledger as ambiguous (no edge, S2) and a language server's dispatch set
+/// puts the speculative fan-out to both in the graph; `main` calls `helper` in
+/// its own file, which is deterministic.
 fn mixed_rung_corpus() -> Arc<StoreSlot> {
     let extractions = vec![
         devmap_extract::extract_file("lib_a.py", "def shared():\n    return 1\n"),
@@ -840,7 +843,8 @@ fn mixed_rung_corpus() -> Arc<StoreSlot> {
     ];
     let mut resolver = devmap_resolve::Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions).unwrap();
+    let mut resolution = resolver.resolve_all(&extractions).unwrap();
+    common::dispatch_ambiguous_sites(&mut resolution);
     let analysis = devmap_analyze::analyze(&extractions, &resolution);
     let store = Store::open_in_memory().expect("in-memory store");
     store
@@ -849,11 +853,11 @@ fn mixed_rung_corpus() -> Arc<StoreSlot> {
     Arc::new(StoreSlot::ready("in-memory", Arc::new(store)))
 }
 
-/// How many `AmbiguousGlobal` edges an answer carries, wherever they sit in it.
+/// How many speculative (`LanguageServerDispatch`) edges an answer carries, wherever they sit in it.
 fn ambiguous_edges(answer: &Value) -> usize {
     answer
         .to_string()
-        .matches(r#""kind":"AmbiguousGlobal""#)
+        .matches(r#""kind":"LanguageServerDispatch""#)
         .count()
 }
 

@@ -46,6 +46,7 @@ mod ask_evidence;
 mod ask_ranking;
 #[cfg(feature = "parse")]
 mod ask_scope;
+mod common;
 #[cfg(feature = "parse")]
 mod coupling_spans_inheritance;
 #[cfg(feature = "parse")]
@@ -171,6 +172,9 @@ mod every_test_file_is_a_module {
         let declared: BTreeSet<String> = include_str!("it.rs")
             .lines()
             .filter_map(|line| line.trim().strip_prefix("mod ")?.strip_suffix(';'))
+            // `common` is the shared helper module, a directory
+            // (tests/common/mod.rs) and not a test file.
+            .filter(|name| *name != "common")
             .map(str::to_string)
             .collect();
         let isolated: BTreeSet<String> = super::ISOLATED

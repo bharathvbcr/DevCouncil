@@ -272,9 +272,12 @@ def test_it():
     }
 }
 
-/// An import that resolves ordinarily keeps its ordinary answer.
+/// S2. An import the ordinary rule resolves is *not* kept when a directory this
+/// file put on `sys.path` first holds a different file for the module: which
+/// one runs is the inserted directory's, and binding the sibling is a
+/// confident edge to what may be the wrong module.
 #[test]
-fn an_ordinarily_resolved_import_is_not_overridden() {
+fn a_sys_path_directory_holding_a_different_file_makes_the_import_abstain() {
     let source = "\
 import sys
 from pathlib import Path
@@ -291,17 +294,42 @@ def test_it():
         ("scripts/analyse_wave20.py", WAVE20),
         ("scripts/aws/analyse_wave20.py", WAVE20),
     ]);
+    for target in ["scripts/analyse_wave20.py", "scripts/aws/analyse_wave20.py"] {
+        assert!(
+            !imports(&resolution, "scripts/test_wave20_analyser.py", target),
+            "{target}: an Imports edge was made"
+        );
+        assert!(
+            callers_of(&resolution, &format!("{target}::spearman")).is_empty(),
+            "{target}: callers {:?}",
+            callers_of(&resolution, &format!("{target}::spearman"))
+        );
+    }
+}
+
+/// An inserted directory that holds the *same* file ordinary resolution found
+/// shadows nothing, so the ordinary answer stands.
+#[test]
+fn a_sys_path_directory_naming_the_same_file_keeps_the_ordinary_answer() {
+    let source = "\
+import sys
+from pathlib import Path
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+import analyse_wave20 as a20
+
+def test_it():
+    a20.spearman([], [])
+";
+    let resolution = resolve(&[
+        ("scripts/test_wave20_analyser.py", source),
+        ("scripts/analyse_wave20.py", WAVE20),
+    ]);
     assert!(imports(
         &resolution,
         "scripts/test_wave20_analyser.py",
         "scripts/analyse_wave20.py"
     ));
-    assert!(!imports(
-        &resolution,
-        "scripts/test_wave20_analyser.py",
-        "scripts/aws/analyse_wave20.py"
-    ));
-    assert!(callers_of(&resolution, "scripts/aws/analyse_wave20.py::spearman").is_empty());
 }
 
 /// `BINN/scripts/test_campaign_tooling.py`, in shape: `scripts/aws/` and
