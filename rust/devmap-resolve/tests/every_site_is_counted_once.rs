@@ -223,9 +223,10 @@ fn an_ambiguous_site_is_one_ledger_row_and_no_edges() {
         Resolution::AmbiguousGlobal { candidates, .. } if candidates.len() == 2
     ));
     assert!(
-        result.edges.iter().all(|edge| !edge.resolution.as_ref().is_some_and(
-            |resolution| matches!(**resolution, Resolution::AmbiguousGlobal { .. })
-        )),
+        result.edges.iter().all(|edge| !edge
+            .resolution
+            .as_ref()
+            .is_some_and(|resolution| matches!(**resolution, Resolution::AmbiguousGlobal { .. }))),
         "an ambiguous site must not fan out into edges"
     );
 }

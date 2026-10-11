@@ -771,13 +771,14 @@ fn extract_treesitter_before_deadline(
                 };
                 // The implicit calls name receivers the resolver types from the
                 // same site bindings an explicit call's receiver does.
-                let binding_calls: std::borrow::Cow<[ExtractedCall]> = if rust_implicit_calls.is_empty() {
-                    std::borrow::Cow::Borrowed(&calls)
-                } else {
-                    std::borrow::Cow::Owned(
-                        calls.iter().chain(&rust_implicit_calls).cloned().collect(),
-                    )
-                };
+                let binding_calls: std::borrow::Cow<[ExtractedCall]> =
+                    if rust_implicit_calls.is_empty() {
+                        std::borrow::Cow::Borrowed(&calls)
+                    } else {
+                        std::borrow::Cow::Owned(
+                            calls.iter().chain(&rust_implicit_calls).cloned().collect(),
+                        )
+                    };
                 let local_bindings = collect_site_bindings(
                     root,
                     source,
@@ -5260,7 +5261,10 @@ fn extract_node(
                                 qualified_name: method_qualified,
                                 kind: SymbolKind::Method,
                                 span: node_span(member),
-                                is_exported: method.chars().next().is_some_and(|c| c.is_uppercase()),
+                                is_exported: method
+                                    .chars()
+                                    .next()
+                                    .is_some_and(|c| c.is_uppercase()),
                                 docstring: None,
                                 signature: None,
                                 parent_symbol: Some(qualified_name.clone()),
@@ -7034,7 +7038,11 @@ const MAX_IMPLICIT_CALLS: usize = 20_000;
 /// states: a constructor expression (`V(1)`, `V { .. }`, `T::new()`), a unit
 /// struct value, or a plain local (the resolver types it from its binding).
 /// Literals and casts are numbers and never qualify.
-fn rust_collect_implicit_calls(root: Node, source: &str, file_symbol_name: &str) -> Vec<ExtractedCall> {
+fn rust_collect_implicit_calls(
+    root: Node,
+    source: &str,
+    file_symbol_name: &str,
+) -> Vec<ExtractedCall> {
     let mut calls = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
@@ -7202,7 +7210,9 @@ fn rust_expand_local_macros(
                             .unwrap_or(&text);
                         // `$crate` is the defining crate's root, which is `crate`
                         // to every caller in this file.
-                        found.extend(scan_rust_token_tree_calls(&inner.replace("$crate", "crate")));
+                        found.extend(scan_rust_token_tree_calls(
+                            &inner.replace("$crate", "crate"),
+                        ));
                     }
                     found.sort();
                     found.dedup();
@@ -10489,8 +10499,15 @@ fn collect_swift_kotlin_parameter_names(
     match callable.kind() {
         // Swift `func` / `init`: `parameter` children hang off the declaration;
         // the type is also a `name` field, so the kind picks the binding.
-        "function_declaration" | "init_declaration" if callable.child_by_field_name("body").is_some_and(|b| b.kind() == "function_body") => {
-            for parameter in callable.children(&mut cursor).filter(|c| c.kind() == "parameter") {
+        "function_declaration" | "init_declaration"
+            if callable
+                .child_by_field_name("body")
+                .is_some_and(|b| b.kind() == "function_body") =>
+        {
+            for parameter in callable
+                .children(&mut cursor)
+                .filter(|c| c.kind() == "parameter")
+            {
                 let mut inner = parameter.walk();
                 let name = parameter
                     .children_by_field_name("name", &mut inner)
@@ -10526,7 +10543,9 @@ fn collect_swift_kotlin_parameter_names(
                                 declared = true;
                             }
                         }
-                        "lambda_function_type" | "lambda_function_type_parameters" | "lambda_parameters" => {
+                        "lambda_function_type"
+                        | "lambda_function_type_parameters"
+                        | "lambda_parameters" => {
                             stack.push(child);
                         }
                         _ => {}
@@ -10549,7 +10568,10 @@ fn collect_swift_kotlin_parameter_names(
                 return false;
             };
             let mut inner = list.walk();
-            for parameter in list.children(&mut inner).filter(|c| c.kind() == "parameter") {
+            for parameter in list
+                .children(&mut inner)
+                .filter(|c| c.kind() == "parameter")
+            {
                 if let Some(name) = parameter
                     .named_child(0)
                     .filter(|n| n.kind() == "identifier")
@@ -11293,9 +11315,12 @@ fn rust_use_is_in_same_name_initializer(node: Node, source: &str, name: &str) ->
             // depending on which span the extractor recorded.
             let callee_is_name = |call: Node| {
                 call.kind() == "call_expression"
-                    && call.child_by_field_name("function").is_some_and(|function| {
-                        function.kind() == "identifier" && get_node_text(function, source) == name
-                    })
+                    && call
+                        .child_by_field_name("function")
+                        .is_some_and(|function| {
+                            function.kind() == "identifier"
+                                && get_node_text(function, source) == name
+                        })
             };
             let called = callee_is_name(node)
                 || (node.kind() == "identifier"

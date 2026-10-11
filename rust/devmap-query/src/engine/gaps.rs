@@ -786,13 +786,19 @@ mod radius_note_tests {
         let note = note_for(Some("gitpulse_lib::hooks"));
         assert!(note.contains("not mapped to an indexed root"), "{note}");
         assert!(note.contains("gitpulse_lib::hooks::dispatch"), "{note}");
-        assert!(!note.contains("an untyped receiver, a local binding"), "{note}");
+        assert!(
+            !note.contains("an untyped receiver, a local binding"),
+            "{note}"
+        );
     }
 
     #[test]
     fn a_value_receiver_keeps_the_untyped_receiver_reason() {
         let note = note_for(Some("state"));
-        assert!(note.contains("an untyped receiver, a local binding"), "{note}");
+        assert!(
+            note.contains("an untyped receiver, a local binding"),
+            "{note}"
+        );
         assert!(!note.contains("indexed root"), "{note}");
     }
 }

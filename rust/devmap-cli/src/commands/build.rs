@@ -992,7 +992,9 @@ pub(crate) fn run(
             ));
         }
         if !cli.verbose
-            && (unattributed_calls > 0 || uninferred_receiver_calls > 0 || unresolved_member_calls > 0)
+            && (unattributed_calls > 0
+                || uninferred_receiver_calls > 0
+                || unresolved_member_calls > 0)
         {
             summary.push(format!("  Unresolved: {unattributed_calls} unattributed, {uninferred_receiver_calls} uninferred receivers, {unresolved_member_calls} unresolved members (details: --verbose)"));
         }

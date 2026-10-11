@@ -15,7 +15,6 @@
 //!   as a separate target or silently skipped: `every_test_file_is_a_module`
 //!   fails until it is declared here or isolated.
 
-mod common;
 mod a_message_literal_has_no_run_of_spaces;
 mod a_named_root_must_be_a_directory;
 mod a_one_file_edit_writes_one_file_of_rows;
@@ -33,6 +32,7 @@ mod caller_assets_over_stdin;
 mod claude_integration;
 mod cli_json_contract;
 mod closed_pipe_is_not_a_panic;
+mod common;
 mod coverage_invariants;
 mod crash_consistency;
 mod daemon_storm_soak;

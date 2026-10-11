@@ -135,9 +135,17 @@ impl Guard { pub fn shared(&self) {} }
 pub fn use_it(g: Guard) { g.only_inner(); g.shared(); }
 ";
     let r = resolve(&[("a.rs", src)]);
-    assert!(r.has("a.rs::use_it", "a.rs::Inner.only_inner"), "{:?}", r.edges);
+    assert!(
+        r.has("a.rs::use_it", "a.rs::Inner.only_inner"),
+        "{:?}",
+        r.edges
+    );
     assert!(r.has("a.rs::use_it", "a.rs::Guard.shared"), "{:?}", r.edges);
-    assert!(!r.has("a.rs::use_it", "a.rs::Inner.shared"), "{:?}", r.edges);
+    assert!(
+        !r.has("a.rs::use_it", "a.rs::Inner.shared"),
+        "{:?}",
+        r.edges
+    );
 }
 
 #[test]
@@ -221,7 +229,9 @@ pub fn go() -> String { \"abc\".shout() }
     let r = resolve(&[("a.rs", two)]);
     assert!(
         !r.edges.iter().any(|(from, _, _)| from == "a.rs::go"
-            && r.edges.iter().any(|(f, t, _)| f == from && t.ends_with(".shout"))),
+            && r.edges
+                .iter()
+                .any(|(f, t, _)| f == from && t.ends_with(".shout"))),
         "two impls answer a string literal: {:?}",
         r.edges
     );
@@ -241,8 +251,16 @@ fn main() {
 ";
     let commands = "pub fn cmd_a() {}\nfn cmd_b() {}\n";
     let r = resolve(&[("main.rs", main), ("commands.rs", commands)]);
-    assert!(r.has("main.rs::main", "commands.rs::cmd_a"), "{:?}", r.edges);
-    assert!(r.has("main.rs::main", "commands.rs::cmd_b"), "{:?}", r.edges);
+    assert!(
+        r.has("main.rs::main", "commands.rs::cmd_a"),
+        "{:?}",
+        r.edges
+    );
+    assert!(
+        r.has("main.rs::main", "commands.rs::cmd_b"),
+        "{:?}",
+        r.edges
+    );
 }
 
 #[test]
@@ -253,7 +271,11 @@ macro_rules! log { ($m:expr) => { $crate::emit($m) }; }
 pub fn caller() -> usize { log!(\"x\") }
 ";
     let r = resolve(&[("src/lib.rs", src)]);
-    assert!(r.has("src/lib.rs::caller", "src/lib.rs::emit"), "{:?}", r.edges);
+    assert!(
+        r.has("src/lib.rs::caller", "src/lib.rs::emit"),
+        "{:?}",
+        r.edges
+    );
 }
 
 #[test]

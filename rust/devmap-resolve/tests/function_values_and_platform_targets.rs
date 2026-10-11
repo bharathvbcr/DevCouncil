@@ -213,9 +213,15 @@ fn go_platform_twins_fan_out_by_file_suffix_and_by_build_tag() {
             .find(|row| row.source_symbol == "sys/use.go::Use" && row.callee_name == "open")
             .unwrap_or_else(|| panic!("{label}: the site must be in the ledger"));
         let Resolution::AmbiguousGlobal { candidates, .. } = &row.resolution else {
-            panic!("{label}: expected AmbiguousGlobal, got {:?}", row.resolution);
+            panic!(
+                "{label}: expected AmbiguousGlobal, got {:?}",
+                row.resolution
+            );
         };
-        let mut targets: Vec<&str> = candidates.iter().map(|(_, symbol)| symbol.as_str()).collect();
+        let mut targets: Vec<&str> = candidates
+            .iter()
+            .map(|(_, symbol)| symbol.as_str())
+            .collect();
         targets.sort();
         assert_eq!(
             targets,

@@ -52,7 +52,9 @@ pub fn add_dispatch_edges(root: &std::path::Path, db: &std::path::Path, files: &
         .collect();
     let mut resolver = devmap_resolve::Resolver::new();
     resolver.index_extractions(&extractions);
-    let mut resolution = resolver.resolve_all(&extractions).expect("fixture resolves");
+    let mut resolution = resolver
+        .resolve_all(&extractions)
+        .expect("fixture resolves");
     let mut seen = std::collections::BTreeSet::new();
     resolution.unresolved.retain(|row| {
         !matches!(row.resolution, Resolution::AmbiguousGlobal { .. })

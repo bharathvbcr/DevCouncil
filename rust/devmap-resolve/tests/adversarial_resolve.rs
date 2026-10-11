@@ -238,10 +238,10 @@ fn sorting_ambiguous_edges_does_not_serialize_the_candidate_list_per_comparison(
         let result = resolve(&extractions);
         let elapsed = started.elapsed();
         assert!(
-            result.unresolved.iter().any(|row| matches!(
-                row.resolution,
-                Resolution::AmbiguousGlobal { .. }
-            )),
+            result
+                .unresolved
+                .iter()
+                .any(|row| matches!(row.resolution, Resolution::AmbiguousGlobal { .. })),
             "fixture is inert: no ambiguous ledger rows were produced"
         );
         assert!(

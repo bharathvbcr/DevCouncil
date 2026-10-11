@@ -1067,10 +1067,7 @@ fn every_sql_statement_the_gate_scripts_embed_parses_against_the_current_schema(
     // scripts are meant to be picked up without editing this -- but a rename
     // that moved one of these out of the glob's reach would otherwise take its
     // coverage with it and leave every assertion below still passing.
-    for required in [
-        "verify.sh",
-        "tools/soak/src/store.rs",
-    ] {
+    for required in ["verify.sh", "tools/soak/src/store.rs"] {
         assert!(
             sources.iter().any(|(name, _)| name == required),
             "{required} is no longer among the discovered gate scripts {:?}; if it \
@@ -1117,10 +1114,7 @@ fn every_sql_statement_the_gate_scripts_embed_parses_against_the_current_schema(
     // Discovered is not the same as covered: each file known to carry SQL must
     // contribute a statement, or a literal the extractor cannot see (lower
     // case, a leading newline) would drop out while the file stayed listed.
-    for required in [
-        "verify.sh",
-        "tools/soak/src/store.rs",
-    ] {
+    for required in ["verify.sh", "tools/soak/src/store.rs"] {
         assert!(
             found.iter().any(|(name, _)| name == required),
             "{required} contributed no embedded SQL statement; if its queries moved, \

@@ -25,7 +25,9 @@ fn call_edges_to<'a>(result: &'a ResolutionResult, target_suffix: &str) -> Vec<&
     result
         .edges
         .iter()
-        .filter(|edge| edge.edge_kind == EdgeKind::Calls && edge.target_symbol.ends_with(target_suffix))
+        .filter(|edge| {
+            edge.edge_kind == EdgeKind::Calls && edge.target_symbol.ends_with(target_suffix)
+        })
         .map(|edge| edge.source_symbol.as_str())
         .collect()
 }
@@ -74,7 +76,10 @@ fn an_unindexed_relative_import_is_an_index_gap_never_a_global_bind() {
         ),
     ]);
     assert!(call_edges_to(&result, "::exportedArrow").is_empty());
-    assert_eq!(row(&result, "exportedArrow").class, UnresolvedClass::Unresolved);
+    assert_eq!(
+        row(&result, "exportedArrow").class,
+        UnresolvedClass::Unresolved
+    );
 }
 
 /// The same import with a specifier that does name an indexed file — a TypeScript
@@ -110,12 +115,17 @@ fn a_family_builtin_is_not_bound_to_a_repository_function_of_that_name() {
 #[test]
 fn a_swift_private_declaration_is_invisible_to_another_file() {
     let result = resolve(&[
-        ("Sources/M/A.swift", "private func forwardSpan() -> Int { 1 }\nfunc keep() -> Int { forwardSpan() }\n"),
+        (
+            "Sources/M/A.swift",
+            "private func forwardSpan() -> Int { 1 }\nfunc keep() -> Int { forwardSpan() }\n",
+        ),
         ("Sources/M/B.swift", "func use() -> Int { forwardSpan() }\n"),
     ]);
     let callers = call_edges_to(&result, "::forwardSpan");
     assert!(
-        callers.iter().all(|caller| caller.starts_with("Sources/M/A.swift")),
+        callers
+            .iter()
+            .all(|caller| caller.starts_with("Sources/M/A.swift")),
         "only the declaring file may call its private function: {callers:?}"
     );
 }
@@ -139,7 +149,10 @@ fn a_ts_module_binding_that_is_not_exported_is_invisible_to_another_file() {
 #[test]
 fn a_rust_item_that_is_not_pub_is_invisible_to_another_crate() {
     let result = resolve(&[
-        ("a/src/lib.rs", "fn secret() -> i32 { 1 }\npub fn open_api() -> i32 { 2 }\n"),
+        (
+            "a/src/lib.rs",
+            "fn secret() -> i32 { 1 }\npub fn open_api() -> i32 { 2 }\n",
+        ),
         (
             "b/src/lib.rs",
             "pub fn go() -> i32 {\n    secret() + open_api()\n}\n",
@@ -207,5 +220,8 @@ fn an_unambiguous_bare_name_with_no_other_evidence_still_binds() {
         .iter()
         .find(|edge| edge.edge_kind == EdgeKind::Calls && edge.source_symbol == "b.py::run")
         .expect("the unique bare name binds");
-    assert!(matches!(edge.resolution.as_deref(), Some(Resolution::UniqueGlobal { .. })));
+    assert!(matches!(
+        edge.resolution.as_deref(),
+        Some(Resolution::UniqueGlobal { .. })
+    ));
 }

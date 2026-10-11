@@ -359,7 +359,10 @@ fn two_crates_of_the_same_name_resolve_to_neither() {
         .find(|row| row.source_file == "c/user/src/lib.rs" && row.callee_name == "only_here")
         .expect("the call is still reported, or this asserts nothing");
     assert!(
-        matches!(row.class, devmap_resolve::model::UnresolvedClass::Unresolved),
+        matches!(
+            row.class,
+            devmap_resolve::model::UnresolvedClass::Unresolved
+        ),
         "an import of an indexed crate is an index gap, got {:?}",
         row.class
     );

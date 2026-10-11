@@ -1624,8 +1624,15 @@ fn dispatch_only_symbols(resolution: &ResolutionResult) -> HashSet<(String, Stri
     };
     let mut dispatched: HashSet<(String, String)> = HashSet::new();
     let mut other: HashSet<(String, String)> = HashSet::new();
-    for edge in resolution.edges.iter().filter(|edge| is_ambiguous_edge(edge)) {
-        let bucket = if matches!(edge.resolution.as_deref(), Some(Resolution::Dispatch { .. })) {
+    for edge in resolution
+        .edges
+        .iter()
+        .filter(|edge| is_ambiguous_edge(edge))
+    {
+        let bucket = if matches!(
+            edge.resolution.as_deref(),
+            Some(Resolution::Dispatch { .. })
+        ) {
             &mut dispatched
         } else {
             &mut other
@@ -2230,7 +2237,11 @@ fn called_and_ambiguous_symbols(resolution: &ResolutionResult) -> CallIndex {
         // symbol may be called, not proof that any one candidate is called.
         // Do not turn speculative resolution into a false liveness negative.
         if is_ambiguous_edge(edge) {
-            record_ambiguous(&mut ambiguous_symbols, &edge.target_file, &edge.target_symbol);
+            record_ambiguous(
+                &mut ambiguous_symbols,
+                &edge.target_file,
+                &edge.target_symbol,
+            );
             continue;
         }
         if matches!(
@@ -2882,7 +2893,8 @@ pub fn analyze_liveness_with_coverage(
                     confidence: cap(0.4),
                     is_exempt: false,
                     exemption_reason: Some(
-                        if dispatch_only.contains(&(ext.file_path.clone(), sym.qualified_name.clone()))
+                        if dispatch_only
+                            .contains(&(ext.file_path.clone(), sym.qualified_name.clone()))
                             || dispatch_only.contains(&(ext.file_path.clone(), sym.name.clone()))
                         {
                             REACHED_BY_DISPATCH

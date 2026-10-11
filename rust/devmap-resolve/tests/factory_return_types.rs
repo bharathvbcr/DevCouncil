@@ -710,11 +710,15 @@ func pick(again bool) {
         "search/pick.go::pick",
     );
     assert!(
-        targets.iter().any(|t| t == "search/providers.go::DBLP.Zzsearch"),
+        targets
+            .iter()
+            .any(|t| t == "search/providers.go::DBLP.Zzsearch"),
         "got {targets:?}"
     );
     assert!(
-        !targets.iter().any(|t| t == "search/providers.go::IEEE.Zzsearch"),
+        !targets
+            .iter()
+            .any(|t| t == "search/providers.go::IEEE.Zzsearch"),
         "got {targets:?}"
     );
 }

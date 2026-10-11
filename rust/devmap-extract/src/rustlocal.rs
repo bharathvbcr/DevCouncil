@@ -357,9 +357,7 @@ fn type_of_local<'tree>(
                 .or_else(|| unwrapped_local(binders, scrutinee, unwrapper, scope, hops))
         }
         Binder::Loop(iterable) => loop_element(binders, iterable, scope, hops),
-        Binder::ClosureParam(closure, index) => {
-            closure_element(binders, closure, index, hops)
-        }
+        Binder::ClosureParam(closure, index) => closure_element(binders, closure, index, hops),
     }
 }
 
@@ -672,7 +670,10 @@ fn unwrapped_local<'tree>(
 ) -> Option<Node<'tree>> {
     let source = binders.source;
     let mut value = scrutinee;
-    while matches!(value.kind(), "reference_expression" | "parenthesized_expression") {
+    while matches!(
+        value.kind(),
+        "reference_expression" | "parenthesized_expression"
+    ) {
         value = value
             .child_by_field_name("value")
             .or_else(|| value.named_child(0))?;
@@ -737,8 +738,18 @@ fn closure_element<'tree>(
         };
         if matches!(
             adapter.as_str(),
-            "filter" | "take_while" | "skip_while" | "skip" | "take" | "rev" | "inspect"
-                | "peekable" | "by_ref" | "step_by" | "cloned" | "copied"
+            "filter"
+                | "take_while"
+                | "skip_while"
+                | "skip"
+                | "take"
+                | "rev"
+                | "inspect"
+                | "peekable"
+                | "by_ref"
+                | "step_by"
+                | "cloned"
+                | "copied"
         ) {
             chain = inner;
             continue;
@@ -832,11 +843,7 @@ fn single_argument_of<'tree>(
 
 /// The first type argument of `Outer<T, ..>` when `Outer` is one of `outers`:
 /// the `T` of a `Result<T, E>`.
-fn first_argument_of<'tree>(
-    ty: Node<'tree>,
-    outers: &[&str],
-    source: &str,
-) -> Option<Node<'tree>> {
+fn first_argument_of<'tree>(ty: Node<'tree>, outers: &[&str], source: &str) -> Option<Node<'tree>> {
     if ty.kind() != "generic_type" {
         return None;
     }

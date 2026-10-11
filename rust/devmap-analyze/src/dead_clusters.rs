@@ -204,12 +204,10 @@ fn is_reaching_edge(edge: &ResolvedEdge) -> bool {
     if !is_symbol_edge(edge) {
         return false;
     }
-    !edge
-        .resolution
-        .as_deref()
-        .is_some_and(|resolution| {
-            resolution.is_unproven_candidate_set() || matches!(resolution, Resolution::Unresolved { .. })
-        })
+    !edge.resolution.as_deref().is_some_and(|resolution| {
+        resolution.is_unproven_candidate_set()
+            || matches!(resolution, Resolution::Unresolved { .. })
+    })
 }
 
 /// Symbols something reaches through evidence the resolver could not bind.
@@ -233,14 +231,10 @@ fn qualifying_symbols<'a>(resolution: &'a ResolutionResult) -> BTreeSet<&'a str>
         if !is_symbol_edge(edge) {
             continue;
         }
-        if edge
-            .resolution
-            .as_deref()
-            .is_some_and(|resolution| {
-                resolution.is_unproven_candidate_set()
-                    || matches!(resolution, Resolution::Unresolved { .. })
-            })
-        {
+        if edge.resolution.as_deref().is_some_and(|resolution| {
+            resolution.is_unproven_candidate_set()
+                || matches!(resolution, Resolution::Unresolved { .. })
+        }) {
             named.insert(edge.target_symbol.as_str());
         }
     }

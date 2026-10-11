@@ -81,7 +81,11 @@ fn python_chains_subscripts_and_calls_on_calls() {
             "a receiver call carries a name-only resolution: {edge:?}"
         );
     }
-    for row in result.unresolved.iter().filter(|row| row.receiver.is_some()) {
+    for row in result
+        .unresolved
+        .iter()
+        .filter(|row| row.receiver.is_some())
+    {
         assert!(!name_only(&row.resolution), "{row:?}");
     }
 }
@@ -89,7 +93,10 @@ fn python_chains_subscripts_and_calls_on_calls() {
 #[test]
 fn typescript_chains_and_optional_calls() {
     let result = resolve(&[
-        ("lib.ts", "export function trim() { return 1; }\nexport function map() { return 2; }\n"),
+        (
+            "lib.ts",
+            "export function trim() { return 1; }\nexport function map() { return 2; }\n",
+        ),
         (
             "app.ts",
             "export function chain(s: string) { return s.trim().length; }\n\
@@ -102,7 +109,11 @@ fn typescript_chains_and_optional_calls() {
             "{edge:?}"
         );
     }
-    for row in result.unresolved.iter().filter(|row| row.receiver.is_some()) {
+    for row in result
+        .unresolved
+        .iter()
+        .filter(|row| row.receiver.is_some())
+    {
         assert!(!name_only(&row.resolution), "{row:?}");
     }
 }
