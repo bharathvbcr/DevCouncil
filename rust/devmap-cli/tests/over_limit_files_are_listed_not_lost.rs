@@ -69,6 +69,19 @@ fn caller_of_at_least(bytes: u64) -> String {
     body
 }
 
+/// A caller of `helper_only_big` of at least `bytes` bytes that is meant to be
+/// *indexed* — just under the limit — with the call sites it needs.
+fn under_limit_caller(bytes: u64) -> String {
+    let mut body =
+        String::from("from lib import helper_only_big\n\n\ndef run():\n    helper_only_big()\n");
+    while (body.len() as u64) < bytes {
+        body.push_str(
+            "# padding that keeps this file near the size limit without costing a parse\n",
+        );
+    }
+    body
+}
+
 fn write_big(root: &Path, gen_bytes: u64) {
     std::fs::write(
         root.join("lib.py"),
@@ -191,7 +204,12 @@ fn the_big_fixture_lists_the_skipped_caller_and_caveats_dead_and_impact() {
 #[test]
 fn a_file_crossing_the_limit_is_reported_as_skipped_not_removed() {
     let root = fixture("crossing");
-    write_big(&root, 848_958);
+    std::fs::write(
+        root.join("lib.py"),
+        "def helper_only_big():\n    return 42\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("gen.py"), under_limit_caller(848_958)).unwrap();
     let build = json(&root, &["--json", "build", "."]);
     assert_eq!(
         build["over_limit_files"],
@@ -228,7 +246,7 @@ fn a_file_crossing_the_limit_is_reported_as_skipped_not_removed() {
     );
 
     // The human summary of the same build shape.
-    std::fs::write(root.join("gen.py"), caller_of_at_least(848_958)).unwrap();
+    std::fs::write(root.join("gen.py"), under_limit_caller(848_958)).unwrap();
     let _ = json(&root, &["--json", "build", "."]);
     std::fs::write(root.join("gen.py"), caller_of_at_least(LIMIT + 700_000)).unwrap();
     let (stdout, stderr) = run(&root, &["build", "."]);
@@ -296,4 +314,36 @@ fn a_vendored_or_data_file_over_the_limit_is_listed_without_degrading() {
     assert_eq!(status["is_fresh"], true, "{status}");
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// What the crossing test needs of its under-limit file is its *size*, and that
+/// its calls reach the helper. It used to buy the size with forty thousand call
+/// sites, which a debug `devmap` parses and walks in about as long as a third of
+/// the per-file parse budget: on a loaded host the budget passed, the file
+/// "failed to parse", the helper had no caller, and the test failed with an
+/// empty impact. The size now comes from comments, which cost almost nothing
+/// to parse, so the file extracts well inside the budget with room for load.
+#[test]
+fn the_under_limit_fixture_extracts_well_inside_the_production_budget() {
+    let source = under_limit_caller(848_958);
+    let budget = devmap_extract::treesitter::DEFAULT_PARSE_BUDGET / 5;
+    let extraction = devmap_extract::treesitter::extract_treesitter_with_budget(
+        "gen.py", "python", &source, budget,
+    );
+    assert!(
+        !matches!(
+            extraction.parse_outcome,
+            devmap_extract::ParseOutcome::Failed { .. }
+        ),
+        "the fixture needed more than {budget:?} to extract: {:?}",
+        extraction.parse_outcome
+    );
+    assert!(
+        extraction
+            .calls
+            .iter()
+            .any(|call| call.callee_name == "helper_only_big"),
+        "the fixture must still call the helper"
+    );
+    assert!(source.len() as u64 >= 848_958 && (source.len() as u64) < LIMIT);
 }
