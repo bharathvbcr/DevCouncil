@@ -115,6 +115,7 @@ mod the_bounded_runner_under_hostile_children;
 mod ts_import_export_fabrication;
 #[cfg(feature = "parse")]
 mod wiring_port_under_stress;
+mod workspaces_collect;
 
 /// Files that keep a process of their own, and why (see the file's header).
 const ISOLATED: &[&str] = &[

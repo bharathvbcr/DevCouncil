@@ -116,6 +116,8 @@ mod type_aliases_are_not_call_targets;
 mod type_position_classification;
 #[cfg(feature = "parse")]
 mod typed_receivers;
+#[cfg(feature = "parse")]
+mod typescript_core_shapes;
 
 /// Files that keep a process of their own, and why (see the file's header).
 const ISOLATED: &[&str] = &[];

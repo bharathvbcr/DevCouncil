@@ -175,6 +175,10 @@ pub struct ProjectManifests {
     /// resolver only knew by its directory and filed every such import
     /// `External` — "expected, not worth acting on" — about code it indexes.
     pub rust_crates: Vec<RustCrateManifest>,
+    /// The packages an npm / yarn / bun workspace links into the tree, by the
+    /// name an importer spells them: `@acme/shared` → `packages/shared`. See
+    /// [`crate::workspaces`].
+    pub ts_workspaces: Vec<crate::workspaces::WorkspacePackage>,
 }
 
 /// One `Cargo.toml` package: the directory it governs and the crate names its
@@ -232,6 +236,7 @@ struct Found {
     modules: Vec<GoModule>,
     rust_crates: Vec<RustCrateManifest>,
     ts_configs: Vec<String>,
+    package_manifests: Vec<(String, crate::workspaces::PackageManifest)>,
     examined: BTreeSet<String>,
     refusals: Vec<(String, DiscoverySkipReason)>,
     /// A walk error about the pass as a whole: the root, or nothing at all.
@@ -251,7 +256,12 @@ fn visit_manifest_entry(root: &Path, entry: &ignore::DirEntry, found: &std::sync
     };
     let is_go_mod = file_name == "go.mod";
     let is_cargo_toml = file_name == "Cargo.toml";
-    if !is_go_mod && !is_cargo_toml && !crate::tsconfig::is_ts_config_name(file_name) {
+    let is_package_json = file_name == "package.json";
+    if !is_go_mod
+        && !is_cargo_toml
+        && !is_package_json
+        && !crate::tsconfig::is_ts_config_name(file_name)
+    {
         return;
     }
     // A link is a candidate whatever it points at. `is_file()` follows it and
@@ -283,6 +293,24 @@ fn visit_manifest_entry(root: &Path, entry: &ignore::DirEntry, found: &std::sync
                     found.rust_crates.push(RustCrateManifest { dir, names });
                 }
             }
+            ManifestRead::Absent | ManifestRead::Skipped => {}
+            ManifestRead::Refused(reason) => found
+                .refusals
+                .push((rel_str, DiscoverySkipReason::Unreadable { reason })),
+        }
+        return;
+    }
+    if is_package_json {
+        let read = read_manifest(root, &rel_str, crate::tsconfig::MAX_CONFIG_BYTES);
+        let mut found = crate::recover_lock(found);
+        found.examined.insert(rel_str.clone());
+        match read {
+            ManifestRead::Read(source) => match crate::workspaces::parse_package_json(&source) {
+                Ok(manifest) => found.package_manifests.push((rel_str, manifest)),
+                Err(reason) => found
+                    .refusals
+                    .push((rel_str, DiscoverySkipReason::Unreadable { reason })),
+            },
             ManifestRead::Absent | ManifestRead::Skipped => {}
             ManifestRead::Refused(reason) => found
                 .refusals
@@ -409,6 +437,7 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
         mut modules,
         mut rust_crates,
         mut ts_configs,
+        mut package_manifests,
         mut examined,
         mut refusals,
         fatal,
@@ -433,6 +462,14 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
     });
     ts_configs.sort();
     rust_crates.sort_by(|left, right| left.dir.cmp(&right.dir));
+    package_manifests.sort_by(|left, right| left.0.cmp(&right.0));
+    let workspaces = crate::workspaces::link_workspaces(&package_manifests);
+    refusals.extend(
+        workspaces
+            .gaps
+            .into_iter()
+            .map(|(path, reason)| (path, DiscoverySkipReason::Unreadable { reason })),
+    );
     let ts = crate::tsconfig::build_ts_projects(root, &ts_configs);
     examined.extend(ts.examined);
     refusals.extend(
@@ -447,6 +484,7 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
         examined,
         refusals,
         rust_crates,
+        ts_workspaces: workspaces.packages,
     })
 }
 

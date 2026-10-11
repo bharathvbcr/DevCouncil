@@ -20,6 +20,8 @@ mod a_bare_ruby_send_has_a_caller;
 #[cfg(feature = "parse")]
 mod a_call_blind_target_is_unavailable_not_empty;
 #[cfg(feature = "parse")]
+mod a_dotted_query_can_name_a_symbol;
+#[cfg(feature = "parse")]
 mod a_kernel_is_reached_from_its_host_by_name;
 mod a_nan_floor_is_refused;
 mod a_query_only_build_can_call_a_store_current;

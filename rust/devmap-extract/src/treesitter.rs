@@ -675,8 +675,20 @@ fn extract_treesitter_before_deadline(
                             symbol.is_exported = true;
                         }
                     }
-                    symbols
-                        .retain(|symbol| symbol.kind != SymbolKind::Variable || symbol.is_exported);
+                    // An unexported object keeps its symbol when it owns a member
+                    // symbol: the member's `parent_symbol` and its qualified name
+                    // both name it, and a parent that is no node is a containment
+                    // edge from nothing.
+                    let owners: BTreeSet<String> = symbols
+                        .iter()
+                        .filter(|symbol| symbol.kind == SymbolKind::Method)
+                        .filter_map(|symbol| symbol.parent_symbol.clone())
+                        .collect();
+                    symbols.retain(|symbol| {
+                        symbol.kind != SymbolKind::Variable
+                            || symbol.is_exported
+                            || owners.contains(&symbol.qualified_name)
+                    });
                 }
 
                 for symbol in symbols.iter().filter(|symbol| symbol.is_exported) {
@@ -687,6 +699,7 @@ fn extract_treesitter_before_deadline(
                     if !exports.iter().any(|export| {
                         export.exported_name == symbol.name
                             || (export.module_specifier.is_none()
+                                && export.exported_name != "default"
                                 && export.local_name.as_deref() == Some(symbol.name.as_str()))
                     }) {
                         exports.push(ExtractedExport {
@@ -1620,13 +1633,24 @@ fn python_import_bindings(node: Node, source: &str) -> (Vec<String>, Vec<String>
 /// module, and inventing one would bind a name the author never wrote.
 fn js_require_bindings(call: Node, source: &str) -> (Option<String>, Vec<String>, Vec<String>) {
     let unbound = (None, Vec::new(), Vec::new());
-    let Some(declarator) = call
+    // `const m = await import('./x')` binds the same handle `require` does; the
+    // `await` (and any parentheses) is how the promise becomes the module.
+    let mut value = call;
+    while let Some(parent) = value.parent().filter(|parent| {
+        matches!(
+            parent.kind(),
+            "await_expression" | "parenthesized_expression"
+        )
+    }) {
+        value = parent;
+    }
+    let Some(declarator) = value
         .parent()
         .filter(|parent| parent.kind() == "variable_declarator")
         .filter(|parent| {
             parent
                 .child_by_field_name("value")
-                .is_some_and(|value| value.id() == call.id())
+                .is_some_and(|bound| bound.id() == value.id())
         })
     else {
         return unbound;
@@ -1685,6 +1709,57 @@ fn js_require_bindings(call: Node, source: &str) -> (Option<String>, Vec<String>
             (None, names, locals)
         }
         _ => unbound,
+    }
+}
+
+/// The names a dynamic `import(...)` binds.
+///
+/// Two shapes bind something: `const m = await import('./x')` (the module
+/// handle, exactly as `require` binds it) and `const Page = lazy(() =>
+/// import('./Page'))` or `React.lazy(...)`, which binds `Page` to the module's
+/// **default** export — `lazy` demands one. A `.then(m => ({ default: m.X }))`
+/// thunk is not matched: which member becomes the component is the author's
+/// expression, not a name.
+fn js_dynamic_import_bindings(
+    call: Node,
+    source: &str,
+) -> (Option<String>, Vec<String>, Vec<String>) {
+    let bound = js_require_bindings(call, source);
+    if !bound.1.is_empty() {
+        return bound;
+    }
+    let lazy_binding = || -> Option<String> {
+        let thunk = call
+            .parent()
+            .filter(|parent| parent.kind() == "arrow_function")?;
+        if thunk
+            .child_by_field_name("body")
+            .is_none_or(|body| body.id() != call.id())
+        {
+            return None;
+        }
+        let arguments = thunk
+            .parent()
+            .filter(|parent| parent.kind() == "arguments")?;
+        let wrapper = arguments
+            .parent()
+            .filter(|parent| parent.kind() == "call_expression")?;
+        let callee = wrapper.child_by_field_name("function")?;
+        if !matches!(
+            get_node_text(callee, source).as_str(),
+            "lazy" | "React.lazy"
+        ) {
+            return None;
+        }
+        let declarator = wrapper
+            .parent()
+            .filter(|parent| parent.kind() == "variable_declarator")?;
+        let name = declarator.child_by_field_name("name")?;
+        (name.kind() == "identifier").then(|| get_node_text(name, source))
+    };
+    match lazy_binding() {
+        Some(local) => (None, vec!["default".to_string()], vec![local]),
+        None => bound,
     }
 }
 
@@ -2255,6 +2330,59 @@ fn js_binding_clause(node: Node<'_>) -> Option<Node<'_>> {
     None
 }
 
+/// The local name a default import binds beside braced ones:
+/// `Card` in `import Card, { memo } from './x'`. The grammar puts the default
+/// as the first identifier of the `import_clause`.
+fn js_default_import_local(node: Node<'_>, source: &str) -> Option<String> {
+    let mut cursor = node.walk();
+    let clause = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "import_clause")?;
+    let mut inner = clause.walk();
+    let first = clause.named_children(&mut inner).next()?;
+    (first.kind() == "identifier").then(|| get_node_text(first, source))
+}
+
+/// The local binding an `export default …` statement publishes, when the
+/// statement names one: `export default function App() {}`,
+/// `export default Card;`, `export default memo(Card);`.
+///
+/// A component wrapper ([`JS_FUNCTION_WRAPPERS`]) returns the component it was
+/// given, so the default export is the wrapped identifier. Any other call
+/// (`connect(mapState)(Card)`, `withRouter(Card)`) is not looked through — what
+/// it returns is its own business — and neither is an anonymous function,
+/// class or object.
+fn js_default_export_local(statement: Node<'_>, source: &str) -> Option<String> {
+    if statement.kind() != "export_statement" {
+        return None;
+    }
+    let mut cursor = statement.walk();
+    let is_default = statement
+        .children(&mut cursor)
+        .any(|child| child.kind() == "default");
+    if !is_default {
+        return None;
+    }
+    if let Some(declaration) = statement.child_by_field_name("declaration") {
+        return get_child_text(declaration, "name", source).filter(|name| !name.is_empty());
+    }
+    let mut value = statement.child_by_field_name("value")?;
+    for _ in 0..=JS_WRAPPER_NESTING {
+        match value.kind() {
+            "identifier" => return Some(get_node_text(value, source)),
+            "call_expression" => {
+                let callee = value.child_by_field_name("function")?;
+                if !JS_FUNCTION_WRAPPERS.contains(&get_node_text(callee, source).as_str()) {
+                    return None;
+                }
+                value = value.child_by_field_name("arguments")?.named_child(0)?;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 fn find_string_child(node: Node, source: &str) -> Option<String> {
     if let Some(s) = node.child_by_field_name("source") {
         return Some(
@@ -2334,6 +2462,14 @@ pub(crate) fn enclosing_callable_qualified(
                 base = Some(format!("{file_symbol_name}::{type_name}.{name}"));
                 break;
             }
+            // A member of a module-level object literal is qualified by the
+            // object, as a class member is by its class.
+            if let Some(object) = js_object_member_owner(parent) {
+                if let Some(object_name) = get_child_text(object, "name", source) {
+                    base = Some(format!("{file_symbol_name}::{object_name}.{name}"));
+                    break;
+                }
+            }
             names.push(name);
             // This is the starting node the former recursive scope lookup
             // would receive, including its Python-default evaluation rules.
@@ -2405,6 +2541,12 @@ fn callable_binding_name(node: Node, source: &str) -> Option<String> {
     if parent.kind() == "variable_declarator" {
         return get_child_text(parent, "name", source);
     }
+    // `handle = () => …` in a class body, and `remove: () => …` in an object
+    // literal bound to a module-level `const`: the member is the binding, and
+    // the symbol emitter names it the same way.
+    if let Some(member) = js_function_valued_member(node, source) {
+        return Some(member);
+    }
     // `const save = useCallback(() => { … }, [deps])`: the binding *is* the
     // function, reached through a wrapper that returns something calling it.
     // Named by the declarator, exactly as the symbol emitter names it.
@@ -2442,6 +2584,106 @@ const JS_FUNCTION_WRAPPERS: &[&str] = &[
 
 /// How many wrappers deep `memo(forwardRef(() => …))` is followed.
 const JS_WRAPPER_NESTING: usize = 3;
+
+/// The member name a function-valued class field or object-literal pair gives
+/// its function: `handle` for `handle = () => …`, `remove` for
+/// `remove: () => …`. `None` when `function` is neither.
+///
+/// A pair counts only when its object is a module-level `const`'s value
+/// ([`js_object_member_owner`]); the same object passed as an argument names no
+/// binding a call could be attributed to.
+fn js_function_valued_member(function: Node, source: &str) -> Option<String> {
+    if !matches!(function.kind(), "arrow_function" | "function_expression") {
+        return None;
+    }
+    let parent = bounded_parent(function)?;
+    match parent.kind() {
+        "public_field_definition" | "field_definition" => {
+            let value = parent.child_by_field_name("value")?;
+            if value.id() != function.id() {
+                return None;
+            }
+            js_field_name(parent, source)
+        }
+        "pair" => {
+            js_object_member_owner(function)?;
+            js_pair_key(parent, source)
+        }
+        _ => None,
+    }
+}
+
+/// The name a class field declares. TypeScript calls the field `name`,
+/// JavaScript `property`; a computed or string-keyed field names nothing a call
+/// could write, so it is left out.
+fn js_field_name(field: Node, source: &str) -> Option<String> {
+    let name = field
+        .child_by_field_name("name")
+        .or_else(|| field.child_by_field_name("property"))?;
+    matches!(
+        name.kind(),
+        "property_identifier" | "private_property_identifier"
+    )
+    .then(|| get_node_text(name, source))
+}
+
+/// The identifier key of an object-literal pair.
+fn js_pair_key(pair: Node, source: &str) -> Option<String> {
+    let key = pair.child_by_field_name("key")?;
+    matches!(key.kind(), "property_identifier" | "identifier").then(|| get_node_text(key, source))
+}
+
+/// The module-level `variable_declarator` an object-literal member belongs to,
+/// when `node` is a member of the object that declarator initialises:
+/// `method() {}` (a `method_definition`) or the function of `name: () => {}`.
+/// The initializer may be wrapped in `as const`, `satisfies T` or parentheses.
+///
+/// Such a member is addressed as `owner.member` — `paperService.fetchOne()` —
+/// so it is a symbol qualified by the object, exactly as a method is qualified
+/// by its class. A member of an object that is returned, passed or nested is
+/// not: nothing names the object, and the factory case already owns its own
+/// shape ([`js_returned_object_method`]).
+fn js_object_member_owner(node: Node) -> Option<Node> {
+    let object = match node.kind() {
+        "method_definition" => bounded_parent(node)?,
+        "arrow_function" | "function_expression" => {
+            let pair = bounded_parent(node)?;
+            if pair.kind() != "pair"
+                || pair
+                    .child_by_field_name("value")
+                    .is_none_or(|value| value.id() != node.id())
+            {
+                return None;
+            }
+            bounded_parent(pair)?
+        }
+        _ => return None,
+    };
+    if object.kind() != "object" {
+        return None;
+    }
+    let mut child = object;
+    let mut parent = bounded_parent(object)?;
+    while matches!(
+        parent.kind(),
+        "as_expression"
+            | "satisfies_expression"
+            | "parenthesized_expression"
+            | "non_null_expression"
+    ) {
+        child = parent;
+        parent = bounded_parent(parent)?;
+    }
+    (parent.kind() == "variable_declarator"
+        && parent
+            .child_by_field_name("value")
+            .is_some_and(|value| value.id() == child.id())
+        && parent
+            .child_by_field_name("name")
+            .is_some_and(|name| name.kind() == "identifier")
+        && is_module_level(parent))
+    .then_some(parent)
+}
 
 /// The function a wrapper call binds, when `value` is one: the first argument
 /// of a [`JS_FUNCTION_WRAPPERS`] call, through at most [`JS_WRAPPER_NESTING`]
@@ -3937,13 +4179,21 @@ fn extract_node(
                     let enclosing_type = (kind == "method_definition")
                         .then(|| enclosing_type_name(node, source))
                         .flatten();
+                    // `const svc = { fetch() {} }`: the method is `svc.fetch`.
+                    let object_owner = (kind == "method_definition" && enclosing_type.is_none())
+                        .then(|| js_object_member_owner(node))
+                        .flatten()
+                        .and_then(|declarator| get_child_text(declarator, "name", source))
+                        .map(|object| format!("{}::{}", file_symbol_name, object));
                     let parent_symbol = enclosing_type
                         .as_ref()
                         .map(|type_name| format!("{}::{}", file_symbol_name, type_name))
+                        .or_else(|| object_owner.clone())
                         .or_else(|| enclosing_callable_qualified(node, source, file_symbol_name))
                         .unwrap_or_else(|| file_symbol_name.to_string());
                     let qualified_name = enclosing_type
                         .map(|type_name| format!("{}::{}.{}", file_symbol_name, type_name, n))
+                        .or_else(|| object_owner.map(|object| format!("{object}.{n}")))
                         .unwrap_or_else(|| {
                             scoped_qualified_name(node, source, file_symbol_name, &n)
                         });
@@ -3986,6 +4236,43 @@ fn extract_node(
                         declaration_hash: None,
                         return_type: None,
                     });
+                }
+            }
+            // `handle = () => this.get(k)` in a class body and `remove: () => …`
+            // in an object literal bound to a module-level `const`: a function
+            // stored in a member is a method of its owner, and a call written
+            // `owner.handle()` names it. Without the symbol the arrow's own calls
+            // were attributed to the file and its callers had nothing to reach.
+            "public_field_definition" | "field_definition" | "pair" => {
+                let value = node.child_by_field_name("value");
+                let function = value.filter(|value| {
+                    matches!(value.kind(), "arrow_function" | "function_expression")
+                });
+                if let Some(function) = function {
+                    let member = js_function_valued_member(function, source);
+                    let owner = if kind == "pair" {
+                        js_object_member_owner(function)
+                            .and_then(|declarator| get_child_text(declarator, "name", source))
+                            .map(|object| format!("{}::{}", file_symbol_name, object))
+                    } else {
+                        enclosing_type_name(node, source)
+                            .map(|type_name| format!("{}::{}", file_symbol_name, type_name))
+                    };
+                    if let (Some(name), Some(owner)) = (member, owner) {
+                        symbols.push(ExtractedSymbol {
+                            qualified_name: format!("{owner}.{name}"),
+                            name,
+                            kind: SymbolKind::Method,
+                            span,
+                            is_exported: js_symbol_is_exported(node, source),
+                            docstring: None,
+                            signature: None,
+                            parent_symbol: Some(owner),
+                            body_signature: None,
+                            declaration_hash: None,
+                            return_type: None,
+                        });
+                    }
                 }
             }
             "variable_declarator" => {
@@ -4114,6 +4401,19 @@ fn extract_node(
                 }
             }
             "import_statement" | "export_statement" => {
+                if let Some(local) = js_default_export_local(node, source) {
+                    // `export default Card` / `export default memo(Card)`: the
+                    // module's default export *is* that local binding. Recorded
+                    // under the name `default`, which is the name an importer's
+                    // `import X from` and a barrel's `export { default } from`
+                    // ask for.
+                    exports.push(ExtractedExport {
+                        exported_name: "default".to_string(),
+                        local_name: Some(local),
+                        module_specifier: None,
+                        span: span.clone(),
+                    });
+                }
                 let text = get_node_text(node, source);
                 let mut alias = None;
                 let mut imported_names = vec![];
@@ -4143,6 +4443,14 @@ fn extract_node(
                     let (names, locals) = js_clause_bindings(clause, source);
                     imported_names = names;
                     local_names = locals;
+                    // `import Card, { memo } from './x'` binds the module's
+                    // default export beside its named ones. The braces were all
+                    // this branch read, so the default's local name was lost and
+                    // every use of it named a binding nothing declared.
+                    if let Some(default_local) = js_default_import_local(node, source) {
+                        imported_names.push("default".to_string());
+                        local_names.push(default_local);
+                    }
                     if text.trim_start().starts_with("export") {
                         for (local, exported) in imported_names.iter().zip(local_names.iter()) {
                             exports.push(ExtractedExport {
@@ -4247,7 +4555,7 @@ fn extract_node(
                                             if callee == "require" {
                                                 js_require_bindings(node, source)
                                             } else {
-                                                (None, vec![], vec![])
+                                                js_dynamic_import_bindings(node, source)
                                             };
                                         imports.push(ExtractedImport {
                                             raw_import: get_node_text(node, source),
@@ -9099,7 +9407,7 @@ fn module_binding_is_symbol(node: Node, source: &str) -> bool {
             "variable_declarator" => {
                 return is_field_child(parent, "name", current)
                     && is_module_level(parent)
-                    && js_symbol_is_exported(parent, source);
+                    && (js_symbol_is_exported(parent, source) || js_owns_member_symbols(parent));
             }
             "const_spec" | "var_spec" => {
                 let mut cursor = parent.walk();
@@ -9214,6 +9522,7 @@ fn collect_non_symbol_locals(scope: Node, source: &str) -> HashSet<String> {
                 | "shorthand_property_identifier"
                 | "shorthand_property_identifier_pattern"
         ) && is_defining_name(node)
+            && !js_names_a_loaded_module(node, source)
         {
             let name = get_node_text(node, source);
             if is_user_ident(&name) {
@@ -9228,6 +9537,86 @@ fn collect_non_symbol_locals(scope: Node, source: &str) -> HashSet<String> {
     }
     locals.retain(|name| !module_bindings.contains(name));
     locals
+}
+
+/// Whether a module-level declarator's value is an object literal with a
+/// function-valued member, which makes the declarator the owner of those member
+/// symbols ([`js_object_member_owner`]) and therefore a symbol itself even when
+/// it is not exported: `const core = { log() {} }; export const l = { ...core }`.
+fn js_owns_member_symbols(declarator: Node) -> bool {
+    let Some(mut value) = declarator.child_by_field_name("value") else {
+        return false;
+    };
+    while matches!(
+        value.kind(),
+        "as_expression"
+            | "satisfies_expression"
+            | "parenthesized_expression"
+            | "non_null_expression"
+    ) {
+        let Some(inner) = value.named_child(0) else {
+            return false;
+        };
+        value = inner;
+    }
+    if value.kind() != "object" || !is_module_level(declarator) {
+        return false;
+    }
+    let mut cursor = value.walk();
+    let found = value.named_children(&mut cursor).any(|member| {
+        member.kind() == "method_definition"
+            || (member.kind() == "pair"
+                && member
+                    .child_by_field_name("value")
+                    .is_some_and(|function| js_object_member_owner(function).is_some()))
+    });
+    found
+}
+
+/// Whether `name` is bound by a declarator whose value is a module load —
+/// `const m = await import('./x')`, `const { a } = require('./y')`.
+///
+/// Such a name is an *import binding*, recorded as one in the file's imports;
+/// counting it as a local variable as well made every `m.f()` through it "a
+/// call on a local whose value is unknown", and the import rung never saw it.
+fn js_names_a_loaded_module(name: Node, source: &str) -> bool {
+    let mut pattern = name;
+    while let Some(parent) = pattern.parent() {
+        if !matches!(
+            parent.kind(),
+            "object_pattern" | "pair_pattern" | "object_assignment_pattern"
+        ) {
+            break;
+        }
+        pattern = parent;
+    }
+    let Some(declarator) = pattern
+        .parent()
+        .filter(|parent| parent.kind() == "variable_declarator")
+        .filter(|parent| {
+            parent
+                .child_by_field_name("name")
+                .is_some_and(|bound| bound.id() == pattern.id())
+        })
+    else {
+        return false;
+    };
+    let Some(mut value) = declarator.child_by_field_name("value") else {
+        return false;
+    };
+    while matches!(
+        value.kind(),
+        "await_expression" | "parenthesized_expression"
+    ) {
+        let Some(inner) = value.named_child(0) else {
+            return false;
+        };
+        value = inner;
+    }
+    value.kind() == "call_expression"
+        && value.child_by_field_name("function").is_some_and(|callee| {
+            matches!(get_node_text(callee, source).as_str(), "import" | "require")
+        })
 }
 
 /// Run `visit` over one scope's local-name set, computing it once per scope.
@@ -9493,7 +9882,74 @@ fn collect_site_bindings(
             ancestor = bounded_parent(scope);
         }
     }
+    if matches!(lang, "javascript" | "typescript" | "tsx") {
+        for call in calls {
+            let on_this = call
+                .receiver_expr
+                .as_deref()
+                .is_some_and(|receiver| receiver == "this" || receiver.starts_with("this."));
+            if !on_this {
+                continue;
+            }
+            let Some(node) =
+                root.descendant_for_byte_range(call.span.start_byte, call.span.end_byte)
+            else {
+                continue;
+            };
+            if let Some(class) = js_lexical_this_class(node, source) {
+                sites.insert(LocalBinding {
+                    start_byte: call.span.start_byte,
+                    name: "this".to_string(),
+                    scope: call.caller_symbol.clone(),
+                    declared_type: Some(class),
+                    initializer: None,
+                });
+            }
+        }
+    }
     sites.into_iter().collect()
+}
+
+/// The class `this` denotes at `node` when it is *lexical*: written inside a
+/// named arrow nested in a method or in a class field's initializer, where the
+/// arrow's own caller symbol (`Gateway.open.connect`) is not a member of the
+/// class and the enclosing-type rung cannot see the class in it.
+///
+/// An arrow has no `this` of its own, so the walk passes through arrows and
+/// stops at the first thing that does: a method or field names the class; a
+/// `function`, generator or nested class means `this` is something else, and
+/// nothing is claimed. A call whose nearest named callable is the member itself
+/// is the enclosing-type rung's, and is left to it, because that rung also
+/// knows an indexed subtype may override the method.
+fn js_lexical_this_class(node: Node, source: &str) -> Option<String> {
+    let mut through_named_arrow = false;
+    let mut ancestor = bounded_parent(node);
+    while let Some(parent) = ancestor {
+        match parent.kind() {
+            "arrow_function" => {
+                if callable_binding_name(parent, source).is_some()
+                    && js_function_valued_member(parent, source).is_none()
+                {
+                    through_named_arrow = true;
+                }
+            }
+            "method_definition" | "public_field_definition" | "field_definition" => {
+                return through_named_arrow
+                    .then(|| enclosing_type_name(parent, source))
+                    .flatten();
+            }
+            "function_declaration"
+            | "generator_function_declaration"
+            | "function_expression"
+            | "generator_function"
+            | "class_declaration"
+            | "abstract_class_declaration"
+            | "class" => return None,
+            _ => {}
+        }
+        ancestor = bounded_parent(parent);
+    }
+    None
 }
 
 /// Type refs with `assigned_to`, keyed by `(enclosing_symbol, binding name)`.
@@ -12022,7 +12478,9 @@ mod tests {
                     // endpoint no resolver can ever bind. It still appears in
                     // the export set below, which is where it belongs.
                 ],
-                vec!["d", "f.ts", "val", "x"],
+                // `default` is the name `export default function d` is
+                // published under, beside `d` itself.
+                vec!["d", "default", "f.ts", "val", "x"],
             ),
             (
                 "f.go",

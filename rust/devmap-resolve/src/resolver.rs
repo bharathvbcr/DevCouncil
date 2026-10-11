@@ -320,6 +320,10 @@ pub struct Resolver {
     /// `<file>::<exported name>` -> the file that declares it, for
     /// `export { x } from './m'`. See `compute_reexport_chains`.
     reexport_chains: BTreeMap<String, String>,
+    /// `<file>` -> the local binding its `export default` publishes. What an
+    /// importer's `import X from` and a barrel's `export { default } from` ask
+    /// for by the name `default`; see `default_binding`.
+    default_exports: BTreeMap<String, String>,
     receiver_types: BTreeMap<String, String>, // (file_path:var_name) -> ClassType
     /// (file_path:enclosing_symbol:var_name) -> ClassType.
     ///
@@ -488,8 +492,10 @@ pub struct Resolver {
     /// TypeScript / JavaScript project configs, deepest directory first: the
     /// `paths` / `baseUrl` mapping a non-relative specifier resolves through.
     ts_projects: Vec<TsProject>,
-    /// The `go_modules_fresh` contract, for `ts_projects`.
+    /// The `go_modules_fresh` contract, for `ts_projects` and `ts_workspaces`.
     ts_projects_fresh: bool,
+    /// Workspace packages by the name an importer spells them, sorted by name.
+    ts_workspaces: Vec<devmap_extract::workspaces::WorkspacePackage>,
     /// file_path → Go package identifier (`pkg` in `package pkg`).
     go_package_by_file: BTreeMap<String, String>,
     /// X45. `(directory, package clause, bare name)` → the **package-level**
@@ -606,6 +612,7 @@ impl Resolver {
             rust_manifest_crates: Vec::new(),
             rust_signatures: BTreeMap::new(),
             reexport_chains: BTreeMap::new(),
+            default_exports: BTreeMap::new(),
             receiver_types: BTreeMap::new(),
             scoped_receiver_types: BTreeMap::new(),
             poisoned_receiver_keys: BTreeSet::new(),
@@ -629,6 +636,7 @@ impl Resolver {
             go_modules_fresh: false,
             ts_projects: Vec::new(),
             ts_projects_fresh: false,
+            ts_workspaces: Vec::new(),
             go_package_by_file: BTreeMap::new(),
             go_package_symbols: BTreeMap::new(),
             go_package_methods: BTreeMap::new(),
@@ -1146,6 +1154,7 @@ impl Resolver {
                 .then_with(|| left.dir.cmp(&right.dir))
         });
         self.ts_projects = projects;
+        self.ts_workspaces = manifests.ts_workspaces.clone();
         self.ts_projects_fresh = true;
     }
 
@@ -1234,6 +1243,27 @@ impl Resolver {
         ]
     }
 
+    /// The TypeScript sources a NodeNext/Node16 specifier ending in a JavaScript
+    /// extension can mean: `./a.js` is `a.ts` or `a.tsx`, `./a.jsx` is `a.tsx`,
+    /// `./a.mjs` is `a.mts`, `./a.cjs` is `a.cts`. Empty for any other ending.
+    fn nodenext_source_siblings(base: &str) -> Vec<String> {
+        let (stem, extensions): (&str, &[&str]) = if let Some(stem) = base.strip_suffix(".js") {
+            (stem, &[".ts", ".tsx"])
+        } else if let Some(stem) = base.strip_suffix(".jsx") {
+            (stem, &[".tsx"])
+        } else if let Some(stem) = base.strip_suffix(".mjs") {
+            (stem, &[".mts"])
+        } else if let Some(stem) = base.strip_suffix(".cjs") {
+            (stem, &[".cts"])
+        } else {
+            return Vec::new();
+        };
+        extensions
+            .iter()
+            .map(|extension| format!("{stem}{extension}"))
+            .collect()
+    }
+
     /// A non-relative JS/TS specifier resolved through the governing config:
     /// its `paths` first, then each mapping's `baseUrl`.
     fn resolve_ts_mapped(&self, file: &str, specifier: &str) -> Option<String> {
@@ -1261,14 +1291,82 @@ impl Resolver {
         })
     }
 
-    /// Whether a JS/TS specifier is a `paths` pattern into this tree: a miss
-    /// through one is an index gap, not an outside module.
+    /// Whether a JS/TS specifier is a `paths` pattern or a workspace package
+    /// into this tree: a miss through one is an index gap, not an outside
+    /// module.
     fn specifier_is_ts_mapped(&self, file: &str, lang: &str, specifier: &str) -> bool {
+        let specifier = specifier.trim_matches(|c| c == '\'' || c == '"');
         LangFamily::from_lang(lang) == LangFamily::JsTs
             && !specifier.starts_with('.')
-            && !self
-                .ts_paths_bases(file, specifier.trim_matches(|c| c == '\'' || c == '"'))
-                .is_empty()
+            && (!self.ts_paths_bases(file, specifier).is_empty()
+                || self.workspace_package_for(specifier).is_some())
+    }
+
+    /// The workspace package a bare specifier names, and the subpath written
+    /// after the name: `@acme/shared/utils` is `@acme/shared` + `utils`.
+    /// The longest name wins, so a package `@acme/shared-ui` is not mistaken
+    /// for `@acme/shared` plus a subpath.
+    fn workspace_package_for<'a>(
+        &'a self,
+        specifier: &'a str,
+    ) -> Option<(&'a devmap_extract::workspaces::WorkspacePackage, &'a str)> {
+        self.ts_workspaces
+            .iter()
+            .filter_map(|package| {
+                let rest = specifier.strip_prefix(package.name.as_str())?;
+                (rest.is_empty() || rest.starts_with('/'))
+                    .then(|| (package, rest.trim_start_matches('/')))
+            })
+            .max_by_key(|(package, _)| package.name.len())
+    }
+
+    /// The indexed file a workspace package specifier names.
+    ///
+    /// The package root asks the manifest's own entries first (`types`, `module`,
+    /// `main`, `exports["."]`), then the conventional source entries — a
+    /// `main` of `dist/index.js` is the build output of `src/index.ts`, and
+    /// the tree holds the source. A subpath is tried under the package
+    /// directory and under its `src/`.
+    fn resolve_workspace_package(&self, specifier: &str) -> Option<String> {
+        let (package, subpath) = self.workspace_package_for(specifier)?;
+        let join = |relative: &str| {
+            let relative = relative.trim_start_matches("./");
+            if package.dir.is_empty() {
+                Self::normalize_rel("", relative)
+            } else {
+                Self::normalize_rel(&package.dir, relative)
+            }
+        };
+        let mut bases: Vec<String> = Vec::new();
+        if subpath.is_empty() {
+            bases.extend(package.entries.iter().filter_map(|entry| join(entry)));
+            bases.extend(
+                ["src/index", "index"]
+                    .iter()
+                    .filter_map(|entry| join(entry)),
+            );
+        } else {
+            bases.extend(
+                [subpath.to_string(), format!("src/{subpath}")]
+                    .iter()
+                    .filter_map(|entry| join(entry)),
+            );
+        }
+        for base in bases {
+            if let Some(found) = Self::nodenext_source_siblings(&base)
+                .into_iter()
+                .find(|candidate| self.file_symbols.contains_key(candidate))
+            {
+                return Some(found);
+            }
+            if let Some(found) = Self::js_module_candidates(&base)
+                .into_iter()
+                .find(|candidate| self.file_symbols.contains_key(candidate))
+            {
+                return Some(found);
+            }
+        }
+        None
     }
 
     /// Resolve a (file, bare name) pair to its graph identity, falling back to
@@ -2590,6 +2688,7 @@ impl Resolver {
         self.rust_crate_roots.clear();
         self.rust_signatures.clear();
         self.reexport_chains.clear();
+        self.default_exports.clear();
         self.receiver_types.clear();
         self.scoped_receiver_types.clear();
         self.poisoned_receiver_keys.clear();
@@ -2659,6 +2758,7 @@ impl Resolver {
         }
         if !std::mem::take(&mut self.ts_projects_fresh) {
             self.ts_projects.clear();
+            self.ts_workspaces.clear();
         }
 
         // Pass one establishes the complete file/symbol universe. Import
@@ -2949,6 +3049,19 @@ impl Resolver {
         // Between the passes, and necessarily so: following a barrel needs the
         // complete symbol universe pass one builds, and pass two's import
         // bindings need the chains.
+        self.default_exports = extractions
+            .iter()
+            .filter_map(|ext| {
+                ext.exports
+                    .iter()
+                    .find(|export| {
+                        export.exported_name == "default" && export.module_specifier.is_none()
+                    })
+                    .and_then(|export| export.local_name.clone())
+                    .filter(|local| !local.is_empty() && local != "default")
+                    .map(|local| (ext.file_path.clone(), local))
+            })
+            .collect();
         self.reexport_chains = self.compute_reexport_chains(extractions);
 
         // Pass two resolves aliases and receiver hints against the complete
@@ -3088,10 +3201,23 @@ impl Resolver {
                         // The `__init__` binding still wins when it really does
                         // declare the name, which is what a re-exporting
                         // package means and the order Python itself uses.
-                        let declares_name = direct
-                            .as_deref()
-                            .and_then(|file| self.file_symbols.get(file))
-                            .is_some_and(|symbols| symbols.iter().any(|symbol| symbol == name));
+                        // `import { default as X }` and the default a mixed
+                        // `import X, { y }` carries ask the module for the name
+                        // `default`, which no symbol has: the module's own
+                        // `export default <local>` says which one it is.
+                        let default_local = (name == "default")
+                            .then(|| {
+                                direct
+                                    .as_deref()
+                                    .and_then(|file| self.default_exports.get(file))
+                            })
+                            .flatten();
+                        let name = default_local.unwrap_or(name);
+                        let declares_name = default_local.is_some()
+                            || direct
+                                .as_deref()
+                                .and_then(|file| self.file_symbols.get(file))
+                                .is_some_and(|symbols| symbols.iter().any(|symbol| symbol == name));
                         // The barrel's own statement, used before the
                         // fallbacks. `export { thing } from './impl'` says
                         // where `thing` comes from; without consulting it the
@@ -3270,7 +3396,15 @@ impl Resolver {
                     let local = alias.map(str::to_string).unwrap_or_else(|| {
                         Self::import_local_name(&ext.language, &imp.module_specifier)
                     });
-                    file_bindings.insert(local.clone(), (target_f, local));
+                    // A JS/TS `import X from './m'` binds whatever `./m`
+                    // publishes as its default, under whatever name `./m` gave
+                    // it — not a symbol called `X`.
+                    let binding = if LangFamily::from_lang(&ext.language) == LangFamily::JsTs {
+                        self.default_binding(&target_f, &local)
+                    } else {
+                        (target_f, local.clone())
+                    };
+                    file_bindings.insert(local, binding);
                 }
             }
             if !file_external.is_empty() {
@@ -3684,6 +3818,100 @@ impl Resolver {
         }
     }
 
+    /// Whether `name` is bound in `file` by an import whose module is **not in
+    /// this tree**: a package (`import { formatTitle } from 'some-npm-lib'`) or
+    /// a relative specifier that names no indexed file.
+    ///
+    /// The file states where the name comes from, so a repository declaration
+    /// that merely shares the spelling is no evidence about it. Letting the
+    /// global tier answer anyway bound an npm import to a local namesake at 0.9
+    /// confidence — 658 of 1,042 JS/TS global-tier edges on the audit corpus
+    /// were of exactly this shape, and none of the 16 sampled was right. The
+    /// site is left to `classify_unresolved`, which files it `external` or
+    /// `unresolved` by the same two tables.
+    ///
+    /// JS/TS only: its import statement is the one place the module a bare name
+    /// comes from is written, and the rule is not claimed for the other
+    /// families here.
+    fn is_bound_by_non_local_import(&self, file: &str, family: LangFamily, name: &str) -> bool {
+        family == LangFamily::JsTs
+            && (self
+                .external_imports
+                .get(file)
+                .is_some_and(|imports| imports.contains_key(name))
+                || self
+                    .unindexed_local_imports
+                    .get(file)
+                    .is_some_and(|imports| imports.contains_key(name)))
+    }
+
+    /// The `(file, declared name)` a default import of `target` binds.
+    ///
+    /// The module's own `export default <local>` when it has one; else the
+    /// barrel's `export { default } from` / `export { default as X } from`
+    /// chain to the file that declares it; else the importer's own spelling,
+    /// which is right whenever the default export is named after its binding
+    /// and is what this answered before default exports were recorded.
+    fn default_binding(&self, target: &str, local: &str) -> (String, String) {
+        if let Some(declared) = self.default_exports.get(target) {
+            return (target.to_string(), declared.clone());
+        }
+        if let Some((file, declared)) = self
+            .reexport_chains
+            .get(&format!("{target}::default"))
+            .and_then(|terminal| terminal.rsplit_once("::"))
+        {
+            return (file.to_string(), declared.to_string());
+        }
+        (target.to_string(), local.to_string())
+    }
+
+    /// One hop for each JS/TS local export that publishes an imported binding:
+    /// `import { x } from './m'; export { x };` and `import X from './m';
+    /// export { X };`. The export names the importing file's own binding and
+    /// the import says where it came from, which is all a barrel's
+    /// `export { x } from './m'` states in one statement.
+    fn js_import_reexport_hops(
+        &self,
+        ext: &Extraction,
+        hops: &mut BTreeMap<String, (String, String)>,
+    ) {
+        for export in &ext.exports {
+            if export.module_specifier.is_some() || export.exported_name.is_empty() {
+                continue;
+            }
+            let Some(local) = export
+                .local_name
+                .as_deref()
+                .filter(|local| !local.is_empty() && *local != "default")
+            else {
+                continue;
+            };
+            for imp in &ext.imports {
+                let imported = if imp.imported_names.is_empty() {
+                    // A default import: `import X from './m'`.
+                    (imp.alias.as_deref() == Some(local)).then(|| "default".to_string())
+                } else {
+                    imp.imported_names
+                        .iter()
+                        .zip(&imp.local_names)
+                        .find(|(_, bound)| bound.as_str() == local)
+                        .map(|(name, _)| name.clone())
+                };
+                let Some(imported) = imported.filter(|name| name != "*") else {
+                    continue;
+                };
+                if let Some(target) =
+                    self.resolve_import_path(&ext.file_path, &ext.language, &imp.module_specifier)
+                {
+                    hops.entry(format!("{}::{}", ext.file_path, export.exported_name))
+                        .or_insert((target, imported));
+                    break;
+                }
+            }
+        }
+    }
+
     fn compute_reexport_chains(&self, extractions: &[Extraction]) -> BTreeMap<String, String> {
         // One hop per re-export, keyed by the re-exporting file's own name for
         // the symbol.
@@ -3721,6 +3949,9 @@ impl Resolver {
             if ext.language == "python" {
                 self.python_import_hops(ext, &mut hops);
             }
+            if LangFamily::from_lang(&ext.language) == LangFamily::JsTs {
+                self.js_import_reexport_hops(ext, &mut hops);
+            }
         }
 
         // A glob names a *module*, not a symbol, so the hop it states —
@@ -3749,6 +3980,13 @@ impl Resolver {
                 }
                 let Some((file, name)) = hops.get(&cursor) else {
                     break;
+                };
+                // A hop asking for `default` asks for what the file's own
+                // `export default` publishes.
+                let name = if name == "default" {
+                    self.default_exports.get(file).unwrap_or(name)
+                } else {
+                    name
                 };
                 let next = format!("{file}::{name}");
                 // The file this hop names declares the symbol itself, so the
@@ -4626,7 +4864,14 @@ impl Resolver {
 
                     // Bare global names share one immutable set per visibility
                     // scope. Receiver and earlier proven rungs stay unchanged.
-                    if resolution.is_none() && call.receiver_expr.is_none() {
+                    if resolution.is_none()
+                        && call.receiver_expr.is_none()
+                        && !self.is_bound_by_non_local_import(
+                            &ext.file_path,
+                            family,
+                            &call.callee_name,
+                        )
+                    {
                         let candidates = match local_candidates.get(call.callee_name.as_str()) {
                             Some(candidates) => Arc::clone(candidates),
                             None => {
@@ -7684,6 +7929,9 @@ impl Resolver {
             return None;
         }
 
+        if self.is_bound_by_non_local_import(&ext.file_path, family, name) {
+            return None;
+        }
         if let Some(hits) = self.symbol_index.get(name) {
             let family_hits: Vec<_> = hits
                 .iter()
@@ -8045,9 +8293,29 @@ impl Resolver {
         // import — the corpus was told a local file came from outside it.
         if LangFamily::from_lang(lang) == LangFamily::JsTs && clean_spec.starts_with('.') {
             let base = Self::normalize_rel(&dir, clean_spec)?;
+            // NodeNext writes the extension the *emitted* file will have:
+            // `'./arrows.js'` names `arrows.ts`. TypeScript tries the source
+            // sibling first, so for a TS importer it goes before the literal
+            // path; a JS importer names the file it wrote and only falls back.
+            let source_sibling = |this: &Self| {
+                Self::nodenext_source_siblings(&base)
+                    .into_iter()
+                    .find(|candidate| this.file_symbols.contains_key(candidate))
+            };
+            let from_ts = matches!(lang, "typescript" | "tsx");
+            if from_ts {
+                if let Some(found) = source_sibling(self) {
+                    return Some(found);
+                }
+            }
             for cand in Self::js_module_candidates(&base) {
                 if self.file_symbols.contains_key(&cand) {
                     return Some(cand);
+                }
+            }
+            if !from_ts {
+                if let Some(found) = source_sibling(self) {
+                    return Some(found);
                 }
             }
         }
@@ -8056,6 +8324,9 @@ impl Resolver {
         if LangFamily::from_lang(lang) == LangFamily::JsTs && !clean_spec.starts_with('.') {
             if let Some(mapped) = self.resolve_ts_mapped(current_file, clean_spec) {
                 return Some(mapped);
+            }
+            if let Some(package) = self.resolve_workspace_package(clean_spec) {
+                return Some(package);
             }
         }
 
@@ -9895,8 +10166,21 @@ mod reference_resolution_tests {
         let cors = express
             .unresolved
             .iter()
-            .find(|row| row.callee_name == "cors")
+            .find(|row| row.callee_name == "cors" && row.kind == UnresolvedKind::Route)
             .expect("the package middleware is recorded, not dropped");
+        // The `cors()` call itself is the package's too: it used to bind to
+        // util.js at the global tier, a confident edge to a namesake the file
+        // demonstrably does not call.
+        let call = express
+            .unresolved
+            .iter()
+            .find(|row| row.callee_name == "cors" && row.kind == UnresolvedKind::Call)
+            .expect("the call is recorded external, not bound to the namesake");
+        assert!(
+            matches!(&call.class, UnresolvedClass::External { module } if module == "cors"),
+            "{:?}",
+            call.class
+        );
         assert_eq!(cors.kind, UnresolvedKind::Route);
         assert!(
             matches!(&cors.class, UnresolvedClass::External { module } if module == "cors"),
