@@ -1017,9 +1017,9 @@ impl Store {
         // compares stored text, so a value normalised on the way in would no
         // longer match what its caller holds and every widening would report as
         // a conflict with itself.
-        if let Err(why) = json::check_array(replacement) {
+        if let Err(why) = json::check_planned_files(replacement) {
             return Err(StoreError::BadScope {
-                reason: format!("{replacement:?} is not a JSON array: {why}"),
+                reason: format!("{replacement:?} is not a list of planned files: {why}"),
             });
         }
 

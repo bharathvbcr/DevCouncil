@@ -80,10 +80,33 @@ pub fn check_container(text: &str) -> Result<(), String> {
     }
 }
 
+/// The changes a planned file may declare, the same set the Go side's
+/// `AllowedChange.Valid` accepts. An absent, null or empty value means
+/// `modify`, as it does there.
+pub const ALLOWED_CHANGES: [&str; 4] = ["create", "modify", "delete", "read_only"];
+
+/// [`check_array`], and every entry is a planned file the Go decoder accepts:
+/// a bare path string, or an object whose `allowed_change` is a string naming
+/// one of [`ALLOWED_CHANGES`].
+///
+/// The raw text is stored and handed to Go, whose decoder refuses an unknown
+/// change and so makes the whole task unreadable; refusing it at the write is
+/// the same fix as for malformed JSON. Keys are matched the way Go matches
+/// them — case-insensitively, after decoding escapes, every duplicate checked —
+/// so none of those spellings reaches the field unchecked.
+pub fn check_planned_files(text: &str) -> Result<(), String> {
+    check_scan(text, b'[', true)
+}
+
 fn check_top(text: &str, open: u8) -> Result<(), String> {
+    check_scan(text, open, false)
+}
+
+fn check_scan(text: &str, open: u8, planned: bool) -> Result<(), String> {
     let mut scanner = Scanner {
         bytes: text.as_bytes(),
         pos: 0,
+        planned,
     };
     scanner.skip_ws();
     if scanner.peek() != Some(open) {
@@ -108,6 +131,36 @@ fn check_top(text: &str, open: u8) -> Result<(), String> {
 struct Scanner<'a> {
     bytes: &'a [u8],
     pos: usize,
+    /// Also hold the entries of the top-level array to the planned-file shape.
+    planned: bool,
+}
+
+/// Decodes the escapes of a string body already proven well formed by
+/// [`Scanner::string`].
+fn unescape(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('b') => out.push('\u{8}'),
+            Some('f') => out.push('\u{c}'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('u') => {
+                let hex: String = chars.by_ref().take(4).collect();
+                let unit = u32::from_str_radix(&hex, 16).unwrap_or(0xfffd);
+                out.push(char::from_u32(unit).unwrap_or('\u{fffd}'));
+            }
+            Some(other) => out.push(other),
+            None => {}
+        }
+    }
+    out
 }
 
 impl Scanner<'_> {
@@ -155,6 +208,15 @@ impl Scanner<'_> {
             return Ok(());
         }
         loop {
+            if self.planned && depth == 0 {
+                self.skip_ws();
+                if !matches!(self.peek(), Some(b'{' | b'"')) {
+                    return Err(format!(
+                        "the entry at byte {} is neither a path string nor an object",
+                        self.pos
+                    ));
+                }
+            }
             self.value(depth + 1)?;
             self.skip_ws();
             match self.peek() {
@@ -183,10 +245,18 @@ impl Scanner<'_> {
         }
         loop {
             self.skip_ws();
+            let key_at = self.pos;
             self.string()?;
+            let key = unescape(&String::from_utf8_lossy(
+                &self.bytes[key_at + 1..self.pos - 1],
+            ));
             self.skip_ws();
             self.expect(b':')?;
-            self.value(depth + 1)?;
+            if self.planned && depth == 1 && key.eq_ignore_ascii_case("allowed_change") {
+                self.allowed_change()?;
+            } else {
+                self.value(depth + 1)?;
+            }
             self.skip_ws();
             match self.peek() {
                 Some(b',') => self.pos += 1,
@@ -202,6 +272,33 @@ impl Scanner<'_> {
                 }
                 None => return Err("the object is unterminated".to_string()),
             }
+        }
+    }
+
+    /// The value of a planned file's `allowed_change`: null or a string, and a
+    /// string must be empty or one of [`ALLOWED_CHANGES`].
+    fn allowed_change(&mut self) -> Result<(), String> {
+        self.skip_ws();
+        match self.peek() {
+            Some(b'n') => self.literal("null"),
+            Some(b'"') => {
+                let start = self.pos;
+                self.string()?;
+                let value = unescape(&String::from_utf8_lossy(
+                    &self.bytes[start + 1..self.pos - 1],
+                ));
+                if value.is_empty() || ALLOWED_CHANGES.contains(&value.as_str()) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "allowed_change {value:?} is not one of create, modify, delete, read_only"
+                    ))
+                }
+            }
+            _ => Err(format!(
+                "allowed_change at byte {} is not a string",
+                self.pos
+            )),
         }
     }
 
