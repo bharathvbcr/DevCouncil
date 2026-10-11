@@ -321,3 +321,173 @@ fn a_refused_document_stops_an_apply_before_it_writes_anything() {
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&home).ok();
 }
+
+fn servers_request(root: &Path) -> Vec<u8> {
+    serde_json::to_vec(&json!({"servers": [{
+        "name": "devcouncil",
+        "command": "/opt/devcouncil/bin/devcouncil",
+        "args": ["mcp"],
+        "env": {"DEVCOUNCIL_PROJECT_ROOT": root.to_str().unwrap()},
+    }]}))
+    .unwrap()
+}
+
+/// `integrate <host> --remove` takes back exactly the server entries an apply
+/// registered, from exactly the documents it is pointed at, and leaves every
+/// other byte of the user's documents alone. Nothing could undo an apply before.
+#[test]
+fn remove_takes_back_what_apply_registered_and_nothing_else() {
+    let root = scratch("remove");
+    let home = scratch("remove-home");
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    let user_config = "# my codex config\nmodel = \"o5\"   # trailing comment\n\n\
+                       [mcp_servers.other]\ncommand = \"x\"   # theirs\nargs = []\n";
+    std::fs::write(home.join(".codex/config.toml"), user_config).unwrap();
+    let root_arg = root.to_str().unwrap();
+    let request = servers_request(&root);
+
+    let apply = devmap(
+        &[
+            "--json",
+            "integrate",
+            "codex",
+            "--project-root",
+            root_arg,
+            "--servers-stdin",
+        ],
+        &request,
+        &home,
+    );
+    assert_eq!(apply.status, Some(0), "{}", apply.stderr);
+    let after_apply = std::fs::read_to_string(home.join(".codex/config.toml")).unwrap();
+    assert!(
+        after_apply.contains("[mcp_servers.devmap]"),
+        "{after_apply}"
+    );
+    assert!(root.join(".codex/config.toml").is_file());
+
+    let user_path = home.join(".codex/config.toml");
+    let project_path = root.join(".codex/config.toml");
+    let remove = |extra: &[&str]| {
+        let mut args = vec![
+            "--json",
+            "integrate",
+            "codex",
+            "--project-root",
+            root_arg,
+            "--servers-stdin",
+            "--remove",
+        ];
+        args.extend_from_slice(extra);
+        devmap(&args, &request, &home)
+    };
+
+    // Pointed at no document it refuses: an undo with no receipt to follow
+    // would have to guess, and it does not.
+    let none = remove(&[]);
+    assert_eq!(none.status, Some(2), "{}", none.stdout);
+    assert_eq!(std::fs::read_to_string(&user_path).unwrap(), after_apply);
+
+    // A check names what is still registered and fails.
+    let check = remove(&["--check", "--only-path", user_path.to_str().unwrap()]);
+    assert_ne!(check.status, Some(0), "{}", check.stdout);
+    assert_eq!(std::fs::read_to_string(&user_path).unwrap(), after_apply);
+
+    let removed = remove(&[
+        "--only-path",
+        user_path.to_str().unwrap(),
+        "--only-path",
+        project_path.to_str().unwrap(),
+    ]);
+    assert_eq!(removed.status, Some(0), "{}", removed.stderr);
+    let report: Value = serde_json::from_str(&removed.stdout).unwrap();
+    assert_eq!(report["check_ok"], true, "{report}");
+    assert_eq!(
+        std::fs::read_to_string(&user_path).unwrap(),
+        user_config,
+        "the user's own lines must come back byte for byte"
+    );
+    assert!(
+        !project_path.exists(),
+        "a document that held only our entry is deleted, not left empty"
+    );
+
+    // Idempotent: nothing left to remove.
+    let again = remove(&["--check", "--only-path", user_path.to_str().unwrap()]);
+    assert_eq!(again.status, Some(0), "{}\n{}", again.stdout, again.stderr);
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn remove_keeps_other_servers_and_keys_in_a_json_document() {
+    let root = scratch("remove-json");
+    let home = scratch("remove-json-home");
+    let root_arg = root.to_str().unwrap();
+    let doc = root.join(".agents/mcp_config.json");
+    std::fs::create_dir_all(doc.parent().unwrap()).unwrap();
+    let theirs =
+        json!({"mcpServers": {"other": {"command": "x", "args": ["serve"]}}, "theme": "dark"});
+    std::fs::write(&doc, serde_json::to_string_pretty(&theirs).unwrap() + "\n").unwrap();
+    let request = servers_request(&root);
+
+    let apply = devmap(
+        &[
+            "--json",
+            "integrate",
+            "antigravity",
+            "--project-root",
+            root_arg,
+            "--servers-stdin",
+        ],
+        &request,
+        &home,
+    );
+    assert_eq!(apply.status, Some(0), "{}", apply.stderr);
+    let registered: Value = serde_json::from_slice(&std::fs::read(&doc).unwrap()).unwrap();
+    assert!(
+        registered["mcpServers"].get("devcouncil").is_some(),
+        "{registered}"
+    );
+
+    let removed = devmap(
+        &[
+            "--json",
+            "integrate",
+            "antigravity",
+            "--project-root",
+            root_arg,
+            "--servers-stdin",
+            "--remove",
+            "--only-path",
+            doc.to_str().unwrap(),
+        ],
+        &request,
+        &home,
+    );
+    assert_eq!(removed.status, Some(0), "{}", removed.stderr);
+    let left: Value = serde_json::from_slice(&std::fs::read(&doc).unwrap()).unwrap();
+    assert_eq!(left, theirs, "only our entries may go");
+
+    // A document the tool will not rewrite stops the removal untouched.
+    let jsonc = "// mine\n{\"mcpServers\":{\"devmap\":{\"command\":\"d\",\"args\":[\"mcp\"]}}}\n";
+    std::fs::write(&doc, jsonc).unwrap();
+    let refused = devmap(
+        &[
+            "--json",
+            "integrate",
+            "antigravity",
+            "--project-root",
+            root_arg,
+            "--remove",
+            "--only-path",
+            doc.to_str().unwrap(),
+        ],
+        b"",
+        &home,
+    );
+    assert_ne!(refused.status, Some(0));
+    assert_eq!(std::fs::read_to_string(&doc).unwrap(), jsonc);
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&home).ok();
+}

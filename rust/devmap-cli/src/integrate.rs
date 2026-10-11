@@ -1105,13 +1105,245 @@ fn splice_toml_server(
     Ok(Some(updated))
 }
 
-/// Replace the `[<container>.<name>]` block and its subtables with `block`.
+/// What `integrate --remove` found in one host document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpRemoval {
+    pub path: PathBuf,
+    /// The server names that were registered there (and, unless this is a dry
+    /// run or a check, are now gone).
+    pub removed: Vec<String>,
+    /// The document held nothing but our entries and was deleted.
+    pub deleted: bool,
+    pub note: String,
+}
+
+/// Take `names` back out of the host documents named in `only`.
 ///
-/// `None` when the header is not found exactly once. The caller re-parses the
-/// result, so a layout this misreads is refused rather than written.
-fn replace_toml_table(text: &str, container: &str, name: &str, block: &str) -> Option<String> {
+/// This is the undo of [`integrate`]'s server registrations, and it is bounded
+/// the way an undo must be: only documents the caller lists (the receipt of the
+/// apply that wrote them) are opened, only the named servers leave them, and
+/// every other key, comment and table stays. Every document is read and its
+/// result computed before the first is written, so a document that refuses
+/// (JSON with comments, a TOML layout the editor cannot cut without loss)
+/// leaves all of them as they were.
+///
+/// `devmap` itself is removed only when its entry is one this installer
+/// writes; a foreign `devmap` entry is left and said so.
+pub fn remove_registered(
+    host: Host,
+    root: &Path,
+    names: &[String],
+    only: &[PathBuf],
+    dry_run: bool,
+    check: bool,
+) -> anyhow::Result<Vec<McpRemoval>> {
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("project root {}", root.display()))?;
+    let mut documents: Vec<(PathBuf, DocFormat, Option<&'static str>)> = Vec::new();
+    let project = host.project_document();
+    documents.push((root.join(project.rel), project.format, project.container));
+    if host.registers_global_mcp() {
+        for path in global_mcp_paths(host)? {
+            documents.push((path, DocFormat::Json, Some("mcpServers")));
+        }
+    }
+    if host.registers_codex_mcp() {
+        documents.push((
+            dirs_home()?.join(".codex").join("config.toml"),
+            DocFormat::Toml,
+            Some("mcp_servers"),
+        ));
+    }
+    for site in project_mcp_sites(host, &root) {
+        documents.push((site.path, DocFormat::Json, Some("mcpServers")));
+    }
+    let wanted: Vec<PathBuf> = only
+        .iter()
+        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+        .collect();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut planned: Vec<(McpRemoval, Option<String>)> = Vec::new();
+    for (path, format, container) in documents {
+        let identity = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if !wanted.contains(&identity) || !seen.insert(identity) {
+            continue;
+        }
+        let Some(text) = read_project_doc(&path)? else {
+            continue;
+        };
+        let (updated, removed, note) = match format {
+            DocFormat::Json => cut_json_servers(&path, &text, container, names)?,
+            DocFormat::Toml => cut_toml_servers(
+                &path,
+                &text,
+                container.ok_or_else(|| anyhow!("{}: no server table", path.display()))?,
+                names,
+            )?,
+        };
+        if removed.is_empty() && note.is_none() {
+            continue;
+        }
+        planned.push((
+            McpRemoval {
+                path,
+                deleted: matches!(&updated, Some(t) if t.trim().is_empty() && format == DocFormat::Toml),
+                removed,
+                note: note.unwrap_or_default(),
+            },
+            updated,
+        ));
+    }
+    if !dry_run && !check {
+        for (removal, updated) in &planned {
+            let Some(updated) = updated else { continue };
+            if removal.deleted {
+                fs::remove_file(&removal.path)
+                    .with_context(|| format!("removing {}", removal.path.display()))?;
+            } else {
+                devmap_query::write_atomic(&removal.path, updated.as_bytes())
+                    .with_context(|| format!("writing {}", removal.path.display()))?;
+            }
+        }
+    }
+    Ok(planned.into_iter().map(|(removal, _)| removal).collect())
+}
+
+type Cut = (Option<String>, Vec<String>, Option<String>);
+
+/// `text` with `names` removed from a JSON document's server map. The document
+/// is re-serialised (as every JSON merge here is), so it is the keys and values
+/// that are preserved, not the whitespace.
+fn cut_json_servers(
+    path: &Path,
+    text: &str,
+    container: Option<&str>,
+    names: &[String],
+) -> anyhow::Result<Cut> {
+    if text.trim().is_empty() {
+        return Ok((None, Vec::new(), None));
+    }
+    let mut document: Value = serde_json::from_str(text).map_err(|err| {
+        anyhow!(
+            "{}: not strict JSON ({err}); JSON-with-comments is refused rather than rewritten",
+            path.display()
+        )
+    })?;
+    let servers = match container {
+        None => document.as_object_mut(),
+        Some(key) => document.get_mut(key).and_then(Value::as_object_mut),
+    };
+    let Some(servers) = servers else {
+        return Ok((None, Vec::new(), None));
+    };
+    let mut removed = Vec::new();
+    let mut note = None;
+    for name in names {
+        match servers.get(name) {
+            None => {}
+            Some(entry) if name == MCP_SERVER_NAME && !is_owned_devmap_entry(entry) => {
+                note = Some(format!(
+                    "{}: a `devmap` entry this installer did not write was left in place",
+                    path.display()
+                ));
+            }
+            Some(_) => {
+                servers.remove(name);
+                removed.push(name.clone());
+            }
+        }
+    }
+    if removed.is_empty() {
+        return Ok((None, removed, note));
+    }
+    let mut updated = serde_json::to_string_pretty(&document)?;
+    updated.push('\n');
+    Ok((Some(updated), removed, note))
+}
+
+/// `text` with `names` cut out of a TOML document's `[<container>.<name>]`
+/// blocks, every other byte kept. Re-parsed and compared with the original
+/// minus those entries; a layout this cannot cut as a block (inline table,
+/// dotted keys) is refused.
+fn cut_toml_servers(
+    path: &Path,
+    text: &str,
+    container: &str,
+    names: &[String],
+) -> anyhow::Result<Cut> {
+    let parsed: toml::Table = text
+        .parse()
+        .map_err(|err| anyhow!("{}: not TOML ({err}); refuse to rewrite it", path.display()))?;
+    let mut expected = parsed.clone();
+    let mut current = text.to_string();
+    let mut removed = Vec::new();
+    let mut note = None;
+    for name in names {
+        let Some(toml::Value::Table(servers)) = parsed.get(container) else {
+            continue;
+        };
+        let Some(entry) = servers.get(name) else {
+            continue;
+        };
+        if name == MCP_SERVER_NAME {
+            let owned = entry
+                .get("args")
+                .and_then(toml::Value::as_array)
+                .and_then(|args| args.last())
+                .and_then(toml::Value::as_str)
+                == Some("mcp");
+            if !owned {
+                note = Some(format!(
+                    "{}: a `devmap` entry this installer did not write was left in place",
+                    path.display()
+                ));
+                continue;
+            }
+        }
+        current = cut_toml_table(&current, container, name).ok_or_else(|| {
+            anyhow!(
+                "{}: [{container}.{name}] is not one block this command can remove \
+                 (inline table or dotted keys); edit it by hand",
+                path.display()
+            )
+        })?;
+        if let Some(toml::Value::Table(servers)) = expected.get_mut(container) {
+            servers.remove(name);
+        }
+        removed.push(name.clone());
+    }
+    if removed.is_empty() {
+        return Ok((None, removed, note));
+    }
+    let reparsed: toml::Table = current.parse().map_err(|err| {
+        anyhow!(
+            "{}: removing the entries would not parse ({err}); refuse to rewrite it",
+            path.display()
+        )
+    })?;
+    // An emptied container is the same document whether or not its (now
+    // headerless) table is spelled out.
+    let without_empty = |mut table: toml::Table| {
+        if matches!(table.get(container), Some(toml::Value::Table(t)) if t.is_empty()) {
+            table.remove(container);
+        }
+        table
+    };
+    if without_empty(reparsed) != without_empty(expected) {
+        bail!(
+            "{}: removing the entries would change other settings; refuse to rewrite it",
+            path.display()
+        );
+    }
+    Ok((Some(current), removed, note))
+}
+
+/// Line range `[start, end)` of the `[<container>.<name>]` block and its
+/// subtables, or `None` when the header is not found exactly once. The caller
+/// re-parses whatever it builds from this, so a layout it misreads is refused
+/// rather than written.
+fn locate_toml_table(lines: &[&str], container: &str, name: &str) -> Option<(usize, usize)> {
     let own = format!("{container}.{name}");
-    let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let header_of = |line: &str| -> Option<(bool, String)> {
         let trimmed = line.trim();
         let (array, inner) = if let Some(rest) = trimmed.strip_prefix("[[") {
@@ -1144,12 +1376,33 @@ fn replace_toml_table(text: &str, container: &str, name: &str, block: &str) -> O
             |(_, line)| matches!(header_of(line), Some((_, ref key)) if !key.starts_with(&nested)),
         )
         .map_or(lines.len(), |(index, _)| index);
-    let mut out: String = lines[..*start].concat();
+    Some((*start, end))
+}
+
+/// Replace the `[<container>.<name>]` block and its subtables with `block`.
+fn replace_toml_table(text: &str, container: &str, name: &str, block: &str) -> Option<String> {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let (start, end) = locate_toml_table(&lines, container, name)?;
+    let mut out: String = lines[..start].concat();
     out.push_str(block);
     if end < lines.len() {
         out.push('\n');
     }
     out.push_str(&lines[end..].concat());
+    Some(out)
+}
+
+/// `text` without the `[<container>.<name>]` block and its subtables. Undoes
+/// the append [`splice_toml_server`] makes: when the block was last, the blank
+/// line that separated it from what came before goes with it.
+fn cut_toml_table(text: &str, container: &str, name: &str) -> Option<String> {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let (start, end) = locate_toml_table(&lines, container, name)?;
+    let mut out: String = lines[..start].concat();
+    out.push_str(&lines[end..].concat());
+    if end == lines.len() && out.ends_with("\n\n") {
+        out.pop();
+    }
     Some(out)
 }
 
