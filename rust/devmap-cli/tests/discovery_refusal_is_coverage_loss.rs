@@ -125,6 +125,19 @@ fn a_refused_file_degrades_the_graph_and_demotes_the_findings_it_could_not_check
         build["files_indexed"], 1,
         "a refused file is not an indexed one: {build}"
     );
+    // The names travel in the result too, as data: Go's client used to recover
+    // them by matching the human wording of stderr. Both numbers are carried,
+    // because the list is a capped sample of the total.
+    let named = &build["discovery_refusals"];
+    assert_eq!(named["total"], 1, "{build}");
+    assert_eq!(named["shown"], 1, "{build}");
+    assert_eq!(named["items"][0]["path"], "app.py", "{build}");
+    assert!(
+        named["items"][0]["reason"]
+            .as_str()
+            .is_some_and(|r| !r.is_empty()),
+        "a refusal without its reason cannot be acted on: {build}"
+    );
     // Every file discovery admitted is in exactly one of the two numbers. This
     // is the property that survives a change of owner: whatever the refusal is
     // spelled as internally, nothing may fall out of both counts.

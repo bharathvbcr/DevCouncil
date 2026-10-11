@@ -312,3 +312,35 @@ func TestTheLiveProducerRefusalIsRecoverable(t *testing.T) {
 		t.Fatalf("a run over the producer's own artifacts is a clean run, got %v", again.Degraded())
 	}
 }
+
+// TestTheLiveBuildNamesARefusalAsData drives the real producer: a source file
+// discovery cannot read is named in the build result, with the producer's
+// total, and no part of that rides on the wording of stderr.
+func TestTheLiveBuildNamesARefusalAsData(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root reads a mode-000 file; the refusal cannot be provoked")
+	}
+	bin := devmapBinary(t)
+	root := fixtureRepo(t)
+	hidden := filepath.Join(root, "hidden.py")
+	if err := os.WriteFile(hidden, []byte("def hidden():\n    return 1\n"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(hidden, 0o644) })
+	if f, err := os.Open(hidden); err == nil {
+		_ = f.Close()
+		t.Skip("the file is readable despite mode 000")
+	}
+	c := New(bin, root)
+	report, err := c.Build(context.Background(), 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Refused != 1 || len(report.Refusals) != 1 || report.Refusals[0].Path != "hidden.py" {
+		t.Fatalf("the refusal was not named: Refused=%d Refusals=%v Unrecognised=%v",
+			report.Refused, report.Refusals, report.Unrecognised)
+	}
+	if len(report.Unrecognised) != 0 {
+		t.Fatalf("stderr carried lines under --json: %v", report.Unrecognised)
+	}
+}
