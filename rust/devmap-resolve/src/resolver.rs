@@ -11,6 +11,10 @@ use crate::model::*;
 
 mod gotypes;
 use gotypes::{GoCall, GoFileIndex, GoModel, DISPATCH_FANOUT_CAP};
+
+/// A protocol method's own declaration, and the conformers' declarations of it:
+/// `(file, symbol)` pairs.
+type ProtocolDispatch = ((String, String), Vec<(String, String)>);
 use devmap_extract::tsconfig::TsProject;
 use devmap_extract::{GoModule, ProjectManifests};
 
@@ -320,6 +324,8 @@ pub struct Resolver {
     /// not). The no-manifest fallback: a name held by exactly one directory
     /// is importable from it.
     py_package_parents: BTreeMap<String, BTreeSet<String>>,
+    /// The Swift targets the manifests declare; see [`Self::swift_modules_of`].
+    swift_targets: Vec<devmap_extract::SwiftTarget>,
     /// `(file, qualified name)` → the header a Rust function was declared
     /// with. Read by the rungs that type a binding from a return type or a
     /// closure parameter; see `devmap_extract::rustsig`.
@@ -543,7 +549,7 @@ pub struct Resolver {
     /// A Swift target is one unqualified namespace. Computed from the path
     /// (`Sources/<Name>/`, `app/MarkDevKit/…`) rather than from a build graph
     /// this kernel does not read. See `devmap_extract::languages::swift_module_of`.
-    swift_module_by_file: BTreeMap<String, String>,
+    swift_module_by_file: BTreeMap<String, Vec<String>>,
     /// module name → every indexed file that constitutes it.
     swift_module_files: BTreeMap<String, BTreeSet<String>>,
     /// `(module, bare name)` → the **file-level** declarations of that name.
@@ -624,6 +630,7 @@ impl Resolver {
             rust_manifest_crates: Vec::new(),
             python_manifest_roots: Vec::new(),
             py_package_parents: BTreeMap::new(),
+            swift_targets: Vec::new(),
             rust_signatures: BTreeMap::new(),
             unexported_symbols: BTreeSet::new(),
             reexport_chains: BTreeMap::new(),
@@ -924,7 +931,27 @@ impl Resolver {
             // Constructor shapes have their own rung, which needs no callee.
             return None;
         }
-        let (callee_file, callee) = if let Some((owner, function)) = shape.rsplit_once("::") {
+        let operator = (family == LangFamily::Swift
+            && !shape.is_empty()
+            && !shape.chars().any(|c| c.is_alphanumeric() || c == '_'))
+        .then(|| {
+            // `a <+> b`: the operator's own declaration says what it returns.
+            let mut declared =
+                self.symbol_index
+                    .get(shape)?
+                    .iter()
+                    .filter(|(_, kind, candidate, _)| {
+                        *kind == SymbolKind::Method && family.admits(*candidate)
+                    });
+            let (file, _, _, identity) = declared.next()?;
+            declared
+                .next()
+                .is_none()
+                .then(|| (file.clone(), identity.to_string()))
+        });
+        let (callee_file, callee) = if let Some(found) = operator {
+            found?
+        } else if let Some((owner, function)) = shape.rsplit_once("::") {
             let owner = owner.rsplit("::").next()?;
             self.unique_type_method(family, owner, function)?
         } else if let Some((receiver, function)) = shape.rsplit_once('.') {
@@ -1168,6 +1195,7 @@ impl Resolver {
                 .then_with(|| left.dir.cmp(&right.dir))
         });
         self.python_manifest_roots = python_roots;
+        self.swift_targets = manifests.swift_targets.clone();
         let mut projects = manifests.ts_projects.clone();
         // Deepest first, whatever order arrived: the nearest config governs.
         projects.sort_by(|left, right| {
@@ -1503,6 +1531,9 @@ impl Resolver {
                     binding.filter(|b| b.name == root),
                 );
             }
+        }
+        if let Some(constructed) = self.swift_constructed_receiver(file, name) {
+            return Some(constructed);
         }
         if let Some((root, field)) = Self::one_hop_field(name) {
             let root_binding = binding.filter(|b| b.name == root);
@@ -2262,6 +2293,16 @@ impl Resolver {
             }
         }
 
+        // Swift: an operator no indexed type overloads is the standard
+        // library's, whatever its operands are.
+        if family == LangFamily::Swift
+            && !callee_name.is_empty()
+            && !callee_name.chars().any(|c| c.is_alphanumeric() || c == '_')
+            && !self.symbol_index.contains_key(callee_name)
+        {
+            return UnresolvedClass::NoNamesake;
+        }
+
         // The enclosing scope's own binding beats every wider authority, so it
         // is asked first. A parameter named `len` shadows Go's builtin, and a
         // parameter named `useState` shadows the import: in both cases the call
@@ -2954,28 +2995,35 @@ impl Resolver {
                     .insert(Self::parent_dir(&ext.file_path));
             }
             if ext.language == "swift" {
-                if let Some(module) = devmap_extract::languages::swift_module_of(&ext.file_path) {
+                let modules = self.swift_modules_of(&ext.file_path);
+                if !modules.is_empty() {
                     self.swift_module_by_file
-                        .insert(ext.file_path.clone(), module.clone());
-                    self.swift_module_files
-                        .entry(module.clone())
-                        .or_default()
-                        .insert(ext.file_path.clone());
-                    for sym in &ext.symbols {
-                        if sym.kind == SymbolKind::File {
-                            continue;
-                        }
-                        let file_level = sym
-                            .parent_symbol
-                            .as_deref()
-                            .is_none_or(|parent| parent == ext.file_path);
-                        if !file_level {
-                            continue;
-                        }
-                        self.swift_module_symbols
-                            .entry((module.clone(), sym.name.clone()))
+                        .insert(ext.file_path.clone(), modules.clone());
+                    for module in &modules {
+                        self.swift_module_files
+                            .entry(module.clone())
                             .or_default()
-                            .push((ext.file_path.clone(), sym.qualified_name.clone(), sym.kind));
+                            .insert(ext.file_path.clone());
+                        for sym in &ext.symbols {
+                            if sym.kind == SymbolKind::File {
+                                continue;
+                            }
+                            let file_level = sym
+                                .parent_symbol
+                                .as_deref()
+                                .is_none_or(|parent| parent == ext.file_path);
+                            if !file_level {
+                                continue;
+                            }
+                            self.swift_module_symbols
+                                .entry((module.clone(), sym.name.clone()))
+                                .or_default()
+                                .push((
+                                    ext.file_path.clone(),
+                                    sym.qualified_name.clone(),
+                                    sym.kind,
+                                ));
+                        }
                     }
                 }
             }
@@ -3513,6 +3561,11 @@ impl Resolver {
                                     continue;
                                 }
                                 let (file, _, _) = others[0];
+                                // The importing file's own module shadows what an
+                                // import brings in under the same name.
+                                if self.own_module_declares(&ext.file_path, name) {
+                                    continue;
+                                }
                                 file_bindings
                                     .entry(name.clone())
                                     .or_insert_with(|| (file.clone(), name.clone()));
@@ -4249,7 +4302,12 @@ impl Resolver {
                     }
                 }
                 if family == LangFamily::Swift {
-                    if let Some(module) = self.swift_module_by_file.get(&ext.file_path) {
+                    for module in self
+                        .swift_module_by_file
+                        .get(&ext.file_path)
+                        .into_iter()
+                        .flatten()
+                    {
                         let key = format!("module:{module}");
                         package_groups
                             .entry(key)
@@ -4463,40 +4521,14 @@ impl Resolver {
                                     iface_symbol,
                                     targets,
                                 } => {
-                                    // The interface method is a symbol: its direct
-                                    // callers are every call written against it.
-                                    let direct = Arc::new(Resolution::ReceiverType {
-                                        target_symbol: iface_symbol.clone(),
-                                        target_file: iface_file.clone(),
-                                        receiver_type: iface.name().to_string(),
-                                    });
-                                    // And every in-repo implementer is a possible
-                                    // runtime target. With none, the direct edge is
-                                    // the whole answer and the generic emission below
-                                    // writes it.
-                                    resolution = Some(match targets.filter(|t| !t.is_empty()) {
-                                        Some(targets) => {
-                                            let caller = call
-                                                .caller_symbol
-                                                .clone()
-                                                .unwrap_or_else(|| ext.file_path.clone());
-                                            edges.push(ResolvedEdge::resolved(
-                                                ext.file_path.clone(),
-                                                iface_file.clone(),
-                                                caller,
-                                                self.qualified_for(&iface_file, &iface_symbol),
-                                                EdgeKind::Calls,
-                                                direct,
-                                                None,
-                                            ));
-                                            Arc::new(Resolution::Dispatch {
-                                                candidates: targets.into(),
-                                                via_file: iface_file,
-                                                via_symbol: iface_symbol,
-                                            })
-                                        }
-                                        None => direct,
-                                    });
+                                    resolution = Some(self.dispatch_through_interface(
+                                        ext,
+                                        call,
+                                        &mut edges,
+                                        iface.name(),
+                                        (iface_file, iface_symbol),
+                                        targets.unwrap_or_default(),
+                                    ));
                                 }
                                 GoCall::Pass => {}
                             }
@@ -4557,7 +4589,8 @@ impl Resolver {
                                     receiver_type: found.declaring_type,
                                 }));
                             }
-                            if let Some(((target_f, target_symbol), receiver_type)) = self
+                            let key = (family, class_type.clone(), call.callee_name.clone());
+                            let own = self
                                 .receiver_method_through_deref(
                                     ext,
                                     family,
@@ -4567,12 +4600,40 @@ impl Resolver {
                                     &class_type,
                                     &call.callee_name,
                                 )
-                                .filter(|_| !class_is_known)
-                            {
-                                resolution = Some(Arc::new(Resolution::ReceiverType {
-                                    target_symbol: target_symbol.clone(),
-                                    target_file: target_f.clone(),
-                                    receiver_type,
+                                .filter(|_| !class_is_known);
+                            // Swift: a method the type does not write is the one
+                            // a protocol extension or base class supplies.
+                            let inherited = (own.is_none()
+                                && family == LangFamily::Swift
+                                && !self.type_methods.contains_key(&key))
+                            .then(|| self.inherited_method(family, &class_type, &call.callee_name))
+                            .flatten();
+                            if let Some(((target_f, target_symbol), receiver_type)) = own.map(|(target, receiver_type)| (target.clone(), receiver_type)).or_else(|| {
+                                inherited.map(|(file, symbol, _)| ((file, symbol), class_type.clone()))
+                            }) {
+                                resolution = Some(match family {
+                                    // A receiver typed by a protocol is a call
+                                    // through it: see `protocol_dispatch`.
+                                    LangFamily::Swift => self
+                                        .protocol_dispatch(family, &class_type, &call.callee_name)
+                                        .map(|(direct, targets)| {
+                                            self.dispatch_through_interface(
+                                                ext,
+                                                call,
+                                                &mut edges,
+                                                &class_type,
+                                                direct,
+                                                targets,
+                                            )
+                                        }),
+                                    _ => None,
+                                }
+                                .unwrap_or_else(|| {
+                                    Arc::new(Resolution::ReceiverType {
+                                        target_symbol: target_symbol.clone(),
+                                        target_file: target_f.clone(),
+                                        receiver_type: receiver_type.clone(),
+                                    })
                                 }));
                             }
                         }
@@ -4642,14 +4703,25 @@ impl Resolver {
                                     }));
                                 }
                                 Some(ImplicitReceiverAnswer::VirtualOverride) => {
-                                    // Block SameFile / other deterministic
-                                    // fallthrough: the declaration is unique on
-                                    // the enclosing type, but an indexed subtype
-                                    // overrides it, so `self` is not a proven
-                                    // single target.
-                                    resolution = Some(Arc::new(Resolution::Unresolved {
-                                        reason: "implicit receiver method is overridden by an indexed subtype".to_string(),
-                                    }));
+                                    // Inside a protocol extension `self` is any
+                                    // conformer: `greet()` written in `extension
+                                    // Greeter` is a call through the protocol.
+                                    let through_protocol = (family == LangFamily::Swift)
+                                        .then(|| self.self_type_at(&ext.file_path, family, caller))
+                                        .flatten()
+                                        .and_then(|own| {
+                                            self.protocol_dispatch(family, &own, &call.callee_name)
+                                                .map(|found| (own, found))
+                                        });
+                                    resolution = Some(match through_protocol {
+                                        Some((own, (direct, targets))) => self
+                                            .dispatch_through_interface(
+                                                ext, call, &mut edges, &own, direct, targets,
+                                            ),
+                                        None => Arc::new(Resolution::Unresolved {
+                                            reason: "implicit receiver method is overridden by an indexed subtype".to_string(),
+                                        }),
+                                    });
                                 }
                                 None => {}
                             }
@@ -4840,6 +4912,30 @@ impl Resolver {
                         }
                     }
 
+                    // 2c'. Swift: a bare call that bound to a method of a protocol is
+                    // a call through it — `greet()` written in `extension Greeter`
+                    // runs whichever conformer `self` is.
+                    if family == LangFamily::Swift && call.receiver_expr.is_none() {
+                        let through_protocol = match resolution.as_deref() {
+                            Some(Resolution::SameFile {
+                                target_symbol,
+                                target_file,
+                            }) => self
+                                .declaring_type_of(target_file, target_symbol)
+                                .and_then(|own| {
+                                    self.protocol_dispatch(family, own, &call.callee_name)
+                                        .map(|found| (own.to_string(), found))
+                                })
+                                .filter(|(_, (_, targets))| !targets.is_empty()),
+                            _ => None,
+                        };
+                        if let Some((own, (direct, targets))) = through_protocol {
+                            resolution = Some(self.dispatch_through_interface(
+                                ext, call, &mut edges, &own, direct, targets,
+                            ));
+                        }
+                    }
+
                     // 2d. A receiver that *is* a type names it directly:
                     // `PdgBuilder::new()`, `Config.default()`. There is no
                     // binding to look up because nothing was bound — the type is
@@ -4892,6 +4988,43 @@ impl Resolver {
                                         resolution = Some(Arc::new(Resolution::ReceiverType {
                                             target_symbol: target_symbol.to_string(),
                                             target_file: target_f.to_string(),
+                                            receiver_type: type_name.to_string(),
+                                        }));
+                                        break;
+                                    }
+                                    // A Swift file compiled into several targets
+                                    // reaches each target's own type: one edge
+                                    // per target, none of them a guess.
+                                    let per_target = if family == LangFamily::Swift {
+                                        self.type_method_targets_per_module(&ext.file_path, hits)
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    if let Some(((first_file, first_symbol), rest)) =
+                                        per_target.split_first().filter(|_| per_target.len() > 1)
+                                    {
+                                        let caller = call
+                                            .caller_symbol
+                                            .clone()
+                                            .unwrap_or_else(|| ext.file_path.clone());
+                                        for (target_f, target_symbol) in rest {
+                                            edges.push(ResolvedEdge::resolved(
+                                                ext.file_path.clone(),
+                                                target_f.to_string(),
+                                                caller.clone(),
+                                                self.qualified_for(target_f, target_symbol),
+                                                EdgeKind::Calls,
+                                                Arc::new(Resolution::ReceiverType {
+                                                    target_symbol: target_symbol.to_string(),
+                                                    target_file: target_f.to_string(),
+                                                    receiver_type: type_name.to_string(),
+                                                }),
+                                                None,
+                                            ));
+                                        }
+                                        resolution = Some(Arc::new(Resolution::ReceiverType {
+                                            target_symbol: first_symbol.to_string(),
+                                            target_file: first_file.to_string(),
                                             receiver_type: type_name.to_string(),
                                         }));
                                         break;
@@ -6939,6 +7072,23 @@ impl Resolver {
         let mut uniq: Vec<&(String, String)> = hits.iter().collect();
         uniq.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
         uniq.dedup();
+        // Swift: a type the caller's own module declares shadows the same name
+        // an import brings in, and a module is where `Theme` is looked up first.
+        // When some hits sit in the caller's modules, only those are candidates.
+        if let Some(own) = self.swift_module_by_file.get(call_file) {
+            let in_own: Vec<&(String, String)> = uniq
+                .iter()
+                .copied()
+                .filter(|hit| {
+                    self.swift_module_by_file
+                        .get(&hit.0)
+                        .is_some_and(|modules| modules.iter().any(|m| own.contains(m)))
+                })
+                .collect();
+            if !in_own.is_empty() {
+                uniq = in_own;
+            }
+        }
         if uniq.is_empty() || !uniq.iter().all(|hit| hit.0 == uniq[0].0) {
             return None;
         }
@@ -6952,10 +7102,112 @@ impl Resolver {
                 self.swift_module_by_file.get(call_file),
                 self.swift_module_by_file.get(target_file.as_str()),
             ) {
-                (Some(caller_module), Some(target_module)) => caller_module == target_module,
+                (Some(caller), Some(target)) => caller.iter().any(|module| target.contains(module)),
                 _ => false,
             };
         corroborated.then_some((target_file.as_str(), target_symbol.as_str()))
+    }
+
+    /// Every `type_methods` hit a Swift type spelling reaches from `call_file`
+    /// when the file is compiled into more than one target: one per target.
+    ///
+    /// `ios/Shared/Formatter.swift` is built into the app and the widget, and
+    /// its `Theme.accent()` is each target's own `Theme`. Both are right — in
+    /// different builds — so both are edges. Abstains (empty) unless every
+    /// target of the file resolves the type to exactly one file.
+    fn type_method_targets_per_module<'a>(
+        &self,
+        call_file: &str,
+        hits: &'a [(String, String)],
+    ) -> Vec<(&'a str, &'a str)> {
+        let Some(own) = self
+            .swift_module_by_file
+            .get(call_file)
+            .filter(|m| m.len() > 1)
+        else {
+            return Vec::new();
+        };
+        let mut found: Vec<(&str, &str)> = Vec::new();
+        for module in own {
+            let in_module: Vec<&(String, String)> = hits
+                .iter()
+                .filter(|hit| {
+                    self.swift_module_by_file
+                        .get(&hit.0)
+                        .is_some_and(|modules| modules.contains(module))
+                })
+                .collect();
+            let files: BTreeSet<&str> = in_module.iter().map(|hit| hit.0.as_str()).collect();
+            if files.len() != 1 {
+                return Vec::new();
+            }
+            let hit = in_module[0];
+            if !found.contains(&(hit.0.as_str(), hit.1.as_str())) {
+                found.push((hit.0.as_str(), hit.1.as_str()));
+            }
+        }
+        found
+    }
+
+    /// The modules a Swift file is compiled into.
+    ///
+    /// A `Package.swift` target owns the folders it names exclusively (the
+    /// deepest claim wins); otherwise every XcodeGen target listing a folder
+    /// above the file compiles it, so `Shared/` belongs to both targets that
+    /// list it. A file no manifest claims falls back to the path heuristic
+    /// (`swift_module_of`), which is right for the conventional layouts.
+    fn swift_modules_of(&self, file: &str) -> Vec<String> {
+        let claim = |target: &devmap_extract::SwiftTarget| -> Option<usize> {
+            target
+                .paths
+                .iter()
+                .filter(|path| {
+                    file == path.as_str()
+                        || file
+                            .strip_prefix(path.as_str())
+                            .is_some_and(|rest| rest.starts_with('/'))
+                })
+                .map(String::len)
+                .max()
+        };
+        let mut package: Vec<(usize, &str)> = Vec::new();
+        let mut project: BTreeSet<&str> = BTreeSet::new();
+        for target in &self.swift_targets {
+            let Some(depth) = claim(target) else {
+                continue;
+            };
+            if target.package {
+                package.push((depth, target.name.as_str()));
+            } else {
+                project.insert(target.name.as_str());
+            }
+        }
+        if let Some(deepest) = package.iter().map(|(depth, _)| *depth).max() {
+            let names: BTreeSet<String> = package
+                .iter()
+                .filter(|(depth, _)| *depth == deepest)
+                .map(|(_, name)| name.to_string())
+                .collect();
+            return names.into_iter().collect();
+        }
+        if !project.is_empty() {
+            return project.into_iter().map(str::to_string).collect();
+        }
+        devmap_extract::languages::swift_module_of(file)
+            .into_iter()
+            .collect()
+    }
+
+    /// Whether a module `file` is compiled into declares a top-level `name`
+    /// anywhere — in which case that declaration, and not an import's, is what
+    /// the name means in `file`.
+    fn own_module_declares(&self, file: &str, name: &str) -> bool {
+        self.swift_module_by_file.get(file).is_some_and(|modules| {
+            modules.iter().any(|module| {
+                self.swift_module_symbols
+                    .contains_key(&(module.clone(), name.to_string()))
+            })
+        })
     }
 
     fn same_swift_module_target(
@@ -6964,20 +7216,34 @@ impl Resolver {
         name: &str,
         accept: impl Fn(SymbolKind) -> bool,
     ) -> Option<(String, String, String)> {
-        let module = self.swift_module_by_file.get(file)?;
-        let hits = self
-            .swift_module_symbols
-            .get(&(module.clone(), name.to_string()))?;
-        let mut visible = hits.iter().filter(|(path, symbol, kind)| {
-            path != file
-                && accept(*kind)
-                && self.candidate_is_visible_from(LangFamily::Swift, file, path, symbol)
-        });
-        let (target_file, target_symbol, _) = visible.next()?;
-        visible
-            .next()
-            .is_none()
-            .then(|| (target_file.clone(), target_symbol.clone(), module.clone()))
+        let mut answers: BTreeSet<(String, String, String)> = BTreeSet::new();
+        for module in self.swift_module_by_file.get(file)? {
+            let Some(hits) = self
+                .swift_module_symbols
+                .get(&(module.clone(), name.to_string()))
+            else {
+                continue;
+            };
+            let mut visible = hits.iter().filter(|(path, symbol, kind)| {
+                path != file
+                    && accept(*kind)
+                    && self.candidate_is_visible_from(LangFamily::Swift, file, path, symbol)
+            });
+            let Some((target_file, target_symbol, _)) = visible.next() else {
+                continue;
+            };
+            if visible.next().is_some() {
+                return None;
+            }
+            answers.insert((target_file.clone(), target_symbol.clone(), module.clone()));
+        }
+        let mut answers = answers.into_iter();
+        let first = answers.next()?;
+        // A target per module that resolves the name to different files has no
+        // single answer for a file compiled into both.
+        answers
+            .all(|other| other.0 == first.0 && other.1 == first.1)
+            .then_some(first)
     }
 
     /// The Swift module a specifier names, if this corpus indexed one.
@@ -7102,6 +7368,217 @@ impl Resolver {
         candidates.sort();
         candidates.dedup();
         (candidates.len() == 1).then(|| candidates.pop().unwrap())
+    }
+
+    /// A call written against an interface (a Go interface, a Swift protocol):
+    /// the interface method is a symbol, so its direct callers are every call
+    /// written against it, and each in-repo implementer is a possible runtime
+    /// target. The one place that shape is built, whichever language found it.
+    ///
+    /// With no implementer the direct edge is the whole answer, returned as an
+    /// ordinary `ReceiverType` for the generic emission to write. Otherwise the
+    /// direct edge is pushed here and the returned [`Resolution::Dispatch`] is
+    /// emitted per candidate — or, past [`DISPATCH_FANOUT_CAP`], as one ledger
+    /// row — by the generic emission.
+    fn dispatch_through_interface(
+        &self,
+        ext: &Extraction,
+        call: &ExtractedCall,
+        edges: &mut Vec<ResolvedEdge>,
+        interface: &str,
+        (iface_file, iface_symbol): (String, String),
+        targets: Vec<(String, String)>,
+    ) -> Arc<Resolution> {
+        let direct = Arc::new(Resolution::ReceiverType {
+            target_symbol: iface_symbol.clone(),
+            target_file: iface_file.clone(),
+            receiver_type: interface.to_string(),
+        });
+        if targets.is_empty() {
+            return direct;
+        }
+        let caller = call
+            .caller_symbol
+            .clone()
+            .unwrap_or_else(|| ext.file_path.clone());
+        edges.push(ResolvedEdge::resolved(
+            ext.file_path.clone(),
+            iface_file.clone(),
+            caller,
+            self.qualified_for(&iface_file, &iface_symbol),
+            EdgeKind::Calls,
+            direct,
+            None,
+        ));
+        Arc::new(Resolution::Dispatch {
+            candidates: targets.into(),
+            via_file: iface_file,
+            via_symbol: iface_symbol,
+        })
+    }
+
+    /// Swift: `Meter(v: 1).bump()` — a receiver that is itself a construction
+    /// is a value of the constructed type. The text must be exactly one call of
+    /// a capitalised name (generic arguments allowed) and the name must be an
+    /// indexed class, struct or enum; a capitalised *function* returning
+    /// something else, or a chain (`Meter(v: 1).scaled().bump()`), is not typed.
+    fn swift_constructed_receiver(&self, file: &str, receiver: &str) -> Option<String> {
+        if !file.ends_with(".swift") || !receiver.ends_with(')') {
+            return None;
+        }
+        let open = receiver.find('(')?;
+        let head = receiver[..open].trim();
+        let head = head.split('<').next().unwrap_or(head);
+        if !head.chars().next().is_some_and(char::is_uppercase) || !Self::is_plain_ident(head) {
+            return None;
+        }
+        // One call spanning the whole text: the parentheses balance only at the end.
+        let mut depth = 0usize;
+        for (index, ch) in receiver.char_indices().skip_while(|(i, _)| *i < open) {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 && index + 1 != receiver.len() {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let declared = self
+            .symbol_index
+            .get(head)?
+            .iter()
+            .any(|(_, kind, family, _)| {
+                *family == LangFamily::Swift
+                    && matches!(
+                        kind,
+                        SymbolKind::Class | SymbolKind::Struct | SymbolKind::Enum
+                    )
+            });
+        declared.then(|| head.to_string())
+    }
+
+    /// Swift: the method `type_name` inherits from a supertype it conforms to —
+    /// a protocol-extension default or a base class's method — when exactly one
+    /// supertype level declares it once. Abstains on every ambiguity, as
+    /// [`Self::implicit_receiver_target`] does.
+    fn inherited_method(
+        &self,
+        family: LangFamily,
+        type_name: &str,
+        method: &str,
+    ) -> Option<(String, String, String)> {
+        let mut frontier: Vec<String> = self
+            .supertypes
+            .get(&(family, type_name.to_string()))
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        visited.insert(type_name.to_string());
+        for _ in 0..Self::HERITAGE_WALK_MAX_DEPTH {
+            let mut found: BTreeSet<(String, String, String)> = BTreeSet::new();
+            let mut next: Vec<String> = Vec::new();
+            for name in frontier.drain(..) {
+                if !visited.insert(name.clone()) {
+                    continue;
+                }
+                if !self.type_name_is_identifiable(family, &name) {
+                    return None;
+                }
+                if let Some(hits) =
+                    self.type_methods
+                        .get(&(family, name.clone(), method.to_string()))
+                {
+                    let [hit] = hits.as_slice() else {
+                        return None;
+                    };
+                    found.insert((hit.0.clone(), hit.1.clone(), name.clone()));
+                }
+                next.extend(
+                    self.supertypes
+                        .get(&(family, name))
+                        .into_iter()
+                        .flatten()
+                        .cloned(),
+                );
+            }
+            match found.len() {
+                0 => {}
+                1 => return found.into_iter().next(),
+                _ => return None,
+            }
+            if next.is_empty() {
+                return None;
+            }
+            frontier = next;
+        }
+        None
+    }
+
+    /// Swift: the protocol method `method` of `protocol`, and the in-repo
+    /// conformers' declarations of it.
+    ///
+    /// `None` unless `protocol` is one indexed protocol declaration that
+    /// declares `method` exactly once. The conformers are the protocol's
+    /// transitive subtypes (`subtypes` is built from the `: Greeter`
+    /// conformance lists, extensions included); a conformer that does not write
+    /// the method inherits a protocol-extension default, which is the direct
+    /// target already. A protocol that refines another contributes its own
+    /// conformers and is not itself a candidate.
+    fn protocol_dispatch(
+        &self,
+        family: LangFamily,
+        protocol: &str,
+        method: &str,
+    ) -> Option<ProtocolDispatch> {
+        let is_protocol = self.symbol_index.get(protocol).is_some_and(|hits| {
+            let mut kinds = hits
+                .iter()
+                .filter(|(_, _, candidate, _)| family.admits(*candidate));
+            kinds.all(|(_, kind, _, _)| *kind == SymbolKind::Interface)
+        });
+        if !is_protocol || !self.type_name_is_identifiable(family, protocol) {
+            return None;
+        }
+        let mut declared = self
+            .type_methods
+            .get(&(family, protocol.to_string(), method.to_string()))?
+            .clone();
+        declared.sort();
+        declared.dedup();
+        let [direct] = declared.as_slice() else {
+            return None;
+        };
+        let mut candidates: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        let mut frontier = vec![protocol.to_string()];
+        for _ in 0..Self::HERITAGE_WALK_MAX_DEPTH {
+            let mut next = Vec::new();
+            for name in frontier.drain(..) {
+                for sub in self.subtypes.get(&(family, name)).into_iter().flatten() {
+                    if !visited.insert(sub.clone()) {
+                        continue;
+                    }
+                    if let Some(hits) =
+                        self.type_methods
+                            .get(&(family, sub.clone(), method.to_string()))
+                    {
+                        candidates.extend(hits.iter().cloned());
+                    }
+                    next.push(sub.clone());
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        candidates.remove(direct);
+        Some((direct.clone(), candidates.into_iter().collect()))
     }
 
     /// The one `type_methods` hit a typed receiver dispatches to.
@@ -7831,6 +8308,33 @@ impl Resolver {
             && !Self::receiver_is_self(receiver)
             && receiver.starts_with(|ch: char| ch.is_ascii_uppercase())
             && binding.is_none()
+        {
+            let key = (family, receiver.to_string(), name.to_string());
+            if let Some((target_file, target_symbol)) = self
+                .type_methods
+                .get(&key)
+                .and_then(|hits| self.type_method_target(&ext.file_path, receiver, hits))
+            {
+                return Some(self.reference_edge(
+                    ext,
+                    target_file,
+                    target_symbol,
+                    reference,
+                    Resolution::ReceiverType {
+                        target_symbol: self.qualified_for(target_file, target_symbol),
+                        target_file: target_file.to_string(),
+                        receiver_type: receiver.to_string(),
+                    },
+                ));
+            }
+        }
+
+        // Swift: `Meter.privDouble` passed by name is a member of the type the
+        // receiver spells — the reference half of call rung 2d. The type must be
+        // corroborated by this file, as `type_method_target` requires.
+        if family == LangFamily::Swift
+            && Self::is_plain_ident(receiver)
+            && receiver.chars().next().is_some_and(char::is_uppercase)
         {
             let key = (family, receiver.to_string(), name.to_string());
             if let Some((target_file, target_symbol)) = self
@@ -8609,6 +9113,18 @@ impl Resolver {
         declaration.in_global_sheet || reference.name.starts_with('#')
     }
 
+    /// Whether `symbol` in `file` is an interface (protocol, trait) declaration.
+    fn declares_interface(&self, file: &str, symbol: &str) -> bool {
+        let bare = symbol.rsplit("::").next().unwrap_or(symbol);
+        self.symbol_index.get(bare).is_some_and(|hits| {
+            hits.iter().any(|(path, kind, _, identity)| {
+                path == file
+                    && *kind == SymbolKind::Interface
+                    && (identity.as_ref() == symbol || identity.rsplit("::").next() == Some(bare))
+            })
+        })
+    }
+
     fn reference_edge(
         &self,
         ext: &Extraction,
@@ -8638,6 +9154,13 @@ impl Resolver {
             // nothing as usual. Both variants were declared with no producer;
             // every reference to them was a label map or a string parser.
             match reference.kind {
+                // Swift, Kotlin and Python write a base class and an interface
+                // in one syntax, so the extractor can only say `Extends`. The
+                // resolver knows what the supertype is: an indexed interface is
+                // implemented, not extended.
+                ReferenceKind::Heritage if self.declares_interface(target_file, target_sym) => {
+                    EdgeKind::Implements
+                }
                 ReferenceKind::Heritage => EdgeKind::Extends,
                 ReferenceKind::HeritageInterface => EdgeKind::Implements,
                 _ => EdgeKind::References,

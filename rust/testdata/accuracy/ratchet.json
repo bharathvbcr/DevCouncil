@@ -20,9 +20,9 @@
     "present": 93
   },
   "swift": {
-    "known_failing": 22,
+    "known_failing": 0,
     "positive_rows": 79,
-    "present": 58
+    "present": 79
   },
   "typescript": {
     "known_failing": 0,

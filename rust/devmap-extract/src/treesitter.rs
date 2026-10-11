@@ -835,7 +835,7 @@ fn extract_treesitter_before_deadline(
                     // After `walk_tree`, so the per-scope cache it warmed is
                     // reused rather than every callable's subtree being walked
                     // a second time.
-                    scope_locals: collect_scope_locals(root, source, &file_symbol_name),
+                    scope_locals: collect_scope_locals(root, source, &file_symbol_name, lang),
                     rust_inline_modules,
                     rust_deref_targets,
                     rust_implicit_calls,
@@ -9346,6 +9346,7 @@ pub(crate) fn walk_deadline_passed() -> bool {
 /// suppressing genuine references there. Extraction of a file must never depend
 /// on what was extracted before it.
 fn reset_scope_locals() {
+    crate::swiftscope::reset();
     SCOPE_LOCALS.with(|cache| cache.borrow_mut().clear());
 }
 
@@ -9809,7 +9810,8 @@ fn collect_site_bindings(
         };
         let mut ancestor = bounded_parent(node);
         while let Some(scope) = ancestor {
-            if is_callable_node(scope) {
+            let swift_scope = lang == "swift" && crate::swiftscope::is_scope(scope);
+            if is_callable_node(scope) || swift_scope {
                 // Python defaults run in the enclosing scope. The parameter's
                 // own declaration is still a binding site, but its value is not.
                 let in_default = scope.kind() == "function_definition"
@@ -9831,7 +9833,29 @@ fn collect_site_bindings(
                         }
                         value
                     });
-                if !in_default {
+                if swift_scope {
+                    // Swift's names and written types come from its own scope
+                    // reader; the shared passes read `identifier` and a
+                    // `parameters` list, neither of which the grammar has.
+                    let bound = crate::swiftscope::bindings(scope, source);
+                    if let Some(written) = bound.get(name) {
+                        let initializer = written.init.clone();
+                        let written = written.ty.clone();
+                        let scope_name = scope.child(0).and_then(|child| {
+                            enclosing_callable_qualified(child, source, file_symbol_name)
+                        });
+                        sites.insert(LocalBinding {
+                            start_byte: span.start_byte,
+                            name: name.to_string(),
+                            declared_type: written.or_else(|| {
+                                binding_declared_type_for(&declared_types, &scope_name, name)
+                            }),
+                            initializer,
+                            scope: scope_name,
+                        });
+                        break;
+                    }
+                } else if !in_default {
                     let names = parameters.entry(scope.id()).or_insert_with(|| {
                         let mut names = BTreeSet::new();
                         collect_parameter_names(scope, source, &mut names);
@@ -10554,7 +10578,12 @@ fn collect_type_parameter_names(callable: Node, source: &str, out: &mut BTreeSet
     }
 }
 
-fn collect_scope_locals(root: Node, source: &str, file_symbol_name: &str) -> Vec<(String, String)> {
+fn collect_scope_locals(
+    root: Node,
+    source: &str,
+    file_symbol_name: &str,
+    lang: &str,
+) -> Vec<(String, String)> {
     let mut by_scope: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut worklist = vec![root];
     while let Some(node) = worklist.pop() {
@@ -10593,6 +10622,9 @@ fn collect_scope_locals(root: Node, source: &str, file_symbol_name: &str) -> Vec
                     // value parameter is, and the resolver reads both from the same
                     // per-scope set.
                     collect_type_parameter_names(node, source, entry);
+                    if lang == "swift" {
+                        entry.extend(crate::swiftscope::bindings(node, source).keys().cloned());
+                    }
                 }
             }
         }

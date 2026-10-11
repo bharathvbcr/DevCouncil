@@ -624,7 +624,13 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// statement. A v84 row has no such call, so the context manager's `__enter__`
 /// would keep looking uncalled until the file was edited. The Python lane
 /// stamped 82 on this payload; it landed after the others, so it is 85.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "85";
+///
+/// v86 records the Swift lane's extraction: protocol requirements as symbols
+/// (`Interface` members, so a call through a protocol-typed value has a direct
+/// edge), and scope-aware Swift locals (`swiftscope`). A v85 row lacks them, so
+/// the requirement would keep looking undeclared and the call unattributed from
+/// a warm cache. The Swift lane carried no stamp of its own, so it is 86.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "86";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

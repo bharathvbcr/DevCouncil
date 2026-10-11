@@ -23,6 +23,7 @@ pub mod langcalls;
 #[cfg(feature = "parse")]
 pub(crate) mod langdecl;
 pub mod rustsig;
+pub mod swifttargets;
 // Takes a `tree_sitter::Node` for the same reason `langimports` does, and is
 // called from the same seam.
 #[cfg(feature = "parse")]
@@ -74,6 +75,11 @@ mod literals;
 pub mod pyproject;
 #[cfg(feature = "parse")]
 mod rustlocal;
+// The names a Swift callable binds and the types it writes for them. Walks a
+// parse tree; its callers are `treesitter::collect_site_bindings` and
+// `treesitter::collect_scope_locals`.
+#[cfg(feature = "parse")]
+mod swiftscope;
 #[cfg(feature = "parse")]
 pub mod treesitter;
 pub mod tsconfig;
@@ -101,6 +107,7 @@ pub use paths::{
     code_graph_path, compact_code_graph_path, content_cache_path, plugin_dir, repo_map_path,
     state_dir, store_path, workspace_path,
 };
+pub use swifttargets::SwiftTarget;
 #[cfg(feature = "parse")]
 pub use treesitter::{extract_treesitter, linked_grammar_count, linked_grammar_keys};
 

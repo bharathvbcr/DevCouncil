@@ -49,6 +49,7 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             "python_source_roots_collect",
             "reliability_source_reads",
             "safe_fs_controls",
+            "swift_targets_collect",
             "the_bounded_runner_under_hostile_children",
             "workspaces_collect",
         ],

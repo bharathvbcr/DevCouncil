@@ -91,7 +91,8 @@ fn written_return(callable: Node, source: &str) -> Option<String> {
             (callable.kind() == "method_declaration")
                 .then(|| callable.child_by_field_name("type"))
                 .flatten()
-        })?;
+        })
+        .or_else(|| swift_return(callable))?;
     let node = if node.kind() == "parameter_list" {
         // Go's parenthesised result list. One unnamed result is a type in
         // parentheses; anything more — `(T, error)` — is a tuple the caller
@@ -119,6 +120,24 @@ fn written_return(callable: Node, source: &str) -> Option<String> {
         .trim_matches(|c| c == '"' || c == '\'')
         .trim();
     (!text.is_empty() && text.len() <= MAX_RETURN_TYPE_BYTES).then(|| text.to_string())
+}
+
+/// A Swift declaration's return type. tree-sitter-swift gives it no field: it is
+/// the type node that follows the parameters and precedes the body, so the
+/// first direct type child after the name is the answer. A function that
+/// returns nothing has none.
+fn swift_return(callable: Node) -> Option<Node> {
+    if callable.kind() != "function_declaration" {
+        return None;
+    }
+    let mut cursor = callable.walk();
+    let found = callable.named_children(&mut cursor).find(|child| {
+        matches!(
+            child.kind(),
+            "user_type" | "optional_type" | "array_type" | "tuple_type" | "function_type"
+        )
+    });
+    found
 }
 
 #[cfg(test)]

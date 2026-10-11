@@ -853,8 +853,11 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // v84 binds Swift and Kotlin parameters as local bindings.
     //
     // v85 records the implicit `__enter__` call of a Python `with Class(..)`.
+    //
+    // v86 records Swift protocol requirements as symbols and scope-aware Swift
+    // locals.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "85",
+        EXTRACTION_SCHEMA_VERSION, "86",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

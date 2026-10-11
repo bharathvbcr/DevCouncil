@@ -194,9 +194,11 @@ fn swift_attributes_calls_to_the_symbol_the_emitter_names() {
     // An `init` body is not a declaration the generic emitter names, so its
     // calls belong to the type — which is a symbol, unlike `s.swift::init`.
     assert_eq!(extracted.caller("register"), Some("s.swift::Service"));
-    // A nested `func` is emitted unqualified by the generic emitter, so its
-    // calls must name it unqualified too.
-    assert_eq!(extracted.caller("deepest"), Some("s.swift::nested"));
+    // A nested `func` is a name its enclosing function binds, not a symbol, so
+    // its calls belong to the function that contains it. (It used to be emitted
+    // as a module-visible `s.swift::nested` and took confident callers from
+    // unrelated files: the audit's F1.)
+    assert_eq!(extracted.caller("deepest"), Some("s.swift::Service.run"));
 }
 
 #[test]
@@ -703,7 +705,8 @@ func outer() {
     let symbols = emitted_symbols("h.swift", "swift", swift);
     assert!(symbols.contains(&"h.swift::Holder.method".to_string()));
     assert!(
-        symbols.contains(&"h.swift::inner".to_string()),
-        "the generic emitter names a nested func unqualified; got {symbols:?}"
+        !symbols.iter().any(|symbol| symbol.ends_with("inner")),
+        "a nested func is local to its function, not a symbol of the file; got {symbols:?}"
     );
+    assert!(symbols.contains(&"h.swift::outer".to_string()));
 }
