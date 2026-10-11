@@ -11,7 +11,7 @@ truly_dead	apps/web/src/v/importtype.tsx::ApiShape	type alias nothing references
 truly_dead	apps/web/src/v/typeofimport.tsx::ApiModule	type alias nothing references
 live	apps/web/src/v/defaults.ts::defaultSleep	V17: destructured default value reference
 live	apps/web/src/v/defaults.ts::repoRoot	V17: destructured default value call
-live	apps/web/src/v/logger.ts::log	spread into logger
+live	apps/web/src/v/logger.ts::core.log	spread into logger
 exported_unreferenced	apps/web/src/lib/format.ts::unusedLibFn	exported from an app package (no exports/main/types), uncalled
 exempt	apps/web/src/v/ambient.d.ts::'*.svg'	V18: ambient declare module shim
 exempt	apps/web/src/v/augment.ts::'./logger'	V19: module augmentation

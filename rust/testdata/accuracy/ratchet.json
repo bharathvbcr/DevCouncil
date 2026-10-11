@@ -25,8 +25,8 @@
     "present": 58
   },
   "typescript": {
-    "known_failing": 12,
-    "positive_rows": 70,
-    "present": 59
+    "known_failing": 0,
+    "positive_rows": 71,
+    "present": 71
   }
 }

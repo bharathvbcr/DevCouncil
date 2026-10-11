@@ -43,9 +43,10 @@ ts.C16a	C16a	apps/web/src/services/store.ts::MemClient.get	apps/web/src/services
 ts.C16b	C16b	apps/web/src/services/store.ts::viaConcrete	apps/web/src/services/store.ts::MemClient.get	edge	must		receiver typed by new
 ts.C16c	C16c	apps/web/src/services/store.ts::viaStatic	apps/web/src/services/store.ts::MemClient.create	edge	must		static call
 ts.C17	C17	apps/web/src/services/store.ts::viaStatic	apps/web/src/services/store.ts::MemClient.handle	edge	must		class-field arrow member
-ts.C18a	C18a	apps/web/src/services/store.ts::useService	apps/web/src/services/store.ts::fetchOne|apps/web/src/services/store.ts::paperService	edge	must		object-literal method call
-ts.C18b	C18b	apps/web/src/services/store.ts::useService	apps/web/src/services/store.ts::svcHelper	edge	must		svcHelper is live
-ts.C18c	C18c	apps/web/src/services/store.ts::useService	apps/web/src/services/store.ts::paperService	edge	must		object-literal arrow member remove
+ts.C18a	C18a	apps/web/src/services/store.ts::useService	apps/web/src/services/store.ts::paperService.fetchOne|apps/web/src/services/store.ts::paperService	edge	must		object-literal method call; the member is qualified by its object
+ts.C18b	C18b	apps/web/src/services/store.ts::paperService.fetchOne	apps/web/src/services/store.ts::svcHelper	edge	must		svcHelper is live; the call is the object-literal method's, not useService's
+ts.C18d	C18d	apps/web/src/services/store.ts::paperService.remove	apps/web/src/services/store.ts::svcHelper	edge	must		the arrow member's call is attributed to the member, not the file
+ts.C18c	C18c	apps/web/src/services/store.ts::useService	apps/web/src/services/store.ts::paperService.remove|apps/web/src/services/store.ts::paperService	edge	must		object-literal arrow member remove
 ts.C19a	C19a	apps/web/src/services/store.ts::useClient	apps/web/src/services/store.ts::MemClient.get|apps/web/src/services/store.ts::Client	edge	must	get	interface dispatch; at least the interface
 ts.C19b	C19b	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/services/store.ts::Client	edge	must		type-only reference
 ts.C20	C20	apps/web/src/hooks/usePapers.ts::usePapers	apps/web/src/lib/format.ts::identity	edge	must		identity<number>(rank)
@@ -55,7 +56,7 @@ ts.C21c	C21c	apps/web/src/services/api.ts::loadAll	apps/web/src/services/api.ts:
 ts.C22	C22	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/services/api.ts::loadAll	edge	must		call inside onClick arrow
 ts.C24	C24	apps/web/src/lib/format.test.ts	apps/web/src/lib/format.ts::formatTitle	edge	must		vitest call at file level
 ts.C25	C25	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/legacy/jsutil.js::jsDouble	edge	must		TS to JS
-ts.C26	C26	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/lib/casefile.ts::caseHelper	edge	should	caseHelper	import '../lib/CaseFile' wrong case: resolved with warning or flagged unresolved; never silent
+ts.C26	C26	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/lib/casefile.ts::caseHelper	forbid	must		import '../lib/CaseFile' names a file that exists only as casefile.ts: an import whose specifier resolves to nothing is flagged unresolved and never bound by bare name at the global tier (audit F1); was a `should` edge, satisfied by that global-tier luck
 ts.C27	C27	apps/web/src/components/PaperList.tsx::PaperList	packages/shared/src/index.ts::sharedFormat	edge	must		@acme/shared workspace package
 ts.C28a	C28a	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/components/Button.tsx::MemoBadge	edge	must		JSX to memo-wrapped
 ts.C28b	C28b	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/components/Button.tsx::FancyInput	edge	must		JSX to forwardRef-wrapped
@@ -72,8 +73,8 @@ ts.V8a	V8a	apps/web/src/v/arrowuser.ts::useArrow	apps/web/src/v/arrows.ts::expor
 ts.V8b	V8b	apps/web/src/v/arrowuser.ts::useArrow	apps/web/src/pages/heavy.ts::heavyCompute	edge	must		explicit .ts extension import
 ts.V8c	V8c	apps/web/src/v/arrowuser.ts::useArrow	apps/web/src/v/arrows.ts::Mode	edge	must		enum reference
 ts.V8d	V8d	apps/web/src/v/arrowuser.ts::useArrow	apps/web/src/v/arrows.ts::modeName	edge	must		call
-ts.V9a	V9a	apps/web/src/v/router.tsx::router	apps/web/src/v/router.tsx::RoutedPage	edge	must		JSX in route object
-ts.V9b	V9b	apps/web/src/v/router.tsx	apps/web/src/v/lazyroute.tsx::Component	edge	should		lazy route module; caller is the file
+ts.V9a	V9a	apps/web/src/v/router.tsx	apps/web/src/v/router.tsx::RoutedPage	edge	must		JSX in a route object at module level; caller is the file, as for every module-level call (C1c)
+ts.V9b	V9b	apps/web/src/v/router.tsx	apps/web/src/v/lazyroute.tsx	import	should		lazy route module `lazy: () => import('./lazyroute')`; the audit scored this file-level (V9), and the module's exports are named by the router at runtime, not by a symbol written here
 ts.V10	V10	apps/web/src/v/api.test.ts	apps/web/src/services/api.ts::loadAll	edge	must		call in test; affected loadAll lists api.test.ts
 ts.V11a	V11a	apps/web/src/v/grammar.ts::afterAbstract	apps/web/src/v/grammar.ts::beforeHelper	edge	must		calls after interface with abstract? field
 ts.V11b	V11b	apps/web/src/v/grammar.ts::afterAbstract	apps/web/src/v/grammar.ts::afterHelper	edge	must		
@@ -84,7 +85,8 @@ ts.V13a	V13a	apps/web/src/v/importtypeuser.tsx::ImportTypeUser	apps/web/src/v/im
 ts.V13b	V13b	apps/web/src/v/importtypeuser.tsx::ImportTypeUser	apps/web/src/v/importtype.tsx::useImportType	edge	must		
 ts.V14	V14	apps/web/src/v/view2user.ts::consumeWorkspace	apps/web/src/v/store2.ts::useWorkspace	edge	must		import {x} from; export {x}
 ts.V15a	V15a	apps/web/src/v/loggeruser.ts::useLogger	apps/web/src/v/logger.ts::getLogs	edge	must		shorthand property
-ts.V15b	V15b	apps/web/src/v/loggeruser.ts::useLogger	apps/web/src/v/logger.ts::clearLogs	edge	must		object-literal arrow member
+ts.V15b	V15b	apps/web/src/v/loggeruser.ts::useLogger	apps/web/src/v/logger.ts::logger.clear|apps/web/src/v/logger.ts::logger	edge	must		object-literal arrow member
+ts.V15c	V15c	apps/web/src/v/logger.ts::logger.clear	apps/web/src/v/logger.ts::clearLogs	edge	must		the arrow member's call is attributed to the member
 ts.V16	V16	apps/web/src/v/lexicalthis.ts::Gateway.open.connect	apps/web/src/v/lexicalthis.ts::Gateway.buildUrl	edge	must		this inside arrow nested in a method
 ts.V17a	V17a	apps/web/src/v/defaults.ts::withDeps	apps/web/src/v/defaults.ts::defaultSleep	edge	must		destructured default parameter reference
 ts.V17b	V17b	apps/web/src/v/defaults.ts::withDeps	apps/web/src/v/defaults.ts::repoRoot	edge	must		destructured default parameter call

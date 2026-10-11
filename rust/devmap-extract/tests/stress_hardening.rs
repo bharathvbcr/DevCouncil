@@ -787,8 +787,12 @@ fn a_brace_literal_in_an_export_is_indexed_rather_than_aborting_the_build() {
             "the real export must survive; {source:?} produced {exported:?}"
         );
         for name in &exported {
+            // An `export default` is published under the name `default`, which
+            // is what importers and barrels ask for; it is recorded only for
+            // the statement that wrote it.
+            let default_statement = source.starts_with("export default");
             assert!(
-                *name == real || *name == "mod.js",
+                *name == real || *name == "mod.js" || (default_statement && *name == "default"),
                 "{source:?} fabricated an export named {name:?}"
             );
         }

@@ -144,15 +144,3 @@ swift	sw.X4	miss	ft-32522da4	own-target type | today: absent today, recorded as 
 swift	sw.X6a	miss	ft-837a6f05	file compiled into the app target | today: absent today, recorded as an honest unresolved row
 swift	sw.X6b	miss	ft-837a6f05	file compiled into the widget target | today: absent today, recorded as an honest unresolved row
 swift	sw.X7	false_edge	ft-32522da4	ctor of own-module type that shadows an imported same-name type | today: HIGH edge to the wrong namesake ["xcode/ios/CoreKit/Sources/CoreKit/Engine.swift::Theme", "xcode/ios/CoreKit/Sources/CoreKit/Engine.swift::Theme"]
-ts	ts.C15	miss	ft-736b0b22	m.heavyCompute() after await import() | today: absent today, recorded as an honest unresolved row
-ts	ts.C17	silent_miss	ft-736b0b22	class-field arrow member | today: ledger rows exist but only in explained classes: [("handle", "no_namesake")]
-ts	ts.C18b	silent_miss	ft-736b0b22	svcHelper is live | today: no ledger row names {"svcHelper"}
-ts	ts.C7	silent_miss	ft-736b0b22	lazy import; AboutPage not dead | today: no ledger row names {"AboutPage"}
-ts	ts.V14	miss	ft-736b0b22	import {x} from; export {x} | today: absent today, recorded as an honest unresolved row
-ts	ts.V15b	silent_miss	ft-736b0b22	object-literal arrow member | today: no ledger row names {"clearLogs"}
-ts	ts.V16	miss	ft-736b0b22	this inside arrow nested in a method | today: absent today, recorded as an honest unresolved row
-ts	ts.V2	false_edge	ft-32522da4	external npm import must not bind to the local namesake | today: forbidden HIGH edge to ["apps/web/src/lib/format.ts::formatTitle"]
-ts	ts.V5a	miss	ft-736b0b22	export default memo(Card) + barrel | today: absent today, recorded as an honest unresolved row
-ts	ts.V8c	silent_miss	ft-736b0b22	enum reference | today: no ledger row names {"Mode"}
-ts	ts.V9a	silent_miss	ft-736b0b22	JSX in route object | today: no ledger row names {"RoutedPage"}
-ts	ts.V9b	silent_miss	ft-736b0b22	lazy route module; caller is the file | today: no ledger row names {"Component"}

@@ -614,7 +614,7 @@ export function Panel() {
         "src/Panel.tsx::Panel",
     );
     assert!(
-        targets.iter().any(|t| t == "src/core.ts::zzinfo"),
+        targets.iter().any(|t| t == "src/core.ts::logger.zzinfo"),
         "got {targets:?}"
     );
 }
