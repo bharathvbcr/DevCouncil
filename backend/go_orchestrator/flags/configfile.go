@@ -27,11 +27,11 @@ func LoadConfigFile(r *Registry, path string) (bool, error) {
 	}
 	defer func() { _ = f.Close() }()
 
-	values, err := ParseConfig(f)
+	layer, err := ParseConfigLayer(f)
 	if err != nil {
 		return true, fmt.Errorf("%s: %w", path, err)
 	}
-	if err := r.LoadConfig(values); err != nil {
+	if err := r.LoadLayer(layer); err != nil {
 		return true, fmt.Errorf("%s: %w", path, err)
 	}
 	return true, nil
@@ -112,12 +112,36 @@ func closeSection(stack []indentEntry, values map[string]string, seen map[string
 	return stack, nil
 }
 
+// ConfigLayer is a parsed config file together with where each key was
+// written. Values is what ParseConfig has always returned; Lines and Lists let
+// the registry refuse a key at the line an operator has to go and fix, and
+// refuse a block list written under a scalar setting, which the flat map cannot
+// represent.
+type ConfigLayer struct {
+	Values map[string]string
+	// Lines maps each key to the line that claimed it.
+	Lines map[string]int
+	// Lists maps each key that has a block list under it to the line of its
+	// first item.
+	Lists map[string]int
+}
+
 // ParseConfig reads YAML configuration files in either flat dotted form (llm.local.model: ...)
 // or hierarchical nested form (llm:\n  local:\n    model: ...), supporting lists, flow collections,
 // multiline quoted values, numbers, booleans, nulls, and comments.
 func ParseConfig(src io.Reader) (map[string]string, error) {
+	layer, err := ParseConfigLayer(src)
+	if err != nil {
+		return nil, err
+	}
+	return layer.Values, nil
+}
+
+// ParseConfigLayer is ParseConfig that also reports key positions and lists.
+func ParseConfigLayer(src io.Reader) (ConfigLayer, error) {
 	values := map[string]string{}
 	seen := map[string]int{}
+	lists := map[string]int{}
 
 	scanner := bufio.NewScanner(src)
 	scanner.Buffer(make([]byte, 0, 4096), 1<<20)
@@ -128,6 +152,7 @@ func ParseConfig(src io.Reader) (map[string]string, error) {
 		multilineKey       string
 		multilineQuote     byte
 		multilineStartLine int
+		multilineIndent    int
 		multilineBuf       strings.Builder
 	)
 
@@ -137,9 +162,29 @@ func ParseConfig(src io.Reader) (map[string]string, error) {
 			raw = strings.TrimPrefix(raw, "\ufeff")
 		}
 
+		// ScanLines already dropped a CR that ends a CRLF line, so one left
+		// inside the line is a bare CR: a CR-only file would otherwise be read
+		// as one giant line, its settings swallowed by the first comment.
+		if strings.IndexByte(raw, '\r') >= 0 {
+			return ConfigLayer{}, fmt.Errorf("line %d: a carriage return that is not part of a CRLF line ending; CR-only files are not supported, convert them to LF", line)
+		}
+
 		if inMultiline {
+			// A continuation of a quoted scalar is indented deeper than the key
+			// that owns it, so a line at or left of the key that reads `key:`
+			// before any quote is the next setting, and the quote that was
+			// meant to end the value is missing. Letting a quote further down
+			// the file close it would silently swallow every setting in
+			// between. (A bare closing quote at the left margin is still a
+			// close, not a setting.)
+			if before, _, _ := strings.Cut(raw, string(multilineQuote)); leadingIndent(raw) <= multilineIndent && strings.Contains(before, ":") {
+				return ConfigLayer{}, fmt.Errorf("line %d: the %q quote opened on line %d is never closed; this line is a new setting", line, string(multilineQuote), multilineStartLine)
+			}
 			idx := strings.IndexByte(raw, multilineQuote)
 			if idx >= 0 {
+				if tail := strings.TrimSpace(raw[idx+1:]); tail != "" && !strings.HasPrefix(tail, "#") {
+					return ConfigLayer{}, fmt.Errorf("line %d: unexpected %q after the closing quote", line, tail)
+				}
 				multilineBuf.WriteString(" ")
 				multilineBuf.WriteString(strings.TrimSpace(raw[:idx]))
 				inMultiline = false
@@ -183,7 +228,11 @@ func ParseConfig(src io.Reader) (map[string]string, error) {
 		// is what closeSection would otherwise report it as.
 		if strings.HasPrefix(trimmed, "- ") || trimmed == "-" {
 			if len(stack) > 0 {
+				top := stack[len(stack)-1]
 				stack[len(stack)-1].hadContent = true
+				if _, dup := lists[fullKeyOf(stack[:len(stack)-1], top.key)]; !dup {
+					lists[fullKeyOf(stack[:len(stack)-1], top.key)] = line
+				}
 			}
 			continue
 		}
@@ -192,7 +241,7 @@ func ParseConfig(src io.Reader) (map[string]string, error) {
 		for len(stack) > 0 && indent <= stack[len(stack)-1].indent {
 			var err error
 			if stack, err = closeSection(stack, values, seen); err != nil {
-				return nil, err
+				return ConfigLayer{}, err
 			}
 		}
 		if len(stack) > 0 {
@@ -201,14 +250,14 @@ func ParseConfig(src io.Reader) (map[string]string, error) {
 
 		keyPart, rest, ok := strings.Cut(trimmed, ":")
 		if !ok {
-			return nil, fmt.Errorf("line %d: no \":\" found; every line is a setting written as key: value", line)
+			return ConfigLayer{}, fmt.Errorf("line %d: no \":\" found; every line is a setting written as key: value", line)
 		}
 		keyPart = strings.TrimSpace(keyPart)
 		if keyPart == "" {
-			return nil, fmt.Errorf("line %d: the key is empty", line)
+			return ConfigLayer{}, fmt.Errorf("line %d: the key is empty", line)
 		}
-		if (strings.HasPrefix(keyPart, `"`) && strings.HasSuffix(keyPart, `"`)) ||
-			(strings.HasPrefix(keyPart, `'`) && strings.HasSuffix(keyPart, `'`)) {
+		if len(keyPart) >= 2 && ((strings.HasPrefix(keyPart, `"`) && strings.HasSuffix(keyPart, `"`)) ||
+			(strings.HasPrefix(keyPart, `'`) && strings.HasSuffix(keyPart, `'`))) {
 			keyPart = keyPart[1 : len(keyPart)-1]
 		}
 
@@ -227,11 +276,11 @@ func ParseConfig(src io.Reader) (map[string]string, error) {
 
 		val, isMulti, quoteByte, err := parseYAMLValue(rest)
 		if err != nil {
-			return nil, fmt.Errorf("line %d: %w", line, err)
+			return ConfigLayer{}, fmt.Errorf("line %d: %w", line, err)
 		}
 
 		if err := reserve(seen, fullKey, line); err != nil {
-			return nil, err
+			return ConfigLayer{}, err
 		}
 
 		if isMulti {
@@ -239,6 +288,7 @@ func ParseConfig(src io.Reader) (map[string]string, error) {
 			multilineKey = fullKey
 			multilineQuote = quoteByte
 			multilineStartLine = line
+			multilineIndent = indent
 			multilineBuf.Reset()
 			multilineBuf.WriteString(val)
 			continue
@@ -248,7 +298,7 @@ func ParseConfig(src io.Reader) (map[string]string, error) {
 	}
 
 	if inMultiline {
-		return nil, fmt.Errorf("line %d: the %q quote is never closed", multilineStartLine, string(multilineQuote))
+		return ConfigLayer{}, fmt.Errorf("line %d: the %q quote is never closed", multilineStartLine, string(multilineQuote))
 	}
 
 	// Checked before the open sections are closed: a scan that stopped early —
@@ -256,7 +306,7 @@ func ParseConfig(src io.Reader) (map[string]string, error) {
 	// never finished, and reporting a key as valueless because the reader gave
 	// up before reaching its contents would name the wrong fault.
 	if err := scanner.Err(); err != nil {
-		return nil, err
+		return ConfigLayer{}, err
 	}
 
 	// End of file closes whatever is still open, so a trailing key with nothing
@@ -264,10 +314,10 @@ func ParseConfig(src io.Reader) (map[string]string, error) {
 	for len(stack) > 0 {
 		var err error
 		if stack, err = closeSection(stack, values, seen); err != nil {
-			return nil, err
+			return ConfigLayer{}, err
 		}
 	}
-	return values, nil
+	return ConfigLayer{Values: values, Lines: seen, Lists: lists}, nil
 }
 
 func parseYAMLValue(rest string) (val string, isMultiline bool, quoteByte byte, err error) {
@@ -319,4 +369,21 @@ func (r *Registry) ConfiguredKeys() []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// leadingIndent measures indentation the way the parser does: a space is one
+// column and a tab two.
+func leadingIndent(raw string) int {
+	indent := 0
+	for _, r := range raw {
+		switch r {
+		case ' ':
+			indent++
+		case '\t':
+			indent += 2
+		default:
+			return indent
+		}
+	}
+	return indent
 }

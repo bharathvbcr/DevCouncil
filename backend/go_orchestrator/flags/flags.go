@@ -232,11 +232,15 @@ func (r *Registry) Define(defs ...Def) error {
 // isHarnessNamespace reports whether key belongs to a namespace defined by the harness.
 // Unknown keys in harness namespaces are typos that must fail; keys in foreign or shared
 // namespaces (e.g. DevCouncil core settings in .devcouncil/config.yaml) are preserved.
+// The bare namespace name (`harness`, `grants`, `policy`) belongs to it too: a
+// scalar or flow mapping written there (`harness: {posture: yolo}`) holds
+// settings the flat key model cannot see, and treating it as foreign dropped
+// them without a word.
 func (r *Registry) isHarnessNamespace(key string) bool {
 	for definedKey := range r.defs {
 		if idx := strings.IndexByte(definedKey, '.'); idx >= 0 {
 			prefix := definedKey[:idx+1]
-			if strings.HasPrefix(key, prefix) {
+			if strings.HasPrefix(key, prefix) || key == prefix[:idx] {
 				return true
 			}
 		} else if key == definedKey || strings.HasPrefix(key, definedKey+".") {
@@ -250,24 +254,48 @@ func (r *Registry) isHarnessNamespace(key string) bool {
 // value must be legal — a typo in harness settings is reported, never ignored.
 // Shared repository settings outside harness namespaces are passed over safely.
 func (r *Registry) LoadConfig(values map[string]string) error {
+	return r.LoadLayer(ConfigLayer{Values: values})
+}
+
+// LoadLayer is LoadConfig with the positions and lists ParseConfigLayer
+// reports, so a refusal names the line and a block list under a scalar setting
+// is refused rather than closed as an empty section.
+func (r *Registry) LoadLayer(layer ConfigLayer) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var unknown []string
 	toSet := map[string]string{}
+	at := func(k string) string {
+		if line, ok := layer.Lines[k]; ok {
+			return fmt.Sprintf("%s (line %d)", k, line)
+		}
+		return k
+	}
 
-	for k, v := range values {
+	for k, v := range layer.Values {
 		d, ok := r.defs[k]
 		if !ok {
-			if r.isHarnessNamespace(k) {
-				unknown = append(unknown, k)
+			// A bare namespace name carrying nothing is a section header that
+			// had no children (or `{}`); with a value it is a flow mapping or
+			// scalar standing where nested keys belong.
+			if r.isHarnessNamespace(k) && (strings.Contains(k, ".") || v != "") {
+				unknown = append(unknown, at(k))
 			}
 			continue
 		}
 
 		if err := validate(d, normalize(v)); err != nil {
-			return fmt.Errorf("flags: config %q: %w", k, err)
+			return fmt.Errorf("flags: config %s: %w", at(k), err)
 		}
 		toSet[k] = normalize(v)
+	}
+	for k, line := range layer.Lists {
+		if _, ok := r.defs[k]; ok {
+			return fmt.Errorf("flags: config %q (line %d): %q is a single setting; a block list is not a legal value", k, line, k)
+		}
+		if r.isHarnessNamespace(k) {
+			unknown = append(unknown, fmt.Sprintf("%s (line %d, a block list)", k, line))
+		}
 	}
 
 	if len(unknown) > 0 {
