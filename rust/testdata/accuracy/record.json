@@ -1,6 +1,6 @@
 {
- "about": "Corpus record for the dead-code confident tier, read by devmap-cli/tests/dead_tier_eligibility.rs. Each corpus is a `git archive` of the named commit, built with the binary named in `built_from`; `rows` are the dead rows whose evidence reached the confident branch (published at 0.9, coverage-capped below it, or capped with confident_tier_unproven), each labelled from source by `rg -uu -w` and reading: dead_true (nothing reaches it), dead_false (a path:line reaches it), unsure (excluded from `rows`, listed). A listed language must have false_positive*20 <= rows on every corpus.",
- "built_from": "devmap 0.2.4 (store schema 27, code graph schema 2, build 4fb915fe7a73) — a clean release build of commit 4fb915fe, the commit before the one that last wrote this file (no code changed between them)",
+ "about": "Corpus record for the dead-code confident tier, read by devmap-cli/tests/dead_tier_eligibility.rs. Each corpus is a `git archive` of the named commit, built with the binary named in `built_from`; every corpus built is listed, with every language it holds dead candidates or exempt symbols of — a language with rows: 0 was measured and had no confident-branch row; `rows` are the dead rows whose evidence reached the confident branch (published at 0.9, coverage-capped below it, or capped with confident_tier_unproven), each labelled from source by `rg -uu -w` and reading: dead_true (nothing reaches it), dead_false (a path:line reaches it), unsure (excluded from `rows`, listed). A listed language must have false_positive*20 <= rows on every corpus.",
+ "built_from": "devmap 0.2.4 (store schema 27, code graph schema 2, build 2b8762cca6dc) — a clean release build of commit 2b8762cc, the commit before the one that last wrote this file (no code changed between them)",
  "measured": "2026-10-10",
  "corpora": [
   {
@@ -36,6 +36,16 @@
       }
      ]
     },
+    "rust": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    },
     "tsx": {
      "dead_fp_by_tier": {
       "0.9": {
@@ -58,6 +68,68 @@
        "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'BulkUpdates' : 1 hit, the declaration (non-exported type alias) components/BulkOperationsModal.tsx:19"
       }
      ]
+    },
+    "typescript": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    }
+   }
+  },
+  {
+   "name": "AppLock",
+   "commit": "e539a3e6099b29b71ce1c18114e4512547612df1",
+   "languages": {
+    "swift": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    }
+   }
+  },
+  {
+   "name": "Blitztree",
+   "commit": "74658ec536481cf04515cff33ed6b129f5a9f7dd",
+   "languages": {
+    "python": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    },
+    "rust": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    },
+    "swift": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
     }
    }
   },
@@ -283,6 +355,26 @@
        "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'MediaRef'  -> 1 hit: the declaration media.rs:124 (#[derive(serde::Deserialize)] struct MediaRef(pub String)); the derive generates an impl but nothing names MediaRef as a deserialization target anywhere (validate_media_ref_list at :126 works on serde_json Value)"
       }
      ]
+    },
+    "tsx": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    },
+    "typescript": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
     }
    }
   },
@@ -354,6 +446,52 @@
        "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'taskChecklistSectionSubtitle' <corpus_root> -> 1 hit, the declaration feature/tasks/src/main/java/com/ChronosFlow/VBCR/feature/tasks/TaskFormSheet.kt:3465 (private top-level fun returning String; no annotation, not @Composable, not override/operator; private so no Java/other-file caller; no callable reference or string mention)"
       }
      ]
+    },
+    "python": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    },
+    "swift": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    }
+   }
+  },
+  {
+   "name": "Curio",
+   "commit": "c211296cf7b3cee801524320027d8ac5ec66ebd7",
+   "languages": {
+    "kotlin": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    },
+    "swift": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
     }
    }
   },
@@ -361,6 +499,16 @@
    "name": "DevCouncil",
    "commit": "acb5e3b9b8d05d58437cd8710259f9b76a619b70",
    "languages": {
+    "go": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    },
     "python": {
      "dead_fp_by_tier": {
       "0.9": {
@@ -395,6 +543,16 @@
        "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w out_rest <root>: 1 hit (teardown_probe_driver.py:28 'out_rest, err = p.communicate()' - assigned, never read)"
       }
      ]
+    },
+    "rust": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
     }
    }
   },
@@ -435,6 +593,134 @@
        "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w 'notes_intact'  -> 1 hit: the declaration stress.rs:616 inside the inherent impl DocFixture (stress.rs:576; the only trait impl is Drop at :569, which defines drop); sibling helpers master_intact/sentinel_untouched are used by the tests but notes_intact is never called, passed as fn value, or named in a macro"
       }
      ]
+    },
+    "tsx": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    },
+    "typescript": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    }
+   }
+  },
+  {
+   "name": "DevType",
+   "commit": "c3697c21bf9ee10cf49d4ac2e53761adb65b82f4",
+   "languages": {
+    "python": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    },
+    "swift": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    }
+   }
+  },
+  {
+   "name": "GitPulse",
+   "commit": "9a9f0b07c1782099cb29806879348c3e30f9f569",
+   "languages": {
+    "go": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    },
+    "kotlin": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    },
+    "rust": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    },
+    "swift": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    },
+    "typescript": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    }
+   }
+  },
+  {
+   "name": "Jarvis",
+   "commit": "74c0cde4c593abd29c89613088ba75623836104a",
+   "languages": {
+    "go": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    },
+    "rust": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
     }
    }
   },
@@ -596,6 +882,26 @@
       }
      ]
     },
+    "rust": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    },
+    "tsx": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    },
     "typescript": {
      "dead_fp_by_tier": {
       "0.9": {
@@ -748,9 +1054,35 @@
    }
   },
   {
+   "name": "M5Blade",
+   "commit": "b7cb408c112d015de0d8f8a67a8b244b8fa7030c",
+   "languages": {
+    "swift": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    }
+   }
+  },
+  {
    "name": "Manvi",
    "commit": "b689a82a96f62b1429b55187577ce2c5b4a749f7",
    "languages": {
+    "go": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    },
     "python": {
      "dead_fp_by_tier": {
       "0.9": {
@@ -797,6 +1129,52 @@
        "evidence": "bench/tasks/state_machine_fuzz/hidden_test.py:3 from proto import Parser, ProtocolError and :15 default exc=ProtocolError - import by module name at run time: sandbox materialised by copytree(setup_dir) (bench/mh/bench.py:248), so proto resolves to this starter file until the candidate replaces it (selftest.py overlays reference/ instead); SPEC.md:8 requires the class. reference/proto.py is a same-named solution copy; rpc.py:362 is an unrelated docstring"
       }
      ]
+    },
+    "rust": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    }
+   }
+  },
+  {
+   "name": "MarkDev",
+   "commit": "20dec7a820923411b21b9dc5acb25ac4ca3ef746",
+   "languages": {
+    "python": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    },
+    "rust": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    },
+    "swift": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
     }
    }
   },
@@ -804,6 +1182,16 @@
    "name": "Meridian",
    "commit": "0b16935a607acefba430b80ace12fbb8752b429a",
    "languages": {
+    "kotlin": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    },
     "python": {
      "dead_fp_by_tier": {
       "0.9": {
@@ -832,6 +1220,16 @@
        "evidence": "tools/semantic_layer/semantic_layer/benchmark.py:152 'cache: SemanticCache = pipe.cache' - property access on SemanticPipeline built at benchmark.py:147"
       }
      ]
+    },
+    "swift": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
     }
    }
   },
@@ -873,6 +1271,16 @@
        "evidence": "RIPGREP_CONFIG_PATH= rg -uu -n -w to_prometheus_lines <root>: 1 hit (metrics.py:66 declaration); to_prometheus_text (metrics.py:178) calls only to_prometheus_line (singular) on counters/threshold"
       }
      ]
+    },
+    "rust": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
     },
     "tsx": {
      "dead_fp_by_tier": {
@@ -917,9 +1325,51 @@
    }
   },
   {
+   "name": "Strait",
+   "commit": "adce8ddb93a588585b815226eef41ce6c34f68d6",
+   "languages": {
+    "swift": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    }
+   }
+  },
+  {
+   "name": "TrailBlazer",
+   "commit": "25d339d0d8bc114e6fdbf5aec23aad44503c15cd",
+   "languages": {
+    "kotlin": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    }
+   }
+  },
+  {
    "name": "scholarlm",
    "commit": "a2cc182d82dd76d3f15396a3606de96acaef8b2a",
    "languages": {
+    "go": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
+    },
     "python": {
      "dead_fp_by_tier": {
       "0.9": {
@@ -972,6 +1422,16 @@
        "evidence": "backend/python_sidecar/services/entailment_service.py:797 'from services.vertex_entailment import BACKEND_VERTEX, model_id' and :807 '\"backend\": BACKEND_VERTEX' - direct reference (also :649, :702)"
       }
      ]
+    },
+    "rust": {
+     "dead_fp_by_tier": {
+      "0.9": {
+       "false_positive": 0,
+       "rows": 0
+      }
+     },
+     "unsure": 0,
+     "labelled_rows": []
     },
     "tsx": {
      "dead_fp_by_tier": {
