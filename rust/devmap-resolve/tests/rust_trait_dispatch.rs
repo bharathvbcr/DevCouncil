@@ -85,7 +85,11 @@ fn a_dyn_trait_parameter_binds_the_trait_declaration() {
         r.from("src/lib.rs::caller"),
         r.unresolved
     );
-    assert!(r.binds_no_impl("src/lib.rs::caller", IMPLS), "{:?}", r.edges);
+    assert!(
+        r.binds_no_impl("src/lib.rs::caller", IMPLS),
+        "{:?}",
+        r.edges
+    );
 }
 
 #[test]
@@ -100,7 +104,11 @@ fn a_boxed_dyn_local_binds_the_trait_declaration() {
         r.from("src/lib.rs::caller"),
         r.unresolved
     );
-    assert!(r.binds_no_impl("src/lib.rs::caller", IMPLS), "{:?}", r.edges);
+    assert!(
+        r.binds_no_impl("src/lib.rs::caller", IMPLS),
+        "{:?}",
+        r.edges
+    );
 }
 
 #[test]
@@ -165,7 +173,11 @@ pub fn caller() -> u8 {{\n    let r = make();\n    r.render()\n}}\n"
         r.from("src/lib.rs::caller"),
         r.unresolved
     );
-    assert!(r.binds_no_impl("src/lib.rs::caller", IMPLS), "{:?}", r.edges);
+    assert!(
+        r.binds_no_impl("src/lib.rs::caller", IMPLS),
+        "{:?}",
+        r.edges
+    );
 }
 
 #[test]
@@ -197,7 +209,11 @@ fn a_generic_bounded_by_one_trait_binds_the_trait_declaration() {
         r.from("src/lib.rs::caller"),
         r.unresolved
     );
-    assert!(r.binds_no_impl("src/lib.rs::caller", IMPLS), "{:?}", r.edges);
+    assert!(
+        r.binds_no_impl("src/lib.rs::caller", IMPLS),
+        "{:?}",
+        r.edges
+    );
 }
 
 #[test]
@@ -224,8 +240,12 @@ pub fn caller<T: A + B>(t: &T) -> u8 {\n    t.render()\n}\n";
     let r = resolve(&[("src/lib.rs", src)]);
     assert!(
         !r.from("src/lib.rs::caller").iter().any(|e| e.3 >= 900
-            && ["src/lib.rs::T.render", "src/lib.rs::A.render", "src/lib.rs::B.render"]
-                .contains(&e.1.as_str())),
+            && [
+                "src/lib.rs::T.render",
+                "src/lib.rs::A.render",
+                "src/lib.rs::B.render"
+            ]
+            .contains(&e.1.as_str())),
         "{:?}",
         r.edges
     );

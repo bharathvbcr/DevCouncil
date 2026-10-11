@@ -1918,7 +1918,10 @@ impl Resolver {
             return Some(ty);
         }
         let Some(header) = caller
-            .and_then(|caller| self.rust_signatures.get(&(file.to_string(), caller.to_string())))
+            .and_then(|caller| {
+                self.rust_signatures
+                    .get(&(file.to_string(), caller.to_string()))
+            })
             .and_then(|signature| parse_header(signature))
         else {
             return Some(ty);
@@ -1947,7 +1950,10 @@ impl Resolver {
                     )
             },
         );
-        matches!((rust.next(), rust.next()), (Some((_, SymbolKind::Trait, _, _)), None))
+        matches!(
+            (rust.next(), rust.next()),
+            (Some((_, SymbolKind::Trait, _, _)), None)
+        )
     }
 
     /// The type a Rust binding has according to a **function header** in the
@@ -3455,11 +3461,7 @@ impl Resolver {
                 // file edge, which the resolution pass emits.
                 if let Some(load) = &imp.path_load {
                     if let Some(local) = imp.alias.as_ref() {
-                        if let Some(target) = self.resolve_path_load(
-                            &ext.file_path,
-                            &imp.module_specifier,
-                            load.anchor_up,
-                        ) {
+                        if let Some(target) = self.resolve_loaded_module(ext, imp, load) {
                             file_path_modules.insert((load.scope.clone(), local.clone()), target);
                         }
                     }
@@ -4498,11 +4500,7 @@ impl Resolver {
                     let targets = match &imp.path_load {
                         // A `sys.path` entry is not an import of anything.
                         Some(load) if load.kind == PathLoadKind::SearchDirectory => continue,
-                        Some(load) => match self.resolve_path_load(
-                            &ext.file_path,
-                            &imp.module_specifier,
-                            load.anchor_up,
-                        ) {
+                        Some(load) => match self.resolve_loaded_module(ext, imp, load) {
                             // Already linked: neither a second edge nor a
                             // spurious "resolved to nothing" row.
                             Some(target) if !path_loaded.insert(target.clone()) => continue,
@@ -8610,6 +8608,28 @@ impl Resolver {
             }
         }
         Vec::new()
+    }
+
+    /// The one indexed file a Python module handle's load names: by path
+    /// ([`Self::resolve_path_load`]), or — for `importlib.import_module` with a
+    /// literal — by module name, exactly as `import <name>` here would resolve
+    /// it, and only when that names one file.
+    fn resolve_loaded_module(
+        &self,
+        ext: &Extraction,
+        imp: &ExtractedImport,
+        load: &devmap_extract::model::PathLoad,
+    ) -> Option<String> {
+        if load.kind == PathLoadKind::ModuleName {
+            let mut targets = self.resolve_import_targets_or_search_dirs(ext, imp);
+            targets.sort();
+            targets.dedup();
+            return match targets.as_slice() {
+                [only] => Some(only.clone()),
+                _ => None,
+            };
+        }
+        self.resolve_path_load(&ext.file_path, &imp.module_specifier, load.anchor_up)
     }
 
     /// The indexed file a Python path load names, or `None`.

@@ -649,7 +649,10 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Trait` (bare, behind a reference, or in a `Box`/`Rc`/`Arc`) by its one named
 /// trait, so a method call on it reaches the trait's declaration. A v87 row
 /// leaves such a binding untyped, so the call would stay an unattributed miss
-/// from a warm cache until the file was edited.
+/// from a warm cache until the file was edited. It also records a Python
+/// `importlib.import_module("pkg.mod")` with a literal name as a scoped module
+/// handle (`PathLoadKind::ModuleName`), which a v87 row lacks, so `mod.f()`
+/// through it would stay unresolved.
 pub const EXTRACTION_SCHEMA_VERSION: &str = "88";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

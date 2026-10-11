@@ -860,7 +860,8 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // v87 is the Kotlin accuracy payload (typed parameters and properties, scope
     // functions, `package` headers, Android manifests, Ruby attributes).
     //
-    // v88 types a Rust `dyn Trait` / `impl Trait` binding by its trait.
+    // v88 types a Rust `dyn Trait` / `impl Trait` binding by its trait, and
+    // records a literal Python `importlib.import_module` as a module handle.
     assert_eq!(
         EXTRACTION_SCHEMA_VERSION, "88",
         "reading <script> blocks changes what a cached payload means, and so does \

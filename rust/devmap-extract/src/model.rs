@@ -912,6 +912,12 @@ pub enum PathLoadKind {
     /// ever emitted with an anchor (`anchor_up` is `Some`), and never for a
     /// file that also removes or reassigns `sys.path`.
     SearchDirectory,
+    /// `module_specifier` is an absolute dotted module **name**, not a path:
+    /// `mod = importlib.import_module("pkg.util")` with a literal argument,
+    /// which is `import pkg.util as mod` spelled as a call. It is resolved as
+    /// that import would be, and binds the handle under the same scoped rules
+    /// as a path-loaded one.
+    ModuleName,
 }
 
 impl PathLoadKind {
