@@ -69,7 +69,7 @@ func secretOperandViolation(clause, root string) string {
 	// files and sed -i's targets change a file without printing it; the write
 	// rungs judge them under path.secret, and calling them a read would both
 	// misname the refusal and displace the write rule that is the right one.
-	writtenList, _, _ := argumentWriteTargets(clause)
+	writtenList := argumentWriteTargets(clause).targets
 	written := make(map[string]bool, len(writtenList))
 	for _, w := range writtenList {
 		written[w] = true
@@ -140,15 +140,8 @@ func secretOperandViolation(clause, root string) string {
 // gitSubcommand is the first non-option word after `git`, stepping over the
 // global options that take a value.
 func gitSubcommand(words []shellWord) string {
-	for i := 0; i < len(words); i++ {
-		text := words[i].text
-		if !strings.HasPrefix(text, "-") {
-			return text
-		}
-		name, _, hasValue := strings.Cut(text, "=")
-		if !hasValue && gitGlobalOptionsWithValue[name] {
-			i++
-		}
+	if at := gitSubcommandAt(words); at >= 0 {
+		return words[at].text
 	}
 	return ""
 }

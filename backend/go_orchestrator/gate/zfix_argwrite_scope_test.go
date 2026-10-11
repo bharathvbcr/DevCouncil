@@ -57,6 +57,11 @@ func TestCommandGateJudgesEveryArgumentWriteAsTheFileGateDoes(t *testing.T) {
 	}
 	for name, template := range scopedWriteCommands {
 		for _, class := range classes {
+			// A removal is judged as a delete: the planned file is planned for
+			// modification, so removing it is outside what the task may do.
+			if name == "rm" && class.name == "planned" {
+				class.blocked, class.rule = true, policy.RuleOperation
+			}
 			command := strings.ReplaceAll(template, "TARGET", class.target)
 			t.Run(name+"/"+class.name, func(t *testing.T) {
 				g := newGate(t, nil)
@@ -82,11 +87,12 @@ func TestCommandGateJudgesEveryArgumentWriteAsTheFileGateDoes(t *testing.T) {
 	}
 }
 
-// The verdict must be the one policy.check.file gives the same path.
+// The verdict must be the one policy.check.file gives the same path for the
+// operation the command performs: rm removes it.
 func TestCommandGateVerdictEqualsFileGateVerdict(t *testing.T) {
 	for _, target := range []string{"src/calc.go", "internal/other.go", ".env", "../outside.txt"} {
 		g := newGate(t, nil)
-		fileVerdict, err := g.EvaluateWrite(target, scopedWriteTask(), dc.OpWrite)
+		fileVerdict, err := g.EvaluateWrite(target, scopedWriteTask(), dc.OpDelete)
 		if err != nil {
 			t.Fatal(err)
 		}

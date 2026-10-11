@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"errors"
 	"fmt"
 	"path"
 	"strings"
@@ -50,6 +51,11 @@ type RedirectSet struct {
 	Targets []string
 	// Opaque reports a write this scan could not name or enumerate.
 	Opaque bool
+	// Deletes are the Targets that are only removed — rm, rmdir, unlink, shred
+	// -u, git rm, git clean — and never also written, so a caller that tells
+	// the operations apart can judge them as dc.OpDelete. They stay in Targets,
+	// so a caller that does not is judging them as writes, as before.
+	Deletes []string
 	// Unjudged, when set, says why the line writes files its text does not
 	// name (git apply, patch with no file operand, xargs or find running a
 	// writer). It is not Opaque: with no task scope there is no fence for such
@@ -61,10 +67,18 @@ type RedirectSet struct {
 // beside the targets, so the one caller that knows whether a scope is bound
 // can decide what Unjudged means.
 func RedirectWrites(command string) (RedirectSet, error) {
-	targets, opaque, unjudged, err := redirectTargets(command, 0)
+	found, err := redirectTargets(command, 0)
 	if err != nil {
 		return RedirectSet{}, err
 	}
+	targets, opaque, unjudged := found.targets, found.opaque, found.unjudged
+	named := make(map[string]int, len(found.deleted))
+	for _, target := range targets {
+		if found.deleted[target] > 0 {
+			named[target]++
+		}
+	}
+	var deletes []string
 	// Deduplicated, and bounded. Both are about what the caller does with this
 	// list: it puts every entry through the write gate, so the length of the
 	// list is a multiplier on the cost of judging one command line.
@@ -88,12 +102,15 @@ func RedirectWrites(command string) (RedirectSet, error) {
 			// Past the cap the enumeration is incomplete, and incomplete is
 			// exactly what opacity means — the caller refuses rather than
 			// judging a prefix of the writes and calling it the whole set.
-			return RedirectSet{Targets: distinct, Opaque: true, Unjudged: unjudged}, nil
+			return RedirectSet{Targets: distinct, Deletes: deletes, Opaque: true, Unjudged: unjudged}, nil
 		}
 		seen[target] = struct{}{}
 		distinct = append(distinct, target)
+		if found.deleted[target] > 0 && found.deleted[target] == named[target] {
+			deletes = append(deletes, target)
+		}
 	}
-	return RedirectSet{Targets: distinct, Opaque: opaque, Unjudged: unjudged}, nil
+	return RedirectSet{Targets: distinct, Deletes: deletes, Opaque: opaque, Unjudged: unjudged}, nil
 }
 
 // streamDevices are the device paths a redirection writes to without creating
@@ -153,7 +170,38 @@ func IsStreamDevice(target string) bool {
 // first sixty-four writes and ignoring the rest.
 const maxRedirectTargets = 64
 
-func redirectTargets(command string, depth int) ([]string, bool, string, error) {
+// redirectFindings is what scanning one command line found.
+type redirectFindings struct {
+	targets []string
+	// deleted counts, per target, the commands in the line that remove it. A
+	// deleted target is also in targets, once per command that names it; it is
+	// a delete only when every one of those is a removal.
+	deleted  map[string]int
+	opaque   bool
+	unjudged string
+}
+
+// scanMemo remembers what one RedirectWrites call has already found for a span
+// at a depth. descend and reconcileWithSubstitutions both scan every
+// substitution span, so without it each level scanned its span twice and a
+// line nested n deep cost 2^n scans of the remainder — bounded by
+// maxSubstitutionDepth, but a factor of 256 on every nested command.
+type scanMemo map[memoKey]redirectFindings
+
+type memoKey struct {
+	text  string
+	depth int
+}
+
+func redirectTargets(command string, depth int) (redirectFindings, error) {
+	return redirectTargetsMemo(command, depth, scanMemo{})
+}
+
+func redirectTargetsMemo(command string, depth int, memo scanMemo) (redirectFindings, error) {
+	key := memoKey{command, depth}
+	if found, ok := memo[key]; ok {
+		return found, nil
+	}
 	// Exhausting the bound reports opacity, not an error. Both mean "there may
 	// be a write in here that I did not resolve", but they travel differently:
 	// opacity becomes a recorded command.substitution denial the run log counts
@@ -165,15 +213,17 @@ func redirectTargets(command string, depth int) ([]string, bool, string, error) 
 	// reported as "no targets", which is how "approved" comes to mean
 	// "unexamined".
 	if depth > maxSubstitutionDepth {
-		return nil, true, "", nil
+		return redirectFindings{opaque: true}, nil
 	}
-	s := redirectScan{runes: []rune(command), depth: depth}
+	s := redirectScan{runes: []rune(command), depth: depth, memo: memo}
 	if err := s.scanOperators(); err != nil {
-		return nil, false, "", err
+		return redirectFindings{}, err
 	}
 	s.addArgumentWrites()
 	s.reconcileWithSubstitutions(command)
-	return s.targets, s.opaque, s.unjudged, nil
+	found := redirectFindings{targets: s.targets, deleted: s.deleted, opaque: s.opaque, unjudged: s.unjudged}
+	memo[key] = found
+	return found, nil
 }
 
 // redirectScan is one command line's walk in redirectTargets: the line, the
@@ -181,8 +231,10 @@ func redirectTargets(command string, depth int) ([]string, bool, string, error) 
 type redirectScan struct {
 	runes []rune
 	depth int
+	memo  scanMemo
 
 	targets  []string
+	deleted  map[string]int
 	opaque   bool
 	unjudged string
 
@@ -259,13 +311,14 @@ func (s *redirectScan) scanOperators() error {
 // are. Its findings merge into this command's, because sh performs them
 // whether or not the surrounding line has a redirect of its own.
 func (s *redirectScan) descend(inner string) error {
-	innerTargets, innerOpaque, innerUnjudged, err := redirectTargets(inner, s.depth+1)
+	inside, err := redirectTargetsMemo(inner, s.depth+1, s.memo)
 	if err != nil {
 		return err
 	}
-	s.targets = append(s.targets, innerTargets...)
-	s.opaque = s.opaque || innerOpaque
-	s.noteUnjudged(innerUnjudged)
+	s.targets = append(s.targets, inside.targets...)
+	s.noteDeleted(inside.deleted)
+	s.opaque = s.opaque || inside.opaque
+	s.noteUnjudged(inside.unjudged)
 	return nil
 }
 
@@ -296,6 +349,11 @@ func (s *redirectScan) arithmeticExpansion(i int) (int, error) {
 	// ordinary files — so those are extracted and descended into, and
 	// nothing else is.
 	nested, err := liveSubstitutions(inner)
+	if errors.Is(err, errNestedTooDeep) {
+		s.opaque = true
+		s.masked.WriteString(substitutionPlaceholder)
+		return next, nil
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -469,10 +527,23 @@ func readRedirectTarget(runes []rune, start int) (string, int, error) {
 // redirect and passed the other four. See argumentWriteTargets for which
 // commands and why.
 func (s *redirectScan) addArgumentWrites() {
-	argTargets, argOpaque, argUnjudged := argumentWriteTargets(s.masked.String())
-	s.targets = append(s.targets, argTargets...)
-	s.opaque = s.opaque || argOpaque
-	s.noteUnjudged(argUnjudged)
+	args := argumentWriteTargets(s.masked.String())
+	s.targets = append(s.targets, args.targets...)
+	for _, d := range args.deletes {
+		s.noteDeleted(map[string]int{d: 1})
+	}
+	s.opaque = s.opaque || args.opaque
+	s.noteUnjudged(args.unjudged)
+}
+
+// noteDeleted records targets a command removes.
+func (s *redirectScan) noteDeleted(more map[string]int) {
+	for target, n := range more {
+		if s.deleted == nil {
+			s.deleted = map[string]int{}
+		}
+		s.deleted[target] += n
+	}
 }
 
 // noteUnjudged keeps the first reason a line writes files it does not name.
@@ -525,13 +596,13 @@ func (s *redirectScan) reconcileWithSubstitutions(command string) {
 		// than adding a second, independent one. Past the bound the call
 		// returns opacity immediately, which is both the fail-closed answer
 		// and what stops this walk.
-		spanTargets, spanOpaque, spanUnjudged, spanErr := redirectTargets(span, s.depth+1)
-		s.noteUnjudged(spanUnjudged)
-		if spanErr != nil || spanOpaque {
+		inside, spanErr := redirectTargetsMemo(span, s.depth+1, s.memo)
+		s.noteUnjudged(inside.unjudged)
+		if spanErr != nil || inside.opaque {
 			s.opaque = true
 			return
 		}
-		for _, target := range spanTargets {
+		for _, target := range inside.targets {
 			if _, ok := have[target]; !ok {
 				s.opaque = true
 				return

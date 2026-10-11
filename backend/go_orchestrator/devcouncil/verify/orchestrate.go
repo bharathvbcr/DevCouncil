@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/policy"
 	"os"
 	"os/exec"
 	"strings"
@@ -409,7 +410,7 @@ func CollectGitState(ctx context.Context, root string) (changed []string, diff s
 	if err != nil {
 		return nil, "", true, err
 	}
-	nameOut, err := runGit(ctx, git, gitListingLimit, "diff", "HEAD", "--name-only", "-z")
+	nameOut, err := runGit(ctx, git, gitListingLimit, append([]string{"diff", "HEAD", "--name-only", "-z"}, toolStateExcludes()...)...)
 	headless := false
 	if err != nil {
 		if !hasNoHead(ctx, git) {
@@ -421,7 +422,9 @@ func CollectGitState(ctx context.Context, root string) (changed []string, diff s
 	add := func(listing []byte) {
 		for _, p := range strings.Split(string(listing), "\x00") {
 			p = strings.TrimSpace(strings.ReplaceAll(p, "\\", "/"))
-			if p == "" {
+			// Tool-owned state is not the agent's work; policy.ToolStateDirs
+			// is the list the write policy protects, so the two cannot differ.
+			if p == "" || policy.IsToolState(p) {
 				continue
 			}
 			if _, ok := seen[p]; !ok {
@@ -445,7 +448,7 @@ func CollectGitState(ctx context.Context, root string) (changed []string, diff s
 	}
 	add([]byte(strings.Join(dirty, "\x00")))
 	if !headless {
-		diffBytes, err := runGit(ctx, git, gitDiffLimit, "-c", "core.quotePath=false", "diff", "HEAD")
+		diffBytes, err := runGit(ctx, git, gitDiffLimit, append([]string{"-c", "core.quotePath=false", "diff", "HEAD"}, toolStateExcludes()...)...)
 		if err != nil {
 			return nil, "", true, err
 		}
@@ -453,6 +456,20 @@ func CollectGitState(ctx context.Context, root string) (changed []string, diff s
 	}
 	empty = len(changed) == 0 && strings.TrimSpace(diff) == ""
 	return changed, diff, empty, nil
+}
+
+// ToolOwned reports whether a changed path is state a DevCouncil tool wrote,
+// which verification never judges. See policy.ToolStateDirs.
+func ToolOwned(path string) bool { return policy.IsToolState(path) }
+
+// toolStateExcludes is the pathspec that leaves policy.ToolStateDirs out of a
+// diff of the whole tree.
+func toolStateExcludes() []string {
+	spec := []string{"--", "."}
+	for _, dir := range policy.ToolStateDirs {
+		spec = append(spec, ":(top,exclude)"+dir)
+	}
+	return spec
 }
 
 // hasNoHead reports whether the repository has no HEAD commit yet: git ran

@@ -14,8 +14,14 @@ import (
 
 // argWrites is what one command's arguments say it writes.
 type argWrites struct {
-	// targets are the literal files written.
+	// targets are the literal files written. Every deletion is in here too, so
+	// a caller that does not tell the two apart still judges it as a write.
 	targets []string
+	// deletes are the targets the command removes rather than writes (rm,
+	// rmdir, unlink, shred -u, git rm, git clean). A subset of targets: the
+	// write evaluator judges them as dc.OpDelete, so a file planned for
+	// modification is not also a file the command may remove.
+	deletes []string
 	// opaque reports a file that is written but whose name only the shell can
 	// compute ($VAR, ~, a substitution): refused wherever it appears.
 	opaque bool
@@ -29,6 +35,7 @@ type argWrites struct {
 
 func (w *argWrites) merge(o argWrites) {
 	w.targets = append(w.targets, o.targets...)
+	w.deletes = append(w.deletes, o.deletes...)
 	w.opaque = w.opaque || o.opaque
 	if w.unjudged == "" {
 		w.unjudged = o.unjudged
@@ -38,6 +45,13 @@ func (w *argWrites) merge(o argWrites) {
 func literalWrites(paths []string) argWrites {
 	targets, opaque := appendResolvable(nil, paths)
 	return argWrites{targets: targets, opaque: opaque}
+}
+
+// literalDeletes is literalWrites for a command that removes its operands.
+func literalDeletes(paths []string) argWrites {
+	w := literalWrites(paths)
+	w.deletes = w.targets
+	return w
 }
 
 // maxWriterNesting bounds xargs/find re-reading the command they run.
@@ -50,7 +64,7 @@ func commandWrites(words []shellWord, at int, args []shellWord, depth int) argWr
 	var w argWrites
 	switch {
 	case isGitWord(words[at].text):
-		w.unjudged = gitApplyUnjudged(words[at+1:])
+		w = gitWrites(words[at+1:])
 	case name == "sed":
 		w.targets, w.opaque = sedWrites(args)
 	case name == "tee":
@@ -61,6 +75,33 @@ func commandWrites(words []shellWord, at int, args []shellWord, depth int) argWr
 		w.targets, w.opaque = copyWrites(args, true)
 	case name == "rm":
 		w = rmWrites(args)
+	case name == "sort":
+		// sort -o FILE writes FILE, which may also be an input.
+		p := parseOptArgs(args, "okStT", "output", "key", "field-separator", "temporary-directory",
+			"buffer-size", "parallel", "batch-size", "random-source", "files0-from", "compress-program")
+		w = literalWrites(p.values("-o", "--output"))
+	case name == "uniq":
+		// uniq [INPUT [OUTPUT]]: the second operand is written.
+		p := parseOptArgs(args, "fsw", "skip-fields", "skip-chars", "check-chars", "group")
+		if len(p.operands) > 1 && p.operands[1] != "-" {
+			w = literalWrites(p.operands[1:2])
+		}
+	case name == "rmdir":
+		w = literalDeletes(parseOptArgs(args, "").operands)
+	case name == "unlink":
+		w = literalDeletes(parseOptArgs(args, "").operands)
+	case name == "shred":
+		w = shredWrites(args)
+	case name == "mkdir":
+		w = literalWrites(parseOptArgs(args, "mZ", "mode", "context").operands)
+	case name == "chmod" || name == "chown" || name == "chgrp":
+		w = ownerWrites(args)
+	case name == "curl":
+		w = curlWrites(args)
+	case name == "wget":
+		w = wgetWrites(args)
+	case name == "ruby":
+		w.targets, w.opaque, w.unjudged = rubyWrites(args)
 	case name == "truncate":
 		w = literalWrites(parseOptArgs(args, "sr", "size", "reference").operands)
 	case name == "touch":
@@ -93,6 +134,9 @@ type optArgs struct {
 	// opts maps each option seen — "-x" or "--name" — to its value, "" for a
 	// flag. Repeated options keep the last.
 	opts map[string]string
+	// all keeps every value of an option given more than once, in order:
+	// `curl -o a URL -o .env URL` writes both.
+	all map[string][]string
 	// missing reports an option that needed a value and had none.
 	missing bool
 }
@@ -102,7 +146,7 @@ type optArgs struct {
 // options with their value after = or, for the names in longValue, in the next
 // word, and "--" ending the options. A lone "-" is an operand.
 func parseOptArgs(args []shellWord, shortValue string, longValue ...string) optArgs {
-	out := optArgs{opts: map[string]string{}}
+	out := optArgs{opts: map[string]string{}, all: map[string][]string{}}
 	endOfOptions := false
 	for k := 0; k < len(args); k++ {
 		w := args[k].text
@@ -125,12 +169,14 @@ func parseOptArgs(args []shellWord, shortValue string, longValue ...string) optA
 				}
 			}
 			out.opts["--"+name] = value
+			out.all["--"+name] = append(out.all["--"+name], value)
 			continue
 		}
 		cluster := w[1:]
 		for c := 0; c < len(cluster); c++ {
 			if strings.IndexByte(shortValue, cluster[c]) < 0 {
 				out.opts["-"+string(cluster[c])] = ""
+				out.all["-"+string(cluster[c])] = append(out.all["-"+string(cluster[c])], "")
 				continue
 			}
 			value := cluster[c+1:]
@@ -143,6 +189,7 @@ func parseOptArgs(args []shellWord, shortValue string, longValue ...string) optA
 				}
 			}
 			out.opts["-"+string(cluster[c])] = value
+			out.all["-"+string(cluster[c])] = append(out.all["-"+string(cluster[c])], value)
 			break
 		}
 	}
@@ -167,6 +214,16 @@ func (o optArgs) has(names ...string) bool {
 	return false
 }
 
+// values returns every value the named options were given, in command-line
+// order within each name.
+func (o optArgs) values(names ...string) []string {
+	var out []string
+	for _, n := range names {
+		out = append(out, o.all[n]...)
+	}
+	return out
+}
+
 func (o optArgs) value(names ...string) (string, bool) {
 	for _, n := range names {
 		if v, ok := o.opts[n]; ok {
@@ -181,7 +238,7 @@ func (o optArgs) value(names ...string) (string, bool) {
 // names, so it is unjudged rather than judged as the one literal path.
 func rmWrites(args []shellWord) argWrites {
 	p := parseOptArgs(args, "")
-	w := literalWrites(p.operands)
+	w := literalDeletes(p.operands)
 	if p.has("-r", "-R", "--recursive") {
 		for _, operand := range p.operands {
 			if strings.ContainsAny(operand, "*?[") {
@@ -367,7 +424,35 @@ func ddWrites(args []shellWord) argWrites {
 // and -i takes the rest of it as its suffix, so `-pi.bak` and `-pie` both have
 // one.
 func perlWrites(args []shellWord) ([]string, bool) {
+	targets, opaque, _ := inPlaceWrites(args, perlFlavor)
+	return targets, opaque
+}
+
+// rubyWrites reads ruby -i, which rewrites its file operands exactly as
+// perl -i does. -C changes the directory every operand is resolved against,
+// which is the one thing the operands alone cannot say.
+func rubyWrites(args []shellWord) ([]string, bool, string) {
+	return inPlaceWrites(args, rubyFlavor)
+}
+
+// inPlaceFlavor names the option letters that matter to reading an in-place
+// interpreter command line: the ones whose argument is the script (so the
+// first operand is a file), the ones that take the next word when they end a
+// cluster, and the ones that take the rest of the cluster whatever it holds.
+type inPlaceFlavor struct {
+	script, nextValue, restValue string
+	// chdir is the option that changes the working directory, or 0.
+	chdir byte
+}
+
+var (
+	perlFlavor = inPlaceFlavor{script: "eE", nextValue: "I", restValue: "FMmCdDVx"}
+	rubyFlavor = inPlaceFlavor{script: "e", nextValue: "rIEC", restValue: "Kx", chdir: 'C'}
+)
+
+func inPlaceWrites(args []shellWord, flavor inPlaceFlavor) ([]string, bool, string) {
 	inPlace, haveScript, endOfOptions := false, false, false
+	unjudged := ""
 	suffix := ""
 	var operands []string
 	for k := 0; k < len(args); k++ {
@@ -386,33 +471,37 @@ func perlWrites(args []shellWord) ([]string, bool) {
 		cluster := w[1:]
 	scan:
 		for c := 0; c < len(cluster); c++ {
-			switch cluster[c] {
-			case 'i':
+			ch := cluster[c]
+			switch {
+			case ch == 'i':
 				inPlace = true
 				suffix = cluster[c+1:]
 				break scan
-			case 'e', 'E':
+			case strings.IndexByte(flavor.script, ch) >= 0:
 				haveScript = true
 				if c+1 == len(cluster) {
 					k++
 				}
 				break scan
-			case 'I':
+			case strings.IndexByte(flavor.nextValue, ch) >= 0:
+				if flavor.chdir != 0 && ch == flavor.chdir {
+					unjudged = "`-" + string(ch) + "` changes the directory the files are resolved in"
+				}
 				if c+1 == len(cluster) {
 					k++
 				}
 				break scan
-			case '0', 'l':
+			case ch == '0' || ch == 'l':
 				for c+1 < len(cluster) && cluster[c+1] >= '0' && cluster[c+1] <= '7' {
 					c++
 				}
-			case 'F', 'M', 'm', 'C', 'd', 'D', 'V', 'x':
+			case strings.IndexByte(flavor.restValue, ch) >= 0:
 				break scan
 			}
 		}
 	}
 	if !inPlace {
-		return nil, false
+		return nil, false, ""
 	}
 	if !haveScript && len(operands) > 0 {
 		operands = operands[1:]
@@ -429,7 +518,7 @@ func perlWrites(args []shellWord) ([]string, bool) {
 			targets = append(targets, sedBackupName(file, suffix))
 		}
 	}
-	return targets, opaque
+	return targets, opaque, unjudged
 }
 
 // gitApplyUnjudged says why `git apply` cannot be judged, or "" when the
@@ -536,6 +625,9 @@ func xargsWrites(args []shellWord, depth int) argWrites {
 			continue
 		}
 		w.targets = append(w.targets, t)
+		if containsString(static.deletes, t) {
+			w.deletes = append(w.deletes, t)
+		}
 	}
 	if w.unjudged != "" {
 		return w
@@ -597,6 +689,9 @@ func findWrites(args []shellWord, depth int) argWrites {
 					continue
 				}
 				w.targets = append(w.targets, t)
+				if containsString(ran.deletes, t) {
+					w.deletes = append(w.deletes, t)
+				}
 			}
 		}
 	}

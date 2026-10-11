@@ -214,13 +214,13 @@ func (g *Gate) EvaluateCommand(command string, task *dc.Task) (policy.Decision, 
 		return g.settle(decision, mode, modeOrigin, flags.PolicyCommandMode), nil
 	}
 
-	refusal, err := EvaluateRedirects(command, taskIDOf(task), task != nil, func(target string) (policy.Decision, error) {
+	refusal, err := EvaluateRedirectsOps(command, taskIDOf(task), task != nil, func(target string, op dc.Operation) (policy.Decision, error) {
 		// Through EvaluateWrite, not the bare ladder: a redirect target must be
 		// judged by exactly what a direct write to the same path faces, ledger
 		// and file-mode posture included, or the two surfaces contradict each
 		// other. It also records the target decision, which is why the
 		// FromTarget branch below does not record it again.
-		return g.EvaluateWrite(target, task, dc.OpWrite)
+		return g.EvaluateWrite(target, task, op)
 	})
 	if err != nil {
 		return policy.Decision{}, err
@@ -253,8 +253,10 @@ func (g *Gate) EvaluateCommand(command string, task *dc.Task) (policy.Decision, 
 // WriteEvaluator judges one file the command would write — a redirection
 // target or a file a command writes through its arguments — as the write it
 // actually is. Every such file is judged as a write (dc.OpWrite in the gate's
-// own evaluator), including the source mv removes; the rung does not tell the
-// evaluator which operation the command performs on it.
+// own evaluator), including the source mv removes and the file rm deletes; a
+// WriteEvaluator is not told which operation the command performs. A host
+// whose evaluator can tell the two apart takes an OperationEvaluator through
+// EvaluateRedirectsOps and judges removals as dc.OpDelete.
 //
 // It is injected rather than fixed so the rung below has exactly one
 // implementation across every plane that runs commands: the DevCouncil gate
@@ -264,6 +266,11 @@ func (g *Gate) EvaluateCommand(command string, task *dc.Task) (policy.Decision, 
 // has, what an unresolvable one means, and that a refused component refuses the
 // command — is decided in one place.
 type WriteEvaluator func(target string) (policy.Decision, error)
+
+// OperationEvaluator is a WriteEvaluator that is told the operation: dc.OpDelete
+// for a file a command only removes (rm, rmdir, unlink, shred -u, git rm,
+// git clean), dc.OpWrite for everything else.
+type OperationEvaluator func(target string, op dc.Operation) (policy.Decision, error)
 
 // RedirectRefusal is the redirect rung's outcome.
 type RedirectRefusal struct {
@@ -321,6 +328,15 @@ type RedirectRefusal struct {
 // ladder as before. The refusal reuses command.substitution, the rung's word
 // for a write it cannot judge, so no new rule enters the contract.
 func EvaluateRedirects(command, taskID string, scopeBound bool, evalWrite WriteEvaluator) (RedirectRefusal, error) {
+	return EvaluateRedirectsOps(command, taskID, scopeBound, func(target string, _ dc.Operation) (policy.Decision, error) {
+		return evalWrite(target)
+	})
+}
+
+// EvaluateRedirectsOps is EvaluateRedirects for an evaluator that judges
+// removals as the deletes they are. A file planned for modification is not a
+// file the task may delete, and `rm` of it was judged as a write and allowed.
+func EvaluateRedirectsOps(command, taskID string, scopeBound bool, evalWrite OperationEvaluator) (RedirectRefusal, error) {
 	set, err := policy.RedirectWrites(command)
 	targets, opaque := set.Targets, set.Opaque
 	if err != nil {
@@ -340,8 +356,16 @@ func EvaluateRedirects(command, taskID string, scopeBound bool, evalWrite WriteE
 			Refused: true,
 		}, nil
 	}
+	deleted := make(map[string]bool, len(set.Deletes))
+	for _, target := range set.Deletes {
+		deleted[target] = true
+	}
 	for _, target := range targets {
-		written, err := evalWrite(target)
+		op := dc.OpWrite
+		if deleted[target] {
+			op = dc.OpDelete
+		}
+		written, err := evalWrite(target, op)
 		if err != nil {
 			return RedirectRefusal{}, err
 		}

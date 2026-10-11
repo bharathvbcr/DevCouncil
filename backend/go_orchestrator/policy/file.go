@@ -98,8 +98,10 @@ var RestrictedPathPatterns = []string{
 	// including any added later.
 	".git",
 	".devcouncil",
+	".devmap",
 	".git/*",
 	".devcouncil/*",
+	".devmap/*",
 	".claude/*",
 	".claude/**",
 	".codex/*",
@@ -115,6 +117,29 @@ var RestrictedPathPatterns = []string{
 	".agents/*",
 	".agents/**",
 	"opencode.json",
+}
+
+// ToolStateDirs are the directories DevCouncil's own tools write state into:
+// the task store, config and correction manifests under .devcouncil, and the
+// code graph and repo map under .devmap. They are a subset of
+// RestrictedPathPatterns — the write policy refuses an agent's write there — and
+// the same list is what verification leaves out of the diff it judges: a file
+// the harness wrote is not work the agent did, and blaming it told an obedient
+// agent to revert (that is, delete) the task store.
+var ToolStateDirs = []string{".devcouncil", ".devmap"}
+
+// IsToolState reports whether a repository-relative path is inside a directory
+// a DevCouncil tool owns. Folded and slash-normalised like the restricted rung,
+// because that is the rung it must agree with.
+func IsToolState(path string) bool {
+	cleaned := strings.TrimPrefix(normalizeSlashes(strings.TrimSpace(path)), "./")
+	folded := fnmatch.Fold(cleaned)
+	for _, dir := range ToolStateDirs {
+		if folded == dir || strings.HasPrefix(folded, dir+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // SubsystemMap answers the two questions the neighbour rule needs. It is an
@@ -192,6 +217,17 @@ func (g FileGate) EvaluateFileChange(path string, task *dc.Task, op dc.Operation
 		if !internal && matchesRestricted(mt, normalized) {
 			return deny(RuleRestrictedPath, "Protected repository paths cannot be modified.", normalized, taskID)
 		}
+		// The same two rungs against the name the filesystem stores, for a path
+		// that exists: a spelling the text rules do not fold to the pattern can
+		// still be the file the pattern protects. See onDiskSpelling.
+		if disk, differs := onDiskSpelling(g.Root, normalized); differs {
+			if mt.anyFold(SecretPathPatterns, disk) {
+				return deny(RuleSecretPath, "Path is another name for `"+disk+"`, a secret or credential path, which is never writable.", normalized, taskID)
+			}
+			if !internal && matchesRestricted(mt, disk) {
+				return deny(RuleRestrictedPath, "Path is another name for `"+disk+"`, a protected repository path.", normalized, taskID)
+			}
+		}
 	}
 
 	if task == nil {
@@ -262,6 +298,18 @@ func (g FileGate) EvaluateFileChange(path string, task *dc.Task, op dc.Operation
 		return g.noteHardRules(d)
 	}
 	return g.noteHardRules(allow("File change is allowed.", normalized, task.ID))
+}
+
+// lendsScope reports whether a planned entry may lend its neighbourhood to the
+// unplanned-scope rungs. An allow-list, not "anything but read_only": an entry
+// whose change is not one this gate knows must lend nothing, since the only
+// reading that never widens is the one where an unknown word grants nothing.
+func lendsScope(pf dc.PlannedFile) bool {
+	switch pf.AllowedChange {
+	case dc.ChangeCreate, dc.ChangeModify, dc.ChangeDelete:
+		return true
+	}
+	return false
 }
 
 // operationRefusal reports whether a planned entry forbids the operation being
@@ -337,6 +385,11 @@ func (g FileGate) EvaluateRead(path string, task *dc.Task) (d Decision) {
 			"Secret and credential paths are not readable. Their contents would enter the model's "+
 				"context, which no later redaction can undo.", normalized, taskID)
 	}
+	if disk, differs := onDiskSpelling(g.Root, normalized); differs && mt.anyFold(SecretPathPatterns, disk) {
+		return deny(RuleSecretRead,
+			"Path is another name for `"+disk+"`, a secret or credential path. Their contents would enter "+
+				"the model's context, which no later redaction can undo.", normalized, taskID)
+	}
 	return allow("Read is allowed.", normalized, taskID)
 }
 
@@ -373,6 +426,9 @@ func ClassifyRead(root, path string) ReadClass {
 		return ReadOutsideRoot
 	}
 	if fnmatch.MatchAnyFold(SecretPathPatterns, normalized) {
+		return ReadSecretPath
+	}
+	if disk, differs := onDiskSpelling(root, normalized); differs && fnmatch.MatchAnyFold(SecretPathPatterns, disk) {
 		return ReadSecretPath
 	}
 	return ReadAllowed
@@ -418,7 +474,7 @@ func (g FileGate) unplannedDecision(path string, task *dc.Task) Decision {
 		// A read-only entry says "look at this, do not change it". Lending its
 		// subsystem as writable would turn that into a permission over every
 		// file beside it, which is the opposite of what it declares.
-		if pf.AllowedChange == dc.ChangeReadOnly {
+		if !lendsScope(pf) {
 			continue
 		}
 		area, ok := g.Subsystems.AreaForPath(normalizeSlashes(pf.Path))
@@ -531,7 +587,7 @@ func (g FileGate) sameDirDecision(path string, task *dc.Task, base Decision) Dec
 	}
 
 	for _, pf := range task.PlannedFiles {
-		if pf.AllowedChange == dc.ChangeReadOnly {
+		if !lendsScope(pf) {
 			continue
 		}
 		plannedDir, ok := scopeDir(pf.Path)
@@ -986,10 +1042,10 @@ func matchesRestricted(mt matching, path string) bool {
 	if mt.anyFold(RestrictedPathPatterns, path) {
 		return true
 	}
-	lower := strings.ToLower(path)
+	lower := fnmatch.Fold(path)
 	for _, pattern := range RestrictedPathPatterns {
 		// Folded here for the same filesystem reason as the glob above.
-		prefix := strings.ToLower(strings.TrimSuffix(strings.Trim(pattern, "*"), "/"))
+		prefix := fnmatch.Fold(strings.TrimSuffix(strings.Trim(pattern, "*"), "/"))
 		if prefix == "" {
 			continue
 		}
@@ -1001,3 +1057,30 @@ func matchesRestricted(mt matching, path string) bool {
 }
 
 func normalizeSlashes(p string) string { return strings.ReplaceAll(p, `\`, "/") }
+
+// WouldBlockVerification reports whether a write this decision lets through
+// will be raised as an unplanned file by verification. Verification judges the
+// exact planned set; the write policy also lends a planned file's subsystem,
+// neighbours and directory, and a posture can demote an unplanned refusal, so a
+// write can be allowed here and blocked there. The answer is the same
+// question verification asks — is the path one the task plans — asked of the
+// path the decision names, so the two verdicts have one definition of scope.
+// A refused write never reaches verification.
+func WouldBlockVerification(d Decision, task *dc.Task) bool {
+	if d.Blocked() || task == nil || d.Target == "" {
+		return false
+	}
+	return !PlansPath(task, d.Target)
+}
+
+// PlansPath reports whether the task's planned files name path exactly, which
+// is the set verification's orphan check compares the changed files with.
+func PlansPath(task *dc.Task, path string) bool {
+	want := strings.TrimPrefix(normalizeSlashes(path), "./")
+	for _, pf := range task.PlannedFiles {
+		if strings.TrimPrefix(normalizeSlashes(pf.Path), "./") == want {
+			return true
+		}
+	}
+	return false
+}

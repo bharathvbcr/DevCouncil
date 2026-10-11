@@ -123,6 +123,33 @@ other value is refused with exit 2 rather than recorded. A task lease is also no
 against arbitrary editors. [Repository boundaries](SECURITY_BOUNDARIES.md)
 provide the detailed implementation limits.
 
+## Write policy versus verification
+
+The write policy and verification answer the same question — which files may
+this task change — and report it at different times. The posture decides how
+firmly the policy answers:
+
+| Setting | Values | Effect |
+| --- | --- | --- |
+| `harness.posture` | `dev` (default), `strict`, `yolo` | `dev` demotes soft scope rules (`scope.unplanned`, `scope.operation`, `task.absent`) to reports; `strict` blocks them; `yolo` also turns the hard rules off. Credential, restricted, outside-root and agent-config rules block under `dev` and `strict`. |
+| `policy.file.mode` | `enforce`, `advisory`, `off` | Whether a soft file refusal blocks. |
+| `policy.command.mode` | `enforce`, `advisory`, `off` | The same for shell commands. A hard command refusal is never demoted. |
+
+Verification does not read these. It blocks any changed file that is not in the
+task's planned files (`orphan_diff`, hard-safety) under `gates.mode: enforce`,
+so a write the policy lets through can still be blocked afterwards. To make that
+visible before the write, `devcouncil_policy_check_write` returns
+`would_block_verification: true` whenever it allows a path the task does not
+plan — lent by a planned file's directory or subsystem, or allowed only because
+the posture demoted the scope refusal. Treat `allowed: true` with
+`would_block_verification: true` as a path to plan, not a path to write.
+
+DevCouncil's own state is not the agent's work. Verification and `get_diff`
+leave out `.devcouncil/` (the task store, `config.yaml`, correction manifests)
+and `.devmap/`; the write policy lists the same directories as restricted
+(`policy.ToolStateDirs`), so an agent can neither write them nor be blamed for
+them, and no gap asks it to "revert" the task store.
+
 ## Repair and completion
 
 The agent reads gaps, modifies the implementation and reruns verification.

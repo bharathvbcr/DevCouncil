@@ -2,6 +2,7 @@ package dc
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -100,6 +101,29 @@ func TestLeaseCodeRecovery(t *testing.T) {
 		if action != tc.wantAction || tool != tc.wantTool {
 			t.Errorf("Recovery(%q) = (%q, %q), want (%q, %q)",
 				tc.code, action, tool, tc.wantAction, tc.wantTool)
+		}
+	}
+}
+
+// A plan's allowed_change is one of four words. Anything else is refused where
+// the plan is decoded: `read-only` must not decode into a value the scope rungs
+// treat as "not read_only".
+func TestPlannedFileRefusesAnUnknownAllowedChange(t *testing.T) {
+	for _, bad := range []string{"read-only", "readonly", "READ_ONLY", "Read_Only", "write", "delete ", "modify\n", "rw", " "} {
+		var pf PlannedFile
+		input := `{"path":"src/a.go","allowed_change":"` + strings.ReplaceAll(bad, "\n", `\n`) + `"}`
+		if err := json.Unmarshal([]byte(input), &pf); err == nil {
+			t.Errorf("allowed_change %q decoded to %+v", bad, pf)
+		}
+	}
+	var task Task
+	if err := json.Unmarshal([]byte(`{"id":"T","planned_files":[{"path":"a","allowed_change":"readonly"}]}`), &task); err == nil {
+		t.Errorf("a task carrying an unknown allowed_change decoded: %+v", task)
+	}
+	for _, good := range []string{"create", "modify", "delete", "read_only"} {
+		var pf PlannedFile
+		if err := json.Unmarshal([]byte(`{"path":"a","allowed_change":"`+good+`"}`), &pf); err != nil || pf.AllowedChange != AllowedChange(good) {
+			t.Errorf("%q: %+v, %v", good, pf, err)
 		}
 	}
 }

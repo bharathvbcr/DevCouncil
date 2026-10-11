@@ -40,7 +40,7 @@ import (
 // the filesystem is not consulted. An operand only the shell can resolve
 // reports opacity, as an unresolvable redirection target does. A glob is
 // judged as the literal path, as a glob in a redirection target is.
-func argumentWriteTargets(line string) (targets []string, opaque bool, unjudged string) {
+func argumentWriteTargets(line string) argWrites {
 	var all argWrites
 	for _, clause := range SplitCommandChain(line) {
 		words := shellWords(clause)
@@ -64,7 +64,7 @@ func argumentWriteTargets(line string) (targets []string, opaque bool, unjudged 
 		}
 		all.merge(commandWrites(words, at, args, 0))
 	}
-	return all.targets, all.opaque, all.unjudged
+	return all
 }
 
 // argumentWrappers run the command named by the following words. Stepped over
