@@ -12,6 +12,17 @@ the Python was retired (`3286db5e^`), read out of git and executed verbatim —
 not copied, so it cannot drift from what actually ran. Each line is searched
 as `+<line>`, as `SecretScanner.scan_diff` did.
 
+Stubs: `verification/stub_detector.py` as it stood at `3286db5e^`, read out of
+git and executed verbatim over `cases.txt`, one case at a time, with the
+`devcouncil.domain.task` import it needs stubbed (`task_allows_scaffolding` is
+never called). A file the diff adds whole is written under a temporary project
+root, because the retired AST passes read the post-image from disk. The
+detector has no severity, so a case is flagged for a gate when it reports any
+finding mapped to that gate, and positive when the corpus expects anything but
+`clean` — the same reading `tests/stub_measurement.rs` uses for Rust.
+`stub_allowed` is not measured: the Python marker was `devcouncil: allow-stub`,
+a different contract from Rust's `allow-stub: <reason>`.
+
 Scope: the retired rule, `cf not in planned_paths` (`orphan_diff.py`), where
 `planned_paths = {pf.path}` (`verify_orchestration.py:93`) and the changed
 files are what `git diff --name-only` lists — the destination only, for a
@@ -23,6 +34,8 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import tempfile
+import types
 from pathlib import Path
 
 RETIRED_AT = "3286db5e^"
@@ -127,6 +140,96 @@ def measure_scope(path: Path) -> dict[str, int]:
     return m
 
 
+def retired_stub_detector():
+    source = subprocess.check_output(
+        [
+            "git",
+            "-C",
+            str(REPO),
+            "show",
+            f"{RETIRED_AT}:src/devcouncil/verification/stub_detector.py",
+        ],
+        text=True,
+    )
+    for name in ("devcouncil", "devcouncil.domain"):
+        sys.modules.setdefault(name, types.ModuleType(name))
+    task_module = types.ModuleType("devcouncil.domain.task")
+    task_module.Task = type("Task", (), {})
+    sys.modules["devcouncil.domain.task"] = task_module
+    # Registered before it runs: its dataclass looks its own module up.
+    module = types.ModuleType("stub_detector")
+    sys.modules["stub_detector"] = module
+    exec(compile(source, "stub_detector.py", "exec"), module.__dict__)
+    return module.detect_stubs
+
+
+STUB_GATES = ("stub_detection", "assert_free_test", "skipped_test")
+
+
+def stub_gate(reason: str) -> str:
+    if reason.startswith(("pytest test skipped", "unittest test skipped", "JS test")):
+        return "skipped_test"
+    if (
+        reason.startswith("placeholder assertion")
+        or "has no assertions" in reason
+        or reason == "test with no assertions"
+        or reason == "commented-out assert in test"
+    ):
+        return "assert_free_test"
+    return "stub_detection"
+
+
+def stub_cases(path: Path) -> list[dict]:
+    cases: list[dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("### case:"):
+            cases.append({"expect": {}, "diff": []})
+        elif not cases:
+            continue
+        elif line.startswith("###"):
+            key, _, value = line[3:].strip().partition(":")
+            if key in STUB_GATES:
+                cases[-1]["expect"][key] = value.strip() != "clean"
+        else:
+            cases[-1]["diff"].append(line)
+    return cases
+
+
+def whole_files(diff: list[str]) -> dict[str, list[str]]:
+    """Files the diff adds whole: path -> lines. Their post-image is the added
+    lines, which is what the retired AST passes read from disk."""
+    files: dict[str, list[str]] = {}
+    current: str | None = None
+    adding = False
+    for line in diff:
+        if line.startswith("--- "):
+            adding = line == "--- /dev/null"
+        elif line.startswith("+++ ") and adding:
+            current = line[4:].strip()
+            current = current[2:] if current.startswith("b/") else current
+            files[current] = []
+        elif current is not None and adding and line.startswith("+"):
+            files[current].append(line[1:])
+        elif line.startswith("diff --git "):
+            current, adding = None, False
+    return files
+
+
+def measure_stubs(path: Path) -> dict[str, dict[str, int]]:
+    detect = retired_stub_detector()
+    matrices = {gate: matrix() for gate in STUB_GATES}
+    for case in stub_cases(path):
+        with tempfile.TemporaryDirectory() as root:
+            for rel, lines in whole_files(case["diff"]).items():
+                target = Path(root) / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            flagged = {stub_gate(f.reason) for f in detect(Path(root), "\n".join(case["diff"]))}
+        for gate in STUB_GATES:
+            record(matrices[gate], case["expect"][gate], gate in flagged)
+    return matrices
+
+
 def main() -> None:
     patterns = retired_secret_patterns()
     for name in ("secrets.tsv", "secrets_holdout.tsv", "secrets_holdout_2.tsv"):
@@ -139,6 +242,8 @@ def main() -> None:
     print(
         report("retired orphan rule on scope.txt", measure_scope(CORPUS / "scope.txt"))
     )
+    for gate, m in measure_stubs(CORPUS / "cases.txt").items():
+        print(report(f"retired stub detector, {gate}, on cases.txt", m))
 
 
 if __name__ == "__main__":
