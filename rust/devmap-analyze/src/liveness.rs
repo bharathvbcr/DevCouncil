@@ -1593,10 +1593,47 @@ fn is_ambiguous_edge(edge: &ResolvedEdge) -> bool {
     !matches!(
         edge.edge_kind,
         EdgeKind::Contains | EdgeKind::Defines | EdgeKind::MemberOf
-    ) && matches!(
-        edge.resolution.as_deref(),
-        Some(Resolution::AmbiguousGlobal { .. }) | Some(Resolution::LanguageServerDispatch { .. })
-    )
+    ) && edge
+        .resolution
+        .as_deref()
+        .is_some_and(Resolution::is_unproven_candidate_set)
+}
+
+/// The reason a symbol reached only through interface dispatch carries.
+pub const REACHED_BY_DISPATCH: &str = "reached_by_dispatch";
+
+/// Targets whose only unproven callers are interface dispatch edges.
+///
+/// A dispatch candidate and an ambiguous name match both leave a symbol at
+/// 0.4, but they are different evidence — the first is a type-system claim that
+/// the symbol *implements* what was called — and the reason says which. Keyed
+/// the way [`called_and_ambiguous_symbols`] keys its sets (qualified, short and
+/// member spellings), so the join cannot miss on spelling.
+fn dispatch_only_symbols(resolution: &ResolutionResult) -> HashSet<(String, String)> {
+    let spellings = |edge: &ResolvedEdge| -> Vec<(String, String)> {
+        let short = edge
+            .target_symbol
+            .rsplit("::")
+            .next()
+            .unwrap_or(edge.target_symbol.as_str());
+        let member = short.rsplit('.').next().unwrap_or(short);
+        [edge.target_symbol.as_str(), short, member]
+            .into_iter()
+            .map(|form| (edge.target_file.clone(), form.to_string()))
+            .collect()
+    };
+    let mut dispatched: HashSet<(String, String)> = HashSet::new();
+    let mut other: HashSet<(String, String)> = HashSet::new();
+    for edge in resolution.edges.iter().filter(|edge| is_ambiguous_edge(edge)) {
+        let bucket = if matches!(edge.resolution.as_deref(), Some(Resolution::Dispatch { .. })) {
+            &mut dispatched
+        } else {
+            &mut other
+        };
+        bucket.extend(spellings(edge));
+    }
+    dispatched.retain(|key| !other.contains(key));
+    dispatched
 }
 
 /// The manifests that scope module privacy, keyed by manifest family, each as
@@ -2536,6 +2573,7 @@ pub fn analyze_liveness_with_coverage(
     let exemptions =
         symbol_exemption_index(extractions, resolution, &called_symbols, &ambiguous_symbols);
 
+    let dispatch_only = dispatch_only_symbols(resolution);
     let mut reports = Vec::new();
     // Unconfirmed rows awaiting their site evidence, by report index. Filled
     // in one pass over the edges and the ledger after the loop, so the cost is
@@ -2765,7 +2803,16 @@ pub fn analyze_liveness_with_coverage(
                     file_path: ext.file_path.clone(),
                     confidence: cap(0.4),
                     is_exempt: false,
-                    exemption_reason: Some("only_ambiguous_callers".to_string()),
+                    exemption_reason: Some(
+                        if dispatch_only.contains(&(ext.file_path.clone(), sym.qualified_name.clone()))
+                            || dispatch_only.contains(&(ext.file_path.clone(), sym.name.clone()))
+                        {
+                            REACHED_BY_DISPATCH
+                        } else {
+                            "only_ambiguous_callers"
+                        }
+                        .to_string(),
+                    ),
                     evidence: Some(DeadEvidence::none()),
                 });
             } else if !is_called
