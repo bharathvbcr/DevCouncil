@@ -196,6 +196,6 @@ func WriteAtomic(path string, content []byte, perm fs.FileMode) error {
 // durability or publish step fail.
 var (
 	renameFile = os.Rename
-	syncFile = func(f *os.File) error { return f.Sync() }
-	syncDir  = syncDirectory
+	syncFile   = func(f *os.File) error { return f.Sync() }
+	syncDir    = syncDirectory
 )
