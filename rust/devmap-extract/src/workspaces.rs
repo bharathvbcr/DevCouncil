@@ -159,8 +159,12 @@ fn pattern_regex(pattern: &str) -> Option<Regex> {
 /// Whether `dir`, relative to a workspace root, is selected by `patterns`: it
 /// matches a positive pattern and no `!` negation.
 fn selected(relative_dir: &str, positives: &[Regex], negatives: &[Regex]) -> bool {
-    positives.iter().any(|pattern| pattern.is_match(relative_dir))
-        && !negatives.iter().any(|pattern| pattern.is_match(relative_dir))
+    positives
+        .iter()
+        .any(|pattern| pattern.is_match(relative_dir))
+        && !negatives
+            .iter()
+            .any(|pattern| pattern.is_match(relative_dir))
 }
 
 /// Everything the workspaces of one tree say.
@@ -201,7 +205,9 @@ pub fn link_workspaces(manifests: &[(String, PackageManifest)]) -> Workspaces {
             let Some(regex) = pattern_regex(pattern) else {
                 gaps.push((
                     root_path.clone(),
-                    format!("workspace pattern {pattern:?} is not a pattern this reader understands"),
+                    format!(
+                        "workspace pattern {pattern:?} is not a pattern this reader understands"
+                    ),
                 ));
                 continue;
             };
@@ -247,10 +253,17 @@ pub fn link_workspaces(manifests: &[(String, PackageManifest)]) -> Workspaces {
         if claimants.len() == 1 {
             packages.extend(claimants);
         } else {
-            let dirs: Vec<&str> = claimants.iter().map(|package| package.dir.as_str()).collect();
+            let dirs: Vec<&str> = claimants
+                .iter()
+                .map(|package| package.dir.as_str())
+                .collect();
             gaps.push((
-                format!("{}/package.json", claimants[0].dir).trim_start_matches('/').to_string(),
-                format!("package name {name:?} is claimed by more than one workspace member: {dirs:?}"),
+                format!("{}/package.json", claimants[0].dir)
+                    .trim_start_matches('/')
+                    .to_string(),
+                format!(
+                    "package name {name:?} is claimed by more than one workspace member: {dirs:?}"
+                ),
             ));
         }
     }
@@ -291,23 +304,44 @@ mod tests {
         .unwrap();
         assert_eq!(
             parsed.entries,
-            ["src/index.ts", "dist/index.js", "./src/index.ts", "./dist/index.mjs"]
+            [
+                "src/index.ts",
+                "dist/index.js",
+                "./src/index.ts",
+                "./dist/index.mjs"
+            ]
         );
     }
 
     #[test]
     fn a_manifest_that_is_not_json_is_an_error_not_an_empty_manifest() {
-        assert!(parse_package_json("{ not json").unwrap_err().contains("JSON"));
-        assert!(parse_package_json("[1]").unwrap_err().contains("not a JSON object"));
+        assert!(parse_package_json("{ not json")
+            .unwrap_err()
+            .contains("JSON"));
+        assert!(parse_package_json("[1]")
+            .unwrap_err()
+            .contains("not a JSON object"));
     }
 
     #[test]
     fn members_are_the_directories_a_pattern_selects() {
         let linked = link_workspaces(&[
-            ("package.json".into(), manifest(Some("root"), &["packages/*", "!packages/skip"])),
-            ("packages/shared/package.json".into(), manifest(Some("@acme/shared"), &[])),
-            ("packages/skip/package.json".into(), manifest(Some("@acme/skip"), &[])),
-            ("tools/package.json".into(), manifest(Some("@acme/tools"), &[])),
+            (
+                "package.json".into(),
+                manifest(Some("root"), &["packages/*", "!packages/skip"]),
+            ),
+            (
+                "packages/shared/package.json".into(),
+                manifest(Some("@acme/shared"), &[]),
+            ),
+            (
+                "packages/skip/package.json".into(),
+                manifest(Some("@acme/skip"), &[]),
+            ),
+            (
+                "tools/package.json".into(),
+                manifest(Some("@acme/tools"), &[]),
+            ),
         ]);
         let names: Vec<&str> = linked.packages.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["@acme/shared"]);
@@ -319,8 +353,14 @@ mod tests {
     fn a_double_star_pattern_reaches_nested_members() {
         let linked = link_workspaces(&[
             ("package.json".into(), manifest(None, &["packages/**"])),
-            ("packages/a/b/package.json".into(), manifest(Some("deep"), &[])),
-            ("packages/top/package.json".into(), manifest(Some("top"), &[])),
+            (
+                "packages/a/b/package.json".into(),
+                manifest(Some("deep"), &[]),
+            ),
+            (
+                "packages/top/package.json".into(),
+                manifest(Some("top"), &[]),
+            ),
         ]);
         assert_eq!(linked.packages.len(), 2);
     }
@@ -339,7 +379,10 @@ mod tests {
     #[test]
     fn a_pattern_naming_no_member_is_a_gap() {
         let linked = link_workspaces(&[
-            ("package.json".into(), manifest(None, &["packages/*", "missing/*"])),
+            (
+                "package.json".into(),
+                manifest(None, &["packages/*", "missing/*"]),
+            ),
             ("packages/a/package.json".into(), manifest(Some("a"), &[])),
         ]);
         assert_eq!(linked.gaps.len(), 1);

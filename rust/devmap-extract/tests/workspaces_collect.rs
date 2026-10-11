@@ -24,9 +24,13 @@ mod tempdir_lite {
 
     impl Dir {
         pub fn new() -> Self {
+            // A counter, not the clock alone: tests of one binary run in
+            // parallel and two can read the same nanosecond.
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let unique = format!(
-                "devmap-workspaces-{}-{}",
+                "devmap-workspaces-{}-{}-{}",
                 std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
@@ -63,7 +67,10 @@ fn reasons(manifests: &devmap_extract::ProjectManifests, path: &str) -> Vec<Stri
 #[test]
 fn members_are_linked_by_name_to_their_directory() {
     let dir = tree(&[
-        ("package.json", r#"{"name":"root","workspaces":["packages/*"]}"#),
+        (
+            "package.json",
+            r#"{"name":"root","workspaces":["packages/*"]}"#,
+        ),
         (
             "packages/shared/package.json",
             r#"{"name":"@acme/shared","main":"src/index.ts"}"#,
@@ -79,7 +86,10 @@ fn members_are_linked_by_name_to_their_directory() {
 #[test]
 fn a_package_json_that_does_not_parse_is_a_coverage_gap_not_silence() {
     let dir = tree(&[
-        ("package.json", r#"{"name":"root","workspaces":["packages/*"]}"#),
+        (
+            "package.json",
+            r#"{"name":"root","workspaces":["packages/*"]}"#,
+        ),
         ("packages/broken/package.json", "{ \"name\": "),
     ]);
     let manifests = collect_project_manifests(dir.path()).unwrap();

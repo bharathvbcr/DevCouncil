@@ -75,8 +75,8 @@ mod rustlocal;
 #[cfg(feature = "parse")]
 pub mod treesitter;
 pub mod tsconfig;
-pub mod workspaces;
 pub mod wiring;
+pub mod workspaces;
 
 use std::collections::BTreeMap;
 use std::fs;

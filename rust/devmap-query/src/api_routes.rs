@@ -392,7 +392,9 @@ fn scan_sites(
                 match first_string_argument(&call) {
                     // Only a URL-shaped literal is a request: `config.get('timeout')`
                     // on a receiver that merely contains `api` is not one.
-                    Some((url, _)) if url.starts_with('/') || url.contains("://") || url.starts_with("${") => {
+                    Some((url, _))
+                        if url.starts_with('/') || url.contains("://") || url.starts_with("${") =>
+                    {
                         found.push((url, caps[2].to_ascii_uppercase()));
                     }
                     Some(_) => {}
@@ -435,7 +437,12 @@ fn call_text(lines: &[&str], line_index: usize, column: usize) -> String {
     let mut depth = 1usize;
     let mut quote: Option<char> = None;
     let mut escaped = false;
-    for (offset, line) in lines.iter().enumerate().skip(line_index).take(CALL_TEXT_LINES) {
+    for (offset, line) in lines
+        .iter()
+        .enumerate()
+        .skip(line_index)
+        .take(CALL_TEXT_LINES)
+    {
         let from = if offset == line_index { column } else { 0 };
         for character in line.get(from..).unwrap_or("").chars() {
             if text.len() >= CALL_TEXT_BYTES {
@@ -480,7 +487,10 @@ fn call_text(lines: &[&str], line_index: usize, column: usize) -> String {
 /// parameter normalisation treats the rest as a wildcard segment.
 fn first_string_argument(call: &str) -> Option<(String, String)> {
     let trimmed = call.trim_start();
-    let quote = trimmed.chars().next().filter(|c| matches!(c, '\'' | '"' | '`'))?;
+    let quote = trimmed
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '\'' | '"' | '`'))?;
     let body = &trimmed[1..];
     let mut end = None;
     let mut escaped = false;
@@ -1637,7 +1647,10 @@ export async function getPapers(q: string) {
             json!([{"kind": "routes_to", "source": "DELETE /api/x", "target": "x"}]),
         );
         let mapped = route_map(&root, &g, &ScanBudget::default());
-        assert_eq!(mapped["routes"][0]["consumers"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            mapped["routes"][0]["consumers"].as_array().unwrap().len(),
+            1
+        );
         assert_eq!(mapped["routes"][0]["consumers"][0]["verb"], "ANY");
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1699,8 +1712,12 @@ export async function getPapers(q: string) {
                    {"id": "h.ts::h", "name": "h", "path": "h.ts", "line": 1, "end_line": 2, "kind": "function"}]),
             json!([{"kind": "routes_to", "source": "GET /api/z", "target": "h.ts::h"}]),
         );
-        write(&root, "h.ts", "export function h() { return {}; }
-");
+        write(
+            &root,
+            "h.ts",
+            "export function h() { return {}; }
+",
+        );
         let mapped = route_map(&root, &g, &ScanBudget::default());
         assert_eq!(mapped["scan"]["complete"], json!(false));
         assert_eq!(mapped["scan"]["sites_unreadable_shape"], json!(2));

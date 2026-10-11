@@ -40,7 +40,11 @@ fn callers(store: &Store, query: &str) -> anyhow::Result<(Vec<String>, bool)> {
     })?;
     let available = matches!(answer.resolution, ResolutionAvailability::Available);
     Ok((
-        answer.items.iter().map(|e| e.source_symbol.clone()).collect(),
+        answer
+            .items
+            .iter()
+            .map(|e| e.source_symbol.clone())
+            .collect(),
         available,
     ))
 }
@@ -62,10 +66,7 @@ fn a_dotted_name_that_is_no_file_starts_from_the_symbol() {
 fn a_real_file_of_that_name_still_wins() {
     // `Thing.go` the file is a file: the fallback is only for a name that
     // matches none.
-    let store = store(&[
-        ("Thing.go", "package p\nfunc Run() {}\n"),
-        ("a.ts", SOURCE),
-    ]);
+    let store = store(&[("Thing.go", "package p\nfunc Run() {}\n"), ("a.ts", SOURCE)]);
     let (_, available) = callers(&store, "Thing.go").unwrap();
     assert!(available);
 }

@@ -49,6 +49,7 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             "reliability_source_reads",
             "safe_fs_controls",
             "the_bounded_runner_under_hostile_children",
+            "workspaces_collect",
         ],
     ),
     ("devmap-resolve", &["resolution_kind_is_one_owner"]),

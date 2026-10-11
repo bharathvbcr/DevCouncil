@@ -464,9 +464,12 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
     rust_crates.sort_by(|left, right| left.dir.cmp(&right.dir));
     package_manifests.sort_by(|left, right| left.0.cmp(&right.0));
     let workspaces = crate::workspaces::link_workspaces(&package_manifests);
-    refusals.extend(workspaces.gaps.into_iter().map(|(path, reason)| {
-        (path, DiscoverySkipReason::Unreadable { reason })
-    }));
+    refusals.extend(
+        workspaces
+            .gaps
+            .into_iter()
+            .map(|(path, reason)| (path, DiscoverySkipReason::Unreadable { reason })),
+    );
     let ts = crate::tsconfig::build_ts_projects(root, &ts_configs);
     examined.extend(ts.examined);
     refusals.extend(

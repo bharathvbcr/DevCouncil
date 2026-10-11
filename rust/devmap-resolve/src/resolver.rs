@@ -1326,9 +1326,17 @@ impl Resolver {
         let mut bases: Vec<String> = Vec::new();
         if subpath.is_empty() {
             bases.extend(package.entries.iter().filter_map(|entry| join(entry)));
-            bases.extend(["src/index", "index"].iter().filter_map(|entry| join(entry)));
+            bases.extend(
+                ["src/index", "index"]
+                    .iter()
+                    .filter_map(|entry| join(entry)),
+            );
         } else {
-            bases.extend([subpath.to_string(), format!("src/{subpath}")].iter().filter_map(|entry| join(entry)));
+            bases.extend(
+                [subpath.to_string(), format!("src/{subpath}")]
+                    .iter()
+                    .filter_map(|entry| join(entry)),
+            );
         }
         for base in bases {
             if let Some(found) = Self::nodenext_source_siblings(&base)
@@ -3549,7 +3557,11 @@ impl Resolver {
     /// export { X };`. The export names the importing file's own binding and
     /// the import says where it came from, which is all a barrel's
     /// `export { x } from './m'` states in one statement.
-    fn js_import_reexport_hops(&self, ext: &Extraction, hops: &mut BTreeMap<String, (String, String)>) {
+    fn js_import_reexport_hops(
+        &self,
+        ext: &Extraction,
+        hops: &mut BTreeMap<String, (String, String)>,
+    ) {
         for export in &ext.exports {
             if export.module_specifier.is_some() || export.exported_name.is_empty() {
                 continue;

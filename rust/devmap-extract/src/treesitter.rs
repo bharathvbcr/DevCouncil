@@ -1696,19 +1696,26 @@ fn js_dynamic_import_bindings(
         return bound;
     }
     let lazy_binding = || -> Option<String> {
-        let thunk = call.parent().filter(|parent| parent.kind() == "arrow_function")?;
+        let thunk = call
+            .parent()
+            .filter(|parent| parent.kind() == "arrow_function")?;
         if thunk
             .child_by_field_name("body")
             .is_none_or(|body| body.id() != call.id())
         {
             return None;
         }
-        let arguments = thunk.parent().filter(|parent| parent.kind() == "arguments")?;
+        let arguments = thunk
+            .parent()
+            .filter(|parent| parent.kind() == "arguments")?;
         let wrapper = arguments
             .parent()
             .filter(|parent| parent.kind() == "call_expression")?;
         let callee = wrapper.child_by_field_name("function")?;
-        if !matches!(get_node_text(callee, source).as_str(), "lazy" | "React.lazy") {
+        if !matches!(
+            get_node_text(callee, source).as_str(),
+            "lazy" | "React.lazy"
+        ) {
             return None;
         }
         let declarator = wrapper
@@ -2618,7 +2625,10 @@ fn js_object_member_owner(node: Node) -> Option<Node> {
     let mut parent = bounded_parent(object)?;
     while matches!(
         parent.kind(),
-        "as_expression" | "satisfies_expression" | "parenthesized_expression" | "non_null_expression"
+        "as_expression"
+            | "satisfies_expression"
+            | "parenthesized_expression"
+            | "non_null_expression"
     ) {
         child = parent;
         parent = bounded_parent(parent)?;
@@ -2633,7 +2643,6 @@ fn js_object_member_owner(node: Node) -> Option<Node> {
         && is_module_level(parent))
     .then_some(parent)
 }
-
 
 /// The function a wrapper call binds, when `value` is one: the first argument
 /// of a [`JS_FUNCTION_WRAPPERS`] call, through at most [`JS_WRAPPER_NESTING`]
@@ -8904,8 +8913,7 @@ fn module_binding_is_symbol(node: Node, source: &str) -> bool {
             "variable_declarator" => {
                 return is_field_child(parent, "name", current)
                     && is_module_level(parent)
-                    && (js_symbol_is_exported(parent, source)
-                        || js_owns_member_symbols(parent));
+                    && (js_symbol_is_exported(parent, source) || js_owns_member_symbols(parent));
             }
             "const_spec" | "var_spec" => {
                 let mut cursor = parent.walk();
@@ -9047,7 +9055,10 @@ fn js_owns_member_symbols(declarator: Node) -> bool {
     };
     while matches!(
         value.kind(),
-        "as_expression" | "satisfies_expression" | "parenthesized_expression" | "non_null_expression"
+        "as_expression"
+            | "satisfies_expression"
+            | "parenthesized_expression"
+            | "non_null_expression"
     ) {
         let Some(inner) = value.named_child(0) else {
             return false;
@@ -9109,9 +9120,9 @@ fn js_names_a_loaded_module(name: Node, source: &str) -> bool {
         value = inner;
     }
     value.kind() == "call_expression"
-        && value
-            .child_by_field_name("function")
-            .is_some_and(|callee| matches!(get_node_text(callee, source).as_str(), "import" | "require"))
+        && value.child_by_field_name("function").is_some_and(|callee| {
+            matches!(get_node_text(callee, source).as_str(), "import" | "require")
+        })
 }
 
 /// Run `visit` over one scope's local-name set, computing it once per scope.

@@ -83,8 +83,14 @@ fn an_object_literal_member_is_qualified_by_its_object() {
     assert_eq!(targets(&result, "s.ts::svc.fetchOne"), ["s.ts::helper"]);
     assert_eq!(targets(&result, "s.ts::svc.remove"), ["s.ts::helper"]);
     let from_use = targets(&result, "s.ts::use");
-    assert!(from_use.contains(&"s.ts::svc.fetchOne".to_string()), "{from_use:?}");
-    assert!(from_use.contains(&"s.ts::svc.remove".to_string()), "{from_use:?}");
+    assert!(
+        from_use.contains(&"s.ts::svc.fetchOne".to_string()),
+        "{from_use:?}"
+    );
+    assert!(
+        from_use.contains(&"s.ts::svc.remove".to_string()),
+        "{from_use:?}"
+    );
 }
 
 #[test]
@@ -186,7 +192,10 @@ fn lazy_and_awaited_imports_bind_the_module_they_load() {
              export function App() { return <About />; }\n",
         ),
     ]);
-    assert_eq!(targets(&result, "app.tsx::App"), ["pages/about.tsx::AboutPage"]);
+    assert_eq!(
+        targets(&result, "app.tsx::App"),
+        ["pages/about.tsx::AboutPage"]
+    );
     assert_eq!(targets(&result, "app.tsx::run"), ["heavy.ts::compute"]);
 }
 
@@ -229,8 +238,15 @@ fn an_npm_import_never_binds_to_a_repository_namesake() {
             "import { formatTitle } from 'some-npm-lib';\nexport function f() { return formatTitle('y'); }\n",
         ),
     ]);
-    assert!(targets(&result, "use.ts::f").is_empty(), "{:?}", calls(&result, "use.ts::f"));
-    assert_eq!(unresolved_class(&result, "use.ts::f", "formatTitle"), ["external"]);
+    assert!(
+        targets(&result, "use.ts::f").is_empty(),
+        "{:?}",
+        calls(&result, "use.ts::f")
+    );
+    assert_eq!(
+        unresolved_class(&result, "use.ts::f", "formatTitle"),
+        ["external"]
+    );
 }
 
 #[test]
@@ -243,7 +259,10 @@ fn an_import_that_resolves_to_no_file_is_unresolved_not_global() {
         ),
     ]);
     assert!(targets(&result, "use.ts::f").is_empty());
-    assert_eq!(unresolved_class(&result, "use.ts::f", "caseHelper"), ["unresolved"]);
+    assert_eq!(
+        unresolved_class(&result, "use.ts::f", "caseHelper"),
+        ["unresolved"]
+    );
 }
 
 #[test]
@@ -251,10 +270,19 @@ fn a_name_the_file_does_not_import_still_resolves_at_the_global_tier() {
     // The gate is the import statement, not the name: a bare call with no
     // import evidence keeps the answer it always had.
     let result = resolve(&[
-        ("lib/format.ts", "export function formatTitle() { return 1; }\n"),
-        ("use.ts", "export function f() { return formatTitle('y'); }\n"),
+        (
+            "lib/format.ts",
+            "export function formatTitle() { return 1; }\n",
+        ),
+        (
+            "use.ts",
+            "export function f() { return formatTitle('y'); }\n",
+        ),
     ]);
-    assert_eq!(targets(&result, "use.ts::f"), ["lib/format.ts::formatTitle"]);
+    assert_eq!(
+        targets(&result, "use.ts::f"),
+        ["lib/format.ts::formatTitle"]
+    );
 }
 
 fn workspace(name: &str, dir: &str, entries: &[&str]) -> WorkspacePackage {
@@ -300,7 +328,9 @@ fn a_workspace_package_resolves_to_its_source_entry_and_subpaths() {
         );
     }
     // The longest name wins: `@acme/shared-ui` is not `@acme/shared` + `-ui`.
-    assert!(found.iter().all(|(t, _)| !t.contains("shared/src/index.ts::button")));
+    assert!(found
+        .iter()
+        .all(|(t, _)| !t.contains("shared/src/index.ts::button")));
     // An unlisted package is external, and nothing binds `gone`.
     assert_eq!(
         unresolved_class(&result, "apps/web/src/use.ts::f", "gone"),
