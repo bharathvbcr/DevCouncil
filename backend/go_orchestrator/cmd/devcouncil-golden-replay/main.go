@@ -270,6 +270,8 @@ func seedRepo() (string, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), gitBudget)
 		defer cancel()
 		cmd := exec.CommandContext(ctx, git, args...)
+		// The deadline must reach whatever git starts, not only git.
+		proc.ConfigureGroup(cmd)
 		cmd.Dir = dir
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("git %v: %w: %s", args, err, out)
