@@ -666,3 +666,29 @@ func TestSubstitutedRedirectSurvivesAGrantedTask(t *testing.T) {
 		}
 	}
 }
+
+// TestOnChangeSeesIssueAndTheConsumeOfASingleUseGrant: the persistence hook a
+// host hangs off the gate fires for the consume that OnIssue never saw.
+func TestOnChangeSeesIssueAndTheConsumeOfASingleUseGrant(t *testing.T) {
+	g := newGate(t, nil)
+	var kinds []grants.ChangeKind
+	g.OnChange = func(c grants.Change) { kinds = append(kinds, c.Kind) }
+
+	decision, err := g.EvaluateWrite("internal/helper.go", testTask(), dc.OpWrite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !decision.Blocked() || !decision.Overridable() {
+		t.Skipf("fixture did not produce an overridable block: %+v", decision)
+	}
+	grant, err := g.RequestOverride(decision, grants.Grantor{Authority: grants.Human, ID: "operator"}, "the plan omitted it", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Ledger.Revoke(grant.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(kinds) != 2 || kinds[0] != grants.Issued || kinds[1] != grants.Revoked {
+		t.Fatalf("gate hook saw %v, want [issued revoked]", kinds)
+	}
+}

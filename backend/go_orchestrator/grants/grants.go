@@ -164,8 +164,42 @@ type Ledger struct {
 	// summary that could not tell the difference would replay every grant ever
 	// issued in this repository as though it had just been argued.
 	restored map[string]bool
+	// onChange is the one durability hook; see SetOnChange.
+	onChange func(Change)
 	// Now is injected for tests. Nil means time.Now.
 	Now func() time.Time
+}
+
+// ChangeKind names what happened to the ledger.
+type ChangeKind string
+
+const (
+	Issued   ChangeKind = "issued"
+	Consumed ChangeKind = "consumed"
+	Revoked  ChangeKind = "revoked"
+)
+
+// Change describes one ledger mutation: the grant as it stands after it.
+type Change struct {
+	Kind  ChangeKind
+	Grant Grant
+}
+
+// SetOnChange installs the one hook that fires after every mutation of the
+// ledger: a grant issued, a single-use grant consumed by Apply, a grant
+// revoked. It runs after the ledger's lock is released, so it may call All to
+// write the whole ledger down. Without it a consumed single-use grant and a
+// revoke lived only in memory, and a restart brought both back to life.
+func (l *Ledger) SetOnChange(fn func(Change)) {
+	l.mu.Lock()
+	l.onChange = fn
+	l.mu.Unlock()
+}
+
+func (l *Ledger) notify(fn func(Change), c *Change) {
+	if fn != nil && c != nil {
+		fn(*c)
+	}
 }
 
 // NewLedger returns a ledger governed by p.
@@ -222,23 +256,31 @@ func (l *Ledger) AgentMayGrant(rule policy.RuleID) bool {
 // Issue validates and records a grant.
 func (l *Ledger) Issue(req Request) (Grant, error) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
+	g, fn, err := l.issueLocked(req)
+	l.mu.Unlock()
+	if err == nil {
+		l.notify(fn, &Change{Kind: Issued, Grant: g})
+	}
+	return g, err
+}
+
+func (l *Ledger) issueLocked(req Request) (Grant, func(Change), error) {
 
 	if !l.policy.Enabled {
-		return Grant{}, ErrDisabled
+		return Grant{}, nil, ErrDisabled
 	}
 	if l.policy.RequireReason && strings.TrimSpace(req.Reason) == "" {
-		return Grant{}, ErrNoReason
+		return Grant{}, nil, ErrNoReason
 	}
 
 	// A grant naming no rules would cover hard rules too. Require the rule set
 	// to be explicit, and reject any hard rule in it.
 	if len(req.Scope.Rules) == 0 {
-		return Grant{}, fmt.Errorf("%w: name the rules being granted", ErrScope)
+		return Grant{}, nil, fmt.Errorf("%w: name the rules being granted", ErrScope)
 	}
 	for _, rule := range req.Scope.Rules {
 		if policy.SeverityOf(rule) == policy.Hard {
-			return Grant{}, fmt.Errorf("%w: %s", ErrHardRule, rule)
+			return Grant{}, nil, fmt.Errorf("%w: %s", ErrHardRule, rule)
 		}
 	}
 
@@ -246,24 +288,24 @@ func (l *Ledger) Issue(req Request) (Grant, error) {
 	switch req.Grantor.Authority {
 	case Agent:
 		if !l.policy.AgentEnabled {
-			return Grant{}, ErrAgentBlocked
+			return Grant{}, nil, ErrAgentBlocked
 		}
 		for _, rule := range req.Scope.Rules {
 			if !l.policy.agentMayGrant(rule) {
-				return Grant{}, fmt.Errorf("%w: %s", ErrNotGrantable, rule)
+				return Grant{}, nil, fmt.Errorf("%w: %s", ErrNotGrantable, rule)
 			}
 		}
 		if req.AgentTask == "" {
-			return Grant{}, fmt.Errorf("%w: an agent grant must name the task it holds", ErrScope)
+			return Grant{}, nil, fmt.Errorf("%w: an agent grant must name the task it holds", ErrScope)
 		}
 		if req.Scope.TaskID != req.AgentTask {
-			return Grant{}, fmt.Errorf("%w: an agent may only grant within its own task %q", ErrScope, req.AgentTask)
+			return Grant{}, nil, fmt.Errorf("%w: an agent may only grant within its own task %q", ErrScope, req.AgentTask)
 		}
 		ceiling = l.policy.AgentMaxTTL
 	case Human:
 		// Humans may grant repository-wide; that is what human authority means.
 	default:
-		return Grant{}, fmt.Errorf("%w: unknown authority %q", ErrScope, req.Grantor.Authority)
+		return Grant{}, nil, fmt.Errorf("%w: unknown authority %q", ErrScope, req.Grantor.Authority)
 	}
 
 	ttl := req.TTL
@@ -272,13 +314,13 @@ func (l *Ledger) Issue(req Request) (Grant, error) {
 		// a caller that passed one almost certainly computed it — a subtraction
 		// against a deadline that has already passed — and the arithmetic being
 		// wrong is not a reason to issue the longest grant available.
-		return Grant{}, fmt.Errorf("%w: negative lifetime %s", ErrTTL, req.TTL)
+		return Grant{}, nil, fmt.Errorf("%w: negative lifetime %s", ErrTTL, req.TTL)
 	}
 	if ttl == 0 {
 		ttl = ceiling
 	}
 	if ttl > ceiling {
-		return Grant{}, fmt.Errorf("%w: %s > %s", ErrTTL, ttl, ceiling)
+		return Grant{}, nil, fmt.Errorf("%w: %s > %s", ErrTTL, ttl, ceiling)
 	}
 
 	now := l.now()
@@ -292,7 +334,7 @@ func (l *Ledger) Issue(req Request) (Grant, error) {
 		ExpiresAt: now.Add(ttl),
 	}
 	l.grants = append(l.grants, g)
-	return g, nil
+	return g, l.onChange, nil
 }
 
 // Apply clears a decision when an active grant covers it, returning the
@@ -306,9 +348,15 @@ func (l *Ledger) Apply(d policy.Decision) (policy.Decision, bool) {
 		return d, false
 	}
 	l.mu.Lock()
-	defer l.mu.Unlock()
+	out, used, spent, fn := l.applyLocked(d)
+	l.mu.Unlock()
+	l.notify(fn, spent)
+	return out, used
+}
+
+func (l *Ledger) applyLocked(d policy.Decision) (policy.Decision, bool, *Change, func(Change)) {
 	if !l.policy.Enabled {
-		return d, false
+		return d, false, nil, nil
 	}
 	now := l.now()
 	for i := range l.grants {
@@ -319,17 +367,19 @@ func (l *Ledger) Apply(d policy.Decision) (policy.Decision, bool) {
 		if policy.SeverityOf(d.Rule) == policy.Hard {
 			continue
 		}
+		var spent *Change
 		if g.Scope.Once {
 			g.Consumed = true
+			spent = &Change{Kind: Consumed, Grant: *g}
 		}
 		cleared := d
 		cleared.Action = policy.Allow
 		cleared.GrantID = g.ID
 		cleared.GrantedBy = g.Grantor.String()
 		cleared.Reason = fmt.Sprintf("%s (cleared by %s: %s)", d.Reason, g.Grantor, g.Reason)
-		return cleared, true
+		return cleared, true, spent, l.onChange
 	}
-	return d, false
+	return d, false, nil, nil
 }
 
 // Issued returns the grants this run issued, newest last, excluding anything
@@ -368,17 +418,24 @@ func (l *Ledger) Active() []Grant {
 	return out
 }
 
-// Revoke consumes a grant early.
+// Revoke consumes a grant early. Every grant carrying the ID is consumed, so a
+// duplicate that slipped past Restore can never outlive its revoke.
 func (l *Ledger) Revoke(id string) error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
+	var changes []Change
 	for i := range l.grants {
 		if l.grants[i].ID == id {
 			l.grants[i].Consumed = true
-			return nil
+			changes = append(changes, Change{Kind: Revoked, Grant: l.grants[i]})
 		}
 	}
-	return fmt.Errorf("grants: no grant %q", id)
+	fn := l.onChange
+	l.mu.Unlock()
+	if len(changes) == 0 {
+		return fmt.Errorf("grants: no grant %q", id)
+	}
+	l.notify(fn, &changes[0])
+	return nil
 }
 
 // SuggestRequest builds the grant request that would clear a decision. The
@@ -495,6 +552,12 @@ func (l *Ledger) Restore(saved []Grant) []string {
 	var refused []string
 	for _, g := range saved {
 		why := l.restoreRefusal(g)
+		if why == "" && strings.TrimSpace(g.ID) == "" {
+			why = "has no ID"
+		}
+		if why == "" && l.hasID(g.ID) {
+			why = "duplicates the ID of a grant already in the ledger; a revoke could not tell them apart"
+		}
 		if why == "" {
 			why = l.expiryRefusal(g, now)
 		}
@@ -513,6 +576,15 @@ func (l *Ledger) Restore(saved []Grant) []string {
 		}
 	}
 	return refused
+}
+
+func (l *Ledger) hasID(id string) bool {
+	for _, have := range l.grants {
+		if have.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // restoreRefusal applies the checks Issue would have applied, minus the TTL
