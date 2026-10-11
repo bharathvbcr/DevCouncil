@@ -338,6 +338,10 @@ pub struct Resolver {
     /// `<file>::<exported name>` -> the file that declares it, for
     /// `export { x } from './m'`. See `compute_reexport_chains`.
     reexport_chains: BTreeMap<String, String>,
+    /// Rust: `<file>` -> the module files its `pub use m::*;` globs name. A
+    /// module path segment that is no child of a file may be a module one of
+    /// these publishes (see `rust_module_through_globs`).
+    rust_module_globs: BTreeMap<String, Vec<String>>,
     /// `<file>` -> the local binding its `export default` publishes. What an
     /// importer's `import X from` and a barrel's `export { default } from` ask
     /// for by the name `default`; see `default_binding`.
@@ -648,6 +652,7 @@ impl Resolver {
             rust_signatures: BTreeMap::new(),
             unexported_symbols: BTreeSet::new(),
             reexport_chains: BTreeMap::new(),
+            rust_module_globs: BTreeMap::new(),
             default_exports: BTreeMap::new(),
             receiver_types: BTreeMap::new(),
             scoped_receiver_types: BTreeMap::new(),
@@ -2893,6 +2898,7 @@ impl Resolver {
         self.rust_signatures.clear();
         self.unexported_symbols.clear();
         self.reexport_chains.clear();
+        self.rust_module_globs.clear();
         self.default_exports.clear();
         self.receiver_types.clear();
         self.scoped_receiver_types.clear();
@@ -3361,6 +3367,7 @@ impl Resolver {
             })
             .collect();
         self.reexport_chains = self.compute_reexport_chains(extractions);
+        self.rust_module_globs = self.compute_rust_module_globs(extractions);
 
         // Pass two resolves aliases and receiver hints against the complete
         // universe built above.
@@ -4271,6 +4278,34 @@ impl Resolver {
                 }
             }
         }
+    }
+
+    /// Every Rust `pub use m::*;` as `(file, the one module file m names)`.
+    fn compute_rust_module_globs(
+        &self,
+        extractions: &[Extraction],
+    ) -> BTreeMap<String, Vec<String>> {
+        let mut globs: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for ext in extractions
+            .iter()
+            .filter(|ext| LangFamily::from_lang(&ext.language) == LangFamily::Rust)
+        {
+            for export in ext
+                .exports
+                .iter()
+                .filter(|export| export.exported_name == "*")
+            {
+                let Some(specifier) = export.module_specifier.as_deref() else {
+                    continue;
+                };
+                if let Some(target) =
+                    self.resolve_import_path(&ext.file_path, &ext.language, specifier)
+                {
+                    globs.entry(ext.file_path.clone()).or_default().push(target);
+                }
+            }
+        }
+        globs
     }
 
     fn compute_reexport_chains(&self, extractions: &[Extraction]) -> BTreeMap<String, String> {
@@ -6655,6 +6690,36 @@ impl Resolver {
         self.consider_indexed(found, format!("{joined}/mod.rs"));
     }
 
+    /// The module file `tail` names below the one crate root in `roots`, when
+    /// a segment is not a child module of the file before it but a module that
+    /// file's glob re-export publishes: `pub use geo::*;` in `lib.rs` makes
+    /// `crate::point` mean `geo`'s `mod point`. Each segment must name exactly
+    /// one file, so a module two globs bring in is no answer. Empty on any
+    /// doubt.
+    fn rust_module_through_globs(&self, roots: &[String], tail: &str) -> Vec<String> {
+        let [root] = roots else {
+            return Vec::new();
+        };
+        let mut current = root.clone();
+        for segment in tail.split("::") {
+            let mut next = Vec::new();
+            self.consider_module_rel(&mut next, &Self::rust_call_base(&current), segment);
+            // A name the file itself declares shadows anything a glob brings.
+            if next.is_empty() && self.symbol_kind_in(&current, segment).is_none() {
+                for glob in self.rust_module_globs.get(&current).into_iter().flatten() {
+                    self.consider_module_rel(&mut next, &Self::rust_call_base(glob), segment);
+                }
+            }
+            next.sort();
+            next.dedup();
+            let [only] = next.as_slice() else {
+                return Vec::new();
+            };
+            current = only.clone();
+        }
+        vec![current]
+    }
+
     /// Indexed files the whole path names, with no segment popped.
     ///
     /// `resolve_import_path` walks a `use` by dropping a trailing type name
@@ -6678,6 +6743,11 @@ impl Resolver {
         }
         if let Some(tail) = path.strip_prefix("crate::") {
             self.consider_module_rel(&mut found, &Self::rust_crate_src_root(file), tail);
+            if found.is_empty() {
+                let mut roots = Vec::new();
+                self.consider_crate_root_files(&mut roots, &Self::rust_crate_src_root(file));
+                found = self.rust_module_through_globs(&roots, tail);
+            }
             return found;
         }
         if let Some(tail) = path.strip_prefix("self::") {
@@ -6706,6 +6776,11 @@ impl Resolver {
             RustPathRoot::Crate(src_root) => {
                 if let Some((_, tail)) = path.split_once("::") {
                     self.consider_module_rel(&mut found, &src_root, tail);
+                    if found.is_empty() {
+                        let mut roots = Vec::new();
+                        self.consider_indexed(&mut roots, format!("{src_root}/lib.rs"));
+                        found = self.rust_module_through_globs(&roots, tail);
+                    }
                 } else {
                     // A crate *name* is the library target. A package with
                     // both `lib.rs` and `main.rs` is not ambiguous to an
