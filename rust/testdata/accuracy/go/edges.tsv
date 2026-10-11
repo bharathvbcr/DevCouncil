@@ -72,4 +72,4 @@ go.Q1	Q1	app/svc/probes2.go::methodReturnCaller	app/store/store.go::Store.ElemGe
 go.Q3	Q3	app/svc/probes2.go::Holder.Rebuild	app/svc/probes2.go::Rebuild	edge	must		edge; NO self-edge Holder.Rebuild->Holder.Rebuild
 go.Q3.noself	Q3	app/svc/probes2.go::Holder.Rebuild	app/svc/probes2.go::Holder.Rebuild	forbid	must		no self-edge
 go.Q4	Q4	app/svc/probes2.go::cache.delete	app/svc/probes2.go::cache.delete	forbid	must		builtin delete is not a self-call
-go.Q5	Q5	app/svc/probes2.go::writer.clear	-	forbid	must		bytes.Buffer is external
+go.Q5	Q5	app/svc/probes2.go::writer.clear	app/svc/probes2.go::Buffer.Reset	forbid	must		bytes.Buffer is external: no HIGH edge to the in-repo namesake Buffer.Reset

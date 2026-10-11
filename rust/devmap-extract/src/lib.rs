@@ -14,6 +14,7 @@ mod entry_names;
 pub mod embedded;
 pub mod fallback;
 pub mod frameworks;
+pub mod gofacts;
 pub mod gomod;
 #[cfg(feature = "parse")]
 pub mod heritage;

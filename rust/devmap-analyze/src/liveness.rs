@@ -1532,7 +1532,7 @@ pub const UNRESOLVED_NAMESAKE_REASON: &str =
 /// with affirmative evidence that the site meant something else — `Builtin`,
 /// `HostGlobal`, `External`, `NoNamesake`, `ModulePath` — must not veto. What is
 /// left is the three the ledger itself calls unattributed
-/// ([`UNATTRIBUTED_LABELS`]): `UninferredReceiver`, `Unresolved`, and
+/// ([`UNATTRIBUTED_LABELS`]): `UninferredReceiver`, `UnresolvedMember`, `Unresolved`, and
 /// `LocalBinding`.
 ///
 /// `LocalBinding` joined on 2026-10-09. It was excluded on the theory that a
@@ -1574,6 +1574,7 @@ fn is_namesake_veto_row(row: &UnresolvedReference) -> bool {
     ) && matches!(
         row.class,
         UnresolvedClass::UninferredReceiver
+            | UnresolvedClass::UnresolvedMember
             | UnresolvedClass::Unresolved
             | UnresolvedClass::LocalBinding
     ) && match &row.resolution {
