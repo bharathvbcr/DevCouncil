@@ -29,6 +29,8 @@ go	go.Q3	false_edge	ft-e221de3c	edge; NO self-edge Holder.Rebuild->Holder.Rebuil
 go	go.Q3.noself	false_edge	ft-e221de3c	no self-edge | today: forbidden HIGH edge to ["app/svc/probes2.go::Holder.Rebuild"]
 go	go.Q4	false_edge	ft-e221de3c	builtin delete is not a self-call | today: forbidden HIGH edge to ["app/svc/probes2.go::cache.delete"]
 kotlin	kt.K02	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
+kotlin	kt.K03	miss	ft-0720fe1d	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
+kotlin	kt.K03b	miss	ft-0720fe1d	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
 kotlin	kt.K05b	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
 kotlin	kt.K06	silent_miss	ft-0720fe1d	 | today: no ledger row names {"slugify"}
 kotlin	kt.K06b	silent_miss	ft-0720fe1d	reference to a property | today: no ledger row names {"label"}
@@ -37,12 +39,13 @@ kotlin	kt.K08	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unr
 kotlin	kt.K09	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
 kotlin	kt.K10c	miss	ft-e3f7d1b1	 | today: absent today, recorded as an honest unresolved row
 kotlin	kt.K14	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
+kotlin	kt.K15	miss	ft-0720fe1d	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
 kotlin	kt.K16	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
 kotlin	kt.K17	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
 kotlin	kt.K19	false_edge	ft-0720fe1d	false-bait | today: forbidden HIGH edge to ["app/src/main/java/com/fx/app/FxApp.kt::FxApp.onCreate"]
 kotlin	kt.K20	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
 kotlin	kt.K20b	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
-kotlin	kt.K23	silent_miss	ft-837a6f05	 | today: ledger rows exist but only in explained classes: [("twice", "external")]
+kotlin	kt.K23	miss	ft-837a6f05	 | today: ledger rows exist but only in explained classes: [("twice", "external")]
 kotlin	kt.K23b	silent_miss	ft-837a6f05	 | today: ledger rows exist but only in explained classes: [("register", "no_namesake")]
 kotlin	kt.K24	silent_miss	ft-0720fe1d	 | today: no ledger row names {"castOrNull"}
 kotlin	kt.K25	miss	ft-0720fe1d	 | today: absent today, recorded as an honest unresolved row
@@ -56,8 +59,6 @@ kotlin-gaps	kg.K30	silent_miss	ft-0720fe1d	import alias: fmt(3) is gaps.util.for
 kotlin-gaps	kg.K31	false_edge	ft-0720fe1d	super.go() reaches the base method | today: HIGH edge to the wrong namesake ["src/main/kotlin/gaps/Events.kt::Child.go"]
 kotlin-gaps	kg.K31b	false_edge	ft-0720fe1d	super.go() is not a self-reference | today: forbidden HIGH edge to ["src/main/kotlin/gaps/Events.kt::Child.go"]
 kotlin-gaps	kg.K33	miss	ft-0720fe1d	nested class constructor Res.Ok(1) | today: absent today, recorded as an honest unresolved row
-kotlin-gaps	kg.S2a	false_edge	ft-32522da4	a function-typed parameter call is a local binding, not Widget.onStart | today: forbidden HIGH edge to ["src/main/kotlin/gaps/Events.kt::Widget.onStart"]
-kotlin-gaps	kg.S2b	false_edge	ft-32522da4	putBoolean inside Editor.apply{} is the external editor, not the project namesake | today: forbidden HIGH edge to ["src/main/kotlin/gaps/Events.kt::Prefs.putBoolean"]
 python	py.C05	miss	ft-c666ba7c	edge (E2(1).step()) | today: absent today, recorded as an honest unresolved row
 python	py.C05b	miss	ft-c666ba7c	edge | today: absent today, recorded as an honest unresolved row
 python	py.C07	miss	ft-c666ba7c	edge (super().__init__) | today: absent today, recorded as an honest unresolved row
@@ -67,16 +68,27 @@ python	py.C08	miss	ft-c666ba7c	property read edge (any kind) or honest miss | to
 python	py.C09	miss	ft-c666ba7c	edge | today: absent today, recorded as an honest unresolved row
 python	py.C09b	miss	ft-c666ba7c	edge | today: absent today, recorded as an honest unresolved row
 python	py.C09d	silent_miss	ft-c666ba7c	edge-ish (cls(0)) or honest miss | today: no ledger row names {"Engine"}
+python	py.C10c	miss	ft-837a6f05	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
+python	py.C13b	miss	ft-837a6f05	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
+python	py.C13c	miss	ft-837a6f05	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
 python	py.C15	silent_miss	ft-c666ba7c	reference edge (partial(helper), apply(helper)) | today: no ledger row names {"helper"}
+python	py.C15b	miss	ft-837a6f05	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
 python	py.C17c	miss	ft-c666ba7c	edge | today: absent today, recorded as an honest unresolved row
+python	py.C18b	miss	ft-837a6f05	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
+python	py.C20	miss	ft-837a6f05	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
+python	py.C20b	miss	ft-837a6f05	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
 python	py.C21	silent_miss	ft-c666ba7c	edge or honest miss (implicit dunder) | today: no ledger row names {"__enter__"}
 python	py.C22b	miss	ft-c666ba7c	edge or honest miss; NOT other/dup.py::helper | today: absent today, recorded as an honest unresolved row
 python	py.C23b	miss	ft-c666ba7c	edge if fixture return typed; honest miss acceptable | today: absent today, recorded as an honest unresolved row
 python	py.C26	miss	ft-837a6f05	Imports edge via pytest pythonpath | today: absent today, recorded as an honest unresolved row
-python-hatch	pr.hatch.import	silent_miss	ft-837a6f05	Imports edge via the source root | today: no unattributed ledger row in the importing file
-python-nomanifest	pr.nomanifest.import	silent_miss	ft-837a6f05	Imports edge via the source root | today: no unattributed ledger row in the importing file
-python-ruff	pr.ruff.import	silent_miss	ft-837a6f05	Imports edge via the source root | today: no unattributed ledger row in the importing file
-python-setupcfg	pr.setupcfg.import	silent_miss	ft-837a6f05	Imports edge via the source root | today: no unattributed ledger row in the importing file
+python-hatch	pr.hatch.edge	miss	ft-837a6f05	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
+python-hatch	pr.hatch.import	miss	ft-837a6f05	Imports edge via the source root | today: no unattributed ledger row in the importing file
+python-nomanifest	pr.nomanifest.edge	miss	ft-837a6f05	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
+python-nomanifest	pr.nomanifest.import	miss	ft-837a6f05	Imports edge via the source root | today: no unattributed ledger row in the importing file
+python-ruff	pr.ruff.edge	miss	ft-837a6f05	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
+python-ruff	pr.ruff.import	miss	ft-837a6f05	Imports edge via the source root | today: no unattributed ledger row in the importing file
+python-setupcfg	pr.setupcfg.edge	miss	ft-837a6f05	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
+python-setupcfg	pr.setupcfg.import	miss	ft-837a6f05	Imports edge via the source root | today: no unattributed ledger row in the importing file
 rust	rs.c02	miss	ft-e3f7d1b1	dyn Trait: trait decl or fan-out to both impls | today: absent today, recorded as an honest unresolved row
 rust	rs.c02b	miss	ft-e3f7d1b1	Box<dyn> in closure | today: absent today, recorded as an honest unresolved row
 rust	rs.c03	miss	ft-e3f7d1b1	generic bound T: Render | today: absent today, recorded as an honest unresolved row
@@ -130,10 +142,8 @@ swift	sw.M2a	miss	ft-8ca270ad	annotated local types the receiver | today: absent
 swift	sw.M2b	miss	ft-8ca270ad	annotated local types the receiver | today: absent today, recorded as an honest unresolved row
 swift	sw.M2c	miss	ft-8ca270ad	annotated local types the receiver | today: absent today, recorded as an honest unresolved row
 swift	sw.M2d	miss	ft-8ca270ad	annotated local enum | today: absent today, recorded as an honest unresolved row
-swift	sw.M4a	false_edge	ft-32522da4	local typed by call result of external() | today: HIGH edge to the wrong namesake ["micro/Sources/M/C.swift::Alpha.run"]
-swift	sw.M4b	false_edge	ft-32522da4	param s: Alpha in another function must not type the local s | today: forbidden HIGH edge to ["micro/Sources/M/C.swift::Alpha.run"]
-swift	sw.M4c	false_edge	ft-32522da4	closure param typed by element type | today: HIGH edge to the wrong namesake ["micro/Sources/M/C.swift::Alpha.run"]
-swift	sw.M4d	false_edge	ft-32522da4	must not bind to Alpha.run | today: forbidden HIGH edge to ["micro/Sources/M/C.swift::Alpha.run"]
+swift	sw.M4a	miss	ft-32522da4	local typed by call result of external() | today: HIGH edge to the wrong namesake ["micro/Sources/M/C.swift::Alpha.run"]
+swift	sw.M4c	miss	ft-32522da4	closure param typed by element type | today: HIGH edge to the wrong namesake ["micro/Sources/M/C.swift::Alpha.run"]
 swift	sw.M5	miss	ft-8ca270ad	Meter(v: 1).bump() typed by constructor | today: absent today, recorded as an honest unresolved row
 swift	sw.P2	miss	ft-8ca270ad	annotated local let m: Meter = .zero | today: absent today, recorded as an honest unresolved row
 swift	sw.P4	miss	ft-8ca270ad	function reference passed by name | today: absent today, recorded as an honest unresolved row
@@ -147,12 +157,15 @@ swift	sw.X7	false_edge	ft-32522da4	ctor of own-module type that shadows an impor
 ts	ts.C15	miss	ft-736b0b22	m.heavyCompute() after await import() | today: absent today, recorded as an honest unresolved row
 ts	ts.C17	silent_miss	ft-736b0b22	class-field arrow member | today: ledger rows exist but only in explained classes: [("handle", "no_namesake")]
 ts	ts.C18b	silent_miss	ft-736b0b22	svcHelper is live | today: no ledger row names {"svcHelper"}
+ts	ts.C26	miss	ft-736b0b22	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
+ts	ts.C27	miss	ft-736b0b22	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
 ts	ts.C7	silent_miss	ft-736b0b22	lazy import; AboutPage not dead | today: no ledger row names {"AboutPage"}
 ts	ts.V14	miss	ft-736b0b22	import {x} from; export {x} | today: absent today, recorded as an honest unresolved row
 ts	ts.V15b	silent_miss	ft-736b0b22	object-literal arrow member | today: no ledger row names {"clearLogs"}
 ts	ts.V16	miss	ft-736b0b22	this inside arrow nested in a method | today: absent today, recorded as an honest unresolved row
-ts	ts.V2	false_edge	ft-32522da4	external npm import must not bind to the local namesake | today: forbidden HIGH edge to ["apps/web/src/lib/format.ts::formatTitle"]
 ts	ts.V5a	miss	ft-736b0b22	export default memo(Card) + barrel | today: absent today, recorded as an honest unresolved row
+ts	ts.V8a	miss	ft-736b0b22	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
 ts	ts.V8c	silent_miss	ft-736b0b22	enum reference | today: no ledger row names {"Mode"}
+ts	ts.V8d	miss	ft-736b0b22	S2: only bound before by the bare-name rung (name coincidence or ambiguous fan-out) while the import failed; now an honest unresolved row until import resolution lands | today: absent today, recorded as an honest unresolved row
 ts	ts.V9a	silent_miss	ft-736b0b22	JSX in route object | today: no ledger row names {"RoutedPage"}
 ts	ts.V9b	silent_miss	ft-736b0b22	lazy route module; caller is the file | today: no ledger row names {"Component"}

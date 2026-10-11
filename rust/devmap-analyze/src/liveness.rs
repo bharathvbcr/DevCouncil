@@ -2124,6 +2124,52 @@ pub struct LivenessOutcome {
 /// resolutions count as reaching.
 type CallIndex = (HashSet<(String, String)>, HashSet<(String, String)>);
 
+/// Record `symbol` of `file` as something an ambiguous site might name, under
+/// the three spellings a declaration is looked up by: its identity, its short
+/// name, and the member name with its owner stripped.
+///
+/// `ExtractedSymbol::name` is the bare `toJson`, while a site names
+/// `File::RemoteTaskEntity.toJson`, so without the stripped form the two never
+/// meet and the ambiguity is recorded against nothing. This became load-bearing
+/// when Kotlin extension functions gained their receiver: one Android file
+/// declares seven `private fun <T>.toJson()` on seven different types and calls
+/// every one of them as `it.toJson()` inside a `map { }`. The receiver `it`
+/// cannot be typed, so the site is ambiguous — and the other six candidates,
+/// each genuinely called, were reported dead at 0.9 confidence.
+///
+/// Bounded to the ambiguous set on purpose: this can only move a finding from
+/// 0.9 to 0.4 `only_ambiguous_callers`, never exempt it, so it cannot hide a
+/// symbol nothing calls. Doing the same for `called_symbols` would silently
+/// exempt every same-named method in the file, which is a different and much
+/// worse trade.
+fn record_ambiguous(set: &mut HashSet<(String, String)>, file: &str, symbol: &str) {
+    set.insert((file.to_string(), symbol.to_string()));
+    if let Some(short_name) = symbol.rsplit("::").next() {
+        set.insert((file.to_string(), short_name.to_string()));
+        if let Some(member) = short_name.rsplit('.').next() {
+            set.insert((file.to_string(), member.to_string()));
+        }
+    }
+}
+
+/// The ambiguous *sites*: every call that named several candidates and bound
+/// none of them (S2). A bare-name site with in-repo namesakes is carried by its
+/// ledger row — `Resolution::AmbiguousGlobal` with the complete candidate list
+/// — and never by edges, so liveness reads the ambiguity from the ledger.
+fn ambiguous_ledger_rows(
+    resolution: &ResolutionResult,
+) -> impl Iterator<Item = (&UnresolvedReference, &[(String, String)])> {
+    resolution.unresolved.iter().filter_map(|row| {
+        if row.kind != UnresolvedKind::Call {
+            return None;
+        }
+        match &row.resolution {
+            Resolution::AmbiguousGlobal { candidates, .. } => Some((row, &candidates[..])),
+            _ => None,
+        }
+    })
+}
+
 fn called_and_ambiguous_symbols(resolution: &ResolutionResult) -> CallIndex {
     // File-scoped called symbols: (target_file, symbol_name_or_qualified_name)
     let mut called_symbols: HashSet<(String, String)> = HashSet::new();
@@ -2144,34 +2190,7 @@ fn called_and_ambiguous_symbols(resolution: &ResolutionResult) -> CallIndex {
         // symbol may be called, not proof that any one candidate is called.
         // Do not turn speculative resolution into a false liveness negative.
         if is_ambiguous_edge(edge) {
-            ambiguous_symbols.insert((edge.target_file.clone(), edge.target_symbol.clone()));
-            if let Some(short_name) = edge.target_symbol.rsplit("::").next() {
-                ambiguous_symbols.insert((edge.target_file.clone(), short_name.to_string()));
-                // …and the member name with its owner stripped.
-                //
-                // `ExtractedSymbol::name` is the bare `toJson`, while an edge
-                // names `File::RemoteTaskEntity.toJson`, so without this the two
-                // never meet and the ambiguity is recorded against nothing.
-                //
-                // This became load-bearing when Kotlin extension functions
-                // gained their receiver: one Android file declares seven
-                // `private fun <T>.toJson()` on seven different types and calls
-                // every one of them as `it.toJson()` inside a `map { }`. The
-                // receiver `it` cannot be typed, so the resolver emits an
-                // *ambiguous* edge naming one candidate — and the other six,
-                // each genuinely called, were reported dead at 0.9 confidence.
-                // Before the receiver fix all seven collapsed into one symbol
-                // and the question could not arise.
-                //
-                // Bounded to the ambiguous set on purpose: this can only move a
-                // finding from 0.9 to 0.4 `only_ambiguous_callers`, never exempt
-                // it, so it cannot hide a symbol nothing calls. Doing the same
-                // for `called_symbols` would silently exempt every same-named
-                // method in the file, which is a different and much worse trade.
-                if let Some(member) = short_name.rsplit('.').next() {
-                    ambiguous_symbols.insert((edge.target_file.clone(), member.to_string()));
-                }
-            }
+            record_ambiguous(&mut ambiguous_symbols, &edge.target_file, &edge.target_symbol);
             continue;
         }
         if matches!(
@@ -2183,6 +2202,12 @@ fn called_and_ambiguous_symbols(resolution: &ResolutionResult) -> CallIndex {
         called_symbols.insert((edge.target_file.clone(), edge.target_symbol.clone()));
         if let Some(short_name) = edge.target_symbol.rsplit("::").next() {
             called_symbols.insert((edge.target_file.clone(), short_name.to_string()));
+        }
+    }
+
+    for (_, candidates) in ambiguous_ledger_rows(resolution) {
+        for (file, symbol) in candidates {
+            record_ambiguous(&mut ambiguous_symbols, file, symbol);
         }
     }
 

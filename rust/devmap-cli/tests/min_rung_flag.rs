@@ -13,6 +13,8 @@
 //!   say how many edges the floor hid, so a short list is never mistaken for a
 //!   sparse graph.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -34,8 +36,11 @@ fn run(root: &Path, args: &[&str]) -> Output {
 }
 
 /// The same shape as the engine fixture: one same-file call resolves
-/// deterministically, one call to a name two files define resolves ambiguously
-/// to both. Mixed rungs are the precondition for any of this to mean anything.
+/// deterministically, one call to a name two files define is a language
+/// server's dispatch set over both (the resolver itself leaves an ambiguous
+/// bare name on the ledger, so `add_dispatch_edges` writes the speculative
+/// generation). Mixed rungs are the precondition for any of this to mean
+/// anything.
 /// `name` is not decoration. `SystemTime` on macOS is coarse enough that four
 /// threads starting at once can read the same nanosecond, and with a shared pid
 /// that put two tests in one directory — where the first to finish deleted the
@@ -64,6 +69,11 @@ fn corpus(name: &str) -> PathBuf {
         built.status.success(),
         "build failed: {}",
         String::from_utf8_lossy(&built.stderr)
+    );
+    common::add_dispatch_edges(
+        &root,
+        &devmap_extract::paths::store_path(&root),
+        &["lib_a.py", "lib_b.py", "app.py"],
     );
     root
 }

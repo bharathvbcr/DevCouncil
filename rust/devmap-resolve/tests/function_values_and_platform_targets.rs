@@ -199,29 +199,28 @@ fn go_platform_twins_fan_out_by_file_suffix_and_by_build_tag() {
         ),
     ] {
         let result = resolve(&files);
-        let calls: Vec<_> = result
-            .edges
+        assert!(
+            result
+                .edges
+                .iter()
+                .all(|edge| edge.edge_kind != EdgeKind::Calls
+                    || edge.source_symbol != "sys/use.go::Use"),
+            "{label}: a platform twin is a guess between candidates, never a bind"
+        );
+        let row = result
+            .unresolved
             .iter()
-            .filter(|edge| {
-                edge.edge_kind == EdgeKind::Calls && edge.source_symbol == "sys/use.go::Use"
-            })
-            .collect();
-        let mut targets: Vec<&str> = calls
-            .iter()
-            .map(|edge| edge.target_symbol.as_str())
-            .collect();
+            .find(|row| row.source_symbol == "sys/use.go::Use" && row.callee_name == "open")
+            .unwrap_or_else(|| panic!("{label}: the site must be in the ledger"));
+        let Resolution::AmbiguousGlobal { candidates, .. } = &row.resolution else {
+            panic!("{label}: expected AmbiguousGlobal, got {:?}", row.resolution);
+        };
+        let mut targets: Vec<&str> = candidates.iter().map(|(_, symbol)| symbol.as_str()).collect();
         targets.sort();
         assert_eq!(
             targets,
             vec!["sys/open_darwin.go::open", "sys/open_linux.go::open"],
             "{label}"
-        );
-        assert!(
-            calls.iter().all(|edge| matches!(
-                edge.resolution.as_deref(),
-                Some(Resolution::AmbiguousGlobal { .. })
-            )),
-            "{label}: a platform twin is a guess between candidates, never a single bind"
         );
     }
 }

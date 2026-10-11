@@ -194,14 +194,13 @@ fn no_unattributed_call_is_dropped_without_a_row() {
     }
 }
 
-/// An ambiguous call fans out into several edges and is still one site. Stated
-/// here as well as in `resolution_rate.rs` because the two crates can drift:
-/// the dedup lives there and the `Arc` sharing that makes it work lives here.
+/// An ambiguous call is one site: since S2 it is one ledger row naming every
+/// candidate and no edge at all, so nothing can count it as several successes.
 ///
 /// Uses a **bare** AmbiguousGlobal (two free functions named `build`). An
-/// untyped `w.build()` no longer fans out — that is UninferredReceiver.
+/// untyped `w.build()` is UninferredReceiver instead.
 #[test]
-fn an_ambiguous_fan_out_shares_one_resolution_allocation() {
+fn an_ambiguous_site_is_one_ledger_row_and_no_edges() {
     let files = [
         ("a.py", "def build():\n    return 1\n"),
         ("b.py", "def build():\n    return 2\n"),
@@ -209,30 +208,25 @@ fn an_ambiguous_fan_out_shares_one_resolution_allocation() {
     ];
     let (_, result) = resolve(&files);
 
-    let fanned: Vec<_> = result
-        .edges
+    let rows: Vec<_> = result
+        .unresolved
         .iter()
-        .filter(|edge| {
-            edge.resolution.as_ref().is_some_and(|resolution| {
-                matches!(**resolution, Resolution::AmbiguousGlobal { .. })
-            })
-        })
+        .filter(|row| matches!(row.resolution, Resolution::AmbiguousGlobal { .. }))
         .collect();
-    assert!(
-        !fanned.is_empty(),
-        "two free-function `build` declarations and a bare call must AmbiguousGlobal"
+    assert_eq!(
+        rows.len(),
+        1,
+        "two free-function `build` declarations and one bare call are one ambiguous site"
     );
-
-    let allocations: HashSet<*const Resolution> = fanned
-        .iter()
-        .map(|edge| std::sync::Arc::as_ptr(edge.resolution.as_ref().expect("checked above")))
-        .collect();
+    assert!(matches!(
+        &rows[0].resolution,
+        Resolution::AmbiguousGlobal { candidates, .. } if candidates.len() == 2
+    ));
     assert!(
-        allocations.len() < fanned.len(),
-        "{} fan-out edges across {} allocations: one call site must share one \
-         `Arc`, or `resolved_sites` counts an ambiguity as several successes",
-        fanned.len(),
-        allocations.len()
+        result.edges.iter().all(|edge| !edge.resolution.as_ref().is_some_and(
+            |resolution| matches!(**resolution, Resolution::AmbiguousGlobal { .. })
+        )),
+        "an ambiguous site must not fan out into edges"
     );
 }
 

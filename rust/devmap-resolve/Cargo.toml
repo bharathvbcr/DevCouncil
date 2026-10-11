@@ -231,3 +231,11 @@ required-features = ["parse"]
 [[test]]
 name = "function_values_and_platform_targets"
 required-features = ["parse"]
+
+[[test]]
+name = "global_rung_requires_no_other_evidence"
+required-features = ["parse"]
+
+[[test]]
+name = "a_receiver_call_never_binds_by_bare_name"
+required-features = ["parse"]

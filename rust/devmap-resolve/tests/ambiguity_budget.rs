@@ -107,25 +107,29 @@ fn repeated_evidence_is_bounded_by_default() {
 
 #[test]
 fn ordinary_candidate_names_do_not_pay_for_escape_sequences() {
-    // 8000 sites with 16 ordinary names are charged before edge deduplication.
-    // Even that upper bound fits the default budget; charging six bytes for
-    // every unescaped ASCII byte incorrectly refuses this workload.
+    // 8000 sites with 16 ordinary names are charged one ledger row each. Even
+    // that upper bound fits the default budget; charging six bytes for every
+    // unescaped ASCII byte incorrectly refuses this workload.
     let inputs = fixture(16, 4000);
     let mut resolver = Resolver::new();
     resolver.index_extractions(&inputs);
     let result = resolver.resolve_all(&inputs).unwrap();
     let ambiguous: Vec<_> = result
-        .edges
+        .unresolved
         .iter()
-        .filter_map(|edge| match edge.resolution.as_deref() {
-            Some(Resolution::AmbiguousGlobal { candidates, .. }) => Some(candidates),
+        .filter_map(|row| match &row.resolution {
+            Resolution::AmbiguousGlobal { candidates, .. } => Some(candidates),
             _ => None,
         })
         .collect();
-    // Each of the two callers still reaches all 16 candidates after repeated
-    // calls from the same symbol are merged into one edge per target.
-    assert_eq!(ambiguous.len(), 32);
+    // Every site keeps its row, each naming all 16 candidates, and none
+    // emits an edge.
+    assert_eq!(ambiguous.len(), 8000);
     assert!(ambiguous.iter().all(|candidates| candidates.len() == 16));
+    assert!(result.edges.iter().all(|edge| !matches!(
+        edge.resolution.as_deref(),
+        Some(Resolution::AmbiguousGlobal { .. })
+    )));
 }
 
 #[test]
@@ -146,21 +150,16 @@ fn candidate_cache_preserves_go_private_visibility() {
     let mut resolver = Resolver::new();
     resolver.index_extractions(&inputs);
     let result = resolver.resolve_all(&inputs).unwrap();
-    let edges: Vec<_> = result
-        .edges
+    let rows: Vec<_> = result
+        .unresolved
         .iter()
-        .filter(|edge| {
-            matches!(
-                edge.resolution.as_deref(),
-                Some(Resolution::AmbiguousGlobal { .. })
-            )
-        })
+        .filter(|row| matches!(row.resolution, Resolution::AmbiguousGlobal { .. }))
         .collect();
-    assert_eq!(edges.len(), 4);
-    for edge in edges {
-        let package = edge.source_file.split('/').next().unwrap();
-        let Some(Resolution::AmbiguousGlobal { candidates, .. }) = edge.resolution.as_deref()
-        else {
+    // Two packages, one bare call each: one site per package.
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        let package = row.source_file.split('/').next().unwrap();
+        let Resolution::AmbiguousGlobal { candidates, .. } = &row.resolution else {
             unreachable!()
         };
         assert_eq!(candidates.len(), 2);

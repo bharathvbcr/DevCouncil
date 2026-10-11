@@ -217,9 +217,22 @@ fn ra2_both_same_named_methods_remain_distinct_ambiguous_candidates() {
         ("b.py", "def ping(): return 2\n"),
         ("c.py", "def run(): return ping()\n"),
     ]);
+    // A bare ambiguous name binds no caller; the ledger row names both (S2).
+    assert!(calls_from(&bare, "c.py::run").is_empty());
+    let row = bare
+        .unresolved
+        .iter()
+        .find(|u| u.callee_name == "ping" && u.source_symbol == "c.py::run")
+        .expect("the bare site is recorded");
+    let Resolution::AmbiguousGlobal { candidates, .. } = &row.resolution else {
+        panic!("expected AmbiguousGlobal, got {:?}", row.resolution);
+    };
     assert_eq!(
-        calls_from(&bare, "c.py::run"),
-        BTreeSet::from(["a.py::ping".into(), "b.py::ping".into()])
+        candidates
+            .iter()
+            .map(|(_, symbol)| symbol.clone())
+            .collect::<BTreeSet<String>>(),
+        BTreeSet::from(["a.py::ping".to_string(), "b.py::ping".to_string()])
     );
 }
 
@@ -247,7 +260,7 @@ fn ra2_ambiguity_caps_count_distinct_identities_in_one_file() {
     let above = resolve(&borrowed);
     assert!(
         calls_from(&above, "c.py::run").is_empty(),
-        "above-ceiling bare AmbiguousGlobal emits no edges"
+        "bare AmbiguousGlobal emits no edges"
     );
     let entry = above
         .unresolved

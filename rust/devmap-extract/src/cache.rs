@@ -597,7 +597,13 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// empty, which charges every such region against the dead-code ceiling —
 /// a lone `}` would keep a whole language out of the confident tier until
 /// the file was edited.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "80";
+///
+/// v81 binds a Swift or Kotlin callable's parameters and a closure's
+/// parameters (and the implicit `it` / `$0`) as local bindings of that scope.
+/// A v80 row has none, so a bare call to a function-typed parameter, or a
+/// receiver typed by another function's same-named parameter, would still be
+/// bound to a project namesake from a warm cache.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "81";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

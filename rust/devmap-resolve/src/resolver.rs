@@ -110,12 +110,8 @@ fn charge_ambiguity(
     candidates: &GlobalCandidates,
     limit: u64,
 ) -> Result<(), ResolutionLimitError> {
-    let rows = if candidates.rows.len() > AMBIGUOUS_FANOUT_CAP {
-        1
-    } else {
-        candidates.rows.len() as u64
-    };
-    let additional = candidates.evidence_bytes.saturating_mul(rows);
+    // One ledger row per ambiguous site, however many candidates it names.
+    let additional = candidates.evidence_bytes;
     // An explicit compare-exchange loop rather than `fetch_update`, which Rust
     // 1.99 deprecates in favour of `try_update` — a name older toolchains this
     // workspace still builds on do not have.
@@ -314,6 +310,11 @@ pub struct Resolver {
     /// with. Read by the rungs that type a binding from a return type or a
     /// closure parameter; see `devmap_extract::rustsig`.
     rust_signatures: BTreeMap<(String, String), String>,
+    /// `(file, qualified name)` of every declaration the language hides from
+    /// other files: a Swift `private`/`fileprivate`, a non-exported binding of
+    /// a TS/JS module, a non-`pub` Rust item. Read by the bare-name rung so
+    /// it never binds a name its caller cannot see (S2).
+    unexported_symbols: BTreeSet<(String, String)>,
     /// `<file>::<exported name>` -> the file that declares it, for
     /// `export { x } from './m'`. See `compute_reexport_chains`.
     reexport_chains: BTreeMap<String, String>,
@@ -594,6 +595,7 @@ impl Resolver {
             rust_crate_roots: BTreeMap::new(),
             rust_manifest_crates: Vec::new(),
             rust_signatures: BTreeMap::new(),
+            unexported_symbols: BTreeSet::new(),
             reexport_chains: BTreeMap::new(),
             receiver_types: BTreeMap::new(),
             scoped_receiver_types: BTreeMap::new(),
@@ -2295,6 +2297,7 @@ impl Resolver {
         self.py_search_dirs.clear();
         self.rust_crate_roots.clear();
         self.rust_signatures.clear();
+        self.unexported_symbols.clear();
         self.reexport_chains.clear();
         self.receiver_types.clear();
         self.scoped_receiver_types.clear();
@@ -2378,6 +2381,13 @@ impl Resolver {
                             signature.clone(),
                         );
                     }
+                }
+                if !sym.is_exported
+                    && Self::visibility_is_enforced(family)
+                    && (family != LangFamily::JsTs || Self::is_js_module(ext))
+                {
+                    self.unexported_symbols
+                        .insert((ext.file_path.clone(), sym.qualified_name.clone()));
                 }
                 let identity: Arc<str> = Arc::from(sym.qualified_name.as_str());
                 self.symbol_index
@@ -2631,6 +2641,52 @@ impl Resolver {
             })
             .collect();
         let rust_crates: BTreeSet<String> = self.rust_crate_roots.keys().cloned().collect();
+        // The directory path of every indexed JVM source file, at every suffix:
+        // `core/src/main/java/com/fx/util/A.kt` holds `util`, `fx/util`,
+        // `com/fx/util` and so on. A JVM package is its directory path, so a
+        // dotted import whose package matches one is an import into this
+        // repository, whatever the build layout puts above it.
+        // Directory names of indexed JS/TS files: a scoped specifier
+        // `@acme/shared` whose last segment names one is a workspace package
+        // of this repository, not a registry package.
+        let js_dir_names: BTreeSet<String> = self
+            .file_symbols
+            .keys()
+            .filter(|path| {
+                matches!(
+                    path.rsplit('.').next(),
+                    Some("ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs")
+                )
+            })
+            .flat_map(|path| {
+                let mut parts: Vec<&str> = path.split('/').collect();
+                parts.pop();
+                parts.into_iter().map(str::to_string)
+            })
+            .collect();
+        let jvm_package_dirs: BTreeSet<String> = self
+            .file_symbols
+            .keys()
+            .filter(|path| {
+                matches!(
+                    path.rsplit('.').next(),
+                    Some("kt" | "kts" | "java" | "scala")
+                )
+            })
+            .flat_map(|path| {
+                let dir = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+                let mut suffixes = Vec::new();
+                let mut rest = dir;
+                while !rest.is_empty() {
+                    suffixes.push(rest.to_string());
+                    match rest.split_once('/') {
+                        Some((_, tail)) => rest = tail,
+                        None => break,
+                    }
+                }
+                suffixes
+            })
+            .collect();
 
         // Between the passes, and necessarily so: following a barrel needs the
         // complete symbol universe pass one builds, and pass two's import
@@ -2681,6 +2737,29 @@ impl Resolver {
                 match ext.language.as_str() {
                     "python" => python_packages.contains(root),
                     "rust" => rust_crates.contains(root),
+                    "typescript" | "tsx" | "javascript" | "jsx" => {
+                        let spec = specifier.trim_matches(|c| c == '\'' || c == '"');
+                        spec.starts_with('@')
+                            && spec
+                                .rsplit('/')
+                                .next()
+                                .is_some_and(|name| js_dir_names.contains(name))
+                    }
+                    "kotlin" | "java" | "scala" => {
+                        // `com.fx.util.format` names the package `com.fx.util`
+                        // (the last segment is the member) or, for `com.fx.*`
+                        // or an import of a package itself, the whole path.
+                        let dotted = specifier
+                            .trim_matches(|c| c == '\'' || c == '"')
+                            .trim_end_matches(".*");
+                        let whole = dotted.replace('.', "/");
+                        jvm_package_dirs.contains(&whole)
+                            || dotted
+                                .rsplit_once('.')
+                                .is_some_and(|(package, _)| {
+                                    jvm_package_dirs.contains(&package.replace('.', "/"))
+                                })
+                    }
                     _ => false,
                 }
             };
@@ -2941,7 +3020,15 @@ impl Resolver {
                                 }
                                 let others: Vec<_> = decls
                                     .iter()
-                                    .filter(|(path, _, _)| path != &ext.file_path)
+                                    .filter(|(path, symbol, _)| {
+                                        path != &ext.file_path
+                                            && self.candidate_is_visible_from(
+                                                LangFamily::Swift,
+                                                &ext.file_path,
+                                                path,
+                                                symbol,
+                                            )
+                                    })
                                     .collect();
                                 if others.len() != 1 {
                                     continue;
@@ -3501,7 +3588,7 @@ impl Resolver {
         let per_file: Vec<FileResolution> = extractions
             .par_iter()
             .map(|ext| -> Result<FileResolution, ResolutionLimitError> {
-                let mut local_candidates: BTreeMap<&str, Arc<GlobalCandidates>> = BTreeMap::new();
+                let mut local_candidates: BTreeMap<(&str, bool), Arc<GlobalCandidates>> = BTreeMap::new();
                 let mut edges: Vec<ResolvedEdge> = Vec::new();
                 let mut unresolved: Vec<UnresolvedReference> = Vec::new();
                 let mut package_groups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -4182,25 +4269,42 @@ impl Resolver {
 
                     // Bare global names share one immutable set per visibility
                     // scope. Receiver and earlier proven rungs stay unchanged.
-                    if resolution.is_none() && call.receiver_expr.is_none() {
-                        let candidates = match local_candidates.get(call.callee_name.as_str()) {
+                    //
+                    // S2. This rung answers only when nothing else is known
+                    // about the name: an import, a builtin or a host global
+                    // already says what it is, and a name that is merely the
+                    // same *spelling* as a repository declaration is not
+                    // evidence of that declaration. Declining leaves the site
+                    // to `classify_unresolved`, which names the evidence.
+                    if resolution.is_none()
+                        && call.receiver_expr.is_none()
+                        && !self.bare_name_has_other_evidence(&ext.file_path, family, &call.callee_name)
+                    {
+                        let in_type = self.call_is_inside_a_type(
+                            &ext.file_path,
+                            family,
+                            call.caller_symbol.as_deref(),
+                        );
+                        let candidates = match local_candidates.get(&(call.callee_name.as_str(), in_type)) {
                             Some(candidates) => Arc::clone(candidates),
                             None => {
-                                let candidates = self.global_candidates(&global_candidates, &ext.file_path, family, &call.callee_name, limits)?;
-                                local_candidates.insert(&call.callee_name, Arc::clone(&candidates));
+                                let candidates = self.global_candidates(
+                                    &global_candidates,
+                                    &ext.file_path,
+                                    family,
+                                    &call.callee_name,
+                                    in_type,
+                                    limits,
+                                )?;
+                                local_candidates.insert((&call.callee_name, in_type), Arc::clone(&candidates));
                                 candidates
                             }
                         };
                         if candidates.declarations == 1 {
                             let (target_f, target_identity) = &candidates.rows[0];
-                            let is_python_stdlib_guard = family == LangFamily::Python
-                                && matches!(call.callee_name.as_str(), "open" | "dir" | "print" | "type" | "id" | "len")
-                                && target_f != &ext.file_path;
-                            if !is_python_stdlib_guard {
-                                resolution = Some(Arc::new(Resolution::UniqueGlobal {
-                                    target_symbol: target_identity.clone(), target_file: target_f.clone(), family,
-                                }));
-                            }
+                            resolution = Some(Arc::new(Resolution::UniqueGlobal {
+                                target_symbol: target_identity.clone(), target_file: target_f.clone(), family,
+                            }));
                         } else if candidates.declarations > 1 {
                             charge_ambiguity(&ambiguity_bytes, &candidates, limits.ambiguity_evidence_bytes)?;
                             resolution = Some(Arc::new(Resolution::AmbiguousGlobal { candidates: Arc::clone(&candidates.rows), family }));
@@ -4218,42 +4322,27 @@ impl Resolver {
                     let mut emitted = false;
                     if let Some(resolution) = &resolution {
                         match resolution.as_ref() {
-                            Resolution::AmbiguousGlobal { candidates, .. } => {
-                                // R7 / dead-hardening: at or below the ceiling,
-                                // emit one edge per candidate (SC4). Above it,
-                                // emit **no** edges — a capped sample of a
-                                // 241-candidate site was still 16 wrong callers
-                                // per site, and every candidate past the old
-                                // take() lost the only_ambiguous_callers
-                                // downgrade while the emitted ones fabricated
-                                // inbound edges. The complete list stays on the
-                                // ledger row's AmbiguousGlobal resolution.
-                                let total = candidates.len();
-                                if total > AMBIGUOUS_FANOUT_CAP {
-                                    unresolved.push(UnresolvedReference {
-                                        source_file: ext.file_path.clone(),
-                                        source_symbol: caller_sym.clone(),
-                                        callee_name: call.callee_name.clone(),
-                                        kind: UnresolvedKind::Call,
-                                        resolution: (**resolution).clone(),
-                                        class: UnresolvedClass::Unresolved,
-                                        receiver: call.receiver_expr.clone(),
-                                    });
-                                    emitted = true;
-                                } else {
-                                    for (target_f, target_sym) in candidates.iter() {
-                                        edges.push(ResolvedEdge::resolved(
-                                            ext.file_path.clone(),
-                                            target_f.clone(),
-                                            caller_sym.clone(),
-                                            self.qualified_for(target_f, target_sym),
-                                            EdgeKind::Calls,
-                                            Arc::clone(resolution),
-                                            None,
-                                        ));
-                                        emitted = true;
-                                    }
-                                }
+                            Resolution::AmbiguousGlobal { .. } => {
+                                // S2. A bare name with several in-repo namesakes
+                                // and no other evidence is **not** a call to any
+                                // of them: measured 0/8 (TS), 1/26 (Swift), 4/12
+                                // (Kotlin) correct, so a fan-out was three wrong
+                                // callers in four standing beside edges that
+                                // were checked. The site keeps one ledger row
+                                // carrying the complete candidate list, classed
+                                // `Unresolved` — it is by definition a bare name
+                                // with namesakes — and liveness reads the
+                                // ambiguity from that row, not from edges.
+                                unresolved.push(UnresolvedReference {
+                                    source_file: ext.file_path.clone(),
+                                    source_symbol: caller_sym.clone(),
+                                    callee_name: call.callee_name.clone(),
+                                    kind: UnresolvedKind::Call,
+                                    resolution: (**resolution).clone(),
+                                    class: UnresolvedClass::Unresolved,
+                                    receiver: call.receiver_expr.clone(),
+                                });
+                                emitted = true;
                             }
                             named => {
                                 if let Some((target_file, target_symbol)) = named.target() {
@@ -4681,27 +4770,39 @@ impl Resolver {
         file: &str,
         family: LangFamily,
         name: &str,
+        caller_in_type: bool,
         limits: ResolutionLimits,
     ) -> Result<Arc<GlobalCandidates>, ResolutionLimitError> {
-        // Unexported Go names have directory visibility. Exported Go names and
-        // other families share the same family/name view across source files.
-        let visibility = if family == LangFamily::Go && !Self::go_name_is_exported(name) {
+        // Visibility is part of the cache key: unexported Go names are visible
+        // from their directory, and a private Swift declaration, a non-exported
+        // TS binding or a non-`pub` Rust item from another crate from nowhere
+        // else. Exported names and the other families share one view.
+        let hits = self
+            .symbol_index
+            .get(name)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let hidden_somewhere = hits.iter().any(|(path, _, _, identity)| {
+            self.unexported_symbols
+                .contains(&(path.clone(), identity.to_string()))
+        });
+        let view = if family == LangFamily::Go && !Self::go_name_is_exported(name) {
             Self::parent_dir(file)
+        } else if hidden_somewhere && Self::visibility_is_enforced(family) {
+            match family {
+                LangFamily::Rust => Self::rust_crate_src_root(file),
+                _ => file.to_string(),
+            }
         } else {
             String::new()
         };
-        let key = (family, name.to_string(), visibility);
+        let key = (family, name.to_string(), format!("{view}|{}", u8::from(caller_in_type)));
         let mut cache = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(known) = cache.sets.get(&key) {
             return Ok(Arc::clone(known));
         }
-        let hits = self
-            .symbol_index
-            .get(name)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
         charge(
             &mut cache.visits,
             hits.len() as u64,
@@ -4716,6 +4817,8 @@ impl Resolver {
                     || Self::go_symbol_visible_from(file, path, name))
                 && (!Self::family_needs_explicit_receiver(family)
                     || self.declared_at_file_level(path, identity))
+                && self.candidate_is_visible_from(family, file, path, identity)
+                && (caller_in_type || *kind != SymbolKind::Method || !Self::method_needs_a_type_scope(family))
             {
                 let bytes =
                     (std::mem::size_of::<(String, String)>() + path.len() + identity.len()) as u64;
@@ -4742,6 +4845,111 @@ impl Resolver {
         });
         cache.sets.insert(key, Arc::clone(&candidates));
         Ok(candidates)
+    }
+
+    /// Families whose declarations carry a visibility the extractor reads into
+    /// `is_exported`, and the bare-name rung must honour (S2): a Swift
+    /// `private`/`fileprivate` declaration is invisible outside its file, a
+    /// non-exported TS/JS module binding outside its module, and a non-`pub`
+    /// Rust item outside its crate.
+    fn visibility_is_enforced(family: LangFamily) -> bool {
+        matches!(family, LangFamily::Swift | LangFamily::JsTs | LangFamily::Rust)
+    }
+
+    /// Whether a JS/TS file is a module, so that an un-exported top-level
+    /// binding is private to it. A classic script shares its top-level names
+    /// with every other script on the page, so for one the absence of `export`
+    /// proves nothing.
+    fn is_js_module(ext: &Extraction) -> bool {
+        // The extractor files one synthetic export for every file, so the
+        // export list says nothing; a real `export` shows as an exported
+        // non-file symbol.
+        matches!(ext.language.as_str(), "typescript" | "tsx")
+            || !ext.imports.is_empty()
+            || ext
+                .symbols
+                .iter()
+                .any(|sym| sym.is_exported && sym.kind != SymbolKind::File)
+    }
+
+    /// Whether `candidate` (declared in `path`) can be named from `file`.
+    fn candidate_is_visible_from(
+        &self,
+        family: LangFamily,
+        file: &str,
+        path: &str,
+        identity: &str,
+    ) -> bool {
+        if path == file
+            || !Self::visibility_is_enforced(family)
+            || !self
+                .unexported_symbols
+                .contains(&(path.to_string(), identity.to_string()))
+        {
+            return true;
+        }
+        family == LangFamily::Rust && Self::rust_crate_src_root(file) == Self::rust_crate_src_root(path)
+    }
+
+    /// Languages whose method is reachable by a bare name only from inside a
+    /// type: a Kotlin or Swift function outside every type has no implicit
+    /// receiver to dispatch on, so a method namesake is not what it calls.
+    fn method_needs_a_type_scope(family: LangFamily) -> bool {
+        matches!(family, LangFamily::Kotlin | LangFamily::Swift)
+    }
+
+    /// Whether the call's enclosing symbol sits (at any depth) inside a type.
+    /// Computed only for the families that ask; it is `false` elsewhere.
+    fn call_is_inside_a_type(&self, file: &str, family: LangFamily, caller: Option<&str>) -> bool {
+        if !Self::method_needs_a_type_scope(family) {
+            return false;
+        }
+        let mut scope = caller.unwrap_or(file).to_string();
+        for _ in 0..1024 {
+            if scope == file {
+                return false;
+            }
+            let is_type = self.symbol_index.get(&scope).is_some_and(|hits| {
+                hits.iter().any(|(path, kind, _, identity)| {
+                    path == file
+                        && identity.as_ref() == scope
+                        && matches!(
+                            kind,
+                            SymbolKind::Class
+                                | SymbolKind::Struct
+                                | SymbolKind::Enum
+                                | SymbolKind::Interface
+                                | SymbolKind::Trait
+                                | SymbolKind::Module
+                        )
+                })
+            });
+            if is_type {
+                return true;
+            }
+            match self.symbol_parents.get(&(file.to_string(), scope.clone())) {
+                Some(parent) => scope = parent.clone(),
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// Evidence about a bare callee name that outranks its spelling matching a
+    /// repository declaration (S2): this file imports the name from a package
+    /// or from a repo-relative path that is not indexed, or it is a builtin or
+    /// a host global of the language. Each such name is classified by
+    /// `classify_unresolved` instead of being bound to a namesake.
+    fn bare_name_has_other_evidence(&self, file: &str, family: LangFamily, name: &str) -> bool {
+        self.external_imports
+            .get(file)
+            .is_some_and(|imports| imports.contains_key(name))
+            || self
+                .unindexed_local_imports
+                .get(file)
+                .is_some_and(|imports| imports.contains_key(name))
+            || crate::builtins::is_builtin(family, name)
+            || crate::builtins::host_global_environment(family, name).is_some()
     }
 
     /// Whether a declaration of `kind` can never be what a bare call in
@@ -5855,9 +6063,11 @@ impl Resolver {
         let hits = self
             .swift_module_symbols
             .get(&(module.clone(), name.to_string()))?;
-        let mut visible = hits
-            .iter()
-            .filter(|(path, _, kind)| path != file && accept(*kind));
+        let mut visible = hits.iter().filter(|(path, symbol, kind)| {
+            path != file
+                && accept(*kind)
+                && self.candidate_is_visible_from(LangFamily::Swift, file, path, symbol)
+        });
         let (target_file, target_symbol, _) = visible.next()?;
         visible
             .next()
@@ -6288,10 +6498,10 @@ impl Resolver {
         // one directory. `import com.foo.*;` and `import foo.bar._` really do
         // depend on all of them, so all of them get an edge.
         //
-        // Not capped, deliberately. `AMBIGUOUS_FANOUT_CAP` bounds an ambiguous
-        // *guess* — N candidates of which at most one is right — where emitting
-        // all N is how a resolver launders uncertainty into volume. These N are
-        // all correct, and the consumer is `unwired_candidates`: truncating the
+        // Not capped, deliberately. An ambiguous bare-name *guess* — N
+        // candidates of which at most one is right — is not emitted as edges at
+        // all, because emitting N is how a resolver launders uncertainty into
+        // volume. These N are all correct, and the consumer is `unwired_candidates`: truncating the
         // list would leave the files past the cut falsely reported as imported
         // by nothing, turning a bound into a false finding. The bound here is
         // the repository's own size, which already bounds everything else.
@@ -6475,6 +6685,29 @@ impl Resolver {
         (!vetoed).then_some(target)
     }
 
+    /// Whether a directory inserted into `sys.path` before `at` holds a file for
+    /// `module` other than the ones ordinary resolution found (`found`).
+    fn sys_path_shadows(&self, ext: &Extraction, at: usize, module: &str, found: &[String]) -> bool {
+        let Some(search) = self.py_search_dirs.get(&ext.file_path) else {
+            return false;
+        };
+        let module = module.trim_matches(|c| c == '\'' || c == '"');
+        if module.is_empty() || module.starts_with('.') {
+            return false;
+        }
+        let relative = module.replace('.', "/");
+        [format!("{relative}.py"), format!("{relative}/__init__.py")]
+            .iter()
+            .any(|candidate| {
+                search
+                    .entries
+                    .iter()
+                    .filter(|(inserted, _)| *inserted < at)
+                    .filter_map(|(_, directory)| Self::normalize_rel(directory, candidate))
+                    .any(|path| self.file_symbols.contains_key(&path) && !found.contains(&path))
+            })
+    }
+
     /// Ordinary import resolution, then — for Python only, and only when that
     /// found nothing — this file's `sys.path` entries.
     fn resolve_import_targets_or_search_dirs(
@@ -6484,8 +6717,19 @@ impl Resolver {
     ) -> Vec<String> {
         let targets =
             self.resolve_import_targets(&ext.file_path, &ext.language, &imp.module_specifier);
-        if !targets.is_empty() || ext.language != "python" {
+        if ext.language != "python" {
             return targets;
+        }
+        if !targets.is_empty() {
+            // A directory this file put on `sys.path` before the import that
+            // holds a *different* file for the module outranks the ordinary
+            // rule at run time, so the ordinary answer may be the wrong
+            // module. Abstain rather than bind it confidently.
+            return if self.sys_path_shadows(ext, imp.span.start_byte, &imp.module_specifier, &targets) {
+                Vec::new()
+            } else {
+                targets
+            };
         }
         self.resolve_via_search_dirs(ext, imp.span.start_byte, &imp.module_specifier)
             .into_iter()
@@ -9135,25 +9379,31 @@ mod reference_resolution_tests {
         assert_eq!(unique_edges.len(), 1);
         assert_eq!(unique_edges[0].confidence, Confidence::HIGH);
 
-        // Several candidates must all stay speculative — never HIGH.
+        // Several candidates are not a call to any of them: no edge, and the
+        // site's ledger row carries the complete list (S2).
         let ambiguous = resolve(&[
             ("u.py", "def use():\n    return shared()\n"),
             ("x.py", "def shared():\n    pass\n"),
             ("y.py", "def shared():\n    pass\n"),
         ]);
-        let ambiguous_edges: Vec<_> = ambiguous
-            .edges
+        assert!(
+            ambiguous
+                .edges
+                .iter()
+                .all(|edge| edge.edge_kind != EdgeKind::Calls),
+            "an ambiguous bare name binds no caller: {:?}",
+            edges_of(&ambiguous, &[EdgeKind::Calls])
+        );
+        let row = ambiguous
+            .unresolved
             .iter()
-            .filter(|edge| edge.edge_kind == EdgeKind::Calls)
-            .collect();
-        assert_eq!(ambiguous_edges.len(), 2, "both candidates are recorded");
-        for edge in &ambiguous_edges {
-            assert_eq!(
-                edge.confidence,
-                Confidence::SPECULATIVE,
-                "a multi-candidate guess must never carry HIGH confidence (G5)"
-            );
-        }
+            .find(|row| row.callee_name == "shared")
+            .expect("the ambiguous site is recorded in the ledger");
+        assert!(matches!(
+            &row.resolution,
+            Resolution::AmbiguousGlobal { candidates, .. } if candidates.len() == 2
+        ));
+        assert_eq!(row.class, UnresolvedClass::Unresolved);
     }
 
     /// A route binds to its handler only when the handler is unambiguous and
@@ -9294,7 +9544,7 @@ mod reference_resolution_tests {
         let cors = express
             .unresolved
             .iter()
-            .find(|row| row.callee_name == "cors")
+            .find(|row| row.callee_name == "cors" && row.kind == UnresolvedKind::Route)
             .expect("the package middleware is recorded, not dropped");
         assert_eq!(cors.kind, UnresolvedKind::Route);
         assert!(

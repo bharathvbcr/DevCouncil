@@ -194,20 +194,14 @@ fn a_super_chain_deeper_than_the_tree_terminates_at_the_root() {
         .all(|edge| edge.edge_kind != EdgeKind::Imports));
 }
 
-/// Ambiguity fan-out is quadratic in candidates, and the sort must not make it
-/// worse.
+/// An ambiguous site carries its whole candidate list, and neither emission nor
+/// the final sorts may serialise it per comparison.
 ///
-/// `resolve_subset` emits one edge per (call site x candidate), which PLAN.md
-/// §3.1/SC4 records as a deliberate decision — capping it manufactures false
-/// dead code. But the final `edges.sort_by` breaks ties with
-/// `format!("{:?}", left.resolution)`, and a `Resolution::AmbiguousGlobal`
-/// carries its **whole candidate list**. Two edges from the same caller to the
-/// same target with the same kind and confidence tie on all six earlier keys,
-/// so that `Debug` format runs — serialising every candidate, twice, per
-/// comparison.
-///
-/// That is the shape this pins: the fan-out itself is accepted, the
-/// *serialisation of the fan-out inside a comparator* is not. The assertion is
+/// Since S2 an ambiguous bare name emits one ledger row per site and no edges.
+/// The earlier hazard was the edge sort's tie-break, `format!("{:?}",
+/// left.resolution)`, which serialised every candidate, twice, per comparison
+/// of fanned-out edges. This pins that the cost of many repeated ambiguous
+/// sites still scales with the candidate count and not with its square. The assertion is
 /// on scaling rather than on absolute time, so it says something on any
 /// machine: doubling the candidate count must not multiply the cost by far
 /// more than two.
@@ -244,16 +238,22 @@ fn sorting_ambiguous_edges_does_not_serialize_the_candidate_list_per_comparison(
         let result = resolve(&extractions);
         let elapsed = started.elapsed();
         assert!(
-            result.edges.iter().any(|edge| matches!(
+            result.unresolved.iter().any(|row| matches!(
+                row.resolution,
+                Resolution::AmbiguousGlobal { .. }
+            )),
+            "fixture is inert: no ambiguous ledger rows were produced"
+        );
+        assert!(
+            result.edges.iter().all(|edge| !matches!(
                 edge.resolution.as_deref(),
                 Some(Resolution::AmbiguousGlobal { .. })
             )),
-            "fixture is inert: no ambiguous edges were produced"
+            "an ambiguous site must not emit edges"
         );
         elapsed
     }
 
-    // In-ceiling sizes only: above AMBIGUOUS_FANOUT_CAP sites emit no edges.
     build(4); // warm the code paths and the allocator
     let (ratio, small, large) = (0..3)
         .map(|_| {
@@ -433,13 +433,12 @@ fn hostile_input_resolves_identically_across_runs() {
     assert!(!first.is_empty(), "fixture is inert: no edges produced");
 }
 
-/// An ambiguous call above the emission ceiling keeps every candidate on the
-/// ledger and emits no edges. Every candidate still names a real indexed file.
+/// An ambiguous call keeps every candidate on its ledger row and emits no
+/// edges. Every candidate still names a real indexed file.
 ///
-/// SC4 records the decision not to *collapse* the fan-out — not to pick a
-/// winner and hide the ambiguity. Above [`AMBIGUOUS_FANOUT_CAP`] that means
-/// one ledger row with the complete candidate list, not a capped sample of
-/// edges that would still fabricate inbound callers.
+/// SC4 records the decision not to *collapse* the ambiguity — not to pick a
+/// winner and hide it. Since S2 that means one ledger row with the complete
+/// candidate list at any width, never edges that would fabricate callers.
 #[test]
 fn every_ambiguous_candidate_names_an_indexed_file() {
     let mut extractions = Vec::new();
@@ -501,7 +500,7 @@ fn every_ambiguous_candidate_names_an_indexed_file() {
         );
     }
 
-    // Positive control: inside the ceiling, every candidate is still an edge.
+    // A narrow site is the same: no edges, the full list on the ledger.
     let mut small = Vec::new();
     for i in 0..2 {
         let path = format!("s{i}.py");
@@ -521,15 +520,20 @@ fn every_ambiguous_candidate_names_an_indexed_file() {
         vec![call("c.py::go", "few")],
     ));
     let inside = resolve(&small);
-    let edges: Vec<_> = inside
-        .edges
+    assert!(
+        inside.edges.iter().all(|e| !matches!(
+            e.resolution.as_deref(),
+            Some(Resolution::AmbiguousGlobal { .. })
+        )),
+        "a narrow ambiguous site emits no edges either"
+    );
+    let row = inside
+        .unresolved
         .iter()
-        .filter(|e| {
-            matches!(
-                e.resolution.as_deref(),
-                Some(Resolution::AmbiguousGlobal { .. })
-            )
-        })
-        .collect();
-    assert_eq!(edges.len(), 2, "in-ceiling AmbiguousGlobal still emits");
+        .find(|u| u.callee_name == "few")
+        .expect("the narrow site is in the ledger");
+    assert!(matches!(
+        &row.resolution,
+        Resolution::AmbiguousGlobal { candidates, .. } if candidates.len() == 2
+    ));
 }

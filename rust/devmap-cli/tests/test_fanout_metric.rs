@@ -2,17 +2,21 @@
 //! correctly, and the only way to know that is a corpus whose fan-out can be
 //! counted by hand.
 //!
-//! `tools/fanout.sql` reconstructs the resolver's ambiguous call sites from the
-//! persisted store: `Confidence::SPECULATIVE` (0.2) has one producer — the
-//! `Resolution::AmbiguousGlobal` rung — which emits one `Calls` edge per
-//! candidate, so the edges of one call site share (source file, caller symbol,
-//! callee name). Nothing in the schema records the callee name, so the SQL
+//! `tools/fanout.sql` reconstructs ambiguous call sites from the persisted
+//! store: `Confidence::SPECULATIVE` (0.2) has one producer that emits edges — a
+//! language server's `LanguageServerDispatch` set — which emits one `Calls`
+//! edge per candidate, so the edges of one call site share (source file,
+//! caller symbol, callee name). Since S2 the resolver's own ambiguous bare names
+//! are ledger rows and emit no edge, so these fixtures turn them into dispatch
+//! sets with `common::add_dispatch_edges` before measuring. Nothing in the schema records the callee name, so the SQL
 //! recovers it, and a grouping key that is merely plausible would silently
 //! produce a number no gate could trust. This pins it against arithmetic done
 //! on paper.
 //!
 //! The test reads the very file `verify.sh` and `tools/memory_model_probe.sh`
 //! read. A copied query would prove only that the copy is self-consistent.
+
+mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -45,7 +49,8 @@ fn write(root: &Path, rel: &str, body: &str) {
 
 /// A corpus whose ambiguity is fixed by construction: N same-named `pub fn`
 /// declarations in N files, called by name from a file that declares none of
-/// them, so the resolution ladder can only reach the `AmbiguousGlobal` rung.
+/// them, so the resolution ladder can only reach the `AmbiguousGlobal` rung
+/// (a ledger row, which the dispatch step turns into the edges measured).
 fn write_fixture(root: &Path) {
     write(
         root,
@@ -153,6 +158,18 @@ fn the_fanout_metric_matches_a_hand_counted_corpus() {
         "build failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    common::add_dispatch_edges(
+        &root,
+        &db,
+        &[
+            "defs/d0.rs",
+            "defs/d1.rs",
+            "defs/d2.rs",
+            "defs/d3.rs",
+            "callers/c0.rs",
+            "callers/c1.rs",
+        ],
+    );
 
     // The shell half runs where its consumers do: `verify.sh` and
     // `memory_model_probe.sh` are unix shell gates. On a Windows runner a bare
@@ -194,7 +211,7 @@ fn the_fanout_metric_matches_a_hand_counted_corpus() {
 
     let f = fanout(&db);
 
-    // Fixture precondition. If the resolver ever stopped producing the
+    // Fixture precondition. If the fixture ever stopped producing the
     // ambiguous fan-out at all, every assertion below would pass vacuously on
     // zeroes, and the gate built on this number would be measuring nothing.
     assert!(
@@ -229,10 +246,9 @@ fn the_fanout_metric_matches_a_hand_counted_corpus() {
     // weigh 3 candidates each and the two `beta` sites weigh 2:
     //   candidates   = 3*3 + 2*2 = 13
     //   candidate_n2 = 3*9 + 2*4 = 35
-    // On this fixture every width is under `AMBIGUOUS_FANOUT_CAP`, so
-    // candidates and edges coincide — which is exactly why the cap makes them
-    // different quantities on a real corpus and why nothing here can be checked
-    // against `edges` and called a check of the candidate column.
+    // On this fixture a dispatch set names every candidate, so candidates and
+    // edges coincide; nothing here can be checked against `edges` and called a
+    // check of the candidate column.
     assert_eq!(f.candidates, 13, "candidates weighed across all sites");
     assert_eq!(f.candidate_n2, 35, "sum of candidates^2 across all sites");
     assert_eq!(f.max_candidates, 3, "widest candidate list");
@@ -292,8 +308,8 @@ fn the_fanout_metric_matches_a_hand_counted_corpus() {
 /// The metric is a *lower bound* on the resolver's own Sum(N^2), and that is a
 /// deliberate, documented property rather than an accident.
 ///
-/// `four` calls `alpha` twice. The resolver emits 3 edges per occurrence, then
-/// sorts and dedups, so the store keeps 3 — not 6. Anyone reading `sum_n2` as
+/// `four` calls `alpha` twice. Each occurrence would add its own edges, and the
+/// edge dedup collapses them, so the store keeps 3 — not 6. Anyone reading `sum_n2` as
 /// the resolver-side quantity would be over-crediting the denominator of a
 /// bytes-per-pair gate, which is the direction that hides a regression. This
 /// pins the collapse so the SQL's header comment cannot quietly become false.
@@ -330,6 +346,11 @@ fn repeated_calls_to_one_ambiguous_name_collapse_into_a_single_site() {
         .output()
         .expect("devmap build");
     assert!(out.status.success());
+    common::add_dispatch_edges(
+        &root,
+        &db,
+        &["defs/d0.rs", "defs/d1.rs", "callers/c0.rs", "callers/c1.rs"],
+    );
 
     let f = fanout(&db);
     assert_eq!(f.sites, 2, "one site per (caller, callee), not per call");
@@ -347,19 +368,15 @@ fn repeated_calls_to_one_ambiguous_name_collapse_into_a_single_site() {
     std::fs::remove_dir_all(&root).unwrap();
 }
 
-/// The case the whole candidate column exists for: above the emission ceiling.
-///
-/// Above [`AMBIGUOUS_FANOUT_CAP`] a bare AmbiguousGlobal site emits **no**
-/// edges and keeps the complete candidate list on the ledger. The store's
-/// `candidate_total` must still reflect that list (or the site must be absent
-/// from edge_rows entirely) — a column that only echoed emitted edges would
-/// report zero candidates for the heaviest sites.
+/// An ambiguous bare name emits no edge at any width: the site is a ledger row
+/// carrying the full candidate list, so the edge-derived fan-out metric stays at
+/// zero however many namesakes there are (S2). A width past the old 16-edge
+/// ceiling is the case that used to differ from narrow ones.
 #[test]
-fn above_the_cap_candidates_and_emitted_edges_are_different_numbers() {
-    let cap = ambiguous_fanout_cap();
-    let width = cap + 24;
+fn an_ambiguous_bare_name_adds_no_fanout_at_any_width() {
+    let width = 40usize;
 
-    let root = std::env::temp_dir().join(format!("devmap-fanout-cap-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("devmap-fanout-wide-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     for index in 0..width {
@@ -389,38 +406,26 @@ fn above_the_cap_candidates_and_emitted_edges_are_different_numbers() {
 
     let f = fanout(&db);
     assert_eq!(
-        f.edges, 0,
-        "above the ceiling AmbiguousGlobal emits zero edges (got {}); the ledger \
-         carries candidates instead of a capped sample",
-        f.edges
+        (f.edges, f.sites),
+        (0, 0),
+        "an ambiguous bare name must emit no fan-out edge, got {} edges over {} sites",
+        f.edges,
+        f.sites
     );
-    // Site may be absent from edge_rows entirely (ledger-only). If the store
-    // still records the site for metrics, candidates must be the full width.
-    if f.sites > 0 {
-        assert_eq!(f.candidates, width as i64);
-        assert_eq!(f.max_candidates, width as i64);
-    }
-    let _ = cap;
+
+    // The site is not lost: it is one ledger row naming the call.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let ledger: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM unresolved_rows u
+               JOIN unresolved_texts r ON r.id = u.reason_id
+              WHERE r.text LIKE 'AmbiguousGlobal%' AND u.valid_to IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(ledger, 1, "the ambiguous site is recorded on the ledger");
+    drop(conn);
 
     std::fs::remove_dir_all(&root).unwrap();
-}
-
-/// Read the cap from its owner rather than repeating it, the same way
-/// `tools/memory_model_probe.sh` does — a test that hard-coded 16 would start
-/// asserting the shape of a resolver that no longer exists.
-fn ambiguous_fanout_cap() -> usize {
-    let source = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../devmap-resolve/src/model.rs"),
-    )
-    .expect("devmap-resolve/src/model.rs is readable");
-    let marker = "AMBIGUOUS_FANOUT_CAP: usize = ";
-    let tail = source
-        .split_once(marker)
-        .expect("AMBIGUOUS_FANOUT_CAP is declared in devmap-resolve/src/model.rs")
-        .1;
-    tail.chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>()
-        .parse()
-        .expect("AMBIGUOUS_FANOUT_CAP is a number")
 }

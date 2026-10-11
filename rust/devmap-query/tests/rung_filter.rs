@@ -18,10 +18,15 @@
 //!   that gets a live symbol deleted.
 //!
 //! The fixture is built so the population is genuinely mixed: a same-file call
-//! resolves deterministically, and a call to a name defined in two files
-//! resolves ambiguously to both. If the resolver's confidences ever change, the
+//! resolves deterministically, and a call to a name defined in two files is a
+//! language server's dispatch set over both (the resolver itself records an
+//! ambiguous bare name on the ledger and emits no edge for it, so the
+//! speculative rung is populated here from the one producer that still has
+//! one). If the resolver's confidences ever change, the
 //! first test below fails with the measured distribution rather than letting
 //! the rest pass vacuously over a single-rung population.
+
+mod common;
 
 use devmap_extract::extract_file;
 use devmap_query::rung::{Rung, RungHistogram};
@@ -32,8 +37,8 @@ use devmap_store::{GenerationWriteOpts, Store};
 
 /// `main` calls `helper` in its own file — one answer, `DETERMINISTIC`.
 /// `helper` calls `shared`, which two files define and no import binds — the
-/// resolver cannot choose, so it records both at a low rung rather than picking
-/// one. That is the mix the histogram has to describe.
+/// resolver cannot choose, so a dispatch set records both at a low rung rather
+/// than picking one. That is the mix the histogram has to describe.
 fn corpus() -> Store {
     let extractions = vec![
         extract_file("lib_a.py", "def shared():\n    return 1\n"),
@@ -61,7 +66,8 @@ fn corpus() -> Store {
     ];
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions).unwrap();
+    let mut resolution = resolver.resolve_all(&extractions).unwrap();
+    common::dispatch_ambiguous_sites(&mut resolution);
     let analysis = devmap_analyze::analyze(&extractions, &resolution);
     let store = Store::open_in_memory().expect("in-memory store");
     store

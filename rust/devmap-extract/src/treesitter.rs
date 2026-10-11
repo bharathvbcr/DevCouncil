@@ -8544,6 +8544,8 @@ pub(crate) fn is_callable_node(node: Node) -> bool {
             // of the *enclosing* function, so a later `marker("x")` in that
             // function was RA1-killed even though the binding is not in scope.
             | "closure_expression"
+            // Swift and Kotlin closures: their own scope for the same reason.
+            | "lambda_literal"
     )
 }
 
@@ -8717,6 +8719,7 @@ fn collect_non_symbol_locals(scope: Node, source: &str) -> HashSet<String> {
         if matches!(
             node.kind(),
             "identifier"
+                | "simple_identifier"
                 | "shorthand_property_identifier"
                 | "shorthand_property_identifier_pattern"
         ) && is_defining_name(node)
@@ -9357,6 +9360,106 @@ const PARAMETER_LIST_KINDS: [&str; 5] = [
     "parameter_list",
 ];
 
+/// Swift and Kotlin spell a parameter with `simple_identifier` (Swift) or a
+/// bare `identifier` inside `parameter` / `variable_declaration` (Kotlin), and
+/// neither sits under one of [`PARAMETER_LIST_KINDS`], so the generic walk found
+/// no parameter in either language. A parameter is a binding the bare-name rung
+/// must never bind to a project namesake: Swift's `completion`, Kotlin's
+/// `onStart`. Returns whether `callable` is one of their callables.
+///
+/// Covers Swift `func` and `init` parameters (the internal name, not the
+/// argument label) and closure parameters, and Kotlin `fun` parameters and
+/// lambda parameters. A lambda with no declared parameter binds the implicit
+/// `it` (Kotlin) or `$0`.. (Swift) instead.
+fn collect_swift_kotlin_parameter_names(
+    callable: Node,
+    source: &str,
+    out: &mut BTreeSet<String>,
+) -> bool {
+    let mut insert = |node: Node| {
+        let name = get_node_text(node, source);
+        if is_user_ident(&name) {
+            out.insert(name);
+        }
+    };
+    let mut cursor = callable.walk();
+    match callable.kind() {
+        // Swift `func` / `init`: `parameter` children hang off the declaration;
+        // the type is also a `name` field, so the kind picks the binding.
+        "function_declaration" | "init_declaration" if callable.child_by_field_name("body").is_some_and(|b| b.kind() == "function_body") => {
+            for parameter in callable.children(&mut cursor).filter(|c| c.kind() == "parameter") {
+                let mut inner = parameter.walk();
+                let name = parameter
+                    .children_by_field_name("name", &mut inner)
+                    .find(|n| n.kind() == "simple_identifier");
+                if let Some(name) = name {
+                    insert(name);
+                }
+            }
+            true
+        }
+        "lambda_literal" => {
+            let mut declared = false;
+            let mut stack = vec![callable];
+            while let Some(node) = stack.pop() {
+                let mut inner = node.walk();
+                for child in node.children(&mut inner) {
+                    match child.kind() {
+                        // Swift: `{ (a: Int, b) in … }` / `{ s in … }`.
+                        "lambda_parameter" => {
+                            let mut c = child.walk();
+                            let name = child
+                                .children_by_field_name("name", &mut c)
+                                .find(|n| n.kind() == "simple_identifier");
+                            if let Some(name) = name {
+                                insert(name);
+                                declared = true;
+                            }
+                        }
+                        // Kotlin: `{ a: Int, b -> … }`.
+                        "variable_declaration" if node.kind() == "lambda_parameters" => {
+                            if let Some(name) = child.named_child(0) {
+                                insert(name);
+                                declared = true;
+                            }
+                        }
+                        "lambda_function_type" | "lambda_function_type_parameters" | "lambda_parameters" => {
+                            stack.push(child);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if !declared {
+                for implicit in ["it", "$0", "$1", "$2"] {
+                    out.insert(implicit.to_string());
+                }
+            }
+            true
+        }
+        // Kotlin `fun`: `function_value_parameters > parameter > identifier`.
+        "function_declaration" => {
+            let Some(list) = callable
+                .children(&mut cursor)
+                .find(|c| c.kind() == "function_value_parameters")
+            else {
+                return false;
+            };
+            let mut inner = list.walk();
+            for parameter in list.children(&mut inner).filter(|c| c.kind() == "parameter") {
+                if let Some(name) = parameter
+                    .named_child(0)
+                    .filter(|n| n.kind() == "identifier")
+                {
+                    insert(name);
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Names a callable's own signature binds.
 ///
 /// Deliberately **not** folded into `collect_non_symbol_locals`, which answers a
@@ -9372,6 +9475,9 @@ const PARAMETER_LIST_KINDS: [&str; 5] = [
 /// `type` and `value` fields are not descended into: `def f(x: Widget)` binds
 /// `x` and refers to `Widget`.
 fn collect_parameter_names(callable: Node, source: &str, out: &mut BTreeSet<String>) {
+    if collect_swift_kotlin_parameter_names(callable, source, out) {
+        return;
+    }
     let mut params_cursor = callable.walk();
     let Some(params) = callable
         .children(&mut params_cursor)

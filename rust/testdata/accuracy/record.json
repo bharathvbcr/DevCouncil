@@ -8,7 +8,7 @@
         "found": 2,
         "truly_dead": 2
       },
-      "devmap_commit": "40b6bbbf8319d8bcab0f6d93abfc664206dfea7b",
+      "devmap_commit": "e94e9cc23b0116b7cf8269e4c01c22ade8f932b2",
       "expected_edge_rows": 51,
       "forbid_rows": 4,
       "high_edges_correct": 30,
@@ -29,19 +29,19 @@
         "found": 1,
         "truly_dead": 1
       },
-      "devmap_commit": "40b6bbbf8319d8bcab0f6d93abfc664206dfea7b",
+      "devmap_commit": "e94e9cc23b0116b7cf8269e4c01c22ade8f932b2",
       "expected_edge_rows": 55,
       "forbid_rows": 4,
-      "high_edges_correct": 29,
-      "high_edges_false": 4,
+      "high_edges_correct": 26,
+      "high_edges_false": 2,
       "honest_miss": {
-        "absent": 25,
-        "rate": 0.6,
-        "recorded": 15
+        "absent": 28,
+        "rate": 0.679,
+        "recorded": 19
       },
-      "precision_at_0.9": 0.879,
-      "present": 29,
-      "recall": 0.527
+      "precision_at_0.9": 0.929,
+      "present": 26,
+      "recall": 0.473
     },
     "python": {
       "dead": {
@@ -50,19 +50,19 @@
         "found": 23,
         "truly_dead": 23
       },
-      "devmap_commit": "40b6bbbf8319d8bcab0f6d93abfc664206dfea7b",
+      "devmap_commit": "e94e9cc23b0116b7cf8269e4c01c22ade8f932b2",
       "expected_edge_rows": 49,
       "forbid_rows": 11,
-      "high_edges_correct": 20,
+      "high_edges_correct": 16,
       "high_edges_false": 0,
       "honest_miss": {
-        "absent": 19,
-        "rate": 0.632,
-        "recorded": 12
+        "absent": 30,
+        "rate": 0.9,
+        "recorded": 27
       },
       "precision_at_0.9": 1.0,
-      "present": 30,
-      "recall": 0.612
+      "present": 19,
+      "recall": 0.388
     },
     "rust": {
       "dead": {
@@ -71,7 +71,7 @@
         "found": 1,
         "truly_dead": 1
       },
-      "devmap_commit": "40b6bbbf8319d8bcab0f6d93abfc664206dfea7b",
+      "devmap_commit": "e94e9cc23b0116b7cf8269e4c01c22ade8f932b2",
       "expected_edge_rows": 105,
       "forbid_rows": 5,
       "high_edges_correct": 66,
@@ -92,17 +92,17 @@
         "found": 1,
         "truly_dead": 1
       },
-      "devmap_commit": "40b6bbbf8319d8bcab0f6d93abfc664206dfea7b",
+      "devmap_commit": "e94e9cc23b0116b7cf8269e4c01c22ade8f932b2",
       "expected_edge_rows": 79,
       "forbid_rows": 3,
       "high_edges_correct": 58,
-      "high_edges_false": 4,
+      "high_edges_false": 2,
       "honest_miss": {
-        "absent": 18,
-        "rate": 0.889,
-        "recorded": 16
+        "absent": 20,
+        "rate": 0.9,
+        "recorded": 18
       },
-      "precision_at_0.9": 0.935,
+      "precision_at_0.9": 0.967,
       "present": 58,
       "recall": 0.734
     },
@@ -113,49 +113,48 @@
         "found": 4,
         "truly_dead": 4
       },
-      "devmap_commit": "40b6bbbf8319d8bcab0f6d93abfc664206dfea7b",
+      "devmap_commit": "e94e9cc23b0116b7cf8269e4c01c22ade8f932b2",
       "expected_edge_rows": 70,
       "forbid_rows": 1,
-      "high_edges_correct": 56,
-      "high_edges_false": 1,
+      "high_edges_correct": 52,
+      "high_edges_false": 0,
       "honest_miss": {
-        "absent": 11,
-        "rate": 0.364,
-        "recorded": 4
+        "absent": 15,
+        "rate": 0.533,
+        "recorded": 8
       },
-      "precision_at_0.9": 0.982,
-      "present": 59,
-      "recall": 0.843
+      "precision_at_0.9": 1.0,
+      "present": 55,
+      "recall": 0.786
     }
   },
   "measurements": [
     {
-      "analysis_status": "Partial { reason: \"call extraction did not cover the whole corpus: 9 file(s) failed to parse, 24 recovered by pattern (no calls extracted), 0 refused by discovery and never read at all — dead-code and unwired findings are a lower bound and are capped below the confident tier; 92 file(s) in a language with no call extractor at all (permanent for this build, not a transient failure); 15 file(s) parsed with ERROR/MISSING regions, so declarations and calls inside those regions are absent\" }",
+      "analysis_status": "Partial { reason: \"call extraction did not cover the whole corpus: 8 file(s) failed to parse, 24 recovered by pattern (no calls extracted), 0 refused by discovery and never read at all — dead-code and unwired findings are a lower bound and are capped below the confident tier; 92 file(s) in a language with no call extractor at all (permanent for this build, not a transient failure); 15 file(s) parsed with ERROR/MISSING regions, so declarations and calls inside those regions are absent\" }",
       "corpus_commit": "7e2fd53419e7a3299b6373fa487fe369212794c7",
       "date": "2026-10-10",
-      "dead_rows_exempt": 14014,
-      "dead_rows_total": 14588,
-      "devmap_commit": "40b6bbbf8319d8bcab0f6d93abfc664206dfea7b",
+      "dead_rows_exempt": 14175,
+      "dead_rows_total": 14783,
+      "devmap_commit": "e94e9cc23b0116b7cf8269e4c01c22ade8f932b2",
       "languages": {
         "go": {
-          "ambiguous_global_edges": 13,
+          "ambiguous_global_edges": 0,
           "dead_rows_by_tier": {
             "0.4": 222
           },
           "high_confidence_edges": 82991,
           "net_resolution_permille": 691,
-          "unattributed_rows": 37970,
+          "unattributed_rows": 37976,
           "unresolved_rows_by_class": {
             "builtin": 108221,
             "external": 132404,
             "local_binding": 3163,
             "no_namesake": 69964,
             "uninferred_receiver": 33813,
-            "unresolved": 994
+            "unresolved": 1000
           },
-          "use_edges": 83004,
+          "use_edges": 82991,
           "use_edges_by_resolution": {
-            "AmbiguousGlobal": 13,
             "ImportScoped": 9907,
             "ReceiverType": 7909,
             "SameFile": 24942,
@@ -164,102 +163,100 @@
           }
         },
         "typescript": {
-          "ambiguous_global_edges": 832,
+          "ambiguous_global_edges": 0,
           "dead_rows_by_tier": {
-            "0.4": 319
+            "0.4": 318
           },
-          "high_confidence_edges": 23160,
-          "net_resolution_permille": 576,
-          "unattributed_rows": 21195,
+          "high_confidence_edges": 23002,
+          "net_resolution_permille": 575,
+          "unattributed_rows": 21321,
           "unresolved_rows_by_class": {
             "builtin": 7684,
-            "external": 74407,
+            "external": 76261,
             "host_global": 9882,
             "local_binding": 1989,
             "no_namesake": 59145,
             "uninferred_receiver": 16611,
-            "unresolved": 2595
+            "unresolved": 2721
           },
-          "use_edges": 23992,
+          "use_edges": 23002,
           "use_edges_by_resolution": {
-            "AmbiguousGlobal": 832,
             "ImportScoped": 10946,
             "ReceiverType": 628,
             "SameFile": 11214,
-            "UniqueGlobal": 372
+            "UniqueGlobal": 214
           }
         }
       },
       "name": "scholarlm"
     },
     {
-      "analysis_status": "Partial { reason: \"call extraction did not cover the whole corpus: 2 file(s) failed to parse, 1 recovered by pattern (no calls extracted), 0 refused by discovery and never read at all — dead-code and unwired findings are a lower bound and are capped below the confident tier; 1 file(s) parsed with ERROR/MISSING regions, so declarations and calls inside those regions are absent\" }",
+      "analysis_status": "Partial { reason: \"call extraction did not cover the whole corpus: 0 file(s) failed to parse, 1 recovered by pattern (no calls extracted), 0 refused by discovery and never read at all — dead-code and unwired findings are a lower bound and are capped below the confident tier; 1 file(s) parsed with ERROR/MISSING regions, so declarations and calls inside those regions are absent\" }",
       "corpus_commit": "f7cb935ac12e273bb83699ee5ca96b7d7b4abfcd",
       "date": "2026-10-10",
-      "dead_rows_exempt": 5442,
-      "dead_rows_total": 5484,
-      "devmap_commit": "40b6bbbf8319d8bcab0f6d93abfc664206dfea7b",
+      "dead_rows_exempt": 5568,
+      "dead_rows_total": 5623,
+      "devmap_commit": "e94e9cc23b0116b7cf8269e4c01c22ade8f932b2",
       "languages": {
         "python": {
-          "ambiguous_global_edges": 395,
+          "ambiguous_global_edges": 0,
           "dead_rows_by_tier": {
-            "0.4": 9
+            "0.4": 9,
+            "0.9": 1
           },
-          "high_confidence_edges": 22716,
-          "net_resolution_permille": 685,
-          "unattributed_rows": 11021,
+          "high_confidence_edges": 22705,
+          "net_resolution_permille": 623,
+          "unattributed_rows": 14453,
           "unresolved_rows_by_class": {
-            "builtin": 32847,
-            "external": 18416,
-            "local_binding": 271,
-            "no_namesake": 22709,
-            "uninferred_receiver": 10147,
-            "unresolved": 603
+            "builtin": 36373,
+            "external": 19378,
+            "local_binding": 280,
+            "no_namesake": 23828,
+            "uninferred_receiver": 10823,
+            "unresolved": 3350
           },
-          "use_edges": 23111,
+          "use_edges": 22705,
           "use_edges_by_resolution": {
-            "AmbiguousGlobal": 395,
-            "ImportScoped": 5816,
-            "ReceiverType": 1395,
-            "SameFile": 12941,
-            "UniqueGlobal": 2564
+            "ImportScoped": 7039,
+            "ReceiverType": 1525,
+            "SameFile": 13655,
+            "UniqueGlobal": 486
           }
         }
       },
       "name": "Lappi-decision"
     },
     {
-      "analysis_status": "Partial { reason: \"call extraction did not cover the whole corpus: 1 file(s) failed to parse, 41 recovered by pattern (no calls extracted), 0 refused by discovery and never read at all — dead-code and unwired findings are a lower bound and are capped below the confident tier; 12 file(s) parsed with ERROR/MISSING regions, so declarations and calls inside those regions are absent\" }",
+      "analysis_status": "Partial { reason: \"call extraction did not cover the whole corpus: 0 file(s) failed to parse, 41 recovered by pattern (no calls extracted), 0 refused by discovery and never read at all — dead-code and unwired findings are a lower bound and are capped below the confident tier; 12 file(s) parsed with ERROR/MISSING regions, so declarations and calls inside those regions are absent\" }",
       "corpus_commit": "f185418549016d613eb0a681389acf5e52263a92",
       "date": "2026-10-10",
-      "dead_rows_exempt": 11989,
-      "dead_rows_total": 12265,
-      "devmap_commit": "40b6bbbf8319d8bcab0f6d93abfc664206dfea7b",
+      "dead_rows_exempt": 12052,
+      "dead_rows_total": 12329,
+      "devmap_commit": "e94e9cc23b0116b7cf8269e4c01c22ade8f932b2",
       "languages": {
         "rust": {
-          "ambiguous_global_edges": 425,
+          "ambiguous_global_edges": 0,
           "dead_rows_by_tier": {
             "0.4": 72
           },
-          "high_confidence_edges": 53873,
-          "net_resolution_permille": 368,
-          "unattributed_rows": 98427,
+          "high_confidence_edges": 54844,
+          "net_resolution_permille": 367,
+          "unattributed_rows": 100476,
           "unresolved_rows_by_class": {
-            "builtin": 38931,
-            "external": 47924,
-            "local_binding": 8328,
-            "module_path": 5043,
-            "no_namesake": 68296,
-            "uninferred_receiver": 84866,
-            "unresolved": 5233
+            "builtin": 39579,
+            "external": 48822,
+            "local_binding": 8470,
+            "module_path": 5049,
+            "no_namesake": 69373,
+            "uninferred_receiver": 86526,
+            "unresolved": 5480
           },
-          "use_edges": 54298,
+          "use_edges": 54844,
           "use_edges_by_resolution": {
-            "AmbiguousGlobal": 425,
-            "ImportScoped": 14355,
-            "ReceiverType": 8065,
-            "SameFile": 29067,
-            "UniqueGlobal": 2386
+            "ImportScoped": 14781,
+            "ReceiverType": 8074,
+            "SameFile": 29684,
+            "UniqueGlobal": 2305
           }
         }
       },
@@ -269,32 +266,33 @@
       "analysis_status": "Partial { reason: \"call extraction did not cover the whole corpus: 0 file(s) failed to parse, 2 recovered by pattern (no calls extracted), 0 refused by discovery and never read at all — dead-code and unwired findings are a lower bound and are capped below the confident tier; 1 file(s) parsed with ERROR/MISSING regions, so declarations and calls inside those regions are absent\" }",
       "corpus_commit": "782a53424f646b49d4660a0c06981d55bbccfcac",
       "date": "2026-10-10",
-      "dead_rows_exempt": 5443,
-      "dead_rows_total": 5443,
-      "devmap_commit": "40b6bbbf8319d8bcab0f6d93abfc664206dfea7b",
+      "dead_rows_exempt": 5779,
+      "dead_rows_total": 5781,
+      "devmap_commit": "e94e9cc23b0116b7cf8269e4c01c22ade8f932b2",
       "languages": {
         "swift": {
-          "ambiguous_global_edges": 1278,
-          "dead_rows_by_tier": {},
-          "high_confidence_edges": 27900,
-          "net_resolution_permille": 579,
-          "unattributed_rows": 20774,
-          "unresolved_rows_by_class": {
-            "builtin": 16230,
-            "external": 18635,
-            "local_binding": 170,
-            "no_namesake": 35635,
-            "uninferred_receiver": 20292,
-            "unresolved": 312
+          "ambiguous_global_edges": 0,
+          "dead_rows_by_tier": {
+            "0.4": 2
           },
-          "use_edges": 29178,
+          "high_confidence_edges": 26046,
+          "net_resolution_permille": 554,
+          "unattributed_rows": 21292,
+          "unresolved_rows_by_class": {
+            "builtin": 15842,
+            "external": 18044,
+            "local_binding": 604,
+            "no_namesake": 34663,
+            "uninferred_receiver": 20175,
+            "unresolved": 513
+          },
+          "use_edges": 26046,
           "use_edges_by_resolution": {
-            "AmbiguousGlobal": 1278,
-            "ImportScoped": 7751,
-            "ReceiverType": 7927,
-            "SameFile": 7983,
-            "SamePackage": 3682,
-            "UniqueGlobal": 557
+            "ImportScoped": 7276,
+            "ReceiverType": 7529,
+            "SameFile": 7299,
+            "SamePackage": 3430,
+            "UniqueGlobal": 512
           }
         }
       },
@@ -304,59 +302,57 @@
       "analysis_status": "Partial { reason: \"call extraction did not cover the whole corpus: 3 file(s) failed to parse, 3 recovered by pattern (no calls extracted), 0 refused by discovery and never read at all — dead-code and unwired findings are a lower bound and are capped below the confident tier; 3 file(s) parsed with ERROR/MISSING regions, so declarations and calls inside those regions are absent\" }",
       "corpus_commit": "b7a23d41c02e4e8cb88a9c6e4c96dc2c1ed2cdc4",
       "date": "2026-10-10",
-      "dead_rows_exempt": 5841,
-      "dead_rows_total": 6037,
-      "devmap_commit": "40b6bbbf8319d8bcab0f6d93abfc664206dfea7b",
+      "dead_rows_exempt": 6058,
+      "dead_rows_total": 6259,
+      "devmap_commit": "e94e9cc23b0116b7cf8269e4c01c22ade8f932b2",
       "languages": {
         "kotlin": {
-          "ambiguous_global_edges": 1222,
+          "ambiguous_global_edges": 0,
           "dead_rows_by_tier": {
-            "0.4": 194
+            "0.4": 200
           },
-          "high_confidence_edges": 17068,
-          "net_resolution_permille": 743,
-          "unattributed_rows": 6702,
+          "high_confidence_edges": 15636,
+          "net_resolution_permille": 641,
+          "unattributed_rows": 9894,
           "unresolved_rows_by_class": {
             "builtin": 2692,
-            "external": 18919,
-            "local_binding": 1,
-            "no_namesake": 20077,
-            "uninferred_receiver": 6125,
-            "unresolved": 576
+            "external": 18752,
+            "local_binding": 556,
+            "no_namesake": 19593,
+            "uninferred_receiver": 6140,
+            "unresolved": 3198
           },
-          "use_edges": 18290,
+          "use_edges": 15636,
           "use_edges_by_resolution": {
-            "AmbiguousGlobal": 1222,
             "ImportScoped": 6060,
-            "ReceiverType": 1720,
-            "SameFile": 5491,
-            "UniqueGlobal": 3797
+            "ReceiverType": 1712,
+            "SameFile": 5459,
+            "UniqueGlobal": 2405
           }
         },
         "swift": {
-          "ambiguous_global_edges": 387,
+          "ambiguous_global_edges": 0,
           "dead_rows_by_tier": {
-            "0.4": 2
+            "0.4": 1
           },
-          "high_confidence_edges": 6346,
-          "net_resolution_permille": 564,
-          "unattributed_rows": 5122,
+          "high_confidence_edges": 6058,
+          "net_resolution_permille": 549,
+          "unattributed_rows": 5046,
           "unresolved_rows_by_class": {
-            "builtin": 7373,
-            "external": 5441,
-            "local_binding": 73,
-            "no_namesake": 14932,
-            "uninferred_receiver": 4729,
-            "unresolved": 320
+            "builtin": 7330,
+            "external": 5419,
+            "local_binding": 93,
+            "no_namesake": 14323,
+            "uninferred_receiver": 4266,
+            "unresolved": 687
           },
-          "use_edges": 6733,
+          "use_edges": 6058,
           "use_edges_by_resolution": {
-            "AmbiguousGlobal": 387,
-            "ImportScoped": 1362,
-            "ReceiverType": 804,
-            "SameFile": 2647,
-            "SamePackage": 1447,
-            "UniqueGlobal": 86
+            "ImportScoped": 1336,
+            "ReceiverType": 801,
+            "SameFile": 2460,
+            "SamePackage": 1377,
+            "UniqueGlobal": 84
           }
         }
       },
