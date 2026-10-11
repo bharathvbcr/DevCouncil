@@ -78,6 +78,15 @@ type Lease struct {
 	ExpiresAt string `json:"expires_at,omitempty"`
 }
 
+// UnreadableLease is an active lease whose stored expiry is not a timestamp.
+// It fails closed for its own task: nothing is offered or acquired over it
+// without a forced acquire, which retires it.
+type UnreadableLease struct {
+	TaskID    string  `json:"task_id"`
+	LeaseID   string  `json:"lease_id"`
+	ExpiresAt *string `json:"expires_at"`
+}
+
 // response is the envelope every command returns.
 type response struct {
 	OK              bool     `json:"ok"`
@@ -94,7 +103,11 @@ type response struct {
 	SuggestedTool   string   `json:"suggested_tool"`
 	Task            *Task    `json:"task"`
 	Tasks           []string `json:"tasks"`
-	Written         bool     `json:"written"`
+	// Degraded and UnreadableLeases: leases whose expiry the store could not
+	// read. They are excluded from Tasks and Leases and named here.
+	Degraded         bool              `json:"degraded"`
+	UnreadableLeases []UnreadableLease `json:"unreadable_leases"`
+	Written          bool              `json:"written"`
 	// CurrentAppended is the appended-scope value the store holds, sent back
 	// when a compare-and-swap found a different one. It is raw so the retry
 	// compares the store's own bytes rather than a re-serialisation of them.
@@ -364,7 +377,7 @@ func (c *Client) Task(ctx context.Context, taskID string) (*Task, error) {
 	// must not reach a write decision as an empty one: "the plan authorises
 	// nothing extra" and "nobody could read what the plan authorises" are
 	// different answers, and only one of them is safe to act on.
-	if len(bytes.TrimSpace(out.Task.AgentAppendedRaw)) > 0 {
+	if len(trimJSONSpace(out.Task.AgentAppendedRaw)) > 0 {
 		if err := json.Unmarshal(out.Task.AgentAppendedRaw, &out.Task.AgentAppended); err != nil {
 			return nil, fmt.Errorf("store: task %s has an unreadable agent-appended scope: %w", taskID, err)
 		}
@@ -521,13 +534,21 @@ func (c *Client) AppendPlannedFiles(ctx context.Context, taskID, token string, a
 		"giving up rather than retrying forever", taskID, stale)
 }
 
+// jsonSpace is JSON's own whitespace and the only whitespace the store trims
+// (json::trim_ws on the Rust side). bytes.TrimSpace strips more — a form feed,
+// a non-breaking space — so a value one side called padded and the other called
+// content could be stored, then never match its own compare-and-swap.
+const jsonSpace = " \t\n\r"
+
+func trimJSONSpace(b []byte) []byte { return bytes.Trim(b, jsonSpace) }
+
 // rawArray is a stored JSON array as text, defaulting to the empty array.
 //
 // The store compares this text, so it is never re-encoded on the way through:
 // a value that round-tripped through a decoder and back would differ from what
 // is on disk and the swap would refuse a value it should have matched.
 func rawArray(raw json.RawMessage) string {
-	if trimmed := bytes.TrimSpace(raw); len(trimmed) > 0 {
+	if trimmed := trimJSONSpace(raw); len(trimmed) > 0 {
 		return string(trimmed)
 	}
 	return "[]"
@@ -536,6 +557,16 @@ func rawArray(raw json.RawMessage) string {
 // scopeStaleCode is the store's answer when the appended scope moved between
 // the read and the swap.
 const scopeStaleCode = "scope_stale"
+
+// ReadyReport is ReadyTasks plus the leases the store could not judge, so an
+// operator sees why a task is missing rather than the store failing as a whole.
+func (c *Client) ReadyReport(ctx context.Context) ([]string, []UnreadableLease, error) {
+	out, err := c.run(ctx, "ready")
+	if err != nil {
+		return nil, nil, err
+	}
+	return out.Tasks, out.UnreadableLeases, nil
+}
 
 // ReadyTasks lists tasks that are workable and unheld. The two conditions are
 // answered in one query on the store side, so a caller cannot be handed a task
@@ -654,6 +685,9 @@ type EvidenceRow struct {
 	RequirementID         string          `json:"requirement_id,omitempty"`
 	AcceptanceCriterionID string          `json:"acceptance_criterion_id,omitempty"`
 	DataJSON              json.RawMessage `json:"data_json"`
+	// DataError is set instead of DataJSON when the stored text was not
+	// provably one JSON value; the store never splices unproven text.
+	DataError string `json:"data_error,omitempty"`
 }
 
 // GapRow is one persisted verification gap.
@@ -666,6 +700,10 @@ type GapRow struct {
 	RecommendedFix string          `json:"recommended_fix"`
 	Blocking       bool            `json:"blocking"`
 	EvidenceJSON   json.RawMessage `json:"evidence_json"`
+	// EvidenceError is set when the stored evidence was not provably a JSON
+	// array. The gap is still reported (a malformed row must not hide a
+	// blocking gap) and EvidenceJSON then stands in as an empty array.
+	EvidenceError string `json:"evidence_error,omitempty"`
 	// The linkage that makes an acceptance-criterion gap actionable: which
 	// requirement and criterion it is about, and how that criterion was meant
 	// to be proven. Nil is "not about a criterion" and travels as SQL NULL and

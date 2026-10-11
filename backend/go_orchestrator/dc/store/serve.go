@@ -46,6 +46,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -98,6 +100,14 @@ var errServeUnsupported = errors.New("the store binary does not support serve")
 
 // servedChild is one persistent dcstore process.
 type servedChild struct {
+	// dbID is the identity (device and inode) of the database file as it was
+	// when this child was started, nil when the path did not exist. The child
+	// opens the store once, for its whole session, so it keeps answering from
+	// that file after the path has been deleted or replaced: a pool that never
+	// compared identities reported a replaced database healthy and let two
+	// clients each lease the same task, one on each file.
+	dbID os.FileInfo
+
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	stdout *bufio.Reader
@@ -128,6 +138,10 @@ type serveResult struct {
 // per-call bound is applied in runServed instead, around the exchange rather
 // than around the process.
 func startChild(lifetime context.Context, binary, db string) (*servedChild, error) {
+	// Taken before the process starts, so a replacement that lands between this
+	// stat and the child's open is seen as a mismatch on the next request
+	// rather than adopted as the file the child holds.
+	dbID, _ := os.Stat(db)
 	// #nosec G204 -- the store binary this harness was configured with and the
 	// database path it was configured with; neither reaches here from a model.
 	cmd := exec.CommandContext(lifetime, binary, "--db", db, "serve")
@@ -159,6 +173,7 @@ func startChild(lifetime context.Context, binary, db string) (*servedChild, erro
 	}
 
 	child := &servedChild{
+		dbID:   dbID,
 		cmd:    cmd,
 		stdin:  stdin,
 		stdout: bufio.NewReaderSize(stdout, 64<<10),
@@ -166,6 +181,27 @@ func startChild(lifetime context.Context, binary, db string) (*servedChild, erro
 	child.stderr.limit = serveStderrLimit
 	go child.drainStderr(stderr)
 	return child, nil
+}
+
+// dbIsCurrent reports whether path still names the file this child opened. A
+// path that cannot be examined, or that no longer exists, is not current: the
+// child's answers can no longer be tied to anything a new process would see.
+//
+// A child started before the file existed is the one that created it (the store
+// creates its database on first use), so it adopts the identity of the first
+// file it finds there. That is the narrowest honest answer available without
+// asking the child which inode it holds; a swap in that single window is not
+// detectable and is the same exposure a one-shot call has.
+func (c *servedChild) dbIsCurrent(path string) bool {
+	now, err := os.Stat(path)
+	if err != nil {
+		return c.dbID == nil && errors.Is(err, fs.ErrNotExist)
+	}
+	if c.dbID == nil {
+		c.dbID = now
+		return true
+	}
+	return os.SameFile(c.dbID, now)
 }
 
 // drainStderr keeps the child's stderr pipe empty and keeps a bounded prefix
@@ -378,14 +414,25 @@ func (p *servePool) take(ctx context.Context, binary, db string) (*servedChild, 
 		return nil, fmt.Errorf("store: waiting for a store process: %w", ctx.Err())
 	}
 
-	p.mu.Lock()
-	if n := len(p.idle); n > 0 {
+	// An idle child is reused only while the path still names the file it
+	// opened. Checked on every borrow, so a database deleted or swapped under a
+	// warm pool is noticed on the next request: the stale children are ended
+	// and a fresh one opens whatever is there now (or fails to, if nothing is).
+	for {
+		p.mu.Lock()
+		n := len(p.idle)
+		if n == 0 {
+			p.mu.Unlock()
+			break
+		}
 		child := p.idle[n-1]
 		p.idle = p.idle[:n-1]
 		p.mu.Unlock()
-		return child, nil
+		if child.dbIsCurrent(db) {
+			return child, nil
+		}
+		child.close()
 	}
-	p.mu.Unlock()
 
 	// Started on its own goroutine so the caller's deadline covers the fork.
 	// exec.Cmd.Start can block in the kernel, and everything that would

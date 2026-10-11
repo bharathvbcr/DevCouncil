@@ -55,7 +55,7 @@ func TestInstallDevmapFromCheckoutBuildsChecksAndInstalls(t *testing.T) {
 	if err != nil || string(got) != "built devmap" {
 		t.Fatalf("installed binary = %q, %v", got, err)
 	}
-	st := LoadState(prefix)
+	st, _ := LoadState(prefix)
 	if _, ok := st.Installed["devmap"]; !ok {
 		t.Fatalf("receipt missing: %+v", st)
 	}
@@ -74,7 +74,7 @@ func TestUninstallOnlyRemovesReceiptBinary(t *testing.T) {
 	if err := os.WriteFile(ours, []byte("ours"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	st := LoadState(prefix)
+	st, _ := LoadState(prefix)
 	st.Record("devmap", ours)
 	if err := SaveState(st); err != nil {
 		t.Fatal(err)
@@ -96,14 +96,14 @@ func TestDisablePersists(t *testing.T) {
 	if err := Disable("devmap", Options{Prefix: prefix}); err != nil {
 		t.Fatal(err)
 	}
-	st := LoadState(prefix)
+	st, _ := LoadState(prefix)
 	if !st.IsDisabled("devmap") {
 		t.Fatal("expected disabled")
 	}
 	if err := Enable("devmap", Options{Prefix: prefix}); err != nil {
 		t.Fatal(err)
 	}
-	if LoadState(prefix).IsDisabled("devmap") {
+	if st, _ := LoadState(prefix); st.IsDisabled("devmap") {
 		t.Fatal("still disabled")
 	}
 }

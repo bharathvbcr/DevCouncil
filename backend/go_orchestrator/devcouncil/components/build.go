@@ -15,6 +15,7 @@ import (
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/console"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/safefile"
 )
 
 // Prober runs a freshly built binary and returns what it printed, stdout and
@@ -267,7 +268,7 @@ func healthCheck(id, bin string, p Prober) error {
 // and on the platforms where it does not, it rewrites the file underneath
 // that process. A rename within one filesystem swaps the directory entry, so
 // anything already running keeps the inode it started with and the next
-// exec gets the new binary whole. writeAtomicFile is the package's one
+// exec gets the new binary whole. safefile.WriteAtomic is the repository's one
 // owner of that discipline: a temporary name of its own (two installers
 // racing on one destination each rename a whole binary rather than one
 // stealing the other's half-written copy), synced before the rename.
@@ -276,7 +277,7 @@ func installAtomic(src, dest string) error {
 	if err != nil {
 		return err
 	}
-	return writeAtomicFile(dest, data, 0o755)
+	return safefile.WriteAtomic(dest, data, 0o755)
 }
 
 // resolutionNotes says, for each installed binary, whether PATH finds the

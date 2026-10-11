@@ -151,6 +151,31 @@ fn a_run_and_its_gaps_commit_together_or_not_at_all() {
     );
 }
 
+#[test]
+fn a_transactional_replacement_runs_the_write_side_json_checks() {
+    let store = Store::open_in_memory().expect("open");
+    store
+        .gaps_replace("T1", &[gap("OLD", Some("T1"))])
+        .expect("seed");
+    let mut bad = gap("G1", Some("T1"));
+    bad.evidence_json = "null".into();
+    let run = VerificationRun {
+        id: "run-bad".into(),
+        task_id: "T1".into(),
+        sandbox: "local".into(),
+        environment_json: "{}".into(),
+        commands_json: "[]".into(),
+        status: "blocked".into(),
+        started_at: "2026-01-01T00:00:00Z".into(),
+        finished_at: None,
+    };
+    store
+        .verification_commit(Some(&run), "T1", &[bad])
+        .expect_err("evidence that is not an array must be refused");
+    assert!(store.run_get("run-bad").expect("get").is_none());
+    assert_eq!(ids(&store, "T1"), ["OLD"], "previous gaps stay");
+}
+
 fn f(s: &str) -> String {
     format!("{}:{s}", s.len())
 }

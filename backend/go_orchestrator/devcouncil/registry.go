@@ -97,7 +97,7 @@ func toolSpecs() []ToolSpec {
 		{
 			Name:        "devcouncil_checkout_task",
 			Description: "Acquire a lease on a task and return its scope, lease token, and allowed next tools.",
-			InputSchema: rawSchema(`{"type":"object","properties":{"task_id":{"type":"string"},"client_id":{"type":"string"},"agent":{"type":"string"},"force":{"type":"boolean"}},"required":["task_id","client_id"],"additionalProperties":false}`),
+			InputSchema: rawSchema(`{"type":"object","properties":{"task_id":{"type":"string"},"client_id":{"type":"string"},"agent":{"type":"string"},"force":{"type":"boolean","description":"Take the task even if another client holds its lease, revoking that lease. The reply names the revoked owner as revoked_lease_owner. Reserved for human intervention."}},"required":["task_id","client_id"],"additionalProperties":false}`),
 			Behaviour:   ToolBehaviour{ReadOnly: false, Destructive: false, Idempotent: false, OpenWorld: false},
 		},
 		{
@@ -293,6 +293,18 @@ func (r *Registry) callGetGaps(ctx context.Context, args map[string]any) any {
 	if err != nil {
 		return ErrorPayload{OK: false, Code: "store_error", Error: err.Error()}
 	}
+	// An id nothing was planned under, and that holds no gaps, is not "no
+	// gaps": the other task tools say not_found, and an empty list read as a
+	// clean bill of health for a task that does not exist.
+	if len(rows) == 0 {
+		task, err := r.Store.Task(ctx, taskID)
+		if err != nil {
+			return ErrorPayload{OK: false, Code: "store_error", Error: err.Error()}
+		}
+		if task == nil {
+			return ErrorPayload{OK: false, Code: "not_found", Error: fmt.Sprintf("Task %s not found.", taskID)}
+		}
+	}
 	// Recurrence rides along with the gap rather than sitting behind a tool of
 	// its own. "You have reported this fixed before" is only useful at the
 	// moment something is deciding what to do about the gap, and a separate
@@ -342,6 +354,12 @@ func (r *Registry) callGetGaps(ctx context.Context, args map[string]any) any {
 			// read without re-running the command.
 			"stdout_path": row.StdoutPath,
 			"stderr_path": row.StderrPath,
+		}
+		// Present and null when the evidence was readable, so a consumer can
+		// tell "no problem" from a server that does not report the field.
+		gap["evidence_error"] = nil
+		if row.EvidenceError != "" {
+			gap["evidence_error"] = row.EvidenceError
 		}
 		if h, ok := history[row.ID]; ok {
 			gap["occurrences"] = h.Occurrences

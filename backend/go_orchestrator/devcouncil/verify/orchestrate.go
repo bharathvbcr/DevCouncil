@@ -584,7 +584,11 @@ func Persist(ctx context.Context, client *store.Client, taskID string, gaps []Ga
 func toStoreGaps(gaps []Gap) []store.GapRow {
 	out := make([]store.GapRow, 0, len(gaps))
 	for _, g := range gaps {
-		ev, _ := json.Marshal(g.Evidence)
+		evidence := g.Evidence
+		if evidence == nil {
+			evidence = []string{}
+		}
+		ev, _ := json.Marshal(evidence)
 		out = append(out, store.GapRow{
 			ID:             g.ID,
 			Severity:       g.Severity,

@@ -40,6 +40,11 @@ type Gate struct {
 	// two that forgot issued grants that could never be reviewed afterwards,
 	// which is the whole reason the ledger is written down.
 	OnIssue func(grants.Grant)
+	// OnChange is notified after every ledger mutation: issue, a single-use
+	// grant consumed by a decision, and revoke. A host that persists the
+	// ledger writes it down here; OnIssue alone left a spent single-use grant
+	// and every revoke to evaporate on restart.
+	OnChange func(grants.Change)
 
 	mu      sync.Mutex
 	decided []policy.Decision
@@ -51,12 +56,23 @@ func New(reg *flags.Registry, root string, subsystems policy.SubsystemMap) (*Gat
 	if err != nil {
 		return nil, err
 	}
-	return &Gate{
+	g := &Gate{
 		Flags:      reg,
 		Ledger:     grants.NewLedger(p),
 		Root:       root,
 		Subsystems: subsystems,
-	}, nil
+	}
+	// The ledger is the one place every mutation passes through, so the gate's
+	// hooks hang off its single change callback rather than off each caller.
+	g.Ledger.SetOnChange(func(c grants.Change) {
+		if c.Kind == grants.Issued && g.OnIssue != nil {
+			g.OnIssue(c.Grant)
+		}
+		if g.OnChange != nil {
+			g.OnChange(c)
+		}
+	})
+	return g, nil
 }
 
 // ReloadPolicy recomputes the grant policy from the registry and installs it.
@@ -416,9 +432,6 @@ func (g *Gate) RequestOverride(d policy.Decision, by grants.Grantor, reason stri
 	grant, err := g.Ledger.Issue(req)
 	if err != nil {
 		return grant, err
-	}
-	if g.OnIssue != nil {
-		g.OnIssue(grant)
 	}
 	return grant, nil
 }

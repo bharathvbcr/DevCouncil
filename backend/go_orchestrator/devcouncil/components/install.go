@@ -312,7 +312,10 @@ func Install(cs []Component, o Options) error {
 		return err
 	}
 	src := o.source()
-	st := LoadState(prefix)
+	st, err := LoadState(prefix)
+	if err != nil {
+		return err
+	}
 
 	var firstErr error
 	var names []string
@@ -465,7 +468,10 @@ func installRust(src, prefix string, ids []string, o Options) ([]string, error) 
 // under a catalog name. It never cargo-uninstalls a foreign toolchain copy.
 func Uninstall(cs []Component, o Options) error {
 	prefix := o.prefix()
-	st := LoadState(prefix)
+	st, err := LoadState(prefix)
+	if err != nil {
+		return err
+	}
 	bindir := filepath.Join(prefix, "bin")
 	for _, c := range cs {
 		rec, have := st.Installed[c.ID]
@@ -593,7 +599,10 @@ func Disable(id string, o Options) error {
 		console.Println("disable", id)
 		return nil
 	}
-	st := LoadState(o.prefix())
+	st, err := LoadState(o.prefix())
+	if err != nil {
+		return err
+	}
 	st.SetDisabled(id, true)
 	return SaveState(st)
 }
@@ -608,7 +617,10 @@ func Enable(id string, o Options) error {
 		console.Println("enable", id)
 		return nil
 	}
-	st := LoadState(o.prefix())
+	st, err := LoadState(o.prefix())
+	if err != nil {
+		return err
+	}
 	st.SetDisabled(id, false)
 	return SaveState(st)
 }
