@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"errors"
 	"fmt"
 	"path"
 	"regexp"
@@ -257,6 +258,7 @@ func (g CommandGate) evaluateSingleCommand(command string, task *dc.Task, depth 
 		return d
 	}
 	g.noteDirectoryChanges(&f, normalized, taskID)
+	g.noteUnverifiableOperands(&f, command, normalized, taskID)
 	if d, found := f.verdict(); found {
 		return d
 	}
@@ -399,6 +401,16 @@ func (g CommandGate) noteDirectoryChanges(f *clauseFindings, normalized, taskID 
 			"`git "+opt+"` runs against a working tree other than the one this gate judges for, "+
 				"so nothing it does was examined. Run git from the repository root instead.",
 			normalized, taskID)))
+	}
+}
+
+// noteUnverifiableOperands applies the operand rung; see unverifiableOperand.
+func (g CommandGate) noteUnverifiableOperands(f *clauseFindings, command, normalized, taskID string) {
+	if !g.HardRules {
+		return
+	}
+	if reason := unverifiableOperand(command, g.Root, matcherOf(g.Matcher)); reason != "" {
+		f.noteUnreadable(g.noteHardRules(deny(RuleCommandOperandUnverifiable, reason, normalized, taskID)))
 	}
 }
 
@@ -790,8 +802,25 @@ func (g CommandGate) noteHardRules(d Decision) Decision {
 // empty list — a scanner that lost track of where code ends must refuse
 // rather than guess.
 func liveSubstitutions(command string) ([]string, error) {
+	return liveSubstitutionsAt([]rune(command), 0)
+}
+
+// errNestedTooDeep reports arithmetic expansions nested past the analysis
+// limit. It is its own error so the redirect scan can answer with opacity — a
+// recorded refusal — rather than an error that unwinds past the decision.
+var errNestedTooDeep = errors.New("arithmetic expansion nested beyond the analysis limit")
+
+// liveSubstitutionsAt is liveSubstitutions over text already converted to
+// runes, at a nesting depth of arithmetic expansions.
+//
+// Descending into `$(( … ))` re-scans the inner text, and an input that nests
+// them re-scanned the remainder once per level — quadratic in a length the
+// caller controls (a 125 KB line took 21 s to refuse). The descent is capped at
+// maxSubstitutionDepth, the bound the rest of the ladder recurses to, and a
+// span nested past it is reported as unreadable, which every caller turns into
+// a hard refusal. Nothing legitimate nests arithmetic that deep.
+func liveSubstitutionsAt(runes []rune, depth int) ([]string, error) {
 	var spans []string
-	runes := []rune(command)
 	n := len(runes)
 	quote := rune(0)
 	i := 0
@@ -820,7 +849,10 @@ func liveSubstitutions(command string) ([]string, error) {
 			// Descended into, not skipped: a substitution nested in here runs,
 			// and one this scanner does not report is one the ladder never
 			// judges. See scanArithmetic.
-			nested, err := liveSubstitutions(inner)
+			if depth >= maxSubstitutionDepth {
+				return nil, errNestedTooDeep
+			}
+			nested, err := liveSubstitutionsAt([]rune(inner), depth+1)
 			if err != nil {
 				return nil, err
 			}

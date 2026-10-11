@@ -125,6 +125,15 @@ const (
 	// the read and redacting known values are different controls; this is the
 	// first one.
 	RuleSecretRead RuleID = "path.secret_read"
+	// RuleCommandOperandUnverifiable refuses a program the gate does not model,
+	// handed a path outside the root or one the restricted list protects. The
+	// argument rung knows what a few programs write; for the rest the gate
+	// cannot tell a read from a write, and the paths it is certain it must
+	// never let a write reach are the only ones asked about. Hard, and in the
+	// unreadable class: it is a statement about the gate's reach, not about
+	// what the program does, so a host that softens unreadable refusals may
+	// soften it (policy.unreadable_only travels on the decision).
+	RuleCommandOperandUnverifiable RuleID = "command.operand.unverifiable"
 	// RuleCommandSecretRead is the same refusal for a shell command: an
 	// operand or an input redirection that names a path under
 	// SecretPathPatterns. `cat .env` was allowed, demoted by the posture, while
@@ -164,22 +173,23 @@ var severities = map[RuleID]Severity{
 	// negotiable. The three git-safety rules protect the verification gates
 	// themselves: a --no-verify commit or a force push can erase the evidence
 	// the whole system reasons about, and no scope decision authorises that.
-	RuleCommandEmpty:             Hard,
-	RuleCommandBypassFlag:        Hard,
-	RuleCommandForcePush:         Hard,
-	RuleCommandProtectedReset:    Hard,
-	RuleCommandProtectedPush:     WarnSeverity,
-	RuleCommandNoLease:           Soft,
-	RuleCommandNotAllowed:        Soft,
-	RuleCommandSubstitution:      Hard,
-	RuleCommandHeredoc:           Hard,
-	RuleCommandReparse:           Hard,
-	RuleCommandTooLong:           Hard,
-	RuleCommandDirectoryChange:   Hard,
-	RuleSecretRead:               Hard,
-	RuleCommandSecretRead:        Hard,
-	RulePathEngineUnavailable:    Hard,
-	RuleCommandEngineUnavailable: Hard,
+	RuleCommandEmpty:               Hard,
+	RuleCommandBypassFlag:          Hard,
+	RuleCommandForcePush:           Hard,
+	RuleCommandProtectedReset:      Hard,
+	RuleCommandProtectedPush:       WarnSeverity,
+	RuleCommandNoLease:             Soft,
+	RuleCommandNotAllowed:          Soft,
+	RuleCommandSubstitution:        Hard,
+	RuleCommandHeredoc:             Hard,
+	RuleCommandReparse:             Hard,
+	RuleCommandTooLong:             Hard,
+	RuleCommandDirectoryChange:     Hard,
+	RuleSecretRead:                 Hard,
+	RuleCommandSecretRead:          Hard,
+	RuleCommandOperandUnverifiable: Hard,
+	RulePathEngineUnavailable:      Hard,
+	RuleCommandEngineUnavailable:   Hard,
 }
 
 // Subject says what a rule's Target names: a path on disk, or a shell command.
@@ -221,18 +231,19 @@ var subjects = map[RuleID]Subject{
 	RuleOperation:       SubjectPath,
 	RuleProtectedWrite:  SubjectPath,
 
-	RuleCommandEmpty:           SubjectCommand,
-	RuleCommandNoLease:         SubjectCommand,
-	RuleCommandNotAllowed:      SubjectCommand,
-	RuleCommandBypassFlag:      SubjectCommand,
-	RuleCommandForcePush:       SubjectCommand,
-	RuleCommandProtectedReset:  SubjectCommand,
-	RuleCommandProtectedPush:   SubjectCommand,
-	RuleCommandSubstitution:    SubjectCommand,
-	RuleCommandHeredoc:         SubjectCommand,
-	RuleCommandReparse:         SubjectCommand,
-	RuleCommandTooLong:         SubjectCommand,
-	RuleCommandDirectoryChange: SubjectCommand,
+	RuleCommandEmpty:               SubjectCommand,
+	RuleCommandNoLease:             SubjectCommand,
+	RuleCommandNotAllowed:          SubjectCommand,
+	RuleCommandBypassFlag:          SubjectCommand,
+	RuleCommandForcePush:           SubjectCommand,
+	RuleCommandProtectedReset:      SubjectCommand,
+	RuleCommandProtectedPush:       SubjectCommand,
+	RuleCommandSubstitution:        SubjectCommand,
+	RuleCommandHeredoc:             SubjectCommand,
+	RuleCommandReparse:             SubjectCommand,
+	RuleCommandTooLong:             SubjectCommand,
+	RuleCommandDirectoryChange:     SubjectCommand,
+	RuleCommandOperandUnverifiable: SubjectCommand,
 
 	RuleSecretRead:        SubjectPath,
 	RuleCommandSecretRead: SubjectCommand,
@@ -280,6 +291,8 @@ var unreadableRules = map[RuleID]bool{
 	RuleCommandHeredoc:         true,
 	RuleCommandSubstitution:    true,
 	RuleCommandReparse:         true,
+
+	RuleCommandOperandUnverifiable: true,
 }
 
 // IsUnreadableRule reports whether a rule refuses a line for the gate's own
