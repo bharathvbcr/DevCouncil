@@ -185,17 +185,20 @@ impl LanguageScore {
     }
 }
 
+/// Per language: `(corpus, false positives, rows)` for each corpus that has the language.
+type FalsePositivesByLanguage = BTreeMap<String, Vec<(String, u64, u64)>>;
+
 /// Corpus 0.9-tier false-positive counts from the accuracy harness's record,
 /// by language, when the record exists.
 ///
 /// Shape read: `{"corpora": [{"name": …, "languages": {"<lang>": {"dead_fp_by_tier":
 /// {"0.9": {"false_positive": n, "rows": m}}}}}]}`.
-fn corpus_record() -> Option<BTreeMap<String, Vec<(String, u64, u64)>>> {
+fn corpus_record() -> Option<FalsePositivesByLanguage> {
     let path = accuracy_root().join("record.json");
     let raw = std::fs::read_to_string(&path).ok()?;
     let record: serde_json::Value = serde_json::from_str(&raw)
         .unwrap_or_else(|e| panic!("{} is not JSON: {e}", path.display()));
-    let mut by_language: BTreeMap<String, Vec<(String, u64, u64)>> = BTreeMap::new();
+    let mut by_language = FalsePositivesByLanguage::new();
     for corpus in record["corpora"].as_array().into_iter().flatten() {
         let name = corpus["name"].as_str().unwrap_or("?").to_string();
         for (language, entry) in corpus["languages"].as_object().into_iter().flatten() {

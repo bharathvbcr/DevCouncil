@@ -27,11 +27,15 @@
 //! one operating system per run.
 
 use std::fs;
+#[cfg(unix)]
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(unix)]
 use std::sync::mpsc;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use devmap_analyze::analyze;
@@ -51,6 +55,7 @@ fn temp_root(name: &str) -> PathBuf {
     root
 }
 
+#[cfg(unix)]
 /// `src/m{i}.py` calls into `src/m{(i + shift) % n}.py`. Changing `shift`
 /// rewrites every file and every edge, so the next build's persist stage closes
 /// and opens a whole generation's worth of rows.
@@ -71,6 +76,7 @@ fn write_corpus(root: &Path, n: usize, shift: usize) {
     }
 }
 
+#[cfg(unix)]
 /// Wait for `child` to exit, bounded. A wait that cannot end is not a test.
 fn wait_bounded(child: &mut Child, limit: Duration) -> std::process::ExitStatus {
     let deadline = Instant::now() + limit;
@@ -87,6 +93,7 @@ fn wait_bounded(child: &mut Child, limit: Duration) -> std::process::ExitStatus 
     }
 }
 
+#[cfg(unix)]
 fn build(db: &Path, root: &Path, full: bool) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_devmap"));
     command
@@ -121,6 +128,7 @@ fn integrity(db: &Path) -> String {
         .expect("integrity_check runs")
 }
 
+#[cfg(unix)]
 /// What the latest generation answers, in a form two stores can be compared by:
 /// every node and every edge, keyed by path and symbol, sorted.
 fn latest_answers(db: &Path) -> (Vec<String>, Vec<String>) {

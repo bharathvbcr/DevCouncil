@@ -317,6 +317,7 @@ fn unlock(path: &Path) {
 }
 
 /// The rows of one `coverage_gaps.discovery_refused` listing, as `(path, reason)`.
+#[cfg(unix)]
 fn refused_rows(status: &serde_json::Value) -> Vec<(String, String)> {
     status["coverage_gaps"]["discovery_refused"]["paths"]
         .as_array()
