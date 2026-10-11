@@ -69,6 +69,12 @@ else
     echo "Check out https://github.com/bharathvbcr/gusset there. CI does this in .github/actions/setup-gusset." >&2
     exit 1
   fi
+  # The sibling must be the revision CI builds; a drifted sibling is a failure,
+  # not a warning (see gusset-engine/check-pin.sh).
+  gusset-engine/check-pin.sh || {
+    echo "GATE FAIL: the Gusset sibling at $gusset_dir is not at the setup-gusset pin." >&2
+    exit 1
+  }
   # Always the incremental build, never "only when missing": that linked
   # whatever archive an older checkout left behind. cgo-env.sh also keys Go's
   # caches on the archive's hash, without which a rebuilt archive is not

@@ -166,13 +166,17 @@ func diffCandidate(prefixIdx, sepIdx, payloadIdx int) string {
 }
 
 func differentialGate() (CommandGate, *dc.Task) {
-	return CommandGate{
+	// Two statements, not one multi-line return of two literals: gofmt 1.26
+	// and 1.27 indent the second literal differently.
+	gate := CommandGate{
 		GlobalAllowedCommands: []string{"echo", "echo *", "cat *", "true", ":"},
 		HardRules:             true,
-	}, &dc.Task{
+	}
+	task := &dc.Task{
 		ID:              "TASK-001",
 		AllowedCommands: []string{"echo *", "cat *"},
 	}
+	return gate, task
 }
 
 // runDifferentialCase executes one candidate under a real sh in its own

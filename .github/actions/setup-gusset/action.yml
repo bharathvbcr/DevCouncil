@@ -22,10 +22,14 @@ runs:
       uses: actions/checkout@v5
       with:
         repository: bharathvbcr/gusset
-        # Pinned to the sibling revision this tree was linked against.
-        # Bump deliberately; tracking main would let a Gusset push fail a
-        # DevCouncil release without a DevCouncil commit.
-        ref: 92c205609f02ab116a12844a074a8b424c121359
+        # Pinned to the sibling revision this tree was linked against, and the
+        # one rust/gusset-engine builds --locked against (register_engine
+        # returns Result there). Bump deliberately, in the same change as the
+        # code that needs it: tracking main would let a Gusset push fail a
+        # DevCouncil release without a DevCouncil commit. ci:local and
+        # rust/verify.sh fail when ../gusset is at another revision
+        # (rust/gusset-engine/check-pin.sh).
+        ref: 984209b542885b10b43e3d9aaf2073fd871e9eb9
         path: third_party/gusset
         persist-credentials: false
 
@@ -78,7 +82,8 @@ runs:
         cargo build --release --locked
         test -f target/release/libgusset.a
         # Key Go's build and test caches on the archive (see cgo-env.sh):
-        # setup-go restores GOCACHE, and without this a cached link or a
-        # cached "ok" from an older archive is replayed.
+        # without this a cached link or a cached "ok" from an older archive
+        # is replayed. (setup-go restores GOCACHE only when its cache key,
+        # backend/go_orchestrator/go.mod here, is found.)
         # The -L is already in gussetfn/engine.go; only the key is needed here.
         ./cgo-env.sh --no-build | grep -v "^CGO_LDFLAGS=" >> "$GITHUB_ENV"
