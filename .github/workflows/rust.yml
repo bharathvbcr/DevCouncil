@@ -198,7 +198,8 @@ jobs:
       - name: Per-crate feature-off build and test
         run: |
           set -euo pipefail
-          # Every workspace crate, not five of thirteen. The five below were
+          # Every library crate in the workspace, not five of thirteen (only the
+          # devmap-soak harness binary is left out). The five below were
           # the only ones checked, so `devmap-cli`, `devmap-serve` and all the
           # `dc-*` crates — including `dc-proc`, added after this job was
           # written — could lose their feature-off shape with nothing to say
@@ -206,7 +207,7 @@ jobs:
           # pins a green state rather than importing a backlog.
           for crate in devmap-extract devmap-resolve devmap-analyze devmap-store devmap-query \
                        dc-glob dc-proc dc-redact dc-grep dc-store dc-verify dc-evidence \
-                       devmap-serve devmap-cli; do
+                       dc-regress dc-regress-store devmap-serve devmap-cli; do
             echo "::group::$crate"
             cargo check -p "$crate" --no-default-features --all-targets
             cargo test -p "$crate" --no-default-features
