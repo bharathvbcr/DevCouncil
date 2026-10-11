@@ -39,9 +39,12 @@
 //! What was rejected is the *exemption*. For a base the registry does not know
 //! (`known_dispatch_contract` in `wiring.rs` says which it does), an uncalled
 //! method is published at 0.4 `external_supertype`, naming the base: visible,
-//! never exempt, out of the act-on tier. The corpus record measured it — 23
-//! false and 2 unsure confident rows left the act-on tier (HTMLParser handlers,
-//! watchdog and `sys.meta_path` hooks, CodeMirror widget methods), no true one.
+//! never exempt, out of the act-on tier. Measured on the corpus record's
+//! repositories, before and after: it moved 7 false confident rows out of the
+//! act-on tier (two `HTMLParser` handlers, a watchdog `FileSystemEventHandler`
+//! hook, four CodeMirror `WidgetType`/`GutterMarker` methods) and one `unsure`
+//! (a `Protocol` member), and no true one. With `object_literal_member` and the
+//! other fixes of that pass, 23 false and 2 unsure rows left, no true one.
 //! A registry-known base keeps the precision this file is about: `autograd`'s
 //! `helper_nobody_calls` and `HTMLElement`'s `unusedMethod` stay confident.
 //!
