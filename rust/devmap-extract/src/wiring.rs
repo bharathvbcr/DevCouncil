@@ -1202,8 +1202,14 @@ pub fn python_base_dispatch_reason(base: &str, method: &str) -> Option<&'static 
         .then_some("torch.autograd.Function method invoked by autograd through `.apply()`");
     }
     if base.ends_with("nn.Module") {
-        return matches!(method, "forward")
-            .then_some("torch nn.Module.forward invoked by `Module.__call__`");
+        return match method {
+            "forward" => Some("torch nn.Module.forward invoked by `Module.__call__`"),
+            "extra_repr" => Some("torch nn.Module.extra_repr invoked by `Module.__repr__`"),
+            "get_extra_state" | "set_extra_state" => {
+                Some("torch nn.Module extra-state hook invoked by `state_dict` / `load_state_dict`")
+            }
+            _ => None,
+        };
     }
     None
 }
@@ -1217,20 +1223,26 @@ pub fn python_base_dispatch_reason(base: &str, method: &str) -> Option<&'static 
 /// element and React class-component lifecycles. Liveness caps the uncalled
 /// methods of a class whose base is outside the corpus (`external_supertype`)
 /// unless this answers yes, because for an unknown base nothing says which
-/// methods it calls. `written` is the base as written (`torch.autograd.Function`,
-/// `React.Component`, `HTMLElement`).
-pub fn known_dispatch_contract(written: &str) -> bool {
-    let written = written.trim();
-    written.ends_with("autograd.Function")
-        || written.ends_with("nn.Module")
-        || matches!(
-            written,
-            "HTMLElement"
-                | "Component"
-                | "PureComponent"
-                | "React.Component"
-                | "React.PureComponent"
-        )
+/// methods it calls.
+///
+/// `qualified` is the base with its root resolved through the file's imports:
+/// `torch.autograd.Function` for `torch.autograd.Function` under `import
+/// torch`, `torch.nn.Module` for `nn.Module` under `import torch.nn as nn`,
+/// `react.Component` for `Component` imported from `react` or for
+/// `React.Component` under `import React from 'react'`; a root no import binds
+/// stays as written. Matched exactly, never by tail: a `Component` imported
+/// from some other library is not React's, and its uncalled methods are what
+/// `external_supertype` is for. `HTMLElement` is the DOM global, so it is known
+/// only unqualified — written with no import binding it.
+pub fn known_dispatch_contract(qualified: &str) -> bool {
+    matches!(
+        qualified.trim(),
+        "torch.autograd.Function"
+            | "torch.nn.Module"
+            | "HTMLElement"
+            | "react.Component"
+            | "react.PureComponent"
+    )
 }
 
 /// Class methods a JS/TS framework calls on the instance's behalf.
@@ -1243,10 +1255,13 @@ pub fn js_lifecycle_hook_reason(name: &str) -> Option<&'static str> {
         "render"
         | "componentDidMount"
         | "componentWillMount"
+        | "UNSAFE_componentWillMount"
         | "componentWillUnmount"
         | "componentDidUpdate"
         | "componentWillUpdate"
+        | "UNSAFE_componentWillUpdate"
         | "componentWillReceiveProps"
+        | "UNSAFE_componentWillReceiveProps"
         | "shouldComponentUpdate"
         | "getSnapshotBeforeUpdate"
         | "componentDidCatch"
@@ -1260,10 +1275,17 @@ pub fn js_lifecycle_hook_reason(name: &str) -> Option<&'static str> {
         | "ngAfterContentChecked"
         | "ngAfterViewInit"
         | "ngAfterViewChecked" => "Angular lifecycle hook called by the framework",
+        // The custom element reactions the HTML standard defines, form-associated
+        // and move callbacks included.
         "connectedCallback"
         | "disconnectedCallback"
+        | "connectedMoveCallback"
         | "adoptedCallback"
-        | "attributeChangedCallback" => "custom-element lifecycle hook called by the DOM",
+        | "attributeChangedCallback"
+        | "formAssociatedCallback"
+        | "formDisabledCallback"
+        | "formResetCallback"
+        | "formStateRestoreCallback" => "custom-element lifecycle hook called by the DOM",
         _ => return None,
     })
 }

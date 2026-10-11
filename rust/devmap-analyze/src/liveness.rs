@@ -1077,8 +1077,11 @@ pub const COVERAGE_LOSS_REASON: &str =
 /// builds every labelled fixture under `testdata/accuracy/` and fails if a
 /// language is listed here while any of its confident-branch rows is not
 /// labelled `truly_dead`, and fails if a language whose fixture is clean — at
-/// least one confident row, no false one, every examined truly-dead marker
-/// found — is *not* listed. So the table cannot rot in either direction: a
+/// least one confident row, no false one, every truly-dead marker in the
+/// confident branch — and whose corpus record (`record.json`) has labelled
+/// rows, at most 5% false on every corpus, is *not* listed. A language the
+/// record never measured, or measured with no row, is unproven: a missing or
+/// unreadable record fails the test. So the table cannot rot in either direction: a
 /// regression that puts one false row in a listed language's confident tier
 /// fails CI, and a fix that earns a language the tier fails CI until it is
 /// listed.
@@ -1096,19 +1099,24 @@ pub const COVERAGE_LOSS_REASON: &str =
 ///
 /// **What listing rests on today, stated so nobody reads more into it.**
 /// (2026-10-10.) Each listed language has zero confident-tier false positives
-/// on its committed fixture *and* at most 5% on every corpus of the record
-/// (`testdata/accuracy/record.json`: 21 local repositories, each row labelled
-/// from source). Measured there: Go 0/17 (all from one corpus), TypeScript
-/// 0/29, TSX 0/14, Kotlin 0/9 (2 unsure), Rust 0/3. Swift has **no** corpus
-/// row at all — on every corpus measured its examined population is `private`
-/// members that something reaches — so its listing rests on one fixture row.
+/// on its committed fixture, every fixture `truly_dead` marker in the confident
+/// branch, at least one labelled row in the corpus record, and at most 5% false
+/// on every corpus of it (`testdata/accuracy/record.json`: 20 local
+/// repositories, every language each holds listed — `rows: 0` where its
+/// confident branch was empty). Measured there: Go 0/17 (all from one corpus),
+/// TypeScript 0/29, TSX 0/14, Rust 0/3, Kotlin 0/9 — and Kotlin's nine are all
+/// coverage-capped at 0.66; the only two Kotlin rows *published* at 0.9 are
+/// labelled `unsure` (operator extensions a library member may shadow) and sit
+/// outside the count.
 ///
-/// Python is off the list: 17 of 58 corpus rows were false (string dispatch,
-/// an aliased import, module constants read from other files, calls through
-/// a Protocol), causes the L-Python and interface-dispatch cards own. It comes
-/// back when the record says so.
-pub const CONFIDENT_TIER_ELIGIBLE: &[&str] =
-    &["go", "kotlin", "rust", "swift", "tsx", "typescript"];
+/// Off the list: **Swift**, measured on ten corpora with no confident-branch
+/// row on any — its examined population is `private` members something
+/// reaches — so nothing beyond one fixture row has ever tested it; **Python**,
+/// 17 of 58 corpus rows false (string dispatch, an aliased import, module
+/// constants read from other files, calls through a Protocol), causes the
+/// L-Python and interface-dispatch cards own. Each comes back when the record
+/// says so.
+pub const CONFIDENT_TIER_ELIGIBLE: &[&str] = &["go", "kotlin", "rust", "tsx", "typescript"];
 
 /// Whether `language` may publish dead rows in the confident tier.
 pub fn confident_tier_eligible(language: &str) -> bool {
@@ -1130,8 +1138,8 @@ pub const UNPROVEN_TIER_CONFIDENCE: f32 = 0.4;
 pub fn confident_tier_unproven_reason(language: &str) -> String {
     format!(
         "{CONFIDENT_TIER_UNPROVEN}: no inbound edge names this symbol, but the {language} \
-         confident tier has not been proven against its labelled fixture — capped below the \
-         act-on tier until CONFIDENT_TIER_ELIGIBLE lists {language}"
+         confident tier has not been proven against its labelled fixture and the corpus \
+         record — capped below the act-on tier until CONFIDENT_TIER_ELIGIBLE lists {language}"
     )
 }
 
@@ -1233,9 +1241,10 @@ fn supertype_dispatches_nothing(name: &str) -> bool {
 /// names it ([`supertypes_by_type`]); a heritage reference with no such edge
 /// is a library type, or one this build could not find — either way something
 /// outside the graph may call the type's methods. A base whose contract the
-/// wiring registry knows (`known_dispatch_contract`: `autograd.Function`,
-/// `nn.Module`, `HTMLElement`, React class components) is not counted: its
-/// dispatched methods are exempt by name and the rest stay ordinary candidates.
+/// wiring registry knows (`known_dispatch_contract`: `torch.autograd.Function`,
+/// `torch.nn.Module`, `HTMLElement`, React class components), matched on the
+/// base as [`import_qualified`] names it, is not counted: its dispatched
+/// methods are exempt by name and the rest stay ordinary candidates.
 fn external_supertypes<'e>(
     extractions: &'e [Extraction],
     supertypes: &HashMap<(&str, &str), Vec<(&str, &str)>>,
@@ -1278,7 +1287,7 @@ fn external_supertypes<'e>(
                 continue;
             }
             let written: Vec<&str> = segments.iter().rev().copied().collect();
-            if devmap_extract::wiring::known_dispatch_contract(&written.join(".")) {
+            if devmap_extract::wiring::known_dispatch_contract(&import_qualified(ext, &written)) {
                 continue;
             }
             let in_corpus = supertypes
@@ -1291,6 +1300,52 @@ fn external_supertypes<'e>(
         }
     }
     out
+}
+
+/// A written base (`["nn", "Module"]`) with its root segment replaced by what
+/// the file's imports bind it to (`torch.nn.Module` under `import torch.nn as
+/// nn`), so the dispatch registry matches the library and not a spelling.
+///
+/// * `from M import X as L` / `import { X as L } from 'M'` binds `L` to `M.X`.
+/// * `import M as L` / `import L from 'M'` / `import * as L from 'M'` binds `L`
+///   to `M` (a JS default import is the module's own export).
+/// * `import torch.nn` binds `torch`, the module's first segment, to itself.
+///
+/// A root no import binds is returned as written: a global (`HTMLElement`) or
+/// a name declared in the file.
+fn import_qualified(ext: &Extraction, written: &[&str]) -> String {
+    let Some((root, rest)) = written.split_first() else {
+        return String::new();
+    };
+    let bound = ext.imports.iter().find_map(|import| {
+        let spec = import.module_specifier.as_str();
+        let named = import
+            .local_names
+            .iter()
+            .zip(&import.imported_names)
+            .find(|(local, _)| local.as_str() == *root)
+            .map(|(_, imported)| {
+                if imported == "*" {
+                    spec.to_string()
+                } else {
+                    format!("{spec}.{imported}")
+                }
+            });
+        named
+            .or_else(|| (import.alias.as_deref() == Some(*root)).then(|| spec.to_string()))
+            .or_else(|| {
+                (import.alias.is_none()
+                    && import.imported_names.is_empty()
+                    && spec.split('.').next() == Some(*root))
+                .then(|| root.to_string())
+            })
+    });
+    let mut qualified = bound.unwrap_or_else(|| root.to_string());
+    for segment in rest {
+        qualified.push('.');
+        qualified.push_str(segment);
+    }
+    qualified
 }
 
 /// The external supertype `declaring_type` inherits from, directly or through

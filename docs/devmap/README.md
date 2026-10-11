@@ -697,19 +697,24 @@ subsystems whose functions only call each other.
   when nothing names the symbol *and* its language is in
   `devmap_analyze::CONFIDENT_TIER_ELIGIBLE` — a table a test binds to the
   labelled fixtures under `rust/testdata/accuracy/` and to the labelled corpus
-  record beside them (`record.json`), so a language is listed exactly when its
-  fixture shows no confident-tier false positive and every corpus shows at most
-  5%. Today that is Go, Kotlin, Rust, Swift, TypeScript and TSX; Python came off
-  on 2026-10-10 (17 of 58 corpus rows false). Swift has no corpus row and rests
-  on its fixture alone. Any other language's
+  record beside them (`record.json`, 20 repositories), so a language is listed
+  exactly when its fixture shows no confident-tier false positive with every
+  truly-dead marker in that tier, and the record holds labelled rows for it with
+  at most 5% false on every corpus. Today that is Go, Kotlin, Rust, TypeScript
+  and TSX. Python came off on 2026-10-10 (17 of 58 corpus rows false); Swift is
+  off because ten corpora measured gave it no confident row to label, so only
+  its fixture had ever tested it. Kotlin's nine corpus rows are all
+  coverage-capped at 0.66. Any other language's
   would-be confident row is published at 0.4 with a reason starting
   `confident_tier_unproven`, naming the language.
 - **0.4 is unconfirmed by contract**: `only_ambiguous_callers`, an unresolved
   namesake, `confident_tier_unproven`, `external_supertype` (a Python or
   TypeScript method on a class whose supertype chain reaches a library type,
   which may call it by name — unless the wiring registry knows that base's
-  contract, as it does `autograd.Function`, `nn.Module`, `HTMLElement` and
-  React class components), `object_literal_member` (a method of a
+  contract, as it does `torch.autograd.Function`, `torch.nn.Module`,
+  `HTMLElement` and React's `Component`/`PureComponent` — matched on the base
+  as the file's imports name it, so a `Component` from another library is not
+  React's), `object_literal_member` (a method of a
   TypeScript/JavaScript object literal, reached through the object), or
   `exported_unreferenced` — an export the manifest or the language proves
   module-private, with nothing reaching it: Go `internal/` packages and

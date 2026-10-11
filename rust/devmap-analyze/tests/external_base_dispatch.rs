@@ -44,6 +44,13 @@
 //! watchdog and `sys.meta_path` hooks, CodeMirror widget methods), no true one.
 //! A registry-known base keeps the precision this file is about: `autograd`'s
 //! `helper_nobody_calls` and `HTMLElement`'s `unusedMethod` stay confident.
+//!
+//! "Known" is decided on the base as the file's imports name it
+//! (`torch.nn.Module`, `react.Component`), never on its spelling: a bare
+//! `Component` from another library inherited React's contract until a review
+//! caught it, and so did every hook the lists left out (`formResetCallback`,
+//! React's `UNSAFE_` names). A known base keeps its *other* methods in the act-on
+//! tier, so its hook list has to be the standard's whole list.
 
 use devmap_analyze::*;
 use devmap_extract::extract_file;
@@ -220,4 +227,156 @@ fn a_class_with_no_base_is_still_an_ordinary_candidate() {
         "`Plain` has no base at all. Reason: {:?}",
         report.exemption_reason
     );
+}
+
+/// Whether `symbol` is spared: exempt, or never a candidate at all.
+fn spared(reports: &[DeadSymbolReport], symbol: &str) -> bool {
+    reports
+        .iter()
+        .find(|r| r.symbol_name == symbol)
+        .is_none_or(|r| r.is_exempt)
+}
+
+/// The registry matches the library, not a spelling.
+///
+/// `known_dispatch_contract` matched a bare `Component`, so a class extending a
+/// `Component` from any library inherited React's contract, and its uncalled
+/// methods stayed in the act-on tier — the unqualified-name guess
+/// `a_local_class_with_a_framework_shaped_name_inherits_nothing` refuses.
+#[test]
+fn a_component_imported_from_another_library_is_not_reacts() {
+    let (extractions, resolution) = resolve(&[(
+        "widget.ts",
+        "import { Component } from 'some-lib';\n\
+         \n\
+         class Widget extends Component {\n\
+         \x20 onHostEvent(): void {}\n\
+         }\n\
+         \n\
+         new Widget();\n",
+    )]);
+    let reports = analyze_liveness(&extractions, &resolution);
+    let report = report_for(&reports, "Widget.onHostEvent");
+    assert!(
+        !confidently_dead(report),
+        "`some-lib`'s Component may call `onHostEvent`; nothing here says it \
+         does not. Got {report:?}"
+    );
+    assert!(
+        report
+            .exemption_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with(EXTERNAL_SUPERTYPE)),
+        "it is unconfirmed because of its base, and says so: {report:?}"
+    );
+}
+
+/// React's contract is still known, however the file names it.
+#[test]
+fn a_react_component_keeps_its_contract_by_name_or_namespace() {
+    for (path, source) in [
+        (
+            "named.tsx",
+            "import { Component } from 'react';\n\
+             \n\
+             class Panel extends Component {\n\
+             \x20 render() { return null; }\n\
+             \x20 helperNobodyCalls(): number { return 1; }\n\
+             }\n\
+             \n\
+             new Panel();\n",
+        ),
+        (
+            "namespace.tsx",
+            "import React from 'react';\n\
+             \n\
+             class Panel extends React.Component {\n\
+             \x20 render() { return null; }\n\
+             \x20 helperNobodyCalls(): number { return 1; }\n\
+             }\n\
+             \n\
+             new Panel();\n",
+        ),
+    ] {
+        let (extractions, resolution) = resolve(&[(path, source)]);
+        let reports = analyze_liveness(&extractions, &resolution);
+        assert!(spared(&reports, "Panel.render"), "{path}: {reports:#?}");
+        let report = report_for(&reports, "Panel.helperNobodyCalls");
+        assert!(
+            confidently_dead(report),
+            "{path}: React's contract is known, so a method it does not \
+             dispatch stays actionable. Got {report:?}"
+        );
+    }
+}
+
+/// The hook lists the carve-out rests on are the standards' whole lists.
+///
+/// A known base keeps its other methods confident, so a hook missing from the
+/// list is a live method published as safe to delete. `formResetCallback` and
+/// the other form-associated reactions (HTML standard, custom elements), and
+/// React's `UNSAFE_` lifecycle names, were missing.
+#[test]
+fn every_hook_a_known_base_dispatches_is_spared() {
+    let (extractions, resolution) = resolve(&[
+        (
+            "field.ts",
+            "class Field extends HTMLElement {\n\
+             \x20 formAssociatedCallback(): void {}\n\
+             \x20 formDisabledCallback(): void {}\n\
+             \x20 formResetCallback(): void {}\n\
+             \x20 formStateRestoreCallback(): void {}\n\
+             \x20 connectedMoveCallback(): void {}\n\
+             }\n\
+             customElements.define('x-field', Field);\n",
+        ),
+        (
+            "legacy.tsx",
+            "import { Component } from 'react';\n\
+             \n\
+             class Legacy extends Component {\n\
+             \x20 UNSAFE_componentWillMount(): void {}\n\
+             \x20 UNSAFE_componentWillReceiveProps(): void {}\n\
+             \x20 UNSAFE_componentWillUpdate(): void {}\n\
+             \x20 render() { return null; }\n\
+             }\n\
+             \n\
+             new Legacy();\n",
+        ),
+        (
+            "net.py",
+            "import torch.nn as nn\n\
+             \n\
+             \n\
+             class Net(nn.Module):\n\
+             \x20   def forward(self, x):\n\
+             \x20       return x\n\
+             \x20   def extra_repr(self):\n\
+             \x20       return 'net'\n\
+             \x20   def get_extra_state(self):\n\
+             \x20       return {}\n\
+             \x20   def set_extra_state(self, state):\n\
+             \x20       pass\n",
+        ),
+    ]);
+    let reports = analyze_liveness(&extractions, &resolution);
+    for hook in [
+        "Field.formAssociatedCallback",
+        "Field.formDisabledCallback",
+        "Field.formResetCallback",
+        "Field.formStateRestoreCallback",
+        "Field.connectedMoveCallback",
+        "Legacy.UNSAFE_componentWillMount",
+        "Legacy.UNSAFE_componentWillReceiveProps",
+        "Legacy.UNSAFE_componentWillUpdate",
+        "Net.extra_repr",
+        "Net.get_extra_state",
+        "Net.set_extra_state",
+    ] {
+        let report = reports.iter().find(|r| r.symbol_name == hook);
+        assert!(
+            report.is_none_or(|r| r.is_exempt),
+            "the framework calls `{hook}`: {report:?}"
+        );
+    }
 }

@@ -277,3 +277,34 @@ fn generic_arguments_and_qualifiers_are_stripped_from_a_supertype() {
          supertype must be looked up by its last segment"
     );
 }
+
+/// A qualified JS/TS base keeps its qualifier, one segment per reference.
+///
+/// `React.Component` and `import { Component } from 'some-lib'` both reduced
+/// to a bare `Component`, so liveness could not tell React's class-component
+/// contract from a library type of the same name. Python's `attribute` base was
+/// already recorded per segment over one span, innermost first; a JS/TS
+/// `member_expression` now is too, and generic arguments stay out.
+#[test]
+fn a_qualified_js_base_is_recorded_per_segment_innermost_first() {
+    for path in ["W.ts", "W.tsx", "W.js"] {
+        let source = if path == "W.js" {
+            "class W extends React.Component { m() {} }\n"
+        } else {
+            "class W extends React.Component<Props> { m(): void {} }\n"
+        };
+        let extraction = extract_file(path, source);
+        let heritage: Vec<(&str, usize)> = extraction
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Heritage)
+            .map(|r| (r.name.as_str(), r.span.start_byte))
+            .collect();
+        let names: Vec<&str> = heritage.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, ["Component", "React"], "{path}: {heritage:?}");
+        assert_eq!(
+            heritage[0].1, heritage[1].1,
+            "{path}: one span, so the segments read back as one written base"
+        );
+    }
+}

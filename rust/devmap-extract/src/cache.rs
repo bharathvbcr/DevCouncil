@@ -607,7 +607,12 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// are indexed, the first with an entry point per registered component; and a
 /// `Package.swift` carries a `ModulePrivateScope` per executable target. A v80
 /// row keeps the old Rust keys and lacks every one of those facts.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "81";
+///
+/// v82 records a qualified JS/TS base (`extends React.Component`) one
+/// `Heritage` reference per segment, innermost first, as Python's dotted bases
+/// already were. A v81 row carries the bare `Component` alone, and liveness
+/// cannot tell React's class-component contract from a library namesake.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "82";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

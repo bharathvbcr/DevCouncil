@@ -842,7 +842,7 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // v81 is the dead-policy card's second pass (Rust/Kotlin/Swift keys,
     // receivers and module-privacy scopes; two more indexed manifests).
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "81",
+        EXTRACTION_SCHEMA_VERSION, "82",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

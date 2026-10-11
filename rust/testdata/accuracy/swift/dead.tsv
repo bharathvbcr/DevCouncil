@@ -19,3 +19,8 @@ exported_unreferenced	spm/Sources/DemoMain/Dial.swift::Dial.updateDrag	nothing c
 exported_unreferenced	spm/Sources/DemoMain/Dial.swift::DemoStyle	nothing applies it
 live	spm/Sources/DemoMain/Dial.swift::Dial.forwardSpan	P5: updateDrag calls it with implicit self (Dial.swift:7)
 exempt	spm/Sources/DemoMain/Dial.swift::DemoStyle.body	P6: ViewModifier requirement, called by SwiftUI
+# Third pass (2026-10-10): P7 `@objc` / `#selector` members of an executable target are never candidates.
+exported_unreferenced	spm/Sources/DemoMain/Tapper.swift::Tapper	nothing in DemoMain constructs it
+exported_unreferenced	spm/Sources/DemoMain/Tapper.swift::Tapper.register	nothing calls it
+exempt	spm/Sources/DemoMain/Tapper.swift::Tapper.onTap	P7: `#selector(onTap(_:))` (Tapper.swift:8), and `@objc` publishes it to the runtime
+exempt	spm/Sources/DemoMain/Tapper.swift::Tapper.onPing	P7: `@objc` publishes it to the Objective-C runtime, which invokes it by selector
