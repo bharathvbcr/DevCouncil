@@ -86,6 +86,14 @@ type rigorOutcome struct {
 	// the findings gates can run perfectly well on a change nobody measured.
 	coverageMeasured      bool
 	coverageSkippedReason string
+	// unavailable marks a skip that is the absence of the scanners rather
+	// than the absence of anything to scan: no dcverify, as opposed to an
+	// empty diff. Only the former makes an enforce run degraded.
+	unavailable bool
+	// degradedReasons are checks that ran with less than their full reach
+	// (stub detection on a file the syntax tree could not read). They do not
+	// block; they keep the run from being called verified.
+	degradedReasons []string
 }
 
 // rigorSkipped builds the outcome for a pass that did not happen.
@@ -119,10 +127,12 @@ func runRigorGates(ctx context.Context, in Input, taskID string, planned []strin
 	}
 
 	if in.Rigor == nil {
-		return rigorSkipped(
+		out := rigorSkipped(
 			"no dcverify binary configured; install it with `devcouncil install --only=dcverify` "+
 				"or point "+dcverify.BinaryEnv+" at a build",
 			coverageReason)
+		out.unavailable = true
+		return out
 	}
 	if in.DiffEmpty || strings.TrimSpace(in.DiffContent) == "" {
 		// Not a failure. The gates read added lines, and there are none.
@@ -166,8 +176,23 @@ func runRigorGates(ctx context.Context, in Input, taskID string, planned []strin
 		applied:          result.GatesRun(),
 		coverageMeasured: result.Coverage().Measured,
 	}
+	if len(result.StubASTDegraded) > 0 {
+		out.degradedReasons = append(out.degradedReasons, "stub detection read "+itoa(len(result.StubASTDegraded))+
+			" file(s) with the weaker line checks because the syntax tree could not analyse them: "+
+			strings.Join(result.StubASTDegraded, "; "))
+	}
 	if out.coverageMeasured {
-		out.gaps = append(out.gaps, gapsFromCoverage(taskID, result.Coverage())...)
+		cov := result.Coverage()
+		out.gaps = append(out.gaps, gapsFromCoverage(taskID, cov)...)
+		if len(cov.Unmeasured) > 0 {
+			// A profile that says nothing about a changed executable file has
+			// not measured the change. Reported as unmeasured, with the files
+			// named, rather than as a clean pass over the files it did cover.
+			out.coverageMeasured = false
+			out.coverageSkippedReason = "the coverage profile does not cover " + itoa(len(cov.Unmeasured)) +
+				" changed file(s): " + strings.Join(cov.Unmeasured, ", ") +
+				" (path not matched, or not part of the profiled run)"
+		}
 	} else {
 		out.coverageSkippedReason = coverageReason
 	}

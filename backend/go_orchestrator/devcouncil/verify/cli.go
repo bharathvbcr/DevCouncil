@@ -86,11 +86,17 @@ func RunCLI(ctx context.Context, root string, client *store.Client, taskID, gate
 			RigorSkippedReason: mcp.RigorSkippedReason,
 		}
 		entry := ToCLITask(id, gaps, meta)
+		// The verdict VerifyTask earned, which knows the run-level degraded
+		// reasons that meta (rebuilt from the payload) does not carry.
+		entry.Status, entry.DegradedReasons = mcp.Status, mcp.DegradedReasons
 		cli.Tasks = append(cli.Tasks, entry)
 		cli.ProcessedTasks++
 		cli.TotalGaps += entry.GapCount
 		if entry.Status == "blocked" {
 			cli.BlockedTasks++
+			cli.OK = false
+		} else if entry.Status == "degraded" {
+			cli.DegradedTasks++
 			cli.OK = false
 		} else if entry.VerificationSkipped {
 			cli.CompletedWithoutVerification++
@@ -103,7 +109,7 @@ func RunCLI(ctx context.Context, root string, client *store.Client, taskID, gate
 			return 1
 		}
 	} else {
-		console.Printf("verified=%d skipped=%d blocked=%d gaps=%d\n", cli.VerifiedTasks, cli.CompletedWithoutVerification, cli.BlockedTasks, cli.TotalGaps)
+		console.Printf("verified=%d skipped=%d blocked=%d degraded=%d gaps=%d\n", cli.VerifiedTasks, cli.CompletedWithoutVerification, cli.BlockedTasks, cli.DegradedTasks, cli.TotalGaps)
 		for _, t := range cli.Tasks {
 			console.Printf("  %s status=%s gaps=%d blocking=%d\n", t.TaskID, t.Status, t.GapCount, t.BlockingGapCount)
 		}

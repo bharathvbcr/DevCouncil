@@ -30,7 +30,11 @@ const (
 
 	binaryProbeBytes    = 8192
 	untrackedInputLimit = 8 * 1024 * 1024
-	untrackedFileLimit  = 4096
+	// gitReadLimit caps every git read get_diff makes. A diff past it is
+	// returned as Truncated; a listing past it is an error, because a partial
+	// file list would be read as the whole change.
+	gitReadLimit       = 32 << 20
+	untrackedFileLimit = 4096
 )
 
 // DiffFile is one path in a get_diff payload.
@@ -251,6 +255,16 @@ func gitDiff(ctx context.Context, root string, paths []string, staged bool) (Dif
 		}
 	}
 
+	for _, item := range []struct {
+		label string
+		out   gitOut
+	}{{"git diff --numstat", numOut}, {"git diff --name-status", nameOut}} {
+		if item.out.truncated {
+			return DiffResult{OK: false, Files: []DiffFile{}, Staged: staged,
+				Error: fmt.Sprintf("%s output exceeded %d bytes; narrow the requested paths", item.label, gitReadLimit)}, nil
+		}
+	}
+
 	statusByPath := parseNameStatusZ(nameOut.stdout)
 	files := make([]DiffFile, 0)
 	for _, line := range strings.Split(numOut.stdout, "\n") {
@@ -307,7 +321,7 @@ func gitDiff(ctx context.Context, root string, paths []string, staged bool) (Dif
 				known[path] = struct{}{}
 			}
 		}
-		uFiles, uDiff, uErr := collectUntracked(git, root, paths, known)
+		uFiles, uDiff, uErr := collectUntracked(ctx, git, root, paths, known)
 		if uErr != "" {
 			return DiffResult{OK: false, Files: []DiffFile{}, Staged: staged, Error: uErr}, nil
 		}
@@ -336,11 +350,11 @@ func gitDiff(ctx context.Context, root string, paths []string, staged bool) (Dif
 	}
 	unified, truncated := TruncateText(combined, DiffOutputLimit)
 	return DiffResult{
-		OK: true, Files: files, UnifiedDiff: unified, Truncated: truncated, Staged: staged,
+		OK: true, Files: files, UnifiedDiff: unified, Truncated: truncated || diffOut.truncated, Staged: staged,
 	}, nil
 }
 
-func collectUntracked(git *proc.GitSession, root string, paths []string, known map[string]struct{}) (files []DiffFile, unified string, failure string) {
+func collectUntracked(ctx context.Context, git *proc.GitSession, root string, paths []string, known map[string]struct{}) (files []DiffFile, unified string, failure string) {
 	held, err := os.OpenRoot(root)
 	if err != nil {
 		return nil, "", err.Error()
@@ -355,11 +369,15 @@ func collectUntracked(git *proc.GitSession, root string, paths []string, known m
 		args = append(args, "--")
 		args = append(args, paths...)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), DiffTimeout)
+	// The caller's context, so cancelling GetDiff reaches this read too.
+	ctx, cancel := context.WithTimeout(ctx, DiffTimeout)
 	defer cancel()
 	out, err := runGit(ctx, git, args...)
 	if err != nil && out.returnCode == 0 {
 		return nil, "", err.Error()
+	}
+	if out.truncated {
+		return nil, "", fmt.Sprintf("untracked listing exceeded %d bytes; narrow the requested paths", gitReadLimit)
 	}
 	if out.returnCode != 0 {
 		detail := strings.TrimSpace(out.stderr)
@@ -545,6 +563,8 @@ type gitOut struct {
 	stdout     string
 	stderr     string
 	returnCode int
+	// truncated is set when the read hit gitReadLimit: the output is a prefix.
+	truncated bool
 }
 
 // runGit runs a git read built by the operation's proc.GitSession: a git the
@@ -553,42 +573,17 @@ type gitOut struct {
 // that is missing, so callers report that git could not run rather than that
 // root is not a repository.
 func runGit(ctx context.Context, git *proc.GitSession, args ...string) (gitOut, error) {
-	cmd, err := git.Command(ctx, args...)
-	if err != nil {
-		return gitOut{stderr: err.Error(), returnCode: -1}, err
+	res, err := git.Run(ctx, gitReadLimit, args...)
+	out := gitOut{
+		stdout:     string(res.Stdout),
+		stderr:     string(res.Stderr),
+		returnCode: res.ExitCode,
+		truncated:  res.Truncated,
 	}
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	// Same bound as every other subprocess boundary in this module:
-	// CommandContext alone does not cover a wedged Start. Group isolation,
-	// so killing reaches grandchildren holding the pipes, is GitCommand's.
-	cmd.WaitDelay = 2 * time.Second
-	err, timedOut := proc.RunBounded(ctx, cmd.Run)
-	out := gitOut{stdout: stdout.String(), stderr: stderr.String()}
-	if timedOut {
-		out.returnCode = 124
-		if out.stderr == "" {
-			out.stderr = fmt.Sprintf("timed out after %s", RepoStateTimeout)
-		}
-		return out, ctx.Err()
+	if res.TimedOut && out.stderr == "" {
+		out.stderr = fmt.Sprintf("timed out after %s", RepoStateTimeout)
 	}
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded || isTimeout(err) {
-			out.returnCode = 124
-			if out.stderr == "" {
-				out.stderr = fmt.Sprintf("timed out after %s", RepoStateTimeout)
-			}
-			return out, err
-		}
-		if ee, ok := err.(*exec.ExitError); ok {
-			out.returnCode = ee.ExitCode()
-			return out, err
-		}
-		out.returnCode = -1
-		return out, err
-	}
-	return out, nil
+	return out, err
 }
 
 func isTimeout(err error) bool {
