@@ -10,7 +10,7 @@ use devmap_extract::model::*;
 use crate::model::*;
 
 mod gotypes;
-use gotypes::{GoCall, GoFileIndex, GoModel};
+use gotypes::{GoCall, GoFileIndex, GoModel, DISPATCH_FANOUT_CAP};
 use devmap_extract::tsconfig::TsProject;
 use devmap_extract::{GoModule, ProjectManifests};
 
@@ -3766,7 +3766,48 @@ impl Resolver {
                                     }));
                                     go_class = Some(UnresolvedClass::UnresolvedMember);
                                 }
-                                GoCall::Interface { .. } | GoCall::Pass => {}
+                                GoCall::Interface {
+                                    iface,
+                                    iface_file,
+                                    iface_symbol,
+                                    targets,
+                                } => {
+                                    // The interface method is a symbol: its direct
+                                    // callers are every call written against it.
+                                    let direct = Arc::new(Resolution::ReceiverType {
+                                        target_symbol: iface_symbol.clone(),
+                                        target_file: iface_file.clone(),
+                                        receiver_type: iface.name().to_string(),
+                                    });
+                                    // And every in-repo implementer is a possible
+                                    // runtime target. With none, the direct edge is
+                                    // the whole answer and the generic emission below
+                                    // writes it.
+                                    resolution = Some(match targets.filter(|t| !t.is_empty()) {
+                                        Some(targets) => {
+                                            let caller = call
+                                                .caller_symbol
+                                                .clone()
+                                                .unwrap_or_else(|| ext.file_path.clone());
+                                            edges.push(ResolvedEdge::resolved(
+                                                ext.file_path.clone(),
+                                                iface_file.clone(),
+                                                caller,
+                                                self.qualified_for(&iface_file, &iface_symbol),
+                                                EdgeKind::Calls,
+                                                direct,
+                                                None,
+                                            ));
+                                            Arc::new(Resolution::Dispatch {
+                                                candidates: targets.into(),
+                                                via_file: iface_file,
+                                                via_symbol: iface_symbol,
+                                            })
+                                        }
+                                        None => direct,
+                                    });
+                                }
+                                GoCall::Pass => {}
                             }
                         }
                     }
@@ -4330,6 +4371,42 @@ impl Resolver {
                                         emitted = true;
                                     }
                                 }
+                            }
+                            Resolution::Dispatch {
+                                candidates,
+                                via_symbol,
+                                ..
+                            } => {
+                                // One edge per implementing method, each carrying
+                                // the interface method it was reached through. Past
+                                // the cap: no edges, and one ledger row holding the
+                                // whole candidate list — the interface method's own
+                                // direct edge stays.
+                                let via = via_symbol.rsplit("::").next().unwrap_or(via_symbol);
+                                if candidates.len() > DISPATCH_FANOUT_CAP {
+                                    unresolved.push(UnresolvedReference {
+                                        source_file: ext.file_path.clone(),
+                                        source_symbol: caller_sym.clone(),
+                                        callee_name: call.callee_name.clone(),
+                                        kind: UnresolvedKind::Call,
+                                        resolution: (**resolution).clone(),
+                                        class: UnresolvedClass::Unresolved,
+                                        receiver: call.receiver_expr.clone(),
+                                    });
+                                } else {
+                                    for (target_f, target_sym) in candidates.iter() {
+                                        edges.push(ResolvedEdge::resolved(
+                                            ext.file_path.clone(),
+                                            target_f.clone(),
+                                            caller_sym.clone(),
+                                            self.qualified_for(target_f, target_sym),
+                                            EdgeKind::Calls,
+                                            Arc::clone(resolution),
+                                            Some(format!("via {via}")),
+                                        ));
+                                    }
+                                }
+                                emitted = true;
                             }
                             named => {
                                 if let Some((target_file, target_symbol)) = named.target() {

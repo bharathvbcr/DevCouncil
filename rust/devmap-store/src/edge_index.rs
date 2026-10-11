@@ -115,7 +115,8 @@ pub fn ambiguous_candidate_total(
 ) -> Option<i64> {
     match resolution? {
         devmap_resolve::model::Resolution::AmbiguousGlobal { candidates, .. }
-        | devmap_resolve::model::Resolution::LanguageServerDispatch { candidates, .. } => {
+        | devmap_resolve::model::Resolution::LanguageServerDispatch { candidates, .. }
+        | devmap_resolve::model::Resolution::Dispatch { candidates, .. } => {
             i64::try_from(candidates.len()).ok()
         }
         _ => None,
