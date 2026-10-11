@@ -97,6 +97,8 @@ mod reexported_module_surfaces;
 mod resolution_honesty;
 mod resolution_kind_is_one_owner;
 #[cfg(feature = "parse")]
+mod resolution_walks_terminate;
+#[cfg(feature = "parse")]
 mod ruby_attributes_are_methods;
 #[cfg(feature = "parse")]
 mod rust_accuracy_core;

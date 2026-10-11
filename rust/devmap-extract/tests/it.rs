@@ -109,6 +109,8 @@ mod safe_fs_controls;
 mod sql_check_constraint_parse;
 #[cfg(feature = "parse")]
 mod stress_hardening;
+#[cfg(feature = "parse")]
+mod swift_scope_terminates;
 mod swift_targets_collect;
 #[cfg(feature = "parse")]
 mod test_phase2_hardening;
