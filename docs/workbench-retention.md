@@ -57,3 +57,28 @@ were eligible. The 100,000-task stress variant (`BenchmarkWorkbenchProfileStress
 not run. List and search latency is independent of history size here, so retention is
 about disk growth and history paging, not list latency at this scale (inferred from the
 unchanged query plans, not separately measured on a compacted fixture).
+
+## Scale behaviour (hx/w4-store-scale)
+
+- `repositories.get` takes `identity_key` instead of `id` (exactly one) and answers from
+  the UNIQUE index: a host that knows a repository only by identity asks once.
+- `items.history` takes `newest_first` (with `before_revision` as its cursor; mixing it
+  with `after_revision` is refused), so the latest revision is one `limit:1` request.
+- A receipt keeps `{ok, sequence, replay:"event", automatic_enhancement_queued}` and a
+  replay rebuilds the response from the event it names, so a record body is stored in the
+  row, `work_revisions` and `work_events` but no longer a fourth time in `work_requests`.
+  Receipts written by older builds keep their full response and replay unchanged. A
+  receipt whose event is gone answers `receipt_unreadable` (retention deletes receipts
+  first, so this means the profile was edited by hand). An older build reading a newer
+  receipt would replay the short form: upgrade every host sharing a profile together.
+- `events.list` and `items.history` no longer run an unbounded `count(*)` per page. A last
+  page is exact without a count; otherwise the count stops at 10,000 and `total_exact`
+  says whether `total` is a floor.
+- A profile created by this build is `auto_vacuum=INCREMENTAL`; `store.compact` then runs
+  `incremental_vacuum(limit)` and reports `vacuum.{incremental,free_pages_before,free_pages_after}`.
+  SQLite cannot change the mode of a file that already has tables without a full `VACUUM`,
+  so existing profiles report `incremental:false` and keep their size until that is run.
+- Measured by `cargo test -p dc-store --release --test workbench_scale_bench -- --ignored --nocapture`
+  (5,000 repositories, one task with 5,000 4 KB revisions, Apple silicon, min of 5):
+  find by identity 34.8 ms / 23 requests before, 0.05 ms / 1 after; last revision 115.6 ms /
+  25 requests before, 0.21 ms / 1 after; receipt 77 bytes instead of body plus envelope.
