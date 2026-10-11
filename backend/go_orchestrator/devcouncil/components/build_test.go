@@ -116,7 +116,7 @@ func TestAnUnhealthyBuildInstallsNothingAndKeepsTheOldBinaries(t *testing.T) {
 			t.Fatalf("%s = %q, want %q", path, got, want)
 		}
 	}
-	if st := LoadState(prefix); len(st.Installed) != 0 {
+	if st, _ := LoadState(prefix); len(st.Installed) != 0 {
 		t.Fatalf("receipt records an install that did not happen: %+v", st.Installed)
 	}
 }
@@ -293,7 +293,7 @@ func TestAPartialInstallRecordsWhatItPutOnDisk(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "install dcverify") {
 		t.Fatalf("err = %v", err)
 	}
-	st := LoadState(prefix)
+	st, _ := LoadState(prefix)
 	if _, ok := st.Installed["dcstore"]; !ok || len(st.Installed) != 1 {
 		t.Fatalf("receipt = %+v, want exactly dcstore", st.Installed)
 	}

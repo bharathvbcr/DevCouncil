@@ -182,7 +182,7 @@ func WriteAtomic(path string, content []byte, perm fs.FileMode) error {
 		_ = os.Remove(tmpName)
 		return err
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+	if err := renameFile(tmpName, path); err != nil {
 		_ = os.Remove(tmpName)
 		return err
 	}
@@ -192,8 +192,10 @@ func WriteAtomic(path string, content []byte, perm fs.FileMode) error {
 	return syncDir(dir)
 }
 
-// syncFile and syncDir are variables so a test can make a durability step fail.
+// syncFile, syncDir and renameFile are variables so a test can make a
+// durability or publish step fail.
 var (
+	renameFile = os.Rename
 	syncFile = func(f *os.File) error { return f.Sync() }
 	syncDir  = syncDirectory
 )

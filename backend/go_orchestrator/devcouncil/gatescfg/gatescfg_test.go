@@ -189,3 +189,37 @@ func TestSetVerificationModeCreatesStub(t *testing.T) {
 	}
 	_ = snap
 }
+
+func TestSetVerificationModeNeverShowsReadersAMissingConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("gates:\n  mode: enforce\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	missing := make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := os.ReadFile(path); err != nil {
+				missing <- err
+				return
+			}
+		}
+	}()
+	for i := 0; i < 200; i++ {
+		mode := []string{"enforce", "advisory"}[i%2]
+		if err := SetVerificationMode(path, mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(stop)
+	select {
+	case err := <-missing:
+		t.Fatalf("a reader saw the config vanish mid-write: %v", err)
+	default:
+	}
+}

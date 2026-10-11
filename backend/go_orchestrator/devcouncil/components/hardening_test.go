@@ -27,7 +27,7 @@ func TestDryRunUninstallDoesNotRemoveDevSymlink(t *testing.T) {
 	if err := os.Symlink("devcouncil", dev); err != nil {
 		t.Fatal(err)
 	}
-	st := LoadState(prefix)
+	st, _ := LoadState(prefix)
 	st.Record("host", host)
 	if err := SaveState(st); err != nil {
 		t.Fatal(err)
@@ -53,7 +53,7 @@ func TestUninstallRefusesReceiptOutsidePrefix(t *testing.T) {
 	if err := os.WriteFile(outside, []byte("keep"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	st := LoadState(prefix)
+	st, _ := LoadState(prefix)
 	st.Record("devmap", outside)
 	if err := SaveState(st); err != nil {
 		t.Fatal(err)
@@ -80,7 +80,7 @@ func TestUninstallRefusesDotDotReceipt(t *testing.T) {
 	if err := os.WriteFile(victim, []byte("keep"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	st := LoadState(prefix)
+	st, _ := LoadState(prefix)
 	st.Record("dcgrep", filepath.Join(bindir, "..", "..", filepath.Base(t.TempDir()), "nope"))
 	// Point the receipt at victim via .. after a fake join that cleans to outside.
 	st.Installed["dcgrep"] = InstallRec{Binary: victim, At: "now"}
@@ -110,7 +110,7 @@ func TestUninstallDoesNotRemoveDirectoryNamedLikeBinary(t *testing.T) {
 	if err := os.WriteFile(marker, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	st := LoadState(prefix)
+	st, _ := LoadState(prefix)
 	st.Record("devmap", dir)
 	if err := SaveState(st); err != nil {
 		t.Fatal(err)
@@ -137,7 +137,10 @@ func TestCorruptStateDoesNotKeepPartialMaps(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"version":1,"installed":{"devmap":{"binary":"/tmp/x"},"dc`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	st := LoadState(prefix)
+	st, err := LoadState(prefix)
+	if err == nil {
+		t.Fatal("a corrupt receipt loaded as if it were empty")
+	}
 	if len(st.Installed) != 0 {
 		t.Fatalf("corrupt JSON leaked installed=%v", st.Installed)
 	}
@@ -155,7 +158,7 @@ func TestLoadStateMergesLegacyDisabledFile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "disabled"), []byte("devmap\nuv\ndevmap\n*\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	st := LoadState(prefix)
+	st, _ := LoadState(prefix)
 	if !st.IsDisabled("devmap") {
 		t.Fatal("legacy disabled file was ignored")
 	}
@@ -165,7 +168,7 @@ func TestLoadStateMergesLegacyDisabledFile(t *testing.T) {
 	if err := SaveState(st); err != nil {
 		t.Fatal(err)
 	}
-	st2 := LoadState(prefix)
+	st2, _ := LoadState(prefix)
 	if !st2.IsDisabled("devmap") {
 		t.Fatal("merged disable did not round-trip")
 	}
@@ -228,7 +231,7 @@ func TestInstallSavesHostReceiptIfRustFails(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected rust failure")
 	}
-	st := LoadState(prefix)
+	st, _ := LoadState(prefix)
 	if _, ok := st.Installed["host"]; !ok {
 		t.Fatalf("host succeeded but receipt was dropped: %+v", st.Installed)
 	}
@@ -243,7 +246,7 @@ func TestConcurrentSaveStateLeavesValidJSON(t *testing.T) {
 		id := ids[i%len(ids)]
 		go func() {
 			defer wg.Done()
-			st := LoadState(prefix)
+			st, _ := LoadState(prefix)
 			st.Record(id, filepath.Join(prefix, "bin", id))
 			_ = SaveState(st)
 		}()
@@ -289,4 +292,29 @@ func (f *failingRunner) Run(name string, args []string, dir string, env []string
 		return os.ErrPermission
 	}
 	return nil
+}
+
+func TestCorruptReceiptIsNeverOverwrittenByDisableEnableOrInstall(t *testing.T) {
+	prefix := t.TempDir()
+	path := filepath.Join(prefix, "share", "devcouncil", "components.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	corrupt := []byte(`{"version":1,"installed":{"devmap":{"binary":"/tmp/x"},"dc`)
+	if err := os.WriteFile(path, corrupt, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	o := Options{Prefix: prefix}
+	for name, run := range map[string]func() error{
+		"disable":   func() error { return Disable("devmap", o) },
+		"enable":    func() error { return Enable("devmap", o) },
+		"uninstall": func() error { return Uninstall(nil, o) },
+	} {
+		if err := run(); err == nil {
+			t.Errorf("%s ran over a corrupt receipt without an error", name)
+		}
+		if got, _ := os.ReadFile(path); string(got) != string(corrupt) {
+			t.Fatalf("%s rewrote the corrupt receipt: %q", name, got)
+		}
+	}
 }

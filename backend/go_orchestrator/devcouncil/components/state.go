@@ -2,12 +2,17 @@ package components
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/safefile"
 )
 
 var saveMu sync.Mutex
@@ -44,25 +49,32 @@ func emptyState(prefix string) State {
 	}
 }
 
-func LoadState(prefix string) State {
+// LoadState reads the receipt. A missing receipt is an empty state. A receipt
+// that exists but cannot be read or parsed is an error: every caller goes on
+// to SaveState, and saving an empty stand-in over a corrupt file would erase
+// the record of every other component. The returned State is still safe to
+// read (empty) so a caller that only reports can show it beside the error.
+func LoadState(prefix string) (State, error) {
 	st := emptyState(prefix)
 	data, err := os.ReadFile(statePath(prefix))
-	if err == nil {
+	switch {
+	case err == nil:
 		var parsed State
-		if json.Unmarshal(data, &parsed) != nil {
-			// Corrupt receipt: refuse the partial map rather than keep it.
+		if err := json.Unmarshal(data, &parsed); err != nil {
 			st.Disabled = mergeDisabled(prefix, nil)
-			return st
+			return st, fmt.Errorf("components receipt %s is corrupt (%w); fix or remove it, nothing was changed", statePath(prefix), err)
 		}
 		if parsed.Installed != nil {
 			st.Installed = parsed.Installed
 		}
 		st.Disabled = parsed.Disabled
+	case !errors.Is(err, fs.ErrNotExist):
+		return st, fmt.Errorf("components receipt %s is unreadable: %w", statePath(prefix), err)
 	}
 	st.Disabled = mergeDisabled(prefix, st.Disabled)
 	st.Prefix = prefix
 	st.Version = stateVersion
-	return st
+	return st, nil
 }
 
 func mergeDisabled(prefix string, jsonIDs []string) []string {
@@ -110,52 +122,14 @@ func SaveState(st State) error {
 		return err
 	}
 	data = append(data, '\n')
-	if err := writeAtomicFile(statePath(st.Prefix), data, 0o644); err != nil {
+	if err := safefile.WriteAtomic(statePath(st.Prefix), data, 0o644); err != nil {
 		return err
 	}
 	body := strings.Join(st.Disabled, "\n")
 	if body != "" {
 		body += "\n"
 	}
-	return writeAtomicFile(disabledTextPath(st.Prefix), []byte(body), 0o644)
-}
-
-func writeAtomicFile(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	f, err := os.CreateTemp(dir, ".tmp-*")
-	if err != nil {
-		return err
-	}
-	tmp := f.Name()
-	ok := false
-	defer func() {
-		if !ok {
-			_ = os.Remove(tmp)
-		}
-	}()
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := f.Chmod(perm); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return err
-	}
-	ok = true
-	return nil
+	return safefile.WriteAtomic(disabledTextPath(st.Prefix), []byte(body), 0o644)
 }
 
 func (st *State) Record(id, binary string) {

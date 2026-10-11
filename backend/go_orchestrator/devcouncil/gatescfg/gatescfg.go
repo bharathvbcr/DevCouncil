@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/flags"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/safefile"
 )
 
 const (
@@ -128,58 +129,17 @@ func SetVerificationMode(path, mode string) error {
 		// key Load above names as retired and nothing reads — so every new
 		// config was born carrying a setting for a gate that does not exist.
 		body := "gates:\n  mode: " + canonical + "\n"
-		return writeAtomicFile(path, []byte(body), 0o644)
+		return safefile.WriteAtomic(path, []byte(body), 0o644)
 	}
 	updated, err := patchYAMLKey(string(data), "gates", "mode", canonical)
 	if err != nil {
 		return err
 	}
-	return writeAtomicFile(path, []byte(updated), 0o644)
+	return safefile.WriteAtomic(path, []byte(updated), 0o644)
 }
 
 func patchYAMLKey(src, section, key, value string) (string, error) {
 	return patchNestedYAML(src, []string{section}, key, value)
-}
-
-func writeAtomicFile(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	f, err := os.CreateTemp(dir, ".cfg-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmp := f.Name()
-	ok := false
-	defer func() {
-		if !ok {
-			_ = os.Remove(tmp)
-		}
-	}()
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := f.Chmod(perm); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(path)
-		if err := os.Rename(tmp, path); err != nil {
-			return err
-		}
-	}
-	ok = true
-	return nil
 }
 
 func patchNestedYAML(src string, sections []string, key, value string) (string, error) {
