@@ -9,7 +9,7 @@
 # .github/workflows/rust.yml and analysis-plane.yml, fix what the new release
 # flags, then update `rust-version` in rust/Cargo.toml and
 # rust/dc-sparse-encode/Cargo.toml to the same minor. See the release
-# checklist in docs/releases/README.md.
+# checklist in docs/workflow.md ("Bumping the pinned toolchains").
 [toolchain]
 channel = "1.99.0"
 profile = "minimal"
