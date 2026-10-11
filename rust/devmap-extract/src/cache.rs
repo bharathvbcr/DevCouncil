@@ -605,7 +605,14 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// of the resolver's Go type evaluator. Two lanes each stamped 81 on these
 /// different payloads; the later one is 82, so no two extractions share a
 /// version.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "82";
+///
+/// v83 records the TypeScript lane's extraction: the workspace-package map
+/// (`workspaces.rs`), member-qualified ids for class-field and object-literal
+/// members (`store.ts::paperService.fetchOne`, not `store.ts::fetchOne`), and
+/// `export default` as an export named `default`. That lane changed what a
+/// TypeScript file extracts to without stamping a version, so a v82 row would
+/// keep serving the old ids.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "83";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
