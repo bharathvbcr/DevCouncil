@@ -1946,16 +1946,16 @@ impl Resolver {
         // `f()?` / `m::f()?` — a free function's value, not an associated
         // function's. The last path segment before the name is a module (or
         // absent) rather than a capitalised type.
-        let names_a_type = call
-            .rsplit_once("::")
-            .is_some_and(|(owner, _)| {
-                owner
-                    .rsplit("::")
-                    .next()
-                    .is_some_and(|last| last.starts_with(|ch: char| ch.is_ascii_uppercase()))
-            });
+        let names_a_type = call.rsplit_once("::").is_some_and(|(owner, _)| {
+            owner
+                .rsplit("::")
+                .next()
+                .is_some_and(|last| last.starts_with(|ch: char| ch.is_ascii_uppercase()))
+        });
         if !names_a_type {
-            if !call.contains("::") && scope.is_some_and(|scope| self.scope_declares_local(file, scope, call)) {
+            if !call.contains("::")
+                && scope.is_some_and(|scope| self.scope_declares_local(file, scope, call))
+            {
                 return None;
             }
             let (callee_file, callee) = self.rust_called_function(file, scope, call)?;
@@ -3356,11 +3356,9 @@ impl Resolver {
                             .trim_end_matches(".*");
                         let whole = dotted.replace('.', "/");
                         jvm_package_dirs.contains(&whole)
-                            || dotted
-                                .rsplit_once('.')
-                                .is_some_and(|(package, _)| {
-                                    jvm_package_dirs.contains(&package.replace('.', "/"))
-                                })
+                            || dotted.rsplit_once('.').is_some_and(|(package, _)| {
+                                jvm_package_dirs.contains(&package.replace('.', "/"))
+                            })
                     }
                     _ => false,
                 }
@@ -6076,7 +6074,11 @@ impl Resolver {
         } else {
             String::new()
         };
-        let key = (family, name.to_string(), format!("{view}|{}", u8::from(caller_in_type)));
+        let key = (
+            family,
+            name.to_string(),
+            format!("{view}|{}", u8::from(caller_in_type)),
+        );
         let mut cache = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -6098,7 +6100,9 @@ impl Resolver {
                 && (!Self::family_needs_explicit_receiver(family)
                     || self.declared_at_file_level(path, identity))
                 && self.candidate_is_visible_from(family, file, path, identity)
-                && (caller_in_type || *kind != SymbolKind::Method || !Self::method_needs_a_type_scope(family))
+                && (caller_in_type
+                    || *kind != SymbolKind::Method
+                    || !Self::method_needs_a_type_scope(family))
             {
                 let bytes =
                     (std::mem::size_of::<(String, String)>() + path.len() + identity.len()) as u64;
@@ -6133,7 +6137,10 @@ impl Resolver {
     /// non-exported TS/JS module binding outside its module, and a non-`pub`
     /// Rust item outside its crate.
     fn visibility_is_enforced(family: LangFamily) -> bool {
-        matches!(family, LangFamily::Swift | LangFamily::JsTs | LangFamily::Rust)
+        matches!(
+            family,
+            LangFamily::Swift | LangFamily::JsTs | LangFamily::Rust
+        )
     }
 
     /// Whether a JS/TS file is a module, so that an un-exported top-level
@@ -6168,7 +6175,8 @@ impl Resolver {
         {
             return true;
         }
-        family == LangFamily::Rust && Self::rust_crate_src_root(file) == Self::rust_crate_src_root(path)
+        family == LangFamily::Rust
+            && Self::rust_crate_src_root(file) == Self::rust_crate_src_root(path)
     }
 
     /// Languages whose method is reachable by a bare name only from inside a
@@ -6935,7 +6943,10 @@ impl Resolver {
     ) -> bool {
         receiver == Some("self")
             && caller
-                .and_then(|caller| self.symbol_parents.get(&(file.to_string(), caller.to_string())))
+                .and_then(|caller| {
+                    self.symbol_parents
+                        .get(&(file.to_string(), caller.to_string()))
+                })
                 .is_some_and(|parent| parent != file)
     }
 
@@ -8665,7 +8676,13 @@ impl Resolver {
 
     /// Whether a directory inserted into `sys.path` before `at` holds a file for
     /// `module` other than the ones ordinary resolution found (`found`).
-    fn sys_path_shadows(&self, ext: &Extraction, at: usize, module: &str, found: &[String]) -> bool {
+    fn sys_path_shadows(
+        &self,
+        ext: &Extraction,
+        at: usize,
+        module: &str,
+        found: &[String],
+    ) -> bool {
         let Some(search) = self.py_search_dirs.get(&ext.file_path) else {
             return false;
         };
@@ -8703,7 +8720,12 @@ impl Resolver {
             // holds a *different* file for the module outranks the ordinary
             // rule at run time, so the ordinary answer may be the wrong
             // module. Abstain rather than bind it confidently.
-            return if self.sys_path_shadows(ext, imp.span.start_byte, &imp.module_specifier, &targets) {
+            return if self.sys_path_shadows(
+                ext,
+                imp.span.start_byte,
+                &imp.module_specifier,
+                &targets,
+            ) {
                 Vec::new()
             } else {
                 targets
@@ -8974,8 +8996,7 @@ impl Resolver {
                         .get(&ext.file_path)
                         .is_some_and(|bindings| bindings.contains_key(receiver)));
             if bare_root_is_free {
-                if let Some(found) =
-                    self.rust_qualified_call(&ext.file_path, receiver, name, true)
+                if let Some(found) = self.rust_qualified_call(&ext.file_path, receiver, name, true)
                 {
                     if let Some((target_file, target_symbol)) = found.target() {
                         return Some(self.reference_edge(
@@ -9809,7 +9830,14 @@ impl Resolver {
             .flat_map(|set| set.roots.iter().map(String::as_str))
             .collect();
         let first = py_path.split('/').next().unwrap_or(py_path);
-        if let Some(parents) = self.py_package_parents.get(first) {
+        // The standard library owns its names: a repository directory called
+        // `logging` is not evidence about `import logging`, so the fallback
+        // abstains for them like it does for a name two directories hold.
+        if let Some(parents) = self
+            .py_package_parents
+            .get(first)
+            .filter(|_| !crate::builtins::is_python_stdlib_module(first))
+        {
             // Held by two directories, it names neither: abstain.
             if parents.len() == 1 {
                 roots.extend(parents.iter().map(String::as_str));

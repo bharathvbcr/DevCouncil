@@ -118,6 +118,29 @@ fn a_manifest_governs_only_its_own_directory() {
     );
 }
 
+/// The no-manifest fallback places an import from the one directory that holds a
+/// package of that name. A directory called `logging`, `json` or `typing` is
+/// not evidence about `import logging`: the standard library owns the name, so
+/// the fallback abstains for it, exactly as it does for a name two directories
+/// hold. (The positive control is the test below, same shape, a non-stdlib name.)
+#[test]
+fn a_repo_directory_named_like_a_stdlib_module_does_not_capture_its_import() {
+    for name in ["logging", "json", "typing", "collections", "os"] {
+        let init = format!("python/{name}/__init__.py");
+        let util = format!("python/{name}/util.py");
+        let source = format!("from {name}.util import split\n");
+        let resolution = resolve(&[
+            (init.as_str(), ""),
+            (util.as_str(), UTIL),
+            ("tests/test_u.py", source.as_str()),
+        ]);
+        assert!(
+            !imports(&resolution, "tests/test_u.py", &util),
+            "a repository directory named `{name}` captured `from {name}.util import ..`"
+        );
+    }
+}
+
 #[test]
 fn the_one_directory_holding_a_package_places_it_without_a_manifest() {
     let resolution = resolve(&[
