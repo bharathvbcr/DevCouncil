@@ -1383,7 +1383,7 @@ fn compose_write_blast(root: &Path, payload: &Value, budget: Duration) -> Option
         } else {
             format!("{path}:{start}-{end}")
         };
-        let report = dc_regress::blast::blast_change_with_program(
+        let report = dc_regress::blast::blast_change_bounded(
             std::ffi::OsStr::new("git"),
             root,
             &graph,
@@ -1391,6 +1391,7 @@ fn compose_write_blast(root: &Path, payload: &Value, budget: Duration) -> Option
             &label_at,
             &until,
             dc_regress::DEFAULT_BLAST_DEPTH,
+            &dc_regress::Budget::within(budget.saturating_sub(started.elapsed())),
         );
         parts.push(format_blast_for_hook(&report));
     }

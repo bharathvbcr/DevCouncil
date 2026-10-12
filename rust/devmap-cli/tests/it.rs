@@ -27,6 +27,7 @@ mod api_views_are_honest;
 mod ast_reports_its_own_totals;
 mod binary_digests_are_memoised;
 mod blast_names_what_a_change_reaches;
+mod blast_reads_once_and_names_every_path;
 mod build_lsp_opt_in;
 mod caller_assets_over_stdin;
 mod claude_integration;
