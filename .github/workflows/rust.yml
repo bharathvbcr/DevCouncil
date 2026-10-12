@@ -141,7 +141,7 @@ jobs:
           cargo build -p devmap-cli --example worktree_stress --example ipc_probe
           "target/debug/examples/worktree_stress$suffix" --binary "target/debug/devmap$suffix" --ipc-probe "target/debug/examples/ipc_probe$suffix" --worktrees 2 --fixture-files 4 --rounds 1 --build-workers 2 --output capacity-smoke.json
           "target/debug/examples/worktree_stress$suffix" --binary "target/debug/devmap$suffix" --ipc-probe "target/debug/examples/ipc_probe$suffix" --worktrees 128 --fixture-files 64 --rounds 4 --build-workers 8 --output capacity-native.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: ${{ always() }}
         with:
           name: capacity-${{ matrix.os }}
