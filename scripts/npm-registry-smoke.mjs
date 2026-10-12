@@ -4,6 +4,8 @@
  *
  * Waits until the tagged version is visible on the npm registry, installs it
  * into a clean temp prefix, and verifies `devcouncil --help` / `dev version`.
+ * A launcher that cannot find the host binary is NOT RUN (exit 2), never a
+ * pass; a launcher that fails otherwise is FAIL (exit 1).
  *
  * Usage:
  *   node scripts/npm-registry-smoke.mjs [--version 0.4.1] [--timeout-sec 600]
@@ -18,6 +20,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { classifyLauncher, exitCodeFor, overallVerdict } from "./npm-registry-smoke-checks.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
@@ -127,35 +130,25 @@ async function main() {
     assertOk(install, `npm install -g ${packageName}@${version}`);
 
     const binDir = path.join(prefix, "bin");
-    const help = run(path.join(binDir, "devcouncil"), ["--help"], {
-      env: { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}` },
-    });
-    const helpText = `${help.stdout || ""}${help.stderr || ""}`;
-    if (help.status === 0) {
-      if (!helpText.trim()) {
-        throw new Error("devcouncil --help produced empty output");
-      }
+    const env = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}` };
+    const results = [
+      classifyLauncher("devcouncil --help", run(path.join(binDir, "devcouncil"), ["--help"], { env })),
+      classifyLauncher("dev version", run(path.join(binDir, "dev"), ["version"], { env })),
+    ];
+    for (const r of results) {
+      console.log(`${r.verdict.padEnd(7)} ${r.label}${r.detail ? `: ${r.detail}` : ""}`);
+    }
+    const verdict = overallVerdict(results);
+    if (verdict === "PASS") {
+      console.log(`registry smoke passed for ${packageName}@${version}`);
+    } else if (verdict === "NOT RUN") {
+      console.error(
+        `registry smoke NOT RUN for ${packageName}@${version}: the package installed, but the launcher reached no host binary, so nothing behind it was exercised. This is not a pass.`,
+      );
     } else {
-      if (!/devcouncil binary not found|requires the devcouncil binary/i.test(helpText)) {
-        throw new Error(
-          `devcouncil --help failed without naming the missing Go binary\n${helpText}`,
-        );
-      }
+      console.error(`registry smoke FAILED for ${packageName}@${version}`);
     }
-
-    const versionCmd = run(path.join(binDir, "dev"), ["version"], {
-      env: { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}` },
-    });
-    const versionOut = `${versionCmd.stdout || ""}${versionCmd.stderr || ""}`;
-    if (versionCmd.status === 0) {
-      if (!versionOut.includes(version.split(".")[0])) {
-        console.warn(`warning: version output did not clearly include ${version}: ${versionOut}`);
-      }
-    } else if (!/devcouncil binary not found|requires the devcouncil binary/i.test(versionOut)) {
-      throw new Error(`dev version failed unexpectedly\n${versionOut}`);
-    }
-
-    console.log(`registry smoke passed for ${packageName}@${version}`);
+    process.exitCode = exitCodeFor(verdict);
   } finally {
     rmSync(prefix, { recursive: true, force: true });
   }

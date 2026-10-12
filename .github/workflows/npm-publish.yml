@@ -100,6 +100,52 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+  # `npm publish` leaves `latest` wherever the registry's tag logic puts it;
+  # a higher withdrawn version can keep it. Assert it, set it if wrong, and
+  # fail the job unless the registry then agrees. Runs whether or not this
+  # run published, so a re-run repairs a tag. Pre-releases are not `latest`.
+  latest:
+    name: Assert dist-tag latest
+    runs-on: ubuntu-latest
+    needs: publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+      - name: Point latest at the released version
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          case "$VERSION" in
+            *-*) echo "::notice::${VERSION} is a pre-release; dist-tags.latest is not asserted"; exit 0;;
+          esac
+          npm ping
+          VIEWED="$(npm view "devcouncil@${VERSION}" version)"
+          if [ "$VIEWED" != "$VERSION" ]; then
+            echo "::error::devcouncil@${VERSION} is not on the registry (npm view said: ${VIEWED:-nothing})"
+            exit 1
+          fi
+          LATEST="$(npm view devcouncil dist-tags.latest)"
+          if [ "$LATEST" != "$VERSION" ]; then
+            echo "::warning::dist-tags.latest is ${LATEST:-unset}, not ${VERSION}; moving it"
+            npm dist-tag add "devcouncil@${VERSION}" latest
+          fi
+          # The registry can lag a tag write; poll before calling it a failure.
+          for attempt in 1 2 3 4 5 6; do
+            LATEST="$(npm view devcouncil dist-tags.latest)"
+            [ "$LATEST" = "$VERSION" ] && { echo "dist-tags.latest = ${VERSION}"; exit 0; }
+            sleep $((attempt * 5))
+          done
+          echo "::error::dist-tags.latest is ${LATEST:-unset} after the update, expected ${VERSION}"
+          exit 1
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
   smoke:
     name: Registry smoke
     runs-on: ubuntu-latest

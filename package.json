@@ -52,7 +52,7 @@
     "agents:sync": "node scripts/sync-agent-defs.mjs",
     "agents:check": "node scripts/sync-agent-defs.mjs --check",
     "agents:prefixes": "node scripts/mcp-served-tools.mjs",
-    "test:scripts": "node --test scripts/check-workflows.test.mjs scripts/sync-agent-defs.test.mjs scripts/ci-local.test.mjs",
+    "test:scripts": "node --test scripts/check-workflows.test.mjs scripts/sync-agent-defs.test.mjs scripts/ci-local.test.mjs scripts/npm-registry-smoke-checks.test.mjs",
     "ci:local": "node scripts/ci-local.mjs"
   },
   "engines": {

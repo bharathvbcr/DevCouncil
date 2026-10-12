@@ -46,6 +46,13 @@ and runs `devcouncil install` with the same arguments, so
 selection and `--dry-run`. Once the host is on PATH, run `devcouncil install`
 directly. Without Go, install DevMap alone with
 `cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked devmap-cli`.
+The host installs only from a checkout. Outside one, `devcouncil install` (the
+default preset includes the host) exits 2 and names
+`git clone https://github.com/bharathvbcr/DevCouncil.git` and
+`devcouncil install --src <dir>`; `--src` points the installer at a clone from
+any working directory. There is no `go install` route (the host links the
+Gusset engine through cgo), and the npm package is only a launcher for a host
+you built.
 After installing from a checkout, the installer checks the schema consumers.
 DevCouncil owns the devmap store, dc-store and workbench schemas, and GitPulse,
 Manvi and Jarvis each read them through binaries or pins that can fall behind.
