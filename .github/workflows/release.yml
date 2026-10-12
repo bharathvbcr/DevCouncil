@@ -66,7 +66,7 @@ jobs:
           node-version: "20"
       # The gate is cmd/dcrelease, a standard-library Go command: it needs Go
       # but not the Gusset checkout the host binary links.
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: backend/go_orchestrator/go.mod
           cache-dependency-path: backend/go_orchestrator/go.mod
@@ -276,7 +276,7 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: backend/go_orchestrator/go.mod
           cache-dependency-path: backend/go_orchestrator/go.mod
