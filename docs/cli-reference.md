@@ -43,7 +43,7 @@ without executing it. `devmap repair --fts --pending --page-size --json`
 returns one combined receipt; `--schema` remains exclusive. Raw GraphML
 (`devmap export --out -`) cannot also request `--json`.
 
-See [CLI presentation audit](CLI_PRESENTATION_AUDIT.md) for reproductions,
+See [CLI presentation audit](archive/CLI_PRESENTATION_AUDIT.md) for reproductions,
 verification commands, measured coverage, and platform limits.
 
 ---
@@ -152,7 +152,7 @@ Compound/custom hook commands whose ownership cannot be proven are preserved.
 Plugin caches and Git map-refresh hooks are outside this lifecycle cleanup scope.
 Reload the host session to discard cached registrations. `dev hook enable` reports
 that lifecycle hooks are retired. DevMap's separate hooks remain available for
-index maintenance. See [the migration audit](hook-migration-audit.md) for test
+index maintenance. See [the migration audit](archive/hook-migration-audit.md) for test
 coverage and remaining platform limits.
 
 ### Agent Skills Distribution
@@ -295,7 +295,7 @@ With Phase 7 and the transition to native Go and Rust binaries, legacy Python CL
 | `dev plan` / `dev approve` | Multi-agent LLM debate & tasks | Managed by upstream agent harnesses (e.g. **Manvi**) or interactive prompts. |
 | `dev run` / `dev e2e` / `dev go` | Python subprocess coding agent runner | Run agents natively via MCP (**Hero Loop**) or via **Manvi**. |
 | `dev prompt` / `dev handoff` | Formatted text prompt generation | Handled over MCP via task checkout contexts and skills. |
-| `dev status` / `dev checkout` / `dev tasks` / `dev doctor` | Python orientation and lease bootstrap | Go unknown command (exit 2). Policy `NoTaskAllowedCommands` still allowlists them (TASK-P7-9). Use `devcouncil mcp` tools / `devmap status` / `devmap doctor`. |
+| `dev status` / `dev checkout` / `dev tasks` / `dev doctor` | Python orientation and lease bootstrap | Go unknown command (exit 2). Policy `NoTaskAllowedCommands` no longer allowlists them (TASK-P7-9; `policy/command.go` admits only `git status`, `git diff`, `echo`, `true`, `:` and `dev map`, held to the dispatch table by `TestPolicyNamesOnlyLiveCommands`). Use `devcouncil mcp` tools / `devmap status` / `devmap doctor`. |
 | `dev check` / `dev check --verify` | Python LLM audit / demo check | Use `devcouncil verify TASK_ID --mode enforce --json` for an existing task, or `dcverify`. |
 | `dev wiki` / `dev okf` / `dev design` | Markdown wiki & OKF bundle generator | Managed guides are available with `devmap build --manifest --guides`; they do not replace the full wiki/OKF feature set. |
 | `dev dashboard` | Textual dashboard UI | Use DevMap HTML exports (`devmap html`, `devmap map-html`) or the consuming harness UI. |

@@ -861,7 +861,7 @@ fn ambiguous_edges(answer: &Value) -> usize {
         .count()
 }
 
-/// DEVMAP_REVIEW R9 / W2.3: `min_rung` reaches the four graph walks over MCP.
+/// docs/archive/DEVMAP_REVIEW.md R9 / W2.3: `min_rung` reaches the four graph walks over MCP.
 ///
 /// The socket protocol and the CLI took a rung floor; the MCP port carried none
 /// of it over, so an agent could not keep `AmbiguousGlobal` guesses out of a

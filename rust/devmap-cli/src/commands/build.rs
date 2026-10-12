@@ -1032,7 +1032,7 @@ pub(crate) fn run(
     // These four own memory and nothing else — no file, lock, thread or
     // `Drop` with an effect — so the OS reclaims them at exit instead.
     // The store still drops normally: closing it releases its locks and
-    // checkpoints the WAL. A/B and probe in BENCHMARK_HARDENING_AUDIT.md.
+    // checkpoints the WAL. A/B and probe in docs/archive/devmap/BENCHMARK_HARDENING_AUDIT.md.
     std::mem::forget((resolution, resolver, extractions, analysis));
     Ok(())
 }

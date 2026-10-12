@@ -2,7 +2,7 @@
 
 > **Historical ledger — read before running anything below (checked 2026-10-07).**
 > The Python product was retired in Phase 7 (2026-09-10; decision table in
-> [docs/PHASE7_LONG_TAIL.md](docs/PHASE7_LONG_TAIL.md)). Commit `3286db5e`
+> [docs/PHASE7_LONG_TAIL.md](../PHASE7_LONG_TAIL.md)). Commit `3286db5e`
 > (2026-09-10) deleted the 398 files under `src/devcouncil/` together with
 > `pyproject.toml` and `uv.lock`; none of them exists at HEAD. There is no
 > Python package, no `uv` path and no pytest lane: `dev`/`devcouncil` is the Go
@@ -686,7 +686,7 @@ stays as recorded; the cause it offers was never demonstrated. What the code
 shows:
 
 - The test still exists, body unchanged since `01677010` (2026-09-01):
-  `rust/devmap-serve/src/protocol.rs:2552-2568`.
+  `rust/devmap-serve/src/protocol.rs:3052-3067` (moved from `:2552-2568` as the file grew; found by name on 2026-10-12; the other line numbers in this note are the 2026-10-07 ones and were not re-checked).
 - Nothing in `lock_ipc_endpoint_with`, `UnixIpcServer::bind` or its `Drop`
   (`protocol.rs:1578-1642`, `:1671-1708`, `:1757-1772`) gives a dropped lock
   file a way to stay locked inside the same process, and the test's own comment

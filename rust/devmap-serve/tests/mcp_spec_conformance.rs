@@ -789,7 +789,7 @@ async fn dead_answer(store: &Arc<StoreSlot>) -> Value {
     response["result"]["structuredContent"].clone()
 }
 
-/// DEVMAP_REVIEW R8: the component pass reaches an agent over MCP, declared.
+/// docs/archive/DEVMAP_REVIEW.md R8: the component pass reaches an agent over MCP, declared.
 ///
 /// `dead_clusters` reached the CLI and the IPC envelope, but the MCP tool never
 /// named it: no description told an agent the field existed, and the output

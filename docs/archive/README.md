@@ -33,6 +33,12 @@ Sibling historical files stayed together under `devmap/`; links to live docs as
 | [devmap/STATE_DISCOVERY_AUDIT_2026-09-09.md](devmap/STATE_DISCOVERY_AUDIT_2026-09-09.md) | First-run / worktree discovery |
 | [devmap/SCHEMA20_QUALIFICATION_2026-09-09.md](devmap/SCHEMA20_QUALIFICATION_2026-09-09.md) | Schema-20 / concurrent-worktree qualification |
 | [devmap/RUST_AUDIT_2026-09-10.md](devmap/RUST_AUDIT_2026-09-10.md) | Rust hardening audit |
+| [devmap/ATTRIBUTION_AUDIT.md](devmap/ATTRIBUTION_AUDIT.md) | Benchmark attribution audit |
+| [devmap/BENCHMARK_HARDENING_AUDIT.md](devmap/BENCHMARK_HARDENING_AUDIT.md) | Benchmark hardening audit (content landed; see its status line) |
+| [devmap/EXTRACTION_RESOLVE_AUDIT_2026-10-02.md](devmap/EXTRACTION_RESOLVE_AUDIT_2026-10-02.md) | Extraction and resolver audit, 2026-10-02 |
+| [devmap/RESOLVER_PRECISION_AB_2026-10-07.md](devmap/RESOLVER_PRECISION_AB_2026-10-07.md) | Resolver precision A/B, 2026-10-07 |
+| [devmap/STORE_FOOTPRINT_AUDIT.md](devmap/STORE_FOOTPRINT_AUDIT.md) | Store footprint audit |
+| [devmap/UPDATE_PROFILE_AUDIT.md](devmap/UPDATE_PROFILE_AUDIT.md) | Update profile audit |
 | `devmap/*.json` | Qualification dumps that accompanied those audits |
 
 ## Other retired product pages
@@ -40,3 +46,8 @@ Sibling historical files stayed together under `devmap/`; links to live docs as
 | File | What it was |
 |------|-------------|
 | [build-week-demo.md](build-week-demo.md) | Python `dev check --verify` walkthrough |
+| [CLI_PRESENTATION_AUDIT.md](CLI_PRESENTATION_AUDIT.md) | CLI presentation audit (closed 2026-09-12) |
+| [hook-migration-audit.md](hook-migration-audit.md) | Hook-retirement migration audit (closed 2026-09-12) |
+| [IMPROVEMENTS.md](IMPROVEMENTS.md) | Python-era improvement ledger (moved from the repository root 2026-10-12) |
+| [DEVMAP_REVIEW.md](DEVMAP_REVIEW.md) / [DEVMAP_HARDENING.md](DEVMAP_HARDENING.md) | 2026-09-06 hardening plan and its review (moved from the root 2026-10-12) |
+| [DevCouncil-website-benchmark.md](DevCouncil-website-benchmark.md) | Site copy for the v0.2.2 competition benchmark (moved from the root 2026-10-12; its recorded checker `benchmarks/results/competition/20260914-v0.2.2/verify_docs.py` still names the old root path) |

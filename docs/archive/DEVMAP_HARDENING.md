@@ -15,6 +15,12 @@
 >   (2026-09-11). Line numbers below predate that move.
 > - **Still present.** `benchmarks/map_bench.py` still exists.
 > - **Landing status.** See the Plan status table and the per-row marks in `DEVMAP_REVIEW.md`.
+>
+> **Archived 2026-10-12** from the repository root. W4.1-W4.3 have landed (W4.1:
+> `rust/devmap-analyze/tests/labelled_corpus_precision.rs` with `rust/testdata/golden/*/truth.json`;
+> W4.2: `rust/testdata/resolution_baseline.json` with `rust/devmap-analyze/tests/resolution_rate_baseline.rs`;
+> W4.3: `_score_labelled_corpus` in `benchmarks/map_bench.py`). Rows below that read "not started" or
+> "unclaimed" are the 2026-09-06 record, not current state.
 
 The kernel's resolution discipline is the strongest of the four tools surveyed (devmap, gortex,
 GitNexus, trace-mcp) — and it is undermined by three places where the analysis layer reads a
