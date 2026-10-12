@@ -1233,6 +1233,15 @@ pub fn daemon_degraded_reason(status: &StoreStatus, unapplied: &UnappliedEdits) 
     }
 }
 
+/// The bound a `blast` or `suspects` runs under: dc-regress's default
+/// deadline, ended early by the same cancel the request timeout trips. The
+/// timeout answers the client and abandons the work; this is what makes the
+/// abandoned work stop spawning git.
+fn analysis_budget(cancel: &devmap_query::Cancel) -> dc_regress::Budget {
+    let cancel = cancel.clone();
+    dc_regress::Budget::default().with_cancel(move || cancel.is_cancelled())
+}
+
 pub(crate) fn dispatch(
     store: &Store,
     request: IpcRequest,
@@ -1500,8 +1509,15 @@ pub(crate) fn dispatch(
             let graph = git_joined_graph(store)?;
             let root = graph.indexed_repo().to_path_buf();
             let until = indexed_head_of(&graph)?;
-            Ok(serde_json::to_value(dc_regress::suspects(
-                &root, &graph, &symptom, &since, &until, depth,
+            Ok(serde_json::to_value(dc_regress::suspects::suspects_bounded(
+                std::ffi::OsStr::new("git"),
+                &root,
+                &graph,
+                &symptom,
+                &since,
+                &until,
+                depth,
+                &analysis_budget(cancel),
             ))?)
         }
         IpcCommand::Blast { since, at, depth } => {
@@ -1514,13 +1530,19 @@ pub(crate) fn dispatch(
             let root = graph.indexed_repo().to_path_buf();
             let until = indexed_head_of(&graph)?;
             let report = match selector {
-                BlastSelector::Since(since) => {
-                    dc_regress::blast(&root, &graph, since, &until, depth)
-                }
+                BlastSelector::Since(since) => dc_regress::blast::blast_bounded(
+                    std::ffi::OsStr::new("git"),
+                    &root,
+                    &graph,
+                    since,
+                    &until,
+                    depth,
+                    &analysis_budget(cancel),
+                ),
                 BlastSelector::At(at) => {
                     let (path, start, end) = dc_regress::change::parse_location(at)
                         .map_err(|error| anyhow::anyhow!(error))?;
-                    dc_regress::blast::blast_change_with_program(
+                    dc_regress::blast::blast_change_bounded(
                         std::ffi::OsStr::new("git"),
                         &root,
                         &graph,
@@ -1528,6 +1550,7 @@ pub(crate) fn dispatch(
                         at,
                         &until,
                         depth,
+                        &analysis_budget(cancel),
                     )
                 }
             };

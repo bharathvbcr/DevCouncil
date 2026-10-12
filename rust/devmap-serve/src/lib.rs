@@ -1,4 +1,6 @@
 pub mod admission;
+#[cfg(test)]
+mod blast_cancel_tests;
 mod binary_identity;
 pub mod daemon;
 pub mod mcp;

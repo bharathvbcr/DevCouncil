@@ -403,3 +403,121 @@ fn a_git_that_stalls_on_version_is_killed_at_the_probe_deadline() {
     );
     assert!(dc_proc::GIT_VERSION_DEADLINE < dc_proc::GIT_HEAD_DEADLINE);
 }
+
+// ---------------------------------------------------------------- the config cache
+
+/// A `git` that logs its arguments, then runs the real one.
+fn counting_git(dir: &Path) -> (PathBuf, PathBuf) {
+    let log = dir.join("spawns.log");
+    let real = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|d| d.join("git"))
+        .find(|c| c.is_file())
+        .unwrap();
+    let git = dir.join("counting-git");
+    script(
+        &git,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+            log.display(),
+            real.display()
+        ),
+    );
+    (git, log)
+}
+
+fn config_listings(log: &Path) -> usize {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains(" config --show-scope"))
+        .count()
+}
+
+fn plain_repo(label: &str) -> (Scratch, PathBuf, PathBuf, PathBuf) {
+    let scratch = Scratch::new(label);
+    let root = scratch.0.join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    repo(&root);
+    let (git, log) = counting_git(&scratch.0);
+    (scratch, root, git, log)
+}
+
+#[test]
+fn an_operation_lists_the_repository_config_once() {
+    let (_scratch, root, git, log) = plain_repo("scope-once");
+    {
+        let _scope = dc_proc::config_scope();
+        for _ in 0..5 {
+            git_with_program(git.as_os_str(), &root, ["diff", "HEAD"]).unwrap();
+            git_with_program(git.as_os_str(), &root, ["show", "HEAD"]).unwrap();
+        }
+    }
+    assert_eq!(
+        config_listings(&log),
+        1,
+        "ten reads, one listing: {}",
+        std::fs::read_to_string(&log).unwrap()
+    );
+}
+
+#[test]
+fn without_an_operation_each_read_lists_the_config() {
+    let (_scratch, root, git, log) = plain_repo("scope-none");
+    for _ in 0..3 {
+        git_with_program(git.as_os_str(), &root, ["diff", "HEAD"]).unwrap();
+    }
+    assert_eq!(config_listings(&log), 3);
+}
+
+#[test]
+fn a_scope_ends_with_its_guard_and_a_nested_one_does_not_end_it_early() {
+    let (_scratch, root, git, log) = plain_repo("scope-ends");
+    {
+        let _outer = dc_proc::config_scope();
+        {
+            let _inner = dc_proc::config_scope();
+            git_with_program(git.as_os_str(), &root, ["diff", "HEAD"]).unwrap();
+        }
+        git_with_program(git.as_os_str(), &root, ["diff", "HEAD"]).unwrap();
+        assert_eq!(config_listings(&log), 1, "the inner guard left the outer scope open");
+    }
+    git_with_program(git.as_os_str(), &root, ["diff", "HEAD"]).unwrap();
+    assert_eq!(config_listings(&log), 2, "a new read after the scope lists again");
+}
+
+/// The cache is not a way to miss a driver the repository adds mid-operation.
+#[test]
+fn an_edit_to_the_repository_config_is_listed_afresh() {
+    let (_scratch, root, git, log) = plain_repo("scope-edit");
+    let _scope = dc_proc::config_scope();
+    let args = |command: &Command| -> Vec<String> {
+        command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    };
+    let before = git_with_program(git.as_os_str(), &root, ["diff", "HEAD"]).unwrap();
+    assert!(!args(&before).iter().any(|a| a.starts_with("filter.planted")));
+
+    setup(&root, &["config", "filter.planted.clean", "/bin/true"]);
+    let after = git_with_program(git.as_os_str(), &root, ["diff", "HEAD"]).unwrap();
+    assert!(
+        args(&after).iter().any(|a| a == "filter.planted.clean="),
+        "the driver added after the first read is neutralised: {:?}",
+        args(&after)
+    );
+    assert_eq!(config_listings(&log), 2);
+}
+
+#[test]
+fn a_different_root_is_a_different_entry() {
+    let (scratch, root, git, log) = plain_repo("scope-roots");
+    let other = scratch.0.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    repo(&other);
+    let _scope = dc_proc::config_scope();
+    git_with_program(git.as_os_str(), &root, ["diff", "HEAD"]).unwrap();
+    git_with_program(git.as_os_str(), &other, ["diff", "HEAD"]).unwrap();
+    git_with_program(git.as_os_str(), &root, ["diff", "HEAD"]).unwrap();
+    assert_eq!(config_listings(&log), 2);
+}
