@@ -30,6 +30,7 @@ mod blast_names_what_a_change_reaches;
 mod blast_reads_once_and_names_every_path;
 mod build_lsp_opt_in;
 mod caller_assets_over_stdin;
+mod claude_config_dir;
 mod claude_integration;
 mod cli_json_contract;
 mod closed_pipe_is_not_a_panic;

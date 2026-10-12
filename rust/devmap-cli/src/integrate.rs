@@ -478,7 +478,7 @@ fn global_mcp_paths(host: Host) -> anyhow::Result<Vec<PathBuf>> {
     let home = dirs_home()?;
     Ok(match host {
         Host::Cursor => vec![home.join(".cursor").join("mcp.json")],
-        Host::Claude => vec![home.join(".claude.json")],
+        Host::Claude => vec![claude::claude_global_config(&home)],
         // Project-scoped only. Antigravity and OpenCode keep their server list
         // beside the repository, and Warp's file is handed to `oz` per run, so
         // there is no user-level document to merge into for any of them.

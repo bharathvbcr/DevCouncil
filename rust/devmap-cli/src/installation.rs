@@ -227,6 +227,14 @@ fn host_mcp_config_paths() -> Vec<McpConfigSite> {
     host_mcp_config_sites(home.as_deref(), &cwd)
 }
 
+/// `path` spelled `~/...` when it lives under `home`, else as is.
+fn display_under_home(path: &Path, home: &Path) -> String {
+    match path.strip_prefix(home) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
 fn host_mcp_config_sites(home: Option<&Path>, cwd: &Path) -> Vec<McpConfigSite> {
     let site = |label: String, path: PathBuf, host: Option<McpHost>| McpConfigSite {
         label,
@@ -241,9 +249,10 @@ fn host_mcp_config_sites(home: Option<&Path>, cwd: &Path) -> Vec<McpConfigSite> 
             home.join(".cursor/mcp.json"),
             Some(McpHost::Cursor),
         ));
+        let global = claude::claude_global_config(home);
         out.push(site(
-            "~/.claude.json".to_string(),
-            home.join(".claude.json"),
+            display_under_home(&global, home),
+            global,
             Some(McpHost::ClaudeCode),
         ));
         // Only the copy Claude Code loads: in place for a local-directory
@@ -672,6 +681,94 @@ pub(crate) fn plugin_warning() -> Option<String> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let issues = plugin_health(&home).issues;
     (!issues.is_empty()).then(|| issues.join("; "))
+}
+
+/// The active Claude Code profile registers the Dev Map MCP server but loads
+/// none of its hooks.
+///
+/// A seat profile pinned with `CLAUDE_CONFIG_DIR` has its own `.claude.json`
+/// and `settings.json`; the MCP queries still land in the store, but no
+/// SessionStart/SessionEnd/PreToolUse hook runs, so sessions never end with a
+/// report. Hooks count when the profile's `settings.json` or the project's
+/// `.claude/settings*.json` names `devmap`, or when the enabled Dev Map plugin
+/// ships a `hooks/hooks.json`. A document that exists but cannot be read is
+/// reported as unchecked, never as clean.
+pub(crate) fn profile_hooks_warning(cwd: &Path) -> Option<String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let config_dir = claude::claude_config_dir(&home);
+    let global = claude::claude_global_config(&home);
+    let read_json = |path: &Path| -> Result<Option<serde_json::Value>, String> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => serde_json::from_str(&text)
+                .map(Some)
+                .map_err(|error| format!("{} is not JSON: {error}", path.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("{}: {error}", path.display())),
+        }
+    };
+    let registers = |config: &serde_json::Value| {
+        let has = |servers: Option<&serde_json::Value>| {
+            servers
+                .and_then(|servers| servers.get(claude::MCP_SERVER_NAME))
+                .is_some()
+        };
+        has(config.get("mcpServers"))
+            || config
+                .get("projects")
+                .and_then(|projects| projects.get(cwd.to_str()?))
+                .is_some_and(|project| has(project.get("mcpServers")))
+    };
+    match read_json(&global) {
+        Ok(Some(config)) if registers(&config) => {}
+        Ok(_) => return None,
+        Err(error) => {
+            return Some(format!(
+                "cannot tell whether this Claude Code profile registers the Dev Map MCP server \
+                 ({error}); its hooks are unchecked"
+            ))
+        }
+    }
+    let names_devmap_hook = |config: &serde_json::Value| {
+        config
+            .get("hooks")
+            .is_some_and(|hooks| hooks.to_string().contains("devmap"))
+    };
+    let project_settings = cwd.join(".claude");
+    let settings = [
+        config_dir.join("settings.json"),
+        project_settings.join("settings.json"),
+        project_settings.join("settings.local.json"),
+    ];
+    for path in &settings {
+        match read_json(path) {
+            Ok(Some(config)) if names_devmap_hook(&config) => return None,
+            Ok(_) => {}
+            Err(error) => {
+                return Some(format!(
+                    "cannot read {error}; whether this Claude Code profile loads the Dev Map \
+                     hooks is unchecked"
+                ))
+            }
+        }
+    }
+    let install = claude::claude_plugin_install(&home);
+    if install.enabled == Some(true)
+        && install
+            .loaded
+            .iter()
+            .any(|plugin| plugin.dir.join("hooks").join("hooks.json").is_file())
+    {
+        return None;
+    }
+    Some(format!(
+        "the Claude Code profile at {} registers the Dev Map MCP server ({}) but loads none of \
+         its hooks: no `devmap` hook in its settings.json, the project's .claude/settings*.json, \
+         or an enabled Dev Map plugin. Sessions under this profile run no SessionStart, \
+         SessionEnd or PreToolUse hook, so they leave no session report; enable the Dev Map \
+         plugin in this profile, or add the `devmap hook <event>` entries to its settings.json",
+        config_dir.display(),
+        global.display()
+    ))
 }
 
 /// Cache directories from earlier installs that Claude Code no longer loads.

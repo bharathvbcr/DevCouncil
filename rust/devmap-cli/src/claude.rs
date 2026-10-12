@@ -1914,6 +1914,47 @@ pub enum LoadOrigin {
     InPlace,
 }
 
+/// The directory Claude Code reads its user-level settings, plugins and
+/// global config from.
+///
+/// `CLAUDE_CONFIG_DIR` when it is set and non-empty, else `<home>/.claude`
+/// (<https://code.claude.com/docs/en/settings>). This is the one owner: every
+/// site that names `settings.json`, `plugins/` or the global `.claude.json`
+/// goes through it, so a seat-pinned profile is read as the profile a session
+/// actually loads. A relative value is made absolute against the current
+/// directory, the way a process that inherited it resolves it; symlinks are
+/// left alone.
+pub fn claude_config_dir(home: &Path) -> PathBuf {
+    config_dir_from(home, std::env::var_os("CLAUDE_CONFIG_DIR"))
+}
+
+fn config_dir_from(home: &Path, env: Option<std::ffi::OsString>) -> PathBuf {
+    match env.filter(|value| !value.is_empty()) {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            std::path::absolute(&dir).unwrap_or(dir)
+        }
+        None => home.join(".claude"),
+    }
+}
+
+/// Claude Code's global config document (`mcpServers`, per-project state).
+///
+/// Claude Code keeps it at `$CLAUDE_CONFIG_DIR/.claude.json` when the variable
+/// is set and at `~/.claude.json` otherwise. The first is confirmed by a seat
+/// profile on disk (`~/.claude-chandra/.claude.json` registering the MCP
+/// servers that profile loads); the second is the unset default.
+pub fn claude_global_config(home: &Path) -> PathBuf {
+    global_config_from(home, std::env::var_os("CLAUDE_CONFIG_DIR"))
+}
+
+fn global_config_from(home: &Path, env: Option<std::ffi::OsString>) -> PathBuf {
+    match env.as_ref().filter(|value| !value.is_empty()) {
+        Some(_) => config_dir_from(home, env).join(".claude.json"),
+        None => home.join(".claude.json"),
+    }
+}
+
 /// One copy of the Dev Map plugin that Claude Code sessions load.
 pub struct LoadedPlugin {
     pub dir: PathBuf,
@@ -1959,7 +2000,7 @@ pub struct ClaudePluginInstall {
 /// never a missed duplicate. An unreadable file rejects nothing.
 pub fn claude_project_server_rejected(home: Option<&Path>, project: &Path, name: &str) -> bool {
     let project_settings = project.join(".claude");
-    home.map(|home| home.join(".claude").join("settings.json"))
+    home.map(|home| claude_config_dir(home).join("settings.json"))
         .into_iter()
         .chain([
             project_settings.join("settings.json"),
@@ -1992,7 +2033,7 @@ pub fn claude_project_server_rejected(home: Option<&Path>, project: &Path, name:
 /// copies the plugin into the cache and loads that copy, so for those the
 /// install record is the answer.
 pub fn claude_plugin_install(home: &Path) -> ClaudePluginInstall {
-    let plugins = home.join(".claude").join("plugins");
+    let plugins = claude_config_dir(home).join("plugins");
     let cache = plugins
         .join("cache")
         .join(MARKETPLACE_NAME)
@@ -2061,7 +2102,7 @@ pub fn claude_plugin_install(home: &Path) -> ClaudePluginInstall {
             })
             .collect(),
     };
-    let enabled = std::fs::read_to_string(home.join(".claude").join("settings.json"))
+    let enabled = std::fs::read_to_string(claude_config_dir(home).join("settings.json"))
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .and_then(|settings| {
@@ -2171,6 +2212,33 @@ fn manifest_version(dir: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_config_dir_is_the_variable_when_set_and_non_empty() {
+        let home = Path::new("/home/u");
+        let os = |value: &str| Some(std::ffi::OsString::from(value));
+        assert_eq!(config_dir_from(home, None), home.join(".claude"));
+        assert_eq!(config_dir_from(home, os("")), home.join(".claude"));
+        assert_eq!(
+            config_dir_from(home, os("/seat/one")),
+            PathBuf::from("/seat/one")
+        );
+        let relative = config_dir_from(home, os("seat"));
+        assert!(relative.is_absolute(), "{relative:?}");
+        assert!(relative.ends_with("seat"), "{relative:?}");
+    }
+
+    #[test]
+    fn the_global_config_follows_the_profile() {
+        let home = Path::new("/home/u");
+        let os = |value: &str| Some(std::ffi::OsString::from(value));
+        assert_eq!(global_config_from(home, None), home.join(".claude.json"));
+        assert_eq!(global_config_from(home, os("")), home.join(".claude.json"));
+        assert_eq!(
+            global_config_from(home, os("/seat/one")),
+            PathBuf::from("/seat/one/.claude.json")
+        );
+    }
 
     #[test]
     fn matcher_classification_follows_the_documented_character_rules() {

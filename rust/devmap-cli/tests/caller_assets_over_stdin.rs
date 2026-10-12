@@ -40,6 +40,7 @@ fn devmap(args: &[&str], stdin: &[u8], home: &Path) -> Run {
     let mut child = Command::new(DEVMAP)
         .args(args)
         .env("HOME", home)
+        .env_remove("CLAUDE_CONFIG_DIR")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -1945,13 +1945,31 @@ fn detach_session_report(
     root: &Path,
     session: Option<&str>,
 ) -> anyhow::Result<()> {
-    let lock_dir = coalesce_lock_dir(root, "session-report");
+    let lock_dir = coalesce_lock_dir(root, &session_report_lock_kind(session));
     if !try_acquire_lock_dir(&lock_dir)? {
         return Ok(());
     }
     let args = session_report_args(root, session);
     let args: Vec<&OsStr> = args.iter().map(std::ffi::OsString::as_os_str).collect();
     spawn_detached_with_cleanup(executable, &args, &lock_dir)
+}
+
+/// The coalesce-lock kind a session's report runs under.
+///
+/// One lock for every session made a SessionEnd that overlapped another's
+/// report vanish without a record. Keyed by session, the lock still collapses
+/// a duplicate end of the *same* session, while a different session's end gets
+/// its own report: each report stamps itself uniquely, so concurrent ones
+/// cannot overwrite each other. A host that names no session has nothing to key
+/// on and shares the plain kind.
+fn session_report_lock_kind(session: Option<&str>) -> String {
+    match session {
+        Some(id) => format!(
+            "session-report-{}",
+            devmap_serve::session_log::session_file_stem(id)
+        ),
+        None => "session-report".to_string(),
+    }
 }
 
 /// `session-report`'s argument vector. The id travels as one `--session-id=`
@@ -3730,6 +3748,45 @@ mod tests {
             render_host_stdout(HookEvent::UserPromptSubmit, &payload, &stdout),
             None
         );
+    }
+
+    /// A SessionEnd that overlaps another session's report used to be dropped
+    /// with no record. Its report now has a lock of its own.
+    #[test]
+    #[cfg(unix)]
+    fn a_session_end_that_overlaps_another_report_still_runs_its_own() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("devmap-end-overlap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let marker = root.join("ran");
+        let script = root.join("fake-devmap");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\necho \"$@\" > '{}'\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        // Another report holds the store-wide lock the old code used for all.
+        let held = coalesce_lock_dir(&root, "session-report");
+        assert!(try_acquire_lock_dir(&held).unwrap());
+        detach_session_report(&script, &root, Some("ending-session")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let ran = fs::read_to_string(&marker).unwrap_or_default();
+        let _ = fs::remove_dir_all(&root);
+        assert!(ran.contains("--session-id=ending-session"), "{ran:?}");
+    }
+
+    #[test]
+    fn a_session_report_lock_is_per_session() {
+        let a = session_report_lock_kind(Some("a"));
+        assert_eq!(a, session_report_lock_kind(Some("a")));
+        assert_ne!(a, session_report_lock_kind(Some("b")));
+        assert_ne!(a, session_report_lock_kind(None));
+        assert!(!session_report_lock_kind(Some("../x/y")).contains('/'));
     }
 
     /// Without the id, a report can never be joined to its session's queries.

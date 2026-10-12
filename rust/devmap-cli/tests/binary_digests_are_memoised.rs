@@ -139,6 +139,7 @@ impl Fixture {
             .current_dir(&self.repo)
             .env("PATH", format!("{}:/usr/bin:/bin", self.bin.display()))
             .env("HOME", &self.home)
+            .env_remove("CLAUDE_CONFIG_DIR")
             .env_remove("DEVMAP_HOME")
             .output()
             .expect("run devmap paths");
@@ -461,6 +462,7 @@ fn doctor_reads_a_memo_but_never_writes_one() {
         .current_dir(&fx.repo)
         .env("PATH", format!("{}:/usr/bin:/bin", fx.bin.display()))
         .env("HOME", &fx.home)
+        .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("DEVMAP_HOME")
         .output()
         .expect("run devmap doctor");
@@ -503,6 +505,7 @@ fn doctor_leaves_an_existing_memo_alone() {
         .current_dir(&fx.repo)
         .env("PATH", format!("{}:/usr/bin:/bin", fx.bin.display()))
         .env("HOME", &fx.home)
+        .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("DEVMAP_HOME")
         .output()
         .expect("run devmap doctor");
