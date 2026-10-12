@@ -1,6 +1,6 @@
 //! Package-level function variables, closures, and platform-conditioned
 //! targets: what the resolver does with each, reproduced before anything is
-//! changed (`docs/devmap/BENCHMARK_HARDENING_AUDIT.md:78`).
+//! changed (`docs/archive/devmap/BENCHMARK_HARDENING_AUDIT.md:78`).
 //!
 //! Each test pins the behaviour measured on 2026-10-08. Where that behaviour is
 //! a limit rather than a correct answer, `docs/devmap/DIVERGENCES.md` ("Known

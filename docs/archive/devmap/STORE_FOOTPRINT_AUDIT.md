@@ -25,7 +25,7 @@ These are the preserved benchmark stores made by the earlier dirty binary, not c
 | Interned paths / unreachable IDs | 888 / 0 | 888 / 0 |
 | Nonempty WAL | None | None |
 
-The retained membership rows share payloads; a second generation does not duplicate the 74 MiB extraction table. Edge and attribution validity ranges also share unchanged rows. Nodes, FTS documents, analysis JSON, dead-symbol rows, and per-generation digests are copied per retained generation. The source retention constants are two generations and 500 build-history entries in [schema.rs](../../rust/devmap-store/src/schema.rs).
+The retained membership rows share payloads; a second generation does not duplicate the 74 MiB extraction table. Edge and attribution validity ranges also share unchanged rows. Nodes, FTS documents, analysis JSON, dead-symbol rows, and per-generation digests are copied per retained generation. The source retention constants are two generations and 500 build-history entries in [schema.rs](../../../rust/devmap-store/src/schema.rs).
 
 ## Where the cold bytes live
 
@@ -48,7 +48,7 @@ All ordinary indexes together occupy **7.938 MiB**. Total unused bytes within B-
 
 Parsing each stored extraction JSON, the serialized values for references account for 37.882 MiB, calls 18.746 MiB, local bindings 7.157 MiB, symbols 3.303 MiB, scope locals 3.172 MiB, and imports 0.681 MiB. These figures exclude JSON keys/separators and row metadata; they are a breakdown of content rather than a second database-size accounting.
 
-The payload serves incremental re-resolution: [try_get_cached_extraction](../../rust/devmap-store/src/db.rs) reads retained payloads through the full content/language/grammar/analyzer identity, and [the resolver](../../rust/devmap-resolve/src/resolver.rs) consumes scope locals and name/type references. [Extraction::for_durable_store](../../rust/devmap-extract/src/model.rs) already removes source text, diagnostics, and redundant call references while preserving receiver-binding information. Deleting these fields without proving equivalent re-resolution would change the product contract.
+The payload serves incremental re-resolution: [try_get_cached_extraction](../../../rust/devmap-store/src/db.rs) reads retained payloads through the full content/language/grammar/analyzer identity, and [the resolver](../../../rust/devmap-resolve/src/resolver.rs) consumes scope locals and name/type references. [Extraction::for_durable_store](../../../rust/devmap-extract/src/model.rs) already removes source text, diagnostics, and redundant call references while preserving receiver-binding information. Deleting these fields without proving equivalent re-resolution would change the product contract.
 
 The physical attribution ledger has 89,421 `uninferred_receiver`, 49,600 `external`, 18,351 `builtin`, 2,087 `local_binding`, 1,683 `module_path`, 1,069 `no_namesake`, 276 `unresolved`, and 103 `host_global` rows. The reported **91,784 remaining attribution sites** are a narrower metric than the physical ledger total. Neither a larger ledger nor its removal establishes higher accuracy. Confidence, coverage gaps, and incomplete-traversal warnings remain required.
 
@@ -81,13 +81,13 @@ The normal store uses incremental auto-vacuum, a strict greater-than-5% free-pag
 
 ## Demonstrated defect and fix
 
-**Verified defect:** 64 generations that each rename one source file retained all 64 historical interned paths, although ordinary generation retention kept only the last two payload sets. No code retired `paths` rows. [PathRanks::read](../../rust/devmap-store/src/db.rs) reads and sorts that entire table for edge queries, so indefinite rename churn also increases read work.
+**Verified defect:** 64 generations that each rename one source file retained all 64 historical interned paths, although ordinary generation retention kept only the last two payload sets. No code retired `paths` rows. [PathRanks::read](../../../rust/devmap-store/src/db.rs) reads and sorts that entire table for edge queries, so indefinite rename churn also increases read work.
 
-The fix extends the existing [generation prune transaction](../../rust/devmap-store/src/db.rs): remove a path ID only when no node, extraction payload, file membership, file digest, edge source, or edge target still references it. Retained generations and edge-only endpoints keep their IDs. The transaction protects the full prune from partial retirement on error. No schema, retention-window, confidence, access, or dependency change is involved.
+The fix extends the existing [generation prune transaction](../../../rust/devmap-store/src/db.rs): remove a path ID only when no node, extraction payload, file membership, file digest, edge source, or edge target still references it. Retained generations and edge-only endpoints keep their IDs. The transaction protects the full prune from partial retirement on error. No schema, retention-window, confidence, access, or dependency change is involved.
 
 A seven-trial diagnostic of the added anti-join on the post-edit backup measured 4.36 ms median, with a 13.89 ms first trial and 4.02–4.47 ms thereafter. It removed zero IDs, as expected from the snapshot inventory. This is added bounded maintenance work; no edit-latency improvement is claimed. The change adds 18 production lines and removes none.
 
-[retention_churn.rs](../../rust/devmap-store/tests/retention_churn.rs) adds six tests:
+[retention_churn.rs](../../../rust/devmap-store/tests/retention_churn.rs) adds six tests:
 
 - 64 unique renames plateau at the last two paths.
 - Deleting every file retains the old path until its last generation leaves the retention window.
@@ -108,7 +108,7 @@ The single ignored existing test is not counted as passed. These tests bound spe
 
 ## Qualified storm, kill, and restart run
 
-**Verified:** the corrected [daemon storm test](../../rust/devmap-cli/tests/daemon_storm_soak.rs) passed all **12 cycles** against clean source commit `962ea5f07921ea925e3b70821c5487472c8b57ea`. The fixture SHA-256 was `d4ab3a7404d22736a2311ac18addc917ab0a8144c5a2aa91456246688496126b`; the tested release SHA-256 was `d6628af04241e3e12853ce279ed1ba60481364e8ca8140ec8cd12ec59cba65db`, matching `.devcouncil/audit/delivery-release/devmap`. Source commit, tree, clean status, fixture, Cargo.lock, and binary hashes matched before and after the run. No other compiler or performance work ran concurrently in this audit.
+**Verified:** the corrected [daemon storm test](../../../rust/devmap-cli/tests/daemon_storm_soak.rs) passed all **12 cycles** against clean source commit `962ea5f07921ea925e3b70821c5487472c8b57ea`. The fixture SHA-256 was `d4ab3a7404d22736a2311ac18addc917ab0a8144c5a2aa91456246688496126b`; the tested release SHA-256 was `d6628af04241e3e12853ce279ed1ba60481364e8ca8140ec8cd12ec59cba65db`, matching `.devcouncil/audit/delivery-release/devmap`. Source commit, tree, clean status, fixture, Cargo.lock, and binary hashes matched before and after the run. No other compiler or performance work ran concurrently in this audit.
 
 The exact invocation, from `.devcouncil/audit/candidate-source/rust`, was `DEVMAP_SOAK_CYCLES=12 cargo test --release --locked --offline -p devmap-cli --test daemon_storm_soak a_storm_kill_restart_cycle_converges_on_the_cold_build -- --ignored --exact --nocapture`, with no `CARGO_TARGET_DIR` override. The recorder imposed a 900-second outer timeout and retained stdout, stderr, invocation, source identities, runner snapshots, measurement, and qualification result in `.devcouncil/audit/storm12-qualified/`. It reported exit 0, no timeout or output cap, **157.125 seconds** elapsed, and **156.62 seconds** for the native test: one passed, zero failed, four fixture regressions filtered out. Those four regressions were run separately as described below.
 

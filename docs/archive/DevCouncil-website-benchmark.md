@@ -4,7 +4,7 @@ Paste-ready copy for the marketing site. Nothing here is deployed by this
 repository — `devcouncil.vbcr.dev` is hosted separately.
 
 Every number traces to
-[the committed benchmark report](benchmarks/results/competition/20260914-v0.2.2/REPORT.md).
+[the committed benchmark report](../../benchmarks/results/competition/20260914-v0.2.2/REPORT.md).
 If you re-run the benchmark, update this file and the site together, or the
 site becomes a stale claim.
 

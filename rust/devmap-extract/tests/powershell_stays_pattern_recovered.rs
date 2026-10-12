@@ -1,6 +1,6 @@
 //! PowerShell is pattern-recovered, and says so.
 //!
-//! Decision 2026-10-08 (`docs/devmap/BENCHMARK_HARDENING_AUDIT.md`): no
+//! Decision 2026-10-08 (`docs/archive/devmap/BENCHMARK_HARDENING_AUDIT.md`): no
 //! PowerShell grammar is linked — one would be a new dependency, and none was
 //! authorised — so `.ps1` declarations are recovered by pattern. That is only
 //! acceptable while the extraction is labelled as such: a `Fallback` outcome is

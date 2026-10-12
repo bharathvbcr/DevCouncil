@@ -1,6 +1,6 @@
 //! `CHECK(json_valid(body))` and the parse outcome of the repository's SQL.
 //!
-//! `docs/devmap/BENCHMARK_HARDENING_AUDIT.md` recorded that all eight `.sql`
+//! `docs/archive/devmap/BENCHMARK_HARDENING_AUDIT.md` recorded that all eight `.sql`
 //! files parsed only partially (23 error ranges) and that a script containing
 //! `CHECK(json_valid(body))` — which SQLite executes — made the parser report
 //! an error. Reproduced 2026-10-08: the linked SQL grammar reports exactly the

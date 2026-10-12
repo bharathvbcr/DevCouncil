@@ -22,9 +22,9 @@ Every claim is sourced to a file and line. Findings that depend on runtime behav
 **Status as of 2026-10-07** (code at `3658417c`): the table below is the dated record of
 2026-09-06 and is left as written. Closed rows are marked individually below. Of the 19 rows
 re-checked against source in this pass (R1–R7, R10–R13, R15, M1–M4, M6, M7, M9): **16 closed,
-3 partly closed (R10, M3, M4), 0 open.** R8, R9, R14, M5 and M8 were not re-checked here and carry
-no mark. Commits naming them exist (`1680505b`, `8239876a`, `c42faed4`), but this pass did not
-verify them. Rows were checked by reading source and tests; no test was executed in this pass.
+3 partly closed (R10, M3, M4), 0 open.** Rows were checked by reading source and tests; no test
+was executed in this pass. R8, R9, R14, M5 and M8 were re-checked on 2026-10-12 (see their rows and
+the plan table); the rows are historical records and the tables below are not rewritten.
 
 **Update 2026-10-08:** R10, M3 and M4 are now closed — each remaining item below is pinned by a
 test that was executed. R10's fails against the unmodified join; M3's and M4's pin behaviour
@@ -45,8 +45,8 @@ that already existed, and each was shown to fail with the rule it pins removed.
 | W2.4 empty fields | **landed** | `runtime_proven_live` retired; `unreachable_files` now fed by clusters. |
 | W3.1 liveness ratchet | **landed** | Rebased on `DevMapClient.manifest()`; `LIVENESS_SCHEMA_VERSION = 2`. |
 | W3.2 `dead_symbols.py` | **landed** | Fail-open closed; `unknown` distinct from `unreached`. |
-| W3.3 wiring dedup | not verified | Out of scope for this pass. |
-| W4.1–W4.3 measurement | not started | Still the highest-leverage unclaimed item. |
+| W3.3 wiring dedup | **landed** (checked 2026-10-12) | `ALLOW_UNWIRED` and the dynamic-import patterns are ported: `ALLOW_UNWIRED` and its use in `rust/devmap-extract/src/wiring.rs`. |
+| W4.1–W4.3 measurement | **landed** (checked 2026-10-12) | W4.1 `rust/devmap-analyze/tests/labelled_corpus_precision.rs` (truth in `rust/testdata/golden/*/truth.json`); W4.2 `rust/testdata/resolution_baseline.json` + `rust/devmap-analyze/tests/resolution_rate_baseline.rs`; W4.3 `_score_labelled_corpus` in `benchmarks/map_bench.py`. |
 
 ---
 
@@ -300,6 +300,13 @@ mask.
 
 **Severity: high (orphaned work).**
 
+**Closed in code (checked 2026-10-12).** The MCP `devmap_dead_symbols` description and output
+declare `dead_clusters`, `dead_clusters_truncated` and `dead_clusters_incomplete`
+(`rust/devmap-serve/src/mcp.rs`, the tool description naming them); `rust/devmap-query/src/engine.rs`
+fills `dead_clusters_incomplete` when the producer's cap refuses. Pinned by
+`rust/devmap-serve/tests/mcp_spec_conformance.rs` (the test headed "R8"). The Python reader and
+`dev graph dead` described below no longer exist; the text is what the review found on 2026-09-06.
+
 `dead_clusters.rs` is ~500 lines with 5 test files. Its output reaches exactly two artifacts:
 `manifest.rs:512-513` and `code_graph.rs:915-916`. It reaches **no query path**:
 
@@ -328,6 +335,11 @@ returns them.
 ## R9 — `min_rung` stops at the kernel
 
 **Severity: medium.**
+
+**Closed for the four graph walks (checked 2026-10-12).** `min_rung` is a property of the MCP graph
+tools (`rung_prop()` in `rust/devmap-serve/src/mcp.rs`) and is pinned over MCP by
+`rust/devmap-serve/tests/mcp_protocol.rs` (the test headed "R9 / W2.3"). Not claimed: a `min_rung`
+on `dead`; this pass did not check it.
 
 Present on **deps, impact, trace** only: CLI flags `main.rs:568,585,620`, parsed at `:3231,3256,3294`,
 validated by `check_rung` (`:2517,2532`); IPC `protocol.rs:118,130,142` with `rung_floor` /
@@ -474,7 +486,12 @@ affect override reasoning) or note in the doc comment that they exist for comple
 
 ## R14 — The CLI under-reports unwired exclusions threefold
 
-**Severity: low.**
+**Severity: low. Moot, and the underlying split exists (checked 2026-10-12).** The code it targets,
+`src/devcouncil/cli/commands/map.py`, was deleted in Phase 7 (`3286db5e`); no Python CLI remains to
+under-report anything. In the Rust kernel the two counts are separate fields,
+`excluded_coverage_loss` and `excluded_import_blind` (plus `excluded_import_blind_paths`), in
+`rust/devmap-query/src/code_graph.rs`, so no one field stands in for the other. Whether the Go or
+Rust CLI prints `excluded_import_blind` was not checked here.
 
 `src/devcouncil/cli/commands/map.py:133-159` reads only `excluded_coverage_loss` and prints
 "N files excluded from unwired: extraction coverage loss." On this repository that is 5, while
@@ -507,10 +524,10 @@ so a new **table** missing from the gate is invisible to it by construction.
 | M2 | The ladder flattens for `blind_share ∈ [10.8%, 12.3%]`: branch 1/2 (`cap(0.4)`) and branch 3 (`cap(0.9)`) return identical numbers — the collapse the grading exists to undo, relocated to a narrow window. `the_cap_is_monotone_at_every_blind_share` checks non-decreasing, not separation. **Closed as accepted** `65ad91b3` (2026-09-06). The window is bounded and pinned, not removed, because removing it would mean replacing `min` with a multiplicative degrade. Pinned by `rust/devmap-analyze/tests/coverage_cap_is_graded.rs:414` `the_ladder_flattens_only_inside_a_narrow_stated_window`, which requires the window to start at about 10.8% and to be contiguous. | `liveness.rs:484` |
 | M3 | `lib.rs:109-117` caps `cluster.confidence` but leaves `cluster.reason` saying "reached by nothing outside the component" with no coverage caveat. The single-symbol path swaps in `COVERAGE_LOSS_REASON` for exactly this. **Closed in code, not pinned.** Since `65ad91b3` (2026-09-06), a degraded corpus appends a coverage caveat to `cluster.reason` (`rust/devmap-analyze/src/lib.rs:126-138`). No test asserts the caveat: rg for its text over `devmap-analyze/tests`, `devmap-query` and `devmap-cli` finds only the source. **Closed 2026-10-08:** pinned in both directions by `a_degraded_corpus_qualifies_the_cluster_reason_and_a_complete_one_does_not` (`devmap-analyze/tests/dead_clusters.rs`). | `lib.rs:109` |
 | M4 | `unwired_candidates` skips edges from `TestFile` sources but not `Vendored` or `GeneratedFile`, so a vendored blob importing a module marks it wired. Pre-existing; the widened `is_wiring_evidence` enlarges the surface. **Closed in code, not pinned.** Since `1680505b` (2026-09-06), `non_authoring_importers` covers `TestFile`, `Vendored` and `GeneratedFile` sources (`rust/devmap-query/src/code_graph.rs:495-506`, applied at `:532`). No test was found in which a vendored or generated importer leaves a module unwired; the commit added no such test, and rg over `devmap-query/tests` and `devmap-cli/tests` found none. **Closed 2026-10-08:** pinned by `a_vendored_or_generated_importer_leaves_the_module_unwired` (`devmap-query/tests/file_liveness_characterization.rs`), with a production importer as the control. | `code_graph.rs:413` |
-| M5 | `only_source_files_are_charged_as_import_blind` asserts a bare `excluded == 2` on a five-file fixture — it verifies a count, not that the two files are the C# and Swift ones its message names. | `unwired_excludes_prose_on_its_own_grounds.rs:152` |
+| M5 | `only_source_files_are_charged_as_import_blind` asserts a bare `excluded == 2` on a five-file fixture — it verifies a count, not that the two files are the C# and Swift ones its message names. **Corrected in the test (checked 2026-10-12):** the test file carries an "M5" doc comment saying so (`rust/devmap-query/tests/unwired_excludes_prose_on_its_own_grounds.rs`). | `unwired_excludes_prose_on_its_own_grounds.rs:152` |
 | M6 | `candidate_total` is written (`db.rs:2919`, `:2947`) and read only by `tools/fanout.sql` / `.sh`. Defensible for an offline metric, but no compiled code fails if the write regresses. **Closed** `7dfa20f4` (2026-09-06). A compiled test now fails if the write regresses: `rust/devmap-cli/tests/test_fanout_metric.rs:139` builds a real store, runs `rust/tools/fanout.sql`, and asserts `candidates == 13` (the sum of `candidate_total`, `:236`) and `pre_v16 == 0` (`:240`). The write has one owner, `rust/devmap-store/src/edge_index.rs:112` `ambiguous_candidate_total`. | — |
 | M7 | `MIGRATION_V16_TO_V17` creates the view without `IF NOT EXISTS` while `CREATE_SCHEMA_V3` uses it. Harmless given the `already_split` probe, but asymmetric. **Closed** `65ad91b3` (2026-09-06). The view is now `CREATE VIEW IF NOT EXISTS generation_files` (`rust/devmap-store/src/schema.rs:711`). | `schema.rs:687`, `:93` |
-| M8 | `liveness_ratchet.py` comments instruct bumping `wiring.LIVENESS_SCAN_VERSION` in step with `LIVENESS_SCHEMA_VERSION`. Nothing tests the coupling; worth confirming it moved. | `liveness_ratchet.py:27` |
+| M8 | **Moot:** `liveness_ratchet.py` was deleted with Phase 7 (`3286db5e`); no file by that name exists. Original: `liveness_ratchet.py` comments instruct bumping `wiring.LIVENESS_SCAN_VERSION` in step with `LIVENESS_SCHEMA_VERSION`. Nothing tests the coupling; worth confirming it moved. | `liveness_ratchet.py:27` |
 | M9 | `DEAD_CLUSTER_MAX_NODES` is checked as `>= MAX` before push, so the real limit is exactly 400,000. Benign. `cap_cluster(x, 0)` treats a zero-member cluster as one member. **Closed** `1680505b` (2026-09-06). Both bounds are now stated: "exactly this many, inclusive" (`rust/devmap-analyze/src/dead_clusters.rs:153-167`), and the clamp's lower bound of 1 (`liveness.rs:786-794`). They are pinned by `tests/coverage_cap_is_graded.rs:488` `the_cluster_ceiling_is_total_over_the_sizes_its_type_permits` and `tests/graded_cap_under_hostile_input.rs:256` `an_oversized_graph_refuses_out_loud` (MAX+1). | `dead_clusters.rs:340` |
 
 Checked and cleared: `#[serde(default)]` coverage on `AnalysisSummary` is complete (six fields), so

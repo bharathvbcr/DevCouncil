@@ -99,8 +99,9 @@ was made.
 - **Partial evidence:** DevMap caller/affected-test walks report unresolved attribution
   and depth/cap limits. Source review and the full Go suite supplement those walks.
 - **Not run:** the Rust quick/full suite, since this isolated patch changes no Rust
-  code; remote CI, publication and merge were not requested. The source patch still
-  needs reconciliation with the concurrent writer before merging into the shared branch.
+  code; remote CI, publication and merge were not requested at the time. (Resolved:
+  the branch was merged as `f2a03b6f`, 2026-09-12, so no reconciliation remains; see
+  Scope.)
 
 ## Operator controls
 

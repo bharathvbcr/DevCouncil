@@ -508,7 +508,12 @@ build/status output and snapshot verification are in
 
 All delivered code and test bytes match clean snapshot `962ea5f07921`; final
 `git diff --check` passed. Changes remain uncommitted in this isolated worktree
-and were not merged into the concurrently edited canonical checkout. The clean
+and were not merged into the concurrently edited canonical checkout.
+
+**Status 2026-10-12:** the content has since landed in this repository (for example
+`rust/devmap-store/tests/retention_churn.rs`, `benchmarks/competition_bench.py` and the extraction
+schema past the 51 this audit cites). The snapshot commit `962ea5f0` named here is not an object
+in this repository, so the "match clean snapshot" claim cannot be re-checked from it. The clean
 release snapshots are local commits in the ignored audit clone, with exact
 patches and executables retained. No new dependency or provider was installed.
 

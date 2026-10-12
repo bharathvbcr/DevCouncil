@@ -1,5 +1,5 @@
 //! Three behaviours the retired Python engine had tests for and the kernel did
-//! not (IMPROVEMENTS.md, "Gaps found, not covered by a kernel test today").
+//! not (docs/archive/IMPROVEMENTS.md, "Gaps found, not covered by a kernel test today").
 //!
 //! * **Subsystem inference on a tree that is not DevCouncil.** The kernel's
 //!   subsystems come from Louvain communities over the import/call graph and

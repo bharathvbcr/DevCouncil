@@ -506,7 +506,7 @@ fail it.
 
 [DevMap guide]: ../../../../docs/devmap/README.md
 [comparison page]: ../../../../docs/devmap/comparison.md
-[site copy]: ../../../../DevCouncil-website-benchmark.md
+[site copy]: ../../../../docs/archive/DevCouncil-website-benchmark.md
 
 `ab_control.py` refuses to run unless both arms match the sha256 recorded in
 [`ab-binaries.json`](ab-binaries.json). The v0.2.1 arm was built for this run from
