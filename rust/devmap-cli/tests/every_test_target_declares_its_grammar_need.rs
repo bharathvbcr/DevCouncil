@@ -67,6 +67,7 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
         "dc-regress",
         &[
             "against_a_real_repository",
+            "blob_reads_and_budget",
             "change_to_impact",
             "hostile_change",
             "hostile_input",

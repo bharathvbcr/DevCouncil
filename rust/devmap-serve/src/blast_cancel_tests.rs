@@ -47,7 +47,11 @@ impl Drop for Fixture {
 }
 
 fn fixture() -> Fixture {
-    let base = std::env::temp_dir().join(format!("devmap-serve-cancel-{}", std::process::id()));
+    // The tests in this file run in parallel in one process: a directory named
+    // by pid alone is one tree both of them remove and `git init` at once.
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!("devmap-serve-cancel-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let root = base.join("repo");
     std::fs::create_dir_all(&root).unwrap();
@@ -117,7 +121,9 @@ fn a_cancelled_blast_says_it_was_cut_short() {
         "an uncancelled request is not cut short: {live:#}"
     );
     assert!(
-        live["changed_files"].as_array().is_some_and(|r| !r.is_empty()),
+        live["changed_files"]
+            .as_array()
+            .is_some_and(|r| !r.is_empty()),
         "{live:#}"
     );
 
