@@ -95,7 +95,7 @@ jobs:
 
     - name: Set up Go
       if: matrix.language == 'go'
-      uses: actions/setup-go@v5
+      uses: actions/setup-go@v7
       with:
         go-version-file: backend/go_orchestrator/go.mod
         cache-dependency-path: backend/go_orchestrator/go.mod
