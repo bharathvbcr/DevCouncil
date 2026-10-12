@@ -10,6 +10,30 @@ use std::sync::{Arc, Barrier};
 
 use dc_store::{AcquireRequest, LeaseCode, Store, StoreError, format_iso_utc, parse_iso_utc};
 
+#[allow(dead_code)]
+mod support;
+
+/// The tasks these cases lease, planted as the workbench items they are.
+const TASKS: [&str; 5] = [
+    "TASK-001",
+    "TASK-SHORT",
+    "TASK-LONG",
+    "TASK-TTL",
+    "TASK-RACE",
+];
+
+fn plant_all(store: &Store) {
+    for id in TASKS {
+        support::plant(store, id, "ready", "{}");
+    }
+}
+
+fn memory() -> Store {
+    let store = Store::open_in_memory().unwrap();
+    plant_all(&store);
+    store
+}
+
 fn req(task: &str, owner: &str) -> AcquireRequest {
     AcquireRequest {
         task_id: task.to_string(),
@@ -21,7 +45,7 @@ fn req(task: &str, owner: &str) -> AcquireRequest {
 
 #[test]
 fn acquire_then_validate_then_release() {
-    let store = Store::open_in_memory().unwrap();
+    let store = memory();
     let lease = store.acquire(&req("TASK-001", "builder-1")).unwrap();
 
     assert!(store.validate("TASK-001", &lease.token).unwrap());
@@ -42,7 +66,7 @@ fn acquire_then_validate_then_release() {
 
 #[test]
 fn a_second_holder_is_refused_with_the_holders_name() {
-    let store = Store::open_in_memory().unwrap();
+    let store = memory();
     store.acquire(&req("TASK-001", "builder-1")).unwrap();
 
     match store.acquire(&req("TASK-001", "builder-2")) {
@@ -56,7 +80,7 @@ fn a_second_holder_is_refused_with_the_holders_name() {
 
 #[test]
 fn another_agents_token_diagnoses_as_held_by_other() {
-    let store = Store::open_in_memory().unwrap();
+    let store = memory();
     store.acquire(&req("TASK-001", "builder-1")).unwrap();
 
     let code = store.diagnose("TASK-001", "some-other-token").unwrap();
@@ -69,7 +93,7 @@ fn another_agents_token_diagnoses_as_held_by_other() {
 
 #[test]
 fn an_unknown_token_is_invalid_not_expired() {
-    let store = Store::open_in_memory().unwrap();
+    let store = memory();
     assert_eq!(
         store.diagnose("TASK-404", "never-issued").unwrap(),
         LeaseCode::Invalid
@@ -78,7 +102,7 @@ fn an_unknown_token_is_invalid_not_expired() {
 
 #[test]
 fn expiry_is_observed_on_read_and_frees_the_task() {
-    let mut store = Store::open_in_memory().unwrap();
+    let mut store = memory();
     let clock = Arc::new(AtomicI64::new(1_700_000_000));
     let handle = Arc::clone(&clock);
     store.set_clock(move || handle.load(Ordering::SeqCst));
@@ -104,7 +128,7 @@ fn expiry_is_observed_on_read_and_frees_the_task() {
 
 #[test]
 fn renew_extends_a_live_lease_and_refuses_a_dead_one() {
-    let mut store = Store::open_in_memory().unwrap();
+    let mut store = memory();
     let clock = Arc::new(AtomicI64::new(1_700_000_000));
     let handle = Arc::clone(&clock);
     store.set_clock(move || handle.load(Ordering::SeqCst));
@@ -142,7 +166,7 @@ fn renew_extends_a_live_lease_and_refuses_a_dead_one() {
 
 #[test]
 fn release_requires_the_holders_token() {
-    let store = Store::open_in_memory().unwrap();
+    let store = memory();
     store.acquire(&req("TASK-001", "builder-1")).unwrap();
 
     assert!(!store.release("TASK-001", "not-my-token").unwrap());
@@ -154,7 +178,7 @@ fn release_requires_the_holders_token() {
 
 #[test]
 fn force_steals_a_lease_and_records_the_old_one() {
-    let store = Store::open_in_memory().unwrap();
+    let store = memory();
     let first = store.acquire(&req("TASK-001", "builder-1")).unwrap();
 
     let second = store
@@ -201,7 +225,7 @@ fn concurrent_acquires_produce_exactly_one_winner() {
     let _ = std::fs::remove_file(&path);
 
     // Create the schema once, so the race is over the lease and not over DDL.
-    Store::open(&path).unwrap();
+    plant_all(&Store::open(&path).unwrap());
 
     const THREADS: usize = 12;
     let barrier = Arc::new(Barrier::new(THREADS));
@@ -245,7 +269,7 @@ fn concurrent_acquires_produce_exactly_one_winner() {
 
 #[test]
 fn active_leases_excludes_expired_ones() {
-    let mut store = Store::open_in_memory().unwrap();
+    let mut store = memory();
     let clock = Arc::new(AtomicI64::new(1_700_000_000));
     let handle = Arc::clone(&clock);
     store.set_clock(move || handle.load(Ordering::SeqCst));
@@ -273,7 +297,7 @@ fn active_leases_excludes_expired_ones() {
 /// would turn a corrupt row into a lease nobody can ever take.
 #[test]
 fn an_unreadable_expiry_is_an_error_not_an_immortal_lease() {
-    let store = Store::open_in_memory().unwrap();
+    let store = memory();
     let lease = store.acquire(&req("TASK-001", "b1")).unwrap();
     store
         .connection()
@@ -319,7 +343,7 @@ fn timestamps_round_trip_and_parse_python_shapes() {
 
 #[test]
 fn non_positive_ttl_is_refused_not_minted() {
-    let store = Store::open_in_memory().unwrap();
+    let store = memory();
     for ttl in [-3600i64, 0] {
         let err = store
             .acquire(&AcquireRequest {
@@ -341,7 +365,7 @@ fn non_positive_ttl_is_refused_not_minted() {
 fn absurd_ttl_is_refused_rather_than_overflowing() {
     // i64::MAX used to walk `now + ttl` off the end of i64: panic in debug,
     // nonsense expiry in release.
-    let store = Store::open_in_memory().unwrap();
+    let store = memory();
     let err = store
         .acquire(&AcquireRequest {
             task_id: "TASK-TTL".into(),

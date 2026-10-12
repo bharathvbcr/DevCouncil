@@ -1,5 +1,6 @@
 //! Exercise the actual protocol binary with a disconnected output consumer.
 #[cfg(unix)]
+#[allow(dead_code)]
 mod support;
 #[cfg(unix)]
 #[test]

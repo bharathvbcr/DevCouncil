@@ -6,8 +6,9 @@
 //! assembled by hand out of a stored column, and a health check that answered
 //! for a database it had just invented.
 
+#[allow(dead_code)]
 mod support;
-use support::{dcstore, seeded, temp_dir};
+use support::{dcstore, plant_db, seeded, temp_dir};
 
 /// A mistyped `--db` used to be answered by a database this call created:
 /// `{"ok":true,...,"active_leases":0}` from a private, empty file nobody else
@@ -68,6 +69,7 @@ fn a_writing_command_still_creates_the_store_it_needs() {
 #[test]
 fn a_force_value_the_parser_does_not_understand_is_refused() {
     let db = seeded("force-parse");
+    plant_db(&db, "TASK-1", "ready", "{}");
     let held = dcstore(
         &db,
         &[
@@ -155,6 +157,7 @@ fn a_force_value_the_parser_does_not_understand_is_refused() {
 #[test]
 fn a_forced_acquire_with_an_unusable_ttl_leaves_the_incumbent_holding() {
     let db = seeded("force-ttl");
+    plant_db(&db, "TASK-1", "ready", "{}");
     let held = dcstore(
         &db,
         &[
@@ -209,16 +212,12 @@ fn scope_append_cannot_inject_a_second_key_into_the_task_reply() {
     let db = seeded("scope-injection");
     // The task row is planted directly: planning is DevCouncil's job, and this
     // test is about what the store will hold, not about how it got there.
-    let store = dc_store::Store::open(&db).expect("open store");
-    store
-        .connection()
-        .execute(
-            "INSERT INTO tasks (id, title, description, planned_files_json, status)
-             VALUES ('TASK-1', 'planted', '', '[{\"path\":\"src/a.go\"}]', 'ready')",
-            [],
-        )
-        .expect("plant task");
-    drop(store);
+    plant_db(
+        &db,
+        "TASK-1",
+        "ready",
+        r#"{"planned_files":[{"path":"src/a.go"}]}"#,
+    );
 
     let acquired = dcstore(
         &db,

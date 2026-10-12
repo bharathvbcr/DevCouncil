@@ -1,4 +1,7 @@
 use dc_store::{AcquireRequest, Store};
+
+#[allow(dead_code)]
+mod support;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -8,6 +11,7 @@ fn concurrent_renewal_by_the_same_holder_still_returns_its_lease() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("state.sqlite");
     let mut store = Store::open(&path).unwrap();
+    support::plant(&store, "SAME", "ready", "{}");
     store.set_clock(|| 1_700_000_000);
     let original = store
         .acquire(&AcquireRequest {
@@ -50,6 +54,7 @@ fn renewal_never_returns_the_holder_that_replaced_its_authenticated_lease() {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.sqlite");
         let mut store = Store::open(&path).unwrap();
+        support::plant(&store, "RACE", "ready", "{}");
         store.set_clock(|| 1_700_000_000);
         let original = store
             .acquire(&AcquireRequest {
