@@ -215,7 +215,8 @@ func DefaultPrefix() string {
 	return filepath.Join(home, ".local")
 }
 
-const (
-	PublicGit     = "https://github.com/bharathvbcr/DevCouncil.git"
-	HostGoInstall = "github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/cmd/devcouncil@latest"
-)
+// PublicGit is the repository to clone for a checkout install. The host has
+// no other install route: it links the Gusset engine through cgo and its
+// go.mod replaces gusset with a sibling path, so `go install ...@latest`
+// cannot build it, and releases ship no host archive.
+const PublicGit = "https://github.com/bharathvbcr/DevCouncil.git"

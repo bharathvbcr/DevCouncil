@@ -8,6 +8,7 @@ package components
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/console"
@@ -58,6 +59,18 @@ func runInstall(args []string, base Options) int {
 	}
 	opts := base
 	opts.Prefix, opts.DryRun = a.prefix, dry
+	if a.src != "" {
+		src, err := resolveSrc(a.src)
+		if err != nil {
+			console.Errorln(err)
+			return 2
+		}
+		opts.SourceRoot = src
+	}
+	if IncludesHost(cs) && opts.source() == "" {
+		console.Errorf("install: %v\n", opts.hostSourceError())
+		return 2
+	}
 	var installErr error
 	// A dry-run plan is already structured; do not print shell commands into JSON.
 	if !jsonOut || !dry {
@@ -113,10 +126,23 @@ func runInstall(args []string, base Options) int {
 	return 0
 }
 
+// resolveSrc makes --src absolute and requires it to be a checkout; a
+// symlinked directory is accepted (the checkout test follows it).
+func resolveSrc(dir string) (string, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", fmt.Errorf("--src %s: %w", dir, err)
+	}
+	if !looksLikeCheckout(abs) {
+		return "", notACheckoutError(dir)
+	}
+	return abs, nil
+}
+
 // installArgs is what `devcouncil install` was asked to do.
 type installArgs struct {
 	list, jsonOut, dry, help bool
-	prefix                   string
+	prefix, src              string
 	names                    []string
 	// gitpulse is the GitPulse checkout whose schema-parity check runs after
 	// the install; empty means GitPulseRootEnv, then the sibling checkout.
@@ -153,6 +179,12 @@ func parseInstallArgs(args []string) (installArgs, error) {
 				return installArgs{}, fmt.Errorf("--prefix needs a directory")
 			}
 			a.prefix = args[i]
+		case "--src":
+			i++
+			if i >= len(args) || args[i] == "" {
+				return installArgs{}, fmt.Errorf("--src needs a directory")
+			}
+			a.src = args[i]
 		case "--gitpulse":
 			i++
 			if i >= len(args) || args[i] == "" {
@@ -179,6 +211,13 @@ func parseInstallArgs(args []string) (installArgs, error) {
 				a.prefix = strings.TrimPrefix(args[i], "--prefix=")
 				if a.prefix == "" {
 					return installArgs{}, fmt.Errorf("--prefix needs a directory")
+				}
+				continue
+			}
+			if strings.HasPrefix(args[i], "--src=") {
+				a.src = strings.TrimPrefix(args[i], "--src=")
+				if a.src == "" {
+					return installArgs{}, fmt.Errorf("--src needs a directory")
 				}
 				continue
 			}

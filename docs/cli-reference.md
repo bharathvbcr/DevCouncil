@@ -55,7 +55,7 @@ The same binary is installed as both `devcouncil` and `dev`.
 ```bash
 Usage:
   devcouncil mcp                                       # Run the MCP stdio server
-  devcouncil install [names…] [--list] [--json] [--prefix DIR] [--dry-run]
+  devcouncil install [names…] [--list] [--json] [--prefix DIR] [--src DIR] [--dry-run]
   devcouncil uninstall [names…] [--yes] [--prefix DIR]
   devcouncil disable NAME [--prefix DIR]
   devcouncil enable NAME [--prefix DIR]

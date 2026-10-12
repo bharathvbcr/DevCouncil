@@ -152,3 +152,105 @@ func TestPlannedCommandsStandaloneHasNoGoBuild(t *testing.T) {
 		t.Fatalf("%s", joined)
 	}
 }
+
+// noCheckoutEnv puts the process where FindSourceRoot finds nothing.
+func noCheckoutEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("DEVCOUNCIL_ROOT", "")
+	t.Setenv("GITPULSE_DEVCOUNCIL_ROOT", "")
+	t.Chdir(t.TempDir())
+}
+
+func TestInstallHostWithoutCheckoutRefusesAndNamesTheCheckoutRoute(t *testing.T) {
+	for _, names := range [][]string{{"host"}, {}, {"all"}, {"host", "--dry-run"}} {
+		noCheckoutEnv(t)
+		r := &fakeRunner{}
+		errOut, restoreErr := swapStderr(t)
+		code := runInstall(append(append([]string{}, names...), "--prefix", t.TempDir()), Options{Runner: r})
+		restoreErr()
+		msg := errOut.String()
+		if code != 2 {
+			t.Errorf("%v: exit %d, want 2\n%s", names, code, msg)
+		}
+		for _, want := range []string{"git clone " + PublicGit, "devcouncil install --src <dir>"} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("%v: refusal lacks %q:\n%s", names, want, msg)
+			}
+		}
+		if len(r.calls) != 0 {
+			t.Errorf("%v: refused install still ran %v", names, r.calls)
+		}
+	}
+}
+
+func TestPlannedCommandsHostWithoutCheckoutNeverPlansGoInstall(t *testing.T) {
+	noCheckoutEnv(t)
+	host, _ := Resolve([]string{"host"})
+	for _, c := range PlannedCommands(host, Options{Prefix: "/opt"}) {
+		if strings.Contains(c, "go install") || strings.Contains(c, "GOBIN=") {
+			t.Fatalf("plan still contains the go install path: %s", c)
+		}
+	}
+}
+
+func TestInstallSrcFlagSelectsTheCheckout(t *testing.T) {
+	noCheckoutEnv(t)
+	real := t.TempDir()
+	if err := osMkdirCheckout(real); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	rel, err := filepath.Rel(mustGetwd(t), real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, src := range map[string]string{"absolute": real, "symlink": link, "relative": rel} {
+		out, restoreOut := swapStdout(t)
+		code := runInstall([]string{"host", "--dry-run", "--src", src, "--prefix", "/opt"}, Options{})
+		restoreOut()
+		if code != 0 {
+			t.Errorf("%s: exit %d", name, code)
+		}
+		if !strings.Contains(out.String(), "go -C ") || !strings.Contains(out.String(), "backend/go_orchestrator") {
+			t.Errorf("%s: plan does not build from the checkout:\n%s", name, out.String())
+		}
+	}
+}
+
+func TestInstallSrcFlagRejectsWhatIsNotACheckout(t *testing.T) {
+	noCheckoutEnv(t)
+	file := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(file, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for name, args := range map[string][]string{
+		"missing":   {"--src", filepath.Join(t.TempDir(), "nope")},
+		"empty dir": {"--src", t.TempDir()},
+		"a file":    {"--src", file},
+		"no value":  {"--src"},
+		"empty":     {"--src="},
+	} {
+		r := &fakeRunner{}
+		errOut, restoreErr := swapStderr(t)
+		code := runInstall(append([]string{"devmap", "--prefix", t.TempDir()}, args...), Options{Runner: r})
+		restoreErr()
+		if code != 2 {
+			t.Errorf("%s: exit %d, want 2\n%s", name, code, errOut.String())
+		}
+		if len(r.calls) != 0 {
+			t.Errorf("%s: ran %v", name, r.calls)
+		}
+	}
+}
+
+func mustGetwd(t *testing.T) string {
+	t.Helper()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return wd
+}

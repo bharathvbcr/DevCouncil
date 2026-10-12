@@ -45,6 +45,10 @@ Options:
   --list              print the catalog and exit
   --json              machine-readable list/status
   --prefix DIR        install root (default: $PREFIX or ~/.local)
+  --src DIR           DevCouncil checkout to build from (default: $DEVCOUNCIL_ROOT,
+                      then the checkout containing the working directory). The
+                      host installs only from a checkout: git clone <repo>, then
+                      devcouncil install --src <dir>
   --dry-run           print the commands; build, check and copy nothing
   --gitpulse DIR      GitPulse checkout for the schema-consumer check
                       (default: $DEVCOUNCIL_GITPULSE_ROOT, then ../GitPulse)
@@ -170,6 +174,19 @@ func (o Options) prefix() string {
 	return DefaultPrefix()
 }
 
+// notACheckoutError is the one refusal for a --src that is not a checkout.
+func notACheckoutError(dir string) error {
+	return fmt.Errorf("--src %s is not a DevCouncil checkout (it needs rust/devmap-cli/Cargo.toml and backend/go_orchestrator/go.mod)", dir)
+}
+
+// hostSourceError is why the host cannot be installed without a checkout.
+func (o Options) hostSourceError() error {
+	if o.SourceRoot != "" {
+		return notACheckoutError(o.SourceRoot)
+	}
+	return fmt.Errorf("the host builds only from a checkout (it links the Gusset engine, so it cannot be fetched remotely): git clone %s, then devcouncil install --src <dir>", PublicGit)
+}
+
 func (o Options) source() string {
 	if o.SourceRoot != "" {
 		if looksLikeCheckout(o.SourceRoot) {
@@ -221,7 +238,7 @@ func PlannedCommands(cs []Component, o Options) []string {
 				shellQuote(filepath.Join(src, "backend", "go_orchestrator")), shellQuote(out)))
 			cmds = append(cmds, fmt.Sprintf("ln -sf %s %s", hostBinaryName(), shellQuote(filepath.Join(prefix, "bin", "dev"))))
 		} else {
-			cmds = append(cmds, "GOBIN="+shellQuote(filepath.Join(prefix, "bin"))+" go install "+HostGoInstall)
+			cmds = append(cmds, o.hostSourceError().Error())
 		}
 	}
 	rust := RustIDs(cs)
@@ -391,10 +408,7 @@ func installHost(src, prefix string, o Options) error {
 		}
 		signForMacOS(out, run)
 	} else {
-		if err := run.Run("go", []string{"install", HostGoInstall}, "",
-			[]string{"GOBIN=" + bindir}); err != nil {
-			return fmt.Errorf("go install host: %w", err)
-		}
+		return o.hostSourceError()
 	}
 	return installDevLink(bindir)
 }
