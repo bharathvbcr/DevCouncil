@@ -3,6 +3,7 @@
 //! SessionEnd hooks share a short budget, so this command only reads the live
 //! query log and a status snapshot. It never builds an index.
 
+use anyhow::Context;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -163,35 +164,24 @@ pub fn run(
     if last {
         return print_last(db, json_out);
     }
-    // Rotation is the recovery, so it must not sit behind the thing that
-    // failed. A log that cannot be summarised — because it is over the read
-    // limit, or not UTF-8 — would otherwise stay live forever: the appender
-    // refuses to add to it past the cap and the reader refuses to read it, so
-    // nothing retires it and telemetry stops for good. Retiring it still costs
-    // nothing: rotation is a rename, and the bytes keep their own file.
-    let report = match build_report(db, session_id) {
-        Ok(report) => report,
-        Err(error) => {
-            let stamp = stamp_now();
-            match session_log::rotate_live(db, &stamp) {
-                Ok(true) => {
-                    return Err(error.context(format!(
-                        "live log could not be summarised; it was rotated to {stamp}.jsonl so the \
-                         next session starts clean"
-                    )))
-                }
-                Ok(false) => return Err(error),
-                Err(rotate_error) => {
-                    return Err(error.context(format!("and rotation failed too: {rotate_error}")))
-                }
-            }
-        }
-    };
-    let stamp = report
-        .get("stamp")
-        .and_then(Value::as_str)
-        .unwrap_or("session")
-        .to_string();
+    // The report claims the live log before it reads it: rotation is an atomic
+    // rename, so of several overlapping reports exactly one owns each row.
+    // Reading first and rotating after let two reports count the same rows,
+    // and dropped any row appended between the read and the rename. Claiming
+    // first also retires a log that cannot be summarised (over the read limit,
+    // not UTF-8), which would otherwise stay live forever: the appender refuses
+    // to add to it past the cap and the reader refuses to read it. The rows
+    // keep their own file either way.
+    let stamp = stamp_now();
+    session_log::rotate_live(db, &stamp)
+        .with_context(|| format!("claim the live log as {stamp}.jsonl"))?;
+    let report =
+        build_report(db, &format!("{stamp}.jsonl"), &stamp, session_id).map_err(|error| {
+            error.context(format!(
+            "the live log was rotated to {stamp}.jsonl but could not be summarised, so the next \
+             session starts clean"
+        ))
+        })?;
     let dir = session_log::sessions_dir(db);
     let json_path = dir.join(format!("{stamp}.json"));
     let md_path = dir.join(format!("{stamp}.md"));
@@ -207,7 +197,6 @@ pub fn run(
     );
     devmap_query::write_atomic(&json_path, &rendered)?;
     devmap_query::write_atomic(&md_path, render_markdown(&report).as_bytes())?;
-    session_log::rotate_live(db, &stamp)?;
     if json_out {
         return Ok(report);
     }
@@ -273,15 +262,19 @@ fn newest_report(db: &Path) -> anyhow::Result<Option<Value>> {
     Ok(Some(serde_json::from_str(&text)?))
 }
 
-fn build_report(db: &Path, session_id: Option<&str>) -> anyhow::Result<Value> {
-    let live = session_log::read_live(db)?;
+fn build_report(
+    db: &Path,
+    log_name: &str,
+    stamp: &str,
+    session_id: Option<&str>,
+) -> anyhow::Result<Value> {
+    let live = session_log::read_log(db, log_name)?;
     let gap_ledger = read_gaps(db)?;
     let queries = live.records;
     let (gaps, resolved_gaps) = open_gaps(gap_ledger.records);
     // Records that were written but cannot be read back. Reported next to the
     // counts they are missing from, so a degraded report is visibly degraded.
     let unreadable = live.malformed.saturating_add(gap_ledger.malformed);
-    let stamp = stamp_now();
     let mut truncated = 0u64;
     let mut walk_incomplete = 0u64;
     let mut empty = 0u64;
@@ -765,7 +758,7 @@ mod tests {
     }
 
     fn open_ids(db: &Path) -> Vec<String> {
-        let report = build_report(db, None).unwrap();
+        let report = build_report(db, "live.jsonl", "session-test", None).unwrap();
         report["gaps"]
             .as_array()
             .unwrap()
@@ -784,7 +777,7 @@ mod tests {
         record_gap(&db, "t", "GAP-DONE", "was broken", None, false).unwrap();
         record_gap(&db, "t", "GAP-DONE", "fixed in abc123", None, true).unwrap();
 
-        let report = build_report(&db, None).unwrap();
+        let report = build_report(&db, "live.jsonl", "session-test", None).unwrap();
         assert_eq!(open_ids(&db), vec!["GAP-OPEN".to_string()], "{report}");
         assert_eq!(report["resolved_gaps"], json!(1), "{report}");
         let text = brief(&report);
@@ -808,7 +801,7 @@ mod tests {
         for session in [Some("ended"), Some("ended"), Some("other"), None] {
             session_log::append_query(&db, session, "devmap_search", None, None, None, 1);
         }
-        let report = build_report(&db, Some("ended")).unwrap();
+        let report = build_report(&db, "live.jsonl", "session-test", Some("ended")).unwrap();
         assert_eq!(report["session_id"], json!("ended"), "{report}");
         assert_eq!(report["query_count"], json!(4), "{report}");
         assert_eq!(report["session_query_count"], json!(2), "{report}");
@@ -825,7 +818,7 @@ mod tests {
         record_gap(&db, "t", "GAP-R", "first", None, false).unwrap();
         record_gap(&db, "t", "GAP-R", "fixed", None, true).unwrap();
         record_gap(&db, "t", "GAP-R", "it came back", None, false).unwrap();
-        let report = build_report(&db, None).unwrap();
+        let report = build_report(&db, "live.jsonl", "session-test", None).unwrap();
         let gaps = report["gaps"].as_array().unwrap();
         assert_eq!(gaps.len(), 1, "{report}");
         assert_eq!(gaps[0]["reason"], json!("it came back"));
@@ -848,14 +841,14 @@ mod tests {
         )
         .unwrap();
 
-        let report = build_report(&db, None).unwrap();
+        let report = build_report(&db, "live.jsonl", "session-test", None).unwrap();
         let gaps = report["gaps"].as_array().unwrap();
         assert_eq!(gaps.len(), 2, "an id-less line must not vanish: {report}");
         assert_eq!(gaps[0]["gap_key"], json!("unkeyed@1789109200000"));
         assert_eq!(gaps[1]["gap_key"], json!("unkeyed#1"));
 
         record_gap(&db, "t", "unkeyed@1789109200000", "stale", None, true).unwrap();
-        let report = build_report(&db, None).unwrap();
+        let report = build_report(&db, "live.jsonl", "session-test", None).unwrap();
         assert_eq!(report["gaps"].as_array().unwrap().len(), 1, "{report}");
         assert_eq!(report["resolved_gaps"], json!(1), "{report}");
         let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
@@ -918,7 +911,7 @@ mod tests {
             let refused = if case == "report" {
                 newest_report(&db).is_err()
             } else {
-                build_report(&db, None).is_err()
+                build_report(&db, "live.jsonl", "session-test", None).is_err()
             };
             fs::remove_dir_all(root).unwrap();
             assert!(refused, "linked {case} source was accepted");
@@ -986,6 +979,31 @@ mod tests {
             json!(3),
             "the full record survives the empty one"
         );
+    }
+
+    /// Overlapping SessionEnds of different sessions each leave a record, and
+    /// the log's rows are counted by exactly one of them.
+    #[test]
+    fn concurrent_reports_each_leave_a_record() {
+        let row = r#"{"tool":"devmap_search","session_id":"a"}"#;
+        let (root, db) = store_with_live_log("concurrent", &[row, row, row, row]);
+        let handles: Vec<_> = (0..8)
+            .map(|n| {
+                let db = db.clone();
+                std::thread::spawn(move || run(&db, false, Some(&format!("s{n}")), true))
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        let reports = reports_in(&root);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(reports.len(), 8, "one record per ending session");
+        let counted: u64 = reports
+            .iter()
+            .map(|report| report["query_count"].as_u64().unwrap())
+            .sum();
+        assert_eq!(counted, 4, "rows are reported once, not dropped or doubled");
     }
 
     #[test]

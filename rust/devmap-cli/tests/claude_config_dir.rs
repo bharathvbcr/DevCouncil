@@ -119,7 +119,11 @@ fn an_enabled_plugin_that_ships_hooks_clears_the_warning() {
     register_mcp(&profile.join(".claude.json"));
     let bundle = profile.join("plugins/cache/devmap-local/devmap/0.0.1");
     fs::create_dir_all(bundle.join("hooks")).unwrap();
-    fs::write(bundle.join("hooks/hooks.json"), r#"{"hooks":{}}"#).unwrap();
+    fs::write(
+        bundle.join("hooks/hooks.json"),
+        r#"{"hooks":{"SessionEnd":[{"hooks":[{"type":"command","command":"devmap hook session-end"}]}]}}"#,
+    )
+    .unwrap();
     fs::write(bundle.join(".mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
     fs::write(
         profile.join("plugins/installed_plugins.json"),
@@ -192,4 +196,57 @@ fn a_profile_that_cannot_be_read_is_reported_unchecked_not_clean() {
     let payload = doctor(&home, &cwd, Some(profile.to_str().unwrap()));
     let text = warning(&payload).expect("an unreadable settings.json is not a pass");
     assert!(text.contains("unchecked"), "{text}");
+}
+
+/// Only a SessionEnd hook writes the report. A profile that runs just
+/// `devmap hook pre-tool-use` is as record-less as one with no hooks.
+#[test]
+fn a_profile_with_only_a_pre_tool_use_hook_is_still_warned_about() {
+    let home = scratch("pretool-home");
+    let cwd = scratch("pretool-cwd");
+    let profile = home.join("profile");
+    register_mcp(&profile.join(".claude.json"));
+    fs::write(
+        profile.join("settings.json"),
+        r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"/abs/devmap hook pre-tool-use"}]}]}}"#,
+    )
+    .unwrap();
+    let text = warning(&doctor(&home, &cwd, Some(profile.to_str().unwrap())))
+        .expect("no SessionEnd hook, no records");
+    assert!(text.contains("SessionEnd"), "{text}");
+}
+
+/// An enabled plugin whose hooks.json lacks SessionEnd records nothing either;
+/// one whose hooks.json cannot be parsed is unchecked, never clean.
+#[test]
+fn a_plugin_without_a_session_end_hook_is_warned_about_and_a_bad_one_is_unchecked() {
+    for (body, expect) in [
+        (r#"{"hooks":{"PreToolUse":[]}}"#, "SessionEnd hook"),
+        ("{not json", "unchecked"),
+    ] {
+        let home = scratch("plugin-end-home");
+        let cwd = scratch("plugin-end-cwd");
+        let profile = home.join("profile");
+        register_mcp(&profile.join(".claude.json"));
+        let bundle = profile.join("plugins/cache/devmap-local/devmap/0.0.1");
+        fs::create_dir_all(bundle.join("hooks")).unwrap();
+        fs::write(bundle.join("hooks/hooks.json"), body).unwrap();
+        fs::write(bundle.join(".mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+        fs::write(
+            profile.join("plugins/installed_plugins.json"),
+            json!({"version": 2, "plugins": {"devmap@devmap-local": [
+                {"scope": "user", "installPath": bundle}
+            ]}})
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            profile.join("settings.json"),
+            r#"{"enabledPlugins":{"devmap@devmap-local":true}}"#,
+        )
+        .unwrap();
+        let text = warning(&doctor(&home, &cwd, Some(profile.to_str().unwrap())))
+            .unwrap_or_else(|| panic!("{body}: expected a warning"));
+        assert!(text.contains(expect), "{body}: {text}");
+    }
 }
