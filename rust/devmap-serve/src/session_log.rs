@@ -465,8 +465,15 @@ fn find_flag(value: &Value, key: &str, depth: u8) -> Option<Value> {
 /// error: see [`parse_jsonl`] for why one torn record must not cost the whole
 /// session.
 pub fn read_live(db_path: &Path) -> std::io::Result<Ledger<Map<String, Value>>> {
+    read_log(db_path, "live.jsonl")
+}
+
+/// Load a log in the session directory by file name (`live.jsonl`, or a
+/// rotated `<stamp>.jsonl` a report has claimed). A missing file is empty.
+pub fn read_log(db_path: &Path, file_name: &str) -> std::io::Result<Ledger<Map<String, Value>>> {
     use devmap_extract::safe_fs::{Access, Creation};
-    let mut file = match SafeFile::open(&live_log_path(db_path), Access::Read, Creation::Never) {
+    let path = sessions_dir(db_path).join(file_name);
+    let mut file = match SafeFile::open(&path, Access::Read, Creation::Never) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Ledger::default()),
         Err(error) => return Err(error),
@@ -499,11 +506,16 @@ pub fn rotate_live(db_path: &Path, stamp: &str) -> std::io::Result<bool> {
         Err(error) => return Err(error),
     }
     // rename_child validates both names as single path components.
-    directory.rename_child(
+    // The log can be claimed by a concurrent report between the check above
+    // and this rename; losing that race is "nothing left to rotate".
+    match directory.rename_child(
         std::ffi::OsStr::new("live.jsonl"),
         std::ffi::OsStr::new(&name),
-    )?;
-    Ok(true)
+    ) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]

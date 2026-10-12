@@ -684,14 +684,14 @@ pub(crate) fn plugin_warning() -> Option<String> {
 }
 
 /// The active Claude Code profile registers the Dev Map MCP server but loads
-/// none of its hooks.
+/// no SessionEnd hook.
 ///
 /// A seat profile pinned with `CLAUDE_CONFIG_DIR` has its own `.claude.json`
 /// and `settings.json`; the MCP queries still land in the store, but no
 /// SessionStart/SessionEnd/PreToolUse hook runs, so sessions never end with a
-/// report. Hooks count when the profile's `settings.json` or the project's
-/// `.claude/settings*.json` names `devmap`, or when the enabled Dev Map plugin
-/// ships a `hooks/hooks.json`. A document that exists but cannot be read is
+/// report. The hook counts when the profile's `settings.json` or the project's
+/// `.claude/settings*.json` names `devmap` under `SessionEnd`, or when the
+/// enabled Dev Map plugin's `hooks/hooks.json` has a `SessionEnd` entry. A document that exists but cannot be read is
 /// reported as unchecked, never as clean.
 pub(crate) fn profile_hooks_warning(cwd: &Path) -> Option<String> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
@@ -728,9 +728,13 @@ pub(crate) fn profile_hooks_warning(cwd: &Path) -> Option<String> {
             ))
         }
     }
+    // SessionEnd is the hook that writes the report. A profile that runs only
+    // `devmap hook pre-tool-use` still leaves no session record, so any other
+    // devmap hook must not clear the warning.
     let names_devmap_hook = |config: &serde_json::Value| {
         config
             .get("hooks")
+            .and_then(|hooks| hooks.get("SessionEnd"))
             .is_some_and(|hooks| hooks.to_string().contains("devmap"))
     };
     let project_settings = cwd.join(".claude");
@@ -752,19 +756,33 @@ pub(crate) fn profile_hooks_warning(cwd: &Path) -> Option<String> {
         }
     }
     let install = claude::claude_plugin_install(&home);
-    if install.enabled == Some(true)
-        && install
-            .loaded
-            .iter()
-            .any(|plugin| plugin.dir.join("hooks").join("hooks.json").is_file())
-    {
-        return None;
+    if install.enabled == Some(true) {
+        for plugin in &install.loaded {
+            let hooks = plugin.dir.join("hooks").join("hooks.json");
+            match read_json(&hooks) {
+                Ok(Some(config))
+                    if config
+                        .get("hooks")
+                        .and_then(|h| h.get("SessionEnd"))
+                        .is_some() =>
+                {
+                    return None
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    return Some(format!(
+                        "cannot read {error}; whether this Claude Code profile loads the Dev Map \
+                         hooks is unchecked"
+                    ))
+                }
+            }
+        }
     }
     Some(format!(
-        "the Claude Code profile at {} registers the Dev Map MCP server ({}) but loads none of \
-         its hooks: no `devmap` hook in its settings.json, the project's .claude/settings*.json, \
-         or an enabled Dev Map plugin. Sessions under this profile run no SessionStart, \
-         SessionEnd or PreToolUse hook, so they leave no session report; enable the Dev Map \
+        "the Claude Code profile at {} registers the Dev Map MCP server ({}) but loads no \
+         Dev Map SessionEnd hook: no `devmap` SessionEnd entry in its settings.json, the \
+         project's .claude/settings*.json, or an enabled Dev Map plugin's hooks.json. Sessions \
+         under this profile never end with a session report; enable the Dev Map \
          plugin in this profile, or add the `devmap hook <event>` entries to its settings.json",
         config_dir.display(),
         global.display()
