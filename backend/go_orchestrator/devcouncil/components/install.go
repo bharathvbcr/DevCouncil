@@ -174,10 +174,15 @@ func (o Options) prefix() string {
 	return DefaultPrefix()
 }
 
+// notACheckoutError is the one refusal for a --src that is not a checkout.
+func notACheckoutError(dir string) error {
+	return fmt.Errorf("--src %s is not a DevCouncil checkout (it needs rust/devmap-cli/Cargo.toml and backend/go_orchestrator/go.mod)", dir)
+}
+
 // hostSourceError is why the host cannot be installed without a checkout.
 func (o Options) hostSourceError() error {
 	if o.SourceRoot != "" {
-		return fmt.Errorf("--src %s is not a DevCouncil checkout (it needs rust/devmap-cli/Cargo.toml and backend/go_orchestrator/go.mod)", o.SourceRoot)
+		return notACheckoutError(o.SourceRoot)
 	}
 	return fmt.Errorf("the host builds only from a checkout (it links the Gusset engine, so it cannot be fetched remotely): git clone %s, then devcouncil install --src <dir>", PublicGit)
 }

@@ -134,7 +134,7 @@ func resolveSrc(dir string) (string, error) {
 		return "", fmt.Errorf("--src %s: %w", dir, err)
 	}
 	if !looksLikeCheckout(abs) {
-		return "", fmt.Errorf("--src %s is not a DevCouncil checkout (it needs rust/devmap-cli/Cargo.toml and backend/go_orchestrator/go.mod)", dir)
+		return "", notACheckoutError(dir)
 	}
 	return abs, nil
 }
