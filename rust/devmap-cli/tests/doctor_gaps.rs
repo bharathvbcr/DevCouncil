@@ -30,6 +30,7 @@ fn doctor_with_home(home: &Path, cwd: &Path) -> Value {
         .args(["--json", "doctor"])
         .current_dir(cwd)
         .env("HOME", home)
+        .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("DEVMAP_HOME")
         .output()
         .expect("doctor runs");
@@ -277,6 +278,7 @@ fn an_agent_whose_tool_list_excludes_devmap_is_named() {
         .args(["--json", "paths"])
         .current_dir(&cwd)
         .env("HOME", &home)
+        .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("DEVMAP_HOME")
         .output()
         .expect("paths runs");

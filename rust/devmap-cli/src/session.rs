@@ -198,6 +198,13 @@ pub fn run(
     let rendered = serde_json::to_vec_pretty(&report)?;
     devmap_extract::safe_fs::preflight_write(&json_path)?;
     devmap_extract::safe_fs::preflight_write(&md_path)?;
+    // Stamps are unique, so an existing record is never ours to replace: an
+    // empty report over a full one is the loss this guards against.
+    anyhow::ensure!(
+        !json_path.exists() && !md_path.exists(),
+        "refusing to replace the existing session record {}",
+        json_path.display()
+    );
     devmap_query::write_atomic(&json_path, &rendered)?;
     devmap_query::write_atomic(&md_path, render_markdown(&report).as_bytes())?;
     session_log::rotate_live(db, &stamp)?;
@@ -461,12 +468,25 @@ fn bump(obj: &mut Map<String, Value>, key: &str) {
     obj.insert(key.into(), json!(next));
 }
 
+/// A name no other report in this store shares.
+///
+/// Seconds alone collided: two SessionEnds in one second wrote the same
+/// `<stamp>.json`, and the later, empty one replaced the earlier report of
+/// nine queries. Sub-second time, the pid (another process) and a per-process
+/// counter (another report in this one) make the name unique without a lock.
 fn stamp_now() -> String {
-    let secs = SystemTime::now()
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQUENCE: AtomicU32 = AtomicU32::new(0);
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("session-{secs}")
+        .unwrap_or_default();
+    format!(
+        "session-{}-{:03}-{}-{}",
+        now.as_secs(),
+        now.subsec_millis(),
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn brief(report: &Value) -> String {
@@ -914,6 +934,64 @@ mod tests {
             assert_ne!(*name, "detect_changes", "`devmap blast` covers it");
             assert!(!note.contains("Python `dev"), "{name}: {note}");
         }
+    }
+
+    fn store_with_live_log(case: &str, rows: &[&str]) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "devmap-session-stamp-{case}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("sessions")).unwrap();
+        fs::write(
+            root.join("sessions").join("live.jsonl"),
+            rows.iter()
+                .map(|row| format!("{row}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        (root.clone(), root.join("store.sqlite"))
+    }
+
+    fn reports_in(root: &Path) -> Vec<Value> {
+        let mut reports: Vec<Value> = fs::read_dir(root.join("sessions"))
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("session-") && name.ends_with(".json")
+            })
+            .map(|entry| serde_json::from_slice(&fs::read(entry.path()).unwrap()).unwrap())
+            .collect();
+        reports.sort_by_key(|report| report["query_count"].as_u64());
+        reports
+    }
+
+    /// Two reports in one second used to share `session-<secs>`: the second,
+    /// finding the log already rotated, replaced the first's nine queries with
+    /// an empty report.
+    #[test]
+    fn two_reports_in_one_second_keep_both_records() {
+        let row = r#"{"tool":"devmap_search","session_id":"a"}"#;
+        let (root, db) = store_with_live_log("same-second", &[row, row, row]);
+        run(&db, false, Some("a"), true).unwrap();
+        run(&db, false, Some("b"), true).unwrap();
+        let reports = reports_in(&root);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(reports.len(), 2, "one record per report: {reports:?}");
+        assert_eq!(reports[0]["query_count"], json!(0));
+        assert_eq!(
+            reports[1]["query_count"],
+            json!(3),
+            "the full record survives the empty one"
+        );
+    }
+
+    #[test]
+    fn stamps_never_repeat_within_a_process() {
+        let stamps: std::collections::HashSet<String> = (0..1000).map(|_| stamp_now()).collect();
+        assert_eq!(stamps.len(), 1000);
     }
 
     #[test]

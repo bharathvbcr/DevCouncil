@@ -54,7 +54,10 @@ fn devmap() -> PathBuf {
 
 fn run_in(root: &Path, args: &[&str], home: Option<&Path>) -> Output {
     let mut cmd = Command::new(devmap());
-    cmd.args(args).current_dir(root).env_remove("DEVMAP_HOME");
+    cmd.args(args)
+        .current_dir(root)
+        .env_remove("DEVMAP_HOME")
+        .env_remove("CLAUDE_CONFIG_DIR");
     if let Some(home) = home {
         cmd.env("HOME", home);
     }
@@ -376,6 +379,7 @@ fn doctor_resolves_bare_devmap_and_hashes_binaries() {
         .args(["--json", "doctor"])
         .current_dir(&cwd)
         .env("HOME", &home)
+        .env_remove("CLAUDE_CONFIG_DIR")
         .env("PATH", &bin)
         .env_remove("DEVMAP_HOME")
         .output()

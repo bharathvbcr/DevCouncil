@@ -42,6 +42,7 @@ fn diagnostics_never_execute_discovered_commands() {
                 .args(["--json", command])
                 .current_dir(&root)
                 .env("HOME", root.join("home"))
+                .env_remove("CLAUDE_CONFIG_DIR")
                 .env(
                     "PATH",
                     root.join(if registration == "devmap" {
@@ -130,6 +131,7 @@ fn diagnostics_stay_inside_their_own_budget() {
             .args(["--json", command])
             .current_dir(&root)
             .env("HOME", root.join("home"))
+            .env_remove("CLAUDE_CONFIG_DIR")
             .env("PATH", root.join("bin"))
             .env_remove("DEVMAP_HOME");
         let output = devmap_extract::subprocess::run_bounded(
@@ -210,6 +212,7 @@ fn paths_field(root: &std::path::Path, field: &str) -> serde_json::Value {
         .args(["--json", "paths"])
         .current_dir(root)
         .env("HOME", root.join("home"))
+        .env_remove("CLAUDE_CONFIG_DIR")
         .env("PATH", root.join("bin"))
         .env_remove("DEVMAP_HOME");
     let output = devmap_extract::subprocess::run_bounded(
