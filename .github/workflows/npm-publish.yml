@@ -102,8 +102,9 @@ jobs:
 
   # `npm publish` leaves `latest` wherever the registry's tag logic puts it;
   # a higher withdrawn version can keep it. Assert it, set it if wrong, and
-  # fail the job unless the registry then agrees. Runs whether or not this
-  # run published, so a re-run repairs a tag. Pre-releases are not `latest`.
+  # fail the job unless the registry then agrees, after re-applying the
+  # withdrawn versions' deprecations. Runs whether or not this run published,
+  # so a re-run repairs both. Pre-releases are not `latest`.
   latest:
     name: Assert dist-tag latest
     runs-on: ubuntu-latest
@@ -117,6 +118,41 @@ jobs:
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
+      # Re-apply the deprecations of the withdrawn versions (owner decision,
+      # 2026-10-09), so a registry edit cannot quietly undo them. The list is
+      # exact versions, never a range: a range such as <1.0.0 would also
+      # deprecate every future 0.x release the moment it is published.
+      - name: Keep the withdrawn versions deprecated
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          WITHDRAWN_MSG="withdrawn: mis-numbered build of the 0.2.4 line; install devcouncil@latest"
+          SUPERSEDED_MSG="superseded by the 0.2.x line; install devcouncil@latest"
+          # version|message, one per line
+          WANT="1.3.5|${WITHDRAWN_MSG}
+          0.3.0|${SUPERSEDED_MSG}
+          0.3.1|${SUPERSEDED_MSG}
+          0.4.0|${SUPERSEDED_MSG}
+          0.4.1|${SUPERSEDED_MSG}
+          0.4.2|${SUPERSEDED_MSG}"
+          if printf '%s\n' "$WANT" | sed 's/^ *//' | cut -d'|' -f1 | grep -qxF "$VERSION"; then
+            echo "::error::${VERSION} is a withdrawn version; it must not be released"
+            exit 1
+          fi
+          npm ping
+          bad=0
+          while IFS='|' read -r v msg; do
+            v="${v#"${v%%[! ]*}"}"
+            npm deprecate "devcouncil@${v}" "$msg" </dev/null
+            got="$(npm view "devcouncil@${v}" deprecated </dev/null)"
+            if [ "$got" != "$msg" ]; then
+              echo "::error::devcouncil@${v} deprecation is '${got:-unset}', expected '${msg}'"
+              bad=1
+            fi
+          done <<< "$WANT"
+          exit "$bad"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Point latest at the released version
         run: |
           set -euo pipefail
@@ -159,6 +195,25 @@ jobs:
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
+      # The npm package is only a launcher; with no host on the runner the
+      # smoke reports NOT RUN and fails. Build the host from this tag's
+      # checkout (the only install route) so the published launcher has a
+      # real binary to reach.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go_orchestrator/go.mod
+          cache-dependency-path: backend/go_orchestrator/go.mod
+      - name: Set up Gusset
+        uses: ./.github/actions/setup-gusset
+      - name: Build the host the launcher will reach
+        run: |
+          set -euo pipefail
+          HOST_DIR="${RUNNER_TEMP}/devcouncil-host"
+          mkdir -p "$HOST_DIR"
+          go -C backend/go_orchestrator build -o "$HOST_DIR/devcouncil" ./cmd/devcouncil
+          "$HOST_DIR/devcouncil" version
+          echo "$HOST_DIR" >> "$GITHUB_PATH"
       - name: Registry smoke (required after a new publish)
         run: |
           set -euo pipefail
