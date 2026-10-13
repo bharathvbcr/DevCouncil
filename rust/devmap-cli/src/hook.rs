@@ -2778,6 +2778,221 @@ mod tests {
         );
     }
 
+    /// A dangling symlink and a symlink loop exist as directory entries and
+    /// still fail `canonicalize`. That is a diagnostic, not a spawn.
+    #[cfg(unix)]
+    #[test]
+    fn probe_does_not_spawn_a_dangling_symlink_or_a_symlink_loop() {
+        let base = scratch_dir("dangling");
+        let repo = base.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let dangling = base.join("dangling-devmap");
+        std::os::unix::fs::symlink(base.join("missing-target"), &dangling).unwrap();
+        let loop_link = base.join("loop-devmap");
+        std::os::unix::fs::symlink(&loop_link, &loop_link).unwrap();
+
+        for exe in [&dangling, &loop_link] {
+            let result = probe(
+                exe,
+                &repo,
+                &["status"],
+                Instant::now(),
+                Duration::from_secs(5),
+            );
+            let err = result.expect_err("canonicalize failure must not spawn");
+            let message = err.to_string();
+            assert!(
+                message.contains("refusing to probe") && message.contains("canonicalize"),
+                "{exe:?} -> {message}"
+            );
+        }
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Zero remaining budget returns before spawn. An outside binary that would
+    /// otherwise run must not run, including when the budget was already spent.
+    #[cfg(unix)]
+    #[test]
+    fn probe_skips_spawn_when_the_deadline_is_already_zero() {
+        let base = scratch_dir("deadline");
+        let repo = base.join("repo");
+        let outside = base.join("other").join("target").join("debug");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let marker = base.join("ran");
+        let exe = outside.join("devmap");
+        write_script(
+            &exe,
+            &format!("#!/bin/sh\n: > '{}'\necho deadline-ran\n", marker.display()),
+        );
+        let inside = repo.join("devmap");
+        write_script(
+            &inside,
+            &format!("#!/bin/sh\n: > '{}'\necho inside-ran\n", marker.display()),
+        );
+
+        let zero = probe(&exe, &repo, &["status"], Instant::now(), Duration::ZERO);
+        let spent = probe(
+            &exe,
+            &repo,
+            &["status"],
+            Instant::now()
+                .checked_sub(Duration::from_secs(30))
+                .expect("instant subtraction"),
+            Duration::from_secs(5),
+        );
+        let inside_zero = probe(&inside, &repo, &["status"], Instant::now(), Duration::ZERO);
+
+        let ran = marker.exists();
+        let _ = fs::remove_dir_all(&base);
+        assert!(
+            matches!(zero, Ok(None)),
+            "a zero budget must skip spawn, got {zero:?}"
+        );
+        assert!(
+            matches!(spent, Ok(None)),
+            "an already-spent budget must skip spawn, got {spent:?}"
+        );
+        assert!(
+            matches!(inside_zero, Ok(None)),
+            "the deadline return stays ahead of the inside-repo refusal, got {inside_zero:?}"
+        );
+        assert!(!ran, "a deadline of zero still spawned the probe");
+    }
+
+    /// `repo/sub/../../repo-evil` is the sibling, not the repo. A `..` that
+    /// stays inside (`repo/sub/../devmap`) is still inside.
+    #[cfg(unix)]
+    #[test]
+    fn probe_treats_dotdot_by_components_not_as_a_string_prefix() {
+        let base = scratch_dir("dotdot");
+        let repo = base.join("repo");
+        let evil = base.join("repo-evil");
+        fs::create_dir_all(repo.join("sub")).unwrap();
+        fs::create_dir_all(&evil).unwrap();
+        let marker = base.join("ran");
+        let outside_exe = evil.join("devmap");
+        write_script(
+            &outside_exe,
+            &format!("#!/bin/sh\n: > '{}'\necho dotdot-out\n", marker.display()),
+        );
+        let inside_exe = repo.join("devmap");
+        write_script(
+            &inside_exe,
+            &format!("#!/bin/sh\n: > '{}'\necho dotdot-in\n", marker.display()),
+        );
+
+        let outside_path = repo
+            .join("sub")
+            .join("..")
+            .join("..")
+            .join("repo-evil")
+            .join("devmap");
+        let outside = probe(
+            &outside_path,
+            &repo,
+            &["status"],
+            Instant::now(),
+            Duration::from_secs(5),
+        );
+        let ran_outside = marker.exists();
+        let _ = fs::remove_file(&marker);
+        let inside_path = repo.join("sub").join("..").join("devmap");
+        let inside = probe(
+            &inside_path,
+            &repo,
+            &["status"],
+            Instant::now(),
+            Duration::from_secs(5),
+        );
+        let ran_inside = marker.exists();
+        let _ = fs::remove_dir_all(&base);
+
+        let stdout = outside.expect("a .. path that leaves the repo must run");
+        assert!(ran_outside, "sibling reached by .. did not run: {stdout:?}");
+        assert!(
+            inside.is_err(),
+            "a .. path that remains inside was spawned: {inside:?}"
+        );
+        assert!(!ran_inside, "the in-repo executable was spawned via ..");
+    }
+
+    /// The original path is `repo-evil`, which is not a string prefix of `repo`,
+    /// but it is a symlink to a binary whose canonical path is inside.
+    #[cfg(unix)]
+    #[test]
+    fn probe_does_not_spawn_when_a_prefixed_symlink_canonicalizes_inside() {
+        let base = scratch_dir("prefix-inside");
+        let repo = base.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let marker = base.join("ran");
+        let real = repo.join("devmap");
+        write_script(
+            &real,
+            &format!(
+                "#!/bin/sh\n: > '{}'\necho prefix-inside\n",
+                marker.display()
+            ),
+        );
+        let evil = base.join("repo-evil");
+        std::os::unix::fs::symlink(&real, &evil).unwrap();
+
+        let result = probe(
+            &evil,
+            &repo,
+            &["status"],
+            Instant::now(),
+            Duration::from_secs(5),
+        );
+        let ran = marker.exists();
+        let _ = fs::remove_dir_all(&base);
+        let err = result.expect_err("canonical path inside the repo must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("refusing to probe") && message.contains("inside"),
+            "{message}"
+        );
+        assert!(!ran, "symlink named repo-evil ran its in-repo target");
+    }
+
+    /// A directory symlink that lives inside the repo and points outside is
+    /// still inside, even though the canonical target is not.
+    #[cfg(unix)]
+    #[test]
+    fn probe_does_not_spawn_through_an_in_repo_directory_symlink() {
+        let base = scratch_dir("dirlink");
+        let repo = base.join("repo");
+        let outside = base.join("outside");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let marker = base.join("ran");
+        let real = outside.join("devmap");
+        write_script(
+            &real,
+            &format!("#!/bin/sh\n: > '{}'\necho dirlink-ran\n", marker.display()),
+        );
+        std::os::unix::fs::symlink(&outside, repo.join("out")).unwrap();
+        let exe = repo.join("out").join("devmap");
+
+        let result = probe(
+            &exe,
+            &repo,
+            &["status"],
+            Instant::now(),
+            Duration::from_secs(5),
+        );
+        let ran = marker.exists();
+        let _ = fs::remove_dir_all(&base);
+        assert!(
+            result.is_err(),
+            "in-repo directory symlink was spawned: {result:?}"
+        );
+        assert!(
+            !ran,
+            "the outside target of an in-repo directory symlink ran"
+        );
+    }
+
     /// The command layer reports the probe refusal as a hook error, not as an
     /// empty success. `run_hook` is what `commands/hook.rs` prints and exits with.
     #[cfg(unix)]
@@ -2816,6 +3031,40 @@ mod tests {
             "refusal must not look like a summary"
         );
         assert!(!ran, "run_hook spawned the in-repo executable");
+    }
+
+    /// A missing executable fails canonicalize. `run_hook` must surface that as
+    /// exit 1 with a diagnostic, not as an empty success and not as a panic.
+    #[cfg(unix)]
+    #[test]
+    fn run_hook_reports_a_missing_executable_as_exit_1() {
+        let base = scratch_dir("missing-hook");
+        let repo = base.join("repo");
+        fs::create_dir_all(repo.join(".devcouncil/codeintel")).unwrap();
+        fs::write(repo.join(".devcouncil/codeintel/devmap.sqlite"), b"x").unwrap();
+        let missing = base.join("no-such-devmap");
+
+        let outcome = run_hook(
+            HookEvent::SessionStart,
+            br#"{"session_id":"missing-exe"}"#,
+            &missing,
+            Some(&repo),
+        );
+
+        let _ = fs::remove_dir_all(&base);
+        assert_eq!(outcome.exit_code, 1, "{:?}", outcome.stderr_line);
+        let line = outcome
+            .stderr_line
+            .expect("canonicalize failure must be a stderr diagnostic");
+        assert!(
+            line.contains("refusing to probe") && line.contains("canonicalize"),
+            "{line}"
+        );
+        assert!(
+            outcome.stdout.is_none(),
+            "missing executable must not look like a summary: {:?}",
+            outcome.stdout
+        );
     }
 
     use serde_json::json;

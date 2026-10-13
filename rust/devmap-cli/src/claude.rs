@@ -2885,6 +2885,144 @@ mod tests {
         }
     }
 
+    /// Apostrophe, backticks, and a substitution glued on after a quote must
+    /// stay one literal word under `/bin/sh -c`. The marker is the proof.
+    #[cfg(unix)]
+    #[test]
+    fn hooks_block_single_quotes_hold_past_apostrophe_and_backtick_breakouts() {
+        let marker = std::env::temp_dir().join(format!(
+            "devmap-hook-break-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let dir = marker.with_extension("dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let subst = "$(touch \"$MARKER\")";
+        let tick = "`touch \"$MARKER\"`";
+        let paths = [
+            format!("/tmp/{subst}/devmap"),
+            format!("/tmp/{tick}/devmap"),
+            format!("/tmp/o'{subst}/devmap"),
+            format!("/tmp/'{subst}'/devmap"),
+            format!("/tmp/foo'; touch \"$MARKER\"; echo '/devmap"),
+            format!("'{subst}"),
+            format!("{subst}'"),
+            format!("/tmp/my bin/{subst}/devmap"),
+            format!("/tmp/δé/{subst}/devmap"),
+            format!("/tmp/路径/{tick}/devmap"),
+            format!("/tmp/$'{subst}'/devmap"),
+            format!("/tmp/foo\\ bar/{subst}/devmap"),
+            format!("/tmp/a\u{2028}{subst}/devmap"),
+            format!("/tmp/a\u{202e}{tick}/devmap"),
+            format!("/tmp/foo # {subst}"),
+            format!("/tmp/<({subst})/devmap"),
+            format!("a'b'c'{subst}"),
+        ];
+        for path in &paths {
+            let block = hooks_block(Path::new(path), &["hook".to_string()])
+                .unwrap_or_else(|err| panic!("emission panicked or refused {path:?}: {err}"));
+            let mut commands = Vec::new();
+            for groups in block["hooks"].as_object().unwrap().values() {
+                for group in groups.as_array().unwrap() {
+                    for handler in group["hooks"].as_array().unwrap() {
+                        commands.push(handler["command"].as_str().unwrap().to_string());
+                    }
+                }
+            }
+            assert!(!commands.is_empty(), "{path:?} emitted no commands");
+            for command in &commands {
+                assert!(
+                    command.starts_with('\''),
+                    "executable must be single-quoted: {command}"
+                );
+                assert!(
+                    !command.contains('\n') && !command.contains('\r') && !command.contains('\0'),
+                    "refused bytes were emitted: {command:?}"
+                );
+                if path.contains('\'') {
+                    assert!(
+                        command.contains("'\\''"),
+                        "an apostrophe must be '\\'' : {command}"
+                    );
+                }
+                let status = std::process::Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg(command)
+                    .current_dir(&dir)
+                    .env_clear()
+                    .env("MARKER", &marker)
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("IFS", " \t\n'\\$`;|&<>")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .expect("sh runs");
+                assert!(
+                    !marker.exists(),
+                    "shell expanded the executable path ({status}) from {path:?}: {command}"
+                );
+            }
+        }
+        let quoted = hooks_block(
+            Path::new("/tmp/o'$(touch \"$MARKER\")/devmap"),
+            &["hook".to_string()],
+        )
+        .expect("apostrophe path emits");
+        let sample = quoted["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            sample,
+            "'/tmp/o'\\''$(touch \"$MARKER\")/devmap' hook session-start"
+        );
+        let cursor = cursor_hooks_document(Path::new("/tmp/`touch \"$MARKER\"`/devmap"))
+            .expect("cursor hooks use the same quoting");
+        let cursor_cmd = cursor["hooks"]["sessionStart"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            cursor_cmd,
+            "'/tmp/`touch \"$MARKER\"`/devmap' hook session-start"
+        );
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(cursor_cmd)
+            .current_dir(&dir)
+            .env_clear()
+            .env("MARKER", &marker)
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("sh runs");
+        assert!(
+            !marker.exists(),
+            "cursor hook command expanded the executable path ({status}): {cursor_cmd}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    /// A newline glued to a substitution is still a newline: refuse, do not emit.
+    #[test]
+    fn hooks_block_refuses_a_breakout_that_embeds_a_newline_cr_or_nul() {
+        for path in [
+            "/tmp/ok/devmap\n/bin/touch",
+            "/tmp/`touch x`\r/devmap",
+            "/tmp/o'$(touch x)\0/devmap",
+        ] {
+            assert!(
+                hooks_block(Path::new(path), &["hook".into()]).is_err(),
+                "emitted a command for {path:?}"
+            );
+        }
+    }
+
     /// The URL an agent is handed must be the address the server binds.
     ///
     /// `mcp_entry` writes `http://{normalize_http_address(..)}` into the client
