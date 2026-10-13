@@ -540,7 +540,7 @@ fn check_handler(event: &str, at: &str, handler: &Value, out: &mut Vec<Diagnosti
                         "`args` is refused: Cursor and Codex run hooks as a shell-string \
                          `command` only, and Cursor drops `args` so the hook becomes bare \
                          `devmap` (exit 2 blocks the agent). Use shell-form \
-                         `\"<abs>\" hook <event>` instead",
+                         `'<abs>' hook <event>` instead",
                     ));
                 }
                 if handler.contains_key("async") {
@@ -566,7 +566,7 @@ fn check_handler(event: &str, at: &str, handler: &Value, out: &mut Vec<Diagnosti
                             at,
                             format!(
                                 "hook `command` {trimmed:?} is a bare name; Cursor/Codex need an \
-                                 absolute-path shell-form command (\"/path/to/devmap\" hook <event>)"
+                                 absolute-path shell-form command ('/path/to/devmap' hook <event>)"
                             ),
                         ));
                     }
@@ -1210,7 +1210,7 @@ pub struct DevmapHook {
 /// Every other event is settled as "no handler" in [`event_coverage`], with the
 /// reason, rather than left unexamined.
 ///
-/// Handlers are shell-form only (`"<abs>" hook <event>`): Cursor drops `args`,
+/// Handlers are shell-form only (`'<abs>' hook <event>`): Cursor drops `args`,
 /// Codex ignores `async`, and exit 2 blocks the agent on both.
 pub const DEVMAP_HOOKS: &[DevmapHook] = &[
     DevmapHook {
@@ -1413,14 +1413,22 @@ fn resolves_to_self(name: &str, executable: &Path, path_var: Option<&std::ffi::O
     false
 }
 
+/// One shell-form hook command: `'<abs>' hook <event>`.
+fn hook_shell_command(exe_text: &str, event: &str) -> anyhow::Result<String> {
+    let quoted = crate::hook::shell_quote_hook_executable(exe_text)?;
+    Ok(format!("{quoted} hook {event}"))
+}
+
 /// Build the `{"hooks": {...}}` block Dev Map installs.
 ///
 /// `subcommands` is the parser's own list; a missing `hook` subcommand is
 /// refused rather than written.
 ///
-/// Shell-form only: `"command": "\"<abs>\" hook <event>"`. No `args`, no
-/// `async`, no `${CLAUDE_PROJECT_DIR}` — Cursor drops args, Codex ignores async,
-/// and root selection happens inside the hook from stdin.
+/// Shell-form only: `"command": "'<abs>' hook <event>"`. The executable is
+/// single-quoted so a shell does not expand `$(...)` or backticks in the
+/// path. No `args`, no `async`, no `${CLAUDE_PROJECT_DIR}` — Cursor drops
+/// args, Codex ignores async, and root selection happens inside the hook
+/// from stdin.
 pub fn hooks_block(executable: &Path, subcommands: &[String]) -> anyhow::Result<Value> {
     if !subcommands.iter().any(|name| name == "hook") {
         anyhow::bail!(
@@ -1446,7 +1454,7 @@ pub fn hooks_block(executable: &Path, subcommands: &[String]) -> anyhow::Result<
                 PERMISSION_DECIDING_EVENTS.join(", ")
             );
         }
-        let command = format!("\"{exe_text}\" hook {}", spec.hook_event);
+        let command = hook_shell_command(&exe_text, spec.hook_event)?;
 
         let mut handler = Map::new();
         handler.insert("type".into(), json!("command"));
@@ -1605,19 +1613,22 @@ pub fn plugin_binary_assets() -> Vec<(PathBuf, &'static [u8])> {
 /// tool, so the directive is injected after the first read instead.
 pub fn cursor_hooks_document(executable: &Path) -> anyhow::Result<Value> {
     let exe = utf8_path("the devmap executable path", &hook_executable(executable))?;
-    let cmd = |event: &str| format!("\"{exe}\" hook {event}");
+    let session_start = hook_shell_command(&exe, "session-start")?;
+    let after_file_edit = hook_shell_command(&exe, "post-tool-use")?;
+    let post_tool_use = hook_shell_command(&exe, "pre-tool-use")?;
+    let session_end = hook_shell_command(&exe, "session-end")?;
     Ok(json!({
         "version": 1,
         "generatedBy": "devmap",
         "hooks": {
-            "sessionStart": [{ "command": cmd("session-start") }],
-            "afterFileEdit": [{ "command": cmd("post-tool-use") }],
+            "sessionStart": [{ "command": session_start }],
+            "afterFileEdit": [{ "command": after_file_edit }],
             "postToolUse": [{
-                "command": cmd("pre-tool-use"),
+                "command": post_tool_use,
                 "matcher": "Read|Grep",
             }],
             "sessionEnd": [{
-                "command": cmd("session-end"),
+                "command": session_end,
                 "timeout": SESSION_END_MAX_TIMEOUT_SECS,
             }],
         }
@@ -2778,6 +2789,98 @@ mod tests {
                 "'{ambiguous}' resolved to {:?} instead of being refused; an address \
                  the user did not clearly specify must not be guessed into a bind",
                 resolve(ambiguous)
+            );
+        }
+    }
+
+    /// A host runs the emitted command through a shell. Double quotes still
+    /// expand `$(...)`; the marker is the proof, not the quote character.
+    #[cfg(unix)]
+    #[test]
+    fn hooks_block_single_quotes_a_path_the_shell_would_expand() {
+        let marker = std::env::temp_dir().join(format!(
+            "devmap-hook-quote-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let dir = marker.with_extension("dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = PathBuf::from("/tmp/$(touch \"$MARKER\")/devmap");
+        let block = hooks_block(&exe, &["hook".to_string()]).expect("normal emission");
+        let mut commands = Vec::new();
+        for groups in block["hooks"].as_object().unwrap().values() {
+            for group in groups.as_array().unwrap() {
+                for handler in group["hooks"].as_array().unwrap() {
+                    commands.push(handler["command"].as_str().unwrap().to_string());
+                }
+            }
+        }
+        assert!(!commands.is_empty(), "hooks_block emitted no commands");
+        for command in &commands {
+            assert!(
+                command.starts_with('\''),
+                "executable must be single-quoted: {command}"
+            );
+            assert!(
+                command.contains("$(touch \"$MARKER\")"),
+                "the metacharacters must survive as literal text: {command}"
+            );
+            let status = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(command)
+                .current_dir(&dir)
+                .env("MARKER", &marker)
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("sh runs");
+            assert!(
+                !marker.exists(),
+                "shell expanded the executable path ({status}): {command}"
+            );
+        }
+        let ordinary = hooks_block(Path::new("/usr/local/bin/devmap"), &["hook".to_string()])
+            .expect("an absolute path with no shell metacharacters must validate");
+        let sample = ordinary["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert_eq!(sample, "'/usr/local/bin/devmap' hook session-start");
+        let cursor = cursor_hooks_document(&exe).expect("cursor hooks use the same quoting");
+        let cursor_cmd = cursor["hooks"]["sessionStart"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            cursor_cmd,
+            "'/tmp/$(touch \"$MARKER\")/devmap' hook session-start"
+        );
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(cursor_cmd)
+            .current_dir(&dir)
+            .env("MARKER", &marker)
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("sh runs");
+        assert!(
+            !marker.exists(),
+            "cursor hook command expanded the executable path ({status}): {cursor_cmd}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    fn hooks_block_refuses_a_path_that_single_quotes_cannot_hold() {
+        for path in ["/tmp/a\nb/devmap", "/tmp/a\rb/devmap", "/tmp/a\0b/devmap"] {
+            let err = hooks_block(Path::new(path), &["hook".into()])
+                .expect_err("newline, CR, or NUL must not be emitted");
+            let text = err.to_string();
+            assert!(
+                text.contains("newline") && text.contains("NUL"),
+                "{path:?} -> {text}"
             );
         }
     }
