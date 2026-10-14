@@ -861,6 +861,7 @@ fn an_unresolved_call_that_goes_away_leaves_the_generation_that_had_it_intact() 
             },
             class: UnresolvedClass::Unresolved,
             receiver: Some("obj".into()),
+            site: None,
         }],
     };
     let analysis = analyze(&extractions, &with_ledger);

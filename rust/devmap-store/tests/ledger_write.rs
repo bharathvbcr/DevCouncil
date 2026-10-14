@@ -89,6 +89,7 @@ fn row(n: usize) -> UnresolvedReference {
         } else {
             Some(format!("recv_{n}"))
         },
+        site: None,
     }
 }
 
@@ -238,6 +239,7 @@ fn interning_preserves_every_reason_byte_and_never_merges_two_rows() {
             },
             class: UnresolvedClass::Unresolved,
             receiver: None,
+            site: None,
         })
         .collect();
     let db = write_ledger(&dir, unresolved.clone());
@@ -723,6 +725,7 @@ fn every_unresolved_class_keeps_its_own_label() {
             },
             class: class.clone(),
             receiver: None,
+            site: None,
         })
         .collect();
 
@@ -811,6 +814,7 @@ fn every_row_keeps_its_own_source_file() {
             },
             class: UnresolvedClass::Unresolved,
             receiver: None,
+            site: None,
         })
         .collect();
 

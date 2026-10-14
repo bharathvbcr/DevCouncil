@@ -4583,6 +4583,7 @@ impl Resolver {
                             },
                             class: UnresolvedClass::Unresolved,
                             receiver: None,
+                            site: None,
                         });
                     }
                     let edge_targets = if ext.language == "go" {
@@ -5730,6 +5731,7 @@ impl Resolver {
                                     resolution: (**resolution).clone(),
                                     class: UnresolvedClass::Unresolved,
                                     receiver: call.receiver_expr.clone(),
+                                    site: Some(SiteBytes::of(&call.span)),
                                 });
                                 emitted = true;
                             }
@@ -5753,6 +5755,7 @@ impl Resolver {
                                         resolution: (**resolution).clone(),
                                         class: UnresolvedClass::Unresolved,
                                         receiver: call.receiver_expr.clone(),
+                                        site: Some(SiteBytes::of(&call.span)),
                                     });
                                 } else {
                                     for (target_f, target_sym) in candidates.iter() {
@@ -5819,6 +5822,7 @@ impl Resolver {
                             },
                             class,
                             receiver: call.receiver_expr.clone(),
+                            site: Some(SiteBytes::of(&call.span)),
                         });
                     }
                 }
@@ -5938,6 +5942,7 @@ impl Resolver {
                         },
                         class,
                         receiver: reference.receiver_expr.clone(),
+                        site: Some(SiteBytes::of(&reference.span)),
                     });
                 }
 
@@ -5992,6 +5997,7 @@ impl Resolver {
                                     module: module.clone(),
                                 },
                                 receiver: entry.qualifier.clone(),
+                                site: None,
                             });
                             continue;
                         }
@@ -6027,6 +6033,7 @@ impl Resolver {
                                 },
                                 class: UnresolvedClass::Unresolved,
                                 receiver: entry.qualifier.clone(),
+                                site: None,
                             }),
                         }
                     }
@@ -6068,6 +6075,7 @@ impl Resolver {
                             },
                             class: UnresolvedClass::Unresolved,
                             receiver: None,
+                            site: None,
                         });
                         continue;
                         }
