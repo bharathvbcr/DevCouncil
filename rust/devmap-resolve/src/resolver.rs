@@ -338,6 +338,10 @@ pub struct Resolver {
     /// `<file>::<exported name>` -> the file that declares it, for
     /// `export { x } from './m'`. See `compute_reexport_chains`.
     reexport_chains: BTreeMap<String, String>,
+    /// Set when the glob expansion behind `reexport_chains` stopped at
+    /// `REEXPORT_GLOB_MAX_HOPS`, so the chains are a partial map. See
+    /// [`Self::reexport_glob_cutoff`].
+    reexport_glob_cutoff: Option<ReexportGlobCutoff>,
     /// Rust: `<file>` -> the module files its `pub use m::*;` globs name. A
     /// module path segment that is no child of a file may be a module one of
     /// these publishes (see `rust_module_through_globs`).
@@ -652,6 +656,7 @@ impl Resolver {
             rust_signatures: BTreeMap::new(),
             unexported_symbols: BTreeSet::new(),
             reexport_chains: BTreeMap::new(),
+            reexport_glob_cutoff: None,
             rust_module_globs: BTreeMap::new(),
             default_exports: BTreeMap::new(),
             receiver_types: BTreeMap::new(),
@@ -2898,6 +2903,7 @@ impl Resolver {
         self.rust_signatures.clear();
         self.unexported_symbols.clear();
         self.reexport_chains.clear();
+        self.reexport_glob_cutoff = None;
         self.rust_module_globs.clear();
         self.default_exports.clear();
         self.receiver_types.clear();
@@ -3378,7 +3384,8 @@ impl Resolver {
                     .map(|local| (ext.file_path.clone(), local))
             })
             .collect();
-        self.reexport_chains = self.compute_reexport_chains(extractions);
+        (self.reexport_chains, self.reexport_glob_cutoff) =
+            self.compute_reexport_chains(extractions);
         self.rust_module_globs = self.compute_rust_module_globs(extractions);
 
         // Pass two resolves aliases and receiver hints against the complete
@@ -4020,7 +4027,8 @@ impl Resolver {
     /// is exactly where it gets large. Past this the expansion stops and the
     /// chains it would have built are simply absent, which is the answer the
     /// map gave before globs were expanded at all: a lost chain costs
-    /// precision, never a wrong edge.
+    /// precision, never a wrong edge. A lost chain is still a loss, so the stop
+    /// is recorded: [`Self::reexport_glob_cutoff`] reports it.
     const REEXPORT_GLOB_MAX_HOPS: usize = 200_000;
 
     /// Turn each glob re-export into one hop per name the target publishes.
@@ -4037,27 +4045,30 @@ impl Resolver {
     /// And a name that *two* globs bring in from two different files has no
     /// single true source — Rust rejects such a program outright — so it is
     /// recorded from neither, on the same rule the cycle follows: picking one
-    /// endpoint would manufacture the certainty the map exists to supply.
+    /// endpoint would manufacture the certainty the map exists to supply. That
+    /// holds across rounds too: a hop a glob swept in on an earlier round is
+    /// reconsidered on every later one, and withdrawn — with every swept hop
+    /// built on it — when a second glob's target comes to publish the name.
+    ///
+    /// Returns the cutoff when the expansion stopped at `max_hops`, so the
+    /// partial map is never mistaken for a complete one.
     fn expand_glob_hops(
         hops: &mut BTreeMap<String, (String, String)>,
+        globs: &BTreeSet<(String, String)>,
         file_symbols: &BTreeMap<String, Vec<String>>,
-    ) {
-        // `(globbing file, target file)` for every `export * from` / `pub use m::*`.
-        let globs: Vec<(String, String)> = hops
-            .iter()
-            .filter(|(_, (_, name))| name == "*")
-            .filter_map(|(key, (target, _))| {
-                key.rsplit_once("::")
-                    .map(|(file, _)| (file.to_string(), target.clone()))
-            })
-            .collect();
+        max_hops: usize,
+    ) -> Option<ReexportGlobCutoff> {
         if globs.is_empty() {
-            return;
+            return None;
         }
 
+        // Keys this expansion inserted. Only these are ever reconsidered: an
+        // explicit re-export is the author's statement and outranks every glob.
+        let mut swept: BTreeSet<String> = BTreeSet::new();
         let mut poisoned: BTreeSet<String> = BTreeSet::new();
+        let mut cutoff = None;
         for _ in 0..Self::REEXPORT_CHAIN_MAX_DEPTH {
-            let additions = {
+            let (additions, conflicts) = {
                 // What each file publishes as of this round.
                 let mut published: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
                 for (file, names) in file_symbols {
@@ -4075,7 +4086,7 @@ impl Resolver {
                 }
 
                 let mut proposals: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
-                for (from, target) in &globs {
+                for (from, target) in globs {
                     let Some(names) = published.get(target.as_str()) else {
                         continue;
                     };
@@ -4090,39 +4101,112 @@ impl Resolver {
                     let container = target.rsplit('/').next().unwrap_or(target.as_str());
                     for name in names.iter().filter(|name| **name != container) {
                         let key = format!("{from}::{name}");
-                        if hops.contains_key(&key) || poisoned.contains(&key) {
+                        if poisoned.contains(&key) {
                             continue;
                         }
-                        proposals.entry(key).or_default().insert(target.as_str());
+                        match hops.get(&key) {
+                            Some(_) if !swept.contains(&key) => continue,
+                            // Taken on an earlier round. It stays a candidate
+                            // beside this one, because a glob whose target only
+                            // publishes the name after its *own* expansion is a
+                            // second source the earlier round could not see.
+                            Some((recorded, _)) => {
+                                let sources = proposals.entry(key).or_default();
+                                sources.insert(recorded.as_str());
+                                sources.insert(target.as_str());
+                            }
+                            None => {
+                                proposals.entry(key).or_default().insert(target.as_str());
+                            }
+                        }
                     }
                 }
 
                 let mut additions: Vec<(String, (String, String))> = Vec::new();
+                let mut conflicts: Vec<String> = Vec::new();
                 for (key, targets) in proposals {
-                    let Some(name) = key.rsplit_once("::").map(|(_, name)| name.to_string()) else {
-                        continue;
-                    };
-                    let mut targets = targets.into_iter();
-                    let Some(first) = targets.next() else {
-                        continue;
-                    };
-                    if targets.next().is_some() {
-                        poisoned.insert(key);
+                    if targets.len() > 1 {
+                        conflicts.push(key);
                         continue;
                     }
-                    additions.push((key, (first.to_string(), name)));
+                    if hops.contains_key(&key) {
+                        // Already recorded, from this same source.
+                        continue;
+                    }
+                    let (Some((_, name)), Some(first)) =
+                        (key.rsplit_once("::"), targets.into_iter().next())
+                    else {
+                        continue;
+                    };
+                    let hop = (first.to_string(), name.to_string());
+                    additions.push((key, hop));
                 }
-                additions
+                (additions, conflicts)
             };
 
-            if additions.is_empty() {
+            if additions.is_empty() && conflicts.is_empty() {
                 break;
             }
-            for (key, hop) in additions {
-                if hops.len() >= Self::REEXPORT_GLOB_MAX_HOPS {
-                    return;
+            let total = additions.len();
+            for (inserted, (key, hop)) in additions.into_iter().enumerate() {
+                if hops.len() >= max_hops {
+                    cutoff = Some(ReexportGlobCutoff {
+                        limit: max_hops,
+                        dropped_at_least: total - inserted,
+                    });
+                    break;
                 }
+                swept.insert(key.clone());
                 hops.insert(key, hop);
+            }
+            // Withdrawn after this round's additions, not before, so a hop
+            // swept in *through* a conflicting key on this same round is found
+            // and withdrawn with it.
+            Self::poison_glob_hops(hops, &mut swept, &mut poisoned, conflicts);
+            if cutoff.is_some() {
+                break;
+            }
+        }
+        cutoff
+    }
+
+    /// Withdraw each conflicting key and every swept hop built on it.
+    ///
+    /// A name two globs publish has no source, so the file holding it does not
+    /// publish it either — and a later round's glob over that file swept in a
+    /// hop naming a source that no longer exists. Those are withdrawn and
+    /// poisoned too: the language rejects a use of the name through them for
+    /// the same ambiguity, and leaving them would let them keep publishing it.
+    fn poison_glob_hops(
+        hops: &mut BTreeMap<String, (String, String)>,
+        swept: &mut BTreeSet<String>,
+        poisoned: &mut BTreeSet<String>,
+        conflicts: Vec<String>,
+    ) {
+        if conflicts.is_empty() {
+            return;
+        }
+        // `"<file>::<name>"` a swept hop asks for -> the swept keys asking.
+        // Built once per call, so the cascade is linear in the swept hops
+        // rather than a scan of them per withdrawn key.
+        let mut dependents: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for key in swept.iter() {
+            if let Some((file, name)) = hops.get(key) {
+                dependents
+                    .entry(format!("{file}::{name}"))
+                    .or_default()
+                    .push(key.clone());
+            }
+        }
+        let mut queue = conflicts;
+        while let Some(key) = queue.pop() {
+            if !poisoned.insert(key.clone()) {
+                continue;
+            }
+            swept.remove(&key);
+            hops.remove(&key);
+            if let Some(downstream) = dependents.remove(&key) {
+                queue.extend(downstream);
             }
         }
     }
@@ -4320,10 +4404,18 @@ impl Resolver {
         globs
     }
 
-    fn compute_reexport_chains(&self, extractions: &[Extraction]) -> BTreeMap<String, String> {
+    fn compute_reexport_chains(
+        &self,
+        extractions: &[Extraction],
+    ) -> (BTreeMap<String, String>, Option<ReexportGlobCutoff>) {
         // One hop per re-export, keyed by the re-exporting file's own name for
         // the symbol.
         let mut hops: BTreeMap<String, (String, String)> = BTreeMap::new();
+        // `(globbing file, target file)` for every `export * from` /
+        // `pub use m::*`. Kept apart from `hops` because a glob names no symbol:
+        // keyed `<file>::*` there, a file's second glob overwrote its first and
+        // only the last one was ever expanded.
+        let mut globs: BTreeSet<(String, String)> = BTreeSet::new();
         for ext in extractions {
             for export in &ext.exports {
                 let Some(specifier) = export.module_specifier.as_deref() else {
@@ -4341,6 +4433,10 @@ impl Resolver {
                     // would manufacture graph structure.
                     continue;
                 };
+                if export.exported_name == "*" {
+                    globs.insert((ext.file_path.clone(), target));
+                    continue;
+                }
                 // `export { a as b } from './m'` publishes `b` and asks `./m`
                 // for `a`. Defaulting to the exported name covers the common
                 // `export { a } from './m'`, where the two are equal.
@@ -4371,7 +4467,12 @@ impl Resolver {
         // The expansion cannot happen in the extractor, which sees one file at
         // a time while a glob names whatever *another* file declares. Here the
         // whole-corpus symbol table is in hand.
-        Self::expand_glob_hops(&mut hops, &self.file_symbols);
+        let cutoff = Self::expand_glob_hops(
+            &mut hops,
+            &globs,
+            &self.file_symbols,
+            Self::REEXPORT_GLOB_MAX_HOPS,
+        );
 
         let mut chains = BTreeMap::new();
         for key in hops.keys() {
@@ -4415,7 +4516,7 @@ impl Resolver {
                 }
             }
         }
-        chains
+        (chains, cutoff)
     }
 
     pub fn resolve_all(
@@ -6436,6 +6537,14 @@ impl Resolver {
     /// Call it **after** [`Self::index_extractions`], which resets the set.
     pub fn mark_go_dirs_incomplete(&mut self, dirs: impl IntoIterator<Item = String>) {
         self.go_package_dirs_unvouched.extend(dirs);
+    }
+
+    /// `Some` when the last [`Self::index_extractions`] stopped expanding glob
+    /// re-exports at `REEXPORT_GLOB_MAX_HOPS`, so every `reexport_chains`
+    /// answer derived from it — and every edge resolved through one — rests on
+    /// a partial map. `None` means the expansion ran to its fixpoint.
+    pub fn reexport_glob_cutoff(&self) -> Option<ReexportGlobCutoff> {
+        self.reexport_glob_cutoff
     }
 
     fn go_name_is_unexported(name: &str) -> bool {
