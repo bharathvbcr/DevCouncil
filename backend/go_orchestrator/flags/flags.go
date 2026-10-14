@@ -17,12 +17,16 @@
 //
 // Mutability is an authority question, not a convenience one: an agent that can
 // switch off its own write gate has no write gate. Flags marked Safety can only
-// ever be moved by a human, and only outside a running turn.
+// ever be moved by a human, and only outside a running turn. The same reasoning
+// governs where a value may come from: a repository's own config.yaml ships
+// with a clone and can be written by the agent it gates, so from that scope a
+// Safety flag may only be tightened (see Def.Ladder and ScopeRepository).
 package flags
 
 import (
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -100,8 +104,22 @@ type Def struct {
 	Mutable Mutability
 	// Safety marks a flag whose off/demoted state weakens a gate. Safety flags
 	// are never agent-settable, and consumers must surface their state in the
-	// decisions they affect.
+	// decisions they affect. From repository scope a Safety flag may only be
+	// tightened; see Ladder and ScopeRepository.
 	Safety bool
+	// Ladder orders a Safety flag's legal values from strictest to loosest. It
+	// is how "the repository's config may only tighten" is decided: a
+	// repository-scope value is accepted when it stands at or before the value
+	// it would replace, and refused when it stands after it.
+	//
+	// A Safety enum must declare one, because enum values have no order of
+	// their own and a guess would be a guess about a gate. A Safety bool may
+	// leave it empty, and then its safest value (Safest, or Default) is the
+	// strict end. A Safety duration declares none: every one in the catalogue is
+	// a ceiling, so shorter is stricter. A Safety flag of any other kind has no
+	// order, and repository scope may only restate the value already in force.
+	// A non-Safety flag may not declare one — it would be a rule nothing reads.
+	Ladder []string
 }
 
 // Value is a resolved flag value and where it came from.
@@ -222,6 +240,9 @@ func (r *Registry) Define(defs ...Def) error {
 		if err := validate(d, d.Default); err != nil {
 			return fmt.Errorf("flags: default for %q: %w", d.Key, err)
 		}
+		if err := validateLadder(d); err != nil {
+			return err
+		}
 		r.defs[d.Key] = d
 		r.order = append(r.order, d.Key)
 	}
@@ -250,20 +271,33 @@ func (r *Registry) isHarnessNamespace(key string) bool {
 	return false
 }
 
-// LoadConfig applies a config-file layer. Every harness key must be defined and every
-// value must be legal — a typo in harness settings is reported, never ignored.
-// Shared repository settings outside harness namespaces are passed over safely.
+// LoadConfig applies an operator-scope config layer: values handed over in code
+// by the program hosting the registry, on an operator's authority. Every harness
+// key must be defined and every value must be legal — a typo in harness
+// settings is reported, never ignored. Shared repository settings outside
+// harness namespaces are passed over safely.
+//
+// It is operator scope because no caller reads a repository file into it; a
+// repository's config.yaml goes through LoadConfigFile, which labels its layer
+// ScopeRepository.
 func (r *Registry) LoadConfig(values map[string]string) error {
-	return r.LoadLayer(ConfigLayer{Values: values})
+	return r.LoadLayer(ConfigLayer{Values: values, Scope: ScopeOperator})
 }
 
 // LoadLayer is LoadConfig with the positions and lists ParseConfigLayer
 // reports, so a refusal names the line and a block list under a scalar setting
 // is refused rather than closed as an empty section.
+//
+// The layer's Scope decides how far it may move a Safety flag. Operator scope
+// may set any legal value. Repository scope — and a layer that does not say,
+// because an unlabelled file is held to the stricter rule — may only tighten:
+// a value that stands looser on the flag's Ladder than the one it would
+// replace refuses the whole layer, naming every such line, rather than being
+// dropped, because an ignored line is a setting that looks applied.
 func (r *Registry) LoadLayer(layer ConfigLayer) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	var unknown []string
+	var unknown, loosened []string
 	toSet := map[string]string{}
 	at := func(k string) string {
 		if line, ok := layer.Lines[k]; ok {
@@ -271,6 +305,7 @@ func (r *Registry) LoadLayer(layer ConfigLayer) error {
 		}
 		return k
 	}
+	repository := layer.Scope != ScopeOperator
 
 	for k, v := range layer.Values {
 		d, ok := r.defs[k]
@@ -284,10 +319,24 @@ func (r *Registry) LoadLayer(layer ConfigLayer) error {
 			continue
 		}
 
-		if err := validate(d, normalize(v)); err != nil {
+		raw := normalize(v)
+		if err := validate(d, raw); err != nil {
 			return fmt.Errorf("flags: config %s: %w", at(k), err)
 		}
-		toSet[k] = normalize(v)
+		if repository && d.Safety {
+			// The value it would replace: one an operator layer already put
+			// here, or the default. Loosening either is the repository
+			// overruling a decision that was not its to make.
+			current, set := r.config[k]
+			if !set {
+				current = d.Default
+			}
+			if !atLeastAsStrict(d, raw, current) {
+				loosened = append(loosened, fmt.Sprintf("%s: %q is looser than %q (set it with %s instead)",
+					at(k), raw, current, EnvKey(k)))
+			}
+		}
+		toSet[k] = raw
 	}
 	for k, line := range layer.Lists {
 		if _, ok := r.defs[k]; ok {
@@ -301,6 +350,14 @@ func (r *Registry) LoadLayer(layer ConfigLayer) error {
 	if len(unknown) > 0 {
 		sort.Strings(unknown)
 		return fmt.Errorf("flags: unknown key(s) in config: %s", strings.Join(unknown, ", "))
+	}
+	if len(loosened) > 0 {
+		sort.Strings(loosened)
+		return fmt.Errorf("flags: repository config may only tighten safety flags, and it loosens: %s. "+
+			"This file ships with the repository and an agent can write it, so it cannot lower its own gate; "+
+			"remove those lines, and set a looser value from operator scope — the environment, an operator "+
+			"config outside the repository, or a human 'flags set'",
+			strings.Join(loosened, "; "))
 	}
 	for k, v := range toSet {
 		r.config[k] = v
@@ -525,6 +582,81 @@ func (r *Registry) Weakened() []Value {
 // the same string. A whitespace-only value therefore becomes empty, which is
 // what the optional sampling flags already document as "unset, omit the field".
 func normalize(raw string) string { return strings.TrimSpace(raw) }
+
+// validateLadder holds a Def's Ladder to the contract documented on the field.
+func validateLadder(d Def) error {
+	if len(d.Ladder) == 0 {
+		if d.Safety && d.Kind == KindEnum {
+			return fmt.Errorf("flags: %q is a safety enum and declares no ladder; "+
+				"without one there is no saying which of its values a repository may move it to", d.Key)
+		}
+		return nil
+	}
+	if !d.Safety {
+		return fmt.Errorf("flags: %q declares a ladder but is not a safety flag; nothing would read it", d.Key)
+	}
+	var legal []string
+	switch d.Kind {
+	case KindEnum:
+		legal = d.Values
+	case KindBool:
+		legal = []string{"true", "false"}
+	default:
+		return fmt.Errorf("flags: %q declares a ladder but is a %s; only an enum or a bool is ordered by one", d.Key, d.Kind)
+	}
+	seen := map[string]bool{}
+	for _, v := range d.Ladder {
+		if seen[v] || !slices.Contains(legal, v) {
+			return fmt.Errorf("flags: %q ladder [%s] is not an ordering of [%s]",
+				d.Key, strings.Join(d.Ladder, ", "), strings.Join(legal, ", "))
+		}
+		seen[v] = true
+	}
+	if len(seen) != len(legal) {
+		return fmt.Errorf("flags: %q ladder [%s] is not an ordering of [%s]",
+			d.Key, strings.Join(d.Ladder, ", "), strings.Join(legal, ", "))
+	}
+	return nil
+}
+
+// atLeastAsStrict reports whether candidate is no looser than current for the
+// Safety flag d. Both have already passed validate. Anything it cannot place
+// answers false: a value whose strictness cannot be shown is not let through a
+// rule that exists to keep the gate from being lowered.
+func atLeastAsStrict(d Def, candidate, current string) bool {
+	switch d.Kind {
+	case KindEnum:
+		ci, ri := slices.Index(d.Ladder, candidate), slices.Index(d.Ladder, current)
+		return ci >= 0 && ri >= 0 && ci <= ri
+	case KindBool:
+		c, cerr := parseBool(candidate)
+		cur, rerr := parseBool(current)
+		if cerr != nil || rerr != nil {
+			return false
+		}
+		ladder := d.Ladder
+		if len(ladder) == 0 {
+			safest := d.Safest
+			if safest == "" {
+				safest = d.Default
+			}
+			s, err := parseBool(safest)
+			if err != nil {
+				return false
+			}
+			ladder = []string{strconv.FormatBool(s), strconv.FormatBool(!s)}
+		}
+		ci := slices.Index(ladder, strconv.FormatBool(c))
+		ri := slices.Index(ladder, strconv.FormatBool(cur))
+		return ci >= 0 && ri >= 0 && ci <= ri
+	case KindDuration:
+		c, cerr := time.ParseDuration(candidate)
+		cur, rerr := time.ParseDuration(current)
+		return cerr == nil && rerr == nil && c <= cur
+	default:
+		return candidate == current
+	}
+}
 
 func validate(d Def, raw string) error {
 	switch d.Kind {

@@ -1,6 +1,8 @@
 package flags
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -85,16 +87,37 @@ func TestAgentCannotEnterYolo(t *testing.T) {
 }
 
 // TestYoloIsALegalValueAndTyposAreNot keeps the enum doing its job: the new
-// posture is accepted through every layer, and a near-miss still fails loudly
-// rather than falling back to a default nobody asked for.
+// posture is accepted through every operator-scope layer, and a near-miss still
+// fails loudly rather than falling back to a default nobody asked for.
+//
+// Revised by decision D-1 (audit 2026-10-13). This used to assert that "the
+// config layer" accepts yolo, which was true of the repository's own
+// config.yaml — a file a clone ships and an agent can write. yolo is still a
+// legal value; what changed is who may choose it. Operator scope (an operator
+// config layer, the environment) still can, and the repository file is now
+// refused by name, which TestRepositoryConfigCannotWeakenASafetyFlag covers
+// key by key.
 func TestYoloIsALegalValueAndTyposAreNot(t *testing.T) {
 	r := testRegistry(t)
 	if err := r.LoadConfig(map[string]string{HarnessPosture: PostureYolo}); err != nil {
-		t.Fatalf("config layer must accept the yolo posture: %v", err)
+		t.Fatalf("operator-scope config must accept the yolo posture: %v", err)
 	}
 	r2 := testRegistry(t)
 	if err := r2.LoadConfig(map[string]string{HarnessPosture: "yolo!"}); err == nil {
 		t.Fatal("a mistyped posture must be an error, not a silent default")
+	}
+
+	repo := testRegistry(t)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("harness.posture: yolo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadConfigFile(repo, path)
+	if err == nil || !strings.Contains(err.Error(), HarnessPosture+" (line 1)") {
+		t.Fatalf("the repository config must refuse yolo by name and line, got %v", err)
+	}
+	if v, _ := repo.Lookup(HarnessPosture); v.Raw != PostureDev || v.Origin != OriginDefault {
+		t.Fatalf("posture = %+v after the refusal, want the default untouched", v)
 	}
 }
 

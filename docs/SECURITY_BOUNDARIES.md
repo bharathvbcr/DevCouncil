@@ -119,6 +119,33 @@ renewal does not return a new holder's token. Secret detection and redaction
 consider every validated occurrence, including a valid token after an invalid
 prefix and multiple token families in one string.
 
+## Repository configuration and safety flags
+
+The write gate's own switches — `harness.posture`, `policy.file.mode`,
+`policy.command.mode`, `policy.hard_rules.enabled`, the agent-grant flags and
+`log.model_visible_assert` — are safety flags in the `flags` catalogue. The
+repository's `.devcouncil/config.yaml` is one of the places they are read from,
+and it is a file a clone ships and an agent can write, so from that file a
+safety flag may only be **tightened**. Each flag declares the order of its
+values (`Def.Ladder`: `strict` < `dev` < `yolo`; `enforce` < `advisory` <
+`off`; for a bool, its safe value first; for a duration ceiling, shorter is
+stricter). A repository value at or before the value it would replace — the
+default, or a value an operator-scope layer already set — applies. One after it
+refuses the whole file with an error naming the file, each offending line and
+key, and the environment variable to use instead; the MCP host then serves
+without a write gate and `devcouncil_policy_check_write` answers
+`not_initialized` rather than a verdict.
+
+Operator scope keeps full authority: the environment (`MANVI_*`), an operator
+config layer a host reads from outside the repository and labels
+`ScopeOperator`, and a human `flags set`. A layer that names no scope is held to
+the repository rule. Every safety flag away from its safest value is still
+listed by `Weakened()` with the layer that set it.
+
+Not yet covered: the DevCouncil MCP host builds the flag registry once at
+startup, so a corrected `config.yaml` takes effect on the next start, and it
+does not yet print the `Weakened()` list at startup.
+
 ## Filesystem operations
 
 Managed guide, graph, session, IPC-lock and writer-lock paths use
