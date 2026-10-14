@@ -9,7 +9,7 @@ use tracing::warn;
 
 use devmap_extract::{
     git_metadata, ignore_rule_files, is_gitignored_reporting, is_ignore_rule_file, is_ignored_path,
-    is_indexable_source,
+    is_indexable_source, repo_relative_key,
 };
 
 const MAX_IGNORE_CACHE_ENTRIES: usize = 8_192;
@@ -329,7 +329,11 @@ fn is_git_ref_event(root: &Path, path: &Path) -> anyhow::Result<bool> {
         let Ok(relative) = path.strip_prefix(dir) else {
             return false;
         };
-        let relative = relative.to_string_lossy().replace('\\', "/");
+        // Through the walk's own key: on Unix `refs\heads\main` is one file
+        // name, and git refuses `\` in a ref name, so it is not a ref.
+        let Ok(relative) = repo_relative_key(&relative.to_string_lossy()) else {
+            return false;
+        };
         !relative.ends_with(".lock")
             && (relative == "HEAD" || relative == "packed-refs" || relative.starts_with("refs/"))
     }))
@@ -373,7 +377,21 @@ fn admitted_watch_path(
         );
         return None;
     };
-    let relative = relative.replace('\\', "/");
+    // The key discovery would store this name under, from the one function
+    // that decides it. On Unix `\` is a byte of a name: folding it made
+    // `src/a\b.py` classify as the real `src/a/b.py` and be queued. Discovery
+    // refuses that name with a reason, so the watcher refuses it too and says
+    // so — like the non-UTF-8 case above, a settled fact about the name.
+    let relative = match repo_relative_key(relative) {
+        Ok(key) => key,
+        Err(reason) => {
+            warn!(
+                "watcher skipped {path:?}: {reason}; it is absent from the graph — this \
+                 is a refusal, not a clean tree"
+            );
+            return None;
+        }
+    };
     if is_ignored_path(&relative) {
         return None;
     }
@@ -1242,6 +1260,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// On Unix `\` is an ordinary byte of a file name. The watcher folded it
+    /// to `/` before classifying, so an edit to `src/a\b.py` was admitted as a
+    /// source under the spelling of the real `src/a/b.py`. Discovery refuses
+    /// that name (`devmap_extract::repo_relative_key`); the watcher refuses it
+    /// the same way rather than queueing a path the walk would never index.
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_name_on_unix_is_refused_as_discovery_refuses_it() {
+        let root = scratch_root("backslash");
+        std::fs::create_dir_all(root.join("src/a")).unwrap();
+        let real = root.join("src/a/b.py");
+        let impostor = root.join("src/a\\b.py");
+        std::fs::write(&real, "def real():\n    return 1\n").unwrap();
+        std::fs::write(&impostor, "def impostor():\n    return 2\n").unwrap();
+        let mut cache = IgnoreVerdictCache::default();
+
+        assert_eq!(
+            admitted_watch_path(&root, &impostor, &mut cache),
+            None,
+            "a name discovery refuses must not be queued under any spelling"
+        );
+        assert_eq!(
+            admitted_watch_path(&root, &real, &mut cache),
+            Some(real.to_string_lossy().into_owned()),
+            "the real path keeps its entry"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A refused event must reach the daemon as a whole-tree rescan, ahead of
     /// everything the queue still holds.
     ///
@@ -2088,6 +2136,24 @@ mod git_head_tests {
         assert!(!is_git_ref_event(
             &root(),
             std::path::Path::new("/elsewhere/.git/HEAD")
+        ));
+    }
+
+    /// On Unix `\` is a byte of a name, not a separator, and git refuses it in
+    /// a ref name, so `.git/refs\heads\main` is a stray file, not a ref. The
+    /// fold made it read as `refs/heads/main` and woke the daemon for it.
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_name_under_the_git_dir_is_not_a_ref_on_unix() {
+        for path in [".git/refs\\heads\\main", ".git/refs\\tags\\v1"] {
+            assert!(
+                !is_git_ref_event(&root(), &root().join(path)),
+                "{path} is one file name on Unix, not a ref"
+            );
+        }
+        assert!(is_git_ref_event(
+            &root(),
+            &root().join(".git/refs/heads/main")
         ));
     }
 
