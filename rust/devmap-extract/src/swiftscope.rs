@@ -24,7 +24,7 @@ use std::rc::Rc;
 
 use tree_sitter::Node;
 
-use crate::treesitter::{bounded_parent, get_node_text};
+use crate::treesitter::{bounded_parent, get_node_text, note_nesting_cap, TYPE_NESTING_MAX_DEPTH};
 
 /// What a scope knows about one name it binds.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -536,11 +536,25 @@ fn function_typed_members(scope: Node, source: &str) -> Vec<String> {
 
 /// `() -> Void`, `((Int) -> Int)?`, `(() -> Void)!`.
 fn is_function_type(node: Node) -> bool {
+    is_function_type_within(node, 0)
+}
+
+/// [`is_function_type`], `depth` wrappers down. tree-sitter-swift 0.7 cannot
+/// nest an optional directly in an optional, so this stops within two levels
+/// today; the bound keeps that a property of this function rather than of the
+/// grammar version.
+fn is_function_type_within(node: Node, depth: usize) -> bool {
+    if depth > TYPE_NESTING_MAX_DEPTH {
+        note_nesting_cap("swiftscope::is_function_type");
+        return false;
+    }
     match node.kind() {
         "function_type" => true,
         "optional_type" | "implicitly_unwrapped_type" | "parenthesized_type" => {
             let mut cursor = node.walk();
-            let found = node.named_children(&mut cursor).any(is_function_type);
+            let found = node
+                .named_children(&mut cursor)
+                .any(|child| is_function_type_within(child, depth + 1));
             found
         }
         _ => false,
@@ -618,6 +632,24 @@ fn user_type_name(node: Node, source: &str) -> Option<String> {
 /// dictionaries). Optionals are unwrapped — `m?.bump()` and `guard let` both
 /// reach the wrapped type — and a generic parameter is its protocol bound.
 fn normalize(node: Node, source: &str, bounds: &BTreeMap<String, String>) -> Option<String> {
+    normalize_within(node, source, bounds, 0)
+}
+
+/// [`normalize`], `depth` wrappers down. Each `[` and each optional is one
+/// level, and a written type of 20,000 nested `[` aborted the process on a
+/// 256 KiB stack, so past [`TYPE_NESTING_MAX_DEPTH`] the type is not read and
+/// the file says so.
+fn normalize_within(
+    node: Node,
+    source: &str,
+    bounds: &BTreeMap<String, String>,
+    depth: usize,
+) -> Option<String> {
+    if depth > TYPE_NESTING_MAX_DEPTH {
+        note_nesting_cap("swiftscope::normalize");
+        return None;
+    }
+    let normalize = |child: Node| normalize_within(child, source, bounds, depth + 1);
     match node.kind() {
         "user_type" => {
             let name = user_type_name(node, source)?;
@@ -629,16 +661,12 @@ fn normalize(node: Node, source: &str, bounds: &BTreeMap<String, String>) -> Opt
         | "existential_type"
         | "parenthesized_type" => {
             let mut cursor = node.walk();
-            let inner = node
-                .named_children(&mut cursor)
-                .find_map(|child| normalize(child, source, bounds));
+            let inner = node.named_children(&mut cursor).find_map(normalize);
             inner
         }
         "array_type" => {
             let mut cursor = node.walk();
-            let element = node
-                .named_children(&mut cursor)
-                .find_map(|child| normalize(child, source, bounds))?;
+            let element = node.named_children(&mut cursor).find_map(normalize)?;
             Some(format!("[{element}]"))
         }
         _ => None,
@@ -752,6 +780,33 @@ mod tests {
         assert!(
             !found.contains_key("count"),
             "an ordinary property is not a function value"
+        );
+    }
+
+    #[test]
+    fn array_types_are_read_to_the_nesting_cap_and_no_further() {
+        let nested = |depth: usize| {
+            format!(
+                "func f(_ a: {}Beta{}) {{}}",
+                "[".repeat(depth),
+                "]".repeat(depth)
+            )
+        };
+        for depth in [0, 1, 2, TYPE_NESTING_MAX_DEPTH] {
+            reset();
+            let found = bound(&nested(depth), "f");
+            assert_eq!(
+                found.get("a").and_then(|b| b.ty.clone()),
+                Some(format!("{}Beta{}", "[".repeat(depth), "]".repeat(depth))),
+                "depth {depth}"
+            );
+        }
+        reset();
+        let found = bound(&nested(TYPE_NESTING_MAX_DEPTH + 1), "f");
+        assert_eq!(
+            found.get("a").map(|b| b.ty.clone()),
+            Some(None),
+            "past the cap the name is bound and untyped"
         );
     }
 

@@ -1,33 +1,16 @@
 #![cfg(unix)]
 
-use devmap_extract::subprocess::{run_bounded, Bounds};
 use devmap_extract::{scan_tree, CacheDirectoryCache, CacheVerdict, CACHEDIR_TAG_SIGNATURE};
 use std::fs;
-use std::process::Command;
 use std::time::Duration;
 
 #[test]
 fn special_cache_marker_cannot_block_discovery() {
-    let mut child = Command::new(std::env::current_exe().unwrap());
-    child.args([
-        "--ignored",
-        "--exact",
-        "fifo_cache_marker_child",
-        "--nocapture",
-    ]);
-    let result = run_bounded(
-        &mut child,
-        Bounds {
-            deadline: Duration::from_secs(3),
-            stdout_cap: 16384,
-            stderr_cap: 16384,
-        },
-    )
-    .expect("cache marker reads must finish within the deadline");
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
+    // Cache marker reads must finish within the deadline.
+    crate::run_child_test(
+        "cache_tag_security::fifo_cache_marker_child",
+        &[],
+        Duration::from_secs(3),
     );
 }
 

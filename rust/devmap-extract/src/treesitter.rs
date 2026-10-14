@@ -237,24 +237,31 @@ enum ParseAttempt {
     NoTree,
 }
 
-fn parse_within_budget(
+/// Parse `source`, cancelled once `deadline` passes: `(tree, cancelled)`.
+///
+/// **Every parse in this crate goes through this.** The progress callback is
+/// polled by tree-sitter during the parse and returning `true` cancels it; it
+/// is the only way to bound a parse that has already entered a pathological
+/// state, because a byte cap only bounds what is offered to the parser, not
+/// how long the parser spends on it. The macro-body probes used to call
+/// `parser.parse(text, None)` with no callback at all, after the file's own
+/// parse had been bounded, inside the walk the daemon holds its writer lock
+/// across.
+///
+/// A cancelled parse leaves the parser holding its partial state, and the next
+/// `parse` on it would *resume* that state instead of starting on the new
+/// text. The probes reuse one parser per thread, so a cancel resets it here
+/// rather than relying on every caller to.
+fn parse_until(
     parser: &mut Parser,
     source: &str,
     deadline: std::time::Instant,
-) -> ParseAttempt {
-    let started = std::time::Instant::now();
-    let mut over_budget = false;
+) -> (Option<tree_sitter::Tree>, bool) {
+    let mut cancelled = false;
     let tree = {
-        // The progress callback is polled by tree-sitter during the parse and
-        // returning `true` cancels it; this is the only way to bound a parse
-        // that has already entered a pathological state.
-        //
-        // Against the *shared* deadline, not a budget of its own: the parse is
-        // the first phase of the file's extraction, not a separately funded
-        // one.
         let mut cancel = |_: &tree_sitter::ParseState| -> bool {
             if std::time::Instant::now() >= deadline {
-                over_budget = true;
+                cancelled = true;
                 return true;
             }
             false
@@ -273,6 +280,55 @@ fn parse_within_budget(
             Some(options),
         )
     };
+    if cancelled {
+        parser.reset();
+    }
+    (tree, cancelled)
+}
+
+/// Parse an in-memory fragment — a macro body, a macro's expansion — against
+/// the deadline of the file whose walk asked for it.
+///
+/// A probe is part of that file's extraction, not a separately funded one, so
+/// it gets no budget of its own: it stops at the same instant
+/// `parse_within_budget` and the walk do. A probe that crosses it latches
+/// `WALK_OVERRAN`, so the file is refused rather than published with the calls
+/// the probe never read. Outside an armed extraction (a unit test calling a
+/// helper directly) it is held to [`DEFAULT_PARSE_BUDGET`] from now, never to
+/// nothing.
+fn parse_probe(parser: &mut Parser, text: &str) -> Option<tree_sitter::Tree> {
+    #[cfg(test)]
+    PROBE_START_HOOK.with(|hook| {
+        if let Some(start) = hook.take() {
+            start();
+        }
+    });
+    // A probe that starts after the deadline does not start: a small fragment
+    // can finish before tree-sitter first polls the callback, and that parse
+    // would still be work done past the point the file was promised to stop.
+    if walk_overran() || walk_deadline_passed() {
+        return None;
+    }
+    let deadline = WALK_DEADLINE
+        .with(|slot| slot.get())
+        .unwrap_or_else(|| std::time::Instant::now() + DEFAULT_PARSE_BUDGET);
+    let (tree, cancelled) = parse_until(parser, text, deadline);
+    if cancelled {
+        WALK_OVERRAN.with(|slot| slot.set(true));
+        return None;
+    }
+    tree
+}
+
+fn parse_within_budget(
+    parser: &mut Parser,
+    source: &str,
+    deadline: std::time::Instant,
+) -> ParseAttempt {
+    let started = std::time::Instant::now();
+    // Against the *shared* deadline, not a budget of its own: the parse is the
+    // first phase of the file's extraction, not a separately funded one.
+    let (tree, over_budget) = parse_until(parser, source, deadline);
     match tree {
         Some(tree) if !over_budget => ParseAttempt::Parsed(tree),
         // A cancelled parse can still hand back a partial tree. It describes a
@@ -287,6 +343,8 @@ fn parse_within_budget(
 #[cfg(test)]
 thread_local! {
     static EXTRACTION_FINISH_HOOK: Cell<Option<fn()>> = const { Cell::new(None) };
+    /// Run once as the next macro-body probe starts, before its parse.
+    static PROBE_START_HOOK: Cell<Option<fn()>> = const { Cell::new(None) };
 }
 
 pub fn extract_treesitter_with_budget(
@@ -911,6 +969,7 @@ fn extract_treesitter_before_deadline(
                 );
                 extraction.literals = literals;
                 extraction.diagnostics.append(&mut notes);
+                extraction.diagnostics.extend(take_nesting_cap_notes());
                 #[cfg(test)]
                 EXTRACTION_FINISH_HOOK.with(|hook| {
                     if let Some(finish) = hook.take() {
@@ -6513,7 +6572,7 @@ pub(crate) const C_MACRO_BODY_MAX_BYTES: usize = 64 * 1024;
 
 /// Parse a C-family fragment that exists only in memory — a macro body, or a
 /// macro invocation's expansion — with `lang`'s grammar, on this thread's
-/// reused probe parser.
+/// reused probe parser, against the file's deadline ([`parse_probe`]).
 pub(crate) fn parse_c_probe(lang: &str, text: &str) -> Option<tree_sitter::Tree> {
     let (grammar, language) = grammar_for(lang)?;
     C_MACRO_PROBE_PARSER.with(|cell| {
@@ -6526,7 +6585,7 @@ pub(crate) fn parse_c_probe(lang: &str, text: &str) -> Option<tree_sitter::Tree>
             *slot = Some((grammar, parser));
         }
         slot.as_mut()
-            .and_then(|(_, parser)| parser.parse(text, None))
+            .and_then(|(_, parser)| parse_probe(parser, text))
     })
 }
 
@@ -7222,12 +7281,28 @@ fn rust_collect_implicit_calls(
 
 /// The receiver text for an operand whose type is stated: see
 /// [`rust_collect_implicit_calls`].
+///
+/// Parentheses and borrows are unwrapped in a loop, at most
+/// [`TYPE_NESTING_MAX_DEPTH`] of them: this runs on the left operand of every
+/// binary expression, and recursing once per `(` let a source of nested
+/// parentheses overflow the extraction thread's stack.
 fn rust_typed_operand(operand: Node, source: &str) -> Option<String> {
-    match operand.kind() {
-        "parenthesized_expression" | "reference_expression" => operand
+    let mut operand = operand;
+    let mut unwrapped = 0usize;
+    while matches!(
+        operand.kind(),
+        "parenthesized_expression" | "reference_expression"
+    ) {
+        if unwrapped == TYPE_NESTING_MAX_DEPTH {
+            note_nesting_cap("rust_typed_operand");
+            return None;
+        }
+        unwrapped += 1;
+        operand = operand
             .child_by_field_name("value")
-            .or_else(|| operand.named_child(0))
-            .and_then(|inner| rust_typed_operand(inner, source)),
+            .or_else(|| operand.named_child(0))?;
+    }
+    match operand.kind() {
         "identifier" => Some(get_node_text(operand, source)),
         "struct_expression" => rust_type_name(operand.child_by_field_name("name")?, source, 0),
         "call_expression" => {
@@ -7472,10 +7547,16 @@ fn probe_macro_body(inner: &str) -> (Vec<(String, Option<String>)>, Vec<String>)
             *slot = Some(parser);
         }
         slot.as_mut()
-            .and_then(|parser| parser.parse(&probe_source, None))
+            .and_then(|parser| parse_probe(parser, &probe_source))
     });
 
     let Some(tree) = parsed else {
+        // A probe stopped by the file's deadline has latched the refusal of
+        // the whole file; the token scan is for a parser that declined, not
+        // more unbounded work after the clock ran out.
+        if walk_overran() {
+            return (Vec::new(), Vec::new());
+        }
         return (scan_rust_token_tree_calls(inner), Vec::new());
     };
     let root = tree.root_node();
@@ -9037,15 +9118,26 @@ fn field_contains(parent: Node, field: &str, needle: Node) -> bool {
         .is_some_and(|haystack| node_contains(haystack, needle))
 }
 
+/// Whether `needle` is `haystack` or one of its descendants.
+///
+/// An explicit stack, not a recursion: the haystack is a whole field — a
+/// `let`'s initializer, an assignment's left side — and one frame per level
+/// let `let g = ((((g()))))` 20,000 deep abort the process on a 256 KiB stack.
+/// Only children whose bytes enclose the needle's are entered, since a node's
+/// span encloses every descendant's; that leaves the one path down plus the
+/// zero-width nodes at its edges, rather than the whole field.
 fn node_contains(haystack: Node, needle: Node) -> bool {
-    if haystack.id() == needle.id() {
-        return true;
-    }
-    let mut cursor = haystack.walk();
-    for child in haystack.children(&mut cursor) {
-        if node_contains(child, needle) {
+    let (start, end) = (needle.start_byte(), needle.end_byte());
+    let mut stack = vec![haystack];
+    while let Some(node) = stack.pop() {
+        if node.id() == needle.id() {
             return true;
         }
+        let mut cursor = node.walk();
+        stack.extend(
+            node.children(&mut cursor)
+                .filter(|child| child.start_byte() <= start && end <= child.end_byte()),
+        );
     }
     false
 }
@@ -9416,6 +9508,10 @@ thread_local! {
     static WALK_OVERRAN: Cell<bool> = const { Cell::new(false) };
     /// Ancestor steps taken since the clock was last read. See `bounded_parent`.
     static PARENT_STEPS: Cell<u32> = const { Cell::new(0) };
+    /// Type walkers that stopped at [`TYPE_NESTING_MAX_DEPTH`] in this file,
+    /// and how often. See [`note_nesting_cap`].
+    static NESTING_CAPS: RefCell<BTreeMap<&'static str, usize>> =
+        const { RefCell::new(BTreeMap::new()) };
     #[cfg(test)]
     static NATIVE_PARENT_READS: Cell<usize> = const { Cell::new(0) };
 }
@@ -9440,6 +9536,7 @@ impl BudgetGuard {
         WALK_DEADLINE.with(|slot| slot.set(Some(deadline)));
         WALK_OVERRAN.with(|slot| slot.set(false));
         PARENT_STEPS.with(|slot| slot.set(0));
+        NESTING_CAPS.with(|caps| caps.borrow_mut().clear());
         BudgetGuard
     }
 }
@@ -9552,6 +9649,44 @@ pub(crate) fn walk_deadline_passed() -> bool {
         }
         _ => false,
     }
+}
+
+/// Deepest type or operand nesting a type walker follows.
+///
+/// The walkers that read a written type — an operand under parentheses, an
+/// array type's element — used to recurse once per level with no bound, and a
+/// 1 MiB source holds a few hundred thousand levels: 20,000 `(` aborted the
+/// process on a 256 KiB stack, and extraction runs on rayon's 2 MiB worker
+/// stacks, where a stack overflow is not a panic anyone can catch. No real
+/// type nests anywhere near this; the sibling walkers (`rust_type_name`,
+/// `receiver_identity`) stop at the same depth.
+pub(crate) const TYPE_NESTING_MAX_DEPTH: usize = 16;
+
+/// Record that `walker` stopped at [`TYPE_NESTING_MAX_DEPTH`] and abstained.
+///
+/// The walker's answer past the cap is "no type stated", which is the
+/// conservative one for every caller — an operand with no type records no
+/// implicit call, a binding with no type binds nothing — but it is not what the
+/// text says, so the file says it was not read that far:
+/// [`take_nesting_cap_notes`] turns these into the extraction's diagnostics.
+pub(crate) fn note_nesting_cap(walker: &'static str) {
+    NESTING_CAPS.with(|caps| *caps.borrow_mut().entry(walker).or_default() += 1);
+}
+
+/// One diagnostic per walker that hit [`TYPE_NESTING_MAX_DEPTH`] in this file.
+fn take_nesting_cap_notes() -> Vec<String> {
+    NESTING_CAPS.with(|caps| {
+        std::mem::take(&mut *caps.borrow_mut())
+            .into_iter()
+            .map(|(walker, count)| {
+                format!(
+                    "{walker} stopped at {TYPE_NESTING_MAX_DEPTH} levels of nesting {count} \
+                     time(s) and stated no type there; what those types would have bound is \
+                     not recorded"
+                )
+            })
+            .collect()
+    })
 }
 
 /// Drop the per-scope local-name cache between files.
@@ -15667,5 +15802,230 @@ mod parent_work_regression {
             reads < 500,
             "reconstructed {reads} root walks for 500 functions"
         );
+    }
+}
+
+#[cfg(test)]
+mod probe_deadlines_and_nesting_caps {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A C macro body inside [`C_MACRO_BODY_MAX_BYTES`] whose parse is real
+    /// work: thousands of calls, so the parser is polled many times before it
+    /// could finish.
+    fn c_macro_body() -> String {
+        let mut body = String::new();
+        while body.len() + 32 < 60 * 1024 {
+            body.push_str("helper(a, b); other(c); ");
+        }
+        assert!(
+            body.len() <= C_MACRO_BODY_MAX_BYTES,
+            "the byte cap stays the bound"
+        );
+        body
+    }
+
+    #[test]
+    fn a_c_probe_stops_at_the_file_deadline_and_refuses_the_file() {
+        let body = c_macro_body();
+        {
+            // The file's deadline has already passed when the probe starts: a
+            // parse that ran to completion here returned after its deadline.
+            let _armed = BudgetGuard::arm(Instant::now());
+            let started = Instant::now();
+            assert!(
+                parse_c_probe("c", &body).is_none(),
+                "a probe past the file's deadline must not hand back a tree"
+            );
+            assert!(walk_overran(), "the probe's stop must refuse the file");
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+        // The reused probe parser was reset by the cancel: the next fragment is
+        // parsed from its own start, not appended to the cancelled parse.
+        let _armed = BudgetGuard::arm(Instant::now() + Duration::from_secs(30));
+        let text = "int f(void) { return g(); }";
+        let tree = parse_c_probe("c", text).expect("a probe inside its deadline parses");
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        assert_eq!(tree.root_node().end_byte(), text.len());
+    }
+
+    #[test]
+    fn a_cancelled_parse_leaves_its_parser_ready_for_new_text() {
+        let (_, language) = grammar_for("c").expect("the C grammar is linked");
+        let mut parser = Parser::new();
+        parser.set_language(&language).expect("the C grammar loads");
+        let (tree, cancelled) = parse_until(&mut parser, &c_macro_body(), Instant::now());
+        assert!(
+            cancelled && tree.is_none(),
+            "the parse must be cancelled mid-way"
+        );
+        let text = "int f(void) { return g(); }";
+        let (tree, cancelled) =
+            parse_until(&mut parser, text, Instant::now() + Duration::from_secs(30));
+        let tree = tree.expect("the next parse completes");
+        assert!(!cancelled);
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        assert_eq!(tree.root_node().end_byte(), text.len());
+    }
+
+    #[test]
+    fn a_rust_macro_probe_stops_at_the_file_deadline() {
+        let inner = "a.work(), helper(b)";
+        let (calls, nested) = {
+            let _armed = BudgetGuard::arm(Instant::now() + Duration::from_secs(30));
+            probe_macro_body(inner)
+        };
+        assert!(
+            calls.iter().any(|(name, _)| name == "helper"),
+            "inside its deadline the probe reads the body: {calls:?}"
+        );
+        assert!(nested.is_empty());
+
+        let _armed = BudgetGuard::arm(Instant::now());
+        let (calls, nested) = probe_macro_body(inner);
+        assert!(
+            calls.is_empty() && nested.is_empty(),
+            "past the deadline the probe neither parses nor falls back to a scan: {calls:?}"
+        );
+        assert!(walk_overran(), "the probe's stop must refuse the file");
+    }
+
+    fn expire_the_armed_deadline() {
+        let deadline = WALK_DEADLINE.with(|slot| slot.get().expect("armed extraction"));
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            std::thread::sleep(remaining);
+        }
+    }
+
+    /// Clears the probe hook even when an assertion fails first.
+    struct ClearProbeHook;
+    impl Drop for ClearProbeHook {
+        fn drop(&mut self) {
+            PROBE_START_HOOK.with(|hook| hook.set(None));
+        }
+    }
+
+    #[test]
+    fn a_file_whose_macro_probe_crosses_the_deadline_is_refused_not_published() {
+        let _clear = ClearProbeHook;
+        let source = format!(
+            "#define STAMP(x) {}\nint main(void) {{ return STAMP(1); }}\n",
+            c_macro_body()
+        );
+        PROBE_START_HOOK.with(|hook| hook.set(Some(expire_the_armed_deadline)));
+        let started = Instant::now();
+        let extraction =
+            extract_treesitter_with_budget("stamp.c", "c", &source, Duration::from_millis(300));
+        assert!(
+            PROBE_START_HOOK.with(|hook| hook.get().is_none()),
+            "the macro-body probe must be reached"
+        );
+        assert!(
+            matches!(&extraction.parse_outcome, ParseOutcome::Failed { reason } if reason.contains("budget")),
+            "a probe stopped by the deadline must refuse the file, got {:?}",
+            extraction.parse_outcome
+        );
+        assert_eq!(extraction.symbols.len(), 1, "only the File node may remain");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_c_probe_inside_its_deadline_reads_the_macro_body() {
+        let extraction = extract_treesitter_with_budget(
+            "stamp.c",
+            "c",
+            "void helper(int);\n#define STAMP(x) helper(x);\nint main(void) { STAMP(1); return 0; }\n",
+            Duration::from_secs(5),
+        );
+        assert_eq!(extraction.parse_outcome, ParseOutcome::Clean);
+        assert!(
+            extraction
+                .calls
+                .iter()
+                .any(|call| call.callee_name == "helper"
+                    && call.caller_symbol.as_deref() == Some("stamp.c::STAMP")),
+            "{:?}",
+            extraction.calls
+        );
+    }
+
+    fn implicit_add_receivers(operand: &str) -> (Vec<Option<String>>, Vec<String>) {
+        let source = format!("struct V;\nfn f(a: V, b: V) {{ let _ = {operand} + b; }}\n");
+        let extraction =
+            extract_treesitter_with_budget("ops.rs", "rust", &source, Duration::from_secs(10));
+        assert_eq!(extraction.parse_outcome, ParseOutcome::Clean);
+        let receivers = extraction
+            .rust_implicit_calls
+            .iter()
+            .filter(|call| call.callee_name == "add")
+            .map(|call| call.receiver_expr.clone())
+            .collect();
+        (receivers, extraction.diagnostics)
+    }
+
+    #[test]
+    fn shallow_rust_operands_keep_their_receiver_and_say_nothing() {
+        for operand in ["a", "(a)", "&a", "(&(a))", "&&a"] {
+            let (receivers, diagnostics) = implicit_add_receivers(operand);
+            assert_eq!(receivers, vec![Some("a".to_string())], "{operand}");
+            assert!(diagnostics.is_empty(), "{operand}: {diagnostics:?}");
+        }
+    }
+
+    #[test]
+    fn a_rust_operand_is_unwrapped_to_the_cap_and_no_further() {
+        let at_cap = format!(
+            "{}a{}",
+            "(".repeat(TYPE_NESTING_MAX_DEPTH),
+            ")".repeat(TYPE_NESTING_MAX_DEPTH)
+        );
+        let (receivers, diagnostics) = implicit_add_receivers(&at_cap);
+        assert_eq!(receivers, vec![Some("a".to_string())]);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        let past_cap = format!("({at_cap})");
+        let (receivers, diagnostics) = implicit_add_receivers(&past_cap);
+        assert!(
+            receivers.is_empty(),
+            "past the cap no receiver is claimed: {receivers:?}"
+        );
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "the abstention is recorded once: {diagnostics:?}"
+        );
+        assert!(diagnostics[0]
+            .starts_with("rust_typed_operand stopped at 16 levels of nesting 1 time(s)"));
+    }
+
+    #[test]
+    fn a_deep_let_initializer_still_answers_same_name_shadowing() {
+        // `let g = ((g()))` calls the item `g`: the binding is not in scope in
+        // its own initializer. Asked through `node_contains`, which no longer
+        // recurses; shallow and deep answers must agree.
+        for depth in [0usize, 3, 40] {
+            let source = format!(
+                "fn g() -> u8 {{ 1 }}\nfn f() {{ let g = {}g(){}; }}\n",
+                "(".repeat(depth),
+                ")".repeat(depth)
+            );
+            let extraction =
+                extract_treesitter_with_budget("let.rs", "rust", &source, Duration::from_secs(10));
+            assert_eq!(extraction.parse_outcome, ParseOutcome::Clean);
+            assert!(
+                extraction.calls.iter().any(|call| call.callee_name == "g"
+                    && call.caller_symbol.as_deref() == Some("let.rs::f")),
+                "depth {depth}: {:?}",
+                extraction.calls
+            );
+        }
     }
 }

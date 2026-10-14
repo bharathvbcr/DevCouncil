@@ -792,6 +792,30 @@ mod content_hash_tests {
 
 /// Collect indexable source files under `root` as owned `(relative_path, source)` pairs.
 /// Skips non-source paths and unreadable / non-UTF8 files (fail-closed: omit, do not invent).
+/// The key a repo-relative path is stored under: `/`-separated, spelled the
+/// same on every host.
+///
+/// On Windows `\` is the separator and is folded to `/`. Everywhere else it is
+/// an ordinary byte of a file name, and folding it there made `src/a\b.py` and
+/// `src/a/b.py` one key: discovery yielded both, so whichever was written last
+/// owned the row and the other file silently vanished from the graph. A key
+/// cannot spell that name without colliding, so it is refused, with the reason
+/// — a hole a reader can see, as `NonUtf8Path` is for a name UTF-8 cannot
+/// spell.
+pub fn repo_relative_key(relative: &str) -> Result<String, DiscoverySkipReason> {
+    if cfg!(windows) {
+        return Ok(relative.replace('\\', "/"));
+    }
+    if relative.contains('\\') {
+        return Err(DiscoverySkipReason::Unreadable {
+            reason: "a backslash in a file name is a path separator on Windows, so this \
+                     name cannot be stored without colliding with a real path; refused"
+                .to_string(),
+        });
+    }
+    Ok(relative.to_string())
+}
+
 pub fn collect_sources(root: &Path) -> anyhow::Result<Vec<(String, String)>> {
     let (sources, _) = collect_sources_with_report(root)?;
     Ok(sources)
@@ -1349,7 +1373,21 @@ fn walk_candidates(root: &Path) -> anyhow::Result<(Vec<(String, PathBuf)>, Disco
             ));
             continue;
         };
-        let rel_str = rel_str.replace('\\', "/");
+        let rel_str = match repo_relative_key(rel_str) {
+            Ok(key) => key,
+            // A hole only where a source file was lost: `notes\todo.txt` is
+            // passed over like any other non-source name, or every repository
+            // holding one would read as permanently degraded.
+            Err(reason) => {
+                let reason = if is_indexable_source(rel_str) {
+                    reason
+                } else {
+                    DiscoverySkipReason::NonSource
+                };
+                report.skipped_paths.push((rel_str.to_string(), reason));
+                continue;
+            }
+        };
         // A symlinked *directory* that leaves the repository is refused before
         // the source gate, not after it. The gate asks whether a path's name is
         // a source file's, and `crates/dc-verify` is not — so a link to a whole

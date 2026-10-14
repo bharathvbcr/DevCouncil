@@ -121,6 +121,65 @@ mod ts_import_export_fabrication;
 mod wiring_port_under_stress;
 mod workspaces_collect;
 
+/// Run `test` — an `#[ignore]`d test of this binary, named by its full module
+/// path — in a bounded child process, and fail unless exactly that one test
+/// ran and passed.
+///
+/// Since the files became modules of this target, a test's name is
+/// `file::test`. Three children were still launched as `--exact child`, which
+/// matched nothing: libtest ran zero tests and exited 0, so the nested-source
+/// stack tests, the FIFO cache-marker test and the FIFO manifest test passed
+/// without their child ever running. An exit status cannot tell "ran and
+/// passed" from "ran nothing", so the summary line is the check.
+pub(crate) fn run_child_test(
+    test: &str,
+    env: &[(&str, &str)],
+    deadline: std::time::Duration,
+) -> devmap_extract::subprocess::Captured {
+    use devmap_extract::subprocess::{run_bounded, Bounds};
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child.args(["--ignored", "--exact", test, "--nocapture"]);
+    for (key, value) in env {
+        child.env(key, value);
+    }
+    let result = run_bounded(
+        &mut child,
+        Bounds {
+            deadline,
+            stdout_cap: 64 * 1024,
+            stderr_cap: 64 * 1024,
+        },
+    )
+    .unwrap_or_else(|failure| panic!("child {test} did not finish: {failure}"));
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        result.status.success(),
+        "child {test} failed ({:?}):\n{stdout}\n{}",
+        result.status,
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        !result.stdout_truncated
+            && stdout.contains("running 1 test")
+            && stdout.contains(" 1 passed;"),
+        "child {test} must run exactly one test and pass it; it reported:\n{stdout}"
+    );
+    result
+}
+
+mod a_child_test_that_runs_nothing_is_a_failure {
+    #[test]
+    #[should_panic(expected = "must run exactly one test")]
+    fn an_unqualified_child_name_matches_no_test_and_is_refused() {
+        // The name a child was launched under before the targets were merged.
+        super::run_child_test(
+            "nested_source_child",
+            &[],
+            std::time::Duration::from_secs(30),
+        );
+    }
+}
+
 /// Files that keep a process of their own, and why (see the file's header).
 const ISOLATED: &[&str] = &[
     "global_excludes_are_one_rule",

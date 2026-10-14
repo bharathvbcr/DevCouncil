@@ -270,3 +270,69 @@ fn a_symlink_to_a_directory_inside_the_repository_is_not_descended() {
          under two names: {paths:?}"
     );
 }
+
+/// On Unix `\` is an ordinary byte of a file name, not a separator. Folding it
+/// to `/` gave `src/a\b.py` and `src/a/b.py` one key, and both were yielded,
+/// so whichever was written last owned the row and the other file vanished.
+/// The backslash name is refused with a reason instead; the real path keeps
+/// its key.
+#[cfg(unix)]
+#[test]
+fn a_backslash_in_a_unix_file_name_never_shares_a_key_with_a_real_path() {
+    let root = scratch("backslash");
+    fs::create_dir_all(root.join("src/a")).unwrap();
+    fs::write(root.join("src/a/b.py"), "def real():\n    return 1\n").unwrap();
+    fs::write(root.join("src/a\\b.py"), "def impostor():\n    return 2\n").unwrap();
+
+    let (sources, report) = collect_sources_with_report(&root).expect("discovery runs");
+    let keys: Vec<&str> = sources.iter().map(|(path, _)| path.as_str()).collect();
+    let mut unique = keys.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        keys.len(),
+        "two entries share one key: {keys:?}"
+    );
+    assert_eq!(
+        keys,
+        ["src/a/b.py"],
+        "only the real path is a source: {keys:?}"
+    );
+    let skipped = report
+        .skipped_paths
+        .iter()
+        .find(|(path, _)| path.contains('\\'))
+        .unwrap_or_else(|| {
+            panic!(
+                "the backslash name must be reported: {:?}",
+                report.skipped_paths
+            )
+        });
+    assert_eq!(
+        skipped.0, "src/a\\b.py",
+        "reported under its own name, not the folded key"
+    );
+    assert!(
+        skipped.1.is_refusal() && skipped.1.to_string().contains("backslash"),
+        "a coverage hole with a reason: {}",
+        skipped.1
+    );
+}
+
+/// A backslash name that is not a source file is the ordinary skip, not a hole.
+#[cfg(unix)]
+#[test]
+fn a_backslash_in_a_non_source_name_is_passed_over_not_counted_as_loss() {
+    let root = scratch("backslash-nonsource");
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::write(root.join("docs\\notes.txt"), "not code\n").unwrap();
+
+    let (_, report) = collect_sources_with_report(&root).expect("discovery runs");
+    assert_eq!(
+        skip_reason(&report, "docs\\notes.txt"),
+        Some(&DiscoverySkipReason::NonSource),
+        "{:?}",
+        report.skipped_paths
+    );
+}

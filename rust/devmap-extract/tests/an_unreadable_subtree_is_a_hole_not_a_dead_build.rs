@@ -639,22 +639,11 @@ fn an_extends_cycle_through_an_unreadable_member_names_it_once() {
 /// hang the suite instead of failing it.
 #[test]
 fn a_fifo_manifest_cannot_block_the_manifest_pass() {
-    use devmap_extract::subprocess::{run_bounded, Bounds};
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
-    child.args(["--ignored", "--exact", "fifo_manifest_child", "--nocapture"]);
-    let result = run_bounded(
-        &mut child,
-        Bounds {
-            deadline: std::time::Duration::from_secs(10),
-            stdout_cap: 16384,
-            stderr_cap: 16384,
-        },
-    )
-    .expect("the manifest pass must finish within the deadline");
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
+    // The manifest pass must finish within the deadline.
+    crate::run_child_test(
+        "an_unreadable_subtree_is_a_hole_not_a_dead_build::fifo_manifest_child",
+        &[],
+        std::time::Duration::from_secs(10),
     );
 }
 
