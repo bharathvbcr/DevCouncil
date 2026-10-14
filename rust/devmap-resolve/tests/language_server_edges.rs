@@ -46,6 +46,7 @@ fn unresolved_site(file: &str, caller: &str, callee: &str) -> UnresolvedReferenc
         },
         class: UnresolvedClass::Unresolved,
         receiver: None,
+        site: None,
     }
 }
 

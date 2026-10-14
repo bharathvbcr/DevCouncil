@@ -61,6 +61,7 @@ fn row(callee: &str, kind: UnresolvedKind, class: UnresolvedClass) -> Unresolved
         },
         class,
         receiver: None,
+        site: None,
     }
 }
 

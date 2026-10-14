@@ -217,6 +217,7 @@ fn local_bindings_are_not_excluded_from_the_net_denominator() {
         },
         class: UnresolvedClass::LocalBinding,
         receiver: None,
+        site: None,
     }];
 
     let rate = resolution_rate(&extractions, &resolution);

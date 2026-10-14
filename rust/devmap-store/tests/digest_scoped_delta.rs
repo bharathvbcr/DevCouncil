@@ -515,6 +515,7 @@ fn one_file_resolution(
         },
         class: UnresolvedClass::Unresolved,
         receiver: Some("obj".into()),
+        site: None,
     };
     mutate(&mut edge, &mut unresolved);
     ResolutionResult {
