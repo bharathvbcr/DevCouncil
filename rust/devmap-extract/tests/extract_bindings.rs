@@ -314,3 +314,44 @@ pub fn two(e: impl Render + Clone) -> u8 { e.render() }
     assert!(typed("d").is_empty(), "{:?}", typed("d"));
     assert!(typed("e").is_empty(), "{:?}", typed("e"));
 }
+
+/// A closure parameter is bound whether or not it is written `mut`: in
+/// tree-sitter-rust `mut s` is a `mut_pattern` whose first named child is the
+/// `mutable_specifier`, not the identifier, so a binder test that reads only
+/// the first named child never sees the name. The control (`|s|`) proves the
+/// fixture reaches the closure-parameter hint at all.
+#[test]
+fn rust_mut_closure_parameter_is_bound_like_a_plain_one() {
+    let source = r#"
+pub struct Engine;
+impl Engine { pub fn tick(&self) {} }
+pub fn apply(f: impl Fn(Engine)) {}
+pub fn caller() {
+    apply(|s| s.tick());
+    apply(|mut s| s.tick());
+}
+"#;
+    let extraction = extract_file("lib.rs", source);
+    let hint_at = |needle: &str| -> Option<String> {
+        let closure = source.find(needle).expect("fixture spells the closure");
+        let mut bindings: Vec<&LocalBinding> = extraction
+            .local_bindings
+            .iter()
+            .filter(|b| b.name == "s" && b.start_byte > closure)
+            .collect();
+        bindings.sort_by_key(|b| b.start_byte);
+        bindings.first().and_then(|b| b.initializer.clone())
+    };
+    assert_eq!(
+        hint_at("|s|").as_deref(),
+        Some("|apply|0|0"),
+        "control: {:?}",
+        extraction.local_bindings
+    );
+    assert_eq!(
+        hint_at("|mut s|").as_deref(),
+        Some("|apply|0|0"),
+        "`mut s` must bind like `s`: {:?}",
+        extraction.local_bindings
+    );
+}
