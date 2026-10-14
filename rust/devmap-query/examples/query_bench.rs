@@ -71,6 +71,35 @@
 //! any page-cache warm-up — and should not be read as results in either
 //! direction.
 //!
+//! ### Cancel checks on the whole-generation reads (ft-9ac4f289)
+//!
+//! Method: the `graph_core_for_store` and `route_map (client scan)` rows were
+//! committed first, on the unmodified engine, and that tree built as the
+//! "before" binary; "after" adds the cancel checks to `scan_sites`, to
+//! `graph_core_for_store` (before each read, per decoded extraction row, every
+//! `Cancel::CHECK_INTERVAL` converted edges) and to the `ask`, `clones` and
+//! `dead_symbols` reads. Both ran interleaved — before, after — for ten rounds
+//! on corpus A, and the **minimum** of the per-round warm p50 is reported. The
+//! machine was shared with other build sessions during the run: single rounds
+//! swung by up to 4x, which is why the minimum and not the median is the
+//! number, and why the controls matter.
+//!
+//! ```text
+//! corpus A, min of 10 rounds (warm p50)    before    after
+//! graph_core_for_store                      2.09 s    2.16 s   +3%
+//! route_map (client scan, 4,000 files)      1.16 s    1.22 s   +5%
+//! read latest_extractions (cold, 1 sample)  416 ms    429 ms   +3%
+//! search            (control, untouched)    56.4 ms   55.0 ms  -2%
+//! dead_symbols      (one check added)      100.6 ms   93.6 ms  -7%
+//! ```
+//!
+//! No speedup and no regression is claimed: every moved row sits inside the
+//! spread the controls show on this run. The change is not a performance
+//! change; it makes these reads stop when their caller has gone, and the
+//! tests in `engine/tests/corpus_read_cancellation_tests.rs` and
+//! `api_routes::tests::a_cancelled_scan_stops_between_files_and_says_so` are
+//! what show that.
+//!
 //! What did NOT get fixed, and why, is in `examples/query_phase_ab.rs`: the
 //! per-call adjacency index inside `traverse_graph` is ~100% of a walk's cost
 //! and lives in `devmap-analyze`; `dead_symbols` reads all 160,000 dead rows
@@ -127,6 +156,7 @@ fn main() -> anyhow::Result<()> {
     trace_between(&corpus, &targets)?;
     neighbors(&corpus, &targets)?;
     dead_symbols(&corpus)?;
+    graph_views(&corpus)?;
     artifacts(&corpus)?;
 
     impact_phases(&store, &targets)?;
@@ -342,6 +372,91 @@ fn dead_symbols(corpus: &Corpus) -> anyhow::Result<()> {
         cold,
         &warm,
         format!("shown={} total={}", answer.shown, answer.total),
+    );
+    Ok(())
+}
+
+/// One cold sample (fresh `Store`) plus `repeats` warm samples on one store,
+/// for the surfaces that take a `Store` rather than an engine.
+fn measure_store<T>(
+    corpus: &Corpus,
+    repeats: usize,
+    mut call: impl FnMut(&Store) -> anyhow::Result<T>,
+) -> anyhow::Result<(Duration, Vec<Duration>, T)> {
+    let started = Instant::now();
+    let cold_store = corpus.open()?;
+    let first = call(&cold_store)?;
+    let cold = started.elapsed();
+    std::hint::black_box(&first);
+
+    let store = corpus.open()?;
+    std::hint::black_box(call(&store)?);
+    let mut warm = Vec::with_capacity(repeats);
+    let mut last = None;
+    for _ in 0..repeats {
+        let started = Instant::now();
+        let answer = call(&store)?;
+        warm.push(started.elapsed());
+        last = Some(answer);
+    }
+    Ok((cold, warm, last.expect("repeats >= 1")))
+}
+
+/// The two halves of `routes` / `api-impact`, as the CLI and the server run
+/// them: `graph_core_for_store` reads the generation's graph, then
+/// `route_map` walks it and scans the client sources on disk.
+///
+/// `route_map` is timed over a graph built once outside the timed region, so
+/// its row is the scan and the matching alone. It needs the indexed tree on
+/// disk; a store whose recorded root is gone is SKIPPED rather than timed as
+/// a scan that read nothing.
+fn graph_views(corpus: &Corpus) -> anyhow::Result<()> {
+    let (cold, warm, graph) = measure_store(corpus, WARM_SLOW, |store| {
+        devmap_query::graph_core_for_store(store)
+    })?;
+    let node_count = graph["nodes"].as_array().map_or(0, Vec::len);
+    report(
+        "graph_core_for_store",
+        cold,
+        &warm,
+        format!(
+            "{node_count} nodes, {} edges",
+            graph["edges"].as_array().map_or(0, Vec::len)
+        ),
+    );
+
+    let store = corpus.open()?;
+    let Some(root) = store
+        .latest_repo_root()?
+        .map(PathBuf::from)
+        .filter(|root| root.is_dir())
+    else {
+        skipped(
+            "route_map (client scan)",
+            "the store's repo root is not on disk",
+        );
+        return Ok(());
+    };
+    let budget = devmap_query::api_routes::ScanBudget::default();
+    let started = Instant::now();
+    let first = devmap_query::api_routes::route_map(&root, &graph, &budget);
+    let cold = started.elapsed();
+    std::hint::black_box(&first);
+    let mut warm = Vec::with_capacity(WARM_SLOW);
+    let mut last = first;
+    for _ in 0..WARM_SLOW {
+        let started = Instant::now();
+        last = devmap_query::api_routes::route_map(&root, &graph, &budget);
+        warm.push(started.elapsed());
+    }
+    report(
+        "route_map (client scan)",
+        cold,
+        &warm,
+        format!(
+            "routes={} files_read={} complete={}",
+            last["count"], last["scan"]["files_read"], last["scan"]["complete"]
+        ),
     );
     Ok(())
 }
