@@ -127,11 +127,13 @@ fn a_statement_tree_deeper_than_the_bound_is_refused_rather_than_overflowing() {
             "Branch/then",
             (|body| PdgStatementKind::Branch {
                 then_body: body,
+                elif_arms: Vec::new(),
                 else_body: Vec::new(),
             }) as fn(Vec<PdgStatement>) -> PdgStatementKind,
         ),
         ("Branch/else", |body| PdgStatementKind::Branch {
             then_body: Vec::new(),
+            elif_arms: Vec::new(),
             else_body: body,
         }),
         ("Try/body", |body| PdgStatementKind::Try {

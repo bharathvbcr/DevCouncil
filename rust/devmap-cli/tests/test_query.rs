@@ -625,3 +625,97 @@ fn savings_reports_the_query_side_without_assuming_a_saving() {
     // test that required one would be pinning the metric to flatter itself.
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Run `devmap --json pdg <file> [extra]` over one fixture file in its own
+/// directory and return the parsed answer.
+fn pdg_json(label: &str, source: &str, extra: &[&str]) -> serde_json::Value {
+    let dir = std::env::temp_dir().join(format!("devmap-pdg-{label}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("subject.py");
+    std::fs::write(&file, source).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_devmap"))
+        .current_dir(&dir)
+        .env("DEVMAP_AUTOSPAWN", "0")
+        .args(["--json", "--progress", "never", "pdg"])
+        .arg(&file)
+        .args(extra)
+        .output()
+        .expect("run devmap pdg");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        output.status.success(),
+        "{label}: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("pdg --json returns JSON")
+}
+
+fn pdg_function_names(answer: &serde_json::Value) -> Vec<String> {
+    answer["functions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row["function"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// devmap-query-03: a sink in a `return` operand was invisible, and `--taint`
+/// drops every function with no recorded sink, so this function vanished.
+#[test]
+fn pdg_taint_lists_a_sink_in_a_return_operand() {
+    let answer = pdg_json(
+        "taint-return",
+        "import subprocess\n\ndef run(cmd):\n    return subprocess.run(cmd, shell=True)\n",
+        &["--taint"],
+    );
+    let names = pdg_function_names(&answer);
+    assert!(
+        names.iter().any(|name| name.ends_with("::run")),
+        "{answer:#}"
+    );
+    assert_eq!(answer["complete"], serde_json::json!(true), "{answer:#}");
+}
+
+/// J-1: a file the grammar cannot read used to answer `functions: []`,
+/// `total: 0`, exactly what an empty module answers.
+#[test]
+fn pdg_reports_a_grammar_failure_as_a_distinct_status() {
+    let broken = pdg_json("broken", "def (:::\n", &[]);
+    assert_ne!(broken["parse"], serde_json::json!("ok"), "{broken:#}");
+    assert_eq!(broken["complete"], serde_json::json!(false), "{broken:#}");
+    assert!(
+        !broken["skipped"].as_array().is_none_or(Vec::is_empty),
+        "an unreadable region must be named: {broken:#}"
+    );
+
+    let empty = pdg_json("empty", "", &[]);
+    assert_eq!(empty["parse"], serde_json::json!("ok"), "{empty:#}");
+    assert_eq!(empty["complete"], serde_json::json!(true), "{empty:#}");
+    assert_eq!(empty["functions"], serde_json::json!([]), "{empty:#}");
+    assert_eq!(empty["skipped"], serde_json::json!([]), "{empty:#}");
+}
+
+/// devmap-query-05: a function with a syntax error inside it is refused by
+/// name rather than built from part of its body, and a sibling that parses
+/// still builds.
+#[test]
+fn pdg_names_a_function_with_a_syntax_error_instead_of_building_part_of_it() {
+    let answer = pdg_json(
+        "partial",
+        "def good(x):\n    return x\n\ndef bad(y):\n    z = (y +\n    return z\n",
+        &[],
+    );
+    assert_eq!(answer["complete"], serde_json::json!(false), "{answer:#}");
+    assert_eq!(answer["parse"], serde_json::json!("partial"), "{answer:#}");
+    let built = pdg_function_names(&answer);
+    assert!(
+        built.iter().any(|name| name.ends_with("::good")),
+        "{answer:#}"
+    );
+    assert!(
+        !built.iter().any(|name| name.ends_with("::bad")),
+        "{answer:#}"
+    );
+}
