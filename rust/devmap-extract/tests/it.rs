@@ -39,6 +39,7 @@ mod c_family;
 mod cache_tag_security;
 #[cfg(feature = "parse")]
 mod capped_reads_say_so;
+mod cargo_manifests_collect;
 #[cfg(feature = "parse")]
 mod cargo_target_roots_are_wired;
 #[cfg(feature = "parse")]

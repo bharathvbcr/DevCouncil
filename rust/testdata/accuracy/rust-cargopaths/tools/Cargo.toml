@@ -1,0 +1,13 @@
+[package]
+name = "tools"
+version = "0.1.0"
+edition = "2021"
+
+# The binary root is outside `src/`, so no `src` ancestor says where `crate::`
+# and `mod helpers;` are relative to.
+[[bin]]
+name = "cli"
+path = "cli/entry.rs"
+
+[dependencies]
+engine-core = { path = "../engine" }

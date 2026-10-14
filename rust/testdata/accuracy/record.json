@@ -1555,7 +1555,7 @@
         "found": 2,
         "truly_dead": 2
       },
-      "devmap_commit": "a94459bee43c2bda3dd682ae293764e1b70cb6cc",
+      "devmap_commit": "a90b17fdbfb6d867c906241618113bd0c5318988",
       "expected_edge_rows": 51,
       "forbid_rows": 4,
       "high_edges_correct": 50,
@@ -1576,10 +1576,10 @@
         "found": 1,
         "truly_dead": 1
       },
-      "devmap_commit": "a94459bee43c2bda3dd682ae293764e1b70cb6cc",
-      "expected_edge_rows": 55,
-      "forbid_rows": 4,
-      "high_edges_correct": 55,
+      "devmap_commit": "a90b17fdbfb6d867c906241618113bd0c5318988",
+      "expected_edge_rows": 61,
+      "forbid_rows": 6,
+      "high_edges_correct": 58,
       "high_edges_false": 0,
       "honest_miss": {
         "absent": 0,
@@ -1587,17 +1587,17 @@
         "recorded": 0
       },
       "precision_at_0.9": 1.0,
-      "present": 55,
+      "present": 61,
       "recall": 1.0
     },
     "python": {
       "dead": {
         "confident_false": 0,
-        "confident_rows": 21,
-        "found": 23,
-        "truly_dead": 23
+        "confident_rows": 22,
+        "found": 24,
+        "truly_dead": 24
       },
-      "devmap_commit": "a94459bee43c2bda3dd682ae293764e1b70cb6cc",
+      "devmap_commit": "a90b17fdbfb6d867c906241618113bd0c5318988",
       "expected_edge_rows": 49,
       "forbid_rows": 11,
       "high_edges_correct": 39,
@@ -1618,10 +1618,10 @@
         "found": 1,
         "truly_dead": 1
       },
-      "devmap_commit": "a94459bee43c2bda3dd682ae293764e1b70cb6cc",
-      "expected_edge_rows": 106,
-      "forbid_rows": 5,
-      "high_edges_correct": 103,
+      "devmap_commit": "a90b17fdbfb6d867c906241618113bd0c5318988",
+      "expected_edge_rows": 113,
+      "forbid_rows": 8,
+      "high_edges_correct": 108,
       "high_edges_false": 0,
       "honest_miss": {
         "absent": 3,
@@ -1629,8 +1629,8 @@
         "recorded": 1
       },
       "precision_at_0.9": 1.0,
-      "present": 103,
-      "recall": 0.972
+      "present": 110,
+      "recall": 0.973
     },
     "swift": {
       "dead": {
@@ -1639,7 +1639,7 @@
         "found": 1,
         "truly_dead": 1
       },
-      "devmap_commit": "a94459bee43c2bda3dd682ae293764e1b70cb6cc",
+      "devmap_commit": "a90b17fdbfb6d867c906241618113bd0c5318988",
       "expected_edge_rows": 79,
       "forbid_rows": 3,
       "high_edges_correct": 79,
@@ -1660,7 +1660,7 @@
         "found": 4,
         "truly_dead": 4
       },
-      "devmap_commit": "a94459bee43c2bda3dd682ae293764e1b70cb6cc",
+      "devmap_commit": "a90b17fdbfb6d867c906241618113bd0c5318988",
       "expected_edge_rows": 71,
       "forbid_rows": 2,
       "high_edges_correct": 70,
