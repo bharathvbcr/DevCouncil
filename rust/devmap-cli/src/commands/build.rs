@@ -948,6 +948,14 @@ pub(crate) fn run(
                                 "files_considered": server.files_considered,
                                 "files_finished": server.files_finished,
                                 "edges_added": server.edges_added,
+                                // What the pass dropped rather than turned
+                                // into an edge or an abstention, so "ran and
+                                // found nothing" reads apart from "ran and
+                                // threw its answers away".
+                                "sites_without_position": server.sites_without_position,
+                                "files_unaddressable": server.files_unaddressable,
+                                "locations_undecodable": server.locations_undecodable,
+                                "locations_outside_repo": server.locations_outside_repo,
                             })
                         }).collect::<Vec<_>>(),
                     })

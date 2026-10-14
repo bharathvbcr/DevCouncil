@@ -163,6 +163,41 @@ fn a_language_server_inside_the_repository_is_refused_not_spawned() {
     let _ = fs::remove_dir_all(&base);
 }
 
+/// Every server row in `build --json` carries the drop counters the pass
+/// keeps — sites with no position, files no in-repository URI names, and
+/// answers dropped as undecodable or outside the repository — so a caller can
+/// tell "ran and found nothing" from "ran and dropped what it was told". A row
+/// for a server that did not run still carries them, as zeros.
+#[cfg(unix)]
+#[test]
+fn build_json_server_rows_carry_the_lsp_drop_counters() {
+    let base = tmp_dir("drop-counters");
+    let repo = base.join("repo");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::write(
+        repo.join("src").join("lib.rs"),
+        "pub fn caller() {\n    not_defined_anywhere();\n}\n",
+    )
+    .unwrap();
+    let empty_path = base.join("empty-path");
+    fs::create_dir_all(&empty_path).unwrap();
+    let row = rust_analyzer_row(&repo, &base.join("devmap.sqlite"), empty_path.as_os_str());
+    assert_eq!(row["ran"], false, "{row}");
+    for counter in [
+        "sites_without_position",
+        "files_unaddressable",
+        "locations_undecodable",
+        "locations_outside_repo",
+    ] {
+        assert_eq!(
+            row[counter].as_u64(),
+            Some(0),
+            "server row must carry `{counter}` as a count: {row}"
+        );
+    }
+    let _ = fs::remove_dir_all(&base);
+}
+
 #[test]
 fn build_without_lsp_flag_omits_the_lsp_block() {
     let dir = tmp_dir("no-flag");
