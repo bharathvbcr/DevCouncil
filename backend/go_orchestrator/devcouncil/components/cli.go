@@ -37,8 +37,9 @@ func runInstall(args []string, base Options) int {
 		return 2
 	}
 	if list {
+		prefix := Options{Prefix: a.prefix}.prefix()
 		if jsonOut {
-			b, err := ListJSON()
+			b, err := ListJSON(prefix)
 			if err != nil {
 				console.Errorf("install: %v\n", err)
 				return 1
@@ -50,6 +51,10 @@ func runInstall(args []string, base Options) int {
 			return 0
 		}
 		console.Print(HelpText)
+		console.Println()
+		for _, line := range ReceiptLines(prefix) {
+			console.Println(line)
+		}
 		return 0
 	}
 	cs, err := Resolve(names)
@@ -58,7 +63,7 @@ func runInstall(args []string, base Options) int {
 		return 2
 	}
 	opts := base
-	opts.Prefix, opts.DryRun = a.prefix, dry
+	opts.Prefix, opts.DryRun, opts.Rev = a.prefix, dry, a.rev
 	if a.src != "" {
 		src, err := resolveSrc(a.src)
 		if err != nil {
@@ -70,6 +75,16 @@ func runInstall(args []string, base Options) int {
 	if IncludesHost(cs) && opts.source() == "" {
 		console.Errorf("install: %v\n", opts.hostSourceError())
 		return 2
+	}
+	if opts.Rev != "" && opts.source() != "" {
+		console.Errorf("install: --rev pins a remote install, but this one builds the checkout at %s as it stands; check out that revision there instead\n", opts.source())
+		return 2
+	}
+	if len(RustIDs(cs)) > 0 && opts.source() == "" {
+		if _, err := opts.remoteRef(); err != nil {
+			console.Errorf("install: %v\n", err)
+			return 2
+		}
 	}
 	var installErr error
 	// A dry-run plan is already structured; do not print shell commands into JSON.
@@ -143,7 +158,9 @@ func resolveSrc(dir string) (string, error) {
 type installArgs struct {
 	list, jsonOut, dry, help bool
 	prefix, src              string
-	names                    []string
+	// rev pins a remote install to a commit instead of the release tag.
+	rev   string
+	names []string
 	// gitpulse is the GitPulse checkout whose schema-parity check runs after
 	// the install; empty means GitPulseRootEnv, then the sibling checkout.
 	gitpulse string
@@ -191,6 +208,12 @@ func parseInstallArgs(args []string) (installArgs, error) {
 				return installArgs{}, fmt.Errorf("--gitpulse needs a directory")
 			}
 			a.gitpulse = args[i]
+		case "--rev":
+			i++
+			if i >= len(args) || args[i] == "" {
+				return installArgs{}, fmt.Errorf("--rev needs a commit")
+			}
+			a.rev = args[i]
 		case "--only":
 			// The bootstrap scripts' spelling of a positional name.
 			i++
@@ -218,6 +241,13 @@ func parseInstallArgs(args []string) (installArgs, error) {
 				a.src = strings.TrimPrefix(args[i], "--src=")
 				if a.src == "" {
 					return installArgs{}, fmt.Errorf("--src needs a directory")
+				}
+				continue
+			}
+			if strings.HasPrefix(args[i], "--rev=") {
+				a.rev = strings.TrimPrefix(args[i], "--rev=")
+				if a.rev == "" {
+					return installArgs{}, fmt.Errorf("--rev needs a commit")
 				}
 				continue
 			}

@@ -281,7 +281,7 @@ No-checkout install (verified: succeeds without a local clone; cold build ~1–2
 minutes depending on the machine, because every tree-sitter grammar compiles):
 
 ```bash
-cargo install --git https://github.com/bharathvbcr/DevCouncil --locked --path rust/devmap-cli
+cargo install --git https://github.com/bharathvbcr/DevCouncil --tag vX.Y.Z --locked devmap-cli  # vX.Y.Z: a release tag
 ```
 
 From a checkout of this tree:

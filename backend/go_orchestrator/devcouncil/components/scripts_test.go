@@ -14,6 +14,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/version"
 )
 
 func repoRoot(t *testing.T) string {
@@ -144,6 +146,11 @@ func TestBootstrapWithoutGoSaysSoAndNamesTheCargoRoute(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "go is required") || !strings.Contains(string(out), "cargo install --git") {
 		t.Fatalf("output:\n%s", out)
+	}
+	// The route it names is pinned to this checkout's release, never the
+	// default branch.
+	if want := "--tag v" + version.Version + " "; !strings.Contains(string(out), want) {
+		t.Fatalf("the cargo route is not pinned (%q):\n%s", want, out)
 	}
 }
 

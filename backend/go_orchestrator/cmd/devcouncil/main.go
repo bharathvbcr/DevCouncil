@@ -117,7 +117,7 @@ The same binary is installed as ` + "`dev`" + ` and ` + "`devcouncil`" + `.
 
 Usage:
   devcouncil mcp              Run the MCP stdio server
-  devcouncil install [names…] [--list] [--json] [--prefix DIR] [--dry-run]
+  devcouncil install [names…] [--list] [--json] [--prefix DIR] [--dry-run] [--rev COMMIT]
   devcouncil uninstall [names…] [--yes] [--prefix DIR]
   devcouncil disable NAME [--prefix DIR]
   devcouncil enable NAME [--prefix DIR]
@@ -149,7 +149,7 @@ NO_COLOR removes color; TERM=dumb and non-UTF-8 locales use simpler output.
 First-time (no host yet): bash scripts/install.sh [install args…] builds this
 host into a temporary directory and runs ` + "`devcouncil install`" + ` with the same
 arguments. Standalone devmap without Go:
-  cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked devmap-cli
+  cargo install --git https://github.com/bharathvbcr/DevCouncil.git --tag v` + Version + ` --locked devmap-cli
 
 Hosts: the ones ` + "`devmap integrate --help`" + ` lists; DevMap owns the host table.
 `)
