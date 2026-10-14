@@ -24,6 +24,22 @@ func TestValidRepoPathRefusesEscapes(t *testing.T) {
 		{"parent in the middle", "src/../../outside", "climbs out"},
 		{"parent at the end", "src/..", "climbs out"},
 		{"bare parent", "..", "climbs out"},
+		// A backslash is a separator on Windows and an ordinary filename byte
+		// on Unix. A child that reports one is either naming a Windows climb
+		// or a Unix file no Windows checkout could hold, so it is refused on
+		// every host (owner decision D-5) rather than read per GOOS.
+		{"backslash climb", `a\..\b`, "backslash"},
+		{"backslash parent at the front", `..\x`, "backslash"},
+		{"mixed separators", `a/..\b`, "backslash"},
+		{"backslash in a name", `src\a.go`, "backslash"},
+		{"drive with backslash", `C:\windows`, "backslash"},
+		// A control byte cannot be a name a person or a tool meant: NUL ends
+		// the string at the syscall, and the rest rewrite the line a gap is
+		// quoted on.
+		{"NUL", "a\x00b", "control byte"},
+		{"newline", "src/a\n.go", "control byte"},
+		{"escape", "src/\x1b[31m.go", "control byte"},
+		{"delete", "src/a\x7f.go", "control byte"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := safefile.ValidRepoPath(tc.path)
@@ -43,14 +59,20 @@ func TestValidRepoPathRefusesEscapes(t *testing.T) {
 // `filepath.VolumeName` is implemented per GOOS: on Windows it reads `C:` off
 // the front, and on every Unix it returns the empty string unconditionally. So
 // the "names a volume" branch is live on Windows and inert everywhere else —
-// which is correct rather than broken, because on Unix `C:\windows` is not an
-// escape at all, just a file with an unusual name.
+// which is correct rather than broken, because on Unix `C:/windows` is not an
+// escape at all, just a directory with an unusual name.
+//
+// The row is spelled with a forward slash. It used to be `C:\windows`, which
+// also asserted that a Unix host accepts a backslash; owner decision D-5
+// retired that expectation (a backslash is refused on every host, see
+// TestValidRepoPathRefusesEscapes), so the volume guard is exercised here by
+// the one spelling that still reaches it.
 //
 // Written this way because the alternative readings are both wrong: asserting
 // a refusal everywhere fails on Unix, and asserting acceptance everywhere
 // would fail on Windows and quietly pass on the CI that never runs there.
 func TestValidRepoPathVolumeGuardIsPlatformConditional(t *testing.T) {
-	err := safefile.ValidRepoPath(`C:\windows`)
+	err := safefile.ValidRepoPath(`C:/windows`)
 	if runtime.GOOS == "windows" {
 		if err == nil {
 			t.Fatal(`on Windows, C:\windows names a volume and must be refused`)
@@ -62,7 +84,7 @@ func TestValidRepoPathVolumeGuardIsPlatformConditional(t *testing.T) {
 	}
 	if err != nil {
 		t.Fatalf(
-			"on %s a colon and a backslash are ordinary filename characters, so "+
+			"on %s a colon is an ordinary filename character, so "+
 				"this is a relative path and not an escape; got %v",
 			runtime.GOOS, err,
 		)

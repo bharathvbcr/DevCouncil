@@ -27,7 +27,13 @@ import (
 //
 //   - empty, which names no file at all;
 //   - absolute, in either separator, which is not relative to anything;
+//   - containing a backslash, on every host: on Windows it is a separator,
+//     so `a\..\..\x` would climb past a `/`-only element check, and on Unix a
+//     name holding one is a file no Windows checkout of the same repository
+//     could hold (owner decision D-5 — refuse rather than read it per GOOS);
 //   - carrying a volume name, which is the Windows spelling of absolute;
+//   - containing a control byte (C0 or DEL): NUL truncates the name at the
+//     syscall, and the rest rewrite the terminal line a gap quotes it on;
 //   - containing a `..` element, which climbs out;
 //   - not valid UTF-8, which cannot be reopened by the name given.
 //
@@ -40,9 +46,21 @@ func ValidRepoPath(path string) error {
 	if strings.HasPrefix(path, "/") || strings.HasPrefix(path, `\`) {
 		return fmt.Errorf("%q is absolute, and every path here is relative to the repository", path)
 	}
+	// Before the volume guard, so `C:\x` is refused for the same reason on
+	// every host instead of for a Windows-only one.
+	if strings.Contains(path, `\`) {
+		return fmt.Errorf("%q contains a backslash, which is a separator on Windows and so cannot name one repository file on every host", path)
+	}
 	if vol := filepath.VolumeName(filepath.FromSlash(path)); vol != "" {
 		return fmt.Errorf("%q names a volume, so it is not inside the repository", path)
 	}
+	for i := 0; i < len(path); i++ {
+		if b := path[i]; b < 0x20 || b == 0x7f {
+			return fmt.Errorf("%q contains a control byte (0x%02x), so it names no file a tool meant to report", path, b)
+		}
+	}
+	// With backslashes refused above, `/` is the only separator left, so this
+	// split sees every element on every host.
 	for _, element := range strings.Split(path, "/") {
 		if element == ".." {
 			return fmt.Errorf("%q climbs out of the repository", path)

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -210,8 +211,8 @@ func runVerificationCommands(taskID string, commands []string, run func(string) 
 	return gaps, records
 }
 
-// DefaultRunCommand shells out through /bin/sh -c in root, each command bounded
-// by CommandTimeout and by ctx. A missing executable or launch failure is
+// DefaultRunCommand shells out through verifyShell (/bin/sh -c, or cmd.exe on
+// Windows) in root, each command bounded by CommandTimeout and by ctx. A missing executable or launch failure is
 // reported as exit -1 with a "Failed to run command: …" summary so
 // CommandIsMalformed classifies it as invalid, never as a pass.
 func DefaultRunCommand(ctx context.Context, root string) func(string) CommandOutcome {
@@ -239,10 +240,21 @@ func runCommandWithPolicy(ctx context.Context, root string, timeout time.Duratio
 		cctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
+		shell, args, err := verifyShell(runtime.GOOS, os.Getenv, command)
+		if err != nil {
+			// Exit -1 with "Failed to run command" is the launch-failure shape
+			// CommandIsMalformed reads as invalid, never as a pass.
+			return CommandOutcome{
+				ExitCode: -1,
+				Summary:  "Failed to run command: " + err.Error(),
+				Stderr:   err.Error(),
+			}
+		}
 		// #nosec G204 -- the command is the task's own verification command,
 		// which this runner exists to execute; see docs/security.md.
-		cmd := exec.CommandContext(cctx, "/bin/sh", "-c", command)
+		cmd := exec.CommandContext(cctx, shell, args...)
 		proc.ConfigureGroup(cmd)
+		setShellCommandLine(cmd, shell, command)
 		cmd.Dir = root
 		// Allowlist, not inherit: a nil Env would hand the command every
 		// secret in the host process (docs/verify-sandbox-security-impact.md).
@@ -289,6 +301,79 @@ func runCommandWithPolicy(ctx context.Context, root string, timeout time.Duratio
 		}
 		return CommandOutcome{ExitCode: 0, Summary: summary, Stdout: text}
 	}
+}
+
+// verifyShell names the shell a verification command runs under on goos, and
+// the arguments that follow it.
+//
+// Everywhere but Windows that is `/bin/sh -c`. On Windows there is no
+// /bin/sh, so it is cmd.exe from ComSpec (or SystemRoot's System32 when
+// ComSpec is unset), run as `/d /s /c`: /d skips the AutoRun registry hook so
+// nothing the host's registry adds runs with the command, and /s /c is the
+// quoting rule windowsShellCommandLine writes the line for.
+//
+// It is a pure function of goos and getenv so the Windows branch is exercised
+// by `go test` on every host, not only on a Windows job.
+//
+// Refusals, each failing closed with its reason:
+//   - no ComSpec and no SystemRoot: there is no shell to name;
+//   - a shell path that is not absolute (bare, `.\`, `C:x`, `\x`): exec would
+//     resolve it against cmd.Dir, the repository under verification, and run a
+//     cmd.exe the repository supplied;
+//   - a quote in the shell path, which would end the quoted program name early;
+//   - a line break in the command: cmd.exe runs only the first line, so the
+//     rest would be reported as verified without having run.
+func verifyShell(goos string, getenv func(string) string, command string) (string, []string, error) {
+	if goos != "windows" {
+		return "/bin/sh", []string{"-c", command}, nil
+	}
+	shell := getenv("ComSpec")
+	source := "ComSpec"
+	if shell == "" {
+		root := getenv("SystemRoot")
+		if root == "" {
+			return "", nil, errors.New("neither ComSpec nor SystemRoot is set, so there is no cmd.exe to run the verification command with")
+		}
+		shell = strings.TrimRight(root, `\/`) + `\System32\cmd.exe`
+		source = "SystemRoot"
+	}
+	if strings.Contains(shell, `"`) {
+		return "", nil, fmt.Errorf("the shell named by %s (%q) contains a quote, so it cannot be written as one program name", source, shell)
+	}
+	if !windowsAbsolute(shell) {
+		return "", nil, fmt.Errorf("the shell named by %s (%q) is not an absolute path, and a relative one would be resolved inside the repository under verification", source, shell)
+	}
+	if strings.ContainsAny(command, "\r\n") {
+		return "", nil, errors.New("the command contains a line break, and cmd.exe would run only its first line")
+	}
+	return shell, []string{"/d", "/s", "/c", command}, nil
+}
+
+// windowsAbsolute reports whether p is fully qualified under Windows rules: a
+// drive letter followed by a separator, or a UNC / device prefix. `C:x` (drive
+// relative) and `\x` (current-drive rooted) are not. Written out rather than
+// via filepath.IsAbs because that answers for the host, and verifyShell is
+// tested for Windows on every host.
+func windowsAbsolute(p string) bool {
+	if len(p) >= 2 && isWindowsSeparator(p[0]) && isWindowsSeparator(p[1]) {
+		return true
+	}
+	if len(p) < 3 || p[1] != ':' || !isWindowsSeparator(p[2]) {
+		return false
+	}
+	c := p[0] | 0x20
+	return c >= 'a' && c <= 'z'
+}
+
+func isWindowsSeparator(b byte) bool { return b == '\\' || b == '/' }
+
+// windowsShellCommandLine writes the whole Windows command line for a
+// verifyShell result. Go builds a Windows command line by escaping each
+// argument with backslashes, a convention cmd.exe does not parse, so the line
+// is written whole instead: with /s, cmd strips the first and last quote of
+// what follows /c and runs everything between them exactly as typed.
+func windowsShellCommandLine(shell, command string) string {
+	return `"` + shell + `" /d /s /c "` + command + `"`
 }
 
 // stopReason says why a command was stopped: its own deadline, or the caller
