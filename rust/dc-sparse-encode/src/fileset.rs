@@ -68,9 +68,11 @@ pub fn select(root: &Path, max_files: usize, force_walk: bool) -> Result<Selecti
             }
         }
     }
+    let mut files = Vec::new();
+    let truncated = walk_into(root, max_files, &mut files)?;
     Ok(Selection {
-        files: walk(root, max_files)?,
-        truncated: false,
+        files,
+        truncated,
         via_walk: true,
     })
 }
@@ -103,14 +105,13 @@ fn list(root: &Path, max_files: usize) -> Result<Selection, String> {
 /// symlinks, and files over the size ceiling. It does not read `.gitignore`.
 pub fn walk(root: &Path, max_files: usize) -> Result<Vec<PathBuf>, String> {
     let mut found = Vec::new();
-    walk_into(root, max_files, &mut found)?;
+    let _omitted = walk_into(root, max_files, &mut found)?;
     Ok(found)
 }
 
-fn walk_into(dir: &Path, max_files: usize, found: &mut Vec<PathBuf>) -> Result<(), String> {
-    if found.len() >= max_files {
-        return Ok(());
-    }
+/// `Ok(true)` means an eligible source file was left out. After `found` is
+/// full, walking continues only until that file or the end of the tree.
+fn walk_into(dir: &Path, max_files: usize, found: &mut Vec<PathBuf>) -> Result<bool, String> {
     let mut entries = Vec::new();
     let read = std::fs::read_dir(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
     for entry in read {
@@ -138,19 +139,18 @@ fn walk_into(dir: &Path, max_files: usize, found: &mut Vec<PathBuf>) -> Result<(
         if !meta.is_file() || !is_source(&path) || meta.len() > MAX_FILE_BYTES {
             continue;
         }
-        found.push(path);
         if found.len() >= max_files {
             eprintln!("note: stopping at {max_files} files; pass --max-files to raise it.");
-            return Ok(());
+            return Ok(true);
         }
+        found.push(path);
     }
     for sub in subdirs {
-        walk_into(&sub, max_files, found)?;
-        if found.len() >= max_files {
-            break;
+        if walk_into(&sub, max_files, found)? {
+            return Ok(true);
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 fn is_source(path: &Path) -> bool {
@@ -159,4 +159,158 @@ fn is_source(path: &Path) -> bool {
     };
     let dotted = format!(".{}", ext.to_ascii_lowercase());
     SOURCE_SUFFIXES.contains(&dotted.as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Removed on drop, including when an assertion panics.
+    struct TempTree {
+        path: PathBuf,
+    }
+
+    impl TempTree {
+        fn new() -> Self {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("dc-sparse-fileset-{}-{seq}", std::process::id()));
+            fs::create_dir_all(&path)
+                .unwrap_or_else(|err| panic!("create {}: {err}", path.display()));
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_file(root: &Path, rel: &str, body: &str) {
+        let path = root.join(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .unwrap_or_else(|err| panic!("create {}: {err}", parent.display()));
+        }
+        fs::write(&path, body).unwrap_or_else(|err| panic!("write {}: {err}", path.display()));
+    }
+
+    #[test]
+    fn capped_walk_of_three_sources_is_truncated() {
+        let tree = TempTree::new();
+        let root = tree.path();
+        write_file(root, "a.rs", "fn a() {}\n");
+        write_file(root, "b.rs", "fn b() {}\n");
+        write_file(root, "c.rs", "fn c() {}\n");
+        let selection = select(root, 2, true).unwrap();
+        assert!(selection.via_walk);
+        assert!(
+            selection.truncated,
+            "capped walk omitted c.rs but truncated was false"
+        );
+        assert_eq!(selection.files, vec![root.join("a.rs"), root.join("b.rs")]);
+    }
+
+    #[test]
+    fn exact_fit_is_not_truncated() {
+        let tree = TempTree::new();
+        let root = tree.path();
+        write_file(root, "a.rs", "fn a() {}\n");
+        write_file(root, "b.rs", "fn b() {}\n");
+        let selection = select(root, 2, true).unwrap();
+        assert!(selection.via_walk);
+        assert!(!selection.truncated);
+        assert_eq!(selection.files.len(), 2);
+    }
+
+    #[test]
+    fn fewer_files_than_the_cap_is_not_truncated() {
+        let tree = TempTree::new();
+        let root = tree.path();
+        write_file(root, "only.rs", "fn only() {}\n");
+        let selection = select(root, 5, true).unwrap();
+        assert!(selection.via_walk);
+        assert!(!selection.truncated);
+        assert_eq!(selection.files, vec![root.join("only.rs")]);
+    }
+
+    #[test]
+    fn a_source_in_a_later_directory_is_an_omission() {
+        let tree = TempTree::new();
+        let root = tree.path();
+        write_file(root, "a.rs", "fn a() {}\n");
+        write_file(root, "b.rs", "fn b() {}\n");
+        write_file(root, "sub/d.rs", "fn d() {}\n");
+        let selection = select(root, 2, true).unwrap();
+        assert!(selection.via_walk);
+        assert!(selection.truncated);
+        assert_eq!(selection.files, vec![root.join("a.rs"), root.join("b.rs")]);
+        assert!(
+            selection
+                .files
+                .iter()
+                .all(|path| path.file_name().is_none_or(|name| name != "d.rs")),
+            "omitted sub/d.rs must not be in the selection"
+        );
+    }
+
+    #[test]
+    fn non_source_files_are_not_omissions() {
+        let tree = TempTree::new();
+        let root = tree.path();
+        write_file(root, "a.rs", "fn a() {}\n");
+        write_file(root, "b.rs", "fn b() {}\n");
+        write_file(root, "notes.bin", "bin\n");
+        // `.txt` is in SOURCE_SUFFIXES, so this root file is eligible. It is
+        // not a stand-in for a non-source neighbor.
+        write_file(root, "skip.txt", "text\n");
+        let with_txt = select(root, 2, true).unwrap();
+        assert!(with_txt.via_walk);
+        assert!(
+            with_txt.truncated,
+            "skip.txt is a source file and is the omitted third file"
+        );
+        assert_eq!(with_txt.files, vec![root.join("a.rs"), root.join("b.rs")]);
+
+        let plain = TempTree::new();
+        let root = plain.path();
+        write_file(root, "a.rs", "fn a() {}\n");
+        write_file(root, "b.rs", "fn b() {}\n");
+        write_file(root, "notes.bin", "bin\n");
+        write_file(root, "skip.dat", "dat\n");
+        write_file(root, "node_modules/nested.rs", "skipped directory\n");
+        write_file(root, ".git/hidden.rs", "hidden directory\n");
+        let fat = root.join("fat.rs");
+        fs::write(&fat, vec![b'x'; (MAX_FILE_BYTES as usize) + 1])
+            .unwrap_or_else(|err| panic!("write {}: {err}", fat.display()));
+        std::os::unix::fs::symlink(root.join("a.rs"), root.join("link.rs")).unwrap();
+        let selection = select(root, 2, true).unwrap();
+        assert!(selection.via_walk);
+        assert!(!selection.truncated, "non-source files are not omissions");
+        assert_eq!(selection.files, vec![root.join("a.rs"), root.join("b.rs")]);
+    }
+
+    #[test]
+    fn non_ascii_source_name_counts_toward_the_cap() {
+        let tree = TempTree::new();
+        let root = tree.path();
+        write_file(root, "naïve.rs", "fn n() {}\n");
+        write_file(root, "z.rs", "fn z() {}\n");
+        let selection = select(root, 1, true).unwrap();
+        assert!(selection.via_walk);
+        assert!(
+            selection.truncated,
+            "naïve.rs is a source file and must occupy the only slot, leaving z.rs out"
+        );
+        assert_eq!(selection.files, vec![root.join("naïve.rs")]);
+    }
 }
