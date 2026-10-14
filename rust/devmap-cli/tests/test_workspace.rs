@@ -361,3 +361,38 @@ fn link_candidates_record_what_they_could_not_examine() {
     );
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// A store that exists but will not open is a failing `link_candidates` input
+/// of its own: the `Err` arm, beside the missing-store arm above. Its imports
+/// were never examined, and the answer must say so rather than read like a
+/// repository that imports nothing.
+#[test]
+fn a_store_that_will_not_open_is_a_link_candidates_gap() {
+    let base = scratch("link-corrupt-store");
+    let built = base.join("built");
+    let corrupt = base.join("corrupt");
+    build_repo(&built, &[("main.py", "def main():\n    return 1\n")]);
+    let db = devmap_extract::paths::store_path(&corrupt);
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    std::fs::write(&db, b"this is not an SQLite database, and never was\n").unwrap();
+
+    let workspace = registry(&[("built", &built), ("corrupt", &corrupt)]);
+    let answer = link_candidates(&workspace)
+        .expect("one unreadable store is a gap in the answer, not a failed answer");
+    let gaps: Vec<(&str, &str)> = answer
+        .coverage_gaps
+        .iter()
+        .map(|gap| (gap.repo.as_str(), gap.reason.as_str()))
+        .collect();
+    assert!(
+        gaps.iter().any(|(repo, reason)| *repo == "corrupt"
+            && reason.contains("could not be opened")
+            && reason.contains("none of its imports were examined")),
+        "a store that will not open is a gap: {gaps:?}"
+    );
+    assert!(
+        gaps.iter().all(|(repo, _)| *repo != "built"),
+        "a repository read in full contributes no gap: {gaps:?}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}

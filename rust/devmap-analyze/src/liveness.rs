@@ -2309,11 +2309,11 @@ pub fn extraction_gaps(extractions: &[Extraction]) -> Vec<ExtractionGapEntry> {
             // whose declarations nobody looked for.
             (ExtractionGap::NotParsed, reason.clone())
         } else if a_grammar_read_this_file(ext) {
-            if let ParseOutcome::Partial { error_ranges, .. } = &ext.parse_outcome {
+            if let ParseOutcome::Partial { .. } = &ext.parse_outcome {
                 gaps.push(ExtractionGapEntry {
                     path: ext.file_path.clone(),
                     gap: ExtractionGap::PartialParse,
-                    reason: partial_parse_reason(error_ranges),
+                    reason: partial_parse_reason(ext),
                 });
             }
             // A clean parse in a language this build has no extractor for.
@@ -2379,26 +2379,209 @@ pub fn extraction_gaps(extractions: &[Extraction]) -> Vec<ExtractionGapEntry> {
 /// The `File` symbol is not a declaration here — its span is the whole file,
 /// which would contain every region.
 fn partial_parse_erased_source(ext: &Extraction) -> bool {
+    partial_region_verdicts(ext)
+        .iter()
+        .any(|(_, verdict)| *verdict == PartialRegionVerdict::Charged)
+}
+
+/// Why one error region of a partial parse is, or is not, charged.
+///
+/// The one owner of the per-region line [`partial_parse_erased_source`]
+/// documents. The charge and the `partial_parse` reason both read it, so the
+/// listing cannot tell a reader a region was lost from the graph while the
+/// ceiling treated it as harmless, which is what one sentence for every
+/// partial file used to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartialRegionVerdict<'a> {
+    /// Holds a name and lies outside every surviving declaration.
+    Charged,
+    /// Lies inside this surviving declaration (its name relative to the file).
+    InsideDeclaration(&'a str),
+    /// Of nonzero width, but the extractor found no identifier character in it.
+    Nameless,
+    /// A zero-width `MISSING` token: nothing was consumed.
+    ZeroWidth,
+}
+
+/// Every error region of `ext`'s partial parse with its verdict, in the order
+/// the extractor reported them, duplicates removed. Empty for any other
+/// outcome.
+///
+/// Inside a declaration, the innermost one is named: a method is more use to
+/// a reader than the `impl` around it.
+fn partial_region_verdicts(ext: &Extraction) -> Vec<(TextRange, PartialRegionVerdict<'_>)> {
     let ParseOutcome::Partial {
         error_ranges,
         nameless_ranges,
     } = &ext.parse_outcome
     else {
-        return false;
+        return Vec::new();
     };
-    error_ranges.iter().any(|range| {
-        range.end_byte > range.start_byte
-            && !nameless_ranges.contains(range)
-            && !ext.symbols.iter().any(|symbol| {
-                symbol.kind != SymbolKind::File
-                    && symbol.span.start_byte <= range.start_byte
-                    && range.end_byte <= symbol.span.end_byte
-            })
-    })
+    let mut seen: HashSet<(usize, usize)> = HashSet::new();
+    error_ranges
+        .iter()
+        .filter(|range| seen.insert((range.start_byte, range.end_byte)))
+        .map(|range| {
+            let verdict = if range.end_byte <= range.start_byte {
+                PartialRegionVerdict::ZeroWidth
+            } else if nameless_ranges.contains(range) {
+                PartialRegionVerdict::Nameless
+            } else {
+                ext.symbols
+                    .iter()
+                    .filter(|symbol| {
+                        symbol.kind != SymbolKind::File
+                            && symbol.span.start_byte <= range.start_byte
+                            && range.end_byte <= symbol.span.end_byte
+                    })
+                    .min_by_key(|symbol| symbol.span.end_byte - symbol.span.start_byte)
+                    .map_or(PartialRegionVerdict::Charged, |symbol| {
+                        PartialRegionVerdict::InsideDeclaration(
+                            symbol
+                                .qualified_name
+                                .strip_prefix(ext.file_path.as_str())
+                                .and_then(|rest| rest.strip_prefix("::"))
+                                .unwrap_or(symbol.name.as_str()),
+                        )
+                    })
+            };
+            (range.clone(), verdict)
+        })
+        .collect()
+}
+
+/// Whether a partially parsed file is charged against the dead-code ceiling.
+///
+/// File-level gates first — a grammar read it, its language extracts calls,
+/// it is not vendored — then the per-region verdict. One predicate, read by
+/// the count in [`extraction_coverage`] and the sentence in
+/// [`partial_parse_reason`].
+fn partial_parse_charged(ext: &Extraction) -> bool {
+    partial_parse_file_exemption(ext).is_none() && partial_parse_erased_source(ext)
+}
+
+/// Why a partially parsed file is not charged whatever its regions hold, or
+/// `None` when its regions decide.
+///
+/// A vendored file is excluded by the rule over-limit files are charged by: a
+/// vendored grammar's `parser.c` cannot call this repository's code. A file in
+/// a language with no call extractor is already charged as `call_blind`, and
+/// charging it again would double its weight in the share.
+fn partial_parse_file_exemption(ext: &Extraction) -> Option<String> {
+    if !a_grammar_read_this_file(ext) {
+        return Some("no grammar read this file".to_string());
+    }
+    if !ext.capabilities().contains(Capability::Calls) {
+        return Some(format!(
+            "`{}` has no call extractor in this build, so the file is charged as call_blind instead",
+            ext.language
+        ));
+    }
+    if devmap_extract::wiring::is_vendored_path(&ext.file_path) {
+        return Some(
+            "the file is vendored, and a vendored file cannot call this repository's code"
+                .to_string(),
+        );
+    }
+    None
 }
 
 /// Most merged error regions a `partial_parse` reason spells out.
 const PARTIAL_PARSE_RANGE_SAMPLE: usize = 8;
+
+/// `ranges` as `a..b` items, at most [`PARTIAL_PARSE_RANGE_SAMPLE`] of them and
+/// how many more when cut — both numbers, never a sample read as the whole.
+fn partial_parse_range_list(ranges: &[String]) -> String {
+    let shown = ranges.len().min(PARTIAL_PARSE_RANGE_SAMPLE);
+    let more = ranges.len() - shown;
+    format!(
+        "{}{}",
+        ranges[..shown].join(", "),
+        if more > 0 {
+            format!(", and {more} more")
+        } else {
+            String::new()
+        }
+    )
+}
+
+/// What a partial parse lost, and which of it is charged, stated.
+///
+/// Every region is named with its verdict from [`partial_region_verdicts`]:
+/// the charged ones, then each exemption with its reason. An exempt region is
+/// listed, never dropped, so the listing still says where the tree was
+/// damaged even where the damage is judged harmless.
+fn partial_parse_reason(ext: &Extraction) -> String {
+    let error_ranges: &[TextRange] = match &ext.parse_outcome {
+        ParseOutcome::Partial { error_ranges, .. } => error_ranges,
+        _ => &[],
+    };
+    let lost = partial_parse_lost(error_ranges);
+    let verdicts = partial_region_verdicts(ext);
+    let named = |pick: &dyn Fn(&PartialRegionVerdict<'_>) -> Option<String>| -> Vec<String> {
+        verdicts
+            .iter()
+            .filter_map(|(range, verdict)| {
+                pick(verdict)
+                    .map(|suffix| format!("{}..{}{suffix}", range.start_byte, range.end_byte))
+            })
+            .collect()
+    };
+    let charged = named(&|verdict| (*verdict == PartialRegionVerdict::Charged).then(String::new));
+    let inside = named(&|verdict| match verdict {
+        PartialRegionVerdict::InsideDeclaration(name) => Some(format!(" in `{name}`")),
+        _ => None,
+    });
+    let nameless = named(&|verdict| (*verdict == PartialRegionVerdict::Nameless).then(String::new));
+    let zero_width =
+        named(&|verdict| (*verdict == PartialRegionVerdict::ZeroWidth).then(String::new));
+
+    let mut sentence = lost;
+    if !charged.is_empty() {
+        let file_exemption = partial_parse_file_exemption(ext);
+        sentence.push_str(&format!(
+            "; {}: {} region(s) outside every surviving declaration ({}){}",
+            if file_exemption.is_some() {
+                "would be charged"
+            } else {
+                "charged"
+            },
+            charged.len(),
+            partial_parse_range_list(&charged),
+            match file_exemption {
+                Some(why) => format!(", but the file is not charged: {why}"),
+                None => " — declarations and calls inside them may be absent from the graph"
+                    .to_string(),
+            }
+        ));
+    }
+    let mut exempt: Vec<String> = Vec::new();
+    if !inside.is_empty() {
+        exempt.push(format!(
+            "{} region(s) inside a surviving declaration ({})",
+            inside.len(),
+            partial_parse_range_list(&inside)
+        ));
+    }
+    if !nameless.is_empty() {
+        exempt.push(format!(
+            "{} region(s) that hold no name ({})",
+            nameless.len(),
+            partial_parse_range_list(&nameless)
+        ));
+    }
+    if !zero_width.is_empty() {
+        exempt.push(format!(
+            "{} zero-width MISSING token(s) ({})",
+            zero_width.len(),
+            partial_parse_range_list(&zero_width)
+        ));
+    }
+    if !exempt.is_empty() {
+        sentence.push_str(&format!("; not charged: {}", exempt.join(", ")));
+    }
+    sentence
+}
 
 /// The byte ranges a partial parse lost, merged and stated.
 ///
@@ -2407,7 +2590,7 @@ const PARTIAL_PARSE_RANGE_SAMPLE: usize = 8;
 /// those would claim more bytes lost than the file holds. Both numbers are
 /// given when the list is cut: a sample presented as the whole is how a hole
 /// comes to look smaller than it is.
-fn partial_parse_reason(error_ranges: &[TextRange]) -> String {
+fn partial_parse_lost(error_ranges: &[TextRange]) -> String {
     let mut ranges: Vec<(usize, usize)> = error_ranges
         .iter()
         .map(|range| (range.start_byte, range.end_byte.max(range.start_byte)))
@@ -2428,8 +2611,7 @@ fn partial_parse_reason(error_ranges: &[TextRange]) -> String {
         .collect();
     let more = merged.len().saturating_sub(shown.len());
     format!(
-        "the tree holds ERROR/MISSING nodes over {} region(s), {lost} byte(s) lost: {}{} — \
-         declarations and calls inside them are absent from the graph",
+        "the tree holds ERROR/MISSING nodes over {} region(s), {lost} byte(s) lost: {}{}",
         merged.len(),
         shown.join(", "),
         if more > 0 {
@@ -2455,18 +2637,11 @@ pub fn extraction_coverage(extractions: &[Extraction]) -> ExtractionCoverage {
         .collect();
     // Partially parsed files whose language extracts calls: charged as blind,
     // and so not counted as covered below — one side of the partition each.
-    // Not vendored ones, by the rule over-limit files are charged by: a
-    // vendored grammar's `parser.c` cannot call this repository's code. And
-    // only those whose damage can have erased something — see
-    // `partial_parse_erased_source`.
+    // Which ones is `partial_parse_charged`'s call, the same predicate the
+    // `partial_parse` reason states its verdict from.
     let partial_with_calls: HashSet<&str> = extractions
         .iter()
-        .filter(|ext| {
-            a_grammar_read_this_file(ext)
-                && ext.capabilities().contains(Capability::Calls)
-                && !devmap_extract::wiring::is_vendored_path(&ext.file_path)
-                && partial_parse_erased_source(ext)
-        })
+        .filter(|ext| partial_parse_charged(ext))
         .map(|ext| ext.file_path.as_str())
         .collect();
     for entry in extraction_gaps(extractions) {
@@ -3531,6 +3706,80 @@ mod tests {
         );
         assert_eq!(coverage.blind_by_language.get("python"), Some(&2));
         assert!(!coverage.is_complete());
+    }
+
+    /// The listing says which regions were charged and which were not, and
+    /// why — the same verdict the charge was decided by. Before, every
+    /// partial file read "declarations and calls inside them are absent from
+    /// the graph", including the `&raw` shape whose declaration survived and
+    /// which was never charged: an exemption the reader could not see.
+    #[test]
+    fn a_partial_parse_reason_names_each_exempt_region_and_why() {
+        let region = |start_byte: usize, end_byte: usize| TextRange {
+            start_byte,
+            end_byte,
+        };
+        let partial = |path: &str, errors: Vec<TextRange>, nameless: Vec<TextRange>| {
+            let mut ext = devmap_extract::extract_file(path, "def x(): pass\n");
+            ext.file_path = path.to_string();
+            ext.parse_outcome = ParseOutcome::Partial {
+                error_ranges: errors,
+                nameless_ranges: nameless,
+            };
+            ext
+        };
+        let reason_for = |ext: &Extraction| -> String {
+            extraction_gaps(std::slice::from_ref(ext))
+                .into_iter()
+                .find(|entry| entry.gap == ExtractionGap::PartialParse)
+                .map(|entry| entry.reason)
+                .expect("a partial file is listed")
+        };
+
+        // `def x(): pass` spans 0..13. Inside it, a stray nameless `}`
+        // outside it, a zero-width MISSING token, and one charged region.
+        let mixed = partial(
+            "src/mixed.py",
+            vec![region(4, 8), region(20, 21), region(11, 11), region(30, 40)],
+            vec![region(20, 21)],
+        );
+        let reason = reason_for(&mixed);
+        assert!(reason.contains("byte(s) lost"), "{reason}");
+        assert!(
+            reason.contains("charged: 1 region(s) outside every surviving declaration (30..40)"),
+            "{reason}"
+        );
+        assert!(
+            reason
+                .contains("not charged: 1 region(s) inside a surviving declaration (4..8 in `x`)"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("1 region(s) that hold no name (20..21)"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("1 zero-width MISSING token(s) (11..11)"),
+            "{reason}"
+        );
+
+        // Nothing charged: the reason must not claim anything was lost from
+        // the graph.
+        let exempt = partial("src/raw.py", vec![region(4, 8)], Vec::new());
+        let reason = reason_for(&exempt);
+        assert!(reason.contains("not charged"), "{reason}");
+        assert!(
+            !reason.contains("outside every surviving declaration"),
+            "{reason}"
+        );
+        assert!(!reason.contains("absent from the graph"), "{reason}");
+
+        // A vendored file's charged-shape region is named, and so is the
+        // reason the file as a whole is not charged.
+        let vendored = partial("vendor/lib/x.py", vec![region(30, 40)], Vec::new());
+        let reason = reason_for(&vendored);
+        assert!(reason.contains("vendored"), "{reason}");
+        assert_eq!(extraction_coverage(&[vendored]).partial_parse_files, 0);
     }
 
     fn extraction(symbols: Vec<ExtractedSymbol>, error: Option<(usize, usize)>) -> Extraction {
