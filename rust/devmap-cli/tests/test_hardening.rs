@@ -810,6 +810,56 @@ fn a_macro_body_call_and_a_qualified_scope_keep_their_targets_out_of_the_confide
             analysis.dead_symbols
         );
     }
+
+    // The partial-parse charge policy (D-7), stated on this fixture rather
+    // than left implicit in the dead-tier verdicts above. The preprocessor
+    // scanner strands a lone `}` between the two macros: the file is a
+    // partial parse and stays *listed* as one, its regions named, but each
+    // region either holds no name (the `}`) or is a zero-width MISSING token
+    // that consumed nothing, so none can have erased a declaration or a
+    // callee and the file is not *charged* against the CUDA ceiling.
+    let ParseOutcome::Partial {
+        error_ranges,
+        nameless_ranges,
+    } = &ext.parse_outcome
+    else {
+        panic!(
+            "the fixture's stray `}}` is a partial parse: {:?}",
+            ext.parse_outcome
+        );
+    };
+    assert!(
+        error_ranges.iter().any(|r| nameless_ranges.contains(r))
+            && error_ranges
+                .iter()
+                .all(|r| nameless_ranges.contains(r) || r.end_byte == r.start_byte),
+        "every error region of this fixture holds no name or is zero-width: \
+         {error_ranges:?} / {nameless_ranges:?}"
+    );
+    let listed: Vec<ExtractionGapEntry> = extraction_gaps(std::slice::from_ref(&ext))
+        .into_iter()
+        .filter(|entry| entry.gap == ExtractionGap::PartialParse)
+        .collect();
+    assert_eq!(listed.len(), 1, "the partial file is listed: {listed:?}");
+    assert!(
+        listed[0].reason.contains("not charged")
+            && listed[0].reason.contains("hold no name")
+            && listed[0].reason.contains("zero-width MISSING")
+            && !listed[0]
+                .reason
+                .contains("outside every surviving declaration"),
+        "the listing names the exempt region and why, and charges nothing: {}",
+        listed[0].reason
+    );
+    let coverage = extraction_coverage(std::slice::from_ref(&ext));
+    assert_eq!(
+        coverage.partial_parse_files, 0,
+        "a nameless region is not charged"
+    );
+    assert!(
+        coverage.is_complete_for("cuda"),
+        "nothing about this file caps the CUDA ceiling: {coverage:?}"
+    );
 }
 
 #[test]
