@@ -762,11 +762,25 @@ impl Daemon {
             }
             // A link to a directory inside the repository. The walk does not
             // descend one, and the files under the target are queued under
-            // their own names, so there is nothing to do for this path —
-            // expanding it would put the same bytes in the graph twice.
+            // their own names, so nothing is extracted here — expanding it
+            // would put the same bytes in the graph twice. What a full build
+            // of this tree holds at the link's path, and under it, is no rows
+            // at all, so any the stored graph has there — a file the link
+            // replaced, or a real directory it replaced — are deleted, by the
+            // same rule the Refused and over-limit arms apply. Naming the path
+            // affected with no extraction and no deletion is what the store
+            // refuses as a silent drop.
             devmap_extract::CandidateKind::LinkedDirectory => {
                 let relative = stored_path(root, &candidate)?;
-                delta.affected.insert(relative);
+                let under = format!("{relative}/");
+                for extraction in previous {
+                    if extraction.file_path.starts_with(&under) {
+                        delta.affected.insert(extraction.file_path.clone());
+                        delta.deleted.insert(extraction.file_path.clone());
+                    }
+                }
+                delta.affected.insert(relative.clone());
+                delta.deleted.insert(relative);
                 return Ok(delta);
             }
             // Over the size limit: a structural skip, by the same rule the
@@ -2675,6 +2689,183 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&outside);
+    }
+
+    /// A scratch tree with `real/x.py` and `other.py` indexed into a fresh
+    /// store, plus whatever `extra` files the caller adds before indexing.
+    #[cfg(unix)]
+    fn indexed_tree_for_linked_directory(
+        tag: &str,
+        extra: &[(&str, &str)],
+    ) -> (std::path::PathBuf, Store) {
+        let root = std::env::temp_dir().join(format!(
+            "devmap-linked-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("real")).unwrap();
+        let root = root.canonicalize().unwrap();
+        fs::write(root.join("real/x.py"), "def x():\n    return 1\n").unwrap();
+        fs::write(root.join("other.py"), "def other_v1():\n    return 2\n").unwrap();
+        for (path, body) in extra {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, body).unwrap();
+        }
+        let initial = extract_tree(&root).unwrap();
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(&initial);
+        let resolution = resolver.resolve_all(&initial).unwrap();
+        let analysis = analyze(&initial, &resolution);
+        let store = Store::open_in_memory().unwrap();
+        save_scratch_generation(&store, &initial, &resolution, &analysis);
+        (root, store)
+    }
+
+    fn persisted_paths(daemon: &Daemon) -> Vec<String> {
+        let mut paths: Vec<String> = daemon
+            .store
+            .latest_extractions()
+            .unwrap()
+            .into_iter()
+            .map(|extraction| extraction.file_path)
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    /// A symlinked directory is reconciled as a deletion of everything the
+    /// stored graph holds at or under its path, and of nothing else.
+    ///
+    /// The cold walk never descends a link, so a full build writes no rows at
+    /// `vendor` or under `vendor/`. The arm used to name the path affected and
+    /// return no extraction and no deletion, which the store committed as a
+    /// silent drop of `vendor` and a carry of every row under it. A sibling
+    /// sharing the prefix as a string (`vendor.py`, `vendorx/`) is a different
+    /// path and must survive.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_directory_deletes_its_own_rows_and_only_those() {
+        let (root, daemon) = daemon_with_one_indexed_source("linked-unit");
+        fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("vendor")).unwrap();
+        let previous = vec![
+            extract_file("vendor", "def was_a_file():\n    return 0\n"),
+            extract_file("vendor/v.py", "def v():\n    return 1\n"),
+            extract_file("vendor.py", "def sibling():\n    return 2\n"),
+            extract_file("vendorx/y.py", "def y():\n    return 3\n"),
+            extract_file("src/a.py", "def a():\n    return 1\n"),
+        ];
+
+        let delta = daemon
+            .collect_pending_path(&root, &previous, "vendor")
+            .expect("a link to a directory inside the repository is answerable");
+
+        let expected: std::collections::BTreeSet<String> = ["vendor", "vendor/v.py"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(delta.deleted, expected, "deleted exactly the link's rows");
+        assert_eq!(
+            delta.affected, expected,
+            "every affected path is accounted for by a deletion, so the store \
+             cannot read it as a silent drop"
+        );
+        assert!(
+            delta.fresh.is_empty(),
+            "nothing is extracted through a link"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A symlinked directory that never had rows commits beside a real edit,
+    /// and drops nothing that is not its own.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_linked_directory_drains_without_dropping_an_unrelated_file() {
+        let (root, store) = indexed_tree_for_linked_directory("new", &[]);
+        std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
+        fs::write(root.join("other.py"), "def other_v2():\n    return 22\n").unwrap();
+        store
+            .enqueue_pending_paths(&[
+                root.join("alias").to_string_lossy().into_owned(),
+                root.join("other.py").to_string_lossy().into_owned(),
+            ])
+            .unwrap();
+        let daemon = Daemon::new(store, root.clone());
+
+        daemon
+            .drain_pending_batch()
+            .expect("a linked directory beside a real edit must commit");
+
+        assert_eq!(
+            persisted_paths(&daemon),
+            vec!["other.py".to_string(), "real/x.py".to_string()]
+        );
+        assert!(
+            daemon
+                .store
+                .latest_extractions()
+                .unwrap()
+                .iter()
+                .any(|extraction| {
+                    extraction.file_path == "other.py"
+                        && extraction
+                            .symbols
+                            .iter()
+                            .any(|symbol| symbol.name == "other_v2")
+                }),
+            "the edit in the same batch must land"
+        );
+        assert_eq!(daemon.store.get_pending_paths().unwrap().len(), 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A real directory replaced by a link to another directory loses the rows
+    /// it held, as a full build of the new tree would.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_replaced_by_a_link_drops_the_rows_under_it() {
+        let (root, store) = indexed_tree_for_linked_directory(
+            "replaced",
+            &[
+                ("vendor/v.py", "def v():\n    return 1\n"),
+                ("vendor.py", "def sibling():\n    return 2\n"),
+            ],
+        );
+        assert!(
+            store
+                .latest_extractions()
+                .unwrap()
+                .iter()
+                .any(|extraction| extraction.file_path == "vendor/v.py"),
+            "fixture precondition: vendor/v.py is indexed"
+        );
+        fs::remove_dir_all(root.join("vendor")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("vendor")).unwrap();
+        store
+            .enqueue_pending_paths(&[root.join("vendor").to_string_lossy().into_owned()])
+            .unwrap();
+        let daemon = Daemon::new(store, root.clone());
+
+        daemon
+            .drain_pending_batch()
+            .expect("a directory replaced by a link must drain");
+
+        assert_eq!(
+            persisted_paths(&daemon),
+            vec![
+                "other.py".to_string(),
+                "real/x.py".to_string(),
+                "vendor.py".to_string()
+            ],
+            "vendor/v.py is under a link the walk does not descend, so a full build \
+             holds no row for it; vendor.py merely shares the prefix"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// One unrepresentable filename must not stop the daemon from starting at
