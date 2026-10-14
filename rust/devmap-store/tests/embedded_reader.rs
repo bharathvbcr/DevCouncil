@@ -168,6 +168,67 @@ fn two_worktrees_cannot_bind_the_same_store_even_before_a_generation_exists() {
     assert!(reader.validate_repo_root(&b).is_err());
 }
 
+/// A repo-local store travels with `mv`, a restore or a drive change, still
+/// stamped with the absolute root it was built at. Once that root is gone the
+/// stamp names nobody, so the next writer at the new location takes the store
+/// over — and the queue it carries with it, which is repo-relative.
+#[test]
+fn a_store_whose_worktree_moved_rebinds_to_the_new_root_and_keeps_its_queue() {
+    let temp = Scratch::new();
+    let a = temp.0.join("a");
+    let b = temp.0.join("b");
+    fs::create_dir(&a).unwrap();
+    let store = Store::open(temp.db()).unwrap();
+    assert_eq!(store.bind_repo_root(&a).unwrap(), None);
+    store
+        .enqueue_pending_paths_under_root(&a, &["x.py".into()])
+        .unwrap();
+    fs::rename(&a, &b).unwrap();
+
+    // A reader cannot rebind; it has to name the remedy that applies to a
+    // store that moved, not "use a separate --db".
+    let reader = Store::open_read_only(temp.db()).unwrap();
+    let refusal = reader.validate_repo_root(&b).unwrap_err().to_string();
+    assert!(refusal.contains("no longer exists"), "{refusal}");
+    assert!(refusal.contains("devmap build"), "{refusal}");
+    assert!(!refusal.contains("separate --db"), "{refusal}");
+
+    let previous = store
+        .bind_repo_root(&b)
+        .expect("a writer at the new root takes over a store whose owner is gone")
+        .expect("the rebind reports the root it replaced");
+    assert!(previous.ends_with("a"), "{previous}");
+    assert_eq!(store.bind_repo_root(&b).unwrap(), None, "already bound");
+    assert_eq!(store.get_pending_paths().unwrap(), vec!["x.py".to_string()]);
+    reader.validate_repo_root(&b).unwrap();
+    assert!(reader.validate_repo_root(&a).is_err());
+}
+
+/// The refusal survives where it is right: both worktrees still exist, as
+/// after a `cp -R`, and the message says so instead of implying a move.
+#[test]
+fn a_store_whose_owner_still_exists_is_refused_with_an_accurate_message() {
+    let temp = Scratch::new();
+    let a = temp.0.join("a");
+    let b = temp.0.join("b");
+    fs::create_dir(&a).unwrap();
+    fs::create_dir(&b).unwrap();
+    let store = Store::open(temp.db()).unwrap();
+    store.bind_repo_root(&a).unwrap();
+    let refusal = store.bind_repo_root(&b).unwrap_err().to_string();
+    assert!(refusal.contains("belongs to worktree"), "{refusal}");
+    assert!(refusal.contains("still exists"), "{refusal}");
+    // A requesting root that does not exist is never a rebind target, even
+    // when the recorded owner is gone too.
+    fs::remove_dir(&a).unwrap();
+    let missing = temp.0.join("missing");
+    assert!(store.bind_repo_root(&missing).is_err());
+    assert!(Store::open_read_only(temp.db())
+        .unwrap()
+        .validate_repo_root(&b)
+        .is_err());
+}
+
 #[test]
 fn two_hundred_fifty_six_concurrent_edit_sessions_preserve_every_unique_event() {
     let temp = Scratch::new();

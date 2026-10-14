@@ -36,10 +36,84 @@ impl RepositoryRef {
     }
 }
 
+/// Which file a cached connection was opened on.
+///
+/// A `Store` holds one long-lived SQLite connection, and on Unix that
+/// connection keeps an unlinked file alive: after `rm -rf .devmap && devmap
+/// build` — the documented quarantine remedy — a cache keyed by path alone
+/// went on answering from the deleted file's last generation, on every slot
+/// mode. The path is the same; the file is not.
+///
+/// Unix compares `(dev, ino)`, which a recreated file cannot share with one
+/// this process still holds open (the open handle keeps the inode allocated).
+/// Elsewhere std has no stable file id, so size and mtime stand in: a write
+/// to the store also changes them, which costs a reopen and never a stale
+/// answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreFileIdentity {
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(not(unix))]
+    len: u64,
+    #[cfg(not(unix))]
+    modified: Option<std::time::SystemTime>,
+}
+
+impl StoreFileIdentity {
+    pub fn of(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Self {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+            }
+        }
+    }
+}
+
+/// Where a cached store came from, which decides whether a hit is re-checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreOrigin {
+    /// Opened by this cache from a file whose identity was taken just before
+    /// the open. Every hit re-stats the path against it.
+    Opened(StoreFileIdentity),
+    /// Handed in already open by a caller that owns it (`StoreSlot::ready`):
+    /// an in-memory store, or one whose lifetime the caller manages. There
+    /// is no file for this cache to check, so it is served as given.
+    CallerOwned,
+}
+
+/// What a cache lookup found.
+pub enum CacheLookup {
+    /// The cached store, still the file at its path.
+    Hit(Arc<Store>),
+    /// An entry existed but its file is gone or was replaced; it has been
+    /// evicted, and the caller must look at the path afresh.
+    Evicted,
+    /// No entry under this key.
+    Miss,
+}
+
+struct LruEntry {
+    key: PathBuf,
+    store: Arc<Store>,
+    origin: StoreOrigin,
+}
+
 /// Bounded LRU of open stores, keyed by canonical store path.
 #[derive(Default)]
 pub struct StoreLru {
-    entries: Vec<(PathBuf, Arc<Store>, RepositoryRef)>,
+    entries: Vec<LruEntry>,
 }
 
 impl StoreLru {
@@ -48,25 +122,49 @@ impl StoreLru {
     }
 
     pub fn last_store_path(&self) -> Option<PathBuf> {
-        self.entries.last().map(|(key, _, _)| key.clone())
+        self.entries.last().map(|entry| entry.key.clone())
     }
 
-    pub fn get(&mut self, key: &Path) -> Option<(Arc<Store>, RepositoryRef)> {
-        let pos = self.entries.iter().position(|(k, _, _)| k == key)?;
+    /// The cached store under `key`, provided the file at `key` is still the
+    /// one it was opened on.
+    ///
+    /// `stat` is asked at most once — `FnOnce` makes that a property of the
+    /// signature — and only when an entry exists, so a steady-state hit costs
+    /// one stat and no reopen. A stat that fails for any reason, or names
+    /// something other than a regular file, evicts: the cache never vouches
+    /// for a file it could not see.
+    pub fn get_verified(
+        &mut self,
+        key: &Path,
+        stat: impl FnOnce(&Path) -> std::io::Result<std::fs::Metadata>,
+    ) -> CacheLookup {
+        let Some(pos) = self.entries.iter().position(|entry| entry.key == key) else {
+            return CacheLookup::Miss;
+        };
+        if let StoreOrigin::Opened(recorded) = self.entries[pos].origin {
+            let current = stat(key)
+                .ok()
+                .filter(std::fs::Metadata::is_file)
+                .map(|metadata| StoreFileIdentity::of(&metadata));
+            if current != Some(recorded) {
+                self.entries.remove(pos);
+                return CacheLookup::Evicted;
+            }
+        }
         let entry = self.entries.remove(pos);
-        let result = (Arc::clone(&entry.1), entry.2.clone());
+        let store = Arc::clone(&entry.store);
         self.entries.push(entry);
-        Some(result)
+        CacheLookup::Hit(store)
     }
 
-    pub fn insert(&mut self, key: PathBuf, store: Arc<Store>, attr: RepositoryRef) {
-        if let Some(pos) = self.entries.iter().position(|(k, _, _)| k == &key) {
+    pub fn insert(&mut self, key: PathBuf, store: Arc<Store>, origin: StoreOrigin) {
+        if let Some(pos) = self.entries.iter().position(|entry| entry.key == key) {
             self.entries.remove(pos);
         }
         if self.entries.len() >= STORE_CACHE_CAP {
             self.entries.remove(0);
         }
-        self.entries.push((key, store, attr));
+        self.entries.push(LruEntry { key, store, origin });
     }
 }
 
@@ -126,4 +224,114 @@ pub fn infer_root_from_store(store_path: &Path) -> PathBuf {
         .and_then(Path::parent)
         .map(canonicalize_path)
         .unwrap_or_else(|| canonicalize_path(store_path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CacheLookup, StoreFileIdentity, StoreLru, StoreOrigin};
+    use devmap_store::Store;
+    use std::cell::Cell;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    fn scratch_file(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "devmap-store-lru-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("store.sqlite");
+        std::fs::write(&file, b"first").unwrap();
+        file
+    }
+
+    #[test]
+    fn a_hit_on_an_unchanged_file_costs_one_stat_and_returns_the_same_store() {
+        let file = scratch_file("steady");
+        let identity = StoreFileIdentity::of(&std::fs::metadata(&file).unwrap());
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mut cache = StoreLru::new();
+        cache.insert(
+            file.clone(),
+            Arc::clone(&store),
+            StoreOrigin::Opened(identity),
+        );
+        let stats = Cell::new(0);
+        for _ in 0..3 {
+            let lookup = cache.get_verified(&file, |path: &Path| {
+                stats.set(stats.get() + 1);
+                std::fs::metadata(path)
+            });
+            let CacheLookup::Hit(hit) = lookup else {
+                panic!("an unchanged file must be a hit");
+            };
+            assert!(Arc::ptr_eq(&hit, &store));
+        }
+        assert_eq!(stats.get(), 3, "one stat per lookup");
+        // A miss never stats: there is nothing to compare against.
+        assert!(matches!(
+            cache.get_verified(Path::new("/nonexistent/other"), |_: &Path| {
+                stats.set(stats.get() + 1);
+                Err(std::io::Error::other("unreachable"))
+            }),
+            CacheLookup::Miss
+        ));
+        assert_eq!(stats.get(), 3);
+        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_replaced_or_vanished_file_evicts_its_entry() {
+        let file = scratch_file("replaced");
+        let identity = StoreFileIdentity::of(&std::fs::metadata(&file).unwrap());
+        let mut cache = StoreLru::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        cache.insert(
+            file.clone(),
+            Arc::clone(&store),
+            StoreOrigin::Opened(identity),
+        );
+        // Keep the original inode alive, as an open SQLite connection does,
+        // so the replacement cannot reuse its number.
+        let _held = std::fs::File::open(&file).unwrap();
+        let sibling = file.with_extension("new");
+        std::fs::write(&sibling, b"second, a different length").unwrap();
+        std::fs::rename(&sibling, &file).unwrap();
+        assert!(matches!(
+            cache.get_verified(&file, |path: &Path| std::fs::metadata(path)),
+            CacheLookup::Evicted
+        ));
+        assert!(matches!(
+            cache.get_verified(&file, |path: &Path| std::fs::metadata(path)),
+            CacheLookup::Miss
+        ));
+
+        cache.insert(file.clone(), store, StoreOrigin::Opened(identity));
+        std::fs::remove_file(&file).unwrap();
+        assert!(matches!(
+            cache.get_verified(&file, |path: &Path| std::fs::metadata(path)),
+            CacheLookup::Evicted
+        ));
+        std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_caller_owned_store_is_served_without_a_stat() {
+        let mut cache = StoreLru::new();
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        cache.insert(PathBuf::from("in-memory"), store, StoreOrigin::CallerOwned);
+        assert!(matches!(
+            cache.get_verified(
+                Path::new("in-memory"),
+                |_: &Path| -> std::io::Result<std::fs::Metadata> {
+                    panic!("a caller-owned store has no file to stat")
+                }
+            ),
+            CacheLookup::Hit(_)
+        ));
+    }
 }

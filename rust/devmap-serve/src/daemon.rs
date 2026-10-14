@@ -1144,7 +1144,12 @@ impl Daemon {
         // at persistence lets a competing build replace the base generation
         // after this drain has read it, invalidating its carry-forward.
         let _writer = self.store.lock_writer(Store::WRITER_LOCK_WAIT)?;
-        self.store.bind_repo_root(&self.root)?;
+        if let Some(previous) = self.store.bind_repo_root(&self.root)? {
+            info!(
+                "store rebound from {previous:?}, which no longer exists, to {}",
+                self.root.display()
+            );
+        }
         let claims = self.store.claim_pending_batch(self.batch_limit)?;
         if claims.is_empty() {
             return Ok(0);
@@ -1560,7 +1565,12 @@ impl Daemon {
     /// gave up and killed the daemon it had just spawned after three seconds,
     /// then fell back to re-doing the work through the CLI, on every call.
     pub async fn run_loop(&self) -> anyhow::Result<()> {
-        self.store.bind_repo_root(&self.root)?;
+        if let Some(previous) = self.store.bind_repo_root(&self.root)? {
+            info!(
+                "store rebound from {previous:?}, which no longer exists, to {}",
+                self.root.display()
+            );
+        }
         // Captured *first*, before the IPC endpoint binds, because the window
         // between binding and here is not empty: `reconcile_connect_time`
         // sweeps the tree in it, which on a large repository is seconds during

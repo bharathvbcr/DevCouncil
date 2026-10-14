@@ -55,8 +55,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use crate::admission::Admission;
 use crate::protocol::{dispatch, validate_request, IpcCommand, IpcRequest, PROTOCOL_VERSION};
 use crate::repo_scope::{
-    canonicalize_path, infer_root_from_store, open_mcp_store, store_for_repo_path, RepositoryRef,
-    StoreLru,
+    canonicalize_path, infer_root_from_store, open_mcp_store, store_for_repo_path, CacheLookup,
+    RepositoryRef, StoreFileIdentity, StoreLru, StoreOrigin,
 };
 use crate::root_resolve::{file_uri_to_path, roots_with_stores, RootResolveInput, MAX_ROOTS};
 
@@ -165,13 +165,12 @@ impl StoreSlot {
     /// An already-open store, for tests and for callers that own one.
     pub fn ready(db_path: impl Into<PathBuf>, store: Arc<Store>) -> Self {
         let db_path = db_path.into();
-        let attr = RepositoryRef {
-            root: infer_root_from_store(&db_path),
-            store: db_path.clone(),
-            resolved_from: "db",
-        };
         let mut cache = StoreLru::new();
-        cache.insert(db_path.clone(), Arc::clone(&store), attr);
+        cache.insert(
+            db_path.clone(),
+            Arc::clone(&store),
+            StoreOrigin::CallerOwned,
+        );
         Self {
             mode: SlotMode::Pinned {
                 db_path: db_path.clone(),
@@ -469,24 +468,39 @@ with an absolute repository path."
         }
     }
 
-    fn cache_open(&self, store_path: &Path, attr: RepositoryRef) -> Result<Arc<Store>, String> {
+    /// The open store for `store_path`, reusing a cached connection only
+    /// while the file at that path is still the one it was opened on.
+    ///
+    /// A hit used to be returned before anything looked at the disk, so a
+    /// `--db`-pinned server kept serving a deleted store, and every mode kept
+    /// serving the unlinked file after a delete-and-rebuild. Each hit now
+    /// re-stats the path (one stat, see [`StoreLru::get_verified`]); a
+    /// mismatch evicts and falls through to the same absence check and open a
+    /// first call takes.
+    fn cache_open(&self, store_path: &Path) -> Result<Arc<Store>, String> {
         let key = devmap_extract::safe_fs::resolve_file_alias(store_path)
             .map_err(|error| format!("unsafe store path: {error}"))?;
         {
             let mut cache = crate::lock_recover(&self.opened);
-            if let Some((store, _)) = cache.get(&key) {
-                return Ok(store);
-            }
-            if let Some((store, _)) = cache.get(store_path) {
-                return Ok(store);
+            for candidate in [key.as_path(), store_path] {
+                if let CacheLookup::Hit(store) =
+                    cache.get_verified(candidate, |path| std::fs::metadata(path))
+                {
+                    return Ok(store);
+                }
             }
         }
-        if !store_path.is_file() {
-            return Err(explain_absence(store_path));
-        }
+        // Identity taken before the open, never after: a file replaced between
+        // the two leaves a stale identity, which costs one extra reopen on the
+        // next call. Taken after, it would vouch for a file the connection
+        // never opened.
+        let identity = match std::fs::metadata(store_path) {
+            Ok(metadata) if metadata.is_file() => StoreFileIdentity::of(&metadata),
+            _ => return Err(explain_absence(store_path)),
+        };
         let store = Arc::new(open_mcp_store(store_path)?);
         let mut cache = crate::lock_recover(&self.opened);
-        cache.insert(key, Arc::clone(&store), attr);
+        cache.insert(key, Arc::clone(&store), StoreOrigin::Opened(identity));
         Ok(store)
     }
 
@@ -508,12 +522,12 @@ use an unpinned shared server and select with repo_path.",
                     ));
                 }
             }
-            let store = self.cache_open(&attr.store, attr.clone())?;
+            let store = self.cache_open(&attr.store)?;
             return Ok((store, attr));
         }
         let resolved = self.resolve_path()?;
         let attr = self.attribution_for_resolved(&resolved);
-        let store = self.cache_open(&resolved, attr.clone())?;
+        let store = self.cache_open(&resolved)?;
         Ok((store, attr))
     }
 
