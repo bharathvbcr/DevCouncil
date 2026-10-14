@@ -8,8 +8,8 @@
   "kotlin": {
     "forbid_any_tier_rows": 2,
     "known_failing": 0,
-    "positive_rows": 55,
-    "present": 55
+    "positive_rows": 61,
+    "present": 61
   },
   "python": {
     "forbid_any_tier_rows": 0,
@@ -20,8 +20,8 @@
   "rust": {
     "forbid_any_tier_rows": 1,
     "known_failing": 3,
-    "positive_rows": 106,
-    "present": 103
+    "positive_rows": 113,
+    "present": 110
   },
   "swift": {
     "forbid_any_tier_rows": 2,

@@ -1,0 +1,30 @@
+# Normalized expected edges. Hand-written ground truth: each row was derived from the
+# fixture's original audit labels (written before DevMap ran) and the language's own
+# semantics, never from DevMap's output. Read by devmap-analyze/tests/accuracy_fixtures.rs.
+#
+# Columns (tab separated):
+#   id        unique within the fixture (<lang>.<construct>)
+#   construct the audit's construct label
+#   caller    symbol id `<file>::<qualified name>`; a bare path means the file node
+#   callee    symbol id(s). `a|b` = any one satisfies; `a&b` = all must be present
+#   kind      edge   = a Calls/References/Instantiates/Extends/Implements/... edge, any tier
+#             import = an Imports edge between the two files
+#             forbid = NO edge of any kind at confidence >= 0.9 may join caller and callee
+#   level     must   = a correct resolver has this edge
+#             should = the audit accepted an honest miss or an alternative here
+#   ledger    optional `a|b` bare names a ledger row may carry when the expected callee's
+#             own name is not the name written at the call site
+#   note      what the row proves
+#
+# Dead-code truth lives beside this file in dead.tsv; failures that exist today live in
+# known_failing.tsv (keyed by the card that owns the fix).
+cp.lib	C48	tools/cli/entry.rs::main	engine/lib/core.rs::run_cp	edge	must		[lib] path = "lib/core.rs": engine_core::run_cp() names the library root the manifest declares
+cp.libx	C48	tools/cli/entry.rs::main	decoy/src/lib.rs::run_cp	forbid	must		the decoy namesake is not engine_core
+cp.mod	C48	engine/lib/core.rs::run_cp	engine/lib/parts.rs::assemble_cp	edge	must		a declared library root keeps its child modules beside it, as lib.rs does
+cp.modx	C48	engine/lib/core.rs::run_cp	decoy/src/lib.rs::assemble_cp	forbid	must		the decoy namesake is another crate
+cp.it	C48	engine/tests/it.rs::it_cp	engine/lib/parts.rs::assemble_cp	edge	must		integration test reaches a module of a library at a declared path
+cp.bin	C48	tools/cli/entry.rs::main	tools/cli/helpers.rs::assist_cp	edge	must		[[bin]] path = "cli/entry.rs": mod helpers; is cli/helpers.rs
+cp.binc	C48	tools/cli/entry.rs::main	tools/cli/helpers.rs::finish_cp	edge	must		crate:: inside a binary at a declared path is relative to that binary root
+cp.binx	C48	tools/cli/entry.rs::main	decoy/src/lib.rs::assist_cp	forbid	must		the decoy namesake is another crate
+cp.imp	C48	tools/cli/entry.rs	tools/cli/helpers.rs	import	must		mod helpers; in a declared binary root
+cp.impl	C48	engine/lib/core.rs	engine/lib/parts.rs	import	must		pub mod parts; in a declared library root

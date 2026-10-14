@@ -315,6 +315,15 @@ pub struct Resolver {
     /// [`Self::index_project_manifests`], which a caller runs before
     /// [`Self::index_extractions`]; that one builds `rust_crate_roots` from it.
     rust_manifest_crates: Vec<devmap_extract::RustCrateManifest>,
+    /// Indexed crate root files a manifest places by hand (`[lib] path`,
+    /// `[[bin]] path`), keyed by the directory each keeps its modules in.
+    /// The path convention (`src/lib.rs`, `src/main.rs`) cannot see them: a
+    /// library at `lib/core.rs` has no `src` ancestor to be relative to and a
+    /// stem that reads as a leaf module. Built with `rust_crate_roots`.
+    rust_declared_roots: BTreeMap<String, BTreeSet<String>>,
+    /// The library root file a manifest's `[lib] path` names, by the directory
+    /// `rust_crate_roots` records for that crate — what a bare crate name is.
+    rust_declared_libs: BTreeMap<String, String>,
     /// The Python source roots each manifest declares, deepest directory
     /// first. Set by [`Self::index_project_manifests`]; read by
     /// [`Self::python_root_candidates`].
@@ -650,6 +659,8 @@ impl Resolver {
             py_search_dirs: BTreeMap::new(),
             rust_crate_roots: BTreeMap::new(),
             rust_manifest_crates: Vec::new(),
+            rust_declared_roots: BTreeMap::new(),
+            rust_declared_libs: BTreeMap::new(),
             python_manifest_roots: Vec::new(),
             py_package_parents: BTreeMap::new(),
             swift_targets: Vec::new(),
@@ -2900,6 +2911,8 @@ impl Resolver {
         self.path_module_bindings.clear();
         self.py_search_dirs.clear();
         self.rust_crate_roots.clear();
+        self.rust_declared_roots.clear();
+        self.rust_declared_libs.clear();
         self.rust_signatures.clear();
         self.unexported_symbols.clear();
         self.reexport_chains.clear();
@@ -3283,33 +3296,79 @@ impl Resolver {
             let root = src_root.to_string();
             Self::claim_rust_crate_name(&mut rust_crate_roots, name, root);
         }
-        // The names a manifest gives the same roots. A package whose library
-        // is `[lib] name = "xlib"` is spelled `use xlib::…` by every caller,
-        // and its directory name is no help (GitPulse: `src-tauri`, package
-        // `gitpulse`, lib `gitpulse_lib`). Only where the crate's own root
-        // file is indexed, and under the same abstain-on-conflict rule.
+        // The target roots a manifest places by hand. Only indexed ones: a
+        // path the manifest names that is not in the corpus is the manifest
+        // pass's refusal row, not a root to resolve against.
+        let mut declared_roots: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut declared_libs: BTreeMap<String, String> = BTreeMap::new();
+        let mut shared_lib_dirs: BTreeSet<String> = BTreeSet::new();
         for manifest in &self.rust_manifest_crates {
-            let src_root = if manifest.dir.is_empty() {
-                "src".to_string()
-            } else {
-                format!("{}/src", manifest.dir)
-            };
-            let indexed = ["lib.rs", "main.rs"].iter().any(|file| {
-                self.file_symbols
-                    .contains_key(&format!("{src_root}/{file}"))
-            });
-            if !indexed {
-                continue;
-            }
-            for name in &manifest.names {
-                if rust_crate_roots.get(name).and_then(Option::as_deref) == Some(src_root.as_str())
-                {
-                    continue;
+            for file in manifest.lib_path.iter().chain(&manifest.bin_paths) {
+                if self.file_symbols.contains_key(file) {
+                    declared_roots
+                        .entry(Self::parent_dir(file))
+                        .or_default()
+                        .insert(file.clone());
                 }
-                Self::claim_rust_crate_name(&mut rust_crate_roots, name.clone(), src_root.clone());
+            }
+            if let Some(lib) = manifest
+                .lib_path
+                .as_ref()
+                .filter(|lib| self.file_symbols.contains_key(*lib))
+            {
+                let dir = Self::parent_dir(lib);
+                if declared_libs.get(&dir).is_some_and(|held| held != lib) {
+                    shared_lib_dirs.insert(dir);
+                } else {
+                    declared_libs.insert(dir, lib.clone());
+                }
             }
         }
+        // The names a manifest gives its roots. A package whose library is
+        // `[lib] name = "xlib"` is spelled `use xlib::…` by every caller, and
+        // its directory name is no help (GitPulse: `src-tauri`, package
+        // `gitpulse`, lib `gitpulse_lib`). Only where the crate's own root
+        // file is indexed. Two manifests claiming one name abstain, as two
+        // directories do; a manifest's name outranks a directory's guess at
+        // one, which is a convention and not a declaration.
+        let mut manifest_claims: BTreeMap<String, Option<String>> = BTreeMap::new();
+        for manifest in &self.rust_manifest_crates {
+            let src_root = match &manifest.lib_path {
+                Some(lib) => {
+                    if !self.file_symbols.contains_key(lib) {
+                        continue;
+                    }
+                    Self::parent_dir(lib)
+                }
+                None => {
+                    let src_root = Self::rel_join(&manifest.dir, "src");
+                    let indexed = ["lib.rs", "main.rs"].iter().any(|file| {
+                        self.file_symbols
+                            .contains_key(&format!("{src_root}/{file}"))
+                    });
+                    if !indexed {
+                        continue;
+                    }
+                    src_root
+                }
+            };
+            for name in &manifest.names {
+                // Two libraries rooted in one directory: the directory cannot
+                // say which root a name means.
+                if shared_lib_dirs.contains(&src_root) {
+                    manifest_claims.insert(name.clone(), None);
+                    continue;
+                }
+                Self::claim_rust_crate_name(&mut manifest_claims, name.clone(), src_root.clone());
+            }
+        }
+        rust_crate_roots.extend(manifest_claims);
+        for dir in &shared_lib_dirs {
+            declared_libs.remove(dir);
+        }
         self.rust_crate_roots = rust_crate_roots;
+        self.rust_declared_roots = declared_roots;
+        self.rust_declared_libs = declared_libs;
         // Python packages this corpus indexes, by the name an absolute import
         // would spell: every directory holding an indexed `__init__.py`.
         let python_packages: BTreeSet<String> = self
@@ -6326,7 +6385,7 @@ impl Resolver {
             Self::parent_dir(file)
         } else if hidden_somewhere && Self::visibility_is_enforced(family) {
             match family {
-                LangFamily::Rust => Self::rust_crate_src_root(file),
+                LangFamily::Rust => self.rust_crate_src_root(file),
                 _ => file.to_string(),
             }
         } else {
@@ -6434,7 +6493,7 @@ impl Resolver {
             return true;
         }
         family == LangFamily::Rust
-            && Self::rust_crate_src_root(file) == Self::rust_crate_src_root(path)
+            && self.rust_crate_src_root(file) == self.rust_crate_src_root(path)
     }
 
     /// Languages whose method is reachable by a bare name only from inside a
@@ -6677,7 +6736,7 @@ impl Resolver {
     /// tried first and the indexed file universe decides; neither can invent a
     /// file that is not there, so the worst case is the answer this rung gave
     /// before.
-    fn rust_module_dirs(file: &str) -> Vec<String> {
+    fn rust_module_dirs(&self, file: &str) -> Vec<String> {
         let dir = Self::parent_dir(file);
         let stem = file
             .rsplit('/')
@@ -6686,8 +6745,15 @@ impl Resolver {
             .strip_suffix(".rs")
             .unwrap_or_default();
         // A directory module's file: its children are its siblings, not its
-        // descendants.
-        if stem.is_empty() || matches!(stem, "mod" | "lib" | "main") {
+        // descendants. A crate root a manifest names (`[lib] path =
+        // "lib/core.rs"`) is one whatever its stem, and that is decidable.
+        if stem.is_empty()
+            || matches!(stem, "mod" | "lib" | "main")
+            || self
+                .rust_declared_roots
+                .get(&dir)
+                .is_some_and(|roots| roots.contains(file))
+        {
             return vec![dir];
         }
         let nested = if dir.is_empty() {
@@ -6711,20 +6777,74 @@ impl Resolver {
     /// in every layout this resolver can be pointed at, single-crate and
     /// workspace alike.
     ///
+    /// A manifest's own word beats the convention: the directory of a root
+    /// file `[lib] path` / `[[bin]] path` names is the root of every file
+    /// under it, unless a `src` nearer the file says otherwise (a deeper crate
+    /// nested inside it).
+    ///
     /// Falls back to the literal `src`, which is what this rung probed
-    /// unconditionally before: a file with no `src` ancestor — `build.rs`, a
-    /// `tests/` integration crate, a bare script — keeps exactly the behaviour
-    /// it had rather than gaining a guess.
-    fn rust_crate_src_root(file: &str) -> String {
+    /// unconditionally before: a file with no `src` ancestor and no declared
+    /// root above it — `build.rs`, a `tests/` integration crate, a bare
+    /// script — keeps exactly the behaviour it had rather than gaining a guess.
+    fn rust_crate_src_root(&self, file: &str) -> String {
         let mut components: Vec<&str> = file.split('/').collect();
         components.pop();
-        while let Some(last) = components.last() {
-            if *last == "src" {
-                return components.join("/");
+        let mut by_convention = None;
+        let mut declared = None;
+        while !(by_convention.is_some() && declared.is_some()) {
+            let dir = components.join("/");
+            if declared.is_none() && self.rust_declared_roots.contains_key(&dir) {
+                declared = Some(dir.clone());
+            }
+            let Some(last) = components.last() else {
+                break;
+            };
+            if by_convention.is_none() && *last == "src" {
+                by_convention = Some(dir);
             }
             components.pop();
         }
-        "src".to_string()
+        match (by_convention, declared) {
+            (Some(src), Some(declared)) if declared.len() > src.len() => declared,
+            (Some(src), _) => src,
+            (None, Some(declared)) => declared,
+            (None, None) => "src".to_string(),
+        }
+    }
+
+    /// `rest` under the repo-relative directory `dir`; the root is `""`.
+    fn rel_join(dir: &str, rest: &str) -> String {
+        if dir.is_empty() {
+            rest.to_string()
+        } else {
+            format!("{dir}/{rest}")
+        }
+    }
+
+    /// The files a crate rooted at `src_root` may be entered through, library
+    /// first: the `[lib] path` a manifest declares there, else `lib.rs`, then
+    /// `main.rs`, then any binary root a manifest declares there.
+    fn rust_root_file_candidates(&self, src_root: &str) -> Vec<String> {
+        let mut files = Vec::new();
+        match self.rust_declared_libs.get(src_root) {
+            Some(lib) => files.push(lib.clone()),
+            None => files.push(Self::rel_join(src_root, "lib.rs")),
+        }
+        files.push(Self::rel_join(src_root, "main.rs"));
+        for declared in self.rust_declared_roots.get(src_root).into_iter().flatten() {
+            if !files.contains(declared) {
+                files.push(declared.clone());
+            }
+        }
+        files
+    }
+
+    /// The library root of the crate at `src_root`: what a bare crate name is.
+    fn rust_library_file(&self, src_root: &str) -> String {
+        self.rust_declared_libs
+            .get(src_root)
+            .cloned()
+            .unwrap_or_else(|| Self::rel_join(src_root, "lib.rs"))
     }
 
     /// The directory this file's own child modules live in.
@@ -6735,8 +6855,8 @@ impl Resolver {
     /// import rung still tries so an old `use` does not go missing. A *call*
     /// must not use it. `helper::run()` in `ledger/bindings.rs` is not the
     /// sibling `ledger/helper.rs`; that path is `super::helper`.
-    fn rust_call_base(file: &str) -> String {
-        Self::rust_module_dirs(file)
+    fn rust_call_base(&self, file: &str) -> String {
+        self.rust_module_dirs(file)
             .into_iter()
             .next()
             .unwrap_or_else(|| Self::parent_dir(file))
@@ -6751,7 +6871,7 @@ impl Resolver {
         if !Self::is_plain_ident(name) {
             return 0;
         }
-        let Some(joined) = Self::normalize_rel(&Self::rust_call_base(file), name) else {
+        let Some(joined) = Self::normalize_rel(&self.rust_call_base(file), name) else {
             return 0;
         };
         let mut shapes = 0usize;
@@ -6785,9 +6905,22 @@ impl Resolver {
         }
     }
 
-    fn consider_crate_root_files(&self, found: &mut Vec<String>, src_root: &str) {
-        self.consider_indexed(found, format!("{src_root}/lib.rs"));
-        self.consider_indexed(found, format!("{src_root}/main.rs"));
+    /// The root file(s) `crate` names from `file`. A crate root a manifest
+    /// declares is its own `crate`, which matters where two binaries share a
+    /// directory; anything else is every root its crate directory holds.
+    fn consider_crate_root_files(&self, found: &mut Vec<String>, file: &str) {
+        let src_root = self.rust_crate_src_root(file);
+        if self
+            .rust_declared_roots
+            .get(&src_root)
+            .is_some_and(|roots| roots.contains(file))
+        {
+            self.consider_indexed(found, file.to_string());
+            return;
+        }
+        for candidate in self.rust_root_file_candidates(&src_root) {
+            self.consider_indexed(found, candidate);
+        }
     }
 
     /// Every conventional file of the module whose directory is `dir`.
@@ -6832,11 +6965,11 @@ impl Resolver {
         let mut current = root.clone();
         for segment in tail.split("::") {
             let mut next = Vec::new();
-            self.consider_module_rel(&mut next, &Self::rust_call_base(&current), segment);
+            self.consider_module_rel(&mut next, &self.rust_call_base(&current), segment);
             // A name the file itself declares shadows anything a glob brings.
             if next.is_empty() && self.symbol_kind_in(&current, segment).is_none() {
                 for glob in self.rust_module_globs.get(&current).into_iter().flatten() {
-                    self.consider_module_rel(&mut next, &Self::rust_call_base(glob), segment);
+                    self.consider_module_rel(&mut next, &self.rust_call_base(glob), segment);
                 }
             }
             next.sort();
@@ -6862,25 +6995,25 @@ impl Resolver {
             return found;
         }
         if path == "crate" {
-            self.consider_crate_root_files(&mut found, &Self::rust_crate_src_root(file));
+            self.consider_crate_root_files(&mut found, file);
             return found;
         }
         if path == "super" {
-            let parent = Self::parent_dir(&Self::rust_call_base(file));
+            let parent = Self::parent_dir(&self.rust_call_base(file));
             self.consider_module_dir(&mut found, &parent);
             return found;
         }
         if let Some(tail) = path.strip_prefix("crate::") {
-            self.consider_module_rel(&mut found, &Self::rust_crate_src_root(file), tail);
+            self.consider_module_rel(&mut found, &self.rust_crate_src_root(file), tail);
             if found.is_empty() {
                 let mut roots = Vec::new();
-                self.consider_crate_root_files(&mut roots, &Self::rust_crate_src_root(file));
+                self.consider_crate_root_files(&mut roots, file);
                 found = self.rust_module_through_globs(&roots, tail);
             }
             return found;
         }
         if let Some(tail) = path.strip_prefix("self::") {
-            self.consider_module_rel(&mut found, &Self::rust_call_base(file), tail);
+            self.consider_module_rel(&mut found, &self.rust_call_base(file), tail);
             return found;
         }
         if let Some(rest) = path.strip_prefix("super::") {
@@ -6890,7 +7023,7 @@ impl Resolver {
                 hops += 1;
                 tail = more;
             }
-            let mut base = Self::rust_call_base(file);
+            let mut base = self.rust_call_base(file);
             for _ in 0..hops {
                 base = Self::parent_dir(&base);
             }
@@ -6907,7 +7040,7 @@ impl Resolver {
                     self.consider_module_rel(&mut found, &src_root, tail);
                     if found.is_empty() {
                         let mut roots = Vec::new();
-                        self.consider_indexed(&mut roots, format!("{src_root}/lib.rs"));
+                        self.consider_indexed(&mut roots, self.rust_library_file(&src_root));
                         found = self.rust_module_through_globs(&roots, tail);
                     }
                 } else {
@@ -6915,14 +7048,14 @@ impl Resolver {
                     // both `lib.rs` and `main.rs` is not ambiguous to an
                     // importer — the binary is not addressable by name — so
                     // `main.rs` answers only when there is no library.
-                    self.consider_indexed(&mut found, format!("{src_root}/lib.rs"));
+                    self.consider_indexed(&mut found, self.rust_library_file(&src_root));
                     if found.is_empty() {
-                        self.consider_indexed(&mut found, format!("{src_root}/main.rs"));
+                        self.consider_indexed(&mut found, Self::rel_join(&src_root, "main.rs"));
                     }
                 }
             }
             RustPathRoot::Child => {
-                self.consider_module_rel(&mut found, &Self::rust_call_base(file), path);
+                self.consider_module_rel(&mut found, &self.rust_call_base(file), path);
             }
             RustPathRoot::Keyword | RustPathRoot::Ambiguous | RustPathRoot::Unknown => {}
         }
@@ -10343,18 +10476,18 @@ impl Resolver {
                     .then(|| current_file.to_string());
             }
             if clean_spec == "crate" {
-                let root = Self::rust_crate_src_root(current_file);
-                for candidate in [format!("{root}/lib.rs"), format!("{root}/main.rs")] {
-                    if self.file_symbols.contains_key(&candidate) {
-                        return Some(candidate);
-                    }
+                let mut roots = Vec::new();
+                self.consider_crate_root_files(&mut roots, current_file);
+                if let Some(first) = roots.into_iter().next() {
+                    return Some(first);
                 }
             }
             // The parent module *as a file*: `src/deep/leaf.rs` is `deep::leaf`,
             // so its `super` is `deep`, which lives in `src/deep/mod.rs` or
             // `src/deep.rs`.
             if clean_spec == "super" {
-                for module_dir in Self::rust_module_dirs(current_file)
+                for module_dir in self
+                    .rust_module_dirs(current_file)
                     .iter()
                     .map(|module_dir| Self::parent_dir(module_dir))
                 {
@@ -10380,14 +10513,14 @@ impl Resolver {
             // the tree root answered nothing for every workspace member. That
             // is why this repository produced no `Imports` edge at all for the
             // hundreds of `use crate::…` lines in its own kernel.
-            let root = Self::rust_crate_src_root(current_file);
+            let root = self.rust_crate_src_root(current_file);
             let mut parts: Vec<&str> = crate_tail.split("::").collect();
             self.trim_to_indexed_depth(&mut parts);
             while !parts.is_empty() {
                 let rust_path = parts.join("/");
                 let candidates = [
-                    format!("{root}/{rust_path}.rs"),
-                    format!("{root}/{rust_path}/mod.rs"),
+                    Self::rel_join(&root, &format!("{rust_path}.rs")),
+                    Self::rel_join(&root, &format!("{rust_path}/mod.rs")),
                 ];
                 for cand in &candidates {
                     if self.file_symbols.contains_key(cand) {
@@ -10435,7 +10568,8 @@ impl Resolver {
             // Both readings of "where does this module keep its children", best
             // first — see `rust_module_dirs`. Each `super::` walks one directory
             // up from whichever base is being tried.
-            let bases: Vec<String> = Self::rust_module_dirs(current_file)
+            let bases: Vec<String> = self
+                .rust_module_dirs(current_file)
                 .into_iter()
                 .map(|mut module_dir| {
                     for _ in 0..hops {
@@ -10489,8 +10623,8 @@ impl Resolver {
                 while !parts.is_empty() {
                     let module_path = parts.join("/");
                     for candidate in [
-                        format!("{root}/{module_path}.rs"),
-                        format!("{root}/{module_path}/mod.rs"),
+                        Self::rel_join(&root, &format!("{module_path}.rs")),
+                        Self::rel_join(&root, &format!("{module_path}/mod.rs")),
                     ] {
                         if self.file_symbols.contains_key(&candidate) {
                             return Some(candidate);
@@ -10498,7 +10632,10 @@ impl Resolver {
                     }
                     parts.pop();
                 }
-                for candidate in [format!("{root}/lib.rs"), format!("{root}/main.rs")] {
+                for candidate in [
+                    self.rust_library_file(&root),
+                    Self::rel_join(&root, "main.rs"),
+                ] {
                     if self.file_symbols.contains_key(&candidate) {
                         return Some(candidate);
                     }
@@ -10517,8 +10654,12 @@ impl Resolver {
             let mut candidates = crate::importpath::candidates(rule, &dir, spec);
             // A Gradle module's own source roots: `core/src/main/java/com/..`.
             // The list is the settings script's `include` statements, so a
-            // module nothing includes is not probed.
+            // module nothing includes is not probed. Ahead of all of them,
+            // the importer's own source set and its module's `main`: a
+            // product flavor sees itself and `main`, never a sibling flavor.
             if matches!(lang, "kotlin" | "java") {
+                let own = crate::importpath::source_set_candidates(rule, current_file, spec);
+                candidates.splice(0..0, own);
                 candidates.extend(crate::importpath::module_candidates(
                     rule,
                     &self.gradle_module_dirs,

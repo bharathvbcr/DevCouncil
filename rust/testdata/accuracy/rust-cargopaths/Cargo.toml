@@ -1,0 +1,5 @@
+# A virtual workspace: no [package], so it names no crate itself. Its members
+# put their targets where the manifest says, not where Cargo's defaults are.
+[workspace]
+resolver = "2"
+members = ["engine", "tools", "decoy"]

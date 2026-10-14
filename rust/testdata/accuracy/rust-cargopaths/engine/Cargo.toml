@@ -1,0 +1,8 @@
+[package]
+name = "engine-core"
+version = "0.1.0"
+edition = "2021"
+
+# The library root is neither `src/lib.rs` nor a file named `lib.rs`.
+[lib]
+path = "lib/core.rs"

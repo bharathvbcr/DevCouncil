@@ -10,6 +10,9 @@
       "java": null,
       "kotlin": 725
     },
+    "accuracy/kotlin-flavors": {
+      "kotlin": 1000
+    },
     "accuracy/kotlin-gaps": {
       "kotlin": 764
     },
@@ -30,6 +33,9 @@
     },
     "accuracy/rust": {
       "rust": 815
+    },
+    "accuracy/rust-cargopaths": {
+      "rust": 1000
     },
     "accuracy/rust-rootcrate": {
       "rust": 714
