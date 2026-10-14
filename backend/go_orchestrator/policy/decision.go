@@ -60,7 +60,7 @@ const (
 	RuleCommandEmpty          RuleID = "command.empty"
 	RuleCommandNoLease        RuleID = "command.no_lease"
 	RuleCommandNotAllowed     RuleID = "command.not_allowed"
-	RuleCommandBypassFlag     RuleID = "command.bypass_flag"
+	RuleCommandBypassFlag     RuleID = "command.bypass_flag" // --no-verify and --no-gpg-sign only
 	RuleCommandForcePush      RuleID = "command.force_push"
 	RuleCommandProtectedReset RuleID = "command.protected_reset"
 	RuleCommandProtectedPush  RuleID = "command.protected_branch_push"
@@ -143,6 +143,22 @@ const (
 	// cannot see (a script on disk, an interpreter's own argument) stays the
 	// documented boundary of every rung that reads the line.
 	RuleCommandSecretRead RuleID = "command.secret_read"
+	// RuleCommandGitReadArgument refuses a read-only git subcommand (diff, log,
+	// show, status, whatchanged) whose arguments do more than read the working
+	// tree: an argument carrying an expansion only the shell can resolve, a
+	// path outside the root or under SecretPathPatterns (`git show HEAD:.env`),
+	// an option that writes a file, reads one the repository does not hold or
+	// runs a program (--output, --no-index, -O), or an unsafe global option or
+	// GIT_* assignment. An allowlist entry like `git diff *` admits the command
+	// by its leading words, so this rung is what reads the rest.
+	//
+	// It used to be reported as command.bypass_flag, which names the
+	// verification-bypass flags; `git log -1 --format=%s "$b"` was refused as
+	// one and the user was told they had tried to skip a hook. Hard, so no
+	// lease, grant or posture but yolo negotiates it, and NOT in the unreadable
+	// class: the rung read the argument to its end and refused what it says,
+	// so a host that softens unreadable refusals must not soften this one.
+	RuleCommandGitReadArgument RuleID = "command.git_read_argument"
 
 	// RulePathEngineUnavailable and RuleCommandEngineUnavailable refuse a
 	// write, read or command because the pattern engine the gate was given
@@ -187,6 +203,7 @@ var severities = map[RuleID]Severity{
 	RuleCommandDirectoryChange:     Hard,
 	RuleSecretRead:                 Hard,
 	RuleCommandSecretRead:          Hard,
+	RuleCommandGitReadArgument:     Hard,
 	RuleCommandOperandUnverifiable: Hard,
 	RulePathEngineUnavailable:      Hard,
 	RuleCommandEngineUnavailable:   Hard,
@@ -243,6 +260,7 @@ var subjects = map[RuleID]Subject{
 	RuleCommandReparse:             SubjectCommand,
 	RuleCommandTooLong:             SubjectCommand,
 	RuleCommandDirectoryChange:     SubjectCommand,
+	RuleCommandGitReadArgument:     SubjectCommand,
 	RuleCommandOperandUnverifiable: SubjectCommand,
 
 	RuleSecretRead:        SubjectPath,

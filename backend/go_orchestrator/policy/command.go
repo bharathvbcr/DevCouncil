@@ -242,8 +242,9 @@ func (g CommandGate) evaluateSingleCommand(command string, task *dc.Task, depth 
 		// What a read-only command is told to do, which the allowlist entry
 		// that admits it never read. Hard and ahead of the allowlists for the
 		// same reason git safety is: no lease, grant or posture negotiates it.
+		// See RuleCommandGitReadArgument.
 		if reason := readOnlyArgumentViolation(normalized, g.Root); reason != "" {
-			return g.noteHardRules(deny(RuleCommandBypassFlag, reason, normalized, taskID))
+			return g.noteHardRules(deny(RuleCommandGitReadArgument, reason, normalized, taskID))
 		}
 		// What any command is told to read: an operand naming a credential
 		// file. See RuleCommandSecretRead.

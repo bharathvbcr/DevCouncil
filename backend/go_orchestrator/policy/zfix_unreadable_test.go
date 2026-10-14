@@ -109,7 +109,7 @@ func TestOnlyTheReachRulesAreUnreadable(t *testing.T) {
 			t.Errorf("%s should be unreadable", r)
 		}
 	}
-	for _, r := range []RuleID{RuleCommandForcePush, RuleCommandBypassFlag, RuleOutsideRoot,
+	for _, r := range []RuleID{RuleCommandForcePush, RuleCommandBypassFlag, RuleCommandGitReadArgument, RuleOutsideRoot,
 		RuleSecretPath, RuleCommandNotAllowed, RuleCommandTooLong, RuleCommandEngineUnavailable} {
 		if IsUnreadableRule(r) {
 			t.Errorf("%s must not be unreadable", r)

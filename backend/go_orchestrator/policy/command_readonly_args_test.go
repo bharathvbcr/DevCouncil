@@ -126,6 +126,13 @@ func TestReadOnlyGitArgumentsAreRefusedHard(t *testing.T) {
 			if d.Action != Deny || d.Severity != Hard {
 				t.Errorf("%s: %q = %s/%s (%s); want a hard refusal", name, command, d.Action, d.Severity, d.Rule)
 			}
+			// None of these is a verification-bypass flag. Some land on
+			// command.directory_change or command.substitution, which name
+			// them correctly; none may borrow bypass_flag's label.
+			if d.Rule == RuleCommandBypassFlag {
+				t.Errorf("%s: %q refused as %s; want %s or the rung that names it",
+					name, command, d.Rule, RuleCommandGitReadArgument)
+			}
 		}
 	}
 }
