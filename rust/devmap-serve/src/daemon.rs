@@ -809,6 +809,17 @@ impl Daemon {
             );
         }
 
+        // The key this name is stored under, decided before anything else, as
+        // the cold walk decides it. A pending entry is a `&str`, so the name is
+        // UTF-8, and it is inside the root (checked above); what can still be
+        // refused is a name no key spells without colliding — `src/a\b.py` on
+        // Unix — and that is answered, not retried.
+        let relative = match stored_path(root, &candidate)? {
+            StoredKey::Key(key) => key,
+            StoredKey::Refused { name, reason } => {
+                return refused_name_delta(&candidate, name, reason);
+            }
+        };
         let mut delta = PendingDelta::default();
         // What the cold walk makes of this path, at the one owner
         // (`devmap_extract::candidate_kind`). Asked before `is_dir()`, which
@@ -823,7 +834,6 @@ impl Daemon {
             // stopped writing in the generation, so the graph went on claiming
             // symbols for a file outside the repository.
             devmap_extract::CandidateKind::Refused(reason) => {
-                let relative = stored_path(root, &candidate)?;
                 warn!(
                     "changed source {relative:?} is {reason}; removing its rows, as a \
                      full build of this tree would, and charging the refusal to coverage"
@@ -844,7 +854,6 @@ impl Daemon {
             // affected with no extraction and no deletion is what the store
             // refuses as a silent drop.
             devmap_extract::CandidateKind::LinkedDirectory => {
-                let relative = stored_path(root, &candidate)?;
                 let under = format!("{relative}/");
                 for extraction in previous {
                     if extraction.file_path.starts_with(&under) {
@@ -865,7 +874,6 @@ impl Daemon {
             // CLI build of the same tree dropped the rows and called itself
             // fresh. Both now drop the rows and list the file.
             devmap_extract::CandidateKind::File { bytes } if bytes > MAX_SOURCE_BYTES => {
-                let relative = stored_path(root, &candidate)?;
                 let reason = DiscoverySkipReason::Oversized {
                     bytes,
                     limit: MAX_SOURCE_BYTES,
@@ -890,7 +898,14 @@ impl Daemon {
             if !canonical.starts_with(root) {
                 anyhow::bail!("watched directory resolves outside daemon root: {canonical:?}");
             }
-            let directory_prefix = stored_path(root, &canonical)?;
+            // The canonical spelling can differ from the queued one through a
+            // linked component, so its name is asked again, by the same rule.
+            let directory_prefix = match stored_path(root, &canonical)? {
+                StoredKey::Key(key) => key,
+                StoredKey::Refused { name, reason } => {
+                    return refused_name_delta(&canonical, name, reason);
+                }
+            };
             let prefix = if directory_prefix.is_empty() {
                 String::new()
             } else {
@@ -973,7 +988,6 @@ impl Daemon {
             return Ok(delta);
         }
 
-        let relative = stored_path(root, &candidate)?;
         delta.affected.insert(relative.clone());
         // `Path::exists()` collapses *every* stat failure into `false`, not
         // just "no such file": a symlink loop (`ELOOP`), a parent that lost
@@ -2218,7 +2232,10 @@ fn should_resweep(
 /// after `MAX_PENDING_ATTEMPTS`, a place in `degraded_reason` — which is the
 /// honest end state for a path this kernel cannot index, and the one
 /// `collect_sources_with_report` already gives it on the build path.
-fn stored_path(root: &std::path::Path, candidate: &std::path::Path) -> anyhow::Result<String> {
+///
+/// A name no key can spell without colliding is answered as
+/// [`StoredKey::Refused`], not folded: see [`repo_relative_key`].
+fn stored_path(root: &std::path::Path, candidate: &std::path::Path) -> anyhow::Result<StoredKey> {
     let relative = candidate
         .strip_prefix(root)
         .map_err(|_| anyhow::anyhow!("path {:?} is outside daemon root {:?}", candidate, root))?;
@@ -2230,7 +2247,97 @@ fn stored_path(root: &std::path::Path, candidate: &std::path::Path) -> anyhow::R
             root
         )
     })?;
-    Ok(relative.replace('\\', "/"))
+    Ok(match repo_relative_key(relative) {
+        Ok(key) => StoredKey::Key(key),
+        Err(reason) => StoredKey::Refused {
+            name: relative.to_string(),
+            reason,
+        },
+    })
+}
+
+/// What [`stored_path`] makes of a name.
+#[derive(Debug, PartialEq, Eq)]
+enum StoredKey {
+    /// The repo-relative key the name is stored under.
+    Key(String),
+    /// A name discovery refuses, spelled as it is on disk, with the reason.
+    /// A settled fact about the name, not a failed attempt: no retry renames
+    /// the file.
+    Refused { name: String, reason: &'static str },
+}
+
+const BACKSLASH_NAME_REFUSAL: &str =
+    "a backslash in a file name is a path separator on Windows, so this name cannot be \
+     stored without colliding with a real path; refused";
+
+/// The key a repo-relative name is stored under: `/`-separated, spelled the
+/// same on every host.
+///
+/// On Windows `\` is the separator and is folded to `/`. Everywhere else it is
+/// an ordinary byte of a name, and folding it made `src/a\b.py` the key of the
+/// real `src/a/b.py`: the drain extracted the impostor's bytes over the real
+/// file's rows. Discovery refuses the name (D-5,
+/// `devmap_extract::repo_relative_key`, introduced on a sibling stack); this
+/// is the same rule, with the same wording, for the drain. When the stacks
+/// join it is to become a delegation to that owner, not a second copy.
+fn repo_relative_key(relative: &str) -> Result<String, &'static str> {
+    if cfg!(windows) {
+        return Ok(relative.replace('\\', "/"));
+    }
+    if relative.contains('\\') {
+        return Err(BACKSLASH_NAME_REFUSAL);
+    }
+    Ok(relative.to_string())
+}
+
+/// The delta for a changed name discovery refuses, as a cold build of the tree
+/// would account for it.
+///
+/// The build path checks the name before anything else and lists the refusal
+/// only where a source file was lost — any other name is passed over as a
+/// non-source. Under a refused directory name every path carries the
+/// backslash, so each source under it is listed by its own name. No stored row
+/// is touched: none can be keyed by a refused name, and the row a fold would
+/// have hit belongs to the real path.
+fn refused_name_delta(
+    candidate: &std::path::Path,
+    name: String,
+    reason: &'static str,
+) -> anyhow::Result<PendingDelta> {
+    let mut delta = PendingDelta::default();
+    let metadata = match std::fs::symlink_metadata(candidate) {
+        Ok(metadata) => metadata,
+        // Gone: the build path lists nothing for a name that is not there.
+        Err(error) if path_is_absent(&error) => return Ok(delta),
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context(format!(
+                "cannot determine whether refused name {name:?} still exists"
+            )))
+        }
+    };
+    if metadata.is_dir() {
+        let (sources, discovery) = collect_sources_with_report(candidate)?;
+        let under = sources
+            .iter()
+            .map(|(path, _)| path)
+            .chain(discovery.skipped_paths.iter().map(|(path, _)| path))
+            .filter(|path| is_indexable_source(path));
+        for path in under {
+            delta
+                .refused
+                .insert(format!("{name}/{path}"), reason.to_string());
+        }
+    } else if is_indexable_source(&name) {
+        delta.refused.insert(name, reason.to_string());
+    }
+    for path in delta.refused.keys() {
+        warn!(
+            "changed source {path:?} is refused: {reason}; it is absent from the graph — \
+             this is a refusal, not a clean tree"
+        );
+    }
+    Ok(delta)
 }
 
 #[cfg(test)]
@@ -2900,6 +3007,98 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// On Unix `\` is an ordinary byte of a file name. `stored_path` folded it
+    /// to `/`, so a change to `src/a\b.py` was extracted under the key of the
+    /// real `src/a/b.py` and overwrote that file's rows; a directory named
+    /// `pkg\sub` put its files under `pkg/sub/`. Discovery refuses such a name
+    /// (D-5), so the drain refuses it too — counted in `refused` under the
+    /// name as spelled, the way the build path lists it — and leaves the real
+    /// path's rows alone. A refusal is a settled fact about the name, so it is
+    /// an answer, not an error the queue would retry and quarantine.
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_name_on_unix_is_refused_not_folded_onto_a_real_path() {
+        let (root, daemon) = daemon_with_one_indexed_source("backslash-drain");
+        fs::create_dir_all(root.join("src/a")).unwrap();
+        fs::write(root.join("src/a/b.py"), "def real():\n    return 1\n").unwrap();
+        fs::write(root.join("src/a\\b.py"), "def impostor():\n    return 2\n").unwrap();
+        fs::create_dir_all(root.join("pkg\\sub")).unwrap();
+        fs::write(root.join("pkg\\sub/m.py"), "def m():\n    return 3\n").unwrap();
+        let previous = vec![
+            extract_file("src/a/b.py", "def real():\n    return 1\n"),
+            extract_file("pkg/sub/m.py", "def kept():\n    return 4\n"),
+        ];
+
+        for (pending, refused_as) in [
+            ("src/a\\b.py".to_string(), "src/a\\b.py"),
+            (
+                root.join("src/a\\b.py").to_string_lossy().into_owned(),
+                "src/a\\b.py",
+            ),
+            // A directory: each source under it is refused by its own name,
+            // as the walk from the root lists it.
+            ("pkg\\sub".to_string(), "pkg\\sub/m.py"),
+        ] {
+            let delta = daemon
+                .collect_pending_path(&root, &previous, &pending)
+                .unwrap_or_else(|error| {
+                    panic!("{pending:?}: a refused name is an answer, not a retry: {error}")
+                });
+            assert!(
+                delta.affected.is_empty() && delta.deleted.is_empty(),
+                "{pending:?} must not touch any stored row: affected {:?}, deleted {:?}",
+                delta.affected,
+                delta.deleted
+            );
+            assert!(
+                delta.fresh.is_empty(),
+                "{pending:?} must not be extracted under any key: {:?}",
+                delta
+                    .fresh
+                    .iter()
+                    .map(|extraction| &extraction.file_path)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                delta.refused.keys().collect::<Vec<_>>(),
+                vec![refused_as],
+                "{pending:?} is counted as a refusal under its own spelling"
+            );
+            assert!(
+                delta.refused[refused_as].contains("backslash"),
+                "and the refusal says why: {:?}",
+                delta.refused
+            );
+        }
+
+        // A non-source name is passed over, as the walk passes it over: a hole
+        // is charged only where a source file was lost.
+        fs::write(root.join("notes\\todo.txt"), "later\n").unwrap();
+        let delta = daemon
+            .collect_pending_path(&root, &previous, "notes\\todo.txt")
+            .expect("a refused non-source name is an answer");
+        assert!(
+            delta.affected.is_empty() && delta.fresh.is_empty() && delta.refused.is_empty(),
+            "a non-source name is neither indexed nor charged: {:?}",
+            delta.refused
+        );
+
+        // Positive control: the real path still drains under its own key.
+        let delta = daemon
+            .collect_pending_path(&root, &previous, "src/a/b.py")
+            .expect("the real path is answerable");
+        assert_eq!(
+            delta
+                .fresh
+                .iter()
+                .map(|extraction| extraction.file_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/a/b.py"]
+        );
+        assert!(delta.refused.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// A symlinked directory that never had rows commits beside a real edit,
     /// and drops nothing that is not its own.
     #[cfg(unix)]
@@ -3346,7 +3545,7 @@ mod tests {
         // forward slashes.
         assert_eq!(
             stored_path(root, &root.join("src/cafe.py")).unwrap(),
-            "src/cafe.py"
+            StoredKey::Key("src/cafe.py".to_string())
         );
     }
 
