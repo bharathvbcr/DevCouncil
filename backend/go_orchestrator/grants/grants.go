@@ -308,6 +308,16 @@ func (l *Ledger) issueLocked(req Request) (Grant, func(Change), error) {
 		return Grant{}, nil, fmt.Errorf("%w: unknown authority %q", ErrScope, req.Grantor.Authority)
 	}
 
+	// A ceiling of zero or less admits no lifetime. Without this check a
+	// zero-TTL request took the ceiling, passed `ttl > ceiling`, and was
+	// appended and returned with a nil error — a grant already expired, reported
+	// as issued. The flag registry refuses such a ceiling at load; a Policy built
+	// any other way meets the same refusal here, where the grant would be minted.
+	if ceiling <= 0 {
+		return Grant{}, nil, fmt.Errorf("%w: the %s ceiling is %s, which admits no lifetime; set a positive max_ttl",
+			ErrTTL, req.Grantor.Authority, ceiling)
+	}
+
 	ttl := req.TTL
 	if ttl < 0 {
 		// Rounding a negative lifetime up to the ceiling is the wrong direction:

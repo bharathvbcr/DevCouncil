@@ -1,6 +1,7 @@
 package grants
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -101,6 +102,75 @@ func TestRestoreEnforcesTheCeilingEvenWhenItIsZero(t *testing.T) {
 				t.Errorf("refusal should name the ceiling: %q", refused[0])
 			}
 		})
+	}
+}
+
+// Issue is the other half of the same ceiling. A request with no lifetime takes
+// the ceiling, and a non-positive ceiling then passes `ttl > ceiling`, so Issue
+// used to append and return a grant whose ExpiresAt was already behind it, with
+// a nil error: the caller was told a grant exists, the ledger carried a dead
+// record, and nothing named the misconfiguration. A ceiling that admits no
+// lifetime is refused with ErrTTL, and no grant is recorded.
+func TestIssueRefusesANonPositiveCeiling(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		authority Authority
+		ceiling   time.Duration
+		ttl       time.Duration
+	}{
+		{"agent, zero ceiling, default lifetime", Agent, 0, 0},
+		{"agent, negative ceiling, default lifetime", Agent, -15 * time.Minute, 0},
+		{"human, zero ceiling, default lifetime", Human, 0, 0},
+		{"human, negative ceiling, default lifetime", Human, -time.Hour, 0},
+		{"agent, negative ceiling, explicit lifetime", Agent, -15 * time.Minute, time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := DefaultPolicy()
+			if tc.authority == Agent {
+				p.AgentMaxTTL = tc.ceiling
+			} else {
+				p.HumanMaxTTL = tc.ceiling
+			}
+			l := restoreLedger(t, p)
+			req := Request{
+				Grantor:   Grantor{Authority: tc.authority, ID: "issuer"},
+				Reason:    "needed for the fix",
+				Scope:     Scope{TaskID: "TASK-001", Rules: []policy.RuleID{policy.RuleUnplannedScope}},
+				TTL:       tc.ttl,
+				AgentTask: "TASK-001",
+			}
+			g, err := l.Issue(req)
+			if !errors.Is(err, ErrTTL) {
+				t.Fatalf("Issue under a %s ceiling = (%+v, %v), want ErrTTL", tc.ceiling, g, err)
+			}
+			if !strings.Contains(err.Error(), "ceiling") {
+				t.Errorf("refusal should name the ceiling: %q", err)
+			}
+			if g.ID != "" {
+				t.Errorf("a refused Issue returned a grant: %+v", g)
+			}
+			if all := l.All(); len(all) != 0 {
+				t.Errorf("a refused Issue recorded %d grant(s): %+v", len(all), all)
+			}
+		})
+	}
+
+	// The smallest positive ceiling still issues, so this is a bound on the
+	// configuration, not a refusal of short grants.
+	p := DefaultPolicy()
+	p.AgentMaxTTL = time.Second
+	l := restoreLedger(t, p)
+	g, err := l.Issue(Request{
+		Grantor:   Grantor{Authority: Agent, ID: "executor"},
+		Reason:    "needed for the fix",
+		Scope:     Scope{TaskID: "TASK-001", Rules: []policy.RuleID{policy.RuleUnplannedScope}},
+		AgentTask: "TASK-001",
+	})
+	if err != nil {
+		t.Fatalf("a one-second ceiling must still issue: %v", err)
+	}
+	if !g.ExpiresAt.After(g.IssuedAt) {
+		t.Fatalf("issued grant expires at %s, not after %s", g.ExpiresAt, g.IssuedAt)
 	}
 }
 

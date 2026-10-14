@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Flag keys the harness defines. Referencing a flag by constant rather than by
@@ -277,12 +278,15 @@ func DefineHarnessFlags(r *Registry) error {
 			Description: "Allow agents to grant their own overrides for agent-grantable rules within their lease scope.",
 		},
 		{
-			Key: GrantsAgentMaxTTL, Kind: KindDuration, Default: "15m",
+			// Floored because a ceiling of zero or less admits no grant: Issue
+			// would mint one already expired. Turning agent grants off is
+			// grants.agent.enabled, not a zero lifetime.
+			Key: GrantsAgentMaxTTL, Kind: KindDuration, Default: "15m", MinDuration: time.Second,
 			Mutable: HumanOnly, Safety: true,
 			Description: "Ceiling on the lifetime of an agent-issued grant.",
 		},
 		{
-			Key: GrantsHumanMaxTTL, Kind: KindDuration, Default: "8h",
+			Key: GrantsHumanMaxTTL, Kind: KindDuration, Default: "8h", MinDuration: time.Second,
 			Mutable:     HumanOnly,
 			Description: "Ceiling on the lifetime of a human-issued grant.",
 		},
