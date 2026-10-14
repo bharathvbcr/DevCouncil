@@ -71,6 +71,35 @@
 //! any page-cache warm-up — and should not be read as results in either
 //! direction.
 //!
+//! ### Cancel checks on the whole-generation reads (ft-9ac4f289)
+//!
+//! Method: the `graph_core_for_store` and `route_map (client scan)` rows were
+//! committed first, on the unmodified engine, and that tree built as the
+//! "before" binary; "after" adds the cancel checks to `scan_sites`, to
+//! `graph_core_for_store` (before each read, per decoded extraction row, every
+//! `Cancel::CHECK_INTERVAL` converted edges) and to the `ask`, `clones` and
+//! `dead_symbols` reads. Both ran interleaved — before, after — for ten rounds
+//! on corpus A, and the **minimum** of the per-round warm p50 is reported. The
+//! machine was shared with other build sessions during the run: single rounds
+//! swung by up to 4x, which is why the minimum and not the median is the
+//! number, and why the controls matter.
+//!
+//! ```text
+//! corpus A, min of 10 rounds (warm p50)    before    after
+//! graph_core_for_store                      2.09 s    2.16 s   +3%
+//! route_map (client scan, 4,000 files)      1.16 s    1.22 s   +5%
+//! read latest_extractions (cold, 1 sample)  416 ms    429 ms   +3%
+//! search            (control, untouched)    56.4 ms   55.0 ms  -2%
+//! dead_symbols      (one check added)      100.6 ms   93.6 ms  -7%
+//! ```
+//!
+//! No speedup and no regression is claimed: every moved row sits inside the
+//! spread the controls show on this run. The change is not a performance
+//! change; it makes these reads stop when their caller has gone, and the
+//! tests in `engine/tests/corpus_read_cancellation_tests.rs` and
+//! `api_routes::tests::a_cancelled_scan_stops_between_files_and_says_so` are
+//! what show that.
+//!
 //! What did NOT get fixed, and why, is in `examples/query_phase_ab.rs`: the
 //! per-call adjacency index inside `traverse_graph` is ~100% of a walk's cost
 //! and lives in `devmap-analyze`; `dead_symbols` reads all 160,000 dead rows
