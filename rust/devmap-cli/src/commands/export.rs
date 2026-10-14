@@ -53,6 +53,10 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
                 // difference between the graph and its export.
                 "edges_dangling": report.edges_dangling,
                 "characters_replaced": report.characters_replaced,
+                // Repaired ids can coincide; GraphML cannot declare one id
+                // twice, so those nodes are written as `<id>~<n>`.
+                "id_collisions": report.id_collisions,
+                "duplicate_nodes": report.duplicate_nodes,
                 "bytes": xml.len(),
             }),
         )?;
@@ -71,6 +75,19 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
                 "  {} character(s) replaced with U+FFFD: XML 1.0 cannot \
 represent them",
                 report.characters_replaced
+            );
+        }
+        if report.id_collisions > 0 {
+            outln!(
+                "  {} node id(s) renamed to <id>~<n>: after replacement they \
+matched another node's id",
+                report.id_collisions
+            );
+        }
+        if report.duplicate_nodes > 0 {
+            outln!(
+                "  {} node(s) omitted: the same id was declared earlier",
+                report.duplicate_nodes
             );
         }
     }

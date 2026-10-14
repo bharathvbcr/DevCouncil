@@ -17,9 +17,13 @@
 //!
 //! ```text
 //! # comment lines and blank lines are ignored
-//! mode=json<TAB>uv<TAB>run<TAB>dev<TAB>cost<TAB>budget<TAB>--json
-//! mode=jsonl<TAB>uv<TAB>run<TAB>dev<TAB>trace<TAB>tail<TAB>--since<TAB>0
+//! mode=json<TAB>devcouncil<TAB>gate<TAB>status<TAB>--json
+//! mode=json<TAB>devcouncil<TAB>install<TAB>--list<TAB>--json
 //! ```
+//!
+//! Every field after the mode is one argument, verbatim: an empty field is an
+//! empty argument, never skipped, and an empty program field is refused with
+//! its line number.
 //!
 //! Output is one JSON object on stdout — this binary holds itself to the
 //! contract it audits — and exit 0 when every invocation passed, 1 when any
@@ -168,14 +172,22 @@ fn parse_manifest(text: &str) -> Result<Vec<Invocation>, String> {
             }
             None => unreachable!("split always yields at least one field"),
         };
-        let argv: Vec<String> = fields
-            .filter(|field| !field.is_empty())
-            .map(str::to_string)
-            .collect();
-        if argv.is_empty() {
-            return Err(format!(
-                "line {line_number}: no command after the mode field"
-            ));
+        // Every field is one argument, an empty one included: `--message`
+        // followed by an empty field is `--message ""`. Dropping it would
+        // shift every later argument one place left.
+        let argv: Vec<String> = fields.map(str::to_string).collect();
+        match argv.first() {
+            None => {
+                return Err(format!(
+                    "line {line_number}: no command after the mode field"
+                ));
+            }
+            Some(program) if program.is_empty() => {
+                return Err(format!(
+                    "line {line_number}: the program field after the mode is empty"
+                ));
+            }
+            Some(_) => {}
         }
         invocations.push(Invocation {
             line_number,
@@ -386,6 +398,26 @@ mod tests {
         assert!(parse_manifest("echo\t{}\n").is_err());
         assert!(parse_manifest("mode=yaml\techo\t{}\n").is_err());
         assert!(parse_manifest("mode=json\n").is_err());
+    }
+
+    /// An empty field is an empty argument (`--message ""`), not a missing
+    /// one. Dropping it shifted every argument after it one place left, so
+    /// the command run was not the command written.
+    #[test]
+    fn manifest_passes_an_empty_field_through_as_an_empty_argument() {
+        let parsed = parse_manifest("mode=json\tcmd\t--message\t\t--json\n").unwrap();
+        assert_eq!(parsed[0].argv, vec!["cmd", "--message", "", "--json"]);
+        let trailing = parse_manifest("mode=json\tcmd\t--message\t\n").unwrap();
+        assert_eq!(trailing[0].argv, vec!["cmd", "--message", ""]);
+    }
+
+    /// A program name cannot be empty; the line says where it was.
+    #[test]
+    fn manifest_refuses_an_empty_program_with_its_line_number() {
+        let err = parse_manifest("mode=json\techo\t{}\nmode=json\t\techo\n").unwrap_err();
+        assert!(err.starts_with("line 2:"), "got {err:?}");
+        let err = parse_manifest("mode=json\t\n").unwrap_err();
+        assert!(err.starts_with("line 1:"), "got {err:?}");
     }
 
     #[test]
