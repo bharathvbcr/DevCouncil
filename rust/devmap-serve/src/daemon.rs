@@ -271,6 +271,60 @@ struct DrainHead {
     moved: bool,
 }
 
+/// Which rows one drain hands the store, and which paths it names as changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DrainWriteScope {
+    /// HEAD unmoved over current payloads: only the batch's own re-reads are
+    /// written, under the batch's affected and deleted paths.
+    Batch,
+    /// HEAD moved over current payloads and the scan found a difference: the
+    /// whole re-read tree is written, naming only the paths whose hashes moved
+    /// so the store's per-file digest scope stays on.
+    Scanned {
+        affected: std::collections::BTreeSet<String>,
+        deleted: std::collections::BTreeSet<String>,
+    },
+    /// Stored payloads predate this kernel: nothing stored may be reused.
+    Full,
+}
+
+/// The paths a whole-tree scan says changed against the previous generation.
+///
+/// `affected` is every extracted path that is new or whose content hash moved;
+/// `deleted` is every previously stored path the scan produced no extraction
+/// for — removed, refused, or over the limit now. Deleted must be named: the
+/// store carries any prior file that is neither affected nor deleted, so a
+/// path left out of both would survive from the checkout HEAD moved away
+/// from.
+///
+/// When both come back empty the hashes agree and only the discovery
+/// inventory differed. That is [`DrainWriteScope::Full`], not an empty
+/// `Scanned`: the store reads an empty affected set as the full-rewrite
+/// signal, and saying so here keeps the two from meaning different things.
+fn scanned_write_scope(
+    previous: &std::collections::BTreeMap<String, u64>,
+    scanned: &[devmap_extract::Extraction],
+) -> DrainWriteScope {
+    let mut affected = std::collections::BTreeSet::new();
+    let mut present = std::collections::HashSet::with_capacity(scanned.len());
+    for extraction in scanned {
+        present.insert(extraction.file_path.as_str());
+        if previous.get(&extraction.file_path) != Some(&extraction.content_hash) {
+            affected.insert(extraction.file_path.clone());
+        }
+    }
+    let deleted: std::collections::BTreeSet<String> = previous
+        .keys()
+        .filter(|path| !present.contains(path.as_str()))
+        .cloned()
+        .collect();
+    if affected.is_empty() && deleted.is_empty() {
+        DrainWriteScope::Full
+    } else {
+        DrainWriteScope::Scanned { affected, deleted }
+    }
+}
+
 /// One batch of watcher/discovery work, before it is persisted.
 #[derive(Debug, Default)]
 struct PendingDelta {
@@ -1190,7 +1244,7 @@ impl Daemon {
         // re-extraction, and a refusal this batch met vanished into a larger
         // carried number instead of raising it. A count cannot be maintained,
         // only replaced; a set of paths can.
-        let (mut extractions, full_rebuild, inventory) = if payload_is_current && !head_moved {
+        let (mut extractions, write_scope, inventory) = if payload_is_current && !head_moved {
             let mut carried: Vec<_> = previous
                 .into_iter()
                 .filter(|extraction| !affected.contains(&extraction.file_path))
@@ -1231,14 +1285,16 @@ impl Daemon {
             let row = |(path, reason)| devmap_store::DiscoveryRefusal { path, reason };
             (
                 carried,
-                false,
+                DrainWriteScope::Batch,
                 devmap_store::DiscoveryInventory {
                     refusals: inventory.into_iter().map(row).collect(),
                     over_limit: carried_over_limit.into_iter().map(row).collect(),
                 },
             )
         } else {
-            let scanned = if payload_is_current && head_moved {
+            // `Some(hashes)` when the stored rows are reusable and only HEAD
+            // moved: the hashes the scan is diffed against below.
+            let (scanned, previous_hashes) = if payload_is_current && head_moved {
                 let scanned = devmap_extract::scan_tree(&self.root)?;
                 let hashes = self.store.latest_file_hashes()?;
                 let stored = self.store.latest_discovery_inventory()?;
@@ -1250,12 +1306,13 @@ impl Daemon {
                     return Ok(succeeded.len());
                 }
                 warn!(
-                    "git HEAD moved since the last generation; re-extracting {:?} in full",
+                    "git HEAD moved since the last generation; re-reading {:?} and writing \
+                     the files whose hashes changed",
                     self.root
                 );
-                scanned
+                (scanned, Some(hashes))
             } else {
-                devmap_extract::scan_tree(&self.root)?
+                (devmap_extract::scan_tree(&self.root)?, None)
             };
             // The branch that actually walks the tree is the one that can
             // measure it. This report was discarded as `_report`, which is what
@@ -1264,12 +1321,24 @@ impl Daemon {
             let whole_tree =
                 devmap_store::extract_scanned_for_generation(&self.store, &scanned, None)?;
             let report = scanned.report;
+            // A moved HEAD over current payloads is a scan, never a
+            // carry-forward (B5) — and the scan has just measured exactly which
+            // files differ. Handing the store an empty affected set here threw
+            // that away: empty is its full-rewrite signal, which turns off the
+            // per-file digest scope and reads every live edge and ledger row in
+            // the repository back to change one file. A stale payload identity
+            // is the one case that must stay a full write, because nothing
+            // stored may be reused at all.
+            let write_scope = match previous_hashes {
+                Some(hashes) => scanned_write_scope(&hashes, &whole_tree),
+                None => DrainWriteScope::Full,
+            };
             // A full walk replaces the inventory outright rather than merging
             // into it: it re-decided every path in the tree, so a carried row
             // could only describe a path this walk has just answered for.
             (
                 whole_tree,
-                true,
+                write_scope,
                 devmap_store::DiscoveryInventory::of(&report, &manifests),
             )
         };
@@ -1311,25 +1380,38 @@ impl Daemon {
         // the next drain still sees a difference and rebuilds. See
         // `head_for_drain`.
         let head_sha = head.sha;
+        // What the store is handed, per scope. A batch carries its unaffected
+        // rows from the previous generation, so it hands over only what it
+        // re-read. A scan re-read the whole tree, so it hands over all of it
+        // and names the changed subset; the store carries every other file
+        // after checking its content hash and payload identity itself. A full
+        // rebuild declares nothing affected: an empty affected set *is* the
+        // full-rewrite signal, and every row it needs is in the extractions.
+        let (write_input, affected_paths, deleted_paths): (&[devmap_extract::Extraction], _, _) =
+            match write_scope {
+                DrainWriteScope::Batch => (
+                    &fresh,
+                    affected.into_iter().collect(),
+                    deleted.into_iter().collect(),
+                ),
+                DrainWriteScope::Scanned {
+                    affected: scanned_affected,
+                    deleted: scanned_deleted,
+                } => (
+                    &extractions,
+                    scanned_affected.into_iter().collect(),
+                    scanned_deleted.into_iter().collect(),
+                ),
+                DrainWriteScope::Full => (&extractions, Vec::new(), Vec::new()),
+            };
         // Writer ownership has been held since before the base snapshot was read.
         self.store.save_generation_with_metadata(
-            if full_rebuild { &extractions } else { &fresh },
+            write_input,
             &resolution,
             &analysis,
             GenerationWriteOpts {
-                // A full rebuild declares nothing affected: an empty affected
-                // set *is* the full-rewrite signal, and every row it needs is
-                // in the extractions above.
-                affected_paths: if full_rebuild {
-                    Vec::new()
-                } else {
-                    affected.into_iter().collect()
-                },
-                deleted_paths: if full_rebuild {
-                    Vec::new()
-                } else {
-                    deleted.into_iter().collect()
-                },
+                affected_paths,
+                deleted_paths,
                 repo_root: Some(root.to_string_lossy().into_owned()),
                 build_started: Some(resync_started),
                 // Always `Some` on this path: both branches above produced a
@@ -1339,8 +1421,9 @@ impl Daemon {
                 over_limit: Some(inventory.over_limit),
                 // The daemon is the most frequent writer there is, and the
                 // scoping exists for exactly its shape: an edit batch that
-                // changes a handful of files. A full rebuild takes the
-                // unscoped path anyway, off the empty affected set above.
+                // changes a handful of files — or a moved HEAD whose scan found
+                // a handful changed. A full rebuild takes the unscoped path
+                // anyway, off the empty affected set above.
                 verify_every_row: false,
             },
             &head_sha,
@@ -2069,6 +2152,50 @@ mod tests {
             raced.is_ok(),
             "`run_loop` neither brought its endpoint up nor returned within 60s: \
              it is hung, not slow"
+        );
+    }
+
+    /// The scan's hash delta, in all three shapes: changed and added paths are
+    /// affected, paths the scan no longer produced are deleted, and a delta
+    /// with neither is the full-rewrite signal said out loud rather than an
+    /// empty `Scanned` the store would read the same way by accident.
+    #[test]
+    fn a_scan_names_exactly_the_paths_whose_hashes_moved() {
+        let extraction = extract_file;
+        let kept = extraction("kept.py", "def kept(): pass\n");
+        let changed = extraction("changed.py", "def changed(): return 2\n");
+        let added = extraction("added.py", "def added(): pass\n");
+        let previous: std::collections::BTreeMap<String, u64> = [
+            ("kept.py".to_string(), kept.content_hash),
+            (
+                "changed.py".to_string(),
+                changed.content_hash.wrapping_add(1),
+            ),
+            ("gone.py".to_string(), 7),
+        ]
+        .into_iter()
+        .collect();
+
+        let scope = scanned_write_scope(&previous, &[kept.clone(), changed.clone(), added]);
+        assert_eq!(
+            scope,
+            DrainWriteScope::Scanned {
+                affected: ["added.py", "changed.py"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                deleted: ["gone.py"].into_iter().map(String::from).collect(),
+            }
+        );
+
+        let identical: std::collections::BTreeMap<String, u64> =
+            [("kept.py".to_string(), kept.content_hash)]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            scanned_write_scope(&identical, &[kept]),
+            DrainWriteScope::Full,
+            "no hash moved and no path left: the store's empty-set signal, named"
         );
     }
 

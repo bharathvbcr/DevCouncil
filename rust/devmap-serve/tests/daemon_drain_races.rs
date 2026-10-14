@@ -174,6 +174,173 @@ fn a_generation_written_after_head_moved_re_reads_the_tree() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A repository whose one commit holds `files`, and a store holding one
+/// generation built from it by the daemon itself.
+fn repo_with_files(name: &str, files: &[(&str, &str)]) -> (PathBuf, Daemon, Store) {
+    let root = scratch(name);
+    git(&root, &["init", "-q"]);
+    git(&root, &["config", "user.email", "devmap@example.invalid"]);
+    git(&root, &["config", "user.name", "devmap test"]);
+    for (path, source) in files {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, source).unwrap();
+    }
+    git(&root, &["add", "-A"]);
+    git(&root, &["commit", "-q", "-m", "one"]);
+    let db_path = root.join("index.sqlite");
+    let daemon = Daemon::new(Store::open(&db_path).unwrap(), root.clone());
+    let reader = Store::open(&db_path).unwrap();
+    assert_eq!(daemon.reconcile_connect_time().unwrap(), files.len());
+    assert_eq!(daemon.drain_pending_batch().unwrap(), files.len());
+    (root, daemon, reader)
+}
+
+/// The live edge rows whose source is `path`, as `(edge_id, target_symbol,
+/// valid_from)`.
+fn live_edges_from(db: &Path, path: &str) -> Vec<(i64, String, i64)> {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.edge_id, e.target_symbol, e.valid_from
+               FROM edge_rows e JOIN paths p ON p.id = e.source_file_id
+              WHERE p.path = ?1 AND e.valid_to IS NULL
+              ORDER BY e.edge_id",
+        )
+        .unwrap();
+    stmt.query_map([path], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+/// A moved HEAD with a real file change must write only the files the scan
+/// found changed, not the whole tree.
+///
+/// The drain scans the tree after HEAD moves — a checkout the watcher missed
+/// must never be carried forward unread — and that scan already knows which
+/// hashes differ. Handing the store an *empty* affected set threw that away:
+/// empty is the store's full-rewrite signal, which turns off the per-file
+/// digest scope, so every live edge row in the repository was read back and
+/// compared to change one file.
+///
+/// The observable: an unchanged file's live edge row is overwritten in place,
+/// row count preserved. A scoped write never reads that file's rows back (its
+/// digest and its live row count both match), so the row stays open under its
+/// original id. A full rewrite reads every row, finds this one in no fresh
+/// resolution, and closes it — which is the work this test proves is not done.
+#[test]
+fn a_head_move_with_a_changed_file_writes_only_that_file() {
+    let (root, daemon, reader) = repo_with_files(
+        "head-moved-scoped",
+        &[
+            ("src/a.py", "def a():\n    return 1\n"),
+            (
+                "src/c.py",
+                "def c():\n    return d()\n\ndef d():\n    return 2\n",
+            ),
+        ],
+    );
+    let db_path = root.join("index.sqlite");
+    let first_head = head_of(&root);
+    let first_generation = reader.latest_generation_id().unwrap().unwrap();
+
+    let before = live_edges_from(&db_path, "src/c.py");
+    assert!(
+        !before.is_empty(),
+        "the fixture must give the unchanged file at least one edge row"
+    );
+    let (planted_id, _, planted_from) = before[0].clone();
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE edge_rows SET target_symbol = 'planted-not-reread' WHERE edge_id = ?1",
+            [planted_id],
+        )
+        .unwrap();
+    }
+
+    std::fs::write(root.join("src/a.py"), "def a():\n    return 99\n").unwrap();
+    git(&root, &["commit", "-q", "-am", "two"]);
+    let second_head = head_of(&root);
+    assert_ne!(first_head, second_head, "the fixture must move HEAD");
+    reader
+        .enqueue_pending_paths(&[devmap_serve::watcher::GIT_HEAD_SENTINEL.to_string()])
+        .unwrap();
+    assert_eq!(daemon.drain_pending_batch().unwrap(), 1);
+
+    let second_generation = reader.latest_generation_id().unwrap().unwrap();
+    assert!(
+        second_generation > first_generation,
+        "a changed file after a HEAD move must write a new generation"
+    );
+    assert_eq!(
+        reader.latest_generation_head_sha().unwrap().as_deref(),
+        Some(second_head.as_str())
+    );
+    let a_hash = reader.latest_file_hashes().unwrap()["src/a.py"];
+    let on_disk = devmap_extract::scan_tree(&root)
+        .unwrap()
+        .file_hashes()
+        .into_iter()
+        .find(|(path, _)| *path == "src/a.py")
+        .map(|(_, hash)| hash)
+        .unwrap();
+    assert_eq!(a_hash, on_disk, "the changed file must be re-extracted");
+
+    let after = live_edges_from(&db_path, "src/c.py");
+    assert!(
+        after.iter().any(|(id, target, from)| *id == planted_id
+            && target == "planted-not-reread"
+            && *from == planted_from),
+        "the unchanged file's edge rows must not be read back or rewritten after a \
+         HEAD move that changed another file; found {after:?}"
+    );
+    assert!(
+        after
+            .iter()
+            .all(|(_, _, from)| i64::from(second_generation) != *from),
+        "no edge row of the unchanged file may be written by the new generation; \
+         found {after:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A checkout the watcher missed that *removes* a file must take it out of the
+/// generation. With the write scoped to what the scan found changed, a file
+/// absent from both the extractions and the deleted set would be carried
+/// forward from the previous generation — the mixed tree B5 forbids.
+#[test]
+fn a_head_move_that_removes_a_file_drops_it_from_the_generation() {
+    let (root, daemon, reader) = repo_with_files(
+        "head-moved-removed",
+        &[
+            ("src/a.py", "def a():\n    return 1\n"),
+            ("src/gone.py", "def gone():\n    return a()\n"),
+        ],
+    );
+    std::fs::remove_file(root.join("src/gone.py")).unwrap();
+    git(&root, &["commit", "-q", "-am", "two"]);
+    reader
+        .enqueue_pending_paths(&[devmap_serve::watcher::GIT_HEAD_SENTINEL.to_string()])
+        .unwrap();
+    assert_eq!(daemon.drain_pending_batch().unwrap(), 1);
+    assert_eq!(
+        generation_paths(&reader),
+        vec!["src/a.py".to_string()],
+        "a file the moved HEAD removed must not be carried forward"
+    );
+    assert!(
+        live_edges_from(&root.join("index.sqlite"), "src/gone.py").is_empty(),
+        "and none of its edge rows may stay live"
+    );
+    assert_eq!(
+        reader.latest_generation_head_sha().unwrap().as_deref(),
+        Some(head_of(&root).as_str())
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A store that has been corrupted underneath the daemon must refuse, never
 /// answer "empty and up to date".
 ///
