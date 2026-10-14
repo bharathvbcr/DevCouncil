@@ -177,6 +177,14 @@ pub fn validate_repo_path(raw: &str) -> Result<PathBuf, String> {
             raw.len()
         ));
     }
+    // Before the shape and existence checks, so a placeholder is refused by
+    // name and never opens a directory that happens to be spelled that way.
+    if let Some(variable) = unexpanded_variable(raw) {
+        return Err(format!(
+            "repo_path {raw:?} contains the unexpanded variable {variable}; the host passed a \
+placeholder instead of a path — pass the absolute repository path"
+        ));
+    }
     if let Some(refusal) = foreign_path_refusal(raw) {
         return Err(refusal.into());
     }
@@ -197,6 +205,55 @@ pub fn validate_repo_path(raw: &str) -> Result<PathBuf, String> {
             path.display()
         )
     })
+}
+
+/// The first unexpanded variable reference in `raw`, if it holds one.
+///
+/// A reference is `$NAME`, `${NAME}` or `%NAME%`, where NAME is a letter or
+/// `_` followed by letters, digits or `_` — the spellings a host leaves behind
+/// when it forgot to expand a placeholder (`${CLAUDE_PROJECT_DIR}` is the
+/// measured case). Any other `$` or `%` is part of a directory name and is not
+/// a reference: `\\host\c$\repo`, `/srv/team$/repo`, `/tmp/50%/b`. Refusing
+/// every `$` turned those real roots away.
+///
+/// The same rule the Go host applies to project roots in `checkProjectRoot`
+/// (cmd/devcouncil/main.go); the two must change together.
+fn unexpanded_variable(raw: &str) -> Option<&str> {
+    let bytes = raw.as_bytes();
+    let name_len = |from: usize| -> usize {
+        match bytes.get(from) {
+            Some(b) if b.is_ascii_alphabetic() || *b == b'_' => {}
+            _ => return 0,
+        }
+        bytes[from..]
+            .iter()
+            .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+            .count()
+    };
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                let len = name_len(i + 2);
+                if len > 0 && bytes.get(i + 2 + len) == Some(&b'}') {
+                    return Some(&raw[i..i + 3 + len]);
+                }
+            }
+            b'$' => {
+                let len = name_len(i + 1);
+                if len > 0 {
+                    return Some(&raw[i..i + 1 + len]);
+                }
+            }
+            b'%' => {
+                let len = name_len(i + 1);
+                if len > 0 && bytes.get(i + 1 + len) == Some(&b'%') {
+                    return Some(&raw[i..i + 2 + len]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Why `raw` is a path from the other platform, if it is.
@@ -767,5 +824,61 @@ mod tests {
         let here = scratch("native-spelling");
         let opened = validate_repo_path(here.to_str().unwrap()).expect("native path opens");
         assert_eq!(opened, here.canonicalize().unwrap());
+    }
+
+    // A host that forgot to expand a placeholder hands over its literal text.
+    // That is refused by name, before the filesystem is asked, so the operator
+    // reads "unexpanded variable" rather than "relative path" or "no such
+    // directory" — and so `/srv/$REPO/x` never opens a directory that happens
+    // to be spelled that way.
+    #[test]
+    fn repo_path_naming_an_unexpanded_variable_is_refused_by_name() {
+        for raw in [
+            "${CLAUDE_PROJECT_DIR}",
+            "${CLAUDE_PROJECT_DIR}/sub",
+            "$HOME/x",
+            "/srv/${REPO}/x",
+            "/srv/$REPO/x",
+            "/srv/$_private/x",
+            "%USERPROFILE%/repo",
+            "/srv/%REPO%/x",
+        ] {
+            let err = validate_repo_path(raw).expect_err(raw);
+            assert!(err.contains("unexpanded variable"), "{raw}: {err}");
+        }
+    }
+
+    // A `$` or `%` that cannot begin a variable name is part of a directory
+    // name: an administrative share (`\\host\c$\repo`), a trailing-`$`
+    // directory (`/srv/team$/repo`), a lone percent. Refusing every `$` turned
+    // those real roots away.
+    #[test]
+    fn a_dollar_or_percent_that_names_no_variable_is_not_a_placeholder() {
+        for raw in [
+            r"\\host\c$\repo",
+            "/srv/team$/repo",
+            "/tmp/a$/b",
+            "/tmp/a$",
+            "/tmp/$/b",
+            "/tmp/${/b",
+            "/tmp/${}/b",
+            "/tmp/$1/b",
+            "/tmp/50%/b",
+            "/tmp/%/b",
+            "/tmp/%%/b",
+            "/tmp/%1%/b",
+        ] {
+            assert_eq!(unexpanded_variable(raw), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn an_existing_root_with_a_dollar_in_a_name_opens() {
+        let base = scratch("dollar-root");
+        let root = base.join("a$").join("b");
+        fs::create_dir_all(&root).unwrap();
+        let raw = root.to_str().unwrap();
+        let opened = validate_repo_path(raw).expect("a `$` that is no variable is a name");
+        assert_eq!(opened, root.canonicalize().unwrap());
     }
 }
