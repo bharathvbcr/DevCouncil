@@ -167,7 +167,7 @@ func (c consumerCheck) run() ConsumerReport {
 	cmd := exec.CommandContext(ctx, node, filepath.FromSlash(parityScript), "--json")
 	proc.ConfigureGroup(cmd)
 	cmd.Dir = root
-	cmd.Env = append(os.Environ(), "GITPULSE_DEVCOUNCIL_ROOT="+c.src)
+	cmd.Env = parityEnv(os.Environ(), c.src)
 	var stdout, stderr proc.CappedBuffer
 	stdout.Limit, stderr.Limit = limit, 64<<10
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -192,6 +192,27 @@ func (c consumerCheck) run() ConsumerReport {
 		code = exitErr.ExitCode()
 	}
 	return parseParity(root, code, stdout.Bytes(), stderr.String())
+}
+
+// parityEnvExtra is what the check needs beyond proc's base allowlist: where
+// the Manvi and Jarvis checkouts it reads live (paths, not credentials), and
+// what node needs to start on Windows, whose process environment spells PATH
+// "Path".
+var parityEnvExtra = []string{
+	"GITPULSE_MANVI_ROOT", "GITPULSE_JARVIS_ROOT",
+	"Path", "PATHEXT", "SystemRoot", "SYSTEMROOT", "windir", "WINDIR", "ComSpec", "COMSPEC",
+	"USERPROFILE", "APPDATA", "LOCALAPPDATA",
+}
+
+// parityEnv is the check's whole environment. The check is another
+// repository's script, so it gets proc's base allowlist and parityEnvExtra,
+// never the caller's environment wholesale: a credential in the installer's
+// environment does not reach it, and neither does NODE_OPTIONS. The DevCouncil
+// checkout it judges is always src, whatever the caller's
+// GITPULSE_DEVCOUNCIL_ROOT says. GitPulse's check reads the checkout from that
+// variable only; its command line takes no checkout argument.
+func parityEnv(environ []string, src string) []string {
+	return append(proc.ScrubEnv(environ, parityEnvExtra...), "GITPULSE_DEVCOUNCIL_ROOT="+src)
 }
 
 // parityOutput is what `check-schema-parity.mjs --json` prints: one line,
