@@ -539,6 +539,13 @@ replaces covered, and claiming a language whose statement tree nothing produces
 would return an empty result that reads as *this file has no control flow*.
 Every other language is refused by name.
 
+A file the grammar cannot fully read is not an empty one. `--json` carries
+`parse` (`ok`, `partial` or `failed`), `complete`, and `skipped`: each syntax
+error region, each function refused because it contains one (it is never built
+from what survived), and each function nested past the 64-level cap.
+`skipped_total` is the real count when the list is capped. `total` counts the
+graphs built, and is the file's function count only when `complete` is true.
+
 A reported sink is evidence. **Its absence is not a safety claim** — the sink
 patterns are a heuristic list of well-known ones, and the analysis has no scope
 resolution, no alias tracking and no cross-function reasoning.

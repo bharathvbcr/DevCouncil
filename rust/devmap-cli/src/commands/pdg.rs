@@ -32,11 +32,11 @@ empty graph, which would read as 'this file has no control flow'.",
     let source = devmap_extract::read_source(file)
         .map_err(|error| anyhow::anyhow!("cannot read {}: {error}", file.display()))?;
     let qualifier = file.to_string_lossy().replace('\\', "/");
-    let inputs = devmap_analyze::pdgsrc::python_function_pdgs(&source, &qualifier, 0, 0);
+    let extraction = devmap_analyze::pdgsrc::python_function_pdgs(&source, &qualifier, 0, 0);
 
     let mut graphs = Vec::new();
     let mut refused = Vec::new();
-    for input in &inputs {
+    for input in &extraction.functions {
         match devmap_analyze::pdg::build_function_pdg(input) {
             Ok(graph) => graphs.push((input, graph)),
             // A function the builder refuses is named with its reason
@@ -48,47 +48,20 @@ empty graph, which would read as 'this file has no control flow'.",
             })),
         }
     }
-
-    let sinks_of = |input: &devmap_analyze::pdg::FunctionPdgInput| -> Vec<String> {
-        fn walk(statements: &[devmap_analyze::pdg::PdgStatement], out: &mut Vec<String>) {
-            use devmap_analyze::pdg::PdgStatementKind as K;
-            for statement in statements {
-                for sink in &statement.taint_sinks {
-                    out.push(format!("{}:{}", statement.line, sink));
-                }
-                match &statement.kind {
-                    K::Branch {
-                        then_body,
-                        else_body,
-                    } => {
-                        walk(then_body, out);
-                        walk(else_body, out);
-                    }
-                    K::Loop { body } => walk(body, out),
-                    K::Try {
-                        body,
-                        handlers,
-                        finally_body,
-                    } => {
-                        walk(body, out);
-                        for handler in handlers {
-                            walk(handler, out);
-                        }
-                        walk(finally_body, out);
-                    }
-                    K::Basic | K::Return | K::Raise => {}
-                }
-            }
-        }
-        let mut out = Vec::new();
-        walk(&input.body, &mut out);
-        out
-    };
+    // What the producer could not read — a grammar failure, a syntax error, a
+    // function nested past the cap — is a gap in the answer exactly as a
+    // refused function is. Without it, an unparseable file answered
+    // `functions: []` like an empty module.
+    let complete = extraction.is_complete() && refused.is_empty();
 
     let rows: Vec<serde_json::Value> = graphs
         .iter()
         .filter_map(|(input, graph)| {
-            let sinks = sinks_of(input);
+            let sinks: Vec<String> = input
+                .taint_sinks()
+                .into_iter()
+                .map(|(line, variable)| format!("{line}:{variable}"))
+                .collect();
             if *taint && sinks.is_empty() {
                 return None;
             }
@@ -110,12 +83,18 @@ empty graph, which would read as 'this file has no control flow'.",
             &serde_json::json!({
                 "file": file,
                 "language": language,
+                "parse": extraction.parse,
                 "functions": rows,
                 // Both numbers: a filtered view reported as a count
                 // reads as a total.
                 "shown": rows.len(),
                 "total": graphs.len(),
+                // `total` counts what was built. It is the file's whole
+                // function count only when `complete` is true.
+                "complete": complete,
                 "refused": refused,
+                "skipped": extraction.skipped,
+                "skipped_total": extraction.skipped_total,
             }),
         )?;
     } else {
@@ -138,6 +117,34 @@ empty graph, which would read as 'this file has no control flow'.",
                 "  refused {}: {}",
                 entry["function"].as_str().unwrap_or(""),
                 entry["reason"].as_str().unwrap_or("")
+            );
+        }
+        for skipped in &extraction.skipped {
+            let reason = serde_json::to_value(skipped.reason)?;
+            outln!(
+                "  skipped lines {}-{}{}: {}",
+                skipped.start_line,
+                skipped.end_line,
+                skipped
+                    .function
+                    .as_deref()
+                    .map(|name| format!(" ({name})"))
+                    .unwrap_or_default(),
+                reason.as_str().unwrap_or("")
+            );
+        }
+        if extraction.skipped_total > extraction.skipped.len() {
+            outln!(
+                "  … {} more skipped region(s) not listed",
+                extraction.skipped_total - extraction.skipped.len()
+            );
+        }
+        if !complete {
+            let parse = serde_json::to_value(extraction.parse)?;
+            outln!(
+                "  incomplete (parse: {}): the count above is a lower bound, not the file's \
+function count.",
+                parse.as_str().unwrap_or("")
             );
         }
     }
