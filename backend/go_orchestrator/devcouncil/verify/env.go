@@ -9,32 +9,15 @@ import (
 	"strings"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/flags"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 )
 
 // envAllowKey is the config.yaml key that extends the base allowlist.
 const envAllowKey = "verify.env_allow"
 
-// baseEnvAllow names the host variables a verification command may inherit.
-// Everything else is dropped. The list is what the common test toolchains need
-// to find themselves and their caches (PATH, HOME, the Go, Cargo, Rustup, Node,
-// Python and JVM roots) and to behave like a terminal-less CI run; it holds no
-// credential. A repository whose tests need more says so in `verify.env_allow`.
-//
-// DevCouncil owns this list. It is not shared with any host that embeds
-// DevCouncil: the embedder is downstream and decides its own.
-var baseEnvAllow = map[string]struct{}{
-	"PATH": {}, "HOME": {}, "USER": {}, "LOGNAME": {}, "SHELL": {},
-	"TMPDIR": {}, "TMP": {}, "TEMP": {}, "TZ": {}, "TERM": {}, "COLORTERM": {}, "NO_COLOR": {}, "CI": {},
-	"LANG": {}, "LANGUAGE": {},
-	"GOCACHE": {}, "GOMODCACHE": {}, "GOPATH": {}, "GOROOT": {}, "GOFLAGS": {}, "GOTOOLCHAIN": {}, "GOENV": {},
-	"CARGO_HOME": {}, "CARGO_TARGET_DIR": {}, "RUSTUP_HOME": {}, "RUSTUP_TOOLCHAIN": {},
-	"NVM_DIR": {}, "NODE_PATH": {}, "PYENV_ROOT": {}, "VIRTUAL_ENV": {}, "JAVA_HOME": {},
-	"XDG_CACHE_HOME": {}, "XDG_CONFIG_HOME": {}, "XDG_DATA_HOME": {}, "XDG_RUNTIME_DIR": {},
-	"DEVELOPER_DIR": {}, "SDKROOT": {},
-}
-
-// baseEnvAllowPrefixes admits families: LC_ALL, LC_CTYPE and the rest.
-var baseEnvAllowPrefixes = []string{"LC_"}
+// A verification command inherits proc's base allowlist (proc.ScrubEnv:
+// the toolchain roots and terminal settings, no credential). A repository
+// whose tests need more says so in `verify.env_allow`.
 
 var (
 	envNameRE    = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -107,34 +90,9 @@ func LoadEnvPolicy(root string) EnvPolicy {
 	return p
 }
 
-// allowed reports whether name may reach the command.
-func (p EnvPolicy) allowed(name string) bool {
-	if _, ok := baseEnvAllow[name]; ok {
-		return true
-	}
-	for _, prefix := range baseEnvAllowPrefixes {
-		if strings.HasPrefix(name, prefix) {
-			return true
-		}
-	}
-	for _, extra := range p.Extra {
-		if extra == name {
-			return true
-		}
-	}
-	return false
-}
-
 // Environ filters environ (KEY=VALUE entries, as os.Environ returns them) down
 // to what the policy allows. It always returns a non-nil slice: a nil Cmd.Env
 // means "inherit everything", which is exactly what this exists to prevent.
 func (p EnvPolicy) Environ(environ []string) []string {
-	out := make([]string, 0, len(environ))
-	for _, kv := range environ {
-		name, _, ok := strings.Cut(kv, "=")
-		if ok && p.allowed(name) {
-			out = append(out, kv)
-		}
-	}
-	return out
+	return proc.ScrubEnv(environ, p.Extra...)
 }

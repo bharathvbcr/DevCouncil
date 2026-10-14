@@ -288,6 +288,66 @@ func TestTheCheckIsPointedAtTheInstallingCheckout(t *testing.T) {
 	}
 }
 
+// envEchoScript answers as the real check does and reports, in its rows, what
+// it found in its own environment: whether the planted secrets reached it,
+// whether it can still find its tools, and which checkouts it was pointed at.
+const envEchoScript = `const env = process.env;
+const has = (name) => Object.prototype.hasOwnProperty.call(env, name);
+console.log(JSON.stringify({
+  ok: true,
+  owner: { store: 27, dcStore: 9, workbench: 13 },
+  devcouncil: env.GITPULSE_DEVCOUNCIL_ROOT ?? "",
+  rows: [
+    { reader: "planted", verdict: "match", detail: ["DEVCOUNCIL_PLANTED_SECRET", "GITHUB_TOKEN", "NODE_OPTIONS"].filter(has).join(",") },
+    { reader: "path", verdict: "match", detail: has("PATH") ? "present" : "missing" },
+    { reader: "manvi", verdict: "match", detail: env.GITPULSE_MANVI_ROOT ?? "" },
+    { reader: "argv", verdict: "match", detail: JSON.stringify(process.argv.slice(2)) },
+  ],
+  summary: "OK",
+}));
+`
+
+// The check runs code from another repository. It gets the environment it
+// needs to find its tools and the checkouts it reads, never the caller's
+// credentials; and the checkout it judges is the one this install names, not
+// whatever the caller's environment happened to say.
+func TestTheCheckDoesNotInheritTheCallersEnvironment(t *testing.T) {
+	needNode(t)
+	t.Setenv(GitPulseRootEnv, "")
+	t.Setenv("DEVCOUNCIL_PLANTED_SECRET", "s3cret-must-not-leak")
+	t.Setenv("GITHUB_TOKEN", "ghp_planted")
+	// NODE_OPTIONS would let the caller's environment inject code into node.
+	t.Setenv("NODE_OPTIONS", "--no-warnings")
+	t.Setenv("GITPULSE_DEVCOUNCIL_ROOT", "/somewhere/else")
+	manvi := t.TempDir()
+	t.Setenv("GITPULSE_MANVI_ROOT", manvi)
+	src, _ := siblings(t, envEchoScript)
+
+	r := consumerCheck{src: src, lookPath: onlyNode}.run()
+	if !r.Checked || !r.Passed() {
+		t.Fatalf("report = %+v", r)
+	}
+	got := map[string]string{}
+	for _, row := range r.Rows {
+		got[row.Reader] = row.Detail
+	}
+	if got["planted"] != "" {
+		t.Fatalf("the caller's environment reached the check: %s", got["planted"])
+	}
+	if got["path"] != "present" {
+		t.Fatalf("the check cannot find its tools: PATH %s", got["path"])
+	}
+	if got["manvi"] != manvi {
+		t.Fatalf("the check lost where Manvi lives: %q, want %q", got["manvi"], manvi)
+	}
+	if r.DevCouncil != src {
+		t.Fatalf("the check judged %q, not the installing checkout %q", r.DevCouncil, src)
+	}
+	if got["argv"] != `["--json"]` {
+		t.Fatalf("the check was started with %s", got["argv"])
+	}
+}
+
 func TestParseParityNeverReadsANonAnswerAsAVerdict(t *testing.T) {
 	good := `{"ok":true,"owner":{"store":27},"rows":[{"reader":"devmap (PATH)","verdict":"match","detail":"devmap store 27"}],"summary":"OK: 1 match"}`
 	for _, tc := range []struct {
