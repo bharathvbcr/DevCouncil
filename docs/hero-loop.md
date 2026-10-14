@@ -135,6 +135,14 @@ firmly the policy answers:
 | `policy.file.mode` | `enforce`, `advisory`, `off` | Whether a soft file refusal blocks. |
 | `policy.command.mode` | `enforce`, `advisory`, `off` | The same for shell commands. A hard command refusal is never demoted. |
 
+These are safety flags. The repository's `.devcouncil/config.yaml` may only
+tighten them — `harness.posture: strict` or `policy.file.mode: enforce` apply,
+while `yolo`, `off`, `advisory`, or `policy.hard_rules.enabled: false` there is
+refused with the file, line and key, and the write gate is not built from that
+file. Loosen them from operator scope: the environment
+(`MANVI_HARNESS_POSTURE`, `MANVI_POLICY_HARD_RULES_ENABLED`, …). See
+[Repository boundaries](SECURITY_BOUNDARIES.md#repository-configuration-and-safety-flags).
+
 Verification does not read these. It blocks any changed file that is not in the
 task's planned files (`orphan_diff`, hard-safety) under `gates.mode: enforce`,
 so a write the policy lets through can still be blocked afterwards. To make that

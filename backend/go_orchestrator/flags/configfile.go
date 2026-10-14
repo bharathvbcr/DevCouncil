@@ -14,6 +14,12 @@ const DefaultConfigFile = "config.yaml"
 
 // LoadConfigFile applies path as the config layer, reporting whether a file was
 // there at all.
+//
+// The file is read at repository scope, so it may tighten a Safety flag and may
+// not loosen one. That is the only file any caller hands it — the repository's
+// .devcouncil/config.yaml — and it is the file a clone ships and an agent can
+// write. A host that reads an operator's own file outside the repository parses
+// it with ParseConfigLayer and passes it to LoadLayer labelled ScopeOperator.
 func LoadConfigFile(r *Registry, path string) (bool, error) {
 	if strings.TrimSpace(path) == "" {
 		return false, nil
@@ -31,11 +37,26 @@ func LoadConfigFile(r *Registry, path string) (bool, error) {
 	if err != nil {
 		return true, fmt.Errorf("%s: %w", path, err)
 	}
+	layer.Scope = ScopeRepository
 	if err := r.LoadLayer(layer); err != nil {
 		return true, fmt.Errorf("%s: %w", path, err)
 	}
 	return true, nil
 }
+
+// Scope is whose authority a config layer carries.
+type Scope string
+
+const (
+	// ScopeRepository is a file inside the repository being worked on. It may
+	// tighten a Safety flag and may not loosen one. A layer that names no scope
+	// is held to this rule.
+	ScopeRepository Scope = "repository"
+	// ScopeOperator is a value the operator supplied from outside the
+	// repository: a user-level config file, or settings handed over in code. It
+	// may set a Safety flag to any legal value, as the environment may.
+	ScopeOperator Scope = "operator"
+)
 
 type indentEntry struct {
 	indent int
@@ -124,6 +145,11 @@ type ConfigLayer struct {
 	// Lists maps each key that has a block list under it to the line of its
 	// first item.
 	Lists map[string]int
+	// Scope is whose authority the layer carries. ParseConfigLayer leaves it
+	// empty, because a parser cannot know where the file came from, and
+	// LoadLayer treats empty as ScopeRepository: an unlabelled layer gets the
+	// stricter rule, never the looser one.
+	Scope Scope
 }
 
 // ParseConfig reads YAML configuration files in either flat dotted form (llm.local.model: ...)

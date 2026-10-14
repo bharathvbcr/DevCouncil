@@ -221,10 +221,13 @@ func DescribePosture(posture string) PostureEffect {
 
 // DefineHarnessFlags registers the harness catalogue on a registry.
 func DefineHarnessFlags(r *Registry) error {
+	// modes is written strictest first, so it is both the legal set and the
+	// order a repository-scope config may only move a gate along.
 	modes := []string{ModeEnforce, ModeAdvisory, ModeOff}
 	defs := []Def{
 		{
 			Key: HarnessPosture, Kind: KindEnum, Values: []string{PostureDev, PostureStrict, PostureYolo},
+			Ladder:  []string{PostureStrict, PostureDev, PostureYolo},
 			Default: PostureDev, Safest: PostureStrict, Mutable: HumanOnly, Safety: true,
 			Description: "Development posture. dev: soft scope rules report instead of blocking, so the harness can be run while it is being built, while hard rules (credentials, outside-root, agent configs, git safety) still enforce. strict: everything enforces. yolo: every gate is off, hard rules included, and nothing is put to the operator for approval. A gate mode or policy.hard_rules.enabled set explicitly overrides this.",
 		},
@@ -233,12 +236,12 @@ func DefineHarnessFlags(r *Registry) error {
 			Description: "Scaffold the repository on startup: create the state directory the harness writes into, and append the managed rules to .gitignore. Off leaves the working tree untouched, and a missing state directory then surfaces as an unreachable store.",
 		},
 		{
-			Key: PolicyFileMode, Kind: KindEnum, Values: modes, Default: ModeEnforce,
+			Key: PolicyFileMode, Kind: KindEnum, Values: modes, Ladder: modes, Default: ModeEnforce,
 			Mutable: HumanOnly, Safety: true,
 			Description: "File write gate: enforce blocks, advisory records findings, off skips soft rules. Hard rules always run. Left unset, harness.posture chooses.",
 		},
 		{
-			Key: PolicyCommandMode, Kind: KindEnum, Values: modes, Default: ModeEnforce,
+			Key: PolicyCommandMode, Kind: KindEnum, Values: modes, Ladder: modes, Default: ModeEnforce,
 			Mutable: HumanOnly, Safety: true,
 			Description: "Shell command gate. Same vocabulary as the file gate. Left unset, harness.posture chooses.",
 		},
@@ -266,7 +269,10 @@ func DefineHarnessFlags(r *Registry) error {
 			Description: "Master switch for the override seam. Off means a soft block can only be cleared by changing task scope.",
 		},
 		{
-			Key: GrantsAgentEnabled, Kind: KindBool, Default: "true",
+			// Ladder declared because the shipped default is the loose end: a
+			// repository that turns agent self-grants off is tightening, and the
+			// derived order (safest = default) would refuse it.
+			Key: GrantsAgentEnabled, Kind: KindBool, Default: "true", Ladder: []string{"false", "true"},
 			Mutable: HumanOnly, Safety: true,
 			Description: "Allow agents to grant their own overrides for agent-grantable rules within their lease scope.",
 		},
@@ -865,6 +871,12 @@ func refuseRetiredConfig(path string) error {
 // down and durable, the environment is what someone typed for this run, and the
 // environment wins. That is the order Lookup has always documented; until now
 // the middle layer was simply never filled.
+//
+// configPath is read at repository scope (LoadConfigFile): every caller hands
+// it the analysed repository's .devcouncil/config.yaml, so a Safety flag set
+// there may only be tightened, and a line that would loosen one fails the build
+// of the registry, naming the file, line and key. The environment is operator
+// scope and keeps full authority.
 func NewHarnessRegistry(configPath string) (*Registry, error) {
 	r := New()
 	if err := DefineHarnessFlags(r); err != nil {

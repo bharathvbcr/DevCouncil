@@ -30,7 +30,10 @@ environment instead of the host's:
   owner.
 - **Failure direction**: an unreadable `verify.env_allow` runs the base list
   alone and adds a blocking `verify_env_config_invalid` gap. Config can only
-  narrow, never widen, beyond the allowlist.
+  narrow, never widen, beyond the allowlist. The write gate's safety flags
+  follow the same rule from the same file: `.devcouncil/config.yaml` may
+  tighten them and is refused, by file, line and key, when it would loosen one
+  (see SECURITY_BOUNDARIES.md, "Repository configuration and safety flags").
 - **Evidence**: each run records `env_scrub`, `env_allow_extra`,
   `env_allow_refused` and `env_allow_error` in its environment record. Names
   only, never values.

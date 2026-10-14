@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
@@ -129,6 +130,36 @@ func TestOpenGateWithoutAUsableMapDegradesAndNeverWidens(t *testing.T) {
 		// turn into refusing everything.
 		if d := writeDecision(t, root, "a/x.go"); d.Blocked() {
 			t.Errorf("%s map: the planned file was refused: %s (%s)", name, d.Rule, d.Reason)
+		}
+	}
+}
+
+// The MCP host builds its gate from the analysed repository's own config.yaml.
+// A line there that switches the gate off used to be taken at its word: yolo
+// turned every gate off, hard rules included, for the agent the gate exists to
+// contain. It now refuses to build the gate at all — the host serves without
+// one and devcouncil_policy_check_write answers not_initialized — and says
+// which file, line and key did it. A tightening file builds as before
+// (gateRepo's strict posture is exactly that).
+func TestOpenGateRefusesARepositoryConfigThatLowersTheGate(t *testing.T) {
+	for _, tc := range []struct{ doc, at string }{
+		{"harness:\n  posture: yolo\n", "harness.posture (line 2)"},
+		{"# tuning\npolicy.hard_rules.enabled: false\n", "policy.hard_rules.enabled (line 2)"},
+		{"policy:\n  file:\n    mode: off\n", "policy.file.mode (line 3)"},
+	} {
+		root := gateRepo(t, nil)
+		cfg := filepath.Join(root, ".devcouncil", "config.yaml")
+		if err := os.WriteFile(cfg, []byte(tc.doc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		g, err := openGate(root)
+		if err == nil {
+			t.Fatalf("%q built a gate (%v); a repository config may not lower its own gate", tc.doc, g != nil)
+		}
+		for _, want := range []string{cfg, tc.at, "only tighten"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("%q: refusal %q does not name %q", tc.doc, err, want)
+			}
 		}
 	}
 }
