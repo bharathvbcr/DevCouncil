@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil"
@@ -124,10 +126,34 @@ func callBudgetFor(method string, params json.RawMessage) time.Duration {
 	return defaultCallBudget
 }
 
-// Serve runs until stdin closes or the stdout pipe breaks. When it stops it
-// cancels every call still running before it waits for them, so what a call
-// started (a verification command and its process group) is stopped by
-// the time Serve returns, not left behind with PPID 1.
+// shutdownSignals end a session the way stdin closing does. On Windows Go
+// delivers os.Interrupt for Ctrl-C/Ctrl-Break and syscall.SIGTERM for the
+// console close, logoff and shutdown events, so the one list covers both.
+var shutdownSignals = []os.Signal{os.Interrupt, syscall.SIGTERM}
+
+// SignalError is what Serve returns when a shutdown signal ended the session.
+// It is an error rather than nil because the client did not end the session:
+// the host was told to stop with calls possibly still owed an answer.
+type SignalError struct {
+	Signal os.Signal
+}
+
+func (e *SignalError) Error() string {
+	return fmt.Sprintf("stopped by %v; running calls were cancelled", e.Signal)
+}
+
+// frameRead is one readFrame result handed from the reader to the serve loop.
+type frameRead struct {
+	line []byte
+	err  error
+}
+
+// Serve runs until stdin closes, the stdout pipe breaks, or the process is sent
+// SIGINT or SIGTERM (the Windows console events included). However it stops,
+// it cancels every call still running before it waits for them, so what a call
+// started (a verification command and its process group) is stopped by the
+// time Serve returns, not left behind with PPID 1. A signal ends it with a
+// *SignalError; a second signal after the first takes the default action.
 func (s *Server) Serve() error {
 	if s.In == nil {
 		s.In = os.Stdin
@@ -138,6 +164,10 @@ func (s *Server) Serve() error {
 	if s.Err == nil {
 		s.Err = os.Stderr
 	}
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, shutdownSignals...)
+	defer signal.Stop(signals)
+
 	root, stop := context.WithCancel(context.Background())
 	defer stop()
 	finish := func(err error) error {
@@ -145,13 +175,46 @@ func (s *Server) Serve() error {
 		s.drainInFlight()
 		return err
 	}
-	reader := bufio.NewReaderSize(s.In, 64*1024)
+
+	// The read runs on its own goroutine so a signal is not stuck behind a
+	// blocking read of stdin. Frames are still dispatched one at a time, in
+	// order, by the loop below. quit releases a reader that has a frame in hand
+	// once the loop is gone; one blocked in the read itself ends with the
+	// process, which is the only reason the loop stops while stdin is open.
+	frames := make(chan frameRead)
+	quit := make(chan struct{})
+	defer close(quit)
+	go func() {
+		reader := bufio.NewReaderSize(s.In, 64*1024)
+		for {
+			line, err := readFrame(reader, maxFrameBytes)
+			select {
+			case frames <- frameRead{line: line, err: err}:
+			case <-quit:
+				return
+			}
+			if err != nil && err != errFrameTooLarge {
+				return
+			}
+		}
+	}()
 
 	for {
 		if s.broken.Load() {
 			return finish(io.ErrClosedPipe)
 		}
-		line, err := readFrame(reader, maxFrameBytes)
+		var line []byte
+		var err error
+		select {
+		case sig := <-signals:
+			// Restore the default action now, so a host that hangs while
+			// draining can still be stopped by a second signal.
+			signal.Stop(signals)
+			fmt.Fprintf(s.Err, "devcouncil-mcp: %v received; cancelling running calls\n", sig)
+			return finish(&SignalError{Signal: sig})
+		case fr := <-frames:
+			line, err = fr.line, fr.err
+		}
 		if err == io.EOF {
 			return finish(nil)
 		}

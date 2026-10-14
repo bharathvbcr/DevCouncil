@@ -493,13 +493,12 @@ func Summary(applied []policy.Decision) []string {
 // it. The reason is the whole value of the ledger; it must not go missing
 // because the mechanism that recorded it was not the mechanism that allowed the
 // write.
-func IssuedSummary(issued []Grant, applied []policy.Decision) []string {
-	used := make(map[string]bool, len(applied))
-	for _, d := range applied {
-		if d.GrantID != "" {
-			used[d.GrantID] = true
-		}
-	}
+//
+// used is the set of grant IDs any decision applied during the run. It is a set
+// rather than the decisions themselves because the caller keeps only a capped
+// sample of those, and a grant applied by a decision that fell out of the
+// sample is still not unused.
+func IssuedSummary(issued []Grant, used map[string]bool) []string {
 	var lines []string
 	for _, g := range issued {
 		if used[g.ID] {

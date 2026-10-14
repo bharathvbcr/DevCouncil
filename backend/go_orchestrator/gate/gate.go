@@ -46,8 +46,26 @@ type Gate struct {
 	// and every revoke to evaporate on restart.
 	OnChange func(grants.Change)
 
-	mu      sync.Mutex
-	decided []policy.Decision
+	mu sync.Mutex
+	// decided is a ring of the most recent maxRecordedDecisions decisions,
+	// oldest at next once it has filled. A long-lived host asks the gate about
+	// every write for the life of the process, so keeping them all grew without
+	// end. tally holds the exact counts Report gives however many fell out of
+	// the ring, and grantsUsed every grant any decision applied, which is what
+	// IssuedSummary needs to be exact and is bounded by the ledger.
+	decided    []policy.Decision
+	next       int
+	tally      tally
+	grantsUsed map[string]bool
+}
+
+// maxRecordedDecisions is how many decisions the gate keeps for Decisions and
+// for the grant lines in Report. Older ones are counted, not kept.
+const maxRecordedDecisions = 4096
+
+// tally is the exact per-outcome count of every decision the gate recorded.
+type tally struct {
+	total, clean, granted, demoted, widened, denied, degraded int
 }
 
 // New builds a gate from a flag registry.
@@ -436,8 +454,36 @@ func (g *Gate) settle(decision policy.Decision, mode string, modeOrigin flags.Or
 // how a denial comes to be made and never counted.
 func (g *Gate) record(decision policy.Decision) policy.Decision {
 	g.mu.Lock()
-	g.decided = append(g.decided, decision)
-	g.mu.Unlock()
+	defer g.mu.Unlock()
+	if len(g.decided) < maxRecordedDecisions {
+		g.decided = append(g.decided, decision)
+	} else {
+		g.decided[g.next] = decision
+		g.next = (g.next + 1) % maxRecordedDecisions
+	}
+	t := &g.tally
+	t.total++
+	switch {
+	case decision.Blocked():
+		t.denied++
+	case decision.GrantID != "":
+		t.granted++
+	case decision.Demoted != "":
+		t.demoted++
+	case decision.Widened != "":
+		t.widened++
+	case decision.Clean():
+		t.clean++
+	}
+	if len(decision.Degraded) > 0 {
+		t.degraded++
+	}
+	if decision.GrantID != "" {
+		if g.grantsUsed == nil {
+			g.grantsUsed = map[string]bool{}
+		}
+		g.grantsUsed[decision.GrantID] = true
+	}
 	return decision
 }
 
@@ -467,11 +513,19 @@ func (g *Gate) AgentCanGrant(rule policy.RuleID) bool {
 	return g.Ledger.AgentMayGrant(rule)
 }
 
-// Decisions returns every decision this gate made, in order.
+// Decisions returns the most recent decisions this gate made, oldest first: all
+// of them until there have been more than maxRecordedDecisions, then the last
+// maxRecordedDecisions. Report's DecisionsDropped says how many fell out.
 func (g *Gate) Decisions() []policy.Decision {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return append([]policy.Decision(nil), g.decided...)
+	return g.decisionsLocked()
+}
+
+func (g *Gate) decisionsLocked() []policy.Decision {
+	out := make([]policy.Decision, 0, len(g.decided))
+	out = append(out, g.decided[g.next:]...)
+	return append(out, g.decided[:g.next]...)
 }
 
 // Report is the run summary that keeps a green result honest: how many writes
@@ -498,9 +552,16 @@ type Report struct {
 	// argued for them expires and this does not: in a later run the appended
 	// scope is still there with no grant beside it, and without this counter
 	// that run would summarise as though the plan had authorised every write.
-	Widened    int      `json:"widened"`
-	Degraded   int      `json:"degraded"`
-	GrantLines []string `json:"grants,omitempty"`
+	Widened  int `json:"widened"`
+	Degraded int `json:"degraded"`
+	// The counts above cover every decision. GrantLines is drawn from the
+	// decisions the gate still holds, a capped sample of the most recent
+	// ones: DecisionsSampled of them, with DecisionsDropped older ones
+	// counted but no longer held. A non-zero DecisionsDropped means a grant
+	// applied only by a dropped decision is missing from GrantLines.
+	DecisionsSampled int      `json:"decisions_sampled"`
+	DecisionsDropped int      `json:"decisions_dropped"`
+	GrantLines       []string `json:"grants,omitempty"`
 	// IssuedGrantLines are grants that were issued and never applied. On an
 	// unplanned path the grant's real effect is the scope it caused to be
 	// written, so this is where the reason for a widening is recorded.
@@ -528,33 +589,29 @@ func (r Report) Strict() bool {
 
 // Report summarises the run.
 func (g *Gate) Report() Report {
-	decisions := g.Decisions()
-	rep := Report{Total: len(decisions)}
+	g.mu.Lock()
+	decisions := g.decisionsLocked()
+	t := g.tally
+	used := make(map[string]bool, len(g.grantsUsed))
+	for id := range g.grantsUsed {
+		used[id] = true
+	}
+	g.mu.Unlock()
+
+	rep := Report{
+		Total: t.total, Clean: t.clean, Granted: t.granted, Demoted: t.demoted,
+		Widened: t.widened, Denied: t.denied, Degraded: t.degraded,
+		DecisionsSampled: len(decisions),
+		DecisionsDropped: t.total - len(decisions),
+	}
 	if posture, _, err := g.Flags.String(flags.HarnessPosture); err == nil {
 		rep.Posture = posture
 	}
 	if hard, _, err := flags.EffectiveHardRules(g.Flags); err == nil {
 		rep.HardRules = hard
 	}
-	for _, d := range decisions {
-		switch {
-		case d.Blocked():
-			rep.Denied++
-		case d.GrantID != "":
-			rep.Granted++
-		case d.Demoted != "":
-			rep.Demoted++
-		case d.Widened != "":
-			rep.Widened++
-		case d.Clean():
-			rep.Clean++
-		}
-		if len(d.Degraded) > 0 {
-			rep.Degraded++
-		}
-	}
 	rep.GrantLines = grants.Summary(decisions)
-	rep.IssuedGrantLines = grants.IssuedSummary(g.Ledger.Issued(), decisions)
+	rep.IssuedGrantLines = grants.IssuedSummary(g.Ledger.Issued(), used)
 	for _, v := range g.Flags.Weakened() {
 		rep.WeakenedFlags = append(rep.WeakenedFlags, fmt.Sprintf("%s=%s (%s)", v.Key, v.Raw, v.Origin))
 	}
