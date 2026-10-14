@@ -294,3 +294,77 @@ fn a_symlink_out_of_the_repository_is_absent_from_the_inventory_too() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// The third shape, from the extractor's side: on Unix `\` is a byte of a file
+/// name, and discovery refuses `src/a\b.py` rather than fold it onto the real
+/// `src/a/b.py` (`devmap_extract::repo_relative_key`). `ls_files` folded it, so
+/// the inventory listed `src/a/b.py` twice and hashed the real file under the
+/// impostor's entry: the two walks disagreed on what the tree holds.
+#[cfg(unix)]
+#[test]
+fn a_backslash_name_on_unix_is_absent_from_the_inventory_as_from_the_index() {
+    let root = std::env::temp_dir().join(format!(
+        "devmap-backslash-inventory-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(root.join("src/a")).unwrap();
+    std::fs::write(root.join("src/a/b.py"), "def real():\n    return 1\n").unwrap();
+    std::fs::write(root.join("src/a\\b.py"), "def impostor():\n    return 2\n").unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["add", "-A"],
+        vec![
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "x",
+        ],
+    ] {
+        let output = Command::new("git")
+            .args(&args)
+            .current_dir(&root)
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let listed = Command::new("git")
+        .args(["ls-files", "-z"])
+        .current_dir(&root)
+        .output()
+        .expect("git ls-files");
+    assert!(
+        listed
+            .stdout
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == b"src/a\\b.py"),
+        "premise: git tracks the backslash name verbatim: {:?}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+    assert_eq!(
+        discovered(&root),
+        ["src/a/b.py"],
+        "premise: discovery refuses the backslash name"
+    );
+
+    let listing = inventory(&root, InventoryLimits::default());
+    assert_eq!(listing.source, InventorySource::Git);
+    assert_eq!(
+        listing.files,
+        ["src/a/b.py"],
+        "the inventory must hold exactly what discovery indexes, each once"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
