@@ -59,7 +59,8 @@ pub const OPCODE_MATCH_PREPARED: u32 = 3;
 /// slower, never a refusal.
 pub const MAX_SETS: usize = 4096;
 
-/// Most pattern bytes the registry holds, across every list.
+/// Most heap bytes the registry holds, across every list: each list's frame
+/// plus its compiled patterns, as `footprint` counts them.
 pub const MAX_REGISTRY_BYTES: usize = 16 << 20;
 
 /// [`prepare_frame`]'s answer when the registry is full.
@@ -283,6 +284,30 @@ fn registry() -> &'static Registry {
     REGISTRY.get_or_init(Registry::new)
 }
 
+/// Heap bytes one registered list holds, charged against [`MAX_REGISTRY_BYTES`].
+///
+/// A list is held twice: its frame, as the dedupe key, and its compiled
+/// patterns. The compiled half dominates. Each pattern character becomes one
+/// `dc_glob` token, tens of bytes wide, so the charge is the patterns' own
+/// [`dc_glob::Pattern::heap_bytes`], not a multiple of the frame length — six
+/// bytes per frame byte once let a full registry hold about nine times its
+/// bound. Not counted: growth slack in the registry's own vector and map,
+/// which is amortised over at most [`MAX_SETS`] entries, and allocator block
+/// overhead.
+fn footprint(frame_len: usize, set: &PreparedSet) -> usize {
+    use std::mem::size_of;
+    let key = frame_len + size_of::<(Vec<u8>, u32)>();
+    let slot = size_of::<Arc<PreparedSet>>() + 2 * size_of::<usize>() + size_of::<PreparedSet>();
+    let patterns = set.patterns.capacity() * size_of::<Option<dc_glob::Pattern>>()
+        + set
+            .patterns
+            .iter()
+            .flatten()
+            .map(dc_glob::Pattern::heap_bytes)
+            .sum::<usize>();
+    key + slot + patterns
+}
+
 /// Registers a pattern list and answers its id as `u32le`.
 ///
 /// Frame: `u32le count | (u32le pattern_len | pattern){count}`, nothing else,
@@ -325,9 +350,7 @@ pub fn prepare_frame(registry: &Registry, input: &[u8]) -> Result<Vec<u8>, Strin
     if let Some(&id) = inner.by_content.get(input) {
         return Ok(id.to_le_bytes().to_vec());
     }
-    // A set is held twice: its frame, as the dedupe key, and its compiled
-    // tokens, at most four bytes of char per byte of pattern plus the frame.
-    let cost = input.len().saturating_mul(6);
+    let cost = footprint(input.len(), &set);
     if inner.sets.len() >= MAX_SETS || inner.bytes.saturating_add(cost) > MAX_REGISTRY_BYTES {
         return Ok(REGISTRY_FULL.to_le_bytes().to_vec());
     }
@@ -663,12 +686,16 @@ mod tests {
         // An existing list is still found.
         assert_eq!(prepare(&reg, &[b"p7"]), 7);
 
+        // Patterns dc-glob compiles (16384 characters), so the registry holds
+        // their tokens and the byte bound is what fills. A pattern past that
+        // is never compiled and costs only its frame.
         let bytes = Registry::new();
-        let big = "x".repeat(MAX_FIELD);
+        let units = MAX_FIELD / 4;
+        let big = "x".repeat(units);
         let mut full = false;
         for i in 0..200 {
             let p = format!("{i}{big}");
-            if prepare(&bytes, &[&p.as_bytes()[..MAX_FIELD]]) == REGISTRY_FULL {
+            if prepare(&bytes, &[&p.as_bytes()[..units]]) == REGISTRY_FULL {
                 full = true;
                 break;
             }
