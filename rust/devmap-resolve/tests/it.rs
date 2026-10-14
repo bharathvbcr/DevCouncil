@@ -46,6 +46,8 @@ mod factory_return_types;
 #[cfg(feature = "parse")]
 mod function_values_and_platform_targets;
 #[cfg(feature = "parse")]
+mod glob_reexport_poison;
+#[cfg(feature = "parse")]
 mod global_rung_requires_no_other_evidence;
 #[cfg(feature = "parse")]
 mod go_own_package_receiver;
