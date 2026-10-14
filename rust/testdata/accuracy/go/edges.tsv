@@ -10,6 +10,7 @@
 #   kind      edge   = a Calls/References/Instantiates/Extends/Implements/... edge, any tier
 #             import = an Imports edge between the two files
 #             forbid = NO edge of any kind at confidence >= 0.9 may join caller and callee
+#             forbid_any_tier = NO use edge at any confidence may join them ("no edge of any tier")
 #   level     must   = a correct resolver has this edge
 #             should = the audit accepted an honest miss or an alternative here
 #   ledger    optional `a|b` bare names a ledger row may carry when the expected callee's
@@ -73,3 +74,5 @@ go.Q3	Q3	app/svc/probes2.go::Holder.Rebuild	app/svc/probes2.go::Rebuild	edge	mus
 go.Q3.noself	Q3	app/svc/probes2.go::Holder.Rebuild	app/svc/probes2.go::Holder.Rebuild	forbid	must		no self-edge
 go.Q4	Q4	app/svc/probes2.go::cache.delete	app/svc/probes2.go::cache.delete	forbid	must		builtin delete is not a self-call
 go.Q5	Q5	app/svc/probes2.go::writer.clear	app/svc/probes2.go::Buffer.Reset	forbid	must		bytes.Buffer is external: no HIGH edge to the in-repo namesake Buffer.Reset
+go.Q2c.twin	Q2c	app/svc/probes2.go::twinLocalTypeUser	app/svc/probes2.go::shadowedLocalTypeUser.entry	forbid_any_tier	must		a function-local type is scoped to its function: twinLocalTypeUser's entry{} is its own, never the other function's entry
+go.Q2c.shadowed	Q2c	app/svc/probes2.go::shadowedLocalTypeUser	app/svc/probes2.go::twinLocalTypeUser.entry	forbid_any_tier	must		a function-local type is scoped to its function: shadowedLocalTypeUser's entry{} is its own, never the twin's entry

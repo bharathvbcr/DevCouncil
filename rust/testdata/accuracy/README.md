@@ -52,7 +52,8 @@ is for after each language card lands).
 ## The gates
 
 `edges.tsv` in each fixture is the normalized edge truth (columns documented in
-its header): caller, callee, `edge`/`import`/`forbid`, `must`/`should`. Rows were
+its header): caller, callee, `edge`/`import`/`forbid`/`forbid_any_tier`,
+`must`/`should`. Rows were
 derived from the audit's original labels and the language's own semantics, never
 from DevMap's output. `devmap-analyze/tests/accuracy_fixtures.rs` runs the
 product's own scan -> manifests -> extract -> resolve -> analyze path over every
@@ -64,9 +65,21 @@ fixture and gates, per language:
    truly-dead symbol reported, no live symbol above 0.4),
 4. recall as a ratchet.
 
+A `forbid` row rules out an edge at >= 0.9 only. A criterion worded "no edge of
+any tier" needs a `forbid_any_tier` row, which fails on a use edge at any
+confidence: TypeScript `ts.V2`, Swift `sw.M4b`/`sw.M4d`, Kotlin `kg.S2a`/`kg.S2b`,
+Rust `rr.count` and Go `go.Q2c.*` (no edge between two functions' same-named local
+types). Every forbid row must name a caller and callee the build actually has —
+one naming a renamed or mistyped symbol would pass vacuously, so it fails. A
+language with no expected-edge row, no HIGH edge to score precision on, or no
+truly-dead row fails as unmeasured; a rate over nothing is written as `null` in
+`record.json`'s `fixtures`, never as 1.0.
+
 Rows that fail today are in `known_failing.tsv`, each keyed by the card that
 owns the fix. The test fails when a listed row starts passing, when a passing row
-regresses, and when `ratchet.json` (counts) would move the wrong way. After an
+regresses, and when `ratchet.json` (counts: present edges and expected and
+`forbid_any_tier` rows may not fall, known failures may not grow) would move the
+wrong way. After an
 improvement, `DEVMAP_ACCURACY_BLESS=1 cargo test -p devmap-analyze --test
 accuracy_fixtures` deletes the fixed rows and rewrites `ratchet.json` and the
 `fixtures` section of `record.json`; it refuses to write a worse state and never
@@ -96,6 +109,15 @@ refuses any other commit or a dirty tree, and writes `record.json`:
   (`<checkout>/.devmap-accuracy/labels.json` or `DEVMAP_CORPUS_<NAME>_LABELS`)
   because they name private paths and symbols. A corpus without labels gets no
   row: an unmeasured number must not look like a passing one.
+* `superseded`: every `measurements` or `corpora` row a later run replaced, with
+  the date — superseded, never deleted.
+* `open_gates`: every gate the record does not meet, over every pinned corpus
+  and language, whether or not the last run measured it. CI
+  (`the_committed_record_lists_every_gate_it_does_not_meet`) recomputes it from
+  the committed record and fails when it is out of date, so the record cannot
+  claim a clean bill it does not have. The runner rewrites it;
+  `DEVMAP_ACCURACY_BLESS=1 cargo test -p devmap-analyze --test
+  real_corpus_accuracy the_committed_record` rewrites it from the record alone.
 * `fixtures`: the per-language fixture measurement, rewritten by the bless above.
 
 Labels file shape:
@@ -114,7 +136,25 @@ honest-miss >= 98%, 0.9-tier dead false positives <= 5%, no regression against t
 previous row (precision -1 pt, recall -2 pt), and the recall floors in
 `corpora.json`. A gate that held in the previous row must keep holding; one that
 did not may only stay put, so the first record is a baseline and each language
-card moves it. Run the runner before any DevMap release and after a change to
+card moves it.
+
+The claims are gated absolutely, whatever the previous row said:
+
+* recall at or above each language card's target (`recall_targets_percent`: Go 95,
+  Python 88, TypeScript 85, Rust 95 free/self and 75 non-self, Swift 90, Kotlin 85),
+  kept separate from the baseline floors, which stay at the measured baseline
+  until a run measures better. Neither table may be lowered, and every language
+  needs an entry in both; a missing one is reported as ungated;
+* UniqueGlobal precision >= 0.95 (vacuous only when the corpus has no UniqueGlobal
+  edge at all);
+* zero AmbiguousGlobal edges (S2 made AmbiguousGlobal ledger-only).
+
+Each of them, and every labelled gate, is *unmeasured* — and fails — when the
+number it needs is missing: a corpus without labels is gated as well, not skipped.
+The runner also refuses to measure with a DevMap that does not contain every
+commit in `record_must_include` (S2, d0552ae1, and each language lane's merge),
+and stamps that list into each measurement as `includes_commits`; a row without it
+is listed in `open_gates` as stale. Run the runner before any DevMap release and after a change to
 `treesitter.rs`, `langcalls/`, `langdecl/`, `resolver.rs` or `liveness.rs` that
 touches the language.
 

@@ -7,6 +7,7 @@
     { "name": "DevType", "commit": "782a53424f646b49d4660a0c06981d55bbccfcac", "languages": ["swift"] },
     { "name": "ChronosFlow", "commit": "b7a23d41c02e4e8cb88a9c6e4c96dc2c1ed2cdc4", "languages": ["kotlin", "swift"] }
   ],
+  "_comment_floors": "recall_floors_percent: the E3 baseline (the 2026-10-09 audit measurement minus two points), held as a no-regression ratchet against the previous record row. recall_targets_percent: what each language card claims, gated absolutely - below target or unmeasured fails. A floor rises only in the change that measures it; neither may be lowered (no_recall_floor_or_card_target_is_ever_lowered).",
   "recall_floors_percent": {
     "go": 88,
     "python": 78,
@@ -15,5 +16,25 @@
     "rust_non_self": 46,
     "swift": 80,
     "kotlin": 60
-  }
+  },
+  "recall_targets_percent": {
+    "go": 95,
+    "python": 88,
+    "typescript": 85,
+    "rust_free_self": 95,
+    "rust_non_self": 75,
+    "swift": 90,
+    "kotlin": 85
+  },
+  "_comment_must_include": "A record row counts only when measured by a DevMap that contains every commit below: S2 (bare-name rung only with no other evidence, AmbiguousGlobal ledger-only) and the merge of each language lane. The runner refuses to run otherwise and stamps the list into each measurement as includes_commits; a row without it is reported stale in record.json open_gates.",
+  "record_must_include": [
+    { "commit": "d0552ae16cc969a98d2055bd90efba473306c278", "what": "S2 resolver: bare-name rung only with no other evidence, AmbiguousGlobal ledger-only" },
+    { "commit": "12dbea1b41fa77041e60015241593e0af85a86ce", "what": "merge hx/w6-resolver (S2)" },
+    { "commit": "c741fb54d97577a1e035daf70d82138cbbd24897", "what": "merge hx/w6-lrust" },
+    { "commit": "f302675b4aec6cc0ffa870a0126c15585681835a", "what": "merge hx/w6-lgo" },
+    { "commit": "c06a3ca813aa7e6c81fdc084c4947df418192312", "what": "merge hx/w6-lts" },
+    { "commit": "b738ea6fb4039c3ebe003316d62b16860159c2d1", "what": "merge hx/w6-lpy" },
+    { "commit": "3e29ccba2b3f7cfe4d56f1808d8f6d445efaeca9", "what": "merge hx/w6-lswift" },
+    { "commit": "5a990463dd61464d9721dffc973acaae9f95c8e4", "what": "merge hx/w6-lkotlin" }
+  ]
 }

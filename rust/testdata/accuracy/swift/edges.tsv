@@ -10,6 +10,7 @@
 #   kind      edge   = a Calls/References/Instantiates/Extends/Implements/... edge, any tier
 #             import = an Imports edge between the two files
 #             forbid = NO edge of any kind at confidence >= 0.9 may join caller and callee
+#             forbid_any_tier = NO use edge at any confidence may join them ("no edge of any tier")
 #   level     must   = a correct resolver has this edge
 #             should = the audit accepted an honest miss or an alternative here
 #   ledger    optional `a|b` bare names a ledger row may carry when the expected callee's
@@ -84,9 +85,9 @@ sw.M2c	M2	micro/Sources/M/B.swift::Host.methodDot	micro/Sources/M/B.swift::Gauge
 sw.M2d	M2	micro/Sources/M/B.swift::freeEnumCase	micro/Sources/M/B.swift::Kind.area	edge	must		annotated local enum
 sw.M3	M3	micro/Sources/M/B.swift::multiDecl	micro/Sources/M/B.swift::Gauge.bump	edge	must		receiver is g, not a.bump() + g
 sw.M4a	M4	micro/Sources/M/C.swift::usesLocal	micro/Sources/M/C.swift::Beta.run	edge	must		local typed by call result of external()
-sw.M4b	M4	micro/Sources/M/C.swift::usesLocal	micro/Sources/M/C.swift::Alpha.run	forbid	must		param s: Alpha in another function must not type the local s
+sw.M4b	M4	micro/Sources/M/C.swift::usesLocal	micro/Sources/M/C.swift::Alpha.run	forbid_any_tier	must		param s: Alpha in another function must not type the local s
 sw.M4c	M4	micro/Sources/M/C.swift::usesClosure	micro/Sources/M/C.swift::Beta.run	edge	must		closure param typed by element type
-sw.M4d	M4	micro/Sources/M/C.swift::usesClosure	micro/Sources/M/C.swift::Alpha.run	forbid	must		must not bind to Alpha.run
+sw.M4d	M4	micro/Sources/M/C.swift::usesClosure	micro/Sources/M/C.swift::Alpha.run	forbid_any_tier	must		must not bind to Alpha.run
 sw.M5	M5	micro/Sources/M/A.swift::ctorChain	micro/Sources/M/A.swift::Meter.bump	edge	must		Meter(v: 1).bump() typed by constructor
 sw.P1	P1	spm/Sources/Core/PrivateReach.swift::Holder.drive	spm/Sources/Core/PrivateReach.swift::Meter.<+>	edge	must		custom operator use
 sw.P2	P2	spm/Sources/Core/PrivateReach.swift::Holder.drive	spm/Sources/Core/PrivateReach.swift::Meter.privBump	edge	must		annotated local let m: Meter = .zero
