@@ -42,6 +42,10 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             "a_subprocess_is_bounded_in_time_and_bytes",
             "an_unreadable_subtree_is_a_hole_not_a_dead_build",
             "cache_tag_security",
+            // Manifest parsing only (`gomod.rs`'s Cargo reader). Verified with
+            // `cargo check -p devmap-extract --no-default-features --all-targets`
+            // and run feature-off (4 passed).
+            "cargo_manifests_collect",
             "discovery_stays_inside_the_root",
             "global_excludes_are_one_rule",
             "ignore_rule_tolerance",
