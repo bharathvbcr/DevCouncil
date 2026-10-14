@@ -167,7 +167,12 @@ pub(crate) fn run(
         Store::lock_writer_at(&cli.db(), Store::WRITER_LOCK_WAIT)
     })?;
     let store = progress.timed("store:open", || Store::open(cli.db()))?;
-    store.bind_repo_root(path)?;
+    if let Some(previous) = store.bind_repo_root(path)? {
+        progress.note(format_args!(
+            "store rebound from {previous:?}, which no longer exists, to {}",
+            path.display()
+        ));
+    }
     // A store this process can only read opens fine — queries need it
     // to — and would otherwise fail at the first write with a bare
     // SQLite code, after paying for the whole scan. Refuse before the
@@ -405,7 +410,18 @@ pub(crate) fn run(
     // the cost of an FNV pass instead of 1,311 store round-trips.
     let previous = progress.timed("scan:previous_hashes", || store.latest_file_hashes())?;
     let file_delta = scanned.file_delta(&previous);
+    // The latest generation has to describe *this* root as well as these
+    // bytes. A store rebound after the repository moved still holds a
+    // generation stamped with the old root, and every reader that walks the
+    // tree (`status`'s freshness check, the manifest) resolves against that
+    // stamp — so equal hashes there are not "up to date", and the skip
+    // would leave the store pointing at a directory that is gone.
+    let generation_root_matches = match path.canonicalize() {
+        Ok(canonical) => store.latest_repo_root()?.as_deref() == canonical.to_str(),
+        Err(_) => false,
+    };
     if !*full
+        && generation_root_matches
         && !previous.is_empty()
         && previous.len() == scanned.sources.len()
         && store.latest_generation_payload_is_current()?

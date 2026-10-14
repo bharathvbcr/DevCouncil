@@ -231,6 +231,69 @@ fn an_absolute_home_cannot_alias_two_worktrees() {
     fs::remove_dir_all(scratch).unwrap();
 }
 
+/// The repo-local store moves with the repository. Before the rebind the
+/// store answered every command at the new location with "belongs to
+/// worktree <old path>", a path that no longer existed, and told the operator
+/// to use a separate `--db` — a remedy that does not apply to a store that
+/// lives inside the repository.
+#[test]
+fn a_moved_repository_rebuilds_its_repo_local_store_in_place() {
+    use devmap_extract::subprocess::{run_bounded, Bounds};
+    use std::time::Duration;
+    let scratch = temp_root("moved-repo");
+    let a = scratch.join("a");
+    let b = scratch.join("b");
+    fs::create_dir(&a).unwrap();
+    fs::write(a.join("source.py"), "def moved_owner():\n    return 1\n").unwrap();
+    let invoke = |root: &std::path::Path, args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_devmap"));
+        command
+            .current_dir(root)
+            .env_remove("DEVMAP_HOME")
+            .env("DEVMAP_AUTOSPAWN", "0")
+            .args(args);
+        let output = run_bounded(
+            &mut command,
+            Bounds {
+                deadline: Duration::from_secs(60),
+                stdout_cap: 1024 * 1024,
+                stderr_cap: 64 * 1024,
+            },
+        )
+        .unwrap();
+        assert!(!output.stdout_truncated && !output.stderr_truncated);
+        output
+    };
+    let built = invoke(&a, &["build", ".", "--json"]);
+    assert!(built.status.success(), "{}", built.stderr_trimmed());
+    fs::rename(&a, &b).unwrap();
+
+    let stale = invoke(&b, &["status", "--json"]);
+    assert!(
+        !stale.status.success(),
+        "status read a store bound elsewhere"
+    );
+    assert!(
+        stale.stderr_trimmed().contains("devmap build"),
+        "a reader must name the remedy for a moved store: {}",
+        stale.stderr_trimmed()
+    );
+
+    let rebuilt = invoke(&b, &["build", ".", "--json"]);
+    assert!(rebuilt.status.success(), "{}", rebuilt.stderr_trimmed());
+    let status = invoke(&b, &["status", "--json"]);
+    assert!(status.status.success(), "{}", status.stderr_trimmed());
+    let payload: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    // Freshness is verified by scanning the generation's recorded root; it can
+    // only come back `true` when that root is the new location.
+    assert_eq!(payload["source_freshness"], true, "{payload}");
+    let found = invoke(&b, &["search", "moved_owner", "--json"]);
+    assert!(found.status.success(), "{}", found.stderr_trimmed());
+    let found: serde_json::Value = serde_json::from_slice(&found.stdout).unwrap();
+    assert_eq!(found["total"], 1);
+    fs::remove_dir_all(scratch).unwrap();
+}
+
 #[test]
 fn navigation_from_a_nested_directory_uses_its_worktree_map() {
     use devmap_extract::subprocess::{run_bounded, Bounds};

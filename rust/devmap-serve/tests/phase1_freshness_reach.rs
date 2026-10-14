@@ -244,6 +244,118 @@ async fn concurrent_status_while_store_deleted_mid_session_fails_closed() {
     );
 }
 
+/// Write `count` generations into a fresh store at `root`'s store path, so a
+/// store can be told apart from its replacement by its latest generation id.
+fn build_store_with_generations(root: &Path, count: u32) -> PathBuf {
+    let store_path = devmap_extract::paths::store_path(root);
+    std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+    let extraction = devmap_extract::extract_file("core.py", "def helper():\n    return 1\n");
+    let extractions = vec![extraction];
+    let mut resolver = devmap_resolve::Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
+    let analysis = devmap_analyze::analyze(&extractions, &resolution);
+    let store = Store::open(&store_path).expect("create store");
+    for _ in 0..count {
+        store
+            .save_generation(&extractions, &resolution, &analysis)
+            .expect("generation");
+    }
+    store_path
+}
+
+/// The slot modes a store can be reached through, each with how one MCP call
+/// opens it. Canonical roots so the cache key is the path itself — the
+/// spelling under which the stale-hit was reachable.
+fn slot_modes(root: &Path) -> Vec<(&'static str, Arc<StoreSlot>, Option<String>)> {
+    let store_path = devmap_extract::paths::store_path(root);
+    vec![
+        ("pinned", Arc::new(StoreSlot::new(store_path)), None),
+        (
+            "cwd",
+            Arc::new(StoreSlot::resolving(None, root.to_path_buf(), None)),
+            None,
+        ),
+        (
+            "root pin",
+            Arc::new(StoreSlot::resolving(
+                None,
+                scratch("rebuilt-elsewhere"),
+                Some(root.to_path_buf()),
+            )),
+            None,
+        ),
+        (
+            "repo_path",
+            Arc::new(StoreSlot::resolving(None, scratch("rebuilt-cwd"), None)),
+            Some(root.display().to_string()),
+        ),
+    ]
+}
+
+fn open_generation(slot: &StoreSlot, repo_path: Option<&str>) -> Result<Option<u32>, String> {
+    let (store, _) = slot.open_for_call(repo_path)?;
+    store
+        .latest_generation_id()
+        .map_err(|error| error.to_string())
+}
+
+/// `rm -rf .devmap && devmap build` is the documented quarantine remedy. A
+/// long-lived MCP process kept its connection to the unlinked inode and went
+/// on answering from that store's last generation on every slot mode.
+#[test]
+#[cfg(unix)]
+fn a_store_rebuilt_at_the_same_path_is_reopened_on_every_slot_mode() {
+    let root = scratch("rebuilt").canonicalize().unwrap();
+    for (mode, slot, repo_path) in slot_modes(&root) {
+        let store_path = build_store_with_generations(&root, 3);
+        assert_eq!(
+            open_generation(&slot, repo_path.as_deref()),
+            Ok(Some(3)),
+            "{mode}: the original store"
+        );
+        let state_dir = store_path.parent().unwrap().parent().unwrap();
+        std::fs::remove_dir_all(state_dir).unwrap();
+        build_store_with_generations(&root, 1);
+        assert_eq!(
+            open_generation(&slot, repo_path.as_deref()),
+            Ok(Some(1)),
+            "{mode}: the next call must answer from the rebuilt store, not the unlinked one"
+        );
+        std::fs::remove_dir_all(state_dir).unwrap();
+    }
+}
+
+/// `--db` pins a path, and nothing on the way to the cache looked at it, so a
+/// store deleted under a pinned server kept answering from the unlinked file.
+#[test]
+#[cfg(unix)]
+fn a_pinned_store_unlinked_with_no_replacement_explains_its_absence() {
+    let root = scratch("pinned-gone").canonicalize().unwrap();
+    let store_path = build_store_with_generations(&root, 1);
+    let slot = StoreSlot::new(store_path.clone());
+    assert_eq!(open_generation(&slot, None), Ok(Some(1)));
+    std::fs::remove_file(&store_path).unwrap();
+    let error = open_generation(&slot, None).expect_err("a vanished store must not answer");
+    assert!(error.contains("no devmap index"), "{error}");
+}
+
+/// The identity check must not turn into a reopen per call: an unchanged
+/// store is served from the same open handle.
+#[test]
+fn an_unchanged_store_is_served_from_the_same_handle() {
+    let root = scratch("steady").canonicalize().unwrap();
+    build_store_with_generations(&root, 1);
+    for (mode, slot, repo_path) in slot_modes(&root) {
+        let (first, _) = slot.open_for_call(repo_path.as_deref()).unwrap();
+        let (second, _) = slot.open_for_call(repo_path.as_deref()).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "{mode}: reopened an unchanged store"
+        );
+    }
+}
+
 #[tokio::test]
 async fn oversized_roots_list_is_capped_in_resolve() {
     let cwd = scratch("big-roots-cwd");

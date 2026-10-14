@@ -10,7 +10,8 @@
 //! Environment: `DEVMAP_BIN` (default `$CARGO_TARGET_DIR/release/devmap`, else
 //! the workspace's `target/release/devmap`), `SOAK_CSV`, `SOAK_TOLERANCE_PCT`
 //! (10), `SOAK_SETTLE_SECONDS` (45, 1..300), `SOAK_SHUTDOWN_SECONDS` (10,
-//! 1..30), `TMPDIR` for the daemon's socket.
+//! 1..30), `SOAK_IDLE_SECONDS` (35, 1..600: the daemon-mode idle stretch its
+//! disk writes are judged over), `TMPDIR` for the daemon's socket.
 //!
 //! Exit codes: 0 the soak passed · 1 it failed, or a check could not run ·
 //! 2 usage.
@@ -41,7 +42,7 @@ mod soak {
     use devmap_soak::daemon::{self, Daemon, Identity};
     use devmap_soak::query::{admit, Mode, Observation, Transport};
     use devmap_soak::samples::{assert_plateau, Sample, Samples};
-    use devmap_soak::{ipc, rss, store, Cleanup};
+    use devmap_soak::{diskio, ipc, rss, store, Cleanup};
 
     struct Config {
         root: PathBuf,
@@ -53,6 +54,7 @@ mod soak {
         devmap: PathBuf,
         csv: PathBuf,
         tolerance: u64,
+        idle: Duration,
     }
 
     enum Refusal {
@@ -125,6 +127,7 @@ mod soak {
         let settle = bounded("SOAK_SETTLE_SECONDS", 45, 1, 300)?;
         let shutdown = bounded("SOAK_SHUTDOWN_SECONDS", 10, 1, 30)?;
         let tolerance = bounded("SOAK_TOLERANCE_PCT", 10, 0, 1000)?;
+        let idle = bounded("SOAK_IDLE_SECONDS", 35, 1, 600)?;
         let devmap = absolute(
             std::env::var_os("DEVMAP_BIN")
                 .filter(|v| !v.is_empty())
@@ -147,6 +150,7 @@ mod soak {
             devmap,
             csv,
             tolerance,
+            idle: Duration::from_secs(idle),
         })
     }
 
@@ -492,6 +496,92 @@ mod soak {
         false
     }
 
+    /// Hold the daemon to its disk-write budget: an idle stretch with no edits
+    /// must write (almost) nothing, and no window of the whole run may average
+    /// more than the sustained rate. Prints every number it judged; true when
+    /// the daemon stayed within both.
+    fn judge_disk_writes(
+        sampler: diskio::Sampler,
+        counters: &dyn Fn() -> Option<diskio::WriteCounters>,
+        cycle_bytes: &[u64],
+        idle: Duration,
+        store_bytes: u64,
+        out: &mut dyn Write,
+    ) -> bool {
+        let mut ok = true;
+        if let Some(max) = cycle_bytes.iter().max() {
+            let mean = cycle_bytes.iter().sum::<u64>() / cycle_bytes.len() as u64;
+            let _ = writeln!(
+                out,
+                "daemon disk writes per edit cycle (two drains): mean {mean} max {max} bytes; \
+                 store {store_bytes} bytes"
+            );
+        }
+        let before = counters();
+        std::thread::sleep(idle);
+        let after = counters();
+        match diskio::judge_idle(before, after) {
+            diskio::IdleVerdict::Within(bytes) => {
+                let _ = writeln!(
+                    out,
+                    "daemon idle disk writes: {bytes} bytes over {idle:?} (bound {} bytes)",
+                    diskio::IDLE_MAX_BYTES
+                );
+            }
+            diskio::IdleVerdict::Over(bytes) => {
+                let _ = writeln!(
+                    out,
+                    "SOAK FAIL: the idle daemon wrote {bytes} bytes over {idle:?} with no edit to \
+                     index, over the {} byte bound",
+                    diskio::IDLE_MAX_BYTES
+                );
+                ok = false;
+            }
+            diskio::IdleVerdict::Unreadable => {
+                let _ = writeln!(
+                    out,
+                    "SOAK FAIL: the daemon's disk-write counters could not be read across the \
+                     idle stretch"
+                );
+                ok = false;
+            }
+        }
+        let (readings, ended) = sampler.finish();
+        if let Some(why) = ended {
+            let _ = writeln!(out, "SOAK FAIL: disk-write sampling ended early: {why}");
+            ok = false;
+        }
+        let budget = diskio::Budget::default();
+        match diskio::judge(&readings, budget) {
+            diskio::Verdict::Within(w) => {
+                let _ = writeln!(
+                    out,
+                    "daemon disk-write rate: worst {:?} window {:.2} MiB/s, budget {} MiB/s",
+                    budget.window,
+                    diskio::mib_per_s(w.rate),
+                    budget.rate >> 20
+                );
+            }
+            diskio::Verdict::Over(w) => {
+                let _ = writeln!(
+                    out,
+                    "SOAK FAIL: the daemon wrote {} bytes in {:.0} s ({:.2} MiB/s), over the {} \
+                     MiB/s sustained budget",
+                    w.bytes,
+                    (w.to - w.from).as_secs_f64(),
+                    diskio::mib_per_s(w.rate),
+                    budget.rate >> 20
+                );
+                ok = false;
+            }
+            diskio::Verdict::NotRun(why) => {
+                let _ = writeln!(out, "SOAK FAIL: disk-write rate NOT RUN: {why}");
+                ok = false;
+            }
+        }
+        ok
+    }
+
     fn lock(cleanup: &Arc<Mutex<Cleanup>>) -> std::sync::MutexGuard<'_, Cleanup> {
         cleanup
             .lock()
@@ -608,6 +698,23 @@ mod soak {
             return Err(1);
         };
 
+        // The daemon's disk writes, sampled for the whole run. On a platform
+        // with a counter, a sampler that cannot start is a failed soak; only a
+        // platform with none skips the budget, and says so.
+        let disk = match diskio::Sampler::start(serve_pid) {
+            Ok(sampler) => Some(sampler),
+            Err(why) if diskio::PLATFORM_SAMPLES => {
+                let _ = writeln!(out, "SOAK FAIL: {why}");
+                return Err(1);
+            }
+            Err(why) => {
+                let _ = writeln!(out, "SOAK DISK-WRITES NOT RUN: {why}");
+                None
+            }
+        };
+        let counters = || dc_proc::diskio::write_counters(serve_pid).ok();
+        let mut cycle_bytes: Vec<u64> = Vec::new();
+
         let relative = corpus.relative.as_str();
         let ask = |frame: &str, mode: Mode, name: &str| match ipc::exchange(&endpoint, frame) {
             Ok(reply) => admit(Transport::Ipc, mode, name, relative, &reply),
@@ -630,6 +737,7 @@ mod soak {
         let mut fails = false;
         for i in 1..=cfg.cycles {
             let name = format!("_soak_{i}");
+            let cycle_start = counters();
             // An OK envelope does not prove the edit was indexed. Keep the
             // edited bytes in place until the exact symbol/file and freshness
             // are observed.
@@ -656,6 +764,9 @@ mod soak {
                 let _ = writeln!(out, "SOAK FAIL: removed symbol cycle {i}");
                 fails = true;
                 break;
+            }
+            if let (Some(from), Some(to)) = (cycle_start, counters()) {
+                cycle_bytes.push(to.logical_bytes.saturating_sub(from.logical_bytes));
             }
             let rss = Command::new("ps")
                 .args(["-o", "rss=", "-p", &serve_pid.to_string()])
@@ -720,6 +831,16 @@ mod soak {
                 let _ = writeln!(out, "SOAK FAIL: final restore did not become current");
                 fails = true;
             }
+        }
+        if let Some(sampler) = disk {
+            fails |= !judge_disk_writes(
+                sampler,
+                &counters,
+                &cycle_bytes,
+                cfg.idle,
+                store::bytes(store_path),
+                out,
+            );
         }
         if !fails {
             match store::digest(store_path) {

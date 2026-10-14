@@ -255,8 +255,16 @@ pub struct Daemon {
     /// say — and the store half of [`Daemon::vanished_reason`] is then skipped
     /// rather than guessed at. A guess here retires a working daemon.
     store_path: Option<std::path::PathBuf>,
+    /// Bytes per second of disk writes the drain loop paces itself to. See
+    /// [`DEFAULT_DRAIN_WRITE_BUDGET`].
+    drain_write_budget: u64,
     #[cfg(test)]
     connect_time_probe: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Stands in for the process's write counter, so a test can state what a
+    /// drain wrote instead of depending on what other tests in the same
+    /// process happen to be writing.
+    #[cfg(test)]
+    write_meter: Option<Arc<dyn Fn() -> Option<u64> + Send + Sync>>,
 }
 
 /// What one drain established about git HEAD, from one reading of it.
@@ -389,6 +397,47 @@ pub const DEFAULT_DRAIN_BATCH_LIMIT: usize = 8192;
 /// one tree walk a minute rather than one per tick.
 const RESWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
+/// The sustained disk-write rate the drain loop holds itself to: 4 MiB/s.
+///
+/// A drain that changes one file still writes a whole generation. Every
+/// generation carries its own copy of the node, full-text and literal rows for
+/// the entire tree, and the prune that follows deletes the oldest copy, so the
+/// bytes a drain writes scale with the *repository*, not with the edit.
+/// Measured with the soak's sampler (`rust/tools/soak`, `--daemon`) on a
+/// 125-file corpus with a 40 MB store: 43 MB of logical writes per edit cycle
+/// of two one-line drains, ~21.5 MB per drain, about half the store each time.
+///
+/// Nothing bounded how often that happened. The loop drained whenever the
+/// queue held anything, so an agent editing a file every second or two drove
+/// a store-sized write every second or two, for as long as the session lasted.
+/// That is the shape macOS reported: a `devmap` process dirtying 549.76 GB of
+/// file-backed memory over 4,281 s (128 MB/s) on a repository whose store is
+/// hundreds of megabytes — a few hundred megabytes a drain, a drain every few
+/// seconds.
+///
+/// So the loop now spends a write budget. After a drain it measures what the
+/// process wrote and waits `bytes / budget` before the next one; edits that
+/// arrive meanwhile wait in the durable queue and are taken together, so a
+/// burst of edits becomes one generation instead of one each. 4 MiB/s keeps a
+/// daemon under the 6.36 MB/s that macOS's 24-hour disk-writes monitor
+/// reports at, and costs nothing on a quiet tree: an idle daemon writes
+/// nothing to pay for, and a drain that only restamps pays for kilobytes.
+pub const DEFAULT_DRAIN_WRITE_BUDGET: u64 = 4 * 1024 * 1024;
+
+/// The longest one drain's writes can delay the next. A store large enough to
+/// earn more than this is still paced to a duty cycle, and the map is never
+/// more than this far behind a burst of edits.
+const MAX_DRAIN_PAUSE: Duration = Duration::from_secs(120);
+
+/// How long the drain loop waits after a drain that wrote `bytes`, to hold
+/// `budget` bytes per second.
+fn drain_pause(bytes: u64, budget: u64) -> Duration {
+    // Capped before the conversion: `from_secs_f64` panics past `Duration`'s
+    // range, and a counter is not a value to trust with a panic.
+    let seconds = (bytes as f64 / budget.max(1) as f64).min(MAX_DRAIN_PAUSE.as_secs_f64());
+    Duration::from_secs_f64(seconds)
+}
+
 impl Daemon {
     pub fn new(store: Store, root: std::path::PathBuf) -> Self {
         let ipc_path = default_ipc_path_for(&root);
@@ -408,9 +457,33 @@ impl Daemon {
             // way.
             serving: Arc::new(tokio::sync::watch::channel(false).0),
             store_path: None,
+            drain_write_budget: DEFAULT_DRAIN_WRITE_BUDGET,
             #[cfg(test)]
             connect_time_probe: None,
+            #[cfg(test)]
+            write_meter: None,
         }
+    }
+
+    /// Pace the drain loop to `bytes_per_second` of disk writes instead of
+    /// [`DEFAULT_DRAIN_WRITE_BUDGET`]. Never below one byte per second: a
+    /// zero budget would divide by zero or, read as "unlimited", switch the
+    /// pacing off, and this is a bound, not a toggle.
+    pub fn with_drain_write_budget(mut self, bytes_per_second: u64) -> Self {
+        self.drain_write_budget = bytes_per_second.max(1);
+        self
+    }
+
+    /// Logical bytes this process has written so far, or `None` where the
+    /// platform has no counter.
+    fn written_bytes(&self) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(meter) = &self.write_meter {
+            return meter();
+        }
+        dc_proc::diskio::write_counters(std::process::id())
+            .ok()
+            .map(|counters| counters.logical_bytes)
     }
 
     /// Tell the daemon which file its store lives in, so it can notice the file
@@ -736,6 +809,17 @@ impl Daemon {
             );
         }
 
+        // The key this name is stored under, decided before anything else, as
+        // the cold walk decides it. A pending entry is a `&str`, so the name is
+        // UTF-8, and it is inside the root (checked above); what can still be
+        // refused is a name no key spells without colliding — `src/a\b.py` on
+        // Unix — and that is answered, not retried.
+        let relative = match stored_path(root, &candidate)? {
+            StoredKey::Key(key) => key,
+            StoredKey::Refused { name, reason } => {
+                return refused_name_delta(&candidate, name, reason);
+            }
+        };
         let mut delta = PendingDelta::default();
         // What the cold walk makes of this path, at the one owner
         // (`devmap_extract::candidate_kind`). Asked before `is_dir()`, which
@@ -750,7 +834,6 @@ impl Daemon {
             // stopped writing in the generation, so the graph went on claiming
             // symbols for a file outside the repository.
             devmap_extract::CandidateKind::Refused(reason) => {
-                let relative = stored_path(root, &candidate)?;
                 warn!(
                     "changed source {relative:?} is {reason}; removing its rows, as a \
                      full build of this tree would, and charging the refusal to coverage"
@@ -771,7 +854,6 @@ impl Daemon {
             // affected with no extraction and no deletion is what the store
             // refuses as a silent drop.
             devmap_extract::CandidateKind::LinkedDirectory => {
-                let relative = stored_path(root, &candidate)?;
                 let under = format!("{relative}/");
                 for extraction in previous {
                     if extraction.file_path.starts_with(&under) {
@@ -792,7 +874,6 @@ impl Daemon {
             // CLI build of the same tree dropped the rows and called itself
             // fresh. Both now drop the rows and list the file.
             devmap_extract::CandidateKind::File { bytes } if bytes > MAX_SOURCE_BYTES => {
-                let relative = stored_path(root, &candidate)?;
                 let reason = DiscoverySkipReason::Oversized {
                     bytes,
                     limit: MAX_SOURCE_BYTES,
@@ -817,7 +898,14 @@ impl Daemon {
             if !canonical.starts_with(root) {
                 anyhow::bail!("watched directory resolves outside daemon root: {canonical:?}");
             }
-            let directory_prefix = stored_path(root, &canonical)?;
+            // The canonical spelling can differ from the queued one through a
+            // linked component, so its name is asked again, by the same rule.
+            let directory_prefix = match stored_path(root, &canonical)? {
+                StoredKey::Key(key) => key,
+                StoredKey::Refused { name, reason } => {
+                    return refused_name_delta(&canonical, name, reason);
+                }
+            };
             let prefix = if directory_prefix.is_empty() {
                 String::new()
             } else {
@@ -900,7 +988,6 @@ impl Daemon {
             return Ok(delta);
         }
 
-        let relative = stored_path(root, &candidate)?;
         delta.affected.insert(relative.clone());
         // `Path::exists()` collapses *every* stat failure into `false`, not
         // just "no such file": a symlink loop (`ELOOP`), a parent that lost
@@ -1071,7 +1158,12 @@ impl Daemon {
         // at persistence lets a competing build replace the base generation
         // after this drain has read it, invalidating its carry-forward.
         let _writer = self.store.lock_writer(Store::WRITER_LOCK_WAIT)?;
-        self.store.bind_repo_root(&self.root)?;
+        if let Some(previous) = self.store.bind_repo_root(&self.root)? {
+            info!(
+                "store rebound from {previous:?}, which no longer exists, to {}",
+                self.root.display()
+            );
+        }
         let claims = self.store.claim_pending_batch(self.batch_limit)?;
         if claims.is_empty() {
             return Ok(0);
@@ -1487,7 +1579,12 @@ impl Daemon {
     /// gave up and killed the daemon it had just spawned after three seconds,
     /// then fell back to re-doing the work through the CLI, on every call.
     pub async fn run_loop(&self) -> anyhow::Result<()> {
-        self.store.bind_repo_root(&self.root)?;
+        if let Some(previous) = self.store.bind_repo_root(&self.root)? {
+            info!(
+                "store rebound from {previous:?}, which no longer exists, to {}",
+                self.root.display()
+            );
+        }
         // Captured *first*, before the IPC endpoint binds, because the window
         // between binding and here is not empty: `reconcile_connect_time`
         // sweeps the tree in it, which on a large repository is seconds during
@@ -1668,6 +1765,7 @@ impl Daemon {
             .checked_sub(RESWEEP_INTERVAL)
             .unwrap_or_else(std::time::Instant::now);
         let mut consecutive_failures = 0u32;
+        let mut warned_unmetered = false;
         let mut next_attempt = tokio::time::Instant::now();
         // An untouched activity record means no consumer ever spoke to this
         // daemon — idle time runs from loop start, not from zero. That is the
@@ -1843,6 +1941,8 @@ impl Daemon {
                     if tokio::time::Instant::now() < next_attempt {
                         continue;
                     }
+                    let written_before = self.written_bytes();
+                    let drain_started = std::time::Instant::now();
                     let worker = self.clone();
                     let drain_result = tokio::task::spawn_blocking(move || {
                         worker.drain_pending_batch()
@@ -1850,6 +1950,39 @@ impl Daemon {
                     .await
                     .map_err(|error| anyhow::anyhow!("pending drain task failed: {error}"))
                     .and_then(|result| result);
+                    // Charge the drain's writes against the budget, whatever it
+                    // returned: a generation write that failed and rolled back
+                    // still wrote its WAL frames. See
+                    // [`DEFAULT_DRAIN_WRITE_BUDGET`].
+                    let pause = match (written_before, self.written_bytes()) {
+                        (Some(before), Some(after)) => {
+                            let wrote = after.saturating_sub(before);
+                            let pause = drain_pause(wrote, self.drain_write_budget);
+                            if pause >= Duration::from_secs(1) {
+                                info!(
+                                    "drain wrote {wrote} bytes; next drain in {pause:?} to hold \
+                                     {} bytes/s of disk writes",
+                                    self.drain_write_budget
+                                );
+                            }
+                            pause
+                        }
+                        // No counter on this platform, or it could not be read:
+                        // the writes are unmeasured, not zero. Pace by the time
+                        // the drain took instead, which holds the loop to at most
+                        // half its time spent writing, and say so once.
+                        _ => {
+                            if !warned_unmetered {
+                                warned_unmetered = true;
+                                warn!(
+                                    "this process's disk-write counter cannot be read; pacing \
+                                     drains by their duration instead of the bytes they write"
+                                );
+                            }
+                            drain_started.elapsed().min(MAX_DRAIN_PAUSE)
+                        }
+                    };
+                    next_attempt = tokio::time::Instant::now() + pause;
                     match drain_result {
                         Ok(0) => consecutive_failures = 0,
                         Ok(n) => {
@@ -1871,7 +2004,7 @@ impl Daemon {
                             }
                             consecutive_failures = consecutive_failures.saturating_add(1);
                             let exponent = consecutive_failures.saturating_sub(1).min(6);
-                            let delay = Duration::from_secs(1u64 << exponent);
+                            let delay = Duration::from_secs(1u64 << exponent).max(pause);
                             next_attempt = tokio::time::Instant::now() + delay;
                             warn!(
                                 "pending drain failed (attempt {consecutive_failures}; retry in {delay:?}): {err}"
@@ -2099,7 +2232,10 @@ fn should_resweep(
 /// after `MAX_PENDING_ATTEMPTS`, a place in `degraded_reason` — which is the
 /// honest end state for a path this kernel cannot index, and the one
 /// `collect_sources_with_report` already gives it on the build path.
-fn stored_path(root: &std::path::Path, candidate: &std::path::Path) -> anyhow::Result<String> {
+///
+/// A name no key can spell without colliding is answered as
+/// [`StoredKey::Refused`], not folded: see [`repo_relative_key`].
+fn stored_path(root: &std::path::Path, candidate: &std::path::Path) -> anyhow::Result<StoredKey> {
     let relative = candidate
         .strip_prefix(root)
         .map_err(|_| anyhow::anyhow!("path {:?} is outside daemon root {:?}", candidate, root))?;
@@ -2111,7 +2247,97 @@ fn stored_path(root: &std::path::Path, candidate: &std::path::Path) -> anyhow::R
             root
         )
     })?;
-    Ok(relative.replace('\\', "/"))
+    Ok(match repo_relative_key(relative) {
+        Ok(key) => StoredKey::Key(key),
+        Err(reason) => StoredKey::Refused {
+            name: relative.to_string(),
+            reason,
+        },
+    })
+}
+
+/// What [`stored_path`] makes of a name.
+#[derive(Debug, PartialEq, Eq)]
+enum StoredKey {
+    /// The repo-relative key the name is stored under.
+    Key(String),
+    /// A name discovery refuses, spelled as it is on disk, with the reason.
+    /// A settled fact about the name, not a failed attempt: no retry renames
+    /// the file.
+    Refused { name: String, reason: &'static str },
+}
+
+const BACKSLASH_NAME_REFUSAL: &str =
+    "a backslash in a file name is a path separator on Windows, so this name cannot be \
+     stored without colliding with a real path; refused";
+
+/// The key a repo-relative name is stored under: `/`-separated, spelled the
+/// same on every host.
+///
+/// On Windows `\` is the separator and is folded to `/`. Everywhere else it is
+/// an ordinary byte of a name, and folding it made `src/a\b.py` the key of the
+/// real `src/a/b.py`: the drain extracted the impostor's bytes over the real
+/// file's rows. Discovery refuses the name (D-5,
+/// `devmap_extract::repo_relative_key`, introduced on a sibling stack); this
+/// is the same rule, with the same wording, for the drain. When the stacks
+/// join it is to become a delegation to that owner, not a second copy.
+fn repo_relative_key(relative: &str) -> Result<String, &'static str> {
+    if cfg!(windows) {
+        return Ok(relative.replace('\\', "/"));
+    }
+    if relative.contains('\\') {
+        return Err(BACKSLASH_NAME_REFUSAL);
+    }
+    Ok(relative.to_string())
+}
+
+/// The delta for a changed name discovery refuses, as a cold build of the tree
+/// would account for it.
+///
+/// The build path checks the name before anything else and lists the refusal
+/// only where a source file was lost — any other name is passed over as a
+/// non-source. Under a refused directory name every path carries the
+/// backslash, so each source under it is listed by its own name. No stored row
+/// is touched: none can be keyed by a refused name, and the row a fold would
+/// have hit belongs to the real path.
+fn refused_name_delta(
+    candidate: &std::path::Path,
+    name: String,
+    reason: &'static str,
+) -> anyhow::Result<PendingDelta> {
+    let mut delta = PendingDelta::default();
+    let metadata = match std::fs::symlink_metadata(candidate) {
+        Ok(metadata) => metadata,
+        // Gone: the build path lists nothing for a name that is not there.
+        Err(error) if path_is_absent(&error) => return Ok(delta),
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context(format!(
+                "cannot determine whether refused name {name:?} still exists"
+            )))
+        }
+    };
+    if metadata.is_dir() {
+        let (sources, discovery) = collect_sources_with_report(candidate)?;
+        let under = sources
+            .iter()
+            .map(|(path, _)| path)
+            .chain(discovery.skipped_paths.iter().map(|(path, _)| path))
+            .filter(|path| is_indexable_source(path));
+        for path in under {
+            delta
+                .refused
+                .insert(format!("{name}/{path}"), reason.to_string());
+        }
+    } else if is_indexable_source(&name) {
+        delta.refused.insert(name, reason.to_string());
+    }
+    for path in delta.refused.keys() {
+        warn!(
+            "changed source {path:?} is refused: {reason}; it is absent from the graph — \
+             this is a refusal, not a clean tree"
+        );
+    }
+    Ok(delta)
 }
 
 #[cfg(test)]
@@ -2781,6 +3007,98 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// On Unix `\` is an ordinary byte of a file name. `stored_path` folded it
+    /// to `/`, so a change to `src/a\b.py` was extracted under the key of the
+    /// real `src/a/b.py` and overwrote that file's rows; a directory named
+    /// `pkg\sub` put its files under `pkg/sub/`. Discovery refuses such a name
+    /// (D-5), so the drain refuses it too — counted in `refused` under the
+    /// name as spelled, the way the build path lists it — and leaves the real
+    /// path's rows alone. A refusal is a settled fact about the name, so it is
+    /// an answer, not an error the queue would retry and quarantine.
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_name_on_unix_is_refused_not_folded_onto_a_real_path() {
+        let (root, daemon) = daemon_with_one_indexed_source("backslash-drain");
+        fs::create_dir_all(root.join("src/a")).unwrap();
+        fs::write(root.join("src/a/b.py"), "def real():\n    return 1\n").unwrap();
+        fs::write(root.join("src/a\\b.py"), "def impostor():\n    return 2\n").unwrap();
+        fs::create_dir_all(root.join("pkg\\sub")).unwrap();
+        fs::write(root.join("pkg\\sub/m.py"), "def m():\n    return 3\n").unwrap();
+        let previous = vec![
+            extract_file("src/a/b.py", "def real():\n    return 1\n"),
+            extract_file("pkg/sub/m.py", "def kept():\n    return 4\n"),
+        ];
+
+        for (pending, refused_as) in [
+            ("src/a\\b.py".to_string(), "src/a\\b.py"),
+            (
+                root.join("src/a\\b.py").to_string_lossy().into_owned(),
+                "src/a\\b.py",
+            ),
+            // A directory: each source under it is refused by its own name,
+            // as the walk from the root lists it.
+            ("pkg\\sub".to_string(), "pkg\\sub/m.py"),
+        ] {
+            let delta = daemon
+                .collect_pending_path(&root, &previous, &pending)
+                .unwrap_or_else(|error| {
+                    panic!("{pending:?}: a refused name is an answer, not a retry: {error}")
+                });
+            assert!(
+                delta.affected.is_empty() && delta.deleted.is_empty(),
+                "{pending:?} must not touch any stored row: affected {:?}, deleted {:?}",
+                delta.affected,
+                delta.deleted
+            );
+            assert!(
+                delta.fresh.is_empty(),
+                "{pending:?} must not be extracted under any key: {:?}",
+                delta
+                    .fresh
+                    .iter()
+                    .map(|extraction| &extraction.file_path)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                delta.refused.keys().collect::<Vec<_>>(),
+                vec![refused_as],
+                "{pending:?} is counted as a refusal under its own spelling"
+            );
+            assert!(
+                delta.refused[refused_as].contains("backslash"),
+                "and the refusal says why: {:?}",
+                delta.refused
+            );
+        }
+
+        // A non-source name is passed over, as the walk passes it over: a hole
+        // is charged only where a source file was lost.
+        fs::write(root.join("notes\\todo.txt"), "later\n").unwrap();
+        let delta = daemon
+            .collect_pending_path(&root, &previous, "notes\\todo.txt")
+            .expect("a refused non-source name is an answer");
+        assert!(
+            delta.affected.is_empty() && delta.fresh.is_empty() && delta.refused.is_empty(),
+            "a non-source name is neither indexed nor charged: {:?}",
+            delta.refused
+        );
+
+        // Positive control: the real path still drains under its own key.
+        let delta = daemon
+            .collect_pending_path(&root, &previous, "src/a/b.py")
+            .expect("the real path is answerable");
+        assert_eq!(
+            delta
+                .fresh
+                .iter()
+                .map(|extraction| extraction.file_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/a/b.py"]
+        );
+        assert!(delta.refused.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// A symlinked directory that never had rows commits beside a real edit,
     /// and drops nothing that is not its own.
     #[cfg(unix)]
@@ -3227,7 +3545,7 @@ mod tests {
         // forward slashes.
         assert_eq!(
             stored_path(root, &root.join("src/cafe.py")).unwrap(),
-            "src/cafe.py"
+            StoredKey::Key("src/cafe.py".to_string())
         );
     }
 
@@ -4922,5 +5240,90 @@ mod tests {
             !read_is_stable(10, 10, Some(now), Some(now), 9),
             "content shorter than the file it came from is a torn read"
         );
+    }
+
+    /// The pause is the bytes over the budget, capped, never negative.
+    #[test]
+    fn a_drain_pause_is_its_writes_over_the_budget_and_capped() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(drain_pause(0, DEFAULT_DRAIN_WRITE_BUDGET), Duration::ZERO);
+        assert_eq!(drain_pause(8 * MIB, 4 * MIB), Duration::from_secs(2));
+        assert_eq!(drain_pause(u64::MAX, 1), MAX_DRAIN_PAUSE);
+        // A zero budget is a bound of one byte a second, not "unlimited".
+        assert_eq!(drain_pause(1, 0), Duration::from_secs(1));
+    }
+
+    /// A drain that wrote waits out its write budget before the next one may
+    /// start, however soon the next edit arrives.
+    ///
+    /// The loop used to drain whenever the queue was non-empty, so each edit
+    /// an agent made bought a whole generation — a write that scales with the
+    /// repository — as fast as edits arrived. That is how a `devmap` process
+    /// came to write 549.76 GB in 71 minutes. Here every drain is metered at
+    /// 16 MiB per generation against an 8 MiB/s budget, so the second may not start
+    /// until two seconds after the first; unpaced it ran one poll later.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drain_that_wrote_waits_out_its_write_budget_before_the_next() {
+        const MIB: u64 = 1024 * 1024;
+        let root = short_unix_fixture_dir("paced").canonicalize().unwrap();
+        fs::write(root.join("a.py"), "def a():\n    return 1\n").unwrap();
+        let socket = root.join("paced.sock");
+        let mut daemon = Daemon::new(Store::open_in_memory().unwrap(), root.clone())
+            .with_ipc_path(socket)
+            .with_idle_poll(Duration::from_millis(20))
+            .with_max_idle(None)
+            .with_drain_write_budget(8 * MIB);
+        // Every generation written is 16 MiB of writes, two seconds of budget;
+        // a drain that wrote none wrote nothing. Read from the store rather
+        // than counted per call, so a poll that found the queue empty is not
+        // charged for a generation it did not write.
+        let generations = Arc::clone(&daemon.store);
+        daemon.write_meter = Some(Arc::new(move || {
+            let written = generations.latest_generation_id().ok()?.unwrap_or(0);
+            Some(u64::from(written) * 16 * MIB)
+        }));
+        let watching = daemon.clone();
+        let mut task = tokio::spawn(async move { daemon.run_loop().await });
+        serving_or_dead(&watching, &mut task).await;
+
+        let store = Arc::clone(&watching.store);
+        let first = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let generation = store.latest_generation_id().unwrap();
+                if generation.is_some() && store.get_pending_paths().unwrap().is_empty() {
+                    return generation;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the connect-time sweep must be drained into a first generation");
+
+        fs::write(root.join("b.py"), "def b():\n    return 2\n").unwrap();
+        let asked = std::time::Instant::now();
+        store
+            .enqueue_pending_paths(&[root.join("b.py").display().to_string()])
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let generation = store.latest_generation_id().unwrap();
+                if generation > first && store.get_pending_paths().unwrap().is_empty() {
+                    return asked.elapsed();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a paced drain must still run once its budget allows");
+        assert!(
+            second >= Duration::from_millis(1500),
+            "the second drain ran {second:?} after it was queued, inside the two seconds \
+             the first drain's 16 MiB earned against an 8 MiB/s budget"
+        );
+
+        watching.request_shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(30), task).await;
+        let _ = fs::remove_dir_all(&root);
     }
 }
