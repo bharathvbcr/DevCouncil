@@ -63,6 +63,8 @@
 //! two fingerprints, churn reports `computed: false` with the reason. Each
 //! caller keeps its contract and gains the bounds.
 
+pub mod diskio;
+
 use std::ffi::OsStr;
 use std::fmt;
 use std::io::Read;

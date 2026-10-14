@@ -15,6 +15,7 @@
 //! sliced shell functions out of the script by string index to test them.
 
 pub mod corpus;
+pub mod diskio;
 pub mod query;
 pub mod rss;
 pub mod samples;

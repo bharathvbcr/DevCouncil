@@ -255,8 +255,16 @@ pub struct Daemon {
     /// say — and the store half of [`Daemon::vanished_reason`] is then skipped
     /// rather than guessed at. A guess here retires a working daemon.
     store_path: Option<std::path::PathBuf>,
+    /// Bytes per second of disk writes the drain loop paces itself to. See
+    /// [`DEFAULT_DRAIN_WRITE_BUDGET`].
+    drain_write_budget: u64,
     #[cfg(test)]
     connect_time_probe: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Stands in for the process's write counter, so a test can state what a
+    /// drain wrote instead of depending on what other tests in the same
+    /// process happen to be writing.
+    #[cfg(test)]
+    write_meter: Option<Arc<dyn Fn() -> Option<u64> + Send + Sync>>,
 }
 
 /// What one drain established about git HEAD, from one reading of it.
@@ -389,6 +397,47 @@ pub const DEFAULT_DRAIN_BATCH_LIMIT: usize = 8192;
 /// one tree walk a minute rather than one per tick.
 const RESWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
+/// The sustained disk-write rate the drain loop holds itself to: 4 MiB/s.
+///
+/// A drain that changes one file still writes a whole generation. Every
+/// generation carries its own copy of the node, full-text and literal rows for
+/// the entire tree, and the prune that follows deletes the oldest copy, so the
+/// bytes a drain writes scale with the *repository*, not with the edit.
+/// Measured with the soak's sampler (`rust/tools/soak`, `--daemon`) on a
+/// 125-file corpus with a 40 MB store: 43 MB of logical writes per edit cycle
+/// of two one-line drains, ~21.5 MB per drain, about half the store each time.
+///
+/// Nothing bounded how often that happened. The loop drained whenever the
+/// queue held anything, so an agent editing a file every second or two drove
+/// a store-sized write every second or two, for as long as the session lasted.
+/// That is the shape macOS reported: a `devmap` process dirtying 549.76 GB of
+/// file-backed memory over 4,281 s (128 MB/s) on a repository whose store is
+/// hundreds of megabytes — a few hundred megabytes a drain, a drain every few
+/// seconds.
+///
+/// So the loop now spends a write budget. After a drain it measures what the
+/// process wrote and waits `bytes / budget` before the next one; edits that
+/// arrive meanwhile wait in the durable queue and are taken together, so a
+/// burst of edits becomes one generation instead of one each. 4 MiB/s keeps a
+/// daemon under the 6.36 MB/s that macOS's 24-hour disk-writes monitor
+/// reports at, and costs nothing on a quiet tree: an idle daemon writes
+/// nothing to pay for, and a drain that only restamps pays for kilobytes.
+pub const DEFAULT_DRAIN_WRITE_BUDGET: u64 = 4 * 1024 * 1024;
+
+/// The longest one drain's writes can delay the next. A store large enough to
+/// earn more than this is still paced to a duty cycle, and the map is never
+/// more than this far behind a burst of edits.
+const MAX_DRAIN_PAUSE: Duration = Duration::from_secs(120);
+
+/// How long the drain loop waits after a drain that wrote `bytes`, to hold
+/// `budget` bytes per second.
+fn drain_pause(bytes: u64, budget: u64) -> Duration {
+    // Capped before the conversion: `from_secs_f64` panics past `Duration`'s
+    // range, and a counter is not a value to trust with a panic.
+    let seconds = (bytes as f64 / budget.max(1) as f64).min(MAX_DRAIN_PAUSE.as_secs_f64());
+    Duration::from_secs_f64(seconds)
+}
+
 impl Daemon {
     pub fn new(store: Store, root: std::path::PathBuf) -> Self {
         let ipc_path = default_ipc_path_for(&root);
@@ -408,9 +457,33 @@ impl Daemon {
             // way.
             serving: Arc::new(tokio::sync::watch::channel(false).0),
             store_path: None,
+            drain_write_budget: DEFAULT_DRAIN_WRITE_BUDGET,
             #[cfg(test)]
             connect_time_probe: None,
+            #[cfg(test)]
+            write_meter: None,
         }
+    }
+
+    /// Pace the drain loop to `bytes_per_second` of disk writes instead of
+    /// [`DEFAULT_DRAIN_WRITE_BUDGET`]. Never below one byte per second: a
+    /// zero budget would divide by zero or, read as "unlimited", switch the
+    /// pacing off, and this is a bound, not a toggle.
+    pub fn with_drain_write_budget(mut self, bytes_per_second: u64) -> Self {
+        self.drain_write_budget = bytes_per_second.max(1);
+        self
+    }
+
+    /// Logical bytes this process has written so far, or `None` where the
+    /// platform has no counter.
+    fn written_bytes(&self) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(meter) = &self.write_meter {
+            return meter();
+        }
+        dc_proc::diskio::write_counters(std::process::id())
+            .ok()
+            .map(|counters| counters.logical_bytes)
     }
 
     /// Tell the daemon which file its store lives in, so it can notice the file
@@ -1668,6 +1741,7 @@ impl Daemon {
             .checked_sub(RESWEEP_INTERVAL)
             .unwrap_or_else(std::time::Instant::now);
         let mut consecutive_failures = 0u32;
+        let mut warned_unmetered = false;
         let mut next_attempt = tokio::time::Instant::now();
         // An untouched activity record means no consumer ever spoke to this
         // daemon — idle time runs from loop start, not from zero. That is the
@@ -1843,6 +1917,8 @@ impl Daemon {
                     if tokio::time::Instant::now() < next_attempt {
                         continue;
                     }
+                    let written_before = self.written_bytes();
+                    let drain_started = std::time::Instant::now();
                     let worker = self.clone();
                     let drain_result = tokio::task::spawn_blocking(move || {
                         worker.drain_pending_batch()
@@ -1850,6 +1926,39 @@ impl Daemon {
                     .await
                     .map_err(|error| anyhow::anyhow!("pending drain task failed: {error}"))
                     .and_then(|result| result);
+                    // Charge the drain's writes against the budget, whatever it
+                    // returned: a generation write that failed and rolled back
+                    // still wrote its WAL frames. See
+                    // [`DEFAULT_DRAIN_WRITE_BUDGET`].
+                    let pause = match (written_before, self.written_bytes()) {
+                        (Some(before), Some(after)) => {
+                            let wrote = after.saturating_sub(before);
+                            let pause = drain_pause(wrote, self.drain_write_budget);
+                            if pause >= Duration::from_secs(1) {
+                                info!(
+                                    "drain wrote {wrote} bytes; next drain in {pause:?} to hold \
+                                     {} bytes/s of disk writes",
+                                    self.drain_write_budget
+                                );
+                            }
+                            pause
+                        }
+                        // No counter on this platform, or it could not be read:
+                        // the writes are unmeasured, not zero. Pace by the time
+                        // the drain took instead, which holds the loop to at most
+                        // half its time spent writing, and say so once.
+                        _ => {
+                            if !warned_unmetered {
+                                warned_unmetered = true;
+                                warn!(
+                                    "this process's disk-write counter cannot be read; pacing \
+                                     drains by their duration instead of the bytes they write"
+                                );
+                            }
+                            drain_started.elapsed().min(MAX_DRAIN_PAUSE)
+                        }
+                    };
+                    next_attempt = tokio::time::Instant::now() + pause;
                     match drain_result {
                         Ok(0) => consecutive_failures = 0,
                         Ok(n) => {
@@ -1871,7 +1980,7 @@ impl Daemon {
                             }
                             consecutive_failures = consecutive_failures.saturating_add(1);
                             let exponent = consecutive_failures.saturating_sub(1).min(6);
-                            let delay = Duration::from_secs(1u64 << exponent);
+                            let delay = Duration::from_secs(1u64 << exponent).max(pause);
                             next_attempt = tokio::time::Instant::now() + delay;
                             warn!(
                                 "pending drain failed (attempt {consecutive_failures}; retry in {delay:?}): {err}"
@@ -4922,5 +5031,90 @@ mod tests {
             !read_is_stable(10, 10, Some(now), Some(now), 9),
             "content shorter than the file it came from is a torn read"
         );
+    }
+
+    /// The pause is the bytes over the budget, capped, never negative.
+    #[test]
+    fn a_drain_pause_is_its_writes_over_the_budget_and_capped() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(drain_pause(0, DEFAULT_DRAIN_WRITE_BUDGET), Duration::ZERO);
+        assert_eq!(drain_pause(8 * MIB, 4 * MIB), Duration::from_secs(2));
+        assert_eq!(drain_pause(u64::MAX, 1), MAX_DRAIN_PAUSE);
+        // A zero budget is a bound of one byte a second, not "unlimited".
+        assert_eq!(drain_pause(1, 0), Duration::from_secs(1));
+    }
+
+    /// A drain that wrote waits out its write budget before the next one may
+    /// start, however soon the next edit arrives.
+    ///
+    /// The loop used to drain whenever the queue was non-empty, so each edit
+    /// an agent made bought a whole generation — a write that scales with the
+    /// repository — as fast as edits arrived. That is how a `devmap` process
+    /// came to write 549.76 GB in 71 minutes. Here every drain is metered at
+    /// 16 MiB per generation against an 8 MiB/s budget, so the second may not start
+    /// until two seconds after the first; unpaced it ran one poll later.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drain_that_wrote_waits_out_its_write_budget_before_the_next() {
+        const MIB: u64 = 1024 * 1024;
+        let root = short_unix_fixture_dir("paced").canonicalize().unwrap();
+        fs::write(root.join("a.py"), "def a():\n    return 1\n").unwrap();
+        let socket = root.join("paced.sock");
+        let mut daemon = Daemon::new(Store::open_in_memory().unwrap(), root.clone())
+            .with_ipc_path(socket)
+            .with_idle_poll(Duration::from_millis(20))
+            .with_max_idle(None)
+            .with_drain_write_budget(8 * MIB);
+        // Every generation written is 16 MiB of writes, two seconds of budget;
+        // a drain that wrote none wrote nothing. Read from the store rather
+        // than counted per call, so a poll that found the queue empty is not
+        // charged for a generation it did not write.
+        let generations = Arc::clone(&daemon.store);
+        daemon.write_meter = Some(Arc::new(move || {
+            let written = generations.latest_generation_id().ok()?.unwrap_or(0);
+            Some(u64::from(written) * 16 * MIB)
+        }));
+        let watching = daemon.clone();
+        let mut task = tokio::spawn(async move { daemon.run_loop().await });
+        serving_or_dead(&watching, &mut task).await;
+
+        let store = Arc::clone(&watching.store);
+        let first = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let generation = store.latest_generation_id().unwrap();
+                if generation.is_some() && store.get_pending_paths().unwrap().is_empty() {
+                    return generation;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the connect-time sweep must be drained into a first generation");
+
+        fs::write(root.join("b.py"), "def b():\n    return 2\n").unwrap();
+        let asked = std::time::Instant::now();
+        store
+            .enqueue_pending_paths(&[root.join("b.py").display().to_string()])
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let generation = store.latest_generation_id().unwrap();
+                if generation > first && store.get_pending_paths().unwrap().is_empty() {
+                    return asked.elapsed();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a paced drain must still run once its budget allows");
+        assert!(
+            second >= Duration::from_millis(1500),
+            "the second drain ran {second:?} after it was queued, inside the two seconds \
+             the first drain's 16 MiB earned against an 8 MiB/s budget"
+        );
+
+        watching.request_shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(30), task).await;
+        let _ = fs::remove_dir_all(&root);
     }
 }

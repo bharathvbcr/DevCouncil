@@ -19,6 +19,9 @@ devmap-query = { path = "../devmap-query" }
 # the walk direction or the basis.
 dc-regress = { path = "../dc-regress" }
 dc-regress-store = { path = "../dc-regress-store" }
+# The process's own disk-write counter, which paces the drain loop (see
+# `DEFAULT_DRAIN_WRITE_BUDGET`). Already in the tree through devmap-extract.
+dc-proc = { path = "../dc-proc" }
 tokio.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
