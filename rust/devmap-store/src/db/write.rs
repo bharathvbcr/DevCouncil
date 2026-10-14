@@ -270,6 +270,25 @@ impl Store {
                 )));
             }
         }
+        // An affected path is never carried, and fresh rows are written only
+        // for the extractions in hand, so an affected path that is neither in
+        // the slice nor declared deleted would get no row at all: the file
+        // silently absent from the generation, its symbols dropped by a write
+        // that never said it was deleting them. The caller has to account for
+        // every path it names — an extraction, or a deletion.
+        let declared_deleted: std::collections::HashSet<&str> =
+            opts.deleted_paths.iter().map(String::as_str).collect();
+        let mut unaccounted = opts.affected_paths.iter().filter(|path| {
+            !unique_paths.contains(path.as_str()) && !declared_deleted.contains(path.as_str())
+        });
+        if let Some(first) = unaccounted.next() {
+            return Err(refusal(format!(
+                "{} affected path(s) have neither an extraction nor a deletion in this write \
+                 (for example {first}); name each affected path in the extractions or in \
+                 deleted_paths, or the generation would drop it without a declared deletion",
+                1 + unaccounted.count()
+            )));
+        }
         let mut conn = lock_conn(&self.conn)?;
         let tx = conn.transaction_with_behavior(Self::GENERATION_TX_BEHAVIOR)?;
         if let Some(root) = &opts.repo_root {
