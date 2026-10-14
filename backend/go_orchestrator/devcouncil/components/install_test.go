@@ -1,10 +1,14 @@
 package components
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/version"
 )
 
 type fakeRunner struct {
@@ -75,7 +79,7 @@ func TestUninstallOnlyRemovesReceiptBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 	st, _ := LoadState(prefix)
-	st.Record("devmap", ours)
+	st.Record("devmap", ours, Origin{})
 	if err := SaveState(st); err != nil {
 		t.Fatal(err)
 	}
@@ -242,6 +246,257 @@ func TestInstallSrcFlagRejectsWhatIsNotACheckout(t *testing.T) {
 		}
 		if len(r.calls) != 0 {
 			t.Errorf("%s: ran %v", name, r.calls)
+		}
+	}
+}
+
+// A remote install fetches from the public repository. Unpinned, two installs
+// a day apart build different trees — possibly at a newer store schema than
+// the host and its readers — so it pins the host's own release tag.
+func TestRemoteInstallPinsTheHostsReleaseTag(t *testing.T) {
+	noCheckoutEnv(t)
+	want := "--tag v" + version.Version
+	cs, err := Resolve([]string{"analysis"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range PlannedCommands(cs, Options{Prefix: "/opt"}) {
+		if !strings.Contains(c, want) {
+			t.Errorf("planned remote install is unpinned: %s", c)
+		}
+	}
+	r := &fakeRunner{}
+	prefix := t.TempDir()
+	if err := Install(cs, Options{Prefix: prefix, Runner: r, LookPath: noPath}); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.calls) != len(RustIDs(cs)) {
+		t.Fatalf("calls = %v", r.calls)
+	}
+	for _, call := range r.calls {
+		if !strings.Contains(call, want) {
+			t.Errorf("ran an unpinned install: %s", call)
+		}
+	}
+}
+
+// The receipt names where each binary came from, and --list prints it.
+func TestRemoteInstallRecordsItsRefAndListPrintsIt(t *testing.T) {
+	noCheckoutEnv(t)
+	prefix := t.TempDir()
+	cs, _ := Resolve([]string{"devmap"})
+	if err := Install(cs, Options{Prefix: prefix, Runner: &fakeRunner{}, LookPath: noPath}); err != nil {
+		t.Fatal(err)
+	}
+	st, err := LoadState(prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRef := "tag v" + version.Version
+	if got := st.Installed["devmap"].Origin; got != (Origin{Source: PublicGit, Ref: wantRef}) {
+		t.Fatalf("receipt origin = %+v, want %s at %s", got, PublicGit, wantRef)
+	}
+
+	out, restore := swapStdout(t)
+	code := runInstall([]string{"--list", "--prefix", prefix}, Options{})
+	restore()
+	if code != 0 || !strings.Contains(out.String(), "devmap") || !strings.Contains(out.String(), PublicGit+" at "+wantRef) {
+		t.Fatalf("exit %d, --list does not show the ref:\n%s", code, out.String())
+	}
+
+	out, restore = swapStdout(t)
+	code = runInstall([]string{"--list", "--json", "--prefix", prefix}, Options{})
+	restore()
+	var listed struct {
+		Installed map[string]InstallRec `json:"installed"`
+	}
+	if code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	if err := json.Unmarshal(out.Bytes(), &listed); err != nil {
+		t.Fatalf("%v:\n%s", err, out.String())
+	}
+	if listed.Installed["devmap"].Ref != wantRef {
+		t.Fatalf("--list --json installed = %+v", listed.Installed)
+	}
+}
+
+func TestCheckoutInstallRecordsTheCheckout(t *testing.T) {
+	src := t.TempDir()
+	if err := osMkdirCheckout(src); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CARGO_TARGET_DIR", "")
+	cs, _ := Resolve([]string{"devmap"})
+	prefix := t.TempDir()
+	r := &cargoRunner{t: t, src: src}
+	if err := Install(cs, Options{Prefix: prefix, Runner: r, Prober: healthyProber{}, SourceRoot: src, LookPath: noPath}); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := LoadState(prefix)
+	if got := st.Installed["devmap"].Origin; got != (Origin{Source: src}) {
+		t.Fatalf("receipt origin = %+v, want the checkout %s", got, src)
+	}
+}
+
+// A host whose version is not a release has no tag to pin to. It refuses a
+// remote install — with nothing run — and names the checkout route and --rev.
+func TestDevBuildRefusesAnUnpinnedRemoteInstall(t *testing.T) {
+	noCheckoutEnv(t)
+	for _, v := range []string{"0.2.5-dev", "dev", "0.3", ""} {
+		hostVersion := v
+		if v == "" {
+			hostVersion = "v0.2.4" // a tag spelled as a version is not a version
+		}
+		r := &fakeRunner{}
+		prefix := t.TempDir()
+		for _, args := range [][]string{{"devmap"}, {"analysis", "--dry-run"}} {
+			errOut, restore := swapStderr(t)
+			code := runInstall(append(args, "--prefix", prefix), Options{Runner: r, HostVersion: hostVersion})
+			restore()
+			if code != 2 {
+				t.Errorf("%s %v: exit %d, want 2", hostVersion, args, code)
+			}
+			for _, want := range []string{"development build", "git clone " + PublicGit, "devcouncil install --src <dir>", "--rev"} {
+				if !strings.Contains(errOut.String(), want) {
+					t.Errorf("%s %v: refusal lacks %q:\n%s", hostVersion, args, want, errOut.String())
+				}
+			}
+		}
+		cs, _ := Resolve([]string{"devmap"})
+		if err := Install(cs, Options{Prefix: prefix, Runner: r, HostVersion: hostVersion, LookPath: noPath}); err == nil {
+			t.Errorf("%s: Install fetched without a pin", hostVersion)
+		}
+		if len(r.calls) != 0 {
+			t.Errorf("%s: refused install ran %v", hostVersion, r.calls)
+		}
+		if st, _ := LoadState(prefix); len(st.Installed) != 0 {
+			t.Errorf("%s: refused install wrote a receipt: %+v", hostVersion, st.Installed)
+		}
+	}
+}
+
+func TestRevPinsARemoteInstall(t *testing.T) {
+	noCheckoutEnv(t)
+	prefix := t.TempDir()
+	r := &fakeRunner{}
+	code := runInstall([]string{"devmap", "--rev", "0123abc", "--prefix", prefix}, Options{Runner: r, HostVersion: "0.2.5-dev", LookPath: noPath})
+	if code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	if len(r.calls) != 1 || !strings.Contains(r.calls[0], "--rev 0123abc") || strings.Contains(r.calls[0], "--tag") {
+		t.Fatalf("calls = %v", r.calls)
+	}
+	st, _ := LoadState(prefix)
+	if got := st.Installed["devmap"].Ref; got != "rev 0123abc" {
+		t.Fatalf("receipt ref = %q", got)
+	}
+
+	for name, args := range map[string][]string{
+		"flag-shaped": {"--rev=-x"},
+		"space":       {"--rev", "a b"},
+		"empty":       {"--rev="},
+		"no value":    {"--rev"},
+	} {
+		r := &fakeRunner{}
+		_, restore := swapStderr(t)
+		code := runInstall(append([]string{"devmap", "--prefix", t.TempDir()}, args...), Options{Runner: r})
+		restore()
+		if code != 2 || len(r.calls) != 0 {
+			t.Errorf("%s: exit %d, calls %v", name, code, r.calls)
+		}
+	}
+
+	src := t.TempDir()
+	if err := osMkdirCheckout(src); err != nil {
+		t.Fatal(err)
+	}
+	r = &fakeRunner{}
+	errOut, restore := swapStderr(t)
+	code = runInstall([]string{"devmap", "--rev", "0123abc", "--src", src, "--prefix", t.TempDir()}, Options{Runner: r})
+	restore()
+	if code != 2 || len(r.calls) != 0 || !strings.Contains(errOut.String(), "--rev pins a remote install") {
+		t.Fatalf("--rev with a checkout: exit %d, calls %v:\n%s", code, r.calls, errOut.String())
+	}
+}
+
+// One removal failing must not leave the receipt claiming the components that
+// were removed, nor hide the other failures: uninstall carries on, forgets
+// what it deleted, saves, and names every component it could not remove.
+func TestUninstallSavesWhatItRemovedAndNamesEveryFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a read-only directory does not stop deletion on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root deletes from a read-only directory")
+	}
+	prefix := t.TempDir()
+	bindir := filepath.Join(prefix, "bin")
+	locked := filepath.Join(prefix, "locked")
+	for _, d := range []string{bindir, locked} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	host := filepath.Join(locked, "devcouncil")
+	dcstore := filepath.Join(locked, "dcstore")
+	devmap := filepath.Join(bindir, "devmap")
+	for _, p := range []string{host, dcstore, devmap} {
+		if err := os.WriteFile(p, []byte("bin"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, _ := LoadState(prefix)
+	st.Record("host", host, Origin{})
+	st.Record("devmap", devmap, Origin{})
+	st.Record("dcstore", dcstore, Origin{})
+	if err := SaveState(st); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+
+	cs, err := Resolve([]string{"host", "devmap", "dcstore"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = Uninstall(cs, Options{Prefix: prefix, Yes: true})
+	if err == nil {
+		t.Fatal("uninstall reported success with two binaries still on disk")
+	}
+	for _, want := range []string{host, dcstore} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error does not name %s: %v", want, err)
+		}
+	}
+	if _, statErr := os.Stat(devmap); !os.IsNotExist(statErr) {
+		t.Errorf("devmap was not removed after the host failed: %v", statErr)
+	}
+	got, loadErr := LoadState(prefix)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if _, ok := got.Installed["devmap"]; ok {
+		t.Errorf("receipt still lists the removed devmap: %+v", got.Installed)
+	}
+	for _, id := range []string{"host", "dcstore"} {
+		if _, ok := got.Installed[id]; !ok {
+			t.Errorf("receipt dropped %s, which is still on disk: %+v", id, got.Installed)
+		}
+	}
+
+	// The CLI exits non-zero and prints every failure.
+	errOut, restore := swapStderr(t)
+	code := RunUninstall([]string{"host", "dcstore", "--yes", "--prefix", prefix})
+	restore()
+	if code != 1 {
+		t.Errorf("exit %d, want 1", code)
+	}
+	for _, want := range []string{host, dcstore} {
+		if !strings.Contains(errOut.String(), want) {
+			t.Errorf("stderr does not name %s:\n%s", want, errOut.String())
 		}
 	}
 }

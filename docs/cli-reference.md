@@ -78,7 +78,7 @@ with the same arguments; standalone DevMap without Go is a cargo install:
 ```bash
 bash scripts/install.sh --only=devmap
 bash scripts/install.sh --help          # devcouncil install --help
-cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked devmap-cli
+cargo install --git https://github.com/bharathvbcr/DevCouncil.git --tag vX.Y.Z --locked devmap-cli  # vX.Y.Z: a release tag
 ```
 
 There is no `uv` / Python install path.

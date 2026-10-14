@@ -3,6 +3,7 @@ package components
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/console"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/release"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/version"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 )
 
@@ -42,7 +45,10 @@ Components:
 
 Options:
   --only NAME         same as a positional name (repeatable)
-  --list              print the catalog and exit
+  --list              print the catalog and what the receipt under --prefix
+                      records (each component's source and ref), and exit
+  --rev COMMIT        pin a remote install (no checkout) to this commit
+                      instead of this host's release tag
   --json              machine-readable list/status
   --prefix DIR        install root (default: $PREFIX or ~/.local)
   --src DIR           DevCouncil checkout to build from (default: $DEVCOUNCIL_ROOT,
@@ -61,7 +67,10 @@ Options:
 From a checkout, Rust components are built with cargo (PROFILE=release by
 default, or debug), each build is health-checked before any is installed, and
 each binary is copied beside its destination and renamed into place. Outside a
-checkout they come from cargo install --git.
+checkout they come from cargo install --git, pinned to this host's release
+tag (v` + version.Version + `) or to --rev; a development build, whose version
+has no release tag, refuses rather than fetch the default branch. The receipt
+records the source and ref of every component; --list prints them.
 
 After a checkout install, the apps that read DevCouncil's schemas (GitPulse,
 Manvi, Jarvis) are asked whether they carry this checkout's numbers, through
@@ -75,7 +84,7 @@ Bootstrap (no host binary yet): bash scripts/install.sh [same arguments], or
 .\scripts\install.ps1 on Windows. Each builds cmd/dcinstall (this command,
 without the Gusset engine the host links) into a temporary directory and runs
 it. Installing the host still needs Gusset checked out beside DevCouncil. Without Go, devmap alone installs with:
-  cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked devmap-cli
+  cargo install --git https://github.com/bharathvbcr/DevCouncil.git --tag v` + version.Version + ` --locked devmap-cli
 
 There is no uv / Python install path. Components are native Go and Rust
 binaries.
@@ -129,8 +138,14 @@ type Options struct {
 	// Profile is the cargo profile for checkout builds: "release" or
 	// "debug". Empty reads $PROFILE, then defaults to release.
 	Profile string
-	Runner  Runner
-	Prober  Prober
+	// Rev pins a remote (no checkout) install to this commit or ref instead
+	// of the host's release tag.
+	Rev string
+	// HostVersion stands in for version.Version, the release whose tag a
+	// remote install pins; empty means version.Version. Tests set it.
+	HostVersion string
+	Runner      Runner
+	Prober      Prober
 	// LookPath resolves a binary name on PATH for the post-install report.
 	LookPath func(string) (string, error)
 	// CgoEnv builds the Gusset engine in the checkout rooted at its argument
@@ -197,8 +212,11 @@ func (o Options) source() string {
 	return FindSourceRoot()
 }
 
-// ListJSON is `install --list --json`.
-func ListJSON() ([]byte, error) {
+// ListJSON is `install --list --json`: the catalog, and the receipt under
+// prefix — what is installed there and the source and ref each was built from.
+// An unreadable receipt is reported in receipt_error, never as nothing
+// installed.
+func ListJSON(prefix string) ([]byte, error) {
 	type row struct {
 		Component
 		PresetOf []string `json:"presets,omitempty"`
@@ -216,10 +234,50 @@ func ListJSON() ([]byte, error) {
 		}
 		rows = append(rows, row{Component: c, PresetOf: presets})
 	}
-	return json.MarshalIndent(map[string]any{
+	out := map[string]any{
 		"components": rows,
 		"presets":    Presets,
-	}, "", "  ")
+		"prefix":     prefix,
+	}
+	st, err := LoadState(prefix)
+	if err != nil {
+		out["receipt_error"] = err.Error()
+	} else {
+		out["installed"] = st.Installed
+	}
+	return json.MarshalIndent(out, "", "  ")
+}
+
+// ReceiptLines is the human form of the receipt under prefix: one line per
+// installed component with the source and ref it was built from.
+func ReceiptLines(prefix string) []string {
+	st, err := LoadState(prefix)
+	if err != nil {
+		return []string{fmt.Sprintf("Installed under %s: unknown (%v)", prefix, err)}
+	}
+	if len(st.Installed) == 0 {
+		return []string{fmt.Sprintf("Installed under %s: nothing recorded", prefix)}
+	}
+	lines := []string{fmt.Sprintf("Installed under %s:", prefix)}
+	for _, c := range Catalog {
+		rec, ok := st.Installed[c.ID]
+		if !ok {
+			continue
+		}
+		from := "source not recorded (installed before receipts named it)"
+		switch {
+		case rec.Ref != "":
+			from = rec.Source + " at " + rec.Ref
+		case rec.Source != "":
+			from = "checkout " + rec.Source
+		}
+		disabled := ""
+		if st.IsDisabled(c.ID) {
+			disabled = " [disabled]"
+		}
+		lines = append(lines, fmt.Sprintf("  %-9s %s  from %s  (%s)%s", c.ID, rec.Binary, from, rec.At, disabled))
+	}
+	return lines
 }
 
 // PlannedCommands is what --dry-run prints.
@@ -267,8 +325,12 @@ func PlannedCommands(cs []Component, o Options) []string {
 		}
 		return cmds
 	}
+	ref, err := o.remoteRef()
+	if err != nil {
+		return append(cmds, err.Error())
+	}
 	for _, id := range rust {
-		name, args, err := cargoInstallArgs(id, prefix)
+		name, args, err := cargoInstallArgs(id, prefix, ref)
 		if err != nil {
 			cmds = append(cmds, err.Error())
 			continue
@@ -278,8 +340,57 @@ func PlannedCommands(cs []Component, o Options) []string {
 	return cmds
 }
 
-func cargoInstallArgs(id, prefix string) (string, []string, error) {
-	args := []string{"install", "--git", PublicGit, "--locked", "--force", "--root", prefix}
+// gitRef is the commit a remote install builds: a release tag or an explicit
+// revision. Kind is the cargo flag's name ("tag" or "rev").
+type gitRef struct {
+	Kind, Name string
+}
+
+func (r gitRef) String() string { return r.Kind + " " + r.Name }
+
+// remoteRef is what a remote install pins to: the --rev the caller named, else
+// the release tag of the version this host was built as. A host whose version
+// is not a release has no tag to pin to, and fetching the default branch
+// instead would install whatever was merged last — possibly at a newer store
+// schema than this host and the apps that read it — so it refuses.
+func (o Options) remoteRef() (gitRef, error) {
+	if o.Rev != "" {
+		if err := validRev(o.Rev); err != nil {
+			return gitRef{}, err
+		}
+		return gitRef{Kind: "rev", Name: o.Rev}, nil
+	}
+	v := o.HostVersion
+	if v == "" {
+		v = version.Version
+	}
+	tag := "v" + v
+	if _, reason := release.ParseTag(tag); reason != "" {
+		return gitRef{}, fmt.Errorf("this host is a development build (version %q), so no release tag matches it and a remote install would have to fetch the default branch, which is refused: build from a checkout (git clone %s, then devcouncil install --src <dir>), or pin a commit with --rev <commit>", v, PublicGit)
+	}
+	return gitRef{Kind: "tag", Name: tag}, nil
+}
+
+// validRev bounds --rev to what names a git commit or ref, so the value can
+// never read as another cargo flag.
+func validRev(rev string) error {
+	if len(rev) > 200 || strings.HasPrefix(rev, "-") {
+		return fmt.Errorf("--rev %q is not a commit or ref name", rev)
+	}
+	for _, r := range rev {
+		ok := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("._/-", r)
+		if !ok {
+			return fmt.Errorf("--rev %q is not a commit or ref name", rev)
+		}
+	}
+	return nil
+}
+
+func cargoInstallArgs(id, prefix string, ref gitRef) (string, []string, error) {
+	if ref.Kind != "tag" && ref.Kind != "rev" || ref.Name == "" {
+		return "", nil, fmt.Errorf("remote install of %s has no pinned ref", id)
+	}
+	args := []string{"install", "--git", PublicGit, "--" + ref.Kind, ref.Name, "--locked", "--force", "--root", prefix}
 	switch id {
 	case "devmap":
 		args = append(args, "devmap-cli")
@@ -345,6 +456,17 @@ func Install(cs []Component, o Options) error {
 	if err != nil {
 		return err
 	}
+	rust := RustIDs(cs)
+	// Resolved before anything is built, so a host that cannot pin a remote
+	// install refuses with nothing changed.
+	rustFrom := Origin{Source: src}
+	var ref gitRef
+	if len(rust) > 0 && src == "" {
+		if ref, err = o.remoteRef(); err != nil {
+			return err
+		}
+		rustFrom = Origin{Source: PublicGit, Ref: ref.String()}
+	}
 
 	var firstErr error
 	var names []string
@@ -352,17 +474,16 @@ func Install(cs []Component, o Options) error {
 		if err := installHost(src, prefix, o); err != nil {
 			return err
 		}
-		st.Record("host", filepath.Join(bindir, hostBinaryName()))
+		st.Record("host", filepath.Join(bindir, hostBinaryName()), Origin{Source: src})
 		names = append(names, hostBinaryName())
 	}
 
-	rust := RustIDs(cs)
 	if len(rust) > 0 {
-		installed, err := installRust(src, prefix, rust, o)
+		installed, err := installRust(src, prefix, rust, ref, o)
 		// A checkout install that stopped part-way still put these on disk;
 		// the receipt must say so or uninstall cannot find them.
 		for _, id := range installed {
-			st.Record(id, filepath.Join(bindir, rustBinaryName(id)))
+			st.Record(id, filepath.Join(bindir, rustBinaryName(id)), rustFrom)
 			st.SetDisabled(id, false)
 			names = append(names, rustBinaryName(id))
 		}
@@ -469,16 +590,16 @@ func classifyDevLink(dest string) (devLinkKind, error) {
 }
 
 // installRust builds from the checkout when there is one, and otherwise
-// installs from the public repository with cargo. It returns the IDs it put
-// on disk, which a failure part-way through can leave non-empty.
-func installRust(src, prefix string, ids []string, o Options) ([]string, error) {
+// installs from the public repository at ref with cargo. It returns the IDs it
+// put on disk, which a failure part-way through can leave non-empty.
+func installRust(src, prefix string, ids []string, ref gitRef, o Options) ([]string, error) {
 	if src != "" {
 		return installRustFromCheckout(src, prefix, ids, o)
 	}
 	run := o.runner()
 	var installed []string
 	for _, id := range ids {
-		name, args, err := cargoInstallArgs(id, prefix)
+		name, args, err := cargoInstallArgs(id, prefix, ref)
 		if err != nil {
 			return installed, err
 		}
@@ -492,6 +613,11 @@ func installRust(src, prefix string, ids []string, o Options) ([]string, error) 
 
 // Uninstall removes binaries we have a receipt for, or that live in $PREFIX/bin
 // under a catalog name. It never cargo-uninstalls a foreign toolchain copy.
+//
+// A component that cannot be removed does not stop the others. Each one
+// removed is forgotten and the receipt saved before the next, so the receipt
+// never lists a binary that is gone; one that failed, even in part, stays
+// listed so a re-run finds what is left. The error names every failure.
 func Uninstall(cs []Component, o Options) error {
 	prefix := o.prefix()
 	st, err := LoadState(prefix)
@@ -499,6 +625,7 @@ func Uninstall(cs []Component, o Options) error {
 		return err
 	}
 	bindir := filepath.Join(prefix, "bin")
+	var errs []error
 	for _, c := range cs {
 		rec, have := st.Installed[c.ID]
 		candidates := []string{}
@@ -508,43 +635,48 @@ func Uninstall(cs []Component, o Options) error {
 		candidates = append(candidates, filepath.Join(bindir, rustBinaryName(c.Binary)))
 		if c.ID == "host" {
 			candidates = append(candidates, filepath.Join(bindir, hostBinaryName()))
+			if runtime.GOOS == "windows" {
+				candidates = append(candidates, filepath.Join(bindir, "dev.exe"))
+			}
 		}
-		removed := false
+		removed, failed := false, false
 		for _, p := range unique(candidates) {
 			did, err := removeOwned(prefix, p, o.DryRun)
 			if err != nil {
-				return err
+				errs = append(errs, fmt.Errorf("%s: %w", c.ID, err))
+				failed = true
+				continue
 			}
 			if did {
 				removed = true
 			}
 		}
-		if c.ID == "host" {
+		if c.ID == "host" && runtime.GOOS != "windows" {
 			dev := filepath.Join(bindir, "dev")
-			if runtime.GOOS == "windows" {
-				dev = filepath.Join(bindir, "dev.exe")
+			kind, err := classifyDevLink(dev)
+			if err != nil {
+				console.Errorf("note: left %s in place: %v\n", dev, err)
+			} else if kind == devLinkOurs {
 				if _, err := removeOwned(prefix, dev, o.DryRun); err != nil {
-					return err
-				}
-			} else {
-				kind, err := classifyDevLink(dev)
-				if err != nil {
-					console.Errorf("note: left %s in place: %v\n", dev, err)
-				} else if kind == devLinkOurs {
-					if _, err := removeOwned(prefix, dev, o.DryRun); err != nil {
-						return err
-					}
+					errs = append(errs, fmt.Errorf("%s: %w", c.ID, err))
+					failed = true
 				}
 			}
 		}
-		if removed || have {
-			st.Forget(c.ID)
+		if failed || !(removed || have) {
+			continue
+		}
+		st.Forget(c.ID)
+		if o.DryRun {
+			continue
+		}
+		if err := SaveState(st); err != nil {
+			// Removing more would widen the gap between disk and receipt.
+			errs = append(errs, fmt.Errorf("removed %s but could not save the receipt (it still lists %s; re-run uninstall): %w", c.ID, c.ID, err))
+			return errors.Join(errs...)
 		}
 	}
-	if o.DryRun {
-		return nil
-	}
-	return SaveState(st)
+	return errors.Join(errs...)
 }
 
 func pathInside(prefix, candidate string) bool {
@@ -585,8 +717,9 @@ func removeOwned(prefix, path string, dry bool) (bool, error) {
 		console.Println("rm", path)
 		return true, nil
 	}
+	// os.Remove's error already reads "remove <path>: <reason>".
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return false, fmt.Errorf("remove %s: %w", path, err)
+		return false, err
 	}
 	return true, nil
 }

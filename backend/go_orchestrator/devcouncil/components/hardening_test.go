@@ -28,7 +28,7 @@ func TestDryRunUninstallDoesNotRemoveDevSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	st, _ := LoadState(prefix)
-	st.Record("host", host)
+	st.Record("host", host, Origin{})
 	if err := SaveState(st); err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestUninstallRefusesReceiptOutsidePrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 	st, _ := LoadState(prefix)
-	st.Record("devmap", outside)
+	st.Record("devmap", outside, Origin{})
 	if err := SaveState(st); err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestUninstallRefusesDotDotReceipt(t *testing.T) {
 		t.Fatal(err)
 	}
 	st, _ := LoadState(prefix)
-	st.Record("dcgrep", filepath.Join(bindir, "..", "..", filepath.Base(t.TempDir()), "nope"))
+	st.Record("dcgrep", filepath.Join(bindir, "..", "..", filepath.Base(t.TempDir()), "nope"), Origin{})
 	// Point the receipt at victim via .. after a fake join that cleans to outside.
 	st.Installed["dcgrep"] = InstallRec{Binary: victim, At: "now"}
 	if err := SaveState(st); err != nil {
@@ -111,7 +111,7 @@ func TestUninstallDoesNotRemoveDirectoryNamedLikeBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 	st, _ := LoadState(prefix)
-	st.Record("devmap", dir)
+	st.Record("devmap", dir, Origin{})
 	if err := SaveState(st); err != nil {
 		t.Fatal(err)
 	}
@@ -247,7 +247,7 @@ func TestConcurrentSaveStateLeavesValidJSON(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			st, _ := LoadState(prefix)
-			st.Record(id, filepath.Join(prefix, "bin", id))
+			st.Record(id, filepath.Join(prefix, "bin", id), Origin{})
 			_ = SaveState(st)
 		}()
 	}

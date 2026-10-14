@@ -31,6 +31,18 @@ type State struct {
 type InstallRec struct {
 	Binary string `json:"binary"`
 	At     string `json:"at"`
+	Origin
+}
+
+// Origin is where an installed binary was built from. A remote install names
+// the public repository and the ref it was pinned to ("tag v0.2.4" or
+// "rev <commit>"), so two receipts can say whether they hold the same build.
+// A checkout install names the checkout and no ref: it builds the working
+// tree as it stands, uncommitted edits included, which no commit names.
+// Receipts written before these fields existed read back with both empty.
+type Origin struct {
+	Source string `json:"source,omitempty"`
+	Ref    string `json:"ref,omitempty"`
 }
 
 func statePath(prefix string) string {
@@ -132,11 +144,11 @@ func SaveState(st State) error {
 	return safefile.WriteAtomic(disabledTextPath(st.Prefix), []byte(body), 0o644)
 }
 
-func (st *State) Record(id, binary string) {
+func (st *State) Record(id, binary string, from Origin) {
 	if st.Installed == nil {
 		st.Installed = map[string]InstallRec{}
 	}
-	st.Installed[id] = InstallRec{Binary: binary, At: time.Now().UTC().Format(time.RFC3339)}
+	st.Installed[id] = InstallRec{Binary: binary, At: time.Now().UTC().Format(time.RFC3339), Origin: from}
 }
 
 func (st *State) Forget(id string) {

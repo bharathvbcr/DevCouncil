@@ -167,7 +167,7 @@ toolchain declared in [`go.mod`](backend/go_orchestrator/go.mod), currently Go
 1.26.9, and a sibling checkout of [Gusset](https://github.com/bharathvbcr/gusset)
 at `../gusset`, at the revision pinned in
 [`.github/actions/setup-gusset/action.yml`](.github/actions/setup-gusset/action.yml)
-(`npm run ci:local` and `rust/verify.sh` fail on any other revision). Without Go, `cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked devmap-cli`
+(`npm run ci:local` and `rust/verify.sh` fail on any other revision). Without Go, `cargo install --git https://github.com/bharathvbcr/DevCouncil.git --tag vX.Y.Z --locked devmap-cli`, with `vX.Y.Z` a [release tag](https://github.com/bharathvbcr/DevCouncil/releases) (the default branch is whatever was merged last),
 installs DevMap alone. The host installs only from a checkout: run from outside one, `devcouncil install` (which includes the host by default) exits 2 and names `git clone https://github.com/bharathvbcr/DevCouncil.git` plus `devcouncil install --src <dir>`; there is no `go install` route, and the npm package is a launcher for a host you built, not a source of one. On Windows use `.\scripts\install.ps1 -Components devmap`,
 or omit `-Components` for the suite.
 

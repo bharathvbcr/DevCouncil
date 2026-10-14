@@ -10,8 +10,9 @@
 #   .\scripts\install.ps1 -Components devmap       # one component, no host
 #   .\scripts\install.ps1 -Uninstall -Components dcgrep -Yes
 #
-# Without Go, devmap alone installs with
-#   cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked devmap-cli
+# Without Go, devmap alone installs with (pinned to a release tag; the
+# default branch is whatever was merged last)
+#   cargo install --git https://github.com/bharathvbcr/DevCouncil.git --tag vX.Y.Z --locked devmap-cli
 param(
     [string]$Prefix = "",
     [string[]]$Components = @(),
@@ -26,13 +27,19 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+$RepoRoot = Split-Path -Parent $PSScriptRoot
+
 if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
+    # The tag is this checkout's release: the constant the release gate holds
+    # package.json, Cargo.toml and the vX.Y.Z tag to.
+    $Tag = "vX.Y.Z"
+    $VersionFile = Join-Path $RepoRoot "backend\go_orchestrator\devcouncil\version\version.go"
+    $Match = Select-String -LiteralPath $VersionFile -Pattern '^const Version = "([^"]+)"$' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($Match) { $Tag = "v" + $Match.Matches[0].Groups[1].Value }
     [Console]::Error.WriteLine("go is required: this script builds the DevCouncil host, and the host is the installer.")
-    [Console]::Error.WriteLine("Without Go, install devmap alone: cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked devmap-cli")
+    [Console]::Error.WriteLine("Without Go, install devmap alone: cargo install --git https://github.com/bharathvbcr/DevCouncil.git --tag $Tag --locked devmap-cli")
     exit 1
 }
-
-$RepoRoot = Split-Path -Parent $PSScriptRoot
 
 $argv = @(if ($Uninstall) { "uninstall" } else { "install" })
 if ($Help) { $argv += "--help" }
