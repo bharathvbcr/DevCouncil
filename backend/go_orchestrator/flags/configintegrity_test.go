@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func loadDoc(t *testing.T, doc string) error {
@@ -298,6 +299,71 @@ func TestLadderDeclarationsAreChecked(t *testing.T) {
 		{"ladder on a non-safety flag", Def{Key: "a.mode", Kind: KindEnum, Values: modes, Ladder: modes, Default: ModeEnforce, Mutable: HumanOnly}},
 		{"bool ladder spelt loosely", Def{Key: "a.on", Kind: KindBool, Ladder: []string{"yes", "no"}, Default: "true", Mutable: HumanOnly, Safety: true}},
 		{"ladder on a string", Def{Key: "a.s", Kind: KindString, Ladder: []string{"x"}, Default: "x", Mutable: HumanOnly, Safety: true}},
+	} {
+		if err := New().Define(tc.def); err == nil {
+			t.Errorf("%s: Define accepted it", tc.name)
+		}
+	}
+}
+
+// TestANonPositiveGrantCeilingIsRefusedAtLoad is go-core-07. Both max_ttl flags
+// are ceilings on a grant's lifetime, and a ceiling of zero or less admits no
+// grant at all: Issue under it used to mint one already expired. Worse, from
+// repository scope "-15m" is shorter than "15m", so the only-tighten rule
+// counted it as tightening and let it through. The bound is declared on the Def
+// and checked by every layer a value enters through, naming the key.
+func TestANonPositiveGrantCeilingIsRefusedAtLoad(t *testing.T) {
+	for _, key := range []string{GrantsAgentMaxTTL, GrantsHumanMaxTTL} {
+		for _, raw := range []string{"-15m", "0", "0s", "-1ns"} {
+			t.Run(key+"="+raw, func(t *testing.T) {
+				path := writeRepoConfig(t, "llm.local.model: qwen\n"+key+": "+raw+"\n")
+				if reg, err := NewHarnessRegistry(path); err == nil {
+					v, _ := reg.Lookup(key)
+					t.Fatalf("%s: %s was accepted from config: %q (origin %s)", key, raw, v.Raw, v.Origin)
+				} else if !strings.Contains(err.Error(), key+" (line 2)") {
+					t.Errorf("refusal %q does not name %s (line 2)", err, key)
+				}
+
+				env := testRegistry(t)
+				env.envLookup = func(k string) (string, bool) {
+					if k == EnvKey(key) {
+						return raw, true
+					}
+					return "", false
+				}
+				if err := env.LoadEnv(); err == nil || !strings.Contains(err.Error(), EnvKey(key)) {
+					t.Errorf("%s=%s from the environment: err = %v, want a refusal naming it", EnvKey(key), raw, err)
+				}
+
+				set := testRegistry(t)
+				if err := set.Set(Human, key, raw); err == nil || !strings.Contains(err.Error(), key) {
+					t.Errorf("Set(%s, %s): err = %v, want a refusal naming the key", key, raw, err)
+				}
+				if v, _ := set.Lookup(key); v.Origin != OriginDefault {
+					t.Errorf("a refused Set applied a value: %+v", v)
+				}
+			})
+		}
+	}
+
+	// The bound is a floor, not a refusal of short ceilings: a repository may
+	// still tighten the agent ceiling to the floor itself.
+	if _, err := NewHarnessRegistry(writeRepoConfig(t, GrantsAgentMaxTTL+": 1s\n")); err != nil {
+		t.Errorf("a one-second agent ceiling was refused: %v", err)
+	}
+}
+
+// TestDurationBoundDeclarationsAreChecked: a duration floor on a flag that is
+// not a duration, a negative floor, or a default below its own floor is a rule
+// nothing could satisfy or nothing reads, so Define refuses each.
+func TestDurationBoundDeclarationsAreChecked(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		def  Def
+	}{
+		{"floor on an int", Def{Key: "a.n", Kind: KindInt, Default: "1", MinDuration: time.Second, Mutable: HumanOnly}},
+		{"negative floor", Def{Key: "a.d", Kind: KindDuration, Default: "1m", MinDuration: -time.Second, Mutable: HumanOnly}},
+		{"default below the floor", Def{Key: "a.d", Kind: KindDuration, Default: "0s", MinDuration: time.Second, Mutable: HumanOnly}},
 	} {
 		if err := New().Define(tc.def); err == nil {
 			t.Errorf("%s: Define accepted it", tc.name)

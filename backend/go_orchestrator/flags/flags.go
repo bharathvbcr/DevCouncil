@@ -100,6 +100,14 @@ type Def struct {
 	// for a flag that declares one. A setting whose real ceiling is zero is a
 	// constant, not a setting, so nothing in the catalogue needs that spelling.
 	Min, Max int
+	// MinDuration is the inclusive floor on a KindDuration value, checked
+	// wherever a value enters, exactly as Min and Max are for an int. Zero means
+	// no floor. A flag that is a ceiling on a lifetime declares one, because
+	// ParseDuration accepts "0" and "-15m", and a ceiling of zero or less admits
+	// no lifetime at all: the consumer would mint something already expired.
+	// From repository scope such a value would also pass as "tightening", since
+	// the only-tighten rule orders durations by length.
+	MinDuration time.Duration
 	// Mutable says who may change this flag after boot.
 	Mutable Mutability
 	// Safety marks a flag whose off/demoted state weakens a gate. Safety flags
@@ -236,6 +244,12 @@ func (r *Registry) Define(defs ...Def) error {
 		}
 		if d.Max != 0 && d.Min > d.Max {
 			return fmt.Errorf("flags: %q declares an empty range %d..%d", d.Key, d.Min, d.Max)
+		}
+		if d.Kind != KindDuration && d.MinDuration != 0 {
+			return fmt.Errorf("flags: %q declares a duration floor %s but is a %s, not a duration", d.Key, d.MinDuration, d.Kind)
+		}
+		if d.MinDuration < 0 {
+			return fmt.Errorf("flags: %q declares a negative duration floor %s", d.Key, d.MinDuration)
 		}
 		if err := validate(d, d.Default); err != nil {
 			return fmt.Errorf("flags: default for %q: %w", d.Key, err)
@@ -678,8 +692,12 @@ func validate(d Def, raw string) error {
 			return fmt.Errorf("expected an int in %d..%d, got %d", d.Min, d.Max, n)
 		}
 	case KindDuration:
-		if _, err := time.ParseDuration(raw); err != nil {
+		v, err := time.ParseDuration(raw)
+		if err != nil {
 			return fmt.Errorf("expected a duration, got %q", raw)
+		}
+		if d.MinDuration > 0 && v < d.MinDuration {
+			return fmt.Errorf("expected a duration of at least %s, got %q", d.MinDuration, raw)
 		}
 	case KindEnum:
 		for _, v := range d.Values {
