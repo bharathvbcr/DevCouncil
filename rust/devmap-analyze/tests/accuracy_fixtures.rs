@@ -15,7 +15,9 @@
 //!
 //! 1. **Precision at >= 0.9.** A `forbid` row that has a HIGH edge, or a HIGH
 //!    edge from a labelled caller to a same-named symbol the row does not
-//!    accept, is a *false edge*: a wrong answer with no caveat.
+//!    accept, is a *false edge*: a wrong answer with no caveat. A
+//!    `forbid_any_tier` row is stricter: any use edge at all, at any
+//!    confidence, is a false edge — the "no edge of any tier" criterion.
 //! 2. **Honest miss.** An expected edge that is absent must have a ledger row
 //!    in an unattributed class (`unresolved`, `uninferred_receiver`,
 //!    `local_binding`) naming the call. No row, or only an *explained* class
@@ -69,7 +71,17 @@ const UNCONFIRMED_CEILING: f64 = 0.4;
 enum Kind {
     Edge,
     Import,
+    /// No edge at >= 0.9 may join caller and callee (the precision contract).
     Forbid,
+    /// No use edge of any confidence may join them: the claim "no edge of any
+    /// tier", which a `Forbid` row does not prove.
+    ForbidAnyTier,
+}
+
+impl Kind {
+    fn forbids(self) -> bool {
+        matches!(self, Kind::Forbid | Kind::ForbidAnyTier)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +178,7 @@ fn load_rows(dir: &Path) -> Vec<Row> {
             "edge" => Kind::Edge,
             "import" => Kind::Import,
             "forbid" => Kind::Forbid,
+            "forbid_any_tier" => Kind::ForbidAnyTier,
             other => panic!("{at}: unknown kind {other:?}"),
         };
         let level = match cols[5] {
@@ -332,6 +345,26 @@ fn evaluate(rows: &[Row], idx: &Index) -> Vec<Verdict> {
                         }
                     }
                 }
+                Kind::ForbidAnyTier => {
+                    let hit: Vec<(&str, i64)> = uses
+                        .iter()
+                        .filter(|(t, _)| row.members().any(|m| m == t))
+                        .copied()
+                        .collect();
+                    if hit.is_empty() {
+                        Verdict {
+                            status: Status::Ok,
+                            detail: String::new(),
+                        }
+                    } else {
+                        Verdict {
+                            status: Status::FalseEdge,
+                            detail: format!(
+                                "forbidden edge at any tier (target, confidence millis): {hit:?}"
+                            ),
+                        }
+                    }
+                }
                 Kind::Import => {
                     let from = file_of(&row.caller);
                     let present = row.callee.iter().any(|alt| {
@@ -402,6 +435,38 @@ fn evaluate(rows: &[Row], idx: &Index) -> Vec<Verdict> {
                     )
                 }
             }
+        })
+        .collect()
+}
+
+/// Every symbol id and file path the build knows. A symbol's `qualified_name`
+/// is already its graph id (`<file>::<name>`), the string edges carry.
+fn known_ids(built: &Built) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    for e in &built.extractions {
+        ids.insert(e.file_path.clone());
+        ids.extend(e.symbols.iter().map(|s| s.qualified_name.clone()));
+    }
+    ids
+}
+
+/// Forbid rows that name a caller or callee the build does not have. Such a
+/// row passes because nothing can join two symbols that do not exist, which
+/// proves nothing: a renamed fixture symbol or a typo would turn the gate off.
+fn vacuous_forbid_rows(rows: &[Row], ids: &BTreeSet<String>) -> Vec<String> {
+    rows.iter()
+        .filter(|r| r.kind.forbids())
+        .flat_map(|r| {
+            std::iter::once(&r.caller)
+                .chain(r.members())
+                .filter(|id| !ids.contains(id.as_str()))
+                .map(move |id| {
+                    format!(
+                        "{}: forbid row names {id}, which the build has no symbol for, so it \
+                         passes vacuously",
+                        r.key()
+                    )
+                })
         })
         .collect()
 }
@@ -500,6 +565,8 @@ struct LangScore {
     must_rows: usize,
     should_rows: usize,
     forbid_rows: usize,
+    /// The subset of `forbid_rows` that rule out an edge of any tier.
+    forbid_any_tier_rows: usize,
     present: usize,
     miss: usize,
     silent_miss: usize,
@@ -514,23 +581,49 @@ struct LangScore {
 }
 
 impl LangScore {
-    fn recall(&self) -> f64 {
+    fn recall(&self) -> Option<f64> {
         ratio(self.present, self.positive_rows)
     }
-    fn precision(&self) -> f64 {
+    fn precision(&self) -> Option<f64> {
         ratio(self.high_correct, self.high_correct + self.high_false)
     }
-    fn honest_miss(&self) -> f64 {
+    /// `None` when nothing is absent: there is no miss to be honest about.
+    fn honest_miss(&self) -> Option<f64> {
         ratio(self.miss, self.miss + self.silent_miss)
     }
 }
 
-fn ratio(n: usize, d: usize) -> f64 {
-    if d == 0 {
-        1.0
-    } else {
-        n as f64 / d as f64
+/// `None` for an empty denominator: a rate over nothing is unmeasured, and
+/// must never read as a perfect score.
+fn ratio(n: usize, d: usize) -> Option<f64> {
+    (d > 0).then(|| n as f64 / d as f64)
+}
+
+/// The fixture gates a scored language has nothing to measure for. A gate with
+/// no rows under it passes vacuously, so each one is named here and the run
+/// fails rather than reporting a language as meeting a gate it never faced.
+fn unmeasured_fixture_gates(lang: &str, s: &LangScore) -> Vec<String> {
+    let mut out = Vec::new();
+    if s.recall().is_none() {
+        out.push(format!(
+            "{lang}: recall is unmeasured (no expected-edge rows)"
+        ));
     }
+    if s.precision().is_none() {
+        out.push(format!(
+            "{lang}: precision at >= 0.9 is unmeasured (no HIGH edge from a labelled caller)"
+        ));
+    }
+    if s.dead_truly_dead == 0 {
+        out.push(format!(
+            "{lang}: dead code is unmeasured (no truly_dead row in any dead.tsv)"
+        ));
+    }
+    out
+}
+
+fn fmt_rate(rate: Option<f64>) -> String {
+    rate.map_or_else(|| "  n/a".to_string(), |r| format!("{r:6.3}"))
 }
 
 /// HIGH edges from the labelled callers to either an accepted symbol (right) or
@@ -557,7 +650,7 @@ fn high_edge_counts(rows: &[Row], idx: &Index, lang: &str) -> (usize, usize) {
         for (target, _) in uses.iter().filter(|(_, m)| *m >= HIGH_MILLIS) {
             let target = *target;
             match row.kind {
-                Kind::Forbid if row.members().any(|m| m == target) => {
+                kind if kind.forbids() && row.members().any(|m| m == target) => {
                     bad.insert((row.caller.as_str(), target));
                 }
                 Kind::Edge => {
@@ -680,6 +773,8 @@ struct Run {
     verdicts: Vec<Verdict>,
     scores: BTreeMap<&'static str, LangScore>,
     dead_violations: Vec<String>,
+    /// Forbid rows naming a symbol the build lacks (see `vacuous_forbid_rows`).
+    vacuous: Vec<String>,
 }
 
 fn run() -> Run {
@@ -687,10 +782,12 @@ fn run() -> Run {
     let mut verdicts = Vec::new();
     let mut scores: BTreeMap<&'static str, LangScore> = BTreeMap::new();
     let mut dead_violations = Vec::new();
+    let mut vacuous = Vec::new();
 
     for dir in fixture_dirs() {
         let built = build(&dir);
         let fixture_rows = load_rows(&dir);
+        vacuous.extend(vacuous_forbid_rows(&fixture_rows, &known_ids(&built)));
         let idx = index(&built);
         let fixture_verdicts = evaluate(&fixture_rows, &idx);
 
@@ -705,7 +802,11 @@ fn run() -> Run {
             let score = scores.entry(row.language).or_default();
             match row.kind {
                 Kind::Forbid => score.forbid_rows += 1,
-                _ => {
+                Kind::ForbidAnyTier => {
+                    score.forbid_rows += 1;
+                    score.forbid_any_tier_rows += 1;
+                }
+                Kind::Edge | Kind::Import => {
                     score.positive_rows += 1;
                     match row.level {
                         Level::Must => score.must_rows += 1,
@@ -740,6 +841,7 @@ fn run() -> Run {
         verdicts,
         scores,
         dead_violations,
+        vacuous,
     }
 }
 
@@ -749,17 +851,17 @@ fn report(run: &Run) -> String {
     );
     for (lang, s) in &run.scores {
         out.push_str(&format!(
-            "{lang:11} {:3}/{:3}/{:3}  {:>8}/{:<3} {:6.3}  {:6.3} ({:2}/{:2})  {:6.3} ({}/{})  {}/{}, {}/{}\n",
+            "{lang:11} {:3}/{:3}/{:3}  {:>8}/{:<3} {}  {} ({:2}/{:2})  {} ({}/{})  {}/{}, {}/{}\n",
             s.must_rows,
             s.should_rows,
             s.forbid_rows,
             s.present,
             s.positive_rows,
-            s.recall(),
-            s.precision(),
+            fmt_rate(s.recall()),
+            fmt_rate(s.precision()),
             s.high_correct,
             s.high_correct + s.high_false,
-            s.honest_miss(),
+            fmt_rate(s.honest_miss()),
             s.miss,
             s.miss + s.silent_miss,
             s.dead_found,
@@ -788,6 +890,7 @@ fn ratchet_of(run: &Run, known: &BTreeMap<String, Known>) -> serde_json::Value {
                 "positive_rows": s.positive_rows,
                 "present": s.present,
                 "known_failing": listed,
+                "forbid_any_tier_rows": s.forbid_any_tier_rows,
             }),
         );
     }
@@ -818,12 +921,13 @@ fn write_fixture_record(run: &Run) {
                 "devmap_commit": commit,
                 "expected_edge_rows": s.positive_rows,
                 "present": s.present,
-                "recall": round3(s.recall()),
+                "recall": s.recall().map(round3),
                 "forbid_rows": s.forbid_rows,
+                "forbid_any_tier_rows": s.forbid_any_tier_rows,
                 "high_edges_correct": s.high_correct,
                 "high_edges_false": s.high_false,
-                "precision_at_0.9": round3(s.precision()),
-                "honest_miss": { "recorded": s.miss, "absent": s.miss + s.silent_miss, "rate": round3(s.honest_miss()) },
+                "precision_at_0.9": s.precision().map(round3),
+                "honest_miss": { "recorded": s.miss, "absent": s.miss + s.silent_miss, "rate": s.honest_miss().map(round3) },
                 "dead": {
                     "truly_dead": s.dead_truly_dead,
                     "found": s.dead_found,
@@ -985,6 +1089,23 @@ fn the_fixtures_meet_the_gates_and_the_ratchet_only_tightens() {
         "dead-code gates failed:\n  {}",
         run.dead_violations.join("\n  ")
     );
+    assert!(
+        run.vacuous.is_empty(),
+        "forbid rows must name symbols that exist:\n  {}",
+        run.vacuous.join("\n  ")
+    );
+    let unmeasured: Vec<String> = SCORED
+        .iter()
+        .flat_map(|lang| match run.scores.get(lang) {
+            Some(s) => unmeasured_fixture_gates(lang, s),
+            None => vec![format!("{lang}: no fixture row is scored under it")],
+        })
+        .collect();
+    assert!(
+        unmeasured.is_empty(),
+        "a gate with nothing under it is unmeasured, not passed:\n  {}",
+        unmeasured.join("\n  ")
+    );
 
     // The recorded counts only move one way. Row-level equality above already
     // pins today's state; this stops a hand edit to known_failing.tsv or a
@@ -1000,23 +1121,26 @@ fn the_fixtures_meet_the_gates_and_the_ratchet_only_tightens() {
             moved.push(format!("{lang}: not in ratchet.json"));
             continue;
         };
-        if current["present"].as_u64() < old["present"].as_u64() {
-            moved.push(format!(
-                "{lang}: present edges fell {} -> {}",
-                old["present"], current["present"]
-            ));
-        }
-        if current["known_failing"].as_u64() > old["known_failing"].as_u64() {
-            moved.push(format!(
-                "{lang}: known_failing grew {} -> {}",
-                old["known_failing"], current["known_failing"]
-            ));
-        }
-        if current["positive_rows"].as_u64() < old["positive_rows"].as_u64() {
-            moved.push(format!(
-                "{lang}: expected rows were deleted {} -> {}",
-                old["positive_rows"], current["positive_rows"]
-            ));
+        // (key, true when the count may only grow, what moving the wrong way means)
+        for (key, grows, wrong_way) in [
+            ("present", true, "present edges fell"),
+            ("known_failing", false, "known_failing grew"),
+            ("positive_rows", true, "expected rows were deleted"),
+            (
+                "forbid_any_tier_rows",
+                true,
+                "forbid_any_tier rows were deleted or weakened to forbid",
+            ),
+        ] {
+            let (Some(before), Some(after)) = (old[key].as_u64(), current[key].as_u64()) else {
+                moved.push(format!(
+                    "{lang}: ratchet.json has no {key} count, so it cannot be held"
+                ));
+                continue;
+            };
+            if (grows && after < before) || (!grows && after > before) {
+                moved.push(format!("{lang}: {wrong_way} {before} -> {after}"));
+            }
         }
     }
     assert!(
@@ -1129,6 +1253,141 @@ fn a_known_failure_without_a_truth_row_is_stale() {
     let known = BTreeMap::from([("go\tgo.GONE".to_string(), known_entry(Status::Miss))]);
     let diff = diff_against_known(&[], &known);
     assert_eq!(diff.regressions.len(), 1);
+}
+
+/// The rows whose card criterion says "no edge of any tier". A `forbid` row
+/// proves only that no edge reaches 0.9; these must prove that none exists.
+const NO_EDGE_OF_ANY_TIER: &[(&str, &str)] = &[
+    ("ts", "ts.V2"),
+    ("swift", "sw.M4b"),
+    ("swift", "sw.M4d"),
+    ("kotlin-gaps", "kg.S2a"),
+    ("kotlin-gaps", "kg.S2b"),
+    ("rust-rootcrate", "rr.count"),
+    ("go", "go.Q2c.twin"),
+    ("go", "go.Q2c.shadowed"),
+];
+
+#[test]
+fn the_rows_that_claim_no_edge_of_any_tier_are_forbid_any_tier_rows() {
+    let mut kinds: BTreeMap<(String, String), String> = BTreeMap::new();
+    for dir in fixture_dirs() {
+        let fixture = dir.file_name().unwrap().to_string_lossy().into_owned();
+        let raw = std::fs::read_to_string(dir.join("edges.tsv")).unwrap();
+        for line in raw
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        {
+            let cols: Vec<&str> = line.split('\t').collect();
+            kinds.insert((fixture.clone(), cols[0].to_string()), cols[4].to_string());
+        }
+    }
+    for (fixture, id) in NO_EDGE_OF_ANY_TIER {
+        let kind = kinds.get(&((*fixture).to_string(), (*id).to_string()));
+        assert_eq!(
+            kind.map(String::as_str),
+            Some("forbid_any_tier"),
+            "{fixture}/{id}: its criterion is \"no edge of any tier\", which a plain `forbid` row \
+             (>= 0.9 only) does not prove"
+        );
+    }
+}
+
+fn synthetic_row(kind: Kind) -> Row {
+    Row {
+        fixture: "go".into(),
+        id: "go.synthetic".into(),
+        caller: "app/a.go::caller".into(),
+        callee: vec![vec!["app/b.go::target".into()]],
+        kind,
+        level: Level::Must,
+        ledger: Vec::new(),
+        language: "go",
+    }
+}
+
+fn index_with_edge(millis: i64) -> Index<'static> {
+    Index {
+        uses: BTreeMap::from([("app/a.go::caller", vec![("app/b.go::target", millis)])]),
+        imports: BTreeSet::new(),
+        ledger: BTreeMap::new(),
+        file_ledger: BTreeMap::new(),
+    }
+}
+
+#[test]
+fn a_forbid_any_tier_row_fails_on_an_edge_below_the_high_tier_and_a_forbid_row_does_not() {
+    let low = index_with_edge(400);
+    let any_tier = evaluate(&[synthetic_row(Kind::ForbidAnyTier)], &low);
+    assert_eq!(any_tier[0].status, Status::FalseEdge, "{:?}", any_tier[0]);
+    assert!(any_tier[0].detail.contains("any tier"), "{:?}", any_tier[0]);
+    let forbid = evaluate(&[synthetic_row(Kind::Forbid)], &low);
+    assert_eq!(
+        forbid[0].status,
+        Status::Ok,
+        "a plain forbid row is the >= 0.9 contract"
+    );
+
+    let none = index_with_edge(0);
+    let none = Index {
+        uses: BTreeMap::new(),
+        ..none
+    };
+    let clean = evaluate(&[synthetic_row(Kind::ForbidAnyTier)], &none);
+    assert_eq!(clean[0].status, Status::Ok);
+
+    // A HIGH edge breaks both, and counts as a false HIGH edge for precision.
+    let high = index_with_edge(950);
+    assert_eq!(
+        evaluate(&[synthetic_row(Kind::ForbidAnyTier)], &high)[0].status,
+        Status::FalseEdge
+    );
+    assert_eq!(
+        high_edge_counts(&[synthetic_row(Kind::ForbidAnyTier)], &high, "go"),
+        (0, 1)
+    );
+}
+
+#[test]
+fn a_forbid_row_naming_a_symbol_the_build_lacks_is_vacuous() {
+    let ids = BTreeSet::from(["app/a.go::caller".to_string()]);
+    for kind in [Kind::Forbid, Kind::ForbidAnyTier] {
+        let found = vacuous_forbid_rows(&[synthetic_row(kind)], &ids);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("app/b.go::target"), "{found:?}");
+    }
+    let both = BTreeSet::from([
+        "app/a.go::caller".to_string(),
+        "app/b.go::target".to_string(),
+    ]);
+    assert!(vacuous_forbid_rows(&[synthetic_row(Kind::ForbidAnyTier)], &both).is_empty());
+    // An expected edge to a missing symbol already fails as a miss.
+    assert!(vacuous_forbid_rows(&[synthetic_row(Kind::Edge)], &ids).is_empty());
+}
+
+#[test]
+fn an_unmeasured_fixture_rate_is_none_not_a_perfect_score() {
+    let empty = LangScore::default();
+    assert_eq!(empty.recall(), None);
+    assert_eq!(empty.precision(), None);
+    assert_eq!(empty.honest_miss(), None);
+    let missing = unmeasured_fixture_gates("go", &empty);
+    for gate in ["recall", "precision at >= 0.9", "dead"] {
+        assert!(
+            missing.iter().any(|m| m.contains(gate)),
+            "{gate} is unmeasured and must be reported: {missing:?}"
+        );
+    }
+    let measured = LangScore {
+        positive_rows: 2,
+        present: 1,
+        high_correct: 1,
+        dead_truly_dead: 1,
+        dead_found: 1,
+        ..LangScore::default()
+    };
+    assert_eq!(measured.recall(), Some(0.5));
+    assert!(unmeasured_fixture_gates("go", &measured).is_empty());
 }
 
 #[test]

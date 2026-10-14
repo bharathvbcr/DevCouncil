@@ -10,6 +10,7 @@
 #   kind      edge   = a Calls/References/Instantiates/Extends/Implements/... edge, any tier
 #             import = an Imports edge between the two files
 #             forbid = NO edge of any kind at confidence >= 0.9 may join caller and callee
+#             forbid_any_tier = NO use edge at any confidence may join them ("no edge of any tier")
 #   level     must   = a correct resolver has this edge
 #             should = the audit accepted an honest miss or an alternative here
 #   ledger    optional `a|b` bare names a ledger row may carry when the expected callee's

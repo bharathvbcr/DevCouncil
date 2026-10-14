@@ -30,7 +30,16 @@
 //!   previous row (precision -1 pt, recall -2 pt) and the recall floors in
 //!   `corpora.json`. A gate that held in the previous row must keep holding; a
 //!   gate that did not may only not get worse, so the first record is a
-//!   baseline and each language card tightens it.
+//!   baseline and each language card tightens it. On top of that ratchet,
+//!   [`claim_gates`] holds the cards' claims absolutely: recall at the card
+//!   target (`recall_targets_percent`), UniqueGlobal precision >= 0.95 and zero
+//!   AmbiguousGlobal edges. A gate whose number is missing - no labels, no
+//!   measurement - is unmeasured and fails; a corpus without labels is gated,
+//!   not skipped.
+//! * **Fresh.** The runner refuses a DevMap that lacks any commit in
+//!   `corpora.json.record_must_include` (S2 and the language lanes). Replaced
+//!   rows move to `record.superseded`; `record.open_gates` lists every gate the
+//!   committed record does not meet, and CI checks that list against the record.
 //!
 //! Run it before any DevMap release and after a change to `treesitter.rs`,
 //! `langcalls/`, `langdecl/`, `resolver.rs` or `liveness.rs` that touches the
@@ -54,6 +63,46 @@ const DEAD_FP_CEILING: f64 = 0.05;
 const PRECISION_TOLERANCE: f64 = 0.01;
 const RECALL_TOLERANCE: f64 = 0.02;
 const HIGH_MILLIS: i64 = 900;
+/// S2's contract: a UniqueGlobal edge (a bare-name bind with no other
+/// evidence) is right at least this often.
+const UNIQUE_GLOBAL_PRECISION_FLOOR: f64 = 0.95;
+
+/// The recall keys `corpora.json` must carry, floor and target alike.
+const RECALL_KEYS: [&str; 7] = [
+    "go",
+    "python",
+    "typescript",
+    "rust_free_self",
+    "rust_non_self",
+    "swift",
+    "kotlin",
+];
+
+/// The lowest each recall *floor* (the E3 baseline: today's measurement minus
+/// two points) may ever be. A language card raises its floor in its own
+/// change; nothing lowers one. Lowering `corpora.json` below this fails
+/// `no_recall_floor_or_card_target_is_ever_lowered`.
+const MIN_RECALL_FLOORS_PERCENT: [(&str, f64); 7] = [
+    ("go", 88.0),
+    ("python", 78.0),
+    ("typescript", 67.0),
+    ("rust_free_self", 91.0),
+    ("rust_non_self", 46.0),
+    ("swift", 80.0),
+    ("kotlin", 60.0),
+];
+
+/// The recall each language card claims (audit 2026-10-13). These are gated
+/// absolutely: below target, or unmeasured, fails.
+const MIN_RECALL_TARGETS_PERCENT: [(&str, f64); 7] = [
+    ("go", 95.0),
+    ("python", 88.0),
+    ("typescript", 85.0),
+    ("rust_free_self", 95.0),
+    ("rust_non_self", 75.0),
+    ("swift", 90.0),
+    ("kotlin", 85.0),
+];
 
 fn accuracy_root() -> PathBuf {
     common::accuracy_root()
@@ -72,7 +121,43 @@ struct Pin {
     languages: Vec<String>,
 }
 
-fn load_pins() -> (Vec<Pin>, BTreeMap<String, f64>) {
+/// What the record is gated on, from `corpora.json`.
+#[derive(Debug, Clone)]
+struct Gates {
+    /// E3 baseline floors, held as a ratchet against the previous record.
+    floors: BTreeMap<String, f64>,
+    /// The language cards' recall targets, gated absolutely.
+    targets: BTreeMap<String, f64>,
+    /// DevMap commits a measurement must be taken on top of (S2 and every
+    /// language lane). A row measured before them describes a DevMap that no
+    /// longer exists.
+    must_include: Vec<String>,
+}
+
+fn rates(value: &Value, key: &str, path: &Path) -> BTreeMap<String, f64> {
+    let table = value[key]
+        .as_object()
+        .unwrap_or_else(|| panic!("{}: no {key} object", path.display()));
+    let out: BTreeMap<String, f64> = table
+        .iter()
+        .map(|(k, v)| {
+            let pct = v
+                .as_f64()
+                .unwrap_or_else(|| panic!("{}: {key}.{k} is not a number", path.display()));
+            (k.clone(), pct / 100.0)
+        })
+        .collect();
+    for k in RECALL_KEYS {
+        assert!(
+            out.contains_key(k),
+            "{}: {key} has no {k}; an ungated language is not a passing one",
+            path.display()
+        );
+    }
+    out
+}
+
+fn load_pins() -> (Vec<Pin>, Gates) {
     let path = accuracy_root().join("corpora.json");
     let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let value: Value =
@@ -92,13 +177,33 @@ fn load_pins() -> (Vec<Pin>, BTreeMap<String, f64>) {
                 .collect(),
         })
         .collect();
-    let floors = value["recall_floors_percent"]
-        .as_object()
-        .expect("recall_floors_percent")
+    let must_include: Vec<String> = value["record_must_include"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{}: no record_must_include array", path.display()))
         .iter()
-        .map(|(k, v)| (k.clone(), v.as_f64().expect("floor") / 100.0))
+        .map(|c| {
+            c["commit"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}: record_must_include row {c} has no commit",
+                        path.display()
+                    )
+                })
+                .to_string()
+        })
         .collect();
-    (pins, floors)
+    assert!(
+        !must_include.is_empty(),
+        "{}: record_must_include is empty, so a stale record cannot be told from a fresh one",
+        path.display()
+    );
+    let gates = Gates {
+        floors: rates(&value, "recall_floors_percent", &path),
+        targets: rates(&value, "recall_targets_percent", &path),
+        must_include,
+    };
+    (pins, gates)
 }
 
 fn env_name(corpus: &str) -> String {
@@ -491,44 +596,132 @@ fn dead_fp_rate(row: &Value) -> Option<f64> {
     (rows > 0.0).then(|| fp / rows)
 }
 
-/// The recall to hold against `floor`: Rust is gated on its two classes
-/// separately, every other language on the overall rate.
-fn recall_for_floor(
+/// The recall to hold against a `table` of floors or targets: Rust is gated on
+/// its two classes separately, every other language on the overall rate.
+/// `Err` when the table has no entry for the language: an ungated language
+/// must be reported, never skipped.
+fn recall_checks(
     lang: &str,
     row: &Value,
-    floors: &BTreeMap<String, f64>,
-) -> Vec<(String, Option<f64>, f64)> {
-    if lang == "rust" {
+    table: &BTreeMap<String, f64>,
+) -> Result<Vec<(String, Option<f64>, f64)>, String> {
+    let keyed: Vec<(String, String, Option<f64>)> = if lang == "rust" {
         ["free_self", "non_self"]
             .iter()
-            .filter_map(|class| {
-                let floor = *floors.get(&format!("rust_{class}"))?;
-                let c = &row["recall"]["by_construct"][*class];
-                let rate = c["rate"].as_f64();
-                Some((format!("recall[{class}]"), rate, floor))
+            .map(|class| {
+                (
+                    format!("rust_{class}"),
+                    format!("recall[{class}]"),
+                    row["recall"]["by_construct"][*class]["rate"].as_f64(),
+                )
             })
             .collect()
     } else {
-        floors
-            .get(lang)
-            .map(|floor| {
-                vec![(
-                    "recall".to_string(),
-                    rate_of(row, &["recall", "rate"]),
-                    *floor,
-                )]
-            })
-            .unwrap_or_default()
-    }
+        vec![(
+            lang.to_string(),
+            "recall".to_string(),
+            rate_of(row, &["recall", "rate"]),
+        )]
+    };
+    keyed
+        .into_iter()
+        .map(|(key, name, rate)| {
+            table
+                .get(&key)
+                .map(|floor| (name, rate, *floor))
+                .ok_or_else(|| {
+                    format!("{lang}: corpora.json sets no recall for {key}, so it is ungated")
+                })
+        })
+        .collect()
 }
 
-/// Gate violations for one language row.
+/// Every gate violation for one corpus language: [`regression_gates`] against
+/// the previous row, then [`claim_gates`] against the cards' targets.
+fn evaluate_gates(
+    lang: &str,
+    previous: Option<&Value>,
+    current: &Value,
+    measurement: Option<&Value>,
+    gates: &Gates,
+) -> Vec<String> {
+    let mut out = regression_gates(lang, previous, current, &gates.floors);
+    out.extend(claim_gates(lang, current, measurement, gates));
+    out
+}
+
+/// The absolute claims the language cards and S2 make, which hold whatever the
+/// previous record said: recall at or above the card's target, UniqueGlobal
+/// precision >= 0.95, and no AmbiguousGlobal edge at all. Each is unmeasured -
+/// and so failing - when the number it needs is missing: `current` is
+/// `Value::Null` for a corpus without labels, `measurement` is `None` for a
+/// language the label-free pass never measured.
+fn claim_gates(
+    lang: &str,
+    current: &Value,
+    measurement: Option<&Value>,
+    gates: &Gates,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    match recall_checks(lang, current, &gates.targets) {
+        Err(e) => out.push(e),
+        Ok(checks) => {
+            for (name, now, target) in checks {
+                match now {
+                    None => out.push(format!(
+                        "{lang}: {name} card target {target:.3} is unmeasured (no labels), so it cannot pass"
+                    )),
+                    Some(v) if v < target => out.push(format!(
+                        "{lang}: {name} {v:.3} is below the card target {target:.3}"
+                    )),
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+
+    let unique_edges = measurement
+        .and_then(|m| m["use_edges_by_resolution"].as_object())
+        .map(|kinds| {
+            kinds
+                .get("UniqueGlobal")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        });
+    match (
+        rate_of(current, &["unique_global_precision", "rate"]),
+        unique_edges,
+    ) {
+        // No UniqueGlobal edge exists to be wrong: nothing to judge.
+        (None, Some(0)) => {}
+        (None, _) => out.push(format!(
+            "{lang}: UniqueGlobal precision is unmeasured (no labelled UniqueGlobal edge), so it cannot pass"
+        )),
+        (Some(v), _) if v < UNIQUE_GLOBAL_PRECISION_FLOOR => out.push(format!(
+            "{lang}: UniqueGlobal precision {v:.3} is below {UNIQUE_GLOBAL_PRECISION_FLOOR:.3}"
+        )),
+        (Some(_), _) => {}
+    }
+
+    match measurement.and_then(|m| m["ambiguous_global_edges"].as_u64()) {
+        None => out.push(format!(
+            "{lang}: AmbiguousGlobal edges are unmeasured (no label-free measurement), so the =0 gate cannot pass"
+        )),
+        Some(0) => {}
+        Some(n) => out.push(format!(
+            "{lang}: {n} AmbiguousGlobal edge(s); S2 makes AmbiguousGlobal ledger-only, so the gate is 0"
+        )),
+    }
+    out
+}
+
+/// Gate violations for one language row against the previous one.
 ///
 /// An absolute gate that held in `previous` must hold now. One that did not
 /// may only stay put (within tolerance): the first record is a baseline, and
 /// each language card is what moves it. A gate whose number is `None` - no
 /// labels, no sample - is reported as unmeasured, never as passed.
-fn evaluate_gates(
+fn regression_gates(
     lang: &str,
     previous: Option<&Value>,
     current: &Value,
@@ -598,16 +791,97 @@ fn evaluate_gates(
         false,
         0.0,
     );
-    for (name, now, floor) in recall_for_floor(lang, current, floors) {
-        let before = previous.and_then(|p| {
-            recall_for_floor(lang, p, floors)
-                .into_iter()
-                .find(|(n, _, _)| *n == name)
-                .and_then(|(_, r, _)| r)
-        });
-        check(&name, now, before, floor, true, RECALL_TOLERANCE);
+    match recall_checks(lang, current, floors) {
+        Err(e) => out.push(e),
+        Ok(checks) => {
+            for (name, now, floor) in checks {
+                let before = previous.and_then(|p| {
+                    recall_checks(lang, p, floors)
+                        .ok()?
+                        .into_iter()
+                        .find(|(n, _, _)| *n == name)
+                        .and_then(|(_, r, _)| r)
+                });
+                check(&name, now, before, floor, true, RECALL_TOLERANCE);
+            }
+        }
     }
     out
+}
+
+/// Every gate the committed `record` does not meet, over every pinned corpus
+/// and language, whether or not this run measured it. A row measured at a
+/// DevMap commit that does not include every `gates.must_include` commit is
+/// stale, and so is every number in it.
+fn open_gates(record: &Value, pins: &[Pin], gates: &Gates) -> Vec<String> {
+    let mut out = BTreeSet::new();
+    let find = |list: &str, pin: &Pin| -> Option<Value> {
+        record[list].as_array().and_then(|rows| {
+            rows.iter()
+                .find(|r| {
+                    r["name"] == pin.name.as_str() && r["corpus_commit"] == pin.commit.as_str()
+                })
+                .cloned()
+        })
+    };
+    for pin in pins {
+        let measurement = find("measurements", pin);
+        match &measurement {
+            None => {
+                out.insert(format!(
+                    "{}: no label-free measurement at the pinned commit {}",
+                    pin.name, pin.commit
+                ));
+            }
+            Some(m) => {
+                let included: BTreeSet<&str> = m["includes_commits"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect();
+                let missing: Vec<&str> = gates
+                    .must_include
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|c| !included.contains(c))
+                    .collect();
+                if !missing.is_empty() {
+                    out.insert(format!(
+                        "{}: stale - measured at DevMap {} ({}), not shown to include {} required commit(s) (S2 and the language lanes); re-run the corpus runner",
+                        pin.name,
+                        m["devmap_commit"].as_str().unwrap_or("unknown"),
+                        m["date"].as_str().unwrap_or("undated"),
+                        missing.len()
+                    ));
+                }
+            }
+        }
+        let labelled = find("corpora", pin);
+        let previous = record["superseded"].as_array().and_then(|rows| {
+            rows.iter()
+                .rev()
+                .find(|r| r["list"] == "corpora" && r["entry"]["name"] == pin.name.as_str())
+                .map(|r| r["entry"].clone())
+        });
+        for lang in &pin.languages {
+            let current = labelled
+                .as_ref()
+                .map_or(Value::Null, |l| l["languages"][lang.as_str()].clone());
+            let prev_row = previous
+                .as_ref()
+                .map(|p| &p["languages"][lang.as_str()])
+                .filter(|v| !v.is_null());
+            let lang_measurement = measurement
+                .as_ref()
+                .map(|m| &m["languages"][lang.as_str()])
+                .filter(|v| !v.is_null());
+            for f in evaluate_gates(lang, prev_row, &current, lang_measurement, gates) {
+                out.insert(format!("{}: {f}", pin.name));
+            }
+        }
+    }
+    out.into_iter().collect()
 }
 
 // ---------------------------------------------------------------- the run
@@ -636,9 +910,43 @@ fn load_record() -> Value {
         .unwrap_or_else(|| json!({ "schema": 1, "corpora": [], "measurements": [] }))
 }
 
+/// Refuses to measure with a DevMap that does not contain every required
+/// commit: a record from before S2 or a language lane is not the record.
+/// Returns the commits proven included, written into each measurement.
+fn verify_devmap_includes(must_include: &[String]) -> Result<Vec<String>, String> {
+    let here = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for commit in must_include {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(here)
+            .args(["merge-base", "--is-ancestor", commit, "HEAD"])
+            .output()
+            .map_err(|e| format!("git merge-base: {e}"))?;
+        match out.status.code() {
+            Some(0) => {}
+            Some(1) => {
+                return Err(format!(
+                    "this DevMap checkout does not include {commit}, which corpora.json requires of every record row"
+                ))
+            }
+            _ => {
+                return Err(format!(
+                    "could not tell whether HEAD includes {commit}: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ))
+            }
+        }
+    }
+    Ok(must_include.to_vec())
+}
+
 /// Measure one pinned corpus. Returns its `measurements` entry, and its
 /// `corpora` entry when it has labels.
-fn measure_corpus(dir: &Path, pin: &Pin) -> Result<(Value, Option<Value>), String> {
+fn measure_corpus(
+    dir: &Path,
+    pin: &Pin,
+    includes: &[String],
+) -> Result<(Value, Option<Value>), String> {
     verify_pin(dir, pin)?;
     let built = common::build(dir);
     let structure = structure(&built, &pin.languages);
@@ -648,6 +956,7 @@ fn measure_corpus(dir: &Path, pin: &Pin) -> Result<(Value, Option<Value>), Strin
         "name": pin.name,
         "date": date,
         "devmap_commit": commit,
+        "includes_commits": includes,
         "corpus_commit": pin.commit,
         "analysis_status": format!("{:?}", built.analysis.status),
         "dead_rows_total": built.analysis.dead_symbols.len(),
@@ -672,22 +981,45 @@ fn measure_corpus(dir: &Path, pin: &Pin) -> Result<(Value, Option<Value>), Strin
     ))
 }
 
-/// Replace the entry named `name` in `list`, or append it.
-fn upsert(list: &mut Value, name: &str, entry: Value) {
-    let items = list.as_array_mut().expect("record list is an array");
-    match items.iter_mut().find(|e| e["name"] == name) {
-        Some(slot) => *slot = entry,
-        None => items.push(entry),
+/// Put `entry` in `record[list]`. An entry already there under the same name
+/// is moved to `record.superseded` (with the date it was superseded), never
+/// dropped: the history of what the record said is part of the record, and
+/// `corpora` also holds the labelled dead record other tests read.
+fn supersede(record: &mut Value, list: &str, name: &str, entry: Value, date: &str) {
+    if !record[list].is_array() {
+        record[list] = json!([]);
     }
+    let items = record[list].as_array_mut().expect("checked above");
+    let old = items
+        .iter()
+        .position(|e| e["name"] == name)
+        .map(|i| items.remove(i));
+    items.push(entry);
+    if let Some(old) = old {
+        if !record["superseded"].is_array() {
+            record["superseded"] = json!([]);
+        }
+        record["superseded"]
+            .as_array_mut()
+            .expect("checked above")
+            .push(json!({ "list": list, "superseded_on": date, "entry": old }));
+    }
+}
+
+/// Rewrites `record.open_gates` from the record itself.
+fn refresh_open_gates(record: &mut Value, pins: &[Pin], gates: &Gates) {
+    record["open_gates"] = json!(open_gates(record, pins, gates));
 }
 
 #[test]
 #[ignore = "needs DEVMAP_CORPUS_<NAME> checkouts of the owner's private repositories"]
 fn score_the_pinned_corpora_and_write_the_record() {
-    let (pins, floors) = load_pins();
+    let (pins, gates) = load_pins();
+    let includes = verify_devmap_includes(&gates.must_include).unwrap_or_else(|e| panic!("{e}"));
     let mut record = load_record();
     let mut failures = Vec::new();
     let mut ran = 0;
+    let date = today();
 
     for pin in &pins {
         let Some(dir) = std::env::var_os(env_name(&pin.name)).map(PathBuf::from) else {
@@ -696,31 +1028,35 @@ fn score_the_pinned_corpora_and_write_the_record() {
         };
         ran += 1;
         let (measurement, labelled) =
-            measure_corpus(&dir, pin).unwrap_or_else(|e| panic!("{}: {e}", pin.name));
+            measure_corpus(&dir, pin, &includes).unwrap_or_else(|e| panic!("{}: {e}", pin.name));
         println!("{}", serde_json::to_string_pretty(&measurement).unwrap());
-        upsert(&mut record["measurements"], &pin.name, measurement);
 
+        let previous = record["corpora"]
+            .as_array()
+            .and_then(|a| a.iter().find(|e| e["name"] == pin.name.as_str()))
+            .cloned();
+        // A corpus without labels is gated too: every labelled gate then
+        // reports itself unmeasured, which fails. Skipping it would let a run
+        // with no labels anywhere pass every gate.
+        for lang in &pin.languages {
+            let prev_row = previous
+                .as_ref()
+                .map(|p| &p["languages"][lang.as_str()])
+                .filter(|v| !v.is_null());
+            let current = labelled
+                .as_ref()
+                .map_or(Value::Null, |e| e["languages"][lang.as_str()].clone());
+            let lang_measurement =
+                Some(&measurement["languages"][lang.as_str()]).filter(|v| !v.is_null());
+            failures.extend(
+                evaluate_gates(lang, prev_row, &current, lang_measurement, &gates)
+                    .into_iter()
+                    .map(|f| format!("{}: {f}", pin.name)),
+            );
+        }
+        supersede(&mut record, "measurements", &pin.name, measurement, &date);
         if let Some(entry) = labelled {
-            let previous = record["corpora"]
-                .as_array()
-                .and_then(|a| a.iter().find(|e| e["name"] == pin.name.as_str()))
-                .cloned();
-            for lang in &pin.languages {
-                let prev_row = previous
-                    .as_ref()
-                    .map(|p| &p["languages"][lang.as_str()])
-                    .filter(|v| !v.is_null());
-                let current = &entry["languages"][lang.as_str()];
-                if current.is_null() {
-                    continue;
-                }
-                failures.extend(
-                    evaluate_gates(lang, prev_row, current, &floors)
-                        .into_iter()
-                        .map(|f| format!("{}: {f}", pin.name)),
-                );
-            }
-            upsert(&mut record["corpora"], &pin.name, entry);
+            supersede(&mut record, "corpora", &pin.name, entry, &date);
         }
     }
     assert!(
@@ -729,7 +1065,9 @@ fn score_the_pinned_corpora_and_write_the_record() {
     );
 
     // The record is written before the gates are asserted: a failing gate is a
-    // finding to commit and explain, not a number to hide.
+    // finding to commit and explain, not a number to hide. `open_gates` carries
+    // it in the record for every pinned corpus, measured this run or not.
+    refresh_open_gates(&mut record, &pins, &gates);
     std::fs::write(
         record_path(),
         serde_json::to_string_pretty(&record).unwrap() + "\n",
@@ -739,6 +1077,46 @@ fn score_the_pinned_corpora_and_write_the_record() {
         failures.is_empty(),
         "record gates failed:\n  {}",
         failures.join("\n  ")
+    );
+}
+
+/// CI half of the record's honesty: `record.json.open_gates` must be exactly
+/// what the gates find in the committed record. So the record cannot claim a
+/// clean bill it does not have - a stale row, an unlabelled corpus or a
+/// nonzero AmbiguousGlobal count is listed until a run actually fixes it - and
+/// a hand edit to `corpora.json` or the record that changes the outcome fails
+/// here until `open_gates` says so.
+/// `DEVMAP_ACCURACY_BLESS=1` rewrites `open_gates` from the record.
+#[test]
+fn the_committed_record_lists_every_gate_it_does_not_meet() {
+    let (pins, gates) = load_pins();
+    let mut record: Value = serde_json::from_str(
+        &std::fs::read_to_string(record_path()).expect("record.json is readable"),
+    )
+    .expect("record.json is JSON");
+    let found = open_gates(&record, &pins, &gates);
+    if std::env::var_os("DEVMAP_ACCURACY_BLESS").is_some() {
+        refresh_open_gates(&mut record, &pins, &gates);
+        std::fs::write(
+            record_path(),
+            serde_json::to_string_pretty(&record).unwrap() + "\n",
+        )
+        .expect("write record.json");
+        return;
+    }
+    let listed: Vec<String> = record["open_gates"]
+        .as_array()
+        .unwrap_or_else(|| panic!("record.json has no open_gates array"))
+        .iter()
+        .map(|v| v.as_str().expect("open_gates holds strings").to_string())
+        .collect();
+    let found_set: BTreeSet<&String> = found.iter().collect();
+    let listed_set: BTreeSet<&String> = listed.iter().collect();
+    let unlisted: Vec<&&String> = found_set.difference(&listed_set).collect();
+    let cleared: Vec<&&String> = listed_set.difference(&found_set).collect();
+    assert!(
+        unlisted.is_empty() && cleared.is_empty(),
+        "record.json open_gates is out of date (DEVMAP_ACCURACY_BLESS=1 rewrites it):\n  failing but not listed: {unlisted:#?}\n  listed but no longer failing: {cleared:#?}"
     );
 }
 
@@ -877,6 +1255,10 @@ fn row(precision: (u64, u64), recall: (u64, u64), honest: (u64, u64), dead: (u64
 }
 
 fn floors() -> BTreeMap<String, f64> {
+    load_pins().1.floors
+}
+
+fn gates() -> Gates {
     load_pins().1
 }
 
@@ -885,14 +1267,14 @@ fn a_gate_that_held_must_keep_holding_and_one_that_did_not_may_only_stay_put() {
     // First record, everything below the floors: a baseline, no failure beyond
     // the unmeasured ones.
     let first = row((90, 100), (60, 100), (90, 100), (3, 10));
-    assert!(evaluate_gates("go", None, &first, &floors()).is_empty());
+    assert!(regression_gates("go", None, &first, &floors()).is_empty());
 
     // The same numbers again: unchanged is not a regression.
-    assert!(evaluate_gates("go", Some(&first), &first, &floors()).is_empty());
+    assert!(regression_gates("go", Some(&first), &first, &floors()).is_empty());
 
     // Precision fell two points: a regression even though it never met 0.95.
     let worse = row((88, 100), (60, 100), (90, 100), (3, 10));
-    let found = evaluate_gates("go", Some(&first), &worse, &floors());
+    let found = regression_gates("go", Some(&first), &worse, &floors());
     assert!(
         found
             .iter()
@@ -902,9 +1284,9 @@ fn a_gate_that_held_must_keep_holding_and_one_that_did_not_may_only_stay_put() {
 
     // Met the floor once, must meet it again.
     let good = row((97, 100), (90, 100), (99, 100), (0, 10));
-    assert!(evaluate_gates("go", Some(&good), &good, &floors()).is_empty());
+    assert!(regression_gates("go", Some(&good), &good, &floors()).is_empty());
     let slipped = row((94, 100), (90, 100), (99, 100), (0, 10));
-    let found = evaluate_gates("go", Some(&good), &slipped, &floors());
+    let found = regression_gates("go", Some(&good), &slipped, &floors());
     assert!(
         found.iter().any(|f| f.contains("no longer meets")),
         "{found:?}"
@@ -912,12 +1294,12 @@ fn a_gate_that_held_must_keep_holding_and_one_that_did_not_may_only_stay_put() {
 
     // Recall under the Go floor (88) that previously held.
     let low_recall = row((97, 100), (80, 100), (99, 100), (0, 10));
-    let found = evaluate_gates("go", Some(&good), &low_recall, &floors());
+    let found = regression_gates("go", Some(&good), &low_recall, &floors());
     assert!(found.iter().any(|f| f.contains("recall")), "{found:?}");
 
     // Dead false positives rising is a regression with zero tolerance.
     let dead_worse = row((97, 100), (90, 100), (99, 100), (1, 10));
-    let found = evaluate_gates("go", Some(&good), &dead_worse, &floors());
+    let found = regression_gates("go", Some(&good), &dead_worse, &floors());
     assert!(
         found.iter().any(|f| f.contains("dead false-positive")),
         "{found:?}"
@@ -927,7 +1309,7 @@ fn a_gate_that_held_must_keep_holding_and_one_that_did_not_may_only_stay_put() {
 #[test]
 fn an_unmeasured_gate_is_reported_and_never_passes() {
     let unlabelled = row((0, 0), (0, 0), (0, 0), (0, 0));
-    let found = evaluate_gates("python", None, &unlabelled, &floors());
+    let found = evaluate_gates("python", None, &unlabelled, None, &gates());
     assert!(
         found
             .iter()
@@ -944,6 +1326,240 @@ fn an_unmeasured_gate_is_reported_and_never_passes() {
         found.iter().any(|f| f.contains("recall is unmeasured")),
         "{found:?}"
     );
+    for claim in [
+        "recall card target 0.880 is unmeasured",
+        "UniqueGlobal precision is unmeasured",
+        "AmbiguousGlobal edges are unmeasured",
+    ] {
+        assert!(
+            found.iter().any(|f| f.contains(claim)),
+            "{claim}: {found:?}"
+        );
+    }
+    // A corpus with no labels at all is `Null`, and fails the same way.
+    let found = evaluate_gates("go", None, &Value::Null, None, &gates());
+    assert!(
+        found
+            .iter()
+            .any(|f| f.contains("confident edge precision is unmeasured")),
+        "{found:?}"
+    );
+}
+
+/// A label-free measurement row for one language.
+fn measured(ambiguous: u64, unique: u64) -> Value {
+    json!({
+        "ambiguous_global_edges": ambiguous,
+        "use_edges_by_resolution": { "AmbiguousGlobal": ambiguous, "UniqueGlobal": unique, "SameFile": 10 },
+    })
+}
+
+/// A labelled row that meets every claim for Go (target 95).
+fn meeting_go_claims() -> Value {
+    let mut r = row((97, 100), (96, 100), (99, 100), (0, 10));
+    r["unique_global_precision"] = json!({ "correct": 19, "total": 20, "rate": 0.95 });
+    r
+}
+
+#[test]
+fn the_claim_gates_pass_only_when_every_claim_is_measured_and_met() {
+    let m = measured(0, 20);
+    let found = claim_gates("go", &meeting_go_claims(), Some(&m), &gates());
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn ambiguous_global_edges_fail_the_gate_whatever_the_previous_record_said() {
+    let found = claim_gates(
+        "go",
+        &meeting_go_claims(),
+        Some(&measured(13, 20)),
+        &gates(),
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("13 AmbiguousGlobal edge(s)"), "{found:?}");
+    // Absolute: an unchanged nonzero count against an identical previous row
+    // still fails through evaluate_gates.
+    let r = meeting_go_claims();
+    let found = evaluate_gates("go", Some(&r), &r, Some(&measured(13, 20)), &gates());
+    assert!(
+        found.iter().any(|f| f.contains("AmbiguousGlobal")),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn unique_global_precision_is_gated_at_095_and_vacuous_only_with_no_unique_global_edge() {
+    let mut r = meeting_go_claims();
+    r["unique_global_precision"] = json!({ "correct": 18, "total": 20, "rate": 0.9 });
+    let found = claim_gates("go", &r, Some(&measured(0, 20)), &gates());
+    assert!(
+        found
+            .iter()
+            .any(|f| f.contains("UniqueGlobal precision 0.900 is below 0.950")),
+        "{found:?}"
+    );
+
+    r["unique_global_precision"] = json!({ "correct": 0, "total": 0, "rate": null });
+    let found = claim_gates("go", &r, Some(&measured(0, 20)), &gates());
+    assert!(
+        found
+            .iter()
+            .any(|f| f.contains("UniqueGlobal precision is unmeasured")),
+        "20 UniqueGlobal edges and no label on any: {found:?}"
+    );
+    let found = claim_gates("go", &r, Some(&measured(0, 0)), &gates());
+    assert!(found.is_empty(), "no UniqueGlobal edge to judge: {found:?}");
+}
+
+#[test]
+fn a_card_target_is_absolute_and_separate_from_the_baseline_floor() {
+    // 90% clears the Go floor (88) but not the Go card's target (95).
+    let mut r = meeting_go_claims();
+    r["recall"] = json!({ "present": 90, "total": 100, "rate": 0.9, "by_construct": {} });
+    assert!(regression_gates("go", None, &r, &floors()).is_empty());
+    let found = claim_gates("go", &r, Some(&measured(0, 20)), &gates());
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].contains("recall 0.900 is below the card target 0.950"),
+        "{found:?}"
+    );
+
+    // Rust: each class against its own target (95 / 75).
+    let mut rust = meeting_go_claims();
+    rust["recall"]["by_construct"] = json!({
+        "free_self": { "correct": 96, "total": 100, "rate": 0.96 },
+        "non_self": { "correct": 70, "total": 100, "rate": 0.70 },
+    });
+    let found = claim_gates("rust", &rust, Some(&measured(0, 20)), &gates());
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("recall[non_self] 0.700"), "{found:?}");
+}
+
+#[test]
+fn a_language_with_no_recall_entry_is_reported_as_ungated() {
+    let mut g = gates();
+    g.targets.remove("kotlin");
+    let found = claim_gates("kotlin", &meeting_go_claims(), Some(&measured(0, 20)), &g);
+    assert!(found.iter().any(|f| f.contains("ungated")), "{found:?}");
+    let found = regression_gates("cobol", None, &meeting_go_claims(), &g.floors);
+    assert!(found.iter().any(|f| f.contains("ungated")), "{found:?}");
+}
+
+#[test]
+fn no_recall_floor_or_card_target_is_ever_lowered() {
+    let g = gates();
+    for (table, minimums, what) in [
+        (&g.floors, &MIN_RECALL_FLOORS_PERCENT, "floor"),
+        (&g.targets, &MIN_RECALL_TARGETS_PERCENT, "card target"),
+    ] {
+        for (key, min) in minimums {
+            let now = table[*key] * 100.0;
+            assert!(
+                now + 1e-9 >= *min,
+                "corpora.json lowers the {key} recall {what} to {now} (minimum {min}); a {what} \
+                 only ratchets up, in the change that earns it"
+            );
+        }
+    }
+    for key in RECALL_KEYS {
+        assert!(
+            g.targets[key] + 1e-9 >= g.floors[key],
+            "{key}: card target {} is below its floor {}",
+            g.targets[key],
+            g.floors[key]
+        );
+    }
+}
+
+#[test]
+fn the_record_must_include_d0552ae1_and_every_language_lane() {
+    let g = gates();
+    for c in &g.must_include {
+        assert_eq!(c.len(), 40, "{c}: a full commit id");
+        assert!(c.chars().all(|ch| ch.is_ascii_hexdigit()), "{c}");
+    }
+    assert!(
+        g.must_include
+            .iter()
+            .any(|c| c == "d0552ae16cc969a98d2055bd90efba473306c278"),
+        "S2 (d0552ae1) must be required of every record row"
+    );
+}
+
+fn pin(name: &str, langs: &[&str]) -> Pin {
+    Pin {
+        name: name.into(),
+        commit: "a".repeat(40),
+        languages: langs.iter().map(|l| (*l).to_string()).collect(),
+    }
+}
+
+#[test]
+fn a_stale_or_missing_measurement_is_an_open_gate() {
+    let g = gates();
+    let p = pin("corpus", &["go"]);
+    let mut record = json!({ "corpora": [], "measurements": [] });
+    let open = open_gates(&record, std::slice::from_ref(&p), &g);
+    assert!(
+        open.iter().any(|f| f.contains("no label-free measurement")),
+        "{open:?}"
+    );
+
+    record["measurements"] = json!([{
+        "name": "corpus", "corpus_commit": "a".repeat(40), "devmap_commit": "40b6bbbf", "date": "2026-10-10",
+        "languages": { "go": measured(0, 0) },
+    }]);
+    let open = open_gates(&record, std::slice::from_ref(&p), &g);
+    assert!(open.iter().any(|f| f.contains("stale")), "{open:?}");
+
+    record["measurements"][0]["includes_commits"] = json!(g.must_include);
+    record["corpora"] = json!([{ "name": "corpus", "corpus_commit": "a".repeat(40), "languages": { "go": meeting_go_claims() } }]);
+    let open = open_gates(&record, std::slice::from_ref(&p), &g);
+    assert!(
+        open.is_empty(),
+        "fresh, labelled and meeting every claim: {open:?}"
+    );
+
+    // A labelled row at another corpus commit is not a measurement of the pin.
+    record["corpora"][0]["corpus_commit"] = json!("b".repeat(40));
+    let open = open_gates(&record, std::slice::from_ref(&p), &g);
+    assert!(
+        open.iter()
+            .any(|f| f.contains("confident edge precision is unmeasured")),
+        "{open:?}"
+    );
+}
+
+#[test]
+fn a_re_measured_corpus_supersedes_its_previous_row_and_keeps_it() {
+    let mut record = json!({ "measurements": [{ "name": "a", "v": 1 }, { "name": "b", "v": 1 }] });
+    supersede(
+        &mut record,
+        "measurements",
+        "a",
+        json!({ "name": "a", "v": 2 }),
+        "2026-10-13",
+    );
+    supersede(
+        &mut record,
+        "measurements",
+        "c",
+        json!({ "name": "c", "v": 1 }),
+        "2026-10-13",
+    );
+    let names: Vec<(&str, i64)> = record["measurements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e["name"].as_str().unwrap(), e["v"].as_i64().unwrap()))
+        .collect();
+    assert_eq!(names, [("b", 1), ("a", 2), ("c", 1)]);
+    let old = record["superseded"].as_array().unwrap();
+    assert_eq!(old.len(), 1, "only the replaced row moves: {old:?}");
+    assert_eq!(old[0]["list"], "measurements");
+    assert_eq!(old[0]["superseded_on"], "2026-10-13");
+    assert_eq!(old[0]["entry"], json!({ "name": "a", "v": 1 }));
 }
 
 #[test]
@@ -956,7 +1572,7 @@ fn rust_recall_is_gated_per_class() {
     let mut prev = r.clone();
     prev["recall"]["by_construct"]["non_self"] =
         json!({ "correct": 50, "total": 100, "rate": 0.5 });
-    let found = evaluate_gates("rust", Some(&prev), &r, &floors());
+    let found = regression_gates("rust", Some(&prev), &r, &floors());
     assert!(
         found.iter().any(|f| f.contains("recall[non_self]")),
         "{found:?}"
@@ -969,7 +1585,8 @@ fn rust_recall_is_gated_per_class() {
 
 #[test]
 fn every_pinned_corpus_has_a_forty_hex_commit_and_a_language() {
-    let (pins, floors) = load_pins();
+    let (pins, gates) = load_pins();
+    let floors = gates.floors;
     assert!(!pins.is_empty());
     for pin in pins {
         assert_eq!(pin.commit.len(), 40, "{} commit {:?}", pin.name, pin.commit);

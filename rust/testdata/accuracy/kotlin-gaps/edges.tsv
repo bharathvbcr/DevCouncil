@@ -10,6 +10,7 @@
 #   kind      edge   = a Calls/References/Instantiates/Extends/Implements/... edge, any tier
 #             import = an Imports edge between the two files
 #             forbid = NO edge of any kind at confidence >= 0.9 may join caller and callee
+#             forbid_any_tier = NO use edge at any confidence may join them ("no edge of any tier")
 #   level     must   = a correct resolver has this edge
 #             should = the audit accepted an honest miss or an alternative here
 #   ledger    optional `a|b` bare names a ledger row may carry when the expected callee's
@@ -18,8 +19,8 @@
 #
 # Dead-code truth lives beside this file in dead.tsv; failures that exist today live in
 # known_failing.tsv (keyed by the card that owns the fix).
-kg.S2a	S2	src/main/kotlin/gaps/Events.kt::runWith	src/main/kotlin/gaps/Events.kt::Widget.onStart	forbid	must		a function-typed parameter call is a local binding, not Widget.onStart
-kg.S2b	S2	src/main/kotlin/gaps/Events.kt::save	src/main/kotlin/gaps/Events.kt::Prefs.putBoolean	forbid	must		putBoolean inside Editor.apply{} is the external editor, not the project namesake
+kg.S2a	S2	src/main/kotlin/gaps/Events.kt::runWith	src/main/kotlin/gaps/Events.kt::Widget.onStart	forbid_any_tier	must		a function-typed parameter call is a local binding, not Widget.onStart
+kg.S2b	S2	src/main/kotlin/gaps/Events.kt::save	src/main/kotlin/gaps/Events.kt::Prefs.putBoolean	forbid_any_tier	must		putBoolean inside Editor.apply{} is the external editor, not the project namesake
 kg.K27	K27	src/main/kotlin/gaps/Events.kt::wire	src/main/kotlin/gaps/Events.kt::Vm.onEvent	edge	must		callable reference vm::onEvent
 kg.K27b	K27	src/main/kotlin/gaps/Events.kt::wire	src/main/kotlin/gaps/Events.kt::register	edge	must		call with a callable-reference argument
 kg.K29	K29	src/main/kotlin/gaps/Events.kt::callOp	src/main/kotlin/gaps/Events.kt::Op.invoke	edge	should	invoke	operator fun invoke through op(2)

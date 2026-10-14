@@ -10,6 +10,7 @@
 #   kind      edge   = a Calls/References/Instantiates/Extends/Implements/... edge, any tier
 #             import = an Imports edge between the two files
 #             forbid = NO edge of any kind at confidence >= 0.9 may join caller and callee
+#             forbid_any_tier = NO use edge at any confidence may join them ("no edge of any tier")
 #   level     must   = a correct resolver has this edge
 #             should = the audit accepted an honest miss or an alternative here
 #   ledger    optional `a|b` bare names a ledger row may carry when the expected callee's
@@ -20,4 +21,4 @@
 # known_failing.tsv (keyed by the card that owns the fix).
 rr.main	C47	src/bin/tool.rs::main	src/lib.rs::dispatch	edge	must		crate at the repository root: use rootpkg::hooks::{self}; hooks::dispatch() and rootpkg::hooks::dispatch() must both bind
 rr.it	C47	tests/it.rs::counts_characters	src/lib.rs::word_chars	edge	must		integration test reaches the root crate library
-rr.count	S2	src/lib.rs::word_chars	src/lib.rs::count	forbid	must		receiver-less .chars().count() must not bind the free fn count
+rr.count	S2	src/lib.rs::word_chars	src/lib.rs::count	forbid_any_tier	must		receiver-less .chars().count() must not bind the free fn count

@@ -10,6 +10,7 @@
 #   kind      edge   = a Calls/References/Instantiates/Extends/Implements/... edge, any tier
 #             import = an Imports edge between the two files
 #             forbid = NO edge of any kind at confidence >= 0.9 may join caller and callee
+#             forbid_any_tier = NO use edge at any confidence may join them ("no edge of any tier")
 #   level     must   = a correct resolver has this edge
 #             should = the audit accepted an honest miss or an alternative here
 #   ledger    optional `a|b` bare names a ledger row may carry when the expected callee's
@@ -61,7 +62,7 @@ ts.C27	C27	apps/web/src/components/PaperList.tsx::PaperList	packages/shared/src/
 ts.C28a	C28a	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/components/Button.tsx::MemoBadge	edge	must		JSX to memo-wrapped
 ts.C28b	C28b	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/components/Button.tsx::FancyInput	edge	must		JSX to forwardRef-wrapped
 ts.V1	V1	apps/web/src/v/onlyfmt.ts::useFmtOnly	apps/web/src/lib/format.ts::formatTitle	edge	must		barrel export { formatTitle as fmt }
-ts.V2	V2	apps/web/src/v/npmcollide.ts::callsNpm	apps/web/src/lib/format.ts::formatTitle	forbid	must		external npm import must not bind to the local namesake
+ts.V2	V2	apps/web/src/v/npmcollide.ts::callsNpm	apps/web/src/lib/format.ts::formatTitle	forbid_any_tier	must		external npm import must not bind to the local namesake
 ts.V3a	V3a	apps/web/src/v/typedparam.ts::viaParam	apps/web/src/services/store.ts::MemClient.get	edge	must		receiver typed by parameter annotation
 ts.V3b	V3b	apps/web/src/v/typedparam.ts::viaArrowParam	apps/web/src/services/store.ts::MemClient.get	edge	must		receiver typed by arrow parameter annotation
 ts.V3c	V3c	apps/web/src/v/typedparam.ts::viaIface	apps/web/src/services/store.ts::Client	edge	should	get	interface param; honest uninferred at minimum
