@@ -50,6 +50,7 @@ mod common;
 
 use common::Built;
 use devmap_analyze::dead_tier::in_confident_branch;
+use devmap_analyze::record_identity::{is_evidence_category, is_identity_hash};
 use devmap_analyze::{DeadSymbolReport, COVERAGE_LOSS_REASON};
 use devmap_extract::model::EdgeKind;
 use devmap_resolve::UNATTRIBUTED_LABELS;
@@ -293,6 +294,67 @@ struct DeadLabel {
     language: String,
     id: String,
     truly_dead: bool,
+    /// A reader could not settle it: listed in the record, scored as neither
+    /// right nor wrong.
+    unsure: bool,
+    /// `h:` plus twelve hex digits of the SHA-256 of `id`, computed beside the
+    /// corpus. Required for every corpus but DevCouncil's own.
+    symbol_hash: Option<String>,
+    /// One of `record_identity::EVIDENCE_CATEGORIES`. Required likewise.
+    category: Option<String>,
+    /// The labeller's prose; only DevCouncil's own (public) rows carry it on.
+    evidence: Option<String>,
+}
+
+/// The one corpus whose rows stay readable in the committed record.
+const OWN_CORPUS: &str = "DevCouncil";
+
+/// The `labelled_rows[]` entry for a dead label that matched a row at `tier`.
+///
+/// A private corpus's row carries `symbol_hash` and `category` from the labels
+/// and nothing else of the labeller's: a label missing either, or carrying one
+/// that fails the shared shape check, is an error and never falls back to the
+/// raw id or prose. The error names the corpus, language and label index, not
+/// the offending string.
+fn labelled_row(
+    corpus: &str,
+    lang: &str,
+    index: usize,
+    l: &DeadLabel,
+    tier: &str,
+) -> Result<Value, String> {
+    let at = format!("{corpus} {lang} dead label {index}");
+    let verdict = if l.unsure {
+        "unsure"
+    } else if l.truly_dead {
+        "dead_true"
+    } else {
+        "dead_false"
+    };
+    let (symbol, evidence) = if corpus == OWN_CORPUS {
+        let evidence = l
+            .evidence
+            .clone()
+            .ok_or_else(|| format!("{at}: `evidence` is missing"))?;
+        (l.id.clone(), evidence)
+    } else {
+        let symbol = l
+            .symbol_hash
+            .as_deref()
+            .filter(|h| is_identity_hash(h))
+            .ok_or_else(|| {
+                format!("{at}: `symbol_hash` is missing or is not `h:` and twelve lowercase hex digits")
+            })?;
+        let evidence = l
+            .category
+            .as_deref()
+            .filter(|c| is_evidence_category(c))
+            .ok_or_else(|| {
+                format!("{at}: `category` is missing or is not an evidence category in the README")
+            })?;
+        (symbol.to_string(), evidence.to_string())
+    };
+    Ok(json!({ "symbol": symbol, "evidence": evidence, "verdict": verdict, "published": tier }))
 }
 
 fn parse_labels(raw: &str) -> Result<Labels, String> {
@@ -329,6 +391,10 @@ fn parse_labels(raw: &str) -> Result<Labels, String> {
             truly_dead: o["truly_dead"]
                 .as_bool()
                 .ok_or_else(|| format!("label {o} has no bool truly_dead"))?,
+            unsure: o["unsure"].as_bool().unwrap_or(false),
+            symbol_hash: o["symbol_hash"].as_str().map(str::to_string),
+            category: o["category"].as_str().map(str::to_string),
+            evidence: o["evidence"].as_str().map(str::to_string),
         });
     }
     Ok(labels)
@@ -465,6 +531,7 @@ fn structure(built: &Built, languages: &[String]) -> BTreeMap<String, Value> {
 /// that no longer matches the graph: a stale label scored as a miss would
 /// quietly turn a moved symbol into a regression.
 fn score_labels(
+    corpus: &str,
     built: &Built,
     labels: &Labels,
     languages: &[String],
@@ -538,11 +605,28 @@ fn score_labels(
         }
 
         let mut dead_fp: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
-        for l in labels.dead.iter().filter(|l| &l.language == lang) {
-            if let Some(tier) = dead_tier.get(&l.id) {
-                let entry = dead_fp.entry(tier).or_default();
-                entry.1 += 1;
-                entry.0 += usize::from(!l.truly_dead);
+        let mut labelled_rows = Vec::new();
+        let mut unsure = 0;
+        for (index, l) in labels
+            .dead
+            .iter()
+            .filter(|l| &l.language == lang)
+            .enumerate()
+        {
+            // Every label is checked, matched or not: one that could not be
+            // written safely fails the run rather than waiting for the build
+            // to reach it.
+            let tier = dead_tier.get(&l.id).copied();
+            let row = labelled_row(corpus, lang, index, l, tier.unwrap_or("none"))?;
+            if let Some(tier) = tier {
+                labelled_rows.push(row);
+                if l.unsure {
+                    unsure += 1;
+                } else {
+                    let entry = dead_fp.entry(tier).or_default();
+                    entry.1 += 1;
+                    entry.0 += usize::from(!l.truly_dead);
+                }
             }
         }
 
@@ -572,6 +656,8 @@ fn score_labels(
                     .iter()
                     .map(|(tier, (fp, rows))| ((*tier).to_string(), json!({ "false_positive": fp, "rows": rows })))
                     .collect::<Map<String, Value>>(),
+                "labelled_rows": labelled_rows,
+                "unsure": unsure,
             }),
         );
     }
@@ -962,7 +1048,7 @@ fn measure_corpus(
     let Some(labels) = load_labels(dir, &pin.name)? else {
         return Ok((measurement, None));
     };
-    let scored = score_labels(&built, &labels, &pin.languages)?;
+    let scored = score_labels(&pin.name, &built, &labels, &pin.languages)?;
     let languages: Map<String, Value> = scored
         .into_iter()
         .map(|(lang, mut row)| {
@@ -1240,12 +1326,13 @@ fn the_scorer_measures_structure_without_labels_and_scores_labels_when_given() {
                 { "language": "go", "construct": "plain", "caller": "app/svc/svc.go::Caller01", "name": "Target01", "truth": "app/util/util.go::Target01" },
                 { "language": "go", "construct": "pointer receiver", "caller": "app/svc/svc.go::Caller03", "name": "PtrGet03", "truth": "app/store/store.go::Store.PtrGet03" }
             ],
-            "dead": [{ "language": "go", "id": "app/util/util2.go::DeadUtil", "truly_dead": true }]
+            "dead": [{ "language": "go", "id": "app/util/util2.go::DeadUtil", "truly_dead": true,
+                       "symbol_hash": "h:0123456789ab", "category": "rg_declaration_only" }]
         })
         .to_string(),
     )
     .unwrap();
-    let scored = score_labels(&built, &labels, &pin.languages).unwrap();
+    let scored = score_labels("fixture", &built, &labels, &pin.languages).unwrap();
     let go = &scored["go"];
     assert_eq!(go["confident_edge_precision"]["correct"], 1);
     assert_eq!(go["recall"]["total"], 2);
@@ -1268,9 +1355,122 @@ fn a_label_that_matches_no_edge_is_an_error_not_a_miss() {
             .to_string(),
     )
     .unwrap();
-    let err = score_labels(&built, &labels, &["go".to_string()]).unwrap_err();
+    let err = score_labels("fixture", &built, &labels, &["go".to_string()]).unwrap_err();
     assert!(err.contains("matches no edge"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+const PRIVATE_SYMBOL: &str = "app/svc/probes.go::deadPriv";
+
+fn dead_labels(extra: Value) -> Labels {
+    let mut label = json!({ "language": "go", "id": PRIVATE_SYMBOL, "truly_dead": true });
+    for (k, v) in extra.as_object().unwrap() {
+        label[k] = v.clone();
+    }
+    parse_labels(&json!({ "dead": [label] }).to_string()).unwrap()
+}
+
+fn score_dead(corpus: &str, labels: &Labels) -> Result<BTreeMap<String, Value>, String> {
+    // The tests run in parallel and `scratch` names a directory by label and
+    // process, so each call needs a label of its own.
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (dir, _) = go_fixture_checkout(&format!("identity-{n}"));
+    let built = common::build(&dir);
+    let scored = score_labels(corpus, &built, labels, &["go".to_string()]);
+    let _ = std::fs::remove_dir_all(&dir);
+    scored
+}
+
+#[test]
+fn a_private_corpus_row_is_written_hashed_with_a_category_never_the_raw_symbol() {
+    let labels = dead_labels(json!({
+        "symbol_hash": "h:0123456789ab",
+        "category": "rg_declaration_only",
+        "evidence": "rg -uu -w deadPriv: app/svc/probes.go declaration only",
+    }));
+    let scored = score_dead("Private", &labels).unwrap();
+    let rows = scored["go"]["labelled_rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{}", scored["go"]);
+    assert_eq!(rows[0]["symbol"], "h:0123456789ab");
+    assert_eq!(rows[0]["evidence"], "rg_declaration_only");
+    assert_eq!(rows[0]["verdict"], "dead_true");
+    let written = scored["go"].to_string();
+    assert!(
+        !written.contains("probes") && !written.contains("deadPriv") && !written.contains("rg -uu"),
+        "the raw symbol or the labeller's prose reached the record: {written}"
+    );
+}
+
+#[test]
+fn a_private_label_without_a_hash_or_a_category_fails_naming_the_label_not_its_text() {
+    for (missing, extra) in [
+        ("symbol_hash", json!({ "category": "rg_declaration_only" })),
+        ("category", json!({ "symbol_hash": "h:0123456789ab" })),
+        ("symbol_hash", json!({ "symbol_hash": PRIVATE_SYMBOL, "category": "rg_declaration_only" })),
+        ("symbol_hash", json!({ "symbol_hash": "h:0123456789AB", "category": "rg_declaration_only" })),
+        ("category", json!({ "symbol_hash": "h:0123456789ab", "category": "nothing imports it" })),
+        ("category", json!({ "symbol_hash": "h:0123456789ab", "category": "src/a.rs:12" })),
+    ] {
+        let err = score_dead("Private", &dead_labels(extra.clone())).unwrap_err();
+        assert!(
+            err.contains("Private go dead label 0") && err.contains(missing),
+            "{extra}: {err}"
+        );
+        assert!(!err.contains("probes") && !err.contains("nothing imports"), "{err}");
+    }
+}
+
+#[test]
+#[should_panic(expected = "Private go dead label 0")]
+fn the_run_panics_on_a_private_label_it_cannot_write_safely() {
+    let scored = score_dead("Private", &dead_labels(json!({ "category": "rg_declaration_only" })));
+    scored.unwrap_or_else(|e| panic!("Private: {e}"));
+}
+
+#[test]
+fn a_label_that_matches_no_row_is_still_checked() {
+    let labels = parse_labels(
+        &json!({ "dead": [{ "language": "go", "id": "app/gone.go::F", "truly_dead": true }] })
+            .to_string(),
+    )
+    .unwrap();
+    assert!(score_dead("Private", &labels).is_err());
+}
+
+#[test]
+fn devcouncils_own_rows_keep_their_symbol_and_evidence() {
+    let own = dead_labels(json!({ "evidence": "rg -uu -w deadPriv: declaration only" }));
+    let scored = score_dead(OWN_CORPUS, &own).unwrap();
+    let rows = scored["go"]["labelled_rows"].as_array().unwrap();
+    assert_eq!(rows[0]["symbol"], PRIVATE_SYMBOL);
+    assert_eq!(rows[0]["evidence"], "rg -uu -w deadPriv: declaration only");
+    // Its own corpus needs no hash, and still needs its evidence.
+    assert!(score_dead(OWN_CORPUS, &dead_labels(json!({}))).is_err());
+}
+
+#[test]
+fn an_unsure_label_is_listed_and_counted_but_scored_neither_way() {
+    let labels = dead_labels(json!({
+        "symbol_hash": "h:0123456789ab",
+        "category": "spot_check_upstream_shadow",
+        "unsure": true,
+    }));
+    let scored = score_dead("Private", &labels).unwrap();
+    let go = &scored["go"];
+    assert_eq!(go["labelled_rows"][0]["verdict"], "unsure");
+    assert_eq!(go["unsure"], 1);
+    assert_eq!(go["dead_fp_by_tier"], json!({}), "{go}");
+}
+
+#[test]
+fn the_identity_shape_is_not_redefined_here() {
+    let source = include_str!("real_corpus_accuracy.rs");
+    let own_copy = ["strip_prefix(\"h", ":\")"].concat();
+    assert!(
+        !source.contains(&own_copy),
+        "the hash shape lives in devmap_analyze::record_identity"
+    );
 }
 
 fn row(precision: (u64, u64), recall: (u64, u64), honest: (u64, u64), dead: (u64, u64)) -> Value {

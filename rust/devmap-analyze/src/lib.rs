@@ -12,6 +12,7 @@ pub mod pdg;
 // the gate they were four warnings the embedder shape carried for nobody.
 #[cfg(feature = "parse")]
 pub mod pdgsrc;
+pub mod record_identity;
 pub mod resolution_rate;
 pub mod traversal;
 
