@@ -5,12 +5,12 @@
 # The set only shrinks: accuracy_fixtures.rs fails when a listed row starts passing and when
 # a passing row is not listed. Fixing a row means deleting its line (DEVMAP_ACCURACY_BLESS=1
 # does it); adding a line needs an owning card and a reason.
+kotlin-gaps	kg.G1	false_edge	ft-0e6cc90f	needs resolver.rs (held by S5) | today: forbidden HIGH edge to gaps/util/Strings.kt::getString
 python	py.C23b	miss	ft-c666ba7c	edge if fixture return typed; honest miss acceptable | today: absent today, recorded as an honest unresolved row
+python	py.SH1a	false_edge	ft-0e6cc90f	needs resolver.rs (held by S5) | today: forbidden edge at any tier to other/typing_namesakes.py::Literal at 900
+python	py.SH1b	false_edge	ft-0e6cc90f	needs resolver.rs (held by S5) | today: forbidden edge at any tier to other/typing_namesakes.py::Protocol at 900
 rust	rs.c04	miss	ft-f9665721	blanket impl on i32 literal | today: absent today, recorded as an honest unresolved row
 rust	rs.c24b	silent_miss	ft-f9665721	 | today: no ledger row names {"helper_c24"}
 rust	rs.c26e	silent_miss	ft-f9665721	operator/Drop/From trait use is implicit; honest miss expected | today: no ledger row names {"from"}
-python	py.SH1a	false_edge	ft-0e6cc90f	needs resolver.rs (held by S5) | today: forbidden edge at any tier to other/typing_namesakes.py::Literal at 900
-python	py.SH1b	false_edge	ft-0e6cc90f	needs resolver.rs (held by S5) | today: forbidden edge at any tier to other/typing_namesakes.py::Protocol at 900
-kotlin-gaps	kg.G1	false_edge	ft-0e6cc90f	needs resolver.rs (held by S5) | today: forbidden HIGH edge to gaps/util/Strings.kt::getString
 swift	sw.L1a	false_edge	ft-6976e8de	argument label emitted as a reference | today: forbidden edge at any tier to micro/Sources/M/D.swift::day at 1000
 swift	sw.L2a	false_edge	ft-6976e8de	leading-dot member emitted as a reference | today: forbidden HIGH edge to micro/Sources/M/D.swift::minute
