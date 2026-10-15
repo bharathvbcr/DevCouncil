@@ -207,8 +207,10 @@ type CorpusRates = BTreeMap<String, Vec<(String, u64, u64)>>;
 ///
 /// Shape read: `{"corpora": [{"name": …, "languages": {"<lang>": {"dead_fp_by_tier":
 /// {"0.9": {"false_positive": n, "rows": m}}}}}]}`. Fails loudly on a missing
-/// file or a missing key: the record is what lets a language publish at 0.9,
-/// and a record that cannot be read must not read as one with nothing wrong.
+/// file, a missing `dead_fp_by_tier` or a malformed `"0.9"` entry: the record is
+/// what lets a language publish at 0.9, and a record that cannot be read must
+/// not read as one with nothing wrong. A `dead_fp_by_tier` with no `"0.9"` key
+/// reads as 0 rows.
 fn corpus_record() -> CorpusRates {
     let path = accuracy_root().join("record.json");
     let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| {
@@ -219,27 +221,47 @@ fn corpus_record() -> CorpusRates {
     });
     let record: serde_json::Value = serde_json::from_str(&raw)
         .unwrap_or_else(|e| panic!("{} is not JSON: {e}", path.display()));
+    corpus_rates(&record, &path.display().to_string())
+}
+
+/// [`corpus_record`] over an already-parsed record; `origin` names it in a
+/// failure. Split out so the shapes the reader accepts and refuses are tested
+/// without writing a record to disk.
+fn corpus_rates(record: &serde_json::Value, origin: &str) -> CorpusRates {
     let corpora = record["corpora"]
         .as_array()
         .filter(|corpora| !corpora.is_empty())
-        .unwrap_or_else(|| panic!("{}: no `corpora` array, or it is empty", path.display()));
+        .unwrap_or_else(|| panic!("{origin}: no `corpora` array, or it is empty"));
     let mut by_language: CorpusRates = BTreeMap::new();
     for corpus in corpora {
         let name = corpus["name"]
             .as_str()
-            .unwrap_or_else(|| panic!("{}: a corpus without a `name`: {corpus}", path.display()))
+            .unwrap_or_else(|| panic!("{origin}: a corpus without a `name`: {corpus}"))
             .to_string();
         let languages = corpus["languages"]
             .as_object()
-            .unwrap_or_else(|| panic!("{}: {name} has no `languages` object", path.display()));
+            .unwrap_or_else(|| panic!("{origin}: {name} has no `languages` object"));
         for (language, entry) in languages {
-            let tier = &entry["dead_fp_by_tier"]["0.9"];
-            let (Some(fp), Some(rows)) = (tier["false_positive"].as_u64(), tier["rows"].as_u64())
-            else {
-                panic!(
-                    "{}: {name}/{language} has no dead_fp_by_tier.0.9",
-                    path.display()
-                );
+            // `dead_fp_by_tier` must be there: a record that does not say
+            // whether the language was scored is not a record of it. Present
+            // with no `"0.9"` key is a measurement - the corpus was labelled and
+            // no row of the language reached the confident tier - so it
+            // contributes 0 rows, which `corpus_proof` never counts as proof.
+            let Some(by_tier) = entry["dead_fp_by_tier"].as_object() else {
+                panic!("{origin}: {name}/{language} has no dead_fp_by_tier object");
+            };
+            let (fp, rows) = match by_tier.get("0.9") {
+                None => (0, 0),
+                Some(tier) => {
+                    let (Some(fp), Some(rows)) =
+                        (tier["false_positive"].as_u64(), tier["rows"].as_u64())
+                    else {
+                        panic!(
+                            "{origin}: {name}/{language} has a malformed dead_fp_by_tier.0.9: {tier}"
+                        );
+                    };
+                    (fp, rows)
+                }
             };
             by_language
                 .entry(language.clone())
@@ -248,6 +270,18 @@ fn corpus_record() -> CorpusRates {
         }
     }
     by_language
+}
+
+/// What a language's corpus rows add up to: the labelled confident rows across
+/// every corpus that measured it, and whether each corpus is at or under 5%
+/// false positives. Rows are the proof; a corpus with 0 rows is clean and proves
+/// nothing, so the caller still requires `rows > 0`.
+fn corpus_proof(corpora: &[(String, u64, u64)]) -> (u64, bool) {
+    let rows = corpora.iter().map(|(_, _, rows)| rows).sum();
+    let clean = corpora
+        .iter()
+        .all(|(_, fp, rows)| fp.saturating_mul(20) <= *rows);
+    (rows, clean)
 }
 
 /// The committed 0.4-tier record: language → `(rows, false_positive)`.
@@ -455,10 +489,7 @@ fn the_confident_tier_is_listed_exactly_for_the_languages_their_fixtures_prove()
     for (language, score) in &scores {
         let listed = CONFIDENT_TIER_ELIGIBLE.contains(language);
         let corpora = record.get(*language).map(Vec::as_slice).unwrap_or_default();
-        let corpus_rows: u64 = corpora.iter().map(|(_, _, rows)| rows).sum();
-        let corpus_clean = corpora
-            .iter()
-            .all(|(_, fp, rows)| fp.saturating_mul(20) <= *rows);
+        let (corpus_rows, corpus_clean) = corpus_proof(corpora);
         // Measured, not merely unrefuted: zero labelled rows is a check that
         // never ran, and passing it would list a language on its fixture alone.
         let proven = score.proven() && corpus_rows > 0 && corpus_clean;
@@ -550,4 +581,125 @@ fn check_excluded(name: &str, built: &Built, violations: &mut Vec<String>) {
              generation_dead_symbols {expected:?}"
         ));
     }
+}
+
+// ---------------------------------------------------- the record reader's shapes
+
+fn record_with(entry: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "corpora": [{ "name": "corpus", "languages": { "lang": entry } }]
+    })
+}
+
+#[test]
+fn a_language_measured_with_no_confident_rows_reads_as_zero_rows() {
+    // `dead_fp_by_tier: {}`: the corpus was labelled and no row of the language
+    // reached the confident tier. Present, measured, empty - 0 rows.
+    let rates = corpus_rates(
+        &record_with(serde_json::json!({ "dead_fp_by_tier": {} })),
+        "test record",
+    );
+    assert_eq!(
+        rates["lang"],
+        vec![("corpus".to_string(), 0, 0)],
+        "an empty tier is a measurement of nothing, not a missing one"
+    );
+    // ... and nothing, however clean, can prove a language eligible.
+    let (rows, clean) = corpus_proof(&rates["lang"]);
+    assert_eq!((rows, clean), (0, true));
+    assert!(
+        rows == 0,
+        "the proof gate is `rows > 0`; an all-empty language must fail it"
+    );
+}
+
+#[test]
+fn empty_rows_beside_a_corpus_with_rows_leave_the_proof_to_that_corpus() {
+    let rates = [
+        ("empty".to_string(), 0, 0),
+        ("measured".to_string(), 1, 40),
+    ];
+    assert_eq!(corpus_proof(&rates), (40, true));
+    let dirty = [
+        ("empty".to_string(), 0, 0),
+        ("measured".to_string(), 3, 40),
+    ];
+    assert_eq!(
+        corpus_proof(&dirty),
+        (40, false),
+        "an empty corpus never excuses a dirty one"
+    );
+}
+
+#[test]
+#[should_panic(expected = "has no dead_fp_by_tier")]
+fn a_row_without_dead_fp_by_tier_still_fails() {
+    corpus_rates(&record_with(serde_json::json!({})), "test record");
+}
+
+#[test]
+#[should_panic(expected = "has no dead_fp_by_tier")]
+fn a_null_dead_fp_by_tier_still_fails() {
+    corpus_rates(
+        &record_with(serde_json::json!({ "dead_fp_by_tier": null })),
+        "test record",
+    );
+}
+
+#[test]
+#[should_panic(expected = "has no dead_fp_by_tier")]
+fn a_dead_fp_by_tier_that_is_not_an_object_still_fails() {
+    corpus_rates(
+        &record_with(serde_json::json!({ "dead_fp_by_tier": [] })),
+        "test record",
+    );
+}
+
+#[test]
+#[should_panic(expected = "dead_fp_by_tier.0.9")]
+fn a_null_confident_tier_fails() {
+    corpus_rates(
+        &record_with(serde_json::json!({ "dead_fp_by_tier": { "0.9": null } })),
+        "test record",
+    );
+}
+
+#[test]
+#[should_panic(expected = "dead_fp_by_tier.0.9")]
+fn an_empty_confident_tier_object_fails() {
+    corpus_rates(
+        &record_with(serde_json::json!({ "dead_fp_by_tier": { "0.9": {} } })),
+        "test record",
+    );
+}
+
+#[test]
+#[should_panic(expected = "dead_fp_by_tier.0.9")]
+fn a_negative_rows_count_fails() {
+    corpus_rates(
+        &record_with(
+            serde_json::json!({ "dead_fp_by_tier": { "0.9": { "false_positive": 0, "rows": -1 } } }),
+        ),
+        "test record",
+    );
+}
+
+#[test]
+#[should_panic(expected = "dead_fp_by_tier.0.9")]
+fn a_float_rows_count_fails() {
+    corpus_rates(
+        &record_with(
+            serde_json::json!({ "dead_fp_by_tier": { "0.9": { "false_positive": 0, "rows": 3.5 } } }),
+        ),
+        "test record",
+    );
+}
+
+#[test]
+#[should_panic(expected = "dead_fp_by_tier.0.9")]
+fn a_confident_tier_missing_its_false_positive_count_fails() {
+    corpus_rates(
+        &record_with(serde_json::json!({ "dead_fp_by_tier": { "0.9": { "rows": 4 } } })),
+        "test record",
+    );
 }
