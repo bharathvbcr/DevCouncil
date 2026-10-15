@@ -1775,19 +1775,19 @@
         "truly_dead": 1
       },
       "devmap_commit": "2286fc440d486aa9beae370bcfa8ca8b9266d385",
-      "expected_edge_rows": 85,
+      "expected_edge_rows": 104,
       "forbid_any_tier_rows": 4,
-      "forbid_rows": 8,
+      "forbid_rows": 10,
       "high_edges_correct": 85,
       "high_edges_false": 2,
       "honest_miss": {
-        "absent": 0,
-        "rate": null,
-        "recorded": 0
+        "absent": 19,
+        "rate": 1.0,
+        "recorded": 19
       },
       "precision_at_0.9": 0.977,
       "present": 85,
-      "recall": 1.0
+      "recall": 0.817
     },
     "typescript": {
       "dead": {

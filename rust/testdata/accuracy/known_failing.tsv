@@ -14,5 +14,24 @@ python	py.SH1b	false_edge	ft-0e6cc90f	needs resolver.rs (held by S5) | today: fo
 rust	rs.c04	miss	ft-f9665721	blanket impl on i32 literal | today: absent today, recorded as an honest unresolved row
 rust	rs.c24b	silent_miss	ft-f9665721	 | today: no ledger row names {"helper_c24"}
 rust	rs.c26e	silent_miss	ft-f9665721	operator/Drop/From trait use is implicit; honest miss expected | today: no ledger row names {"from"}
+swift	sw.C1	miss	ft-8ca270ad	recall characterization: prefix ! over Probe().snapshot().ok | today: absent, recorded as an honest unresolved row
+swift	sw.C2	miss	ft-8ca270ad	recall characterization: multi-line constructor call then .scan() | today: absent, recorded as an honest unresolved row
+swift	sw.C3	miss	ft-8ca270ad	recall characterization: store.snapshot(p).usage(for:) chain | today: absent, recorded as an honest unresolved row
+swift	sw.C4	miss	ft-8ca270ad	recall characterization: (x as? T)?.m() | today: absent, recorded as an honest unresolved row
+swift	sw.E1	miss	ft-8ca270ad	recall characterization: member of a labelled-tuple parameter | today: absent, recorded as an honest unresolved row
 swift	sw.L1a	false_edge	ft-6976e8de	argument label emitted as a reference | today: forbidden edge at any tier to micro/Sources/M/D.swift::day at 1000
 swift	sw.L2a	false_edge	ft-6976e8de	leading-dot member emitted as a reference | today: forbidden HIGH edge to micro/Sources/M/D.swift::minute
+swift	sw.O1a	miss	ft-8ca270ad	recall characterization: closure over a stored [T] property | today: absent, recorded as an honest unresolved row
+swift	sw.O1b	miss	ft-8ca270ad	recall characterization: closure over a stored [T] property in a computed property | today: absent, recorded as an honest unresolved row
+swift	sw.O1c	miss	ft-8ca270ad	recall characterization: local typed by a free function returning [T] | today: absent, recorded as an honest unresolved row
+swift	sw.O1d	miss	ft-8ca270ad	recall characterization: (opt?.items ?? []).filter closure | today: absent, recorded as an honest unresolved row
+swift	sw.O2	miss	ft-8ca270ad	recall characterization: closure in an array annotated [(T)->Void] | today: absent, recorded as an honest unresolved row
+swift	sw.O2b	miss	ft-8ca270ad	recall characterization: closure in a labelled-tuple element | today: absent, recorded as an honest unresolved row
+swift	sw.O3	miss	ft-8ca270ad	recall characterization: protocol-extension method chained after another | today: absent, recorded as an honest unresolved row
+swift	sw.T1	miss	ft-8ca270ad	recall characterization: local typed by an enclosing-type method | today: absent, recorded as an honest unresolved row
+swift	sw.T2	miss	ft-8ca270ad	recall characterization: local typed by a method on a parameter receiver | today: absent, recorded as an honest unresolved row
+swift	sw.T3	miss	ft-8ca270ad	recall characterization: tuple destructuring from a free function | today: absent, recorded as an honest unresolved row
+swift	sw.T4	miss	ft-8ca270ad	recall characterization: private let m = T.shared | today: absent, recorded as an honest unresolved row
+swift	sw.T5	miss	ft-8ca270ad	recall characterization: property-wrapper-typed stored property | today: absent, recorded as an honest unresolved row
+swift	sw.T6	miss	ft-8ca270ad	recall characterization: if let u = history.pop() | today: absent, recorded as an honest unresolved row
+swift	sw.T7	miss	ft-8ca270ad	recall characterization: local typed by a ctor whose type has a private nested namesake | today: absent, recorded as an honest unresolved row
