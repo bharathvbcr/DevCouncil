@@ -49,7 +49,8 @@
 mod common;
 
 use common::Built;
-use devmap_analyze::{CONFIDENT_TIER_UNPROVEN, HIGHEST_DEGRADED_CONFIDENCE};
+use devmap_analyze::dead_tier::in_confident_branch;
+use devmap_analyze::{DeadSymbolReport, COVERAGE_LOSS_REASON};
 use devmap_extract::model::EdgeKind;
 use devmap_resolve::UNATTRIBUTED_LABELS;
 use serde_json::{json, Map, Value};
@@ -381,8 +382,8 @@ impl Counts {
     }
 }
 
-fn tier_label(confidence: f32) -> &'static str {
-    if f64::from(confidence) > f64::from(HIGHEST_DEGRADED_CONFIDENCE) {
+fn tier_label(r: &DeadSymbolReport) -> &'static str {
+    if in_confident_branch(f64::from(r.confidence), r.exemption_reason.as_deref()) {
         "0.9"
     } else {
         "0.4"
@@ -427,7 +428,7 @@ fn structure(built: &Built, languages: &[String]) -> BTreeMap<String, Value> {
         *dead
             .entry(language_of(&r.file_path))
             .or_default()
-            .entry(tier_label(r.confidence))
+            .entry(tier_label(r))
             .or_default() += 1;
     }
     let rate = &built.analysis.resolution_rate.by_language;
@@ -494,12 +495,7 @@ fn score_labels(
     }
     let mut dead_tier: BTreeMap<String, &'static str> = BTreeMap::new();
     for r in built.analysis.dead_symbols.iter().filter(|r| !r.is_exempt) {
-        let confident = f64::from(r.confidence) > f64::from(HIGHEST_DEGRADED_CONFIDENCE)
-            || r.exemption_reason
-                .as_deref()
-                .is_some_and(|x| x.starts_with(CONFIDENT_TIER_UNPROVEN));
-        let tier = if confident { "0.9" } else { "0.4" };
-        dead_tier.insert(format!("{}::{}", r.file_path, r.symbol_name), tier);
+        dead_tier.insert(format!("{}::{}", r.file_path, r.symbol_name), tier_label(r));
     }
 
     let mut out = BTreeMap::new();
@@ -1161,6 +1157,39 @@ fn go_fixture_checkout(label: &str) -> (PathBuf, String) {
     ]);
     let head = run(&["rev-parse", "HEAD"]);
     (dir, head)
+}
+
+#[test]
+fn the_scorer_buckets_a_coverage_capped_dead_row_with_the_confident_tier() {
+    // Kotlin's ChronosFlow proof rows publish at 0.663 with the coverage-loss
+    // reason: confident-branch evidence that the coverage cap only demoted.
+    let row = |confidence: f32, reason: Option<&str>| DeadSymbolReport {
+        symbol_name: "helper".into(),
+        file_path: "src/a.kt".into(),
+        confidence,
+        is_exempt: false,
+        exemption_reason: reason.map(str::to_string),
+        evidence: None,
+    };
+    assert_eq!(tier_label(&row(0.663, Some(COVERAGE_LOSS_REASON))), "0.9");
+    assert_eq!(tier_label(&row(0.4, Some(COVERAGE_LOSS_REASON))), "0.9");
+    assert_eq!(tier_label(&row(0.9, None)), "0.9");
+    assert_eq!(tier_label(&row(0.663, None)), "0.4");
+}
+
+#[test]
+fn the_scorer_does_not_reimplement_the_confident_branch() {
+    let source = include_str!("real_corpus_accuracy.rs");
+    for needle in [
+        ["starts_with(CONFIDENT", "_TIER_UNPROVEN)"],
+        ["> f64::from(HIGHEST", "_DEGRADED_CONFIDENCE)"],
+    ] {
+        assert!(
+            !source.contains(&needle.concat()),
+            "{}: the confident-branch rule lives in devmap_analyze::dead_tier",
+            needle.concat()
+        );
+    }
 }
 
 #[test]

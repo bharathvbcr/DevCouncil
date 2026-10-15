@@ -40,10 +40,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use devmap_analyze::{
-    CONFIDENT_TIER_ELIGIBLE, CONFIDENT_TIER_UNPROVEN, EXPORTED_UNREFERENCED,
-    HIGHEST_DEGRADED_CONFIDENCE,
-};
+use devmap_analyze::dead_tier::in_confident_branch;
+use devmap_analyze::{CONFIDENT_TIER_ELIGIBLE, EXPORTED_UNREFERENCED, HIGHEST_DEGRADED_CONFIDENCE};
 
 static SEQUENCE: AtomicU32 = AtomicU32::new(0);
 
@@ -178,10 +176,21 @@ fn confidence(row: &serde_json::Value) -> f64 {
     row["confidence"].as_f64().expect("confidence is a number")
 }
 
-/// Whether the evidence earned the confident tier, published or capped.
-fn in_confident_branch(row: &serde_json::Value) -> bool {
-    confidence(row) > f64::from(HIGHEST_DEGRADED_CONFIDENCE)
-        || reason(row).starts_with(CONFIDENT_TIER_UNPROVEN)
+/// Whether the evidence reached the confident branch, published or capped: the
+/// rule is `devmap_analyze::dead_tier::in_confident_branch`, shared with the
+/// corpus runner.
+fn row_in_confident_branch(row: &serde_json::Value) -> bool {
+    in_confident_branch(confidence(row), row["exemption_reason"].as_str())
+}
+
+#[test]
+fn the_eligibility_gate_does_not_reimplement_the_confident_branch() {
+    let source = include_str!("dead_tier_eligibility.rs");
+    let needle = ["starts_with(CONFIDENT", "_TIER_UNPROVEN)"].concat();
+    assert!(
+        !source.contains(&needle),
+        "the confident-branch rule lives in devmap_analyze::dead_tier"
+    );
 }
 
 #[derive(Debug, Default)]
@@ -346,7 +355,7 @@ fn the_confident_tier_is_listed_exactly_for_the_languages_their_fixtures_prove()
                 row["symbol_name"].as_str().unwrap_or("")
             );
             let language = language_of(row["file_path"].as_str().unwrap_or(""));
-            if in_confident_branch(row) {
+            if row_in_confident_branch(row) {
                 let score = scores.entry(language).or_default();
                 score.confident_rows += 1;
                 if truth.get(&id) != Some(&Verdict::TrulyDead) {
@@ -392,7 +401,7 @@ fn the_confident_tier_is_listed_exactly_for_the_languages_their_fixtures_prove()
                     None => violations.push(format!("{name}: truly dead {id} is not reported")),
                     // Found, but outside the confident branch: the language has
                     // not proven the tier, so a listed one fails below.
-                    Some(row) if !in_confident_branch(row) => scores
+                    Some(row) if !row_in_confident_branch(row) => scores
                         .entry(language_of(id.split("::").next().unwrap_or("")))
                         .or_default()
                         .missed_markers
