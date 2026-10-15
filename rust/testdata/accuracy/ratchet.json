@@ -24,10 +24,10 @@
     "present": 110
   },
   "swift": {
-    "forbid_any_tier_rows": 3,
+    "forbid_any_tier_rows": 4,
     "known_failing": 2,
-    "positive_rows": 81,
-    "present": 81
+    "positive_rows": 85,
+    "present": 85
   },
   "typescript": {
     "forbid_any_tier_rows": 1,

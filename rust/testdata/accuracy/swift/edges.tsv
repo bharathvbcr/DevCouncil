@@ -107,3 +107,8 @@ sw.L1a	L1	micro/Sources/M/D.swift::callMark	micro/Sources/M/D.swift::day	forbid_
 sw.L1b	L1	micro/Sources/M/D.swift::callMark	micro/Sources/M/D.swift::mark	edge	must		guard: the labelled call itself resolves
 sw.L2a	L2	micro/Sources/M/D.swift::callF	micro/Sources/M/D.swift::minute	forbid	must		leading-dot .minute is the Unit case, not the free func
 sw.L2b	L2	micro/Sources/M/D.swift::callF	micro/Sources/M/D.swift::f	edge	must		guard: f(.minute) call resolves
+sw.X42a	X42	spm/Sources/Core/Lifecycle.swift::Session	spm/Sources/Core/Lifecycle.swift::Session.cleanup	edge	must		deinit is not a symbol; its self.cleanup() call attributes to the owning type, and cleanup is declared in an extension
+sw.X42b	X42	spm/Sources/Core/Lifecycle.swift::Session.close	spm/Sources/Core/Lifecycle.swift::Session.release	edge	must		implicit self call from a class method to a member declared in an extension
+sw.X42c	X42	spm/Sources/Core/Lifecycle.swift::Session.release	spm/Sources/Core/Lifecycle.swift::Session.cleanup	edge	must		implicit self call between two members of one extension
+sw.X42d	X42	spm/Sources/Core/Lifecycle.swift::retire	spm/Sources/Core/Lifecycle.swift::Session.close	edge	must		free function calls a method through a Session-typed parameter
+sw.X42e	X42	spm/Sources/Core/Lifecycle.swift::Session	spm/Sources/Core/Lifecycle.swift::Session.release	forbid_any_tier	must		deinit calls cleanup() only; it does not call release()
