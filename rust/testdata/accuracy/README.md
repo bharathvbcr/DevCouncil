@@ -181,6 +181,25 @@ no row on ten corpora (off the list). The coverage-capped rows count because
 their evidence is the confident branch's; the fixtures have no coverage loss,
 so the two definitions agree there.
 
+Identity is not committed. In every corpus but DevCouncil's own, a
+`labelled_rows[]` row's `symbol` is `h:` plus the first twelve hex digits of the
+SHA-256 of the original id, and its `evidence` is one category token; the
+`verdict` and `published` fields are unchanged, and no row was dropped. The
+labeller's prose lives beside the corpus with the labels. The tokens:
+
+* `rg_declaration_only` - `rg -uu -w` finds the declaration as the only code
+  reference (other hits are comments, docs, re-exports or unrelated namesakes).
+* `direct_reference` - a call or use at a `path:line` reaches it (`dead_false`).
+* `framework_hook` - a framework or import-system hook calls it (`dead_false`).
+* `runtime_import_by_name` - imported by module name at run time (`dead_false`).
+* `spot_check_upstream_shadow` - the verdict rests on upstream library source
+  outside the corpus (`unsure`).
+* `spot_check_comment_only` - the only use sits inside a comment.
+
+`devmap-cli/tests/record_names_no_private_identity.rs` fails on a path-like or
+`::`-qualified `symbol`/`evidence`, a `symbol` that is not a hash token, a prose
+`evidence`, or a row missing either field.
+
 The eligibility test binds each listed language to its corpus 0.9-tier
 false-positive rate through `corpora[].languages.<lang>.dead_fp_by_tier`. The
 shape it reads — anything else in the file is ignored, and a listed
