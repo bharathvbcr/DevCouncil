@@ -37,7 +37,11 @@ mod budget_characterization;
 #[cfg(feature = "parse")]
 mod budget_is_a_real_bound;
 #[cfg(feature = "parse")]
+mod budget_attack;
+#[cfg(feature = "parse")]
 mod budget_retry;
+#[cfg(feature = "parse")]
+mod extract_all_bench;
 #[cfg(feature = "parse")]
 mod c_family;
 mod cache_tag_security;
