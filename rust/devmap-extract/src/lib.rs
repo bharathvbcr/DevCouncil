@@ -909,14 +909,33 @@ pub fn retry_budget_refusals(
     };
     for index in refused {
         let cancelled = cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
-        if cancelled || report.retried >= treesitter::MAX_BUDGET_RETRIES {
+        // What the final reason says happened after the first pass, so a
+        // reader of `parse_failed` can tell the three refusals apart.
+        let verdict = if cancelled {
             report.not_retried += 1;
+            "; not retried: the build was cancelled before the serial retry reached this file"
+                .to_string()
+        } else if report.retried >= treesitter::MAX_BUDGET_RETRIES {
+            report.not_retried += 1;
+            format!(
+                "; not retried: more than {} files were refused for budget, the cap on serial retries",
+                treesitter::MAX_BUDGET_RETRIES
+            )
         } else {
             report.retried += 1;
             let file = &files[index];
             extractions[index] = extract_file_with_budget(file.path, file.source, budgets.retry);
             if !extractions[index].is_budget_refusal() {
                 report.recovered += 1;
+            }
+            format!(
+                "; refused again by the serial retry at the {:?} budget",
+                budgets.retry
+            )
+        };
+        if extractions[index].is_budget_refusal() {
+            if let model::ParseOutcome::Failed { reason } = &mut extractions[index].parse_outcome {
+                reason.push_str(&verdict);
             }
         }
         let still_refused = extractions[index].is_budget_refusal();
@@ -929,6 +948,15 @@ pub fn retry_budget_refusals(
         if let Some(progress) = progress {
             progress.finish_file(false, extractions[index].is_parse_failure());
         }
+    }
+    if let Some(progress) = progress {
+        progress.record_budget_retry(progress::BudgetRetryCounts {
+            refused: report.first_pass_refused,
+            retried: report.retried,
+            recovered: report.recovered,
+            not_retried: report.not_retried,
+            still_refused: report.still_refused_total,
+        });
     }
     report
 }

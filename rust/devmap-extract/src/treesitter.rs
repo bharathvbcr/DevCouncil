@@ -92,7 +92,7 @@ pub const MAX_BUDGET_RETRIES: usize = 16;
 
 /// Stamp a budget-overrun reason so [`crate::model::Extraction::is_budget_refusal`]
 /// can recognise it. The single constructor of such reasons.
-fn budget_refusal_reason(detail: String) -> String {
+pub(crate) fn budget_refusal_reason(detail: String) -> String {
     format!("{}{detail}", crate::model::BUDGET_REFUSAL_PREFIX)
 }
 

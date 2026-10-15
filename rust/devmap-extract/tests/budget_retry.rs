@@ -115,9 +115,16 @@ fn duplicate_paths_are_each_retried_and_reported() {
 
 #[test]
 fn a_non_budget_failure_is_not_retried_or_relabelled() {
-    // A malformed notebook fails at any budget.
+    // A malformed notebook fails at any budget that lets it start; the first
+    // pass here is real-budget for it and refused-for-budget for the python.
     let files = [file("broken.ipynb", "not JSON"), file("a.py", PY)];
-    let (out, report) = extract_all_with_budgets(&files, None, SMALL_FIRST, None);
+    let mut out = vec![
+        extract_file_with_budget("broken.ipynb", "not JSON", Duration::from_secs(60)),
+        extract_file_with_budget("a.py", PY, Duration::ZERO),
+    ];
+    let before = reason(&out[0]);
+    let report = retry_budget_refusals(&files, &mut out, None, SMALL_FIRST, None);
+    assert_eq!(reason_or_empty(&out[0]), before, "left exactly as reported");
 
     assert!(out[0].is_parse_failure());
     assert!(!out[0].is_budget_refusal());
@@ -166,4 +173,78 @@ fn progress_counts_each_file_once_and_failures_only_when_final() {
     extract_all_with_budgets(&files, Some(&refused), BOTH_TOO_SMALL, None);
     let snap = refused.snapshot();
     assert_eq!((snap.completed, snap.failed, snap.valid), (2, 2, true));
+}
+
+fn reason_or_empty(extraction: &devmap_extract::Extraction) -> String {
+    match &extraction.parse_outcome {
+        devmap_extract::ParseOutcome::Failed { reason } => reason.clone(),
+        _ => String::new(),
+    }
+}
+
+fn reason(extraction: &devmap_extract::Extraction) -> String {
+    match &extraction.parse_outcome {
+        devmap_extract::ParseOutcome::Failed { reason } => reason.clone(),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_file_refused_after_the_retry_says_so() {
+    let files = [file("a.py", PY)];
+    let (out, _) = extract_all_with_budgets(&files, None, BOTH_TOO_SMALL, None);
+    let reason = reason(&out[0]);
+    assert!(
+        reason.starts_with(devmap_extract::BUDGET_REFUSAL_PREFIX),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("refused again by the serial retry"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn a_file_past_the_retry_cap_says_it_was_not_retried_for_that_reason() {
+    let paths: Vec<String> = (0..devmap_extract::treesitter::MAX_BUDGET_RETRIES + 1)
+        .map(|i| format!("f{i}.py"))
+        .collect();
+    let files: Vec<FileRef> = paths.iter().map(|p| file(p, PY)).collect();
+    let (out, _) = extract_all_with_budgets(&files, None, BOTH_TOO_SMALL, None);
+    let last = reason(out.last().unwrap());
+    assert!(
+        last.contains("not retried") && last.contains("cap on serial retries"),
+        "{last}"
+    );
+    assert!(reason(&out[0]).contains("refused again"));
+}
+
+#[test]
+fn a_cancelled_retry_says_it_was_cancelled() {
+    let files = [file("a.py", PY)];
+    let cancel = AtomicBool::new(true);
+    let (out, _) = extract_all_with_budgets(&files, None, SMALL_FIRST, Some(&cancel));
+    let reason = reason(&out[0]);
+    assert!(
+        reason.contains("not retried") && reason.contains("cancelled"),
+        "{reason}"
+    );
+    assert!(out[0].is_budget_refusal());
+}
+
+#[test]
+fn the_build_progress_snapshot_reports_the_retry() {
+    let files = [file("a.py", PY), file("b.py", PY)];
+    let progress = devmap_extract::progress::FileProgress::default();
+    extract_all_with_budgets(&files, Some(&progress), SMALL_FIRST, None);
+    let counts = progress.snapshot().budget_retry;
+    assert_eq!(
+        (
+            counts.refused,
+            counts.retried,
+            counts.recovered,
+            counts.still_refused
+        ),
+        (2, 2, 2, 0)
+    );
 }
