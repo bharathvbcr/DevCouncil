@@ -1516,6 +1516,10 @@ pub fn go_interface_method_matches<'a>(
         .collect()
 }
 
+/// The leading words of every `ParseOutcome::Failed` reason that records a
+/// parse-budget overrun. See [`Extraction::is_budget_refusal`].
+pub const BUDGET_REFUSAL_PREFIX: &str = "parse budget exceeded: ";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Extraction {
     pub file_path: String,
@@ -1743,6 +1747,23 @@ impl Extraction {
     pub fn is_parse_failure(&self) -> bool {
         matches!(self.parse_outcome, ParseOutcome::Failed { .. })
             && !matches!(self.engine, ExtractionEngine::NotApplicable { .. })
+    }
+
+    /// Whether this file was refused because it ran out of parse budget, as
+    /// opposed to failing for any other reason.
+    ///
+    /// The one question the budget retry pass asks: only a budget refusal can
+    /// be cured by a larger budget, so a grammar fault or a depth refusal must
+    /// never be retried or relabelled. Answered by the reason's
+    /// [`BUDGET_REFUSAL_PREFIX`], which `treesitter` stamps on every budget
+    /// refusal through one function, because `ParseOutcome` is a serialized
+    /// shape and a new variant would be a schema change.
+    pub fn is_budget_refusal(&self) -> bool {
+        self.is_parse_failure()
+            && matches!(
+                &self.parse_outcome,
+                ParseOutcome::Failed { reason } if reason.starts_with(BUDGET_REFUSAL_PREFIX)
+            )
     }
 
     /// Whether a grammar actually read this file.

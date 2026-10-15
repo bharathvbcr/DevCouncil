@@ -371,11 +371,15 @@ pub fn extract_notebook(
 }
 
 /// Production entry: every cell receives only the remaining shared budget.
-pub(crate) fn extract_notebook_bounded(path: &str, raw: &str) -> Extraction {
+pub(crate) fn extract_notebook_bounded(
+    path: &str,
+    raw: &str,
+    budget: std::time::Duration,
+) -> Extraction {
     extract_notebook_with_parser(
         path,
         raw,
-        crate::treesitter::DEFAULT_PARSE_BUDGET,
+        budget,
         crate::treesitter::extract_treesitter_with_budget,
     )
 }
