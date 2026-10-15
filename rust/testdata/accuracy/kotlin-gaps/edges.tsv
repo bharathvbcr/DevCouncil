@@ -29,3 +29,5 @@ kg.K31	K31	src/main/kotlin/gaps/Events.kt::Child.go	src/main/kotlin/gaps/Events.
 kg.K31b	K31	src/main/kotlin/gaps/Events.kt::Child.go	src/main/kotlin/gaps/Events.kt::Child.go	forbid	must		super.go() is not a self-reference
 kg.K32	K32	src/main/kotlin/gaps/Events.kt::useFactory	src/main/kotlin/gaps/Events.kt::Factory.build	edge	must		companion object call
 kg.K33	K33	src/main/kotlin/gaps/Events.kt::mk	src/main/kotlin/gaps/Events.kt::Res.Ok	edge	must	Ok	nested class constructor Res.Ok(1)
+kg.OV1	overload	src/main/kotlin/gaps/Overloads.kt::Calc.add	src/main/kotlin/gaps/Overloads.kt::Calc.add	forbid_any_tier	must		add(String) calls add(Int), a different declaration: two overloads must keep distinct identities, so no edge may join a symbol to itself
+kg.OV2	overload	src/main/kotlin/gaps/Overloads.kt::useCalc	src/main/kotlin/gaps/Overloads.kt::Calc.add	edge	must		c.add(1) and c.add("two") on a Calc-typed parameter reach Calc.add (either overload)
