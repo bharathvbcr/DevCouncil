@@ -5,7 +5,12 @@
     { "name": "Lappi-decision", "commit": "f7cb935ac12e273bb83699ee5ca96b7d7b4abfcd", "languages": ["python"] },
     { "name": "GitPulse", "commit": "f185418549016d613eb0a681389acf5e52263a92", "languages": ["rust"] },
     { "name": "DevType", "commit": "782a53424f646b49d4660a0c06981d55bbccfcac", "languages": ["swift"] },
-    { "name": "ChronosFlow", "commit": "b7a23d41c02e4e8cb88a9c6e4c96dc2c1ed2cdc4", "languages": ["kotlin", "swift"] }
+    { "name": "ChronosFlow", "commit": "b7a23d41c02e4e8cb88a9c6e4c96dc2c1ed2cdc4", "languages": ["kotlin", "swift"] },
+    { "name": "LiquiTask", "commit": "fd2015e99d7bf415fe9f5922c6a9426885b91bde", "languages": ["go", "rust", "typescript"] },
+    { "name": "SalEdge", "commit": "3eafbd4c26bf0e38217b8ae33a8e12dbab336e36", "languages": ["rust", "typescript"] },
+    { "name": "AcademiaTrack", "commit": "be7e844207ca4dd8a06a21706eac26100d937c74", "languages": ["rust", "typescript"] },
+    { "name": "Chronicle", "commit": "fa784171b5ce01e52f6558941b3ca5c80c33f406", "languages": ["kotlin", "rust", "typescript"] },
+    { "name": "DevPrism", "commit": "af20d777393e95127404b5611275f67e9f81f130", "languages": ["rust", "typescript"] }
   ],
   "_comment_floors": "recall_floors_percent: the E3 baseline (the 2026-10-09 audit measurement minus two points), held as a no-regression ratchet against the previous record row. recall_targets_percent: what each language card claims, gated absolutely - below target or unmeasured fails. A floor rises only in the change that measures it; neither may be lowered (no_recall_floor_or_card_target_is_ever_lowered).",
   "recall_floors_percent": {
