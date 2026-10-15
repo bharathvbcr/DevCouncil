@@ -157,10 +157,43 @@ fn build_fixture(name: &str, fixture: &Path) -> Built {
         answer["truncated"], false,
         "{name}: the whole dead list must fit the budget, or this test scores a sample"
     );
+    let status: serde_json::Value = serde_json::from_str(&run(&["--json", "status"]))
+        .unwrap_or_else(|e| panic!("{name}: status --json is not JSON: {e}"));
+    if let Some(why) = fixture_incompleteness(&status) {
+        panic!(
+            "{name}: fixture has incomplete coverage ({why}); an incomplete scan \
+             gives its dead rows the coverage-loss reason and must not prove a language"
+        );
+    }
     Built {
         rows: answer["items"].as_array().cloned().unwrap_or_default(),
         excluded: answer["excluded"].clone(),
         db,
+    }
+}
+
+/// Why a fixture's scan was not complete, from `devmap --json status`, or
+/// `None` when it was.
+///
+/// The verdict is the status's own `degraded_reason`, which is `None` exactly
+/// when the index is complete: it is where a file that failed to parse, was
+/// recovered by pattern, was refused by discovery, or whose lost regions hold a
+/// name is reported. The `coverage_gaps` ledger is not scanned for a non-zero
+/// total, because it also lists files that are not losses (an Android manifest
+/// under `not_parsed`, a name-free ERROR region under `partial_parse`); it is
+/// quoted in the message, and its absence is itself a refusal. A status without
+/// either field is incomplete: a check that could not run must not read as one
+/// that passed.
+fn fixture_incompleteness(status: &serde_json::Value) -> Option<String> {
+    let (Some(reason), Some(gaps)) = (
+        status.get("degraded_reason"),
+        status.get("coverage_gaps").filter(|g| g.is_object()),
+    ) else {
+        return Some("status carries no degraded_reason or coverage_gaps".to_string());
+    };
+    match reason {
+        serde_json::Value::Null => None,
+        other => Some(format!("degraded_reason: {other}; coverage_gaps: {gaps}")),
     }
 }
 
@@ -711,4 +744,41 @@ fn a_confident_tier_missing_its_false_positive_count_fails() {
         &record_with(serde_json::json!({ "dead_fp_by_tier": { "0.9": { "rows": 4 } } })),
         "test record",
     );
+}
+
+/// A fixture the scan could not read in full gives its `truly_dead` markers the
+/// coverage-loss reason, which the shared predicate counts as the confident
+/// branch: the gate would read an incomplete scan as proof. It must refuse.
+#[test]
+#[should_panic(expected = "incomplete coverage")]
+fn an_incomplete_fixture_is_refused_not_scored() {
+    let tmp = std::env::temp_dir().join(format!("devmap-incomplete-go-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    copy_tree(&accuracy_root().join("go"), &tmp);
+    for i in 0..3 {
+        std::fs::write(
+            tmp.join(format!("app/svc/broken{i}.go")),
+            "package svc\nfunc ((( {{{ ;;; )))\ntype struct {\n",
+        )
+        .expect("write unparseable file");
+    }
+    build_fixture("incomplete-go", &tmp);
+}
+
+#[test]
+fn fixture_completeness_follows_the_status_verdict() {
+    let ledger =
+        serde_json::json!({ "not_parsed": { "total": 1, "paths": ["AndroidManifest.xml"] } });
+    // A listed non-loss (an Android manifest) beside a null verdict is complete.
+    let clean = serde_json::json!({ "degraded_reason": null, "coverage_gaps": ledger });
+    assert_eq!(fixture_incompleteness(&clean), None);
+    let broken = serde_json::json!({
+        "degraded_reason": "3 file(s) failed to parse",
+        "coverage_gaps": ledger
+    });
+    assert!(fixture_incompleteness(&broken).is_some_and(|why| why.contains("failed to parse")));
+    // A status that cannot say is not a status that came back clean.
+    assert!(fixture_incompleteness(&serde_json::json!({})).is_some());
+    assert!(fixture_incompleteness(&serde_json::json!({ "degraded_reason": null })).is_some());
+    assert!(fixture_incompleteness(&serde_json::json!({ "coverage_gaps": ledger })).is_some());
 }
