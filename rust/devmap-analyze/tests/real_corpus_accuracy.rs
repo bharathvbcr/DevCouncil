@@ -28,9 +28,10 @@
 //! * **Gated.** [`evaluate_gates`]: confident precision >= 0.95, honest-miss >=
 //!   98%, 0.9-tier dead false positives <= 5%, no regression against the
 //!   previous row (precision -1 pt, recall -2 pt) and the recall floors in
-//!   `corpora.json`. A gate that held in the previous row must keep holding; a
-//!   gate that did not may only not get worse, so the first record is a
-//!   baseline and each language card tightens it. On top of that ratchet,
+//!   `corpora.json`. Precision, honest-miss and dead FP are absolute: open
+//!   whenever missed, even on a first measurement. The recall floors are a
+//!   ratchet: one that held must keep holding, one that did not may only not
+//!   get worse, so each language card tightens it. On top of that,
 //!   [`claim_gates`] holds the cards' claims absolutely: recall at the card
 //!   target (`recall_targets_percent`), UniqueGlobal precision >= 0.95 and zero
 //!   AmbiguousGlobal edges. A gate whose number is missing - no labels, no
@@ -799,10 +800,14 @@ fn claim_gates(
 
 /// Gate violations for one language row against the previous one.
 ///
-/// An absolute gate that held in `previous` must hold now. One that did not
-/// may only stay put (within tolerance): the first record is a baseline, and
-/// each language card is what moves it. A gate whose number is `None` - no
-/// labels, no sample - is reported as unmeasured, never as passed.
+/// Two kinds of gate. An *absolute* one (confident precision, honest-miss,
+/// 0.9-tier dead false positives) is open whenever the number misses its
+/// threshold, with or without a previous row: a first measurement is not a
+/// pass. A *ratchet* one (the recall floors, which are the E3 baseline and not
+/// a claim) must keep holding once it held, and otherwise may only stay put
+/// within tolerance; each language card is what raises it. Both also may not
+/// regress against `previous`. A gate whose number is `None` - no labels, no
+/// sample - is reported as unmeasured, never as passed.
 fn regression_gates(
     lang: &str,
     previous: Option<&Value>,
@@ -815,7 +820,8 @@ fn regression_gates(
                      before: Option<f64>,
                      floor: f64,
                      higher_is_better: bool,
-                     tolerance: f64| {
+                     tolerance: f64,
+                     absolute: bool| {
         let Some(now) = now else {
             out.push(format!(
                 "{lang}: {name} is unmeasured (no labels), so it cannot pass"
@@ -833,6 +839,10 @@ fn regression_gates(
         if held && !meets(now) {
             out.push(format!(
                 "{lang}: {name} {now:.3} no longer meets {floor:.3}, which the previous record did"
+            ));
+        } else if absolute && !meets(now) {
+            out.push(format!(
+                "{lang}: {name} {now:.3} does not meet the absolute floor {floor:.3}"
             ));
         }
         if let Some(before) = before {
@@ -856,6 +866,7 @@ fn regression_gates(
         CONFIDENT_PRECISION_FLOOR,
         true,
         PRECISION_TOLERANCE,
+        true,
     );
     check(
         "honest-miss rate",
@@ -864,6 +875,7 @@ fn regression_gates(
         HONEST_MISS_FLOOR,
         true,
         RECALL_TOLERANCE,
+        true,
     );
     check(
         "0.9-tier dead false-positive rate",
@@ -872,6 +884,7 @@ fn regression_gates(
         DEAD_FP_CEILING,
         false,
         0.0,
+        true,
     );
     match recall_checks(lang, current, floors) {
         Err(e) => out.push(e),
@@ -884,7 +897,7 @@ fn regression_gates(
                         .find(|(n, _, _)| *n == name)
                         .and_then(|(_, r, _)| r)
                 });
-                check(&name, now, before, floor, true, RECALL_TOLERANCE);
+                check(&name, now, before, floor, true, RECALL_TOLERANCE, false);
             }
         }
     }
@@ -1493,13 +1506,18 @@ fn gates() -> Gates {
 
 #[test]
 fn a_gate_that_held_must_keep_holding_and_one_that_did_not_may_only_stay_put() {
-    // First record, everything below the floors: a baseline, no failure beyond
-    // the unmeasured ones.
+    // First record, everything below the floors: the recall floor is only a
+    // ratchet, so a first recall below it is a baseline; the absolute gates
+    // (precision, honest-miss, dead FP) are open whatever `previous` says.
     let first = row((90, 100), (60, 100), (90, 100), (3, 10));
-    assert!(regression_gates("go", None, &first, &floors()).is_empty());
+    let found = regression_gates("go", None, &first, &floors());
+    assert_eq!(found.len(), 3, "{found:?}");
+    assert!(!found.iter().any(|f| f.contains("recall")), "{found:?}");
 
-    // The same numbers again: unchanged is not a regression.
-    assert!(regression_gates("go", Some(&first), &first, &floors()).is_empty());
+    // The same numbers again: unchanged is not a regression, only still open.
+    let found = regression_gates("go", Some(&first), &first, &floors());
+    assert_eq!(found.len(), 3, "{found:?}");
+    assert!(!found.iter().any(|f| f.contains("regressed")), "{found:?}");
 
     // Precision fell two points: a regression even though it never met 0.95.
     let worse = row((88, 100), (60, 100), (90, 100), (3, 10));
@@ -1531,6 +1549,89 @@ fn a_gate_that_held_must_keep_holding_and_one_that_did_not_may_only_stay_put() {
     let found = regression_gates("go", Some(&good), &dead_worse, &floors());
     assert!(
         found.iter().any(|f| f.contains("dead false-positive")),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn an_absolute_floor_is_open_on_a_first_measurement_and_a_recall_floor_is_not() {
+    // The scholarlm TypeScript shape: honest-miss 26/27 = 96.3% against 98%,
+    // with no previous row.
+    let first = row((97, 100), (90, 100), (26, 27), (0, 10));
+    let found = regression_gates("typescript", None, &first, &floors());
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].contains("honest-miss rate 0.963 does not meet the absolute floor 0.980"),
+        "{found:?}"
+    );
+
+    // Each absolute gate on its own, with no previous row.
+    let found = regression_gates(
+        "go",
+        None,
+        &row((94, 100), (90, 100), (99, 100), (0, 10)),
+        &floors(),
+    );
+    assert!(
+        found
+            .iter()
+            .any(|f| f.contains("confident edge precision 0.940")),
+        "{found:?}"
+    );
+    let found = regression_gates(
+        "go",
+        None,
+        &row((97, 100), (90, 100), (99, 100), (1, 10)),
+        &floors(),
+    );
+    assert!(
+        found
+            .iter()
+            .any(|f| f.contains("dead false-positive rate 0.100")),
+        "{found:?}"
+    );
+
+    // Exactly at each threshold is met, not open.
+    let at = row((95, 100), (88, 100), (98, 100), (1, 20));
+    assert!(regression_gates("go", None, &at, &floors()).is_empty());
+
+    // Previous met, current does not: "no longer meets" plus the regression,
+    // and not also the absolute-floor line.
+    let good = row((97, 100), (90, 100), (99, 100), (0, 10));
+    let slipped = row((97, 100), (90, 100), (96, 100), (0, 10));
+    let found = regression_gates("go", Some(&good), &slipped, &floors());
+    assert_eq!(
+        found.iter().filter(|f| f.contains("honest-miss")).count(),
+        2,
+        "no longer meets + regressed: {found:?}"
+    );
+    assert!(
+        found.iter().any(|f| f.contains("no longer meets")),
+        "{found:?}"
+    );
+    assert!(
+        !found.iter().any(|f| f.contains("absolute floor")),
+        "{found:?}"
+    );
+
+    // Previous unmet and current unmet: still open.
+    let prev = row((97, 100), (90, 100), (95, 100), (0, 10));
+    let found = regression_gates("go", Some(&prev), &slipped, &floors());
+    assert!(
+        found.iter().any(|f| f.contains("absolute floor")),
+        "{found:?}"
+    );
+
+    // n = 0: unmeasured, not passed and not a panic.
+    let found = regression_gates(
+        "go",
+        None,
+        &row((97, 100), (90, 100), (0, 0), (0, 10)),
+        &floors(),
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].contains("honest-miss rate is unmeasured"),
         "{found:?}"
     );
 }
