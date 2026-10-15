@@ -112,3 +112,24 @@ sw.X42b	X42	spm/Sources/Core/Lifecycle.swift::Session.close	spm/Sources/Core/Lif
 sw.X42c	X42	spm/Sources/Core/Lifecycle.swift::Session.release	spm/Sources/Core/Lifecycle.swift::Session.cleanup	edge	must		implicit self call between two members of one extension
 sw.X42d	X42	spm/Sources/Core/Lifecycle.swift::retire	spm/Sources/Core/Lifecycle.swift::Session.close	edge	must		free function calls a method through a Session-typed parameter
 sw.X42e	X42	spm/Sources/Core/Lifecycle.swift::Session	spm/Sources/Core/Lifecycle.swift::Session.release	forbid_any_tier	must		deinit calls cleanup() only; it does not call release()
+sw.O1a	O1	micro/Sources/M/Q1.swift::Crate.total	micro/Sources/M/Q1.swift::Parcel.weight	edge	must		closure over a stored [Parcel] property: $0 is the element
+sw.O1b	O1	micro/Sources/M/Q1.swift::Crate	micro/Sources/M/Q1.swift::Parcel.weight	edge	must		closure over a stored [Parcel] property inside a computed property
+sw.O1c	O1	micro/Sources/M/Q1.swift::Crate.fromFree	micro/Sources/M/Q1.swift::Parcel.weight	edge	must		local typed by a free function returning [Parcel]; closure $0 is the element
+sw.O1d	O1	micro/Sources/M/Q1.swift::Crate.viaOptional	micro/Sources/M/Q1.swift::Parcel.weight	edge	must		(opt?.items ?? []).filter closure: $0 is the element
+sw.O2	O2	micro/Sources/M/Q2.swift::runSteps	micro/Sources/M/Q2.swift::Motor.tick	edge	must		closure literal in an array annotated [(Motor)->Void]
+sw.O2b	O2	micro/Sources/M/Q2.swift::runCases	micro/Sources/M/Q2.swift::Motor.tick	edge	must		closure inside a labelled-tuple element annotated (name:String, apply:(Motor)->Void)
+sw.O3	O3	micro/Sources/M/Q3.swift::Screen	micro/Sources/M/Q3.swift::View.badge	edge	must		protocol-extension method chained after another extension method on a typed stored property
+sw.O3.not	O3	micro/Sources/M/Q3.swift::Screen	micro/Sources/M/Q3.swift::Other.badge	forbid	must		unrelated type with a same-named method
+sw.C1	C1	micro/Sources/M/Q4.swift::check	micro/Sources/M/Q4.swift::Probe.snapshot	edge	must		prefix ! over Probe().snapshot().ok
+sw.C2	C2	micro/Sources/M/Q4.swift::scanIt	micro/Sources/M/Q4.swift::Svc.scan	edge	must		multi-line constructor call then .scan()
+sw.C3	C3	micro/Sources/M/Q4.swift::usageOf	micro/Sources/M/Q4.swift::Snap.usage	edge	must		store.snapshot(p) returns Snap; chained .usage(for:)
+sw.C4	C4	micro/Sources/M/Q4.swift::openAny	micro/Sources/M/Q4.swift::AppDel.openIt	edge	must		(x as? AppDel)?.openIt()
+sw.T1	T1	micro/Sources/M/Q5.swift::Runner.t1	micro/Sources/M/Q2.swift::Motor.tick	edge	must		local typed by a method of the enclosing type returning Motor
+sw.T2	T2	micro/Sources/M/Q5.swift::Runner.t2	micro/Sources/M/Q4.swift::Snap.usage	edge	must		local typed by store.snapshot(): return type of a method on a parameter-typed receiver
+sw.T3	T3	micro/Sources/M/Q5.swift::Runner.t3	micro/Sources/M/Q5.swift::Svc.stash	edge	must		tuple destructuring from a free function returning (Store, Svc)
+sw.T4	T4	micro/Sources/M/Q5.swift::Runner.t4	micro/Sources/M/Q5.swift::Mgr.run	edge	must		private let m = Mgr.shared (static property of its own type)
+sw.T5	T5	micro/Sources/M/Q5.swift::Runner.t5	micro/Sources/M/Q5.swift::Client.send	edge	must		property wrapper whose init takes Client.self; wrappedValue is Client
+sw.T6	T6	micro/Sources/M/Q5.swift::Runner.t6	micro/Sources/M/Q5.swift::Cmd.inverse	edge	must		if let u = history.pop() with pop() -> Cmd?
+sw.T7	T7	micro/Sources/M/Q6.swift::roll	micro/Sources/M/Q6.swift::Rng.next	edge	must		var r = Rng(seed:1) binds the visible Rng, not a private nested namesake in another file
+sw.T7.not	T7	micro/Sources/M/Q6.swift::roll	micro/Sources/M/Q7.swift::Rng.next	forbid	must		private nested Rng in another file is not visible here
+sw.E1	E1	micro/Sources/M/Q8.swift::Joiner.apply	micro/Sources/M/Q8.swift::Case.apply	edge	must		open.transform.apply(x): labelled-tuple parameter member typed Case, beside a same-named enclosing method
