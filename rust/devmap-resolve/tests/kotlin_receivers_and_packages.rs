@@ -51,6 +51,37 @@ fn has(result: &ResolutionResult, from: &str, to: &str) -> bool {
         .any(|(source, target, _)| source == from && target == to)
 }
 
+/// Same-name overloads in one class (`fun add(Int)` / `fun add(String)`), where
+/// the second calls the first. Fixture rows `kg.OV1` / `kg.OV2`.
+///
+/// Both declarations are extracted, but they share the id `Overloads.kt::Calc.add`,
+/// so the call from `add(String)` to `add(Int)` is stored as `Calc.add -> Calc.add`,
+/// a self-edge. Identity-by-overload needs the resolver (`resolver.rs`), so this
+/// is ignored until ft-0720fe1d lands there; run it with `--ignored`.
+#[test]
+#[ignore = "ft-0720fe1d: overloads share one symbol id; needs resolver.rs"]
+fn overloads_keep_distinct_identities_and_never_self_edge() {
+    let source = "package gaps\n\nclass Calc {\n    fun add(a: Int): Int = a\n\n    fun add(a: String): Int = add(a.length)\n}\n\nfun useCalc(c: Calc): Int = c.add(1) + c.add(\"two\")\n";
+    let extraction = extract_file("gaps/Overloads.kt", source);
+    let declared = extraction
+        .symbols
+        .iter()
+        .filter(|s| s.qualified_name.ends_with("Calc.add"))
+        .count();
+    assert_eq!(declared, 2, "both overloads are declared");
+
+    let result = resolve(&[("gaps/Overloads.kt", source)]);
+    let found = calls(&result);
+    assert!(
+        found.iter().all(|(from, to, _)| from != to),
+        "an overload calling its sibling overload is not a self-edge: {found:?}"
+    );
+    assert!(
+        has(&result, "gaps/Overloads.kt::useCalc", "gaps/Overloads.kt::Calc.add"),
+        "c.add(..) on a Calc-typed parameter reaches Calc.add: {found:?}"
+    );
+}
+
 #[test]
 fn a_constructor_property_and_a_parameter_type_their_receivers() {
     let result = resolve(&[
