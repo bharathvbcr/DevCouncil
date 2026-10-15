@@ -101,3 +101,8 @@ sw.P8	P8	spm/Sources/Core/PrivateReach.swift::Holder	spm/Sources/Core/PrivateRea
 sw.P9	P9	spm/Sources/Core/PrivateReach.swift::Holder	spm/Sources/Core/PrivateReach.swift::Holder.privCompute	edge	must		lazy var initializer
 sw.X6a	X6	xcode/ios/Shared/Formatter.swift::sharedFormat	xcode/ios/AppTarget/Theme.swift::Theme.accent	edge	must		file compiled into the app target
 sw.X6b	X6	xcode/ios/Shared/Formatter.swift::sharedFormat	xcode/ios/WidgetTarget/Theme.swift::Theme.accent	edge	must		file compiled into the widget target
+sw.X42a	X42	spm/Sources/Core/Lifecycle.swift::Session	spm/Sources/Core/Lifecycle.swift::Session.cleanup	edge	must		deinit is not a symbol; its self.cleanup() call attributes to the owning type, and cleanup is declared in an extension
+sw.X42b	X42	spm/Sources/Core/Lifecycle.swift::Session.close	spm/Sources/Core/Lifecycle.swift::Session.release	edge	must		implicit self call from a class method to a member declared in an extension
+sw.X42c	X42	spm/Sources/Core/Lifecycle.swift::Session.release	spm/Sources/Core/Lifecycle.swift::Session.cleanup	edge	must		implicit self call between two members of one extension
+sw.X42d	X42	spm/Sources/Core/Lifecycle.swift::retire	spm/Sources/Core/Lifecycle.swift::Session.close	edge	must		free function calls a method through a Session-typed parameter
+sw.X42e	X42	spm/Sources/Core/Lifecycle.swift::Session	spm/Sources/Core/Lifecycle.swift::Session.release	forbid_any_tier	must		deinit calls cleanup() only; it does not call release()
