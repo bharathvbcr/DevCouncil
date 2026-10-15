@@ -712,3 +712,33 @@ fn a_confident_tier_missing_its_false_positive_count_fails() {
         "test record",
     );
 }
+
+/// Attack probe (Q3): a fixture whose coverage is incomplete. Prints the old
+/// (4e682dca) and new (ac70f212) gate verdict for each dead row.
+#[test]
+fn attack_incomplete_coverage_gate_verdict_before_and_after() {
+    let root = accuracy_root().join("go");
+    let tmp = std::env::temp_dir().join(format!("devmap-attack-go-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    copy_tree(&root, &tmp);
+    for i in 0..3 {
+        std::fs::write(
+            tmp.join(format!("app/svc/broken{i}.go")),
+            "package svc\nfunc ((( {{{ ;;; )))\ntype struct {\n",
+        )
+        .unwrap();
+    }
+    let built = build_fixture("attack-go", &tmp);
+    for row in &built.rows {
+        let old = confidence(row) > f64::from(HIGHEST_DEGRADED_CONFIDENCE)
+            || reason(row).starts_with(devmap_analyze::CONFIDENT_TIER_UNPROVEN);
+        let short: String = reason(row).chars().take(50).collect();
+        println!(
+            "ATTACK raw={} {:.3} old_branch={old} new_branch={} {} | {short}",
+            row["confidence"],
+            confidence(row),
+            row_in_confident_branch(row),
+            row["symbol_name"],
+        );
+    }
+}
