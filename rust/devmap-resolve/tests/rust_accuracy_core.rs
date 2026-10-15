@@ -429,6 +429,26 @@ pub fn own(o: Own) -> String { o.describe() }
     // A type that declares the method itself answers before any blanket impl.
     assert!(r.has("a.rs::own", "a.rs::Own.describe"), "{:?}", r.edges);
     assert!(!r.has("a.rs::own", "a.rs::T.describe"), "{:?}", r.edges);
+    // The bound is not checked, so a blanket answer is the only candidate, not
+    // a type that names it: HIGH, below the deterministic tier `own` earns.
+    assert_eq!(
+        r.tier("a.rs::literal", "a.rs::T.describe"),
+        Some(900),
+        "{:?}",
+        r.tiers
+    );
+    assert_eq!(
+        r.tier("a.rs::typed", "a.rs::T.describe"),
+        Some(900),
+        "{:?}",
+        r.tiers
+    );
+    assert_eq!(
+        r.tier("a.rs::own", "a.rs::Own.describe"),
+        Some(1000),
+        "{:?}",
+        r.tiers
+    );
 
     let two = "\
 pub trait A { fn shared(&self) -> u8; }

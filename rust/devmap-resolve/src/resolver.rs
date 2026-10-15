@@ -1734,11 +1734,11 @@ impl Resolver {
     /// receiver whose own type (and every type it derefs to) declares none.
     ///
     /// The impl's bound is not checked — that needs the trait solver — so two
-    /// blanket impls declaring the name abstain rather than pick one. One is a
-    /// `ReceiverType` claim on the strength of being the only declaration that
-    /// can answer, the rule the literal-extension rung applies, and like that
-    /// rung it does not see a method the standard library supplies under the
-    /// same name.
+    /// blanket impls declaring the name abstain rather than pick one. One is
+    /// bound as `UniqueGlobal` (HIGH), not `ReceiverType`: nothing about the
+    /// receiver's type names it, only being the one blanket declaration of the
+    /// name in the family. It does not see a method the standard library
+    /// supplies under the same name.
     fn rust_blanket_method(&self, method: &str) -> Option<&(String, String)> {
         match self.rust_blanket_methods.get(method)?.as_slice() {
             [one] => Some(one),
@@ -5121,30 +5121,39 @@ impl Resolver {
                             // Swift: a method the type does not write is the one
                             // a protocol extension or base class supplies.
                             // Rust: a method the impl does not write is the
-                            // default body of a trait the type implements, or
-                            // failing that the one a blanket impl supplies.
+                            // default body of a trait the type implements.
                             let inherited = (own.is_none()
                                 && matches!(family, LangFamily::Swift | LangFamily::Rust)
                                 && !self.type_methods.contains_key(&key))
                             .then(|| {
                                 self.inherited_method(family, &class_type, &call.callee_name)
                                     .map(|(file, symbol, _)| (file, symbol))
-                                    .or_else(|| {
-                                        (family == LangFamily::Rust)
-                                            .then(|| self.rust_blanket_method(&call.callee_name))
-                                            .flatten()
-                                            .cloned()
-                                    })
                             })
+                            .flatten();
+                            // Failing that, the one a Rust blanket impl
+                            // supplies — see `rust_blanket_method` for its tier.
+                            let blanket = (family == LangFamily::Rust
+                                && own.is_none()
+                                && inherited.is_none()
+                                && !self.type_methods.contains_key(&key))
+                            .then(|| self.rust_blanket_method(&call.callee_name))
                             .flatten();
                             // The type is known and declares nothing by that
                             // name: a miss about the member, not the receiver.
                             if family == LangFamily::Rust
                                 && own.is_none()
                                 && inherited.is_none()
+                                && blanket.is_none()
                                 && self.declares_type(family, &class_type)
                             {
                                 rust_member_miss = true;
+                            }
+                            if let Some((target_f, target_symbol)) = blanket {
+                                resolution = Some(Arc::new(Resolution::UniqueGlobal {
+                                    target_symbol: target_symbol.clone(),
+                                    target_file: target_f.clone(),
+                                    family,
+                                }));
                             }
                             if let Some(((target_f, target_symbol), receiver_type)) = own
                                 .map(|(target, receiver_type)| (target.clone(), receiver_type))
@@ -5262,17 +5271,10 @@ impl Resolver {
                                 if let Some((target_f, target_symbol)) =
                                     self.rust_blanket_method(&call.callee_name)
                                 {
-                                    // The impl's own parameter (`T`): an
-                                    // unsuffixed literal has no one type to name.
-                                    let receiver_type = target_symbol
-                                        .rsplit_once('.')
-                                        .map(|(owner, _)| owner.rsplit("::").next().unwrap_or(owner))
-                                        .unwrap_or(target_symbol)
-                                        .to_string();
-                                    resolution = Some(Arc::new(Resolution::ReceiverType {
+                                    resolution = Some(Arc::new(Resolution::UniqueGlobal {
                                         target_symbol: target_symbol.clone(),
                                         target_file: target_f.clone(),
-                                        receiver_type,
+                                        family,
                                     }));
                                 }
                             }
