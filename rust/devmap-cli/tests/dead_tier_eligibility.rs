@@ -40,10 +40,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use devmap_analyze::{
-    CONFIDENT_TIER_ELIGIBLE, CONFIDENT_TIER_UNPROVEN, EXPORTED_UNREFERENCED,
-    HIGHEST_DEGRADED_CONFIDENCE,
-};
+use devmap_analyze::dead_tier::in_confident_branch;
+use devmap_analyze::{CONFIDENT_TIER_ELIGIBLE, EXPORTED_UNREFERENCED, HIGHEST_DEGRADED_CONFIDENCE};
 
 static SEQUENCE: AtomicU32 = AtomicU32::new(0);
 
@@ -159,10 +157,43 @@ fn build_fixture(name: &str, fixture: &Path) -> Built {
         answer["truncated"], false,
         "{name}: the whole dead list must fit the budget, or this test scores a sample"
     );
+    let status: serde_json::Value = serde_json::from_str(&run(&["--json", "status"]))
+        .unwrap_or_else(|e| panic!("{name}: status --json is not JSON: {e}"));
+    if let Some(why) = fixture_incompleteness(&status) {
+        panic!(
+            "{name}: fixture has incomplete coverage ({why}); an incomplete scan \
+             gives its dead rows the coverage-loss reason and must not prove a language"
+        );
+    }
     Built {
         rows: answer["items"].as_array().cloned().unwrap_or_default(),
         excluded: answer["excluded"].clone(),
         db,
+    }
+}
+
+/// Why a fixture's scan was not complete, from `devmap --json status`, or
+/// `None` when it was.
+///
+/// The verdict is the status's own `degraded_reason`, which is `None` exactly
+/// when the index is complete: it is where a file that failed to parse, was
+/// recovered by pattern, was refused by discovery, or whose lost regions hold a
+/// name is reported. The `coverage_gaps` ledger is not scanned for a non-zero
+/// total, because it also lists files that are not losses (an Android manifest
+/// under `not_parsed`, a name-free ERROR region under `partial_parse`); it is
+/// quoted in the message, and its absence is itself a refusal. A status without
+/// either field is incomplete: a check that could not run must not read as one
+/// that passed.
+fn fixture_incompleteness(status: &serde_json::Value) -> Option<String> {
+    let (Some(reason), Some(gaps)) = (
+        status.get("degraded_reason"),
+        status.get("coverage_gaps").filter(|g| g.is_object()),
+    ) else {
+        return Some("status carries no degraded_reason or coverage_gaps".to_string());
+    };
+    match reason {
+        serde_json::Value::Null => None,
+        other => Some(format!("degraded_reason: {other}; coverage_gaps: {gaps}")),
     }
 }
 
@@ -178,10 +209,21 @@ fn confidence(row: &serde_json::Value) -> f64 {
     row["confidence"].as_f64().expect("confidence is a number")
 }
 
-/// Whether the evidence earned the confident tier, published or capped.
-fn in_confident_branch(row: &serde_json::Value) -> bool {
-    confidence(row) > f64::from(HIGHEST_DEGRADED_CONFIDENCE)
-        || reason(row).starts_with(CONFIDENT_TIER_UNPROVEN)
+/// Whether the evidence reached the confident branch, published or capped: the
+/// rule is `devmap_analyze::dead_tier::in_confident_branch`, shared with the
+/// corpus runner.
+fn row_in_confident_branch(row: &serde_json::Value) -> bool {
+    in_confident_branch(confidence(row), row["exemption_reason"].as_str())
+}
+
+#[test]
+fn the_eligibility_gate_does_not_reimplement_the_confident_branch() {
+    let source = include_str!("dead_tier_eligibility.rs");
+    let needle = ["starts_with(CONFIDENT", "_TIER_UNPROVEN)"].concat();
+    assert!(
+        !source.contains(&needle),
+        "the confident-branch rule lives in devmap_analyze::dead_tier"
+    );
 }
 
 #[derive(Debug, Default)]
@@ -346,7 +388,7 @@ fn the_confident_tier_is_listed_exactly_for_the_languages_their_fixtures_prove()
                 row["symbol_name"].as_str().unwrap_or("")
             );
             let language = language_of(row["file_path"].as_str().unwrap_or(""));
-            if in_confident_branch(row) {
+            if row_in_confident_branch(row) {
                 let score = scores.entry(language).or_default();
                 score.confident_rows += 1;
                 if truth.get(&id) != Some(&Verdict::TrulyDead) {
@@ -392,7 +434,7 @@ fn the_confident_tier_is_listed_exactly_for_the_languages_their_fixtures_prove()
                     None => violations.push(format!("{name}: truly dead {id} is not reported")),
                     // Found, but outside the confident branch: the language has
                     // not proven the tier, so a listed one fails below.
-                    Some(row) if !in_confident_branch(row) => scores
+                    Some(row) if !row_in_confident_branch(row) => scores
                         .entry(language_of(id.split("::").next().unwrap_or("")))
                         .or_default()
                         .missed_markers
@@ -702,4 +744,41 @@ fn a_confident_tier_missing_its_false_positive_count_fails() {
         &record_with(serde_json::json!({ "dead_fp_by_tier": { "0.9": { "rows": 4 } } })),
         "test record",
     );
+}
+
+/// A fixture the scan could not read in full gives its `truly_dead` markers the
+/// coverage-loss reason, which the shared predicate counts as the confident
+/// branch: the gate would read an incomplete scan as proof. It must refuse.
+#[test]
+#[should_panic(expected = "incomplete coverage")]
+fn an_incomplete_fixture_is_refused_not_scored() {
+    let tmp = std::env::temp_dir().join(format!("devmap-incomplete-go-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    copy_tree(&accuracy_root().join("go"), &tmp);
+    for i in 0..3 {
+        std::fs::write(
+            tmp.join(format!("app/svc/broken{i}.go")),
+            "package svc\nfunc ((( {{{ ;;; )))\ntype struct {\n",
+        )
+        .expect("write unparseable file");
+    }
+    build_fixture("incomplete-go", &tmp);
+}
+
+#[test]
+fn fixture_completeness_follows_the_status_verdict() {
+    let ledger =
+        serde_json::json!({ "not_parsed": { "total": 1, "paths": ["AndroidManifest.xml"] } });
+    // A listed non-loss (an Android manifest) beside a null verdict is complete.
+    let clean = serde_json::json!({ "degraded_reason": null, "coverage_gaps": ledger });
+    assert_eq!(fixture_incompleteness(&clean), None);
+    let broken = serde_json::json!({
+        "degraded_reason": "3 file(s) failed to parse",
+        "coverage_gaps": ledger
+    });
+    assert!(fixture_incompleteness(&broken).is_some_and(|why| why.contains("failed to parse")));
+    // A status that cannot say is not a status that came back clean.
+    assert!(fixture_incompleteness(&serde_json::json!({})).is_some());
+    assert!(fixture_incompleteness(&serde_json::json!({ "degraded_reason": null })).is_some());
+    assert!(fixture_incompleteness(&serde_json::json!({ "coverage_gaps": ledger })).is_some());
 }

@@ -1,6 +1,7 @@
 pub mod clones;
 pub mod clustering;
 pub mod dead_clusters;
+pub mod dead_tier;
 pub mod graph_intel;
 pub mod liveness;
 pub mod model;
