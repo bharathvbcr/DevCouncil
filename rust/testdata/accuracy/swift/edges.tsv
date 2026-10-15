@@ -101,3 +101,9 @@ sw.P8	P8	spm/Sources/Core/PrivateReach.swift::Holder	spm/Sources/Core/PrivateRea
 sw.P9	P9	spm/Sources/Core/PrivateReach.swift::Holder	spm/Sources/Core/PrivateReach.swift::Holder.privCompute	edge	must		lazy var initializer
 sw.X6a	X6	xcode/ios/Shared/Formatter.swift::sharedFormat	xcode/ios/AppTarget/Theme.swift::Theme.accent	edge	must		file compiled into the app target
 sw.X6b	X6	xcode/ios/Shared/Formatter.swift::sharedFormat	xcode/ios/WidgetTarget/Theme.swift::Theme.accent	edge	must		file compiled into the widget target
+sw.G2a	G2	micro/Sources/M/D.swift::useParam	micro/Sources/M/D.swift::fetchCount	forbid	must		parameter named like a unique in-repo function is called
+sw.G2b	G2	micro/Sources/M/D.swift::useClosure	micro/Sources/M/D.swift::fetchCount	forbid	must		local closure named like a unique in-repo function is called
+sw.L1a	L1	micro/Sources/M/D.swift::callMark	micro/Sources/M/D.swift::day	forbid_any_tier	must		argument label day: is not a reference
+sw.L1b	L1	micro/Sources/M/D.swift::callMark	micro/Sources/M/D.swift::mark	edge	must		guard: the labelled call itself resolves
+sw.L2a	L2	micro/Sources/M/D.swift::callF	micro/Sources/M/D.swift::minute	forbid	must		leading-dot .minute is the Unit case, not the free func
+sw.L2b	L2	micro/Sources/M/D.swift::callF	micro/Sources/M/D.swift::f	edge	must		guard: f(.minute) call resolves

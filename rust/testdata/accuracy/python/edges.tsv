@@ -67,3 +67,6 @@ py.C22b	C22b	lib/pkg/dyn.py::by_import	lib/pkg/util.py::helper	edge	should		edge
 py.C22b.not	C22b	lib/pkg/dyn.py::by_import	other/dup.py::helper	forbid	must		namesake must not bind
 py.C23b	C23b	tests/test_core.py::test_engine	lib/pkg/core.py::Engine.step	edge	should		edge if fixture return typed; honest miss acceptable
 py.C26	C26	tests/test_core.py	lib/pkg/util.py	import	must		Imports edge via pytest pythonpath
+py.SH1a	SH1	lib/pkg/typed_user.py::pick	other/typing_namesakes.py::Literal	forbid_any_tier	must		from typing import Literal binds past the in-repo namesake
+py.SH1b	SH1	lib/pkg/typed_user.py::Sized	other/typing_namesakes.py::Protocol	forbid_any_tier	must		class Sized(Protocol) with typing.Protocol imported
+py.SH2	SH2	lib/pkg/typed_user.py::local_shadow	other/typing_namesakes.py::shadowed_target	forbid	must		local variable shadows the in-repo function and is called
