@@ -2174,6 +2174,7 @@
     "GitPulse: rust: recall[non_self] card target 0.750 is unmeasured (no labels), so it cannot pass",
     "GitPulse: rust: recall[non_self] is unmeasured (no labels), so it cannot pass",
     "Lappi-decision: python: UniqueGlobal precision 0.042 is below 0.950",
+    "Lappi-decision: python: confident edge precision 0.858 does not meet the absolute floor 0.950",
     "LiquiTask: go: 0.9-tier dead false-positive rate is unmeasured (no labels), so it cannot pass",
     "LiquiTask: go: AmbiguousGlobal edges are unmeasured (no label-free measurement), so the =0 gate cannot pass",
     "LiquiTask: go: UniqueGlobal precision is unmeasured (no labelled UniqueGlobal edge), so it cannot pass",
@@ -2222,7 +2223,8 @@
     "scholarlm: go: recall card target 0.950 is unmeasured (no labels), so it cannot pass",
     "scholarlm: go: recall is unmeasured (no labels), so it cannot pass",
     "scholarlm: typescript: 0.9-tier dead false-positive rate is unmeasured (no labels), so it cannot pass",
-    "scholarlm: typescript: UniqueGlobal precision 0.794 is below 0.950"
+    "scholarlm: typescript: UniqueGlobal precision 0.794 is below 0.950",
+    "scholarlm: typescript: honest-miss rate 0.963 does not meet the absolute floor 0.980"
   ],
   "schema": 1,
   "superseded": [
