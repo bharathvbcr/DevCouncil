@@ -11,7 +11,9 @@
 //! * `evidence` is one category token (`rg_declaration_only`, ...), never the
 //!   prose the labeller wrote. A string with a `/`, a `\`, a `::` or a source
 //!   file extension is a path or a qualified symbol and fails by name; a
-//!   string with whitespace is prose and fails too.
+//!   token outside the vocabulary (prose included) fails too. The hash shape
+//!   and the vocabulary are `devmap_analyze::record_identity`, the same
+//!   definitions the corpus runner writes rows with.
 //!
 //! The check fails closed. A row that is not an object, or lacks a string
 //! `symbol` or `evidence`, is a failure and not a pass: a row this test could
@@ -20,6 +22,7 @@
 
 use std::path::Path;
 
+use devmap_analyze::record_identity::{is_evidence_category, is_identity_hash};
 use serde_json::Value;
 
 /// Extensions that make a bare token a file name.
@@ -36,13 +39,6 @@ fn record_path() -> std::path::PathBuf {
         .parent()
         .expect("devmap-cli sits under the workspace root")
         .join("testdata/accuracy/record.json")
-}
-
-/// `h:` and twelve lowercase hex digits.
-fn is_hash_token(s: &str) -> bool {
-    s.strip_prefix("h:").is_some_and(|hex| {
-        hex.len() == 12 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    })
 }
 
 /// A `.ext` suffix on any run of identifier characters.
@@ -94,13 +90,13 @@ fn check_field(
         out.push(format!(
             "{where_}: `{field}` {why} (a private identity in a committed record)"
         ));
-    } else if field == "symbol" && !is_hash_token(text) {
+    } else if field == "symbol" && !is_identity_hash(text) {
         out.push(format!(
             "{where_}: `symbol` is not an `h:<12 hex>` hash token"
         ));
-    } else if field == "evidence" && (text.is_empty() || text.contains(char::is_whitespace)) {
+    } else if field == "evidence" && !is_evidence_category(text) {
         out.push(format!(
-            "{where_}: `evidence` is empty or prose, not one category token"
+            "{where_}: `evidence` is not one of the README's category tokens"
         ));
     }
 }
@@ -233,6 +229,13 @@ fn a_path_in_evidence_fails_even_with_a_hashed_symbol() {
             "{evidence}: {found:?}"
         );
     }
+}
+
+#[test]
+fn a_token_outside_the_vocabulary_fails_though_it_looks_harmless() {
+    let mut row = clean_row();
+    row["evidence"] = "some_made_up_token".into();
+    assert_eq!(leaks(&record_with("Private", row)).len(), 1);
 }
 
 #[test]
