@@ -36,3 +36,7 @@ live	lib/pkg/core.py::Duck.quack	ducks_used
 # Second pass (2026-10-10): a method a library base class calls by name.
 live	lib/pkg/handlers.py::TextParser.handle_starttag	HTMLParser.feed calls it (handlers.py:14)
 truly_dead	lib/pkg/handlers.py::to_text	nothing calls it
+truly_dead	lib/pkg/typed_user.py::pick	SH1/SH2 fixture; nothing calls it
+truly_dead	lib/pkg/typed_user.py::Sized	SH1/SH2 fixture; nothing calls it
+truly_dead	lib/pkg/typed_user.py::Sized.size	SH1/SH2 fixture; nothing calls it
+truly_dead	lib/pkg/typed_user.py::local_shadow	SH1/SH2 fixture; nothing calls it

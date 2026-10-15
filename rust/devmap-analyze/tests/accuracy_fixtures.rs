@@ -58,6 +58,14 @@ const OWNER_CARDS: &[(&str, &str)] = &[
     ("ft-837a6f05", "S4 manifests"),
     ("ft-e3f7d1b1", "S5 dispatch"),
     ("ft-4cd88dbe", "S1 harness"),
+    (
+        "ft-0e6cc90f",
+        "UniqueGlobal binds past a closer binding (external import, local, inherited member)",
+    ),
+    (
+        "ft-6976e8de",
+        "Swift argument labels and leading-dot members emitted as references",
+    ),
 ];
 
 /// Edge confidence in thousandths at or above which a claim is "act on it".

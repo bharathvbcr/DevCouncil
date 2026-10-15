@@ -29,3 +29,4 @@ kg.K31	K31	src/main/kotlin/gaps/Events.kt::Child.go	src/main/kotlin/gaps/Events.
 kg.K31b	K31	src/main/kotlin/gaps/Events.kt::Child.go	src/main/kotlin/gaps/Events.kt::Child.go	forbid	must		super.go() is not a self-reference
 kg.K32	K32	src/main/kotlin/gaps/Events.kt::useFactory	src/main/kotlin/gaps/Events.kt::Factory.build	edge	must		companion object call
 kg.K33	K33	src/main/kotlin/gaps/Events.kt::mk	src/main/kotlin/gaps/Events.kt::Res.Ok	edge	must	Ok	nested class constructor Res.Ok(1)
+kg.G1	G1	src/main/kotlin/gaps/Svc.kt::PollService.label	src/main/kotlin/gaps/util/Strings.kt::getString	forbid	must		getString(1) is the member inherited from android.app.Service, not a repo top-level fun
