@@ -41,6 +41,8 @@ rs.c11a	C11	corelib/src/lib.rs::c11_caller	corelib/src/lib.rs::parse_c11	edge	mu
 rs.c11b	C11	corelib/src/lib.rs::c11_caller	corelib/src/lib.rs::Config.validate_c11	edge	must		
 rs.c12a	C12	corelib/src/macros.rs::c12_caller	corelib/src/macros.rs::helper_c12	edge	must		macro_rules!
 rs.c12b	C12	corelib/src/macros.rs::c12_caller	corelib/src/macros.rs::emit_c12	edge	should		emit_c12 is called only in the macro body
+rs.c12c	C12	corelib/src/macros.rs::c12_caller	corelib/src/macros.rs::twice_c12	edge	must		`twice_c12!(..)` invokes the macro_rules! macro (audit finding 9)
+rs.c12d	C12	corelib/src/macros.rs::c12_caller	corelib/src/macros.rs::log_c12	edge	must		`log_c12!(..)` invokes the macro_rules! macro (audit finding 9)
 rs.c13a	C13	corelib/src/macros.rs::c13_caller	corelib/src/macros.rs::fmt_c13	edge	must		println!/assert_eq!/vec!/format! args
 rs.c13b	C13	corelib/src/macros.rs::c13_caller	corelib/src/macros.rs::calc_c13	edge	must		
 rs.c13c	C13	corelib/src/macros.rs::c13_caller	corelib/src/macros.rs::Named.name_c13	edge	must		
