@@ -76,8 +76,14 @@ fn a_genuinely_uncalled_private_function_in_the_same_file_is_still_confident() {
     let reports = reports(&[("Codec.kt", AMBIGUOUS)]);
     let found = report_for(&reports, "neverCalled")
         .unwrap_or_else(|| panic!("`neverCalled` must be reported: {reports:?}"));
+    // Kotlin is off CONFIDENT_TIER_ELIGIBLE, so the confident branch publishes
+    // at 0.4 carrying `confident_tier_unproven`, never above and never exempt.
     assert!(
-        !found.is_exempt && found.confidence > 0.8,
+        !found.is_exempt
+            && found
+                .exemption_reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with(CONFIDENT_TIER_UNPROVEN)),
         "nothing names `neverCalled`, so the analysis must still say so: {found:?}"
     );
 }
