@@ -33,7 +33,15 @@ mod adversarial_corpus;
 mod allow_unwired_and_dynamic_imports;
 mod an_unreadable_subtree_is_a_hole_not_a_dead_build;
 #[cfg(feature = "parse")]
+mod budget_characterization;
+#[cfg(feature = "parse")]
 mod budget_is_a_real_bound;
+#[cfg(feature = "parse")]
+mod budget_attack;
+#[cfg(feature = "parse")]
+mod budget_retry;
+#[cfg(feature = "parse")]
+mod extract_all_bench;
 #[cfg(feature = "parse")]
 mod c_family;
 mod cache_tag_security;
