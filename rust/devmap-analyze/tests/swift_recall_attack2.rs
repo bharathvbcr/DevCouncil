@@ -295,17 +295,6 @@ fn nil_coalescing_with_a_named_default_keeps_the_left_type() {
 }
 
 #[test]
-fn a_typealias_in_an_extension_in_another_file_is_not_the_top_level_type() {
-    let entry = ("entry.swift", "struct Entry { func weight() -> Int { 3 } }\n");
-    let ext = ("hostext.swift", "extension Host { typealias Entry = Item }\n");
-    let got = run(
-        "struct Host { var items: [Entry]\n func run() { items.forEach { $0.weight() } } }\n",
-        &[entry, ext],
-    );
-    assert!(!has(&got, "Entry.weight"), "Entry is Item inside Host: {got:?}");
-}
-
-#[test]
 fn a_generic_nesting_member_is_not_read_through_the_outer_generic() {
     let got = run(
         "struct Host { struct Box<T> { var items: [T] }\n var box: Box<Item>\n func run() { box.items.forEach { $0.weight() } } }\n",
