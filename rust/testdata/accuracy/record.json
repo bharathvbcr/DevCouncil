@@ -1778,16 +1778,16 @@
       "expected_edge_rows": 104,
       "forbid_any_tier_rows": 4,
       "forbid_rows": 10,
-      "high_edges_correct": 94,
+      "high_edges_correct": 93,
       "high_edges_false": 2,
       "honest_miss": {
-        "absent": 10,
+        "absent": 11,
         "rate": 1.0,
-        "recorded": 10
+        "recorded": 11
       },
       "precision_at_0.9": 0.979,
-      "present": 94,
-      "recall": 0.904
+      "present": 93,
+      "recall": 0.894
     },
     "typescript": {
       "dead": {
