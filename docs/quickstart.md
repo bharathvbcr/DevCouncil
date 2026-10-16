@@ -168,13 +168,18 @@ devcouncil doctor        # which store next_task reads, and how many ready items
 ```
 
 Checking a task out (`devcouncil_checkout_task`) sets it `in_progress`; a verify
-that passes sets it `review`. Closing it is a person's decision:
+that passes sets it `review`.
 
 ```bash
-devcouncil task status TASK-001 --to done
 devcouncil verify TASK-001 --mode enforce --json
 # Supply an actual coverage profile to measure changed-line coverage:
 devcouncil verify TASK-001 --mode enforce --coverage /path/to/coverage-profile --json
+```
+
+Closing the task is a person's decision, made once the work is accepted:
+
+```bash
+devcouncil task status TASK-001 --to done
 ```
 
 Verification is opt-in; the default mode is `off`. Check `status`,

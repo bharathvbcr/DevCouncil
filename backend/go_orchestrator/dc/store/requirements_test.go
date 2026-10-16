@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,9 +17,10 @@ import (
 // requirement and acceptance-criterion links, the way DevCouncil's planner
 // writes them.
 //
-// The row is planted through the sqlite3 CLI rather than through this client
-// because planning is DevCouncil's job: what is under test is whether the two
-// planes agree about a row that already exists, not how it came to exist.
+// The task is planted as the workbench item it is, through the store's own
+// `work` command rather than through this client, because planning is not this
+// client's job: what is under test is whether the two planes agree about an item
+// that already exists, not how it came to exist.
 func plantTaskWithLinks(t *testing.T, reqs, acs string) (*Client, string) {
 	t.Helper()
 	bin := testsupport.DCStore(t)
@@ -79,7 +81,12 @@ func plantRequirements(t *testing.T, db, reqIDs string, rows ...string) {
 	if err != nil {
 		testsupport.Unavailable(t, "sqlite3 is not on PATH, so no requirement row can be planted")
 	}
-	stmt := "UPDATE work_items SET body = json_set(body, '$.scope.requirement_ids', json('" + reqIDs + "')) WHERE id = 'TASK-1';"
+	var ids []string
+	if err := json.Unmarshal([]byte(reqIDs), &ids); err != nil {
+		t.Fatalf("requirement ids %s: %v", reqIDs, err)
+	}
+	testsupport.MergeTaskScope(t, db, "TASK-1", map[string]any{"requirement_ids": ids})
+	stmt := ""
 	for _, row := range rows {
 		stmt += "INSERT INTO requirements (id, title, description, priority, source, " +
 			"acceptance_criteria_json) VALUES " + row + ";"

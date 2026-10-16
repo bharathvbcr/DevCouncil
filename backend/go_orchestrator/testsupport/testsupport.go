@@ -214,6 +214,55 @@ func SeedTask(t testing.TB, db string, seed TaskSeed) {
 	}
 }
 
+// MergeTaskScope sets the named keys of an existing task's scope, keeping the
+// rest, through the same revisioned `items.put` an edit takes. It exists
+// because a task's body cannot be edited with the sqlite3 CLI: the item search
+// index is an FTS5 table that the system CLI may not be built with, and a
+// direct write would skip the scope validation anyway.
+func MergeTaskScope(t testing.TB, db, id string, patch map[string]any) {
+	t.Helper()
+	bin := DCStore(t)
+	run := func(method string, input []byte) []byte {
+		out, err := exec.Command(bin, "--db", db, "work", "--method", method, "--input", string(input)).CombinedOutput()
+		if err != nil {
+			t.Fatalf("dcstore work %s: %v\n%s", method, err, out)
+		}
+		return out
+	}
+	request, _ := json.Marshal(map[string]string{"id": id})
+	var got struct {
+		Item struct {
+			Title    string         `json:"title"`
+			Status   string         `json:"status"`
+			Revision int64          `json:"revision"`
+			Scope    map[string]any `json:"scope"`
+			Repos    []string       `json:"repository_ids"`
+			Primary  string         `json:"primary_repository_id"`
+		} `json:"item"`
+	}
+	if err := json.Unmarshal(run("items.get", request), &got); err != nil || got.Item.Revision == 0 {
+		t.Fatalf("reading task %s: %v", id, err)
+	}
+	scope := got.Item.Scope
+	if scope == nil {
+		scope = map[string]any{}
+	}
+	for key, value := range patch {
+		scope[key] = value
+	}
+	put, err := json.Marshal(map[string]any{
+		"request_id": fmt.Sprintf("scope-%s-%d", id, got.Item.Revision), "id": id,
+		"expected_revision": got.Item.Revision, "title": got.Item.Title, "status": got.Item.Status,
+		"repository_ids": got.Item.Repos, "primary_repository_id": got.Item.Primary, "scope": scope,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out := run("items.put", put); !strings.Contains(string(out), `"ok":true`) {
+		t.Fatalf("changing the scope of %s was refused: %s", id, out)
+	}
+}
+
 // DCVerify builds the Rust verifier binary and returns its path.
 func DCVerify(t testing.TB) string { return cargoBin(t, "dc-verify", "dcverify") }
 

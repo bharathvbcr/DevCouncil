@@ -29,6 +29,7 @@ func client(t *testing.T) *Client {
 
 func TestAcquireReleaseRoundTrip(t *testing.T) {
 	c := client(t)
+	seedTask(t, c, "TASK-001")
 	ctx := context.Background()
 
 	lease, err := c.Acquire(ctx, AcquireRequest{TaskID: "TASK-001", Owner: "builder-1", TTL: 15 * time.Minute})
@@ -60,6 +61,7 @@ func TestAcquireReleaseRoundTrip(t *testing.T) {
 // is the reason the store exists.
 func TestTwoBuildersRacingOneTaskProduceExactlyOneHolder(t *testing.T) {
 	c := client(t)
+	seedTask(t, c, "TASK-001")
 	ctx := context.Background()
 
 	first, err := c.Acquire(ctx, AcquireRequest{TaskID: "TASK-001", Owner: "builder-1", TTL: time.Minute})
@@ -91,6 +93,7 @@ func TestTwoBuildersRacingOneTaskProduceExactlyOneHolder(t *testing.T) {
 
 func TestDiagnoseDistinguishesTheFailureModes(t *testing.T) {
 	c := client(t)
+	seedTask(t, c, "TASK-001")
 	ctx := context.Background()
 
 	lease, err := c.Acquire(ctx, AcquireRequest{TaskID: "TASK-001", Owner: "builder-1", TTL: time.Minute})
@@ -119,6 +122,7 @@ func TestDiagnoseDistinguishesTheFailureModes(t *testing.T) {
 
 func TestRenewExtendsAndReportsExpiry(t *testing.T) {
 	c := client(t)
+	seedTask(t, c, "TASK-001")
 	ctx := context.Background()
 
 	lease, err := c.Acquire(ctx, AcquireRequest{TaskID: "TASK-001", Owner: "b1", TTL: time.Minute})
@@ -190,6 +194,7 @@ func TestMisconfigurationIsNamed(t *testing.T) {
 // the codes Go branches on are the strings Rust emits.
 func TestGoAndRustAgreeOnTheLeaseVocabulary(t *testing.T) {
 	c := client(t)
+	seedTask(t, c, "T1")
 	ctx := context.Background()
 
 	lease, err := c.Acquire(ctx, AcquireRequest{TaskID: "T1", Owner: "o", TTL: time.Minute})
@@ -213,6 +218,9 @@ func TestGoAndRustAgreeOnTheLeaseVocabulary(t *testing.T) {
 // binary across shared and distinct tasks simultaneously.
 func TestConcurrentStressUnderHighLoad(t *testing.T) {
 	c := client(t)
+	for i := 0; i < 4; i++ {
+		seedTask(t, c, fmt.Sprintf("TASK-CONC-%d", i))
+	}
 	ctx := context.Background()
 
 	const workers = 16
@@ -266,7 +274,7 @@ func TestConcurrentStressUnderHighLoad(t *testing.T) {
 // TestAvailableNeverManufacturesTheStoreItChecks.
 //
 // health used to open the path with SQLite's default flags, so a mistyped --db
-// was answered by a database this very call created: ok, schema 9, zero active
+// was answered by a database this very call created: ok, schema 10, zero active
 // leases, from a private file nobody else was using. Two harnesses configured
 // with two spellings of one path therefore shared no exclusion at all while
 // both reported healthy — which is the precise thing Available's contract says
@@ -307,7 +315,7 @@ func TestAvailableNeverManufacturesTheStoreItChecks(t *testing.T) {
 func TestAvailableRequiresTheExclusionIndexAssertion(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "old-store.sh")
-	body := "#!/bin/sh\necho '{\"ok\":true,\"store\":\"dc-store\",\"schema_version\":9,\"active_leases\":0}'\n"
+	body := "#!/bin/sh\necho '{\"ok\":true,\"store\":\"dc-store\",\"schema_version\":10,\"active_leases\":0}'\n"
 	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
 		t.Fatal(err)
 	}

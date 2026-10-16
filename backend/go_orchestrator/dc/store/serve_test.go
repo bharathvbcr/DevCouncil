@@ -121,7 +121,7 @@ func TestAServedConflictIsStillAnOutcome(t *testing.T) {
 func TestABinaryWithoutServeIsAnsweredOneShot(t *testing.T) {
 	// No framing: the whole answer is the JSON object an older store prints,
 	// whatever it was asked.
-	c := fakeClient(t, `{"ok":true,"store":"dc-store","schema_version":9,"exclusion_index":"verified","active_leases":0}`)
+	c := fakeClient(t, `{"ok":true,"store":"dc-store","schema_version":10,"exclusion_index":"verified","active_leases":0}`)
 
 	if err := c.Available(context.Background()); err != nil {
 		t.Fatalf("a store that does not speak serve was reported unavailable: %v", err)
@@ -145,6 +145,7 @@ func TestABinaryWithoutServeIsAnsweredOneShot(t *testing.T) {
 // run back to back on a loaded one moved between 19x and 104x.
 func TestTheServedChildIsReusedAcrossCalls(t *testing.T) {
 	c := client(t)
+	seedTask(t, c, "TASK-1")
 	t.Cleanup(c.Close)
 	ctx := context.Background()
 
@@ -190,6 +191,7 @@ func idleChild(t *testing.T, c *Client) *servedChild {
 // the real binary with such a value and reads it back.
 func TestAValueContainingNewlinesSurvivesTheWire(t *testing.T) {
 	c := client(t)
+	seedTask(t, c, "TASK-1")
 	t.Cleanup(c.Close)
 	ctx := context.Background()
 
@@ -281,6 +283,7 @@ func TestAnOverSizedServedReplyIsRefused(t *testing.T) {
 // bound on that child only begins counting once Start has returned.
 func TestACancelledCallReleasesItsSlot(t *testing.T) {
 	c := client(t)
+	seedTask(t, c, "TASK-1")
 	t.Cleanup(c.Close)
 
 	lease, err := c.Acquire(context.Background(), AcquireRequest{

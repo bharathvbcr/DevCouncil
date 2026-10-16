@@ -87,6 +87,7 @@ func TestWorkbenchConflictsStayTypedAndDoNotBreakTheSession(t *testing.T) {
 
 func TestWorkbenchCannotAffectAnotherProfilesExecutionLease(t *testing.T) {
 	leaseClient := client(t)
+	seedTask(t, leaseClient, "t1")
 	t.Cleanup(leaseClient.Close)
 	lease, err := leaseClient.Acquire(t.Context(), AcquireRequest{TaskID: "t1", Owner: "builder", TTL: time.Minute})
 	if err != nil {
