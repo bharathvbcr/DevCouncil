@@ -41,6 +41,8 @@ mod budget_attack;
 #[cfg(feature = "parse")]
 mod budget_retry;
 #[cfg(feature = "parse")]
+mod edge_inputs_under_cpu_contention;
+#[cfg(feature = "parse")]
 mod extract_all_bench;
 #[cfg(feature = "parse")]
 mod c_family;

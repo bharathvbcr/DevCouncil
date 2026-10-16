@@ -425,6 +425,10 @@ pub(crate) fn run(
         && !previous.is_empty()
         && previous.len() == scanned.sources.len()
         && store.latest_generation_payload_is_current()?
+        // Equal hashes do not make a budget-refused file current: its stored
+        // payload is the machine's load at that build, not the file. Falling
+        // through re-extracts it; `affected_closure` marks it affected.
+        && store.latest_budget_refusals()?.is_none_or(|refused| refused.total == 0)
     {
         // The refusals as well as the hashes, which is the proof `status`
         // and the drain already ask for. Hashes cover only the files that
@@ -1214,6 +1218,15 @@ fn affected_closure(
             }
             // A path present now but not before is an addition.
             None => return Ok(None),
+        }
+    }
+    // A file the previous generation refused for the parse budget has an
+    // unchanged hash and a payload describing nothing. Left out of `changed`,
+    // the writer would carry that refused row forward and discard the
+    // extraction this build just made of it, so the refusal could never heal.
+    for path in store.latest_budget_refused_paths()? {
+        if previous_hashes.contains_key(&path) {
+            changed.insert(path);
         }
     }
     if changed.is_empty() {
