@@ -2,7 +2,12 @@ package probe
 
 import "example.com/helper"
 
+type Reader interface {
+	Read() string
+}
+
 type Widget struct {
+	Reader
 	Name string
 }
 

@@ -667,7 +667,13 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// handle (`PathLoadKind::ModuleName`), which a v88 row lacks, so `mod.f()`
 /// through it would stay unresolved. The resolver-accuracy lane stamped 88
 /// on this payload; it landed after the dead-policy lane, so it is 89.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "89";
+///
+/// v90 records a TypeScript `method_signature` inside an `interface_declaration`
+/// as a `Method` symbol, and a Go struct or interface embedding (a field or
+/// type element with no name) as a `Heritage` reference. A v89 row has neither,
+/// so a call through an interface stays unbound and a Go embedding stays
+/// invisible until the file is edited.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "90";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

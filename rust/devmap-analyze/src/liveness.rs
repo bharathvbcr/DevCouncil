@@ -1406,10 +1406,9 @@ fn unconfirmed_dispatch_reason(
     if matches!(language, "typescript" | "tsx" | "javascript")
         && sym.parent_symbol.as_deref().is_none_or(|parent| {
             parent == ext.file_path
-                || ext
-                    .symbols
-                    .iter()
-                    .any(|owner| owner.qualified_name == parent && owner.kind == SymbolKind::Variable)
+                || ext.symbols.iter().any(|owner| {
+                    owner.qualified_name == parent && owner.kind == SymbolKind::Variable
+                })
         })
     {
         return Some(format!(
@@ -2902,6 +2901,10 @@ fn symbol_exemption_index(
     ambiguous: &HashSet<(String, String)>,
 ) -> HashMap<(String, String), String> {
     let supertypes = supertypes_by_type(resolution);
+    // Dispatch candidates are not proven reached. The direct edge to the
+    // interface method is a call, so the heritage exemption would spare every
+    // conformer and the `reached_by_dispatch` verdict would never run.
+    let dispatch_only = dispatch_only_symbols(resolution);
     let go_interface_specs = go_interface_specs_by_package(extractions);
     let c_header_exports = c_header_exported_names(extractions);
     let go_build_variants = go_build_variant_identities(extractions);
@@ -3013,8 +3016,14 @@ fn symbol_exemption_index(
                 .contains(&(ext.file_path.clone(), sym.name.clone()))
                 || ambiguous.contains(&(ext.file_path.clone(), sym.qualified_name.clone()));
 
-            let heritage =
-                reached_through_a_supertype(&ext.file_path, &identity, &supertypes, called);
+            let reached_only_by_dispatch = dispatch_only
+                .contains(&(ext.file_path.clone(), sym.qualified_name.clone()))
+                || dispatch_only.contains(&(ext.file_path.clone(), sym.name.clone()));
+            let heritage = (!reached_only_by_dispatch)
+                .then(|| {
+                    reached_through_a_supertype(&ext.file_path, &identity, &supertypes, called)
+                })
+                .flatten();
 
             let reason: Option<String> = wired
                 .get(sym.qualified_name.as_str())
