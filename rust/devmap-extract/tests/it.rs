@@ -26,6 +26,8 @@ mod a_declared_field_has_a_type;
 mod a_minified_bundle_is_not_parsed;
 #[cfg(feature = "parse")]
 mod a_receiver_is_not_its_operator;
+#[cfg(feature = "parse")]
+mod swift_recall_r5_attack;
 mod a_subprocess_is_bounded_in_time_and_bytes;
 #[cfg(feature = "parse")]
 mod adversarial_corpus;
