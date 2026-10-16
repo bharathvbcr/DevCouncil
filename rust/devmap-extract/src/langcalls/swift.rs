@@ -338,7 +338,22 @@ const WHOLE_RECEIVER_BYTES: usize = 96;
 ///   argument list. Only a bare-name callee with a parenthesised argument list
 ///   is collapsed; a trailing-closure call or a chain keeps the old clamp.
 fn swift_receiver(target: Node, source: &str) -> Option<String> {
-    let target = swift_unwrap_prefix(target).unwrap_or(target);
+    let mut target = swift_unwrap_prefix(target).unwrap_or(target);
+    // `try Svc(…).run()` and `await Svc(…).run()`: the effect keyword wraps the
+    // construction in the target; the receiver is what it wraps.
+    for _ in 0..4 {
+        if !matches!(target.kind(), "try_expression" | "await_expression") {
+            break;
+        }
+        let mut cursor = target.walk();
+        let inner = target
+            .named_children(&mut cursor)
+            .find(|child| !matches!(child.kind(), "try_operator" | "await_operator" | "comment"));
+        match inner {
+            Some(inner) => target = inner,
+            None => break,
+        }
+    }
     if target.kind() != "call_expression" {
         return receiver_from(target, source);
     }
@@ -538,6 +553,20 @@ mod tests {
         assert_eq!(one(many, "scan").as_deref(), Some("Svc(…)"));
         let long = format!("func f() {{ Svc(root: \"{}\").scan() }}", "x".repeat(200));
         assert_eq!(one(&long, "scan").as_deref(), Some("Svc(…)"));
+    }
+
+    #[test]
+    fn an_effect_keyword_is_not_part_of_a_constructed_receiver() {
+        for keyword in ["try", "await", "try await"] {
+            let source = format!(
+                "func f() async throws {{\n    {keyword} Svc(\n        a: 1\n    ).run()\n}}"
+            );
+            assert_eq!(one(&source, "run").as_deref(), Some("Svc(…)"), "{keyword}");
+        }
+        assert_eq!(
+            one("func f() throws { try Svc(a: 1).run() }", "run").as_deref(),
+            Some("Svc(a: 1)")
+        );
     }
 
     #[test]

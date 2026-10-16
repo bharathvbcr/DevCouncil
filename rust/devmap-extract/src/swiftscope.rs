@@ -63,21 +63,27 @@ pub(crate) fn reset() {
 /// declarations, so a name declared twice with different answers types nothing.
 #[derive(Debug, Default)]
 struct FileIndex {
-    /// Function name → its written return type, when every declaration of that
-    /// name in the file (free function or method) agrees on one.
+    /// Function name → its written return type. Only a function that takes no
+    /// parameters has one: a call with no arguments can then only mean that
+    /// signature, which Swift allows once per scope. Any same-named declaration
+    /// with parameters, or one that disagrees, makes the name unknowable.
     returns: HashMap<String, Option<String>>,
-    /// (type name, property name) → its written type; `None` when the type
-    /// states none or the property is declared more than once.
+    /// (qualified type, property name) → its written type; `None` when the
+    /// type states none or the property is declared more than once.
     members: HashMap<(String, String), Option<String>>,
-    /// (type name, property name) → the type its initializer constructs, for a
-    /// property with no written type: `var history = Hist()`.
+    /// (qualified type, property name) → the type its initializer constructs,
+    /// for a property with no written type: `var history = Hist()`.
     constructed: HashMap<(String, String), Option<String>>,
-    /// (type name, method name) → its written return type, when every method of
-    /// that name declared on the type agrees.
+    /// (qualified type, method name) → its written return type, under the same
+    /// rule as `returns`.
     methods: HashMap<(String, String), Option<String>>,
-    /// Type name → how many non-extension declarations carry it. Two nested
-    /// `Rng`s make `Rng`'s members unknowable from a name alone.
-    nominal: HashMap<String, usize>,
+    /// Short type name → the qualified name of every non-extension declaration
+    /// that carries it. More than one makes the short name unreadable, and one
+    /// nested declaration is readable only from inside the type that holds it.
+    declared: HashMap<String, Vec<String>>,
+    /// Names this file declares with `typealias`, anywhere. A written type
+    /// that names one is not the nominal type of that name.
+    aliases: HashSet<String>,
 }
 
 /// The root of the tree `node` sits in, `None` when the climb was cut short.
@@ -101,6 +107,11 @@ fn file_index(from: Node, source: &str) -> Option<Rc<FileIndex>> {
         match node.kind() {
             "function_declaration" => index_function(node, source, &mut built),
             "class_declaration" => index_type(node, source, &mut built),
+            "typealias_declaration" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    built.aliases.insert(get_node_text(name, source));
+                }
+            }
             _ => {}
         }
         let mut cursor = node.walk();
@@ -141,6 +152,14 @@ fn index_function(node: Node, source: &str, built: &mut FileIndex) {
     {
         returned = None;
     }
+    // A function with parameters never states what a bare `name()` returns.
+    let mut cursor = node.walk();
+    let takes_parameters = node
+        .named_children(&mut cursor)
+        .any(|child| child.kind() == "parameter");
+    if takes_parameters {
+        returned = None;
+    }
     let name = get_node_text(name, source);
     // A method is also keyed by the type it is declared on. Only a function
     // that is a direct member of a type body counts; a nested function is not.
@@ -150,11 +169,11 @@ fn index_function(node: Node, source: &str, built: &mut FileIndex) {
                 .and_then(bounded_parent)
                 .is_some_and(|grand| grand.id() == owner.id())
         })
-        .and_then(|owner| declared_type_name(owner, source));
-    if let Some((type_name, _)) = direct_owner {
+        .and_then(|owner| type_path(owner, source));
+    if let Some((qualified, _)) = direct_owner {
         merge_declared(
             &mut built.methods,
-            (type_name, name.clone()),
+            (qualified, name.clone()),
             returned.clone(),
         );
     }
@@ -204,7 +223,7 @@ fn generic_names(node: Node, source: &str) -> HashSet<String> {
 
 /// Whether a normalized type (`T`, `[T]`) is one of `generics`.
 fn names_generic(ty: &str, generics: &HashSet<String>) -> bool {
-    let bare = ty.trim_start_matches('[').trim_end_matches(']');
+    let bare = ty.trim_start_matches('[').trim_end_matches([']', '?']);
     generics.contains(bare)
 }
 
@@ -230,22 +249,52 @@ fn constructed_property_type(node: Node, source: &str) -> Option<String> {
         .then_some(name)
 }
 
-/// The name a `class_declaration` declares or extends, and whether it extends.
-fn declared_type_name(node: Node, source: &str) -> Option<(String, bool)> {
+/// The qualified name a `class_declaration` declares or extends — `Outer.Inner`
+/// for a nested type, the dotted path as written for `extension A.B` — and
+/// whether it is an extension. A bare short name says nothing about which of
+/// two nested namesakes is meant; the qualified one does.
+fn type_path(node: Node, source: &str) -> Option<(String, bool)> {
     let name = node.child_by_field_name("name")?;
-    match name.kind() {
-        "type_identifier" => Some((get_node_text(name, source), false)),
-        "user_type" => user_type_name(name, source).map(|n| (n, true)),
-        _ => None,
+    if name.kind() == "user_type" {
+        let mut cursor = name.walk();
+        let segments: Vec<String> = name
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() == "type_identifier")
+            .map(|child| get_node_text(child, source))
+            .collect();
+        return (!segments.is_empty()).then(|| (segments.join("."), true));
     }
+    if name.kind() != "type_identifier" {
+        return None;
+    }
+    let mut path = get_node_text(name, source);
+    let mut ancestor = bounded_parent(node);
+    while let Some(outer) = ancestor {
+        if outer.kind() == "class_declaration" {
+            let (outer_path, _) = type_path(outer, source)?;
+            path = format!("{outer_path}.{path}");
+            break;
+        }
+        ancestor = bounded_parent(outer);
+    }
+    Some((path, false))
+}
+
+/// The last segment of a qualified name.
+fn short_name(qualified: &str) -> &str {
+    qualified.rsplit('.').next().unwrap_or(qualified)
 }
 
 fn index_type(node: Node, source: &str, built: &mut FileIndex) {
-    let Some((type_name, extension)) = declared_type_name(node, source) else {
+    let Some((type_name, extension)) = type_path(node, source) else {
         return;
     };
     if !extension {
-        *built.nominal.entry(type_name.clone()).or_default() += 1;
+        built
+            .declared
+            .entry(short_name(&type_name).to_string())
+            .or_default()
+            .push(type_name.clone());
     }
     let Some(body) = node.child_by_field_name("body") else {
         return;
@@ -536,7 +585,15 @@ fn lambda_parameters(
     // The function type the closure is written against types its parameters
     // when no collection does; the two are exclusive, because a closure handed
     // to `xs.map` is an argument, not an element of an annotated literal.
-    let annotated = annotated_closure_parameters(scope, source, bounds).unwrap_or_default();
+    let mut annotated = annotated_closure_parameters(scope, source, bounds).unwrap_or_default();
+    for ty in annotated.iter_mut() {
+        if ty
+            .as_deref()
+            .is_some_and(|ty| names_alias(scope, source, ty))
+        {
+            *ty = None;
+        }
+    }
     let annotated_at = |index: usize| annotated.get(index).cloned().flatten();
     match explicit.as_slice() {
         [] => {
@@ -717,6 +774,8 @@ fn conditions(node: Node, source: &str, out: &mut Bindings) {
             Some(_) => None,
             None => lookup_outer(node, source, &name, out),
         };
+        // The binding unwraps the optional it is made from.
+        let ty = ty.map(|ty| ty.strip_suffix('?').map_or(ty.clone(), str::to_string));
         // `if let u = history.pop()`: the call shape a `let` is typed by. A name
         // this scope already bound is a second binding of it, and which one a use
         // means is not known, so it keeps no shape.
@@ -797,9 +856,54 @@ fn lookup_scoped(
 
 /// The type of `name` as a stored property of the type `from` sits in.
 fn member_type(from: Node, source: &str, name: &str) -> Option<String> {
-    let owner = enclosing_type(from)?;
-    let (type_name, _) = declared_type_name(owner, source)?;
-    member_of_type(owner, source, &type_name, name)
+    let index = file_index(from, source)?;
+    let owner = lexical_owner(&index, from, source)?;
+    index
+        .members
+        .get(&(owner, name.to_string()))
+        .cloned()
+        .flatten()
+}
+
+/// The qualified name of the type `from` sits in, `None` when the file declares
+/// that name more than once (a type is then not told apart by its name).
+fn lexical_owner(index: &FileIndex, from: Node, source: &str) -> Option<String> {
+    let (qualified, extension) = type_path(enclosing_type(from)?, source)?;
+    let copies = index.declared.get(short_name(&qualified)).map_or(0, |all| {
+        all.iter().filter(|each| **each == qualified).count()
+    });
+    (extension || copies <= 1).then_some(qualified)
+}
+
+/// The declaration a written short type name means where `from` sits. The file
+/// must declare exactly one type of that name, and a nested one is the name's
+/// meaning only inside the type that holds it: anywhere else the same spelling
+/// may be a top-level type in a file this index cannot see.
+fn resolve_type(index: &FileIndex, from: Node, source: &str, short: &str) -> Option<String> {
+    let [qualified] = index.declared.get(short)?.as_slice() else {
+        return None;
+    };
+    let Some((holder, _)) = qualified.rsplit_once('.') else {
+        return Some(qualified.clone());
+    };
+    let mut cursor = Some(from);
+    while let Some(node) = cursor {
+        if node.kind() == "class_declaration" {
+            if let Some((path, _)) = type_path(node, source) {
+                if path == holder || path.starts_with(&format!("{holder}.")) {
+                    return Some(qualified.clone());
+                }
+            }
+        }
+        cursor = bounded_parent(node);
+    }
+    None
+}
+
+/// Whether a written type names something this file declares with `typealias`.
+fn names_alias(from: Node, source: &str, ty: &str) -> bool {
+    let bare = ty.trim_matches(['[', ']', '?']);
+    file_index(from, source).is_some_and(|index| index.aliases.contains(bare))
 }
 
 fn enclosing_type(from: Node) -> Option<Node> {
@@ -818,12 +922,10 @@ fn enclosing_type(from: Node) -> Option<Node> {
 /// (two extensions), because the name alone cannot say which one is meant.
 fn member_of_type(from: Node, source: &str, type_name: &str, member: &str) -> Option<String> {
     let index = file_index(from, source)?;
-    if index.nominal.get(type_name).copied().unwrap_or(0) > 1 {
-        return None;
-    }
+    let qualified = resolve_type(&index, from, source, type_name)?;
     index
         .members
-        .get(&(type_name.to_string(), member.to_string()))
+        .get(&(qualified, member.to_string()))
         .cloned()
         .flatten()
 }
@@ -839,12 +941,10 @@ fn constructed_member_type(
     member: &str,
 ) -> Option<String> {
     let index = file_index(from, source)?;
-    if index.nominal.get(type_name).copied().unwrap_or(0) > 1 {
-        return None;
-    }
+    let qualified = resolve_type(&index, from, source, type_name)?;
     index
         .constructed
-        .get(&(type_name.to_string(), member.to_string()))
+        .get(&(qualified, member.to_string()))
         .cloned()
         .flatten()
 }
@@ -852,12 +952,10 @@ fn constructed_member_type(
 /// The type a method of `type_name` is written to return, read from this file.
 fn method_return_type(from: Node, source: &str, type_name: &str, method: &str) -> Option<String> {
     let index = file_index(from, source)?;
-    if index.nominal.get(type_name).copied().unwrap_or(0) > 1 {
-        return None;
-    }
+    let qualified = resolve_type(&index, from, source, type_name)?;
     index
         .methods
-        .get(&(type_name.to_string(), method.to_string()))
+        .get(&(qualified, method.to_string()))
         .cloned()
         .flatten()
 }
@@ -877,6 +975,35 @@ fn expression_type(
     current: &Bindings,
     depth: usize,
 ) -> Option<String> {
+    let ty = expression_type_unaliased(node, source, from, current, depth)?;
+    // A nested `typealias Entry = Item` makes `Entry` another spelling of
+    // `Item`, not the top-level `Entry` a name lookup would find.
+    (!names_alias(from, source, &ty)).then_some(ty)
+}
+
+/// Whether a call passes no arguments and no trailing closure.
+fn call_passes_nothing(call: Node) -> bool {
+    let mut cursor = call.walk();
+    let Some(suffix) = call
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "call_suffix")
+    else {
+        return false;
+    };
+    let mut inner = suffix.walk();
+    let mut parts = suffix.named_children(&mut inner);
+    let first = parts.next();
+    first.is_some_and(|args| args.kind() == "value_arguments" && args.named_child_count() == 0)
+        && parts.next().is_none()
+}
+
+fn expression_type_unaliased(
+    node: Node,
+    source: &str,
+    from: Node,
+    current: &Bindings,
+    depth: usize,
+) -> Option<String> {
     if depth > EXPRESSION_DEPTH {
         return None;
     }
@@ -887,15 +1014,19 @@ fn expression_type(
             match lookup_scoped(from, source, &name, current) {
                 Some(ty) => ty,
                 None => member_type(from, source, &name).or_else(|| {
-                    let owner = enclosing_type(from)?;
-                    let (type_name, _) = declared_type_name(owner, source)?;
-                    constructed_member_type(owner, source, &type_name, &name)
+                    let index = file_index(from, source)?;
+                    let owner = lexical_owner(&index, from, source)?;
+                    index
+                        .constructed
+                        .get(&(owner, name.clone()))
+                        .cloned()
+                        .flatten()
                 }),
             }
         }
         "self_expression" => enclosing_type(node)
-            .and_then(|owner| declared_type_name(owner, source))
-            .map(|(name, _)| name),
+            .and_then(|owner| type_path(owner, source))
+            .map(|(qualified, _)| short_name(&qualified).to_string()),
         "navigation_expression" => {
             let member = get_node_text(
                 node.child_by_field_name("suffix")?
@@ -912,19 +1043,45 @@ fn expression_type(
             let only = values.next()?;
             values.next().is_none().then(|| recurse(only)).flatten()
         }
-        "try_expression" => recurse(node.child_by_field_name("expr")?),
+        "try_expression" => {
+            let inner = recurse(node.child_by_field_name("expr")?)?;
+            // `try? f()` is an Optional: `.map` on it hands the closure the whole
+            // collection, so the collection is marked optional.
+            let optional = {
+                let mut cursor = node.walk();
+                let found = node.named_children(&mut cursor).any(|child| {
+                    child.kind() == "try_operator" && get_node_text(child, source) == "try?"
+                });
+                found
+            };
+            Some(
+                if optional && inner.starts_with('[') && !inner.ends_with('?') {
+                    format!("{inner}?")
+                } else {
+                    inner
+                },
+            )
+        }
         "nil_coalescing_expression" => {
-            // `xs ?? []` is `xs`'s type. Any other default may be a different
-            // type, and a collection typed wrongly binds a wrong edge.
+            // `xs ?? []` is `xs`'s type, no longer optional. Any other default may
+            // be a different type, and a collection typed wrongly binds a wrong edge.
             let default = node.child_by_field_name("if_nil")?;
             let empty = default.kind() == "array_literal" && default.named_child_count() == 0;
             if !empty {
                 return None;
             }
-            recurse(node.child_by_field_name("value")?)
+            let inner = recurse(node.child_by_field_name("value")?)?;
+            Some(
+                inner
+                    .strip_suffix('?')
+                    .map_or(inner.clone(), str::to_string),
+            )
         }
         "call_expression" => {
-            if swift_is_subscript_call(node) {
+            // `f()` and `r.m()` name a signature only when they pass nothing: a
+            // call with arguments may be any overload, including one declared
+            // where this file cannot see it.
+            if swift_is_subscript_call(node) || !call_passes_nothing(node) {
                 return None;
             }
             let mut cursor = node.walk();
@@ -950,6 +1107,12 @@ fn expression_type(
             // A local closure or a function-typed member named like a function
             // is what the call names.
             if lookup_scoped(from, source, &name, current).is_some() {
+                return None;
+            }
+            // Inside a type, a bare call may name a method — of the type, an
+            // extension of it in another file, or a superclass — which shadows
+            // the free function. This file cannot rule that out, so it abstains.
+            if enclosing_type(node).is_some() {
                 return None;
             }
             file_index(node, source)?
@@ -1013,7 +1176,17 @@ fn element_type(lambda: Node, source: &str) -> Option<String> {
     }
     let target = callee.child_by_field_name("target")?;
     let collection = expression_type(target, source, lambda, &Bindings::new(), 0)?;
-    element_of(&collection)
+    match collection.strip_suffix('?') {
+        // `Optional.map` hands its closure the whole collection. Only optional
+        // chaining (`xs?.map`) reaches the elements of an optional collection.
+        Some(unwrapped) => {
+            let name = callee.child_by_field_name("suffix")?;
+            let between = source.get(target.end_byte()..name.end_byte())?;
+            let chained = between.trim_start().starts_with('?');
+            chained.then(|| element_of(unwrapped)).flatten()
+        }
+        None => element_of(&collection),
+    }
 }
 
 /// The parameter types of the function type a closure literal is written
@@ -1341,11 +1514,18 @@ fn normalize_within(
             }
             Some(bounds.get(&name).cloned().unwrap_or(name))
         }
-        "optional_type"
-        | "implicitly_unwrapped_type"
-        | "opaque_type"
-        | "existential_type"
-        | "parenthesized_type" => {
+        "optional_type" | "implicitly_unwrapped_type" => {
+            let mut cursor = node.walk();
+            let inner = node.named_children(&mut cursor).find_map(normalize)?;
+            // An optional collection stays marked: `Optional.map` is not the
+            // collection's `map`. A wrapped nominal type is still the type.
+            Some(if inner.starts_with('[') && !inner.ends_with('?') {
+                format!("{inner}?")
+            } else {
+                inner
+            })
+        }
+        "opaque_type" | "existential_type" | "parenthesized_type" => {
             let mut cursor = node.walk();
             let inner = node.named_children(&mut cursor).find_map(normalize);
             inner
@@ -1364,6 +1544,8 @@ mod tests {
     use super::*;
 
     fn bound(source: &str, function: &str) -> Bindings {
+        // Node ids are arena addresses, so every parse starts from a clean cache.
+        reset();
         let mut parser = tree_sitter::Parser::new();
         parser
             .set_language(&tree_sitter_swift::LANGUAGE.into())
@@ -1505,7 +1687,18 @@ mod tests {
             "{PARCEL}struct A {{ struct Crate {{ var items: [Parcel] }} }}\n\
              struct B {{ struct Crate {{ var items: [Parcel]\n func total() {{ _ = items.map {{ $0.weight() }} }} }} }}"
         );
-        assert_eq!(ty_of(&lambda_bound(&nested_twice, 0), "$0"), None);
+        // Inside `B.Crate` the implicit member is `B.Crate`'s, whatever else is
+        // called `Crate`; a use that only spells `Crate` cannot tell the two apart.
+        assert_eq!(
+            ty_of(&lambda_bound(&nested_twice, 0), "$0"),
+            Some("Parcel".to_string())
+        );
+        let by_name = format!(
+            "{PARCEL}struct A {{ struct Crate {{ var items: [Parcel] }} }}\n\
+             struct B {{ struct Crate {{ var items: [Parcel] }} }}\n\
+             func g(c: Crate) {{ _ = c.items.map {{ $0.weight() }} }}"
+        );
+        assert_eq!(ty_of(&lambda_bound(&by_name, 0), "$0"), None);
         // One declaration in a struct and its extension is not ambiguous.
         let extension = format!(
             "{PARCEL}struct Crate {{ var items: [Parcel] }}\n\
@@ -1515,6 +1708,105 @@ mod tests {
             ty_of(&lambda_bound(&extension, 0), "$0"),
             Some("Parcel".to_string())
         );
+    }
+
+    #[test]
+    fn a_nested_type_is_read_by_name_only_from_inside_its_holder() {
+        let outside = format!(
+            "{PARCEL}struct Outer {{ struct Pouch {{ var items: [Parcel] }} }}\n\
+             struct Host {{ func run(p: Pouch) {{ p.items.forEach {{ $0.weight() }} }} }}"
+        );
+        assert_eq!(ty_of(&lambda_bound(&outside, 0), "$0"), None);
+        let inside = format!(
+            "{PARCEL}struct Outer {{ struct Pouch {{ var items: [Parcel] }}\n\
+             func run(p: Pouch) {{ p.items.forEach {{ $0.weight() }} }} }}"
+        );
+        assert_eq!(
+            ty_of(&lambda_bound(&inside, 0), "$0"),
+            Some("Parcel".to_string())
+        );
+        let top_level_and_nested = format!(
+            "{PARCEL}struct Pouch {{ var items: [Parcel] }}\n\
+             struct Outer {{ struct Pouch {{ var items: [Parcel] }} }}\n\
+             func run(p: Pouch) {{ p.items.forEach {{ $0.weight() }} }}"
+        );
+        assert_eq!(ty_of(&lambda_bound(&top_level_and_nested, 0), "$0"), None);
+        // An extension of a qualified name is not the namesake declared here.
+        let extension = format!(
+            "{PARCEL}struct B {{ struct Crate {{ var items: [Parcel] }} }}\n\
+             extension A.Crate {{ func run() {{ items.forEach {{ $0.weight() }} }} }}"
+        );
+        assert_eq!(ty_of(&lambda_bound(&extension, 0), "$0"), None);
+    }
+
+    #[test]
+    fn a_typealias_element_is_not_the_type_of_that_name() {
+        let source = format!(
+            "{PARCEL}struct Host {{ typealias Entry = Parcel\n var items: [Entry]\n\
+             func run() {{ items.forEach {{ $0.weight() }} }} }}"
+        );
+        assert_eq!(ty_of(&lambda_bound(&source, 0), "$0"), None);
+        let annotated = format!(
+            "{PARCEL}typealias Step = Parcel\n\
+             func f() {{ let g: (Step) -> Void = {{ $0.weight() }}; _ = g }}"
+        );
+        assert_eq!(ty_of(&lambda_bound(&annotated, 0), "$0"), None);
+    }
+
+    #[test]
+    fn optional_map_is_not_an_element_closure() {
+        let member = format!(
+            "{PARCEL}struct Host {{ var items: [Parcel]?\n func run() {{ _ = items.map {{ $0.weight() }} }} }}"
+        );
+        assert_eq!(ty_of(&lambda_bound(&member, 0), "$0"), None);
+        let try_local = format!(
+            "{PARCEL}func load() throws -> [Parcel] {{ [] }}\n\
+             func f() {{ let xs = try? load(); _ = xs.map {{ $0.weight() }} }}"
+        );
+        assert_eq!(ty_of(&lambda_bound(&try_local, 0), "$0"), None);
+        let try_paren = format!(
+            "{PARCEL}func load() throws -> [Parcel] {{ [] }}\n\
+             func f() {{ _ = (try? load()).map {{ $0.weight() }} }}"
+        );
+        assert_eq!(ty_of(&lambda_bound(&try_paren, 0), "$0"), None);
+        // Chaining, `?? []` and an `if let` unwrap reach the elements.
+        let chained = format!(
+            "{PARCEL}func load() throws -> [Parcel] {{ [] }}\n\
+             func f() {{ let xs = try? load(); _ = xs?.map {{ $0.weight() }} }}"
+        );
+        assert_eq!(
+            ty_of(&lambda_bound(&chained, 0), "$0"),
+            Some("Parcel".to_string())
+        );
+        let unwrapped = format!(
+            "{PARCEL}func f(xs: [Parcel]?) {{ if let ys = xs {{ _ = ys.map {{ $0.weight() }} }} }}"
+        );
+        assert_eq!(
+            ty_of(&lambda_bound(&unwrapped, 0), "$0"),
+            Some("Parcel".to_string())
+        );
+    }
+
+    #[test]
+    fn a_bare_call_inside_a_type_or_with_arguments_names_no_return_type() {
+        // Inside a type the call may be a method this file cannot see.
+        let inside = format!(
+            "{PARCEL}func load() -> [Parcel] {{ [] }}\n\
+             struct Host {{ func run() {{ let xs = load(); _ = xs.map {{ $0.weight() }} }} }}"
+        );
+        assert_eq!(ty_of(&lambda_bound(&inside, 0), "$0"), None);
+        // A call with arguments may be an overload declared elsewhere.
+        let arguments = format!(
+            "{PARCEL}func load() -> [Parcel] {{ [] }}\n\
+             func f() {{ let xs = load(1); _ = xs.map {{ $0.weight() }} }}"
+        );
+        assert_eq!(ty_of(&lambda_bound(&arguments, 0), "$0"), None);
+        // A function with parameters types no bare call of its name.
+        let parameters = format!(
+            "{PARCEL}func load(_ n: Int = 1) -> [Parcel] {{ [] }}\n\
+             func f() {{ let xs = load(); _ = xs.map {{ $0.weight() }} }}"
+        );
+        assert_eq!(ty_of(&lambda_bound(&parameters, 0), "$0"), None);
     }
 
     #[test]
