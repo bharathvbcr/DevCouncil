@@ -570,6 +570,9 @@ pub struct Resolver {
     /// Kotlin/Java `package` header per file: every file of one package shares
     /// an unqualified namespace, test source sets included.
     jvm_package_by_file: BTreeMap<String, String>,
+    /// Every name any Swift file declares with `typealias`; see
+    /// [`Extraction::swift_type_aliases`].
+    swift_type_aliases: BTreeSet<String>,
     /// `(package, declared name)` to the files of that package declaring it:
     /// what a Kotlin/Java `import a.b.name` is read against, because a
     /// top-level function or an extension is not in a file named for it.
@@ -702,6 +705,7 @@ impl Resolver {
             go_model: GoModel::default(),
             swift_module_by_file: BTreeMap::new(),
             jvm_package_by_file: BTreeMap::new(),
+            swift_type_aliases: BTreeSet::new(),
             jvm_package_symbols: BTreeMap::new(),
             field_initializers: BTreeMap::new(),
             gradle_module_dirs: Vec::new(),
@@ -1559,6 +1563,24 @@ impl Resolver {
     /// one-hop field receivers (`w.Priority.valid()`, `h.engine.tick()`) via
     /// the field's Type ref keyed by owning type.
     fn receiver_type_for(
+        &self,
+        file: &str,
+        scope: Option<&str>,
+        name: &str,
+        binding: Option<&devmap_extract::model::LocalBinding>,
+    ) -> Option<String> {
+        let ty = self.receiver_type_unchecked(file, scope, name, binding)?;
+        // A Swift file that writes `Entry` cannot tell a top-level `Entry` from
+        // a member alias another file introduces (`extension Host { typealias
+        // Entry = Item }`); only this pass sees every file. A name some file
+        // declares with `typealias` types nothing, as the in-file case already
+        // does in the extractor.
+        let aliased = self.family_of_file(file) == Some(LangFamily::Swift)
+            && self.swift_type_aliases.contains(ty.as_str());
+        (!aliased).then_some(ty)
+    }
+
+    fn receiver_type_unchecked(
         &self,
         file: &str,
         scope: Option<&str>,
@@ -2946,6 +2968,7 @@ impl Resolver {
         self.go_model = GoModel::default();
         self.swift_module_by_file.clear();
         self.jvm_package_by_file.clear();
+        self.swift_type_aliases.clear();
         self.jvm_package_symbols.clear();
         self.field_initializers.clear();
         self.swift_module_files.clear();
@@ -3162,6 +3185,8 @@ impl Resolver {
                 self.go_package_dirs_unvouched
                     .insert(Self::parent_dir(&ext.file_path));
             }
+            self.swift_type_aliases
+                .extend(ext.swift_type_aliases.iter().cloned());
             if let Some(package) = ext.jvm_package.as_deref() {
                 self.jvm_package_by_file
                     .insert(ext.file_path.clone(), package.to_string());
