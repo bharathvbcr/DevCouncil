@@ -10223,6 +10223,14 @@ fn collect_site_bindings(
                     // reader; the shared passes read `identifier` and a
                     // `parameters` list, neither of which the grammar has.
                     let bound = crate::swiftscope::bindings(scope, source);
+                    // `if let task = task(from: x)`: the binding is not in scope in
+                    // its own initializer, so the use names the outer `task`.
+                    if bound.contains_key(name)
+                        && crate::swiftscope::use_is_in_own_initializer(node, source, name)
+                    {
+                        ancestor = bounded_parent(scope);
+                        continue;
+                    }
                     if let Some(written) = bound.get(name) {
                         let initializer = written.init.clone();
                         let written = written.ty.clone();
@@ -11044,7 +11052,13 @@ fn collect_scope_locals(
                     // per-scope set.
                     collect_type_parameter_names(node, source, entry);
                     if lang == "swift" {
-                        entry.extend(crate::swiftscope::bindings(node, source).keys().cloned());
+                        // A dotted key (`open.transform`) types a member path, not a name.
+                        entry.extend(
+                            crate::swiftscope::bindings(node, source)
+                                .keys()
+                                .filter(|name| !name.contains('.'))
+                                .cloned(),
+                        );
                     }
                 }
             }
