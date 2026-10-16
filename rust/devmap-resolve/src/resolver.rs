@@ -7559,6 +7559,7 @@ impl Resolver {
     /// abstention is not relabelled as a missing member.
     fn indexed_type_lacks_member(&self, family: LangFamily, type_name: &str, method: &str) -> bool {
         let mut files: BTreeSet<&str> = BTreeSet::new();
+        let mut only_interfaces = true;
         for (path, kind, candidate_family, _) in
             self.symbol_index.get(type_name).into_iter().flatten()
         {
@@ -7573,9 +7574,27 @@ impl Resolver {
                 )
             {
                 files.insert(path.as_str());
+                only_interfaces &= *kind == SymbolKind::Interface;
             }
         }
+        // A TypeScript `type X = number` is indexed as an `Interface` and
+        // declares no member symbols, as does `interface P { x: number }`.
+        // Neither says what the value's members are, so only an interface
+        // with at least one method of its own can show a member absent.
+        if family == LangFamily::JsTs
+            && only_interfaces
+            && !self.type_declares_any_method(family, type_name)
+        {
+            return false;
+        }
         files.len() == 1 && !self.member_reachable(family, type_name, method)
+    }
+
+    fn type_declares_any_method(&self, family: LangFamily, type_name: &str) -> bool {
+        self.type_methods
+            .range((family, type_name.to_string(), String::new())..)
+            .next()
+            .is_some_and(|((f, t, _), _)| *f == family && t == type_name)
     }
 
     fn type_has_method(&self, family: LangFamily, type_name: &str, method: &str) -> bool {
