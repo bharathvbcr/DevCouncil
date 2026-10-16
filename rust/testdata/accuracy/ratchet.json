@@ -25,9 +25,9 @@
   },
   "swift": {
     "forbid_any_tier_rows": 4,
-    "known_failing": 15,
+    "known_failing": 12,
     "positive_rows": 105,
-    "present": 93
+    "present": 96
   },
   "typescript": {
     "forbid_any_tier_rows": 1,

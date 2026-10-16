@@ -355,3 +355,41 @@ pub fn caller() {
         extraction.local_bindings
     );
 }
+
+/// A Swift `if let task = task(from: i)` binds `task` after its initializer, so
+/// the call inside the initializer names the method, not the new local; the
+/// uses after it are the local's. `guard let session = s, session > 0` binds
+/// `session` for the condition after the comma.
+#[test]
+fn a_swift_binding_is_not_a_local_in_its_own_initializer() {
+    let source = "final class D {\n    func task(from i: Int) -> Int? { i }\n    func go(_ i: Int) {\n        if let task = task(from: i) { _ = task }\n    }\n    func check(_ s: Int?) {\n        guard let session = s, session > 0 else { return }\n    }\n}\n";
+    let extraction = extract_file("a.swift", source);
+    let at = |name: &str, start: usize| {
+        extraction
+            .local_bindings
+            .iter()
+            .any(|b| b.name == name && b.start_byte == start)
+    };
+    let call = source
+        .find("task(from: i) {")
+        .expect("the initializer's call");
+    let later_use = source.find("_ = task").expect("the use") + "_ = ".len();
+    assert!(
+        !at("task", call),
+        "the call in the initializer names the method: {:?}",
+        extraction.local_bindings
+    );
+    assert!(
+        at("task", later_use),
+        "a use after the binding is the local: {:?}",
+        extraction.local_bindings
+    );
+    let test = source
+        .find("session > 0")
+        .expect("the condition after the binding");
+    assert!(
+        at("session", test),
+        "a plain test after a binding sees the new local: {:?}",
+        extraction.local_bindings
+    );
+}
