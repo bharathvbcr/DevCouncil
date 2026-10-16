@@ -178,3 +178,19 @@ required-features = ["parse"]
 [[test]]
 name = "cfg_variants_are_one_dead_row"
 required-features = ["parse"]
+
+[[test]]
+name = "swift_attack_corpus"
+required-features = ["parse"]
+
+[[test]]
+name = "swift_recall_attack"
+required-features = ["parse"]
+
+[[test]]
+name = "swift_recall_attack2"
+required-features = ["parse"]
+
+[[test]]
+name = "swift_receiver_collapse_attack"
+required-features = ["parse"]

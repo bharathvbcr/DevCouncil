@@ -72,6 +72,9 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
         &[
             "against_a_real_repository",
             "blob_reads_and_budget",
+            // Git change-set paths only; compiles feature-off. Verified with
+            // `cargo check -p dc-regress --no-default-features --tests`.
+            "change_paths",
             "change_to_impact",
             "hostile_change",
             "hostile_input",
