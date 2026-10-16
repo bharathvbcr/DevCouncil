@@ -16,6 +16,7 @@ updates:
     directories:
       - "/backend/go_orchestrator"
       - "/benchmarks/plots"
+      - "/tools/accuracy"
     schedule:
       interval: weekly
     open-pull-requests-limit: 5

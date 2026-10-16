@@ -73,6 +73,16 @@ jobs:
         working-directory: benchmarks/plots
         run: go test ./... -count=1
 
+      # tools/accuracy is its own Go module (the go/types labeller behind the
+      # DevMap corpus record); its golden test keeps
+      # rust/testdata/accuracy/go.labels.json equal to the labeller's output.
+      - name: Accuracy labeller tests
+        working-directory: tools/accuracy
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test ./... -count=1
+
       - name: Package smoke
         run: |
           npm pack --dry-run
