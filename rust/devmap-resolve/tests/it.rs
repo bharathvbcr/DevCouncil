@@ -138,6 +138,10 @@ mod type_position_classification;
 mod typed_receivers;
 #[cfg(feature = "parse")]
 mod typescript_core_shapes;
+#[cfg(feature = "parse")]
+mod typescript_interface_dispatch;
+#[cfg(feature = "parse")]
+mod unresolved_member;
 
 /// Files that keep a process of their own, and why (see the file's header).
 const ISOLATED: &[&str] = &[];
