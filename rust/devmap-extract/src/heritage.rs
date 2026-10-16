@@ -270,6 +270,7 @@ fn heritage_clauses<'a>(
             | ("rust", "impl_item")
             | ("objc", "class_interface" | "class_implementation")
             | ("solidity", "contract_declaration" | "interface_declaration")
+            | ("go", "type_spec")
     );
     if !interesting {
         return None;
@@ -317,7 +318,92 @@ fn heritage_clauses<'a>(
     if lang == "objc" {
         collect_objc_heritage(node, &mut clauses);
     }
+    if lang == "go" {
+        collect_go_heritage(node, &mut clauses);
+    }
     Some(clauses)
+}
+
+/// The type name an embedded Go field or interface names.
+///
+/// `*pkg.Reader` and `pkg.Reader[T]` are one type, `Reader`. Passing the whole
+/// `qualified_type` to `names_under` would also emit the package, which is not
+/// a supertype. A named field (`Name string`, `a, b int`) is not an embedding
+/// and never reaches here.
+fn go_embedded_name_node(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node;
+    for _ in 0..4 {
+        match current.kind() {
+            "pointer_type" | "parenthesized_type" => current = current.named_child(0)?,
+            "generic_type" => current = current.child_by_field_name("type")?,
+            "qualified_type" => return current.child_by_field_name("name"),
+            "type_identifier" => return Some(current),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Go states embedding by omitting the field name. A struct field with a name,
+/// and an interface element that is a method or a union, add no supertype.
+/// The grammar does not spell `implements`; an embedded interface is still
+/// `Extends` here, and the resolver rewrites it when the target is an indexed
+/// interface.
+fn collect_go_heritage<'a>(node: Node<'a>, clauses: &mut Vec<(Relation, Node<'a>)>) {
+    let Some(body) = node.child_by_field_name("type") else {
+        return;
+    };
+    match body.kind() {
+        "struct_type" => {
+            let mut cursor = body.walk();
+            let Some(list) = body
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "field_declaration_list")
+            else {
+                return;
+            };
+            let mut fields = list.walk();
+            for decl in list.named_children(&mut fields) {
+                if decl.kind() != "field_declaration" {
+                    continue;
+                }
+                let mut names = decl.walk();
+                if decl
+                    .children_by_field_name("name", &mut names)
+                    .next()
+                    .is_some()
+                {
+                    continue;
+                }
+                let Some(ty) = decl.child_by_field_name("type") else {
+                    continue;
+                };
+                if let Some(name) = go_embedded_name_node(ty) {
+                    clauses.push((Relation::Extends, name));
+                }
+            }
+        }
+        "interface_type" => {
+            let mut cursor = body.walk();
+            for child in body.named_children(&mut cursor) {
+                if child.kind() != "type_elem" || child.named_child_count() != 1 {
+                    continue;
+                }
+                let Some(only) = child.named_child(0).filter(|only| {
+                    matches!(
+                        only.kind(),
+                        "type_identifier" | "qualified_type" | "generic_type"
+                    )
+                }) else {
+                    continue;
+                };
+                if let Some(name) = go_embedded_name_node(only) {
+                    clauses.push((Relation::Extends, name));
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// `include Reader` / `prepend Reader` in a class or module body: the module is

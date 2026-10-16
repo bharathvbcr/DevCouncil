@@ -48,8 +48,9 @@ ts.C18a	C18a	apps/web/src/services/store.ts::useService	apps/web/src/services/st
 ts.C18b	C18b	apps/web/src/services/store.ts::paperService.fetchOne	apps/web/src/services/store.ts::svcHelper	edge	must		svcHelper is live; the call is the object-literal method's, not useService's
 ts.C18d	C18d	apps/web/src/services/store.ts::paperService.remove	apps/web/src/services/store.ts::svcHelper	edge	must		the arrow member's call is attributed to the member, not the file
 ts.C18c	C18c	apps/web/src/services/store.ts::useService	apps/web/src/services/store.ts::paperService.remove|apps/web/src/services/store.ts::paperService	edge	must		object-literal arrow member remove
-ts.C19a	C19a	apps/web/src/services/store.ts::useClient	apps/web/src/services/store.ts::MemClient.get|apps/web/src/services/store.ts::Client	edge	must	get	interface dispatch; at least the interface
+ts.C19a	C19a	apps/web/src/services/store.ts::useClient	apps/web/src/services/store.ts::MemClient.get	edge	must	get	interface dispatch to the implementer
 ts.C19b	C19b	apps/web/src/components/PaperList.tsx::PaperList	apps/web/src/services/store.ts::Client	edge	must		type-only reference
+ts.C19d	C19d	apps/web/src/services/store.ts::useClient	apps/web/src/services/store.ts::Client.get	edge	must		direct edge to the interface method
 ts.C20	C20	apps/web/src/hooks/usePapers.ts::usePapers	apps/web/src/lib/format.ts::identity	edge	must		identity<number>(rank)
 ts.C21a	C21a	apps/web/src/services/api.ts::loadAll	apps/web/src/services/api.ts::parseBody	edge	must		.then(parseBody) reference
 ts.C21b	C21b	apps/web/src/services/api.ts::loadAll	apps/web/src/services/api.ts::logIt	edge	must		call inside .then arrow

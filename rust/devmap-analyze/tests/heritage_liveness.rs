@@ -260,3 +260,53 @@ fn a_type_alias_used_as_a_generic_constructor_is_not_dead() {
         }
     }
 }
+
+/// One implementer of a called interface method is reached, so it is not dead.
+#[test]
+fn one_implementer_called_through_the_interface_is_not_dead() {
+    let (extractions, resolution) = resolve(&[(
+        "one.ts",
+        "interface Greeter { hello(): string }\n\
+         class English implements Greeter { hello(): string { return \"hi\" } }\n\
+         function greetAll(g: Greeter): string { return g.hello() }\n",
+    )]);
+    let reports = analyze_liveness(&extractions, &resolution);
+    assert!(
+        reports
+            .iter()
+            .all(|report| report.symbol_name != "English.hello"),
+        "a single implementer is called: {reports:?}"
+    );
+}
+
+/// Two implementers are ambiguous evidence at 0.4, not a heritage exemption.
+///
+/// The direct edge to `Greeter.hello` is a call. Treating that as proof that
+/// every conformer ran would hide the candidate set.
+#[test]
+fn two_implementers_are_reached_by_dispatch() {
+    let (extractions, resolution) = resolve(&[(
+        "two.ts",
+        "interface Greeter { hello(): string }\n\
+         class English implements Greeter { hello(): string { return \"hi\" } }\n\
+         class French implements Greeter { hello(): string { return \"salut\" } }\n\
+         function greetAll(g: Greeter): string { return g.hello() }\n",
+    )]);
+    let reports = analyze_liveness(&extractions, &resolution);
+    for name in ["English.hello", "French.hello"] {
+        let report = reports
+            .iter()
+            .find(|report| report.symbol_name == name)
+            .unwrap_or_else(|| panic!("{name} missing from {reports:?}"));
+        assert!(!report.is_exempt, "{report:?}");
+        assert_eq!(
+            report.exemption_reason.as_deref(),
+            Some(devmap_analyze::liveness::REACHED_BY_DISPATCH),
+            "{report:?}"
+        );
+        assert!(
+            (report.confidence - 0.4).abs() < 1e-3,
+            "dispatch evidence stays at 0.4: {report:?}"
+        );
+    }
+}

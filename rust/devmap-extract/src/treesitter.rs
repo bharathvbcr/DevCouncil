@@ -3189,6 +3189,31 @@ fn enclosing_type_name(node: Node, source: &str) -> Option<String> {
     None
 }
 
+/// The interface a `method_signature` belongs to, or `None` when it does not.
+///
+/// A class overload is the same node kind (`area(): number;` beside
+/// `area(): number { … }`) and is the method body's declaration, not a second
+/// symbol. Stopping at a class or a function keeps that signature — and a
+/// signature nested inside one — from being filed under an outer interface.
+fn enclosing_interface_name(node: Node, source: &str) -> Option<String> {
+    let mut ancestor = bounded_parent(node);
+    while let Some(parent) = ancestor {
+        match parent.kind() {
+            "interface_declaration" => return get_child_text(parent, "name", source),
+            "class_declaration"
+            | "abstract_class_declaration"
+            | "class"
+            | "function_declaration"
+            | "generator_function_declaration"
+            | "method_definition"
+            | "function_expression"
+            | "arrow_function" => return None,
+            _ => ancestor = bounded_parent(parent),
+        }
+    }
+    None
+}
+
 /// The owner name of a Rust type declared inside a function body, keyed under
 /// that function: `with_guard.Guard` for `fn with_guard() { struct Guard; impl
 /// Drop for Guard { fn drop(..) } }`.
@@ -4660,6 +4685,35 @@ fn extract_node(
                         declaration_hash: None,
                         return_type: None,
                     });
+                }
+            }
+            // An interface method is a requirement a call through the interface
+            // can name. A class overload signature is the same node and is not:
+            // the method body is already the symbol. Property, call, construct
+            // and index signatures are not methods.
+            "method_signature" => {
+                if let Some(interface) = enclosing_interface_name(node, source) {
+                    if let Some(name_node) = node.child_by_field_name("name") {
+                        if name_node.kind() == "property_identifier" {
+                            let n = get_node_text(name_node, source);
+                            if !n.is_empty() {
+                                let parent = format!("{file_symbol_name}::{interface}");
+                                symbols.push(ExtractedSymbol {
+                                    name: n.clone(),
+                                    qualified_name: format!("{parent}.{n}"),
+                                    kind: SymbolKind::Method,
+                                    span,
+                                    is_exported: js_symbol_is_exported(node, source),
+                                    docstring: None,
+                                    signature: None,
+                                    parent_symbol: Some(parent),
+                                    body_signature: None,
+                                    declaration_hash: None,
+                                    return_type: None,
+                                });
+                            }
+                        }
+                    }
                 }
             }
             "interface_declaration" | "type_alias_declaration" => {
@@ -13218,11 +13272,10 @@ mod tests {
     /// qualification of impl items, and `f.go::Client.Run` is SC9's receiver
     /// ownership, without which Go method edges do not join at all.
     ///
-    /// This is a record of current behavior, not an endorsement of it. Two
-    /// entries are parity artifacts rather than intent: a TS `type` alias is
-    /// reported as `Interface`, and a Go `interface` type as `Struct`. They are
-    /// pinned so that changing them is a visible decision instead of a silent
-    /// drift.
+    /// This is a record of current behavior, not an endorsement of it. One
+    /// entry is a parity artifact rather than intent: a TS `type` alias is
+    /// reported as `Interface`. It is pinned so that changing it is a visible
+    /// decision instead of a silent drift.
     ///
     /// Exported module-level bindings *are* emitted now (`f.go::Limit`); this
     /// golden previously pinned their absence as deliberate, which is how the
@@ -13256,6 +13309,7 @@ mod tests {
                 &[
                     (SymbolKind::File, "f.ts", true),
                     (SymbolKind::Interface, "f.ts::Shape", true),
+                    (SymbolKind::Method, "f.ts::Shape.area", true),
                     (SymbolKind::Interface, "f.ts::Alias", true),
                     (SymbolKind::Class, "f.ts::Box", true),
                     (SymbolKind::Method, "f.ts::Box.area", true),

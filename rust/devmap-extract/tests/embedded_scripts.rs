@@ -869,8 +869,13 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     //
     // v90 records Rust `macro_rules!` symbols, blanket-impl parameters, `?`
     // From candidates and calls through a same-file const fn pointer.
+    // v90 records a TypeScript interface method as a symbol and a Go embedding
+    // as heritage. Both are additive: a v89 row looks complete and would keep
+    // serving calls through those interfaces with no method to dispatch to.
+    //
+    // v92 integrates the Rust, TypeScript/Go and Swift lanes (see cache.rs).
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "90",
+        EXTRACTION_SCHEMA_VERSION, "92",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

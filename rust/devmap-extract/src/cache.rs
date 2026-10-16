@@ -668,7 +668,7 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// through it would stay unresolved. The resolver-accuracy lane stamped 88
 /// on this payload; it landed after the dead-policy lane, so it is 89.
 ///
-/// v90 is the second L-Rust payload: a `macro_rules!` definition is a `Macro`
+/// v90 (rust lane) is the second L-Rust payload: a `macro_rules!` definition is a `Macro`
 /// symbol its same-file invocations reference; a Rust file records the type
 /// parameter of each blanket impl (`rust_blanket_impl_params`) and the
 /// `From::from` candidate of each `?` in a function returning `Result<_, E>`
@@ -677,7 +677,18 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// has no macro symbol and none of those facts, so the blanket-impl method, the
 /// `?` conversion and the pointer's target would stay without a caller from a
 /// warm cache until the file was edited.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "90";
+///
+/// v90 (ts/go lane) records a TypeScript `method_signature` inside an `interface_declaration`
+/// as a `Method` symbol, and a Go struct or interface embedding (a field or
+/// type element with no name) as a `Heritage` reference. A v89 row has neither,
+/// so a call through an interface stays unbound and a Go embedding stays
+/// invisible until the file is edited.
+///
+/// v92 integrates the Rust, TypeScript/Go and Swift lanes. The first two each
+/// stamped 90 on different payloads and the Swift lane adds `swift_type_aliases`
+/// to the extractor output without a bump, so 92 is a number no lane stamped and
+/// no cached payload can share.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "92";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

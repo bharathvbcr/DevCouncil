@@ -148,6 +148,13 @@ const MATRIX: &[HeritageCase] = &[
         &["Base", "IFace"],
         &[],
     ),
+    (
+        "go embeds a type by omitting the field name",
+        "w.go",
+        "package p\n\ntype Reader interface { Read() string }\n\ntype Widget struct {\n\tReader\n\tName string\n}\n",
+        &["Reader"],
+        &[],
+    ),
 ];
 
 fn named(path: &str, source: &str, kind: ReferenceKind) -> Vec<String> {
@@ -232,6 +239,10 @@ fn a_class_without_a_supertype_emits_no_heritage() {
         ("w.py", "class W:\n    def m(self):\n        pass\n"),
         ("W.java", "class W { void m() {} }\n"),
         ("w.rb", "class W\n  def m; end\nend\n"),
+        (
+            "w.go",
+            "package p\n\ntype Widget struct {\n\tName string\n}\n\ntype I interface {\n\tRead() string\n}\n",
+        ),
     ] {
         let extraction = extract_file(path, source);
         assert!(
@@ -307,4 +318,34 @@ fn a_qualified_js_base_is_recorded_per_segment_innermost_first() {
             "{path}: one span, so the segments read back as one written base"
         );
     }
+}
+
+/// A Go embedding names the type, not the package, the pointer, or a named field.
+#[test]
+fn a_go_embedding_names_the_type_only() {
+    let source = "package p\n\ntype Widget struct {\n\t*pkg.Reader\n\tio.Closer\n\tName string\n}\n\ntype Read interface { Read() string }\n\ntype ReadWriter interface {\n\tRead\n\tWrite\n\t~int | string\n}\n";
+    let extraction = extract_file("w.go", source);
+    let mut names: Vec<String> = extraction
+        .references
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.kind,
+                ReferenceKind::Heritage | ReferenceKind::HeritageInterface
+            )
+        })
+        .map(|r| r.name.clone())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "Closer".to_string(),
+            "Read".to_string(),
+            "Reader".to_string(),
+            "Write".to_string(),
+        ],
+        "the package, the pointer and the named field are not supertypes: {:?}",
+        extraction.references
+    );
 }

@@ -26,7 +26,7 @@ C16-static	store.ts::viaStatic	MemClient.create	static call
 C17-class-field	store.ts::viaStatic	MemClient.handle	KNOWN ft-32522da4 #6 (field arrow)
 C18-object-literal-method	store.ts::useService	paperService.fetchOne / svcHelper	call; svcHelper live
 C18-object-literal-arrow	store.ts::useService	paperService.remove	call
-C19-interface	store.ts::useClient	Client.get (interface) -> MemClient.get impl	interface dispatch; at least Client.get
+C19-interface	store.ts::useClient	MemClient.get	interface dispatch to the implementer; the direct edge to Client.get is C19d
 C19-type-import	PaperList	Client	type-only reference, no call edge
 C20-generics	usePapers	format.ts::identity	call `identity<number>(rank)`
 C21-promise-chain	api.ts::loadAll	api.ts::parseBody	reference via .then(parseBody)

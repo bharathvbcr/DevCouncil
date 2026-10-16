@@ -4993,6 +4993,7 @@ impl Resolver {
                     // declares, derefs to, inherits and is blanket-supplied no
                     // member of this name (set by the typed-receiver rung).
                     let mut rust_member_miss = false;
+                    let mut typed_member_absent = false;
                     if resolution.is_none() {
                         if let Some(index) = &go_index {
                             match self.go_call(ext, index, call) {
@@ -5162,11 +5163,15 @@ impl Resolver {
                                 })
                             {
                                 resolution = Some(match family {
-                                    // A receiver typed by a protocol (Swift) or a
+                                    // A receiver typed by a protocol (Swift), a
                                     // trait (Rust: `dyn T`, `impl T`, a `T`
-                                    // bound) is a call through it: see
-                                    // `protocol_dispatch`.
-                                    LangFamily::Swift | LangFamily::Rust => self
+                                    // bound) or an interface (TypeScript) is a
+                                    // call through it: see `protocol_dispatch`.
+                                    // A class of the same name stays
+                                    // `ReceiverType`, because `protocol_dispatch`
+                                    // returns `None` unless every indexed hit is
+                                    // an interface or a trait.
+                                    LangFamily::Swift | LangFamily::Rust | LangFamily::JsTs => self
                                         .protocol_dispatch(family, &class_type, &call.callee_name)
                                         .map(|(direct, targets)| {
                                             self.dispatch_through_interface(
@@ -5209,6 +5214,28 @@ impl Resolver {
                                         receiver_type: receiver_type.clone(),
                                     })
                                 }));
+                            }
+                            // The method is not on this type, on a supertype, or
+                            // (Rust) on a type it derefs to. A later bare-name
+                            // rung would bind a namesake the type does not have.
+                            // Go has its own answer (`GoCall::Absent`), including
+                            // embeddings the flat tables do not see.
+                            if resolution.is_none()
+                                && family != LangFamily::Go
+                                && (family != LangFamily::Python || class_is_known)
+                                && self.indexed_type_lacks_member(
+                                    family,
+                                    &class_type,
+                                    &call.callee_name,
+                                )
+                            {
+                                resolution = Some(Arc::new(Resolution::Unresolved {
+                                    reason: format!(
+                                        "the receiver is a {class_type}, which declares no member {:?}",
+                                        call.callee_name
+                                    ),
+                                }));
+                                typed_member_absent = true;
                             }
                         }
                     }
@@ -6052,28 +6079,32 @@ impl Resolver {
                         // D17 / R5: a call the ladder could not resolve is recorded,
                         // never dropped. Silence here is indistinguishable from
                         // "there was no call", which is the failure R5 forbids.
-                        let class = go_class.unwrap_or_else(|| {
-                            match self.classify_unresolved(
-                                &ext.file_path,
-                                family,
-                                &call.callee_name,
-                                call.receiver_expr.as_deref(),
-                                &caller_sym,
-                                UsePosition::value_at(
-                                    ext,
-                                    call.span.start_byte,
+                        let class = if typed_member_absent {
+                            UnresolvedClass::UnresolvedMember
+                        } else {
+                            go_class.unwrap_or_else(|| {
+                                match self.classify_unresolved(
+                                    &ext.file_path,
+                                    family,
+                                    &call.callee_name,
                                     call.receiver_expr.as_deref(),
-                                ),
-                            ) {
-                                // The receiver was typed; only the member was
-                                // not found. A class that explains the miss
-                                // (no namesake anywhere, an external) stands.
-                                UnresolvedClass::UninferredReceiver if rust_member_miss => {
-                                    UnresolvedClass::UnresolvedMember
+                                    &caller_sym,
+                                    UsePosition::value_at(
+                                        ext,
+                                        call.span.start_byte,
+                                        call.receiver_expr.as_deref(),
+                                    ),
+                                ) {
+                                    // The receiver was typed; only the member was
+                                    // not found. A class that explains the miss
+                                    // (no namesake anywhere, an external) stands.
+                                    UnresolvedClass::UninferredReceiver if rust_member_miss => {
+                                        UnresolvedClass::UnresolvedMember
+                                    }
+                                    class => class,
                                 }
-                                class => class,
-                            }
-                        });
+                            })
+                        };
                         unresolved.push(UnresolvedReference {
                             source_file: ext.file_path.clone(),
                             source_symbol: caller_sym,
@@ -7664,6 +7695,108 @@ impl Resolver {
             }
         }
         files.len() <= 1
+    }
+
+    /// The indexed type declares no member of this name on itself, on any
+    /// supertype, or — for Rust — on a type it derefs to.
+    ///
+    /// False when the name is not one indexed declaration (an external
+    /// annotation, or two files declaring it): absence is only meaningful for
+    /// a type this index can see uniquely. A method that exists but is
+    /// ambiguous is present — `contains_key`, not a unique hit — so an
+    /// abstention is not relabelled as a missing member.
+    fn indexed_type_lacks_member(&self, family: LangFamily, type_name: &str, method: &str) -> bool {
+        let mut files: BTreeSet<&str> = BTreeSet::new();
+        let mut only_interfaces = true;
+        for (path, kind, candidate_family, _) in
+            self.symbol_index.get(type_name).into_iter().flatten()
+        {
+            if family.admits(*candidate_family)
+                && matches!(
+                    kind,
+                    SymbolKind::Class
+                        | SymbolKind::Struct
+                        | SymbolKind::Enum
+                        | SymbolKind::Interface
+                        | SymbolKind::Trait
+                )
+            {
+                files.insert(path.as_str());
+                only_interfaces &= *kind == SymbolKind::Interface;
+            }
+        }
+        // A TypeScript `type X = number` is indexed as an `Interface` and
+        // declares no member symbols, as does `interface P { x: number }`.
+        // Neither says what the value's members are, so only an interface
+        // with at least one method of its own can show a member absent.
+        if family == LangFamily::JsTs
+            && only_interfaces
+            && !self.type_declares_any_method(family, type_name)
+        {
+            return false;
+        }
+        files.len() == 1 && !self.member_reachable(family, type_name, method)
+    }
+
+    fn type_declares_any_method(&self, family: LangFamily, type_name: &str) -> bool {
+        self.type_methods
+            .range((family, type_name.to_string(), String::new())..)
+            .next()
+            .is_some_and(|((f, t, _), _)| *f == family && t == type_name)
+    }
+
+    fn type_has_method(&self, family: LangFamily, type_name: &str, method: &str) -> bool {
+        self.type_methods
+            .contains_key(&(family, type_name.to_string(), method.to_string()))
+    }
+
+    /// `method` on `type_name`, or on a Rust `Deref` target within
+    /// [`Self::RUST_DEREF_HOPS`].
+    fn type_or_deref_has_method(&self, family: LangFamily, type_name: &str, method: &str) -> bool {
+        if self.type_has_method(family, type_name, method) {
+            return true;
+        }
+        if family != LangFamily::Rust {
+            return false;
+        }
+        let mut current = type_name.to_string();
+        for _ in 0..Self::RUST_DEREF_HOPS {
+            let Some(next) = self.rust_deref_targets.get(&current).and_then(Clone::clone) else {
+                return false;
+            };
+            if self.type_has_method(family, &next, method) {
+                return true;
+            }
+            current = next;
+        }
+        false
+    }
+
+    /// Whether `method` is declared on `type_name` or any supertype within
+    /// [`Self::HERITAGE_WALK_MAX_DEPTH`], counting an ambiguous declaration as
+    /// present.
+    fn member_reachable(&self, family: LangFamily, type_name: &str, method: &str) -> bool {
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut frontier = vec![type_name.to_string()];
+        for _ in 0..Self::HERITAGE_WALK_MAX_DEPTH {
+            let mut next = Vec::new();
+            for name in frontier.drain(..) {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                if self.type_or_deref_has_method(family, &name, method) {
+                    return true;
+                }
+                for supertype in self.supertypes.get(&(family, name)).into_iter().flatten() {
+                    next.push(supertype.clone());
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        false
     }
 
     /// X42. Where `self.m()` / `cls.m()` / `this.m()` / a Go receiver's `s.M()`

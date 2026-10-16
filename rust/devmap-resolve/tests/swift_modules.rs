@@ -218,8 +218,11 @@ fn typed_swift_prelude_values_and_local_types_keep_distinct_classifications() {
             !calls.is_empty(),
             "the method call must remain recorded (local type: {local_type})"
         );
+        // The local `String` is a typed receiver whose indexed type declares no
+        // `lowercased`: a missing member, not an untyped receiver. The point
+        // of the case is unchanged: it is not the prelude's `Builtin`.
         let expected = if local_type {
-            UnresolvedClass::UninferredReceiver
+            UnresolvedClass::UnresolvedMember
         } else {
             UnresolvedClass::Builtin
         };

@@ -345,4 +345,15 @@ fn every_capability_bit_reaches_the_per_language_readout() {
          make the field meaningless: {:?}",
         python.blind_to
     );
+
+    let go = rate
+        .by_language
+        .get("go")
+        .expect("the corpus contains a Go probe");
+    assert!(
+        !go.blind_to.iter().any(|blind| blind == "heritage"),
+        "Go extracts embedded types as heritage, so status must not list it \
+         as blind: {:?}",
+        go.blind_to
+    );
 }

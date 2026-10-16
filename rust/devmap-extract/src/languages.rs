@@ -344,7 +344,7 @@ pub static LANGUAGE_SPECS: &[LanguageSpec] = &[
         extractor_id: ExtractorId::Go,
         lsp_id: "gopls",
         viz_color: "#00ADD8",
-        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES),
+        capabilities: Capabilities::new(CALLS | IMPORTS | REFERENCES | HERITAGE),
         liveness_unit: LivenessUnit::Module,
     },
     LanguageSpec {
