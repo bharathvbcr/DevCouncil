@@ -94,6 +94,21 @@ mod tests {
         assert!(in_confident_branch(7.0, None));
     }
 
+    /// Attack Q5: the same published 0.89 judged in-process (f32 widened) and
+    /// after a decimal round trip through JSON (f64 parse of "0.89").
+    #[test]
+    fn attack_a_published_0_89_is_judged_alike_in_process_and_after_json() {
+        let in_process = f64::from(HIGHEST_DEGRADED_CONFIDENCE);
+        // The CLI's JSON carries the widened f32 (0.8899999856948853), so the
+        // CLI path agrees with in-process: not in the branch.
+        let widened_json: f64 = format!("{:?}", in_process).parse().unwrap();
+        assert!(!in_confident_branch(widened_json, None));
+        // A hand-written decimal 0.89 (a record file, a test literal) is NOT
+        // the same number and lands in the branch: documented hazard.
+        let decimal_literal: f64 = "0.89".parse().unwrap();
+        assert!(in_confident_branch(decimal_literal, None));
+    }
+
     #[test]
     fn a_reason_must_start_with_the_token_not_merely_contain_it() {
         let embedded = format!("see also {COVERAGE_LOSS_REASON}");
