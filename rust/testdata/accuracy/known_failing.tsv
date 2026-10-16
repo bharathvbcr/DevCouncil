@@ -27,9 +27,6 @@ python	py.Z6b	miss	ft-c666ba7c	recall characterization: same through a @dataclas
 python	py.Z6c	miss	ft-c666ba7c	recall characterization: same through @dataclass(frozen=True, slots=True) | today: absent, recorded as an honest unresolved row
 python	py.Z6d	miss	ft-c666ba7c	recall characterization: same, root typed by a parameter annotation | today: absent, recorded as an honest unresolved row
 python	py.Z6e	miss	ft-c666ba7c	recall characterization: same, field read into a local first | today: absent, recorded as an honest unresolved row
-rust	rs.c04	miss	ft-f9665721	blanket impl on i32 literal | today: absent today, recorded as an honest unresolved row
-rust	rs.c24b	silent_miss	ft-f9665721	 | today: no ledger row names {"helper_c24"}
-rust	rs.c26e	silent_miss	ft-f9665721	operator/Drop/From trait use is implicit; honest miss expected | today: no ledger row names {"from"}
 swift	sw.C3	miss	ft-8ca270ad	recall characterization: store.snapshot(p).usage(for:) chain | today: absent, recorded as an honest unresolved row
 swift	sw.C4	miss	ft-8ca270ad	recall characterization: (x as? T)?.m() | today: absent, recorded as an honest unresolved row
 swift	sw.E1	miss	ft-8ca270ad	recall characterization: member of a labelled-tuple parameter | today: absent, recorded as an honest unresolved row

@@ -866,8 +866,11 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     //
     // v89 types a Rust `dyn Trait` / `impl Trait` binding by its trait, and
     // records a literal Python `importlib.import_module` as a module handle.
+    //
+    // v90 records Rust `macro_rules!` symbols, blanket-impl parameters, `?`
+    // From candidates and calls through a same-file const fn pointer.
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "89",
+        EXTRACTION_SCHEMA_VERSION, "90",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

@@ -25,10 +25,15 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// The consequence is stated rather than hidden: DevMap does not report unused
 /// CSS. Svelte's own compiler does, from inside the compilation that knows the
 /// answer, and that is the tool for it.
+///
+/// `Macro` is here for the same reason: a `macro_rules!` macro is linked only to
+/// its invocations in the file that defines it. One invoked from another file
+/// through `#[macro_use]`, a `use` of the macro or `$crate::name!` leaves no
+/// edge, so an unreferenced macro is not evidence of a dead one.
 fn is_never_dead_candidate(kind: SymbolKind) -> bool {
     matches!(
         kind,
-        SymbolKind::File | SymbolKind::MarkupAnchor | SymbolKind::StyleRule
+        SymbolKind::File | SymbolKind::MarkupAnchor | SymbolKind::StyleRule | SymbolKind::Macro
     )
 }
 

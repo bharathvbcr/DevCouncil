@@ -667,7 +667,17 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// handle (`PathLoadKind::ModuleName`), which a v88 row lacks, so `mod.f()`
 /// through it would stay unresolved. The resolver-accuracy lane stamped 88
 /// on this payload; it landed after the dead-policy lane, so it is 89.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "89";
+///
+/// v90 is the second L-Rust payload: a `macro_rules!` definition is a `Macro`
+/// symbol its same-file invocations reference; a Rust file records the type
+/// parameter of each blanket impl (`rust_blanket_impl_params`) and the
+/// `From::from` candidate of each `?` in a function returning `Result<_, E>`
+/// (`rust_try_conversions`); and a bare call of a same-file `const`/`static`
+/// function pointer also calls the function its initializer names. A v89 row
+/// has no macro symbol and none of those facts, so the blanket-impl method, the
+/// `?` conversion and the pointer's target would stay without a caller from a
+/// warm cache until the file was edited.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "90";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
