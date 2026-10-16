@@ -295,7 +295,6 @@ fn nil_coalescing_with_a_named_default_keeps_the_left_type() {
 }
 
 #[test]
-#[ignore = "known failing (ft-8ca270ad): cross-file extension typealias binds a top-level namesake; needs cross-file knowledge in the resolver (S5)"]
 fn a_typealias_in_an_extension_in_another_file_is_not_the_top_level_type() {
     let entry = ("entry.swift", "struct Entry { func weight() -> Int { 3 } }\n");
     let ext = ("hostext.swift", "extension Host { typealias Entry = Item }\n");

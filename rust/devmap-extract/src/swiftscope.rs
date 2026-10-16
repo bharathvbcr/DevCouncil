@@ -107,6 +107,13 @@ fn file_index(from: Node, source: &str) -> Option<Rc<FileIndex>> {
         match node.kind() {
             "function_declaration" => index_function(node, source, &mut built),
             "class_declaration" => index_type(node, source, &mut built),
+            // A protocol is a declared type too; it has no stored members here.
+            "protocol_declaration" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    let name = get_node_text(name, source);
+                    built.declared.entry(name.clone()).or_default().push(name);
+                }
+            }
             "typealias_declaration" => {
                 if let Some(name) = node.child_by_field_name("name") {
                     built.aliases.insert(get_node_text(name, source));
@@ -589,7 +596,7 @@ fn lambda_parameters(
     for ty in annotated.iter_mut() {
         if ty
             .as_deref()
-            .is_some_and(|ty| names_alias(scope, source, ty))
+            .is_some_and(|ty| unreadable_type(scope, source, ty))
         {
             *ty = None;
         }
@@ -900,10 +907,16 @@ fn resolve_type(index: &FileIndex, from: Node, source: &str, short: &str) -> Opt
     None
 }
 
-/// Whether a written type names something this file declares with `typealias`.
-fn names_alias(from: Node, source: &str, ty: &str) -> bool {
+/// Whether a written type cannot be taken for the nominal type of that name.
+///
+/// It can when this file declares a type of the name and no `typealias` of it.
+/// A name this file does not declare may be a member typealias an extension in
+/// another file introduces (`extension Host { typealias Entry = Item }`), which
+/// is another type than a top-level `Entry`; so it is not read.
+fn unreadable_type(from: Node, source: &str, ty: &str) -> bool {
     let bare = ty.trim_matches(['[', ']', '?']);
-    file_index(from, source).is_some_and(|index| index.aliases.contains(bare))
+    file_index(from, source)
+        .is_none_or(|index| index.aliases.contains(bare) || !index.declared.contains_key(bare))
 }
 
 fn enclosing_type(from: Node) -> Option<Node> {
@@ -978,7 +991,7 @@ fn expression_type(
     let ty = expression_type_unaliased(node, source, from, current, depth)?;
     // A nested `typealias Entry = Item` makes `Entry` another spelling of
     // `Item`, not the top-level `Entry` a name lookup would find.
-    (!names_alias(from, source, &ty)).then_some(ty)
+    (!unreadable_type(from, source, &ty)).then_some(ty)
 }
 
 /// Whether a call passes no arguments and no trailing closure.
@@ -1751,6 +1764,26 @@ mod tests {
              func f() {{ let g: (Step) -> Void = {{ $0.weight() }}; _ = g }}"
         );
         assert_eq!(ty_of(&lambda_bound(&annotated, 0), "$0"), None);
+    }
+
+    #[test]
+    fn an_element_type_this_file_does_not_declare_is_not_read() {
+        // `Entry` may be a member typealias an extension elsewhere introduces.
+        let undeclared =
+            "struct Host { var items: [Entry]\n func run() { items.forEach { $0.weight() } } }";
+        assert_eq!(ty_of(&lambda_bound(undeclared, 0), "$0"), None);
+        let declared = "struct Entry { func weight() -> Int { 1 } }\n\
+             struct Host { var items: [Entry]\n func run() { items.forEach { $0.weight() } } }";
+        assert_eq!(
+            ty_of(&lambda_bound(declared, 0), "$0"),
+            Some("Entry".to_string())
+        );
+        let protocol = "protocol P { func weight() -> Int }\n\
+             struct Host { var items: [P]\n func run() { items.forEach { $0.weight() } } }";
+        assert_eq!(
+            ty_of(&lambda_bound(protocol, 0), "$0"),
+            Some("P".to_string())
+        );
     }
 
     #[test]
