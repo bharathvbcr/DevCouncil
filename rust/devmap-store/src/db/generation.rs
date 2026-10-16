@@ -1316,6 +1316,67 @@ generation {latest}; run `devmap status` to re-verify",
             })
     }
 
+    /// Files of the latest generation whose stored parse outcome is still a
+    /// wall-clock budget refusal, after the build's serial retry.
+    ///
+    /// The parse budget is a fact about the machine's load as much as about the
+    /// file, and `ParseOutcome::Failed` is the only place it is recorded (a new
+    /// variant would be a schema change), so `coverage_gaps.parse_failed` lists
+    /// these beside grammar faults even though only these are cured by building
+    /// again. Read straight from `generation_files.parse_outcome_json` by the
+    /// reason's [`devmap_extract::model::BUDGET_REFUSAL_PREFIX`] — the same test
+    /// `Extraction::is_budget_refusal` applies — in one snapshot with the
+    /// generation id, so a file deleted or re-parsed since is simply absent.
+    /// The listing is capped at [`crate::COVERAGE_GAP_SAMPLE`] and carries its
+    /// total. `None` when the store holds no generation: nothing was measured.
+    pub fn latest_budget_refusals(&self) -> Result<Option<CoverageGapSample>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(None);
+        };
+        let prefix = devmap_extract::model::BUDGET_REFUSAL_PREFIX;
+        // `substr` rather than `LIKE`: the prefix is compared literally and
+        // case-sensitively, as `starts_with` does.
+        let matched = "json_extract(f.parse_outcome_json, '$.Failed.reason') IS NOT NULL
+               AND substr(json_extract(f.parse_outcome_json, '$.Failed.reason'), 1, ?2) = ?3";
+        let total: i64 = snapshot.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM generation_files f
+                 WHERE f.generation_id = ?1 AND {matched}"
+            ),
+            params![generation, prefix.chars().count() as i64, prefix],
+            |row| row.get(0),
+        )?;
+        let mut page = snapshot.prepare(&format!(
+            "SELECT p.path, json_extract(f.parse_outcome_json, '$.Failed.reason')
+             FROM generation_files f
+             JOIN paths p ON p.id = f.file_id
+             WHERE f.generation_id = ?1 AND {matched}
+             ORDER BY p.path ASC
+             LIMIT ?4"
+        ))?;
+        let shown = page
+            .query_map(
+                params![
+                    generation,
+                    prefix.chars().count() as i64,
+                    prefix,
+                    crate::COVERAGE_GAP_SAMPLE as i64
+                ],
+                |row| {
+                    Ok(CoverageGapRow {
+                        path: row.get(0)?,
+                        reason: row.get(1)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(CoverageGapSample {
+            total: total.max(0) as usize,
+            shown,
+        }))
+    }
+
     /// Stored edges of the latest generation whose confidence contradicts the
     /// resolution kind recorded for them, counted in SQL.
     ///

@@ -337,10 +337,42 @@ pub(crate) fn store_status_fields(
             Some(format!("timeout: {reason}"))
         }
     };
+    // Files still refused for the wall-clock parse budget after the build's
+    // serial retry. Stored as an ordinary `Failed` outcome, so the analysis
+    // status above counts them as "failed to parse" like a grammar fault; but
+    // the cause is the machine's load and the cure is building again, which is
+    // the distinction an operator needs. Surfaced as its own listing and its
+    // own clause rather than a new value of any existing field, so a consumer
+    // that matches `degraded_reason` or `coverage_gaps` keys is unaffected.
+    let budget_refused = store.latest_budget_refusals()?;
+    let budget_degraded = budget_refused
+        .as_ref()
+        .filter(|sample| sample.total > 0)
+        .map(|sample| {
+            format!(
+                "budget-degraded: {} file(s) refused for the parse budget after the serial \
+                 retry (load-dependent, not a grammar fault; rebuild when the machine is idle)",
+                sample.total
+            )
+        });
     let degraded_reason = devmap_analyze::combine_reasons(
-        devmap_serve::freshness_degraded_reason(&status),
-        analysis_degraded,
+        devmap_analyze::combine_reasons(
+            devmap_serve::freshness_degraded_reason(&status),
+            analysis_degraded,
+        ),
+        budget_degraded,
     );
+    let budget_refused_json = budget_refused.as_ref().map(|sample| {
+        serde_json::json!({
+            "total": sample.total,
+            "shown": sample.shown.len(),
+            "truncated": sample.truncated(),
+            "paths": sample.shown.iter().map(|row| serde_json::json!({
+                "path": row.path,
+                "reason": row.reason,
+            })).collect::<Vec<_>>(),
+        })
+    });
     let serde_json::Value::Object(fields) = serde_json::json!({
         "generation_id": status.latest_generation,
         "pending_count": status.pending_count,
@@ -368,6 +400,10 @@ pub(crate) fn store_status_fields(
         // opening the database. Rendered by `devmap_serve::coverage_gaps_json`,
         // shared with the daemon's own `status`.
         "coverage_gaps": devmap_serve::coverage_gaps_json(&status),
+        // The budget-refused subset of `coverage_gaps.parse_failed`, capped
+        // with its total. `null` when no generation was measured; `total: 0`
+        // is a measurement.
+        "budget_refused": budget_refused_json,
         // Whether this generation's edges carry the evidence the resolver
         // recorded, or a reconstruction standing in for one it never stored.
         // `null` when there is no generation or it holds no edges — which is

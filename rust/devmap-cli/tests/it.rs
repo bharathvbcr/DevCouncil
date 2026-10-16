@@ -71,6 +71,7 @@ mod secret_paths_stay_out_of_answers_and_artifacts;
 mod small_native_stack;
 mod standalone_namespace;
 mod state_discovery_contract;
+mod status_names_budget_refused_files;
 mod status_names_what_it_could_not_read;
 mod suspects_names_the_commit;
 mod test_code_graph_artifact;

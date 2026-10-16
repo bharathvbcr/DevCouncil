@@ -2,8 +2,8 @@ use super::Store;
 #[cfg(feature = "parse")]
 use super::{
     bucket_identities, charge, claim_matching_candidate, decode_stored_outcome, edge_tuple,
-    lock_conn, refusal, stored_is_parse_failure, validate_head_sha, EdgeTuple, GenerationWriteOpts,
-    RowSetDigest, StoredPayload, UnresolvedTuple, WriteBreakdown,
+    is_budget_refusal_json, lock_conn, refusal, stored_is_parse_failure, validate_head_sha,
+    EdgeTuple, GenerationWriteOpts, RowSetDigest, StoredPayload, UnresolvedTuple, WriteBreakdown,
 };
 #[cfg(feature = "parse")]
 use crate::schema::BUILD_HISTORY_RETENTION;
@@ -55,9 +55,9 @@ impl Store {
             engine_json,
             extraction_json,
         } = payload;
-        if let Some(id) = tx
+        if let Some((id, stored_outcome)) = tx
             .prepare_cached(
-                "SELECT payload_id FROM file_payloads
+                "SELECT payload_id, parse_outcome_json FROM file_payloads
                   WHERE file_id = ?1 AND content_hash = ?2 AND language = ?3
                     AND COALESCE(grammar_version, '') = ?4
                     AND COALESCE(analyzer_version, '') = ?5",
@@ -70,10 +70,33 @@ impl Store {
                     grammar_version,
                     analyzer_version
                 ],
-                |row| row.get::<_, i64>(0),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?
         {
+            // The key names the content and the extractor, and a wall-clock
+            // budget refusal is neither: it is the machine's load at the
+            // moment of the build. Sharing the row would make that refusal
+            // permanent -- a later build that parsed the same bytes would
+            // store its generation's nodes and still read `Failed` back from
+            // the payload, so `status` would name a file the graph holds. The
+            // unique index admits one row per identity, so the recovered
+            // extraction replaces the refused one in place.
+            if is_budget_refusal_json(&stored_outcome)
+                && !is_budget_refusal_json(parse_outcome_json)
+            {
+                tx.prepare_cached(
+                    "UPDATE file_payloads
+                        SET parse_outcome_json = ?2, engine_json = ?3, extraction_json = ?4
+                      WHERE payload_id = ?1",
+                )?
+                .execute(params![
+                    id,
+                    parse_outcome_json,
+                    engine_json,
+                    extraction_json
+                ])?;
+            }
             return Ok(id);
         }
         tx.prepare_cached(
