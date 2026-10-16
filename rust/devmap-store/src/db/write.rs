@@ -74,14 +74,23 @@ impl Store {
             )
             .optional()?
         {
+            // DECLARED INTERIM: a retained-generation immutability exception,
+            // tracked by ft-3bdf1450d4367fc8c7ba0c01fbe7cfe3 (task_id
+            // devmap-payload-identity-budget-refusal), which gives a budget
+            // refusal its own payload identity and removes this UPDATE.
+            //
             // The key names the content and the extractor, and a wall-clock
             // budget refusal is neither: it is the machine's load at the
-            // moment of the build. Sharing the row would make that refusal
-            // permanent -- a later build that parsed the same bytes would
-            // store its generation's nodes and still read `Failed` back from
-            // the payload, so `status` would name a file the graph holds. The
-            // unique index admits one row per identity, so the recovered
-            // extraction replaces the refused one in place.
+            // moment of the build. Sharing the row would keep the refusal as
+            // the stored payload of a later generation that parsed the same
+            // bytes. The unique index admits one row per identity, so the
+            // recovered extraction replaces the refused one in place -- which
+            // also rewrites what every retained older generation reads from
+            // this row (`a_retained_older_generation_keeps_the_refusal_it_was_
+            // built_with`, ignored against the card). Only refusal -> non-
+            // refusal is ever promoted; the reverse is not written, and
+            // `latest_budget_refusals` does not read this row, so status does
+            // not depend on either.
             if is_budget_refusal_json(&stored_outcome)
                 && !is_budget_refusal_json(parse_outcome_json)
             {

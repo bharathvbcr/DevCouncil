@@ -15,6 +15,7 @@
 //!   as a separate target or silently skipped: `every_test_file_is_a_module`
 //!   fails until it is declared here or isolated.
 
+mod a_budget_refused_file_is_re_extracted_by_the_next_build;
 mod a_message_literal_has_no_run_of_spaces;
 mod a_named_root_must_be_a_directory;
 mod a_one_file_edit_writes_one_file_of_rows;

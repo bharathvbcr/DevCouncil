@@ -13,6 +13,16 @@ use rusqlite::{params, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+/// The coverage-gap label a budget refusal is stored under: it is a
+/// `ParseOutcome::Failed`, so it lands in `parse_failed` beside grammar faults.
+const PARSE_FAILED_GAP: &str = "parse_failed";
+
+/// `?1` generation, `?2` gap label, `?3` prefix length, `?4` prefix. `substr`
+/// rather than `LIKE`: the prefix is compared literally and case-sensitively,
+/// as `starts_with` does.
+const BUDGET_GAP_FILTER: &str = "generation_id = ?1 AND gap = ?2
+               AND substr(reason, 1, ?3) = ?4";
+
 impl Store {
     /// Most recent builds, newest first. `limit` is clamped to the retention cap.
     pub fn build_history(&self, limit: usize) -> Result<Vec<BuildHistoryRow>> {
@@ -1316,17 +1326,22 @@ generation {latest}; run `devmap status` to re-verify",
             })
     }
 
-    /// Files of the latest generation whose stored parse outcome is still a
-    /// wall-clock budget refusal, after the build's serial retry.
+    /// Files of the latest generation that were refused for the wall-clock
+    /// parse budget, after the build's serial retry.
     ///
     /// The parse budget is a fact about the machine's load as much as about the
     /// file, and `ParseOutcome::Failed` is the only place it is recorded (a new
     /// variant would be a schema change), so `coverage_gaps.parse_failed` lists
     /// these beside grammar faults even though only these are cured by building
-    /// again. Read straight from `generation_files.parse_outcome_json` by the
+    /// again. Read from the generation's `parse_failed` coverage-gap rows by the
     /// reason's [`devmap_extract::model::BUDGET_REFUSAL_PREFIX`] — the same test
-    /// `Extraction::is_budget_refusal` applies — in one snapshot with the
-    /// generation id, so a file deleted or re-parsed since is simply absent.
+    /// `Extraction::is_budget_refusal` applies. Those rows are a per-generation
+    /// snapshot of the live extraction, **not** `generation_files`, which is a
+    /// view over `file_payloads` rows shared by every generation naming the same
+    /// file, content and extractor: reading the payload would report whatever the
+    /// last writer left there rather than what this generation was built from.
+    /// One snapshot with the generation id, so a file deleted or re-parsed since
+    /// is simply absent.
     /// The listing is capped at [`crate::COVERAGE_GAP_SAMPLE`] and carries its
     /// total. `None` when the store holds no generation: nothing was measured.
     pub fn latest_budget_refusals(&self) -> Result<Option<CoverageGapSample>> {
@@ -1335,30 +1350,27 @@ generation {latest}; run `devmap status` to re-verify",
             return Ok(None);
         };
         let prefix = devmap_extract::model::BUDGET_REFUSAL_PREFIX;
-        // `substr` rather than `LIKE`: the prefix is compared literally and
-        // case-sensitively, as `starts_with` does.
-        let matched = "json_extract(f.parse_outcome_json, '$.Failed.reason') IS NOT NULL
-               AND substr(json_extract(f.parse_outcome_json, '$.Failed.reason'), 1, ?2) = ?3";
         let total: i64 = snapshot.query_row(
-            &format!(
-                "SELECT COUNT(*) FROM generation_files f
-                 WHERE f.generation_id = ?1 AND {matched}"
-            ),
-            params![generation, prefix.chars().count() as i64, prefix],
+            &format!("SELECT COUNT(*) FROM generation_coverage_gaps WHERE {BUDGET_GAP_FILTER}"),
+            params![
+                generation,
+                PARSE_FAILED_GAP,
+                prefix.chars().count() as i64,
+                prefix
+            ],
             |row| row.get(0),
         )?;
         let mut page = snapshot.prepare(&format!(
-            "SELECT p.path, json_extract(f.parse_outcome_json, '$.Failed.reason')
-             FROM generation_files f
-             JOIN paths p ON p.id = f.file_id
-             WHERE f.generation_id = ?1 AND {matched}
-             ORDER BY p.path ASC
-             LIMIT ?4"
+            "SELECT path, reason FROM generation_coverage_gaps
+             WHERE {BUDGET_GAP_FILTER}
+             ORDER BY path ASC
+             LIMIT ?5"
         ))?;
         let shown = page
             .query_map(
                 params![
                     generation,
+                    PARSE_FAILED_GAP,
                     prefix.chars().count() as i64,
                     prefix,
                     crate::COVERAGE_GAP_SAMPLE as i64
@@ -1375,6 +1387,33 @@ generation {latest}; run `devmap status` to re-verify",
             total: total.max(0) as usize,
             shown,
         }))
+    }
+
+    /// Every path [`Self::latest_budget_refusals`] counts, uncapped.
+    ///
+    /// For the build, which must re-extract all of them: a capped read would
+    /// leave the files past fifty refused for good. Bounded by the corpus.
+    pub fn latest_budget_refused_paths(&self) -> Result<Vec<String>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(Vec::new());
+        };
+        let prefix = devmap_extract::model::BUDGET_REFUSAL_PREFIX;
+        let mut stmt = snapshot.prepare(&format!(
+            "SELECT path FROM generation_coverage_gaps
+             WHERE {BUDGET_GAP_FILTER}
+             ORDER BY path ASC"
+        ))?;
+        let rows = stmt.query_map(
+            params![
+                generation,
+                PARSE_FAILED_GAP,
+                prefix.chars().count() as i64,
+                prefix
+            ],
+            |row| row.get::<_, String>(0),
+        )?;
+        rows.collect()
     }
 
     /// Stored edges of the latest generation whose confidence contradicts the

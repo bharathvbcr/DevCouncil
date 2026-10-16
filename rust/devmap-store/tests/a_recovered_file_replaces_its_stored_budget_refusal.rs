@@ -27,6 +27,34 @@ fn commit(store: &Store, extractions: &[Extraction]) {
         .unwrap();
 }
 
+/// `latest_budget_refusals` reads the `parse_failed` gap rows by the reason's
+/// prefix. Pin the two facts it relies on: the stored label is the one the
+/// analysis names, and the stored reason really starts with the prefix.
+#[test]
+fn the_stored_parse_failed_gap_reason_carries_the_budget_prefix() {
+    let store = Store::open_in_memory().unwrap();
+    commit(
+        &store,
+        &[extract_file_with_budget(PATH, SRC, Duration::ZERO)],
+    );
+    let status = store.status(":memory:").unwrap();
+    let rows = &status.coverage_gaps.parse_failed.shown;
+    assert_eq!(rows.len(), 1, "{:?}", status.coverage_gaps);
+    assert!(
+        rows[0]
+            .reason
+            .starts_with(devmap_extract::model::BUDGET_REFUSAL_PREFIX),
+        "{}",
+        rows[0].reason
+    );
+    assert_eq!(
+        devmap_analyze::ExtractionGap::ParseFailed.label(),
+        "parse_failed"
+    );
+    assert_eq!(store.latest_budget_refusals().unwrap().unwrap().total, 1);
+    assert_eq!(store.latest_budget_refused_paths().unwrap(), [PATH]);
+}
+
 #[test]
 fn a_recovered_extraction_replaces_the_stored_refusal_for_identical_bytes() {
     let store = Store::open_in_memory().unwrap();
