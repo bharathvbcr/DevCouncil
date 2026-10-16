@@ -7,15 +7,15 @@
   },
   "kotlin": {
     "forbid_any_tier_rows": 3,
-    "known_failing": 3,
-    "positive_rows": 62,
+    "known_failing": 9,
+    "positive_rows": 68,
     "present": 61
   },
   "python": {
     "forbid_any_tier_rows": 2,
-    "known_failing": 3,
-    "positive_rows": 49,
-    "present": 48
+    "known_failing": 13,
+    "positive_rows": 61,
+    "present": 50
   },
   "rust": {
     "forbid_any_tier_rows": 1,

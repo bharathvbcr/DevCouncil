@@ -42,3 +42,16 @@ truly_dead	lib/pkg/typed_user.py::Sized.size	SH1/SH2 fixture; nothing calls it
 truly_dead	lib/pkg/typed_user.py::local_shadow	SH1/SH2 fixture; nothing calls it
 truly_dead	other/typing_namesakes.py::shadowed_target	SH2: the only call site is shadowed by a local lambda in local_shadow
 # Once ft-0e6cc90f lands, other/typing_namesakes.py::Literal and ::Protocol lose their false callers and dead will report them: the fixer must label them here.
+truly_dead	micro/zqpkg/calls.py::use_call_result	caller probe nothing calls
+truly_dead	micro/zqpkg/calls.py::use_function_attribute	caller probe nothing calls
+truly_dead	micro/zqpkg/calls.py::use_tuple_unpack	caller probe nothing calls
+truly_dead	micro/zqpkg/run.py::run_plain	caller probe nothing calls
+truly_dead	micro/zqpkg/run.py::run_data	caller probe nothing calls
+truly_dead	micro/zqpkg/run.py::run_slots	caller probe nothing calls
+truly_dead	micro/zqpkg/run.py::run_single	caller probe nothing calls
+truly_dead	micro/zqpkg/run.py::run_param	caller probe nothing calls
+truly_dead	micro/zqpkg/run.py::run_param_plainlog	caller probe nothing calls
+truly_dead	micro/zqpkg/step_a.py::build_a	caller probe nothing calls
+truly_dead	micro/zqpkg/step_c.py::build_c	caller probe nothing calls
+truly_dead	micro/zqpkg/step_b.py::use_b	caller probe nothing calls
+truly_dead	micro/zqpkg/anchors.py::anchor	caller probe nothing calls

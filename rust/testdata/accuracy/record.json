@@ -1709,41 +1709,41 @@
         "truly_dead": 1
       },
       "devmap_commit": "2286fc440d486aa9beae370bcfa8ca8b9266d385",
-      "expected_edge_rows": 62,
+      "expected_edge_rows": 68,
       "forbid_any_tier_rows": 3,
-      "forbid_rows": 8,
+      "forbid_rows": 10,
       "high_edges_correct": 58,
       "high_edges_false": 2,
       "honest_miss": {
-        "absent": 1,
+        "absent": 7,
         "rate": 1.0,
-        "recorded": 1
+        "recorded": 7
       },
       "precision_at_0.9": 0.967,
       "present": 61,
-      "recall": 0.984
+      "recall": 0.897
     },
     "python": {
       "dead": {
         "confident_false": 0,
-        "confident_rows": 26,
-        "found": 29,
-        "truly_dead": 29
+        "confident_rows": 39,
+        "found": 42,
+        "truly_dead": 42
       },
       "devmap_commit": "2286fc440d486aa9beae370bcfa8ca8b9266d385",
-      "expected_edge_rows": 49,
+      "expected_edge_rows": 61,
       "forbid_any_tier_rows": 2,
-      "forbid_rows": 14,
-      "high_edges_correct": 39,
+      "forbid_rows": 16,
+      "high_edges_correct": 41,
       "high_edges_false": 2,
       "honest_miss": {
-        "absent": 1,
+        "absent": 11,
         "rate": 1.0,
-        "recorded": 1
+        "recorded": 11
       },
-      "precision_at_0.9": 0.951,
-      "present": 48,
-      "recall": 0.98
+      "precision_at_0.9": 0.953,
+      "present": 50,
+      "recall": 0.82
     },
     "rust": {
       "dead": {
