@@ -8,9 +8,25 @@
 kotlin-gaps	kg.G1	false_edge	ft-0e6cc90f	needs resolver.rs (held by S5) | today: forbidden HIGH edge to gaps/util/Strings.kt::getString
 kotlin-gaps	kg.OV1	false_edge	ft-0720fe1d	needs resolver.rs (held by S5 worktree) | two overloads share one symbol id Calc.add, so add(String) -> add(Int) is emitted as a SameFile Calc.add -> Calc.add self-edge
 kotlin-gaps	kg.OV2	miss	ft-0720fe1d	needs resolver.rs (held by S5 worktree) | no c.add(..) call edge from useCalc today (cause inferred: two same-name candidates; unverified)
+kotlin-gaps	kg.Z1	miss	ft-0720fe1d	recall characterization: local initialised by a stdlib String method; stdlib return types are not modelled; needs resolver.rs/treesitter.rs (S5 held) | today: absent, recorded as an honest unresolved row
+kotlin-gaps	kg.Z2	miss	ft-0720fe1d	recall characterization: lambda parameter typed by the callee's function-type parameter; needs treesitter.rs binding | today: absent, recorded as an honest unresolved row
+kotlin-gaps	kg.Z3	miss	ft-0720fe1d	recall characterization: if-expression local with a generic List receiver (admissible_nominal_type refuses generics, resolver.rs:2116) | today: absent, recorded as an honest unresolved row
+kotlin-gaps	kg.Z4	miss	ft-0720fe1d	recall characterization: member initialised by an expression-body function with no written return type (return_types holds written types only, resolver.rs:439) | today: absent, recorded as an honest unresolved row
+kotlin-gaps	kg.Z5	miss	ft-0720fe1d	recall characterization: explicit type argument of a reified factory naming an interface (unique_indexed_type is Class/Struct only, resolver.rs:724) | today: absent, recorded as an honest unresolved row
+kotlin-gaps	kg.Z6	miss	ft-0720fe1d	recall characterization: T::class.java argument types the result (Hilt EntryPoint idiom); interface target | today: absent, recorded as an honest unresolved row
 python	py.C23b	miss	ft-c666ba7c	edge if fixture return typed; honest miss acceptable | today: absent today, recorded as an honest unresolved row
 python	py.SH1a	false_edge	ft-0e6cc90f	needs resolver.rs (held by S5) | today: forbidden edge at any tier to other/typing_namesakes.py::Literal at 900
 python	py.SH1b	false_edge	ft-0e6cc90f	needs resolver.rs (held by S5) | today: forbidden edge at any tier to other/typing_namesakes.py::Protocol at 900
+python	py.Z1	miss	ft-c666ba7c	recall characterization: function-local super() whose class name two files declare; type_name_is_identifiable refuses a flat name (resolver.rs:7500, pytypes.rs:105); needs resolver.rs (S5 held) | today: absent, recorded as an honest unresolved row
+python	py.Z2	miss	ft-c666ba7c	recall characterization: same as py.Z1, second file's base | today: absent, recorded as an honest unresolved row
+python	py.Z3	miss	ft-c666ba7c	recall characterization: f(x).m() receiver is reduced to the callee text (treesitter.rs:6947), indistinguishable from f.m(); needs treesitter.rs (S5 held) | today: absent, recorded as an honest unresolved row
+python	py.Z4	miss	ft-c666ba7c	recall characterization: tuple-unpack of an unannotated helper's returned constructor locals; needs return-flow inference | today: absent, recorded as an honest unresolved row
+python	py.Z5	miss	ft-c666ba7c	recall characterization: pytest fixture parameter typed by the fixture's return annotation; fixtures are read for liveness only (treesitter.rs:10038) | today: absent, recorded as an honest unresolved row
+python	py.Z6a	miss	ft-c666ba7c	recall characterization: class-body field annotation loss_log: T is never bound as a field type (assigned_to is set for parameters only, treesitter.rs:9002); needs treesitter.rs (S5 held) | today: absent, recorded as an honest unresolved row
+python	py.Z6b	miss	ft-c666ba7c	recall characterization: same through a @dataclass field | today: absent, recorded as an honest unresolved row
+python	py.Z6c	miss	ft-c666ba7c	recall characterization: same through @dataclass(frozen=True, slots=True) | today: absent, recorded as an honest unresolved row
+python	py.Z6d	miss	ft-c666ba7c	recall characterization: same, root typed by a parameter annotation | today: absent, recorded as an honest unresolved row
+python	py.Z6e	miss	ft-c666ba7c	recall characterization: same, field read into a local first | today: absent, recorded as an honest unresolved row
 rust	rs.c04	miss	ft-f9665721	blanket impl on i32 literal | today: absent today, recorded as an honest unresolved row
 rust	rs.c24b	silent_miss	ft-f9665721	 | today: no ledger row names {"helper_c24"}
 rust	rs.c26e	silent_miss	ft-f9665721	operator/Drop/From trait use is implicit; honest miss expected | today: no ledger row names {"from"}

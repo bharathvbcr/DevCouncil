@@ -70,3 +70,17 @@ py.C26	C26	tests/test_core.py	lib/pkg/util.py	import	must		Imports edge via pyte
 py.SH1a	SH1	lib/pkg/typed_user.py::pick	other/typing_namesakes.py::Literal	forbid_any_tier	must		from typing import Literal binds past the in-repo namesake
 py.SH1b	SH1	lib/pkg/typed_user.py::Sized	other/typing_namesakes.py::Protocol	forbid_any_tier	must		class Sized(Protocol) with typing.Protocol imported
 py.SH2	SH2	lib/pkg/typed_user.py::local_shadow	other/typing_namesakes.py::shadowed_target	forbid	must		local variable shadows the in-repo function and is called
+py.Z1	Z1	micro/zqpkg/step_a.py::ZqNan.accumulate	micro/zqpkg/base.py::ZqBase.accumulate	edge	must		super().accumulate() in a function-local class whose name another file also declares reads its own file's bases
+py.Z2	Z1	micro/zqpkg/step_b.py::ZqNan.accumulate	micro/zqpkg/base.py::ZqBaseB.accumulate	edge	must		module-level class of the same name in the second file reaches that file base
+py.Z2.not	Z1	micro/zqpkg/step_a.py::ZqNan.accumulate	micro/zqpkg/base.py::ZqBaseB.accumulate	forbid	must		the namesake class in the other file has a different base: its accumulate is not this super()
+py.Z3	Z3	micro/zqpkg/calls.py::use_call_result	micro/zqpkg/base.py::ZqTable.digest_of	edge	must		make_table([1]).digest_of(): receiver is a call of a module function annotated -> ZqTable
+py.Z3.not	Z3	micro/zqpkg/calls.py::use_function_attribute	micro/zqpkg/base.py::ZqTable.cache_clear	forbid	must		make_table.cache_clear() reads an attribute of the function object, not of the ZqTable it returns
+py.Z4	Z4	micro/zqpkg/calls.py::use_tuple_unpack	micro/zqpkg/base.py::ZqTable.digest_of	edge	must		table, other = unannotated_pair(): the helper has no annotation, its returned tuple is built from constructor locals
+py.Z5	Z5	micro/zqpkg/test_zq.py::test_zq_launches	micro/zqpkg/test_zq.py::ZqEnv.launch	edge	must		pytest fixture parameter with no annotation, fixture declared -> ZqEnv
+py.Z6a	Z6	micro/zqpkg/run.py::run_plain	micro/zqpkg/trainer.py::ZqLogPlain.losses	edge	must		result = train_plain(); result.loss_log.losses(): plain class field annotated ZqLogPlain
+py.Z6b	Z6	micro/zqpkg/run.py::run_data	micro/zqpkg/trainer.py::ZqLog.losses	edge	must		same through a @dataclass field
+py.Z6c	Z6	micro/zqpkg/run.py::run_slots	micro/zqpkg/trainer.py::ZqLogSlots.losses	edge	must		same through @dataclass(frozen=True, slots=True)
+py.Z6.ctl	Z6	micro/zqpkg/run.py::run_single	micro/zqpkg/trainer.py::ZqLogPlain.losses	edge	must		control: a factory returning the log class directly (no field hop) resolves today, so the Z6 failures are the class-body field annotation
+py.Z6d	Z6	micro/zqpkg/run.py::run_param	micro/zqpkg/trainer.py::ZqLogPlain.losses	edge	must		typed parameter then field hop: the parameter is typed, the class-body field annotation loss_log: ZqLogPlain is not bound
+py.Z6e	Z6	micro/zqpkg/run.py::run_param_plainlog	micro/zqpkg/trainer.py::ZqLogPlain.losses	edge	must		log = result.loss_log then log.losses(): the field type is the missing fact
+py.Z1.ctl	Z1	micro/zqpkg/step_c.py::ZqUniq.accumulate	micro/zqpkg/base.py::ZqBase.accumulate	edge	must		control: the same function-local super() with a corpus-unique class name resolves today, so Z1/Z2 fail on the duplicated class name
