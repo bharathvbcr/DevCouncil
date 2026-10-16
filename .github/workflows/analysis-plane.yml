@@ -222,6 +222,32 @@ jobs:
           echo "$out" | grep -q -- '--- PASS: TestTheLiveContractHolds' || {
             echo "::error::TestTheLiveContractHolds did not run"; exit 1; }
 
+      # The flag table and the state-dir port also drive the real devmap.
+      # testsupport.Devmap fails when the binary cannot be built, and skips
+      # only when DEVCOUNCIL_TEST_ALLOW_SKIP=1. A skip there is the same hole
+      # as a skipped TestTheLive*: the job would be green without having
+      # spoken to the producer. Name both tests, and fail if either skips.
+      - name: Flag and state-dir contracts must have run
+        working-directory: backend/go_orchestrator
+        run: |
+          set +e
+          out="$(go test ./cmd/devcouncil/ ./repomap/ -count=1 -run '^(TestDevmapGlobalFlagTablesMatchTheRealBinary|TestStateDirAgreesWithDevmapOnEveryRung)$' -v 2>&1)"
+          status="$?"
+          set -e
+          echo "$out"
+          if [ "$status" -ne 0 ]; then
+            echo "::error::flag-table or state-dir contract failed"
+            exit 1
+          fi
+          if echo "$out" | grep -q -- '--- SKIP'; then
+            echo "::error::flag-table or state-dir contract skipped; the producer was never driven"
+            exit 1
+          fi
+          echo "$out" | grep -q -- '--- PASS: TestDevmapGlobalFlagTablesMatchTheRealBinary' || {
+            echo "::error::TestDevmapGlobalFlagTablesMatchTheRealBinary did not run"; exit 1; }
+          echo "$out" | grep -q -- '--- PASS: TestStateDirAgreesWithDevmapOnEveryRung' || {
+            echo "::error::TestStateDirAgreesWithDevmapOnEveryRung did not run"; exit 1; }
+
   # The Go host on Windows. Windows-only paths (quoted path handling in hook
   # cleanup, integrate writes, separators in reported paths) never ran in CI:
   # the `go` job above is Unix only. Gusset is Unix only, so on Windows the
