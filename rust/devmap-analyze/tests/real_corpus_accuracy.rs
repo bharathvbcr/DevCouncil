@@ -50,7 +50,7 @@ mod common;
 
 use common::Built;
 use devmap_analyze::{CONFIDENT_TIER_UNPROVEN, HIGHEST_DEGRADED_CONFIDENCE};
-use devmap_extract::model::EdgeKind;
+use devmap_extract::model::{EdgeKind, SymbolKind};
 use devmap_resolve::UNATTRIBUTED_LABELS;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -265,6 +265,25 @@ struct Labels {
     recall: Vec<RecallLabel>,
     /// A dead-code row a reader classified.
     dead: Vec<DeadLabel>,
+    /// What a type checker bound, per language: judges every confident edge
+    /// from a caller it read, with no per-edge label.
+    oracle: Vec<OracleLabel>,
+}
+
+/// A type checker's account of one language: every use of an in-repo function
+/// or method it bound, from every caller it read. Unlike [`EdgeLabel`] it is a
+/// function of the corpus alone, so it does not go stale when DevMap's edges
+/// move: an edge is judged right when the oracle bound the same pair, wrong
+/// when it did not.
+#[derive(Debug)]
+struct OracleLabel {
+    language: String,
+    /// Every caller id the oracle read. An edge from any other caller (a
+    /// build-tagged file the oracle did not load) is not judged at all.
+    covered_callers: BTreeSet<String>,
+    /// `(caller, callee)` for every use the oracle bound; an interface method
+    /// use also binds the caller to each in-repo implementation.
+    uses: BTreeSet<(String, String)>,
 }
 
 #[derive(Debug)]
@@ -283,7 +302,8 @@ struct RecallLabel {
     caller: String,
     /// The name written at the call site.
     name: String,
-    /// The true in-repo callee symbol id.
+    /// The true in-repo callee symbol id; `a|b` when an edge to any one of
+    /// them is the call (an interface method or one of its implementations).
     truth: String,
 }
 
@@ -328,6 +348,42 @@ fn parse_labels(raw: &str) -> Result<Labels, String> {
             truly_dead: o["truly_dead"]
                 .as_bool()
                 .ok_or_else(|| format!("label {o} has no bool truly_dead"))?,
+        });
+    }
+    let strings = |o: &Value, k: &str| -> Result<Vec<String>, String> {
+        o[k].as_array()
+            .ok_or_else(|| format!("oracle entry has no array {k:?}"))?
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("oracle {k:?} holds a non-string: {v}"))
+            })
+            .collect()
+    };
+    for o in v["oracle"].as_array().into_iter().flatten() {
+        let language = text(o, "language")?;
+        let covered_callers: BTreeSet<String> =
+            strings(o, "covered_callers")?.into_iter().collect();
+        let mut uses = BTreeSet::new();
+        for u in o["uses"]
+            .as_array()
+            .ok_or_else(|| format!("oracle entry for {language} has no array \"uses\""))?
+        {
+            let caller = text(u, "caller")?;
+            if !covered_callers.contains(&caller) {
+                return Err(format!(
+                    "oracle use {u} is from a caller not in covered_callers"
+                ));
+            }
+            for callee in std::iter::once(text(u, "callee")?).chain(strings(u, "impls")?) {
+                uses.insert((caller.clone(), callee));
+            }
+        }
+        labels.oracle.push(OracleLabel {
+            language,
+            covered_callers,
+            uses,
         });
     }
     Ok(labels)
@@ -492,20 +548,84 @@ fn score_labels(
             .or_default()
             .push((u.callee_name.as_str(), u.class.label()));
     }
-    let mut dead_tier: BTreeMap<String, &'static str> = BTreeMap::new();
+    // Every dead row by id: its tier, and the language of its file.
+    let mut dead_tier: BTreeMap<String, (&'static str, String)> = BTreeMap::new();
     for r in built.analysis.dead_symbols.iter().filter(|r| !r.is_exempt) {
         let confident = f64::from(r.confidence) > f64::from(HIGHEST_DEGRADED_CONFIDENCE)
             || r.exemption_reason
                 .as_deref()
                 .is_some_and(|x| x.starts_with(CONFIDENT_TIER_UNPROVEN));
         let tier = if confident { "0.9" } else { "0.4" };
-        dead_tier.insert(format!("{}::{}", r.file_path, r.symbol_name), tier);
+        dead_tier.insert(
+            format!("{}::{}", r.file_path, r.symbol_name),
+            (tier, language_of(&r.file_path)),
+        );
+    }
+    // What an oracle judges: the strongest Calls/References edge per pair from
+    // a caller in `lang` to a function or method. Extends/Implements and the
+    // structural kinds are not uses a call-site oracle can see.
+    let callable: BTreeSet<&str> = built
+        .extractions
+        .iter()
+        .flat_map(|x| &x.symbols)
+        .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method))
+        .map(|s| s.qualified_name.as_str())
+        .collect();
+    let mut judgeable: BTreeMap<(&str, &str), (i64, &'static str, String)> = BTreeMap::new();
+    for e in built.resolution.edges.iter().filter(|e| {
+        matches!(e.edge_kind, EdgeKind::Calls | EdgeKind::References)
+            && callable.contains(e.target_symbol.as_str())
+    }) {
+        let kind = e.resolution.as_ref().map_or("none", |r| r.kind().label());
+        let millis = e.confidence.to_millis();
+        let entry = judgeable
+            .entry((e.source_symbol.as_str(), e.target_symbol.as_str()))
+            .or_insert((millis, kind, language_of(&e.source_file)));
+        if millis > entry.0 {
+            entry.0 = millis;
+            entry.1 = kind;
+        }
     }
 
     let mut out = BTreeMap::new();
     for lang in languages {
+        let has_labels = labels.edges.iter().any(|l| &l.language == lang)
+            || labels.recall.iter().any(|l| &l.language == lang)
+            || labels.dead.iter().any(|l| &l.language == lang)
+            || labels.oracle.iter().any(|l| &l.language == lang);
+        // Labels that say nothing about a pinned language leave it
+        // unmeasured: no row, so `claim_gates` reports it as such. An empty
+        // row would read as measured.
+        if !has_labels {
+            continue;
+        }
         let mut confident = Counts::default();
         let mut unique = Counts::default();
+        let hand_labelled: BTreeSet<(&str, &str)> = labels
+            .edges
+            .iter()
+            .filter(|l| &l.language == lang)
+            .map(|l| (l.caller.as_str(), l.callee.as_str()))
+            .collect();
+        for oracle in labels.oracle.iter().filter(|o| &o.language == lang) {
+            for ((caller, callee), (millis, kind, from)) in &judgeable {
+                if from != lang
+                    || hand_labelled.contains(&(*caller, *callee))
+                    || !oracle.covered_callers.contains(*caller)
+                {
+                    continue;
+                }
+                let correct = oracle
+                    .uses
+                    .contains(&((*caller).to_string(), (*callee).to_string()));
+                if *millis >= HIGH_MILLIS {
+                    confident.record(correct);
+                }
+                if *kind == "UniqueGlobal" {
+                    unique.record(correct);
+                }
+            }
+        }
         for l in labels.edges.iter().filter(|l| &l.language == lang) {
             let Some((millis, kind)) = edge_conf.get(&(l.caller.as_str(), l.callee.as_str()))
             else {
@@ -525,7 +645,10 @@ fn score_labels(
         let mut by_construct: BTreeMap<&str, Counts> = BTreeMap::new();
         let mut honest = Counts::default();
         for l in labels.recall.iter().filter(|l| &l.language == lang) {
-            let present = any_edge.contains(&(l.caller.as_str(), l.truth.as_str()));
+            let present = l
+                .truth
+                .split('|')
+                .any(|truth| any_edge.contains(&(l.caller.as_str(), truth)));
             by_construct
                 .entry(l.construct.as_str())
                 .or_default()
@@ -541,9 +664,32 @@ fn score_labels(
             }
         }
 
-        let mut dead_fp: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+        // The confident tier is always written, so a row has the shape
+        // `dead_tier_eligibility.rs` reads; `rows: 0` must then mean the
+        // confident branch was empty, so every row in it needs a label.
+        let mut dead_fp: BTreeMap<&str, (usize, usize)> = BTreeMap::from([("0.9", (0, 0))]);
+        let dead_labelled: BTreeSet<&str> = labels
+            .dead
+            .iter()
+            .filter(|l| &l.language == lang)
+            .map(|l| l.id.as_str())
+            .collect();
+        let unlabelled: Vec<&str> = dead_tier
+            .iter()
+            .filter(|(id, (tier, of))| {
+                *tier == "0.9" && of == lang && !dead_labelled.contains(id.as_str())
+            })
+            .map(|(id, _)| id.as_str())
+            .collect();
+        if !unlabelled.is_empty() {
+            return Err(format!(
+                "{} confident-branch dead row(s) of {lang} have no dead label, so the 0.9-tier rate would be over a subset; label them: {}",
+                unlabelled.len(),
+                unlabelled.join(", ")
+            ));
+        }
         for l in labels.dead.iter().filter(|l| &l.language == lang) {
-            if let Some(tier) = dead_tier.get(&l.id) {
+            if let Some((tier, _)) = dead_tier.get(&l.id) {
                 let entry = dead_fp.entry(tier).or_default();
                 entry.1 += 1;
                 entry.0 += usize::from(!l.truly_dead);
@@ -981,10 +1127,25 @@ fn measure_corpus(
     ))
 }
 
-/// Put `entry` in `record[list]`. An entry already there under the same name
-/// is moved to `record.superseded` (with the date it was superseded), never
-/// dropped: the history of what the record said is part of the record, and
-/// `corpora` also holds the labelled dead record other tests read.
+/// A row this runner wrote for corpus `name`. Runner rows carry
+/// `corpus_commit`; the hand-labelled dead record that shares `corpora` (and
+/// the corpus name) carries `commit` instead, and is never one.
+fn is_runner_row(entry: &Value, name: &str) -> bool {
+    entry["name"] == name && entry.get("corpus_commit").is_some()
+}
+
+/// The runner row for corpus `name` in `record[list]`, if there is one.
+fn runner_row<'a>(record: &'a Value, list: &str, name: &str) -> Option<&'a Value> {
+    record[list]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|e| is_runner_row(e, name)))
+}
+
+/// Put `entry` in `record[list]`. The runner row already there for the same
+/// corpus is moved to `record.superseded` (with the date it was superseded),
+/// never dropped: the history of what the record said is part of the record.
+/// `corpora` also holds the labelled dead record other tests read, under the
+/// same corpus name; a runner row never displaces it.
 fn supersede(record: &mut Value, list: &str, name: &str, entry: Value, date: &str) {
     if !record[list].is_array() {
         record[list] = json!([]);
@@ -992,7 +1153,7 @@ fn supersede(record: &mut Value, list: &str, name: &str, entry: Value, date: &st
     let items = record[list].as_array_mut().expect("checked above");
     let old = items
         .iter()
-        .position(|e| e["name"] == name)
+        .position(|e| is_runner_row(e, name))
         .map(|i| items.remove(i));
     items.push(entry);
     if let Some(old) = old {
@@ -1031,10 +1192,7 @@ fn score_the_pinned_corpora_and_write_the_record() {
             measure_corpus(&dir, pin, &includes).unwrap_or_else(|e| panic!("{}: {e}", pin.name));
         println!("{}", serde_json::to_string_pretty(&measurement).unwrap());
 
-        let previous = record["corpora"]
-            .as_array()
-            .and_then(|a| a.iter().find(|e| e["name"] == pin.name.as_str()))
-            .cloned();
+        let previous = runner_row(&record, "corpora", &pin.name).cloned();
         // A corpus without labels is gated too: every labelled gate then
         // reports itself unmeasured, which fails. Skipping it would let a run
         // with no labels anywhere pass every gate.
@@ -1211,7 +1369,13 @@ fn the_scorer_measures_structure_without_labels_and_scores_labels_when_given() {
                 { "language": "go", "construct": "plain", "caller": "app/svc/svc.go::Caller01", "name": "Target01", "truth": "app/util/util.go::Target01" },
                 { "language": "go", "construct": "pointer receiver", "caller": "app/svc/svc.go::Caller03", "name": "PtrGet03", "truth": "app/store/store.go::Store.PtrGet03" }
             ],
-            "dead": [{ "language": "go", "id": "app/util/util2.go::DeadUtil", "truly_dead": true }]
+            // Every confident-branch dead row must carry a label (dead.tsv's
+            // two truly_dead rows); DeadUtil is exempt and its label unused.
+            "dead": [
+                { "language": "go", "id": "app/util/util2.go::DeadUtil", "truly_dead": true },
+                { "language": "go", "id": "app/svc/probes.go::deadPriv", "truly_dead": true },
+                { "language": "go", "id": "app/svc/probes.go::fast.unusedM", "truly_dead": true }
+            ]
         })
         .to_string(),
     )
@@ -1241,6 +1405,204 @@ fn a_label_that_matches_no_edge_is_an_error_not_a_miss() {
     .unwrap();
     let err = score_labels(&built, &labels, &["go".to_string()]).unwrap_err();
     assert!(err.contains("matches no edge"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `corpora` holds two kinds of row under one corpus name: the hand-labelled
+/// dead record (`commit`, read by `dead_tier_eligibility.rs`) and the rows this
+/// runner writes (`corpus_commit`). A runner row replaces only the runner row
+/// before it; the dead record is never superseded by one.
+#[test]
+fn a_runner_row_never_supersedes_the_labelled_dead_record() {
+    let dead_record = json!({
+        "name": "x",
+        "commit": "c1",
+        "languages": { "go": { "dead_fp_by_tier": { "0.9": { "false_positive": 0, "rows": 2 } } } },
+    });
+    let mut record = json!({ "corpora": [dead_record.clone()] });
+    let first = json!({ "name": "x", "corpus_commit": "p1", "languages": {} });
+    supersede(&mut record, "corpora", "x", first.clone(), "d1");
+    assert_eq!(
+        record["corpora"],
+        json!([dead_record.clone(), first.clone()])
+    );
+    assert!(record["superseded"].is_null(), "{record}");
+    assert_eq!(runner_row(&record, "corpora", "x"), Some(&first));
+
+    let second = json!({ "name": "x", "corpus_commit": "p2", "languages": {} });
+    supersede(&mut record, "corpora", "x", second.clone(), "d2");
+    assert_eq!(record["corpora"], json!([dead_record, second]));
+    assert_eq!(
+        record["superseded"],
+        json!([{ "list": "corpora", "superseded_on": "d2", "entry": first }])
+    );
+}
+
+/// A pinned language the labels say nothing about gets no row: an empty row
+/// would read as measured. A row that is written carries `dead_fp_by_tier.0.9`
+/// (the shape `dead_tier_eligibility.rs` requires of every row), and that needs
+/// every confident-branch dead row of the language labelled - an unlabelled
+/// one is an error, never a row quietly left out of `rows`.
+#[test]
+fn a_scored_row_is_written_only_for_a_labelled_language_and_carries_the_confident_dead_tier() {
+    let (dir, _) = go_fixture_checkout("rows");
+    let built = common::build(&dir);
+    let languages = vec!["go".to_string(), "typescript".to_string()];
+    let recall = json!([{ "language": "go", "construct": "plain", "caller": "app/svc/svc.go::Caller01", "name": "Target01", "truth": "app/util/util.go::Target01" }]);
+    let labels = parse_labels(
+        &json!({
+            "recall": recall,
+            "dead": [
+                { "language": "go", "id": "app/svc/probes.go::deadPriv", "truly_dead": true },
+                { "language": "go", "id": "app/svc/probes.go::fast.unusedM", "truly_dead": true }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let scored = score_labels(&built, &labels, &languages).unwrap();
+    assert!(
+        !scored.contains_key("typescript"),
+        "no typescript label, so no typescript row: {scored:?}"
+    );
+    assert_eq!(
+        scored["go"]["dead_fp_by_tier"]["0.9"],
+        json!({ "false_positive": 0, "rows": 2 })
+    );
+
+    let partial = parse_labels(
+        &json!({
+            "recall": recall,
+            "dead": [{ "language": "go", "id": "app/svc/probes.go::deadPriv", "truly_dead": true }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let err = score_labels(&built, &partial, &languages).unwrap_err();
+    assert!(err.contains("app/svc/probes.go::fast.unusedM"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The committed Go oracle labels (`go.labels.json`, written by
+/// `tools/accuracy/cmd/golabel -root rust/testdata/accuracy/go`) scored against
+/// the fixture build: every id the oracle names is one the build has, so the
+/// labeller and DevMap agree on symbol ids, and the fixture - no Go row in
+/// `known_failing.tsv` - scores perfect precision, recall and honest-miss.
+/// The labeller's own golden test keeps the file equal to its output.
+#[test]
+fn the_go_oracle_labels_name_the_fixture_build_and_score_it_clean() {
+    let (dir, _) = go_fixture_checkout("golabel");
+    let built = common::build(&dir);
+    let path = accuracy_root().join("go.labels.json");
+    let mut raw: Value = serde_json::from_str(
+        &std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())),
+    )
+    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    // dead.tsv's two truly_dead rows, the fixture's whole confident branch.
+    raw["dead"] = json!([
+        { "language": "go", "id": "app/svc/probes.go::deadPriv", "truly_dead": true },
+        { "language": "go", "id": "app/svc/probes.go::fast.unusedM", "truly_dead": true }
+    ]);
+    let labels = parse_labels(&raw.to_string()).unwrap();
+
+    let known: BTreeSet<&str> = built
+        .extractions
+        .iter()
+        .flat_map(|x| {
+            std::iter::once(x.file_path.as_str())
+                .chain(x.symbols.iter().map(|s| s.qualified_name.as_str()))
+        })
+        .collect();
+    let mut unknown: BTreeSet<&str> = BTreeSet::new();
+    for l in &labels.recall {
+        unknown.extend(
+            std::iter::once(l.caller.as_str())
+                .chain(l.truth.split('|'))
+                .filter(|id| !known.contains(id)),
+        );
+    }
+    for o in &labels.oracle {
+        unknown.extend(
+            o.covered_callers
+                .iter()
+                .map(String::as_str)
+                .filter(|id| !known.contains(id)),
+        );
+        unknown.extend(
+            o.uses
+                .iter()
+                .map(|(_, callee)| callee.as_str())
+                .filter(|id| !known.contains(id)),
+        );
+    }
+    assert!(
+        unknown.is_empty(),
+        "the oracle names ids the build does not have, so its id scheme and DevMap's disagree: {unknown:#?}"
+    );
+
+    let scored = score_labels(&built, &labels, &["go".to_string()]).unwrap();
+    let go = &scored["go"];
+    let precision = &go["confident_edge_precision"];
+    assert!(precision["total"].as_u64().unwrap() > 50, "{go}");
+    assert_eq!(precision["correct"], precision["total"], "{go}");
+    let unique = &go["unique_global_precision"];
+    assert_eq!(unique["correct"], unique["total"], "{go}");
+    assert!(go["recall"]["total"].as_u64().unwrap() > 50, "{go}");
+    assert_eq!(go["recall"]["present"], go["recall"]["total"], "{go}");
+    assert_eq!(go["honest_miss"]["absent"], 0, "{go}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An oracle judges every confident Calls/References edge from a caller it
+/// read, right when it bound the same pair and wrong when it did not; an edge
+/// from a caller it did not read is not judged at all.
+#[test]
+fn an_oracle_judges_every_confident_edge_from_a_caller_it_read_and_no_other() {
+    let (dir, _) = go_fixture_checkout("oracle");
+    let built = common::build(&dir);
+    let go = vec!["go".to_string()];
+    let dead = json!([
+        { "language": "go", "id": "app/svc/probes.go::deadPriv", "truly_dead": true },
+        { "language": "go", "id": "app/svc/probes.go::fast.unusedM", "truly_dead": true }
+    ]);
+    let score = |oracle: Value| {
+        let labels =
+            parse_labels(&json!({ "dead": dead, "oracle": [oracle] }).to_string()).unwrap();
+        score_labels(&built, &labels, &go).unwrap()["go"]["confident_edge_precision"].clone()
+    };
+
+    let agrees = score(json!({
+        "language": "go",
+        "covered_callers": ["app/svc/svc.go::Caller01"],
+        "uses": [{ "caller": "app/svc/svc.go::Caller01", "callee": "app/util/util.go::Target01", "impls": [] }]
+    }));
+    assert_eq!(agrees["total"], 1, "{agrees}");
+    assert_eq!(agrees["correct"], 1, "{agrees}");
+
+    // The same caller, an oracle that bound nothing: DevMap's edge is wrong.
+    let disagrees = score(json!({
+        "language": "go",
+        "covered_callers": ["app/svc/svc.go::Caller01"],
+        "uses": []
+    }));
+    assert_eq!(disagrees["total"], 1, "{disagrees}");
+    assert_eq!(disagrees["correct"], 0, "{disagrees}");
+
+    // A caller the oracle never read: nothing to judge.
+    let unread = score(json!({ "language": "go", "covered_callers": [], "uses": [] }));
+    assert_eq!(unread["total"], 0, "{unread}");
+
+    // A use from a caller the oracle says it did not read is malformed.
+    let err = parse_labels(
+        &json!({ "oracle": [{
+            "language": "go",
+            "covered_callers": [],
+            "uses": [{ "caller": "app/svc/svc.go::Caller01", "callee": "app/util/util.go::Target01", "impls": [] }]
+        }] })
+        .to_string(),
+    )
+    .unwrap_err();
+    assert!(err.contains("not in covered_callers"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1533,21 +1895,11 @@ fn a_stale_or_missing_measurement_is_an_open_gate() {
 
 #[test]
 fn a_re_measured_corpus_supersedes_its_previous_row_and_keeps_it() {
-    let mut record = json!({ "measurements": [{ "name": "a", "v": 1 }, { "name": "b", "v": 1 }] });
-    supersede(
-        &mut record,
-        "measurements",
-        "a",
-        json!({ "name": "a", "v": 2 }),
-        "2026-10-13",
-    );
-    supersede(
-        &mut record,
-        "measurements",
-        "c",
-        json!({ "name": "c", "v": 1 }),
-        "2026-10-13",
-    );
+    // Runner rows: each carries the `corpus_commit` it was measured at.
+    let row = |name: &str, v: i64| json!({ "name": name, "corpus_commit": "p", "v": v });
+    let mut record = json!({ "measurements": [row("a", 1), row("b", 1)] });
+    supersede(&mut record, "measurements", "a", row("a", 2), "2026-10-13");
+    supersede(&mut record, "measurements", "c", row("c", 1), "2026-10-13");
     let names: Vec<(&str, i64)> = record["measurements"]
         .as_array()
         .unwrap()
@@ -1559,7 +1911,7 @@ fn a_re_measured_corpus_supersedes_its_previous_row_and_keeps_it() {
     assert_eq!(old.len(), 1, "only the replaced row moves: {old:?}");
     assert_eq!(old[0]["list"], "measurements");
     assert_eq!(old[0]["superseded_on"], "2026-10-13");
-    assert_eq!(old[0]["entry"], json!({ "name": "a", "v": 1 }));
+    assert_eq!(old[0]["entry"], row("a", 1));
 }
 
 #[test]

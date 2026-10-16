@@ -216,6 +216,10 @@ function main() {
   run("go orchestrator tests", "go", ["test", "./...", "-count=1"], {
     cwd: GO_MODULE,
   });
+  // The go/types labeller behind the DevMap corpus record, its own module.
+  const accuracyModule = path.join(REPO_ROOT, "tools", "accuracy");
+  run("accuracy labeller vet", "go", ["vet", "./..."], { cwd: accuracyModule });
+  run("accuracy labeller tests", "go", ["test", "./...", "-count=1"], { cwd: accuracyModule });
   run("rust verify --quick", "bash", ["./verify.sh", "--quick"], {
     cwd: path.join(REPO_ROOT, "rust"),
   });

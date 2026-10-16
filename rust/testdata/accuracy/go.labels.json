@@ -1,0 +1,1420 @@
+{
+  "recall": [
+    {
+      "language": "go",
+      "construct": "bare same-package",
+      "caller": "app/cgox/cgox.go::Caller22",
+      "name": "goSide22",
+      "truth": "app/cgox/cgox.go::goSide22"
+    },
+    {
+      "language": "go",
+      "construct": "param receiver",
+      "caller": "app/gen/gen.go::Use23",
+      "name": "String",
+      "truth": "app/gen/color_string.go::Color.String"
+    },
+    {
+      "language": "go",
+      "construct": "bare same-package",
+      "caller": "app/gen/gen.go::Use23",
+      "name": "GeneratedHelper23",
+      "truth": "app/gen/color_string.go::GeneratedHelper23"
+    },
+    {
+      "language": "go",
+      "construct": "bare same-package",
+      "caller": "app/main.go::init",
+      "name": "initOnly13",
+      "truth": "app/main.go::initOnly13"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/main.go::main",
+      "name": "Caller22",
+      "truth": "app/cgox/cgox.go::Caller22"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/main.go::main",
+      "name": "Use23",
+      "truth": "app/gen/gen.go::Use23"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/main.go::main",
+      "name": "Probes",
+      "truth": "app/svc/probes.go::Probes"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/main.go::main",
+      "name": "Probes2",
+      "truth": "app/svc/probes2.go::Probes2"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/main.go::main",
+      "name": "Caller01",
+      "truth": "app/svc/svc.go::Caller01"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/main.go::main",
+      "name": "Caller03",
+      "truth": "app/svc/svc.go::Caller03"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/main.go::main",
+      "name": "Caller04",
+      "truth": "app/svc/svc.go::Caller04"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/main.go::main",
+      "name": "Caller05",
+      "truth": "app/svc/svc.go::Caller05"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/main.go::main",
+      "name": "Caller06",
+      "truth": "app/svc/svc.go::Caller06"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/main.go::main",
+      "name": "Caller07b",
+      "truth": "app/svc/svc.go::Caller07b"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/main.go::main",
+      "name": "Caller08",
+      "truth": "app/svc/svc.go::Caller08"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/main.go::main",
+      "name": "Caller10",
+      "truth": "app/svc/svc.go::Caller10"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/main.go::main",
+      "name": "Caller11",
+      "truth": "app/svc/svc.go::Caller11"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/main.go::main",
+      "name": "Caller12",
+      "truth": "app/svc/svc.go::Caller12"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/main.go::main",
+      "name": "Caller16",
+      "truth": "app/svc/svc.go::Caller16"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/main.go::main",
+      "name": "Caller17",
+      "truth": "app/svc/svc.go::Caller17"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/main.go::main",
+      "name": "Caller18",
+      "truth": "app/svc/svc.go::Caller18"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/main.go::main",
+      "name": "Caller19",
+      "truth": "app/svc/svc.go::Caller19"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/main.go::main",
+      "name": "Caller20",
+      "truth": "app/svc/svc.go::Caller20"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/main.go::main",
+      "name": "Caller25",
+      "truth": "app/svc/svc.go::Caller25"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/main.go::main",
+      "name": "Caller26",
+      "truth": "app/svc/svc.go::Caller26"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/main.go::main",
+      "name": "Caller28",
+      "truth": "app/svc/svc.go::Caller28"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/main.go::main",
+      "name": "Caller29",
+      "truth": "app/svc/svc.go::Caller29"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/main.go::main",
+      "name": "NewService",
+      "truth": "app/svc/svc.go::NewService"
+    },
+    {
+      "language": "go",
+      "construct": "call-result binding",
+      "caller": "app/main.go::main",
+      "name": "Caller09",
+      "truth": "app/svc/svc.go::Service.Caller09"
+    },
+    {
+      "language": "go",
+      "construct": "call-result binding",
+      "caller": "app/main.go::main",
+      "name": "Caller15",
+      "truth": "app/svc/svc.go::Service.Caller15"
+    },
+    {
+      "language": "go",
+      "construct": "call-result binding",
+      "caller": "app/main.go::main",
+      "name": "Caller24",
+      "truth": "app/svc/svc.go::Service.Caller24"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/main.go::main",
+      "name": "Routes",
+      "truth": "app/web/web.go::Routes"
+    },
+    {
+      "language": "go",
+      "construct": "param receiver",
+      "caller": "app/svc/probes.go::ParamCaller",
+      "name": "PtrGet03",
+      "truth": "app/store/store.go::Store.PtrGet03"
+    },
+    {
+      "language": "go",
+      "construct": "bare same-package",
+      "caller": "app/svc/probes.go::Probes",
+      "name": "ParamCaller",
+      "truth": "app/svc/probes.go::ParamCaller"
+    },
+    {
+      "language": "go",
+      "construct": "bare same-package",
+      "caller": "app/svc/probes.go::Probes",
+      "name": "callbackCaller",
+      "truth": "app/svc/probes.go::callbackCaller"
+    },
+    {
+      "language": "go",
+      "construct": "bare same-package",
+      "caller": "app/svc/probes.go::Probes",
+      "name": "goDeferMethods",
+      "truth": "app/svc/probes.go::goDeferMethods"
+    },
+    {
+      "language": "go",
+      "construct": "bare same-package",
+      "caller": "app/svc/probes.go::Probes",
+      "name": "multiReturnCaller",
+      "truth": "app/svc/probes.go::multiReturnCaller"
+    },
+    {
+      "language": "go",
+      "construct": "bare same-package",
+      "caller": "app/svc/probes.go::Probes",
+      "name": "useRunner",
+      "truth": "app/svc/probes.go::useRunner"
+    },
+    {
+      "language": "go",
+      "construct": "bare same-package",
+      "caller": "app/svc/probes.go::Probes",
+      "name": "varDeclCaller",
+      "truth": "app/svc/probes.go::varDeclCaller"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/svc/probes.go::callbackCaller",
+      "name": "NewStore",
+      "truth": "app/store/store.go::NewStore"
+    },
+    {
+      "language": "go",
+      "construct": "method value",
+      "caller": "app/svc/probes.go::callbackCaller",
+      "name": "MethodValue05",
+      "truth": "app/store/store.go::Store.MethodValue05"
+    },
+    {
+      "language": "go",
+      "construct": "bare same-package",
+      "caller": "app/svc/probes.go::callbackCaller",
+      "name": "takesFn",
+      "truth": "app/svc/probes.go::takesFn"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/svc/probes.go::goDeferMethods",
+      "name": "NewStore",
+      "truth": "app/store/store.go::NewStore"
+    },
+    {
+      "language": "go",
+      "construct": "call-result binding",
+      "caller": "app/svc/probes.go::goDeferMethods",
+      "name": "Close29",
+      "truth": "app/store/store.go::Store.Close29"
+    },
+    {
+      "language": "go",
+      "construct": "call-result binding",
+      "caller": "app/svc/probes.go::goDeferMethods",
+      "name": "MethodValue05",
+      "truth": "app/store/store.go::Store.MethodValue05"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/svc/probes.go::multiReturnCaller",
+      "name": "OpenStore",
+      "truth": "app/store/store.go::OpenStore"
+    },
+    {
+      "language": "go",
+      "construct": "multi-value binding",
+      "caller": "app/svc/probes.go::multiReturnCaller",
+      "name": "ElemGet24",
+      "truth": "app/store/store.go::Store.ElemGet24"
+    },
+    {
+      "language": "go",
+      "construct": "interface dispatch",
+      "caller": "app/svc/probes.go::useRunner",
+      "name": "run",
+      "truth": "app/svc/probes.go::runner.run|app/svc/probes.go::fast.run"
+    },
+    {
+      "language": "go",
+      "construct": "var x T",
+      "caller": "app/svc/probes.go::varDeclCaller",
+      "name": "inc",
+      "truth": "app/svc/probes.go::counter.inc"
+    },
+    {
+      "language": "go",
+      "construct": "bare same-package",
+      "caller": "app/svc/probes2.go::Holder.Rebuild",
+      "name": "Rebuild",
+      "truth": "app/svc/probes2.go::Rebuild"
+    },
+    {
+      "language": "go",
+      "construct": "composite literal",
+      "caller": "app/svc/probes2.go::Probes2",
+      "name": "Rebuild",
+      "truth": "app/svc/probes2.go::Holder.Rebuild"
+    },
+    {
+      "language": "go",
+      "construct": "composite binding",
+      "caller": "app/svc/probes2.go::Probes2",
+      "name": "delete",
+      "truth": "app/svc/probes2.go::cache.delete"
+    },
+    {
+      "language": "go",
+      "construct": "bare same-package",
+      "caller": "app/svc/probes2.go::Probes2",
+      "name": "localTypeUser",
+      "truth": "app/svc/probes2.go::localTypeUser"
+    },
+    {
+      "language": "go",
+      "construct": "bare same-package",
+      "caller": "app/svc/probes2.go::Probes2",
+      "name": "methodReturnCaller",
+      "truth": "app/svc/probes2.go::methodReturnCaller"
+    },
+    {
+      "language": "go",
+      "construct": "bare same-package",
+      "caller": "app/svc/probes2.go::Probes2",
+      "name": "shadowedLocalTypeUser",
+      "truth": "app/svc/probes2.go::shadowedLocalTypeUser"
+    },
+    {
+      "language": "go",
+      "construct": "bare same-package",
+      "caller": "app/svc/probes2.go::Probes2",
+      "name": "twinLocalTypeUser",
+      "truth": "app/svc/probes2.go::twinLocalTypeUser"
+    },
+    {
+      "language": "go",
+      "construct": "composite binding",
+      "caller": "app/svc/probes2.go::Probes2",
+      "name": "clear",
+      "truth": "app/svc/probes2.go::writer.clear"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/svc/probes2.go::factory.Make",
+      "name": "NewStore",
+      "truth": "app/store/store.go::NewStore"
+    },
+    {
+      "language": "go",
+      "construct": "method-result binding",
+      "caller": "app/svc/probes2.go::methodReturnCaller",
+      "name": "ElemGet24",
+      "truth": "app/store/store.go::Store.ElemGet24"
+    },
+    {
+      "language": "go",
+      "construct": "var x T",
+      "caller": "app/svc/probes2.go::methodReturnCaller",
+      "name": "Make",
+      "truth": "app/svc/probes2.go::factory.Make"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/svc/svc.go::Caller01",
+      "name": "Target01",
+      "truth": "app/util/util.go::Target01"
+    },
+    {
+      "language": "go",
+      "construct": "var x pkg.T",
+      "caller": "app/svc/svc.go::Caller03",
+      "name": "PtrGet03",
+      "truth": "app/store/store.go::Store.PtrGet03"
+    },
+    {
+      "language": "go",
+      "construct": "composite binding",
+      "caller": "app/svc/svc.go::Caller04",
+      "name": "ValGet04",
+      "truth": "app/store/store.go::Store.ValGet04"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/svc/svc.go::Caller05",
+      "name": "NewStore",
+      "truth": "app/store/store.go::NewStore"
+    },
+    {
+      "language": "go",
+      "construct": "method value",
+      "caller": "app/svc/svc.go::Caller05",
+      "name": "MethodValue05",
+      "truth": "app/store/store.go::Store.MethodValue05"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/svc/svc.go::Caller06",
+      "name": "NewStore",
+      "truth": "app/store/store.go::NewStore"
+    },
+    {
+      "language": "go",
+      "construct": "method expression",
+      "caller": "app/svc/svc.go::Caller06",
+      "name": "MethodExpr06",
+      "truth": "app/store/store.go::Store.MethodExpr06"
+    },
+    {
+      "language": "go",
+      "construct": "interface dispatch",
+      "caller": "app/svc/svc.go::Caller07",
+      "name": "Read07",
+      "truth": "app/store/store.go::Reader.Read07|app/store/store.go::FileReader.Read07|app/store/store.go::MemReader.Read07"
+    },
+    {
+      "language": "go",
+      "construct": "bare same-package",
+      "caller": "app/svc/svc.go::Caller07b",
+      "name": "Caller07",
+      "truth": "app/svc/svc.go::Caller07"
+    },
+    {
+      "language": "go",
+      "construct": "bare same-package",
+      "caller": "app/svc/svc.go::Caller07b",
+      "name": "Caller07",
+      "truth": "app/svc/svc.go::Caller07"
+    },
+    {
+      "language": "go",
+      "construct": "promoted",
+      "caller": "app/svc/svc.go::Caller08",
+      "name": "Promoted08",
+      "truth": "app/store/store.go::Base.Promoted08"
+    },
+    {
+      "language": "go",
+      "construct": "promoted",
+      "caller": "app/svc/svc.go::Caller08",
+      "name": "PtrPromoted08",
+      "truth": "app/store/store.go::Base.PtrPromoted08"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/svc/svc.go::Caller08",
+      "name": "NewStore",
+      "truth": "app/store/store.go::NewStore"
+    },
+    {
+      "language": "go",
+      "construct": "generic type",
+      "caller": "app/svc/svc.go::Caller10",
+      "name": "Get10",
+      "truth": "app/store/generic.go::Box.Get10"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/svc/svc.go::Caller10",
+      "name": "NewBox10",
+      "truth": "app/store/generic.go::NewBox10"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/svc/svc.go::Caller10",
+      "name": "Pair10",
+      "truth": "app/store/generic.go::Pair10"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/svc/svc.go::Caller10",
+      "name": "Sum10",
+      "truth": "app/store/generic.go::Sum10"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/svc/svc.go::Caller10",
+      "name": "Zero10",
+      "truth": "app/store/generic.go::Zero10"
+    },
+    {
+      "language": "go",
+      "construct": "bare same-package",
+      "caller": "app/svc/svc.go::Caller11",
+      "name": "helper11",
+      "truth": "app/svc/svc.go::helper11"
+    },
+    {
+      "language": "go",
+      "construct": "bare same-package",
+      "caller": "app/svc/svc.go::Caller12",
+      "name": "cleanup12",
+      "truth": "app/svc/svc.go::cleanup12"
+    },
+    {
+      "language": "go",
+      "construct": "bare same-package",
+      "caller": "app/svc/svc.go::Caller12",
+      "name": "worker12",
+      "truth": "app/svc/svc.go::worker12"
+    },
+    {
+      "language": "go",
+      "construct": "range var",
+      "caller": "app/svc/svc.go::Caller16",
+      "name": "RangeGet16",
+      "truth": "app/store/store.go::Store.RangeGet16"
+    },
+    {
+      "language": "go",
+      "construct": "type switch",
+      "caller": "app/svc/svc.go::Caller17",
+      "name": "Area17",
+      "truth": "app/store/store.go::Circle.Area17"
+    },
+    {
+      "language": "go",
+      "construct": "type switch",
+      "caller": "app/svc/svc.go::Caller17",
+      "name": "Side17",
+      "truth": "app/store/store.go::Square.Side17"
+    },
+    {
+      "language": "go",
+      "construct": "var x pkg.T",
+      "caller": "app/svc/svc.go::Caller18",
+      "name": "Detail18",
+      "truth": "app/store/store.go::PathErr.Detail18"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/svc/svc.go::Caller19",
+      "name": "Target19",
+      "truth": "app/internal/secret/secret.go::Target19"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/svc/svc.go::Caller20",
+      "name": "LibTarget20",
+      "truth": "libmod/lib.go::LibTarget20"
+    },
+    {
+      "language": "go",
+      "construct": "var x pkg.T",
+      "caller": "app/svc/svc.go::Caller20",
+      "name": "LibMethod20",
+      "truth": "libmod/lib.go::LibType20.LibMethod20"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/svc/svc.go::Caller25",
+      "name": "NewStore",
+      "truth": "app/store/store.go::NewStore"
+    },
+    {
+      "language": "go",
+      "construct": "call-result binding",
+      "caller": "app/svc/svc.go::Caller25",
+      "name": "Ctor25",
+      "truth": "app/store/store.go::Store.Ctor25"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/svc/svc.go::Caller26",
+      "name": "NewStore",
+      "truth": "app/store/store.go::NewStore"
+    },
+    {
+      "language": "go",
+      "construct": "chain",
+      "caller": "app/svc/svc.go::Caller26",
+      "name": "Ctor25",
+      "truth": "app/store/store.go::Store.Ctor25"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/svc/svc.go::Caller28",
+      "name": "Target28",
+      "truth": "app/util/util.go::Target28"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/svc/svc.go::Caller29",
+      "name": "NewStore",
+      "truth": "app/store/store.go::NewStore"
+    },
+    {
+      "language": "go",
+      "construct": "call-result binding",
+      "caller": "app/svc/svc.go::Caller29",
+      "name": "Close29",
+      "truth": "app/store/store.go::Store.Close29"
+    },
+    {
+      "language": "go",
+      "construct": "package-qualified",
+      "caller": "app/svc/svc.go::NewService",
+      "name": "NewStore",
+      "truth": "app/store/store.go::NewStore"
+    },
+    {
+      "language": "go",
+      "construct": "promoted",
+      "caller": "app/svc/svc.go::Service.Caller09",
+      "name": "Log09",
+      "truth": "app/store/store.go::Logger.Log09|app/internal/secret/widen.go::FileSink.Log09|app/main.go::nopLogger.Log09"
+    },
+    {
+      "language": "go",
+      "construct": "field",
+      "caller": "app/svc/svc.go::Service.Caller15",
+      "name": "PtrGet03",
+      "truth": "app/store/store.go::Store.PtrGet03"
+    },
+    {
+      "language": "go",
+      "construct": "interface dispatch",
+      "caller": "app/svc/svc.go::Service.Caller15",
+      "name": "Find15",
+      "truth": "app/svc/svc.go::Repo.Find15|app/svc/svc.go::SQLRepo.Find15"
+    },
+    {
+      "language": "go",
+      "construct": "element",
+      "caller": "app/svc/svc.go::Service.Caller24",
+      "name": "ElemGet24",
+      "truth": "app/store/store.go::Store.ElemGet24"
+    },
+    {
+      "language": "go",
+      "construct": "element",
+      "caller": "app/svc/svc.go::Service.Caller24",
+      "name": "ElemGet24",
+      "truth": "app/store/store.go::Store.ElemGet24"
+    },
+    {
+      "language": "go",
+      "construct": "bare same-package",
+      "caller": "app/svc/svc_test.go::TestCaller01Table",
+      "name": "Caller01",
+      "truth": "app/svc/svc.go::Caller01"
+    },
+    {
+      "language": "go",
+      "construct": "bare same-package",
+      "caller": "app/util/util.go::Target02b",
+      "name": "Target02",
+      "truth": "app/util/util2.go::Target02"
+    },
+    {
+      "language": "go",
+      "construct": "method value",
+      "caller": "app/web/web.go::Routes",
+      "name": "ServeItems14",
+      "truth": "app/web/web.go::Handler.ServeItems14"
+    },
+    {
+      "language": "go",
+      "construct": "func value",
+      "caller": "app/web/web.go::Routes",
+      "name": "handleIndex14",
+      "truth": "app/web/web.go::handleIndex14"
+    },
+    {
+      "language": "go",
+      "construct": "func value",
+      "caller": "app/web/web.go::Routes",
+      "name": "handleWrapped14",
+      "truth": "app/web/web.go::handleWrapped14"
+    },
+    {
+      "language": "go",
+      "construct": "bare same-package",
+      "caller": "app/web/web.go::Routes",
+      "name": "inline14",
+      "truth": "app/web/web.go::inline14"
+    }
+  ],
+  "oracle": [
+    {
+      "language": "go",
+      "covered_callers": [
+        "app/cgox/cgox.go",
+        "app/cgox/cgox.go::Caller22",
+        "app/cgox/cgox.go::goSide22",
+        "app/gen/color_string.go",
+        "app/gen/color_string.go::Color.String",
+        "app/gen/color_string.go::GeneratedHelper23",
+        "app/gen/gen.go",
+        "app/gen/gen.go::Use23",
+        "app/internal/secret/cgo_export.go",
+        "app/internal/secret/cgo_export.go::SecretCallback",
+        "app/internal/secret/linkname.go",
+        "app/internal/secret/linkname.go::LinkedClock",
+        "app/internal/secret/secret.go",
+        "app/internal/secret/secret.go::Target19",
+        "app/internal/secret/widen.go",
+        "app/internal/secret/widen.go::FileSink.Log09",
+        "app/internal/secret/widen.go::ValidateChunks",
+        "app/main.go",
+        "app/main.go::StampSectionRescoredAt",
+        "app/main.go::init",
+        "app/main.go::initOnly13",
+        "app/main.go::main",
+        "app/main.go::nopLogger.Log09",
+        "app/store/generic.go",
+        "app/store/generic.go::Box.Get10",
+        "app/store/generic.go::NewBox10",
+        "app/store/generic.go::Pair10",
+        "app/store/generic.go::Sum10",
+        "app/store/generic.go::Zero10",
+        "app/store/store.go",
+        "app/store/store.go::Base.Promoted08",
+        "app/store/store.go::Base.PtrPromoted08",
+        "app/store/store.go::Circle.Area17",
+        "app/store/store.go::FileReader.Read07",
+        "app/store/store.go::MemReader.Read07",
+        "app/store/store.go::NewStore",
+        "app/store/store.go::OpenStore",
+        "app/store/store.go::Other.Close29",
+        "app/store/store.go::PathErr.Detail18",
+        "app/store/store.go::PathErr.Error",
+        "app/store/store.go::Square.Side17",
+        "app/store/store.go::Store.Close29",
+        "app/store/store.go::Store.Ctor25",
+        "app/store/store.go::Store.ElemGet24",
+        "app/store/store.go::Store.MethodExpr06",
+        "app/store/store.go::Store.MethodValue05",
+        "app/store/store.go::Store.PtrGet03",
+        "app/store/store.go::Store.RangeGet16",
+        "app/store/store.go::Store.ValGet04",
+        "app/svc/probes.go",
+        "app/svc/probes.go::ParamCaller",
+        "app/svc/probes.go::Probes",
+        "app/svc/probes.go::callbackCaller",
+        "app/svc/probes.go::counter.inc",
+        "app/svc/probes.go::deadPriv",
+        "app/svc/probes.go::fast.run",
+        "app/svc/probes.go::fast.unusedM",
+        "app/svc/probes.go::goDeferMethods",
+        "app/svc/probes.go::multiReturnCaller",
+        "app/svc/probes.go::takesFn",
+        "app/svc/probes.go::useRunner",
+        "app/svc/probes.go::varDeclCaller",
+        "app/svc/probes2.go",
+        "app/svc/probes2.go::Buffer.Reset",
+        "app/svc/probes2.go::Holder.Rebuild",
+        "app/svc/probes2.go::Probes2",
+        "app/svc/probes2.go::Rebuild",
+        "app/svc/probes2.go::cache.delete",
+        "app/svc/probes2.go::factory.Make",
+        "app/svc/probes2.go::localTypeUser",
+        "app/svc/probes2.go::methodReturnCaller",
+        "app/svc/probes2.go::shadowedLocalTypeUser",
+        "app/svc/probes2.go::twinLocalTypeUser",
+        "app/svc/probes2.go::writer.clear",
+        "app/svc/svc.go",
+        "app/svc/svc.go::Caller01",
+        "app/svc/svc.go::Caller03",
+        "app/svc/svc.go::Caller04",
+        "app/svc/svc.go::Caller05",
+        "app/svc/svc.go::Caller06",
+        "app/svc/svc.go::Caller07",
+        "app/svc/svc.go::Caller07b",
+        "app/svc/svc.go::Caller08",
+        "app/svc/svc.go::Caller10",
+        "app/svc/svc.go::Caller11",
+        "app/svc/svc.go::Caller12",
+        "app/svc/svc.go::Caller16",
+        "app/svc/svc.go::Caller17",
+        "app/svc/svc.go::Caller18",
+        "app/svc/svc.go::Caller19",
+        "app/svc/svc.go::Caller20",
+        "app/svc/svc.go::Caller25",
+        "app/svc/svc.go::Caller26",
+        "app/svc/svc.go::Caller28",
+        "app/svc/svc.go::Caller29",
+        "app/svc/svc.go::NewService",
+        "app/svc/svc.go::SQLRepo.Find15",
+        "app/svc/svc.go::Service.Caller09",
+        "app/svc/svc.go::Service.Caller15",
+        "app/svc/svc.go::Service.Caller24",
+        "app/svc/svc.go::SinkLogger",
+        "app/svc/svc.go::cleanup12",
+        "app/svc/svc.go::helper11",
+        "app/svc/svc.go::worker12",
+        "app/svc/svc_test.go",
+        "app/svc/svc_test.go::TestCaller01Table",
+        "app/util/util.go",
+        "app/util/util.go::Target01",
+        "app/util/util.go::Target02b",
+        "app/util/util.go::Target28",
+        "app/util/util2.go",
+        "app/util/util2.go::DeadUtil",
+        "app/util/util2.go::Target02",
+        "app/web/web.go",
+        "app/web/web.go::Handler.ServeItems14",
+        "app/web/web.go::Routes",
+        "app/web/web.go::handleIndex14",
+        "app/web/web.go::handleWrapped14",
+        "app/web/web.go::inline14",
+        "libmod/lib.go",
+        "libmod/lib.go::LibTarget20",
+        "libmod/lib.go::LibType20.LibMethod20"
+      ],
+      "uses": [
+        {
+          "caller": "app/cgox/cgox.go::Caller22",
+          "callee": "app/cgox/cgox.go::goSide22",
+          "impls": []
+        },
+        {
+          "caller": "app/gen/gen.go::Use23",
+          "callee": "app/gen/color_string.go::Color.String",
+          "impls": []
+        },
+        {
+          "caller": "app/gen/gen.go::Use23",
+          "callee": "app/gen/color_string.go::GeneratedHelper23",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::init",
+          "callee": "app/main.go::initOnly13",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/cgox/cgox.go::Caller22",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/gen/gen.go::Use23",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/svc/probes.go::Probes",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/svc/probes2.go::Probes2",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/svc/svc.go::Caller01",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/svc/svc.go::Caller03",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/svc/svc.go::Caller04",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/svc/svc.go::Caller05",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/svc/svc.go::Caller06",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/svc/svc.go::Caller07b",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/svc/svc.go::Caller08",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/svc/svc.go::Caller10",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/svc/svc.go::Caller11",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/svc/svc.go::Caller12",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/svc/svc.go::Caller16",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/svc/svc.go::Caller17",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/svc/svc.go::Caller18",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/svc/svc.go::Caller19",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/svc/svc.go::Caller20",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/svc/svc.go::Caller25",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/svc/svc.go::Caller26",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/svc/svc.go::Caller28",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/svc/svc.go::Caller29",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/svc/svc.go::NewService",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/svc/svc.go::Service.Caller09",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/svc/svc.go::Service.Caller15",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/svc/svc.go::Service.Caller24",
+          "impls": []
+        },
+        {
+          "caller": "app/main.go::main",
+          "callee": "app/web/web.go::Routes",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes.go::ParamCaller",
+          "callee": "app/store/store.go::Store.PtrGet03",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes.go::Probes",
+          "callee": "app/svc/probes.go::ParamCaller",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes.go::Probes",
+          "callee": "app/svc/probes.go::callbackCaller",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes.go::Probes",
+          "callee": "app/svc/probes.go::goDeferMethods",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes.go::Probes",
+          "callee": "app/svc/probes.go::multiReturnCaller",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes.go::Probes",
+          "callee": "app/svc/probes.go::useRunner",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes.go::Probes",
+          "callee": "app/svc/probes.go::varDeclCaller",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes.go::callbackCaller",
+          "callee": "app/store/store.go::NewStore",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes.go::callbackCaller",
+          "callee": "app/store/store.go::Store.MethodValue05",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes.go::callbackCaller",
+          "callee": "app/svc/probes.go::takesFn",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes.go::goDeferMethods",
+          "callee": "app/store/store.go::NewStore",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes.go::goDeferMethods",
+          "callee": "app/store/store.go::Store.Close29",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes.go::goDeferMethods",
+          "callee": "app/store/store.go::Store.MethodValue05",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes.go::multiReturnCaller",
+          "callee": "app/store/store.go::OpenStore",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes.go::multiReturnCaller",
+          "callee": "app/store/store.go::Store.ElemGet24",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes.go::useRunner",
+          "callee": "app/svc/probes.go::runner.run",
+          "impls": [
+            "app/svc/probes.go::fast.run"
+          ]
+        },
+        {
+          "caller": "app/svc/probes.go::varDeclCaller",
+          "callee": "app/svc/probes.go::counter.inc",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes2.go::Holder.Rebuild",
+          "callee": "app/svc/probes2.go::Rebuild",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes2.go::Probes2",
+          "callee": "app/svc/probes2.go::Holder.Rebuild",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes2.go::Probes2",
+          "callee": "app/svc/probes2.go::cache.delete",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes2.go::Probes2",
+          "callee": "app/svc/probes2.go::localTypeUser",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes2.go::Probes2",
+          "callee": "app/svc/probes2.go::methodReturnCaller",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes2.go::Probes2",
+          "callee": "app/svc/probes2.go::shadowedLocalTypeUser",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes2.go::Probes2",
+          "callee": "app/svc/probes2.go::twinLocalTypeUser",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes2.go::Probes2",
+          "callee": "app/svc/probes2.go::writer.clear",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes2.go::factory.Make",
+          "callee": "app/store/store.go::NewStore",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes2.go::methodReturnCaller",
+          "callee": "app/store/store.go::Store.ElemGet24",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes2.go::methodReturnCaller",
+          "callee": "app/svc/probes2.go::factory.Make",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller01",
+          "callee": "app/util/util.go::Target01",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller03",
+          "callee": "app/store/store.go::Store.PtrGet03",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller04",
+          "callee": "app/store/store.go::Store.ValGet04",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller05",
+          "callee": "app/store/store.go::NewStore",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller05",
+          "callee": "app/store/store.go::Store.MethodValue05",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller06",
+          "callee": "app/store/store.go::NewStore",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller06",
+          "callee": "app/store/store.go::Store.MethodExpr06",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller07",
+          "callee": "app/store/store.go::Reader.Read07",
+          "impls": [
+            "app/store/store.go::FileReader.Read07",
+            "app/store/store.go::MemReader.Read07"
+          ]
+        },
+        {
+          "caller": "app/svc/svc.go::Caller07b",
+          "callee": "app/svc/svc.go::Caller07",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller08",
+          "callee": "app/store/store.go::Base.Promoted08",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller08",
+          "callee": "app/store/store.go::Base.PtrPromoted08",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller08",
+          "callee": "app/store/store.go::NewStore",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller10",
+          "callee": "app/store/generic.go::Box.Get10",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller10",
+          "callee": "app/store/generic.go::NewBox10",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller10",
+          "callee": "app/store/generic.go::Pair10",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller10",
+          "callee": "app/store/generic.go::Sum10",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller10",
+          "callee": "app/store/generic.go::Zero10",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller11",
+          "callee": "app/svc/svc.go::helper11",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller12",
+          "callee": "app/svc/svc.go::cleanup12",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller12",
+          "callee": "app/svc/svc.go::worker12",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller16",
+          "callee": "app/store/store.go::Store.RangeGet16",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller17",
+          "callee": "app/store/store.go::Circle.Area17",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller17",
+          "callee": "app/store/store.go::Square.Side17",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller18",
+          "callee": "app/store/store.go::PathErr.Detail18",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller19",
+          "callee": "app/internal/secret/secret.go::Target19",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller20",
+          "callee": "libmod/lib.go::LibTarget20",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller20",
+          "callee": "libmod/lib.go::LibType20.LibMethod20",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller25",
+          "callee": "app/store/store.go::NewStore",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller25",
+          "callee": "app/store/store.go::Store.Ctor25",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller26",
+          "callee": "app/store/store.go::NewStore",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller26",
+          "callee": "app/store/store.go::Store.Ctor25",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller28",
+          "callee": "app/util/util.go::Target28",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller29",
+          "callee": "app/store/store.go::NewStore",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Caller29",
+          "callee": "app/store/store.go::Store.Close29",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::NewService",
+          "callee": "app/store/store.go::NewStore",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Service.Caller09",
+          "callee": "app/store/store.go::Logger.Log09",
+          "impls": [
+            "app/internal/secret/widen.go::FileSink.Log09",
+            "app/main.go::nopLogger.Log09"
+          ]
+        },
+        {
+          "caller": "app/svc/svc.go::Service.Caller15",
+          "callee": "app/store/store.go::Store.PtrGet03",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc.go::Service.Caller15",
+          "callee": "app/svc/svc.go::Repo.Find15",
+          "impls": [
+            "app/svc/svc.go::SQLRepo.Find15"
+          ]
+        },
+        {
+          "caller": "app/svc/svc.go::Service.Caller24",
+          "callee": "app/store/store.go::Store.ElemGet24",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/svc_test.go::TestCaller01Table",
+          "callee": "app/svc/svc.go::Caller01",
+          "impls": []
+        },
+        {
+          "caller": "app/util/util.go::Target02b",
+          "callee": "app/util/util2.go::Target02",
+          "impls": []
+        },
+        {
+          "caller": "app/web/web.go::Routes",
+          "callee": "app/web/web.go::Handler.ServeItems14",
+          "impls": []
+        },
+        {
+          "caller": "app/web/web.go::Routes",
+          "callee": "app/web/web.go::handleIndex14",
+          "impls": []
+        },
+        {
+          "caller": "app/web/web.go::Routes",
+          "callee": "app/web/web.go::handleWrapped14",
+          "impls": []
+        },
+        {
+          "caller": "app/web/web.go::Routes",
+          "callee": "app/web/web.go::inline14",
+          "impls": []
+        }
+      ]
+    }
+  ],
+  "dead": []
+}

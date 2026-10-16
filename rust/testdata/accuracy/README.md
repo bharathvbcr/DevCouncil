@@ -125,10 +125,51 @@ Labels file shape:
 ```json
 {
   "edges":  [{"language": "go", "caller": "<symbol id>", "callee": "<symbol id>", "correct": true}],
-  "recall": [{"language": "go", "construct": "typed receiver", "caller": "<symbol id>", "name": "Get", "truth": "<symbol id>"}],
+  "recall": [{"language": "go", "construct": "typed receiver", "caller": "<symbol id>", "name": "Get", "truth": "<symbol id>|<symbol id>"}],
+  "oracle": [{"language": "go", "covered_callers": ["<symbol id or file>"],
+              "uses": [{"caller": "<symbol id>", "callee": "<symbol id>", "impls": ["<symbol id>"]}]}],
   "dead":   [{"language": "go", "id": "<file>::<symbol>", "truly_dead": false}]
 }
 ```
+
+* `edges` are hand judgements of edges DevMap emitted; one naming no edge in
+  the build is an error (regenerate the labels).
+* `recall` rows are call sites with their true callee; `a|b` in `truth` means
+  an edge to any one of them is the call (an interface method or one of its
+  implementations).
+* `oracle` is a type checker's account of a language: every use of an in-repo
+  function or method it bound, from every caller it read. Every confident
+  Calls/References edge to a function or method from a covered caller is
+  judged against it (right when the oracle bound the pair or the interface
+  method it implements); edges from callers it did not read (build-tagged
+  files) stay unjudged. It depends on the corpus alone, so it does not go
+  stale when DevMap's edges move.
+* `dead` must label every confident-branch dead row of each language the file
+  labels: the row always carries `dead_fp_by_tier.0.9`, and `rows: 0` must
+  mean the confident branch was empty. An unlabelled one is an error naming it.
+* A pinned language the file says nothing about gets no `corpora` row at all
+  (its gates stay unmeasured), never an empty one.
+
+`corpora` holds two kinds of row under one corpus name: the labelled dead
+record below (`commit`) and the runner's rows (`corpus_commit`). A runner row
+supersedes only the runner row before it.
+
+**Go labels** come from `tools/accuracy/cmd/golabel`, a `go/types` oracle
+(`golang.org/x/tools/go/packages`, owner decision D-8, in its own module, not
+the host's): it loads every module under the root with its tests and writes
+`recall` (constructs: the audit's receiver shapes) and `oracle`. Dead rows are
+a judgement it does not make; `-dead <file>` merges hand-labelled ones:
+
+```text
+go -C tools/accuracy run ./cmd/golabel -root <checkout> -dead <dead.json> \
+  -o <checkout>/.devmap-accuracy/labels.json
+```
+
+`go.labels.json` beside this README is its output on the Go fixture. Its
+golden test (`go test ./...` in `tools/accuracy`) keeps the file equal to the
+labeller; `the_go_oracle_labels_name_the_fixture_build_and_score_it_clean`
+scores DevMap against it, so the labeller's symbol ids and DevMap's are held
+equal on every construct the fixture has.
 
 For Rust, `construct` is `free_self` or `non_self`, the two classes the recall
 floors (Rust 91 / 46) are set on. The gates: confident precision >= 0.95,
