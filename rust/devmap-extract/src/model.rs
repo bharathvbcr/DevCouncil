@@ -1565,6 +1565,13 @@ pub struct Extraction {
     /// in scope — which the call alone cannot say.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scope_receivers: Vec<ScopeReceiver>,
+    /// Names a Swift file declares with `typealias`, anywhere in it, sorted. A
+    /// member alias (`extension Host { typealias Entry = Item }`) makes `Entry`
+    /// another spelling of `Item` inside `Host`, and a file that writes `Entry`
+    /// cannot tell that from a top-level `Entry` declared elsewhere; the
+    /// resolver, which sees every file, abstains on such a name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub swift_type_aliases: Vec<String>,
     /// Whether a Go file carries a build constraint — a `//go:build` or
     /// `// +build` directive, or an implicit `_GOOS`/`_GOARCH` filename suffix.
     /// Always false for non-Go files.

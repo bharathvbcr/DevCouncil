@@ -901,9 +901,20 @@ fn resolve_type(index: &FileIndex, from: Node, source: &str, short: &str) -> Opt
 }
 
 /// Whether a written type names something this file declares with `typealias`.
+/// A typealias another file declares is the resolver's to refuse: it alone sees
+/// every file (`Extraction::swift_type_aliases`).
 fn names_alias(from: Node, source: &str, ty: &str) -> bool {
     let bare = ty.trim_matches(['[', ']', '?']);
     file_index(from, source).is_some_and(|index| index.aliases.contains(bare))
+}
+
+/// Every name the file declares with `typealias`, anywhere, sorted.
+pub(crate) fn declared_aliases(root: Node, source: &str) -> Vec<String> {
+    let mut names: Vec<String> = file_index(root, source)
+        .map(|index| index.aliases.iter().cloned().collect())
+        .unwrap_or_default();
+    names.sort();
+    names
 }
 
 fn enclosing_type(from: Node) -> Option<Node> {
@@ -1751,6 +1762,22 @@ mod tests {
              func f() {{ let g: (Step) -> Void = {{ $0.weight() }}; _ = g }}"
         );
         assert_eq!(ty_of(&lambda_bound(&annotated, 0), "$0"), None);
+    }
+
+    #[test]
+    fn declared_aliases_lists_every_typealias_including_member_ones() {
+        let source = "typealias Step = Parcel\nextension Host { typealias Entry = Item }\n\
+             struct Host { typealias Row = Item }";
+        reset();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_swift::LANGUAGE.into())
+            .expect("swift grammar");
+        let tree = parser.parse(source, None).expect("parse");
+        assert_eq!(
+            declared_aliases(tree.root_node(), source),
+            vec!["Entry".to_string(), "Row".to_string(), "Step".to_string()]
+        );
     }
 
     #[test]

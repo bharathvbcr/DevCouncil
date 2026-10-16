@@ -942,6 +942,11 @@ fn extract_treesitter_before_deadline(
                     } else {
                         Vec::new()
                     },
+                    swift_type_aliases: if lang == "swift" {
+                        crate::swiftscope::declared_aliases(root, source)
+                    } else {
+                        Vec::new()
+                    },
                     go_build_constrained: lang == "go" && go_build_constrained(path, source),
                     go_interface_methods,
                     go_method_params,
@@ -2138,6 +2143,7 @@ fn unparsed_extraction(
         go_package: None,
         jvm_package: None,
         scope_receivers: Vec::new(),
+        swift_type_aliases: Vec::new(),
         go_build_constrained: false,
         go_interface_methods: Vec::new(),
         go_method_params: Vec::new(),
@@ -2354,6 +2360,7 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
         go_package: None,
         jvm_package: None,
         scope_receivers: Vec::new(),
+        swift_type_aliases: Vec::new(),
         go_build_constrained: false,
         go_interface_methods: Vec::new(),
         go_method_params: Vec::new(),
