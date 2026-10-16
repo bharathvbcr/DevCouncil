@@ -15,7 +15,11 @@ use std::path::Path;
 
 /// The coverage-gap label a budget refusal is stored under: it is a
 /// `ParseOutcome::Failed`, so it lands in `parse_failed` beside grammar faults.
-const PARSE_FAILED_GAP: &str = "parse_failed";
+/// The label has one owner, `ExtractionGap`, which the write side stores and
+/// `CoverageGaps::slot` reads, so a rename cannot split the readers.
+fn parse_failed_gap() -> &'static str {
+    devmap_analyze::ExtractionGap::ParseFailed.label()
+}
 
 /// `?1` generation, `?2` gap label, `?3` prefix length, `?4` prefix. `substr`
 /// rather than `LIKE`: the prefix is compared literally and case-sensitively,
@@ -1354,7 +1358,7 @@ generation {latest}; run `devmap status` to re-verify",
             &format!("SELECT COUNT(*) FROM generation_coverage_gaps WHERE {BUDGET_GAP_FILTER}"),
             params![
                 generation,
-                PARSE_FAILED_GAP,
+                parse_failed_gap(),
                 prefix.chars().count() as i64,
                 prefix
             ],
@@ -1370,7 +1374,7 @@ generation {latest}; run `devmap status` to re-verify",
             .query_map(
                 params![
                     generation,
-                    PARSE_FAILED_GAP,
+                    parse_failed_gap(),
                     prefix.chars().count() as i64,
                     prefix,
                     crate::COVERAGE_GAP_SAMPLE as i64
@@ -1407,7 +1411,7 @@ generation {latest}; run `devmap status` to re-verify",
         let rows = stmt.query_map(
             params![
                 generation,
-                PARSE_FAILED_GAP,
+                parse_failed_gap(),
                 prefix.chars().count() as i64,
                 prefix
             ],
