@@ -36,14 +36,16 @@ func RunCLI(ctx context.Context, root string, client *store.Client, taskID strin
 	if taskID != "" {
 		taskIDs = []string{taskID}
 	} else {
-		ids, err := client.ReadyTasks(ctx)
+		ready, err := client.ReadyTasks(ctx, store.ReadyMode(gate.Mode))
 		if err != nil {
 			writeJSON(map[string]any{"ok": false, "error": err.Error()})
 			return 1
 		}
 		// ReadyTasks may be empty; fall back to listing is not available —
 		// require an explicit task id when nothing is ready.
-		taskIDs = ids
+		for _, t := range ready {
+			taskIDs = append(taskIDs, t.ID)
+		}
 		if len(taskIDs) == 0 {
 			writeJSON(map[string]any{"ok": false, "error": "No tasks found to verify."})
 			return 1

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -338,19 +337,15 @@ func TestReadyTasksReOffersATaskWhoseHolderDied(t *testing.T) {
 	}
 	seedTask(t, c, "TASK-1")
 
-	ready, err := c.ReadyTasks(ctx)
-	if err != nil {
-		t.Fatalf("ready: %v", err)
-	}
-	if len(ready) != 1 || ready[0] != "TASK-1" {
+	if ready := readyIDs(t, c); len(ready) != 1 || ready[0] != "TASK-1" {
 		t.Fatalf("ready before the lease = %v", ready)
 	}
 
 	if _, err := c.Acquire(ctx, AcquireRequest{TaskID: "TASK-1", Owner: "builder-1", TTL: time.Second}); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	if ready, err = c.ReadyTasks(ctx); err != nil || len(ready) != 0 {
-		t.Fatalf("a held task was still offered: %v (%v)", ready, err)
+	if ready := readyIDs(t, c); len(ready) != 0 {
+		t.Fatalf("a held task was still offered: %v", ready)
 	}
 
 	// The holder is gone and its TTL has passed. Nothing else looks at the row
@@ -362,24 +357,28 @@ func TestReadyTasksReOffersATaskWhoseHolderDied(t *testing.T) {
 	// the clock reads X+2. Sleeping only just past the TTL would make this pass
 	// or fail on where the second boundary happened to fall.
 	time.Sleep(2200 * time.Millisecond)
-	ready, err = c.ReadyTasks(ctx)
-	if err != nil {
-		t.Fatalf("ready: %v", err)
-	}
-	if len(ready) != 1 || ready[0] != "TASK-1" {
+	if ready := readyIDs(t, c); len(ready) != 1 || ready[0] != "TASK-1" {
 		t.Fatalf("ready after the lease expired = %v; a crashed builder's task was never re-offered", ready)
 	}
 }
 
-// seedTask plants the row DevCouncil's planner would have written. Planning is
-// not this client's job, so the task arrives through sqlite3 rather than
-// through an API this package would otherwise have to grow.
+// seedTask plants a ready task as the workbench item it is, through the store's
+// own `work` command: there is one definition of a task and no private copy.
 func seedTask(t *testing.T, c *Client, id string) {
 	t.Helper()
-	sql := fmt.Sprintf(
-		"INSERT INTO tasks (id,title,description,planned_files_json,status) VALUES ('%s','t','d','[]','ready');", id)
-	cmd := exec.Command(testsupport.Tool(t, "sqlite3"), c.DB, sql)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("seeding %s: %v %s", id, err, out)
+	testsupport.SeedTask(t, c.DB, testsupport.TaskSeed{ID: id, Title: "t"})
+}
+
+// readyIDs is what `next_task` could offer under enforce.
+func readyIDs(t *testing.T, c *Client) []string {
+	t.Helper()
+	ready, err := c.ReadyTasks(context.Background(), ReadyEnforce)
+	if err != nil {
+		t.Fatalf("ready: %v", err)
 	}
+	ids := []string{}
+	for _, r := range ready {
+		ids = append(ids, r.ID)
+	}
+	return ids
 }

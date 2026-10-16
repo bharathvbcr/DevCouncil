@@ -47,3 +47,41 @@ pub fn seeded(name: &str) -> PathBuf {
     assert_eq!(reply.code, 0, "seeding the store: {}", reply.stdout);
     db
 }
+
+/// The `items.put` request that makes one task: a workbench item of this
+/// repository, with the status and scope object a test names. Items are the
+/// only way a task comes to exist now, so every suite plants through here.
+pub fn item_request(id: &str, status: &str, scope: &str) -> String {
+    format!(
+        r#"{{"request_id":"plant-{id}","id":"{id}","expected_revision":0,"title":"planted {id}","status":"{status}","repository_ids":["this-repo"],"primary_repository_id":"this-repo","scope":{scope}}}"#
+    )
+}
+
+/// Plants a task through an open store handle.
+pub fn plant(store: &dc_store::Store, id: &str, status: &str, scope: &str) {
+    store.ensure_local_repository().expect("local repository");
+    store
+        .workbench_request("items.put", &item_request(id, status, scope))
+        .unwrap_or_else(|e| panic!("planting {id}: {e}"));
+}
+
+/// Plants a task the way an operator does, through the `dcstore` binary.
+pub fn plant_db(db: &Path, id: &str, status: &str, scope: &str) {
+    let repo = dcstore(db, &["local-repository"]);
+    assert_eq!(repo.code, 0, "local repository: {}", repo.stdout);
+    let reply = dcstore(
+        db,
+        &[
+            "work",
+            "--method",
+            "items.put",
+            "--input",
+            &item_request(id, status, scope),
+        ],
+    );
+    assert!(
+        reply.stdout.contains("\"ok\":true"),
+        "planting {id}: {}",
+        reply.stdout
+    );
+}

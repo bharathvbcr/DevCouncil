@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -48,11 +47,7 @@ func TestALiveHostFollowsTheGateConfigAndFailsClosedWhenItCannotRead(t *testing.
 	if _, err := client.ActiveLeases(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	sql := "INSERT INTO tasks (id,title,description,planned_files_json,expected_tests_json,status) " +
-		`VALUES ('TASK-G','gate','','[]','[]','ready');`
-	if out, err := exec.Command(testsupport.Tool(t, "sqlite3"), client.DB, sql).CombinedOutput(); err != nil {
-		t.Fatalf("task fixture: %v %s", err, out)
-	}
+	testsupport.SeedTask(t, client.DB, testsupport.TaskSeed{ID: "TASK-G", Title: "gate"})
 	reg := devcouncil.NewRegistry(root, client, nil)
 
 	if got := reg.GateState(); got.Mode != "off" {

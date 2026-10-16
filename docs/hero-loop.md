@@ -8,8 +8,11 @@ supplies state and verification; it does not run the agent’s model loop.
 ## Prerequisites
 
 - Native `devcouncil`, `dcstore` and `dcverify` binaries on the consumer’s PATH.
-- A project `.devcouncil/state.sqlite` initialized by a store client or consuming
-  application, with a real task, planned files and expected commands.
+- A task in the project's task store (`.devcouncil/state.sqlite`, or the
+  repo-local file named by `workbench.db`), created with `devcouncil task create`
+  or synced in from a board: a workbench item with a `scope` of planned files and
+  expected commands. `devcouncil doctor` shows what `devcouncil_next_task` will
+  offer.
 - Host MCP registration pointing at the intended project.
 - An explicit choice of gate mode. Default `off` is not a verification pass.
 

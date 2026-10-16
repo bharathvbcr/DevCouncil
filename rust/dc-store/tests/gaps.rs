@@ -14,6 +14,7 @@
 use dc_store::Store;
 use rusqlite::Connection;
 
+#[allow(dead_code)]
 mod support;
 use support::{dcstore, seeded, temp_dir};
 

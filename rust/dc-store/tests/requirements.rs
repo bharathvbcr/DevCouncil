@@ -22,24 +22,20 @@
 
 use dc_store::Store;
 
+#[allow(dead_code)]
 mod support;
-use support::{dcstore, seeded};
+use support::{dcstore, plant, plant_db, seeded};
 
 /// Plants a task carrying both links, exactly as DevCouncil's planner writes
 /// them, and returns the database path.
 fn task_with_links(name: &str) -> std::path::PathBuf {
     let db = seeded(name);
-    let store = Store::open(&db).expect("open store");
-    store
-        .connection()
-        .execute(
-            "INSERT INTO tasks (id, title, description, status, \
-             requirement_ids_json, acceptance_criterion_ids_json) \
-             VALUES ('TASK-1', 'planted', '', 'ready', \
-             '[\"REQ-1\",\"REQ-2\"]', '[\"AC-1\",\"AC-2\",\"AC-3\"]')",
-            [],
-        )
-        .expect("plant task");
+    plant_db(
+        &db,
+        "TASK-1",
+        "ready",
+        r#"{"requirement_ids":["REQ-1","REQ-2"],"acceptance_criterion_ids":["AC-1","AC-2","AC-3"]}"#,
+    );
     db
 }
 
@@ -94,16 +90,7 @@ fn the_links_reach_the_boundary_reply() {
 #[test]
 fn a_task_with_no_links_reads_as_empty_rather_than_absent() {
     let db = seeded("requirements-empty");
-    let store = Store::open(&db).expect("open store");
-    store
-        .connection()
-        .execute(
-            "INSERT INTO tasks (id, title, description, status) \
-             VALUES ('TASK-1', 'planted', '', 'ready')",
-            [],
-        )
-        .expect("plant task");
-    drop(store);
+    plant_db(&db, "TASK-1", "ready", "{}");
 
     let store = Store::open(&db).expect("reopen store");
     let task = store
@@ -128,8 +115,8 @@ fn task_with_requirement_rows(name: &str) -> std::path::PathBuf {
     store
         .connection()
         .execute_batch(
-            "UPDATE tasks SET requirement_ids_json = '[\"REQ-2\",\"REQ-GONE\",\"REQ-1\"]' \
-               WHERE id = 'TASK-1'; \
+            "UPDATE work_items SET body = json_set(body, '$.scope.requirement_ids', \
+               json('[\"REQ-2\",\"REQ-GONE\",\"REQ-1\"]')) WHERE id = 'TASK-1'; \
              INSERT INTO requirements (id, title, description, priority, source, \
                acceptance_criteria_json) VALUES \
                ('REQ-1', 'sums', 'adds two numbers', 'high', 'user', \
@@ -232,14 +219,16 @@ fn the_requirements_reach_the_boundary_reply() {
 fn a_malformed_requirement_column_is_an_error_not_a_broken_reply() {
     let db = seeded("requirements-malformed");
     let store = Store::open(&db).expect("open store");
+    plant(&store, "TASK-1", "ready", "{}");
+    // Another writer sharing the file leaves a scalar where a list belongs; the
+    // validated write path would have refused it.
     store
         .connection()
         .execute(
-            "INSERT INTO tasks (id, title, description, status, requirement_ids_json) \
-             VALUES ('TASK-1', 'planted', '', 'ready', '\"REQ-1\"')",
+            "UPDATE work_items SET body = json_set(body, '$.scope.requirement_ids', 'REQ-1')",
             [],
         )
-        .expect("plant task");
+        .expect("plant malformed scope");
     drop(store);
 
     let store = Store::open(&db).expect("reopen store");
@@ -248,7 +237,7 @@ fn a_malformed_requirement_column_is_an_error_not_a_broken_reply() {
         .expect_err("a non-array requirement column must not read as a task");
     let message = err.to_string();
     assert!(
-        message.contains("requirement_ids_json"),
+        message.contains("scope.requirement_ids"),
         "the error must name the column that is wrong: {message}"
     );
 }

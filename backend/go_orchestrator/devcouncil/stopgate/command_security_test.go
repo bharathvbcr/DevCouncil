@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
@@ -32,14 +31,11 @@ func TestRealStoreStopGateCannotPassAFailedCommandFromItsOutput(t *testing.T) {
 			if _, err := client.ActiveLeases(ctx); err != nil {
 				t.Fatal(err)
 			}
-			commands, err := json.Marshal([]string{test.command})
+			scope, err := json.Marshal(map[string]any{"expected_tests": []string{test.command}})
 			if err != nil {
 				t.Fatal(err)
 			}
-			sql := "INSERT INTO tasks (id,title,description,planned_files_json,expected_tests_json,status) VALUES ('SECURITY-CHECK','check','','[]','" + strings.ReplaceAll(string(commands), "'", "''") + "','ready');"
-			if out, err := exec.Command(testsupport.Tool(t, "sqlite3"), client.DB, sql).CombinedOutput(); err != nil {
-				t.Fatalf("task fixture: %v %s", err, out)
-			}
+			testsupport.SeedTask(t, client.DB, testsupport.TaskSeed{ID: "SECURITY-CHECK", Title: "check", Scope: string(scope)})
 			out := stopgate.Run(ctx, stopgate.Input{Root: root, Store: client, TaskID: "SECURITY-CHECK", GateMode: "enforce"})
 			if out.Decision.Allow != test.passed || out.MCP.Passed != test.passed || out.Decision.Skipped {
 				t.Fatalf("store-backed command result: %+v", out)

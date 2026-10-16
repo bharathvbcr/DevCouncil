@@ -718,6 +718,15 @@ func VerifyTask(ctx context.Context, root string, client *store.Client, taskID s
 		// the store never recorded must not be acted on as if it had been.
 		return result, gaps, fmt.Errorf("its result was not recorded in the store: %w", persistErr)
 	}
+	// A pass puts the task in review. It is a person who closes it to done: a
+	// verifier proving the diff is not the owner accepting the work. Only a real
+	// pass moves it — a skipped, degraded or blocked run does not — and only from
+	// in progress, so verifying a task nobody checked out changes nothing.
+	if result.Passed && result.Status == "verified" {
+		if _, err := client.MoveTaskStatus(ctx, taskID, store.StatusInProgress, store.StatusReview); err != nil {
+			return result, gaps, fmt.Errorf("it passed, but the task could not be moved to review: %w", err)
+		}
+	}
 	return result, gaps, nil
 }
 

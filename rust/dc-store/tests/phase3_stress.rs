@@ -7,6 +7,9 @@ use dc_store::{AcquireRequest, SCHEMA_VERSION, Store, schema};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
+#[allow(dead_code)]
+mod support;
+
 #[test]
 fn schema_newer_than_known_is_refused() {
     let store = Store::open_in_memory().expect("open");
@@ -68,14 +71,8 @@ fn concurrent_acquire_elects_exactly_one_holder() {
     let db = dir.join("state.sqlite");
     {
         let store = Store::open(&db).expect("create");
-        // Seed a task row so ready/task paths stay coherent under contention.
-        store
-            .connection()
-            .execute(
-                "INSERT INTO tasks (id, title, description) VALUES ('RACE', 'r', 'd')",
-                [],
-            )
-            .expect("seed");
+        // Seed a task so ready/task paths stay coherent under contention.
+        support::plant(&store, "RACE", "ready", "{}");
     }
 
     let barrier = Arc::new(Barrier::new(16));

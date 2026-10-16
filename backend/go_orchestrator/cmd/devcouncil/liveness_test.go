@@ -205,10 +205,10 @@ func TestPackagedSkillsNameOnlyLiveToolsAndCommands(t *testing.T) {
 // nothing. Each of these is a shape the skills and refusals actually used.
 func TestLivenessScannerCatchesTheRetiredShapes(t *testing.T) {
 	text := "Run `dev status` or `uv run dev map`, then\n```bash\ndev repair TASK-1 # fix\n" +
-		"dev verify TASK-1\n```\nand `cd x && dev doctor`. A dev schema is prose."
+		"dev verify TASK-1\n```\nand `cd x && dev checkout`. A dev schema is prose."
 	got := deadInvocations(commandInvocations(codeFragments(text)))
 	sort.Strings(got)
-	want := []string{"dev doctor", "dev repair TASK-1 # fix", "dev status",
+	want := []string{"dev checkout", "dev repair TASK-1 # fix", "dev status",
 		"uv run dev map (no `uv` entry point runs the host)"}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("dead invocations = %q, want %q", got, want)
