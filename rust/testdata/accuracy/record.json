@@ -1774,20 +1774,20 @@
         "found": 1,
         "truly_dead": 1
       },
-      "devmap_commit": "2286fc440d486aa9beae370bcfa8ca8b9266d385",
+      "devmap_commit": "ad07225360453790467f5c410133dc2161c821a3",
       "expected_edge_rows": 104,
       "forbid_any_tier_rows": 4,
       "forbid_rows": 10,
-      "high_edges_correct": 85,
+      "high_edges_correct": 94,
       "high_edges_false": 2,
       "honest_miss": {
-        "absent": 19,
+        "absent": 10,
         "rate": 1.0,
-        "recorded": 19
+        "recorded": 10
       },
-      "precision_at_0.9": 0.977,
-      "present": 85,
-      "recall": 0.817
+      "precision_at_0.9": 0.979,
+      "present": 94,
+      "recall": 0.904
     },
     "typescript": {
       "dead": {
