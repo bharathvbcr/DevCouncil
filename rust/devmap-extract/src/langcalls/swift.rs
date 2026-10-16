@@ -312,11 +312,83 @@ fn swift_navigation_call<'tree>(nav: Node<'tree>, source: &str) -> Option<SwiftC
     }
     Some(SwiftCall {
         callee_name,
-        receiver_expr: receiver_from(target, source),
+        receiver_expr: swift_receiver(target, source),
         name_node,
         kind: ReferenceKind::Call,
         operator: false,
     })
+}
+
+/// The longest receiver text kept whole; past it, or across lines, a
+/// construction is collapsed to its head (`clamp_receiver` owns the same limit).
+const WHOLE_RECEIVER_BYTES: usize = 96;
+
+/// The receiver text for a member call's target.
+///
+/// Two shapes reach `receiver_from` as text the resolver cannot read:
+///
+/// * `!Probe().snapshot()`: tree-sitter-swift binds the `!` to `Probe`, so the
+///   target is the call `!Probe()` and the text starts with an operator. Swift
+///   applies a prefix operator to the whole member chain, so the receiver of
+///   `.snapshot` is `Probe()`; the operand is read, never the operator.
+/// * `Svc(\n root: "a",\n limit: 2\n).scan()`: `clamp_receiver` keeps the first
+///   line and a `…`, which loses the closing parenthesis the resolver needs to
+///   see one construction. A construction that is multi-line or longer than the
+///   whole-receiver limit is written `Svc(…)`: the callee and a balanced, elided
+///   argument list. Only a bare-name callee with a parenthesised argument list
+///   is collapsed; a trailing-closure call or a chain keeps the old clamp.
+fn swift_receiver(target: Node, source: &str) -> Option<String> {
+    let mut target = swift_unwrap_prefix(target).unwrap_or(target);
+    // `try Svc(…).run()` and `await Svc(…).run()`: the effect keyword wraps the
+    // construction in the target; the receiver is what it wraps.
+    for _ in 0..4 {
+        if !matches!(target.kind(), "try_expression" | "await_expression") {
+            break;
+        }
+        let mut cursor = target.walk();
+        let inner = target
+            .named_children(&mut cursor)
+            .find(|child| !matches!(child.kind(), "try_operator" | "await_operator" | "comment"));
+        match inner {
+            Some(inner) => target = inner,
+            None => break,
+        }
+    }
+    if target.kind() != "call_expression" {
+        return receiver_from(target, source);
+    }
+    let Some(callee) = swift_callee_target(target) else {
+        return receiver_from(target, source);
+    };
+    let head = swift_unwrap_prefix(callee).unwrap_or(callee);
+    if head.kind() != "simple_identifier" || swift_is_subscript(target) {
+        return receiver_from(target, source);
+    }
+    let Some(text) = source.get(head.start_byte()..target.end_byte()) else {
+        return receiver_from(target, source);
+    };
+    let parenthesised = {
+        let mut cursor = target.walk();
+        let found = target
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "call_suffix")
+            .is_some_and(|suffix| {
+                let mut inner = suffix.walk();
+                let first = suffix.named_children(&mut inner).next();
+                first.is_some_and(|args| {
+                    args.kind() == "value_arguments"
+                        && args.child(0).is_some_and(|open| open.kind() == "(")
+                }) && text.ends_with(')')
+            });
+        found
+    };
+    if parenthesised && (text.contains('\n') || text.len() > WHOLE_RECEIVER_BYTES) {
+        return Some(format!("{}(…)", get_node_text(head, source)));
+    }
+    if head.id() != callee.id() {
+        return clamp_receiver(text);
+    }
+    receiver_from(target, source)
 }
 
 /// The type named by a `user_type`, and the type or module qualifying it.
@@ -407,4 +479,115 @@ fn swift_assignment_binding(node: Node, source: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The receiver text recorded for every call named `callee`, in source order.
+    fn receivers(source: &str, callee: &str) -> Vec<Option<String>> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_swift::LANGUAGE.into())
+            .expect("swift grammar");
+        let tree = parser.parse(source, None).expect("parse");
+        let mut calls = Vec::new();
+        let mut references = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            extract_swift_call(node, source, "a.swift", &mut calls, &mut references);
+            for index in (0..node.child_count()).rev() {
+                if let Some(child) = node.child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+        calls
+            .into_iter()
+            .filter(|call| call.callee_name == callee)
+            .map(|call| call.receiver_expr)
+            .collect()
+    }
+
+    fn one(source: &str, callee: &str) -> Option<String> {
+        let found = receivers(source, callee);
+        assert_eq!(found.len(), 1, "calls to {callee}: {found:?}");
+        found.into_iter().next().flatten()
+    }
+
+    #[test]
+    fn a_prefix_operator_is_not_part_of_a_constructed_receiver() {
+        assert_eq!(
+            one("func f() -> Bool { !Probe().snapshot().ok }", "snapshot").as_deref(),
+            Some("Probe()")
+        );
+        assert_eq!(
+            one("func f() { _ = -Meter(v: 1).bump() }", "bump").as_deref(),
+            Some("Meter(v: 1)")
+        );
+        assert_eq!(
+            one("func f() { _ = !!Probe().snapshot() }", "snapshot").as_deref(),
+            Some("Probe()")
+        );
+    }
+
+    #[test]
+    fn a_prefix_on_a_plain_name_leaves_the_name() {
+        assert_eq!(
+            one("func f() { _ = !flag.toggled() }", "toggled").as_deref(),
+            Some("flag")
+        );
+    }
+
+    #[test]
+    fn a_construction_receiver_is_whole_on_one_line_and_elided_across_lines() {
+        let one_line = "func f() { Svc(root: \"a\", limit: 2).scan() }";
+        assert_eq!(
+            one(one_line, "scan").as_deref(),
+            Some("Svc(root: \"a\", limit: 2)")
+        );
+        let two = "func f() {\n    Svc(root: \"a\",\n        limit: 2).scan()\n}";
+        assert_eq!(one(two, "scan").as_deref(), Some("Svc(…)"));
+        let many = "func f() {\n    Svc(\n        root: \"a\",\n        limit: 2,\n        deep: 3\n    ).scan()\n}";
+        assert_eq!(one(many, "scan").as_deref(), Some("Svc(…)"));
+        let long = format!("func f() {{ Svc(root: \"{}\").scan() }}", "x".repeat(200));
+        assert_eq!(one(&long, "scan").as_deref(), Some("Svc(…)"));
+    }
+
+    #[test]
+    fn an_effect_keyword_is_not_part_of_a_constructed_receiver() {
+        for keyword in ["try", "await", "try await"] {
+            let source = format!(
+                "func f() async throws {{\n    {keyword} Svc(\n        a: 1\n    ).run()\n}}"
+            );
+            assert_eq!(one(&source, "run").as_deref(), Some("Svc(…)"), "{keyword}");
+        }
+        assert_eq!(
+            one("func f() throws { try Svc(a: 1).run() }", "run").as_deref(),
+            Some("Svc(a: 1)")
+        );
+    }
+
+    #[test]
+    fn a_multi_line_construction_under_a_prefix_operator_is_elided_too() {
+        let source = "func f() -> Bool {\n    !Probe(\n        a: 1\n    ).snapshot().ok\n}";
+        assert_eq!(one(source, "snapshot").as_deref(), Some("Probe(…)"));
+    }
+
+    #[test]
+    fn only_a_parenthesised_construction_is_elided() {
+        // A trailing-closure call is not a construction with an argument list.
+        let closure = "func f() {\n    Stack {\n        a()\n    }.run()\n}";
+        let got = one(closure, "run");
+        assert_ne!(got.as_deref(), Some("Stack(…)"), "{got:?}");
+        // A chain keeps the first-line clamp: its head is not a bare name.
+        let chain = "func f() {\n    Svc(\n        a: 1\n    ).make().scan()\n}";
+        let got = one(chain, "scan");
+        assert_ne!(got.as_deref(), Some("Svc(…)"), "{got:?}");
+        // A subscript is not a call of the collection.
+        let subscript = "func f() {\n    items[\n        0\n    ].run()\n}";
+        let got = one(subscript, "run");
+        assert_ne!(got.as_deref(), Some("items(…)"), "{got:?}");
+    }
 }
