@@ -60,10 +60,41 @@ fn is_metal_path(path: &str) -> bool {
 /// a repository containing one would look like a hang, and a daemon rebuild
 /// would hold its lock for the duration.
 ///
-/// Five seconds is far above any legitimate file measured on the corpora in
-/// this repository (the slowest real source parses in single-digit
-/// milliseconds) and far below the pathological case.
+/// Five seconds is far above what a legitimate file costs on an idle machine
+/// and far below the pathological case. Measured on the real corpora: the
+/// largest source seen (624 KB, 12,353 lines) takes **875 ms** standalone at a
+/// load average of 85, and most files take single-digit milliseconds.
+///
+/// It is a *wall-clock* bound, so it is not load-independent: the parallel
+/// pass runs one file per rayon worker, and under heavy contention (load
+/// 100-300) that 875 ms file stretches past five seconds and is refused. That
+/// is a property of the clock, not of the file, so a budget refusal in the
+/// parallel pass is not final: `extract_all_with_budgets` and
+/// `retry_budget_refusals` re-run each such file serially, with no sibling
+/// competing for the cores, under [`RETRY_BUDGET_FACTOR`] times this budget
+/// (25 s). Only a file that overruns that too stays refused, and it is named
+/// in the extraction report and in `devmap status` (`parse_failed`).
 pub const DEFAULT_PARSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How much larger the serial retry budget is than the parallel-pass budget.
+///
+/// Five: enough to absorb the 6x contention stretch measured on the 875 ms
+/// file's worst case once the contention within the process is gone, while
+/// keeping the retry bounded at 25 s per file against the 131 s pathological
+/// C++ input.
+pub const RETRY_BUDGET_FACTOR: u32 = 5;
+
+/// At most this many files are retried per build, so a corpus full of
+/// pathological inputs costs at most `MAX_BUDGET_RETRIES x 25 s` of serial
+/// retry rather than `N x 25 s`. Files past the cap stay refused and are
+/// counted in `BudgetRetryReport::not_retried`.
+pub const MAX_BUDGET_RETRIES: usize = 16;
+
+/// Stamp a budget-overrun reason so [`crate::model::Extraction::is_budget_refusal`]
+/// can recognise it. The single constructor of such reasons.
+pub(crate) fn budget_refusal_reason(detail: String) -> String {
+    format!("{}{detail}", crate::model::BUDGET_REFUSAL_PREFIX)
+}
 
 /// Grammars deliberately not routed to, and why.
 ///
@@ -378,9 +409,9 @@ pub fn extract_treesitter_with_budget(
             path,
             lang,
             source,
-            format!(
+            budget_refusal_reason(format!(
                 "extraction finalization exceeded the {budget:?} budget; no symbols are claimed for this file"
-            ),
+            )),
         )
     } else {
         extraction
@@ -477,12 +508,12 @@ fn extract_treesitter_before_deadline(
                     path,
                     lang,
                     source,
-                    format!(
+                    budget_refusal_reason(format!(
                         "parse of {} bytes exceeded the {:?} budget for grammar {grammar} \
                          (stopped at {elapsed:?}); no symbols are claimed for this file",
                         source.len(),
                         budget
-                    ),
+                    )),
                 );
             }
             ParseAttempt::GrammarLoadFailed => {
@@ -561,11 +592,11 @@ fn extract_treesitter_before_deadline(
                 // in the tail cannot be reported differently from one cut short
                 // in the walk.
                 let over_budget = |phase: &str| {
-                    format!(
+                    budget_refusal_reason(format!(
                         "extraction of {} bytes exceeded the {budget:?} budget for grammar \
                          {grammar} while {phase}; no symbols are claimed for this file",
                         source.len()
-                    )
+                    ))
                 };
                 let walk_completed = walk_tree(
                     root,
@@ -1049,7 +1080,9 @@ fn parse_outcome_of(root: Node, source: &str, is_metal: bool, is_python: bool) -
             since_check = 0;
             if walk_deadline_passed() {
                 return ParseOutcome::Failed {
-                    reason: "parse outcome validation exceeded the extraction budget".to_string(),
+                    reason: budget_refusal_reason(
+                        "parse outcome validation exceeded the extraction budget".to_string(),
+                    ),
                 };
             }
         }
