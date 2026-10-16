@@ -20,6 +20,7 @@ import {
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const GO_MODULE = path.join(REPO_ROOT, "backend", "go_orchestrator");
+const ACCURACY_MODULE = path.join(REPO_ROOT, "tools", "accuracy");
 
 /** Steps that could not run. They are listed at the end and never counted as passes. */
 const notRun = [];
@@ -140,20 +141,22 @@ function gofmtClean() {
   }
   const gofmt = path.join(goroot, "bin", process.platform === "win32" ? "gofmt.exe" : "gofmt");
   console.log(`gofmt from ${toolchain}`);
-  const result = spawnSync(gofmt, ["-l", "."], {
-    cwd: GO_MODULE,
-    encoding: "utf8",
-    shell: false,
-  });
-  if (result.error) {
-    console.error(`FAIL: gofmt could not run: ${result.error.message}`);
-    process.exit(2);
-  }
-  const extra = (result.stdout || "").trim();
-  if (result.status !== 0 || extra) {
-    if (extra) console.error(extra);
-    console.error("FAIL: gofmt would rewrite files");
-    process.exit(1);
+  for (const cwd of [GO_MODULE, ACCURACY_MODULE]) {
+    const result = spawnSync(gofmt, ["-l", "."], {
+      cwd,
+      encoding: "utf8",
+      shell: false,
+    });
+    if (result.error) {
+      console.error(`FAIL: gofmt could not run: ${result.error.message}`);
+      process.exit(2);
+    }
+    const extra = (result.stdout || "").trim();
+    if (result.status !== 0 || extra) {
+      if (extra) console.error(extra);
+      console.error(`FAIL: gofmt would rewrite files in ${path.relative(REPO_ROOT, cwd)}`);
+      process.exit(1);
+    }
   }
 }
 
@@ -216,6 +219,9 @@ function main() {
   run("go orchestrator tests", "go", ["test", "./...", "-count=1"], {
     cwd: GO_MODULE,
   });
+  // The go/types labeller behind the DevMap corpus record, its own module.
+  run("accuracy labeller vet", "go", ["vet", "./..."], { cwd: ACCURACY_MODULE });
+  run("accuracy labeller tests", "go", ["test", "./...", "-count=1"], { cwd: ACCURACY_MODULE });
   run("rust verify --quick", "bash", ["./verify.sh", "--quick"], {
     cwd: path.join(REPO_ROOT, "rust"),
   });
