@@ -52,7 +52,7 @@ fn a_budget_refusal_committed_in_a_generation_is_reparsed_by_the_next_build() {
 fn a_recovered_extraction_committed_in_a_generation_is_a_cache_hit() {
     let store = Store::open_in_memory().unwrap();
     let recovered = extract_file_with_budget(PATH, SRC, Duration::from_secs(60));
-    commit(&store, &[recovered.clone()]);
+    commit(&store, std::slice::from_ref(&recovered));
     let progress = devmap_extract::progress::FileProgress::default();
     let next = extract_scanned_for_generation(&store, &scanned(), Some(&progress)).unwrap();
     assert_eq!(progress.snapshot().cache_hits, 1);
