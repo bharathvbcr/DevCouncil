@@ -2,7 +2,6 @@ package devcouncil_test
 
 import (
 	"context"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -51,12 +50,8 @@ func scopedStore(t *testing.T) *store.Client {
 	if _, err := client.ActiveLeases(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	planned := `[{"path":"src/a.go","allowed_change":"modify"},{"path":".env","allowed_change":"modify"}]`
-	sql := "INSERT INTO tasks (id,title,description,planned_files_json,expected_tests_json,status) " +
-		"VALUES ('TASK-1','scope','','" + planned + "','[]','ready');"
-	if out, err := exec.Command(testsupport.Tool(t, "sqlite3"), client.DB, sql).CombinedOutput(); err != nil {
-		t.Fatalf("task fixture: %v %s", err, out)
-	}
+	testsupport.SeedTask(t, client.DB, testsupport.TaskSeed{ID: "TASK-1", Title: "scope",
+		Scope: `{"planned_files":[{"path":"src/a.go","allowed_change":"modify"},{"path":".env","allowed_change":"modify"}]}`})
 	return client
 }
 

@@ -103,6 +103,10 @@ type response struct {
 	SuggestedTool   string   `json:"suggested_tool"`
 	Task            *Task    `json:"task"`
 	Tasks           []string `json:"tasks"`
+	// Ready is `ready`'s detail, one entry per id in Tasks and in the same order.
+	Ready  []ReadyTask `json:"ready"`
+	Mode   string      `json:"mode"`
+	RepoID string      `json:"repository_id"`
 	// Degraded and UnreadableLeases: leases whose expiry the store could not
 	// read. They are excluded from Tasks and Leases and named here.
 	Degraded         bool              `json:"degraded"`
@@ -174,6 +178,18 @@ func (c *Conflict) Error() string {
 // Code returns the lease code an agent branches on.
 func (c *Conflict) Code() dc.LeaseCode { return dc.LeaseHeldByOther }
 
+// TaskUnavailable reports that the task cannot be leased: it is not a live item
+// of this repository, it is archived, or its status is not one that can be
+// worked. Like Conflict it is an ordinary outcome a caller routes on.
+type TaskUnavailable struct {
+	TaskID string
+	// Code is the store's: no_such_task, task_archived or task_not_ready.
+	Code   string
+	Reason string
+}
+
+func (e *TaskUnavailable) Error() string { return "store: " + e.Reason }
+
 // AcquireRequest asks for a lease.
 type AcquireRequest struct {
 	TaskID   string
@@ -221,6 +237,10 @@ func (c *Client) Acquire(ctx context.Context, req AcquireRequest) (*Lease, error
 	if !out.OK {
 		if out.Code == string(dc.LeaseHeldByOther) {
 			return nil, &Conflict{TaskID: req.TaskID, Holder: out.Holder}
+		}
+		switch out.Code {
+		case "no_such_task", "task_archived", "task_not_ready":
+			return nil, &TaskUnavailable{TaskID: req.TaskID, Code: out.Code, Reason: out.Error}
 		}
 		return nil, fmt.Errorf("store: acquire failed: %s", out.Error)
 	}
@@ -323,6 +343,10 @@ type Task struct {
 	// coverage gate cannot tell apart from a task that satisfies none.
 	RequirementIDs         []string `json:"requirement_ids"`
 	AcceptanceCriterionIDs []string `json:"acceptance_criterion_ids"`
+	// BlockingGapCount is derived from the task's gaps on every read; "blocked"
+	// is not a status. An explicit checkout of a blocked task still works, and
+	// this is how its payload says why it is blocked.
+	BlockingGapCount int `json:"blocking_gap_count"`
 }
 
 // Domain converts to the type the policy gate evaluates against.
@@ -561,25 +585,76 @@ func rawArray(raw json.RawMessage) string {
 // the read and the swap.
 const scopeStaleCode = "scope_stale"
 
+// ReadyMode is the gate mode as `ready` orders work by it. Under Enforce a task
+// with a blocking gap is not offered; under Advisory and Off it is listed after
+// every unblocked one, flagged not ready to check out.
+type ReadyMode string
+
+const (
+	ReadyEnforce  ReadyMode = "enforce"
+	ReadyAdvisory ReadyMode = "advisory"
+	ReadyOff      ReadyMode = "off"
+)
+
+// ReadyTask is one task `ready` offers, with what makes it more or less ready.
+type ReadyTask struct {
+	ID               string `json:"id"`
+	ReadyToCheckout  bool   `json:"ready_to_checkout"`
+	BlockingGapCount int    `json:"blocking_gap_count"`
+}
+
 // ReadyReport is ReadyTasks plus the leases the store could not judge, so an
 // operator sees why a task is missing rather than the store failing as a whole.
-func (c *Client) ReadyReport(ctx context.Context) ([]string, []UnreadableLease, error) {
-	out, err := c.run(ctx, "ready")
+func (c *Client) ReadyReport(ctx context.Context, mode ReadyMode) ([]ReadyTask, []UnreadableLease, error) {
+	out, err := c.run(ctx, "ready", "--mode", string(mode))
 	if err != nil {
 		return nil, nil, err
 	}
-	return out.Tasks, out.UnreadableLeases, nil
+	ready, err := readyFrom(out)
+	if err != nil {
+		return nil, nil, err
+	}
+	return ready, out.UnreadableLeases, nil
 }
 
-// ReadyTasks lists tasks that are workable and unheld. The two conditions are
-// answered in one query on the store side, so a caller cannot be handed a task
-// that was claimed between them.
-func (c *Client) ReadyTasks(ctx context.Context) ([]string, error) {
-	out, err := c.run(ctx, "ready")
-	if err != nil {
-		return nil, err
+// ReadyTasks lists the workbench items that are workable and unheld, in the
+// order the mode dictates. The conditions are answered in one query on the store
+// side, so a caller cannot be handed a task that was claimed between them. The
+// mode is the caller's and is required: a caller that does not say which gate is
+// in force does not get to guess the permissive one.
+func (c *Client) ReadyTasks(ctx context.Context, mode ReadyMode) ([]ReadyTask, error) {
+	ready, _, err := c.ReadyReport(ctx, mode)
+	return ready, err
+}
+
+// readyFrom checks that the detail and the id list describe the same tasks
+// before either is believed.
+func readyFrom(out *response) ([]ReadyTask, error) {
+	if len(out.Ready) != len(out.Tasks) {
+		return nil, fmt.Errorf("store: ready listed %d ids but %d details", len(out.Tasks), len(out.Ready))
 	}
-	return out.Tasks, nil
+	for i, t := range out.Ready {
+		if t.ID != out.Tasks[i] {
+			return nil, fmt.Errorf("store: ready detail %d is %q but the id list says %q", i, t.ID, out.Tasks[i])
+		}
+		if t.ReadyToCheckout != (t.BlockingGapCount == 0) {
+			return nil, fmt.Errorf("store: ready task %s says ready_to_checkout=%v with %d blocking gaps", t.ID, t.ReadyToCheckout, t.BlockingGapCount)
+		}
+	}
+	return out.Ready, nil
+}
+
+// LocalRepository makes sure the repository row every task names as its
+// primary exists, and returns its id.
+func (c *Client) LocalRepository(ctx context.Context) (string, error) {
+	out, err := c.run(ctx, "local-repository")
+	if err != nil {
+		return "", err
+	}
+	if out.RepoID == "" {
+		return "", errors.New("store: local-repository returned no repository id")
+	}
+	return out.RepoID, nil
 }
 
 // Available reports whether the store is reachable and usable.
@@ -640,7 +715,7 @@ const exclusionIndexVerified = "verified"
 
 // SchemaVersion is the lease-schema revision this harness understands. It must
 // match dc_store::SCHEMA_VERSION; Available refuses to proceed when it does not.
-const SchemaVersion = 9
+const SchemaVersion = 10
 
 // storeIdentity is the name the real store answers to.
 const storeIdentity = "dc-store"

@@ -69,12 +69,8 @@ func repoWithWorkingTreeChange(t *testing.T, path, content string) string {
 // plantTask inserts one ready task with the given planned file.
 func plantTask(t *testing.T, client *store.Client, id, plannedFile string) {
 	t.Helper()
-	planned := `[{"path":"` + plannedFile + `","allowed_change":"modify"}]`
-	sql := "INSERT INTO tasks (id,title,description,planned_files_json,expected_tests_json,status) " +
-		"VALUES ('" + id + "','rigor','','" + planned + "','[]','ready');"
-	if out, err := exec.Command(testsupport.Tool(t, "sqlite3"), client.DB, sql).CombinedOutput(); err != nil {
-		t.Fatalf("task fixture: %v %s", err, out)
-	}
+	testsupport.SeedTask(t, client.DB, testsupport.TaskSeed{ID: id, Title: "rigor",
+		Scope: `{"planned_files":[{"path":"` + plannedFile + `","allowed_change":"modify"}]}`})
 }
 
 func newStore(t *testing.T) *store.Client {

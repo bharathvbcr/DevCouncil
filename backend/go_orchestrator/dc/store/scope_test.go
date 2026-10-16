@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"strings"
 	"sync"
 	"testing"
@@ -32,12 +31,8 @@ func newScopeFixture(t *testing.T, plannedJSON string) *scopeFixture {
 	if _, err := c.ActiveLeases(ctx); err != nil {
 		t.Fatalf("store: %v", err)
 	}
-	sql := "INSERT INTO tasks (id,title,description,planned_files_json,status) VALUES ('TASK-1','t','d','" +
-		strings.ReplaceAll(plannedJSON, "'", "''") + "','ready');"
-	cmd := exec.Command(testsupport.Tool(t, "sqlite3"), c.DB, sql)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("seeding a task failed: %v %s", err, out)
-	}
+	testsupport.SeedTask(t, c.DB, testsupport.TaskSeed{ID: "TASK-1", Title: "t",
+		Scope: `{"planned_files":` + plannedJSON + `}`})
 
 	lease, err := c.Acquire(ctx, AcquireRequest{TaskID: "TASK-1", Owner: "builder-1", TTL: 15 * time.Minute})
 	if err != nil {

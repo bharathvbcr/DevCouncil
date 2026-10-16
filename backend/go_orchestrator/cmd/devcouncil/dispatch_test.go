@@ -111,7 +111,8 @@ func TestDispatchGateHelp(t *testing.T) {
 }
 
 func TestUnknownCommandExit2(t *testing.T) {
-	for _, name := range []string{"boot", "status", "init", "doctor"} {
+	// `doctor` is not here: it is a live command again (it reports the task store).
+	for _, name := range []string{"boot", "status", "init", "checkout"} {
 		t.Run(name, func(t *testing.T) {
 			stderr, restore := swapStderr(t)
 			code := dispatch([]string{name})

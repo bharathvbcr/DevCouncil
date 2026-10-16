@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -43,12 +42,8 @@ func startLiveHost(t *testing.T, command string) *liveHost {
 		t.Fatal(err)
 	}
 	pidFile := filepath.Join(root, "child.pid")
-	cmdJSON, _ := json.Marshal([]string{strings.ReplaceAll(command, "PIDFILE", pidFile)})
-	sql := "INSERT INTO tasks (id,title,description,planned_files_json,expected_tests_json,status) " +
-		"VALUES ('TASK-L','live','','[]','" + string(cmdJSON) + "','ready');"
-	if out, err := exec.Command(testsupport.Tool(t, "sqlite3"), client.DB, sql).CombinedOutput(); err != nil {
-		t.Fatalf("task fixture: %v %s", err, out)
-	}
+	scope, _ := json.Marshal(map[string]any{"expected_tests": []string{strings.ReplaceAll(command, "PIDFILE", pidFile)}})
+	testsupport.SeedTask(t, client.DB, testsupport.TaskSeed{ID: "TASK-L", Title: "live", Scope: string(scope)})
 	pr, pw := io.Pipe()
 	h := &liveHost{t: t, in: pw, out: &syncBuffer{}, done: make(chan error, 1), pidFile: pidFile}
 	srv := &mcp.Server{Registry: devcouncil.NewRegistry(root, client, nil), In: pr, Out: h.out, Err: io.Discard}

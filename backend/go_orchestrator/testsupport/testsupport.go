@@ -42,6 +42,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -162,6 +163,56 @@ var buildsMu sync.Mutex
 
 // DCStore builds the Rust store binary and returns its path.
 func DCStore(t testing.TB) string { return cargoBin(t, "dc-store", "dcstore") }
+
+// TaskSeed describes one task to plant in a store: a workbench item of the
+// store's repository. Zero values are a ready task titled after its ID with an
+// empty scope.
+type TaskSeed struct {
+	ID     string
+	Status string
+	Title  string
+	// Scope is the item's scope object as JSON; empty means {}.
+	Scope string
+	// Priority is 1 (highest) to 3; zero leaves the default.
+	Priority int
+}
+
+// SeedTask plants a task the way an operator does, through `dcstore work`, so
+// the test exercises the one definition of a task rather than a private copy
+// of its storage. The store is created if it does not exist. A refusal fails
+// the test with the store's own message.
+func SeedTask(t testing.TB, db string, seed TaskSeed) {
+	t.Helper()
+	bin := DCStore(t)
+	run := func(args ...string) string {
+		out, err := exec.Command(bin, append([]string{"--db", db}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("dcstore %s: %v\n%s", args[0], err, out)
+		}
+		return string(out)
+	}
+	run("local-repository")
+	if seed.Status == "" {
+		seed.Status = "ready"
+	}
+	if seed.Title == "" {
+		seed.Title = seed.ID
+	}
+	if seed.Scope == "" {
+		seed.Scope = "{}"
+	}
+	priority := ""
+	if seed.Priority != 0 {
+		priority = fmt.Sprintf(`,"priority":%d`, seed.Priority)
+	}
+	title, _ := json.Marshal(seed.Title)
+	input := fmt.Sprintf(`{"request_id":"seed-%s","id":%q,"expected_revision":0,"title":%s,"status":%q%s,`+
+		`"repository_ids":["this-repo"],"primary_repository_id":"this-repo","scope":%s}`,
+		seed.ID, seed.ID, title, seed.Status, priority, seed.Scope)
+	if out := run("work", "--method", "items.put", "--input", input); !strings.Contains(out, `"ok":true`) {
+		t.Fatalf("seeding task %s was refused: %s", seed.ID, out)
+	}
+}
 
 // DCVerify builds the Rust verifier binary and returns its path.
 func DCVerify(t testing.TB) string { return cargoBin(t, "dc-verify", "dcverify") }

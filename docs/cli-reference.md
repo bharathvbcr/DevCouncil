@@ -65,6 +65,8 @@ Usage:
   devcouncil integrate uninstall --target hooks        # Uninstall integration hooks
   devcouncil skills list                               # List embedded agent skills
   devcouncil skills scaffold [options]                 # Distribute skills into project
+  devcouncil task create|status|show …                 # Create, move and show tasks (workbench items)
+  devcouncil doctor [--json]                           # Which store next_task reads; how many ready items it holds
   devcouncil verify TASK_ID [options]                  # Deterministically verify a task diff
   devcouncil map [devmap args…]                        # Exec `devmap` (bare: build --manifest)
   devcouncil graph …                                   # Alias of map
@@ -82,6 +84,36 @@ cargo install --git https://github.com/bharathvbcr/DevCouncil.git --locked devma
 ```
 
 There is no `uv` / Python install path.
+
+### Tasks
+
+A task is a workbench item in the repository's task store. These commands wrap
+`dcstore work` and refuse what the store refuses.
+
+```bash
+devcouncil task create --id ID --title TITLE [--description TEXT] [--status S] [--priority 1-3] \
+                       [--scope-json JSON | --scope-file PATH] [--project-root DIR]
+devcouncil task status ID --to inbox|backlog|ready|in_progress|review|done
+devcouncil task show ID [--json]
+devcouncil doctor [--json] [--project-root DIR]
+```
+
+- `--scope-json` / `--scope-file` is the item's `scope`: `planned_files` (paths or
+  `{path, allowed_change, reason}` with `allowed_change` one of `create`, `modify`,
+  `delete`, `read_only`), `forbidden_changes`, `allowed_commands`, `expected_tests`,
+  `requirement_ids`, `acceptance_criterion_ids`, `difficulty`. An invalid scope is
+  refused with code `invalid_scope`. Planned paths are repository-relative: no
+  absolute path, no `..`, no backslash; each list holds at most 1024 entries.
+- Checkout sets the task `in_progress`; a verify that passes sets it `review`; a
+  person moves it to `done`.
+- `blocked` is not a status. A task is blocked while it has a blocking gap.
+  Under `enforce`, `devcouncil_next_task` leaves it out; under `advisory` and
+  `off` it comes after every unblocked task with `ready_to_checkout: false` and a
+  `blocking_gap_count`. An explicit checkout still works.
+- `doctor` prints which database `next_task` reads (the `workbench.db` config key,
+  default `.devcouncil/state.sqlite`, always inside `.devcouncil/`), the gate mode,
+  and how many ready items the store holds: all of them, and how many `next_task`
+  offers under that mode. It exits 1 when the store cannot be read.
 
 ### Host MCP Server
 
@@ -295,10 +327,10 @@ With Phase 7 and the transition to native Go and Rust binaries, legacy Python CL
 | `dev plan` / `dev approve` | Multi-agent LLM debate & tasks | Managed by upstream agent harnesses (e.g. **Manvi**) or interactive prompts. |
 | `dev run` / `dev e2e` / `dev go` | Python subprocess coding agent runner | Run agents natively via MCP (**Hero Loop**) or via **Manvi**. |
 | `dev prompt` / `dev handoff` | Formatted text prompt generation | Handled over MCP via task checkout contexts and skills. |
-| `dev status` / `dev checkout` / `dev tasks` / `dev doctor` | Python orientation and lease bootstrap | Go unknown command (exit 2). Policy `NoTaskAllowedCommands` no longer allowlists them (TASK-P7-9; `policy/command.go` admits only `git status`, `git diff`, `echo`, `true`, `:` and `dev map`, held to the dispatch table by `TestPolicyNamesOnlyLiveCommands`). Use `devcouncil mcp` tools / `devmap status` / `devmap doctor`. |
+| `dev status` / `dev checkout` / `dev tasks` | Python orientation and lease bootstrap | Go unknown command (exit 2). Policy `NoTaskAllowedCommands` no longer allowlists them (TASK-P7-9; `policy/command.go` admits only `git status`, `git diff`, `echo`, `true`, `:` and `dev map`, held to the dispatch table by `TestPolicyNamesOnlyLiveCommands`). Use `devcouncil mcp` tools, `devcouncil task show` / `devcouncil doctor`, or `devmap status`. |
 | `dev check` / `dev check --verify` | Python LLM audit / demo check | Use `devcouncil verify TASK_ID --mode enforce --json` for an existing task, or `dcverify`. |
 | `dev wiki` / `dev okf` / `dev design` | Markdown wiki & OKF bundle generator | Managed guides are available with `devmap build --manifest --guides`; they do not replace the full wiki/OKF feature set. |
 | `dev dashboard` | Textual dashboard UI | Use DevMap HTML exports (`devmap html`, `devmap map-html`) or the consuming harness UI. |
-| `dev cost` / `dev doctor` | Python model pricing ledger & env checks | Health checks via `devmap doctor` and binary health flags. |
+| `dev cost` | Python model pricing ledger | Retired. (`devcouncil doctor` is a different, live command: it reports the task store.) Environment health checks: `devmap doctor` and binary health flags. |
 
 For detailed rationale on the retirement decisions, see [PHASE7_LONG_TAIL.md](PHASE7_LONG_TAIL.md). Open follow-ups: [TODO.md](TODO.md).

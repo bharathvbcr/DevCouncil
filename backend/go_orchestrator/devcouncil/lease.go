@@ -140,6 +140,16 @@ func (s *LeaseService) Checkout(ctx context.Context, taskID, clientID, agent str
 		TaskID: taskID, Owner: owner, Agent: agent, ClientID: clientID,
 		TTL: s.ttl(), Force: force,
 	})
+	var unavailable *store.TaskUnavailable
+	if errors.As(err, &unavailable) {
+		// The item was retired, archived or moved on between being read and
+		// being leased (the store decides inside the acquire transaction).
+		code := unavailable.Code
+		if code == "no_such_task" {
+			code = "not_found"
+		}
+		return map[string]any{"ok": false, "code": code, "error": unavailable.Reason, "task_id": taskID}
+	}
 	var conflict *store.Conflict
 	if errors.As(err, &conflict) {
 		// The same client asking again holds the lease already: hand it back
@@ -161,6 +171,23 @@ func (s *LeaseService) Checkout(ctx context.Context, taskID, clientID, agent str
 		return map[string]any{"ok": false, "error": err.Error(), "code": "store_error", "task_id": taskID}
 	}
 
+	// Checking a task out is what makes it in progress. It is the same
+	// revisioned edit the board makes, so a person sees the card move. Done only
+	// from `ready`: a task that was already started (a lapsed lease taken
+	// again) or that a person parked elsewhere is left where it is.
+	moved, err := s.Store.MoveTaskStatus(ctx, taskID, store.StatusReady, store.StatusInProgress)
+	if err != nil {
+		// A lease on a task the board still shows as ready would be invisible
+		// work. Give the lease back rather than hold it on a failed move.
+		_, _ = s.Store.Release(ctx, taskID, lease.Token)
+		return map[string]any{
+			"ok": false, "code": "store_error", "task_id": taskID,
+			"error": fmt.Sprintf("the lease was released because the task could not be marked in progress: %v", err),
+		}
+	}
+	if moved {
+		task.Status = store.StatusInProgress
+	}
 	payload := s.checkoutPayload(taskID, task, lease)
 	if revoked != "" {
 		payload["revoked_lease_owner"] = revoked
@@ -209,7 +236,7 @@ func (s *LeaseService) checkoutPayload(taskID string, task *store.Task, lease *s
 	}
 	status := task.Status
 	if status == "" {
-		status = "planned"
+		status = store.StatusReady
 	}
 	allowedCmds := task.AllowedCommands
 	if allowedCmds == nil {
@@ -227,6 +254,7 @@ func (s *LeaseService) checkoutPayload(taskID string, task *store.Task, lease *s
 		"expires_at":         lease.ExpiresAt,
 		"gate_mode":          gate.Mode,
 		"status":             status,
+		"blocking_gap_count": task.BlockingGapCount,
 		"planned_files":      planned,
 		"allowed_commands":   allowedCmds,
 		"expected_tests":     expected,
