@@ -112,3 +112,8 @@ required-features = ["parse"]
 [[test]]
 name = "a_recovered_file_replaces_its_stored_budget_refusal"
 required-features = ["parse"]
+
+# Shared-payload rewrite attack; needs `save_generation`.
+[[test]]
+name = "a_shared_payload_row_does_not_misreport_a_generation"
+required-features = ["parse"]
