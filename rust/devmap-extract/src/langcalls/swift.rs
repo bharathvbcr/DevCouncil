@@ -484,7 +484,10 @@ fn swift_cast_type(target: Node, source: &str) -> Option<String> {
         return None;
     }
     let (name, qualifier) = swift_user_type_identity(written, source)?;
-    if qualifier.is_some() || !starts_capitalised(&name) {
+    if qualifier.is_some()
+        || !starts_capitalised(&name)
+        || crate::swiftscope::is_generic_parameter(target, source, &name)
+    {
         return None;
     }
     Some(alias_name(target, source, name))

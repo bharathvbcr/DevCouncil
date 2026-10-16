@@ -97,6 +97,8 @@ struct AliasDef {
     /// What it stands for, read like any written type; `None` when it is
     /// generic, sits in a generic type or a protocol, or names no readable type.
     target: Option<String>,
+    /// Written as one bare nominal type, not an optional, array or tuple.
+    plain: bool,
 }
 
 /// What a file says about its `typealias` names. A written type that names one
@@ -107,6 +109,8 @@ struct AliasIndex {
     defs: HashMap<String, Vec<AliasDef>>,
     /// Short names of the types and protocols this file declares.
     types: HashSet<String>,
+    /// Names this file declares with `associatedtype`.
+    associated: HashSet<String>,
 }
 
 /// The root of the tree `node` sits in, `None` when the climb was cut short.
@@ -182,6 +186,18 @@ pub(crate) fn use_is_in_own_initializer(node: Node, source: &str, name: &str) ->
                 }
                 return bound.iter().any(|each| each == name);
             }
+            // `for x in x.sorted()`: the sequence is read before `x` is bound.
+            "for_statement" => {
+                let (Some(item), Some(collection)) = (
+                    parent.child_by_field_name("item"),
+                    parent.child_by_field_name("collection"),
+                ) else {
+                    return false;
+                };
+                let mut bound = Vec::new();
+                collect_bound(item, source, &mut bound);
+                return within(collection) && bound.iter().any(|each| each == name);
+            }
             "if_statement" | "guard_statement" | "while_statement" => {
                 // `introduced` is the name a condition binds, and `assigned` that
                 // its `=` was seen: `guard let s, s.ok` binds `s` with no
@@ -255,6 +271,11 @@ fn alias_index(from: Node, source: &str) -> Option<Rc<AliasIndex>> {
                 }
             }
             "typealias_declaration" => index_alias(node, source, &mut built),
+            "associatedtype_declaration" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    built.associated.insert(get_node_text(name, source));
+                }
+            }
             _ => {}
         }
         let mut cursor = node.walk();
@@ -313,7 +334,11 @@ fn index_alias(node: Node, source: &str, built: &mut AliasIndex) {
         .defs
         .entry(get_node_text(name, source))
         .or_default()
-        .push(AliasDef { holder, target });
+        .push(AliasDef {
+            holder,
+            target,
+            plain: written.is_some_and(|written| written.kind() == "user_type"),
+        });
 }
 
 /// What a bare type name written at `from` stands for, when this file's own
@@ -323,11 +348,79 @@ fn index_alias(node: Node, source: &str, built: &mut AliasIndex) {
 /// type's body is the name's meaning only inside that type: anywhere else the
 /// same spelling may be a type this file cannot see.
 pub(crate) fn alias_target(from: Node, source: &str, name: &str) -> Option<String> {
+    alias_target_in(from, source, name, false)
+}
+
+/// Whether `name` is a generic parameter of a declaration `from` sits in.
+pub(crate) fn is_generic_parameter(from: Node, source: &str, name: &str) -> bool {
+    let mut ancestor = bounded_parent(from);
+    while let Some(node) = ancestor {
+        if matches!(
+            node.kind(),
+            "function_declaration"
+                | "init_declaration"
+                | "class_declaration"
+                | "typealias_declaration"
+        ) && generic_names(node, source).contains(name)
+        {
+            return true;
+        }
+        ancestor = bounded_parent(node);
+    }
+    false
+}
+
+/// Whether a callable `from` sits in declares a `typealias` of `name` in its body.
+fn declares_local_alias(from: Node, source: &str, name: &str) -> bool {
+    let mut ancestor = bounded_parent(from);
+    while let Some(scope) = ancestor {
+        if matches!(
+            scope.kind(),
+            "function_declaration"
+                | "init_declaration"
+                | "deinit_declaration"
+                | "lambda_literal"
+                | "computed_property"
+        ) {
+            let mut stack = vec![scope];
+            let mut seen = 0usize;
+            while let Some(node) = stack.pop() {
+                seen += 1;
+                if seen > 20_000 {
+                    // Too large to read: not knowing is not a no.
+                    return true;
+                }
+                if node.kind() == "typealias_declaration"
+                    && node
+                        .child_by_field_name("name")
+                        .is_some_and(|each| get_node_text(each, source) == name)
+                {
+                    return true;
+                }
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+        }
+        ancestor = bounded_parent(scope);
+    }
+    false
+}
+
+/// [`alias_target`]; `receiver` also demands a plain nominal alias (`Parcel`,
+/// not `Parcel?` or `[Parcel]`), the only kind a static member is looked up on.
+fn alias_target_in(from: Node, source: &str, name: &str, receiver: bool) -> Option<String> {
     let index = alias_index(from, source)?;
     let [def] = index.defs.get(name)?.as_slice() else {
         return None;
     };
-    if index.types.contains(name) {
+    if index.types.contains(name) || index.associated.contains(name) {
+        return None;
+    }
+    if receiver && !def.plain {
+        return None;
+    }
+    // A generic parameter or a local alias of the name in scope is what it names.
+    if is_generic_parameter(from, source, name) || declares_local_alias(from, source, name) {
         return None;
     }
     let target = def.target.clone()?;
@@ -362,7 +455,7 @@ pub(crate) fn alias_of_type_name(from: Node, source: &str, name: &str) -> Option
     if !name.chars().next().is_some_and(char::is_uppercase) {
         return None;
     }
-    alias_target(from, source, name).filter(|target| !target.contains(['[', ']', '?']))
+    alias_target_in(from, source, name, true).filter(|target| !target.contains(['[', ']', '?']))
 }
 
 fn index_function(node: Node, source: &str, built: &mut FileIndex) {
@@ -720,7 +813,11 @@ fn compute(scope: Node, source: &str) -> Bindings {
                 && field_of(node, child) == Some("bound_identifier")
             {
                 // Already bound, and typed, by the statement's own handler.
-                out.entry(get_node_text(child, source)).or_default();
+                let name = get_node_text(child, source);
+                // A pattern that binds a name again hides what the first
+                // binding's members were typed through.
+                hide_members(&mut out, &name);
+                out.entry(name).or_default();
             } else {
                 stack.push(child);
             }
@@ -758,11 +855,20 @@ fn bind(out: &mut Bindings, name: String, ty: Option<String>) {
                 existing.ty = None;
                 existing.init = None;
             }
+            // A second binding of the name: which one a use means is not known,
+            // so what was typed through the first (`open.transform`) is not either.
+            hide_members(out, &name);
         }
         None => {
             out.insert(name, Bound { ty, init: None });
         }
     }
+}
+
+/// Drop the member paths (`name.label`, `name.0`) a name was typed through.
+fn hide_members(out: &mut Bindings, name: &str) {
+    let prefix = format!("{name}.");
+    out.retain(|key, _| !key.starts_with(&prefix));
 }
 
 fn parameter(node: Node, source: &str, bounds: &BTreeMap<String, String>, out: &mut Bindings) {
@@ -1424,7 +1530,7 @@ fn expression_type_unaliased(
             )
         }
         "call_expression" => {
-            if let Some(collection) = collection_call_type(node, source, &recurse) {
+            if let Some(collection) = collection_call_type(node, source, current, &recurse) {
                 return Some(collection);
             }
             // `f()` and `r.m()` name a signature only when they pass nothing: a
@@ -1494,6 +1600,7 @@ const SAME_ELEMENT_METHODS: &[&str] = &[
 fn collection_call_type(
     call: Node,
     source: &str,
+    current: &Bindings,
     recurse: &dyn Fn(Node) -> Option<String>,
 ) -> Option<String> {
     if swift_is_subscript_call(call) {
@@ -1517,9 +1624,74 @@ fn collection_call_type(
         return owner.starts_with('[').then_some(owner);
     }
     if method == "fetch" {
+        let target = callee.child_by_field_name("target")?;
+        if !is_model_context(target, source, current, recurse) {
+            return None;
+        }
         return fetched_collection(call, source);
     }
     None
+}
+
+/// Whether `target` is a SwiftData `ModelContext`: a name written as one, bound
+/// by `ModelContext(…)`, or a property wrapped `@Environment(\.modelContext)`.
+/// A file that declares its own `fetch`, `FetchDescriptor` or `ModelContext` is
+/// not asking SwiftData.
+fn is_model_context(
+    target: Node,
+    source: &str,
+    current: &Bindings,
+    recurse: &dyn Fn(Node) -> Option<String>,
+) -> bool {
+    let Some(index) = file_index(target, source) else {
+        return false;
+    };
+    if index.returns.contains_key("fetch")
+        || index.declared.contains_key("FetchDescriptor")
+        || index.declared.contains_key("ModelContext")
+    {
+        return false;
+    }
+    if recurse(target).as_deref() == Some("ModelContext") {
+        return true;
+    }
+    if target.kind() != "simple_identifier" {
+        return false;
+    }
+    let name = get_node_text(target, source);
+    // `let context = ModelContext(container)`.
+    if let Some(found) = current.get(&name) {
+        return found.init.as_deref() == Some("ModelContext");
+    }
+    let mut ancestor = bounded_parent(target);
+    while let Some(scope) = ancestor {
+        if is_scope(scope) || scope.kind() == "computed_property" {
+            if let Some(found) = bindings(scope, source).get(&name) {
+                return found.init.as_deref() == Some("ModelContext");
+            }
+        }
+        ancestor = bounded_parent(scope);
+    }
+    // `@Environment(\.modelContext) private var context` on the enclosing type.
+    let Some(owner) = enclosing_type(target) else {
+        return false;
+    };
+    let Some(body) = owner.child_by_field_name("body") else {
+        return false;
+    };
+    let mut cursor = body.walk();
+    let members: Vec<Node> = body.named_children(&mut cursor).collect();
+    members.into_iter().any(|member| {
+        if member.kind() != "property_declaration" {
+            return false;
+        }
+        let text = get_node_text(member, source);
+        let head = text.split(['=', '{']).next().unwrap_or("");
+        let compact: String = head.split_whitespace().collect();
+        compact.contains("@Environment(\\.modelContext)")
+            && (compact.ends_with(&format!("var{name}"))
+                || compact.contains(&format!("var{name}:")))
+    })
 }
 
 /// `[T]` for `x.fetch(FetchDescriptor<T>(…))`, the one argument a SwiftData
@@ -1563,6 +1735,10 @@ fn fetched_collection(call: Node, source: &str) -> Option<String> {
         return None;
     }
     let element = normalize(written, source, &BTreeMap::new())?;
+    // A generic parameter is no nominal type.
+    if is_generic_parameter(call, source, &element) {
+        return None;
+    }
     (!element.contains(['[', '?'])).then(|| format!("[{element}]"))
 }
 
@@ -1647,11 +1823,14 @@ fn in_optional_chain(node: Node, source: &str) -> bool {
                 ) else {
                     return false;
                 };
-                if source
-                    .get(target.end_byte()..suffix.end_byte())
-                    .is_some_and(|between| between.trim_start().starts_with('?'))
-                {
-                    return true;
+                // Only a `?.` on the chain's root — a parenthesised `try?` — is
+                // known to unwrap the optional this collection carries. After a
+                // named root (`h?.maybe.map`) the optional may be the member's
+                // own, and that `.map` is `Optional.map`.
+                if target.kind() == "tuple_expression" {
+                    return source
+                        .get(target.end_byte()..suffix.end_byte())
+                        .is_some_and(|between| between.trim_start().starts_with('?'));
                 }
                 node = target;
             }
@@ -2447,6 +2626,44 @@ mod tests {
              struct Host {{ func run() {{ let p = make(); p.weight() }} }}"
         );
         assert_eq!(ty_of(&bound(&elsewhere, "run"), "p"), None);
+    }
+
+    #[test]
+    fn a_fetch_is_swiftdatas_only_on_a_model_context() {
+        let map = |body: &str| {
+            format!(
+                "import SwiftData\nstruct Habit {{ func done() -> Bool {{ true }} }}\n\
+                 struct V {{ @Environment(\\.modelContext) private var env\n\
+                 @Environment(\\.other) private var other\n func f(_ ctx: ModelContext, _ x: Repo) {{ {body} }} }}"
+            )
+        };
+        let typed = |body: &str| ty_of(&lambda_bound(&map(body), 0), "$0");
+        let habit = Some("Habit".to_string());
+        let call = |receiver: &str| {
+            format!(
+                "_ = ((try? {receiver}.fetch(FetchDescriptor<Habit>())) ?? []).map {{ $0.done() }}"
+            )
+        };
+        assert_eq!(typed(&call("ctx")), habit);
+        assert_eq!(typed(&call("env")), habit);
+        assert_eq!(
+            typed(&format!("let c = ModelContext(k); {}", call("c"))),
+            habit
+        );
+        // A receiver the file does not show to be a ModelContext, and a property
+        // wrapped with another key, is not read.
+        assert_eq!(typed(&call("x")), None);
+        assert_eq!(typed(&call("other")), None);
+        assert_eq!(typed(&call("store.mainContext")), None);
+        assert_eq!(typed(&format!("let c = make(); {}", call("c"))), None);
+        // A file with its own `fetch` or `FetchDescriptor` is not asking SwiftData.
+        let own = format!("struct FetchDescriptor<T> {{}}\n{}", map(&call("ctx")));
+        assert_eq!(ty_of(&lambda_bound(&own, 0), "$0"), None);
+        // An optional member after `?.` keeps its own `Optional.map`.
+        let member = "struct Parcel { func weight() -> Int { 1 } }\n\
+                      struct Holder { var maybe: [Parcel]? }\n\
+                      func f(_ h: Holder?) { _ = h?.maybe.map { $0.weight() } }";
+        assert_eq!(ty_of(&lambda_bound(member, 0), "$0"), None);
     }
 
     const FETCH: &str = "import SwiftData\nstruct Habit { func done() -> Bool { true } }\n";

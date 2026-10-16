@@ -667,7 +667,16 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// handle (`PathLoadKind::ModuleName`), which a v88 row lacks, so `mod.f()`
 /// through it would stay unresolved. The resolver-accuracy lane stamped 88
 /// on this payload; it landed after the dead-policy lane, so it is 89.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "89";
+///
+/// v90 is the Swift recall lane's payload: a receiver or constructor named
+/// through a same-file `typealias` is the aliased type, `(x as? T)?.m()` is a
+/// call on `T`, a tuple parameter's member is a receiver of its written type,
+/// a bare call of a type's own parameterless method types the local it
+/// initialises, a SwiftData `fetch(FetchDescriptor<T>)` is `[T]`, a Swift name
+/// is not a local inside its own initializer, and a member chain after a sum
+/// (`a + b.c.run()`) has the receiver `b.c`. A v89 row keeps the old receivers
+/// and the dropped calls, so a warm cache would serve stale Swift edges.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "90";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
