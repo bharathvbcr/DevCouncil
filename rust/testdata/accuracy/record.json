@@ -1482,80 +1482,90 @@
       "corpus_commit": "b7a23d41c02e4e8cb88a9c6e4c96dc2c1ed2cdc4",
       "languages": {
         "kotlin": {
+          "carried_dead_evidence": {
+            "dead_fp_by_tier": {
+              "0.9": {
+                "false_positive": 0,
+                "rows": 9
+              }
+            },
+            "devmap_commit": "735e210eeb29a1d8bd94908268fc823808de806e",
+            "labelled_rows": [
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:afa825cdd6a9",
+                "verdict": "dead_true"
+              },
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:d27961dc3195",
+                "verdict": "dead_true"
+              },
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:9d58deeb07a7",
+                "verdict": "dead_true"
+              },
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:fdac8e796abf",
+                "verdict": "dead_true"
+              },
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:13af50120f5d",
+                "verdict": "dead_true"
+              },
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:ec479619d2a1",
+                "verdict": "dead_true"
+              },
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:eea668c56c21",
+                "verdict": "dead_true"
+              },
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:9ca12c9598c3",
+                "verdict": "dead_true"
+              },
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:b02cd7b020d7",
+                "verdict": "dead_true"
+              }
+            ],
+            "reason": "the dead labels these rows were scored from are lost. At 251d798f all 9 rows (matched by identity hash) are still reported by devmap dead, but coverage-capped at 0.66, none published at 0.9; their dead_true verdicts are not re-scored and their published tier of 0.9 is no longer what devmap reports",
+            "since": "2026-10-15",
+            "source_commit": "26c5139b",
+            "status": "carried, not re-scored",
+            "verified": false
+          },
           "confident_edge_precision": {
             "correct": 179,
             "rate": 0.9944444444444444,
             "total": 180
           },
-          "date": "2026-10-15",
-          "dead_fp_by_tier": {
-            "0.9": {
-              "false_positive": 0,
-              "rows": 9
-            }
-          },
-          "devmap_commit": "735e210eeb29a1d8bd94908268fc823808de806e",
+          "date": "2026-10-16",
+          "dead_fp_by_tier": {},
+          "devmap_commit": "251d798f2f58069ba698c4a379b8323709903753",
           "honest_miss": {
             "absent": 13,
             "rate": 1.0,
             "recorded": 13
           },
-          "labelled_rows": [
-            {
-              "evidence": "rg_declaration_only",
-              "published": "0.9",
-              "symbol": "h:afa825cdd6a9",
-              "verdict": "dead_true"
-            },
-            {
-              "evidence": "rg_declaration_only",
-              "published": "0.9",
-              "symbol": "h:d27961dc3195",
-              "verdict": "dead_true"
-            },
-            {
-              "evidence": "rg_declaration_only",
-              "published": "0.9",
-              "symbol": "h:9d58deeb07a7",
-              "verdict": "dead_true"
-            },
-            {
-              "evidence": "rg_declaration_only",
-              "published": "0.9",
-              "symbol": "h:fdac8e796abf",
-              "verdict": "dead_true"
-            },
-            {
-              "evidence": "rg_declaration_only",
-              "published": "0.9",
-              "symbol": "h:13af50120f5d",
-              "verdict": "dead_true"
-            },
-            {
-              "evidence": "rg_declaration_only",
-              "published": "0.9",
-              "symbol": "h:ec479619d2a1",
-              "verdict": "dead_true"
-            },
-            {
-              "evidence": "rg_declaration_only",
-              "published": "0.9",
-              "symbol": "h:eea668c56c21",
-              "verdict": "dead_true"
-            },
-            {
-              "evidence": "rg_declaration_only",
-              "published": "0.9",
-              "symbol": "h:9ca12c9598c3",
-              "verdict": "dead_true"
-            },
-            {
-              "evidence": "rg_declaration_only",
-              "published": "0.9",
-              "symbol": "h:b02cd7b020d7",
-              "verdict": "dead_true"
-            }
-          ],
+          "labelled_rows": [],
           "recall": {
             "by_construct": {
               "bare": {
@@ -2144,6 +2154,7 @@
     "Chronicle: typescript: honest-miss rate is unmeasured (no labels), so it cannot pass",
     "Chronicle: typescript: recall card target 0.850 is unmeasured (no labels), so it cannot pass",
     "Chronicle: typescript: recall is unmeasured (no labels), so it cannot pass",
+    "ChronosFlow: kotlin: 0.9-tier dead false-positive rate is unmeasured (no labels), so it cannot pass",
     "ChronosFlow: swift: 0.9-tier dead false-positive rate is unmeasured (no labels), so it cannot pass",
     "ChronosFlow: swift: recall 0.892 is below the card target 0.900",
     "DevPrism: no label-free measurement at the pinned commit af20d777393e95127404b5611275f67e9f81f130",
