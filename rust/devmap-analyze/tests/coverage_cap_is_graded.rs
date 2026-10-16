@@ -34,7 +34,8 @@
 
 use devmap_analyze::{
     analyze_liveness_with_coverage, DeadSymbolReport, DiscoveryCoverage, ExtractionCoverage,
-    COVERAGE_LOSS_CONFIDENCE_CAP, HIGHEST_DEGRADED_CONFIDENCE,
+    CONFIDENT_TIER_UNPROVEN, COVERAGE_LOSS_CONFIDENCE_CAP, HIGHEST_DEGRADED_CONFIDENCE,
+    UNPROVEN_TIER_CONFIDENCE,
 };
 use devmap_extract::extract_file;
 use devmap_extract::model::{Extraction, ExtractionEngine, ParseOutcome};
@@ -198,10 +199,23 @@ fn a_complete_corpus_is_not_graded_at_all() {
         coverage.is_complete(),
         "no blind file was added, so coverage must be complete: {coverage:?}"
     );
+    // Kotlin is off CONFIDENT_TIER_ELIGIBLE (its corpus proof is carried and
+    // unverified), so the confident branch publishes at the unproven 0.4 with
+    // `confident_tier_unproven`: still ungraded by coverage, still the branch.
     let confident = confidence_of(&reports, "neverCalled");
     assert!(
-        (confident - 0.9).abs() < 1e-6,
-        "a clean corpus must still reach the confident tier: {confident}"
+        (confident - f32::from(UNPROVEN_TIER_CONFIDENCE)).abs() < 1e-6,
+        "a clean corpus must still reach the confident branch: {confident}"
+    );
+    let row = reports
+        .iter()
+        .find(|r| r.symbol_name == "neverCalled")
+        .expect("neverCalled is reported");
+    assert!(
+        row.exemption_reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with(CONFIDENT_TIER_UNPROVEN)),
+        "{row:?}"
     );
 }
 
