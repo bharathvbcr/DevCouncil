@@ -610,6 +610,10 @@ pub struct Resolver {
     /// Rust type name → the type it `Deref`s to; `None` when two indexed
     /// `impl Deref` blocks disagree about a type of that name.
     rust_deref_targets: BTreeMap<String, Option<String>>,
+    /// Method name → every Rust method a blanket impl declares under that name
+    /// (`T.describe` for `impl<T: Display> Describe for T`), as `(file,
+    /// identity)`. See `Extraction::rust_blanket_impl_params`.
+    rust_blanket_methods: BTreeMap<String, Vec<(String, String)>>,
     /// Slash-separated components in the deepest path this resolver indexed.
     ///
     /// The module ladders in [`Self::resolve_import_path`] walk a specifier
@@ -710,6 +714,7 @@ impl Resolver {
             scope_locals: BTreeSet::new(),
             rust_inline_modules: BTreeMap::new(),
             rust_deref_targets: BTreeMap::new(),
+            rust_blanket_methods: BTreeMap::new(),
             max_indexed_path_depth: 0,
             unique_basename: BTreeMap::new(),
         }
@@ -1725,6 +1730,22 @@ impl Resolver {
     /// How many `Deref` hops a method lookup follows.
     const RUST_DEREF_HOPS: usize = 4;
 
+    /// The one method a Rust blanket impl declares under `method`, for a
+    /// receiver whose own type (and every type it derefs to) declares none.
+    ///
+    /// The impl's bound is not checked — that needs the trait solver — so two
+    /// blanket impls declaring the name abstain rather than pick one. One is
+    /// bound as `UniqueGlobal` (HIGH), not `ReceiverType`: nothing about the
+    /// receiver's type names it, only being the one blanket declaration of the
+    /// name in the family. It does not see a method the standard library
+    /// supplies under the same name.
+    fn rust_blanket_method(&self, method: &str) -> Option<&(String, String)> {
+        match self.rust_blanket_methods.get(method)?.as_slice() {
+            [one] => Some(one),
+            _ => None,
+        }
+    }
+
     /// `x` for the guard chains `x.borrow`, `x.borrow_mut`, `x.lock.unwrap`,
     /// `x.lock.expect`, `x.read.unwrap`, `x.write.unwrap` (and `expect`) the
     /// extractor spells a receiver `x.lock().unwrap()` as. A field that happens
@@ -2347,7 +2368,9 @@ impl Resolver {
             if path != file {
                 return None;
             }
-            if family == LangFamily::Go && *kind == SymbolKind::Method {
+            if (family == LangFamily::Go && *kind == SymbolKind::Method)
+                || Self::never_a_call_target(family, *kind)
+            {
                 return None;
             }
             let identity = identity.as_ref();
@@ -2953,6 +2976,7 @@ impl Resolver {
         self.scope_locals.clear();
         self.rust_inline_modules.clear();
         self.rust_deref_targets.clear();
+        self.rust_blanket_methods.clear();
         self.max_indexed_path_depth = extractions
             .iter()
             .map(|ext| ext.file_path.split('/').count())
@@ -3098,6 +3122,31 @@ impl Resolver {
                         }
                     })
                     .or_insert_with(|| Some(target.clone()));
+            }
+            if !ext.rust_blanket_impl_params.is_empty() {
+                for sym in ext
+                    .symbols
+                    .iter()
+                    .filter(|sym| sym.kind == SymbolKind::Method)
+                {
+                    let blanket = sym
+                        .parent_symbol
+                        .as_deref()
+                        .and_then(|parent| parent.rsplit("::").next())
+                        .is_some_and(|owner| {
+                            ext.rust_blanket_impl_params.iter().any(|p| p == owner)
+                        });
+                    if blanket {
+                        let hit = (ext.file_path.clone(), sym.qualified_name.clone());
+                        let hits = self
+                            .rust_blanket_methods
+                            .entry(sym.name.clone())
+                            .or_default();
+                        if !hits.contains(&hit) {
+                            hits.push(hit);
+                        }
+                    }
+                }
             }
             if !ext.rust_inline_modules.is_empty() {
                 self.rust_inline_modules.insert(
@@ -4940,6 +4989,10 @@ impl Resolver {
                     // type that lives outside the index binds nothing in it.
                     // What it cannot tell falls through to the rungs below.
                     let mut go_class: Option<UnresolvedClass> = None;
+                    // A Rust receiver typed to an indexed struct or enum that
+                    // declares, derefs to, inherits and is blanket-supplied no
+                    // member of this name (set by the typed-receiver rung).
+                    let mut rust_member_miss = false;
                     if resolution.is_none() {
                         if let Some(index) = &go_index {
                             match self.go_call(ext, index, call) {
@@ -5072,13 +5125,40 @@ impl Resolver {
                             let inherited = (own.is_none()
                                 && matches!(family, LangFamily::Swift | LangFamily::Rust)
                                 && !self.type_methods.contains_key(&key))
-                            .then(|| self.inherited_method(family, &class_type, &call.callee_name))
+                            .then(|| {
+                                self.inherited_method(family, &class_type, &call.callee_name)
+                                    .map(|(file, symbol, _)| (file, symbol))
+                            })
                             .flatten();
+                            // Failing that, the one a Rust blanket impl
+                            // supplies — see `rust_blanket_method` for its tier.
+                            let blanket = (family == LangFamily::Rust
+                                && own.is_none()
+                                && inherited.is_none()
+                                && !self.type_methods.contains_key(&key))
+                            .then(|| self.rust_blanket_method(&call.callee_name))
+                            .flatten();
+                            // The type is known and declares nothing by that
+                            // name: a miss about the member, not the receiver.
+                            if family == LangFamily::Rust
+                                && own.is_none()
+                                && inherited.is_none()
+                                && blanket.is_none()
+                                && self.declares_type(family, &class_type)
+                            {
+                                rust_member_miss = true;
+                            }
+                            if let Some((target_f, target_symbol)) = blanket {
+                                resolution = Some(Arc::new(Resolution::UniqueGlobal {
+                                    target_symbol: target_symbol.clone(),
+                                    target_file: target_f.clone(),
+                                    family,
+                                }));
+                            }
                             if let Some(((target_f, target_symbol), receiver_type)) = own
                                 .map(|(target, receiver_type)| (target.clone(), receiver_type))
                                 .or_else(|| {
-                                    inherited
-                                        .map(|(file, symbol, _)| ((file, symbol), class_type.clone()))
+                                    inherited.map(|(file, symbol)| ((file, symbol), class_type.clone()))
                                 })
                             {
                                 resolution = Some(match family {
@@ -5184,6 +5264,19 @@ impl Resolver {
                                     target_file: target_f.clone(),
                                     receiver_type: receiver_type.to_string(),
                                 }));
+                            } else if answers.is_empty() && !Self::rust_literal_types(recv).is_empty() {
+                                // No impl for the primitive itself: a blanket
+                                // impl (`impl<T: Display> Describe for T`) is
+                                // the one that can supply it.
+                                if let Some((target_f, target_symbol)) =
+                                    self.rust_blanket_method(&call.callee_name)
+                                {
+                                    resolution = Some(Arc::new(Resolution::UniqueGlobal {
+                                        target_symbol: target_symbol.clone(),
+                                        target_file: target_f.clone(),
+                                        family,
+                                    }));
+                                }
                             }
                         }
                     }
@@ -5434,7 +5527,14 @@ impl Resolver {
                             .is_none_or(Self::receiver_is_self)
                     {
                         if call.receiver_expr.is_none() {
-                            if let Some(target_symbol) = self.lexical_target(&ext.file_path, family, call.caller_symbol.as_deref(), &call.callee_name) {
+                            if let Some(target_symbol) = self
+                                .lexical_target(&ext.file_path, family, call.caller_symbol.as_deref(), &call.callee_name)
+                                .filter(|identity| {
+                                    !self.file_declares_as(&ext.file_path, identity, |kind| {
+                                        Self::never_a_call_target(family, kind)
+                                    })
+                                })
+                            {
                                 resolution = Some(Arc::new(Resolution::SameFile {
                                     target_symbol, target_file: ext.file_path.clone(),
                                 }));
@@ -5953,7 +6053,7 @@ impl Resolver {
                         // never dropped. Silence here is indistinguishable from
                         // "there was no call", which is the failure R5 forbids.
                         let class = go_class.unwrap_or_else(|| {
-                            self.classify_unresolved(
+                            match self.classify_unresolved(
                                 &ext.file_path,
                                 family,
                                 &call.callee_name,
@@ -5964,7 +6064,15 @@ impl Resolver {
                                     call.span.start_byte,
                                     call.receiver_expr.as_deref(),
                                 ),
-                            )
+                            ) {
+                                // The receiver was typed; only the member was
+                                // not found. A class that explains the miss
+                                // (no namesake anywhere, an external) stands.
+                                UnresolvedClass::UninferredReceiver if rust_member_miss => {
+                                    UnresolvedClass::UnresolvedMember
+                                }
+                                class => class,
+                            }
                         });
                         unresolved.push(UnresolvedReference {
                             source_file: ext.file_path.clone(),
@@ -5985,6 +6093,43 @@ impl Resolver {
                             site: Some(SiteBytes::of(&call.span)),
                         });
                     }
+                }
+
+                // `?` into a function's `Result<_, E>`: a possible call to the
+                // `From::from` impl `E` declares, at the dispatch tier — the
+                // operand's error type is not known, and when it is already `E`
+                // the identity conversion runs instead (see
+                // `Extraction::rust_try_conversions`). A candidate that names no
+                // indexed impl is dropped, like an operator candidate.
+                for conversion in &ext.rust_try_conversions {
+                    let Some(error_type) = conversion.receiver_expr.as_deref() else {
+                        continue;
+                    };
+                    let key = (family, error_type.to_string(), conversion.callee_name.clone());
+                    let Some((target_f, target_sym)) = self
+                        .type_methods
+                        .get(&key)
+                        .and_then(|hits| self.type_method_target(&ext.file_path, error_type, hits))
+                    else {
+                        continue;
+                    };
+                    let resolution = Arc::new(Resolution::Dispatch {
+                        candidates: vec![(target_f.to_string(), target_sym.to_string())].into(),
+                        via_file: target_f.to_string(),
+                        via_symbol: "core::convert::From.from".to_string(),
+                    });
+                    edges.push(ResolvedEdge::resolved(
+                        ext.file_path.clone(),
+                        target_f.to_string(),
+                        conversion
+                            .caller_symbol
+                            .clone()
+                            .unwrap_or_else(|| ext.file_path.clone()),
+                        self.qualified_for(target_f, target_sym),
+                        EdgeKind::Calls,
+                        resolution,
+                        Some("via From.from (`?`)".to_string()),
+                    ));
                 }
 
                 for reference in &ext.references {
@@ -6571,11 +6716,14 @@ impl Resolver {
     /// SAM conversions) and Java (`new Listener() { … }`) can name an interface
     /// in call position, so they keep the candidate.
     fn never_a_call_target(family: LangFamily, kind: SymbolKind) -> bool {
-        kind == SymbolKind::Interface
-            && matches!(
-                family,
-                LangFamily::Rust | LangFamily::Python | LangFamily::JsTs
-            )
+        // A macro is invoked as `name!(..)`, which its own reference records;
+        // `name()` is a function call, so a macro is never its target.
+        kind == SymbolKind::Macro
+            || (kind == SymbolKind::Interface
+                && matches!(
+                    family,
+                    LangFamily::Rust | LangFamily::Python | LangFamily::JsTs
+                ))
     }
 
     fn parent_dir(current_file: &str) -> String {

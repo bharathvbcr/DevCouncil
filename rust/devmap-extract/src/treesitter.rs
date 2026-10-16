@@ -826,9 +826,11 @@ fn extract_treesitter_before_deadline(
                         root,
                         source,
                         &file_symbol_name,
+                        &mut symbols,
                         &mut calls,
                         &mut references,
                     );
+                    rust_calls_through_fn_pointer_items(root, source, &mut calls);
                 }
                 references.sort_by(|a, b| {
                     (a.span.start_byte, a.span.end_byte, &a.name).cmp(&(
@@ -904,11 +906,12 @@ fn extract_treesitter_before_deadline(
                     );
                 }
 
-                let (rust_inline_modules, rust_deref_targets) = if lang == "rust" {
-                    collect_rust_item_facts(root, source)
-                } else {
-                    (Vec::new(), Vec::new())
-                };
+                let (rust_inline_modules, rust_deref_targets, rust_blanket_impl_params) =
+                    if lang == "rust" {
+                        collect_rust_item_facts(root, source)
+                    } else {
+                        (Vec::new(), Vec::new(), Vec::new())
+                    };
                 // Bound rather than returned: the embedded-script merge below
                 // still has to run, and it mutates this value in place.
                 let mut extraction = Extraction {
@@ -951,7 +954,13 @@ fn extract_treesitter_before_deadline(
                     scope_locals: collect_scope_locals(root, source, &file_symbol_name, lang),
                     rust_inline_modules,
                     rust_deref_targets,
+                    rust_blanket_impl_params,
                     rust_implicit_calls,
+                    rust_try_conversions: if lang == "rust" {
+                        rust_collect_try_conversions(root, source, &file_symbol_name)
+                    } else {
+                        Vec::new()
+                    },
                     local_bindings,
                     source_code: Some(source.to_string()),
                     literals: Vec::new(),
@@ -2137,7 +2146,9 @@ fn unparsed_extraction(
         scope_locals: Vec::new(),
         rust_inline_modules: Vec::new(),
         rust_deref_targets: Vec::new(),
+        rust_blanket_impl_params: Vec::new(),
         rust_implicit_calls: Vec::new(),
+        rust_try_conversions: Vec::new(),
         local_bindings: Vec::new(),
         source_code: Some(source.to_string()),
         literals: Vec::new(),
@@ -2351,7 +2362,9 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
         scope_locals: Vec::new(),
         rust_inline_modules: Vec::new(),
         rust_deref_targets: Vec::new(),
+        rust_blanket_impl_params: Vec::new(),
         rust_implicit_calls: Vec::new(),
+        rust_try_conversions: Vec::new(),
         local_bindings: Vec::new(),
         source_code: Some(source.to_string()),
         literals: Vec::new(),
@@ -7384,7 +7397,195 @@ fn rust_let_implicit_call(node: Node, source: &str) -> Option<(&'static str, Opt
     Some(("drop", receiver))
 }
 
-/// Most calls one file's `macro_rules!` expansions may add.
+/// The `From::from` candidates a file's `?` operators make: see
+/// `Extraction::rust_try_conversions`.
+fn rust_collect_try_conversions(
+    root: Node,
+    source: &str,
+    file_symbol_name: &str,
+) -> Vec<ExtractedCall> {
+    // Each function of this file by name, with its declared error type; a name
+    // declared twice with different error types (cfg twins, methods of two
+    // types) is not one function and identifies nothing.
+    let mut error_types: HashMap<String, Option<String>> = HashMap::new();
+    let mut functions = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if walk_deadline_passed() {
+            return Vec::new();
+        }
+        if node.kind() == "function_item" {
+            if let Some(name) = get_child_text(node, "name", source) {
+                let error = rust_result_error_type(node, source);
+                error_types
+                    .entry(name)
+                    .and_modify(|known| {
+                        if *known != error {
+                            *known = None;
+                        }
+                    })
+                    .or_insert(error);
+            }
+            functions.push(node);
+        }
+        push_named_children(node, &mut stack);
+    }
+
+    let mut calls = Vec::new();
+    for function in functions {
+        let Some(error) = rust_result_error_type(function, source) else {
+            continue;
+        };
+        let Some(body) = function.child_by_field_name("body") else {
+            continue;
+        };
+        let mut stack = vec![body];
+        while let Some(node) = stack.pop() {
+            if walk_deadline_passed() || calls.len() >= MAX_IMPLICIT_CALLS {
+                return calls;
+            }
+            match node.kind() {
+                // These return their own type, so a `?` inside converts into
+                // theirs; a nested function is visited as its own.
+                "closure_expression" | "async_block" | "function_item" => continue,
+                "try_expression" => {
+                    let identity = node
+                        .named_child(0)
+                        .and_then(|operand| rust_called_function_name(operand, source))
+                        .and_then(|name| error_types.get(&name))
+                        .is_some_and(|known| known.as_deref() == Some(error.as_str()));
+                    if !identity {
+                        calls.push(ExtractedCall {
+                            caller_symbol: enclosing_callable_qualified(
+                                node,
+                                source,
+                                file_symbol_name,
+                            ),
+                            callee_name: "from".to_string(),
+                            receiver_expr: Some(error.clone()),
+                            span: node_span(node),
+                        });
+                    }
+                }
+                _ => {}
+            }
+            push_named_children(node, &mut stack);
+        }
+    }
+    calls.sort_by_key(|call| call.span.start_byte);
+    calls
+}
+
+/// `E` for a function declared `-> Result<T, E>` (any path ending `Result`
+/// with exactly two type arguments), reduced to its bare name. An alias with
+/// one argument (`io::Result<T>`) states no error type here.
+fn rust_result_error_type(function: Node, source: &str) -> Option<String> {
+    let returned = function.child_by_field_name("return_type")?;
+    if returned.kind() != "generic_type" {
+        return None;
+    }
+    let head = get_node_text(returned.child_by_field_name("type")?, source);
+    if head.rsplit("::").next() != Some("Result") {
+        return None;
+    }
+    let arguments = returned.child_by_field_name("type_arguments")?;
+    let mut cursor = arguments.walk();
+    let types: Vec<Node> = arguments
+        .named_children(&mut cursor)
+        .filter(|child| !matches!(child.kind(), "line_comment" | "block_comment"))
+        .collect();
+    match types.as_slice() {
+        [_, error] => rust_type_name(*error, source, 0),
+        _ => None,
+    }
+}
+
+/// The function a call expression names by its last segment: `f(..)`,
+/// `m::f(..)`, `Self::f(..)`, `x.f(..)`. Anything else is not a named call.
+fn rust_called_function_name(operand: Node, source: &str) -> Option<String> {
+    if operand.kind() != "call_expression" {
+        return None;
+    }
+    let mut function = operand.child_by_field_name("function")?;
+    // `f::<T>(..)`: the turbofish wraps the path once.
+    if function.kind() == "generic_function" {
+        function = function.child_by_field_name("function")?;
+    }
+    match function.kind() {
+        "identifier" => Some(get_node_text(function, source)),
+        "scoped_identifier" => get_child_text(function, "name", source),
+        "field_expression" => get_child_text(function, "field", source),
+        _ => None,
+    }
+}
+
+/// Give a call through a `const`/`static` function pointer this file declares
+/// the call the pointer makes.
+///
+/// `pub const F: fn() -> u8 = helper;` then `F()` calls `helper`, and the only
+/// place that is written is the item's initializer. Like the macro expansion
+/// above, textual and stated as such: only an item whose declared type is a
+/// function pointer and whose value is a plain path (`helper`, `m::helper`),
+/// called by its bare name; a closure, a cast, or a name declared twice with
+/// different targets adds nothing. The call to the item itself stays.
+fn rust_calls_through_fn_pointer_items(root: Node, source: &str, calls: &mut Vec<ExtractedCall>) {
+    let mut targets: HashMap<String, Option<(String, Option<String>)>> = HashMap::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if walk_deadline_passed() {
+            return;
+        }
+        if matches!(node.kind(), "const_item" | "static_item")
+            && node
+                .child_by_field_name("type")
+                .is_some_and(|ty| ty.kind() == "function_type")
+        {
+            let target = node
+                .child_by_field_name("value")
+                .and_then(|value| match value.kind() {
+                    "identifier" => Some((get_node_text(value, source), None)),
+                    "scoped_identifier" => Some((
+                        get_child_text(value, "name", source)?,
+                        Some(get_node_text(value.child_by_field_name("path")?, source)),
+                    )),
+                    _ => None,
+                });
+            if let Some(name) = get_child_text(node, "name", source) {
+                targets
+                    .entry(name)
+                    .and_modify(|known| {
+                        if *known != target {
+                            *known = None;
+                        }
+                    })
+                    .or_insert(target);
+            }
+            continue;
+        }
+        push_named_children(node, &mut stack);
+    }
+    if targets.values().all(Option::is_none) {
+        return;
+    }
+    let added: Vec<ExtractedCall> = calls
+        .iter()
+        .filter(|call| call.receiver_expr.is_none())
+        .filter_map(|call| {
+            let (callee_name, receiver_expr) = targets.get(&call.callee_name)?.clone()?;
+            Some(ExtractedCall {
+                caller_symbol: call.caller_symbol.clone(),
+                callee_name,
+                receiver_expr,
+                span: call.span.clone(),
+            })
+        })
+        .take(MAX_IMPLICIT_CALLS)
+        .collect();
+    calls.extend(added);
+}
+
+/// Most calls and invocation references one file's `macro_rules!` expansions
+/// may add.
 const MAX_MACRO_EXPANSION_CALLS: usize = 10_000;
 
 /// Give each invocation of a `macro_rules!` macro this file defines the calls
@@ -7403,10 +7604,17 @@ const MAX_MACRO_EXPANSION_CALLS: usize = 10_000;
 ///
 /// An invocation inside a macro definition is not expanded, so a macro that
 /// invokes itself cannot grow the result, and the total is bounded.
+///
+/// Each definition is also a [`SymbolKind::Macro`] symbol (exported when it is
+/// `#[macro_export]`, keyed under its function when it is declared inside
+/// one), and each invocation of it in this file references it by name. An
+/// invocation of a macro another file defines (`#[macro_use]`, a `use`, or
+/// `$crate::m!`) is not linked, which is why liveness never reports a macro.
 fn rust_expand_local_macros(
     root: Node,
     source: &str,
     file_symbol_name: &str,
+    symbols: &mut Vec<ExtractedSymbol>,
     calls: &mut Vec<ExtractedCall>,
     references: &mut Vec<ExtractedReference>,
 ) {
@@ -7420,6 +7628,33 @@ fn rust_expand_local_macros(
         match node.kind() {
             "macro_definition" => {
                 if let Some(name) = get_child_text(node, "name", source) {
+                    let parent = enclosing_callable_qualified(node, source, file_symbol_name);
+                    let qualified_name = match &parent {
+                        Some(function) => format!("{function}.{name}"),
+                        None => format!("{file_symbol_name}::{name}"),
+                    };
+                    if !symbols
+                        .iter()
+                        .any(|symbol| symbol.qualified_name == qualified_name)
+                    {
+                        symbols.push(ExtractedSymbol {
+                            name: name.clone(),
+                            qualified_name,
+                            kind: SymbolKind::Macro,
+                            span: node_span(node),
+                            is_exported: rust_attribute_paths(node, source)
+                                .iter()
+                                .any(|path| path == "macro_export"),
+                            docstring: None,
+                            signature: None,
+                            parent_symbol: Some(
+                                parent.unwrap_or_else(|| file_symbol_name.to_string()),
+                            ),
+                            body_signature: None,
+                            declaration_hash: None,
+                            return_type: None,
+                        });
+                    }
                     let mut found = Vec::new();
                     let mut cursor = node.walk();
                     for rule in node
@@ -7463,6 +7698,18 @@ fn rust_expand_local_macros(
         let Some(body) = bodies.get(&name) else {
             continue;
         };
+        added += 1;
+        if added > MAX_MACRO_EXPANSION_CALLS {
+            return;
+        }
+        references.push(extracted_reference(
+            node,
+            source,
+            file_symbol_name,
+            name.clone(),
+            ReferenceKind::Name,
+            None,
+        ));
         let caller = enclosing_callable_qualified(node, source, file_symbol_name);
         for (callee_name, receiver_expr) in body {
             added += 1;
@@ -8161,9 +8408,13 @@ fn rust_absorb_inline_super(node: Node, receiver: Option<String>) -> Option<Stri
 /// A `mod name;` declaration has no body and names a file, so it is not an
 /// inline module. The walk is an explicit worklist, bounded by the same
 /// deadline every other whole-tree pass here honours.
-fn collect_rust_item_facts(root: Node, source: &str) -> (Vec<String>, Vec<(String, String)>) {
+fn collect_rust_item_facts(
+    root: Node,
+    source: &str,
+) -> (Vec<String>, Vec<(String, String)>, Vec<String>) {
     let mut modules = BTreeSet::new();
     let mut derefs = BTreeSet::new();
+    let mut blankets = BTreeSet::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if walk_deadline_passed() {
@@ -8179,12 +8430,42 @@ fn collect_rust_item_facts(root: Node, source: &str) -> (Vec<String>, Vec<(Strin
                 if let Some(pair) = rust_deref_impl(node, source) {
                     derefs.insert(pair);
                 }
+                if let Some(param) = rust_blanket_impl_param(node, source) {
+                    blankets.insert(param);
+                }
             }
             _ => {}
         }
         push_named_children(node, &mut stack);
     }
-    (modules.into_iter().collect(), derefs.into_iter().collect())
+    (
+        modules.into_iter().collect(),
+        derefs.into_iter().collect(),
+        blankets.into_iter().collect(),
+    )
+}
+
+/// `T` for a blanket impl, `impl<T: Display> Describe for T`: a trait impl
+/// whose self type is one of the impl's own type parameters.
+fn rust_blanket_impl_param(node: Node, source: &str) -> Option<String> {
+    node.child_by_field_name("trait")?;
+    let self_type = node.child_by_field_name("type")?;
+    if self_type.kind() != "type_identifier" {
+        return None;
+    }
+    let self_type = get_node_text(self_type, source);
+    let params = node.child_by_field_name("type_parameters")?;
+    let mut cursor = params.walk();
+    let declared = params.named_children(&mut cursor).any(|param| {
+        let name = match param.kind() {
+            "type_identifier" => Some(get_node_text(param, source)),
+            "constrained_type_parameter" => get_child_text(param, "left", source),
+            "type_parameter" | "optional_type_parameter" => get_child_text(param, "name", source),
+            _ => None,
+        };
+        name.as_deref() == Some(self_type.as_str())
+    });
+    declared.then_some(self_type)
 }
 
 /// `(Guard, Inner)` for `impl Deref for Guard { type Target = Inner; .. }`.
