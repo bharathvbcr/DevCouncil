@@ -133,5 +133,5 @@ sw.T6	T6	micro/Sources/M/Q5.swift::Runner.t6	micro/Sources/M/Q5.swift::Cmd.inver
 sw.T7	T7	micro/Sources/M/Q6.swift::roll	micro/Sources/M/Q6.swift::Rng.next	edge	must		var r = Rng(seed:1) binds the visible Rng, not a private nested namesake in another file
 sw.T7.not	T7	micro/Sources/M/Q6.swift::roll	micro/Sources/M/Q7.swift::Rng.next	forbid	must		private nested Rng in another file is not visible here
 sw.E1	E1	micro/Sources/M/Q8.swift::Joiner.apply	micro/Sources/M/Q8.swift::Case.apply	edge	must		open.transform.apply(x): labelled-tuple parameter member typed Case, beside a same-named enclosing method
-sw.Y1	Y1	micro/Sources/M/Q10.swift::Depot.tally	micro/Sources/M/Q9.swift::Lot.mass	edge	must		cross-file extension typealias: Stock is Lot inside Depot, so the closure element is Lot
-sw.Y1.not	Y1	micro/Sources/M/Q10.swift::Depot.tally	micro/Sources/M/Q9.swift::Stock.mass	forbid	must		top-level Stock is shadowed by the extension typealias inside Depot
+sw.Y1	Y1	micro/Sources/M/Q9.swift::Depot.tally	micro/Sources/M/Q9.swift::Lot.mass	edge	must		cross-file extension typealias (declared in Q10): Stock is Lot inside Depot, so the closure element is Lot
+sw.Y1.not	Y1	micro/Sources/M/Q9.swift::Depot.tally	micro/Sources/M/Q9.swift::Stock.mass	forbid	must		top-level Stock is shadowed by the extension typealias inside Depot

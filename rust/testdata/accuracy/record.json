@@ -1779,13 +1779,13 @@
       "forbid_any_tier_rows": 4,
       "forbid_rows": 11,
       "high_edges_correct": 93,
-      "high_edges_false": 2,
+      "high_edges_false": 3,
       "honest_miss": {
-        "absent": 12,
+        "absent": 11,
         "rate": 1.0,
-        "recorded": 12
+        "recorded": 11
       },
-      "precision_at_0.9": 0.979,
+      "precision_at_0.9": 0.969,
       "present": 93,
       "recall": 0.886
     },

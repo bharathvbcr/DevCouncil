@@ -27,4 +27,5 @@ swift	sw.T3	miss	ft-8ca270ad	recall characterization: tuple destructuring from a
 swift	sw.T4	miss	ft-8ca270ad	recall characterization: private let m = T.shared | today: absent, recorded as an honest unresolved row
 swift	sw.T5	miss	ft-8ca270ad	recall characterization: property-wrapper-typed stored property | today: absent, recorded as an honest unresolved row
 swift	sw.T7	miss	ft-8ca270ad	recall characterization: local typed by a ctor whose type has a private nested namesake | today: absent, recorded as an honest unresolved row
-swift	sw.Y1	miss	ft-8ca270ad	cross-file extension typealias; requires cross-file knowledge -> resolver (S5)
+swift	sw.Y1	false_edge	ft-8ca270ad	cross-file extension typealias; requires cross-file knowledge -> resolver (S5)
+swift	sw.Y1.not	false_edge	ft-8ca270ad	cross-file extension typealias; requires cross-file knowledge -> resolver (S5)
