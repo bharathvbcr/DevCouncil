@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from typing import Literal, Protocol
 
 
@@ -12,3 +13,7 @@ class Sized(Protocol):
 def local_shadow():
     shadowed_target = lambda: 2
     return shadowed_target()
+
+
+def run_cb(cb: Callable[[int], int]) -> int:
+    return cb(1)

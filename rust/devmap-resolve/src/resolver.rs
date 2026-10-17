@@ -20,6 +20,13 @@ use gotypes::{GoCall, GoFileIndex, GoModel, DISPATCH_FANOUT_CAP};
 
 mod pytypes;
 
+/// The key a wildcard import (`from m import *`, `export * from 'm'`) takes in
+/// `external_imports` and `unindexed_local_imports` when its module is not
+/// indexed. Not a spelling any identifier can have, so it never collides with a
+/// bound name; it is read by [`Resolver::names_a_non_local_import`], which is
+/// why a star import blocks bare-name binding to a namesake.
+const STAR_IMPORT: &str = "*";
+
 /// One package-level declaration, as [`Resolver::go_package_symbols`] holds it:
 /// the file that declares it, its qualified name, and its kind.
 type PackageDecl = (String, String, SymbolKind);
@@ -1531,6 +1538,18 @@ impl Resolver {
             ))
     }
 
+    /// Whether `file` itself binds `name` at module scope without declaring a
+    /// symbol for it — a JS/TS private `const fetchThing = vi.fn()`, which the
+    /// extractor files under the file's own name in `scope_locals`.
+    ///
+    /// Deliberately not folded into [`Self::scope_declares_local`]: that one is
+    /// asked about receivers too, and a module-scope singleton is a receiver
+    /// the member rungs already type; this answers the bare-name question only.
+    fn file_scope_declares(&self, file: &str, name: &str) -> bool {
+        self.scope_locals
+            .contains(&(file.to_string(), file.to_string(), name.to_string()))
+    }
+
     /// Whether `root`, written as a receiver's first segment, is a **value**
     /// at this site rather than a module or crate name.
     ///
@@ -2545,6 +2564,14 @@ impl Resolver {
             if local_gap.is_some_and(|imports| imports.contains_key(callee_name)) {
                 return UnresolvedClass::Unresolved;
             }
+            // A module-scope binding of the file itself (`const fetchThing =
+            // vi.fn()`). After the two import rungs, not with the enclosing
+            // scope's own binding above: a `const { x } = require('m')` is a
+            // module-scope declarator too, and the import is what says where
+            // it came from.
+            if self.file_scope_declares(file_path, callee_name) {
+                return UnresolvedClass::LocalBinding;
+            }
             // Type names obey the same binding precedence as callees:
             // `use other::String` and a generic `<String>` both shadow the
             // prelude. Qualified types were handled above; only a bare name
@@ -2585,12 +2612,26 @@ impl Resolver {
             // runtime puts it on the global object. Checked *after* the import
             // rung on purpose — an explicit `import { fetch } from 'node-fetch'`
             // is file-specific evidence and outranks a global name list.
-            return match crate::builtins::host_global_environment(family, callee_name) {
-                Some(environment) => UnresolvedClass::HostGlobal {
+            if let Some(environment) = crate::builtins::host_global_environment(family, callee_name)
+            {
+                return UnresolvedClass::HostGlobal {
                     environment: environment.to_string(),
-                },
-                None => self.bare_name_miss(callee_name),
-            };
+                };
+            }
+            // `from numpy import *`: nothing binds `zeros` by name, but the
+            // star import is where it may have come from, which is the evidence
+            // that kept it from a namesake. Last, so that a name an explicit
+            // import, a builtin or a host global already accounts for keeps
+            // the more specific label.
+            if let Some(module) = external.and_then(|imports| imports.get(STAR_IMPORT)) {
+                return UnresolvedClass::External {
+                    module: module.clone(),
+                };
+            }
+            if local_gap.is_some_and(|imports| imports.contains_key(STAR_IMPORT)) {
+                return UnresolvedClass::Unresolved;
+            }
+            return self.bare_name_miss(callee_name);
         };
 
         // A path receiver is rooted at its leftmost segment, so
@@ -3817,6 +3858,33 @@ impl Resolver {
                         unresolved_import(local, &imp.module_specifier);
                         continue;
                     };
+                    // `from m import *`, marked by the alias `*` as a Go
+                    // dot-import is by `.`. The wildcard names nothing, but it is
+                    // evidence about every bare name in the file, and is kept as
+                    // such rather than dropped:
+                    //
+                    // * a source the tree does not index took the early exit
+                    //   above and sits under [`STAR_IMPORT`] in the external or
+                    //   unindexed half, which every bare-name rung reads as "this
+                    //   name may come from there" and so will not bind to a
+                    //   namesake;
+                    // * an indexed source binds the names it declares at file
+                    //   level, as Python does — public ones only, and never over
+                    //   an explicit import, which `or_insert_with` keeps.
+                    if alias == Some(STAR_IMPORT) {
+                        for file in targets.iter().filter(|file| **file != ext.file_path) {
+                            for symbol in self.file_symbols.get(file).into_iter().flatten() {
+                                if !symbol.starts_with('_')
+                                    && self.declared_at_file_level(file, symbol)
+                                {
+                                    file_bindings
+                                        .entry(symbol.clone())
+                                        .or_insert_with(|| (file.clone(), symbol.clone()));
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     if alias == Some(".") {
                         for file in &targets {
                             // X41. A glob of the file's *own* module —
@@ -4427,19 +4495,21 @@ impl Resolver {
     /// site is left to `classify_unresolved`, which files it `external` or
     /// `unresolved` by the same two tables.
     ///
-    /// JS/TS only: its import statement is the one place the module a bare name
-    /// comes from is written, and the rule is not claimed for the other
-    /// families here.
-    fn is_bound_by_non_local_import(&self, file: &str, family: LangFamily, name: &str) -> bool {
-        family == LangFamily::JsTs
-            && (self
-                .external_imports
-                .get(file)
-                .is_some_and(|imports| imports.contains_key(name))
-                || self
-                    .unindexed_local_imports
-                    .get(file)
-                    .is_some_and(|imports| imports.contains_key(name)))
+    /// Every family, because both ladders read it through one owner,
+    /// [`Self::bare_name_has_other_evidence`]. It was JS/TS only in the reference
+    /// ladder while the call ladder applied it to all, which let `from typing
+    /// import Literal` bind a type reference to an in-repo `class Literal`.
+    ///
+    /// A wildcard import is evidence about *every* bare name the file uses: a
+    /// non-indexed `from numpy import *` is where a bare `zeros` may come from,
+    /// so it counts under [`STAR_IMPORT`] exactly as a named import does.
+    fn names_a_non_local_import(&self, file: &str, name: &str) -> bool {
+        let names = |imports: &BTreeMap<String, BTreeMap<String, String>>| {
+            imports.get(file).is_some_and(|imports| {
+                imports.contains_key(name) || imports.contains_key(STAR_IMPORT)
+            })
+        };
+        names(&self.external_imports) || names(&self.unindexed_local_imports)
     }
 
     /// The `(file, declared name)` a default import of `target` binds.
@@ -6747,13 +6817,8 @@ impl Resolver {
     /// a host global of the language. Each such name is classified by
     /// `classify_unresolved` instead of being bound to a namesake.
     fn bare_name_has_other_evidence(&self, file: &str, family: LangFamily, name: &str) -> bool {
-        self.external_imports
-            .get(file)
-            .is_some_and(|imports| imports.contains_key(name))
-            || self
-                .unindexed_local_imports
-                .get(file)
-                .is_some_and(|imports| imports.contains_key(name))
+        self.file_scope_declares(file, name)
+            || self.names_a_non_local_import(file, name)
             || crate::builtins::is_builtin(family, name)
             || crate::builtins::host_global_environment(family, name).is_some()
     }
@@ -10107,6 +10172,7 @@ impl Resolver {
             }
         }
 
+        let mut bound_by_unfollowable_import = false;
         if let Some(bindings) = self
             .import_bindings
             .get(&ext.file_path)
@@ -10128,6 +10194,16 @@ impl Resolver {
                         },
                     ));
                 }
+                // Bound by an import, and the module it names holds no
+                // unambiguous declaration of that name — a barrel that
+                // `export *`s a package, a submodule handle. The file said where
+                // the name comes from, so no namesake elsewhere in the tree can
+                // answer for it. The call ladder abstains at this same point
+                // (rung 2a); falling through to the global tier here bound the
+                // reference to whichever repository symbol shared the spelling.
+                // Only the global tier is closed: the package rungs below read
+                // a block the language itself defines, not a spelling.
+                bound_by_unfollowable_import = true;
             }
         }
 
@@ -10218,7 +10294,15 @@ impl Resolver {
             return None;
         }
 
-        if self.is_bound_by_non_local_import(&ext.file_path, family, name) {
+        // The call ladder's own classification, not a second copy of it: a name
+        // the file imports from outside the tree (or may take from a star
+        // import of one), a builtin and a host global all say what the name is,
+        // and a repository declaration that merely shares the spelling is no
+        // evidence about it. This replaced a JS/TS-only import test and a
+        // nine-name Python list.
+        if bound_by_unfollowable_import
+            || self.bare_name_has_other_evidence(&ext.file_path, family, name)
+        {
             return None;
         }
         if let Some(hits) = self.symbol_index.get(name) {
@@ -10238,25 +10322,17 @@ impl Resolver {
                 .collect();
             if family_hits.len() == 1 {
                 let (target_f, _, _, target_identity) = family_hits[0];
-                let stdlib_guard = family == LangFamily::Python
-                    && matches!(
-                        name,
-                        "open" | "dir" | "print" | "type" | "id" | "len" | "str" | "int" | "list"
-                    )
-                    && target_f != &ext.file_path;
-                if !stdlib_guard {
-                    return Some(self.reference_edge(
-                        ext,
-                        target_f,
-                        name,
-                        reference,
-                        Resolution::UniqueGlobal {
-                            target_symbol: target_identity.to_string(),
-                            target_file: target_f.clone(),
-                            family,
-                        },
-                    ));
-                }
+                return Some(self.reference_edge(
+                    ext,
+                    target_f,
+                    name,
+                    reference,
+                    Resolution::UniqueGlobal {
+                        target_symbol: target_identity.to_string(),
+                        target_file: target_f.clone(),
+                        family,
+                    },
+                ));
             }
         }
         None

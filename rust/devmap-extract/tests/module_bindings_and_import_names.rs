@@ -599,3 +599,43 @@ fn js_import_names_survive_comments() {
     assert_eq!(import.imported_names, ["a", "b"]);
     assert_no_fabricated_names(&extraction);
 }
+
+/// ft-0e6cc90f. A Python wildcard names nothing but is evidence about every bare
+/// name in the file, so it carries the alias `*` — which `import m` and `from m
+/// import a` do not.
+#[test]
+fn a_python_wildcard_import_is_marked_and_a_named_one_is_not() {
+    let extraction = extract_file(
+        "pkg/mod.py",
+        "from star import *\nfrom named import a\nimport plain\n",
+    );
+    let marked: Vec<(&str, Option<&str>)> = extraction
+        .imports
+        .iter()
+        .map(|import| (import.module_specifier.as_str(), import.alias.as_deref()))
+        .collect();
+    assert_eq!(
+        marked,
+        [("star", Some("*")), ("named", None), ("plain", None)]
+    );
+}
+
+/// ft-0e6cc90f. A private JS/TS module-scope `const` is a binding of the file,
+/// filed under the file's own name; a name bound only inside a function is not.
+#[test]
+fn a_js_module_scope_const_is_a_scope_local_of_the_file() {
+    let extraction = extract_file(
+        "v/mock.test.ts",
+        "const fetchThing = vi.fn();\nexport const { a, b: c } = make();\n\
+         function run() { const inner = 1; return inner; }\n",
+    );
+    let at_file_scope: Vec<&str> = extraction
+        .scope_locals
+        .iter()
+        .filter(|(scope, _)| scope == "v/mock.test.ts")
+        .map(|(_, local)| local.as_str())
+        .collect();
+    assert!(at_file_scope.contains(&"fetchThing"), "{at_file_scope:?}");
+    assert!(at_file_scope.contains(&"a") && at_file_scope.contains(&"c"));
+    assert!(!at_file_scope.contains(&"inner"), "{at_file_scope:?}");
+}

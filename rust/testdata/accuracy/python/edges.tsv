@@ -84,3 +84,8 @@ py.Z6.ctl	Z6	micro/zqpkg/run.py::run_single	micro/zqpkg/trainer.py::ZqLogPlain.l
 py.Z6d	Z6	micro/zqpkg/run.py::run_param	micro/zqpkg/trainer.py::ZqLogPlain.losses	edge	must		typed parameter then field hop: the parameter is typed, the class-body field annotation loss_log: ZqLogPlain is not bound
 py.Z6e	Z6	micro/zqpkg/run.py::run_param_plainlog	micro/zqpkg/trainer.py::ZqLogPlain.losses	edge	must		log = result.loss_log then log.losses(): the field type is the missing fact
 py.Z1.ctl	Z1	micro/zqpkg/step_c.py::ZqUniq.accumulate	micro/zqpkg/base.py::ZqBase.accumulate	edge	must		control: the same function-local super() with a corpus-unique class name resolves today, so Z1/Z2 fail on the duplicated class name
+py.SH1c	SH1	lib/pkg/typed_user.py::run_cb	other/typing_namesakes.py::Callable	forbid_any_tier	must		from collections.abc import Callable binds past the in-repo namesake
+py.SH1d	SH1	lib/pkg/local_literal.py::local_literal	other/typing_namesakes.py::Literal	forbid_any_tier	must		a function-local from typing import Literal binds past the in-repo namesake
+py.ST1a	ST1	lib/pkg/star_ext.py::make	other/typing_namesakes.py::zeros	forbid_any_tier	must		from numpy import * names a package outside the tree, so a bare zeros() is not the in-repo namesake
+py.ST1b	ST1	lib/pkg/star_ext.py::typed	other/typing_namesakes.py::ndarray	forbid_any_tier	must		the same star import, in annotation position
+py.ST3	ST3	lib/pkg/star_loc.py::use	lib/pkg/starlocal.py::ones	edge	must		from pkg.starlocal import * binds the indexed module's names; the global tier abstains between two ones
