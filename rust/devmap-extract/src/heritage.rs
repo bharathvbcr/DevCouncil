@@ -290,7 +290,24 @@ fn heritage_clauses<'a>(
             }
             // Python states no relation: `class W(Base, Mixin)` is an
             // `argument_list` and a metaclass keyword argument lives there too.
-            ("python", "argument_list") => Relation::Extends,
+            // Only the positional entries are bases: `metaclass=M` and any
+            // other `k=v` configure the class statement and are not in its MRO.
+            // A subscripted base (`Base[int]`) is the base named by its value.
+            ("python", "argument_list") => {
+                let mut inner = child.walk();
+                for base in child.named_children(&mut inner) {
+                    let base = match base.kind() {
+                        "identifier" | "attribute" => base,
+                        "subscript" => match base.child_by_field_name("value") {
+                            Some(value) => value,
+                            None => continue,
+                        },
+                        _ => continue,
+                    };
+                    clauses.push((Relation::Extends, base));
+                }
+                continue;
+            }
             ("java", "superclass") => Relation::Extends,
             ("java", "super_interfaces" | "extends_interfaces") => Relation::Implements,
             ("csharp", "base_list") => Relation::Extends,

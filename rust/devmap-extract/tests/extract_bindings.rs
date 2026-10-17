@@ -449,3 +449,67 @@ fn a_python_self_field_initializer_is_stamped_with_the_field_spelling() {
         "only `self` names a field of the enclosing class"
     );
 }
+
+/// What the callee names and which function writes it decide whether a
+/// `self.x = ...()` types a field: a call of a call, a lambda, a subscript or a
+/// static method's `self` parameter is not an instance's constructor call, and
+/// a closure inside a method still writes the method's `self`.
+#[test]
+fn a_python_self_field_stamp_needs_a_named_callee_and_an_instance_method() {
+    let source = "class H:\n    def a(self):\n        self.a = A()()\n    def b(self):\n        self.b = (lambda: A())()\n    def c(self):\n        self.c = fns[0]()\n    @staticmethod\n    def d(self):\n        self.d = A()\n    @classmethod\n    def e(self):\n        self.e = A()\n    def f(self):\n        def later():\n            self.f = A()\n    def g(self):\n        def later(self):\n            self.g = A()\n    def h(self):\n        self.h = pkg.mod.make()\n";
+    let extraction = extract_file("h.py", source);
+    let stamp = |line: &str| -> Vec<Option<String>> {
+        let start = source.find(line).expect("line");
+        let end = start + line.len();
+        extraction
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call)
+            .filter(|r| r.span.start_byte >= start && r.span.end_byte <= end)
+            .map(|r| r.assigned_to.clone())
+            .collect()
+    };
+    let typed = |line: &str| {
+        stamp(line)
+            .iter()
+            .any(|assigned| assigned.as_deref().is_some_and(|a| a.starts_with("self.")))
+    };
+    assert!(!typed("self.a = A()()"), "call of a call");
+    assert!(!typed("self.b = (lambda: A())()"), "lambda");
+    assert!(!typed("self.c = fns[0]()"), "subscript callee");
+    assert!(!typed("self.d = A()"), "static method's `self` is a parameter");
+    assert!(!typed("self.e = A()"), "classmethod's first parameter is the class");
+    assert!(typed("self.f = A()"), "a closure writes the method's self");
+    assert!(!typed("self.g = A()"), "a nested function with its own `self`");
+    assert!(typed("self.h = pkg.mod.make()"), "a dotted callee");
+}
+
+/// A class header's keyword arguments configure the statement and are not
+/// bases; a subscripted base is the base named by its value.
+#[test]
+fn a_python_class_header_names_only_its_positional_bases() {
+    let source = "class C(Base, metaclass=Meta, flag=Other):\n    pass\n\nclass D(Gen[int], pkg.Mixin):\n    pass\n";
+    let extraction = extract_file("c.py", source);
+    let bases = |class: &str| -> Vec<String> {
+        extraction
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Heritage)
+            .filter(|r| r.enclosing_symbol.as_deref().is_some_and(|s| s.ends_with(&format!("::{class}"))))
+            .map(|r| r.name.clone())
+            .collect()
+    };
+    assert_eq!(bases("C"), ["Base"]);
+    // A dotted base is one reference per segment over one span: the member
+    // first (the name the resolver reads the base's own name from), then the
+    // qualifier from the root down.
+    assert_eq!(bases("D"), ["Gen", "Mixin", "pkg"]);
+    let deep = extract_file("e.py", "class E(a.b.C):\n    pass\n");
+    let segments: Vec<String> = deep
+        .references
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Heritage)
+        .map(|r| r.name.clone())
+        .collect();
+    assert_eq!(segments, ["C", "a", "b"]);
+}

@@ -11659,13 +11659,114 @@ fn python_self_field_binding(assignment: Node, origin: Node, source: &str) -> Op
     if right.kind() != "call" {
         return None;
     }
+    // The callee must be a name (`Engine`, `mod.make`): `A()()`, `A().build()`,
+    // `(lambda: A())()` and `fns[0]()` return what some other value returns,
+    // and the inner call is not that value.
+    let function = right.child_by_field_name("function")?;
+    if !python_is_dotted_name(function) || !python_self_names_an_instance(assignment, source) {
+        return None;
+    }
     // The call itself, or its callee: an argument lies past the callee's end.
-    let callee_end = right
-        .child_by_field_name("function")
-        .map_or(right.end_byte(), |function| function.end_byte());
     (origin.id() == right.id()
-        || (origin.start_byte() >= right.start_byte() && origin.end_byte() <= callee_end))
+        || (origin.start_byte() >= right.start_byte() && origin.end_byte() <= function.end_byte()))
         .then(|| format!("self.{}", get_node_text(attribute, source)))
+}
+
+/// `name` or `a.b.c`, with nothing but identifiers in it.
+fn python_is_dotted_name(node: Node) -> bool {
+    match node.kind() {
+        "identifier" => true,
+        "attribute" => {
+            node.child_by_field_name("attribute")
+                .is_some_and(|attribute| attribute.kind() == "identifier")
+                && node
+                    .child_by_field_name("object")
+                    .is_some_and(python_is_dotted_name)
+        }
+        _ => false,
+    }
+}
+
+/// The name a Python parameter binds: `x`, `x: T`, `x=1`, `x: T = 1`.
+fn python_parameter_name<'a>(parameter: Node<'a>, source: &str) -> Option<String> {
+    match parameter.kind() {
+        "identifier" => Some(get_node_text(parameter, source)),
+        "typed_parameter" => parameter
+            .named_child(0)
+            .filter(|name| name.kind() == "identifier")
+            .map(|name| get_node_text(name, source)),
+        "default_parameter" | "typed_default_parameter" => parameter
+            .child_by_field_name("name")
+            .filter(|name| name.kind() == "identifier")
+            .map(|name| get_node_text(name, source)),
+        _ => None,
+    }
+}
+
+/// Whether the `self` an assignment names is the instance of a class: the
+/// outermost function around the assignment is an instance method of a class
+/// (its first parameter is `self`, and it is neither a `@staticmethod` nor a
+/// `@classmethod`), and no function nested between rebinds `self` as its own
+/// parameter. A closure inside the method still writes the method's `self`.
+fn python_self_names_an_instance(assignment: Node, source: &str) -> bool {
+    let mut method: Option<Node> = None;
+    let mut current = assignment;
+    for _ in 0..64 {
+        let Some(parent) = bounded_parent(current) else {
+            return false;
+        };
+        match parent.kind() {
+            "function_definition" => {
+                if let Some(inner) = method {
+                    // A nested function that takes its own `self` shadows it.
+                    let rebinds = inner
+                        .child_by_field_name("parameters")
+                        .into_iter()
+                        .flat_map(|parameters| {
+                            let mut cursor = parameters.walk();
+                            parameters
+                                .named_children(&mut cursor)
+                                .filter_map(|p| python_parameter_name(p, source))
+                                .collect::<Vec<_>>()
+                        })
+                        .any(|name| name == "self");
+                    if rebinds {
+                        return false;
+                    }
+                }
+                method = Some(parent);
+            }
+            "lambda" => {}
+            "class_definition" => {
+                let Some(method) = method else {
+                    return false;
+                };
+                let first = method
+                    .child_by_field_name("parameters")
+                    .and_then(|parameters| parameters.named_child(0))
+                    .and_then(|first| python_parameter_name(first, source));
+                if first.as_deref() != Some("self") {
+                    return false;
+                }
+                let decorated = bounded_parent(method)
+                    .filter(|wrapper| wrapper.kind() == "decorated_definition");
+                return !decorated.is_some_and(|wrapper| {
+                    let mut cursor = wrapper.walk();
+                    let mut decorators = wrapper.named_children(&mut cursor);
+                    decorators.any(|decorator| {
+                        decorator.kind() == "decorator" && {
+                            let text = get_node_text(decorator, source);
+                            let name = text.trim_start_matches('@').trim();
+                            name == "staticmethod" || name == "classmethod"
+                        }
+                    })
+                });
+            }
+            _ => {}
+        }
+        current = parent;
+    }
+    false
 }
 
 fn assignment_binding(mut node: Node, source: &str) -> Option<String> {
