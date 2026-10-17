@@ -250,6 +250,62 @@ func TestScalarGatesAndUnknownModeFailClosed(t *testing.T) {
 	}
 }
 
+// A block list is not a mode. ParseConfig drops it, so an unset gates.mode used
+// to take the missing-file default and a list of "enforce" read as off.
+func TestBlockListGateModeFailsClosed(t *testing.T) {
+	for name, body := range map[string]string{
+		"mode list":  "gates:\n  mode:\n    - enforce\n",
+		"gates list": "gates:\n  - enforce\n",
+	} {
+		root := t.TempDir()
+		writeCfg(t, root, body)
+		for _, snap := range []Snapshot{Load(root), Resolve(root)} {
+			if snap.VerificationMode != ModeEnforce || snap.VerificationOrigin != OriginInvalid || snap.Error == "" || !snap.ConfigPresent {
+				t.Errorf("%s = %+v, want enforce/invalid, present, with an error", name, snap)
+			}
+		}
+	}
+}
+
+// A symlink whose target is gone is a present path. Open follows it and
+// reports the target missing, which is not os.IsNotExist on the config path.
+func TestDanglingSymlinkConfigFailsClosed(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, ".devcouncil")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.Symlink(filepath.Join(dir, "missing.yaml"), path); err != nil {
+		t.Fatal(err)
+	}
+	for _, snap := range []Snapshot{Load(root), Resolve(root)} {
+		if snap.VerificationMode != ModeEnforce || snap.VerificationOrigin != OriginInvalid || snap.Error == "" || !snap.ConfigPresent {
+			t.Fatalf("dangling symlink = %+v, want enforce/invalid, present, with an error", snap)
+		}
+	}
+}
+
+// A live symlink is the file it names. Only a dangling one is unreadable.
+func TestLiveSymlinkConfigIsRead(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, ".devcouncil")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dir, "real.yaml")
+	if err := os.WriteFile(target, []byte("gates:\n  mode: advisory\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, "config.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	snap := Resolve(root)
+	if snap.VerificationMode != ModeAdvisory || snap.VerificationOrigin != OriginConfig || snap.Error != "" || !snap.ConfigPresent {
+		t.Fatalf("live symlink = %+v, want advisory/config", snap)
+	}
+}
+
 // Resolve is read per call, so `gate set` reaches a host that is already
 // running, and chmod-ing a file that was read fine a moment ago is noticed.
 func TestResolveFollowsTheFileWithoutRestart(t *testing.T) {

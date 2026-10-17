@@ -102,6 +102,98 @@ func TestUnmodelledProgramOperandsAreMatchedAgainstTheHardRules(t *testing.T) {
 	_ = strings.TrimSpace
 }
 
+// A path inside a JSON operand is handed to the program as surely as a bare
+// one. `claude mcp add-json lp '{"command":"/opt/x"}'` passed: as one word the
+// document read as a relative file name inside the root, and pretty-printed it
+// had whitespace and read as prose.
+func TestUnmodelledProgramJSONOperandsAreOpened(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".git", "hooks"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gate := CommandGate{HardRules: true, Root: root}
+
+	// One past the string-count and depth bounds in command_operands.go (4096
+	// strings, depth 64), written as numbers so the test builds against the code
+	// before the fix and fails there on behaviour. Raising a bound fails it
+	// loudly. Empty strings keep the document under fnmatch's 16384-unit cap,
+	// past which the secret-read rung refuses the word first (see below).
+	strs := make([]string, 4097)
+	for i := range strs {
+		strs[i] = `""`
+	}
+	refused := []string{
+		`claude mcp add-json --scope user lp '{"type":"stdio","command":"/opt/x","args":["mcp"]}'`,
+		`claude mcp add-json lp '{"type": "stdio", "command": "/opt/x"}'`,
+		`mytool '["/etc/x"]'`,
+		`mytool '[{"nested":{"deeper":["../x"]}}]'`,
+		`mytool --json='{"p":"../x"}'`,
+		`mytool CONFIG='{"p":"/etc/x"}'`,
+		`mytool '{"args":["--out=/etc/x"]}'`,
+		`mytool '{"p":".git/hooks/pre-commit"}'`,
+		`mytool '{"/etc/x":1}'`,
+		`mytool '{"config":"{\"command\":\"/etc/x\"}"}'`,
+		`mytool ' {"p":"/etc/x"} '`,
+		"mytool '" + strings.Repeat("[", 66) + strings.Repeat("]", 66) + "'",
+		"mytool '[" + strings.Join(strs, ",") + "]'",
+	}
+	for _, command := range refused {
+		d := gate.EvaluateCommand(command, nil)
+		if d.Action != Deny || d.Rule != RuleCommandOperandUnverifiable || d.Severity != Hard {
+			label := command
+			if len(label) > 120 {
+				label = label[:120] + "…"
+			}
+			t.Errorf("%q = %s/%s/%s (%s); want hard %s", label, d.Action, d.Rule, d.Severity, d.Reason, RuleCommandOperandUnverifiable)
+		}
+	}
+
+	// A word past fnmatch's 16384-unit cap is refused by the secret-read rung,
+	// which runs before this one, so through the gate the 64 KiB bound can only
+	// be seen as a hard refusal by either rung. The bound itself is checked on
+	// jsonOperandStrings, over it and exactly at it.
+	over := `["` + strings.Repeat("a", maxJSONOperandBytes) + `"]`
+	if d := gate.EvaluateCommand("mytool '"+over+"'", nil); d.Action != Deny || d.Severity != Hard {
+		t.Errorf("a %d-byte JSON operand = %s/%s/%s; want a hard deny", len(over), d.Action, d.Rule, d.Severity)
+	}
+	if _, isJSON, ok := jsonOperandStrings(over); !isJSON || ok {
+		t.Errorf("a %d-byte JSON document: isJSON %v ok %v; want isJSON and not ok", len(over), isJSON, ok)
+	}
+	atBound := `["` + strings.Repeat("a", maxJSONOperandBytes-4) + `"]`
+	if strs, isJSON, ok := jsonOperandStrings(atBound); !isJSON || !ok || len(strs) != 1 {
+		t.Errorf("a %d-byte JSON document: %d strings, isJSON %v ok %v; want one string, read in full", len(atBound), len(strs), isJSON, ok)
+	}
+
+	untouched := []string{
+		`mytool '{"command":"bin/tool","args":["src/main.go","--out=dist/x"]}'`,
+		`mytool '{"url":"https://example.com/a/../b"}'`,
+		`mytool '{"note":"a note about ../x"}'`,
+		`mytool '{"dev":"/dev/null","n":3,"ok":true,"none":null}'`,
+		`mytool '{}'`,
+		`mytool '[]'`,
+		`mytool '{nope'`,
+		`mytool '[not json'`,
+		`cat '{"command":"/etc/x"}'`,
+		`echo '{"command":"/etc/x"}'`,
+	}
+	for _, command := range untouched {
+		d := gate.EvaluateCommand(command, nil)
+		if d.Rule == RuleCommandOperandUnverifiable {
+			t.Errorf("%q refused as %s (%s); it names no protected path or is a modelled program", command, d.Rule, d.Reason)
+		}
+	}
+	if d := (CommandGate{HardRules: false, Root: root}).EvaluateCommand(`mytool '{"p":"/etc/x"}'`, nil); d.Rule == RuleCommandOperandUnverifiable {
+		t.Errorf("with hard rules off the operand rung must not fire: %+v", d)
+	}
+	// Keys are read in sorted order, so the path a refusal names does not
+	// depend on map iteration order.
+	for range 20 {
+		if d := gate.EvaluateCommand(`mytool '{"b":"/two","a":"/one"}'`, nil); !strings.Contains(d.Reason, "`/one`") {
+			t.Fatalf("refusal names the wrong path, or none: %s/%s (%s)", d.Action, d.Rule, d.Reason)
+		}
+	}
+}
+
 // sort -o and uniq's second operand write; the reads-only table does not exempt them.
 func TestReadsOnlyProgramsStillHaveTheirWritesJudged(t *testing.T) {
 	for line, want := range map[string][]string{

@@ -79,10 +79,13 @@ func failClosed(snap Snapshot, reason string) Snapshot {
 	return snap
 }
 
-// Load reads `.devcouncil/config.yaml` under root, uncached. A missing file is
-// off, origin default, and is the only way to reach the default. A file that is
-// present but cannot be opened or parsed, or that holds a scalar `gates` or an
-// unknown mode, is enforce with origin invalid and the reason in Error.
+// Load reads `.devcouncil/config.yaml` under root, uncached. A path that
+// lstat says does not exist is off, origin default, and is the only way to
+// reach the default. A path that is present but cannot be opened or parsed —
+// including a symlink whose target is gone, because Open follows the link and
+// reports the target missing — or that holds a scalar `gates`, a block list
+// under `gates` or `gates.mode`, or an unknown mode, is enforce with origin
+// invalid and the reason in Error.
 func Load(root string) Snapshot {
 	path := filepath.Join(root, ".devcouncil", "config.yaml")
 	snap := Snapshot{
@@ -90,27 +93,41 @@ func Load(root string) Snapshot {
 		VerificationOrigin: OriginDefault,
 		ConfigPath:         path,
 	}
-	f, err := os.Open(path)
-	if err != nil {
+	// Lstat, not Stat or Open. Open follows a symlink, so a link whose target
+	// is gone returns the same ENOENT as a path that was never created, and
+	// that is the one error this function is allowed to treat as "no config".
+	if _, err := os.Lstat(path); err != nil {
 		if os.IsNotExist(err) {
 			return snap
 		}
 		snap.ConfigPresent = true
 		return failClosed(snap, fmt.Sprintf("%s: %v", path, err))
 	}
-	defer func() { _ = f.Close() }()
 	snap.ConfigPresent = true
-	values, err := flags.ParseConfig(f)
+	f, err := os.Open(path)
 	if err != nil {
 		return failClosed(snap, fmt.Sprintf("%s: %v", path, err))
 	}
-	if _, scalar := values["gates"]; scalar {
+	defer func() { _ = f.Close() }()
+	layer, err := flags.ParseConfigLayer(f)
+	if err != nil {
+		return failClosed(snap, fmt.Sprintf("%s: %v", path, err))
+	}
+	if _, scalar := layer.Values["gates"]; scalar {
 		// `gates: [` and `gates: off` are scalars, not a mapping with mode.
 		return failClosed(snap, path+": gates must be a mapping with a mode key, not a scalar")
 	}
-	snap.VerificationMode, snap.VerificationOrigin = Normalize(values["gates.mode"])
+	if line, listed := layer.Lists["gates"]; listed {
+		return failClosed(snap, fmt.Sprintf("%s:%d: gates must be a mapping with a mode key, not a block list", path, line))
+	}
+	if line, listed := layer.Lists["gates.mode"]; listed {
+		// ParseConfig's flat map cannot represent a list, so a missing
+		// gates.mode used to fall through to the empty-string default.
+		return failClosed(snap, fmt.Sprintf("%s:%d: gates.mode must be a mode, not a block list", path, line))
+	}
+	snap.VerificationMode, snap.VerificationOrigin = Normalize(layer.Values["gates.mode"])
 	if snap.VerificationOrigin == OriginInvalid {
-		snap.Error = fmt.Sprintf("%s: unknown gate mode %q (want off, advisory, or enforce)", path, values["gates.mode"])
+		snap.Error = fmt.Sprintf("%s: unknown gate mode %q (want off, advisory, or enforce)", path, layer.Values["gates.mode"])
 	}
 	// Neither `execution.hook_gate.mode` nor `integrations.<host>.write_gate`
 	// is read. Both named pre-tool-use containment that only DevCouncil's

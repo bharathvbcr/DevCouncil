@@ -53,10 +53,25 @@ global list 3.32 / 3.79 ms; workspace 8.29 / 9.31 ms; repository 1.90 / 2.33 ms;
 search 10.2 / 12.95 ms; history 0.59 / 0.79 ms; edit 2.16 / 2.83 ms.
 One `store.compact {"keep_revisions":1,"limit":100000}` pass deleted 90,021 revisions
 (eligible 90,021, not truncated) in 2.94 s; receipts and events were all fresh so none
-were eligible. The 100,000-task stress variant (`BenchmarkWorkbenchProfileStress`) was
-not run. List and search latency is independent of history size here, so retention is
-about disk growth and history paging, not list latency at this scale (inferred from the
-unchanged query plans, not separately measured on a compacted fixture).
+were eligible. List and search latency on that 10,000-task fixture is independent of
+history size, so retention there is about disk growth and history paging, not list
+latency (inferred from the unchanged query plans, not separately measured on a
+compacted fixture).
+
+`BenchmarkWorkbenchProfileStress` was run on 2026-10-13 (Apple M5 Pro, `-benchtime=20x`,
+`-count=1`). Same mutation count, spread over 100,000 tasks with one revision each:
+100,110 events, seed 8m28.6s, `latest_sequence` 100,110 (`events.list` total is only a
+10,000 floor once the log exceeds that). Twenty iterations, mean / p95 in milliseconds:
+global 9.63 / 11.65, workspace 76.23 / 112.9, repository 7.17 / 9.944, search 83.88 / 120.5,
+history 0.606 / 1.160, rare search 2.39 / 5.646, repository search 57.80 / 72.87,
+workspace search 115.9 / 150.5, empty status 2.92 / 7.977, edit 5.10 / 11.78.
+One `store.compact {"keep_revisions":1,"limit":100000}` deleted 21 revisions (eligible 21,
+not truncated) in 517 ms; receipts and events were fresh. The printed edit sample is 20
+iterations. The high-water mark after edits was 100,131 (100,110 seed events plus 21
+committed edits); the benchmark's revision counter includes any extra invocation of that
+sub-benchmark. Workspace list and search are
+slower at 100,000 tasks than at 10,000 tasks with the same number of mutations. The same
+figures are in Manvi `docs/WORKBENCH.md`.
 
 ## Scale behaviour (hx/w4-store-scale)
 

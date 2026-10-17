@@ -479,10 +479,18 @@ fn a_scope_ends_with_its_guard_and_a_nested_one_does_not_end_it_early() {
             git_with_program(git.as_os_str(), &root, ["diff", "HEAD"]).unwrap();
         }
         git_with_program(git.as_os_str(), &root, ["diff", "HEAD"]).unwrap();
-        assert_eq!(config_listings(&log), 1, "the inner guard left the outer scope open");
+        assert_eq!(
+            config_listings(&log),
+            1,
+            "the inner guard left the outer scope open"
+        );
     }
     git_with_program(git.as_os_str(), &root, ["diff", "HEAD"]).unwrap();
-    assert_eq!(config_listings(&log), 2, "a new read after the scope lists again");
+    assert_eq!(
+        config_listings(&log),
+        2,
+        "a new read after the scope lists again"
+    );
 }
 
 /// The cache is not a way to miss a driver the repository adds mid-operation.
@@ -497,7 +505,11 @@ fn an_edit_to_the_repository_config_is_listed_afresh() {
             .collect()
     };
     let before = git_with_program(git.as_os_str(), &root, ["diff", "HEAD"]).unwrap();
-    assert!(!args(&before).iter().any(|a| a.starts_with("filter.planted")));
+    assert!(
+        !args(&before)
+            .iter()
+            .any(|a| a.starts_with("filter.planted"))
+    );
 
     setup(&root, &["config", "filter.planted.clean", "/bin/true"]);
     let after = git_with_program(git.as_os_str(), &root, ["diff", "HEAD"]).unwrap();

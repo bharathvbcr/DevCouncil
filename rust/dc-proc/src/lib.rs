@@ -661,10 +661,10 @@ fn repository_config(git: &Path, root: &Path) -> Result<RepositoryConfig, Failur
     let fresh = probe_repository_config(git, root)?;
     if let (Some(key), Some((_, stamp))) = (key, stamp) {
         CONFIG_SCOPE.with(|scope| {
-            if let Some(scope) = scope.borrow_mut().as_mut() {
-                if scope.entries.len() < CONFIG_SCOPE_ENTRIES || scope.entries.contains_key(&key) {
-                    scope.entries.insert(key, (stamp, fresh.clone()));
-                }
+            if let Some(scope) = scope.borrow_mut().as_mut()
+                && (scope.entries.len() < CONFIG_SCOPE_ENTRIES || scope.entries.contains_key(&key))
+            {
+                scope.entries.insert(key, (stamp, fresh.clone()));
             }
         });
     }

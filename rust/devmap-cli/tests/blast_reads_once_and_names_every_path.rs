@@ -258,7 +258,10 @@ fn the_diff_prefix_settings_do_not_change_which_files_changed() {
             .unwrap()
             .iter()
             .any(|file| !file["renamed_from"].is_null());
-        assert!(!renamed, "{key}={value} made a file look renamed: {report:#}");
+        assert!(
+            !renamed,
+            "{key}={value} made a file look renamed: {report:#}"
+        );
         assert_eq!(
             report["seeds"].as_array().unwrap().len(),
             3,

@@ -1030,10 +1030,13 @@ fn merge_toml_server(
 /// The text of `text` with `[<container>.<name>]` set to `entry`, or `None`
 /// when it already is. Pure: nothing is read or written here.
 ///
-/// Every byte outside that table survives. The result is parsed back and
-/// compared with the original plus our entry, so a document whose layout keeps
-/// our table from being found as one block (an inline `mcp_servers = {…}`,
-/// dotted keys) is refused rather than rewritten. This is the one TOML editor:
+/// Every byte outside that table survives. A comment or a key this installer
+/// does not set also survives inside the table; a table made only of keys we
+/// write is replaced, so a stale subtable of one of those keys does not. The
+/// result is parsed back and compared with the original plus our keys, so a
+/// document whose layout keeps our table from being found as one block (an
+/// inline `mcp_servers = {…}`, dotted keys) is refused rather than rewritten.
+/// This is the one TOML editor:
 /// the project-level and the user-level Codex documents both go through it,
 /// where the user-level one used to parse and re-serialise the whole file and
 /// drop the user's comments.
@@ -1052,25 +1055,41 @@ fn splice_toml_server(
         Some(toml::Value::Table(servers)) => servers.get(name),
         Some(_) => bail!("{}: `{container}` is not a table", path.display()),
     };
-    let wanted = toml::Value::Table(entry);
-    if current == Some(&wanted) {
+    let wanted = toml::Value::Table(entry.clone());
+    // Extra keys and comments inside the table are the user's. A match on the
+    // keys this installer writes is already current, even when `env` is also set.
+    if let Some(toml::Value::Table(have)) = current {
+        if entry
+            .iter()
+            .all(|(key, value)| have.get(key) == Some(value))
+        {
+            return Ok(None);
+        }
+    } else if current == Some(&wanted) {
         return Ok(None);
     }
 
     let mut wrapper = toml::Table::new();
     let mut servers = toml::Table::new();
-    servers.insert(name.to_string(), wanted.clone());
+    servers.insert(name.to_string(), wanted);
     wrapper.insert(container.to_string(), toml::Value::Table(servers));
     let block = toml::to_string(&wrapper).map_err(|err| anyhow!("serialize {name}: {err}"))?;
 
-    let updated = if current.is_some() {
-        replace_toml_table(text, container, name, &block).ok_or_else(|| {
-            anyhow!(
-                "{}: [{container}.{name}] is not one block this command can replace \
-                 (inline table or dotted keys); edit it by hand",
-                path.display()
-            )
-        })?
+    let updated = if let Some(current) = current {
+        let cannot_retarget = format!(
+            "{}: [{container}.{name}] is not one block this command can replace \
+             (inline table or dotted keys); edit it by hand",
+            path.display()
+        );
+        // A table whose every key is one we write, and that holds no comment,
+        // is replaced whole — including a stale subtable of a key we write.
+        // Anything else is patched: a comment or a key we do not set stays.
+        let rewritten = if server_has_user_lines(text, container, name, &entry, current) {
+            patch_owned_toml_keys(text, container, name, &entry)
+        } else {
+            replace_toml_table(text, container, name, &block)
+        };
+        rewritten.ok_or_else(|| anyhow!(cannot_retarget))?
     } else {
         let mut out = text.to_string();
         if !out.is_empty() && !out.ends_with('\n') {
@@ -1090,12 +1109,7 @@ fn splice_toml_server(
         )
     })?;
     let mut expected = parsed;
-    if let toml::Value::Table(servers) = expected
-        .entry(container.to_string())
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-    {
-        servers.insert(name.to_string(), wanted);
-    }
+    overlay_server_keys(&mut expected, container, name, &entry)?;
     if reparsed != expected {
         bail!(
             "{}: adding [{container}.{name}] would change other settings; refuse to rewrite it",
@@ -1390,6 +1404,145 @@ fn replace_toml_table(text: &str, container: &str, name: &str, block: &str) -> O
     }
     out.push_str(&lines[end..].concat());
     Some(out)
+}
+
+/// True when the table holds a comment or a key `owned` does not set. Those
+/// lines are the user's; a whole-block replace would delete them.
+fn server_has_user_lines(
+    text: &str,
+    container: &str,
+    name: &str,
+    owned: &toml::Table,
+    current: &toml::Value,
+) -> bool {
+    if let toml::Value::Table(table) = current {
+        if table.keys().any(|key| !owned.contains_key(key)) {
+            return true;
+        }
+    } else {
+        return true;
+    }
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let Some((start, end)) = locate_toml_table(&lines, container, name) else {
+        return true;
+    };
+    lines[start + 1..end]
+        .iter()
+        .any(|line| line.trim().starts_with('#'))
+}
+
+/// Rewrite only `owned` keys inside `[<container>.<name>]`. Comments, every
+/// other key, and subtables stay on their original lines. `None` when the
+/// table is not one header this editor can find, or a value will not render
+/// as a single assignment.
+fn patch_owned_toml_keys(
+    text: &str,
+    container: &str,
+    name: &str,
+    owned: &toml::Table,
+) -> Option<String> {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let (start, end) = locate_toml_table(&lines, container, name)?;
+    let nested = format!("{container}.{name}.");
+    let direct_end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .take(end.saturating_sub(start + 1))
+        .find(|(_, line)| toml_header_key(line).is_some_and(|key| key.starts_with(&nested)))
+        .map_or(end, |(index, _)| index);
+    let mut body: Vec<String> = lines[start + 1..direct_end]
+        .iter()
+        .map(|line| (*line).to_string())
+        .collect();
+    let mut missing = Vec::new();
+    for (key, value) in owned {
+        let rendered = render_assignment(key, value)?;
+        let mut found = false;
+        for line in &mut body {
+            if assigns_key(line, key) {
+                let newline = if line.ends_with('\n') { "\n" } else { "" };
+                *line = format!("{rendered}{newline}");
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            missing.push(format!("{rendered}\n"));
+        }
+    }
+    let mut out = lines[..start + 1].concat();
+    for line in &missing {
+        out.push_str(line);
+    }
+    for line in &body {
+        out.push_str(line);
+    }
+    out.push_str(&lines[direct_end..].concat());
+    Some(out)
+}
+
+fn toml_header_key(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let inner = if let Some(rest) = trimmed.strip_prefix("[[") {
+        rest.split_once("]]")?.0
+    } else {
+        trimmed.strip_prefix('[')?.split_once(']')?.0
+    };
+    Some(
+        inner
+            .split('.')
+            .map(|part| part.trim().trim_matches(|c| c == '"' || c == '\''))
+            .collect::<Vec<_>>()
+            .join("."),
+    )
+}
+
+fn assigns_key(line: &str, key: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return false;
+    }
+    let Some((left, _)) = trimmed.split_once('=') else {
+        return false;
+    };
+    left.trim() == key
+}
+
+fn render_assignment(key: &str, value: &toml::Value) -> Option<String> {
+    let mut table = toml::Table::new();
+    table.insert(key.to_string(), value.clone());
+    let text = toml::to_string(&table).ok()?;
+    let line = text.trim_end();
+    if line.contains('\n') || line.is_empty() {
+        return None;
+    }
+    Some(line.to_string())
+}
+
+/// Set `owned` on `[container.name]`, leaving every other key in that table.
+fn overlay_server_keys(
+    document: &mut toml::Table,
+    container: &str,
+    name: &str,
+    owned: &toml::Table,
+) -> anyhow::Result<()> {
+    let slot = document
+        .entry(container.to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let toml::Value::Table(servers) = slot else {
+        bail!("`{container}` is not a table");
+    };
+    let server = servers
+        .entry(name.to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let toml::Value::Table(table) = server else {
+        bail!("`{container}.{name}` is not a table");
+    };
+    for (key, value) in owned {
+        table.insert(key.clone(), value.clone());
+    }
+    Ok(())
 }
 
 /// `text` without the `[<container>.<name>]` block and its subtables. Undoes
@@ -2887,6 +3040,46 @@ mod tests {
         let healed = fs::read_to_string(&path).unwrap();
         assert!(healed.starts_with(original), "{healed}");
         assert!(!healed.contains("/old/devmap"), "{healed}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A comment and an env table inside `[mcp_servers.devmap]` are the user's.
+    /// Replacing the whole block with command and args used to delete both.
+    #[test]
+    fn user_level_codex_merge_keeps_lines_inside_the_owned_table() {
+        let dir = scratch("codex-owned-lines");
+        let path = dir.join("config.toml");
+        let original = "\
+# my codex config\n\
+model = \"o5\"\n\
+\n\
+[mcp_servers.devmap]\n\
+# user note inside the table\n\
+command = \"/old/devmap\"\n\
+args = [\"mcp\"]\n\
+env = { FOO = \"bar\" }\n\
+\n\
+[mcp_servers.other]\n\
+command = \"x\"\n";
+        fs::write(&path, original).unwrap();
+        merge_codex_mcp(&path, Path::new("/tmp/fake-devmap"), false).unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        for line in [
+            "# my codex config",
+            "# user note inside the table",
+            "env = { FOO = \"bar\" }",
+            "[mcp_servers.other]",
+            "command = \"x\"",
+        ] {
+            assert!(after.contains(line), "lost {line:?} from:\n{after}");
+        }
+        assert!(after.contains("/tmp/fake-devmap"), "{after}");
+        assert!(!after.contains("/old/devmap"), "{after}");
+        let parsed: toml::Table = after.parse().unwrap();
+        assert_eq!(
+            parsed["mcp_servers"]["devmap"]["env"]["FOO"].as_str(),
+            Some("bar")
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

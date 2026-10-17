@@ -1,10 +1,8 @@
-// Package correction ports Python planning/correction_manifest persistence
-// shapes into Go. Manifests are written as JSON beside the task and recorded
-// in dc-store's correction_manifests table when a store client is available.
+// Package correction writes a repair brief as JSON beside the task, under
+// .devcouncil/corrections/. The brief is a file. Nothing records it in dc-store.
 package correction
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -85,25 +83,6 @@ func Write(opts WriteOptions) (Manifest, string, error) {
 	}
 	if err := safefile.WriteAtomic(path, raw, 0o644); err != nil {
 		return Manifest{}, "", err
-	}
-	return m, path, nil
-}
-
-// RecordFunc is injected so this package does not depend on dcstore wire
-// details. Callers that have a store pass a function that runs handoff-like
-// persistence; nil is fine (disk-only).
-type RecordFunc func(ctx context.Context, manifest Manifest, path string) error
-
-// WriteAndRecord writes the manifest and optionally records it.
-func WriteAndRecord(ctx context.Context, opts WriteOptions, record RecordFunc) (Manifest, string, error) {
-	m, path, err := Write(opts)
-	if err != nil {
-		return m, path, err
-	}
-	if record != nil {
-		if err := record(ctx, m, path); err != nil {
-			return m, path, err
-		}
 	}
 	return m, path, nil
 }

@@ -92,6 +92,10 @@ name = "accuracy_fixtures"
 required-features = ["parse"]
 
 [[test]]
+name = "accuracy_language_stress"
+required-features = ["parse"]
+
+[[test]]
 name = "real_corpus_accuracy"
 required-features = ["parse"]
 

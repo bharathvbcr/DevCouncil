@@ -57,16 +57,11 @@ func benchmarkWorkbenchProfile(b *testing.B, tasks, revisions int) {
 			call("items.put", json.RawMessage(fmt.Sprintf(`{"request_id":"t%d-v%d","id":"t%d","expected_revision":%d,"title":"Benchmark startup latency task %d","description":"%s","repository_ids":["r%d"],"primary_repository_id":"r%d","home_workspace_id":"w%d","position":%d}`, i, rev, i, rev, i, description, i%repositories, i%repositories, i%10, i)))
 		}
 	}
-	var events struct {
-		Total int `json:"total"`
-	}
-	if err := json.Unmarshal(call("events.list", json.RawMessage(`{"limit":1}`)), &events); err != nil {
-		b.Fatal(err)
-	}
-	if events.Total != tasks*revisions+repositories+10 {
-		b.Fatalf("fixture has %d events", events.Total)
-	}
-	b.Logf("Fixture: %d tasks, %d repositories, %d events; seed %s", tasks, repositories, events.Total, time.Since(seedStarted))
+	// events.list stops its count at 10_000. sequence is AUTOINCREMENT and this
+	// fixture never deletes a row, so latest_sequence is the event count.
+	expectedEvents := tasks*revisions + repositories + 10
+	requireEventLog(b, call("events.list", json.RawMessage(`{"limit":1}`)), expectedEvents)
+	b.Logf("Fixture: %d tasks, %d repositories, %d events; seed %s", tasks, repositories, expectedEvents, time.Since(seedStarted))
 	for _, query := range []struct {
 		name, method, input string
 		total               int
@@ -137,12 +132,7 @@ func benchmarkWorkbenchProfile(b *testing.B, tasks, revisions int) {
 			b.ReportMetric(float64(samples[(len(samples)-1)*95/100].Microseconds())/1000, "p95-ms")
 		}
 	})
-	if err := json.Unmarshal(call("events.list", json.RawMessage(`{"limit":1}`)), &events); err != nil {
-		b.Fatal(err)
-	}
-	if expected := tasks*revisions + repositories + 10 + revision - revisions; events.Total != expected {
-		b.Fatalf("edits did not commit once each: %d events; expected %d", events.Total, expected)
-	}
+	requireEventLog(b, call("events.list", json.RawMessage(`{"limit":1}`)), tasks*revisions+repositories+10+revision-revisions)
 	// Retention: one bounded pass over the whole fixture. Receipts and events are
 	// fresh, so only superseded revisions are eligible; the report carries both
 	// the deleted and the eligible counts, and the history must shrink to the bound.
@@ -162,5 +152,33 @@ func benchmarkWorkbenchProfile(b *testing.B, tasks, revisions int) {
 	b.Logf("Compaction: %s; %s", time.Since(compacted), report)
 	if want := tasks*(revisions-1) + (revision - revisions); reported.Item.Revisions.Deleted != want || reported.Item.Revisions.Truncated {
 		b.Fatalf("compaction deleted %d revisions; expected %d", reported.Item.Revisions.Deleted, want)
+	}
+}
+
+// requireEventLog checks the fixture through the public events.list contract.
+// `total` is an exact count at or under 10_000 and a floor above that
+// (`total_exact` false). `latest_sequence` stays the exact high-water mark.
+func requireEventLog(b *testing.B, raw json.RawMessage, expected int) {
+	b.Helper()
+	var events struct {
+		Total          int  `json:"total"`
+		TotalExact     bool `json:"total_exact"`
+		LatestSequence int  `json:"latest_sequence"`
+	}
+	if err := json.Unmarshal(raw, &events); err != nil {
+		b.Fatal(err)
+	}
+	if events.LatestSequence != expected {
+		b.Fatalf("event log high-water is %d; expected %d (total %d, total_exact %v)", events.LatestSequence, expected, events.Total, events.TotalExact)
+	}
+	const cap = 10_000
+	if expected <= cap {
+		if events.Total != expected || !events.TotalExact {
+			b.Fatalf("event total %d total_exact %v; expected an exact total of %d", events.Total, events.TotalExact, expected)
+		}
+		return
+	}
+	if events.Total != cap || events.TotalExact {
+		b.Fatalf("event total %d total_exact %v; expected a floor of %d over %d events", events.Total, events.TotalExact, cap, expected)
 	}
 }
