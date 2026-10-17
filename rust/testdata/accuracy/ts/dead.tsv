@@ -36,6 +36,18 @@ exported_unreferenced	apps/web/src/v/grammar.ts::afterAbstract	nothing in the fi
 exported_unreferenced	apps/web/src/v/lexicalthis.ts::Gateway	nothing in the fixture references it
 exported_unreferenced	apps/web/src/v/lexicalthis.ts::Gateway.open	nothing in the fixture references it
 exported_unreferenced	apps/web/src/v/loggeruser.ts::useLogger	nothing in the fixture references it
+live	apps/web/src/v/spreadcore.ts::spreadCore	spread, aliased and Object.assign-ed by spreadbuild.ts (a module-scope reference to an exported const is not yet read as a use)
+live	apps/web/src/v/spreadcore.ts::spreadLater	spread by spreadbuild.ts layeredW (same gap as spreadCore)
+exported_unreferenced	apps/web/src/v/spreadcore.ts::spreadCore.warn	probe member nothing calls
+exported_unreferenced	apps/web/src/v/spreaduser.ts::useSpread	probe nothing references
+exported_unreferenced	apps/web/src/v/spreaduser.ts::useAssign	probe nothing references
+exported_unreferenced	apps/web/src/v/spreaduser.ts::useAlias	probe nothing references
+exported_unreferenced	apps/web/src/v/spreaduser.ts::useForward	probe nothing references
+exported_unreferenced	apps/web/src/v/spreaduser.ts::useShorthand	probe nothing references
+exported_unreferenced	apps/web/src/v/spreaduser.ts::useLayered	probe nothing references
+exported_unreferenced	apps/web/src/v/spreaduser.ts::useOverridden	probe nothing references
+exported_unreferenced	apps/web/src/v/spreaduser.ts::useUnknown	probe nothing references
+exported_unreferenced	apps/web/src/v/spreaduser.ts::useCycle	probe nothing references
 exported_unreferenced	apps/web/src/v/npmcollide.ts::callsNpm	nothing in the fixture references it
 exported_unreferenced	apps/web/src/v/onlyfmt.ts::useFmtOnly	nothing in the fixture references it
 exported_unreferenced	apps/web/src/v/typedparam.ts::viaArrowParam	nothing in the fixture references it
