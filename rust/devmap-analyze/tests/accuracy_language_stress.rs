@@ -581,16 +581,14 @@ fn unicode_and_odd_paths_resolve() {
     let has = |suffix: &str| {
         admitted.iter().any(|path| {
             path.ends_with(suffix)
-                || (suffix.contains('ï')
-                    && path.ends_with("local.go")
-                    && path.chars().any(|c| !c.is_ascii()))
+                || (suffix.contains('ï') && path.ends_with("local.go") && !path.is_ascii())
         })
     };
     for suffix in ["naïve/local.go", "odd/my file.go", "pkg/.hidden.go"] {
         assert!(has(suffix), "{suffix} was not admitted: {admitted:?}");
     }
     assert!(
-        !admitted.iter().any(|path| *path == ".hidden.go"),
+        !admitted.contains(&".hidden.go"),
         "a root dot path must not be indexed: {admitted:?}"
     );
     assert!(

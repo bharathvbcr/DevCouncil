@@ -485,7 +485,9 @@ pub(super) fn blast_radius_from_edges(
     let mut visited: BTreeSet<&str> = seed_set.clone();
     let mut frontier: Vec<&str> = seed_set.iter().copied().collect();
     // `(symbol, reached by a non-dispatch edge, reached by a dispatch edge)`.
-    let mut bands: Vec<(usize, BTreeMap<&str, (bool, bool)>, Option<f32>)> = Vec::new();
+    // `(depth, members, weakest confidence on the edges that reached them)`.
+    type Band<'a> = (usize, BTreeMap<&'a str, (bool, bool)>, Option<f32>);
+    let mut bands: Vec<Band<'_>> = Vec::new();
     let mut total_impacted: u32 = 0;
 
     for depth in 1..=depth_cap {

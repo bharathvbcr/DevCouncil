@@ -204,7 +204,7 @@ fn a_complete_corpus_is_not_graded_at_all() {
     // `confident_tier_unproven`: still ungraded by coverage, still the branch.
     let confident = confidence_of(&reports, "neverCalled");
     assert!(
-        (confident - f32::from(UNPROVEN_TIER_CONFIDENCE)).abs() < 1e-6,
+        (confident - UNPROVEN_TIER_CONFIDENCE).abs() < 1e-6,
         "a clean corpus must still reach the confident branch: {confident}"
     );
     let row = reports
