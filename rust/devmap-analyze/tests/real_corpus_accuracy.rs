@@ -2785,3 +2785,293 @@ fn rows_with_labels_or_without_a_committed_row_are_not_marked_unverifiable() {
     let entry = carry_unverifiable(Some(&committed), Some(empty), &pin).unwrap();
     assert!(!entry["languages"]["go"]["unverifiable"].is_null());
 }
+
+// ------------------------------------------------------------ ATTACK probes
+// Adversarial tests for the honest-miss split, tiers and unverifiable rows.
+// A failing test here is a break; see the commit message of this branch.
+
+fn attack_labels(recall: Vec<Value>, edges: Vec<Value>) -> Labels {
+    parse_labels(
+        &json!({ "edges": edges, "recall": recall, "dead": fixture_dead_labels() }).to_string(),
+    )
+    .unwrap()
+}
+
+fn attack_recall(name: &str, truth: &str) -> Value {
+    json!({ "language": "go", "construct": "atk", "caller": "app/svc/svc.go::Caller01",
+            "name": name, "truth": truth })
+}
+
+fn attack_honest(label: &str, labels: &Labels) -> (Value, Value) {
+    let (dir, _) = go_fixture_checkout(label);
+    let built = common::build(&dir);
+    let scored = score_labels("Fixture", &built, labels, &["go".to_string()]).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    (
+        scored["go"]["honest_miss"].clone(),
+        scored["go"]["confident_edge_precision"].clone(),
+    )
+}
+
+/// Two call sites of one name from one caller: one bound HIGH and correct, the
+/// other missing. `wrongly_bound` must not swallow the missing one.
+#[test]
+fn attack_a_correct_same_name_edge_does_not_turn_a_silent_miss_into_wrongly_bound() {
+    let labels = attack_labels(
+        vec![attack_recall("Target01", "app/util/util2.go::Target02")],
+        vec![json!({ "language": "go", "caller": "app/svc/svc.go::Caller01",
+                      "callee": "app/util/util.go::Target01", "correct": true })],
+    );
+    let (honest, precision) = attack_honest("atk-same-name", &labels);
+    assert_eq!(precision["correct"], 1, "{precision}");
+    assert_eq!(
+        honest["wrongly_bound"], 0,
+        "the HIGH edge is labelled CORRECT, precision never debits it, yet the missing site is hidden as wrongly_bound: {honest}"
+    );
+    assert_eq!(honest["silent"], 1, "{honest}");
+}
+
+/// The old matcher compared the label name whole to the ledger row's last
+/// segment; the new one takes both last segments, so `zzz.X` is credited with
+/// the ledger row of an unrelated receiver's `X`.
+#[test]
+fn attack_a_dotted_label_name_does_not_borrow_another_receivers_ledger_row() {
+    let (dir, _) = go_fixture_checkout("atk-dotted");
+    let built = common::build(&dir);
+    let row = built
+        .resolution
+        .unresolved
+        .iter()
+        .find(|u| UNATTRIBUTED_LABELS.contains(&u.class.label()))
+        .expect("an unattributed ledger row");
+    let name = format!("zzz.{}", last_segment(&row.callee_name));
+    let labels = parse_labels(
+        &json!({ "recall": [{ "language": "go", "construct": "atk",
+            "caller": row.source_symbol, "name": name, "truth": "app/util/util2.go::Target02" }],
+            "dead": fixture_dead_labels() })
+        .to_string(),
+    )
+    .unwrap();
+    let scored = score_labels("Fixture", &built, &labels, &["go".to_string()]).unwrap();
+    let honest = &scored["go"]["honest_miss"];
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        honest["recorded"], 0,
+        "label {name:?} was credited as recorded by ledger row {:?} ({}): {honest}",
+        row.callee_name, row.source_symbol
+    );
+}
+
+/// A MEDIUM wrong edge is not a HIGH binding: the site stays silent/recorded.
+#[test]
+fn attack_a_medium_edge_is_not_wrongly_bound() {
+    let (dir, _) = go_fixture_checkout("atk-medium");
+    let mut built = common::build(&dir);
+    // Demote every Caller01 -> *Target01 edge to MEDIUM confidence.
+    let mut demoted = 0;
+    for e in built.resolution.edges.iter_mut() {
+        if e.source_symbol == "app/svc/svc.go::Caller01"
+            && matches!(e.edge_kind, EdgeKind::Calls | EdgeKind::References)
+            && last_segment(&e.target_symbol) == "Target01"
+        {
+            e.confidence.0 = 0.6;
+            demoted += 1;
+        }
+    }
+    assert!(demoted > 0, "no Caller01 -> Target01 edge to demote");
+    let labels = attack_labels(
+        vec![attack_recall("Target01", "app/util/util2.go::Target02")],
+        vec![],
+    );
+    let scored = score_labels("Fixture", &built, &labels, &["go".to_string()]).unwrap();
+    let honest = scored["go"]["honest_miss"].clone();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(honest["wrongly_bound"], 0, "{honest}");
+}
+
+/// A site with a truth edge AND a wrong same-name edge is present: no honest row.
+#[test]
+fn attack_a_site_with_a_truth_edge_and_a_wrong_edge_is_present() {
+    let labels = attack_labels(
+        vec![attack_recall(
+            "Target01",
+            "app/util/util.go::Target01|app/util/util2.go::Target02",
+        )],
+        vec![],
+    );
+    let (honest, _) = attack_honest("atk-both", &labels);
+    assert_eq!(honest["absent"], 0, "{honest}");
+    assert_eq!(honest["wrongly_bound"], 0, "{honest}");
+}
+
+/// Characterisation: with no edge label the wrong HIGH edge is in nobody's
+/// precision, and the site left honest-miss. Recall (present=false) is the only
+/// place it still shows.
+#[test]
+fn attack_an_unsampled_wrong_high_edge_leaves_precision_and_honest_miss() {
+    let labels = attack_labels(
+        vec![attack_recall("Target01", "app/util/util2.go::Target02")],
+        vec![],
+    );
+    let (honest, precision) = attack_honest("atk-unsampled", &labels);
+    assert_eq!(honest["wrongly_bound"], 1, "{honest}");
+    assert_eq!(
+        precision["total"], 1,
+        "the comment says precision already debits this wrong binding; with no edge label it debits nothing: {precision}"
+    );
+}
+
+#[test]
+fn attack_last_segment_of_a_name_ending_in_a_separator_is_not_empty() {
+    // `doThing:with:` style selectors and `a.` collapse to "" and then match
+    // every other name that does the same.
+    assert_ne!(last_segment("doThing:with:"), last_segment("other:"));
+}
+
+#[test]
+fn attack_dead_fp_state_rejects_impossible_numbers() {
+    let tier = |fp: Value, rows: Value| json!({ "dead_fp_by_tier": { "0.9": { "false_positive": fp, "rows": rows } } });
+    let mut wrong = Vec::new();
+    for (fp, rows) in [(json!(0), json!(-5)), (json!(-5), json!(10)), (json!(11), json!(10)), (json!(0), json!(0.5))] {
+        let state = dead_fp_state(&tier(fp.clone(), rows.clone()));
+        if !matches!(state, DeadFp::Unmeasured) {
+            wrong.push(format!("fp={fp} rows={rows} read as {state:?}, not Unmeasured"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    // Present-but-wrong-type and missing values.
+    for t in [
+        tier(json!("0"), json!("10")),
+        tier(json!(null), json!(10)),
+        json!({ "dead_fp_by_tier": {} }),
+        json!({ "dead_fp_by_tier": { "0.9": null } }),
+        json!({ "dead_fp_by_tier": { "0.9": { "rows": 0 } } }),
+    ] {
+        assert_eq!(dead_fp_state(&t), DeadFp::Unmeasured, "{t}");
+    }
+}
+
+#[test]
+fn attack_a_malformed_dead_unmeasured_block_is_not_read_as_zero() {
+    let mut wrong = Vec::new();
+    for block in [
+        json!({ "unlabelled": "2", "malformed": 0 }),
+        json!({ "unlabelled": -1, "malformed": 0 }),
+        json!({ "unlabelled": 2.5 }),
+        json!({ "unlabelled": null }),
+        json!("x"),
+    ] {
+        let row = json!({ "dead_fp_by_tier": { "0.9": { "false_positive": 0, "rows": 10 } },
+                          "dead_unmeasured": block.clone() });
+        let state = dead_fp_state(&row);
+        if state != DeadFp::Unmeasured {
+            wrong.push(format!("dead_unmeasured {block} read as {state:?} (the CLI reader panics on it)"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[test]
+fn attack_an_empty_tier_after_a_measured_one_still_fails_and_says_why() {
+    let tier = |rows: u64| json!({ "dead_fp_by_tier": { "0.9": { "false_positive": 0, "rows": rows } } });
+    let found = regression_gates("go", Some(&tier(10)), &tier(0), &BTreeMap::new());
+    let dead: Vec<_> = found.iter().filter(|f| f.contains("dead")).collect();
+    assert_eq!(dead.len(), 1, "{found:?}");
+    assert!(dead[0].contains("empty tier"), "{dead:?}");
+}
+
+#[test]
+fn attack_a_non_string_unverifiable_stamp_still_fails_the_gate() {
+    for stamp in [json!(true), json!({}), json!(["x"]), json!(1)] {
+        let mut current = row((99, 100), (96, 100), (100, 100), (0, 20));
+        current["unverifiable"] = stamp.clone();
+        let found = evaluate_gates("go", None, &current, None, &gates());
+        assert!(
+            found.iter().any(|f| f.contains("unverifiable")),
+            "unverifiable={stamp} is treated as a verified row by the runner (the CLI reader treats any non-null as unverifiable): {found:?}"
+        );
+    }
+}
+
+#[test]
+fn attack_the_old_flow_left_a_committed_row_looking_measured() {
+    // Old runner: no labels -> nothing superseded -> the committed good row
+    // stays and regression_gates over it is clean. New: stamped -> fails.
+    let pin = unverifiable_pin(&["go"]);
+    let committed = json!({ "name": "Corpus", "corpus_commit": "0".repeat(40),
+        "languages": { "go": row((97, 100), (90, 100), (99, 100), (0, 10)) } });
+    let good = &committed["languages"]["go"];
+    assert!(regression_gates("go", None, good, &floors()).is_empty());
+    let stamped = carry_unverifiable(Some(&committed), None, &pin).unwrap();
+    let found = evaluate_gates("go", Some(good), &stamped["languages"]["go"], None, &gates());
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("unverifiable"));
+}
+
+#[test]
+fn attack_a_moved_pin_does_not_stamp_the_old_commit_row_under_the_new_pin() {
+    let old_commit = "1".repeat(40);
+    let pin = unverifiable_pin(&["go"]);
+    let previous = json!({ "name": "Corpus", "corpus_commit": old_commit,
+        "languages": { "go": row((97, 100), (90, 100), (99, 100), (0, 10)) } });
+    let entry = carry_unverifiable(Some(&previous), None, &pin).expect("carried");
+    assert_ne!(
+        entry["corpus_commit"], json!(old_commit),
+        "the stamped entry still claims commit {old_commit}, not the pin {}: {entry}",
+        pin.commit
+    );
+    // With labels that cover only another language, the carried row is from a
+    // different commit than the fresh entry it is spliced into.
+    let fresh = json!({ "name": "Corpus", "corpus_commit": pin.commit, "languages": {} });
+    let pin2 = unverifiable_pin(&["go", "python"]);
+    let entry = carry_unverifiable(Some(&previous), Some(fresh), &pin2).unwrap();
+    let reason = entry["languages"]["go"]["unverifiable"].as_str().unwrap();
+    assert!(
+        reason.contains("commit") || reason.contains("pin"),
+        "row measured at {old_commit} is spliced under corpus_commit {} with reason {reason:?}",
+        pin.commit
+    );
+}
+
+#[test]
+fn attack_double_stamping_keeps_the_first_reason_and_a_scored_run_clears_it() {
+    let pin = unverifiable_pin(&["go"]);
+    let committed = json!({ "name": "Corpus", "corpus_commit": "0".repeat(40),
+        "languages": { "go": row((97, 100), (90, 100), (99, 100), (0, 10)) } });
+    let once = carry_unverifiable(Some(&committed), None, &pin).unwrap();
+    let twice = carry_unverifiable(Some(&once), None, &pin).unwrap();
+    assert_eq!(once, twice);
+    let empty_labels = json!({ "name": "Corpus", "corpus_commit": "0".repeat(40), "languages": {} });
+    let third = carry_unverifiable(Some(&once), Some(empty_labels), &pin).unwrap();
+    assert_eq!(
+        third["languages"]["go"]["unverifiable"], once["languages"]["go"]["unverifiable"],
+        "the first reason is kept"
+    );
+    let fresh = json!({ "name": "Corpus", "corpus_commit": "0".repeat(40),
+        "languages": { "go": row((98, 100), (95, 100), (99, 100), (0, 10)) } });
+    let cleared = carry_unverifiable(Some(&once), Some(fresh.clone()), &pin).unwrap();
+    assert_eq!(cleared, fresh);
+}
+
+#[test]
+fn attack_a_pin_language_spelled_differently_from_the_committed_row_still_fails() {
+    let committed = json!({ "name": "Corpus", "corpus_commit": "0".repeat(40),
+        "languages": { "typescript": row((97, 100), (90, 100), (99, 100), (0, 10)) } });
+    let pin = unverifiable_pin(&["ts"]);
+    assert_eq!(carry_unverifiable(Some(&committed), None, &pin), None);
+    // Nothing carried, nothing superseded: the run's own gate over a Null
+    // current row must still fail.
+    assert!(!evaluate_gates("ts", None, &Value::Null, None, &gates()).is_empty());
+}
+
+#[test]
+fn attack_labels_that_are_not_an_object_of_known_sections_are_refused() {
+    // `[]`, `{}` and a typo'd section name parse as "no labels" and then, at
+    // best, stamp the committed row unverifiable. A typo'd section next to a
+    // good one is dropped silently.
+    let accepted: Vec<&str> = ["[]", "{}", r#"{"recal": []}"#, r#"{"edges": [], "recall_typo": [1]}"#]
+        .into_iter()
+        .filter(|raw| parse_labels(raw).is_ok())
+        .collect();
+    assert!(accepted.is_empty(), "parse_labels accepted {accepted:?}");
+}

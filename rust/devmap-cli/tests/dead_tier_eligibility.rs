@@ -860,3 +860,38 @@ fn fixture_completeness_follows_the_status_verdict() {
     assert!(fixture_incompleteness(&serde_json::json!({ "degraded_reason": null })).is_some());
     assert!(fixture_incompleteness(&serde_json::json!({ "coverage_gaps": ledger })).is_some());
 }
+
+// ATTACK probes for the `unverifiable` stamp.
+
+#[test]
+fn attack_any_non_null_unverifiable_stamp_is_no_proof_even_beside_a_clean_corpus() {
+    for stamp in [
+        serde_json::json!("why"),
+        serde_json::json!(true),
+        serde_json::json!(false),
+        serde_json::json!(""),
+        serde_json::json!({}),
+    ] {
+        let record = serde_json::json!({ "corpora": [
+            { "name": "stamped", "languages": { "lang": {
+                "dead_fp_by_tier": { "0.9": { "false_positive": 0, "rows": 40 } },
+                "unverifiable": stamp.clone() } } },
+            { "name": "other", "languages": { "lang": {
+                "dead_fp_by_tier": { "0.9": { "false_positive": 0, "rows": 3 } } } } },
+        ]});
+        let rates = corpus_rates(&record, "attack");
+        assert_eq!(corpus_proof(&rates["lang"]).0, 3, "stamp {stamp}: {:?}", rates["lang"]);
+    }
+}
+
+#[test]
+fn attack_a_null_unverifiable_stamp_is_not_a_stamp() {
+    let rates = corpus_rates(
+        &record_with(serde_json::json!({
+            "dead_fp_by_tier": { "0.9": { "false_positive": 0, "rows": 40 } },
+            "unverifiable": null,
+        })),
+        "attack",
+    );
+    assert_eq!(corpus_proof(&rates["lang"]).0, 40);
+}
