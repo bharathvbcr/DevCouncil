@@ -67,3 +67,8 @@ truly_dead	micro/zqpkg/step_a.py::build_a	caller probe nothing calls
 truly_dead	micro/zqpkg/step_c.py::build_c	caller probe nothing calls
 truly_dead	micro/zqpkg/step_b.py::use_b	caller probe nothing calls
 truly_dead	micro/zqpkg/anchors.py::anchor	caller probe nothing calls
+truly_dead	micro/fieldleak/holders.py::FlHolderA.go	caller probe nothing calls
+truly_dead	micro/fieldleak/holders.py::FlHolderB.go	caller probe nothing calls
+truly_dead	micro/fieldleak/holders.py::FlHolderA	class probe nothing references
+truly_dead	micro/fieldleak/holders.py::FlHolderB	class probe nothing references
+truly_dead	micro/fieldleak/engines.py::FlOther.run	only caller is the dead probe FlHolderB.go; reported at 0.4 while the self.engine = FlOther() hop is unbound (ft-40f73e87)

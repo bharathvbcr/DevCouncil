@@ -95,3 +95,5 @@ ts.V17b	V17b	apps/web/src/v/defaults.ts::withDeps	apps/web/src/v/defaults.ts::re
 ts.V17c	V17c	apps/web/src/v/defaults.ts::withPlain	apps/web/src/v/defaults.ts::plainDefault	edge	must		simple default parameter call
 ts.SH1a	SH1	apps/web/src/v/fetchmock.test.ts	apps/web/src/v/thingservice.ts::fetchThing	forbid	must		a module-scope const fetchThing = vi.fn() called inside it() is the mock, not the service export
 ts.SH1b	SH1	apps/web/src/v/extbarreluser.ts::describeWidget	apps/web/src/v/thingservice.ts::WidgetProps	forbid_any_tier	must		a type reached through a barrel that re-exports an external package with export * is not the in-repo namesake
+ts.FL1.not	FL1	apps/web/src/v/fieldleak.ts::FlHolderB.go	apps/web/src/v/fieldleak.ts::FlEngine.run	forbid_any_tier	must		FlHolderA typed field engine must not type FlHolderB untyped engine
+ts.FL1.ctl	FL1	apps/web/src/v/fieldleak.ts::FlHolderA.go	apps/web/src/v/fieldleak.ts::FlEngine.run	edge	must		control: the declaring class still binds
