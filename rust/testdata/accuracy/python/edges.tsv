@@ -84,3 +84,6 @@ py.Z6.ctl	Z6	micro/zqpkg/run.py::run_single	micro/zqpkg/trainer.py::ZqLogPlain.l
 py.Z6d	Z6	micro/zqpkg/run.py::run_param	micro/zqpkg/trainer.py::ZqLogPlain.losses	edge	must		typed parameter then field hop: the parameter is typed, the class-body field annotation loss_log: ZqLogPlain is not bound
 py.Z6e	Z6	micro/zqpkg/run.py::run_param_plainlog	micro/zqpkg/trainer.py::ZqLogPlain.losses	edge	must		log = result.loss_log then log.losses(): the field type is the missing fact
 py.Z1.ctl	Z1	micro/zqpkg/step_c.py::ZqUniq.accumulate	micro/zqpkg/base.py::ZqBase.accumulate	edge	must		control: the same function-local super() with a corpus-unique class name resolves today, so Z1/Z2 fail on the duplicated class name
+py.FL1.not	FL1	micro/fieldleak/holders.py::FlHolderB.go	micro/fieldleak/engines.py::FlEngine.run	forbid_any_tier	must		FlHolderA class-body annotation engine: FlEngine must not type FlHolderB self.engine
+py.FL1	FL1	micro/fieldleak/holders.py::FlHolderB.go	micro/fieldleak/engines.py::FlOther.run	edge	should	run	self.engine = FlOther() in __init__: Other.run or an honest miss
+py.FL1.ctl	FL1	micro/fieldleak/holders.py::FlHolderA.go	micro/fieldleak/engines.py::FlEngine.run	edge	must		control: the class that declares the annotation still binds

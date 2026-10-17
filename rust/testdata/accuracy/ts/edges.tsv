@@ -93,3 +93,5 @@ ts.V16	V16	apps/web/src/v/lexicalthis.ts::Gateway.open.connect	apps/web/src/v/le
 ts.V17a	V17a	apps/web/src/v/defaults.ts::withDeps	apps/web/src/v/defaults.ts::defaultSleep	edge	must		destructured default parameter reference
 ts.V17b	V17b	apps/web/src/v/defaults.ts::withDeps	apps/web/src/v/defaults.ts::repoRoot	edge	must		destructured default parameter call
 ts.V17c	V17c	apps/web/src/v/defaults.ts::withPlain	apps/web/src/v/defaults.ts::plainDefault	edge	must		simple default parameter call
+ts.FL1.not	FL1	apps/web/src/v/fieldleak.ts::FlHolderB.go	apps/web/src/v/fieldleak.ts::FlEngine.run	forbid_any_tier	must		FlHolderA typed field engine must not type FlHolderB untyped engine
+ts.FL1.ctl	FL1	apps/web/src/v/fieldleak.ts::FlHolderA.go	apps/web/src/v/fieldleak.ts::FlEngine.run	edge	must		control: the declaring class still binds

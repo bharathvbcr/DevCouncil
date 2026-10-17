@@ -1682,8 +1682,14 @@ impl Resolver {
             {
                 return Some(typed.clone());
             }
-            if let Some(declared) = self.lookup_declared_type_name(file, Some(scope), name) {
-                return Some(declared);
+            // This scope's own declaration only: the owner-less `file:name@type`
+            // slot is the file-wide rung's, asked last, because it holds
+            // whichever type in the file wrote that name.
+            if let Some(typed) = self
+                .declared_types
+                .get(&format!("{file}:{scope}:{name}@type"))
+            {
+                return Self::admissible_nominal_type(typed);
             }
             if self.scope_declares_local(file, scope, name) {
                 return None;
@@ -1695,6 +1701,21 @@ impl Resolver {
             // knows nothing about which type a name belongs to.
             if let Some(member) = self.member_declared_type(file, Some(scope), name) {
                 return Some(member);
+            }
+            // A member the enclosing type constructs (`var engine = Other()`)
+            // is typed under that type's own scope. Asked before the
+            // file-wide maps below, which hold one slot per name and would
+            // answer with a sibling type's same-named member.
+            if let Some(owner) = self.declaring_type_of(file, scope) {
+                if let Some(typed) = [
+                    format!("{file}:{file}::{owner}:{name}"),
+                    format!("{file}:{owner}:{name}"),
+                ]
+                .iter()
+                .find_map(|key| self.scoped_receiver_types.get(key))
+                {
+                    return Some(typed.clone());
+                }
             }
         }
         self.receiver_types
@@ -2288,7 +2309,6 @@ impl Resolver {
         let keys = [
             format!("{file}:{file}::{owner}:{field}@type"),
             format!("{file}:{owner}:{field}@type"),
-            format!("{file}:{field}@type"),
         ];
         for key in &keys {
             if let Some(typed) = self
@@ -2299,11 +2319,17 @@ impl Resolver {
                 return Some(typed);
             }
         }
-        // Unique Class/Struct hit for the field name when the Type ref only
-        // populated receiver_types (assigned_to = field name).
-        self.receiver_types
-            .get(&format!("{file}:{field}"))
-            .and_then(|t| Self::admissible_nominal_type(t))
+        // Unique Class/Struct hit for the field when the Type ref only
+        // populated the scoped receiver map. Keyed by the owning class like
+        // the declared slots above: the owner-less `file:field` key is one
+        // slot per file, so another class's same-named field would answer.
+        [
+            format!("{file}:{file}::{owner}:{field}"),
+            format!("{file}:{owner}:{field}"),
+        ]
+        .iter()
+        .find_map(|key| self.scoped_receiver_types.get(key))
+        .and_then(|t| Self::admissible_nominal_type(t))
     }
 
     /// Bare-name miss: [`NoNamesake`] when the corpus has no symbol of that

@@ -53,3 +53,8 @@ live	apps/web/src/v/external.ts::parser.startState	V20: StreamLanguage calls the
 live	apps/web/src/v/external.ts::parser.token	V20: StreamLanguage calls the parser object's token
 exported_unreferenced	apps/web/src/v/external.ts::makeEditor	nothing calls it
 exported_unreferenced	apps/web/src/lib/casefile.ts::caseHelper	C26: its only reference is PaperList.tsx's wrong-case import of ../lib/CaseFile, which must not bind
+exported_unreferenced	apps/web/src/v/fieldleak.ts::FlHolderA	probe class nothing references
+exported_unreferenced	apps/web/src/v/fieldleak.ts::FlHolderA.go	probe method nothing calls
+exported_unreferenced	apps/web/src/v/fieldleak.ts::FlHolderB	probe class nothing references
+exported_unreferenced	apps/web/src/v/fieldleak.ts::FlHolderB.go	probe method nothing calls
+exported_unreferenced	apps/web/src/v/fieldleak.ts::FlOther.run	only caller is the dead probe FlHolderB.go

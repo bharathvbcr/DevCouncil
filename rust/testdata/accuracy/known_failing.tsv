@@ -15,6 +15,7 @@ kotlin-gaps	kg.Z4	miss	ft-0720fe1d	recall characterization: member initialised b
 kotlin-gaps	kg.Z5	miss	ft-0720fe1d	recall characterization: explicit type argument of a reified factory naming an interface (unique_indexed_type is Class/Struct only, resolver.rs:724) | today: absent, recorded as an honest unresolved row
 kotlin-gaps	kg.Z6	miss	ft-0720fe1d	recall characterization: T::class.java argument types the result (Hilt EntryPoint idiom); interface target | today: absent, recorded as an honest unresolved row
 python	py.C23b	miss	ft-c666ba7c	edge if fixture return typed; honest miss acceptable | today: absent today, recorded as an honest unresolved row
+python	py.FL1	miss	ft-c666ba7c	follow-up ft-40f73e87: self.engine = FlOther() needs field_initializers read by field_type_on | today: absent, recorded as an honest unresolved row
 python	py.SH1a	false_edge	ft-0e6cc90f	needs resolver.rs (held by S5) | today: forbidden edge at any tier to other/typing_namesakes.py::Literal at 900
 python	py.SH1b	false_edge	ft-0e6cc90f	needs resolver.rs (held by S5) | today: forbidden edge at any tier to other/typing_namesakes.py::Protocol at 900
 python	py.Z1	miss	ft-c666ba7c	recall characterization: function-local super() whose class name two files declare; type_name_is_identifiable refuses a flat name (resolver.rs:7500, pytypes.rs:105); needs resolver.rs (S5 held) | today: absent, recorded as an honest unresolved row
