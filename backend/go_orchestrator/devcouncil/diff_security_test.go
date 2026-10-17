@@ -138,6 +138,34 @@ func TestTrackedSecretHunksAreWithheld(t *testing.T) {
 	}
 }
 
+// Credential files the write gate's list used to miss still reached get_diff:
+// the AWS shared credentials file, a direnv file, git's credential store, and
+// a PKCS#12 bundle. Each is withheld at the root and one directory down.
+func TestCredentialStoreShapesAreWithheld(t *testing.T) {
+	root := newRepo(t)
+	write(t, root, ".aws/credentials", "aws_secret_access_key = synthetic-aws-secret\n")
+	write(t, root, "home/.aws/credentials", "aws_secret_access_key = nested-aws-secret\n")
+	write(t, root, ".envrc", "export DIRENV_SENTINEL=direnv-secret\n")
+	write(t, root, "app/.envrc", "export DIRENV_SENTINEL=nested-direnv-secret\n")
+	write(t, root, ".git-credentials", "https://user:git-credential-secret@github.com\n")
+	write(t, root, "home/.git-credentials", "https://user:nested-git-credential@github.com\n")
+	write(t, root, "client.p12", "synthetic-pkcs12-sentinel\n")
+	write(t, root, "certs/client.p12", "nested-pkcs12-sentinel\n")
+	write(t, root, "src/ok.py", "ordinary untracked content\n")
+	diff := mustDiff(t, getDiff(t, root, devcouncil.GetDiffArgs{}))
+	if !diff.OK {
+		t.Fatalf("a secret path failed the whole diff: %+v", diff)
+	}
+	assertAbsent(t, diff, "synthetic-aws-secret", "nested-aws-secret", "direnv-secret", "nested-direnv-secret",
+		"git-credential-secret", "nested-git-credential", "synthetic-pkcs12-sentinel", "nested-pkcs12-sentinel")
+	if !strings.Contains(diff.UnifiedDiff, "+ordinary untracked content") {
+		t.Fatalf("the ordinary untracked file was lost: %q", diff.UnifiedDiff)
+	}
+	assertWithheld(t, diff, ".aws/credentials", "home/.aws/credentials", ".envrc", "app/.envrc",
+		".git-credentials", "home/.git-credentials", "client.p12", "certs/client.p12")
+	assertNotWithheld(t, diff, "src/ok.py")
+}
+
 // A rename out of a secret directory carries the old file's contents in its
 // hunks; the old name alone is enough to withhold them.
 func TestRenameOutOfASecretPathIsWithheld(t *testing.T) {

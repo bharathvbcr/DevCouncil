@@ -75,6 +75,16 @@ var SecretPathPatterns = []string{
 	"**/.pypirc",
 	".netrc",
 	"**/.netrc",
+	// `.env.*` does not match `.envrc` (no dot after env). These are credential
+	// files the `*.pem` / `credentials/**` forms also miss: a file named
+	// credentials is not a directory, and `*` does not require a dot.
+	".aws/credentials",
+	"**/.aws/credentials",
+	".envrc",
+	"**/.envrc",
+	".git-credentials",
+	"**/.git-credentials",
+	"*.p12",
 }
 
 // RestrictedPathPatterns protect the repository's own machinery — including
