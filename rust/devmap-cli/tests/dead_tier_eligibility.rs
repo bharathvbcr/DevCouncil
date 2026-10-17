@@ -305,6 +305,25 @@ fn corpus_rates(record: &serde_json::Value, origin: &str) -> CorpusRates {
                     (fp, rows)
                 }
             };
+            // A row the harness could not fully score (`dead_unmeasured`: an
+            // unlabelled confident row, or a label it could not write) is a
+            // rate over a subset. It is unproven, the same as a missing row:
+            // it contributes no rows, so it can neither prove a language nor
+            // be read as a clean zero. Absent block = nothing unmeasured; a
+            // block that is not numbers is a record that cannot be read.
+            let block = &entry["dead_unmeasured"];
+            let count = |key: &str| {
+                if block.is_null() {
+                    return 0;
+                }
+                block[key].as_u64().unwrap_or_else(|| {
+                    panic!(
+                        "{origin}: {name}/{language} has a malformed dead_unmeasured.{key}: {block}"
+                    )
+                })
+            };
+            let unmeasured = count("unlabelled") + count("malformed");
+            let (fp, rows) = if unmeasured > 0 { (0, 0) } else { (fp, rows) };
             by_language
                 .entry(language.clone())
                 .or_default()
@@ -656,16 +675,54 @@ fn a_language_measured_with_no_confident_rows_reads_as_zero_rows() {
 }
 
 #[test]
+fn a_row_with_unlabelled_or_malformed_dead_rows_is_not_proof() {
+    for unmeasured in [
+        serde_json::json!({ "unlabelled": 2, "malformed": 0 }),
+        serde_json::json!({ "unlabelled": 0, "malformed": 1 }),
+    ] {
+        let rates = corpus_rates(
+            &record_with(serde_json::json!({
+                "dead_fp_by_tier": { "0.9": { "false_positive": 0, "rows": 40 } },
+                "dead_unmeasured": unmeasured,
+            })),
+            "test record",
+        );
+        assert_eq!(
+            rates["lang"],
+            vec![("corpus".to_string(), 0, 0)],
+            "{unmeasured}: a rate over the labelled subset is not a measurement"
+        );
+        let (rows, _) = corpus_proof(&rates["lang"]);
+        assert_eq!(rows, 0, "the proof gate is `rows > 0`; it must fail");
+    }
+    // Nothing unmeasured: the same row is proof, as before.
+    let rates = corpus_rates(
+        &record_with(serde_json::json!({
+            "dead_fp_by_tier": { "0.9": { "false_positive": 0, "rows": 40 } },
+            "dead_unmeasured": { "unlabelled": 0, "malformed": 0 },
+        })),
+        "test record",
+    );
+    assert_eq!(rates["lang"], vec![("corpus".to_string(), 0, 40)]);
+}
+
+#[test]
+#[should_panic(expected = "malformed dead_unmeasured.unlabelled")]
+fn a_dead_unmeasured_block_that_is_not_numbers_still_fails() {
+    corpus_rates(
+        &record_with(serde_json::json!({
+            "dead_fp_by_tier": { "0.9": { "false_positive": 0, "rows": 40 } },
+            "dead_unmeasured": { "unlabelled": "none", "malformed": 0 },
+        })),
+        "test record",
+    );
+}
+
+#[test]
 fn empty_rows_beside_a_corpus_with_rows_leave_the_proof_to_that_corpus() {
-    let rates = [
-        ("empty".to_string(), 0, 0),
-        ("measured".to_string(), 1, 40),
-    ];
+    let rates = [("empty".to_string(), 0, 0), ("measured".to_string(), 1, 40)];
     assert_eq!(corpus_proof(&rates), (40, true));
-    let dirty = [
-        ("empty".to_string(), 0, 0),
-        ("measured".to_string(), 3, 40),
-    ];
+    let dirty = [("empty".to_string(), 0, 0), ("measured".to_string(), 3, 40)];
     assert_eq!(
         corpus_proof(&dirty),
         (40, false),
