@@ -274,7 +274,7 @@ dependencies = [
 
 [[package]]
 name = "dc-evidence"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -283,11 +283,11 @@ dependencies = [
 
 [[package]]
 name = "dc-glob"
-version = "0.2.4"
+version = "0.2.5"
 
 [[package]]
 name = "dc-grep"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "grep-regex",
  "grep-searcher",
@@ -302,18 +302,18 @@ dependencies = [
 
 [[package]]
 name = "dc-proc"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "dc-redact"
-version = "0.2.4"
+version = "0.2.5"
 
 [[package]]
 name = "dc-regress"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "dc-proc",
  "devmap-extract",
@@ -323,7 +323,7 @@ dependencies = [
 
 [[package]]
 name = "dc-regress-store"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "dc-regress",
@@ -333,14 +333,14 @@ dependencies = [
 
 [[package]]
 name = "dc-store"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "rusqlite",
 ]
 
 [[package]]
 name = "dc-verify"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "dc-evidence",
  "dc-glob",
@@ -358,7 +358,7 @@ dependencies = [
 
 [[package]]
 name = "devmap-analyze"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "devmap-extract",
@@ -371,7 +371,7 @@ dependencies = [
 
 [[package]]
 name = "devmap-cli"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "devmap-extract"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "cc",
@@ -446,7 +446,7 @@ dependencies = [
 
 [[package]]
 name = "devmap-query"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "dc-glob",
@@ -463,7 +463,7 @@ dependencies = [
 
 [[package]]
 name = "devmap-resolve"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "devmap-extract",
  "rayon",
@@ -473,7 +473,7 @@ dependencies = [
 
 [[package]]
 name = "devmap-serve"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "dc-proc",
@@ -497,7 +497,7 @@ dependencies = [
 
 [[package]]
 name = "devmap-soak"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "dc-proc",
  "rusqlite",
@@ -508,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "devmap-store"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "devmap-analyze",

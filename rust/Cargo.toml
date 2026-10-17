@@ -56,7 +56,7 @@ inherits = "release"
 lto = "thin"
 
 [workspace.package]
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 # The pinned toolchain (../rust-toolchain.toml) is the only version CI builds,
 # so it is the only one this workspace can claim to support.
