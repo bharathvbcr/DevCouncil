@@ -12,10 +12,10 @@
     "present": 62
   },
   "python": {
-    "forbid_any_tier_rows": 7,
-    "known_failing": 12,
-    "positive_rows": 64,
-    "present": 52
+    "forbid_any_tier_rows": 21,
+    "known_failing": 9,
+    "positive_rows": 73,
+    "present": 64
   },
   "rust": {
     "forbid_any_tier_rows": 1,
