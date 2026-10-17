@@ -384,6 +384,21 @@ fn labelled_row(
 
 fn parse_labels(raw: &str) -> Result<Labels, String> {
     let v: Value = serde_json::from_str(raw).map_err(|e| format!("labels are not JSON: {e}"))?;
+    // A typo'd section name or a section that is not an array would otherwise
+    // be read as "no labels of that kind" and quietly drop what was written.
+    let sections = v
+        .as_object()
+        .ok_or_else(|| "labels are not a JSON object".to_string())?;
+    for (name, section) in sections {
+        if !["edges", "recall", "oracle", "dead"].contains(&name.as_str()) {
+            return Err(format!(
+                "unknown labels section {name:?} (the runner reads edges, recall, oracle, dead)"
+            ));
+        }
+        if !section.is_array() {
+            return Err(format!("labels section {name:?} is not an array"));
+        }
+    }
     let text = |o: &Value, k: &str| -> Result<String, String> {
         o[k].as_str()
             .map(str::to_string)
@@ -510,8 +525,15 @@ impl Counts {
 }
 
 /// Last `.`/`:`-separated segment of a symbol or call name.
+///
+/// A name that ends in a separator (an Objective-C selector `doThing:with:`)
+/// has an empty last segment; it stays whole, so it is never equal to every
+/// other such name.
 fn last_segment(name: &str) -> &str {
-    name.rsplit(['.', ':']).next().unwrap_or(name)
+    match name.rsplit(['.', ':']).next() {
+        Some(segment) if !segment.is_empty() => segment,
+        _ => name,
+    }
 }
 
 /// Recall sites whose truth edge is absent, split by what DevMap did instead.
@@ -634,10 +656,10 @@ fn score_labels(
 ) -> Result<BTreeMap<String, Value>, String> {
     let mut edge_conf: BTreeMap<(&str, &str), (i64, &'static str)> = BTreeMap::new();
     let mut any_edge: BTreeSet<(&str, &str)> = BTreeSet::new();
-    // `(caller, last segment of the target's name)` for every HIGH call edge:
-    // what a recall site was bound to when its truth edge is absent. Read from
-    // the build's edges, never from labels.
-    let mut high_bound: BTreeSet<(&str, &str)> = BTreeSet::new();
+    // `(caller, last segment of the target's name)` -> targets, for every HIGH
+    // call edge: what a recall site was bound to when its truth edge is absent.
+    // Read from the build's edges; labels only say whether one was right.
+    let mut high_bound: BTreeMap<(&str, &str), BTreeSet<&str>> = BTreeMap::new();
     for e in built
         .resolution
         .edges
@@ -648,7 +670,10 @@ fn score_labels(
         if matches!(e.edge_kind, EdgeKind::Calls | EdgeKind::References)
             && e.confidence.to_millis() >= HIGH_MILLIS
         {
-            high_bound.insert((e.source_symbol.as_str(), last_segment(&e.target_symbol)));
+            high_bound
+                .entry((e.source_symbol.as_str(), last_segment(&e.target_symbol)))
+                .or_default()
+                .insert(e.target_symbol.as_str());
         }
         let kind = e.resolution.as_ref().map_or("none", |r| r.kind().label());
         let entry = edge_conf
@@ -756,6 +781,17 @@ fn score_labels(
 
         let mut by_construct: BTreeMap<&str, Counts> = BTreeMap::new();
         let mut honest = HonestMiss::default();
+        // An edge a hand label says is right, or an oracle that read the
+        // caller bound.
+        let judged_correct = |caller: &str, callee: &str| {
+            labels.edges.iter().any(|e| {
+                &e.language == lang && e.correct && e.caller == caller && e.callee == callee
+            }) || labels.oracle.iter().any(|o| {
+                &o.language == lang
+                    && o.covered_callers.contains(caller)
+                    && o.uses.contains(&(caller.to_string(), callee.to_string()))
+            })
+        };
         for l in labels.recall.iter().filter(|l| &l.language == lang) {
             let present = l
                 .truth
@@ -768,14 +804,24 @@ fn score_labels(
             if !present {
                 let recorded = ledger.get(l.caller.as_str()).is_some_and(|rows| {
                     rows.iter().any(|(name, class)| {
-                        UNATTRIBUTED_LABELS.contains(class)
-                            && last_segment(name) == last_segment(&l.name)
+                        UNATTRIBUTED_LABELS.contains(class) && last_segment(name) == l.name
                     })
                 });
-                // A HIGH edge for this call name to a non-truth target is a
-                // wrong binding, which precision scores; it is neither an
-                // honest nor a silent miss.
-                if high_bound.contains(&(l.caller.as_str(), last_segment(&l.name))) {
+                // A HIGH edge from this caller for this call name, none of
+                // which a label or the oracle judged correct, is a wrong
+                // binding: neither an honest nor a silent miss. (Edge labels
+                // and the oracle debit precision for it only where they judge
+                // that edge.) A (caller, name) pair cannot tell two call sites
+                // of one name apart, so a correct same-name edge elsewhere in
+                // the caller leaves a missing site silent, never wrongly bound.
+                let wrongly_bound = high_bound
+                    .get(&(l.caller.as_str(), l.name.as_str()))
+                    .is_some_and(|targets| {
+                        !targets
+                            .iter()
+                            .any(|target| judged_correct(&l.caller, target))
+                    });
+                if wrongly_bound {
                     honest.wrongly_bound += 1;
                 } else if recorded {
                     honest.recorded += 1;
@@ -904,9 +950,19 @@ fn rate_of(row: &Value, path: &[&str]) -> Option<f64> {
 
 /// Rows the dead gate could not score: confident-branch rows with no label plus
 /// labels that were malformed.
-fn dead_unmeasured_count(row: &Value) -> u64 {
-    let n = |k: &str| row["dead_unmeasured"][k].as_u64().unwrap_or(0);
-    n("unlabelled") + n("malformed")
+///
+/// `None` when the block is there but is not two non-negative integers: a
+/// record that cannot be read is never read as "nothing unmeasured". An absent
+/// block is 0, as the CLI reader (`dead_tier_eligibility.rs`) reads it; that
+/// reader panics on the malformed forms, the runner turns them into an
+/// unmeasured gate instead.
+fn dead_unmeasured_count(row: &Value) -> Option<u64> {
+    let block = &row["dead_unmeasured"];
+    if block.is_null() {
+        return Some(0);
+    }
+    let n = |k: &str| block[k].as_u64();
+    n("unlabelled")?.checked_add(n("malformed")?)
 }
 
 /// What a row says about the 0.9-tier dead false-positive gate.
@@ -924,15 +980,20 @@ enum DeadFp {
 }
 
 fn dead_fp_state(row: &Value) -> DeadFp {
-    if dead_unmeasured_count(row) > 0 {
+    if dead_unmeasured_count(row) != Some(0) {
         return DeadFp::Unmeasured;
     }
+    // Counts are non-negative integers and a false positive is one of the
+    // rows; anything else is an unreadable record, not a rate.
     let tier = &row["dead_fp_by_tier"]["0.9"];
-    let (Some(fp), Some(rows)) = (tier["false_positive"].as_f64(), tier["rows"].as_f64()) else {
+    let (Some(fp), Some(rows)) = (tier["false_positive"].as_u64(), tier["rows"].as_u64()) else {
         return DeadFp::Unmeasured;
     };
-    if rows > 0.0 {
-        DeadFp::Measured(fp / rows)
+    if fp > rows {
+        return DeadFp::Unmeasured;
+    }
+    if rows > 0 {
+        DeadFp::Measured(fp as f64 / rows as f64)
     } else {
         DeadFp::EmptyTier
     }
@@ -997,8 +1058,13 @@ fn evaluate_gates(
 ) -> Vec<String> {
     // Numbers carried from a row this run could not re-check are not evidence:
     // the unverifiable row fails by itself and its stale rates are not read.
-    if let Some(reason) = current["unverifiable"].as_str() {
-        return vec![unverifiable_gate(lang, reason)];
+    // Any non-null stamp counts, whatever its type: the CLI reader does the same.
+    let stamp = &current["unverifiable"];
+    if !stamp.is_null() {
+        let reason = stamp
+            .as_str()
+            .map_or_else(|| stamp.to_string(), str::to_string);
+        return vec![unverifiable_gate(lang, &reason)];
     }
     let mut out = regression_gates(lang, previous, current, &gates.floors);
     out.extend(claim_gates(lang, current, measurement, gates));
@@ -1392,12 +1458,25 @@ fn carry_unverifiable(
     if missing.is_empty() {
         return labelled;
     }
-    let reason = if labelled.is_none() {
+    let mut reason = if labelled.is_none() {
         format!("no labels file was found for {}", pin.name)
     } else {
         "the labels hold nothing for this language".to_string()
     };
+    // The carried row was measured at the commit the record names; when the
+    // pin has moved, the entry written under the pin's commit says so rather
+    // than passing the old row off as a measurement of the new one.
+    let measured_at = previous["corpus_commit"]
+        .as_str()
+        .unwrap_or("an unknown commit");
+    if measured_at != pin.commit {
+        reason.push_str(&format!(
+            "; the carried row was measured at corpus commit {measured_at}, not the pinned {}",
+            pin.commit
+        ));
+    }
     let mut entry = labelled.unwrap_or_else(|| previous.clone());
+    entry["corpus_commit"] = json!(pin.commit);
     for lang in missing {
         let mut row = previous["languages"][lang.as_str()].clone();
         // A row already stamped keeps the reason it was first stamped with.
@@ -2024,7 +2103,12 @@ fn a_scored_row_is_written_only_for_a_labelled_language_and_carries_the_confiden
     );
     // The fully labelled fixture reports nothing unmeasured and has a rate.
     let full = score_labels("Fixture", &built, &labels, &languages).unwrap();
-    assert_eq!(dead_unmeasured_count(&full["go"]), 0, "{}", full["go"]);
+    assert_eq!(
+        dead_unmeasured_count(&full["go"]),
+        Some(0),
+        "{}",
+        full["go"]
+    );
     assert_eq!(dead_fp_rate(&full["go"]), Some(0.0));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2819,8 +2903,10 @@ fn attack_honest(label: &str, labels: &Labels) -> (Value, Value) {
 fn attack_a_correct_same_name_edge_does_not_turn_a_silent_miss_into_wrongly_bound() {
     let labels = attack_labels(
         vec![attack_recall("Target01", "app/util/util2.go::Target02")],
-        vec![json!({ "language": "go", "caller": "app/svc/svc.go::Caller01",
-                      "callee": "app/util/util.go::Target01", "correct": true })],
+        vec![
+            json!({ "language": "go", "caller": "app/svc/svc.go::Caller01",
+                      "callee": "app/util/util.go::Target01", "correct": true }),
+        ],
     );
     let (honest, precision) = attack_honest("atk-same-name", &labels);
     assert_eq!(precision["correct"], 1, "{precision}");
@@ -2904,11 +2990,13 @@ fn attack_a_site_with_a_truth_edge_and_a_wrong_edge_is_present() {
     assert_eq!(honest["wrongly_bound"], 0, "{honest}");
 }
 
-/// Characterisation: with no edge label the wrong HIGH edge is in nobody's
-/// precision, and the site left honest-miss. Recall (present=false) is the only
-/// place it still shows.
+/// Documented limit (characterisation, not a fix): with no edge label and no
+/// oracle covering the caller, a wrong HIGH edge is in nobody's precision. It
+/// is still reported as `wrongly_bound`, and recall (present=false) shows it.
+/// Test changed from an assertion that precision debits it (total == 1): that
+/// expectation was wrong, precision only debits edges something judged.
 #[test]
-fn attack_an_unsampled_wrong_high_edge_leaves_precision_and_honest_miss() {
+fn attack_an_unsampled_wrong_high_edge_is_a_documented_limit_of_precision() {
     let labels = attack_labels(
         vec![attack_recall("Target01", "app/util/util2.go::Target02")],
         vec![],
@@ -2916,8 +3004,8 @@ fn attack_an_unsampled_wrong_high_edge_leaves_precision_and_honest_miss() {
     let (honest, precision) = attack_honest("atk-unsampled", &labels);
     assert_eq!(honest["wrongly_bound"], 1, "{honest}");
     assert_eq!(
-        precision["total"], 1,
-        "the comment says precision already debits this wrong binding; with no edge label it debits nothing: {precision}"
+        precision["total"], 0,
+        "an edge nobody judged is in no precision count: {precision}"
     );
 }
 
@@ -2932,10 +3020,17 @@ fn attack_last_segment_of_a_name_ending_in_a_separator_is_not_empty() {
 fn attack_dead_fp_state_rejects_impossible_numbers() {
     let tier = |fp: Value, rows: Value| json!({ "dead_fp_by_tier": { "0.9": { "false_positive": fp, "rows": rows } } });
     let mut wrong = Vec::new();
-    for (fp, rows) in [(json!(0), json!(-5)), (json!(-5), json!(10)), (json!(11), json!(10)), (json!(0), json!(0.5))] {
+    for (fp, rows) in [
+        (json!(0), json!(-5)),
+        (json!(-5), json!(10)),
+        (json!(11), json!(10)),
+        (json!(0), json!(0.5)),
+    ] {
         let state = dead_fp_state(&tier(fp.clone(), rows.clone()));
         if !matches!(state, DeadFp::Unmeasured) {
-            wrong.push(format!("fp={fp} rows={rows} read as {state:?}, not Unmeasured"));
+            wrong.push(format!(
+                "fp={fp} rows={rows} read as {state:?}, not Unmeasured"
+            ));
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
@@ -2965,7 +3060,9 @@ fn attack_a_malformed_dead_unmeasured_block_is_not_read_as_zero() {
                           "dead_unmeasured": block.clone() });
         let state = dead_fp_state(&row);
         if state != DeadFp::Unmeasured {
-            wrong.push(format!("dead_unmeasured {block} read as {state:?} (the CLI reader panics on it)"));
+            wrong.push(format!(
+                "dead_unmeasured {block} read as {state:?} (the CLI reader panics on it)"
+            ));
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
@@ -2973,7 +3070,8 @@ fn attack_a_malformed_dead_unmeasured_block_is_not_read_as_zero() {
 
 #[test]
 fn attack_an_empty_tier_after_a_measured_one_still_fails_and_says_why() {
-    let tier = |rows: u64| json!({ "dead_fp_by_tier": { "0.9": { "false_positive": 0, "rows": rows } } });
+    let tier =
+        |rows: u64| json!({ "dead_fp_by_tier": { "0.9": { "false_positive": 0, "rows": rows } } });
     let found = regression_gates("go", Some(&tier(10)), &tier(0), &BTreeMap::new());
     let dead: Vec<_> = found.iter().filter(|f| f.contains("dead")).collect();
     assert_eq!(dead.len(), 1, "{found:?}");
@@ -3003,7 +3101,13 @@ fn attack_the_old_flow_left_a_committed_row_looking_measured() {
     let good = &committed["languages"]["go"];
     assert!(regression_gates("go", None, good, &floors()).is_empty());
     let stamped = carry_unverifiable(Some(&committed), None, &pin).unwrap();
-    let found = evaluate_gates("go", Some(good), &stamped["languages"]["go"], None, &gates());
+    let found = evaluate_gates(
+        "go",
+        Some(good),
+        &stamped["languages"]["go"],
+        None,
+        &gates(),
+    );
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].contains("unverifiable"));
 }
@@ -3016,7 +3120,8 @@ fn attack_a_moved_pin_does_not_stamp_the_old_commit_row_under_the_new_pin() {
         "languages": { "go": row((97, 100), (90, 100), (99, 100), (0, 10)) } });
     let entry = carry_unverifiable(Some(&previous), None, &pin).expect("carried");
     assert_ne!(
-        entry["corpus_commit"], json!(old_commit),
+        entry["corpus_commit"],
+        json!(old_commit),
         "the stamped entry still claims commit {old_commit}, not the pin {}: {entry}",
         pin.commit
     );
@@ -3041,7 +3146,8 @@ fn attack_double_stamping_keeps_the_first_reason_and_a_scored_run_clears_it() {
     let once = carry_unverifiable(Some(&committed), None, &pin).unwrap();
     let twice = carry_unverifiable(Some(&once), None, &pin).unwrap();
     assert_eq!(once, twice);
-    let empty_labels = json!({ "name": "Corpus", "corpus_commit": "0".repeat(40), "languages": {} });
+    let empty_labels =
+        json!({ "name": "Corpus", "corpus_commit": "0".repeat(40), "languages": {} });
     let third = carry_unverifiable(Some(&once), Some(empty_labels), &pin).unwrap();
     assert_eq!(
         third["languages"]["go"]["unverifiable"], once["languages"]["go"]["unverifiable"],
@@ -3066,12 +3172,20 @@ fn attack_a_pin_language_spelled_differently_from_the_committed_row_still_fails(
 
 #[test]
 fn attack_labels_that_are_not_an_object_of_known_sections_are_refused() {
-    // `[]`, `{}` and a typo'd section name parse as "no labels" and then, at
-    // best, stamp the committed row unverifiable. A typo'd section next to a
-    // good one is dropped silently.
-    let accepted: Vec<&str> = ["[]", "{}", r#"{"recal": []}"#, r#"{"edges": [], "recall_typo": [1]}"#]
-        .into_iter()
-        .filter(|raw| parse_labels(raw).is_ok())
-        .collect();
+    // A non-object, a typo'd section name and a section that is not an array
+    // would be dropped silently. Test changed: `{}` is no longer in the list.
+    // It is a well-formed labels file that says nothing, which the runner
+    // already fails loudly on (no row, or the committed row stamped
+    // `unverifiable`), and `labelmerge` emits it for an all-empty store.
+    let accepted: Vec<&str> = [
+        "[]",
+        r#"{"recal": []}"#,
+        r#"{"edges": [], "recall_typo": [1]}"#,
+        r#"{"edges": {}}"#,
+    ]
+    .into_iter()
+    .filter(|raw| parse_labels(raw).is_ok())
+    .collect();
     assert!(accepted.is_empty(), "parse_labels accepted {accepted:?}");
+    assert!(parse_labels("{}").is_ok());
 }

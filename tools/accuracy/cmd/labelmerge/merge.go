@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -89,7 +90,7 @@ func Merge(dir string, opts Options) ([]byte, map[string]int, error) {
 		bySite[s] = map[string][]source{}
 	}
 	for _, f := range files {
-		raw, err := os.ReadFile(filepath.Join(dir, f.name))
+		raw, err := readBounded(filepath.Join(dir, f.name), f.name)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -131,6 +132,13 @@ func Merge(dir string, opts Options) ([]byte, map[string]int, error) {
 			}
 		}
 	}
+	total := 0
+	for _, n := range counts {
+		total += n
+	}
+	if total == 0 {
+		return nil, nil, fmt.Errorf("%s: %d label file(s) hold no labels at all; refusing to write an empty labels file", dir, len(files))
+	}
 	encoded, err := encode(out)
 	if err != nil {
 		return nil, nil, err
@@ -155,8 +163,15 @@ func inputFiles(dir string) ([]inputFile, error) {
 	var files []inputFile
 	for _, e := range entries {
 		name := e.Name()
-		if e.IsDir() || !strings.HasPrefix(name, "labels-") || !strings.HasSuffix(name, ".json") {
+		lower := strings.ToLower(name)
+		if e.IsDir() || !strings.HasPrefix(lower, "labels-") || !strings.HasSuffix(lower, ".json") {
 			continue
+		}
+		// A case variant (`Labels-go.json`, `labels-go.JSON`) is a label file
+		// someone meant to include; on a case-insensitive filesystem it is
+		// also the same file as the lower-case spelling. Never skip it.
+		if name != lower {
+			return nil, fmt.Errorf("%s: %s is a case variant of a label file name; rename it to %s", dir, name, lower)
 		}
 		m := fileName.FindStringSubmatch(name)
 		if m == nil {
@@ -188,9 +203,15 @@ func inputFiles(dir string) ([]inputFile, error) {
 
 // parseFile decodes one label file into canonical rows per section.
 func parseFile(name, language string, raw []byte, opts Options) (map[string][]row, error) {
+	if err := noDuplicateKeys(raw); err != nil {
+		return nil, fmt.Errorf("%s: %w", name, err)
+	}
 	var top map[string]json.RawMessage
 	if err := decodeStrict(raw, &top); err != nil {
 		return nil, fmt.Errorf("%s: not a JSON object of label arrays: %w", name, err)
+	}
+	if top == nil {
+		return nil, fmt.Errorf("%s: is JSON null, not an object of label arrays", name)
 	}
 	for k := range top {
 		if _, ok := specs[k]; !ok {
@@ -207,6 +228,10 @@ func parseFile(name, language string, raw []byte, opts Options) (map[string][]ro
 		if err := decodeStrict(msg, &entries); err != nil {
 			return nil, fmt.Errorf("%s: %q is not an array of objects: %w", name, s, err)
 		}
+		if entries == nil {
+			return nil, fmt.Errorf("%s: %q is null, not an array", name, s)
+		}
+		seen := map[string]int{}
 		for i, obj := range entries {
 			r, err := checkEntry(s, obj)
 			if err != nil {
@@ -220,6 +245,20 @@ func parseFile(name, language string, raw []byte, opts Options) (map[string][]ro
 					return nil, fmt.Errorf("%s: dead[%d]: %w", name, i, err)
 				}
 			}
+			// One file says one thing about a site. Two recall rows may share
+			// (caller, name) - two call sites of one name - but not the truth.
+			site := r.key
+			if s == "recall" {
+				site += obj["truth"].(string)
+			}
+			if first, dup := seen[site]; dup {
+				kind := "conflicts with"
+				if out[s][first].canon == r.canon {
+					kind = "duplicates"
+				}
+				return nil, fmt.Errorf("%s: %s[%d] %s %s[%d] (same site %s)", name, s, i, kind, s, first, describe(r.key))
+			}
+			seen[site] = len(out[s])
 			out[s] = append(out[s], r)
 		}
 	}
@@ -314,6 +353,79 @@ func describe(key string) string {
 		return key
 	}
 	return strings.Join(parts, " | ")
+}
+
+// maxInputBytes bounds one label file; a variable so a test can lower it.
+var maxInputBytes int64 = 64 << 20
+
+// readBounded reads a label file of at most maxInputBytes.
+func readBounded(path, name string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, maxInputBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", name, err)
+	}
+	if int64(len(raw)) > maxInputBytes {
+		return nil, fmt.Errorf("%s: larger than the %d MiB limit for one label file", name, maxInputBytes>>20)
+	}
+	return raw, nil
+}
+
+// noDuplicateKeys walks raw's JSON and refuses an object that repeats a key:
+// encoding/json keeps the last one silently, so the file would say two things
+// about one field and the merge would pick one without telling.
+func noDuplicateKeys(raw []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	return walkKeys(dec, 0)
+}
+
+// maxDepth bounds the nesting walkKeys follows, so a hostile file cannot
+// exhaust the stack.
+const maxDepth = 256
+
+func walkKeys(dec *json.Decoder, depth int) error {
+	if depth > maxDepth {
+		return fmt.Errorf("JSON nested deeper than %d levels", maxDepth)
+	}
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		seen := map[string]bool{}
+		for dec.More() {
+			keyTok, err := dec.Token()
+			if err != nil {
+				return err
+			}
+			key, _ := keyTok.(string)
+			if seen[key] {
+				return fmt.Errorf("duplicate JSON key %q in one object", key)
+			}
+			seen[key] = true
+			if err := walkKeys(dec, depth+1); err != nil {
+				return err
+			}
+		}
+	case '[':
+		for dec.More() {
+			if err := walkKeys(dec, depth+1); err != nil {
+				return err
+			}
+		}
+	}
+	_, err = dec.Token() // the closing delimiter
+	return err
 }
 
 // decodeStrict decodes exactly one JSON value, keeping numbers exact.

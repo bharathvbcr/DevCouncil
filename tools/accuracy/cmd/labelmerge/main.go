@@ -66,34 +66,72 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
-	if err := os.WriteFile(*out, merged, 0o644); err != nil {
+	if err := writeAtomic(*out, merged); err != nil {
 		fmt.Fprintf(stderr, "labelmerge: %v\n", err)
 		return 1
 	}
 	return 0
 }
 
-// refuseInput errors when out is one of the store's files, compared by file
-// identity so a symlink or a relative spelling cannot get around it.
-func refuseInput(dir, out string) error {
-	outInfo, err := os.Stat(out)
+// writeAtomic puts data at path through a temporary file in the same
+// directory, synced and renamed over it: a reader sees the old file or the
+// whole new one, never a truncated labels.json.
+func writeAtomic(path string, data []byte) (err error) {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".labelmerge-*.tmp")
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tmp.Close()
+			_ = os.Remove(tmp.Name())
 		}
+	}()
+	if _, err = tmp.Write(data); err != nil {
 		return err
 	}
-	files, err := inputFiles(dir)
-	if err != nil {
+	if err = tmp.Chmod(0o644); err != nil {
 		return err
 	}
-	for _, f := range files {
-		in, err := os.Stat(filepath.Join(dir, f.name))
+	if err = tmp.Sync(); err != nil {
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
+}
+
+// refuseInput errors when out could land in the store or on one of its
+// files: a symlink (whose target may be a name the store will read), a file in
+// the store directory (the next merge would read it back as an input), or a
+// hard link to an input, compared by file identity.
+func refuseInput(dir, out string) error {
+	if info, err := os.Lstat(out); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing -o %s: it is a symbolic link", out)
+	}
+	outInfo, err := os.Stat(out)
+	switch {
+	case err == nil:
+		files, err := inputFiles(dir)
 		if err != nil {
 			return err
 		}
-		if os.SameFile(in, outInfo) {
-			return fmt.Errorf("refusing to write over the input %s", filepath.Join(dir, f.name))
+		for _, f := range files {
+			in, err := os.Stat(filepath.Join(dir, f.name))
+			if err != nil {
+				return err
+			}
+			if os.SameFile(in, outInfo) {
+				return fmt.Errorf("refusing to write over the input %s", filepath.Join(dir, f.name))
+			}
+		}
+	case !os.IsNotExist(err):
+		return err
+	}
+	if dirInfo, err := os.Stat(dir); err == nil {
+		if outDir, err := os.Stat(filepath.Dir(out)); err == nil && os.SameFile(dirInfo, outDir) {
+			return fmt.Errorf("refusing -o %s: it is inside the label store %s", out, dir)
 		}
 	}
 	return nil

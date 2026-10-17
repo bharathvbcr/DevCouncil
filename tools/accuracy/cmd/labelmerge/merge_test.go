@@ -150,20 +150,23 @@ func TestEmptyAndUnusableDirectoriesAreRefused(t *testing.T) {
 	}
 }
 
-func TestEmptyObjectFilesMergeToEmptyArrays(t *testing.T) {
+// Test changed: a lone `{}` used to merge to empty arrays; a store that holds
+// no labels at all is now refused, so the runner is never handed an empty file
+// as if it were a labelling. An empty file beside real labels is still fine.
+func TestEmptyObjectFilesAreFineBesideLabelsButNotAlone(t *testing.T) {
 	dir := write(t, map[string]string{"labels-go.json": `{}`})
-	out, counts, err := Merge(dir, Options{})
-	if err != nil || len(counts) != 0 {
-		t.Fatalf("err=%v counts=%v", err, counts)
+	if _, _, err := Merge(dir, Options{}); err == nil || !strings.Contains(err.Error(), "no labels at all") {
+		t.Fatalf("an all-empty store merged: %v", err)
 	}
-	want := "{\n  \"dead\": [],\n  \"edges\": [],\n  \"oracle\": [],\n  \"recall\": []\n}\n"
-	if string(out) != want {
-		t.Fatalf("got %q", out)
+	dir = write(t, map[string]string{"labels-go.json": `{}`, "labels-go-r2.json": `{"edges":[` + edge("true") + `]}`})
+	if _, counts, err := Merge(dir, Options{}); err != nil || counts["go"] != 1 {
+		t.Fatalf("err=%v counts=%v", err, counts)
 	}
 }
 
 func TestRunRefusesToWriteOverAnInput(t *testing.T) {
-	dir := write(t, map[string]string{"labels-go.json": `{}`})
+	content := `{"edges":[{"language":"go","caller":"a::F","callee":"a::G","correct":true}]}`
+	dir := write(t, map[string]string{"labels-go.json": content})
 	input := filepath.Join(dir, "labels-go.json")
 	var stdout, stderr bytes.Buffer
 	if code := run([]string{"-dir", dir, "-o", input}, &stdout, &stderr); code != 1 {
@@ -172,7 +175,7 @@ func TestRunRefusesToWriteOverAnInput(t *testing.T) {
 	if !strings.Contains(stderr.String(), "refusing to write over the input") {
 		t.Errorf("stderr %q", stderr.String())
 	}
-	if raw, _ := os.ReadFile(input); string(raw) != `{}` {
+	if raw, _ := os.ReadFile(input); string(raw) != content {
 		t.Errorf("the input was modified: %q", raw)
 	}
 	// A symlink to the input is the same file.

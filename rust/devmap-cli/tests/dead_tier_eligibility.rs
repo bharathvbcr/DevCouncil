@@ -880,7 +880,12 @@ fn attack_any_non_null_unverifiable_stamp_is_no_proof_even_beside_a_clean_corpus
                 "dead_fp_by_tier": { "0.9": { "false_positive": 0, "rows": 3 } } } } },
         ]});
         let rates = corpus_rates(&record, "attack");
-        assert_eq!(corpus_proof(&rates["lang"]).0, 3, "stamp {stamp}: {:?}", rates["lang"]);
+        assert_eq!(
+            corpus_proof(&rates["lang"]).0,
+            3,
+            "stamp {stamp}: {:?}",
+            rates["lang"]
+        );
     }
 }
 

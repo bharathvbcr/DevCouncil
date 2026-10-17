@@ -58,19 +58,17 @@ func TestAttackSameFileConflictingOracleRowsAreRefused(t *testing.T) {
 	}
 }
 
-// An identical duplicate inside one file is double counted by the runner's
-// precision tally; across files the merge keeps it once, within a file it
-// keeps it twice.
-func TestAttackSameFileIdenticalDuplicateIsKeptOnce(t *testing.T) {
+// An identical duplicate inside one file would be double counted by the
+// runner's precision tally. Test changed: it asked for the duplicate to be
+// kept once; the coordinator chose refusal (a file that repeats a row is a
+// labelling slip to fix, not to paper over), and the error names the file.
+func TestAttackSameFileIdenticalDuplicateIsRefused(t *testing.T) {
 	dir := write(t, map[string]string{
 		"labels-go.json": `{"edges":[` + edge("true") + `,` + edge("true") + `]}`,
 	})
-	out, counts, err := Merge(dir, Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if counts["go"] != 1 {
-		t.Fatalf("identical duplicate row kept %d times (precision would double count it):\n%s", counts["go"], out)
+	_, _, err := Merge(dir, Options{})
+	if err == nil || !strings.Contains(err.Error(), "labels-go.json") || !strings.Contains(err.Error(), "duplicates") {
+		t.Fatalf("identical in-file duplicate not refused by name: %v", err)
 	}
 }
 
@@ -79,9 +77,8 @@ func TestAttackDegenerateFilesAreRefused(t *testing.T) {
 		"zero-byte":         "",
 		"bom":               "\xef\xbb\xbf" + `{"edges":[` + edge("true") + `]}`,
 		"json-null":         "null",
-		"empty-object":      "{}",
-		"empty-arrays":      `{"edges":[],"recall":[],"oracle":[],"dead":[]}`,
 		"null-arrays":       `{"edges":null,"recall":null}`,
+		"deep-nesting":      `{"edges":` + strings.Repeat("[", 5000) + strings.Repeat("]", 5000) + `}`,
 		"whitespace-only":   "  \n",
 		"nul-byte-trailing": `{"edges":[` + edge("true") + `]}` + "\x00",
 	}
@@ -110,20 +107,36 @@ func TestAttackStoreOfOnlyEmptyLabelFilesIsRefused(t *testing.T) {
 	}
 }
 
-// Misnamed files: only names that start `labels-` and end `.json`, exactly
-// lower-case, are examined. Every other spelling is skipped without a word.
+// Misnamed files. Test changed: a case variant of the label-file name is
+// refused with an error naming it (it is a label file someone meant to
+// include, and the same file on a case-insensitive filesystem). Genuinely
+// different names are not label files and are skipped, as the coordinator
+// ruled; the old test demanded they be named too.
 func TestAttackMisnamedLabelFilesAreNotSkippedSilently(t *testing.T) {
 	good := `{"edges":[` + edge("true") + `]}`
-	for _, bad := range []string{"Labels-go.json", "LABELS-go.json", "labels-go.JSON", "label-go.json", "labels_go.json", "labels-go.json.json.bak", "labels-go-r2.jsn"} {
-		t.Run(bad, func(t *testing.T) {
-			dir := write(t, map[string]string{
-				"labels-go.json": good,
-				bad:              `{"edges":[` + edge("false") + `]}`,
-			})
+	other := `{"edges":[` + strings.Replace(edge("false"), "a::F", "b::F", 1) + `]}`
+	for _, bad := range []string{"Labels-go.json", "LABELS-go.json", "labels-go.JSON", "labels-GO.json", "labels-go-R2.json"} {
+		t.Run("refused "+bad, func(t *testing.T) {
+			// The sibling is a python file: on a case-insensitive filesystem a
+			// second spelling of labels-go.json would overwrite it.
+			py := strings.Replace(good, `"go"`, `"python"`, 1)
+			dir := write(t, map[string]string{"labels-python.json": py, bad: other})
 			var stderr bytes.Buffer
 			code := run([]string{"-dir", dir}, &bytes.Buffer{}, &stderr)
-			if code == 0 && !strings.Contains(stderr.String(), bad) {
-				t.Fatalf("%s was neither merged nor named; exit 0, stderr=%q", bad, stderr.String())
+			if code == 0 || !strings.Contains(stderr.String(), bad) {
+				t.Fatalf("%s was not refused by name; exit %d, stderr=%q", bad, code, stderr.String())
+			}
+		})
+	}
+	for _, skipped := range []string{"label-go.json", "labels_go.json", "labels-go.json.json.bak", "labels-go-r2.jsn"} {
+		t.Run("skipped "+skipped, func(t *testing.T) {
+			dir := write(t, map[string]string{"labels-go.json": good, skipped: other})
+			var stdout bytes.Buffer
+			if code := run([]string{"-dir", dir}, &stdout, &bytes.Buffer{}); code != 0 {
+				t.Fatalf("exit %d", code)
+			}
+			if strings.Contains(stdout.String(), "b::F") {
+				t.Fatalf("%s was merged: %s", skipped, stdout.String())
 			}
 		})
 	}
@@ -197,13 +210,18 @@ func TestAttackOutputThroughHardlinkAndSymlinkOfInputIsRefused(t *testing.T) {
 	})
 }
 
-// -o inside the store, under a name the store's own pattern matches, poisons
-// the next merge (the output is read back as an input).
+// -o inside the store, under a name the store's own pattern matches, would
+// poison the next merge (the output read back as an input). Test changed: the
+// first merge is now refused outright, which is what keeps the store sound.
 func TestAttackOutputInsideStoreDoesNotPoisonNextMerge(t *testing.T) {
 	dir := write(t, map[string]string{"labels-go.json": `{"edges":[` + edge("true") + `]}`})
 	out := filepath.Join(dir, "labels-merged.json")
-	if code := run([]string{"-dir", dir, "-o", out}, &bytes.Buffer{}, &bytes.Buffer{}); code != 0 {
-		t.Fatal("first merge failed")
+	var refusal bytes.Buffer
+	if code := run([]string{"-dir", dir, "-o", out}, &bytes.Buffer{}, &refusal); code == 0 || !strings.Contains(refusal.String(), "inside the label store") {
+		t.Fatalf("-o inside the store was not refused: exit %d, %q", code, refusal.String())
+	}
+	if _, err := os.Stat(out); err == nil {
+		t.Fatal("the refused output was written anyway")
 	}
 	var stderr bytes.Buffer
 	if code := run([]string{"-dir", dir}, &bytes.Buffer{}, &stderr); code != 0 {
@@ -297,17 +315,28 @@ func TestAttackPrivateHashAndCategoryHoldAgainstOddShapes(t *testing.T) {
 	}
 }
 
-// No size bound: os.ReadFile plus map decoding of an arbitrarily large file.
+// Each input is bounded at 64 MiB. Test changed: it wrote a 48 MiB file and
+// demanded refusal, which contradicts the 64 MiB bound the coordinator set;
+// it now pins the bound and exercises the refusal with the limit lowered so
+// the test does not allocate hundreds of MiB.
 func TestAttackLabelFileSizeIsBounded(t *testing.T) {
-	if testing.Short() {
-		t.Skip("allocates ~100MB")
+	if maxInputBytes != 64<<20 {
+		t.Fatalf("the bound is %d bytes, want 64 MiB", maxInputBytes)
 	}
-	pad := strings.Repeat("x", 48<<20)
-	dir := write(t, map[string]string{
-		"labels-go.json": `{"edges":[{"language":"go","caller":"a::F","callee":"a::G","correct":true,"pad":"` + pad + `"}]}`,
-	})
-	if _, _, err := Merge(dir, Options{}); err == nil {
-		t.Fatal("a 48MB label file was read and merged with no size bound")
+	old := maxInputBytes
+	maxInputBytes = 1 << 20
+	defer func() { maxInputBytes = old }()
+	row := func(pad int) string {
+		return `{"edges":[{"language":"go","caller":"a::F","callee":"a::G","correct":true,"pad":"` + strings.Repeat("x", pad) + `"}]}`
+	}
+	dir := write(t, map[string]string{"labels-go.json": row(2 << 20)})
+	_, _, err := Merge(dir, Options{})
+	if err == nil || !strings.Contains(err.Error(), "labels-go.json") || !strings.Contains(err.Error(), "limit") {
+		t.Fatalf("an over-limit file was not refused by name: %v", err)
+	}
+	dir = write(t, map[string]string{"labels-go.json": row(1 << 10)})
+	if _, _, err := Merge(dir, Options{}); err != nil {
+		t.Fatalf("a file under the limit was refused: %v", err)
 	}
 }
 

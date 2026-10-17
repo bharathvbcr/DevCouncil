@@ -166,10 +166,16 @@ Labels file shape:
   is absent: `recorded` (an unattributed ledger row names the call), `silent`
   (no ledger row and no edge at all) and `wrongly_bound` (the caller has a HIGH
   Calls/References edge for that call name to a non-truth target, read from the
-  build's edges, not from labels). The rate is `recorded / (recorded + silent)`;
+  build's edges, and none of those same-name edges is judged correct by an edge
+  label or the oracle). The rate is `recorded / (recorded + silent)`;
   `wrongly_bound` is outside the denominator because it is precision's defect
-  (an edge label or the oracle debits it there) and counting it again as a
-  silent miss would move two gates for one fault. `absent` keeps its old meaning
+  and counting it again as a silent miss would move two gates for one fault.
+  Limits: precision debits that edge only when an edge label or the oracle
+  judges it, so a wrong HIGH edge nobody judged is reported as `wrongly_bound`
+  and shows in recall, but in no precision count. And `(caller, name)` cannot
+  tell two call sites of one name apart: a correct same-name edge elsewhere in
+  the caller leaves a missing site `silent`, never `wrongly_bound`. A ledger
+  row is matched on the whole call name, not its last segment. `absent` keeps its old meaning
   (all three summed), so rows committed before the split stay comparable; they
   carry no `silent` or `wrongly_bound` key.
 * **The dead gate has three states**: measured (a rate over >= 1 confident row,
@@ -185,8 +191,17 @@ Labels file shape:
   `"unverifiable": "<reason>"` and fails the gate naming the corpus and
   language (`<corpus>: <lang>: committed labelled row is unverifiable: ...`).
   `open_gates` lists it from the committed record, its stale numbers are not
-  read, and `dead_tier_eligibility.rs` counts it as no proof. A later run that
-  scores the language replaces the row and clears the stamp.
+  read, and `dead_tier_eligibility.rs` counts it as no proof. Any non-null
+  `unverifiable` value counts, in the runner and the CLI alike. When the pinned
+  corpus commit has moved since the row was measured, the entry is written under
+  the pin's commit and the reason names both commits. A later run that scores
+  the language replaces the row and clears the stamp.
+* A `dead_unmeasured` block, or a `dead_fp_by_tier.0.9` count, that is not
+  non-negative integers (or has more false positives than rows) is unmeasured in
+  the runner; the CLI reader refuses it (it panics, as it always has).
+* The runner refuses a labels file that is not a JSON object, has a section
+  other than `edges`, `recall`, `oracle`, `dead`, or has one that is not an
+  array.
 
 **Merging a label store.** Labels live beside the corpus, one file per language
 and round (`labels-<lang>[-rN].json`). `tools/accuracy/cmd/labelmerge` merges a
@@ -202,6 +217,13 @@ order (sorted by language, then caller/callee/name/id), entries' fields sorted,
 unknown fields kept. A site two files label differently (same language and
 caller and call name, edge pair, dead id or oracle language) is an error naming
 both files, never last-wins; an identical repeat in a later round is kept once.
+Within one file a repeated site is refused too (identical or conflicting; two
+recall rows may share caller and name if their `truth` differs), as is a
+repeated JSON key, a file over 64 MiB, a store whose files hold no labels in
+total, and a case variant of a label file name (`Labels-go.json`). Names that
+differ otherwise (`label-go.json`, `labels_go.json`) are not label files and
+are skipped. The output is written through a temporary file, synced and
+renamed, and `-o` may not be inside the store or a symbolic link.
 It also refuses a malformed file, a row whose `language` is not the file's, a
 `labels-*.json` name that does not follow the pattern, an empty store, a
 `symbol_hash` that is not `h:` + 12 lowercase hex digits, and an `-o` that is
