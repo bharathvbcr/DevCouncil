@@ -509,6 +509,41 @@ impl Counts {
     }
 }
 
+/// Last `.`/`:`-separated segment of a symbol or call name.
+fn last_segment(name: &str) -> &str {
+    name.rsplit(['.', ':']).next().unwrap_or(name)
+}
+
+/// Recall sites whose truth edge is absent, split by what DevMap did instead.
+/// `recorded`: an unattributed ledger row names the call. `silent`: no ledger
+/// row and no edge at all. `wrongly_bound`: a HIGH edge for that call name to a
+/// non-truth target - precision's defect, reported here but kept out of the
+/// rate, which is `recorded / (recorded + silent)`.
+#[derive(Default, Debug, PartialEq, Eq)]
+struct HonestMiss {
+    recorded: usize,
+    silent: usize,
+    wrongly_bound: usize,
+}
+
+impl HonestMiss {
+    fn rate(&self) -> Option<f64> {
+        let denominator = self.recorded + self.silent;
+        (denominator > 0).then(|| self.recorded as f64 / denominator as f64)
+    }
+    /// `absent` keeps its meaning (every site whose truth edge is missing) so
+    /// rows committed before the split stay comparable.
+    fn json(&self) -> Value {
+        json!({
+            "recorded": self.recorded,
+            "silent": self.silent,
+            "wrongly_bound": self.wrongly_bound,
+            "absent": self.recorded + self.silent + self.wrongly_bound,
+            "rate": self.rate(),
+        })
+    }
+}
+
 fn tier_label(r: &DeadSymbolReport) -> &'static str {
     if in_confident_branch(f64::from(r.confidence), r.exemption_reason.as_deref()) {
         "0.9"
@@ -599,6 +634,10 @@ fn score_labels(
 ) -> Result<BTreeMap<String, Value>, String> {
     let mut edge_conf: BTreeMap<(&str, &str), (i64, &'static str)> = BTreeMap::new();
     let mut any_edge: BTreeSet<(&str, &str)> = BTreeSet::new();
+    // `(caller, last segment of the target's name)` for every HIGH call edge:
+    // what a recall site was bound to when its truth edge is absent. Read from
+    // the build's edges, never from labels.
+    let mut high_bound: BTreeSet<(&str, &str)> = BTreeSet::new();
     for e in built
         .resolution
         .edges
@@ -606,6 +645,11 @@ fn score_labels(
         .filter(|e| is_use(e.edge_kind))
     {
         any_edge.insert((e.source_symbol.as_str(), e.target_symbol.as_str()));
+        if matches!(e.edge_kind, EdgeKind::Calls | EdgeKind::References)
+            && e.confidence.to_millis() >= HIGH_MILLIS
+        {
+            high_bound.insert((e.source_symbol.as_str(), last_segment(&e.target_symbol)));
+        }
         let kind = e.resolution.as_ref().map_or("none", |r| r.kind().label());
         let entry = edge_conf
             .entry((e.source_symbol.as_str(), e.target_symbol.as_str()))
@@ -711,7 +755,7 @@ fn score_labels(
         }
 
         let mut by_construct: BTreeMap<&str, Counts> = BTreeMap::new();
-        let mut honest = Counts::default();
+        let mut honest = HonestMiss::default();
         for l in labels.recall.iter().filter(|l| &l.language == lang) {
             let present = l
                 .truth
@@ -725,10 +769,19 @@ fn score_labels(
                 let recorded = ledger.get(l.caller.as_str()).is_some_and(|rows| {
                     rows.iter().any(|(name, class)| {
                         UNATTRIBUTED_LABELS.contains(class)
-                            && name.rsplit(['.', ':']).next() == Some(l.name.as_str())
+                            && last_segment(name) == last_segment(&l.name)
                     })
                 });
-                honest.record(recorded);
+                // A HIGH edge for this call name to a non-truth target is a
+                // wrong binding, which precision scores; it is neither an
+                // honest nor a silent miss.
+                if high_bound.contains(&(l.caller.as_str(), last_segment(&l.name))) {
+                    honest.wrongly_bound += 1;
+                } else if recorded {
+                    honest.recorded += 1;
+                } else {
+                    honest.silent += 1;
+                }
             }
         }
 
@@ -827,11 +880,7 @@ fn score_labels(
                     "rate": (recall_total > 0).then(|| recall_present as f64 / recall_total as f64),
                     "by_construct": by_construct_json,
                 },
-                "honest_miss": {
-                    "recorded": honest.correct,
-                    "absent": honest.total,
-                    "rate": honest.rate(),
-                },
+                "honest_miss": honest.json(),
                 "dead_fp_by_tier": dead_fp
                     .iter()
                     .map(|(tier, (fp, rows))| ((*tier).to_string(), json!({ "false_positive": fp, "rows": rows })))
@@ -860,13 +909,41 @@ fn dead_unmeasured_count(row: &Value) -> u64 {
     n("unlabelled") + n("malformed")
 }
 
-fn dead_fp_rate(row: &Value) -> Option<f64> {
+/// What a row says about the 0.9-tier dead false-positive gate.
+#[derive(Debug, PartialEq)]
+enum DeadFp {
+    /// Every confident row was labelled and there is at least one.
+    Measured(f64),
+    /// The corpus was labelled and scored, and no row reached the confident
+    /// tier: there is nothing to be wrong about, which is not evidence of
+    /// accuracy. It does not pass. Whether an empty tier may pass is an open
+    /// owner decision; the default is strict.
+    EmptyTier,
+    /// No labels, an unlabelled or malformed row, or a row that cannot be read.
+    Unmeasured,
+}
+
+fn dead_fp_state(row: &Value) -> DeadFp {
     if dead_unmeasured_count(row) > 0 {
-        return None;
+        return DeadFp::Unmeasured;
     }
     let tier = &row["dead_fp_by_tier"]["0.9"];
-    let (fp, rows) = (tier["false_positive"].as_f64()?, tier["rows"].as_f64()?);
-    (rows > 0.0).then(|| fp / rows)
+    let (Some(fp), Some(rows)) = (tier["false_positive"].as_f64(), tier["rows"].as_f64()) else {
+        return DeadFp::Unmeasured;
+    };
+    if rows > 0.0 {
+        DeadFp::Measured(fp / rows)
+    } else {
+        DeadFp::EmptyTier
+    }
+}
+
+/// The measured rate, `None` for both non-measured states.
+fn dead_fp_rate(row: &Value) -> Option<f64> {
+    match dead_fp_state(row) {
+        DeadFp::Measured(rate) => Some(rate),
+        DeadFp::EmptyTier | DeadFp::Unmeasured => None,
+    }
 }
 
 /// The recall to hold against a `table` of floors or targets: Rust is gated on
@@ -918,6 +995,11 @@ fn evaluate_gates(
     measurement: Option<&Value>,
     gates: &Gates,
 ) -> Vec<String> {
+    // Numbers carried from a row this run could not re-check are not evidence:
+    // the unverifiable row fails by itself and its stale rates are not read.
+    if let Some(reason) = current["unverifiable"].as_str() {
+        return vec![unverifiable_gate(lang, reason)];
+    }
     let mut out = regression_gates(lang, previous, current, &gates.floors);
     out.extend(claim_gates(lang, current, measurement, gates));
     out
@@ -1067,15 +1149,18 @@ fn regression_gates(
         RECALL_TOLERANCE,
         true,
     );
-    check(
-        "0.9-tier dead false-positive rate",
-        dead_fp_rate(current),
-        previous.and_then(dead_fp_rate),
-        DEAD_FP_CEILING,
-        false,
-        0.0,
-        true,
-    );
+    let empty_tier = dead_fp_state(current) == DeadFp::EmptyTier;
+    if !empty_tier {
+        check(
+            "0.9-tier dead false-positive rate",
+            dead_fp_rate(current),
+            previous.and_then(dead_fp_rate),
+            DEAD_FP_CEILING,
+            false,
+            0.0,
+            true,
+        );
+    }
     match recall_checks(lang, current, floors) {
         Err(e) => out.push(e),
         Ok(checks) => {
@@ -1090,6 +1175,11 @@ fn regression_gates(
                 check(&name, now, before, floor, true, RECALL_TOLERANCE, false);
             }
         }
+    }
+    if empty_tier {
+        out.push(format!(
+            "{lang}: 0.9-tier dead false-positive rate: empty tier (0 rows), so it cannot pass; whether an empty tier may pass is an open owner decision, default strict"
+        ));
     }
     out
 }
@@ -1266,6 +1356,59 @@ fn measure_corpus(
     ))
 }
 
+/// The gate message for a committed labelled row this run could not re-check.
+/// `open_gates` and the runner both prefix it with the corpus.
+fn unverifiable_gate(lang: &str, reason: &str) -> String {
+    format!("{lang}: committed labelled row is unverifiable: {reason}")
+}
+
+/// The `corpora` entry to write for `pin`, given the committed runner row and
+/// this run's scored labels.
+///
+/// A language the record holds a labelled row for, and the run scored nothing
+/// for (no labels file, or none for that language), is never dropped and never
+/// left looking measured: its committed row is kept, stamped `unverifiable`
+/// with the reason, and every gate then fails on it naming the corpus and
+/// language ([`evaluate_gates`]). The next run that scores the language
+/// replaces the row and clears the stamp.
+fn carry_unverifiable(
+    previous: Option<&Value>,
+    labelled: Option<Value>,
+    pin: &Pin,
+) -> Option<Value> {
+    let Some(previous) = previous else {
+        return labelled;
+    };
+    let scored = |lang: &str| {
+        labelled
+            .as_ref()
+            .is_some_and(|e| !e["languages"][lang].is_null())
+    };
+    let missing: Vec<&String> = pin
+        .languages
+        .iter()
+        .filter(|lang| !previous["languages"][lang.as_str()].is_null() && !scored(lang))
+        .collect();
+    if missing.is_empty() {
+        return labelled;
+    }
+    let reason = if labelled.is_none() {
+        format!("no labels file was found for {}", pin.name)
+    } else {
+        "the labels hold nothing for this language".to_string()
+    };
+    let mut entry = labelled.unwrap_or_else(|| previous.clone());
+    for lang in missing {
+        let mut row = previous["languages"][lang.as_str()].clone();
+        // A row already stamped keeps the reason it was first stamped with.
+        if row["unverifiable"].is_null() {
+            row["unverifiable"] = json!(reason);
+        }
+        entry["languages"][lang.as_str()] = row;
+    }
+    Some(entry)
+}
+
 /// A row this runner wrote for corpus `name`. Runner rows carry
 /// `corpus_commit`; the hand-labelled dead record that shares `corpora` (and
 /// the corpus name) carries `commit` instead, and is never one.
@@ -1332,6 +1475,7 @@ fn score_the_pinned_corpora_and_write_the_record() {
         println!("{}", serde_json::to_string_pretty(&measurement).unwrap());
 
         let previous = runner_row(&record, "corpora", &pin.name).cloned();
+        let labelled = carry_unverifiable(previous.as_ref(), labelled, pin);
         // A corpus without labels is gated too: every labelled gate then
         // reports itself unmeasured, which fails. Skipping it would let a run
         // with no labels anywhere pass every gate.
@@ -2441,4 +2585,203 @@ fn every_pinned_corpus_has_a_forty_hex_commit_and_a_language() {
     ] {
         assert!(floors.contains_key(key), "no recall floor for {key}");
     }
+}
+
+// ------------------------------------- honest-miss split, tiers, unverifiable
+
+/// A site that received a wrong HIGH edge is one defect: precision debits it
+/// once, and the honest-miss gate reports it as `wrongly_bound` instead of
+/// counting it a second time as a silent miss.
+#[test]
+fn a_wrong_high_edge_is_counted_once_in_precision_and_as_wrongly_bound_not_silent() {
+    let (dir, _) = go_fixture_checkout("wrong-high");
+    let built = common::build(&dir);
+    let ledger_row = built
+        .resolution
+        .unresolved
+        .iter()
+        .find(|u| UNATTRIBUTED_LABELS.contains(&u.class.label()))
+        .expect("the Go fixture records an unattributed call in its ledger");
+    let recorded_site = json!({
+        "language": "go", "construct": "recorded", "caller": ledger_row.source_symbol,
+        "name": ledger_row.callee_name, "truth": "app/util/util2.go::Target02",
+    });
+    let labels = parse_labels(
+        &json!({
+            "edges": [{ "language": "go", "caller": "app/svc/svc.go::Caller01", "callee": "app/util/util.go::Target01", "correct": false }],
+            "recall": [
+                // Caller01 is bound HIGH to Target01; the truth is said to be Target02.
+                { "language": "go", "construct": "wrong", "caller": "app/svc/svc.go::Caller01", "name": "Target01", "truth": "app/util/util2.go::Target02" },
+                // No edge and no ledger row for this name at all.
+                { "language": "go", "construct": "silent", "caller": "app/svc/svc.go::Caller01", "name": "NoSuchCall", "truth": "app/util/util2.go::Target02" },
+                recorded_site,
+            ],
+            "dead": fixture_dead_labels(),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let scored = score_labels("Fixture", &built, &labels, &["go".to_string()]).unwrap();
+    let go = &scored["go"];
+    assert_eq!(go["confident_edge_precision"]["total"], 1, "{go}");
+    assert_eq!(go["confident_edge_precision"]["correct"], 0, "{go}");
+    let honest = &go["honest_miss"];
+    assert_eq!(honest["wrongly_bound"], 1, "{honest}");
+    assert_eq!(honest["silent"], 1, "{honest}");
+    assert_eq!(honest["recorded"], 1, "{honest}");
+    assert_eq!(honest["absent"], 3, "{honest}");
+    // wrongly_bound is outside the denominator: 1 / (1 + 1).
+    assert_eq!(honest["rate"], 0.5, "{honest}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn honest_miss_rate_ignores_wrongly_bound_sites_and_is_unmeasured_without_a_denominator() {
+    let only_wrong = HonestMiss {
+        wrongly_bound: 4,
+        ..HonestMiss::default()
+    };
+    assert_eq!(only_wrong.rate(), None);
+    assert_eq!(only_wrong.json()["absent"], 4);
+    let mixed = HonestMiss {
+        recorded: 3,
+        silent: 1,
+        wrongly_bound: 9,
+    };
+    assert_eq!(mixed.rate(), Some(0.75));
+}
+
+#[test]
+fn the_dead_gate_tells_an_empty_tier_from_an_unmeasured_one_and_neither_passes() {
+    let tier = |rows: u64, fp: u64| json!({ "dead_fp_by_tier": { "0.9": { "false_positive": fp, "rows": rows } } });
+    assert_eq!(dead_fp_state(&tier(10, 1)), DeadFp::Measured(0.1));
+    assert_eq!(dead_fp_state(&tier(0, 0)), DeadFp::EmptyTier);
+    assert_eq!(dead_fp_state(&Value::Null), DeadFp::Unmeasured);
+    let mut unlabelled = tier(10, 0);
+    unlabelled["dead_unmeasured"] = json!({ "unlabelled": 2, "malformed": 0 });
+    assert_eq!(dead_fp_state(&unlabelled), DeadFp::Unmeasured);
+    let mut empty_but_malformed = tier(0, 0);
+    empty_but_malformed["dead_unmeasured"] = json!({ "unlabelled": 0, "malformed": 1 });
+    assert_eq!(dead_fp_state(&empty_but_malformed), DeadFp::Unmeasured);
+
+    let dead_findings = |row: &Value| -> Vec<String> {
+        regression_gates("go", None, row, &BTreeMap::new())
+            .into_iter()
+            .filter(|f| f.contains("dead false-positive rate"))
+            .collect()
+    };
+    let empty = dead_findings(&tier(0, 0));
+    assert_eq!(empty.len(), 1, "{empty:?}");
+    assert!(empty[0].contains("empty tier (0 rows)"), "{empty:?}");
+    assert!(!empty[0].contains("unmeasured"), "{empty:?}");
+    let unmeasured = dead_findings(&Value::Null);
+    assert_eq!(unmeasured.len(), 1, "{unmeasured:?}");
+    assert!(unmeasured[0].contains("is unmeasured"), "{unmeasured:?}");
+    assert!(dead_findings(&tier(10, 0)).is_empty());
+}
+
+/// `tools/accuracy/cmd/labelmerge` writes the file this runner reads; its
+/// golden output must parse here, so the two sides cannot drift apart.
+#[test]
+fn the_labelmerge_golden_output_parses_as_runner_labels() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tools/accuracy/cmd/labelmerge/testdata/merged.golden.json");
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let labels = parse_labels(&raw).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert_eq!(labels.edges.len(), 2);
+    assert_eq!(labels.recall.len(), 5);
+    assert_eq!(labels.oracle.len(), 1);
+    assert_eq!(labels.dead.len(), 2);
+    let hashed = labels
+        .dead
+        .iter()
+        .all(|d| d.symbol_hash.as_deref().is_some_and(is_identity_hash));
+    assert!(hashed, "{:?}", labels.dead);
+}
+
+fn unverifiable_pin(languages: &[&str]) -> Pin {
+    Pin {
+        name: "Corpus".into(),
+        commit: "0".repeat(40),
+        languages: languages.iter().map(|l| (*l).to_string()).collect(),
+    }
+}
+
+fn committed_corpus_row() -> Value {
+    json!({
+        "name": "Corpus", "corpus_commit": "0".repeat(40),
+        "languages": {
+            "go": row((99, 100), (96, 100), (100, 100), (0, 20)),
+            "python": row((99, 100), (90, 100), (100, 100), (0, 20)),
+        },
+    })
+}
+
+#[test]
+fn a_committed_row_whose_labels_are_missing_is_unverifiable_and_fails_the_gate() {
+    let pin = unverifiable_pin(&["go", "python"]);
+    let committed = committed_corpus_row();
+
+    // No labels file at all: both committed rows are kept and stamped.
+    let entry = carry_unverifiable(Some(&committed), None, &pin).expect("rows are carried");
+    for lang in ["go", "python"] {
+        let reason = entry["languages"][lang]["unverifiable"].as_str().unwrap();
+        assert!(
+            reason.contains("no labels file was found for Corpus"),
+            "{reason}"
+        );
+        let found = evaluate_gates(
+            lang,
+            Some(&committed["languages"][lang]),
+            &entry["languages"][lang],
+            None,
+            &gates(),
+        );
+        assert_eq!(found, vec![unverifiable_gate(lang, reason)], "{found:?}");
+    }
+
+    // Labels that cover only python: go is stamped, python is the fresh row.
+    let fresh = json!({ "name": "Corpus", "corpus_commit": "0".repeat(40),
+        "languages": { "python": row((99, 100), (90, 100), (100, 100), (0, 20)) } });
+    let entry = carry_unverifiable(Some(&committed), Some(fresh), &pin).unwrap();
+    assert!(entry["languages"]["go"]["unverifiable"]
+        .as_str()
+        .unwrap()
+        .contains("nothing for this language"));
+    assert!(entry["languages"]["python"]["unverifiable"].is_null());
+
+    // open_gates over a record holding the stamped rows names corpus + language.
+    let stamped = carry_unverifiable(Some(&committed), None, &pin).unwrap();
+    let record = json!({ "corpora": [stamped], "measurements": [] });
+    let open = open_gates(&record, std::slice::from_ref(&pin), &gates());
+    for lang in ["go", "python"] {
+        let wanted = format!("Corpus: {lang}: committed labelled row is unverifiable");
+        assert!(open.iter().any(|g| g.starts_with(&wanted)), "{open:?}");
+    }
+}
+
+#[test]
+fn rows_with_labels_or_without_a_committed_row_are_not_marked_unverifiable() {
+    let pin = unverifiable_pin(&["go", "python"]);
+    let committed = committed_corpus_row();
+    // Nothing committed: an unlabelled corpus stays unmeasured, not unverifiable.
+    assert_eq!(carry_unverifiable(None, None, &pin), None);
+    // Every committed language scored this run: the fresh entry is untouched.
+    let fresh = committed_corpus_row();
+    assert_eq!(
+        carry_unverifiable(Some(&committed), Some(fresh.clone()), &pin),
+        Some(fresh)
+    );
+    // A language the pin does not list is not this run's business.
+    let go_only = unverifiable_pin(&["go"]);
+    let fresh_go = json!({ "name": "Corpus", "corpus_commit": "0".repeat(40),
+        "languages": { "go": row((99, 100), (96, 100), (100, 100), (0, 20)) } });
+    assert_eq!(
+        carry_unverifiable(Some(&committed), Some(fresh_go.clone()), &go_only),
+        Some(fresh_go)
+    );
+    // A labels file that scored no language still stamps every committed row.
+    let empty = json!({ "name": "Corpus", "corpus_commit": "0".repeat(40), "languages": {} });
+    let entry = carry_unverifiable(Some(&committed), Some(empty), &pin).unwrap();
+    assert!(!entry["languages"]["go"]["unverifiable"].is_null());
 }

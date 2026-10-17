@@ -1,0 +1,17 @@
+{
+  "edges": [
+    {"language": "go", "caller": "app/svc/svc.go::Caller01", "callee": "app/util/util.go::Target01", "correct": true},
+    {"language": "go", "caller": "app/svc/svc.go::Zürich", "callee": "app/util/util.go::Target01", "correct": false}
+  ],
+  "recall": [
+    {"language": "go", "construct": "plain", "caller": "app/svc/svc.go::Caller01", "name": "Target01", "truth": "app/util/util.go::Target01"},
+    {"language": "go", "construct": "plain", "caller": "app/svc/svc.go::Caller01", "name": "Get", "truth": "app/store/store.go::A.Get"},
+    {"language": "go", "construct": "plain", "caller": "app/svc/svc.go::Caller01", "name": "Get", "truth": "app/store/store.go::B.Get"}
+  ],
+  "oracle": [
+    {"language": "go", "covered_callers": ["app/svc/svc.go::Caller01"], "uses": [{"caller": "app/svc/svc.go::Caller01", "callee": "app/util/util.go::Target01", "impls": []}]}
+  ],
+  "dead": [
+    {"language": "go", "id": "app/svc/probes.go::deadPriv", "truly_dead": true, "symbol_hash": "h:0123456789ab", "category": "rg_declaration_only", "note": "kept verbatim"}
+  ]
+}

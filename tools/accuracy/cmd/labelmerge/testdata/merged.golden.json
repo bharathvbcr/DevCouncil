@@ -1,0 +1,86 @@
+{
+  "dead": [
+    {
+      "category": "rg_declaration_only",
+      "id": "app/svc/probes.go::deadPriv",
+      "language": "go",
+      "note": "kept verbatim",
+      "symbol_hash": "h:0123456789ab",
+      "truly_dead": true
+    },
+    {
+      "category": "spot_check_upstream_shadow",
+      "id": "app/svc/probes.go::fast.unusedM",
+      "language": "go",
+      "symbol_hash": "h:0123456789ac",
+      "truly_dead": false,
+      "unsure": true
+    }
+  ],
+  "edges": [
+    {
+      "callee": "app/util/util.go::Target01",
+      "caller": "app/svc/svc.go::Caller01",
+      "correct": true,
+      "language": "go"
+    },
+    {
+      "callee": "app/util/util.go::Target01",
+      "caller": "app/svc/svc.go::Zürich",
+      "correct": false,
+      "language": "go"
+    }
+  ],
+  "oracle": [
+    {
+      "covered_callers": [
+        "app/svc/svc.go::Caller01"
+      ],
+      "language": "go",
+      "uses": [
+        {
+          "callee": "app/util/util.go::Target01",
+          "caller": "app/svc/svc.go::Caller01",
+          "impls": []
+        }
+      ]
+    }
+  ],
+  "recall": [
+    {
+      "caller": "app/svc/svc.go::Caller01",
+      "construct": "plain",
+      "language": "go",
+      "name": "Get",
+      "truth": "app/store/store.go::A.Get"
+    },
+    {
+      "caller": "app/svc/svc.go::Caller01",
+      "construct": "plain",
+      "language": "go",
+      "name": "Get",
+      "truth": "app/store/store.go::B.Get"
+    },
+    {
+      "caller": "app/svc/svc.go::Caller01",
+      "construct": "plain",
+      "language": "go",
+      "name": "Target01",
+      "truth": "app/util/util.go::Target01"
+    },
+    {
+      "caller": "app/svc/svc.go::Caller02",
+      "construct": "plain",
+      "language": "go",
+      "name": "Target02",
+      "truth": "app/util/util2.go::Target02"
+    },
+    {
+      "caller": "pkg/a.py::run",
+      "construct": "method",
+      "language": "python",
+      "name": "go",
+      "truth": "pkg/b.py::Thing.go"
+    }
+  ]
+}

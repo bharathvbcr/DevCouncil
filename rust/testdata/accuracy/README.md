@@ -162,6 +162,54 @@ Labels file shape:
   `unsure` label counts as labelled (it is listed, scored neither way).
 * A pinned language the file says nothing about gets no `corpora` row at all
   (its gates stay unmeasured), never an empty one.
+* **`honest_miss` is split three ways.** For each recall site whose truth edge
+  is absent: `recorded` (an unattributed ledger row names the call), `silent`
+  (no ledger row and no edge at all) and `wrongly_bound` (the caller has a HIGH
+  Calls/References edge for that call name to a non-truth target, read from the
+  build's edges, not from labels). The rate is `recorded / (recorded + silent)`;
+  `wrongly_bound` is outside the denominator because it is precision's defect
+  (an edge label or the oracle debits it there) and counting it again as a
+  silent miss would move two gates for one fault. `absent` keeps its old meaning
+  (all three summed), so rows committed before the split stay comparable; they
+  carry no `silent` or `wrongly_bound` key.
+* **The dead gate has three states**: measured (a rate over >= 1 confident row,
+  all labelled), *empty tier* (the language was labelled and scored but no row
+  reached the 0.9 tier: `rows` is 0) and unmeasured (no labels, or an
+  unlabelled or malformed row). The gate output names empty tier as
+  `empty tier (0 rows)`, distinct from `is unmeasured`. **An empty tier does not
+  pass**; it blocks a green verdict exactly like unmeasured. Whether an empty
+  tier may ever pass is an open OWNER decision; the default is strict.
+* **A committed row never silently loses its labels.** When `record.json` holds
+  a runner row for a corpus and language and this run finds no labels file, or
+  none for that language, the runner keeps the committed row, stamps it
+  `"unverifiable": "<reason>"` and fails the gate naming the corpus and
+  language (`<corpus>: <lang>: committed labelled row is unverifiable: ...`).
+  `open_gates` lists it from the committed record, its stale numbers are not
+  read, and `dead_tier_eligibility.rs` counts it as no proof. A later run that
+  scores the language replaces the row and clears the stamp.
+
+**Merging a label store.** Labels live beside the corpus, one file per language
+and round (`labels-<lang>[-rN].json`). `tools/accuracy/cmd/labelmerge` merges a
+directory of them into the single file the runner reads:
+
+```text
+go -C tools/accuracy run ./cmd/labelmerge -dir <store> [-private] \
+  -o <checkout>/.devmap-accuracy/labels.json
+```
+
+The output has the four arrays (`edges`, `recall`, `oracle`, `dead`) in a fixed
+order (sorted by language, then caller/callee/name/id), entries' fields sorted,
+unknown fields kept. A site two files label differently (same language and
+caller and call name, edge pair, dead id or oracle language) is an error naming
+both files, never last-wins; an identical repeat in a later round is kept once.
+It also refuses a malformed file, a row whose `language` is not the file's, a
+`labels-*.json` name that does not follow the pattern, an empty store, a
+`symbol_hash` that is not `h:` + 12 lowercase hex digits, and an `-o` that is
+(or links to) one of its inputs. `-private` additionally requires `symbol_hash`
+and an evidence `category` on every dead label, as the runner does for any
+corpus but DevCouncil's. A test keeps its hash and category rules equal to
+`record_identity.rs`, and the runner's `parse_labels` is tested against its
+golden output.
 
 `corpora` holds two kinds of row under one corpus name: the labelled dead
 record below (`commit`) and the runner's rows (`corpus_commit`). A runner row

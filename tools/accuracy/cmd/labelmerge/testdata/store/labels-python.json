@@ -1,0 +1,5 @@
+{
+  "recall": [
+    {"language": "python", "construct": "method", "caller": "pkg/a.py::run", "name": "go", "truth": "pkg/b.py::Thing.go"}
+  ]
+}

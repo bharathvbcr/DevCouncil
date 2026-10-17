@@ -323,7 +323,15 @@ fn corpus_rates(record: &serde_json::Value, origin: &str) -> CorpusRates {
                 })
             };
             let unmeasured = count("unlabelled") + count("malformed");
-            let (fp, rows) = if unmeasured > 0 { (0, 0) } else { (fp, rows) };
+            // A row the runner could not re-verify against labels
+            // (`unverifiable`, written by real_corpus_accuracy.rs) carries
+            // numbers from an earlier run: they prove nothing now.
+            let unverifiable = !entry["unverifiable"].is_null();
+            let (fp, rows) = if unmeasured > 0 || unverifiable {
+                (0, 0)
+            } else {
+                (fp, rows)
+            };
             by_language
                 .entry(language.clone())
                 .or_default()
@@ -704,6 +712,19 @@ fn a_row_with_unlabelled_or_malformed_dead_rows_is_not_proof() {
         "test record",
     );
     assert_eq!(rates["lang"], vec![("corpus".to_string(), 0, 40)]);
+}
+
+#[test]
+fn an_unverifiable_row_carries_stale_numbers_and_is_not_proof() {
+    let rates = corpus_rates(
+        &record_with(serde_json::json!({
+            "dead_fp_by_tier": { "0.9": { "false_positive": 0, "rows": 40 } },
+            "unverifiable": "no labels file was found for corpus",
+        })),
+        "test record",
+    );
+    assert_eq!(rates["lang"], vec![("corpus".to_string(), 0, 0)]);
+    assert_eq!(corpus_proof(&rates["lang"]).0, 0);
 }
 
 #[test]
