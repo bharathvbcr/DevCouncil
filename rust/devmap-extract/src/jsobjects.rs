@@ -69,7 +69,10 @@ fn text<'a>(node: Node, source: &'a str) -> &'a str {
 fn unwrap(mut node: Node) -> Node {
     while matches!(
         node.kind(),
-        "as_expression" | "satisfies_expression" | "parenthesized_expression" | "non_null_expression"
+        "as_expression"
+            | "satisfies_expression"
+            | "parenthesized_expression"
+            | "non_null_expression"
     ) {
         match node.named_child(0) {
             Some(inner) => node = inner,
@@ -127,7 +130,10 @@ fn declaration_fact(declarator: Node, source: &str) -> Option<JsObjectFact> {
         }
         _ => {
             let reference = reference_text(value, source)?;
-            (vec![JsObjectPart::Spread(reference.clone())], Some(reference))
+            (
+                vec![JsObjectPart::Spread(reference.clone())],
+                Some(reference),
+            )
         }
     };
     Some(JsObjectFact {
@@ -167,15 +173,16 @@ fn assign_fact(call: Node, source: &str) -> Option<JsObjectFact> {
 }
 
 fn is_object_assign(call: Node, source: &str) -> bool {
-    call.child_by_field_name("function").is_some_and(|function| {
-        function.kind() == "member_expression"
-            && function
-                .child_by_field_name("object")
-                .is_some_and(|object| text(object, source) == "Object")
-            && function
-                .child_by_field_name("property")
-                .is_some_and(|property| text(property, source) == "assign")
-    })
+    call.child_by_field_name("function")
+        .is_some_and(|function| {
+            function.kind() == "member_expression"
+                && function
+                    .child_by_field_name("object")
+                    .is_some_and(|object| text(object, source) == "Object")
+                && function
+                    .child_by_field_name("property")
+                    .is_some_and(|property| text(property, source) == "assign")
+        })
 }
 
 /// The parts of `Object.assign(target, ...sources)` as one new object: the
@@ -240,13 +247,19 @@ fn object_parts(object: Node, source: &str, owned: bool, depth: usize) -> Vec<Js
                     value: name,
                 });
             }
-            "method_definition" => match member.child_by_field_name("name").and_then(|name| key_text(name, source)) {
+            "method_definition" => match member
+                .child_by_field_name("name")
+                .and_then(|name| key_text(name, source))
+            {
                 Some(key) if owned => parts.push(JsObjectPart::Inline(key)),
                 Some(key) => parts.push(JsObjectPart::Opaque(key)),
                 None => parts.push(JsObjectPart::Unknown),
             },
             "pair" => {
-                let Some(key) = member.child_by_field_name("key").and_then(|key| key_text(key, source)) else {
+                let Some(key) = member
+                    .child_by_field_name("key")
+                    .and_then(|key| key_text(key, source))
+                else {
                     parts.push(JsObjectPart::Unknown);
                     continue;
                 };
@@ -255,7 +268,10 @@ fn object_parts(object: Node, source: &str, owned: bool, depth: usize) -> Vec<Js
                     Some(value)
                         if matches!(
                             value.kind(),
-                            "arrow_function" | "function_expression" | "function" | "generator_function"
+                            "arrow_function"
+                                | "function_expression"
+                                | "function"
+                                | "generator_function"
                         ) =>
                     {
                         if owned {

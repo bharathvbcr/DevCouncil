@@ -129,8 +129,10 @@ fn a_shorthand_property_binds_to_the_function_it_names() {
 
 #[test]
 fn a_spread_in_another_file_than_the_receiver_binds() {
-    let holder = "import { core } from './core';\nexport const debugLogger = { ...core, extra() {} };\n";
-    let consumer = "import { debugLogger } from './holder';\nexport function run() { debugLogger.warn(); }\n";
+    let holder =
+        "import { core } from './core';\nexport const debugLogger = { ...core, extra() {} };\n";
+    let consumer =
+        "import { debugLogger } from './holder';\nexport function run() { debugLogger.warn(); }\n";
     let result = resolve(&[
         ("src/core.ts", CORE),
         ("src/holder.ts", holder),
@@ -170,7 +172,10 @@ export const w = { ...core, info() {} };
 ";
     let consumer = "import { w } from './w';\nexport function run() { w.info(); }\n";
     let result = resolve(&[("src/w.ts", source), ("src/user.ts", consumer)]);
-    assert_eq!(targets(&result, "src/user.ts::run"), vec!["src/w.ts::w.info"]);
+    assert_eq!(
+        targets(&result, "src/user.ts::run"),
+        vec!["src/w.ts::w.info"]
+    );
 }
 
 #[test]
@@ -218,7 +223,10 @@ fn a_namespace_import_spread_binds_to_the_module_function() {
     let ns = "export function info(): void {}\n";
     let user = "import * as core from './ns';\nconst w = { ...core };\nexport function run() { w.info(); }\n";
     let result = resolve(&[("src/ns.ts", ns), ("src/user.ts", user)]);
-    assert_eq!(targets(&result, "src/user.ts::run"), vec!["src/ns.ts::info"]);
+    assert_eq!(
+        targets(&result, "src/user.ts::run"),
+        vec!["src/ns.ts::info"]
+    );
 }
 
 #[test]
@@ -226,7 +234,10 @@ fn a_commonjs_require_spread_binds_to_the_module_function() {
     let ns = "export function info(): void {}\n";
     let user = "const core = require('./ns');\nconst w = { ...core };\nexport function run() { w.info(); }\n";
     let result = resolve(&[("src/ns.ts", ns), ("src/user.ts", user)]);
-    assert_eq!(targets(&result, "src/user.ts::run"), vec!["src/ns.ts::info"]);
+    assert_eq!(
+        targets(&result, "src/user.ts::run"),
+        vec!["src/ns.ts::info"]
+    );
 }
 
 #[test]
@@ -294,7 +305,10 @@ fn one_identifier_imported_from_two_modules_binds_per_file() {
         ("src/b.ts", b),
     ]);
     assert_eq!(targets(&result, "src/a.ts::run"), vec![CORE_INFO]);
-    assert_eq!(targets(&result, "src/b.ts::run"), vec!["src/core2.ts::core.info"]);
+    assert_eq!(
+        targets(&result, "src/b.ts::run"),
+        vec!["src/core2.ts::core.info"]
+    );
 }
 
 #[test]

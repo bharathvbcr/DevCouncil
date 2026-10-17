@@ -114,7 +114,9 @@ impl Resolver {
             .get(file)
             .and_then(|bindings| bindings.get(identifier))
         {
-            Some((target_file, target_symbol)) => self.lookup_in_package(target_file, target_symbol),
+            Some((target_file, target_symbol)) => {
+                self.lookup_in_package(target_file, target_symbol)
+            }
             None => self.lookup_in_package(file, identifier),
         };
         match named {
@@ -151,9 +153,7 @@ impl Resolver {
         let written_through_alias = facts.iter().any(|alias| {
             alias.declaration
                 && alias.alias_of.as_deref() == Some(value)
-                && facts
-                    .iter()
-                    .any(|f| !f.declaration && f.name == alias.name)
+                && facts.iter().any(|f| !f.declaration && f.name == alias.name)
         });
         let mut steps: Vec<&JsObjectPart> = declaration.parts.iter().collect();
         for mutation in mutations {
@@ -195,7 +195,10 @@ impl Resolver {
                         None => ObjectMember::Abstain,
                     };
                 }
-                JsObjectPart::Forward { key, value: forwarded } if key == member => {
+                JsObjectPart::Forward {
+                    key,
+                    value: forwarded,
+                } if key == member => {
                     return self.forwarded_declaration(file, forwarded);
                 }
                 JsObjectPart::Opaque(key) if key == member => return ObjectMember::Abstain,

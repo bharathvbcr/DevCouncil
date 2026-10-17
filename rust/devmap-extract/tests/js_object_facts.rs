@@ -31,8 +31,14 @@ fn a_literal_records_its_steps_in_source_order() {
             spread("core"),
             JsObjectPart::Inline("info".into()),
             JsObjectPart::Inline("run".into()),
-            JsObjectPart::Forward { key: "clear".into(), value: "clearLogs".into() },
-            JsObjectPart::Forward { key: "shorthand".into(), value: "shorthand".into() },
+            JsObjectPart::Forward {
+                key: "clear".into(),
+                value: "clearLogs".into()
+            },
+            JsObjectPart::Forward {
+                key: "shorthand".into(),
+                value: "shorthand".into()
+            },
             JsObjectPart::Opaque("n".into()),
             spread("late"),
         ]
@@ -55,10 +61,16 @@ fn an_alias_and_an_object_assign_record_their_source() {
         "a function inside a nested literal is no symbol of the const"
     );
     assert_eq!(declared(&all, "c").alias_of, None);
-    assert_eq!(declared(&all, "d").parts, vec![spread("core"), spread("other")]);
+    assert_eq!(
+        declared(&all, "d").parts,
+        vec![spread("core"), spread("other")]
+    );
     assert_eq!(declared(&all, "d").alias_of.as_deref(), Some("core"));
     // `Object.assign(core, other)` also writes into `core`.
-    assert!(all.iter().any(|f| !f.declaration && f.name == "core" && f.parts == vec![spread("other")]));
+    assert!(
+        all.iter()
+            .any(|f| !f.declaration && f.name == "core" && f.parts == vec![spread("other")])
+    );
 }
 
 #[test]
@@ -69,7 +81,11 @@ fn what_cannot_be_read_is_unknown_not_skipped() {
     );
     assert_eq!(
         declared(&all, "w").parts,
-        vec![JsObjectPart::Unknown, JsObjectPart::Unknown, JsObjectPart::Unknown]
+        vec![
+            JsObjectPart::Unknown,
+            JsObjectPart::Unknown,
+            JsObjectPart::Unknown
+        ]
     );
     assert_eq!(declared(&all, "v").parts, vec![JsObjectPart::Unknown]);
 }
