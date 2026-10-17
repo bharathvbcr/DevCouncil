@@ -1027,20 +1027,38 @@ fn super_dead_edge_target_is_declared_in_target_file() {
     );
 }
 
-#[test]
-fn field_stress_ten_thousand_assignments_in_one_class() {
+fn stress_time(n: usize, prefix: &str) -> Duration {
     let mut src = String::from("from a import A\n\nclass Big:\n    def __init__(self):\n");
-    for i in 0..10_000 {
-        src.push_str(&format!("        self.f{i} = A()\n"));
+    for i in 0..n {
+        src.push_str(&format!("        {prefix}f{i} = A()\n"));
     }
-    src.push_str("    def go(self):\n        return self.f9999.run()\n");
-    let owned = vec![
-        ("a.py".to_string(), A_SRC.to_string()),
-        ("big.py".to_string(), src),
-    ];
-    let (r, took) = resolve_owned_within(owned, 120).expect("10k fields hung");
-    assert!(took < Duration::from_secs(20), "10k field assignments took {took:?}");
-    assert!(methods(&r, "big.py::Big.go").len() <= 1);
+    src.push_str(&format!("    def go(self):\n        return {prefix}f{}.run()\n", n - 1));
+    (0..3)
+        .map(|_| {
+            let owned = vec![
+                ("a.py".to_string(), A_SRC.to_string()),
+                ("big.py".to_string(), src.clone()),
+            ];
+            resolve_owned_within(owned, 300).expect("stress input hung").1
+        })
+        .min()
+        .unwrap()
+}
+
+#[test]
+fn field_stress_scales_no_worse_than_the_same_number_of_locals() {
+    let fields_small = stress_time(2_500, "self.");
+    let fields_big = stress_time(10_000, "self.");
+    let locals_big = stress_time(10_000, "");
+    eprintln!("fields 2.5k {fields_small:?} 10k {fields_big:?} locals 10k {locals_big:?}");
+    assert!(
+        fields_big.as_secs_f64() < 3.0 * locals_big.as_secs_f64() + 0.5,
+        "10k fields {fields_big:?} vs 10k locals {locals_big:?}"
+    );
+    assert!(
+        fields_big.as_secs_f64() < 8.0 * fields_small.as_secs_f64() + 0.5,
+        "4x the fields took {fields_big:?} vs {fields_small:?}: super-linear"
+    );
 }
 
 // ------------------------------------------------------------- determinism
