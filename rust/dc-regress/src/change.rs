@@ -1008,10 +1008,7 @@ mod tests {
     /// refusal and not a guess: the patch only supplies the ranges.
     #[test]
     fn a_path_git_quoted_in_the_patch_is_named_by_the_raw_listing() {
-        let raw = raw(&[
-            (M, &[b"src/nl\nname.py"]),
-            (M, &[b"src/ok.py"]),
-        ]);
+        let raw = raw(&[(M, &[b"src/nl\nname.py"]), (M, &[b"src/ok.py"])]);
         let patch = "diff --git \"a/src/nl\\nname.py\" \"b/src/nl\\nname.py\"\n\
                      --- \"a/src/nl\\nname.py\"\n+++ \"b/src/nl\\nname.py\"\n@@ -1 +1,2 @@\n\
                      diff --git a/src/ok.py b/src/ok.py\n--- a/src/ok.py\n+++ b/src/ok.py\n@@ -3 +3 @@\n";
@@ -1061,7 +1058,10 @@ mod tests {
 
     #[test]
     fn a_binary_file_and_a_mode_change_are_files_with_no_ranges() {
-        let raw = raw(&[(M, &[b"i.png"]), (":100644 100755 aaaaaaa aaaaaaa M", &[b"run.sh"])]);
+        let raw = raw(&[
+            (M, &[b"i.png"]),
+            (":100644 100755 aaaaaaa aaaaaaa M", &[b"run.sh"]),
+        ]);
         let patch = "diff --git a/i.png b/i.png\nindex 1..2 100644\n\
                      Binary files a/i.png and b/i.png differ\n\
                      diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n";

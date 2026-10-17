@@ -37,11 +37,11 @@ use std::time::{Duration, Instant};
 use devmap_extract::model::{LineIndex, Span};
 use serde::{Deserialize, Serialize};
 
+use crate::blob::BlobReader;
+use crate::budget::Budget;
 use crate::change::{
     changes_between_with_program, ChangeSet, ChangeStatus, ChangedRange, FileChange,
 };
-use crate::blob::BlobReader;
-use crate::budget::Budget;
 use crate::history;
 use crate::{CodeGraph, ConeEntry, GraphSymbol, Unavailable};
 
@@ -497,14 +497,7 @@ pub fn blast_change_bounded<G: CodeGraph>(
             exhausted = true;
             break;
         }
-        place_file(
-            blobs,
-            graph,
-            file,
-            until,
-            &mut seeds,
-            &mut unattributed,
-        );
+        place_file(blobs, graph, file, until, &mut seeds, &mut unattributed);
     }
 
     // Every unattributed range means the walk started from fewer places than

@@ -40,8 +40,8 @@ use std::time::{Duration, Instant};
 
 use dc_proc::{git_with_program, spawn_session, Session};
 
-use crate::history::{commit_oid, HistoryRefusal, CONTENT_CAP, HISTORY_DEADLINE};
 use crate::history::ResolvedBlob;
+use crate::history::{commit_oid, HistoryRefusal, CONTENT_CAP, HISTORY_DEADLINE};
 use crate::BlobIdentity;
 
 /// Entries the memos keep. A walk past it forgets and asks again — bounded
@@ -82,11 +82,7 @@ struct Lane {
 }
 
 impl Lane {
-    fn start(
-        program: &OsStr,
-        repo: &Path,
-        with_content: bool,
-    ) -> Result<Lane, HistoryRefusal> {
+    fn start(program: &OsStr, repo: &Path, with_content: bool) -> Result<Lane, HistoryRefusal> {
         let flag = if with_content {
             "--batch"
         } else {
@@ -191,9 +187,7 @@ fn read_answers(stdout: ChildStdout, with_content: bool, tx: Sender<Answer>) {
             Ok(Record::Ambiguous)
         } else {
             match parse_header(&header) {
-                Some((oid, kind, size)) => {
-                    read_body(&mut reader, with_content, oid, kind, size)
-                }
+                Some((oid, kind, size)) => read_body(&mut reader, with_content, oid, kind, size),
                 None => Err(format!("unrecognised header {header:?}")),
             }
         };
@@ -213,7 +207,11 @@ fn parse_header(header: &str) -> Option<(String, String, u64)> {
     if !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    Some((oid.to_ascii_lowercase(), kind.to_string(), size.parse().ok()?))
+    Some((
+        oid.to_ascii_lowercase(),
+        kind.to_string(),
+        size.parse().ok()?,
+    ))
 }
 
 fn read_body(
@@ -341,12 +339,11 @@ impl BlobReader {
         let lane = lane_of(&mut state.content, &self.program, &self.repo, true)?;
         let answer = lane.ask(&spec);
         let blob = blob_of(answer, rev, path);
-        let identity = blob.as_ref().map(|(oid, _, _)| oid.clone()).map_err(Clone::clone);
-        remember(
-            &mut state.identities,
-            (commit, path.to_string()),
-            &identity,
-        );
+        let identity = blob
+            .as_ref()
+            .map(|(oid, _, _)| oid.clone())
+            .map_err(Clone::clone);
+        remember(&mut state.identities, (commit, path.to_string()), &identity);
         let (oid, size, body) = blob?;
         let Some(body) = body else {
             return Err(HistoryRefusal::OutputCapped {
@@ -418,7 +415,9 @@ fn blob_of(
             if kind == "blob" {
                 Ok((oid, size, body))
             } else {
-                Err(refused(format!("{path:?} at {rev} is a {kind}, not a file")))
+                Err(refused(format!(
+                    "{path:?} at {rev} is a {kind}, not a file"
+                )))
             }
         }
     }

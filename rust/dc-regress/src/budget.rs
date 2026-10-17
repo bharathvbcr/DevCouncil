@@ -120,8 +120,8 @@ mod tests {
     fn the_cancel_hook_ends_the_budget_before_its_deadline() {
         let flag = Arc::new(AtomicBool::new(false));
         let seen = flag.clone();
-        let budget =
-            Budget::within(Duration::from_secs(60)).with_cancel(move || seen.load(Ordering::SeqCst));
+        let budget = Budget::within(Duration::from_secs(60))
+            .with_cancel(move || seen.load(Ordering::SeqCst));
         assert_eq!(budget.check(), Ok(()));
         flag.store(true, Ordering::SeqCst);
         assert_eq!(budget.check(), Err(Exhausted::Cancelled));

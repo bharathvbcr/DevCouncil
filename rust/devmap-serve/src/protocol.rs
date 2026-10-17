@@ -1509,16 +1509,18 @@ pub(crate) fn dispatch(
             let graph = git_joined_graph(store)?;
             let root = graph.indexed_repo().to_path_buf();
             let until = indexed_head_of(&graph)?;
-            Ok(serde_json::to_value(dc_regress::suspects::suspects_bounded(
-                std::ffi::OsStr::new("git"),
-                &root,
-                &graph,
-                &symptom,
-                &since,
-                &until,
-                depth,
-                &analysis_budget(cancel),
-            ))?)
+            Ok(serde_json::to_value(
+                dc_regress::suspects::suspects_bounded(
+                    std::ffi::OsStr::new("git"),
+                    &root,
+                    &graph,
+                    &symptom,
+                    &since,
+                    &until,
+                    depth,
+                    &analysis_budget(cancel),
+                ),
+            )?)
         }
         IpcCommand::Blast { since, at, depth } => {
             // The selector first, before the store is touched: an argument the

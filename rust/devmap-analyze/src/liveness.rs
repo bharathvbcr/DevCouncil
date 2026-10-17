@@ -1407,10 +1407,9 @@ fn unconfirmed_dispatch_reason(
     if matches!(language, "typescript" | "tsx" | "javascript")
         && sym.parent_symbol.as_deref().is_none_or(|parent| {
             parent == ext.file_path
-                || ext
-                    .symbols
-                    .iter()
-                    .any(|owner| owner.qualified_name == parent && owner.kind == SymbolKind::Variable)
+                || ext.symbols.iter().any(|owner| {
+                    owner.qualified_name == parent && owner.kind == SymbolKind::Variable
+                })
         })
     {
         return Some(format!(

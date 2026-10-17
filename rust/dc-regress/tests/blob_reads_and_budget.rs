@@ -206,7 +206,9 @@ fn a_blob_past_the_cap_is_skipped_without_losing_the_stream() {
         reader.identity(&next, "big.txt").is_ok(),
         "an oversized blob still has an identity"
     );
-    let small = reader.read(&next, "src/f0.rs").expect("the stream is in step");
+    let small = reader
+        .read(&next, "src/f0.rs")
+        .expect("the stream is in step");
     assert_eq!(small.content, "pub fn f0() {}\n");
 }
 
@@ -330,7 +332,10 @@ fn a_spent_deadline_is_named_not_a_short_list() {
         &Budget::within(Duration::ZERO),
     );
     assert!(!report.complete, "{report:#?}");
-    assert!(report.seeds.is_empty(), "nothing was read past the deadline");
+    assert!(
+        report.seeds.is_empty(),
+        "nothing was read past the deadline"
+    );
     assert!(
         report.unavailable.iter().any(|u| matches!(
             u,
