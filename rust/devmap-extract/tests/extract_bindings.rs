@@ -477,10 +477,19 @@ fn a_python_self_field_stamp_needs_a_named_callee_and_an_instance_method() {
     assert!(!typed("self.a = A()()"), "call of a call");
     assert!(!typed("self.b = (lambda: A())()"), "lambda");
     assert!(!typed("self.c = fns[0]()"), "subscript callee");
-    assert!(!typed("self.d = A()"), "static method's `self` is a parameter");
-    assert!(!typed("self.e = A()"), "classmethod's first parameter is the class");
+    assert!(
+        !typed("self.d = A()"),
+        "static method's `self` is a parameter"
+    );
+    assert!(
+        !typed("self.e = A()"),
+        "classmethod's first parameter is the class"
+    );
     assert!(typed("self.f = A()"), "a closure writes the method's self");
-    assert!(!typed("self.g = A()"), "a nested function with its own `self`");
+    assert!(
+        !typed("self.g = A()"),
+        "a nested function with its own `self`"
+    );
     assert!(typed("self.h = pkg.mod.make()"), "a dotted callee");
 }
 
@@ -495,7 +504,11 @@ fn a_python_class_header_names_only_its_positional_bases() {
             .references
             .iter()
             .filter(|r| r.kind == ReferenceKind::Heritage)
-            .filter(|r| r.enclosing_symbol.as_deref().is_some_and(|s| s.ends_with(&format!("::{class}"))))
+            .filter(|r| {
+                r.enclosing_symbol
+                    .as_deref()
+                    .is_some_and(|s| s.ends_with(&format!("::{class}")))
+            })
             .map(|r| r.name.clone())
             .collect()
     };

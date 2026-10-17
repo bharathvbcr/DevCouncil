@@ -11669,7 +11669,7 @@ fn python_self_field_binding(assignment: Node, origin: Node, source: &str) -> Op
     // The call itself, or its callee: an argument lies past the callee's end.
     (origin.id() == right.id()
         || (origin.start_byte() >= right.start_byte() && origin.end_byte() <= function.end_byte()))
-        .then(|| format!("self.{}", get_node_text(attribute, source)))
+    .then(|| format!("self.{}", get_node_text(attribute, source)))
 }
 
 /// `name` or `a.b.c`, with nothing but identifiers in it.
