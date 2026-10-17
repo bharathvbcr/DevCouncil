@@ -1,8 +1,10 @@
 package policy
 
 import (
+	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -50,9 +52,10 @@ var pathWritingCommands = map[string]bool{
 // unverifiable. A credential path is refused by secretOperandViolation first.
 //
 // Operands are the clause's non-option words and the value of `--opt=value`
-// and `KEY=value` words. A word carrying an expansion is not judged here (the
-// substitution rungs own those), nor is a URL, a stream device or text with
-// whitespace in it, which is prose rather than a path.
+// and `KEY=value` words, and every string a JSON object or array among them
+// carries (see jsonOperandCandidates). A word carrying an expansion is not
+// judged here (the substitution rungs own those), nor is a URL, a stream
+// device or text with whitespace in it, which is prose rather than a path.
 func unverifiableOperand(clause, root string, mt matching) string {
 	words := shellWords(clause)
 	at := argumentCommandWord(words)
@@ -80,6 +83,13 @@ func unverifiableOperand(clause, root string, mt matching) string {
 		if _, value, ok := strings.Cut(text, "="); ok {
 			candidates = append(candidates, value)
 		}
+		candidates, complete := jsonOperandCandidates(candidates)
+		if !complete {
+			return fmt.Sprintf("`%s` is handed an operand that opens like a JSON document and is larger or "+
+				"more deeply nested than the gate examines, so the paths it may carry were not judged and the "+
+				"gate cannot tell a read from a write. Pass a smaller document, or use a program the gate "+
+				"understands.", name)
+		}
 		for _, candidate := range candidates {
 			if where := protectedOperand(candidate, root, mt); where != "" {
 				return fmt.Sprintf("`%s` is handed %s, and the gate has no model of what it does to a path, "+
@@ -89,6 +99,107 @@ func unverifiableOperand(clause, root string, mt matching) string {
 		}
 	}
 	return ""
+}
+
+// The bounds on a JSON operand the gate opens. Past any of them the operand is
+// refused as unverifiable rather than judged by the part that was read: a
+// document the gate stopped reading is not a document it found clean.
+const (
+	maxJSONOperandBytes   = 64 << 10
+	maxJSONOperandStrings = 4096
+	maxJSONOperandDepth   = 64
+)
+
+// jsonOperandCandidates adds to a word's candidates every string a JSON object
+// or array among them carries — keys and values at any depth, the value of a
+// `--opt=value` string, and the strings of a JSON document encoded inside a
+// string. A program handed `{"command":"/opt/x"}` is handed /opt/x as surely
+// as one handed /opt/x itself; as a single word the document reads as a
+// relative file name inside the root, and pretty-printed it has whitespace and
+// reads as prose. Each string keeps the prose exemption, so a note in a JSON
+// field is still a note. complete is false when a document is past the bounds.
+func jsonOperandCandidates(candidates []string) (out []string, complete bool) {
+	queue := append([]string(nil), candidates...)
+	for len(queue) > 0 {
+		candidate := queue[0]
+		queue = queue[1:]
+		out = append(out, candidate)
+		strs, isJSON, ok := jsonOperandStrings(candidate)
+		if !ok {
+			return out, false
+		}
+		if !isJSON {
+			continue
+		}
+		for _, s := range strs {
+			queue = append(queue, s)
+			if _, value, found := strings.Cut(s, "="); found {
+				queue = append(queue, value)
+			}
+		}
+		if len(out)+len(queue) > maxJSONOperandStrings {
+			return out, false
+		}
+	}
+	return out, true
+}
+
+// jsonOperandStrings returns the strings of a JSON object or array, keys in
+// sorted order so the path a refusal names does not depend on map order.
+// isJSON is false for anything else, which is judged as the word it is. ok is
+// false when the document is past the bounds.
+func jsonOperandStrings(text string) (strs []string, isJSON, ok bool) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" || (trimmed[0] != '{' && trimmed[0] != '[') {
+		return nil, false, true
+	}
+	// Bounded before it is read at all: an operand this large that opens like
+	// a document is refused whether or not it would have parsed.
+	if len(trimmed) > maxJSONOperandBytes {
+		return nil, true, false
+	}
+	if !json.Valid([]byte(trimmed)) {
+		return nil, false, true
+	}
+	var doc any
+	if err := json.Unmarshal([]byte(trimmed), &doc); err != nil {
+		return nil, false, true
+	}
+	if !collectJSONStrings(doc, 0, &strs) {
+		return nil, true, false
+	}
+	return strs, true, true
+}
+
+func collectJSONStrings(v any, depth int, out *[]string) bool {
+	if depth > maxJSONOperandDepth {
+		return false
+	}
+	switch v := v.(type) {
+	case string:
+		if len(*out) >= maxJSONOperandStrings {
+			return false
+		}
+		*out = append(*out, v)
+	case []any:
+		for _, item := range v {
+			if !collectJSONStrings(item, depth+1, out) {
+				return false
+			}
+		}
+	case map[string]any:
+		keys := make([]string, 0, len(v))
+		for key := range v {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			if !collectJSONStrings(key, depth+1, out) || !collectJSONStrings(v[key], depth+1, out) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // protectedOperand describes why an operand is a path the hard rules refuse to
