@@ -79,13 +79,7 @@ impl Resolver {
     ) -> Result<Option<PythonMethod>, ()> {
         let (class_file, identity) = self.python_class_named(file, written).ok_or(())?;
         let type_key = Self::python_type_key(&identity);
-        let own: Vec<&(String, String)> = self
-            .type_methods
-            .get(&(LangFamily::Python, type_key.to_string(), method.to_string()))
-            .into_iter()
-            .flatten()
-            .filter(|(path, _)| *path == class_file)
-            .collect();
+        let own = self.python_own_methods(&class_file, type_key, method);
         match own.as_slice() {
             [(path, symbol)] => {
                 return Ok(Some(PythonMethod {
@@ -97,7 +91,116 @@ impl Resolver {
             [] => {}
             _ => return Ok(None),
         }
-        Ok(self.python_inherited_method(type_key, method))
+        Ok(self.python_inherited_from(&class_file, type_key, method))
+    }
+
+    /// The declarations of `method` that the class `type_key`, declared in
+    /// `class_file`, writes on itself.
+    fn python_own_methods(
+        &self,
+        class_file: &str,
+        type_key: &str,
+        method: &str,
+    ) -> Vec<&(String, String)> {
+        self.type_methods
+            .get(&(LangFamily::Python, type_key.to_string(), method.to_string()))
+            .into_iter()
+            .flatten()
+            .filter(|(path, _)| path == class_file)
+            .collect()
+    }
+
+    /// `method` as the bases of the class `type_key` (declared in `class_file`)
+    /// provide it: the file-scoped walk first, the flat table only when that
+    /// walk finds nothing.
+    ///
+    /// The flat read refuses any class name two files declare, so a collision
+    /// in the child's or a base's name used to lose the edge. The scoped walk
+    /// asks Python's own question instead — which class does this file's
+    /// `class` statement or `import` bind the base name to. A scoped answer is
+    /// always a binding of a name this file resolved; the flat fallback keeps
+    /// every answer the resolver gave before and still abstains on a collision.
+    pub(super) fn python_inherited_from(
+        &self,
+        class_file: &str,
+        type_key: &str,
+        method: &str,
+    ) -> Option<PythonMethod> {
+        self.python_scoped_inherited_method(class_file, type_key, method)
+            .or_else(|| self.python_inherited_method(type_key, method))
+    }
+
+    /// The one method `method` that the declared bases of `type_key` (declared
+    /// in `class_file`) provide, walking each base through the file that names
+    /// it. Breadth-first, like [`Self::supertype_method`], so a method is found
+    /// at the level it is first declared, and abstaining on the same
+    /// ambiguities: two bases of one level that both declare it, or a class
+    /// that declares it twice. This resolver has no MRO, so a diamond answers
+    /// only when exactly one base on the nearest level provides the method.
+    ///
+    /// `None` also when a base is declared in the corpus but cannot be bound to
+    /// one class (declared twice in its file, reached through a qualified name
+    /// or star import), because binding it by its flat name is exactly what
+    /// this walk exists to avoid. A base the corpus does not declare at all
+    /// (`object`, `ABC`) provides nothing indexed and is skipped.
+    fn python_scoped_inherited_method(
+        &self,
+        class_file: &str,
+        type_key: &str,
+        method: &str,
+    ) -> Option<PythonMethod> {
+        let mut frontier: Vec<(String, String)> =
+            vec![(class_file.to_string(), type_key.to_string())];
+        let mut visited: BTreeSet<(String, String)> = BTreeSet::new();
+        for _ in 0..Self::HERITAGE_WALK_MAX_DEPTH {
+            let mut found: BTreeSet<(String, String, String)> = BTreeSet::new();
+            let mut next: Vec<(String, String)> = Vec::new();
+            for (file, class) in &frontier {
+                if !visited.insert((file.clone(), class.clone())) {
+                    continue;
+                }
+                let Some(bases) = self.python_bases.get(&(file.clone(), class.clone())) else {
+                    continue;
+                };
+                for base in bases {
+                    let Some((base_file, identity)) = self.python_class_named(file, base) else {
+                        if self.declares_type(LangFamily::Python, base) {
+                            return None;
+                        }
+                        continue;
+                    };
+                    let base_key = Self::python_type_key(&identity);
+                    match self
+                        .python_own_methods(&base_file, base_key, method)
+                        .as_slice()
+                    {
+                        [] => {}
+                        [(path, symbol)] => {
+                            found.insert((path.clone(), symbol.clone(), base_key.to_string()));
+                        }
+                        _ => return None,
+                    }
+                    next.push((base_file, base_key.to_string()));
+                }
+            }
+            match found.len() {
+                1 => {
+                    let (file, symbol, declaring_type) = found.into_iter().next()?;
+                    return Some(PythonMethod {
+                        file,
+                        symbol,
+                        declaring_type,
+                    });
+                }
+                0 => {}
+                _ => return None,
+            }
+            if next.is_empty() {
+                return None;
+            }
+            frontier = next;
+        }
+        None
     }
 
     /// `method` as the declared bases of `type_key` provide it. Needs the class
@@ -135,7 +238,7 @@ impl Resolver {
         method: &str,
     ) -> Option<PythonMethod> {
         let enclosing = self.self_type_at(file, LangFamily::Python, caller)?;
-        self.python_inherited_method(&enclosing, method)
+        self.python_inherited_from(file, &enclosing, method)
     }
 
     /// The class a `cls(...)` call inside a method of it constructs.

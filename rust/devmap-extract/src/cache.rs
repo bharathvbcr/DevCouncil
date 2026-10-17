@@ -708,7 +708,11 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// module-scope `const`/`let`/`var` name in `scope_locals` under the file's own
 /// name, so a private module-scope binding is no longer invisible. A v93 row has
 /// neither.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "94";
+///
+/// v95 stamps a Python call reference that is the whole right-hand side of
+/// `self.name = callee(..)` with `assigned_to = "self.name"`, so the resolver
+/// can type the field from its initializer. A v94 row carries `None` there.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "95";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

@@ -11627,9 +11627,56 @@ fn is_call_callee(node: Node) -> bool {
     false
 }
 
+/// The field a Python `self.name = callee(..)` assigns, spelled `self.name`,
+/// when `origin` is the callee of the call that is the assignment's whole
+/// right-hand side.
+///
+/// Spelled with the `self.` prefix so it can never equal a local's name: the
+/// receiver maps key a local by its bare name, and a field is not in scope as
+/// a variable (Swift's `swift_assignment_binding` refuses the same spelling for
+/// that reason). The resolver reads the prefix and routes the initializer to
+/// the owning class's field table instead.
+///
+/// Only the direct right-hand side counts. `self.xs = [Engine()]` holds a list,
+/// `self.e = wrap(Engine())` holds what `wrap` returns, and
+/// `self.e = Engine() if c else None` is not one type: binding any of them to
+/// the inner call would type the field wrongly, and nothing here can tell a
+/// wrapper from the value.
+fn python_self_field_binding(assignment: Node, origin: Node, source: &str) -> Option<String> {
+    let left = assignment.child_by_field_name("left")?;
+    if left.kind() != "attribute" {
+        return None;
+    }
+    let object = left.child_by_field_name("object")?;
+    let attribute = left.child_by_field_name("attribute")?;
+    if object.kind() != "identifier"
+        || attribute.kind() != "identifier"
+        || get_node_text(object, source) != "self"
+    {
+        return None;
+    }
+    let right = assignment.child_by_field_name("right")?;
+    if right.kind() != "call" {
+        return None;
+    }
+    // The call itself, or its callee: an argument lies past the callee's end.
+    let callee_end = right
+        .child_by_field_name("function")
+        .map_or(right.end_byte(), |function| function.end_byte());
+    (origin.id() == right.id()
+        || (origin.start_byte() >= right.start_byte() && origin.end_byte() <= callee_end))
+        .then(|| format!("self.{}", get_node_text(attribute, source)))
+}
+
 fn assignment_binding(mut node: Node, source: &str) -> Option<String> {
+    let origin = node;
     for _ in 0..4 {
         node = bounded_parent(node)?;
+        if node.kind() == "assignment" {
+            if let Some(field) = python_self_field_binding(node, origin, source) {
+                return Some(field);
+            }
+        }
         let binding = match node.kind() {
             "assignment"
             | "assignment_expression"

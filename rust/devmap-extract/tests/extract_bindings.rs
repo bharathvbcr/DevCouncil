@@ -12,8 +12,8 @@ use devmap_extract::model::{LocalBinding, ReferenceKind};
 fn extraction_schema_version_tracks_binding_and_ruleguard() {
     assert_eq!(
         devmap_extract::cache::EXTRACTION_SCHEMA_VERSION,
-        "94",
-        "v94 marks a Python `from m import *` with the alias `*` and a JS/TS module-scope binding in `scope_locals` under the file's name; v93 integrates main's Swift receiver-typing payload (v90 on main: same-file `typealias`, parenthesised cast, tuple parameter member, own-method return and SwiftData fetch receivers, with scope-aware abstentions) on top of v92; v92 integrates the Rust, TypeScript/Go and Swift lanes (Swift type aliases are extractor output); v90 (ts/go lane) records a TypeScript interface method_signature as a Method symbol and a Go embedding as a Heritage reference; v90 (rust lane) records `macro_rules!` macros as Macro symbols their same-file invocations reference, blanket-impl type parameters, `?` From candidates and calls through a same-file const fn pointer; v89 types a Rust `dyn Trait` / `impl Trait` binding by its one named trait and records a literal Python `importlib.import_module` as a scoped module handle; v88 is the dead-policy lane's payload (function-local Rust impl keys, Kotlin callable-reference receivers on name references, Rust `fn main` outside `src/`, Rust restricted-visibility and SwiftPM executable-target scopes, indexed project.pbxproj, a qualified JS/TS base as one Heritage reference per segment); v87 records a Kotlin parameter, typed local and constructor property as a typed binding, a Kotlin/Java file's package header, Kotlin scope-function lambdas, callable references and written return types, Android manifests as config, and Ruby attributes and mixins as methods and heritage; v86 records Swift protocol requirements as symbols and scope-aware Swift locals; v85 records the implicit `__enter__` call of a Python `with Class(..)`; v84 binds Swift and Kotlin parameters and closure parameters as local bindings; v83 records the TypeScript workspace-package map and the member-qualified ids of class-field and object-literal members, and an `export default` as an export named `default`; v82 records a Go file's declarations, local scopes and call receivers as structured facts (`go_facts`), the input of the resolver's Go type evaluator; v81 records inline Rust modules, `Deref` targets, implicit operator/drop/from candidates, `generate_handler!` lists and `macro_rules!` expansions, and drops macro member names as references; v80 records which partial-parse error regions hold no name; v79 is both lanes' v78 payloads together, under a number neither stamped: the read-tools lane's v78 withholds a secret file's literal values, docstrings and string-made references; the dead-policy lane's v78 adds the dead-policy extractor fixes (cgo/linkname and Tauri entry points, TS ambient exemptions, destructuring defaults as uses, Swift custom-operator calls and standard-operator exemptions, Swift `Type.member` receivers); v77 adds macro-stamped C-family functions and EntryName references on top of v76; v76 is v73, v74 and the literal half of v75 together, because extraction-recall and metal-kernels both stamped 75 on different payloads; v75 records string literals and the uses of a Rust module-level const; v74 binds the names a CommonJS `require` declares; v73 references the type a Rust struct literal constructs (`Name {{ .. }}`, `Self {{ .. }}`); v72 adds the MCP-parity lane's v67 (route middleware and Go routes); v71 adds the resolver-precision lane's v67 (Rust function headers, Rust locals typed from their own binders, a Go `var w T`); v70 merges v68 and v69 under a number neither lane stamped; v69 records each callable's written return type and binds a single-name Go var/const spec's initializer; v68 stops a JSX tag, a C# member access, an annotation, an attribute or a preprocessor test from binding a local, and binds wrapped callbacks (`useCallback(() => …)`, `memo`, `forwardRef`) as functions; v66 emits every Python module-scope binding, multi-name Go specs, destructured TS/JS names and type aliases, reads import names off the tree, and stops a module binding shadowing its module-level reads; v65 references the scope of `T::m` and records the calls inside a function-like macro body; v64 stops filing a C++ template callee or template type use as a local binding and annotates a Python function decorated with a parameter of its enclosing callable; v63 records in-function Python `sys.path` inserts as scoped vetoes; v62 records Python `sys.path` entries; v61 reads Python path constants and parameterised path loaders; v60 records a Go file's unexported field and interface-method names, the veto for the unexported-selector rung; v59 records a Python module loaded by file path as a `path_load` import; v58 records a shell `source` as a glob import and a `build.rs`'s `cargo:rerun-if-changed=` paths as dynamic references, and stops emitting a Go struct-literal field key as a name reference, on top of v57's object-literal method exemption, v56's Rust `pub use` exports, v55's inline-module `super` receiver, v54's declared-field types, v53's receiver-prefix reduction and v52's duplicate-callee drop, while retaining v48 bindings, v49 ruleguard wiring, v50 attribution fixes and v51 captured-receiver classifications"
+        "95",
+        "v95 stamps a Python `self.name = callee(..)` call reference with `assigned_to = \"self.name\"`; v94 marks a Python `from m import *` with the alias `*` and a JS/TS module-scope binding in `scope_locals` under the file's name; v93 integrates main's Swift receiver-typing payload (v90 on main: same-file `typealias`, parenthesised cast, tuple parameter member, own-method return and SwiftData fetch receivers, with scope-aware abstentions) on top of v92; v92 integrates the Rust, TypeScript/Go and Swift lanes (Swift type aliases are extractor output); v90 (ts/go lane) records a TypeScript interface method_signature as a Method symbol and a Go embedding as a Heritage reference; v90 (rust lane) records `macro_rules!` macros as Macro symbols their same-file invocations reference, blanket-impl type parameters, `?` From candidates and calls through a same-file const fn pointer; v89 types a Rust `dyn Trait` / `impl Trait` binding by its one named trait and records a literal Python `importlib.import_module` as a scoped module handle; v88 is the dead-policy lane's payload (function-local Rust impl keys, Kotlin callable-reference receivers on name references, Rust `fn main` outside `src/`, Rust restricted-visibility and SwiftPM executable-target scopes, indexed project.pbxproj, a qualified JS/TS base as one Heritage reference per segment); v87 records a Kotlin parameter, typed local and constructor property as a typed binding, a Kotlin/Java file's package header, Kotlin scope-function lambdas, callable references and written return types, Android manifests as config, and Ruby attributes and mixins as methods and heritage; v86 records Swift protocol requirements as symbols and scope-aware Swift locals; v85 records the implicit `__enter__` call of a Python `with Class(..)`; v84 binds Swift and Kotlin parameters and closure parameters as local bindings; v83 records the TypeScript workspace-package map and the member-qualified ids of class-field and object-literal members, and an `export default` as an export named `default`; v82 records a Go file's declarations, local scopes and call receivers as structured facts (`go_facts`), the input of the resolver's Go type evaluator; v81 records inline Rust modules, `Deref` targets, implicit operator/drop/from candidates, `generate_handler!` lists and `macro_rules!` expansions, and drops macro member names as references; v80 records which partial-parse error regions hold no name; v79 is both lanes' v78 payloads together, under a number neither stamped: the read-tools lane's v78 withholds a secret file's literal values, docstrings and string-made references; the dead-policy lane's v78 adds the dead-policy extractor fixes (cgo/linkname and Tauri entry points, TS ambient exemptions, destructuring defaults as uses, Swift custom-operator calls and standard-operator exemptions, Swift `Type.member` receivers); v77 adds macro-stamped C-family functions and EntryName references on top of v76; v76 is v73, v74 and the literal half of v75 together, because extraction-recall and metal-kernels both stamped 75 on different payloads; v75 records string literals and the uses of a Rust module-level const; v74 binds the names a CommonJS `require` declares; v73 references the type a Rust struct literal constructs (`Name {{ .. }}`, `Self {{ .. }}`); v72 adds the MCP-parity lane's v67 (route middleware and Go routes); v71 adds the resolver-precision lane's v67 (Rust function headers, Rust locals typed from their own binders, a Go `var w T`); v70 merges v68 and v69 under a number neither lane stamped; v69 records each callable's written return type and binds a single-name Go var/const spec's initializer; v68 stops a JSX tag, a C# member access, an annotation, an attribute or a preprocessor test from binding a local, and binds wrapped callbacks (`useCallback(() => …)`, `memo`, `forwardRef`) as functions; v66 emits every Python module-scope binding, multi-name Go specs, destructured TS/JS names and type aliases, reads import names off the tree, and stops a module binding shadowing its module-level reads; v65 references the scope of `T::m` and records the calls inside a function-like macro body; v64 stops filing a C++ template callee or template type use as a local binding and annotates a Python function decorated with a parameter of its enclosing callable; v63 records in-function Python `sys.path` inserts as scoped vetoes; v62 records Python `sys.path` entries; v61 reads Python path constants and parameterised path loaders; v60 records a Go file's unexported field and interface-method names, the veto for the unexported-selector rung; v59 records a Python module loaded by file path as a `path_load` import; v58 records a shell `source` as a glob import and a `build.rs`'s `cargo:rerun-if-changed=` paths as dynamic references, and stops emitting a Go struct-literal field key as a name reference, on top of v57's object-literal method exemption, v56's Rust `pub use` exports, v55's inline-module `super` receiver, v54's declared-field types, v53's receiver-prefix reduction and v52's duplicate-callee drop, while retaining v48 bindings, v49 ruleguard wiring, v50 attribution fixes and v51 captured-receiver classifications"
     );
 }
 
@@ -391,5 +391,61 @@ fn a_swift_binding_is_not_a_local_in_its_own_initializer() {
         at("session", test),
         "a plain test after a binding sees the new local: {:?}",
         extraction.local_bindings
+    );
+}
+
+/// `self.engine = Engine()` assigns a field, not a local, and the extractor
+/// says so with the `self.` spelling no local can have. Only a call that is the
+/// whole right-hand side is stamped: a wrapped, nested or conditional value is
+/// not what the call returns.
+#[test]
+fn a_python_self_field_initializer_is_stamped_with_the_field_spelling() {
+    let source = "class H:\n    def __init__(self):\n        self.a = Engine()\n        self.b = mod.make()\n        self.c = [Engine()]\n        self.d = wrap(Engine())\n        self.e = Engine() if x else None\n        local = Engine()\n        other.f = Engine()\n";
+    let extraction = extract_file("h.py", source);
+    let stamped = |line: &str| -> Vec<(String, Option<String>)> {
+        let start = source.find(line).expect("line");
+        let end = start + line.len();
+        extraction
+            .references
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Call)
+            .filter(|r| r.span.start_byte >= start && r.span.end_byte <= end)
+            .map(|r| (r.name.clone(), r.assigned_to.clone()))
+            .collect()
+    };
+    assert_eq!(
+        stamped("self.a = Engine()"),
+        vec![("Engine".to_string(), Some("self.a".to_string()))]
+    );
+    assert_eq!(
+        stamped("self.b = mod.make()"),
+        vec![("make".to_string(), Some("self.b".to_string()))]
+    );
+    // The outer call is the value; the argument is not.
+    assert_eq!(
+        stamped("self.d = wrap(Engine())"),
+        vec![
+            ("wrap".to_string(), Some("self.d".to_string())),
+            ("Engine".to_string(), None)
+        ]
+    );
+    for wrapped in ["self.c = [Engine()]", "self.e = Engine() if x else None"] {
+        assert!(
+            stamped(wrapped)
+                .iter()
+                .all(|(_, assigned)| assigned.as_deref().is_none_or(|a| !a.starts_with("self."))),
+            "{wrapped}: {:?}",
+            stamped(wrapped)
+        );
+    }
+    assert_eq!(
+        stamped("local = Engine()"),
+        vec![("Engine".to_string(), Some("local".to_string()))]
+    );
+    assert!(
+        stamped("other.f = Engine()")
+            .iter()
+            .all(|(_, assigned)| assigned.is_none()),
+        "only `self` names a field of the enclosing class"
     );
 }

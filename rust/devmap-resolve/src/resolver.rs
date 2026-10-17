@@ -393,6 +393,15 @@ pub struct Resolver {
     /// that reads it refuses to continue through a type name two files declare,
     /// where the chain stops being identifiable.
     supertypes: BTreeMap<(LangFamily, String), BTreeSet<String>>,
+    /// `(file, subtype)` -> the bare base names that file's `class` statement
+    /// writes, for Python only.
+    ///
+    /// [`Self::supertypes`] is flat by bare name, so two classes of one name in
+    /// two files share one entry. A Python class is identified by the file that
+    /// declares it, and its bases by the file's own imports, so this table is
+    /// the per-declaration half the `pytypes` walk reads before it falls back
+    /// to the flat one.
+    python_bases: BTreeMap<(String, String), BTreeSet<String>>,
     /// Reverse of [`Self::supertypes`]: `(family, type name)` → indexed subtypes.
     ///
     /// Built from the same heritage rows. X42's virtual-`self` guard walks this
@@ -689,6 +698,7 @@ impl Resolver {
             poisoned_receiver_keys: BTreeSet::new(),
             type_methods: BTreeMap::new(),
             supertypes: BTreeMap::new(),
+            python_bases: BTreeMap::new(),
             subtypes: BTreeMap::new(),
             import_bindings: BTreeMap::new(),
             value_imports: BTreeMap::new(),
@@ -2313,13 +2323,78 @@ impl Resolver {
                     .get(&format!("{owner}:{owner}::{enclosing}:{name}@type"))
                     .and_then(|typed| Self::admissible_nominal_type(typed))
             })
-            .or_else(|| {
-                let shape = self
-                    .field_initializers
-                    .get(&format!("{file}:{qualified}:{name}"))?;
-                let family = self.family_of_file(file)?;
-                self.factory_return_type(family, file, None, shape)
-            })
+            .or_else(|| self.field_initializer_type(file, enclosing, name))
+    }
+
+    /// The type a field's own initializer gives it: what the factory
+    /// declares it returns, or, for Python's `self.engine = Engine()`, the
+    /// class the call names.
+    ///
+    /// The one reader of `field_initializers`, so the implicit-`self` rung
+    /// ([`Self::member_declared_type`]) and the explicit `self.field` rung
+    /// ([`Self::field_type_on`]) answer from the same fact. Keyed by the owning
+    /// class like every declared slot: class A's `self.engine = Engine()`
+    /// never types class B's `engine` in the same file.
+    fn field_initializer_type(&self, file: &str, owner: &str, field: &str) -> Option<String> {
+        let shape = self
+            .field_initializers
+            .get(&format!("{file}:{file}::{owner}:{field}"))?;
+        let family = self.family_of_file(file)?;
+        if family == LangFamily::Python
+            && Self::is_plain_ident(shape)
+            && self.python_class_named(file, shape).is_some()
+        {
+            return Some(shape.clone());
+        }
+        self.factory_return_type(family, file, None, shape)
+    }
+
+    /// Record `self.<field> = callee(..)` as `field`'s initializer on the class
+    /// that owns the method it is written in.
+    ///
+    /// A field assigned two different shapes (in `__init__` and again in a
+    /// reset method) is not one type: the entry is dropped and stays dropped,
+    /// because a winner picked by extraction order is the confidently-wrong
+    /// answer. The same shape written twice is one fact.
+    fn record_python_field_initializer(
+        &mut self,
+        ext: &Extraction,
+        reference: &ExtractedReference,
+        field: &str,
+    ) {
+        if !matches!(
+            reference.kind,
+            ReferenceKind::Call | ReferenceKind::Constructor
+        ) {
+            return;
+        }
+        let (Some(scope), Some(shape)) = (
+            reference.enclosing_symbol.as_deref(),
+            reference.initializer_shape(&ext.calls),
+        ) else {
+            return;
+        };
+        let Some(owner) = self
+            .declaring_type_of(&ext.file_path, scope)
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let key = format!("{}:{}::{}:{}", ext.file_path, ext.file_path, owner, field);
+        let poison = format!("field-initializer:{key}");
+        if self.poisoned_receiver_keys.contains(&poison) {
+            return;
+        }
+        match self.field_initializers.get(&key) {
+            Some(existing) if *existing != shape => {
+                self.field_initializers.remove(&key);
+                self.poisoned_receiver_keys.insert(poison);
+            }
+            Some(_) => {}
+            None => {
+                self.field_initializers.insert(key, shape);
+            }
+        }
     }
 
     /// Type of `field` on `owner`, from the field Type ref indexed at build.
@@ -2349,6 +2424,10 @@ impl Resolver {
         .iter()
         .find_map(|key| self.scoped_receiver_types.get(key))
         .and_then(|t| Self::admissible_nominal_type(t))
+        // No annotation and no field Type ref: the initializer is the file's
+        // only statement of the type, the same fallback the implicit-`self`
+        // rung takes. A declaration always outranks it.
+        .or_else(|| self.field_initializer_type(file, &owner, field))
     }
 
     /// Bare-name miss: [`NoNamesake`] when the corpus has no symbol of that
@@ -3036,6 +3115,7 @@ impl Resolver {
         self.poisoned_receiver_keys.clear();
         self.type_methods.clear();
         self.supertypes.clear();
+        self.python_bases.clear();
         self.subtypes.clear();
         self.import_bindings.clear();
         self.value_imports.clear();
@@ -4068,6 +4148,12 @@ impl Resolver {
                 if supertype.is_empty() || supertype == subtype {
                     continue;
                 }
+                if family == LangFamily::Python {
+                    self.python_bases
+                        .entry((ext.file_path.clone(), subtype.to_string()))
+                        .or_default()
+                        .insert(supertype.to_string());
+                }
                 self.supertypes
                     .entry((family, subtype.to_string()))
                     .or_default()
@@ -4081,6 +4167,16 @@ impl Resolver {
                 let Some(receiver) = &reference.assigned_to else {
                     continue;
                 };
+                // `self.engine = Engine()`: the extractor spells a Python field
+                // target `self.<name>`, which is no local's name, so it never
+                // reaches the receiver maps below. It is the owning class's
+                // initializer for that field, read by `field_initializer_type`.
+                if family == LangFamily::Python {
+                    if let Some(field) = receiver.strip_prefix("self.") {
+                        self.record_python_field_initializer(ext, reference, field);
+                        continue;
+                    }
+                }
                 // A Kotlin property initialized by a factory call names no type,
                 // but the factory's declaration does. `lazy` itself is the
                 // delegate, not the value.
