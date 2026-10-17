@@ -701,7 +701,14 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// receiver-typing payload above while this branch's lanes stamped 90 (Rust,
 /// TypeScript/Go) and 92 on other payloads, so 93 is a number no binary has
 /// cached under a different meaning.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "93";
+///
+/// v94 marks a Python `from m import *` with the alias `*` (as a Go dot-import
+/// is marked by `.`), so the resolver can tell a star import from `import m`,
+/// and records a JS/TS
+/// module-scope `const`/`let`/`var` name in `scope_locals` under the file's own
+/// name, so a private module-scope binding is no longer invisible. A v93 row has
+/// neither.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "94";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

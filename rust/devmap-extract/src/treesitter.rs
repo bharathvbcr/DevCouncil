@@ -4419,12 +4419,21 @@ fn extract_node(
                     .map(|module| python_module_path(module, source))
                     .unwrap_or_default();
                 let (imported_names, local_names) = python_import_bindings(node, source);
+                // `from m import *` names nothing, so it has no `imported_names`
+                // (a `*` there once bound a local called `*`); it is marked by
+                // the alias `*` instead, as a Go dot-import is by `.`: the
+                // marker for "binds whatever this module exports", and still
+                // evidence about every bare name the file uses.
+                let mut cursor = node.walk();
+                let wildcard = node
+                    .children(&mut cursor)
+                    .any(|child| child.kind() == "wildcard_import");
                 imports.push(ExtractedImport {
                     raw_import: get_node_text(node, source),
                     module_specifier,
                     imported_names,
                     local_names,
-                    alias: None,
+                    alias: wildcard.then(|| "*".to_string()),
                     span,
                     path_load: None,
                 });
@@ -11349,6 +11358,37 @@ fn collect_type_parameter_names(callable: Node, source: &str, out: &mut BTreeSet
     }
 }
 
+/// Every name a JS/TS file's top-level `const`/`let`/`var` declarations bind,
+/// destructuring included, whether or not the declaration is exported.
+fn js_module_scope_names(root: Node, source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut cursor = root.walk();
+    for statement in root.named_children(&mut cursor) {
+        let declaration = match statement.kind() {
+            "export_statement" => statement.child_by_field_name("declaration"),
+            _ => Some(statement),
+        };
+        let Some(declaration) = declaration.filter(|declaration| {
+            matches!(
+                declaration.kind(),
+                "lexical_declaration" | "variable_declaration"
+            )
+        }) else {
+            continue;
+        };
+        let mut inner = declaration.walk();
+        for declarator in declaration.named_children(&mut inner) {
+            if declarator.kind() != "variable_declarator" {
+                continue;
+            }
+            if let Some(target) = declarator.child_by_field_name("name") {
+                names.extend(js_pattern_bound_names(target, source));
+            }
+        }
+    }
+    names
+}
+
 fn collect_scope_locals(
     root: Node,
     source: &str,
@@ -11406,6 +11446,20 @@ fn collect_scope_locals(
             }
         }
         push_children(node, &mut worklist);
+    }
+    // A JS/TS module-scope `const x = …` is a binding of the file itself, keyed
+    // by the file's own name — the caller a module-level call reports. Only the
+    // exported ones become symbols, so without this a private
+    // `const fetchThing = vi.fn()` was invisible and `fetchThing()` bound to
+    // whichever other file exports that name.
+    if matches!(lang, "javascript" | "typescript" | "tsx") {
+        let module_names = js_module_scope_names(root, source);
+        if !module_names.is_empty() {
+            by_scope
+                .entry(file_symbol_name.to_string())
+                .or_default()
+                .extend(module_names);
+        }
     }
     by_scope
         .into_iter()
