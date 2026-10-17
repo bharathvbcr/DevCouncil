@@ -454,7 +454,7 @@ pub struct Resolver {
     module_value_members: BTreeMap<(String, String), BTreeSet<String>>,
     /// `file` → how each of its module-scope JS/TS const objects is built, in
     /// source order. Read only through [`Self::object_member_target`].
-    js_objects: BTreeMap<String, Vec<JsObjectFact>>,
+    js_objects: BTreeMap<String, jsobjects::FileObjects>,
     /// `(file, qualified name)` → the return type a callable's declaration
     /// writes, as the extractor recorded it. What types a factory-built value;
     /// read only through [`Self::factory_return_type`].
@@ -5753,18 +5753,40 @@ impl Resolver {
                                     self.scope_declares_local(&ext.file_path, scope, first)
                                 });
                             if !shadowed {
-                                if let Some((target_file, target_symbol)) = self
-                                    .object_member_target(&ext.file_path, recv, &call.callee_name)
-                                {
-                                    resolution = Some(Arc::new(if target_file == ext.file_path {
-                                        Resolution::SameFile { target_symbol, target_file }
-                                    } else {
-                                        Resolution::ImportScoped {
-                                            target_symbol,
-                                            target_file,
-                                            imported_from: recv.to_string(),
-                                        }
-                                    }));
+                                let use_at = call
+                                    .caller_symbol
+                                    .is_none()
+                                    .then_some(call.span.start_byte);
+                                match self.object_member_target(
+                                    &ext.file_path,
+                                    recv,
+                                    &call.callee_name,
+                                    use_at,
+                                ) {
+                                    jsobjects::ObjectMember::Bound(target_file, target_symbol) => {
+                                        resolution = Some(Arc::new(if target_file == ext.file_path {
+                                            Resolution::SameFile { target_symbol, target_file }
+                                        } else {
+                                            Resolution::ImportScoped {
+                                                target_symbol,
+                                                target_file,
+                                                imported_from: recv.to_string(),
+                                            }
+                                        }));
+                                    }
+                                    // The object is known and some step that
+                                    // may define this member is not readable:
+                                    // a later rung would answer with a
+                                    // namesake the object does not have.
+                                    jsobjects::ObjectMember::Abstain => {
+                                        resolution = Some(Arc::new(Resolution::Unresolved {
+                                            reason: format!(
+                                                "the receiver is an object whose member {:?} is written by a step that cannot be read",
+                                                call.callee_name
+                                            ),
+                                        }));
+                                    }
+                                    jsobjects::ObjectMember::Absent => {}
                                 }
                             }
                         }

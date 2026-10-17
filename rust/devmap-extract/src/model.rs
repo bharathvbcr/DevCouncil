@@ -1711,9 +1711,9 @@ pub struct Extraction {
     /// core)` and `const w = core` all give `w` members its own declaration
     /// never spells, and the resolver needs the *order* the properties are
     /// applied in (the last write wins) to say which source owns a key. Empty
-    /// for every other language, and on an extraction cached before this field
-    /// existed — the resolver then abstains rather than read absence as "the
-    /// object has only what its literal spells".
+    /// for every other language. An extraction cached before this field existed
+    /// (schema v95 and older) is never served: the schema version moved to 96
+    /// with it, because an empty list cannot say "not collected".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub js_objects: Vec<JsObjectFact>,
 }
@@ -1725,12 +1725,19 @@ pub struct JsObjectFact {
     /// `Object.assign` writes into.
     pub name: String,
     pub start_byte: usize,
-    /// `true` for the `const name = …` declaration; `false` for an
-    /// `Object.assign(name, …)` that mutates it.
+    /// `true` for the `const name = …` declaration; `false` for a later write
+    /// to the object (`Object.assign(name, …)`, `name.k = …`, `delete name.k`,
+    /// `Object.defineProperty(name, …)`) or a place it escapes to (passed to a
+    /// call, returned, stored in another value), at `start_byte`.
     pub declaration: bool,
     /// A mutation written inside a callable: it may run any number of times,
     /// or never, so the resolver reads it as a source it cannot name.
     pub in_callable: bool,
+    /// A module-level write under an `if`, `?:`, `&&`/`||`/`??`, a loop,
+    /// `switch` or `try`: it may not run, so it can only make the keys it
+    /// touches uncertain.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub conditional: bool,
     /// The identifier (or `ns.name`) whose object this declaration *is*, not a
     /// copy of: `const w = core` and `const w = Object.assign(core, …)`. A
     /// write through `w` is then a write to `core`'s members too.

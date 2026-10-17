@@ -713,13 +713,19 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `self.name = callee(..)` with `assigned_to = "self.name"`, so the resolver
 /// can type the field from its initializer. A v94 row carries `None` there.
 ///
-/// v95 also adds `Extraction::js_objects` (JS/TS only): how each module-scope
-/// `const` object is built — its literal members, spreads, `Object.assign`
-/// sources and plain alias, in source order — and every `Object.assign(name,
-/// …)` that writes into one. The field is purely additive (no existing field
-/// changes meaning), and a row cached without it reads as "not collected": the
-/// resolver then abstains instead of treating the literal as the whole object.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "95";
+/// v96 adds `Extraction::js_objects` (JS/TS, including `<script>` blocks of
+/// Vue/Svelte/Astro): how each module-scope `const` object is built — literal
+/// members, spreads, `Object.assign` sources and plain aliases, in source order
+/// — and every later write that can change its members: `Object.assign(name,
+/// …)`, `name.k = …`, `delete name.k`, `Object.defineProperty`/`Reflect.set`
+/// and friends, plus any place the object escapes (passed to a call, returned,
+/// stored in another value). Each carries whether it runs conditionally or
+/// inside a callable. The field is additive, but a v95 row has none of it, and
+/// the resolver cannot tell "no objects" from "not collected": served as
+/// current it would leave every unchanged JS/TS file without the spread,
+/// alias and member-write answers. The bump is what keeps such a row from
+/// being served at all.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "96";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

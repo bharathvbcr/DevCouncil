@@ -50,7 +50,7 @@ fn a_literal_records_its_steps_in_source_order() {
 fn an_alias_and_an_object_assign_record_their_source() {
     let all = facts(
         "a.ts",
-        "const a = core;\nconst b = ns.core;\nconst c = Object.assign({}, core, { x() {} });\nconst d = Object.assign(core, other);\n",
+        "const core = {};\nconst a = core;\nconst b = ns.core;\nconst c = Object.assign({}, core, { x() {} });\nconst d = Object.assign(core, other);\n",
     );
     assert_eq!(declared(&all, "a").parts, vec![spread("core")]);
     assert_eq!(declared(&all, "a").alias_of.as_deref(), Some("core"));
@@ -109,4 +109,86 @@ fn only_a_module_scope_const_is_recorded() {
     );
     assert!(all.is_empty(), "got {all:?}");
     assert!(facts("a.py", "w = {**core}\n").is_empty());
+}
+
+fn writes<'a>(all: &'a [JsObjectFact], name: &str) -> Vec<&'a JsObjectFact> {
+    all.iter()
+        .filter(|f| !f.declaration && f.name == name)
+        .collect()
+}
+
+#[test]
+fn member_writes_are_recorded_as_steps_with_their_context() {
+    let all = facts(
+        "a.ts",
+        "const w: any = {};\nw.a = f;\nw['b'] = 1;\nw[k] = 1;\ndelete w.c;\nObject.defineProperty(w, 'd', {});\nReflect.set(w, 'e', 1);\nif (x) w.g = h;\nfunction p() { w.i = 1; }\n",
+    );
+    let w = writes(&all, "w");
+    let parts: Vec<_> = w.iter().map(|f| f.parts.clone()).collect();
+    assert_eq!(
+        parts,
+        vec![
+            vec![JsObjectPart::Forward {
+                key: "a".into(),
+                value: "f".into()
+            }],
+            vec![JsObjectPart::Opaque("b".into())],
+            vec![JsObjectPart::Unknown],
+            vec![JsObjectPart::Opaque("c".into())],
+            vec![JsObjectPart::Opaque("d".into())],
+            vec![JsObjectPart::Opaque("e".into())],
+            vec![JsObjectPart::Forward {
+                key: "g".into(),
+                value: "h".into()
+            }],
+            vec![JsObjectPart::Opaque("i".into())],
+        ]
+    );
+    assert!(w[6].conditional && !w[6].in_callable);
+    assert!(w[7].in_callable);
+    assert!(!w[0].conditional && !w[0].in_callable);
+}
+
+#[test]
+fn an_escape_is_an_unreadable_write_and_a_read_is_nothing() {
+    let all = facts(
+        "a.ts",
+        "const w = {};\nconst a = w;\nfoo(w);\nconst o = { k: w };\nfunction r() { return w; }\nw.x();\nconst n = Object.keys(w);\nexport { w };\n",
+    );
+    // `const a = w` is an alias, `w.x()` and `Object.keys(w)` read.
+    let unknowns: Vec<_> = writes(&all, "w")
+        .into_iter()
+        .filter(|f| f.parts == vec![JsObjectPart::Unknown])
+        .collect();
+    assert_eq!(unknowns.len(), 3, "foo(w), {{ k: w }}, return w: {all:?}");
+    assert_eq!(declared(&all, "a").alias_of.as_deref(), Some("w"));
+}
+
+#[test]
+fn a_getter_is_opaque_and_a_type_assertion_is_unwrapped() {
+    let all = facts(
+        "a.ts",
+        "const w = { ...core, get info() { return f; }, run() {} };\nconst v = <Logger>{ ...core };\n",
+    );
+    assert_eq!(
+        declared(&all, "w").parts,
+        vec![
+            spread("core"),
+            JsObjectPart::Opaque("info".into()),
+            JsObjectPart::Inline("run".into())
+        ]
+    );
+    assert_eq!(declared(&all, "v").parts, vec![spread("core")]);
+}
+
+#[test]
+fn an_embedded_script_carries_its_facts_at_file_offsets() {
+    let source =
+        "<template><div/></template>\n<script lang=\"ts\">\nconst w = { ...core };\n</script>\n";
+    let all = facts("a.vue", source);
+    let fact = declared(&all, "w");
+    assert!(
+        source[fact.start_byte..].starts_with("w ="),
+        "the fact's offset is in the .vue file's own coordinates: {fact:?}"
+    );
 }

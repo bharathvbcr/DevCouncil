@@ -312,6 +312,26 @@ fn one_identifier_imported_from_two_modules_binds_per_file() {
 }
 
 #[test]
+fn a_default_import_alias_binds_through_the_default_export_object() {
+    let m =
+        "export function info(): void {}\nconst obj = { info(): void {} };\nexport default obj;\n";
+    let user = "import lg from './m';\nconst w = lg;\nexport function run() { w.info(); }\n";
+    let result = resolve(&[("src/m.ts", m), ("src/user.ts", user)]);
+    assert_eq!(
+        targets(&result, "src/user.ts::run"),
+        vec!["src/m.ts::obj.info"]
+    );
+}
+
+#[test]
+fn an_anonymous_default_export_alias_abstains() {
+    let m = "export function info(): void {}\nexport default { info(): void {} };\n";
+    let user = "import lg from './m';\nconst w = lg;\nexport function run() { w.info(); }\n";
+    let result = resolve(&[("src/m.ts", m), ("src/user.ts", user)]);
+    assert!(targets(&result, "src/user.ts::run").is_empty());
+}
+
+#[test]
 fn a_local_that_shadows_the_object_is_not_the_object() {
     binds_nothing(
         "import { core } from './core';\nconst w = { ...core };\nexport function run(w: { info(): void }) { w.info(); }\n",
