@@ -152,6 +152,43 @@ fn a_missing_program_names_itself() {
     );
 }
 
+/// A `#[cfg(test)] mod name;` in the sibling `lib.rs` or `main.rs` is a test
+/// module that lives under `src/` so it can see private items. The `tests/`
+/// directory skip does not cover it, and its fixture `Command::new("git")` is
+/// the same legitimate unbounded spawn the directory skip already allows.
+fn cfg_test_module(path: &std::path::Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    let needle = format!("mod {stem};");
+    for root_name in ["lib.rs", "main.rs"] {
+        let Ok(text) = std::fs::read_to_string(dir.join(root_name)) else {
+            continue;
+        };
+        let mut cfg_test = false;
+        for line in text.lines() {
+            let trim = line.trim();
+            if trim.starts_with("//") {
+                continue;
+            }
+            if trim == "#[cfg(test)]" {
+                cfg_test = true;
+                continue;
+            }
+            if cfg_test && trim == needle {
+                return true;
+            }
+            if !trim.is_empty() {
+                cfg_test = false;
+            }
+        }
+    }
+    false
+}
+
 /// Structural: no library crate's production code spawns a child on its own.
 /// The three runners this module replaced each began as one reasonable
 /// `Command::new`, and the way a fourth arrives is the same — so a new one
@@ -195,6 +232,7 @@ fn every_child_process_in_the_kernel_goes_through_the_runner() {
                 || path
                     .file_name()
                     .is_some_and(|name| name == "subprocess.rs" || name == "build.rs")
+                || cfg_test_module(&path)
             {
                 continue;
             }
