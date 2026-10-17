@@ -97,3 +97,14 @@ ts.SH1a	SH1	apps/web/src/v/fetchmock.test.ts	apps/web/src/v/thingservice.ts::fet
 ts.SH1b	SH1	apps/web/src/v/extbarreluser.ts::describeWidget	apps/web/src/v/thingservice.ts::WidgetProps	forbid_any_tier	must		a type reached through a barrel that re-exports an external package with export * is not the in-repo namesake
 ts.FL1.not	FL1	apps/web/src/v/fieldleak.ts::FlHolderB.go	apps/web/src/v/fieldleak.ts::FlEngine.run	forbid_any_tier	must		FlHolderA typed field engine must not type FlHolderB untyped engine
 ts.FL1.ctl	FL1	apps/web/src/v/fieldleak.ts::FlHolderA.go	apps/web/src/v/fieldleak.ts::FlEngine.run	edge	must		control: the declaring class still binds
+ts.SP1	SP1	apps/web/src/v/spreaduser.ts::useSpread	apps/web/src/v/spreadcore.ts::spreadCore.info	edge	must		const w = { ...core }; w.info() binds the imported core member
+ts.SP2	SP2	apps/web/src/v/spreaduser.ts::useAssign	apps/web/src/v/spreadcore.ts::spreadCore.info	edge	must		const w = Object.assign({}, core); w.info()
+ts.SP3	SP3	apps/web/src/v/spreaduser.ts::useAlias	apps/web/src/v/spreadcore.ts::spreadCore.info	edge	must		export const aliased = core; aliased.info() from another file
+ts.SP4	SP4	apps/web/src/v/spreaduser.ts::useForward	apps/web/src/v/spreadcore.ts::spreadClear	edge	must		forwarding property { clear: spreadClear }; x.clear()
+ts.SP5	SP5	apps/web/src/v/spreaduser.ts::useShorthand	apps/web/src/v/spreadcore.ts::spreadClear	edge	must		shorthand property { spreadClear }; x.spreadClear()
+ts.SP6a	SP6	apps/web/src/v/spreaduser.ts::useLayered	apps/web/src/v/spreadcore.ts::spreadLater.info	edge	must		two spreads define info: the later source wins
+ts.SP6b	SP6	apps/web/src/v/spreaduser.ts::useLayered	apps/web/src/v/spreadcore.ts::spreadCore.info	forbid_any_tier	must		the earlier spread's info is overwritten by the later one
+ts.SP7a	SP7	apps/web/src/v/spreaduser.ts::useOverridden	apps/web/src/v/spreadbuild.ts::overriddenW.info	edge	must		an explicit key after a spread binds the explicit one
+ts.SP7b	SP7	apps/web/src/v/spreaduser.ts::useOverridden	apps/web/src/v/spreadcore.ts::spreadCore.info	forbid_any_tier	must		the spread's info is overwritten by the explicit key
+ts.SP8	SP8	apps/web/src/v/spreaduser.ts::useUnknown	apps/web/src/v/spreadcore.ts::spreadCore.info	forbid_any_tier	must		a later spread of a call result may define info: abstain
+ts.SP9	SP9	apps/web/src/v/spreaduser.ts::useCycle	apps/web/src/v/spreadcore.ts::spreadCore.info	forbid_any_tier	must		a = {...b}; b = {...a} terminates and binds nothing

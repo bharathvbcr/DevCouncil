@@ -712,6 +712,13 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// v95 stamps a Python call reference that is the whole right-hand side of
 /// `self.name = callee(..)` with `assigned_to = "self.name"`, so the resolver
 /// can type the field from its initializer. A v94 row carries `None` there.
+///
+/// v95 also adds `Extraction::js_objects` (JS/TS only): how each module-scope
+/// `const` object is built — its literal members, spreads, `Object.assign`
+/// sources and plain alias, in source order — and every `Object.assign(name,
+/// …)` that writes into one. The field is purely additive (no existing field
+/// changes meaning), and a row cached without it reads as "not collected": the
+/// resolver then abstains instead of treating the literal as the whole object.
 pub const EXTRACTION_SCHEMA_VERSION: &str = "95";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

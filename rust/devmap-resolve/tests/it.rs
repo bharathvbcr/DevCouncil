@@ -143,6 +143,8 @@ mod typescript_core_shapes;
 #[cfg(feature = "parse")]
 mod typescript_interface_dispatch;
 #[cfg(feature = "parse")]
+mod typescript_object_spread;
+#[cfg(feature = "parse")]
 mod unresolved_member;
 
 /// Files that keep a process of their own, and why (see the file's header).

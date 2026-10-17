@@ -70,3 +70,6 @@ V16-lexical-this-arrow	v/lexicalthis.ts::Gateway.open(.connect)	Gateway.buildUrl
 V17-default-param-ref	v/defaults.ts::withDeps	defaultSleep (reference), repoRoot (call)	destructured default parameter values; neither reported dead
 V17-default-param-call	v/defaults.ts::withPlain	plainDefault (call)	simple default parameter call
 V18-ambient-module	v/ambient.d.ts	-	`declare module` augmentation must not be a dead candidate
+V21-object-spread-alias	v/spreaduser.ts::useSpread/useAssign/useAlias	spreadCore.info	a member of an object built by spread, Object.assign or a plain alias is the source object's member
+V21-object-forward	v/spreaduser.ts::useForward/useShorthand	spreadClear	a forwarding or shorthand property is the function it names
+V21-object-precedence	v/spreaduser.ts::useLayered/useOverridden/useUnknown/useCycle	-	last write wins; an unreadable later source or a cycle binds nothing

@@ -969,6 +969,11 @@ fn extract_treesitter_before_deadline(
                     local_bindings,
                     source_code: Some(source.to_string()),
                     literals: Vec::new(),
+                    js_objects: if matches!(lang, "javascript" | "typescript" | "tsx") {
+                        crate::jsobjects::collect(root, source)
+                    } else {
+                        Vec::new()
+                    },
                 };
 
                 // The code inside a template language's `<script>` blocks, in
@@ -2158,6 +2163,7 @@ fn unparsed_extraction(
         local_bindings: Vec::new(),
         source_code: Some(source.to_string()),
         literals: Vec::new(),
+        js_objects: Vec::new(),
     }
 }
 
@@ -2375,6 +2381,7 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
         local_bindings: Vec::new(),
         source_code: Some(source.to_string()),
         literals: Vec::new(),
+        js_objects: Vec::new(),
     }
 }
 
@@ -3886,7 +3893,7 @@ fn rust_crate_private_scopes(
 ///
 /// Module-level bindings are public API surface; a constant declared inside a
 /// function is a local and belongs in nobody's graph.
-fn is_module_level(node: Node) -> bool {
+pub(crate) fn is_module_level(node: Node) -> bool {
     let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         if is_callable_node(parent) {

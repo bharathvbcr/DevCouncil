@@ -10,6 +10,7 @@ use devmap_extract::model::*;
 use crate::model::*;
 
 mod gotypes;
+mod jsobjects;
 
 /// A protocol method's own declaration, and the conformers' declarations of it:
 /// `(file, symbol)` pairs.
@@ -451,6 +452,9 @@ pub struct Resolver {
     /// built from those functions is exactly that. Only a name the literal
     /// itself spells is admitted, so the coincidence stays refused.
     module_value_members: BTreeMap<(String, String), BTreeSet<String>>,
+    /// `file` → how each of its module-scope JS/TS const objects is built, in
+    /// source order. Read only through [`Self::object_member_target`].
+    js_objects: BTreeMap<String, Vec<JsObjectFact>>,
     /// `(file, qualified name)` → the return type a callable's declaration
     /// writes, as the extractor recorded it. What types a factory-built value;
     /// read only through [`Self::factory_return_type`].
@@ -706,6 +710,7 @@ impl Resolver {
             value_imports: BTreeMap::new(),
             module_value_types: BTreeMap::new(),
             module_value_members: BTreeMap::new(),
+            js_objects: BTreeMap::new(),
             return_types: BTreeMap::new(),
             module_value_factories: BTreeMap::new(),
             declared_types: BTreeMap::new(),
@@ -3169,6 +3174,7 @@ impl Resolver {
         self.value_imports.clear();
         self.module_value_types.clear();
         self.module_value_members.clear();
+        self.js_objects.clear();
         self.return_types.clear();
         self.module_value_factories.clear();
         self.declared_types.clear();
@@ -4335,6 +4341,7 @@ impl Resolver {
                 }
             }
             self.index_module_value_types(ext, family);
+            self.index_js_objects(ext);
             // A `let x = self.field` (including through `if` / `&`) takes the
             // field's type, so `x.run()` can dispatch. Field `Type` references
             // are indexed just above; this pass is a second walk so a field
@@ -5727,6 +5734,38 @@ impl Resolver {
                                     target_file,
                                     imported_from: recv.to_string(),
                                 }));
+                            }
+                        }
+                    }
+
+                    // 2a''. A member of a module-scope JS/TS const object built
+                    // by spread, `Object.assign`, an alias or a forwarding
+                    // property (`debugLogger.warn()` for `{ ...core }`): the
+                    // member's own declaration, by JavaScript's last-write-wins
+                    // order. A receiver the call's scope rebinds is not the
+                    // module's object, and a member no step can be proven to
+                    // define falls through to the rungs below unchanged.
+                    if resolution.is_none() && family == LangFamily::JsTs {
+                        if let Some(recv) = call.receiver_expr.as_deref() {
+                            let first = recv.split('.').next().unwrap_or(recv);
+                            let shadowed = ext.local_binding_at(call.span.start_byte, first).is_some()
+                                || call.caller_symbol.as_deref().is_some_and(|scope| {
+                                    self.scope_declares_local(&ext.file_path, scope, first)
+                                });
+                            if !shadowed {
+                                if let Some((target_file, target_symbol)) = self
+                                    .object_member_target(&ext.file_path, recv, &call.callee_name)
+                                {
+                                    resolution = Some(Arc::new(if target_file == ext.file_path {
+                                        Resolution::SameFile { target_symbol, target_file }
+                                    } else {
+                                        Resolution::ImportScoped {
+                                            target_symbol,
+                                            target_file,
+                                            imported_from: recv.to_string(),
+                                        }
+                                    }));
+                                }
                             }
                         }
                     }

@@ -1704,6 +1704,59 @@ pub struct Extraction {
     /// const, so the reader is a site even when the literal is written once.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub literals: Vec<ExtractedLiteral>,
+    /// How each module-scope JS/TS `const` object is built, and every
+    /// `Object.assign(name, …)` that writes into one, in source order.
+    ///
+    /// `const w = { ...core, clear: clearLogs }`, `const w = Object.assign({},
+    /// core)` and `const w = core` all give `w` members its own declaration
+    /// never spells, and the resolver needs the *order* the properties are
+    /// applied in (the last write wins) to say which source owns a key. Empty
+    /// for every other language, and on an extraction cached before this field
+    /// existed — the resolver then abstains rather than read absence as "the
+    /// object has only what its literal spells".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub js_objects: Vec<JsObjectFact>,
+}
+
+/// One statement that decides what members a JS/TS module-scope object has.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JsObjectFact {
+    /// The const the object is bound to, or the identifier an
+    /// `Object.assign` writes into.
+    pub name: String,
+    pub start_byte: usize,
+    /// `true` for the `const name = …` declaration; `false` for an
+    /// `Object.assign(name, …)` that mutates it.
+    pub declaration: bool,
+    /// A mutation written inside a callable: it may run any number of times,
+    /// or never, so the resolver reads it as a source it cannot name.
+    pub in_callable: bool,
+    /// The identifier (or `ns.name`) whose object this declaration *is*, not a
+    /// copy of: `const w = core` and `const w = Object.assign(core, …)`. A
+    /// write through `w` is then a write to `core`'s members too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_of: Option<String>,
+    /// The properties it applies, in the order JavaScript applies them.
+    pub parts: Vec<JsObjectPart>,
+}
+
+/// One step of building an object. Later steps overwrite earlier ones.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JsObjectPart {
+    /// `key() {}` or `key: () => {}`: a function written in place, which the
+    /// extractor already files as the symbol `owner.key`.
+    Inline(String),
+    /// `key: value` or the shorthand `key` where the value is an identifier.
+    Forward { key: String, value: String },
+    /// A key whose value names nothing the extraction can follow
+    /// (`key: make()`, `key: 5`).
+    Opaque(String),
+    /// `...source`, an `Object.assign` source, or the whole right-hand side of
+    /// an alias: an identifier or a one-hop `ns.name`.
+    Spread(String),
+    /// A source or key the extraction cannot read (`...make()`, `[k]: v`,
+    /// `...(a ? b : c)`): it may define any key.
+    Unknown,
 }
 
 /// One string literal and the symbol whose span contains it.
