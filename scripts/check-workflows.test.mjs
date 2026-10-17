@@ -77,6 +77,50 @@ describe("check:workflows", () => {
     assert.equal(uses("codeql.yml"), 1);
   });
 
+  it("pins release actions and keeps contents write off pull_request jobs", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("../.github/workflows/release.yml", import.meta.url)),
+      "utf8",
+    );
+    const head = source.slice(0, source.search(/^jobs\s*:/m));
+    assert.match(head, /"contents": "read"/);
+    assert.doesNotMatch(head, /"contents": "write"/);
+    for (const ref of [
+      "actions/checkout@v7",
+      "actions/setup-node@v7",
+      "actions/setup-go@v7",
+      "actions/upload-artifact@v7",
+      "actions/download-artifact@v8",
+    ]) {
+      assert.equal(source.includes(`uses: ${ref}\n`) || source.includes(`uses: ${ref} `), false, ref);
+    }
+    const pins = {
+      "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1 # v7",
+      "actions/setup-node": "949feb2413d6458794dcd2491c4babbbce0c15c1 # v7",
+      "actions/setup-go": "b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7",
+      "actions/upload-artifact": "cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7",
+      "actions/download-artifact": "9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8",
+    };
+    for (const [action, pin] of Object.entries(pins)) {
+      assert.ok(source.includes(`uses: ${action}@${pin}`), action);
+    }
+    const job = (name) => {
+      const matched = source.match(new RegExp(`\\n  ${name}:\\n([\\s\\S]*?)(?=\\n  [a-z0-9-]+:\\n|$)`));
+      assert.ok(matched, name);
+      return matched[1];
+    };
+    for (const name of ["identity", "plan", "build-local-artifacts", "build-global-artifacts", "announce"]) {
+      assert.match(job(name), /"contents": "read"/, name);
+      assert.doesNotMatch(job(name), /"contents": "write"/, name);
+    }
+    for (const name of ["create-release", "host"]) {
+      assert.match(job(name), /"contents": "write"/, name);
+    }
+    assert.ok(source.includes("persist-credentials: false"));
+    assert.ok(source.includes("dist host --steps=create"));
+    assert.ok(source.includes("dist host ${{ needs.plan.outputs.tag-flag }} --steps=upload --steps=release"));
+  });
+
   it("invokes the archive gate before publishing, including the Windows zip", () => {
     const source = readFileSync(
       fileURLToPath(new URL("../.github/workflows/release.yml", import.meta.url)),
