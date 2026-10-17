@@ -63,6 +63,8 @@ use std::process::Command;
 const CONFIDENT_PRECISION_FLOOR: f64 = 0.95;
 const HONEST_MISS_FLOOR: f64 = 0.98;
 const DEAD_FP_CEILING: f64 = 0.05;
+/// How many ids (or malformed-label reasons) a `dead_unmeasured` block lists.
+const UNMEASURED_SAMPLE_CAP: usize = 5;
 const PRECISION_TOLERANCE: f64 = 0.01;
 const RECALL_TOLERANCE: f64 = 0.02;
 const HIGH_MILLIS: i64 = 900;
@@ -731,53 +733,82 @@ fn score_labels(
         }
 
         // The confident tier is always written, so a row has the shape
-        // `dead_tier_eligibility.rs` reads; `rows: 0` must then mean the
-        // confident branch was empty, so every row in it needs a label.
+        // `dead_tier_eligibility.rs` reads. A confident-branch row nobody
+        // labelled, and a label that cannot be written safely, are not scored
+        // and are never a pass: both are counted and reported as unmeasured
+        // (`dead_unmeasured`), the run goes on, and `dead_fp_rate` then reads
+        // the language's dead gate as unmeasured instead of a rate over a
+        // subset.
         let mut dead_fp: BTreeMap<&str, (usize, usize)> = BTreeMap::from([("0.9", (0, 0))]);
-        let dead_labelled: BTreeSet<&str> = labels
-            .dead
-            .iter()
-            .filter(|l| &l.language == lang)
-            .map(|l| l.id.as_str())
-            .collect();
-        let unlabelled: Vec<&str> = dead_tier
-            .iter()
-            .filter(|(id, (tier, of))| {
-                *tier == "0.9" && of == lang && !dead_labelled.contains(id.as_str())
-            })
-            .map(|(id, _)| id.as_str())
-            .collect();
-        if !unlabelled.is_empty() {
-            return Err(format!(
-                "{} confident-branch dead row(s) of {lang} have no dead label, so the 0.9-tier rate would be over a subset; label them: {}",
-                unlabelled.len(),
-                unlabelled.join(", ")
-            ));
-        }
         let mut labelled_rows = Vec::new();
         let mut unsure = 0;
+        let mut malformed: Vec<String> = Vec::new();
+        let mut malformed_ids: BTreeSet<&str> = BTreeSet::new();
+        let mut well_formed_ids: BTreeSet<&str> = BTreeSet::new();
         for (index, l) in labels
             .dead
             .iter()
             .filter(|l| &l.language == lang)
             .enumerate()
         {
-            // Every label is checked, matched or not: one that could not be
-            // written safely fails the run rather than waiting for the build
-            // to reach it.
+            // Every label is checked, matched or not, so one that could not be
+            // written safely is reported rather than waiting for the build to
+            // reach it.
             let tier = dead_tier.get(&l.id).map(|(tier, _)| *tier);
-            let row = labelled_row(corpus, lang, index, l, tier.unwrap_or("none"))?;
-            if let Some(tier) = tier {
-                labelled_rows.push(row);
-                if l.unsure {
-                    unsure += 1;
-                } else {
-                    let entry = dead_fp.entry(tier).or_default();
-                    entry.1 += 1;
-                    entry.0 += usize::from(!l.truly_dead);
+            match labelled_row(corpus, lang, index, l, tier.unwrap_or("none")) {
+                Err(why) => {
+                    malformed.push(why);
+                    malformed_ids.insert(l.id.as_str());
+                }
+                Ok(row) => {
+                    well_formed_ids.insert(l.id.as_str());
+                    if let Some(tier) = tier {
+                        labelled_rows.push(row);
+                        if l.unsure {
+                            unsure += 1;
+                        } else {
+                            let entry = dead_fp.entry(tier).or_default();
+                            entry.1 += 1;
+                            entry.0 += usize::from(!l.truly_dead);
+                        }
+                    }
                 }
             }
         }
+        // A row whose label is malformed is counted once, as malformed.
+        let unlabelled: Vec<&str> = dead_tier
+            .iter()
+            .filter(|(id, (tier, of))| {
+                *tier == "0.9"
+                    && of == lang
+                    && !well_formed_ids.contains(id.as_str())
+                    && !malformed_ids.contains(id.as_str())
+            })
+            .map(|(id, _)| id.as_str())
+            .collect();
+        // A private corpus's raw ids never reach the committed record; its
+        // sample goes to the run's output instead.
+        let sample: Vec<&str> = unlabelled
+            .iter()
+            .take(UNMEASURED_SAMPLE_CAP)
+            .copied()
+            .collect();
+        if !unlabelled.is_empty() {
+            eprintln!(
+                "{corpus} {lang}: {} confident-branch dead row(s) have no dead label and are unmeasured (first {}): {}",
+                unlabelled.len(),
+                sample.len(),
+                sample.join(", ")
+            );
+        }
+        let malformed_sample: Vec<&String> = malformed.iter().take(UNMEASURED_SAMPLE_CAP).collect();
+        let dead_unmeasured = json!({
+            "unlabelled": unlabelled.len(),
+            "unlabelled_sample": if corpus == OWN_CORPUS { json!(sample) } else { json!([]) },
+            "malformed": malformed.len(),
+            "malformed_sample": malformed_sample,
+            "sample_cap": UNMEASURED_SAMPLE_CAP,
+        });
 
         let recall_total: usize = by_construct.values().map(|c| c.total).sum();
         let recall_present: usize = by_construct.values().map(|c| c.correct).sum();
@@ -806,6 +837,7 @@ fn score_labels(
                     .map(|(tier, (fp, rows))| ((*tier).to_string(), json!({ "false_positive": fp, "rows": rows })))
                     .collect::<Map<String, Value>>(),
                 "labelled_rows": labelled_rows,
+                "dead_unmeasured": dead_unmeasured,
                 "unsure": unsure,
             }),
         );
@@ -821,7 +853,17 @@ fn rate_of(row: &Value, path: &[&str]) -> Option<f64> {
         .and_then(Value::as_f64)
 }
 
+/// Rows the dead gate could not score: confident-branch rows with no label plus
+/// labels that were malformed.
+fn dead_unmeasured_count(row: &Value) -> u64 {
+    let n = |k: &str| row["dead_unmeasured"][k].as_u64().unwrap_or(0);
+    n("unlabelled") + n("malformed")
+}
+
 fn dead_fp_rate(row: &Value) -> Option<f64> {
+    if dead_unmeasured_count(row) > 0 {
+        return None;
+    }
     let tier = &row["dead_fp_by_tier"]["0.9"];
     let (fp, rows) = (tier["false_positive"].as_f64()?, tier["rows"].as_f64()?);
     (rows > 0.0).then(|| fp / rows)
@@ -1608,7 +1650,8 @@ fn a_private_corpus_row_is_written_hashed_with_a_category_never_the_raw_symbol()
 }
 
 #[test]
-fn a_private_label_without_a_hash_or_a_category_fails_naming_the_label_not_its_text() {
+fn a_private_label_without_a_hash_or_a_category_is_reported_malformed_naming_the_label_not_its_text(
+) {
     for (missing, extra) in [
         ("symbol_hash", json!({ "category": "rg_declaration_only" })),
         ("category", json!({ "symbol_hash": "h:0123456789ab" })),
@@ -1629,26 +1672,44 @@ fn a_private_label_without_a_hash_or_a_category_fails_naming_the_label_not_its_t
             json!({ "symbol_hash": "h:0123456789ab", "category": "src/a.rs:12" }),
         ),
     ] {
-        let err = score_dead("Private", &dead_labels(extra.clone())).unwrap_err();
+        // The run goes on: the label is reported, not an error.
+        let scored = score_dead("Private", &dead_labels(extra.clone()))
+            .unwrap_or_else(|e| panic!("{extra}: a malformed label aborted the run: {e}"));
+        let go = &scored["go"];
+        let um = &go["dead_unmeasured"];
+        assert_eq!(um["malformed"], 1, "{extra}: {go}");
+        let reason = um["malformed_sample"][0].as_str().unwrap();
         assert!(
-            err.contains("Private go dead label 0") && err.contains(missing),
-            "{extra}: {err}"
+            reason.contains("Private go dead label 0") && reason.contains(missing),
+            "{extra}: {reason}"
         );
+        let written = go.to_string();
         assert!(
-            !err.contains("probes") && !err.contains("nothing imports"),
-            "{err}"
+            !written.contains("probes") && !written.contains("nothing imports"),
+            "{written}"
         );
+        // Unmeasured, never scored: the malformed row is in neither the rows
+        // nor the rate, and the dead gate cannot read the row as a pass.
+        assert_eq!(go["labelled_rows"].as_array().unwrap().len(), 1, "{go}");
+        assert_eq!(go["dead_fp_by_tier"]["0.9"]["rows"], 1, "{go}");
+        assert_eq!(um["unlabelled"], 0, "counted once, as malformed: {go}");
+        assert_eq!(dead_fp_rate(go), None, "{go}");
     }
 }
 
 #[test]
-#[should_panic(expected = "Private go dead label 0")]
-fn the_run_panics_on_a_private_label_it_cannot_write_safely() {
-    let scored = score_dead(
-        "Private",
-        &dead_labels(json!({ "category": "rg_declaration_only" })),
+fn a_malformed_label_lappi_style_does_not_abort_the_run() {
+    // A label with no `symbol_hash` at all (Lappi's shape) used to make the
+    // whole run return Err; it is now one malformed, unmeasured row.
+    let labels = dead_labels(json!({ "category": "rg_declaration_only" }));
+    let scored = score_dead("Lappi", &labels).expect("the run keeps going");
+    assert_eq!(scored["go"]["dead_unmeasured"]["malformed"], 1);
+    assert!(
+        regression_gates("go", None, &scored["go"], &BTreeMap::new())
+            .iter()
+            .any(|f| f.contains("dead false-positive rate is unmeasured")),
+        "an unmeasured dead rate must be reported as a failed gate"
     );
-    scored.unwrap_or_else(|e| panic!("Private: {e}"));
 }
 
 #[test]
@@ -1660,8 +1721,16 @@ fn a_label_that_matches_no_row_is_still_checked() {
     ];
     dead.push(json!({ "language": "go", "id": "app/gone.go::F", "truly_dead": true }));
     let labels = parse_labels(&json!({ "dead": dead }).to_string()).unwrap();
-    let err = score_dead("Private", &labels).unwrap_err();
-    assert!(err.contains("Private go dead label 2"), "{err}");
+    let scored = score_dead("Private", &labels).expect("a malformed label does not abort");
+    let um = &scored["go"]["dead_unmeasured"];
+    assert_eq!(um["malformed"], 1, "{um}");
+    assert!(
+        um["malformed_sample"][0]
+            .as_str()
+            .unwrap()
+            .contains("Private go dead label 2"),
+        "{um}"
+    );
 }
 
 #[test]
@@ -1672,7 +1741,8 @@ fn devcouncils_own_rows_keep_their_symbol_and_evidence() {
     assert_eq!(rows[0]["symbol"], PRIVATE_SYMBOL);
     assert_eq!(rows[0]["evidence"], "rg -uu -w deadPriv: declaration only");
     // Its own corpus needs no hash, and still needs its evidence.
-    assert!(score_dead(OWN_CORPUS, &dead_labels(json!({}))).is_err());
+    let missing = score_dead(OWN_CORPUS, &dead_labels(json!({}))).unwrap();
+    assert_eq!(missing["go"]["dead_unmeasured"]["malformed"], 1);
 }
 
 #[test]
@@ -1737,9 +1807,9 @@ fn a_runner_row_never_supersedes_the_labelled_dead_record() {
 
 /// A pinned language the labels say nothing about gets no row: an empty row
 /// would read as measured. A row that is written carries `dead_fp_by_tier.0.9`
-/// (the shape `dead_tier_eligibility.rs` requires of every row), and that needs
-/// every confident-branch dead row of the language labelled - an unlabelled
-/// one is an error, never a row quietly left out of `rows`.
+/// (the shape `dead_tier_eligibility.rs` requires of every row). A
+/// confident-branch dead row nobody labelled is counted in `dead_unmeasured`,
+/// never quietly left out of `rows` and never a pass.
 #[test]
 fn a_scored_row_is_written_only_for_a_labelled_language_and_carries_the_confident_dead_tier() {
     let (dir, _) = go_fixture_checkout("rows");
@@ -1772,8 +1842,46 @@ fn a_scored_row_is_written_only_for_a_labelled_language_and_carries_the_confiden
         .to_string(),
     )
     .unwrap();
-    let err = score_labels("Fixture", &built, &partial, &languages).unwrap_err();
-    assert!(err.contains("app/svc/probes.go::fast.unusedM"), "{err}");
+    // An unlabelled confident row no longer aborts the run: it is counted as
+    // unmeasured, the labelled row is scored as before, and the dead gate
+    // reads unmeasured rather than a rate over the subset.
+    let scored = score_labels("Fixture", &built, &partial, &languages)
+        .expect("an unlabelled confident row does not abort the run");
+    let go = &scored["go"];
+    assert_eq!(go["dead_unmeasured"]["unlabelled"], 1, "{go}");
+    assert_eq!(go["dead_unmeasured"]["malformed"], 0, "{go}");
+    assert_eq!(
+        go["dead_fp_by_tier"]["0.9"],
+        json!({ "false_positive": 0, "rows": 1 }),
+        "the labelled row scores exactly as before: {go}"
+    );
+    assert_eq!(dead_fp_rate(go), None, "an unlabelled row is never a pass");
+    // DevCouncil's own rows carry the id sample; a private corpus's do not.
+    assert_eq!(
+        go["dead_unmeasured"]["unlabelled_sample"],
+        json!([]),
+        "{go}"
+    );
+    let own_labels = parse_labels(
+        &json!({
+            "recall": recall,
+            "dead": [{ "language": "go", "id": "app/svc/probes.go::deadPriv",
+                       "truly_dead": true, "evidence": "rg -uu -w deadPriv: declaration only" }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let own = score_labels(OWN_CORPUS, &built, &own_labels, &languages).unwrap();
+    assert_eq!(
+        own["go"]["dead_unmeasured"]["unlabelled_sample"],
+        json!(["app/svc/probes.go::fast.unusedM"]),
+        "{}",
+        own["go"]
+    );
+    // The fully labelled fixture reports nothing unmeasured and has a rate.
+    let full = score_labels("Fixture", &built, &labels, &languages).unwrap();
+    assert_eq!(dead_unmeasured_count(&full["go"]), 0, "{}", full["go"]);
+    assert_eq!(dead_fp_rate(&full["go"]), Some(0.0));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

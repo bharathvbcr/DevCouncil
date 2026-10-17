@@ -144,10 +144,22 @@ Labels file shape:
   method it implements); edges from callers it did not read (build-tagged
   files) stay unjudged. It depends on the corpus alone, so it does not go
   stale when DevMap's edges move.
-* `dead` must label every confident-branch dead row of each language the file
-  labels: the row always carries `dead_fp_by_tier.0.9`, and `rows: 0` must
-  mean the confident branch was empty. An unlabelled one is an error naming it;
-  an `unsure` label counts as labelled (it is listed, scored neither way).
+* `dead` should label every confident-branch dead row of each language the
+  file labels; the row always carries `dead_fp_by_tier.0.9`, which counts only
+  the rows that were scored. A confident row with no label does not abort the
+  run: it is counted as unmeasured, per corpus and language, in the row's
+  `dead_unmeasured` block (`unlabelled`, a capped `unlabelled_sample` of ids,
+  `sample_cap`). The sample is filled for DevCouncil's own corpus only; a
+  private corpus's raw ids go to the run's stderr, never the committed record.
+  A label that cannot be written safely (a private label missing or misshaping
+  `symbol_hash` or `category`, or an own-corpus label missing `evidence`) is
+  likewise reported, as `malformed` with a capped `malformed_sample` of
+  reasons that name the label's index and never its text, and is left out of
+  the rows and the rate. A row whose label is malformed is counted once, as
+  malformed. A language with any unlabelled or malformed dead row has an
+  unmeasured 0.9-tier dead false-positive gate, which fails: unmeasured is
+  never a pass, and the labelled rows are scored exactly as before. An
+  `unsure` label counts as labelled (it is listed, scored neither way).
 * A pinned language the file says nothing about gets no `corpora` row at all
   (its gates stay unmeasured), never an empty one.
 
