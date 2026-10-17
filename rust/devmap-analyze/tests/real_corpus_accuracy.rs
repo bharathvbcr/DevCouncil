@@ -1441,8 +1441,14 @@ fn copy_tree(from: &Path, to: &Path) {
 
 /// A committed git checkout of the Go fixture, standing in for a corpus.
 fn go_fixture_checkout(label: &str) -> (PathBuf, String) {
+    fixture_checkout("go", label)
+}
+
+/// A committed audit fixture as a one-commit repository: the shape a corpus
+/// checkout has, so the corpus scorer reads it unchanged.
+fn fixture_checkout(fixture: &str, label: &str) -> (PathBuf, String) {
     let dir = scratch(label);
-    copy_tree(&accuracy_root().join("go"), &dir);
+    copy_tree(&accuracy_root().join(fixture), &dir);
     let run = |args: &[&str]| git(&dir, args).unwrap();
     run(&["init", "-q"]);
     run(&["add", "-A"]);
@@ -1949,6 +1955,93 @@ fn the_go_oracle_labels_name_the_fixture_build_and_score_it_clean() {
     assert!(go["recall"]["total"].as_u64().unwrap() > 50, "{go}");
     assert_eq!(go["recall"]["present"], go["recall"]["total"], "{go}");
     assert_eq!(go["honest_miss"]["absent"], 0, "{go}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The committed Rust oracle labels (`rust.labels.json`, written by
+/// `rust/tools/rustlabel -root rust/testdata/accuracy/rust`) scored against the
+/// Rust fixture build. Every id the oracle names is one the build has, so the
+/// labeller's symbol ids and DevMap's agree; the two recall classes the Rust
+/// gates are set on are both measured, and every labelled site has its edge.
+/// Precision is not perfect, and the one edge it loses is named below: an
+/// oracle that binds written names does not see through a `const` function
+/// pointer.
+#[test]
+fn the_rust_oracle_labels_name_the_fixture_build_and_score_it() {
+    let (dir, _) = fixture_checkout("rust", "rustlabel");
+    let built = common::build(&dir);
+    let path = accuracy_root().join("rust.labels.json");
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let labels = parse_labels(&raw).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+
+    let known: BTreeSet<&str> = built
+        .extractions
+        .iter()
+        .flat_map(|x| {
+            std::iter::once(x.file_path.as_str())
+                .chain(x.symbols.iter().map(|s| s.qualified_name.as_str()))
+        })
+        .collect();
+    let mut unknown: BTreeSet<&str> = BTreeSet::new();
+    for l in &labels.recall {
+        assert_eq!(l.language, "rust", "{l:?}");
+        assert!(
+            matches!(l.construct.as_str(), "free_self" | "non_self"),
+            "a Rust row must carry a class the gates read: {l:?}"
+        );
+        unknown.extend(
+            std::iter::once(l.caller.as_str())
+                .chain(l.truth.split('|'))
+                .filter(|id| !known.contains(id)),
+        );
+    }
+    for o in &labels.oracle {
+        assert_eq!(o.language, "rust");
+        unknown.extend(
+            o.covered_callers
+                .iter()
+                .map(String::as_str)
+                .filter(|id| !known.contains(id)),
+        );
+        unknown.extend(
+            o.uses
+                .iter()
+                .map(|(_, callee)| callee.as_str())
+                .filter(|id| !known.contains(id)),
+        );
+    }
+    assert!(
+        unknown.is_empty(),
+        "the oracle names ids the build does not have, so its id scheme and DevMap's disagree: {unknown:#?}"
+    );
+
+    let scored = score_labels("Fixture", &built, &labels, &["rust".to_string()]).unwrap();
+    let rust = &scored["rust"];
+    eprintln!(
+        "rust fixture scored against rustlabel: recall {} honest_miss {} unique {}",
+        rust["recall"], rust["honest_miss"], rust["unique_global_precision"]
+    );
+    let precision = &rust["confident_edge_precision"];
+    let (total, correct) = (
+        precision["total"].as_u64().unwrap(),
+        precision["correct"].as_u64().unwrap(),
+    );
+    assert!(total > 50, "{rust}");
+    // `c24_caller -> helper_c24` is DevMap seeing through `const FPTR_C24:
+    // fn() -> u8 = helper_c24; ... FPTR_C24()`. rust-analyzer binds the call to
+    // the const, which is not a function, so the oracle has no such use: the
+    // edge is judged wrong without being wrong. Nothing else may be.
+    assert!(total - correct <= 1, "{rust}");
+    for class in ["free_self", "non_self"] {
+        let counts = &rust["recall"]["by_construct"][class];
+        assert!(
+            counts["total"].as_u64().unwrap() > 20,
+            "{class} is not measured on the fixture: {rust}"
+        );
+        assert_eq!(counts["correct"], counts["total"], "{class}: {rust}");
+    }
+    assert_eq!(rust["recall"]["present"], rust["recall"]["total"], "{rust}");
+    assert_eq!(rust["honest_miss"]["absent"], 0, "{rust}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

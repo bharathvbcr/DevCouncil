@@ -18,6 +18,7 @@ members = [
     "devmap-serve",
     "devmap-cli",
     "tools/soak",
+    "tools/rustlabel",
 ]
 
 # The kernel is built rarely and run on every agent turn. Its hot loops —

@@ -184,6 +184,97 @@ labeller; `the_go_oracle_labels_name_the_fixture_build_and_score_it_clean`
 scores DevMap against it, so the labeller's symbol ids and DevMap's are held
 equal on every construct the fixture has.
 
+**Rust labels** come from `rust/tools/rustlabel` (workspace member
+`devmap-rustlabel`, `publish = false`, `dist = false`, so no released binary
+links it, like `tools/soak`). It asks rust-analyzer `textDocument/definition`
+at every call, method call, function used as a value and overloadable operator
+in every `.rs` file DevMap indexes, through the one language-server client the
+workspace has (`devmap-resolve`'s `lsp.rs`, extended with a session API for
+it), and writes the same file `golabel` writes. It adds no dependency: the
+walk is `tree-sitter-rust`, the symbol ids come from `devmap_extract`.
+
+```text
+cargo run --release -p devmap-rustlabel --manifest-path rust/Cargo.toml -- \
+  -root <checkout> [-dead <dead.json>] \
+  -o <checkout>/.devmap-accuracy/labels.json \
+  -report <checkout>/.devmap-accuracy/rustlabel-report.json \
+  -trace <checkout>/.devmap-accuracy/rustlabel-trace.txt
+```
+
+Needs `rust-analyzer` and the `rust-src` component for the toolchain that runs
+in the checkout (`rustup component add rust-src`); without std sources every
+call that goes through a std type is unanswerable, so it refuses to start. It
+starts rust-analyzer with `CARGO_NET_OFFLINE` (pass `-online` for a checkout
+whose dependencies are not fetched) and a build directory of its own (the
+checkout is never written; `-target-dir` keeps one between runs).
+`-max-sites`, `-deadline-secs`, `-request-secs` and `-load-secs` bound it; the
+defaults are 2,000,000 sites, 4 h, 30 s and 15 min. `-no-references` labels
+calls only.
+
+`rust.labels.json` beside this README is its output on the Rust fixture. Its
+golden test (`cargo test -p devmap-rustlabel --test it golden -- --ignored`,
+`RUSTLABEL_UPDATE=1` to rewrite) keeps the file equal to the labeller; it is
+`#[ignore]`d because it needs rust-analyzer and `rust-src`, so a default run
+reports it as ignored, never as passed, and an explicit run without them
+fails. `the_rust_oracle_labels_name_the_fixture_build_and_score_it` (in
+`real_corpus_accuracy.rs`, runs everywhere) scores DevMap against the file:
+every id is one the build has, both recall classes are measured, every labelled
+site has its edge, and the one confident edge the oracle judges wrong is named
+in the test.
+
+What a label is worth:
+
+* A site rust-analyzer cannot answer is **unknown, never a label**, and its
+  caller is left out of the oracle's `covered_callers`, so DevMap's edges from
+  it are unjudged, not judged wrong. The report counts every site once:
+  `labelled + external + unknown + skipped = sites_enumerated`, by reason
+  (`no_answer`, `request_error`, `session_lost`, `deadline`, `target_unnamed`,
+  `mixed_targets`, `impls_unanswered`, `operator_unresolved`, `over_cap`,
+  `non_function_target`, `not_in_repo_name`), and `asked` against `-max-sites`
+  carries the cap. A session that dies mid-run keeps its labels and counts the
+  rest as `session_lost`; a workspace that does not load, or reports
+  `health: error`, produces no file.
+* "Defined outside the repository" (`external`) is an answer; it labels nothing
+  and does not uncover the caller.
+* A site that spells no function name the corpus declares (nor a `use ... as`
+  alias) is not asked (`not_in_repo_name`): it cannot bind in the repository.
+  A function a macro generates under a name no `fn` item spells is invisible to
+  that rule.
+* Trait methods: a call bound to a trait method's declaration has `truth`
+  `decl|impl|impl...` (`textDocument/implementation`), the same shape as Go's
+  interface dispatch; a call bound to a trait implementation's method also
+  accepts the trait's declaration (`textDocument/declaration`), because DevMap
+  keeps the written type (`impl Trait` returns) and rust-analyzer does not.
+* Macros: the grammar does not parse a macro's arguments. A call inside one is
+  not a site, and any macro invocation or `macro_rules!` body that spells the
+  name of a corpus function, and every invocation of a macro the corpus defines,
+  uncovers its caller.
+* Operators, `?` and indexing are sites (`non_self`), asked at the operator
+  token. rust-analyzer answers for whichever token neighbours the offset, so an
+  operator answer counts only when it is a function the operator's trait names;
+  otherwise it is `operator_unresolved` (unknown). `t[0]` is always that.
+* **Implicit calls are not seen**: scope-end `Drop`, `.into()` reaching `From`,
+  `for` reaching `IntoIterator`, `{}` reaching `Display`, deref coercion, and a
+  call through a `const` function pointer. A confident DevMap edge that rests
+  on one is judged wrong by the oracle without being wrong, so precision over a
+  corpus is a **lower bound**. The report lists, by name, the std-trait method
+  names the corpus declares (`implicit_callee_names`: `drop`, `from`, `next`,
+  `fmt`, ...); read the precision number against it.
+* Symbol ids are DevMap's own (`devmap_extract`'s qualified names), because
+  they are the join key. A naming defect in the extractor therefore appears on
+  both sides of a label and is not caught by it; a binding defect is.
+* Classes: `free_self` is a bare or module-qualified call, a function used as a
+  value, and anything through the enclosing type (`self.m()`, `Self::f()`);
+  `non_self` is a method call on any other receiver, a path to a method of a
+  named type or trait, and an operator.
+* Code behind a `cfg` that is off, a crate outside the Cargo workspace
+  (`tauri_like` in the fixture) and a file no crate includes are `no_answer`.
+  Proc-macro-generated and build-script-generated code resolves only when the
+  build ran (`-no-build-scripts` turns it off).
+
+`-trace` writes one line per site (`file:line name outcome`); it names private
+symbols, so keep it beside the corpus.
+
 For Rust, `construct` is `free_self` or `non_self`, the two classes the recall
 floors (Rust 91 / 46) are set on. The gates: confident precision >= 0.95,
 honest-miss >= 98%, 0.9-tier dead false positives <= 5%, no regression against the
