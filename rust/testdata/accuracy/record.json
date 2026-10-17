@@ -1696,7 +1696,7 @@
         "found": 2,
         "truly_dead": 2
       },
-      "devmap_commit": "8bb03e20ab993a4ef38bd3116357ec128e722f65",
+      "devmap_commit": "ce893921c07e99e66adf9bf978a6ad1c36fbba3b",
       "expected_edge_rows": 51,
       "forbid_any_tier_rows": 2,
       "forbid_rows": 6,
@@ -1718,7 +1718,7 @@
         "found": 1,
         "truly_dead": 1
       },
-      "devmap_commit": "8bb03e20ab993a4ef38bd3116357ec128e722f65",
+      "devmap_commit": "ce893921c07e99e66adf9bf978a6ad1c36fbba3b",
       "expected_edge_rows": 69,
       "forbid_any_tier_rows": 4,
       "forbid_rows": 11,
@@ -1740,7 +1740,7 @@
         "found": 90,
         "truly_dead": 90
       },
-      "devmap_commit": "8bb03e20ab993a4ef38bd3116357ec128e722f65",
+      "devmap_commit": "ce893921c07e99e66adf9bf978a6ad1c36fbba3b",
       "expected_edge_rows": 75,
       "forbid_any_tier_rows": 22,
       "forbid_rows": 36,
@@ -1762,7 +1762,7 @@
         "found": 1,
         "truly_dead": 1
       },
-      "devmap_commit": "8bb03e20ab993a4ef38bd3116357ec128e722f65",
+      "devmap_commit": "ce893921c07e99e66adf9bf978a6ad1c36fbba3b",
       "expected_edge_rows": 115,
       "forbid_any_tier_rows": 1,
       "forbid_rows": 8,
@@ -1784,7 +1784,7 @@
         "found": 1,
         "truly_dead": 1
       },
-      "devmap_commit": "8bb03e20ab993a4ef38bd3116357ec128e722f65",
+      "devmap_commit": "ce893921c07e99e66adf9bf978a6ad1c36fbba3b",
       "expected_edge_rows": 106,
       "forbid_any_tier_rows": 5,
       "forbid_rows": 12,
@@ -1806,11 +1806,11 @@
         "found": 4,
         "truly_dead": 4
       },
-      "devmap_commit": "8bb03e20ab993a4ef38bd3116357ec128e722f65",
-      "expected_edge_rows": 73,
-      "forbid_any_tier_rows": 3,
-      "forbid_rows": 5,
-      "high_edges_correct": 71,
+      "devmap_commit": "ce893921c07e99e66adf9bf978a6ad1c36fbba3b",
+      "expected_edge_rows": 80,
+      "forbid_any_tier_rows": 7,
+      "forbid_rows": 9,
+      "high_edges_correct": 78,
       "high_edges_false": 0,
       "honest_miss": {
         "absent": 0,
@@ -1818,7 +1818,7 @@
         "recorded": 0
       },
       "precision_at_0.9": 1.0,
-      "present": 73,
+      "present": 80,
       "recall": 1.0
     }
   },
