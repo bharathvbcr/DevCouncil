@@ -50,6 +50,56 @@ impl Relation {
     }
 }
 
+/// The reference name recorded, in position, for a Python positional base
+/// that names no class: `*mixins`, `make_base()`, `A if c else B`. It is no
+/// identifier, so it can never equal a declared class; the resolver reads it
+/// as an unknown class that may define any method and does not resolve it.
+pub const OPAQUE_BASE: &str = "<opaque>";
+
+/// The expression that names a Python base: parentheses and a subscript
+/// (`Base[int]`) are stripped to the value they wrap. The node itself when it
+/// is anything else.
+fn python_base_expression(base: Node) -> Node {
+    let mut current = base;
+    for _ in 0..64 {
+        let inner = match current.kind() {
+            "parenthesized_expression" => current.named_child(0),
+            "subscript" => current.child_by_field_name("value"),
+            _ => None,
+        };
+        match inner {
+            Some(inner) => current = inner,
+            None => break,
+        }
+    }
+    current
+}
+
+/// The names a Python base records: a dotted name as one name per segment,
+/// the member first and then the qualifier from the root down (`C`, `a`, `b`
+/// for `a.b.C`), over the one span of the base. Anything that is not a dotted
+/// name of plain identifiers is the single [`OPAQUE_BASE`] marker.
+///
+/// Spelled here rather than left to `names_under`'s traversal and the sort's
+/// tie-break by name, because the order is the only thing that says which
+/// segment is the class and how the qualifier reads: `treesitter` keeps the
+/// emission order of Python heritage rows that share a span.
+fn python_base_names(clause: Node, source: &str) -> Vec<String> {
+    let segments: Vec<&str> = text(clause, source).split('.').map(str::trim).collect();
+    let plain = crate::treesitter::python_is_dotted_name(clause)
+        && segments.iter().all(|segment| {
+            !segment.is_empty() && segment.chars().all(|c| c.is_alphanumeric() || c == '_')
+        });
+    if let (true, Some((member, qualifier))) = (plain, segments.split_last()) {
+        std::iter::once(member)
+            .chain(qualifier)
+            .map(|segment| segment.to_string())
+            .collect()
+    } else {
+        vec![OPAQUE_BASE.to_string()]
+    }
+}
+
 fn text<'a>(node: Node, source: &'a str) -> &'a str {
     source
         .get(node.start_byte()..node.end_byte())
@@ -292,19 +342,23 @@ fn heritage_clauses<'a>(
             // `argument_list` and a metaclass keyword argument lives there too.
             // Only the positional entries are bases: `metaclass=M` and any
             // other `k=v` configure the class statement and are not in its MRO.
-            // A subscripted base (`Base[int]`) is the base named by its value.
+            // A subscripted base (`Base[int]`) is the base named by its value,
+            // and parentheses around a base are no part of it. A positional
+            // base that is none of a name, an attribute or a subscript of one
+            // (`*mixins`, `make_base()`, `A if c else B`) is still a base, in
+            // its position, whose class nothing here can name: it is pushed as
+            // it stands and `push_heritage_references` records the
+            // [`OPAQUE_BASE`] marker for it.
             ("python", "argument_list") => {
                 let mut inner = child.walk();
                 for base in child.named_children(&mut inner) {
-                    let base = match base.kind() {
-                        "identifier" | "attribute" => base,
-                        "subscript" => match base.child_by_field_name("value") {
-                            Some(value) => value,
-                            None => continue,
-                        },
-                        _ => continue,
-                    };
-                    clauses.push((Relation::Extends, base));
+                    if matches!(
+                        base.kind(),
+                        "comment" | "keyword_argument" | "dictionary_splat"
+                    ) {
+                        continue;
+                    }
+                    clauses.push((Relation::Extends, python_base_expression(base)));
                 }
                 continue;
             }
@@ -548,8 +602,13 @@ pub(crate) fn push_heritage_references(
     let enclosing = format!("{file_symbol_name}::{declarer}");
 
     for (relation, clause) in clauses {
-        let mut names = Vec::new();
-        names_under(clause, source, &mut names);
+        let names = if lang == "python" {
+            python_base_names(clause, source)
+        } else {
+            let mut names = Vec::new();
+            names_under(clause, source, &mut names);
+            names
+        };
         for name in names {
             // A type never extends itself. Python's `argument_list` also
             // carries `metaclass=…` keyword arguments, and a self-reference

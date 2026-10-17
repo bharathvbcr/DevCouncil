@@ -832,11 +832,22 @@ fn extract_treesitter_before_deadline(
                     );
                     rust_calls_through_fn_pointer_items(root, source, &mut calls);
                 }
+                // Ties on a span break by name, except for a Python base: its
+                // segments share the base's one span and their emission order
+                // (member, then qualifiers innermost out) is what says which
+                // segment is the class, so the sort keeps it.
+                fn tie_name<'r>(lang: &str, reference: &'r ExtractedReference) -> &'r str {
+                    if lang == "python" && reference.kind == ReferenceKind::Heritage {
+                        ""
+                    } else {
+                        reference.name.as_str()
+                    }
+                }
                 references.sort_by(|a, b| {
-                    (a.span.start_byte, a.span.end_byte, &a.name).cmp(&(
+                    (a.span.start_byte, a.span.end_byte, tie_name(lang, a)).cmp(&(
                         b.span.start_byte,
                         b.span.end_byte,
-                        &b.name,
+                        tie_name(lang, b),
                     ))
                 });
 
@@ -11680,7 +11691,7 @@ fn python_self_field_binding(assignment: Node, origin: Node, source: &str) -> Op
 }
 
 /// `name` or `a.b.c`, with nothing but identifiers in it.
-fn python_is_dotted_name(node: Node) -> bool {
+pub(crate) fn python_is_dotted_name(node: Node) -> bool {
     match node.kind() {
         "identifier" => true,
         "attribute" => {
@@ -11708,6 +11719,31 @@ fn python_parameter_name<'a>(parameter: Node<'a>, source: &str) -> Option<String
             .map(|name| get_node_text(name, source)),
         _ => None,
     }
+}
+
+/// Whether a decorator makes its method take no instance: its expression is
+/// `staticmethod` or `classmethod`, or an attribute path ending in one
+/// (`builtins.staticmethod`, `__import__('builtins').staticmethod`).
+///
+/// Read from the expression node, not the decorator's text: the text carries a
+/// trailing comment (`@classmethod  # build`), which is no part of the
+/// expression. Any other expression leaves the method an instance method.
+fn python_decorator_drops_instance(decorator: Node, source: &str) -> bool {
+    let mut cursor = decorator.walk();
+    let expression = decorator
+        .named_children(&mut cursor)
+        .find(|child| child.kind() != "comment");
+    let last = match expression {
+        Some(node) if node.kind() == "identifier" => Some(node),
+        Some(node) if node.kind() == "attribute" => node.child_by_field_name("attribute"),
+        _ => None,
+    };
+    last.is_some_and(|name| {
+        matches!(
+            get_node_text(name, source).as_str(),
+            "staticmethod" | "classmethod"
+        )
+    })
 }
 
 /// Whether the `self` an assignment names is the instance of a class: the
@@ -11761,11 +11797,8 @@ fn python_self_names_an_instance(assignment: Node, source: &str) -> bool {
                     let mut cursor = wrapper.walk();
                     let mut decorators = wrapper.named_children(&mut cursor);
                     decorators.any(|decorator| {
-                        decorator.kind() == "decorator" && {
-                            let text = get_node_text(decorator, source);
-                            let name = text.trim_start_matches('@').trim();
-                            name == "staticmethod" || name == "classmethod"
-                        }
+                        decorator.kind() == "decorator"
+                            && python_decorator_drops_instance(decorator, source)
                     })
                 });
             }

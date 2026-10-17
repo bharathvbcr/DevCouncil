@@ -1263,8 +1263,10 @@ fn external_supertypes<'e>(
             continue;
         }
         // A dotted base arrives as one `Heritage` reference per segment over
-        // one span, innermost first (`Function`, `autograd`, `torch`), so the
-        // written base is the segments reversed; the bare name is the first.
+        // one span. Python records the member first and the qualifier from the
+        // root down (`Function`, `torch`, `autograd`); the other languages
+        // record it innermost first (`Function`, `autograd`, `torch`), so the
+        // written base is the segments reversed. The bare name is the first.
         let mut bases: Vec<(&str, usize, Vec<&str>)> = Vec::new();
         for reference in &ext.references {
             // `implements` names an interface, which has no code to call with.
@@ -1289,10 +1291,26 @@ fn external_supertypes<'e>(
         }
         for (declarer, _, segments) in bases {
             let base = segments[0].rsplit('.').next().unwrap_or(segments[0]);
-            if base.is_empty() || supertype_dispatches_nothing(base) {
+            // A base no name denotes is a marker for the resolver's MRO walk,
+            // not a supertype this report can name.
+            if base.is_empty()
+                || base == devmap_extract::heritage::OPAQUE_BASE
+                || supertype_dispatches_nothing(base)
+            {
                 continue;
             }
-            let written: Vec<&str> = segments.iter().rev().copied().collect();
+            // A Python base is the member first and then the qualifier from
+            // the root down, so the written path is the qualifier and then the
+            // member; the other languages record theirs innermost first.
+            let written: Vec<&str> = if ext.code_language() == "python" {
+                segments[1..]
+                    .iter()
+                    .chain(&segments[..1])
+                    .copied()
+                    .collect()
+            } else {
+                segments.iter().rev().copied().collect()
+            };
             if devmap_extract::wiring::known_dispatch_contract(&import_qualified(ext, &written)) {
                 continue;
             }

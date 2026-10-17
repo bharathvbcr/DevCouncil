@@ -349,3 +349,43 @@ fn a_go_embedding_names_the_type_only() {
         extraction.references
     );
 }
+
+fn python_bases(source: &str) -> Vec<(String, usize)> {
+    extract_file("w.py", source)
+        .references
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Heritage)
+        .map(|r| (r.name.clone(), r.span.start_byte))
+        .collect()
+}
+
+/// A positional base that names no class keeps its position as the opaque
+/// marker; keyword arguments and `**kw` are not bases; parentheses and a
+/// subscript are stripped to the name they wrap.
+#[test]
+fn a_python_base_no_name_denotes_is_an_opaque_marker_in_position() {
+    use devmap_extract::heritage::OPAQUE_BASE;
+    let names = |source: &str| -> Vec<String> {
+        python_bases(source)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    };
+    assert_eq!(
+        names("class W(*mixins, Base, make(), A if c else B, (Paren), Gen[int], **kw, metaclass=M):\n    pass\n"),
+        [OPAQUE_BASE, "Base", OPAQUE_BASE, OPAQUE_BASE, "Paren", "Gen"]
+    );
+    // An attribute whose object is not a plain name is not a dotted base.
+    assert_eq!(names("class W(f().Base):\n    pass\n"), [OPAQUE_BASE]);
+}
+
+/// A dotted Python base is one reference per segment over one span, the
+/// member first and then the qualifier from the root down, whatever the
+/// segments' spelling — an upper-case root must not sort ahead of its member.
+#[test]
+fn a_dotted_python_base_keeps_member_first_then_qualifier_root_down() {
+    let bases = python_bases("class W(Zed.mid.base):\n    pass\n");
+    let names: Vec<&str> = bases.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["base", "Zed", "mid"], "{bases:?}");
+    assert!(bases.iter().all(|(_, start)| *start == bases[0].1));
+}

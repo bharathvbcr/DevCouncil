@@ -10,6 +10,7 @@
 //! the name was proven to live in.
 
 use super::*;
+use devmap_extract::heritage::OPAQUE_BASE;
 
 /// What a Python call on a class resolves to: the declaring file, the method's
 /// identity, and the class that declares it (which is a base class when the
@@ -27,6 +28,29 @@ pub(super) struct PythonMethod {
 pub(super) enum MroNode {
     Class(String, String),
     Opaque(String),
+}
+
+/// What one Python import statement binds a local name to. A file's imports
+/// bind a name once only when they agree on one of these.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum PythonImportBind {
+    /// `import a.b.c`: the package `a` (payload `a`), whatever else is imported
+    /// under it. `import a.x` and `import a.y` bind the same package.
+    Package(String),
+    /// `import a.b as m`: the module `a.b`.
+    Module(String),
+    /// `from a import n [as m]`: the member spelled `a.n`, a submodule or a
+    /// name the module declares.
+    Member(String),
+}
+
+impl PythonImportBind {
+    /// The dotted module path a member access on the bound name starts from.
+    fn module_spec(&self) -> String {
+        match self {
+            Self::Package(spec) | Self::Module(spec) | Self::Member(spec) => spec.clone(),
+        }
+    }
 }
 
 /// Why the file-scoped walk gave no linearization.
@@ -54,6 +78,12 @@ impl Resolver {
     /// class declared elsewhere. `None` when the name is neither, or is
     /// declared twice in the file.
     pub(super) fn python_class_named(&self, file: &str, written: &str) -> Option<(String, String)> {
+        // `m.A`, written through a module the file imports: the same reading a
+        // dotted base gets, and none when the root is not bound exactly once.
+        if let Some((root, member)) = written.split_once('.') {
+            let binds = self.python_import_binds.get(file)?.get(root)?;
+            return self.python_dotted_class(file, root, member, binds);
+        }
         let is_class = |path: &str, identity: &str| {
             self.symbol_index
                 .get(identity.rsplit("::").next().unwrap_or(identity))
@@ -160,6 +190,16 @@ impl Resolver {
         match self.python_mro_method(class_file, type_key, method) {
             MroAnswer::Found(found) => Some(found),
             MroAnswer::Abstain => None,
+            // The flat table keeps no position and no unnamed bases, so it
+            // cannot speak for a class that writes one.
+            MroAnswer::NotScoped
+                if self
+                    .python_bases
+                    .get(&(class_file.to_string(), type_key.to_string()))
+                    .is_some_and(|bases| bases.iter().any(|base| base == OPAQUE_BASE)) =>
+            {
+                None
+            }
             MroAnswer::NotScoped => self.python_inherited_method(type_key, method),
         }
     }
@@ -208,11 +248,10 @@ impl Resolver {
     /// [`MroStop::NotScoped`].
     fn python_mro_node(&self, file: &str, written: &str) -> Result<MroNode, MroStop> {
         if let Some((root, member)) = written.split_once('.') {
-            let Some((module_file, _)) = self
-                .import_bindings
+            let Some(binds) = self
+                .python_import_binds
                 .get(file)
                 .and_then(|bound| bound.get(root))
-                .filter(|_| !self.is_value_import(file, root))
             else {
                 return if self.python_name_is_imported(file, root) {
                     Ok(MroNode::Opaque(written.to_string()))
@@ -225,18 +264,12 @@ impl Resolver {
                     Ok(MroNode::Opaque(written.to_string()))
                 };
             };
-            // `import pkg.mod as m; class C(m.Base)`: a member of an indexed
-            // module is that module's class, or nothing this walk can name.
-            return Ok(match member.contains('.') {
-                false => self
-                    .lookup_in_package(module_file, member)
-                    .filter(|(path, identity)| self.python_is_class(path, identity))
-                    .map_or_else(
-                        || MroNode::Opaque(written.to_string()),
-                        |(path, identity)| MroNode::Class(path, identity),
-                    ),
-                true => MroNode::Opaque(written.to_string()),
-            });
+            return Ok(self
+                .python_dotted_class(file, root, member, binds)
+                .map_or_else(
+                    || MroNode::Opaque(written.to_string()),
+                    |(path, identity)| MroNode::Class(path, identity),
+                ));
         }
         if let Some((path, identity)) = self.python_class_named(file, written) {
             return Ok(MroNode::Class(path, identity));
@@ -248,6 +281,121 @@ impl Resolver {
             return Err(MroStop::NotScoped);
         }
         Ok(MroNode::Opaque(written.to_string()))
+    }
+
+    /// The class a dotted base `root.member` names, where `root` is a name the
+    /// file's imports bind (`binds` is everything they bind it to).
+    ///
+    /// Python's own reading, and nothing else: the root must be bound exactly
+    /// once in the file (a second `import ... as o`, or a module-level `o = ..`,
+    /// means the class statement may see either, and the answer is none); each
+    /// segment but the last extends the module path (`a.b.C` asks module
+    /// `a.b`); and the module is the file the ordinary import resolution
+    /// names. The last segment is a class that module declares or re-exports
+    /// (a package `__init__` that lifts it out of a submodule). `None` for
+    /// anything else, which the caller reads as an opaque base — never the
+    /// flat table, because the root is an import and the file said where it
+    /// comes from.
+    fn python_dotted_class(
+        &self,
+        file: &str,
+        root: &str,
+        member: &str,
+        binds: &BTreeSet<PythonImportBind>,
+    ) -> Option<(String, String)> {
+        let mut only = binds.iter();
+        let (Some(bind), None) = (only.next(), only.next()) else {
+            return None;
+        };
+        if self.python_declares_at_file_level(file, root) {
+            return None;
+        }
+        let (middle, class_name) = match member.rsplit_once('.') {
+            Some((middle, class_name)) => (Some(middle), class_name),
+            None => (None, member),
+        };
+        let module_file = match middle {
+            // `import pkg.mod as m; class C(m.Base)`, `import one; one.Base`:
+            // the binding the import walk already resolved, which follows the
+            // file's `sys.path` evidence.
+            None => self
+                .import_bindings
+                .get(file)
+                .and_then(|bound| bound.get(root))
+                .filter(|_| !self.is_value_import(file, root))
+                .map(|(module_file, _)| module_file.clone())
+                .or_else(|| self.resolve_import_path(file, "python", &bind.module_spec()))?,
+            Some(middle) => self.resolve_import_path(
+                file,
+                "python",
+                &format!("{}.{middle}", bind.module_spec()),
+            )?,
+        };
+        let (class_file, identity) = {
+            let (declaring_file, declared) = self.declaring_site(&module_file, class_name);
+            self.lookup_in_package(&declaring_file, &declared)?
+        };
+        self.python_is_class(&class_file, &identity)
+            .then_some((class_file, identity))
+    }
+
+    /// Whether `file` declares `name` at file level under any kind: a class, a
+    /// function or a module-level assignment all rebind an imported name.
+    fn python_declares_at_file_level(&self, file: &str, name: &str) -> bool {
+        self.symbol_index
+            .get(name)
+            .into_iter()
+            .flatten()
+            .any(|(path, _, family, identity)| {
+                path == file
+                    && *family == LangFamily::Python
+                    && self.declared_at_file_level(path, identity)
+            })
+    }
+
+    /// Whether `written`, a base in `file`, is a typing marker with no methods
+    /// of its own that can precede a real base in the MRO: a name the file's
+    /// one import binds to the `typing`, `typing_extensions` or `abc` module
+    /// (`Generic`, `Protocol`, `ABC`, `NamedTuple`, `typing.Generic`). Decided
+    /// by the module the import names, never by the class name, and only when
+    /// that module is not one this corpus declares. Builtins such as `dict` are
+    /// not skipped: they define methods.
+    fn python_base_is_structural(&self, file: &str, written: &str) -> bool {
+        let (root, member) = match written.split_once('.') {
+            Some((root, member)) => (root, Some(member)),
+            None => (written, None),
+        };
+        let Some(binds) = self
+            .python_import_binds
+            .get(file)
+            .and_then(|bound| bound.get(root))
+        else {
+            return false;
+        };
+        let mut only = binds.iter();
+        let (Some(bind), None) = (only.next(), only.next()) else {
+            return false;
+        };
+        if self.python_declares_at_file_level(file, root) {
+            return false;
+        }
+        let module = match (bind, member) {
+            // `from typing import Generic`: the module is what precedes the name.
+            (PythonImportBind::Member(spec), None) => {
+                spec.rsplit_once('.').map(|(module, _)| module.to_string())
+            }
+            (PythonImportBind::Member(_), Some(_)) => None,
+            // `typing.Generic`, `import typing as t; t.Generic`.
+            (_, Some(member)) => Some(match member.rsplit_once('.') {
+                Some((middle, _)) => format!("{}.{middle}", bind.module_spec()),
+                None => bind.module_spec(),
+            }),
+            (_, None) => None,
+        };
+        module.is_some_and(|module| {
+            matches!(module.as_str(), "typing" | "typing_extensions" | "abc")
+                && self.resolve_import_path(file, "python", &module).is_none()
+        })
     }
 
     /// The C3 linearization of `node` (the node first), memoised.
@@ -285,8 +433,14 @@ impl Resolver {
             None => &[],
         };
         let mut bases: Vec<MroNode> = Vec::new();
-        for base in written {
-            bases.push(self.python_mro_node(file, base)?);
+        for (position, base) in written.iter().enumerate() {
+            if base == OPAQUE_BASE {
+                // A base the class statement writes but no name denotes: an
+                // unknown class in this position, distinct from every other.
+                bases.push(MroNode::Opaque(format!("{OPAQUE_BASE}@{position}")));
+            } else if !self.python_base_is_structural(file, base) {
+                bases.push(self.python_mro_node(file, base)?);
+            }
         }
         let mut sequences: Vec<Vec<MroNode>> = Vec::new();
         for base in &bases {
@@ -398,4 +552,129 @@ impl Resolver {
         let enclosing = self.self_type_at(file, LangFamily::Python, caller)?;
         self.python_class_named(file, &enclosing)
     }
+
+    /// The class name a Python scope symbol is, as the enclosing-type tables
+    /// spell it (the tail of the scope after `::`), when it is a class.
+    ///
+    /// A class written inside a function carries its parents' names in its own
+    /// identity (`H.__init__.Inner`) while its members' parent says `Inner`, so
+    /// the scope's spelling may be the end of the identity.
+    pub(super) fn python_class_scope(&self, file: &str, scope: &str) -> Option<String> {
+        let tail = scope.rsplit("::").next().filter(|tail| !tail.is_empty())?;
+        let bare = tail.rsplit('.').next().unwrap_or(tail);
+        self.symbol_index
+            .get(bare)
+            .into_iter()
+            .flatten()
+            .any(|(path, kind, family, identity)| {
+                let declared = identity.rsplit("::").next().unwrap_or(identity);
+                path == file
+                    && *kind == SymbolKind::Class
+                    && *family == LangFamily::Python
+                    && (declared == tail || declared.ends_with(&format!(".{tail}")))
+            })
+            .then(|| tail.to_string())
+    }
+
+    /// Whether the Python name `root`, read in `scope` of `file`, is a binding
+    /// of something other than the one thing the file's imports and
+    /// declarations make it: bound more than once at module scope (an import
+    /// and a later assignment, two imports), or by a function that encloses
+    /// `scope`, which a closure's free variable reads first.
+    pub(super) fn python_name_is_rebound(&self, file: &str, scope: &str, root: &str) -> bool {
+        let module_bindings = self
+            .python_import_binds
+            .get(file)
+            .and_then(|bound| bound.get(root))
+            .map_or(0, BTreeSet::len)
+            + self
+                .symbol_index
+                .get(root)
+                .into_iter()
+                .flatten()
+                .filter(|(path, _, family, identity)| {
+                    path == file
+                        && *family == LangFamily::Python
+                        && self.declared_at_file_level(path, identity)
+                })
+                .count();
+        if module_bindings > 1 {
+            return true;
+        }
+        let mut current = scope.to_string();
+        for _ in 0..Self::PYTHON_MRO_MAX_DEPTH {
+            // A class body's names are not in scope inside its methods.
+            if self.python_class_scope(file, &current).is_none()
+                && self.scope_declares_local(file, &current, root)
+            {
+                return true;
+            }
+            let Some(parent) = self
+                .symbol_parents
+                .get(&(file.to_string(), current.clone()))
+                .filter(|parent| parent.as_str() != file && **parent != current)
+            else {
+                return false;
+            };
+            current = parent.clone();
+        }
+        true
+    }
+}
+
+/// What a Python file's imports bind each local name to: `import a.b` binds
+/// the package `a`, `import a.b as m` the module `a.b`, and `from a import n
+/// as m` the member `n` of `a`. Every import counts, at any depth: a name a
+/// function imports again is a second binding the class statement may or may
+/// not see.
+pub(super) fn python_import_binds(
+    ext: &Extraction,
+) -> BTreeMap<String, BTreeSet<PythonImportBind>> {
+    let mut binds: BTreeMap<String, BTreeSet<PythonImportBind>> = BTreeMap::new();
+    for imp in &ext.imports {
+        if imp.path_load.is_some() {
+            continue;
+        }
+        let specifier = imp.module_specifier.as_str();
+        if imp.imported_names.is_empty() {
+            let (local, bind) = match imp.alias.as_deref() {
+                Some("*" | ".") => continue,
+                Some(alias) => (alias, PythonImportBind::Module(specifier.to_string())),
+                None => {
+                    let root = specifier.split('.').next().unwrap_or(specifier);
+                    (root, PythonImportBind::Package(root.to_string()))
+                }
+            };
+            if !local.is_empty() {
+                binds.entry(local.to_string()).or_default().insert(bind);
+            }
+            continue;
+        }
+        for (index, name) in imp.imported_names.iter().enumerate() {
+            if name.is_empty() || name == "*" {
+                continue;
+            }
+            let local = imp
+                .local_names
+                .get(index)
+                .map(String::as_str)
+                .filter(|local| !local.is_empty())
+                .or_else(|| {
+                    (imp.imported_names.len() == 1)
+                        .then_some(imp.alias.as_deref())
+                        .flatten()
+                })
+                .unwrap_or(name.as_str());
+            let member = if specifier.chars().all(|c| c == '.') {
+                format!("{specifier}{name}")
+            } else {
+                format!("{specifier}.{name}")
+            };
+            binds
+                .entry(local.to_string())
+                .or_default()
+                .insert(PythonImportBind::Member(member));
+        }
+    }
+    binds
 }

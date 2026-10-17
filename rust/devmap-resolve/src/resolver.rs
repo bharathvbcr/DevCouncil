@@ -20,6 +20,7 @@ use devmap_extract::{GoModule, ProjectManifests};
 use gotypes::{GoCall, GoFileIndex, GoModel, DISPATCH_FANOUT_CAP};
 
 mod pytypes;
+use pytypes::PythonImportBind;
 
 /// The key a wildcard import (`from m import *`, `export * from 'm'`) takes in
 /// `external_imports` and `unindexed_local_imports` when its module is not
@@ -405,6 +406,10 @@ pub struct Resolver {
     /// the per-declaration half the `pytypes` walk reads before it falls back
     /// to the flat one.
     python_bases: BTreeMap<(String, String), Vec<String>>,
+    /// `file` -> local name -> everything the file's Python imports bind that
+    /// name to. A name bound to more than one thing is not a name the file
+    /// can be read as meaning one module at a class statement.
+    python_import_binds: BTreeMap<String, BTreeMap<String, BTreeSet<PythonImportBind>>>,
     /// Reverse of [`Self::supertypes`]: `(family, type name)` → indexed subtypes.
     ///
     /// Built from the same heritage rows. X42's virtual-`self` guard walks this
@@ -705,6 +710,7 @@ impl Resolver {
             type_methods: BTreeMap::new(),
             supertypes: BTreeMap::new(),
             python_bases: BTreeMap::new(),
+            python_import_binds: BTreeMap::new(),
             subtypes: BTreeMap::new(),
             import_bindings: BTreeMap::new(),
             value_imports: BTreeMap::new(),
@@ -2353,10 +2359,7 @@ impl Resolver {
             .field_initializers
             .get(&format!("{file}:{file}::{owner}:{field}"))?;
         let family = self.family_of_file(file)?;
-        if family == LangFamily::Python
-            && Self::is_plain_ident(shape)
-            && self.python_class_named(file, shape).is_some()
-        {
+        if family == LangFamily::Python && self.python_class_named(file, shape).is_some() {
             return Some(shape.clone());
         }
         self.factory_return_type(family, file, None, shape)
@@ -2404,7 +2407,7 @@ impl Resolver {
             return;
         }
         let callee_root = shape.split('.').next().unwrap_or(&shape);
-        let shadowed = self.scope_declares_local(file, scope, callee_root);
+        let shadowed = self.python_name_is_rebound(file, scope, callee_root);
         match self.field_initializers.get(&key) {
             _ if shadowed => {
                 self.field_initializers.remove(&key);
@@ -2432,18 +2435,10 @@ impl Resolver {
                 .get(&(file.to_string(), current.clone()))
                 .filter(|parent| *parent != file)?
                 .clone();
-            let tail = parent.rsplit("::").next().filter(|tail| !tail.is_empty())?;
-            let bare = tail.rsplit('.').next().unwrap_or(tail);
-            let is_class = self.symbol_index.get(bare).into_iter().flatten().any(
-                |(path, kind, family, identity)| {
-                    path == file
-                        && *kind == SymbolKind::Class
-                        && *family == LangFamily::Python
-                        && identity.rsplit("::").next() == Some(tail)
-                },
-            );
-            if is_class {
-                return Some(tail.to_string());
+            // The nearest class wins: a class written inside a method owns the
+            // `self` its own methods write, and never the outer class's.
+            if let Some(class) = self.python_class_scope(file, &parent) {
+                return Some(class);
             }
             current = parent;
         }
@@ -3169,6 +3164,7 @@ impl Resolver {
         self.type_methods.clear();
         self.supertypes.clear();
         self.python_bases.clear();
+        self.python_import_binds.clear();
         self.subtypes.clear();
         self.import_bindings.clear();
         self.value_imports.clear();
@@ -4168,6 +4164,13 @@ impl Resolver {
             }
 
             let family = LangFamily::from_lang(&ext.language);
+            if family == LangFamily::Python {
+                let binds = pytypes::python_import_binds(ext);
+                if !binds.is_empty() {
+                    self.python_import_binds
+                        .insert(ext.file_path.clone(), binds);
+                }
+            }
             // X42. The supertype table, read from the heritage references the
             // extractor emits. `enclosing_symbol` on one of these is the
             // *declaring* type — that is what makes the `Extends` edge have two
@@ -4228,7 +4231,12 @@ impl Resolver {
                     }
                     last_python_base = Some(span);
                 }
-                if supertype.is_empty() || supertype == subtype {
+                // An opaque base names no class: it has no supertype row.
+                if supertype.is_empty()
+                    || supertype == subtype
+                    || (family == LangFamily::Python
+                        && reference.name == devmap_extract::heritage::OPAQUE_BASE)
+                {
                     continue;
                 }
                 self.supertypes
@@ -6517,6 +6525,14 @@ impl Resolver {
                         reference.kind,
                         ReferenceKind::Call | ReferenceKind::Constructor | ReferenceKind::JsxTag
                     ) {
+                        continue;
+                    }
+                    // A Python base no name denotes is a fact about the MRO,
+                    // not a reference to attribute: it is neither an edge nor
+                    // a failed attribution.
+                    if reference.kind == ReferenceKind::Heritage
+                        && reference.name == devmap_extract::heritage::OPAQUE_BASE
+                    {
                         continue;
                     }
                     // A DOM or stylesheet identity, answered by its own two-rung
