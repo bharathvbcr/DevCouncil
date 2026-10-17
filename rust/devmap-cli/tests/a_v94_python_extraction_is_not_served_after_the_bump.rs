@@ -10,7 +10,7 @@ use devmap_store::Store;
 const SOURCE: &str = "from a import A\n\nclass H:\n    def __init__(self):\n        self.e = A()\n";
 
 fn field_binding(ext: &devmap_extract::model::Extraction) -> bool {
-    ext.calls
+    ext.references
         .iter()
         .any(|reference| reference.assigned_to.as_deref() == Some("self.e"))
 }
@@ -25,7 +25,7 @@ fn the_current_extraction_carries_the_field_binding() {
 fn a_payload_stored_under_the_v94_identity_is_not_served_to_a_v95_key() {
     let store = Store::open_in_memory().unwrap();
     let mut old = extract_file("h.py", SOURCE);
-    for reference in &mut old.calls {
+    for reference in &mut old.references {
         reference.assigned_to = None;
     }
     let current = CacheKey::for_extraction(&old);
