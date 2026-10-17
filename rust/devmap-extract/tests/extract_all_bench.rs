@@ -50,8 +50,5 @@ fn extract_all_bench() {
         best = best.min(started.elapsed().as_millis());
         failed = out.iter().filter(|e| e.is_parse_failure()).count();
     }
-    println!(
-        "BENCH files={} failed={failed} min_ms={best}",
-        files.len()
-    );
+    println!("BENCH files={} failed={failed} min_ms={best}", files.len());
 }

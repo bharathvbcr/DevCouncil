@@ -161,7 +161,12 @@ fn the_committed_record_names_no_private_symbol_or_path() {
         .expect("corpora")
         .iter()
         .filter(|c| c["name"] != OWN_CORPUS)
-        .flat_map(|c| c["languages"].as_object().into_iter().flat_map(|l| l.values()))
+        .flat_map(|c| {
+            c["languages"]
+                .as_object()
+                .into_iter()
+                .flat_map(|l| l.values())
+        })
         .map(|l| l["labelled_rows"].as_array().map_or(0, Vec::len))
         .sum();
     assert!(
@@ -188,7 +193,10 @@ fn clean_row() -> Value {
 
 #[test]
 fn a_hashed_symbol_with_a_category_token_passes() {
-    assert_eq!(leaks(&record_with("Private", clean_row())), Vec::<String>::new());
+    assert_eq!(
+        leaks(&record_with("Private", clean_row())),
+        Vec::<String>::new()
+    );
 }
 
 #[test]
@@ -214,13 +222,21 @@ fn a_path_or_qualified_symbol_in_a_private_corpus_fails_naming_the_row() {
             found[0].contains("Private go labelled_rows[0]") && found[0].contains("`symbol`"),
             "{found:?}"
         );
-        assert!(!found[0].contains(symbol), "the offending string must not be echoed");
+        assert!(
+            !found[0].contains(symbol),
+            "the offending string must not be echoed"
+        );
     }
 }
 
 #[test]
 fn a_path_in_evidence_fails_even_with_a_hashed_symbol() {
-    for evidence in ["rg hit at src/lib.rs:12", "lib.py", "a::b", "rg_declaration_only/extra"] {
+    for evidence in [
+        "rg hit at src/lib.rs:12",
+        "lib.py",
+        "a::b",
+        "rg_declaration_only/extra",
+    ] {
         let mut row = clean_row();
         row["evidence"] = evidence.into();
         let found = leaks(&record_with("Private", row));
@@ -246,7 +262,12 @@ fn prose_evidence_and_a_bare_private_name_fail() {
     let mut row = clean_row();
     row["symbol"] = "YearData".into();
     assert_eq!(leaks(&record_with("Private", row)).len(), 1);
-    for near_hash in ["h:0123456789A", "h:0123456789abc", "h:0123456789ag", "0123456789ab"] {
+    for near_hash in [
+        "h:0123456789A",
+        "h:0123456789abc",
+        "h:0123456789ag",
+        "0123456789ab",
+    ] {
         let mut row = clean_row();
         row["symbol"] = near_hash.into();
         assert_eq!(leaks(&record_with("Private", row)).len(), 1, "{near_hash}");
@@ -279,9 +300,13 @@ fn a_row_the_check_cannot_read_fails_instead_of_passing() {
     }
     assert!(!leaks(&serde_json::json!({})).is_empty());
     assert!(!leaks(&serde_json::json!({ "corpora": [ { "languages": {} } ] })).is_empty());
-    assert!(!leaks(&serde_json::json!({ "corpora": [ { "name": "P", "languages": 3 } ] })).is_empty());
-    assert!(!leaks(&serde_json::json!({ "corpora": [ { "name": "P", "languages": {
-        "go": { "labelled_rows": "x" } } } ] }))
+    assert!(
+        !leaks(&serde_json::json!({ "corpora": [ { "name": "P", "languages": 3 } ] })).is_empty()
+    );
+    assert!(!leaks(
+        &serde_json::json!({ "corpora": [ { "name": "P", "languages": {
+        "go": { "labelled_rows": "x" } } } ] })
+    )
     .is_empty());
 }
 

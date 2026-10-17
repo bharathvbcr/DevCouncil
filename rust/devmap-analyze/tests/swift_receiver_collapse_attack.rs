@@ -19,20 +19,35 @@ fn only_a_bare_name_construction_collapses() {
     let long = "x".repeat(120);
     // (source, callee, the one shape of receiver that would be wrong)
     let cases: Vec<(String, &str)> = vec![
-        ("func f() {\n    \"a(\n b)\".hasPrefix(\"a\")\n}".into(), "hasPrefix"),
+        (
+            "func f() {\n    \"a(\n b)\".hasPrefix(\"a\")\n}".into(),
+            "hasPrefix",
+        ),
         ("func f() {\n    (a,\n b).0.run()\n}".into(), "run"),
-        ("func f() {\n    { () -> Svc in\n        Svc() }().run()\n}".into(), "run"),
-        ("func f() {\n    Svc<Int>(\n        a: 1\n    ).run()\n}".into(), "run"),
-        ("func f() {\n    Mod.Svc(\n        a: 1\n    ).run()\n}".into(), "run"),
-        (format!("func f() {{ (try? Svc(a: \"{long}\"))?.run() }}"), "run"),
+        (
+            "func f() {\n    { () -> Svc in\n        Svc() }().run()\n}".into(),
+            "run",
+        ),
+        (
+            "func f() {\n    Svc<Int>(\n        a: 1\n    ).run()\n}".into(),
+            "run",
+        ),
+        (
+            "func f() {\n    Mod.Svc(\n        a: 1\n    ).run()\n}".into(),
+            "run",
+        ),
+        (
+            format!("func f() {{ (try? Svc(a: \"{long}\"))?.run() }}"),
+            "run",
+        ),
     ];
     for (source, callee) in &cases {
         let got = receivers("a.swift", source, callee);
-        eprintln!("RECEIVER {:?} => {got:?}", source.lines().nth(1).unwrap_or(source));
-        assert!(
-            got.iter().all(|t| t != "Svc(…)"),
-            "{source:?} -> {got:?}"
+        eprintln!(
+            "RECEIVER {:?} => {got:?}",
+            source.lines().nth(1).unwrap_or(source)
         );
+        assert!(got.iter().all(|t| t != "Svc(…)"), "{source:?} -> {got:?}");
     }
 }
 
@@ -82,8 +97,14 @@ fn other_languages_never_see_the_collapse() {
         ("a.kt", "fun f() {\n    Svc(\n        1\n    ).run()\n}\n"),
         ("a.ts", "function f() {\n  new Svc(\n    1\n  ).run();\n}\n"),
         ("a.py", "def f():\n    Svc(\n        1\n    ).run()\n"),
-        ("a.go", "package a\nfunc f() {\n\tNewSvc(\n\t\t1,\n\t).Run()\n}\n"),
-        ("a.rs", "fn f() {\n    Svc::new(\n        1\n    ).run();\n}\n"),
+        (
+            "a.go",
+            "package a\nfunc f() {\n\tNewSvc(\n\t\t1,\n\t).Run()\n}\n",
+        ),
+        (
+            "a.rs",
+            "fn f() {\n    Svc::new(\n        1\n    ).run();\n}\n",
+        ),
     ] {
         let found: Vec<String> = extract_file(path, src)
             .calls
@@ -91,6 +112,9 @@ fn other_languages_never_see_the_collapse() {
             .filter_map(|c| c.receiver_expr)
             .collect();
         eprintln!("LANG {path}: {found:?}");
-        assert!(found.iter().all(|t| !t.ends_with("(…)")), "{path}: {found:?}");
+        assert!(
+            found.iter().all(|t| !t.ends_with("(…)")),
+            "{path}: {found:?}"
+        );
     }
 }

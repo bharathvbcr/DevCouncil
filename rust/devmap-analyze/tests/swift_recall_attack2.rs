@@ -38,7 +38,10 @@ const ITEM: (&str, &str) = (
     "item.swift",
     "struct Item { var id: Tag\n func weight() -> Int { 1 }\n func append(_ x: Int) {}\n func contains(_ x: Int) -> Bool { true } }\n",
 );
-const TAG: (&str, &str) = ("tag.swift", "struct Tag { func weight() -> Int { 9 }\n func append(_ x: Int) {} }\n");
+const TAG: (&str, &str) = (
+    "tag.swift",
+    "struct Tag { func weight() -> Int { 9 }\n func append(_ x: Int) {} }\n",
+);
 const OTHER: (&str, &str) = (
     "other.swift",
     "struct Other { func weight() -> Int { 2 }\n func append(_ x: Int) {}\n func contains(_ x: Int) -> Bool { false } }\n",
@@ -67,7 +70,10 @@ fn a_superclass_member_beats_a_global_of_the_same_name() {
         "var items: [Other] = []\nclass Host: Base { func run() { items.forEach { $0.weight() } } }\n",
         &[base],
     );
-    assert!(!has(&got, "Other.weight"), "inherited items is [Item]: {got:?}");
+    assert!(
+        !has(&got, "Other.weight"),
+        "inherited items is [Item]: {got:?}"
+    );
 }
 
 #[test]
@@ -124,7 +130,10 @@ fn a_nested_array_outer_closure_receives_an_array() {
         "struct Host { var groups: [[Item]]\n func run() { groups.map { $0.append(1) } } }\n",
         &[],
     );
-    assert!(!has(&got, "Item.append"), "$0 is [Item], Array.append: {got:?}");
+    assert!(
+        !has(&got, "Item.append"),
+        "$0 is [Item], Array.append: {got:?}"
+    );
 }
 
 #[test]
@@ -138,7 +147,10 @@ fn dictionary_values_and_pairs_are_not_elements() {
         "struct Host { var d: [String: Item]\n func run() { d.map { $0.append(1) } } }\n",
         &[],
     );
-    assert!(!has(&got, "Item.append"), "$0 is a (key, value) pair: {got:?}");
+    assert!(
+        !has(&got, "Item.append"),
+        "$0 is a (key, value) pair: {got:?}"
+    );
 }
 
 #[test]
@@ -152,10 +164,13 @@ fn a_set_member_is_not_typed_as_an_array() {
 
 #[test]
 fn a_projected_property_wrapper_value_is_not_the_collection() {
-    for decl in ["@Binding var items: [Item]", "@Published var items: [Item]", "@State var items: [Item]"] {
-        let src = format!(
-            "struct Host {{ {decl}\n func run() {{ $items.map {{ $0.append(1) }} }} }}\n"
-        );
+    for decl in [
+        "@Binding var items: [Item]",
+        "@Published var items: [Item]",
+        "@State var items: [Item]",
+    ] {
+        let src =
+            format!("struct Host {{ {decl}\n func run() {{ $items.map {{ $0.append(1) }} }} }}\n");
         let got = run(&src, &[]);
         assert!(!has(&got, "Item.append"), "{decl}: {got:?}");
     }
@@ -176,7 +191,10 @@ fn closures_in_a_tuple_of_function_types_are_typed_by_position() {
         "struct Host { func run() { let pair: (a: (Item) -> Void, b: (Other) -> Void) = ({ $0.contains(1) }, { $0.append(1) }); _ = pair } }\n",
         &[],
     );
-    assert!(!has(&got, "Item.append"), "second closure takes Other: {got:?}");
+    assert!(
+        !has(&got, "Item.append"),
+        "second closure takes Other: {got:?}"
+    );
 }
 
 #[test]
@@ -196,7 +214,10 @@ fn try_await_before_a_construction_does_not_change_other_receivers() {
         &[svc],
     );
     assert!(has(&got, "Svc.run"), "construction still resolves: {got:?}");
-    assert!(!has(&got, "Item.append") && !has(&got, "Tag.append"), "{got:?}");
+    assert!(
+        !has(&got, "Item.append") && !has(&got, "Tag.append"),
+        "{got:?}"
+    );
 }
 
 #[test]
@@ -209,7 +230,10 @@ fn await_of_a_method_chain_keeps_its_receiver() {
         "struct Host { var client: Client\n func run() async { _ = await client.fetch(\n a: 1\n ).append(1) } }\n",
         &[client],
     );
-    assert!(!has(&got, "Item.append") && !has(&got, "Tag.append"), "{got:?}");
+    assert!(
+        !has(&got, "Item.append") && !has(&got, "Tag.append"),
+        "{got:?}"
+    );
 }
 
 #[test]
@@ -225,13 +249,22 @@ fn deeply_nested_namesake_types_are_told_apart_by_path() {
     let a = confident(&files, "Crate.runA");
     let x = confident(&files, "Crate.runX");
     eprintln!("runA {a:?} runX {x:?}");
-    assert!(!has(&a, "Other.contains"), "A.B.Crate.items is [Item]: {a:?}");
-    assert!(!has(&x, "Item.contains"), "X.B.Crate.items is [Other]: {x:?}");
+    assert!(
+        !has(&a, "Other.contains"),
+        "A.B.Crate.items is [Item]: {a:?}"
+    );
+    assert!(
+        !has(&x, "Item.contains"),
+        "X.B.Crate.items is [Other]: {x:?}"
+    );
 }
 
 #[test]
 fn an_extension_of_a_nested_type_in_another_file_is_not_read_from_a_namesake_here() {
-    let decl = ("a.swift", "struct A { struct Crate { var items: [Item] } }\n");
+    let decl = (
+        "a.swift",
+        "struct A { struct Crate { var items: [Item] } }\n",
+    );
     let other = (
         "b.swift",
         "struct B { struct Crate { var items: [Other] } }\n",
@@ -259,7 +292,10 @@ fn an_extension_of_a_nested_type_declared_in_an_extension_is_typed_by_its_own_pa
 #[test]
 fn a_typealias_declared_elsewhere_is_not_a_namesake_nested_type() {
     let alias = ("alias.swift", "typealias Row = Other\n");
-    let nested = ("nested.swift", "struct Foo { struct Row { func weight() -> Int { 5 } } }\n");
+    let nested = (
+        "nested.swift",
+        "struct Foo { struct Row { func weight() -> Int { 5 } } }\n",
+    );
     let got = run(
         "struct Host { var rows: [Row]\n func run() { rows.forEach { $0.weight() } } }\n",
         &[alias, nested],
@@ -296,13 +332,22 @@ fn nil_coalescing_with_a_named_default_keeps_the_left_type() {
 
 #[test]
 fn a_typealias_in_an_extension_in_another_file_is_not_the_top_level_type() {
-    let entry = ("entry.swift", "struct Entry { func weight() -> Int { 3 } }\n");
-    let ext = ("hostext.swift", "extension Host { typealias Entry = Item }\n");
+    let entry = (
+        "entry.swift",
+        "struct Entry { func weight() -> Int { 3 } }\n",
+    );
+    let ext = (
+        "hostext.swift",
+        "extension Host { typealias Entry = Item }\n",
+    );
     let got = run(
         "struct Host { var items: [Entry]\n func run() { items.forEach { $0.weight() } } }\n",
         &[entry, ext],
     );
-    assert!(!has(&got, "Entry.weight"), "Entry is Item inside Host: {got:?}");
+    assert!(
+        !has(&got, "Entry.weight"),
+        "Entry is Item inside Host: {got:?}"
+    );
 }
 
 #[test]
@@ -320,5 +365,8 @@ fn nil_coalescing_on_a_non_collection_left_types_nothing() {
         "struct Host { var tag: Tag?\n func run() { (tag ?? Tag()).append(1); (tag ?? Tag()).id } }\n",
         &[],
     );
-    assert!(!has(&got, "Item.append") && !has(&got, "Other.append"), "{got:?}");
+    assert!(
+        !has(&got, "Item.append") && !has(&got, "Other.append"),
+        "{got:?}"
+    );
 }

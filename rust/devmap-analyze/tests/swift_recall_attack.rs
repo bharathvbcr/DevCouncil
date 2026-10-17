@@ -99,7 +99,10 @@ fn a_free_function_is_shadowed_by_an_inherited_method_from_another_file() {
         "func load() -> [Item] { [] }\n\
          class Host: Base { func run() { let xs = load(); xs.forEach { $0.weight() } } }\n",
     );
-    let base = ("base.swift", "class Base { func load() -> [Other] { [] } }\n");
+    let base = (
+        "base.swift",
+        "class Base { func load() -> [Other] { [] } }\n",
+    );
     let got = confident(&edges(&[ITEM, OTHER, host, base]), "Host.run");
     assert!(!has(&got, "Item.weight"), "{got:?}");
 }
@@ -152,7 +155,10 @@ fn a_nested_typealias_is_not_the_top_level_type_of_the_same_name() {
          func run() { items.forEach { $0.weight() } } }\n",
     );
     let got = confident(&edges(&[ITEM, entry, host]), "Host.run");
-    assert!(!has(&got, "Entry.weight"), "alias is Item, not Entry: {got:?}");
+    assert!(
+        !has(&got, "Entry.weight"),
+        "alias is Item, not Entry: {got:?}"
+    );
 }
 
 // 1(e) extension in another file names the type; this file declares another nested type of that name
@@ -225,10 +231,7 @@ fn a_dictionary_default_is_not_a_collection() {
 // 1(h) chained closure: the second $0 is a different type
 #[test]
 fn the_second_closure_in_a_chain_is_not_typed_by_the_first_collection() {
-    let tag = (
-        "tag.swift",
-        "struct Tag { func weight() -> Int { 9 } }\n",
-    );
+    let tag = ("tag.swift", "struct Tag { func weight() -> Int { 9 } }\n");
     let item = (
         "item2.swift",
         "struct Item { var id: Tag\n func weight() -> Int { 1 } }\n",
@@ -251,10 +254,11 @@ fn enumerated_zip_and_lazy_do_not_type_dollar_zero_as_the_element() {
         "items.lazy.map { $0.weight() }",
         "items.reversed().map { $0.weight() }",
     ] {
-        let src = format!(
-            "struct Host {{ var items: [Item]\n func run() {{ _ = {chain} }} }}\n"
+        let src = format!("struct Host {{ var items: [Item]\n func run() {{ _ = {chain} }} }}\n");
+        let got = confident(
+            &edges(&[ITEM, OTHER, ("host.swift", src.as_str())]),
+            "Host.run",
         );
-        let got = confident(&edges(&[ITEM, OTHER, ("host.swift", src.as_str())]), "Host.run");
         // `lazy`/`reversed` keep the element, so Item.weight is not wrong there;
         // the tuple shapes must never reach Item.append through `$0`.
         assert!(!has(&got, "Item.append"), "{chain}: {got:?}");
@@ -297,7 +301,10 @@ fn a_pattern_binding_named_like_the_member_shadows_it() {
              struct Host {{ var items: [Item]\n var groups: [[Other]]\n\
              func go() throws {{}}\n func run(e: E) {{ {body} }} }}\n"
         );
-        let got = confident(&edges(&[ITEM, OTHER, ("host.swift", src.as_str())]), "Host.run");
+        let got = confident(
+            &edges(&[ITEM, OTHER, ("host.swift", src.as_str())]),
+            "Host.run",
+        );
         assert!(!has(&got, "Item.append"), "{body}: {got:?}");
     }
 }

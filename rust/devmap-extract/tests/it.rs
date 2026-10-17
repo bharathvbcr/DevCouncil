@@ -26,8 +26,6 @@ mod a_declared_field_has_a_type;
 mod a_minified_bundle_is_not_parsed;
 #[cfg(feature = "parse")]
 mod a_receiver_is_not_its_operator;
-#[cfg(feature = "parse")]
-mod swift_recall_r5_attack;
 mod a_subprocess_is_bounded_in_time_and_bytes;
 #[cfg(feature = "parse")]
 mod adversarial_corpus;
@@ -35,17 +33,13 @@ mod adversarial_corpus;
 mod allow_unwired_and_dynamic_imports;
 mod an_unreadable_subtree_is_a_hole_not_a_dead_build;
 #[cfg(feature = "parse")]
+mod budget_attack;
+#[cfg(feature = "parse")]
 mod budget_characterization;
 #[cfg(feature = "parse")]
 mod budget_is_a_real_bound;
 #[cfg(feature = "parse")]
-mod budget_attack;
-#[cfg(feature = "parse")]
 mod budget_retry;
-#[cfg(feature = "parse")]
-mod edge_inputs_under_cpu_contention;
-#[cfg(feature = "parse")]
-mod extract_all_bench;
 #[cfg(feature = "parse")]
 mod c_family;
 mod cache_tag_security;
@@ -60,7 +54,11 @@ mod cprobe;
 mod declarations;
 mod discovery_stays_inside_the_root;
 #[cfg(feature = "parse")]
+mod edge_inputs_under_cpu_contention;
+#[cfg(feature = "parse")]
 mod embedded_scripts;
+#[cfg(feature = "parse")]
+mod extract_all_bench;
 #[cfg(feature = "parse")]
 mod extract_bindings;
 #[cfg(feature = "parse")]
@@ -122,6 +120,8 @@ mod safe_fs_controls;
 mod sql_check_constraint_parse;
 #[cfg(feature = "parse")]
 mod stress_hardening;
+#[cfg(feature = "parse")]
+mod swift_recall_r5_attack;
 #[cfg(feature = "parse")]
 mod swift_scope_terminates;
 mod swift_targets_collect;

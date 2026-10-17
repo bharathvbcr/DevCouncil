@@ -69,9 +69,8 @@ fn a_case_let_that_rebinds_a_tuple_parameter_hides_its_members() {
 /// `typealias Entry = Parcel` is not what it names.
 #[test]
 fn a_generic_parameter_named_like_an_alias_is_not_the_alias() {
-    let source = format!(
-        "{PARCEL}typealias Entry = Parcel\nfunc run<Entry>(_ e: Entry) {{ e.weight() }}"
-    );
+    let source =
+        format!("{PARCEL}typealias Entry = Parcel\nfunc run<Entry>(_ e: Entry) {{ e.weight() }}");
     assert!(
         !types_of(&source, "e").contains(&"Parcel".to_string()),
         "{:?}",

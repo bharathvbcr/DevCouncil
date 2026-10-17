@@ -95,7 +95,10 @@ fn dump_swift_edges() {
                 line,
                 call.caller_symbol.as_deref().unwrap_or(""),
                 call.callee_name,
-                call.receiver_expr.as_deref().unwrap_or("").replace('\n', " ")
+                call.receiver_expr
+                    .as_deref()
+                    .unwrap_or("")
+                    .replace('\n', " ")
             );
         }
     }
@@ -148,7 +151,9 @@ fn time_synthetic_swift_file() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(10);
-    let mut src = String::from("struct Item { var id: Int; func weight() -> Int { 1 } }\nfinal class Host {\n");
+    let mut src = String::from(
+        "struct Item { var id: Int; func weight() -> Int { 1 } }\nfinal class Host {\n",
+    );
     for i in 0..members {
         let _ = writeln!(src, "    var items{i}: [Item] = []");
     }
@@ -168,8 +173,15 @@ fn time_synthetic_swift_file() {
         let start = Instant::now();
         let ext = extract_file("big.swift", &src);
         best = best.min(start.elapsed().as_secs_f64() * 1000.0);
-        assert!(matches!(ext.parse_outcome, ParseOutcome::Clean), "{:?}", ext.parse_outcome);
+        assert!(
+            matches!(ext.parse_outcome, ParseOutcome::Clean),
+            "{:?}",
+            ext.parse_outcome
+        );
         calls = ext.calls.len();
     }
-    eprintln!("SYNTH members={members} bytes={} calls={calls} min_ms={best:.1}", src.len());
+    eprintln!(
+        "SYNTH members={members} bytes={} calls={calls} min_ms={best:.1}",
+        src.len()
+    );
 }

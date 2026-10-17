@@ -77,7 +77,11 @@ fn overloads_keep_distinct_identities_and_never_self_edge() {
         "an overload calling its sibling overload is not a self-edge: {found:?}"
     );
     assert!(
-        has(&result, "gaps/Overloads.kt::useCalc", "gaps/Overloads.kt::Calc.add"),
+        has(
+            &result,
+            "gaps/Overloads.kt::useCalc",
+            "gaps/Overloads.kt::Calc.add"
+        ),
         "c.add(..) on a Calc-typed parameter reaches Calc.add: {found:?}"
     );
 }
