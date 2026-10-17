@@ -112,6 +112,9 @@ py.SK2	SK2	micro/superkw/children.py::SkAliased.ping	micro/superkw/base_a.py::Sk
 py.SK2.not	SK2	micro/superkw/children.py::SkAliased.ping	micro/superkw/base_b.py::SkBase.ping	forbid_any_tier	must		the alias does not reach the namesake
 py.SK3	SK3	micro/superkw/children.py::SkBuilder.build	micro/superkw/base_a.py::SkBase.build	edge	must		super().build() in a classmethod
 py.SK3.not	SK3	micro/superkw/children.py::SkBuilder.build	micro/superkw/base_b.py::SkBase.build	forbid_any_tier	must		classmethod super() does not reach the namesake base
-py.SK5.not1	SK5	micro/superkw/children.py::SkDiamond.hop	micro/superkw/base_a.py::SkLeft.hop	forbid_any_tier	must		two bases of one level both declare hop: this resolver has no MRO, so it abstains
-py.SK5.not2	SK5	micro/superkw/children.py::SkDiamond.hop	micro/superkw/base_a.py::SkRight.hop	forbid_any_tier	must		same diamond, the other base
+py.SK5	SK5	micro/superkw/children.py::SkDiamond.hop	micro/superkw/base_a.py::SkLeft.hop	edge	must		two bases of one level both declare hop: C3 order is SkDiamond, SkLeft, SkRight, so super().hop() is SkLeft.hop
+py.SK5.not	SK5	micro/superkw/children.py::SkDiamond.hop	micro/superkw/base_a.py::SkRight.hop	forbid_any_tier	must		the later base in the MRO is shadowed by SkLeft.hop
 py.SK6	SK6	micro/superkw/children.py::SkOneProvider.hop	micro/superkw/base_a.py::SkLeft.hop	edge	must		of two bases only SkLeft declares hop: the one provider on the nearest level
+py.SK7.not	SK7	micro/superkw/children.py::SkExternalFirst.hop	micro/superkw/base_a.py::SkLeft.hop	forbid_any_tier	must		extpkg.Mixin precedes SkLeft in the MRO and may define hop: no in-repo edge
+py.SK8	SK8	micro/superkw/children.py::SkMeta.hop	micro/superkw/base_a.py::SkLeft.hop	edge	must		metaclass=SkMetaBase is a class-statement keyword, not a base: super().hop() is SkLeft.hop
+py.SK8.not	SK8	micro/superkw/children.py::SkMeta.hop	micro/superkw/children.py::SkMetaBase.hop	forbid_any_tier	must		the metaclass is not in the MRO

@@ -1,3 +1,5 @@
+import extpkg
+
 from .base_a import SkBase, SkLeft, SkRight, SkSilent
 from .base_a import SkBase as AliasBase
 
@@ -34,3 +36,18 @@ class SkDiamond(SkLeft, SkRight):
 class SkOneProvider(SkSilent, SkLeft):
     def hop(self):
         return super().hop()
+
+
+class SkExternalFirst(extpkg.Mixin, SkLeft):
+    def hop(self):
+        return super().hop()
+
+
+class SkMeta(SkLeft, metaclass=SkMetaBase):
+    def hop(self):
+        return super().hop()
+
+
+class SkMetaBase(type):
+    def hop(cls):
+        return 0
