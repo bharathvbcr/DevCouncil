@@ -4235,7 +4235,7 @@ impl Resolver {
                 if supertype.is_empty()
                     || supertype == subtype
                     || (family == LangFamily::Python
-                        && reference.name == devmap_extract::heritage::OPAQUE_BASE)
+                        && reference.name == OPAQUE_BASE)
                 {
                     continue;
                 }
@@ -6531,7 +6531,7 @@ impl Resolver {
                     // not a reference to attribute: it is neither an edge nor
                     // a failed attribution.
                     if reference.kind == ReferenceKind::Heritage
-                        && reference.name == devmap_extract::heritage::OPAQUE_BASE
+                        && reference.name == OPAQUE_BASE
                     {
                         continue;
                     }

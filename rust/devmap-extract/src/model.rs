@@ -1033,6 +1033,13 @@ pub enum ReferenceKind {
     EntryName,
 }
 
+/// The `Heritage` reference name recorded, in position, for a Python
+/// positional base that names no class: `*mixins`, `make_base()`,
+/// `A if c else B`. It is no identifier, so it can never equal a declared
+/// class; the resolver reads it as an unknown class that may define any
+/// method and never resolves it as a reference.
+pub const OPAQUE_BASE: &str = "<opaque>";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractedReference {
     pub name: String,

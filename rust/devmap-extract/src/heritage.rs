@@ -19,7 +19,7 @@
 //! an actual parse of the language in question; the fixtures that produced them
 //! are in `tests/heritage.rs`, which fails if a grammar renames one.
 
-use crate::model::{ExtractedReference, ReferenceKind, Span};
+use crate::model::{ExtractedReference, ReferenceKind, Span, OPAQUE_BASE};
 use tree_sitter::Node;
 
 /// Whether a supertype was stated as an interface the type implements.
@@ -49,12 +49,6 @@ impl Relation {
         }
     }
 }
-
-/// The reference name recorded, in position, for a Python positional base
-/// that names no class: `*mixins`, `make_base()`, `A if c else B`. It is no
-/// identifier, so it can never equal a declared class; the resolver reads it
-/// as an unknown class that may define any method and does not resolve it.
-pub const OPAQUE_BASE: &str = "<opaque>";
 
 /// The expression that names a Python base: parentheses and a subscript
 /// (`Base[int]`) are stripped to the value they wrap. The node itself when it

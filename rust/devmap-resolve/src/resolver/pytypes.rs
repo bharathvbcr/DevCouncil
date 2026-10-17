@@ -10,7 +10,6 @@
 //! the name was proven to live in.
 
 use super::*;
-use devmap_extract::heritage::OPAQUE_BASE;
 
 /// What a Python call on a class resolves to: the declaring file, the method's
 /// identity, and the class that declares it (which is a base class when the

@@ -81,6 +81,7 @@ mod primary_languages;
 mod python_class_identity;
 #[cfg(feature = "parse")]
 mod python_field_super_attack;
+#[cfg(feature = "parse")]
 mod python_field_super_attack2;
 #[cfg(feature = "parse")]
 mod python_import_module_literal;

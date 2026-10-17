@@ -364,7 +364,7 @@ fn python_bases(source: &str) -> Vec<(String, usize)> {
 /// subscript are stripped to the name they wrap.
 #[test]
 fn a_python_base_no_name_denotes_is_an_opaque_marker_in_position() {
-    use devmap_extract::heritage::OPAQUE_BASE;
+    use devmap_extract::model::OPAQUE_BASE;
     let names = |source: &str| -> Vec<String> {
         python_bases(source)
             .into_iter()

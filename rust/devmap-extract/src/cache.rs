@@ -718,7 +718,7 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// not), and a subscripted base (`Base[int]`) is its value. A v94 row recorded
 /// keyword arguments as bases.
 ///
-/// v96 makes two changes. It changes Python heritage again: parentheses around
+/// v96 changes Python heritage again: parentheses around
 /// a base are stripped; any other positional entry that is not a name, an
 /// attribute or a subscript of one (`*mixins`, `make_base()`, `A if c else B`)
 /// is recorded in position as the opaque marker [`crate::model::OPAQUE_BASE`],
@@ -726,8 +726,10 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// a hierarchy with the entry missing; and a dotted base's segments keep their
 /// emission order (member first, then the qualifier from the root down) instead
 /// of being sorted by name. A v95 row dropped those entries and ordered the
-/// segments alphabetically. And it adds `Extraction::js_objects (JS/TS, including `<script>` blocks of
-/// Vue/Svelte/Astro): how each module-scope `const` object is built — literal
+/// segments alphabetically.
+///
+/// v96 also adds `Extraction::js_objects` (JS/TS, including `<script>` blocks
+/// of Vue/Svelte/Astro): how each module-scope `const` object is built — literal
 /// members, spreads, `Object.assign` sources and plain aliases, in source order
 /// — and every later write that can change its members: `Object.assign(name,
 /// …)`, `name.k = …`, `delete name.k`, `Object.defineProperty`/`Reflect.set`

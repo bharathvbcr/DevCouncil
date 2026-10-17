@@ -1294,7 +1294,7 @@ fn external_supertypes<'e>(
             // A base no name denotes is a marker for the resolver's MRO walk,
             // not a supertype this report can name.
             if base.is_empty()
-                || base == devmap_extract::heritage::OPAQUE_BASE
+                || base == devmap_extract::model::OPAQUE_BASE
                 || supertype_dispatches_nothing(base)
             {
                 continue;
