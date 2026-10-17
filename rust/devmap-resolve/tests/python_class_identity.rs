@@ -266,7 +266,7 @@ fn an_aliased_class_import_and_an_inherited_method_bind_through_the_class() {
 }
 
 #[test]
-fn super_reaches_the_base_declaration_and_abstains_on_two_bases() {
+fn super_reaches_the_base_declaration_and_follows_the_c3_order_on_two_bases() {
     let resolution = resolve(&[(
         "m.py",
         "class Base:\n    def run(self):\n        return 1\n\nclass Child(Base):\n    def run(self):\n        return super().run() + 1\n\nclass Left:\n    def go(self):\n        return 1\n\nclass Right:\n    def go(self):\n        return 2\n\nclass Both(Left, Right):\n    def go(self):\n        return super().go()\n",
@@ -275,14 +275,23 @@ fn super_reaches_the_base_declaration_and_abstains_on_two_bases() {
         methods_of(&resolution, "m.py::Child.run"),
         ["m.py::Base.run"]
     );
-    assert!(
-        methods_of(&resolution, "m.py::Both.go").is_empty(),
-        "two bases declare it: the MRO is not modelled, so no edge"
+    // `class Both(Left, Right)`: Python's C3 order is Both, Left, Right, so
+    // `super().go()` is `Left.go`. (This used to assert no edge, from before
+    // the walk modelled the MRO.)
+    assert_eq!(
+        methods_of(&resolution, "m.py::Both.go"),
+        ["m.py::Left.go"],
+        "the first base in C3 order that declares it"
     );
 }
 
+/// Python says which `Base` a `class Child(Base)` means: the one the file
+/// imports. Two files declaring the name does not make the child's base
+/// ambiguous, so the inherited method binds to the imported base and never to
+/// the namesake. (This test used to demand abstention, which was the flat
+/// `supertypes` table's limit rather than a fact about the program.)
 #[test]
-fn an_inherited_method_through_a_base_two_files_declare_is_not_bound() {
+fn an_inherited_method_through_a_base_two_files_declare_binds_the_imported_one() {
     let resolution = resolve(&[
         ("one.py", "class Base:\n    def quack(self):\n        return 1\n"),
         ("two.py", "class Base:\n    def quack(self):\n        return 2\n"),
@@ -291,10 +300,46 @@ fn an_inherited_method_through_a_base_two_files_declare_is_not_bound() {
             "from one import Base\n\nclass Child(Base):\n    pass\n\ndef run():\n    return Child().quack()\n",
         ),
     ]);
+    assert_eq!(
+        methods_of(&resolution, "child.py::run"),
+        vec!["one.py::Base.quack".to_string()]
+    );
+}
+
+/// `import one; class Child(one.Base)`: the qualified name is the class `one`
+/// declares, whatever other files call theirs. (The flat table could not say
+/// which `Base` this was and this test used to demand abstention.)
+#[test]
+fn an_inherited_method_through_a_qualified_base_two_files_declare_binds_the_imported_module_s() {
+    let resolution = resolve(&[
+        ("one.py", "class Base:\n    def quack(self):\n        return 1\n"),
+        ("two.py", "class Base:\n    def quack(self):\n        return 2\n"),
+        (
+            "child.py",
+            "import one\n\nclass Child(one.Base):\n    pass\n\ndef run():\n    return Child().quack()\n",
+        ),
+    ]);
+    assert_eq!(
+        methods_of(&resolution, "child.py::run"),
+        vec!["one.py::Base.quack".to_string()]
+    );
+}
+
+/// A base declared twice in the very file that names it is ambiguous for real:
+/// the import cannot choose, so `super()` abstains instead of binding either.
+#[test]
+fn super_through_a_base_declared_twice_in_its_own_file_is_not_bound() {
+    let resolution = resolve(&[
+        (
+            "child.py",
+            "class Base:\n    def ping(self):\n        return 1\n\nclass Base:\n    def ping(self):\n        return 2\n\nclass Child(Base):\n    def ping(self):\n        return super().ping()\n",
+        ),
+        ("other.py", "class Base:\n    def ping(self):\n        return 3\n"),
+    ]);
     assert!(
-        methods_of(&resolution, "child.py::run").is_empty(),
+        methods_of(&resolution, "child.py::Child.ping").is_empty(),
         "{:?}",
-        methods_of(&resolution, "child.py::run")
+        methods_of(&resolution, "child.py::Child.ping")
     );
 }
 

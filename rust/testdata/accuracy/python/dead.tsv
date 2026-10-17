@@ -71,4 +71,37 @@ truly_dead	micro/fieldleak/holders.py::FlHolderA.go	caller probe nothing calls
 truly_dead	micro/fieldleak/holders.py::FlHolderB.go	caller probe nothing calls
 truly_dead	micro/fieldleak/holders.py::FlHolderA	class probe nothing references
 truly_dead	micro/fieldleak/holders.py::FlHolderB	class probe nothing references
-truly_dead	micro/fieldleak/engines.py::FlOther.run	only caller is the dead probe FlHolderB.go; reported at 0.4 while the self.engine = FlOther() hop is unbound (ft-40f73e87)
+live	micro/fieldleak/engines.py::FlOther.run	RELABELLED truly_dead -> live by ft-40f73e87. Before it, only caller FlHolderB.go (a dead probe) was unbound (self.engine = FlOther() typed nothing), so run had no inbound edge and was reported at 0.4. Now the source really does call it (self.engine.run() in FlHolderB.go, whose self.engine is FlOther) and the resolver emits that edge; dead analysis is not transitive through a dead caller, so the symbol is not a candidate. The convention for a callee reached only by a dead probe is `live`, as for Duck.quack and Base.quack.
+truly_dead	micro/fieldinit/holders.py::FiAnnotated	class probe nothing references
+truly_dead	micro/fieldinit/holders.py::FiAnnotated.go	caller probe nothing calls
+truly_dead	micro/fieldinit/holders.py::FiCross	class probe nothing references
+truly_dead	micro/fieldinit/holders.py::FiCross.go	caller probe nothing calls
+truly_dead	micro/fieldinit/holders.py::FiExternal	class probe nothing references
+truly_dead	micro/fieldinit/holders.py::FiExternal.go	caller probe nothing calls
+truly_dead	micro/fieldinit/holders.py::FiFactory	class probe nothing references
+truly_dead	micro/fieldinit/holders.py::FiFactory.go	caller probe nothing calls
+truly_dead	micro/fieldinit/holders.py::FiLeakA	class probe nothing references
+truly_dead	micro/fieldinit/holders.py::FiLeakB	class probe nothing references
+truly_dead	micro/fieldinit/holders.py::FiLeakB.go	caller probe nothing calls
+truly_dead	micro/fieldinit/holders.py::FiSame	class probe nothing references
+truly_dead	micro/fieldinit/holders.py::FiSame.go	caller probe nothing calls
+truly_dead	micro/fieldinit/holders.py::FiTwice	class probe nothing references
+truly_dead	micro/fieldinit/holders.py::FiTwice.go	caller probe nothing calls
+truly_dead	micro/fieldinit/holders.py::FiTwice.reset	caller probe nothing calls
+truly_dead	micro/fieldinit/holders.py::FiUntyped	class probe nothing references
+truly_dead	micro/fieldinit/holders.py::FiUntyped.go	caller probe nothing calls
+truly_dead	micro/fieldinit/holders.py::FiWrapped	class probe nothing references
+truly_dead	micro/fieldinit/holders.py::FiWrapped.go	caller probe nothing calls
+truly_dead	micro/superkw/base_a.py::SkRight.hop	nothing calls it: SkDiamond.hop's super().hop() is SkLeft.hop in C3 order, and SkRight sits behind it in the MRO
+truly_dead	micro/superkw/base_a.py::SkSilent.other	caller probe nothing calls
+truly_dead	micro/superkw/base_b.py::SkBase.build	caller probe nothing calls
+truly_dead	micro/superkw/children.py::SkAliased	class probe nothing references
+truly_dead	micro/superkw/children.py::SkBuilder	class probe nothing references
+truly_dead	micro/superkw/children.py::SkChild	class probe nothing references
+truly_dead	micro/superkw/children.py::SkDiamond	class probe nothing references
+truly_dead	micro/superkw/children.py::SkNested	class probe nothing references
+truly_dead	micro/superkw/children.py::SkOneProvider	class probe nothing references
+truly_dead	micro/superkw/children_b.py::SkChild	class probe nothing references
+truly_dead	micro/superkw/children.py::SkExternalFirst	class probe nothing references
+truly_dead	micro/superkw/children.py::SkMeta	class probe nothing references
+truly_dead	micro/superkw/children.py::SkMetaBase.hop	nothing calls it: SkMeta.hop's super().hop() is SkLeft.hop, the metaclass keyword is not a base; reported at 0.4 unconfirmed
