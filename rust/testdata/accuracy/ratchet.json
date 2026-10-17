@@ -6,16 +6,16 @@
     "present": 51
   },
   "kotlin": {
-    "forbid_any_tier_rows": 3,
+    "forbid_any_tier_rows": 4,
     "known_failing": 9,
-    "positive_rows": 68,
-    "present": 61
+    "positive_rows": 69,
+    "present": 62
   },
   "python": {
-    "forbid_any_tier_rows": 2,
-    "known_failing": 13,
-    "positive_rows": 61,
-    "present": 50
+    "forbid_any_tier_rows": 7,
+    "known_failing": 12,
+    "positive_rows": 64,
+    "present": 52
   },
   "rust": {
     "forbid_any_tier_rows": 1,
@@ -24,15 +24,15 @@
     "present": 115
   },
   "swift": {
-    "forbid_any_tier_rows": 4,
+    "forbid_any_tier_rows": 5,
     "known_failing": 11,
-    "positive_rows": 105,
-    "present": 96
+    "positive_rows": 106,
+    "present": 97
   },
   "typescript": {
-    "forbid_any_tier_rows": 1,
+    "forbid_any_tier_rows": 3,
     "known_failing": 0,
-    "positive_rows": 71,
-    "present": 71
+    "positive_rows": 73,
+    "present": 73
   }
 }

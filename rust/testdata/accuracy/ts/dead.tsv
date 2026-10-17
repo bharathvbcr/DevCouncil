@@ -53,3 +53,12 @@ live	apps/web/src/v/external.ts::parser.startState	V20: StreamLanguage calls the
 live	apps/web/src/v/external.ts::parser.token	V20: StreamLanguage calls the parser object's token
 exported_unreferenced	apps/web/src/v/external.ts::makeEditor	nothing calls it
 exported_unreferenced	apps/web/src/lib/casefile.ts::caseHelper	C26: its only reference is PaperList.tsx's wrong-case import of ../lib/CaseFile, which must not bind
+# ft-0e6cc90f fixtures: nothing in the tree calls these.
+exported_unreferenced	apps/web/src/v/extbarreluser.ts::describeWidget	nothing calls it
+exported_unreferenced	apps/web/src/v/thingservice.ts::WidgetProps	its only mention is through a barrel that re-exports an external package
+exported_unreferenced	apps/web/src/v/thingservice.ts::fetchThing	fetchmock.test.ts calls its own module-scope mock of that name, not this export
+exported_unreferenced	apps/web/src/v/fieldleak.ts::FlHolderA	probe class nothing references
+exported_unreferenced	apps/web/src/v/fieldleak.ts::FlHolderA.go	probe method nothing calls
+exported_unreferenced	apps/web/src/v/fieldleak.ts::FlHolderB	probe class nothing references
+exported_unreferenced	apps/web/src/v/fieldleak.ts::FlHolderB.go	probe method nothing calls
+exported_unreferenced	apps/web/src/v/fieldleak.ts::FlOther.run	only caller is the dead probe FlHolderB.go

@@ -135,3 +135,5 @@ sw.T7.not	T7	micro/Sources/M/Q6.swift::roll	micro/Sources/M/Q7.swift::Rng.next	f
 sw.E1	E1	micro/Sources/M/Q8.swift::Joiner.apply	micro/Sources/M/Q8.swift::Case.apply	edge	must		open.transform.apply(x): labelled-tuple parameter member typed Case, beside a same-named enclosing method
 sw.Y1	Y1	micro/Sources/M/Q9.swift::Depot.tally	micro/Sources/M/Q9.swift::Lot.mass	edge	must		cross-file extension typealias (declared in Q10): Stock is Lot inside Depot, so the closure element is Lot
 sw.Y1.not	Y1	micro/Sources/M/Q9.swift::Depot.tally	micro/Sources/M/Q9.swift::Stock.mass	forbid	must		top-level Stock is shadowed by the extension typealias inside Depot
+sw.FL1.not	FL1	micro/Sources/M/FieldLeak.swift::FlHolderB.go	micro/Sources/M/FieldLeak.swift::FlEngine.run	forbid_any_tier	must		FlHolderA typed property engine must not type FlHolderB inferred engine
+sw.FL1.ctl	FL1	micro/Sources/M/FieldLeak.swift::FlHolderA.go	micro/Sources/M/FieldLeak.swift::FlEngine.run	edge	must		control: the declaring struct still binds

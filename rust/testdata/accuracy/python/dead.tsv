@@ -41,7 +41,19 @@ truly_dead	lib/pkg/typed_user.py::Sized	SH1/SH2 fixture; nothing calls it
 truly_dead	lib/pkg/typed_user.py::Sized.size	SH1/SH2 fixture; nothing calls it
 truly_dead	lib/pkg/typed_user.py::local_shadow	SH1/SH2 fixture; nothing calls it
 truly_dead	other/typing_namesakes.py::shadowed_target	SH2: the only call site is shadowed by a local lambda in local_shadow
-# Once ft-0e6cc90f lands, other/typing_namesakes.py::Literal and ::Protocol lose their false callers and dead will report them: the fixer must label them here.
+# ft-0e6cc90f: the in-repo namesakes lost their false callers (a typing/collections.abc/numpy import is not them), so nothing calls them.
+truly_dead	other/typing_namesakes.py::Literal	SH1: only typed_user.py's `from typing import Literal` names it, and that is typing's
+truly_dead	other/typing_namesakes.py::Protocol	SH1: only typed_user.py's `from typing import Protocol` names it, and that is typing's
+truly_dead	other/typing_namesakes.py::Callable	SH1: only typed_user.py's `from collections.abc import Callable` names it, and that is the stdlib's
+truly_dead	other/typing_namesakes.py::ndarray	ST1: only star_ext.py's annotation names it, and that is numpy's via `from numpy import *`
+truly_dead	other/typing_namesakes.py::zeros	ST1: only star_ext.py's zeros() names it, and that is numpy's via `from numpy import *`
+truly_dead	other/typing_namesakes.py::ones	ST3: star_loc.py's ones() is starlocal.ones, the module its star import names
+truly_dead	lib/pkg/typed_user.py::run_cb	SH1 fixture; nothing calls it
+truly_dead	lib/pkg/local_literal.py::local_literal	SH1 fixture; nothing calls it
+truly_dead	lib/pkg/star_ext.py::make	ST1 fixture; nothing calls it
+truly_dead	lib/pkg/star_ext.py::typed	ST1 fixture; nothing calls it
+truly_dead	lib/pkg/star_loc.py::use	ST3 fixture; nothing calls it
+live	lib/pkg/starlocal.py::ones	ST3: star_loc.use calls it through `from pkg.starlocal import *`
 truly_dead	micro/zqpkg/calls.py::use_call_result	caller probe nothing calls
 truly_dead	micro/zqpkg/calls.py::use_function_attribute	caller probe nothing calls
 truly_dead	micro/zqpkg/calls.py::use_tuple_unpack	caller probe nothing calls
@@ -55,3 +67,8 @@ truly_dead	micro/zqpkg/step_a.py::build_a	caller probe nothing calls
 truly_dead	micro/zqpkg/step_c.py::build_c	caller probe nothing calls
 truly_dead	micro/zqpkg/step_b.py::use_b	caller probe nothing calls
 truly_dead	micro/zqpkg/anchors.py::anchor	caller probe nothing calls
+truly_dead	micro/fieldleak/holders.py::FlHolderA.go	caller probe nothing calls
+truly_dead	micro/fieldleak/holders.py::FlHolderB.go	caller probe nothing calls
+truly_dead	micro/fieldleak/holders.py::FlHolderA	class probe nothing references
+truly_dead	micro/fieldleak/holders.py::FlHolderB	class probe nothing references
+truly_dead	micro/fieldleak/engines.py::FlOther.run	only caller is the dead probe FlHolderB.go; reported at 0.4 while the self.engine = FlOther() hop is unbound (ft-40f73e87)

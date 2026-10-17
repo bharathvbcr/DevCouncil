@@ -68,3 +68,5 @@ kt.K21	K21	app/src/androidTest/java/com/fx/app/HeaderUiTest.kt::HeaderUiTest.sho
 kt.K22	K22	app/build.gradle.kts	app/build.gradle.kts::versionCodeFor	edge	must		
 kt.K06	K06	core/src/main/java/com/fx/core/util/Formatting.kt::Task.label	core/src/main/java/com/fx/core/util/Formatting.kt::String.slugify	edge	must		
 kt.K06b	K06	app/src/main/java/com/fx/app/MainActivity.kt::MainActivity.onCreate	core/src/main/java/com/fx/core/util/Formatting.kt::Task.label	edge	must		reference to a property
+kt.FL1.not	FL1	core/src/main/java/com/fx/core/util/FieldLeak.kt::FlHolderB.go	core/src/main/java/com/fx/core/util/FieldLeak.kt::FlEngine.tick	forbid_any_tier	must		FlHolderA typed property engine must not type FlHolderB inferred engine
+kt.FL1.ctl	FL1	core/src/main/java/com/fx/core/util/FieldLeak.kt::FlHolderA.go	core/src/main/java/com/fx/core/util/FieldLeak.kt::FlEngine.tick	edge	must		control: the declaring class still binds
