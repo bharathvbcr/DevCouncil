@@ -684,11 +684,24 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// so a call through an interface stays unbound and a Go embedding stays
 /// invisible until the file is edited.
 ///
-/// v92 integrates the Rust, TypeScript/Go and Swift lanes. The first two each
-/// stamped 90 on different payloads and the Swift lane adds `swift_type_aliases`
-/// to the extractor output without a bump, so 92 is a number no lane stamped and
-/// no cached payload can share.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "92";
+/// v90 (main's Swift recall lane) is the Swift receiver-typing payload: a
+/// receiver or constructor named through a same-file `typealias` is the aliased
+/// type, `(x as? T)?.m()` is a call on `T`, a tuple parameter's member is a
+/// receiver of its written type, a bare call of a type's own parameterless
+/// method types the local it initialises, a SwiftData `fetch(FetchDescriptor<T>)`
+/// is `[T]`, a Swift name is not a local inside its own initializer, a member
+/// chain after a sum (`a + b.c.run()`) has the receiver `b.c`, and the file's
+/// own scoping (a generic parameter, a local typealias, an associatedtype, a
+/// rebinding) makes the extractor abstain.
+///
+/// v92 integrates the Rust, TypeScript/Go and Swift lanes (the Swift lane adds
+/// `swift_type_aliases` to the extractor output without a bump).
+///
+/// v93 integrates main into that branch. Main stamped 90 on the Swift
+/// receiver-typing payload above while this branch's lanes stamped 90 (Rust,
+/// TypeScript/Go) and 92 on other payloads, so 93 is a number no binary has
+/// cached under a different meaning.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "93";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

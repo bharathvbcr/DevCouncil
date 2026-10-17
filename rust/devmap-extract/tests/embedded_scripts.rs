@@ -873,9 +873,15 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // as heritage. Both are additive: a v89 row looks complete and would keep
     // serving calls through those interfaces with no method to dispatch to.
     //
-    // v92 integrates the Rust, TypeScript/Go and Swift lanes (see cache.rs).
+    // v90 (main) is the Swift receiver-typing payload: receivers typed by a
+    // same-file `typealias`, a parenthesised cast, a tuple parameter's member,
+    // a type's own method return and a SwiftData fetch, with scope-aware
+    // abstentions.
+    //
+    // v92 integrates the Rust, TypeScript/Go and Swift lanes; v93 integrates
+    // main's Swift payload on top (see cache.rs).
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "92",
+        EXTRACTION_SCHEMA_VERSION, "93",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );

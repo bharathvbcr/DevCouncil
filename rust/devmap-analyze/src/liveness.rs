@@ -1109,19 +1109,20 @@ pub const COVERAGE_LOSS_REASON: &str =
 /// on every corpus of it (`testdata/accuracy/record.json`: 20 local
 /// repositories, every language each holds listed — `rows: 0` where its
 /// confident branch was empty). Measured there: Go 0/17 (all from one corpus),
-/// TypeScript 0/29, TSX 0/14, Rust 0/3, Kotlin 0/9 — and Kotlin's nine are all
-/// coverage-capped at 0.66; the only two Kotlin rows *published* at 0.9 are
-/// labelled `unsure` (operator extensions a library member may shadow) and sit
-/// outside the count.
+/// TypeScript 0/29, TSX 0/14, Rust 0/3.
 ///
-/// Off the list: **Swift**, measured on ten corpora with no confident-branch
+/// Off the list: **Kotlin**, whose only corpus proof was nine ChronosFlow rows
+/// (0/9, all coverage-capped at 0.66) scored on 2026-10-15 (26c5139b). Their
+/// dead labels are lost, so the rows are carried and unverified in
+/// `record.json` (`carried_dead_evidence`) and no longer count; re-labelling
+/// is tracked by ft-8ed75897. **Swift**, measured on ten corpora with no confident-branch
 /// row on any — its examined population is `private` members something
 /// reaches — so nothing beyond one fixture row has ever tested it; **Python**,
 /// 17 of 58 corpus rows false (string dispatch, an aliased import, module
 /// constants read from other files, calls through a Protocol), causes the
 /// L-Python and interface-dispatch cards own. Each comes back when the record
 /// says so.
-pub const CONFIDENT_TIER_ELIGIBLE: &[&str] = &["go", "kotlin", "rust", "tsx", "typescript"];
+pub const CONFIDENT_TIER_ELIGIBLE: &[&str] = &["go", "rust", "tsx", "typescript"];
 
 /// Whether `language` may publish dead rows in the confident tier.
 pub fn confident_tier_eligible(language: &str) -> bool {

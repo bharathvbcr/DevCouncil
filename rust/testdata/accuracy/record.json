@@ -1272,7 +1272,7 @@
         "typescript": {
           "confident_edge_precision": {
             "correct": 172,
-            "rate": 0.9608938547486033,
+            "rate": 0.9608938547486032,
             "total": 179
           },
           "date": "2026-10-15",
@@ -1280,7 +1280,7 @@
           "devmap_commit": "bcba2d60c0f7a4839ff0ca0a8f1d3a6643bf5add",
           "honest_miss": {
             "absent": 27,
-            "rate": 0.9629629629629629,
+            "rate": 0.9629629629629628,
             "recorded": 26
           },
           "labelled_rows": [],
@@ -1303,7 +1303,7 @@
               },
               "self_method": {
                 "correct": 95,
-                "rate": 0.9223300970873787,
+                "rate": 0.9223300970873788,
                 "total": 103
               },
               "typed_receiver": {
@@ -1395,7 +1395,7 @@
               }
             },
             "present": 162,
-            "rate": 0.9050279329608939,
+            "rate": 0.905027932960894,
             "total": 179
           },
           "unique_global_precision": {
@@ -1417,25 +1417,25 @@
             "rate": 0.9722222222222222,
             "total": 180
           },
-          "date": "2026-10-15",
+          "date": "2026-10-16",
           "dead_fp_by_tier": {},
-          "devmap_commit": "735e210eeb29a1d8bd94908268fc823808de806e",
+          "devmap_commit": "251d798f2f58069ba698c4a379b8323709903753",
           "honest_miss": {
-            "absent": 22,
+            "absent": 16,
             "rate": 1.0,
-            "recorded": 22
+            "recorded": 16
           },
           "labelled_rows": [],
           "recall": {
             "by_construct": {
               "bare": {
-                "correct": 39,
-                "rate": 0.9069767441860465,
+                "correct": 40,
+                "rate": 0.9302325581395348,
                 "total": 43
               },
               "chained": {
-                "correct": 4,
-                "rate": 0.5714285714285714,
+                "correct": 5,
+                "rate": 0.7142857142857143,
                 "total": 7
               },
               "constructor": {
@@ -1445,12 +1445,12 @@
               },
               "module_qualified": {
                 "correct": 37,
-                "rate": 0.9487179487179487,
+                "rate": 0.9487179487179488,
                 "total": 39
               },
               "other": {
-                "correct": 2,
-                "rate": 0.3333333333333333,
+                "correct": 6,
+                "rate": 1.0,
                 "total": 6
               },
               "self_method": {
@@ -1464,13 +1464,13 @@
                 "total": 25
               }
             },
-            "present": 160,
-            "rate": 0.8791208791208791,
+            "present": 166,
+            "rate": 0.912087912087912,
             "total": 182
           },
           "unique_global_precision": {
             "correct": 32,
-            "rate": 0.9142857142857143,
+            "rate": 0.9142857142857144,
             "total": 35
           },
           "unsure": 0
@@ -1482,85 +1482,95 @@
       "corpus_commit": "b7a23d41c02e4e8cb88a9c6e4c96dc2c1ed2cdc4",
       "languages": {
         "kotlin": {
+          "carried_dead_evidence": {
+            "dead_fp_by_tier": {
+              "0.9": {
+                "false_positive": 0,
+                "rows": 9
+              }
+            },
+            "devmap_commit": "735e210eeb29a1d8bd94908268fc823808de806e",
+            "labelled_rows": [
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:afa825cdd6a9",
+                "verdict": "dead_true"
+              },
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:d27961dc3195",
+                "verdict": "dead_true"
+              },
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:9d58deeb07a7",
+                "verdict": "dead_true"
+              },
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:fdac8e796abf",
+                "verdict": "dead_true"
+              },
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:13af50120f5d",
+                "verdict": "dead_true"
+              },
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:ec479619d2a1",
+                "verdict": "dead_true"
+              },
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:eea668c56c21",
+                "verdict": "dead_true"
+              },
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:9ca12c9598c3",
+                "verdict": "dead_true"
+              },
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:b02cd7b020d7",
+                "verdict": "dead_true"
+              }
+            ],
+            "reason": "the dead labels these rows were scored from are lost. At 251d798f all 9 rows (matched by identity hash) are still reported by devmap dead, but coverage-capped at 0.66, none published at 0.9; their dead_true verdicts are not re-scored and their published tier of 0.9 is no longer what devmap reports",
+            "since": "2026-10-15",
+            "source_commit": "26c5139b",
+            "status": "carried, not re-scored",
+            "verified": false
+          },
           "confident_edge_precision": {
             "correct": 179,
-            "rate": 0.9944444444444445,
+            "rate": 0.9944444444444444,
             "total": 180
           },
-          "date": "2026-10-15",
-          "dead_fp_by_tier": {
-            "0.9": {
-              "false_positive": 0,
-              "rows": 9
-            }
-          },
-          "devmap_commit": "735e210eeb29a1d8bd94908268fc823808de806e",
+          "date": "2026-10-16",
+          "dead_fp_by_tier": {},
+          "devmap_commit": "251d798f2f58069ba698c4a379b8323709903753",
           "honest_miss": {
             "absent": 13,
             "rate": 1.0,
             "recorded": 13
           },
-          "labelled_rows": [
-            {
-              "evidence": "rg_declaration_only",
-              "published": "0.9",
-              "symbol": "h:afa825cdd6a9",
-              "verdict": "dead_true"
-            },
-            {
-              "evidence": "rg_declaration_only",
-              "published": "0.9",
-              "symbol": "h:d27961dc3195",
-              "verdict": "dead_true"
-            },
-            {
-              "evidence": "rg_declaration_only",
-              "published": "0.9",
-              "symbol": "h:9d58deeb07a7",
-              "verdict": "dead_true"
-            },
-            {
-              "evidence": "rg_declaration_only",
-              "published": "0.9",
-              "symbol": "h:fdac8e796abf",
-              "verdict": "dead_true"
-            },
-            {
-              "evidence": "rg_declaration_only",
-              "published": "0.9",
-              "symbol": "h:13af50120f5d",
-              "verdict": "dead_true"
-            },
-            {
-              "evidence": "rg_declaration_only",
-              "published": "0.9",
-              "symbol": "h:ec479619d2a1",
-              "verdict": "dead_true"
-            },
-            {
-              "evidence": "rg_declaration_only",
-              "published": "0.9",
-              "symbol": "h:eea668c56c21",
-              "verdict": "dead_true"
-            },
-            {
-              "evidence": "rg_declaration_only",
-              "published": "0.9",
-              "symbol": "h:9ca12c9598c3",
-              "verdict": "dead_true"
-            },
-            {
-              "evidence": "rg_declaration_only",
-              "published": "0.9",
-              "symbol": "h:b02cd7b020d7",
-              "verdict": "dead_true"
-            }
-          ],
+          "labelled_rows": [],
           "recall": {
             "by_construct": {
               "bare": {
                 "correct": 64,
-                "rate": 0.9411764705882353,
+                "rate": 0.9411764705882352,
                 "total": 68
               },
               "chained": {
@@ -1605,7 +1615,7 @@
           },
           "unique_global_precision": {
             "correct": 46,
-            "rate": 0.9787234042553191,
+            "rate": 0.9787234042553192,
             "total": 47
           },
           "unsure": 0
@@ -1616,20 +1626,20 @@
             "rate": 0.9774011299435028,
             "total": 177
           },
-          "date": "2026-10-15",
+          "date": "2026-10-16",
           "dead_fp_by_tier": {},
-          "devmap_commit": "735e210eeb29a1d8bd94908268fc823808de806e",
+          "devmap_commit": "251d798f2f58069ba698c4a379b8323709903753",
           "honest_miss": {
-            "absent": 31,
+            "absent": 24,
             "rate": 1.0,
-            "recorded": 31
+            "recorded": 24
           },
           "labelled_rows": [],
           "recall": {
             "by_construct": {
               "bare": {
-                "correct": 59,
-                "rate": 0.9516129032258065,
+                "correct": 61,
+                "rate": 0.9838709677419356,
                 "total": 62
               },
               "chained": {
@@ -1643,13 +1653,13 @@
                 "total": 32
               },
               "module_qualified": {
-                "correct": 40,
-                "rate": 0.8888888888888888,
+                "correct": 41,
+                "rate": 0.9111111111111112,
                 "total": 45
               },
               "other": {
-                "correct": 5,
-                "rate": 0.21739130434782608,
+                "correct": 9,
+                "rate": 0.391304347826087,
                 "total": 23
               },
               "self_method": {
@@ -1663,8 +1673,8 @@
                 "total": 11
               }
             },
-            "present": 191,
-            "rate": 0.8603603603603603,
+            "present": 198,
+            "rate": 0.8918918918918919,
             "total": 222
           },
           "unique_global_precision": {
@@ -1983,10 +1993,10 @@
     {
       "analysis_status": "Partial { reason: \"call extraction did not cover the whole corpus: 0 file(s) failed to parse, 2 recovered by pattern (no calls extracted), 0 refused by discovery and never read at all — dead-code and unwired findings are a lower bound and are capped below the confident tier; 1 file(s) parsed with ERROR/MISSING regions, so declarations and calls inside those regions are absent\" }",
       "corpus_commit": "782a53424f646b49d4660a0c06981d55bbccfcac",
-      "date": "2026-10-15",
-      "dead_rows_exempt": 5757,
-      "dead_rows_total": 5760,
-      "devmap_commit": "735e210eeb29a1d8bd94908268fc823808de806e",
+      "date": "2026-10-16",
+      "dead_rows_exempt": 5747,
+      "dead_rows_total": 5748,
+      "devmap_commit": "251d798f2f58069ba698c4a379b8323709903753",
       "includes_commits": [
         "d0552ae16cc969a98d2055bd90efba473306c278",
         "12dbea1b41fa77041e60015241593e0af85a86ce",
@@ -2001,27 +2011,27 @@
         "swift": {
           "ambiguous_global_edges": 0,
           "dead_rows_by_tier": {
-            "0.4": 3
+            "0.4": 1
           },
-          "high_confidence_edges": 25654,
-          "net_resolution_permille": 530,
-          "unattributed_rows": 23143,
+          "high_confidence_edges": 25832,
+          "net_resolution_permille": 534,
+          "unattributed_rows": 22938,
           "unresolved_rows_by_class": {
-            "builtin": 16025,
-            "external": 18015,
-            "local_binding": 984,
-            "no_namesake": 36630,
-            "uninferred_receiver": 21661,
+            "builtin": 16029,
+            "external": 18030,
+            "local_binding": 918,
+            "no_namesake": 36594,
+            "uninferred_receiver": 21522,
             "unresolved": 498
           },
-          "use_edges": 26005,
+          "use_edges": 26183,
           "use_edges_by_resolution": {
             "Dispatch": 351,
-            "ImportScoped": 7034,
-            "ReceiverType": 7760,
-            "SameFile": 7195,
+            "ImportScoped": 7046,
+            "ReceiverType": 7857,
+            "SameFile": 7260,
             "SamePackage": 3165,
-            "UniqueGlobal": 500
+            "UniqueGlobal": 504
           }
         }
       },
@@ -2030,10 +2040,10 @@
     {
       "analysis_status": "Partial { reason: \"call extraction did not cover the whole corpus: 3 file(s) failed to parse, 3 recovered by pattern (no calls extracted), 0 refused by discovery and never read at all — dead-code and unwired findings are a lower bound and are capped below the confident tier; 3 file(s) parsed with ERROR/MISSING regions, so declarations and calls inside those regions are absent\" }",
       "corpus_commit": "b7a23d41c02e4e8cb88a9c6e4c96dc2c1ed2cdc4",
-      "date": "2026-10-15",
+      "date": "2026-10-16",
       "dead_rows_exempt": 5099,
-      "dead_rows_total": 5294,
-      "devmap_commit": "735e210eeb29a1d8bd94908268fc823808de806e",
+      "dead_rows_total": 5291,
+      "devmap_commit": "251d798f2f58069ba698c4a379b8323709903753",
       "includes_commits": [
         "d0552ae16cc969a98d2055bd90efba473306c278",
         "12dbea1b41fa77041e60015241593e0af85a86ce",
@@ -2074,26 +2084,26 @@
         "swift": {
           "ambiguous_global_edges": 0,
           "dead_rows_by_tier": {
-            "0.4": 44,
+            "0.4": 41,
             "0.9": 1
           },
-          "high_confidence_edges": 6087,
-          "net_resolution_permille": 537,
-          "unattributed_rows": 5309,
+          "high_confidence_edges": 6124,
+          "net_resolution_permille": 542,
+          "unattributed_rows": 5253,
           "unresolved_rows_by_class": {
             "builtin": 7392,
             "external": 5418,
-            "local_binding": 189,
+            "local_binding": 183,
             "no_namesake": 15930,
-            "uninferred_receiver": 4432,
+            "uninferred_receiver": 4382,
             "unresolved": 688
           },
-          "use_edges": 6089,
+          "use_edges": 6126,
           "use_edges_by_resolution": {
             "Dispatch": 2,
             "ImportScoped": 1290,
-            "ReceiverType": 836,
-            "SameFile": 2410,
+            "ReceiverType": 867,
+            "SameFile": 2416,
             "SamePackage": 1520,
             "UniqueGlobal": 31
           }
@@ -2144,8 +2154,9 @@
     "Chronicle: typescript: honest-miss rate is unmeasured (no labels), so it cannot pass",
     "Chronicle: typescript: recall card target 0.850 is unmeasured (no labels), so it cannot pass",
     "Chronicle: typescript: recall is unmeasured (no labels), so it cannot pass",
+    "ChronosFlow: kotlin: 0.9-tier dead false-positive rate is unmeasured (no labels), so it cannot pass",
     "ChronosFlow: swift: 0.9-tier dead false-positive rate is unmeasured (no labels), so it cannot pass",
-    "ChronosFlow: swift: recall 0.860 is below the card target 0.900",
+    "ChronosFlow: swift: recall 0.892 is below the card target 0.900",
     "DevPrism: no label-free measurement at the pinned commit af20d777393e95127404b5611275f67e9f81f130",
     "DevPrism: rust: 0.9-tier dead false-positive rate is unmeasured (no labels), so it cannot pass",
     "DevPrism: rust: AmbiguousGlobal edges are unmeasured (no label-free measurement), so the =0 gate cannot pass",
@@ -2165,7 +2176,6 @@
     "DevPrism: typescript: recall is unmeasured (no labels), so it cannot pass",
     "DevType: swift: 0.9-tier dead false-positive rate is unmeasured (no labels), so it cannot pass",
     "DevType: swift: UniqueGlobal precision 0.914 is below 0.950",
-    "DevType: swift: recall 0.879 is below the card target 0.900",
     "GitPulse: rust: 0.9-tier dead false-positive rate is unmeasured (no labels), so it cannot pass",
     "GitPulse: rust: UniqueGlobal precision is unmeasured (no labelled UniqueGlobal edge), so it cannot pass",
     "GitPulse: rust: confident edge precision is unmeasured (no labels), so it cannot pass",
@@ -3611,6 +3621,412 @@
       },
       "list": "corpora",
       "superseded_on": "2026-10-15"
+    },
+    {
+      "entry": {
+        "analysis_status": "Partial { reason: \"call extraction did not cover the whole corpus: 0 file(s) failed to parse, 2 recovered by pattern (no calls extracted), 0 refused by discovery and never read at all — dead-code and unwired findings are a lower bound and are capped below the confident tier; 1 file(s) parsed with ERROR/MISSING regions, so declarations and calls inside those regions are absent\" }",
+        "corpus_commit": "782a53424f646b49d4660a0c06981d55bbccfcac",
+        "date": "2026-10-15",
+        "dead_rows_exempt": 5757,
+        "dead_rows_total": 5760,
+        "devmap_commit": "735e210eeb29a1d8bd94908268fc823808de806e",
+        "includes_commits": [
+          "d0552ae16cc969a98d2055bd90efba473306c278",
+          "12dbea1b41fa77041e60015241593e0af85a86ce",
+          "c741fb54d97577a1e035daf70d82138cbbd24897",
+          "f302675b4aec6cc0ffa870a0126c15585681835a",
+          "c06a3ca813aa7e6c81fdc084c4947df418192312",
+          "b738ea6fb4039c3ebe003316d62b16860159c2d1",
+          "3e29ccba2b3f7cfe4d56f1808d8f6d445efaeca9",
+          "5a990463dd61464d9721dffc973acaae9f95c8e4"
+        ],
+        "languages": {
+          "swift": {
+            "ambiguous_global_edges": 0,
+            "dead_rows_by_tier": {
+              "0.4": 3
+            },
+            "high_confidence_edges": 25654,
+            "net_resolution_permille": 530,
+            "unattributed_rows": 23143,
+            "unresolved_rows_by_class": {
+              "builtin": 16025,
+              "external": 18015,
+              "local_binding": 984,
+              "no_namesake": 36630,
+              "uninferred_receiver": 21661,
+              "unresolved": 498
+            },
+            "use_edges": 26005,
+            "use_edges_by_resolution": {
+              "Dispatch": 351,
+              "ImportScoped": 7034,
+              "ReceiverType": 7760,
+              "SameFile": 7195,
+              "SamePackage": 3165,
+              "UniqueGlobal": 500
+            }
+          }
+        },
+        "name": "DevType"
+      },
+      "list": "measurements",
+      "superseded_on": "2026-10-16"
+    },
+    {
+      "entry": {
+        "corpus_commit": "782a53424f646b49d4660a0c06981d55bbccfcac",
+        "languages": {
+          "swift": {
+            "confident_edge_precision": {
+              "correct": 175,
+              "rate": 0.9722222222222222,
+              "total": 180
+            },
+            "date": "2026-10-15",
+            "dead_fp_by_tier": {},
+            "devmap_commit": "735e210eeb29a1d8bd94908268fc823808de806e",
+            "honest_miss": {
+              "absent": 22,
+              "rate": 1.0,
+              "recorded": 22
+            },
+            "labelled_rows": [],
+            "recall": {
+              "by_construct": {
+                "bare": {
+                  "correct": 39,
+                  "rate": 0.9069767441860463,
+                  "total": 43
+                },
+                "chained": {
+                  "correct": 4,
+                  "rate": 0.5714285714285714,
+                  "total": 7
+                },
+                "constructor": {
+                  "correct": 22,
+                  "rate": 1.0,
+                  "total": 22
+                },
+                "module_qualified": {
+                  "correct": 37,
+                  "rate": 0.9487179487179488,
+                  "total": 39
+                },
+                "other": {
+                  "correct": 2,
+                  "rate": 0.3333333333333333,
+                  "total": 6
+                },
+                "self_method": {
+                  "correct": 39,
+                  "rate": 0.975,
+                  "total": 40
+                },
+                "typed_receiver": {
+                  "correct": 17,
+                  "rate": 0.68,
+                  "total": 25
+                }
+              },
+              "present": 160,
+              "rate": 0.8791208791208791,
+              "total": 182
+            },
+            "unique_global_precision": {
+              "correct": 32,
+              "rate": 0.9142857142857144,
+              "total": 35
+            },
+            "unsure": 0
+          }
+        },
+        "name": "DevType"
+      },
+      "list": "corpora",
+      "superseded_on": "2026-10-16"
+    },
+    {
+      "entry": {
+        "analysis_status": "Partial { reason: \"call extraction did not cover the whole corpus: 3 file(s) failed to parse, 3 recovered by pattern (no calls extracted), 0 refused by discovery and never read at all — dead-code and unwired findings are a lower bound and are capped below the confident tier; 3 file(s) parsed with ERROR/MISSING regions, so declarations and calls inside those regions are absent\" }",
+        "corpus_commit": "b7a23d41c02e4e8cb88a9c6e4c96dc2c1ed2cdc4",
+        "date": "2026-10-15",
+        "dead_rows_exempt": 5099,
+        "dead_rows_total": 5294,
+        "devmap_commit": "735e210eeb29a1d8bd94908268fc823808de806e",
+        "includes_commits": [
+          "d0552ae16cc969a98d2055bd90efba473306c278",
+          "12dbea1b41fa77041e60015241593e0af85a86ce",
+          "c741fb54d97577a1e035daf70d82138cbbd24897",
+          "f302675b4aec6cc0ffa870a0126c15585681835a",
+          "c06a3ca813aa7e6c81fdc084c4947df418192312",
+          "b738ea6fb4039c3ebe003316d62b16860159c2d1",
+          "3e29ccba2b3f7cfe4d56f1808d8f6d445efaeca9",
+          "5a990463dd61464d9721dffc973acaae9f95c8e4"
+        ],
+        "languages": {
+          "kotlin": {
+            "ambiguous_global_edges": 0,
+            "dead_rows_by_tier": {
+              "0.4": 137,
+              "0.9": 13
+            },
+            "high_confidence_edges": 25812,
+            "net_resolution_permille": 750,
+            "unattributed_rows": 10256,
+            "unresolved_rows_by_class": {
+              "builtin": 2696,
+              "external": 28142,
+              "local_binding": 606,
+              "no_namesake": 43099,
+              "uninferred_receiver": 8476,
+              "unresolved": 1174
+            },
+            "use_edges": 26933,
+            "use_edges_by_resolution": {
+              "Dispatch": 1121,
+              "ImportScoped": 13321,
+              "ReceiverType": 4185,
+              "SameFile": 5586,
+              "UniqueGlobal": 2720
+            }
+          },
+          "swift": {
+            "ambiguous_global_edges": 0,
+            "dead_rows_by_tier": {
+              "0.4": 44,
+              "0.9": 1
+            },
+            "high_confidence_edges": 6087,
+            "net_resolution_permille": 537,
+            "unattributed_rows": 5309,
+            "unresolved_rows_by_class": {
+              "builtin": 7392,
+              "external": 5418,
+              "local_binding": 189,
+              "no_namesake": 15930,
+              "uninferred_receiver": 4432,
+              "unresolved": 688
+            },
+            "use_edges": 6089,
+            "use_edges_by_resolution": {
+              "Dispatch": 2,
+              "ImportScoped": 1290,
+              "ReceiverType": 836,
+              "SameFile": 2410,
+              "SamePackage": 1520,
+              "UniqueGlobal": 31
+            }
+          }
+        },
+        "name": "ChronosFlow"
+      },
+      "list": "measurements",
+      "superseded_on": "2026-10-16"
+    },
+    {
+      "entry": {
+        "corpus_commit": "b7a23d41c02e4e8cb88a9c6e4c96dc2c1ed2cdc4",
+        "languages": {
+          "kotlin": {
+            "confident_edge_precision": {
+              "correct": 179,
+              "rate": 0.9944444444444444,
+              "total": 180
+            },
+            "date": "2026-10-15",
+            "dead_fp_by_tier": {
+              "0.9": {
+                "false_positive": 0,
+                "rows": 9
+              }
+            },
+            "devmap_commit": "735e210eeb29a1d8bd94908268fc823808de806e",
+            "honest_miss": {
+              "absent": 13,
+              "rate": 1.0,
+              "recorded": 13
+            },
+            "labelled_rows": [
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:afa825cdd6a9",
+                "verdict": "dead_true"
+              },
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:d27961dc3195",
+                "verdict": "dead_true"
+              },
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:9d58deeb07a7",
+                "verdict": "dead_true"
+              },
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:fdac8e796abf",
+                "verdict": "dead_true"
+              },
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:13af50120f5d",
+                "verdict": "dead_true"
+              },
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:ec479619d2a1",
+                "verdict": "dead_true"
+              },
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:eea668c56c21",
+                "verdict": "dead_true"
+              },
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:9ca12c9598c3",
+                "verdict": "dead_true"
+              },
+              {
+                "evidence": "rg_declaration_only",
+                "published": "0.9",
+                "symbol": "h:b02cd7b020d7",
+                "verdict": "dead_true"
+              }
+            ],
+            "recall": {
+              "by_construct": {
+                "bare": {
+                  "correct": 64,
+                  "rate": 0.9411764705882352,
+                  "total": 68
+                },
+                "chained": {
+                  "correct": 0,
+                  "rate": 0.0,
+                  "total": 1
+                },
+                "constructor": {
+                  "correct": 52,
+                  "rate": 1.0,
+                  "total": 52
+                },
+                "module_qualified": {
+                  "correct": 25,
+                  "rate": 0.9615384615384616,
+                  "total": 26
+                },
+                "other": {
+                  "correct": 0,
+                  "rate": 0.0,
+                  "total": 1
+                },
+                "self_method": {
+                  "correct": 1,
+                  "rate": 1.0,
+                  "total": 1
+                },
+                "super": {
+                  "correct": 1,
+                  "rate": 1.0,
+                  "total": 1
+                },
+                "typed_receiver": {
+                  "correct": 26,
+                  "rate": 0.8125,
+                  "total": 32
+                }
+              },
+              "present": 169,
+              "rate": 0.9285714285714286,
+              "total": 182
+            },
+            "unique_global_precision": {
+              "correct": 46,
+              "rate": 0.9787234042553192,
+              "total": 47
+            },
+            "unsure": 0
+          },
+          "swift": {
+            "confident_edge_precision": {
+              "correct": 173,
+              "rate": 0.9774011299435028,
+              "total": 177
+            },
+            "date": "2026-10-15",
+            "dead_fp_by_tier": {},
+            "devmap_commit": "735e210eeb29a1d8bd94908268fc823808de806e",
+            "honest_miss": {
+              "absent": 31,
+              "rate": 1.0,
+              "recorded": 31
+            },
+            "labelled_rows": [],
+            "recall": {
+              "by_construct": {
+                "bare": {
+                  "correct": 59,
+                  "rate": 0.9516129032258064,
+                  "total": 62
+                },
+                "chained": {
+                  "correct": 0,
+                  "rate": 0.0,
+                  "total": 1
+                },
+                "constructor": {
+                  "correct": 32,
+                  "rate": 1.0,
+                  "total": 32
+                },
+                "module_qualified": {
+                  "correct": 40,
+                  "rate": 0.8888888888888888,
+                  "total": 45
+                },
+                "other": {
+                  "correct": 5,
+                  "rate": 0.21739130434782608,
+                  "total": 23
+                },
+                "self_method": {
+                  "correct": 48,
+                  "rate": 1.0,
+                  "total": 48
+                },
+                "typed_receiver": {
+                  "correct": 7,
+                  "rate": 0.6363636363636364,
+                  "total": 11
+                }
+              },
+              "present": 191,
+              "rate": 0.8603603603603603,
+              "total": 222
+            },
+            "unique_global_precision": {
+              "correct": 31,
+              "rate": 0.96875,
+              "total": 32
+            },
+            "unsure": 0
+          }
+        },
+        "name": "ChronosFlow"
+      },
+      "list": "corpora",
+      "superseded_on": "2026-10-16"
     }
   ]
 }
