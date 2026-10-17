@@ -92,3 +92,26 @@ py.ST3	ST3	lib/pkg/star_loc.py::use	lib/pkg/starlocal.py::ones	edge	must		from p
 py.FL1.not	FL1	micro/fieldleak/holders.py::FlHolderB.go	micro/fieldleak/engines.py::FlEngine.run	forbid_any_tier	must		FlHolderA class-body annotation engine: FlEngine must not type FlHolderB self.engine
 py.FL1	FL1	micro/fieldleak/holders.py::FlHolderB.go	micro/fieldleak/engines.py::FlOther.run	edge	should	run	self.engine = FlOther() in __init__: Other.run or an honest miss
 py.FL1.ctl	FL1	micro/fieldleak/holders.py::FlHolderA.go	micro/fieldleak/engines.py::FlEngine.run	edge	must		control: the class that declares the annotation still binds
+py.FI1a	FI1	micro/fieldinit/holders.py::FiCross.go	micro/fieldinit/engines.py::FiEngine.run	edge	must		self.engine = FiEngine() in __init__, self.engine.run() in another method
+py.FI1b	FI1	micro/fieldinit/holders.py::FiSame.go	micro/fieldinit/engines.py::FiEngine.run	edge	must		self.engine = FiEngine() and self.engine.run() in the same method
+py.FI1c	FI1	micro/fieldinit/holders.py::FiFactory.go	micro/fieldinit/engines.py::FiEngine.run	edge	must		self.engine = make_engine() where def make_engine() -> FiEngine
+py.FI2.not	FI2	micro/fieldinit/holders.py::FiLeakB.go	micro/fieldinit/engines.py::FiEngine.run	forbid_any_tier	must		FiLeakA's self.engine = FiEngine() initializer must not type FiLeakB's own engine field
+py.FI3.not1	FI3	micro/fieldinit/holders.py::FiTwice.go	micro/fieldinit/engines.py::FiEngine.run	forbid_any_tier	must		engine is assigned FiEngine() in __init__ and FiOther() in reset: not one type, so neither binds
+py.FI3.not2	FI3	micro/fieldinit/holders.py::FiTwice.go	micro/fieldinit/engines.py::FiOther.run	forbid_any_tier	must		same field, the other initializer
+py.FI4	FI4	micro/fieldinit/holders.py::FiAnnotated.go	micro/fieldinit/engines.py::FiOther.run	edge	must		class-body annotation engine: FiOther outranks the self.engine = FiEngine() initializer
+py.FI4.not	FI4	micro/fieldinit/holders.py::FiAnnotated.go	micro/fieldinit/engines.py::FiEngine.run	forbid_any_tier	must		the initializer never overrides a written annotation
+py.FI5.not1	FI5	micro/fieldinit/holders.py::FiExternal.go	micro/fieldinit/engines.py::FiEngine.run	forbid_any_tier	must		self.engine = external_lib.build(): an unindexed factory types nothing
+py.FI5.not2	FI5	micro/fieldinit/holders.py::FiExternal.go	micro/fieldinit/engines.py::FiOther.run	forbid_any_tier	must		same unindexed factory, the other namesake
+py.FI6.not	FI6	micro/fieldinit/holders.py::FiUntyped.go	micro/fieldinit/engines.py::FiEngine.run	forbid_any_tier	must		self.engine = make_untyped(): the factory writes no return type, so the field has none
+py.FI7.not	FI7	micro/fieldinit/holders.py::FiWrapped.go	micro/fieldinit/engines.py::FiEngine.run	forbid_any_tier	must		self.engine = [FiEngine()] holds a list, not a FiEngine
+py.SK1	SK1	micro/superkw/children.py::SkChild.ping	micro/superkw/base_a.py::SkBase.ping	edge	must		super().ping(): two files declare SkBase and two declare SkChild; this child imports base_a's
+py.SK1.not	SK1	micro/superkw/children.py::SkChild.ping	micro/superkw/base_b.py::SkBase.ping	forbid_any_tier	must		the namesake SkBase in base_b is not the imported one
+py.SK1b	SK1	micro/superkw/children_b.py::SkChild.ping	micro/superkw/base_b.py::SkBase.ping	edge	must		the second SkChild imports base_b's SkBase
+py.SK1b.not	SK1	micro/superkw/children_b.py::SkChild.ping	micro/superkw/base_a.py::SkBase.ping	forbid_any_tier	must		and not base_a's
+py.SK2	SK2	micro/superkw/children.py::SkAliased.ping	micro/superkw/base_a.py::SkBase.ping	edge	must		from .base_a import SkBase as AliasBase; class SkAliased(AliasBase)
+py.SK2.not	SK2	micro/superkw/children.py::SkAliased.ping	micro/superkw/base_b.py::SkBase.ping	forbid_any_tier	must		the alias does not reach the namesake
+py.SK3	SK3	micro/superkw/children.py::SkBuilder.build	micro/superkw/base_a.py::SkBase.build	edge	must		super().build() in a classmethod
+py.SK3.not	SK3	micro/superkw/children.py::SkBuilder.build	micro/superkw/base_b.py::SkBase.build	forbid_any_tier	must		classmethod super() does not reach the namesake base
+py.SK5.not1	SK5	micro/superkw/children.py::SkDiamond.hop	micro/superkw/base_a.py::SkLeft.hop	forbid_any_tier	must		two bases of one level both declare hop: this resolver has no MRO, so it abstains
+py.SK5.not2	SK5	micro/superkw/children.py::SkDiamond.hop	micro/superkw/base_a.py::SkRight.hop	forbid_any_tier	must		same diamond, the other base
+py.SK6	SK6	micro/superkw/children.py::SkOneProvider.hop	micro/superkw/base_a.py::SkLeft.hop	edge	must		of two bases only SkLeft declares hop: the one provider on the nearest level
