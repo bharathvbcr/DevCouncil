@@ -172,12 +172,93 @@ fn self_identity(node: Node, source: &str) -> Option<(SymbolKind, String)> {
 /// `let` inside a computed property's getter from being mistaken for a member of
 /// the type that getter belongs to.
 pub(crate) fn property_declaration_of(node: Node) -> Option<Node> {
-    if node.kind() != "simple_identifier" {
-        return None;
+    match name_role(node) {
+        Role::Property(raw) => {
+            // SAFETY: the same argument `parent_index::parent` makes. `raw` was
+            // taken from a live `Node` of the tree `node` belongs to (checked by
+            // the tree identity stored beside it in `ROLES`), the cache is
+            // emptied by `reset_roles` before the next file's tree exists, and
+            // no pointer is cast or fabricated.
+            Some(unsafe { Node::from_raw(raw) })
+        }
+        Role::EnumCase | Role::Other => None,
     }
+}
+
+/// What a `simple_identifier` declares, if anything.
+#[derive(Clone, Copy)]
+enum Role {
+    /// A bound name of a member property; carries its declaration.
+    Property(tree_sitter::ffi::TSNode),
+    /// A name an `enum_entry` declares.
+    EnumCase,
+    Other,
+}
+
+thread_local! {
+    /// `(tree, role)` by node id, for the file being extracted.
+    ///
+    /// Every rule that asks "is this a property name" asks it of the same
+    /// identifier several times — the declaration, its owner, its visibility,
+    /// its exemption, its signature, the locals pass — and each answer walks
+    /// up the tree. tree-sitter's own `parent` costs time proportional to the
+    /// siblings it passes, and a type with tens of thousands of members is one
+    /// body of that many children, so the repeated walks were quadratic: 30,000
+    /// properties retired 3.2x the instructions of the same file with no
+    /// property symbols. One answer per identifier makes it a single walk.
+    static ROLES: std::cell::RefCell<std::collections::HashMap<usize, (*const tree_sitter::ffi::TSTree, Role)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Forget every cached role. Node ids are arena addresses, reused once a tree
+/// is dropped, so the cache must not outlive its file.
+pub(crate) fn reset_roles() {
+    ROLES.with(|roles| roles.borrow_mut().clear());
+}
+
+fn name_role(node: Node) -> Role {
+    if node.kind() != "simple_identifier" {
+        return Role::Other;
+    }
+    let tree = node.into_raw().tree;
+    let key = node.id();
+    if let Some(known) = ROLES.with(|roles| {
+        roles
+            .borrow()
+            .get(&key)
+            .filter(|(cached_tree, _)| *cached_tree == tree)
+            .map(|(_, role)| *role)
+    }) {
+        return known;
+    }
+    let role = compute_role(node);
+    ROLES.with(|roles| roles.borrow_mut().insert(key, (tree, role)));
+    role
+}
+
+fn compute_role(node: Node) -> Role {
     // Called for every identifier in the file, so the cheap test comes first:
-    // the parent's own `bound_identifier` field, not a scan of its children.
-    let parent = crate::treesitter::bounded_parent(node)?;
+    // the parent's own field, not a scan of its children.
+    let Some(parent) = crate::treesitter::bounded_parent(node) else {
+        return Role::Other;
+    };
+    if parent.kind() == "enum_entry" {
+        return if is_named_child(node, "name") {
+            Role::EnumCase
+        } else {
+            Role::Other
+        };
+    }
+    match member_property_declaration(node, parent) {
+        Some(declaration) => Role::Property(declaration.into_raw()),
+        None => Role::Other,
+    }
+}
+
+fn member_property_declaration<'tree>(
+    node: Node<'tree>,
+    parent: Node<'tree>,
+) -> Option<Node<'tree>> {
     if parent.kind() != "pattern"
         || parent
             .child_by_field_name("bound_identifier")
@@ -209,10 +290,7 @@ pub(crate) fn property_declaration_of(node: Node) -> Option<Node> {
 /// Whether `node` is a name an `enum_entry` declares (`fast` and `slow` in
 /// `case fast, slow`).
 pub(crate) fn is_enum_case_name(node: Node) -> bool {
-    node.kind() == "simple_identifier"
-        && crate::treesitter::bounded_parent(node)
-            .is_some_and(|parent| parent.kind() == "enum_entry")
-        && is_named_child(node, "name")
+    matches!(name_role(node), Role::EnumCase)
 }
 
 /// The name node of the property `parent` declares, when `parent` is a

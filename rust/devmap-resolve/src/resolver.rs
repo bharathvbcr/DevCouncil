@@ -7178,7 +7178,10 @@ impl Resolver {
             .filter(|edge| {
                 matches!(
                     edge.edge_kind,
-                    EdgeKind::Calls | EdgeKind::References | EdgeKind::Extends | EdgeKind::Implements
+                    EdgeKind::Calls
+                        | EdgeKind::References
+                        | EdgeKind::Extends
+                        | EdgeKind::Implements
                 ) && edge.target_file.ends_with(".swift")
             })
             .filter(|edge| {
@@ -10260,9 +10263,11 @@ impl Resolver {
         let implicit = Self::receiver_is_self(receiver);
         if implicit {
             let answer = reference.enclosing_symbol.as_deref().and_then(|caller| {
-                Self::read_members(family, name).into_iter().find_map(|member| {
-                    self.implicit_receiver_target(&ext.file_path, family, caller, &member)
-                })
+                Self::read_members(family, name)
+                    .into_iter()
+                    .find_map(|member| {
+                        self.implicit_receiver_target(&ext.file_path, family, caller, &member)
+                    })
             })?;
             match answer {
                 ImplicitReceiverAnswer::Unique {

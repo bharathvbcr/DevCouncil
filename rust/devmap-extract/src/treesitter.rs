@@ -795,17 +795,34 @@ fn extract_treesitter_before_deadline(
                     });
                 }
 
+                // The names the exports so far publish, kept as sets so each
+                // exported symbol asks one lookup instead of scanning every
+                // export: a type with tens of thousands of exported members made
+                // this loop quadratic (30,000 Swift properties spent most of
+                // their extraction here).
+                let mut published_as: std::collections::HashSet<String> = exports
+                    .iter()
+                    .map(|export| export.exported_name.clone())
+                    .collect();
+                let mut published_from: std::collections::HashSet<String> = exports
+                    .iter()
+                    .filter(|export| {
+                        export.module_specifier.is_none() && export.exported_name != "default"
+                    })
+                    .filter_map(|export| export.local_name.clone())
+                    .collect();
                 for symbol in symbols.iter().filter(|symbol| symbol.is_exported) {
                     // A symbol already published under another name —
                     // `export { local as Public }` — is not also exported as
                     // itself. Matching on `exported_name` alone fabricated a
                     // second export, `local`, that the module never declared.
-                    if !exports.iter().any(|export| {
-                        export.exported_name == symbol.name
-                            || (export.module_specifier.is_none()
-                                && export.exported_name != "default"
-                                && export.local_name.as_deref() == Some(symbol.name.as_str()))
-                    }) {
+                    if !published_as.contains(&symbol.name)
+                        && !published_from.contains(&symbol.name)
+                    {
+                        published_as.insert(symbol.name.clone());
+                        if symbol.name != "default" {
+                            published_from.insert(symbol.name.clone());
+                        }
                         exports.push(ExtractedExport {
                             exported_name: symbol.name.clone(),
                             local_name: Some(symbol.name.clone()),
@@ -9381,14 +9398,16 @@ fn maybe_push_name_reference(
         ref_kind = ReferenceKind::Type;
     }
     if is_argument_label(node)
-        || (lang == "swift"
-            && swift_leading_dot_member(node, source)
-            && swift_leading_dot_context(node, source).is_none())
         || name_field_holds_a_use(node)
         || is_defining_name(node)
         || is_inside_import_or_export(node)
         || is_call_callee(node)
         || rust_macro_member_name(node, lang)
+        // Last: a declaration's own name is refused above and never pays for
+        // the extra ancestor walk.
+        || (lang == "swift"
+            && swift_leading_dot_member(node, source)
+            && swift_leading_dot_context(node, source).is_none())
     {
         return;
     }
@@ -9677,9 +9696,14 @@ fn swift_leading_dot_context(node: Node, source: &str) -> Option<String> {
         if ty.kind() != "user_type" || ty.named_child_count() != 1 {
             return None;
         }
-        let name = ty.named_child(0).filter(|n| n.kind() == "type_identifier")?;
+        let name = ty
+            .named_child(0)
+            .filter(|n| n.kind() == "type_identifier")?;
         let name = get_node_text(name, source);
-        name.chars().next().is_some_and(char::is_uppercase).then_some(name)
+        name.chars()
+            .next()
+            .is_some_and(char::is_uppercase)
+            .then_some(name)
     };
     let mut current = bounded_parent(node)?;
     let mut returned = false;
@@ -9687,7 +9711,10 @@ fn swift_leading_dot_context(node: Node, source: &str) -> Option<String> {
         let parent = bounded_parent(current)?;
         match parent.kind() {
             // `.circle(1)`: the member is the callee, the call is the value.
-            "call_expression" if parent.named_child(0).is_some_and(|c| c.id() == current.id()) => {}
+            "call_expression"
+                if parent
+                    .named_child(0)
+                    .is_some_and(|c| c.id() == current.id()) => {}
             "control_transfer_statement"
                 if source
                     .get(parent.start_byte()..parent.end_byte())
