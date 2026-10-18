@@ -225,3 +225,58 @@ fn an_answer_never_carries_another_generations_verified_verdict() {
         &verified_wrong[..verified_wrong.len().min(8)]
     );
 }
+
+/// Deterministic form of the race above: a hook lands generations 2 and 3 and
+/// refreshes the verdict cache after the answer was read from generation 1 and
+/// before `exit` reads the verdict. No timing involved.
+#[test]
+fn a_verdict_for_another_generation_is_never_attached_as_verified() {
+    let db = std::env::temp_dir().join(format!("attack2-pin-{}.sqlite", std::process::id()));
+    let _ = fs::remove_file(&db);
+    let fx = fixture("attack2-pin", Some(&db));
+    let reader = Store::open(&db).unwrap();
+    reader.status("t").unwrap();
+    let writer = Store::open(&db).unwrap();
+    let moved = std::cell::Cell::new(false);
+    let engine = StoreQueryEngine::new(&reader).with_interleave_hook(|| {
+        for generation in 2..=3 {
+            land_generation(&fx.root, &writer, generation);
+        }
+        reader.status("t").unwrap();
+        moved.set(true);
+    });
+    let answer = engine.impact(req("d", 1)).unwrap();
+    assert!(moved.get(), "the interleave hook never ran");
+    assert_eq!(
+        reader.latest_generation_id().unwrap(),
+        Some(3),
+        "the hook did not land the generations"
+    );
+    let verdict = &answer.source_freshness;
+    assert_eq!(verdict.fresh, None, "claimed {verdict:?} for a generation not read");
+    assert_eq!(verdict.generation_id, None, "{verdict:?}");
+    let reason = verdict.reason.as_deref().unwrap_or_default();
+    assert!(reason.contains("index moved from generation 1 to 3"), "{reason}");
+}
+
+/// The guard above must not degrade every answer: when no generation lands
+/// during the query, the verified verdict for the generation read is kept.
+#[test]
+fn a_verdict_for_the_generation_read_stays_verified() {
+    let db = std::env::temp_dir().join(format!("attack2-same-{}.sqlite", std::process::id()));
+    let _ = fs::remove_file(&db);
+    let fx = fixture("attack2-same", Some(&db));
+    let reader = Store::open(&db).unwrap();
+    reader.status("t").unwrap();
+    let hooked = std::cell::Cell::new(false);
+    let engine = StoreQueryEngine::new(&reader).with_interleave_hook(|| {
+        reader.status("t").unwrap();
+        hooked.set(true);
+    });
+    let answer = engine.impact(req("d", 1)).unwrap();
+    assert!(hooked.get());
+    let _ = &fx;
+    let verdict = &answer.source_freshness;
+    assert!(verdict.fresh.is_some(), "matching generations lost their verdict: {verdict:?}");
+    assert_eq!(verdict.generation_id, reader.latest_generation_id().unwrap());
+}

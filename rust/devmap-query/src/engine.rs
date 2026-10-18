@@ -97,6 +97,22 @@ pub const MAX_TOKEN_BUDGET: u32 = 100_000;
 /// clamp is actually applied, so this is where the number belongs.
 pub const MAX_TRAVERSAL_DEPTH: usize = 64;
 
+/// Keep `verdict` only when it describes the generation the answer was built
+/// from. A verified verdict naming a different generation than `read` is
+/// replaced by an explicit unverified one: the answer never claims fresh or
+/// stale for a generation it did not read. Unverified verdicts pass through.
+fn pin_verdict(read: Option<u32>, verdict: SourceFreshness) -> SourceFreshness {
+    match (verdict.generation_id, read) {
+        (Some(verdict_generation), Some(read)) if verdict_generation == read => verdict,
+        (Some(verdict_generation), read) => SourceFreshness::unverified(format!(
+            "the index moved from generation {} to {verdict_generation} while this answer was \
+             built; run `devmap status` for a verified verdict",
+            read.map_or_else(|| "none".to_string(), |g| g.to_string())
+        )),
+        (None, _) => verdict,
+    }
+}
+
 pub struct QueryEngine<'a> {
     extractions: &'a [Extraction],
     resolution: &'a ResolutionResult,
@@ -115,6 +131,10 @@ pub struct StoreQueryEngine<'a> {
     /// Consulted inside the long loops. Default is a flag nobody sets, so a
     /// caller that has no way to give up (the CLI) behaves exactly as before.
     cancel: Cancel,
+    /// Runs inside [`Self::exit`] after the answer is built and before the
+    /// verdict is read: the window a daemon commit or status refresh can land
+    /// in. Tests use it to force that interleaving deterministically.
+    interleave: Option<Box<dyn Fn() + 'a>>,
 }
 
 impl<'a> StoreQueryEngine<'a> {
@@ -122,7 +142,17 @@ impl<'a> StoreQueryEngine<'a> {
         Self {
             store,
             cancel: Cancel::new(),
+            interleave: None,
         }
+    }
+
+    /// Run `hook` between building an answer and reading its freshness verdict.
+    /// Exists so a test can land a generation or refresh the verdict cache in
+    /// exactly that window; production callers never set it.
+    #[doc(hidden)]
+    pub fn with_interleave_hook(mut self, hook: impl Fn() + 'a) -> Self {
+        self.interleave = Some(Box::new(hook));
+        self
     }
 
     /// Answer under a cancellation flag the caller can trip.
@@ -153,10 +183,18 @@ impl<'a> StoreQueryEngine<'a> {
         &self,
         answer: impl FnOnce() -> anyhow::Result<R>,
     ) -> anyhow::Result<R> {
+        // Generation ids only grow, and every read path resolves "the latest
+        // generation" when it runs. So the generation an answer read lies in
+        // [before, the latest at verdict time], and the verdict -- which names
+        // the latest generation at the moment it is read -- describes the answer
+        // only when the two ends are the same generation.
+        let before = self.store.latest_generation_id().ok().flatten();
         let mut answer = answer()?;
-        answer.stamp(&SourceFreshness::from_store(
-            self.store.query_source_freshness(),
-        ));
+        if let Some(hook) = &self.interleave {
+            hook();
+        }
+        let verdict = SourceFreshness::from_store(self.store.query_source_freshness());
+        answer.stamp(&pin_verdict(before, verdict));
         Ok(answer)
     }
 
