@@ -55,6 +55,8 @@ mod coverage_loss_artifacts;
 mod dead_clusters_reach_a_query;
 #[cfg(feature = "parse")]
 mod dependencies_are_outbound;
+#[cfg(feature = "parse")]
+mod dependencies_attack;
 mod documentation_visibility;
 #[cfg(feature = "parse")]
 mod dynamic_references_clear_unwired;
