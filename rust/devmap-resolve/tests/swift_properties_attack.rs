@@ -596,6 +596,16 @@ fn wrong_explicit_self_read_with_a_same_named_property_on_another_type_binds_the
     assert!(dangling_targets(&r).is_empty(), "{:?}", dangling_targets(&r));
 }
 
+/// REGRESSION vs 9030d08c (where the same read was an honest unresolved row):
+/// the edge's target is the bare spelling `x`, which is no symbol anywhere.
+#[test]
+fn wrong_explicit_self_read_on_a_duplicated_name_emits_no_dangling_edge() {
+    let r = one(
+        "struct A { var x: Int }\nstruct B {\n    var x: Int\n    func viaSelf() -> Int { self.x }\n}\n",
+    );
+    assert!(dangling_targets(&r).is_empty(), "{:?}", dangling_targets(&r));
+}
+
 #[test]
 fn wrong_explicit_self_read_in_an_extension_with_a_same_named_property_elsewhere() {
     let r = one(
