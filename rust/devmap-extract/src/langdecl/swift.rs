@@ -176,13 +176,23 @@ fn self_identity(node: Node, source: &str) -> Option<(SymbolKind, String)> {
 /// `let` inside a computed property's getter from being mistaken for a member of
 /// the type that getter belongs to.
 pub(crate) fn property_declaration_of(node: Node) -> Option<Node> {
-    if node.kind() != "simple_identifier" || !is_named_child(node, "bound_identifier") {
+    if node.kind() != "simple_identifier" {
+        return None;
+    }
+    // Called for every identifier in the file, so the cheap test comes first:
+    // the parent's own `bound_identifier` field, not a scan of its children.
+    let parent = crate::treesitter::bounded_parent(node)?;
+    if parent.kind() != "pattern"
+        || parent
+            .child_by_field_name("bound_identifier")
+            .is_none_or(|bound| bound.id() != node.id())
+    {
         return None;
     }
     // `let (x, y) = …` nests one pattern per tuple element. A `pattern` that is
     // a direct child of the declaration is always a bound name: the initializer
     // is its `value` and a type annotation is its own node.
-    let mut ancestor = crate::treesitter::bounded_parent(node)?;
+    let mut ancestor = parent;
     while ancestor.kind() == "pattern" {
         ancestor = crate::treesitter::bounded_parent(ancestor)?;
     }

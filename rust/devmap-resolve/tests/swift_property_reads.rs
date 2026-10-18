@@ -141,6 +141,29 @@ fn a_same_named_property_of_another_type_is_not_bound() {
     assert!(reaches(&b, "B.id") && !reaches(&b, "A.id"), "{b:?}");
 }
 
+/// A name the enclosing callable binds itself is that binding, not the
+/// property of the same spelling the type declares.
+#[test]
+fn a_local_that_shadows_a_property_is_not_a_read_of_it() {
+    let result = resolve(&[(
+        "Sources/M/Shadow.swift",
+        "enum E { case a(Int) }\nstruct S {\n    var count: Int\n    func letLocal() -> Int { let count = 1; return count }\n    func param(count: Int) -> Int { count }\n    func closure(_ xs: [Int]) -> [Int] { xs.map { count in count } }\n    func ifLet(_ o: Int?) -> Int { if let count = o { return count }; return 0 }\n    func forIn(_ xs: [Int]) { for count in xs { _ = count } }\n    func guardLet(_ o: Int?) -> Int { guard let count = o else { return 0 }; return count }\n    func caseLet(_ e: E) -> Int { switch e { case .a(let count): return count } }\n    func real() -> Int { count }\n}\n",
+    )]);
+    for caller in [
+        "S.letLocal",
+        "S.param",
+        "S.closure",
+        "S.ifLet",
+        "S.forIn",
+        "S.guardLet",
+        "S.caseLet",
+    ] {
+        let uses = uses_from(&result, caller);
+        assert!(!reaches(&uses, "S.count"), "{caller}: {uses:?}");
+    }
+    assert!(reaches(&uses_from(&result, "S.real"), "S.count"));
+}
+
 #[test]
 fn an_argument_label_and_a_leading_dot_member_are_not_property_reads() {
     let result = resolve(&[(
