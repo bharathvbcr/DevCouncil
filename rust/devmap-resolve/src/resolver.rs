@@ -74,6 +74,9 @@ enum ImplicitReceiverAnswer {
         receiver_type: String,
     },
     VirtualOverride,
+    /// The Python heritage walk reached a bound before it could answer; the
+    /// reason names the bound.
+    HeritageCap(String),
 }
 
 fn escaped_evidence_bytes(value: &str) -> u64 {
@@ -415,6 +418,13 @@ pub struct Resolver {
     /// spans, because a class in a function and a class in a same-named class
     /// share one identity.
     python_class_enclosers: BTreeMap<(String, String), Vec<(String, bool)>>,
+    /// The Python files whose `__all__` is not the literal list the extractor
+    /// reads names from, so `from m import *` may take any name they bind. See
+    /// [`pytypes::python_all_is_dynamic`].
+    python_dynamic_all: BTreeSet<String>,
+    /// `file` -> the names its functions and class bodies import. See
+    /// [`pytypes::python_scoped_imports`].
+    python_scoped_imports: BTreeMap<String, pytypes::PythonScopedImports>,
     /// Reverse of [`Self::supertypes`]: `(family, type name)` → indexed subtypes.
     ///
     /// Built from the same heritage rows. X42's virtual-`self` guard walks this
@@ -724,6 +734,8 @@ impl Resolver {
             python_bases: BTreeMap::new(),
             python_import_binds: BTreeMap::new(),
             python_class_enclosers: BTreeMap::new(),
+            python_dynamic_all: BTreeSet::new(),
+            python_scoped_imports: BTreeMap::new(),
             subtypes: BTreeMap::new(),
             import_bindings: BTreeMap::new(),
             value_imports: BTreeMap::new(),
@@ -3178,6 +3190,8 @@ impl Resolver {
         self.python_bases.clear();
         self.python_import_binds.clear();
         self.python_class_enclosers.clear();
+        self.python_dynamic_all.clear();
+        self.python_scoped_imports.clear();
         self.subtypes.clear();
         self.import_bindings.clear();
         self.value_imports.clear();
@@ -3844,7 +3858,17 @@ impl Resolver {
                 self.py_search_dirs
                     .insert(ext.file_path.clone(), search_path);
             }
+            // A Python import written inside a function or class body binds a
+            // name in that scope, not the module's. The table is flat, so such
+            // an import must not take a name the module scope already binds
+            // (a later `import two as o` in a function is not what a class at
+            // module level reads as `o`); it still binds one nothing else does.
+            let py_scopes = (LangFamily::from_lang(&ext.language) == LangFamily::Python)
+                .then(|| pytypes::python_scope_containers(ext));
             for imp in &ext.imports {
+                let nested_python = py_scopes
+                    .as_deref()
+                    .is_some_and(|scopes| pytypes::python_innermost_container(scopes, &imp.span).is_some());
                 // A Python module loaded by file path binds a *scoped* handle,
                 // so it goes to its own table and never to `file_bindings`. A
                 // load that binds nothing (`run_path`) contributes only the
@@ -4016,7 +4040,13 @@ impl Resolver {
                             submodule.or(direct)
                         };
                         if let Some(target_f) = resolved {
-                            file_bindings.insert(local.to_string(), (target_f, declared_as));
+                            if nested_python {
+                                file_bindings
+                                    .entry(local.to_string())
+                                    .or_insert((target_f, declared_as));
+                            } else {
+                                file_bindings.insert(local.to_string(), (target_f, declared_as));
+                            }
                         } else {
                             unresolved_import(local.to_string(), &imp.module_specifier);
                         }
@@ -4158,7 +4188,11 @@ impl Resolver {
                     } else {
                         (target_f, local.clone())
                     };
-                    file_bindings.insert(local, binding);
+                    if nested_python {
+                        file_bindings.entry(local).or_insert(binding);
+                    } else {
+                        file_bindings.insert(local, binding);
+                    }
                 }
             }
             if !file_external.is_empty() {
@@ -4203,6 +4237,14 @@ impl Resolver {
                 if !binds.is_empty() {
                     self.python_import_binds
                         .insert(ext.file_path.clone(), binds);
+                }
+                if pytypes::python_all_is_dynamic(ext) {
+                    self.python_dynamic_all.insert(ext.file_path.clone());
+                }
+                let scoped_imports = pytypes::python_scoped_imports(ext);
+                if !scoped_imports.is_empty() {
+                    self.python_scoped_imports
+                        .insert(ext.file_path.clone(), scoped_imports);
                 }
                 for (key, encloser) in pytypes::python_class_enclosers(ext) {
                     self.python_class_enclosers
@@ -5711,6 +5753,9 @@ impl Resolver {
                                         }),
                                     });
                                 }
+                                Some(ImplicitReceiverAnswer::HeritageCap(reason)) => {
+                                    resolution = Some(Arc::new(Resolution::Unresolved { reason }));
+                                }
                                 None => {}
                             }
                         }
@@ -6132,7 +6177,7 @@ impl Resolver {
                         let found = match call.receiver_expr.as_deref() {
                             Some("super" | "super()") => call.caller_symbol.as_deref().and_then(
                                 |caller| {
-                                    self.python_super_method(&ext.file_path, caller, &call.callee_name)
+                                    self.python_super_method(ext, call, caller, &call.callee_name)
                                 },
                             ),
                             Some(recv)
@@ -8326,21 +8371,42 @@ impl Resolver {
                 return None;
             }
         }
-        let (target_file, target_symbol, receiver_type) =
-            self.supertype_method(family, vec![enclosing.clone()], method)?;
+        let flat = self.supertype_method(family, vec![enclosing.clone()], method);
         // The breadth-first walk has no unknown or ambiguous bases and no
-        // order. For Python the class's own MRO walk can veto its answer: an
+        // order. For Python the class's own MRO walk is the authority: an
         // opaque or ambiguous base ahead of the declaring class, or a different
-        // class first in the MRO, means the edge would be a guess. It never
-        // adds an answer (a diamond the walk refuses stays refused).
+        // class first in the MRO, means the flat answer would be a guess. A
+        // class the file-scoped walk cannot speak for (a base declared inside a
+        // function, say) is read from the flat table only when no class in its
+        // heritage has several bases, because only then are the two orders the
+        // same.
         if family == LangFamily::Python {
-            match self.python_mro_method(file, &enclosing, method) {
-                pytypes::MroAnswer::Found(found)
-                    if found.file == target_file && found.symbol == target_symbol => {}
-                pytypes::MroAnswer::NotScoped => {}
+            match self.python_mro_method(file, &enclosing, method, true) {
+                pytypes::MroAnswer::Found(found) => {
+                    if flat
+                        .as_ref()
+                        .is_some_and(|(f, s, _)| *f != found.file || *s != found.symbol)
+                    {
+                        return None;
+                    }
+                    return Some(self.implicit_receiver_unique(
+                        family,
+                        &enclosing,
+                        method,
+                        found.file,
+                        found.symbol,
+                        found.declaring_type,
+                    ));
+                }
+                pytypes::MroAnswer::Capped(reason) => {
+                    return Some(ImplicitReceiverAnswer::HeritageCap(reason));
+                }
+                pytypes::MroAnswer::NotScoped
+                    if self.python_flat_heritage_is_linear(file, &enclosing) => {}
                 _ => return None,
             }
         }
+        let (target_file, target_symbol, receiver_type) = flat?;
         Some(self.implicit_receiver_unique(
             family,
             &enclosing,
@@ -10320,7 +10386,9 @@ impl Resolver {
                 // Same rule as the call ladder: an overridden `self.m` is not a
                 // deterministic reference target. Returning `None` here refuses
                 // the import fallthrough for an implicit receiver.
-                ImplicitReceiverAnswer::VirtualOverride => return None,
+                ImplicitReceiverAnswer::VirtualOverride | ImplicitReceiverAnswer::HeritageCap(_) => {
+                    return None
+                }
             }
         }
 

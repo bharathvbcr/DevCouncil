@@ -669,7 +669,6 @@ fn super_two_arg_form_binds_base() {
 }
 
 #[test]
-#[ignore = "known gap, filed: python heritage residue (8-11) — see GitPulse"]
 fn super_two_arg_form_naming_another_class_does_not_read_enclosing_bases() {
     let r = resolve(&[(
         "m.py",
@@ -846,7 +845,7 @@ fn super_star_import_base_with_namesake_does_not_bind_namesake() {
 }
 
 #[test]
-#[ignore = "known gap, filed: python heritage residue (8-11) — see GitPulse"]
+#[ignore = "needs extractor change (schema frozen at 97), ft-572bb69d"]
 fn super_base_reassigned_alias() {
     let r = resolve(&[(
         "c.py",
@@ -968,7 +967,6 @@ fn super_nested_same_name_classes_do_not_merge_bases() {
 }
 
 #[test]
-#[ignore = "known gap, filed: python heritage residue (8-11) — see GitPulse"]
 fn super_same_class_name_twice_via_conditional_unions_bases() {
     let r = resolve(&[(
         "c.py",

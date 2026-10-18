@@ -122,7 +122,6 @@ fn self_method_bare_attribute_bfs_c3_disagree() {
 }
 
 #[test]
-#[ignore = "pre-existing wrong edge, ft-572bb69d"]
 fn disagreement_inside_a_function_scoped_class() {
     let src = "class A:\n    def m(self):\n        return 1\n\nclass Z:\n    pass\n\nclass C(Z):\n    def m(self):\n        return 2\n\ndef build():\n    class B(A):\n        pass\n    class D(B, C):\n        def go(self):\n            return self.m()\n    return D\n";
     let r = resolve(&[("c.py", src)]);
@@ -226,7 +225,7 @@ fn try_except_importerror_rebinding() {
 }
 
 #[test]
-#[ignore = "pre-existing wrong edge, ft-572bb69d"]
+#[ignore = "needs extractor change (schema frozen at 97), ft-572bb69d"]
 fn rebinding_in_except_importerror_branch_for_a_torch_name() {
     let src = "try:\n    import torch.nn as nn\nexcept ImportError:\n    nn = None\n\nclass M(nn.Module):\n    def forward(self, x):\n        return x\n";
     // A runtime name that is `None` on one path is not torch's; the exemption
@@ -237,7 +236,7 @@ fn rebinding_in_except_importerror_branch_for_a_torch_name() {
 }
 
 #[test]
-#[ignore = "recall gap, ft-572bb69d"]
+#[ignore = "needs extractor change (schema frozen at 97), ft-572bb69d"]
 fn function_body_decorator_runs_after_later_module_rebinding() {
     // The class statement inside `build` runs when build() is called, after the
     // module-level rebinding below it. Textual order is not execution order.
@@ -291,7 +290,6 @@ fn all_extended_by_a_call_after_a_literal_prefix() {
 }
 
 #[test]
-#[ignore = "pre-existing wrong edge, ft-572bb69d"]
 fn all_extend_call_after_a_literal_prefix_name_from_elsewhere() {
     // Base is bound by a star of its own and exported only dynamically.
     let m = "from other import *\n__all__ = ['x']\n__all__.extend(other_names())\nx = 1\n";
@@ -322,7 +320,6 @@ fn all_is_a_tuple() {
 }
 
 #[test]
-#[ignore = "recall gap, ft-572bb69d"]
 fn all_tuple_without_base_keeps_the_edge() {
     let m = "class Base:\n    pass\nx = 1\n__all__ = ('x',)\n";
     let r = resolve(&[("base.py", BASE), ("m.py", m), ("c.py", USER)]);
@@ -392,7 +389,6 @@ fn star_chain_a_b_c_where_c_defines_the_name() {
 }
 
 #[test]
-#[ignore = "recall gap, ft-572bb69d"]
 fn star_chain_with_middle_all_not_listing_the_name() {
     // m has __all__ = ['y']; c_mod's Base is not exported by m (correct to keep).
     let m = "from c_mod import *\n__all__ = ['y']\ny = 1\n";
@@ -518,14 +514,14 @@ fn dataclass_rewrap_rebinding_characterised() {
 }
 
 #[test]
-#[ignore = "recall gap, ft-572bb69d"]
+#[ignore = "recall gap, ft-572bb69d: `Base = dec(Base)` rebinds Base to whatever dec returns, so abstaining is the sound reading; the probe asserts recall CPython does not promise"]
 fn imported_base_rewrapped_characterised() {
     let c = "from base import Base\nBase = dec(Base)\n\nclass C(Base):\n    def go(self):\n        return self.run()\n";
     assert!(base_run_edge(c), "recall");
 }
 
 #[test]
-#[ignore = "recall gap, ft-572bb69d"]
+#[ignore = "needs extractor change (schema frozen at 97), ft-572bb69d"]
 fn annotation_only_name_does_not_make_it_ambiguous() {
     let c = "from base import Base\nBase: type\n\nclass C(Base):\n    def go(self):\n        return self.run()\n";
     assert!(base_run_edge(c));
@@ -571,7 +567,7 @@ fn torch_from_import_nn_is_wired() {
 }
 
 #[test]
-#[ignore = "pre-existing wrong edge, ft-572bb69d"]
+#[ignore = "needs extractor change (schema frozen at 97), ft-572bb69d"]
 fn torch_from_import_nn_then_rebound_is_not_wired() {
     assert!(!forward_wired(&format!(
         "from torch import nn\nfrom mylib import fake\nnn = fake\n{MODULE_BODY}"
@@ -579,19 +575,19 @@ fn torch_from_import_nn_then_rebound_is_not_wired() {
 }
 
 #[test]
-#[ignore = "pre-existing wrong edge, ft-572bb69d"]
+#[ignore = "needs extractor change (schema frozen at 97), ft-572bb69d"]
 fn torch_nn_rebound_by_plain_assignment_is_not_wired() {
     assert!(!forward_wired(&format!("import torch.nn as nn\nnn = object()\n{MODULE_BODY}")));
 }
 
 #[test]
-#[ignore = "pre-existing wrong edge, ft-572bb69d"]
+#[ignore = "needs extractor change (schema frozen at 97), ft-572bb69d"]
 fn torch_nn_rebound_by_def_is_not_wired() {
     assert!(!forward_wired(&format!("import torch.nn as nn\ndef nn():\n    pass\n{MODULE_BODY}")));
 }
 
 #[test]
-#[ignore = "pre-existing wrong edge, ft-572bb69d"]
+#[ignore = "needs extractor change (schema frozen at 97), ft-572bb69d"]
 fn torch_imported_only_under_type_checking_is_not_runtime_wired() {
     assert!(!forward_wired(&format!(
         "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    import torch.nn as nn\n{MODULE_BODY}"
@@ -633,7 +629,6 @@ fn dotted_star_all_literal_without_root_keeps_edge() {
 }
 
 #[test]
-#[ignore = "pre-existing wrong edge, ft-572bb69d"]
 fn dotted_star_all_literal_plus_other_all_must_abstain() {
     let other = "mod = None\n__all__ = ['mod']\n";
     let m = "import other\nfrom other import *\n__all__ = ['x'] + other.__all__\nx = 1\n";
@@ -642,21 +637,18 @@ fn dotted_star_all_literal_plus_other_all_must_abstain() {
 }
 
 #[test]
-#[ignore = "pre-existing wrong edge, ft-572bb69d"]
 fn dotted_star_all_prefix_then_call_extension_must_abstain() {
     let m = "from other import helper\n__all__ = ['x']\n__all__ += helper()\nx = 1\n";
     assert!(!dotted_star_edge(m), "`__all__ += helper()` may add `mod`");
 }
 
 #[test]
-#[ignore = "pre-existing wrong edge, ft-572bb69d"]
 fn dotted_star_all_prefix_then_extend_call_must_abstain() {
     let m = "from other import helper\n__all__ = ['x']\n__all__.extend(helper())\nx = 1\n";
     assert!(!dotted_star_edge(m));
 }
 
 #[test]
-#[ignore = "pre-existing wrong edge, ft-572bb69d"]
 fn dotted_star_all_prefix_then_setattr_style_update_must_abstain() {
     let m = "__all__ = ['x']\nx = 1\nglobals().update(mod=1)\n__all__.append('mod')\n";
     assert!(!dotted_star_edge(m), "`__all__.append('mod')` exports mod");
@@ -668,7 +660,6 @@ fn dotted_star_all_is_tuple_with_root() {
 }
 
 #[test]
-#[ignore = "pre-existing wrong edge, ft-572bb69d"]
 fn dotted_star_all_concatenated_two_literals() {
     assert!(!dotted_star_edge("mod = None\n__all__ = ['x'] + ['mod']\nx = 1\n"));
 }
@@ -686,7 +677,6 @@ fn dotted_star_all_unlisted_name_defined_in_module_is_not_exported() {
 }
 
 #[test]
-#[ignore = "pre-existing wrong edge, ft-572bb69d"]
 fn dotted_star_function_named_all_collides_with_the_export_key() {
     let m = "mod = None\n\ndef __all__():\n    tmp = 1\n    return tmp\n";
     assert!(!dotted_star_edge(m), "`def __all__` locals read as the export list");

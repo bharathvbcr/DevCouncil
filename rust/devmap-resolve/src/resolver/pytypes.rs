@@ -62,14 +62,19 @@ impl PythonImportBind {
 pub(super) enum MroStop {
     /// A base this file cannot bind or prove external: ask the flat table.
     NotScoped,
-    /// A cycle, an inconsistent hierarchy or a bound hit: answer nothing.
+    /// A cycle or an inconsistent hierarchy: answer nothing.
     Abstain,
+    /// The walk reached one of its bounds. The reason names the bound, so the
+    /// site's ledger row says why nothing was answered.
+    Capped(String),
 }
 
 pub(super) enum MroAnswer {
     Found(PythonMethod),
     Abstain,
     NotScoped,
+    /// The walk reached a bound; see [`MroStop::Capped`].
+    Capped(String),
 }
 
 impl Resolver {
@@ -198,9 +203,9 @@ impl Resolver {
         type_key: &str,
         method: &str,
     ) -> Option<PythonMethod> {
-        match self.python_mro_method(class_file, type_key, method) {
+        match self.python_mro_method(class_file, type_key, method, false) {
             MroAnswer::Found(found) => Some(found),
-            MroAnswer::Abstain => None,
+            MroAnswer::Abstain | MroAnswer::Capped(_) => None,
             // The flat table keeps no position and no unnamed bases, so it
             // cannot speak for a class that writes one.
             MroAnswer::NotScoped
@@ -211,8 +216,92 @@ impl Resolver {
             {
                 None
             }
+            // The flat walk is breadth-first, which is C3 only along a chain.
+            MroAnswer::NotScoped if !self.python_flat_heritage_is_linear(class_file, type_key) => {
+                None
+            }
             MroAnswer::NotScoped => self.python_inherited_method(type_key, method),
         }
+    }
+
+    /// Whether the heritage of the class `type_key`, as the flat tables record
+    /// it, is a single chain: no class on it has more than one base (an
+    /// opaque base counts as one). On a chain the breadth-first walk and C3
+    /// visit classes in the same order, so a class the file-scoped walk cannot
+    /// speak for may be read from the flat table. A chain longer than
+    /// [`Resolver::HERITAGE_WALK_MAX_DEPTH`] is not known to be one.
+    pub(super) fn python_flat_heritage_is_linear(&self, file: &str, type_key: &str) -> bool {
+        let mut current = type_key.to_string();
+        for depth in 0..Self::HERITAGE_WALK_MAX_DEPTH {
+            let flat = self
+                .supertypes
+                .get(&(LangFamily::Python, current.clone()))
+                .map_or(0, |bases| bases.len());
+            let opaque = if depth == 0 {
+                self.python_bases
+                    .get(&(file.to_string(), current.clone()))
+                    .map_or(0, |bases| bases.iter().filter(|base| *base == OPAQUE_BASE).count())
+            } else {
+                0
+            };
+            match flat + opaque {
+                0 => return true,
+                1 => {}
+                _ => return false,
+            }
+            let Some(only) = self
+                .supertypes
+                .get(&(LangFamily::Python, current.clone()))
+                .and_then(|bases| bases.iter().next())
+            else {
+                return true;
+            };
+            current = only.clone();
+        }
+        false
+    }
+
+    /// Whether the base `written` of the class `identity` is read in a scope
+    /// that rebinds its first name: a function the class is written inside
+    /// binds it (a parameter, a local, an import), or a class body it is
+    /// written inside imports it. The file's module-scope reading of the name
+    /// is then not what the class statement sees.
+    fn python_base_is_rebound_around(&self, file: &str, identity: &str, written: &str) -> bool {
+        let key = Self::python_type_key(identity);
+        let bare = key.rsplit('.').next().unwrap_or(key);
+        let Some(enclosers) = self
+            .python_class_enclosers
+            .get(&(file.to_string(), bare.to_string()))
+        else {
+            return false;
+        };
+        let root = written.split('.').next().unwrap_or(written);
+        enclosers.iter().any(|(enclosing, is_callable)| {
+            if *is_callable {
+                self.python_scope_binds_name(file, enclosing, root, 1)
+            } else {
+                self.python_scoped_imports
+                    .get(file)
+                    .is_some_and(|scoped| scoped.in_class_body.contains(root))
+            }
+        })
+    }
+
+    /// How many `class` statements `file` writes under the identity `identity`.
+    fn python_class_declarations(&self, file: &str, identity: &str) -> usize {
+        let key = Self::python_type_key(identity);
+        let bare = key.rsplit('.').next().unwrap_or(key);
+        self.symbol_index
+            .get(bare)
+            .into_iter()
+            .flatten()
+            .filter(|(path, kind, family, candidate_identity)| {
+                path == file
+                    && Self::python_type_key(candidate_identity) == key
+                    && *kind == SymbolKind::Class
+                    && *family == LangFamily::Python
+            })
+            .count()
     }
 
     /// Whether `identity`, declared in `path`, is a Python class.
@@ -434,8 +523,38 @@ impl Resolver {
         };
         let (module, _) = qualified.rsplit_once('.')?;
         (matches!(module, "typing" | "typing_extensions" | "abc")
-            && self.resolve_import_path(file, "python", module).is_none())
+            && !self.python_stdlib_name_is_shadowed(file, module))
         .then_some(qualified)
+    }
+
+    /// Whether the corpus declares a module that `import module`, written in
+    /// `file`, reaches instead of the standard library's.
+    ///
+    /// Python 3 imports are absolute: `from typing import Generic` in
+    /// `pkg/c.py` is the standard library's even when `pkg/typing.py` exists,
+    /// because `pkg` is a package and its siblings are named `pkg.typing`. A
+    /// module reached through the repository root, `src/` or a manifest's
+    /// source roots shadows it, and so does one beside the importer in a
+    /// directory that is no package (a script's directory is on `sys.path`).
+    fn python_stdlib_name_is_shadowed(&self, file: &str, module: &str) -> bool {
+        let Some(found) = self.resolve_import_path(file, "python", module) else {
+            return false;
+        };
+        let dir = Self::parent_dir(file);
+        let beside = [
+            format!("{dir}/{module}.py"),
+            format!("{dir}/{module}/__init__.py"),
+        ];
+        let at_a_root = [
+            format!("{module}.py"),
+            format!("{module}/__init__.py"),
+            format!("src/{module}.py"),
+            format!("src/{module}/__init__.py"),
+        ];
+        if !beside.contains(&found) || at_a_root.contains(&found) {
+            return true;
+        }
+        !self.file_symbols.contains_key(&format!("{dir}/__init__.py"))
     }
 
     /// What `file`'s imports bind the local `name` to, minus every `from m
@@ -467,6 +586,11 @@ impl Resolver {
         let Some(module) = self.resolve_import_path(file, "python", spec) else {
             return true;
         };
+        // An `__all__` built any way but one literal list exports what the
+        // module computes, which no fact here reads.
+        if self.python_dynamic_all.contains(&module) {
+            return true;
+        }
         let all_key = format!("{module}::__all__");
         let lowest = (module.clone(), all_key.clone(), String::new());
         let has_all = self
@@ -516,8 +640,9 @@ impl Resolver {
     ///
     /// Bounded by [`Self::PYTHON_MRO_MAX_DEPTH`] and by the number of nodes
     /// the walk may create; an inheritance cycle, an inconsistent hierarchy
-    /// (where C3 has no answer — Python raises `TypeError` there) and a
-    /// bound hit are all [`MroStop::Abstain`].
+    /// (where C3 has no answer — Python raises `TypeError` there) are
+    /// [`MroStop::Abstain`]; a bound hit is [`MroStop::Capped`], which names the
+    /// bound.
     fn python_linearize(
         &self,
         node: &MroNode,
@@ -531,13 +656,47 @@ impl Resolver {
         let MroNode::Class(file, identity) = node else {
             return Ok(vec![node.clone()]);
         };
-        if depth > Self::PYTHON_MRO_MAX_DEPTH
-            || memo.len() > Self::PYTHON_MRO_MAX_NODES
-            || !in_progress.insert(node.clone())
-        {
+        if depth > Self::PYTHON_MRO_MAX_DEPTH {
+            return Err(MroStop::Capped(format!(
+                "python heritage walk stopped at its cap of {} bases deep",
+                Self::PYTHON_MRO_MAX_DEPTH
+            )));
+        }
+        if memo.len() > Self::PYTHON_MRO_MAX_NODES {
+            return Err(MroStop::Capped(format!(
+                "python heritage walk stopped at its cap of {} classes linearized",
+                Self::PYTHON_MRO_MAX_NODES
+            )));
+        }
+        if !in_progress.insert(node.clone()) {
+            return Err(MroStop::Abstain);
+        }
+        // `if c: class C(A)` / `else: class C(B)` declares one identity twice
+        // and the heritage table unions both statements' bases. Whichever
+        // statement ran is not knowable, so no linearization is read from it.
+        if self.python_class_declarations(file, identity) > 1 {
             return Err(MroStop::Abstain);
         }
         let key = Self::python_type_key(identity).to_string();
+        // A class written inside a function files its heritage under its bare
+        // name, not under the dotted identity this walk reads by, so a class
+        // with several bases there would be linearized without them. Such a
+        // class is not scoped; the flat table answers for it, and only when its
+        // heritage is a single chain ([`Self::python_flat_heritage_is_linear`]).
+        // A module-level class of the same bare name shares that entry, and then
+        // neither is read.
+        let bare = key.rsplit('.').next().unwrap_or(&key).to_string();
+        if self
+            .python_class_enclosers
+            .get(&(file.clone(), bare.clone()))
+            .is_some_and(|enclosers| enclosers.iter().any(|(_, callable)| *callable))
+        {
+            return Err(if self.python_class_declarations(file, &bare) > 0 {
+                MroStop::Abstain
+            } else {
+                MroStop::NotScoped
+            });
+        }
         let written: &[String] = match self.python_bases.get(&(file.clone(), key)) {
             Some(bases) => bases,
             // The root of the walk has no recorded heritage: nothing here says
@@ -552,6 +711,11 @@ impl Resolver {
                 // A base the class statement writes but no name denotes: an
                 // unknown class in this position, distinct from every other.
                 bases.push(MroNode::Opaque(format!("{OPAQUE_BASE}@{position}")));
+            } else if self.python_base_is_rebound_around(file, identity, base) {
+                // The class is written inside a scope that binds the base's
+                // first name itself, so the module's reading of it is not
+                // the class statement's.
+                bases.push(MroNode::Opaque(base.clone()));
             } else if !self.python_base_is_structural(file, base) {
                 bases.push(self.python_mro_node(file, base)?);
             }
@@ -592,11 +756,19 @@ impl Resolver {
     /// An [`MroNode::Opaque`] class ahead of that class abstains: the external
     /// or builtin base comes first in Python's order and might define the
     /// method itself. A class that declares the name twice abstains too.
+    ///
+    /// With `sole_declarer`, a second class further along the MRO that also
+    /// declares the name abstains as well: C3 does choose the first, but a
+    /// `self.m()` written in a class is a call on whichever subclass instance
+    /// is running, and the resolver commits to an edge only when one
+    /// declaration is all there is. `super().m()` names the next class by
+    /// definition and does not ask for this.
     pub(super) fn python_mro_method(
         &self,
         class_file: &str,
         type_key: &str,
         method: &str,
+        sole_declarer: bool,
     ) -> MroAnswer {
         let root = MroNode::Class(class_file.to_string(), type_key.to_string());
         let mut memo = BTreeMap::new();
@@ -605,8 +777,9 @@ impl Resolver {
             Ok(linear) => linear,
             Err(MroStop::NotScoped) => return MroAnswer::NotScoped,
             Err(MroStop::Abstain) => return MroAnswer::Abstain,
+            Err(MroStop::Capped(reason)) => return MroAnswer::Capped(reason),
         };
-        for node in linear.iter().skip(1) {
+        for (position, node) in linear.iter().enumerate().skip(1) {
             match node {
                 MroNode::Opaque(_) => return MroAnswer::Abstain,
                 MroNode::Class(file, identity) => {
@@ -614,6 +787,20 @@ impl Resolver {
                     match self.python_own_methods(file, key, method).as_slice() {
                         [] => {}
                         [(path, symbol)] => {
+                            let shadowed = sole_declarer
+                                && linear[position + 1..].iter().any(|later| match later {
+                                    MroNode::Class(later_file, later_identity) => !self
+                                        .python_own_methods(
+                                            later_file,
+                                            Self::python_type_key(later_identity),
+                                            method,
+                                        )
+                                        .is_empty(),
+                                    MroNode::Opaque(_) => false,
+                                });
+                            if shadowed {
+                                return MroAnswer::Abstain;
+                            }
                             return MroAnswer::Found(PythonMethod {
                                 file: path.clone(),
                                 symbol: symbol.clone(),
@@ -656,13 +843,22 @@ impl Resolver {
     /// The method a `super().method()` call reaches from a call attributed to
     /// `caller`: the enclosing class's declared bases, never the enclosing
     /// class itself.
+    ///
+    /// Only the zero-argument form and `super(Enclosing, self)` name the
+    /// enclosing class; `super(Other, self)` starts the walk after `Other` in
+    /// the instance's MRO, which is not this class's bases.
     pub(super) fn python_super_method(
         &self,
-        file: &str,
+        ext: &Extraction,
+        call: &ExtractedCall,
         caller: &str,
         method: &str,
     ) -> Option<PythonMethod> {
+        let file = ext.file_path.as_str();
         let enclosing = self.self_type_at(file, LangFamily::Python, caller)?;
+        if !python_super_names_enclosing(ext, call, &enclosing) {
+            return None;
+        }
         self.python_inherited_from(file, &enclosing, method)
     }
 
@@ -730,7 +926,14 @@ impl Resolver {
                 self.python_class_scope(file, &current)
             };
             // A class body's names are not in scope inside its methods.
-            if class_tail.is_none() && self.scope_declares_local(file, &current, root) {
+            if class_tail.is_none()
+                && (self.scope_declares_local(file, &current, root)
+                    || self.python_scoped_imports.get(file).is_some_and(|scoped| {
+                        scoped
+                            .in_callable
+                            .contains(&(current.clone(), root.to_string()))
+                    }))
+            {
                 return true;
             }
             callable = false;
@@ -769,6 +972,98 @@ impl Resolver {
             current = parent.clone();
         }
         true
+    }
+}
+
+/// Whether a Python module's `__all__` is anything but the one literal list the
+/// extractor reads names from.
+///
+/// The extractor files the strings of a literal `__all__ = [..]` (and `+= [..]`)
+/// as locals of the scope `{file}::__all__`, and keeps nothing of any other
+/// way to build the list, so a reader of those names alone would take a
+/// module whose list is also extended by a call as exporting only the
+/// literal part. The other ways are each recorded under another fact:
+///
+/// * a call or comprehension on the right of `=` / `+=` is a reference assigned
+///   to `__all__`, and a concatenation of literals is one too (its strings
+///   become `EntryName` references assigned to it);
+/// * `__all__.extend(..)`, `.append(..)` and every other method on it is a
+///   call whose receiver is `__all__`;
+/// * `other.__all__` read at module level is a `Name` with a receiver;
+/// * a `def __all__` or `class __all__` is a symbol of that name, whose
+///   locals share the `{file}::__all__` scope key with the literal list;
+/// * the extractor reads those names from the source *text*, wherever
+///   `__all__ = [..]` is written: a docstring, a function body or a class body
+///   file names under the same key. A name with no string literal at module
+///   level is therefore not a name a module-level `__all__` lists.
+///
+/// Any of them means `import *` may take any name the module binds.
+pub(super) fn python_all_is_dynamic(ext: &Extraction) -> bool {
+    let all_scope = format!("{}::__all__", ext.file_path);
+    ext.scope_locals.iter().any(|(scope, name)| {
+        *scope == all_scope
+            && !ext
+                .literals
+                .iter()
+                .any(|literal| literal.value == *name && literal.enclosing_qualified_name.is_empty())
+    }) || ext.symbols.iter().any(|symbol| {
+        symbol.name == "__all__"
+            && matches!(symbol.kind, SymbolKind::Function | SymbolKind::Class)
+            && symbol.parent_symbol.as_deref() == Some(ext.file_path.as_str())
+    }) || ext.references.iter().any(|reference| {
+        reference.enclosing_symbol.is_none()
+            && (reference.assigned_to.as_deref() == Some("__all__")
+                || (reference.kind == ReferenceKind::Name
+                    && reference.name == "__all__"
+                    && reference.receiver_expr.is_some()))
+    }) || ext.calls.iter().any(|call| {
+        call.caller_symbol.is_none() && call.receiver_expr.as_deref() == Some("__all__")
+    })
+}
+
+/// Whether the `super(..)` a `super(..).m()` call is made through starts the
+/// walk at the class it is written in: `super()`, or `super(Enclosing, x)` with
+/// the enclosing class's own name as its first argument.
+///
+/// The extractor keeps no arguments on a call, but it does keep every
+/// identifier it reads as a `Name` reference at its own span, so the arguments
+/// of the inner `super` call are the `Name`s inside its span. No names is the
+/// zero-argument form. Two names whose first is the enclosing class's bare
+/// name, written as `super(Name, x)` with at most one separator between them,
+/// is the explicit form of the same walk; anything else (another class, a
+/// dotted or computed first argument, a third argument) names a class this
+/// resolver does not follow and is refused.
+fn python_super_names_enclosing(ext: &Extraction, call: &ExtractedCall, enclosing: &str) -> bool {
+    let Some(inner) = ext.calls.iter().find(|inner| {
+        inner.callee_name == "super"
+            && inner.receiver_expr.is_none()
+            && inner.span.start_byte == call.span.start_byte
+            && inner.span.end_byte <= call.span.end_byte
+    }) else {
+        // No `super(..)` call was recorded under this one: the receiver was
+        // the bare name `super`, read as the zero-argument form before.
+        return true;
+    };
+    let mut names: Vec<&ExtractedReference> = ext
+        .references
+        .iter()
+        .filter(|reference| {
+            reference.kind == ReferenceKind::Name
+                && reference.span.start_byte >= inner.span.start_byte
+                && reference.span.end_byte <= inner.span.end_byte
+        })
+        .collect();
+    names.sort_by_key(|reference| reference.span.start_byte);
+    match names.as_slice() {
+        [] => true,
+        [first, second] => {
+            let own = enclosing.rsplit('.').next().unwrap_or(enclosing);
+            first.name == own
+                && first.span.start_byte == inner.span.start_byte + "super(".len()
+                && second.span.start_byte <= first.span.end_byte + 2
+                && second.span.end_byte + 1 == inner.span.end_byte
+        }
+        _ => false,
     }
 }
 
@@ -813,9 +1108,13 @@ pub(super) fn python_class_enclosers(ext: &Extraction) -> Vec<((String, String),
 
 /// What a Python file's imports bind each local name to: `import a.b` binds
 /// the package `a`, `import a.b as m` the module `a.b`, and `from a import n
-/// as m` the member `n` of `a`. Every import counts, at any depth: a name a
-/// function imports again is a second binding the class statement may or may
-/// not see.
+/// as m` the member `n` of `a`.
+///
+/// Module scope only: an import written inside a function binds that
+/// function's local (the extractor files it in `scope_locals`, which the scope
+/// walk reads), and one written in a class body binds a class attribute
+/// ([`python_scoped_imports`]). Neither rebinds the module's name, so a
+/// class statement at module level reads the module's imports alone.
 pub(super) fn python_import_binds(
     ext: &Extraction,
 ) -> BTreeMap<String, BTreeSet<PythonImportBind>> {
@@ -824,8 +1123,9 @@ pub(super) fn python_import_binds(
     // written after a name's import may rebind it.
     let mut first_import: BTreeMap<String, usize> = BTreeMap::new();
     let mut stars: Vec<(usize, &str)> = Vec::new();
+    let containers = python_scope_containers(ext);
     for imp in &ext.imports {
-        if imp.path_load.is_some() {
+        if imp.path_load.is_some() || python_innermost_container(&containers, &imp.span).is_some() {
             continue;
         }
         let specifier = imp.module_specifier.as_str();
@@ -897,4 +1197,106 @@ pub(super) fn python_import_binds(
         }
     }
     binds
+}
+
+/// The spans of every function, method and class a Python file declares, with
+/// the kind: the scopes an import can be written inside.
+pub(super) fn python_scope_containers(ext: &Extraction) -> Vec<ScopeSpan<'_>> {
+    ext.symbols
+        .iter()
+        .filter(|sym| {
+            matches!(
+                sym.kind,
+                SymbolKind::Function | SymbolKind::Method | SymbolKind::Class
+            )
+        })
+        .map(|sym| {
+            (
+                sym.span.start_byte,
+                sym.span.end_byte,
+                sym.kind,
+                sym.qualified_name.as_str(),
+            )
+        })
+        .collect()
+}
+
+/// A function, method or class of a Python file: its span, kind and qualified
+/// name.
+pub(super) type ScopeSpan<'a> = (usize, usize, SymbolKind, &'a str);
+
+/// The kind and qualified name of the innermost function, method or class
+/// that contains `span`, or `None` for a statement at module scope.
+pub(super) fn python_innermost_container<'a>(
+    containers: &[ScopeSpan<'a>],
+    span: &Span,
+) -> Option<(SymbolKind, &'a str)> {
+    containers
+        .iter()
+        .filter(|(start, end, _, _)| *start <= span.start_byte && span.end_byte <= *end)
+        .min_by_key(|(start, end, _, _)| end - start)
+        .map(|(_, _, kind, name)| (*kind, *name))
+}
+
+/// The names Python imports bind outside module scope.
+#[derive(Debug, Default)]
+pub(super) struct PythonScopedImports {
+    /// `(function or method, local name)` for each import written in a
+    /// callable's body. The extractor's `scope_locals` carries only some of
+    /// these (an aliased import, not `from m import A`).
+    pub(super) in_callable: BTreeSet<(String, String)>,
+    /// The local names a class body imports directly (`class H: from b import
+    /// A`). That binds a class attribute, which a nested class's base list can
+    /// read and a method cannot.
+    pub(super) in_class_body: BTreeSet<String>,
+}
+
+impl PythonScopedImports {
+    pub(super) fn is_empty(&self) -> bool {
+        self.in_callable.is_empty() && self.in_class_body.is_empty()
+    }
+}
+
+/// The local names a Python file's imports bind outside module scope, by the
+/// scope that binds them.
+pub(super) fn python_scoped_imports(ext: &Extraction) -> PythonScopedImports {
+    let containers = python_scope_containers(ext);
+    let mut scoped = PythonScopedImports::default();
+    for imp in &ext.imports {
+        if imp.path_load.is_some() {
+            continue;
+        }
+        let Some((kind, scope)) = python_innermost_container(&containers, &imp.span) else {
+            continue;
+        };
+        let mut locals: Vec<&str> = Vec::new();
+        if imp.imported_names.is_empty() {
+            locals.push(
+                imp.alias
+                    .as_deref()
+                    .filter(|alias| !matches!(*alias, "*" | "."))
+                    .unwrap_or_else(|| imp.module_specifier.split('.').next().unwrap_or("")),
+            );
+        } else {
+            for (index, name) in imp.imported_names.iter().enumerate() {
+                locals.push(
+                    imp.local_names
+                        .get(index)
+                        .map(String::as_str)
+                        .filter(|local| !local.is_empty())
+                        .unwrap_or(name.as_str()),
+                );
+            }
+        }
+        for local in locals.into_iter().filter(|local| !matches!(*local, "" | "*")) {
+            if kind == SymbolKind::Class {
+                scoped.in_class_body.insert(local.to_string());
+            } else {
+                scoped
+                    .in_callable
+                    .insert((scope.to_string(), local.to_string()));
+            }
+        }
+    }
+    scoped
 }

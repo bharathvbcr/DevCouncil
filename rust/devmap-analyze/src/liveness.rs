@@ -1291,12 +1291,11 @@ fn external_supertypes<'e>(
         }
         for (declarer, _, segments) in bases {
             let base = segments[0].rsplit('.').next().unwrap_or(segments[0]);
-            // A base no name denotes is a marker for the resolver's MRO walk,
-            // not a supertype this report can name.
-            if base.is_empty()
-                || base == devmap_extract::model::OPAQUE_BASE
-                || supertype_dispatches_nothing(base)
-            {
+            // A base no name denotes (`make_base()`, `*mixins`) is still a
+            // base the corpus does not declare: the class's methods may be
+            // called by whatever that expression evaluates to. It is kept,
+            // under the marker, as the external supertype it is.
+            if base.is_empty() || supertype_dispatches_nothing(base) {
                 continue;
             }
             // A Python base is the member first and then the qualifier from
@@ -1372,6 +1371,77 @@ fn import_qualified(ext: &Extraction, written: &[&str]) -> String {
     qualified
 }
 
+/// The methods of a Python class whose written base is a framework class with a
+/// known dispatch contract, keyed by the method's qualified name.
+///
+/// The extractor exempts these from the base *text* (`autograd.Function`), so a
+/// base it cannot read as text — `(torch.autograd.Function)`, `torch.autograd.
+/// Function[int]` — earns no exemption there. The heritage references carry
+/// the same base as segments whatever the punctuation around it, so the same
+/// contract table ([`devmap_extract::wiring::python_base_dispatch_reason`]) is
+/// asked here with the base resolved through the file's imports. A root the
+/// file rebinds at module scope is not the import's, so it is not read.
+fn python_contract_exemptions(ext: &Extraction) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    if ext.code_language() != "python" {
+        return out;
+    }
+    let mut bases: Vec<(&str, usize, Vec<&str>)> = Vec::new();
+    for reference in &ext.references {
+        if reference.kind != ReferenceKind::Heritage {
+            continue;
+        }
+        let Some(declarer) = reference.enclosing_symbol.as_deref() else {
+            continue;
+        };
+        let start = reference.span.start_byte;
+        match bases
+            .iter_mut()
+            .find(|(owner, at, _)| *owner == declarer && *at == start)
+        {
+            Some((_, _, segments)) => segments.push(reference.name.as_str()),
+            None => bases.push((declarer, start, vec![reference.name.as_str()])),
+        }
+    }
+    for (declarer, _, segments) in bases {
+        let written: Vec<&str> = segments[1..]
+            .iter()
+            .chain(&segments[..1])
+            .copied()
+            .collect();
+        let root = written[0];
+        if root == OPAQUE_BASE
+            || ext.scope_locals.iter().any(|(scope, name)| {
+                scope == &ext.file_path && name == root
+            })
+            || ext.symbols.iter().any(|symbol| {
+                symbol.name == root
+                    && symbol.kind != SymbolKind::File
+                    && symbol.parent_symbol.as_deref() == Some(ext.file_path.as_str())
+            })
+        {
+            continue;
+        }
+        // Matched exactly: the reason table matches on a tail, which a local
+        // `local.autograd.Function` also has.
+        let qualified = import_qualified(ext, &written);
+        if !devmap_extract::wiring::known_dispatch_contract(&qualified) {
+            continue;
+        }
+        for symbol in &ext.symbols {
+            if symbol.kind == SymbolKind::Method && symbol.parent_symbol.as_deref() == Some(declarer)
+            {
+                if let Some(reason) =
+                    devmap_extract::wiring::python_base_dispatch_reason(&qualified, &symbol.name)
+                {
+                    out.insert(symbol.qualified_name.clone(), reason.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The external supertype `declaring_type` inherits from, directly or through
 /// in-corpus ancestors, walked as [`reached_through_a_supertype`] walks them.
 fn external_supertype_of<'e>(
@@ -1443,8 +1513,13 @@ fn unconfirmed_dispatch_reason(
     }
     let (declaring_type, _) = identity.rsplit_once('.')?;
     let base = external_supertype_of(&ext.file_path, declaring_type, supertypes, external)?;
+    let base = if base == OPAQUE_BASE {
+        "a base class written as an expression no name denotes".to_string()
+    } else {
+        format!("`{base}`")
+    };
     Some(format!(
-        "{EXTERNAL_SUPERTYPE}: its class inherits from `{base}`, which the corpus does not \
+        "{EXTERNAL_SUPERTYPE}: its class inherits from {base}, which the corpus does not \
          declare, and a base class calls a subclass's methods by name — no call names it, \
          which is not evidence nothing calls it"
     ))
@@ -3006,6 +3081,8 @@ fn symbol_exemption_index(
             .map(|w| (w.target_symbol.as_str(), w.details.as_str()))
             .collect();
 
+        let python_contracts = python_contract_exemptions(ext);
+
         // Read by the corpus-wide exported-interface arm below; empty for
         // every other language, which never reaches it.
         let go_param_counts = if ext.language == "go" {
@@ -3074,6 +3151,7 @@ fn symbol_exemption_index(
             let reason: Option<String> = wired
                 .get(sym.qualified_name.as_str())
                 .map(|details| (*details).to_string())
+                .or_else(|| python_contracts.get(&sym.qualified_name).cloned())
                 // An explicit declaration in a manifest, ahead of every
                 // inference below it: `pip` writes the launcher that calls this
                 // function, and the launcher is generated at install time and
