@@ -137,6 +137,11 @@ struct Gates {
     /// language lane). A row measured before them describes a DevMap that no
     /// longer exists.
     must_include: Vec<String>,
+    /// Per corpus, the `parse_failed` baseline exactly as `corpora.json` spells
+    /// it: the number of files that fail to parse on an idle machine. Kept raw
+    /// so a negative or non-integer entry is refused as malformed by
+    /// [`check_build`] rather than panicking the load or being coerced.
+    parse_failed: BTreeMap<String, Value>,
 }
 
 fn rates(value: &Value, key: &str, path: &Path) -> BTreeMap<String, f64> {
@@ -203,10 +208,20 @@ fn load_pins() -> (Vec<Pin>, Gates) {
         "{}: record_must_include is empty, so a stale record cannot be told from a fresh one",
         path.display()
     );
+    let parse_failed = value["corpora"]
+        .as_array()
+        .expect("corpora is an array")
+        .iter()
+        .filter_map(|c| {
+            let baseline = c.get("parse_failed")?.clone();
+            Some((c["name"].as_str()?.to_string(), baseline))
+        })
+        .collect();
     let gates = Gates {
         floors: rates(&value, "recall_floors_percent", &path),
         targets: rates(&value, "recall_targets_percent", &path),
         must_include,
+        parse_failed,
     };
     (pins, gates)
 }
@@ -1381,15 +1396,175 @@ fn verify_devmap_includes(must_include: &[String]) -> Result<Vec<String>, String
     Ok(must_include.to_vec())
 }
 
-/// Measure one pinned corpus. Returns its `measurements` entry, and its
-/// `corpora` entry when it has labels.
+/// What measuring one pinned corpus came to.
+enum Outcome {
+    /// Its `measurements` entry, and its `corpora` entry when it has labels.
+    Measured(Value, Option<Value>),
+    /// The build's own health refused the row; one line per cause, each ending
+    /// in the retry command. Nothing about this corpus may reach the record.
+    Refused(Vec<String>),
+}
+
+/// Most refused paths a refusal names. The total is carried beside them, the
+/// same cap `devmap status` applies to `budget_refused.paths`.
+const REFUSED_PATH_SAMPLE: usize = 50;
+
+/// What a build says about its own parse health: the two numbers a row measured
+/// on a degraded build must not be recorded without.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BuildStatus {
+    /// Files still refused for the wall-clock parse budget after the serial
+    /// retry (`budget_refused.total` in `devmap status --json`).
+    budget_refused_total: usize,
+    /// The first [`REFUSED_PATH_SAMPLE`] of them, sorted; the total is above.
+    budget_refused_paths: Vec<String>,
+    /// Files that failed to parse, budget refusals included
+    /// (`ExtractionCoverage::parse_failed_files`, the count behind the
+    /// `analysis_status` the record carries).
+    parse_failed: usize,
+}
+
+/// Reads the build's status the way `devmap status` derives it: budget refusals
+/// by `Extraction::is_budget_refusal` (the store's own test), parse failures by
+/// `extraction_coverage`. A budget refusal is a parse failure, so a build that
+/// counts more of the first than the second contradicts itself: unverifiable.
+fn build_status(built: &Built) -> Result<BuildStatus, String> {
+    let mut paths: Vec<&str> = built
+        .extractions
+        .iter()
+        .filter(|ext| ext.is_budget_refusal())
+        .map(|ext| ext.file_path.as_str())
+        .collect();
+    paths.sort_unstable();
+    let parse_failed = devmap_analyze::extraction_coverage(&built.extractions).parse_failed_files;
+    if parse_failed < paths.len() {
+        return Err(format!(
+            "the build counts {} budget refusal(s) but only {parse_failed} parse failure(s), \
+             and a budget refusal is a parse failure",
+            paths.len()
+        ));
+    }
+    Ok(BuildStatus {
+        budget_refused_total: paths.len(),
+        budget_refused_paths: paths
+            .iter()
+            .take(REFUSED_PATH_SAMPLE)
+            .map(|p| (*p).to_string())
+            .collect(),
+        parse_failed,
+    })
+}
+
+/// The expected `parse_failed` count from `corpora.json`, or why it cannot be
+/// trusted. Only a non-negative JSON integer is a baseline.
+fn parse_baseline(raw: Option<&Value>) -> Result<u64, String> {
+    match raw {
+        None => Err("corpora.json has no parse_failed baseline for this corpus; add one \
+             (its failed-to-parse count on an idle machine)"
+            .to_string()),
+        Some(v) => v.as_u64().ok_or_else(|| {
+            format!(
+                "corpora.json parse_failed baseline {v} is malformed: it must be a non-negative integer"
+            )
+        }),
+    }
+}
+
+/// The guarded re-run every refusal ends with.
+fn retry_command(corpus: &str) -> String {
+    format!(
+        "retry on an idle machine: RAYON_NUM_THREADS=4 {}=<checkout> cargo test --release -j 4 \
+         -p devmap-analyze --test real_corpus_accuracy -- --ignored --nocapture",
+        env_name(corpus)
+    )
+}
+
+/// What [`check_build`] decided about one corpus.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BuildCheck {
+    /// Causes that refuse the row, each naming itself: `budget refusal`,
+    /// `parse failure` or `unverifiable`. Empty means the row may be recorded.
+    refusals: Vec<String>,
+    /// Facts that do not refuse but should reach the operator, e.g. a count
+    /// below its baseline, which can then be tightened.
+    notes: Vec<String>,
+}
+
+/// Whether a row measured on a build with this `status` may be recorded.
+///
+/// Pure over the status, so a test injects any build. A status that could not
+/// be read, a missing or malformed baseline and every count over its limit all
+/// refuse; none of them falls through to "clean".
+fn check_build(
+    corpus: &str,
+    baseline: Option<&Value>,
+    status: Result<&BuildStatus, &str>,
+) -> BuildCheck {
+    let mut check = BuildCheck::default();
+    let retry = retry_command(corpus);
+    let baseline = parse_baseline(baseline);
+    if let Err(why) = &baseline {
+        check.refusals.push(format!("unverifiable: {why}; {retry}"));
+    }
+    let status = match status {
+        Ok(status) => status,
+        Err(why) => {
+            check.refusals.push(format!(
+                "unverifiable: the build's status could not be read ({why}), so its parse health is unknown; {retry}"
+            ));
+            return check;
+        }
+    };
+    if status.budget_refused_total > 0 {
+        check.refusals.push(format!(
+            "budget refusal: {total} file(s) were refused for the parse budget after the serial retry \
+             (load-dependent, not a grammar fault); showing {shown} of {total}: {paths}; {retry}",
+            total = status.budget_refused_total,
+            shown = status.budget_refused_paths.len(),
+            paths = status.budget_refused_paths.join(", ")
+        ));
+    }
+    // Budget refusals are already named above; the baseline is the count of
+    // files that fail to parse on an idle machine, which has none of them.
+    let failed = status
+        .parse_failed
+        .saturating_sub(status.budget_refused_total) as u64;
+    if let Ok(expected) = baseline {
+        if failed > expected {
+            check.refusals.push(format!(
+                "parse failure: {failed} file(s) failed to parse, above the baseline of {expected} in corpora.json; \
+                 find what regressed, or raise the baseline in the change that explains it; {retry}"
+            ));
+        } else if failed < expected {
+            check.notes.push(format!(
+                "{corpus}: {failed} file(s) failed to parse, below the baseline of {expected}; tighten parse_failed in corpora.json"
+            ));
+        }
+    }
+    check
+}
+
+/// Measure one pinned corpus.
 fn measure_corpus(
     dir: &Path,
     pin: &Pin,
     includes: &[String],
-) -> Result<(Value, Option<Value>), String> {
+    gates: &Gates,
+) -> Result<Outcome, String> {
     verify_pin(dir, pin)?;
     let built = common::build(dir);
+    let status = build_status(&built);
+    let check = check_build(
+        &pin.name,
+        gates.parse_failed.get(&pin.name),
+        status.as_ref().map_err(String::as_str),
+    );
+    for note in &check.notes {
+        eprintln!("{note}");
+    }
+    if !check.refusals.is_empty() {
+        return Ok(Outcome::Refused(check.refusals));
+    }
     let structure = structure(&built, &pin.languages);
     let date = today();
     let commit = devmap_commit();
@@ -1400,12 +1575,13 @@ fn measure_corpus(
         "includes_commits": includes,
         "corpus_commit": pin.commit,
         "analysis_status": format!("{:?}", built.analysis.status),
+        "parse_failed_files": status.as_ref().map_or(0, |s| s.parse_failed),
         "dead_rows_total": built.analysis.dead_symbols.len(),
         "dead_rows_exempt": built.analysis.dead_symbols.iter().filter(|r| r.is_exempt).count(),
         "languages": structure,
     });
     let Some(labels) = load_labels(dir, &pin.name)? else {
-        return Ok((measurement, None));
+        return Ok(Outcome::Measured(measurement, None));
     };
     let scored = score_labels(&pin.name, &built, &labels, &pin.languages)?;
     let languages: Map<String, Value> = scored
@@ -1416,7 +1592,7 @@ fn measure_corpus(
             (lang, row)
         })
         .collect();
-    Ok((
+    Ok(Outcome::Measured(
         measurement,
         Some(json!({ "name": pin.name, "corpus_commit": pin.commit, "languages": languages })),
     ))
@@ -1442,6 +1618,17 @@ fn carry_unverifiable(
     labelled: Option<Value>,
     pin: &Pin,
 ) -> Option<Value> {
+    carry_unverifiable_because(previous, labelled, pin, None)
+}
+
+/// [`carry_unverifiable`] with the cause the caller knows, e.g. a refused
+/// build; `None` derives it from the labels, as the label path always has.
+fn carry_unverifiable_because(
+    previous: Option<&Value>,
+    labelled: Option<Value>,
+    pin: &Pin,
+    cause: Option<&str>,
+) -> Option<Value> {
     let Some(previous) = previous else {
         return labelled;
     };
@@ -1458,10 +1645,10 @@ fn carry_unverifiable(
     if missing.is_empty() {
         return labelled;
     }
-    let mut reason = if labelled.is_none() {
-        format!("no labels file was found for {}", pin.name)
-    } else {
-        "the labels hold nothing for this language".to_string()
+    let mut reason = match cause {
+        Some(cause) => cause.to_string(),
+        None if labelled.is_none() => format!("no labels file was found for {}", pin.name),
+        None => "the labels hold nothing for this language".to_string(),
     };
     // The carried row was measured at the commit the record names; when the
     // pin has moved, the entry written under the pin's commit says so rather
@@ -1533,26 +1720,62 @@ fn refresh_open_gates(record: &mut Value, pins: &[Pin], gates: &Gates) {
     record["open_gates"] = json!(open_gates(record, pins, gates));
 }
 
-#[test]
-#[ignore = "needs DEVMAP_CORPUS_<NAME> checkouts of the owner's private repositories"]
-fn score_the_pinned_corpora_and_write_the_record() {
-    let (pins, gates) = load_pins();
-    let includes = verify_devmap_includes(&gates.must_include).unwrap_or_else(|e| panic!("{e}"));
-    let mut record = load_record();
-    let mut failures = Vec::new();
-    let mut ran = 0;
-    let date = today();
-
-    for pin in &pins {
-        let Some(dir) = std::env::var_os(env_name(&pin.name)).map(PathBuf::from) else {
-            eprintln!("skipping {}: {} is not set", pin.name, env_name(&pin.name));
+/// Folds every corpus's outcome into a copy of `record`, or refuses.
+///
+/// Any refused corpus refuses the whole run before a byte of the record is
+/// produced: the caller writes only an `Ok`, so a refused run leaves
+/// `record.json` - `open_gates` included - exactly as committed. The refusal
+/// text carries each cause and the gate the committed row would fail as
+/// (`carry_unverifiable_because` stamps it the way a missing labels file does),
+/// so the operator sees what the record holds until the guarded re-run.
+/// `Ok` is the new record and the gate failures to assert on.
+fn apply_outcomes(
+    record: &Value,
+    outcomes: Vec<(&Pin, Outcome)>,
+    pins: &[Pin],
+    gates: &Gates,
+    date: &str,
+) -> Result<(Value, Vec<String>), String> {
+    let mut refused = Vec::new();
+    for (pin, outcome) in &outcomes {
+        let Outcome::Refused(causes) = outcome else {
             continue;
         };
-        ran += 1;
-        let (measurement, labelled) =
-            measure_corpus(&dir, pin, &includes).unwrap_or_else(|e| panic!("{}: {e}", pin.name));
-        println!("{}", serde_json::to_string_pretty(&measurement).unwrap());
+        refused.push(format!(
+            "{} refused:\n    {}",
+            pin.name,
+            causes.join("\n    ")
+        ));
+        let previous = runner_row(record, "corpora", &pin.name);
+        let stamped = carry_unverifiable_because(previous, None, pin, Some(&causes.join("; ")));
+        for lang in &pin.languages {
+            let current = stamped
+                .as_ref()
+                .map_or(Value::Null, |e| e["languages"][lang.as_str()].clone());
+            if !current["unverifiable"].is_null() {
+                refused.extend(
+                    evaluate_gates(lang, None, &current, None, gates)
+                        .into_iter()
+                        .map(|g| {
+                            format!(
+                                "  {}: {g} (committed row kept; record not written)",
+                                pin.name
+                            )
+                        }),
+                );
+            }
+        }
+    }
+    if !refused.is_empty() {
+        return Err(refused.join("\n  "));
+    }
 
+    let mut record = record.clone();
+    let mut failures = Vec::new();
+    for (pin, outcome) in outcomes {
+        let Outcome::Measured(measurement, labelled) = outcome else {
+            continue;
+        };
         let previous = runner_row(&record, "corpora", &pin.name).cloned();
         let labelled = carry_unverifiable(previous.as_ref(), labelled, pin);
         // A corpus without labels is gated too: every labelled gate then
@@ -1569,25 +1792,51 @@ fn score_the_pinned_corpora_and_write_the_record() {
             let lang_measurement =
                 Some(&measurement["languages"][lang.as_str()]).filter(|v| !v.is_null());
             failures.extend(
-                evaluate_gates(lang, prev_row, &current, lang_measurement, &gates)
+                evaluate_gates(lang, prev_row, &current, lang_measurement, gates)
                     .into_iter()
                     .map(|f| format!("{}: {f}", pin.name)),
             );
         }
-        supersede(&mut record, "measurements", &pin.name, measurement, &date);
+        supersede(&mut record, "measurements", &pin.name, measurement, date);
         if let Some(entry) = labelled {
-            supersede(&mut record, "corpora", &pin.name, entry, &date);
+            supersede(&mut record, "corpora", &pin.name, entry, date);
         }
     }
+    // `open_gates` carries every pinned corpus's failures, measured this run or not.
+    refresh_open_gates(&mut record, pins, gates);
+    Ok((record, failures))
+}
+
+#[test]
+#[ignore = "needs DEVMAP_CORPUS_<NAME> checkouts of the owner's private repositories"]
+fn score_the_pinned_corpora_and_write_the_record() {
+    let (pins, gates) = load_pins();
+    let includes = verify_devmap_includes(&gates.must_include).unwrap_or_else(|e| panic!("{e}"));
+    let record = load_record();
+    let mut outcomes = Vec::new();
+
+    for pin in &pins {
+        let Some(dir) = std::env::var_os(env_name(&pin.name)).map(PathBuf::from) else {
+            eprintln!("skipping {}: {} is not set", pin.name, env_name(&pin.name));
+            continue;
+        };
+        let outcome = measure_corpus(&dir, pin, &includes, &gates)
+            .unwrap_or_else(|e| panic!("{}: {e}", pin.name));
+        if let Outcome::Measured(measurement, _) = &outcome {
+            println!("{}", serde_json::to_string_pretty(measurement).unwrap());
+        }
+        outcomes.push((pin, outcome));
+    }
     assert!(
-        ran > 0,
+        !outcomes.is_empty(),
         "no DEVMAP_CORPUS_<NAME> variable is set; nothing was measured"
     );
 
     // The record is written before the gates are asserted: a failing gate is a
-    // finding to commit and explain, not a number to hide. `open_gates` carries
-    // it in the record for every pinned corpus, measured this run or not.
-    refresh_open_gates(&mut record, &pins, &gates);
+    // finding to commit and explain, not a number to hide. A refused build is
+    // not a finding about the resolver, so it never reaches the record.
+    let (record, failures) = apply_outcomes(&record, outcomes, &pins, &gates, &today())
+        .unwrap_or_else(|e| panic!("the record was not written:\n  {e}"));
     std::fs::write(
         record_path(),
         serde_json::to_string_pretty(&record).unwrap() + "\n",
@@ -3188,4 +3437,201 @@ fn attack_labels_that_are_not_an_object_of_known_sections_are_refused() {
     .collect();
     assert!(accepted.is_empty(), "parse_labels accepted {accepted:?}");
     assert!(parse_labels("{}").is_ok());
+}
+
+// ------------------------------------------- build health refuses a row
+
+fn status(budget: usize, shown: &[&str], parse_failed: usize) -> BuildStatus {
+    BuildStatus {
+        budget_refused_total: budget,
+        budget_refused_paths: shown.iter().map(|p| (*p).to_string()).collect(),
+        parse_failed,
+    }
+}
+
+fn clean_check(baseline: u64, status: &BuildStatus) -> BuildCheck {
+    check_build("Corpus", Some(&json!(baseline)), Ok(status))
+}
+
+#[test]
+fn a_budget_refusal_refuses_the_row_naming_capped_paths_and_carrying_the_total() {
+    // Unicode paths, and a listing capped well below the total.
+    let shown: Vec<String> = (0..REFUSED_PATH_SAMPLE)
+        .map(|i| format!("café/日本語/ファイル{i}.rs"))
+        .collect();
+    let shown_refs: Vec<&str> = shown.iter().map(String::as_str).collect();
+    let check = clean_check(8, &status(120, &shown_refs, 128));
+    assert_eq!(check.refusals.len(), 1, "{check:?}");
+    let text = &check.refusals[0];
+    assert!(text.starts_with("budget refusal:"), "{text}");
+    assert!(text.contains("showing 50 of 120"), "{text}");
+    assert!(text.contains("café/日本語/ファイル0.rs"), "{text}");
+    assert!(text.contains("RAYON_NUM_THREADS=4"), "{text}");
+    assert!(text.contains("idle machine"), "{text}");
+    // 128 failures include the 120 budget ones: 8 is the baseline, so only
+    // the budget refusal refuses.
+    assert!(!text.contains("parse failure"), "{text}");
+}
+
+#[test]
+fn a_status_that_could_not_be_read_is_unverifiable_never_clean() {
+    let check = check_build(
+        "Corpus",
+        Some(&json!(8)),
+        Err("no store at /x/devmap.sqlite"),
+    );
+    assert_eq!(check.refusals.len(), 1, "{check:?}");
+    assert!(check.refusals[0].starts_with("unverifiable:"));
+    assert!(check.refusals[0].contains("no store at /x/devmap.sqlite"));
+    assert!(check.refusals[0].contains("RAYON_NUM_THREADS=4"));
+}
+
+#[test]
+fn a_parse_failure_count_above_its_baseline_refuses_and_below_it_is_reported() {
+    let at = clean_check(8, &status(0, &[], 8));
+    assert_eq!(
+        at,
+        BuildCheck::default(),
+        "at the baseline is clean and silent"
+    );
+
+    let over = clean_check(8, &status(0, &[], 9));
+    assert_eq!(over.refusals.len(), 1, "{over:?}");
+    assert!(over.refusals[0].starts_with("parse failure:"));
+    assert!(over.refusals[0].contains("9 file(s)") && over.refusals[0].contains("baseline of 8"));
+    assert!(over.refusals[0].contains("RAYON_NUM_THREADS=4"));
+
+    let under = clean_check(8, &status(0, &[], 5));
+    assert!(under.refusals.is_empty(), "{under:?}");
+    assert_eq!(under.notes.len(), 1, "{under:?}");
+    assert!(under.notes[0].contains("below the baseline of 8"));
+    assert!(under.notes[0].contains("tighten parse_failed"));
+}
+
+#[test]
+fn a_missing_or_malformed_baseline_refuses() {
+    let clean = status(0, &[], 0);
+    let missing = check_build("NewCorpus", None, Ok(&clean));
+    assert_eq!(missing.refusals.len(), 1, "{missing:?}");
+    assert!(missing.refusals[0].contains("no parse_failed baseline"));
+    assert!(missing.refusals[0].contains("add one"));
+    for bad in [json!(-1), json!(2.5), json!(3.0), json!("3"), json!(null)] {
+        let check = check_build("Corpus", Some(&bad), Ok(&clean));
+        assert_eq!(check.refusals.len(), 1, "{bad}: {check:?}");
+        assert!(check.refusals[0].contains("malformed"), "{bad}");
+    }
+}
+
+#[test]
+fn the_committed_baselines_are_the_documented_idle_counts() {
+    let (pins, gates) = load_pins();
+    let expected = [
+        ("scholarlm", 8),
+        ("Lappi-decision", 0),
+        ("GitPulse", 0),
+        ("DevType", 0),
+        ("ChronosFlow", 3),
+    ];
+    for (name, count) in expected {
+        assert_eq!(
+            parse_baseline(gates.parse_failed.get(name)),
+            Ok(count),
+            "{name}"
+        );
+    }
+    for (name, raw) in &gates.parse_failed {
+        assert!(parse_baseline(Some(raw)).is_ok(), "{name}: {raw}");
+        assert!(pins.iter().any(|p| &p.name == name), "{name} is not pinned");
+    }
+}
+
+#[test]
+fn build_status_counts_budget_refusals_by_the_stores_own_test() {
+    use devmap_extract::model::{ParseOutcome, BUDGET_REFUSAL_PREFIX};
+    let dir = common::fixture_dirs().remove(0);
+    let mut built = common::build(&dir);
+    let before = build_status(&built).expect("a fixture build has a readable status");
+    assert_eq!(before.budget_refused_total, 0, "{before:?}");
+
+    let ext = built
+        .extractions
+        .iter_mut()
+        .find(|e| {
+            !e.is_parse_failure() && (e.file_path.ends_with(".rs") || e.file_path.ends_with(".go"))
+        })
+        .expect("the fixture holds a source file");
+    let path = ext.file_path.clone();
+
+    ext.parse_outcome = ParseOutcome::Failed {
+        reason: format!("{BUDGET_REFUSAL_PREFIX}over 5s"),
+    };
+    let after = build_status(&built).expect("readable");
+    assert_eq!(after.budget_refused_total, 1, "{after:?}");
+    assert_eq!(after.budget_refused_paths, vec![path]);
+    assert_eq!(after.parse_failed, before.parse_failed + 1);
+}
+
+fn refused_run_fixture() -> (Pin, Value, Gates) {
+    let pin = unverifiable_pin(&["go", "python"]);
+    let record = json!({
+        "corpora": [committed_corpus_row()],
+        "measurements": [],
+        "open_gates": ["sentinel: untouched"],
+    });
+    (pin, record, gates())
+}
+
+#[test]
+fn a_refused_run_writes_nothing_and_stamps_the_committed_row_unverifiable_with_the_cause() {
+    let (pin, record, gates) = refused_run_fixture();
+    let before = record.clone();
+    let cause = check_build(
+        "Corpus",
+        Some(&json!(0)),
+        Ok(&status(2, &["a.rs", "b.rs"], 2)),
+    )
+    .refusals;
+    let other = Pin {
+        name: "Other".into(),
+        ..unverifiable_pin(&["go"])
+    };
+    let fine = Outcome::Measured(json!({ "name": "Other" }), None);
+    let err = apply_outcomes(
+        &record,
+        vec![(&other, fine), (&pin, Outcome::Refused(cause.clone()))],
+        std::slice::from_ref(&pin),
+        &gates,
+        "2026-10-18",
+    )
+    .expect_err("a refused corpus refuses the run");
+    assert!(err.contains("budget refusal"), "{err}");
+    assert!(err.contains("RAYON_NUM_THREADS=4"), "{err}");
+    // The existing stamping mechanism names corpus-language and cause.
+    for lang in ["go", "python"] {
+        let reason = cause.join("; ");
+        assert!(
+            err.contains(&unverifiable_gate(lang, &reason)),
+            "{lang}: {err}"
+        );
+    }
+    assert_eq!(record, before, "the committed record is untouched");
+    assert_eq!(record["open_gates"], json!(["sentinel: untouched"]));
+}
+
+#[test]
+fn a_clean_run_still_rewrites_the_record_and_open_gates() {
+    let (pin, record, gates) = refused_run_fixture();
+    let (written, _failures) = apply_outcomes(
+        &record,
+        vec![(
+            &pin,
+            Outcome::Measured(json!({ "name": "Corpus", "languages": {} }), None),
+        )],
+        std::slice::from_ref(&pin),
+        &gates,
+        "2026-10-18",
+    )
+    .expect("a measured corpus is recorded");
+    assert_ne!(written["open_gates"], json!(["sentinel: untouched"]));
+    assert_eq!(written["measurements"].as_array().map(Vec::len), Some(1));
 }

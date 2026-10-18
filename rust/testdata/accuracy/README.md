@@ -278,7 +278,35 @@ number it needs is missing: a corpus without labels is gated as well, not skippe
 The runner also refuses to measure with a DevMap that does not contain every
 commit in `record_must_include` (S2, d0552ae1, and each language lane's merge),
 and stamps that list into each measurement as `includes_commits`; a row without it
-is listed in `open_gates` as stale. Run the runner before any DevMap release and after a change to
+is listed in `open_gates` as stale.
+
+The runner also refuses a row measured on a degraded build. The load guard is
+code (`check_build`), not a habit; each refusal names its cause and ends with the
+guarded retry, `RAYON_NUM_THREADS=4 DEVMAP_CORPUS_<NAME>=<checkout> cargo test
+--release -j 4 -p devmap-analyze --test real_corpus_accuracy -- --ignored
+--nocapture`, run on an idle machine:
+
+* **budget refusal** - any file still refused for the parse budget after the
+  serial retry (the `budget_refused.total` of `devmap status`, counted by
+  `Extraction::is_budget_refusal`). The refusal names up to 50 paths and carries
+  the total.
+* **parse failure** - more files failed to parse (budget refusals excluded) than
+  the corpus's `parse_failed` baseline in `corpora.json`. A count below the
+  baseline is allowed but printed, so the baseline can be tightened.
+* **unverifiable** - the build's status could not be read, or the corpus has no
+  `parse_failed` baseline (add one), or it is not a non-negative integer.
+
+`parse_failed` lives in `corpora.json`, beside the pin it describes, because it
+is a property of the pinned commit that a reviewer changes with it; `record.json`
+holds only measurements. Seeded with the idle-machine counts: scholarlm 8,
+Lappi-decision 0, GitPulse 0, DevType 0, ChronosFlow 3. The other pinned corpora
+have none yet and are refused until one is measured and added.
+
+A refused run writes nothing: `record.json`, `open_gates` included, stays as
+committed. The refusal text lists the gate each committed row fails as while
+stamped `unverifiable` with the cause, the same stamp a missing labels file gets.
+
+Run the runner before any DevMap release and after a change to
 `treesitter.rs`, `langcalls/`, `langdecl/`, `resolver.rs` or `liveness.rs` that
 touches the language.
 
