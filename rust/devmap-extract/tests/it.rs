@@ -123,9 +123,13 @@ mod sql_check_constraint_parse;
 #[cfg(feature = "parse")]
 mod stress_hardening;
 #[cfg(feature = "parse")]
+mod non_swift_byte_compare;
+#[cfg(feature = "parse")]
 mod swift_properties;
 #[cfg(feature = "parse")]
 mod swift_properties_attack;
+#[cfg(feature = "parse")]
+mod swift_close_attack;
 #[cfg(feature = "parse")]
 mod swift_property_read_shapes;
 #[cfg(feature = "parse")]

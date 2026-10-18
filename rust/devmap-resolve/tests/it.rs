@@ -129,9 +129,13 @@ mod semantic_scope_and_identity;
 #[cfg(feature = "parse")]
 mod shell_source_resolves;
 #[cfg(feature = "parse")]
+mod non_swift_edge_compare;
+#[cfg(feature = "parse")]
 mod swift_modules;
 #[cfg(feature = "parse")]
 mod swift_properties_attack;
+#[cfg(feature = "parse")]
+mod swift_close_attack;
 #[cfg(feature = "parse")]
 mod swift_property_reads;
 #[cfg(feature = "parse")]
