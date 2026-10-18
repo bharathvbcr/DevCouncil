@@ -26,6 +26,8 @@ mod a_kernel_is_reached_from_its_host_by_name;
 mod a_nan_floor_is_refused;
 mod a_query_only_build_can_call_a_store_current;
 #[cfg(feature = "parse")]
+mod a_refusal_carries_the_freshness_the_store_reports;
+#[cfg(feature = "parse")]
 mod a_rendered_component_has_a_caller;
 #[cfg(feature = "parse")]
 mod a_traversal_over_a_hole_says_so;

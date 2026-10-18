@@ -562,13 +562,13 @@ impl<'a> StoreQueryEngine<'a> {
         let Some((generation, index)) = self.store.generation_edges_with_id()? else {
             let reason = "no persisted generation is available".to_string();
             return Ok(LayeredImpact {
-                edges: unavailable_response(ResolutionAvailability::Unavailable {
+                edges: self.unavailable(ResolutionAvailability::Unavailable {
                     reason: reason.clone(),
                 }),
                 blast_radius: BlastRadius {
                     seeds: Vec::new(),
                     unmatched_targets: vec![req.query],
-                    layers: unavailable_response(ResolutionAvailability::Unavailable { reason }),
+                    layers: self.unavailable(ResolutionAvailability::Unavailable { reason }),
                     total_impacted: 0,
                 },
             });
@@ -576,7 +576,7 @@ impl<'a> StoreQueryEngine<'a> {
         let direction = index.directed(true, req.min_confidence);
         let target = req.query.clone();
         let min_confidence = req.min_confidence;
-        let (mut edges, bands) = self.traverse_walked(
+        let (mut edges, bands) = self.traverse_walked_finished(
             &index,
             &direction,
             Request {
@@ -781,7 +781,7 @@ impl<'a> StoreQueryEngine<'a> {
                 .iter()
                 .map(|target| {
                     let unavailable = || {
-                        unavailable_response(ResolutionAvailability::Unavailable {
+                        self.unavailable(ResolutionAvailability::Unavailable {
                             reason: "no persisted generation is available".to_string(),
                         })
                     };
@@ -937,7 +937,7 @@ impl<'a> StoreQueryEngine<'a> {
                 .reason(),
         );
         let unavailable = |reason: String| {
-            let mut response = unavailable_response(ResolutionAvailability::Unavailable { reason });
+            let mut response = self.unavailable(ResolutionAvailability::Unavailable { reason });
             response.walk_incomplete = coverage_gap.clone();
             response
         };
@@ -1265,8 +1265,32 @@ impl<'a> StoreQueryEngine<'a> {
         min_rung: Option<crate::rung::Rung>,
     ) -> anyhow::Result<Response<ResolvedEdge>> {
         Ok(self
-            .traverse_walked(index, direction, req, min_rung, None)?
+            .traverse_walked_finished(index, direction, req, min_rung, None)?
             .0)
+    }
+
+    /// [`Self::traverse_walked`] with both halves routed through
+    /// [`Self::finish`]. The kernel builds its refusals from
+    /// `unavailable_response` and its answers from `budget_take`, neither of
+    /// which asks the store, so freshness is attached here once for every
+    /// caller rather than at each of its returns.
+    fn traverse_walked_finished(
+        &self,
+        index: &GenerationEdges,
+        direction: &devmap_store::DirectedEdges<'_>,
+        req: Request<String>,
+        min_rung: Option<crate::rung::Rung>,
+        band_budget: Option<u32>,
+    ) -> anyhow::Result<(Response<ResolvedEdge>, Option<BlastRadius>)> {
+        let (response, bands) =
+            self.traverse_walked(index, direction, req, min_rung, band_budget)?;
+        Ok((
+            self.finish(response),
+            bands.map(|mut bands| {
+                bands.layers = self.finish(bands.layers);
+                bands
+            }),
+        ))
     }
 
     /// [`Self::traverse_over`], optionally banding the same walk by distance.
@@ -1644,14 +1668,14 @@ impl<'a> StoreQueryEngine<'a> {
         let budget = explore_budget(token_budget);
         let empty = |reason: String| ExploreReport {
             query: query.to_string(),
-            definitions: unavailable_response(ResolutionAvailability::Unavailable {
+            definitions: self.unavailable(ResolutionAvailability::Unavailable {
                 reason: reason.clone(),
             }),
             limit: u32::try_from(limit).unwrap_or(u32::MAX),
             blast_radius: BlastRadius {
                 seeds: Vec::new(),
                 unmatched_targets: Vec::new(),
-                layers: unavailable_response(ResolutionAvailability::Unavailable { reason }),
+                layers: self.unavailable(ResolutionAvailability::Unavailable { reason }),
                 total_impacted: 0,
             },
             budget,
@@ -1843,13 +1867,13 @@ impl<'a> StoreQueryEngine<'a> {
         let list_budget = token_budget.saturating_sub(layer_budget);
         let empty_report = |reason: String| AffectedTestsReport {
             targets: targets.to_vec(),
-            tests: unavailable_response(ResolutionAvailability::Unavailable {
+            tests: self.unavailable(ResolutionAvailability::Unavailable {
                 reason: reason.clone(),
             }),
             blast_radius: BlastRadius {
                 seeds: Vec::new(),
                 unmatched_targets: targets.to_vec(),
-                layers: unavailable_response(ResolutionAvailability::Unavailable { reason }),
+                layers: self.unavailable(ResolutionAvailability::Unavailable { reason }),
                 total_impacted: 0,
             },
         };
@@ -2225,7 +2249,7 @@ impl<'a> StoreQueryEngine<'a> {
     ) -> anyhow::Result<CloneReport> {
         if self.store.latest_generation_id()?.is_none() {
             return Ok(CloneReport {
-                groups: unavailable_response(ResolutionAvailability::Unavailable {
+                groups: self.unavailable(ResolutionAvailability::Unavailable {
                     reason: "no persisted generation is available".to_string(),
                 }),
                 signed_symbols: 0,
