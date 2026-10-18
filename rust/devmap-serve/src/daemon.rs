@@ -5189,6 +5189,179 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// A store holding one generation whose analysis carries `status`, with a
+    /// parse-budget-refused file when `budget_refused`. Nothing is queued, so
+    /// freshness is fine and any reason on the wire must come from the analysis.
+    fn store_with_analysis(
+        status: devmap_analyze::model::AnalysisStatus,
+        budget_refused: bool,
+    ) -> (std::path::PathBuf, Store) {
+        // A generation with no repository root reports "source freshness
+        // unverified", which would be the reason in every test below.
+        // A counter beside the clock: parallel tests can read the same
+        // nanosecond, and a shared root makes one test's file another's delta.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "devmap-analysis-status-{}-{stamp}-{n}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("fine.py"), "def fine():\n    return 1\n").unwrap();
+        let ok = devmap_extract::extract_file("fine.py", "def fine():\n    return 1\n");
+        let mut extractions = vec![ok];
+        if budget_refused {
+            fs::write(root.join("slow.py"), "def slow():\n    return 2\n").unwrap();
+            let refused = devmap_extract::extract_file_with_budget(
+                "slow.py",
+                "def slow():\n    return 2\n",
+                Duration::ZERO,
+            );
+            assert!(refused.is_budget_refusal(), "fixture must be a refusal");
+            extractions.push(refused);
+        }
+        let mut resolver = devmap_resolve::Resolver::new();
+        resolver.index_extractions(&extractions);
+        let resolution = resolver.resolve_all(&extractions).unwrap();
+        let mut analysis = devmap_analyze::analyze(&extractions, &resolution);
+        analysis.status = status;
+        let store = Store::open_in_memory().unwrap();
+        store
+            .save_generation_with_opts(
+                &extractions,
+                &resolution,
+                &analysis,
+                devmap_store::GenerationWriteOpts {
+                    repo_root: Some(root.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        (root, store)
+    }
+
+    fn ask_status(store: &Store, unapplied: &crate::protocol::UnappliedEdits) -> serde_json::Value {
+        crate::protocol::dispatch(
+            store,
+            crate::protocol::IpcRequest {
+                version: crate::protocol::PROTOCOL_VERSION,
+                command: crate::protocol::IpcCommand::Status,
+            },
+            &devmap_query::Cancel::new(),
+            unapplied,
+        )
+        .expect("status must answer")
+    }
+
+    /// A partial generation must not read `degraded_reason: null` over IPC (and
+    /// therefore over MCP, which dispatches with no unapplied edits) while
+    /// `devmap status` says the analysis is partial. The clause is the shared
+    /// helper's, so the two surfaces cannot spell it differently.
+    #[test]
+    fn the_ipc_status_frame_carries_a_partial_analysis() {
+        let (root, store) = store_with_analysis(
+            devmap_analyze::model::AnalysisStatus::Partial {
+                reason: "1 file(s) refused by discovery".to_string(),
+            },
+            false,
+        );
+        let unapplied = crate::protocol::UnappliedEdits::default();
+        let frame = ask_status(&store, &unapplied);
+
+        assert_eq!(frame["is_fresh"], serde_json::json!(true), "{frame}");
+        assert_eq!(frame["pending_count"], serde_json::json!(0), "{frame}");
+        let clause = crate::protocol::analysis_degraded_clause(&store)
+            .unwrap()
+            .expect("a partial analysis has a clause");
+        assert_eq!(clause, "partial: 1 file(s) refused by discovery");
+        assert_eq!(
+            frame["degraded_reason"],
+            serde_json::json!(clause),
+            "freshness is fine and nothing is unapplied, so the analysis clause is the whole reason: {frame}"
+        );
+        let status = store.status("daemon").unwrap();
+        assert_eq!(
+            crate::protocol::store_degraded_reason(&store, &status, None).unwrap(),
+            Some(clause),
+            "the CLI's helper and the daemon agree"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_ipc_status_frame_carries_a_timeout_analysis() {
+        let (root, store) = store_with_analysis(
+            devmap_analyze::model::AnalysisStatus::Timeout {
+                reason: "community detection hit its ceiling".to_string(),
+            },
+            false,
+        );
+        let frame = ask_status(&store, &crate::protocol::UnappliedEdits::default());
+        assert_eq!(
+            frame["degraded_reason"],
+            serde_json::json!("timeout: community detection hit its ceiling"),
+            "{frame}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_ipc_status_frame_carries_budget_refusals_after_the_analysis() {
+        let (root, store) = store_with_analysis(
+            devmap_analyze::model::AnalysisStatus::Partial {
+                reason: "1 file(s) failed to parse".to_string(),
+            },
+            true,
+        );
+        let frame = ask_status(&store, &crate::protocol::UnappliedEdits::default());
+        let reason = frame["degraded_reason"]
+            .as_str()
+            .expect("reason")
+            .to_string();
+        let partial = reason
+            .find("partial: 1 file(s) failed to parse")
+            .expect(&reason);
+        let budget = reason
+            .find("budget-degraded: 1 file(s) refused for the parse budget")
+            .expect(&reason);
+        assert!(
+            partial < budget,
+            "CLI order is analysis then budget: {reason}"
+        );
+        assert!(reason.contains("; budget-degraded"), "{reason}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unapplied_edits_and_a_partial_analysis_are_both_reported_in_order() {
+        let (root, store) = store_with_analysis(
+            devmap_analyze::model::AnalysisStatus::Partial {
+                reason: "1 file(s) refused by discovery".to_string(),
+            },
+            false,
+        );
+        let unapplied = crate::protocol::UnappliedEdits::default();
+        note_watch_batch(&["m.py".to_string()], &unapplied, |_| {
+            Err(anyhow::anyhow!("database or disk is full"))
+        });
+        let frame = ask_status(&store, &unapplied);
+        let reason = frame["degraded_reason"].as_str().expect("reason");
+        let partial = reason
+            .find("partial: 1 file(s) refused by discovery")
+            .expect(reason);
+        let dropped = reason.find("Also: ").expect(reason);
+        assert!(
+            partial < dropped,
+            "store clauses first, then unapplied: {reason}"
+        );
+        assert!(reason.contains("could not be recorded"), "{reason}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// K-B3: a stability check that could not run must not answer "stable".
     ///
     /// The guard read `before.modified().ok() == after.modified().ok()`. On a

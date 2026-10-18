@@ -17,7 +17,7 @@ pub use mcp::{serve_stdio, tool_specs, StoreSlot};
 pub use mcp_http::serve_http;
 pub use protocol::{
     coverage_gaps_json, freshness_degraded_reason, handle_stream, index_is_fresh,
-    source_delta_json, IpcCommand, IpcRequest, PROTOCOL_VERSION,
+    source_delta_json, store_degraded_reason, IpcCommand, IpcRequest, PROTOCOL_VERSION,
 };
 pub use root_resolve::{rebuild_required_reason, RootResolveInput};
 pub use watcher::start_file_watcher;

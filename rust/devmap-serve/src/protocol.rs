@@ -1217,7 +1217,69 @@ pub fn daemon_index_is_fresh(status: &StoreStatus, unapplied: &UnappliedEdits) -
     index_is_fresh(status) && unapplied.is_empty()
 }
 
-/// Why a *daemon's* index is not current, when it is not.
+/// The analysis clause of a degraded reason: the latest generation's own
+/// `Partial`/`Timeout` status, spelled `partial: ...` / `timeout: ...`.
+///
+/// `freshness_degraded_reason` describes the *index* and says nothing about a
+/// generation built from a corpus the extractor could not read in full. The CLI
+/// and the daemon both answer from here so a partial corpus cannot read
+/// `degraded_reason: null` on one surface and a sentence on the other.
+pub fn analysis_degraded_clause(store: &Store) -> anyhow::Result<Option<String>> {
+    Ok(match store.latest_analysis_status()? {
+        Some(devmap_analyze::model::AnalysisStatus::Ok) | None => None,
+        Some(devmap_analyze::model::AnalysisStatus::Partial { reason }) => {
+            Some(format!("partial: {reason}"))
+        }
+        Some(devmap_analyze::model::AnalysisStatus::Timeout { reason }) => {
+            Some(format!("timeout: {reason}"))
+        }
+    })
+}
+
+/// The clause for files still refused for the wall-clock parse budget after the
+/// build's serial retry. The cause is the machine's load and the cure is
+/// building again, which is the distinction an operator needs; it is its own
+/// clause rather than a new value of any existing field.
+pub fn budget_degraded_clause(sample: Option<&devmap_store::CoverageGapSample>) -> Option<String> {
+    sample.filter(|sample| sample.total > 0).map(|sample| {
+        format!(
+            "budget-degraded: {} file(s) refused for the parse budget after the serial \
+             retry (load-dependent, not a grammar fault; rebuild when the machine is idle)",
+            sample.total
+        )
+    })
+}
+
+/// Every reason the *store* is degraded, joined in one fixed order: freshness,
+/// then the analysis status, then the parse-budget refusals. The one owner of
+/// that join for `devmap status`, `devmap build`'s status and the daemon.
+/// `budget_refused` is passed in because callers also render the listing.
+pub fn store_degraded_reason(
+    store: &Store,
+    status: &StoreStatus,
+    budget_refused: Option<&devmap_store::CoverageGapSample>,
+) -> anyhow::Result<Option<String>> {
+    Ok(devmap_analyze::combine_reasons(
+        devmap_analyze::combine_reasons(
+            freshness_degraded_reason(status),
+            analysis_degraded_clause(store)?,
+        ),
+        budget_degraded_clause(budget_refused),
+    ))
+}
+
+/// Appends the daemon's unapplied-edits fact to a store-level reason.
+fn with_unapplied(store_reason: Option<String>, unapplied: &UnappliedEdits) -> Option<String> {
+    match (store_reason, unapplied.describe()) {
+        (Some(store), Some(dropped)) => Some(format!("{store} Also: {dropped}")),
+        (Some(store), None) => Some(store),
+        (None, Some(dropped)) => Some(dropped),
+        (None, None) => None,
+    }
+}
+
+/// Why a *daemon's* index is not current, by freshness and unapplied edits
+/// alone; [`daemon_status_reason`] adds the analysis clauses.
 ///
 /// Both reasons, when there are both. A store that is degraded for its own
 /// reasons and a daemon that dropped edits are independent facts, and reporting
@@ -1225,12 +1287,21 @@ pub fn daemon_index_is_fresh(status: &StoreStatus, unapplied: &UnappliedEdits) -
 /// see: `devmap status` opening the store directly cannot know about dropped
 /// edits, so if this does not say it, nothing does.
 pub fn daemon_degraded_reason(status: &StoreStatus, unapplied: &UnappliedEdits) -> Option<String> {
-    match (freshness_degraded_reason(status), unapplied.describe()) {
-        (Some(store), Some(dropped)) => Some(format!("{store} Also: {dropped}")),
-        (Some(store), None) => Some(store),
-        (None, Some(dropped)) => Some(dropped),
-        (None, None) => None,
-    }
+    with_unapplied(freshness_degraded_reason(status), unapplied)
+}
+
+/// The daemon's full `degraded_reason`: the store-level join the CLI emits,
+/// then the unapplied edits only this process knows about.
+pub fn daemon_status_reason(
+    store: &Store,
+    status: &StoreStatus,
+    unapplied: &UnappliedEdits,
+) -> anyhow::Result<Option<String>> {
+    let budget_refused = store.latest_budget_refusals()?;
+    Ok(with_unapplied(
+        store_degraded_reason(store, status, budget_refused.as_ref())?,
+        unapplied,
+    ))
 }
 
 /// The bound a `blast` or `suspects` runs under: dc-regress's default
@@ -1271,10 +1342,11 @@ pub(crate) fn dispatch(
                 "is_fresh": daemon_index_is_fresh(&status, unapplied),
                 "source_freshness": status.source_freshness,
                 "analyzer_freshness": status.analyzer_freshness,
-                "degraded_reason": daemon_degraded_reason(&status, unapplied),
+                "degraded_reason": daemon_status_reason(store, &status, unapplied)?,
                 "delta": status.source_delta.as_ref().map(source_delta_json),
                 "quarantined_count": status.quarantined_count,
-                // The paths behind the three numbers `degraded_reason` states.
+                // The paths behind the numbers `degraded_reason` states
+                // (freshness, discovery refusals and the analysis status).
                 // Without them "1 refused by discovery" is a fact an operator
                 // cannot act on or check.
                 "coverage_gaps": coverage_gaps_json(&status),
