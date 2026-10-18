@@ -110,6 +110,8 @@ mod powershell_stays_pattern_recovered;
 #[cfg(feature = "parse")]
 mod python_attack3_fixes;
 #[cfg(feature = "parse")]
+mod python_extract_attack4;
+#[cfg(feature = "parse")]
 mod python_heritage_attack3;
 #[cfg(feature = "parse")]
 mod python_path_loads;
