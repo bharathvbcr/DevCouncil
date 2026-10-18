@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use devmap_query::{Request, StoreQueryEngine, MAX_TOKEN_BUDGET, MAX_TRAVERSAL_DEPTH};
+use devmap_query::{
+    bounded_reason, Request, StoreQueryEngine, MAX_TOKEN_BUDGET, MAX_TRAVERSAL_DEPTH,
+};
 use devmap_store::{Store, StoreStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1220,37 +1222,6 @@ pub fn freshness_degraded_reason(status: &StoreStatus) -> Option<String> {
 /// refused.
 pub fn daemon_index_is_fresh(status: &StoreStatus, unapplied: &UnappliedEdits) -> bool {
     index_is_fresh(status) && unapplied.is_empty()
-}
-
-/// The most one component of a degraded reason may carry, in bytes of the
-/// escaped text. A reason is a sentence for an operator, not a transport: the
-/// components are free text from the store, the analysis and the OS.
-pub const MAX_REASON_COMPONENT_BYTES: usize = 4096;
-
-/// A component reason made safe to put in a status sentence: control
-/// characters (newline, ESC, NUL, ...) are rendered as their visible escapes
-/// (`\n`, `\u{1b}`), and the result is cut at [`MAX_REASON_COMPONENT_BYTES`]
-/// on a character boundary with a `…[N bytes]` marker naming how much was cut,
-/// so a capped reason is never mistaken for a whole one.
-pub fn bounded_reason(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len().min(MAX_REASON_COMPONENT_BYTES + 8));
-    for ch in text.chars() {
-        if ch.is_control() {
-            escaped.extend(ch.escape_default());
-        } else {
-            escaped.push(ch);
-        }
-    }
-    if escaped.len() <= MAX_REASON_COMPONENT_BYTES {
-        return escaped;
-    }
-    let mut cut = MAX_REASON_COMPONENT_BYTES;
-    while !escaped.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    let omitted = escaped.len() - cut;
-    escaped.truncate(cut);
-    format!("{escaped}…[{omitted} bytes]")
 }
 
 /// `kind` alone when `reason` is empty, else `kind: reason`.

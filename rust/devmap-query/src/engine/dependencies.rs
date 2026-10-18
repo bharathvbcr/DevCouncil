@@ -12,6 +12,7 @@ use std::collections::BTreeSet;
 use devmap_extract::model::EdgeKind;
 use devmap_resolve::model::ResolvedEdge;
 
+use crate::bounded::bounded_text;
 use crate::rung::Rung;
 
 /// `Contains` and `MemberOf` are a symbol's own declaration inside its file or
@@ -96,34 +97,46 @@ pub(super) struct DependencyFacts<'a> {
     pub(super) shadowed_symbols: usize,
 }
 
+/// The most of the caller's query a note repeats, in escaped bytes.
+const NOTE_QUERY_BYTES: usize = 256;
+/// The most a whole note may carry. The fixed sentences and two bounded queries
+/// fit well inside it; it is the backstop, not the working limit.
+const NOTE_BYTES: usize = 1024;
+
 /// The informational note: `Response::note`, never `walk_incomplete`.
 ///
-/// Emptiness is judged *before* the rung cut. An answer emptied by `min_rung`
-/// is not a target that depends on nothing, and says how many edges the rung
-/// hid. The inbound pointer appears only when nothing leaves the target at all.
+/// The query is the caller's own text, so it is escaped and capped by
+/// [`bounded_text`](crate::bounded::bounded_text) before it is repeated, and the
+/// assembled note is bounded again.
+///
+/// Emptiness is judged *before* the rung cut. Edges a `min_rung` floor hid are
+/// counted and said, whether it hid some or all of them, so an answer emptied by
+/// the floor is never "depends on nothing". The inbound pointer appears only
+/// when nothing leaves the target at all.
 pub(super) fn dependency_note(facts: &DependencyFacts<'_>) -> Option<String> {
+    let query = bounded_text(facts.query, NOTE_QUERY_BYTES);
     let mut parts: Vec<String> = Vec::new();
-    if facts.outbound_after_rung == 0 {
-        if facts.outbound_before_rung > 0 {
-            let rung = facts.min_rung.map_or("the requested rung", Rung::label);
-            parts.push(format!(
-                "{} outbound edge(s) of {} hidden by min_rung={rung}",
-                facts.outbound_before_rung, facts.query
-            ));
-        } else if facts.inbound > 0 {
-            parts.push(format!(
-                "{} depends on nothing in the index, but {} inbound edge(s) point at it; \
-                 `dependencies` lists outbound edges only — ask `impact` for what reaches it",
-                facts.query, facts.inbound
-            ));
-        }
+    let rung_hidden = facts
+        .outbound_before_rung
+        .saturating_sub(facts.outbound_after_rung);
+    if rung_hidden > 0 {
+        let rung = facts.min_rung.map_or("the requested rung", Rung::label);
+        parts.push(format!(
+            "{rung_hidden} outbound edge(s) of {query} hidden by min_rung={rung}"
+        ));
+    } else if facts.outbound_after_rung == 0 && facts.inbound > 0 {
+        parts.push(format!(
+            "{query} depends on nothing in the index, but {} inbound edge(s) point at it; \
+             `dependencies` lists outbound edges only — ask `impact` for what reaches it",
+            facts.inbound
+        ));
     }
     if facts.shadowed_symbols > 0 {
         parts.push(format!(
-            "{} is an indexed file and also spells {} symbol(s); the file was answered — \
+            "{query} is an indexed file and also spells {} symbol(s); the file was answered — \
              use `file::symbol` to ask about a symbol",
-            facts.query, facts.shadowed_symbols
+            facts.shadowed_symbols
         ));
     }
-    (!parts.is_empty()).then(|| parts.join("; "))
+    (!parts.is_empty()).then(|| bounded_text(&parts.join("; "), NOTE_BYTES))
 }
