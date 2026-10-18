@@ -237,16 +237,16 @@ fn a_verdict_for_another_generation_is_never_attached_as_verified() {
     let reader = Store::open(&db).unwrap();
     reader.status("t").unwrap();
     let writer = Store::open(&db).unwrap();
-    let moved = std::cell::Cell::new(false);
+    let moved = AtomicBool::new(false);
     let engine = StoreQueryEngine::new(&reader).with_interleave_hook(|| {
         for generation in 2..=3 {
             land_generation(&fx.root, &writer, generation);
         }
         reader.status("t").unwrap();
-        moved.set(true);
+        moved.store(true, Ordering::Relaxed);
     });
     let answer = engine.impact(req("d", 1)).unwrap();
-    assert!(moved.get(), "the interleave hook never ran");
+    assert!(moved.load(Ordering::Relaxed), "the interleave hook never ran");
     assert_eq!(
         reader.latest_generation_id().unwrap(),
         Some(3),
@@ -268,13 +268,13 @@ fn a_verdict_for_the_generation_read_stays_verified() {
     let fx = fixture("attack2-same", Some(&db));
     let reader = Store::open(&db).unwrap();
     reader.status("t").unwrap();
-    let hooked = std::cell::Cell::new(false);
+    let hooked = AtomicBool::new(false);
     let engine = StoreQueryEngine::new(&reader).with_interleave_hook(|| {
         reader.status("t").unwrap();
-        hooked.set(true);
+        hooked.store(true, Ordering::Relaxed);
     });
     let answer = engine.impact(req("d", 1)).unwrap();
-    assert!(hooked.get());
+    assert!(hooked.load(Ordering::Relaxed));
     let _ = &fx;
     let verdict = &answer.source_freshness;
     assert!(verdict.fresh.is_some(), "matching generations lost their verdict: {verdict:?}");

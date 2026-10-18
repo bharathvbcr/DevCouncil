@@ -134,7 +134,7 @@ pub struct StoreQueryEngine<'a> {
     /// Runs inside [`Self::exit`] after the answer is built and before the
     /// verdict is read: the window a daemon commit or status refresh can land
     /// in. Tests use it to force that interleaving deterministically.
-    interleave: Option<Box<dyn Fn() + 'a>>,
+    interleave: Option<Box<dyn Fn() + Send + Sync + 'a>>,
 }
 
 impl<'a> StoreQueryEngine<'a> {
@@ -150,7 +150,7 @@ impl<'a> StoreQueryEngine<'a> {
     /// Exists so a test can land a generation or refresh the verdict cache in
     /// exactly that window; production callers never set it.
     #[doc(hidden)]
-    pub fn with_interleave_hook(mut self, hook: impl Fn() + 'a) -> Self {
+    pub fn with_interleave_hook(mut self, hook: impl Fn() + Send + Sync + 'a) -> Self {
         self.interleave = Some(Box::new(hook));
         self
     }
