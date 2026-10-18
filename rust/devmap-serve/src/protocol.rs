@@ -209,13 +209,18 @@ impl UnappliedEdits {
         let slot = crate::lock_recover(&self.0);
         let record = slot.as_ref()?;
         if record.batches == 0 {
-            return Some(record.reason.clone());
+            return Some(bounded_reason(&record.reason));
         }
+        // An empty cause keeps the count and drops the `: <cause>` fragment.
+        let cause = match record.reason.is_empty() {
+            true => String::new(),
+            false => format!(": {}", bounded_reason(&record.reason)),
+        };
         Some(format!(
             "{} changed path(s) in {} batch(es) could not be recorded as pending work and are \
-NOT in this generation: {}. This index is behind the tree by an amount only a rebuild can \
+NOT in this generation{cause}. This index is behind the tree by an amount only a rebuild can \
 establish — run `devmap build`, or restart the daemon once the store accepts writes again.",
-            record.paths, record.batches, record.reason
+            record.paths, record.batches
         ))
     }
 }
@@ -1217,7 +1222,109 @@ pub fn daemon_index_is_fresh(status: &StoreStatus, unapplied: &UnappliedEdits) -
     index_is_fresh(status) && unapplied.is_empty()
 }
 
-/// Why a *daemon's* index is not current, when it is not.
+/// The most one component of a degraded reason may carry, in bytes of the
+/// escaped text. A reason is a sentence for an operator, not a transport: the
+/// components are free text from the store, the analysis and the OS.
+pub const MAX_REASON_COMPONENT_BYTES: usize = 4096;
+
+/// A component reason made safe to put in a status sentence: control
+/// characters (newline, ESC, NUL, ...) are rendered as their visible escapes
+/// (`\n`, `\u{1b}`), and the result is cut at [`MAX_REASON_COMPONENT_BYTES`]
+/// on a character boundary with a `…[N bytes]` marker naming how much was cut,
+/// so a capped reason is never mistaken for a whole one.
+pub fn bounded_reason(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len().min(MAX_REASON_COMPONENT_BYTES + 8));
+    for ch in text.chars() {
+        if ch.is_control() {
+            escaped.extend(ch.escape_default());
+        } else {
+            escaped.push(ch);
+        }
+    }
+    if escaped.len() <= MAX_REASON_COMPONENT_BYTES {
+        return escaped;
+    }
+    let mut cut = MAX_REASON_COMPONENT_BYTES;
+    while !escaped.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let omitted = escaped.len() - cut;
+    escaped.truncate(cut);
+    format!("{escaped}…[{omitted} bytes]")
+}
+
+/// `kind` alone when `reason` is empty, else `kind: reason`.
+fn kind_clause(kind: &str, reason: &str) -> String {
+    if reason.is_empty() {
+        kind.to_owned()
+    } else {
+        format!("{kind}: {}", bounded_reason(reason))
+    }
+}
+
+/// The analysis clause of a degraded reason: the latest generation's own
+/// `Partial`/`Timeout` status, spelled `partial: ...` / `timeout: ...`.
+///
+/// `freshness_degraded_reason` describes the *index* and says nothing about a
+/// generation built from a corpus the extractor could not read in full. The CLI
+/// and the daemon both answer from here so a partial corpus cannot read
+/// `degraded_reason: null` on one surface and a sentence on the other.
+pub fn analysis_degraded_clause(store: &Store) -> anyhow::Result<Option<String>> {
+    Ok(match store.latest_analysis_status()? {
+        Some(devmap_analyze::model::AnalysisStatus::Ok) | None => None,
+        Some(devmap_analyze::model::AnalysisStatus::Partial { reason }) => {
+            Some(kind_clause("partial", &reason))
+        }
+        Some(devmap_analyze::model::AnalysisStatus::Timeout { reason }) => {
+            Some(kind_clause("timeout", &reason))
+        }
+    })
+}
+
+/// The clause for files still refused for the wall-clock parse budget after the
+/// build's serial retry. The cause is the machine's load and the cure is
+/// building again, which is the distinction an operator needs; it is its own
+/// clause rather than a new value of any existing field.
+pub fn budget_degraded_clause(sample: Option<&devmap_store::CoverageGapSample>) -> Option<String> {
+    sample.filter(|sample| sample.total > 0).map(|sample| {
+        format!(
+            "budget-degraded: {} file(s) refused for the parse budget after the serial \
+             retry (load-dependent, not a grammar fault; rebuild when the machine is idle)",
+            sample.total
+        )
+    })
+}
+
+/// Every reason the *store* is degraded, joined in one fixed order: freshness,
+/// then the analysis status, then the parse-budget refusals. The one owner of
+/// that join for `devmap status`, `devmap build`'s status and the daemon.
+/// `budget_refused` is passed in because callers also render the listing.
+pub fn store_degraded_reason(
+    store: &Store,
+    status: &StoreStatus,
+    budget_refused: Option<&devmap_store::CoverageGapSample>,
+) -> anyhow::Result<Option<String>> {
+    Ok(devmap_analyze::combine_reasons(
+        devmap_analyze::combine_reasons(
+            freshness_degraded_reason(status).map(|reason| bounded_reason(&reason)),
+            analysis_degraded_clause(store)?,
+        ),
+        budget_degraded_clause(budget_refused),
+    ))
+}
+
+/// Appends the daemon's unapplied-edits fact to a store-level reason.
+fn with_unapplied(store_reason: Option<String>, unapplied: &UnappliedEdits) -> Option<String> {
+    match (store_reason, unapplied.describe()) {
+        (Some(store), Some(dropped)) => Some(format!("{store} Also: {dropped}")),
+        (Some(store), None) => Some(store),
+        (None, Some(dropped)) => Some(dropped),
+        (None, None) => None,
+    }
+}
+
+/// Why a *daemon's* index is not current, by freshness and unapplied edits
+/// alone; [`daemon_status_reason`] adds the analysis clauses.
 ///
 /// Both reasons, when there are both. A store that is degraded for its own
 /// reasons and a daemon that dropped edits are independent facts, and reporting
@@ -1225,12 +1332,21 @@ pub fn daemon_index_is_fresh(status: &StoreStatus, unapplied: &UnappliedEdits) -
 /// see: `devmap status` opening the store directly cannot know about dropped
 /// edits, so if this does not say it, nothing does.
 pub fn daemon_degraded_reason(status: &StoreStatus, unapplied: &UnappliedEdits) -> Option<String> {
-    match (freshness_degraded_reason(status), unapplied.describe()) {
-        (Some(store), Some(dropped)) => Some(format!("{store} Also: {dropped}")),
-        (Some(store), None) => Some(store),
-        (None, Some(dropped)) => Some(dropped),
-        (None, None) => None,
-    }
+    with_unapplied(freshness_degraded_reason(status), unapplied)
+}
+
+/// The daemon's full `degraded_reason`: the store-level join the CLI emits,
+/// then the unapplied edits only this process knows about.
+pub fn daemon_status_reason(
+    store: &Store,
+    status: &StoreStatus,
+    unapplied: &UnappliedEdits,
+) -> anyhow::Result<Option<String>> {
+    let budget_refused = store.latest_budget_refusals()?;
+    Ok(with_unapplied(
+        store_degraded_reason(store, status, budget_refused.as_ref())?,
+        unapplied,
+    ))
 }
 
 /// The bound a `blast` or `suspects` runs under: dc-regress's default
@@ -1271,10 +1387,11 @@ pub(crate) fn dispatch(
                 "is_fresh": daemon_index_is_fresh(&status, unapplied),
                 "source_freshness": status.source_freshness,
                 "analyzer_freshness": status.analyzer_freshness,
-                "degraded_reason": daemon_degraded_reason(&status, unapplied),
+                "degraded_reason": daemon_status_reason(store, &status, unapplied)?,
                 "delta": status.source_delta.as_ref().map(source_delta_json),
                 "quarantined_count": status.quarantined_count,
-                // The paths behind the three numbers `degraded_reason` states.
+                // The paths behind the numbers `degraded_reason` states
+                // (freshness, discovery refusals and the analysis status).
                 // Without them "1 refused by discovery" is a fact an operator
                 // cannot act on or check.
                 "coverage_gaps": coverage_gaps_json(&status),
