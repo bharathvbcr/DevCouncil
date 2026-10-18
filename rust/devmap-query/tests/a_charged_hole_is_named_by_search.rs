@@ -236,12 +236,12 @@ fn a_longer_identifier_that_contains_the_name_is_not_a_match() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Unicode names, matched the way search matches them (case-insensitively).
+/// Unicode names, matched exactly (Rust is case-sensitive).
 #[test]
 fn a_unicode_name_in_a_charged_range_is_found() {
     let source = "pub const KEPT: u32 = 1;\npub const ÜBERMASS: u32 = 2;\n";
     let (store, root) = corpus("unicode", source, &["pub const ÜBERMASS: u32 = 2;"]);
-    let reason = reason(&ask(&store, "übermass", &["consts.rs"]));
+    let reason = reason(&ask(&store, "ÜBERMASS", &["consts.rs"]));
     assert!(reason.contains("consts.rs lines 2-2"), "{reason}");
     let _ = std::fs::remove_dir_all(&root);
 }

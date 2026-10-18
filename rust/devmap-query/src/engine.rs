@@ -266,10 +266,10 @@ impl<'a> StoreQueryEngine<'a> {
             devmap_analyze::combine_reasons(coverage_gap, empty_result_gap(total, &req.query)),
         );
         if total == 0 {
-            if let Some(reason) = self.outside_index_reason(
-                filter.map_or(&[][..], |filter| filter.paths()),
-                &req.query,
-            )? {
+            let outside = self.outside_index_reason(filter, &req.query)?;
+            response.walk_incomplete =
+                devmap_analyze::combine_reasons(response.walk_incomplete.take(), outside.note);
+            if let Some(reason) = outside.reason {
                 response.resolution = ResolutionAvailability::Unavailable { reason };
             }
         }
@@ -1708,20 +1708,23 @@ impl<'a> StoreQueryEngine<'a> {
             .map(|narrowing| scope_report_from_narrowing(narrowing, snapshot.analysis.as_ref()));
         // No definition, over a generation with holes in it: the name may be
         // declared where nothing was indexed. See `outside_index_reason`.
+        let mut unchecked_note = None;
         if total == 0 {
-            if let Some(reason) = self.outside_index_reason(
-                filter.map_or(&[][..], |filter| filter.paths()),
-                query,
-            )? {
+            let outside = self.outside_index_reason(filter, query)?;
+            if let Some(reason) = outside.reason {
                 return Ok(ExploreReport {
                     scope,
                     ..empty(reason)
                 });
             }
+            unchecked_note = outside.note;
         }
         let coverage_gap = devmap_analyze::combine_reasons(
-            search_coverage_gap(analysis_status_gap(snapshot.analysis.as_ref())),
-            ranking_coverage_gap(total, pool),
+            devmap_analyze::combine_reasons(
+                search_coverage_gap(analysis_status_gap(snapshot.analysis.as_ref())),
+                ranking_coverage_gap(total, pool),
+            ),
+            unchecked_note,
         );
         let rows = snapshot.rows;
         let repo_root = snapshot.repo_root;

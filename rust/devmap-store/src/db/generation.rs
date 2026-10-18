@@ -1262,40 +1262,73 @@ generation {latest}; run `devmap status` to re-verify",
         Ok(inventory)
     }
 
-    /// Every partial-parse row of the latest generation, by path, uncapped.
+    /// The partial-parse rows of the latest generation whose reason contains
+    /// `containing`, by path: at most `limit` of them, and the true count.
     ///
-    /// The same rows `status` lists under `coverage_gaps.partial_parse`, read
-    /// whole: `status` shows [`crate::COVERAGE_GAP_SAMPLE`] of them beside the
-    /// total, which is right for an inventory and wrong for a name lookup, where
-    /// the file holding the hole may be the fifty-first. Each reason is one
-    /// short sentence, so reading all of them is bounded by the file count.
-    pub fn latest_partial_parse_gaps(&self) -> Result<Vec<CoverageGapRow>> {
+    /// The same rows `status` lists under `coverage_gaps.partial_parse`, but
+    /// not sampled at fifty by path: a name lookup has to say how many it did
+    /// not look at, and the file holding the hole may be the fifty-first.
+    /// `admit` narrows to a caller's scope; `None` admits every row and is
+    /// counted in SQL, so an unscoped lookup pays for `limit` rows and one
+    /// `COUNT`, not for a walk over the whole inventory. Each row carries the
+    /// language and the content hash the generation recorded for the file, so a
+    /// reader can tell a file edited since the build from the one that was
+    /// parsed.
+    pub fn latest_partial_parse_gaps(
+        &self,
+        containing: &str,
+        admit: Option<&dyn Fn(&str) -> bool>,
+        limit: usize,
+    ) -> Result<(Vec<crate::PartialParseGap>, usize)> {
         let conn = lock_conn(&self.conn)?;
         let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         };
-        let mut stmt = snapshot.prepare(
-            "SELECT path, reason FROM generation_coverage_gaps
-             WHERE generation_id = ?1 AND gap = ?2
-             ORDER BY path ASC",
-        )?;
-        let rows = stmt
-            .query_map(
-                params![
-                    generation,
-                    devmap_analyze::ExtractionGap::PartialParse.label()
-                ],
-                |row| {
-                    Ok(CoverageGapRow {
-                        path: row.get(0)?,
-                        reason: row.get(1)?,
-                    })
-                },
-            )?
-            .collect::<Result<Vec<_>>>()?;
+        let label = devmap_analyze::ExtractionGap::PartialParse.label();
+        let filter = "g.generation_id = ?1 AND g.gap = ?2 AND instr(g.reason, ?3) > 0";
+        let total_unscoped: Option<usize> = match admit {
+            None => Some(snapshot.query_row(
+                &format!("SELECT COUNT(*) FROM generation_coverage_gaps g WHERE {filter}"),
+                params![generation, label, containing],
+                |row| row.get::<_, i64>(0).map(|count| count as usize),
+            )?),
+            Some(_) => None,
+        };
+        let mut stmt = snapshot.prepare(&format!(
+            "SELECT g.path, g.reason, f.language, f.content_hash
+             FROM generation_coverage_gaps g
+             JOIN paths p ON p.path = g.path
+             JOIN generation_files f ON f.file_id = p.id AND f.generation_id = g.generation_id
+             WHERE {filter}
+             ORDER BY g.path ASC"
+        ))?;
+        let mut rows = stmt.query(params![generation, label, containing])?;
+        let mut kept = Vec::new();
+        let mut seen = 0usize;
+        while let Some(row) = rows.next()? {
+            let admitted = match admit {
+                Some(admit) => admit(row.get_ref(0)?.as_str()?),
+                None => true,
+            };
+            if !admitted {
+                continue;
+            }
+            seen += 1;
+            if kept.len() < limit {
+                kept.push(crate::PartialParseGap {
+                    path: row.get(0)?,
+                    reason: row.get(1)?,
+                    language: row.get(2)?,
+                    content_hash: row.get::<_, i64>(3)? as u64,
+                });
+            } else if total_unscoped.is_some() {
+                break;
+            }
+        }
+        drop(rows);
         drop(stmt);
         drop(snapshot);
-        Ok(rows)
+        Ok((kept, total_unscoped.unwrap_or(seen)))
     }
 
     /// Whether the latest generation's edges carry the resolution the resolver
