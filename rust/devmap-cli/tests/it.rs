@@ -43,6 +43,7 @@ mod crash_consistency;
 mod daemon_storm_soak;
 mod dead_tier_eligibility;
 mod dependencies_attack;
+mod dependencies_close_attack;
 mod discovery_refusal_is_coverage_loss;
 mod doctor_gaps;
 mod doctor_reports_edge_confidence;

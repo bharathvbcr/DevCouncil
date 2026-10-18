@@ -57,6 +57,8 @@ mod dead_clusters_reach_a_query;
 mod dependencies_are_outbound;
 #[cfg(feature = "parse")]
 mod dependencies_attack;
+#[cfg(feature = "parse")]
+mod dependencies_close_attack;
 mod documentation_visibility;
 #[cfg(feature = "parse")]
 mod dynamic_references_clear_unwired;
