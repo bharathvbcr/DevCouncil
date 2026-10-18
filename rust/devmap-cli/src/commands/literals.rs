@@ -6,6 +6,9 @@ use crate::output::{emit_json, emit_truncation, open_for_read};
 #[derive(clap::Args)]
 #[group(id = "Literals")]
 pub(crate) struct Args {
+    /// Text the value contains. May start with `-`: a CSS custom property
+    /// such as `--sky-time` is a query, while a known flag stays a flag.
+    #[arg(allow_hyphen_values = true)]
     pub(crate) query: String,
     /// Require the value to equal the query.
     #[arg(long)]
@@ -31,7 +34,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
 }
 
 fn emit_literals(report: &devmap_query::LiteralReport) {
-    let mode = if report.exact { "exact" } else { "prefix" };
+    let mode = if report.exact { "exact" } else { "substring" };
     outln!("literals {mode} {:?}", report.query);
     for site in &report.items {
         let symbol = if site.qualified_name.is_empty() {

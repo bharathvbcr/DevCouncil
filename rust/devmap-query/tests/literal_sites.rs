@@ -8,7 +8,7 @@ use devmap_extract::extract_file;
 use devmap_query::StoreQueryEngine;
 use devmap_resolve::Resolver;
 use devmap_store::{GenerationWriteOpts, Store};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const SOURCE: &str = r#"
 struct ToolCall {
@@ -32,18 +32,19 @@ fn spawn_session_inner() {
 }
 "#;
 
-fn scratch() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("devmap-literals-{}", std::process::id()));
+/// One directory per test: the tests share a process, so a dir keyed on the
+/// pid alone would be wiped by whichever test started second.
+fn scratch(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("devmap-literals-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir.canonicalize().unwrap()
 }
 
-#[test]
-fn a_prefix_reaches_a_const_use_and_a_direct_write() {
-    let root = scratch();
-    std::fs::write(root.join("actions.rs"), SOURCE).unwrap();
-    let extraction = extract_file("actions.rs", SOURCE);
+/// A store holding one extracted file, written as a build would write it.
+fn store_of(root: &Path, file: &str, source: &str) -> Store {
+    std::fs::write(root.join(file), source).unwrap();
+    let extraction = extract_file(file, source);
     let mut resolver = Resolver::new();
     resolver.index_extractions(std::slice::from_ref(&extraction));
     let resolution = resolver
@@ -62,6 +63,13 @@ fn a_prefix_reaches_a_const_use_and_a_direct_write() {
             },
         )
         .unwrap();
+    store
+}
+
+#[test]
+fn a_substring_reaches_a_const_use_and_a_direct_write() {
+    let root = scratch("const-use");
+    let store = store_of(&root, "actions.rs", SOURCE);
     let engine = StoreQueryEngine::new(&store);
     let report = engine.literals("session.", false, 8_000).unwrap();
     assert_eq!(report.shown + report.hidden, report.total);
@@ -101,4 +109,66 @@ fn a_prefix_reaches_a_const_use_and_a_direct_write() {
     assert_eq!(starved.total, report.total);
     assert_eq!(starved.shown + starved.hidden, starved.total);
     assert!(starved.hidden > 0, "budget 1 withholds sites: {starved:?}");
+}
+
+/// The two lines from the report: a dataset write whose key is an identifier,
+/// and a CSS custom property passed as a string.
+const AMBIENCE: &str = "function seed(pal) {
+  document.documentElement.dataset.timeOfDay = pal.mode;
+  document.documentElement.style.setProperty('--sky-time', pal.mode);
+}
+";
+
+#[test]
+fn a_query_matches_anywhere_inside_the_value_not_only_at_its_start() {
+    let root = scratch("substring");
+    let store = store_of(&root, "ambience.js", AMBIENCE);
+    let engine = StoreQueryEngine::new(&store);
+
+    // The fixture extracts: the whole value finds the call's argument.
+    let whole = engine.literals("--sky-time", true, 8_000).unwrap();
+    assert_eq!(whole.total, 1, "{whole:?}");
+    assert_eq!(whole.items[0].line, 3, "{whole:?}");
+
+    // `sky-time` is inside `--sky-time`, not at its start.
+    let inner = engine.literals("sky-time", false, 8_000).unwrap();
+    assert!(!inner.exact);
+    assert_eq!(inner.total, 1, "{inner:?}");
+    assert_eq!(inner.shown + inner.hidden, inner.total);
+    let site = &inner.items[0];
+    assert_eq!(site.file_path, "ambience.js");
+    assert_eq!(site.line, 3, "the setProperty line: {inner:?}");
+    assert_eq!(site.value, "--sky-time");
+    assert!(site.qualified_name.contains("seed"), "{inner:?}");
+
+    // Mid-string, the tail, and the head all reach the one site.
+    for query in ["ky-ti", "time", "--sky"] {
+        let report = engine.literals(query, false, 8_000).unwrap();
+        assert_eq!(report.total, 1, "{query:?}: {report:?}");
+        assert_eq!(report.items[0].value, "--sky-time", "{query:?}");
+    }
+
+    // The dataset key is a property name, not a string: line 2 has no literal.
+    for query in ["timeOfDay", "dataset", "mode"] {
+        let report = engine.literals(query, false, 8_000).unwrap();
+        assert_eq!(report.total, 0, "{query:?} is no literal: {report:?}");
+    }
+
+    // The comparison stays binary.
+    let upper = engine.literals("SKY-TIME", false, 8_000).unwrap();
+    assert_eq!(upper.total, 0, "case-sensitive: {upper:?}");
+
+    // Exact still needs the whole value.
+    let partial = engine.literals("sky-time", true, 8_000).unwrap();
+    assert!(partial.exact);
+    assert_eq!(partial.total, 0, "exact is equality: {partial:?}");
+
+    // `%` and `_` are text, not LIKE wildcards.
+    for query in ["%", "_", "sky%time", "sky_time"] {
+        let report = engine.literals(query, false, 8_000).unwrap();
+        assert_eq!(
+            report.total, 0,
+            "{query:?} is matched literally: {report:?}"
+        );
+    }
 }

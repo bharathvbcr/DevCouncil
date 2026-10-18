@@ -341,8 +341,10 @@ pub(crate) enum Commands {
     Explore(commands::explore::Args),
     /// Where a string constant is written.
     ///
-    /// Matches the literal text, not a symbol name. A prefix is the default
-    /// (`session.` matches `session.spawn`); `--exact` requires equality.
+    /// Matches the literal text, not a symbol name. By default the value
+    /// contains the query anywhere (`sky-time` matches `--sky-time`,
+    /// `session.` matches `session.spawn`); `--exact` requires equality. The
+    /// comparison is case-sensitive.
     /// Each site names the file, line and enclosing symbol. A Rust
     /// module-level const's value is also reported at each use of that const.
     Literals(commands::literals::Args),

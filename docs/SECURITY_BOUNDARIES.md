@@ -292,8 +292,10 @@ redacted afterwards.
   a store written before this is cleaned on its next build. `literals`,
   `search`, `ask` (with `--evidence`), `explore` and `skeleton` mark such
   items `withheld: secret_path` and return no source for them. A store that
-  has not been rebuilt still matches a `literals` prefix against its stored
-  values, so the match count can be probed until the next build.
+  has not been rebuilt still matches a `literals` query against its stored
+  values. The query matches anywhere in a value, not only at its start, so
+  until the next build the match count can be probed with any piece of a
+  stale value.
 
 ## Verification
 

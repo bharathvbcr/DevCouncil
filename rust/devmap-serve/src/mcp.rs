@@ -1513,7 +1513,8 @@ matches it with parameters normalised (`/users/:id` matches `/users/42`)."},
         ),
         "literals" => (
             "Where a string constant is written. Matches the literal text, not a symbol name. \
-Prefix by default, so session. matches session.spawn; pass exact for equality. Comparison is \
+By default the value contains the query anywhere, so sky-time matches --sky-time and session. \
+matches session.spawn; pass exact for equality. Comparison is \
 case-sensitive. Each site is the file, the 1-based line, the value, and the enclosing \
 qualified symbol. A Rust module-level const's value is also reported at each use of that \
 const. Budgeted: read shown, hidden and total. walk_incomplete means the page cap cut the \
@@ -1522,9 +1523,9 @@ read before the budget did.",
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "minLength": 1, "maxLength": 4096,
-                        "description": "The literal text. A prefix unless exact is true."},
+                        "description": "The literal text. Matched anywhere in a value unless exact is true."},
                     "exact": {"type": "boolean", "default": false,
-                        "description": "Require equality instead of a prefix."},
+                        "description": "Require equality instead of a substring match."},
                     "budget": budget_prop(2000)
                 },
                 "required": ["query"],
@@ -2046,7 +2047,7 @@ Candidate list to verify, not a delete list.",
             "properties": {
                 "query": {"type": "string"},
                 "exact": {"type": "boolean",
-                    "description": "True when the match was equality rather than a prefix."},
+                    "description": "True when the match was equality rather than a substring."},
                 "items": {"type": "array",
                     "description": "Sites: file_path, line (1-based), value, qualified_name and \
         symbol_name of the enclosing symbol. qualified_name is empty outside every symbol."},

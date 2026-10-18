@@ -132,12 +132,15 @@ fn no_answer_and_no_artifact_carries_a_planted_value() {
     run(&root, &["build"]);
     run(&root, &["manifest"]);
 
-    // `hunter` rather than `hunter2`: an answer echoes its own query.
-    for prefix in ["AKIA", "ghp_", "xoxb", "hunter"] {
-        let text = run(&root, &["literals", prefix]);
-        assert_clean(&format!("literals {prefix}"), &text.stdout);
-        let json = run(&root, &["--json", "literals", prefix]);
-        assert_clean(&format!("--json literals {prefix}"), &json.stdout);
+    // `hunter` rather than `hunter2`: an answer echoes its own query. A query
+    // matches anywhere in a value, so pieces from inside each value too.
+    for query in [
+        "AKIA", "ghp_", "xoxb", "hunter", "IOSFODNN", "unter", "mnopqrst", "-1234567",
+    ] {
+        let text = run(&root, &["literals", query]);
+        assert_clean(&format!("literals {query}"), &text.stdout);
+        let json = run(&root, &["--json", "literals", query]);
+        assert_clean(&format!("--json literals {query}"), &json.stdout);
     }
     let marked = run(&root, &["--json", "literals", "<withheld"]);
     let marked = String::from_utf8_lossy(&marked.stdout);

@@ -56,6 +56,7 @@ mod hotspots_are_churn_times_coupling;
 mod incremental_equivalence;
 mod kernel_defects;
 mod license_declarations_agree;
+mod literals_take_a_hyphen_leading_query;
 mod manifest_is_written_once;
 mod mcp_over_real_stdio;
 mod min_rung_flag;

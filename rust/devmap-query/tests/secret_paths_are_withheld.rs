@@ -115,7 +115,11 @@ fn literals_search_ask_explore_and_skeleton_withhold_secret_values() {
     save(&store, &root, &extract_all());
     let engine = StoreQueryEngine::new(&store);
 
-    for query in ["AKIA", "ghp_", "xoxb", "hunter2"] {
+    // The heads, and pieces from inside each value: a query matches anywhere
+    // in a value, so the middle of a key must reach no more than its start.
+    for query in [
+        "AKIA", "ghp_", "xoxb", "hunter2", "IOSFODNN", "unter", "mnopqrst", "-1234567",
+    ] {
         let report = engine.literals(query, false, 8_000).unwrap();
         assert_no_planted_value(
             &format!("literals {query}"),
@@ -283,16 +287,23 @@ fn a_store_written_before_the_rule_is_withheld_on_read_and_scrubbed_on_write() {
     }
 
     let engine = StoreQueryEngine::new(&store);
-    let before = engine.literals("hunter2", false, 8_000).unwrap();
-    assert!(before.total > 0, "the stale rows still match: {before:?}");
-    assert_no_planted_value(
-        "literals against a stale store",
-        &serde_json::to_string(&before.items).unwrap(),
-    );
-    assert!(before
-        .items
-        .iter()
-        .all(|site| site.withheld.as_deref() == Some(WITHHELD_SECRET_PATH)));
+    // `unter` sits inside the stale value, so it reaches the rows `hunter2`
+    // does; both must come back withheld.
+    for query in ["hunter2", "unter"] {
+        let before = engine.literals(query, false, 8_000).unwrap();
+        assert!(
+            before.total > 0,
+            "the stale rows still match {query:?}: {before:?}"
+        );
+        assert_no_planted_value(
+            &format!("literals {query} against a stale store"),
+            &serde_json::to_string(&before.items).unwrap(),
+        );
+        assert!(before
+            .items
+            .iter()
+            .all(|site| site.withheld.as_deref() == Some(WITHHELD_SECRET_PATH)));
+    }
     drop(engine);
 
     // The next build, of an unchanged tree.
