@@ -448,6 +448,44 @@ fn module_import_after_a_function_import_of_the_same_name_still_types_other_func
     assert!(has(&calls(&r, "c.py::two"), "m.py::A.hi"), "{:?}", calls(&r, "c.py::two"));
 }
 
+#[test]
+fn structural_aliased_local_import_is_read_by_the_call_path() {
+    // `from m import A as A` is in the extractor's scope_locals; the unaliased
+    // form is only in the lane's table. If the two sources agreed, this and
+    // `method_local_unaliased_import_binds_the_call_in_that_method` would
+    // answer alike.
+    let r = resolve(&[
+        ("m.py", "class A:\n    def hi(self):\n        return 1\n"),
+        ("other.py", "class A:\n    def hi(self):\n        return 2\n"),
+        (
+            "c.py",
+            "from other import A\n\ndef go():\n    from m import A as A\n    x = A()\n    return x.hi()\n",
+        ),
+    ]);
+    let got = calls(&r, "c.py::go");
+    assert!(!has(&got, "other.py::A.hi"), "{got:?}");
+}
+
+#[test]
+fn structural_unaliased_and_aliased_local_imports_answer_alike() {
+    let probe = |import: &str| {
+        let src = format!(
+            "from other import A\n\ndef go():\n    {import}\n    x = A()\n    return x.hi()\n"
+        );
+        let r = resolve(&[
+            ("m.py", "class A:\n    def hi(self):\n        return 1\n"),
+            ("other.py", "class A:\n    def hi(self):\n        return 2\n"),
+            ("c.py", &src),
+        ]);
+        has(&calls(&r, "c.py::go"), "other.py::A.hi")
+    };
+    assert_eq!(
+        probe("from m import A"),
+        probe("from m import A as A"),
+        "the two tables disagree about a function-local import"
+    );
+}
+
 // ------------------------------------- 3. function-scoped base (flat table)
 
 #[test]
@@ -934,7 +972,7 @@ fn chain80() -> String {
     for i in 1..80 {
         src.push_str(&format!("class C{i}(C{}):\n    pass\n\n", i - 1));
     }
-    src.push_str("class Leaf(C79):\n    def m(self):\n        return super().m()\n\n    def go(self):\n        return self.m()\n\ndef typed():\n    x = Leaf()\n    return x.m()\n");
+    src.push_str("class Leaf(C79):\n    def run(self):\n        return super().m()\n\n    def go(self):\n        return self.m()\n\ndef typed():\n    x = Leaf()\n    return x.m()\n");
     src
 }
 
@@ -950,7 +988,7 @@ fn rows_naming_the_cap(r: &ResolutionResult) -> Vec<String> {
 fn finding_super_call_on_a_capped_chain_records_the_cap() {
     let r = resolve(&[("c.py", &chain80())]);
     assert!(
-        rows_naming_the_cap(&r).iter().any(|row| row.starts_with("c.py::Leaf.m|m|")),
+        rows_naming_the_cap(&r).iter().any(|row| row.starts_with("c.py::Leaf.run|m|")),
         "super().m() abstains with no ledger row naming the cap: {:?}",
         rows_naming_the_cap(&r)
     );
