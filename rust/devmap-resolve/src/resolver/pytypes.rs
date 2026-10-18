@@ -686,10 +686,14 @@ impl Resolver {
         // A module-level class of the same bare name shares that entry, and then
         // neither is read.
         let bare = key.rsplit('.').next().unwrap_or(&key).to_string();
-        if self
-            .python_class_enclosers
-            .get(&(file.clone(), bare.clone()))
-            .is_some_and(|enclosers| enclosers.iter().any(|(_, callable)| *callable))
+        // The root is named by the bare name its own heritage is filed under
+        // (`self_type_at`), so only a class reached through a base, which the
+        // walk names by its dotted identity, is affected.
+        if depth > 0
+            && self
+                .python_class_enclosers
+                .get(&(file.clone(), bare.clone()))
+                .is_some_and(|enclosers| enclosers.iter().any(|(_, callable)| *callable))
         {
             return Err(if self.python_class_declarations(file, &bare) > 0 {
                 MroStop::Abstain
