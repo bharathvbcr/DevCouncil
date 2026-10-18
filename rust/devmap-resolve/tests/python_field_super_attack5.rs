@@ -592,6 +592,121 @@ fn torch_alias_is_a_local_package_is_not_wired() {
     assert!(!forward_wired(&format!("import torch_geometric.nn as nn\n{MODULE_BODY}")));
 }
 
+// ------------------------------------------- 3b. star import, dotted base
+//
+// The plain-name self-call path abstains on any later star import, so the
+// effective-binds filter only matters for a dotted base `mod.Base`.
+
+const DOT_MOD: &str = "class Base:\n    def run(self):\n        return 1\n";
+const DOT_USER: &str = "import mod\nfrom m import *\n\nclass C(mod.Base):\n    def go(self):\n        return self.run()\n";
+
+fn dotted_star_edge(m: &str) -> bool {
+    let r = resolve(&[("mod.py", DOT_MOD), ("m.py", m), ("c.py", DOT_USER)]);
+    hits(&targets(&r, "c.py::C.go"), "mod.py::Base.run")
+}
+
+#[test]
+fn dotted_control_star_from_unrelated_module_keeps_the_edge() {
+    assert!(dotted_star_edge("def other():\n    return 1\n"));
+}
+
+#[test]
+fn dotted_control_star_module_defining_root_abstains() {
+    assert!(!dotted_star_edge("mod = None\n"));
+}
+
+#[test]
+fn dotted_star_all_literal_without_root_keeps_edge() {
+    assert!(dotted_star_edge("mod = None\nx = 1\n__all__ = ['x']\n"));
+}
+
+#[test]
+fn dotted_star_all_literal_plus_other_all_must_abstain() {
+    let other = "mod = None\n__all__ = ['mod']\n";
+    let m = "import other\nfrom other import *\n__all__ = ['x'] + other.__all__\nx = 1\n";
+    let r = resolve(&[("mod.py", DOT_MOD), ("other.py", other), ("m.py", m), ("c.py", DOT_USER)]);
+    assert!(!hits(&targets(&r, "c.py::C.go"), "mod.py::Base.run"), "m exports `mod` through other.__all__");
+}
+
+#[test]
+fn dotted_star_all_prefix_then_call_extension_must_abstain() {
+    let m = "from other import helper\n__all__ = ['x']\n__all__ += helper()\nx = 1\n";
+    assert!(!dotted_star_edge(m), "`__all__ += helper()` may add `mod`");
+}
+
+#[test]
+fn dotted_star_all_prefix_then_extend_call_must_abstain() {
+    let m = "from other import helper\n__all__ = ['x']\n__all__.extend(helper())\nx = 1\n";
+    assert!(!dotted_star_edge(m));
+}
+
+#[test]
+fn dotted_star_all_prefix_then_setattr_style_update_must_abstain() {
+    let m = "__all__ = ['x']\nx = 1\nglobals().update(mod=1)\n__all__.append('mod')\n";
+    assert!(!dotted_star_edge(m), "`__all__.append('mod')` exports mod");
+}
+
+#[test]
+fn dotted_star_all_is_tuple_with_root() {
+    assert!(!dotted_star_edge("mod = None\n__all__ = ('mod',)\n"));
+}
+
+#[test]
+fn dotted_star_all_concatenated_two_literals() {
+    assert!(!dotted_star_edge("mod = None\n__all__ = ['x'] + ['mod']\nx = 1\n"));
+}
+
+#[test]
+fn dotted_star_all_in_a_conditional_second_assignment() {
+    let m = "import sys\nmod = None\n__all__ = ['x']\nx = 1\nif sys.platform == 'win32':\n    __all__ = ['mod']\n";
+    assert!(!dotted_star_edge(m), "the guarded `__all__` may be the live one");
+}
+
+#[test]
+fn dotted_star_all_unlisted_name_defined_in_module_is_not_exported() {
+    // `mod` defined but `__all__` omits it: kept edge is CPython-correct.
+    assert!(dotted_star_edge("mod = None\nx = 1\n__all__ = ['x']\n"));
+}
+
+#[test]
+fn dotted_star_function_named_all_collides_with_the_export_key() {
+    let m = "mod = None\n\ndef __all__():\n    tmp = 1\n    return tmp\n";
+    assert!(!dotted_star_edge(m), "`def __all__` locals read as the export list");
+}
+
+#[test]
+fn dotted_star_function_named_all_with_local_named_like_root() {
+    let m = "mod = None\n\ndef __all__():\n    mod = 1\n    return mod\n";
+    assert!(!dotted_star_edge(m));
+}
+
+#[test]
+fn dotted_star_chain_a_b_c() {
+    let b = "from c_mod import *\n";
+    let c = "mod = None\n";
+    let r = resolve(&[("mod.py", DOT_MOD), ("c_mod.py", c), ("m.py", b), ("c.py", DOT_USER)]);
+    assert!(!hits(&targets(&r, "c.py::C.go"), "mod.py::Base.run"));
+}
+
+#[test]
+fn dotted_star_chain_through_all_bearing_middle_reexport() {
+    // m lists `mod` in __all__ and gets it from c_mod by star.
+    let m = "from c_mod import *\n__all__ = ['mod']\n";
+    let r = resolve(&[("mod.py", DOT_MOD), ("c_mod.py", "mod = None\n"), ("m.py", m), ("c.py", DOT_USER)]);
+    assert!(!hits(&targets(&r, "c.py::C.go"), "mod.py::Base.run"));
+}
+
+#[test]
+fn dotted_star_circular_terminates_and_abstains() {
+    let r = resolve(&[
+        ("mod.py", DOT_MOD),
+        ("a.py", "from b import *\nmod = None\n"),
+        ("b.py", "from a import *\n"),
+        ("c.py", "import mod\nfrom a import *\n\nclass C(mod.Base):\n    def go(self):\n        return self.run()\n"),
+    ]);
+    assert!(!hits(&targets(&r, "c.py::C.go"), "mod.py::Base.run"));
+}
+
 // ------------------------------------------------------------ 6. dotted base
 
 fn dotted(n: usize) -> String {
