@@ -108,6 +108,8 @@ mod one_ignore_owner;
 #[cfg(feature = "parse")]
 mod powershell_stays_pattern_recovered;
 #[cfg(feature = "parse")]
+mod python_heritage_attack3;
+#[cfg(feature = "parse")]
 mod python_path_loads;
 #[cfg(feature = "parse")]
 mod python_path_loads_under_stress;
