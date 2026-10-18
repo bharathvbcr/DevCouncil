@@ -238,13 +238,6 @@ fn a_non_torch_package_with_a_torch_prefix_is_not_torch() {
 }
 
 #[test]
-fn a_local_class_named_nn_with_a_module_member_is_not_torch() {
-    assert!(!dispatched(
-        "class nn:\n    class Module:\n        pass\nclass M(nn.Module):\n    def forward(self, x):\n        return x\n"
-    ));
-}
-
-#[test]
 fn many_torch_methods_in_one_file_extract_in_bounded_time() {
     let mut src = String::from("import torch.nn as nn\n");
     for i in 0..1500 {

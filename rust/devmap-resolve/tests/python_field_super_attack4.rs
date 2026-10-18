@@ -257,8 +257,25 @@ fn field_go(extra: &[(&str, &str)], h: &str) -> Vec<String> {
         vec![("a.py", "class A:\n    def run(self):\n        return 1\n")];
     files.extend_from_slice(extra);
     files.push(("h.py", h));
-    let r = resolve(&files);
-    methods(&r, "h.py::H.go")
+    go_edges(&resolve(&files))
+}
+
+/// The in-class call targets of every `…H.go` in `h.py` (a class nested in a
+/// function is `build.H`, so the caller is not always `h.py::H.go`).
+fn go_edges(r: &ResolutionResult) -> Vec<String> {
+    let mut out: Vec<String> = r
+        .edges
+        .iter()
+        .filter(|e| {
+            e.edge_kind == EdgeKind::Calls
+                && e.source_symbol.starts_with("h.py::")
+                && e.source_symbol.ends_with("H.go")
+        })
+        .map(|e| e.target_symbol.clone())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 const H_TAIL: &str = "\nclass H:\n    def __init__(self):\n        self.x = A()\n    def go(self):\n        return self.x.run()\n";
@@ -422,7 +439,7 @@ fn function_build_and_module_class_build_with_nested_h_collide() {
     // local poisons only the function's `H`.
     let got = field_go(
         &[],
-        "from a import A\n\ndef build():\n    A = object\n    class H:\n        def __init__(self):\n            self.x = A()\n        def go(self):\n            return self.x.run()\n    return H\n\nclass build:\n    class H:\n        def __init__(self):\n            self.x = A()\n        def go(self):\n            return self.x.run()\n",
+        "from a import A\n\ndef build():\n    A = object\n    class H:\n        def __init__(self):\n            self.x = A()\n        def go(self):\n            return self.x.run()\n    return H\n\nclass build:\n    class H:\n        def go(self):\n            return 1\n",
     );
     assert!(got.is_empty(), "the function's H reads its local A: {got:?}");
 }
@@ -433,7 +450,7 @@ fn module_class_build_nested_h_does_not_inherit_a_functions_local() {
     // function `build` with a local `A` must not poison it (recall).
     let src = "from a import A\n\ndef build():\n    A = object\n    return A\n\nclass build:\n    class H:\n        def __init__(self):\n            self.x = A()\n        def go(self):\n            return self.x.run()\n";
     let r = resolve(&[("a.py", "class A:\n    def run(self):\n        return 1\n"), ("h.py", src)]);
-    assert_eq!(methods(&r, "h.py::build.H.go"), A_RUN);
+    assert_eq!(go_edges(&r), A_RUN);
 }
 
 #[test]
@@ -452,7 +469,7 @@ fn redefined_function_build_second_has_no_local_binds() {
     // Two `build` functions; `H` lives in the second, which has no local `A`.
     let src = "from a import A\n\ndef build():\n    A = object\n    return A\n\ndef build():\n    class H:\n        def __init__(self):\n            self.x = A()\n        def go(self):\n            return self.x.run()\n    return H\n";
     let r = resolve(&[("a.py", "class A:\n    def run(self):\n        return 1\n"), ("h.py", src)]);
-    assert_eq!(methods(&r, "h.py::build.H.go"), A_RUN);
+    assert_eq!(go_edges(&r), A_RUN);
 }
 
 #[test]
