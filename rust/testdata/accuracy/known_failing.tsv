@@ -24,8 +24,6 @@ python	py.Z6c	miss	ft-c666ba7c	recall characterization: same through @dataclass(
 python	py.Z6d	miss	ft-c666ba7c	recall characterization: same, root typed by a parameter annotation | today: absent, recorded as an honest unresolved row
 python	py.Z6e	miss	ft-c666ba7c	recall characterization: same, field read into a local first | today: absent, recorded as an honest unresolved row
 swift	sw.C3	miss	ft-8ca270ad	recall characterization: store.snapshot(p).usage(for:) chain | today: absent, recorded as an honest unresolved row
-swift	sw.L1a	false_edge	ft-6976e8de	argument label emitted as a reference | today: forbidden edge at any tier to micro/Sources/M/D.swift::day at 1000
-swift	sw.L2a	false_edge	ft-6976e8de	leading-dot member emitted as a reference | today: forbidden HIGH edge to micro/Sources/M/D.swift::minute
 swift	sw.O1c	miss	ft-8ca270ad	recall characterization: local typed by a free function returning [T] | today: absent, recorded as an honest unresolved row; a bare call inside a type may name a method this file cannot see, so the call's return type is not read there
 swift	sw.O3	miss	ft-8ca270ad	recall characterization: protocol-extension method chained after another | today: absent, recorded as an honest unresolved row
 swift	sw.T2	miss	ft-8ca270ad	recall characterization: local typed by a method on a parameter receiver | today: absent, recorded as an honest unresolved row

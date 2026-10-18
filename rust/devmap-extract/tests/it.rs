@@ -123,6 +123,8 @@ mod sql_check_constraint_parse;
 #[cfg(feature = "parse")]
 mod stress_hardening;
 #[cfg(feature = "parse")]
+mod swift_properties;
+#[cfg(feature = "parse")]
 mod swift_recall_r5_attack;
 #[cfg(feature = "parse")]
 mod swift_scope_terminates;

@@ -131,6 +131,8 @@ mod shell_source_resolves;
 #[cfg(feature = "parse")]
 mod swift_modules;
 #[cfg(feature = "parse")]
+mod swift_property_reads;
+#[cfg(feature = "parse")]
 mod swift_protocol_dispatch;
 #[cfg(feature = "parse")]
 mod test_phase3_hardening;

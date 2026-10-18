@@ -45,8 +45,9 @@ pub(crate) fn declaration(node: Node, source: &str) -> Option<Declaration> {
         // and `subscript` is reached through `a[i]`, which `langcalls::swift`
         // deliberately refuses to record as a call.
         "init_declaration" | "deinit_declaration" | "subscript_declaration" => None,
-        // A protocol property requirement is not emitted: a stored or computed
-        // property is no symbol anywhere in this graph.
+        // A protocol property requirement is declared by the `simple_identifier`
+        // naming it (see `property_declaration_of`), exactly as every other
+        // property is, so the declaration node itself emits nothing.
         //
         // A protocol *function* requirement is, owned by its protocol. It was
         // withheld while a receiver typed by a protocol could not be resolved at
@@ -74,7 +75,13 @@ pub(crate) fn declaration(node: Node, source: &str) -> Option<Declaration> {
             // cannot join a reference attributed to the nested class — the
             // enclosing symbol is `Workspace.ActiveSaveRequest` — so a field
             // typed as the nested enum was confident-dead on a live save path.
-            let owner = if matches!(declared_kind, SymbolKind::Field | SymbolKind::Enum) {
+            //
+            // A property is owned by its type's bare name, as a method is: a
+            // read writes `p.count` against the type, and the resolver keys a
+            // type's members by that bare name.
+            let owner = if property_declaration_of(node).is_some() {
+                enclosing_owner(node, source, owner_identity)
+            } else if matches!(declared_kind, SymbolKind::Field | SymbolKind::Enum) {
                 super::enclosing_owner_path(node, source, declaration)
             } else {
                 enclosing_owner(node, source, owner_identity)
@@ -143,8 +150,54 @@ fn self_identity(node: Node, source: &str) -> Option<(SymbolKind, String)> {
         {
             Some((SymbolKind::Field, get_node_text(node, source)))
         }
+        // A stored or computed property of a type, of an extension or of a
+        // protocol. It reuses `Field`, the kind an enum case already carries
+        // (and the one `devmap-query` presents as `property`), rather than
+        // adding a parallel kind.
+        //
+        // Keyed on the *name node* for the enum-case reason: `var a = 1, b = 2`
+        // is one `property_declaration` with two names, and `let (x, y) = pair`
+        // binds two names from one pattern.
+        "simple_identifier" if property_declaration_of(node).is_some() => {
+            Some((SymbolKind::Field, get_node_text(node, source)))
+        }
         _ => None,
     }
+}
+
+/// The `property_declaration` (or protocol requirement) that `node` names, when
+/// `node` is a bound name of a **member** property.
+///
+/// A member is a property written directly in a `class_body`, `enum_class_body`
+/// or `protocol_body`. A `let`/`var` anywhere else is not a symbol: inside a
+/// function, initializer, closure or accessor body it is a local, which the
+/// scope pass binds, and at file level it is a global this graph does not model.
+/// Requiring the declaration's *direct* parent to be a type body is what keeps a
+/// `let` inside a computed property's getter from being mistaken for a member of
+/// the type that getter belongs to.
+pub(crate) fn property_declaration_of(node: Node) -> Option<Node> {
+    if node.kind() != "simple_identifier" || !is_named_child(node, "bound_identifier") {
+        return None;
+    }
+    // `let (x, y) = …` nests one pattern per tuple element. A `pattern` that is
+    // a direct child of the declaration is always a bound name: the initializer
+    // is its `value` and a type annotation is its own node.
+    let mut ancestor = crate::treesitter::bounded_parent(node)?;
+    while ancestor.kind() == "pattern" {
+        ancestor = crate::treesitter::bounded_parent(ancestor)?;
+    }
+    if !matches!(
+        ancestor.kind(),
+        "property_declaration" | "protocol_property_declaration"
+    ) {
+        return None;
+    }
+    let body = crate::treesitter::bounded_parent(ancestor)?;
+    matches!(
+        body.kind(),
+        "class_body" | "enum_class_body" | "protocol_body"
+    )
+    .then_some(ancestor)
 }
 
 /// Whether `node` occupies `field` on its own parent.
@@ -244,6 +297,9 @@ fn visibility_modifier(node: Node, source: &str) -> Option<String> {
 /// Only the declaration's own list is read. Reading its text instead — which is
 /// what `generic_is_exported` does — reaches into every body it contains.
 fn modifier_nodes(node: Node<'_>) -> Vec<Node<'_>> {
+    // A property's modifiers hang off its `property_declaration`, not off the
+    // name node that is the symbol.
+    let node = property_declaration_of(node).unwrap_or(node);
     let mut cursor = node.walk();
     let modifiers = node
         .named_children(&mut cursor)
@@ -336,6 +392,9 @@ pub(crate) fn exemption(
             WiringKind::StructuralExempt,
             "Swift protocol requirement — declares what a conformer must provide, so no caller of its own is expected",
         ));
+    }
+    if let Some(property) = property_declaration_of(node) {
+        return property_exemption(property, node, source);
     }
     // An enum case is reached through leading-dot inference — `let m: Mode =
     // .fast`, `case .number(let n)` — which names the case without naming its
@@ -475,6 +534,101 @@ fn enclosing_type_is_xctest(node: Node, source: &str) -> bool {
         ancestor = crate::treesitter::bounded_parent(parent);
     }
     false
+}
+
+/// Why a member property is reached without an observable read.
+///
+/// Every reason is evidence on the declaration or on the type it is written in,
+/// and the rule fails closed: a property is a dead-code candidate only when
+/// nothing but a read could reach it.
+///
+/// * A protocol requirement declares what a conformer provides.
+/// * An attribute makes the framework a reader — a property wrapper
+///   (`@Published`, `@State`, `@AppStorage`) is read through its projected
+///   value `$name`, which names no property, and `@objc`/`@IBOutlet`/`@NSManaged`
+///   publish it to the Objective-C runtime.
+/// * `override` is read by the declaring superclass.
+/// * A type that lists any supertype may satisfy a requirement with a
+///   non-private property, and its synthesized `Codable`/`Equatable`/`Hashable`
+///   conformance reads **every stored property, private ones included**. The
+///   supertype named may itself inherit `Codable` (`protocol Model: Codable`),
+///   so the conformance list is not narrowed to a known name.
+fn property_exemption(
+    property: Node,
+    name: Node,
+    source: &str,
+) -> Option<(WiringKind, &'static str)> {
+    if property.kind() == "protocol_property_declaration" {
+        return Some((
+            WiringKind::StructuralExempt,
+            "Swift protocol property requirement — declares what a conformer must provide, so no reader of its own is expected",
+        ));
+    }
+    if let Some(attribute) = attribute_names(name, source).first() {
+        return Some(match crate::wiring::swift_attribute_entry_reason(attribute) {
+            Some(reason) => (WiringKind::RuntimeEntryPoint, reason),
+            None => (
+                WiringKind::StructuralExempt,
+                "Swift attributed property (property wrapper or runtime-visible) is read by the framework through its projected value or by name",
+            ),
+        });
+    }
+    if has_member_modifier(name, source, "override") {
+        return Some((
+            WiringKind::RuntimeEntryPoint,
+            "Swift property override read by the declaring superclass or framework",
+        ));
+    }
+    let container = enclosing_type_declaration(property);
+    if container.is_some_and(|container| {
+        attribute_names(container, source)
+            .iter()
+            .any(|attribute| attribute == "objcMembers")
+    }) {
+        return Some((
+            WiringKind::RuntimeEntryPoint,
+            "published to the Objective-C runtime by the enclosing type's @objcMembers",
+        ));
+    }
+    let conforms =
+        container.is_some_and(|container| !inherited_types(container, source).is_empty());
+    if !conforms {
+        return None;
+    }
+    let private = !is_exported(name, source);
+    let stored = !property_is_computed(property);
+    if !private {
+        return Some((
+            WiringKind::StructuralExempt,
+            "Swift property of a type with supertypes — it may witness a protocol requirement or be read by a synthesized conformance",
+        ));
+    }
+    stored.then_some((
+        WiringKind::StructuralExempt,
+        "Swift private stored property of a type with supertypes — a synthesized Codable, Equatable or Hashable conformance reads every stored property",
+    ))
+}
+
+/// Whether a `property_declaration` computes its value rather than storing it.
+fn property_is_computed(property: Node) -> bool {
+    let mut cursor = property.walk();
+    let computed = property
+        .named_children(&mut cursor)
+        .any(|child| child.kind() == "computed_property");
+    computed
+}
+
+/// The `class_declaration` or `protocol_declaration` a member is written in —
+/// an extension included — or `None` outside a type.
+fn enclosing_type_declaration(node: Node) -> Option<Node> {
+    let mut ancestor = crate::treesitter::bounded_parent(node);
+    while let Some(parent) = ancestor {
+        if matches!(parent.kind(), "class_declaration" | "protocol_declaration") {
+            return Some(parent);
+        }
+        ancestor = crate::treesitter::bounded_parent(parent);
+    }
+    None
 }
 
 /// Whether an owner path ends in the reserved `CodingKeys` segment.

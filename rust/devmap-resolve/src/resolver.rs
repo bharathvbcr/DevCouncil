@@ -3270,7 +3270,9 @@ impl Resolver {
                         family,
                         Arc::clone(&identity),
                     ));
-                if sym.kind == SymbolKind::Method {
+                if sym.kind == SymbolKind::Method
+                    || Self::is_swift_member_property(family, sym.kind)
+                {
                     if let Some(type_name) = sym
                         .parent_symbol
                         .as_deref()
@@ -7110,11 +7112,25 @@ impl Resolver {
         // A macro is invoked as `name!(..)`, which its own reference records;
         // `name()` is a function call, so a macro is never its target.
         kind == SymbolKind::Macro
+            // A Swift property (or enum case) is a member its owner's receiver
+            // names, and `name()` never reaches one through a bare spelling: the
+            // bare-name rungs would otherwise bind any unique namesake in the
+            // module, which is the unique-global defect (ft-0e6cc90f) on the
+            // property surface. A typed or implicit `self` receiver reaches it
+            // through `type_methods`, which this does not touch.
+            || Self::is_swift_member_property(family, kind)
             || (kind == SymbolKind::Interface
                 && matches!(
                     family,
                     LangFamily::Rust | LangFamily::Python | LangFamily::JsTs
                 ))
+    }
+
+    /// Whether a symbol of `kind` in `family` is a member the language reaches
+    /// only through a receiver: a Swift stored or computed property, or an enum
+    /// case (the two share `Field`).
+    fn is_swift_member_property(family: LangFamily, kind: SymbolKind) -> bool {
+        family == LangFamily::Swift && kind == SymbolKind::Field
     }
 
     fn parent_dir(current_file: &str) -> String {

@@ -9351,6 +9351,7 @@ fn maybe_push_name_reference(
         ref_kind = ReferenceKind::Type;
     }
     if is_argument_label(node)
+        || (lang == "swift" && swift_leading_dot_member(node, source))
         || name_field_holds_a_use(node)
         || is_defining_name(node)
         || is_inside_import_or_export(node)
@@ -9610,6 +9611,25 @@ fn c_declarator_declaration(node: Node) -> Option<Node> {
     climbed.then_some(current)
 }
 
+/// Whether `node` is the member of a Swift leading-dot expression: the
+/// `minute` of `f(.minute)` or the `size` of `return .size`.
+///
+/// tree-sitter-swift parses `.minute` as a `prefix_expression` whose target is
+/// the bare identifier, so it looked exactly like a bare read of `minute`. A
+/// leading-dot member names a case or static member of the *contextual* type —
+/// a type this extractor cannot see — so it is no reference to any declaration
+/// that merely shares the spelling: a free function `minute`, or a property
+/// `size` of the type the expression is written inside.
+fn swift_leading_dot_member(node: Node, source: &str) -> bool {
+    let Some(parent) = bounded_parent(node) else {
+        return false;
+    };
+    parent.kind() == "prefix_expression"
+        && source
+            .get(parent.start_byte()..node.start_byte())
+            .is_some_and(|operator| operator.trim() == ".")
+}
+
 /// Whether `node` is a call's argument label — the `x` of Python `f(x=…)`,
 /// C# `F(x: …)` and `[A(x = …)]`, R and PHP `f(x = …)` / `f(x: …)`, Solidity
 /// `f({x: …})`, Scala `T[x = …]`.
@@ -9625,16 +9645,20 @@ fn c_declarator_declaration(node: Node) -> Option<Node> {
 /// fabricated read of whatever shares its name.
 fn is_argument_label(node: Node) -> bool {
     bounded_parent(node).is_some_and(|parent| {
-        matches!(
-            parent.kind(),
-            "keyword_argument"
-                | "argument"
-                | "attribute_argument"
-                | "call_struct_argument"
-                | "named_type_argument"
-        ) && parent
-            .child_by_field_name("name")
-            .is_some_and(|label| label.id() == node.id())
+        // Swift's `f(count: 1)` wraps the label in its own node:
+        // `value_argument > name: value_argument_label > simple_identifier`, so
+        // the label is never on a `name` field of the identifier's own parent.
+        parent.kind() == "value_argument_label"
+            || (matches!(
+                parent.kind(),
+                "keyword_argument"
+                    | "argument"
+                    | "attribute_argument"
+                    | "call_struct_argument"
+                    | "named_type_argument"
+            ) && parent
+                .child_by_field_name("name")
+                .is_some_and(|label| label.id() == node.id()))
     })
 }
 
@@ -10240,6 +10264,13 @@ fn is_symbol_binding(node: Node, source: &str) -> bool {
     // Same reasoning for Objective-C, whose class names and selector parts are
     // unnamed children rather than declarator chains.
     if is_objc_declaring_identifier(node) {
+        return true;
+    }
+    // A Swift member property is a `Field` symbol. Filed as a file-scope local
+    // instead, its own name shadowed every bare read of it written outside a
+    // function body — a computed property's getter, a property initializer —
+    // and the read was dropped before the resolver saw it.
+    if crate::langdecl::swift::property_declaration_of(node).is_some() {
         return true;
     }
     let Some(parent) = bounded_parent(node) else {

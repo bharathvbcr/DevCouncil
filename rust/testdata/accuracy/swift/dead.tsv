@@ -24,3 +24,10 @@ exported_unreferenced	spm/Sources/DemoMain/Tapper.swift::Tapper	nothing in DemoM
 exported_unreferenced	spm/Sources/DemoMain/Tapper.swift::Tapper.register	nothing calls it
 exempt	spm/Sources/DemoMain/Tapper.swift::Tapper.onTap	P7: `#selector(onTap(_:))` (Tapper.swift:8), and `@objc` publishes it to the runtime
 exempt	spm/Sources/DemoMain/Tapper.swift::Tapper.onPing	P7: `@objc` publishes it to the Objective-C runtime, which invokes it by selector
+# Fourth pass (2026-10-17): member properties are symbols (ft-6a46dddd).
+truly_dead	micro/Sources/M/Props.swift::PlaybackState.privTrulyDeadProp	private computed property nothing reads
+live	micro/Sources/M/Props.swift::PlaybackState.privReadProp	implicit-self read in readPriv
+live	micro/Sources/M/Props.swift::PlaybackState.count	self.count and implicit count
+live	micro/Sources/M/Props.swift::PlaybackState.isPaused	typed receiver read p.isPaused
+live	micro/Sources/M/Props.swift::PropTask.isCompleted	$0.isCompleted in a closure over [PropTask]
+live	spm/Sources/Core/Shapes.swift::Clamped.value	read bare in the wrappedValue getter and written in init

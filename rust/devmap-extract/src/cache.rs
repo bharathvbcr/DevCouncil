@@ -740,7 +740,24 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// current it would leave every unchanged JS/TS file without the spread,
 /// alias and member-write answers. The bump is what keeps such a row from
 /// being served at all.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "96";
+///
+/// v97 records a Swift member property as a symbol. A stored or computed
+/// `let`/`var` written directly in a `class`, `struct`, `enum`, `actor`,
+/// `extension` or `protocol` body — `static`, `class`, `lazy`, property-wrapped
+/// and observer-bearing ones included — is a [`crate::model::SymbolKind::Field`]
+/// named by its bound identifier and owned by its type's bare name, as a method
+/// is (`App.swift::Person.count`); a protocol property requirement is one too.
+/// A `let`/`var` inside a function, closure or accessor body, and one at file
+/// level, is not. Calls and references inside a property's initializer or
+/// getter keep the enclosing *type* as their caller, as before. The symbol
+/// carries a wiring exemption where a framework or the compiler is the reader
+/// (an attribute, `override`, a protocol requirement, a stored property of a
+/// type with supertypes). v97 also stops a Swift argument label (`f(count: 1)`)
+/// and a leading-dot member (`.count`) being recorded as a `Name` reference,
+/// which would now bind to a property. A v96 row has no property symbol and
+/// still records those two spellings, so serving it would leave every
+/// unchanged Swift file with no property for a read to bind to.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "97";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

@@ -137,3 +137,15 @@ sw.Y1	Y1	micro/Sources/M/Q9.swift::Depot.tally	micro/Sources/M/Q9.swift::Lot.mas
 sw.Y1.not	Y1	micro/Sources/M/Q9.swift::Depot.tally	micro/Sources/M/Q9.swift::Stock.mass	forbid	must		top-level Stock is shadowed by the extension typealias inside Depot
 sw.FL1.not	FL1	micro/Sources/M/FieldLeak.swift::FlHolderB.go	micro/Sources/M/FieldLeak.swift::FlEngine.run	forbid_any_tier	must		FlHolderA typed property engine must not type FlHolderB inferred engine
 sw.FL1.ctl	FL1	micro/Sources/M/FieldLeak.swift::FlHolderA.go	micro/Sources/M/FieldLeak.swift::FlEngine.run	edge	must		control: the declaring struct still binds
+sw.PR1	PR1	micro/Sources/M/Props.swift::pausedLocal	micro/Sources/M/Props.swift::PlaybackState.isPaused	edge	must		property read on a local typed by its initializer
+sw.PR1b	PR1	micro/Sources/M/Props.swift::pausedFlag	micro/Sources/M/Props.swift::PlaybackState.isPaused	edge	must		property read on a typed parameter
+sw.PR2	PR2	micro/Sources/M/Props.swift::doneAny	micro/Sources/M/Props.swift::PropTask.isCompleted	edge	must		$0.isCompleted in a closure over a [PropTask] parameter
+sw.PR3	PR3	micro/Sources/M/Props.swift::PlaybackState.viaSelf	micro/Sources/M/Props.swift::PlaybackState.count	edge	must		self.count
+sw.PR4	PR4	micro/Sources/M/Props.swift::PlaybackState.bump	micro/Sources/M/Props.swift::PlaybackState.count	edge	must		implicit self property read inside a method
+sw.PR5	PR5	micro/Sources/M/Props.swift::doubledOf	micro/Sources/M/Props.swift::PlaybackState.doubled	edge	must		computed property declared in an extension, read through a typed receiver
+sw.PR6	PR6	micro/Sources/M/Props.swift::PlaybackState.readPriv	micro/Sources/M/Props.swift::PlaybackState.privReadProp	edge	must		implicit read of a private computed property
+sw.PR7.not	PR7	micro/Sources/M/Props.swift::untypedRead	micro/Sources/M/Props.swift::PlaybackState.isPaused	forbid_any_tier	must		property read on an untyped receiver never binds through the unique-global rung
+sw.PR8	PR8	micro/Sources/M/Props.swift::readA	micro/Sources/M/Props.swift::IdA.id	edge	must		a: IdA binds IdA.id
+sw.PR8.not	PR8	micro/Sources/M/Props.swift::readA	micro/Sources/M/Props.swift::IdB.id	forbid_any_tier	must		the same-named property of an unrelated type is not bound
+sw.PR9.not	PR9	micro/Sources/M/Props.swift::Tally.make	micro/Sources/M/Props.swift::Tally.total	forbid_any_tier	must		argument label total: is not a property read
+sw.PR10.not	PR10	micro/Sources/M/Props.swift::Gauge.pick	micro/Sources/M/Props.swift::Gauge.size	forbid_any_tier	must		leading-dot .size names the Axis case, not the enclosing type property

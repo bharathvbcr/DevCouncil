@@ -881,7 +881,7 @@ fn the_cache_identity_covers_the_embedded_grammars() {
     // v92 integrates the Rust, TypeScript/Go and Swift lanes; v93 integrates
     // main's Swift payload on top (see cache.rs).
     assert_eq!(
-        EXTRACTION_SCHEMA_VERSION, "96",
+        EXTRACTION_SCHEMA_VERSION, "97",
         "reading <script> blocks changes what a cached payload means, and so does \
          every later addition to it"
     );
