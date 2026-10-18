@@ -3635,3 +3635,364 @@ fn a_clean_run_still_rewrites_the_record_and_open_gates() {
     assert_ne!(written["open_gates"], json!(["sentinel: untouched"]));
     assert_eq!(written["measurements"].as_array().map(Vec::len), Some(1));
 }
+
+// --- adversarial: corpus refusals ---
+//
+// Probes against `check_build`, `build_status`, `apply_outcomes` and
+// `retry_command`. Tests named `attack_*_breaks_*` fail against 4dc8acac and
+// name the defect; the rest pin behavior that holds.
+
+fn fixture_built() -> Built {
+    common::build(&common::fixture_dirs().remove(0))
+}
+
+/// Mark the parseable source file at index `skip` as failed with `reason`;
+/// returns its path.
+fn fail_nth_source(built: &mut Built, skip: usize, reason: String) -> String {
+    use devmap_extract::model::ParseOutcome;
+    let ext = built
+        .extractions
+        .iter_mut()
+        .filter(|e| {
+            !e.is_parse_failure() && (e.file_path.ends_with(".rs") || e.file_path.ends_with(".go"))
+        })
+        .nth(skip)
+        .expect("the fixture holds enough source files");
+    ext.parse_outcome = ParseOutcome::Failed { reason };
+    ext.file_path.clone()
+}
+
+fn is_clean_of_control(text: &str) -> bool {
+    !text.chars().any(char::is_control)
+}
+
+// Probe 1: refusal leakage.
+#[test]
+fn attack_probe1_one_clean_one_refused_corpus_writes_nothing_in_either_order() {
+    let (pin, record, gates) = refused_run_fixture();
+    let before = record.clone();
+    let other = Pin {
+        name: "Other".into(),
+        ..unverifiable_pin(&["go"])
+    };
+    let cause = check_build("Corpus", Some(&json!(0)), Ok(&status(1, &["a.rs"], 1))).refusals;
+    for refused_first in [true, false] {
+        let clean = Outcome::Measured(
+            json!({ "name": "Other", "languages": {}, "secret_marker": 1 }),
+            None,
+        );
+        let refused = (&pin, Outcome::Refused(cause.clone()));
+        let outcomes = if refused_first {
+            vec![refused, (&other, clean)]
+        } else {
+            vec![(&other, clean), refused]
+        };
+        let pins = [pin.clone(), other.clone()];
+        let err = apply_outcomes(&record, outcomes, &pins, &gates, "2026-10-18")
+            .expect_err("any refused corpus refuses the whole run");
+        assert!(!err.contains("secret_marker"), "{err}");
+        assert!(!err.contains("Other refused"), "{err}");
+        assert_eq!(record, before);
+    }
+}
+
+// Probe 2: the baseline is a count, so a different failing file at the same
+// count is indistinguishable. Expressible only as "the statuses differ".
+#[test]
+fn attack_probe2_breaks_a_swapped_failing_file_at_the_same_count_is_invisible() {
+    let reason = "grammar fault".to_string();
+    let mut a = fixture_built();
+    fail_nth_source(&mut a, 0, reason.clone());
+    let mut b = fixture_built();
+    fail_nth_source(&mut b, 1, reason);
+    let (sa, sb) = (build_status(&a).unwrap(), build_status(&b).unwrap());
+    assert_eq!(sa.parse_failed, sb.parse_failed, "same count by construction");
+    assert_ne!(
+        sa, sb,
+        "BuildStatus carries only a count, so a baseline of {} cannot tell file A from file B failing",
+        sa.parse_failed
+    );
+}
+
+// Probe 2b: a budget refusal on a baseline-set file refuses (the budget cause),
+// but the note it also prints tells the operator to tighten the baseline,
+// which is the wrong advice for a refused, load-degraded run.
+#[test]
+fn attack_probe2_breaks_a_refused_run_must_not_advise_tightening_the_baseline() {
+    // baseline 1 (one file always fails); that very file was budget-refused.
+    let check = clean_check(1, &status(1, &["always_fails.rs"], 1));
+    assert_eq!(check.refusals.len(), 1, "{check:?}");
+    assert!(
+        check.notes.iter().all(|n| !n.contains("tighten")),
+        "a refused run printed a tighten-the-baseline note: {:?}",
+        check.notes
+    );
+}
+
+// Probe 3: double counting.
+#[test]
+fn attack_probe3_a_real_extra_failure_does_not_hide_behind_budget_refusals() {
+    // 3 budget + 2 real failures, baseline 1: the 2 real ones exceed it.
+    let check = clean_check(1, &status(3, &["a", "b", "c"], 5));
+    assert_eq!(check.refusals.len(), 2, "{check:?}");
+    assert!(check.refusals[0].starts_with("budget refusal:"));
+    assert!(check.refusals[1].starts_with("parse failure: 2 file(s)"));
+}
+
+#[test]
+fn attack_probe3_end_to_end_one_budget_refusal_plus_one_real_failure_over_baseline_zero() {
+    use devmap_extract::model::BUDGET_REFUSAL_PREFIX;
+    let mut built = fixture_built();
+    let budget = fail_nth_source(&mut built, 0, format!("{BUDGET_REFUSAL_PREFIX}over 5s"));
+    let real = fail_nth_source(&mut built, 0, "grammar fault".into());
+    assert_ne!(budget, real);
+    let st = build_status(&built).unwrap();
+    assert_eq!((st.budget_refused_total, st.parse_failed), (1, 2));
+    let check = clean_check(0, &st);
+    assert_eq!(check.refusals.len(), 2, "{check:?}");
+    // A reason that merely contains the prefix is a parse failure, not a budget one.
+    let mut built = fixture_built();
+    fail_nth_source(&mut built, 0, format!("x {BUDGET_REFUSAL_PREFIX}over 5s"));
+    let st = build_status(&built).unwrap();
+    assert_eq!((st.budget_refused_total, st.parse_failed), (0, 1));
+}
+
+#[test]
+fn attack_probe3_an_inconsistent_status_still_refuses() {
+    // parse_failed < budget total cannot come from build_status, but check_build
+    // is pure over any status: it must not read it as clean.
+    let check = clean_check(0, &status(5, &[], 2));
+    assert!(!check.refusals.is_empty(), "{check:?}");
+}
+
+// Probe 4: status variants.
+#[test]
+fn attack_probe4_breaks_an_empty_status_error_message_is_not_rendered_as_empty_parens() {
+    let check = check_build("Corpus", Some(&json!(0)), Err(""));
+    assert_eq!(check.refusals.len(), 1, "{check:?}");
+    assert!(check.refusals[0].starts_with("unverifiable:"));
+    assert!(
+        !check.refusals[0].contains("()"),
+        "empty cause rendered as '()': {}",
+        check.refusals[0]
+    );
+}
+
+#[test]
+fn attack_probe4_a_truncated_listing_carries_the_total() {
+    let check = clean_check(0, &status(7, &["a.rs", "b.rs"], 7));
+    assert!(check.refusals[0].contains("showing 2 of 7"), "{check:?}");
+}
+
+#[test]
+fn attack_probe4_breaks_refusal_text_has_no_control_characters_from_paths() {
+    let nasty = "ok.rs\n[FAKE] corpus clean\r\u{1b}[2J\u{0}\u{7f}\u{85}\u{2028}tail.rs";
+    let check = clean_check(0, &status(1, &[nasty], 1));
+    let text = &check.refusals[0];
+    assert!(
+        is_clean_of_control(text),
+        "a path with newline/ESC/NUL reached the refusal verbatim (log injection): {text:?}"
+    );
+}
+
+#[test]
+fn attack_probe4_breaks_refusal_text_has_no_control_characters_from_status_error() {
+    let check = check_build(
+        "Corpus",
+        Some(&json!(0)),
+        Err("boom\n[FAKE] all clean\u{1b}[0m"),
+    );
+    assert!(
+        is_clean_of_control(&check.refusals[0]),
+        "{:?}",
+        check.refusals[0]
+    );
+}
+
+#[test]
+fn attack_probe4_breaks_a_very_long_path_is_capped_in_the_refusal() {
+    let long = "日本語/".repeat(200_000); // ~1.2 MB
+    let check = clean_check(0, &status(1, &[&long], 1));
+    assert!(
+        check.refusals[0].len() < 10_000,
+        "a single path made the refusal {} bytes",
+        check.refusals[0].len()
+    );
+}
+
+#[test]
+fn attack_probe4_breaks_check_build_itself_caps_a_ten_thousand_path_listing() {
+    // build_status caps at REFUSED_PATH_SAMPLE, but check_build is the pure
+    // seam every status goes through and it names whatever it is handed.
+    let paths: Vec<String> = (0..10_000).map(|i| format!("dir/file{i}.rs")).collect();
+    let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let check = clean_check(0, &status(10_000, &refs, 10_000));
+    assert!(
+        check.refusals[0].len() < 20_000,
+        "refusal text is {} bytes",
+        check.refusals[0].len()
+    );
+}
+
+#[test]
+fn attack_probe4_build_status_caps_ten_thousand_refusals_at_the_sample() {
+    use devmap_extract::model::{ParseOutcome, BUDGET_REFUSAL_PREFIX};
+    let mut built = fixture_built();
+    let template = built
+        .extractions
+        .iter()
+        .find(|e| e.file_path.ends_with(".rs") || e.file_path.ends_with(".go"))
+        .expect("source file")
+        .clone();
+    for i in 0..10_000 {
+        let mut ext = template.clone();
+        ext.file_path = format!("gen/f{i:05}.rs");
+        ext.parse_outcome = ParseOutcome::Failed {
+            reason: format!("{BUDGET_REFUSAL_PREFIX}over 5s"),
+        };
+        built.extractions.push(ext);
+    }
+    let st = build_status(&built).unwrap();
+    assert_eq!(st.budget_refused_total, 10_000);
+    assert_eq!(st.budget_refused_paths.len(), REFUSED_PATH_SAMPLE);
+    let check = clean_check(0, &st);
+    assert!(check.refusals[0].contains("showing 50 of 10000"));
+}
+
+// Probe 5: malformed corpora.json baselines.
+#[test]
+fn attack_probe5_non_integer_spellings_are_malformed() {
+    let clean = status(0, &[], 0);
+    for raw in [
+        "1e3",
+        "1000.0",
+        "true",
+        "false",
+        "[]",
+        "{}",
+        "-0.0",
+        "18446744073709551616",
+    ] {
+        let v: Value = serde_json::from_str(raw).unwrap();
+        let check = check_build("Corpus", Some(&v), Ok(&clean));
+        assert_eq!(check.refusals.len(), 1, "{raw}: {check:?}");
+        assert!(check.refusals[0].contains("malformed"), "{raw}");
+    }
+}
+
+#[test]
+fn attack_probe5_breaks_a_u64_max_baseline_is_not_an_implausible_pass_everything() {
+    let v: Value = serde_json::from_str("18446744073709551615").unwrap();
+    let check = check_build("Corpus", Some(&v), Ok(&status(0, &[], 1_000_000)));
+    assert!(
+        !check.refusals.is_empty(),
+        "u64::MAX baseline accepted; a parse failure gate that can never fire: {check:?}"
+    );
+}
+
+#[test]
+fn attack_probe5_committed_pin_names_and_env_vars_are_unique() {
+    let (pins, _) = load_pins();
+    let names: BTreeSet<&String> = pins.iter().map(|p| &p.name).collect();
+    assert_eq!(names.len(), pins.len(), "duplicate pin names");
+    let envs: BTreeSet<String> = pins.iter().map(|p| env_name(&p.name)).collect();
+    assert_eq!(envs.len(), pins.len(), "two pins share one env var");
+}
+
+#[test]
+fn attack_probe5_breaks_every_pinned_corpus_has_a_baseline_and_no_baseline_is_stray() {
+    let (pins, gates) = load_pins();
+    for p in &pins {
+        assert!(
+            gates.parse_failed.contains_key(&p.name),
+            "{} has no baseline",
+            p.name
+        );
+    }
+    assert_eq!(gates.parse_failed.len(), pins.len(), "stray baseline entry");
+}
+
+// Probe 6: interaction with carry_unverifiable.
+#[test]
+fn attack_probe6_a_refused_corpus_with_no_committed_row_creates_no_row() {
+    let pin = unverifiable_pin(&["go"]);
+    let cause = check_build("Corpus", Some(&json!(0)), Ok(&status(1, &["a.rs"], 1))).refusals;
+    assert!(carry_unverifiable_because(None, None, &pin, Some(&cause.join("; "))).is_none());
+    let record = json!({ "corpora": [], "measurements": [], "open_gates": [] });
+    let err = apply_outcomes(
+        &record,
+        vec![(&pin, Outcome::Refused(cause))],
+        std::slice::from_ref(&pin),
+        &gates(),
+        "2026-10-18",
+    )
+    .unwrap_err();
+    assert!(err.contains("budget refusal"), "{err}");
+    assert!(
+        !err.contains("unverifiable"),
+        "no row, so nothing to stamp: {err}"
+    );
+}
+
+#[test]
+fn attack_probe6_a_moved_pin_and_a_refusal_carry_both_commits_and_the_cause() {
+    let (mut pin, record, gates) = refused_run_fixture();
+    pin.commit = "f".repeat(40);
+    let cause = check_build("Corpus", Some(&json!(0)), Ok(&status(1, &["a.rs"], 1))).refusals;
+    let err = apply_outcomes(
+        &record,
+        vec![(&pin, Outcome::Refused(cause))],
+        std::slice::from_ref(&pin),
+        &gates,
+        "2026-10-18",
+    )
+    .unwrap_err();
+    assert!(err.contains(&"0".repeat(40)), "old commit missing: {err}");
+    assert!(err.contains(&"f".repeat(40)), "pinned commit missing: {err}");
+    assert!(err.contains("budget refusal"), "{err}");
+}
+
+#[test]
+fn attack_probe6_an_already_stamped_row_is_stamped_deterministically() {
+    let pin = unverifiable_pin(&["go", "python"]);
+    let committed = committed_corpus_row();
+    let first = carry_unverifiable_because(Some(&committed), None, &pin, Some("cause one")).unwrap();
+    let again = carry_unverifiable_because(Some(&first), None, &pin, Some("cause two")).unwrap();
+    let twice = carry_unverifiable_because(Some(&first), None, &pin, Some("cause two")).unwrap();
+    assert_eq!(again, twice, "same inputs, same stamp");
+    assert_eq!(again["languages"]["go"]["unverifiable"], json!("cause one"));
+}
+
+// Probe 7: the printed retry command names the variable the runner reads.
+#[test]
+fn attack_probe7_the_retry_command_names_the_env_var_the_runner_reads() {
+    let (pins, _) = load_pins();
+    for p in &pins {
+        let want = format!("{}=<checkout>", env_name(&p.name));
+        assert!(retry_command(&p.name).contains(&want), "{}", p.name);
+    }
+    assert!(retry_command("Lappi-decision").contains("DEVMAP_CORPUS_LAPPI_DECISION=<checkout>"));
+    assert!(retry_command("a.b c").contains("DEVMAP_CORPUS_A_B_C=<checkout>"));
+}
+
+// Probe 8: the new measurement field and old rows.
+#[test]
+fn attack_probe8_gates_do_not_read_parse_failed_files_so_old_rows_cannot_read_as_zero() {
+    let src = include_str!("real_corpus_accuracy.rs");
+    let readers = src
+        .lines()
+        .filter(|l| {
+            l.contains("[\"parse_failed_files\"]") || l.contains("get(\"parse_failed_files\")")
+        })
+        .filter(|l| !l.contains("l.contains") && !l.contains("= json!"))
+        .count();
+    assert_eq!(readers, 0, "a gate reads the field; old rows lack it");
+    let (pins, gates) = load_pins();
+    let record = load_record();
+    let baseline = open_gates(&record, &pins, &gates);
+    let mut with = record.clone();
+    for m in with["measurements"].as_array_mut().into_iter().flatten() {
+        m["parse_failed_files"] = json!(0);
+    }
+    assert_eq!(open_gates(&with, &pins, &gates), baseline);
+}
