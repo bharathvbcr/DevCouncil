@@ -1696,7 +1696,7 @@
         "found": 2,
         "truly_dead": 2
       },
-      "devmap_commit": "f0d27cc9fdaa95d422e54ebcf6bd6f699ab87800",
+      "devmap_commit": "31b0cee28449572a6c5e8792de5882a51e6de77a",
       "expected_edge_rows": 51,
       "forbid_any_tier_rows": 2,
       "forbid_rows": 6,
@@ -1718,7 +1718,7 @@
         "found": 1,
         "truly_dead": 1
       },
-      "devmap_commit": "f0d27cc9fdaa95d422e54ebcf6bd6f699ab87800",
+      "devmap_commit": "31b0cee28449572a6c5e8792de5882a51e6de77a",
       "expected_edge_rows": 69,
       "forbid_any_tier_rows": 4,
       "forbid_rows": 11,
@@ -1740,7 +1740,7 @@
         "found": 90,
         "truly_dead": 90
       },
-      "devmap_commit": "f0d27cc9fdaa95d422e54ebcf6bd6f699ab87800",
+      "devmap_commit": "31b0cee28449572a6c5e8792de5882a51e6de77a",
       "expected_edge_rows": 75,
       "forbid_any_tier_rows": 22,
       "forbid_rows": 36,
@@ -1762,7 +1762,7 @@
         "found": 1,
         "truly_dead": 1
       },
-      "devmap_commit": "f0d27cc9fdaa95d422e54ebcf6bd6f699ab87800",
+      "devmap_commit": "31b0cee28449572a6c5e8792de5882a51e6de77a",
       "expected_edge_rows": 115,
       "forbid_any_tier_rows": 1,
       "forbid_rows": 8,
@@ -1784,11 +1784,11 @@
         "found": 2,
         "truly_dead": 2
       },
-      "devmap_commit": "f0d27cc9fdaa95d422e54ebcf6bd6f699ab87800",
-      "expected_edge_rows": 114,
+      "devmap_commit": "31b0cee28449572a6c5e8792de5882a51e6de77a",
+      "expected_edge_rows": 117,
       "forbid_any_tier_rows": 9,
       "forbid_rows": 16,
-      "high_edges_correct": 105,
+      "high_edges_correct": 108,
       "high_edges_false": 0,
       "honest_miss": {
         "absent": 9,
@@ -1796,8 +1796,8 @@
         "recorded": 9
       },
       "precision_at_0.9": 1.0,
-      "present": 105,
-      "recall": 0.921
+      "present": 108,
+      "recall": 0.923
     },
     "typescript": {
       "dead": {
@@ -1806,7 +1806,7 @@
         "found": 4,
         "truly_dead": 4
       },
-      "devmap_commit": "f0d27cc9fdaa95d422e54ebcf6bd6f699ab87800",
+      "devmap_commit": "31b0cee28449572a6c5e8792de5882a51e6de77a",
       "expected_edge_rows": 80,
       "forbid_any_tier_rows": 7,
       "forbid_rows": 9,

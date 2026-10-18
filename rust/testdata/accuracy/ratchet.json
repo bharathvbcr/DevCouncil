@@ -26,8 +26,8 @@
   "swift": {
     "forbid_any_tier_rows": 9,
     "known_failing": 9,
-    "positive_rows": 114,
-    "present": 105
+    "positive_rows": 117,
+    "present": 108
   },
   "typescript": {
     "forbid_any_tier_rows": 7,
