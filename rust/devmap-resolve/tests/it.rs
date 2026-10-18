@@ -90,6 +90,10 @@ mod python_field_super_attack4;
 #[cfg(feature = "parse")]
 mod python_edge_dump_attack4;
 #[cfg(feature = "parse")]
+mod python_field_super_attack5;
+#[cfg(feature = "parse")]
+mod python_edge_dump_attack5;
+#[cfg(feature = "parse")]
 mod python_import_module_literal;
 #[cfg(feature = "parse")]
 mod python_module_constants;
