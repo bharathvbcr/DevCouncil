@@ -9700,6 +9700,11 @@ fn swift_leading_dot_context(node: Node, source: &str) -> Option<String> {
             .named_child(0)
             .filter(|n| n.kind() == "type_identifier")?;
         let name = get_node_text(name, source);
+        // A generic parameter of the enclosing function or type stands for any
+        // type: a real `struct T` elsewhere is not what `-> T` names there.
+        if crate::swiftscope::is_generic_parameter(node, source, &name) {
+            return None;
+        }
         name.chars()
             .next()
             .is_some_and(char::is_uppercase)

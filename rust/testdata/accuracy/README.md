@@ -350,3 +350,7 @@ own Rust has 58 dead rows, every one 0.4: 19 vetoed by an unresolved namesake,
 39 `exported_unreferenced`), Kotlin 9, all coverage-capped (see
 `CONFIDENT_TIER_ELIGIBLE`'s documentation). The record is re-measured by hand:
 re-label any new confident-branch row when a change moves the corpora.
+
+## Swift member properties: build cost
+
+Making Swift member properties symbols (ft-6a46dddd) is measured with `devmap build`, release, interleaved base/head x5, min of 5 instructions retired, against 9030d08c. The Swift fixture costs +2.0%; 2000 types sharing `id`/`name` costs 1.26x (no worse than unique names, 1.28x); one type with 30,000 properties costs 1.63x instructions and 395 MB against 189 MB max RSS. The last was accepted because the ratio measures symbols the base never created: it stored 4 symbols for that file, and persisting 30,000 of them is about 30% of the head profile and grows linearly. The store-insert cost is the follow-up, ft-f6abefd9. The quadratic paths the shape exposed (the per-symbol export scan and the same-name lexical scan) are fixed.
