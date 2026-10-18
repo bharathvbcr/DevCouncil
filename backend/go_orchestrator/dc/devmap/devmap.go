@@ -302,7 +302,21 @@ func (e Edge) identified() bool { return e.SourceFile != "" || e.TargetFile != "
 type edgeResult struct {
 	Items  []Edge `json:"items"`
 	Hidden int    `json:"hidden"`
+	// Note is information about a complete answer: an empty list over a target
+	// that has callers, edges a min_rung floor hid, a file that shadows a symbol.
+	Note string `json:"note"`
+	// WalkIncomplete is the producer's statement that the answer is partial.
+	WalkIncomplete string `json:"walk_incomplete"`
 }
+
+// annotated is implemented by wire shapes that carry the producer's own
+// qualifications of an answer, so runQuery can pass them on instead of
+// flattening the answer to its items.
+type annotated interface {
+	annotations() (note, walkIncomplete string)
+}
+
+func (r edgeResult) annotations() (string, string) { return r.Note, r.WalkIncomplete }
 
 // searchResult is the wire shape of a query that returns symbols.
 // identified reports whether the symbol carries anything usable.
@@ -328,6 +342,12 @@ type Result[T any] struct {
 	// dropped: a capped sample presented as complete coverage is the same
 	// failure as a check that did not run.
 	Hidden int
+	// Note is the producer's information about a complete answer — for Deps, an
+	// empty list over a file whose only edges are inbound says how many there
+	// were. It is not a degradation: Clean ignores it. A caller that renders an
+	// empty Items must render Note beside it, or "no outbound edges" reads as
+	// "nothing touches this".
+	Note string
 	// Stale marks an answer drawn from an index older than the working tree.
 	Stale bool
 	// Degraded names why an answer is less than it appears.
@@ -781,14 +801,15 @@ func (c *Client) Dead(ctx context.Context) (Result[DeadSymbol], error) {
 		"dead", "--budget", strconv.Itoa(c.Budget))
 }
 
-// Deps returns every edge touching a file, in both directions.
+// Deps returns the outbound edges of a file — what it depends on — or of a
+// symbol, when file names one (`name`, `Type.method`, `file::symbol`).
 //
-// The command is named for dependencies but its answer is undirected: it
-// returns edges where the file is the source and edges where it is the target,
-// and on this repository every returned edge touches the queried file. Callers
-// split them by comparing SourceFile and TargetFile to the path they asked
-// about, which derives the direction from the data rather than from what the
-// subcommand happens to be called.
+// Every returned edge has the queried file as its source. Callers of the file
+// are not here: when nothing leaves the target but edges point at it, Items is
+// empty and Result.Note says how many inbound edges were left out, so an empty
+// answer is not read as "no dependencies and no dependents". Ask impact for
+// callers. An ambiguous symbol name is refused by the command, which lists the
+// candidates.
 func (c *Client) Deps(ctx context.Context, file string) (Result[Edge], error) {
 	return runQuery[Edge, edgeResult](ctx, c,
 		func(r edgeResult) ([]Edge, int) { return r.Items, r.Hidden },
@@ -961,6 +982,14 @@ func runQuery[T any, W any](ctx context.Context, c *Client,
 		return Result[T]{}, err
 	}
 	result := Result[T]{Items: items, Hidden: hidden}
+	if a, ok := any(wire).(annotated); ok {
+		note, incomplete := a.annotations()
+		result.Note = note
+		if incomplete != "" {
+			result.Degraded = append(result.Degraded,
+				"devmap says the answer is partial: "+incomplete)
+		}
+	}
 
 	status, err := c.Status(ctx)
 	if err != nil {

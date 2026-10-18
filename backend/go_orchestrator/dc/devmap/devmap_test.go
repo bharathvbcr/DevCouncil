@@ -218,6 +218,40 @@ func TestEdgesCarryBothEndpoints(t *testing.T) {
 	}
 }
 
+// TestDepsCarriesTheProducersNoteAndPartialMark: dependencies are outbound, so
+// a file with only callers answers an empty list. The note that says how many
+// callers were left out must reach the caller (otherwise the empty answer reads
+// as "touches nothing"), and the producer's own partial-answer mark must make
+// the result degraded without the note doing so.
+func TestDepsCarriesTheProducersNoteAndPartialMark(t *testing.T) {
+	noted := fake(t, map[string]string{
+		"status": healthyStatus,
+		"deps":   `{"hidden":0,"items":[],"note":"defs.py depends on nothing in the index, but 4 inbound edge(s) point at it"}`,
+	})
+	result, err := noted.Deps(context.Background(), "defs.py")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Items) != 0 || !strings.Contains(result.Note, "4 inbound edge(s)") {
+		t.Fatalf("the inbound note was dropped: %+v", result)
+	}
+	if !result.Clean() {
+		t.Fatalf("a note is information, not a degradation: %+v", result)
+	}
+
+	partial := fake(t, map[string]string{
+		"status": healthyStatus,
+		"deps":   `{"hidden":0,"items":[],"walk_incomplete":"the analysis is partial"}`,
+	})
+	result, err = partial.Deps(context.Background(), "defs.py")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Clean() || len(result.Degraded) != 1 || !strings.Contains(result.Degraded[0], "the analysis is partial") {
+		t.Fatalf("walk_incomplete must degrade the result: %+v", result)
+	}
+}
+
 func TestBuildAndManifest(t *testing.T) {
 	dir := t.TempDir()
 	mapPath := filepath.Join(dir, "repo_map.json")
