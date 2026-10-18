@@ -740,6 +740,25 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// current it would leave every unchanged JS/TS file without the spread,
 /// alias and member-write answers. The bump is what keeps such a row from
 /// being served at all.
+///
+/// v97 (Python heritage, lane/py-attack3-fixes): the constant is frozen by the
+/// owner and is NOT bumped here; the Swift lane's bump to "97" covers this
+/// change when the lanes are rebased together. Python extractor output changes:
+/// (1) heritage rows read a dotted base's segments from the attribute nodes (a
+/// comment or line continuation between segments no longer makes the base
+/// opaque); the self-reference skip drops only a base that is exactly the
+/// class's own bare name, so `class Model(models.Model)` records `Model`,
+/// `models` and `class b(a.b.C)` records `C`, `a`, `b`; a subscript whose index
+/// is a numeric literal, slice or arithmetic (`bases[0]`) is the opaque marker,
+/// not a base named `bases`. (2) `scope_locals` gains, under the file's own
+/// name, each Python module-scope name bound by a `for`/`with`/`except` target,
+/// a walrus, a `del`, or a `global` declaration in any function. (3) A
+/// `@staticmethod`/`@classmethod` decorator no longer makes a method a
+/// non-instance method when the name is rebound in the file or the attribute's
+/// object is not the `builtins` module, so a `self.x = A()` field in such a
+/// method is now recorded. (4) The `torch.autograd.Function` / `nn.Module`
+/// dispatch exemption is applied only when the base's root is imported from
+/// torch (or is not an import at all). A v96 row has none of these.
 pub const EXTRACTION_SCHEMA_VERSION: &str = "96";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

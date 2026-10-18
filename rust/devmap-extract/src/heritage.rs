@@ -58,7 +58,9 @@ fn python_base_expression(base: Node) -> Node {
     for _ in 0..64 {
         let inner = match current.kind() {
             "parenthesized_expression" => current.named_child(0),
-            "subscript" => current.child_by_field_name("value"),
+            "subscript" if python_subscript_is_parameterised(current) => {
+                current.child_by_field_name("value")
+            }
             _ => None,
         };
         match inner {
@@ -67,6 +69,46 @@ fn python_base_expression(base: Node) -> Node {
         }
     }
     current
+}
+
+/// Whether a subscript is a generic parameterisation (`Base[int]`,
+/// `Generic[T]`, `Mapping[str, list[int]]`) rather than an index into a runtime
+/// value (`bases[0]`, `bases[1:]`, `bases[-1]`). An index that is a numeric
+/// literal, a slice or arithmetic cannot be a type argument, so the value it
+/// subscripts is no class named by its spelling.
+fn python_subscript_is_parameterised(subscript: Node) -> bool {
+    let mut cursor = subscript.walk();
+    let mut indices = subscript.children_by_field_name("subscript", &mut cursor);
+    indices.all(|index| {
+        !matches!(
+            index.kind(),
+            "integer" | "float" | "slice" | "unary_operator" | "binary_operator"
+        )
+    })
+}
+
+/// The segments of a dotted Python name, member first and then the qualifier
+/// from the root down (`C`, `a`, `b` for `a.b.C`), read from the attribute
+/// nodes. A comment or line continuation between segments is no part of any of
+/// them, so nothing here reads a span's text. `None` unless the node is plain
+/// identifiers joined by attributes.
+fn python_dotted_segments(node: Node, source: &str) -> Option<Vec<String>> {
+    if !crate::treesitter::python_is_dotted_name(node) {
+        return None;
+    }
+    let mut outward_in = Vec::new();
+    let mut current = node;
+    while current.kind() == "attribute" {
+        outward_in.push(text(current.child_by_field_name("attribute")?, source).to_string());
+        current = current.child_by_field_name("object")?;
+    }
+    outward_in.push(text(current, source).to_string());
+    let member = outward_in.remove(0);
+    Some(
+        std::iter::once(member)
+            .chain(outward_in.into_iter().rev())
+            .collect(),
+    )
 }
 
 /// The names a Python base records: a dotted name as one name per segment,
@@ -79,19 +121,7 @@ fn python_base_expression(base: Node) -> Node {
 /// segment is the class and how the qualifier reads: `treesitter` keeps the
 /// emission order of Python heritage rows that share a span.
 fn python_base_names(clause: Node, source: &str) -> Vec<String> {
-    let segments: Vec<&str> = text(clause, source).split('.').map(str::trim).collect();
-    let plain = crate::treesitter::python_is_dotted_name(clause)
-        && segments.iter().all(|segment| {
-            !segment.is_empty() && segment.chars().all(|c| c.is_alphanumeric() || c == '_')
-        });
-    if let (true, Some((member, qualifier))) = (plain, segments.split_last()) {
-        std::iter::once(member)
-            .chain(qualifier)
-            .map(|segment| segment.to_string())
-            .collect()
-    } else {
-        vec![OPAQUE_BASE.to_string()]
-    }
+    python_dotted_segments(clause, source).unwrap_or_else(|| vec![OPAQUE_BASE.to_string()])
 }
 
 fn text<'a>(node: Node, source: &'a str) -> &'a str {
@@ -603,11 +633,14 @@ pub(crate) fn push_heritage_references(
             names_under(clause, source, &mut names);
             names
         };
+        // A type never extends itself, so a base that is exactly the declarer's
+        // own bare name is dropped. Python's one-segment base is the only
+        // shape that can be the bare name; a segment of a dotted base is one
+        // part of a different name (`class Model(models.Model)` extends
+        // `models.Model`) and is never dropped by comparison with the declarer.
+        let own_bare_name = lang == "python" && names.len() == 1;
         for name in names {
-            // A type never extends itself. Python's `argument_list` also
-            // carries `metaclass=…` keyword arguments, and a self-reference
-            // would make every such class its own supertype.
-            if name == declarer {
+            if (lang != "python" || own_bare_name) && name == declarer {
                 continue;
             }
             references.push(ExtractedReference {
