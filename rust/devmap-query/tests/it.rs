@@ -103,6 +103,10 @@ mod preview_containment;
 mod preview_unreadable_file;
 #[cfg(feature = "parse")]
 mod query_cancellation;
+#[cfg(feature = "parse")]
+mod refusal_cost_probe;
+#[cfg(feature = "parse")]
+mod refusal_freshness_attack;
 mod repository_git_config;
 #[cfg(feature = "parse")]
 mod retired_python_claims_have_kernel_tests;
