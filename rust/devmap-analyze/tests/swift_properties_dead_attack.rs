@@ -95,6 +95,47 @@ fn a_same_file_extension_read_of_a_private_property_is_a_use() {
 }
 
 #[test]
+fn an_explicit_self_read_is_a_use_when_another_type_has_a_property_of_that_name() {
+    // Two types spell `secret`; each is read only through `self.secret`.
+    let src = "struct S {\n    private var secret = 1\n    func a() -> Int { self.secret }\n}\nstruct T {\n    private var secret = 2\n    func b() -> Int { self.secret }\n}\nfunc use(_ s: S, _ t: T) -> Int { s.a() + t.b() }\n";
+    let r = reports(&[("Sources/M/S.swift", src)]);
+    assert!(
+        !reported(&r, "S.secret") && !reported(&r, "T.secret"),
+        "a `self.x` read was lost to a same-named property: {:?}",
+        r.iter().map(|x| (&x.symbol_name, x.confidence)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_member_read_as_the_right_operand_of_an_infix_operator_is_a_use() {
+    // Pre-existing receiver-text defect (`1 + self`), newly visible as a
+    // confident-tier dead finding on a live property.
+    for body in [
+        "    func a() -> Int { 1 + self.secret }",
+        "    func b(_ o: S) -> Int { 1 + o.secret }",
+        "    func c(_ o: S) -> Int { o.secret * 2 + o.secret }",
+    ] {
+        assert!(secret_is_live(body, ""), "reported dead: {body}");
+    }
+}
+
+#[test]
+fn a_bare_read_in_an_extension_computed_property_is_a_use() {
+    assert!(secret_is_live(
+        "",
+        "extension S { var viaExt: Int { secret * 2 } }\nfunc use(_ s: S) -> Int { s.viaExt }"
+    ));
+}
+
+#[test]
+fn a_self_read_in_an_extension_computed_property_is_a_use() {
+    assert!(secret_is_live(
+        "",
+        "extension S { var viaExt: Int { self.secret * 2 } }\nfunc use(_ s: S) -> Int { s.viaExt }"
+    ));
+}
+
+#[test]
 fn a_property_read_only_in_an_if_debug_block_is_a_use() {
     assert!(secret_is_live(
         "    func d() {\n#if DEBUG\n        print(secret)\n#endif\n    }",

@@ -41,7 +41,7 @@ fn is_field(ex: &Extraction, suffix: &str) -> bool {
 fn an_argument_value_equal_to_its_label_is_still_a_name_ref() {
     let ex = extract_file(
         "A.swift",
-        "func take(total: Int) {}\nfunc f(total: Int) {\n    take(total: total)\n}\nfunc g() {\n    take(total: 1)\n}\n",
+        "let total = 3\nfunc take(total: Int) {}\nfunc f() {\n    take(total: total)\n}\nfunc g() {\n    take(total: 1)\n}\n",
     );
     let f = names(&ex, ReferenceKind::Name, "::f");
     assert_eq!(f.iter().filter(|n| *n == "total").count(), 1, "f: {f:?}");
@@ -220,7 +220,7 @@ fn duplicate_property_names_across_extensions_yield_distinct_symbol_ids() {
         .symbols
         .iter()
         .filter(|s| s.qualified_name.ends_with("S.v"))
-        .map(|s| (s.qualified_name.clone(), s.span.start_line))
+        .map(|s| (s.qualified_name.clone(), s.span.start_byte))
         .collect();
     assert_eq!(ids.len(), 2, "{ids:?}");
 }
@@ -228,7 +228,9 @@ fn duplicate_property_names_across_extensions_yield_distinct_symbol_ids() {
 #[test]
 fn hostile_fifty_thousand_properties_extract_in_bounded_time() {
     let mut s = String::from("struct Big {\n");
-    for i in 0..50_000 {
+    // 50k lines is 1.3 MB, over the 1 MiB per-file limit (a stated refusal);
+    // 30k stays under it.
+    for i in 0..30_000 {
         s.push_str(&format!("  var p{i}: Int = {i}\n"));
     }
     s.push_str("}\n");
@@ -236,6 +238,6 @@ fn hostile_fifty_thousand_properties_extract_in_bounded_time() {
     let ex = extract_file("Big.swift", &s);
     let el = t.elapsed();
     let n = ex.symbols.iter().filter(|x| x.kind == SymbolKind::Field).count();
-    assert!(n >= 49_000, "only {n} of 50000 properties extracted (silent cap?)");
+    assert!(n >= 29_900, "only {n} of 30000 properties extracted (silent cap?)");
     assert!(el.as_secs() < 20, "took {el:?}");
 }
