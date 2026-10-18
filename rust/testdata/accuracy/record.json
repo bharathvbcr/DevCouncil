@@ -1696,7 +1696,7 @@
         "found": 2,
         "truly_dead": 2
       },
-      "devmap_commit": "6df13d241d4da42eb2777eb10f808459ec7b8b7f",
+      "devmap_commit": "f0d27cc9fdaa95d422e54ebcf6bd6f699ab87800",
       "expected_edge_rows": 51,
       "forbid_any_tier_rows": 2,
       "forbid_rows": 6,
@@ -1718,7 +1718,7 @@
         "found": 1,
         "truly_dead": 1
       },
-      "devmap_commit": "6df13d241d4da42eb2777eb10f808459ec7b8b7f",
+      "devmap_commit": "f0d27cc9fdaa95d422e54ebcf6bd6f699ab87800",
       "expected_edge_rows": 69,
       "forbid_any_tier_rows": 4,
       "forbid_rows": 11,
@@ -1740,7 +1740,7 @@
         "found": 90,
         "truly_dead": 90
       },
-      "devmap_commit": "6df13d241d4da42eb2777eb10f808459ec7b8b7f",
+      "devmap_commit": "f0d27cc9fdaa95d422e54ebcf6bd6f699ab87800",
       "expected_edge_rows": 75,
       "forbid_any_tier_rows": 22,
       "forbid_rows": 36,
@@ -1762,7 +1762,7 @@
         "found": 1,
         "truly_dead": 1
       },
-      "devmap_commit": "6df13d241d4da42eb2777eb10f808459ec7b8b7f",
+      "devmap_commit": "f0d27cc9fdaa95d422e54ebcf6bd6f699ab87800",
       "expected_edge_rows": 115,
       "forbid_any_tier_rows": 1,
       "forbid_rows": 8,
@@ -1780,24 +1780,24 @@
     "swift": {
       "dead": {
         "confident_false": 0,
-        "confident_rows": 1,
-        "found": 1,
-        "truly_dead": 1
+        "confident_rows": 2,
+        "found": 2,
+        "truly_dead": 2
       },
-      "devmap_commit": "6df13d241d4da42eb2777eb10f808459ec7b8b7f",
-      "expected_edge_rows": 106,
-      "forbid_any_tier_rows": 5,
-      "forbid_rows": 12,
-      "high_edges_correct": 97,
-      "high_edges_false": 2,
+      "devmap_commit": "f0d27cc9fdaa95d422e54ebcf6bd6f699ab87800",
+      "expected_edge_rows": 114,
+      "forbid_any_tier_rows": 9,
+      "forbid_rows": 16,
+      "high_edges_correct": 105,
+      "high_edges_false": 0,
       "honest_miss": {
         "absent": 9,
         "rate": 1.0,
         "recorded": 9
       },
-      "precision_at_0.9": 0.98,
-      "present": 97,
-      "recall": 0.915
+      "precision_at_0.9": 1.0,
+      "present": 105,
+      "recall": 0.921
     },
     "typescript": {
       "dead": {
@@ -1806,7 +1806,7 @@
         "found": 4,
         "truly_dead": 4
       },
-      "devmap_commit": "6df13d241d4da42eb2777eb10f808459ec7b8b7f",
+      "devmap_commit": "f0d27cc9fdaa95d422e54ebcf6bd6f699ab87800",
       "expected_edge_rows": 80,
       "forbid_any_tier_rows": 7,
       "forbid_rows": 9,
