@@ -96,6 +96,8 @@ mod python_edge_dump_attack5;
 #[cfg(feature = "parse")]
 mod python_heritage_residue;
 #[cfg(feature = "parse")]
+mod python_residue_attack;
+#[cfg(feature = "parse")]
 mod python_import_module_literal;
 #[cfg(feature = "parse")]
 mod python_module_constants;
