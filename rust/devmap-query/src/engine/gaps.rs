@@ -243,7 +243,18 @@ pub(super) enum RadiusSide {
 const OUTSIDE_INDEX_SAMPLE: usize = 5;
 
 /// Most indexed files whose charged ranges one missed lookup reads from disk.
-const MAX_CHARGED_FILES_READ: usize = 64;
+///
+/// The cost of a miss is this many hardened reads: `safe_fs::read_repo_source`
+/// walks every path component without following links, about 100 µs a file.
+/// Release min-of-5 on `search_partial_attack::p5_timing_miss_on_2000_partial_files`
+/// (2,000 partial files, unscoped): base miss about 0.39 ms; cap 64 about
+/// 6.2 ms (16x); cap 16 about 1.93 ms (about 5x). The 3x target was missed and
+/// the cap lowered rather than the target relaxed, per Fable's ruling of
+/// 2026-10-18 (option b). Files past the cap are counted and reported as "could
+/// not be checked", so correctness does not depend on the number. A
+/// cross-query cache of read windows was rejected: global state to speed a cold
+/// path.
+const MAX_CHARGED_FILES_READ: usize = 16;
 
 /// Most charged ranges (or unchecked files) one answer spells out.
 const CHARGED_RANGE_SAMPLE: usize = 5;
