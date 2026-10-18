@@ -198,3 +198,7 @@ required-features = ["parse"]
 [[test]]
 name = "swift_receiver_collapse_attack"
 required-features = ["parse"]
+
+[[test]]
+name = "python_heritage_attack3"
+required-features = ["parse"]
