@@ -69,6 +69,8 @@ mod edge_index_under_writes;
 #[cfg(feature = "parse")]
 mod every_emitted_field_says_whether_it_ran;
 #[cfg(feature = "parse")]
+mod every_store_answer_leaves_with_the_stores_verdict;
+#[cfg(feature = "parse")]
 mod explore_and_affected;
 #[cfg(feature = "parse")]
 mod file_liveness_characterization;

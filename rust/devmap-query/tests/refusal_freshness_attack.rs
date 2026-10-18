@@ -50,12 +50,12 @@ fn git(root: &Path, args: &[&str]) {
     assert!(status.success(), "git {args:?}");
 }
 
-struct Fixture {
-    root: PathBuf,
-    store: Store,
+pub(crate) struct Fixture {
+    pub(crate) root: PathBuf,
+    pub(crate) store: Store,
 }
 
-fn fixture(label: &str, db: Option<&Path>) -> Fixture {
+pub(crate) fn fixture(label: &str, db: Option<&Path>) -> Fixture {
     let root = tmp_dir(label);
     git(&root, &["init", "-q"]);
     git(&root, &["config", "user.email", "a@example.invalid"]);
@@ -117,12 +117,12 @@ fn s(values: &[&str]) -> Vec<String> {
 }
 
 /// One observed `source_freshness`, named by the call and the arm that made it.
-type Seen = Vec<(String, SourceFreshness)>;
+pub(crate) type Seen = Vec<(String, SourceFreshness)>;
 
 /// Drive every `StoreQueryEngine` method that yields a `Response`, on a success
 /// path and on every refusal path reachable from outside, and record every
 /// freshness each one carries (including nested halves).
-fn sweep(engine: &StoreQueryEngine) -> (Seen, Vec<String>) {
+pub(crate) fn sweep(engine: &StoreQueryEngine) -> (Seen, Vec<String>) {
     let mut seen: Seen = Vec::new();
     let mut errored: Vec<String> = Vec::new();
     macro_rules! rec {
@@ -269,7 +269,7 @@ fn sweep(engine: &StoreQueryEngine) -> (Seen, Vec<String>) {
     (seen, errored)
 }
 
-fn expected(store: &Store) -> SourceFreshness {
+pub(crate) fn expected(store: &Store) -> SourceFreshness {
     SourceFreshness::from_store(store.query_source_freshness())
 }
 

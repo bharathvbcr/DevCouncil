@@ -4,7 +4,6 @@ use crate::model::{
     SourceFreshness,
 };
 use devmap_extract::model::Span;
-use devmap_store::Store;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Divide one caller-supplied budget across `explore`'s four parts.
@@ -138,11 +137,6 @@ pub(super) fn unavailable_response<T>(resolution: ResolutionAvailability) -> Res
         note: None,
         scope: None,
     }
-}
-
-pub(super) fn attach_source_freshness<T>(store: &Store, mut response: Response<T>) -> Response<T> {
-    response.source_freshness = SourceFreshness::from_store(store.query_source_freshness());
-    response
 }
 
 pub(crate) fn byte_span_to_line_range(source: &str, span: &Span) -> (u32, u32) {
