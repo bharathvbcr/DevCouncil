@@ -72,6 +72,7 @@ mod paths_answers_without_opening_a_store;
 mod phase1_status_doctor_mcp;
 mod record_names_no_private_identity;
 mod redirected_stdout_has_no_terminal_control_bytes;
+mod refusal_freshness_parity_attack;
 mod repo_scope_hardening;
 mod secret_paths_stay_out_of_answers_and_artifacts;
 mod small_native_stack;
