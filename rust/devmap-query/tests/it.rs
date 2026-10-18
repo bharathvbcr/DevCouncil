@@ -109,6 +109,8 @@ mod query_cancellation;
 mod refusal_cost_probe;
 #[cfg(feature = "parse")]
 mod refusal_freshness_attack;
+#[cfg(feature = "parse")]
+mod attack2_exit_close;
 mod repository_git_config;
 #[cfg(feature = "parse")]
 mod retired_python_claims_have_kernel_tests;
