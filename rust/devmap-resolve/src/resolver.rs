@@ -410,6 +410,11 @@ pub struct Resolver {
     /// name to. A name bound to more than one thing is not a name the file
     /// can be read as meaning one module at a class statement.
     python_import_binds: BTreeMap<String, BTreeMap<String, BTreeSet<PythonImportBind>>>,
+    /// `(file, class name)` -> what each class of that name is written inside:
+    /// `(enclosing identity, whether it is a callable)`. Read from the symbols'
+    /// spans, because a class in a function and a class in a same-named class
+    /// share one identity.
+    python_class_enclosers: BTreeMap<(String, String), Vec<(String, bool)>>,
     /// Reverse of [`Self::supertypes`]: `(family, type name)` → indexed subtypes.
     ///
     /// Built from the same heritage rows. X42's virtual-`self` guard walks this
@@ -718,6 +723,7 @@ impl Resolver {
             supertypes: BTreeMap::new(),
             python_bases: BTreeMap::new(),
             python_import_binds: BTreeMap::new(),
+            python_class_enclosers: BTreeMap::new(),
             subtypes: BTreeMap::new(),
             import_bindings: BTreeMap::new(),
             value_imports: BTreeMap::new(),
@@ -3171,6 +3177,7 @@ impl Resolver {
         self.supertypes.clear();
         self.python_bases.clear();
         self.python_import_binds.clear();
+        self.python_class_enclosers.clear();
         self.subtypes.clear();
         self.import_bindings.clear();
         self.value_imports.clear();
@@ -4196,6 +4203,12 @@ impl Resolver {
                 if !binds.is_empty() {
                     self.python_import_binds
                         .insert(ext.file_path.clone(), binds);
+                }
+                for (key, encloser) in pytypes::python_class_enclosers(ext) {
+                    self.python_class_enclosers
+                        .entry(key)
+                        .or_default()
+                        .push(encloser);
                 }
             }
             // X42. The supertype table, read from the heritage references the
@@ -8315,6 +8328,19 @@ impl Resolver {
         }
         let (target_file, target_symbol, receiver_type) =
             self.supertype_method(family, vec![enclosing.clone()], method)?;
+        // The breadth-first walk has no unknown or ambiguous bases and no
+        // order. For Python the class's own MRO walk can veto its answer: an
+        // opaque or ambiguous base ahead of the declaring class, or a different
+        // class first in the MRO, means the edge would be a guess. It never
+        // adds an answer (a diamond the walk refuses stays refused).
+        if family == LangFamily::Python {
+            match self.python_mro_method(file, &enclosing, method) {
+                pytypes::MroAnswer::Found(found)
+                    if found.file == target_file && found.symbol == target_symbol => {}
+                pytypes::MroAnswer::NotScoped => {}
+                _ => return None,
+            }
+        }
         Some(self.implicit_receiver_unique(
             family,
             &enclosing,

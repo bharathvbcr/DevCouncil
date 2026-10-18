@@ -766,6 +766,35 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// has no property symbol and still records the old spellings, so serving it
 /// would leave every unchanged Swift file with no property for a read to bind
 /// to.
+///
+/// v97 also changes Python extractor output (Python heritage, scope-local and
+/// decorator work), which the same bump covers:
+/// (1) heritage rows read a dotted base's segments from the attribute nodes (a
+/// comment, line continuation or parenthesis between segments no longer makes
+/// the base opaque: `(a).b.C`); the self-reference skip drops only a base that
+/// is exactly the class's own bare name, so `class Model(models.Model)` records
+/// `Model`, `models` and `class b(a.b.C)` records `C`, `a`, `b`; a subscript
+/// with ONE index that is a numeric literal, slice or arithmetic (`bases[0]`)
+/// is the opaque marker, not a base named `bases`, while a parameter list
+/// (`Array[float, 3]`) is the base named by its value. (2) `scope_locals` gains,
+/// under the file's own name, each Python module-scope name bound by a
+/// `for`/`with`/`except`/`except*` target, a walrus, a `del` (parenthesised,
+/// tuple or list targets too), a `match` capture pattern, or a function's
+/// `global` declaration PLUS a binding of that name in the same function (a
+/// bare `global A` binds nothing); and, under `{file}::__all__`, the names a
+/// literal `__all__` lists. (3) A `@staticmethod`/`@classmethod` decorator is
+/// the builtin only when the bare name is not bound textually before the
+/// decorator at module scope (a `from builtins import staticmethod [as sm]` is
+/// the builtin and is no rebinding), or its attribute's object is the
+/// `builtins` module (literal, a module-scope `import builtins as X` neither
+/// rebound before the decorator, or `__import__('builtins')`); a function-scope
+/// import or binding is another scope. A `self.x = A()` field in a method the
+/// old classifier called static is now recorded. (4) The `torch.autograd.
+/// Function` / `nn.Module` dispatch exemption reads the base through the
+/// module-scope imports (`from torch import nn as N`, `from torch.autograd
+/// import Function` are now matched) and applies only when each import of the
+/// root names `torch`; a root no import binds is read as written. A v96 row has
+/// none of these.
 pub const EXTRACTION_SCHEMA_VERSION: &str = "97";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

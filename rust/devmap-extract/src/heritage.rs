@@ -73,18 +73,56 @@ fn python_base_expression(base: Node) -> Node {
 
 /// Whether a subscript is a generic parameterisation (`Base[int]`,
 /// `Generic[T]`, `Mapping[str, list[int]]`) rather than an index into a runtime
-/// value (`bases[0]`, `bases[1:]`, `bases[-1]`). An index that is a numeric
+/// value (`bases[0]`, `bases[1:]`, `bases[-1]`). A lone index that is a numeric
 /// literal, a slice or arithmetic cannot be a type argument, so the value it
-/// subscripts is no class named by its spelling.
+/// subscripts is no class named by its spelling. More than one index is a
+/// parameter list (`Array[float, 3]`, `Annotated[int, 3]`): an index
+/// expression takes exactly one.
 fn python_subscript_is_parameterised(subscript: Node) -> bool {
     let mut cursor = subscript.walk();
-    let mut indices = subscript.children_by_field_name("subscript", &mut cursor);
-    indices.all(|index| {
-        !matches!(
-            index.kind(),
+    let indices: Vec<Node> = subscript
+        .children_by_field_name("subscript", &mut cursor)
+        .collect();
+    match indices.as_slice() {
+        [only] => !matches!(
+            only.kind(),
             "integer" | "float" | "slice" | "unary_operator" | "binary_operator"
-        )
-    })
+        ),
+        _ => true,
+    }
+}
+
+/// `name`, `a.b.c` or either with parentheses around any part (`(a).b`,
+/// `((a.b)).C`), made of plain identifiers.
+fn python_is_dotted_base(node: Node) -> bool {
+    // Iterative: a base nested a thousand parentheses or attributes deep must
+    // not be able to exhaust the native stack.
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "identifier" => return true,
+            "parenthesized_expression" => {
+                let mut cursor = current.walk();
+                let mut inner = current
+                    .named_children(&mut cursor)
+                    .filter(|child| child.kind() != "comment");
+                match (inner.next(), inner.next()) {
+                    (Some(only), None) => current = only,
+                    _ => return false,
+                }
+            }
+            "attribute" => {
+                let named = current
+                    .child_by_field_name("attribute")
+                    .is_some_and(|attribute| attribute.kind() == "identifier");
+                match current.child_by_field_name("object") {
+                    Some(object) if named => current = object,
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        }
+    }
 }
 
 /// The segments of a dotted Python name, member first and then the qualifier
@@ -93,14 +131,27 @@ fn python_subscript_is_parameterised(subscript: Node) -> bool {
 /// them, so nothing here reads a span's text. `None` unless the node is plain
 /// identifiers joined by attributes.
 fn python_dotted_segments(node: Node, source: &str) -> Option<Vec<String>> {
-    if !crate::treesitter::python_is_dotted_name(node) {
+    if !python_is_dotted_base(node) {
         return None;
     }
     let mut outward_in = Vec::new();
     let mut current = node;
-    while current.kind() == "attribute" {
-        outward_in.push(text(current.child_by_field_name("attribute")?, source).to_string());
-        current = current.child_by_field_name("object")?;
+    loop {
+        match current.kind() {
+            "attribute" => {
+                outward_in
+                    .push(text(current.child_by_field_name("attribute")?, source).to_string());
+                current = current.child_by_field_name("object")?;
+            }
+            "parenthesized_expression" => {
+                let mut cursor = current.walk();
+                let inner = current
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() != "comment")?;
+                current = inner;
+            }
+            _ => break,
+        }
     }
     outward_in.push(text(current, source).to_string());
     let member = outward_in.remove(0);

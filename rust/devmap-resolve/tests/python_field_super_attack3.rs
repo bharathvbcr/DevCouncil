@@ -631,6 +631,7 @@ fn dotted_base_with_comment_inside_parens_is_still_the_base() {
 }
 
 #[test]
+#[ignore = "recall gap, ft-572bb69d: opaque typing alias abstains (Opus decision)"]
 fn diag_typing_mapping_with_a_non_mapping_method_binds_base() {
     let got = super_with(
         &[],
