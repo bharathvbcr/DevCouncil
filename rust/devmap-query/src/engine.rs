@@ -266,9 +266,10 @@ impl<'a> StoreQueryEngine<'a> {
             devmap_analyze::combine_reasons(coverage_gap, empty_result_gap(total, &req.query)),
         );
         if total == 0 {
-            if let Some(reason) =
-                self.outside_index_reason(filter.map_or(&[][..], |filter| filter.paths()))?
-            {
+            if let Some(reason) = self.outside_index_reason(
+                filter.map_or(&[][..], |filter| filter.paths()),
+                &req.query,
+            )? {
                 response.resolution = ResolutionAvailability::Unavailable { reason };
             }
         }
@@ -1708,9 +1709,10 @@ impl<'a> StoreQueryEngine<'a> {
         // No definition, over a generation with holes in it: the name may be
         // declared where nothing was indexed. See `outside_index_reason`.
         if total == 0 {
-            if let Some(reason) =
-                self.outside_index_reason(filter.map_or(&[][..], |filter| filter.paths()))?
-            {
+            if let Some(reason) = self.outside_index_reason(
+                filter.map_or(&[][..], |filter| filter.paths()),
+                query,
+            )? {
                 return Ok(ExploreReport {
                     scope,
                     ..empty(reason)

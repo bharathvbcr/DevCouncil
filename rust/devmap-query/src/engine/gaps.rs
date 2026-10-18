@@ -5,6 +5,7 @@ use devmap_extract::model::ParseOutcome;
 use devmap_resolve::model::{LangFamily, UnresolvedReference};
 use devmap_store::StoredSymbol;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 /// Why one file's edge list is a lower bound, or `None` when it is not.
 ///
@@ -241,6 +242,207 @@ pub(super) enum RadiusSide {
 /// Most never-indexed paths an "outside index" answer names.
 const OUTSIDE_INDEX_SAMPLE: usize = 5;
 
+/// Most indexed files whose charged ranges one missed lookup reads from disk.
+const MAX_CHARGED_FILES_READ: usize = 64;
+
+/// Most charged ranges (or undecidable holes) one answer spells out.
+const CHARGED_RANGE_SAMPLE: usize = 5;
+
+/// Whether `path` lies under one of the caller's path prefixes, or the caller
+/// gave none. The one scope test for every hole this module names.
+fn path_in_scope(path: &str, scope_paths: &[String]) -> bool {
+    scope_paths.is_empty()
+        || scope_paths.iter().any(|prefix| {
+            let prefix = prefix.trim_end_matches('/');
+            path == prefix || path.starts_with(&format!("{prefix}/"))
+        })
+}
+
+/// One charged region whose text holds the looked-up name.
+#[derive(Debug)]
+struct ChargedMatch {
+    path: String,
+    first_line: usize,
+    last_line: usize,
+    start: usize,
+    end: usize,
+    /// False when every occurrence sits on a line that looks like a comment or
+    /// holds an unbalanced quote.
+    in_code: bool,
+}
+
+#[derive(Debug, Default)]
+struct ChargedHoles {
+    matches: Vec<ChargedMatch>,
+    /// Holes in scope the check could not read or decide, worded for a reader.
+    unverified: Vec<String>,
+    /// The caller narrowed to paths, so an undecidable hole in them is the
+    /// answer rather than background.
+    scoped: bool,
+}
+
+impl ChargedHoles {
+    /// The sentence for this check, or `None` when there is nothing a reader
+    /// should be told. An undecidable hole earns a sentence only when the
+    /// caller scoped to it or a match already makes one.
+    fn note(&self, query: &str) -> Option<String> {
+        let say_unverified =
+            !self.unverified.is_empty() && (self.scoped || !self.matches.is_empty());
+        if self.matches.is_empty() && !say_unverified {
+            return None;
+        }
+        let listed = |items: Vec<String>| {
+            let more = items.len().saturating_sub(CHARGED_RANGE_SAMPLE);
+            let mut text = items
+                .into_iter()
+                .take(CHARGED_RANGE_SAMPLE)
+                .collect::<Vec<_>>()
+                .join("; ");
+            if more > 0 {
+                text.push_str(&format!("; and {more} more"));
+            }
+            text
+        };
+        let mut parts = Vec::new();
+        if !self.matches.is_empty() {
+            let rows = self
+                .matches
+                .iter()
+                .map(|m| {
+                    format!(
+                        "{} lines {}-{} (bytes {}..{}{})",
+                        m.path,
+                        m.first_line,
+                        m.last_line,
+                        m.start,
+                        m.end,
+                        if m.in_code {
+                            ""
+                        } else {
+                            "; the name appears only on lines that look like a comment or a \
+                             string, so this may not be a declaration"
+                        }
+                    )
+                })
+                .collect();
+            parts.push(format!(
+                "no indexed symbol matches `{query}`, but {} charged partial-parse range(s) of \
+                 indexed files contain that name and may declare it — the parser lost these \
+                 regions, so declarations inside them are absent from the index: {}",
+                self.matches.len(),
+                listed(rows)
+            ));
+        }
+        if say_unverified {
+            parts.push(format!(
+                "{} charged partial-parse hole(s) in scope could not be checked for this name: {}",
+                self.unverified.len(),
+                listed(self.unverified.clone())
+            ));
+        }
+        Some(parts.join("; "))
+    }
+}
+
+/// The identifier a lookup names, or `None` when the query is not one: several
+/// words describe a symbol rather than name it, and a path names a file.
+fn single_name(query: &str) -> Option<&str> {
+    let query = query.trim();
+    if query.is_empty() || query.contains(char::is_whitespace) || query.contains('/') {
+        return None;
+    }
+    let name = query.rsplit("::").next().unwrap_or(query);
+    let name = name.rsplit('.').next().unwrap_or(name);
+    (!name.is_empty()).then_some(name)
+}
+
+fn is_ident(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Whether `window` holds `name` as a whole identifier, ignoring case: `None`
+/// for no, `Some(true)` when some occurrence is on a line that does not look
+/// like a comment or a string, `Some(false)` when every occurrence does.
+fn name_occurrence(window: &str, name: &str) -> Option<bool> {
+    let wanted: Vec<char> = name.chars().flat_map(char::to_lowercase).collect();
+    let mut seen = false;
+    let mut prev: Option<char> = None;
+    for (index, c) in window.char_indices() {
+        let boundary_before = prev.is_none_or(|p| !is_ident(p));
+        prev = Some(c);
+        if !boundary_before {
+            continue;
+        }
+        let mut pending = wanted.iter();
+        let mut tail = window[index..].chars();
+        let mut matched = true;
+        let mut left = wanted.len();
+        while left > 0 && matched {
+            let Some(next) = tail.next() else {
+                matched = false;
+                break;
+            };
+            for lowered in next.to_lowercase() {
+                matched &= pending.next() == Some(&lowered);
+                left = left.saturating_sub(1);
+            }
+        }
+        if !matched || tail.next().is_some_and(is_ident) {
+            continue;
+        }
+        seen = true;
+        let line_start = window[..index].rfind('\n').map_or(0, |at| at + 1);
+        if !looks_like_comment_or_string(&window[line_start..index]) {
+            return Some(true);
+        }
+    }
+    seen.then_some(false)
+}
+
+/// Whether the text before an occurrence, on its own line, puts it inside a
+/// comment or a string literal. A heuristic, which is why it only changes the
+/// wording of a "may declare" and never removes the claim.
+fn looks_like_comment_or_string(before: &str) -> bool {
+    let trimmed = before.trim_start();
+    ["//", "#", "--", "*", "/*", ";"]
+        .iter()
+        .any(|marker| trimmed.starts_with(marker))
+        || before.contains("//")
+        || before.matches('"').count() % 2 == 1
+}
+
+/// The charged byte ranges the stored partial-parse sentence names, and how
+/// many it elided with "and N more". Reads only the `; charged: ` clause:
+/// `would be charged` (a file the charge exempts) and `not charged` (regions
+/// judged harmless) are other clauses and name nothing this lookup may blame.
+fn parse_charged_ranges(reason: &str) -> (Vec<(usize, usize)>, usize) {
+    const CLAUSE: &str = "; charged: ";
+    const LIST_OPEN: &str = "region(s) outside every surviving declaration (";
+    let Some(at) = reason.find(CLAUSE) else {
+        return (Vec::new(), 0);
+    };
+    let clause = &reason[at + CLAUSE.len()..];
+    let Some(open) = clause.find(LIST_OPEN) else {
+        return (Vec::new(), 0);
+    };
+    let list = clause[open + LIST_OPEN.len()..]
+        .split(')')
+        .next()
+        .unwrap_or("");
+    let mut ranges = Vec::new();
+    let mut elided = 0usize;
+    for item in list.split(", ") {
+        if let Some((start, end)) = item.split_once("..") {
+            if let (Ok(start), Ok(end)) = (start.trim().parse(), end.trim().parse()) {
+                ranges.push((start, end));
+            }
+        } else if let Some(count) = item.trim().strip_prefix("and ") {
+            elided = count.trim_end_matches(" more").trim().parse().unwrap_or(0);
+        }
+    }
+    (ranges, elided)
+}
+
 impl StoreQueryEngine<'_> {
     /// Why a name lookup that matched nothing cannot answer "no such symbol":
     /// the paths this generation never indexed, or `None` when it indexed
@@ -258,42 +460,159 @@ impl StoreQueryEngine<'_> {
     /// `scope_paths`, when given, narrows the holes to those under the
     /// caller's path prefixes: a lookup scoped to `src/` is not made
     /// unavailable by a refusal under `vendor/`.
+    ///
+    /// A hole is also a *charged partial-parse range of an indexed file*: the
+    /// file has rows, but the parser lost a region and a declaration inside it
+    /// has none. Those are checked first ([`Self::charged_hole_check`]) and
+    /// named by file and line, because a range whose text holds the name is
+    /// evidence and a never-read path is only absence of it; the latter is then
+    /// listed as "also unread". A lookup scoped to a file with such a hole it
+    /// cannot rule out is unavailable too, not an empty `Available`.
     pub(super) fn outside_index_reason(
         &self,
         scope_paths: &[String],
+        query: &str,
     ) -> anyhow::Result<Option<String>> {
         let inventory = self.store.latest_discovery_inventory()?;
-        let in_scope = |path: &str| {
-            scope_paths.is_empty()
-                || scope_paths.iter().any(|prefix| {
-                    let prefix = prefix.trim_end_matches('/');
-                    path == prefix || path.starts_with(&format!("{prefix}/"))
-                })
-        };
         let holes: Vec<&str> = inventory
             .refusals
             .iter()
             .chain(inventory.over_limit.iter())
             .map(|row| row.path.as_str())
-            .filter(|path| in_scope(path))
+            .filter(|path| path_in_scope(path, scope_paths))
             .collect();
-        if holes.is_empty() {
-            return Ok(None);
-        }
-        let shown: Vec<&str> = holes.iter().take(OUTSIDE_INDEX_SAMPLE).copied().collect();
-        let more = holes.len() - shown.len();
-        Ok(Some(format!(
-            "outside index: no indexed symbol matches, and {} path(s) this generation never \
-             indexed — refused by discovery or over the source size limit — may declare it: \
-             {}{}",
-            holes.len(),
-            shown.join(", "),
-            if more > 0 {
-                format!(", and {more} more")
-            } else {
-                String::new()
+        let unread = |label: &str| {
+            let shown: Vec<&str> = holes.iter().take(OUTSIDE_INDEX_SAMPLE).copied().collect();
+            let more = holes.len() - shown.len();
+            format!(
+                "{} path(s) this generation never indexed — refused by discovery or over the \
+                 source size limit — {label}: {}{}",
+                holes.len(),
+                shown.join(", "),
+                if more > 0 {
+                    format!(", and {more} more")
+                } else {
+                    String::new()
+                }
+            )
+        };
+        let charged = self.charged_hole_check(scope_paths, query)?.note(query);
+        Ok(match (charged, holes.is_empty()) {
+            (None, true) => None,
+            (None, false) => Some(format!(
+                "outside index: no indexed symbol matches, and {}",
+                unread("may declare it")
+            )),
+            (Some(note), true) => Some(format!("outside index: {note}")),
+            (Some(note), false) => Some(format!(
+                "outside index: {note}; also unread, with nothing showing they declare it: {}",
+                unread("not read at all")
+            )),
+        })
+    }
+
+    /// The charged partial-parse regions of indexed files in `scope_paths`
+    /// whose text holds `query` as a whole identifier.
+    ///
+    /// The store keeps each partial file's charged byte ranges inside the
+    /// sentence `status` prints (`coverage_gaps.partial_parse`), and
+    /// [`parse_charged_ranges`] reads them back out of it; the round trip is
+    /// pinned against the producer in this module's tests. The declaration test
+    /// is a byte-range read of the file as it is now plus an identifier-
+    /// boundary match, case-insensitive as search is. A declaration contains
+    /// its own name, so a range without the name cannot be hiding it, and a
+    /// range with it only might: the answer says "may", louder when every
+    /// occurrence sits on a line that looks like a comment or a string.
+    ///
+    /// What it cannot decide is carried, not dropped: a file it cannot read, a
+    /// file past [`MAX_CHARGED_FILES_READ`], and ranges the stored sentence
+    /// elided ("and N more") are `unverified`.
+    fn charged_hole_check(
+        &self,
+        scope_paths: &[String],
+        query: &str,
+    ) -> anyhow::Result<ChargedHoles> {
+        let mut found = ChargedHoles {
+            scoped: !scope_paths.is_empty(),
+            ..ChargedHoles::default()
+        };
+        let Some(name) = single_name(query) else {
+            return Ok(found);
+        };
+        let rows = self.store.latest_partial_parse_gaps()?;
+        let root = self.store.latest_generation_repo_root()?;
+        let mut files_read = 0usize;
+        for row in rows
+            .iter()
+            .filter(|row| path_in_scope(&row.path, scope_paths))
+        {
+            self.cancel.check()?;
+            let (ranges, elided) = parse_charged_ranges(&row.reason);
+            if elided > 0 {
+                found.unverified.push(format!(
+                    "{} ({elided} charged range(s) not listed in the stored reason)",
+                    row.path
+                ));
             }
-        )))
+            if ranges.is_empty() {
+                continue;
+            }
+            if files_read >= MAX_CHARGED_FILES_READ {
+                found.unverified.push(format!(
+                    "{} (past the {MAX_CHARGED_FILES_READ}-file read cap)",
+                    row.path
+                ));
+                continue;
+            }
+            files_read += 1;
+            let source = match devmap_extract::safe_fs::read_repo_source(
+                root.as_deref().map(Path::new),
+                &row.path,
+                devmap_extract::MAX_SOURCE_BYTES,
+            ) {
+                Ok(source) => source,
+                Err(error) => {
+                    found
+                        .unverified
+                        .push(format!("{} (unreadable now: {error})", row.path));
+                    continue;
+                }
+            };
+            let line_of = |byte: usize| {
+                1 + source.as_bytes()[..byte.min(source.len())]
+                    .iter()
+                    .filter(|b| **b == b'\n')
+                    .count()
+            };
+            for (start, end) in ranges {
+                let Some(window) = source.get(start..end.min(source.len())) else {
+                    found.unverified.push(format!(
+                        "{} (bytes {start}..{end} are not a text range of the file as it is now)",
+                        row.path
+                    ));
+                    continue;
+                };
+                let Some(in_code) = name_occurrence(window, name) else {
+                    continue;
+                };
+                found.matches.push(ChargedMatch {
+                    path: row.path.clone(),
+                    first_line: line_of(start),
+                    last_line: line_of(end.saturating_sub(1).max(start)),
+                    start,
+                    end,
+                    in_code,
+                });
+            }
+        }
+        // Code occurrences first: they are the stronger claim.
+        found.matches.sort_by(|a, b| {
+            b.in_code
+                .cmp(&a.in_code)
+                .then_with(|| a.path.cmp(&b.path))
+                .then_with(|| a.start.cmp(&b.start))
+        });
+        Ok(found)
     }
 
     /// Whether calls the resolver could not bind touch *this* answer.
@@ -832,5 +1151,81 @@ mod radius_note_tests {
             "{note}"
         );
         assert!(!note.contains("indexed root"), "{note}");
+    }
+}
+
+#[cfg(test)]
+mod charged_range_tests {
+    use super::*;
+    use devmap_extract::model::{ParseOutcome, TextRange};
+
+    fn producer_reason(regions: &[(usize, usize)]) -> String {
+        let mut ext = devmap_extract::extract_file("src/a.py", "def x(): pass\n");
+        ext.parse_outcome = ParseOutcome::Partial {
+            error_ranges: regions
+                .iter()
+                .map(|&(start_byte, end_byte)| TextRange {
+                    start_byte,
+                    end_byte,
+                })
+                .collect(),
+            nameless_ranges: Vec::new(),
+        };
+        devmap_analyze::extraction_gaps(&[ext])
+            .into_iter()
+            .find(|entry| entry.gap == devmap_analyze::ExtractionGap::PartialParse)
+            .expect("a partial file is listed")
+            .reason
+    }
+
+    /// The parser reads the producer's own sentence, so a rewording of it
+    /// fails here instead of silently emptying every charged-hole answer.
+    #[test]
+    fn the_charged_clause_round_trips_through_the_producer() {
+        // `def x(): pass` is 0..13: 4..8 is inside it (exempt), the rest is charged.
+        let reason = producer_reason(&[(4, 8), (20, 30), (40, 55)]);
+        assert_eq!(parse_charged_ranges(&reason), (vec![(20, 30), (40, 55)], 0));
+    }
+
+    #[test]
+    fn an_elided_tail_is_counted_not_dropped() {
+        let regions: Vec<(usize, usize)> = (0..11).map(|n| (20 + n * 10, 25 + n * 10)).collect();
+        let (listed, elided) = parse_charged_ranges(&producer_reason(&regions));
+        assert_eq!((listed.len(), elided), (8, 3));
+    }
+
+    #[test]
+    fn exempt_regions_name_nothing_to_blame() {
+        // Only an inside-a-declaration region: "not charged: ...", no clause.
+        assert_eq!(
+            parse_charged_ranges(&producer_reason(&[(4, 8)])),
+            (Vec::new(), 0)
+        );
+    }
+
+    #[test]
+    fn a_name_matches_whole_identifiers_only_and_ignores_case() {
+        assert_eq!(name_occurrence("let FOO_BAR = 1;", "foo_bar"), Some(true));
+        assert_eq!(name_occurrence("let FOO_BARS = 1;", "foo_bar"), None);
+        assert_eq!(name_occurrence("let XFOO_BAR = 1;", "foo_bar"), None);
+        assert_eq!(name_occurrence("// FOO_BAR", "FOO_BAR"), Some(false));
+        assert_eq!(
+            name_occurrence("let s = \"FOO_BAR\";", "FOO_BAR"),
+            Some(false)
+        );
+        assert_eq!(
+            name_occurrence("// FOO_BAR\nconst FOO_BAR: u8 = 1;", "FOO_BAR"),
+            Some(true),
+            "one code occurrence outweighs a comment one"
+        );
+        assert_eq!(name_occurrence("const ÜBER: u8 = 1;", "über"), Some(true));
+    }
+
+    #[test]
+    fn only_a_single_identifier_is_a_name() {
+        assert_eq!(single_name("a b"), None);
+        assert_eq!(single_name("src/a.rs"), None);
+        assert_eq!(single_name("mod::Thing"), Some("Thing"));
+        assert_eq!(single_name("  plain "), Some("plain"));
     }
 }

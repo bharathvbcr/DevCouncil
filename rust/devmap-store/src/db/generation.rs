@@ -1262,6 +1262,42 @@ generation {latest}; run `devmap status` to re-verify",
         Ok(inventory)
     }
 
+    /// Every partial-parse row of the latest generation, by path, uncapped.
+    ///
+    /// The same rows `status` lists under `coverage_gaps.partial_parse`, read
+    /// whole: `status` shows [`crate::COVERAGE_GAP_SAMPLE`] of them beside the
+    /// total, which is right for an inventory and wrong for a name lookup, where
+    /// the file holding the hole may be the fifty-first. Each reason is one
+    /// short sentence, so reading all of them is bounded by the file count.
+    pub fn latest_partial_parse_gaps(&self) -> Result<Vec<CoverageGapRow>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = snapshot.prepare(
+            "SELECT path, reason FROM generation_coverage_gaps
+             WHERE generation_id = ?1 AND gap = ?2
+             ORDER BY path ASC",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    generation,
+                    devmap_analyze::ExtractionGap::PartialParse.label()
+                ],
+                |row| {
+                    Ok(CoverageGapRow {
+                        path: row.get(0)?,
+                        reason: row.get(1)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>>>()?;
+        drop(stmt);
+        drop(snapshot);
+        Ok(rows)
+    }
+
     /// Whether the latest generation's edges carry the resolution the resolver
     /// recorded, or a reconstruction standing in for one it never stored.
     ///
