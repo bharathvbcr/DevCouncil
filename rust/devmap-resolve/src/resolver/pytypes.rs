@@ -20,6 +20,101 @@ pub(super) struct PythonMethod {
     pub(super) declaring_type: String,
 }
 
+/// Prefix of an [`MroNode::Opaque`] name that is a `typing`/`typing_extensions`/
+/// `abc` member the file's import named, spelled `module.Member`. Distinguishes
+/// it from an opaque base that merely *spells* `typing.X` without importing it.
+const STDLIB_OPAQUE: &str = "stdlib:";
+
+/// The public methods defined by the standard containers and ABCs that the
+/// `typing` module aliases (`List`, `Dict`, `Set`, `Tuple`, `Deque`,
+/// `DefaultDict`, `OrderedDict`, `Counter`, `ChainMap`, `Mapping` and the other
+/// `collections.abc` classes, `NamedTuple`, the generator/coroutine and IO
+/// protocols): the union, since a base the table cannot tell apart is asked
+/// "might any of them define this".
+const PYTHON_TYPING_ALIAS_METHODS: &[&str] = &[
+    // list, tuple, deque, sequences
+    "append",
+    "appendleft",
+    "clear",
+    "copy",
+    "count",
+    "extend",
+    "extendleft",
+    "index",
+    "insert",
+    "pop",
+    "popleft",
+    "remove",
+    "reverse",
+    "rotate",
+    "sort",
+    "maxlen",
+    // dict, mappings, OrderedDict, Counter, ChainMap
+    "fromkeys",
+    "get",
+    "items",
+    "keys",
+    "popitem",
+    "setdefault",
+    "update",
+    "values",
+    "move_to_end",
+    "most_common",
+    "elements",
+    "subtract",
+    "total",
+    "new_child",
+    "parents",
+    "maps",
+    // set, frozenset, sets
+    "add",
+    "difference",
+    "difference_update",
+    "discard",
+    "intersection",
+    "intersection_update",
+    "isdisjoint",
+    "issubset",
+    "issuperset",
+    "symmetric_difference",
+    "symmetric_difference_update",
+    "union",
+    // NamedTuple
+    "_asdict",
+    "_make",
+    "_replace",
+    "_fields",
+    "_field_defaults",
+    // generators, coroutines, awaitables
+    "send",
+    "throw",
+    "close",
+    "asend",
+    "athrow",
+    "aclose",
+    "cr_await",
+    // IO
+    "read",
+    "readline",
+    "readlines",
+    "write",
+    "writelines",
+    "seek",
+    "tell",
+    "flush",
+    "fileno",
+    "isatty",
+    "readable",
+    "seekable",
+    "writable",
+    "truncate",
+    "closed",
+    "name",
+    "mode",
+    "buffer",
+    "encoding",
+];
+
 /// A class in a Python MRO: one this corpus declares, or a base that is not
 /// in it (external, builtin, or an import that names no class here) and so may
 /// define any method.
@@ -41,13 +136,19 @@ pub(super) enum PythonImportBind {
     /// `from a import n [as m]`: the member spelled `a.n`, a submodule or a
     /// name the module declares.
     Member(String),
+    /// `from a import *` written after this name was imported: the star may
+    /// have rebound it, so the name is bound to more than one thing and no
+    /// reading of it is trusted. The payload is the star's module.
+    Star(String),
 }
 
 impl PythonImportBind {
     /// The dotted module path a member access on the bound name starts from.
     fn module_spec(&self) -> String {
         match self {
-            Self::Package(spec) | Self::Module(spec) | Self::Member(spec) => spec.clone(),
+            Self::Package(spec) | Self::Module(spec) | Self::Member(spec) | Self::Star(spec) => {
+                spec.clone()
+            }
         }
     }
 }
@@ -112,6 +213,12 @@ impl Resolver {
             [only] => return Some((file.to_string(), only.to_string())),
             [] => {}
             _ => return None,
+        }
+        // The file also declares the name as something that is not a class
+        // (`if TYPE_CHECKING: from a import Base` / `else: Base = object`): the
+        // name is two things, and neither reading is the class statement's.
+        if self.python_declares_at_file_level(file, written) {
+            return None;
         }
         let (target_file, target_symbol) = self.import_bindings.get(file)?.get(written)?;
         let (class_file, identity) = self.lookup_in_package(target_file, target_symbol)?;
@@ -246,6 +353,12 @@ impl Resolver {
     /// corpus declares that this file cannot bind to one declaration is
     /// [`MroStop::NotScoped`].
     fn python_mro_node(&self, file: &str, written: &str) -> Result<MroNode, MroStop> {
+        // A standard-library member the file's import names: one class whatever
+        // the spelling (`Counter`, `typing.Counter`, `t.Counter`), so it is one
+        // node, and one whose methods the standard library can answer.
+        if let Some(member) = self.python_stdlib_member(file, written) {
+            return Ok(MroNode::Opaque(format!("{STDLIB_OPAQUE}{member}")));
+        }
         if let Some((root, member)) = written.split_once('.') {
             let Some(binds) = self
                 .python_import_binds
@@ -352,14 +465,36 @@ impl Resolver {
             })
     }
 
-    /// Whether `written`, a base in `file`, is a typing marker with no methods
-    /// of its own that can precede a real base in the MRO: a name the file's
-    /// one import binds to the `typing`, `typing_extensions` or `abc` module
-    /// (`Generic`, `Protocol`, `ABC`, `NamedTuple`, `typing.Generic`). Decided
-    /// by the module the import names, never by the class name, and only when
-    /// that module is not one this corpus declares. Builtins such as `dict` are
-    /// not skipped: they define methods.
+    /// Whether `written`, a base in `file`, is a structural marker with no
+    /// methods of its own that can precede a real base in the MRO.
+    ///
+    /// Python's typing semantics fix exactly three such names: `Generic` and
+    /// `Protocol` (typing, typing_extensions) only parameterise or tag the
+    /// class, and `abc.ABC` only supplies the `ABCMeta` metaclass. Every other
+    /// name from those modules is a real class or an alias of one
+    /// (`typing.Counter` is `collections.Counter`, `typing.Mapping` is
+    /// `collections.abc.Mapping`, `abc.ABCMeta` is a metaclass), so it stays in
+    /// the MRO as an opaque base ([`Self::python_stdlib_member`]).
     fn python_base_is_structural(&self, file: &str, written: &str) -> bool {
+        self.python_stdlib_member(file, written)
+            .is_some_and(|member| {
+                matches!(
+                    member.as_str(),
+                    "typing.Generic"
+                        | "typing.Protocol"
+                        | "typing_extensions.Generic"
+                        | "typing_extensions.Protocol"
+                        | "abc.ABC"
+                )
+            })
+    }
+
+    /// The `module.Member` a base `written` in `file` names when the file's one
+    /// import binds it to a member of `typing`, `typing_extensions` or `abc`
+    /// (`Generic`, `typing.Generic`, `import typing as t; t.Generic`). Decided
+    /// by the module the import names, never by the class name, and only when
+    /// that module is not one this corpus declares.
+    fn python_stdlib_member(&self, file: &str, written: &str) -> Option<String> {
         let (root, member) = match written.split_once('.') {
             Some((root, member)) => (root, Some(member)),
             None => (written, None),
@@ -369,32 +504,45 @@ impl Resolver {
             .get(file)
             .and_then(|bound| bound.get(root))
         else {
-            return false;
+            return None;
         };
         let mut only = binds.iter();
         let (Some(bind), None) = (only.next(), only.next()) else {
-            return false;
+            return None;
         };
         if self.python_declares_at_file_level(file, root) {
-            return false;
+            return None;
         }
-        let module = match (bind, member) {
-            // `from typing import Generic`: the module is what precedes the name.
-            (PythonImportBind::Member(spec), None) => {
-                spec.rsplit_once('.').map(|(module, _)| module.to_string())
-            }
-            (PythonImportBind::Member(_), Some(_)) => None,
+        let qualified = match (bind, member) {
+            // `from typing import Generic`: the member spelled `typing.Generic`.
+            (PythonImportBind::Member(spec), None) => spec.clone(),
+            (PythonImportBind::Member(_) | PythonImportBind::Star(_), _) => return None,
             // `typing.Generic`, `import typing as t; t.Generic`.
-            (_, Some(member)) => Some(match member.rsplit_once('.') {
-                Some((middle, _)) => format!("{}.{middle}", bind.module_spec()),
-                None => bind.module_spec(),
-            }),
-            (_, None) => None,
+            (_, Some(member)) => format!("{}.{member}", bind.module_spec()),
+            (_, None) => return None,
         };
-        module.is_some_and(|module| {
-            matches!(module.as_str(), "typing" | "typing_extensions" | "abc")
-                && self.resolve_import_path(file, "python", &module).is_none()
-        })
+        let (module, _) = qualified.rsplit_once('.')?;
+        (matches!(module, "typing" | "typing_extensions" | "abc")
+            && self.resolve_import_path(file, "python", module).is_none())
+        .then_some(qualified)
+    }
+
+    /// Whether the base `member` (`typing.Counter`, `abc.ABCMeta`) can define
+    /// `method`, as far as the standard library says.
+    ///
+    /// Only the `typing`/`typing_extensions` aliases of the standard
+    /// containers and ABCs are answered, from the union of the public methods
+    /// those classes define ([`PYTHON_TYPING_ALIAS_METHODS`]) and every dunder:
+    /// a name outside that union is not defined by any of them, so the alias
+    /// does not hide a real base's method. Anything else (a metaclass such as
+    /// `abc.ABCMeta`, or an alias this table does not cover) may define it.
+    fn python_stdlib_base_may_define(member: &str, method: &str) -> bool {
+        let Some((module, _)) = member.rsplit_once('.') else {
+            return true;
+        };
+        !matches!(module, "typing" | "typing_extensions")
+            || method.starts_with("__")
+            || PYTHON_TYPING_ALIAS_METHODS.contains(&method)
     }
 
     /// The C3 linearization of `node` (the node first), memoised.
@@ -488,7 +636,15 @@ impl Resolver {
         };
         for node in linear.iter().skip(1) {
             match node {
-                MroNode::Opaque(_) => return MroAnswer::Abstain,
+                MroNode::Opaque(name) => {
+                    let stdlib = name.strip_prefix(STDLIB_OPAQUE);
+                    if stdlib
+                        .is_some_and(|member| !Self::python_stdlib_base_may_define(member, method))
+                    {
+                        continue;
+                    }
+                    return MroAnswer::Abstain;
+                }
                 MroNode::Class(file, identity) => {
                     let key = Self::python_type_key(identity);
                     match self.python_own_methods(file, key, method).as_slice() {
@@ -597,27 +753,59 @@ impl Resolver {
                         && self.declared_at_file_level(path, identity)
                 })
                 .count();
-        if module_bindings > 1 {
+        // A module-scope `for`/`with`/`except` target, walrus, `del` or `global`
+        // declaration is a binding the import and declaration tables do not
+        // carry; the extractor files each under the file's own name.
+        if module_bindings > 1 || self.file_scope_declares(file, root) {
             return true;
         }
         let mut current = scope.to_string();
         for _ in 0..Self::PYTHON_MRO_MAX_DEPTH {
+            let class_tail = self.python_class_scope(file, &current);
             // A class body's names are not in scope inside its methods.
-            if self.python_class_scope(file, &current).is_none()
-                && self.scope_declares_local(file, &current, root)
-            {
+            if class_tail.is_none() && self.scope_declares_local(file, &current, root) {
                 return true;
             }
-            let Some(parent) = self
-                .symbol_parents
-                .get(&(file.to_string(), current.clone()))
-                .filter(|parent| parent.as_str() != file && **parent != current)
-            else {
-                return false;
+            // A class written inside a function is recorded with the file as
+            // its parent, so its enclosing function is read off its identity
+            // (`build.H`) instead.
+            let enclosing =
+                class_tail.and_then(|tail| self.python_class_enclosing_scope(file, &tail));
+            let parent = match enclosing {
+                Some(enclosing) => enclosing,
+                None => match self
+                    .symbol_parents
+                    .get(&(file.to_string(), current.clone()))
+                    .filter(|parent| parent.as_str() != file && **parent != current)
+                {
+                    Some(parent) => parent.clone(),
+                    None => return false,
+                },
             };
-            current = parent.clone();
+            current = parent;
         }
         true
+    }
+
+    /// The scope a class named `tail` is written inside when its identity
+    /// carries the enclosing callable (`build.H` is `H` inside `build`):
+    /// `{file}::build`. `None` for a class written at file level.
+    fn python_class_enclosing_scope(&self, file: &str, tail: &str) -> Option<String> {
+        let bare = tail.rsplit('.').next().unwrap_or(tail);
+        let suffix = format!(".{tail}");
+        self.symbol_index
+            .get(bare)
+            .into_iter()
+            .flatten()
+            .filter(|(path, kind, family, _)| {
+                path == file && *kind == SymbolKind::Class && *family == LangFamily::Python
+            })
+            .find_map(|(_, _, _, identity)| {
+                let declared = identity.rsplit("::").next().unwrap_or(identity);
+                declared
+                    .strip_suffix(&suffix)
+                    .map(|enclosing| format!("{file}::{enclosing}"))
+            })
     }
 }
 
@@ -630,6 +818,10 @@ pub(super) fn python_import_binds(
     ext: &Extraction,
 ) -> BTreeMap<String, BTreeSet<PythonImportBind>> {
     let mut binds: BTreeMap<String, BTreeSet<PythonImportBind>> = BTreeMap::new();
+    // Where each name is first imported, and each `from m import *`: a star
+    // written after a name's import may rebind it.
+    let mut first_import: BTreeMap<String, usize> = BTreeMap::new();
+    let mut stars: Vec<(usize, &str)> = Vec::new();
     for imp in &ext.imports {
         if imp.path_load.is_some() {
             continue;
@@ -637,7 +829,11 @@ pub(super) fn python_import_binds(
         let specifier = imp.module_specifier.as_str();
         if imp.imported_names.is_empty() {
             let (local, bind) = match imp.alias.as_deref() {
-                Some("*" | ".") => continue,
+                Some("*") => {
+                    stars.push((imp.span.start_byte, specifier));
+                    continue;
+                }
+                Some(".") => continue,
                 Some(alias) => (alias, PythonImportBind::Module(specifier.to_string())),
                 None => {
                     let root = specifier.split('.').next().unwrap_or(specifier);
@@ -645,6 +841,10 @@ pub(super) fn python_import_binds(
                 }
             };
             if !local.is_empty() {
+                first_import
+                    .entry(local.to_string())
+                    .and_modify(|start| *start = (*start).min(imp.span.start_byte))
+                    .or_insert(imp.span.start_byte);
                 binds.entry(local.to_string()).or_default().insert(bind);
             }
             continue;
@@ -669,10 +869,23 @@ pub(super) fn python_import_binds(
             } else {
                 format!("{specifier}.{name}")
             };
+            first_import
+                .entry(local.to_string())
+                .and_modify(|start| *start = (*start).min(imp.span.start_byte))
+                .or_insert(imp.span.start_byte);
             binds
                 .entry(local.to_string())
                 .or_default()
                 .insert(PythonImportBind::Member(member));
+        }
+    }
+    for (star_start, module) in stars {
+        for (local, import_start) in &first_import {
+            if *import_start < star_start {
+                if let Some(bound) = binds.get_mut(local) {
+                    bound.insert(PythonImportBind::Star(module.to_string()));
+                }
+            }
         }
     }
     binds

@@ -1698,13 +1698,94 @@ fn python_bound_names(target: Node, source: &str) -> Vec<String> {
                     names.push(name);
                 }
             }
-            "pattern_list" | "tuple_pattern" | "list_pattern" | "list_splat_pattern" => {
+            // `tuple` and `as_pattern_target` are the shapes a `with … as (A, B)`
+            // alias and an `except … as e` alias are parsed into.
+            "pattern_list" | "tuple_pattern" | "list_pattern" | "list_splat_pattern" | "tuple"
+            | "expression_list" | "as_pattern_target" => {
                 let mut cursor = node.walk();
                 let children: Vec<Node> = node.named_children(&mut cursor).collect();
                 stack.extend(children.into_iter().rev());
             }
             _ => {}
         }
+    }
+    names
+}
+
+/// The names a Python file binds at module scope other than by a plain
+/// assignment, in the sense that a later reading of the name at module level
+/// does not see the import or declaration that came before: a `for` or `with`
+/// target, a walrus, a `del`, an `except … as`, and any name a function in the
+/// file declares `global` (it may be written from anywhere, at any time).
+/// With `definitions` the file's own assignments, `def`s, `class`es and
+/// imports are counted too: the full set of module-level bindings of a name.
+///
+/// A function, class or lambda body is another scope and contributes nothing
+/// but its `global` declarations; a comprehension's own `for` targets are its
+/// own, but a walrus inside it binds in the enclosing scope.
+fn python_module_rebound_names(root: Node, source: &str, definitions: bool) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let mut worklist = vec![(root, true)];
+    while let Some((node, module_scope)) = worklist.pop() {
+        let bind = |names: &mut BTreeSet<String>, target: Option<Node>| {
+            if let Some(target) = target {
+                names.extend(python_bound_names(target, source));
+            }
+        };
+        match node.kind() {
+            "global_statement" => {
+                let mut cursor = node.walk();
+                let declared: Vec<String> = node
+                    .named_children(&mut cursor)
+                    .filter(|child| child.kind() == "identifier")
+                    .map(|child| get_node_text(child, source))
+                    .collect();
+                names.extend(declared);
+            }
+            "for_statement" if module_scope => bind(&mut names, node.child_by_field_name("left")),
+            "with_item" | "except_clause" if module_scope => bind(
+                &mut names,
+                node.child_by_field_name("value")
+                    .filter(|value| value.kind() == "as_pattern")
+                    .and_then(|value| value.child_by_field_name("alias")),
+            ),
+            "named_expression" if module_scope => {
+                bind(&mut names, node.child_by_field_name("name"))
+            }
+            "delete_statement" if module_scope => bind(&mut names, node.named_child(0)),
+            "assignment" | "augmented_assignment" if module_scope && definitions => {
+                bind(&mut names, node.child_by_field_name("left"))
+            }
+            "function_definition" | "class_definition" if module_scope && definitions => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    names.insert(get_node_text(name, source));
+                }
+            }
+            "import_statement" if module_scope && definitions => {
+                let mut cursor = node.walk();
+                for target in node.children_by_field_name("name", &mut cursor) {
+                    let bound = match target.kind() {
+                        "aliased_import" => target.child_by_field_name("alias"),
+                        _ => target.named_child(0),
+                    };
+                    if let Some(bound) = bound {
+                        names.insert(get_node_text(bound, source));
+                    }
+                }
+            }
+            "import_from_statement" if module_scope && definitions => {
+                names.extend(python_import_bindings(node, source).1);
+            }
+            _ => {}
+        }
+        let inner = module_scope
+            && !matches!(
+                node.kind(),
+                "function_definition" | "class_definition" | "lambda"
+            );
+        let mut cursor = node.walk();
+        let children: Vec<Node> = node.named_children(&mut cursor).collect();
+        worklist.extend(children.into_iter().rev().map(|child| (child, inner)));
     }
     names
 }
@@ -3199,6 +3280,71 @@ fn python_enclosing_superclasses(node: Node, source: &str) -> Vec<String> {
     Vec::new()
 }
 
+/// Whether a base written `written` (`autograd.Function`, `nn.Module`) reaches
+/// torch through the file's imports, as opposed to a spelling that merely ends
+/// the same way (`from local import autograd` makes `autograd.Function` the
+/// repository's own class).
+///
+/// The first segment is read through every import in the file that binds it
+/// (`import torch`, `import torch.nn as nn`, `from torch import autograd`);
+/// the contract holds only when each of them names a `torch` module. A root no
+/// import binds is left as written: a name declared in the file, or a global,
+/// is no import and the spelling is all there is. Called only for a base the
+/// registry already matched, so the walk over the file's imports is paid by
+/// the rare method that has a candidate contract.
+fn python_base_is_imported_from_torch(node: Node, written: &str, source: &str) -> bool {
+    let root_name = written.split('.').next().unwrap_or(written).trim();
+    let mut root = node;
+    while let Some(parent) = bounded_parent(root) {
+        root = parent;
+    }
+    let mut qualified: Vec<String> = Vec::new();
+    let mut worklist = vec![root];
+    while let Some(statement) = worklist.pop() {
+        match statement.kind() {
+            "import_statement" => {
+                let mut cursor = statement.walk();
+                for target in statement.children_by_field_name("name", &mut cursor) {
+                    match target.kind() {
+                        "aliased_import" => {
+                            let alias = target
+                                .child_by_field_name("alias")
+                                .map(|alias| get_node_text(alias, source));
+                            if alias.as_deref() == Some(root_name) {
+                                if let Some(module) = target.child_by_field_name("name") {
+                                    qualified.push(python_module_path(module, source));
+                                }
+                            }
+                        }
+                        _ => {
+                            let module = python_module_path(target, source);
+                            if module.split('.').next() == Some(root_name) {
+                                qualified.push(root_name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            "import_from_statement" => {
+                let module = statement
+                    .child_by_field_name("module_name")
+                    .map(|module| python_module_path(module, source))
+                    .unwrap_or_default();
+                let (imported, locals) = python_import_bindings(statement, source);
+                for (imported, local) in imported.iter().zip(&locals) {
+                    if local == root_name {
+                        qualified.push(format!("{module}.{imported}"));
+                    }
+                }
+            }
+            _ => push_children(statement, &mut worklist),
+        }
+    }
+    qualified
+        .iter()
+        .all(|module| module == "torch" || module.starts_with("torch."))
+}
+
 fn enclosing_type_name(node: Node, source: &str) -> Option<String> {
     let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
@@ -4380,7 +4526,11 @@ fn extract_node(
                     if is_method {
                         if let Some(reason) = python_enclosing_superclasses(node, source)
                             .iter()
-                            .find_map(|base| crate::wiring::python_base_dispatch_reason(base, &n))
+                            .find_map(|base| {
+                                crate::wiring::python_base_dispatch_reason(base, &n).filter(|_| {
+                                    python_base_is_imported_from_torch(node, base, source)
+                                })
+                            })
                         {
                             wiring.push(WiringAnnotation {
                                 kind: WiringKind::RuntimeEntryPoint,
@@ -11641,6 +11791,20 @@ fn collect_scope_locals(
                 .extend(module_names);
         }
     }
+    // A Python module-scope name bound by a `for`/`with`/`except` target, a
+    // walrus, a `del` or a `global` declaration is a binding of the file itself,
+    // keyed by the file's own name as the JS/TS ones are. None of them is a
+    // symbol, so without this a name an import brought in could be rebound
+    // beneath the resolver without a trace.
+    if lang == "python" {
+        let rebound = python_module_rebound_names(root, source, false);
+        if !rebound.is_empty() {
+            by_scope
+                .entry(file_symbol_name.to_string())
+                .or_default()
+                .extend(rebound);
+        }
+    }
     by_scope
         .into_iter()
         .flat_map(|(scope, locals)| locals.into_iter().map(move |local| (scope.clone(), local)))
@@ -11883,29 +12047,100 @@ fn python_parameter_name<'a>(parameter: Node<'a>, source: &str) -> Option<String
     }
 }
 
-/// Whether a decorator makes its method take no instance: its expression is
-/// `staticmethod` or `classmethod`, or an attribute path ending in one
-/// (`builtins.staticmethod`, `__import__('builtins').staticmethod`).
+/// Whether `object`, the left side of `X.staticmethod`, is the `builtins`
+/// module: the name `builtins` itself, a name the file binds with
+/// `import builtins as X`, or the call `__import__('builtins')`.
+fn python_names_the_builtins_module(object: Node, root: Node, source: &str) -> bool {
+    match object.kind() {
+        "identifier" => {
+            let name = get_node_text(object, source);
+            if name == "builtins" {
+                return true;
+            }
+            let mut worklist = vec![root];
+            while let Some(node) = worklist.pop() {
+                if node.kind() == "import_statement" {
+                    let mut cursor = node.walk();
+                    let aliased =
+                        node.children_by_field_name("name", &mut cursor)
+                            .filter(|target| target.kind() == "aliased_import")
+                            .any(|target| {
+                                target.child_by_field_name("name").is_some_and(|module| {
+                                    get_node_text(module, source) == "builtins"
+                                }) && target
+                                    .child_by_field_name("alias")
+                                    .is_some_and(|alias| get_node_text(alias, source) == name)
+                            });
+                    if aliased {
+                        return true;
+                    }
+                    continue;
+                }
+                push_children(node, &mut worklist);
+            }
+            false
+        }
+        "call" => {
+            let named_import = object
+                .child_by_field_name("function")
+                .is_some_and(|function| get_node_text(function, source) == "__import__");
+            let mut cursor = object.walk();
+            let argument = object
+                .child_by_field_name("arguments")
+                .and_then(|arguments| arguments.named_children(&mut cursor).next());
+            named_import
+                && argument.is_some_and(|argument| {
+                    argument.kind() == "string"
+                        && get_node_text(argument, source).trim_matches(['"', '\'']) == "builtins"
+                })
+        }
+        _ => false,
+    }
+}
+
+/// Whether a decorator makes its method take no instance: its expression is the
+/// builtin `staticmethod` or `classmethod`.
+///
+/// A bare `staticmethod` / `classmethod` is the builtin unless the file binds
+/// the name itself (an import, a `def`, an assignment, a `for` target ...). An
+/// attribute `X.staticmethod` is the builtin only when `X` is the `builtins`
+/// module ([`python_names_the_builtins_module`]): `deco.staticmethod` is some
+/// other object's attribute that merely shares the spelling. Any other
+/// expression leaves the method an instance method.
 ///
 /// Read from the expression node, not the decorator's text: the text carries a
 /// trailing comment (`@classmethod  # build`), which is no part of the
-/// expression. Any other expression leaves the method an instance method.
+/// expression.
 fn python_decorator_drops_instance(decorator: Node, source: &str) -> bool {
     let mut cursor = decorator.walk();
     let expression = decorator
         .named_children(&mut cursor)
         .find(|child| child.kind() != "comment");
-    let last = match expression {
-        Some(node) if node.kind() == "identifier" => Some(node),
-        Some(node) if node.kind() == "attribute" => node.child_by_field_name("attribute"),
-        _ => None,
-    };
-    last.is_some_and(|name| {
+    let is_builtin_name = |name: Node| {
         matches!(
             get_node_text(name, source).as_str(),
             "staticmethod" | "classmethod"
         )
-    })
+    };
+    let mut root = decorator;
+    while let Some(parent) = bounded_parent(root) {
+        root = parent;
+    }
+    match expression {
+        Some(node) if node.kind() == "identifier" => {
+            is_builtin_name(node)
+                && !python_module_rebound_names(root, source, true)
+                    .contains(&get_node_text(node, source))
+        }
+        Some(node) if node.kind() == "attribute" => {
+            node.child_by_field_name("attribute")
+                .is_some_and(is_builtin_name)
+                && node
+                    .child_by_field_name("object")
+                    .is_some_and(|object| python_names_the_builtins_module(object, root, source))
+        }
+        _ => false,
+    }
 }
 
 /// Whether the `self` an assignment names is the instance of a class: the
