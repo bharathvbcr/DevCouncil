@@ -309,10 +309,11 @@ impl<'a> StoreQueryEngine<'a> {
         min_rung: Option<crate::rung::Rung>,
     ) -> anyhow::Result<Response<ResolvedEdge>> {
         self.cancel.check()?;
+        // An indexed file path is read first and wins a spelling collision with
+        // a symbol. Anything else is a symbol query and goes through the same
+        // resolution `impact` uses.
         let Some(snapshot) = self.store.file_edges(&req.query, req.min_confidence)? else {
-            return Ok(self.unavailable(ResolutionAvailability::Unavailable {
-                reason: format!("{} is not indexed", req.query),
-            }));
+            return self.symbol_dependencies(req, min_rung);
         };
         if matches!(snapshot.file.parse_outcome, ParseOutcome::Failed { .. }) {
             return Ok(self.unavailable(ResolutionAvailability::Unavailable {
@@ -341,13 +342,148 @@ impl<'a> StoreQueryEngine<'a> {
             .map(stored_edge_to_resolved)
             .collect::<anyhow::Result<Vec<_>>>()?;
         let (edges, rungs) = crate::rung::narrow(edges, min_rung);
+        // The file has edges pointing at it and none leaving it: an empty page
+        // is the honest answer to "what does it depend on", and the callers
+        // are named rather than left to read as absent.
+        let inbound_note = (edges.is_empty() && snapshot.inbound_edges > 0)
+            .then(|| inbound_only_note(&req.query, snapshot.inbound_edges));
         let mut response = budget_take(edges, req.token_budget, |_| 25);
         response.rungs = Some(rungs);
         // Composed, not assigned: `budget_take` may already have set a reason
         // of its own, and a reader deciding whether to act on this list needs
         // every qualification the answer holds, not the last one written.
-        response.walk_incomplete =
-            devmap_analyze::combine_reasons(response.walk_incomplete.take(), coverage_gap);
+        response.walk_incomplete = devmap_analyze::combine_reasons(
+            devmap_analyze::combine_reasons(response.walk_incomplete.take(), coverage_gap),
+            inbound_note,
+        );
+        Ok(self.finish(response))
+    }
+
+    /// `dependencies` for a query that is not an indexed file path: a symbol,
+    /// `Type.method`, `file::symbol`, or an unindexed path.
+    ///
+    /// Resolved by [`indexed_traversal_starts`], the function `impact` and
+    /// `trace` resolve their targets with, so the two cannot disagree about what
+    /// a name means — including refusing an ambiguous bare name and listing the
+    /// candidates. The answer is the resolved symbol's own outbound edges, one
+    /// hop, which is what the tool is documented to return; it is not a depth-1
+    /// `trace`, whose "stopped at depth 1, not the full blast radius" caveat
+    /// would ride on every answer.
+    ///
+    /// A symbol that is indexed but calls nothing answers `Available`, empty,
+    /// with its inbound edge count named. It is resolved from either side of the
+    /// index for that reason: a constant is only ever a target.
+    fn symbol_dependencies(
+        &self,
+        req: Request<String>,
+        min_rung: Option<crate::rung::Rung>,
+    ) -> anyhow::Result<Response<ResolvedEdge>> {
+        let min_confidence = devmap_store::checked_min_confidence(req.min_confidence)?;
+        let not_indexed = |this: &Self| {
+            this.unavailable(ResolutionAvailability::Unavailable {
+                reason: format!("{} is not indexed", req.query),
+            })
+        };
+        let Some(index) = self.generation_edges()? else {
+            return Ok(not_indexed(self));
+        };
+        let target = req.query.trim();
+        let outbound_starts =
+            indexed_traversal_starts(&index, target, false, min_confidence, &self.cancel)?;
+        let inbound_starts =
+            indexed_traversal_starts(&index, target, true, min_confidence, &self.cancel)?;
+        let named: BTreeSet<(String, String)> = outbound_starts
+            .iter()
+            .chain(inbound_starts.iter())
+            .cloned()
+            .collect();
+        if matches!(
+            crate::query_match::classify(target),
+            crate::query_match::StartQuery::Symbol(_)
+        ) {
+            // One side may hold a namesake the other does not: a callee-only
+            // `run` and a called-only `run` are two symbols.
+            traversal::refuse_ambiguous(target, &named.iter().cloned().collect::<Vec<_>>())?;
+        }
+        if named.is_empty() {
+            return Ok(not_indexed(self));
+        }
+        self.cancel.check()?;
+        let call_blind = self.call_blind_starts(named.iter().map(|(_, file)| file.as_str()))?;
+        let mut ids: Vec<u32> = Vec::new();
+        let sources: BTreeSet<&(String, String)> = outbound_starts.iter().collect();
+        for (symbol, file) in sources {
+            for id in index.from_source_symbol(symbol) {
+                if index.source_file(*id) == file
+                    && index.admits(*id, min_confidence)
+                    && index.confidence(*id) >= min_confidence
+                {
+                    ids.push(*id);
+                }
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        let mut edges = Vec::with_capacity(ids.len());
+        for (checked, id) in ids.into_iter().enumerate() {
+            self.cancel.check_every(checked)?;
+            edges.push(stored_edge_to_resolved(index.stored_edge(id))?);
+        }
+        edges.sort_by(|a, b| {
+            b.confidence
+                .0
+                .total_cmp(&a.confidence.0)
+                .then_with(|| a.target_file.cmp(&b.target_file))
+                .then_with(|| a.target_symbol.cmp(&b.target_symbol))
+                .then_with(|| a.source_symbol.cmp(&b.source_symbol))
+        });
+        let (edges, rungs) = crate::rung::narrow(edges, min_rung);
+        let coverage_gap = devmap_analyze::combine_reasons(
+            analysis_status_gap(index.analysis()),
+            self.radius_attribution_gap(
+                index.generation(),
+                index.analysis(),
+                &named,
+                RadiusSide::Callees,
+            )?,
+        );
+        let inbound_note = if edges.is_empty() {
+            let mut inbound = 0usize;
+            for (symbol, file) in &inbound_starts {
+                inbound += index
+                    .into_target_symbol(symbol)
+                    .iter()
+                    .filter(|id| {
+                        index.target_file(**id) == file
+                            && index.source_symbol(**id) != symbol
+                            && index.admits(**id, min_confidence)
+                            && index.confidence(**id) >= min_confidence
+                    })
+                    .count();
+            }
+            (inbound > 0).then(|| inbound_only_note(&req.query, inbound))
+        } else {
+            None
+        };
+        // A target whose calls were never extracted has nothing measured:
+        // refused, as `impact` refuses it, rather than answered as a leaf.
+        if edges.is_empty() && call_blind.every_start_is_blind() {
+            let reason = call_blind.reason().unwrap_or_default();
+            let mut response = self.unavailable(ResolutionAvailability::Unavailable {
+                reason: format!("{} has no measured dependencies: {reason}", req.query),
+            });
+            response.walk_incomplete = coverage_gap;
+            return Ok(response);
+        }
+        let mut response = budget_take(edges, req.token_budget, |_| EDGE_TOKENS);
+        response.rungs = Some(rungs);
+        response.walk_incomplete = devmap_analyze::combine_reasons(
+            devmap_analyze::combine_reasons(
+                devmap_analyze::combine_reasons(response.walk_incomplete.take(), coverage_gap),
+                call_blind.reason(),
+            ),
+            inbound_note,
+        );
         Ok(self.finish(response))
     }
 
@@ -3685,6 +3821,17 @@ fn latest_extractions_cancellable(
     store
         .latest_extractions_until(&mut || cancel.check().is_err())?
         .ok_or_else(|| anyhow::Error::new(crate::cancel::QueryCancelled))
+}
+
+/// The qualification an empty `dependencies` answer carries when edges point at
+/// the target but none leave it. `dependencies` is outbound only; without this
+/// an empty page reads as "nothing touches this", which is the reading that
+/// gets a live symbol deleted.
+fn inbound_only_note(target: &str, inbound: usize) -> String {
+    format!(
+        "{target} depends on nothing in the index, but {inbound} inbound edge(s) point at it; \
+         `dependencies` lists outbound edges only — ask `impact` for what reaches it"
+    )
 }
 
 fn stored_edge_to_resolved(edge: StoredEdge) -> anyhow::Result<ResolvedEdge> {

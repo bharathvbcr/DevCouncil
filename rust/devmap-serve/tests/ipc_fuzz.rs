@@ -745,13 +745,13 @@ async fn unknown_fields_are_ignored_including_misspelled_ones() {
     let tight = accepted(
         Arc::clone(&store),
         "spelled correctly",
-        br#"{"version":1,"cmd":"deps","target":"core.py","budget":25}"#,
+        br#"{"version":1,"cmd":"deps","target":"caller.py","budget":25}"#,
     )
     .await;
     let default = accepted(
         Arc::clone(&store),
         "field omitted",
-        br#"{"version":1,"cmd":"deps","target":"core.py"}"#,
+        br#"{"version":1,"cmd":"deps","target":"caller.py"}"#,
     )
     .await;
     assert_ne!(
@@ -764,7 +764,7 @@ async fn unknown_fields_are_ignored_including_misspelled_ones() {
     let misspelled = accepted(
         Arc::clone(&store),
         "misspelled field",
-        br#"{"version":1,"cmd":"deps","target":"core.py","budgt":25}"#,
+        br#"{"version":1,"cmd":"deps","target":"caller.py","budgt":25}"#,
     )
     .await;
     assert_eq!(

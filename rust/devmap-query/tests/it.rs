@@ -53,6 +53,8 @@ mod coupling_spans_inheritance;
 mod coverage_loss_artifacts;
 #[cfg(feature = "parse")]
 mod dead_clusters_reach_a_query;
+#[cfg(feature = "parse")]
+mod dependencies_are_outbound;
 mod documentation_visibility;
 #[cfg(feature = "parse")]
 mod dynamic_references_clear_unwired;

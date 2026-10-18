@@ -952,8 +952,21 @@ pub type IndexedFiles = Vec<(String, String)>;
 pub struct FileEdges {
     pub generation: u32,
     pub file: StoredFile,
+    /// Edges written in this file (`source_file == file`): its dependencies.
     pub edges: Vec<StoredEdge>,
+    /// Edges from other files into this one, at the same confidence floor.
+    /// Not in `edges`; counted so an answer can say they were left out.
+    pub inbound_edges: usize,
     pub analysis: Option<AnalysisDisclosure>,
+}
+
+/// Which endpoint of an edge must be the file a per-file read names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EdgeSide {
+    /// `source` is the file: what the file depends on.
+    Outbound,
+    /// Either endpoint is the file.
+    Either,
 }
 
 /// Symbols declared in one file in the latest generation, with that

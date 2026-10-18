@@ -153,54 +153,106 @@ impl<'a> QueryEngine<'a> {
         response
     }
 
+    /// What the target depends on: its outbound edges.
+    ///
+    /// An indexed file path answers the edges written in that file. Any other
+    /// query is a symbol (`name`, `Type.method`, `file::symbol`) resolved by the
+    /// same matcher `impact` uses, and answers that symbol's own outbound
+    /// edges. A bare name with several namesakes is refused with its candidates,
+    /// as the store-backed engine refuses it. Inbound edges are never listed
+    /// here; when they are all there is, the answer says how many there were.
     pub fn dependencies(&self, req: Request<String>) -> Response<ResolvedEdge> {
         if let Err(error) = devmap_store::checked_min_confidence(req.min_confidence) {
             return unavailable_response(ResolutionAvailability::Unavailable {
                 reason: error.to_string(),
             });
         }
-        let file_path = &req.query;
-        let availability = match self
+        let query = &req.query;
+        let extraction = self
             .extractions
             .iter()
-            .find(|extraction| &extraction.file_path == file_path)
-        {
-            None => ResolutionAvailability::Unavailable {
-                reason: format!("{file_path} is not indexed"),
-            },
-            Some(extraction) if matches!(extraction.parse_outcome, ParseOutcome::Failed { .. }) => {
-                ResolutionAvailability::Unavailable {
-                    reason: format!("{file_path} could not be parsed"),
-                }
+            .find(|extraction| &extraction.file_path == query);
+        if let Some(extraction) = extraction {
+            if matches!(extraction.parse_outcome, ParseOutcome::Failed { .. }) {
+                return unavailable_response(ResolutionAvailability::Unavailable {
+                    reason: format!("{query} could not be parsed"),
+                });
             }
-            Some(_) => ResolutionAvailability::Available,
-        };
-        if !matches!(availability, ResolutionAvailability::Available) {
-            return unavailable_response(availability);
         }
-        // The same statement the store-backed engine makes, from the same
-        // owner: a file whose calls and imports were never extracted answers
-        // here in the exact shape of one that genuinely has none.
-        let file_gap = self
-            .extractions
-            .iter()
-            .find(|extraction| &extraction.file_path == file_path)
-            .and_then(|extraction| file_edge_coverage_gap(&extraction.parse_outcome));
-        let file_sites = self.radius_attribution_gap(
-            &BTreeSet::from([(file_path.clone(), file_path.clone())]),
-            RadiusSide::FileCallees,
-        );
+        let target = query.trim();
+        // `None` outbound starts means a file query: every edge written in the
+        // file. Otherwise the `(symbol, file)` nodes the query names.
+        let (outbound_starts, file_gap, sites, side): (
+            Option<BTreeSet<(String, String)>>,
+            Option<String>,
+            BTreeSet<(String, String)>,
+            RadiusSide,
+        ) = match extraction {
+            Some(extraction) => (
+                None,
+                file_edge_coverage_gap(&extraction.parse_outcome),
+                BTreeSet::from([(query.clone(), query.clone())]),
+                RadiusSide::FileCallees,
+            ),
+            None => {
+                let outbound: BTreeSet<(String, String)> =
+                    super::traversal_starts(&self.resolution.edges, target, false)
+                        .into_iter()
+                        .collect();
+                let inbound = super::traversal_starts(&self.resolution.edges, target, true);
+                let named: BTreeSet<(String, String)> =
+                    outbound.iter().cloned().chain(inbound).collect();
+                if matches!(
+                    crate::query_match::classify(target),
+                    crate::query_match::StartQuery::Symbol(_)
+                ) {
+                    if let Err(error) = super::traversal::refuse_ambiguous(
+                        target,
+                        &named.iter().cloned().collect::<Vec<_>>(),
+                    ) {
+                        return unavailable_response(ResolutionAvailability::Unavailable {
+                            reason: error.to_string(),
+                        });
+                    }
+                }
+                if named.is_empty() {
+                    return unavailable_response(ResolutionAvailability::Unavailable {
+                        reason: format!("{query} is not indexed"),
+                    });
+                }
+                (Some(outbound), None, named, RadiusSide::Callees)
+            }
+        };
+        let file_sites = self.radius_attribution_gap(&sites, side);
         let coverage_gap = devmap_analyze::combine_reasons(
             file_gap,
             devmap_analyze::combine_reasons(self.coverage_gap.clone(), file_sites),
         );
         let mut deps = Vec::new();
-
+        let mut inbound = 0usize;
         for edge in &self.resolution.edges {
-            if (&edge.source_file == file_path || &edge.target_file == file_path)
-                && edge.confidence.0 >= req.min_confidence
-            {
-                deps.push(edge.clone());
+            if edge.confidence.0 < req.min_confidence {
+                continue;
+            }
+            match &outbound_starts {
+                None if &edge.source_file == query => deps.push(edge.clone()),
+                None if &edge.target_file == query => inbound += 1,
+                Some(starts)
+                    if starts.contains(&(edge.source_symbol.clone(), edge.source_file.clone())) =>
+                {
+                    deps.push(edge.clone());
+                }
+                Some(_)
+                    if edge.source_symbol != edge.target_symbol
+                        && crate::query_match::traversal_start_matches(
+                            target,
+                            &edge.target_symbol,
+                            &edge.target_file,
+                        ) =>
+                {
+                    inbound += 1;
+                }
+                _ => {}
             }
         }
 
@@ -213,9 +265,13 @@ impl<'a> QueryEngine<'a> {
                 .then_with(|| a.target_symbol.cmp(&b.target_symbol))
         });
 
+        let inbound_note =
+            (deps.is_empty() && inbound > 0).then(|| super::inbound_only_note(query, inbound));
         let mut response = budget_take(deps, req.token_budget, |_| 25);
-        response.walk_incomplete =
-            devmap_analyze::combine_reasons(response.walk_incomplete.take(), coverage_gap);
+        response.walk_incomplete = devmap_analyze::combine_reasons(
+            devmap_analyze::combine_reasons(response.walk_incomplete.take(), coverage_gap),
+            inbound_note,
+        );
         response
     }
 
