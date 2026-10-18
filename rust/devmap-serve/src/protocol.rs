@@ -209,13 +209,18 @@ impl UnappliedEdits {
         let slot = crate::lock_recover(&self.0);
         let record = slot.as_ref()?;
         if record.batches == 0 {
-            return Some(record.reason.clone());
+            return Some(bounded_reason(&record.reason));
         }
+        // An empty cause keeps the count and drops the `: <cause>` fragment.
+        let cause = match record.reason.is_empty() {
+            true => String::new(),
+            false => format!(": {}", bounded_reason(&record.reason)),
+        };
         Some(format!(
             "{} changed path(s) in {} batch(es) could not be recorded as pending work and are \
-NOT in this generation: {}. This index is behind the tree by an amount only a rebuild can \
+NOT in this generation{cause}. This index is behind the tree by an amount only a rebuild can \
 establish — run `devmap build`, or restart the daemon once the store accepts writes again.",
-            record.paths, record.batches, record.reason
+            record.paths, record.batches
         ))
     }
 }
@@ -1217,6 +1222,46 @@ pub fn daemon_index_is_fresh(status: &StoreStatus, unapplied: &UnappliedEdits) -
     index_is_fresh(status) && unapplied.is_empty()
 }
 
+/// The most one component of a degraded reason may carry, in bytes of the
+/// escaped text. A reason is a sentence for an operator, not a transport: the
+/// components are free text from the store, the analysis and the OS.
+pub const MAX_REASON_COMPONENT_BYTES: usize = 4096;
+
+/// A component reason made safe to put in a status sentence: control
+/// characters (newline, ESC, NUL, ...) are rendered as their visible escapes
+/// (`\n`, `\u{1b}`), and the result is cut at [`MAX_REASON_COMPONENT_BYTES`]
+/// on a character boundary with a `…[N bytes]` marker naming how much was cut,
+/// so a capped reason is never mistaken for a whole one.
+pub fn bounded_reason(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len().min(MAX_REASON_COMPONENT_BYTES + 8));
+    for ch in text.chars() {
+        if ch.is_control() {
+            escaped.extend(ch.escape_default());
+        } else {
+            escaped.push(ch);
+        }
+    }
+    if escaped.len() <= MAX_REASON_COMPONENT_BYTES {
+        return escaped;
+    }
+    let mut cut = MAX_REASON_COMPONENT_BYTES;
+    while !escaped.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let omitted = escaped.len() - cut;
+    escaped.truncate(cut);
+    format!("{escaped}…[{omitted} bytes]")
+}
+
+/// `kind` alone when `reason` is empty, else `kind: reason`.
+fn kind_clause(kind: &str, reason: &str) -> String {
+    if reason.is_empty() {
+        kind.to_owned()
+    } else {
+        format!("{kind}: {}", bounded_reason(reason))
+    }
+}
+
 /// The analysis clause of a degraded reason: the latest generation's own
 /// `Partial`/`Timeout` status, spelled `partial: ...` / `timeout: ...`.
 ///
@@ -1228,10 +1273,10 @@ pub fn analysis_degraded_clause(store: &Store) -> anyhow::Result<Option<String>>
     Ok(match store.latest_analysis_status()? {
         Some(devmap_analyze::model::AnalysisStatus::Ok) | None => None,
         Some(devmap_analyze::model::AnalysisStatus::Partial { reason }) => {
-            Some(format!("partial: {reason}"))
+            Some(kind_clause("partial", &reason))
         }
         Some(devmap_analyze::model::AnalysisStatus::Timeout { reason }) => {
-            Some(format!("timeout: {reason}"))
+            Some(kind_clause("timeout", &reason))
         }
     })
 }
@@ -1261,7 +1306,7 @@ pub fn store_degraded_reason(
 ) -> anyhow::Result<Option<String>> {
     Ok(devmap_analyze::combine_reasons(
         devmap_analyze::combine_reasons(
-            freshness_degraded_reason(status),
+            freshness_degraded_reason(status).map(|reason| bounded_reason(&reason)),
             analysis_degraded_clause(store)?,
         ),
         budget_degraded_clause(budget_refused),
