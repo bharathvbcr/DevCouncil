@@ -199,7 +199,7 @@ fn an_objc_property_is_a_runtime_entry_point() {
 fn an_argument_label_and_a_leading_dot_member_are_not_name_references() {
     let extraction = extract_file(
         "T.swift",
-        "struct T {\n    var count: Int\n    func a() { g(count: 1) }\n    func b() -> Axis { .count }\n    func c() -> Int { count }\n}\n",
+        "struct T {\n    var count: Int\n    func a() { g(count: 1) }\n    func b() { h(.count) }\n    func c() -> Int { count }\n}\n",
     );
     let sites: Vec<_> = extraction
         .references

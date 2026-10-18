@@ -35,3 +35,10 @@ struct Gauge {
     var size: Int
     func pick() -> Axis { .size }
 }
+enum Shape {
+    case circle(Int)
+    static func unit() -> Shape { .circle(1) }
+}
+func total(_ p: PlaybackState, _ q: PlaybackState) -> Int { p.count + q.count }
+class BaseBox { var shared: Int = 0 }
+class LeafBox: BaseBox { func read() -> Int { shared } }

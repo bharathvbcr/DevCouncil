@@ -19,7 +19,10 @@ fn resolve(files: &[(&str, &str)]) -> ResolutionResult {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    resolver.resolve_all(&extractions).unwrap()
+    let result = resolver.resolve_all(&extractions).unwrap();
+    // Every use edge names a declared symbol, never a bare member spelling.
+    assert_eq!(resolver.dangling_targets(&result), Vec::<String>::new());
+    result
 }
 
 /// Every use edge (a read or a call) a symbol ending in `caller` makes, as

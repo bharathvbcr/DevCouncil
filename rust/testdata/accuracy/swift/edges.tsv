@@ -149,3 +149,6 @@ sw.PR8	PR8	micro/Sources/M/Props.swift::readA	micro/Sources/M/Props.swift::IdA.i
 sw.PR8.not	PR8	micro/Sources/M/Props.swift::readA	micro/Sources/M/Props.swift::IdB.id	forbid_any_tier	must		the same-named property of an unrelated type is not bound
 sw.PR9.not	PR9	micro/Sources/M/Props.swift::Tally.make	micro/Sources/M/Props.swift::Tally.total	forbid_any_tier	must		argument label total: is not a property read
 sw.PR10.not	PR10	micro/Sources/M/Props.swift::Gauge.pick	micro/Sources/M/Props.swift::Gauge.size	forbid_any_tier	must		leading-dot .size names the Axis case, not the enclosing type property
+sw.PR11	PR11	micro/Sources/M/Props.swift::Shape.unit	micro/Sources/M/Props.swift::Shape.circle	edge	must		leading-dot .circle(1) written against the declared return type Shape
+sw.PR12	PR12	micro/Sources/M/Props.swift::total	micro/Sources/M/Props.swift::PlaybackState.count	edge	must		property read as the right operand of an infix operator (q.count in p.count + q.count)
+sw.PR13	PR13	micro/Sources/M/Props.swift::LeafBox.read	micro/Sources/M/Props.swift::BaseBox.shared	edge	must		bare read of a property the superclass declares

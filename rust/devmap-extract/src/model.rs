@@ -837,6 +837,26 @@ pub struct ExtractedSymbol {
     pub return_type: Option<String>,
 }
 
+/// The `signature` a Swift member property carries: what separates it from the
+/// other `Field` symbols (enum cases) and says whether it stores a value.
+pub const SWIFT_STORED_PROPERTY: &str = "stored property";
+/// See [`SWIFT_STORED_PROPERTY`].
+pub const SWIFT_COMPUTED_PROPERTY: &str = "computed property";
+/// See [`SWIFT_STORED_PROPERTY`].
+pub const SWIFT_PROPERTY_REQUIREMENT: &str = "property requirement";
+
+impl ExtractedSymbol {
+    /// Whether this is a Swift member property (stored, computed or a protocol
+    /// requirement), as opposed to an enum case, which shares `Field`.
+    pub fn is_member_property(&self) -> bool {
+        self.kind == SymbolKind::Field
+            && matches!(
+                self.signature.as_deref(),
+                Some(SWIFT_STORED_PROPERTY | SWIFT_COMPUTED_PROPERTY | SWIFT_PROPERTY_REQUIREMENT)
+            )
+    }
+}
+
 /// Two hashes of one symbol body, from [`crate::clonesig`].
 ///
 /// Kept in the model rather than beside the walk that computes it so the query

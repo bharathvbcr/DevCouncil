@@ -127,6 +127,8 @@ mod swift_properties;
 #[cfg(feature = "parse")]
 mod swift_properties_attack;
 #[cfg(feature = "parse")]
+mod swift_property_read_shapes;
+#[cfg(feature = "parse")]
 mod swift_recall_r5_attack;
 #[cfg(feature = "parse")]
 mod swift_scope_terminates;

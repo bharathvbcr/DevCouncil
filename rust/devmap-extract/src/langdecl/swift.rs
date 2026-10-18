@@ -143,11 +143,7 @@ fn self_identity(node: Node, source: &str) -> Option<(SymbolKind, String)> {
         // Emitting these closes the asymmetry SC31 named for C macros:
         // `Payload.text("z")` is already recorded as a call, and without the
         // case there is no node it could ever resolve to.
-        "simple_identifier"
-            if crate::treesitter::bounded_parent(node)
-                .is_some_and(|parent| parent.kind() == "enum_entry")
-                && is_named_child(node, "name") =>
-        {
+        "simple_identifier" if is_enum_case_name(node) => {
             Some((SymbolKind::Field, get_node_text(node, source)))
         }
         // A stored or computed property of a type, of an extension or of a
@@ -208,6 +204,70 @@ pub(crate) fn property_declaration_of(node: Node) -> Option<Node> {
         "class_body" | "enum_class_body" | "protocol_body"
     )
     .then_some(ancestor)
+}
+
+/// Whether `node` is a name an `enum_entry` declares (`fast` and `slow` in
+/// `case fast, slow`).
+pub(crate) fn is_enum_case_name(node: Node) -> bool {
+    node.kind() == "simple_identifier"
+        && crate::treesitter::bounded_parent(node)
+            .is_some_and(|parent| parent.kind() == "enum_entry")
+        && is_named_child(node, "name")
+}
+
+/// The name node of the property `parent` declares, when `parent` is a
+/// `property_declaration` written in an `extension` body and `inside` lies in its
+/// value (an initializer or a computed body) rather than in its name or type.
+pub(crate) fn extension_property_symbol<'tree>(
+    parent: Node<'tree>,
+    inside: Node<'tree>,
+) -> Option<Node<'tree>> {
+    if parent.kind() != "property_declaration" {
+        return None;
+    }
+    let body = crate::treesitter::bounded_parent(parent)?;
+    let owner = crate::treesitter::bounded_parent(body)?;
+    if body.kind() != "class_body" || owner.kind() != "class_declaration" {
+        return None;
+    }
+    let is_extension = owner
+        .child_by_field_name("declaration_kind")
+        .is_some_and(|kind| kind.kind() == "extension");
+    if !is_extension {
+        return None;
+    }
+    let value = parent
+        .child_by_field_name("computed_value")
+        .or_else(|| parent.child_by_field_name("value"))?;
+    if inside.start_byte() < value.start_byte() || inside.end_byte() > value.end_byte() {
+        return None;
+    }
+    let mut cursor = parent.walk();
+    let mut pattern = parent
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "pattern")?;
+    // `let (a, b) = …` binds several names; the first stands for the declaration.
+    while pattern.child_by_field_name("bound_identifier").is_none() {
+        let mut inner = pattern.walk();
+        let next = pattern
+            .named_children(&mut inner)
+            .find(|child| child.kind() == "pattern")?;
+        pattern = next;
+    }
+    pattern.child_by_field_name("bound_identifier")
+}
+
+/// The `signature` a member property is emitted with (see
+/// [`crate::model::SWIFT_STORED_PROPERTY`]), or `None` when `node` is not one.
+pub(crate) fn property_signature(node: Node) -> Option<&'static str> {
+    let property = property_declaration_of(node)?;
+    Some(if property.kind() == "protocol_property_declaration" {
+        crate::model::SWIFT_PROPERTY_REQUIREMENT
+    } else if property_is_computed(property) {
+        crate::model::SWIFT_COMPUTED_PROPERTY
+    } else {
+        crate::model::SWIFT_STORED_PROPERTY
+    })
 }
 
 /// Whether `node` occupies `field` on its own parent.

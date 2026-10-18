@@ -754,9 +754,18 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// (an attribute, `override`, a protocol requirement, a stored property of a
 /// type with supertypes). v97 also stops a Swift argument label (`f(count: 1)`)
 /// and a leading-dot member (`.count`) being recorded as a `Name` reference,
-/// which would now bind to a property. A v96 row has no property symbol and
-/// still records those two spellings, so serving it would leave every
-/// unchanged Swift file with no property for a read to bind to.
+/// which would now bind to a property; a leading-dot member written against a
+/// stated type (`-> Shape { .circle(1) }`, `var v: Shape = .circle(1)`) is
+/// recorded with that type as its receiver instead. A Swift property carries
+/// the `signature` `stored property`, `computed property` or `property
+/// requirement`, which is what tells it from an enum case; a key path
+/// (`\S.secret`) records its root type as the receiver; the right operand of an
+/// infix operator keeps its own receiver (`p.a + q.b` reads `q.b`, not `p.a +
+/// q`); a body written in an extension's computed property is attributed to
+/// that property; and an enum case's own name is no file-scope local. A v96 row
+/// has no property symbol and still records the old spellings, so serving it
+/// would leave every unchanged Swift file with no property for a read to bind
+/// to.
 pub const EXTRACTION_SCHEMA_VERSION: &str = "97";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

@@ -3040,8 +3040,33 @@ fn member_access_receiver(node: Node, source: &str) -> Option<String> {
         let navigation =
             bounded_parent(parent).filter(|nav| nav.kind() == "navigation_expression")?;
         let target = navigation.child_by_field_name("target")?;
-        let text = receiver_identity(target, source, 0);
+        // A key path names its member through the root type written after the
+        // backslash: `\S.secret` reads `S.secret`, and `\.secret` names no root.
+        if target.kind() == "key_path_expression" {
+            let mut cursor = target.walk();
+            let root = target
+                .named_children(&mut cursor)
+                .find(|child| matches!(child.kind(), "type_identifier" | "user_type"))
+                .map(|child| get_node_text(child, source));
+            return root.filter(|root| !root.is_empty());
+        }
+        // `p.a + q.b` parses as `((p.a + q).b)`: the sum is the target of the
+        // member access, which binds tighter than `+`. The receiver is the
+        // right operand (and what follows it), as `langcalls::swift` reads it
+        // for a call.
+        if let Some(tail) = crate::langcalls::swift::swift_sum_tail(target) {
+            return source
+                .get(tail.start_byte()..target.end_byte())
+                .and_then(crate::langcalls::scope::clamp_receiver);
+        }
+        let operand = crate::langcalls::swift::swift_call_operand(target);
+        let text = receiver_identity(operand, source, 0);
         return (!text.is_empty()).then_some(text);
+    }
+    // The member of a leading-dot expression (`.circle(1)`) names a member of
+    // the type the expression is written against, where that type is stated.
+    if parent.kind() == "prefix_expression" && swift_leading_dot_member(node, source) {
+        return swift_leading_dot_context(node, source);
     }
     // Kotlin's `callable_reference` has no fields either: `Type::m` names the
     // receiver type in its first named child and the member in its last.
@@ -5828,7 +5853,12 @@ fn extract_node(
                         file_symbol_name,
                     ),
                     docstring: None,
-                    signature: None,
+                    // A Swift member property says so, and whether it stores a
+                    // value: it shares `Field` with an enum case.
+                    signature: (lang == "swift")
+                        .then(|| crate::langdecl::swift::property_signature(node))
+                        .flatten()
+                        .map(str::to_string),
                     parent_symbol: Some(declaration.parent_symbol(file_symbol_name)),
                     body_signature: None,
                     declaration_hash: None,
@@ -9351,7 +9381,9 @@ fn maybe_push_name_reference(
         ref_kind = ReferenceKind::Type;
     }
     if is_argument_label(node)
-        || (lang == "swift" && swift_leading_dot_member(node, source))
+        || (lang == "swift"
+            && swift_leading_dot_member(node, source)
+            && swift_leading_dot_context(node, source).is_none())
         || name_field_holds_a_use(node)
         || is_defining_name(node)
         || is_inside_import_or_export(node)
@@ -9628,6 +9660,67 @@ fn swift_leading_dot_member(node: Node, source: &str) -> bool {
         && source
             .get(parent.start_byte()..node.start_byte())
             .is_some_and(|operator| operator.trim() == ".")
+}
+
+/// The type a Swift leading-dot expression is written against, when the source
+/// states it: `Shape` for the `.circle(1)` of `func unit() -> Shape { .circle(1) }`
+/// (an implicit or explicit `return`), of `var v: Shape = .circle(1)` and of
+/// `var w: Shape { .square }`.
+///
+/// Anything else — an argument (`f(.minute)`, whose parameter type is the
+/// callee's), an assignment, a `switch` pattern — has no contextual type this
+/// extractor can read, and the member then names nothing. Only a plain
+/// capitalised type name counts: an optional, an array or a generic names a
+/// different thing than the member's owner.
+fn swift_leading_dot_context(node: Node, source: &str) -> Option<String> {
+    let simple_type = |ty: Node| -> Option<String> {
+        if ty.kind() != "user_type" || ty.named_child_count() != 1 {
+            return None;
+        }
+        let name = ty.named_child(0).filter(|n| n.kind() == "type_identifier")?;
+        let name = get_node_text(name, source);
+        name.chars().next().is_some_and(char::is_uppercase).then_some(name)
+    };
+    let mut current = bounded_parent(node)?;
+    let mut returned = false;
+    for _ in 0..8 {
+        let parent = bounded_parent(current)?;
+        match parent.kind() {
+            // `.circle(1)`: the member is the callee, the call is the value.
+            "call_expression" if parent.named_child(0).is_some_and(|c| c.id() == current.id()) => {}
+            "control_transfer_statement"
+                if source
+                    .get(parent.start_byte()..parent.end_byte())
+                    .is_some_and(|text| text.trim_start().starts_with("return")) =>
+            {
+                returned = true;
+            }
+            // An implicit return is the body's last expression.
+            "statements"
+                if returned
+                    || parent
+                        .named_child(parent.named_child_count().checked_sub(1)?)
+                        .is_some_and(|last| last.id() == current.id()) => {}
+            "function_body" | "computed_property" | "computed_getter" => {}
+            "function_declaration" => {
+                let mut cursor = parent.walk();
+                let returns = parent
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() == "user_type");
+                return returns.and_then(simple_type);
+            }
+            "property_declaration" => {
+                let mut cursor = parent.walk();
+                let annotation = parent
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() == "type_annotation")?;
+                return annotation.child_by_field_name("name").and_then(simple_type);
+            }
+            _ => return None,
+        }
+        current = parent;
+    }
+    None
 }
 
 /// Whether `node` is a call's argument label — the `x` of Python `f(x=…)`,
@@ -10270,7 +10363,13 @@ fn is_symbol_binding(node: Node, source: &str) -> bool {
     // instead, its own name shadowed every bare read of it written outside a
     // function body — a computed property's getter, a property initializer —
     // and the read was dropped before the resolver saw it.
-    if crate::langdecl::swift::property_declaration_of(node).is_some() {
+    //
+    // An enum case is the same: it is a symbol, so its own spelling is no local
+    // either, and `.circle` in a property initializer must not be dropped
+    // because `case circle` is declared in the same file.
+    if crate::langdecl::swift::property_declaration_of(node).is_some()
+        || crate::langdecl::swift::is_enum_case_name(node)
+    {
         return true;
     }
     let Some(parent) = bounded_parent(node) else {
