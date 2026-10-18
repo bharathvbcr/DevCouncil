@@ -71,7 +71,11 @@ fn a_chain_past_the_cap_records_a_ledger_row_naming_the_cap() {
 
 #[test]
 fn explicit_super_with_the_enclosing_class_binds_whatever_the_spacing() {
-    for call in ["super(Child, self)", "super(Child,self)", "super( Child , self )"] {
+    for call in [
+        "super(Child, self)",
+        "super(Child,self)",
+        "super( Child , self )",
+    ] {
         let src = format!(
             "class Base:\n    def m(self):\n        return 1\n\nclass Child(Base):\n    def m(self):\n        return {call}.m()\n"
         );
@@ -139,7 +143,10 @@ fn a_module_that_declares_its_own_typing_in_a_plain_directory_shadows_the_standa
         ),
     ]);
     let got = calls(&r, "scripts/c.py::C.m");
-    assert!(!got.contains(&"scripts/c.py::Base.m".to_string()), "{got:?}");
+    assert!(
+        !got.contains(&"scripts/c.py::Base.m".to_string()),
+        "{got:?}"
+    );
 }
 
 #[test]

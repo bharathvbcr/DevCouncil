@@ -240,7 +240,9 @@ impl Resolver {
             let opaque = if depth == 0 {
                 self.python_bases
                     .get(&(file.to_string(), current.clone()))
-                    .map_or(0, |bases| bases.iter().filter(|base| *base == OPAQUE_BASE).count())
+                    .map_or(0, |bases| {
+                        bases.iter().filter(|base| *base == OPAQUE_BASE).count()
+                    })
             } else {
                 0
             };
@@ -554,7 +556,9 @@ impl Resolver {
         if !beside.contains(&found) || at_a_root.contains(&found) {
             return true;
         }
-        !self.file_symbols.contains_key(&format!("{dir}/__init__.py"))
+        !self
+            .file_symbols
+            .contains_key(&format!("{dir}/__init__.py"))
     }
 
     /// What `file`'s imports bind the local `name` to, minus every `from m
@@ -1006,10 +1010,9 @@ pub(super) fn python_all_is_dynamic(ext: &Extraction) -> bool {
     let all_scope = format!("{}::__all__", ext.file_path);
     ext.scope_locals.iter().any(|(scope, name)| {
         *scope == all_scope
-            && !ext
-                .literals
-                .iter()
-                .any(|literal| literal.value == *name && literal.enclosing_qualified_name.is_empty())
+            && !ext.literals.iter().any(|literal| {
+                literal.value == *name && literal.enclosing_qualified_name.is_empty()
+            })
     }) || ext.symbols.iter().any(|symbol| {
         symbol.name == "__all__"
             && matches!(symbol.kind, SymbolKind::Function | SymbolKind::Class)
@@ -1292,7 +1295,10 @@ pub(super) fn python_scoped_imports(ext: &Extraction) -> PythonScopedImports {
                 );
             }
         }
-        for local in locals.into_iter().filter(|local| !matches!(*local, "" | "*")) {
+        for local in locals
+            .into_iter()
+            .filter(|local| !matches!(*local, "" | "*"))
+        {
             if kind == SymbolKind::Class {
                 scoped.in_class_body.insert(local.to_string());
             } else {

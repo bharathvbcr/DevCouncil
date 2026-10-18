@@ -3866,9 +3866,9 @@ impl Resolver {
             let py_scopes = (LangFamily::from_lang(&ext.language) == LangFamily::Python)
                 .then(|| pytypes::python_scope_containers(ext));
             for imp in &ext.imports {
-                let nested_python = py_scopes
-                    .as_deref()
-                    .is_some_and(|scopes| pytypes::python_innermost_container(scopes, &imp.span).is_some());
+                let nested_python = py_scopes.as_deref().is_some_and(|scopes| {
+                    pytypes::python_innermost_container(scopes, &imp.span).is_some()
+                });
                 // A Python module loaded by file path binds a *scoped* handle,
                 // so it goes to its own table and never to `file_bindings`. A
                 // load that binds nothing (`run_path`) contributes only the
@@ -10386,9 +10386,8 @@ impl Resolver {
                 // Same rule as the call ladder: an overridden `self.m` is not a
                 // deterministic reference target. Returning `None` here refuses
                 // the import fallthrough for an implicit receiver.
-                ImplicitReceiverAnswer::VirtualOverride | ImplicitReceiverAnswer::HeritageCap(_) => {
-                    return None
-                }
+                ImplicitReceiverAnswer::VirtualOverride
+                | ImplicitReceiverAnswer::HeritageCap(_) => return None,
             }
         }
 

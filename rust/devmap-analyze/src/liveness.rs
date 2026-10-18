@@ -1411,9 +1411,10 @@ fn python_contract_exemptions(ext: &Extraction) -> HashMap<String, String> {
             .collect();
         let root = written[0];
         if root == OPAQUE_BASE
-            || ext.scope_locals.iter().any(|(scope, name)| {
-                scope == &ext.file_path && name == root
-            })
+            || ext
+                .scope_locals
+                .iter()
+                .any(|(scope, name)| scope == &ext.file_path && name == root)
             || ext.symbols.iter().any(|symbol| {
                 symbol.name == root
                     && symbol.kind != SymbolKind::File
@@ -1429,7 +1430,8 @@ fn python_contract_exemptions(ext: &Extraction) -> HashMap<String, String> {
             continue;
         }
         for symbol in &ext.symbols {
-            if symbol.kind == SymbolKind::Method && symbol.parent_symbol.as_deref() == Some(declarer)
+            if symbol.kind == SymbolKind::Method
+                && symbol.parent_symbol.as_deref() == Some(declarer)
             {
                 if let Some(reason) =
                     devmap_extract::wiring::python_base_dispatch_reason(&qualified, &symbol.name)
