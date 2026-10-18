@@ -70,6 +70,7 @@ struct Outcome {
     total: u32,
     truncated: bool,
     walk_incomplete: Option<String>,
+    note: Option<String>,
 }
 
 fn row(e: &ResolvedEdge) -> Row {
@@ -93,6 +94,7 @@ fn outcome(r: Result<Response<ResolvedEdge>, String>) -> Outcome {
             total: 0,
             truncated: false,
             walk_incomplete: None,
+            note: None,
         },
         Ok(r) => {
             let (available, refusal) = match &r.resolution {
@@ -108,6 +110,7 @@ fn outcome(r: Result<Response<ResolvedEdge>, String>) -> Outcome {
                 total: r.total,
                 truncated: r.truncated,
                 walk_incomplete: r.walk_incomplete.clone(),
+                note: r.note.clone(),
             }
         }
     }
@@ -151,8 +154,8 @@ fn diff(store: &Outcome, memory: &Outcome) -> String {
 fn diff_with(store: &Outcome, memory: &Outcome, strict: bool) -> String {
     let (mut store, mut memory) = (store.clone(), memory.clone());
     if !strict {
-        store.walk_incomplete = blank_count(&store.walk_incomplete).or(store.walk_incomplete);
-        memory.walk_incomplete = blank_count(&memory.walk_incomplete).or(memory.walk_incomplete);
+        store.note = blank_count(&store.note).or(store.note);
+        memory.note = blank_count(&memory.note).or(memory.note);
     }
     let (store, memory) = (&store, &memory);
     let mut out = String::new();
@@ -202,6 +205,7 @@ fn diff_with(store: &Outcome, memory: &Outcome, strict: bool) -> String {
         format!("{:?}", store.walk_incomplete),
         format!("{:?}", memory.walk_incomplete),
     );
+    field("note", store.note == memory.note, format!("{:?}", store.note), format!("{:?}", memory.note));
     out
 }
 
@@ -405,11 +409,11 @@ fn p2_a_file_that_shadows_a_symbol_says_so() {
         assert!(o.available, "{engine}: {o:?}");
         assert!(o.items.iter().all(|r| r.0 == "Svc.py"), "{engine}: file must win: {o:?}");
         let announced = o
-            .walk_incomplete
+            .note
             .as_deref()
             .is_some_and(|n| n.contains("symbol") || n.contains("shadow"));
         if !announced {
-            report.push_str(&format!("  {engine}: file wins silently; note={:?}\n", o.walk_incomplete));
+            report.push_str(&format!("  {engine}: file wins silently; note={:?}\n", o.note));
         }
     }
     assert!(report.is_empty(), "shadowing not announced:\n{report}");
@@ -669,14 +673,14 @@ fn p4_zero_outbound_many_inbound_is_not_truncated() {
             assert!(o.available, "{engine} {query}: {o:?}");
             assert!(!o.truncated, "{engine} {query}: truncated with nothing hidden: {o:?}");
             assert_eq!((o.total, o.hidden, o.shown), (0, 0, 0), "{engine} {query}");
-            let note = o.walk_incomplete.clone().unwrap_or_default();
+            let note = o.note.clone().unwrap_or_default();
             let truth = raw_rows(&fx)
                 .iter()
                 .filter(|e| e.target_symbol == "hub.py::hub" && e.source_symbol != e.target_symbol)
                 .count() as u64;
             assert!(truth >= 60, "fixture: {truth}");
             assert_eq!(
-                inbound_count(&o.walk_incomplete),
+                inbound_count(&o.note),
                 Some(truth),
                 "{engine} {query}: the stated inbound count must be the stored one: {note:?}"
             );
@@ -714,7 +718,7 @@ fn p4_an_all_inbound_file_at_budget_one_is_not_truncated() {
             .iter()
             .filter(|e| e.target_file == "hub.py" && e.source_file != "hub.py")
             .count() as u64;
-        assert_eq!(inbound_count(&o.walk_incomplete), Some(truth), "{engine}: {o:?}");
+        assert_eq!(inbound_count(&o.note), Some(truth), "{engine}: {o:?}");
     }
     assert_parity(&stripped, &["hub.py", "hub", "hub.py::hub"], &[1, 8_000]);
 }
@@ -824,7 +828,7 @@ fn p5_the_inbound_count_equals_the_stored_inbound_rows() {
         ("store", store_answer(&fx, "RETRY_BUDGET_FACTOR", 8_000)),
         ("memory", memory_answer(&fx, "RETRY_BUDGET_FACTOR", 8_000)),
     ] {
-        let note = o.walk_incomplete.unwrap_or_default();
+        let note = o.note.unwrap_or_default();
         assert!(note.contains(&format!("{inbound} inbound edge(s)")), "{engine}: want {inbound}: {note:?}");
         assert!(note.contains("`impact`"), "{engine}: {note:?}");
     }
@@ -842,7 +846,7 @@ fn p5_the_note_does_not_ride_on_a_non_empty_answer() {
         ] {
             assert!(!o.items.is_empty(), "{engine} {query}");
             assert!(
-                !o.walk_incomplete.unwrap_or_default().contains("inbound edge(s)"),
+                !o.note.unwrap_or_default().contains("inbound edge(s)"),
                 "{engine} {query}"
             );
         }
@@ -1005,7 +1009,7 @@ fn p5_a_rung_that_filters_every_edge_does_not_claim_the_target_depends_on_nothin
     assert!(floored.items.is_empty(), "fixture: the floor must remove them: {floored:?}");
     let filtered = floored.rungs.as_ref().map_or(0, |h| h.filtered_out);
     assert!(filtered > 0, "histogram must show what the rung hid");
-    let note = floored.walk_incomplete.clone().unwrap_or_default();
+    let note = floored.note.clone().unwrap_or_default();
     assert!(
         !note.contains("depends on nothing"),
         "helper has {filtered} edge(s) hidden by the rung, yet the answer says: {note}"
@@ -1024,7 +1028,7 @@ fn p1_inbound_counts_agree_between_engines_and_with_the_store() {
     for query in ["RETRY_BUDGET_FACTOR", "lib.py::RETRY_BUDGET_FACTOR", "b.py::dup", "lib.py::Svc.run"] {
         let s = store_answer(&fx, query, 8_000);
         let m = memory_answer(&fx, query, 8_000);
-        let (sc, mc) = (inbound_count(&s.walk_incomplete), inbound_count(&m.walk_incomplete));
+        let (sc, mc) = (inbound_count(&s.note), inbound_count(&m.note));
         let want = raw
             .iter()
             .filter(|e| {
@@ -1108,9 +1112,9 @@ fn p4_a_large_inbound_population_is_counted_once_and_cheaply() {
     let s = store_answer(&fx, "hub", 8_000);
     let took = started.elapsed();
     assert!(took < Duration::from_secs(2), "store took {took:?} for {truth} inbound edges");
-    assert_eq!(inbound_count(&s.walk_incomplete), Some(truth), "{:?}", s.walk_incomplete);
+    assert_eq!(inbound_count(&s.note), Some(truth), "{:?}", s.walk_incomplete);
     let m = memory_answer(&fx, "hub", 8_000);
-    assert_eq!(inbound_count(&m.walk_incomplete), Some(truth), "{:?}", m.walk_incomplete);
+    assert_eq!(inbound_count(&m.note), Some(truth), "{:?}", m.walk_incomplete);
 }
 
 /// Probe 3. A self edge (recursion) is outbound from the symbol exactly once

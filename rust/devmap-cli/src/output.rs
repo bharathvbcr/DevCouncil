@@ -149,6 +149,10 @@ pub(crate) fn emit_edges(resp: &devmap_query::Response<devmap_resolve::ResolvedE
     if let Some(reason) = &resp.walk_incomplete {
         outln!("warning: {reason}");
     }
+    // Information about a complete answer, not a defect in it: no `warning:`.
+    if let Some(note) = &resp.note {
+        outln!("note: {note}");
+    }
 }
 
 pub(crate) fn emit_blast_radius(radius: &devmap_query::BlastRadius) {

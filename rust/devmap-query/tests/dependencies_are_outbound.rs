@@ -168,7 +168,7 @@ fn a_symbol_with_no_outbound_edges_is_an_honest_empty_answer() {
         assert!(!reason(&answer).contains("not indexed"), "{engine}");
         assert!(answer.items.is_empty(), "{engine}: {:?}", answer.items);
         assert_eq!(answer.total, 0, "{engine}");
-        let note = answer.walk_incomplete.clone().unwrap_or_default();
+        let note = answer.note.clone().unwrap_or_default();
         assert!(
             note.contains("inbound edge(s)") && note.contains("impact"),
             "{engine}: the inbound edges left out must be named: {note:?}"
@@ -261,7 +261,7 @@ fn an_all_inbound_file_is_withheld_and_labelled() {
         let answer = answer.unwrap();
         assert!(available(&answer), "{engine}");
         assert!(answer.items.is_empty(), "{engine}: {:?}", answer.items);
-        let note = answer.walk_incomplete.clone().unwrap_or_default();
+        let note = answer.note.clone().unwrap_or_default();
         assert!(
             note.contains(&format!("{inbound} inbound edge(s)")),
             "{engine}: the count must be stated: {note:?}"

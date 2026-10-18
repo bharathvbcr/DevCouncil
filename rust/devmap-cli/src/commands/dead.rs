@@ -271,6 +271,7 @@ mod tests {
                 dead_clusters_incomplete: incomplete.map(str::to_string),
                 excluded: None,
                 unresolved_namesakes: None,
+                note: None,
                 scope: None,
             }
         }

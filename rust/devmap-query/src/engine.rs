@@ -14,6 +14,7 @@ use crate::model::*;
 // defined in this file: public ones are re-exported below, and private ones are
 // `pub(super)` there and imported here, so `engine::` names are unchanged.
 mod budget;
+mod dependencies;
 mod gaps;
 mod hits;
 mod in_memory;
@@ -44,6 +45,9 @@ use self::hits::{
 pub use self::hits::{EVIDENCE_TEST_BUDGET_SHARE, EVIDENCE_TEST_DEPTH};
 use self::trace::shortest_path;
 pub(crate) use self::trace::PathSearch;
+use self::dependencies::{
+    dependency_note, dependency_order, shadowed_symbol_count, DependencyFacts, InboundTarget,
+};
 use self::traversal::{
     bare_callee_name, blast_radius_from_edges, family_of_path, indexed_traversal_starts,
     indexed_traversed_edges, node_id_of, reached_by, BlastBand, BlastWalk, NamesakeRead,
@@ -341,21 +345,40 @@ impl<'a> StoreQueryEngine<'a> {
             .into_iter()
             .map(stored_edge_to_resolved)
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let (edges, rungs) = crate::rung::narrow(edges, min_rung);
-        // The file has edges pointing at it and none leaving it: an empty page
-        // is the honest answer to "what does it depend on", and the callers
-        // are named rather than left to read as absent.
-        let inbound_note = (edges.is_empty() && snapshot.inbound_edges > 0)
-            .then(|| inbound_only_note(&req.query, snapshot.inbound_edges));
+        let outbound_before_rung = edges.len();
+        let (mut edges, rungs) = crate::rung::narrow(edges, min_rung);
+        edges.sort_by(dependency_order);
+        // Which symbols the file's spelling also names. Only a spelling with no
+        // path separator can, and the index is the same one a symbol query
+        // reads, so a warm daemon pays nothing for the check.
+        let shadowed_symbols = if req.query.contains(['/', '\\']) {
+            0
+        } else if let Some(index) = self.generation_edges()? {
+            let names: BTreeSet<&str> = index
+                .symbols(false)
+                .chain(index.symbols(true))
+                .map(|(name, _)| name)
+                .collect();
+            shadowed_symbol_count(&req.query, names.into_iter())
+        } else {
+            0
+        };
+        let note = dependency_note(&DependencyFacts {
+            query: &req.query,
+            outbound_before_rung,
+            outbound_after_rung: edges.len(),
+            inbound: snapshot.inbound_edges,
+            min_rung,
+            shadowed_symbols,
+        });
         let mut response = budget_take(edges, req.token_budget, |_| 25);
         response.rungs = Some(rungs);
+        response.note = note;
         // Composed, not assigned: `budget_take` may already have set a reason
         // of its own, and a reader deciding whether to act on this list needs
         // every qualification the answer holds, not the last one written.
-        response.walk_incomplete = devmap_analyze::combine_reasons(
-            devmap_analyze::combine_reasons(response.walk_incomplete.take(), coverage_gap),
-            inbound_note,
-        );
+        response.walk_incomplete =
+            devmap_analyze::combine_reasons(response.walk_incomplete.take(), coverage_gap);
         Ok(self.finish(response))
     }
 
@@ -429,15 +452,9 @@ impl<'a> StoreQueryEngine<'a> {
             self.cancel.check_every(checked)?;
             edges.push(stored_edge_to_resolved(index.stored_edge(id))?);
         }
-        edges.sort_by(|a, b| {
-            b.confidence
-                .0
-                .total_cmp(&a.confidence.0)
-                .then_with(|| a.target_file.cmp(&b.target_file))
-                .then_with(|| a.target_symbol.cmp(&b.target_symbol))
-                .then_with(|| a.source_symbol.cmp(&b.source_symbol))
-        });
-        let (edges, rungs) = crate::rung::narrow(edges, min_rung);
+        let outbound_before_rung = edges.len();
+        let (mut edges, rungs) = crate::rung::narrow(edges, min_rung);
+        edges.sort_by(dependency_order);
         let coverage_gap = devmap_analyze::combine_reasons(
             analysis_status_gap(index.analysis()),
             self.radius_attribution_gap(
@@ -447,42 +464,54 @@ impl<'a> StoreQueryEngine<'a> {
                 RadiusSide::Callees,
             )?,
         );
-        let inbound_note = if edges.is_empty() {
-            let mut inbound = 0usize;
-            for (symbol, file) in &inbound_starts {
-                inbound += index
-                    .into_target_symbol(symbol)
-                    .iter()
-                    .filter(|id| {
-                        index.target_file(**id) == file
-                            && index.source_symbol(**id) != symbol
-                            && index.admits(**id, min_confidence)
-                            && index.confidence(**id) >= min_confidence
-                    })
-                    .count();
+        // Distinct nodes, then distinct edges: a node named by several inbound
+        // edges is one start, and an edge reachable from two starts is one edge.
+        // Counting per `(start, edge)` made the figure quadratic in the number
+        // of callers.
+        let inbound_nodes: BTreeSet<(String, String)> = inbound_starts.into_iter().collect();
+        let inbound_target = InboundTarget::Symbols(&inbound_nodes);
+        let mut inbound_ids: BTreeSet<u32> = BTreeSet::new();
+        if edges.is_empty() {
+            for (symbol, _) in &inbound_nodes {
+                for id in index.into_target_symbol(symbol) {
+                    if index.admits(*id, min_confidence)
+                        && index.confidence(*id) >= min_confidence
+                        && inbound_target.admits(
+                            index.source_file(*id),
+                            index.source_symbol(*id),
+                            index.target_file(*id),
+                            index.target_symbol(*id),
+                        )
+                    {
+                        inbound_ids.insert(*id);
+                    }
+                }
             }
-            (inbound > 0).then(|| inbound_only_note(&req.query, inbound))
-        } else {
-            None
-        };
+        }
         // A target whose calls were never extracted has nothing measured:
         // refused, as `impact` refuses it, rather than answered as a leaf.
-        if edges.is_empty() && call_blind.every_start_is_blind() {
-            let reason = call_blind.reason().unwrap_or_default();
-            let mut response = self.unavailable(ResolutionAvailability::Unavailable {
-                reason: format!("{} has no measured dependencies: {reason}", req.query),
-            });
-            response.walk_incomplete = coverage_gap;
-            return Ok(response);
+        if edges.is_empty() {
+            if let Some(reason) = call_blind.refusal_when_empty(&req.query) {
+                let mut response =
+                    self.unavailable(ResolutionAvailability::Unavailable { reason });
+                response.walk_incomplete = coverage_gap;
+                return Ok(response);
+            }
         }
+        let note = dependency_note(&DependencyFacts {
+            query: &req.query,
+            outbound_before_rung,
+            outbound_after_rung: edges.len(),
+            inbound: inbound_ids.len(),
+            min_rung,
+            shadowed_symbols: 0,
+        });
         let mut response = budget_take(edges, req.token_budget, |_| EDGE_TOKENS);
         response.rungs = Some(rungs);
+        response.note = note;
         response.walk_incomplete = devmap_analyze::combine_reasons(
-            devmap_analyze::combine_reasons(
-                devmap_analyze::combine_reasons(response.walk_incomplete.take(), coverage_gap),
-                call_blind.reason(),
-            ),
-            inbound_note,
+            devmap_analyze::combine_reasons(response.walk_incomplete.take(), coverage_gap),
+            call_blind.reason(),
         );
         Ok(self.finish(response))
     }
@@ -1523,23 +1552,11 @@ impl<'a> StoreQueryEngine<'a> {
         };
         for path in distinct.into_iter().take(MAX_CALL_BLIND_FILES_CHECKED) {
             self.cancel.check()?;
-            starts.checked += 1;
             let Some(file) = self.store.latest_file(path)? else {
+                starts.checked += 1;
                 continue;
             };
-            if matches!(
-                file.parse_outcome,
-                devmap_extract::model::ParseOutcome::Clean
-            ) {
-                starts.clean.insert(file.path.clone());
-            }
-            if devmap_extract::model::is_call_blind(
-                &file.language,
-                &file.engine,
-                &file.parse_outcome,
-            ) {
-                starts.blind.push((file.path, file.language));
-            }
+            starts.record(&file.path, &file.language, &file.engine, &file.parse_outcome);
         }
         Ok(starts)
     }
@@ -3281,6 +3298,7 @@ impl<'a> StoreQueryEngine<'a> {
             dead_clusters_incomplete: None,
             excluded: None,
             unresolved_namesakes: None,
+            note: None,
             scope: None,
         };
 
@@ -3821,17 +3839,6 @@ fn latest_extractions_cancellable(
     store
         .latest_extractions_until(&mut || cancel.check().is_err())?
         .ok_or_else(|| anyhow::Error::new(crate::cancel::QueryCancelled))
-}
-
-/// The qualification an empty `dependencies` answer carries when edges point at
-/// the target but none leave it. `dependencies` is outbound only; without this
-/// an empty page reads as "nothing touches this", which is the reading that
-/// gets a live symbol deleted.
-fn inbound_only_note(target: &str, inbound: usize) -> String {
-    format!(
-        "{target} depends on nothing in the index, but {inbound} inbound edge(s) point at it; \
-         `dependencies` lists outbound edges only — ask `impact` for what reaches it"
-    )
 }
 
 fn stored_edge_to_resolved(edge: StoredEdge) -> anyhow::Result<ResolvedEdge> {

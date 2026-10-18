@@ -1196,7 +1196,7 @@ for a known name. Pass `paths` / `languages` to rank within one subtree or langu
         ),
         "deps" => (
             "What the target depends on — its outbound edges. Accepts a file path or a \
-symbol name.",
+symbol name. An empty list is complete: read `note` for the inbound edges it left out.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1618,7 +1618,11 @@ fn budgeted_envelope(items: &str) -> Value {
             "walk_incomplete": {"type": ["string", "null"],
                 "description": "Present only when the *producer* stopped early — a depth cap, a \
     cancellation — as distinct from the budgeter trimming a complete set. Its presence means the \
-    answer is partial by an unknown amount, which `hidden` cannot express."}
+    answer is partial by an unknown amount, which `hidden` cannot express."},
+            "note": {"type": ["string", "null"],
+                "description": "Present when a complete answer has something worth reading — for \
+    `deps`, an empty list over a target that has callers, or edges hidden by `min_rung`. It is \
+    information, not a warning: it never means the answer is partial."}
         },
         "required": ["items", "shown", "hidden", "total", "truncated", "tokens_used", "resolution"],
         "additionalProperties": true

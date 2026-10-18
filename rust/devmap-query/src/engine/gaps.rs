@@ -71,6 +71,38 @@ pub(super) struct CallBlindStarts {
 }
 
 impl CallBlindStarts {
+    /// Fold one read start file in. The single place a file's parse outcome and
+    /// language become a call-blind verdict, shared by the store-backed engine
+    /// (which reads the file row) and the in-memory one (which holds the
+    /// extraction).
+    pub(super) fn record(
+        &mut self,
+        path: &str,
+        language: &str,
+        engine: &devmap_extract::model::ExtractionEngine,
+        parse_outcome: &devmap_extract::model::ParseOutcome,
+    ) {
+        self.checked += 1;
+        if matches!(parse_outcome, devmap_extract::model::ParseOutcome::Clean) {
+            self.clean.insert(path.to_string());
+        }
+        if devmap_extract::model::is_call_blind(language, engine, parse_outcome) {
+            self.blind.push((path.to_string(), language.to_string()));
+        }
+    }
+
+    /// The refusal an empty `dependencies` answer must give when nothing it rests
+    /// on was measured, or `None` when the emptiness is a measured one.
+    pub(super) fn refusal_when_empty(&self, target: &str) -> Option<String> {
+        if !self.every_start_is_blind() {
+            return None;
+        }
+        Some(format!(
+            "{target} has no measured dependencies: {}",
+            self.reason().unwrap_or_default()
+        ))
+    }
+
     /// Whether nothing the answer rests on was measured: at least one start
     /// was checked, every checked start is call-blind, and none went unread.
     pub(super) fn every_start_is_blind(&self) -> bool {

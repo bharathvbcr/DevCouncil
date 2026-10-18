@@ -127,6 +127,7 @@ pub(super) fn unavailable_response<T>(resolution: ResolutionAvailability) -> Res
         dead_clusters_incomplete: None,
         excluded: None,
         unresolved_namesakes: None,
+        note: None,
         scope: None,
     }
 }
@@ -308,6 +309,7 @@ where
         dead_clusters_incomplete: None,
         excluded: None,
         unresolved_namesakes: None,
+        note: None,
         scope: None,
     }
 }
@@ -339,6 +341,7 @@ where
             dead_clusters_incomplete: None,
             excluded: None,
             unresolved_namesakes: None,
+            note: None,
             scope: None,
         };
     }
@@ -360,6 +363,7 @@ where
         dead_clusters_incomplete: None,
         excluded: None,
         unresolved_namesakes: None,
+        note: None,
         scope: None,
     }
 }

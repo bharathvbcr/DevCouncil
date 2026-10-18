@@ -1,3 +1,7 @@
+use super::dependencies::{
+    dependency_note, dependency_order, shadowed_symbol_count, DependencyFacts, InboundTarget,
+};
+use super::gaps::CallBlindStarts;
 use super::{
     attribution_coverage_gap, budget_take, byte_span_to_line_range, cap_source_span,
     empty_result_gap, file_edge_coverage_gap, reached_by, search_coverage_gap,
@@ -47,6 +51,7 @@ impl<'a> QueryEngine<'a> {
                 dead_clusters_incomplete: None,
                 excluded: None,
                 unresolved_namesakes: None,
+                note: None,
                 scope: None,
             };
         }
@@ -180,28 +185,36 @@ impl<'a> QueryEngine<'a> {
             }
         }
         let target = query.trim();
-        // `None` outbound starts means a file query: every edge written in the
-        // file. Otherwise the `(symbol, file)` nodes the query names.
-        let (outbound_starts, file_gap, sites, side): (
-            Option<BTreeSet<(String, String)>>,
-            Option<String>,
-            BTreeSet<(String, String)>,
-            RadiusSide,
-        ) = match extraction {
-            Some(extraction) => (
-                None,
-                file_edge_coverage_gap(&extraction.parse_outcome),
-                BTreeSet::from([(query.clone(), query.clone())]),
-                RadiusSide::FileCallees,
-            ),
+        // A file query reads every edge written in the file; a symbol query reads
+        // the edges leaving the `(symbol, file)` nodes it names.
+        let mut outbound_nodes: Option<BTreeSet<(String, String)>> = None;
+        let mut inbound_nodes: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut call_blind = CallBlindStarts::default();
+        let (file_gap, sites, side, shadowed_symbols) = match extraction {
+            Some(extraction) => {
+                let symbols = self.resolution.edges.iter().flat_map(|edge| {
+                    [edge.source_symbol.as_str(), edge.target_symbol.as_str()]
+                });
+                (
+                    file_edge_coverage_gap(&extraction.parse_outcome),
+                    BTreeSet::from([(query.clone(), query.clone())]),
+                    RadiusSide::FileCallees,
+                    shadowed_symbol_count(query, symbols),
+                )
+            }
             None => {
                 let outbound: BTreeSet<(String, String)> =
                     super::traversal_starts(&self.resolution.edges, target, false)
                         .into_iter()
                         .collect();
-                let inbound = super::traversal_starts(&self.resolution.edges, target, true);
-                let named: BTreeSet<(String, String)> =
-                    outbound.iter().cloned().chain(inbound).collect();
+                inbound_nodes = super::traversal_starts(&self.resolution.edges, target, true)
+                    .into_iter()
+                    .collect();
+                let named: BTreeSet<(String, String)> = outbound
+                    .iter()
+                    .cloned()
+                    .chain(inbound_nodes.iter().cloned())
+                    .collect();
                 if matches!(
                     crate::query_match::classify(target),
                     crate::query_match::StartQuery::Symbol(_)
@@ -220,7 +233,17 @@ impl<'a> QueryEngine<'a> {
                         reason: format!("{query} is not indexed"),
                     });
                 }
-                (Some(outbound), None, named, RadiusSide::Callees)
+                let files: BTreeSet<&str> = named.iter().map(|(_, file)| file.as_str()).collect();
+                for path in files {
+                    match self.extractions.iter().find(|e| e.file_path == path) {
+                        Some(e) => {
+                            call_blind.record(&e.file_path, &e.language, &e.engine, &e.parse_outcome)
+                        }
+                        None => call_blind.checked += 1,
+                    }
+                }
+                outbound_nodes = Some(outbound);
+                (None, named, RadiusSide::Callees, 0)
             }
         };
         let file_sites = self.radius_attribution_gap(&sites, side);
@@ -228,49 +251,57 @@ impl<'a> QueryEngine<'a> {
             file_gap,
             devmap_analyze::combine_reasons(self.coverage_gap.clone(), file_sites),
         );
+        let inbound_target = match &outbound_nodes {
+            None => InboundTarget::File(query),
+            Some(_) => InboundTarget::Symbols(&inbound_nodes),
+        };
         let mut deps = Vec::new();
         let mut inbound = 0usize;
         for edge in &self.resolution.edges {
             if edge.confidence.0 < req.min_confidence {
                 continue;
             }
-            match &outbound_starts {
-                None if &edge.source_file == query => deps.push(edge.clone()),
-                None if &edge.target_file == query => inbound += 1,
-                Some(starts)
-                    if starts.contains(&(edge.source_symbol.clone(), edge.source_file.clone())) =>
-                {
-                    deps.push(edge.clone());
+            let outbound = match &outbound_nodes {
+                None => &edge.source_file == query,
+                Some(nodes) => {
+                    nodes.contains(&(edge.source_symbol.clone(), edge.source_file.clone()))
                 }
-                Some(_)
-                    if edge.source_symbol != edge.target_symbol
-                        && crate::query_match::traversal_start_matches(
-                            target,
-                            &edge.target_symbol,
-                            &edge.target_file,
-                        ) =>
-                {
-                    inbound += 1;
-                }
-                _ => {}
+            };
+            if outbound {
+                deps.push(edge.clone());
+            } else if inbound_target.admits(
+                &edge.source_file,
+                &edge.source_symbol,
+                &edge.target_file,
+                &edge.target_symbol,
+            ) {
+                inbound += 1;
             }
         }
 
-        deps.sort_by(|a, b| {
-            b.confidence
-                .0
-                .total_cmp(&a.confidence.0)
-                .then_with(|| a.source_file.cmp(&b.source_file))
-                .then_with(|| a.target_file.cmp(&b.target_file))
-                .then_with(|| a.target_symbol.cmp(&b.target_symbol))
+        let outbound_before_rung = deps.len();
+        deps.sort_by(dependency_order);
+        if outbound_nodes.is_some() && deps.is_empty() {
+            if let Some(reason) = call_blind.refusal_when_empty(query) {
+                let mut response = unavailable_response(ResolutionAvailability::Unavailable { reason });
+                response.walk_incomplete = coverage_gap;
+                return response;
+            }
+        }
+        // `dependencies` here takes no rung floor, so the cut never empties it.
+        let note = dependency_note(&DependencyFacts {
+            query,
+            outbound_before_rung,
+            outbound_after_rung: deps.len(),
+            inbound,
+            min_rung: None,
+            shadowed_symbols,
         });
-
-        let inbound_note =
-            (deps.is_empty() && inbound > 0).then(|| super::inbound_only_note(query, inbound));
         let mut response = budget_take(deps, req.token_budget, |_| 25);
+        response.note = note;
         response.walk_incomplete = devmap_analyze::combine_reasons(
             devmap_analyze::combine_reasons(response.walk_incomplete.take(), coverage_gap),
-            inbound_note,
+            call_blind.reason(),
         );
         response
     }
