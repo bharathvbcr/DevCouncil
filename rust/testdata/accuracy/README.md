@@ -298,9 +298,20 @@ guarded retry, `RAYON_NUM_THREADS=4 DEVMAP_CORPUS_<NAME>=<checkout> cargo test
 
 `parse_failed` lives in `corpora.json`, beside the pin it describes, because it
 is a property of the pinned commit that a reviewer changes with it; `record.json`
-holds only measurements. Seeded with the idle-machine counts: scholarlm 8,
-Lappi-decision 0, GitPulse 0, DevType 0, ChronosFlow 3. The other pinned corpora
-have none yet and are refused until one is measured and added.
+holds only measurements. Every pin carries the key (CI checks it): an integer
+from 0 to 100000, or `"unmeasured"` for a corpus whose idle count was never
+taken, which refuses at run time until one is measured and added. Measured:
+scholarlm 8, Lappi-decision 0, GitPulse 0, DevType 0, ChronosFlow 3. Unmeasured:
+LiquiTask, SalEdge, AcademiaTrack, Chronicle, DevPrism. Duplicate corpus names
+refuse at load. Paths and messages in refusal text are escaped and capped (512
+bytes each, 50 paths), and the retry command names `DEVMAP_CORPUS_<NAME>_LABELS`
+when the run used it. `record.json` is replaced atomically (temp file, fsync,
+rename).
+
+**Deferred.** The baseline is a count, so a different file failing at the same
+count is invisible (`characterisation_a_swapped_failing_file_...`). Recording
+the failing set would leak private paths unless hashed as `record_identity`
+does; that is a design question for the owner.
 
 A refused run writes nothing: `record.json`, `open_gates` included, stays as
 committed. The refusal text lists the gate each committed row fails as while
