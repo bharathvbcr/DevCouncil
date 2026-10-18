@@ -58,6 +58,16 @@ impl PythonImportBind {
     }
 }
 
+/// What binds a name in the nearest function that binds it; see
+/// [`Resolver::python_scope_lookup`].
+pub(super) enum ScopeHit<'a> {
+    /// An import written in the function; `None` when it names no indexed
+    /// file, or the function imports the name from two places.
+    Import(Option<&'a (String, String)>),
+    /// Any other binding: a parameter, an assignment, a `for` target.
+    Local,
+}
+
 /// Why the file-scoped walk gave no linearization.
 pub(super) enum MroStop {
     /// A base this file cannot bind or prove external: ask the flat table.
@@ -87,12 +97,27 @@ impl Resolver {
     /// identity)`: declared at file level here, or bound by an `import` to a
     /// class declared elsewhere. `None` when the name is neither, or is
     /// declared twice in the file.
-    pub(super) fn python_class_named(&self, file: &str, written: &str) -> Option<(String, String)> {
+    ///
+    /// `scope` is the callable the name is written in (`Some(file)` for the
+    /// module): a function that binds the name itself is not the module's
+    /// reading of it ([`Self::python_import_binding`]).
+    pub(super) fn python_class_named(
+        &self,
+        file: &str,
+        scope: Option<&str>,
+        written: &str,
+    ) -> Option<(String, String)> {
         // `m.A`, written through a module the file imports: the same reading a
         // dotted base gets, and none when the root is not bound exactly once.
         if let Some((root, member)) = written.split_once('.') {
+            if scope
+                .filter(|scope| *scope != file)
+                .is_some_and(|scope| self.python_scope_lookup(file, scope, root, 0).is_some())
+            {
+                return None;
+            }
             let binds = self.python_effective_binds(file, root)?;
-            return self.python_dotted_class(file, root, member, &binds);
+            return self.python_dotted_class(file, scope, root, member, &binds);
         }
         let is_class = |path: &str, identity: &str| {
             self.symbol_index
@@ -130,7 +155,7 @@ impl Resolver {
         if self.python_declares_at_file_level(file, written) {
             return None;
         }
-        let (target_file, target_symbol) = self.import_bindings.get(file)?.get(written)?;
+        let (target_file, target_symbol) = self.python_import_binding(file, scope, written)?;
         let (class_file, identity) = self.lookup_in_package(target_file, target_symbol)?;
         is_class(&class_file, &identity).then_some((class_file, identity))
     }
@@ -148,10 +173,11 @@ impl Resolver {
     pub(super) fn python_method_on(
         &self,
         file: &str,
+        scope: Option<&str>,
         written: &str,
         method: &str,
     ) -> Result<Option<PythonMethod>, ()> {
-        let (class_file, identity) = self.python_class_named(file, written).ok_or(())?;
+        let (class_file, identity) = self.python_class_named(file, scope, written).ok_or(())?;
         let type_key = Self::python_type_key(&identity);
         let own = self.python_own_methods(&class_file, type_key, method);
         match own.as_slice() {
@@ -237,14 +263,29 @@ impl Resolver {
                 .supertypes
                 .get(&(LangFamily::Python, current.clone()))
                 .map_or(0, |bases| bases.len());
-            let opaque = if depth == 0 {
+            // An opaque base at any link of the chain is a second base there:
+            // the root's own file for the root, and every file that declares a
+            // class of that name for the links the flat table names by bare name.
+            let opaque_in = |path: &str| {
                 self.python_bases
-                    .get(&(file.to_string(), current.clone()))
+                    .get(&(path.to_string(), current.clone()))
                     .map_or(0, |bases| {
                         bases.iter().filter(|base| *base == OPAQUE_BASE).count()
                     })
+            };
+            let opaque = if depth == 0 {
+                opaque_in(file)
             } else {
-                0
+                self.symbol_index
+                    .get(current.rsplit('.').next().unwrap_or(&current))
+                    .into_iter()
+                    .flatten()
+                    .filter(|(_, kind, family, _)| {
+                        *kind == SymbolKind::Class && *family == LangFamily::Python
+                    })
+                    .map(|(path, _, _, _)| opaque_in(path))
+                    .max()
+                    .unwrap_or(0)
             };
             match flat + opaque {
                 0 => return true,
@@ -282,9 +323,9 @@ impl Resolver {
             if *is_callable {
                 self.python_scope_binds_name(file, enclosing, root, 1)
             } else {
-                self.python_scoped_imports
-                    .get(file)
-                    .is_some_and(|scoped| scoped.in_class_body.contains(root))
+                self.python_scoped_import_bindings
+                    .get(&(file.to_string(), enclosing.clone()))
+                    .is_some_and(|names| names.contains_key(root))
             }
         })
     }
@@ -369,7 +410,7 @@ impl Resolver {
                 };
             };
             return Ok(self
-                .python_dotted_class(file, root, member, &binds)
+                .python_dotted_class(file, Some(file), root, member, &binds)
                 .map_or_else(
                     || MroNode::Opaque(written.to_string()),
                     |(path, identity)| MroNode::Class(path, identity),
@@ -382,7 +423,7 @@ impl Resolver {
         if self.python_name_is_ambiguous(file, written) {
             return Ok(MroNode::Opaque(written.to_string()));
         }
-        if let Some((path, identity)) = self.python_class_named(file, written) {
+        if let Some((path, identity)) = self.python_class_named(file, Some(file), written) {
             return Ok(MroNode::Class(path, identity));
         }
         if self.python_name_is_imported(file, written) {
@@ -410,6 +451,7 @@ impl Resolver {
     fn python_dotted_class(
         &self,
         file: &str,
+        scope: Option<&str>,
         root: &str,
         member: &str,
         binds: &BTreeSet<PythonImportBind>,
@@ -430,9 +472,7 @@ impl Resolver {
             // the binding the import walk already resolved, which follows the
             // file's `sys.path` evidence.
             None => self
-                .import_bindings
-                .get(file)
-                .and_then(|bound| bound.get(root))
+                .python_import_binding(file, scope, root)
                 .filter(|_| !self.is_value_import(file, root))
                 .map(|(module_file, _)| module_file.clone())
                 .or_else(|| self.resolve_import_path(file, "python", &bind.module_spec()))?,
@@ -873,7 +913,7 @@ impl Resolver {
     /// The class a `cls(...)` call inside a method of it constructs.
     pub(super) fn python_cls_target(&self, file: &str, caller: &str) -> Option<(String, String)> {
         let enclosing = self.self_type_at(file, LangFamily::Python, caller)?;
-        self.python_class_named(file, &enclosing)
+        self.python_class_named(file, Some(caller), &enclosing)
     }
 
     /// The class name a Python scope symbol is, as the enclosing-type tables
@@ -925,6 +965,26 @@ impl Resolver {
     /// each of them, and any function among them that binds `root` answers
     /// yes: a conservative abstention, never a binding of the wrong scope.
     fn python_scope_binds_name(&self, file: &str, scope: &str, root: &str, depth: usize) -> bool {
+        self.python_scope_lookup(file, scope, root, depth).is_some()
+    }
+
+    /// What binds `root` in the innermost function that encloses `scope`
+    /// (walking out from it, class bodies skipped as Python skips them): an
+    /// import written in that function ([`ScopeHit::Import`], with what it
+    /// resolved to, or nothing when it resolved to no file) or any other
+    /// binding the extractor records for it ([`ScopeHit::Local`]). `None` when
+    /// no enclosing function binds it, so the module's binding is the one read.
+    ///
+    /// The one owner of "is this name bound in this scope": the base lookup,
+    /// the field-initializer shadow check and the call path's import lookup
+    /// ([`Self::python_import_binding`]) all ask it.
+    pub(super) fn python_scope_lookup(
+        &self,
+        file: &str,
+        scope: &str,
+        root: &str,
+        depth: usize,
+    ) -> Option<ScopeHit<'_>> {
         let mut current = scope.to_string();
         let mut callable = depth > 0;
         for _ in 0..Self::PYTHON_MRO_MAX_DEPTH {
@@ -934,15 +994,17 @@ impl Resolver {
                 self.python_class_scope(file, &current)
             };
             // A class body's names are not in scope inside its methods.
-            if class_tail.is_none()
-                && (self.scope_declares_local(file, &current, root)
-                    || self.python_scoped_imports.get(file).is_some_and(|scoped| {
-                        scoped
-                            .in_callable
-                            .contains(&(current.clone(), root.to_string()))
-                    }))
-            {
-                return true;
+            if class_tail.is_none() {
+                if let Some(bound) = self
+                    .python_scoped_import_bindings
+                    .get(&(file.to_string(), current.clone()))
+                    .and_then(|names| names.get(root))
+                {
+                    return Some(ScopeHit::Import(bound.as_ref()));
+                }
+                if self.scope_declares_local(file, &current, root) {
+                    return Some(ScopeHit::Local);
+                }
             }
             callable = false;
             let enclosers = class_tail.as_deref().and_then(|tail| {
@@ -954,20 +1016,22 @@ impl Resolver {
                 let mut classes = Vec::new();
                 for (enclosing, is_callable) in enclosers {
                     if *is_callable {
-                        if self.python_scope_binds_name(file, enclosing, root, depth + 1) {
-                            return true;
+                        if let Some(hit) =
+                            self.python_scope_lookup(file, enclosing, root, depth + 1)
+                        {
+                            return Some(hit);
                         }
                     } else {
                         classes.push(enclosing.clone());
                     }
                 }
                 match classes.as_slice() {
-                    [] => return false,
+                    [] => return None,
                     [only] => {
                         current = only.clone();
                         continue;
                     }
-                    _ => return false,
+                    _ => return None,
                 }
             }
             let Some(parent) = self
@@ -975,11 +1039,52 @@ impl Resolver {
                 .get(&(file.to_string(), current.clone()))
                 .filter(|parent| parent.as_str() != file && **parent != current)
             else {
-                return false;
+                return None;
             };
             current = parent.clone();
         }
-        true
+        Some(ScopeHit::Local)
+    }
+
+    /// The `(target file, declared name)` an import binds `name` to where it is
+    /// read in `scope` of `file`.
+    ///
+    /// `scope` is the callable the name is read in; `Some(file)` (or `None`)
+    /// reads at module scope. An import in an enclosing function wins over the
+    /// module's, and when that import resolved to no file, or the function
+    /// binds the name some other way, the answer is none: it never falls
+    /// through to the module's import of the same name. At module scope a name
+    /// some function also imports, differently, is answered only when the
+    /// module scope is what is being read.
+    pub(super) fn python_import_binding(
+        &self,
+        file: &str,
+        scope: Option<&str>,
+        name: &str,
+    ) -> Option<&(String, String)> {
+        if let Some(scope) = scope.filter(|scope| *scope != file) {
+            match self.python_scope_lookup(file, scope, name, 0) {
+                Some(ScopeHit::Import(bound)) => return bound,
+                Some(ScopeHit::Local) => return None,
+                None => {}
+            }
+        }
+        let flat = self.import_bindings.get(file)?.get(name)?;
+        match self
+            .python_import_conflicts
+            .get(&(file.to_string(), name.to_string()))
+        {
+            // The module binds it and a function imports it differently: the
+            // flat table holds the module's. A read whose scope is known and
+            // whose enclosing functions do not bind the name reads it; an
+            // unscoped read may be inside the function that does.
+            Some(true) if scope.is_some() => Some(flat),
+            Some(true) => None,
+            // Only functions bind it, to different things: the flat table
+            // holds one of them.
+            Some(false) => None,
+            None => Some(flat),
+        }
     }
 }
 
@@ -1003,7 +1108,9 @@ impl Resolver {
 /// * the extractor reads those names from the source *text*, wherever
 ///   `__all__ = [..]` is written: a docstring, a function body or a class body
 ///   file names under the same key. A name with no string literal at module
-///   level is therefore not a name a module-level `__all__` lists.
+///   level is therefore not a name a module-level `__all__` lists;
+/// * the string `"__all__"` written anywhere (`globals()["__all__"]`,
+///   `setattr(module, "__all__", ..)`) is the list being read or set by name.
 ///
 /// Any of them means `import *` may take any name the module binds.
 pub(super) fn python_all_is_dynamic(ext: &Extraction) -> bool {
@@ -1024,8 +1131,16 @@ pub(super) fn python_all_is_dynamic(ext: &Extraction) -> bool {
                     && reference.name == "__all__"
                     && reference.receiver_expr.is_some()))
     }) || ext.calls.iter().any(|call| {
-        call.caller_symbol.is_none() && call.receiver_expr.as_deref() == Some("__all__")
-    })
+        // A method called on `__all__`, from any scope: a function the module
+        // runs at import can append to it as well as the module body can.
+        // `globals()["__all__"].append(..)` spells the receiver around it.
+        call.receiver_expr
+            .as_deref()
+            .is_some_and(|receiver| receiver.contains("__all__"))
+    }) || ext
+        .literals
+        .iter()
+        .any(|literal| literal.value == "__all__")
 }
 
 /// Whether the `super(..)` a `super(..).m()` call is made through starts the
@@ -1120,7 +1235,7 @@ pub(super) fn python_class_enclosers(ext: &Extraction) -> Vec<((String, String),
 /// Module scope only: an import written inside a function binds that
 /// function's local (the extractor files it in `scope_locals`, which the scope
 /// walk reads), and one written in a class body binds a class attribute
-/// ([`python_scoped_imports`]). Neither rebinds the module's name, so a
+/// ([`Resolver::python_scope_lookup`]). Neither rebinds the module's name, so a
 /// class statement at module level reads the module's imports alone.
 pub(super) fn python_import_binds(
     ext: &Extraction,
@@ -1243,70 +1358,4 @@ pub(super) fn python_innermost_container<'a>(
         .filter(|(start, end, _, _)| *start <= span.start_byte && span.end_byte <= *end)
         .min_by_key(|(start, end, _, _)| end - start)
         .map(|(_, _, kind, name)| (*kind, *name))
-}
-
-/// The names Python imports bind outside module scope.
-#[derive(Debug, Default)]
-pub(super) struct PythonScopedImports {
-    /// `(function or method, local name)` for each import written in a
-    /// callable's body. The extractor's `scope_locals` carries only some of
-    /// these (an aliased import, not `from m import A`).
-    pub(super) in_callable: BTreeSet<(String, String)>,
-    /// The local names a class body imports directly (`class H: from b import
-    /// A`). That binds a class attribute, which a nested class's base list can
-    /// read and a method cannot.
-    pub(super) in_class_body: BTreeSet<String>,
-}
-
-impl PythonScopedImports {
-    pub(super) fn is_empty(&self) -> bool {
-        self.in_callable.is_empty() && self.in_class_body.is_empty()
-    }
-}
-
-/// The local names a Python file's imports bind outside module scope, by the
-/// scope that binds them.
-pub(super) fn python_scoped_imports(ext: &Extraction) -> PythonScopedImports {
-    let containers = python_scope_containers(ext);
-    let mut scoped = PythonScopedImports::default();
-    for imp in &ext.imports {
-        if imp.path_load.is_some() {
-            continue;
-        }
-        let Some((kind, scope)) = python_innermost_container(&containers, &imp.span) else {
-            continue;
-        };
-        let mut locals: Vec<&str> = Vec::new();
-        if imp.imported_names.is_empty() {
-            locals.push(
-                imp.alias
-                    .as_deref()
-                    .filter(|alias| !matches!(*alias, "*" | "."))
-                    .unwrap_or_else(|| imp.module_specifier.split('.').next().unwrap_or("")),
-            );
-        } else {
-            for (index, name) in imp.imported_names.iter().enumerate() {
-                locals.push(
-                    imp.local_names
-                        .get(index)
-                        .map(String::as_str)
-                        .filter(|local| !local.is_empty())
-                        .unwrap_or(name.as_str()),
-                );
-            }
-        }
-        for local in locals
-            .into_iter()
-            .filter(|local| !matches!(*local, "" | "*"))
-        {
-            if kind == SymbolKind::Class {
-                scoped.in_class_body.insert(local.to_string());
-            } else {
-                scoped
-                    .in_callable
-                    .insert((scope.to_string(), local.to_string()));
-            }
-        }
-    }
-    scoped
 }
