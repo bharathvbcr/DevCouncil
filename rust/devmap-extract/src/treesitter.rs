@@ -834,7 +834,7 @@ fn extract_treesitter_before_deadline(
                 }
                 // Ties on a span break by name, except for a Python base: its
                 // segments share the base's one span and their emission order
-                // (member, then qualifiers innermost out) is what says which
+                // (member, then the qualifier from the root down) is what says which
                 // segment is the class, so the sort keeps it.
                 fn tie_name<'r>(lang: &str, reference: &'r ExtractedReference) -> &'r str {
                     if lang == "python" && reference.kind == ReferenceKind::Heritage {
