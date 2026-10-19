@@ -210,3 +210,7 @@ required-features = ["parse"]
 [[test]]
 name = "python_heritage_attack3"
 required-features = ["parse"]
+
+[[test]]
+name = "python_residue_attack"
+required-features = ["parse"]

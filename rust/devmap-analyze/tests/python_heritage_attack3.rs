@@ -60,7 +60,6 @@ fn nn_module_contract_holds_when_the_class_is_named_module() {
 }
 
 #[test]
-#[ignore = "recall gap, ft-572bb69d"]
 fn autograd_function_contract_holds_through_an_import_alias() {
     let (extractions, resolution) = resolve(&[(
         "fn.py",
@@ -72,7 +71,6 @@ fn autograd_function_contract_holds_through_an_import_alias() {
 }
 
 #[test]
-#[ignore = "recall gap, ft-572bb69d"]
 fn autograd_function_contract_holds_for_parenthesized_and_subscripted_base() {
     for base in ["(torch.autograd.Function)", "torch.autograd.Function[int]"] {
         let src = format!(
@@ -104,7 +102,6 @@ fn a_local_dotted_base_with_a_framework_shaped_tail_inherits_nothing() {
 }
 
 #[test]
-#[ignore = "recall gap, ft-572bb69d"]
 fn a_class_whose_only_base_is_unknown_is_not_confidently_dead() {
     // `make_base()` / `*mixins` / `namedtuple(...)` name a base this corpus
     // cannot see. An uncalled method of a class with a base the corpus does

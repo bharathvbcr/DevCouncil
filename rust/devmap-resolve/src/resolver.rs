@@ -74,6 +74,9 @@ enum ImplicitReceiverAnswer {
         receiver_type: String,
     },
     VirtualOverride,
+    /// The Python heritage walk reached a bound before it could answer; the
+    /// reason names the bound.
+    HeritageCap(String),
 }
 
 fn escaped_evidence_bytes(value: &str) -> u64 {
@@ -415,6 +418,21 @@ pub struct Resolver {
     /// spans, because a class in a function and a class in a same-named class
     /// share one identity.
     python_class_enclosers: BTreeMap<(String, String), Vec<(String, bool)>>,
+    /// The Python files whose `__all__` is not the literal list the extractor
+    /// reads names from, so `from m import *` may take any name they bind. See
+    /// [`pytypes::python_all_is_dynamic`].
+    python_dynamic_all: BTreeSet<String>,
+    /// `(file, function or class qualified name)` -> what each import written
+    /// in that scope binds its local name to; `None` when it resolved to no
+    /// file or the scope imports the name from two places. The flat
+    /// `import_bindings` keeps only module-scope imports for a name the module
+    /// binds; this is where the function's own live.
+    python_scoped_import_bindings:
+        BTreeMap<(String, String), BTreeMap<String, Option<(String, String)>>>,
+    /// `(file, name)` that several functions import differently and the module
+    /// does not import: the flat table holds one of them, so a read that no
+    /// function's own scope answers has no binding.
+    python_ambiguous_scoped_imports: BTreeSet<(String, String)>,
     /// Reverse of [`Self::supertypes`]: `(family, type name)` → indexed subtypes.
     ///
     /// Built from the same heritage rows. X42's virtual-`self` guard walks this
@@ -724,6 +742,9 @@ impl Resolver {
             python_bases: BTreeMap::new(),
             python_import_binds: BTreeMap::new(),
             python_class_enclosers: BTreeMap::new(),
+            python_dynamic_all: BTreeSet::new(),
+            python_scoped_import_bindings: BTreeMap::new(),
+            python_ambiguous_scoped_imports: BTreeSet::new(),
             subtypes: BTreeMap::new(),
             import_bindings: BTreeMap::new(),
             value_imports: BTreeMap::new(),
@@ -1054,9 +1075,7 @@ impl Resolver {
                 return None;
             }
             let module = self
-                .import_bindings
-                .get(file)
-                .and_then(|bindings| bindings.get(receiver))
+                .import_binding_at(family, file, scope, receiver)
                 .filter(|_| !self.is_value_import(file, receiver));
             match module {
                 Some((module_file, _)) => self.lookup_in_package(module_file, function)?,
@@ -1076,7 +1095,7 @@ impl Resolver {
             match self.lookup_in_package(file, shape) {
                 Some(found) => found,
                 None => {
-                    let (target, declared) = self.import_bindings.get(file)?.get(shape)?;
+                    let (target, declared) = self.import_binding_at(family, file, scope, shape)?;
                     self.lookup_in_package(target, declared)?
                 }
             }
@@ -1573,6 +1592,23 @@ impl Resolver {
                 enclosing_symbol.to_string(),
                 name.to_string(),
             ))
+    }
+
+    /// The `(file, declared name)` an import binds `name` to where it is read
+    /// in `scope`: Python asks its scope walk ([`Self::python_import_binding`]),
+    /// every other family its one flat table.
+    fn import_binding_at(
+        &self,
+        family: LangFamily,
+        file: &str,
+        scope: Option<&str>,
+        name: &str,
+    ) -> Option<&(String, String)> {
+        if family == LangFamily::Python {
+            self.python_import_binding(file, scope, name)
+        } else {
+            self.import_bindings.get(file)?.get(name)
+        }
     }
 
     /// Whether `file` itself binds `name` at module scope without declaring a
@@ -2373,7 +2409,9 @@ impl Resolver {
             .field_initializers
             .get(&format!("{file}:{file}::{owner}:{field}"))?;
         let family = self.family_of_file(file)?;
-        if family == LangFamily::Python && self.python_class_named(file, shape).is_some() {
+        if family == LangFamily::Python
+            && self.python_class_named(file, Some(file), shape).is_some()
+        {
             return Some(shape.clone());
         }
         self.factory_return_type(family, file, None, shape)
@@ -3178,6 +3216,9 @@ impl Resolver {
         self.python_bases.clear();
         self.python_import_binds.clear();
         self.python_class_enclosers.clear();
+        self.python_dynamic_all.clear();
+        self.python_scoped_import_bindings.clear();
+        self.python_ambiguous_scoped_imports.clear();
         self.subtypes.clear();
         self.import_bindings.clear();
         self.value_imports.clear();
@@ -3844,7 +3885,41 @@ impl Resolver {
                 self.py_search_dirs
                     .insert(ext.file_path.clone(), search_path);
             }
+            // A Python import written inside a function or class body binds a
+            // name in that scope, not the module's. The table is flat, so such
+            // an import must not take a name the module scope already binds
+            // (a later `import two as o` in a function is not what a class at
+            // module level reads as `o`); it still binds one nothing else does.
+            let py_scopes = (LangFamily::from_lang(&ext.language) == LangFamily::Python)
+                .then(|| pytypes::python_scope_containers(ext));
+            // What each such import bound, by the scope that wrote it, and the
+            // names the module scope itself imports.
+            let mut file_scoped: BTreeMap<String, BTreeMap<String, Option<(String, String)>>> =
+                BTreeMap::new();
+            let mut module_imported: BTreeSet<String> = BTreeSet::new();
+            let mut note_scoped = |scope: &str, local: &str, bound: Option<(String, String)>| {
+                use std::collections::btree_map::Entry;
+                match file_scoped
+                    .entry(scope.to_string())
+                    .or_default()
+                    .entry(local.to_string())
+                {
+                    Entry::Vacant(slot) => {
+                        slot.insert(bound);
+                    }
+                    // Two imports of one name in one scope: whichever ran.
+                    Entry::Occupied(mut slot) => {
+                        if *slot.get() != bound {
+                            slot.insert(None);
+                        }
+                    }
+                }
+            };
             for imp in &ext.imports {
+                let nested_python: Option<String> = py_scopes.as_ref().and_then(|scopes| {
+                    pytypes::python_innermost_container(scopes, &imp.span)
+                        .map(|(_, scope)| scope.to_string())
+                });
                 // A Python module loaded by file path binds a *scoped* handle,
                 // so it goes to its own table and never to `file_bindings`. A
                 // load that binds nothing (`run_path`) contributes only the
@@ -4016,8 +4091,23 @@ impl Resolver {
                             submodule.or(direct)
                         };
                         if let Some(target_f) = resolved {
-                            file_bindings.insert(local.to_string(), (target_f, declared_as));
+                            if let Some(scope) = &nested_python {
+                                note_scoped(
+                                    scope,
+                                    local,
+                                    Some((target_f.clone(), declared_as.clone())),
+                                );
+                                file_bindings
+                                    .entry(local.to_string())
+                                    .or_insert((target_f, declared_as));
+                            } else {
+                                module_imported.insert(local.to_string());
+                                file_bindings.insert(local.to_string(), (target_f, declared_as));
+                            }
                         } else {
+                            if let Some(scope) = &nested_python {
+                                note_scoped(scope, local, None);
+                            }
                             unresolved_import(local.to_string(), &imp.module_specifier);
                         }
                     }
@@ -4045,6 +4135,9 @@ impl Resolver {
                             .unwrap_or_else(|| {
                                 Self::import_local_name(&ext.language, &imp.module_specifier)
                             });
+                        if let Some(scope) = &nested_python {
+                            note_scoped(scope, &local, None);
+                        }
                         unresolved_import(local, &imp.module_specifier);
                         continue;
                     };
@@ -4158,8 +4251,48 @@ impl Resolver {
                     } else {
                         (target_f, local.clone())
                     };
-                    file_bindings.insert(local, binding);
+                    if let Some(scope) = &nested_python {
+                        // `import a.b` binds the package `a`, the same package a
+                        // module-level `import a` binds, not the module the flat
+                        // table files under `b`. The scope's `a` is that package
+                        // (none when it names no indexed file), and the flat
+                        // table gains nothing for `b`.
+                        let root = imp.module_specifier.split('.').next().unwrap_or("");
+                        if alias.is_none() && root != local {
+                            let package = self
+                                .resolve_import_path(&ext.file_path, &ext.language, root)
+                                .map(|file| (file, root.to_string()));
+                            note_scoped(scope, root, package);
+                        } else {
+                            note_scoped(scope, &local, Some(binding.clone()));
+                            file_bindings.entry(local).or_insert(binding);
+                        }
+                    } else {
+                        module_imported.insert(local.clone());
+                        file_bindings.insert(local, binding);
+                    }
                 }
+            }
+            // A name only functions bind, and bind to different things, has no
+            // one binding in the flat table. A name the module also binds is
+            // not a conflict: a module-scope read is the module's, and a read
+            // in a function asks the scope walk first.
+            let mut targets_by_name: BTreeMap<&str, BTreeSet<&Option<(String, String)>>> =
+                BTreeMap::new();
+            for names in file_scoped.values() {
+                for (name, bound) in names {
+                    targets_by_name.entry(name).or_default().insert(bound);
+                }
+            }
+            for (name, targets) in targets_by_name {
+                if targets.len() > 1 && !module_imported.contains(name) {
+                    self.python_ambiguous_scoped_imports
+                        .insert((ext.file_path.clone(), name.to_string()));
+                }
+            }
+            for (scope, names) in file_scoped {
+                self.python_scoped_import_bindings
+                    .insert((ext.file_path.clone(), scope), names);
             }
             if !file_external.is_empty() {
                 self.external_imports
@@ -4203,6 +4336,9 @@ impl Resolver {
                 if !binds.is_empty() {
                     self.python_import_binds
                         .insert(ext.file_path.clone(), binds);
+                }
+                if pytypes::python_all_is_dynamic(ext) {
+                    self.python_dynamic_all.insert(ext.file_path.clone());
                 }
                 for (key, encloser) in pytypes::python_class_enclosers(ext) {
                     self.python_class_enclosers
@@ -4367,11 +4503,67 @@ impl Resolver {
                 // statement, else the import that bound it — so a name more
                 // than one file declares still types the receiver; the lookup
                 // at the call restricts to that class's file.
+                // `K.A()` with `K` a class this file declares reads `A` off the
+                // class: a class attribute, not the class `A` the name alone
+                // would name.
+                //
+                // `K` is that class only where the reading scope does not
+                // rebind it (`import m as K` inside the function is a module),
+                // and when `K` declares a nested `class A` the attribute is
+                // that class, which the unique-name rule below may still bind.
+                let local_class_qualifier = family == LangFamily::Python
+                    && reference
+                        .receiver_expr
+                        .clone()
+                        .or_else(|| {
+                            reference.initializer_shape(&ext.calls).and_then(|shape| {
+                                shape
+                                    .rsplit_once('.')
+                                    .map(|(qualifier, _)| qualifier.to_string())
+                            })
+                        })
+                        .as_deref()
+                        .is_some_and(|qualifier| {
+                            let root = qualifier.split('.').next().unwrap_or(qualifier);
+                            let declares_class = |name: &str| {
+                                self.symbol_index.get(name).into_iter().flatten().any(
+                                    |(path, kind, candidate_family, _)| {
+                                        *path == ext.file_path
+                                            && *kind == SymbolKind::Class
+                                            && *candidate_family == LangFamily::Python
+                                    },
+                                )
+                            };
+                            declares_class(root)
+                                && !reference.enclosing_symbol.as_deref().is_some_and(|scope| {
+                                    self.python_scope_lookup(&ext.file_path, scope, root, 0)
+                                        .is_some()
+                                })
+                        });
+                let nested_class_attribute = local_class_qualifier
+                    && ext.symbols.iter().any(|nested| {
+                        nested.name == reference.name
+                            && nested.kind == SymbolKind::Class
+                            // The extractor files a class written in a class under
+                            // the file; its span says which class it sits in.
+                            && ext.symbols.iter().any(|owner| {
+                                owner.kind == SymbolKind::Class
+                                    && owner.name != nested.name
+                                    && owner.span.start_byte <= nested.span.start_byte
+                                    && nested.span.end_byte <= owner.span.end_byte
+                            })
+                    });
+                let class_attribute = local_class_qualifier && !nested_class_attribute;
                 let python_names_one_class = family == LangFamily::Python
+                    && !local_class_qualifier
                     && self
-                        .python_class_named(&ext.file_path, &reference.name)
+                        .python_class_named(
+                            &ext.file_path,
+                            reference.enclosing_symbol.as_deref(),
+                            &reference.name,
+                        )
                         .is_some();
-                if types.len() == 1 || python_names_one_class {
+                if (types.len() == 1 && !class_attribute) || python_names_one_class {
                     if let Some(scope) = reference.enclosing_symbol.as_deref() {
                         Self::bind_receiver(
                             &mut self.scoped_receiver_types,
@@ -5018,6 +5210,20 @@ impl Resolver {
                 let mut unresolved: Vec<UnresolvedReference> = Vec::new();
                 let mut package_groups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
                 let family = LangFamily::from_lang(&ext.language);
+                // The scope a Python statement is read in. A call in a function
+                // names it; one in a class body is recorded with no caller, and
+                // its span says which class body it is written in; one outside
+                // every function and class is read at module scope.
+                let py_call_scopes = (family == LangFamily::Python)
+                    .then(|| pytypes::python_scope_containers(ext));
+                let read_scope = |caller: Option<&'_ str>, span: &Span| -> Option<String> {
+                    caller.map(str::to_string).or_else(|| {
+                        py_call_scopes.as_ref().and_then(|scopes| {
+                            pytypes::python_innermost_container(scopes, span)
+                                .map(|(_, scope)| scope.to_string())
+                        })
+                    })
+                };
 
                 // Lexical containment. The file owns every symbol declared in it —
                 // including nested methods — and a type additionally owns its own
@@ -5437,6 +5643,7 @@ impl Resolver {
                                 .then(|| {
                                     self.python_method_on(
                                         &ext.file_path,
+                                        read_scope(call.caller_symbol.as_deref(), &call.span).as_deref(),
                                         &class_type,
                                         &call.callee_name,
                                     )
@@ -5711,6 +5918,9 @@ impl Resolver {
                                         }),
                                     });
                                 }
+                                Some(ImplicitReceiverAnswer::HeritageCap(reason)) => {
+                                    resolution = Some(Arc::new(Resolution::Unresolved { reason }));
+                                }
                                 None => {}
                             }
                         }
@@ -5747,21 +5957,24 @@ impl Resolver {
                     // demonstrably does not call, and one that also hands the
                     // real method one fewer caller than it has.
                     if resolution.is_none() && call.receiver_expr.is_none() {
-                        if let Some(bindings) = self.import_bindings.get(&ext.file_path) {
-                            if let Some((target_f, target_sym)) = bindings.get(&call.callee_name) {
-                                if let Some((resolved_file, resolved_sym)) =
-                                    self.lookup_in_package(target_f, target_sym)
-                                {
-                                    resolution = Some(Arc::new(Resolution::ImportScoped {
-                                        target_symbol: resolved_sym,
-                                        target_file: resolved_file,
-                                        imported_from: call.callee_name.clone(),
-                                    }));
-                                } else {
-                                    resolution = Some(Arc::new(Resolution::Unresolved {
-                                        reason: "the named import has no unambiguous declaration in its module".to_string(),
-                                    }));
-                                }
+                        if let Some((target_f, target_sym)) = self.import_binding_at(
+                            family,
+                            &ext.file_path,
+                            read_scope(call.caller_symbol.as_deref(), &call.span).as_deref(),
+                            &call.callee_name,
+                        ) {
+                            if let Some((resolved_file, resolved_sym)) =
+                                self.lookup_in_package(target_f, target_sym)
+                            {
+                                resolution = Some(Arc::new(Resolution::ImportScoped {
+                                    target_symbol: resolved_sym,
+                                    target_file: resolved_file,
+                                    imported_from: call.callee_name.clone(),
+                                }));
+                            } else {
+                                resolution = Some(Arc::new(Resolution::Unresolved {
+                                    reason: "the named import has no unambiguous declaration in its module".to_string(),
+                                }));
                             }
                         }
                     }
@@ -5851,8 +6064,13 @@ impl Resolver {
                         };
                         if !recv.is_empty() && !method.is_empty()
                             && ext.local_binding_at(call.span.start_byte, &recv).is_none() {
-                            if let Some(bindings) = self.import_bindings.get(&ext.file_path) {
-                                if let Some((target_f, _)) = bindings.get(&recv) {
+                            {
+                                if let Some((target_f, _)) = self.import_binding_at(
+                                    family,
+                                    &ext.file_path,
+                                    read_scope(call.caller_symbol.as_deref(), &call.span).as_deref(),
+                                    &recv,
+                                ) {
                                     // A module member: a member of a module
                                     // handle, of an imported type, or of an
                                     // object literal that spells it — never
@@ -6132,7 +6350,7 @@ impl Resolver {
                         let found = match call.receiver_expr.as_deref() {
                             Some("super" | "super()") => call.caller_symbol.as_deref().and_then(
                                 |caller| {
-                                    self.python_super_method(&ext.file_path, caller, &call.callee_name)
+                                    self.python_super_method(ext, call, caller, &call.callee_name)
                                 },
                             ),
                             Some(recv)
@@ -6142,7 +6360,12 @@ impl Resolver {
                                         self.scope_declares_local(&ext.file_path, scope, recv)
                                     }) =>
                             {
-                                self.python_method_on(&ext.file_path, recv, &call.callee_name)
+                                self.python_method_on(
+                                    &ext.file_path,
+                                    read_scope(call.caller_symbol.as_deref(), &call.span).as_deref(),
+                                    recv,
+                                    &call.callee_name,
+                                )
                                     .ok()
                                     .flatten()
                             }
@@ -8326,21 +8549,42 @@ impl Resolver {
                 return None;
             }
         }
-        let (target_file, target_symbol, receiver_type) =
-            self.supertype_method(family, vec![enclosing.clone()], method)?;
+        let flat = self.supertype_method(family, vec![enclosing.clone()], method);
         // The breadth-first walk has no unknown or ambiguous bases and no
-        // order. For Python the class's own MRO walk can veto its answer: an
+        // order. For Python the class's own MRO walk is the authority: an
         // opaque or ambiguous base ahead of the declaring class, or a different
-        // class first in the MRO, means the edge would be a guess. It never
-        // adds an answer (a diamond the walk refuses stays refused).
+        // class first in the MRO, means the flat answer would be a guess. A
+        // class the file-scoped walk cannot speak for (a base declared inside a
+        // function, say) is read from the flat table only when no class in its
+        // heritage has several bases, because only then are the two orders the
+        // same.
         if family == LangFamily::Python {
-            match self.python_mro_method(file, &enclosing, method) {
-                pytypes::MroAnswer::Found(found)
-                    if found.file == target_file && found.symbol == target_symbol => {}
-                pytypes::MroAnswer::NotScoped => {}
+            match self.python_mro_method(file, &enclosing, method, true) {
+                pytypes::MroAnswer::Found(found) => {
+                    if flat
+                        .as_ref()
+                        .is_some_and(|(f, s, _)| *f != found.file || *s != found.symbol)
+                    {
+                        return None;
+                    }
+                    return Some(self.implicit_receiver_unique(
+                        family,
+                        &enclosing,
+                        method,
+                        found.file,
+                        found.symbol,
+                        found.declaring_type,
+                    ));
+                }
+                pytypes::MroAnswer::Capped(reason) => {
+                    return Some(ImplicitReceiverAnswer::HeritageCap(reason));
+                }
+                pytypes::MroAnswer::NotScoped
+                    if self.python_flat_heritage_is_linear(file, &enclosing) => {}
                 _ => return None,
             }
         }
+        let (target_file, target_symbol, receiver_type) = flat?;
         Some(self.implicit_receiver_unique(
             family,
             &enclosing,
@@ -10111,7 +10355,15 @@ impl Resolver {
                 })
             })
             .flatten()
-            .and_then(|written| self.python_method_on(&ext.file_path, &written, name).ok());
+            .and_then(|written| {
+                self.python_method_on(
+                    &ext.file_path,
+                    reference.enclosing_symbol.as_deref(),
+                    &written,
+                    name,
+                )
+                .ok()
+            });
         let class_is_known = python_class.is_some();
         if let Some(Some(found)) = python_class {
             return Some(self.reference_edge(
@@ -10320,7 +10572,8 @@ impl Resolver {
                 // Same rule as the call ladder: an overridden `self.m` is not a
                 // deterministic reference target. Returning `None` here refuses
                 // the import fallthrough for an implicit receiver.
-                ImplicitReceiverAnswer::VirtualOverride => return None,
+                ImplicitReceiverAnswer::VirtualOverride
+                | ImplicitReceiverAnswer::HeritageCap(_) => return None,
             }
         }
 

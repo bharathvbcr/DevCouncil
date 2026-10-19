@@ -117,7 +117,6 @@ fn function_scope_import_of_same_module_does_not_abstain() {
 }
 
 #[test]
-#[ignore = "recall gap, ft-572bb69d"]
 fn function_scope_import_of_other_module_does_not_change_module_level_reading() {
     // The class statement runs at module level: `o` is `one`, whatever a
     // function imports under the same local name.
@@ -164,7 +163,6 @@ fn class_body_rebinding_of_callee_does_not_poison() {
 }
 
 #[test]
-#[ignore = "recall gap, ft-572bb69d"]
 fn class_body_import_of_callee_does_not_poison_enclosed_method() {
     let got = field_go_files(
         &[("b.py", "class A:\n    def run(self):\n        return 2\n")],
@@ -272,14 +270,14 @@ fn call_decorator_staticmethod_parens_does_not_panic() {
 }
 
 #[test]
-#[ignore = "recall gap, ft-572bb69d"]
+#[ignore = "needs extractor change (schema frozen at 97), ft-572bb69d"]
 fn parenthesized_staticmethod_decorator_is_not_an_instance() {
     let got = field_in_method("    @(staticmethod)\n    def make(self):\n        self.x = A()");
     assert!(got.is_empty(), "{got:?}");
 }
 
 #[test]
-#[ignore = "recall gap, ft-572bb69d"]
+#[ignore = "needs extractor change (schema frozen at 97), ft-572bb69d"]
 fn parenthesized_classmethod_attribute_decorator_is_not_an_instance() {
     let got = field_in_method(
         "    @(__import__('builtins').classmethod)\n    def make(self):\n        self.x = A()",
@@ -288,7 +286,7 @@ fn parenthesized_classmethod_attribute_decorator_is_not_an_instance() {
 }
 
 #[test]
-#[ignore = "recall gap, ft-572bb69d"]
+#[ignore = "needs extractor change (schema frozen at 97), ft-572bb69d"]
 fn aliased_staticmethod_decorator_is_not_an_instance() {
     let got = field_in_method("    @sm\n    def make(self):\n        self.x = A()");
     assert!(got.is_empty(), "{got:?}");
@@ -454,7 +452,6 @@ fn abc_only_class_super_of_object_method_has_no_in_repo_edge() {
 }
 
 #[test]
-#[ignore = "recall gap, ft-572bb69d"]
 fn typing_import_shadowed_by_local_sibling_module_still_skips() {
     // `pkg/typing.py` exists; `from typing import Generic` in pkg/c.py is the
     // stdlib's (absolute import), so the skip must still apply.
