@@ -155,3 +155,93 @@ fn a_cancelled_suspects_says_it_was_cut_short() {
     assert!(exhausted(&report), "{report:#}");
     assert_eq!(report["complete"], json!(false), "{report:#}");
 }
+
+// ---- the store graph's basis reads through the program it was given ----
+
+use dc_regress::blast::{blast_change_with_program, UnattributedReason};
+use dc_regress::{BlobIdentity, CodeGraph};
+use dc_regress_store::StoreGraph;
+use std::os::unix::fs::PermissionsExt;
+
+fn script(f: &Fixture, name: &str, body: &str) -> PathBuf {
+    let path = f.base.join(name);
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+fn real_git() -> String {
+    let out = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .expect("sh");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn the_graphs_basis_is_read_through_the_injected_program() {
+    let f = fixture();
+    let log = f.base.join("spawns.log");
+    let counting = script(
+        &f,
+        "counting-git",
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+            log.display(),
+            real_git()
+        ),
+    );
+    let repo = f.base.join("repo");
+    let graph = StoreGraph::new(&f.store, &repo)
+        .expect("graph")
+        .with_program(counting.as_os_str());
+    let (_, basis) = graph.symbols_in("core.py");
+    assert!(
+        matches!(basis, BlobIdentity::Blob(_)),
+        "the basis resolved: {basis:?}"
+    );
+    let spawned = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        spawned.contains("cat-file"),
+        "the basis was asked of the injected program, not of PATH's git: {spawned:?}"
+    );
+}
+
+#[test]
+fn a_basis_that_could_not_be_read_is_unavailable_content_not_a_mismatch() {
+    let f = fixture();
+    let repo = f.base.join("repo");
+    let change = dc_regress::change::changes_between(&repo, &f.since, "HEAD").expect("change");
+    let broken = script(&f, "broken-git", "#!/bin/sh\nexit 1\n");
+    let graph = StoreGraph::new(&f.store, &repo)
+        .expect("graph")
+        .with_program(broken.as_os_str());
+    let (_, basis) = graph.symbols_in("core.py");
+    assert!(
+        matches!(basis, BlobIdentity::Unreadable { .. }),
+        "a git that cannot answer is not an unrecorded basis: {basis:?}"
+    );
+    let report = blast_change_with_program(
+        broken.as_os_str(),
+        &repo,
+        &graph,
+        &change,
+        "test",
+        "HEAD",
+        3,
+    );
+    assert!(
+        report
+            .unattributed
+            .iter()
+            .any(|u| matches!(u.reason, UnattributedReason::ContentUnavailable { .. })),
+        "{report:#?}"
+    );
+    assert!(
+        !report
+            .unattributed
+            .iter()
+            .any(|u| matches!(u.reason, UnattributedReason::BasisMismatch { .. })),
+        "a transient read failure is never reported as a basis mismatch: {report:#?}"
+    );
+}
