@@ -495,8 +495,8 @@ pub(crate) fn gaps_has_column(conn: &Connection, name: &str) -> rusqlite::Result
 
 /// Ensures `schema_version` matches this build, refusing a newer unknown row.
 ///
-/// Aligns with Python `storage/db.py` (`SCHEMA_VERSION = 9`): create/upgrade
-/// when missing or behind; fail closed when the file is ahead of this binary.
+/// Creates or upgrades the row when it is missing or behind
+/// (`crate::SCHEMA_VERSION`); fails closed when the file is ahead of this binary.
 pub fn ensure_schema_version(conn: &Connection, known: u32) -> std::result::Result<(), String> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_version (

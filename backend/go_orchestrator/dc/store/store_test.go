@@ -390,3 +390,26 @@ func readyIDs(t *testing.T, c *Client) []string {
 	}
 	return ids
 }
+
+// A status move reports a task that does not exist as ErrNoSuchTask, never as
+// "not moved": `devcouncil task status NOSUCH done` used to print a sentence
+// and exit 0, and a status in --json said ok:true (ft-4966b304).
+func TestMoveTaskStatusNamesAMissingTask(t *testing.T) {
+	ctx := context.Background()
+	c := client(t)
+	seedTask(t, c, "TASK-1")
+
+	moved, err := c.MoveTaskStatus(ctx, "TASK-NOSUCH", "", StatusReview)
+	if !errors.Is(err, ErrNoSuchTask) {
+		t.Fatalf("a missing task moved=%v err=%v; want ErrNoSuchTask", moved, err)
+	}
+	if moved, err := c.MoveTaskStatus(ctx, "TASK-1", "", StatusReady); err != nil || moved {
+		t.Fatalf("a task already ready: moved=%v err=%v; want not moved, no error", moved, err)
+	}
+	if moved, err := c.MoveTaskStatus(ctx, "TASK-1", StatusInProgress, StatusReview); err != nil || moved {
+		t.Fatalf("a task not in the from status: moved=%v err=%v; want not moved, no error", moved, err)
+	}
+	if moved, err := c.MoveTaskStatus(ctx, "TASK-1", StatusReady, StatusInProgress); err != nil || !moved {
+		t.Fatalf("a ready task to in progress: moved=%v err=%v; want moved", moved, err)
+	}
+}

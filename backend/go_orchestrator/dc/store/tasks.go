@@ -29,6 +29,11 @@ var itemPutFields = []string{
 	"home_workspace_id", "position",
 }
 
+// ErrNoSuchTask is a status move on an id the store holds no item for. It is
+// an error, not a "not moved" answer: an operator who typed the wrong id must
+// not be told the move was merely unnecessary.
+var ErrNoSuchTask = errors.New("store: no such task")
+
 // maxStatusMoveAttempts bounds the read-modify-write when another writer keeps
 // editing the item between this client's read and its write.
 const maxStatusMoveAttempts = 3
@@ -38,8 +43,9 @@ const maxStatusMoveAttempts = 3
 // moved. It moves only from `from` (empty means from anywhere, for an operator's
 // explicit move): an item that is anywhere else — a person already moved it, or
 // the verify ran on a task nobody checked out — is left exactly as it is and
-// reported as not moved, which is an answer and not a fault. A retry after a lost race re-reads, so it never writes over an edit it
-// did not see.
+// reported as not moved, which is an answer and not a fault. An id with no item
+// is ErrNoSuchTask. A retry after a lost race re-reads, so it never writes over
+// an edit it did not see.
 func (c *Client) MoveTaskStatus(ctx context.Context, taskID, from, to string) (bool, error) {
 	if taskID == "" || to == "" || from == to {
 		return false, errors.New("store: a status move needs a task and a status to move to")
@@ -53,7 +59,7 @@ func (c *Client) MoveTaskStatus(ctx context.Context, taskID, from, to string) (b
 		if err != nil {
 			var refusal *WorkbenchError
 			if errors.As(err, &refusal) && refusal.Code == "not_found" {
-				return false, nil
+				return false, fmt.Errorf("%w: %s", ErrNoSuchTask, taskID)
 			}
 			return false, err
 		}

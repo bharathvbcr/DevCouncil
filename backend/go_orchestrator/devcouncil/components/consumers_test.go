@@ -148,10 +148,10 @@ func TestACheckThatPrintsTooMuchIsNotChecked(t *testing.T) {
 const staleScript = `const root = process.env.GITPULSE_DEVCOUNCIL_ROOT ?? "";
 console.log(JSON.stringify({
   ok: false,
-  owner: { store: 27, dcStore: 9, workbench: 13 },
+  owner: { store: 27, dcStore: 10, workbench: 14 },
   devcouncil: root,
   rows: [
-    { reader: "GitPulse vendored crates", verdict: "match", detail: "devmap store 27, dc-store 9, workbench 13" },
+    { reader: "GitPulse vendored crates", verdict: "match", detail: "devmap store 27, dc-store 10, workbench 14" },
     { reader: "gitpulse-mcp (PATH)", verdict: "stale", detail: "devmap store 26, DevCouncil writes 27" },
     { reader: "Jarvis pin (upstream.lock.json)", verdict: "absent", detail: "no checkout found" },
   ],
@@ -221,7 +221,7 @@ func TestStrictConsumersFailsTheInstallWhenTheCheckCouldNotRun(t *testing.T) {
 func TestStrictConsumersPassesWhenEveryPresentReaderMatches(t *testing.T) {
 	needNode(t)
 	t.Setenv(GitPulseRootEnv, "")
-	src, _ := siblings(t, `console.log(JSON.stringify({ ok: true, owner: { store: 27, dcStore: 9, workbench: 13 }, devcouncil: "x",
+	src, _ := siblings(t, `console.log(JSON.stringify({ ok: true, owner: { store: 27, dcStore: 10, workbench: 14 }, devcouncil: "x",
   rows: [{ reader: "devmap (PATH)", verdict: "match", detail: "devmap store 27" }], summary: "OK: 1 match" }))`)
 	if code, _, stderr := installWithChecker(t, src, "--strict-consumers"); code != 0 {
 		t.Fatalf("exit %d\n%s", code, stderr)
@@ -295,7 +295,7 @@ const envEchoScript = `const env = process.env;
 const has = (name) => Object.prototype.hasOwnProperty.call(env, name);
 console.log(JSON.stringify({
   ok: true,
-  owner: { store: 27, dcStore: 9, workbench: 13 },
+  owner: { store: 27, dcStore: 10, workbench: 14 },
   devcouncil: env.GITPULSE_DEVCOUNCIL_ROOT ?? "",
   rows: [
     { reader: "planted", verdict: "match", detail: ["DEVCOUNCIL_PLANTED_SECRET", "GITHUB_TOKEN", "NODE_OPTIONS"].filter(has).join(",") },

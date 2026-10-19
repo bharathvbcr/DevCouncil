@@ -256,16 +256,26 @@ func runTaskStatus(args []string) int {
 	}
 	defer client.Close()
 	moved, err := client.MoveTaskStatus(console.Context(), f.rest[0], "", to)
+	if errors.Is(err, store.ErrNoSuchTask) {
+		if f.json {
+			_ = console.JSON(map[string]any{"ok": false, "code": "no_such_task", "task_id": f.rest[0]})
+		} else {
+			console.Errorf("task status: no task %s in this store\n", f.rest[0])
+		}
+		return 1
+	}
 	if err != nil {
 		console.Errorf("task status: %v\n", err)
 		return 1
 	}
+	// With no from status, the only move MoveTaskStatus declines is to the
+	// status the task already has.
 	if f.json {
 		_ = console.JSON(map[string]any{"ok": true, "task_id": f.rest[0], "status": to, "moved": moved})
 	} else if moved {
 		console.Printf("%s is now %s\n", f.rest[0], to)
 	} else {
-		console.Printf("%s was not moved: it is already %s or is not a task of this repository\n", f.rest[0], to)
+		console.Printf("%s is already %s\n", f.rest[0], to)
 	}
 	return 0
 }

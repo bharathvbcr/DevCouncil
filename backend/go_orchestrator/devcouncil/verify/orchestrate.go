@@ -723,7 +723,9 @@ func VerifyTask(ctx context.Context, root string, client *store.Client, taskID s
 	// pass moves it — a skipped, degraded or blocked run does not — and only from
 	// in progress, so verifying a task nobody checked out changes nothing.
 	if result.Passed && result.Status == "verified" {
-		if _, err := client.MoveTaskStatus(ctx, taskID, store.StatusInProgress, store.StatusReview); err != nil {
+		// A verify run names its task by id; one with no item has no card to
+		// move, which changes nothing, as for a task nobody checked out.
+		if _, err := client.MoveTaskStatus(ctx, taskID, store.StatusInProgress, store.StatusReview); err != nil && !errors.Is(err, store.ErrNoSuchTask) {
 			return result, gaps, fmt.Errorf("it passed, but the task could not be moved to review: %w", err)
 		}
 	}
