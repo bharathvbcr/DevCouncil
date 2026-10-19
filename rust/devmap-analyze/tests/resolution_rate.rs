@@ -357,3 +357,77 @@ fn every_capability_bit_reaches_the_per_language_readout() {
         go.blind_to
     );
 }
+
+const REAL_PY: &str = "def helper():\n    return 1\n\n\ndef main():\n    return helper()\n";
+const HTML_WITH_REFERENCES: &str = "<!doctype html>\n<html>\n<body>\n\
+<label for=\"probe-field\">Probe</label>\n\
+<p id=\"probe-field\" class=\"probe\" data-probe-hook>Probe</p>\n\
+<style>\n.probe { color: red; }\n</style>\n</body>\n</html>\n";
+const VENDORED_C: &str = "int add(int a, int b) { return a + b; }\n\
+int twice(int a) { return add(a, a) + missing_external(a); }\n";
+
+/// A call-blind language must not publish a call rate, whatever else resolves.
+///
+/// HTML has a REFERENCES extractor and no call extractor. Its reference edges
+/// fill the numerator while nothing could ever have been a call, so it scored a
+/// perfect 1000. It must read as unmeasured, with the sites still visible.
+#[test]
+fn a_call_blind_language_with_resolved_non_call_sites_is_not_measured() {
+    let extractions = vec![
+        extract_file("lib.py", REAL_PY),
+        extract_file("site/index.html", HTML_WITH_REFERENCES),
+    ];
+    let rate = rate_of(&extractions);
+    let html = rate.by_language.get("html").expect("html row");
+    assert!(!html.extracts_calls, "{html:?}");
+    assert!(
+        html.resolved_sites > 0,
+        "the fixture must exercise non-call resolutions or the test is vacuous: {html:?}"
+    );
+    assert_eq!(html.net_permille, None, "{html:?}");
+    assert_eq!(html.gross_permille, None, "{html:?}");
+    assert_eq!(
+        rate.call_blind_sites,
+        html.resolved_sites + html.unresolved_sites
+    );
+}
+
+/// Vendored code is not this repository's code, in the row or the headline.
+#[test]
+fn vendored_sites_are_excluded_from_rows_and_headline_and_counted_apart() {
+    let extractions = vec![
+        extract_file("lib.py", REAL_PY),
+        extract_file("rust/vendor/grammars/x/scanner.c", VENDORED_C),
+    ];
+    let rate = rate_of(&extractions);
+    assert!(
+        !rate.by_language.contains_key("c"),
+        "a vendored-only language must not read as this repository's: {:?}",
+        rate.by_language.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(rate.vendored_files, 1, "{rate:?}");
+    assert!(rate.vendored_sites > 0, "{rate:?}");
+    assert_eq!(
+        rate.net_permille,
+        Some(1000),
+        "the vendored C miss must not drag the headline: {rate:?}"
+    );
+    // Totals stay raw so they keep matching `unresolved_calls`.
+    assert!(rate.unresolved_sites >= 1, "{rate:?}");
+}
+
+/// The combined corpus: real code, call-blind HTML and vendored C.
+#[test]
+fn the_headline_is_the_real_code_alone() {
+    let extractions = vec![
+        extract_file("lib.py", REAL_PY),
+        extract_file("site/index.html", HTML_WITH_REFERENCES),
+        extract_file("third_party/lib/scanner.c", VENDORED_C),
+    ];
+    let rate = rate_of(&extractions);
+    let python = &rate.by_language["python"];
+    assert_eq!(rate.net_permille, python.net_permille, "{rate:?}");
+    assert_eq!(rate.gross_permille, python.gross_permille, "{rate:?}");
+    assert_eq!(rate.vendored_files, 1);
+    assert!(rate.call_blind_sites > 0);
+}

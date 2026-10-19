@@ -230,3 +230,11 @@ required-features = ["parse"]
 [[test]]
 name = "budget_refusal_attack"
 required-features = ["parse"]
+
+[[test]]
+name = "resolution_rate_attack"
+required-features = ["parse"]
+
+[[test]]
+name = "resolution_rate_attack_head"
+required-features = ["parse"]
