@@ -605,9 +605,44 @@ impl Resolver {
                 targets
             };
         }
+        // `from .x import m` where `x/` is a namespace package (no
+        // `__init__.py`): the module names no file, but each imported name
+        // can be a submodule of it, `x/m.py`. Only a relative module is
+        // probed, and only for names that are real files, so a name that is
+        // an attribute of a missing module still yields no edge.
+        if imp.module_specifier.starts_with('.') {
+            let mut submodules: Vec<String> = imp
+                .imported_names
+                .iter()
+                .filter(|name| !name.is_empty() && name.as_str() != "*")
+                .filter_map(|name| {
+                    self.resolve_import_path(
+                        &ext.file_path,
+                        &ext.language,
+                        &Self::python_submodule_spec(&imp.module_specifier, name),
+                    )
+                })
+                .collect();
+            submodules.sort();
+            submodules.dedup();
+            if !submodules.is_empty() {
+                return submodules;
+            }
+        }
         self.resolve_via_search_dirs(ext, imp.span.start_byte, &imp.module_specifier)
             .into_iter()
             .collect()
+    }
+
+    /// The dotted module `name` names inside the Python module `module`:
+    /// `.x` + `m` is `.x.m`, while bare dots take the name directly, so `.` +
+    /// `b` is `.b` (not `..b`, which would climb a package).
+    pub(super) fn python_submodule_spec(module: &str, name: &str) -> String {
+        if module.chars().all(|c| c == '.') {
+            format!("{module}{name}")
+        } else {
+            format!("{module}.{name}")
+        }
     }
 
     /// The file a path-loaded Python module handle names, read at a use site.
