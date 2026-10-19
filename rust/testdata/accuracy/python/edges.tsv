@@ -118,3 +118,9 @@ py.SK6	SK6	micro/superkw/children.py::SkOneProvider.hop	micro/superkw/base_a.py:
 py.SK7.not	SK7	micro/superkw/children.py::SkExternalFirst.hop	micro/superkw/base_a.py::SkLeft.hop	forbid_any_tier	must		extpkg.Mixin precedes SkLeft in the MRO and may define hop: no in-repo edge
 py.SK8	SK8	micro/superkw/children.py::SkMeta.hop	micro/superkw/base_a.py::SkLeft.hop	edge	must		metaclass=SkMetaBase is a class-statement keyword, not a base: super().hop() is SkLeft.hop
 py.SK8.not	SK8	micro/superkw/children.py::SkMeta.hop	micro/superkw/children.py::SkMetaBase.hop	forbid_any_tier	must		the metaclass is not in the MRO
+py.R1	R1	relroot_main.py	relroot_util.py	import	must		from .relroot_util import ... at the repo root: the importing package is the root, so the base is the empty path
+py.R1b	R1	relroot_main.py::rz_root_run	relroot_util.py::rz_root_helper	edge	must		the root-level relative import binds the call
+py.R3.not	R3	relroot_beyond.py	relroot_util.py	forbid_any_tier	must		from ... climbs above the repository root: it resolves to nothing, never clamps to a root file
+py.R4.not	R4	rzpkg/a.py::rz_missing_run	src/rzpkg/util.py::rz_f	forbid_any_tier	must		rzpkg/util.py is absent: a missing sibling does not fall through into src/rzpkg/util.py
+py.R4b.not	R4	rzpkg/a.py::rz_missing_run	rzpkg/rzpkg/util.py::rz_g	forbid_any_tier	must		nor into the doubled rzpkg/rzpkg/util.py
+py.R4c.not	R4	rzpkg/a.py	src/rzpkg/util.py	forbid_any_tier	must		no Imports edge into the src/ namesake either

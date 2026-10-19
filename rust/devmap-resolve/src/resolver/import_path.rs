@@ -100,37 +100,37 @@ impl Resolver {
         }
 
         if lang == "python" {
-            let mut py_path = clean_spec.to_string();
-            let mut dots = 0;
-            for c in clean_spec.chars() {
-                if c == '.' {
-                    dots += 1;
-                } else {
-                    break;
-                }
-            }
+            let dots = clean_spec.chars().take_while(|c| *c == '.').count();
             if dots > 0 {
-                let mut d = dir.clone();
-                for _ in 1..dots {
-                    if let Some(parent) = std::path::Path::new(&d).parent() {
-                        d = parent.to_string_lossy().replace('\\', "/");
-                    }
-                }
-                let suffix = &clean_spec[dots..].replace('.', "/");
-                py_path = if suffix.is_empty() {
-                    d
+                // A relative import names a module of the importer's own
+                // package, climbing one package level per extra dot. The base
+                // goes through `normalize_rel`, the single owner of `.`/`..`
+                // handling: a climb past the repository root is `None`, and
+                // the root directory is the empty base, not `"."`. Only the
+                // two forms a module can take are probed, and a miss ends the
+                // lookup: a missing sibling must not fall through into
+                // `src/<pkg>/` or `<dir>/<dir>/`, which name other modules.
+                let tail = clean_spec[dots..].replace('.', "/");
+                let climb = "../".repeat(dots - 1);
+                let base = Self::normalize_rel(&dir, &format!("{climb}{tail}"))?;
+                // A bare `.`/`..` names the package itself, so only its
+                // `__init__.py` can be the answer: a stray `pkg.py` beside
+                // the `pkg/` directory is a different module.
+                let candidates = if base.is_empty() {
+                    vec!["__init__.py".to_string()]
+                } else if tail.is_empty() {
+                    vec![format!("{base}/__init__.py")]
                 } else {
-                    format!("{}/{}", d, suffix)
+                    vec![format!("{base}.py"), format!("{base}/__init__.py")]
                 };
-            } else {
-                py_path = py_path.replace('.', "/");
+                return candidates
+                    .into_iter()
+                    .find(|cand| self.file_symbols.contains_key(cand));
             }
-
-            if dots == 0 {
-                for cand in self.python_root_candidates(current_file, &py_path) {
-                    if self.file_symbols.contains_key(&cand) {
-                        return Some(cand);
-                    }
+            let py_path = clean_spec.replace('.', "/");
+            for cand in self.python_root_candidates(current_file, &py_path) {
+                if self.file_symbols.contains_key(&cand) {
+                    return Some(cand);
                 }
             }
             let candidates = [

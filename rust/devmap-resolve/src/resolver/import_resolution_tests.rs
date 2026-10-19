@@ -278,6 +278,97 @@ fn each_language_resolves_import_paths_by_its_own_rules() {
     );
 }
 
+/// A Python relative import is answered from the importer's own package and
+/// nowhere else (ft-bd1bfac9).
+///
+/// `src/pkg/util.py` and `pkg/pkg/util.py` are present while `pkg/util.py` is
+/// not, which is exactly the shape the old hand-rolled arm bound by probing
+/// `src/{path}` and `{dir}/{path}` after the real candidates missed.
+#[test]
+#[cfg(feature = "parse")]
+fn python_relative_imports_resolve_in_the_importing_package_only() {
+    use devmap_extract::extract_file;
+    let files = [
+        ("main.py", "def m():\n    pass\n"),
+        ("util.py", "def f():\n    pass\n"),
+        ("pkg/__init__.py", "\n"),
+        ("pkg/a.py", "def a():\n    pass\n"),
+        ("src/pkg/util.py", "def f():\n    pass\n"),
+        ("pkg/pkg/util.py", "def f():\n    pass\n"),
+        // A namespace package: no `__init__.py` anywhere under it.
+        ("ns/inner/leaf.py", "def leaf():\n    pass\n"),
+        ("ns/sibling.py", "def s():\n    pass\n"),
+    ];
+    let extractions: Vec<_> = files
+        .iter()
+        .map(|(path, source)| extract_file(path, source))
+        .collect();
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolve =
+        |file: &str, spec: &str| resolver.resolve_import_path(file, "python", spec);
+
+    assert_eq!(
+        resolve("main.py", ".util").as_deref(),
+        Some("util.py"),
+        "at the repo root the importing package is the root directory itself"
+    );
+    assert_eq!(
+        resolve("main.py", "."),
+        None,
+        "`from . import x` at a root with no __init__.py names no module file"
+    );
+    assert_eq!(
+        resolve("main.py", ".missing"),
+        None,
+        "a missing root sibling abstains"
+    );
+    assert_eq!(
+        resolve("pkg/a.py", "."),
+        Some("pkg/__init__.py".to_string()),
+        "`from . import x` is the importer's own package"
+    );
+    assert_eq!(
+        resolve("pkg/a.py", "..util").as_deref(),
+        Some("util.py"),
+        "two dots climb one package level, to the root"
+    );
+    assert_eq!(
+        resolve("pkg/a.py", "..."),
+        None,
+        "three dots from a depth-one package climb above the root"
+    );
+    assert_eq!(
+        resolve("main.py", "..util"),
+        None,
+        "two dots at the root climb above it: nothing, never the clamped root file"
+    );
+    assert_eq!(
+        resolve("main.py", "...util"),
+        None,
+        "further climbs past the root stay unresolved"
+    );
+    assert_eq!(
+        resolve("pkg/a.py", ".util"),
+        None,
+        "pkg/util.py is absent: not src/pkg/util.py, not pkg/pkg/util.py"
+    );
+    assert_eq!(
+        resolve("pkg/a.py", ".pkg.util").as_deref(),
+        Some("pkg/pkg/util.py"),
+        "a dotted tail after the leading dots names a real sub-package"
+    );
+    assert_eq!(
+        resolve("ns/inner/leaf.py", "..sibling").as_deref(),
+        Some("ns/sibling.py"),
+        "a namespace package (no __init__.py) still counts as a package"
+    );
+    assert_eq!(
+        resolve("ns/inner/leaf.py", "..inner.leaf").as_deref(),
+        Some("ns/inner/leaf.py")
+    );
+}
+
 /// Fixture spanning every tier of the Go import ladder.    /// Fixture spanning every tier of the Go import ladder.
 #[cfg(feature = "parse")]
 fn go_fixture() -> Resolver {
