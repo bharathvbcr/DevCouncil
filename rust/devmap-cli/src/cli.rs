@@ -176,20 +176,26 @@ impl Cli {
     }
 }
 
-/// Parses a repository-root argument into the one absolute, symlink-free form
-/// every later path is derived from.
+/// Parses a repository-root argument into the one absolute form every later
+/// path is derived from.
 ///
 /// A relative root used to travel as spelled: the state directory derived from
 /// it (`tmp/rel/.devmap/...`) was already cwd-relative, and the manifest writer
 /// then joined that onto the store's absolute repo root again, so
-/// `devmap build --manifest tmp/rel` wrote `tmp/rel/tmp/rel/.devmap/`. Resolving
-/// once at the boundary leaves nothing downstream to join twice. A path that
-/// cannot be resolved (missing) is kept as spelled so `validate_root` reports it.
+/// `devmap build --manifest tmp/rel` wrote `tmp/rel/tmp/rel/.devmap/`. Anchoring
+/// it to the working directory once, at the boundary, leaves nothing downstream
+/// to join twice. Symlinks are deliberately not resolved (`/tmp` and `/var` are
+/// links on macOS, and callers compare against the path they spelled); an
+/// absolute root is returned untouched, and a missing one stays missing so
+/// `validate_root` reports it.
 pub(crate) fn root_parser() -> impl clap::builder::TypedValueParser<Value = PathBuf> {
     use clap::builder::TypedValueParser as _;
     clap::builder::OsStringValueParser::new().map(|raw| {
         let path = PathBuf::from(raw);
-        path.canonicalize().unwrap_or(path)
+        if path.is_absolute() {
+            return path;
+        }
+        std::path::absolute(&path).unwrap_or(path)
     })
 }
 

@@ -172,22 +172,35 @@ fn a_unicode_directory_name_is_not_doubled() {
 
 #[cfg(unix)]
 #[test]
-fn a_relative_root_that_is_a_symlink_writes_into_the_tree_it_points_at() {
+fn a_relative_root_that_is_a_symlink_is_refused_like_its_absolute_spelling() {
     let base = scratch("link");
     let real = repo(&base, "real");
     std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
-    succeeded(
-        &run(&base, &["build", "--manifest", "--full", "link"]),
-        "symlink build",
+    // The store refuses a managed directory it would have to follow a link to
+    // open. A relative spelling must reach the same refusal, and leave nothing
+    // behind in either the link or the tree it points at.
+    let relative = run(&base, &["build", "--manifest", "--full", "link"]);
+    let absolute = run(
+        &base,
+        &[
+            "build",
+            "--manifest",
+            "--full",
+            base.join("link").to_str().unwrap(),
+        ],
     );
-    let names = built(&real);
-    assert!(
-        names
-            .iter()
-            .all(|name| name == "a.rs" || name.starts_with(".devmap/")),
-        "{names:?}"
+    for (what, out) in [("relative", &relative), ("absolute", &absolute)] {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success() && stderr.contains("real path"),
+            "{what}: a symlinked root must be refused with its remedy: {stderr}"
+        );
+    }
+    assert_eq!(
+        built(&real),
+        BTreeSet::from(["a.rs".to_string()]),
+        "a refused root must not write into the tree it points at"
     );
-    assert!(names.contains(".devmap/repo_map.json"), "{names:?}");
 }
 
 #[test]
