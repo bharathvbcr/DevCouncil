@@ -113,8 +113,13 @@ impl Resolver {
                 let tail = clean_spec[dots..].replace('.', "/");
                 let climb = "../".repeat(dots - 1);
                 let base = Self::normalize_rel(&dir, &format!("{climb}{tail}"))?;
+                // A bare `.`/`..` names the package itself, so only its
+                // `__init__.py` can be the answer: a stray `pkg.py` beside
+                // the `pkg/` directory is a different module.
                 let candidates = if base.is_empty() {
                     vec!["__init__.py".to_string()]
+                } else if tail.is_empty() {
+                    vec![format!("{base}/__init__.py")]
                 } else {
                     vec![format!("{base}.py"), format!("{base}/__init__.py")]
                 };
