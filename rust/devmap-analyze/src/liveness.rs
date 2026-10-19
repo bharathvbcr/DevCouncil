@@ -371,6 +371,12 @@ pub struct ExtractionCoverage {
     /// build of every real repository as degraded, and a degraded flag that is
     /// always on carries no information at all.
     pub parse_failed_files: usize,
+    /// The subset of [`Self::parse_failed_files`] refused for overrunning the
+    /// parse budget (`BUDGET_REFUSAL_PREFIX`). A different fact from a grammar
+    /// failure: it is the machine's load, not the file, and the next build
+    /// re-extracts it. Not a separate cap input; `parse_failed_files` already
+    /// charges it.
+    pub budget_refused_files: usize,
     /// Files whose declarations were recovered by line pattern.
     ///
     /// A `.proto` or `.ps1` this build cannot parse is a genuine gap in call
@@ -697,6 +703,15 @@ impl ExtractionCoverage {
                 "; {} file(s) in a language with no call extractor at all \
                  (permanent for this build, not a transient failure)",
                 self.call_blind_files
+            ));
+        }
+        // Named apart from grammar failures: these were refused for the
+        // machine's load, and re-running the build is exactly the fix.
+        if self.budget_refused_files > 0 {
+            reason.push_str(&format!(
+                "; {} of the parse failure(s) are budget-refused (the parse overran its \
+                 wall-clock budget under load; the next build re-extracts them)",
+                self.budget_refused_files
             ));
         }
         // Its own clause for the same reason: the fix is to split or shrink
@@ -2855,9 +2870,19 @@ pub fn extraction_coverage(extractions: &[Extraction]) -> ExtractionCoverage {
         .filter(|ext| partial_parse_charged(ext))
         .map(|ext| ext.file_path.as_str())
         .collect();
+    let budget_refused: HashSet<&str> = extractions
+        .iter()
+        .filter(|ext| ext.is_budget_refusal())
+        .map(|ext| ext.file_path.as_str())
+        .collect();
     for entry in extraction_gaps(extractions) {
         match entry.gap {
-            ExtractionGap::ParseFailed => coverage.parse_failed_files += 1,
+            ExtractionGap::ParseFailed => {
+                coverage.parse_failed_files += 1;
+                if budget_refused.contains(entry.path.as_str()) {
+                    coverage.budget_refused_files += 1;
+                }
+            }
             ExtractionGap::PatternRecovered => coverage.pattern_recovered_files += 1,
             ExtractionGap::CallBlind => coverage.call_blind_files += 1,
             ExtractionGap::ImportBlind => coverage.import_blind_files += 1,

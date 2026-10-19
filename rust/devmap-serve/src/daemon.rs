@@ -3414,6 +3414,146 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// A store whose latest generation holds `slow.py` refused by the parse
+    /// budget (the real extractor's refusal, from a zero budget) beside a clean
+    /// `a.py`, over a tree whose files are the same bytes the refusal was made
+    /// from. This is the state a daemon meets after a `devmap build` that ran
+    /// under load.
+    fn budget_refused_daemon(tag: &str) -> (std::path::PathBuf, Daemon) {
+        let root = std::env::temp_dir().join(format!(
+            "devmap-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let slow = "def slow():\n    return 2\n";
+        fs::write(root.join("a.py"), "def a():\n    return 1\n").unwrap();
+        fs::write(root.join("slow.py"), slow).unwrap();
+        let refused =
+            devmap_extract::extract_file_with_budget("slow.py", slow, Duration::ZERO);
+        assert!(refused.is_budget_refusal(), "the fixture must be a refusal");
+        let initial = vec![
+            devmap_extract::extract_file("a.py", "def a():\n    return 1\n"),
+            refused,
+        ];
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(&initial);
+        let resolution = resolver.resolve_all(&initial).unwrap();
+        let analysis = analyze(&initial, &resolution);
+        let store = Store::open_in_memory().unwrap();
+        save_scratch_generation(&store, &initial, &resolution, &analysis);
+        assert_eq!(store.latest_budget_refused_paths().unwrap(), ["slow.py"]);
+        let daemon = Daemon::new(store, root.clone());
+        (root, daemon)
+    }
+
+    /// What a differential write must leave true of a refused file it did not
+    /// touch, and what the next build then does with it.
+    fn assert_a_refusal_survives_and_the_next_build_recovers_it(daemon: &Daemon, root: &std::path::Path) {
+        // Still reported, by the same listing `devmap status` renders as
+        // `budget_refused`, and still stored as the refusal rather than as a
+        // clean row beside the nodes of a file nothing parsed.
+        let listing = daemon.store.latest_budget_refusals().unwrap();
+        assert_eq!(
+            listing.as_ref().map(|sample| sample.total),
+            Some(1),
+            "the drain dropped the refusal: {listing:?}"
+        );
+        assert_eq!(daemon.store.latest_budget_refused_paths().unwrap(), ["slow.py"]);
+        let stored = daemon.store.latest_file("slow.py").unwrap().unwrap();
+        assert!(
+            matches!(&stored.parse_outcome, devmap_extract::ParseOutcome::Failed { reason }
+                if reason.starts_with(devmap_extract::model::BUDGET_REFUSAL_PREFIX)),
+            "slow.py was carried forward as {:?}",
+            stored.parse_outcome
+        );
+
+        // The next build's input is exactly this path list, and a re-extraction
+        // of the unchanged bytes must not come back from a cache as the refusal.
+        let scanned = devmap_extract::scan_tree(root).unwrap();
+        let extractions =
+            devmap_store::extract_scanned_for_generation(&daemon.store, &scanned, None).unwrap();
+        let again = extractions
+            .iter()
+            .find(|extraction| extraction.file_path == "slow.py")
+            .expect("slow.py is in the tree");
+        assert!(!again.is_parse_failure(), "{:?}", again.parse_outcome);
+        let mut resolver = Resolver::new();
+        resolver.index_extractions(&extractions);
+        let resolution = resolver.resolve_all(&extractions).unwrap();
+        let analysis = analyze(&extractions, &resolution);
+        daemon
+            .store
+            .save_generation_with_metadata(
+                &extractions,
+                &resolution,
+                &analysis,
+                GenerationWriteOpts {
+                    affected_paths: daemon.store.latest_budget_refused_paths().unwrap(),
+                    ..GenerationWriteOpts::default()
+                },
+                SCRATCH_HEAD,
+            )
+            .unwrap();
+        assert_eq!(
+            daemon.store.latest_budget_refusals().unwrap().map(|s| s.total),
+            Some(0),
+            "the build that re-extracted the refused file must clear it"
+        );
+    }
+
+    /// A batch drain (HEAD unmoved) over a refused file it was not told about
+    /// carries the refusal forward as a refusal.
+    #[test]
+    fn a_batch_drain_keeps_an_untouched_budget_refusal() {
+        let (root, daemon) = budget_refused_daemon("refusal-batch");
+        fs::write(root.join("a.py"), "def a():\n    return 99\n").unwrap();
+        daemon
+            .store
+            .enqueue_pending_paths(&[root.join("a.py").display().to_string()])
+            .unwrap();
+        assert_eq!(daemon.drain_pending_batch().unwrap(), 1);
+        assert_a_refusal_survives_and_the_next_build_recovers_it(&daemon, &root);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The scan branch (HEAD moved, one file's hash differs) re-reads the whole
+    /// tree and hands the store every extraction, including a clean one for the
+    /// refused file whose bytes did not change. The store must not read that
+    /// fresh extraction as license to forget the refusal it still carries, and
+    /// must not leave the refused file as a clean row either.
+    #[test]
+    fn a_scanning_drain_keeps_an_untouched_budget_refusal() {
+        let (root, daemon) = budget_refused_daemon("refusal-scan");
+        fs::write(root.join("a.py"), "def a():\n    return 99\n").unwrap();
+        daemon
+            .store
+            .enqueue_pending_paths(&[root.join("a.py").display().to_string()])
+            .unwrap();
+        let moved = "b".repeat(40);
+        assert_eq!(
+            daemon
+                .drain_pending_batch_with_head(&move |_: &std::path::Path| Ok(moved.clone()))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            daemon
+                .store
+                .latest_generation_head_sha()
+                .unwrap()
+                .as_deref(),
+            Some("b".repeat(40).as_str()),
+            "the premise: this drain took the moved-HEAD scan branch"
+        );
+        assert_a_refusal_survives_and_the_next_build_recovers_it(&daemon, &root);
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// A checkout that lands *during* a drain must not be able to stamp itself
     /// onto a generation built from the previous one.
     ///
