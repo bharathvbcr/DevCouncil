@@ -158,7 +158,11 @@ impl Resolver {
         // Ordered the way the value rungs are: file-specific evidence (the
         // qualifier the author wrote) outranks a name list, for the same reason
         // an import outranks the host-global table.
-        if let UsePosition::Type { types: Some(typed) } = position {
+        if let UsePosition::Type {
+            types: Some(typed),
+            scope,
+        } = position
+        {
             // `t *testing.T`. The extractor splits the written type into a bare
             // name for dispatch and a `TypeQualifier` sibling for provenance
             // (SC25), so by the time the bare `T` fails the ladder the qualifier
@@ -166,7 +170,7 @@ impl Resolver {
             // through `declared_types`, which is where that sibling was
             // indexed, and scope-only for the SC9 reason: a qualifier this
             // scope wrote may not speak for a same-named binding in another.
-            let qualifier = self.qualifier_declared_in(file_path, Some(enclosing_symbol), typed);
+            let qualifier = self.qualifier_declared_in(file_path, scope, typed);
             if let Some(qualifier) = qualifier {
                 if let Some(module) = self
                     .external_imports

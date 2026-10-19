@@ -171,7 +171,12 @@ enum UsePosition<'a> {
     /// A type annotation. `types` names the value this annotation types — `t`
     /// for `t *testing.T` — when the extractor recorded one, because that is
     /// the key the `TypeQualifier` sibling was indexed under.
-    Type { types: Option<&'a str> },
+    Type {
+        types: Option<&'a str>,
+        /// The annotation's own enclosing symbol, `None` when unscoped. Not the
+        /// substituted source path, which names no `declared_types` scope.
+        scope: Option<&'a str>,
+    },
 }
 
 impl<'a> UsePosition<'a> {
