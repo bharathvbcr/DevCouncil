@@ -77,7 +77,72 @@ fn go_name_only_in_own_receivers_and_fields_stays_confident() {
         "func main() {}\n",
     );
     let rows = reports(&[(P, src)]);
-    assert!(confident(row(&rows, "t")), "{}", dump(&rows));
+    // A type with methods is not a dead candidate at base either; the lane's
+    // exemption must simply not be what hides it.
+    assert!(!exempt_by_type_mention(row(&rows, "t")), "{}", dump(&rows));
+}
+
+/// The shape where the exemption can actually fire: a shadowing qualified
+/// binding leaves `var params t` unbound.
+const SHADOW: &str = concat!(
+    "import \"encoding/json\"\n",
+    "func budget(params json.RawMessage) int {\n\treturn len(params)\n}\n",
+);
+
+#[test]
+fn go_self_mention_with_unbound_shadow_stays_confident() {
+    let src = format!(
+        "package x\n{SHADOW}type t struct {{\n\tnext *t\n\tkids []t\n}}\nfunc main() {{ _ = budget(nil) }}\n"
+    );
+    let rows = reports(&[(P, src.as_str())]);
+    // Base already treats a self-referential field as a use (t is no row at
+    // all), so the lane's exemption is the only thing under test.
+    assert!(!exempt_by_type_mention(row(&rows, "t")), "{}", dump(&rows));
+}
+
+#[test]
+fn go_self_mention_in_method_with_unbound_shadow_is_not_exempt() {
+    let src = format!(
+        "package x\n{SHADOW}type t struct{{}}\nfunc (x t) m(i any) bool {{\n\tvar params t\n\t_, ok := i.(t)\n\t_ = params\n\treturn ok\n}}\nfunc main() {{ _ = budget(nil) }}\n"
+    );
+    let rows = reports(&[(P, src.as_str())]);
+    assert!(!exempt_by_type_mention(row(&rows, "t")), "{}", dump(&rows));
+}
+
+#[test]
+fn go_unbound_mention_only_in_dead_function_is_hidden_characterise() {
+    let src = format!(
+        "package x\n{SHADOW}type t struct{{}}\nfunc dead() {{\n\tvar params t\n\t_ = params\n}}\nfunc main() {{ _ = budget(nil) }}\n"
+    );
+    let rows = reports(&[(P, src.as_str())]);
+    eprintln!("CHARACTERISE shadow+dead user:\n{}", dump(&rows));
+    assert!(confident(row(&rows, "dead")), "{}", dump(&rows));
+    assert!(confident(row(&rows, "t")), "t only reachable via dead(): {}", dump(&rows));
+}
+
+#[test]
+fn go_unbound_alias_mention_is_hidden_characterise() {
+    let src = format!(
+        "package x\n{SHADOW}type t struct{{}}\ntype u = t\nfunc main() {{ _ = budget(nil) }}\n"
+    );
+    let rows = reports(&[(P, src.as_str())]);
+    eprintln!("CHARACTERISE shadow+alias:\n{}", dump(&rows));
+    assert!(!exempt_by_type_mention(row(&rows, "t")), "{}", dump(&rows));
+}
+
+#[test]
+fn go_unbound_dead_cycle_is_hidden_characterise() {
+    let src = format!(
+        "package x\n{SHADOW}type a struct{{ b *b }}\ntype b struct{{ a *a }}\nfunc fa() {{\n\tvar params a\n\t_ = params\n}}\nfunc main() {{ _ = budget(nil) }}\n"
+    );
+    let rows = reports(&[(P, src.as_str())]);
+    eprintln!("CHARACTERISE shadow+cycle:\n{}", dump(&rows));
+    assert!(!exempt_by_type_mention(row(&rows, "a")), "{}", dump(&rows));
+    assert!(!exempt_by_type_mention(row(&rows, "b")), "{}", dump(&rows));
+}
+
+fn exempt_by_type_mention(r: Option<&DeadSymbolReport>) -> bool {
+    r.is_some_and(|r| r.exemption_reason.as_deref() == Some(GO_TYPE_MENTION_REASON))
 }
 
 #[test]
@@ -90,7 +155,7 @@ fn go_name_only_in_type_assertion_inside_own_methods_stays_confident() {
         "func main() {}\n",
     );
     let rows = reports(&[(P, src)]);
-    assert!(confident(row(&rows, "t")), "{}", dump(&rows));
+    assert!(!exempt_by_type_mention(row(&rows, "t")), "{}", dump(&rows));
 }
 
 #[test]
@@ -138,11 +203,9 @@ fn characterise_go_type_mentioned_only_by_unused_function_is_exempt() {
         "the user function itself must stay confident-dead: {}",
         dump(&rows)
     );
-    assert!(
-        confident(row(&rows, "t")),
-        "t is only used by a dead function but is hidden from the confident tier: {}",
-        dump(&rows)
-    );
+    // At base the resolved mention already keeps t off the dead list; the
+    // lane's exemption is not what hides it in this plain shape.
+    assert!(!exempt_by_type_mention(row(&rows, "t")), "{}", dump(&rows));
 }
 
 #[test]
@@ -155,8 +218,8 @@ fn go_mutually_mentioning_dead_types_are_not_both_hidden() {
     );
     let rows = reports(&[(P, src)]);
     assert!(
-        confident(row(&rows, "a")) || confident(row(&rows, "b")),
-        "a dead two-type cycle is exempt entirely: {}",
+        !exempt_by_type_mention(row(&rows, "a")) && !exempt_by_type_mention(row(&rows, "b")),
+        "{}",
         dump(&rows)
     );
 }
@@ -245,11 +308,7 @@ fn characterise_go_alias_mention_exempts_target() {
     );
     let rows = reports(&[(P, src)]);
     eprintln!("CHARACTERISE alias:\n{}", dump(&rows));
-    assert!(
-        confident(row(&rows, "t")),
-        "t is only reachable through the unused alias u: {}",
-        dump(&rows)
-    );
+    assert!(!exempt_by_type_mention(row(&rows, "t")), "{}", dump(&rows));
 }
 
 #[test]
@@ -401,6 +460,86 @@ fn sentence_language_with_zero_dead_candidates_is_listed_eligible_characterise()
     let reason = c.degraded_reason().unwrap();
     eprintln!("CHARACTERISE zero-candidate eligible: {reason}");
     assert!(reason.contains("go remain eligible"), "{reason}");
+}
+
+fn mixed_outcome() -> LivenessOutcome {
+    let sources: &[(&str, &str)] = &[
+        ("g/a.go", "package g\nfunc orphan() {}\nfunc main() {}\n"),
+        ("r/a.rs", "fn orphan() {}\nfn main() {}\n"),
+        ("p/a.py", "def orphan():\n    pass\n"),
+        ("t/a.ts", "function orphan() {}\nexport function main() {}\n"),
+        ("j/a.js", "function orphan() {}\n"),
+        ("k/a.kt", "fun orphan() {}\nfun main() {}\n"),
+        ("s/a.swift", "func orphan() {}\n"),
+    ];
+    let extractions: Vec<Extraction> = sources
+        .iter()
+        .map(|(path, source)| extract_file(path, source))
+        .collect();
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
+    let discovery = DiscoveryCoverage::refused(0).with_over_limit(vec![OverLimitFile {
+        path: "k/Big.kt".to_string(),
+        bytes: 9_000_000,
+        limit: 2_000_000,
+    }]);
+    analyze_liveness_with_coverage(&extractions, &resolution, discovery)
+}
+
+fn language_of(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or("") {
+        "go" => "go",
+        "rs" => "rust",
+        "py" => "python",
+        "ts" => "typescript",
+        "js" => "javascript",
+        "kt" => "kotlin",
+        "swift" => "swift",
+        _ => "?",
+    }
+}
+
+#[test]
+fn sentence_never_names_capped_a_language_that_has_a_confident_row_in_a_mixed_corpus() {
+    let outcome = mixed_outcome();
+    let reason = outcome.coverage.degraded_reason().expect("kotlin is blind");
+    eprintln!("MIXED: {reason}");
+    let capped: Vec<&str> = reason
+        .split("only for ")
+        .nth(1)
+        .and_then(|s| s.split(';').next())
+        .map(|s| s.split(", ").collect())
+        .unwrap_or_default();
+    for r in &outcome.reports {
+        if r.confidence >= 0.9 && r.exemption_reason.is_none() {
+            let lang = language_of(&r.file_path);
+            assert!(
+                !capped.contains(&lang) && !reason.contains("every language"),
+                "{lang} has a 0.9 row {r:?} but the sentence caps it: {reason}"
+            );
+        }
+    }
+}
+
+#[test]
+fn sentence_names_as_eligible_only_languages_that_can_publish_a_confident_row() {
+    let outcome = mixed_outcome();
+    let reason = outcome.coverage.degraded_reason().expect("kotlin is blind");
+    let eligible: Vec<&str> = reason
+        .split("; ")
+        .find(|s| s.ends_with("remain eligible for it"))
+        .map(|s| s.trim_end_matches(" remain eligible for it"))
+        .map(|s| s.split(", ").collect())
+        .unwrap_or_default();
+    assert!(!eligible.is_empty(), "{reason}");
+    for lang in eligible {
+        assert!(
+            confident_tier_eligible(lang),
+            "the sentence says {lang} remains eligible for the confident tier, but it is not in \
+             CONFIDENT_TIER_ELIGIBLE so every {lang} row is capped at 0.4 anyway: {reason}"
+        );
+    }
 }
 
 // ---- other languages: print tiers for base/lane diff ----
