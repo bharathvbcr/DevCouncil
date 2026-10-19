@@ -871,7 +871,8 @@ impl Resolver {
                         } else {
                             let submodule = match ext.language.as_str() {
                                 "python" => {
-                                    let dotted = format!("{}.{}", imp.module_specifier, name);
+                                    let dotted =
+                                        Self::python_submodule_spec(&imp.module_specifier, name);
                                     self.resolve_import_path(&ext.file_path, &ext.language, &dotted)
                                         .or_else(|| {
                                             self.resolve_via_search_dirs(

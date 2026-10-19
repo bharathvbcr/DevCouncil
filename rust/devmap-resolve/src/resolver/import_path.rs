@@ -113,8 +113,14 @@ impl Resolver {
                 let tail = clean_spec[dots..].replace('.', "/");
                 let climb = "../".repeat(dots - 1);
                 let base = Self::normalize_rel(&dir, &format!("{climb}{tail}"))?;
+                // Bare dots (`from . import x`, `from .. import z`) name a
+                // package, which is a directory: only its `__init__.py` can
+                // answer. A `pkg.py` beside the `pkg/` directory is a different
+                // module, never the package the dots climbed to.
                 let candidates = if base.is_empty() {
                     vec!["__init__.py".to_string()]
+                } else if tail.is_empty() {
+                    vec![format!("{base}/__init__.py")]
                 } else {
                     vec![format!("{base}.py"), format!("{base}/__init__.py")]
                 };

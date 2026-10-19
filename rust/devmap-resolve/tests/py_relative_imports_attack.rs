@@ -62,7 +62,10 @@ fn src_layout_parent_climb_resolves() {
 fn package_dir_mapped_root_relative_import_resolves() {
     // package-dir = {"pkg" = "impl"}: physical path impl/a.py, import name pkg.a.
     let r = resolve(&[
-        ("pyproject.toml", "[tool.setuptools]\npackage-dir = {\"pkg\" = \"impl\"}\n"),
+        (
+            "pyproject.toml",
+            "[tool.setuptools]\npackage-dir = {\"pkg\" = \"impl\"}\n",
+        ),
         ("impl/a.py", "from .b import f\n"),
         ("impl/b.py", "def f():\n    pass\n"),
     ]);
@@ -87,19 +90,28 @@ fn relative_import_of_sibling_module_via_dot_name() {
 
 #[test]
 fn pyi_only_sibling_characterized() {
-    let r = resolve(&[("pkg/a.py", "from .b import f\n"), ("pkg/b.pyi", "def f() -> None: ...\n")]);
+    let r = resolve(&[
+        ("pkg/a.py", "from .b import f\n"),
+        ("pkg/b.pyi", "def f() -> None: ...\n"),
+    ]);
     eprintln!("PYI targets: {:?}", targets(&r, "pkg/a.py"));
 }
 
 #[test]
 fn pyw_sibling_characterized() {
-    let r = resolve(&[("pkg/a.py", "from .b import f\n"), ("pkg/b.pyw", "def f():\n    pass\n")]);
+    let r = resolve(&[
+        ("pkg/a.py", "from .b import f\n"),
+        ("pkg/b.pyw", "def f():\n    pass\n"),
+    ]);
     eprintln!("PYW targets: {:?}", targets(&r, "pkg/a.py"));
 }
 
 #[test]
 fn pyi_importer_characterized() {
-    let r = resolve(&[("pkg/a.pyi", "from .b import f\n"), ("pkg/b.py", "def f():\n    pass\n")]);
+    let r = resolve(&[
+        ("pkg/a.pyi", "from .b import f\n"),
+        ("pkg/b.py", "def f():\n    pass\n"),
+    ]);
     eprintln!("PYI importer targets: {:?}", targets(&r, "pkg/a.pyi"));
 }
 
@@ -107,7 +119,10 @@ fn pyi_importer_characterized() {
 
 #[test]
 fn ns_pkg_x_init() {
-    let r = resolve(&[("ns/a.py", "from .x import y\n"), ("ns/x/__init__.py", "y = 1\n")]);
+    let r = resolve(&[
+        ("ns/a.py", "from .x import y\n"),
+        ("ns/x/__init__.py", "y = 1\n"),
+    ]);
     assert!(imports(&r, "ns/a.py", "ns/x/__init__.py"));
 }
 
@@ -119,7 +134,10 @@ fn ns_pkg_x_py() {
 
 #[test]
 fn ns_pkg_x_is_namespace_dir_dotted_module() {
-    let r = resolve(&[("ns/a.py", "from .x.m import y\n"), ("ns/x/m.py", "y = 1\n")]);
+    let r = resolve(&[
+        ("ns/a.py", "from .x.m import y\n"),
+        ("ns/x/m.py", "y = 1\n"),
+    ]);
     assert!(imports(&r, "ns/a.py", "ns/x/m.py"));
 }
 
@@ -127,7 +145,11 @@ fn ns_pkg_x_is_namespace_dir_dotted_module() {
 fn ns_pkg_x_is_namespace_dir_from_import_submodule() {
     // `from .x import m` where x/ has no __init__: m is the submodule ns/x/m.py.
     let r = resolve(&[("ns/a.py", "from .x import m\n"), ("ns/x/m.py", "y = 1\n")]);
-    assert!(imports(&r, "ns/a.py", "ns/x/m.py"), "{:?}", targets(&r, "ns/a.py"));
+    assert!(
+        imports(&r, "ns/a.py", "ns/x/m.py"),
+        "{:?}",
+        targets(&r, "ns/a.py")
+    );
 }
 
 #[test]
@@ -138,7 +160,11 @@ fn ns_miss_never_becomes_an_edge_to_an_unrelated_file() {
         ("src/ns/x.py", "y = 2\n"),
         ("ns/ns/x.py", "y = 3\n"),
     ]);
-    assert!(targets(&r, "ns/a.py").is_empty(), "{:?}", targets(&r, "ns/a.py"));
+    assert!(
+        targets(&r, "ns/a.py").is_empty(),
+        "{:?}",
+        targets(&r, "ns/a.py")
+    );
 }
 
 // ---- 4. climb ------------------------------------------------------------
@@ -147,7 +173,11 @@ fn ns_miss_never_becomes_an_edge_to_an_unrelated_file() {
 fn dot_only_never_binds_a_module_file_beside_the_package_dir() {
     // `from . import x` in pkg/a.py names package `pkg`; `pkg.py` is not it.
     let r = resolve(&[("pkg/a.py", "from . import x\n"), ("pkg.py", EMPTY)]);
-    assert!(!imports(&r, "pkg/a.py", "pkg.py"), "{:?}", targets(&r, "pkg/a.py"));
+    assert!(
+        !imports(&r, "pkg/a.py", "pkg.py"),
+        "{:?}",
+        targets(&r, "pkg/a.py")
+    );
 }
 
 #[test]
@@ -164,7 +194,11 @@ fn dot_only_with_init_present_never_adds_the_beside_file() {
 #[test]
 fn double_dot_never_binds_parent_dir_as_py_file() {
     let r = resolve(&[("top/pkg/a.py", "from .. import z\n"), ("top.py", EMPTY)]);
-    assert!(!imports(&r, "top/pkg/a.py", "top.py"), "{:?}", targets(&r, "top/pkg/a.py"));
+    assert!(
+        !imports(&r, "top/pkg/a.py", "top.py"),
+        "{:?}",
+        targets(&r, "top/pkg/a.py")
+    );
 }
 
 #[test]
@@ -175,8 +209,15 @@ fn climb_to_root_probes_root_init_characterized() {
 
 #[test]
 fn climb_to_root_dotted_module_resolves() {
-    let r = resolve(&[("pkg/a.py", "from ..x import f\n"), ("x.py", "def f():\n    pass\n")]);
-    assert!(imports(&r, "pkg/a.py", "x.py"), "{:?}", targets(&r, "pkg/a.py"));
+    let r = resolve(&[
+        ("pkg/a.py", "from ..x import f\n"),
+        ("x.py", "def f():\n    pass\n"),
+    ]);
+    assert!(
+        imports(&r, "pkg/a.py", "x.py"),
+        "{:?}",
+        targets(&r, "pkg/a.py")
+    );
 }
 
 #[test]
@@ -187,7 +228,10 @@ fn root_file_dot_import_without_root_init_characterized() {
 
 #[test]
 fn root_file_dot_module_import() {
-    let r = resolve(&[("main.py", "from .x import f\n"), ("x.py", "def f():\n    pass\n")]);
+    let r = resolve(&[
+        ("main.py", "from .x import f\n"),
+        ("x.py", "def f():\n    pass\n"),
+    ]);
     assert!(imports(&r, "main.py", "x.py"));
 }
 
@@ -198,13 +242,24 @@ fn deep_climb_past_root_is_a_miss() {
         ("q.py", EMPTY),
         ("a/q.py", EMPTY),
     ]);
-    assert!(targets(&r, "a/b/c.py").is_empty(), "{:?}", targets(&r, "a/b/c.py"));
+    assert!(
+        targets(&r, "a/b/c.py").is_empty(),
+        "{:?}",
+        targets(&r, "a/b/c.py")
+    );
 }
 
 #[test]
 fn deep_climb_exact_depth_resolves() {
-    let r = resolve(&[("a/b/c/d.py", "from ...q import r\n"), ("a/q.py", "r = 1\n")]);
-    assert!(imports(&r, "a/b/c/d.py", "a/q.py"), "{:?}", targets(&r, "a/b/c/d.py"));
+    let r = resolve(&[
+        ("a/b/c/d.py", "from ...q import r\n"),
+        ("a/q.py", "r = 1\n"),
+    ]);
+    assert!(
+        imports(&r, "a/b/c/d.py", "a/q.py"),
+        "{:?}",
+        targets(&r, "a/b/c/d.py")
+    );
 }
 
 // ---- 6. hostile specs ----------------------------------------------------
@@ -244,24 +299,41 @@ fn hostile_specs_do_not_panic_or_escape() {
 #[test]
 fn slash_in_spec_does_not_traverse() {
     let r = resolve(&[("pkg/a.py", "from .x/y import q\n"), ("pkg/x/y.py", EMPTY)]);
-    assert!(targets(&r, "pkg/a.py").is_empty(), "{:?}", targets(&r, "pkg/a.py"));
+    assert!(
+        targets(&r, "pkg/a.py").is_empty(),
+        "{:?}",
+        targets(&r, "pkg/a.py")
+    );
 }
 
 // ---- 5. dump for absolute-import edge diffs (ignored; env driven) -------
 
 fn walk(base: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, String)>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         let name = e.file_name().to_string_lossy().to_string();
-        if name == "target" || name == ".git" || name.starts_with("target-") || name == "node_modules" || name == "tmp" {
+        if name == "target"
+            || name == ".git"
+            || name.starts_with("target-")
+            || name == "node_modules"
+            || name == "tmp"
+        {
             continue;
         }
         if p.is_dir() {
             walk(base, &p, out);
         } else if name.ends_with(".py") || name.ends_with(".toml") || name.ends_with(".cfg") {
             if let Ok(s) = std::fs::read_to_string(&p) {
-                out.push((p.strip_prefix(base).unwrap().to_string_lossy().replace('\\', "/"), s));
+                out.push((
+                    p.strip_prefix(base)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                    s,
+                ));
             }
         }
     }
@@ -276,17 +348,34 @@ fn relative_imports_inside_manifest_fixtures_resolve() {
         let base = manifest.join(name);
         let mut files: Vec<(String, String)> = Vec::new();
         walk(&base, &base, &mut files);
-        files.push(("python/rootpkg/rel.py".into(), "from .util import split\n".into()));
+        files.push((
+            "python/rootpkg/rel.py".into(),
+            "from .util import split\n".into(),
+        ));
         files.push(("python/rootpkg/sub/__init__.py".into(), String::new()));
-        files.push(("python/rootpkg/sub/deep.py".into(), "from ..util import split\n".into()));
-        let borrowed: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
-        let extractions: Vec<Extraction> = borrowed.iter().map(|(p, s)| extract_file(p, s)).collect();
+        files.push((
+            "python/rootpkg/sub/deep.py".into(),
+            "from ..util import split\n".into(),
+        ));
+        let borrowed: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let extractions: Vec<Extraction> =
+            borrowed.iter().map(|(p, s)| extract_file(p, s)).collect();
         let mut resolver = Resolver::new();
-        resolver.index_project_manifests(&devmap_extract::collect_project_manifests(&base).unwrap());
+        resolver
+            .index_project_manifests(&devmap_extract::collect_project_manifests(&base).unwrap());
         resolver.index_extractions(&extractions);
         let r = resolver.resolve_all(&extractions).unwrap();
-        assert!(imports(&r, "python/rootpkg/rel.py", "python/rootpkg/util.py"), "{name}");
-        assert!(imports(&r, "python/rootpkg/sub/deep.py", "python/rootpkg/util.py"), "{name}");
+        assert!(
+            imports(&r, "python/rootpkg/rel.py", "python/rootpkg/util.py"),
+            "{name}"
+        );
+        assert!(
+            imports(&r, "python/rootpkg/sub/deep.py", "python/rootpkg/util.py"),
+            "{name}"
+        );
     }
 }
 
@@ -299,7 +388,10 @@ fn dump_import_edges() {
     let mut files: Vec<(String, String)> = Vec::new();
     walk(base, base, &mut files);
     files.sort();
-    let borrowed: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
     let extractions: Vec<Extraction> = borrowed.iter().map(|(p, s)| extract_file(p, s)).collect();
     let mut resolver = Resolver::new();
     resolver.index_project_manifests(&devmap_extract::collect_project_manifests(base).unwrap());

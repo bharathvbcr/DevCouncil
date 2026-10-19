@@ -305,8 +305,7 @@ fn python_relative_imports_resolve_in_the_importing_package_only() {
         .collect();
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
-    let resolve =
-        |file: &str, spec: &str| resolver.resolve_import_path(file, "python", spec);
+    let resolve = |file: &str, spec: &str| resolver.resolve_import_path(file, "python", spec);
 
     assert_eq!(
         resolve("main.py", ".util").as_deref(),
