@@ -987,13 +987,25 @@ impl Resolver {
     ) -> Option<ScopeHit<'_>> {
         let mut current = scope.to_string();
         let mut callable = depth > 0;
+        let mut own_body = depth == 0;
         for _ in 0..Self::PYTHON_MRO_MAX_DEPTH {
             let class_tail = if callable {
                 None
             } else {
                 self.python_class_scope(file, &current)
             };
-            // A class body's names are not in scope inside its methods.
+            // A class body's names are not in scope inside its methods, but a
+            // read written in the class body itself sees its imports.
+            if class_tail.is_some() && own_body {
+                if let Some(bound) = self
+                    .python_scoped_import_bindings
+                    .get(&(file.to_string(), current.clone()))
+                    .and_then(|names| names.get(root))
+                {
+                    return Some(ScopeHit::Import(bound.as_ref()));
+                }
+            }
+            own_body = false;
             if class_tail.is_none() {
                 if let Some(bound) = self
                     .python_scoped_import_bindings
@@ -1049,13 +1061,13 @@ impl Resolver {
     /// The `(target file, declared name)` an import binds `name` to where it is
     /// read in `scope` of `file`.
     ///
-    /// `scope` is the callable the name is read in; `Some(file)` (or `None`)
-    /// reads at module scope. An import in an enclosing function wins over the
-    /// module's, and when that import resolved to no file, or the function
-    /// binds the name some other way, the answer is none: it never falls
-    /// through to the module's import of the same name. At module scope a name
-    /// some function also imports, differently, is answered only when the
-    /// module scope is what is being read.
+    /// `scope` is the callable the name is read in; `Some(file)` (or `None`,
+    /// which is what a statement outside every function and class records)
+    /// reads at module scope, where only the module's own binding exists
+    /// whatever a function elsewhere imports. An import in an enclosing
+    /// function wins over the module's, and when that import resolved to no
+    /// file, or the function binds the name some other way, the answer is
+    /// none: it never falls through to the module's import of the same name.
     pub(super) fn python_import_binding(
         &self,
         file: &str,
@@ -1070,21 +1082,12 @@ impl Resolver {
             }
         }
         let flat = self.import_bindings.get(file)?.get(name)?;
-        match self
-            .python_import_conflicts
-            .get(&(file.to_string(), name.to_string()))
-        {
-            // The module binds it and a function imports it differently: the
-            // flat table holds the module's. A read whose scope is known and
-            // whose enclosing functions do not bind the name reads it; an
-            // unscoped read may be inside the function that does.
-            Some(true) if scope.is_some() => Some(flat),
-            Some(true) => None,
-            // Only functions bind it, to different things: the flat table
-            // holds one of them.
-            Some(false) => None,
-            None => Some(flat),
-        }
+        // Only functions bind it, and to different things: the flat table
+        // holds one of them, and no function enclosing this read is the one.
+        (!self
+            .python_ambiguous_scoped_imports
+            .contains(&(file.to_string(), name.to_string())))
+        .then_some(flat)
     }
 }
 
@@ -1127,20 +1130,61 @@ pub(super) fn python_all_is_dynamic(ext: &Extraction) -> bool {
     }) || ext.references.iter().any(|reference| {
         reference.enclosing_symbol.is_none()
             && (reference.assigned_to.as_deref() == Some("__all__")
+                // `other.__all__` read at module level and handed to no call
+                // (`['x'] + other.__all__`) is an operand of the list being
+                // built; one inside a call (`len(os.__all__)`,
+                // `os.__all__.copy()`) is a read of someone else's list.
                 || (reference.kind == ReferenceKind::Name
                     && reference.name == "__all__"
-                    && reference.receiver_expr.is_some()))
+                    && reference.receiver_expr.is_some()
+                    && !ext.calls.iter().any(|call| {
+                        call.span.start_byte <= reference.span.start_byte
+                            && reference.span.end_byte <= call.span.end_byte
+                    })))
     }) || ext.calls.iter().any(|call| {
-        // A method called on `__all__`, from any scope: a function the module
-        // runs at import can append to it as well as the module body can.
-        // `globals()["__all__"].append(..)` spells the receiver around it.
-        call.receiver_expr
-            .as_deref()
-            .is_some_and(|receiver| receiver.contains("__all__"))
-    }) || ext
-        .literals
+        // A mutating method on the bare name `__all__`, from any scope: a
+        // function the module runs at import can append to it as well as the
+        // module body can. `globals()["__all__"].append(..)` spells the
+        // receiver around it. `os.__all__`, `my__all__` and a read such as
+        // `__all__.__len__()` are not mutations of this module's list.
+        const MUTATORS: [&str; 9] = [
+            "append", "extend", "insert", "remove", "pop", "clear", "sort", "reverse", "__iadd__",
+        ];
+        call.receiver_expr.as_deref().is_some_and(|receiver| {
+            (receiver == "__all__"
+                || (receiver.starts_with("globals()[")
+                    && (receiver.contains("\"__all__\"") || receiver.contains("'__all__'"))))
+                && MUTATORS.contains(&call.callee_name.as_str())
+        })
+    }) || python_all_named_by_string(ext)
+}
+
+/// Whether the string `"__all__"` is the key of `globals()[..]` or the
+/// attribute name of `setattr(module, "__all__", ..)`: the two spellings that
+/// set the list by name. Any other use of the string (`hasattr`, a log
+/// message, an assertion) reads or says nothing about this module's list.
+fn python_all_named_by_string(ext: &Extraction) -> bool {
+    ext.literals
         .iter()
-        .any(|literal| literal.value == "__all__")
+        .filter(|literal| literal.value == "__all__")
+        .any(|literal| {
+            ext.calls.iter().any(|call| {
+                call.receiver_expr.is_none()
+                    && match call.callee_name.as_str() {
+                        // `globals()["__all__"]`: the string follows the call.
+                        "globals" => {
+                            call.span.end_byte <= literal.start_byte
+                                && literal.start_byte <= call.span.end_byte + 3
+                        }
+                        // `setattr(module, "__all__", ..)`: inside the call.
+                        "setattr" => {
+                            call.span.start_byte <= literal.start_byte
+                                && literal.start_byte < call.span.end_byte
+                        }
+                        _ => false,
+                    }
+            })
+        })
 }
 
 /// Whether the `super(..)` a `super(..).m()` call is made through starts the
@@ -1323,8 +1367,9 @@ pub(super) fn python_import_binds(
 
 /// The spans of every function, method and class a Python file declares, with
 /// the kind: the scopes an import can be written inside.
-pub(super) fn python_scope_containers(ext: &Extraction) -> Vec<ScopeSpan<'_>> {
-    ext.symbols
+pub(super) fn python_scope_containers(ext: &Extraction) -> ScopeIndex<'_> {
+    let mut spans: Vec<ScopeSpan<'_>> = ext
+        .symbols
         .iter()
         .filter(|sym| {
             matches!(
@@ -1340,22 +1385,49 @@ pub(super) fn python_scope_containers(ext: &Extraction) -> Vec<ScopeSpan<'_>> {
                 sym.qualified_name.as_str(),
             )
         })
-        .collect()
+        .collect();
+    // Outer scopes first at one start, so a stack sweep finds each parent.
+    spans.sort_by_key(|(start, end, _, _)| (*start, std::cmp::Reverse(*end)));
+    let mut parents: Vec<Option<usize>> = Vec::with_capacity(spans.len());
+    let mut open: Vec<usize> = Vec::new();
+    for (index, (start, _, _, _)) in spans.iter().enumerate() {
+        while open.last().is_some_and(|top| spans[*top].1 <= *start) {
+            open.pop();
+        }
+        parents.push(open.last().copied());
+        open.push(index);
+    }
+    ScopeIndex { spans, parents }
 }
 
 /// A function, method or class of a Python file: its span, kind and qualified
 /// name.
 pub(super) type ScopeSpan<'a> = (usize, usize, SymbolKind, &'a str);
 
+/// The functions, methods and classes of a Python file, ordered by position
+/// with each one's enclosing scope, so the innermost scope around a span is a
+/// binary search and a short walk rather than a scan of every symbol.
+pub(super) struct ScopeIndex<'a> {
+    spans: Vec<ScopeSpan<'a>>,
+    parents: Vec<Option<usize>>,
+}
+
 /// The kind and qualified name of the innermost function, method or class
 /// that contains `span`, or `None` for a statement at module scope.
 pub(super) fn python_innermost_container<'a>(
-    containers: &[ScopeSpan<'a>],
+    containers: &ScopeIndex<'a>,
     span: &Span,
 ) -> Option<(SymbolKind, &'a str)> {
-    containers
-        .iter()
-        .filter(|(start, end, _, _)| *start <= span.start_byte && span.end_byte <= *end)
-        .min_by_key(|(start, end, _, _)| end - start)
-        .map(|(_, _, kind, name)| (*kind, *name))
+    let after = containers
+        .spans
+        .partition_point(|(start, _, _, _)| *start <= span.start_byte);
+    let mut current = after.checked_sub(1);
+    while let Some(index) = current {
+        let (_, end, kind, name) = containers.spans[index];
+        if span.end_byte <= end {
+            return Some((kind, name));
+        }
+        current = containers.parents[index];
+    }
+    None
 }

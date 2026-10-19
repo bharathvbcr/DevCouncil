@@ -429,10 +429,10 @@ pub struct Resolver {
     /// binds; this is where the function's own live.
     python_scoped_import_bindings:
         BTreeMap<(String, String), BTreeMap<String, Option<(String, String)>>>,
-    /// `(file, name)` the module scope and some function (`true`), or several
-    /// functions (`false`), import differently. The flat table cannot say which
-    /// binding a read without a scope means.
-    python_import_conflicts: BTreeMap<(String, String), bool>,
+    /// `(file, name)` that several functions import differently and the module
+    /// does not import: the flat table holds one of them, so a read that no
+    /// function's own scope answers has no binding.
+    python_ambiguous_scoped_imports: BTreeSet<(String, String)>,
     /// Reverse of [`Self::supertypes`]: `(family, type name)` → indexed subtypes.
     ///
     /// Built from the same heritage rows. X42's virtual-`self` guard walks this
@@ -744,7 +744,7 @@ impl Resolver {
             python_class_enclosers: BTreeMap::new(),
             python_dynamic_all: BTreeSet::new(),
             python_scoped_import_bindings: BTreeMap::new(),
-            python_import_conflicts: BTreeMap::new(),
+            python_ambiguous_scoped_imports: BTreeSet::new(),
             subtypes: BTreeMap::new(),
             import_bindings: BTreeMap::new(),
             value_imports: BTreeMap::new(),
@@ -3218,7 +3218,7 @@ impl Resolver {
         self.python_class_enclosers.clear();
         self.python_dynamic_all.clear();
         self.python_scoped_import_bindings.clear();
-        self.python_import_conflicts.clear();
+        self.python_ambiguous_scoped_imports.clear();
         self.subtypes.clear();
         self.import_bindings.clear();
         self.value_imports.clear();
@@ -3916,7 +3916,7 @@ impl Resolver {
                 }
             };
             for imp in &ext.imports {
-                let nested_python: Option<String> = py_scopes.as_deref().and_then(|scopes| {
+                let nested_python: Option<String> = py_scopes.as_ref().and_then(|scopes| {
                     pytypes::python_innermost_container(scopes, &imp.span)
                         .map(|(_, scope)| scope.to_string())
                 });
@@ -4252,13 +4252,17 @@ impl Resolver {
                         (target_f, local.clone())
                     };
                     if let Some(scope) = &nested_python {
-                        // `import a.b` binds the package `a`, not the module
-                        // the flat table files under `b`. The scope's `a` is
-                        // therefore a binding no table here resolves (none),
-                        // and the flat table gains nothing for `b`.
+                        // `import a.b` binds the package `a`, the same package a
+                        // module-level `import a` binds, not the module the flat
+                        // table files under `b`. The scope's `a` is that package
+                        // (none when it names no indexed file), and the flat
+                        // table gains nothing for `b`.
                         let root = imp.module_specifier.split('.').next().unwrap_or("");
                         if alias.is_none() && root != local {
-                            note_scoped(scope, root, None);
+                            let package = self
+                                .resolve_import_path(&ext.file_path, &ext.language, root)
+                                .map(|file| (file, root.to_string()));
+                            note_scoped(scope, root, package);
                         } else {
                             note_scoped(scope, &local, Some(binding.clone()));
                             file_bindings.entry(local).or_insert(binding);
@@ -4269,25 +4273,21 @@ impl Resolver {
                     }
                 }
             }
-            // A name a function imports that the module also imports, or that
-            // several functions import differently, is not one binding.
-            for (scope, names) in &file_scoped {
+            // A name only functions bind, and bind to different things, has no
+            // one binding in the flat table. A name the module also binds is
+            // not a conflict: a module-scope read is the module's, and a read
+            // in a function asks the scope walk first.
+            let mut targets_by_name: BTreeMap<&str, BTreeSet<&Option<(String, String)>>> =
+                BTreeMap::new();
+            for names in file_scoped.values() {
                 for (name, bound) in names {
-                    let module_binds = module_imported.contains(name);
-                    let differs = if module_binds {
-                        file_bindings.get(name) != bound.as_ref()
-                    } else {
-                        file_scoped.iter().any(|(other, other_names)| {
-                            other != scope
-                                && other_names
-                                    .get(name)
-                                    .is_some_and(|other_bound| other_bound != bound)
-                        })
-                    };
-                    if differs {
-                        self.python_import_conflicts
-                            .insert((ext.file_path.clone(), name.clone()), module_binds);
-                    }
+                    targets_by_name.entry(name).or_default().insert(bound);
+                }
+            }
+            for (name, targets) in targets_by_name {
+                if targets.len() > 1 && !module_imported.contains(name) {
+                    self.python_ambiguous_scoped_imports
+                        .insert((ext.file_path.clone(), name.to_string()));
                 }
             }
             for (scope, names) in file_scoped {
@@ -4506,7 +4506,12 @@ impl Resolver {
                 // `K.A()` with `K` a class this file declares reads `A` off the
                 // class: a class attribute, not the class `A` the name alone
                 // would name.
-                let class_attribute = family == LangFamily::Python
+                //
+                // `K` is that class only where the reading scope does not
+                // rebind it (`import m as K` inside the function is a module),
+                // and when `K` declares a nested `class A` the attribute is
+                // that class, which the unique-name rule below may still bind.
+                let local_class_qualifier = family == LangFamily::Python
                     && reference
                         .receiver_expr
                         .clone()
@@ -4520,16 +4525,37 @@ impl Resolver {
                         .as_deref()
                         .is_some_and(|qualifier| {
                             let root = qualifier.split('.').next().unwrap_or(qualifier);
-                            self.symbol_index.get(root).into_iter().flatten().any(
-                                |(path, kind, candidate_family, _)| {
-                                    *path == ext.file_path
-                                        && *kind == SymbolKind::Class
-                                        && *candidate_family == LangFamily::Python
-                                },
-                            )
+                            let declares_class = |name: &str| {
+                                self.symbol_index.get(name).into_iter().flatten().any(
+                                    |(path, kind, candidate_family, _)| {
+                                        *path == ext.file_path
+                                            && *kind == SymbolKind::Class
+                                            && *candidate_family == LangFamily::Python
+                                    },
+                                )
+                            };
+                            declares_class(root)
+                                && !reference.enclosing_symbol.as_deref().is_some_and(|scope| {
+                                    self.python_scope_lookup(&ext.file_path, scope, root, 0)
+                                        .is_some()
+                                })
                         });
+                let nested_class_attribute = local_class_qualifier
+                    && ext.symbols.iter().any(|nested| {
+                        nested.name == reference.name
+                            && nested.kind == SymbolKind::Class
+                            // The extractor files a class written in a class under
+                            // the file; its span says which class it sits in.
+                            && ext.symbols.iter().any(|owner| {
+                                owner.kind == SymbolKind::Class
+                                    && owner.name != nested.name
+                                    && owner.span.start_byte <= nested.span.start_byte
+                                    && nested.span.end_byte <= owner.span.end_byte
+                            })
+                    });
+                let class_attribute = local_class_qualifier && !nested_class_attribute;
                 let python_names_one_class = family == LangFamily::Python
-                    && !class_attribute
+                    && !local_class_qualifier
                     && self
                         .python_class_named(
                             &ext.file_path,
@@ -5184,6 +5210,20 @@ impl Resolver {
                 let mut unresolved: Vec<UnresolvedReference> = Vec::new();
                 let mut package_groups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
                 let family = LangFamily::from_lang(&ext.language);
+                // The scope a Python statement is read in. A call in a function
+                // names it; one in a class body is recorded with no caller, and
+                // its span says which class body it is written in; one outside
+                // every function and class is read at module scope.
+                let py_call_scopes = (family == LangFamily::Python)
+                    .then(|| pytypes::python_scope_containers(ext));
+                let read_scope = |caller: Option<&'_ str>, span: &Span| -> Option<String> {
+                    caller.map(str::to_string).or_else(|| {
+                        py_call_scopes.as_ref().and_then(|scopes| {
+                            pytypes::python_innermost_container(scopes, span)
+                                .map(|(_, scope)| scope.to_string())
+                        })
+                    })
+                };
 
                 // Lexical containment. The file owns every symbol declared in it —
                 // including nested methods — and a type additionally owns its own
@@ -5603,7 +5643,7 @@ impl Resolver {
                                 .then(|| {
                                     self.python_method_on(
                                         &ext.file_path,
-                                        call.caller_symbol.as_deref(),
+                                        read_scope(call.caller_symbol.as_deref(), &call.span).as_deref(),
                                         &class_type,
                                         &call.callee_name,
                                     )
@@ -5920,7 +5960,7 @@ impl Resolver {
                         if let Some((target_f, target_sym)) = self.import_binding_at(
                             family,
                             &ext.file_path,
-                            call.caller_symbol.as_deref(),
+                            read_scope(call.caller_symbol.as_deref(), &call.span).as_deref(),
                             &call.callee_name,
                         ) {
                             if let Some((resolved_file, resolved_sym)) =
@@ -6028,7 +6068,7 @@ impl Resolver {
                                 if let Some((target_f, _)) = self.import_binding_at(
                                     family,
                                     &ext.file_path,
-                                    call.caller_symbol.as_deref(),
+                                    read_scope(call.caller_symbol.as_deref(), &call.span).as_deref(),
                                     &recv,
                                 ) {
                                     // A module member: a member of a module
@@ -6322,7 +6362,7 @@ impl Resolver {
                             {
                                 self.python_method_on(
                                     &ext.file_path,
-                                    call.caller_symbol.as_deref(),
+                                    read_scope(call.caller_symbol.as_deref(), &call.span).as_deref(),
                                     recv,
                                     &call.callee_name,
                                 )
