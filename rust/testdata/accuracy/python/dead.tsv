@@ -108,3 +108,5 @@ truly_dead	micro/superkw/children.py::SkMetaBase.hop	nothing calls it: SkMeta.ho
 truly_dead	relroot_main.py::rz_root_run	caller probe nothing calls
 truly_dead	relroot_beyond.py::rz_beyond_run	caller probe nothing calls
 truly_dead	rzpkg/a.py::rz_missing_run	caller probe nothing calls
+truly_dead	rzpkg/rzpkg/util.py::rz_g	nothing calls it: the relative import in rzpkg/a.py names rzpkg/util.py, which does not exist; reported at 0.4 unconfirmed
+truly_dead	src/rzpkg/util.py::rz_f	nothing calls it: the relative import in rzpkg/a.py names rzpkg/util.py, which does not exist; reported at 0.4 unconfirmed
