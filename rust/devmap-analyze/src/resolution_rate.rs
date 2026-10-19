@@ -129,15 +129,35 @@ pub struct ResolutionRate {
     /// `devmap_extract::wiring::is_vendored_path`. Counted in the totals,
     /// absent from `by_language` and from both permille figures: a vendored
     /// file is not this repository's code.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub vendored_sites: usize,
     /// Grammar-read files under vendored paths.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub vendored_files: usize,
     /// Attribution sites (resolved plus unresolved) in languages with no call
     /// extractor. Counted in the totals, excluded from both permille figures.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub call_blind_sites: usize,
+    /// The headline's own counts: the sums over measured languages that
+    /// `net_permille` and `gross_permille` are computed from, so a reader can
+    /// reproduce them. `net = measured_resolved / (measured_resolved +
+    /// measured_unresolved - measured_explained)`. Absent or null reads as 0
+    /// on a row stored before they existed.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub measured_resolved_sites: usize,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub measured_unresolved_sites: usize,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub measured_explained_sites: usize,
+}
+
+/// An explicit `null` reads as the type's default, the same as an absent field.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// Structural edges are not attributions.
@@ -373,6 +393,9 @@ pub fn resolution_rate(
         vendored_sites: vendored_resolved + vendored_unresolved,
         vendored_files,
         call_blind_sites,
+        measured_resolved_sites: measured_resolved,
+        measured_unresolved_sites: measured_unresolved,
+        measured_explained_sites: measured_explained,
     }
 }
 

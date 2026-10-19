@@ -1336,14 +1336,18 @@ fn resolution_rate_lines(rate: &devmap_analyze::ResolutionRate) -> Vec<String> {
         return lines;
     };
     lines.push(format!(
-        "  Resolution rate: {}.{}% net, {}.{}% gross ({} resolved / {} unresolved, {} explained)",
+        "  Resolution rate: {}.{}% net, {}.{}% gross ({} resolved / {} unresolved, {} explained \
+         measured; {} sites total, {} excluded as vendored, {} as call-blind)",
         net / 10,
         net % 10,
         rate.gross_permille.map(|g| g / 10).unwrap_or(0),
         rate.gross_permille.map(|g| g % 10).unwrap_or(0),
-        rate.resolved_sites,
-        rate.unresolved_sites,
-        rate.explained_sites,
+        rate.measured_resolved_sites,
+        rate.measured_unresolved_sites,
+        rate.measured_explained_sites,
+        rate.resolved_sites + rate.unresolved_sites,
+        rate.vendored_sites,
+        rate.call_blind_sites,
     ));
     push_excluded_sites(&mut lines, rate);
     push_language_rows(&mut lines, rate);
