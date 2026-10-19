@@ -2,7 +2,7 @@ use crate::model::*;
 use devmap_extract::languages::{capabilities_for_language, Capability};
 use devmap_extract::model::*;
 use devmap_resolve::model::*;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Symbol identity relative to its file, so that `file_path` + `symbol_name`
 /// reconstructs the graph id exactly. A method must report as `MyClass.execute`
@@ -169,6 +169,46 @@ pub const GO_BUILD_VARIANT_REASON: &str =
 /// so the index cannot show that nothing uses it.
 pub const GO_VALUE_MENTION_REASON: &str =
     "Named as a value in its own Go package — the mention is a bare identifier the ladder declines";
+
+/// Why a Go type is exempt rather than reported dead while its own file names it
+/// in type position.
+///
+/// A statement about the evidence, like [`GO_VALUE_MENTION_REASON`]: the
+/// extraction holds a `Type` reference to this name that the resolver did not
+/// bind, so the index cannot show that nothing uses the type.
+pub const GO_TYPE_MENTION_REASON: &str =
+    "Named in type position in its own Go file — the reference is one the resolver left unbound";
+
+/// `(file, type name)` pairs a Go file names in type position from *outside* the
+/// type's own body, each carrying the qualified names of the symbols that wrote
+/// the mention.
+///
+/// The resolver binds `var x T` through the same-file rung, but a `Type`
+/// reference is keyed by the *variable* it annotates and read back through a
+/// file-wide `@mod` slot, so one `params json.RawMessage` elsewhere in the file
+/// sends every `var params T` down the qualified-type path and the bare type is
+/// never bound (`toolsCallParams` in `mcp/server.go`). This reads the extraction
+/// fact directly so that failure cannot turn a used type into a confident
+/// finding. Same file only: that is the scope the same-file rung is entitled to,
+/// and the one a Go type's unqualified name is exact in.
+fn go_type_mentions(extractions: &[Extraction]) -> HashMap<(&str, &str), HashSet<&str>> {
+    let mut mentions: HashMap<(&str, &str), HashSet<&str>> = HashMap::new();
+    for ext in extractions {
+        if ext.language != "go" {
+            continue;
+        }
+        for reference in &ext.references {
+            if reference.kind != ReferenceKind::Type {
+                continue;
+            }
+            mentions
+                .entry((ext.file_path.as_str(), reference.name.as_str()))
+                .or_default()
+                .insert(reference.enclosing_symbol.as_deref().unwrap_or(""));
+        }
+    }
+    mentions
+}
 
 /// Bare value-position identifiers named in a Go package, keyed by
 /// `(directory, package clause, name)` and carrying the files that named them.
@@ -584,6 +624,49 @@ impl ExtractionCoverage {
             .saturating_add(self.not_parsed_files)
     }
 
+    /// Which languages the cap reaches, said in the terms [`Self::cap_for`]
+    /// decides it: a language is capped exactly when
+    /// [`Self::is_complete_for`] is false for it, so this sentence cannot claim
+    /// the confident tier is shut while a row of an eligible language sits at
+    /// 0.9. Languages come from the per-language maps; with none (aggregate
+    /// counters only, or a discovery refusal that reaches every language) every
+    /// language is capped.
+    fn confident_tier_clause(&self) -> String {
+        // Every language in the corpus, plus the members of every family, so a
+        // language capped only through a sibling's blindness is named too.
+        let present: BTreeSet<&str> = self
+            .covered_by_language
+            .keys()
+            .chain(self.blind_by_language.keys())
+            .map(String::as_str)
+            .collect();
+        let candidates: BTreeSet<&str> = present
+            .iter()
+            .copied()
+            .chain(LANGUAGE_FAMILIES.iter().flat_map(|(_, m)| m.iter().copied()))
+            .collect();
+        let mut capped: Vec<&str> = Vec::new();
+        let mut eligible: Vec<&str> = Vec::new();
+        for language in candidates {
+            // Capped exactly when `cap_for` cannot return the full confidence:
+            // its ceilings never exceed `HIGHEST_DEGRADED_CONFIDENCE`.
+            if self.cap_for(language, 1.0) <= HIGHEST_DEGRADED_CONFIDENCE {
+                capped.push(language);
+            } else if present.contains(language) && confident_tier_eligible(language) {
+                eligible.push(language);
+            }
+        }
+        if eligible.is_empty() {
+            return "findings in every language are capped below the confident tier".to_string();
+        }
+        format!(
+            "findings are capped below the confident tier only for {}; {} remain eligible \
+             for it",
+            bounded_names(&capped),
+            bounded_names(&eligible)
+        )
+    }
+
     /// Why the corpus-level scan is incomplete, or `None` when it is complete.
     ///
     /// `None` on a clean corpus is the whole point: this string is what
@@ -597,9 +680,11 @@ impl ExtractionCoverage {
         let mut reason = format!(
             "call extraction did not cover the whole corpus: {} file(s) failed to parse, \
              {} recovered by pattern (no calls extracted), {} refused by discovery and never \
-             read at all — dead-code and unwired findings are a lower bound and are capped \
-             below the confident tier",
-            self.parse_failed_files, self.pattern_recovered_files, self.discovery_refused_files
+             read at all — dead-code and unwired findings are a lower bound; {}",
+            self.parse_failed_files,
+            self.pattern_recovered_files,
+            self.discovery_refused_files,
+            self.confident_tier_clause()
         );
         // Appended rather than folded into the sentence above, because it is a
         // different kind of fact and a permanent one. The other three describe
@@ -932,23 +1017,47 @@ pub fn language_can_reference(from: &str, to: &str) -> bool {
 }
 
 fn language_family(language: &str) -> Option<&'static str> {
-    Some(match language {
-        "javascript" | "typescript" | "tsx" | "arkts" | "svelte" | "vue" | "astro" | "liquid" => {
-            "js"
-        }
-        "c" | "cpp" | "objc" | "cuda" | "metal" => "c",
-        "java" | "kotlin" | "scala" => "jvm",
-        "csharp" | "vbnet" => "clr",
-        "python" => "python",
-        "go" => "go",
-        "rust" => "rust",
-        "swift" => "swift",
-        "ruby" => "ruby",
-        "php" => "php",
-        "dart" => "dart",
-        _ => return None,
-    })
+    LANGUAGE_FAMILIES
+        .iter()
+        .find(|(_, members)| members.contains(&language))
+        .map(|(family, _)| *family)
 }
+
+/// Most language names the degraded sentence lists before saying "and K more".
+const SENTENCE_NAME_LIMIT: usize = 8;
+
+/// `names` joined for a sentence, bounded by count so a corpus of dozens of
+/// languages cannot make `degraded_reason` unbounded.
+fn bounded_names(names: &[&str]) -> String {
+    if names.len() <= SENTENCE_NAME_LIMIT {
+        return names.join(", ");
+    }
+    format!(
+        "{} and {} more",
+        names[..SENTENCE_NAME_LIMIT].join(", "),
+        names.len() - SENTENCE_NAME_LIMIT
+    )
+}
+
+/// Languages whose files can call one another, by family. The one table
+/// [`language_family`] reads, and what the degraded sentence walks to find
+/// languages capped through a sibling's blindness (Kotlin blind caps Java).
+const LANGUAGE_FAMILIES: &[(&str, &[&str])] = &[
+    (
+        "js",
+        &["javascript", "typescript", "tsx", "arkts", "svelte", "vue", "astro", "liquid"],
+    ),
+    ("c", &["c", "cpp", "objc", "cuda", "metal"]),
+    ("jvm", &["java", "kotlin", "scala"]),
+    ("clr", &["csharp", "vbnet"]),
+    ("python", &["python"]),
+    ("go", &["go"]),
+    ("rust", &["rust"]),
+    ("swift", &["swift"]),
+    ("ruby", &["ruby"]),
+    ("php", &["php"]),
+    ("dart", &["dart"]),
+];
 
 /// How many members the cluster ceiling compounds over before it stops caring.
 ///
@@ -1567,6 +1676,8 @@ pub fn exemption_token(reason: &str) -> &'static str {
         "go_build_variant"
     } else if reason == GO_VALUE_MENTION_REASON {
         "go_value_mention"
+    } else if reason == GO_TYPE_MENTION_REASON {
+        "go_type_mention"
     } else if reason == "Symbol overlaps a tree-sitter parse error" {
         "parse_error_overlap"
     } else if reason == FILE_EXEMPT_REASON {
@@ -3031,6 +3142,7 @@ fn symbol_exemption_index(
     let c_header_exports = c_header_exported_names(extractions);
     let go_build_variants = go_build_variant_identities(extractions);
     let go_value_mentions = go_value_mentioned_names(extractions);
+    let go_type_mentions = go_type_mentions(extractions);
     let go_exported_specs = go_exported_interface_specs(extractions);
     let swift_conforming = swift_types_with_supertypes(extractions);
 
@@ -3261,6 +3373,28 @@ fn symbol_exemption_index(
                                 files.iter().any(|file| *file != ext.file_path.as_str())
                             }))
                     .then(|| GO_VALUE_MENTION_REASON.to_string())
+                })
+                // A Go type its own file writes in type position. A mention
+                // from inside the type (`func (t T) m()`, a self-referential
+                // field) is the type's own body and is not evidence of use.
+                .or_else(|| {
+                    (ext.language == "go"
+                        && matches!(
+                            sym.kind,
+                            SymbolKind::Struct | SymbolKind::Interface | SymbolKind::Class
+                        )
+                        && go_type_mentions
+                            .get(&(ext.file_path.as_str(), sym.name.as_str()))
+                            .is_some_and(|writers| {
+                                writers.iter().any(|writer| {
+                                    *writer != sym.qualified_name
+                                        && !writer.starts_with(&format!(
+                                            "{}.",
+                                            sym.qualified_name
+                                        ))
+                                })
+                            }))
+                    .then(|| GO_TYPE_MENTION_REASON.to_string())
                 })
                 // An exported Go method whose shape some interface declares.
                 //

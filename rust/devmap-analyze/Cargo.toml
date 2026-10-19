@@ -68,6 +68,10 @@ name = "go_function_value_liveness"
 required-features = ["parse"]
 
 [[test]]
+name = "go_type_use_liveness"
+required-features = ["parse"]
+
+[[test]]
 name = "module_private_widening"
 required-features = ["parse"]
 
@@ -213,4 +217,8 @@ required-features = ["parse"]
 
 [[test]]
 name = "python_residue_attack"
+required-features = ["parse"]
+
+[[test]]
+name = "go_type_use_attack"
 required-features = ["parse"]
