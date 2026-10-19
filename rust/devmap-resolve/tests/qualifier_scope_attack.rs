@@ -207,6 +207,21 @@ fn p3_python_module_level_annotation_stays_external() {
 // helper's own doc says answers unscoped references is unreachable here.
 const GO_BODILESS: &str = "package p\n\nimport \"encoding/json\"\n\nfunc native(params json.RawMessage) int\n";
 
+const GO_IFACE: &str = "package p\n\nimport \"encoding/json\"\n\ntype I interface {\n\tM(params json.RawMessage) int\n}\n\nfunc native2(a, b json.RawMessage, c *json.RawMessage) int\n";
+
+// Same shape as the bodiless probe: every function-with-no-body declaration
+// (assembly-backed Go functions) keeps `enclosing_symbol = None`.
+#[test]
+fn p3_go_bodiless_func_every_param_form_is_external() {
+    let res = resolve("p/p.go", GO_IFACE);
+    let cs = classes(&res, "RawMessage");
+    assert!(
+        all_external(&cs),
+        "{cs:?}\n{}",
+        dump("p/p.go", GO_IFACE)
+    );
+}
+
 #[test]
 fn p3_go_bodiless_func_qualified_param_is_external() {
     let res = resolve("p/p.go", GO_BODILESS);
