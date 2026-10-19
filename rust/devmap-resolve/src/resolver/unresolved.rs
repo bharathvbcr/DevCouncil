@@ -158,23 +158,24 @@ impl Resolver {
         // Ordered the way the value rungs are: file-specific evidence (the
         // qualifier the author wrote) outranks a name list, for the same reason
         // an import outranks the host-global table.
-        if let UsePosition::Type { types: Some(typed) } = position {
+        if let UsePosition::Type {
+            types: Some(typed),
+            scope,
+        } = position
+        {
             // `t *testing.T`. The extractor splits the written type into a bare
             // name for dispatch and a `TypeQualifier` sibling for provenance
             // (SC25), so by the time the bare `T` fails the ladder the qualifier
             // is the only thing that still knows where it came from. Read
             // through `declared_types`, which is where that sibling was
-            // indexed, and scoped-first for the SC9 reason: a qualifier this
+            // indexed, and scope-only for the SC9 reason: a qualifier this
             // scope wrote may not speak for a same-named binding in another.
-            let qualifier = self
-                .declared_types
-                .get(&format!("{file_path}:{enclosing_symbol}:{typed}@mod"))
-                .or_else(|| self.declared_types.get(&format!("{file_path}:{typed}@mod")));
+            let qualifier = self.qualifier_declared_in(file_path, scope, typed);
             if let Some(qualifier) = qualifier {
                 if let Some(module) = self
                     .external_imports
                     .get(file_path)
-                    .and_then(|imports| imports.get(qualifier.as_str()))
+                    .and_then(|imports| imports.get(qualifier))
                 {
                     return UnresolvedClass::External {
                         module: module.clone(),
@@ -185,7 +186,7 @@ impl Resolver {
                 if self
                     .unindexed_local_imports
                     .get(file_path)
-                    .is_some_and(|imports| imports.contains_key(qualifier.as_str()))
+                    .is_some_and(|imports| imports.contains_key(qualifier))
                 {
                     return UnresolvedClass::Unresolved;
                 }

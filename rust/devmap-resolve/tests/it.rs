@@ -18,6 +18,8 @@
 #[cfg(feature = "parse")]
 mod a_field_types_its_receiver;
 #[cfg(feature = "parse")]
+mod qualifier_scope_attack;
+#[cfg(feature = "parse")]
 mod a_prelude_type_receiver_is_not_a_value;
 #[cfg(feature = "parse")]
 mod a_receiver_call_never_binds_by_bare_name;
@@ -53,6 +55,10 @@ mod global_rung_requires_no_other_evidence;
 mod go_own_package_receiver;
 #[cfg(feature = "parse")]
 mod go_package_scope;
+#[cfg(feature = "parse")]
+mod go_qualifier_scope;
+#[cfg(feature = "parse")]
+mod qualifier_scope_other_families;
 #[cfg(feature = "parse")]
 mod go_unexported_selector;
 #[cfg(feature = "parse")]

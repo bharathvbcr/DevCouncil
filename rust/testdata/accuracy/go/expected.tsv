@@ -59,3 +59,4 @@ Q4	app/svc/probes2.go::cache.delete	-	NO self-edge (builtin delete)
 Q5	app/svc/probes2.go::writer.clear	-	NO edge to app/svc/probes2.go::Buffer.Reset (bytes.Buffer is external)
 Q2b	-	app/svc/probes2.go::shadowedLocalTypeUser.entry	NOT dead (local type later shadowed by a range var)
 Q2c	-	app/svc/probes2.go::twinLocalTypeUser.entry	NOT dead; no cross-function edge between the two local entry types
+Q6	app/svc/probes3.go::bareRawUser	app/svc/probes3.go::RawMessage	edge; qualified param in budgetOf must not bind to RawMessage

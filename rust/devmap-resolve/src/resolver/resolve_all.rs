@@ -1716,6 +1716,7 @@ impl Resolver {
                     ) {
                         UsePosition::Type {
                             types: reference.assigned_to.as_deref(),
+                            scope: reference.enclosing_symbol.as_deref(),
                         }
                     } else {
                         UsePosition::value_at(
