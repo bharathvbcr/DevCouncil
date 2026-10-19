@@ -105,3 +105,6 @@ truly_dead	micro/superkw/children_b.py::SkChild	class probe nothing references
 truly_dead	micro/superkw/children.py::SkExternalFirst	class probe nothing references
 truly_dead	micro/superkw/children.py::SkMeta	class probe nothing references
 truly_dead	micro/superkw/children.py::SkMetaBase.hop	nothing calls it: SkMeta.hop's super().hop() is SkLeft.hop, the metaclass keyword is not a base; reported at 0.4 unconfirmed
+truly_dead	relroot_main.py::rz_root_run	caller probe nothing calls
+truly_dead	relroot_beyond.py::rz_beyond_run	caller probe nothing calls
+truly_dead	rzpkg/a.py::rz_missing_run	caller probe nothing calls
