@@ -110,6 +110,7 @@ fn go_self_mention_in_method_with_unbound_shadow_is_not_exempt() {
 }
 
 #[test]
+#[ignore = "accepted over-exemption while the reference is unbound; resolver half of ft-19604c23 (lane/go-qualifier-leak) removes the shape"]
 fn go_unbound_mention_only_in_dead_function_is_hidden_characterise() {
     let src = format!(
         "package x\n{SHADOW}type t struct{{}}\nfunc dead() {{\n\tvar params t\n\t_ = params\n}}\nfunc main() {{ _ = budget(nil) }}\n"

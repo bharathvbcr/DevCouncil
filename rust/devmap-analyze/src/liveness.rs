@@ -632,19 +632,28 @@ impl ExtractionCoverage {
     /// counters only, or a discovery refusal that reaches every language) every
     /// language is capped.
     fn confident_tier_clause(&self) -> String {
-        let mut capped: Vec<&str> = Vec::new();
-        let mut eligible: Vec<&str> = Vec::new();
-        let languages: BTreeSet<&str> = self
+        // Every language in the corpus, plus the members of every family, so a
+        // language capped only through a sibling's blindness is named too.
+        let present: BTreeSet<&str> = self
             .covered_by_language
             .keys()
             .chain(self.blind_by_language.keys())
             .map(String::as_str)
             .collect();
-        for language in languages {
-            if self.is_complete_for(language) {
-                eligible.push(language);
-            } else {
+        let candidates: BTreeSet<&str> = present
+            .iter()
+            .copied()
+            .chain(LANGUAGE_FAMILIES.iter().flat_map(|(_, m)| m.iter().copied()))
+            .collect();
+        let mut capped: Vec<&str> = Vec::new();
+        let mut eligible: Vec<&str> = Vec::new();
+        for language in candidates {
+            // Capped exactly when `cap_for` cannot return the full confidence:
+            // its ceilings never exceed `HIGHEST_DEGRADED_CONFIDENCE`.
+            if self.cap_for(language, 1.0) <= HIGHEST_DEGRADED_CONFIDENCE {
                 capped.push(language);
+            } else if present.contains(language) && confident_tier_eligible(language) {
+                eligible.push(language);
             }
         }
         if eligible.is_empty() {
@@ -653,8 +662,8 @@ impl ExtractionCoverage {
         format!(
             "findings are capped below the confident tier only for {}; {} remain eligible \
              for it",
-            capped.join(", "),
-            eligible.join(", ")
+            bounded_names(&capped),
+            bounded_names(&eligible)
         )
     }
 
@@ -1008,23 +1017,47 @@ pub fn language_can_reference(from: &str, to: &str) -> bool {
 }
 
 fn language_family(language: &str) -> Option<&'static str> {
-    Some(match language {
-        "javascript" | "typescript" | "tsx" | "arkts" | "svelte" | "vue" | "astro" | "liquid" => {
-            "js"
-        }
-        "c" | "cpp" | "objc" | "cuda" | "metal" => "c",
-        "java" | "kotlin" | "scala" => "jvm",
-        "csharp" | "vbnet" => "clr",
-        "python" => "python",
-        "go" => "go",
-        "rust" => "rust",
-        "swift" => "swift",
-        "ruby" => "ruby",
-        "php" => "php",
-        "dart" => "dart",
-        _ => return None,
-    })
+    LANGUAGE_FAMILIES
+        .iter()
+        .find(|(_, members)| members.contains(&language))
+        .map(|(family, _)| *family)
 }
+
+/// Most language names the degraded sentence lists before saying "and K more".
+const SENTENCE_NAME_LIMIT: usize = 8;
+
+/// `names` joined for a sentence, bounded by count so a corpus of dozens of
+/// languages cannot make `degraded_reason` unbounded.
+fn bounded_names(names: &[&str]) -> String {
+    if names.len() <= SENTENCE_NAME_LIMIT {
+        return names.join(", ");
+    }
+    format!(
+        "{} and {} more",
+        names[..SENTENCE_NAME_LIMIT].join(", "),
+        names.len() - SENTENCE_NAME_LIMIT
+    )
+}
+
+/// Languages whose files can call one another, by family. The one table
+/// [`language_family`] reads, and what the degraded sentence walks to find
+/// languages capped through a sibling's blindness (Kotlin blind caps Java).
+const LANGUAGE_FAMILIES: &[(&str, &[&str])] = &[
+    (
+        "js",
+        &["javascript", "typescript", "tsx", "arkts", "svelte", "vue", "astro", "liquid"],
+    ),
+    ("c", &["c", "cpp", "objc", "cuda", "metal"]),
+    ("jvm", &["java", "kotlin", "scala"]),
+    ("clr", &["csharp", "vbnet"]),
+    ("python", &["python"]),
+    ("go", &["go"]),
+    ("rust", &["rust"]),
+    ("swift", &["swift"]),
+    ("ruby", &["ruby"]),
+    ("php", &["php"]),
+    ("dart", &["dart"]),
+];
 
 /// How many members the cluster ceiling compounds over before it stops caring.
 ///
