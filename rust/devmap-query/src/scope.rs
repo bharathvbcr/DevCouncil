@@ -363,7 +363,7 @@ fn admits(paths: &[String], languages: &[String], path: &str, language: &str) ->
 
 /// `path` is `prefix` or lies beneath it — a segment-boundary match, so
 /// `frontend` does not admit `frontend2/x.ts`.
-fn under_prefix(path: &str, prefix: &str) -> bool {
+pub(crate) fn under_prefix(path: &str, prefix: &str) -> bool {
     path == prefix
         || (path.len() > prefix.len()
             && path.starts_with(prefix)
@@ -396,7 +396,7 @@ fn normalise_prefix(raw: &str) -> anyhow::Result<String> {
 }
 
 /// An absolute prefix made relative to the indexed root; a relative one as is.
-fn relative_to_root(prefix: &str, repo_root: Option<&str>) -> anyhow::Result<String> {
+pub(crate) fn relative_to_root(prefix: &str, repo_root: Option<&str>) -> anyhow::Result<String> {
     if !prefix.starts_with('/') {
         return Ok(prefix.to_string());
     }

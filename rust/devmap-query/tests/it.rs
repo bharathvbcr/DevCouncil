@@ -20,6 +20,8 @@ mod a_bare_ruby_send_has_a_caller;
 #[cfg(feature = "parse")]
 mod a_call_blind_target_is_unavailable_not_empty;
 #[cfg(feature = "parse")]
+mod a_charged_hole_is_named_by_search;
+#[cfg(feature = "parse")]
 mod a_dotted_query_can_name_a_symbol;
 #[cfg(feature = "parse")]
 mod a_kernel_is_reached_from_its_host_by_name;
@@ -126,6 +128,10 @@ mod rung_filter_under_stress;
 mod search_counts_under_concurrent_writes;
 #[cfg(feature = "parse")]
 mod search_hostile_queries;
+#[cfg(feature = "parse")]
+mod search_partial_attack;
+#[cfg(feature = "parse")]
+mod search_partial_close_attack;
 #[cfg(feature = "parse")]
 mod search_ranks_before_paging;
 #[cfg(feature = "parse")]
