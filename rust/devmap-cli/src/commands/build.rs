@@ -1309,13 +1309,33 @@ fn affected_closure(
 /// W0.2's bug class — CFML and Terraform contributing no call edges while
 /// reporting complete coverage — without anyone going looking for it.
 fn print_resolution_rate(rate: &devmap_analyze::ResolutionRate) {
+    for line in resolution_rate_lines(rate) {
+        outln!("{line}");
+    }
+}
+
+/// The lines [`print_resolution_rate`] prints, separated so a test can read them.
+fn resolution_rate_lines(rate: &devmap_analyze::ResolutionRate) -> Vec<String> {
+    let mut lines = Vec::new();
     let Some(net) = rate.net_permille else {
-        // No site was attempted. Saying "0.0%" here would report a failure that
-        // never happened; the `Option` exists precisely to keep the two apart.
-        outln!("  Resolution rate: not measured (no attribution sites)");
-        return;
+        // No measured site was attempted. Saying "0.0%" here would report a
+        // failure that never happened; the `Option` exists precisely to keep
+        // the two apart. Sites may still exist (call-blind or vendored), and
+        // "no attribution sites" would then be false.
+        lines.push(if rate.resolved_sites + rate.unresolved_sites == 0 {
+            "  Resolution rate: not measured (no attribution sites)".to_string()
+        } else {
+            format!(
+                "  Resolution rate: not measured ({} resolved / {} unresolved site(s), \
+                 none in a language with a call extractor outside vendored code)",
+                rate.resolved_sites, rate.unresolved_sites
+            )
+        });
+        push_excluded_sites(&mut lines, rate);
+        push_language_rows(&mut lines, rate);
+        return lines;
     };
-    outln!(
+    lines.push(format!(
         "  Resolution rate: {}.{}% net, {}.{}% gross ({} resolved / {} unresolved, {} explained)",
         net / 10,
         net % 10,
@@ -1324,27 +1344,38 @@ fn print_resolution_rate(rate: &devmap_analyze::ResolutionRate) {
         rate.resolved_sites,
         rate.unresolved_sites,
         rate.explained_sites,
-    );
+    ));
+    push_excluded_sites(&mut lines, rate);
+    push_language_rows(&mut lines, rate);
+    lines
+}
 
+/// The worst-first per-language rows under the headline.
+fn push_language_rows(lines: &mut Vec<String>, rate: &devmap_analyze::ResolutionRate) {
     let mut rows: Vec<(&String, &devmap_analyze::LanguageResolution)> =
         rate.by_language.iter().collect();
     // Worst first; a language that attempted nothing sorts last rather than
     // first, because `None` is "not measured" and not "measured at zero".
     rows.sort_by_key(|(language, row)| (row.net_permille.unwrap_or(u32::MAX), (*language).clone()));
     for (language, row) in rows.iter().take(RESOLUTION_RATE_LANGUAGES_SHOWN) {
-        match row.net_permille {
-            Some(net) => outln!(
+        // Whether this row's own line already said "no call extractor", which
+        // is the only thing that licenses leaving "calls" out of the list below.
+        let said_no_call_extractor = row.net_permille.is_none() && !row.extracts_calls;
+        lines.push(match row.net_permille {
+            Some(net) => format!(
                 "    {language:<12} {}.{}%  ({} resolved / {} unresolved)",
                 net / 10,
                 net % 10,
                 row.resolved_sites,
                 row.unresolved_sites
             ),
-            None if !row.extracts_calls => {
-                outln!("    {language:<12} no call extractor in this build (0 attribution sites)")
-            }
-            None => outln!("    {language:<12} not measured (no attribution sites)"),
-        }
+            None if !row.extracts_calls => format!(
+                "    {language:<12} no call extractor in this build: not measured \
+                 ({} non-call site(s) resolved, {} unresolved)",
+                row.resolved_sites, row.unresolved_sites
+            ),
+            None => format!("    {language:<12} not measured (no attribution sites)"),
+        });
         // Printed beside a *measured* row too, and that is the point: a language
         // can attribute calls perfectly and still have no heritage extractor, so
         // "no Extends edges in this corpus" reads as a fact about the code when
@@ -1354,22 +1385,39 @@ fn print_resolution_rate(rate: &devmap_analyze::ResolutionRate) {
             .blind_to
             .iter()
             .map(String::as_str)
-            .filter(|name| *name != "calls")
+            .filter(|name| !(said_no_call_extractor && *name == "calls"))
             .collect();
         if !blind.is_empty() {
-            outln!(
+            lines.push(format!(
                 "    {:<12} …and this build extracts no {} for it, so an empty \
                  answer there is a hole and not a finding",
                 "",
                 blind.join("/")
-            );
+            ));
         }
     }
     if rows.len() > RESOLUTION_RATE_LANGUAGES_SHOWN {
-        outln!(
+        lines.push(format!(
             "    … {} more language(s); the full breakdown is in `--json`",
             rows.len() - RESOLUTION_RATE_LANGUAGES_SHOWN
-        );
+        ));
+    }
+}
+
+/// Name what the headline figure leaves out, so a reader can tell a rate over
+/// this repository's measured code from one over everything the walk saw.
+fn push_excluded_sites(lines: &mut Vec<String>, rate: &devmap_analyze::ResolutionRate) {
+    if rate.vendored_files > 0 || rate.vendored_sites > 0 {
+        lines.push(format!(
+            "    excluded as vendored: {} file(s), {} site(s); not this repository's code",
+            rate.vendored_files, rate.vendored_sites
+        ));
+    }
+    if rate.call_blind_sites > 0 {
+        lines.push(format!(
+            "    excluded as call-blind: {} site(s) in languages with no call extractor",
+            rate.call_blind_sites
+        ));
     }
 }
 
@@ -1384,6 +1432,70 @@ const RESOLUTION_RATE_LANGUAGES_SHOWN: usize = 8;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use devmap_analyze::{LanguageResolution, ResolutionRate};
+
+    fn rate_with(rows: Vec<(&str, LanguageResolution)>) -> ResolutionRate {
+        ResolutionRate {
+            by_language: rows.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            ..ResolutionRate::default()
+        }
+    }
+
+    /// A call-blind row prints no percent, never claims "0 attribution sites"
+    /// while sites resolved, and keeps "calls" out of the "extracts no" list
+    /// only because its own line already said so.
+    #[test]
+    fn a_call_blind_row_is_not_scored_and_does_not_claim_zero_sites() {
+        let mut rate = rate_with(vec![(
+            "html",
+            LanguageResolution {
+                extracts_calls: false,
+                blind_to: vec!["calls".into(), "imports".into(), "heritage".into()],
+                resolved_sites: 126,
+                ..LanguageResolution::default()
+            },
+        )]);
+        rate.resolved_sites = 126;
+        rate.net_permille = Some(500);
+        let text = resolution_rate_lines(&rate).join("\n");
+        assert!(!text.contains("100.0%"), "{text}");
+        assert!(!text.contains("0 attribution sites"), "{text}");
+        assert!(
+            text.contains("no call extractor in this build: not measured (126 non-call"),
+            "{text}"
+        );
+        assert!(text.contains("extracts no imports/heritage"), "{text}");
+    }
+
+    /// A row that did not say "no call extractor" keeps "calls" in the list.
+    #[test]
+    fn calls_stay_in_the_blind_list_unless_the_line_said_it() {
+        let rate = rate_with(vec![(
+            "odd",
+            LanguageResolution {
+                extracts_calls: true,
+                net_permille: None,
+                blind_to: vec!["calls".into()],
+                ..LanguageResolution::default()
+            },
+        )]);
+        let text = resolution_rate_lines(&rate).join("\n");
+        assert!(text.contains("extracts no calls"), "{text}");
+    }
+
+    /// The headline names what it leaves out, and a headline with sites but no
+    /// measured language does not say there were none.
+    #[test]
+    fn excluded_vendored_and_call_blind_sites_are_named() {
+        let mut rate = rate_with(vec![]);
+        rate.resolved_sites = 3;
+        rate.unresolved_sites = 2;
+        rate.vendored_files = 13;
+        rate.vendored_sites = 5;
+        let text = resolution_rate_lines(&rate).join("\n");
+        assert!(!text.contains("no attribution sites"), "{text}");
+        assert!(text.contains("13 file(s), 5 site(s)"), "{text}");
+    }
 
     /// CSV path lists drop blanks and keep every real entry.
     ///
