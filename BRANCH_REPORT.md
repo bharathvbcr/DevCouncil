@@ -1,3 +1,20 @@
+# Branch consolidation, 2026-10-19 pass 9
+
+Nothing was merged, committed or deleted by this pass apart from this report. Main is `690ca2dd`: another session landed `testsupport: end cargoBin's waits before the test's own deadline` and removed its own `fix/testsupport-test-deadline` worktree and branch.
+
+- **Not merged: py-relative-imports (ft-bd1bfac9).** I staged the attack branch, which contains the lane (`attack/py-relative-imports` 720f1937, `lane/py-relative-imports` d224cd37), as a `--no-ff` merge on a scratch worktree. The text merge was clean (13 files), and the accuracy fixtures and corpus record passed (12/12, 89/89). But **4 of the attack round's probes fail**:
+  - `dot_only_never_binds_a_module_file_beside_the_package_dir`
+  - `double_dot_never_binds_parent_dir_as_py_file`
+  - `dot_only_with_init_present_never_adds_the_beside_file`
+  - `ns_pkg_x_is_namespace_dir_from_import_submodule`
+
+  Main has not changed `devmap-resolve` or `devmap-extract` since the lane's base, so the failures are the lane's own. `cargo fmt --check` also flags the lane's `import_resolution_tests.rs:305`. Under the owner's rule the attack round has not closed, so I discarded the staging merge. The lane belongs to pid 136's wave.
+- **Not touched: resolution-rate.** Its worktrees are locked by pid 136 and a process is running in one.
+- **Kept, as before:** pid 136's 7 older locked worktrees, integration/wave7, and claude/literals-substring-b3546e (pid 16139).
+- **Unchanged:** main stays unpushed until the schema-10 consumer sweep (pass 8).
+
+---
+
 # Branch consolidation, 2026-10-19 pass 8: the workbench landing
 
 This pass ran locally and pushed nothing. Main went from `e93dab27` to `fcd619eb`. **Main must not be pushed until the cross-app sweep below is done.**
