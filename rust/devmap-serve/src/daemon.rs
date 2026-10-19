@@ -3433,8 +3433,7 @@ mod tests {
         let slow = "def slow():\n    return 2\n";
         fs::write(root.join("a.py"), "def a():\n    return 1\n").unwrap();
         fs::write(root.join("slow.py"), slow).unwrap();
-        let refused =
-            devmap_extract::extract_file_with_budget("slow.py", slow, Duration::ZERO);
+        let refused = devmap_extract::extract_file_with_budget("slow.py", slow, Duration::ZERO);
         assert!(refused.is_budget_refusal(), "the fixture must be a refusal");
         let initial = vec![
             devmap_extract::extract_file("a.py", "def a():\n    return 1\n"),
@@ -3453,7 +3452,10 @@ mod tests {
 
     /// What a differential write must leave true of a refused file it did not
     /// touch, and what the next build then does with it.
-    fn assert_a_refusal_survives_and_the_next_build_recovers_it(daemon: &Daemon, root: &std::path::Path) {
+    fn assert_a_refusal_survives_and_the_next_build_recovers_it(
+        daemon: &Daemon,
+        root: &std::path::Path,
+    ) {
         // Still reported, by the same listing `devmap status` renders as
         // `budget_refused`, and still stored as the refusal rather than as a
         // clean row beside the nodes of a file nothing parsed.
@@ -3463,7 +3465,10 @@ mod tests {
             Some(1),
             "the drain dropped the refusal: {listing:?}"
         );
-        assert_eq!(daemon.store.latest_budget_refused_paths().unwrap(), ["slow.py"]);
+        assert_eq!(
+            daemon.store.latest_budget_refused_paths().unwrap(),
+            ["slow.py"]
+        );
         let stored = daemon.store.latest_file("slow.py").unwrap().unwrap();
         assert!(
             matches!(&stored.parse_outcome, devmap_extract::ParseOutcome::Failed { reason }
@@ -3500,7 +3505,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            daemon.store.latest_budget_refusals().unwrap().map(|s| s.total),
+            daemon
+                .store
+                .latest_budget_refusals()
+                .unwrap()
+                .map(|s| s.total),
             Some(0),
             "the build that re-extracted the refused file must clear it"
         );
