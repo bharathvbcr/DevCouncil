@@ -59,13 +59,24 @@ fn p2_top_level_fields_reproduce_the_headline() {
     let ex = vec![extract_file("lib.py", PY), extract_file("vendor/d.py", &vendored)];
     let rate = rate_of(&ex);
     eprintln!("{rate:#?}");
-    let derived = rate.resolved_sites * 1000
-        / (rate.resolved_sites + rate.unresolved_sites - rate.explained_sites);
+    // Repointed to measured_* by Opus ruling 2026-10-19: the raw totals are a public contract kept for attribution coverage; the headline's denominators are the additive measured_* fields.
+    let derived = rate.measured_resolved_sites * 1000
+        / (rate.measured_resolved_sites + rate.measured_unresolved_sites
+            - rate.measured_explained_sites);
     assert_eq!(
         rate.net_permille,
         Some(derived as u32),
-        "headline {:?} is not derivable from top-level totals (derived {derived}): {rate:?}",
+        "headline {:?} is not derivable from the measured_* fields (derived {derived}): {rate:?}",
         rate.net_permille
+    );
+    // Pinned invariant: the raw totals still count every attribution site.
+    assert_eq!(
+        rate.resolved_sites + rate.unresolved_sites,
+        rate.measured_resolved_sites
+            + rate.measured_unresolved_sites
+            + rate.vendored_sites
+            + rate.call_blind_sites,
+        "raw totals must stay the attribution totals: {rate:?}"
     );
 }
 
