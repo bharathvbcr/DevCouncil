@@ -18,6 +18,8 @@
 #[cfg(feature = "parse")]
 mod a_field_types_its_receiver;
 #[cfg(feature = "parse")]
+mod qualifier_scope_attack;
+#[cfg(feature = "parse")]
 mod a_prelude_type_receiver_is_not_a_value;
 #[cfg(feature = "parse")]
 mod a_receiver_call_never_binds_by_bare_name;
