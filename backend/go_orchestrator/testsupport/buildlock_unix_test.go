@@ -3,6 +3,7 @@
 package testsupport
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -24,7 +25,7 @@ import (
 func TestLockBuildOutputsExcludesASecondHolder(t *testing.T) {
 	path := filepath.Join(t.TempDir(), buildLockName)
 
-	release, err := lockBuildOutputs(path)
+	release, err := lockBuildOutputs(context.Background(), path)
 	if err != nil {
 		t.Fatalf("lockBuildOutputs(%s): %v", path, err)
 	}
@@ -66,7 +67,7 @@ func TestLockBuildOutputsExcludesASecondHolder(t *testing.T) {
 func TestLockBuildOutputsReportsAPathItCannotOpen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "no-such-directory", buildLockName)
 
-	release, err := lockBuildOutputs(path)
+	release, err := lockBuildOutputs(context.Background(), path)
 	if err == nil {
 		release()
 		t.Fatalf("lockBuildOutputs reported success for %s, which it cannot open", path)

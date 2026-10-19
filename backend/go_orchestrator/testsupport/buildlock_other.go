@@ -8,7 +8,10 @@
 // current platform's.
 package testsupport
 
-// lockBuildOutputs is a no-op where flock is not available.
+import "context"
+
+// lockBuildOutputs is a no-op where flock is not available, so it has nothing
+// to wait for and never ends early on ctx.
 //
 // Without it, two test processes can copy the cargo artifact while a third is
 // replacing it. That is not silently tolerated: readStableArtifact re-checks
@@ -16,4 +19,4 @@ package testsupport
 // disagree, so a torn read is caught and repeated rather than executed. The
 // lock is what makes the copy contention-free; the size check is what makes it
 // correct without one.
-func lockBuildOutputs(string) (func(), error) { return func() {}, nil }
+func lockBuildOutputs(context.Context, string) (func(), error) { return func() {}, nil }

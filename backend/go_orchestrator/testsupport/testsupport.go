@@ -43,6 +43,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -151,18 +152,33 @@ func RustWorkspace(t testing.TB) string {
 	return workspace
 }
 
+// build is one binary's build, shared by every caller in this process. The
+// first caller starts it; every caller, the first included, waits for done
+// under its own deadline. path, err and log are written before done closes and
+// read only after it has.
 type build struct {
-	once sync.Once
-	path string
-	err  error
-	log  []byte
+	start sync.Once
+	done  chan struct{}
+	path  string
+	err   error
+	log   []byte
 }
 
 var builds = map[string]*build{}
 var buildsMu sync.Mutex
 
+// errOverran marks a build that ran out of time: the lock wait, the cargo
+// build, or another caller's build this one was waiting on. It fails the test
+// even when AllowSkipEnv is set, because running out of time says nothing
+// about whether the toolchain is present. Letting it skip would turn a slow
+// machine into an uncovered seam that reports like a deliberate one.
+var errOverran = errors.New("the test build ran out of time")
+
 // DCStore builds the Rust store binary and returns its path.
-func DCStore(t testing.TB) string { return cargoBin(t, "dc-store", "dcstore") }
+func DCStore(t testing.TB) string {
+	t.Helper()
+	return cargoBin(t, "dc-store", "dcstore")
+}
 
 // TaskSeed describes one task to plant in a store: a workbench item of the
 // store's repository. Zero values are a ready task titled after its ID with an
@@ -289,10 +305,16 @@ func MergeTaskScope(t testing.TB, db, id string, patch map[string]any) {
 }
 
 // DCVerify builds the Rust verifier binary and returns its path.
-func DCVerify(t testing.TB) string { return cargoBin(t, "dc-verify", "dcverify") }
+func DCVerify(t testing.TB) string {
+	t.Helper()
+	return cargoBin(t, "dc-verify", "dcverify")
+}
 
 // DCGrep builds the Rust searcher binary and returns its path.
-func DCGrep(t testing.TB) string { return cargoBin(t, "dc-grep", "dcgrep") }
+func DCGrep(t testing.TB) string {
+	t.Helper()
+	return cargoBin(t, "dc-grep", "dcgrep")
+}
 
 // Devmap returns the devmap binary: DEVMAP_BIN when set — used or refused,
 // never replaced, the rule the host binary applies — else a build of this
@@ -337,6 +359,13 @@ func Devmap(t testing.TB) string {
 // everything else. They are not pruned during a run: a copy another test
 // process is about to exec is indistinguishable from a leftover, and deleting
 // the wrong one would reintroduce exactly the failure this exists to prevent.
+//
+// Every wait in here ends before the calling test's deadline: the lock, the
+// build, and another caller's build in this process. `go test` arms an alarm
+// at its -timeout (ten minutes by default) that panics with every goroutine's
+// stack, and a wait that outlasts it is reported as that dump, which looks
+// like a hang and names nothing. Ending first, with a message naming what was
+// waited for, is the difference. See buildBound for how the time is chosen.
 func cargoBin(t testing.TB, crate, binary string) string {
 	t.Helper()
 	// Resolved before the sync.Once, not inside it: a caller that arrives
@@ -347,64 +376,173 @@ func cargoBin(t testing.TB, crate, binary string) string {
 	buildsMu.Lock()
 	b, ok := builds[binary]
 	if !ok {
-		b = &build{}
+		b = &build{done: make(chan struct{})}
 		builds[binary] = b
 	}
 	buildsMu.Unlock()
 
-	b.once.Do(func() {
-		target := filepath.Join(crates, "target")
-		if b.err = os.MkdirAll(target, 0o755); b.err != nil {
-			return
-		}
+	// A build that has already finished costs no time, so its outcome is
+	// reported before the deadline is consulted: a late test must not fail
+	// for want of time to wait on something it need not wait for.
+	select {
+	case <-b.done:
+		return b.outcome(t, binary)
+	default:
+	}
 
-		// Held across the build *and* the copy. Cargo's workspace lock covers
-		// only the compile and is released while target/debug is still being
-		// rewritten, which is the window that produces the ENOENT.
-		unlock, err := lockBuildOutputs(filepath.Join(target, buildLockName))
-		if err != nil {
-			b.err = fmt.Errorf("locking cargo build outputs: %w", err)
-			return
-		}
-		defer unlock()
+	bound, boundBy := buildBound(t)
+	if bound <= 0 {
+		t.Fatalf("cannot build %s: no time is left for it under %s", binary, boundBy)
+	}
+	stop := time.Now().Add(bound)
 
-		ctx, cancel := context.WithTimeout(context.Background(), cargoBuildBound)
-		defer cancel()
-		cmd := exec.CommandContext(ctx, "cargo", "build", "-p", crate, "--bin", binary)
-		proc.ConfigureGroup(cmd)
-		cmd.Dir = crates
-		log := &proc.CappedBuffer{Limit: cargoLogLimit}
-		cmd.Stdout, cmd.Stderr = log, log
-		cmd.WaitDelay = 5 * time.Second
-		runErr, timedOut := proc.RunBounded(ctx, cmd.Run)
-		if timedOut {
-			b.err = fmt.Errorf("cargo build did not return within %s", cargoBuildBound)
-			return
-		}
-		b.log, b.err = log.Bytes(), runErr
-		if b.err != nil {
-			return
-		}
-
-		built := filepath.Join(target, "debug", binary)
-		data, err := readStableArtifact(built)
-		if err != nil {
-			b.err = err
-			return
-		}
-		b.path, b.err = publishArtifact(target, binary, data)
+	// The build runs on its own goroutine rather than inside the Do, because
+	// a second caller blocks in Do until the first caller's function returns
+	// and so would wait under the first caller's bound instead of its own.
+	b.start.Do(func() {
+		go func() {
+			defer close(b.done)
+			b.path, b.log, b.err = buildAndPublish(stop, boundBy, crates, crate, binary)
+		}()
 	})
+
+	// The grace covers the copy after a build that finished just in time; the
+	// build itself is cut off at stop.
+	wait := time.NewTimer(time.Until(stop) + publishGrace)
+	defer wait.Stop()
+	select {
+	case <-b.done:
+	case <-wait.C:
+		t.Fatalf("cannot build %s: %v: another test in this process started the build, and it had not "+
+			"finished within %s, the bound set by %s", binary, errOverran, bound.Round(time.Second), boundBy)
+	}
+	return b.outcome(t, binary)
+}
+
+// outcome hands a caller the finished build, or fails it with the reason.
+// Only called once done has closed.
+func (b *build) outcome(t testing.TB, binary string) string {
+	t.Helper()
 	if b.err != nil {
+		if errors.Is(b.err, errOverran) {
+			t.Fatalf("cannot build %s: %v\n%s", binary, b.err, b.log)
+		}
 		Unavailable(t, "cannot build %s: %v\n%s", binary, b.err, b.log)
 	}
 	return b.path
 }
 
-// cargoBuildBound is how long one `cargo build` of a test binary may take,
+// buildAndPublish builds one binary under the lock and copies it out, giving
+// up at stop. boundBy says what set stop, for the error.
+func buildAndPublish(stop time.Time, boundBy, crates, crate, binary string) (string, []byte, error) {
+	ctx, cancel := context.WithDeadline(context.Background(), stop)
+	defer cancel()
+	target := filepath.Join(crates, "target")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		return "", nil, err
+	}
+
+	// Held across the build *and* the copy. Cargo's workspace lock covers
+	// only the compile and is released while target/debug is still being
+	// rewritten, which is the window that produces the ENOENT.
+	unlock, err := lockBuildOutputs(ctx, filepath.Join(target, buildLockName))
+	if err != nil {
+		return "", nil, fmt.Errorf("locking cargo build outputs: %w (the wait was bounded by %s)", err, boundBy)
+	}
+	defer unlock()
+
+	started := time.Now()
+	cmd := exec.CommandContext(ctx, "cargo", "build", "-p", crate, "--bin", binary)
+	proc.ConfigureGroup(cmd)
+	cmd.Dir = crates
+	log := &proc.CappedBuffer{Limit: cargoLogLimit}
+	cmd.Stdout, cmd.Stderr = log, log
+	cmd.WaitDelay = 5 * time.Second
+	ran := make(chan struct{})
+	runErr, timedOut := proc.RunBounded(ctx, func() error {
+		defer close(ran)
+		return cmd.Run()
+	})
+	if timedOut {
+		err := fmt.Errorf("%w: `cargo build -p %s --bin %s` in %s was stopped after %s, the bound set by %s.%s",
+			errOverran, crate, binary, crates, time.Since(started).Round(time.Second), boundBy, cargoWaitHint(crate, binary))
+		// The deadline has already had cargo's group killed, and WaitDelay
+		// bounds the reap, so Run normally returns moments later. Once it has,
+		// nothing writes log any more and it can be shown: it is the evidence
+		// of where the time went — the slot gate prints that it is waiting.
+		// If Run is stuck in Start, the goroutine is abandoned and log, which
+		// it may still write, is not read.
+		select {
+		case <-ran:
+			return "", log.Bytes(), err
+		case <-time.After(cmd.WaitDelay + time.Second):
+			return "", nil, err
+		}
+	}
+	if runErr != nil {
+		return "", log.Bytes(), runErr
+	}
+
+	data, err := readStableArtifact(filepath.Join(target, "debug", binary))
+	if err != nil {
+		return "", log.Bytes(), err
+	}
+	path, err := publishArtifact(target, binary, data)
+	return path, log.Bytes(), err
+}
+
+// cargoWaitHint says where the time of a build that overran may have gone.
+//
+// The build's output, shown with the error when cargo could be reaped, is the
+// evidence; this names the one known cause of a build that sits idle — the
+// cargo-slot-gate wrapper Claude Code shells put on PATH, which queues every
+// gated build behind the slots other sessions hold — when the environment says
+// it is in play, and the remedies either way.
+func cargoWaitHint(crate, binary string) string {
+	hint := ""
+	if os.Getenv("CLAUDECODE") == "1" && os.Getenv("CARGO_SLOT_HELD") == "" {
+		cargo, err := exec.LookPath("cargo")
+		if err != nil {
+			cargo = "cargo"
+		}
+		hint = fmt.Sprintf(" This is a Claude Code shell, where %s may be the cargo-slot-gate wrapper: "+
+			"it queues each build until one of its slots (CARGO_SLOT_DIR, default ~/.cache/cargo-slots) is free, "+
+			"and the time spent queued behind other sessions' builds counts against this bound.", cargo)
+	}
+	return hint + fmt.Sprintf(" Re-run with a larger go test -timeout, or build it first with "+
+		"`cargo build -p %s --bin %s` so this build has nothing to compile.", crate, binary)
+}
+
+// buildBound is how long cargoBin may spend on one binary, and what set it.
+//
+// It is the test's own deadline less testDeadlineMargin when the test has one
+// that comes sooner than cargoBuildBound, and cargoBuildBound otherwise. The
+// margin leaves time for the failure to be reported, and for cleanups to run,
+// before go test's alarm fires. testing.TB has no Deadline; *testing.T does,
+// and a *testing.F or *testing.B, or a run with -timeout 0, falls back to the
+// cap.
+func buildBound(t testing.TB) (time.Duration, string) {
+	if d, ok := t.(interface{ Deadline() (time.Time, bool) }); ok {
+		if deadline, set := d.Deadline(); set {
+			if left := time.Until(deadline) - testDeadlineMargin; left < cargoBuildBound {
+				return left, fmt.Sprintf("the go test -timeout deadline at %s less a %s margin",
+					deadline.Format(time.TimeOnly), testDeadlineMargin)
+			}
+		}
+	}
+	return cargoBuildBound, fmt.Sprintf("the %s cap on a test build", cargoBuildBound)
+}
+
+// cargoBuildBound caps how long one `cargo build` of a test binary may take,
 // and cargoLogLimit how much of its output is kept for the failure message.
+// testDeadlineMargin is how far before the test's deadline cargoBin gives up,
+// and publishGrace how long past its bound a caller waits for the outcome: the
+// copy of a build that finished in time, or the reap of one that did not.
 const (
-	cargoBuildBound = 20 * time.Minute
-	cargoLogLimit   = 1 << 20
+	cargoBuildBound    = 20 * time.Minute
+	cargoLogLimit      = 1 << 20
+	testDeadlineMargin = 30 * time.Second
+	publishGrace       = 10 * time.Second
 )
 
 // buildLockName is the lock file guarding the build-and-copy critical section.
