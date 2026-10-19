@@ -261,8 +261,14 @@ where
 /// so `GIT_LITERAL_PATHSPECS` stops a file called `:(glob)x`, `:!x` or `*.rs`
 /// from being read as pathspec magic; `--` alone only ends option parsing. The
 /// Go host's `proc.gitEnv` keeps its own list because its callers pass
-/// `:(top,exclude)` on purpose.
+/// `:(top,exclude)` on purpose. The glob, noglob and icase switches are global
+/// pathspec settings too, and git refuses a literal setting alongside any of
+/// them, so a user's inherited copies are removed.
 fn git_env(command: &mut Command) {
+    command
+        .env_remove("GIT_GLOB_PATHSPECS")
+        .env_remove("GIT_NOGLOB_PATHSPECS")
+        .env_remove("GIT_ICASE_PATHSPECS");
     command
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")

@@ -45,9 +45,19 @@ fn an_inherited_global_pathspec_switch_does_not_break_a_literal_read() {
         let mut command =
             git_with_program(OsStr::new("git"), &root, ["log", "--format=%s", "--", "a.txt"])
                 .unwrap();
-        // Same effect as the variable being in the kernel process's own
-        // environment: `Command` inherits it unless git_env removes it.
-        command.env(var, "1");
+        // git_env must have recorded the variable as removed, so a copy in the
+        // kernel process's own environment is not inherited. (dc-proc forbids
+        // `unsafe`, so the test cannot set the process environment itself;
+        // dc-regress's `owners_inherited_pathspec_env` does, against real git.)
+        let removed = command
+            .get_envs()
+            .any(|(key, value)| key == OsStr::new(var) && value.is_none());
+        assert!(removed, "{var} is not removed from the git environment");
+        let literal = command
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new("GIT_LITERAL_PATHSPECS"))
+            .and_then(|(_, value)| value);
+        assert_eq!(literal, Some(OsStr::new("1")));
         let captured = run_bounded(
             &mut command,
             Bounds {

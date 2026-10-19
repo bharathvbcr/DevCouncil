@@ -83,6 +83,7 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             // answers from a handed graph. Verified with
             // `cargo check -p dc-regress --no-default-features --all-targets`.
             "owners_and_test_signal",
+            "owners_inherited_pathspec_env",
             "owners_literal_pathspecs",
             "repository_git_config",
         ],
