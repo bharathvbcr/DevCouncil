@@ -53,6 +53,7 @@ mod cprobe;
 #[cfg(feature = "parse")]
 mod declarations;
 mod discovery_stays_inside_the_root;
+mod divergences_x42_names_swift;
 #[cfg(feature = "parse")]
 mod edge_inputs_under_cpu_contention;
 #[cfg(feature = "parse")]
