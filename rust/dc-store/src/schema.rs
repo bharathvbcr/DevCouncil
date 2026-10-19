@@ -437,16 +437,7 @@ fn migrate_inner(
 
     conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(|e| format!("migration could not take the write lock: {e}"))?;
-    let outcome = (|| {
-        // Re-read under the lock: another process may have migrated, or a
-        // newer binary may have stamped a higher version, since the look above.
-        if let Some(v) = read_version(conn)? {
-            check_version(v, known)?;
-        }
-        add_missing_columns(conn, budget)?;
-        spend(budget)?;
-        ensure_schema_version(conn, known)
-    })();
+    let outcome = bring_current(conn, known, budget);
     match outcome {
         Ok(()) => conn
             .execute_batch("COMMIT")
@@ -456,6 +447,23 @@ fn migrate_inner(
             Err(e)
         }
     }
+}
+
+/// Adds the missing columns and stamps `known`, inside a write transaction the
+/// caller already holds, so the stamp commits with whatever else that
+/// transaction carries — the columns here, and the legacy tasks retirement when
+/// it runs — or not at all.
+pub(crate) fn bring_current(
+    conn: &Connection,
+    known: u32,
+    budget: &mut Option<usize>,
+) -> std::result::Result<(), String> {
+    // Re-read under the lock: another process may have migrated, or a newer
+    // binary may have stamped a higher version, since the caller last looked.
+    check_stored_version(conn, known)?;
+    add_missing_columns(conn, budget)?;
+    spend(budget)?;
+    ensure_schema_version(conn, known)
 }
 
 /// Refuses a stored `schema_version` newer than `known`, touching nothing.

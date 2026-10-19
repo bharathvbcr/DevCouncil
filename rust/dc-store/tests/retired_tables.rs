@@ -2,13 +2,17 @@
 //! store from before the retirement still opens.
 //!
 //! The retired tables are not in the DDL. An older file still has them, so
-//! open has to drop them and leave everything else — including the schema
-//! version — where it was.
+//! open has to drop them and leave everything else where it was. Dropping them
+//! needs no version of its own: the only stamp a v9 store receives on open is
+//! schema 10's, from retiring the legacy tasks table into workbench items.
 
-use dc_store::{Store, schema};
+use dc_store::{SCHEMA_VERSION, Store, schema};
 use rusqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+mod support;
+use support::LEGACY_TASKS;
 
 /// Planning state (`assumptions`, `project_state`, `critique_findings`) left
 /// with the Python `planning/` package in Phase 7. The shell, file-change and
@@ -238,7 +242,7 @@ fn a_new_store_does_not_create_retired_tables() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, i64::from(SCHEMA_VERSION));
 }
 
 #[test]
@@ -246,26 +250,29 @@ fn an_existing_v9_store_opens_without_retired_tables() {
     let dir = temp_dir("reopen");
     let path = dir.join("state.sqlite");
     {
-        let store = Store::open(&path).expect("create");
-        store
-            .connection()
-            .execute(
-                "INSERT INTO tasks (id, title, description) VALUES ('T', 'title', 'body')",
-                [],
-            )
-            .unwrap();
-    }
-    {
+        // A store as schema 9 wrote it: the current tables, the legacy tasks
+        // table holding one task, and the retired tables an older build made.
         let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(schema::SCHEMA).unwrap();
+        conn.execute_batch(LEGACY_TASKS).unwrap();
+        conn.execute_batch(
+            "INSERT INTO tasks (id, title, description) VALUES ('T', 'title', 'body');
+             INSERT OR REPLACE INTO schema_version (id, version) VALUES ('singleton', 9);",
+        )
+        .unwrap();
         conn.execute_batch(PLANTED).unwrap();
         for name in RETIRED {
             assert!(table_present(&conn, name), "did not plant {name}");
         }
     }
     let store = Store::open(&path).expect("an existing store should open");
+    assert!(
+        !table_present(store.connection(), "tasks"),
+        "the legacy tasks table survived open"
+    );
     let title: String = store
         .connection()
-        .query_row("SELECT title FROM tasks WHERE id = 'T'", [], |row| {
+        .query_row("SELECT title FROM work_items WHERE id = 'T'", [], |row| {
             row.get(0)
         })
         .unwrap();
@@ -278,7 +285,7 @@ fn an_existing_v9_store_opens_without_retired_tables() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, i64::from(SCHEMA_VERSION));
     for name in RETIRED {
         assert!(
             !table_present(store.connection(), name),

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,9 +25,9 @@ import (
 // them has created yet — so "database is locked" reached agents that had no way
 // to act on it.
 //
-// Every racer here only lists ready tasks, which is what makes the test sharp:
-// no lease is taken, so contention over one is impossible by construction and any
-// failure at all is the bug. The database is
+// Every racer here takes a *distinct* task, which is what makes the test sharp:
+// contention over a lease is impossible by construction, so a *Conflict would be
+// as wrong as a lock error and any failure at all is the bug. The database is
 // left uncreated on purpose. Do not add a warm-up call.
 func TestColdStartContentionYieldsNoLockErrors(t *testing.T) {
 	bin := binary(t)
@@ -55,11 +56,27 @@ func TestColdStartContentionYieldsNoLockErrors(t *testing.T) {
 				c := New(bin, db)
 				c.Timeout = 30 * time.Second
 				<-start
-				// `ready` is a command that does work, so it creates and migrates
-				// the database exactly as a first acquire does; it needs no task
-				// to exist, which an acquire now does (a task is a workbench
-				// item), and a store that cannot be opened is its only failure.
-				_, err := c.ReadyTasks(context.Background(), ReadyEnforce)
+				// An acquire needs its task to exist (a task is a workbench
+				// item), so each racer creates its own on the database nobody
+				// has created yet, then acquires it. The first writes and the
+				// acquires all race the cold store; every step is idempotent or
+				// names a distinct task, so any error at all is the bug.
+				ctx := context.Background()
+				id := fmt.Sprintf("TASK-COLD-%d", i)
+				if _, err := c.LocalRepository(ctx); err != nil {
+					results <- err
+					return
+				}
+				put := fmt.Sprintf(`{"request_id":"cold-%d","id":%q,"expected_revision":0,"title":"cold","status":"ready",`+
+					`"repository_ids":["this-repo"],"primary_repository_id":"this-repo","scope":{}}`, i, id)
+				if _, err := c.Workbench(ctx, "items.put", json.RawMessage(put)); err != nil {
+					results <- err
+					return
+				}
+				_, err := c.Acquire(ctx, AcquireRequest{
+					TaskID: id, Owner: fmt.Sprintf("builder-%d", i),
+					TTL: time.Minute,
+				})
 				results <- err
 			}(i)
 		}

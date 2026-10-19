@@ -7,10 +7,30 @@
 //! divergence — a different temp-directory policy, a different definition of
 //! "seeded" — would be invisible until two suites disagreed about a failure.
 
+// Each suite compiles its own copy of this module and uses a subset of it.
+#![allow(dead_code)]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const DCSTORE: &str = env!("CARGO_BIN_EXE_dcstore");
+
+/// The legacy `tasks` table exactly as schema 9 created it, for the suites that
+/// build a pre-retirement store by hand.
+pub const LEGACY_TASKS: &str = "CREATE TABLE tasks (
+    id VARCHAR NOT NULL, title VARCHAR NOT NULL, description VARCHAR NOT NULL,
+    requirement_ids_json VARCHAR NOT NULL DEFAULT '[]',
+    acceptance_criterion_ids_json VARCHAR NOT NULL DEFAULT '[]',
+    planned_files_json VARCHAR NOT NULL DEFAULT '[]',
+    expected_tests_json VARCHAR NOT NULL DEFAULT '[]',
+    allowed_commands_json VARCHAR NOT NULL DEFAULT '[]',
+    forbidden_changes_json VARCHAR NOT NULL DEFAULT '[]',
+    status VARCHAR NOT NULL DEFAULT 'planned', difficulty VARCHAR,
+    agent_appended_expected_tests_json VARCHAR NOT NULL DEFAULT '[]',
+    agent_appended_allowed_commands_json VARCHAR NOT NULL DEFAULT '[]',
+    priority VARCHAR,
+    agent_appended_planned_files_json VARCHAR NOT NULL DEFAULT '[]',
+    PRIMARY KEY (id));";
 
 /// A directory of this test's own, named for the process and the case, so
 /// concurrent tests never share a database.

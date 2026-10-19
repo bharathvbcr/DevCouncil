@@ -2,7 +2,7 @@
 
 **Canonical owner:** DevCouncil — `rust/dc-store/src/schema.rs` owns the DDL. Manvi builds the same crate through a symlink (`Manvi/crates/dc-store`); it does not own it.
 **Store location:** `.devcouncil/state.sqlite`, per repository.
-**Consumers:** DevCouncil and Manvi (`dc-store`), GitPulse (links `dc-store` directly).
+**Consumers:** DevCouncil and Manvi (`dc-store`), GitPulse (a vendored copy under `src-tauri/vendored/dc-store`, refreshed by `GitPulse/scripts/vendor-crates.mjs`).
 
 This document describes the tables as *implemented*, not as intended. Where a
 consumer's model disagrees with what follows, `schema.rs` wins and the consumer
@@ -27,9 +27,12 @@ There is no `tasks` table. Until dc-store schema 10 this store kept a task
 table of its own, with no command that created a task or moved its status; it
 was retired in favour of the one task definition that already existed, the
 workbench item (`work_items`, the table GitPulse's board is built on). Opening
-an older store archives every legacy row as an item and drops the table, in one
-transaction, keeping each task's id so leases, gaps, evidence and runs still
-name their task.
+an older store archives every legacy row as an item, drops the table and stamps
+schema 10, in one transaction, keeping each task's id so leases, gaps, evidence
+and runs still name their task. If any step is refused, the store is left at
+its old version with its tasks table, which an older reader still understands.
+A legacy table with no rows is dropped without creating or upgrading the
+workbench profile.
 
 A task is a live `work_items` row whose primary repository is
 `this-repo` (`dc_store::workbench::LOCAL_REPOSITORY_ID`) and whose body carries

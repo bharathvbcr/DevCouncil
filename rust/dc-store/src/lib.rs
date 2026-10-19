@@ -417,6 +417,10 @@ impl Store {
     }
 
     fn prepare(conn: Connection) -> Result<Self> {
+        Self::prepare_with(conn, &mut None)
+    }
+
+    fn prepare_with(conn: Connection, stamp_budget: &mut Option<usize>) -> Result<Self> {
         // WAL lets readers proceed while a writer holds the write lock, and the
         // busy timeout absorbs the contention two builders produce. Both are
         // set before any statement runs.
@@ -457,14 +461,26 @@ impl Store {
             now_fn: None,
             workbench_upgrades: true,
         };
-        // The legacy tasks table becomes workbench items, in one transaction,
-        // before the version is stamped: a refusal leaves the store as found.
-        workbench::retire_legacy_tasks(&store).map_err(|e| StoreError::Workbench {
-            code: e.code,
-            message: e.message,
+        // The legacy tasks table becomes workbench items and the version is
+        // stamped in one transaction: a refusal leaves the store as found, at
+        // the old version with its tasks table, which an older reader still
+        // understands.
+        workbench::retire_legacy_tasks(&store, SCHEMA_VERSION, stamp_budget).map_err(|e| {
+            StoreError::Workbench {
+                code: e.code,
+                message: e.message,
+            }
         })?;
         schema::migrate(&store.conn, SCHEMA_VERSION).map_err(too_new)?;
         Ok(store)
+    }
+
+    /// Opens `path` like [`Store::open`], but fails the schema stamp that
+    /// commits with the legacy tasks retirement after `steps` write steps, so a
+    /// test can check the store is left exactly as it was found.
+    #[doc(hidden)]
+    pub fn open_failing_stamp_after(path: impl AsRef<Path>, steps: usize) -> Result<Self> {
+        Self::prepare_with(Connection::open(path)?, &mut Some(steps))
     }
 
     /// Stops this handle from upgrading an older workbench profile. A request

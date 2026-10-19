@@ -219,16 +219,31 @@ fn request(conn: &Connection, row: &LegacyRow) -> Result<String> {
 /// Archives the legacy `tasks` table as workbench items and drops it, if the
 /// store still has one. Safe to call on every open: with no such table it
 /// reads one catalog row and returns.
-pub(crate) fn retire(store: &Store) -> Result<Retired> {
+///
+/// The store's columns and its `schema_version` stamp (`known`) commit in the
+/// same transaction as the drop. Stamping afterwards would leave a window — a
+/// failed stamp after a committed drop — in which the store reads as the old
+/// version with no tasks table, and an older reader recreates an empty one and
+/// answers "no ready tasks". `stamp_budget` fails the stamp after that many
+/// write steps, for the test that proves the rollback.
+pub(crate) fn retire(
+    store: &Store,
+    known: u32,
+    stamp_budget: &mut Option<usize>,
+) -> Result<Retired> {
     let conn = &store.conn;
     if !table_exists(conn)? {
         return Ok(Retired::default());
     }
-    // The workbench profile the items go into, created or brought current
-    // before the transaction opens: its own steps are transactions.
-    ensure_schema(conn, true)?;
     let held: i64 = conn.query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))?;
-    if held > 0 {
+    // Rows need the workbench profile to land in, created or brought current
+    // (and backed up) before the transaction opens: its own steps are
+    // transactions. An empty legacy table — every store before schema 10 had
+    // one — is dropped without touching the profile, so a read does not
+    // upgrade it for hosts that still speak the older one.
+    let workbench_ready = held > 0;
+    if workbench_ready {
+        ensure_schema(conn, true)?;
         backup_profile(conn, "pre-tasks-retire", |backup, detail| {
             format!(
                 "the legacy tasks table cannot be retired because its backup {} could not be written: {detail}",
@@ -238,7 +253,16 @@ pub(crate) fn retire(store: &Store) -> Result<Retired> {
     }
 
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    let outcome = archive(store);
+    let outcome = archive(store, workbench_ready).and_then(|done| {
+        crate::schema::bring_current(conn, known, stamp_budget)
+            .map(|()| done)
+            .map_err(|detail| Error {
+                code: "legacy_task_unmigratable",
+                message: format!(
+                    "the legacy tasks table was not retired because the schema could not be brought to version {known}: {detail}; the store was left as it was found"
+                ),
+            })
+    });
     match outcome {
         Ok(done) => {
             conn.execute_batch("COMMIT")?;
@@ -251,7 +275,7 @@ pub(crate) fn retire(store: &Store) -> Result<Retired> {
     }
 }
 
-fn archive(store: &Store) -> Result<Retired> {
+fn archive(store: &Store, workbench_ready: bool) -> Result<Retired> {
     let conn = &store.conn;
     // Re-checked under the write lock: another process may have finished it
     // while this one waited.
@@ -261,6 +285,14 @@ fn archive(store: &Store) -> Result<Retired> {
     let now_ms = store.workbench_now_millis()?;
     let now = now_ms / 1000;
     let rows = read_rows(conn)?;
+    if !rows.is_empty() && !workbench_ready {
+        return Err(Error {
+            code: "legacy_task_unmigratable",
+            message: "rows were added to the legacy tasks table while it was being retired; \
+                      the store was left as it was found, and the next open retires them"
+                .to_string(),
+        });
+    }
     if !rows.is_empty() {
         let raw = local_repository_request();
         let repository = Input::new(conn, &raw)?;

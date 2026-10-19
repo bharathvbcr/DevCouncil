@@ -10,7 +10,7 @@ use std::path::Path;
 
 #[allow(dead_code)]
 mod support;
-use support::{dcstore, item_request, plant, plant_db, seeded, temp_dir};
+use support::{LEGACY_TASKS, dcstore, item_request, plant, plant_db, seeded, temp_dir};
 
 fn put(store: &Store, id: &str, scope: &str) -> Result<String, dc_store::workbench::Error> {
     store.ensure_local_repository().unwrap();
@@ -489,21 +489,6 @@ fn a_planted_scope_that_is_not_an_array_is_reported_not_spliced() {
 
 // --- the legacy tasks table is archived into items ------------------------------
 
-const LEGACY: &str = "CREATE TABLE tasks (
-    id VARCHAR NOT NULL, title VARCHAR NOT NULL, description VARCHAR NOT NULL,
-    requirement_ids_json VARCHAR NOT NULL DEFAULT '[]',
-    acceptance_criterion_ids_json VARCHAR NOT NULL DEFAULT '[]',
-    planned_files_json VARCHAR NOT NULL DEFAULT '[]',
-    expected_tests_json VARCHAR NOT NULL DEFAULT '[]',
-    allowed_commands_json VARCHAR NOT NULL DEFAULT '[]',
-    forbidden_changes_json VARCHAR NOT NULL DEFAULT '[]',
-    status VARCHAR NOT NULL DEFAULT 'planned', difficulty VARCHAR,
-    agent_appended_expected_tests_json VARCHAR NOT NULL DEFAULT '[]',
-    agent_appended_allowed_commands_json VARCHAR NOT NULL DEFAULT '[]',
-    priority VARCHAR,
-    agent_appended_planned_files_json VARCHAR NOT NULL DEFAULT '[]',
-    PRIMARY KEY (id));";
-
 /// A store as schema 9 left it: the legacy table with rows in each status, a
 /// live lease, a gap and a run that all name tasks by id.
 fn pre_migration(name: &str) -> std::path::PathBuf {
@@ -511,7 +496,7 @@ fn pre_migration(name: &str) -> std::path::PathBuf {
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch("PRAGMA journal_mode=WAL").ok();
     conn.execute_batch(schema::SCHEMA).unwrap();
-    conn.execute_batch(LEGACY).unwrap();
+    conn.execute_batch(LEGACY_TASKS).unwrap();
     conn.execute_batch(
         r#"INSERT INTO tasks (id, title, description, status, priority, difficulty, planned_files_json,
                               requirement_ids_json, acceptance_criterion_ids_json, expected_tests_json,
@@ -669,7 +654,7 @@ fn a_half_migrated_store_is_finished_not_duplicated() {
     let conn = Connection::open(&path).unwrap();
     conn.execute("ATTACH DATABASE ?1 AS old", [&backup])
         .unwrap();
-    conn.execute_batch(LEGACY).unwrap();
+    conn.execute_batch(LEGACY_TASKS).unwrap();
     conn.execute_batch(
         "INSERT INTO tasks SELECT * FROM old.tasks;
          DETACH DATABASE old;
@@ -800,7 +785,7 @@ fn a_store_with_zero_legacy_rows_just_drops_the_empty_table() {
     let path = temp_dir("tasks-empty").join("state.sqlite");
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(schema::SCHEMA).unwrap();
-    conn.execute_batch(LEGACY).unwrap();
+    conn.execute_batch(LEGACY_TASKS).unwrap();
     conn.execute("UPDATE schema_version SET version = 9", [])
         .ok();
     conn.execute(
@@ -811,9 +796,72 @@ fn a_store_with_zero_legacy_rows_just_drops_the_empty_table() {
     drop(conn);
     let store = Store::open(&path).unwrap();
     assert!(!table_exists(store.connection(), "tasks"));
+    assert_eq!(
+        stamped_version(store.connection()),
+        i64::from(SCHEMA_VERSION)
+    );
+    // Opening is a read for hosts that share the profile: an empty legacy table
+    // gives it nothing to receive, so the open must not create or upgrade it.
+    assert!(
+        !table_exists(store.connection(), "work_items"),
+        "retiring an empty legacy table created the workbench profile"
+    );
     assert!(ids(&store, ReadyMode::Enforce).is_empty());
     assert!(
         !Path::new(&format!("{}.pre-tasks-retire.bak", path.display())).exists(),
         "an empty table needs no backup"
     );
+}
+
+// --- the retirement and the schema stamp commit together ----------------------
+
+fn stamped_version(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT version FROM schema_version WHERE id = 'singleton'",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_failed_stamp_leaves_the_legacy_table_and_its_version_as_found() {
+    let path = pre_migration("tasks-stamp-fails");
+    let refused = Store::open_failing_stamp_after(&path, 0)
+        .expect_err("an injected stamp failure must refuse the open");
+    assert!(
+        matches!(
+            refused,
+            StoreError::Workbench {
+                code: "legacy_task_unmigratable",
+                ..
+            }
+        ),
+        "{refused}"
+    );
+    {
+        // As found: an older reader still sees version 9 with its tasks table
+        // and every row, never version 9 with the table gone.
+        let conn = Connection::open(&path).unwrap();
+        assert!(
+            table_exists(&conn, "tasks"),
+            "the drop committed without the stamp"
+        );
+        let held: i64 = conn
+            .query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(held, 7);
+        assert_eq!(stamped_version(&conn), 9);
+        let items: i64 = conn
+            .query_row("SELECT count(*) FROM work_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(items, 0, "items committed without the stamp");
+    }
+    let store = Store::open(&path).expect("the next open finishes the retirement");
+    assert!(!table_exists(store.connection(), "tasks"));
+    assert_eq!(
+        stamped_version(store.connection()),
+        i64::from(SCHEMA_VERSION)
+    );
+    assert_eq!(item_state(store.connection(), "TASK-1").0, "done");
 }

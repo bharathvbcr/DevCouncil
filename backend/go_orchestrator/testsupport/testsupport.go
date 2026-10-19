@@ -177,6 +177,39 @@ type TaskSeed struct {
 	Priority int
 }
 
+// dcstoreBound caps one seeding call to the store binary, and
+// dcstoreOutputLimit how much of its reply is kept.
+const (
+	dcstoreBound       = 2 * time.Minute
+	dcstoreOutputLimit = 1 << 20
+)
+
+// runDCStore runs the store binary once under a deadline with a bounded reply.
+// A timeout, a non-zero exit or a reply cut at the limit fails the test: a
+// truncated reply would otherwise be parsed as if it were whole.
+func runDCStore(t testing.TB, bin string, args ...string) []byte {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), dcstoreBound)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, args...)
+	proc.ConfigureGroup(cmd)
+	out := &proc.CappedBuffer{Limit: dcstoreOutputLimit}
+	cmd.Stdout, cmd.Stderr = out, out
+	cmd.WaitDelay = 5 * time.Second
+	err, timedOut := proc.RunBounded(ctx, cmd.Run)
+	if timedOut {
+		// The abandoned goroutine may still be writing out; it is not read.
+		t.Fatalf("dcstore %s did not return within %s", strings.Join(args, " "), dcstoreBound)
+	}
+	if err != nil {
+		t.Fatalf("dcstore %s: %v\n%s", strings.Join(args, " "), err, out.Bytes())
+	}
+	if out.Overflowed() {
+		t.Fatalf("dcstore %s replied with more than %d bytes", strings.Join(args, " "), dcstoreOutputLimit)
+	}
+	return out.Bytes()
+}
+
 // SeedTask plants a task the way an operator does, through `dcstore work`, so
 // the test exercises the one definition of a task rather than a private copy
 // of its storage. The store is created if it does not exist. A refusal fails
@@ -185,11 +218,7 @@ func SeedTask(t testing.TB, db string, seed TaskSeed) {
 	t.Helper()
 	bin := DCStore(t)
 	run := func(args ...string) string {
-		out, err := exec.Command(bin, append([]string{"--db", db}, args...)...).CombinedOutput()
-		if err != nil {
-			t.Fatalf("dcstore %s: %v\n%s", args[0], err, out)
-		}
-		return string(out)
+		return string(runDCStore(t, bin, append([]string{"--db", db}, args...)...))
 	}
 	run("local-repository")
 	if seed.Status == "" {
@@ -223,11 +252,7 @@ func MergeTaskScope(t testing.TB, db, id string, patch map[string]any) {
 	t.Helper()
 	bin := DCStore(t)
 	run := func(method string, input []byte) []byte {
-		out, err := exec.Command(bin, "--db", db, "work", "--method", method, "--input", string(input)).CombinedOutput()
-		if err != nil {
-			t.Fatalf("dcstore work %s: %v\n%s", method, err, out)
-		}
-		return out
+		return runDCStore(t, bin, "--db", db, "work", "--method", method, "--input", string(input))
 	}
 	request, _ := json.Marshal(map[string]string{"id": id})
 	var got struct {

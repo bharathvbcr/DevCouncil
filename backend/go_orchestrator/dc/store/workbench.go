@@ -46,8 +46,10 @@ type WorkbenchError struct {
 
 func (e *WorkbenchError) Error() string { return "workbench: " + e.Code + ": " + e.Message }
 
-// Workbench uses this client's existing lazy, bounded process pool. Hosts create
-// a separate Client for their profile database, never reuse the lease client.
+// Workbench uses this client's existing lazy, bounded process pool. A host's
+// board profile gets a Client of its own; the repository's lease client also
+// calls it, because since dc-store schema 10 that store's tasks are workbench
+// items in the same database (MoveTaskStatus, `devcouncil task`).
 // Mutations carry request_id and expected_revision; transport failures are not
 // retried here because the caller must retain the same idempotency identity.
 func (c *Client) Workbench(ctx context.Context, method string, input json.RawMessage) (json.RawMessage, error) {
