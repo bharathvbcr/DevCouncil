@@ -2879,7 +2879,10 @@ pub fn extraction_coverage(extractions: &[Extraction]) -> ExtractionCoverage {
                 // The entry's own reason, so one decision per entry: a path that
                 // appears twice is judged twice, and this can never exceed
                 // `parse_failed_files`.
-                if entry.reason.starts_with(devmap_extract::model::BUDGET_REFUSAL_PREFIX) {
+                if entry
+                    .reason
+                    .starts_with(devmap_extract::model::BUDGET_REFUSAL_PREFIX)
+                {
                     coverage.budget_refused_files += 1;
                 }
             }
