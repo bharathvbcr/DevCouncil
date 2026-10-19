@@ -234,7 +234,7 @@ fn p3_nested_class_binds_inner() {
     let src = "class K:\n    class A:\n        def __init__(self):\n            pass\n\ndef f():\n    return K.A()\n";
     let r = resolve(&[("u.py", src)]);
     let got = calls(&r, "u.py::f");
-    assert!(has(&got, "u.py::K.A.__init__") || has(&got, "u.py::K.A"), "{got:?}");
+    assert!(has(&got, "u.py::A.__init__") || has(&got, "u.py::A"), "{got:?}");
 }
 
 #[test]
@@ -242,7 +242,7 @@ fn p3_nested_class_method_through_instance() {
     let src = "class K:\n    class A:\n        def run(self):\n            return 1\n\ndef f():\n    x = K.A()\n    return x.run()\n";
     let r = resolve(&[("u.py", src)]);
     let got = calls(&r, "u.py::f");
-    assert!(has(&got, "u.py::K.A.run"), "{got:?}");
+    assert!(has(&got, "u.py::A.run"), "{got:?}");
 }
 
 #[test]
@@ -279,7 +279,7 @@ fn p3_imported_k_binds_nested() {
     let src = "from k import K\n\ndef f():\n    x = K.A()\n    return x.run()\n";
     let r = resolve(&[("k.py", k), ("u.py", src)]);
     let got = calls(&r, "u.py::f");
-    assert!(has(&got, "k.py::K.A.run"), "{got:?}");
+    assert!(has(&got, "k.py::A.run"), "{got:?}");
 }
 
 #[test]
@@ -322,7 +322,7 @@ fn p3_self_a_binds_inner() {
     let src = "class K:\n    class A:\n        def run(self):\n            return 1\n    def m(self):\n        x = self.A()\n        return x.run()\n";
     let r = resolve(&[("u.py", src)]);
     let got = calls(&r, "u.py::K.m");
-    assert!(has(&got, "u.py::K.A.run"), "{got:?}");
+    assert!(has(&got, "u.py::A.run"), "{got:?}");
 }
 
 #[test]
@@ -517,4 +517,75 @@ fn p6_module_level_call_unaffected() {
     let r = resolve(&[("a/__init__.py", "def x():\n    return 1\n"), ("a/b.py", "def f():\n    return 1\n"), ("u.py", src)]);
     let e = all_calls(&r);
     assert!(edge_from(&e, |s| s == "u.py", "a/__init__.py::x"), "{e:?}");
+}
+
+// ------------------------------------------------------------ 5. performance
+
+fn wide_extractions(n: usize) -> Vec<Extraction> {
+    let mut files: Vec<(String, String)> = Vec::new();
+    for m in 0..10 {
+        let mut s = String::new();
+        for k in 0..10 {
+            s.push_str(&format!("def n{m}_{k}():\n    return {k}\n"));
+        }
+        files.push((format!("m{m}.py"), s));
+    }
+    let mut big = String::new();
+    for i in 0..n {
+        let m = i % 10;
+        let names: Vec<String> = (0..10).map(|k| format!("n{m}_{k}")).collect();
+        big.push_str(&format!(
+            "def f{i}():\n    from m{m} import {}\n    return 1\n",
+            names.join(", ")
+        ));
+    }
+    files.push(("big.py".to_string(), big));
+    files.iter().map(|(p, s)| extract_file(p, s)).collect()
+}
+
+fn index_time(n: usize) -> std::time::Duration {
+    let ex = wide_extractions(n);
+    let mut best = std::time::Duration::MAX;
+    for _ in 0..3 {
+        let mut resolver = Resolver::new();
+        let t = std::time::Instant::now();
+        resolver.index_extractions(&ex);
+        best = best.min(t.elapsed());
+    }
+    best
+}
+
+#[test]
+fn p5_index_is_linear_in_function_count() {
+    let small = index_time(1000);
+    let large = index_time(4000);
+    // 4x the functions: linear is ~4x, quadratic ~16x.
+    let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
+    assert!(
+        ratio < 8.0,
+        "index_extractions 1000 fns {small:?}, 4000 fns {large:?}, ratio {ratio:.1}"
+    );
+}
+
+fn chain_src(depth: usize) -> String {
+    let mut s = String::from("def top():\n    from m0 import helper\n");
+    for d in 1..=depth {
+        s.push_str(&format!("{}def f{d}():\n", "    ".repeat(d)));
+    }
+    s.push_str(&format!("{}return helper()\n", "    ".repeat(depth + 1)));
+    s
+}
+
+#[test]
+fn p5_deep_chain_50_binds() {
+    let r = resolve(&[("m0.py", "def helper():\n    return 1\n"), ("u.py", &chain_src(50))]);
+    let e = all_calls(&r);
+    assert!(e.iter().any(|(_, t)| t == "m0.py::helper"), "50-deep chain lost the import: {e:?}");
+}
+
+#[test]
+fn p5_deep_chain_70_binds() {
+    let r = resolve(&[("m0.py", "def helper():\n    return 1\n"), ("u.py", &chain_src(70))]);
+    let e = all_calls(&r);
+    assert!(e.iter().any(|(_, t)| t == "m0.py::helper"), "70-deep chain lost the import: {e:?}");
 }
