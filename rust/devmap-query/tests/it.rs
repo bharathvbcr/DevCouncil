@@ -129,6 +129,8 @@ mod search_hostile_queries;
 #[cfg(feature = "parse")]
 mod search_partial_attack;
 #[cfg(feature = "parse")]
+mod search_partial_close_attack;
+#[cfg(feature = "parse")]
 mod search_ranks_before_paging;
 #[cfg(feature = "parse")]
 mod search_zero_is_not_absence;
