@@ -707,11 +707,13 @@ impl ExtractionCoverage {
         }
         // Named apart from grammar failures: these were refused for the
         // machine's load, and re-running the build is exactly the fix.
-        if self.budget_refused_files > 0 {
+        // Clamped to its parent: a hand-built aggregate record can set the
+        // subset above the whole, and "5 of 1" must not be printed.
+        let budget_refused = self.budget_refused_files.min(self.parse_failed_files);
+        if budget_refused > 0 {
             reason.push_str(&format!(
-                "; {} of the parse failure(s) are budget-refused (the parse overran its \
-                 wall-clock budget under load; the next build re-extracts them)",
-                self.budget_refused_files
+                "; {budget_refused} of the parse failure(s) are budget-refused (the parse \
+                 overran its wall-clock budget under load; the next build re-extracts them)"
             ));
         }
         // Its own clause for the same reason: the fix is to split or shrink
@@ -2870,16 +2872,14 @@ pub fn extraction_coverage(extractions: &[Extraction]) -> ExtractionCoverage {
         .filter(|ext| partial_parse_charged(ext))
         .map(|ext| ext.file_path.as_str())
         .collect();
-    let budget_refused: HashSet<&str> = extractions
-        .iter()
-        .filter(|ext| ext.is_budget_refusal())
-        .map(|ext| ext.file_path.as_str())
-        .collect();
     for entry in extraction_gaps(extractions) {
         match entry.gap {
             ExtractionGap::ParseFailed => {
                 coverage.parse_failed_files += 1;
-                if budget_refused.contains(entry.path.as_str()) {
+                // The entry's own reason, so one decision per entry: a path that
+                // appears twice is judged twice, and this can never exceed
+                // `parse_failed_files`.
+                if entry.reason.starts_with(devmap_extract::model::BUDGET_REFUSAL_PREFIX) {
                     coverage.budget_refused_files += 1;
                 }
             }
