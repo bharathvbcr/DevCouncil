@@ -1,6 +1,6 @@
 # Build report: GitPulse backlog run, 2026-10-17 to 2026-10-18
 
-This run worked the open GitPulse cards for DevCouncil. Each lane went through an Opus brief, a Sonnet implementer, one or more adversarial Sonnet passes, and an Opus review. Fable ruled on sequencing and tradeoffs. Local `main` moved from `4a5ca10c` to `9cbd0f2b`. **Nothing is pushed.** No card reached done: requesting done returns "no verification record exists for this task: Manvi's work.verify.task has not judged it", and that tool cannot be invoked from this session.
+This run worked the open GitPulse cards for DevCouncil. Each lane went through an Opus brief, a Sonnet implementer, one or more adversarial Sonnet passes, and an Opus review. Fable ruled on sequencing and tradeoffs. Local `main` moved from `4a5ca10c` to `a49c42bf`. **Nothing is pushed.** No card reached done: requesting done returns "no verification record exists for this task: Manvi's work.verify.task has not judged it", and that tool cannot be invoked from this session.
 
 AUDIT_REPORT.md's waves 1–6 were already all in review when the run began, so work continued by priority, severity and Fable's order. The previous report is kept as `BUILD_REPORT-2026-10-15.md`.
 
@@ -31,6 +31,9 @@ AUDIT_REPORT.md's waves 1–6 were already all in review when the run began, so 
 | ft-90cef8de (split) | treesitter.rs 17,248 → 84 lines and resolver.rs 13,658 → 859 lines, now in 27 submodules; byte-identical build | pure move, so identity evidence stood in for an attack |
 | ft-19604c23 (Go type use) | same-file Go type mention exemption; the dead caveat names capped and eligible languages; resolver qualifier-slot leak fixed | 2 rounds each half |
 | ft-eb82c9d3 (relative build root) | one `root_parser` anchors and lexically cleans every root | 1 medium plus 2 lows fixed |
+| ft-befc1ff0 (blast pathspecs) | `GIT_LITERAL_PATHSPECS=1` in the shared dc-proc git runner; the conflicting global switches are stripped | 1 medium fixed; Go call sites are logged as a follow-up |
+| ft-09f2437e (budget refusals in answers) | pinning tests for dead, affected, explore and the daemon drain; caveat names "budget-refused" and a count. Fable amended criterion 2 to a corpus-wide caveat. | 0 high/medium; 2 lows fixed |
+| ft-93ece913 (blast/suspects) | mostly already on main (cded4595, 4e311c09); added an unreadable basis → ContentUnavailable | the ≤1/3 wall-time target has not been measured on a quiet machine, so the card stays open |
 
 ## Benchmarks on touched paths
 
@@ -94,7 +97,8 @@ Instructions retired, min-of-N, interleaved.
 4. Store schema: structured charged ranges (ft-38ef7393) and payload identity (ft-3bdf1450).
 5. The count-only parse baseline cannot see a swapped failing file. Recording the set needs hashed paths.
 6. `accuracy/rustlabel` was merged by another session (`1c4866d2`) after Fable advised a full read first. Decide whether it needs that review now.
-7. Leftover git state: one stash entry, `stash@{0}`, "lane-fix-search-partial". Its content is already committed, but the gate held the drop. Also scratch branches `attack/base-timing`, `attack2/timing-base`, `attack5/base-run`.
+7. Disk: about 37 GiB free. The gate holds deletes of finished build directories: `tmp/bra-target` and `tmp/lp-target` (8.1 GB), plus each agent worktree's `target-lane`. New lanes are paused until space is freed.
+8. Leftover git state: one stash entry, `stash@{0}`, "lane-fix-search-partial". Its content is already committed, but the gate held the drop. Also scratch branches `attack/base-timing`, `attack2/timing-base`, `attack5/base-run`.
 
 ## Not verified
 
