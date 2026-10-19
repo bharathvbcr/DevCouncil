@@ -459,7 +459,7 @@ fn many_files(dir: &str, n: usize, ext: &str, start: usize) -> Vec<F> {
         .collect()
 }
 
-/// 70 partial files under a/ (6 past the 64 cap), 3 under b/. A lookup scoped to
+/// 70 partial files under a/ (54 past the 16 cap), 3 under b/. A lookup scoped to
 /// b/ has 3 in scope: nothing is past the cap, so nothing may be called
 /// unchecked for the cap.
 #[test]
@@ -471,14 +471,14 @@ fn p4_out_of_scope_partial_files_do_not_inflate_the_count_for_a_path_scope() {
     let wire = serde_json::to_string(&b).unwrap();
     assert!(!wire.contains("more partial-parse"), "{wire}");
     assert!(!is_unavailable(&b), "{}", describe(&b));
-    // In scope for a/: exactly 6 are past the cap, not 9.
+    // In scope for a/: exactly 54 (70 - 16) are past the cap, not 57.
     let a = ask(&store, "NOSUCH", &["a"], &[]);
     let why = reason(&a);
-    assert!(why.contains("6 more partial-parse file(s)"), "{why}");
-    // Unscoped: 73 total, 9 past the cap.
+    assert!(why.contains("54 more partial-parse file(s)"), "{why}");
+    // Unscoped: 73 total, 57 (73 - 16) past the cap.
     let u = ask(&store, "NOSUCH", &[], &[]);
     let note = u.walk_incomplete.clone().unwrap_or_default();
-    assert!(note.contains("9 more partial-parse file(s)"), "{note}");
+    assert!(note.contains("57 more partial-parse file(s)"), "{note}");
     let _ = std::fs::remove_dir_all(&root);
 }
 

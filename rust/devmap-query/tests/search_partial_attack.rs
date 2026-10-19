@@ -545,7 +545,7 @@ fn p4_elided_range_unscoped_is_not_silent() {
 
 // ---------------------------------------------------------------- probe 5
 
-/// 70 partial files; the name is in the 70th by path. Past the 64-file cap an
+/// 70 partial files; the name is in the 70th by path. Past the read cap (16 files) an
 /// UNSCOPED lookup says nothing about the files it did not read.
 #[test]
 fn p5_the_read_cap_is_not_silent_when_unscoped() {

@@ -266,11 +266,11 @@ const REASON_PATH_BYTES: usize = 160;
 /// Longest looked-up name one sentence carries.
 const REASON_NAME_BYTES: usize = 128;
 
-/// The clause of the stored partial-parse sentence that lists the charged
-/// regions (see `devmap_analyze`'s partial-parse reason). Also the SQL filter
+/// The phrase that opens each region list of the stored partial-parse sentence
+/// (see `devmap_analyze`, partial-parse reason). Also the SQL filter
 /// that picks the rows worth reading, so the reader and the filter cannot
-/// disagree about which rows hold a charged region.
-const CHARGED_CLAUSE: &str = "; charged: ";
+/// disagree about which rows list a region that could hold a declaration.
+const REGION_LIST: &str = "surviving declaration (";
 
 /// What a missed lookup found out about the holes it was asked about.
 #[derive(Debug, Default)]
@@ -292,8 +292,15 @@ fn bounded_path(path: &str) -> String {
 /// extractor's `LanguageSpec` registry carries no case rule, so this is the one
 /// place one is written; every other language — Rust, Go, Python, TypeScript,
 /// Swift, Kotlin — matches a name exactly.
+///
+/// PHP is here because its function, method and class names ignore case. Its
+/// variables do not, but a range does not say which kind of name it holds, and
+/// a false "may declare it" is worded as a maybe where a missed one is silence.
+/// The other registry grammars were checked: C#, Java, Ruby, Lua, Erlang, R,
+/// Scala, Dart, Solidity, Terraform and Nix are case-sensitive, and the
+/// markup grammars name no declarations.
 fn language_folds_case(language: &str) -> bool {
-    matches!(language, "sql" | "cobol" | "pascal" | "vb" | "cfml")
+    matches!(language, "sql" | "cobol" | "pascal" | "vb" | "cfml" | "php")
 }
 
 /// One charged region whose text holds the looked-up name.
@@ -327,6 +334,9 @@ struct ChargedHoles {
     /// The caller narrowed to paths or languages, so an unchecked region in
     /// scope is the answer rather than background.
     scoped: bool,
+    /// Attribution did not run (the query names no identifier) over partial
+    /// files in scope: said, never silent.
+    skipped: Option<String>,
 }
 
 fn listed(items: Vec<String>) -> String {
@@ -410,6 +420,9 @@ impl ChargedHoles {
     fn split(&self, query: &str) -> (Option<String>, Option<String>) {
         let matched = self.match_sentence(query);
         let unchecked = self.unchecked_sentence();
+        if let Some(skipped) = &self.skipped {
+            return (None, Some(skipped.clone()));
+        }
         if matched.is_some() || self.scoped {
             let reason = match (matched, unchecked) {
                 (Some(matched), Some(unchecked)) => Some(format!("{matched}; {unchecked}")),
@@ -434,30 +447,46 @@ fn is_identifier(segment: &str) -> bool {
         && chars.all(is_ident)
 }
 
-/// The identifier a lookup names, or `None` when the query is not one.
+/// What a lookup names: the qualifiers before the last segment, and the last
+/// segment, or why the query names no identifier.
 ///
 /// Several words describe a symbol rather than name it, and a path names a
-/// file. A qualified identifier (`mod::Thing`, `Class.method`) names its last
-/// segment, but only when every segment is an identifier: `release.0` is a
-/// version and `nosuchfile.rs` a file, and collapsing either to its tail would
-/// blame every region that holds a `0` or an `rs`. The extension test reads the
-/// extractor's own table, so a language added there is recognised here.
-fn single_name(query: &str) -> Option<&str> {
+/// file. A dotted or `::` query whose segments are all identifiers is a
+/// qualified identifier (`mod::Thing`, `Class.method`, and also `foo.go`, a
+/// method `go` on `foo`: an extension-shaped tail is not evidence of a file
+/// name, and skipping it answered a clean zero over a hole). `release.0` is a
+/// version, so a numeric segment is refused.
+///
+/// Qualifiers are returned because the tail alone is too weak a test:
+/// `nosuchfile.rs` would otherwise blame any region that mentions an `rs`
+/// token. [`qualifier_present`] asks that each qualifier also occur in the file.
+fn query_target(query: &str) -> Result<(Vec<&str>, &str), &'static str> {
     let query = query.trim();
-    if query.is_empty() || query.contains(char::is_whitespace) || query.contains('/') {
-        return None;
+    if query.is_empty() || query.contains(char::is_whitespace) {
+        return Err("the query is a phrase, not a name");
     }
-    let mut last = query;
-    for segment in query.split("::").flat_map(|part| part.split('.')) {
-        if !is_identifier(segment) {
-            return None;
-        }
-        last = segment;
+    if query.contains('/') {
+        return Err("the query contains a path separator");
     }
-    if query.contains('.') && devmap_extract::languages::find_spec_by_extension(last).is_some() {
-        return None;
+    let segments: Vec<&str> = query.split("::").flat_map(|part| part.split('.')).collect();
+    if !segments.iter().all(|segment| is_identifier(segment)) {
+        return Err("the query is not a (qualified) identifier");
     }
-    Some(last)
+    let (name, qualifiers) = segments.split_last().ok_or("the query is empty")?;
+    Ok((qualifiers.to_vec(), name))
+}
+
+/// Whether a qualifier of the query can belong to this file: it occurs in the
+/// source as a whole identifier, or it is one of the file's own path
+/// components (`mod.func` for a function in `pkg/mod.py`).
+fn qualifier_present(qualifier: &str, source: &str, path: &str, fold: bool) -> bool {
+    name_occurrence(source, qualifier, fold).is_some()
+        || path.split('/').any(|component| {
+            let stem = component
+                .rsplit_once('.')
+                .map_or(component, |(stem, _)| stem);
+            stem == qualifier || (fold && stem.eq_ignore_ascii_case(qualifier))
+        })
 }
 
 /// Whether `window` holds `name` as a whole identifier: `None` for no,
@@ -523,33 +552,49 @@ fn looks_like_comment_or_string(before: &str) -> bool {
         || before.matches('"').count() % 2 == 1
 }
 
-/// The charged byte ranges the stored partial-parse sentence names, and how
-/// many it elided with "and N more". Reads only the `; charged: ` clause:
-/// `would be charged` (a file the charge exempts) and `not charged` (regions
-/// judged harmless) are other clauses and name nothing this lookup may blame.
+/// The byte ranges the stored partial-parse sentence lists as able to hold a
+/// declaration, and how many it elided with "and N more".
+///
+/// Two lists qualify, both introduced by `surviving declaration (`: the regions
+/// *outside* every surviving declaration (charged, or "would be charged" for a
+/// file the charge exempts), and the regions *inside* one (`4..8 in `x``). The
+/// charge exempts the second kind from the dead-code cap, but a lost method of
+/// a surviving class is still a declaration the index lacks, so a name lookup
+/// must not skip it. Nameless regions and zero-width MISSING tokens cannot hold
+/// a name and are not listed here.
 fn parse_charged_ranges(reason: &str) -> (Vec<(usize, usize)>, usize) {
-    const LIST_OPEN: &str = "region(s) outside every surviving declaration (";
-    let Some(at) = reason.find(CHARGED_CLAUSE) else {
-        return (Vec::new(), 0);
-    };
-    let clause = &reason[at + CHARGED_CLAUSE.len()..];
-    let Some(open) = clause.find(LIST_OPEN) else {
-        return (Vec::new(), 0);
-    };
-    let list = clause[open + LIST_OPEN.len()..]
-        .split(')')
-        .next()
-        .unwrap_or("");
     let mut ranges = Vec::new();
     let mut elided = 0usize;
-    for item in list.split(", ") {
-        if let Some((start, end)) = item.split_once("..") {
-            if let (Ok(start), Ok(end)) = (start.trim().parse(), end.trim().parse()) {
-                ranges.push((start, end));
+    let mut rest = reason;
+    while let Some(at) = rest.find(REGION_LIST) {
+        let list = &rest[at + REGION_LIST.len()..];
+        // The list ends at the first `)` outside backticks (an item may name a
+        // declaration such as `f()`).
+        let mut in_name = false;
+        let end = list
+            .char_indices()
+            .find(|&(_, c)| match c {
+                '`' => {
+                    in_name = !in_name;
+                    false
+                }
+                ')' => !in_name,
+                _ => false,
+            })
+            .map_or(list.len(), |(index, _)| index);
+        for item in list[..end].split(", ") {
+            if let Some((start, tail)) = item.split_once("..") {
+                let digits = tail
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(tail.len());
+                if let (Ok(start), Ok(stop)) = (start.trim().parse(), tail[..digits].parse()) {
+                    ranges.push((start, stop));
+                }
+            } else if let Some(count) = item.trim().strip_prefix("and ") {
+                elided += count.trim_end_matches(" more").trim().parse().unwrap_or(0);
             }
-        } else if let Some(count) = item.trim().strip_prefix("and ") {
-            elided = count.trim_end_matches(" more").trim().parse().unwrap_or(0);
         }
+        rest = &list[end..];
     }
     (ranges, elided)
 }
@@ -692,8 +737,12 @@ impl StoreQueryEngine<'_> {
         query: &str,
     ) -> anyhow::Result<ChargedHoles> {
         let mut found = ChargedHoles::default();
-        let Some(name) = single_name(query) else {
-            return Ok(found);
+        // An exact indexed file path is a file lookup, not a name.
+        let target = match query_target(query) {
+            Ok(_) if query.contains('.') && self.store.latest_file(query.trim())?.is_some() => {
+                Err("the query is an indexed file path")
+            }
+            other => other,
         };
         // The scope layer's own resolution of paths and languages, so an
         // absolute path, `./sub` and a language-only scope admit exactly the
@@ -713,9 +762,27 @@ impl StoreQueryEngine<'_> {
         let admit_in_scope =
             |path: &str| resolved.as_ref().is_some_and(|scope| scope.contains(path));
         let admit: Option<&dyn Fn(&str) -> bool> = resolved.as_ref().map(|_| &admit_in_scope as _);
+        let (qualifiers, name) = match target {
+            Ok(target) => target,
+            Err(why) => {
+                // Attribution is skipped, and with partial files in scope that
+                // must not read as a clean miss.
+                let (_, held) = self
+                    .store
+                    .latest_partial_parse_gaps(REGION_LIST, admit, 0)?;
+                if held > 0 {
+                    found.skipped = Some(format!(
+                        "{held} partial-parse file(s) in scope hold charged regions this lookup \
+                         did not check for `{}`: {why}, so the name was not matched against them",
+                        crate::bounded_text(query, REASON_NAME_BYTES)
+                    ));
+                }
+                return Ok(found);
+            }
+        };
         let (rows, total) =
             self.store
-                .latest_partial_parse_gaps(CHARGED_CLAUSE, admit, MAX_CHARGED_FILES_READ)?;
+                .latest_partial_parse_gaps(REGION_LIST, admit, MAX_CHARGED_FILES_READ)?;
         found.files_past_cap = total.saturating_sub(rows.len());
         for row in rows {
             self.cancel.check()?;
@@ -757,7 +824,13 @@ impl StoreQueryEngine<'_> {
                                 .count()
                         };
                         let mut undecidable = 0usize;
+                        let qualified_here = qualifiers
+                            .iter()
+                            .all(|q| qualifier_present(q, &source, &row.path, fold));
                         for (start, end) in ranges {
+                            if !qualified_here {
+                                break;
+                            }
                             let Some(window) = source.get(start..end) else {
                                 undecidable += 1;
                                 continue;
@@ -1369,9 +1442,13 @@ mod charged_range_tests {
     /// fails here instead of silently emptying every charged-hole answer.
     #[test]
     fn the_charged_clause_round_trips_through_the_producer() {
-        // `def x(): pass` is 0..13: 4..8 is inside it (exempt), the rest is charged.
+        // `def x(): pass` is 0..13: 4..8 is inside it (listed separately), the rest is charged.
         let reason = producer_reason(&[(4, 8), (20, 30), (40, 55)]);
-        assert_eq!(parse_charged_ranges(&reason), (vec![(20, 30), (40, 55)], 0));
+        let (ranges, elided) = parse_charged_ranges(&reason);
+        assert_eq!(
+            (merge_ranges(ranges), elided),
+            (vec![(4, 8), (20, 30), (40, 55)], 0)
+        );
     }
 
     #[test]
@@ -1382,12 +1459,40 @@ mod charged_range_tests {
     }
 
     #[test]
-    fn exempt_regions_name_nothing_to_blame() {
-        // Only an inside-a-declaration region: "not charged: ...", no clause.
+    fn a_region_inside_a_surviving_declaration_can_still_hold_a_lost_method() {
+        // `4..8 in `x``: exempt from the charge, but a lost method of a
+        // surviving class is a declaration the index lacks.
         assert_eq!(
             parse_charged_ranges(&producer_reason(&[(4, 8)])),
-            (Vec::new(), 0)
+            (vec![(4, 8)], 0)
         );
+    }
+
+    #[test]
+    fn nameless_and_zero_width_regions_name_nothing_to_blame() {
+        let mut ext = devmap_extract::extract_file("src/a.py", "def x(): pass\n");
+        ext.parse_outcome = ParseOutcome::Partial {
+            error_ranges: vec![
+                TextRange {
+                    start_byte: 20,
+                    end_byte: 21,
+                },
+                TextRange {
+                    start_byte: 11,
+                    end_byte: 11,
+                },
+            ],
+            nameless_ranges: vec![TextRange {
+                start_byte: 20,
+                end_byte: 21,
+            }],
+        };
+        let reason = devmap_analyze::extraction_gaps(&[ext])
+            .into_iter()
+            .find(|entry| entry.gap == devmap_analyze::ExtractionGap::PartialParse)
+            .expect("listed")
+            .reason;
+        assert_eq!(parse_charged_ranges(&reason), (Vec::new(), 0), "{reason}");
     }
 
     #[test]
@@ -1435,16 +1540,46 @@ mod charged_range_tests {
 
     #[test]
     fn only_a_qualified_identifier_is_a_name() {
-        assert_eq!(single_name("a b"), None);
-        assert_eq!(single_name("src/a.rs"), None);
-        assert_eq!(single_name("mod::Thing"), Some("Thing"));
-        assert_eq!(single_name("Class.method"), Some("method"));
-        assert_eq!(single_name("  plain "), Some("plain"));
-        assert_eq!(single_name("release.0"), None);
-        assert_eq!(single_name("nosuchfile.rs"), None);
-        assert_eq!(single_name("a..b"), None);
-        assert_eq!(single_name("a::"), None);
-        assert_eq!(single_name("rs"), Some("rs"), "no dot, so not a file name");
+        assert!(query_target("a b").is_err());
+        assert!(query_target("src/a.rs").is_err());
+        assert_eq!(query_target("mod::Thing"), Ok((vec!["mod"], "Thing")));
+        assert_eq!(query_target("Class.method"), Ok((vec!["Class"], "method")));
+        assert_eq!(query_target("  plain "), Ok((vec![], "plain")));
+        assert!(query_target("release.0").is_err());
+        assert!(query_target("a..b").is_err());
+        assert!(query_target("a::").is_err());
+        assert_eq!(query_target("rs"), Ok((vec![], "rs")));
+        // An extension-shaped tail is a qualified name (method `go` on `foo`).
+        assert_eq!(query_target("foo.go"), Ok((vec!["foo"], "go")));
+        assert_eq!(query_target("Config.ts"), Ok((vec!["Config"], "ts")));
+    }
+
+    #[test]
+    fn a_qualifier_must_belong_to_the_file() {
+        assert!(qualifier_present("foo", "type foo struct{}", "m.go", false));
+        assert!(!qualifier_present(
+            "nosuchfile",
+            "use std::rs::x;",
+            "consts.rs",
+            false
+        ));
+        assert!(qualifier_present(
+            "mod",
+            "def f(): pass",
+            "pkg/mod.py",
+            false
+        ));
+        assert!(qualifier_present("MOD", "x", "pkg/mod.pas", true));
+    }
+
+    #[test]
+    fn php_folds_case_and_the_case_sensitive_grammars_do_not() {
+        assert!(language_folds_case("php"));
+        for exact in [
+            "csharp", "java", "ruby", "lua", "erlang", "r", "scala", "dart",
+        ] {
+            assert!(!language_folds_case(exact), "{exact}");
+        }
     }
 
     #[test]
