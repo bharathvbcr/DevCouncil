@@ -1,3 +1,20 @@
+# Branch consolidation, 2026-10-19 pass 7
+
+This pass ran locally and pushed nothing. Main stays at `9558b8a1`; pid 136 landed the overnight wave itself, the last merge at 01:45.
+
+- **Committed:** nothing. Every worktree was clean.
+- **Merged:** nothing left to merge. Every lane of the wave was already on main when the pass started: lane/build-relative-root, lane/blast-literal-pathspecs, lane/budget-refusal-answers and lane/blast-blob-batch. The only unmerged branches are superseded, owner-kept, or the scratch probe attack2/timing-base.
+- **Backups:** `refs/backup/2026-10-19-pass7/*` (46 branches) and `/Users/bharath/Code/devtools/DevCouncil-branches-2026-10-19-pass7.bundle` (verified).
+- **Deleted with `-d`, worktree removed:** lane/blast-literal-pathspecs, lane/build-relative-root, lane/blast-blob-batch. Also 4 orphaned `worktree-agent-*` pointers.
+- **Worktrees removed, branch left for your `-D`:** attack/literal-pathspecs, attack/budget-refusal, attack/relative-root, all cherry `−`. Also attack3/py-followup.
+- **attack3/py-followup worktree:** removed with your approval. Its nested scratch worktree `tmp/base` had 7 dirty files; they and their diff are archived in `tmp/wt-archive/agent-ac9f-base.{tgz,diff,files}` before `git worktree remove --force` on the nested worktree only. The parent's ignored files are in `tmp/wt-archive/agent-ac9f4211914703da9.tgz`.
+- **Held:** blast-radius timed out on `git branch -D` a third time. By your choice, you will run the deletion of the 20 superseded branches yourself.
+- **Kept, by your choice:** the 7 worktrees pid 136 has locked, until it exits: lane/split-resolver-treesitter, lane/budget-refusal-answers, lane/corpus-runner-refusals, lane/mcp-status-degraded (merged); attack/swift-properties, attack4/py-wave8, attack/mcp-status (superseded). a5de's `tmp/dump-*/go.labels.json` must be archived before that one is removed.
+- **Also kept:** integration/wave7 (pid 136's integration branch), claude/literals-substring-b3546e (pid 16139 is in it), finish/workbench and lane/workbench (your decision).
+- **Verification:** `git fsck --connectivity-only` printed nothing (rc 0). `gitpulse_insights` returned every facet `ok`: 9 worktrees, 0 dirty, 0 overlaps, 3 live sessions (136, 46486, 16139), each with its worktree intact.
+
+---
+
 # Branch consolidation, 2026-10-18 pass 6 (after "commit and merge all changes, delete old and stale branches")
 
 This pass ran locally and pushed nothing. Main went from `732f5311` to `1c4866d2`.
