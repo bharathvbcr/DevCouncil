@@ -168,6 +168,9 @@ impl Resolver {
         if let Some(constructed) = self.swift_constructed_receiver(file, name) {
             return Some(constructed);
         }
+        if let Some(chained) = self.swift_chained_receiver(file, scope, name, binding) {
+            return Some(chained);
+        }
         if let Some((root, field)) = Self::one_hop_field(name) {
             let root_binding = binding.filter(|b| b.name == root);
             let owner = self

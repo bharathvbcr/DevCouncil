@@ -1306,9 +1306,19 @@ impl Resolver {
                 };
                 let types: Vec<_> = candidates
                     .iter()
-                    .filter(|(_, kind, candidate_family, _)| {
+                    .filter(|(path, kind, candidate_family, identity)| {
                         family.admits(*candidate_family)
                             && matches!(kind, SymbolKind::Class | SymbolKind::Struct)
+                            // Swift: a `private`/`fileprivate` type of another
+                            // file is not a type this file can write, so it
+                            // does not make the name ambiguous here.
+                            && (family != LangFamily::Swift
+                                || self.candidate_is_visible_from(
+                                    family,
+                                    &ext.file_path,
+                                    path,
+                                    identity,
+                                ))
                     })
                     .map(|(path, kind, _, _)| (path, kind))
                     .collect();

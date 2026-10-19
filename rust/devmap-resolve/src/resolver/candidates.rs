@@ -138,6 +138,49 @@ impl Resolver {
             && self.rust_crate_src_root(file) == self.rust_crate_src_root(path)
     }
 
+    /// Swift: whether the member `hit` (a `type_methods` entry) of the type
+    /// spelled `type_name` can be reached from `file`.
+    ///
+    /// `type_methods` is keyed by the bare type name, so a `private struct Rng`
+    /// nested in one file and a top-level `Rng` in another share a key. The
+    /// member itself may be `private`, and so may the type that declares it —
+    /// the type declarations named `type_name` in the hit's own file are the
+    /// evidence, because the member's parent identity can lack the nesting
+    /// (`Wrapper.Rng` declares `Rng.next`). A file that declares no type of that
+    /// name (an `extension` of a type declared elsewhere) says nothing about
+    /// the type's visibility, so the member alone decides.
+    pub(super) fn swift_member_hit_is_visible_from(
+        &self,
+        file: &str,
+        hit: &(String, String),
+        type_name: &str,
+    ) -> bool {
+        if !self.candidate_is_visible_from(LangFamily::Swift, file, &hit.0, &hit.1) {
+            return false;
+        }
+        let mut declared = self
+            .symbol_index
+            .get(type_name)
+            .into_iter()
+            .flatten()
+            .filter(|(path, kind, family, _)| {
+                *path == hit.0
+                    && *family == LangFamily::Swift
+                    && matches!(
+                        kind,
+                        SymbolKind::Class
+                            | SymbolKind::Struct
+                            | SymbolKind::Enum
+                            | SymbolKind::Interface
+                    )
+            })
+            .peekable();
+        declared.peek().is_none()
+            || declared.any(|(path, _, _, identity)| {
+                self.candidate_is_visible_from(LangFamily::Swift, file, path, identity)
+            })
+    }
+
     /// Languages whose method is reachable by a bare name only from inside a
     /// type: a Kotlin or Swift function outside every type has no implicit
     /// receiver to dispatch on, so a method namesake is not what it calls.

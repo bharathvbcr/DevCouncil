@@ -312,6 +312,111 @@ impl Resolver {
         declared.then(|| head.to_string())
     }
 
+    /// Swift: `base.padding().badge()` — a receiver that is one method call on a
+    /// receiver this resolver can type is a value of that method's written
+    /// return type.
+    ///
+    /// The method is the one `type_methods` holds under the receiver's type, or
+    /// the one level of its supertypes that declares it once (a protocol
+    /// extension's default included); an overload set, a generic, an optional,
+    /// a collection or a tuple result types nothing, because the written text
+    /// does not say which value reaches the next call. An opaque result
+    /// (`some View`, `any View`) is the protocol it names — a call on it is a
+    /// call through that protocol. The result must be one declared type: a name
+    /// two files declare is a type this resolver cannot dispatch on.
+    pub(super) fn swift_chained_receiver(
+        &self,
+        file: &str,
+        scope: Option<&str>,
+        receiver: &str,
+        binding: Option<&LocalBinding>,
+    ) -> Option<String> {
+        if !file.ends_with(".swift") || !receiver.ends_with(')') {
+            return None;
+        }
+        // The `(` that closes with the final `)`; a string or character literal
+        // in the arguments can hold an unbalanced paren, so none is read.
+        let mut depth = 0usize;
+        let mut open = None;
+        for (index, ch) in receiver.char_indices().rev() {
+            match ch {
+                '"' | '\'' | '\\' => return None,
+                ')' => depth += 1,
+                '(' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        open = Some(index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let head = &receiver[..open?];
+        let (prefix, method) = head.rsplit_once('.')?;
+        if !Self::is_plain_ident(method) || prefix.is_empty() || prefix.ends_with(['?', '!']) {
+            return None;
+        }
+        let root = Self::path_root(prefix);
+        let base = self.receiver_type_for(
+            file,
+            scope,
+            prefix,
+            binding.filter(|binding| binding.name == root),
+        )?;
+        let key = (LangFamily::Swift, base.clone(), method.to_string());
+        let (callee_file, callee) = match self.type_methods.get(&key) {
+            Some(hits) => {
+                let visible: Vec<&(String, String)> = hits
+                    .iter()
+                    .filter(|hit| self.swift_member_hit_is_visible_from(file, hit, &base))
+                    .collect();
+                match visible.as_slice() {
+                    [only] if hits.len() == 1 => (only.0.clone(), only.1.clone()),
+                    _ => return None,
+                }
+            }
+            None => {
+                let (found_file, found, _) =
+                    self.inherited_method(LangFamily::Swift, &base, method)?;
+                (found_file, found)
+            }
+        };
+        let written = self
+            .return_types
+            .get(&(callee_file.clone(), callee.clone()))?;
+        let written = written
+            .trim()
+            .strip_prefix("some ")
+            .or_else(|| written.trim().strip_prefix("any "))
+            .unwrap_or_else(|| written.trim());
+        let mut nominal = Self::admissible_nominal_type(written)?;
+        if nominal == "Self" {
+            nominal = self.declaring_type_of(&callee_file, &callee)?.to_string();
+        }
+        if self.swift_type_aliases.contains(nominal.as_str()) {
+            return None;
+        }
+        let mut declarations: Vec<&(String, SymbolKind, LangFamily, Arc<str>)> = self
+            .symbol_index
+            .get(nominal.as_str())?
+            .iter()
+            .filter(|(path, kind, family, identity)| {
+                *family == LangFamily::Swift
+                    && matches!(
+                        kind,
+                        SymbolKind::Class
+                            | SymbolKind::Struct
+                            | SymbolKind::Enum
+                            | SymbolKind::Interface
+                    )
+                    && self.candidate_is_visible_from(LangFamily::Swift, file, path, identity)
+            })
+            .collect();
+        declarations.dedup_by(|a, b| a.0 == b.0 && a.3 == b.3);
+        (declarations.len() == 1).then_some(nominal)
+    }
+
     /// Swift: the method `type_name` inherits from a supertype it conforms to —
     /// a protocol-extension default or a base class's method — when exactly one
     /// supertype level declares it once. Abstains on every ambiguity, as
@@ -458,6 +563,19 @@ impl Resolver {
         class_type: &str,
         hits: &'a [(String, String)],
     ) -> Option<&'a (String, String)> {
+        // Swift: a `private`/`fileprivate` type, or member, of another file is
+        // not a candidate for a name written here. Two files can each declare
+        // an `Rng` and only the one this file can see is the receiver's type;
+        // a lone hit that this file cannot see is no answer at all.
+        if ext.language == "swift" {
+            let mut visible = hits
+                .iter()
+                .filter(|hit| self.swift_member_hit_is_visible_from(&ext.file_path, hit, class_type));
+            return match (visible.next(), visible.next()) {
+                (Some(only), None) => Some(only),
+                _ => None,
+            };
+        }
         if let [only] = hits {
             return Some(only);
         }

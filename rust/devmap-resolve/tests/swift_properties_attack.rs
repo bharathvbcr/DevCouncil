@@ -136,7 +136,7 @@ fn wrong_an_implicit_self_read_in_a_type_with_a_case_of_that_name_in_another_typ
 // ------------------------------------------------------------- shadowing
 
 #[test]
-#[ignore = "pre-existing Swift residue, ft-915b0a03"]
+#[ignore = "needs extractor change (schema frozen at 97): `let count = self.count` emits no read of the property at all, ft-915b0a03"]
 fn wrong_a_nested_func_and_capture_list_shadow_the_property() {
     let r = one(
         "struct S {\n  var count: Int\n  func nested() -> Int {\n    func inner(count: Int) -> Int { count }\n    return inner(count: 1)\n  }\n  func capture() -> Int {\n    let count = 3\n    let f = { [count] in count + 1 }\n    return f()\n  }\n  func letSelf() -> Int {\n    let count = self.count\n    return count\n  }\n}\n",
@@ -177,7 +177,7 @@ fn wrong_a_shorthand_if_let_and_guard_let_shadow_afterwards() {
 }
 
 #[test]
-#[ignore = "pre-existing Swift residue, ft-915b0a03"]
+#[ignore = "needs extractor change (schema frozen at 97): the read of `count` after a nested `do` block that shadowed it emits no reference, ft-915b0a03"]
 fn wrong_a_local_shadow_ends_with_its_scope() {
     // After the inner block, `count` is the property again.
     let r = one(
@@ -523,7 +523,7 @@ fn recall_a_label_like_name_in_a_tuple_and_a_case_pattern_value_is_a_read() {
 // ------------------------------------------------------------- tuple pattern
 
 #[test]
-#[ignore = "pre-existing Swift residue, ft-915b0a03"]
+#[ignore = "needs extractor change (schema frozen at 97): a tuple-pattern member property emits no symbol, ft-915b0a03"]
 fn recall_tuple_pattern_member_properties_are_symbols() {
     let ex = extract_file(
         "A.swift",
@@ -536,7 +536,7 @@ fn recall_tuple_pattern_member_properties_are_symbols() {
 }
 
 #[test]
-#[ignore = "pre-existing Swift residue, ft-915b0a03"]
+#[ignore = "needs extractor change (schema frozen at 97): a tuple-pattern member property emits no symbol, so the bare name binds the free function, ft-915b0a03"]
 fn wrong_tuple_pattern_member_does_not_poison_the_bare_name_of_a_free_function() {
     // The tuple member is (maybe) not extracted; the bare `a` in `f` must then
     // not bind some unrelated global `a`.
