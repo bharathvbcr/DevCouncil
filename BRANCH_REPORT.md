@@ -1,3 +1,50 @@
+# Branch consolidation, 2026-10-19 pass 10
+
+This pass ran locally and pushed nothing. Main went from `6d32a01e` to `c167b9d8`.
+
+## What landed
+- **pid 136, on its own:**
+  - `7e110127` merged lane/resolution-rate-honesty at 16:33.
+  - `ec034f60` merged lane/py-relative-imports at 16:53, with its own bare-dots fix (`30a7143c`). That landing marked the namespace-submodule probe `#[ignore]` as a follow-up.
+- **This session:** `c167b9d8`, a linear follow-up on top of `ec034f60`:
+  - `from .x import m` through a namespace package now resolves to `x/m.py`, so that probe is no longer ignored;
+  - the binding-level join no longer climbs (`.` + `b` was built as `..b`), and `python_submodule_spec` now owns that join;
+  - a new decoy probe fails with the old join;
+  - an absence-only probe now also asserts its positive target;
+  - rustfmt on the lane's two files.
+
+  My first version (`c9abc376`, `ec191bba` on fix/py-relative-imports-probes) also fixed bare dots. pid 136 landed the same logic first, so only the parts main lacked were carried over.
+
+## Verification
+- On main + `c167b9d8`: rustfmt clean on the touched files.
+  - devmap-resolve: **1414 passed / 0 failed**.
+  - accuracy_fixtures 12/12, real_corpus_accuracy 89/89.
+  - devmap-cli dead_tier_eligibility + record_names_no_private_identity 29/29.
+- An adversarial Opus check found no wrong edge. It asked for the decoy probe, which is now added. Two low notes remain open:
+  - a regular package's `from . import b` still produces an edge only to `__init__.py`;
+  - an unindexed `x.so`/`x.pyx` beside `x/` reads as a namespace package.
+- `git fsck --connectivity-only`: clean.
+- `gitpulse_insights` at 17:10 was deferred on every git facet under load. Sessions and worktrees came from `git worktree list` and `lsof`.
+
+## Deleted
+- Worktrees: my scratch `tmp/merge-pr` and `tmp/fix-pr`, and the idle `agent-aa9a2524` (attack/py-relative-imports, cherry all `−`). Its ignored files are archived in `tmp/wt-archive/`.
+- Branch: `merge/py-relative-imports-2026-10-19` (`-d`, merged).
+
+## Needs the owner's `-D` (blast-radius timed out on `-D` earlier today)
+Both are backed up in `refs/backup/2026-10-19-pass10/` and the pass10 bundle.
+- **attack/py-relative-imports** (`720f1937`): both commits are patch-equivalent on main (`fbb6103f`, `e2c0cc1f`).
+- **fix/py-relative-imports-probes** (`ec191bba`): superseded. Its content is on main through `30a7143c` and `c167b9d8`, apart from the wording of one comment.
+
+## Kept
+- **pid 136's next wave:** lane/py-receiver-residue, lane/swift-resolver-residue.
+- **lane/py-relative-imports:** merged, but pid 136 has a process in its worktree.
+- **The resolution-rate lane and its attack branch:** the worktrees are locked and a process is running.
+- **Also kept:** the 7 older locked worktrees, integration/wave7, and claude/literals-substring-b3546e.
+
+Main stays unpushed until the schema-10 consumer sweep (pass 8).
+
+---
+
 # Branch consolidation, 2026-10-19 pass 9
 
 Nothing was merged, committed or deleted by this pass apart from this report. Main is `690ca2dd`: another session landed `testsupport: end cargoBin's waits before the test's own deadline` and removed its own `fix/testsupport-test-deadline` worktree and branch.
