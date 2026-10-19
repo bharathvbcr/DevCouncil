@@ -1,3 +1,71 @@
+# Branch consolidation, 2026-10-18 pass 6 (after "commit and merge all changes, delete old and stale branches")
+
+This pass ran locally and pushed nothing. Main went from `732f5311` to `1c4866d2`.
+
+## Committed
+- `76d9c680` docs: the 11 untracked audit, branch and build reports in the main checkout. A scan for credential shapes found none.
+- Nothing else was dirty that could be committed:
+  - the only other dirty tree is `agent-ac9f…/tmp/base`, a detached scratch worktree;
+  - its 7 files are attack3 probes that match main blob for blob, plus 2 untracked scratch probes;
+  - it has no branch, so it was left alone.
+
+## Merged
+| Branch | Merge commit | Conflicts | Review | Verification |
+|---|---|---|---|---|
+| accuracy/rustlabel (`b0d060c2`) | `1c4866d2` (`--no-ff`, built on a staging worktree, then main fast-forwarded) | none in text. One semantic fix: `Cargo.lock` entry `devmap-rustlabel` 0.2.4 → 0.2.5 (main's workspace version), because the auto-merged lock failed `--locked` | Opus deep review: **merge with follow-ups**, no blocker. No new third-party dependency, `publish`/`dist` false, existing `lsp.rs` callers unchanged | `fmt --check` ok. Tests: devmap-rustlabel + devmap-resolve **1510 pass / 0 fail**; `real_corpus_accuracy` **89 / 0**. Clippy: 0 lints in `tools/rustlabel` or `lsp.rs` |
+
+- **Clippy `-D warnings` is red on main's own drift,** in files this merge does not touch:
+  - `devmap-extract/src/treesitter/bindings.rs:255` (type_complexity, from the split commit `0ce3b70a`);
+  - `devmap-resolve/src/resolver.rs:436` and `:571` (type_complexity);
+  - `devmap-resolve/src/resolver/pytypes.rs:1049` (question_mark).
+
+  All four are pid 136's wave code, so I left them for that session to fix.
+- **Not run:** full `ci:local` (its Go/npm/workflow steps need the sibling gusset layout, and load was 60–110), and the `#[ignore]`d rustlabel golden test (needs rust-analyzer).
+- **Review follow-ups** were folded into ft-b812a97c (rev 5, stays in review):
+  - partial runs exit 0 without saying so;
+  - the golden test runs nowhere in CI;
+  - `namer.rs` `target_at` does not check the symbol's name;
+  - two README corrections.
+- **Not merged: `lane/build-relative-root` + `attack/relative-root`.** pid 136's attack round on it is still running, and your rule says no merge before the attack round closes.
+
+## Deleted
+Every branch below has a ref under `refs/backup/2026-10-18-pass6/` and is in `/Users/bharath/Code/devtools/DevCouncil-branches-2026-10-18-pass6.bundle` (66 branches, verified).
+- **Deleted with `-d` (merged), worktree removed:** lane/deps-outbound, lane/verdict-generation-pin, lane/py-residue, attack2/freshness-close, lane/py-attack3-fixes, lane/traverse-freshness, lane/swift-properties, lane/search-partial-parse, lane/go-qualifier-leak, lane/go-type-use-dead, accuracy/rustlabel, merge/rustlabel-2026-10-18 (staging).
+- **Deleted with `-d`:** 20 `worktree-agent-<id>` harness pointers whose worktrees were gone. 6 remain, for live worktrees.
+- **Worktrees removed:** 24. Each was unlocked, tracked-clean, had no process cwd inside and no nested worktree.
+  - Every removal used `git worktree remove` without `--force`.
+  - Ignored non-build content (`tmp/`, logs) was archived first to the main checkout's `tmp/wt-archive/<agent-id>.tgz`.
+  - Target directories and `.devcouncil/` indexes were not archived; both can be rebuilt.
+  - The only accuracy labels found outside tracked source (`tmp/dump-*/go.labels.json`) are in a5de, which is locked and kept.
+
+## Held: needs your approval
+The `blast-radius` mod held `git branch -D` twice and timed out with no answer, so these 16 proven-superseded branches still exist. Their worktrees are already removed.
+- attack5/py-close, attack/deps-outbound, attack/py-residue, attack/corpus-refusals, attack/verdict-pin, attack2/swift-close, attack/go-type-use, attack2/search-partial-close, attack/search-partial, attack2/py-residue-close, attack/go-qualifier, attack/traverse-freshness, attack2/deps-close
+- attack5/base-run, attack/base-timing (no worktree)
+- attack2/timing-base, a scratch probe not on main; the 5-line difference is recorded in pass 5
+
+To delete them, run `git branch -D` with that list, or approve the prompt.
+
+## Kept
+- **pid 136's locked worktrees,** with their branches: lane/split-resolver-treesitter (merged), attack/swift-properties, attack4/py-wave8, lane/corpus-runner-refusals (merged), attack/mcp-status, lane/mcp-status-degraded (merged).
+- **The live wave:** lane/build-relative-root, attack/relative-root, integration/wave7.
+- **attack3/py-followup:** its worktree holds a nested dirty scratch worktree.
+- **claude/literals-substring-b3546e:** live session pid 16139 is in it.
+- **finish/workbench, lane/workbench:** your decision; a cross-app schema change.
+- **`tmp/rrm`:** a detached worktree another session made.
+
+## Verification
+- `git fsck --connectivity-only` exited 0 with no output.
+- The final `gitpulse_insights` returned every facet `ok`: 13 worktrees scanned, 0 overlapping files, 3 live sessions (136 and 46486 in the main checkout, 16139). Every live session's worktree and branch is intact.
+
+## Restore
+```sh
+git branch <name> refs/backup/2026-10-18-pass6/<name>
+git worktree add .claude/worktrees/<agent-id> <name>   # then: tar -xzf tmp/wt-archive/<agent-id>.tgz -C .claude/worktrees/<agent-id>
+```
+
+---
+
 # Branch consolidation, 2026-10-18 pass 5
 
 This pass ran locally and pushed nothing. **This session merged no branches, deleted no branches, removed no worktrees and committed nothing.** It made only two kinds of change: backup refs and a bundle.
