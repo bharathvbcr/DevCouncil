@@ -189,6 +189,10 @@ fn dot_only_with_init_present_never_adds_the_beside_file() {
     ]);
     let t = targets(&r, "pkg/a.py");
     assert!(!t.contains(&"pkg.py".to_string()), "{t:?}");
+    assert!(
+        t.contains(&"pkg/__init__.py".to_string()),
+        "the package itself is the target: {t:?}"
+    );
 }
 
 #[test]
@@ -406,4 +410,27 @@ fn dump_import_edges() {
     lines.sort();
     lines.dedup();
     std::fs::write(out, lines.join("\n")).unwrap();
+}
+
+// ---- 5. bindings through a bare-dots submodule import --------------------
+
+#[test]
+fn bare_dot_submodule_binding_never_climbs_to_a_parent_namesake() {
+    // `from . import b` in pkg/a.py names pkg/b.py. The binding probe built
+    // `..b` for it, which climbs a package and bound the decoy b.py instead.
+    let r = resolve(&[
+        ("pkg/__init__.py", ""),
+        ("pkg/a.py", "from . import b\n\ndef g():\n    b.f()\n"),
+        ("pkg/b.py", "def f():\n    pass\n"),
+        ("b.py", "def f():\n    pass\n"),
+    ]);
+    let mut called: Vec<String> = r
+        .edges
+        .iter()
+        .filter(|e| e.edge_kind == EdgeKind::Calls && e.source_file == "pkg/a.py")
+        .map(|e| e.target_file.clone())
+        .collect();
+    called.sort();
+    called.dedup();
+    assert_eq!(called, vec!["pkg/b.py".to_string()], "{called:?}");
 }

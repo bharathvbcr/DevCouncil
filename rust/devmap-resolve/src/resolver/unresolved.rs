@@ -630,7 +630,7 @@ impl Resolver {
             && imported_name != "*"
             && module_specifier.chars().all(|character| character == '.')
         {
-            format!("{module_specifier}{imported_name}")
+            Self::python_submodule_spec(module_specifier, imported_name)
         } else {
             module_specifier.to_string()
         }
