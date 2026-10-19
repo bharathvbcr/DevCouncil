@@ -143,13 +143,18 @@ impl Cli {
             | Commands::Manifest(commands::manifest::Args { path, .. })
             | Commands::MapHtml(commands::map_html::Args { path, .. })
             | Commands::Freshness(commands::freshness::Args { path, .. })
-            | Commands::Serve(commands::serve::Args { path, .. })
             | Commands::Html(commands::html::Args { path, .. })
             | Commands::Export(commands::export::Args { path, .. })
             | Commands::Routes(commands::routes::Args { path, .. })
             | Commands::ShapeCheck(commands::shape_check::Args { path, .. })
             | Commands::ApiImpact(commands::api_impact::Args { path, .. })
             | Commands::Paths(commands::paths::Args { path }) => path.clone(),
+            // The positional is optional here so `run` can tell a spelled path
+            // from the default and refuse one that names another repository
+            // than `--root`.
+            Commands::Serve(commands::serve::Args { path, .. }) => {
+                path.clone().unwrap_or_else(default_root_hint)
+            }
             // Hook templates retain project-relative paths for the host that
             // will execute them; they are not a query against this checkout.
             Commands::Claude(_) | Commands::Skills(_) | Commands::Hook(_) => PathBuf::from("."),
@@ -192,11 +197,38 @@ pub(crate) fn root_parser() -> impl clap::builder::TypedValueParser<Value = Path
     use clap::builder::TypedValueParser as _;
     clap::builder::OsStringValueParser::new().map(|raw| {
         let path = PathBuf::from(raw);
-        if path.is_absolute() {
-            return path;
-        }
-        std::path::absolute(&path).unwrap_or(path)
+        let anchored = if path.is_absolute() {
+            path
+        } else {
+            match std::path::absolute(&path) {
+                Ok(absolute) => absolute,
+                Err(_) => return path,
+            }
+        };
+        lexically_clean(&anchored)
     })
+}
+
+/// Drops `.` and folds `..` into the component before it, without touching the
+/// filesystem, so `x/../x` and `x` yield one `db_path`. A `..` at the root stays
+/// at the root, as the OS resolves it.
+fn lexically_clean(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => out.push(".."),
+            },
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Omitted roots agree with rootless queries. An explicit `.` still scopes a
