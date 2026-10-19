@@ -333,15 +333,29 @@ impl Resolver {
             return None;
         }
         let typed = reference.assigned_to.as_deref()?;
-        reference
-            .enclosing_symbol
-            .as_deref()
-            .and_then(|scope| {
-                self.declared_types
-                    .get(&format!("{file}:{scope}:{typed}@mod"))
-            })
-            .or_else(|| self.declared_types.get(&format!("{file}:{typed}@mod")))
-            .map(String::as_str)
+        self.qualifier_declared_in(file, reference.enclosing_symbol.as_deref(), typed)
+    }
+
+    /// The `@mod` slot for `typed` as written in `scope`.
+    ///
+    /// A binding written inside a scope is read from that scope's slot alone.
+    /// The annotation and its `TypeQualifier` sibling share an enclosing symbol,
+    /// so a qualified type is always in its own scope's slot; a miss there
+    /// means the binding is bare. Falling back to the file-wide slot on a miss
+    /// let `params json.RawMessage` in one function qualify a bare
+    /// `var params t` in another. The file-wide slot answers only for a
+    /// reference with no enclosing scope (empty `scope` counts as none).
+    pub(super) fn qualifier_declared_in(
+        &self,
+        file: &str,
+        scope: Option<&str>,
+        typed: &str,
+    ) -> Option<&str> {
+        let key = match scope.filter(|scope| !scope.is_empty()) {
+            Some(scope) => format!("{file}:{scope}:{typed}@mod"),
+            None => format!("{file}:{typed}@mod"),
+        };
+        self.declared_types.get(&key).map(String::as_str)
     }
 
     /// X46. The type `Self` names in a Rust type annotation, or `None` where

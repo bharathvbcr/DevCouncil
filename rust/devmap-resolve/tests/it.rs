@@ -54,6 +54,10 @@ mod go_own_package_receiver;
 #[cfg(feature = "parse")]
 mod go_package_scope;
 #[cfg(feature = "parse")]
+mod go_qualifier_scope;
+#[cfg(feature = "parse")]
+mod qualifier_scope_other_families;
+#[cfg(feature = "parse")]
 mod go_unexported_selector;
 #[cfg(feature = "parse")]
 mod host_global_objects;
