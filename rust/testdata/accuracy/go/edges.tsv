@@ -76,3 +76,5 @@ go.Q4	Q4	app/svc/probes2.go::cache.delete	app/svc/probes2.go::cache.delete	forbi
 go.Q5	Q5	app/svc/probes2.go::writer.clear	app/svc/probes2.go::Buffer.Reset	forbid	must		bytes.Buffer is external: no HIGH edge to the in-repo namesake Buffer.Reset
 go.Q2c.twin	Q2c	app/svc/probes2.go::twinLocalTypeUser	app/svc/probes2.go::shadowedLocalTypeUser.entry	forbid_any_tier	must		a function-local type is scoped to its function: twinLocalTypeUser's entry{} is its own, never the other function's entry
 go.Q2c.shadowed	Q2c	app/svc/probes2.go::shadowedLocalTypeUser	app/svc/probes2.go::twinLocalTypeUser.entry	forbid_any_tier	must		a function-local type is scoped to its function: shadowedLocalTypeUser's entry{} is its own, never the twin's entry
+go.Q6.bare	Q6	app/svc/probes3.go::bareRawUser	app/svc/probes3.go::RawMessage	edge	must		var params RawMessage is a bare in-repo type; budgetOf's json.RawMessage param must not qualify it
+go.Q6.qualified	Q6	app/svc/probes3.go::budgetOf	app/svc/probes3.go::RawMessage	forbid_any_tier	must		json.RawMessage is external: no edge to the in-repo namesake RawMessage
