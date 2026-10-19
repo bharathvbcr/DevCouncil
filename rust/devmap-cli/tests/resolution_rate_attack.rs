@@ -69,7 +69,7 @@ fn p2_printed_totals_reproduce_the_printed_headline() {
         "p2",
         &[("lib.py", PY), ("vendor/dep.py", &misses(30)), ("index.html", "<a href=\"x.html\">x</a>\n")],
     );
-    let text = run(&root, &["build", "."]);
+    let text = run(&root, &["--verbose", "build", "."]);
     let line = headline(&text);
     eprintln!("{text}");
     // "  Resolution rate: N.M% net, G.H% gross (R resolved / U unresolved, E explained)"
@@ -103,7 +103,7 @@ fn p5_all_excluded_prints_no_nan_and_no_percent() {
         "p5",
         &[("vendor/dep.py", &misses(5)), ("index.html", "<a href=\"x.html\">x</a>\n")],
     );
-    let text = run(&root, &["build", "."]);
+    let text = run(&root, &["--verbose", "build", "."]);
     eprintln!("{text}");
     let line = headline(&text);
     assert!(!line.contains("NaN"), "{line}");
@@ -115,7 +115,7 @@ fn p5_all_excluded_prints_no_nan_and_no_percent() {
 #[test]
 fn p5_zero_resolved_prints_zero_percent() {
     let root = fixture("p5z", &[("a.py", &misses(3))]);
-    let text = run(&root, &["build", "."]);
+    let text = run(&root, &["--verbose", "build", "."]);
     eprintln!("{text}");
     let line = headline(&text);
     assert!(line.contains("0.0% net"), "{line}");
