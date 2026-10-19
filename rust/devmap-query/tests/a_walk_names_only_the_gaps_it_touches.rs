@@ -320,3 +320,90 @@ fn an_inconsistent_breakdown_falls_back_to_the_repository_wide_sentence() {
     let reason = impact.walk_incomplete.expect("coverage is unknown");
     assert!(reason.contains("unavailable or inconsistent"), "{reason}");
 }
+
+fn refused(path: &str, body: &str) -> devmap_extract::model::Extraction {
+    let ext = devmap_extract::extract_file_with_budget(path, body, std::time::Duration::ZERO);
+    assert!(ext.is_budget_refusal());
+    ext
+}
+
+fn store_refused(files: &[(&str, &str)], refused_files: &[(&str, &str)]) -> Store {
+    let mut extractions: Vec<_> = files.iter().map(|(p, b)| extract_file(p, b)).collect();
+    extractions.extend(refused_files.iter().map(|(p, b)| refused(p, b)));
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
+    let analysis = devmap_analyze::analyze(&extractions, &resolution);
+    let store = Store::open_in_memory().unwrap();
+    store
+        .save_generation_with_opts(
+            &extractions,
+            &resolution,
+            &analysis,
+            GenerationWriteOpts::default(),
+        )
+        .unwrap();
+    store
+}
+
+/// A file refused for the parse budget has no symbols, calls or imports, so it
+/// has no edge a walk's radius could contain: its calls could land anywhere. The
+/// honest bound is therefore corpus-wide, and every walk (inside or outside any
+/// notional radius) says so. What this pins is that the sentence now tells a
+/// load refusal from a grammar failure.
+#[test]
+fn every_walk_over_a_corpus_with_a_budget_refused_file_says_budget_refused() {
+    let store = store_refused(
+        &[("app.py", APP)],
+        &[("slow.py", "def slow():\n    return 1\n")],
+    );
+    let engine = StoreQueryEngine::new(&store);
+    let impact = engine.impact(request("app.py::top", 3)).unwrap();
+    let trace = engine.trace(request("app.py::top", 3)).unwrap();
+    let affected = engine
+        .affected_tests(&["app.py::top".to_string()], 20_000, 0.0, 3)
+        .unwrap();
+    let explore = engine.explore("top", 5, 20_000, 0.0, 3).unwrap();
+    let reasons = [
+        ("impact", impact.walk_incomplete),
+        ("trace", trace.walk_incomplete),
+        ("affected tests", affected.tests.walk_incomplete),
+        (
+            "affected radius",
+            affected.blast_radius.layers.walk_incomplete,
+        ),
+        (
+            "explore radius",
+            explore.blast_radius.layers.walk_incomplete,
+        ),
+    ];
+    for (surface, reason) in reasons {
+        let reason = reason.unwrap_or_else(|| panic!("{surface} answered clean over a hole"));
+        assert!(
+            reason.contains("1 file(s) failed to parse"),
+            "{surface}: {reason}"
+        );
+        assert!(reason.contains("budget-refused"), "{surface}: {reason}");
+    }
+}
+
+#[test]
+fn the_same_walks_without_the_refusal_stay_clean() {
+    let store = store_with(
+        &[("app.py", APP), ("slow.py", "def slow():\n    return 1\n")],
+        |_| {},
+    );
+    let engine = StoreQueryEngine::new(&store);
+    assert_eq!(
+        engine
+            .impact(request("app.py::top", 3))
+            .unwrap()
+            .walk_incomplete,
+        None
+    );
+    let affected = engine
+        .affected_tests(&["app.py::top".to_string()], 20_000, 0.0, 3)
+        .unwrap();
+    assert_eq!(affected.tests.walk_incomplete, None);
+    assert_eq!(affected.blast_radius.layers.walk_incomplete, None);
+}

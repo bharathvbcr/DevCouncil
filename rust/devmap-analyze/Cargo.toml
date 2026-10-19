@@ -222,3 +222,11 @@ required-features = ["parse"]
 [[test]]
 name = "go_type_use_attack"
 required-features = ["parse"]
+
+[[test]]
+name = "a_budget_refused_file_caps_the_dead_answer"
+required-features = ["parse"]
+
+[[test]]
+name = "budget_refusal_attack"
+required-features = ["parse"]
