@@ -1,3 +1,47 @@
+# Branch consolidation, 2026-10-19 pass 8: the workbench landing
+
+This pass ran locally and pushed nothing. Main went from `e93dab27` to `fcd619eb`. **Main must not be pushed until the cross-app sweep below is done.**
+
+## Merged
+| Commit | What | Review / verification |
+|---|---|---|
+| `05bdec0b` | `--no-ff` merge of finish/workbench (d74379fb, contains lane/workbench): dc-store schema 9→10, workbench 13→14; legacy `tasks` retired into `work_items` (ft-aeb4a53f) | No text conflicts. Opus review: land with fixes (2 blocking, 1 high) |
+| `cb26c53e` | Semantic merge fixes (below) | Opus re-review: land. `cargo test -p dc-store` all pass. Go vet ok; every package ok except gate's wall-clock test, which also fails on main |
+| `fcd619eb` | ft-4966b304 (a missing task exits 1, `ok:false`), the `schema.rs` comment, consumer fixtures at 10/14 | New test failed before the fix (`moved=false err=<nil>`); 5 affected packages pass |
+
+## Conflicts resolved, and why
+None of these were text conflicts. Each one is main's newer code or guard against the branch's older assumptions.
+1. **Main's `retired_tables` test** expected version 9 and inserted into `tasks`. It now expects `SCHEMA_VERSION` and builds a real v9 store with the legacy DDL (shared as `support::LEGACY_TASKS`). It asserts the row became a `work_items` item.
+2. **The retirement and the schema-10 stamp were two separate commits.** A failed stamp would have left a v9 store with no `tasks` table, and an older reader would then answer "no ready tasks". Both now commit in one transaction (`schema::bring_current` inside `retire`). The new test `a_failed_stamp_leaves_the_legacy_table_and_its_version_as_found` injects the failure.
+3. **The branch upgraded the workbench profile on every open,** which breaks main's upgrade-only-on-write rule (b4c66198). An empty legacy table now just gets dropped. The empty-table test asserts no `work_items`; it fails on the unfixed merge.
+4. **Main's unbounded-child-output guard** rejected the branch's `CombinedOutput()` calls in testsupport. `runDCStore` now uses `proc.RunBounded` with a `CappedBuffer`.
+5. **Main's contract checksum and citation tests:** `lease.schema.md` now matches the code; CHECKSUMS is updated, and the citation reads `GitPulse/scripts/vendor-crates.mjs`.
+6. **The branch weakened main's cold-start race test.** It is restored to distinct-task acquires, each creating its task on a database nobody has created yet.
+
+## Deleted
+`finish/workbench` (d74379fb), `lane/workbench` (d88688b5), and the staging branches `merge/workbench-2026-10-19` and `fix/workbench-followups`. All were merged first. The first two are backed up under `refs/backup/2026-10-19-pass7/`.
+
+## Kept
+- pid 136's new wave: lane/py-relative-imports, lane/resolution-rate-honesty, attack/resolution-rate.
+- Its 7 locked worktrees, and integration/wave7.
+- claude/literals-substring-b3546e (pid 16139).
+- Uncommitted edits by another live session in the main checkout, which I did not touch: `testsupport/buildlock_*.go`, `testsupport.go`, `cargobin_unix_test.go`.
+
+## Cross-app sweep: needed before main is pushed
+- **GitPulse** (vendored dc-store at 9/13):
+  - Run `node scripts/vendor-crates.mjs`, then `bun run check:vendor-schema`.
+  - Port about 18 test-only `INSERT INTO tasks` sites to `items.put`.
+  - Rebuild the app and gitpulse-mcp, then run `bun run mcp:doctor`.
+- **Manvi:** `scripts/module-pins.txt` pins DevCouncil at `1ae3bc15`. Bumping it needs your approval.
+- **Jarvis:** `upstream.lock.json` pins DevCouncil at `1ae3bc15`. Bump it together with the manvi and gusset rows; needs your approval. Then run `dev check-pins`.
+- **Finally:** `bun run check:schema-parity` from GitPulse, `devmap --version`, and `manvi doctor`.
+
+## Not run
+- Full `ci:local`.
+- Linux and Windows.
+
+---
+
 # Branch consolidation, 2026-10-19 pass 7
 
 This pass ran locally and pushed nothing. Main stays at `9558b8a1`; pid 136 landed the overnight wave itself, the last merge at 01:45.
