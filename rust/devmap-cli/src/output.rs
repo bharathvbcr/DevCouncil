@@ -23,6 +23,10 @@ pub(crate) fn open_for_read(cli: &Cli) -> anyhow::Result<Store> {
 }
 
 pub(crate) fn ensure_parent(path: &std::path::Path) -> anyhow::Result<()> {
+    // Refuses a linked ancestor before anything is created: `create_dir_all`
+    // follows links, so a build the store was about to refuse still left an
+    // empty state directory inside the link's target.
+    devmap_extract::safe_fs::preflight_write(path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

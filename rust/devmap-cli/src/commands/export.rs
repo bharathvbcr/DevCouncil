@@ -3,14 +3,14 @@ use std::path::PathBuf;
 use devmap_query::{resolved_edge_from_stored, FreshnessInfo, StampedFreshness};
 use devmap_store::Store;
 
-use crate::cli::{default_root_hint, Cli};
+use crate::cli::{default_root_hint, root_parser, Cli};
 use crate::output::{emit_json, open_for_read};
 use crate::write_stdout;
 
 #[derive(clap::Args)]
 #[group(id = "Export")]
 pub(crate) struct Args {
-    #[arg(default_value_os_t = default_root_hint())]
+    #[arg(default_value_os_t = default_root_hint(), value_parser = root_parser())]
     pub(crate) path: PathBuf,
     /// Where to write. Defaults to `<state dir>/graph.graphml`; `-` is stdout.
     #[arg(short, long)]

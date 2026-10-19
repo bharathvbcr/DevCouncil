@@ -1,12 +1,12 @@
 use std::path::PathBuf;
 
-use crate::cli::{default_root_hint, Cli};
+use crate::cli::{default_root_hint, root_parser, Cli};
 
 #[derive(clap::Args)]
 #[group(id = "MapHtml")]
 pub(crate) struct Args {
     /// Repository root; `--input` and `--output` resolve against it.
-    #[arg(default_value_os_t = default_root_hint())]
+    #[arg(default_value_os_t = default_root_hint(), value_parser = root_parser())]
     pub(crate) path: PathBuf,
     /// The repo map to render. Defaults to the resolved state directory.
     #[arg(long)]

@@ -3,14 +3,14 @@ use std::path::PathBuf;
 use devmap_serve::{default_ipc_path_for, Daemon};
 use devmap_store::Store;
 
-use crate::cli::{default_root_hint, Cli};
+use crate::cli::{root_parser, Cli};
 use crate::output::{emit_json, ensure_parent};
 
 #[derive(clap::Args)]
 #[group(id = "Serve")]
 pub(crate) struct Args {
-    #[arg(default_value_os_t = default_root_hint())]
-    pub(crate) path: PathBuf,
+    #[arg(value_parser = root_parser())]
+    pub(crate) path: Option<PathBuf>,
     #[arg(long)]
     pub(crate) socket: Option<PathBuf>,
     /// Print the IPC endpoint this repository would be served on and exit,
@@ -39,7 +39,22 @@ pub(crate) async fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     //
     // `default_ipc_path_for` canonicalizes too, so the two agree; this
     // one is what the daemon is *rooted* at.
-    let root = path.canonicalize()?;
+    if let (Some(flag), Some(positional)) = (&cli.root, path) {
+        let same = flag == positional
+            || matches!(
+                (flag.canonicalize(), positional.canonicalize()),
+                (Ok(a), Ok(b)) if a == b
+            );
+        if !same {
+            anyhow::bail!(
+                "--root {} and the serve path {} name different repositories; the store comes \
+                 from --root and the endpoint from the path. Pass one of them",
+                flag.display(),
+                positional.display()
+            );
+        }
+    }
+    let root = cli.root_hint().canonicalize()?;
     let ipc_path = socket
         .clone()
         .unwrap_or_else(|| default_ipc_path_for(&root));

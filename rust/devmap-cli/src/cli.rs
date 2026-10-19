@@ -105,7 +105,7 @@ pub(crate) struct Cli {
     /// state directory a repository uses is a property of the repository.
     ///
     /// `--db` still wins where both are given: it names a store outright.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, value_parser = root_parser())]
     pub(crate) root: Option<PathBuf>,
 
     /// Machine-readable output. Global; see `--db`.
@@ -143,13 +143,18 @@ impl Cli {
             | Commands::Manifest(commands::manifest::Args { path, .. })
             | Commands::MapHtml(commands::map_html::Args { path, .. })
             | Commands::Freshness(commands::freshness::Args { path, .. })
-            | Commands::Serve(commands::serve::Args { path, .. })
             | Commands::Html(commands::html::Args { path, .. })
             | Commands::Export(commands::export::Args { path, .. })
             | Commands::Routes(commands::routes::Args { path, .. })
             | Commands::ShapeCheck(commands::shape_check::Args { path, .. })
             | Commands::ApiImpact(commands::api_impact::Args { path, .. })
             | Commands::Paths(commands::paths::Args { path }) => path.clone(),
+            // The positional is optional here so `run` can tell a spelled path
+            // from the default and refuse one that names another repository
+            // than `--root`.
+            Commands::Serve(commands::serve::Args { path, .. }) => {
+                path.clone().unwrap_or_else(default_root_hint)
+            }
             // Hook templates retain project-relative paths for the host that
             // will execute them; they are not a query against this checkout.
             Commands::Claude(_) | Commands::Skills(_) | Commands::Hook(_) => PathBuf::from("."),
@@ -174,6 +179,56 @@ impl Cli {
             None => devmap_extract::paths::store_path(self.root_hint()),
         }
     }
+}
+
+/// Parses a repository-root argument into the one absolute form every later
+/// path is derived from.
+///
+/// A relative root used to travel as spelled: the state directory derived from
+/// it (`tmp/rel/.devmap/...`) was already cwd-relative, and the manifest writer
+/// then joined that onto the store's absolute repo root again, so
+/// `devmap build --manifest tmp/rel` wrote `tmp/rel/tmp/rel/.devmap/`. Anchoring
+/// it to the working directory once, at the boundary, leaves nothing downstream
+/// to join twice. Symlinks are deliberately not resolved (`/tmp` and `/var` are
+/// links on macOS, and callers compare against the path they spelled); an
+/// absolute root is returned untouched, and a missing one stays missing so
+/// `validate_root` reports it.
+pub(crate) fn root_parser() -> impl clap::builder::TypedValueParser<Value = PathBuf> {
+    use clap::builder::TypedValueParser as _;
+    clap::builder::OsStringValueParser::new().map(|raw| {
+        let path = PathBuf::from(raw);
+        let anchored = if path.is_absolute() {
+            path
+        } else {
+            match std::path::absolute(&path) {
+                Ok(absolute) => absolute,
+                Err(_) => return path,
+            }
+        };
+        lexically_clean(&anchored)
+    })
+}
+
+/// Drops `.` and folds `..` into the component before it, without touching the
+/// filesystem, so `x/../x` and `x` yield one `db_path`. A `..` at the root stays
+/// at the root, as the OS resolves it.
+fn lexically_clean(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => out.push(".."),
+            },
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Omitted roots agree with rootless queries. An explicit `.` still scopes a
