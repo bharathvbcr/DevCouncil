@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -30,6 +29,7 @@ func client(t *testing.T) *Client {
 
 func TestAcquireReleaseRoundTrip(t *testing.T) {
 	c := client(t)
+	seedTask(t, c, "TASK-001")
 	ctx := context.Background()
 
 	lease, err := c.Acquire(ctx, AcquireRequest{TaskID: "TASK-001", Owner: "builder-1", TTL: 15 * time.Minute})
@@ -61,6 +61,7 @@ func TestAcquireReleaseRoundTrip(t *testing.T) {
 // is the reason the store exists.
 func TestTwoBuildersRacingOneTaskProduceExactlyOneHolder(t *testing.T) {
 	c := client(t)
+	seedTask(t, c, "TASK-001")
 	ctx := context.Background()
 
 	first, err := c.Acquire(ctx, AcquireRequest{TaskID: "TASK-001", Owner: "builder-1", TTL: time.Minute})
@@ -92,6 +93,7 @@ func TestTwoBuildersRacingOneTaskProduceExactlyOneHolder(t *testing.T) {
 
 func TestDiagnoseDistinguishesTheFailureModes(t *testing.T) {
 	c := client(t)
+	seedTask(t, c, "TASK-001")
 	ctx := context.Background()
 
 	lease, err := c.Acquire(ctx, AcquireRequest{TaskID: "TASK-001", Owner: "builder-1", TTL: time.Minute})
@@ -120,6 +122,7 @@ func TestDiagnoseDistinguishesTheFailureModes(t *testing.T) {
 
 func TestRenewExtendsAndReportsExpiry(t *testing.T) {
 	c := client(t)
+	seedTask(t, c, "TASK-001")
 	ctx := context.Background()
 
 	lease, err := c.Acquire(ctx, AcquireRequest{TaskID: "TASK-001", Owner: "b1", TTL: time.Minute})
@@ -191,6 +194,7 @@ func TestMisconfigurationIsNamed(t *testing.T) {
 // the codes Go branches on are the strings Rust emits.
 func TestGoAndRustAgreeOnTheLeaseVocabulary(t *testing.T) {
 	c := client(t)
+	seedTask(t, c, "T1")
 	ctx := context.Background()
 
 	lease, err := c.Acquire(ctx, AcquireRequest{TaskID: "T1", Owner: "o", TTL: time.Minute})
@@ -214,6 +218,9 @@ func TestGoAndRustAgreeOnTheLeaseVocabulary(t *testing.T) {
 // binary across shared and distinct tasks simultaneously.
 func TestConcurrentStressUnderHighLoad(t *testing.T) {
 	c := client(t)
+	for i := 0; i < 4; i++ {
+		seedTask(t, c, fmt.Sprintf("TASK-CONC-%d", i))
+	}
 	ctx := context.Background()
 
 	const workers = 16
@@ -267,7 +274,7 @@ func TestConcurrentStressUnderHighLoad(t *testing.T) {
 // TestAvailableNeverManufacturesTheStoreItChecks.
 //
 // health used to open the path with SQLite's default flags, so a mistyped --db
-// was answered by a database this very call created: ok, schema 9, zero active
+// was answered by a database this very call created: ok, schema 10, zero active
 // leases, from a private file nobody else was using. Two harnesses configured
 // with two spellings of one path therefore shared no exclusion at all while
 // both reported healthy — which is the precise thing Available's contract says
@@ -308,7 +315,7 @@ func TestAvailableNeverManufacturesTheStoreItChecks(t *testing.T) {
 func TestAvailableRequiresTheExclusionIndexAssertion(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "old-store.sh")
-	body := "#!/bin/sh\necho '{\"ok\":true,\"store\":\"dc-store\",\"schema_version\":9,\"active_leases\":0}'\n"
+	body := "#!/bin/sh\necho '{\"ok\":true,\"store\":\"dc-store\",\"schema_version\":10,\"active_leases\":0}'\n"
 	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -338,19 +345,15 @@ func TestReadyTasksReOffersATaskWhoseHolderDied(t *testing.T) {
 	}
 	seedTask(t, c, "TASK-1")
 
-	ready, err := c.ReadyTasks(ctx)
-	if err != nil {
-		t.Fatalf("ready: %v", err)
-	}
-	if len(ready) != 1 || ready[0] != "TASK-1" {
+	if ready := readyIDs(t, c); len(ready) != 1 || ready[0] != "TASK-1" {
 		t.Fatalf("ready before the lease = %v", ready)
 	}
 
 	if _, err := c.Acquire(ctx, AcquireRequest{TaskID: "TASK-1", Owner: "builder-1", TTL: time.Second}); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	if ready, err = c.ReadyTasks(ctx); err != nil || len(ready) != 0 {
-		t.Fatalf("a held task was still offered: %v (%v)", ready, err)
+	if ready := readyIDs(t, c); len(ready) != 0 {
+		t.Fatalf("a held task was still offered: %v", ready)
 	}
 
 	// The holder is gone and its TTL has passed. Nothing else looks at the row
@@ -362,24 +365,28 @@ func TestReadyTasksReOffersATaskWhoseHolderDied(t *testing.T) {
 	// the clock reads X+2. Sleeping only just past the TTL would make this pass
 	// or fail on where the second boundary happened to fall.
 	time.Sleep(2200 * time.Millisecond)
-	ready, err = c.ReadyTasks(ctx)
-	if err != nil {
-		t.Fatalf("ready: %v", err)
-	}
-	if len(ready) != 1 || ready[0] != "TASK-1" {
+	if ready := readyIDs(t, c); len(ready) != 1 || ready[0] != "TASK-1" {
 		t.Fatalf("ready after the lease expired = %v; a crashed builder's task was never re-offered", ready)
 	}
 }
 
-// seedTask plants the row DevCouncil's planner would have written. Planning is
-// not this client's job, so the task arrives through sqlite3 rather than
-// through an API this package would otherwise have to grow.
+// seedTask plants a ready task as the workbench item it is, through the store's
+// own `work` command: there is one definition of a task and no private copy.
 func seedTask(t *testing.T, c *Client, id string) {
 	t.Helper()
-	sql := fmt.Sprintf(
-		"INSERT INTO tasks (id,title,description,planned_files_json,status) VALUES ('%s','t','d','[]','ready');", id)
-	cmd := exec.Command(testsupport.Tool(t, "sqlite3"), c.DB, sql)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("seeding %s: %v %s", id, err, out)
+	testsupport.SeedTask(t, c.DB, testsupport.TaskSeed{ID: id, Title: "t"})
+}
+
+// readyIDs is what `next_task` could offer under enforce.
+func readyIDs(t *testing.T, c *Client) []string {
+	t.Helper()
+	ready, err := c.ReadyTasks(context.Background(), ReadyEnforce)
+	if err != nil {
+		t.Fatalf("ready: %v", err)
 	}
+	ids := []string{}
+	for _, r := range ready {
+		ids = append(ids, r.ID)
+	}
+	return ids
 }

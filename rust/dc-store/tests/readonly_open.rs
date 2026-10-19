@@ -5,6 +5,9 @@ use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[allow(dead_code)]
+mod support;
+
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
 struct Scratch(PathBuf);
@@ -61,6 +64,9 @@ fn observing_leases_writes_nothing_and_reports_each_row() {
     let dir = Scratch::new();
     let path = dir.path().join("state.sqlite");
     let store = Store::open(&path).unwrap();
+    for id in ["T-live", "T-lapsed", "T-bad", "T-new"] {
+        support::plant(&store, id, "ready", "{}");
+    }
     lease(&store, "T-live", 3600);
     lease(&store, "T-lapsed", 1);
     lease(&store, "T-bad", 3600);

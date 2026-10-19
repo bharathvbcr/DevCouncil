@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,35 +17,20 @@ import (
 // requirement and acceptance-criterion links, the way DevCouncil's planner
 // writes them.
 //
-// The row is planted through the sqlite3 CLI rather than through this client
-// because planning is DevCouncil's job: what is under test is whether the two
-// planes agree about a row that already exists, not how it came to exist.
+// The task is planted as the workbench item it is, through the store's own
+// `work` command rather than through this client, because planning is not this
+// client's job: what is under test is whether the two planes agree about an item
+// that already exists, not how it came to exist.
 func plantTaskWithLinks(t *testing.T, reqs, acs string) (*Client, string) {
 	t.Helper()
 	bin := testsupport.DCStore(t)
 	db := filepath.Join(t.TempDir(), "state.sqlite")
 	c := New(bin, db)
 
-	if _, err := c.ReadyTasks(context.Background()); err != nil {
-		t.Fatalf("seeding the store: %v", err)
-	}
-
-	sqlite, err := exec.LookPath("sqlite3")
-	if err != nil {
-		testsupport.Unavailable(t, "sqlite3 is not on PATH, so no task row can be planted")
-	}
-	stmt := "INSERT INTO tasks (id, title, description, status, " +
-		"requirement_ids_json, acceptance_criterion_ids_json) VALUES " +
-		"('TASK-1', 'planted', '', 'ready', '" + reqs + "', '" + acs + "');"
-	// Bound to the test's context so a sqlite3 that hangs is killed with the
-	// test rather than outliving it.
-	// #nosec G204 -- sqlite is resolved from PATH by exec.LookPath, db is this
-	// test's own t.TempDir, and stmt is assembled from literals and this
-	// package's own fixtures.
-	cmd := exec.CommandContext(t.Context(), sqlite, db, stmt)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("planting the task: %v\n%s", err, out)
-	}
+	testsupport.SeedTask(t, db, testsupport.TaskSeed{
+		ID: "TASK-1", Title: "planted",
+		Scope: `{"requirement_ids":` + reqs + `,"acceptance_criterion_ids":` + acs + `}`,
+	})
 	return c, db
 }
 
@@ -95,7 +81,12 @@ func plantRequirements(t *testing.T, db, reqIDs string, rows ...string) {
 	if err != nil {
 		testsupport.Unavailable(t, "sqlite3 is not on PATH, so no requirement row can be planted")
 	}
-	stmt := "UPDATE tasks SET requirement_ids_json = '" + reqIDs + "' WHERE id = 'TASK-1';"
+	var ids []string
+	if err := json.Unmarshal([]byte(reqIDs), &ids); err != nil {
+		t.Fatalf("requirement ids %s: %v", reqIDs, err)
+	}
+	testsupport.MergeTaskScope(t, db, "TASK-1", map[string]any{"requirement_ids": ids})
+	stmt := ""
 	for _, row := range rows {
 		stmt += "INSERT INTO requirements (id, title, description, priority, source, " +
 			"acceptance_criteria_json) VALUES " + row + ";"
@@ -185,20 +176,7 @@ func TestAnUnlinkedTaskReportsNoRequirementsRatherThanFailing(t *testing.T) {
 	bin := testsupport.DCStore(t)
 	db := filepath.Join(t.TempDir(), "state.sqlite")
 	c := New(bin, db)
-	if _, err := c.ReadyTasks(context.Background()); err != nil {
-		t.Fatalf("seeding the store: %v", err)
-	}
-	sqlite, err := exec.LookPath("sqlite3")
-	if err != nil {
-		testsupport.Unavailable(t, "sqlite3 is not on PATH, so no task row can be planted")
-	}
-	// #nosec G204 -- sqlite is resolved from PATH by exec.LookPath, db is this
-	// test's own t.TempDir, and the statement is a literal.
-	cmd := exec.CommandContext(t.Context(), sqlite, db,
-		"INSERT INTO tasks (id, title, description, status) VALUES ('TASK-1','planted','','ready');")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("planting the task: %v\n%s", err, out)
-	}
+	testsupport.SeedTask(t, db, testsupport.TaskSeed{ID: "TASK-1", Title: "planted"})
 
 	task, err := c.Task(context.Background(), "TASK-1")
 	if err != nil {

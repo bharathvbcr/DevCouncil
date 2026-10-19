@@ -10,8 +10,9 @@ use dc_store::{AcquireRequest, ScopeWrite, Store, schema};
 use rusqlite::{Connection, OptionalExtension};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[allow(dead_code)]
 mod support;
-use support::{dcstore, seeded, temp_dir};
+use support::{dcstore, plant, seeded, temp_dir};
 
 const INJECTION: &str = r#"[]}],"gaps":[],"x":[{"q":0"#;
 
@@ -146,14 +147,17 @@ fn run_record_environment_and_commands_are_validated() {
 fn store_with_task(name: &str) -> (Store, std::path::PathBuf) {
     let path = temp_dir(name).join("state.sqlite");
     let store = Store::open(&path).unwrap();
-    store
-        .connection()
-        .execute(
-            "INSERT INTO tasks (id, title, description, status) VALUES ('T1','t','', 'ready')",
-            [],
-        )
-        .unwrap();
+    plant(&store, "T1", "ready", "{}");
     (store, path)
+}
+
+fn ready_ids(store: &Store) -> Vec<String> {
+    store
+        .ready_tasks(dc_store::ReadyMode::Enforce)
+        .unwrap()
+        .into_iter()
+        .map(|t| t.id)
+        .collect()
 }
 
 fn lease_for(store: &Store, task: &str, ttl: Option<i64>) -> dc_store::Lease {
@@ -201,7 +205,7 @@ fn newline_padded_scope_is_normalised_and_swappable() {
     store
         .connection()
         .execute(
-            "UPDATE tasks SET agent_appended_planned_files_json = ?1 WHERE id = 'T1'",
+            "UPDATE task_scope_appends SET planned_files_json = ?1 WHERE task_id = 'T1'",
             ["\n[{\"path\":\"a.go\",\"allowed_change\":\"modify\"}]\n"],
         )
         .unwrap();
@@ -231,7 +235,7 @@ fn a_planted_form_feed_column_is_reported_not_served() {
     store
         .connection()
         .execute(
-            "UPDATE tasks SET agent_appended_planned_files_json = ?1",
+            "INSERT OR REPLACE INTO task_scope_appends (task_id, planned_files_json) VALUES ('T1', ?1)",
             ["\x0c[]"],
         )
         .unwrap();
@@ -256,18 +260,12 @@ fn plant_bad_expiry(store: &Store, task: &str) {
 #[test]
 fn one_unreadable_expiry_fails_closed_for_its_own_task_only() {
     let (store, path) = store_with_task("integrity-bad-expiry");
-    store
-        .connection()
-        .execute(
-            "INSERT INTO tasks (id, title, description, status) VALUES ('T2','t','', 'ready')",
-            [],
-        )
-        .unwrap();
+    plant(&store, "T2", "ready", "{}");
     lease_for(&store, "T1", Some(900));
     plant_bad_expiry(&store, "T1");
 
     // Other tasks are served; the planted one is excluded and reported.
-    assert_eq!(store.ready_tasks().unwrap(), vec!["T2".to_string()]);
+    assert_eq!(ready_ids(&store), vec!["T2".to_string()]);
     let bad = store.unreadable_leases().unwrap();
     assert_eq!(bad.len(), 1);
     assert_eq!(bad[0].task_id, "T1");
@@ -347,6 +345,7 @@ fn a_stale_mark_never_overwrites_a_renewal_that_landed_first() {
     let path = dir.join("state.sqlite");
     let mut a = Store::open(&path).unwrap();
     a.set_clock(|| 1_700_000_000);
+    plant(&a, "T1", "ready", "{}");
     let lease = lease_for(&a, "T1", Some(3600));
 
     let mut b = Store::open(&path).unwrap();
@@ -376,6 +375,7 @@ fn a_released_lease_is_never_rewritten_to_stale() {
     let path = dir.join("state.sqlite");
     let mut a = Store::open(&path).unwrap();
     a.set_clock(|| 1_700_000_000);
+    plant(&a, "T1", "ready", "{}");
     let lease = lease_for(&a, "T1", Some(900));
     let mut b = Store::open(&path).unwrap();
     let released = AtomicBool::new(false);
@@ -408,12 +408,7 @@ fn concurrent_renew_expire_and_release_keep_one_consistent_row() {
     let path = dir.join("state.sqlite");
     {
         let s = Store::open(&path).unwrap();
-        s.connection()
-            .execute(
-                "INSERT INTO tasks (id, title, description, status) VALUES ('T1','t','','ready')",
-                [],
-            )
-            .unwrap();
+        plant(&s, "T1", "ready", "{}");
     }
     let handles: Vec<_> = (0..6)
         .map(|i| {
@@ -500,6 +495,14 @@ fn v6_store(name: &str) -> std::path::PathBuf {
             status VARCHAR NOT NULL DEFAULT 'planned', difficulty VARCHAR,
             PRIMARY KEY (id));
          INSERT INTO tasks (id, title, description, status) VALUES ('T1','t','','ready');
+         -- gaps as they were before the output-path columns existed.
+         CREATE TABLE gaps (
+            id VARCHAR NOT NULL, severity VARCHAR NOT NULL, gap_type VARCHAR NOT NULL,
+            requirement_id VARCHAR, task_id VARCHAR, description VARCHAR NOT NULL,
+            evidence_json VARCHAR NOT NULL DEFAULT '[]', recommended_fix VARCHAR NOT NULL,
+            blocking BOOLEAN NOT NULL, file VARCHAR, line INTEGER, suggested_command VARCHAR,
+            acceptance_criterion_id VARCHAR, expected_verification_method VARCHAR,
+            PRIMARY KEY (id));
          CREATE TABLE schema_version (id VARCHAR NOT NULL, version INTEGER NOT NULL, PRIMARY KEY (id));
          INSERT INTO schema_version VALUES ('singleton', 6);",
     )
@@ -508,7 +511,7 @@ fn v6_store(name: &str) -> std::path::PathBuf {
 }
 
 fn columns(conn: &Connection) -> Vec<String> {
-    let mut s = conn.prepare("PRAGMA table_info(tasks)").unwrap();
+    let mut s = conn.prepare("PRAGMA table_info(gaps)").unwrap();
     s.query_map([], |r| r.get::<_, String>("name"))
         .unwrap()
         .map(Result::unwrap)
@@ -517,6 +520,8 @@ fn columns(conn: &Connection) -> Vec<String> {
 
 #[test]
 fn a_v6_store_opens_with_every_column_and_reads_a_task() {
+    // Its legacy `tasks` row is archived as an item on the way in, so the
+    // task still reads; the columns this checks are the ones a v6 table lacks.
     let path = v6_store("integrity-v6");
     let store = Store::open(&path).unwrap();
     let task = store.task("T1").unwrap().expect("a migrated v6 task reads");
@@ -526,10 +531,8 @@ fn a_v6_store_opens_with_every_column_and_reads_a_task() {
         .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(version, dc_store::SCHEMA_VERSION as i64);
-    assert!(
-        columns(store.connection()).contains(&"agent_appended_expected_tests_json".to_string())
-    );
-    assert_eq!(store.ready_tasks().unwrap(), vec!["T1".to_string()]);
+    assert!(columns(store.connection()).contains(&"stdout_path".to_string()));
+    assert_eq!(ready_ids(&store), vec!["T1".to_string()]);
 }
 
 /// Crash at each write step: nothing is added and nothing is stamped; a clean

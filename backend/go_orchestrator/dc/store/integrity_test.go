@@ -40,6 +40,7 @@ func TestAWarmPoolRefusesAfterTheDatabaseIsDeleted(t *testing.T) {
 func TestAWarmPoolNeverLeasesTheSameTaskOnAReplacedDatabase(t *testing.T) {
 	warm := client(t)
 	t.Cleanup(warm.Close)
+	seedTask(t, warm, "T1")
 	if _, err := warm.ActiveLeases(context.Background()); err != nil { // creates the store
 		t.Fatal(err)
 	}
@@ -50,9 +51,7 @@ func TestAWarmPoolNeverLeasesTheSameTaskOnAReplacedDatabase(t *testing.T) {
 	// Another client builds a fresh database and renames it over the path, so
 	// the warm child keeps the old, now unlinked, inode.
 	fresh := New(warm.Binary, filepath.Join(filepath.Dir(warm.DB), "fresh.sqlite"))
-	if _, err := fresh.ActiveLeases(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	seedTask(t, fresh, "T1")
 	fresh.Close()
 	// The journal files go with it: they are named after the path, and left in
 	// place the old and new databases would share one WAL index.

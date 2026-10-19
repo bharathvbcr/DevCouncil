@@ -245,18 +245,28 @@ func (r *Registry) callNextTask(ctx context.Context, args map[string]any) any {
 	if r.Store == nil {
 		return map[string]any{"ok": false, "error": "DevCouncil not initialized in this directory.", "code": "not_initialized"}
 	}
-	ids, err := r.Store.ReadyTasks(ctx)
+	gate := r.GateState()
+	// The store orders the work for the gate mode in force: under enforce a task
+	// with a blocking gap is not offered at all; under advisory and off it comes
+	// after every unblocked task, flagged. Taking the first id is only right
+	// because of that ordering, and it is the store's, not this function's.
+	ready, err := r.Store.ReadyTasks(ctx, store.ReadyMode(gate.Mode))
 	if err != nil {
 		return map[string]any{"ok": false, "error": err.Error(), "code": "store_error"}
 	}
-	if len(ids) == 0 {
-		return withGateConfigError(map[string]any{"ok": true, "task": nil}, r.GateState())
+	if len(ready) == 0 {
+		return withGateConfigError(map[string]any{"ok": true, "task": nil}, gate)
 	}
-	task, err := r.Store.Task(ctx, ids[0])
+	next := ready[0]
+	task, err := r.Store.Task(ctx, next.ID)
 	if err != nil {
 		return map[string]any{"ok": false, "error": err.Error(), "code": "store_error"}
 	}
-	return withGateConfigError(map[string]any{"ok": true, "task_id": ids[0], "task": task}, r.GateState())
+	return withGateConfigError(map[string]any{
+		"ok": true, "task_id": next.ID, "task": task,
+		"ready_to_checkout":  next.ReadyToCheckout,
+		"blocking_gap_count": next.BlockingGapCount,
+	}, gate)
 }
 
 func (r *Registry) callVerify(ctx context.Context, args map[string]any) any {

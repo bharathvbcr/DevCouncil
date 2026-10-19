@@ -80,6 +80,8 @@ var commands = map[string]func(args []string) int{
 	"disable":      runDisable,
 	"enable":       runEnable,
 	"gate":         runGate,
+	"task":         runTask,
+	"doctor":       runDoctor,
 	"hook":         runHook,
 	"map":          func(args []string) int { return runDevmap(mapArgs(args)) },
 	"graph":        func(args []string) int { return runDevmap(mapArgs(args)) },
@@ -123,6 +125,13 @@ Usage:
   devcouncil enable NAME [--prefix DIR]
   devcouncil gate status [--json] [--project-root DIR]
   devcouncil gate set --mode off|advisory|enforce
+  devcouncil task create --id ID --title TITLE [--description TEXT] [--status S] [--priority 1-3]
+                              [--scope-json JSON | --scope-file PATH] [--project-root DIR]
+  devcouncil task status ID --to inbox|backlog|ready|in_progress|review|done [--project-root DIR]
+  devcouncil task show ID [--json] [--project-root DIR]
+                                   Tasks are workbench items; these wrap ` + "`dcstore work`" + `
+  devcouncil doctor [--json] [--project-root DIR]
+                                   Which store next_task reads, and how many ready items it holds
   devcouncil hook <event>     Retired lifecycle compatibility (silent no-op)
   devcouncil hook status|disable [--project-root DIR] [--client HOST]
   devcouncil integrate HOST [--apply|--check|--dry-run] [--project-root DIR] [--devmap-bin PATH]
@@ -255,16 +264,31 @@ func runMCP() int {
 // openStore returns the task-store client, or nil when the project has no
 // state database or no dcstore it may run.
 //
+// The database is the `workbench.db` config key, repo-local by construction
+// (gatescfg.ResolveWorkbenchDB refuses anything outside .devcouncil/): the host
+// never opens GitPulse's profile database. A key that cannot be honoured is
+// said out loud and yields no store, never a silent read of the default one.
+//
 // The binary is resolved here, to a path, and never left as the bare name:
 // exec would search PATH for a bare name again, with none of the checks that
 // keep a dcstore inside the repository from owning its task store. A
 // database without a binary is said out loud, because the callers report a
 // nil client as state that is unavailable, which alone would be false.
 func openStore(root string) *store.Client {
-	db := filepath.Join(root, ".devcouncil", "state.sqlite")
-	if _, err := os.Stat(db); err != nil {
+	loc, err := gatescfg.ResolveWorkbenchDB(root)
+	if err != nil {
+		console.Errorf("devcouncil: the task store cannot be opened: %v\n", err)
 		return nil
 	}
+	if _, err := os.Stat(loc.Path); err != nil {
+		return nil
+	}
+	return dcstoreClient(root, loc.Path)
+}
+
+// dcstoreClient is the client for a database that exists, or nil with the
+// reason said.
+func dcstoreClient(root, db string) *store.Client {
 	bin, err := proc.ResolveComponent("dcstore", root, proc.Override{})
 	if err != nil {
 		console.Errorf("devcouncil: %s exists but no dcstore can run against it: %v; "+

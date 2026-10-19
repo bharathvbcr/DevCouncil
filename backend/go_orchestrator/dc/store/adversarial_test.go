@@ -24,9 +24,9 @@ import (
 // them has created yet — so "database is locked" reached agents that had no way
 // to act on it.
 //
-// Every racer here takes a *distinct* task, which is what makes the test sharp:
-// contention over a lease is impossible by construction, so a *Conflict would be
-// as wrong as a lock error and any failure at all is the bug. The database is
+// Every racer here only lists ready tasks, which is what makes the test sharp:
+// no lease is taken, so contention over one is impossible by construction and any
+// failure at all is the bug. The database is
 // left uncreated on purpose. Do not add a warm-up call.
 func TestColdStartContentionYieldsNoLockErrors(t *testing.T) {
 	bin := binary(t)
@@ -55,10 +55,11 @@ func TestColdStartContentionYieldsNoLockErrors(t *testing.T) {
 				c := New(bin, db)
 				c.Timeout = 30 * time.Second
 				<-start
-				_, err := c.Acquire(context.Background(), AcquireRequest{
-					TaskID: fmt.Sprintf("TASK-COLD-%d", i), Owner: fmt.Sprintf("builder-%d", i),
-					TTL: time.Minute,
-				})
+				// `ready` is a command that does work, so it creates and migrates
+				// the database exactly as a first acquire does; it needs no task
+				// to exist, which an acquire now does (a task is a workbench
+				// item), and a store that cannot be opened is its only failure.
+				_, err := c.ReadyTasks(context.Background(), ReadyEnforce)
 				results <- err
 			}(i)
 		}
@@ -99,6 +100,7 @@ func TestConcurrentAcquireElectsExactlyOneHolder(t *testing.T) {
 	if _, err := New(bin, db).ActiveLeases(context.Background()); err != nil {
 		t.Fatalf("prepare store: %v", err)
 	}
+	seedTask(t, New(bin, db), "TASK-RACE")
 
 	const racers = 24
 	var wg sync.WaitGroup

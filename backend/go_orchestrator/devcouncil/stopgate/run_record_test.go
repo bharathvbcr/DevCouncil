@@ -20,11 +20,8 @@ import (
 func TestARunCutShortByItsBudgetIsStillRecordedWithItsTimeoutGap(t *testing.T) {
 	root := repoWithWorkingTreeChange(t, "src/app.go", "package app\n")
 	client := newStore(t)
-	sql := "INSERT INTO tasks (id,title,description,planned_files_json,expected_tests_json,status) " +
-		`VALUES ('TASK-BUDGET','budget','','[{"path":"src/app.go","allowed_change":"modify"}]','["sleep 2"]','ready');`
-	if out, err := exec.Command(testsupport.Tool(t, "sqlite3"), client.DB, sql).CombinedOutput(); err != nil {
-		t.Fatalf("task fixture: %v %s", err, out)
-	}
+	testsupport.SeedTask(t, client.DB, testsupport.TaskSeed{ID: "TASK-BUDGET", Title: "budget",
+		Scope: `{"planned_files":[{"path":"src/app.go","allowed_change":"modify"}],"expected_tests":["sleep 2"]}`})
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()

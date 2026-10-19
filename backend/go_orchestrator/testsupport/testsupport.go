@@ -42,6 +42,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -162,6 +163,105 @@ var buildsMu sync.Mutex
 
 // DCStore builds the Rust store binary and returns its path.
 func DCStore(t testing.TB) string { return cargoBin(t, "dc-store", "dcstore") }
+
+// TaskSeed describes one task to plant in a store: a workbench item of the
+// store's repository. Zero values are a ready task titled after its ID with an
+// empty scope.
+type TaskSeed struct {
+	ID     string
+	Status string
+	Title  string
+	// Scope is the item's scope object as JSON; empty means {}.
+	Scope string
+	// Priority is 1 (highest) to 3; zero leaves the default.
+	Priority int
+}
+
+// SeedTask plants a task the way an operator does, through `dcstore work`, so
+// the test exercises the one definition of a task rather than a private copy
+// of its storage. The store is created if it does not exist. A refusal fails
+// the test with the store's own message.
+func SeedTask(t testing.TB, db string, seed TaskSeed) {
+	t.Helper()
+	bin := DCStore(t)
+	run := func(args ...string) string {
+		out, err := exec.Command(bin, append([]string{"--db", db}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("dcstore %s: %v\n%s", args[0], err, out)
+		}
+		return string(out)
+	}
+	run("local-repository")
+	if seed.Status == "" {
+		seed.Status = "ready"
+	}
+	if seed.Title == "" {
+		seed.Title = seed.ID
+	}
+	if seed.Scope == "" {
+		seed.Scope = "{}"
+	}
+	priority := ""
+	if seed.Priority != 0 {
+		priority = fmt.Sprintf(`,"priority":%d`, seed.Priority)
+	}
+	title, _ := json.Marshal(seed.Title)
+	input := fmt.Sprintf(`{"request_id":"seed-%s","id":%q,"expected_revision":0,"title":%s,"status":%q%s,`+
+		`"repository_ids":["this-repo"],"primary_repository_id":"this-repo","scope":%s}`,
+		seed.ID, seed.ID, title, seed.Status, priority, seed.Scope)
+	if out := run("work", "--method", "items.put", "--input", input); !strings.Contains(out, `"ok":true`) {
+		t.Fatalf("seeding task %s was refused: %s", seed.ID, out)
+	}
+}
+
+// MergeTaskScope sets the named keys of an existing task's scope, keeping the
+// rest, through the same revisioned `items.put` an edit takes. It exists
+// because a task's body cannot be edited with the sqlite3 CLI: the item search
+// index is an FTS5 table that the system CLI may not be built with, and a
+// direct write would skip the scope validation anyway.
+func MergeTaskScope(t testing.TB, db, id string, patch map[string]any) {
+	t.Helper()
+	bin := DCStore(t)
+	run := func(method string, input []byte) []byte {
+		out, err := exec.Command(bin, "--db", db, "work", "--method", method, "--input", string(input)).CombinedOutput()
+		if err != nil {
+			t.Fatalf("dcstore work %s: %v\n%s", method, err, out)
+		}
+		return out
+	}
+	request, _ := json.Marshal(map[string]string{"id": id})
+	var got struct {
+		Item struct {
+			Title    string         `json:"title"`
+			Status   string         `json:"status"`
+			Revision int64          `json:"revision"`
+			Scope    map[string]any `json:"scope"`
+			Repos    []string       `json:"repository_ids"`
+			Primary  string         `json:"primary_repository_id"`
+		} `json:"item"`
+	}
+	if err := json.Unmarshal(run("items.get", request), &got); err != nil || got.Item.Revision == 0 {
+		t.Fatalf("reading task %s: %v", id, err)
+	}
+	scope := got.Item.Scope
+	if scope == nil {
+		scope = map[string]any{}
+	}
+	for key, value := range patch {
+		scope[key] = value
+	}
+	put, err := json.Marshal(map[string]any{
+		"request_id": fmt.Sprintf("scope-%s-%d", id, got.Item.Revision), "id": id,
+		"expected_revision": got.Item.Revision, "title": got.Item.Title, "status": got.Item.Status,
+		"repository_ids": got.Item.Repos, "primary_repository_id": got.Item.Primary, "scope": scope,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out := run("items.put", put); !strings.Contains(string(out), `"ok":true`) {
+		t.Fatalf("changing the scope of %s was refused: %s", id, out)
+	}
+}
 
 // DCVerify builds the Rust verifier binary and returns its path.
 func DCVerify(t testing.TB) string { return cargoBin(t, "dc-verify", "dcverify") }

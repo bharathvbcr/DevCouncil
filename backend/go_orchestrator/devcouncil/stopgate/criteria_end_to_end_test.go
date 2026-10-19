@@ -16,10 +16,12 @@ import (
 
 func linkCriterion(t *testing.T, db, taskID, method string) {
 	t.Helper()
-	sql := "UPDATE tasks SET requirement_ids_json = '[\"REQ-1\"]', " +
-		"acceptance_criterion_ids_json = '[\"AC-1\"]', expected_tests_json = '[\"true\"]' " +
-		"WHERE id = '" + taskID + "';" +
-		"INSERT INTO requirements (id,title,description,priority,source,acceptance_criteria_json) " +
+	testsupport.MergeTaskScope(t, db, taskID, map[string]any{
+		"requirement_ids":          []string{"REQ-1"},
+		"acceptance_criterion_ids": []string{"AC-1"},
+		"expected_tests":           []string{"true"},
+	})
+	sql := "INSERT INTO requirements (id,title,description,priority,source,acceptance_criteria_json) " +
 		"VALUES ('REQ-1','r','','high','user','[{\"id\":\"AC-1\",\"description\":\"d\"," +
 		"\"verification_method\":\"" + method + "\"}]');"
 	if out, err := exec.Command(testsupport.Tool(t, "sqlite3"), db, sql).CombinedOutput(); err != nil {

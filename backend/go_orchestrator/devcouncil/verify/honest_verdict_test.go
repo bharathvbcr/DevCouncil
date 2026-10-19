@@ -169,13 +169,11 @@ func plantRepoTask(t *testing.T, root, id, command string) *store.Client {
 	if _, err := client.ActiveLeases(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	tests, _ := json.Marshal([]string{command})
-	sql := "INSERT INTO tasks (id,title,description,planned_files_json,expected_tests_json,status) VALUES ('" +
-		id + "','t','','[{\"path\":\"a.go\",\"allowed_change\":\"modify\"}]','" +
-		strings.ReplaceAll(string(tests), "'", "''") + "','ready');"
-	if out, err := exec.Command(testsupport.Tool(t, "sqlite3"), client.DB, sql).CombinedOutput(); err != nil {
-		t.Fatalf("task fixture: %v %s", err, out)
-	}
+	scope, _ := json.Marshal(map[string]any{
+		"planned_files":  []map[string]string{{"path": "a.go", "allowed_change": "modify"}},
+		"expected_tests": []string{command},
+	})
+	testsupport.SeedTask(t, client.DB, testsupport.TaskSeed{ID: id, Title: "t", Scope: string(scope)})
 	return client
 }
 

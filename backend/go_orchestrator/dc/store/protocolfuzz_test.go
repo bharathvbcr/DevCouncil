@@ -78,7 +78,7 @@ func FuzzStoreReplyIsNeverAZeroValueReadAsSuccess(f *testing.F) {
 		`{"ok":false}`,
 		`{"ok":false,"error":"no such task"}`,
 		`{"ok":false,"code":"held_by_other","holder":"builder-2"}`,
-		`{"ok":true,"store":"dc-store","schema_version":9,"exclusion_index":"verified"}`,
+		`{"ok":true,"store":"dc-store","schema_version":10,"exclusion_index":"verified"}`,
 		`{"ok":true,"store":"dc-store","schema_version":0,"exclusion_index":""}`,
 		`{"ok":true,"lease":{"id":"1","task_id":"T","owner":"o","token":"tok","status":"active"}}`,
 		`{"ok":true,"lease":null}`,

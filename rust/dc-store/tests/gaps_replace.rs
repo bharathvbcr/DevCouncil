@@ -4,6 +4,7 @@
 use dc_store::Store;
 use dc_store::records::{GapRow, MAX_GAPS_PER_REPLACE, VerificationRun};
 
+#[allow(dead_code)]
 mod support;
 use support::{dcstore, seeded};
 

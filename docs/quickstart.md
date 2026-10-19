@@ -154,21 +154,49 @@ dcverify health
 dcgrep health
 ```
 
-Task verification needs an initialized `.devcouncil/state.sqlite` and a real
-task with planned files and expected commands, supplied by your consuming
-application or store client. Installing or mapping does not create a task.
+Task verification needs a task in this repository's task store. A task is a
+workbench item: create one with `devcouncil task create` (installing or mapping
+does not create one), and check what the host will hand out with
+`devcouncil doctor`.
 
 ```bash
-# TASK-001 must already exist in this project's task store.
+# Create a task. --scope-json is the gate scope the store validates.
+devcouncil task create --id TASK-001 --title "Add the parser" \
+  --scope-json '{"planned_files":["src/parser.go",{"path":"src/parser_test.go","allowed_change":"create"}],"expected_tests":["go test ./..."]}'
+devcouncil task show TASK-001
+devcouncil doctor        # which store next_task reads, and how many ready items it holds
+```
+
+Checking a task out (`devcouncil_checkout_task`) sets it `in_progress`; a verify
+that passes sets it `review`.
+
+```bash
 devcouncil verify TASK-001 --mode enforce --json
 # Supply an actual coverage profile to measure changed-line coverage:
 devcouncil verify TASK-001 --mode enforce --coverage /path/to/coverage-profile --json
+```
+
+Closing the task is a person's decision, made once the work is accepted:
+
+```bash
+devcouncil task status TASK-001 --to done
 ```
 
 Verification is opt-in; the default mode is `off`. Check `status`,
 `verification_skipped`, `rigor_applied`, `rigor_skipped_reason`,
 `coverage_measured` and `coverage_skipped_reason`. The `--sandbox` flag records
 a value on the report; it does not provide Docker/Nix isolation.
+
+The task store is `.devcouncil/state.sqlite`, or the path named by the
+`workbench.db` key in `.devcouncil/config.yaml`. That path must be a file inside
+`.devcouncil/`: the host reads only a repo-local store and never opens another
+application's database. A board such as GitPulse's reaches this store by syncing
+items into it, addressed to the repository `this-repo`.
+
+Whether a task is *blocked* is derived from its blocking gaps, not stored:
+under `enforce` `devcouncil_next_task` never offers a task with a blocking gap;
+under `advisory` or `off` it offers unblocked tasks first, then blocked ones
+marked `ready_to_checkout: false` with a `blocking_gap_count`.
 
 Next: [task workflow](workflow.md), [MCP task loop](hero-loop.md),
 [architecture](architecture.md), [CLI reference](cli-reference.md).

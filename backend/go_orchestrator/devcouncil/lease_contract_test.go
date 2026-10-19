@@ -3,7 +3,6 @@ package devcouncil_test
 import (
 	"context"
 	"encoding/json"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -21,11 +20,7 @@ func leaseRegistry(t *testing.T, status string) *devcouncil.Registry {
 	if _, err := client.ActiveLeases(context.Background()); err != nil { // creates the store
 		t.Fatal(err)
 	}
-	seed := exec.Command(testsupport.Tool(t, "sqlite3"), client.DB,
-		"INSERT INTO tasks (id,title,description,status) VALUES ('T1','t','d','"+status+"');")
-	if out, err := seed.CombinedOutput(); err != nil {
-		t.Fatalf("seed: %v %s", err, out)
-	}
+	testsupport.SeedTask(t, client.DB, testsupport.TaskSeed{ID: "T1", Title: "t", Status: status})
 	return devcouncil.NewRegistry(t.TempDir(), client, nil)
 }
 
