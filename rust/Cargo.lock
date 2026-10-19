@@ -472,6 +472,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "devmap-rustlabel"
+version = "0.2.5"
+dependencies = [
+ "devmap-extract",
+ "devmap-resolve",
+ "serde",
+ "serde_json",
+ "tree-sitter",
+ "tree-sitter-rust",
+]
+
+[[package]]
 name = "devmap-serve"
 version = "0.2.5"
 dependencies = [

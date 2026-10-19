@@ -1,0 +1,41 @@
+[package]
+name = "devmap-rustlabel"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+license.workspace = true
+description = "Dev-only rust-analyzer oracle: writes the Rust half of a DevMap accuracy labels file"
+publish = false
+autotests = false
+
+[lib]
+name = "rustlabel"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rustlabel"
+path = "src/main.rs"
+
+[[test]]
+name = "it"
+path = "tests/it.rs"
+
+[dependencies]
+# Every dependency is already in the workspace: devmap-resolve owns the one
+# language-server client, devmap-extract owns DevMap's symbol ids and its
+# file discovery, and tree-sitter-rust is the grammar devmap-extract parses
+# Rust with. Nothing new enters the lockfile but this package.
+devmap-extract = { path = "../../devmap-extract" }
+devmap-resolve = { path = "../../devmap-resolve" }
+serde.workspace = true
+serde_json.workspace = true
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true
+
+[lints]
+workspace = true
+
+# A measuring instrument, not a product binary: cargo-dist must not ship it,
+# and nothing in the released `devmap` links it.
+[package.metadata.dist]
+dist = false
