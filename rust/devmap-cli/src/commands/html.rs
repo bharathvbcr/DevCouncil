@@ -1,13 +1,13 @@
 use std::path::{Path, PathBuf};
 
-use crate::cli::{default_root_hint, Cli};
+use crate::cli::{default_root_hint, root_parser, Cli};
 use crate::commands::export::graph_value_for_read;
 use crate::output::{emit_json, open_for_read};
 
 #[derive(clap::Args)]
 #[group(id = "Html")]
 pub(crate) struct Args {
-    #[arg(default_value_os_t = default_root_hint())]
+    #[arg(default_value_os_t = default_root_hint(), value_parser = root_parser())]
     pub(crate) path: PathBuf,
     /// Where to write. Defaults to `<state dir>/graph.html`.
     #[arg(short, long)]

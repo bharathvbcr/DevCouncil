@@ -3,13 +3,13 @@ use std::path::PathBuf;
 use devmap_query::freshness;
 use devmap_query::freshness::{FreshnessDigests, InventoryLimits, InventorySource};
 
-use crate::cli::{default_root_hint, Cli, InventoryFlags};
+use crate::cli::{default_root_hint, root_parser, Cli, InventoryFlags};
 use crate::output::emit_json;
 
 #[derive(clap::Args)]
 #[group(id = "Freshness")]
 pub(crate) struct Args {
-    #[arg(default_value_os_t = default_root_hint())]
+    #[arg(default_value_os_t = default_root_hint(), value_parser = root_parser())]
     pub(crate) path: PathBuf,
     /// The `generated_head` a map carries. Compared, never written.
     #[arg(long)]

@@ -105,7 +105,7 @@ pub(crate) struct Cli {
     /// state directory a repository uses is a property of the repository.
     ///
     /// `--db` still wins where both are given: it names a store outright.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, value_parser = root_parser())]
     pub(crate) root: Option<PathBuf>,
 
     /// Machine-readable output. Global; see `--db`.
@@ -174,6 +174,23 @@ impl Cli {
             None => devmap_extract::paths::store_path(self.root_hint()),
         }
     }
+}
+
+/// Parses a repository-root argument into the one absolute, symlink-free form
+/// every later path is derived from.
+///
+/// A relative root used to travel as spelled: the state directory derived from
+/// it (`tmp/rel/.devmap/...`) was already cwd-relative, and the manifest writer
+/// then joined that onto the store's absolute repo root again, so
+/// `devmap build --manifest tmp/rel` wrote `tmp/rel/tmp/rel/.devmap/`. Resolving
+/// once at the boundary leaves nothing downstream to join twice. A path that
+/// cannot be resolved (missing) is kept as spelled so `validate_root` reports it.
+pub(crate) fn root_parser() -> impl clap::builder::TypedValueParser<Value = PathBuf> {
+    use clap::builder::TypedValueParser as _;
+    clap::builder::OsStringValueParser::new().map(|raw| {
+        let path = PathBuf::from(raw);
+        path.canonicalize().unwrap_or(path)
+    })
 }
 
 /// Omitted roots agree with rootless queries. An explicit `.` still scopes a

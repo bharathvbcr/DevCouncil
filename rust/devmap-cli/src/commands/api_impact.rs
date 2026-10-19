@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::cli::{default_root_hint, Cli};
+use crate::cli::{default_root_hint, root_parser, Cli};
 use crate::commands::routes::{repo_root_for, report_scan, scan_budget};
 use crate::output::{emit_json, open_for_read};
 
@@ -9,7 +9,7 @@ use crate::output::{emit_json, open_for_read};
 pub(crate) struct Args {
     /// The route path or `"VERB /path"` id.
     pub(crate) route: String,
-    #[arg(default_value_os_t = default_root_hint())]
+    #[arg(default_value_os_t = default_root_hint(), value_parser = root_parser())]
     pub(crate) path: PathBuf,
     #[arg(long, default_value_t = 5_000)]
     pub(crate) max_files: usize,

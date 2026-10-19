@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 
-use crate::cli::{default_root_hint, Cli};
+use crate::cli::{default_root_hint, root_parser, Cli};
 use crate::commands::doctor::extend_agent_tools;
 use crate::installation::{
     binaries_skew_warning, build_identity_json, duplicate_mcp_registration_warning,
@@ -14,7 +14,7 @@ use crate::output::emit_json;
 #[derive(clap::Args)]
 #[group(id = "Paths")]
 pub(crate) struct Args {
-    #[arg(default_value_os_t = default_root_hint())]
+    #[arg(default_value_os_t = default_root_hint(), value_parser = root_parser())]
     pub(crate) path: PathBuf,
 }
 

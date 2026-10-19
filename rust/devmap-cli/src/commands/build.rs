@@ -4,7 +4,7 @@ use devmap_extract::collect_project_manifests;
 use devmap_resolve::{Resolver, UnresolvedClass};
 use devmap_store::{current_git_head, GenerationWriteOpts, Store, GENERATION_RETENTION};
 
-use crate::cli::{default_root_hint, Cli, InventoryFlags, StampFlags};
+use crate::cli::{default_root_hint, root_parser, Cli, InventoryFlags, StampFlags};
 use crate::commands::manifest::{
     manifest_json, report_manifest, resolve_graph_output, resolve_map_output,
     write_consumer_artifacts, ManifestOutcome, ManifestRequest,
@@ -17,7 +17,7 @@ use crate::reporter::ProgressReporter;
 #[derive(clap::Args)]
 #[group(id = "Build")]
 pub(crate) struct Args {
-    #[arg(default_value_os_t = default_root_hint())]
+    #[arg(default_value_os_t = default_root_hint(), value_parser = root_parser())]
     pub(crate) path: PathBuf,
     #[arg(long)]
     pub(crate) affected: Option<String>,
