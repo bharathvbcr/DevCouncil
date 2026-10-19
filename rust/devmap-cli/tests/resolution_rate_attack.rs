@@ -138,15 +138,22 @@ fn p2_json_lets_a_consumer_reproduce_the_headline() {
         py["explained_sites"].as_u64().unwrap(),
     );
     // A consumer holding only the top-level fields:
+    // Repointed to measured_* by Opus ruling 2026-10-19: the raw totals are a public contract kept for attribution coverage; the headline's denominators are the additive measured_* fields.
     let (tr, tu, te) = (
-        rr["resolved_sites"].as_u64().unwrap(),
-        rr["unresolved_sites"].as_u64().unwrap(),
-        rr["explained_sites"].as_u64().unwrap(),
+        rr["measured_resolved_sites"].as_u64().unwrap(),
+        rr["measured_unresolved_sites"].as_u64().unwrap(),
+        rr["measured_explained_sites"].as_u64().unwrap(),
     );
     assert_eq!(net, r * 1000 / (r + u - e), "per-language rows reproduce it");
     assert_eq!(
         net,
         tr * 1000 / (tr + tu - te),
-        "top-level fields do not reproduce the headline: {rr}"
+        "top-level measured_* fields do not reproduce the headline: {rr}"
+    );
+    // Pinned invariant: the raw totals still count every attribution site.
+    assert_eq!(
+        rr["resolved_sites"].as_u64().unwrap() + rr["unresolved_sites"].as_u64().unwrap(),
+        tr + tu + rr["vendored_sites"].as_u64().unwrap() + rr["call_blind_sites"].as_u64().unwrap(),
+        "raw totals must stay the attribution totals: {rr}"
     );
 }
