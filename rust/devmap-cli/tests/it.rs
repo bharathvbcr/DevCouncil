@@ -24,6 +24,7 @@ mod a_one_file_edit_writes_one_file_of_rows;
 mod a_python_index_is_named_not_migrated;
 mod a_read_arm_does_not_run_git_log;
 mod a_refusal_is_printed_once;
+mod a_relative_root_is_resolved_once;
 mod a_root_anchor_replaces_a_baked_store_path;
 mod an_ignore_file_binds_the_daemon;
 mod api_views_are_honest;
