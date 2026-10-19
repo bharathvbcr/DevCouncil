@@ -267,6 +267,29 @@ fn walk(base: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, St
     }
 }
 
+/// Inject relative-import files into the real manifest fixtures (the fixtures
+/// themselves contain none) and require them to resolve physically.
+#[test]
+fn relative_imports_inside_manifest_fixtures_resolve() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../testdata/accuracy");
+    for name in ["python-hatch", "python-setupcfg", "python-ruff"] {
+        let base = manifest.join(name);
+        let mut files: Vec<(String, String)> = Vec::new();
+        walk(&base, &base, &mut files);
+        files.push(("python/rootpkg/rel.py".into(), "from .util import split\n".into()));
+        files.push(("python/rootpkg/sub/__init__.py".into(), String::new()));
+        files.push(("python/rootpkg/sub/deep.py".into(), "from ..util import split\n".into()));
+        let borrowed: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let extractions: Vec<Extraction> = borrowed.iter().map(|(p, s)| extract_file(p, s)).collect();
+        let mut resolver = Resolver::new();
+        resolver.index_project_manifests(&devmap_extract::collect_project_manifests(&base).unwrap());
+        resolver.index_extractions(&extractions);
+        let r = resolver.resolve_all(&extractions).unwrap();
+        assert!(imports(&r, "python/rootpkg/rel.py", "python/rootpkg/util.py"), "{name}");
+        assert!(imports(&r, "python/rootpkg/sub/deep.py", "python/rootpkg/util.py"), "{name}");
+    }
+}
+
 #[test]
 #[ignore]
 fn dump_import_edges() {
@@ -277,7 +300,11 @@ fn dump_import_edges() {
     walk(base, base, &mut files);
     files.sort();
     let borrowed: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
-    let r = resolve(&borrowed);
+    let extractions: Vec<Extraction> = borrowed.iter().map(|(p, s)| extract_file(p, s)).collect();
+    let mut resolver = Resolver::new();
+    resolver.index_project_manifests(&devmap_extract::collect_project_manifests(base).unwrap());
+    resolver.index_extractions(&extractions);
+    let r = resolver.resolve_all(&extractions).unwrap();
     let mut lines: Vec<String> = r
         .edges
         .iter()
