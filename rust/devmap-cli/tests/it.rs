@@ -81,6 +81,7 @@ mod secret_paths_stay_out_of_answers_and_artifacts;
 mod small_native_stack;
 mod standalone_namespace;
 mod state_discovery_contract;
+mod resolution_rate_attack;
 mod status_names_budget_refused_files;
 mod status_reason_parity;
 mod status_names_what_it_could_not_read;
