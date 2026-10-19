@@ -1,9 +1,9 @@
 {
   "go": {
-    "forbid_any_tier_rows": 2,
+    "forbid_any_tier_rows": 3,
     "known_failing": 0,
-    "positive_rows": 51,
-    "present": 51
+    "positive_rows": 52,
+    "present": 52
   },
   "kotlin": {
     "forbid_any_tier_rows": 4,
