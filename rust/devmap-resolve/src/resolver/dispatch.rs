@@ -324,18 +324,46 @@ impl Resolver {
     /// (`some View`, `any View`) is the protocol it names — a call on it is a
     /// call through that protocol. The result must be one declared type: a name
     /// two files declare is a type this resolver cannot dispatch on.
-    pub(super) fn swift_chained_receiver(
-        &self,
-        file: &str,
-        scope: Option<&str>,
-        receiver: &str,
-        binding: Option<&LocalBinding>,
-    ) -> Option<String> {
-        if !file.ends_with(".swift") || !receiver.ends_with(')') {
+    /// Swift: whether the property `property` (a member identity in `file`) may
+    /// hold something callable, so that `x.property(..)` is a use of it.
+    ///
+    /// The extraction states a property's type only when it is one nominal
+    /// type: a `Type` reference assigned to the property's name inside its
+    /// owner. A closure, a tuple and a collection state none, so no such
+    /// reference is the one evidence left that the type is not a plain value.
+    /// A property of nominal type is refused (`padding: CGFloat`, `count: Int`)
+    /// unless that name is a `typealias`, whose target the extraction does not
+    /// carry — an alias stays a candidate, which is the one place this admits
+    /// a value type it cannot rule out.
+    pub(super) fn swift_property_may_be_called(&self, file: &str, property: &str) -> bool {
+        let Some(owner) = self
+            .symbol_parents
+            .get(&(file.to_string(), property.to_string()))
+        else {
+            return false;
+        };
+        let name = property.rsplit('.').next().unwrap_or(property);
+        match self.swift_member_written_types.get(&(
+            file.to_string(),
+            owner.clone(),
+            name.to_string(),
+        )) {
+            None => true,
+            Some(types) => types
+                .iter()
+                .all(|written| self.swift_type_aliases.contains(written)),
+        }
+    }
+
+    /// `(prefix, method)` of a receiver that is exactly one method call on a
+    /// plain receiver: `base.padding()` is `("base", "padding")`. The `(` read
+    /// is the one that closes with the final `)`; a string or character literal
+    /// in the arguments can hold an unbalanced paren, so none is read. A call on
+    /// an optional (`a?.m()`, `a!.m()`) is not one: the value is wrapped.
+    pub(super) fn swift_call_chain_split(receiver: &str) -> Option<(&str, &str)> {
+        if !receiver.ends_with(')') {
             return None;
         }
-        // The `(` that closes with the final `)`; a string or character literal
-        // in the arguments can hold an unbalanced paren, so none is read.
         let mut depth = 0usize;
         let mut open = None;
         for (index, ch) in receiver.char_indices().rev() {
@@ -352,11 +380,22 @@ impl Resolver {
                 _ => {}
             }
         }
-        let head = &receiver[..open?];
-        let (prefix, method) = head.rsplit_once('.')?;
-        if !Self::is_plain_ident(method) || prefix.is_empty() || prefix.ends_with(['?', '!']) {
+        let (prefix, method) = receiver[..open?].rsplit_once('.')?;
+        (Self::is_plain_ident(method) && !prefix.is_empty() && !prefix.ends_with(['?', '!']))
+            .then_some((prefix, method))
+    }
+
+    pub(super) fn swift_chained_receiver(
+        &self,
+        file: &str,
+        scope: Option<&str>,
+        receiver: &str,
+        binding: Option<&LocalBinding>,
+    ) -> Option<String> {
+        if !file.ends_with(".swift") {
             return None;
         }
+        let (prefix, method) = Self::swift_call_chain_split(receiver)?;
         let root = Self::path_root(prefix);
         let base = self.receiver_type_for(
             file,
@@ -392,7 +431,31 @@ impl Resolver {
             .unwrap_or_else(|| written.trim());
         let mut nominal = Self::admissible_nominal_type(written)?;
         if nominal == "Self" {
-            nominal = self.declaring_type_of(&callee_file, &callee)?.to_string();
+            // `-> Self` is the receiver's own concrete type, whichever
+            // supertype's extension declared the method: the next call is then
+            // resolved against that type, an override included.
+            nominal = base.clone();
+        } else {
+            // A return type that is a generic parameter of the function
+            // (`id<Item>(_:) -> Item`: a second unassigned mention, the clause)
+            // or of its type (`Box<Element>`: a mention on the type's own
+            // header) is not the same-named declared type.
+            let mentions = self
+                .swift_unassigned_type_mentions
+                .get(&(callee_file.clone(), callee.clone(), nominal.clone()))
+                .copied()
+                .unwrap_or(0);
+            let owner = self
+                .declaring_type_of(&callee_file, &callee)
+                .map(|owner| owner.rsplit('.').next().unwrap_or(owner).to_string());
+            if mentions != 1
+                || owner.is_some_and(|owner| {
+                    self.swift_type_header_mentions
+                        .contains(&(owner, nominal.clone()))
+                })
+            {
+                return None;
+            }
         }
         if self.swift_type_aliases.contains(nominal.as_str()) {
             return None;

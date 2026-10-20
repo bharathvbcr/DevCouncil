@@ -635,6 +635,18 @@ pub struct Resolver {
     /// Every name any Swift file declares with `typealias`; see
     /// [`Extraction::swift_type_aliases`].
     swift_type_aliases: BTreeSet<String>,
+    /// `(file, enclosing symbol, bare type name)` to how many `Type`
+    /// references with no assigned name a Swift declaration makes of it. A
+    /// callable that writes `-> Inner` makes one; a generic clause adds another.
+    swift_unassigned_type_mentions: BTreeMap<(String, String, String), u32>,
+    /// `(bare owner type, bare type name)` for every unassigned `Type`
+    /// reference a Swift type declaration makes outside its members: where a
+    /// generic parameter of the type (`Box<Element>`) is declared.
+    swift_type_header_mentions: BTreeSet<(String, String)>,
+    /// `(file, owner scope, member name)` to the nominal type names the
+    /// extraction wrote for that member (a `Type` reference assigned to it).
+    /// A member with no entry states no single nominal type.
+    swift_member_written_types: BTreeMap<(String, String, String), BTreeSet<String>>,
     /// `(package, declared name)` to the files of that package declaring it:
     /// what a Kotlin/Java `import a.b.name` is read against, because a
     /// top-level function or an extension is not in a file named for it.
@@ -780,6 +792,9 @@ impl Resolver {
             swift_module_by_file: BTreeMap::new(),
             jvm_package_by_file: BTreeMap::new(),
             swift_type_aliases: BTreeSet::new(),
+            swift_unassigned_type_mentions: BTreeMap::new(),
+            swift_type_header_mentions: BTreeSet::new(),
+            swift_member_written_types: BTreeMap::new(),
             jvm_package_symbols: BTreeMap::new(),
             field_initializers: BTreeMap::new(),
             gradle_module_dirs: Vec::new(),

@@ -291,21 +291,49 @@ impl Resolver {
         // The caller's own type, declared in its file, with the nesting its
         // qualified name carries (`A.Inner` for the type whose members are
         // parented to `Inner`).
+        // A nested type's qualified name keeps only its immediate parent
+        // (`M.Deep` inside `A.M`), so the outer type is found by climbing:
+        // each type's parent, resolved by its bare name within the file, up to
+        // the target's outer type.
         let file_prefix = format!("{file}::");
-        let lexically_inside = self
-            .symbol_index
-            .get(caller_type.rsplit('.').next().unwrap_or(&caller_type))
-            .into_iter()
-            .flatten()
-            .any(|(path, kind, _, identity)| {
-                path == file
-                    && is_type(*kind)
-                    && identity
-                        .strip_prefix(&file_prefix)
-                        .is_some_and(|qualified| inside(qualified))
-            });
-        if lexically_inside {
-            return false;
+        let type_named = |bare: &str| -> Vec<String> {
+            self.symbol_index
+                .get(bare)
+                .into_iter()
+                .flatten()
+                .filter(|(path, kind, _, _)| path == file && is_type(*kind))
+                .map(|(_, _, _, identity)| identity.to_string())
+                .collect()
+        };
+        let mut climbing = type_named(caller_type.rsplit('.').next().unwrap_or(&caller_type));
+        let mut climbed: BTreeSet<String> = BTreeSet::new();
+        for _ in 0..Self::HERITAGE_WALK_MAX_DEPTH * 4 {
+            let mut parents: Vec<String> = Vec::new();
+            for identity in climbing.drain(..) {
+                if !climbed.insert(identity.clone()) {
+                    continue;
+                }
+                if identity
+                    .strip_prefix(&file_prefix)
+                    .is_some_and(|qualified| inside(qualified))
+                {
+                    return false;
+                }
+                if let Some(parent) = self
+                    .symbol_parents
+                    .get(&(file.to_string(), identity))
+                    .and_then(|parent| parent.strip_prefix(&file_prefix))
+                {
+                    if inside(parent) {
+                        return false;
+                    }
+                    parents.extend(type_named(parent.rsplit('.').next().unwrap_or(parent)));
+                }
+            }
+            if parents.is_empty() {
+                break;
+            }
+            climbing = parents;
         }
         // A subtype sees the member types of its supertypes.
         let outer_name = outer.rsplit('.').next().unwrap_or(outer);

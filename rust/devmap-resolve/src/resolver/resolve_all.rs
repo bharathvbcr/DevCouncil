@@ -548,6 +548,13 @@ impl Resolver {
                                         self.inherited_method(family, &class_type, &member)
                                             .map(|(file, symbol, _)| (file, symbol))
                                     })
+                                    // Only a property that can hold a closure is
+                                    // called through its name; a `CGFloat` or
+                                    // `Int` property beside an unindexed
+                                    // `padding(_:)`/`count()` method is not.
+                                    .filter(|(file, symbol)| {
+                                        self.swift_property_may_be_called(file, symbol)
+                                    })
                             })
                             .flatten();
                             let inherited = inherited.or(through_property);
@@ -591,9 +598,19 @@ impl Resolver {
                                     // `ReceiverType`, because `protocol_dispatch`
                                     // returns `None` unless every indexed hit is
                                     // an interface or a trait.
-                                    LangFamily::Swift | LangFamily::Rust | LangFamily::JsTs => self
-                                        .protocol_dispatch(family, &class_type, &call.callee_name)
-                                        .map(|(direct, targets)| {
+                                    // A Swift receiver typed by a call chain
+                                    // (`a.padding().badge()`) is a protocol named
+                                    // by one return type's text. Conformers are
+                                    // joined to a protocol by its bare name, so
+                                    // fanning out from that text would reach a
+                                    // namesake protocol's conformer (SwiftUI's
+                                    // `View`): the chain gets the direct edge only.
+                                    LangFamily::Swift | LangFamily::Rust | LangFamily::JsTs => (!(family
+                                        == LangFamily::Swift
+                                        && Self::swift_call_chain_split(recv).is_some()))
+                                    .then(|| self.protocol_dispatch(family, &class_type, &call.callee_name))
+                                    .flatten()
+                                    .map(|(direct, targets)| {
                                             self.dispatch_through_interface(
                                                 ext,
                                                 call,
