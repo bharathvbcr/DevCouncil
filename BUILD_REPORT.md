@@ -1,6 +1,6 @@
 # Build report: GitPulse backlog run, 2026-10-17 to 2026-10-18
 
-This run worked the open GitPulse cards for DevCouncil. Each lane went through an Opus brief, a Sonnet implementer, one or more adversarial Sonnet passes, and an Opus review. Fable ruled on sequencing and tradeoffs. Local `main` moved from `4a5ca10c` to `a49c42bf`. **Nothing is pushed.** No card reached done: requesting done returns "no verification record exists for this task: Manvi's work.verify.task has not judged it", and that tool cannot be invoked from this session.
+This run worked the open GitPulse cards for DevCouncil. Each lane went through an Opus brief, a Sonnet implementer, one or more adversarial Sonnet passes, and an Opus review. Fable ruled on sequencing and tradeoffs. Local `main` moved from `4a5ca10c` to `638c5a6e` (as of 2026-10-19). Still in flight: ft-915b0a03 (Swift resolver residue), which was sent back after its attack found one high and four medium regressions, and ft-c0afdfef (Python receiver residue), whose implementer is still running. **Nothing is pushed.** No card reached done: requesting done returns "no verification record exists for this task: Manvi's work.verify.task has not judged it", and that tool cannot be invoked from this session.
 
 AUDIT_REPORT.md's waves 1–6 were already all in review when the run began, so work continued by priority, severity and Fable's order. The previous report is kept as `BUILD_REPORT-2026-10-15.md`.
 
@@ -34,6 +34,8 @@ AUDIT_REPORT.md's waves 1–6 were already all in review when the run began, so 
 | ft-befc1ff0 (blast pathspecs) | `GIT_LITERAL_PATHSPECS=1` in the shared dc-proc git runner; the conflicting global switches are stripped | 1 medium fixed; Go call sites are logged as a follow-up |
 | ft-09f2437e (budget refusals in answers) | pinning tests for dead, affected, explore and the daemon drain; caveat names "budget-refused" and a count. Fable amended criterion 2 to a corpus-wide caveat. | 0 high/medium; 2 lows fixed |
 | ft-93ece913 (blast/suspects) | mostly already on main (cded4595, 4e311c09); added an unreadable basis → ContentUnavailable | the ≤1/3 wall-time target has not been measured on a quiet machine, so the card stays open |
+| ft-b7362179 (resolution-rate honesty) | call-blind and vendored sites leave the headline rate; additive `measured_resolved_sites` / `measured_unresolved_sites` / `measured_explained_sites` carry the headline denominators. Opus ruled the raw totals stay a public contract, and an invariant test ties them to the measured fields. Merged as `7e110127`. | probes repointed to `measured_*`; analyze and cli suites green on the combined tree |
+| ft-bd1bfac9 (Python relative imports) | a relative import resolves only inside the importing package; a bare `.` or `..` names the package, so only its `__init__.py` answers (`30a7143c`). Merged as `ec034f60`. The follow-up `c167b9d8` handles namespace-package submodules and the bare-dots binding join. | 4 attack probes failed on the first round, then were fixed before merge |
 
 ## Benchmarks on touched paths
 
