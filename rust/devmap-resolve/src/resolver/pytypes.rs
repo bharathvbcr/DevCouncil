@@ -1590,16 +1590,71 @@ pub(super) fn python_import_binds(
 /// like `register(x)` between two functions therefore also counts, which costs
 /// a return type, never a wrong edge.
 ///
-/// `staticmethod`, `classmethod`, `functools.lru_cache` and `functools.cache`
-/// are transparent: each returns the wrapped function's value unchanged, so the
-/// written return type is still what a call yields.
+/// Transparent decorators return the wrapped function's value unchanged, so
+/// the written return type is still what a call yields: `functools.cache` and
+/// `functools.lru_cache` (by their `functools` identity through this file's
+/// imports — `from functools import cache as memo`, `import functools`), and
+/// the builtins `staticmethod` and `classmethod` when nothing in the file
+/// rebinds them. A same-named function the file defines or imports from
+/// elsewhere is opaque. A base class in a class header is a `Name` reference
+/// over the span of its `Heritage` reference, and is no decorator.
 pub(super) fn python_decorated_callables(ext: &Extraction) -> Vec<String> {
-    const TRANSPARENT: [&str; 4] = ["staticmethod", "classmethod", "lru_cache", "cache"];
-    let transparent_starts: BTreeSet<usize> = ext
+    let binds = python_import_binds(ext);
+    let file_level: BTreeSet<&str> = ext
+        .symbols
+        .iter()
+        .filter(|sym| sym.parent_symbol.as_deref() == Some(ext.file_path.as_str()))
+        .map(|sym| sym.name.as_str())
+        .collect();
+    let sole_bind = |name: &str| -> Option<&PythonImportBind> {
+        let bound = binds.get(name)?;
+        let mut only = bound.iter();
+        match (only.next(), only.next()) {
+            (Some(bind), None) if !file_level.contains(name) => Some(bind),
+            _ => None,
+        }
+    };
+    let is_functools_module = |name: &str| {
+        matches!(
+            sole_bind(name),
+            Some(PythonImportBind::Package(module) | PythonImportBind::Module(module))
+                if module == "functools"
+        )
+    };
+    let is_cache_name = |name: &str| matches!(name, "cache" | "lru_cache");
+    let functools_roots: BTreeSet<usize> = ext
         .references
         .iter()
-        .filter(|r| TRANSPARENT.contains(&r.name.as_str()))
+        .filter(|r| {
+            r.kind == ReferenceKind::Name
+                && r.receiver_expr.is_none()
+                && is_functools_module(&r.name)
+        })
         .map(|r| r.span.start_byte)
+        .collect();
+    let transparent = |r: &ExtractedReference| -> bool {
+        let name = r.name.as_str();
+        match r.receiver_expr.as_deref() {
+            Some(root) => is_cache_name(name) && is_functools_module(root),
+            None => {
+                (matches!(name, "staticmethod" | "classmethod")
+                    && !file_level.contains(name)
+                    && !binds.contains_key(name))
+                    || matches!(
+                        sole_bind(name),
+                        Some(PythonImportBind::Member(member))
+                            if member == "functools.cache" || member == "functools.lru_cache"
+                    )
+                    || (is_cache_name(name) && functools_roots.contains(&r.span.start_byte))
+                    || (r.kind == ReferenceKind::Name && is_functools_module(name))
+            }
+        }
+    };
+    let base_spans: BTreeSet<(usize, usize)> = ext
+        .references
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Heritage)
+        .map(|r| (r.span.start_byte, r.span.end_byte))
         .collect();
     let mut gaps: Vec<(usize, usize)> = ext
         .references
@@ -1607,8 +1662,9 @@ pub(super) fn python_decorated_callables(ext: &Extraction) -> Vec<String> {
         .filter(|r| {
             matches!(r.kind, ReferenceKind::Name | ReferenceKind::Call)
                 && r.assigned_to.is_none()
-                && !TRANSPARENT.contains(&r.name.as_str())
-                && !transparent_starts.contains(&r.span.start_byte)
+                && !transparent(r)
+                && !(r.kind == ReferenceKind::Name
+                    && base_spans.contains(&(r.span.start_byte, r.span.end_byte)))
         })
         .map(|r| (r.span.start_byte, r.span.end_byte))
         .collect();
