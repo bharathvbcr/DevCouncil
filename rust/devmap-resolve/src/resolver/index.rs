@@ -60,7 +60,6 @@ impl Resolver {
         self.swift_type_aliases.clear();
         self.swift_unassigned_type_mentions.clear();
         self.swift_type_header_mentions.clear();
-        self.swift_member_written_types.clear();
         self.jvm_package_symbols.clear();
         self.field_initializers.clear();
         self.swift_module_files.clear();
@@ -351,26 +350,6 @@ impl Resolver {
                 for reference in &ext.references {
                     if reference.kind != ReferenceKind::Type {
                         continue;
-                    }
-                    if let (Some(owner), Some(member)) = (
-                        reference.enclosing_symbol.as_deref(),
-                        reference.assigned_to.as_deref(),
-                    ) {
-                        self.swift_member_written_types
-                            .entry((
-                                ext.file_path.clone(),
-                                owner.to_string(),
-                                member.to_string(),
-                            ))
-                            .or_default()
-                            .insert(
-                                reference
-                                    .name
-                                    .rsplit('.')
-                                    .next()
-                                    .unwrap_or(&reference.name)
-                                    .to_string(),
-                            );
                     }
                     if let (Some(owner), None) = (
                         reference.enclosing_symbol.as_deref(),

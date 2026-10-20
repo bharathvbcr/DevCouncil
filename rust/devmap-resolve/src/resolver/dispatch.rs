@@ -324,37 +324,6 @@ impl Resolver {
     /// (`some View`, `any View`) is the protocol it names — a call on it is a
     /// call through that protocol. The result must be one declared type: a name
     /// two files declare is a type this resolver cannot dispatch on.
-    /// Swift: whether the property `property` (a member identity in `file`) may
-    /// hold something callable, so that `x.property(..)` is a use of it.
-    ///
-    /// The extraction states a property's type only when it is one nominal
-    /// type: a `Type` reference assigned to the property's name inside its
-    /// owner. A closure, a tuple and a collection state none, so no such
-    /// reference is the one evidence left that the type is not a plain value.
-    /// A property of nominal type is refused (`padding: CGFloat`, `count: Int`)
-    /// unless that name is a `typealias`, whose target the extraction does not
-    /// carry — an alias stays a candidate, which is the one place this admits
-    /// a value type it cannot rule out.
-    pub(super) fn swift_property_may_be_called(&self, file: &str, property: &str) -> bool {
-        let Some(owner) = self
-            .symbol_parents
-            .get(&(file.to_string(), property.to_string()))
-        else {
-            return false;
-        };
-        let name = property.rsplit('.').next().unwrap_or(property);
-        match self.swift_member_written_types.get(&(
-            file.to_string(),
-            owner.clone(),
-            name.to_string(),
-        )) {
-            None => true,
-            Some(types) => types
-                .iter()
-                .all(|written| self.swift_type_aliases.contains(written)),
-        }
-    }
-
     /// `(prefix, method)` of a receiver that is exactly one method call on a
     /// plain receiver: `base.padding()` is `("base", "padding")`. The `(` read
     /// is the one that closes with the final `)`; a string or character literal

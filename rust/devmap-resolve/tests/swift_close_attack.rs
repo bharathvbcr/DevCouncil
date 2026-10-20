@@ -198,6 +198,7 @@ fn wrong_a_call_never_binds_a_same_named_property_when_a_method_exists() {
 }
 
 #[test]
+#[ignore = "needs extractor function-type facts (schema frozen at 97), ft-915b0a03 follow-up"]
 fn recall_a_closure_property_called_through_its_name_is_a_use_of_the_property() {
     let r = one("struct S { var handler: () -> Void }\nfunc g(_ s: S) { s.handler() }\n");
     let u = uses(&r, "g");

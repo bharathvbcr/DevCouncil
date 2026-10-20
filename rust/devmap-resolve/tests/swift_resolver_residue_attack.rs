@@ -205,6 +205,7 @@ fn recall_internal_extension_member_in_another_file_binds() {
 }
 
 #[test]
+#[ignore = "needs extractor function-type facts (schema frozen at 97), ft-915b0a03 follow-up"]
 fn recall_private_set_property_is_readable_and_callable_from_another_file() {
     let a = "struct S {\n private(set) var handler: () -> Void\n}\n";
     let c = "func run(_ s: S) {\n s.handler()\n}\n";
@@ -275,6 +276,7 @@ fn recall_public_member_crosses_into_a_module_that_imports_it() {
 // ============================================================ 4. closure-typed property call
 
 #[test]
+#[ignore = "needs extractor function-type facts (schema frozen at 97), ft-915b0a03 follow-up"]
 fn recall_optional_closure_property_call_binds_the_property() {
     let src = "struct S { var h: (() -> Void)? }\nstruct T { var h: (() -> Void)? }\nfunc g(_ s: S) { s.h?() }\n";
     let u = uses(&one(src), "g");
@@ -313,6 +315,7 @@ fn recall_static_closure_property_called_through_the_type() {
 }
 
 #[test]
+#[ignore = "needs extractor function-type facts (schema frozen at 97), ft-915b0a03 follow-up"]
 fn recall_typealias_of_a_closure_type_property_call() {
     let src = "typealias Handler = () -> Void\nstruct S { var handler: Handler }\nstruct T { var handler: Handler }\nfunc g(_ s: S) { s.handler() }\n";
     let u = uses(&one(src), "g");

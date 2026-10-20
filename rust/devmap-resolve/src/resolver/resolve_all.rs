@@ -520,44 +520,6 @@ impl Resolver {
                                     .map(|(file, symbol, _)| (file, symbol))
                             })
                             .flatten();
-                            // Swift: `s.handler()` where `handler` is a stored
-                            // closure (or a value with `callAsFunction`) is a
-                            // call *through the property*. The type declares no
-                            // method of that name, so the member the receiver's
-                            // type does declare under it is the property.
-                            let through_property = (family == LangFamily::Swift
-                                && own.is_none()
-                                && inherited.is_none()
-                                && !self.type_methods.contains_key(&key))
-                            .then(|| {
-                                let member = Self::property_member(&call.callee_name);
-                                self.type_methods
-                                    .get(&(family, class_type.clone(), member.clone()))
-                                    .and_then(|hits| {
-                                        self.receiver_type_method(
-                                            ext,
-                                            call.caller_symbol.as_deref(),
-                                            recv,
-                                            site_binding,
-                                            &class_type,
-                                            hits,
-                                        )
-                                    })
-                                    .map(|(file, symbol)| (file.clone(), symbol.clone()))
-                                    .or_else(|| {
-                                        self.inherited_method(family, &class_type, &member)
-                                            .map(|(file, symbol, _)| (file, symbol))
-                                    })
-                                    // Only a property that can hold a closure is
-                                    // called through its name; a `CGFloat` or
-                                    // `Int` property beside an unindexed
-                                    // `padding(_:)`/`count()` method is not.
-                                    .filter(|(file, symbol)| {
-                                        self.swift_property_may_be_called(file, symbol)
-                                    })
-                            })
-                            .flatten();
-                            let inherited = inherited.or(through_property);
                             // Failing that, the one a Rust blanket impl
                             // supplies — see `rust_blanket_method` for its tier.
                             let blanket = (family == LangFamily::Rust
