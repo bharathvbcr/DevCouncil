@@ -1043,3 +1043,297 @@ fn walk(base: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, St
         }
     }
 }
+
+// =================== second round ========================================
+
+#[test]
+fn a21b_local_instance_method_call_result() {
+    let res = resolve(&[(
+        "m.py",
+        "class B:\n    def run(self):\n        return 1\n\nclass C:\n    def make(self) -> B:\n        return B()\n\ndef go():\n    c = C()\n    return c.make().run()\n",
+    )]);
+    edge(&res, "m.py::go", "m.py::B.run", "a21b local c = C(); c.make().run() regression");
+}
+
+#[test]
+fn a21c_module_global_instance_method_call_result() {
+    let res = resolve(&[(
+        "m.py",
+        "class B:\n    def run(self):\n        return 1\n\nclass C:\n    def make(self) -> B:\n        return B()\n\nc: C = C()\n\ndef go():\n    return c.make().run()\n",
+    )]);
+    edge(&res, "m.py::go", "m.py::B.run", "a21c global c: C; c.make().run() regression");
+}
+
+#[test]
+fn a25b_decorated_factory_assignment_form_classifies_preexisting() {
+    let res = resolve(&[(
+        "m.py",
+        "from typing import List\n\nclass A:\n    def run(self):\n        return 1\n    def append(self, x):\n        return 2\n\ndef many(fn):\n    def inner(*a) -> List[A]:\n        return [fn(*a)]\n    return inner\n\n@many\ndef make() -> A:\n    return A()\n\ndef use():\n    x = make()\n    x.append(1)\n",
+    )]);
+    no_edge(&res, "m.py::use", "m.py::A.append", "a25b x = make() with @many");
+}
+
+#[test]
+fn a30b_aliased_return_type_assignment_form_classifies_preexisting() {
+    let res = resolve(&[
+        ("real.py", "class Log:\n    def write(self):\n        return 1\n"),
+        ("other.py", "class L:\n    def write(self):\n        return 2\n"),
+        ("factory.py", "from real import Log as L\n\ndef make() -> L:\n    return L()\n"),
+        ("app.py", "from factory import make\n\ndef use():\n    x = make()\n    x.write()\n"),
+    ]);
+    no_edge(&res, "app.py::use", "other.py::L.write", "a30b x = make()");
+}
+
+#[test]
+fn a02b_star_import_assignment_form_classifies_preexisting() {
+    let res = resolve(&[
+        ("a.py", &format!("{A_RUN}\ndef make() -> A:\n    return A()\n")),
+        ("b.py", &format!("{B_RUN}\ndef make() -> B:\n    return B()\n")),
+        ("app.py", "from a import *\nfrom b import *\n\ndef use():\n    x = make()\n    x.run()\n"),
+    ]);
+    no_edge(&res, "app.py::use", "a.py::A.run", "a02b x = make() star");
+}
+
+#[test]
+fn a33_nested_def_shadows_factory() {
+    let res = resolve(&[
+        ("a.py", &format!("{A_RUN}\ndef make() -> A:\n    return A()\n")),
+        ("b.py", B_RUN),
+        (
+            "app.py",
+            "from a import make\nfrom b import B\n\ndef use():\n    def make() -> B:\n        return B()\n    return make().run()\n",
+        ),
+    ]);
+    no_edge(&res, "app.py::use", "a.py::A.run", "a33");
+}
+
+#[test]
+fn a34_conditional_defs_of_the_factory() {
+    let res = resolve(&[(
+        "m.py",
+        "import sys\n\nclass A:\n    def run(self):\n        return 1\n\nclass B:\n    def run(self):\n        return 2\n\nif sys.platform == 'win32':\n    def make() -> A:\n        return A()\nelse:\n    def make() -> B:\n        return B()\n\ndef use():\n    return make().run()\n",
+    )]);
+    let a = reaches(&res, "m.py::use", "m.py::A.run");
+    let b = reaches(&res, "m.py::use", "m.py::B.run");
+    assert_eq!(a, b, "a34: {:?}", calls_from(&res, "m.py::use"));
+}
+
+#[test]
+fn b12b_same_file_untyped_param_classifies_preexisting() {
+    let res = resolve(&[(
+        "m.py",
+        "class Log:\n    def write(self):\n        return 1\n\nclass Holder:\n    log: Log\n\ndef typed(h: Holder):\n    return h.log.write()\n\ndef untyped(h):\n    return h.log.write()\n",
+    )]);
+    no_edge(&res, "m.py::untyped", "m.py::Log.write", "b12b same file");
+}
+
+#[test]
+fn b12c_untyped_method_param_other_file_holder() {
+    let res = resolve(&[
+        ("logs.py", LOGS),
+        ("holder.py", &holder("Log")),
+        (
+            "app.py",
+            "from holder import Holder\n\ndef typed(h: Holder):\n    return 1\n\nclass Svc:\n    def go(self, h):\n        return h.log.write()\n",
+        ),
+    ]);
+    no_edge(&res, "app.py::Svc.go", "logs.py::Log.write", "b12c untyped method param h");
+}
+
+#[test]
+fn b14b_with_var_alone() {
+    let res = resolve(&[
+        ("logs.py", LOGS),
+        ("holder.py", &holder("Log")),
+        (
+            "app.py",
+            "from holder import Holder\n\ndef typed(h: Holder):\n    return h.log.write()\n\ndef ctx(m):\n    with m() as h:\n        h.log.write()\n",
+        ),
+    ]);
+    no_edge(&res, "app.py::ctx", "logs.py::Log.write", "b14b with var");
+}
+
+#[test]
+fn b14c_comprehension_var() {
+    let res = resolve(&[
+        ("logs.py", LOGS),
+        ("holder.py", &holder("Log")),
+        (
+            "app.py",
+            "from holder import Holder\n\ndef typed(h: Holder):\n    return h.log.write()\n\ndef comp(xs):\n    return [h.log.write() for h in xs]\n",
+        ),
+    ]);
+    no_edge(&res, "app.py::comp", "logs.py::Log.write", "b14c comprehension var");
+}
+
+fn c06b_case(label: &str, tail: &str) {
+    let src = format!("import a.b.c\n{tail}\ndef use():\n    a.b.c.f()\n");
+    let files: Vec<(&str, &str)> = vec![
+        ("a/__init__.py", ""),
+        ("a/b/__init__.py", ""),
+        ("a/b/c.py", "def f():\n    return 1\n"),
+        ("app.py", &src),
+    ];
+    let res = resolve(&files);
+    no_edge(&res, "app.py::use", "a/b/c.py::f", &format!("c06b rebind via {label}"));
+}
+
+#[test]
+fn c06c_rebind_for() { c06b_case("for", "for a in []:\n    pass\n"); }
+#[test]
+fn c06d_rebind_with() { c06b_case("with", "with open('x') as a:\n    pass\n"); }
+#[test]
+fn c06e_rebind_def() { c06b_case("def", "def a():\n    pass\n"); }
+#[test]
+fn c06f_rebind_class() { c06b_case("class", "class a:\n    pass\n"); }
+#[test]
+fn c06g_rebind_del() { c06b_case("del", "del a\n"); }
+#[test]
+fn c06h_rebind_walrus() { c06b_case("walrus", "(a := 3)\n"); }
+#[test]
+fn c06i_rebind_import_as() { c06b_case("import-as", "import os as a\n"); }
+#[test]
+fn c06j_rebind_try_except_as() { c06b_case("except-as", "try:\n    pass\nexcept Exception as a:\n    pass\n"); }
+#[test]
+fn c06k_rebind_assign_later() { c06b_case("later-assign", "a = object()\n"); }
+#[test]
+fn c06l_rebind_from_import() { c06b_case("from-import", "from os import path as a\n"); }
+
+#[test]
+fn c15_global_declaration_rebind_in_other_function() {
+    let res = tree(
+        &[("o.py", "class O:\n    def f(self):\n        return 1\n")],
+        "import a.b.c\nfrom o import O\n\ndef setup():\n    global a\n    a = O()\n\ndef use():\n    a.b.c.f()\n",
+    );
+    no_edge(&res, "app.py::use", "a/b/c.py::f", "c15 global a rebound in setup()");
+}
+
+#[test]
+fn s05_many_dotted_calls_times_many_imports() {
+    let mut src = String::new();
+    for i in 0..2000 {
+        src.push_str(&format!("import pk{i}.sub.mod\n"));
+    }
+    src.push_str("\ndef use(o):\n");
+    for _ in 0..5000 {
+        src.push_str("    o.attr.method()\n");
+    }
+    let t = Instant::now();
+    let _ = resolve(&[("big.py", &src)]);
+    eprintln!("S05_ELAPSED_MS {}", t.elapsed().as_millis());
+    assert!(t.elapsed().as_secs() < 60);
+}
+
+#[test]
+fn s06_many_dotted_module_calls_resolve_cost() {
+    let mut files: Vec<(String, String)> = vec![];
+    let mut src = String::new();
+    for i in 0..300 {
+        files.push((format!("pk{i}/__init__.py"), String::new()));
+        files.push((format!("pk{i}/sub/__init__.py"), String::new()));
+        files.push((format!("pk{i}/sub/mod.py"), "def f():\n    return 1\n".to_string()));
+        src.push_str(&format!("import pk{i}.sub.mod\n"));
+    }
+    src.push_str("\ndef use():\n");
+    for i in 0..300 {
+        for _ in 0..10 {
+            src.push_str(&format!("    pk{i}.sub.mod.f()\n"));
+        }
+    }
+    files.push(("app.py".to_string(), src));
+    let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let t = Instant::now();
+    let res = resolve(&refs);
+    eprintln!("S06_ELAPSED_MS {}", t.elapsed().as_millis());
+    assert!(t.elapsed().as_secs() < 60);
+    edge(&res, "app.py::use", "pk0/sub/mod.py::f", "s06 (recall)");
+}
+
+/// Characterisation: print the tier of the wrong edges the probes above catch.
+#[test]
+fn z_confidence_report() {
+    let cases: Vec<(&str, Vec<(&str, String)>, &str)> = vec![
+        (
+            "b12 untyped param",
+            vec![
+                ("logs.py", LOGS.to_string()),
+                ("holder.py", holder("Log")),
+                ("app.py", "from holder import Holder\n\ndef typed(h: Holder):\n    return h.log.write()\n\ndef untyped(h):\n    return h.log.write()\n".to_string()),
+            ],
+            "app.py::untyped",
+        ),
+        (
+            "a30 alias",
+            vec![
+                ("real.py", "class Log:\n    def write(self):\n        return 1\n".to_string()),
+                ("other.py", "class L:\n    def write(self):\n        return 2\n".to_string()),
+                ("factory.py", "from real import Log as L\n\ndef make() -> L:\n    return L()\n".to_string()),
+                ("app.py", "from factory import make\n\ndef use():\n    make().write()\n".to_string()),
+            ],
+            "app.py::use",
+        ),
+        (
+            "c05 ambiguous roots",
+            vec![
+                ("src/a/b/c.py", "def f():\n    return 1\n".to_string()),
+                ("lib/a/b/c.py", "def f():\n    return 2\n".to_string()),
+                ("app.py", "import a.b.c\n\ndef use():\n    a.b.c.f()\n".to_string()),
+            ],
+            "app.py::use",
+        ),
+        (
+            "c06c for rebind",
+            vec![
+                ("a/__init__.py", String::new()),
+                ("a/b/__init__.py", String::new()),
+                ("a/b/c.py", "def f():\n    return 1\n".to_string()),
+                ("app.py", "import a.b.c\nfor a in []:\n    pass\n\ndef use():\n    a.b.c.f()\n".to_string()),
+            ],
+            "app.py::use",
+        ),
+        (
+            "a02 star",
+            vec![
+                ("a.py", format!("{A_RUN}\ndef make() -> A:\n    return A()\n")),
+                ("b.py", format!("{B_RUN}\ndef make() -> B:\n    return B()\n")),
+                ("app.py", "from a import *\nfrom b import *\n\ndef use():\n    make().run()\n".to_string()),
+            ],
+            "app.py::use",
+        ),
+    ];
+    for (label, files, caller) in cases {
+        let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (*a, b.as_str())).collect();
+        let res = resolve(&refs);
+        for e in res.edges.iter().filter(|e| e.edge_kind == EdgeKind::Calls && e.source_symbol == caller) {
+            eprintln!("CONF {label}: {} -> {} {:?}", e.source_symbol, e.target_symbol, e.confidence);
+        }
+    }
+}
+
+fn ab_hops(hops: usize) -> String {
+    let mut chain = String::from("A.make()");
+    for _ in 1..hops {
+        chain.push_str(".make()");
+    }
+    format!(
+        "class A:\n    @staticmethod\n    def make() -> \"B\":\n        return B()\n    def run(self):\n        return 1\n\nclass B:\n    @staticmethod\n    def make() -> A:\n        return A()\n    def run(self):\n        return 2\n\ndef use():\n    return {chain}.run()\n"
+    )
+}
+
+#[test]
+fn t01_one_hop_lands_on_b() {
+    let res = resolve(&[("m.py", &ab_hops(1))]);
+    no_edge(&res, "m.py::use", "m.py::A.run", "t01 A.make().run() is a B");
+}
+
+#[test]
+fn t02_two_hops_land_on_a() {
+    let res = resolve(&[("m.py", &ab_hops(2))]);
+    no_edge(&res, "m.py::use", "m.py::B.run", "t02 A.make().make().run() is an A");
+}
+
+#[test]
+fn t03_three_hops_land_on_b() {
+    let res = resolve(&[("m.py", &ab_hops(3))]);
+    no_edge(&res, "m.py::use", "m.py::A.run", "t03 three hops is a B");
+}
