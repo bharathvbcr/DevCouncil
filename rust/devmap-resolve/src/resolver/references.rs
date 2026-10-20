@@ -760,6 +760,29 @@ impl Resolver {
                 .collect();
             if family_hits.len() == 1 {
                 let (target_f, _, _, target_identity) = family_hits[0];
+                // A Swift type nested in another type is named bare only from
+                // inside that type (see `swift_nested_type_is_out_of_scope`).
+                if family == LangFamily::Swift
+                    && reference.name == name
+                    && self.type_qualifier_of(&ext.file_path, reference).is_none()
+                    // `A.Inner` arrives as a `Type` reference for `A` and one for
+                    // `Inner`, the second starting one byte (the dot) after the
+                    // first ends. A qualified spelling names its outer type, so
+                    // only a bare `Inner` can be out of scope.
+                    && !ext.references.iter().any(|written| {
+                        written.kind == ReferenceKind::Type
+                            && written.enclosing_symbol == reference.enclosing_symbol
+                            && written.span.end_byte + 1 == reference.span.start_byte
+                    })
+                    && self.swift_nested_type_is_out_of_scope(
+                        &ext.file_path,
+                        reference.enclosing_symbol.as_deref(),
+                        target_f,
+                        target_identity,
+                    )
+                {
+                    return None;
+                }
                 return Some(self.reference_edge(
                     ext,
                     target_f,

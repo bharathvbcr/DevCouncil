@@ -227,6 +227,144 @@ impl Resolver {
             .map(str::to_string)
     }
 
+    /// Swift: whether `target`, a nested type, cannot be named by its bare
+    /// spelling from where `caller` sits.
+    ///
+    /// A type nested in `A` is a member of `A`: it is found unqualified inside
+    /// `A`, inside a type nested in `A`, in an `extension A` (in any file) and
+    /// in a subtype of `A` — and nowhere else. A bare `Inner` written in an
+    /// unrelated type or a free function names some other `Inner`, so the one
+    /// namesake the global rung finds is a fabricated callee. `false` for a
+    /// top-level target, for a target that is not a type, and for a name a
+    /// `typealias` somewhere may rebind (the alias, not the spelling, then
+    /// decides, and this has no way to read it).
+    ///
+    /// The nesting is read from the declarations' qualified names, because the
+    /// extractor parents a nested type's own members to the bare inner name
+    /// (`a_nested_type_is_a_known_extractor_gap_not_a_rung_gap`), which alone
+    /// loses the outer type.
+    pub(super) fn swift_nested_type_is_out_of_scope(
+        &self,
+        file: &str,
+        caller: Option<&str>,
+        target_file: &str,
+        target: &str,
+    ) -> bool {
+        let is_type = |kind: SymbolKind| {
+            matches!(
+                kind,
+                SymbolKind::Class | SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Interface
+            )
+        };
+        let target_is_a_type = self
+            .symbol_index
+            .get(target)
+            .into_iter()
+            .flatten()
+            .any(|(path, kind, _, identity)| {
+                path == target_file && **identity == *target && is_type(*kind)
+            });
+        let Some(outer) = self
+            .declaring_type_of(target_file, target)
+            .filter(|_| target_is_a_type)
+        else {
+            return false;
+        };
+        let name = target.rsplit(['.', ':']).next().unwrap_or(target);
+        if self.swift_type_aliases.contains(name) {
+            return false;
+        }
+        let Some(caller_type) =
+            caller.and_then(|caller| self.self_type_at(file, LangFamily::Swift, caller))
+        else {
+            return true;
+        };
+        let inside = |written: &str| {
+            written == outer
+                || written
+                    .strip_prefix(outer)
+                    .is_some_and(|rest| rest.starts_with('.'))
+        };
+        if inside(&caller_type) {
+            return false;
+        }
+        // The caller's own type, declared in its file, with the nesting its
+        // qualified name carries (`A.Inner` for the type whose members are
+        // parented to `Inner`).
+        // A nested type's qualified name keeps only its immediate parent
+        // (`M.Deep` inside `A.M`), so the outer type is found by climbing:
+        // each type's parent, resolved by its bare name within the file, up to
+        // the target's outer type.
+        let file_prefix = format!("{file}::");
+        let type_named = |bare: &str| -> Vec<String> {
+            self.symbol_index
+                .get(bare)
+                .into_iter()
+                .flatten()
+                .filter(|(path, kind, _, _)| path == file && is_type(*kind))
+                .map(|(_, _, _, identity)| identity.to_string())
+                .collect()
+        };
+        let mut climbing = type_named(caller_type.rsplit('.').next().unwrap_or(&caller_type));
+        let mut climbed: BTreeSet<String> = BTreeSet::new();
+        for _ in 0..Self::HERITAGE_WALK_MAX_DEPTH * 4 {
+            let mut parents: Vec<String> = Vec::new();
+            for identity in climbing.drain(..) {
+                if !climbed.insert(identity.clone()) {
+                    continue;
+                }
+                if identity
+                    .strip_prefix(&file_prefix)
+                    .is_some_and(|qualified| inside(qualified))
+                {
+                    return false;
+                }
+                if let Some(parent) = self
+                    .symbol_parents
+                    .get(&(file.to_string(), identity))
+                    .and_then(|parent| parent.strip_prefix(&file_prefix))
+                {
+                    if inside(parent) {
+                        return false;
+                    }
+                    parents.extend(type_named(parent.rsplit('.').next().unwrap_or(parent)));
+                }
+            }
+            if parents.is_empty() {
+                break;
+            }
+            climbing = parents;
+        }
+        // A subtype sees the member types of its supertypes.
+        let outer_name = outer.rsplit('.').next().unwrap_or(outer);
+        let mut frontier = vec![caller_type];
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        for _ in 0..Self::HERITAGE_WALK_MAX_DEPTH {
+            let mut next = Vec::new();
+            for name in frontier.drain(..) {
+                if !visited.insert(name.clone()) {
+                    continue;
+                }
+                for base in self
+                    .supertypes
+                    .get(&(LangFamily::Swift, name))
+                    .into_iter()
+                    .flatten()
+                {
+                    if base == outer_name {
+                        return false;
+                    }
+                    next.push(base.clone());
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        true
+    }
+
     /// Whether exactly one indexed file declares a type of this name.
     ///
     /// The identifiability test for the supertype walk. `type_methods` and

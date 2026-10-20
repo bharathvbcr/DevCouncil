@@ -560,9 +560,19 @@ impl Resolver {
                                     // `ReceiverType`, because `protocol_dispatch`
                                     // returns `None` unless every indexed hit is
                                     // an interface or a trait.
-                                    LangFamily::Swift | LangFamily::Rust | LangFamily::JsTs => self
-                                        .protocol_dispatch(family, &class_type, &call.callee_name)
-                                        .map(|(direct, targets)| {
+                                    // A Swift receiver typed by a call chain
+                                    // (`a.padding().badge()`) is a protocol named
+                                    // by one return type's text. Conformers are
+                                    // joined to a protocol by its bare name, so
+                                    // fanning out from that text would reach a
+                                    // namesake protocol's conformer (SwiftUI's
+                                    // `View`): the chain gets the direct edge only.
+                                    LangFamily::Swift | LangFamily::Rust | LangFamily::JsTs => (!(family
+                                        == LangFamily::Swift
+                                        && Self::swift_call_chain_split(recv).is_some()))
+                                    .then(|| self.protocol_dispatch(family, &class_type, &call.callee_name))
+                                    .flatten()
+                                    .map(|(direct, targets)| {
                                             self.dispatch_through_interface(
                                                 ext,
                                                 call,
@@ -1326,6 +1336,44 @@ impl Resolver {
                             }
                         }
                     }
+                    // Swift: a bare call inside a type is first a member of that
+                    // type — `self.name(...)` — and a member this file cannot see
+                    // is still one: the type's own, declared in an extension in
+                    // another file, or a supertype's. Asked before the module's
+                    // free functions, because a member shadows a function of the
+                    // same name.
+                    if resolution.is_none()
+                        && family == LangFamily::Swift
+                        && call.receiver_expr.is_none()
+                        && ext
+                            .local_binding_at(call.span.start_byte, &call.callee_name)
+                            .is_none()
+                    {
+                        if let Some(caller) = call
+                            .caller_symbol
+                            .as_deref()
+                            .filter(|caller| {
+                                !self.scope_declares_local(&ext.file_path, caller, &call.callee_name)
+                            })
+                        {
+                            if let Some(ImplicitReceiverAnswer::Unique {
+                                target_file,
+                                target_symbol,
+                                receiver_type,
+                            }) = self.implicit_receiver_target(
+                                &ext.file_path,
+                                family,
+                                caller,
+                                &call.callee_name,
+                            ) {
+                                resolution = Some(Arc::new(Resolution::ReceiverType {
+                                    target_symbol,
+                                    target_file,
+                                    receiver_type,
+                                }));
+                            }
+                        }
+                    }
                     // A Swift module is the same scope rule as a Go package:
                     // every file-level name is unqualified throughout the
                     // target. Reuses `SamePackage` rather than a second kind —
@@ -1438,9 +1486,21 @@ impl Resolver {
                         };
                         if candidates.declarations == 1 {
                             let (target_f, target_identity) = &candidates.rows[0];
-                            resolution = Some(Arc::new(Resolution::UniqueGlobal {
-                                target_symbol: target_identity.clone(), target_file: target_f.clone(), family,
-                            }));
+                            // A Swift type nested in another type is named
+                            // bare only from inside that type; from anywhere
+                            // else the one namesake this rung found is not it.
+                            let out_of_scope = family == LangFamily::Swift
+                                && self.swift_nested_type_is_out_of_scope(
+                                    &ext.file_path,
+                                    call.caller_symbol.as_deref(),
+                                    target_f,
+                                    target_identity,
+                                );
+                            if !out_of_scope {
+                                resolution = Some(Arc::new(Resolution::UniqueGlobal {
+                                    target_symbol: target_identity.clone(), target_file: target_f.clone(), family,
+                                }));
+                            }
                         } else if candidates.declarations > 1 {
                             charge_ambiguity(&ambiguity_bytes, &candidates, limits.ambiguity_evidence_bytes)?;
                             resolution = Some(Arc::new(Resolution::AmbiguousGlobal { candidates: Arc::clone(&candidates.rows), family }));

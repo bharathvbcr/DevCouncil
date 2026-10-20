@@ -58,6 +58,8 @@ impl Resolver {
         self.swift_module_by_file.clear();
         self.jvm_package_by_file.clear();
         self.swift_type_aliases.clear();
+        self.swift_unassigned_type_mentions.clear();
+        self.swift_type_header_mentions.clear();
         self.jvm_package_symbols.clear();
         self.field_initializers.clear();
         self.swift_module_files.clear();
@@ -322,6 +324,56 @@ impl Resolver {
             }
             self.swift_type_aliases
                 .extend(ext.swift_type_aliases.iter().cloned());
+            if family == LangFamily::Swift {
+                // A generic parameter's declaration is a `Type` reference like
+                // any other: `id<Item>(_ x: Item) -> Item` has one for the
+                // clause, one for the parameter and one for the return, and
+                // `Box<Element>` has one on the type itself. What tells a
+                // parameter from a named type is therefore how many unassigned
+                // mentions a callable makes of the name (a lone one is the
+                // return type) and whether the owner type mentions it outside
+                // any member. Counted here so the resolver reads one fact.
+                let type_identities: BTreeSet<&str> = ext
+                    .symbols
+                    .iter()
+                    .filter(|sym| {
+                        matches!(
+                            sym.kind,
+                            SymbolKind::Class
+                                | SymbolKind::Struct
+                                | SymbolKind::Enum
+                                | SymbolKind::Interface
+                        )
+                    })
+                    .map(|sym| sym.qualified_name.as_str())
+                    .collect();
+                for reference in &ext.references {
+                    if reference.kind != ReferenceKind::Type {
+                        continue;
+                    }
+                    if let (Some(owner), None) = (
+                        reference.enclosing_symbol.as_deref(),
+                        reference.assigned_to.as_deref(),
+                    ) {
+                        let written = reference
+                            .name
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or(&reference.name)
+                            .to_string();
+                        if type_identities.contains(owner) {
+                            let bare = owner.rsplit("::").next().unwrap_or(owner);
+                            let bare = bare.rsplit('.').next().unwrap_or(bare);
+                            self.swift_type_header_mentions
+                                .insert((bare.to_string(), written.clone()));
+                        }
+                        *self
+                            .swift_unassigned_type_mentions
+                            .entry((ext.file_path.clone(), owner.to_string(), written))
+                            .or_insert(0) += 1;
+                    }
+                }
+            }
             if let Some(package) = ext.jvm_package.as_deref() {
                 self.jvm_package_by_file
                     .insert(ext.file_path.clone(), package.to_string());
@@ -1307,9 +1359,19 @@ impl Resolver {
                 };
                 let types: Vec<_> = candidates
                     .iter()
-                    .filter(|(_, kind, candidate_family, _)| {
+                    .filter(|(path, kind, candidate_family, identity)| {
                         family.admits(*candidate_family)
                             && matches!(kind, SymbolKind::Class | SymbolKind::Struct)
+                            // Swift: a `private`/`fileprivate` type of another
+                            // file is not a type this file can write, so it
+                            // does not make the name ambiguous here.
+                            && (family != LangFamily::Swift
+                                || self.candidate_is_visible_from(
+                                    family,
+                                    &ext.file_path,
+                                    path,
+                                    identity,
+                                ))
                     })
                     .map(|(path, kind, _, _)| (path, kind))
                     .collect();

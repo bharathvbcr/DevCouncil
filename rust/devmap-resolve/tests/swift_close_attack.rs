@@ -61,7 +61,7 @@ fn wrong_a_bare_case_spelling_in_a_free_function_binds_no_case() {
 }
 
 #[test]
-#[ignore = "pre-existing top-level let named like a case, ft-915b0a03"]
+#[ignore = "needs extractor change (schema frozen at 97): a top-level `let` emits no symbol for the read to reach, ft-915b0a03"]
 fn recall_a_global_named_like_a_case_still_binds_the_global() {
     let r = one("let circle = 1\nenum Shape { case circle }\nfunc g() -> Int { circle }\n");
     let u = uses(&r, "g");
@@ -198,7 +198,7 @@ fn wrong_a_call_never_binds_a_same_named_property_when_a_method_exists() {
 }
 
 #[test]
-#[ignore = "closure-typed property call, ft-915b0a03"]
+#[ignore = "needs extractor function-type facts (schema frozen at 97), ft-915b0a03 follow-up"]
 fn recall_a_closure_property_called_through_its_name_is_a_use_of_the_property() {
     let r = one("struct S { var handler: () -> Void }\nfunc g(_ s: S) { s.handler() }\n");
     let u = uses(&r, "g");
@@ -229,7 +229,6 @@ fn wrong_a_local_function_does_not_leak_into_a_sibling_method() {
 }
 
 #[test]
-#[ignore = "pre-existing nested-type leak, ft-915b0a03"]
 fn wrong_a_nested_type_does_not_leak_into_a_sibling_type() {
     let r = one("struct A { struct Inner {}\n func f() { _ = Inner() } }\nstruct B { func g() { _ = Inner() } }\n");
     let u = uses(&r, "g");
@@ -247,7 +246,7 @@ fn wrong_same_named_nested_types_in_siblings_each_bind_their_own() {
 // ---------------------------------------------------------------- #6 leading dot (resolve level)
 
 #[test]
-#[ignore = "leading-dot contextual type through an optional, ft-915b0a03"]
+#[ignore = "needs extractor change (schema frozen at 97): a leading-dot member through an optional result emits no reference, ft-915b0a03"]
 fn recall_an_optional_result_leading_dot_reaches_the_case() {
     let r = one("enum Shape { case circle }\nfunc f() -> Shape? { .circle }\n");
     let u = uses(&r, "f");
@@ -255,7 +254,7 @@ fn recall_an_optional_result_leading_dot_reaches_the_case() {
 }
 
 #[test]
-#[ignore = "leading-dot contextual type through an array, ft-915b0a03"]
+#[ignore = "needs extractor change (schema frozen at 97): a leading-dot member inside an array result emits no reference, ft-915b0a03"]
 fn recall_an_array_result_leading_dot_reaches_the_case() {
     let r = one("enum Shape { case circle }\nfunc f() -> [Shape] { [.circle] }\n");
     let u = uses(&r, "f");
@@ -270,7 +269,7 @@ fn recall_a_self_result_leading_dot_reaches_the_case() {
 }
 
 #[test]
-#[ignore = "leading-dot contextual type through a ternary, ft-915b0a03"]
+#[ignore = "needs extractor change (schema frozen at 97): a leading-dot member in a ternary branch emits no reference, ft-915b0a03"]
 fn recall_a_ternary_leading_dot_reaches_the_case() {
     let r = one("enum E { case a, b }\nfunc f(_ c: Bool) -> E { c ? .a : .b }\n");
     let u = uses(&r, "f");
@@ -294,7 +293,7 @@ fn wrong_a_keypath_without_a_root_outside_its_type_binds_nothing() {
 }
 
 #[test]
-#[ignore = "accepted over-liveness of an in-type contextual key path, ft-915b0a03"]
+#[ignore = "needs extractor change (schema frozen at 97): `\\.count` is emitted as a bare `count` read with no key-path marker, indistinguishable from an implicit-self read, ft-915b0a03"]
 fn wrong_a_contextual_keypath_inside_another_type_does_not_bind_that_types_member() {
     let r = one("struct Foo { var count = 0\n func f(_ xs: [String]) -> [Int] { xs.map(\\.count) } }\n");
     let u = uses(&r, "f");

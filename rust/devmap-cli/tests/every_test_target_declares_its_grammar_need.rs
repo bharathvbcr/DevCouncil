@@ -47,6 +47,8 @@ const FEATURE_OFF_SAFE: &[(&str, &[&str])] = &[
             // and run feature-off (4 passed).
             "cargo_manifests_collect",
             "discovery_stays_inside_the_root",
+            // Reads `docs/devmap/DIVERGENCES.md` and nothing else.
+            "divergences_x42_names_swift",
             "global_excludes_are_one_rule",
             "ignore_rule_tolerance",
             "one_ignore_owner",
