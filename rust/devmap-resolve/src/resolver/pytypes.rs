@@ -488,15 +488,11 @@ impl Resolver {
                 && candidate.caller_symbol == call.caller_symbol
                 && candidate.span.end_byte < call.span.end_byte
                 && match candidate.receiver_expr.as_deref() {
-                    Some(qualifier) => {
-                        receiver == format!("{qualifier}.{}", candidate.callee_name)
-                    }
+                    Some(qualifier) => receiver == format!("{qualifier}.{}", candidate.callee_name),
                     None => receiver == candidate.callee_name,
                 }
         });
-        is_the_receiver.then(|| {
-            self.factory_return_type(LangFamily::Python, file, scope, receiver)
-        })
+        is_the_receiver.then(|| self.factory_return_type(LangFamily::Python, file, scope, receiver))
     }
 
     /// The declaration `root.member` names, where `root` is a module the file
@@ -571,8 +567,9 @@ impl Resolver {
                 && import.alias.is_none()
                 && (import.module_specifier == module_path
                     || import.module_specifier.starts_with(&nested))
-                && containers
-                    .is_none_or(|containers| python_innermost_container(containers, &import.span).is_none())
+                && containers.is_none_or(|containers| {
+                    python_innermost_container(containers, &import.span).is_none()
+                })
         });
         if !reached {
             return None;

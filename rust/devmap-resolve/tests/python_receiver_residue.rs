@@ -107,8 +107,14 @@ fn z3_the_two_spellings_in_one_caller_are_told_apart() {
         ),
     ]);
     let got = calls_from(&res, "pkg/calls.py::both");
-    assert!(got.iter().any(|t| t == "pkg/base.py::ZqTable.digest_of"), "{got:?}");
-    assert!(!got.iter().any(|t| t == "pkg/base.py::ZqTable.cache_clear"), "{got:?}");
+    assert!(
+        got.iter().any(|t| t == "pkg/base.py::ZqTable.digest_of"),
+        "{got:?}"
+    );
+    assert!(
+        !got.iter().any(|t| t == "pkg/base.py::ZqTable.cache_clear"),
+        "{got:?}"
+    );
 }
 
 /// A call argument that is itself a call of the same name starts later than
@@ -124,7 +130,11 @@ fn z3_a_same_named_call_in_the_arguments_is_not_the_receiver() {
         ),
     ]);
     assert!(
-        !reaches(&res, "pkg/calls.py::arg_only", "pkg/base.py::ZqTable.cache_clear"),
+        !reaches(
+            &res,
+            "pkg/calls.py::arg_only",
+            "pkg/base.py::ZqTable.cache_clear"
+        ),
         "{:?}",
         calls_from(&res, "pkg/calls.py::arg_only")
     );
@@ -152,7 +162,12 @@ fn z3_an_unannotated_factory_binds_nothing() {
 
 #[test]
 fn z3_a_generic_or_optional_return_binds_nothing() {
-    for annotation in ["list[ZqTable]", "Optional[ZqTable]", "ZqTable | None", "tuple[ZqTable, int]"] {
+    for annotation in [
+        "list[ZqTable]",
+        "Optional[ZqTable]",
+        "ZqTable | None",
+        "tuple[ZqTable, int]",
+    ] {
         let base = format!(
             "from typing import Optional\n\n\nclass ZqTable:\n    def digest_of(self):\n        return 'd'\n\n\ndef make_table(keys) -> {annotation}:\n    return []\n"
         );
@@ -270,7 +285,11 @@ fn z3_members_and_second_calls_of_the_result_are_not_typed() {
         calls_from(&res, "pkg/calls.py::attr")
     );
     assert!(
-        !reaches(&res, "pkg/calls.py::second", "pkg/base.py::ZqTable.digest_of"),
+        !reaches(
+            &res,
+            "pkg/calls.py::second",
+            "pkg/base.py::ZqTable.digest_of"
+        ),
         "{:?}",
         calls_from(&res, "pkg/calls.py::second")
     );
@@ -283,7 +302,11 @@ const TRAINER: &str = "from dataclasses import dataclass\n\n\nclass ZqLog:\n    
 const RUN: &str = "from .trainer import ZqHolderPlain, train_data, train_plain, train_slots\n\n\ndef run_plain():\n    result = train_plain()\n    return result.loss_log.losses()\n\n\ndef run_data():\n    result = train_data()\n    return result.loss_log.losses()\n\n\ndef run_slots():\n    result = train_slots()\n    return result.loss_log.losses()\n\n\ndef run_param(result: ZqHolderPlain):\n    return result.loss_log.losses()\n\n\ndef run_param_plainlog(result: ZqHolderPlain):\n    log = result.loss_log\n    return log.losses()\n";
 
 fn field_files<'a>() -> [(&'a str, &'a str); 3] {
-    [("pkg/__init__.py", ""), ("pkg/trainer.py", TRAINER), ("pkg/run.py", RUN)]
+    [
+        ("pkg/__init__.py", ""),
+        ("pkg/trainer.py", TRAINER),
+        ("pkg/run.py", RUN),
+    ]
 }
 
 /// py.Z6a: a plain class's `loss_log: ZqLogPlain`, declared in another file than
@@ -293,7 +316,11 @@ fn field_files<'a>() -> [(&'a str, &'a str); 3] {
 fn z6a_a_plain_class_field_annotation_types_the_receiver() {
     let res = resolve(&field_files());
     assert!(
-        reaches(&res, "pkg/run.py::run_plain", "pkg/trainer.py::ZqLogPlain.losses"),
+        reaches(
+            &res,
+            "pkg/run.py::run_plain",
+            "pkg/trainer.py::ZqLogPlain.losses"
+        ),
         "{:?}",
         calls_from(&res, "pkg/run.py::run_plain")
     );
@@ -315,7 +342,11 @@ fn z6b_a_dataclass_field_annotation_types_the_receiver() {
 fn z6c_a_frozen_slots_dataclass_field_annotation_types_the_receiver() {
     let res = resolve(&field_files());
     assert!(
-        reaches(&res, "pkg/run.py::run_slots", "pkg/trainer.py::ZqLogSlots.losses"),
+        reaches(
+            &res,
+            "pkg/run.py::run_slots",
+            "pkg/trainer.py::ZqLogSlots.losses"
+        ),
         "{:?}",
         calls_from(&res, "pkg/run.py::run_slots")
     );
@@ -326,7 +357,11 @@ fn z6c_a_frozen_slots_dataclass_field_annotation_types_the_receiver() {
 fn z6d_a_parameter_typed_root_reads_the_field_annotation() {
     let res = resolve(&field_files());
     assert!(
-        reaches(&res, "pkg/run.py::run_param", "pkg/trainer.py::ZqLogPlain.losses"),
+        reaches(
+            &res,
+            "pkg/run.py::run_param",
+            "pkg/trainer.py::ZqLogPlain.losses"
+        ),
         "{:?}",
         calls_from(&res, "pkg/run.py::run_param")
     );
@@ -340,7 +375,11 @@ fn z6d_a_parameter_typed_root_reads_the_field_annotation() {
 fn z6e_a_field_read_into_a_local_is_an_honest_miss() {
     let res = resolve(&field_files());
     assert!(
-        !reaches(&res, "pkg/run.py::run_param_plainlog", "pkg/trainer.py::ZqLogPlain.losses"),
+        !reaches(
+            &res,
+            "pkg/run.py::run_param_plainlog",
+            "pkg/trainer.py::ZqLogPlain.losses"
+        ),
         "the extractor change landed: move py.Z6e out of known_failing.tsv and assert the edge"
     );
     assert!(
@@ -353,17 +392,21 @@ fn z6e_a_field_read_into_a_local_is_an_honest_miss() {
 /// same file types nothing here.
 #[test]
 fn z6_a_namesake_field_on_another_class_does_not_answer() {
-    let trainer = format!(
-        "{TRAINER}\n\nclass ZqHolderOther:\n    loss_log: ZqLogSlots\n"
-    );
+    let trainer = format!("{TRAINER}\n\nclass ZqHolderOther:\n    loss_log: ZqLogSlots\n");
     let res = resolve(&[
         ("pkg/__init__.py", ""),
         ("pkg/trainer.py", &trainer),
         ("pkg/run.py", RUN),
     ]);
     let got = calls_from(&res, "pkg/run.py::run_plain");
-    assert!(got.iter().any(|t| t == "pkg/trainer.py::ZqLogPlain.losses"), "{got:?}");
-    assert!(!got.iter().any(|t| t == "pkg/trainer.py::ZqLogSlots.losses"), "{got:?}");
+    assert!(
+        got.iter().any(|t| t == "pkg/trainer.py::ZqLogPlain.losses"),
+        "{got:?}"
+    );
+    assert!(
+        !got.iter().any(|t| t == "pkg/trainer.py::ZqLogSlots.losses"),
+        "{got:?}"
+    );
 }
 
 /// The annotation's class is declared twice in the corpus and the reader names
@@ -389,16 +432,19 @@ fn z6_a_field_type_the_corpus_declares_twice_binds_nothing() {
 /// The reader's own `ZqLogPlain` is not the class the owner's file annotated.
 #[test]
 fn z6_a_readers_own_namesake_is_not_the_field_type() {
-    let run = format!(
-        "{RUN}\n\nclass ZqLogPlain:\n    def losses(self):\n        return ['mine']\n"
-    );
+    let run =
+        format!("{RUN}\n\nclass ZqLogPlain:\n    def losses(self):\n        return ['mine']\n");
     let res = resolve(&[
         ("pkg/__init__.py", ""),
         ("pkg/trainer.py", TRAINER),
         ("pkg/run.py", &run),
     ]);
     assert!(
-        !reaches(&res, "pkg/run.py::run_plain", "pkg/run.py::ZqLogPlain.losses"),
+        !reaches(
+            &res,
+            "pkg/run.py::run_plain",
+            "pkg/run.py::ZqLogPlain.losses"
+        ),
         "{:?}",
         calls_from(&res, "pkg/run.py::run_plain")
     );
@@ -408,7 +454,12 @@ fn z6_a_readers_own_namesake_is_not_the_field_type() {
 /// in.
 #[test]
 fn z6_a_generic_field_annotation_binds_nothing() {
-    for annotation in ["list[ZqLog]", "Optional[ZqLog]", "ZqLog | None", "dict[str, ZqLog]"] {
+    for annotation in [
+        "list[ZqLog]",
+        "Optional[ZqLog]",
+        "ZqLog | None",
+        "dict[str, ZqLog]",
+    ] {
         let trainer = format!(
             "from typing import Optional\n\n\nclass ZqLog:\n    def losses(self):\n        return []\n\n\nclass ZqHolder:\n    loss_log: {annotation}\n\n\ndef train() -> ZqHolder:\n    return ZqHolder()\n"
         );
@@ -468,10 +519,18 @@ fn z4_tuple_unpack_from_an_unannotated_helper_is_an_honest_miss() {
         ),
     ]);
     assert!(
-        !reaches(&res, "pkg/calls.py::use_tuple_unpack", "pkg/base.py::ZqTable.digest_of"),
+        !reaches(
+            &res,
+            "pkg/calls.py::use_tuple_unpack",
+            "pkg/base.py::ZqTable.digest_of"
+        ),
         "the extractor change landed: move py.Z4 out of known_failing.tsv and assert the edge"
     );
-    assert!(unresolved_call(&res, "pkg/calls.py::use_tuple_unpack", "digest_of"));
+    assert!(unresolved_call(
+        &res,
+        "pkg/calls.py::use_tuple_unpack",
+        "digest_of"
+    ));
 }
 
 /// py.Z5 / py.C23b stay honest misses: the extraction records `@pytest.fixture`
@@ -488,15 +547,23 @@ fn z5_a_pytest_fixture_parameter_is_an_honest_miss() {
         ),
     ]);
     assert!(
-        !reaches(&res, "tests/test_zq.py::test_zq_launches", "tests/test_zq.py::ZqEnv.launch"),
+        !reaches(
+            &res,
+            "tests/test_zq.py::test_zq_launches",
+            "tests/test_zq.py::ZqEnv.launch"
+        ),
         "the extractor change landed: move py.Z5 out of known_failing.tsv and assert the edge"
     );
-    assert!(unresolved_call(&res, "tests/test_zq.py::test_zq_launches", "launch"));
+    assert!(unresolved_call(
+        &res,
+        "tests/test_zq.py::test_zq_launches",
+        "launch"
+    ));
 }
 
 // ------------------------------------------------------ 3-segment module path
 
-fn deep_files<'a>(main: &'a str) -> [(&'a str, &'a str); 5] {
+fn deep_files(main: &str) -> [(&str, &str); 5] {
     [
         ("a/__init__.py", ""),
         ("a/b/__init__.py", ""),
@@ -510,7 +577,9 @@ fn deep_files<'a>(main: &'a str) -> [(&'a str, &'a str); 5] {
 /// resolution and binds the one `f` that file declares.
 #[test]
 fn a_three_segment_import_binds_the_module_member() {
-    let res = resolve(&deep_files("import a.b.c\n\n\ndef g():\n    return a.b.c.f()\n"));
+    let res = resolve(&deep_files(
+        "import a.b.c\n\n\ndef g():\n    return a.b.c.f()\n",
+    ));
     assert!(
         reaches(&res, "main.py::g", "a/b/c.py::f"),
         "{:?}",
@@ -522,17 +591,39 @@ fn a_three_segment_import_binds_the_module_member() {
 /// `import a.b.c as m` binds the leaf, `from a.b import c` binds the leaf too.
 #[test]
 fn a_three_segment_alias_and_from_import_bind_the_module_member() {
-    let aliased = resolve(&deep_files("import a.b.c as m\n\n\ndef g():\n    return m.f()\n"));
-    assert!(reaches(&aliased, "main.py::g", "a/b/c.py::f"), "{:?}", calls_from(&aliased, "main.py::g"));
-    let from = resolve(&deep_files("from a.b import c\n\n\ndef g():\n    return c.f()\n"));
-    assert!(reaches(&from, "main.py::g", "a/b/c.py::f"), "{:?}", calls_from(&from, "main.py::g"));
+    let aliased = resolve(&deep_files(
+        "import a.b.c as m\n\n\ndef g():\n    return m.f()\n",
+    ));
+    assert!(
+        reaches(&aliased, "main.py::g", "a/b/c.py::f"),
+        "{:?}",
+        calls_from(&aliased, "main.py::g")
+    );
+    let from = resolve(&deep_files(
+        "from a.b import c\n\n\ndef g():\n    return c.f()\n",
+    ));
+    assert!(
+        reaches(&from, "main.py::g", "a/b/c.py::f"),
+        "{:?}",
+        calls_from(&from, "main.py::g")
+    );
 }
 
 /// A path prefix is not the leaf: `a.b.f()` after `import a.b.c` names `f` of
 /// package `a.b` (its `__init__`), which declares none.
 #[test]
 fn a_three_segment_import_does_not_bind_the_prefix_module() {
-    let res = resolve(&deep_files("import a.b.c\n\n\ndef g():\n    return a.b.f()\n"));
-    assert!(!reaches(&res, "main.py::g", "a/b/c.py::f"), "{:?}", calls_from(&res, "main.py::g"));
-    assert!(!reaches(&res, "main.py::g", "a/b/other.py::f"), "{:?}", calls_from(&res, "main.py::g"));
+    let res = resolve(&deep_files(
+        "import a.b.c\n\n\ndef g():\n    return a.b.f()\n",
+    ));
+    assert!(
+        !reaches(&res, "main.py::g", "a/b/c.py::f"),
+        "{:?}",
+        calls_from(&res, "main.py::g")
+    );
+    assert!(
+        !reaches(&res, "main.py::g", "a/b/other.py::f"),
+        "{:?}",
+        calls_from(&res, "main.py::g")
+    );
 }

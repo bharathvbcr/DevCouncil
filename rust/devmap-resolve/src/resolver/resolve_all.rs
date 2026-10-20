@@ -223,12 +223,14 @@ impl Resolver {
                 // Python calls by start offset: the one way to tell `f(x).m()`
                 // from `f.m()`, whose extracted receivers are both `f`, is the
                 // inner call `f(x)` that begins where the outer call begins.
-                let py_calls_at = (family == LangFamily::Python)
-                    .then(|| pytypes::python_calls_by_start(ext))
-                    .unwrap_or_default();
-                let py_field_reads = (family == LangFamily::Python)
-                    .then(|| pytypes::python_field_reads(ext))
-                    .unwrap_or_default();
+                let (py_calls_at, py_field_reads) = if family == LangFamily::Python {
+                    (
+                        pytypes::python_calls_by_start(ext),
+                        pytypes::python_field_reads(ext),
+                    )
+                } else {
+                    Default::default()
+                };
 
                 // The Go type evaluator's per-file tables; `None` for a file
                 // with no extracted Go facts, which leaves its calls to the
