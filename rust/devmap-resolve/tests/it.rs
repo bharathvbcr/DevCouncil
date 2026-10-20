@@ -161,6 +161,8 @@ mod swift_close_attack;
 #[cfg(feature = "parse")]
 mod swift_resolver_residue;
 #[cfg(feature = "parse")]
+mod swift_resolver_residue_attack;
+#[cfg(feature = "parse")]
 mod swift_property_reads;
 #[cfg(feature = "parse")]
 mod swift_protocol_dispatch;
