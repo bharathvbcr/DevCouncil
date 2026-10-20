@@ -320,9 +320,43 @@ fn recall_typealias_of_a_closure_type_property_call() {
 #[test]
 fn wrong_a_swiftui_method_call_on_a_view_with_a_same_named_stored_property_binds_no_property() {
     // `padding(4)` is View.padding, an unindexed SwiftUI method; Card.padding is a CGFloat.
-    let src = "import SwiftUI\nstruct Card: View {\n var padding: CGFloat = 8\n var body: some View { Text(\"\") }\n}\nstruct Screen: View {\n var card: Card\n var body: some View { card.padding(4) }\n}\n";
-    let u = uses(&one(src), "Screen.body");
+    let src = "import SwiftUI\nstruct Card: View {\n var padding: CGFloat = 8\n var body: some View { Text(\"\") }\n}\nfunc g(_ c: Card) { _ = c.padding(4) }\n";
+    let u = uses(&one(src), "g");
     assert!(!has(&u, "Card.padding"), "{u:?}");
+}
+
+#[test]
+fn wrong_a_swiftui_modifier_named_like_a_stored_property_in_a_view_body_binds_no_property() {
+    // The body of a View is a property: its source is the enclosing type.
+    let src = "import SwiftUI\nstruct Card: View {\n var opacity: Double = 1\n var body: some View { Text(\"\") }\n}\nstruct Screen: View {\n var card: Card\n var body: some View { card.opacity(0.5) }\n}\n";
+    let r = one(src);
+    let bad: Vec<_> = r
+        .edges
+        .iter()
+        .filter(|e| e.target_symbol.ends_with("Card.opacity") && e.source_symbol.contains("Screen"))
+        .collect();
+    assert!(bad.is_empty(), "{:?}", bad.iter().map(|e| (&e.source_symbol, &e.target_symbol)).collect::<Vec<_>>());
+}
+
+#[test]
+fn recall_qualified_nested_type_in_a_property_and_generic_annotation_binds() {
+    let src = "struct A { struct Inner {} }\nstruct H {\n var one: A.Inner\n var many: [A.Inner]\n func f(_ x: [A.Inner]) -> A.Inner? { nil }\n}\n";
+    let r = one(src);
+    let hits = r
+        .edges
+        .iter()
+        .filter(|e| e.target_symbol.ends_with("A.Inner") && e.source_symbol.contains("H"))
+        .count();
+    assert!(hits >= 1, "no edge from H to A.Inner: {:?}", all_edges(&[("Sources/M/A.swift", src)]));
+}
+
+#[test]
+fn recall_qualified_nested_type_annotation_in_another_file_binds() {
+    let a = "struct A { struct Inner { func m() {} } }\n";
+    let c = "func take(_ x: A.Inner) { x.m() }\n";
+    let r = resolve(&[("Sources/M/A.swift", a), ("Sources/M/C.swift", c)]);
+    let u = uses(&r, "take");
+    assert!(has(&u, "A.Inner"), "{u:?}");
 }
 
 #[test]
@@ -539,6 +573,10 @@ fn dump_inline_swift_fixtures() {
             ("Sources/App/Root.swift", SWIFTUI_FILE),
             ("Sources/Lib/Host.swift", "struct Host {\n var v: any View\n func go() { v.badge() }\n}\n"),
         ]),
+        ("deep_nested", vec![("Sources/M/A.swift", "struct A {\n struct M {\n  struct Deep { func f() { _ = Inner() } }\n }\n struct Inner {}\n}\n")]),
+        ("qualified_annotation", vec![("Sources/M/A.swift", "struct A { struct Inner { func m() {} } }\nfunc take(_ x: A.Inner) { x.m() }\n")]),
+        ("qualified_ctor", vec![("Sources/M/A.swift", "struct A { struct Inner { func m() {} } }\nstruct B { struct Inner { func m() {} } }\nfunc free() { var x = A.Inner(); x.m() }\n")]),
+        ("swiftui_padding", vec![("Sources/M/A.swift", "import SwiftUI\nstruct Card: View {\n var padding: CGFloat = 8\n var body: some View { Text(\"\") }\n}\nstruct Screen: View {\n var card: Card\n var body: some View { card.padding(4) }\n}\nfunc g(_ c: Card) { c.padding(4) }\n")]),
         ("run_method_same_name", vec![("Sources/M/A.swift",
             "struct S {\n var run: () -> Void\n func run(_ n: Int) {}\n}\nstruct T { func run() {} }\nfunc g(_ s: S) { s.run() }\n")]),
     ];
