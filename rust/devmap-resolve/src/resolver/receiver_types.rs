@@ -177,14 +177,19 @@ impl Resolver {
                     // file wrote that name with a type. A Python root the
                     // reading scope binds itself — a local assigned from a
                     // call — is not that scope's parameter of the same name.
-                    let shadowed = root_binding.is_none()
-                        && scope.is_some_and(|scope| {
-                            self.scope_declares_local(file, scope, root)
-                                && !self
-                                    .declared_types
-                                    .contains_key(&format!("{file}:{scope}:{root}@type"))
-                        })
-                        && self.family_of_file(file) == Some(LangFamily::Python);
+                    // Any binding site of the root in the scope or the functions
+                    // around it — a parameter (typed or not), a `for`, `with`
+                    // or `except` target, a comprehension variable, a walrus,
+                    // a nested `def` — makes the name that scope's own, whose
+                    // type is the scope-keyed slot or nothing.
+                    let shadowed = scope.is_some_and(|scope| {
+                        self.family_of_file(file) == Some(LangFamily::Python)
+                            && scope != file
+                            && self.python_scope_lookup(file, scope, root, 0).is_some()
+                            && !self
+                                .declared_types
+                                .contains_key(&format!("{file}:{scope}:{root}@type"))
+                    });
                     (!shadowed)
                         .then(|| self.lookup_declared_type_name(file, scope, root))
                         .flatten()
@@ -1024,7 +1029,12 @@ impl Resolver {
             return self.field_type_on(file, &owner, field);
         };
         let type_key = identity.rsplit("::").next().unwrap_or(&identity);
-        let nominal = self.field_type_on(&owner_file, type_key, field)?;
+        let mut nominal = self.field_type_on(&owner_file, type_key, field)?;
+        // The annotation is a name in the owner's file: an alias there is the
+        // class it aliases, and an import this walk cannot follow names nothing.
+        if owner_file != file {
+            nominal = self.python_annotation_class(&owner_file, &nominal)?;
+        }
         (owner_file == file
             || self.unique_indexed_type(LangFamily::Python, &nominal)
             || self.names_one_type_in_both(file, &owner_file, &nominal))

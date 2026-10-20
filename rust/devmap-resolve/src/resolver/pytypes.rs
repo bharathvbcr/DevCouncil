@@ -160,6 +160,85 @@ impl Resolver {
         is_class(&class_file, &identity).then_some((class_file, identity))
     }
 
+    /// The bare class name a type written as `written` in `declaring_file`'s
+    /// module scope denotes, so a name another file reads it by is the class
+    /// that file meant: `-> L` where the file wrote `from real import Log as L`
+    /// is `Log`, never an unrelated corpus-unique `L`.
+    ///
+    /// A name the file binds to a class is that class. A name an import binds
+    /// that the walk cannot follow (an external module, a star import, a
+    /// conditional alternate) names nothing here — no fallback to a bare name
+    /// the corpus happens to declare once. Only a name no import of the file
+    /// claims is read as written.
+    pub(super) fn python_annotation_class(
+        &self,
+        declaring_file: &str,
+        written: &str,
+    ) -> Option<String> {
+        if let Some((_, identity)) =
+            self.python_class_named(declaring_file, Some(declaring_file), written)
+        {
+            return Some(Self::python_type_key(&identity).to_string());
+        }
+        let root = written.split('.').next().unwrap_or(written);
+        let binds = self.python_import_binds.get(declaring_file);
+        let import_bound =
+            binds.is_some_and(|binds| binds.contains_key(root) || binds.contains_key("*"));
+        (!import_bound).then(|| written.to_string())
+    }
+
+    /// Whether exactly one thing provides the bare name `name` to `file` at
+    /// module scope: not two imports of it (a `try`/`except ImportError`
+    /// alternate), and not two `from m import *` that may both define it —
+    /// the last star wins in Python, and which one ran is not a static fact.
+    pub(super) fn python_bare_name_has_one_provider(&self, file: &str, name: &str) -> bool {
+        let explicit = self
+            .python_effective_binds(file, name)
+            .map_or(0, |bound| bound.len());
+        if explicit > 1 {
+            return false;
+        }
+        if explicit == 1 {
+            return true;
+        }
+        let stars = self
+            .python_import_binds
+            .get(file)
+            .and_then(|binds| binds.get("*"));
+        stars.is_none_or(|stars| {
+            stars
+                .iter()
+                .filter(|star| match star {
+                    PythonImportBind::Star(spec) => self.python_star_may_define(file, spec, name),
+                    _ => false,
+                })
+                .count()
+                <= 1
+        })
+    }
+
+    /// Whether a function or class named `name` is declared directly inside
+    /// the callable `scope`, which shadows an import or module-level binding of
+    /// that name for every read written in it.
+    fn python_nested_declares(&self, file: &str, scope: &str, name: &str) -> bool {
+        self.symbol_index
+            .get(name)
+            .into_iter()
+            .flatten()
+            .any(|(path, kind, family, identity)| {
+                path == file
+                    && *family == LangFamily::Python
+                    && matches!(
+                        kind,
+                        SymbolKind::Function | SymbolKind::Method | SymbolKind::Class
+                    )
+                    && self
+                        .symbol_parents
+                        .get(&(file.to_string(), identity.to_string()))
+                        .is_some_and(|parent| parent == scope)
+            })
+    }
+
     /// The bare type name `type_methods` and `supertypes` key a class by.
     fn python_type_key(identity: &str) -> &str {
         identity.rsplit("::").next().unwrap_or(identity)
@@ -585,6 +664,38 @@ impl Resolver {
             binds.iter().collect::<Vec<_>>().as_slice(),
             [PythonImportBind::Package(package)] if package == root
         ) {
+            return None;
+        }
+        // Any other binding of the root anywhere in the module — a `for`,
+        // `with`, `except` target, walrus, `del`, a `global` write in another
+        // function, a later assignment — may be what the name holds when the
+        // call runs; and two roots or a package beside a module of the same
+        // path are two answers to the one import.
+        if self.python_name_is_ambiguous(file, root)
+            || self.python_absolute_module_files(file, module_path).len() > 1
+        {
+            return None;
+        }
+        // The same dotted path under two source roots (`src/a/b/c.py` and
+        // `lib/a/b/c.py`): which one the import names is a `sys.path` fact the
+        // walk's root list may not hold, so a second file of that path is a
+        // second answer.
+        let tail = module_path.replace('.', "/");
+        let module = format!("{tail}.py");
+        let package = format!("{tail}/__init__.py");
+        let nested_module = format!("/{module}");
+        let nested_package = format!("/{package}");
+        let namesakes = self
+            .file_symbols
+            .keys()
+            .filter(|path| {
+                **path == module
+                    || **path == package
+                    || path.ends_with(&nested_module)
+                    || path.ends_with(&nested_package)
+            })
+            .count();
+        if namesakes > 1 {
             return None;
         }
         self.python_dotted_declaration(file, scope, root, &format!("{middle}.{member}"), &binds)
@@ -1114,7 +1225,9 @@ impl Resolver {
                 {
                     return Some(ScopeHit::Import(bound.as_ref()));
                 }
-                if self.scope_declares_local(file, &current, root) {
+                if self.scope_declares_local(file, &current, root)
+                    || self.python_nested_declares(file, &current, root)
+                {
                     return Some(ScopeHit::Local);
                 }
             }
@@ -1463,6 +1576,82 @@ pub(super) fn python_import_binds(
         }
     }
     binds
+}
+
+/// The functions and methods of a Python file a decorator may wrap, by
+/// qualified name.
+///
+/// The extraction does not link a decorator to what it decorates: `@many` is a
+/// `Name` reference at the enclosing scope, ahead of the `def`. So the test is
+/// the one the spans allow, and it errs toward abstaining: a callable counts as
+/// decorated when any such reference (a name or call that is not the target of
+/// an assignment) begins after the previous symbol ended and inside the
+/// callable's own enclosing scope, and ends before the `def`. A statement
+/// like `register(x)` between two functions therefore also counts, which costs
+/// a return type, never a wrong edge.
+///
+/// `staticmethod`, `classmethod`, `functools.lru_cache` and `functools.cache`
+/// are transparent: each returns the wrapped function's value unchanged, so the
+/// written return type is still what a call yields.
+pub(super) fn python_decorated_callables(ext: &Extraction) -> Vec<String> {
+    const TRANSPARENT: [&str; 4] = ["staticmethod", "classmethod", "lru_cache", "cache"];
+    let transparent_starts: BTreeSet<usize> = ext
+        .references
+        .iter()
+        .filter(|r| TRANSPARENT.contains(&r.name.as_str()))
+        .map(|r| r.span.start_byte)
+        .collect();
+    let mut gaps: Vec<(usize, usize)> = ext
+        .references
+        .iter()
+        .filter(|r| {
+            matches!(r.kind, ReferenceKind::Name | ReferenceKind::Call)
+                && r.assigned_to.is_none()
+                && !TRANSPARENT.contains(&r.name.as_str())
+                && !transparent_starts.contains(&r.span.start_byte)
+        })
+        .map(|r| (r.span.start_byte, r.span.end_byte))
+        .collect();
+    gaps.sort_unstable();
+    let mut ends: Vec<usize> = ext
+        .symbols
+        .iter()
+        .filter(|sym| sym.kind != SymbolKind::File)
+        .map(|sym| sym.span.end_byte)
+        .collect();
+    ends.sort_unstable();
+    let starts: BTreeMap<&str, usize> = ext
+        .symbols
+        .iter()
+        .map(|sym| (sym.qualified_name.as_str(), sym.span.start_byte))
+        .collect();
+    let mut decorated = Vec::new();
+    for sym in &ext.symbols {
+        if !matches!(sym.kind, SymbolKind::Function | SymbolKind::Method) {
+            continue;
+        }
+        let def_start = sym.span.start_byte;
+        let previous_end = ends
+            .partition_point(|end| *end <= def_start)
+            .checked_sub(1)
+            .map_or(0, |at| ends[at]);
+        let parent_start = sym
+            .parent_symbol
+            .as_deref()
+            .filter(|parent| *parent != ext.file_path)
+            .and_then(|parent| starts.get(parent).copied())
+            .unwrap_or(0);
+        let lower = previous_end.max(parent_start);
+        let first = gaps.partition_point(|(start, _)| *start < lower);
+        let wrapped = gaps[first..]
+            .iter()
+            .take_while(|(start, _)| *start < def_start)
+            .any(|(_, end)| *end <= def_start);
+        if wrapped {
+            decorated.push(sym.qualified_name.clone());
+        }
+    }
+    decorated
 }
 
 /// A Python file's calls grouped by the byte offset they begin at. Two calls
