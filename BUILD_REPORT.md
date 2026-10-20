@@ -1,6 +1,6 @@
 # Build report: GitPulse backlog run, 2026-10-17 to 2026-10-18
 
-This run worked the open GitPulse cards for DevCouncil. Each lane went through an Opus brief, a Sonnet implementer, one or more adversarial Sonnet passes, and an Opus review. Fable ruled on sequencing and tradeoffs. Local `main` moved from `4a5ca10c` to `55647cb1` (as of 2026-10-19). Still in flight at wrap-up: ft-c0afdfef (Python receiver residue). Its attack found one high and six medium regressions, and it is in a final fix round. **Nothing is pushed.** No card reached done: requesting done returns "no verification record exists for this task: Manvi's work.verify.task has not judged it", and that tool cannot be invoked from this session.
+This run worked the open GitPulse cards for DevCouncil. Each lane went through an Opus brief, a Sonnet implementer, one or more adversarial Sonnet passes, and an Opus review. Fable ruled on sequencing and tradeoffs. Local `main` moved from `4a5ca10c` to `e53d1665` (as of 2026-10-19, at wrap-up). No lane is in flight. **Nothing is pushed.** No card reached done: requesting done returns "no verification record exists for this task: Manvi's work.verify.task has not judged it", and that tool cannot be invoked from this session.
 
 AUDIT_REPORT.md's waves 1–6 were already all in review when the run began, so work continued by priority, severity and Fable's order. The previous report is kept as `BUILD_REPORT-2026-10-15.md`.
 
@@ -37,6 +37,7 @@ AUDIT_REPORT.md's waves 1–6 were already all in review when the run began, so 
 | ft-b7362179 (resolution-rate honesty) | call-blind and vendored sites leave the headline rate; additive `measured_resolved_sites` / `measured_unresolved_sites` / `measured_explained_sites` carry the headline denominators. Opus ruled the raw totals stay a public contract, and an invariant test ties them to the measured fields. Merged as `7e110127`. | probes repointed to `measured_*`; analyze and cli suites green on the combined tree |
 | ft-bd1bfac9 (Python relative imports) | a relative import resolves only inside the importing package; a bare `.` or `..` names the package, so only its `__init__.py` answers (`30a7143c`). Merged as `ec034f60`. The follow-up `c167b9d8` handles namespace-package submodules and the bare-dots binding join. | 4 attack probes failed on the first round, then were fixed before merge |
 | ft-915b0a03 (Swift resolver residue) | private nested namesakes; call chains where `-> Self` resolves to the receiver's concrete type before override resolution; generic-parameter returns abstain; qualified `A.Inner` keeps its edges; a chain-typed receiver gets no bare-name protocol fan-out; X42 deinit doc line. The closure-property call path was **removed**: the extraction has no function-type facts, so it bound inferred, lazy, computed and collection properties. Merged as `55647cb1`. | 2 rounds (53 and 38 probes): 1 HIGH plus 4 MEDIUM, then 4 HIGH plus 4 MEDIUM, all closed. Swift fixture +3/−0 edges, all checked against source. |
+| ft-c0afdfef (Python receiver residue) | `f(x).m()` call-result receivers typed via `factory_return_type`; class-body field annotations read in the owner class's file; 3-segment `import a.b.c` calls. Abstains on any scope shadow (all binding forms via `python_scope_lookup`), annotations it cannot follow through the owner file's imports, opaque decorators (`cache`/`lru_cache` only via `functools`), names provided by two imports, and rebound or ambiguous 3-segment roots. Python recall 0.88 → 0.949, precision 1.0. Merged as `e53d1665`, with the `known_failing.tsv` conflict resolved as the union of the Swift and Python rows. | 3 rounds (100 + 81 probes): 1 HIGH + 6 MEDIUM, then 3 MEDIUM, all closed. Fixture +8/−0 Python edges; bench −0.5% (fixture), −2.9% (2000-caller shape). |
 
 ## Benchmarks on touched paths
 
@@ -91,6 +92,11 @@ Instructions retired, min-of-N, interleaved.
 - **ft-1f7825c8** — release archives. Blocked on CI green (ft-7cb2d308), the release decision, and a supply-chain sign-off.
 - **ft-75ddb66b criterion 3, ft-6a46dddd criterion 5, and the Python probes tagged "needs extractor change"** — waiting on the schema unfreeze or the corpus labels.
 - **Swift extractor follow-ups for ft-915b0a03:** function-type property facts, so closure-property calls can bind soundly, and the "needs extractor change" ignores. These wait on the schema unfreeze.
+- **Python extractor follow-ups for ft-c0afdfef:**
+  - Rows py.Z4, py.Z5/C23b and py.Z6e: return and unpack facts, decorator-to-function links, and attribute-read initializers.
+  - `match`/`case` capture bindings.
+
+  These wait on the schema unfreeze. One known recall loss from this lane is ignored with a pointer: d08g, where a nested local factory no longer types its result. It means a missing edge, never a wrong one. No extractor card has been filed yet; this list is the input for one.
 - **Corpus relabelling, the five "unmeasured" baselines** (LiquiTask, SalEdge, AcademiaTrack, Chronicle, DevPrism), **and the corpus re-measure** — owner work outside this repo.
 
 ## Owner decisions pending
@@ -103,8 +109,9 @@ Instructions retired, min-of-N, interleaved.
 6. `accuracy/rustlabel` was merged by another session (`1c4866d2`) after Fable advised a full read first. Decide whether it needs that review now.
 7. Disk: about 37 GiB free. The gate holds deletes of finished build directories: `tmp/bra-target` and `tmp/lp-target` (8.1 GB), plus each agent worktree's `target-lane`. New lanes are paused until space is freed.
 8. Leftover git state: one stash entry, `stash@{0}`, "lane-fix-search-partial". Its content is already committed, but the gate held the drop.
-9. Branch cleanup (2026-10-19): 19 merged branches and 15 finished worktrees were removed. You declined a force-delete twice, so these branches remain:
-   - `attack/py-relative-imports`, `fix/py-relative-imports-probes`, `attack/mcp-status`, `attack/resolution-rate`, `attack/swift-properties`, `attack4/py-wave8`, `attack/swift-resolver-residue`, `attack2/swift-resolver-residue`.
+9. Branch cleanup (2026-10-19): 21 merged branches and 20 finished worktrees were removed. You declined a force-delete twice, so these branches remain:
+   - `attack/py-relative-imports`, `fix/py-relative-imports-probes`, `attack/mcp-status`, `attack/resolution-rate`, `attack/swift-properties`, `attack4/py-wave8`, `attack/swift-resolver-residue`, `attack2/swift-resolver-residue`, `attack/py-receiver-residue`, `attack2/py-receiver-residue`.
+   - The `literals-substring-b3546e` worktree and its merged branch belong to another session and were left alone.
    - Their commits are on main as rebased or cherry-picked equivalents. `git cherry` confirms this for most; `attack4/py-wave8` matches by subject, and `fix/py-relative-imports-probes` differs from `c167b9d8` only in one comment.
    - Delete them with `git branch -D` once you are satisfied.
 
