@@ -122,6 +122,8 @@ mod py_relative_imports_attack;
 #[cfg(feature = "parse")]
 mod py_receiver_residue_attack;
 #[cfg(feature = "parse")]
+mod py_receiver_residue_attack2;
+#[cfg(feature = "parse")]
 mod qualified_module_paths;
 #[cfg(feature = "parse")]
 mod real_corpus_resolution;
