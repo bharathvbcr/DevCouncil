@@ -29,6 +29,7 @@ impl Resolver {
         self.supertypes.clear();
         self.python_bases.clear();
         self.python_import_binds.clear();
+        self.python_decorated.clear();
         self.python_class_enclosers.clear();
         self.python_dynamic_all.clear();
         self.python_scoped_import_bindings.clear();
@@ -1206,6 +1207,10 @@ impl Resolver {
                 }
                 if pytypes::python_all_is_dynamic(ext) {
                     self.python_dynamic_all.insert(ext.file_path.clone());
+                }
+                for callable in pytypes::python_decorated_callables(ext) {
+                    self.python_decorated
+                        .insert((ext.file_path.clone(), callable));
                 }
                 for (key, encloser) in pytypes::python_class_enclosers(ext) {
                     self.python_class_enclosers

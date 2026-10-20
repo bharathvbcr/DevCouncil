@@ -418,6 +418,9 @@ pub struct Resolver {
     /// name to. A name bound to more than one thing is not a name the file
     /// can be read as meaning one module at a class statement.
     python_import_binds: BTreeMap<String, BTreeMap<String, BTreeSet<PythonImportBind>>>,
+    /// `(file, callable qualified name)` for every Python function or method a
+    /// decorator may wrap. See [`pytypes::python_decorated_callables`].
+    python_decorated: BTreeSet<(String, String)>,
     /// `(file, class name)` -> what each class of that name is written inside:
     /// `(enclosing identity, whether it is a callable)`. Read from the symbols'
     /// spans, because a class in a function and a class in a same-named class
@@ -754,6 +757,7 @@ impl Resolver {
             supertypes: BTreeMap::new(),
             python_bases: BTreeMap::new(),
             python_import_binds: BTreeMap::new(),
+            python_decorated: BTreeSet::new(),
             python_class_enclosers: BTreeMap::new(),
             python_dynamic_all: BTreeSet::new(),
             python_scoped_import_bindings: BTreeMap::new(),

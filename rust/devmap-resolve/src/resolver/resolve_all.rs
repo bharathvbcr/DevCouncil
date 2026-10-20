@@ -220,6 +220,18 @@ impl Resolver {
                     }
                 }
 
+                // Python calls by start offset: the one way to tell `f(x).m()`
+                // from `f.m()`, whose extracted receivers are both `f`, is the
+                // inner call `f(x)` that begins where the outer call begins.
+                let (py_calls_at, py_field_reads) = if family == LangFamily::Python {
+                    (
+                        pytypes::python_calls_by_start(ext),
+                        pytypes::python_field_reads(ext),
+                    )
+                } else {
+                    Default::default()
+                };
+
                 // The Go type evaluator's per-file tables; `None` for a file
                 // with no extracted Go facts, which leaves its calls to the
                 // name-based ladder below.
@@ -456,14 +468,41 @@ impl Resolver {
                         let root = Self::path_root(recv);
                         let site_binding = ext
                             .local_binding_at(call.span.start_byte, root)
-                            .or_else(|| ext.local_binding_at(call.span.start_byte, recv));
-                        if let Some(class_type) = self
-                            .receiver_type_for(
+                            .or_else(|| ext.local_binding_at(call.span.start_byte, recv))
+                            .or_else(|| {
+                                let (root, field) = Self::one_hop_field(recv)?;
+                                (family == LangFamily::Python)
+                                    .then(|| {
+                                        pytypes::python_field_root_binding(
+                                            ext, &py_field_reads, call, root, field,
+                                        )
+                                    })
+                                    .flatten()
+                            });
+                        // `f(x).m()`: the receiver is the call's result, typed by
+                        // `f`'s written return type — never by a value named
+                        // `f`, which the extracted receiver text cannot tell
+                        // from the call's result.
+                        let call_result = py_calls_at
+                            .get(&call.span.start_byte)
+                            .and_then(|inner| {
+                                self.python_call_result_type(
+                                    &ext.file_path,
+                                    call.caller_symbol.as_deref(),
+                                    call,
+                                    recv,
+                                    inner,
+                                )
+                            });
+                        if let Some(class_type) = match call_result {
+                            Some(result_type) => result_type,
+                            None => self.receiver_type_for(
                                 &ext.file_path,
                                 call.caller_symbol.as_deref(),
                                 recv,
                                 site_binding,
-                            )
+                            ),
+                        }
                             .filter(|_| family.admits(family))
                             .and_then(|ty| {
                                 self.rust_generic_receiver_type(
@@ -978,6 +1017,38 @@ impl Resolver {
                                         imported_from: recv.to_string(),
                                     }));
                                 }
+                            }
+                        }
+                    }
+
+                    // 2b''. A Python dotted module path: `import a.b.c` then
+                    // `a.b.c.f()`. The flat import table files the module under
+                    // its leaf, so the whole path is no key there; the import
+                    // statement and the module resolution are the evidence, and
+                    // a root the call's own scope rebinds is not the package.
+                    if resolution.is_none()
+                        && family == LangFamily::Python
+                        && ext
+                            .local_binding_at(
+                                call.span.start_byte,
+                                call.receiver_expr.as_deref().and_then(|r| r.split('.').next()).unwrap_or_default(),
+                            )
+                            .is_none()
+                    {
+                        if let Some(recv) = call.receiver_expr.as_deref().filter(|r| r.contains('.')) {
+                            let scope = read_scope(call.caller_symbol.as_deref(), &call.span);
+                            if let Some((resolved_file, resolved_sym)) = self.python_module_path_member(
+                                ext,
+                                py_call_scopes.as_ref(),
+                                scope.as_deref(),
+                                recv,
+                                &call.callee_name,
+                            ) {
+                                resolution = Some(Arc::new(Resolution::ImportScoped {
+                                    target_symbol: resolved_sym,
+                                    target_file: resolved_file,
+                                    imported_from: recv.to_string(),
+                                }));
                             }
                         }
                     }

@@ -175,7 +175,28 @@ impl Resolver {
             let root_binding = binding.filter(|b| b.name == root);
             let owner = self
                 .receiver_type_for(file, scope, root, root_binding)
-                .or_else(|| self.lookup_declared_type_name(file, scope, root))
+                .or_else(|| {
+                    // The file-wide declared slot holds whichever scope in the
+                    // file wrote that name with a type. A Python root the
+                    // reading scope binds itself — a local assigned from a
+                    // call — is not that scope's parameter of the same name.
+                    // Any binding site of the root in the scope or the functions
+                    // around it — a parameter (typed or not), a `for`, `with`
+                    // or `except` target, a comprehension variable, a walrus,
+                    // a nested `def` — makes the name that scope's own, whose
+                    // type is the scope-keyed slot or nothing.
+                    let shadowed = scope.is_some_and(|scope| {
+                        self.family_of_file(file) == Some(LangFamily::Python)
+                            && scope != file
+                            && self.python_scope_lookup(file, scope, root, 0).is_some()
+                            && !self
+                                .declared_types
+                                .contains_key(&format!("{file}:{scope}:{root}@type"))
+                    });
+                    (!shadowed)
+                        .then(|| self.lookup_declared_type_name(file, scope, root))
+                        .flatten()
+                })
                 .or_else(|| {
                     // `self.lease.run()`. No map records a type under the
                     // keyword, because `self` is not a binding any declaration
@@ -190,7 +211,7 @@ impl Resolver {
                         .map(str::to_string)
                 });
             return match owner {
-                Some(owner) => self.field_type_on(file, &owner, field),
+                Some(owner) => self.field_type_through(file, scope, &owner, field),
                 // `ns.svc.run()`: the root is no typed value, but it may be an
                 // imported module whose member is a module-scope instance. A
                 // root the scope binds itself shadows the import.
@@ -978,6 +999,66 @@ impl Resolver {
             current = parent;
         }
         None
+    }
+
+    /// Type of `field` on the type `owner` names where it is read in `file`.
+    ///
+    /// Every family but Python writes the owner's field slots under the file the
+    /// reader is in ([`Self::field_type_on`]). A Python class is named by its
+    /// declaring file, which is not the reading file when the class was
+    /// imported or came out of a factory: `result.loss_log` in `run.py`, with
+    /// `loss_log: ZqLog` written in `class Holder` in `trainer.py`. So the
+    /// owner's own file is asked, and the field's written type — a name in
+    /// *that* file's scope — is handed on only when it denotes one class from
+    /// the reader's scope as well: the corpus declares it once, or both files
+    /// bind the name to the same declaration. The `factory_return_type` rule.
+    pub(super) fn field_type_through(
+        &self,
+        file: &str,
+        scope: Option<&str>,
+        owner: &str,
+        field: &str,
+    ) -> Option<String> {
+        if self.family_of_file(file) != Some(LangFamily::Python) {
+            return self.field_type_on(file, owner, field);
+        }
+        let owner = Self::admissible_nominal_type(owner)?;
+        let Some((owner_file, identity)) = self
+            .python_class_named(file, scope, &owner)
+            .or_else(|| self.python_unique_class(&owner))
+        else {
+            // A class this file declares inside a callable or a class names no
+            // file-level class; its slots are the reading file's own.
+            return self.field_type_on(file, &owner, field);
+        };
+        let type_key = identity.rsplit("::").next().unwrap_or(&identity);
+        let mut nominal = self.field_type_on(&owner_file, type_key, field)?;
+        // The annotation is a name in the owner's file: an alias there is the
+        // class it aliases, and an import this walk cannot follow names nothing.
+        if owner_file != file {
+            nominal = self.python_annotation_class(&owner_file, &nominal)?;
+        }
+        (owner_file == file
+            || self.unique_indexed_type(LangFamily::Python, &nominal)
+            || self.names_one_type_in_both(file, &owner_file, &nominal))
+        .then_some(nominal)
+    }
+
+    /// The one Python class called `name` in the corpus, as `(declaring file,
+    /// identity)`; `None` when none or several declare it.
+    fn python_unique_class(&self, name: &str) -> Option<(String, String)> {
+        let mut classes = self
+            .symbol_index
+            .get(name)?
+            .iter()
+            .filter(|(_, kind, family, _)| {
+                *kind == SymbolKind::Class && *family == LangFamily::Python
+            });
+        let (path, _, _, identity) = classes.next()?;
+        classes
+            .next()
+            .is_none()
+            .then(|| (path.clone(), identity.to_string()))
     }
 
     /// Type of `field` on `owner`, from the field Type ref indexed at build.

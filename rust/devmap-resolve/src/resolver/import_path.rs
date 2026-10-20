@@ -1,6 +1,32 @@
 use super::*;
 
 impl Resolver {
+    /// Every indexed file an absolute Python module path may name, in the order
+    /// [`Self::resolve_import_path`] tries them: the manifest or package source
+    /// roots, then the repository root, `src/`, and the importer's own
+    /// directory. The first is the answer the import walk gives; a caller that
+    /// must not guess between roots asks for all of them.
+    pub(super) fn python_absolute_module_files(
+        &self,
+        current_file: &str,
+        specifier: &str,
+    ) -> Vec<String> {
+        let dir = Self::parent_dir(current_file);
+        let py_path = specifier.replace('.', "/");
+        let mut files: Vec<String> = self.python_root_candidates(current_file, &py_path);
+        files.extend([
+            format!("{}.py", py_path),
+            format!("{}/__init__.py", py_path),
+            format!("src/{}.py", py_path),
+            format!("src/{}/__init__.py", py_path),
+            format!("{}/{}.py", dir, py_path),
+            format!("{}/{}/__init__.py", dir, py_path),
+        ]);
+        let mut seen = BTreeSet::new();
+        files.retain(|cand| self.file_symbols.contains_key(cand) && seen.insert(cand.clone()));
+        files
+    }
+
     pub(super) fn resolve_import_path(
         &self,
         current_file: &str,
@@ -127,24 +153,12 @@ impl Resolver {
                     .into_iter()
                     .find(|cand| self.file_symbols.contains_key(cand));
             }
-            let py_path = clean_spec.replace('.', "/");
-            for cand in self.python_root_candidates(current_file, &py_path) {
-                if self.file_symbols.contains_key(&cand) {
-                    return Some(cand);
-                }
-            }
-            let candidates = [
-                format!("{}.py", py_path),
-                format!("{}/__init__.py", py_path),
-                format!("src/{}.py", py_path),
-                format!("src/{}/__init__.py", py_path),
-                format!("{}/{}.py", dir, py_path),
-                format!("{}/{}/__init__.py", dir, py_path),
-            ];
-            for cand in &candidates {
-                if self.file_symbols.contains_key(cand) {
-                    return Some(cand.clone());
-                }
+            if let Some(found) = self
+                .python_absolute_module_files(current_file, clean_spec)
+                .into_iter()
+                .next()
+            {
+                return Some(found);
             }
         }
 

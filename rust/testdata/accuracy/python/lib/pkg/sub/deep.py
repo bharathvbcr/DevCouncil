@@ -1,3 +1,4 @@
+import pkg.sub.leaf
 import pkg.util
 from pkg import util as u
 from pkg import Engine
@@ -13,3 +14,8 @@ def forms() -> int:
     d = Engine(1).run()        # __init__ re-export
     e = E2(1).step()           # relative alias of class
     return a + b + c + d + e
+
+
+def three_segments() -> int:
+    """C02c: import a.b.c, then a dotted call three segments deep."""
+    return pkg.sub.leaf.leaf_value()

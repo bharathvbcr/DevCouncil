@@ -106,6 +106,8 @@ mod python_residue_attack;
 #[cfg(feature = "parse")]
 mod python_residue_attack2;
 #[cfg(feature = "parse")]
+mod python_receiver_residue;
+#[cfg(feature = "parse")]
 mod python_import_module_literal;
 #[cfg(feature = "parse")]
 mod python_module_constants;
@@ -117,6 +119,10 @@ mod python_path_constants_and_loaders;
 mod python_sys_path_imports;
 #[cfg(feature = "parse")]
 mod py_relative_imports_attack;
+#[cfg(feature = "parse")]
+mod py_receiver_residue_attack;
+#[cfg(feature = "parse")]
+mod py_receiver_residue_attack2;
 #[cfg(feature = "parse")]
 mod qualified_module_paths;
 #[cfg(feature = "parse")]

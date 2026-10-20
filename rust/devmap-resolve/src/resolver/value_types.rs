@@ -282,7 +282,7 @@ impl Resolver {
         } else if let Some((receiver, function)) = shape.rsplit_once('.') {
             if !Self::is_plain_ident(receiver)
                 || !Self::is_plain_ident(function)
-                || scope.is_some_and(|scope| self.scope_declares_local(file, scope, receiver))
+                || scope.is_some_and(|scope| self.scope_shadows(family, file, scope, receiver))
             {
                 return None;
             }
@@ -300,18 +300,32 @@ impl Resolver {
             }
         } else {
             if !Self::is_plain_ident(shape)
-                || scope.is_some_and(|scope| self.scope_declares_local(file, scope, shape))
+                || scope.is_some_and(|scope| self.scope_shadows(family, file, scope, shape))
             {
                 return None;
             }
             match self.lookup_in_package(file, shape) {
                 Some(found) => found,
                 None => {
+                    if family == LangFamily::Python
+                        && !self.python_bare_name_has_one_provider(file, shape)
+                    {
+                        return None;
+                    }
                     let (target, declared) = self.import_binding_at(family, file, scope, shape)?;
                     self.lookup_in_package(target, declared)?
                 }
             }
         };
+        // A Python callable a decorator may wrap returns whatever the decorator
+        // makes of it, not what its own annotation says.
+        if family == LangFamily::Python
+            && self
+                .python_decorated
+                .contains(&(callee_file.clone(), callee.clone()))
+        {
+            return None;
+        }
         let written = self
             .return_types
             .get(&(callee_file.clone(), callee.clone()))?;
@@ -319,9 +333,35 @@ impl Resolver {
         if nominal == "Self" {
             nominal = self.declaring_type_of(&callee_file, &callee)?.to_string();
         }
+        // The annotation is a name in the callee's file, which the caller may
+        // not share: read it there (an alias is the class it aliases).
+        if family == LangFamily::Python && callee_file != file {
+            nominal = self.python_annotation_class(&callee_file, &nominal)?;
+        }
         (self.unique_indexed_type(family, &nominal)
             || self.names_one_type_in_both(file, &callee_file, &nominal))
         .then_some(nominal)
+    }
+
+    /// Whether the callable `scope` binds `name` itself, so a read of it there is
+    /// not the module's or an import's. Python asks its scope walk, which also
+    /// sees a nested `def`/`class` and the enclosing functions; a function-scope
+    /// import is not a shadow here, because the import lookup reads it.
+    pub(super) fn scope_shadows(
+        &self,
+        family: LangFamily,
+        file: &str,
+        scope: &str,
+        name: &str,
+    ) -> bool {
+        if family == LangFamily::Python {
+            return scope != file
+                && matches!(
+                    self.python_scope_lookup(file, scope, name, 0),
+                    Some(super::pytypes::ScopeHit::Local)
+                );
+        }
+        self.scope_declares_local(file, scope, name)
     }
 
     /// Whether `nominal`, read where the factory wrote it and where the call is
