@@ -24,3 +24,7 @@ def unannotated_pair():
     table = ZqTable()
     other = ZqBase()
     return table, other
+
+
+def make_table_list(keys) -> list[ZqTable]:
+    return [ZqTable()]

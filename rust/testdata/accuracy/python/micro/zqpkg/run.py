@@ -1,4 +1,4 @@
-from .trainer import ZqHolderPlain, train_data, train_log, train_plain, train_slots
+from .trainer import ZqHolderPlain, train_data, train_generic, train_log, train_plain, train_slots
 
 
 def run_plain():
@@ -28,3 +28,8 @@ def run_param(result: ZqHolderPlain):
 def run_param_plainlog(result: ZqHolderPlain):
     log = result.loss_log
     return log.losses()
+
+
+def run_generic():
+    result = train_generic()
+    return result.loss_logs.losses()

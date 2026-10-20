@@ -22,7 +22,8 @@
 py.C01	C01	lib/pkg/__init__.py	lib/pkg/core.py	import	must		edge
 py.C01b	C01	lib/pkg/sub/deep.py::forms	lib/pkg/core.py::Engine	edge	must		Calls/References edge via pkg.__init__ re-export
 py.C02	C02	lib/pkg/sub/deep.py::forms	lib/pkg/util.py::helper	edge	must		edge (import pkg.util; pkg.util.helper())
-py.C03	C03	lib/pkg/sub/deep.py::forms	lib/pkg/util.py::helper	edge	must		edge (from pkg import util as u; u.helper())
+py.C02c	C02c	lib/pkg/sub/deep.py::three_segments	lib/pkg/sub/leaf.py::leaf_value	edge	must		import pkg.sub.leaf then pkg.sub.leaf.leaf_value(): a 3-segment module path goes through import resolution
+py.C03	C03lib/pkg/sub/deep.py::forms	lib/pkg/util.py::helper	edge	must		edge (from pkg import util as u; u.helper())
 py.C04	C04	lib/pkg/sub/deep.py::forms	lib/pkg/util.py::helper	edge	must		edge (from ..util import helper as h)
 py.C05	C05	lib/pkg/sub/deep.py::forms	lib/pkg/core.py::Engine.step	edge	must		edge (E2(1).step())
 py.C05b	C05b	lib/pkg/sub/deep.py::forms	lib/pkg/core.py::Engine.run	edge	must		edge
@@ -75,14 +76,18 @@ py.Z2	Z1	micro/zqpkg/step_b.py::ZqNan.accumulate	micro/zqpkg/base.py::ZqBaseB.ac
 py.Z2.not	Z1	micro/zqpkg/step_a.py::ZqNan.accumulate	micro/zqpkg/base.py::ZqBaseB.accumulate	forbid	must		the namesake class in the other file has a different base: its accumulate is not this super()
 py.Z3	Z3	micro/zqpkg/calls.py::use_call_result	micro/zqpkg/base.py::ZqTable.digest_of	edge	must		make_table([1]).digest_of(): receiver is a call of a module function annotated -> ZqTable
 py.Z3.not	Z3	micro/zqpkg/calls.py::use_function_attribute	micro/zqpkg/base.py::ZqTable.cache_clear	forbid	must		make_table.cache_clear() reads an attribute of the function object, not of the ZqTable it returns
-py.Z4	Z4	micro/zqpkg/calls.py::use_tuple_unpack	micro/zqpkg/base.py::ZqTable.digest_of	edge	must		table, other = unannotated_pair(): the helper has no annotation, its returned tuple is built from constructor locals
+py.Z3.not2	Z3	micro/zqpkg/calls.py::use_call_in_arguments	micro/zqpkg/base.py::ZqTable.cache_clear	forbid_any_tier	must		make_table.cache_clear(make_table(2)): the call in the arguments begins after the outer call, so it is not the receiver
+py.Z3.not3	Z3	micro/zqpkg/calls.py::use_generic_result	micro/zqpkg/base.py::ZqTable.digest_of	forbid_any_tier	must		make_table_list(..) -> list[ZqTable]: a list is not a ZqTable
+py.Z3.not4	Z3	micro/zqpkg/calls.py::use_shadowed_factory	micro/zqpkg/base.py::ZqTable.digest_of	forbid_any_tier	must		the parameter make_table is not the module's function, so its call result has no known type
+py.Z4	Z4micro/zqpkg/calls.py::use_tuple_unpack	micro/zqpkg/base.py::ZqTable.digest_of	edge	must		table, other = unannotated_pair(): the helper has no annotation, its returned tuple is built from constructor locals
 py.Z5	Z5	micro/zqpkg/test_zq.py::test_zq_launches	micro/zqpkg/test_zq.py::ZqEnv.launch	edge	must		pytest fixture parameter with no annotation, fixture declared -> ZqEnv
 py.Z6a	Z6	micro/zqpkg/run.py::run_plain	micro/zqpkg/trainer.py::ZqLogPlain.losses	edge	must		result = train_plain(); result.loss_log.losses(): plain class field annotated ZqLogPlain
 py.Z6b	Z6	micro/zqpkg/run.py::run_data	micro/zqpkg/trainer.py::ZqLog.losses	edge	must		same through a @dataclass field
 py.Z6c	Z6	micro/zqpkg/run.py::run_slots	micro/zqpkg/trainer.py::ZqLogSlots.losses	edge	must		same through @dataclass(frozen=True, slots=True)
 py.Z6.ctl	Z6	micro/zqpkg/run.py::run_single	micro/zqpkg/trainer.py::ZqLogPlain.losses	edge	must		control: a factory returning the log class directly (no field hop) resolves today, so the Z6 failures are the class-body field annotation
 py.Z6d	Z6	micro/zqpkg/run.py::run_param	micro/zqpkg/trainer.py::ZqLogPlain.losses	edge	must		typed parameter then field hop: the parameter is typed, the class-body field annotation loss_log: ZqLogPlain is not bound
-py.Z6e	Z6	micro/zqpkg/run.py::run_param_plainlog	micro/zqpkg/trainer.py::ZqLogPlain.losses	edge	must		log = result.loss_log then log.losses(): the field type is the missing fact
+py.Z6.not	Z6	micro/zqpkg/run.py::run_generic	micro/zqpkg/trainer.py::ZqLog.losses	forbid_any_tier	must		loss_logs: list[ZqLog] holds a list, not a ZqLog
+py.Z6e	Z6micro/zqpkg/run.py::run_param_plainlog	micro/zqpkg/trainer.py::ZqLogPlain.losses	edge	must		log = result.loss_log then log.losses(): the field type is the missing fact
 py.Z1.ctl	Z1	micro/zqpkg/step_c.py::ZqUniq.accumulate	micro/zqpkg/base.py::ZqBase.accumulate	edge	must		control: the same function-local super() with a corpus-unique class name resolves today, so Z1/Z2 fail on the duplicated class name
 py.SH1c	SH1	lib/pkg/typed_user.py::run_cb	other/typing_namesakes.py::Callable	forbid_any_tier	must		from collections.abc import Callable binds past the in-repo namesake
 py.SH1d	SH1	lib/pkg/local_literal.py::local_literal	other/typing_namesakes.py::Literal	forbid_any_tier	must		a function-local from typing import Literal binds past the in-repo namesake

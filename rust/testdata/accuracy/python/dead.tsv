@@ -57,6 +57,11 @@ live	lib/pkg/starlocal.py::ones	ST3: star_loc.use calls it through `from pkg.sta
 truly_dead	micro/zqpkg/calls.py::use_call_result	caller probe nothing calls
 truly_dead	micro/zqpkg/calls.py::use_function_attribute	caller probe nothing calls
 truly_dead	micro/zqpkg/calls.py::use_tuple_unpack	caller probe nothing calls
+truly_dead	micro/zqpkg/calls.py::use_call_in_arguments	caller probe nothing calls
+truly_dead	micro/zqpkg/calls.py::use_generic_result	caller probe nothing calls
+truly_dead	micro/zqpkg/calls.py::use_shadowed_factory	caller probe nothing calls
+truly_dead	micro/zqpkg/run.py::run_generic	caller probe nothing calls
+truly_dead	lib/pkg/sub/deep.py::three_segments	caller probe nothing calls
 truly_dead	micro/zqpkg/run.py::run_plain	caller probe nothing calls
 truly_dead	micro/zqpkg/run.py::run_data	caller probe nothing calls
 truly_dead	micro/zqpkg/run.py::run_slots	caller probe nothing calls

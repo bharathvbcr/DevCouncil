@@ -456,6 +456,62 @@ impl Resolver {
         member: &str,
         binds: &BTreeSet<PythonImportBind>,
     ) -> Option<(String, String)> {
+        let (class_file, identity) =
+            self.python_dotted_declaration(file, scope, root, member, binds)?;
+        self.python_is_class(&class_file, &identity)
+            .then_some((class_file, identity))
+    }
+
+    /// What `call`'s receiver is when it is the *result of a call*, as
+    /// `Some(its type)` (or `Some(None)` when that type is not known), and `None`
+    /// when the receiver is not a call result at all.
+    ///
+    /// The extractor reduces the receiver of `make(x).m()` to the callee text
+    /// `make`, the same text `make.m()` records. What tells them apart is the
+    /// inner call `make(x)`: it begins where the outer call begins, ends before
+    /// it, and its own identity (`make`, or `mod.make` for a member) is the
+    /// receiver text. `inner` holds the calls that begin at the outer call's
+    /// start. The type is the callee's *written* return annotation, read by
+    /// [`Self::factory_return_type`] — the same owner `x = make()` uses — so an
+    /// unannotated, generic or optional return types nothing, and neither does
+    /// a callee name the calling scope binds itself.
+    pub(super) fn python_call_result_type(
+        &self,
+        file: &str,
+        scope: Option<&str>,
+        call: &ExtractedCall,
+        receiver: &str,
+        inner: &[&ExtractedCall],
+    ) -> Option<Option<String>> {
+        let is_the_receiver = inner.iter().any(|candidate| {
+            !std::ptr::eq(*candidate, call)
+                && candidate.caller_symbol == call.caller_symbol
+                && candidate.span.end_byte < call.span.end_byte
+                && match candidate.receiver_expr.as_deref() {
+                    Some(qualifier) => {
+                        receiver == format!("{qualifier}.{}", candidate.callee_name)
+                    }
+                    None => receiver == candidate.callee_name,
+                }
+        });
+        is_the_receiver.then(|| {
+            self.factory_return_type(LangFamily::Python, file, scope, receiver)
+        })
+    }
+
+    /// The declaration `root.member` names, where `root` is a module the file
+    /// imports and `member` is a dotted path through it ending in the declared
+    /// name: `(declaring file, identity)`. The reading
+    /// [`Self::python_dotted_class`] documents, without its class test, so a
+    /// dotted base class and a dotted module-function call ask one owner.
+    fn python_dotted_declaration(
+        &self,
+        file: &str,
+        scope: Option<&str>,
+        root: &str,
+        member: &str,
+        binds: &BTreeSet<PythonImportBind>,
+    ) -> Option<(String, String)> {
         let mut only = binds.iter();
         let (Some(bind), None) = (only.next(), only.next()) else {
             return None;
@@ -482,12 +538,59 @@ impl Resolver {
                 &format!("{}.{middle}", bind.module_spec()),
             )?,
         };
-        let (class_file, identity) = {
-            let (declaring_file, declared) = self.declaring_site(&module_file, class_name);
-            self.lookup_in_package(&declaring_file, &declared)?
-        };
-        self.python_is_class(&class_file, &identity)
-            .then_some((class_file, identity))
+        let (declaring_file, declared) = self.declaring_site(&module_file, class_name);
+        self.lookup_in_package(&declaring_file, &declared)
+    }
+
+    /// The declaration `module_path.member` names, where `module_path` is a
+    /// dotted module path (`a.b.c`) the file reached with a module-level `import
+    /// a.b.c` and nothing rebinds: `(declaring file, identity)`.
+    ///
+    /// `import a.b.c` binds only the package `a`, so `a.b.c.f()` is a call on a
+    /// path the *import statement* made reachable. Hence three conditions beyond
+    /// the dotted-declaration reading: this file has a module-level import of
+    /// that path (or of a longer one under it), the root is bound by that
+    /// package import alone, and the function the call sits in does not bind the
+    /// root itself. A path no import here reaches names nothing.
+    pub(super) fn python_module_path_member(
+        &self,
+        ext: &Extraction,
+        containers: Option<&ScopeIndex<'_>>,
+        scope: Option<&str>,
+        module_path: &str,
+        member: &str,
+    ) -> Option<(String, String)> {
+        let file = ext.file_path.as_str();
+        let (root, middle) = module_path.split_once('.')?;
+        if !module_path.split('.').all(Self::is_plain_ident) {
+            return None;
+        }
+        let nested = format!("{module_path}.");
+        let reached = ext.imports.iter().any(|import| {
+            import.imported_names.is_empty()
+                && import.alias.is_none()
+                && (import.module_specifier == module_path
+                    || import.module_specifier.starts_with(&nested))
+                && containers
+                    .is_none_or(|containers| python_innermost_container(containers, &import.span).is_none())
+        });
+        if !reached {
+            return None;
+        }
+        if scope
+            .filter(|scope| *scope != file)
+            .is_some_and(|scope| self.python_scope_lookup(file, scope, root, 0).is_some())
+        {
+            return None;
+        }
+        let binds = self.python_effective_binds(file, root)?;
+        if !matches!(
+            binds.iter().collect::<Vec<_>>().as_slice(),
+            [PythonImportBind::Package(package)] if package == root
+        ) {
+            return None;
+        }
+        self.python_dotted_declaration(file, scope, root, &format!("{middle}.{member}"), &binds)
     }
 
     /// Whether `file` declares `name` at file level under any kind: a class, a
@@ -1363,6 +1466,62 @@ pub(super) fn python_import_binds(
         }
     }
     binds
+}
+
+/// A Python file's calls grouped by the byte offset they begin at. Two calls
+/// share a start when one is the receiver of the other (`f(x).m()`), which is
+/// how [`Resolver::python_call_result_type`] finds the inner call.
+pub(super) fn python_calls_by_start(ext: &Extraction) -> BTreeMap<usize, Vec<&ExtractedCall>> {
+    let mut by_start: BTreeMap<usize, Vec<&ExtractedCall>> = BTreeMap::new();
+    for call in &ext.calls {
+        by_start.entry(call.span.start_byte).or_default().push(call);
+    }
+    by_start.retain(|_, calls| calls.len() > 1);
+    by_start
+}
+
+/// A Python file's attribute reads (`Name` references with a receiver), keyed
+/// by `(receiver, name)` with their start offsets in source order. See
+/// [`python_field_root_binding`].
+pub(super) fn python_field_reads(ext: &Extraction) -> BTreeMap<(&str, &str), Vec<usize>> {
+    let mut reads: BTreeMap<(&str, &str), Vec<usize>> = BTreeMap::new();
+    for reference in &ext.references {
+        if reference.kind != ReferenceKind::Name {
+            continue;
+        }
+        if let Some(receiver) = reference.receiver_expr.as_deref() {
+            reads
+                .entry((receiver, reference.name.as_str()))
+                .or_default()
+                .push(reference.span.start_byte);
+        }
+    }
+    for starts in reads.values_mut() {
+        starts.sort_unstable();
+    }
+    reads
+}
+
+/// The binding of `root` where the call `root.field.m()` reads `field`.
+///
+/// A parameter has a binding at every use, so the call's own start finds it. A
+/// local assigned from a factory (`result = train()`) is bound only at the
+/// attribute read the extractor records inside the call — at `field`'s own
+/// offset, after `root.` — and without it the root is untyped here, left to
+/// the file-wide maps, which hold a *namesake in another function*. The read
+/// is the first one of `root.field` that begins inside the call, which is the
+/// receiver's own: the receiver is written before the arguments.
+pub(super) fn python_field_root_binding<'a>(
+    ext: &'a Extraction,
+    reads: &BTreeMap<(&str, &str), Vec<usize>>,
+    call: &ExtractedCall,
+    root: &str,
+    field: &str,
+) -> Option<&'a LocalBinding> {
+    let starts = reads.get(&(root, field))?;
+    let first = starts.partition_point(|start| *start < call.span.start_byte);
+    let at = *starts.get(first).filter(|at| **at < call.span.end_byte)?;
+    ext.local_binding_at(at, root)
 }
 
 /// The spans of every function, method and class a Python file declares, with

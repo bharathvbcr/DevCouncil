@@ -44,3 +44,11 @@ def train_slots() -> ZqHolderSlots:
 
 def train_log() -> ZqLogPlain:
     return ZqLogPlain()
+
+
+class ZqHolderGeneric:
+    loss_logs: list[ZqLog]
+
+
+def train_generic() -> ZqHolderGeneric:
+    return ZqHolderGeneric()
