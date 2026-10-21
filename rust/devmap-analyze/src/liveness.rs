@@ -1350,6 +1350,18 @@ pub const EXTERNAL_SUPERTYPE: &str = "external_supertype";
 /// The machine token a row starts with when it is a member of an object literal.
 pub const OBJECT_LITERAL_MEMBER: &str = "object_literal_member";
 
+/// The reason an unreferenced, unexported TypeScript `namespace`/`module` is
+/// unconfirmed rather than confidently dead.
+///
+/// The extractor files a namespace's own name as a file-scope *local*
+/// (`is_symbol_binding` has no `internal_module` arm), so `name_is_shadowed_by_local`
+/// drops every non-call read of it written at file scope — `console.log(NS.a)`
+/// emits no reference to `NS` or `a`. The facts that would identify such a read
+/// do not exist in an `Extraction`, so the cap applies to every namespace with
+/// no inbound evidence. Lifts when extract-v98 stops shadowing the name.
+pub const NAMESPACE_READ_UNEXTRACTED: &str =
+    "namespace member reads at module scope are not extracted (ft-260158ce, extract-v98)";
+
 /// Languages where a subclass overrides a base method with no keyword saying so.
 ///
 /// Kotlin, Java, Swift, C# and Scala require `override` (or `@Override`), and
@@ -1662,6 +1674,9 @@ fn unconfirmed_dispatch_reason(
     external: &HashMap<(&str, &str), &str>,
 ) -> Option<String> {
     let language = ext.code_language();
+    if sym.kind == SymbolKind::Module && matches!(language, "typescript" | "tsx" | "javascript") {
+        return Some(NAMESPACE_READ_UNEXTRACTED.to_string());
+    }
     if sym.kind != SymbolKind::Method || !overrides_without_keyword(language) {
         return None;
     }

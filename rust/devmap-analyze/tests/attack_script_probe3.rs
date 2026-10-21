@@ -31,10 +31,24 @@ fn ts_namespace_in_script_is_live() {
     let d = dead("bin/t.ts", &format!("#!/usr/bin/env node\n{NS}"));
     assert!(d.is_empty(), "script: {d:?}");
 }
+// ft-260158ce: the extractor drops a file-scope read of a namespace, so a plain
+// module's row is capped to the unconfirmed tier rather than published at 0.9.
+fn confident_dead(path: &str, src: &str) -> Vec<String> {
+    reports(&[(path, src)])
+        .iter()
+        .filter(|x| !x.is_exempt)
+        .filter(|x| {
+            devmap_analyze::dead_tier::in_confident_branch(
+                f64::from(x.confidence),
+                x.exemption_reason.as_deref(),
+            )
+        })
+        .map(|x| format!("{} conf={:?}", x.symbol_name, x.confidence))
+        .collect()
+}
 #[test]
-#[ignore = "ft-260158ce: a TS namespace const read as NS.a is reported dead at 0.9 in a plain module: pre-existing, independent of ScriptEntry"]
 fn ts_namespace_in_plain_module_is_live() {
-    let d = dead("src/t.ts", NS);
+    let d = confident_dead("src/t.ts", NS);
     assert!(d.is_empty(), "plain module (control): {d:?}");
 }
 #[test]
@@ -54,9 +68,8 @@ fn ts_namespace_used_in_main_is_live() {
 }
 // A non-shebang TS file with a top-level call has no ScriptEntry on either side; control.
 #[test]
-#[ignore = "ft-260158ce: same pre-existing TS namespace gap, no shebang"]
 fn ts_script_without_shebang_control() {
-    let d = dead("scripts/t.ts", NS);
+    let d = confident_dead("scripts/t.ts", NS);
     assert!(d.is_empty(), "no shebang control: {d:?}");
 }
 // Python: Num alias via string annotation in a plain module (control).
