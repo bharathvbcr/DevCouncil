@@ -44,7 +44,11 @@ fn a_function_local_alias_read_binds_to_the_module_constant() {
         "import pkg.m as cr",
     ] {
         let user = format!("def check():\n    {import}\n\n    return cr.CONST_READ\n");
-        let found = reads(&[("pkg/__init__.py", ""), ("pkg/m.py", M), ("pkg/use.py", &user)]);
+        let found = reads(&[
+            ("pkg/__init__.py", ""),
+            ("pkg/m.py", M),
+            ("pkg/use.py", &user),
+        ]);
         assert!(
             reaches(&found, "pkg/use.py::check", "pkg/m.py::CONST_READ"),
             "{import}: {found:?}"
@@ -65,10 +69,22 @@ fn two_functions_with_one_alias_for_two_modules_each_bind_their_own() {
         ("pkg/n.py", "CONST_READ = 3\n"),
         ("pkg/use.py", user),
     ]);
-    assert!(reaches(&found, "pkg/use.py::one", "pkg/m.py::CONST_READ"), "{found:?}");
-    assert!(reaches(&found, "pkg/use.py::two", "pkg/n.py::CONST_READ"), "{found:?}");
-    assert!(!reaches(&found, "pkg/use.py::one", "pkg/n.py::CONST_READ"), "{found:?}");
-    assert!(!reaches(&found, "pkg/use.py::two", "pkg/m.py::CONST_READ"), "{found:?}");
+    assert!(
+        reaches(&found, "pkg/use.py::one", "pkg/m.py::CONST_READ"),
+        "{found:?}"
+    );
+    assert!(
+        reaches(&found, "pkg/use.py::two", "pkg/n.py::CONST_READ"),
+        "{found:?}"
+    );
+    assert!(
+        !reaches(&found, "pkg/use.py::one", "pkg/n.py::CONST_READ"),
+        "{found:?}"
+    );
+    assert!(
+        !reaches(&found, "pkg/use.py::two", "pkg/m.py::CONST_READ"),
+        "{found:?}"
+    );
 }
 
 fn abstains(user: &str, module: &str, extra: &[(&str, &str)]) {

@@ -45,14 +45,20 @@ fn z3(callee_return: &str, extra: &str) -> String {
 fn z3_a_local_from_a_function_written_to_return_a_generic_list_is_a_list() {
     let source = z3("List<String>", "");
     let found = calls(&[("p/Z.kt", &source)]);
-    assert!(reaches(&found, "p/Z.kt::use", "p/Z.kt::List.total"), "{found:?}");
+    assert!(
+        reaches(&found, "p/Z.kt::use", "p/Z.kt::List.total"),
+        "{found:?}"
+    );
 }
 
 #[test]
 fn z3_nested_generics_type_the_outer_constructor() {
     let source = "package p\n\nprivate fun Map<String, List<Int>>.total(): Int = size\n\nfun table(): Map<String, List<Int>> = emptyMap()\n\nfun use(): Int {\n    val t = table()\n    return t.total()\n}\n";
     let found = calls(&[("p/Z.kt", source)]);
-    assert!(reaches(&found, "p/Z.kt::use", "p/Z.kt::Map.total"), "{found:?}");
+    assert!(
+        reaches(&found, "p/Z.kt::use", "p/Z.kt::Map.total"),
+        "{found:?}"
+    );
 }
 
 #[test]
@@ -71,7 +77,10 @@ fn z3_a_nullable_a_star_projection_and_a_platform_type_abstain() {
 fn z3_a_type_parameter_is_not_a_type() {
     let source = "package p\n\nprivate fun <T> T.total(): Int = 1\n\nfun <T> ident(x: T): T = x\n\nfun use(): Int {\n    val v = ident(1)\n    return v.total()\n}\n";
     let found = calls(&[("p/Z.kt", source)]);
-    assert!(!reaches(&found, "p/Z.kt::use", "p/Z.kt::T.total"), "{found:?}");
+    assert!(
+        !reaches(&found, "p/Z.kt::use", "p/Z.kt::T.total"),
+        "{found:?}"
+    );
 }
 
 #[test]
@@ -80,7 +89,10 @@ fn z3_a_name_the_corpus_declares_twice_abstains() {
     let again = "package r\n\nclass List<T>\n";
     let source = z3("List<String>", "");
     let found = calls(&[("p/Z.kt", &source), ("q/L.kt", other), ("r/L.kt", again)]);
-    assert!(!reaches(&found, "p/Z.kt::use", "p/Z.kt::List.total"), "{found:?}");
+    assert!(
+        !reaches(&found, "p/Z.kt::use", "p/Z.kt::List.total"),
+        "{found:?}"
+    );
 }
 
 #[test]
@@ -88,14 +100,20 @@ fn z3_the_function_in_another_file_abstains() {
     let user = "package p\n\nprivate fun List<String>.total(): Int = size\n\nfun use(): Int {\n    val files = names()\n    return files.total()\n}\n";
     let provider = "package p\n\nfun names(): List<String> = listOf(\"a\")\n";
     let found = calls(&[("p/U.kt", user), ("p/N.kt", provider)]);
-    assert!(!reaches(&found, "p/U.kt::use", "p/U.kt::List.total"), "{found:?}");
+    assert!(
+        !reaches(&found, "p/U.kt::use", "p/U.kt::List.total"),
+        "{found:?}"
+    );
 }
 
 #[test]
 fn z3_a_callee_name_the_scope_binds_itself_abstains() {
     let source = "package p\n\nprivate fun List<String>.total(): Int = size\n\nfun names(): List<String> = listOf(\"a\")\n\nfun use(names: () -> Int): Int {\n    val files = names()\n    return files.total()\n}\n";
     let found = calls(&[("p/Z.kt", source)]);
-    assert!(!reaches(&found, "p/Z.kt::use", "p/Z.kt::List.total"), "{found:?}");
+    assert!(
+        !reaches(&found, "p/Z.kt::use", "p/Z.kt::List.total"),
+        "{found:?}"
+    );
 }
 
 const Z5_TYPES: &str = "package p\n\ninterface Repo {\n    fun find(id: Int): String\n}\n\nfun <reified T> mock(): T = throw IllegalStateException()\n\n";
@@ -106,7 +124,10 @@ fn z5_an_explicit_type_argument_naming_an_interface_types_the_local() {
         "{Z5_TYPES}fun use(): String {{\n    val repo = mock<Repo>()\n    return repo.find(1)\n}}\n"
     );
     let found = calls(&[("p/Z.kt", &source)]);
-    assert!(reaches(&found, "p/Z.kt::use", "p/Z.kt::Repo.find"), "{found:?}");
+    assert!(
+        reaches(&found, "p/Z.kt::use", "p/Z.kt::Repo.find"),
+        "{found:?}"
+    );
 }
 
 #[test]
@@ -136,7 +157,10 @@ fn z5_abstains_when_the_argument_is_not_one_declared_type() {
 fn z5_a_concrete_return_type_is_the_callees_word_not_the_argument() {
     let source = "package p\n\ninterface Repo {\n    fun find(id: Int): String\n}\n\nclass Box {\n    fun find(id: Int): String = \"b\"\n}\n\nfun <T> make(): Box = Box()\n\nfun use(): String {\n    val repo = make<Repo>()\n    return repo.find(1)\n}\n";
     let found = calls(&[("p/Z.kt", source)]);
-    assert!(!reaches(&found, "p/Z.kt::use", "p/Z.kt::Repo.find"), "{found:?}");
+    assert!(
+        !reaches(&found, "p/Z.kt::use", "p/Z.kt::Repo.find"),
+        "{found:?}"
+    );
 }
 
 #[test]
@@ -145,7 +169,10 @@ fn z5_a_value_argument_is_not_a_type_argument() {
         "{Z5_TYPES}fun <T> pick(x: Any): T = throw IllegalStateException()\n\nfun use(): String {{\n    val repo = pick(Repo)\n    return repo.find(1)\n}}\n"
     );
     let found = calls(&[("p/Z.kt", &source)]);
-    assert!(!reaches(&found, "p/Z.kt::use", "p/Z.kt::Repo.find"), "{found:?}");
+    assert!(
+        !reaches(&found, "p/Z.kt::use", "p/Z.kt::Repo.find"),
+        "{found:?}"
+    );
 }
 
 #[test]
@@ -154,6 +181,12 @@ fn z5_a_local_bound_twice_in_one_scope_is_withdrawn() {
         "{Z5_TYPES}class Other {{\n    fun find(id: Int): String = \"o\"\n}}\n\nfun use(flag: Boolean): String {{\n    if (flag) {{\n        val repo = mock<Repo>()\n        return repo.find(1)\n    }} else {{\n        val repo = mock<Other>()\n        return repo.find(2)\n    }}\n}}\n"
     );
     let found = calls(&[("p/Z.kt", &source)]);
-    assert!(!reaches(&found, "p/Z.kt::use", "p/Z.kt::Repo.find"), "{found:?}");
-    assert!(!reaches(&found, "p/Z.kt::use", "p/Z.kt::Other.find"), "{found:?}");
+    assert!(
+        !reaches(&found, "p/Z.kt::use", "p/Z.kt::Repo.find"),
+        "{found:?}"
+    );
+    assert!(
+        !reaches(&found, "p/Z.kt::use", "p/Z.kt::Other.find"),
+        "{found:?}"
+    );
 }

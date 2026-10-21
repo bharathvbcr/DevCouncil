@@ -66,7 +66,9 @@ fn assert_overloads_never_self_edge(path: &str, source: &str, owner: &str, user:
     );
     let reasons = abstentions(&result, "add");
     assert!(
-        reasons.iter().any(|reason| reason.contains("overloads share one id")),
+        reasons
+            .iter()
+            .any(|reason| reason.contains("overloads share one id")),
         "{path}: the dropped sibling call is a labelled abstention, not silence: {reasons:?}"
     );
 }
@@ -93,7 +95,9 @@ fn java_overloads_never_self_edge() {
     );
     let reasons = abstentions(&result, "add");
     assert!(
-        reasons.iter().any(|reason| reason.contains("overloads share one id")),
+        reasons
+            .iter()
+            .any(|reason| reason.contains("overloads share one id")),
         "the dropped sibling call is a labelled abstention: {reasons:?}"
     );
 }
@@ -108,7 +112,10 @@ fn java_typed_parameter_receiver_binds() {
     let result = resolve("Calc.java", JAVA_OVERLOADS);
     let calls = call_edges(&result);
     assert!(
-        calls.contains(&("Calc.java::U.use".to_string(), "Calc.java::Calc.add".to_string())),
+        calls.contains(&(
+            "Calc.java::U.use".to_string(),
+            "Calc.java::Calc.add".to_string()
+        )),
         "{calls:?}"
     );
 }
@@ -135,7 +142,10 @@ fn typescript_overload_signatures_bind_the_receiver_call() {
     );
     let calls = call_edges(&result);
     assert!(
-        calls.contains(&("calc.ts::useCalc".to_string(), "calc.ts::Calc.add".to_string())),
+        calls.contains(&(
+            "calc.ts::useCalc".to_string(),
+            "calc.ts::Calc.add".to_string()
+        )),
         "{calls:?}"
     );
     assert!(calls.iter().all(|(from, to)| from != to), "{calls:?}");
@@ -150,8 +160,14 @@ fn real_recursion_of_a_single_declaration_still_self_edges() {
         "fun f(n: Int): Int { return f(n - 1) }\nclass R { fun g(n: Int): Int = g(n - 1) }\n",
     );
     let calls = call_edges(&result);
-    assert!(calls.contains(&("rec.kt::f".into(), "rec.kt::f".into())), "{calls:?}");
-    assert!(calls.contains(&("rec.kt::R.g".into(), "rec.kt::R.g".into())), "{calls:?}");
+    assert!(
+        calls.contains(&("rec.kt::f".into(), "rec.kt::f".into())),
+        "{calls:?}"
+    );
+    assert!(
+        calls.contains(&("rec.kt::R.g".into(), "rec.kt::R.g".into())),
+        "{calls:?}"
+    );
 }
 
 /// Same-named methods of two different classes are different identities: the
@@ -163,5 +179,8 @@ fn same_method_name_on_two_classes_is_not_an_overload() {
         "class A {\n    fun go(): Int = 1\n}\n\nclass B {\n    fun go(a: A): Int = a.go()\n}\n",
     );
     let calls = call_edges(&result);
-    assert!(calls.contains(&("two.kt::B.go".into(), "two.kt::A.go".into())), "{calls:?}");
+    assert!(
+        calls.contains(&("two.kt::B.go".into(), "two.kt::A.go".into())),
+        "{calls:?}"
+    );
 }

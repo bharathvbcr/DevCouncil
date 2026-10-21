@@ -410,7 +410,10 @@ impl Resolver {
 
     /// The single type argument written in `call_ref`'s call (`<Repo>` in
     /// `make<Repo>()`), or `None` when the call is not exactly that shape.
-    fn kotlin_written_type_argument(ext: &Extraction, call_ref: &ExtractedReference) -> Option<String> {
+    fn kotlin_written_type_argument(
+        ext: &Extraction,
+        call_ref: &ExtractedReference,
+    ) -> Option<String> {
         let call = ext.calls.iter().find(|call| {
             call.span.start_byte == call_ref.span.start_byte
                 && call.callee_name == call_ref.name
@@ -439,11 +442,7 @@ impl Resolver {
     /// (class, interface or enum) of that name. A callee returning a concrete
     /// type, an ambiguous or unindexed argument, or a name the scope shadows
     /// abstains.
-    pub(super) fn kotlin_reified_type(
-        &self,
-        file: &str,
-        binding: &LocalBinding,
-    ) -> Option<String> {
+    pub(super) fn kotlin_reified_type(&self, file: &str, binding: &LocalBinding) -> Option<String> {
         let scope = binding.scope.clone().unwrap_or_else(|| file.to_string());
         let (callee_name, argument) = self
             .kotlin_type_arguments
@@ -475,18 +474,20 @@ impl Resolver {
         {
             return None;
         }
-        let mut declared = self.symbol_index.get(argument.as_str())?.iter().filter(
-            |(_, kind, family, _)| {
-                LangFamily::Kotlin.admits(*family)
-                    && matches!(
-                        kind,
-                        SymbolKind::Class
-                            | SymbolKind::Struct
-                            | SymbolKind::Interface
-                            | SymbolKind::Enum
-                    )
-            },
-        );
+        let mut declared =
+            self.symbol_index
+                .get(argument.as_str())?
+                .iter()
+                .filter(|(_, kind, family, _)| {
+                    LangFamily::Kotlin.admits(*family)
+                        && matches!(
+                            kind,
+                            SymbolKind::Class
+                                | SymbolKind::Struct
+                                | SymbolKind::Interface
+                                | SymbolKind::Enum
+                        )
+                });
         match (declared.next(), declared.next()) {
             (Some(_), None) => Some(argument.clone()),
             _ => None,

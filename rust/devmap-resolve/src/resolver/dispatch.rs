@@ -602,7 +602,9 @@ impl Resolver {
         if ext.language == "swift" {
             let visible: Vec<&(String, String)> = hits
                 .iter()
-                .filter(|hit| self.swift_member_hit_is_visible_from(&ext.file_path, hit, class_type))
+                .filter(|hit| {
+                    self.swift_member_hit_is_visible_from(&ext.file_path, hit, class_type)
+                })
                 .collect();
             return visible
                 .first()
@@ -611,7 +613,10 @@ impl Resolver {
         }
         // Overloads of one method are several hits that name one identity
         // (`add(Int)` / `add(String)` both mint `Calc.add`): one target.
-        if let Some(first) = hits.first().filter(|first| hits.iter().all(|hit| hit == *first)) {
+        if let Some(first) = hits
+            .first()
+            .filter(|first| hits.iter().all(|hit| hit == *first))
+        {
             return Some(first);
         }
         let scope = binding.and_then(|b| b.scope.as_deref()).or(scope);

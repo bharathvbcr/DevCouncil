@@ -62,11 +62,21 @@ fn write(root: &Path, path: &str, source: &str) {
 fn assert_corrected(rows: &[String], when: &str) {
     // Overloads: no self-edge, and the receiver call binds.
     assert!(
-        !has(rows, "Overloads.kt::Calc.add", "Overloads.kt::Calc.add", "Calls"),
+        !has(
+            rows,
+            "Overloads.kt::Calc.add",
+            "Overloads.kt::Calc.add",
+            "Calls"
+        ),
         "{when}: an overload calling its sibling is no self-edge"
     );
     assert!(
-        has(rows, "Overloads.kt::useCalc", "Overloads.kt::Calc.add", "Calls"),
+        has(
+            rows,
+            "Overloads.kt::useCalc",
+            "Overloads.kt::Calc.add",
+            "Calls"
+        ),
         "{when}: c.add(..) on a Calc binds"
     );
     // Kotlin Z3 / Z5.
@@ -80,7 +90,12 @@ fn assert_corrected(rows: &[String], when: &str) {
     );
     // Python function-local alias read.
     assert!(
-        has(rows, "pkg/use.py::check", "pkg/m.py::CONST_READ", "References"),
+        has(
+            rows,
+            "pkg/use.py::check",
+            "pkg/m.py::CONST_READ",
+            "References"
+        ),
         "{when}: cr.CONST_READ through a function-local alias binds"
     );
 }

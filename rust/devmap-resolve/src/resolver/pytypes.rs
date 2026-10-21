@@ -1296,7 +1296,8 @@ impl Resolver {
         if !Self::is_plain_ident(receiver) {
             return None;
         }
-        let Some(ScopeHit::Import(Some(bound))) = self.python_scope_lookup(file, scope, receiver, 0)
+        let Some(ScopeHit::Import(Some(bound))) =
+            self.python_scope_lookup(file, scope, receiver, 0)
         else {
             return None;
         };
