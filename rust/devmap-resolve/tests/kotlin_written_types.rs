@@ -1,13 +1,14 @@
 //! Kotlin receivers typed by a *written* type that `admissible_nominal_type`
-//! used to refuse (ft-87b28bb6, resolver half; fixture rows `kg.Z3`, `kg.Z5`).
+//! used to refuse (ft-87b28bb6, resolver half; fixture row `kg.Z3`).
 //!
 //! * Z3: a local initialised from a function written to return `List<String>`
 //!   is a `List`; the extension `List<String>.total()` is reachable.
-//! * Z5: `val repo = mock<Repo>()` writes its type argument; `Repo` may be an
-//!   interface.
 //!
-//! Each binds only through a written, unique type and abstains otherwise. Z1,
-//! Z2, Z4 and Z6 need extractor facts (extract-v98) and are not touched.
+//! It binds only through a written, unqualified, unique type and abstains
+//! otherwise. Z5 (`val repo = mock<Repo>()`) was reverted: soundness needs the
+//! callee's type-parameter list, which the extraction does not carry (no
+//! signature text for Kotlin), so `fun <T> f(): Logger` cannot be told from
+//! `fun <T> f(): T`. Z1, Z2, Z4, Z5 and Z6 are blocked on extract-v98.
 
 use devmap_extract::extract_file;
 use devmap_extract::model::EdgeKind;
@@ -112,81 +113,6 @@ fn z3_a_callee_name_the_scope_binds_itself_abstains() {
     let found = calls(&[("p/Z.kt", source)]);
     assert!(
         !reaches(&found, "p/Z.kt::use", "p/Z.kt::List.total"),
-        "{found:?}"
-    );
-}
-
-const Z5_TYPES: &str = "package p\n\ninterface Repo {\n    fun find(id: Int): String\n}\n\nfun <reified T> mock(): T = throw IllegalStateException()\n\n";
-
-#[test]
-fn z5_an_explicit_type_argument_naming_an_interface_types_the_local() {
-    let source = format!(
-        "{Z5_TYPES}fun use(): String {{\n    val repo = mock<Repo>()\n    return repo.find(1)\n}}\n"
-    );
-    let found = calls(&[("p/Z.kt", &source)]);
-    assert!(
-        reaches(&found, "p/Z.kt::use", "p/Z.kt::Repo.find"),
-        "{found:?}"
-    );
-}
-
-#[test]
-fn z5_abstains_when_the_argument_is_not_one_declared_type() {
-    let cases = [
-        // Two declarations of the name: no unique type.
-        ("class Repo2\n", "Repo", true),
-        // A nullable argument and a nested one are not a bare type name.
-        ("", "Repo?", false),
-        ("", "List<Repo>", false),
-        // A name nothing declares.
-        ("", "Nothing2", false),
-    ];
-    for (extra, argument, _) in cases {
-        let source = format!(
-            "{Z5_TYPES}{extra}class Repo\n\nfun use(): String {{\n    val repo = mock<{argument}>()\n    return repo.find(1)\n}}\n"
-        );
-        let found = calls(&[("p/Z.kt", &source)]);
-        assert!(
-            !reaches(&found, "p/Z.kt::use", "p/Z.kt::Repo.find"),
-            "{argument}: {found:?}"
-        );
-    }
-}
-
-#[test]
-fn z5_a_concrete_return_type_is_the_callees_word_not_the_argument() {
-    let source = "package p\n\ninterface Repo {\n    fun find(id: Int): String\n}\n\nclass Box {\n    fun find(id: Int): String = \"b\"\n}\n\nfun <T> make(): Box = Box()\n\nfun use(): String {\n    val repo = make<Repo>()\n    return repo.find(1)\n}\n";
-    let found = calls(&[("p/Z.kt", source)]);
-    assert!(
-        !reaches(&found, "p/Z.kt::use", "p/Z.kt::Repo.find"),
-        "{found:?}"
-    );
-}
-
-#[test]
-fn z5_a_value_argument_is_not_a_type_argument() {
-    let source = format!(
-        "{Z5_TYPES}fun <T> pick(x: Any): T = throw IllegalStateException()\n\nfun use(): String {{\n    val repo = pick(Repo)\n    return repo.find(1)\n}}\n"
-    );
-    let found = calls(&[("p/Z.kt", &source)]);
-    assert!(
-        !reaches(&found, "p/Z.kt::use", "p/Z.kt::Repo.find"),
-        "{found:?}"
-    );
-}
-
-#[test]
-fn z5_a_local_bound_twice_in_one_scope_is_withdrawn() {
-    let source = format!(
-        "{Z5_TYPES}class Other {{\n    fun find(id: Int): String = \"o\"\n}}\n\nfun use(flag: Boolean): String {{\n    if (flag) {{\n        val repo = mock<Repo>()\n        return repo.find(1)\n    }} else {{\n        val repo = mock<Other>()\n        return repo.find(2)\n    }}\n}}\n"
-    );
-    let found = calls(&[("p/Z.kt", &source)]);
-    assert!(
-        !reaches(&found, "p/Z.kt::use", "p/Z.kt::Repo.find"),
-        "{found:?}"
-    );
-    assert!(
-        !reaches(&found, "p/Z.kt::use", "p/Z.kt::Other.find"),
         "{found:?}"
     );
 }

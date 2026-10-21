@@ -1295,10 +1295,10 @@ impl Resolver {
             }
         }
         let flat = self.import_bindings.get(file)?.get(name)?;
-        // Only functions bind it, and to different things: the flat table
-        // holds one of them, and no function enclosing this read is the one.
+        // Only functions bind it: the flat table holds the first of them, and
+        // no function enclosing this read is the one.
         (!self
-            .python_ambiguous_scoped_imports
+            .python_function_only_imports
             .contains(&(file.to_string(), name.to_string())))
         .then_some(flat)
     }

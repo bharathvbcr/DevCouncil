@@ -155,7 +155,8 @@ fn ov_kotlin_nested_class_same_method_name_as_outer() {
     let s = "package p\n\nclass Outer {\n    fun run(n: Int): Int = if (n > 0) run(n - 1) else 0\n\n    class Inner {\n        fun run(n: Int): Int = if (n > 0) run(n - 1) else 0\n    }\n}\n";
     let e = calls(&[("p/Z.kt", s)]);
     assert!(has(&e, "p/Z.kt::Outer.run", "p/Z.kt::Outer.run"), "{e:?}");
-    assert!(has(&e, "p/Z.kt::Outer.Inner.run", "p/Z.kt::Outer.Inner.run"), "{e:?}");
+    // The extractor names a nested class's member `Inner.run`, not `Outer.Inner.run`.
+    assert!(has(&e, "p/Z.kt::Inner.run", "p/Z.kt::Inner.run"), "{e:?}");
 }
 
 #[test]

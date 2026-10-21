@@ -1143,7 +1143,14 @@ impl Resolver {
                     // 2c'. Swift: a bare call that bound to a method of a protocol is
                     // a call through it — `greet()` written in `extension Greeter`
                     // runs whichever conformer `self` is.
-                    if family == LangFamily::Swift && call.receiver_expr.is_none() {
+                    if family == LangFamily::Swift
+                        && call.receiver_expr.is_none()
+                        && !self.is_overload_self_call(
+                            &ext.file_path,
+                            call.caller_symbol.as_deref().unwrap_or(&ext.file_path),
+                            resolution.as_deref(),
+                        )
+                    {
                         let through_protocol = match resolution.as_deref() {
                             Some(Resolution::SameFile {
                                 target_symbol,
@@ -1588,22 +1595,13 @@ impl Resolver {
                     // too, and nothing recorded about the call (no arity)
                     // separates the two: abstain, with the reason, rather than
                     // assert a self-edge a sibling call would make false.
-                    if let Some(Resolution::SameFile { target_symbol, target_file }
-                    | Resolution::ReceiverType { target_symbol, target_file, .. }) = resolution.as_deref()
-                    {
-                        if *target_symbol == caller_sym
-                            && *target_file == ext.file_path
-                            && self
-                                .shared_identities
-                                .contains(&(ext.file_path.clone(), caller_sym.clone()))
-                        {
-                            resolution = Some(Arc::new(Resolution::Unresolved {
-                                reason: format!(
-                                    "{caller_sym} is declared more than once in {} (overloads share one id), so a call to {:?} from inside it cannot be told apart from a call to a sibling overload",
-                                    ext.file_path, call.callee_name
-                                ),
-                            }));
-                        }
+                    if self.is_overload_self_call(&ext.file_path, &caller_sym, resolution.as_deref()) {
+                        resolution = Some(Arc::new(Resolution::Unresolved {
+                            reason: format!(
+                                "{caller_sym} is declared more than once in {} (overloads share one id), so a call to {:?} from inside it cannot be told apart from a call to a sibling overload",
+                                ext.file_path, call.callee_name
+                            ),
+                        }));
                     }
                     // Emission is driven entirely by the resolution, and
                     // anything that emits no edge falls through to the ledger —

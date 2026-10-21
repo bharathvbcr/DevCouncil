@@ -151,6 +151,21 @@ fn typescript_overload_signatures_bind_the_receiver_call() {
     assert!(calls.iter().all(|(from, to)| from != to), "{calls:?}");
 }
 
+/// A protocol-dispatched overload must not get its self-edge back through the
+/// fan-out to conformers (the abstain and the fan-out agree).
+#[test]
+fn swift_protocol_fan_out_gives_an_overload_no_self_edge() {
+    let result = resolve(
+        "Calc.swift",
+        "protocol Adder {\n  func add(_ a: Int) -> Int\n  func add(_ a: String) -> Int\n}\n\nextension Adder {\n  func add(_ a: String) -> Int { return add(a.count) }\n}\n\nclass Calc: Adder {\n  func add(_ a: Int) -> Int { return a }\n  func add(_ a: String) -> Int { return a.count }\n}\n",
+    );
+    let calls = call_edges(&result);
+    assert!(
+        calls.iter().all(|(from, to)| from != to),
+        "no self-edge through the fan-out: {calls:?}"
+    );
+}
+
 /// The guard is keyed on a *shared* identity, so a function with one
 /// declaration keeps its genuine recursion edge.
 #[test]

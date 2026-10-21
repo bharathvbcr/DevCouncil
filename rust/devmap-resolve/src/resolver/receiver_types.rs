@@ -239,9 +239,11 @@ impl Resolver {
             }) {
                 return Some(from_factory);
             }
-            // `val repo = mock<Repo>()`: the type argument the call writes.
-            if let Some(from_argument) = self.kotlin_reified_type(file, binding) {
-                return Some(from_argument);
+            // `val files = names()` with `fun names(): List<String>`.
+            if self.family_of_file(file) == Some(LangFamily::Kotlin) {
+                if let Some(generic) = self.kotlin_generic_factory_type(file, binding) {
+                    return Some(generic);
+                }
             }
             // A Kotlin local whose initializer states no type (`val vm =
             // createViewModel()`) is still the name the file types everywhere
@@ -798,9 +800,10 @@ impl Resolver {
         if depth != 0 {
             return None;
         }
+        // A qualified spelling (`Map.Entry`, `ext.Repo`, `a.b.Page`) names what
+        // its qualifier says, not whatever type the last segment is elsewhere.
         let path = written[..open].trim();
-        let bare = path.rsplit('.').next()?;
-        (path.split('.').all(Self::is_plain_ident) && !bare.is_empty()).then(|| bare.to_string())
+        Self::is_plain_ident(path).then(|| path.to_string())
     }
 
     pub(super) fn admissible_nominal_type(raw: &str) -> Option<String> {

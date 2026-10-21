@@ -33,7 +33,7 @@ impl Resolver {
         self.python_class_enclosers.clear();
         self.python_dynamic_all.clear();
         self.python_scoped_import_bindings.clear();
-        self.python_ambiguous_scoped_imports.clear();
+        self.python_function_only_imports.clear();
         self.subtypes.clear();
         self.import_bindings.clear();
         self.value_imports.clear();
@@ -49,7 +49,7 @@ impl Resolver {
         self.local_module_roots.clear();
         self.qualified_names.clear();
         self.shared_identities.clear();
-        self.kotlin_type_arguments.clear();
+        self.kotlin_initializer_calls.clear();
         self.symbol_parents.clear();
         self.scope_children.clear();
         self.go_package_by_file.clear();
@@ -118,7 +118,21 @@ impl Resolver {
         for ext in extractions {
             let family = LangFamily::from_lang(&ext.language);
             let mut file_syms = Vec::new();
-            let mut file_identities: BTreeSet<&str> = BTreeSet::new();
+            let mut file_identities: BTreeSet<(&str, Option<&str>)> = BTreeSet::new();
+            let overloads_by_signature = matches!(
+                ext.language.as_str(),
+                "kotlin" | "swift" | "java" | "csharp" | "scala"
+            );
+            let mut callable_names: BTreeMap<&str, usize> = BTreeMap::new();
+            if overloads_by_signature {
+                for sym in &ext.symbols {
+                    if matches!(sym.kind, SymbolKind::Function | SymbolKind::Method) {
+                        *callable_names
+                            .entry(sym.qualified_name.as_str())
+                            .or_default() += 1;
+                    }
+                }
+            }
             for sym in &ext.symbols {
                 if family == LangFamily::Rust {
                     if let Some(signature) = &sym.signature {
@@ -136,7 +150,18 @@ impl Resolver {
                         .insert((ext.file_path.clone(), sym.qualified_name.clone()));
                 }
                 let identity: Arc<str> = Arc::from(sym.qualified_name.as_str());
-                if !file_identities.insert(sym.qualified_name.as_str()) {
+                // Overloads: two callables of one name in one container, in a
+                // language that overloads by signature. A Python redefinition,
+                // a Rust impl of two traits, or a local function of the same
+                // name in two different functions are not siblings of one id.
+                if overloads_by_signature
+                    && matches!(sym.kind, SymbolKind::Function | SymbolKind::Method)
+                    && callable_names.get(sym.qualified_name.as_str()) > Some(&1)
+                    && !file_identities.insert((
+                        sym.qualified_name.as_str(),
+                        Self::innermost_container(ext, sym),
+                    ))
+                {
                     self.shared_identities
                         .insert((ext.file_path.clone(), sym.qualified_name.clone()));
                 }
@@ -1148,21 +1173,17 @@ impl Resolver {
                     }
                 }
             }
-            // A name only functions bind, and bind to different things, has no
-            // one binding in the flat table. A name the module also binds is
-            // not a conflict: a module-scope read is the module's, and a read
-            // in a function asks the scope walk first.
-            let mut targets_by_name: BTreeMap<&str, BTreeSet<&Option<(String, String)>>> =
-                BTreeMap::new();
+            // A name only functions bind is bound in no scope but theirs: the
+            // flat table keeps the first such import, which is the answer for
+            // no other function and not for module scope. A name the module
+            // also binds is not affected: a module-scope read is the module's,
+            // and a read in a function asks the scope walk first.
             for names in file_scoped.values() {
-                for (name, bound) in names {
-                    targets_by_name.entry(name).or_default().insert(bound);
-                }
-            }
-            for (name, targets) in targets_by_name {
-                if targets.len() > 1 && !module_imported.contains(name) {
-                    self.python_ambiguous_scoped_imports
-                        .insert((ext.file_path.clone(), name.to_string()));
+                for name in names.keys() {
+                    if !module_imported.contains(name) {
+                        self.python_function_only_imports
+                            .insert((ext.file_path.clone(), name.to_string()));
+                    }
                 }
             }
             for (scope, names) in file_scoped {
@@ -1470,7 +1491,7 @@ impl Resolver {
             }
             self.index_module_value_types(ext, family);
             if family == LangFamily::Kotlin {
-                self.index_kotlin_type_arguments(ext);
+                self.index_kotlin_initializer_calls(ext);
             }
             self.index_js_objects(ext);
             // A `let x = self.field` (including through `if` / `&`) takes the

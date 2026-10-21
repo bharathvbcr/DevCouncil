@@ -103,6 +103,64 @@ impl Resolver {
             .then(|| first.to_string())
     }
 
+    /// The callable `sym` is declared inside, when it is a local function (the
+    /// smallest enclosing symbol is a function or method). A local function's
+    /// recorded parent is the file, so containment is the only fact that tells
+    /// `a`'s `helper` from `b`'s; a member, an extension, a companion member
+    /// and a top-level function all answer `None`, so they stay siblings.
+    pub(super) fn innermost_container<'a>(
+        ext: &'a Extraction,
+        sym: &ExtractedSymbol,
+    ) -> Option<&'a str> {
+        ext.symbols
+            .iter()
+            .filter(|other| {
+                other.kind != SymbolKind::File
+                    && other.span.start_byte <= sym.span.start_byte
+                    && sym.span.end_byte <= other.span.end_byte
+                    && (other.span.start_byte, other.span.end_byte)
+                        != (sym.span.start_byte, sym.span.end_byte)
+            })
+            .min_by_key(|other| other.span.end_byte - other.span.start_byte)
+            .filter(|other| matches!(other.kind, SymbolKind::Function | SymbolKind::Method))
+            .map(|other| other.qualified_name.as_str())
+    }
+
+    /// Whether `resolution` binds a call written inside `caller` back to
+    /// `caller` itself where `caller` is one of several same-named callables of
+    /// one container (overloads share one id).
+    ///
+    /// Real recursion binds there too, and nothing recorded about the call (no
+    /// arity) separates it from a call to a sibling overload, so the ladder
+    /// abstains rather than assert either; the accepted cost is a recursion
+    /// inside one overload of a real pair.
+    pub(super) fn is_overload_self_call(
+        &self,
+        file: &str,
+        caller: &str,
+        resolution: Option<&Resolution>,
+    ) -> bool {
+        let Some(
+            Resolution::SameFile {
+                target_symbol,
+                target_file,
+            }
+            | Resolution::ReceiverType {
+                target_symbol,
+                target_file,
+                ..
+            },
+        ) = resolution
+        else {
+            return false;
+        };
+        target_symbol == caller
+            && target_file == file
+            && self
+                .shared_identities
+                .contains(&(file.to_string(), caller.to_string()))
+    }
+
     /// The leftmost segment of a dotted, scoped or slashed path.
     ///
     /// One owner for a split that `classify_unresolved` was doing inline and

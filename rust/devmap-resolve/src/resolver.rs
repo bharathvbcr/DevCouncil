@@ -437,10 +437,10 @@ pub struct Resolver {
     /// binds; this is where the function's own live.
     python_scoped_import_bindings:
         BTreeMap<(String, String), BTreeMap<String, Option<(String, String)>>>,
-    /// `(file, name)` that several functions import differently and the module
-    /// does not import: the flat table holds one of them, so a read that no
-    /// function's own scope answers has no binding.
-    python_ambiguous_scoped_imports: BTreeSet<(String, String)>,
+    /// `(file, name)` that only functions import and the module does not: the
+    /// flat table holds the first of them, so a read that no function's own
+    /// scope answers (another function, or module scope) has no binding.
+    python_function_only_imports: BTreeSet<(String, String)>,
     /// Reverse of [`Self::supertypes`]: `(family, type name)` → indexed subtypes.
     ///
     /// Built from the same heritage rows. X42's virtual-`self` guard walks this
@@ -560,10 +560,10 @@ pub struct Resolver {
     /// declaration of such an identity to the same identity cannot be told from
     /// a call to its sibling overload without the call's arity.
     shared_identities: BTreeSet<(String, String)>,
-    /// `(file, scope, local)` → `(callee, type argument)` for a Kotlin
-    /// `val local = callee<Type>()`. `None` withdraws the key: the call was not
-    /// exactly that shape, or the local is bound twice in its scope.
-    kotlin_type_arguments: BTreeMap<(String, String, String), Option<(String, String)>>,
+    /// `(file, scope, local)` → every callee the Kotlin local's initializer
+    /// names, in source order of first mention (`if (f) a() else b()` names
+    /// `a` and `b`).
+    kotlin_initializer_calls: BTreeMap<(String, String, String), Vec<String>>,
     /// `(file, qualified name)` → the symbol that declares it, with the file
     /// path standing for "declared at file level".
     ///
@@ -771,7 +771,7 @@ impl Resolver {
             python_class_enclosers: BTreeMap::new(),
             python_dynamic_all: BTreeSet::new(),
             python_scoped_import_bindings: BTreeMap::new(),
-            python_ambiguous_scoped_imports: BTreeSet::new(),
+            python_function_only_imports: BTreeSet::new(),
             subtypes: BTreeMap::new(),
             import_bindings: BTreeMap::new(),
             value_imports: BTreeMap::new(),
@@ -787,7 +787,7 @@ impl Resolver {
             local_module_roots: BTreeMap::new(),
             qualified_names: BTreeMap::new(),
             shared_identities: BTreeSet::new(),
-            kotlin_type_arguments: BTreeMap::new(),
+            kotlin_initializer_calls: BTreeMap::new(),
             symbol_parents: BTreeMap::new(),
             scope_children: BTreeMap::new(),
             go_modules: Vec::new(),
