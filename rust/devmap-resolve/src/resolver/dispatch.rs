@@ -611,38 +611,6 @@ impl Resolver {
                 .copied()
                 .filter(|first| visible.iter().all(|hit| hit == first));
         }
-        // A single-name import of the type from outside the index (`import
-        // ext.Repo`) says the bare name means that type here, whatever indexed
-        // class shares the spelling.
-        //
-        // Only where an indexed class of that spelling exists to be mistaken:
-        // an extension declared on the external type itself (`fun Modifier.x()`
-        // beside `import androidx.compose.ui.Modifier`) is the import's very
-        // reason to apply.
-        if matches!(ext.language.as_str(), "kotlin" | "java" | "scala")
-            && self.symbol_index.get(class_type).is_some_and(|declared| {
-                declared.iter().any(|(_, kind, family, _)| {
-                    LangFamily::from_lang(&ext.language).admits(*family)
-                        && matches!(
-                            kind,
-                            SymbolKind::Class
-                                | SymbolKind::Struct
-                                | SymbolKind::Interface
-                                | SymbolKind::Enum
-                        )
-                })
-            })
-            && (self
-                .external_imports
-                .get(&ext.file_path)
-                .is_some_and(|imports| imports.contains_key(class_type))
-                || self
-                    .unindexed_local_imports
-                    .get(&ext.file_path)
-                    .is_some_and(|imports| imports.contains_key(class_type)))
-        {
-            return None;
-        }
         // Overloads of one method are several hits that name one identity
         // (`add(Int)` / `add(String)` both mint `Calc.add`): one target.
         if let Some(first) = hits

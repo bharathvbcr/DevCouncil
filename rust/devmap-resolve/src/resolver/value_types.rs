@@ -1,51 +1,5 @@
 use super::*;
 
-/// The type names every Kotlin file sees without an import (`kotlin.*`,
-/// `kotlin.collections.*`, `kotlin.sequences.*`, `kotlin.text.*`, `kotlin.io.*`
-/// and `kotlin.ranges.*`), which a repository class of the same name does not
-/// replace unless the file declares or imports it.
-const KOTLIN_DEFAULT_IMPORTS: &[&str] = &[
-    "Any",
-    "Array",
-    "ArrayList",
-    "BooleanArray",
-    "Collection",
-    "Comparable",
-    "Comparator",
-    "Deferred",
-    "Entry",
-    "Enum",
-    "Error",
-    "Exception",
-    "HashMap",
-    "HashSet",
-    "Iterable",
-    "Iterator",
-    "LinkedHashMap",
-    "LinkedHashSet",
-    "List",
-    "ListIterator",
-    "Lazy",
-    "Map",
-    "MutableCollection",
-    "MutableIterable",
-    "MutableIterator",
-    "MutableList",
-    "MutableMap",
-    "MutableSet",
-    "Nothing",
-    "Number",
-    "Pair",
-    "Result",
-    "Sequence",
-    "Set",
-    "String",
-    "StringBuilder",
-    "Throwable",
-    "Triple",
-    "Unit",
-];
-
 impl Resolver {
     /// The one indexed `Class`/`Struct` called `name` in a family `family`
     /// admits, or `None` when there is no such type or more than one.
@@ -297,19 +251,6 @@ impl Resolver {
         scope: Option<&str>,
         shape: &str,
     ) -> Option<String> {
-        let (callee_file, callee) = self.factory_callee(family, file, scope, shape)?;
-        self.factory_written_type(family, file, &callee_file, &callee)
-    }
-
-    /// The one callable an initializer shape names, as `(file, qualified
-    /// name)`: the half of [`Self::factory_return_type`] that finds the callee.
-    pub(super) fn factory_callee(
-        &self,
-        family: LangFamily,
-        file: &str,
-        scope: Option<&str>,
-        shape: &str,
-    ) -> Option<(String, String)> {
         let shape = shape.trim();
         if shape.ends_with("{..}") || shape.ends_with("::new") {
             // Constructor shapes have their own rung, which needs no callee.
@@ -360,9 +301,6 @@ impl Resolver {
         } else {
             if !Self::is_plain_ident(shape)
                 || scope.is_some_and(|scope| self.scope_shadows(family, file, scope, shape))
-                || scope.is_some_and(|scope| {
-                    self.enclosing_type_declares_member(family, file, scope, shape)
-                })
             {
                 return None;
             }
@@ -388,281 +326,21 @@ impl Resolver {
         {
             return None;
         }
-        Some((callee_file, callee))
-    }
-
-    /// Whether a type enclosing `scope` declares a member called `name`, in a
-    /// language whose bare call inside a method is first the enclosing type's
-    /// own member (Kotlin, Swift, Java and the other brace languages).
-    ///
-    /// A bare `make()` written in `class C` is `this.make()` when `C` declares
-    /// one, and only otherwise a top-level `make`; when both exist the callee is
-    /// not the top-level one the file-level lookup finds, so the factory rungs
-    /// abstain rather than type the local by the wrong function.
-    pub(super) fn enclosing_type_declares_member(
-        &self,
-        family: LangFamily,
-        file: &str,
-        scope: &str,
-        name: &str,
-    ) -> bool {
-        if !matches!(
-            family,
-            LangFamily::Kotlin | LangFamily::Swift | LangFamily::CStyle
-        ) {
-            return false;
-        }
-        let declares = |type_identity: &str| {
-            let bare = type_identity.rsplit("::").next().unwrap_or(type_identity);
-            self.type_methods
-                .contains_key(&(family, bare.to_string(), name.to_string()))
-        };
-        // A call attributed to the type itself (a property initializer) sees its
-        // own members; a call in a method sees its type's, then the outer ones.
-        let mut current = scope.to_string();
-        for _ in 0..8 {
-            if current != file && declares(&current) {
-                return true;
-            }
-            let Some(parent) = self
-                .symbol_parents
-                .get(&(file.to_string(), current.clone()))
-                .filter(|parent| parent.as_str() != file && **parent != current)
-            else {
-                return false;
-            };
-            if declares(parent) {
-                return true;
-            }
-            current = parent.clone();
-        }
-        false
-    }
-
-    /// The nominal type the callable `(callee_file, callee)` is written to
-    /// return, read at a call site in `file`.
-    pub(super) fn factory_written_type(
-        &self,
-        family: LangFamily,
-        file: &str,
-        callee_file: &str,
-        callee: &str,
-    ) -> Option<String> {
         let written = self
             .return_types
-            .get(&(callee_file.to_string(), callee.to_string()))?;
+            .get(&(callee_file.clone(), callee.clone()))?;
         let mut nominal = Self::admissible_nominal_type(written)?;
         if nominal == "Self" {
-            nominal = self.declaring_type_of(callee_file, callee)?.to_string();
+            nominal = self.declaring_type_of(&callee_file, &callee)?.to_string();
         }
         // The annotation is a name in the callee's file, which the caller may
         // not share: read it there (an alias is the class it aliases).
         if family == LangFamily::Python && callee_file != file {
-            nominal = self.python_annotation_class(callee_file, &nominal)?;
-        }
-        // Kotlin reads a bare name through its imports and package, so the one
-        // corpus declaration must also be the one both files' spellings reach
-        // (not a nested class, not shadowed by a single-name import).
-        if family == LangFamily::Kotlin
-            && !self.kotlin_constructor_is_one_type(file, callee_file, &nominal)
-        {
-            return None;
+            nominal = self.python_annotation_class(&callee_file, &nominal)?;
         }
         (self.unique_indexed_type(family, &nominal)
-            || self.names_one_type_in_both(file, callee_file, &nominal))
+            || self.names_one_type_in_both(file, &callee_file, &nominal))
         .then_some(nominal)
-    }
-
-    /// Fill [`Self::kotlin_initializer_calls`] for one Kotlin file: for each
-    /// local, every callee named in its initializer (`if (f) a() else b()`
-    /// names both; `a(b())` names both).
-    pub(super) fn index_kotlin_initializer_calls(&mut self, ext: &Extraction) {
-        for reference in ext.references.iter().filter(|reference| {
-            matches!(
-                reference.kind,
-                ReferenceKind::Call | ReferenceKind::Constructor
-            )
-        }) {
-            let Some(bound) = reference.assigned_to.as_deref() else {
-                continue;
-            };
-            let scope = reference
-                .enclosing_symbol
-                .clone()
-                .unwrap_or_else(|| ext.file_path.clone());
-            let callees = self
-                .kotlin_initializer_calls
-                .entry((ext.file_path.clone(), scope, bound.to_string()))
-                .or_default();
-            if !callees.contains(&reference.name) {
-                callees.push(reference.name.clone());
-            }
-        }
-    }
-
-    /// The type a Kotlin local gets from an initializer whose callee is written
-    /// to return a *generic* type: `val files = names()` with `fun names():
-    /// List<String>` is a `List`.
-    ///
-    /// The constructor is a written nominal type, but dropping its arguments
-    /// must not let a stdlib-spelled name reach a same-named class of the repo,
-    /// so it binds only when:
-    ///
-    /// * the written type is one unqualified, un-nullable `Name<...>` (see
-    ///   [`Self::kotlin_type_constructor`]) — a qualified or aliased spelling
-    ///   names whatever its qualifier says;
-    /// * the corpus declares no type of that name and the callee and the call
-    ///   are in one file (a stdlib or external type: one import list governs
-    ///   both spellings), or the corpus declares exactly one and both files
-    ///   reach that declaration by an explicit import of it or by sharing its
-    ///   package — never for a name Kotlin imports by default unless the
-    ///   declaration is in the same file or imported explicitly, and never when
-    ///   the file imports that name from elsewhere;
-    /// * every callee the initializer names agrees on the type (an `if`/`when`
-    ///   with two different branch types, or a call nested in an argument whose
-    ///   type is not known, abstains).
-    pub(super) fn kotlin_generic_factory_type(
-        &self,
-        file: &str,
-        binding: &LocalBinding,
-    ) -> Option<String> {
-        let shape = binding.initializer.as_deref()?;
-        let (callee_file, callee) =
-            self.factory_callee(LangFamily::Kotlin, file, binding.scope.as_deref(), shape)?;
-        let written = self.return_types.get(&(callee_file.clone(), callee))?;
-        let constructor = Self::kotlin_type_constructor(written)?;
-        if !self.kotlin_constructor_is_one_type(file, &callee_file, &constructor) {
-            return None;
-        }
-        let scope = binding.scope.clone().unwrap_or_else(|| file.to_string());
-        let callees =
-            self.kotlin_initializer_calls
-                .get(&(file.to_string(), scope, binding.name.clone()))?;
-        callees
-            .iter()
-            .all(|other| {
-                other == shape
-                    || self
-                        .kotlin_callee_constructor(file, binding.scope.as_deref(), other)
-                        .is_some_and(|found| found == constructor)
-            })
-            .then_some(constructor)
-    }
-
-    /// The type constructor a named Kotlin callee yields: its written generic
-    /// return type, or — for a stdlib collection factory the corpus does not
-    /// redeclare — the collection it builds.
-    fn kotlin_callee_constructor(
-        &self,
-        file: &str,
-        scope: Option<&str>,
-        callee: &str,
-    ) -> Option<String> {
-        if let Some((callee_file, identity)) =
-            self.factory_callee(LangFamily::Kotlin, file, scope, callee)
-        {
-            let written = self.return_types.get(&(callee_file, identity))?;
-            return Self::kotlin_type_constructor(written);
-        }
-        if self.family_declares(LangFamily::Kotlin, callee) {
-            return None;
-        }
-        let built = match callee {
-            "emptyList" | "listOf" => "List",
-            "emptySet" | "setOf" => "Set",
-            "emptyMap" | "mapOf" => "Map",
-            _ => return None,
-        };
-        Some(built.to_string())
-    }
-
-    /// Whether the type constructor `constructor`, written in `callee_file` and
-    /// read at a call site in `file`, is one type. See
-    /// [`Self::kotlin_generic_factory_type`] for the rule.
-    pub(super) fn kotlin_constructor_is_one_type(
-        &self,
-        file: &str,
-        callee_file: &str,
-        constructor: &str,
-    ) -> bool {
-        let declared: Vec<&(String, SymbolKind, LangFamily, Arc<str>)> = self
-            .symbol_index
-            .get(constructor)
-            .into_iter()
-            .flatten()
-            .filter(|(_, kind, family, _)| {
-                // A function or method sharing the name (a `fun Repo()` factory
-                // beside `class Repo`) is not a type.
-                LangFamily::Kotlin.admits(*family)
-                    && !matches!(kind, SymbolKind::Function | SymbolKind::Method)
-            })
-            .collect();
-        let [(declaring_file, kind, _, identity)] = declared.as_slice() else {
-            // None declared: a stdlib or external type. Two or more: no one
-            // declaration for either spelling to mean.
-            return declared.is_empty() && file == callee_file;
-        };
-        // A nested class (`Outer.Repo`) is not what a bare `Repo` names outside
-        // `Outer`.
-        identity
-            .strip_prefix(declaring_file.as_str())
-            .and_then(|rest| rest.strip_prefix("::"))
-            == Some(constructor)
-            && matches!(
-                kind,
-                SymbolKind::Class | SymbolKind::Struct | SymbolKind::Interface | SymbolKind::Enum
-            )
-            // Only the callee's file writes the type; the call site just
-            // receives a value of it.
-            && self.kotlin_site_names_declaration(callee_file, constructor, declaring_file)
-    }
-
-    /// Whether `site` reads the bare type name `name` as the declaration in
-    /// `declaring_file`: it declares it, imports exactly it, or — for a name
-    /// Kotlin does not import by default — shares its package. A file that
-    /// imports the name from anywhere else binds it there.
-    pub(super) fn kotlin_site_names_declaration(
-        &self,
-        site: &str,
-        name: &str,
-        declaring_file: &str,
-    ) -> bool {
-        // The import table already holds only what this file's imports bind: a
-        // single-name import from outside the index has removed a star import's
-        // binding of the same name (see `index_extractions`).
-        if let Some((target, _)) = self
-            .import_bindings
-            .get(site)
-            .and_then(|bindings| bindings.get(name))
-        {
-            return target == declaring_file;
-        }
-        // No binding, but an import from outside the index names it: it means
-        // that type here.
-        if self
-            .external_imports
-            .get(site)
-            .is_some_and(|imports| imports.contains_key(name))
-            || self
-                .unindexed_local_imports
-                .get(site)
-                .is_some_and(|imports| imports.contains_key(name))
-        {
-            return false;
-        }
-        if site == declaring_file {
-            return true;
-        }
-        if KOTLIN_DEFAULT_IMPORTS.contains(&name) {
-            return false;
-        }
-        matches!(
-            (
-                self.jvm_package_by_file.get(site),
-                self.jvm_package_by_file.get(declaring_file),
-            ),
-            (Some(here), Some(there)) if here == there
-        )
     }
 
     /// Whether the callable `scope` binds `name` itself, so a read of it there is

@@ -383,14 +383,6 @@ impl Resolver {
                 for candidate in &candidates {
                     let basename = candidate.rsplit('/').next().unwrap_or(candidate);
                     if let Some(Some(unique)) = self.unique_basename.get(basename) {
-                        // A JVM import names a package: `import ext.Repo` is
-                        // not the one `Repo.kt` in package `a` just because no
-                        // other file shares the stem.
-                        if matches!(lang, "kotlin" | "java" | "scala")
-                            && !self.jvm_import_names_package_of(spec, unique)
-                        {
-                            continue;
-                        }
                         return Some(unique.clone());
                     }
                 }
@@ -398,28 +390,5 @@ impl Resolver {
         }
 
         None
-    }
-
-    /// file `candidate` declares: the specifier minus its last segment, or minus
-    /// `.*`, must equal the file's `package` clause.
-    fn jvm_import_names_package_of(&self, spec: &str, candidate: &str) -> bool {
-        let package = match spec.strip_suffix(".*") {
-            Some(package) => package,
-            None => spec.rsplit_once('.').map_or("", |(package, _)| package),
-        };
-        if self
-            .jvm_package_by_file
-            .get(candidate)
-            .is_some_and(|declared| declared == package)
-        {
-            return true;
-        }
-        // The specifier names a package some indexed file declares, just not
-        // this file's (a typealias or re-export written in that package): the
-        // unique basename stays the guess it always was. A package nothing in
-        // the corpus declares is a library's, and the stem proves nothing.
-        self.jvm_package_by_file
-            .values()
-            .any(|declared| declared == package)
     }
 }
