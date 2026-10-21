@@ -30,7 +30,6 @@ macro_rules! js { ($name:ident, $path:expr, $live:expr, $src:expr) => {
 
 macro_rules! macro_ignored { ($why:literal, $name:ident, $live:expr, $src:expr) => { #[test] #[ignore = $why] fn $name() { assert_live("tools/s.py", $src, $live); } };}
 
-const G: &str = "#!/usr/bin/env python3\n";
 py!(p_argparse_type, &["to_int"], "#!/usr/bin/env python3\nimport argparse\ndef to_int(s):\n    return int(s)\nif __name__ == '__main__':\n    p = argparse.ArgumentParser()\n    p.add_argument('x', type=to_int)\n    p.parse_args()\n");
 py!(p_argparse_action_cls, &["MyAct"], "#!/usr/bin/env python3\nimport argparse\nclass MyAct(argparse.Action):\n    def __call__(self, *a):\n        pass\nif __name__ == '__main__':\n    p = argparse.ArgumentParser()\n    p.add_argument('x', action=MyAct)\n    p.parse_args()\n");
 py!(p_excepthook, &["hook"], "#!/usr/bin/env python3\nimport sys\ndef hook(*a):\n    pass\nsys.excepthook = hook\n");
