@@ -56,7 +56,14 @@ fn staleness_audit_navigation_survives_repeated_edits_and_rebuilds() {
     )
     .unwrap();
     staleness_query(&root, &["build", "."]);
-    for cycle in 0..20 {
+    // 20 cycles by default; `DEVMAP_FRESHNESS_SOAK_CYCLES` lengthens the same
+    // loop into the freshness soak. The test is not ignored; the default run
+    // stays short.
+    let cycles: usize = std::env::var("DEVMAP_FRESHNESS_SOAK_CYCLES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(20);
+    for cycle in 0..cycles {
         let fresh = staleness_query(&root, &["status"]);
         assert_eq!(fresh["is_fresh"], true, "cycle {cycle}: {fresh}");
         fs::write(&target, changed).unwrap();
@@ -113,6 +120,12 @@ fn staleness_audit_navigation_survives_repeated_edits_and_rebuilds() {
         assert_eq!(explore["definitions"]["shown"], 1);
         staleness_query(&root, &["build", "."]);
         assert_eq!(staleness_query(&root, &["status"])["is_fresh"], true);
+        let rebuilt = staleness_query(&root, &["search", "renamed_symbol"]);
+        assert_ne!(
+            rebuilt["source_freshness"]["fresh"],
+            false,
+            "cycle {cycle}: a just-rebuilt store must never report fresh=false: {rebuilt}"
+        );
         assert_eq!(
             staleness_query(&root, &["search", "renamed_symbol"])["total"],
             1
