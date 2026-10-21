@@ -76,6 +76,8 @@ mod kotlin_receivers_and_packages;
 #[cfg(feature = "parse")]
 mod overload_self_edges;
 #[cfg(feature = "parse")]
+mod kotlin_written_types;
+#[cfg(feature = "parse")]
 mod language_server_edges;
 #[cfg(feature = "parse")]
 mod markup_selectors_resolve;

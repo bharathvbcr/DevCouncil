@@ -560,6 +560,10 @@ pub struct Resolver {
     /// declaration of such an identity to the same identity cannot be told from
     /// a call to its sibling overload without the call's arity.
     shared_identities: BTreeSet<(String, String)>,
+    /// `(file, scope, local)` → `(callee, type argument)` for a Kotlin
+    /// `val local = callee<Type>()`. `None` withdraws the key: the call was not
+    /// exactly that shape, or the local is bound twice in its scope.
+    kotlin_type_arguments: BTreeMap<(String, String, String), Option<(String, String)>>,
     /// `(file, qualified name)` → the symbol that declares it, with the file
     /// path standing for "declared at file level".
     ///
@@ -783,6 +787,7 @@ impl Resolver {
             local_module_roots: BTreeMap::new(),
             qualified_names: BTreeMap::new(),
             shared_identities: BTreeSet::new(),
+            kotlin_type_arguments: BTreeMap::new(),
             symbol_parents: BTreeMap::new(),
             scope_children: BTreeMap::new(),
             go_modules: Vec::new(),

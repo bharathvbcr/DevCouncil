@@ -251,6 +251,19 @@ impl Resolver {
         scope: Option<&str>,
         shape: &str,
     ) -> Option<String> {
+        let (callee_file, callee) = self.factory_callee(family, file, scope, shape)?;
+        self.factory_written_type(family, file, &callee_file, &callee)
+    }
+
+    /// The one callable an initializer shape names, as `(file, qualified
+    /// name)`: the half of [`Self::factory_return_type`] that finds the callee.
+    pub(super) fn factory_callee(
+        &self,
+        family: LangFamily,
+        file: &str,
+        scope: Option<&str>,
+        shape: &str,
+    ) -> Option<(String, String)> {
         let shape = shape.trim();
         if shape.ends_with("{..}") || shape.ends_with("::new") {
             // Constructor shapes have their own rung, which needs no callee.
@@ -326,21 +339,195 @@ impl Resolver {
         {
             return None;
         }
+        Some((callee_file, callee))
+    }
+
+    /// The nominal type the callable `(callee_file, callee)` is written to
+    /// return, read at a call site in `file`.
+    pub(super) fn factory_written_type(
+        &self,
+        family: LangFamily,
+        file: &str,
+        callee_file: &str,
+        callee: &str,
+    ) -> Option<String> {
         let written = self
             .return_types
-            .get(&(callee_file.clone(), callee.clone()))?;
+            .get(&(callee_file.to_string(), callee.to_string()))?;
+        // Kotlin writes a collection's type with arguments (`List<String>`),
+        // which `admissible_nominal_type` refuses as a generic. The type
+        // constructor is still a written, nominal type: `List`.
+        if family == LangFamily::Kotlin {
+            if let Some(constructor) = Self::kotlin_type_constructor(written) {
+                return self
+                    .kotlin_constructor_is_this_file_s_one_type(file, callee_file, &constructor)
+                    .then_some(constructor);
+            }
+        }
         let mut nominal = Self::admissible_nominal_type(written)?;
         if nominal == "Self" {
-            nominal = self.declaring_type_of(&callee_file, &callee)?.to_string();
+            nominal = self.declaring_type_of(callee_file, callee)?.to_string();
         }
         // The annotation is a name in the callee's file, which the caller may
         // not share: read it there (an alias is the class it aliases).
         if family == LangFamily::Python && callee_file != file {
-            nominal = self.python_annotation_class(&callee_file, &nominal)?;
+            nominal = self.python_annotation_class(callee_file, &nominal)?;
         }
         (self.unique_indexed_type(family, &nominal)
-            || self.names_one_type_in_both(file, &callee_file, &nominal))
+            || self.names_one_type_in_both(file, callee_file, &nominal))
         .then_some(nominal)
+    }
+
+    /// Fill [`Self::kotlin_type_arguments`] for one Kotlin file: for each
+    /// `val x = make<Repo>()` the one type argument the call writes.
+    ///
+    /// The extraction records the argument as a `Name` reference spanning just
+    /// the type name, placed one byte after the callee (`<`) and followed by
+    /// `>()` before the call ends. Anything else inside the call — a value
+    /// argument, a second type argument, a nested call — leaves the call with no
+    /// answer, and a name bound twice in one scope is withdrawn: the type is
+    /// whichever ran last, which the extraction does not say.
+    pub(super) fn index_kotlin_type_arguments(&mut self, ext: &Extraction) {
+        for call_ref in ext
+            .references
+            .iter()
+            .filter(|reference| reference.kind == ReferenceKind::Call)
+        {
+            let Some(bound) = call_ref.assigned_to.as_deref() else {
+                continue;
+            };
+            let scope = call_ref
+                .enclosing_symbol
+                .clone()
+                .unwrap_or_else(|| ext.file_path.clone());
+            let argument = Self::kotlin_written_type_argument(ext, call_ref);
+            self.kotlin_type_arguments
+                .entry((ext.file_path.clone(), scope, bound.to_string()))
+                .and_modify(|known| *known = None)
+                .or_insert_with(|| argument.map(|name| (call_ref.name.clone(), name)));
+        }
+    }
+
+    /// The single type argument written in `call_ref`'s call (`<Repo>` in
+    /// `make<Repo>()`), or `None` when the call is not exactly that shape.
+    fn kotlin_written_type_argument(ext: &Extraction, call_ref: &ExtractedReference) -> Option<String> {
+        let call = ext.calls.iter().find(|call| {
+            call.span.start_byte == call_ref.span.start_byte
+                && call.callee_name == call_ref.name
+                && call.receiver_expr.is_none()
+        })?;
+        let mut inside = ext.references.iter().filter(|reference| {
+            reference.span.start_byte >= call.span.start_byte
+                && reference.span.end_byte <= call.span.end_byte
+                && !std::ptr::eq(*reference, call_ref)
+        });
+        let argument = inside.next()?;
+        let well_placed = argument.kind == ReferenceKind::Name
+            && argument.span.start_byte == call.span.start_byte + call.callee_name.len() + 1
+            && argument.span.end_byte + ">()".len() == call.span.end_byte
+            && argument.span.end_byte - argument.span.start_byte == argument.name.len();
+        (inside.next().is_none() && well_placed && Self::is_plain_ident(&argument.name))
+            .then(|| argument.name.clone())
+    }
+
+    /// The type a Kotlin local gets from the type argument its reified factory
+    /// call writes: `val repo = mock<Repo>()` is a `Repo`.
+    ///
+    /// Sound only when the callee is one resolvable callable whose written
+    /// return type is a bare name no indexed type owns — a type parameter, which
+    /// the argument instantiates — and the argument is the one declared type
+    /// (class, interface or enum) of that name. A callee returning a concrete
+    /// type, an ambiguous or unindexed argument, or a name the scope shadows
+    /// abstains.
+    pub(super) fn kotlin_reified_type(
+        &self,
+        file: &str,
+        binding: &LocalBinding,
+    ) -> Option<String> {
+        let scope = binding.scope.clone().unwrap_or_else(|| file.to_string());
+        let (callee_name, argument) = self
+            .kotlin_type_arguments
+            .get(&(file.to_string(), scope, binding.name.clone()))?
+            .as_ref()?;
+        if binding.initializer.as_deref() != Some(callee_name.as_str())
+            || binding.declared_type.is_some()
+        {
+            return None;
+        }
+        let (callee_file, callee) = self.factory_callee(
+            LangFamily::Kotlin,
+            file,
+            binding.scope.as_deref(),
+            callee_name,
+        )?;
+        let written = self
+            .return_types
+            .get(&(callee_file, callee))?
+            .trim()
+            .to_string();
+        if !Self::is_plain_ident(&written) || self.family_declares(LangFamily::Kotlin, &written) {
+            return None;
+        }
+        if binding
+            .scope
+            .as_deref()
+            .is_some_and(|scope| self.scope_declares_local(file, scope, argument))
+        {
+            return None;
+        }
+        let mut declared = self.symbol_index.get(argument.as_str())?.iter().filter(
+            |(_, kind, family, _)| {
+                LangFamily::Kotlin.admits(*family)
+                    && matches!(
+                        kind,
+                        SymbolKind::Class
+                            | SymbolKind::Struct
+                            | SymbolKind::Interface
+                            | SymbolKind::Enum
+                    )
+            },
+        );
+        match (declared.next(), declared.next()) {
+            (Some(_), None) => Some(argument.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether the generic type constructor `constructor`, written in
+    /// `callee_file` and read at a call site in `file`, is one type.
+    ///
+    /// Either one indexed declaration both files bind (the rule every other
+    /// factory answer follows), or — for a stdlib or external type such as
+    /// `List` — no declaration of that name anywhere in the corpus, and the two
+    /// places are the same file, so one import list governs both spellings.
+    /// A corpus that declares the name twice (two `List` classes) abstains.
+    pub(super) fn kotlin_constructor_is_this_file_s_one_type(
+        &self,
+        file: &str,
+        callee_file: &str,
+        constructor: &str,
+    ) -> bool {
+        if self.unique_indexed_type(LangFamily::Kotlin, constructor)
+            || self.names_one_type_in_both(file, callee_file, constructor)
+        {
+            return true;
+        }
+        file == callee_file
+            && !self
+                .symbol_index
+                .get(constructor)
+                .is_some_and(|candidates| {
+                    candidates.iter().any(|(_, kind, family, _)| {
+                        LangFamily::Kotlin.admits(*family)
+                            && matches!(
+                                kind,
+                                SymbolKind::Class
+                                    | SymbolKind::Struct
+                                    | SymbolKind::Interface
+                                    | SymbolKind::Enum
+                            )
+                    })
+                })
     }
 
     /// Whether the callable `scope` binds `name` itself, so a read of it there is

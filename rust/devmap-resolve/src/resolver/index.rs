@@ -49,6 +49,7 @@ impl Resolver {
         self.local_module_roots.clear();
         self.qualified_names.clear();
         self.shared_identities.clear();
+        self.kotlin_type_arguments.clear();
         self.symbol_parents.clear();
         self.scope_children.clear();
         self.go_package_by_file.clear();
@@ -1468,6 +1469,9 @@ impl Resolver {
                 }
             }
             self.index_module_value_types(ext, family);
+            if family == LangFamily::Kotlin {
+                self.index_kotlin_type_arguments(ext);
+            }
             self.index_js_objects(ext);
             // A `let x = self.field` (including through `if` / `&`) takes the
             // field's type, so `x.run()` can dispatch. Field `Type` references
