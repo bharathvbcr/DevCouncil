@@ -12,7 +12,6 @@ pub(crate) fn is_callable_node(node: Node) -> bool {
     matches!(
         node.kind(),
         "function_definition"
-            | "async_function_definition"
             | "function_declaration"
             | "method_definition"
             | "function_item"
@@ -157,7 +156,6 @@ pub(super) fn is_symbol_binding(node: Node, source: &str) -> bool {
     if matches!(
         parent.kind(),
         "function_definition"
-            | "async_function_definition"
             | "function_declaration"
             | "method_definition"
             | "function_item"
@@ -1459,7 +1457,6 @@ pub(super) fn is_inside_import_or_export(node: Node) -> bool {
                 | "compound_statement"
                 | "function_declaration"
                 | "function_definition"
-                | "async_function_definition"
                 | "arrow_function"
                 | "function_expression"
                 | "method_definition"

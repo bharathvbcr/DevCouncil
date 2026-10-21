@@ -526,3 +526,76 @@ fn a_python_class_header_names_only_its_positional_bases() {
         .collect();
     assert_eq!(segments, ["C", "a", "b"]);
 }
+
+/// No linked grammar emits an `async_function_definition` node: Python spells
+/// `async def` as a `function_definition` with an anonymous `async` token, and
+/// the other grammars' async forms are modifiers on their own function nodes.
+/// This pins that an `async def` extracts exactly like a plain `def` at every
+/// position (top level, method, nested, decorated), symbols and calls alike.
+#[test]
+fn a_python_async_def_extracts_like_a_def_at_every_position() {
+    let shape = |source: &str| {
+        let extraction = extract_file("a.py", source);
+        let symbols: Vec<(String, String, Option<String>)> = extraction
+            .symbols
+            .iter()
+            .map(|s| {
+                (
+                    s.qualified_name.clone(),
+                    format!("{:?}", s.kind),
+                    s.parent_symbol.clone(),
+                )
+            })
+            .collect();
+        let calls: Vec<(Option<String>, String)> = extraction
+            .calls
+            .iter()
+            .map(|c| (c.caller_symbol.clone(), c.callee_name.clone()))
+            .collect();
+        (symbols, calls)
+    };
+    let template = [
+        "import functools",
+        "@functools.cache",
+        "KW top():",
+        "    helper()",
+        "class Svc:",
+        "    KW method(self):",
+        "        self.step()",
+        "    @staticmethod",
+        "    KW decorated():",
+        "        build()",
+        "KW outer():",
+        "    KW inner():",
+        "        leaf()",
+        "    inner()",
+        "",
+    ]
+    .join("\n");
+    let sync = template.replace("KW", "def");
+    let asynchronous = template.replace("KW", "async def");
+    let (sync_symbols, sync_calls) = shape(&sync);
+    let (async_symbols, async_calls) = shape(&asynchronous);
+
+    let names: Vec<&str> = async_symbols.iter().map(|s| s.0.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "a.py",
+            "a.py::top",
+            "a.py::Svc",
+            "a.py::Svc.method",
+            "a.py::Svc.decorated",
+            "a.py::outer",
+            "a.py::outer.inner",
+        ]
+    );
+    for callee in ["helper", "step", "build", "leaf", "inner"] {
+        assert!(
+            async_calls.iter().any(|c| c.1 == callee && c.0.is_some()),
+            "{callee} lost its caller: {async_calls:?}"
+        );
+    }
+    assert_eq!(sync_symbols, async_symbols, "async def must extract as def");
+    assert_eq!(sync_calls, async_calls, "async def calls must attribute as def");
+}
