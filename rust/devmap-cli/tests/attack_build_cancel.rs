@@ -37,7 +37,8 @@ fn write_corpus(root: &Path, n: usize, shift: usize) {
 
 fn integrity(db: &Path) -> String {
     let conn = rusqlite::Connection::open(db).unwrap();
-    conn.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap()
+    conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .unwrap()
 }
 
 fn latest(db: &Path, n: usize) -> u32 {
@@ -62,7 +63,10 @@ fn plain_build(db: &Path, root: &Path) {
         .stderr(Stdio::null())
         .status()
         .unwrap();
-    assert!(status.success(), "the build after an interrupt must succeed: {status}");
+    assert!(
+        status.success(),
+        "the build after an interrupt must succeed: {status}"
+    );
 }
 
 #[derive(Debug)]
@@ -74,7 +78,13 @@ struct Outcome {
 
 /// Start a build, wait for the extraction stage to be announced, sleep
 /// `delay_ms`, send `sigints` SIGINTs `gap_ms` apart.
-fn interrupted_build(db: &Path, root: &Path, delay_ms: u64, sigints: usize, gap_ms: u64) -> Outcome {
+fn interrupted_build(
+    db: &Path,
+    root: &Path,
+    delay_ms: u64,
+    sigints: usize,
+    gap_ms: u64,
+) -> Outcome {
     let mut child = Command::new(env!("CARGO_BIN_EXE_devmap"))
         .arg("--db")
         .arg(db)
@@ -115,7 +125,9 @@ fn interrupted_build(db: &Path, root: &Path, delay_ms: u64, sigints: usize, gap_
         if Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("HANG: build ignored {sigints} SIGINT(s) sent {delay_ms} ms after extraction began");
+            panic!(
+                "HANG: build ignored {sigints} SIGINT(s) sent {delay_ms} ms after extraction began"
+            );
         }
         std::thread::sleep(Duration::from_millis(5));
     };
@@ -137,7 +149,10 @@ fn sigint_at_any_point_ends_130_or_complete_and_leaves_a_whole_store() {
     plain_build(&db, &root);
     let mut generation = latest(&db, FILES);
     let mut lost_interrupts = Vec::new();
-    for (round, delay) in [0u64, 1, 3, 8, 20, 50, 100, 200, 400, 800, 1600].iter().enumerate() {
+    for (round, delay) in [0u64, 1, 3, 8, 20, 50, 100, 200, 400, 800, 1600]
+        .iter()
+        .enumerate()
+    {
         write_corpus(&root, FILES, round + 2);
         let outcome = interrupted_build(&db, &root, *delay, 1, 0);
         let after = latest(&db, FILES);
@@ -159,7 +174,6 @@ fn sigint_at_any_point_ends_130_or_complete_and_leaves_a_whole_store() {
             "round {round}: generation jumped {generation} -> {after}"
         );
         eprintln!("round {round} delay {delay}ms: {outcome:?} gen {generation}->{after}");
-        generation = after;
         plain_build(&db, &root);
         generation = latest(&db, FILES);
     }
@@ -183,7 +197,9 @@ fn a_second_sigint_exits_130_promptly_and_leaves_a_whole_store() {
         write_corpus(&root, FILES, 2 + gap as usize);
         let outcome = interrupted_build(&db, &root, 5, 2, gap);
         assert!(
-            outcome.code == Some(130) || outcome.signal == Some(libc::SIGINT) || outcome.code == Some(0),
+            outcome.code == Some(130)
+                || outcome.signal == Some(libc::SIGINT)
+                || outcome.code == Some(0),
             "gap {gap}: {outcome:?}"
         );
         let after = latest(&db, FILES);

@@ -8,8 +8,12 @@
 //! also owns the fallback: a second SIGINT, or any SIGINT once the build has
 //! passed its last cancellable point ([`InterruptWatch::settle`]), exits at
 //! once with [`EXIT_SIGINT`] exactly as the default action would have.
+//!
+//! Whether a signal came before or after that last point is decided by one
+//! compare-and-swap on a single phase word, so a SIGINT is always either
+//! acknowledged *and* seen by the build, or answered by an immediate exit.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use devmap_query::Cancel;
@@ -17,8 +21,14 @@ use devmap_query::Cancel;
 /// The shell's convention for a process ended by SIGINT: 128 + 2.
 pub(crate) const EXIT_SIGINT: u8 = 130;
 
-/// What one SIGINT should do, given whether the build can still be cancelled
-/// and whether an earlier SIGINT already asked it to stop.
+/// Cancellation can still be observed and no SIGINT has arrived.
+const RUNNING: u8 = 0;
+/// A SIGINT arrived while the build could still observe it.
+const INTERRUPTED: u8 = 1;
+/// The build passed its last cancellable point; SIGINT now exits.
+const SETTLED: u8 = 2;
+
+/// What one SIGINT should do.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum OnSignal {
     /// Ask the build to stop at its next file.
@@ -28,11 +38,41 @@ pub(crate) enum OnSignal {
     ExitNow,
 }
 
-pub(crate) fn on_signal(settled: bool, already_cancelled: bool) -> OnSignal {
-    if settled || already_cancelled {
-        OnSignal::ExitNow
-    } else {
-        OnSignal::Cancel
+/// The phase word and the token, shared by the signal task and the build.
+struct Shared {
+    phase: AtomicU8,
+    cancel: Cancel,
+}
+
+impl Shared {
+    fn new() -> Self {
+        Self {
+            phase: AtomicU8::new(RUNNING),
+            cancel: Cancel::new(),
+        }
+    }
+
+    /// One SIGINT. Only the transition out of `RUNNING` cancels.
+    fn signal(&self) -> OnSignal {
+        match self
+            .phase
+            .compare_exchange(RUNNING, INTERRUPTED, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => {
+                self.cancel.cancel();
+                OnSignal::Cancel
+            }
+            Err(_) => OnSignal::ExitNow,
+        }
+    }
+
+    /// The build is past its last cancellable point. `true` when it may go on
+    /// to persist; `false` when a SIGINT got there first and the build must
+    /// stop.
+    fn settle(&self) -> bool {
+        self.phase
+            .compare_exchange(RUNNING, SETTLED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
     }
 }
 
@@ -57,24 +97,43 @@ impl Interrupts {
     }
 }
 
-#[cfg(not(unix))]
+/// The Windows listener is created once and kept: `tokio::signal::ctrl_c()`
+/// builds a fresh listener on every call, and a Ctrl-C arriving between two
+/// calls is lost.
+#[cfg(windows)]
+struct Interrupts(Option<tokio::signal::windows::CtrlC>);
+
+#[cfg(windows)]
+impl Interrupts {
+    fn register() -> Self {
+        Self(tokio::signal::windows::ctrl_c().ok())
+    }
+
+    async fn next(&mut self) -> bool {
+        match &mut self.0 {
+            Some(stream) => stream.recv().await.is_some(),
+            None => false,
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 struct Interrupts;
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl Interrupts {
     fn register() -> Self {
         Self
     }
 
     async fn next(&mut self) -> bool {
-        tokio::signal::ctrl_c().await.is_ok()
+        false
     }
 }
 
 /// Owns the build's cancellation token and the SIGINT task that trips it.
 pub(crate) struct InterruptWatch {
-    cancel: Cancel,
-    settled: Arc<AtomicBool>,
+    shared: Arc<Shared>,
 }
 
 impl InterruptWatch {
@@ -82,10 +141,9 @@ impl InterruptWatch {
     /// running. Without one (a plain test thread) the token is simply never
     /// tripped and SIGINT keeps its default action.
     pub(crate) fn install() -> Self {
-        let cancel = Cancel::new();
-        let settled = Arc::new(AtomicBool::new(false));
+        let shared = Arc::new(Shared::new());
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let (task_cancel, task_settled) = (cancel.clone(), Arc::clone(&settled));
+            let task_shared = Arc::clone(&shared);
             // Registered here, synchronously, rather than inside the task: a
             // SIGINT between `install` returning and the task's first poll
             // would otherwise hit the default action or be missed.
@@ -93,32 +151,30 @@ impl InterruptWatch {
             let mut interrupts = Interrupts::register();
             runtime.spawn(async move {
                 while interrupts.next().await {
-                    match on_signal(
-                        task_settled.load(Ordering::Relaxed),
-                        task_cancel.is_cancelled(),
-                    ) {
-                        OnSignal::Cancel => {
-                            task_cancel.cancel();
-                            eprintln!(
-                                "interrupt: stopping the build; press Ctrl-C again to exit now"
-                            );
-                        }
+                    match task_shared.signal() {
+                        OnSignal::Cancel => eprintln!(
+                            "interrupt: stopping the build; press Ctrl-C again to exit now"
+                        ),
                         OnSignal::ExitNow => std::process::exit(i32::from(EXIT_SIGINT)),
                     }
                 }
             });
         }
-        Self { cancel, settled }
+        Self { shared }
     }
 
     /// The token the extraction reads.
     pub(crate) fn cancel(&self) -> &Cancel {
-        &self.cancel
+        &self.shared.cancel
     }
 
     /// The build is past its last cancellable point: from here SIGINT exits.
-    pub(crate) fn settle(&self) {
-        self.settled.store(true, Ordering::Relaxed);
+    ///
+    /// Returns `false` when a SIGINT was already acknowledged, in which case
+    /// the caller must abort (exit [`EXIT_SIGINT`]) rather than persist.
+    #[must_use]
+    pub(crate) fn settle(&self) -> bool {
+        self.shared.settle()
     }
 }
 
@@ -127,54 +183,98 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    #[test]
-    fn a_first_signal_cancels_and_a_repeat_or_a_settled_build_exits() {
-        assert_eq!(on_signal(false, false), OnSignal::Cancel);
-        assert_eq!(on_signal(false, true), OnSignal::ExitNow);
-        assert_eq!(on_signal(true, false), OnSignal::ExitNow);
-    }
-
-    /// ATTACK: build.rs reads `cancel().is_cancelled()` and only then calls
-    /// `settle()`. A SIGINT landing between the two is acknowledged
-    /// ("stopping the build") by the task, trips the token, and nothing reads
-    /// the token again: the build persists, exits 0, and the operator's Ctrl-C
-    /// is silently swallowed with no exit. Replays that window deterministically.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_sigint_between_the_last_check_and_settle_is_not_swallowed() {
-        let watch = InterruptWatch::install();
-        // build.rs: `if interrupt.cancel().is_cancelled() { return Err(..) }`
-        assert!(!watch.cancel().is_cancelled());
-        // ... SIGINT lands here ...
-        assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !watch.cancel().is_cancelled() {
-            assert!(Instant::now() < deadline);
-            tokio::time::sleep(Duration::from_millis(5)).await;
+    /// Runs `body` in a child copy of this test binary. SIGINT is
+    /// process-global, and the watcher exits the process on a repeat or
+    /// settled signal, so a signal-raising test sharing a process with any
+    /// other test could kill the harness. The parent re-executes itself with
+    /// this one test selected exactly; the child, recognised by the
+    /// environment variable, runs the body.
+    fn isolated(name: &str, body: impl FnOnce()) {
+        const MARK: &str = "DEVMAP_ISOLATED_SIGINT_TEST";
+        if std::env::var(MARK).as_deref() == Ok(name) {
+            body();
+            return;
         }
-        // build.rs: `interrupt.settle();` and proceeds to persist.
-        watch.settle();
-        // Either the process exited (not reached) or the build must be able to
-        // learn of the interrupt. settle() returns `()` (type-checked here) and
-        // no later check exists, so the reachable state is cancelled-and-settled.
-        let _: () = watch.settle();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([name, "--exact", "--test-threads=1", "--nocapture"])
+            .env(MARK, name)
+            .output()
+            .expect("re-exec the test binary");
         assert!(
-            !watch.cancel().is_cancelled(),
-            "SIGINT was acknowledged (token tripped, 'stopping the build' printed) after the \
-             last check and before settle(); the build persists and exits 0 and the process did \
-             not exit"
+            output.status.success(),
+            "isolated test {name} failed ({:?})\nstdout={}\nstderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn sigint_trips_the_build_token() {
-        let watch = InterruptWatch::install();
-        assert!(!watch.cancel().is_cancelled());
-        // SAFETY: raising a signal this process has a handler installed for.
-        assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !watch.cancel().is_cancelled() {
-            assert!(Instant::now() < deadline, "SIGINT never tripped the token");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_first_signal_cancels_and_a_repeat_or_a_settled_build_exits() {
+        let running = Shared::new();
+        assert_eq!(running.signal(), OnSignal::Cancel);
+        assert!(running.cancel.is_cancelled());
+        assert_eq!(running.signal(), OnSignal::ExitNow);
+        assert!(!running.settle(), "an acknowledged SIGINT blocks settling");
+
+        let settled = Shared::new();
+        assert!(settled.settle());
+        assert_eq!(settled.signal(), OnSignal::ExitNow);
+        assert!(
+            !settled.cancel.is_cancelled(),
+            "a settled build is not cancelled"
+        );
+    }
+
+    #[test]
+    fn sigint_trips_the_build_token() {
+        isolated("interrupt::tests::sigint_trips_the_build_token", || {
+            runtime().block_on(async {
+                let watch = InterruptWatch::install();
+                assert!(!watch.cancel().is_cancelled());
+                // SAFETY: raising a signal this process has a handler for.
+                assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !watch.cancel().is_cancelled() {
+                    assert!(Instant::now() < deadline, "SIGINT never tripped the token");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            });
+        });
+    }
+
+    /// A SIGINT after the build's last look at the token but before `settle`
+    /// must not be acknowledged and then swallowed: `settle` reports it, so
+    /// the build aborts instead of persisting and exiting 0.
+    #[test]
+    fn a_sigint_between_the_last_check_and_settle_is_not_swallowed() {
+        isolated(
+            "interrupt::tests::a_sigint_between_the_last_check_and_settle_is_not_swallowed",
+            || {
+                runtime().block_on(async {
+                    let watch = InterruptWatch::install();
+                    assert!(!watch.cancel().is_cancelled());
+                    // SAFETY: raising a signal this process has a handler for.
+                    assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while !watch.cancel().is_cancelled() {
+                        assert!(Instant::now() < deadline);
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    assert!(
+                        !watch.settle(),
+                        "settle() let the build go on to persist after an acknowledged SIGINT"
+                    );
+                });
+            },
+        );
     }
 }

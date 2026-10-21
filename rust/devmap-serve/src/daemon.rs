@@ -434,6 +434,12 @@ pub const DEFAULT_DRAIN_WRITE_BUDGET: u64 = 4 * 1024 * 1024;
 /// more than this far behind a burst of edits.
 const MAX_DRAIN_PAUSE: Duration = Duration::from_secs(120);
 
+/// Whether a drain stopped because the build was cancelled (the daemon is
+/// shutting down) rather than because it failed.
+fn is_cancelled_build(error: &anyhow::Error) -> bool {
+    error.is::<devmap_extract::BuildCancelled>()
+}
+
 /// How long the drain loop waits after a drain that wrote `bytes`, to hold
 /// `budget` bytes per second.
 fn drain_pause(bytes: u64, budget: u64) -> Duration {
@@ -2031,6 +2037,16 @@ impl Daemon {
                     };
                     next_attempt = tokio::time::Instant::now() + pause;
                     match drain_result {
+                        // The drain read the shutdown flag before this loop's
+                        // own shutdown arm won the select. That is the
+                        // shutdown, not a failed drain: no warning, no backoff.
+                        Err(ref err) if is_cancelled_build(err) => {
+                            info!(
+                                "pending drain cancelled by shutdown; releasing the IPC \
+                                 endpoint and exiting (pending work stays queued in the store)"
+                            );
+                            break LoopExit::ReleaseEndpoint(Ok(()));
+                        }
                         Ok(0) => consecutive_failures = 0,
                         Ok(n) => {
                             consecutive_failures = 0;
@@ -3609,6 +3625,19 @@ mod tests {
         );
         assert_a_refusal_survives_and_the_next_build_recovers_it(&daemon, &root);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A drain that ended on `BuildCancelled` is the shutdown, never a failure
+    /// to back off from (even when other context wraps the error).
+    #[test]
+    fn a_cancelled_drain_is_classified_as_shutdown_not_failure() {
+        use anyhow::Context;
+        let cancelled = anyhow::Error::new(devmap_extract::BuildCancelled);
+        assert!(is_cancelled_build(&cancelled));
+        let wrapped: anyhow::Result<()> =
+            Err(anyhow::Error::new(devmap_extract::BuildCancelled)).context("drain");
+        assert!(is_cancelled_build(&wrapped.unwrap_err()));
+        assert!(!is_cancelled_build(&anyhow::anyhow!("disk full")));
     }
 
     /// A shutdown requested before (or while) a scanning drain extracts must

@@ -953,17 +953,20 @@ pub fn retry_budget_refusals_observing(
         let cancelled = cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
         // What the final reason says happened after the first pass, so a
         // reader of `parse_failed` can tell the three refusals apart.
-        let verdict = if cancelled {
-            report.not_retried += 1;
-            report.cancelled += 1;
-            "; not retried: the build was cancelled before the serial retry reached this file"
-                .to_string()
-        } else if report.retried >= treesitter::MAX_BUDGET_RETRIES {
+        // The cap is decided first: a file past it was never going to be
+        // retried, so a cancel arriving after the last slot was used must not
+        // turn it into a cancelled file and discard a finished build.
+        let verdict = if report.retried >= treesitter::MAX_BUDGET_RETRIES {
             report.not_retried += 1;
             format!(
                 "; not retried: more than {} files were refused for budget, the cap on serial retries",
                 treesitter::MAX_BUDGET_RETRIES
             )
+        } else if cancelled {
+            report.not_retried += 1;
+            report.cancelled += 1;
+            "; not retried: the build was cancelled before the serial retry reached this file"
+                .to_string()
         } else {
             report.retried += 1;
             let file = &files[index];

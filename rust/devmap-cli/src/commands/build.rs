@@ -629,11 +629,12 @@ pub(crate) fn run(
     })?;
     // A cancel that landed after the last file is still a cancel: nothing has
     // been persisted yet, so stop here rather than write a generation the
-    // operator asked not to wait for.
-    if interrupt.cancel().is_cancelled() {
+    // operator asked not to wait for. `settle` decides that atomically: a
+    // SIGINT either got in first (it returns false and we stop) or arrives
+    // after and exits the process, so none is acknowledged and then ignored.
+    if !interrupt.settle() {
         return Err(anyhow::Error::new(devmap_extract::BuildCancelled));
     }
-    interrupt.settle();
     let extraction_snapshot = extraction_progress.snapshot();
     // The corpus text is dead the moment extraction has consumed it,
     // but it is bound in this scope and would otherwise stay resident
