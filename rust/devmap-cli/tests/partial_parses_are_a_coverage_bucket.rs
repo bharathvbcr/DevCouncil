@@ -166,6 +166,9 @@ fn a_kotlin_mis_parse_is_listed_with_its_byte_range() {
 /// The `start..end` byte ranges a `partial_parse` reason names.
 fn lost_ranges(reason: &str) -> Vec<(usize, usize)> {
     let listed = reason.split("byte(s) lost: ").nth(1).unwrap_or("");
+    // The ranges end at the first `;` (a `charged: ..` note follows) or at the
+    // `, and N more region(s)` tail.
+    let listed = listed.split(';').next().unwrap_or("");
     listed
         .split(", ")
         .filter_map(|part| {
