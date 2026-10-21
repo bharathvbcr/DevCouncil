@@ -347,9 +347,13 @@ impl Resolver {
     }
 
     pub(super) fn parent_dir(current_file: &str) -> String {
-        Path::new(current_file)
+        // `Path` splits on `/` only on Unix, so `a\b.go` would have no parent
+        // (`.`). A repo-relative path may be spelled with either separator, and
+        // the answer is always `/`-separated.
+        let normalized = current_file.replace('\\', "/");
+        Path::new(&normalized)
             .parent()
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .map(|p| p.to_string_lossy().into_owned())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| ".".to_string())
     }

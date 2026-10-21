@@ -11,6 +11,17 @@ fn evidence_size_keeps_an_escape_bound_for_hostile_names() {
     assert_eq!(super::escaped_evidence_bytes("\"\\\n\0"), 24);
 }
 
+#[test]
+fn parent_dir_splits_on_either_separator() {
+    use super::Resolver;
+    assert_eq!(Resolver::parent_dir("a/b.go"), "a");
+    assert_eq!(Resolver::parent_dir("a\\b.go"), "a");
+    assert_eq!(Resolver::parent_dir("a\\b\\c.go"), "a/b");
+    assert_eq!(Resolver::parent_dir("a/b\\c.go"), "a/b");
+    assert_eq!(Resolver::parent_dir("b.go"), ".");
+    assert_eq!(Resolver::parent_dir("\\b.go"), "/");
+}
+
 #[cfg(feature = "parse")]
 use super::*;
 #[cfg(feature = "parse")]
