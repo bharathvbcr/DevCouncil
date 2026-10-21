@@ -597,5 +597,8 @@ fn a_python_async_def_extracts_like_a_def_at_every_position() {
         );
     }
     assert_eq!(sync_symbols, async_symbols, "async def must extract as def");
-    assert_eq!(sync_calls, async_calls, "async def calls must attribute as def");
+    assert_eq!(
+        sync_calls, async_calls,
+        "async def calls must attribute as def"
+    );
 }
