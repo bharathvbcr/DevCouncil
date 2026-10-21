@@ -16,6 +16,7 @@
 //!   fails until it is declared here or isolated.
 
 mod a_budget_refused_file_is_re_extracted_by_the_next_build;
+mod a_dead_verdict_lands_on_an_unchanged_file_under_a_narrowed_write;
 mod budget_refusal_attack;
 mod a_v94_python_extraction_is_not_served_after_the_bump;
 mod a_v96_swift_extraction_is_not_served_after_the_bump;
