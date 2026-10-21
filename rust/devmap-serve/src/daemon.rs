@@ -3646,6 +3646,73 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// ATTACK: shutdown at a random moment against a real `run_loop` whose
+    /// pending path forces the whole-tree (cancellable) drain. Whatever the
+    /// interleaving: the loop must return Ok, release the socket and lock, and
+    /// the queue must be either fully drained or untouched and uncharged.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn attack_shutdown_at_a_random_moment_leaves_the_queue_drained_or_untouched() {
+        let mut state = 0x9E3779B97F4A7C15u64;
+        let (mut drained, mut left_queued) = (0, 0);
+        for round in 0..40 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let delay = Duration::from_micros(state % 60_000);
+            let (root, daemon) = budget_refused_daemon(&format!("atk-shut-{round}"));
+            fs::write(root.join("a.py"), "def a():\n    return 99\n").unwrap();
+            daemon
+                .store
+                .enqueue_pending_paths(&[root.join("a.py").display().to_string()])
+                .unwrap();
+            let queued = daemon.store.get_pending_paths().unwrap();
+            let socket = std::path::PathBuf::from(format!(
+                "/tmp/devmap-atk-{}-{round}.sock",
+                std::process::id()
+            ));
+            let lock = crate::protocol::ipc_lock_path(&socket);
+            let _ = fs::remove_file(&socket);
+            let _ = fs::remove_file(&lock);
+            let daemon = daemon
+                .with_ipc_path(socket.clone())
+                .with_idle_poll(Duration::from_millis(5));
+            if round % 4 == 0 {
+                // Before the loop even starts.
+                daemon.request_shutdown();
+            }
+            let running = daemon.clone();
+            let task = tokio::spawn(async move { running.run_loop().await });
+            if round % 4 != 0 {
+                tokio::time::sleep(delay).await;
+                daemon.request_shutdown();
+            }
+            let outcome = tokio::time::timeout(Duration::from_secs(30), task)
+                .await
+                .unwrap_or_else(|_| panic!("round {round}: run_loop hung after shutdown"))
+                .expect("run_loop must not panic");
+            assert!(outcome.is_ok(), "round {round}: {outcome:?}");
+            assert!(!socket.exists(), "round {round}: socket left behind");
+            assert!(!lock.exists(), "round {round}: lock left behind");
+            let pending = daemon.store.get_pending_paths().unwrap();
+            if pending.is_empty() {
+                drained += 1;
+            } else {
+                left_queued += 1;
+                let _ = &queued;
+                for path in &pending {
+                    assert_eq!(
+                        daemon.store.pending_attempts(path).unwrap(),
+                        Some(0),
+                        "round {round}: a shutdown charged {path} an attempt"
+                    );
+                }
+            }
+            let _ = fs::remove_dir_all(&root);
+        }
+        eprintln!("drained={drained} left_queued={left_queued}");
+    }
+
     /// A checkout that lands *during* a drain must not be able to stamp itself
     /// onto a generation built from the previous one.
     ///

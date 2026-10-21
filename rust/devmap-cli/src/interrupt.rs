@@ -134,6 +134,37 @@ mod tests {
         assert_eq!(on_signal(true, false), OnSignal::ExitNow);
     }
 
+    /// ATTACK: build.rs reads `cancel().is_cancelled()` and only then calls
+    /// `settle()`. A SIGINT landing between the two is acknowledged
+    /// ("stopping the build") by the task, trips the token, and nothing reads
+    /// the token again: the build persists, exits 0, and the operator's Ctrl-C
+    /// is silently swallowed with no exit. Replays that window deterministically.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sigint_between_the_last_check_and_settle_is_not_swallowed() {
+        let watch = InterruptWatch::install();
+        // build.rs: `if interrupt.cancel().is_cancelled() { return Err(..) }`
+        assert!(!watch.cancel().is_cancelled());
+        // ... SIGINT lands here ...
+        assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !watch.cancel().is_cancelled() {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // build.rs: `interrupt.settle();` and proceeds to persist.
+        watch.settle();
+        // Either the process exited (not reached) or the build must be able to
+        // learn of the interrupt. settle() returns `()` (type-checked here) and
+        // no later check exists, so the reachable state is cancelled-and-settled.
+        let _: () = watch.settle();
+        assert!(
+            !watch.cancel().is_cancelled(),
+            "SIGINT was acknowledged (token tripped, 'stopping the build' printed) after the \
+             last check and before settle(); the build persists and exits 0 and the process did \
+             not exit"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sigint_trips_the_build_token() {
         let watch = InterruptWatch::install();
