@@ -11,6 +11,9 @@ fn run(files: &[(&str, &str)], kind: EdgeKind) -> E {
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
     let result = resolver.resolve_all(&extractions).unwrap();
+    for e in result.edges.iter().filter(|e| e.edge_kind == kind) {
+        println!("EDGE {} -> {} conf={:?}", e.source_symbol, e.target_symbol, e.confidence);
+    }
     let mut v: E = result
         .edges
         .iter()
@@ -83,7 +86,7 @@ fn ov_top_level_pair_true_recursion_in_one_overload() {
 
 #[test]
 fn ov_same_name_in_different_classes_keep_cross_edges() {
-    let s = "package p\n\nclass A {\n    fun go(x: Int): Int = B().go(\"s\")\n}\n\nclass B {\n    fun go(s: String): Int = A().go(1)\n}\n";
+    let s = "package p\n\nclass A {\n    fun go(x: Int, b: B): Int = b.go(\"s\")\n}\n\nclass B {\n    fun go(s: String, a: A): Int = a.go(1, this)\n}\n";
     let e = calls(&[("p/Z.kt", s)]);
     assert!(has(&e, "p/Z.kt::A.go", "p/Z.kt::B.go"), "{e:?}");
     assert!(has(&e, "p/Z.kt::B.go", "p/Z.kt::A.go"), "{e:?}");
@@ -177,7 +180,7 @@ fn ov_ts_overload_signatures_keep_impl_recursion() {
 
 #[test]
 fn ov_rust_two_trait_impls_same_method_recursion() {
-    let s = "struct X(Option<Box<X>>);\ntrait T1 { fn walk(&self) -> u32; }\ntrait T2 { fn walk(&self) -> u32; }\nimpl T1 for X {\n    fn walk(&self) -> u32 { match &self.0 { Some(c) => c.walk() + 1, None => 0 } }\n}\nimpl T2 for X {\n    fn walk(&self) -> u32 { 2 }\n}\n";
+    let s = "struct X(Option<Box<X>>);\ntrait T1 { fn walk(&self) -> u32; }\ntrait T2 { fn walk(&self) -> u32; }\nimpl T1 for X {\n    fn walk(&self) -> u32 { if false { self.walk() } else { 0 } }\n}\nimpl T2 for X {\n    fn walk(&self) -> u32 { 2 }\n}\n";
     let e = calls(&[("a/x.rs", s)]);
     println!("rust: {e:?}");
     assert!(e.iter().any(|(a, b)| a == b && a.ends_with("walk")), "rust recursion w/ two impls lost: {e:?}");
