@@ -25,7 +25,6 @@ pub(super) fn callable_binding_name(node: Node, source: &str) -> Option<String> 
     if matches!(
         node.kind(),
         "function_definition"
-            | "async_function_definition"
             | "function_declaration"
             | "method_definition"
             | "function_item"
@@ -616,7 +615,6 @@ pub(super) fn enclosing_type_name(node: Node, source: &str) -> Option<String> {
             // method inherited the impl type and collided with a real method
             // of that name (`Store.run` inside `checkpoint_wal`).
             "function_definition"
-            | "async_function_definition"
             | "function_declaration"
             | "function_expression"
             | "arrow_function"

@@ -70,7 +70,7 @@ pub(super) fn extract_node(
                     }
                 }
             }
-            "function_definition" | "async_function_definition" => {
+            "function_definition" => {
                 if let Some(n) = get_child_text(node, "name", source) {
                     let enclosing_type = enclosing_type_name(node, source);
                     let is_method = enclosing_type.is_some();
