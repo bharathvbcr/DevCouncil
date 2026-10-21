@@ -611,6 +611,21 @@ impl Resolver {
                 .copied()
                 .filter(|first| visible.iter().all(|hit| hit == first));
         }
+        // A single-name import of the type from outside the index (`import
+        // ext.Repo`) says the bare name means that type here, whatever indexed
+        // class shares the spelling.
+        if matches!(ext.language.as_str(), "kotlin" | "java" | "scala")
+            && (self
+                .external_imports
+                .get(&ext.file_path)
+                .is_some_and(|imports| imports.contains_key(class_type))
+                || self
+                    .unindexed_local_imports
+                    .get(&ext.file_path)
+                    .is_some_and(|imports| imports.contains_key(class_type)))
+        {
+            return None;
+        }
         // Overloads of one method are several hits that name one identity
         // (`add(Int)` / `add(String)` both mint `Calc.add`): one target.
         if let Some(first) = hits

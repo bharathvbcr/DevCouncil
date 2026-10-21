@@ -115,6 +115,12 @@ impl Resolver {
         // Pass one establishes the complete file/symbol universe. Import
         // binding resolution must not depend on whether the importer happens
         // to precede its target in the input slice.
+        //
+        // `(language, qualified name)` → the files declaring a callable of it,
+        // for the two languages whose one type is written across files (Swift
+        // extensions, C# partial classes): an overload there may sit in another
+        // file.
+        let mut split_types: BTreeMap<(&str, &str), BTreeSet<(&str, &str)>> = BTreeMap::new();
         for ext in extractions {
             let family = LangFamily::from_lang(&ext.language);
             let mut file_syms = Vec::new();
@@ -154,6 +160,21 @@ impl Resolver {
                 // language that overloads by signature. A Python redefinition,
                 // a Rust impl of two traits, or a local function of the same
                 // name in two different functions are not siblings of one id.
+                if matches!(ext.language.as_str(), "swift" | "csharp")
+                    && matches!(sym.kind, SymbolKind::Function | SymbolKind::Method)
+                {
+                    // Ids carry their file (`B.swift::T.f`), so the type's own
+                    // spelling is what the files share.
+                    let local = sym
+                        .qualified_name
+                        .strip_prefix(ext.file_path.as_str())
+                        .and_then(|rest| rest.strip_prefix("::"))
+                        .unwrap_or(sym.qualified_name.as_str());
+                    split_types
+                        .entry((ext.language.as_str(), local))
+                        .or_default()
+                        .insert((ext.file_path.as_str(), sym.qualified_name.as_str()));
+                }
                 if overloads_by_signature
                     && matches!(sym.kind, SymbolKind::Function | SymbolKind::Method)
                     && callable_names.get(sym.qualified_name.as_str()) > Some(&1)
@@ -462,6 +483,15 @@ impl Resolver {
                                 ));
                         }
                     }
+                }
+            }
+        }
+        for declarations in split_types.values() {
+            let files: BTreeSet<&str> = declarations.iter().map(|(file, _)| *file).collect();
+            if files.len() > 1 {
+                for (file, qualified) in declarations {
+                    self.shared_identities
+                        .insert((file.to_string(), qualified.to_string()));
                 }
             }
         }
@@ -1185,6 +1215,15 @@ impl Resolver {
                             .insert((ext.file_path.clone(), name.to_string()));
                     }
                 }
+            }
+            // A single-name import shadows a star import of the same name
+            // (`import ext.Repo` beats `import a.*`, in either order), so a
+            // name the file imports from outside the index — or from a path
+            // that names no indexed file — is not the star's declaration.
+            if matches!(ext.language.as_str(), "kotlin" | "java" | "scala") {
+                file_bindings.retain(|name, _| {
+                    !file_external.contains_key(name) && !file_local_gap.contains_key(name)
+                });
             }
             for (scope, names) in file_scoped {
                 self.python_scoped_import_bindings

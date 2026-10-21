@@ -1143,14 +1143,18 @@ impl Resolver {
                     // 2c'. Swift: a bare call that bound to a method of a protocol is
                     // a call through it — `greet()` written in `extension Greeter`
                     // runs whichever conformer `self` is.
-                    if family == LangFamily::Swift
-                        && call.receiver_expr.is_none()
-                        && !self.is_overload_self_call(
+                    if family == LangFamily::Swift && call.receiver_expr.is_none() {
+                        // An overload calling its sibling cannot say whether the
+                        // protocol's own declaration is the target, so that one
+                        // edge is withheld — but the conformers it fans out to
+                        // are still reached, and are kept.
+                        let caller_identity =
+                            call.caller_symbol.as_deref().unwrap_or(&ext.file_path);
+                        let withhold_self = self.is_overload_self_call(
                             &ext.file_path,
-                            call.caller_symbol.as_deref().unwrap_or(&ext.file_path),
+                            caller_identity,
                             resolution.as_deref(),
-                        )
-                    {
+                        );
                         let through_protocol = match resolution.as_deref() {
                             Some(Resolution::SameFile {
                                 target_symbol,
@@ -1164,10 +1168,26 @@ impl Resolver {
                                 .filter(|(_, (_, targets))| !targets.is_empty()),
                             _ => None,
                         };
-                        if let Some((own, (direct, targets))) = through_protocol {
-                            resolution = Some(self.dispatch_through_interface(
-                                ext, call, &mut edges, &own, direct, targets,
-                            ));
+                        if let Some((own, (direct, mut targets))) = through_protocol {
+                            if withhold_self {
+                                targets.retain(|(file, symbol)| {
+                                    !(*file == ext.file_path && symbol == caller_identity)
+                                });
+                            }
+                            if !(withhold_self && targets.is_empty()) {
+                                // The dispatch pushes the direct edge into the
+                                // vector it is given; the withheld self-edge goes
+                                // to a scratch one instead.
+                                let mut scratch = Vec::new();
+                                let sink = if withhold_self {
+                                    &mut scratch
+                                } else {
+                                    &mut edges
+                                };
+                                resolution = Some(self.dispatch_through_interface(
+                                    ext, call, sink, &own, direct, targets,
+                                ));
+                            }
                         }
                     }
 

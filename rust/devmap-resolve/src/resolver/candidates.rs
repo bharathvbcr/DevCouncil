@@ -243,6 +243,13 @@ impl Resolver {
     ) -> bool {
         self.file_scope_declares(file, name)
             || self.names_a_non_local_import(file, name)
+            // A name some function of the file imports, read where no import
+            // reaches it: the file says what the name is, and it is not whatever
+            // repository declaration shares the spelling.
+            || (family == LangFamily::Python
+                && self
+                    .python_function_only_imports
+                    .contains(&(file.to_string(), name.to_string())))
             || crate::builtins::is_builtin(family, name)
             || crate::builtins::host_global_environment(family, name).is_some()
     }

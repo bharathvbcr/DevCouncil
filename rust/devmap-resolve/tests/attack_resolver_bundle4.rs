@@ -116,7 +116,8 @@ fn py_init_reexport_function_level_import() {
     let imp = ("pkg/impl.py", "def helper():\n    return 1\n");
     let m = "def a():\n    from pkg import helper\n    return helper()\n\ndef d():\n    return helper()\n";
     let e = calls(&[init, imp, ("mainx.py", m)]);
-    assert!(has(&e, "mainx.py::a", "pkg/impl.py::helper"), "{e:?}");
+    // `a`'s own import binds only through the call ladder's function-local
+    // alias rung (recall, recorded); `d` imports nothing and binds nothing.
     assert!(!has(&e, "mainx.py::d", "pkg/impl.py::helper"), "d does not import: {e:?}");
 }
 
@@ -124,8 +125,7 @@ fn py_init_reexport_function_level_import() {
 fn py_same_name_two_functions_different_modules() {
     let m = "def a():\n    import lib as m\n    return m.helper()\n\ndef b():\n    import lib2 as m\n    return m.helper()\n\ndef d():\n    return m.helper()\n";
     let e = calls(&[LIB, LIB2, ("mainx.py", m)]);
-    assert!(has(&e, "mainx.py::a", H), "{e:?}");
-    assert!(has(&e, "mainx.py::b", H2), "{e:?}");
+    // Function-local aliases are recall only for calls (not bound; extract-v98).
     assert!(!has(&e, "mainx.py::a", H2) && !has(&e, "mainx.py::b", H), "cross-wise: {e:?}");
     assert!(!e.iter().any(|(f, _)| f == "mainx.py::d"), "d binds nothing: {e:?}");
 }
@@ -134,7 +134,7 @@ fn py_same_name_two_functions_different_modules() {
 fn py_same_name_two_functions_same_module() {
     let m = "def a():\n    import lib\n    return lib.helper()\n\ndef b():\n    import lib\n    return lib.helper()\n";
     let e = calls(&[LIB, ("mainx.py", m)]);
-    assert!(has(&e, "mainx.py::a", H) && has(&e, "mainx.py::b", H), "{e:?}");
+    assert!(!e.iter().any(|(_, t)| t != H), "{e:?}");
 }
 
 #[test]
@@ -181,7 +181,6 @@ fn py_value_reference_function_import_other_function() {
 fn py_from_import_value_function_only() {
     let m = "def a():\n    from lib import helper\n    return helper()\n\ndef d():\n    return helper()\n";
     let e = calls(&[LIB, ("mainx.py", m)]);
-    assert!(has(&e, "mainx.py::a", H), "{e:?}");
     assert!(!has(&e, "mainx.py::d", H), "{e:?}");
 }
 
@@ -226,7 +225,9 @@ fn py_import_dotted_function_and_other_function_plain_module_level() {
     let init = ("pkg/__init__.py", "");
     let m = "import pkg.sub\n\ndef a():\n    import pkg.sub\n    return pkg.sub.helper()\n\ndef d():\n    return pkg.sub.helper()\n";
     let e = calls(&[init, sub, ("mainx.py", m)]);
-    assert!(has(&e, "mainx.py::a", "pkg/sub.py::helper"), "{e:?}");
+    // `a`'s function-local `import pkg.sub` is not bound for calls (recall,
+    // extract-v98: the extraction cannot show the name was not rebound); `d`
+    // reads the module-level import.
     assert!(has(&e, "mainx.py::d", "pkg/sub.py::helper"), "{e:?}");
 }
 
@@ -234,9 +235,10 @@ fn py_import_dotted_function_and_other_function_plain_module_level() {
 fn py_aliased_module_level_alias_function_other() {
     let m = "import lib as L\n\ndef a():\n    import lib2 as L\n    return L.helper()\n\ndef d():\n    return L.helper()\n";
     let e = calls(&[LIB, LIB2, ("mainx.py", m)]);
-    assert!(has(&e, "mainx.py::a", H2), "{e:?}");
+    // `a`'s function-local alias is recall only (not bound for calls).
     assert!(has(&e, "mainx.py::d", H), "{e:?}");
     assert!(!has(&e, "mainx.py::d", H2), "{e:?}");
+    assert!(!has(&e, "mainx.py::a", H), "{e:?}");
 }
 
 #[test]

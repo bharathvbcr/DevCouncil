@@ -360,6 +360,9 @@ impl Resolver {
         } else {
             if !Self::is_plain_ident(shape)
                 || scope.is_some_and(|scope| self.scope_shadows(family, file, scope, shape))
+                || scope.is_some_and(|scope| {
+                    self.enclosing_type_declares_member(family, file, scope, shape)
+                })
             {
                 return None;
             }
@@ -388,6 +391,54 @@ impl Resolver {
         Some((callee_file, callee))
     }
 
+    /// Whether a type enclosing `scope` declares a member called `name`, in a
+    /// language whose bare call inside a method is first the enclosing type's
+    /// own member (Kotlin, Swift, Java and the other brace languages).
+    ///
+    /// A bare `make()` written in `class C` is `this.make()` when `C` declares
+    /// one, and only otherwise a top-level `make`; when both exist the callee is
+    /// not the top-level one the file-level lookup finds, so the factory rungs
+    /// abstain rather than type the local by the wrong function.
+    pub(super) fn enclosing_type_declares_member(
+        &self,
+        family: LangFamily,
+        file: &str,
+        scope: &str,
+        name: &str,
+    ) -> bool {
+        if !matches!(
+            family,
+            LangFamily::Kotlin | LangFamily::Swift | LangFamily::CStyle
+        ) {
+            return false;
+        }
+        let declares = |type_identity: &str| {
+            let bare = type_identity.rsplit("::").next().unwrap_or(type_identity);
+            self.type_methods
+                .contains_key(&(family, bare.to_string(), name.to_string()))
+        };
+        // A call attributed to the type itself (a property initializer) sees its
+        // own members; a call in a method sees its type's, then the outer ones.
+        let mut current = scope.to_string();
+        for _ in 0..8 {
+            if current != file && declares(&current) {
+                return true;
+            }
+            let Some(parent) = self
+                .symbol_parents
+                .get(&(file.to_string(), current.clone()))
+                .filter(|parent| parent.as_str() != file && **parent != current)
+            else {
+                return false;
+            };
+            if declares(parent) {
+                return true;
+            }
+            current = parent.clone();
+        }
+        false
+    }
+
     /// The nominal type the callable `(callee_file, callee)` is written to
     /// return, read at a call site in `file`.
     pub(super) fn factory_written_type(
@@ -408,6 +459,14 @@ impl Resolver {
         // not share: read it there (an alias is the class it aliases).
         if family == LangFamily::Python && callee_file != file {
             nominal = self.python_annotation_class(callee_file, &nominal)?;
+        }
+        // Kotlin reads a bare name through its imports and package, so the one
+        // corpus declaration must also be the one both files' spellings reach
+        // (not a nested class, not shadowed by a single-name import).
+        if family == LangFamily::Kotlin
+            && !self.kotlin_constructor_is_one_type(file, callee_file, &nominal)
+        {
+            return None;
         }
         (self.unique_indexed_type(family, &nominal)
             || self.names_one_type_in_both(file, callee_file, &nominal))
@@ -531,33 +590,45 @@ impl Resolver {
             .get(constructor)
             .into_iter()
             .flatten()
-            .filter(|(_, _, family, _)| LangFamily::Kotlin.admits(*family))
+            .filter(|(_, kind, family, _)| {
+                // A function or method sharing the name (a `fun Repo()` factory
+                // beside `class Repo`) is not a type.
+                LangFamily::Kotlin.admits(*family)
+                    && !matches!(kind, SymbolKind::Function | SymbolKind::Method)
+            })
             .collect();
-        let [(declaring_file, kind, _, _)] = declared.as_slice() else {
+        let [(declaring_file, kind, _, identity)] = declared.as_slice() else {
             // None declared: a stdlib or external type. Two or more: no one
             // declaration for either spelling to mean.
             return declared.is_empty() && file == callee_file;
         };
-        matches!(
-            kind,
-            SymbolKind::Class | SymbolKind::Struct | SymbolKind::Interface | SymbolKind::Enum
-        ) && [callee_file, file]
-            .iter()
-            .all(|site| self.kotlin_site_names_declaration(site, constructor, declaring_file))
+        // A nested class (`Outer.Repo`) is not what a bare `Repo` names outside
+        // `Outer`.
+        identity
+            .strip_prefix(declaring_file.as_str())
+            .and_then(|rest| rest.strip_prefix("::"))
+            == Some(constructor)
+            && matches!(
+                kind,
+                SymbolKind::Class | SymbolKind::Struct | SymbolKind::Interface | SymbolKind::Enum
+            )
+            && [callee_file, file]
+                .iter()
+                .all(|site| self.kotlin_site_names_declaration(site, constructor, declaring_file))
     }
 
     /// Whether `site` reads the bare type name `name` as the declaration in
     /// `declaring_file`: it declares it, imports exactly it, or — for a name
     /// Kotlin does not import by default — shares its package. A file that
     /// imports the name from anywhere else binds it there.
-    fn kotlin_site_names_declaration(&self, site: &str, name: &str, declaring_file: &str) -> bool {
-        if let Some((target, _)) = self
-            .import_bindings
-            .get(site)
-            .and_then(|bindings| bindings.get(name))
-        {
-            return target == declaring_file;
-        }
+    pub(super) fn kotlin_site_names_declaration(
+        &self,
+        site: &str,
+        name: &str,
+        declaring_file: &str,
+    ) -> bool {
+        // A single-name import of the name from outside the index binds it
+        // there, and beats a star import in either order.
         if self
             .external_imports
             .get(site)
@@ -568,6 +639,13 @@ impl Resolver {
                 .is_some_and(|imports| imports.contains_key(name))
         {
             return false;
+        }
+        if let Some((target, _)) = self
+            .import_bindings
+            .get(site)
+            .and_then(|bindings| bindings.get(name))
+        {
+            return target == declaring_file;
         }
         if site == declaring_file {
             return true;
