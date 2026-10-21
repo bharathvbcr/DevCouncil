@@ -232,13 +232,21 @@ fn an_extension_function_beside_a_kotlin_error_region_is_emitted_or_covered() {
         &root,
         &["--json", "search", "withChronosReadableContentColors"],
     );
-    if found
-        .to_string()
-        .contains("withChronosReadableContentColors")
-    {
+    // Only the result items count: a miss's explanation can name the function
+    // (the partial-parse reason), which would pass without proving emission.
+    let emitted = found["items"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["symbol_name"]
+                .as_str()
+                .is_some_and(|name| name.ends_with("withChronosReadableContentColors"))
+        })
+    });
+    if emitted {
+        eprintln!("AC4 branch: EMITTED");
         let _ = std::fs::remove_dir_all(&root);
         return;
     }
+    eprintln!("AC4 branch: not emitted, checking covered-by-partial");
     let status = json(&root, &["--json", "status"]);
     let rows = partial_rows(&status);
     let (_, reason) = rows.iter().find(|(path, _)| path == "Theme.kt").unwrap_or_else(|| {
@@ -249,5 +257,6 @@ fn an_extension_function_beside_a_kotlin_error_region_is_emitted_or_covered() {
         covers(&lost_ranges(reason), offset),
         "the extension function (byte {offset}) is absent and not inside a listed range: {reason}"
     );
+    eprintln!("AC4 branch: COVERED-BY-PARTIAL ({reason})");
     let _ = std::fs::remove_dir_all(&root);
 }
