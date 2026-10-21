@@ -46,11 +46,39 @@ fn dead_symbol_identity(symbol: &ExtractedSymbol, file_path: &str) -> String {
         .unwrap_or_else(|| symbol.name.clone())
 }
 
+/// Whether a file-scoped `ScriptEntry` still exempts every symbol of the file.
+///
+/// A script's entry *file* is a claim about the file. It stops sparing the
+/// symbols inside it where the entry function stays live by other evidence:
+///
+/// * Go and Rust: the entry function is exempt by name at symbol level.
+/// * Python, JavaScript, TypeScript: the guarded or top-level `main()` is a
+///   real call edge from module-level code, a `[project.scripts]` target is a
+///   symbol-scoped `ConfigEntryPoint`, and a click/typer command is a
+///   decorator-contract exemption. An uncalled constant or helper in a script
+///   is as dead as one anywhere else.
+///
+/// Every other language keeps the file-level exemption: no probe established
+/// that its entry reaches a call edge at symbol level (shell, Ruby, PHP, Lua,
+/// R and the JVM/Apple script dialects either hold only exported top-level
+/// symbols or are call-blind at module scope), and the fail-open direction is
+/// one more finding unseen rather than a live function reported dead.
+fn script_entry_exempts_its_symbols(language: &str) -> bool {
+    !matches!(
+        language,
+        "go" | "rust" | "python" | "javascript" | "typescript"
+    )
+}
+
 /// Directory owning a path, used as half of a Go package identity. Two packages
 /// with the same name in different directories are unrelated, so the name alone
 /// cannot key the interface join.
+///
+/// Splits on the last `/` or `\`. The indexed pipeline stores forward slashes,
+/// but this is a boundary: a caller handing in a Windows-spelled path must not
+/// have a whole directory collapse into the root package.
 fn parent_dir(path: &str) -> &str {
-    path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("")
+    path.rfind(['/', '\\']).map_or("", |at| &path[..at])
 }
 
 /// Go package identity of an extraction: `(directory, package clause)`.
@@ -3638,8 +3666,10 @@ pub fn analyze_liveness_with_coverage(
             // package's next file was. The rule this list states — a
             // file-level claim is not a claim about the symbols in it —
             // applies, so for these two the annotation stays a claim about
-            // the file.
-            (w.kind == WiringKind::ScriptEntry && !matches!(ext.language.as_str(), "go" | "rust"))
+            // the file — and so for Python, JavaScript and TypeScript, whose
+            // entry is a call edge; see `script_entry_exempts_its_symbols`.
+            (w.kind == WiringKind::ScriptEntry
+                && script_entry_exempts_its_symbols(ext.language.as_str()))
                 || matches!(
                     w.kind,
                     WiringKind::Vendored
@@ -3933,6 +3963,19 @@ mod tests {
         assert_eq!(parent_dir("a/b/c/d.go"), "a/b/c");
         // Two files in different directories must not share a key.
         assert_ne!(parent_dir("a/x.go"), parent_dir("b/x.go"));
+    }
+
+    /// A Windows-spelled path used to key as the root package, so every Go
+    /// package written that way collapsed into one identity.
+    #[test]
+    fn parent_dir_splits_on_either_separator() {
+        assert_eq!(parent_dir("a\\b.go"), "a");
+        assert_eq!(parent_dir("a/b\\c.go"), "a/b");
+        assert_eq!(parent_dir("a\\b/c.go"), "a\\b");
+        assert_eq!(parent_dir("pkg\\svc\\node.go"), "pkg\\svc");
+        assert_eq!(parent_dir("pkg/svc/node.go"), "pkg/svc");
+        assert_eq!(parent_dir("node.go"), "");
+        assert_ne!(parent_dir("a\\x.go"), parent_dir("b\\x.go"));
     }
 
     fn symbol(name: &str, start: usize, end: usize) -> ExtractedSymbol {

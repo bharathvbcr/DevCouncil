@@ -184,6 +184,10 @@ name = "python_constant_liveness"
 required-features = ["parse"]
 
 [[test]]
+name = "python_script_entry_liveness"
+required-features = ["parse"]
+
+[[test]]
 name = "cfg_variants_are_one_dead_row"
 required-features = ["parse"]
 
