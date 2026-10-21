@@ -242,3 +242,15 @@ required-features = ["parse"]
 [[test]]
 name = "resolution_rate_attack_head"
 required-features = ["parse"]
+
+[[test]]
+name = "attack_script_probe"
+required-features = ["parse"]
+
+[[test]]
+name = "attack_script_probe2"
+required-features = ["parse"]
+
+[[test]]
+name = "attack_script_probe3"
+required-features = ["parse"]
