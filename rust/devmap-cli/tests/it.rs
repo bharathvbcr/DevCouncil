@@ -24,6 +24,7 @@ mod a_message_literal_has_no_run_of_spaces;
 mod a_named_root_must_be_a_directory;
 mod a_one_file_edit_writes_one_file_of_rows;
 mod a_python_index_is_named_not_migrated;
+mod a_resolver_verdict_lands_on_an_unchanged_file_under_a_narrowed_write;
 mod a_read_arm_does_not_run_git_log;
 mod a_refusal_is_printed_once;
 mod a_relative_root_is_resolved_once;
