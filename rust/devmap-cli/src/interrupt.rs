@@ -200,12 +200,29 @@ mod tests {
             .env(MARK, name)
             .output()
             .expect("re-exec the test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             output.status.success(),
-            "isolated test {name} failed ({:?})\nstdout={}\nstderr={}",
+            "isolated test {name} failed ({:?})\nstdout={stdout}\nstderr={}",
             output.status,
-            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+        // A name that no longer matches a test runs nothing and exits 0;
+        // require that exactly the one selected test ran.
+        assert!(
+            stdout.contains("1 passed") && stdout.contains("0 failed"),
+            "isolated test {name} did not run exactly one test (renamed or moved?)\nstdout={stdout}"
+        );
+    }
+
+    #[test]
+    fn isolated_fails_when_its_name_matches_no_test() {
+        let outcome = std::panic::catch_unwind(|| {
+            isolated("interrupt::tests::no_such_test", || {});
+        });
+        assert!(
+            outcome.is_err(),
+            "a stale name must fail, not pass silently"
         );
     }
 
