@@ -43,6 +43,7 @@ fn z3(callee_return: &str, extra: &str) -> String {
 }
 
 #[test]
+#[ignore = "ft-2c800986: pre-existing, reverted per Fable 2026-10-21"]
 fn z3_a_local_from_a_function_written_to_return_a_generic_list_is_a_list() {
     let source = z3("List<String>", "");
     let found = calls(&[("p/Z.kt", &source)]);
@@ -53,6 +54,7 @@ fn z3_a_local_from_a_function_written_to_return_a_generic_list_is_a_list() {
 }
 
 #[test]
+#[ignore = "ft-2c800986: pre-existing, reverted per Fable 2026-10-21"]
 fn z3_nested_generics_type_the_outer_constructor() {
     let source = "package p\n\nprivate fun Map<String, List<Int>>.total(): Int = size\n\nfun table(): Map<String, List<Int>> = emptyMap()\n\nfun use(): Int {\n    val t = table()\n    return t.total()\n}\n";
     let found = calls(&[("p/Z.kt", source)]);

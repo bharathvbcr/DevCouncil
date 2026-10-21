@@ -7,9 +7,9 @@
   },
   "kotlin": {
     "forbid_any_tier_rows": 4,
-    "known_failing": 6,
+    "known_failing": 7,
     "positive_rows": 69,
-    "present": 64
+    "present": 63
   },
   "python": {
     "forbid_any_tier_rows": 30,

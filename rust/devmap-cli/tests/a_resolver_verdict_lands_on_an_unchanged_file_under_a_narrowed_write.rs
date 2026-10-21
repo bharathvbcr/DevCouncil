@@ -2,9 +2,9 @@
 //! for a file nobody edited even when the write is narrowed to the file
 //! somebody did (`devmap build --affected <path>`).
 //!
-//! The resolver changes of this lane (overload self-edges and receiver binds,
-//! Kotlin generic factory types, a Python name only another function imports)
-//! each decide edges of files that stay byte-identical. The narrowed build
+//! The resolver change of this lane (same-file overload self-edges and the
+//! receiver bind on an overloaded method) decides edges of a file that stays
+//! byte-identical. The narrowed build
 //! below edits only `unrelated.py`; the edges of the untouched files must be
 //! the ones a cold build writes, and must be the corrected ones.
 
@@ -79,21 +79,6 @@ fn assert_corrected(rows: &[String], when: &str) {
         ),
         "{when}: c.add(..) on a Calc binds"
     );
-    // Kotlin Z3.
-    assert!(
-        has(rows, "Z.kt::useList", "Z.kt::List.total", "Calls"),
-        "{when}: a local from a List<String> function reaches List.total"
-    );
-    // Python: a name only another function imports is not this function's.
-    assert!(
-        !has(
-            rows,
-            "pkg/use.py::other",
-            "pkg/m.py::CONST_READ",
-            "References"
-        ),
-        "{when}: a read of a name only `check` imports must not bind in `other`"
-    );
 }
 
 #[test]
@@ -103,18 +88,6 @@ fn resolver_verdicts_land_on_unchanged_files_in_a_narrowed_build() {
         &root,
         "Overloads.kt",
         "package gaps\n\nclass Calc {\n    fun add(a: Int): Int = a\n\n    fun add(a: String): Int = add(a.length)\n}\n\nfun useCalc(c: Calc): Int = c.add(1) + c.add(\"two\")\n",
-    );
-    write(
-        &root,
-        "Z.kt",
-        "package gaps\n\nprivate fun List<String>.total(): Int = size\n\nfun names(): List<String> = listOf(\"a\")\n\nfun useList(flag: Boolean): Int {\n    val files = if (flag) names() else emptyList()\n    return files.total()\n}\n",
-    );
-    write(&root, "pkg/__init__.py", "");
-    write(&root, "pkg/m.py", "CONST_DEAD = 1\nCONST_READ = 2\n");
-    write(
-        &root,
-        "pkg/use.py",
-        "def check():\n    from . import m as cr\n\n    return cr.CONST_READ\n\n\ndef other():\n    return cr.CONST_READ\n",
     );
     write(&root, "unrelated.py", "def one():\n    return 1\n");
     run(&root, &["build", "."]);

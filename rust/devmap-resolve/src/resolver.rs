@@ -437,10 +437,10 @@ pub struct Resolver {
     /// binds; this is where the function's own live.
     python_scoped_import_bindings:
         BTreeMap<(String, String), BTreeMap<String, Option<(String, String)>>>,
-    /// `(file, name)` that only functions import and the module does not: the
-    /// flat table holds the first of them, so a read that no function's own
-    /// scope answers (another function, or module scope) has no binding.
-    python_function_only_imports: BTreeSet<(String, String)>,
+    /// `(file, name)` that several functions import differently and the module
+    /// does not import: the flat table holds one of them, so a read that no
+    /// function's own scope answers has no binding.
+    python_ambiguous_scoped_imports: BTreeSet<(String, String)>,
     /// Reverse of [`Self::supertypes`]: `(family, type name)` → indexed subtypes.
     ///
     /// Built from the same heritage rows. X42's virtual-`self` guard walks this
@@ -554,11 +554,12 @@ pub struct Resolver {
     /// identities, not bare words: emitting `open` instead of `app.py::open`
     /// makes an edge unjoinable to the node it names.
     qualified_names: BTreeMap<(String, String), Option<Arc<str>>>,
-    /// `(file, qualified name)` identities that more than one declaration in the
-    /// file carries: Kotlin, Java and Swift overloads (`add(Int)` / `add(String)`),
-    /// whose ids the extractor mints from the name alone. A call from inside one
-    /// declaration of such an identity to the same identity cannot be told from
-    /// a call to its sibling overload without the call's arity.
+    /// `(file, qualified name)` identities that more than one callable of one
+    /// container declares in that file: Kotlin, Swift, Java, C# and Scala
+    /// overloads (`add(Int)` / `add(String)`), whose ids the extractor mints
+    /// from the name alone. A call from inside one declaration of such an
+    /// identity to the same identity cannot be told from a call to its sibling
+    /// overload without the call's arity.
     shared_identities: BTreeSet<(String, String)>,
     /// `(file, qualified name)` → the symbol that declares it, with the file
     /// path standing for "declared at file level".
@@ -767,7 +768,7 @@ impl Resolver {
             python_class_enclosers: BTreeMap::new(),
             python_dynamic_all: BTreeSet::new(),
             python_scoped_import_bindings: BTreeMap::new(),
-            python_function_only_imports: BTreeSet::new(),
+            python_ambiguous_scoped_imports: BTreeSet::new(),
             subtypes: BTreeMap::new(),
             import_bindings: BTreeMap::new(),
             value_imports: BTreeMap::new(),

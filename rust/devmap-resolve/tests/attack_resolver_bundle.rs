@@ -602,6 +602,7 @@ fn py_rebinding_forms_abstain() {
 }
 
 #[test]
+#[ignore = "ft-2c800986: pre-existing, reverted per Fable 2026-10-21"]
 fn py_global_decl_before_import() {
     let e = py_one(
         "cr = None\n\ndef check():\n    global cr\n    from . import m as cr\n    return cr.CONST\n\ndef other():\n    return cr.CONST\n",
@@ -641,6 +642,7 @@ fn py_inner_import_not_visible_in_outer_with_module_alias() {
 }
 
 #[test]
+#[ignore = "ft-2c800986: pre-existing, reverted per Fable 2026-10-21"]
 fn py_other_function_param_named_like_alias() {
     let e = py_one(
         "def a():\n    from . import m as cr\n    return cr.CONST\n\ndef b(cr):\n    return cr.CONST\n\ndef c():\n    cr = make()\n    return cr.CONST\n\ndef d():\n    return cr.CONST\n",
@@ -653,6 +655,7 @@ fn py_other_function_param_named_like_alias() {
 }
 
 #[test]
+#[ignore = "ft-2c800986: pre-existing, reverted per Fable 2026-10-21"]
 fn py_method_reads_function_alias_from_other_method() {
     let e = py_one(
         "class K:\n    def a(self):\n        from . import m as cr\n        return cr.CONST\n\n    def b(self):\n        return cr.CONST\n\n    def c(self, cr):\n        return cr.CONST\n",

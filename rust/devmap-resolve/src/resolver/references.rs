@@ -298,17 +298,7 @@ impl Resolver {
         if !self.module_member_admitted(&ext.file_path, receiver, name) {
             return None;
         }
-        // Python reads the import the scope the reference is written in sees:
-        // a name only another function imports is not bound here.
-        let (module_file, _) = if family == LangFamily::Python {
-            self.python_import_binding(
-                &ext.file_path,
-                reference.enclosing_symbol.as_deref(),
-                receiver,
-            )?
-        } else {
-            self.import_bindings.get(&ext.file_path)?.get(receiver)?
-        };
+        let (module_file, _) = self.import_bindings.get(&ext.file_path)?.get(receiver)?;
         let (resolved_file, resolved_symbol) = self.lookup_in_package(module_file, name)?;
         Some(self.reference_edge(
             ext,
