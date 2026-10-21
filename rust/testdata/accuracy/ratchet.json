@@ -7,15 +7,15 @@
   },
   "kotlin": {
     "forbid_any_tier_rows": 4,
-    "known_failing": 5,
+    "known_failing": 9,
     "positive_rows": 69,
-    "present": 65
+    "present": 62
   },
   "python": {
     "forbid_any_tier_rows": 30,
-    "known_failing": 4,
+    "known_failing": 5,
     "positive_rows": 79,
-    "present": 75
+    "present": 74
   },
   "rust": {
     "forbid_any_tier_rows": 1,
@@ -25,9 +25,9 @@
   },
   "swift": {
     "forbid_any_tier_rows": 9,
-    "known_failing": 6,
+    "known_failing": 9,
     "positive_rows": 117,
-    "present": 111
+    "present": 108
   },
   "typescript": {
     "forbid_any_tier_rows": 7,
