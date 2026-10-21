@@ -272,6 +272,56 @@ fn py_async_def_and_method_importing() {
 }
 
 #[test]
+fn py_from_imports_same_name_two_functions_different_modules() {
+    let m = "def a():\n    from lib import helper\n    return helper()\n\ndef b():\n    from lib2 import helper\n    return helper()\n\ndef d():\n    return 0\n";
+    let e = calls(&[LIB, LIB2, ("mainx.py", m)]);
+    assert!(has(&e, "mainx.py::a", H), "{e:?}");
+    assert!(has(&e, "mainx.py::b", H2), "{e:?}");
+    assert!(!has(&e, "mainx.py::a", H2) && !has(&e, "mainx.py::b", H), "cross-wise: {e:?}");
+}
+
+#[test]
+fn py_from_import_function_and_module_level_other_function_same_name() {
+    // module imports helper from lib; function a imports helper from lib2.
+    let m = "from lib import helper\n\ndef a():\n    from lib2 import helper\n    return helper()\n\ndef d():\n    return helper()\n";
+    let e = calls(&[LIB, LIB2, ("mainx.py", m)]);
+    assert!(has(&e, "mainx.py::a", H2), "{e:?}");
+    assert!(has(&e, "mainx.py::d", H), "{e:?}");
+    assert!(!has(&e, "mainx.py::a", H) && !has(&e, "mainx.py::d", H2), "{e:?}");
+}
+
+#[test]
+fn py_module_level_import_in_function_scoped_flat_table_ordering() {
+    // function import appears BEFORE the module-level import in file order.
+    let m = "def a():\n    from lib2 import helper\n    return helper()\n\nfrom lib import helper\n\ndef d():\n    return helper()\n";
+    let e = calls(&[LIB, LIB2, ("mainx.py", m)]);
+    assert!(has(&e, "mainx.py::a", H2) && has(&e, "mainx.py::d", H), "{e:?}");
+}
+
+#[test]
+fn py_module_level_import_inside_nested_if_in_class_at_module() {
+    // import inside `if` inside a *class body*: class-scoped, methods do not see it.
+    let m = "import sys\nclass K:\n    if sys.platform == 'x':\n        import lib\n    def run(self):\n        return lib.helper()\n";
+    let e = calls(&[LIB, ("mainx.py", m)]);
+    assert!(!has(&e, "mainx.py::K.run", H), "{e:?}");
+}
+
+#[test]
+fn py_module_level_import_after_def_used_by_global_decl() {
+    let m = "def d():\n    global lib\n    return lib.helper()\n\nimport lib\n";
+    let e = calls(&[LIB, ("mainx.py", m)]);
+    assert!(has(&e, "mainx.py::d", H), "{e:?}");
+}
+
+#[test]
+fn py_function_import_used_via_global_by_other_function() {
+    // a declares `global lib; import lib` => binds module-level name for d too.
+    let m = "def a():\n    global lib\n    import lib\n\ndef d():\n    return lib.helper()\n";
+    let e = calls(&[LIB, ("mainx.py", m)]);
+    println!("global import: {e:?}");
+}
+
+#[test]
 fn py_module_level_unresolved_import_then_function_import() {
     // module-level `import missing as lib` (unresolved); function a imports real lib.
     let m = "import missing as lib\n\ndef a():\n    import lib\n    return lib.helper()\n\ndef d():\n    return lib.helper()\n";

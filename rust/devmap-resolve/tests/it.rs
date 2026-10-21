@@ -262,3 +262,5 @@ mod attack_resolver_bundle2;
 mod attack_resolver_bundle3;
 #[cfg(feature = "parse")]
 mod attack_resolver_bundle4;
+#[cfg(feature = "parse")]
+mod corpus_dump_attack;

@@ -401,6 +401,36 @@ fn ov_swift_init_overloads_and_convenience() {
     assert!(!e.iter().any(|(f, t)| f == t), "init self-edge: {e:?}");
 }
 
+#[test]
+fn m1_protocol_extension_overload_delegating_to_other_conformers() {
+    let a = "protocol Adder {\n  func add(_ a: Int) -> Int\n  func add(_ a: String) -> Int\n}\n\nextension Adder {\n  func add(_ a: String) -> Int { return add(a.count) }\n}\n";
+    let b = "class Calc: Adder {\n  func add(_ a: Int) -> Int { return a }\n}\n\nclass Calc2: Adder {\n  func add(_ a: Int) -> Int { return a + 1 }\n}\n";
+    let e = calls(&[("A.swift", a), ("B.swift", b)]);
+    println!("m1 conformers: {e:?}");
+    // The call `add(a.count)` is add(Int): a true edge to each conformer's add exists.
+    assert!(
+        e.iter().any(|(f, t)| f.ends_with("Adder.add") && t.ends_with("Calc.add")),
+        "cross-conformer fan-out lost: {e:?}"
+    );
+}
+
+#[test]
+fn m1_protocol_extension_nonoverloaded_fan_out_kept() {
+    let a = "protocol Greeter {\n  func name() -> String\n}\n\nextension Greeter {\n  func greet() -> String { return name() }\n}\n\nclass A: Greeter {\n  func name() -> String { return \"a\" }\n}\n\nclass B: Greeter {\n  func name() -> String { return \"b\" }\n}\n";
+    let e = calls(&[("A.swift", a)]);
+    assert!(e.iter().any(|(f, t)| f.ends_with("Greeter.greet") && t.ends_with("A.name")), "{e:?}");
+    assert!(e.iter().any(|(f, t)| f.ends_with("Greeter.greet") && t.ends_with("B.name")), "{e:?}");
+}
+
+#[test]
+fn m1_conformer_overloads_call_each_other() {
+    let a = "protocol Adder {\n  func add(_ a: Int) -> Int\n}\nclass Calc: Adder {\n  func add(_ a: Int) -> Int { return a }\n  func add(_ s: String) -> Int { return add(s.count) }\n}\nfunc go(_ c: Calc) -> Int { return c.add(1) }\n";
+    let e = calls(&[("A.swift", a)]);
+    println!("m1 conformer: {e:?}");
+    assert!(!e.iter().any(|(f, t)| f == t), "{e:?}");
+    assert!(e.iter().any(|(f, t)| f.ends_with("::go") && t.ends_with("Calc.add")), "{e:?}");
+}
+
 // ---- baselines / blame ----
 
 #[test]
