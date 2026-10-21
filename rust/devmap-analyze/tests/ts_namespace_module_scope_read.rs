@@ -119,6 +119,45 @@ fn a_python_class_attribute_read_at_module_scope_stays_live() {
     assert!(row(&rows, "Cls").is_none(), "{rows:?}");
 }
 
+fn multi(sources: &[(&str, &str)]) -> Vec<DeadSymbolReport> {
+    let extractions: Vec<Extraction> = sources.iter().map(|(p, s)| extract_file(p, s)).collect();
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
+    analyze_liveness(&extractions, &resolution)
+}
+
+#[test]
+fn an_exported_namespace_read_at_its_own_file_scope_is_not_confidently_dead() {
+    let own = "export namespace NS { export const a = 1; }\nconsole.log(NS.a);\n";
+    let rows = multi(&[("src/a.ts", own)]);
+    let bad: Vec<_> = rows
+        .iter()
+        .filter(|r| !r.is_exempt)
+        .filter(|r| {
+            dead_tier::in_confident_branch(f64::from(r.confidence), r.exemption_reason.as_deref())
+        })
+        .map(|r| format!("{} conf={:?}", r.symbol_name, r.confidence))
+        .collect();
+    assert!(bad.is_empty(), "{bad:?}");
+}
+
+#[test]
+fn an_exported_namespace_read_from_another_file_is_live() {
+    let a = "export namespace NS { export const a = 1; }\n";
+    let b = "import { NS } from './a';\nconsole.log(NS.a);\n";
+    let rows = multi(&[("src/a.ts", a), ("src/b.ts", b)]);
+    let bad: Vec<_> = rows
+        .iter()
+        .filter(|r| !r.is_exempt)
+        .filter(|r| {
+            dead_tier::in_confident_branch(f64::from(r.confidence), r.exemption_reason.as_deref())
+        })
+        .map(|r| format!("{} conf={:?}", r.symbol_name, r.confidence))
+        .collect();
+    assert!(bad.is_empty(), "{bad:?}");
+}
+
 #[test]
 fn a_python_class_never_read_is_still_reported() {
     let src = "class Cls:\n    attr = 1\n\nprint(1)\n";

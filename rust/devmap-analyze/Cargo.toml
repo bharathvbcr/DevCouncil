@@ -254,3 +254,7 @@ required-features = ["parse"]
 [[test]]
 name = "attack_script_probe3"
 required-features = ["parse"]
+
+[[test]]
+name = "ts_namespace_module_scope_read"
+required-features = ["parse"]
