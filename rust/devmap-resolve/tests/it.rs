@@ -256,3 +256,5 @@ mod every_test_file_is_a_module {
         );
     }
 }
+#[cfg(feature = "parse")]
+mod attack_resolver_bundle;
