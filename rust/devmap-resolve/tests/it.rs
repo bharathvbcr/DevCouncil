@@ -258,3 +258,7 @@ mod every_test_file_is_a_module {
 mod attack_resolver_bundle;
 #[cfg(feature = "parse")]
 mod attack_resolver_bundle2;
+#[cfg(feature = "parse")]
+mod attack_resolver_bundle3;
+#[cfg(feature = "parse")]
+mod attack_resolver_bundle4;
