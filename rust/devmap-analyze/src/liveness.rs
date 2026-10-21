@@ -48,15 +48,11 @@ fn dead_symbol_identity(symbol: &ExtractedSymbol, file_path: &str) -> String {
 
 /// Whether a file-scoped `ScriptEntry` still exempts every symbol of the file.
 ///
-/// A script's entry *file* is a claim about the file. It stops sparing the
-/// symbols inside it where the entry function stays live by other evidence:
+/// A script's entry *file* is a claim about the file, not about what is in it.
+/// It stops sparing symbols where something else keeps the entry live:
 ///
 /// * Go and Rust: the entry function is exempt by name at symbol level.
-/// * Python, JavaScript, TypeScript: the guarded or top-level `main()` is a
-///   real call edge from module-level code, a `[project.scripts]` target is a
-///   symbol-scoped `ConfigEntryPoint`, and a click/typer command is a
-///   decorator-contract exemption. An uncalled constant or helper in a script
-///   is as dead as one anywhere else.
+/// * Python, JavaScript, TypeScript: see [`script_entry_exempts_callables`].
 ///
 /// Every other language keeps the file-level exemption: no probe established
 /// that its entry reaches a call edge at symbol level (shell, Ruby, PHP, Lua,
@@ -68,6 +64,22 @@ fn script_entry_exempts_its_symbols(language: &str) -> bool {
         language,
         "go" | "rust" | "python" | "javascript" | "typescript"
     )
+}
+
+/// Python, JavaScript and TypeScript scripts keep the file-level claim for
+/// everything callable or type-like (functions, methods, classes) and give it
+/// up for module-level variables only.
+///
+/// This is a scope decision, not a proof that the callables are dead or live.
+/// Narrowing them too exposed resolver gaps that scripts lean on harder than
+/// libraries do: dispatch tables (`COMMANDS[cmd]()`), `getattr` dispatch,
+/// object-literal members, `nn.Module.forward`, methods reached through
+/// attribute receivers. Measured on real repositories, 16 of 16 and at least
+/// 12 of 57 newly reported callables were live. A module-level variable is a
+/// name with readers or none, and an uncalled one in a script is as dead as
+/// anywhere else (the `F_POSITIONS` shape).
+fn script_entry_exempts_callables(language: &str) -> bool {
+    matches!(language, "python" | "javascript" | "typescript")
 }
 
 /// Directory owning a path, used as half of a Go package identity. Two packages
@@ -3695,6 +3707,11 @@ pub fn analyze_liveness_with_coverage(
         let is_file_exempt = is_parse_failed
             || matches!(ext.file_liveness(), FileLiveness::NotCode { .. })
             || exempting_wiring.is_some();
+        // What survives of a script's file-level claim for Python, JavaScript
+        // and TypeScript: every symbol but module-level variables.
+        let script_callable_claim = file_wiring.iter().copied().find(|w| {
+            w.kind == WiringKind::ScriptEntry && script_entry_exempts_callables(ext.language.as_str())
+        });
 
         // Per-symbol exemptions: a runtime, framework, or harness reaches the
         // symbol without an explicit call site, or the language forbids the
@@ -3784,7 +3801,11 @@ pub fn analyze_liveness_with_coverage(
             // Nothing else spares it: not its file, not a recorded exemption,
             // not a parse error over its span. Every report branch below
             // requires this; the exempt branch is what is left.
-            let unspared = !is_file_exempt && symbol_exemption.is_none() && !overlaps_parse_error;
+            let script_spared = script_callable_claim.is_some() && sym.kind != SymbolKind::Variable;
+            let unspared = !is_file_exempt
+                && !script_spared
+                && symbol_exemption.is_none()
+                && !overlaps_parse_error;
             let identity = dead_symbol_identity(sym, &ext.file_path);
             let language = ext.code_language();
             let dispatch_reason = (!is_called && !is_exported && unspared)
@@ -3925,6 +3946,11 @@ pub fn analyze_liveness_with_coverage(
                         symbol_exemption
                             .map(str::to_string)
                             .or_else(|| file_reason.clone())
+                            .or_else(|| {
+                                script_callable_claim
+                                    .filter(|_| script_spared)
+                                    .map(|w| w.details.clone())
+                            })
                             .or_else(|| {
                                 Some(if is_exported {
                                     EXPORTED_NOT_EXAMINED_REASON.to_string()

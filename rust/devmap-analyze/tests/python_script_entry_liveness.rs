@@ -4,13 +4,16 @@
 //! the name `__main__.py` gets a file-scoped `ScriptEntry` annotation. Go and
 //! Rust were narrowed so the annotation stops exempting every symbol of the
 //! file (their entry function is exempt by name); Python was not, so an
-//! uncalled module constant or helper in a guarded script was never reported
-//! (the `v5_accounting.py::F_POSITIONS` shape from the audit).
+//! uncalled module constant in a guarded script was never reported (the
+//! `v5_accounting.py::F_POSITIONS` shape from the audit).
 //!
-//! The entry function stays live without the file-level claim: the guarded
-//! `main()` is a real call edge from module-level code, a `[project.scripts]`
-//! target is a symbol-scoped `ConfigEntryPoint`, and a click command is a
-//! decorator-contract exemption. Each is asserted here beside the dead twin.
+//! **Scope decision.** For Python, JavaScript and TypeScript the file-level
+//! claim is given up for module-level *variables* only. Functions, methods and
+//! classes in a script keep it: narrowing them exposed resolver gaps (dispatch
+//! tables, `getattr`, object-literal members, attribute receivers) that script
+//! files lean on and real repositories showed as live callables reported dead.
+//! The tests named `..._stays_exempt_by_scope_decision` are that decision, not
+//! a claim that the callable is live.
 
 use devmap_analyze::*;
 use devmap_extract::extract_file;
@@ -83,11 +86,21 @@ fn an_uncalled_constant_in_a_guarded_script_is_reported() {
 }
 
 #[test]
-fn an_uncalled_helper_in_a_guarded_script_is_reported() {
+fn an_uncalled_helper_function_in_a_guarded_script_stays_exempt_by_scope_decision() {
+    // Inverted from the first version of this lane, which reported it. A
+    // function in a script keeps the file-level claim (see the module doc).
     let reports = reports(&[("tools/v5.py", SCRIPT), ("tools/helpers.py", HELPERS)]);
     assert!(
-        finding(&reports, "tools/v5.py", "helper_nobody_calls").is_some(),
+        finding(&reports, "tools/v5.py", "helper_nobody_calls").is_none(),
         "{reports:#?}"
+    );
+    let row = reports
+        .iter()
+        .find(|r| r.file_path == "tools/v5.py" && r.symbol_name == "helper_nobody_calls")
+        .expect("an exempt row still names its reason");
+    assert_eq!(
+        row.exemption_reason.as_deref(),
+        Some("Script / binary entry point")
     );
 }
 
@@ -121,7 +134,7 @@ fn a_module_entry_file_reports_its_dead_symbols_but_not_its_entry() {
         "{reports:#?}"
     );
     assert!(
-        finding(&reports, "pkg/__main__.py", "orphan").is_some(),
+        finding(&reports, "pkg/__main__.py", "orphan").is_none(),
         "{reports:#?}"
     );
     assert!(
@@ -147,7 +160,7 @@ fn a_console_script_target_in_a_shebang_script_stays_exempt() {
         "{reports:#?}"
     );
     assert!(
-        finding(&reports, "pkg/cli.py", "stranded").is_some(),
+        finding(&reports, "pkg/cli.py", "stranded").is_none(),
         "{reports:#?}"
     );
     assert!(
@@ -214,27 +227,33 @@ if __name__ == \"__main__\":
             "`{live}` is live: {reports:#?}"
         );
     }
-    for dead in ["UNUSED_LIMIT", "cmd_never"] {
-        assert!(
-            finding(&reports, "tools/run.py", dead).is_some(),
-            "`{dead}` is dead: {reports:#?}"
-        );
-    }
+    assert!(
+        finding(&reports, "tools/run.py", "UNUSED_LIMIT").is_some(),
+        "{reports:#?}"
+    );
+    assert!(
+        finding(&reports, "tools/run.py", "cmd_never").is_none(),
+        "a script function stays exempt by scope decision: {reports:#?}"
+    );
 }
 
-/// The same rule for the other languages whose top-level entry call is an
-/// edge: a bin script's uncalled helper is reported, its `main` is not.
+/// JavaScript and TypeScript bin scripts: functions, arrow-function constants
+/// (extracted as `Function`) and object-literal members stay exempt by scope
+/// decision, while an unread object-literal constant (a `Variable`) is
+/// reported. Plain `const X = 1` is not an extracted symbol in these languages.
 #[test]
-fn javascript_and_typescript_bin_scripts_report_their_dead_helpers() {
+fn javascript_and_typescript_bin_scripts_keep_callables_and_report_unread_variables() {
     for path in ["bin/tool.js", "bin/tool.ts"] {
-        let source = "#!/usr/bin/env node\nfunction helperDead() { return 1; }\nfunction main() { return 2; }\nmain();\n";
+        let source = "#!/usr/bin/env node\nfunction helperDead() { return 1; }\nconst arrowDead = () => 2;\nconst UNREAD = { member() { return 3; } };\nfunction main() { return 2; }\nmain();\n";
         let reports = reports(&[(path, source)]);
+        for exempt in ["helperDead", "arrowDead", "UNREAD.member", "main"] {
+            assert!(
+                finding(&reports, path, exempt).is_none(),
+                "{path}: `{exempt}` stays exempt by scope decision: {reports:#?}"
+            );
+        }
         assert!(
-            finding(&reports, path, "helperDead").is_some(),
-            "{path}: {reports:#?}"
-        );
-        assert!(
-            finding(&reports, path, "main").is_none(),
+            finding(&reports, path, "UNREAD").is_some(),
             "{path}: {reports:#?}"
         );
     }
