@@ -593,6 +593,11 @@ pub(crate) fn run(
     progress
         .display
         .files("extracting", std::sync::Arc::clone(&extraction_progress));
+    // One token for the whole build: Ctrl-C trips it, and the extraction and
+    // its serial budget retry read it. Extraction is the only stage that can
+    // run for minutes uninterrupted; past it `settle` hands SIGINT back to
+    // exiting the process.
+    let interrupt = crate::interrupt::InterruptWatch::install();
     let extractions = progress.timed("extract:files", || {
         if *full {
             let refs: Vec<devmap_extract::FileRef<'_>> = scanned
@@ -603,18 +608,33 @@ pub(crate) fn run(
                     source: source.as_str(),
                 })
                 .collect();
-            Ok(devmap_extract::extract_all_with_progress(
+            let (extractions, report) = devmap_extract::extract_all_with_budgets(
                 &refs,
                 Some(&extraction_progress),
-            ))
+                devmap_extract::ParseBudgets::default(),
+                Some(interrupt.cancel().flag()),
+            );
+            if report.was_cancelled() {
+                return Err(anyhow::Error::new(devmap_extract::BuildCancelled));
+            }
+            Ok(extractions)
         } else {
             devmap_store::extract_scanned_for_generation(
                 &store,
                 &scanned,
                 Some(&extraction_progress),
+                Some(interrupt.cancel().flag()),
             )
         }
     })?;
+    // A cancel that landed after the last file is still a cancel: nothing has
+    // been persisted yet, so stop here rather than write a generation the
+    // operator asked not to wait for. `settle` decides that atomically: a
+    // SIGINT either got in first (it returns false and we stop) or arrives
+    // after and exits the process, so none is acknowledged and then ignored.
+    if !interrupt.settle() {
+        return Err(anyhow::Error::new(devmap_extract::BuildCancelled));
+    }
     let extraction_snapshot = extraction_progress.snapshot();
     // The corpus text is dead the moment extraction has consumed it,
     // but it is bound in this scope and would otherwise stay resident

@@ -239,6 +239,11 @@ pub struct Daemon {
     /// Tripped by [`Daemon::request_shutdown`], and by SIGTERM/SIGINT, to end
     /// [`Daemon::run_loop`] through its orderly-release path.
     shutdown: Arc<tokio::sync::Notify>,
+    /// The flag the blocking drain's extraction reads. Tripped wherever
+    /// `shutdown` is (a `Notify` cannot be polled from a blocking thread), so
+    /// a shutdown mid-retry returns at the next file instead of after the
+    /// serial retry's whole budget.
+    build_cancel: devmap_query::Cancel,
     /// Latched by [`Daemon::run_loop`] the moment its IPC endpoint is live, and
     /// awaited through [`Daemon::wait_until_serving`].
     ///
@@ -429,6 +434,12 @@ pub const DEFAULT_DRAIN_WRITE_BUDGET: u64 = 4 * 1024 * 1024;
 /// more than this far behind a burst of edits.
 const MAX_DRAIN_PAUSE: Duration = Duration::from_secs(120);
 
+/// Whether a drain stopped because the build was cancelled (the daemon is
+/// shutting down) rather than because it failed.
+fn is_cancelled_build(error: &anyhow::Error) -> bool {
+    error.is::<devmap_extract::BuildCancelled>()
+}
+
 /// How long the drain loop waits after a drain that wrote `bytes`, to hold
 /// `budget` bytes per second.
 fn drain_pause(bytes: u64, budget: u64) -> Duration {
@@ -449,6 +460,7 @@ impl Daemon {
             ipc_path,
             max_idle: None,
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            build_cancel: devmap_query::Cancel::new(),
             // `channel`, not `Sender::new`: the workspace declares tokio 1.38
             // as its floor and this half of the API is older than either, so
             // nothing here depends on the lockfile happening to resolve newer.
@@ -509,6 +521,7 @@ impl Daemon {
         // `notify_one` stores a permit if nobody is waiting yet, so a shutdown
         // requested before the loop reaches its select is not lost.
         self.shutdown.notify_one();
+        self.build_cancel.cancel();
     }
 
     /// Resolve once [`Self::run_loop`] has brought this daemon's IPC endpoint
@@ -1424,8 +1437,15 @@ impl Daemon {
             // measure it. This report was discarded as `_report`, which is what
             // made a full re-extraction the *most* confident thing the daemon
             // did and the least entitled to be.
-            let whole_tree =
-                devmap_store::extract_scanned_for_generation(&self.store, &scanned, None)?;
+            // `build_cancel` is the shutdown flag: a retry in flight stops at
+            // its next file and the drain returns `BuildCancelled` with the
+            // claimed paths still queued (nothing acknowledged or persisted).
+            let whole_tree = devmap_store::extract_scanned_for_generation(
+                &self.store,
+                &scanned,
+                None,
+                Some(self.build_cancel.flag()),
+            )?;
             let report = scanned.report;
             // A moved HEAD over current payloads is a scan, never a
             // carry-forward (B5) — and the scan has just measured exactly which
@@ -1944,12 +1964,45 @@ impl Daemon {
                     let written_before = self.written_bytes();
                     let drain_started = std::time::Instant::now();
                     let worker = self.clone();
-                    let drain_result = tokio::task::spawn_blocking(move || {
+                    let mut drain = tokio::task::spawn_blocking(move || {
                         worker.drain_pending_batch()
-                    })
-                    .await
-                    .map_err(|error| anyhow::anyhow!("pending drain task failed: {error}"))
-                    .and_then(|result| result);
+                    });
+                    // The drain is awaited inside this arm, so the shutdown and
+                    // signal arms above cannot run until it returns. Race them
+                    // here: either one trips `build_cancel`, which the blocking
+                    // extraction reads, and the drain is then awaited briefly
+                    // (it stops at its next file) before the loop exits.
+                    let mut stopping = false;
+                    let joined = tokio::select! {
+                        joined = &mut drain => joined,
+                        signal = signals.recv() => {
+                            info!(
+                                "{signal} received during a drain; cancelling it and \
+                                 exiting (pending work stays queued in the store)"
+                            );
+                            stopping = true;
+                            self.build_cancel.cancel();
+                            drain.await
+                        }
+                        _ = self.shutdown.notified() => {
+                            info!(
+                                "shutdown requested during a drain; cancelling it and \
+                                 exiting (pending work stays queued in the store)"
+                            );
+                            stopping = true;
+                            self.build_cancel.cancel();
+                            drain.await
+                        }
+                    };
+                    if stopping {
+                        if let Err(error) = &joined {
+                            warn!("pending drain task failed while stopping: {error}");
+                        }
+                        break LoopExit::ReleaseEndpoint(Ok(()));
+                    }
+                    let drain_result = joined
+                        .map_err(|error| anyhow::anyhow!("pending drain task failed: {error}"))
+                        .and_then(|result| result);
                     // Charge the drain's writes against the budget, whatever it
                     // returned: a generation write that failed and rolled back
                     // still wrote its WAL frames. See
@@ -1984,6 +2037,16 @@ impl Daemon {
                     };
                     next_attempt = tokio::time::Instant::now() + pause;
                     match drain_result {
+                        // The drain read the shutdown flag before this loop's
+                        // own shutdown arm won the select. That is the
+                        // shutdown, not a failed drain: no warning, no backoff.
+                        Err(ref err) if is_cancelled_build(err) => {
+                            info!(
+                                "pending drain cancelled by shutdown; releasing the IPC \
+                                 endpoint and exiting (pending work stays queued in the store)"
+                            );
+                            break LoopExit::ReleaseEndpoint(Ok(()));
+                        }
                         Ok(0) => consecutive_failures = 0,
                         Ok(n) => {
                             consecutive_failures = 0;
@@ -3481,7 +3544,8 @@ mod tests {
         // of the unchanged bytes must not come back from a cache as the refusal.
         let scanned = devmap_extract::scan_tree(root).unwrap();
         let extractions =
-            devmap_store::extract_scanned_for_generation(&daemon.store, &scanned, None).unwrap();
+            devmap_store::extract_scanned_for_generation(&daemon.store, &scanned, None, None)
+                .unwrap();
         let again = extractions
             .iter()
             .find(|extraction| extraction.file_path == "slow.py")
@@ -3561,6 +3625,121 @@ mod tests {
         );
         assert_a_refusal_survives_and_the_next_build_recovers_it(&daemon, &root);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A drain that ended on `BuildCancelled` is the shutdown, never a failure
+    /// to back off from (even when other context wraps the error).
+    #[test]
+    fn a_cancelled_drain_is_classified_as_shutdown_not_failure() {
+        use anyhow::Context;
+        let cancelled = anyhow::Error::new(devmap_extract::BuildCancelled);
+        assert!(is_cancelled_build(&cancelled));
+        let wrapped: anyhow::Result<()> =
+            Err(anyhow::Error::new(devmap_extract::BuildCancelled)).context("drain");
+        assert!(is_cancelled_build(&wrapped.unwrap_err()));
+        assert!(!is_cancelled_build(&anyhow::anyhow!("disk full")));
+    }
+
+    /// A shutdown requested before (or while) a scanning drain extracts must
+    /// stop that drain with `BuildCancelled`: no generation is written, and the
+    /// claimed path is neither acknowledged nor charged an attempt, so the next
+    /// daemon redoes it. `request_shutdown` is the same route SIGTERM takes.
+    #[test]
+    fn a_shutdown_cancels_a_scanning_drain_and_leaves_its_work_queued() {
+        let (root, daemon) = budget_refused_daemon("refusal-cancel");
+        fs::write(root.join("a.py"), "def a():\n    return 99\n").unwrap();
+        daemon
+            .store
+            .enqueue_pending_paths(&[root.join("a.py").display().to_string()])
+            .unwrap();
+        let before = daemon.store.latest_generation_head_sha().unwrap();
+        daemon.request_shutdown();
+        let moved = "b".repeat(40);
+        let error = daemon
+            .drain_pending_batch_with_head(&move |_: &std::path::Path| Ok(moved.clone()))
+            .expect_err("a drain started after a shutdown request must be cancelled");
+        assert!(
+            error.is::<devmap_extract::BuildCancelled>(),
+            "wrong error: {error:#}"
+        );
+        assert_eq!(
+            daemon.store.latest_generation_head_sha().unwrap(),
+            before,
+            "a cancelled drain must not commit a generation"
+        );
+        assert_eq!(
+            daemon.store.get_pending_paths().unwrap().len(),
+            1,
+            "the cancelled drain's work must stay queued"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// ATTACK: shutdown at a random moment against a real `run_loop` whose
+    /// pending path forces the whole-tree (cancellable) drain. Whatever the
+    /// interleaving: the loop must return Ok, release the socket and lock, and
+    /// the queue must be either fully drained or untouched and uncharged.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn attack_shutdown_at_a_random_moment_leaves_the_queue_drained_or_untouched() {
+        let mut state = 0x9E3779B97F4A7C15u64;
+        let (mut drained, mut left_queued) = (0, 0);
+        for round in 0..40 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let delay = Duration::from_micros(state % 60_000);
+            let (root, daemon) = budget_refused_daemon(&format!("atk-shut-{round}"));
+            fs::write(root.join("a.py"), "def a():\n    return 99\n").unwrap();
+            daemon
+                .store
+                .enqueue_pending_paths(&[root.join("a.py").display().to_string()])
+                .unwrap();
+            let queued = daemon.store.get_pending_paths().unwrap();
+            let socket = std::path::PathBuf::from(format!(
+                "/tmp/devmap-atk-{}-{round}.sock",
+                std::process::id()
+            ));
+            let lock = crate::protocol::ipc_lock_path(&socket);
+            let _ = fs::remove_file(&socket);
+            let _ = fs::remove_file(&lock);
+            let daemon = daemon
+                .with_ipc_path(socket.clone())
+                .with_idle_poll(Duration::from_millis(5));
+            if round % 4 == 0 {
+                // Before the loop even starts.
+                daemon.request_shutdown();
+            }
+            let running = daemon.clone();
+            let task = tokio::spawn(async move { running.run_loop().await });
+            if round % 4 != 0 {
+                tokio::time::sleep(delay).await;
+                daemon.request_shutdown();
+            }
+            let outcome = tokio::time::timeout(Duration::from_secs(30), task)
+                .await
+                .unwrap_or_else(|_| panic!("round {round}: run_loop hung after shutdown"))
+                .expect("run_loop must not panic");
+            assert!(outcome.is_ok(), "round {round}: {outcome:?}");
+            assert!(!socket.exists(), "round {round}: socket left behind");
+            assert!(!lock.exists(), "round {round}: lock left behind");
+            let pending = daemon.store.get_pending_paths().unwrap();
+            if pending.is_empty() {
+                drained += 1;
+            } else {
+                left_queued += 1;
+                let _ = &queued;
+                for path in &pending {
+                    assert_eq!(
+                        daemon.store.pending_attempts(path).unwrap(),
+                        Some(0),
+                        "round {round}: a shutdown charged {path} an attempt"
+                    );
+                }
+            }
+            let _ = fs::remove_dir_all(&root);
+        }
+        eprintln!("drained={drained} left_queued={left_queued}");
     }
 
     /// A checkout that lands *during* a drain must not be able to stamp itself
