@@ -1,0 +1,2 @@
+CONST_DEAD = 1
+CONST_READ = 2

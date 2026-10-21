@@ -13,8 +13,8 @@
   },
   "python": {
     "forbid_any_tier_rows": 30,
-    "known_failing": 4,
-    "positive_rows": 78,
+    "known_failing": 5,
+    "positive_rows": 79,
     "present": 74
   },
   "rust": {

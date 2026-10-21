@@ -129,3 +129,4 @@ py.R3.not	R3	relroot_beyond.py	relroot_util.py	forbid_any_tier	must		from ... cl
 py.R4.not	R4	rzpkg/a.py::rz_missing_run	src/rzpkg/util.py::rz_f	forbid_any_tier	must		rzpkg/util.py is absent: a missing sibling does not fall through into src/rzpkg/util.py
 py.R4b.not	R4	rzpkg/a.py::rz_missing_run	rzpkg/rzpkg/util.py::rz_g	forbid_any_tier	must		nor into the doubled rzpkg/rzpkg/util.py
 py.R4c.not	R4	rzpkg/a.py	src/rzpkg/util.py	forbid_any_tier	must		no Imports edge into the src/ namesake either
+py.AR1	alias-attribute-read	aliasread/use.py::check	aliasread/m.py::CONST_READ	edge	must		a module constant read as `alias.NAME` through a function-local `from . import m as alias` is a use of NAME (a module-level `import m as alias` already binds)
