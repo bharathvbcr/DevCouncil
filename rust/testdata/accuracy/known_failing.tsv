@@ -6,8 +6,6 @@
 # a passing row is not listed. Fixing a row means deleting its line (DEVMAP_ACCURACY_BLESS=1
 # does it); adding a line needs an owning card and a reason.
 kotlin-gaps	kg.G1	false_edge	ft-0e6cc90f	needs resolver.rs (held by S5) | today: forbidden HIGH edge to gaps/util/Strings.kt::getString
-kotlin-gaps	kg.OV1	false_edge	ft-0720fe1d	needs resolver.rs (held by S5 worktree) | two overloads share one symbol id Calc.add, so add(String) -> add(Int) is emitted as a SameFile Calc.add -> Calc.add self-edge
-kotlin-gaps	kg.OV2	miss	ft-0720fe1d	needs resolver.rs (held by S5 worktree) | no c.add(..) call edge from useCalc today (cause inferred: two same-name candidates; unverified)
 kotlin-gaps	kg.Z1	miss	ft-0720fe1d	recall characterization: local initialised by a stdlib String method; stdlib return types are not modelled; needs resolver.rs/treesitter.rs (S5 held) | today: absent, recorded as an honest unresolved row
 kotlin-gaps	kg.Z2	miss	ft-0720fe1d	recall characterization: lambda parameter typed by the callee's function-type parameter; needs treesitter.rs binding | today: absent, recorded as an honest unresolved row
 kotlin-gaps	kg.Z3	miss	ft-0720fe1d	recall characterization: if-expression local with a generic List receiver (admissible_nominal_type refuses generics, resolver.rs:2116) | today: absent, recorded as an honest unresolved row

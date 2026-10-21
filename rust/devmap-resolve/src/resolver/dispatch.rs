@@ -600,16 +600,19 @@ impl Resolver {
         // an `Rng` and only the one this file can see is the receiver's type;
         // a lone hit that this file cannot see is no answer at all.
         if ext.language == "swift" {
-            let mut visible = hits
+            let visible: Vec<&(String, String)> = hits
                 .iter()
-                .filter(|hit| self.swift_member_hit_is_visible_from(&ext.file_path, hit, class_type));
-            return match (visible.next(), visible.next()) {
-                (Some(only), None) => Some(only),
-                _ => None,
-            };
+                .filter(|hit| self.swift_member_hit_is_visible_from(&ext.file_path, hit, class_type))
+                .collect();
+            return visible
+                .first()
+                .copied()
+                .filter(|first| visible.iter().all(|hit| hit == first));
         }
-        if let [only] = hits {
-            return Some(only);
+        // Overloads of one method are several hits that name one identity
+        // (`add(Int)` / `add(String)` both mint `Calc.add`): one target.
+        if let Some(first) = hits.first().filter(|first| hits.iter().all(|hit| hit == *first)) {
+            return Some(first);
         }
         let scope = binding.and_then(|b| b.scope.as_deref()).or(scope);
         if ext.language != "go" || !Self::go_receiver_spelled_bare(ext, scope, receiver, class_type)

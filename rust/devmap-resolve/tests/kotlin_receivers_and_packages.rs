@@ -56,10 +56,10 @@ fn has(result: &ResolutionResult, from: &str, to: &str) -> bool {
 ///
 /// Both declarations are extracted, but they share the id `Overloads.kt::Calc.add`,
 /// so the call from `add(String)` to `add(Int)` is stored as `Calc.add -> Calc.add`,
-/// a self-edge. Identity-by-overload needs the resolver (`resolver.rs`), so this
-/// is ignored until ft-0720fe1d lands there; run it with `--ignored`.
+/// a self-edge. The resolver half now holds (see `overload_self_edges`); what stays
+/// open is distinct ids per overload, which the extractor mints (extract-v98).
 #[test]
-#[ignore = "ft-0720fe1d: overloads share one symbol id; needs resolver.rs"]
+#[ignore = "blocked on extract-v98: distinct ids per overload need extractor-minted ids (ft-eda9b3a6); the resolver half (no self-edge, receiver call binds) is pinned by overload_self_edges"]
 fn overloads_keep_distinct_identities_and_never_self_edge() {
     let source = "package gaps\n\nclass Calc {\n    fun add(a: Int): Int = a\n\n    fun add(a: String): Int = add(a.length)\n}\n\nfun useCalc(c: Calc): Int = c.add(1) + c.add(\"two\")\n";
     let extraction = extract_file("gaps/Overloads.kt", source);

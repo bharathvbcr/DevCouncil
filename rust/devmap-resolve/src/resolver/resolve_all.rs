@@ -1582,6 +1582,29 @@ impl Resolver {
                         .caller_symbol
                         .clone()
                         .unwrap_or_else(|| ext.file_path.clone());
+                    // Overloads share one id, so a call out of one overload to
+                    // its sibling (`fun add(a: String) = add(a.length)`) binds
+                    // to the caller's own identity. Real recursion binds there
+                    // too, and nothing recorded about the call (no arity)
+                    // separates the two: abstain, with the reason, rather than
+                    // assert a self-edge a sibling call would make false.
+                    if let Some(Resolution::SameFile { target_symbol, target_file }
+                    | Resolution::ReceiverType { target_symbol, target_file, .. }) = resolution.as_deref()
+                    {
+                        if *target_symbol == caller_sym
+                            && *target_file == ext.file_path
+                            && self
+                                .shared_identities
+                                .contains(&(ext.file_path.clone(), caller_sym.clone()))
+                        {
+                            resolution = Some(Arc::new(Resolution::Unresolved {
+                                reason: format!(
+                                    "{caller_sym} is declared more than once in {} (overloads share one id), so a call to {:?} from inside it cannot be told apart from a call to a sibling overload",
+                                    ext.file_path, call.callee_name
+                                ),
+                            }));
+                        }
+                    }
                     // Emission is driven entirely by the resolution, and
                     // anything that emits no edge falls through to the ledger —
                     // so a rung that ever produced evidence naming no target

@@ -554,6 +554,12 @@ pub struct Resolver {
     /// identities, not bare words: emitting `open` instead of `app.py::open`
     /// makes an edge unjoinable to the node it names.
     qualified_names: BTreeMap<(String, String), Option<Arc<str>>>,
+    /// `(file, qualified name)` identities that more than one declaration in the
+    /// file carries: Kotlin, Java and Swift overloads (`add(Int)` / `add(String)`),
+    /// whose ids the extractor mints from the name alone. A call from inside one
+    /// declaration of such an identity to the same identity cannot be told from
+    /// a call to its sibling overload without the call's arity.
+    shared_identities: BTreeSet<(String, String)>,
     /// `(file, qualified name)` → the symbol that declares it, with the file
     /// path standing for "declared at file level".
     ///
@@ -776,6 +782,7 @@ impl Resolver {
             external_module_roots: BTreeMap::new(),
             local_module_roots: BTreeMap::new(),
             qualified_names: BTreeMap::new(),
+            shared_identities: BTreeSet::new(),
             symbol_parents: BTreeMap::new(),
             scope_children: BTreeMap::new(),
             go_modules: Vec::new(),

@@ -48,6 +48,7 @@ impl Resolver {
         self.external_module_roots.clear();
         self.local_module_roots.clear();
         self.qualified_names.clear();
+        self.shared_identities.clear();
         self.symbol_parents.clear();
         self.scope_children.clear();
         self.go_package_by_file.clear();
@@ -116,6 +117,7 @@ impl Resolver {
         for ext in extractions {
             let family = LangFamily::from_lang(&ext.language);
             let mut file_syms = Vec::new();
+            let mut file_identities: BTreeSet<&str> = BTreeSet::new();
             for sym in &ext.symbols {
                 if family == LangFamily::Rust {
                     if let Some(signature) = &sym.signature {
@@ -133,6 +135,10 @@ impl Resolver {
                         .insert((ext.file_path.clone(), sym.qualified_name.clone()));
                 }
                 let identity: Arc<str> = Arc::from(sym.qualified_name.as_str());
+                if !file_identities.insert(sym.qualified_name.as_str()) {
+                    self.shared_identities
+                        .insert((ext.file_path.clone(), sym.qualified_name.clone()));
+                }
                 self.symbol_index
                     .entry(sym.name.clone())
                     .or_default()
