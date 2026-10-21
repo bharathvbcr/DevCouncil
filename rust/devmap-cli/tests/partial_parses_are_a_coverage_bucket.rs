@@ -162,3 +162,89 @@ fn a_kotlin_mis_parse_is_listed_with_its_byte_range() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The `start..end` byte ranges a `partial_parse` reason names.
+fn lost_ranges(reason: &str) -> Vec<(usize, usize)> {
+    let listed = reason.split("byte(s) lost: ").nth(1).unwrap_or("");
+    listed
+        .split(", ")
+        .filter_map(|part| {
+            let (start, end) = part.split_once("..")?;
+            Some((start.parse().ok()?, end.parse().ok()?))
+        })
+        .collect()
+}
+
+fn covers(ranges: &[(usize, usize)], offset: usize) -> bool {
+    ranges
+        .iter()
+        .any(|(start, end)| *start <= offset && offset < *end)
+}
+
+/// ft-5ad86836 AC3. The grammar rejects a one-line `class C { companion object
+/// { .. } }` (an `ERROR` node, not a clean tree), so `C`, its companion function
+/// and the top-level function after it are not extracted. The file must be
+/// listed in `coverage_gaps.partial_parse` with a range that covers every one
+/// of them — the loss is reported even though the declaration is not recovered.
+#[test]
+fn a_one_line_companion_object_loss_is_listed_with_a_range_covering_it() {
+    let root = scratch("companion");
+    let source = "package a\n\nclass C { companion object { fun f() = 1 } }\nfun top() = 2\n";
+    std::fs::write(root.join("Comp.kt"), source).unwrap();
+    std::fs::write(root.join("Clean.kt"), "package a\n\nfun tidy() = 3\n").unwrap();
+    let _ = json(&root, &["--json", "build", "."]);
+    let status = json(&root, &["--json", "status"]);
+    let rows = partial_rows(&status);
+    let (_, reason) = rows
+        .iter()
+        .find(|(path, _)| path == "Comp.kt")
+        .unwrap_or_else(|| panic!("the one-line companion mis-parse is listed: {rows:?}"));
+    let ranges = lost_ranges(reason);
+    for lost in ["class C", "fun f()", "fun top()"] {
+        let offset = source.find(lost).unwrap();
+        assert!(
+            covers(&ranges, offset),
+            "`{lost}` (byte {offset}) is not inside a listed lost range {ranges:?}: {reason}"
+        );
+    }
+    assert!(
+        rows.iter().all(|(path, _)| path != "Clean.kt"),
+        "a clean file is not listed: {rows:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// ft-5ad86836 AC4 (ChronosTheme.kt:136 shape). An extension function on a
+/// library type in a file that also holds an `ERROR` region is either emitted,
+/// or the file is reported partial with a range that covers it. It is never
+/// silently absent from a file that looks clean.
+#[test]
+fn an_extension_function_beside_a_kotlin_error_region_is_emitted_or_covered() {
+    let root = scratch("extension");
+    let source = "package a\n\nclass C { companion object { fun f() = 1 } }\n\
+                  fun ColorScheme.withChronosReadableContentColors(): ColorScheme = copy()\n";
+    std::fs::write(root.join("Theme.kt"), source).unwrap();
+    let _ = json(&root, &["--json", "build", "."]);
+    let found = json(
+        &root,
+        &["--json", "search", "withChronosReadableContentColors"],
+    );
+    if found
+        .to_string()
+        .contains("withChronosReadableContentColors")
+    {
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
+    let status = json(&root, &["--json", "status"]);
+    let rows = partial_rows(&status);
+    let (_, reason) = rows.iter().find(|(path, _)| path == "Theme.kt").unwrap_or_else(|| {
+        panic!("the extension function is absent from a file not listed as partial: {rows:?} / {found}")
+    });
+    let offset = source.find("fun ColorScheme.").unwrap();
+    assert!(
+        covers(&lost_ranges(reason), offset),
+        "the extension function (byte {offset}) is absent and not inside a listed range: {reason}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -594,6 +594,131 @@ fn kotlin_entry_points_are_read_from_annotations_and_modifiers() {
     assert_eq!(exemption(&extraction, "E.kt::ordinary"), None);
 }
 
+// ------------------------------------------- ft-5ad86836: Kotlin declaration loss
+
+/// Qualified names of every non-file symbol in `source`.
+fn kt_names(path: &str, source: &str) -> Vec<String> {
+    qualified_names(&extract_file(path, source))
+}
+
+fn assert_emitted(names: &[String], want: &[&str], shape: &str) {
+    for expected in want {
+        assert!(
+            names.iter().any(|name| name == expected),
+            "{shape}: `{expected}` was dropped; emitted {names:?}"
+        );
+    }
+}
+
+/// AC1 (audit F7, LiquidBackdrop.kt:884 shape). A property initializer, two
+/// stacked annotations on their own lines, then a private function.
+#[test]
+#[ignore = "ft-5ad86836: stacked annotations + visibility modifier + block-bodied fun drops the fun (parsed as annotated_expression, Clean); extractor fix needs extract-v98 (schema frozen at 97)"]
+fn kotlin_stacked_annotations_after_a_property_initializer_keep_the_function() {
+    let shape = "val X = 1; @Preview; @Composable; private fun f()";
+    let names = kt_names(
+        "A.kt",
+        "private val X = 1\n@Preview\n@Composable\nprivate fun f() {}\nfun after() {}\n",
+    );
+    assert_emitted(&names, &["A.kt::f", "A.kt::after"], shape);
+}
+
+#[test]
+#[ignore = "ft-5ad86836: stacked annotations + visibility modifier + block-bodied fun drops the fun (parsed as annotated_expression, Clean); extractor fix needs extract-v98 (schema frozen at 97)"]
+fn kotlin_stacked_annotations_after_a_multiline_initializer_keep_the_function() {
+    let shape = "multi-line lambda initializer; stacked annotations; private fun f()";
+    let names = kt_names(
+        "B.kt",
+        "private val X = listOf(1, 2).map {\n    it + 1\n}\n@Preview\n@Composable\nprivate fun f() {}\nfun after() {}\n",
+    );
+    assert_emitted(&names, &["B.kt::f", "B.kt::after"], shape);
+}
+
+#[test]
+#[ignore = "ft-5ad86836: stacked annotations + visibility modifier + block-bodied fun drops the fun (parsed as annotated_expression, Clean); extractor fix needs extract-v98 (schema frozen at 97)"]
+fn kotlin_annotations_with_arguments_after_a_property_initializer_keep_the_function() {
+    let shape = "val X = 1; @Preview(showBackground = true); @Composable; private fun f()";
+    let names = kt_names(
+        "C.kt",
+        "private val X = 1\n@Preview(showBackground = true)\n@Composable\nprivate fun f() {}\nfun after() {}\n",
+    );
+    assert_emitted(&names, &["C.kt::f", "C.kt::after"], shape);
+}
+
+#[test]
+#[ignore = "ft-5ad86836: stacked annotations + visibility modifier + block-bodied fun drops the fun (parsed as annotated_expression, Clean); extractor fix needs extract-v98 (schema frozen at 97)"]
+fn kotlin_stacked_annotations_after_a_blank_line_keep_the_function() {
+    let shape = "val X = 1; blank line; @Preview; @Composable; private fun f()";
+    let names = kt_names(
+        "D.kt",
+        "private val X = 1\n\n@Preview\n@Composable\nprivate fun f() {}\nfun after() {}\n",
+    );
+    assert_emitted(&names, &["D.kt::f", "D.kt::after"], shape);
+}
+
+/// The boundary of the AC1 loss, pinned so the ignored tests name the trigger
+/// exactly: it needs two annotations, a modifier and a block body. Removing
+/// any one of the three keeps `f`.
+#[test]
+fn kotlin_annotation_stacks_that_still_parse_as_declarations_keep_the_function() {
+    for (path, source) in [
+        (
+            "G1.kt",
+            "private val X = 1\n@Preview\nprivate fun f() {}\nfun after() {}\n",
+        ),
+        (
+            "G2.kt",
+            "private val X = 1\n@Preview\n@Composable\nfun f() {}\nfun after() {}\n",
+        ),
+        (
+            "G3.kt",
+            "private val X = 1\n@Preview\n@Composable\nprivate fun f(): Int = 1\nfun after() {}\n",
+        ),
+    ] {
+        let names = kt_names(path, source);
+        assert_emitted(
+            &names,
+            &[&format!("{path}::f"), &format!("{path}::after")],
+            path,
+        );
+    }
+}
+
+/// AC2. A one-line companion object: its members belong to the host class
+/// (`langdecl/kotlin.rs` skips the companion node), so `C.f`, not `C.Companion.f`.
+#[test]
+#[ignore = "ft-5ad86836: one-line `class C { companion object { .. } }` drops C, C.f and following top-level funs (ERROR node, Partial); extractor fix needs extract-v98 (schema frozen at 97)"]
+fn kotlin_one_line_companion_object_keeps_the_class_and_later_functions() {
+    let shape = "class C { companion object { fun f() = 1 } } on one line";
+    let names = kt_names(
+        "K.kt",
+        "class C { companion object { fun f() = 1 } }\nfun top() {}\nfun top2() = 2\n",
+    );
+    assert_emitted(
+        &names,
+        &["K.kt::C", "K.kt::C.f", "K.kt::top", "K.kt::top2"],
+        shape,
+    );
+}
+
+#[test]
+#[ignore = "ft-5ad86836: one-line `class C { companion object Factory { .. } }` drops C, C.f and following top-level funs (ERROR node, Partial); extractor fix needs extract-v98 (schema frozen at 97)"]
+fn kotlin_one_line_named_companion_keeps_the_class_and_later_functions() {
+    let shape = "class C { companion object Factory { fun f() = 1 } } on one line";
+    let names = kt_names(
+        "N.kt",
+        "class C { companion object Factory { fun f() = 1 } }\nfun top() {}\n",
+    );
+    assert_emitted(&names, &["N.kt::C", "N.kt::C.f", "N.kt::top"], shape);
+}
+
+#[test]
+fn kotlin_one_line_object_keeps_the_object_and_later_functions() {
+    let shape = "object O { fun g() = 2 } on one line";
+    let names = kt_names("O.kt", "object O { fun g() = 2 }\nfun top() {}\n");
+    assert_emitted(&names, &["O.kt::O", "O.kt::O.g", "O.kt::top"], shape);
+}
+
 // -------------------------------------------------------------------- Dart
 
 const DART: &str = r#"int helper(int a) => a + 1;
