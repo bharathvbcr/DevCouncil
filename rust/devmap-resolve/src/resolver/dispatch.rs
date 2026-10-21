@@ -614,7 +614,24 @@ impl Resolver {
         // A single-name import of the type from outside the index (`import
         // ext.Repo`) says the bare name means that type here, whatever indexed
         // class shares the spelling.
+        //
+        // Only where an indexed class of that spelling exists to be mistaken:
+        // an extension declared on the external type itself (`fun Modifier.x()`
+        // beside `import androidx.compose.ui.Modifier`) is the import's very
+        // reason to apply.
         if matches!(ext.language.as_str(), "kotlin" | "java" | "scala")
+            && self.symbol_index.get(class_type).is_some_and(|declared| {
+                declared.iter().any(|(_, kind, family, _)| {
+                    LangFamily::from_lang(&ext.language).admits(*family)
+                        && matches!(
+                            kind,
+                            SymbolKind::Class
+                                | SymbolKind::Struct
+                                | SymbolKind::Interface
+                                | SymbolKind::Enum
+                        )
+                })
+            })
             && (self
                 .external_imports
                 .get(&ext.file_path)

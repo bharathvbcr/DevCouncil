@@ -400,7 +400,6 @@ impl Resolver {
         None
     }
 
-    /// Whether a JVM import specifier (`a.b.Repo`, `a.b.*`) names a package the
     /// file `candidate` declares: the specifier minus its last segment, or minus
     /// `.*`, must equal the file's `package` clause.
     fn jvm_import_names_package_of(&self, spec: &str, candidate: &str) -> bool {
@@ -408,8 +407,19 @@ impl Resolver {
             Some(package) => package,
             None => spec.rsplit_once('.').map_or("", |(package, _)| package),
         };
-        self.jvm_package_by_file
+        if self
+            .jvm_package_by_file
             .get(candidate)
             .is_some_and(|declared| declared == package)
+        {
+            return true;
+        }
+        // The specifier names a package some indexed file declares, just not
+        // this file's (a typealias or re-export written in that package): the
+        // unique basename stays the guess it always was. A package nothing in
+        // the corpus declares is a library's, and the stem proves nothing.
+        self.jvm_package_by_file
+            .values()
+            .any(|declared| declared == package)
     }
 }

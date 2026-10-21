@@ -1221,8 +1221,12 @@ impl Resolver {
             // name the file imports from outside the index — or from a path
             // that names no indexed file — is not the star's declaration.
             if matches!(ext.language.as_str(), "kotlin" | "java" | "scala") {
+                // A name this file also imports explicitly into the index is
+                // kept: a same-spelled external import may be a property or a
+                // function (`icons.filled.Person` beside the class `Person`).
                 file_bindings.retain(|name, _| {
-                    !file_external.contains_key(name) && !file_local_gap.contains_key(name)
+                    module_imported.contains(name)
+                        || (!file_external.contains_key(name) && !file_local_gap.contains_key(name))
                 });
             }
             for (scope, names) in file_scoped {

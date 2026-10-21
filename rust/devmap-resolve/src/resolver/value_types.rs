@@ -612,9 +612,9 @@ impl Resolver {
                 kind,
                 SymbolKind::Class | SymbolKind::Struct | SymbolKind::Interface | SymbolKind::Enum
             )
-            && [callee_file, file]
-                .iter()
-                .all(|site| self.kotlin_site_names_declaration(site, constructor, declaring_file))
+            // Only the callee's file writes the type; the call site just
+            // receives a value of it.
+            && self.kotlin_site_names_declaration(callee_file, constructor, declaring_file)
     }
 
     /// Whether `site` reads the bare type name `name` as the declaration in
@@ -627,8 +627,18 @@ impl Resolver {
         name: &str,
         declaring_file: &str,
     ) -> bool {
-        // A single-name import of the name from outside the index binds it
-        // there, and beats a star import in either order.
+        // The import table already holds only what this file's imports bind: a
+        // single-name import from outside the index has removed a star import's
+        // binding of the same name (see `index_extractions`).
+        if let Some((target, _)) = self
+            .import_bindings
+            .get(site)
+            .and_then(|bindings| bindings.get(name))
+        {
+            return target == declaring_file;
+        }
+        // No binding, but an import from outside the index names it: it means
+        // that type here.
         if self
             .external_imports
             .get(site)
@@ -639,13 +649,6 @@ impl Resolver {
                 .is_some_and(|imports| imports.contains_key(name))
         {
             return false;
-        }
-        if let Some((target, _)) = self
-            .import_bindings
-            .get(site)
-            .and_then(|bindings| bindings.get(name))
-        {
-            return target == declaring_file;
         }
         if site == declaring_file {
             return true;
