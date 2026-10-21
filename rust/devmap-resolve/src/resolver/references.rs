@@ -288,9 +288,16 @@ impl Resolver {
                 },
             ));
         }
-        if ext
-            .local_binding_at(reference.span.start_byte, receiver)
-            .is_some()
+        // A function's own `from . import m as cr` is also an untyped local
+        // binding of `cr` there, so the refusal below would stop a read of
+        // `cr.CONST` that the scope's import answers.
+        let scoped_alias = (family == LangFamily::Python)
+            .then(|| self.python_scoped_module_alias(ext, reference, receiver))
+            .flatten();
+        if scoped_alias.is_none()
+            && ext
+                .local_binding_at(reference.span.start_byte, receiver)
+                .is_some()
         {
             return None;
         }
@@ -298,7 +305,10 @@ impl Resolver {
         if !self.module_member_admitted(&ext.file_path, receiver, name) {
             return None;
         }
-        let (module_file, _) = self.import_bindings.get(&ext.file_path)?.get(receiver)?;
+        let (module_file, _) = match scoped_alias {
+            Some(bound) => bound,
+            None => self.import_bindings.get(&ext.file_path)?.get(receiver)?,
+        };
         let (resolved_file, resolved_symbol) = self.lookup_in_package(module_file, name)?;
         Some(self.reference_edge(
             ext,

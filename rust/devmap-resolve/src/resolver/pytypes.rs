@@ -1271,6 +1271,62 @@ impl Resolver {
         Some(ScopeHit::Local)
     }
 
+    /// The module a *function-local* import binds `receiver` to at a member
+    /// read in that function: `from . import m as cr` inside `def check()`,
+    /// then `cr.CONST`.
+    ///
+    /// The import also records `cr` as an untyped local of the function, which
+    /// is why the reference ladder used to refuse the read. The import is the
+    /// local's value only when nothing else could be: it abstains when the
+    /// scope binds `cr` any other way (a typed or initialised binding, a
+    /// reference assigned to it), when the module binds the same name (a symbol
+    /// or an import of a different target), and when the target module defines
+    /// `__getattr__`, whose attributes are not the ones it declares.
+    pub(super) fn python_scoped_module_alias(
+        &self,
+        ext: &Extraction,
+        reference: &ExtractedReference,
+        receiver: &str,
+    ) -> Option<&(String, String)> {
+        let file = ext.file_path.as_str();
+        let scope = reference
+            .enclosing_symbol
+            .as_deref()
+            .filter(|scope| *scope != file)?;
+        if !Self::is_plain_ident(receiver) {
+            return None;
+        }
+        let Some(ScopeHit::Import(Some(bound))) = self.python_scope_lookup(file, scope, receiver, 0)
+        else {
+            return None;
+        };
+        let rebound = ext.local_bindings.iter().any(|binding| {
+            binding.name == receiver
+                && binding.scope.as_deref() == Some(scope)
+                && (binding.declared_type.is_some() || binding.initializer.is_some())
+        }) || ext.references.iter().any(|other| {
+            other.assigned_to.as_deref() == Some(receiver)
+                && other.enclosing_symbol.as_deref() == Some(scope)
+        });
+        // The flat import table also holds the first function-local import of a
+        // name, so the module's own import is read from the import statements:
+        // one written outside every function and class.
+        let module_imports_it = ext.imports.iter().any(|import| {
+            import.local_names.iter().any(|local| local == receiver)
+                && !ext.symbols.iter().any(|symbol| {
+                    symbol.kind != SymbolKind::File
+                        && symbol.span.start_byte <= import.span.start_byte
+                        && import.span.end_byte <= symbol.span.end_byte
+                })
+        });
+        let module_binds_it = module_imports_it
+            || self
+                .qualified_names
+                .contains_key(&(file.to_string(), receiver.to_string()));
+        let dynamic_module = self.lookup_in_package(&bound.0, "__getattr__").is_some();
+        (!rebound && !module_binds_it && !dynamic_module).then_some(bound)
+    }
+
     /// The `(target file, declared name)` an import binds `name` to where it is
     /// read in `scope` of `file`.
     ///
