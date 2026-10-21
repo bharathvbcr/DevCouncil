@@ -248,3 +248,98 @@ fn the_build_progress_snapshot_reports_the_retry() {
         (2, 2, 2, 0)
     );
 }
+
+type FirstPass = (Vec<String>, Vec<devmap_extract::Extraction>);
+
+fn first_pass_refused(count: usize) -> FirstPass {
+    let paths: Vec<String> = (0..count).map(|i| format!("f{i}.py")).collect();
+    let out = paths
+        .iter()
+        .map(|path| extract_file_with_budget(path, PY, Duration::ZERO))
+        .collect();
+    (paths, out)
+}
+
+#[test]
+fn a_cancel_mid_retry_stops_at_the_next_file_and_reports_the_rest_as_cancelled() {
+    use devmap_extract::retry_budget_refusals_observing;
+    let (paths, mut out) = first_pass_refused(5);
+    let files: Vec<FileRef<'_>> = paths.iter().map(|p| file(p, PY)).collect();
+    let cancel = AtomicBool::new(false);
+    let mut retried_calls = 0;
+    let started = std::time::Instant::now();
+    let report = retry_budget_refusals_observing(
+        &files,
+        &mut out,
+        None,
+        SMALL_FIRST,
+        Some(&cancel),
+        &mut |_| {
+            retried_calls += 1;
+            if retried_calls == 2 {
+                // Twice on purpose: a repeated cancel is harmless.
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        },
+    );
+    assert!(started.elapsed() < Duration::from_secs(30));
+    assert_eq!(retried_calls, 2, "no file is re-run after the cancel");
+    assert_eq!(report.first_pass_refused, 5);
+    assert_eq!(report.retried, 2);
+    assert_eq!(report.recovered, 2);
+    assert_eq!(report.cancelled, 3, "{report:?}");
+    assert_eq!(report.not_retried, 3);
+    assert!(report.was_cancelled());
+    assert_eq!(report.still_refused, vec!["f2.py", "f3.py", "f4.py"]);
+    for cancelled in &out[2..] {
+        let reason = reason(cancelled);
+        assert!(reason.contains("cancelled"), "{reason}");
+    }
+    assert!(!out[0].is_budget_refusal() && !out[1].is_budget_refusal());
+}
+
+#[test]
+fn a_cancel_before_the_first_retried_file_cancels_all_of_them() {
+    let (paths, mut out) = first_pass_refused(3);
+    let files: Vec<FileRef<'_>> = paths.iter().map(|p| file(p, PY)).collect();
+    let cancel = AtomicBool::new(true);
+    let report = retry_budget_refusals(&files, &mut out, None, SMALL_FIRST, Some(&cancel));
+    assert_eq!((report.retried, report.cancelled), (0, 3), "{report:?}");
+}
+
+#[test]
+fn a_cancel_after_the_last_retried_file_is_not_a_cancellation() {
+    use devmap_extract::retry_budget_refusals_observing;
+    let (paths, mut out) = first_pass_refused(3);
+    let files: Vec<FileRef<'_>> = paths.iter().map(|p| file(p, PY)).collect();
+    let cancel = AtomicBool::new(false);
+    let mut calls = 0;
+    let report = retry_budget_refusals_observing(
+        &files,
+        &mut out,
+        None,
+        SMALL_FIRST,
+        Some(&cancel),
+        &mut |_| {
+            calls += 1;
+            if calls == 3 {
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        },
+    );
+    assert!(!report.was_cancelled(), "{report:?}");
+    assert_eq!((report.retried, report.recovered), (3, 3));
+    assert!(out.iter().all(|e| !e.is_parse_failure()));
+}
+
+#[test]
+fn the_retry_cap_is_not_counted_as_a_cancellation() {
+    let count = devmap_extract::treesitter::MAX_BUDGET_RETRIES + 2;
+    let (paths, mut out) = first_pass_refused(count);
+    let files: Vec<FileRef<'_>> = paths.iter().map(|p| file(p, PY)).collect();
+    let report = retry_budget_refusals(&files, &mut out, None, BOTH_TOO_SMALL, None);
+    assert_eq!(report.not_retried, 2, "{report:?}");
+    assert_eq!(report.cancelled, 0);
+    assert!(!report.was_cancelled());
+}

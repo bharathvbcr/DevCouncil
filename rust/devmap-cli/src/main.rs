@@ -99,6 +99,7 @@ mod digest_cache;
 mod hook;
 mod installation;
 mod integrate;
+mod interrupt;
 mod output;
 mod presentation;
 mod progress;
@@ -399,7 +400,12 @@ async fn main() -> std::process::ExitCode {
                     }
                 }
             }
-            std::process::ExitCode::FAILURE
+            // A build the operator interrupted ends as SIGINT would have.
+            if error.is::<devmap_extract::BuildCancelled>() {
+                std::process::ExitCode::from(interrupt::EXIT_SIGINT)
+            } else {
+                std::process::ExitCode::FAILURE
+            }
         }
     }
 }

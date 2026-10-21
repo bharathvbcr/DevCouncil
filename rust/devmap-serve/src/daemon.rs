@@ -239,6 +239,11 @@ pub struct Daemon {
     /// Tripped by [`Daemon::request_shutdown`], and by SIGTERM/SIGINT, to end
     /// [`Daemon::run_loop`] through its orderly-release path.
     shutdown: Arc<tokio::sync::Notify>,
+    /// The flag the blocking drain's extraction reads. Tripped wherever
+    /// `shutdown` is (a `Notify` cannot be polled from a blocking thread), so
+    /// a shutdown mid-retry returns at the next file instead of after the
+    /// serial retry's whole budget.
+    build_cancel: devmap_query::Cancel,
     /// Latched by [`Daemon::run_loop`] the moment its IPC endpoint is live, and
     /// awaited through [`Daemon::wait_until_serving`].
     ///
@@ -449,6 +454,7 @@ impl Daemon {
             ipc_path,
             max_idle: None,
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            build_cancel: devmap_query::Cancel::new(),
             // `channel`, not `Sender::new`: the workspace declares tokio 1.38
             // as its floor and this half of the API is older than either, so
             // nothing here depends on the lockfile happening to resolve newer.
@@ -509,6 +515,7 @@ impl Daemon {
         // `notify_one` stores a permit if nobody is waiting yet, so a shutdown
         // requested before the loop reaches its select is not lost.
         self.shutdown.notify_one();
+        self.build_cancel.cancel();
     }
 
     /// Resolve once [`Self::run_loop`] has brought this daemon's IPC endpoint
@@ -1424,8 +1431,15 @@ impl Daemon {
             // measure it. This report was discarded as `_report`, which is what
             // made a full re-extraction the *most* confident thing the daemon
             // did and the least entitled to be.
-            let whole_tree =
-                devmap_store::extract_scanned_for_generation(&self.store, &scanned, None)?;
+            // `build_cancel` is the shutdown flag: a retry in flight stops at
+            // its next file and the drain returns `BuildCancelled` with the
+            // claimed paths still queued (nothing acknowledged or persisted).
+            let whole_tree = devmap_store::extract_scanned_for_generation(
+                &self.store,
+                &scanned,
+                None,
+                Some(self.build_cancel.flag()),
+            )?;
             let report = scanned.report;
             // A moved HEAD over current payloads is a scan, never a
             // carry-forward (B5) — and the scan has just measured exactly which
@@ -1944,12 +1958,45 @@ impl Daemon {
                     let written_before = self.written_bytes();
                     let drain_started = std::time::Instant::now();
                     let worker = self.clone();
-                    let drain_result = tokio::task::spawn_blocking(move || {
+                    let mut drain = tokio::task::spawn_blocking(move || {
                         worker.drain_pending_batch()
-                    })
-                    .await
-                    .map_err(|error| anyhow::anyhow!("pending drain task failed: {error}"))
-                    .and_then(|result| result);
+                    });
+                    // The drain is awaited inside this arm, so the shutdown and
+                    // signal arms above cannot run until it returns. Race them
+                    // here: either one trips `build_cancel`, which the blocking
+                    // extraction reads, and the drain is then awaited briefly
+                    // (it stops at its next file) before the loop exits.
+                    let mut stopping = false;
+                    let joined = tokio::select! {
+                        joined = &mut drain => joined,
+                        signal = signals.recv() => {
+                            info!(
+                                "{signal} received during a drain; cancelling it and \
+                                 exiting (pending work stays queued in the store)"
+                            );
+                            stopping = true;
+                            self.build_cancel.cancel();
+                            drain.await
+                        }
+                        _ = self.shutdown.notified() => {
+                            info!(
+                                "shutdown requested during a drain; cancelling it and \
+                                 exiting (pending work stays queued in the store)"
+                            );
+                            stopping = true;
+                            self.build_cancel.cancel();
+                            drain.await
+                        }
+                    };
+                    if stopping {
+                        if let Err(error) = &joined {
+                            warn!("pending drain task failed while stopping: {error}");
+                        }
+                        break LoopExit::ReleaseEndpoint(Ok(()));
+                    }
+                    let drain_result = joined
+                        .map_err(|error| anyhow::anyhow!("pending drain task failed: {error}"))
+                        .and_then(|result| result);
                     // Charge the drain's writes against the budget, whatever it
                     // returned: a generation write that failed and rolled back
                     // still wrote its WAL frames. See
@@ -3481,7 +3528,8 @@ mod tests {
         // of the unchanged bytes must not come back from a cache as the refusal.
         let scanned = devmap_extract::scan_tree(root).unwrap();
         let extractions =
-            devmap_store::extract_scanned_for_generation(&daemon.store, &scanned, None).unwrap();
+            devmap_store::extract_scanned_for_generation(&daemon.store, &scanned, None, None)
+                .unwrap();
         let again = extractions
             .iter()
             .find(|extraction| extraction.file_path == "slow.py")
@@ -3560,6 +3608,41 @@ mod tests {
             "the premise: this drain took the moved-HEAD scan branch"
         );
         assert_a_refusal_survives_and_the_next_build_recovers_it(&daemon, &root);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A shutdown requested before (or while) a scanning drain extracts must
+    /// stop that drain with `BuildCancelled`: no generation is written, and the
+    /// claimed path is neither acknowledged nor charged an attempt, so the next
+    /// daemon redoes it. `request_shutdown` is the same route SIGTERM takes.
+    #[test]
+    fn a_shutdown_cancels_a_scanning_drain_and_leaves_its_work_queued() {
+        let (root, daemon) = budget_refused_daemon("refusal-cancel");
+        fs::write(root.join("a.py"), "def a():\n    return 99\n").unwrap();
+        daemon
+            .store
+            .enqueue_pending_paths(&[root.join("a.py").display().to_string()])
+            .unwrap();
+        let before = daemon.store.latest_generation_head_sha().unwrap();
+        daemon.request_shutdown();
+        let moved = "b".repeat(40);
+        let error = daemon
+            .drain_pending_batch_with_head(&move |_: &std::path::Path| Ok(moved.clone()))
+            .expect_err("a drain started after a shutdown request must be cancelled");
+        assert!(
+            error.is::<devmap_extract::BuildCancelled>(),
+            "wrong error: {error:#}"
+        );
+        assert_eq!(
+            daemon.store.latest_generation_head_sha().unwrap(),
+            before,
+            "a cancelled drain must not commit a generation"
+        );
+        assert_eq!(
+            daemon.store.get_pending_paths().unwrap().len(),
+            1,
+            "the cancelled drain's work must stay queued"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

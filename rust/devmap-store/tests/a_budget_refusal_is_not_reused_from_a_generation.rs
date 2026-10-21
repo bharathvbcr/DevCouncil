@@ -39,7 +39,7 @@ fn a_budget_refusal_committed_in_a_generation_is_reparsed_by_the_next_build() {
     assert!(refused.is_budget_refusal(), "fixture must be a refusal");
     commit(&store, &[refused]);
 
-    let next = extract_scanned_for_generation(&store, &scanned(), None).unwrap();
+    let next = extract_scanned_for_generation(&store, &scanned(), None, None).unwrap();
     assert_eq!(next.len(), 1);
     assert!(
         !next[0].is_parse_failure(),
@@ -54,7 +54,7 @@ fn a_recovered_extraction_committed_in_a_generation_is_a_cache_hit() {
     let recovered = extract_file_with_budget(PATH, SRC, Duration::from_secs(60));
     commit(&store, std::slice::from_ref(&recovered));
     let progress = devmap_extract::progress::FileProgress::default();
-    let next = extract_scanned_for_generation(&store, &scanned(), Some(&progress)).unwrap();
+    let next = extract_scanned_for_generation(&store, &scanned(), Some(&progress), None).unwrap();
     assert_eq!(progress.snapshot().cache_hits, 1);
     assert_eq!(next[0].symbols.len(), recovered.symbols.len());
 }
