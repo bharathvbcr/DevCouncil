@@ -1,5 +1,8 @@
 # One scope and import model for the JVM family (and Python's bare names)
 
+Status: approved with changes (Fable, 2026-10-21). See "Review ruling" at the end; where it
+conflicts with the body, the ruling wins.
+
 Card: ft-2c800986. Status: **design for review, no code until approved** (Fable's ruling).
 Base: `b888043d` (main). Author's evidence labels: **[V]** verified in code at the cited
 `file:line`, **[I]** inferred from code reading, **[U]** unverified.
@@ -517,3 +520,19 @@ the edge and adding the variant where `p` declares or star-imports `q`, which mu
   completeness decides how often `Unbound` is returned for a stdlib type; incomplete
   entries abstain rather than bind, so errors are recall-only.
 - **Q8 Language policy.** Rust, in the existing crate; no new dependency.
+
+## Review ruling (Fable, 2026-10-21): approved with changes
+
+1. Phase 0 is a gate, not a step. Every probe whose "now" column proves wrong gets its F-row re-justified before commit 1.
+2. Commit 3 is split into three green commits: typed receivers, factories, bare-call ladder. A seam dies with its last caller, never earlier.
+3. The resolver bench (`resolve_bench.rs`) lands in commit 1, so the A/B baseline predates the behaviour changes.
+4. The Java and Scala accuracy fixtures land before commit 3 merges. The corpus has neither language, so the fixtures are the only F6/F7 evidence.
+5. Q2: if Phase 0 shows no typealias target fact, j10 becomes an ignored probe citing V5, with no alias stem rule.
+
+Open questions:
+
+- Q1: no fallback up front. If the corpus diff loses a non-generated true edge, bring the case, not a tier.
+- Q3: invert the test, with a star-import variant that must abstain.
+- Q4: keep the rung with the stated gating; retiring it is ft-0e6cc90f's call.
+- Q5: path heuristic, labelled; no derivable module means Ambiguous.
+- Q6: v97 first; v98 is its own approved step after the consumer sweep.
