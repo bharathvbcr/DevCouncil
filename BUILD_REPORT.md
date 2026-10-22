@@ -223,16 +223,25 @@ The owner said: "merge all and for others go with fable".
 - **GAP-13:** a 40-cycle daemon soak was clean, and a 200-cycle CLI freshness loop passed after making its cycle count configurable and adding an assertion. Daemon-mode envelope freshness is still unchecked. The soak's default corpus fails because `main` is ambiguous.
 - All of this is filed as **ft-ae653b10** (DevMap test-harness debt).
 
+### ft-ae653b10 harness debt (merged, main `8381c35c`)
+
+Fable scoped this narrowly.
+- The 13 surviving `maintenance.rs` mutants are now killed: 80 mutants, 76 caught, 0 missed, 4 unviable.
+- The soak now targets the unique symbol `<file>::_soak_<i>`; the 5- and 20-cycle runs pass.
+- `mutants.yml` documents its scope.
+- **Still open, and the owner's decision:** the weekly job cannot produce `mutants-baseline.txt`. The full scope is 4,509 mutants, which cannot fit the 350-minute budget. Either shard it with a `--shard k/n` matrix, or shrink the scope.
+- GAP-11 property coverage and daemon envelope freshness stay out of scope.
+
 ### Consumer sweep handover (run from sessions rooted in each repo)
 
-`devcouncil install` reports these consumers stale against DevCouncil `500a55c8`. The schemas are devmap-extract 97, dc-store 10 and workbench 14.
+`devcouncil install` reports these consumers stale against DevCouncil main (now `8381c35c`; use the HEAD at sweep time). The schemas are devmap-extract 97, dc-store 10 and workbench 14.
 
 1. **GitPulse** (`/Users/bharath/Code/devtools/GitPulse`):
    - re-vendor: `node scripts/vendor-crates.mjs && bun run check:vendor-schema`, then commit;
    - copy Manvi's `contracts/serve.ops.schema.json` over GitPulse's copy and update the Rust side;
    - `bun run mcp:install && bun run mcp:doctor` (all three verdicts OK);
    - `bun run tauri build` and reinstall GitPulse.app.
-2. **Manvi:** bump the DevCouncil pin in `scripts/module-pins.txt` from `1ae3bc15` to `500a55c8` (devmap-extract 94→97, dc-store 9→10, workbench 13→14), then `manvi doctor`.
-3. **Jarvis:** bump the DevCouncil pin in `upstream.lock.json` and `go.mod` from `1ae3bc15` to `500a55c8`. Gusset must agree in all three places. Then `dev check-pins` and doctor.
+2. **Manvi:** bump the DevCouncil pin in `scripts/module-pins.txt` from `1ae3bc15` to the DevCouncil HEAD at sweep time (devmap-extract 94→97, dc-store 9→10, workbench 13→14), then `manvi doctor`.
+3. **Jarvis:** bump the DevCouncil pin in `upstream.lock.json` and `go.mod` from `1ae3bc15` to the DevCouncil HEAD at sweep time. Gusset must agree in all three places. Then `dev check-pins` and doctor.
 4. **Confirm from the GitPulse checkout:** `bun run check:schema-parity` passes with no stale or unverifiable rows.
 5. **Then:** push DevCouncil main once, and only then unfreeze extract-v98.
