@@ -30,6 +30,23 @@ consumer. Updating the DevCouncil CLI alone does not change an installed
 GitPulse application. There is no independently running DevCouncil cleaner and
 these changes do not install or enable schedules.
 
+## Before removing a git worktree
+
+`git worktree remove` deletes the worktree's ignored files without listing them;
+that is how the r5 accuracy labels were lost (ft-8ed75897). Before removing one,
+run `git status --porcelain --ignored` in it, separate build output (`target/`,
+`node_modules/`, caches) from non-build files (labels, datasets, run outputs,
+local state), and copy the latter out or confirm they are reproducible. An
+unreadable or truncated listing is a refusal, not approval. `stash@{0}` (the
+pre-land copies of session 36664's orphaned work) is the owner's to drop once it
+is no longer wanted; agents do not drop stashes they did not create.
+
+`core.fsmonitor` is set in the shared `.git/config`, so every worktree starts its
+own `git fsmonitor--daemon`, and daemons of removed worktrees pile up and hang
+`git status`. Whether to turn it off for this repository or keep it and stop
+the daemons per worktree (`git fsmonitor--daemon stop` before or after removal)
+is an owner decision that is still open; no agent changes the shared config.
+
 Validation: from the repository root, run `cargo test --manifest-path rust/Cargo.toml -p devmap-query
 --no-default-features` and the same package's Clippy check. The regression cases
 cover path traversal, mixed path separators, case-insensitive preservation,

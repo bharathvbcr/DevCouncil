@@ -59,6 +59,7 @@ fn doctor_report(
         "missing_binary_warning": missing_binary_warning(&binaries),
         "duplicate_mcp_registration_warning": duplicate_mcp_registration_warning(),
         "stray_state_warning": stray_state_warning(),
+        "skills_receipt_warning": skills_receipt_warning(root),
         "plugin_warning": plugin_warning(),
         "plugin_cleanup_note": plugin_cleanup_note(),
         "profile_hooks_warning": profile_hooks_warning(&std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf())),
@@ -68,6 +69,35 @@ fn doctor_report(
     });
     extend_agent_tools(&mut report, root);
     Ok(report)
+}
+
+/// Whether the skill files `devmap skills install` wrote under `root` still
+/// match the five skills this binary embeds (`skills install --check`, read
+/// only). `None` when the repository has no `.devcouncil-skills.json` receipt,
+/// since nothing was installed to disagree; only layouts whose directory exists
+/// are compared, so a repository that installed one host's layout is not told
+/// the others are missing. A check that could not run is a warning, never
+/// silence: the receipt is per-workspace state and is not version-controlled.
+fn skills_receipt_warning(root: &Path) -> Option<String> {
+    if !root.join(".devcouncil-skills.json").is_file() {
+        return None;
+    }
+    let destinations: Vec<&str> = crate::skills::DEFAULT_DESTINATIONS
+        .iter()
+        .copied()
+        .filter(|dest| root.join(dest).is_dir())
+        .collect();
+    match crate::skills::install_devmap_skills(root, &destinations, false, true) {
+        Ok(report) if report.check_ok => None,
+        Ok(report) => Some(format!(
+            "{} installed skill file(s) are missing or differ from the skills this devmap \
+             embeds; run `devmap skills install` to refresh them",
+            report.differing.len()
+        )),
+        Err(error) => Some(format!(
+            "the skills receipt could not be checked against the installed skills: {error}"
+        )),
+    }
 }
 
 /// The git the kernels would run against `root`: where it was found, its

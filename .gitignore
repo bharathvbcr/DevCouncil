@@ -164,6 +164,12 @@ opencode.json
 .conducor/
 .warp/
 .agents/
+# Skills-install receipt and lock: per-workspace producer state, written by
+# `devmap skills install` / `devmap integrate`. Its subjects (.agents/, .claude/)
+# are ignored above, so a tracked receipt only recorded hashes of files git does
+# not hold. Untracked under ft-7364b2c8 (D14).
+/.devcouncil-skills.json
+/.devcouncil-skills.lock
 .codex/
 .antigravity/
 .grok/

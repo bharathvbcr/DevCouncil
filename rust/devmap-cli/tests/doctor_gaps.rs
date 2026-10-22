@@ -388,3 +388,54 @@ fn a_gitpulse_grant_is_a_gap_and_a_devmap_denial_is_an_opt_out() {
     let _ = fs::remove_dir_all(&home);
     let _ = fs::remove_dir_all(&cwd);
 }
+
+/// The skills receipt is per-workspace state: doctor says nothing when none was
+/// written, nothing when the installed skills match this binary's, and names
+/// the drift once a skill file is edited (`skills install --check`, read only).
+#[test]
+fn doctor_reports_skills_that_no_longer_match_the_receipt() {
+    let home = scratch("skills-home");
+    let cwd = scratch("skills-cwd");
+
+    let before = doctor_with_home(&home, &cwd);
+    assert!(
+        before["skills_receipt_warning"].is_null(),
+        "no receipt, nothing to disagree: {before}"
+    );
+
+    let install = Command::new(devmap_bin())
+        .args(["skills", "install", "--destination", ".claude/skills"])
+        .arg("--project-root")
+        .arg(&cwd)
+        .env("HOME", &home)
+        .output()
+        .expect("skills install runs");
+    assert!(
+        install.status.success(),
+        "{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    assert!(cwd.join(".devcouncil-skills.json").is_file());
+    let matching = doctor_with_home(&home, &cwd);
+    assert!(
+        matching["skills_receipt_warning"].is_null(),
+        "freshly installed skills match: {matching}"
+    );
+
+    let skill = fs::read_dir(cwd.join(".claude/skills"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("SKILL.md");
+    fs::write(&skill, "edited by hand\n").unwrap();
+    let drifted = doctor_with_home(&home, &cwd);
+    let warning = drifted["skills_receipt_warning"].as_str().unwrap_or("");
+    assert!(
+        warning.contains("missing or differ"),
+        "an edited skill must be named: {drifted}"
+    );
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&cwd);
+}

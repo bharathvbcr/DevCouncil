@@ -30,8 +30,11 @@ select several layouts. Claude users can also generate the native plugin with
 `devmap claude plugin`; that existing path includes MCP settings and hooks in
 addition to the skills. Standalone scaffolding installs skill files only.
 
-Keep the skill files and `.devcouncil-skills.json` receipt in version control
-when distributing them with a repository. The receipt contains relative paths
+Version-control the receipt only where the skill files are version-controlled.
+This repository ignores both, so its receipt is per-workspace state and is not
+tracked. `devmap doctor` reports `skills_receipt_warning` when the installed
+skill files no longer match the skills this binary embeds (the read-only
+`devmap skills install --check`). The receipt contains relative paths
 and content hashes, allowing subsequent installs to recognize unchanged managed
 files. Check that repository ignore rules expose the intended files. Codex
 discovers repository skills under `.agents/skills`; if an existing session does
