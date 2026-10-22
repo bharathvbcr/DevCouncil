@@ -189,13 +189,26 @@ The owner said: "merge all and for others go with fable".
      - It changes no behaviour: edge dumps are byte-identical to main on Curio, Meridian, MarkDev, DevType and ChronosFlow.
      - The probe-assertion sweep made about 52 assertions symbol-exact and fixed two wrong expected ids (j4, r5). It added the guards x4 and x5 (an extension on an external `Task` beside an unrelated same-named member).
      - **Not merged on its own:** `resolve_name` answers `Unmodelled` and nothing reads the tables yet. It merges with the commit that wires it in.
-     - An adversarial round on the tables is running now.
+   - The tables attack (3 HIGH, 6 MEDIUM) was fixed. Fable ruled that Uncertain is a ledger label, never a verdict, and dropped the weak triggers.
+   - **Commit 2** adds `resolve_name` ranks 1–8. Its fixes after round 1 (35 of 50 probes failing) covered rank 8, `MaybeExternal`, and the removed fact scan.
+   - **Round 2** (36 of 82 failing) showed that nearly every confident wrong verdict comes from a missing extractor fact.
+   - **Fable chose to pause:** `lane/jvm-scope-model` @ `a247f398` stays **unmerged**, because the unwired tables are placeholders. It waits for an extract-v98 "JVM declaration facts" concern: V1, V2, V3 type parameters, V5–V8, V9 inner/static, V10 companions, V11 header/body spans, V12 local extents, V13 parse-drop and V14 visibility.
+   - 45 ignored probes are its acceptance suite.
+   - The doc, marked paused, is on main. The card is in review, recorded as paused.
+   - Bench baseline: +1.2–1.9% quiet on ChronosFlow, and +12% on the 30k-method file.
 2. **ft-87b28bb6:** left in review with a note; Z3/Z5 ride on ft-2c800986 and v98.
 3. **ft-8a85f117:** GAP-7 is VB.NET pattern-only, by decision. GAP-11/12/13 were each run once and all are measured-open; see the next section.
 4. **ft-c86df5d4 competition benchmark:** on hold. Installing the pinned competitor binaries (CodeGraph, codebase-memory-mcp, Gortex, Graphify, GitNexus) needs your explicit OK, plus an idle machine.
 5. **Consumer sweep (ft-3018ab76):** this session did the DevCouncil half. The rest is handed over, below.
 6. **v98 unfreeze:** after the sweep.
-7. **Cleanup:** merged worktrees only, after surveying ignored files.
+7. **Cleanup** (the owner then asked to delete old and stale branches, 2026-10-22). All merged and patch-equivalent branches and their worktrees are deleted: 30+ branches, every lane/attack/agent worktree and the nested probe worktrees. Left in place:
+   - `main`;
+   - `lane/jvm-scope-model` (paused, unmerged);
+   - `claude/literals-substring-b3546e` and its worktree (another session's; Fable said to leave it);
+   - the remote `origin/dependabot/...` (deleting it would be a push);
+   - two old stashes.
+
+   The earlier cleanup notes:
    - Removed: the integration worktree and the known-gaps, liveness-script, resolver-bundle, attack/liveness-script and attack/build-cancel agent worktrees.
    - Left, because removal needs `--force`:
      - the agent-locked worktrees for kotlin-decl-proof, build-cancel, ts-namespace and attack/resolver-bundle;

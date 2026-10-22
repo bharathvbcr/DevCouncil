@@ -1,9 +1,11 @@
 # One scope and import model for the JVM family (and Python's bare names)
 
-Status: approved with changes (Fable, 2026-10-21). See "Review ruling" at the end; where it
-conflicts with the body, the ruling wins.
+Status: Paused at commit 2, waiting on extract-v98 (Fable 2026-10-22). The branch
+`lane/jvm-scope-model` stays unmerged: the tables and `resolve_name` have no caller, so they are
+placeholders until the facts in "v98 JVM declaration facts" exist. Approved with changes (Fable,
+2026-10-21); see "Review ruling" at the end; where it conflicts with the body, the ruling wins.
 
-Card: ft-2c800986. Status: **design for review, no code until approved** (Fable's ruling).
+Card: ft-2c800986. (Original status: design for review, no code until approved.)
 Base: `b888043d` (main). Author's evidence labels: **[V]** verified in code at the cited
 `file:line`, **[I]** inferred from code reading, **[U]** unverified.
 
@@ -138,8 +140,8 @@ test (or `-` for the round-3 guards that pass today and must keep passing).
 | F2 | Repo class wrongly typed when an explicit repo import should win or when two same-named repo classes exist | `type_methods` row is shared by name; several hits => abstain, one hit => bind regardless of import | r6, s1, r7 (same FQN in two modules) |
 | F3 | Nested `Outer.Repo` answers a top-level bare `Repo` | `unique_indexed_type` counts nested classes (`value_types.rs:10`); identity has no container chain visible at the use site | base_nested_class_nominal_factory |
 | F4 | Own member `make()` is read as top-level factory `make()` | `lookup_in_package` finds only file-level decls (`dispatch.rs:197`), never asks the enclosing type chain (`value_types.rs:302-318`) | base_member_shadows_toplevel_nominal_factory |
-| F5 | Inherited or companion member `make()` is invisible | enclosing-type test (round-2 `enclosing_type_declares_member`) keyed on bare type name; inherited members need `supertypes` plus identity | e1, e5 (e6 is the Swift extension twin) |
-| F6 | Imports of members and aliases do not bind | `import a.Util.go` binds the object `Util`'s file then demands a *file-level* `go` (`resolve_all.rs:855`, `dispatch.rs:197`); alias `F` is not a `type_methods` key; Java caller of a Kotlin class crosses families | j2, j5, j6, e7, s3, r3 |
+| F5 | Inherited or companion member `make()` is invisible | enclosing-type test (round-2 `enclosing_type_declares_member`) keyed on bare type name; inherited members need `supertypes` plus identity | e1, e5 (e6 is **not** an instance: Phase 0 shows main already edges `Host.use -> Other.find`; its assertion is satisfied by file+member name, see "Phase 0 results") |
+| F6 | Imports of members and aliases do not bind | `import a.Util.go` binds the object `Util`'s file then demands a *file-level* `go` (`resolve_all.rs:855`, `dispatch.rs:197`); alias `F` is not a `type_methods` key; Java caller of a Kotlin class crosses families | j2, j5, s3 (as stated); **j6, r3, e7 have a second, prior cause**: the Java extractor emits no `declared_type` for a formal parameter or for a local initialised by a call, so the receiver is untyped before any resolver rung runs (see "Phase 0 results"). `resolve_name` alone cannot fix them |
 | F7 | Scala imports resolve only by path or basename | no package fact, `resolve_jvm_import` is Kotlin/Java only (`imports.rs:197`) | r4 (j1, j8 are guards) |
 | F8 | Kotlin generic return types are not types | `admissible_nominal_type` refuses `<` (`receiver_types.rs:806`); lifting that without identity widens F1-F5 | the 4 ignored z3_* probes and `kg.Z3` |
 | F9 | Swift extension / C# partial overloads across files look like recursion | `shared_identities` knows only same-file duplicates (`index.rs:156-170`); a cross-file sibling is invisible | ov_swift_extensions_across_files..., ov_csharp_partial_classes_across_files... |
@@ -149,7 +151,7 @@ Round-3 constraints and what each rules out (all guards run today unless noted):
 
 | Guard | What it forbids | Why round 2 broke it |
 |---|---|---|
-| ChronosFlow `Task.toDayQuickItem`, `Habit.statusLabel`; x1, x2 | abstaining because "an external import names a class that also exists in the repo" | the test was by simple name: an unrelated nested `UndoableAction.Task` exists. The true edge is an *extension declared on the external* `Task` (owner = the external type) |
+| ChronosFlow `Task.toDayQuickItem`, `Habit.statusLabel` (the **x1, x2 probes are not guards today: they fail with no edge**, see "Phase 0 results") | abstaining because "an external import names a class that also exists in the repo" | the test was by simple name: an unrelated nested `UndoableAction.Task` exists. The true edge is an *extension declared on the external* `Task` (owner = the external type) |
 | j1, j8 | a package-gated stem rule for Scala | `jvm_package_by_file` has no Scala rows, so every sbt multi-module import was dropped |
 | p9 | a function-local import suppressing a module star-import bind in another function | rule (f) keyed on "name imported by *some* function" |
 | t1, t2, t3, e3 | cross-file split types keyed on `(language, spelling)`, bare type name rows | merged distinct `Node` / `X` types and top-level functions; `type_methods` key is the bare name |
@@ -238,14 +240,18 @@ For a simple name `N`, namespace, at site `S` in file `F`:
 6. **Star imports**: `import p.*`, Java `p.*` and `static p.U.*`, Scala `p._`, Kotlin
    `p.Outer.*`. Candidates `Fqn(p.N)`; exactly one source with exactly one repo decl and
    **no unindexed star** gives `Decl`; a repo decl plus an unindexed star gives
-   `MaybeExternal`; two repo decls give `Ambiguous`.
+   `MaybeExternal`; two repo decls give `Ambiguous` (several callables, or one class and its
+   factory functions, give `Overloads`); and **no repo decl but an unindexed star** also gives
+   `MaybeExternal`, before the default imports are consulted, because the library package may
+   supply even a default-imported name. A non-static `p.Outer.*` imports nested types only.
 7. **Default imports**: a per-language table of default-imported *type and function*
    names (`kotlin.*`, `kotlin.collections.*`, `kotlin.text.*`, `java.lang.*`, `scala._`,
    `Predef`). A name in the table is `External(fqn)`. Names not in the table are never
    assumed external.
-8. `Unbound`. There is **no repo-wide "unique class of that spelling" fallback** for
-   typed receivers and factory returns. (Open question Q1: whether a guarded last-resort
-   tier is wanted back.)
+8. `Unbound`. There is **no repo-wide "unique class of that spelling" fallback** for typed
+   receivers and factory returns. (Open question Q1: whether a guarded last-resort tier is
+   wanted back.) The unindexed-star rule of step 6 replaces the earlier wording of this step
+   (Fable's ruling on commit 2; section 5, `base_nested_class_nominal_factory`).
 
 Order per language, from the language specifications [I; Kotlin, Java and Scala specs to
 be re-read when implementing, I have not re-fetched them in this session]: Kotlin explicit
@@ -298,6 +304,14 @@ approved step, with the cross-app consumer sweep):
   documented residual risk of F8.
 - V4 (optional hardening): import kind flags `{is_static, is_wildcard, member}` so the
   resolver stops parsing `raw_import`.
+- V5 Kotlin `typealias` target fact (j10).
+- V6 Java declared types for formal parameters and call-initialised locals (r3, j6, e7).
+- **V7 property and field symbols.** The extractor emits none, so `val o = object { fun anon() }`
+  leaves `anon` looking like a member of its class. No fact names the object expression, so no
+  label is set; the mis-ownership is the characterization row `kg.V7` (see "Commit 1 review").
+- **V8 Java `record` and `@interface` symbols.** Neither emits a symbol, so their members are
+  attributed to the enclosing class, or look top-level when the record is top-level. Same: no
+  fact, no label; pinned by an ignored probe.
 
 **Scala until V1 lands**: the unique-basename rung (`import_path.rs:382`) stays enabled
 for `scala` only (explicit allow-list), so j1, j8 and r4 keep passing; the Scala analogue
@@ -536,3 +550,262 @@ Open questions:
 - Q4: keep the rung with the stated gating; retiring it is ft-0e6cc90f's call.
 - Q5: path heuristic, labelled; no derivable module means Ambiguous.
 - Q6: v97 first; v98 is its own approved step after the consumer sweep.
+
+## Phase 0 results (2026-10-21, main 99d41a1f, implementer run)
+
+Run with `cargo test -p devmap-resolve --test it -- --ignored` and the named guards; the CLI
+guard through `-p devmap-cli --test it`. Section 5's "now" was [I]; this section is [V].
+
+- All 45 `ft-2c800986` probes **fail** on main (none passes). 39 fail for the mechanism the
+  F-row names. Three groups were mis-described:
+  - **e6 (Swift) is a false probe, not a failure shape.** Main's edges are
+    `Host.use -> Host.make` and `Host.use -> A.swift::Other.find`: correct. The assertion
+    `!to_file(.., "A.swift::Repo.find")` is satisfied by *file path + member name* (`to_file`,
+    `attack_resolver_bundle5.rs:40`), so `Other.find` in the same file matches. Under the model
+    the edge stays; the probe needs a symbol-exact assertion. e6 leaves F5.
+  - **r3, j6, e7 (Java receivers) fail before the resolver.** The stored extraction of
+    `int run(Task t) { return t.find(); }` has a `Type` reference `Task` with no `assigned_to`, so
+    `local_bindings` for `t` has no `declared_type` (scratch run with the installed `devmap 0.2.5`,
+    build aacffb852c4f; main's `r3` also returns `[]`). A Java local initialised by `new Repo()`
+    types; one initialised by `make()` (e7) or a parameter (r3, j6) does not. The cause is an
+    extractor fact (Java declared types), not F6's import or family handling. Un-ignoring them needs
+    a new fact, named **V6: Java declared type for formal parameters and call-initialised locals**.
+    j6 additionally needs the family bridge F6 describes. Root-cause code location is [I].
+  - **x1, x2 fail today (`[]`), contrary to the guard table.** Two identities named `Task.toItem`
+    (the repo member and the file-private extension) make `receiver_type_method` abstain [I]. The
+    ChronosFlow guards pass on the real corpus only because no unrelated class there has a member
+    of that name; x1/x2 are probes of the model, not regression guards.
+- Guards that pass today: j1, j8, p9, t1, t2, t3, e3, j3, j4, j7,
+  `z3_explicit_ext_import_with_star_import_of_repo_package`,
+  `z3_a_name_the_corpus_declares_twice_abstains` (Q3 inverts it) and the CLI test
+  `a_nested_class_never_answers_an_unrelated_import`. j10 also passes today (by the stem).
+- **Q2: no typealias target fact.** A Kotlin `typealias Foo = a.impl.Foo` extracts no symbol and
+  no `Type` reference: its identifiers appear only as `Name` references, and no edge leaves
+  `Aliases.kt` (scratch build, installed binary; the Kotlin extractor has no `type_alias` arm).
+  Per the ruling, j10 becomes an ignored probe citing V5, with no alias stem rule.
+- Surprises confirmed by reading: `receiver_type_method` (`dispatch.rs:589-628`) has no import,
+  package or visibility test for non-Swift, non-Go families; a JVM star import is bound under the
+  local name `"*"` (`import_local_name` takes `rsplit('.')`, `scope.rs:4-27`, bound at
+  `index.rs:1134-1136`); Java is `LangFamily::CStyle` (`model.rs:70`).
+- The `to_file` matcher is file-plus-member-name based. Every probe that asserts *absence* with it
+  should be re-read for the e6 trap before it is un-ignored.
+
+## Phase 0 ruling (Fable, 2026-10-21)
+
+1. **r3, j6, e7 stay `#[ignore]`, citing V6** (Java declared-type facts, extract-v98). The Java
+   fixture is the v98 proof, not a v97 gate: no Java F-row is claimed fixed by the v97 resolver
+   model, and F6 is scoped to Kotlin (j2, j5) and Java static members (s3).
+2. **e6** is a guard that passes today, with an exact-id assertion. Every `attack_resolver_bundle*`
+   and `kotlin_written_types` assertion that matched by prefix, `contains`, `ends_with` or
+   file-plus-member-name now compares whole symbol ids; the only remaining non-exact helper is
+   `reaches_file`, used solely to assert a file is *not* reached.
+3. **x1, x2 are model targets, not guards.** The ChronosFlow shape is covered by two fixtures that
+   pass today and must keep passing: `x4` (extension on an imported external `Task` beside an
+   unrelated repo class `Widget` with a same-named member) and `x5` (beside a nested repo
+   `UndoableAction.Task`).
+4. **j10** is `#[ignore]`d citing V5; there is no alias stem rule.
+5. **Commit 1** carries the bench, the tables and the `resolve_name` seam, and changes no edge:
+   the corpus edge set must be byte-identical to main.
+
+## Commit 1 review: the adversarial pass and what the tables now do
+
+**Ruling (Fable, option D): a label is a ledger entry, never a verdict.** A row whose placement
+rests on a fact that can be wrong carries a `Doubt` label so the unresolved-ledger can say why.
+The label records; it does not decide. A member of a labelled owner is returned from both tables
+exactly like any other and binds as `Decl` at today's confidence. **`resolve_name` must never turn
+a label into `Ambiguous`**: `Ambiguous` is for two declarations that really tie at one rank.
+This is encoded in the types (`JvmDecl::ledger_label` is the only reader of the label, the
+`placement` field is not public, the `NameVerdict::Ambiguous` doc says so, and a test pins that a
+labelled row is returned like any other), so commit 2 cannot get it wrong by omission.
+
+A label is attached only where a *fact* names the doubt:
+
+- `PartialParse`: a symbol at or after the first parse-error range. A fact (the parse outcome).
+- `UnparsedFile`: any symbol of a file that was not parsed. A fact.
+- A label is inherited down the chain: the chain above a member is only as good as its owner's.
+- There is no label for class-level initializer content. A supertype constructor call or a
+  `by lazy` is no evidence of an object expression, and a typed declaration is none either; those
+  triggers are gone. No reference or extraction fact names an `object` expression, so
+  `OwnerBodyHasGaps` does not exist until V7 supplies a fact.
+
+What the tables do (`jvm_tables.rs`, devmap-resolve only, no extractor change):
+
+1. **Identity.** A `DeclId` is `(file, container chain + name)` rebuilt from spans, not the
+   extractor's qualified name, which keeps only the direct parent (`X.A.Inner.f` and
+   `Y.A.Inner.f` are both `Inner.f`). `JvmDecl::symbol` keeps the extractor's id for edges.
+   Members are keyed by the owner's row, so those two have distinct owners and members.
+2. **Local bodies.** A symbol whose innermost enclosing symbol is a callable is local and in
+   neither table. (Commit 1 also excluded a symbol inside a class-level call or constructor
+   expression, such as a Java anonymous class in a field initializer. That exclusion had no fact
+   behind it before V7/V8 and cost a third of the table build, so it was removed in the follow-up
+   to commit 2: the anonymous class's method is now taken for a member of its host, pinned by
+   the ignored probe `v8_a_java_anonymous_class_method_is_not_a_member_of_its_host`.)
+3. **Known mis-ownership, characterized, no label (V7, V8).**
+   - **V7 property and field symbols.** `val o = object { fun f() }` in a plain class leaves `f`
+     looking like a member of the class. Fixture row `kotlin-gaps/kg.V7` (`ZqOwners.kt`), a
+     `false_edge` in `known_failing.tsv` owned by ft-2c800986 and blocked on extract-v98: the bare
+     call `zqOwnerName()` in the class body binds to the object expression's member, not the
+     top-level function.
+   - **V8 Java `record` and `@interface` symbols.** A record emits no symbol, so its method looks
+     like a member of the enclosing class. The harness scores no Java language gate (a `java` row is
+     refused there), so this is the ignored probe `v8_a_java_record_method_is_not_a_member_of_its_host`
+     in `attack_resolver_bundle5.rs`, citing V8 and extract-v98.
+4. **Extension receivers.** The extractor keeps only the last dotted segment of a receiver, with
+   generics stripped, and nothing for a nullable or function-type receiver. `Receiver::Last(name)`
+   is a visible receiver (a member extension keeps both: its owner is the dispatch receiver),
+   `Receiver::Unseen` means no marker is visible, which is not a promise there is none, and
+   `NotExtension` is only for non-callables and Java.
+5. **Twins.** Identical `(file, path)` declarations are one row with `copies > 1`: a conditional
+   twin for a type, an overload set of one id for a callable.
+6. **Headerless files.** `Package` is a validated type (non-empty segments), so an FQN cannot start
+   with a dot.
+7. **Scale.** Nesting beyond 64 is not indexed and the package is recorded. The container-chain
+   rebuild is one sort (skipped when the extractor's order already is outermost-first, which it
+   is) plus one stack walk, with no per-symbol rescan.
+
+**Migration notes.** `jvm_package_symbols` still has callers and stays until commit 3.
+`resolve_name` (commit 2) reads `Decl` rows without regard to a label and may attach the label
+to a ledger row. `jvm_package_is_unsure` is a ledger fact too: it explains an unresolved row and
+never changes a verdict.
+
+## Commit 2: `resolve_name` for Kotlin and Java (no caller wired)
+
+`names.rs::resolve_name` applies ranks 1-8 of section 3.3, memoised on
+`(file, innermost enclosing type, name, namespace)`; locals depend on the offset and are answered
+before the memo. Nothing in `resolve_all` calls it, so no edge changes. Per-rank unit tests and the
+adjacent-pair precedence tests are in `jvm_names_tests.rs`; every probe the design maps to
+`resolve_name` is exercised there as a verdict, not an edge (r3, r4, r6, r7, j2, j4, j5, j6, s1, s3,
+s5, s6, e1, e3, e4, e5, e7, x1/x2/x3, z3, base_nested, and the label rule).
+
+What the ranks read, built in `index_jvm_decls`: `jvm_imports` (explicit and star lists, from the
+extractor's specifier and alias, and from the source text for a Java `import static`, whose member
+the specifier drops), the type rows per file, the heritage references per type, the functions and
+classes local to a callable, and the known packages. The default-import tables are in
+`builtins.rs` (`default_import`), and the Scala stem allow-list is `importpath::stem_rung_allowed`
+(not consulted yet: wiring it is what removes the rung for Kotlin and Java).
+
+Decisions taken that the design left open, and one deviation:
+
+- **Rank 8 and an unindexed star.** Section 3.3 says a name no rank names is `Unbound`; section 5
+  (`base_nested_class_nominal_factory`) says `import ext.*` makes the name `MaybeExternal`. The
+  second wins: a name nothing names, in a file that star-imports a source the index declares
+  nothing under, is `MaybeExternal`, because that star could supply it. Without such a star it is
+  `Unbound`.
+- **Inherited members** resolve each supertype at the subtype's declaration site (the scope outside
+  its own body), bounded by `HERITAGE_WALK_MAX_DEPTH`, with a visited-by-depth cycle guard. An
+  unresolved, external or too-deep supertype that no repository supertype beats makes the name
+  `MaybeExternal`.
+- **Kotlin `scope_receivers`** (`apply { }`, `with(x) { }`) are not modelled: the receiver is a
+  written *value* expression whose type this module cannot name. The Kotlin receiver rungs that
+  already type it run before the ladder and are not moved by this commit. A closure's captured
+  outer locals are seen only where the extractor's parent chain reaches that callable.
+- **Scala** and a file with no package header answer `Unmodelled` (no package fact until V1).
+- **Labels never decide**: a labelled row binds like any other (`a_ledger_label_never_changes_a_verdict`).
+- **Default imports** follow the Kotlin docs' list (`kotlin.*`, `kotlin.annotation`,
+  `kotlin.collections`, `kotlin.comparisons`, `kotlin.io`, `kotlin.ranges`, `kotlin.sequences`,
+  `kotlin.text`, `kotlin.math`, and on the JVM `java.lang.*` and `kotlin.jvm.*`;
+  <https://kotlinlang.org/docs/packages.html>). The page does not state how a default import ranks
+  against explicit, same-package and star imports; the order used (explicit, same package, star,
+  default) is the design's [I] reading of the specification and is unverified here. The tables list
+  commonly written names only (Q7): a name missing from them is `Unbound`, never assumed external.
+- **Same-package tie** between declarations of one name in several files: callables are an
+  `Overloads` set, types go to the Gradle-module tie-break (`jvm_module_of`: an included module
+  directory, else the prefix before `src/<set>/{kotlin,java}`), and an underivable module is
+  `Ambiguous` (Q5).
+- **typealias (V5)**: `import a.Foo` where `a.Foo` is a typealias is `External("a.Foo")` today, since
+  no symbol exists for it; j10 stays ignored citing V5.
+
+## Commit 2 review: the adversarial round on `resolve_name`
+
+The governing rule: **`resolve_name` never returns a confident `Decl` or `External` that could be
+wrong.** Where facts are missing the verdict is `MaybeExternal` or `Ambiguous`. 50 probes
+(`jvm_names_attack.rs`) were attacked at commit 2; all pass or are ignored below with a named
+V-fact and a sibling test pinning the non-confident verdict that stands in until the fact exists.
+
+- **Qualified spellings** are resolved by their head with the unindexed-star fallback off, so a
+  library star (`import java.util.*`) cannot hide that `a.b.Repo` is a package of this repository;
+  a path nothing in the repository names is `External`, and one with a repository package or
+  declaration as a prefix is `MaybeExternal` (a member or nested type the extractor did not emit).
+- **Inherited members**: an external or unresolved supertype may declare any member name, so a
+  value-position hit beside one is `MaybeExternal`; a type-position name is not blanked by it.
+  Every supertype is visited once (a diamond costs its size), to depth 64.
+- **Explicit imports** whose path the index does not declare reach the member through the longest
+  prefix that is a type (companion members, Java fields, members inherited through a subclass), else
+  are `External` only when no prefix is a repository package or declaration (V7).
+- **Header scope.** A name in a type's header (its supertype list and a supertype constructor call's
+  arguments) resolves outside the type's body. `Heritage::header_end` is where the supertype
+  references and the matching constructor reference end.
+- **Overloads**: callables across files and star imports, and a class with factory functions of its
+  name in the value namespace, are `Overloads`; a type-position use gets the class. A type and a
+  callable of one name in one file have distinct ids (the callable's ends in `()`).
+- **Private** (Kotlin, not exported by the extractor) top-level declarations are visible only from
+  their own file. A renamed import hides the original from a star import. A Java non-static
+  `import a.Outer.*` brings in nested types only. Java `import static` is parsed token by token
+  (whitespace, newlines and comments between the words); backticks are unquoted in imports and
+  package names.
+- **Calls.** `NameSite::call` says the name is a callee: a Java variable never shadows a method name
+  at a call. Elsewhere a variable binding is `Local` only when nothing else could be meant.
+- **Ambiguity** with fewer than two ids is not a tie: it is `MaybeExternal`. `maxOf`/`minOf` are
+  `kotlin.comparisons`.
+
+New facts the model needs, none of which the extractor emits at v97:
+
+- **V3 type parameters.** (Superseded by round 2: the one-letter heuristic that stood here was
+  deleted; V3 shapes are ignored probes awaiting the type-parameter fact.)
+- **V9 `inner` / `static` modifiers.** A member of an outer type found from inside a nested one is
+  `MaybeExternal`: it is visible to an inner class and a companion's or static member to both.
+  Ignored probes `a01`, `a01b`; pinned by `a01_v9_...`.
+- **V12 extents of local bindings.** Ignored probe `a17e`; pinned by `a17e_v12_...`.
+- **V13 the Kotlin grammar drops declarations after a parse error** (and some one-line class
+  bodies parse Partial: the `a07`, `a10`, `a20` probes were reformatted multi-line, since the
+  classes they test were never extracted). Ignored probe `a21b`; the label records the doubt and
+  the verdict stays `Unbound`.
+
+## Round 2 of the adversarial pass, and the pause (Fable, 2026-10-22)
+
+The second attack on `resolve_name` (`jvm_names_attack2.rs`, 8ee22c07) found that most of what it
+could still break needs a fact the extractor does not emit, not a better rule. Fable's ruling (option
+B): the lane pauses at commit 2 until extract-v98 supplies those facts, and does not merge.
+
+What this round changed:
+
+- **The one-letter type-parameter heuristic is deleted.** It downgraded a real class named `C` or
+  `I1` to `MaybeExternal` on no evidence. A type name inside a generic declaration that may be a
+  type parameter is now a V3 ignored probe, not a guess from the spelling.
+- **Two real bugs fixed.** An explicit import of a private class of another file is `MaybeExternal`,
+  not the lower-ranked name of the same spelling (`v02b`). A member of a *local class* is no name of
+  the enclosing callable (`m01`, `s01`), and a value name written inside a local class body is
+  `MaybeExternal`, since its members and supertypes are in no table.
+- **One probe was the attacker's mistake** (`r06` imported `a.B` but declared `Bee`) and is fixed.
+- **Every other failing probe is `#[ignore = "extract-v98 JVM declaration facts: <V-id>: <shape>"]`.**
+  Nothing was deleted. They are the v98 acceptance suite: run them with
+  `cargo test -p devmap-resolve --lib jvm_names_attack -- --ignored`; all 45 fail today, and each
+  must pass when its fact lands. Where a stand-in verdict exists, a sibling test pins the
+  non-confident answer (`a01_v9_...`, `a17e_v12_...`); the verdict never becomes a confident wrong
+  `Decl` or `External`.
+
+## v98 JVM declaration facts
+
+What the extractor must emit for the tables and `resolve_name` to answer without abstaining, and the
+probes that wait on each. "Probes" are `#[ignore]`d tests that fail today.
+
+| Fact | What it is | Probes waiting |
+|---|---|---|
+| V1 | Scala package scopes (`package a.b`, nested blocks) | `r4`, `j8` guards in `attack_resolver_bundle5` stay on the stem allow-list until it lands |
+| V2 | C# namespace per type | `ov_csharp_partial_classes_across_files_sibling_call_not_self` |
+| V3 | Type-parameter names on classes, methods and typealiases | 15: `a02`, `a02b`, `a02c`, `d02`, `t01`, `t01j`, `t05`, `t06`, `t07`, `t08`, `t08b`, `t09`, `t10`, `t11`, `t12` |
+| V4 | Import kind flags (`static`, `*`, member) so the resolver stops parsing text | none (hardening) |
+| V5 | Kotlin `typealias` target fact | `j10` |
+| V6 | Java declared types for parameters and call-initialised locals | `r3`, `j6`, `e7` |
+| V7 | Property and field symbols (Kotlin properties, Java fields, enum entries, companion constants) | 9: `c02b`, `c04`, `c05`, `c09`, `c14`, `c15`, `m03`, `o05`, `i02`; fixture row `kotlin-gaps/kg.V7` |
+| V8 | Java `record`, `@interface` and anonymous-class symbols | `v8_a_java_record_method_is_not_a_member_of_its_host`, `v8_a_java_anonymous_class_method_is_not_a_member_of_its_host` |
+| V9 | `inner` (Kotlin) and `static` (Java) modifiers on nested types | 2: `a01`, `a01b` |
+| V10 | Companion object symbols, named or not, with their own span | 3: `c06`, `c06b`, `i03b` |
+| V11 | Class header and body spans (supertype list, primary constructor, annotation arguments, `where` clauses, type-parameter bounds, delegation) | 9: `d01`, `h01`, `h03`, `h03b`, `h03c`, `h05`, `h07`, `h08`, `h08b` |
+| V12 | Block and lambda extents of local bindings | 1: `a17e` |
+| V13 | A parse-drop flag: which declarations the extractor lost to a grammar error (Kotlin drops the declarations after one, and some one-line class bodies parse Partial) | 3: `a21b`, `p01`, `p02` |
+| V14 | Visibility modifiers (`internal`, package-private, `protected`) | 3: `v03`, `v04`, `v05` |
+
+Ignored-probe counts per V-id across `jvm_names_attack{,2}.rs`: V3 15, V7 9, V9 2, V10 3, V11 9,
+V12 1, V13 3, V14 3: 45 in all. V1, V2, V5, V6 and V8 are older ignored probes in
+`attack_resolver_bundle3.rs` and `attack_resolver_bundle5.rs`.
