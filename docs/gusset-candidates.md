@@ -21,7 +21,7 @@ of the two.
 
 ### The measurement
 
-`policy.BenchmarkDecisionAB` (`policy/zengine_test.go`, `-tags gussetengine`)
+`policy.BenchmarkDecisionAB` (`policy/engine_oracle_test.go`, `-tags gussetengine`)
 is the committed A/B. It runs the production write gate (hard rules,
 neighbour and same-directory scope on, as the flag defaults have them) over
 `policy/testdata/write_targets.txt`. That file holds the 349 paths this
@@ -93,7 +93,7 @@ Back to back, a decision's questions then took 4.3 µs against fnmatch's
 once per agent tool call, after the process has been idle, and every such
 call has to wake gusset's worker and completion reader. Both spin for only
 50 µs (`WORKER_SPIN`, `ticketReaderSpin`) and then park.
-`BenchmarkIsolatedDecisionAB` (`policy/zengine_test.go`) measures that shape:
+`BenchmarkIsolatedDecisionAB` (`policy/engine_oracle_test.go`) measures that shape:
 the whole write decision, a sleep before each sample, 300 decisions a side.
 `BenchmarkIsolatedBatchAB` on the prototype branch measures the questions
 alone.
@@ -122,7 +122,7 @@ case gusset says not to take.
 - **Oracle.** dc-glob is the matcher dc-verify links, and the Gusset bridge is
   how its answers are held equal to fnmatch. Under `-tags gussetengine`,
   `rust/verify.sh` runs the whole policy suite with the engine as the default
-  matcher (`policy/zengine_test.go`): adversarial, hardening and fuzz seeds,
+  matcher (`policy/engine_oracle_test.go`): adversarial, hardening and fuzz seeds,
   plus `TestEngineDecisionsEqualGoDecisions`. The oracle there never falls
   back to fnmatch, because a fallback would compare fnmatch with itself. A
   question past its 30 s bound is an error, and an error is a decision no Go
