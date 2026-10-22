@@ -46,6 +46,7 @@ mod closed_pipe_is_not_a_panic;
 mod common;
 mod coverage_invariants;
 mod crash_consistency;
+mod daemon_envelope_freshness_cycles;
 mod daemon_storm_soak;
 mod dead_tier_eligibility;
 mod dependencies_attack;

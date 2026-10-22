@@ -465,6 +465,18 @@ mod tests {
         SymbolScope::new(&paths, &languages).unwrap().unwrap()
     }
 
+    /// AUDIT G17: `./` is stripped as a prefix, never as a character set, so a
+    /// dot-directory keeps its dot.
+    #[test]
+    fn g17_a_dot_directory_keeps_its_leading_dot() {
+        assert_eq!(
+            normalise_prefix("./.github/workflows").unwrap(),
+            ".github/workflows"
+        );
+        assert_eq!(normalise_prefix(".devcouncil/").unwrap(), ".devcouncil");
+        assert_eq!(normalise_prefix("././src").unwrap(), "src");
+    }
+
     #[test]
     fn no_paths_and_no_languages_is_no_scope() {
         assert_eq!(SymbolScope::new(&[], &[]).unwrap(), None);
