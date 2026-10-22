@@ -1,29 +1,39 @@
 name: mutation testing
 
-# Scope. The jobs below mutate and test one package at a time (`-p`), which is
-# what makes them viable: cargo-mutants copies only the workspace root (`rust/`)
-# to its scratch tree, and the `include_str!` fixtures in dc-glob and dc-verify
-# reach `../../../protocols`, `backend` and `testdata` outside it. A
-# workspace-wide test run (`--test-workspace=true`) compiles those crates, so
-# every mutant is UNVIABLE there. If that scope is ever wanted, try
-# `--in-place` (cargo-mutants 27.1.0: "test mutations in the source tree,
-# rather than in a copy"; not exercised here) instead of rewriting the paths.
-
 # cargo-mutants on the resolver and the analyzer, where a test that cannot fail
 # costs the most. Two modes:
 #
 #   pull request: only mutants in the lines the PR changed (--in-diff), bounded
 #                 by the job timeout. A timeout is a failure, never a pass.
-#   weekly:       the full run, compared with rust/mutants-baseline.txt, the
-#                 committed list of mutants the suite is known to miss. A missed
-#                 mutant that is not in the baseline fails the job (a
+#   weekly:       the full run, one shard per crate, each compared with its own
+#                 committed baseline rust/mutants-baseline/<crate>.txt, the list
+#                 of mutants that crate's suite is known to miss. A missed
+#                 mutant that is not in the baseline fails the shard (a
 #                 regression); a baseline entry that is now caught is reported
-#                 so the baseline can shrink. The baseline is not zero yet, so
-#                 the job is blocking only on regressions above it.
+#                 so the baseline can shrink. The baselines are not empty yet,
+#                 so a shard blocks only on regressions above its baseline.
 #
-# There is no baseline until the first full run has produced one: the weekly
-# job then FAILS with the instruction below rather than comparing against
-# nothing, and uploads mutants.out so the missed list can be committed.
+# Sharding rules:
+#   * A shard is a whole crate, never a slice of one. cargo-mutants' --shard and
+#     per-file selection split a crate's tests from the sources they read with
+#     include_str!, so a slice can pass for the wrong reason.
+#   * Runs are --in-place on the runner's checkout. cargo-mutants otherwise
+#     copies only rust/, and tests that read the rest of the repository (for
+#     example devmap-analyze's real_corpus_accuracy reading tools/accuracy/...)
+#     fail in the unmutated baseline, which ends the run with exit 4 before a
+#     single mutant is tested. Exit 4 is not tolerated below.
+#   * At most 4 shards run at once (max-parallel), each on its own runner.
+#   * A shard that does not finish (the step bound below, the job bound, a
+#     cancelled runner) is "not run" and FAILS: the `weekly` job below fails
+#     unless every shard concluded `success`. Neither a timeout nor a skipped
+#     shard can read as a pass.
+#   * A shard whose baseline is not committed fails with the instruction to
+#     commit it, and uploads mutants.out so the missed list can be taken from
+#     the artifact. To generate one locally instead:
+#       cargo mutants -d rust -p <crate> --timeout 60 --no-shuffle
+#       cat rust/mutants.out/missed.txt rust/mutants.out/timeout.txt | sort -u > rust/mutants-baseline/<crate>.txt
+#
+# Adding a crate is one matrix entry plus its baseline file.
 
 on:
   pull_request:
@@ -67,13 +77,21 @@ jobs:
             echo "NOT RUN: the pull request changes no mutable line in devmap-resolve or devmap-analyze"
             exit 0
           fi
-          cargo mutants -p devmap-resolve -p devmap-analyze --in-diff "$RUNNER_TEMP/pr.diff" --timeout 60
+          cargo mutants -p devmap-resolve -p devmap-analyze --in-diff "$RUNNER_TEMP/pr.diff" --timeout 60 --in-place
 
-  weekly:
-    name: full run against the baseline
+  shard:
+    name: full run, ${{ matrix.crate }}
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        crate:
+          - devmap-resolve
+          - devmap-analyze
+          - dc-glob
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-rust
@@ -81,28 +99,38 @@ jobs:
         with:
           cache-on-failure: true
           workspaces: rust
+          shared-key: mutants-${{ matrix.crate }}
       - name: Install cargo-mutants
         run: cargo install cargo-mutants --version 27.1.0 --locked
-      - name: Run every mutant
+      - name: Run every mutant in the crate
+        id: mutate
+        # Bound the step below the job bound so the steps after it still run and
+        # say "not run", instead of the runner being cancelled in silence. Exit
+        # 2 is "some mutants were missed" and 3 "some mutants timed out"; the
+        # comparison below judges both against the baseline. Exit 4 (the
+        # unmutated tree fails) and everything else fail the shard.
+        timeout-minutes: 330
         working-directory: rust
-        run: cargo mutants -p devmap-resolve -p devmap-analyze --timeout 60 --no-shuffle || test $? -eq 2
+        run: cargo mutants -p "${{ matrix.crate }}" --timeout 60 --no-shuffle --in-place || { c=$?; test $c -eq 2 -o $c -eq 3; }
       - uses: actions/upload-artifact@v7
         if: ${{ always() }}
         with:
-          name: mutants-out
+          name: mutants-out-${{ matrix.crate }}
           path: rust/mutants.out
-          if-no-files-found: error
+          if-no-files-found: ignore
       - name: Compare the missed mutants with the baseline
+        id: compare
         working-directory: rust
         run: |
           set -euo pipefail
+          baseline="mutants-baseline/${{ matrix.crate }}.txt"
           test -f mutants.out/missed.txt || { echo "::error::cargo-mutants wrote no missed.txt; the run did not complete"; exit 1; }
-          if [ ! -f mutants-baseline.txt ]; then
-            echo "::error::rust/mutants-baseline.txt is not committed. Download the mutants-out artifact and commit mutants.out/missed.txt as rust/mutants-baseline.txt."
+          if [ ! -f "$baseline" ]; then
+            echo "::error::rust/$baseline is not committed. Download the mutants-out-${{ matrix.crate }} artifact and commit missed.txt plus timeout.txt (sorted, unique) as rust/$baseline."
             exit 1
           fi
-          sort -u mutants.out/missed.txt > "$RUNNER_TEMP/now.txt"
-          sort -u mutants-baseline.txt > "$RUNNER_TEMP/base.txt"
+          cat mutants.out/missed.txt mutants.out/timeout.txt | sort -u > "$RUNNER_TEMP/now.txt"
+          sort -u "$baseline" > "$RUNNER_TEMP/base.txt"
           regress="$(comm -13 "$RUNNER_TEMP/base.txt" "$RUNNER_TEMP/now.txt")"
           caught="$(comm -23 "$RUNNER_TEMP/base.txt" "$RUNNER_TEMP/now.txt")"
           if [ -n "$caught" ]; then
@@ -112,5 +140,23 @@ jobs:
           if [ -n "$regress" ]; then
             echo "::error::missed mutants not in the baseline:"
             echo "$regress"
+            exit 1
+          fi
+      - name: Say so when the shard did not finish
+        if: ${{ always() && steps.compare.outcome != 'success' && steps.mutate.outcome != 'success' }}
+        run: echo "::error::NOT RUN. The ${{ matrix.crate }} shard did not complete its mutants (step outcome ${{ steps.mutate.outcome }}); that is a failure, not a pass."
+
+  weekly:
+    name: full run against the baselines
+    if: ${{ always() && github.event_name != 'pull_request' }}
+    needs: shard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every shard concluded success
+        run: |
+          result="${{ needs.shard.result }}"
+          if [ "$result" != "success" ]; then
+            echo "::error::mutation testing is NOT a pass: the shards concluded '$result' (cancelled, skipped and timed-out shards are not run)."
             exit 1
           fi

@@ -907,6 +907,26 @@ impl Store {
                 ))
             }
         };
+        // A remembered verdict describes the tree as `status` last walked it. Edits
+        // the watcher has queued since then end that verdict without changing the
+        // generation id, so a non-empty queue means the cache cannot speak.
+        let queued: Result<i64> = lock_conn(&self.conn).and_then(|conn| {
+            Ok(conn.query_row("SELECT COUNT(*) FROM pending_paths", [], |row| row.get(0))?)
+        });
+        match queued {
+            Ok(0) => {}
+            Ok(count) => {
+                return QuerySourceFreshness::unverified(format!(
+                    "{count} changed path(s) are queued and not yet indexed; the last verified \
+source freshness no longer describes the tree"
+                ))
+            }
+            Err(error) => {
+                return QuerySourceFreshness::unverified(format!(
+                    "source freshness unverified: could not read the pending queue ({error})"
+                ))
+            }
+        }
         let cache = self
             .source_freshness_cache
             .lock()
