@@ -1272,8 +1272,8 @@ pub const COVERAGE_LOSS_REASON: &str =
 /// (2026-10-10.) Each listed language has zero confident-tier false positives
 /// on its committed fixture, every fixture `truly_dead` marker in the confident
 /// branch, at least one labelled row in the corpus record, and at most 5% false
-/// on every corpus of it (`testdata/accuracy/record.json`: 20 local
-/// repositories, every language each holds listed — `rows: 0` where its
+/// on every corpus of it (`testdata/accuracy/record.json`: 21 corpora
+/// (17 pinned by `commit`, 4 by `corpus_commit`), every language each holds listed — `rows: 0` where its
 /// confident branch was empty). Measured there: Go 0/17 (all from one corpus),
 /// TypeScript 0/29, TSX 0/14, Rust 0/3.
 ///
