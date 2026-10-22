@@ -71,6 +71,20 @@ impl Corpus {
         )
     }
 
+    /// The daemon `impact` frame for cycle `i`'s own symbol, as the
+    /// `file::symbol` id the kernel treats as unambiguous. A bare name such as
+    /// `main` matches every same-named symbol in the corpus (29 in the default
+    /// one) and the kernel refuses an ambiguous target, so the soak asks about
+    /// the one symbol it knows is unique: the function it just appended.
+    pub fn impact_frame(&self, i: u64) -> String {
+        serde_json::json!({
+            "version": 1,
+            "cmd": "impact",
+            "target": format!("{}::_soak_{i}", self.relative),
+        })
+        .to_string()
+    }
+
     /// Put the pristine bytes back, touching the file only when they differ:
     /// a rewrite of identical bytes is still an edit to a watcher.
     pub fn restore(&self) -> io::Result<()> {
@@ -108,6 +122,18 @@ mod tests {
         let none = tree("none", &[".devmap/a.py", "readme.md"]);
         assert_eq!(find_target(&none), None);
         fs::remove_dir_all(&none).expect("cleanup");
+    }
+
+    #[test]
+    fn the_impact_frame_names_the_cycle_symbol_by_file_and_name() {
+        let root = tree("impact", &["pkg/main.py"]);
+        let corpus = Corpus::open(&root, 9).expect("open");
+        let frame: serde_json::Value =
+            serde_json::from_str(&corpus.impact_frame(4)).expect("valid json");
+        assert_eq!(frame["cmd"], "impact");
+        assert_eq!(frame["version"], 1);
+        assert_eq!(frame["target"], "pkg/main.py::_soak_4");
+        fs::remove_dir_all(&root).expect("cleanup");
     }
 
     #[test]

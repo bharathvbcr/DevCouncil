@@ -748,12 +748,7 @@ mod soak {
                 fails = true;
                 break;
             }
-            if ask(
-                r#"{"version":1,"cmd":"impact","target":"main"}"#,
-                Mode::Validate,
-                "",
-            ) != Observation::Observed
-            {
+            if ask(&corpus.impact_frame(i), Mode::Validate, "") != Observation::Observed {
                 let _ = writeln!(out, "SOAK FAIL: impact cycle {i}");
                 fails = true;
                 break;

@@ -102,6 +102,50 @@ fn fts_rowids_do_not_collide_across_generations() {
     assert!(!hits.is_empty());
 }
 
+/// Frames currently in the `-wal` file next to `db`: a 32-byte header, then
+/// one (24-byte frame header + page) per frame.
+fn wal_frames(db: &std::path::Path) -> i64 {
+    let page_size: i64 = rusqlite::Connection::open(db)
+        .unwrap()
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .unwrap();
+    let mut wal = db.as_os_str().to_owned();
+    wal.push("-wal");
+    let len = i64::try_from(fs::metadata(&wal).unwrap().len()).unwrap();
+    (len - 32).max(0) / (page_size + 24)
+}
+
+#[test]
+fn a_free_truncate_checkpoint_reports_an_emptied_wal() {
+    let dir = tmp_dir("wal-truncate");
+    let db = dir.join("index.sqlite");
+    let store = Store::open(&db).unwrap();
+    let ext = extract_file("a.py", "def alpha():\n    return 1\n");
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(std::slice::from_ref(&ext));
+    let resolution = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
+    let analysis = analyze(std::slice::from_ref(&ext), &resolution);
+    store
+        .save_generation(std::slice::from_ref(&ext), &resolution, &analysis)
+        .unwrap();
+
+    let checkpoint = store.checkpoint_wal().unwrap();
+    assert_eq!(checkpoint.mode, WalCheckpointMode::Truncate);
+    // TRUNCATE with no reader empties the WAL; SQLite then reports no frames
+    // left in the log and none pending.
+    assert_eq!(
+        (
+            checkpoint.busy,
+            checkpoint.log_frames,
+            checkpoint.checkpointed_frames
+        ),
+        (0, 0, 0),
+        "{checkpoint:?}"
+    );
+    assert_eq!(wal_frames(&db), 0, "the WAL file must have been truncated");
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_s18_busy_truncate_checkpoint_falls_back_to_passive() {
     let dir = tmp_dir("wal-checkpoint");
@@ -122,6 +166,13 @@ fn test_s18_busy_truncate_checkpoint_falls_back_to_passive() {
     let _: i64 = reader
         .query_row("SELECT COUNT(*) FROM generations", [], |row| row.get(0))
         .unwrap();
+    // The reader's snapshot ends at the last frame the first generation wrote;
+    // PASSIVE can backfill no further than that.
+    let reader_mark = wal_frames(&db);
+    assert!(
+        reader_mark > 0,
+        "the first generation must have written WAL frames"
+    );
 
     let second = extract_file("a.py", "def alpha():\n    return 2\n");
     let mut resolver = Resolver::new();
@@ -131,6 +182,11 @@ fn test_s18_busy_truncate_checkpoint_falls_back_to_passive() {
     store
         .save_generation(std::slice::from_ref(&second), &resolution, &analysis)
         .unwrap();
+    let wal_total = wal_frames(&db);
+    assert!(
+        wal_total > reader_mark,
+        "the second generation must add frames"
+    );
 
     let started = Instant::now();
     let checkpoint = store.checkpoint_wal().unwrap();
@@ -143,9 +199,19 @@ fn test_s18_busy_truncate_checkpoint_falls_back_to_passive() {
         started.elapsed()
     );
     assert_eq!(checkpoint.mode, WalCheckpointMode::Passive);
-    assert!(
-        checkpoint.log_frames >= checkpoint.checkpointed_frames,
-        "checkpoint counts must be internally consistent: {checkpoint:?}"
+    // PRAGMA wal_checkpoint reports (busy, frames in the WAL, frames moved to
+    // the database). PASSIVE does not wait for the reader, so it is not busy;
+    // it sees every frame in the file but backfills only up to the reader's
+    // snapshot. The expected numbers come from the WAL file's own length, not
+    // from the pragma under test.
+    assert_eq!(
+        (
+            checkpoint.busy,
+            checkpoint.log_frames,
+            checkpoint.checkpointed_frames
+        ),
+        (0, wal_total, reader_mark),
+        "PASSIVE counts must be the WAL length and the reader's snapshot: {checkpoint:?}"
     );
 
     reader.execute_batch("ROLLBACK").unwrap();
@@ -338,6 +404,44 @@ fn test_x7_failed_parse_never_admitted_to_cache() {
     store.admit_cached_extraction(&key, &ext).unwrap();
     assert!(store.try_get_cached_extraction(&key).unwrap().is_none());
     assert_eq!(store.extraction_retry_count(ext.content_hash).unwrap(), 1);
+}
+
+#[test]
+fn extraction_retry_count_counts_attempts_per_content_hash() {
+    use devmap_extract::cache::{CacheKey, ANALYZER_VERSION};
+    use devmap_extract::model::ParseOutcome;
+
+    let failing = |path: &str, source: &str| {
+        let mut ext = extract_file(path, source);
+        ext.parse_outcome = ParseOutcome::Failed {
+            reason: "syntax fatal".to_string(),
+        };
+        let key = CacheKey {
+            content_hash: ext.content_hash,
+            language: ext.language.clone(),
+            grammar_version: devmap_extract::cache::grammar_version_for(&ext.language),
+            analyzer_version: ANALYZER_VERSION.to_string(),
+        };
+        (key, ext)
+    };
+    let (key_a, ext_a) = failing("a.py", "def ((( a");
+    let (key_b, ext_b) = failing("b.py", "def ((( bb");
+    assert_ne!(ext_a.content_hash, ext_b.content_hash);
+
+    let store = Store::open_in_memory().unwrap();
+    assert_eq!(store.extraction_retry_count(ext_a.content_hash).unwrap(), 0);
+    for expected in 1..=3 {
+        store.admit_cached_extraction(&key_a, &ext_a).unwrap();
+        assert_eq!(
+            store.extraction_retry_count(ext_a.content_hash).unwrap(),
+            expected
+        );
+    }
+    // Another content hash keeps its own counter, and an unseen one reads 0.
+    assert_eq!(store.extraction_retry_count(ext_b.content_hash).unwrap(), 0);
+    store.admit_cached_extraction(&key_b, &ext_b).unwrap();
+    assert_eq!(store.extraction_retry_count(ext_b.content_hash).unwrap(), 1);
+    assert_eq!(store.extraction_retry_count(ext_a.content_hash).unwrap(), 3);
 }
 
 #[test]

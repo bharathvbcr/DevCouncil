@@ -1,5 +1,14 @@
 name: mutation testing
 
+# Scope. The jobs below mutate and test one package at a time (`-p`), which is
+# what makes them viable: cargo-mutants copies only the workspace root (`rust/`)
+# to its scratch tree, and the `include_str!` fixtures in dc-glob and dc-verify
+# reach `../../../protocols`, `backend` and `testdata` outside it. A
+# workspace-wide test run (`--test-workspace=true`) compiles those crates, so
+# every mutant is UNVIABLE there. If that scope is ever wanted, try
+# `--in-place` (cargo-mutants 27.1.0: "test mutations in the source tree,
+# rather than in a copy"; not exercised here) instead of rewriting the paths.
+
 # cargo-mutants on the resolver and the analyzer, where a test that cannot fail
 # costs the most. Two modes:
 #
