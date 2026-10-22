@@ -184,8 +184,9 @@ devcouncil task status TASK-001 --to done
 
 Verification is opt-in; the default mode is `off`. Check `status`,
 `verification_skipped`, `rigor_applied`, `rigor_skipped_reason`,
-`coverage_measured` and `coverage_skipped_reason`. The `--sandbox` flag records
-a value on the report; it does not provide Docker/Nix isolation.
+`coverage_measured` and `coverage_skipped_reason`. The `--sandbox` flag accepts
+only `local` (verification commands run on the host); any other value exits 2
+(`verify.ParseSandbox`). There is no Docker/Nix isolation.
 
 The task store is `.devcouncil/state.sqlite`, or the path named by the
 `workbench.db` key in `.devcouncil/config.yaml`. That path must be a file inside

@@ -18,7 +18,7 @@ availability; it does not certify every platform, editor session or release.
 | Engineering skills | Embedded/scaffolded instructions | Guidance, not enforced permission or proof of host loading |
 | Sandbox selector | `--sandbox local` only | Anything else is refused (`verify.ParseSandbox`, exit 2); Docker/Nix isolation is not implemented; building it is planned (owner decision 2026-10-07, task `dc-verify-isolated-sandbox`) and is gated on an approved security-impact statement |
 
-Native source versions are declared independently: currently 0.2.4 in the
+Native source versions are declared independently: currently 0.2.5 in the
 Rust workspace (`rust/Cargo.toml`), the Go host
 (`backend/go_orchestrator/devcouncil/version/version.go`) and the npm launcher
 (`package.json`). These are source

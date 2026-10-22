@@ -35,7 +35,7 @@ Hard-safety findings remain blocking in every mode.
 Read persisted state without re-verifying:
 
 ```
-devcouncil_get_gaps           # gap list (blocking_only filter available)
+devcouncil_get_gaps           # gap list for task_id (no filter argument; read each gap's blocking field)
 devcouncil_get_diff           # working-tree diff, optionally scoped to the task
 ```
 

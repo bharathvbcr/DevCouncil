@@ -428,10 +428,13 @@ of `rows`). Labels were made by one pass per language and spot-checked; three
 were corrected and say so in their evidence. The eligibility test binds each
 listed language to it: at least one labelled row, and at most 5% false on every
 corpus; a missing record, or one missing `corpora`/`name`/`languages`, fails.
-Measured: Go 0/17 (one corpus of six), TypeScript 0/29, TSX 0/14, Rust 0/3
-(two corpora of twelve), Kotlin 0/9 — all nine coverage-capped at 0.66, and
-its two rows published at 0.9 are `unsure` — Python 17/58 (off the list), Swift
-no row on ten corpora (off the list). The coverage-capped rows count because
+Measured at that date: Go 0/17 (one corpus of six), TypeScript 0/29, TSX 0/14,
+Rust 0/3 (two corpora of twelve), Kotlin 0/9 — all nine coverage-capped at 0.66,
+and its two rows published at 0.9 are `unsure` — Python 17/58 (off the list),
+Swift no row on ten corpora (off the list). Kotlin was delisted on 2026-10-16
+(`88902fe4`) when its nine rows lost their dead labels; the list today is Go,
+Rust, TypeScript and TSX (`CONFIDENT_TIER_ELIGIBLE`), and `corpora` holds 21
+corpora, not 20. The coverage-capped rows count because
 their evidence is the confident branch's; the fixtures have no coverage loss,
 so the two definitions agree there.
 

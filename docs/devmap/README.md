@@ -330,6 +330,18 @@ devmap build . --manifest   # also write repo_map.json and code_graph.json
 devmap status               # generation, node/edge counts, freshness
 ```
 
+`--full` re-parses every source and writes a full generation. `--verify-rows` is
+its cheap half: it keeps incremental extraction and only re-derives the validity
+of every stored edge. `--force` is a different flag: it needs `--manifest` and
+replaces a repo map or code graph written by another schema or tool; it does not
+widen the rebuild.
+
+Ctrl-C stops a build. The first interrupt makes it return at the next file with
+nothing committed and exit **130**. A second interrupt, or one that arrives after
+extraction has finished and the build is persisting, exits 130 immediately. The
+serial retry of budget-refused files is covered too, so a long retry no longer
+needs a second kill. A build cancelled during extraction commits no generation.
+
 State lives in `.devmap/` by default. See **Where state lives** below.
 
 For a fresh checkout or linked worktree, run `devmap paths --json` to find
@@ -704,11 +716,13 @@ subsystems whose functions only call each other.
   when nothing names the symbol *and* its language is in
   `devmap_analyze::CONFIDENT_TIER_ELIGIBLE` — a table a test binds to the
   labelled fixtures under `rust/testdata/accuracy/` and to the labelled corpus
-  record beside them (`record.json`, 20 repositories), so a language is listed
+  record beside them (`record.json`, 21 corpora), so a language is listed
   exactly when its fixture shows no confident-tier false positive with every
   truly-dead marker in that tier, and the record holds labelled rows for it with
-  at most 5% false on every corpus. Today that is Go, Kotlin, Rust, TypeScript
-  and TSX. Python came off on 2026-10-10 (17 of 58 corpus rows false); Swift is
+  at most 5% false on every corpus. Today that is Go, Rust, TypeScript and TSX
+  (`CONFIDENT_TIER_ELIGIBLE`, `liveness.rs:1291`). Kotlin was delisted on
+  2026-10-16 (`88902fe4`): its nine labelled rows lost their dead labels, so they
+  no longer count. Python came off on 2026-10-10 (17 of 58 corpus rows false); Swift is
   off because ten corpora measured gave it no confident row to label, so only
   its fixture had ever tested it. Kotlin's nine corpus rows are all
   coverage-capped at 0.66. Any other language's
@@ -733,6 +747,14 @@ subsystems whose functions only call each other.
   conforms to a framework protocol are withheld as possible witnesses). Every such row carries `evidence`: how many
   unbound sites name the symbol and the first one as `first_path` /
   `first_line`, so it can be checked in one jump.
+- **Scripts and namespaces.** A script's entry claim spares the functions,
+  methods and classes of a Python, JavaScript or TypeScript file, but not its
+  module-level variables: an uncalled constant in a script is reported like one
+  anywhere else. That is a scope decision rather than a proof the callables are
+  live. An unreferenced, unexported TypeScript/JavaScript `namespace` or `module`
+  is held at 0.4 (`namespace member reads at module scope are not extracted`)
+  until extraction stops shadowing its name, because a file-scope `NS.a` read
+  emits no reference (DIVERGENCES X63, X64).
 - **`excluded` says what was never examined.** Per language, the uncalled
   symbols spared for their visibility (`not_examined`) and those spared by a
   recorded reason (`exempt`, broken down by token in `by_reason`). A short or
