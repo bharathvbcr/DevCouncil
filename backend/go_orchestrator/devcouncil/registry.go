@@ -121,7 +121,7 @@ func toolSpecs() []ToolSpec {
 		},
 		{
 			Name:        "devcouncil_verify_task",
-			Description: "Verify a leased task. Requires a valid lease_token. Returns Report/Gap/NextAction shapes matching the Python golden fixtures.",
+			Description: "Verify a leased task. Requires a valid lease_token. Verifies the task's diff against its scope and acceptance criteria and returns the verdict: status, blocking gaps, and typed next actions to repair them. The result shape is pinned by committed golden envelopes captured from the retired Python implementation.",
 			InputSchema: rawSchema(`{"type":"object","properties":{"task_id":{"type":"string"},"lease_token":{"type":"string"}},"required":["task_id","lease_token"],"additionalProperties":false}`),
 			Behaviour:   ToolBehaviour{ReadOnly: false, Destructive: false, Idempotent: true, OpenWorld: true},
 		},
