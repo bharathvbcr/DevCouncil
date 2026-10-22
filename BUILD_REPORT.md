@@ -232,6 +232,50 @@ Fable scoped this narrowly.
 - **Still open, and the owner's decision:** the weekly job cannot produce `mutants-baseline.txt`. The full scope is 4,509 mutants, which cannot fit the 350-minute budget. Either shard it with a `--shard k/n` matrix, or shrink the scope.
 - GAP-11 property coverage and daemon envelope freshness stay out of scope.
 
+### Wave of 2026-10-22 (owner: "Next wave"; plan by Fable)
+
+All of this is merged to main, now `1d8a3505`.
+
+**Records honesty, ft-0ed8604:**
+- Docs only, with every claim checked against code.
+- Version 0.2.5.
+- The v0.2.4 notes are marked as never published.
+- New DIVERGENCES rows X63–X66 cover this run's DevMap changes.
+- The Kotlin confident-tier claim is corrected.
+- The LSP row is corrected to opt-in.
+
+**extract-v98 spec, `docs/devmap/design/extract-v98.md`:** a 28-row fact inventory with a probe map, a schema plan and two lanes.
+
+**Quiet benchmark re-run, `benchmarks/results/2026-10-22-quiet-rerun/REPORT.md`:**
+- Main vs pre-run main: +1.2% instructions on a cold build, with no difference on a one-file edit, `dead` or `impact`.
+- The JVM tables add +0.46% per resolve round.
+
+**Store write cost, `docs/devmap/design/store-write-cost-proposal.md` (ft-f6abefd9, measurement half):**
+- The `generation_literals` carry is 52% of an edit's write.
+- The card's two-relation prototype would save only about 4%, so it is a NO-GO.
+- The non-schema wins come first. A v28 payload-scoped unit is projected at 27–29%, and that is the owner's call.
+
+**Benchmark data and hygiene, ft-bc87301a and ft-7364b2c8:**
+- 3,741 raw benchmark captures are untracked: tracked `benchmarks/` fell from 36.3 MB to 8.7 MB. Local ignored copies were restored.
+- Two dead Python scripts are gone.
+- 22 `z`-prefixed Go test files are renamed. Opus checked that the `init()` order still holds.
+- The skills receipt is untracked, and `devmap doctor` warns when installed skills drift.
+- `scripts/__pycache__` was removed.
+- These are still yours:
+  - `${CLAUDE_PROJECT_DIR}/`, which the gate cannot address;
+  - `.venv`, which a system process holds open;
+  - the `.devcouncil/*` files.
+
+**Harness coverage, ft-2950b25e:**
+- The mutants job is sharded per crate, a timed-out shard reports NOT RUN, and the `dc-glob` baseline is committed.
+- `docs/devmap/property-coverage.md` maps all 58 IDs: 33 covered, 3 new tests, 14 retired, 10 uncovered.
+- A new 20-cycle daemon test found a **real bug** and fixed it. Query envelopes said `fresh:true` while queued edits made the tree differ. They now report unverified while `pending_paths` is non-empty.
+
+**Still open from this wave:**
+- The `devmap-resolve` and `devmap-analyze` mutant baselines, from the first CI run.
+- Envelopes read `fresh:null` after a rebuild until `status` runs.
+- The non-schema store wins.
+
 ### Consumer sweep handover (run from sessions rooted in each repo)
 
 `devcouncil install` reports these consumers stale against DevCouncil main (now `8381c35c`; use the HEAD at sweep time). The schemas are devmap-extract 97, dc-store 10 and workbench 14.
