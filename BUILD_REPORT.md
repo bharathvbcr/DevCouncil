@@ -1,124 +1,225 @@
-# Build report: GitPulse backlog run, 2026-10-17 to 2026-10-18
+# Build report: DevMap backlog run, 2026-10-20 to 2026-10-21
 
-This run worked the open GitPulse cards for DevCouncil. Each lane went through an Opus brief, a Sonnet implementer, one or more adversarial Sonnet passes, and an Opus review. Fable ruled on sequencing and tradeoffs. Local `main` moved from `4a5ca10c` to `e53d1665` (as of 2026-10-19, at wrap-up). No lane is in flight. **Nothing is pushed.** No card reached done: requesting done returns "no verification record exists for this task: Manvi's work.verify.task has not judged it", and that tool cannot be invoked from this session.
+This run worked the open DevMap cards on the GitPulse board, as the owner asked ("focus on devmap improvements"). Each lane went through four steps: an Opus brief, a Sonnet implementer in its own worktree, one or more adversarial Sonnet passes, and an Opus review. Fable ruled on sequencing and scope.
 
-AUDIT_REPORT.md's waves 1–6 were already all in review when the run began, so work continued by priority, severity and Fable's order. The previous report is kept as `BUILD_REPORT-2026-10-15.md`.
+**Update, 2026-10-21:** the owner said "merge all and for others go with fable".
+- Every lane is merged. Local `main` moved `aacffb85` → `b888043d` (lanes), then → `99d41a1f` (the ft-2c800986 design doc), then → `500a55c8` (the GAP-13 harness).
+- **Nothing is pushed.** Fable ruled that main pushes after the consumer sweep.
+- See "After the merge" at the end of this report.
 
-## Rules adopted mid-run (owner: "proceed with Fable's advice")
+No card reached done: done is gated on Manvi's verification, and that has not run. The previous report is kept as `BUILD_REPORT-2026-10-19.md`.
 
-- A lane does not merge until its adversarial round closes with no open high or medium findings.
-- At most two lanes run at once. Load was 60–190 throughout, so a wall-clock test that fails under load is treated as no evidence and rerun alone.
-- Commit before any switch, checkout, rebase or cherry-pick. This was an owner instruction.
-- `EXTRACTION_SCHEMA_VERSION` is frozen at 97. Once a version is on main it is frozen.
-- Main is not pushed until the consumer sweep (ft-3018ab76).
-- Cards stay in review until Manvi verifies them. An empty dead-code tier never passes.
-- Every merge is built with `merge-tree`, tested on the combined tree, then fast-forwarded, and the card is updated only after the fast-forward is confirmed. Other sessions merged to main three times during the run.
+AUDIT_REPORT.md's waves were already all in review before this run, so the order came from priority, severity and Fable's rulings.
 
-## Cards moved to review (merged to local main)
+## Rules in force
 
-| Card | What landed | Adversarial rounds |
-|---|---|---|
-| ft-b812a97c, ft-8ed75897 (harness parts) | honest_miss split (recorded / silent / wrongly_bound); `DeadFp` empty-tier state that never passes; fail-loud `unverifiable` rows; `tools/accuracy/cmd/labelmerge` (Go) | 17 breaks, all fixed |
-| ft-40f73e87 (Python fields and `super()`) | `self.x = Ctor()`/factory field typing; bounded C3 MRO; per-file import-resolved bases; typing/abc markers skipped, aliases opaque | 5 rounds; regressions fixed; residue moved to ft-572bb69d |
-| ft-a7f9a7de (TS spread/assign/alias) | `js_objects` facts plus a last-write-wins walk: member writes, conditionals, escape, default-import alias, Vue/Svelte | 19 breaks fixed |
-| ft-6a46dddd (Swift properties) | properties become `Field` symbols reachable only via ReceiverType/self; dead-code exemptions | 2 rounds; Fable accepted 1.63× on 30k properties (new symbols) |
-| ft-572bb69d (Python residue) | one `python_scope_lookup` for every resolver path; `ScopeIndex` keeps indexing linear | 3 rounds; 12 regressions plus 2 mediums fixed |
-| ft-292df47e (corpus runner refusals) | refuses builds with budget refusals or extra parse failures; per-corpus `parse_failed` baseline in corpora.json; atomic record write | 1 medium plus lows fixed |
-| ft-ce979db3 (MCP status) | daemon/MCP `degraded_reason` uses the same join as the CLI (`store_degraded_reason`) | 0 high/medium; 4 lows fixed |
-| ft-c7d548e1 (dependencies direction) | outbound-only `deps` for symbols and files; additive `Response.note`; shared `bounded_text` | squared count (high) and min_rung (medium) fixed; criterion 1 amended by Fable |
-| ft-b79f84e2 (refusal freshness) | every query answer leaves through one `exit` that stamps the store verdict; the verdict is pinned to the generation the answer read (race fix) | 3 rounds; one real race found on main and fixed |
-| ft-75ddb66b (search half) | a missed name names the partial-parse region that may hide it; case per language; stale-file check; read cap 16 (Fable) | 3 rounds |
-| ft-90cef8de (split) | treesitter.rs 17,248 → 84 lines and resolver.rs 13,658 → 859 lines, now in 27 submodules; byte-identical build | pure move, so identity evidence stood in for an attack |
-| ft-19604c23 (Go type use) | same-file Go type mention exemption; the dead caveat names capped and eligible languages; resolver qualifier-slot leak fixed | 2 rounds each half |
-| ft-eb82c9d3 (relative build root) | one `root_parser` anchors and lexically cleans every root | 1 medium plus 2 lows fixed |
-| ft-befc1ff0 (blast pathspecs) | `GIT_LITERAL_PATHSPECS=1` in the shared dc-proc git runner; the conflicting global switches are stripped | 1 medium fixed; Go call sites are logged as a follow-up |
-| ft-09f2437e (budget refusals in answers) | pinning tests for dead, affected, explore and the daemon drain; caveat names "budget-refused" and a count. Fable amended criterion 2 to a corpus-wide caveat. | 0 high/medium; 2 lows fixed |
-| ft-93ece913 (blast/suspects) | mostly already on main (cded4595, 4e311c09); added an unreadable basis → ContentUnavailable | the ≤1/3 wall-time target has not been measured on a quiet machine, so the card stays open |
-| ft-b7362179 (resolution-rate honesty) | call-blind and vendored sites leave the headline rate; additive `measured_resolved_sites` / `measured_unresolved_sites` / `measured_explained_sites` carry the headline denominators. Opus ruled the raw totals stay a public contract, and an invariant test ties them to the measured fields. Merged as `7e110127`. | probes repointed to `measured_*`; analyze and cli suites green on the combined tree |
-| ft-bd1bfac9 (Python relative imports) | a relative import resolves only inside the importing package; a bare `.` or `..` names the package, so only its `__init__.py` answers (`30a7143c`). Merged as `ec034f60`. The follow-up `c167b9d8` handles namespace-package submodules and the bare-dots binding join. | 4 attack probes failed on the first round, then were fixed before merge |
-| ft-915b0a03 (Swift resolver residue) | private nested namesakes; call chains where `-> Self` resolves to the receiver's concrete type before override resolution; generic-parameter returns abstain; qualified `A.Inner` keeps its edges; a chain-typed receiver gets no bare-name protocol fan-out; X42 deinit doc line. The closure-property call path was **removed**: the extraction has no function-type facts, so it bound inferred, lazy, computed and collection properties. Merged as `55647cb1`. | 2 rounds (53 and 38 probes): 1 HIGH plus 4 MEDIUM, then 4 HIGH plus 4 MEDIUM, all closed. Swift fixture +3/−0 edges, all checked against source. |
-| ft-c0afdfef (Python receiver residue) | `f(x).m()` call-result receivers typed via `factory_return_type`; class-body field annotations read in the owner class's file; 3-segment `import a.b.c` calls. Abstains on any scope shadow (all binding forms via `python_scope_lookup`), annotations it cannot follow through the owner file's imports, opaque decorators (`cache`/`lru_cache` only via `functools`), names provided by two imports, and rebound or ambiguous 3-segment roots. Python recall 0.88 → 0.949, precision 1.0. Merged as `e53d1665`, with the `known_failing.tsv` conflict resolved as the union of the Swift and Python rows. | 3 rounds (100 + 81 probes): 1 HIGH + 6 MEDIUM, then 3 MEDIUM, all closed. Fixture +8/−0 Python edges; bench −0.5% (fixture), −2.9% (2000-caller shape). |
+These were carried over from the owner's 2026-10-17 adoption of Fable's advice.
+
+- At most two lanes ran at once. Load stayed between 8 and 70.
+- No merge before a lane's adversarial round closes.
+- `EXTRACTION_SCHEMA_VERSION` stays frozen at 97, so no lane changed extraction output.
+- Cards stay in review until Manvi verifies them.
+
+## Cards moved to review
+
+| Card | Branch @ head | What landed | Adversarial |
+|---|---|---|---|
+| ft-47124ed7 (load-degraded index) | none (bookkeeping) | Every criterion is either met on main or moved to ft-09f2437e or ft-292df47e. Evidence tests were re-run: status 8/8, contention 4/4, traversal hole 6/6. | n/a |
+| ft-fb394194 (build cancellation) | `lane/build-cancel` @ `d6915e19` | One token, `devmap_query::Cancel`, flows from SIGINT in `devmap build` and from daemon shutdown or signals into extraction and the budget retry. A single phase CAS decides cancel versus exit 130. A cancelled build writes no generation. Daemon paths stay queued and uncharged. | 1 MEDIUM and 2 LOW, plus 2 inferred issues, all fixed with probes. Non-cancelled output is byte-identical to main (node, edge and payload hashes). 200 random-point cancels and an 11-delay real SIGINT sweep held. |
+| ft-5ad86836 (Kotlin declaration drops) | `lane/kotlin-decl-proof` @ `b392f0a5` | Tests only. AC3 and AC4 are met by test. **AC1 found a silent loss:** `@A\n@B\nprivate fun f() {}` parses Clean as an `infix_expression`, so `f` disappears with no partial flag. AC2: a one-line `class C { companion object { … } }` is an ERROR node. Both fixes are extractor output (v98), and their tests are ignored with the reason. | Opus returned the AC4 found-check (it matched the whole JSON) and it was fixed. |
+| ft-a43bfbc6 (parent_dir) | `lane/liveness-script` @ `93af32be` | Splits on `/` or `\`. Indexed paths are already normalised, so this is boundary hardening. | Attacked with lane C; held. |
+| ft-1d03bb95 (Python script exemption, getattr) | `lane/liveness-script` @ `93af32be` | Part 2: a Python, JS or TS ScriptEntry file claim no longer exempts **module-level constants and variables**. Functions, classes and methods keep it (Fable's scope). Part 1 (getattr) is **blocked on extract-v98**: no call record exists for the outer call. | Narrowing every symbol exposed about 20 live callables at 0.4 in real repos (scholarlm 16/16 live), so Fable cut the scope to constants. A 141-probe attack corpus is kept as tests. |
+| ft-8a85f117 (KNOWN_GAPS) | `lane/known-gaps` @ `1d83a9c6` | See the item breakdown below the table. | Byte-identity evidence (pure dead-code deletion) |
+| ft-eda9b3a6 (Kotlin overloads) | `lane/resolver-bundle` @ `1fd736bd`, also `lane/resolver-bundle-on-lane-c` @ `bb7933fc` | Same-file sibling overloads (Kotlin, Swift, Java, C#, Scala) no longer self-edge; they get a labelled abstain. Identical receiver hits count as one target, so kg.OV2 binds. The Swift protocol fan-out keeps the other conformers. `Resolver.parent_dir` is fixed. kg.OV1 and kg.OV2 leave known_failing. **AC4 (distinct ids) is blocked on v98.** | 3 rounds; see below |
+| ft-87b28bb6 (Kotlin Z1–Z6) | — | **Nothing landed.** Z3 and Z5 were implemented, attacked and reverted on Fable's ruling. Z3 now waits on ft-2c800986; Z1, Z2, Z4, Z5 and Z6 wait on v98. Recommendation: close this card in favour of those. | — |
+| ft-260158ce (TS namespace dead at 0.9, new) | `lane/ts-namespace` @ `53ad3ef5` | The root cause is verified: `scope_locals.rs` has no `internal_module` arm, so a namespace shadows itself and file-scope reads are dropped. The real fix is v98. Meanwhile, unexported TS and JS namespaces with no inbound evidence are capped at 0.4 with a named reason. | Demote-only change; Opus confirmed `Module` comes only from namespaces in TS and JS |
+
+The ft-8a85f117 items:
+- **GAP-21, closed.** The `async_function_definition` arms were dead in all 33 linked grammars and are deleted. Output is byte-identical on `rust/` (17,123 nodes, 68,109 edges) and on MLSystemsLab.
+- **rayon dev-dependency, kept.** The `worktree_stress` example uses it.
+- **`manifest` path, used.** It is honoured, with no change.
+- **GAP-10, measured, still open.** A one-file `--affected` build costs about 18% of a cold build: scan and resolve stay whole-tree.
+- **GAP-8 and GAP-9, re-measured** on local corpora. They are not the original 12,821-file corpus.
+
+### Lane D's adversarial rounds (resolver bundle)
+
+- **Round 1** found wrong edges at 1.0:
+  - Z5 accepted any bare return type and ignored casts.
+  - Z3 dropped qualifiers.
+  - Python alias reads bound through `for`, `with`, walrus and comprehension rebinding.
+  - Some true recursion was lost.
+
+  Z5 and the alias bind were reverted to v98. Z3 was hardened and the overload abstain was scoped to siblings.
+- **Round 2** found three pre-existing wrong edges at 1.0 in the Kotlin factory path, widened by Z3:
+  - an explicit import loses to a star import;
+  - a nested class is read as a top-level name;
+  - a member `make()` is mistaken for the top-level one.
+
+  The fixes touched six resolver seams.
+- **Round 3** found that those fixes caused 4 HIGH regressions against main:
+  - ChronosFlow `Task.toDayQuickItem` and `Habit.statusLabel` were lost;
+  - Scala never stem-binds;
+  - a function-local import suppresses a star import;
+  - cross-file `split_types` drops real recursion.
+- **Fable chose option B:** keep only the same-file overload abstain and `parent_dir`, revert every round-2 change and Z3, and file the pre-existing bugs as ft-2c800986.
+- **Close condition, met:** a corpus diff of the cut branch against main on 12 repos (AppLock, Blitztree, ChronosFlow, Curio, DevType, Graft, M5Blade, MarkDev, Meridian, scholarlm, Strait, Vani). Every removed edge is a same-file overload self-edge, and no non-self edge was lost. The added edges are overload receiver binds and the 0.40 protocol fan-out, and spot checks were right. 45 probes are ignored, citing ft-2c800986.
 
 ## Benchmarks on touched paths
 
-Instructions retired, min-of-N, interleaved.
+Each figure is `devmap build rust --full`, release build, instructions retired, min of 3, interleaved against that lane's base.
 
-| Path | Result |
-|---|---|
-| Python, TS and Go fixture builds | within ±2% of base on every lane |
-| Swift fixture | +2.0% |
-| Swift, 2000 shared names | 1.26× |
-| Swift, 30k properties in one type | 1.63×, RSS 395 vs 189 MB. Accepted by Fable because it measures new symbols. The follow-up is folded into ft-f6abefd9. |
-| TS 10k-alias hostile tree | 1.27× (bound 1.5×) |
-| Python indexing, 2000 functions × 10 imports | 1.01× |
-| Search miss over 2,000 partial files | 0.39 → 1.9 ms (~5×), which misses the 3× target. Accepted by Fable and recorded on the cap constant. A hit costs 1.04–1.06×. |
-| Refusal freshness exit | 0.97–1.00× |
-| resolver/treesitter split | ±0.5% |
+| Lane | Base → new | Delta |
+|---|---|---|
+| build-cancel | 188.511G → 188.376G | −0.07% |
+| liveness-script | 190.37G → 187.86G | −1.3% |
+| known-gaps | 189.60G → 187.23G | −1.25% (peak RSS +2%, likely noise) |
+| resolver-bundle (cut) | 190.48G → 192.68G | +1.2% |
+| ts-namespace | 191.24G → 191.43G | +0.10% |
+
+None exceeds the 5% gate.
 
 ## New and folded cards
 
-- **New:**
-  - ft-572bb69d — Python residue. Later worked and merged.
-  - ft-38ef7393 — store charged partial-parse ranges as structured rows. Owner decision; it is a store schema change.
-  - ft-eb82c9d3 — relative build root. Merged.
-  - 10 split cards from the four stale umbrellas (label `split-2026-10-17`): ft-bd1bfac9, ft-1d03bb95, ft-c0afdfef, ft-eda9b3a6, ft-87b28bb6, ft-5ad86836, ft-80c5d100, ft-915b0a03, ft-292df47e (merged), ft-09f2437e.
-- **Folded into existing cards:**
-  - the 30k-symbol insert cost → ft-f6abefd9;
-  - the generation-id reuse case → ft-c13da1b7;
-  - the Go resolver half → ft-19604c23;
-  - the wave-7 re-vendor target → ft-3018ab76.
-- **Released to backlog:** ft-c666ba7c, ft-0720fe1d, ft-8ca270ad, ft-47124ed7 (each re-filed as the split cards above), and ft-befc1ff0, moved back to ready.
+- **ft-260158ce** (new, p1, high): a TS namespace is confident-dead. It is now in review with the cap; the extractor fix is v98.
+- **ft-f0af68af** (new, p2, medium): recall gaps that keep script callables exempt. These are JS object-literal members, `T[k]()` dispatch, Python attribute-receiver methods, `nn.Module` hooks, string annotations and `global X; X += 1`. Most are v98.
+- **ft-2c800986** (new, p1, high): the pre-existing Kotlin and JVM factory-path wrong edges at 1.0, and Scala stem binding. It also covers the Python 0.9 global-unique bind. It carries the round-3 regression guards as constraints.
+- **Not filed as a separate card:** an extract-v98 bundle. The board's duplicate check flagged it. Each v98 item stays on its own card; the list is below.
 
 ## Fable's decisions
 
-- Waves serialise on resolver.rs. The Python follow-up ran in parallel with TS only because it fixed regressions on main.
-- Schema handling:
-  - accept the 94→95 bump;
-  - hold the version across lanes;
-  - bump to 96 once 95 was on main;
-  - freeze at 97.
-- BLESS only when monotone. Labels are justified in the label file.
-- Typing markers are decided by resolved module, not by an allowlist. Opus narrowed this: builtins stay opaque, and the method allowlist was later deleted as unsound.
-- An empty dead tier never passes.
-- Do not merge `accuracy/rustlabel` on a shallow review. Another session merged it on 2026-10-18; see below.
-- Release the stale umbrella cards. Do the split before further language work.
-- deps criterion 1 is amended: outbound-only stays honest.
-- Accept the Swift 1.63× (new symbols) and the search read cap of 16. Reject a cross-query cache.
+1. Resolver-only and liveness changes are allowed under the v97 freeze. They land at the first build that sees an edit, or with `devmap build --full`; a warm, unchanged store stays stale until then. (Fable's ruling named `--force`, but `--force` only replaces a foreign map; this was verified 2026-10-21.) Each lane proves its change lands under a narrowed write. This revised Fable's first ruling, which had blocked them.
+2. Every extractor-output fix waits for one v98 bump, after the consumer sweep (ft-3018ab76).
+3. Lane C narrows constants and variables only, for Python, JS and TS. A 0.4 label does not make a false row free.
+4. Lane C is merge-eligible despite 12 live 0.4 constants on MLSystemsLab. That gap is pre-existing and resolver-owned, and it is pinned as known_failing `py.AR1`.
+5. Lane D: option B scope cut after round 3. Lost true edges outrank removed self-edges.
+6. ft-2c800986 needs a scope and import model designed before code. Stop after wave 4 rather than stack a fifth unmerged branch.
+7. Defer the competition benchmark (ft-c86df5d4). Reasons:
+   - none of the five competitor tools is installed, and installing them is a new third-party dependency;
+   - the idle-machine guard cannot be met;
+   - it should measure the merged build.
+
+## Waiting on extract-v98 (one bump, after ft-3018ab76)
+
+- **Kotlin:**
+  - Stacked annotations plus a modifier plus a block body are silently dropped on a Clean parse (ft-5ad86836 AC1; HIGH, since a Clean file hides declarations).
+  - One-line companion object (ft-5ad86836 AC2).
+  - Distinct overload ids (ft-eda9b3a6 AC4), and same-name inner classes under different outers.
+  - Z1, Z2, Z4 and Z6 extractor facts, and the Z5 callee type-parameter list (ft-87b28bb6).
+- **Java:** parameter declared types (`declared_type: None`), needed for receiver binding.
+- **Python:**
+  - a getattr outer-call record (ft-1d03bb95 part 1);
+  - function-local alias rebinding facts (`py.AR1`);
+  - the items carried from the previous report.
+- **TS:** namespace self-shadowing in `scope_locals.rs` (ft-260158ce).
+- **tsconfig.rs:** `parent_dir` splits only on `/`.
+- **Swift:** extract-side residue (ft-80c5d100) and function-type property facts.
+- **Scala:** package facts for `jvm_package_by_file` (ft-2c800986).
 
 ## Deferred or blocked, with reasons
 
-- **ft-3018ab76** — GitPulse re-vendor to extract v97, plus the Jarvis and Manvi pins. Each pin bump needs the owner and must be done from those repos. GitPulse's DevMap view already reports "stored extraction payload is obsolete" for this repo.
-- **ft-aeb4a53f** — destructive schema migration (owner).
-- **ft-1f7825c8** — release archives. Blocked on CI green (ft-7cb2d308), the release decision, and a supply-chain sign-off.
-- **ft-75ddb66b criterion 3, ft-6a46dddd criterion 5, and the Python probes tagged "needs extractor change"** — waiting on the schema unfreeze or the corpus labels.
-- **Swift extractor follow-ups for ft-915b0a03:** function-type property facts, so closure-property calls can bind soundly, and the "needs extractor change" ignores. These wait on the schema unfreeze.
-- **Python extractor follow-ups for ft-c0afdfef:**
-  - Rows py.Z4, py.Z5/C23b and py.Z6e: return and unpack facts, decorator-to-function links, and attribute-read initializers.
-  - `match`/`case` capture bindings.
-
-  These wait on the schema unfreeze. One known recall loss from this lane is ignored with a pointer: d08g, where a nested local factory no longer types its result. It means a missing edge, never a wrong one. No extractor card has been filed yet; this list is the input for one.
-- **Corpus relabelling, the five "unmeasured" baselines** (LiquiTask, SalEdge, AcademiaTrack, Chronicle, DevPrism), **and the corpus re-measure** — owner work outside this repo.
+- **ft-c86df5d4**, the competition benchmark: see Fable's decision 7.
+- **ft-f6abefd9, ft-3bdf1450 and ft-38ef7393**: store schema changes, which need the owner.
+- **ft-9465b250**, Windows Job Object: a decision, and it cannot be tested on this Mac.
+- **ft-3018ab76**: in progress under an owner gate, and was not touched.
+- **ft-2c800986**: needs a design first (Fable).
+- **ft-f0af68af** and **ft-80c5d100**: mostly v98.
+- **ft-8a85f117 GAP-7**: a VB.NET grammar is a new dependency. **GAP-11, 12 and 13**: run them or retire them.
 
 ## Owner decisions pending
 
-1. Re-vendor GitPulse to extract v97 and bump the Jarvis and Manvi pins, then push main once.
-2. Run Manvi verification for the review cards.
-3. Relabel the corpora and measure the five missing parse-failure baselines.
-4. Store schema: structured charged ranges (ft-38ef7393) and payload identity (ft-3bdf1450).
-5. The count-only parse baseline cannot see a swapped failing file. Recording the set needs hashed paths.
-6. `accuracy/rustlabel` was merged by another session (`1c4866d2`) after Fable advised a full read first. Decide whether it needs that review now.
-7. Disk: about 37 GiB free. The gate holds deletes of finished build directories: `tmp/bra-target` and `tmp/lp-target` (8.1 GB), plus each agent worktree's `target-lane`. New lanes are paused until space is freed.
-8. Leftover git state: one stash entry, `stash@{0}`, "lane-fix-search-partial". Its content is already committed, but the gate held the drop.
-9. Branch cleanup (2026-10-19): 21 merged branches and 20 finished worktrees were removed. You declined a force-delete twice, so these branches remain:
-   - `attack/py-relative-imports`, `fix/py-relative-imports-probes`, `attack/mcp-status`, `attack/resolution-rate`, `attack/swift-properties`, `attack4/py-wave8`, `attack/swift-resolver-residue`, `attack2/swift-resolver-residue`, `attack/py-receiver-residue`, `attack2/py-receiver-residue`.
-   - The `literals-substring-b3546e` worktree and its merged branch belong to another session and were left alone.
-   - Their commits are on main as rebased or cherry-picked equivalents. `git cherry` confirms this for most; `attack4/py-wave8` matches by subject, and `fix/py-relative-imports-probes` differs from `c167b9d8` only in one comment.
-   - Delete them with `git branch -D` once you are satisfied.
+1. **Merge to main.** Proposed order:
+   - first the independent lanes, `lane/build-cancel`, `lane/known-gaps` and `lane/kotlin-decl-proof`;
+   - then the stack, `lane/ts-namespace`, which contains `lane/liveness-script` and then `lane/resolver-bundle-on-lane-c`. Merge it as one fast-forward of the stack.
+
+   `lane/resolver-bundle` is the same resolver change based on main, and is redundant if the stack is merged. Pairwise `git merge-tree` of the four tips is clean, but the **combined tree has not been built or tested**. After merging, run the full Rust suites on it, reinstall `devmap`, and run `devmap build --full` so warm stores pick up the resolver and liveness changes. **Done 2026-10-21; see below.**
+2. Manvi verification for the cards in review.
+3. The consumer sweep and the v98 unfreeze (ft-3018ab76). `devcouncil install devmap` reports the following consumers stale:
+   - GitPulse vendored crates, `gitpulse-mcp` and GitPulse.app;
+   - `dcstore`;
+   - the Manvi and Jarvis pins (devmap-extract 94 against 97, dc-store 9 against 10, workbench 13 against 14).
+4. ft-2c800986 design: one JVM/Kotlin scope and import model, so explicit-over-star, nested-versus-top-level and member-versus-top-level are decided at one owner.
+5. ft-87b28bb6: close it in favour of ft-2c800986 and v98.
+6. ft-8a85f117: GAP-7, VB.NET, either a pattern-only decision or a grammar dependency. GAP-11, 12 and 13: run or retire.
+7. ft-c86df5d4: approve installing the pinned competitor binaries, and schedule an idle machine.
+8. **The devmap MCP server is misconfigured.** It points at `tmp/fix-wb/rust/target/devcouncil-testbin/…/devmap`, which no longer exists, so every lane navigated with the CLI.
+9. **Cleanup:**
+   - Agent worktrees under `.claude/worktrees/agent-*` hold the lane and attack branches.
+   - Three detached probe worktrees, under `agent-a1ed67124fcd39a2b/{probe-c,probe-main,.claude/worktrees/probe-main}`, plus an untracked `corpus-out/`.
+   - Survey ignored files before removal: `git worktree remove` deletes ignored files.
+   - The attack branches are `attack/build-cancel`, `attack/liveness-script`, `attack/resolver-bundle`, `attack2/resolver-bundle` and `attack3/resolver-bundle`.
 
 ## Not verified
 
-- No workspace-wide `cargo test`. Each merge was verified on the affected crates' full suites on the combined tree.
-- Go host tests ran only for `dc/devmap`.
-- DevMap MCP was unavailable for the whole run (ENOENT). Lanes navigated with the CLI and source reads.
-- Manvi verification has not run.
-- No corpus re-measure was done.
+- The combined merge tree was not built or tested; only each lane's own suites ran.
+- Wall-clock tests failed under load in several suites: `s01_thousands_of_factories_bounded_and_correct`, `crash_consistency::a_build_killed_mid_persist_leaves_a_whole_generation`, `build_lsp_opt_in`, and others listed in the card logs. Each passed when rerun alone. Not every one was checked against main.
+- Windows `cfg` arms (lane A's `CtrlC` stream) were not compiled.
+- No workspace-wide `cargo test`, and no Go host tests.
+- Corpus classification of added edges was by sampling. Removed edges were checked in full where the counts were small.
+- GitPulse insights git facets were deferred under load at the start and the end of the run (unscanned, not clean). `collision_risk` was clean once, with 2 of 2 worktrees scanned.
+- The DevMap MCP was unavailable for the whole run. Lanes used the `devmap` CLI, extraction dumps and source reads, and DevMap answers were often `walk_incomplete`.
+- The installed `devmap` was rebuilt from main at the start: it had been 7aa6bf51 and was missing the freshness fix. It now reports build `aacffb85`.
+
+## After the merge (2026-10-21)
+
+The owner said: "merge all and for others go with fable".
+
+### How the merge was done and verified
+
+- I built the merge commits with `merge-tree` and `commit-tree` on top of the stack `lane/ts-namespace`, in this order:
+  - `7787808c` merges build-cancel;
+  - `1e5eefd6` merges known-gaps;
+  - `b888043d` merges kotlin-decl-proof.
+- Combined-tree test: the full suites of devmap-extract, -store, -query, -resolve, -analyze, -cli and -serve ran on `b888043d` in a scratch worktree. 139 suite binaries passed and 8 tests failed.
+  - 7 of the 8 passed when rerun alone at load 30: `test_adversarial_inputs`, `the_under_limit_fixture…`, `a_file_of_nothing_but_dynamic_imports…`, two `python_extract_attack4` timing tests, `p4_a_five_thousand_edge…` and `hostile_five_thousand_extensions…`.
+  - The 8th, `s01_thousands_of_factories_bounded_and_correct`, fails the same way on main: "0/3000 resolved". Under load the 5 s parse budget refuses its generated file. It predates this run.
+- Main then fast-forwarded `aacffb85` → `b888043d`, confirmed by rev-parse.
+- I reinstalled `devmap` (build `99d41a1f`, reported as `-dirty` only because BUILD_REPORT.md was uncommitted) and `dcstore` (0.2.5, workbench 14; now a match). Then `devmap build --full --manifest` ran: generation 4564, fresh, 0 budget refusals.
+- **Correction:** `devmap build --force` does **not** bypass the unchanged early-return; `--full` does. Earlier notes that say `--force` mean `--full`.
+
+### Fable's rulings on the delegated decisions
+
+1. **ft-2c800986:** design-first.
+   - The doc `docs/devmap/design/jvm-scope-import-model.md` was written, approved with changes, and merged (`99d41a1f`).
+   - Phase 0 ran: 39 of 45 probes failed as the doc predicted.
+     - e6 was a false probe (a loose assertion).
+     - r3, j6 and e7 need Java declared-type facts (V6, v98) and stay ignored.
+     - x1 and x2 are model targets, not guards.
+     - j10 is ignored, citing V5.
+   - **Commit 1** (`lane/jvm-scope-model` @ `c9a6e127`) adds the bench, the FQN/container-chain declaration tables, owner-keyed members and the `resolve_name` seam.
+     - It changes no behaviour: edge dumps are byte-identical to main on Curio, Meridian, MarkDev, DevType and ChronosFlow.
+     - The probe-assertion sweep made about 52 assertions symbol-exact and fixed two wrong expected ids (j4, r5). It added the guards x4 and x5 (an extension on an external `Task` beside an unrelated same-named member).
+     - **Not merged on its own:** `resolve_name` answers `Unmodelled` and nothing reads the tables yet. It merges with the commit that wires it in.
+     - An adversarial round on the tables is running now.
+2. **ft-87b28bb6:** left in review with a note; Z3/Z5 ride on ft-2c800986 and v98.
+3. **ft-8a85f117:** GAP-7 is VB.NET pattern-only, by decision. GAP-11/12/13 were each run once and all are measured-open; see the next section.
+4. **ft-c86df5d4 competition benchmark:** on hold. Installing the pinned competitor binaries (CodeGraph, codebase-memory-mcp, Gortex, Graphify, GitNexus) needs your explicit OK, plus an idle machine.
+5. **Consumer sweep (ft-3018ab76):** this session did the DevCouncil half. The rest is handed over, below.
+6. **v98 unfreeze:** after the sweep.
+7. **Cleanup:** merged worktrees only, after surveying ignored files.
+   - Removed: the integration worktree and the known-gaps, liveness-script, resolver-bundle, attack/liveness-script and attack/build-cancel agent worktrees.
+   - Left, because removal needs `--force`:
+     - the agent-locked worktrees for kotlin-decl-proof, build-cancel, ts-namespace and attack/resolver-bundle;
+     - the nested probe worktrees under `agent-a1ed67124fcd39a2b`, which hold untracked files;
+     - `agent-a9bb175e705f145d9`, where deletion was refused with "Permission denied".
+8. **Push main:** after the sweep. Not pushed.
+
+### GAP-11/12/13, measured once (`measure/known-gaps-11-13` @ `6478b0f1`, merged as `500a55c8`)
+
+- **GAP-11:** 62 of 120 audit property IDs have an ID-named test (heuristic).
+- **GAP-12:** package-scope mutation of devmap-store `maintenance.rs`: 80 mutants, 63 caught, 13 missed (12 in `checkpoint_wal`), 4 unviable. The weekly `mutants.yml` job fails because `rust/mutants-baseline.txt` was never committed. Workspace-scope mutation is unviable because `include_str!` reaches outside `rust/`.
+- **GAP-13:** a 40-cycle daemon soak was clean, and a 200-cycle CLI freshness loop passed after making its cycle count configurable and adding an assertion. Daemon-mode envelope freshness is still unchecked. The soak's default corpus fails because `main` is ambiguous.
+- All of this is filed as **ft-ae653b10** (DevMap test-harness debt).
+
+### Consumer sweep handover (run from sessions rooted in each repo)
+
+`devcouncil install` reports these consumers stale against DevCouncil `500a55c8`. The schemas are devmap-extract 97, dc-store 10 and workbench 14.
+
+1. **GitPulse** (`/Users/bharath/Code/devtools/GitPulse`):
+   - re-vendor: `node scripts/vendor-crates.mjs && bun run check:vendor-schema`, then commit;
+   - copy Manvi's `contracts/serve.ops.schema.json` over GitPulse's copy and update the Rust side;
+   - `bun run mcp:install && bun run mcp:doctor` (all three verdicts OK);
+   - `bun run tauri build` and reinstall GitPulse.app.
+2. **Manvi:** bump the DevCouncil pin in `scripts/module-pins.txt` from `1ae3bc15` to `500a55c8` (devmap-extract 94→97, dc-store 9→10, workbench 13→14), then `manvi doctor`.
+3. **Jarvis:** bump the DevCouncil pin in `upstream.lock.json` and `go.mod` from `1ae3bc15` to `500a55c8`. Gusset must agree in all three places. Then `dev check-pins` and doctor.
+4. **Confirm from the GitPulse checkout:** `bun run check:schema-parity` passes with no stale or unverifiable rows.
+5. **Then:** push DevCouncil main once, and only then unfreeze extract-v98.
