@@ -104,9 +104,12 @@ fn as_refs(files: &[(String, String)]) -> Vec<(&str, &str)> {
 /// instrument that silently stops charging one of its relations reports the
 /// same shape as one that charged it nothing.
 const RELATIONS: &[&str] = &[
+    "serialize",
+    "payloads",
     "file_rows",
     "nodes",
     "fts",
+    "literals",
     "edges",
     "unresolved",
     "digests",
@@ -114,7 +117,7 @@ const RELATIONS: &[&str] = &[
     "dead",
     "history",
     "commit",
-    // Not a relation: the residual, `total - the ten spans above`. Pinned in
+    // Not a relation: the residual, `total - the thirteen spans above`. Pinned in
     // the same list because it is reported in the same list, and because a
     // build that stopped computing it would otherwise look identical to one
     // whose spans genuinely covered the whole write.
@@ -310,5 +313,84 @@ fn an_incremental_build_still_copies_every_node_and_full_text_row() {
         edges_after - edges_before <= edges_before / 10,
         "the ranged relation writes a delta: {edges_before} -> {edges_after}"
     );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A tree whose files carry string literals, so `generation_literals` has rows.
+fn literal_tree(revision: usize, modules: usize) -> Vec<(String, String)> {
+    (0..modules)
+        .map(|index| {
+            (
+                format!("lit_{index}.py"),
+                format!(
+                    "def leaf_{index}():\n    return \"value-{index}-{revision}\"\n\n\ndef caller_{index}():\n    return leaf_{index}() + \"suffix-{index}\"\n"
+                ),
+            )
+        })
+        .collect()
+}
+
+/// The three regions that used to hide in `other` have names, and with them
+/// `other` is a minor remainder rather than half the write.
+///
+/// ft-f6abefd9 measured the cold write's `other` at 1.63 s of 2.96 s (payload
+/// JSON, literal inserts and `ensure_payload_id`) and a one-file edit's at
+/// 0.68 s (the literal carry). Asserted on both shapes, with the named spans
+/// required to be non-zero so a span that silently stopped charging cannot
+/// pass by leaving its time in the residual.
+#[test]
+fn the_regions_that_hid_in_other_are_named_and_other_is_a_remainder() {
+    let dir = tmp_dir("write-breakdown-named-regions");
+    let store = Store::open(dir.join("devmap.sqlite")).unwrap();
+
+    let first = literal_tree(0, 400);
+    let (extractions, resolution, analysis) = pipeline(&as_refs(&first));
+    let (_gen, cold) = store
+        .save_generation_timed(
+            &extractions,
+            &resolution,
+            &analysis,
+            GenerationWriteOpts::default(),
+            "unknown",
+        )
+        .unwrap();
+
+    let second = literal_tree(1, 400);
+    let (extractions, resolution, analysis) = pipeline(&as_refs(&second));
+    let opts = GenerationWriteOpts {
+        affected_paths: vec!["lit_0.py".to_string()],
+        ..Default::default()
+    };
+    let (_gen, incremental) = store
+        .save_generation_timed(&extractions, &resolution, &analysis, opts, "unknown")
+        .unwrap();
+
+    for (shape, breakdown, must_charge) in [
+        ("cold", &cold, &["serialize", "payloads", "literals"][..]),
+        ("incremental", &incremental, &["literals"][..]),
+    ] {
+        let total: f64 = breakdown.parts().iter().map(|(_, secs)| secs).sum();
+        let part = |wanted: &str| {
+            breakdown
+                .parts()
+                .into_iter()
+                .find(|(label, _)| *label == wanted)
+                .map(|(_, secs)| secs)
+                .unwrap_or_else(|| panic!("{shape}: no span named {wanted}"))
+        };
+        for wanted in must_charge {
+            assert!(
+                part(wanted) > 0.0,
+                "{shape}: `{wanted}` charged nothing: {:?}",
+                breakdown.parts()
+            );
+        }
+        assert!(
+            part("other") < total * 0.15,
+            "{shape}: `other` is {:.1}% of the write, not under 15%: {:?}",
+            100.0 * part("other") / total,
+            breakdown.parts()
+        );
+    }
     let _ = fs::remove_dir_all(&dir);
 }

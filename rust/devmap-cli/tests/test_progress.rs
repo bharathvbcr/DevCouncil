@@ -1427,9 +1427,12 @@ fn the_persist_write_phase_reports_what_each_relation_cost() {
     assert_eq!(
         named,
         vec![
+            "serialize",
+            "payloads",
             "file_rows",
             "nodes",
             "fts",
+            "literals",
             "edges",
             "unresolved",
             "digests",
@@ -1437,7 +1440,7 @@ fn the_persist_write_phase_reports_what_each_relation_cost() {
             "dead",
             "history",
             "commit",
-            // The residual: `persist:write` minus the ten relations above.
+            // The residual: `persist:write` minus the thirteen spans above.
             // Reported alongside them rather than left implicit, because the
             // ten covered 84% of a cold write and the missing 16% — the
             // `AnalysisSummary` serialization, third-largest thing the write
