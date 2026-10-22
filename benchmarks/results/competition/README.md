@@ -65,3 +65,12 @@ verification evidence. Read each report's interface, coverage, and
 reproducibility limits before comparing results. The
 [DevMap guide](../../../docs/devmap/README.md#benchmark-comparison) provides a
 shorter summary without replacing the full report.
+
+## Raw captures are not tracked
+
+The per-invocation `*.stdout` / `*.stderr` files each run wrote (3,741 files,
+27.5 MB) were untracked on 2026-10-22 (ft-bc87301a); they remain in git history.
+The captures a REPORT links by name are still tracked, so those links resolve.
+Everything else a report cites (`measurements.jsonl`, `summary.json`,
+`provenance.json`, the frozen run scripts) is tracked. See
+[`benchmarks/README.md`](../../README.md) for where new raw runs go.

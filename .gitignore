@@ -274,7 +274,16 @@ sparse.jsonl
 # Generated benchmark outputs (benchmark source under benchmarks/ stays tracked)
 # benchmarks/results/ is deliberately tracked: the correctness figures the
 # README and CV cite (0.81 -> 0.94, 0 false negatives) are only checkable
-# against the run that produced them.
+# against the run that produced them. What stays tracked is the summary layer
+# (REPORT.md, summary/measurement JSON, provenance, the frozen run scripts).
+# The raw per-invocation captures (`<step>-<tool>-<n>.stdout|.stderr`, ~3,700
+# files, 27 MB at 2026-10-22) are local-only: they are ignored here, were
+# untracked by ft-bc87301a (history keeps them), and a new run leaves them
+# beside its results or under .devcouncil/benchmarks/<run>/. The few a report
+# links by name remain tracked; to cite another, `git add -f` that one file and
+# link it from the REPORT.
+benchmarks/results/competition/*/*.stdout
+benchmarks/results/competition/*/*.stderr
 
 # DevCouncil local state.
 #

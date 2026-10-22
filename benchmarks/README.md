@@ -10,6 +10,28 @@ handling) which a terse natural-language goal omits. The agent never sees the
 hidden tests; they are applied only at scoring time. This is what separates
 "passes the happy path" from "actually correct".
 
+## What is tracked, and where raw runs live
+
+`results/` keeps the summary layer in git: every `REPORT.md`, `summary.json`,
+`measurements.jsonl`, provenance file and the frozen run scripts copied into each
+run folder. The raw per-invocation captures of the competitor runs
+(`results/competition/<run>/<step>-<tool>-<n>.stdout|.stderr`) are **not**
+tracked (untracked under ft-bc87301a; history still holds them). `.gitignore`
+ignores that pattern, so a new run leaves its raw captures next to its results or
+under `.devcouncil/benchmarks/<run>/`, both local-only. A capture a report links
+by name is kept tracked so the link resolves; to cite another one, `git add -f`
+that single file and link it from the REPORT.
+
+Status of the Python here under the language policy: the scripts are throwaway
+analysis and reference harnesses, not shipped tooling. `map_bench.py`,
+`competition_bench.py` and the three `*_ab.py` drivers (each carries its own copy
+of the ABBA `schedule()`) produced the published speed claims and stay as the
+provenance of those numbers until a Rust harness reproduces them. The
+effectiveness harness (`run_bench.py`, `tasks.py`, `analyze.py`, `_validate.py`,
+`calibration_dashboard.py`) drives the retired Python `dev` CLI from a project
+`.venv`. Nothing in CI runs any of it; CI runs only the Go plot program in
+`benchmarks/plots`.
+
 ## What it measures
 
 For the **same terse goal**, run two (optionally three) arms and score each arm's
@@ -105,7 +127,7 @@ Arm-B acceptance-check tuning (how DevCouncil proves each acceptance criterion):
   **majority vote** (default `1` for the benchmark pass). A criterion is proven only
   when a strict majority pass; an all-fail is a real defect (blocks); a split is
   inconclusive (non-blocking). `>1` outvotes a single mis-generated check — useful
-  for `local_monitor_probe.py` calibration, not the default e2e run.
+  for local-monitor calibration, not the default e2e run.
 - `--ac-repair-attempts N` — when a compiled check *fails to run* (wrong import, broken
   one-liner) feed the error back and regenerate the command up to `N` times (default
   `1`). Rescues the under-credited `incomplete`; can never weaken the gate, since a
@@ -117,7 +139,7 @@ Arm-B acceptance-check tuning (how DevCouncil proves each acceptance criterion):
   monitor. Compounds with `--ac-samples`.
 
 For calibrating a weak/local reviewer (not the default e2e pass), use
-`local_monitor_probe.py` with `--samples 3 --per-criterion`, or the e2e flags
+the e2e flags
 `--ac-samples 3 --ac-repair-attempts 2 --ac-per-criterion` alongside a larger
 `--monitor-model`.
 
@@ -133,36 +155,11 @@ python benchmarks/calibration_dashboard.py benchmarks/results/<run>.json
 Reports decisive accuracy (passed/blocked), overall calibration including `incomplete`
 verdicts, and infra-error exclusions per run.
 
-
-`local_monitor_probe.py` isolates the link the full benchmark showed failing on
-local monitors: can the `implementation_reviewer` model compile runnable,
-faithful per-criterion acceptance checks? It drives the REAL production stack
-(OllamaProvider → ModelRouter → AcceptanceTestCompiler), compiles checks for a
-few fixed tasks, then executes those checks against a **reference**
-implementation (every criterion must be proven — anything less is exactly the
-under-credited `incomplete`/false `blocked` from the e2e benchmark) and a
-**buggy** one (the criteria the bug breaks must NOT be proven — a proven one is
-a rubber-stamped defect).
-
-```bash
-python3 benchmarks/local_monitor_probe.py                 # config's reviewer model
-python3 benchmarks/local_monitor_probe.py --model qwen3:8b --samples 3 --per-criterion
-OLLAMA_THINK=false python3 benchmarks/local_monitor_probe.py   # latency/quality tradeoff
-```
-
-Requires only a running Ollama server. Results land in
-`results/local_monitor_<ts>.{json,md}`. Useful Ollama runtime knobs (all env):
-`OLLAMA_NUM_CTX` (base context window; requests auto-grow up to
-`OLLAMA_MAX_NUM_CTX` when a prompt would otherwise be silently truncated),
-`OLLAMA_THINK=true|false|low|medium|high` (thinking models: reasoning dominates
-latency — measured ~65x on one compile call — but usually improves check
-quality; `low|medium|high` set an explicit thinking BUDGET on models that
-support levels, Ollama >= 0.12), `OLLAMA_NUM_PREDICT` (hard cap on generated
-tokens — bounds a runaway thinking spiral to a fast, healable truncation
-instead of a 600s HTTP timeout), `OLLAMA_MAX_CONCURRENCY` (client-side cap on
-in-flight requests, default 2 — fan-out callers otherwise queue server-side
-where their read timeouts tick while waiting; `off` disables),
-`OLLAMA_KEEP_ALIVE`, `OLLAMA_TIMEOUT`.
+The local-monitor probe (`local_monitor_probe.py`) was removed under ft-bc87301a:
+it drove the retired Python `devcouncil` package (`OllamaProvider`,
+`AcceptanceTestCompiler`), which no longer exists in this tree, so it could not
+run. Its recorded runs, `results/local_monitor_*.{json,md}`, stay and are still
+plotted; `git log -- benchmarks/local_monitor_probe.py` has the source.
 
 Output: a `results/<timestamp>.json` (raw per-run data, including the
 `acceptance_checks` settings used) and a printed Markdown summary table.
