@@ -35,6 +35,9 @@ mod support_ignored;
 
 const CYCLES: usize = 20;
 const SETTLE_BOUND: Duration = Duration::from_secs(30);
+/// How long after a settled rebuild the daemon may take to publish its verified
+/// verdict (a tree walk) before the envelope's `null` counts as a failure.
+const VERIFY_BOUND: Duration = Duration::from_secs(10);
 
 async fn ipc(socket: &Path, mut request: Value) -> Value {
     request
@@ -245,18 +248,38 @@ async fn the_daemon_envelope_never_lies_about_freshness_across_edit_rebuild_cycl
             json!({"cmd": "search", "query": "base_0"}),
             json!({"cmd": "impact", "target": "base_1"}),
         ] {
-            let g_before = generation(&reader);
-            let envelope = ipc(&socket, query.clone()).await;
-            let g_after = generation(&reader);
-            let still_settled = !tree_differs(&root, &reader);
-            let (fresh, _) = verdict(&envelope);
-            match fresh {
-                Some(false) if g_before == g_after && still_settled => tally.violations.push(format!(
-                    "cycle {cycle}: fresh:false right after a completed rebuild of generation {g_after} for {query}: {envelope}"
-                )),
-                Some(true) => tally.settled_true += 1,
-                None => tally.settled_null += 1,
-                Some(false) => {}
+            // No `status` has been asked since this rebuild, so `true` can only
+            // come from the daemon verifying the generation it just wrote. That
+            // verification runs right after the drain acknowledges its queue,
+            // so `null` is allowed for a bounded moment and never for good.
+            let verified = Instant::now();
+            loop {
+                let g_before = generation(&reader);
+                let envelope = ipc(&socket, query.clone()).await;
+                let g_after = generation(&reader);
+                let still_settled = !tree_differs(&root, &reader);
+                let (fresh, _) = verdict(&envelope);
+                match fresh {
+                    Some(false) if g_before == g_after && still_settled => {
+                        tally.violations.push(format!(
+                            "cycle {cycle}: fresh:false right after a completed rebuild of generation {g_after} for {query}: {envelope}"
+                        ));
+                        break;
+                    }
+                    Some(true) => {
+                        tally.settled_true += 1;
+                        break;
+                    }
+                    _ if g_before != g_after || !still_settled => break, // a newer rebuild: not this sample
+                    _ if verified.elapsed() >= VERIFY_BOUND => {
+                        tally.settled_null += 1;
+                        tally.violations.push(format!(
+                            "cycle {cycle}: no verified verdict within {VERIFY_BOUND:?} of a settled rebuild of generation {g_after} (no `status` was asked) for {query}: {envelope}"
+                        ));
+                        break;
+                    }
+                    _ => tokio::time::sleep(Duration::from_millis(50)).await,
+                }
             }
         }
     }
@@ -281,6 +304,13 @@ async fn the_daemon_envelope_never_lies_about_freshness_across_edit_rebuild_cycl
         "only {} of {CYCLES} racy samples saw the tree differing before and after the query; the \
          test is not measuring the window it exists for",
         CYCLES - tally.racy_inconclusive
+    );
+    assert!(
+        tally.settled_true >= CYCLES,
+        "only {} settled samples read fresh:true out of {} (no `status` between rebuild and \
+         query); the daemon is not publishing a verified verdict after its drains",
+        tally.settled_true,
+        2 * CYCLES
     );
     assert!(
         tally.violations.is_empty(),
