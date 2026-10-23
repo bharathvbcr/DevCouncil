@@ -276,6 +276,20 @@ All of this is merged to main, now `1d8a3505`.
 - Envelopes read `fresh:null` after a rebuild until `status` runs.
 - The non-schema store wins.
 
+### Second wave of 2026-10-22 (merged; main `812ae141`)
+
+**Store write wins (ft-f6abefd9, non-schema half):**
+- `prepare_cached` for the fresh-row INSERTs.
+- A one-statement literal carry.
+- Three new `persist:write` spans (serialize, payloads, literals). `other` drops from about 47% to under 0.5% on a cold build, which meets acceptance #1.
+- The six store tables are byte-identical to main's.
+- Instructions: −2.4% on a cold build and −3.9% on a one-file edit. The Swift 30k `nodes` span is about 2.4× faster.
+
+**Daemon freshness (ft-2950b25e follow-up):**
+- After each successful drain, the daemon verifies freshness with a `status` walk, so query answers read `fresh:true` without a separate `status` call. Settled samples read true or null at 0/40 before the fix and 40/0 after. A race test passes.
+- Cost: one tree walk per drain, about 2.2 s wall and 0.23 s user CPU on this repo at load 51. It has not been measured on a large repo.
+- The liveness corpus-count comment and the `verify_task` description are corrected.
+
 ### Consumer sweep handover (run from sessions rooted in each repo)
 
 `devcouncil install` reports these consumers stale against DevCouncil main (now `8381c35c`; use the HEAD at sweep time). The schemas are devmap-extract 97, dc-store 10 and workbench 14.
