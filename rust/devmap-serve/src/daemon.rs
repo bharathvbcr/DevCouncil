@@ -1578,6 +1578,27 @@ impl Daemon {
         Ok(succeeded.len())
     }
 
+    /// Establish a verified whole-tree freshness verdict for the generation a
+    /// drain just wrote, so the next query envelope reports `true` (or an honest
+    /// `false`) instead of `null` until somebody asks for `status`.
+    ///
+    /// This is `Store::status` itself, not a shortcut: a batch drain re-read only
+    /// the paths it claimed, so the digest it wrote proves nothing about the rest
+    /// of the tree, and only a walk compared with the stored hashes can. `status`
+    /// already refuses to certify while `pending_paths` is non-empty and
+    /// re-checks the generation and the queue after its walk, so an edit that
+    /// lands mid-drain or mid-walk leaves the queue non-empty and no verdict is
+    /// recorded; `query_source_freshness` additionally refuses to replay one
+    /// while the queue is non-empty. The cost is one tree walk per drain that did
+    /// work. The returned duration is what that walk took.
+    fn refresh_freshness_verdict(&self) -> anyhow::Result<Duration> {
+        let started = std::time::Instant::now();
+        self.store.status("daemon")?;
+        let elapsed = started.elapsed();
+        tracing::debug!("post-drain freshness verification took {elapsed:?}");
+        Ok(elapsed)
+    }
+
     /// Discovery, hashing and SQLite work must not occupy the IPC executor.
     /// Startup and later repair sweeps share this path, including runtimes
     /// with a single worker. The durable queue remains the commit boundary.
@@ -2051,6 +2072,23 @@ impl Daemon {
                         Ok(n) => {
                             consecutive_failures = 0;
                             info!("drained {n} pending path(s)");
+                            // Only a drain that returned `Ok` gets here: a
+                            // failed or cancelled one matched an arm above.
+                            let verifier = self.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                verifier.refresh_freshness_verdict()
+                            })
+                            .await
+                            {
+                                Ok(Ok(_)) => {}
+                                Ok(Err(error)) => warn!(
+                                    "post-drain freshness verification failed; envelopes stay \
+                                     unverified until `status` runs: {error}"
+                                ),
+                                Err(error) => warn!(
+                                    "post-drain freshness verification task failed: {error}"
+                                ),
+                            }
                         }
                         Err(err) => {
                             // A failed drain is the loudest symptom of a
@@ -5825,6 +5863,95 @@ mod tests {
 
         watching.request_shutdown();
         let _ = tokio::time::timeout(Duration::from_secs(30), task).await;
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The post-drain verification (`refresh_freshness_verdict`) is the only
+    /// thing that lets an envelope say `fresh: true` without a `status` call,
+    /// and it must never say it for a tree the drain did not finish with.
+    ///
+    /// Three situations, one daemon:
+    /// 1. a clean drain, then the refresh: the next envelope verdict is `true`;
+    /// 2. an edit the watcher queues *while the drain runs* (the HEAD reader the
+    ///    drain calls is the only hook inside it): the queued row survives the
+    ///    drain's acknowledgement, so the refresh records nothing and the
+    ///    envelope is not `true`;
+    /// 3. an edit made after the drain that no watcher event has named yet: the
+    ///    refresh walks the tree and the verdict is `false`, not `true`.
+    #[test]
+    fn the_post_drain_verdict_is_true_only_for_a_tree_the_drain_finished_with() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("devmap-post-drain-{stamp}"));
+        fs::create_dir_all(root.join("src")).unwrap();
+        let root = root.canonicalize().unwrap();
+        fs::write(root.join("src/a.py"), "def a():\n    return 1\n").unwrap();
+        let a = "src/a.py".to_string();
+
+        let daemon = Daemon::new(Store::open_in_memory().unwrap(), root.clone());
+        daemon
+            .store
+            .enqueue_pending_paths_under_root(&root, &[a.clone()])
+            .unwrap();
+        assert_eq!(daemon.drain_pending_batch().unwrap(), 1);
+        assert_eq!(
+            daemon.store.query_source_freshness().fresh,
+            None,
+            "precondition: a drain alone leaves the envelope unverified"
+        );
+        daemon.refresh_freshness_verdict().unwrap();
+        let settled = daemon.store.query_source_freshness();
+        assert_eq!(settled.fresh, Some(true), "{settled:?}");
+
+        // (2) An edit lands mid-drain.
+        fs::write(root.join("src/a.py"), "def a():\n    return 2\n").unwrap();
+        daemon
+            .store
+            .enqueue_pending_paths_under_root(&root, &[a.clone()])
+            .unwrap();
+        let sha = "c".repeat(40);
+        let store = daemon.store.clone();
+        let root_in_drain = root.clone();
+        let racing = a.clone();
+        let drained = daemon
+            .drain_pending_batch_with_head(&move |_: &std::path::Path| {
+                fs::write(root_in_drain.join("src/a.py"), "def a():\n    return 3\n").unwrap();
+                store
+                    .enqueue_pending_paths_under_root(&root_in_drain, &[racing.clone()])
+                    .unwrap();
+                Ok(sha.clone())
+            })
+            .unwrap();
+        assert_eq!(drained, 1);
+        assert!(
+            daemon.store.status("<memory>").unwrap().pending_count > 0,
+            "precondition: the mid-drain edit must survive the drain's acknowledgement"
+        );
+        daemon.refresh_freshness_verdict().unwrap();
+        let racing_verdict = daemon.store.query_source_freshness();
+        assert_ne!(
+            racing_verdict.fresh,
+            Some(true),
+            "an edit queued during the drain was reported fresh: {racing_verdict:?}"
+        );
+
+        // The queued edit drains; the tree is settled again and verifies.
+        assert_eq!(daemon.drain_pending_batch().unwrap(), 1);
+        daemon.refresh_freshness_verdict().unwrap();
+        let after = daemon.store.query_source_freshness();
+        assert_eq!(after.fresh, Some(true), "{after:?}");
+
+        // (3) An edit after the drain that no event has named: the walk sees it.
+        fs::write(root.join("src/a.py"), "def a():\n    return 4\n").unwrap();
+        daemon.refresh_freshness_verdict().unwrap();
+        let silent = daemon.store.query_source_freshness();
+        assert_eq!(
+            silent.fresh,
+            Some(false),
+            "an unqueued edit after the drain must read stale: {silent:?}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }
