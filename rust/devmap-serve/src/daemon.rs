@@ -12,7 +12,7 @@ use devmap_resolve::Resolver;
 use devmap_store::{current_git_head, GenerationWriteOpts, Store, GENERATION_RETENTION};
 
 use crate::binary_identity::{executable_identity, should_retire_for_new_binary};
-use crate::watcher::start_file_watcher;
+use crate::watcher::{start_file_watcher_observed, WatchBacklog};
 
 const STABLE_READ_ATTEMPTS: usize = 3;
 
@@ -263,6 +263,19 @@ pub struct Daemon {
     /// Bytes per second of disk writes the drain loop paces itself to. See
     /// [`DEFAULT_DRAIN_WRITE_BUDGET`].
     drain_write_budget: u64,
+    /// How long the queue must stay quiet after a drain before the whole-tree
+    /// freshness walk runs. See [`DEFAULT_FRESHNESS_SETTLE`].
+    freshness_settle: Duration,
+    /// What the watcher still holds that the store's queue does not show.
+    watch_backlog: WatchBacklog,
+    /// Tripped with `shutdown` and again when the loop exits, and read by the
+    /// freshness walk, so no exit waits for a tree walk.
+    walk_cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Walks started: the cost the settle window exists to bound.
+    freshness_walks: Arc<std::sync::atomic::AtomicUsize>,
+    /// Runs at the top of every walk, on the walk's thread.
+    #[cfg(test)]
+    freshness_probe: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     connect_time_probe: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Stands in for the process's write counter, so a test can state what a
@@ -434,6 +447,19 @@ pub const DEFAULT_DRAIN_WRITE_BUDGET: u64 = 4 * 1024 * 1024;
 /// more than this far behind a burst of edits.
 const MAX_DRAIN_PAUSE: Duration = Duration::from_secs(120);
 
+/// How long the queue must stay quiet after a drain that did work before the
+/// whole-tree freshness walk runs.
+///
+/// The walk costs a full tree scan (measured at about 2.2 s wall on this
+/// repository's 1,868 files under load), and an edit storm drains many times.
+/// Every drain re-arms this window, so a storm costs one walk after it ends
+/// instead of one per drain. 400 ms sits above the 250 ms poll the watcher
+/// consumer wakes on and above the gap between an editor's successive saves,
+/// so a burst reads as one, and it is small against the 10 s a consumer
+/// is told to allow for a verified verdict. Injectable through
+/// [`Daemon::with_freshness_settle`].
+pub const DEFAULT_FRESHNESS_SETTLE: Duration = Duration::from_millis(400);
+
 /// Whether a drain stopped because the build was cancelled (the daemon is
 /// shutting down) rather than because it failed.
 fn is_cancelled_build(error: &anyhow::Error) -> bool {
@@ -470,6 +496,12 @@ impl Daemon {
             serving: Arc::new(tokio::sync::watch::channel(false).0),
             store_path: None,
             drain_write_budget: DEFAULT_DRAIN_WRITE_BUDGET,
+            freshness_settle: DEFAULT_FRESHNESS_SETTLE,
+            watch_backlog: WatchBacklog::default(),
+            walk_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            freshness_walks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            freshness_probe: None,
             #[cfg(test)]
             connect_time_probe: None,
             #[cfg(test)]
@@ -484,6 +516,19 @@ impl Daemon {
     pub fn with_drain_write_budget(mut self, bytes_per_second: u64) -> Self {
         self.drain_write_budget = bytes_per_second.max(1);
         self
+    }
+
+    /// Hold the post-drain freshness walk until the queue has been quiet for
+    /// `settle` instead of [`DEFAULT_FRESHNESS_SETTLE`].
+    pub fn with_freshness_settle(mut self, settle: Duration) -> Self {
+        self.freshness_settle = settle;
+        self
+    }
+
+    /// Whole-tree freshness walks this daemon has started.
+    pub fn freshness_walks(&self) -> usize {
+        self.freshness_walks
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Logical bytes this process has written so far, or `None` where the
@@ -522,6 +567,8 @@ impl Daemon {
         // requested before the loop reaches its select is not lost.
         self.shutdown.notify_one();
         self.build_cancel.cancel();
+        self.walk_cancel
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Resolve once [`Self::run_loop`] has brought this daemon's IPC endpoint
@@ -1589,14 +1636,41 @@ impl Daemon {
     /// re-checks the generation and the queue after its walk, so an edit that
     /// lands mid-drain or mid-walk leaves the queue non-empty and no verdict is
     /// recorded; `query_source_freshness` additionally refuses to replay one
-    /// while the queue is non-empty. The cost is one tree walk per drain that did
-    /// work. The returned duration is what that walk took.
+    /// while the queue is non-empty. The returned duration is what the walk took.
+    ///
+    /// The loop does not call this once per drain: it waits for the queue to
+    /// stay quiet for [`DEFAULT_FRESHNESS_SETTLE`] (see
+    /// [`Self::freshness_walk_blocked`]), so a storm costs one walk. The walk
+    /// reads `walk_cancel` and returns an error, recording no verdict, when
+    /// the daemon is leaving.
     fn refresh_freshness_verdict(&self) -> anyhow::Result<Duration> {
         let started = std::time::Instant::now();
-        self.store.status("daemon")?;
+        self.freshness_walks
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(test)]
+        if let Some(probe) = &self.freshness_probe {
+            probe();
+        }
+        self.store.status_cancellable("daemon", &self.walk_cancel)?;
         let elapsed = started.elapsed();
         tracing::debug!("post-drain freshness verification took {elapsed:?}");
         Ok(elapsed)
+    }
+
+    /// Whether a freshness walk started now would be wasted: an edit is queued
+    /// in the store, or the watcher holds one it has not queued yet. Either way
+    /// the walk's verdict would be discarded (`status` refuses to certify over a
+    /// non-empty queue and `query_source_freshness` refuses to replay one), and
+    /// the drain that follows will arm a new walk.
+    ///
+    /// A queue that cannot be read counts as not quiet: a check that could not
+    /// run must not start the expensive one.
+    fn freshness_walk_blocked(&self) -> bool {
+        self.watch_backlog.is_busy()
+            || self
+                .store
+                .queued_path_count()
+                .map_or(true, |queued| queued != 0)
     }
 
     /// Discovery, hashing and SQLite work must not occupy the IPC executor.
@@ -1683,29 +1757,34 @@ impl Daemon {
         // This daemon's own socket and endpoint lock, which it creates and
         // unlinks itself. See `endpoint_artifacts`.
         let own_artifacts = endpoint_artifacts(&self.ipc_path);
-        let _watcher = start_file_watcher(root, move |paths| {
-            let paths: Vec<String> = paths
-                .into_iter()
-                .filter(|path| {
-                    !own_artifacts
-                        .iter()
-                        .any(|artifact| artifact.as_os_str() == path.as_str())
-                })
-                .collect();
-            if paths.is_empty() {
-                return;
-            }
-            watcher_state.activity.touch();
-            // K1(a): the watcher emits *absolute* paths while the connect-time
-            // sweep emits repo-relative ones, and the queue used to store both
-            // verbatim. That is how this repository's store came to hold 64
-            // rows naming a directory the checkout had moved out of, none of
-            // which any drain could process and nothing could delete. Both
-            // producers now write the same canonical, root-checked form.
-            note_watch_batch(&paths, &watcher_state.unapplied, |paths| {
-                Ok(store.enqueue_pending_paths_under_root(&enqueue_root, paths)?)
-            });
-        })?;
+        let watch_backlog = self.watch_backlog.clone();
+        let _watcher = start_file_watcher_observed(
+            root,
+            move |paths| {
+                let paths: Vec<String> = paths
+                    .into_iter()
+                    .filter(|path| {
+                        !own_artifacts
+                            .iter()
+                            .any(|artifact| artifact.as_os_str() == path.as_str())
+                    })
+                    .collect();
+                if paths.is_empty() {
+                    return;
+                }
+                watcher_state.activity.touch();
+                // K1(a): the watcher emits *absolute* paths while the connect-time
+                // sweep emits repo-relative ones, and the queue used to store both
+                // verbatim. That is how this repository's store came to hold 64
+                // rows naming a directory the checkout had moved out of, none of
+                // which any drain could process and nothing could delete. Both
+                // producers now write the same canonical, root-checked form.
+                note_watch_batch(&paths, &watcher_state.unapplied, |paths| {
+                    Ok(store.enqueue_pending_paths_under_root(&enqueue_root, paths)?)
+                });
+            },
+            watch_backlog,
+        )?;
 
         #[cfg(unix)]
         let mut ipc_task = AbortTaskOnDrop({
@@ -1808,6 +1887,18 @@ impl Daemon {
         let mut consecutive_failures = 0u32;
         let mut warned_unmetered = false;
         let mut next_attempt = tokio::time::Instant::now();
+        // The post-drain freshness walk is a deferred job, not a step of the
+        // drain: a drain that did work arms `verdict_due`, every further
+        // drain or pending edit pushes it back, and only a queue that has
+        // stayed quiet for the settle window starts the walk. The walk is
+        // polled by the select below rather than awaited in the tick, so a
+        // drain, a request or a shutdown never waits behind it.
+        if !self.build_cancel.is_cancelled() {
+            self.walk_cancel
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        let mut verdict_due: Option<tokio::time::Instant> = None;
+        let mut verdict_walk: Option<tokio::task::JoinHandle<anyhow::Result<Duration>>> = None;
         // An untouched activity record means no consumer ever spoke to this
         // daemon — idle time runs from loop start, not from zero. That is the
         // orphan case: spawned, used once, client died, nothing left to ask.
@@ -1848,6 +1939,26 @@ impl Daemon {
                          (pending work stays queued in the store)"
                     );
                     break LoopExit::ReleaseEndpoint(Ok(()));
+                }
+                joined = async {
+                    match verdict_walk.as_mut() {
+                        Some(walk) => walk.await,
+                        None => std::future::pending().await,
+                    }
+                }, if verdict_walk.is_some() => {
+                    verdict_walk = None;
+                    match joined {
+                        Ok(Ok(_)) => {}
+                        // The daemon is leaving; the walk stopped on request.
+                        Ok(Err(_)) if self.walk_cancel.load(std::sync::atomic::Ordering::SeqCst) => {}
+                        Ok(Err(error)) => warn!(
+                            "post-drain freshness verification failed; envelopes stay \
+                             unverified until `status` runs: {error}"
+                        ),
+                        Err(error) => warn!(
+                            "post-drain freshness verification task failed: {error}"
+                        ),
+                    }
                 }
                 _ = ticker.tick() => {
                     // Exit when there is nothing left to serve. Checked before
@@ -1979,6 +2090,25 @@ impl Daemon {
                             }
                         }
                     }
+                    if verdict_walk.is_none() {
+                        if let Some(due) = verdict_due {
+                            let now = tokio::time::Instant::now();
+                            if now >= due {
+                                if self.freshness_walk_blocked() {
+                                    // Work is queued or arriving: this walk's
+                                    // verdict would be discarded. Wait out a
+                                    // fresh settle window instead.
+                                    verdict_due = Some(now + self.freshness_settle);
+                                } else {
+                                    verdict_due = None;
+                                    let worker = self.clone();
+                                    verdict_walk = Some(tokio::task::spawn_blocking(move || {
+                                        worker.refresh_freshness_verdict()
+                                    }));
+                                }
+                            }
+                        }
+                    }
                     if tokio::time::Instant::now() < next_attempt {
                         continue;
                     }
@@ -2074,21 +2204,12 @@ impl Daemon {
                             info!("drained {n} pending path(s)");
                             // Only a drain that returned `Ok` gets here: a
                             // failed or cancelled one matched an arm above.
-                            let verifier = self.clone();
-                            match tokio::task::spawn_blocking(move || {
-                                verifier.refresh_freshness_verdict()
-                            })
-                            .await
-                            {
-                                Ok(Ok(_)) => {}
-                                Ok(Err(error)) => warn!(
-                                    "post-drain freshness verification failed; envelopes stay \
-                                     unverified until `status` runs: {error}"
-                                ),
-                                Err(error) => warn!(
-                                    "post-drain freshness verification task failed: {error}"
-                                ),
-                            }
+                            // Arm (or push back) the deferred walk. A walk
+                            // already running describes the tree before this
+                            // drain, so it is left to finish and this arms the
+                            // next one.
+                            verdict_due =
+                                Some(tokio::time::Instant::now() + self.freshness_settle);
                         }
                         Err(err) => {
                             // A failed drain is the loudest symptom of a
@@ -2115,6 +2236,13 @@ impl Daemon {
                 }
             }
         };
+
+        // Every exit stops a walk in flight instead of waiting for it: the
+        // handle is dropped, not awaited, and the flag the walk reads tells its
+        // blocking thread to return at the next directory entry.
+        self.walk_cancel
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(verdict_walk);
 
         match exit {
             // The IPC future has already completed, so `UnixIpcServer::drop`
@@ -5953,5 +6081,271 @@ mod tests {
             "an unqueued edit after the drain must read stale: {silent:?}"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The walk itself stops on the flag and records nothing: a walk cut short
+    /// compared with the stored hashes would read as a mass deletion, so it is
+    /// an error, never a `fresh: false` the envelope would then replay.
+    #[test]
+    fn a_cancelled_freshness_walk_is_an_error_and_records_no_verdict() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("devmap-walk-cancel-{stamp}"));
+        fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        fs::write(root.join("a.py"), "def a():\n    return 1\n").unwrap();
+        let daemon = Daemon::new(Store::open_in_memory().unwrap(), root.clone());
+        daemon
+            .store
+            .enqueue_pending_paths_under_root(&root, &["a.py".to_string()])
+            .unwrap();
+        assert_eq!(daemon.drain_pending_batch().unwrap(), 1);
+
+        daemon
+            .walk_cancel
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = daemon
+            .refresh_freshness_verdict()
+            .expect_err("a cancelled walk must not return a status");
+        assert!(
+            error.to_string().contains("cancelled"),
+            "the error must say the walk was cancelled: {error}"
+        );
+        assert_eq!(
+            daemon.store.query_source_freshness().fresh,
+            None,
+            "a cancelled walk recorded a verdict"
+        );
+
+        daemon
+            .walk_cancel
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        daemon.refresh_freshness_verdict().unwrap();
+        assert_eq!(daemon.store.query_source_freshness().fresh, Some(true));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A running daemon over `root` with the freshness walk's settle window set
+    /// to `settle` and every drain unpaced, plus its task and store.
+    #[cfg(unix)]
+    async fn freshness_fixture(
+        tag: &str,
+        settle: Duration,
+        probe: Option<Arc<dyn Fn() + Send + Sync>>,
+        paced: bool,
+    ) -> (
+        Daemon,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+        std::path::PathBuf,
+    ) {
+        let root = short_unix_fixture_dir(tag).canonicalize().unwrap();
+        fs::write(root.join("a.py"), "def a():\n    return 0\n").unwrap();
+        let mut daemon = Daemon::new(Store::open_in_memory().unwrap(), root.clone())
+            .with_ipc_path(root.join(format!("{tag}.sock")))
+            .with_idle_poll(Duration::from_millis(20))
+            .with_max_idle(None)
+            .with_freshness_settle(settle);
+        const MIB: u64 = 1024 * 1024;
+        if paced {
+            // Every generation earns two seconds of budget: 16 MiB at 8 MiB/s.
+            daemon = daemon.with_drain_write_budget(8 * MIB);
+            let generations = Arc::clone(&daemon.store);
+            daemon.write_meter = Some(Arc::new(move || {
+                let written = generations.latest_generation_id().ok()?.unwrap_or(0);
+                Some(u64::from(written) * 16 * MIB)
+            }));
+        } else {
+            daemon.write_meter = Some(Arc::new(|| Some(0)));
+        }
+        daemon.freshness_probe = probe;
+        let watching = daemon.clone();
+        let mut task = tokio::spawn(async move { daemon.run_loop().await });
+        serving_or_dead(&watching, &mut task).await;
+        (watching, task, root)
+    }
+
+    /// Wait until the store holds a generation and an empty queue.
+    #[cfg(unix)]
+    async fn wait_for_drained_generation(store: &Store) -> u32 {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let generation = store.latest_generation_id().unwrap();
+                if let Some(id) = generation {
+                    if store.get_pending_paths().unwrap().is_empty() {
+                        return id;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the connect-time sweep must be drained into a generation")
+    }
+
+    /// An edit storm drains many times and must cost a handful of walks, not one
+    /// per drain. Each drain used to buy a whole-tree status walk that the next
+    /// drain's edit discarded.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_edit_storm_costs_far_fewer_freshness_walks_than_drains() {
+        const EDITS: usize = 30;
+        let (daemon, task, root) =
+            freshness_fixture("storm", Duration::from_millis(600), None, false).await;
+        let store = Arc::clone(&daemon.store);
+        let first = wait_for_drained_generation(&store).await;
+        for edit in 0..EDITS {
+            fs::write(
+                root.join("a.py"),
+                format!("def a():\n    return {}\n", edit + 1),
+            )
+            .unwrap();
+            store
+                .enqueue_pending_paths(&[root.join("a.py").display().to_string()])
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        let verified = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if store.get_pending_paths().unwrap().is_empty()
+                    && store.query_source_freshness().fresh == Some(true)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        // Let any trailing walk run before counting.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let drains = store.latest_generation_id().unwrap().unwrap() - first;
+        let walks = daemon.freshness_walks();
+        daemon.request_shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(30), task).await;
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            drains >= 10,
+            "the storm produced only {drains} drains, so it does not measure per-drain cost"
+        );
+        assert!(
+            walks <= 3,
+            "{walks} freshness walks over {drains} drains from {EDITS} edits"
+        );
+        assert!(verified.is_ok(), "the settled tree never read fresh:true");
+    }
+
+    /// A shutdown that arrives while a walk is running must not wait for it.
+    /// The tick used to await the walk, so no shutdown or signal arm was polled
+    /// until the walk returned. The probe stands in for a walk that does not
+    /// finish soon and does not look at the cancel flag.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_during_a_freshness_walk_returns_promptly() {
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe_entered = Arc::clone(&entered);
+        let probe_release = Arc::clone(&release);
+        let probe: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            probe_entered.store(true, std::sync::atomic::Ordering::SeqCst);
+            let started = std::time::Instant::now();
+            while !probe_release.load(std::sync::atomic::Ordering::SeqCst)
+                && started.elapsed() < Duration::from_secs(8)
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let (daemon, task, root) = freshness_fixture(
+            "walk-shutdown",
+            Duration::from_millis(20),
+            Some(probe),
+            false,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !entered.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the post-drain walk never started");
+
+        let asked = std::time::Instant::now();
+        daemon.request_shutdown();
+        let outcome = tokio::time::timeout(Duration::from_secs(3), task).await;
+        let waited = asked.elapsed();
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            outcome.is_ok(),
+            "run_loop was still waiting for the freshness walk {waited:?} after the shutdown request"
+        );
+    }
+
+    /// No walk starts while an edit is queued or arriving, and one runs once the
+    /// queue has been quiet. The pacing meter holds the second drain back for
+    /// two seconds, so the queue stays non-empty with nothing draining it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_freshness_walk_runs_while_events_are_pending() {
+        let (daemon, task, root) =
+            freshness_fixture("pending-walk", Duration::from_millis(500), None, true).await;
+        let store = Arc::clone(&daemon.store);
+        wait_for_drained_generation(&store).await;
+
+        // Queue an edit at once. The first drain's pause keeps it queued.
+        fs::write(root.join("b.py"), "def b():\n    return 1\n").unwrap();
+        store
+            .enqueue_pending_paths(&[root.join("b.py").display().to_string()])
+            .unwrap();
+        let queued_since = std::time::Instant::now();
+        while queued_since.elapsed() < Duration::from_millis(1200)
+            && !store.get_pending_paths().unwrap().is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pending_held = !store.get_pending_paths().unwrap().is_empty();
+        let walks_while_pending = daemon.freshness_walks();
+
+        // A raw watcher event not yet queued blocks the walk the same way.
+        daemon.watch_backlog.pretend_event_in_flight(true);
+        let drained = tokio::time::timeout(Duration::from_secs(30), async {
+            while !store.get_pending_paths().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let walks_while_event_in_flight = daemon.freshness_walks();
+        daemon.watch_backlog.pretend_event_in_flight(false);
+        let resumed = tokio::time::timeout(Duration::from_secs(15), async {
+            while daemon.freshness_walks() == walks_while_event_in_flight {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+
+        daemon.request_shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(30), task).await;
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            pending_held,
+            "precondition: the edit was drained before the window was observed"
+        );
+        assert_eq!(
+            walks_while_pending, 0,
+            "a walk ran while an edit was queued; its verdict would have been discarded"
+        );
+        assert!(drained.is_ok(), "the queued edit never drained");
+        assert_eq!(
+            walks_while_event_in_flight, 0,
+            "a walk ran while the watcher still held an event"
+        );
+        assert!(
+            resumed.is_ok(),
+            "no walk ran after the queue went quiet; the verdict would stay null"
+        );
     }
 }
