@@ -271,6 +271,11 @@ pub struct Daemon {
     /// Tripped with `shutdown` and again when the loop exits, and read by the
     /// freshness walk, so no exit waits for a tree walk.
     walk_cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// The token of the walk in flight. A loop walk reads its own token, never
+    /// `walk_cancel` directly, so a drain can stop one walk without tripping
+    /// the shutdown flag. The mutex orders [`Self::begin_walk_token`] against
+    /// [`Self::stop_walks`], so a shutdown is never lost between the two.
+    walk_token: Arc<std::sync::Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>>,
     /// Walks started: the cost the settle window exists to bound.
     freshness_walks: Arc<std::sync::atomic::AtomicUsize>,
     /// Runs at the top of every walk, on the walk's thread.
@@ -499,6 +504,7 @@ impl Daemon {
             freshness_settle: DEFAULT_FRESHNESS_SETTLE,
             watch_backlog: WatchBacklog::default(),
             walk_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            walk_token: Arc::new(std::sync::Mutex::new(None)),
             freshness_walks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             freshness_probe: None,
@@ -567,8 +573,48 @@ impl Daemon {
         // requested before the loop reaches its select is not lost.
         self.shutdown.notify_one();
         self.build_cancel.cancel();
+        self.stop_walks();
+    }
+
+    /// Trip the shutdown flag and the walk in flight. Shutdown is sticky: a
+    /// walk begun afterwards starts already cancelled.
+    fn stop_walks(&self) {
+        let token = self.walk_token.lock().unwrap_or_else(|e| e.into_inner());
         self.walk_cancel
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(token) = token.as_ref() {
+            token.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Whether the walk in flight has been told to stop, by a drain or a
+    /// shutdown. What a test observes instead of the walk's own thread.
+    #[cfg(test)]
+    fn walk_in_flight_cancelled(&self) -> bool {
+        let current = self.walk_token.lock().unwrap_or_else(|e| e.into_inner());
+        current
+            .as_ref()
+            .is_some_and(|token| token.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// A fresh cancel token for a walk about to start, pre-tripped when a
+    /// shutdown has already been requested.
+    fn begin_walk_token(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        let mut current = self.walk_token.lock().unwrap_or_else(|e| e.into_inner());
+        let token = Arc::new(std::sync::atomic::AtomicBool::new(
+            self.walk_cancel.load(std::sync::atomic::Ordering::SeqCst),
+        ));
+        *current = Some(Arc::clone(&token));
+        token
+    }
+
+    /// Stop the walk in flight because a drain is about to change the tree it
+    /// is comparing. Leaves the shutdown flag alone.
+    fn cancel_walk_for_drain(&self) {
+        let current = self.walk_token.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(token) = current.as_ref() {
+            token.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     /// Resolve once [`Self::run_loop`] has brought this daemon's IPC endpoint
@@ -1644,6 +1690,15 @@ impl Daemon {
     /// reads `walk_cancel` and returns an error, recording no verdict, when
     /// the daemon is leaving.
     fn refresh_freshness_verdict(&self) -> anyhow::Result<Duration> {
+        self.refresh_freshness_verdict_with(&self.walk_cancel)
+    }
+
+    /// [`Self::refresh_freshness_verdict`] reading `cancel`, the walk's own
+    /// token (see [`Self::begin_walk_token`]).
+    fn refresh_freshness_verdict_with(
+        &self,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> anyhow::Result<Duration> {
         let started = std::time::Instant::now();
         self.freshness_walks
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1651,7 +1706,7 @@ impl Daemon {
         if let Some(probe) = &self.freshness_probe {
             probe();
         }
-        self.store.status_cancellable("daemon", &self.walk_cancel)?;
+        self.store.status_cancellable("daemon", cancel)?;
         let elapsed = started.elapsed();
         tracing::debug!("post-drain freshness verification took {elapsed:?}");
         Ok(elapsed)
@@ -1899,6 +1954,7 @@ impl Daemon {
         }
         let mut verdict_due: Option<tokio::time::Instant> = None;
         let mut verdict_walk: Option<tokio::task::JoinHandle<anyhow::Result<Duration>>> = None;
+        let mut walk_token: Option<Arc<std::sync::atomic::AtomicBool>> = None;
         // An untouched activity record means no consumer ever spoke to this
         // daemon — idle time runs from loop start, not from zero. That is the
         // orphan case: spawned, used once, client died, nothing left to ask.
@@ -1947,10 +2003,20 @@ impl Daemon {
                     }
                 }, if verdict_walk.is_some() => {
                     verdict_walk = None;
+                    let drain_cancelled = walk_token.take().is_some_and(|token| {
+                        token.load(std::sync::atomic::Ordering::SeqCst)
+                    });
                     match joined {
                         Ok(Ok(_)) => {}
                         // The daemon is leaving; the walk stopped on request.
                         Ok(Err(_)) if self.walk_cancel.load(std::sync::atomic::Ordering::SeqCst) => {}
+                        // A drain cancelled it: nothing was recorded, and the
+                        // next quiet window starts a new walk.
+                        Ok(Err(_)) if drain_cancelled => {
+                            verdict_due.get_or_insert(
+                                tokio::time::Instant::now() + self.freshness_settle,
+                            );
+                        }
                         Ok(Err(error)) => warn!(
                             "post-drain freshness verification failed; envelopes stay \
                              unverified until `status` runs: {error}"
@@ -2102,8 +2168,10 @@ impl Daemon {
                                 } else {
                                     verdict_due = None;
                                     let worker = self.clone();
+                                    let token = self.begin_walk_token();
+                                    walk_token = Some(Arc::clone(&token));
                                     verdict_walk = Some(tokio::task::spawn_blocking(move || {
-                                        worker.refresh_freshness_verdict()
+                                        worker.refresh_freshness_verdict_with(&token)
                                     }));
                                 }
                             }
@@ -2111,6 +2179,13 @@ impl Daemon {
                     }
                     if tokio::time::Instant::now() < next_attempt {
                         continue;
+                    }
+                    // A drain with work changes the tree a walk in flight is
+                    // comparing, and that walk's verdict would be discarded:
+                    // stop it now rather than let it burn CPU. An idle tick
+                    // (empty queue) changes nothing and leaves it be.
+                    if verdict_walk.is_some() && self.freshness_walk_blocked() {
+                        self.cancel_walk_for_drain();
                     }
                     let written_before = self.written_bytes();
                     let drain_started = std::time::Instant::now();
@@ -2206,8 +2281,8 @@ impl Daemon {
                             // failed or cancelled one matched an arm above.
                             // Arm (or push back) the deferred walk. A walk
                             // already running describes the tree before this
-                            // drain, so it is left to finish and this arms the
-                            // next one.
+                            // drain; it was cancelled when the drain began, and
+                            // this arms the next one.
                             verdict_due =
                                 Some(tokio::time::Instant::now() + self.freshness_settle);
                         }
@@ -2240,8 +2315,7 @@ impl Daemon {
         // Every exit stops a walk in flight instead of waiting for it: the
         // handle is dropped, not awaited, and the flag the walk reads tells its
         // blocking thread to return at the next directory entry.
-        self.walk_cancel
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.stop_walks();
         drop(verdict_walk);
 
         match exit {
@@ -6280,6 +6354,170 @@ mod tests {
         assert!(
             outcome.is_ok(),
             "run_loop was still waiting for the freshness walk {waited:?} after the shutdown request"
+        );
+    }
+
+    /// A probe for a walk that outlives the drain it should have been stopped
+    /// by: it blocks until `release`, or `limit`, and reports whether the walk
+    /// had been told to stop by then. Only the first walk blocks.
+    #[cfg(unix)]
+    fn blocking_walk_probe(
+        daemon_cell: Arc<std::sync::OnceLock<Daemon>>,
+        entered: Arc<std::sync::atomic::AtomicBool>,
+        release: Arc<std::sync::atomic::AtomicBool>,
+        saw_cancel: Arc<std::sync::atomic::AtomicBool>,
+        wait_for_cancel: bool,
+    ) -> Arc<dyn Fn() + Send + Sync> {
+        let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        Arc::new(move || {
+            if !first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            entered.store(true, std::sync::atomic::Ordering::SeqCst);
+            let started = std::time::Instant::now();
+            while !release.load(std::sync::atomic::Ordering::SeqCst)
+                && started.elapsed() < Duration::from_secs(8)
+            {
+                if wait_for_cancel
+                    && daemon_cell
+                        .get()
+                        .is_some_and(Daemon::walk_in_flight_cancelled)
+                {
+                    saw_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+    }
+
+    /// A drain that begins while a walk is in flight cancels that walk, which
+    /// records nothing, and the next quiet window walks again and certifies the
+    /// tree the drain left. Before, the walk ran to completion over a tree the
+    /// drain was changing and its verdict was discarded.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drain_that_starts_during_a_freshness_walk_cancels_it_and_the_walk_rearms() {
+        let cell = Arc::new(std::sync::OnceLock::new());
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = blocking_walk_probe(
+            Arc::clone(&cell),
+            Arc::clone(&entered),
+            Arc::clone(&release),
+            Arc::clone(&saw_cancel),
+            true,
+        );
+        let (daemon, task, root) =
+            freshness_fixture("walk-drain", Duration::from_millis(100), Some(probe), false).await;
+        let _ = cell.set(daemon.clone());
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !entered.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the post-drain walk never started");
+
+        // An edit lands while the walk is in flight; the next tick drains it.
+        fs::write(root.join("a.py"), "def a():\n    return 7\n").unwrap();
+        daemon
+            .store
+            .enqueue_pending_paths(&[root.join("a.py").display().to_string()])
+            .unwrap();
+        let rewalked = tokio::time::timeout(Duration::from_secs(30), async {
+            while daemon.freshness_walks() < 2
+                || daemon.store.query_source_freshness().fresh != Some(true)
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        daemon.request_shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(30), task).await;
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            saw_cancel.load(std::sync::atomic::Ordering::SeqCst),
+            "the walk in flight was never told to stop when a drain began; it ran to completion over a tree the drain changed"
+        );
+        assert!(
+            rewalked.is_ok(),
+            "the walk did not re-arm and certify the drained tree"
+        );
+    }
+
+    /// ATTACK: a shutdown arrives while a drain-cancelled walk is still
+    /// unwinding (its thread ignores the flag, as a walk stuck in a slow
+    /// directory read would). The loop must return promptly and must not
+    /// start another walk on its way out or afterwards.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_while_a_drain_cancelled_walk_unwinds_exits_without_a_new_walk() {
+        let cell = Arc::new(std::sync::OnceLock::new());
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = blocking_walk_probe(
+            Arc::clone(&cell),
+            Arc::clone(&entered),
+            Arc::clone(&release),
+            Arc::clone(&saw_cancel),
+            false,
+        );
+        let (daemon, task, root) = freshness_fixture(
+            "walk-drain-shutdown",
+            Duration::from_millis(50),
+            Some(probe),
+            false,
+        )
+        .await;
+        let _ = cell.set(daemon.clone());
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !entered.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the post-drain walk never started");
+
+        fs::write(root.join("a.py"), "def a():\n    return 9\n").unwrap();
+        daemon
+            .store
+            .enqueue_pending_paths(&[root.join("a.py").display().to_string()])
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !daemon.walk_in_flight_cancelled() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the drain never cancelled the walk");
+
+        let walks_before = daemon.freshness_walks();
+        let asked = std::time::Instant::now();
+        daemon.request_shutdown();
+        let outcome = tokio::time::timeout(Duration::from_secs(3), task).await;
+        let waited = asked.elapsed();
+        // Let the stuck walk unwind, then give a buggy loop time to re-arm.
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let walks_after = daemon.freshness_walks();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            outcome.is_ok(),
+            "run_loop was still running {waited:?} after a shutdown during a cancelled walk"
+        );
+        assert_eq!(
+            walks_after, walks_before,
+            "a walk started after the shutdown request"
+        );
+        assert!(
+            daemon.walk_cancel.load(std::sync::atomic::Ordering::SeqCst),
+            "the shutdown flag was undone"
         );
     }
 
