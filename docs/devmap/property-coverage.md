@@ -97,6 +97,68 @@ to fail under mutation), **retire**, **uncovered**.
 | retire | 15 (adds S16) |
 | uncovered | 0 |
 
-No mutation-testing (`cargo mutants`) pass has been run over the new tests; they were each proved by one hand-made break (see the lane report).
+## Mutation results (lane `property-mutation`, base 44d37505)
+
+`cargo mutants --in-place`, scoped with `--file` and `--re` to the production
+functions each property exercises, and with the property's own test selected
+(`--test b_series_schema_cost_properties`, or `--lib <test-name-prefix>`), so a
+mutant is "caught" only if that property's test fails. No whole-crate run was
+made. "Caught" counts viable mutants; unviable ones (no compiling replacement)
+are listed separately. The first number of each pair is before the lane's
+strengthening, the second after. Hand mutants were applied with a one-line edit,
+run, and reverted (`git checkout`).
+
+| ID | Functions exercised | cargo-mutants tried (viable / unviable) | Caught before -> after | Hand mutants (all caught) | Survivors |
+|---|---|---|---|---|---|
+| B6 | `Store::prune_generations_except_latest`; the DDL in `schema.rs` (SQL text, which cargo-mutants cannot mutate) | 7 / 0 | 0 -> 7 | `generation_dead_symbols` key reordered to `(ordinal, generation_id)`: the plan check fails with `SCAN generation_dead_symbols` | none |
+| B7 | `Store::admit_cached_extraction` | 2 / 0 | 0 -> 2 | a full `COUNT(DISTINCT payload_json)` scan added inside admit: 12.7 s per 200 against 79 ms, the 8x bound fails | none |
+| B9 | none: a schema property over DDL, no function to mutate | NOT RUN (nothing cargo-mutants can mutate) | n/a | `file_path` appended to the `generation_dead_symbols` primary key: fails. The other three ordinal-keyed tables were not mutated (NOT RUN) | n/a. Test unchanged |
+| B12 | `extract_scanned_with_progress`, `extract_one_cached_with`, `extract_scanned_for_generation` | 7 / 4 | 1 -> 4 | `par_iter()` -> `iter()`: fails ("144 files ran on 1 workers of a 18-wide pool") | 3, below |
+| N9 | the same test as B12; the pool is rayon's global, and no production code sizes it | NOT RUN: no production function configures the pool, so there is nothing to mutate | n/a | a pool clamp (NOT RUN, no site exists) | n/a. The RAM half stays unimplemented and unasserted |
+| G9 | `scan_sites`, `graph_files`, `route_map`, `api_impact` (not `handler_return_keys`, which G15's lane owns) | 75 / 6 | 22 -> 26 | `api_impact` runs `route_map` twice: the per-file cancellation count (6, not 3) fails | 49 against G9 alone, 20 against every `api_routes` test; below |
+| G24 | `budget_take`, `QueryEngine::impact`, `StoreQueryEngine::impact`, `StoreQueryEngine::traverse_walked` | 11 / 20 | 5 -> 5 (all five are `budget_take`) | the confidence comparator reversed in `in_memory.rs` (fails the in-memory test) and in `engine.rs` (fails the store-engine test): 2 of 2. The comparator is a closure argument, which cargo-mutants has no mutation for | 6, below |
+| X12 | `LspClient::write_message`, `notify`, `kill`, `request`, `read_message`, `spawn_with` | 15 / 2 | 7 -> 10 | `try_send` -> a blocking `send`: fails ("the client blocked writing to a server that stopped reading") | 5, below |
+
+Strengthening made (each fails against the mutant above, shown with the hand
+mutant or the cargo-mutants run, never only by reading):
+
+- B6: `b6_prune_removes_exactly_the_generations_outside_the_window` runs the real
+  prune over four generations (keep 1, keep 2, and no-op cases) and checks the
+  returned count, every per-generation row of pruned and retained generations,
+  and the validity-range reclaim at the cutoff.
+  `b6_the_checked_deletes_are_the_ones_prune_issues` reads the prune's own
+  `DELETE` statements so the plan test cannot drift from the code.
+- B7: after the timed batches, every admitted extraction is a row and the retry
+  ledger is empty, so a no-op admit no longer passes as "O(1)".
+- B12: the pass through `extract_scanned_for_generation` returns one extraction
+  per file in scan order, and nothing is admitted to the cache before the
+  generation commits.
+- G9: `files_eligible`, `files_attempted`, `sites_found` and the consumer count
+  are pinned beside the cancellation count and bytes read.
+- X12: the server's pid must be dead after the writer gives up, checked while the
+  client is still alive (dropping it would reap the server and hide a missing
+  `kill`); `x12_the_payload_cap_admits_exactly_the_cap_and_refuses_one_byte_more`
+  pins the `write_message` size guard exactly.
+
+Survivors and their disposition:
+
+| ID | Survivor | Disposition |
+|---|---|---|
+| B12 | `extract_cache.rs:96` delete field `cancel`; `:160` delete `!` (progress `withheld`); `:213` `cached.file_path == path` to `!=` | Outside B12/N9 (cancellation, progress accounting, path-bound cache reuse). Each is killed by the module's other tests: a run with every `extract_cache` test caught them all except `:218`, which B12 now kills |
+| G9 | 20 mutants no `api_routes` test kills: `scan_sites` 377 (`-` to `+`), 385 (guard `true`), 386 (`<` to `==`, `<=`), 387 (`+=` to `-=`, `*=`), 394 (`*=`), 428 (guard `true`; `||` to `&&`), 438 (`<=`), 447 (`+=` to `-=`, `*=`); `route_map` 975 (`>` to `==`, `>=`), 978 (`-=` to `+=`, `/=`), 985 (`*=`); `api_impact` 1248 (`||` to `&&`; `==` to `!=` twice) | Not the G9 property (once per query). They are the over-size, budget-skip, site-cap and route-selection accounting. Not killed and not argued equivalent, except 377 (`remaining` only differs within 64 MB of the byte cap, unreachable with a test-sized fixture). Follow-up: a budget-accounting test, not folded into G9 |
+| G24 | 6 in `traverse_walked`: `engine.rs:1443`, `1447`, `1448`, `1460` (two), `1561` (call-blind start guards) | Not confidence-ordered truncation. They decide when a start is disclosed as call-blind. No test in the G24 selection reaches them; not run against the other engine tests (NOT RUN) |
+| G24 | `atomic_budget_take` 6 comparison mutants (`budget.rs:327`, `336`) | Swept in by the `budget_take` regex. It is the all-or-nothing scoped-trace packer, not the caller-list budget; not G24, left unrun against its own tests (NOT RUN) |
+| X12 | `LspClient::spawn_with` `lsp.rs:1078` `delete !` and `:1079` `||` to `&&` (reader thread exit); `LspClient::request` `:1214` `Ok(Default)`, `:1219` `+=` to `-=`, `*=` | Reader-thread lifetime and request ids are not the write-side property. With all `devmap-resolve` lib tests a run still leaves `:1079` and `:1219 *=`: the first changes only when a finished reader thread exits (unobservable without a thread probe), the second repeats request id 1, which no test with two requests to one server checks. The other three are killed by the sibling lib tests. Not killed here |
+
+Card ft-ae653b10 (`rust/devmap-store/src/db/maintenance.rs`): the nine mutants
+this lane touched there (seven in the prune, two in admit) all survived the
+B6/B7 test binary before the strengthening and none survive it now; with the
+sibling suites (`retention_churn`, `validity_ranges`, `store_hardening`,
+`adversarial_store`) all nine were already caught. The rest of the file was not
+mutated (NOT RUN: whole-file sweeps are out of scope).
+
+NOT RUN: `devmap-cli/tests/build_lsp_opt_in.rs` (the CLI LSP test) maps to none
+of these IDs (X11 and X12 live in `devmap-resolve/src/lsp.rs`), so no mutants
+were scoped to it. G15 and `handler_return_keys` were not touched.
 
 Several "covered" rows are partial or inferred; the note in each row says so.

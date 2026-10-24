@@ -666,5 +666,23 @@ mod tests {
             "{} files ran on {used} workers of a {expected}-wide pool",
             scanned.sources.len()
         );
+
+        // The pass builds extractions for the generation to commit; it must not
+        // admit them to the cache first (that is the generation's own write).
+        for (path, source) in scanned.sources.iter().take(4) {
+            let key = CacheKey::for_source(detect_language(Path::new(path)), source);
+            assert!(
+                store.try_get_cached_extraction(&key).unwrap().is_none(),
+                "{path} was admitted to the cache before its generation committed"
+            );
+        }
+
+        // The production entry point is that same pass: one extraction per
+        // scanned file, in scan order, for every file.
+        let produced = extract_scanned_for_generation(&store, &scanned, None, None)
+            .expect("the generation entry point extracts");
+        let produced_paths: Vec<&str> = produced.iter().map(|e| e.file_path.as_str()).collect();
+        let scanned_paths: Vec<&str> = scanned.sources.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(produced_paths, scanned_paths);
     }
 }

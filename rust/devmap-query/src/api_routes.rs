@@ -2092,6 +2092,12 @@ async function load() {
         let bytes: usize = sources.iter().map(|(_, body)| body.len()).sum();
         assert_eq!(impact["scan"]["files_read"], 3, "{impact}");
         assert_eq!(impact["scan"]["source_bytes_read"], bytes, "{impact}");
+        // Every counter that a second scan would double: the files it opened,
+        // the files it attempted, and the call sites it found (two fetches).
+        assert_eq!(impact["scan"]["files_eligible"], 3, "{impact}");
+        assert_eq!(impact["scan"]["files_attempted"], 3, "{impact}");
+        assert_eq!(impact["scan"]["sites_found"], 2, "{impact}");
+        assert_eq!(impact["consumers"].as_array().unwrap().len(), 2, "{impact}");
         assert_eq!(
             checks.load(Ordering::Relaxed),
             sources.len(),
