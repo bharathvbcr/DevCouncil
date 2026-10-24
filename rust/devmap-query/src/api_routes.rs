@@ -1364,6 +1364,32 @@ mod tests {
         json!({"nodes": nodes, "edges": edges})
     }
 
+    const TWO_HANDLERS: &str = "def users():\n    return {\"ids\": [], \"total\": 0}\n\n\
+        def orders():\n    return {\"order_id\": 1}\n";
+
+    /// AUDIT G15: a handler yields the keys of its own `return {...}`, and only
+    /// those. The Python took any function whose span contained the line, so a
+    /// neighbour's keys leaked into the shape check.
+    #[test]
+    fn g15_a_handler_returns_only_the_keys_inside_its_own_span() {
+        let users = json!({"line": 1, "end_line": 2});
+        let orders = json!({"line": 4, "end_line": 5});
+        assert_eq!(handler_return_keys(TWO_HANDLERS, &users), ["ids", "total"]);
+        assert_eq!(handler_return_keys(TWO_HANDLERS, &orders), ["order_id"]);
+    }
+
+    /// AUDIT G15, second half: a handler with no usable line (the regex
+    /// fallback's `line = 0`) must not absorb every function's keys.
+    #[test]
+    #[ignore = "ft-2950b25e: handler_return_keys treats a handler with line 0/no end_line as the file's first 120 lines, so it absorbs every function's keys (AUDIT G15 second half)"]
+    fn g15_a_line_zero_handler_does_not_absorb_every_functions_keys() {
+        let keys = handler_return_keys(TWO_HANDLERS, &json!({"line": 0}));
+        assert!(
+            keys.is_empty() || keys.len() < 3,
+            "a handler with no span claimed every function's keys: {keys:?}"
+        );
+    }
+
     #[test]
     fn a_template_literal_parameter_normalises_without_leaving_its_dollar() {
         // `${id}` contains `{id}`; matching the inner form first leaves a `$`.
@@ -1907,6 +1933,55 @@ async function load() {
         assert_eq!(full["scan"]["files_read"], 3);
         assert_eq!(full["scan"]["cancelled"], json!(false));
         assert_eq!(full["consumers"].as_array().unwrap().len(), 2);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// AUDIT G9: `api_impact` scans the client tree once per query. The Python
+    /// ran the full fetch-site scan twice; the scan checks for cancellation
+    /// exactly once before each file it opens, so the number of checks is the
+    /// number of file visits and a second scan would double it.
+    #[test]
+    fn g9_api_impact_visits_each_client_file_once_per_query() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let root = tempdir("g9-once");
+        let sources = [
+            ("a.ts", "// nothing here\n"),
+            ("b.ts", "fetch('/api/thing');\n"),
+            ("c.ts", "fetch('/api/thing');\n"),
+        ];
+        for (path, body) in sources {
+            write(&root, path, body);
+        }
+        let g = graph(
+            json!([
+                {"id": "a.ts", "name": "a", "path": "a.ts", "line": 0, "kind": "file"},
+                {"id": "b.ts", "name": "b", "path": "b.ts", "line": 0, "kind": "file"},
+                {"id": "c.ts", "name": "c", "path": "c.ts", "line": 0, "kind": "file"},
+                {"id": "h", "name": "h", "path": "a.ts", "line": 1, "kind": "function"},
+            ]),
+            json!([{"kind": "routes_to", "source": "GET /api/thing", "target": "h"}]),
+        );
+        let checks = Arc::new(AtomicUsize::new(0));
+        let observed = checks.clone();
+        let cancel = crate::cancel::Cancel::new().with_check_probe(move || {
+            observed.fetch_add(1, Ordering::Relaxed);
+        });
+        let budget = ScanBudget {
+            cancel,
+            ..ScanBudget::default()
+        };
+        let impact = api_impact(&root, &g, &budget, "/api/thing");
+
+        let bytes: usize = sources.iter().map(|(_, body)| body.len()).sum();
+        assert_eq!(impact["scan"]["files_read"], 3, "{impact}");
+        assert_eq!(impact["scan"]["source_bytes_read"], bytes, "{impact}");
+        assert_eq!(
+            checks.load(Ordering::Relaxed),
+            sources.len(),
+            "one cancellation check per file visit: a second scan would double it"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

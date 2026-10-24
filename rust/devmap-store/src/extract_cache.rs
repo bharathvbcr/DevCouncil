@@ -599,4 +599,72 @@ mod tests {
                 .expect_err("a pre-cancelled build must not return extractions");
         assert!(error.is::<devmap_extract::BuildCancelled>(), "{error:#}");
     }
+
+    static WORKERS: std::sync::Mutex<Vec<std::thread::ThreadId>> = std::sync::Mutex::new(Vec::new());
+
+    /// An extractor that takes long enough for every idle worker to join in,
+    /// and records which threads ran it.
+    fn slow_recording_extractor(path: &str, source: &str) -> Extraction {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let id = std::thread::current().id();
+        let mut seen = WORKERS.lock().unwrap();
+        if !seen.contains(&id) {
+            seen.push(id);
+        }
+        drop(seen);
+        extract_file(path, source)
+    }
+
+    /// PLAN B12 and N9: the extraction pass runs on a pool sized from the
+    /// host's cores, with no fixed ceiling. The Python capped it at
+    /// `min(4, cpu_count() // 2)`, so a 12-core host used four.
+    ///
+    /// The whole extraction pass is rayon's global pool, so two facts pin it:
+    /// the pool is as wide as the host (N9), and a build over enough slow files
+    /// actually runs them on that many distinct workers (B12). Scaling is
+    /// observed as worker threads reached, not as wall time, which load on a
+    /// shared machine would turn into noise.
+    #[test]
+    fn b12_n9_extraction_saturates_every_core_with_no_fixed_ceiling() {
+        let cores = std::thread::available_parallelism().map_or(1, usize::from);
+        let configured = std::env::var("RAYON_NUM_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|threads| *threads > 0);
+        let expected = configured.unwrap_or(cores);
+
+        WORKERS.lock().unwrap().clear();
+        let mut scanned = devmap_extract::ScannedTree::default();
+        for index in 0..(expected * 8).max(32) {
+            scanned.sources.push((
+                format!("f{index}.py"),
+                format!("def f{index}():\n    return {index}\n"),
+            ));
+        }
+        let store = Store::open_in_memory().unwrap();
+        extract_scanned_with_progress(
+            &store,
+            &scanned,
+            None,
+            CacheAdmission::AtGenerationCommit,
+            BuildControl {
+                extractor: slow_recording_extractor,
+                ..BuildControl::default()
+            },
+        )
+        .expect("extraction");
+        // Asked after the build: querying the global pool first would create it
+        // at the default width and hide anything the build itself configures.
+        assert_eq!(
+            rayon::current_num_threads(),
+            expected,
+            "the extraction pool must be as wide as the host: no ceiling below {expected}"
+        );
+        let used = WORKERS.lock().unwrap().len();
+        assert_eq!(
+            used, expected,
+            "{} files ran on {used} workers of a {expected}-wide pool",
+            scanned.sources.len()
+        );
+    }
 }

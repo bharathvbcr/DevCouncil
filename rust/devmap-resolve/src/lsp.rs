@@ -2049,6 +2049,48 @@ mod session_bounds {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// AUDIT X12: a server that stops reading while the client keeps writing
+    /// cannot wedge the client. The Python held its write lock across a
+    /// blocking pipe write, and the reader thread needed that lock to drain
+    /// the server's replies, so a full pipe deadlocked both. Here a server
+    /// answers `initialize` and then never reads stdin again; the client's
+    /// writes must end in `TimedOut`, not block. The loop runs on its own
+    /// thread so a regression fails after ten seconds instead of hanging the
+    /// suite.
+    #[test]
+    fn x12_a_server_that_stops_reading_cannot_wedge_the_client_writes() {
+        let script = "printf 'Content-Length: 36\\r\\n\\r\\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'; sleep 60"
+            .to_string();
+        let (done, outcome) = mpsc::channel();
+        thread::spawn(move || {
+            let started = Instant::now();
+            let mut client = LspClient::spawn(
+                &spec(script),
+                Path::new("sh"),
+                &std::env::temp_dir(),
+                started + Duration::from_secs(5),
+            )
+            .unwrap_or_else(|e| panic!("initialize was answered: {e:?}"));
+            // 200 frames of 200 KB against a 64 KB pipe and a 16-frame queue.
+            let filler = "A".repeat(200_000);
+            let result = (0..200).try_for_each(|_| {
+                client.notify("textDocument/didChange", json!({ "text": filler }))
+            });
+            let _ = done.send((result, started.elapsed()));
+        });
+        let (result, elapsed) = outcome
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the client blocked writing to a server that stopped reading");
+        assert!(
+            matches!(result, Err(LspDidNotRun::TimedOut)),
+            "a backed-up writer must end the session as TimedOut, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "took {elapsed:?} against a 5s deadline"
+        );
+    }
+
     /// A language server in `sh`: answers `initialize` and `shutdown` with
     /// `null`, appends `line:character` of every definition request to `$1`,
     /// and answers each with one location in the URI `$2`, at line 0
