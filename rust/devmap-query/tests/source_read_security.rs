@@ -220,7 +220,8 @@ fn stored_search_paths_cannot_disclose_outside_source() {
 #[test]
 fn source_cache_and_handler_work_have_reported_aggregate_limits() {
     let root = fixture("aggregate");
-    let text = "#".repeat(1024 * 1024);
+    // Exactly 1 MiB, but in 1024 lines: a handler needs a real span to be read.
+    let text = format!("{}\n", "#".repeat(1023)).repeat(1024);
     let paths: Vec<_> = (0..65)
         .map(|index| format!("source{index:02}.py"))
         .collect();
@@ -237,7 +238,7 @@ fn source_cache_and_handler_work_have_reported_aggregate_limits() {
     );
     assert_eq!(mapped["scan"]["complete"], false);
     let value = json!({
-        "nodes":(1..=65).map(|line|json!({"id":format!("h{line}"),"path":"source00.py","kind":"function","line":line})).collect::<Vec<_>>(),
+        "nodes":(1..=65).map(|line|json!({"id":format!("h{line}"),"path":"source00.py","kind":"function","line":line,"end_line":line})).collect::<Vec<_>>(),
         "edges":(1..=65).map(|line|json!({"kind":"routes_to","source":format!("GET /route{line}"),"target":format!("h{line}")})).collect::<Vec<_>>()
     });
     let mapped = route_map(&root, &value, &ScanBudget::default());
