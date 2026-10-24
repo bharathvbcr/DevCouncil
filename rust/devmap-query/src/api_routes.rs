@@ -913,29 +913,38 @@ fn resolve_handler(
     }
 }
 
+/// The 0-based half-open line range a handler declares, or `None` when the
+/// graph does not give both bounds in a form that can be trusted.
+///
+/// The graph writes `line: 0, end_line: 0` for a node whose span could not be
+/// resolved (and for file nodes), and an old node may carry a `line` with no
+/// `end_line`. Neither names a region, so neither borrows a guessed window: a
+/// handler read over the wrong lines reports another function's keys as its
+/// own. An end before the start, or past the end of the source (a stale
+/// index), is equally untrustworthy.
+fn handler_span(line_count: usize, handler: &Value) -> Option<(usize, usize)> {
+    let bound = |field: &str| {
+        handler[field]
+            .as_u64()
+            .and_then(|line| usize::try_from(line).ok())
+    };
+    let (start, end) = (bound("line")?, bound("end_line")?);
+    (start >= 1 && end >= start && end <= line_count).then(|| (start - 1, end))
+}
+
 /// Keys a Python handler returns in a `return {...}` literal.
 ///
 /// Pattern-based, over the handler's own line range rather than the whole file:
 /// the Python re-parses the entire module per handler, and its fallback when
 /// the name does not match is to accept any function whose span contains the
 /// line — which for a nested function is the enclosing one.
-fn handler_return_keys(text: &str, handler: &Value) -> Vec<String> {
+///
+/// `None` means the handler's span is unknown, which is not "returns no keys":
+/// the caller must report the keys as unavailable, or every consumer key would
+/// read as missing from the handler.
+fn handler_return_keys(text: &str, handler: &Value) -> Option<Vec<String>> {
     let lines: Vec<&str> = text.lines().collect();
-    let start = handler["line"]
-        .as_u64()
-        .and_then(|line| usize::try_from(line).ok())
-        .unwrap_or(1)
-        .max(1)
-        - 1;
-    let end = handler["end_line"]
-        .as_u64()
-        .and_then(|line| usize::try_from(line).ok())
-        .filter(|l| *l > start)
-        .unwrap_or(start.saturating_add(120))
-        .min(lines.len());
-    if start >= lines.len() {
-        return Vec::new();
-    }
+    let (start, end) = handler_span(lines.len(), handler)?;
     let chunk = lines[start..end].join("\n");
 
     let pat = patterns();
@@ -945,7 +954,7 @@ fn handler_return_keys(text: &str, handler: &Value) -> Vec<String> {
             keys.insert(key[1].to_string());
         }
     }
-    keys.into_iter().collect()
+    Some(keys.into_iter().collect())
 }
 
 /// Routes, their handlers and the clients that call them.
@@ -976,7 +985,7 @@ pub fn route_map(root: &Path, graph: &Value, budget: &ScanBudget) -> Value {
                         return None;
                     }
                     handler_bytes_remaining -= source.len() as u64;
-                    Some(handler_return_keys(source, handler))
+                    handler_return_keys(source, handler)
                 });
             match keys {
                 Some(keys) => handler_keys.extend(keys.iter().cloned()),
@@ -1374,20 +1383,126 @@ mod tests {
     fn g15_a_handler_returns_only_the_keys_inside_its_own_span() {
         let users = json!({"line": 1, "end_line": 2});
         let orders = json!({"line": 4, "end_line": 5});
-        assert_eq!(handler_return_keys(TWO_HANDLERS, &users), ["ids", "total"]);
-        assert_eq!(handler_return_keys(TWO_HANDLERS, &orders), ["order_id"]);
+        assert_eq!(
+            handler_return_keys(TWO_HANDLERS, &users).unwrap(),
+            ["ids", "total"]
+        );
+        assert_eq!(
+            handler_return_keys(TWO_HANDLERS, &orders).unwrap(),
+            ["order_id"]
+        );
     }
 
     /// AUDIT G15, second half: a handler with no usable line (the regex
     /// fallback's `line = 0`) must not absorb every function's keys.
     #[test]
-    #[ignore = "ft-2950b25e: handler_return_keys treats a handler with line 0/no end_line as the file's first 120 lines, so it absorbs every function's keys (AUDIT G15 second half)"]
     fn g15_a_line_zero_handler_does_not_absorb_every_functions_keys() {
         let keys = handler_return_keys(TWO_HANDLERS, &json!({"line": 0}));
-        assert!(
-            keys.is_empty() || keys.len() < 3,
-            "a handler with no span claimed every function's keys: {keys:?}"
+        assert_eq!(
+            keys, None,
+            "a handler with no span claimed function keys: {keys:?}"
         );
+    }
+
+    /// An unknown span is `None`, never a guessed window and never `Some([])`
+    /// (which would read as "returns no keys" and flag every consumer key).
+    #[test]
+    fn g15_a_handler_without_trustworthy_bounds_yields_no_keys_at_all() {
+        for handler in [
+            json!({"line": 0, "end_line": 2}), // line 0 with an end
+            json!({"line": 0, "end_line": 0}), // the graph's unresolved sentinel
+            json!({"line": 1}),                // a line with no end
+            json!({"line": 1, "end_line": null}),
+            json!({"end_line": 2}), // an end with no line
+            json!({}),
+            json!({"line": 5, "end_line": 4}),  // end before start
+            json!({"line": 1, "end_line": 6}),  // end past EOF (5 lines)
+            json!({"line": 9, "end_line": 12}), // wholly past EOF
+            json!({"line": "1", "end_line": "2"}), // wrong type
+            json!({"line": -1, "end_line": 2}),
+        ] {
+            assert_eq!(
+                handler_return_keys(TWO_HANDLERS, &handler),
+                None,
+                "{handler}"
+            );
+        }
+        assert_eq!(
+            handler_return_keys("", &json!({"line": 1, "end_line": 1})),
+            None
+        );
+    }
+
+    /// Bounds are inclusive and exact: the last line of the file is a valid end,
+    /// a one-line span reads one line.
+    #[test]
+    fn g15_bounds_are_inclusive_at_both_edges() {
+        let header = json!({"line": 4, "end_line": 4});
+        assert_eq!(handler_return_keys(TWO_HANDLERS, &header), Some(vec![]));
+        let last = json!({"line": 5, "end_line": 5});
+        assert_eq!(
+            handler_return_keys(TWO_HANDLERS, &last).unwrap(),
+            ["order_id"]
+        );
+        let whole = json!({"line": 1, "end_line": 5});
+        assert_eq!(
+            handler_return_keys(TWO_HANDLERS, &whole).unwrap(),
+            ["ids", "order_id", "total"]
+        );
+        let ret_only = json!({"line": 2, "end_line": 2});
+        assert_eq!(
+            handler_return_keys(TWO_HANDLERS, &ret_only).unwrap(),
+            ["ids", "total"]
+        );
+    }
+
+    /// Two handlers with overlapping spans each read exactly their own declared
+    /// range: the inner one does not inherit the outer's keys, nor the reverse.
+    #[test]
+    fn g15_overlapping_spans_each_read_only_their_own_range() {
+        let outer = json!({"line": 1, "end_line": 5});
+        let inner = json!({"line": 4, "end_line": 5});
+        assert_eq!(
+            handler_return_keys(TWO_HANDLERS, &outer).unwrap(),
+            ["ids", "order_id", "total"]
+        );
+        assert_eq!(
+            handler_return_keys(TWO_HANDLERS, &inner).unwrap(),
+            ["order_id"]
+        );
+    }
+
+    /// End to end: a handler whose node has the unresolved `0/0` span makes the
+    /// route's keys unavailable, so the shape check cannot report a mismatch
+    /// against keys that were never read.
+    #[test]
+    fn g15_an_unresolved_span_makes_the_route_keys_unavailable() {
+        let root = tempdir("g15-unresolved");
+        write(
+            &root,
+            "web/app.ts",
+            "async function load() {\n  const res = await fetch('/api/users/42');\n  const data = await res.json();\n  console.log(data.name);\n}\n",
+        );
+        write(
+            &root,
+            "api/handlers.ts",
+            "export function other() {\n  return { secret: 1 };\n}\nexport function getUser() {\n  return { name: 'x' };\n}\n",
+        );
+        let g = graph(
+            json!([
+                {"id": "web/app.ts", "name": "app", "path": "web/app.ts", "line": 0, "kind": "file"},
+                {"id": "api/handlers.ts::getUser", "name": "getUser", "path": "api/handlers.ts",
+                 "line": 0, "end_line": 0, "kind": "function"},
+            ]),
+            json!([{"kind": "routes_to", "source": "GET /api/users/:id",
+                    "target": "api/handlers.ts::getUser"}]),
+        );
+        let mapped = route_map(&root, &g, &ScanBudget::default());
+        let route = &mapped["routes"][0];
+        assert_eq!(route["handler_keys_available"], false);
+        assert_eq!(route["handler_keys"], Value::Null);
+        assert_eq!(mapped["scan"]["handler_sources_unavailable"], 1);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1994,7 +2109,7 @@ async function load() {
             json!([
                 {"id": "a.ts", "name": "a", "path": "a.ts", "line": 0, "kind": "file"},
                 {"id": "b.ts", "name": "b", "path": "b.ts", "line": 0, "kind": "file"},
-                {"id": "h", "name": "h", "path": "a.ts", "line": 1, "kind": "function"},
+                {"id": "h", "name": "h", "path": "a.ts", "line": 1, "end_line": 1, "kind": "function"},
             ]),
             json!([{"kind": "routes_to", "source": "GET /api/thing", "target": "h"}]),
         );
@@ -2028,7 +2143,7 @@ async function load() {
         let root = tempdir("nocaller");
         write(&root, "a.ts", "export function h() { return {}; }\n");
         let g = graph(
-            json!([{"id": "h", "name": "h", "path": "a.ts", "line": 1, "kind": "function"}]),
+            json!([{"id": "h", "name": "h", "path": "a.ts", "line": 1, "end_line": 1, "kind": "function"}]),
             json!([{"kind": "routes_to", "source": "GET /api/quiet", "target": "h"}]),
         );
         let impact = api_impact(&root, &g, &ScanBudget::default(), "/api/quiet");
