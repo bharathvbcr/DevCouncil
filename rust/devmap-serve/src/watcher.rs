@@ -238,6 +238,10 @@ impl DebounceBuffer {
         Some(std::mem::take(&mut self.pending).into_iter().collect())
     }
 
+    fn holds_paths(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     fn take_ready(&mut self, now: Instant) -> Option<Vec<String>> {
         let last_event = self.last_event?;
         if self.pending.is_empty() {
@@ -254,6 +258,56 @@ impl DebounceBuffer {
         self.oldest_pending = None;
         self.collapsed = false;
         Some(std::mem::take(&mut self.pending).into_iter().collect())
+    }
+}
+
+#[derive(Default)]
+struct BacklogState {
+    /// Raw events offered to the channel and not yet folded into the debounce
+    /// buffer.
+    queued: std::sync::atomic::AtomicUsize,
+    /// The debounce buffer holds paths it has not delivered. They are not in
+    /// the store's pending queue until the callback runs, up to `DEBOUNCE` (or
+    /// `MAX_DEBOUNCE_HOLD`) after the edit, so the store alone cannot say the
+    /// tree is still moving.
+    holding: AtomicBool,
+}
+
+/// Whether the watcher has events the store's pending queue does not yet show.
+///
+/// Shared between the OS callback, the consumer thread and a reader (the
+/// daemon's post-drain verification, which skips a tree walk whose verdict the
+/// next drain would discard). A reader that sees `false` has proof only that no
+/// event was in flight at that instant, not that none will arrive.
+#[derive(Clone, Default)]
+pub struct WatchBacklog(Arc<BacklogState>);
+
+impl WatchBacklog {
+    /// True while an event is in the channel or held by the debounce.
+    pub fn is_busy(&self) -> bool {
+        self.0.holding.load(Ordering::SeqCst) || self.0.queued.load(Ordering::SeqCst) > 0
+    }
+
+    /// Record that the consumer folded one event into `buffer`. `holding` is
+    /// stored before `queued` drops, so the two never read idle in between.
+    fn event_consumed(&self, buffer: &DebounceBuffer) {
+        self.0.holding.store(buffer.holds_paths(), Ordering::SeqCst);
+        self.0.queued.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Stand in for one raw event the OS has offered and the consumer has not
+    /// yet folded in, so a test can hold the backlog busy deterministically.
+    #[cfg(test)]
+    pub(crate) fn pretend_event_in_flight(&self, in_flight: bool) {
+        if in_flight {
+            self.0.queued.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.0.queued.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    fn buffer_changed(&self, buffer: &DebounceBuffer) {
+        self.0.holding.store(buffer.holds_paths(), Ordering::SeqCst);
     }
 }
 
@@ -537,10 +591,14 @@ fn watch_error_paths(root: &Path, error: &notify::Error) -> Vec<String> {
 fn offer_watch_event(
     tx: &std::sync::mpsc::SyncSender<notify::Result<notify::Event>>,
     overflowed: &AtomicBool,
+    backlog: &WatchBacklog,
     event: notify::Result<notify::Event>,
 ) {
+    // Counted before the send so the consumer's decrement can never run first.
+    backlog.0.queued.fetch_add(1, Ordering::SeqCst);
     if tx.try_send(event).is_err() {
-        overflowed.store(true, Ordering::Relaxed);
+        backlog.0.queued.fetch_sub(1, Ordering::SeqCst);
+        overflowed.store(true, Ordering::SeqCst);
     }
 }
 
@@ -553,6 +611,7 @@ fn run_watch_loop<F: Fn(Vec<String>)>(
     rx: std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
     stop_rx: std::sync::mpsc::Receiver<()>,
     overflowed: &AtomicBool,
+    backlog: &WatchBacklog,
     debounce: Duration,
     callback: F,
 ) {
@@ -649,19 +708,23 @@ fn run_watch_loop<F: Fn(Vec<String>)>(
         if let Some(paths) = buffer.take_ready(now) {
             callback(paths);
         }
+        backlog.buffer_changed(&buffer);
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(Ok(event)) => {
                 let admitted = watch_event_paths(root, event, &mut ignore_cache);
                 buffer.push(admitted, Instant::now());
+                backlog.event_consumed(&buffer);
             }
             Ok(Err(error)) => {
                 let admitted = watch_error_paths(root, &error);
                 buffer.push(admitted, Instant::now());
+                backlog.event_consumed(&buffer);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if let Some(paths) = buffer.take_ready(Instant::now()) {
                     callback(paths);
                 }
+                backlog.buffer_changed(&buffer);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 // The producer is gone, so nothing more will arrive — but what
@@ -686,6 +749,16 @@ pub fn start_file_watcher<P: AsRef<Path>, F: Fn(Vec<String>) + Send + 'static>(
     root_path: P,
     callback: F,
 ) -> anyhow::Result<WatcherHandle> {
+    start_file_watcher_observed(root_path, callback, WatchBacklog::default())
+}
+
+/// [`start_file_watcher`] that reports, through `backlog`, whether events are
+/// still in flight between the OS and the callback.
+pub fn start_file_watcher_observed<P: AsRef<Path>, F: Fn(Vec<String>) + Send + 'static>(
+    root_path: P,
+    callback: F,
+    backlog: WatchBacklog,
+) -> anyhow::Result<WatcherHandle> {
     let root = root_path.as_ref().canonicalize()?;
     let (tx, rx) = sync_channel(WATCH_QUEUE_CAPACITY);
     let (stop_tx, stop_rx) = channel();
@@ -695,8 +768,9 @@ pub fn start_file_watcher<P: AsRef<Path>, F: Fn(Vec<String>) + Send + 'static>(
     // tree — the same rule K-A3 applies to the kernel's own drop notice.
     let overflowed = Arc::new(AtomicBool::new(false));
     let overflow_writer = Arc::clone(&overflowed);
+    let offer_backlog = backlog.clone();
     let mut watcher = RecommendedWatcher::new(
-        move |event| offer_watch_event(&tx, &overflow_writer, event),
+        move |event| offer_watch_event(&tx, &overflow_writer, &offer_backlog, event),
         Config::default(),
     )?;
     watcher.watch(&root, RecursiveMode::Recursive)?;
@@ -723,12 +797,14 @@ pub fn start_file_watcher<P: AsRef<Path>, F: Fn(Vec<String>) + Send + 'static>(
         }
     }
 
+    let loop_backlog = backlog.clone();
     let thread = std::thread::spawn(move || {
         run_watch_loop(
             &root,
             rx,
             stop_rx,
             &overflowed,
+            &loop_backlog,
             Duration::from_secs(2),
             callback,
         );
@@ -801,6 +877,7 @@ mod tests {
                 rx,
                 stop_rx,
                 &AtomicBool::new(overflowed),
+                &WatchBacklog::default(),
                 Duration::from_secs(2),
                 |paths| delivered_tx.send(paths).unwrap(),
             );
@@ -854,6 +931,7 @@ mod tests {
                     rx,
                     stop_rx,
                     &loop_overflowed,
+                    &WatchBacklog::default(),
                     if stop_requested {
                         Duration::from_secs(30)
                     } else {
@@ -919,6 +997,7 @@ mod tests {
                 rx,
                 stop_rx,
                 &AtomicBool::new(false),
+                &WatchBacklog::default(),
                 Duration::from_secs(30),
                 |paths| {
                     writer.enqueue_pending_paths(&paths).unwrap();
@@ -980,6 +1059,7 @@ mod tests {
                 rx,
                 stop_rx,
                 &AtomicBool::new(false),
+                &WatchBacklog::default(),
                 Duration::from_secs(30),
                 |paths| batches_tx.send(paths).unwrap(),
             );
@@ -1321,7 +1401,7 @@ mod tests {
         let overflowed = Arc::new(AtomicBool::new(false));
 
         for filled in 0..WATCH_QUEUE_CAPACITY {
-            offer_watch_event(&tx, &overflowed, edited());
+            offer_watch_event(&tx, &overflowed, &WatchBacklog::default(), edited());
             assert!(
                 !overflowed.load(Ordering::Relaxed),
                 "the queue still had room at {filled} of {WATCH_QUEUE_CAPACITY}; \
@@ -1329,7 +1409,7 @@ mod tests {
                  rescan on every busy moment"
             );
         }
-        offer_watch_event(&tx, &overflowed, edited());
+        offer_watch_event(&tx, &overflowed, &WatchBacklog::default(), edited());
         assert!(
             overflowed.load(Ordering::Relaxed),
             "the {}st event has nowhere to go and must be recorded as refused, \
@@ -1347,6 +1427,7 @@ mod tests {
                 rx,
                 stop_rx,
                 &loop_flag,
+                &WatchBacklog::default(),
                 Duration::ZERO,
                 move |paths| {
                     let _ = batches_tx.send(paths);
@@ -1418,6 +1499,7 @@ mod tests {
         offer_watch_event(
             &tx,
             &overflowed,
+            &WatchBacklog::default(),
             Ok(
                 notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
                     .add_path(root.join("src/a.py")),
@@ -1434,6 +1516,7 @@ mod tests {
                 rx,
                 stop_rx,
                 &loop_flag,
+                &WatchBacklog::default(),
                 // Far longer than this test lives, so a delivery here is the
                 // shutdown flush and cannot be the debounce maturing.
                 Duration::from_secs(30),
@@ -1495,6 +1578,7 @@ mod tests {
                 rx,
                 stop_rx,
                 &loop_flag,
+                &WatchBacklog::default(),
                 Duration::from_secs(30),
                 move |paths| {
                     let _ = batches_tx.send(paths);
@@ -1526,6 +1610,7 @@ mod tests {
         offer_watch_event(
             &tx,
             &overflowed,
+            &WatchBacklog::default(),
             Ok(
                 notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
                     .add_path(root.join("src/a.py")),
@@ -1543,6 +1628,7 @@ mod tests {
                 rx,
                 stop_rx,
                 &loop_flag,
+                &WatchBacklog::default(),
                 Duration::ZERO,
                 move |paths| {
                     let _ = batches_tx.send(paths);
