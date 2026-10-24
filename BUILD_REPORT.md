@@ -287,8 +287,35 @@ All of this is merged to main, now `1d8a3505`.
 
 **Daemon freshness (ft-2950b25e follow-up):**
 - After each successful drain, the daemon verifies freshness with a `status` walk, so query answers read `fresh:true` without a separate `status` call. Settled samples read true or null at 0/40 before the fix and 40/0 after. A race test passes.
-- Cost: one tree walk per drain, about 2.2 s wall and 0.23 s user CPU on this repo at load 51. It has not been measured on a large repo.
+- Cost: one tree walk per drain, about 2.2 s wall and 0.23 s user CPU on this repo at load 51. The third wave bounded it to one walk per quiet period.
 - The liveness corpus-count comment and the `verify_task` description are corrected.
+
+### Third wave of 2026-10-22 (merged)
+
+**Property tests (GAP-11, merged `4ec5cfab`):**
+- ID-named tests for B6, B7, B9, B12, N9, G9, G15, G24 and X12; S16 is retired.
+- G15 is pinned as an ignored test, not fixed. `handler_return_keys` maps a handler with line 0 and no end line to the first 120 lines, so it absorbs every function's keys.
+- The new `b_series_schema_cost_properties` target failed devmap-cli's classification gate on main. It is now declared `required-features = ["parse"]` (`7e554bd6`).
+- The mutation check for these tests was NOT RUN.
+
+**Bounded post-drain walk (ft-2950b25e follow-up):**
+- The status walk after a drain is now a deferred job.
+  - Every drain re-arms a 400 ms settle window, which `with_freshness_settle` can change.
+  - The walk starts only when the store queue is empty and the watcher holds no undelivered event (`WatchBacklog`).
+  - A queue that cannot be read counts as busy.
+- The walk can now be cancelled (`scan_tree_cancellable`, `Store::status_cancellable`). A shutdown no longer waits for it, and a cancelled walk is an error that records no verdict.
+- Truth guards are unchanged: `status` and `query_source_freshness` still refuse to certify over a non-empty queue.
+- Tests: three new tests failed against the inline per-drain walk and pass now.
+  - Storm test: 31 walks over 30 drains before, at most 3 after.
+  - Shutdown test: before, the loop was still blocked 3 s after shutdown.
+  - Pending test: no walk runs while an edit is queued or held.
+  - A fourth test covers a cancelled walk.
+- Measured with real-watcher storms of 50 edits at 1 s spacing; CPU is user+sys, n=2 per arm, load 7–52.
+  - The watcher already coalesces such a storm into 2 drains, so walks fell from 2 to 1.
+  - On a 20k-file synthetic tree, daemon CPU was about 9% lower (32.7/35.7 s before, 29.4/32.1 s after).
+  - On `rust/` (1,682 files) the difference was inside noise.
+  - The clear gains are the walk count and a shutdown that no longer blocks.
+- Limitation: a drain that starts during a walk does not cancel it. The walk's verdict is still guarded by the generation re-check.
 
 ### Consumer sweep handover (run from sessions rooted in each repo)
 
