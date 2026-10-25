@@ -294,9 +294,9 @@ All of this is merged to main, now `1d8a3505`.
 
 **Property tests (GAP-11, merged `4ec5cfab`):**
 - ID-named tests for B6, B7, B9, B12, N9, G9, G15, G24 and X12; S16 is retired.
-- G15 is pinned as an ignored test, not fixed. `handler_return_keys` maps a handler with line 0 and no end line to the first 120 lines, so it absorbs every function's keys.
+- G15 was pinned as an ignored test, not fixed (fixed in the wrap-up below). `handler_return_keys` maps a handler with line 0 and no end line to the first 120 lines, so it absorbs every function's keys.
 - The new `b_series_schema_cost_properties` target failed devmap-cli's classification gate on main. It is now declared `required-features = ["parse"]` (`7e554bd6`).
-- The mutation check for these tests was NOT RUN.
+- The mutation check for these tests was NOT RUN at this merge; the wrap-up below ran it.
 
 **Bounded post-drain walk (ft-2950b25e follow-up):**
 - The status walk after a drain is now a deferred job.
@@ -315,7 +315,64 @@ All of this is merged to main, now `1d8a3505`.
   - On a 20k-file synthetic tree, daemon CPU was about 9% lower (32.7/35.7 s before, 29.4/32.1 s after).
   - On `rust/` (1,682 files) the difference was inside noise.
   - The clear gains are the walk count and a shutdown that no longer blocks.
-- Limitation: a drain that starts during a walk does not cancel it. The walk's verdict is still guarded by the generation re-check.
+- Limitation at this merge: a drain that starts during a walk did not cancel it. The wrap-up below closes this (walk-cancel).
+
+### Wrap-up of 2026-10-24 (owner: "Start wrapping up"; triage by Fable)
+
+Opus reviewed each lane diff before its merge. Before each fast-forward, the combined tree was tested on a full `git archive` export.
+
+**Walk-cancel (merged `ea7ea58d`, lane commit `16386b68`):**
+- A drain that starts while a freshness walk is in flight now cancels that walk through a per-walk token, and the walk re-arms after the settle window.
+- A shutdown during that unwind exits without starting a new walk.
+- Two new tests both failed against `43695341`.
+
+**G15 handler bounds (merged `545725f8`, lane commit `8552826e`):**
+- `handler_return_keys` now reads only a `line..=end_line` span that lies inside the source. Otherwise it returns `None`, and `route_map` reports `handler_keys_available=false`. Before, a handler with no span got the first 120 lines and took every function's keys.
+- The G15 test is no longer ignored, and adversarial span tests were added.
+- `cargo-mutants` on the change: 16 of 17 caught. The survivor is `api_routes.rs:358` (`files_eligible` in `scan_sites`), which predates this change and is filed on ft-ae653b10.
+
+**Mutation check of the GAP-11 property tests (merged `ba435074`, lane commits `8d403902` and `261566b2`):**
+- Tests only; no production code changed. The per-ID table is in `docs/devmap/property-coverage.md`.
+- Caught before → after:
+
+  | ID | Caught |
+  |---|---|
+  | B6 | 0/7 → 7/7 |
+  | B7 | 0/2 → 2/2 |
+  | B12 | 1/7 → 4/7 |
+  | G9 | 22/75 → 26/75 |
+  | X12 | 7/15 → 10/15 |
+  | G24 | 5/11 → 5/11 |
+
+- G24's comparator was reversed by hand and its tests failed.
+- B9 (DDL) and N9 (nothing configures the pool) have no function to mutate, so they were NOT RUN.
+- Survivors outside these properties stay open on ft-ae653b10:
+  - G9: 20 survivors in the size-budget and site-cap accounting.
+  - X12: `spawn_with:1079` and `request:1219`, which survive the whole `devmap-resolve` lib suite.
+  - G24: 6 call-blind start guards in `traverse_walked`.
+
+### Owner handover: commands this session cannot run
+
+These were triaged by Fable on 2026-10-24. The gate refuses them, or they are yours to decide.
+
+1. **Mutants baselines for devmap-resolve and devmap-analyze** (overnight; hours of CPU). From the repository root, for each crate:
+   ```
+   cargo mutants -d rust -p devmap-resolve --timeout 60 --no-shuffle --in-place
+   sort -u rust/mutants.out/missed.txt rust/mutants.out/timeout.txt > rust/mutants-baseline/devmap-resolve.txt
+   ```
+   Repeat with `devmap-analyze`, then commit both files. Until they are committed, those two shards of the weekly job fail with "baseline not committed". That is the intended loud failure.
+2. **Hygiene.** The gate protects these paths. Look first, then delete:
+   - `.claude/worktrees/agent-a3d621dedc64bce2a/` and `.claude/worktrees/agent-a0e3bc78f1b282c07/`: each holds only a Finder `.DS_Store`. `rm .claude/worktrees/agent-a3d621dedc64bce2a/.DS_Store && rmdir .claude/worktrees/agent-a3d621dedc64bce2a`, and the same for the other one.
+   - `.claude/worktrees/agent-a9bb175e705f145d9/`: an orphaned checkout from 2026-10-21. It has no `.git/worktrees` entry and no branch. On 2026-10-24 every file in it was hashed, including `.devcouncil/` and the large vendored grammar. All matched blobs already in the repository except the `.git` pointer file, so it holds no unique work. Remove it with `rm -rf .claude/worktrees/agent-a9bb175e705f145d9`.
+   - The literal `${CLAUDE_PROJECT_DIR}/` directory at the repository root: `ls -la './${CLAUDE_PROJECT_DIR}'`, then `rm -r './${CLAUDE_PROJECT_DIR}'`. Keep the single quotes so the shell does not expand it.
+   - `.venv/`: a system process held it open at the last check. Run `lsof +D .venv | head` before you remove it.
+   - The orphaned `.devcouncil/*` files named on card ft-7364b2c8.
+3. **Confirm** the `artifact.go` date 2027-01-31.
+4. **Store v28 payload-scoped unit:** decide using `docs/devmap/design/store-write-cost-proposal.md`.
+5. **Consumer sweep, then push, then the v98 unfreeze:** see below.
+6. **GitPulse board is unreachable from this session (2026-10-24).** Every `gitpulse_*` MCP call returns `unsupported DevCouncil schema version 10; this binary knows 9`. The only `gitpulse-mcp` on PATH is `~/.cargo/bin/gitpulse-mcp`, built on 2026-10-21, and it predates dc-store schema 10. Rebuild and reinstall it from the GitPulse checkout (step 1 of the sweep), then confirm with `bun run check:schema-parity`. Until then, file these two items on the board by hand:
+   - **Dependabot branches.** `origin/dependabot/pip/…/20260912-expanded/pip-8c0f375029` and `origin/dependabot/uv/…/uv-8c0f375029` bump dependencies inside the dated snapshot `benchmarks/results/competition/20260912-expanded`. The wrap-up left them unmerged because they are dependency upgrades and nothing is pushed before the sweep. Merge them if the snapshot is meant to be re-runnable. Otherwise close them, and make Dependabot ignore that path.
+   - **Wrap-up results for ft-2950b25e.** These belong in the card's log, and the card stays in review. The results are in "Wrap-up of 2026-10-24" above: walk-cancel, G15 and the mutation table.
 
 ### Consumer sweep handover (run from sessions rooted in each repo)
 
