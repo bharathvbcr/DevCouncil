@@ -65,14 +65,19 @@ func TestArgumentWriteTargets(t *testing.T) {
 		{"mv a docs/other.md", []string{"docs/other.md", "a"}, false},
 		{"mv a b c dir/", []string{"dir/a", "dir/b", "dir/c", "a", "b", "c"}, false},
 		{"mv -t dir a", []string{"dir/a", "a"}, false},
-		// Unresolvable operands are refused exactly as a `> $VAR` target is.
-		{"cp a $DEST", nil, true},
-		{"tee ~/x", nil, true},
-		{`sed -i s/a/b/ "$F"`, nil, true},
-		{"mv $SRC docs/x", []string{"docs/x"}, true},
-		{"cp a b $DIR", nil, true},
-		{"cp -t $DIR a", nil, true},
-		{"sed -i'$X' s/a/b/ f.txt", []string{"f.txt"}, true},
+		// A variable the line does not bind is judged by its spelling, as a
+		// `> $VAR` target is; the tilde and $HOME resolve (expandBindings); a
+		// variable the line binds is judged as its value. Only a substitution
+		// still makes the write opaque.
+		{"cp a $DEST", []string{"$DEST"}, false},
+		{"tee ~/x", []string{"/home/agent/x"}, false},
+		{`sed -i s/a/b/ "$F"`, []string{"$F"}, false},
+		{"mv $SRC docs/x", []string{"docs/x", "$SRC"}, false},
+		{"cp a b $DIR", []string{"$DIR/a", "$DIR/b"}, false},
+		{"cp -t $DIR a", []string{"$DIR/a"}, false},
+		{"sed -i'$X' s/a/b/ f.txt", []string{"f.txt", "f.txt$X"}, false},
+		{"D=docs; cp a $D/x", []string{"docs/x"}, false},
+		{"for f in a.md b.md; do tee $f; done", []string{"a.md", "b.md"}, false},
 		{"cp a $(pick)", nil, true},
 		// A glob is judged as the literal path, as a glob in `> src/*.go` is.
 		{"sed -i s/a/b/ src/*.go", []string{"src/*.go"}, false},
@@ -110,6 +115,7 @@ func TestArgumentWriteTargets(t *testing.T) {
 		{"grep tee f", nil, false},
 		{"echo 'tee f'", nil, false},
 	}
+	t.Setenv("HOME", "/home/agent")
 	for _, tc := range tests {
 		targets, opaque, err := RedirectTargets(tc.input)
 		if err != nil {

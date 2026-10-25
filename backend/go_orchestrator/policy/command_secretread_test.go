@@ -62,7 +62,9 @@ func TestShellCommandsNamingASecretPathAreRefusedHard(t *testing.T) {
 		"cat README.md .env",
 		"git cat-file -p HEAD:.env",
 		"git grep API_KEY -- .env",
-		"cat $F",
+		"F=.env; cat $F",
+		"export F=secrets/token.txt && head -1 \"$F\"",
+		"for f in README.md .env; do cat $f; done",
 		"cat $(echo .env)",
 		"git add . && cat .env",
 		"sed -n p .env",
@@ -73,6 +75,14 @@ func TestShellCommandsNamingASecretPathAreRefusedHard(t *testing.T) {
 		d := gate.EvaluateCommand(command, nil)
 		if d.Action != Deny || d.Severity != Hard {
 			t.Errorf("%q was %s %s/%s, want a hard refusal", command, d.Action, d.Rule, d.Severity)
+		}
+	}
+	// A variable the line does not bind is judged by its spelling (owner
+	// decision, 2026-10-24), so it is no longer a secret read on sight; the
+	// same variable bound to a credential path above is.
+	for _, command := range []string{"cat $F", "for f in $(ls); do cat $f; done", "head -5 \"$OUT/log\""} {
+		if d := gate.EvaluateCommand(command, nil); d.Rule == RuleCommandSecretRead {
+			t.Errorf("%q refused as %s (%s); an unbound variable names no credential path", command, d.Rule, d.Reason)
 		}
 	}
 	// And the rule is the one that names them, where it is the one that decides.

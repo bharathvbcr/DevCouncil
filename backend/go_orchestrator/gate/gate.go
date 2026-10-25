@@ -366,8 +366,9 @@ func EvaluateRedirectsOps(command, taskID string, scopeBound bool, evalWrite Ope
 				Action:   policy.Deny,
 				Rule:     policy.RuleCommandSubstitution,
 				Severity: policy.SeverityOf(policy.RuleCommandSubstitution),
-				Reason: "A file this command writes — a redirection target or a file operand — carries " +
-					"an expansion only the shell can resolve and was judged as an unverifiable write.",
+				Reason: "A file this command writes — a redirection target or a file operand — is chosen " +
+					"by a command substitution, or the line writes more files than the gate enumerates, " +
+					"and was judged as an unverifiable write.",
 				Target: command,
 				TaskID: taskID,
 			},

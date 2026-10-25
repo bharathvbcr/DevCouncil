@@ -50,6 +50,9 @@ func TestUnmodelledProgramOperandsAreMatchedAgainstTheHardRules(t *testing.T) {
 		"FOO=1 mytool ../x",
 		"mytool < in.txt ../x",
 		"true; mytool ../x",
+		"mytool $HOME/x",
+		"mytool --out=~/x",
+		"D=../x; mytool $D",
 	}
 	for _, command := range refused {
 		d := gate.EvaluateCommand(command, nil)
@@ -68,8 +71,10 @@ func TestUnmodelledProgramOperandsAreMatchedAgainstTheHardRules(t *testing.T) {
 		"mytool -o out.txt",
 		"mytool https://example.com/a/../b",
 		"mytool 'a note about ../x'",
-		"mytool $HOME/x",
-		"mytool --out=$HOME/x",
+		// An unbound variable is judged by its spelling, which names no
+		// protected path; $HOME resolves, so it is in the refused list.
+		"mytool $OUT/x",
+		"mytool --out=$OUT/x",
 		"mytool .gitignore .github/workflows/ci.yml .gitattributes",
 		"mytool /dev/null",
 		"mytool src/not-a-link",

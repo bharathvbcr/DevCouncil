@@ -201,6 +201,7 @@ func TestReadOnlyGitArgumentsRungIsInertForOtherCommands(t *testing.T) {
 }
 
 func TestPytestOutputOptionsAreWrites(t *testing.T) {
+	t.Setenv("HOME", "/home/agent")
 	for _, tc := range []struct {
 		command string
 		want    []string
@@ -231,7 +232,8 @@ func TestPytestOutputOptionsAreWrites(t *testing.T) {
 		{"pytest --rootdir=/tmp/x", []string{"/tmp/x/.pytest_cache"}, false},
 		{"pytest --rootdir /tmp/x", []string{"/tmp/x/.pytest_cache"}, false},
 		{"pytest -c /tmp/x/pytest.ini", []string{"/tmp/x/.pytest_cache"}, false},
-		{"pytest --junitxml=$HOME/x.xml", nil, true},
+		{"pytest --junitxml=$HOME/x.xml", []string{"/home/agent/x.xml"}, false},
+		{"pytest --junitxml=$(pick)", nil, true},
 		{"pytest @args.txt", nil, true},
 		// Reports under the root, and plain runs, write only what they name.
 		{"pytest -q tests/", nil, false},

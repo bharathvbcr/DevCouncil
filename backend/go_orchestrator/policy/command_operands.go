@@ -226,6 +226,11 @@ func protectedOperand(operand, root string, mt matching) string {
 	if outside && normalized == "" && root != "" && namesRoot(root, operand) {
 		return "" // the tree itself: `go test .`, `tool /path/to/this/repo`
 	}
+	if outside && root != "" && tempWrite(root, normalized) {
+		// A temporary directory takes writes (see tempWrite), so whether the
+		// program reads or writes it no longer matters: `go build -o /tmp/x`.
+		return ""
+	}
 	switch {
 	case outside:
 		return fmt.Sprintf("a path outside the repository (`%s`)", operand)

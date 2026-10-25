@@ -531,7 +531,7 @@ func TestYoloPostureAlsoDisablesHardRules(t *testing.T) {
 
 	// Git safety goes with them: the rules that protect the evidence the
 	// verifier reasons about are hard rules like any other.
-	for _, command := range []string{"git commit --no-verify -m x", "git push --force origin main"} {
+	for _, command := range []string{"git commit --no-gpg-sign -m x", "git push --force origin main"} {
 		d, err := g.EvaluateCommand(command, task)
 		if err != nil {
 			t.Fatal(err)

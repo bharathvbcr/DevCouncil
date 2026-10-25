@@ -60,7 +60,7 @@ const (
 	RuleCommandEmpty          RuleID = "command.empty"
 	RuleCommandNoLease        RuleID = "command.no_lease"
 	RuleCommandNotAllowed     RuleID = "command.not_allowed"
-	RuleCommandBypassFlag     RuleID = "command.bypass_flag" // --no-verify and --no-gpg-sign only
+	RuleCommandBypassFlag     RuleID = "command.bypass_flag" // --no-gpg-sign only; --no-verify is allowed
 	RuleCommandForcePush      RuleID = "command.force_push"
 	RuleCommandProtectedReset RuleID = "command.protected_reset"
 	RuleCommandProtectedPush  RuleID = "command.protected_branch_push"
@@ -187,8 +187,10 @@ var severities = map[RuleID]Severity{
 
 	// An empty command has nothing to grant, so it is closed rather than
 	// negotiable. The three git-safety rules protect the verification gates
-	// themselves: a --no-verify commit or a force push can erase the evidence
+	// themselves: an unsigned commit or a force push can erase the evidence
 	// the whole system reasons about, and no scope decision authorises that.
+	// (--no-verify, which skips the repository's own hooks, is allowed by owner
+	// decision; see gitSafetyVariant.)
 	RuleCommandEmpty:               Hard,
 	RuleCommandBypassFlag:          Hard,
 	RuleCommandForcePush:           Hard,

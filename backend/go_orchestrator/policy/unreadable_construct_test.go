@@ -20,10 +20,10 @@ func TestABehaviouralRefusalIsNeverHiddenBehindAnUnreadableOne(t *testing.T) {
 	gate := CommandGate{HardRules: true}
 	for cmd, want := range map[string]RuleID{
 		"cd src && git push --force origin main":        RuleCommandForcePush,
-		"cd src || git commit --no-verify -m x":         RuleCommandBypassFlag,
+		"cd src || git commit --no-gpg-sign -m x":       RuleCommandBypassFlag,
 		"pushd src; git push -f":                        RuleCommandForcePush,
 		"git push --force origin main <<'EOF'":          RuleCommandForcePush,
-		`git commit --no-verify -m "$(cat <<'EOF'`:      RuleCommandBypassFlag,
+		`git commit --no-gpg-sign -m "$(cat <<'EOF'`:    RuleCommandBypassFlag,
 		`echo "$(cd src && git push -f)"`:               RuleCommandForcePush,
 		"cat <<'EOF'\ngit push --force\nEOF":            RuleCommandForcePush,
 		`echo "$(cat <<'EOF'` + "\ngit push -f\nEOF\n)": RuleCommandForcePush,
@@ -31,7 +31,7 @@ func TestABehaviouralRefusalIsNeverHiddenBehindAnUnreadableOne(t *testing.T) {
 		// A soft refusal in front is the same masking, and worse: soft is
 		// demotable, so `date` hid the push from every posture that demotes.
 		"date; git push --force origin main":  RuleCommandForcePush,
-		"nope && git commit --no-verify -m x": RuleCommandBypassFlag,
+		"nope && git commit --no-gpg-sign -m x": RuleCommandBypassFlag,
 	} {
 		d := gate.EvaluateCommand(cmd, task)
 		if d.Action != Deny || d.Rule != want {

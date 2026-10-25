@@ -25,9 +25,10 @@ var gitContentSubcommands = map[string]bool{
 }
 
 // fileReaders are the commands whose operands are always files they read or
-// copy. An operand of theirs that only the shell can resolve (`cat $F`) cannot
-// be judged, and is refused rather than guessed at: the rest of the ladder
-// treats an unreadable construct the same way.
+// copy. An operand of theirs that a command substitution chooses (`cat
+// $(pick)`) cannot be judged, and is refused rather than guessed at. A
+// variable (`cat $F`) is judged by its literal text once expandBindings has
+// substituted what it can; see carriesSubstitution.
 var fileReaders = map[string]bool{
 	"cat": true, "head": true, "tail": true, "less": true, "more": true,
 	"tac": true, "nl": true, "base64": true, "xxd": true, "od": true,
@@ -122,9 +123,9 @@ func secretOperandViolation(clause, root string) string {
 			if operand == "" || written[operand] {
 				continue
 			}
-			if hasExpansion(operand) {
+			if carriesSubstitution(operand) {
 				if fileReaders[command] {
-					return fmt.Sprintf("`%s` has an operand (`%s`) that only the shell can resolve, so "+
+					return fmt.Sprintf("`%s` has an operand (`%s`) that a command substitution chooses, so "+
 						"the file it reads cannot be judged.", command, text)
 				}
 				continue

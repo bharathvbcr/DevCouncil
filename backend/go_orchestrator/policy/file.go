@@ -216,6 +216,9 @@ func (g FileGate) EvaluateFileChange(path string, task *dc.Task, op dc.Operation
 		if reason, bad := malformedPath(normalized); bad {
 			return deny(RuleMalformedPath, reason, normalized, taskID)
 		}
+		if outside && tempWrite(g.Root, normalized) {
+			return allow("Write to a temporary directory allowed.", normalized, taskID)
+		}
 		if outside {
 			return deny(RuleOutsideRoot, "Path is outside the project root.", normalized, taskID)
 		}
@@ -750,6 +753,63 @@ func cleanInput(raw string) string {
 		}
 		raw = trimmed
 	}
+}
+
+// tempDirs are the machine's temporary directories. A variable so a test can
+// point it at directories of its own.
+var tempDirs = func() []string { return []string{os.TempDir(), "/tmp", "/private/tmp"} }
+
+// tempWrite reports whether a path NormalizeRepoPath placed outside root lies
+// inside one of tempDirs, each with its own symlinks resolved, while root does
+// not.
+//
+// Writes there are allowed although they leave the project (owner decision,
+// 2026-10-24). A host tells its agent to keep scratch files in exactly these
+// places — Claude Code names a per-session scratchpad under the temporary
+// directory — and refusing them made the harness contradict the host on every
+// session, while nothing the repository or the person's credentials hold lives
+// there. The path given is the one NormalizeRepoPath returned, which has
+// already followed every symlink that exists, dangling ones included, so a link
+// under /tmp that leads to ~/.ssh is judged where it leads and is still
+// outside.
+//
+// A root that itself lives in a temporary directory gets no such allowance:
+// there the temporary directory is the repository's own surroundings — its
+// parent, its siblings — which is what the outside-root rung protects, and a
+// `../x` from it would otherwise read as a scratch write.
+func tempWrite(root, resolved string) bool {
+	if resolved == "" || !filepath.IsAbs(filepath.FromSlash(resolved)) {
+		return false
+	}
+	rootResolved, ok := resolveExisting(root)
+	if !ok {
+		return false
+	}
+	path := filepath.Clean(filepath.FromSlash(resolved))
+	inside := false
+	for _, dir := range tempDirs() {
+		if dir == "" {
+			continue
+		}
+		base, ok := resolveExisting(dir)
+		if !ok {
+			continue
+		}
+		if within(base, rootResolved) || base == rootResolved {
+			return false
+		}
+		inside = inside || within(base, path)
+	}
+	return inside
+}
+
+// within reports whether path lies strictly below base.
+func within(base, path string) bool {
+	rel, err := filepath.Rel(base, path)
+	if err != nil || rel == "." || rel == ".." {
+		return false
+	}
+	return !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // NormalizeRepoPath resolves raw against root and reports containment.

@@ -155,10 +155,10 @@ func TestHeredocIsRefused(t *testing.T) {
 
 func TestQuotedGitSafetyBypassFlagsAreCaught(t *testing.T) {
 	tests := []string{
-		`git commit --no-'v'erify -m x`,
-		`git commit "--no-verify" -m x`,
-		`git commit --no\-verify -m x`,
-		`git commit --no-veri\fy -m x`,
+		`git commit --no-'g'pg-sign -m x`,
+		`git commit "--no-gpg-sign" -m x`,
+		`git commit --no\-gpg-sign -m x`,
+		`git commit --no-gpg-si\gn -m x`,
 	}
 	for _, cmd := range tests {
 		if d := GitSafety(cmd); d.Action != Deny {
@@ -214,8 +214,11 @@ func TestRedirectTargetsExtraction(t *testing.T) {
 		{"cmd 2> err.log", []string{"err.log"}, false, false},
 		{"cmd &> all.log", []string{"all.log"}, false, false},
 		{`cmd > 'my file.txt'`, []string{"my file.txt"}, false, false},
-		{"cmd > $HOME/x", nil, true, false},
-		{"cmd > ~/.ssh/keys", nil, true, false},
+		// The tilde and $HOME resolve, so the write is judged where it lands
+		// (expandBindings); an unbound variable is judged by its spelling.
+		{"cmd > $HOME/x", []string{"/home/agent/x"}, false, false},
+		{"cmd > ~/.ssh/keys", []string{"/home/agent/.ssh/keys"}, false, false},
+		{"cmd > $OUT", []string{"$OUT"}, false, false},
 		{"cmd < input.txt", nil, false, false}, // reads are not gated here
 		{"cmd << EOF", nil, false, false},      // heredoc introducer, not a path
 		{"cmd >", nil, false, true},            // dangling redirect
@@ -234,14 +237,15 @@ func TestRedirectTargetsExtraction(t *testing.T) {
 		{`echo '$(echo hi > .env)'`, nil, false, false},
 		// A comparison in an arithmetic expansion is not a redirection.
 		{"echo $((3 > 2))", nil, false, false},
-		// An expansion inside a substituted redirect is still unnameable.
-		{"echo $(echo hi > $HOME/x)", nil, true, false},
+		// An expansion inside a substituted redirect resolves as it does outside.
+		{"echo $(echo hi > $HOME/x)", []string{"/home/agent/x"}, false, false},
 		// A target the shell computes is a path this gate cannot name either.
 		{"cmd > `pick-a-file`", nil, true, false},
 		// An unbounded span is refused rather than scanned past.
 		{"echo $(echo hi > .env", nil, false, true},
 		{"echo `echo hi > .env", nil, false, true},
 	}
+	t.Setenv("HOME", "/home/agent")
 	for _, tc := range tests {
 		targets, opaque, err := RedirectTargets(tc.input)
 		if tc.wantErr {

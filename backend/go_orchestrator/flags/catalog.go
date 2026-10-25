@@ -155,7 +155,7 @@ const (
 // yolo takes the hard rules down with the soft ones. That is the whole of the
 // difference from dev, and it is a large difference: the credential-path,
 // restricted-path, malformed-path, and outside-root rungs stop firing, and so
-// do the git-safety rules that refuse a force push or a --no-verify commit.
+// do the git-safety rules that refuse a force push or an unsigned commit.
 // The repository boundary goes with them — the write tools consult this same
 // setting before resolving an escaping path, so under yolo the harness is not
 // containing the agent to the repository at all. The only thing still refused

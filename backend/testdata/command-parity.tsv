@@ -49,6 +49,12 @@
 #   MCP tool, not a shell command. `dev map`, `dev graph` and the path-prefixed
 #   `.venv/bin/dev map` spellings are live and unchanged. This only ever
 #   tightens.
+# DIVERGENCE from the deleted Python engine, frozen in this snapshot — 1 row:
+#   GIT for `git commit --no-verify -m 'x'`, now allow. Skipping the
+#   repository's own commit and push hooks is the person's call (owner
+#   decision, 2026-10-24); --no-gpg-sign stays refused. The ALLOW_TASK and
+#   ALLOW_NOTASK rows for the same command still deny, on the allowlist and
+#   no-lease rungs. This is the one divergence here that loosens.
 NORM		
 NORM	   	
 NORM	dev status	dev status
@@ -289,7 +295,7 @@ GIT	make build	allow
 GIT	cargo test	allow
 GIT	go test ./...	allow
 GIT	git commit -m 'x'	allow
-GIT	git commit --no-verify -m 'x'	deny
+GIT	git commit --no-verify -m 'x'	allow
 GIT	git commit --no-gpg-sign -m 'x'	deny
 GIT	git reset --hard main	deny
 GIT	git reset --hard origin/main	deny

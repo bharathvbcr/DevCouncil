@@ -24,6 +24,80 @@ var safeGitGlobalOptions = map[string]bool{
 	"--glob-pathspecs": true, "--noglob-pathspecs": true, "--icase-pathspecs": true,
 }
 
+// safeGitConfigKeys are the `-c` keys a read-only invocation may set: they
+// change how output is laid out, never which program runs, which file is read
+// or which tree is looked at. Matched case-insensitively, as git matches them.
+// An `-c` naming any other key is refused, so a key git grows later is refused
+// until someone decides it is safe — diff.external, core.sshCommand,
+// core.fsmonitor and alias.* all run programs.
+var safeGitConfigKeys = map[string]bool{
+	"core.quotepath": true, "core.abbrev": true, "core.precomposeunicode": true,
+	"log.decorate": true, "log.date": true, "log.abbrevcommit": true, "log.follow": true,
+	"log.mailmap": true, "log.showroot": true,
+	"diff.noprefix": true, "diff.mnemonicprefix": true, "diff.renames": true,
+	"diff.relative": true, "diff.algorithm": true, "diff.colormoved": true,
+	"diff.indentheuristic": true, "diff.context": true, "diff.interhunkcontext": true,
+	"diff.statgraphwidth": true, "diff.suppressblankempty": true,
+	"status.short": true, "status.branch": true, "status.showuntrackedfiles": true,
+	"status.renames": true, "i18n.logoutputencoding": true,
+	// Skipping the repository's own hooks is the person's call (owner
+	// decision, 2026-10-24), as --no-verify is; see gitSafetyVariant.
+	"core.hookspath": true,
+}
+
+// safeGitConfigPrefixes are the key families that only affect presentation.
+var safeGitConfigPrefixes = []string{"color.", "advice.", "column."}
+
+// safePagers are the pager values that page and nothing else. A pager is a
+// program, so `core.pager=x` runs x; these are the ones agents use to turn
+// paging off.
+var safePagers = map[string]bool{
+	"": true, "cat": true, "less": true, "more": true, "less -R": true,
+	"less -FR": true, "less -FRX": true, "true": true, "false": true,
+}
+
+// safeGitConfig reports whether one `-c key=value` is safe on a read-only
+// invocation. A key with no `=` is set to true, as git reads it.
+func safeGitConfig(setting string) bool {
+	if hasExpansion(setting) {
+		return false
+	}
+	key, value, _ := strings.Cut(setting, "=")
+	key = strings.ToLower(key)
+	if key == "core.pager" || strings.HasPrefix(key, "pager.") {
+		return safePagers[value]
+	}
+	if safeGitConfigKeys[key] {
+		return true
+	}
+	for _, prefix := range safeGitConfigPrefixes {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// safeGitEnvironment reports whether a GIT_* assignment ahead of a read-only
+// invocation only changes presentation or locking, or points git at an index
+// file inside the repository that is not a credential path.
+func safeGitEnvironment(name, value, root string) bool {
+	if hasExpansion(value) {
+		return false
+	}
+	switch name {
+	case "GIT_PAGER":
+		return safePagers[value]
+	case "GIT_INDEX_FILE":
+		return value != "" && classifyReadOperand(root, value) == ReadAllowed
+	case "GIT_OPTIONAL_LOCKS", "GIT_TERMINAL_PROMPT", "GIT_CONFIG_NOSYSTEM", "GIT_FLUSH",
+		"GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS",
+		"GIT_ICASE_PATHSPECS", "GIT_NO_REPLACE_OBJECTS":
+		return true
+	}
+	return false
+}
+
 // gitUnsafeLongOptions are the long options of diff, log and show that write a
 // file, read a file the repository does not hold, or run a program. A word
 // refuses when it is a prefix of one of these: git (and argparse) accept any
@@ -76,7 +150,11 @@ func readOnlyArgumentViolation(clause, root string) string {
 		// The directory options keep their own refusal, command.directory_change,
 		// which names them for what they do; they are stepped over here.
 		isDirectory := name == "-C" || name == "--git-dir" || name == "--work-tree"
-		if !isDirectory && (!safeGitGlobalOptions[name] || hasValue) {
+		safe := safeGitGlobalOptions[name] && !hasValue
+		if name == "-c" && !hasValue && i+1 < len(words) {
+			safe = safeGitConfig(words[i+1].text)
+		}
+		if !isDirectory && !safe {
 			if unsafeGlobal == "" {
 				unsafeGlobal = opt
 			}
@@ -94,7 +172,8 @@ func readOnlyArgumentViolation(clause, root string) string {
 			"other configuration, programs or trees and is not part of read-only orientation.", sub, unsafeGlobal)
 	}
 	for _, w := range words[:at] {
-		if name, _, ok := strings.Cut(w.text, "="); ok && strings.HasPrefix(name, "GIT_") && isAssignmentWord(w.text) {
+		if name, value, ok := strings.Cut(w.text, "="); ok && strings.HasPrefix(name, "GIT_") && isAssignmentWord(w.text) &&
+			!safeGitEnvironment(name, value, root) {
 			return fmt.Sprintf("`git %s` here runs with %s set, which redirects git to other "+
 				"programs, configuration or trees than the ones the gate judged.", sub, name)
 		}
@@ -145,6 +224,24 @@ func hasExpansion(word string) bool {
 	return strings.ContainsAny(word, "$`") || strings.HasPrefix(word, "~")
 }
 
+// carriesSubstitution reports whether a word holds text only running a command
+// can produce: a $( … ) or backtick span, or the placeholder the argument scan
+// leaves where one was.
+//
+// It is the narrower question the operand rungs ask. A parameter expansion the
+// line does not bind ($OUT, ${dir}) is no longer refused on sight (owner
+// decision, 2026-10-24): expandBindings has already rewritten every variable
+// the line or the well-known environment names, so what is left is a value
+// the gate cannot know, and refusing every such operand blocked the loops and
+// scratch variables agents write constantly. Such a word is judged by its
+// literal text instead — `$X/.env` still names a credential file — and the
+// cost, a parent environment pointing a variable somewhere the gate did not
+// see, is the one the owner accepted. A substitution stays refused: it runs a
+// command to choose the path, and that is not a value at all.
+func carriesSubstitution(word string) bool {
+	return strings.Contains(word, "$(") || strings.Contains(word, "`")
+}
+
 // readOnlyOperandViolation judges one non-option word of a read-only git
 // command. It is a revision, a pathspec or `rev:path`, and the gate cannot tell
 // which, so every reading of it is judged: the word itself, and each piece of
@@ -152,8 +249,8 @@ func hasExpansion(word string) bool {
 // that is also a plausible path (`origin/main`) is judged and passes, because a
 // path inside the root that is not secret is readable.
 func readOnlyOperandViolation(word, root string) string {
-	if hasExpansion(word) {
-		return "it carries an expansion only the shell can resolve, so the path it names cannot be judged."
+	if carriesSubstitution(word) {
+		return "it carries a command substitution, so the path it names cannot be judged."
 	}
 	pieces := []string{word}
 	for _, piece := range strings.Split(word, ":") {
