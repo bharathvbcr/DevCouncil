@@ -160,7 +160,7 @@ jobs:
 
     it("flags a planted crate that is tested by --workspace but outside every paths filter", () => {
       const planted = [...members, { dir: "planted", name: "planted" }];
-      const out = membersOutOfScope(planted, { "rust.yml": rust.replace(" --exclude dc-b", " --exclude dc-b") });
+      const out = membersOutOfScope(planted, { "rust.yml": rust });
       assert.deepEqual(out.map((m) => m.name).sort(), ["dc-b", "planted"]);
       assert.equal(out.find((m) => m.name === "planted").tested, true);
     });
