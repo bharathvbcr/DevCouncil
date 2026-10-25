@@ -489,6 +489,9 @@ pub(crate) fn report_manifest(cli: &Cli, outcome: &ManifestOutcome) -> anyhow::R
             devmap_query::guides::GuideDisposition::MalformedBlock(reason) => {
                 format!("left alone, NOT refreshed: malformed devmap block ({reason})")
             }
+            devmap_query::guides::GuideDisposition::Linked(sibling) => {
+                format!("a link to {sibling}, which is handled as itself")
+            }
             devmap_query::guides::GuideDisposition::Refused(reason) => {
                 format!("left alone, NOT refreshed: could not be read ({reason})")
             }

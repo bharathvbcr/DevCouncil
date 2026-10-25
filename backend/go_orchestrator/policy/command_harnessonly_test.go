@@ -56,6 +56,14 @@ func TestRecordingAReviewIsRefusedInEveryAgentShell(t *testing.T) {
 		"dcstore\treview-append --task T",
 		"rust/target/debug/dcstore review-append --task T",
 		"sh -c 'devcouncil review record --file r.json'",
+		// Round 2 on c8f63bc0.
+		"printf x | dcstore serve --db s.sqlite",
+		"dcstore serve --db s.sqlite < req.bin",
+		"sudo devcouncil review record --file r.json",
+		`bash -lc "devcouncil review record --file r.json"`,
+		"watch 'dev review record --file r.json'",
+		`sh -c "sh -c 'devcouncil review record'"`,
+		`env -S 'devcouncil review record --file r.json'`,
 	}
 	for name, gate := range gates {
 		for _, command := range refused {
@@ -85,6 +93,12 @@ func TestReadingReviewsAndLookalikesAreNotHarnessOnly(t *testing.T) {
 		"devcouncil review list --task 'TASK-1' --json",
 		"dcstore --db s.sqlite reviews --task T",
 		"devcouncil task show TASK-1",
+		// Text that mentions the command is not the command.
+		`git commit -m "docs: devcouncil review record is harness only"`,
+		`echo "run devcouncil review record later"`,
+		`grep -n "dcstore serve" docs/cli-reference.md`,
+		"pnpm dev --port $PORT",
+		"npm run dev -- --host $HOST",
 	} {
 		if reason := harnessOnlyViolation(command); reason != "" {
 			t.Errorf("%q refused as harness-only: %s", command, reason)

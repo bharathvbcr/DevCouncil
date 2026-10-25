@@ -18,6 +18,7 @@ func TestEveryGuideDispositionFoldsToWhatHappened(t *testing.T) {
 		"adopted":         {ModeApply: "wrote", ModeDryRun: "would_write"},
 		"unchanged":       {ModeApply: "unchanged", ModeDryRun: "unchanged"},
 		"not_ours":        {ModeApply: "not_ours", ModeDryRun: "not_ours"},
+		"linked":          {ModeApply: "linked", ModeDryRun: "linked"},
 		"malformed_block": {ModeApply: "needs_attention", ModeDryRun: "needs_attention"},
 		"refused":         {ModeApply: "needs_attention", ModeDryRun: "needs_attention"},
 		"from_the_future": {ModeApply: "unknown:from_the_future", ModeDryRun: "unknown:from_the_future"},
@@ -32,7 +33,7 @@ func TestEveryGuideDispositionFoldsToWhatHappened(t *testing.T) {
 				t.Errorf("%s in %v: %q, want %q", disposition, mode, got, state)
 			}
 			current := len(receipt.Drifted()) == 0
-			if wantCurrent := state == "unchanged" || state == "not_ours"; current != wantCurrent {
+			if wantCurrent := state == "unchanged" || state == "not_ours" || state == "linked"; current != wantCurrent {
 				t.Errorf("%s in %v: current=%v, want %v", disposition, mode, current, wantCurrent)
 			}
 		}

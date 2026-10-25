@@ -129,6 +129,10 @@ pub enum GuideDisposition {
     /// limit, no permission); a write would refuse it too. The reason is the
     /// error.
     Refused(String),
+    /// The file is a symlink to the named sibling guide in the same directory
+    /// (`CLAUDE.md -> AGENTS.md`). The sibling is handled as itself; nothing is
+    /// written through the link, and it needs nobody.
+    Linked(String),
 }
 
 impl GuideDisposition {
@@ -142,6 +146,7 @@ impl GuideDisposition {
             Self::Adopted => "adopted",
             Self::MalformedBlock(_) => "malformed_block",
             Self::Refused(_) => "refused",
+            Self::Linked(_) => "linked",
         }
     }
 
@@ -604,6 +609,39 @@ fn closes(line: &str, fence: &Fence) -> bool {
     cols <= 3 && len >= fence.len && rest[len * fence.marker.len_utf8()..].trim().is_empty()
 }
 
+/// The closing token of the raw HTML block a line opens, if it opens one that
+/// it does not also close: a comment (`<!--` without its `-->`), or a `pre`,
+/// `script`, `style` or `textarea` element (CommonMark's first two kinds of
+/// HTML block, which run to their closing token). Text inside one is not
+/// prose, so a marker quoted there is not a marker.
+fn html_block_opening(line: &str) -> Option<&'static str> {
+    let (cols, rest) = indentation(line);
+    if cols > 3 {
+        return None;
+    }
+    let lower = rest.to_ascii_lowercase();
+    if let Some(after) = lower.strip_prefix("<!--") {
+        return (!after.contains("-->")).then_some("-->");
+    }
+    for (tag, close) in [
+        ("<pre", "</pre>"),
+        ("<script", "</script>"),
+        ("<style", "</style>"),
+        ("<textarea", "</textarea>"),
+    ] {
+        if let Some(after) = lower.strip_prefix(tag) {
+            let boundary = after
+                .chars()
+                .next()
+                .is_none_or(|c| c == '>' || c.is_whitespace());
+            if boundary {
+                return (!after.contains(close)).then_some(close);
+            }
+        }
+    }
+    None
+}
+
 /// Whether a line, outside code, is exactly `marker`: at most three columns
 /// of indent (four is an indented code block) and nothing else but trailing
 /// whitespace.
@@ -631,6 +669,7 @@ fn ownership(existing: &str) -> Ownership<'_> {
     let mut ends = Vec::new();
     let mut whole_file_marked = false;
     let mut fence: Option<Fence> = None;
+    let mut html: Option<&'static str> = None;
     let mut offset = 0;
     for line in existing.split_inclusive('\n') {
         let start = offset;
@@ -642,8 +681,18 @@ fn ownership(existing: &str) -> Ownership<'_> {
             }
             continue;
         }
+        if let Some(close) = html {
+            if bare.to_ascii_lowercase().contains(close) {
+                html = None;
+            }
+            continue;
+        }
         if let Some(open) = fence_opening(bare) {
             fence = Some(open);
+            continue;
+        }
+        if let Some(close) = html_block_opening(bare) {
+            html = Some(close);
             continue;
         }
         if is_marker_line(bare, AGENT_GUIDE_BLOCK_BEGIN) {
@@ -659,7 +708,7 @@ fn ownership(existing: &str) -> Ownership<'_> {
     match (begins.as_slice(), ends.as_slice()) {
         ([], []) if whole_file_marked => Ownership::WholeFile,
         ([], []) => Ownership::HandWritten {
-            ends_in_code: fence.is_some(),
+            ends_in_code: fence.is_some() || html.is_some(),
         },
         ([begin], [(end_start, end, terminator)]) if begin < end_start => Ownership::Block {
             start: *begin,
@@ -751,7 +800,7 @@ fn decide_guide(
             // found by the next run, which would append another.
             HandWrittenGuides::Adopt if ends_in_code => Decision::leave(
                 GuideDisposition::MalformedBlock(
-                    "the file ends inside a code fence it never closes, so a block appended \
+                    "the file ends inside a code fence or HTML block it never closes, so a block appended \
                      there would be code; close the fence or add the devmap:begin/devmap:end \
                      lines yourself"
                         .to_string(),
@@ -792,6 +841,30 @@ struct Prepared {
     disposition: GuideDisposition,
     block: bool,
     step: Step,
+}
+
+/// The sibling guide `path` is a symlink to, when it is exactly that: a link
+/// in the same directory whose target is a bare name of another guide in
+/// [`GUIDE_FILENAMES`] that exists as a regular file there. `CLAUDE.md ->
+/// AGENTS.md` is the common case; the sibling is handled as itself, and the
+/// link is never written through. Any other symlink is not this, and the
+/// destination checks refuse it as before.
+fn linked_sibling(repo_root: &Path, path: &Path) -> Option<String> {
+    if !std::fs::symlink_metadata(path)
+        .ok()?
+        .file_type()
+        .is_symlink()
+    {
+        return None;
+    }
+    let target = std::fs::read_link(path).ok()?;
+    let name = target.to_str()?;
+    let own = path.file_name()?.to_str()?;
+    if name == own || !GUIDE_FILENAMES.contains(&name) {
+        return None;
+    }
+    let meta = std::fs::symlink_metadata(repo_root.join(name)).ok()?;
+    meta.file_type().is_file().then(|| name.to_string())
 }
 
 /// Inspect one destination. A plan pass that cannot read it — a symlink, a file
@@ -945,12 +1018,19 @@ pub fn agent_guides(
     // A readable guide that needs no write needs neither write access nor
     // ownership.
     for filename in GUIDE_FILENAMES {
-        prepared.push(prepare_destination(
-            repo_root.join(filename),
-            pass,
-            &whole,
-            |existing| decide_guide(existing, &whole, &body, hand_written),
-        )?);
+        let path = repo_root.join(filename);
+        if let Some(sibling) = linked_sibling(repo_root, &path) {
+            prepared.push(Prepared {
+                path,
+                disposition: GuideDisposition::Linked(sibling),
+                block: false,
+                step: Step::Leave,
+            });
+            continue;
+        }
+        prepared.push(prepare_destination(path, pass, &whole, |existing| {
+            decide_guide(existing, &whole, &body, hand_written)
+        })?);
     }
     prepared.push(prepare_destination(
         repo_root.join(CURSOR_RULE_REL),
@@ -1800,8 +1880,8 @@ mod tests {
     #[test]
     fn a_plan_reports_a_guide_it_cannot_read_and_a_write_refuses_it() {
         let dir = scratch("plan-refused");
-        std::fs::write(dir.join("AGENTS.md"), "# hand written\n").unwrap();
-        std::os::unix::fs::symlink("AGENTS.md", dir.join("CLAUDE.md")).unwrap();
+        std::fs::write(dir.join("notes.md"), "# hand written\n").unwrap();
+        std::os::unix::fs::symlink("notes.md", dir.join("CLAUDE.md")).unwrap();
         let plan = agent_guides(
             &dir,
             &computed_map(),
@@ -1854,5 +1934,118 @@ mod tests {
             HandWrittenGuides::Preserve,
             GuidePass::Write,
         )
+    }
+
+    // Round 2 on c8f63bc0.
+
+    /// `CLAUDE.md -> AGENTS.md` is one guide under two names. Both passes
+    /// handle the sibling as itself and leave the link alone; a check of such
+    /// a repository is not permanently failing.
+    #[cfg(unix)]
+    #[test]
+    fn a_guide_linked_to_its_sibling_is_handled_once_in_both_passes() {
+        for (label, sibling) in [
+            ("hand", "# hand written\n".to_string()),
+            ("ours", String::new()),
+        ] {
+            let dir = scratch(&format!("linked-{label}"));
+            if !sibling.is_empty() {
+                std::fs::write(dir.join("AGENTS.md"), &sibling).unwrap();
+            } else {
+                write_with(&dir, HandWrittenGuides::Preserve);
+                std::fs::remove_file(dir.join("CLAUDE.md")).unwrap();
+            }
+            std::os::unix::fs::symlink("AGENTS.md", dir.join("CLAUDE.md")).unwrap();
+            let agents_before = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+            for pass in [GuidePass::Plan, GuidePass::Write] {
+                let outcomes = agent_guides(
+                    &dir,
+                    &computed_map(),
+                    "m.json",
+                    "g.json",
+                    "s.sqlite",
+                    HandWrittenGuides::Preserve,
+                    pass,
+                )
+                .unwrap_or_else(|e| panic!("{label} {pass:?}: {e}"));
+                let claude = outcome_for(&outcomes, &dir.join("CLAUDE.md"));
+                assert_eq!(
+                    claude.disposition,
+                    GuideDisposition::Linked("AGENTS.md".into()),
+                    "{label} {pass:?}"
+                );
+                assert!(!claude.changed() && !claude.needs_attention());
+            }
+            assert!(std::fs::symlink_metadata(dir.join("CLAUDE.md"))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(
+                std::fs::read_to_string(dir.join("AGENTS.md")).unwrap(),
+                agents_before
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn markers_quoted_in_an_html_block_are_not_taken_over() {
+        let b = AGENT_GUIDE_BLOCK_BEGIN;
+        let e = AGENT_GUIDE_BLOCK_END;
+        for (label, text) in [
+            (
+                "pre",
+                format!("# Example\n\n<pre>\n{b}\nEXAMPLE\n{e}\n</pre>\n"),
+            ),
+            (
+                "PRE attrs",
+                format!("<PRE class=\"x\">\n{b}\n{e}\n</PRE>\n"),
+            ),
+            ("comment", format!("<!-- how to:\n{b}\n{e}\n-->\nNotes.\n")),
+            ("textarea", format!("<textarea>\n{b}\n{e}\n</textarea>\n")),
+        ] {
+            let dir = scratch("html");
+            let claude = dir.join("CLAUDE.md");
+            std::fs::write(&claude, &text).unwrap();
+            // Never rewritten. A comment is the one case that is not plainly
+            // NotOurs: the begin marker carries its own `-->`, which ends the
+            // comment there (as CommonMark reads it), so the end marker
+            // stands alone and the file is reported malformed — still left
+            // alone.
+            let disposition = disposition_of(&dir, HandWrittenGuides::Preserve);
+            assert!(
+                matches!(
+                    disposition,
+                    GuideDisposition::NotOurs | GuideDisposition::MalformedBlock(_)
+                ),
+                "{label}: {disposition:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&claude).unwrap(), text, "{label}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        // An element that closes on its own line is no block, and a marker
+        // after it is a marker.
+        let dir = scratch("html-inline");
+        let claude = dir.join("CLAUDE.md");
+        std::fs::write(&claude, format!("<pre>x</pre>\n{b}\nold\n{e}\n")).unwrap();
+        assert_eq!(
+            disposition_of(&dir, HandWrittenGuides::Preserve),
+            GuideDisposition::Updated
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adopting_after_an_unclosed_html_comment_is_refused() {
+        let dir = scratch("adopt-open-comment");
+        let claude = dir.join("CLAUDE.md");
+        let text = "# Notes\n<!-- unfinished\n";
+        std::fs::write(&claude, text).unwrap();
+        assert!(matches!(
+            disposition_of(&dir, HandWrittenGuides::Adopt),
+            GuideDisposition::MalformedBlock(_)
+        ));
+        assert_eq!(std::fs::read_to_string(&claude).unwrap(), text);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

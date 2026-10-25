@@ -85,10 +85,17 @@ func WorkingTreeSubject(ctx context.Context, root string) (string, error) {
 			return "", fmt.Errorf("reading HEAD into a scratch index: %w", err)
 		}
 	}
-	if _, err := runGitEnv(ctx, git, 1<<20, subjectBound, env, append([]string{"add", "--all"}, toolStateExcludes()...)...); err != nil {
+	// Staged with core.ignorecase off, so a case-only rename on a
+	// case-insensitive filesystem (z_test.go -> z_Test.go, which moves a file
+	// from test-only into the package) is a different tree, not the same one.
+	addEnv := append([]string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=core.ignorecase", "GIT_CONFIG_VALUE_0=false"}, env...)
+	if _, err := runGitEnv(ctx, git, 1<<20, subjectBound, addEnv, append([]string{"add", "--all"}, toolStateExcludes()...)...); err != nil {
 		return "", fmt.Errorf("staging the working tree into a scratch index: %w", err)
 	}
 	if err := checkGitlinks(ctx, git, env, headless); err != nil {
+		return "", err
+	}
+	if err := checkSymlinks(ctx, git, env, root); err != nil {
 		return "", err
 	}
 	if err := checkIgnoredRulesFiles(ctx, git); err != nil {
@@ -153,13 +160,99 @@ func checkGitlinks(ctx context.Context, git *proc.GitSession, env []string, head
 		return fmt.Errorf("%s is a nested repository or gitlink HEAD does not have, so its files are not in "+
 			"the tree and a change to them could not be seen", strings.Join(unknown, ", "))
 	}
-	dirty, err := git.DirtySubmodules(ctx)
-	if err != nil {
-		return fmt.Errorf("reading submodule state: %w", err)
+	// Each gitlink is asked directly, whether or not .gitmodules names it, and
+	// for untracked files too: the tree records a gitlink only as the commit
+	// it is checked out at, so anything else in it is invisible to the
+	// subject. (proc.DirtySubmodules is not enough: it trusts .gitmodules and
+	// reports only tracked changes.)
+	var dirty []string
+	for _, p := range links {
+		changed, err := gitlinkHasChanges(ctx, filepath.Join(git.Root(), filepath.FromSlash(p)))
+		if err != nil {
+			return fmt.Errorf("reading the state of %s: %w", p, err)
+		}
+		if changed {
+			dirty = append(dirty, p)
+		}
 	}
 	if len(dirty) > 0 {
-		return fmt.Errorf("submodule %s has changes of its own, which the tree records only as a commit "+
-			"and so cannot name", strings.Join(dirty, ", "))
+		return fmt.Errorf("submodule %s has changes of its own (tracked or untracked), which the tree "+
+			"records only as a commit and so cannot name", strings.Join(dirty, ", "))
+	}
+	return nil
+}
+
+// gitlinkHasChanges reports whether the repository checked out at dir has any
+// change of its own, untracked files included. A gitlink with nothing checked
+// out (an uninitialised submodule: an empty directory, or none) has no
+// content to hide.
+func gitlinkHasChanges(ctx context.Context, dir string) (bool, error) {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) || (err == nil && len(entries) == 0) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	sub, err := proc.NewGitSession(dir)
+	if err != nil {
+		return false, err
+	}
+	out, err := runGit(ctx, sub, gitListingLimit, "status", "--porcelain=v1", "-z",
+		"--untracked-files=all", "--ignore-submodules=none")
+	if err != nil {
+		return false, err
+	}
+	return len(out) > 0, nil
+}
+
+// checkSymlinks refuses a tree holding a symlink whose target's content the
+// tree does not hold: one that resolves outside the repository, into tool
+// state, or onto an ignored path. The tree records a symlink only as its
+// target text, so a change to that content would not move the subject.
+func checkSymlinks(ctx context.Context, git *proc.GitSession, env []string, root string) error {
+	staged, err := runGitEnv(ctx, git, gitListingLimit, subjectBound, env, "ls-files", "--stage", "-z")
+	if err != nil {
+		return fmt.Errorf("listing the scratch index: %w", err)
+	}
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return err
+	}
+	var inside []string
+	for _, entry := range strings.Split(string(staged), "\x00") {
+		meta, p, ok := strings.Cut(entry, "\t")
+		if !ok || !strings.HasPrefix(meta, "120000 ") {
+			continue
+		}
+		link := filepath.Join(root, filepath.FromSlash(p))
+		target, err := filepath.EvalSymlinks(link)
+		if errors.Is(err, os.ErrNotExist) {
+			continue // dangling: no content to hide
+		}
+		if err != nil {
+			return fmt.Errorf("%s: %w", p, err)
+		}
+		rel, err := filepath.Rel(realRoot, target)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("%s is a symlink to %s, outside the repository, whose content the tree cannot name", p, target)
+		}
+		rel = filepath.ToSlash(rel)
+		if ToolOwned(rel) {
+			return fmt.Errorf("%s is a symlink into tool state (%s), which the tree leaves out", p, rel)
+		}
+		inside = append(inside, rel)
+	}
+	if len(inside) == 0 {
+		return nil
+	}
+	res, err := git.Run(ctx, gitListingLimit, append([]string{"check-ignore", "--no-index", "--"}, inside...)...)
+	if err != nil && res.ExitCode != 1 {
+		return fmt.Errorf("checking symlink targets: %w", err)
+	}
+	if ignored := strings.Fields(string(res.Stdout)); len(ignored) > 0 {
+		return fmt.Errorf("a tracked symlink points at %s, which is ignored, so its content is not in the tree",
+			strings.Join(ignored, ", "))
 	}
 	return nil
 }
@@ -179,7 +272,7 @@ func gitlinkPaths(listing []byte, split func(string) (mode, p string, ok bool)) 
 // the tree, and nothing in the tree records that it did.
 func checkIgnoredRulesFiles(ctx context.Context, git *proc.GitSession) error {
 	ignored, err := runGit(ctx, git, gitListingLimit, "ls-files", "--others", "--ignored", "--exclude-standard",
-		"-z", "--", ":(glob)**/.gitignore")
+		"-z", "--", ":(glob,icase)**/.gitignore")
 	if err != nil {
 		return fmt.Errorf("listing ignored rules files: %w", err)
 	}
@@ -225,13 +318,18 @@ func checkIgnoredRulesFiles(ctx context.Context, git *proc.GitSession) error {
 	return nil
 }
 
-// excludeRulesDigest is a digest of the effective rules in the repository's
-// own exclude files outside the tree (.git/info/exclude, and core.excludesFile
-// when the repository's local config sets it), or "" when they hold none.
-// Comments and blank lines are not rules. A user-level excludes file is left
-// out: it lies outside the repository, where an agent's writes are refused,
-// and folding the machine's own file in would give one tree a different
-// subject on every machine.
+// excludeRulesDigest is a digest of the effective rules in every exclude file
+// outside the tree — .git/info/exclude, and the excludes file git actually
+// uses: core.excludesFile from any scope (includes followed), or the XDG
+// default when it is unset — or "" when they hold none. Comments and blank
+// lines are not rules.
+//
+// The user-level file is included although it lies outside the repository:
+// an agent whose allowlist admits `git *` can point core.excludesFile
+// anywhere with `git config --global`, and rules outside the tree decide what
+// the tree leaves out. The cost is that the same tree can have a different
+// subject on two machines with different excludes; a review is recorded and
+// verified on the machine that runs both.
 func excludeRulesDigest(ctx context.Context, git *proc.GitSession, root string) (string, error) {
 	var sources []string
 	if out, err := runGit(ctx, git, 1<<12, "rev-parse", "--git-path", "info/exclude"); err == nil {
@@ -243,10 +341,19 @@ func excludeRulesDigest(ctx context.Context, git *proc.GitSession, root string) 
 	} else {
 		return "", fmt.Errorf("locating info/exclude: %w", err)
 	}
-	if out, err := runGit(ctx, git, 1<<12, "config", "--local", "--path", "core.excludesFile"); err == nil {
-		if p := strings.TrimSpace(string(out)); p != "" {
+	// Exit 1 is "unset", an answer; anything else is a failure to read.
+	res, err := git.Run(ctx, 1<<12, "config", "--includes", "--path", "core.excludesFile")
+	switch {
+	case err == nil:
+		if p := strings.TrimSpace(string(res.Stdout)); p != "" {
 			sources = append(sources, p)
 		}
+	case res.ExitCode == 1:
+		if p := defaultExcludesFile(); p != "" {
+			sources = append(sources, p)
+		}
+	default:
+		return "", fmt.Errorf("reading core.excludesFile: %w", err)
 	}
 	h := sha256.New()
 	rules := 0
@@ -273,6 +380,18 @@ func excludeRulesDigest(ctx context.Context, git *proc.GitSession, root string) 
 		return "", nil
 	}
 	return hex.EncodeToString(h.Sum(nil))[:16], nil
+}
+
+// defaultExcludesFile is the excludes file git reads when core.excludesFile is
+// unset: $XDG_CONFIG_HOME/git/ignore, or ~/.config/git/ignore.
+func defaultExcludesFile() string {
+	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+		return filepath.Join(xdg, "git", "ignore")
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".config", "git", "ignore")
+	}
+	return ""
 }
 
 func readSmall(p string, limit int64) ([]byte, error) {

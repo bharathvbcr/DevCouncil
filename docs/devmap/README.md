@@ -897,14 +897,17 @@ DevMap section: put the two block lines where the section should go, or run
 `devmap manifest . --guides --adopt-guides` once. Later runs refresh the block
 without the flag. Marker lines — the whole-file marker too — count only where
 CommonMark would not read them as code: not inside a fence (closed only by the
-same character, at least as many of them), not indented four columns or more.
+same character, at least as many of them), not indented four columns or more,
+not inside an HTML comment or a `pre`/`script`/`style`/`textarea` block.
 So a guide that quotes the markers as an example is never taken over, and
 `--adopt-guides` refuses a file that ends inside a fence it never closes rather
 than appending a block that would be code. The JSON report carries
 `disposition`, `block`, `changed`, `needs_attention` and, for `malformed_block`
 or `refused`, `reason`. `refused` is what a plan (`integrate --check` /
 `--dry-run`) reports for a guide it cannot read — a symlink, a file over the read
-limit — where a write would fail. `devmap integrate <host>` plans and writes
+limit — where a write would fail. A guide that is a symlink to its sibling guide
+(`CLAUDE.md -> AGENTS.md`) is `linked`: the sibling is handled as itself and
+nothing is written through the link. `devmap integrate <host>` plans and writes
 through the same code and takes the same `--adopt-guides` flag.
 
 The guide states which fields this map actually *computed*. An agent told to use

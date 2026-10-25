@@ -69,19 +69,20 @@ type Receipt struct {
 	Backups     map[string]string `json:"backups,omitempty"`      // original relative path -> recoverable backup
 	Host        string            `json:"host"`
 	Mode        string            `json:"mode"`
-	Files       map[string]string `json:"files"` // path -> wrote|unchanged|would_write|drift|not_ours|needs_attention|unknown:<disposition>
+	Files       map[string]string `json:"files"` // path -> wrote|unchanged|would_write|drift|not_ours|linked|needs_attention|unknown:<disposition>
 	Spawned     []string          `json:"spawned,omitempty"`
 	Notes       []string          `json:"notes,omitempty"`
 }
 
 // Drifted lists, sorted, the files a check found missing or different. A file
-// is current only when it is "unchanged" (or not ours to manage): any other
+// is current only when it is "unchanged" (or not ours to manage, or a link to a
+// sibling guide that is handled as that guide): any other
 // word is a state that --apply would change, and a state this command does not
 // recognise must not read as current.
 func (r *Receipt) Drifted() []string {
 	var files []string
 	for path, state := range r.Files {
-		if state != "unchanged" && state != "not_ours" {
+		if state != "unchanged" && state != "not_ours" && state != "linked" {
 			files = append(files, path)
 		}
 	}
@@ -249,6 +250,10 @@ func foldReport(receipt *Receipt, root string, mode Mode, report *devmap.Integra
 			receipt.Files[rel(guide.Path)] = "not_ours"
 		case "unchanged":
 			receipt.Files[rel(guide.Path)] = "unchanged"
+		case "linked":
+			// A link to its sibling guide (CLAUDE.md -> AGENTS.md), handled
+			// as that sibling: current whenever the sibling is.
+			receipt.Files[rel(guide.Path)] = "linked"
 		case "created", "updated", "adopted":
 			receipt.Files[rel(guide.Path)] = action(true)
 		case "malformed_block", "refused":

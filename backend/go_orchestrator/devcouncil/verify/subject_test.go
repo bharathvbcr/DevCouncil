@@ -21,6 +21,7 @@ type subjectRepo struct {
 
 func newSubjectRepo(t *testing.T) *subjectRepo {
 	t.Helper()
+	isolateGitConfig(t)
 	r := &subjectRepo{t: t, root: t.TempDir(), git: testsupport.Tool(t, "git")}
 	r.run("init", "-q", r.root)
 	r.write(".gitignore", "build/\n")
@@ -307,6 +308,138 @@ func TestStagedToolStateDoesNotMoveTheSubject(t *testing.T) {
 	if s := r.subject(); s != before {
 		t.Errorf("staging tool state moved the subject %s -> %s", before, s)
 	}
+}
+
+// isolateGitConfig gives git (this test's and the subject's) an empty user
+// and system config, so a machine's own excludes file cannot decide what a
+// test expects.
+func isolateGitConfig(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	global := filepath.Join(home, ".gitconfig")
+	if err := os.WriteFile(global, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	return home
+}
+
+// Round 2 on c8f63bc0: each of these changed content verify would judge and
+// left the subject where it was.
+
+func TestAnUppercaseRulesFileCannotHideSource(t *testing.T) {
+	r := newSubjectRepo(t)
+	before := r.subject()
+	r.write("pkg/evil.go", "package pkg\nfunc init() { panic(1) }\n")
+	r.write("pkg/.GITIGNORE", ".GITIGNORE\nevil.go\n")
+	r.mustNotCollide(before, "a new file hidden by an uppercase .GITIGNORE")
+}
+
+func TestUntrackedFilesInASubmoduleAreSeen(t *testing.T) {
+	for _, withModulesFile := range []bool{true, false} {
+		r := newSubjectRepo(t)
+		inner := &subjectRepo{t: t, root: filepath.Join(r.root, "sub"), git: r.git}
+		inner.write("x.go", "package sub\n")
+		inner.run("init", "-q", inner.root)
+		inner.run("add", ".")
+		inner.run("commit", "-qm", "inner")
+		if withModulesFile {
+			r.write(".gitmodules", "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n")
+		}
+		r.run("add", ".")
+		r.run("commit", "-qm", "with a gitlink")
+		before := r.subject()
+		r.write("sub/evil.go", "package sub\nfunc init() { panic(1) }\n")
+		r.mustNotCollide(before, "an untracked file in a submodule")
+		if err := os.Remove(filepath.Join(r.root, "sub/evil.go")); err != nil {
+			t.Fatal(err)
+		}
+		r.write("sub/x.go", "package sub\n// changed\n")
+		r.mustNotCollide(before, "a tracked change in a submodule")
+	}
+}
+
+func TestASymlinkWhoseTargetTheTreeLacksIsRefused(t *testing.T) {
+	r := newSubjectRepo(t)
+	r.write("build/impl.go.txt", "package a\n")
+	if err := os.Symlink("build/impl.go.txt", filepath.Join(r.root, "impl.go")); err != nil {
+		t.Fatal(err)
+	}
+	if s, err := r.subjectOrErr(); err == nil {
+		t.Fatalf("a symlink into an ignored directory was named %s", s)
+	}
+	r2 := newSubjectRepo(t)
+	if err := os.Symlink(t.TempDir(), filepath.Join(r2.root, "out")); err != nil {
+		t.Fatal(err)
+	}
+	if s, err := r2.subjectOrErr(); err == nil {
+		t.Fatalf("a symlink out of the repository was named %s", s)
+	}
+	// A symlink to tracked content, or a dangling one, is fine: the tree
+	// holds the target, or there is none.
+	r3 := newSubjectRepo(t)
+	for name, target := range map[string]string{"alias.go": "a.go", "dangling": "nowhere"} {
+		if err := os.Symlink(target, filepath.Join(r3.root, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := r3.subjectOrErr(); err != nil {
+		t.Errorf("a symlink to tracked content was refused: %v", err)
+	}
+}
+
+func TestExcludesFromAnyScopeArePartOfTheSubject(t *testing.T) {
+	t.Run("through include.path", func(t *testing.T) {
+		r := newSubjectRepo(t)
+		before := r.subject()
+		r.write("rules", "evil.go\n")
+		r.write("inc.cfg", "[core]\n\texcludesFile = "+filepath.Join(r.root, "rules")+"\n")
+		r.run("config", "include.path", filepath.Join(r.root, "inc.cfg"))
+		r.write("evil.go", "package a\nfunc init() { panic(1) }\n")
+		r.mustNotCollide(before, "a file hidden by an excludesFile set through include.path")
+	})
+	t.Run("global", func(t *testing.T) {
+		r := newSubjectRepo(t)
+		before := r.subject()
+		rules := filepath.Join(t.TempDir(), "rules")
+		if err := os.WriteFile(rules, []byte("evil.go\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		r.run("config", "--global", "core.excludesFile", rules)
+		r.write("evil.go", "package a\nfunc init() { panic(1) }\n")
+		r.mustNotCollide(before, "a file hidden by a global excludesFile")
+	})
+	t.Run("xdg default", func(t *testing.T) {
+		r := newSubjectRepo(t)
+		before := r.subject()
+		r.write("evil.go", "package a\nfunc init() { panic(1) }\n")
+		xdg := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "git")
+		if err := os.MkdirAll(xdg, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(xdg, "ignore"), []byte("evil.go\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		r.mustNotCollide(before, "a file hidden by the XDG default excludes file")
+	})
+}
+
+func TestACaseOnlyRenameMovesTheSubject(t *testing.T) {
+	r := newSubjectRepo(t)
+	r.write("z_test.go", "package a\n")
+	r.run("add", ".")
+	r.run("commit", "-qm", "test file")
+	before := r.subject()
+	if err := os.Rename(filepath.Join(r.root, "z_test.go"), filepath.Join(r.root, "tmpname")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(r.root, "tmpname"), filepath.Join(r.root, "z_Test.go")); err != nil {
+		t.Fatal(err)
+	}
+	r.mustNotCollide(before, "a case-only rename")
 }
 
 func TestASparseCheckoutIsRefused(t *testing.T) {
