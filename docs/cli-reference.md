@@ -253,6 +253,7 @@ devmap neighbors <TARGETS…> [--depth N]
 devmap affected <TARGETS…>
 devmap dead [--json]
 devmap clones [--kind exact|structural]
+devmap doc-drift [PATH…] [--exclude PREFIX]… [--budget N]   # Markdown references to code that is gone or moved
 devmap preview --file <FILE> [--content <PATH|->]
 
 # Git + Code Graph Bidirectional Analysis
