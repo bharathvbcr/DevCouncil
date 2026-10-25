@@ -68,10 +68,16 @@
 //!   reported: a stale qualifier cannot be told from a spelling the extractor
 //!   does not share. For a link, a symbol defined in the target file under
 //!   another owner is the same skip.
-//! * **`external_qualifier`**: a qualified name whose first segment is no
-//!   symbol, directory or file stem of this repository (`serde_json::Value`,
-//!   `tokio::spawn`, `React.Component`) names somebody else's code. Bare
-//!   well-known external names cannot be told apart and stay checked.
+//! * **`external_qualifier`** is a positive fact: the qualifier's first segment
+//!   is a dependency the repository's manifests declare (`Cargo.toml` tables
+//!   incl. renamed `package =`, `go.mod` requires, `package.json`
+//!   dependencies, read from indexed files only, at most 256) or a language
+//!   standard root listed in the code. `oldmod::run_task`, where nothing
+//!   declares or defines `oldmod`, is a vanished module and `missing_symbol`.
+//! * **Backslash targets** are `backslash_path`, never resolved. A symlink's
+//!   target is judged where it lands: inside the repo at nothing is
+//!   `missing_file`, outside or a loop is `outside_repo`. A directive counts
+//!   only on a prose line (not fenced, not indented code, not in a comment).
 //! * **Spans and links differ on a missing top-level directory.** A link is
 //!   resolved against its document, so a missing target is certainly broken:
 //!   `[main](oldpkg/main.go)` is `missing_file`. A span's root is ambiguous, so
@@ -174,12 +180,98 @@ const DOC_EXTENSIONS: [&str; 12] = [
     "md", "mdx", "toml", "json", "yaml", "yml", "sh", "sql", "proto", "html", "css", "txt",
 ];
 
-/// Qualifiers that name somebody else's code.
-const EXTERNAL_QUALIFIERS: [&str; 41] = [
-    "std", "core", "alloc", "fmt", "os", "io", "fs", "sys", "strings", "strconv", "errors", "time",
-    "context", "http", "json", "sync", "sort", "bytes", "regexp", "filepath", "log", "flag",
-    "self", "Self", "this", "crate", "super", "console", "process", "window", "document", "Math",
-    "JSON", "Object", "Array", "Vec", "Option", "Result", "clippy", "rustc", "rustfmt",
+/// Qualifier roots that are no code of this repository by the language's own
+/// definition, listed here so "external" is a fact and not a guess. Everything
+/// else is external only when a manifest declares it (see
+/// [`declared_dependencies`]); a name nothing declares and nothing defines is
+/// `missing_symbol`.
+///
+/// * Rust: the standard roots and the tool namespaces that qualify lints.
+/// * Go: the standard library's top-level packages (a bounded list, not every
+///   package).
+/// * JS and TS: the language's global objects; Node built-ins are written with
+///   a `node:` prefix, which is not an identifier and never reaches here.
+/// * Relative roots (`self`, `Self`, `this`, `crate`, `super`) name the current
+///   scope, which a document cannot pin down.
+const STANDARD_ROOTS: &[&str] = &[
+    // Rust
+    "std",
+    "core",
+    "alloc",
+    "proc_macro",
+    "test",
+    "Vec",
+    "Option",
+    "Result",
+    "clippy",
+    "rustc",
+    "rustfmt",
+    // Go standard library, top level
+    "fmt",
+    "os",
+    "io",
+    "fs",
+    "sys",
+    "bufio",
+    "bytes",
+    "strings",
+    "strconv",
+    "errors",
+    "time",
+    "context",
+    "sync",
+    "sort",
+    "math",
+    "regexp",
+    "path",
+    "filepath",
+    "net",
+    "http",
+    "json",
+    "log",
+    "flag",
+    "reflect",
+    "runtime",
+    "testing",
+    "unicode",
+    "unsafe",
+    "embed",
+    "slog",
+    "maps",
+    "slices",
+    "cmp",
+    "crypto",
+    "hash",
+    "binary",
+    "base64",
+    "hex",
+    "csv",
+    "xml",
+    "html",
+    "template",
+    "url",
+    "exec",
+    "signal",
+    "syscall",
+    "atomic",
+    "rand",
+    "utf8",
+    "ioutil",
+    // JS and TS globals
+    "console",
+    "process",
+    "window",
+    "document",
+    "Math",
+    "JSON",
+    "Object",
+    "Array",
+    // Relative roots
+    "self",
+    "Self",
+    "this",
+    "crate",
+    "super",
 ];
 
 /// Product and language names that are PascalCase without being symbols.
@@ -414,7 +506,9 @@ fn prose_lines(text: &str, cancel: Option<&Cancel>) -> Result<(Vec<Line>, bool),
             cancel.check_every(index)?;
         }
         let no = u32::try_from(index + 1).unwrap_or(u32::MAX);
-        if fence.is_none() {
+        // A directive counts only on a prose line: not fenced, not inside an
+        // open HTML comment, not indented as code.
+        if fence.is_none() && !in_comment && leading_indent(raw) < 4 {
             match suppression(raw) {
                 Some(Suppression::NextLine) => ignore_line = Some(no.saturating_add(1)),
                 Some(Suppression::File) => ignore_file = true,
@@ -537,6 +631,7 @@ fn heading_text(heading: &str) -> String {
     // (index into `out`, can open, can close)
     let mut underscores: Vec<(usize, bool, bool)> = Vec::new();
     let mut unclosed: u64 = 0;
+    let mut budget = src.len() * 32 + 4096;
     let mut i = 0;
     while i < src.len() {
         let ch = src[i];
@@ -589,7 +684,12 @@ fn heading_text(heading: &str) -> String {
                 let mut depth = 0u32;
                 let mut j = i + 1;
                 let mut end = None;
-                while j < src.len() {
+                // Bounded by the lookahead window and by what is left of the
+                // heading's allowance: a line of `](` would otherwise rescan to
+                // its end from every one.
+                let window = src.len().min(i + 1 + LINK_LOOKAHEAD);
+                while j < window && budget > 0 {
+                    budget -= 1;
                     if src[j] == '\\' {
                         j += 2;
                         continue;
@@ -615,7 +715,14 @@ fn heading_text(heading: &str) -> String {
             }
             '<' => {
                 // An inline HTML tag contributes nothing.
-                match src[i..].iter().take(256).position(|c| *c == '>') {
+                let reach = (src.len() - i).min(256);
+                let found = if budget >= reach {
+                    budget -= reach;
+                    src[i..].iter().take(256).position(|c| *c == '>')
+                } else {
+                    None
+                };
+                match found {
                     Some(offset)
                         if src
                             .get(i + 1)
@@ -835,7 +942,10 @@ pub fn heading_anchors(text: &str, cancel: Option<&Cancel>) -> Result<Anchors, Q
     let (lines, _) = prose_lines(text, cancel)?;
     let mut paragraph: Option<String> = None;
     let mut previous: Option<(u32, bool)> = None;
-    for line in &lines {
+    for (index, line) in lines.iter().enumerate() {
+        if let Some(cancel) = cancel {
+            cancel.check_every(index)?;
+        }
         let long = line.text.len() > MAX_LINE_BYTES;
         let peeled = peel_block_prefixes(&line.text);
         if long {
@@ -999,6 +1109,14 @@ fn classify_span(content: &str) -> Classified {
         return Classified::Ignore;
     }
     let (base, lines) = split_line_suffix(span);
+    // `docs\out\hosts.md`: a path written with backslashes is never resolved
+    // (see `check_link`). Only a path-shaped span counts; a regex escape is not.
+    if base.contains('\\')
+        && (base.contains('/') || has_known_extension(base.rsplit('\\').next().unwrap_or(base)))
+        && !base.contains(['*', '?', '<', '>', '{', '}', '$', '|'])
+    {
+        return Classified::Skip("backslash_path");
+    }
     if base.contains('/') {
         return classify_path(base, lines);
     }
@@ -1070,7 +1188,7 @@ fn classify_symbol(span: &str) -> Classified {
         .iter()
         .map(|s| (*s).to_string())
         .collect();
-    if segments.len() > 1 && EXTERNAL_QUALIFIERS.contains(&segments[0]) {
+    if segments.len() > 1 && STANDARD_ROOTS.contains(&segments[0]) {
         return Classified::Skip("external_qualifier");
     }
     if KNOWN_TERMS.contains(&body) {
@@ -1508,6 +1626,11 @@ pub struct DocDriftReport {
     /// How many documents those exclusions left out.
     #[serde(default)]
     pub docs_excluded_by_default: u32,
+    /// Said plainly when documents were left out: an empty `findings` covers
+    /// only the scanned documents. Not a `walk_incomplete` reason, because the
+    /// exclusion is a request default, not a failure to look.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_note: Option<String>,
     /// Candidates found: checked, skipped and those that held.
     pub references: u32,
     /// Checks made, by kind: `link`, `path`, `line`, `anchor`, `symbol`.
@@ -1640,10 +1763,10 @@ struct Resolver<'a> {
     /// Targets whose heading scan skipped a line that may have been a heading.
     unscanned_anchor_targets: u32,
     limits: Limits,
-    /// Names a document could qualify a symbol with: every symbol name and every
-    /// directory and file stem, normalised. A qualifier outside it names
-    /// somebody else's code.
-    known_qualifiers: HashSet<String>,
+    /// Dependencies the repository's own manifests declare, normalised. A
+    /// qualifier in it names somebody else's code: that is a fact the
+    /// manifests state. Nothing else is external.
+    declared: HashSet<String>,
     /// Symbols the index does not define, awaiting the word search.
     pending: Vec<PendingSymbol>,
 }
@@ -1718,7 +1841,12 @@ impl<'a> Resolver<'a> {
                         }
                         Err(_) => return PathState::Missing,
                     },
-                    // Out of the tree, dangling, or a loop: not followed.
+                    // Dangling: judged by where it points, so a link into the
+                    // repository at nothing is missing, not unreadable.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return self.dangling(&current);
+                    }
+                    // Out of the tree, or a loop: not followed.
                     _ => return PathState::Outside,
                 }
             } else {
@@ -1738,12 +1866,49 @@ impl<'a> Resolver<'a> {
         PathState::Dir
     }
 
-    /// Whether `rel` is a secret path as written or once its links are
-    /// resolved: `docs/alias -> ../.env` is `.env`.
-    fn is_secret(&self, rel: &str) -> bool {
-        if devmap_extract::secret::is_secret_path(rel) {
-            return true;
+    /// A symlink whose target does not exist. Missing when it points inside the
+    /// repository, outside otherwise: the nearest ancestor of the (lexically
+    /// normalised) target that does exist decides, because that is the part of
+    /// the host the link would have us look at.
+    fn dangling(&self, link: &Path) -> PathState {
+        use std::path::Component;
+        let Ok(target) = std::fs::read_link(link) else {
+            return PathState::Outside;
+        };
+        let joined = if target.is_absolute() {
+            target
+        } else {
+            link.parent().unwrap_or(self.root).join(target)
+        };
+        let mut normal = std::path::PathBuf::new();
+        for component in joined.components() {
+            match component {
+                Component::ParentDir => {
+                    normal.pop();
+                }
+                Component::CurDir => {}
+                other => normal.push(other.as_os_str()),
+            }
         }
+        let mut ancestor = normal.as_path();
+        loop {
+            if let Ok(real) = ancestor.canonicalize() {
+                return if real.starts_with(self.root) && normal.starts_with(self.root) {
+                    PathState::Missing
+                } else {
+                    PathState::Outside
+                };
+            }
+            match ancestor.parent() {
+                Some(parent) => ancestor = parent,
+                None => return PathState::Outside,
+            }
+        }
+    }
+
+    /// `rel` with its links resolved, relative to the root. `None` when it does
+    /// not exist or resolves outside the repository.
+    fn real_rel(&self, rel: &str) -> Option<String> {
         std::fs::canonicalize(self.root.join(rel))
             .ok()
             .and_then(|real| {
@@ -1751,7 +1916,24 @@ impl<'a> Resolver<'a> {
                     .ok()
                     .map(|inside| inside.to_string_lossy().replace('\\', "/"))
             })
-            .is_some_and(|real| devmap_extract::secret::is_secret_path(&real))
+    }
+
+    /// Whether `rel` is a secret path as written or once its links are
+    /// resolved: `docs/alias -> ../.env` is `.env`.
+    fn is_secret(&self, rel: &str) -> bool {
+        devmap_extract::secret::is_secret_path(rel)
+            || self
+                .real_rel(rel)
+                .is_some_and(|real| devmap_extract::secret::is_secret_path(&real))
+    }
+
+    /// Whether `rel` is Markdown by its own name or by where its links land: a
+    /// link named `c1` to `GUIDE.md` has `GUIDE.md`'s headings.
+    fn is_markdown_target(&self, rel: &str) -> bool {
+        is_markdown_path(rel)
+            || self
+                .real_rel(rel)
+                .is_some_and(|real| is_markdown_path(&real))
     }
 
     /// Line count and heading slugs of `rel`. `None` when the file cannot be
@@ -1771,7 +1953,7 @@ impl<'a> Resolver<'a> {
             None => None,
             Some(text) => Some(std::rc::Rc::new(TargetFacts {
                 lines: text.lines().count(),
-                anchors: if is_markdown_path(rel) {
+                anchors: if self.is_markdown_target(rel) {
                     Some(heading_anchors(&text, Some(self.cancel))?)
                 } else {
                     None
@@ -1854,11 +2036,12 @@ impl<'a> Resolver<'a> {
         name: &str,
         written: &str,
     ) {
-        // `serde_json::Value`, `tokio::spawn`: a qualifier that is no type,
-        // module, crate, package or directory of this repository names
-        // somebody else's code, whose absence from the index is no drift.
+        // `serde_json::Value`, `tokio::spawn`: a qualifier the repository's
+        // manifests declare as a dependency names somebody else's code, whose
+        // absence from the index is no drift. A qualifier nothing declares and
+        // nothing defines (`oldmod::run_task`) is a deleted or renamed module.
         if let Some(first) = qualifier.first() {
-            if !self.known_qualifiers.contains(&normalise_segment(first)) {
+            if self.declared.contains(&normalise_segment(first)) {
                 self.skip("external_qualifier");
                 return;
             }
@@ -1981,6 +2164,13 @@ impl<'a> Resolver<'a> {
             self.skip("same_document_anchor");
             return Ok(());
         }
+        // A backslash separates components on Windows but not here, so the
+        // per-component link checks would not be the ones the OS applies.
+        // Never resolved, on any platform.
+        if path_part.contains('\\') {
+            self.skip("backslash_path");
+            return Ok(());
+        }
         let Some(rel) = resolve_relative(doc, &path_part) else {
             self.skip("outside_repo");
             return Ok(());
@@ -2100,6 +2290,59 @@ impl<'a> Resolver<'a> {
         Ok(())
     }
 
+    /// Read the indexed `Cargo.toml`, `go.mod` and `package.json` files, at most
+    /// [`MAX_MANIFESTS`], and collect what they declare. Secret paths are not
+    /// read. Returns a `walk_incomplete` reason when a manifest could not be
+    /// read or the bound cut the list: a dependency it declares would then be
+    /// reported as a missing module.
+    fn load_declared(&mut self, files: &[(String, String)]) -> anyhow::Result<Option<String>> {
+        let mut read = 0usize;
+        let mut unreadable = 0u32;
+        let mut cut = false;
+        for (path, _) in files {
+            let name = path.rsplit('/').next().unwrap_or(path);
+            let parse: fn(&str) -> Vec<String> = match name {
+                "Cargo.toml" => cargo_dependencies,
+                "go.mod" => go_module_names,
+                "package.json" => package_json_dependencies,
+                _ => continue,
+            };
+            if self.is_secret(path) {
+                continue;
+            }
+            if read >= MAX_MANIFESTS {
+                cut = true;
+                break;
+            }
+            self.cancel.check()?;
+            read += 1;
+            match devmap_extract::safe_fs::read_repo_source(
+                Some(self.root),
+                path,
+                devmap_extract::MAX_SOURCE_BYTES,
+            ) {
+                Ok(text) => {
+                    for dependency in parse(&text) {
+                        self.declared.insert(normalise_segment(&dependency));
+                    }
+                }
+                Err(_) => unreadable += 1,
+            }
+        }
+        let mut reasons = Vec::new();
+        if cut {
+            reasons.push(format!(
+                "manifest bound of {MAX_MANIFESTS} cut the list; dependencies in the rest are not recognised as external"
+            ));
+        }
+        if unreadable > 0 {
+            reasons.push(format!(
+                "{unreadable} manifest(s) could not be read; a dependency one declares may be reported as a missing module"
+            ));
+        }
+        Ok((!reasons.is_empty()).then(|| reasons.join("; ")))
+    }
+
     /// Whether `name` appears as a word anywhere in `rel`. `None` when the file
     /// cannot be read.
     fn file_mentions(&self, rel: &str, name: &str) -> anyhow::Result<Option<bool>> {
@@ -2134,7 +2377,7 @@ impl<'a> Resolver<'a> {
             return Ok(());
         }
         let wanted = parse_line_anchor(anchor);
-        let markdown = is_markdown_path(rel);
+        let markdown = self.is_markdown_target(rel);
         if wanted.is_none() && !markdown {
             self.skip("non_markdown_anchor");
             return Ok(());
@@ -2363,6 +2606,164 @@ fn path_suffixes(paths: impl Iterator<Item = impl AsRef<str>>) -> HashSet<String
     suffixes
 }
 
+/// Manifests read per call.
+const MAX_MANIFESTS: usize = 256;
+
+/// The text of a quoted TOML string that starts `text` (after whitespace).
+fn quoted(text: &str) -> Option<&str> {
+    let text = text.trim_start();
+    let quote = text.chars().next().filter(|c| matches!(c, '"' | '\''))?;
+    let inner = &text[1..];
+    inner.find(quote).map(|end| &inner[..end])
+}
+
+/// A TOML key, unquoted.
+fn toml_key(key: &str) -> &str {
+    key.trim().trim_matches(['"', '\''])
+}
+
+/// Dependency names a `Cargo.toml` declares: the keys of `[dependencies]`,
+/// `[dev-dependencies]`, `[build-dependencies]`, `[workspace.dependencies]` and
+/// their `[target.….dependencies]` forms, the `[dependencies.name]` sub-table
+/// form, and the real crate behind a renamed dependency (`package = "…"`).
+/// Line-based, which is exact for the shapes Cargo itself writes.
+pub fn cargo_dependencies(text: &str) -> Vec<String> {
+    enum Section {
+        None,
+        Table,
+        Named,
+    }
+    const KINDS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+    let mut names = Vec::new();
+    let mut section = Section::None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[') {
+            let header = header.trim_start_matches('[');
+            let header = header.split(']').next().unwrap_or("").trim();
+            section = Section::None;
+            if header == "workspace.dependencies"
+                || KINDS
+                    .iter()
+                    .any(|kind| header == *kind || header.ends_with(&format!(".{kind}")))
+            {
+                section = Section::Table;
+                continue;
+            }
+            for kind in KINDS {
+                let named = header
+                    .strip_prefix(&format!("{kind}."))
+                    .or_else(|| {
+                        header
+                            .find(&format!(".{kind}."))
+                            .map(|at| &header[at + kind.len() + 2..])
+                    })
+                    .or_else(|| header.strip_prefix("workspace.dependencies."));
+                if let Some(name) = named {
+                    names.push(toml_key(name).to_string());
+                    section = Section::Named;
+                    break;
+                }
+            }
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match section {
+            Section::Table => {
+                names.push(toml_key(key).to_string());
+                if let Some(at) = value.find("package") {
+                    let after = value[at + "package".len()..].trim_start();
+                    if let Some(real) = after.strip_prefix('=').and_then(quoted) {
+                        names.push(real.to_string());
+                    }
+                }
+            }
+            Section::Named if toml_key(key) == "package" => {
+                if let Some(real) = quoted(value) {
+                    names.push(real.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    names.retain(|name| !name.is_empty());
+    names
+}
+
+/// The names a `go.mod` makes importable: each required module path's last
+/// element, without a `/vN` major-version tail or a `.vN` suffix, and the
+/// element before a `/vN`.
+pub fn go_module_names(text: &str) -> Vec<String> {
+    let mut paths: Vec<&str> = Vec::new();
+    let mut in_block = false;
+    for line in text.lines() {
+        let line = line.split("//").next().unwrap_or("").trim();
+        if in_block {
+            if line.starts_with(')') {
+                in_block = false;
+            } else if let Some(path) = line.split_whitespace().next() {
+                paths.push(path);
+            }
+        } else if let Some(rest) = line.strip_prefix("require") {
+            let rest = rest.trim();
+            if rest.starts_with('(') {
+                in_block = true;
+            } else if let Some(path) = rest.split_whitespace().next() {
+                paths.push(path);
+            }
+        }
+    }
+    let is_major = |part: &str| {
+        part.len() > 1 && part.starts_with('v') && part[1..].chars().all(|c| c.is_ascii_digit())
+    };
+    let mut names = Vec::new();
+    for path in paths {
+        let mut parts: Vec<&str> = path.split('/').collect();
+        while parts.len() > 1 && parts.last().is_some_and(|last| is_major(last)) {
+            parts.pop();
+        }
+        if let Some(last) = parts.last() {
+            names.push((*last).to_string());
+            if let Some((stem, version)) = last.rsplit_once('.') {
+                if is_major(version) {
+                    names.push(stem.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
+/// The package names a `package.json` declares, scoped names as written and by
+/// their bare part.
+pub fn package_json_dependencies(text: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for field in [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ] {
+        if let Some(map) = value.get(field).and_then(|v| v.as_object()) {
+            for name in map.keys() {
+                names.push(name.clone());
+                if let Some((_, bare)) = name.strip_prefix('@').and_then(|s| s.split_once('/')) {
+                    names.push(bare.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
 fn push_reason(reasons: &mut Vec<String>, reason: String) {
     reasons.push(reason);
 }
@@ -2419,6 +2820,7 @@ pub fn doc_drift_report_with(
         Vec::new()
     };
     let unavailable = |reason: &str| DocDriftReport {
+        scope_note: None,
         default_excludes: Vec::new(),
         docs_excluded_by_default: 0,
         available: false,
@@ -2517,16 +2919,6 @@ pub fn doc_drift_report_with(
             .or_default()
             .push(symbol);
     }
-    let mut known_qualifiers: HashSet<String> =
-        by_name.keys().map(|name| normalise_segment(name)).collect();
-    for (path, _) in &files {
-        for part in path.split('/') {
-            known_qualifiers.insert(normalise_segment(part));
-            if let Some((stem, _)) = part.rsplit_once('.') {
-                known_qualifiers.insert(normalise_segment(stem));
-            }
-        }
-    }
     let mut resolver = Resolver {
         root: &root,
         cancel,
@@ -2545,9 +2937,12 @@ pub fn doc_drift_report_with(
         unreadable_targets: 0,
         unscanned_anchor_targets: 0,
         limits: options.limits,
-        known_qualifiers,
+        declared: HashSet::new(),
         pending: Vec::new(),
     };
+    if let Some(reason) = resolver.load_declared(&files)? {
+        push_reason(&mut reasons, reason);
+    }
 
     let mut docs_scanned = 0u32;
     let mut references = 0u32;
@@ -2680,7 +3075,16 @@ pub fn doc_drift_report_with(
     }
     let shown = u32::try_from(shown_findings.len()).unwrap_or(u32::MAX);
     let hidden = total.saturating_sub(shown);
+    let scope_note = (excluded_by_default > 0).then(|| {
+        format!(
+            "findings, and an empty list, cover only the {docs_scanned} scanned document(s); \
+             {excluded_by_default} under {} were left out by default (name a path inside it, or \
+             turn the default off, to scan them)",
+            defaults.join(", ")
+        )
+    });
     Ok(DocDriftReport {
+        scope_note,
         default_excludes: if excluded_by_default > 0 {
             defaults.iter().map(|p| (*p).to_string()).collect()
         } else {

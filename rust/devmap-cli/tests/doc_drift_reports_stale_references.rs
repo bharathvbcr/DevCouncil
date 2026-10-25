@@ -373,3 +373,44 @@ fn a_secret_document_is_withheld_and_not_scanned() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn the_archive_default_is_stated_beside_an_empty_list() {
+    let root = scratch("archive");
+    std::fs::create_dir_all(root.join("docs/archive")).unwrap();
+    std::fs::write(root.join("docs/live.md"), "Nothing stale here.\n").unwrap();
+    std::fs::write(root.join("docs/archive/old.md"), "[gone](gone.md)\n").unwrap();
+    git_init(&root);
+    let root = root.canonicalize().unwrap();
+    ok(&root, &["build"]);
+
+    let report = json(&root, &["doc-drift"]);
+    assert_eq!(findings(&report), Vec::new(), "{report}");
+    assert_eq!(report["docs_scanned"], 1);
+    assert_eq!(report["docs_excluded_by_default"], 1, "{report}");
+    assert_eq!(
+        report["default_excludes"],
+        serde_json::json!(["docs/archive"])
+    );
+    assert!(
+        report["scope_note"]
+            .as_str()
+            .is_some_and(|n| n.contains("cover only the 1 scanned") && n.contains("docs/archive")),
+        "{report}"
+    );
+    // An exclusion is not an incomplete walk.
+    assert!(report.get("walk_incomplete").is_none(), "{report}");
+
+    let text = ok(&root, &["doc-drift"]);
+    assert!(
+        text.contains("note: findings, and an empty list, cover only the 1 scanned document(s)"),
+        "{text}"
+    );
+
+    // Lifting the default scans it, and the note goes.
+    let lifted = json(&root, &["doc-drift", "--no-default-excludes"]);
+    assert_eq!(lifted["docs_scanned"], 2, "{lifted}");
+    assert_eq!(findings(&lifted).len(), 1);
+    assert!(lifted.get("scope_note").is_none(), "{lifted}");
+    let _ = std::fs::remove_dir_all(&root);
+}

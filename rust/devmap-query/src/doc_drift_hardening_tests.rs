@@ -498,35 +498,6 @@ fn a_symbol_is_moved_only_when_it_is_confidently_gone_from_the_file() {
 
 #[cfg(feature = "parse")]
 #[test]
-fn a_qualifier_that_is_nothing_in_this_repository_is_external() {
-    let f = fixture(
-        "external",
-        &[
-            ("src/store.rs", "pub struct Store;\nimpl Store {\n    pub fn build() {}\n}\n"),
-            (
-                "docs/guide.md",
-                "`serde_json::Value` `tokio::spawn()` `anyhow::Result` `clap::Parser` `errgroup.Group` `React.Component` `Store::build` `Store::missingMethod()`\n",
-            ),
-        ],
-    );
-    let report = run(&f);
-    assert_eq!(skipped(&report, "external_qualifier"), 6, "{report:?}");
-    // `Store::build` holds; `Store::missingMethod()` has a repo qualifier and
-    // no such method anywhere, which is the one finding.
-    assert_eq!(
-        found(&report),
-        vec![(
-            "docs/guide.md".into(),
-            1,
-            "missing_symbol",
-            "Store::missingMethod()".into()
-        )],
-        "{report:?}"
-    );
-}
-
-#[cfg(feature = "parse")]
-#[test]
 fn a_link_reports_a_missing_directory_and_a_span_does_not() {
     // Links resolve against the document, so a missing target is certainly
     // broken. A span's root is ambiguous, so a span whose first directory is
@@ -710,4 +681,310 @@ fn a_cancelled_report_returns_the_cancellation() {
     )
     .unwrap_err();
     assert!(error.downcast_ref::<QueryCancelled>().is_some(), "{error}");
+}
+
+// Round two ---------------------------------------------------------------------
+
+#[test]
+fn a_directive_counts_only_on_a_prose_line() {
+    let a_link = "[a](a.md)\n";
+    for (label, text) in [
+        (
+            "indented code",
+            format!("text\n\n    <!-- devmap:doc-drift ignore-file -->\n\n{a_link}"),
+        ),
+        (
+            "indented with a tab",
+            format!("text\n\n\t<!-- devmap:doc-drift ignore-file -->\n\n{a_link}"),
+        ),
+        (
+            "inside an open comment",
+            format!("<!--\n<!-- devmap:doc-drift ignore-file -->\n-->\n{a_link}"),
+        ),
+        (
+            "a next-line directive in code",
+            "text\n\n    <!-- devmap:doc-drift ignore-next-line -->\n[a](a.md)\n".to_string(),
+        ),
+    ] {
+        let extraction = extract_references(&text);
+        assert_eq!(extraction.references.len(), 1, "{label}: {extraction:?}");
+        assert!(
+            !extraction.skipped.contains_key("ignored_by_comment"),
+            "{label}"
+        );
+    }
+    // Three columns is still prose.
+    let prose = format!("   <!-- devmap:doc-drift ignore-file -->\n{a_link}");
+    assert!(extract_references(&prose).references.is_empty());
+}
+
+#[test]
+fn manifests_name_their_dependencies() {
+    let cargo = "[package]\nname = \"x\"\n\n[workspace.dependencies]\nserde_json = \"1\"\n\n[dependencies]\ntokio = { version = \"1\" }\nmy-lib = { package = \"real_name\", version = \"1\" }\n# commented = \"1\"\n\n[dev-dependencies.anyhow]\nversion = \"1\"\n\n[dependencies.renamed]\npackage = \"origin\"\n\n[target.'cfg(unix)'.dependencies]\nlibc = \"0.2\"\n\n[features]\nnot_a_dependency = []\n";
+    let mut found = cargo_dependencies(cargo);
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            "anyhow",
+            "libc",
+            "my-lib",
+            "origin",
+            "real_name",
+            "renamed",
+            "serde_json",
+            "tokio"
+        ]
+    );
+
+    let go = "module x\n\ngo 1.22\n\nrequire (\n\tgolang.org/x/sync v0.1.0 // indirect\n\tgithub.com/stretchr/testify/v2 v2.0.0\n\tgopkg.in/yaml.v3 v3.0.1\n)\n\nrequire github.com/google/go-cmp v0.6.0\n";
+    let mut found = go_module_names(go);
+    found.sort();
+    assert_eq!(found, vec!["go-cmp", "sync", "testify", "yaml", "yaml.v3"]);
+
+    let npm = r#"{"name":"x","dependencies":{"react":"18"},"devDependencies":{"@scope/widgets":"1"},"peerDependencies":{"left-pad":"1"},"scripts":{"build":"x"}}"#;
+    let mut found = package_json_dependencies(npm);
+    found.sort();
+    assert_eq!(
+        found,
+        vec!["@scope/widgets", "left-pad", "react", "widgets"]
+    );
+    assert!(package_json_dependencies("not json").is_empty());
+}
+
+#[cfg(feature = "parse")]
+#[test]
+fn external_means_declared_and_a_vanished_module_is_reported() {
+    let f = fixture(
+        "declared",
+        &[
+            (
+                "Cargo.toml",
+                "[workspace.dependencies]\nserde_json = \"1\"\n[dependencies]\ntokio = \"1\"\nmy-lib = { package = \"real_name\" }\n[dev-dependencies.anyhow]\nversion = \"1\"\n[target.'cfg(unix)'.dependencies]\nlibc = \"0.2\"\n",
+            ),
+            (
+                "web/package.json",
+                "{\"dependencies\":{\"react\":\"18\"},\"devDependencies\":{\"@scope/widgets\":\"1\"}}",
+            ),
+            (
+                "go.mod",
+                "module x\nrequire (\n\tgolang.org/x/sync v0.1.0\n)\n",
+            ),
+            ("src/store.rs", "pub struct Store;\nimpl Store {\n    pub fn build() {}\n}\n"),
+            (
+                "docs/guide.md",
+                "`serde_json::Value` `tokio::spawn()` `anyhow::Result` `my_lib::Thing()` `real_name::Other()` `libc::getpid()` `React.Component` `Widgets.Button` `Sync.Mutex` `std::fmt::Debug`\n\
+                 `oldmod::run_task()` `oldmod::RunTask` `undeclared_crate::Thing` `Store::missingMethod()` `Store::build`\n",
+            ),
+        ],
+    );
+    let report = run(&f);
+    // Ten qualifiers are external by a positive fact: nine a manifest declares
+    // (a renamed dependency by either name) and `std`.
+    assert_eq!(skipped(&report, "external_qualifier"), 10, "{report:?}");
+    // A module nothing declares and nothing defines is a vanished module, not
+    // somebody else's code.
+    assert_eq!(
+        found(&report),
+        vec![
+            (
+                "docs/guide.md".into(),
+                2,
+                "missing_symbol",
+                "oldmod::run_task()".into()
+            ),
+            (
+                "docs/guide.md".into(),
+                2,
+                "missing_symbol",
+                "oldmod::RunTask".into()
+            ),
+            (
+                "docs/guide.md".into(),
+                2,
+                "missing_symbol",
+                "undeclared_crate::Thing".into()
+            ),
+            (
+                "docs/guide.md".into(),
+                2,
+                "missing_symbol",
+                "Store::missingMethod()".into()
+            ),
+        ],
+        "{report:?}"
+    );
+}
+
+#[cfg(all(feature = "parse", unix))]
+#[test]
+fn a_dangling_link_is_judged_by_where_it_points() {
+    let outside =
+        std::env::temp_dir().join(format!("devmap-doc-drift-dangle-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&outside);
+    std::fs::create_dir_all(&outside).unwrap();
+    let f = fixture(
+        "dangle",
+        &[(
+            "docs/guide.md",
+            "[a](dangle) [b](dangle-out) [c](loop-a) [d](dangle-deep/x.md)\n",
+        )],
+    );
+    let link = |target: &std::path::Path, name: &str| {
+        std::os::unix::fs::symlink(target, f.root.join("docs").join(name)).unwrap();
+    };
+    link(std::path::Path::new("../nowhere.md"), "dangle");
+    link(&outside.join("nope.md"), "dangle-out");
+    link(std::path::Path::new("loop-b"), "loop-a");
+    link(std::path::Path::new("loop-a"), "loop-b");
+    link(std::path::Path::new("../gone-dir/deep"), "dangle-deep");
+    let report = run(&f);
+    let _ = std::fs::remove_dir_all(&outside);
+    // Inside the repository and absent: missing. Outside, or a loop: not
+    // judged.
+    assert_eq!(
+        found(&report),
+        vec![
+            ("docs/guide.md".into(), 1, "missing_file", "dangle".into()),
+            (
+                "docs/guide.md".into(),
+                1,
+                "missing_file",
+                "dangle-deep/x.md".into()
+            ),
+        ],
+        "{report:?}"
+    );
+    assert_eq!(skipped(&report, "outside_repo"), 2, "{report:?}");
+}
+
+#[cfg(all(feature = "parse", unix))]
+#[test]
+fn an_anchor_through_a_symlinked_markdown_file_is_checked() {
+    let f = fixture(
+        "md-link",
+        &[
+            ("docs/guide.md", "[x](c1#nope) [y](c1#real) [z](c2#nope)\n"),
+            ("GUIDE.md", "# Real\n"),
+            ("notes.txt", "plain\n"),
+        ],
+    );
+    std::os::unix::fs::symlink(f.root.join("GUIDE.md"), f.root.join("docs/c1")).unwrap();
+    std::os::unix::fs::symlink(f.root.join("notes.txt"), f.root.join("docs/c2")).unwrap();
+    let report = run(&f);
+    assert_eq!(
+        found(&report),
+        vec![(
+            "docs/guide.md".into(),
+            1,
+            "missing_anchor",
+            "c1#nope".into()
+        )],
+        "{report:?}"
+    );
+    assert_eq!(skipped(&report, "non_markdown_anchor"), 1, "{report:?}");
+}
+
+#[test]
+fn backslash_spans_are_a_named_skip() {
+    let extraction = extract_references("`docs\\out\\hosts.md` `docs\\out/x.rs` `\\d+\\.rs`\n");
+    assert!(extraction.references.is_empty(), "{extraction:?}");
+    // The regex-looking span has no path shape and no extension... it does end
+    // in `.rs`, so it is a skipped path-shaped span too; what matters is that
+    // none is resolved.
+    assert!(
+        extraction
+            .skipped
+            .get("backslash_path")
+            .copied()
+            .unwrap_or(0)
+            >= 2
+    );
+}
+
+#[cfg(feature = "parse")]
+#[test]
+fn a_backslash_link_is_never_resolved() {
+    let f = fixture(
+        "backslash",
+        &[(
+            "docs/guide.md",
+            "[a](docs\\out\\x.md) [b](..%5Cx.md) `docs\\out\\y.md`\n",
+        )],
+    );
+    let report = run(&f);
+    assert_eq!(found(&report), Vec::new(), "{report:?}");
+    assert_eq!(skipped(&report, "backslash_path"), 3, "{report:?}");
+    assert_eq!(report.checked["link"], 0, "{report:?}");
+}
+
+#[cfg(feature = "parse")]
+#[test]
+fn the_report_says_an_empty_list_covers_only_the_scanned_documents() {
+    let f = fixture(
+        "scope",
+        &[
+            ("docs/new.md", "fine\n"),
+            ("docs/archive/old.md", "[gone](gone.md)\n"),
+        ],
+    );
+    let report = run(&f);
+    assert!(report.findings.is_empty());
+    assert!(
+        report.walk_incomplete.is_none(),
+        "an exclusion is not an incomplete walk"
+    );
+    let note = report.scope_note.as_deref().unwrap_or("");
+    assert!(
+        note.contains("cover only the 1 scanned") && note.contains("1 under docs/archive"),
+        "{note}"
+    );
+    // Nothing excluded, nothing to say.
+    let all = run_with(&f, &[], &[], false, Limits::default());
+    assert!(all.scope_note.is_none());
+}
+
+fn heading_flood(unit: &str, bytes: usize) -> String {
+    let line = format!("# {}\n", unit.repeat((MAX_LINE_BYTES - 8) / unit.len()));
+    line.repeat(bytes / line.len() + 1)
+}
+
+#[test]
+fn a_heading_of_link_openers_is_linear() {
+    for unit in ["](", "][", "<a ", "`a``", "_a"] {
+        let doc = heading_flood(unit, HOSTILE_BYTES);
+        let started = Instant::now();
+        let _ = heading_anchors(&doc, None).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{unit:?}: {} bytes took {:?}",
+            doc.len(),
+            started.elapsed()
+        );
+    }
+}
+
+#[test]
+fn the_heading_loop_stops_when_cancelled() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    // 2000 lines: four checks while the lines are collected, and the heading
+    // loop's own checks after them. The flag is raised on the fifth, which only
+    // the heading loop reaches.
+    let doc = "# Heading\n".repeat(2000);
+    let cancel = Cancel::new();
+    let handle = cancel.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let cancel = cancel.with_check_probe(move || {
+        if counter.fetch_add(1, Ordering::SeqCst) + 1 == 5 {
+            handle.cancel();
+        }
+    });
+    assert!(heading_anchors(&doc, Some(&cancel)).is_err());
+    assert!(
+        calls.load(Ordering::SeqCst) <= 6,
+        "{}",
+        calls.load(Ordering::SeqCst)
+    );
 }

@@ -531,11 +531,22 @@ What the report cannot see, each surfaced as a `skipped` count rather than hidde
 - `qualifier_unmatched` hides references to a renamed owner: `OldType::method` is not reported
   while `method` exists under another type.
 - `external_qualifier`: `serde_json::Value`, `tokio::spawn`, `React.Component` — a qualifier
-  that is nothing in this repository names someone else's code.
+  the repository's own manifests declare (`Cargo.toml` dependency tables including renamed
+  `package =`, `go.mod` requires, `package.json` dependencies, read only from indexed files) or
+  a language standard root listed in the code. A qualifier nothing declares and nothing defines
+  (`oldmod::run_task`) is a vanished module and is reported as `missing_symbol`.
+- A target path written with backslashes is `backslash_path`: never resolved, on any platform.
+- A link that is a symlink is judged by where it lands: into the repository at nothing is
+  `missing_file`; out of the repository, or a loop, is `outside_repo`.
+- A directive counts only on a prose line: not fenced, not indented code, not inside an HTML
+  comment.
 - Links and spans differ on a missing top-level directory: `[x](oldpkg/main.go)` is
   `missing_file`, `` `oldpkg/main.go` `` is `unrooted_path`, because a span's root is ambiguous.
-- `docs/archive/` is excluded by default (`default_excludes` and `docs_excluded_by_default` in
-  the report). Name a path inside it, or pass `--no-default-excludes` / `default_excludes: false`.
+- `docs/archive/` is excluded by default (`default_excludes`, `docs_excluded_by_default` and a
+  plain `scope_note` in the report, and a `note:` line in the text output): an empty findings
+  list then covers only the scanned documents, with the excluded count beside it. It is not a
+  `walk_incomplete` reason. Name a path inside it, or pass `--no-default-excludes` /
+  `default_excludes: false`.
 - A document opts out deliberately with a whole-line comment outside a fence:
   `<!-- devmap:doc-drift ignore-next-line -->` or `<!-- devmap:doc-drift ignore-file -->`; what
   it hid is `skipped.ignored_by_comment`.

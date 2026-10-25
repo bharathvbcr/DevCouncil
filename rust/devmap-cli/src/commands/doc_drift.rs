@@ -70,12 +70,8 @@ fn emit_doc_drift(report: &DocDriftReport) {
                 .join(", ")
         }
     };
-    if !report.default_excludes.is_empty() {
-        outln!(
-            "note: {} document(s) under {} were left out by default; name a path inside it or pass --no-default-excludes to scan them",
-            report.docs_excluded_by_default,
-            report.default_excludes.join(", ")
-        );
+    if let Some(note) = &report.scope_note {
+        outln!("note: {note}");
     }
     outln!(
         "doc-drift: {} of {} docs scanned, {} references; checked: {}; skipped: {}",
