@@ -13,6 +13,7 @@ pub mod cancel;
 pub mod code_graph;
 pub mod cypher;
 pub mod digest;
+pub mod doc_drift;
 pub mod engine;
 pub mod escape;
 pub mod evidence;
@@ -63,6 +64,7 @@ pub use engine::{
     StoreQueryEngine, BYTES_PER_TOKEN, EVIDENCE_TEST_BUDGET_SHARE, EVIDENCE_TEST_DEPTH,
     MAX_NEIGHBOR_TARGETS, MAX_TOKEN_BUDGET, MAX_TRAVERSAL_DEPTH, PREVIEW_CALLER_MIN_CONFIDENCE,
 };
+pub use doc_drift::{DocDriftFinding, DocDriftReport, DriftKind};
 pub use escape::{html_escape, render_symbol_label};
 pub use evidence::{EvidenceFile, EvidencePack, EvidenceRole, EvidenceUnit};
 pub use linguist::{palette, swatch, Swatch, LINGUIST_VERSION, NEUTRAL_COLOR};

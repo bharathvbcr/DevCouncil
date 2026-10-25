@@ -2672,6 +2672,22 @@ impl<'a> StoreQueryEngine<'a> {
         })
     }
 
+    /// Markdown references that name code which no longer exists or has
+    /// moved. `paths` and `exclude` are repo-relative prefixes; no `paths`
+    /// means every indexed Markdown file. See [`crate::doc_drift`] for what is
+    /// checked and what is deliberately skipped. `walk_incomplete` is set
+    /// whenever anything was not checked for a reason other than those skips,
+    /// and `available` is false (never an empty clean list) when no generation
+    /// is persisted.
+    pub fn doc_drift(
+        &self,
+        paths: &[String],
+        exclude: &[String],
+        token_budget: u32,
+    ) -> anyhow::Result<crate::doc_drift::DocDriftReport> {
+        crate::doc_drift::doc_drift_report(self.store, &self.cancel, paths, exclude, token_budget)
+    }
+
     /// The symbol rows a ranking runs over: the whole latest generation, or
     /// the part of it `scope` admits, with the scope checked against the files
     /// that same generation indexed.
