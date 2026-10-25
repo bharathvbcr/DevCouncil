@@ -520,7 +520,32 @@ index defines no symbol of that name (enum variants, fields, config keys) are co
 `shown`/`hidden`/`total`/`truncated`. `available: false` means no generation exists and nothing was
 checked; an empty `findings` list is clean only when `walk_incomplete` is absent. The exit status
 is 0 with findings: it is a report. Documents the index never read (over the size limit,
-ignored) are not scanned, and secret paths are never opened.
+ignored) are not scanned, and secret paths are never opened (judged after symlinks are
+resolved; a link that leaves the repository is `outside_repo` and never stat'd past).
+
+What the report cannot see, each surfaced as a `skipped` count rather than hidden:
+
+- A name that survives in a comment or a string suppresses `missing_symbol`
+  (`defined_outside_symbol_index`): a deleted function still mentioned in a comment goes
+  unreported.
+- `qualifier_unmatched` hides references to a renamed owner: `OldType::method` is not reported
+  while `method` exists under another type.
+- `external_qualifier`: `serde_json::Value`, `tokio::spawn`, `React.Component` — a qualifier
+  that is nothing in this repository names someone else's code.
+- Links and spans differ on a missing top-level directory: `[x](oldpkg/main.go)` is
+  `missing_file`, `` `oldpkg/main.go` `` is `unrooted_path`, because a span's root is ambiguous.
+- `docs/archive/` is excluded by default (`default_excludes` and `docs_excluded_by_default` in
+  the report). Name a path inside it, or pass `--no-default-excludes` / `default_excludes: false`.
+- A document opts out deliberately with a whole-line comment outside a fence:
+  `<!-- devmap:doc-drift ignore-next-line -->` or `<!-- devmap:doc-drift ignore-file -->`; what
+  it hid is `skipped.ignored_by_comment`.
+
+Heading anchors follow github-slugger (emphasis, entities, inline code and links reduced to text;
+a taken `-N` suffix is skipped; `id`/`name` attributes count; headings in blockquotes and list
+items count). A target with a line too long to scan makes a missing anchor
+`anchor_target_unscanned`, not a finding. Extraction is linear and cancellable; the unindexed-name
+word search reads at most 64 MiB and says when it was cut; the finding cap keeps the first 10 000
+by document and line.
 
 ```mermaid
 flowchart TD
