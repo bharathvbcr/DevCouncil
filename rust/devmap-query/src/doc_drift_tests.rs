@@ -227,6 +227,39 @@ fn symbol_shapes_are_checked_and_ambiguous_names_are_skipped() {
     assert_eq!(extraction.skipped.get("known_term"), Some(&1));
 }
 
+/// Found by running the report over this repository: git config keys, Kotlin
+/// properties, namespaces and lint names were all reported as missing symbols.
+#[test]
+fn dotted_config_keys_namespaces_and_lint_names_are_not_symbols() {
+    let text = "`receive.denyCurrentBranch` `Habit.statusLabel` `Microsoft.Extensions.DependencyInjection` `clippy::useless_concat` `extensions.worktreeConfig`\n";
+    let extraction = extract_references(text);
+    assert!(extraction.references.is_empty(), "{extraction:?}");
+    assert_eq!(extraction.skipped.get("ambiguous_identifier"), Some(&4));
+    assert_eq!(extraction.skipped.get("external_qualifier"), Some(&1));
+}
+
+#[test]
+fn generated_paths_are_recognised() {
+    for generated in [
+        "tmp/x.sh",
+        "target/debug/devmap",
+        "node_modules/a/b.js",
+        ".devcouncil/repo_map.json",
+        ".cursor/mcp.json",
+        "benchmarks/run/verify.log",
+    ] {
+        assert!(is_generated_path(generated), "{generated}");
+    }
+    for kept in [
+        "docs/a.md",
+        ".github/workflows/ci.yml",
+        "../x.md",
+        "rust/target-notes.md",
+    ] {
+        assert!(!is_generated_path(kept), "{kept}");
+    }
+}
+
 #[test]
 fn extraction_counts_candidates_as_references_plus_skips() {
     let extraction = extract_references("`VerifyTask` `word` [a](a.md) [b](https://x.dev)\n");

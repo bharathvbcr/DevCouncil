@@ -90,6 +90,8 @@ pub const MAX_FINDINGS: usize = 10_000;
 const LINK_LOOKAHEAD: usize = 512;
 /// Target facts kept between references.
 const TARGET_CACHE_CAP: usize = 512;
+/// Source bytes the word search for unindexed names reads at most.
+const MAX_WORD_SEARCH_BYTES: u64 = 512 * 1024 * 1024;
 /// Locations named on a moved-symbol finding.
 const MAX_LOCATIONS: usize = 5;
 
@@ -106,11 +108,11 @@ const DOC_EXTENSIONS: [&str; 12] = [
 ];
 
 /// Qualifiers that name somebody else's code.
-const EXTERNAL_QUALIFIERS: [&str; 38] = [
+const EXTERNAL_QUALIFIERS: [&str; 41] = [
     "std", "core", "alloc", "fmt", "os", "io", "fs", "sys", "strings", "strconv", "errors", "time",
     "context", "http", "json", "sync", "sort", "bytes", "regexp", "filepath", "log", "flag",
     "self", "Self", "this", "crate", "super", "console", "process", "window", "document", "Math",
-    "JSON", "Object", "Array", "Vec", "Option", "Result",
+    "JSON", "Object", "Array", "Vec", "Option", "Result", "clippy", "rustc", "rustfmt",
 ];
 
 /// Product and language names that are PascalCase without being symbols.
@@ -722,9 +724,12 @@ fn classify_symbol(span: &str) -> Classified {
     } else if all_caps {
         false
     } else if qualified {
+        // `a::b` is a path. `pkg.Func` is a package-qualified name; a dotted
+        // chain that is deeper (`Microsoft.Extensions.Foo`) is a namespace,
+        // and one ending lower-case (`receive.denyCurrentBranch`,
+        // `Habit.statusLabel`) is a config key or a property.
         separators_colon
-            || name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-            || has_case_change(name)
+            || (qualifier.len() == 1 && name.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
     } else {
         has_case_change(name)
     };
@@ -1165,6 +1170,22 @@ struct Resolver<'a> {
     findings: Vec<DocDriftFinding>,
     total_findings: u32,
     unreadable_targets: u32,
+    /// Symbols the index does not define, awaiting the word search.
+    pending: Vec<PendingSymbol>,
+}
+
+struct PendingSymbol {
+    doc: String,
+    line: u32,
+    written: String,
+    name: String,
+    detail: String,
+}
+
+/// The identifier-shaped words of `text`.
+fn words(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|word| !word.is_empty())
 }
 
 impl<'a> Resolver<'a> {
@@ -1308,33 +1329,97 @@ impl<'a> Resolver<'a> {
         if !self.matches(qualifier, name).is_empty() {
             return;
         }
-        let elsewhere: Vec<&StoredSymbol> = self
-            .by_name
-            .get(name)
-            .map(|all| all.to_vec())
-            .unwrap_or_default();
-        if elsewhere.is_empty() {
-            self.find(
-                doc,
-                line,
-                DriftKind::MissingSymbol,
-                written,
-                format!("no symbol named {name} is defined in the index"),
-                Vec::new(),
-            );
-        } else {
-            self.find(
-                doc,
-                line,
-                DriftKind::MissingSymbol,
-                written,
-                format!(
-                    "{name} is defined, but not under the qualifier {}",
-                    qualifier.join("::")
-                ),
-                Self::locations(&elsewhere),
-            );
+        if self.by_name.contains_key(name) {
+            // The name exists, under other qualifiers. Whether the document's
+            // qualifier is stale or only spelled differently from the
+            // extractor's cannot be told from here: not a finding.
+            self.skip("qualifier_unmatched");
+            return;
         }
+        self.pending.push(PendingSymbol {
+            doc: doc.to_string(),
+            line,
+            written: written.to_string(),
+            name: name.to_string(),
+            detail: format!("no symbol named {name} is defined in the index"),
+        });
+    }
+
+    /// Settle the symbols the index does not define. The index models
+    /// functions, types and methods; it does not model enum variants, fields,
+    /// config keys or other people's libraries. A name is therefore missing
+    /// only when it appears as a word in no indexed source file either: one
+    /// pass over the non-Markdown files, early out once every wanted name is
+    /// seen.
+    fn settle_pending(&mut self, files: &[(String, String)]) -> anyhow::Result<Option<String>> {
+        if self.pending.is_empty() {
+            return Ok(None);
+        }
+        let mut wanted: HashSet<String> = self.pending.iter().map(|p| p.name.clone()).collect();
+        let mut remaining = wanted.len();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut bytes_read = 0u64;
+        let mut unreadable = 0u32;
+        let mut cut: Option<String> = None;
+        for (path, language) in files {
+            if remaining == 0 {
+                break;
+            }
+            if language == "markdown" || devmap_extract::secret::is_secret_path(path) {
+                continue;
+            }
+            if bytes_read >= MAX_WORD_SEARCH_BYTES {
+                cut = Some(format!(
+                    "the word search over source files stopped at {MAX_WORD_SEARCH_BYTES} bytes; \
+                     names it had not found were left unchecked"
+                ));
+                break;
+            }
+            self.cancel.check()?;
+            let Ok(text) = devmap_extract::safe_fs::read_repo_source(
+                Some(self.root),
+                path,
+                devmap_extract::MAX_SOURCE_BYTES,
+            ) else {
+                unreadable += 1;
+                continue;
+            };
+            bytes_read += text.len() as u64;
+            for word in words(&text) {
+                if wanted.contains(word) {
+                    wanted.remove(word);
+                    seen.insert(word.to_string());
+                    remaining -= 1;
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        let pending = std::mem::take(&mut self.pending);
+        for item in pending {
+            if seen.contains(&item.name) {
+                self.skip("defined_outside_symbol_index");
+            } else if cut.is_some() && wanted.contains(&item.name) {
+                self.skip("word_search_incomplete");
+            } else {
+                self.find(
+                    &item.doc,
+                    item.line,
+                    DriftKind::MissingSymbol,
+                    &item.written,
+                    item.detail,
+                    Vec::new(),
+                );
+            }
+        }
+        Ok(match (cut, unreadable) {
+            (Some(reason), _) => Some(reason),
+            (None, 0) => None,
+            (None, n) => Some(format!(
+                "{n} source file(s) could not be read for the word search; a name reported missing may appear in one of them"
+            )),
+        })
     }
 
     fn check_link(
@@ -1364,6 +1449,12 @@ impl<'a> Resolver<'a> {
         self.check("link");
         match self.state(&rel) {
             PathState::Missing => {
+                if is_generated_path(&rel) {
+                    // A link to a log or a build output that a clean checkout
+                    // does not carry.
+                    self.skip("generated_path");
+                    return Ok(());
+                }
                 self.find(
                     doc,
                     line,
@@ -1391,15 +1482,11 @@ impl<'a> Resolver<'a> {
         }
         if self.is_code_file(&rel) {
             for written in symbols {
-                let (qualifier, name) = split_written(written);
+                // The link names the file, so the qualifier adds nothing.
+                let (_, name) = split_written(written);
                 self.check("symbol");
                 let all = self.by_name.get(name.as_str()).cloned().unwrap_or_default();
-                let here: Vec<&StoredSymbol> = all
-                    .iter()
-                    .filter(|symbol| symbol.path == rel && qualifier_matches(symbol, &qualifier))
-                    .copied()
-                    .collect();
-                if !here.is_empty() {
+                if all.iter().any(|symbol| symbol.path == rel) {
                     continue;
                 }
                 let elsewhere: Vec<&StoredSymbol> = all
@@ -1408,14 +1495,15 @@ impl<'a> Resolver<'a> {
                     .copied()
                     .collect();
                 if elsewhere.is_empty() {
-                    self.find(
-                        doc,
+                    self.pending.push(PendingSymbol {
+                        doc: doc.to_string(),
                         line,
-                        DriftKind::MissingSymbol,
-                        written,
-                        format!("{name} is not defined in {rel} or anywhere else in the index"),
-                        Vec::new(),
-                    );
+                        written: written.clone(),
+                        name: name.clone(),
+                        detail: format!(
+                            "{name} is not defined in {rel} or anywhere else in the index"
+                        ),
+                    });
                 } else {
                     self.find(
                         doc,
@@ -1544,6 +1632,21 @@ impl<'a> Resolver<'a> {
                 self.skip("not_a_path");
                 return Ok(());
             }
+            if is_generated_path(path) {
+                self.skip("generated_path");
+                return Ok(());
+            }
+            // A path whose first directory is nowhere in this tree is written
+            // against some other root: a sibling repository, a crate directory,
+            // an example. Not checkable, not drift.
+            let first = path.split('/').next().unwrap_or("");
+            let rooted = !matches!(self.state(first), PathState::Missing)
+                || resolve_relative(doc, first)
+                    .is_some_and(|rel| !matches!(self.state(&rel), PathState::Missing));
+            if !rooted {
+                self.skip("unrooted_path");
+                return Ok(());
+            }
             self.check("path");
             self.find(
                 doc,
@@ -1565,6 +1668,20 @@ impl<'a> Resolver<'a> {
         }
         Ok(())
     }
+}
+
+/// Paths a build, a scratch run or a tool's per-user setup creates: absent from
+/// a clean checkout without being stale.
+fn is_generated_path(path: &str) -> bool {
+    let first = path.split('/').next().unwrap_or("");
+    matches!(first, "tmp" | "target" | "node_modules" | "dist" | "build")
+        || (first.starts_with('.')
+            && first.len() > 1
+            && !matches!(
+                first,
+                ".github" | ".gitlab" | ".circleci" | ".vscode" | ".cargo" | ".husky" | ".."
+            ))
+        || path.ends_with(".log")
 }
 
 /// `L10` or `L10-L20` as a line range.
@@ -1764,6 +1881,7 @@ pub fn doc_drift_report(
         findings: Vec::new(),
         total_findings: 0,
         unreadable_targets: 0,
+        pending: Vec::new(),
     };
 
     let mut docs_scanned = 0u32;
@@ -1820,6 +1938,9 @@ pub fn doc_drift_report(
                 } => resolver.check_symbol(doc, reference.line, qualifier, name, written),
             }
         }
+    }
+    if let Some(reason) = resolver.settle_pending(&files)? {
+        push_reason(&mut reasons, reason);
     }
     if !unread.is_empty() {
         push_reason(
