@@ -85,6 +85,21 @@ func TestRecordingAReviewIsRefusedInEveryAgentShell(t *testing.T) {
 		`pwsh -Command "devcouncil review record"`,
 		`env --split-string='devcouncil review record'`,
 		`find . -exec devcouncil review record \;`,
+		// Round 5 on 99f5dd5e: wrappers whose options take values, and the
+		// shell grammar that keeps a word in command position.
+		"env -u HOME devcouncil review record",
+		"sudo -u x devcouncil review record",
+		"timeout -s KILL 5 devcouncil review record",
+		"( devcouncil review record )",
+		"{ devcouncil review record; }",
+		"! devcouncil review record",
+		"coproc devcouncil review record",
+		"f() { devcouncil review record; }; f",
+		"if true; then devcouncil review record; fi",
+		"while true; do devcouncil review record; done",
+		"taskset -c 0 dcstore serve",
+		"flock -w 5 /tmp/l dcstore review-append",
+		"A=1 B=2 nice -n 5 devcouncil review record",
 	}
 	for name, gate := range gates {
 		for _, command := range refused {
@@ -93,6 +108,52 @@ func TestRecordingAReviewIsRefusedInEveryAgentShell(t *testing.T) {
 				t.Errorf("%s: %q: %s %s/%s, want a hard %s", name, command, d.Action, d.Rule, d.Severity, RuleCommandHarnessOnly)
 			}
 		}
+	}
+}
+
+// Every composition of shell grammar, wrapper, binary spelling and
+// subcommand spelling that runs `review record` is refused: a table built
+// from parts rather than listed by hand, so a new wrapper or spelling is
+// covered in every position at once.
+func TestEveryCompositionThatRecordsAReviewIsRefused(t *testing.T) {
+	prefixes := []string{"", "! ", "( ", "{ ", "then ", "do ", "coproc ", "A=1 ", "f() { "}
+	wrappers := []string{
+		"", "env ", "env -i ", "env -u HOME ", "nice -n 5 ", "sudo ", "sudo -u x ", "time -p ",
+		"timeout 5 ", "timeout -s KILL 5 ", "xargs ", "xargs -0 -n1 ", "nohup ", "stdbuf -oL ",
+		"flock -w 5 /tmp/l ", "command ", "exec ",
+	}
+	binaries := []string{"devcouncil", "dev", "/opt/bin/devcouncil", "DevCouncil", "dev\\\ncouncil", "'devcouncil'"}
+	actions := []string{
+		"review record", "review\\\n record", "rev\\\niew record", "review 'record'", `review "record"`,
+		"review {record,}", "review rec?rd", "review $'record'", "review \"$(echo record)\"",
+	}
+	var checked int
+	for _, prefix := range prefixes {
+		for _, wrapper := range wrappers {
+			for _, binary := range binaries {
+				for _, action := range actions {
+					clause := prefix + wrapper + binary + " " + action + " --file r.json"
+					checked++
+					if harnessOnlyViolation(clause) == "" {
+						t.Errorf("not refused: %q", clause)
+					}
+				}
+			}
+		}
+	}
+	for _, wrapper := range wrappers {
+		for _, store := range []string{"dcstore", "/usr/bin/dcstore", "DCSTORE"} {
+			for _, rest := range []string{"review-append --task T", "review-\\\nappend", "serve", "ser\\\nve", "{serve,}"} {
+				clause := wrapper + store + " --db s.sqlite " + rest
+				checked++
+				if harnessOnlyViolation(clause) == "" {
+					t.Errorf("not refused: %q", clause)
+				}
+			}
+		}
+	}
+	if checked < 1000 {
+		t.Fatalf("only %d compositions checked", checked)
 	}
 }
 

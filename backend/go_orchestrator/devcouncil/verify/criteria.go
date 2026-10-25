@@ -132,7 +132,7 @@ const maxRubricBytes = 1 << 20
 // state after a fix — but never consulted. A newest-matching row that could
 // not be read blocks rather than falling through to an older one: an
 // unreadable record is not a missing one.
-func judgeReview(criterion dc.AcceptanceCriterion, ev ReviewEvidence) (reasons []string, record *dc.ReviewRecord) {
+func judgeReview(taskID string, criterion dc.AcceptanceCriterion, ev ReviewEvidence) (reasons []string, record *dc.ReviewRecord) {
 	acID := criterion.ID
 	if ev.ReadErr != nil {
 		return []string{"the reviews could not be read: " + ev.ReadErr.Error()}, nil
@@ -170,9 +170,9 @@ func judgeReview(criterion dc.AcceptanceCriterion, ev ReviewEvidence) (reasons [
 	if err := r.Validate(); err != nil {
 		return []string{fmt.Sprintf("review %d is not a valid record: %v", match.ID, err)}, nil
 	}
-	if r.SubjectHash != match.SubjectHash || r.AcceptanceCriterionID != acID {
-		return []string{fmt.Sprintf("review %d names %s/%s but is filed under %s/%s",
-			match.ID, r.AcceptanceCriterionID, r.SubjectHash, acID, match.SubjectHash)}, nil
+	if r.SubjectHash != match.SubjectHash || r.AcceptanceCriterionID != acID || r.TaskID != taskID {
+		return []string{fmt.Sprintf("review %d names %s/%s/%s but is filed under %s/%s/%s",
+			match.ID, r.TaskID, r.AcceptanceCriterionID, r.SubjectHash, taskID, acID, match.SubjectHash)}, nil
 	}
 	if want := dc.CriterionDigest(criterion); r.CriterionSHA256 != want {
 		reasons = append(reasons, fmt.Sprintf("review %d answered a different version of %s (criterion "+
@@ -369,7 +369,7 @@ func dispatchCriteria(taskID string, claimed []string, linked store.LinkedRequir
 				ExpectedVerificationMethod: &method,
 			})
 		case executor == executorReview:
-			reasons, record := judgeReview(found.criterion, reviews)
+			reasons, record := judgeReview(taskID, found.criterion, reviews)
 			if len(reasons) > 0 {
 				gaps = append(gaps, Gap{
 					ID:       StableGapID(taskID, "AC", "ac:"+acID),

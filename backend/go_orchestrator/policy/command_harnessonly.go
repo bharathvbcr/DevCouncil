@@ -87,7 +87,7 @@ func harnessOnlyIn(text string, depth int) string {
 }
 
 func harnessOnlyInCommand(words []shellWord, depth int) string {
-	commandPosition := true
+	commandPosition, wrapped := true, false
 	runner := false
 	for i, word := range words {
 		base := strings.ToLower(path.Base(strings.ReplaceAll(strings.TrimLeft(word.text, "({"), `\`, "/")))
@@ -96,7 +96,7 @@ func harnessOnlyInCommand(words []shellWord, depth int) string {
 		// (`os.system('devcouncil …')`) or a shell line flattened by codeWords,
 		// where command position cannot be read. At the top level only
 		// command position counts, so `rg dcstore` is not a run of dcstore.
-		if commandPosition || depth > 0 {
+		if commandPosition || wrapped || depth > 0 {
 			switch binaryOf(word.text) {
 			case "host":
 				return hostReviewWrite(words[i+1:])
@@ -128,46 +128,31 @@ func harnessOnlyInCommand(words []shellWord, depth int) string {
 		if commandRunners[strings.TrimSuffix(base, ".exe")] {
 			runner = true
 		}
-		// What is in command position next: still, after an assignment, a
-		// wrapper, or a wrapper's own option or numeric argument; otherwise
-		// the command word has been passed and the rest are its arguments.
+		// What is in command position next. Shell grammar keeps it: an
+		// assignment, a reserved word or grouping (`(`, `{`, `!`, `then`,
+		// `do`, …), a function head `name()`. A program wrapper (`sudo`,
+		// `timeout`, `env`, …) takes options whose arity this rule cannot
+		// know — `sudo -u x`, `timeout -s KILL 5`, `env -u HOME` — so after
+		// one, every remaining word of the command is a candidate.
 		switch {
 		case commandPosition && isAssignmentWord(word.text):
+		case commandPosition && (shellGrammar[word.text] || strings.HasSuffix(word.text, "()")):
 		case commandWrappers[strings.TrimSuffix(base, ".exe")]:
-			commandPosition = true
-		case commandPosition && i > 0 && wrapperArgument(word.text):
+			commandPosition, wrapped = true, true
+		case wrapped:
 		default:
-			commandPosition = commandWrappers[strings.TrimSuffix(base, ".exe")]
+			commandPosition = false
 		}
 	}
 	return ""
 }
 
-// wrapperArgument reports whether a word is the kind a wrapper takes before
-// the command it runs: an option, a number or duration, or a lock path for
-// flock — anything but a bare program name is treated as one, so the program
-// that follows is still in command position. A bare word ends the wrapper's
-// arguments.
-func wrapperArgument(word string) bool {
-	if strings.HasPrefix(word, "-") {
-		return true
-	}
-	if word == "" {
-		return false
-	}
-	trimmed := strings.TrimRight(word, "smhd")
-	for _, c := range trimmed {
-		if !(c >= '0' && c <= '9' || c == '.') {
-			return strings.ContainsAny(word, "/") && !isProgramPath(word)
-		}
-	}
-	return true
-}
-
-// isProgramPath reports whether a word with a slash names one of the guarded
-// programs, so it is the command, not a wrapper's path argument.
-func isProgramPath(word string) bool {
-	return binaryOf(word) != ""
+// shellGrammar are the reserved words and grouping tokens after which the
+// next word is still a command: `( devcouncil …)`, `! devcouncil …`,
+// `if …; then devcouncil …`, `coproc devcouncil …`.
+var shellGrammar = map[string]bool{
+	"(": true, "{": true, "!": true, "if": true, "then": true, "else": true, "elif": true,
+	"do": true, "while": true, "until": true, "coproc": true, "function": true,
 }
 
 // commandSegments splits a command line at the operators that separate

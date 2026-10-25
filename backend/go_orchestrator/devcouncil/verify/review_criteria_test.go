@@ -197,6 +197,11 @@ func TestAReviewThatCannotVouchForThisContentBlocks(t *testing.T) {
 			s.SubjectHash = reviewedSubject
 			return reviewInput(t, true, s)
 		}, "is filed under"},
+		"a record naming another task": {func(t *testing.T) verify.Input {
+			r := goodReview()
+			r.TaskID = "TASK-OTHER"
+			return reviewInput(t, true, stored(1, r))
+		}, "is filed under"},
 		"no evidence read at all": {func(t *testing.T) verify.Input {
 			in := criterionInput(dc.VerifyLLMReview, true, 0, "go test ./...")
 			return in
