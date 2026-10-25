@@ -310,7 +310,7 @@ fn a_budget_that_cuts_the_list_says_what_it_hid() {
     let hidden = report["hidden"].as_u64().unwrap();
     assert_eq!(report["total"], 6, "{report}");
     assert!(
-        shown >= 1 && shown < 6,
+        (1..6).contains(&shown),
         "a budget of 40 keeps some: {report}"
     );
     assert_eq!(shown + hidden, 6, "{report}");

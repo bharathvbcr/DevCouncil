@@ -1380,12 +1380,7 @@ async fn the_doc_drift_tool_reports_drift_over_mcp() {
     .await;
     assert_eq!(narrowed["structuredContent"]["total"], 2, "{narrowed}");
 
-    let excluded = tool(
-        &store,
-        "devmap_doc_drift",
-        json!({"exclude": ["NOTES.md"]}),
-    )
-    .await;
+    let excluded = tool(&store, "devmap_doc_drift", json!({"exclude": ["NOTES.md"]})).await;
     assert_eq!(
         excluded["structuredContent"]["docs_scanned"], 0,
         "{excluded}"
