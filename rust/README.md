@@ -273,7 +273,7 @@ fails if they skipped.
   to read before planning a cutover**: these components are not uniformly better
   than the Python they resemble, and `dcverify`'s stub detection is measurably
   weaker than `verification/stub_detector.py`, which does AST analysis.
-- [`../docs/archive/devmap/STATUS.md`](../docs/archive/devmap/STATUS.md) — archived kernel port ledger (pre-Phase-7). Live kernel contracts: [`../docs/devmap/DIVERGENCES.md`](../docs/devmap/DIVERGENCES.md), [`../docs/TODO.md`](../docs/TODO.md).
+- [`../docs/archive/devmap/STATUS.md`](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/archive/devmap/STATUS.md) — archived kernel port ledger (pre-Phase-7). Live kernel contracts: [`../docs/devmap/DIVERGENCES.md`](../docs/devmap/DIVERGENCES.md); frozen follow-up ledger: [`docs/TODO.md`](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/TODO.md).
 - MANVI's `docs/COMPONENTS_AND_HARNESS.md` — the consumer's view: the resolution
   ladder, where a change belongs, and the checklist a newly ported component
   must satisfy before anything depends on it.

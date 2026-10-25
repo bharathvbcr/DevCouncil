@@ -423,7 +423,7 @@ command and response contracts recorded in each run's version/schema artifacts;
 an unknown response is unverified, never an empty successful answer. One cold
 sample is recorded per tool/repository. Native build work and bundled provider
 availability differ, and synthetic definition checks do not estimate caller
-recall. Read [the hardening audit](../docs/archive/devmap/BENCHMARK_HARDENING_AUDIT.md)
+recall. Read [the hardening audit](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/archive/devmap/BENCHMARK_HARDENING_AUDIT.md)
 before interpreting the results as a product comparison. This comparative
 runner supplements the Rust gates; the historical `map_bench.py` stages below
 remain retired.

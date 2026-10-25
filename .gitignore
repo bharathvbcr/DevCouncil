@@ -198,6 +198,16 @@ CLAUDE.md
 *_Implementation_Plan.md
 **/*.plan.md
 docs/superpowers/plans/
+# Dated session reports, the retired-audit archive and the Phase 7 ledgers are
+# local-only. They were untracked on 2026-10-25 and history keeps them; tracked
+# docs link to them by permalink at b18cea3f, the last commit that held them.
+/AUDIT_REPORT*.md
+/BRANCH_REPORT*.md
+/BUILD_REPORT*.md
+/docs/archive/
+/docs/TODO.md
+/docs/PHASE7_LONG_TAIL.md
+/docs/DEVMAP_SKILL_DELIVERY.md
 
 # =============================================================================
 # Databases & runtime state files
