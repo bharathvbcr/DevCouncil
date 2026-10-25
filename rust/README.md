@@ -221,8 +221,9 @@ the new build is broken.
 
 ### Requirements
 
-- **Rust, stable.** `dc-grep` requires 1.89 or newer for standard-library file
-  locking. The other component manifests retain their existing requirements.
+- **Rust 1.99.** `rust-toolchain.toml` pins channel 1.99.0 and `rust-version` in
+  `rust/Cargo.toml` is 1.99; `dc-grep` inherits it (it uses standard-library file
+  locking, which needs 1.89 or newer).
 - **A C compiler.** `dc-store` takes `rusqlite` with `bundled` and compiles
   SQLite from source rather than linking whatever `libsqlite3` the host ships.
 - **`sqlite3`** for the Go client tests, which plant a task row with it.

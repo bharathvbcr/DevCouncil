@@ -1,7 +1,10 @@
 # DevMap vs GitNexus, CodeGraph, Graphify, Gortex, and codebase-memory-mcp
 
-**Short answer:** DevMap 0.2.2 was the fastest of six code-graph tools at cold
-indexing and unchanged refresh on **all four repositories tested**, had the
+**Short answer:** DevMap 0.2.2 was the fastest of the five tools timed as
+standalone CLIs (itself, CodeGraph, codebase-memory-mcp, GitNexus and Graphify)
+at cold indexing and unchanged refresh on **all four repositories tested**; the
+sixth tool, Gortex, is a resident daemon measured at its own log gates and is not
+comparable on those two stages. DevMap had the
 lowest median in **all six symbol-query cells**, and found **all five**
 source-inspected caller pairs — more than any tool except codebase-memory-mcp,
 which matched it. CodeGraph beat it on one axis that matters, re-indexing a
@@ -23,7 +26,7 @@ Rust, Go, TypeScript, Python and Swift. Minimum of three interleaved repeats.
 |---|---|---|
 | Cold index | 0.757 s – 4.611 s | **Fastest on all four**, by 1.6× to 21× |
 | Unchanged refresh | 0.053 s – 0.141 s | **Fastest on all four**, by 2.2× to 107× |
-| One file changed | 0.389 s – 2.449 s | **Slowest of the two leaders** — CodeGraph wins all four |
+| One file changed | 0.389 s – 2.449 s | **Not fastest** — CodeGraph wins all four |
 
 The unchanged-refresh margin is the widest and the most load-bearing: it is the
 watcher's common tick, and DevMap stays near-flat as the corpus grows (0.053 s
@@ -105,7 +108,7 @@ test callers.
 
 The widest gap in the set. DevMap indexed cold **16.7× faster**, edited **39×
 faster**, refreshed **7.8× faster**, and queried **~82× faster** on definitions
-and **~29× faster** on callers.
+and **~28× faster** on callers.
 
 GitNexus also produced the run's one correctness failure. When a file is
 reverted to content GitNexus has already indexed, it keeps answering with a
@@ -132,7 +135,7 @@ extraction with no hosted inference. It also **used less memory than DevMap on
 the largest repository** (1,458 MB against 1,725 MB): its sampled peak barely
 moves with corpus size while DevMap's grows.
 
-Against that, it indexed cold 7.5× slower here, and its unchanged refresh
+Against that, it indexed cold 7.4× slower here, and its unchanged refresh
 degrades badly with scale — 14.0 s on the 4,335-file corpus, ~100× DevMap's.
 Its clustering and LLM enrichment were disabled for this run, so its
 full-feature behaviour is unmeasured.

@@ -8,6 +8,8 @@ Every number traces to
 If you re-run the benchmark, update this file and the site together, or the
 site becomes a stale claim.
 
+> **Superseded before reuse:** "five other tools", "faster than all five" and "Next fastest" below overstate the cold-index and refresh results, which compare four CLI tools (Gortex is not comparable there); see [comparison.md](../devmap/comparison.md).
+
 ---
 
 ## 1. Page metadata
@@ -17,12 +19,12 @@ server*, *devmap vs gitnexus*, *codebase context for Claude Code*.
 
 ```html
 <title>DevMap — Fast Code Intelligence &amp; Code Graph for AI Coding Agents</title>
-<meta name="description" content="Symbol-level code graph, blast radius, and dead-code analysis for AI coding agents. Benchmarked against GitNexus, CodeGraph, Graphify, Gortex, and codebase-memory-mcp across four repositories: fastest cold index and refresh on all four, 10ms symbol queries.">
+<meta name="description" content="Symbol-level code graph, blast radius, and dead-code analysis for AI coding agents. Benchmarked against four CLI tools (CodeGraph, codebase-memory-mcp, GitNexus, Graphify) across four repositories: fastest cold index and unchanged refresh on all four, 10ms symbol queries.">
 <link rel="canonical" href="https://devcouncil.vbcr.dev/">
 
 <meta property="og:type" content="website">
 <meta property="og:title" content="DevMap — Code Intelligence for AI Coding Agents">
-<meta property="og:description" content="Fastest cold index and refresh on all four benchmarked repositories, 10ms symbol queries, 5/5 caller pairs. Measured, with the raw evidence published.">
+<meta property="og:description" content="Fastest cold index and unchanged refresh on all four benchmarked repositories, 10ms symbol queries, 5/5 caller pairs. Measured, with the raw evidence published.">
 <meta property="og:url" content="https://devcouncil.vbcr.dev/">
 <meta name="twitter:card" content="summary_large_image">
 ```
@@ -37,10 +39,12 @@ version above is deliberately fact-dense rather than adjective-dense.
 > ### Your AI agent is guessing about your codebase.
 >
 > DevMap gives it a symbol-level map instead — every definition, caller, and
-> blast radius, in milliseconds. Six code-graph tools indexed the same four
-> repositories. DevMap was fastest on cold indexing and refresh on **every one
-> of them**, fastest on every symbol query we measured, and the only tool
-> besides one to find all five hand-inspected caller pairs.
+> blast radius, in milliseconds. Six code-graph tools were run on the same four
+> repositories; five of them were timed as standalone CLIs. DevMap was fastest
+> on cold indexing and unchanged-tree refresh on **every one of them** (though
+> not on re-indexing one edited file), fastest on every symbol query we
+> measured, and the only tool besides one to find all five hand-inspected
+> caller pairs.
 >
 > **[See the benchmark →]** &nbsp; **[Install →]**
 
@@ -52,23 +56,27 @@ Alternate, more specific headline if you want the keyword up front:
 
 ## 3. Benchmark section
 
-> ## Measured against five other code-graph tools
+> ## Measured against four other code-graph CLI tools
 >
-> Not an estimate. Six tools indexed the same **four repositories** — 595 to
-> 4,335 files across Rust, Go, TypeScript, Python and Swift — on one machine.
-> Every corpus pinned to a commit, every competitor binary hash-verified, every
+> Not an estimate. DevMap and four other tools (CodeGraph, codebase-memory-mcp,
+> GitNexus, Graphify) were timed as standalone CLIs on the same **four
+> repositories** — 595 to 4,335 files across Rust, Go, TypeScript, Python and
+> Swift — on one machine. A sixth tool, Gortex, is a resident daemon, was
+> measured at its own log gates, and is not comparable on these stages. Every
+> corpus pinned to a commit, every competitor binary hash-verified, every
 > command's raw output published.
 
-**Fastest on all four repositories:**
+**Fastest cold index and unchanged refresh on all four repositories, against the four CLI tools:**
 
-| Stage | DevMap 0.2.2 | Next fastest |
-|---|---|---|
-| Cold index | 0.76 s – 4.61 s | 1.6× to 21× slower |
-| Unchanged refresh | 0.05 s – 0.14 s | 2.2× to 107× slower |
+| Stage | DevMap 0.2.2 | Closest CLI competitor | Range across the four competitors |
+|---|---|---|---|
+| Cold index | 0.76 s – 4.61 s | 1.6× to 2.8× slower | 1.6× to 21× slower |
+| Unchanged refresh | 0.05 s – 0.14 s | 2.2× to 3.7× slower | 2.2× to 107× slower |
+| One file changed | 0.39 s – 2.45 s | CodeGraph is faster on all four | DevMap is 1.08× to 3.61× CodeGraph's time |
 
 Detailed, on the 1,098-file corpus where correctness was also checked:
 
-| Tool | Cold index | Refresh | Edit | Symbol query | Peak RSS | Callers found |
+| Tool | Cold index | Unchanged refresh | One-file edit | Symbol query | Peak RSS | Callers found |
 |---|---:|---:|---:|---:|---:|---:|
 | **DevMap 0.2.2** | **2.01 s** | **89 ms** | 816 ms | **9.7 ms** | **678 MiB** | **5/5** |
 | CodeGraph 1.6.0 | 3.29 s | 235 ms | **512 ms** | 101–106 ms | 2430 MiB | 3/5 |
@@ -76,6 +84,9 @@ Detailed, on the 1,098-file corpus where correctness was also checked:
 | Graphify 0.9.59 | 14.99 s | 5.08 s | 4.88 s | 557–572 ms | 3417 MiB | 3/5 |
 | GitNexus 1.6.9 | 33.69 s | 699 ms | 31.84 s | ~800 ms | 3355 MiB | 3/5 |
 | Gortex 0.64.3 | 16.5 s to query-ready | — | — | 92–104 ms | — | 4/5 |
+
+Gortex is a resident daemon: its cold figure is a log gate, not a CLI wall time,
+so it is not comparable to the other rows' cold, refresh or edit columns.
 
 > **Where we lose.** CodeGraph re-indexes a single edited file faster than we do
 > on **every** repository — 512 ms to our 816 ms here, and 3.6× faster on the
@@ -113,8 +124,10 @@ rather than lines that mention the name. For reference, ripgrep searched the
 same corpus in ~45 ms — DevMap's resolved symbol lookup was 9.7 ms.
 
 **Is it faster than GitNexus / CodeGraph / Graphify?**
-On the four benchmarked repositories: faster than all five on cold indexing and
+On the four benchmarked repositories: faster than all four CLI tools
+(CodeGraph, codebase-memory-mcp, GitNexus, Graphify) on cold indexing and
 unchanged refresh on every one, and faster on every symbol query measured.
+Gortex, a resident daemon, is not comparable on the indexing stages.
 CodeGraph is faster at re-indexing a single edited file, on every repository.
 
 **Which languages are supported?**
@@ -171,7 +184,7 @@ user-submitted ratings — fabricated review markup is a manual-action risk.
       "name": "Is DevMap faster than GitNexus or CodeGraph?",
       "acceptedAnswer": {
         "@type": "Answer",
-        "text": "Across four benchmarked repositories, DevMap was fastest at cold indexing and unchanged refresh on all four. On the 1,098-file corpus it indexed cold in 2.01 seconds against CodeGraph's 3.29 and GitNexus's 33.69, and answered symbol queries in 9.7 ms against 101-106 ms and ~800 ms respectively. CodeGraph was faster at re-indexing a single edited file on every repository, at 512 ms against DevMap's 816 ms on this corpus."
+        "text": "Across four benchmarked repositories, DevMap was fastest at cold indexing and unchanged refresh on all four, against the four CLI tools timed (a fifth, Gortex, is a resident daemon and not comparable on those stages). On the 1,098-file corpus it indexed cold in 2.01 seconds against CodeGraph's 3.29 and GitNexus's 33.69, and answered symbol queries in 9.7 ms against 101-106 ms and ~800 ms respectively. CodeGraph was faster at re-indexing a single edited file on every repository, at 512 ms against DevMap's 816 ms on this corpus."
       }
     },
     {

@@ -100,9 +100,12 @@ Full method, caveats, and raw output:
 **[benchmark report](benchmarks/results/competition/20260914-v0.2.2/REPORT.md)**.
 
 **DevMap 0.2.2 was fastest on most of what was measured:** cold indexing and
-unchanged refresh on **all four repositories**, the lowest median in **all six
-symbol-query cells**, and **5/5** source-inspected caller pairs — matched only
-by codebase-memory-mcp.
+unchanged refresh on **all four repositories** against the four tools timed as
+standalone CLIs (CodeGraph, codebase-memory-mcp, GitNexus, Graphify; Gortex is a
+resident daemon and is not comparable on those two stages), the lowest median in
+**all six symbol-query cells**, and **5/5** source-inspected caller pairs —
+matched only by codebase-memory-mcp. It did not win the one-file-changed
+refresh: CodeGraph did, on all four.
 
 Detailed table on the 1,098-file DevCouncil corpus, where the correctness and
 query campaign also ran:
@@ -117,7 +120,8 @@ query campaign also ran:
 | Gortex 0.64.3 | 16.5 s to query-ready | — | — | 92–104 ms | — | 4/5 |
 
 **Where DevMap won.** Fastest cold index on all four corpora (**1.6–21×** the
-competitors' time) and fastest unchanged refresh on all four (**2.2–107×**).
+time of the four CLI tools) and fastest unchanged refresh on all four
+(**2.2–107×**).
 Lowest median in all six query cells — definition lookups at 9.7 ms, **~10×
 faster than CodeGraph** and **~82× faster than GitNexus**. Lowest sampled peak
 memory on three of four corpora. All five source-inspected caller pairs, and a

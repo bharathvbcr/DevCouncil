@@ -12,7 +12,7 @@ Kernel sources live under [`rust/`](../../rust/) (`devmap-*` crates, `vendor/`,
 
 Concurrent agent worktrees: [design, audit and rollout contract](AGENTIC_WORKTREE_DESIGN.md), with archived [native qualification and schema-20 cutover](../archive/devmap/SCHEMA20_QUALIFICATION_2026-09-09.md). Navigation is read-only; use explicit `devmap repair --schema` only after coordinating all installed readers and writers.
 
-Latest dated review: [extraction and resolver audit, 2026-10-02](../archive/devmap/EXTRACTION_RESOLVE_AUDIT_2026-10-02.md).
+Latest dated reviews: [extraction and resolver audit, 2026-10-02](../archive/devmap/EXTRACTION_RESOLVE_AUDIT_2026-10-02.md) and [resolver precision A/B, 2026-10-07](../archive/devmap/RESOLVER_PRECISION_AB_2026-10-07.md).
 
 Host applications can link the query crate or use the versioned JSON and HTML
 process contract in [HOST_INTEGRATION.md](HOST_INTEGRATION.md).
@@ -70,7 +70,7 @@ flowchart TD
     end
 
     subgraph Storage["4. Canonical Store (devmap-store)"]
-        SQLiteStore[("devmap.sqlite<br/>(Schema 22: Nodes, Edges, Evidence, Gaps)")]
+        SQLiteStore[("devmap.sqlite<br/>(Schema 27: Nodes, Edges, Evidence, Gaps)")]
         ManifestExports["Artifact Exports<br/>(repo_map.json, code_graph.json, AGENTS.md)"]
     end
 
@@ -192,8 +192,10 @@ session. Earlier reports remain published with their own measurements —
 and [the four-repository v0.2.1 run](../../benchmarks/results/competition/20260913-multirepo/REPORT.md).
 
 **DevMap 0.2.2 led cold indexing and unchanged refresh on all four
-repositories, and all six symbol-query cells.** It lost the one-file edit to
-CodeGraph on all four.
+repositories against the four standalone-CLI tools (CodeGraph,
+codebase-memory-mcp, GitNexus, Graphify; Gortex's resident daemon is not
+comparable on those stages), and led all six symbol-query cells.** It lost the
+one-file edit to CodeGraph on all four.
 
 Detailed figures on the 1,098-file DevCouncil corpus (cold/refresh/edit are
 minimums of three interleaved repeats; queries are medians of five):
@@ -262,18 +264,19 @@ commits did not change what was extracted from this workload. That is a
 statement about this corpus, not about the changed extractors in general.
 Keep these control samples separate from the competitor medians above.
 
-Graphify used AST-only extraction with clustering disabled. Gortex cold time
-includes enrichment (query-ready median: 14.591 s), and its queries use a
-resident daemon; the other measured interfaces were standalone CLIs. CBM's
+Graphify used AST-only extraction with clustering disabled. Gortex's cold
+figure is its query-ready log gate (16.51 s on this corpus, n=1; enrichment
+completed at 36.88 s), and its queries use a resident daemon; the other measured
+interfaces were standalone CLIs. CBM's
 roughly four-second CLI queries do not measure its persistent MCP engine.
 Native filters, output scope, index formats, and sampled RSS differ.
 
 The report retains per-tool positives and negatives, complete timing ranges,
 raw outputs, memory/storage, coverage warnings, and inferred follow-up work.
 No product test suite, hosted inference, UI, persistent-MCP parity, or broad
-language-accuracy qualification was run for this benchmark follow-up. The old
-dirty binary lacks its exact source patch; the new binary was hash-verified
-but not rebuilt during this run.
+language-accuracy qualification was run for the build-48cd3c7 follow-up above.
+That run's old dirty binary lacks its exact source patch; its new binary was
+hash-verified but not rebuilt during it.
 
 ## Install
 
