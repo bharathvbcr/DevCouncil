@@ -548,7 +548,9 @@ What the report cannot see, each surfaced as a `skipped` count rather than hidde
 - A path whose spelling differs from the on-disk entry only in case (`guide.md` for
   `GUIDE.md`) is `missing_file` with the on-disk spelling in its detail, on case-sensitive and
   case-insensitive file systems alike (each component is checked against its directory's
-  entries, up to 20 000 per directory).
+  entries, up to 20 000 per directory; a directory past the cap is named in `walk_incomplete`
+  and counted as `skipped.spelling_unchecked`). A difference in Unicode normalisation only is
+  not case: it is reported only when some entry equals the reference ignoring case.
 - A dependency on a sibling npm or yarn workspace member (a package whose `name` some
   `package.json` in the repository gives) is the repository's own even when declared by plain
   version. `crate::`, `self::` and `super::` paths are the repository's own: the relative root

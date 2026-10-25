@@ -1219,6 +1219,97 @@ fn a_spelling_that_differs_only_in_case_is_broken_on_every_file_system() {
 
 #[cfg(feature = "parse")]
 #[test]
+fn a_unicode_normalisation_difference_is_not_a_case_difference() {
+    // `Café.md` stored decomposed (NFD). A file system that ignores
+    // normalisation opens it by the composed (NFC) spelling; that difference is
+    // not case, and no entry folds equal to the reference, so it is no finding.
+    let nfd = "Cafe\u{301}.md";
+    let nfc = "Caf\u{e9}.md";
+    let f = fixture(
+        "unicode",
+        &[
+            (&format!("docs/uni/{nfd}"), "# Cafe\n"),
+            ("docs/uni/R\u{e9}sum\u{e9}.md", "# Resume\n"),
+            (
+                "docs/index.md",
+                &format!(
+                    "[a](uni/{nfc}) [b](uni/{nfd}) [c](uni/r\u{e9}sum\u{e9}.md) [d](uni/R\u{e9}sum\u{e9}.md)\n"
+                ),
+            ),
+        ],
+    );
+    // Whether this file system opens the other normalisation form at all.
+    let opens = std::fs::metadata(f.root.join("docs/uni").join(nfc)).is_ok();
+    let report = run(&f);
+    let mut expected = vec![(
+        "docs/index.md".to_string(),
+        1,
+        "missing_file",
+        "uni/r\u{e9}sum\u{e9}.md".to_string(),
+    )];
+    if !opens {
+        // A byte-exact file system: the composed spelling simply is not there.
+        expected.insert(
+            0,
+            (
+                "docs/index.md".to_string(),
+                1,
+                "missing_file",
+                format!("uni/{nfc}"),
+            ),
+        );
+    }
+    assert_eq!(found(&report), expected, "{report:?}");
+    let wrong_case = report.findings.last().unwrap();
+    assert!(
+        wrong_case.detail.contains("exists, but the case differs"),
+        "{}",
+        wrong_case.detail
+    );
+}
+
+#[cfg(feature = "parse")]
+#[test]
+fn a_directory_past_the_listing_cap_is_named_not_silently_unchecked() {
+    let mut files: Vec<(String, String)> = (0..5)
+        .map(|n| (format!("docs/big/f{n}.md"), "x\n".to_string()))
+        .collect();
+    files.push((
+        "docs/index.md".to_string(),
+        "[a](big/f0.md) [b](big/F1.md)\n".to_string(),
+    ));
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(p, t)| (p.as_str(), t.as_str()))
+        .collect();
+    let f = fixture("listing-cap", &borrowed);
+    let limits = Limits {
+        max_dir_entries: 3,
+        ..Limits::default()
+    };
+    let report = run_with(&f, &[], &[], true, limits);
+    // `big` has more entries than the cap: its spelling is not checked, so the
+    // wrong-case `F1.md` is not judged here, and the report says where and why.
+    assert_eq!(skipped(&report, "spelling_unchecked"), 2, "{report:?}");
+    let reason = report.walk_incomplete.as_deref().unwrap_or("");
+    assert!(
+        reason.contains("1 directory listing(s) exceeded the cap of 3")
+            && reason.contains("docs/big"),
+        "{reason}"
+    );
+    // Within the cap the same references are judged.
+    let full = run(&f);
+    assert_eq!(skipped(&full, "spelling_unchecked"), 0, "{full:?}");
+    assert!(
+        full.walk_incomplete
+            .as_deref()
+            .is_none_or(|r| !r.contains("listing")),
+        "{full:?}"
+    );
+}
+
+#[cfg(feature = "parse")]
+#[test]
 fn a_package_that_a_sibling_workspace_member_names_is_the_repositorys_own() {
     let f = fixture(
         "npm-workspace",

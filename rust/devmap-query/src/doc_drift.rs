@@ -1744,6 +1744,15 @@ enum Spelling {
 
 /// Entries read from one directory when checking spelling.
 const MAX_DIR_ENTRIES: usize = 20_000;
+
+/// A directory as read for the spelling check.
+#[derive(Clone)]
+enum Listing {
+    Names(std::rc::Rc<Vec<String>>),
+    /// More entries than the cap: not listed, not checked.
+    Cut,
+    Unreadable,
+}
 /// Directory listings kept between lookups.
 const LISTING_CACHE_CAP: usize = 512;
 
@@ -1755,6 +1764,8 @@ pub struct Limits {
     pub max_findings: usize,
     /// Source bytes the word search for unindexed names reads.
     pub max_word_search_bytes: u64,
+    /// Entries read from one directory to check how a path is spelled.
+    pub max_dir_entries: usize,
 }
 
 impl Default for Limits {
@@ -1762,6 +1773,7 @@ impl Default for Limits {
         Self {
             max_findings: MAX_FINDINGS,
             max_word_search_bytes: MAX_WORD_SEARCH_BYTES,
+            max_dir_entries: MAX_DIR_ENTRIES,
         }
     }
 }
@@ -1791,8 +1803,10 @@ struct Resolver<'a> {
     /// Names of the repository's own code, as written; see `load_declared`.
     in_repo: HashSet<String>,
     /// Directory listings read to check spelling, by directory.
-    #[allow(clippy::type_complexity)]
-    listings: std::cell::RefCell<HashMap<std::path::PathBuf, Option<std::rc::Rc<Vec<String>>>>>,
+    listings: std::cell::RefCell<HashMap<std::path::PathBuf, Listing>>,
+    /// Lookups whose directory was past the listing cap, and which directories.
+    unchecked_lookups: std::cell::Cell<u32>,
+    unlisted: std::cell::RefCell<BTreeSet<String>>,
     /// The root as the index recorded it, when that differs from the canonical
     /// path: absolute link targets may be written either way.
     root_aliases: Vec<String>,
@@ -1903,8 +1917,9 @@ impl<'a> Resolver<'a> {
                     }
                     return PathState::Case { actual: corrected };
                 }
-                Spelling::Absent => return PathState::Missing,
-                Spelling::Exact | Spelling::Unknown => {}
+                // Nothing matches even ignoring case: the operating system
+                // decides (and a normalisation-insensitive one may open it).
+                Spelling::Exact | Spelling::Absent | Spelling::Unknown => {}
             }
             let Ok(meta) = std::fs::symlink_metadata(&next) else {
                 return PathState::Missing;
@@ -1962,22 +1977,38 @@ impl<'a> Resolver<'a> {
     }
 
     /// How `name` is spelled among the entries of `dir`.
+    ///
+    /// `Differs` only when an entry equals `name` under case folding yet is
+    /// spelled otherwise. A name no entry matches even folded is `Absent`, and
+    /// the caller lets the operating system decide: when it opens that name
+    /// anyway, the difference is Unicode normalisation (an NFD name opened by
+    /// its NFC spelling), not case, and no finding is owed.
     fn spelling(&self, dir: &Path, name: &str) -> Spelling {
         let listing = {
             let mut cache = self.listings.borrow_mut();
             match cache.get(dir) {
                 Some(cached) => cached.clone(),
                 None => {
-                    let read = std::fs::read_dir(dir).ok().and_then(|entries| {
-                        let mut names = Vec::new();
-                        for entry in entries.flatten() {
-                            if names.len() >= MAX_DIR_ENTRIES {
-                                return None;
+                    let cap = self.limits.max_dir_entries;
+                    let read = match std::fs::read_dir(dir) {
+                        Err(_) => Listing::Unreadable,
+                        Ok(entries) => {
+                            let mut names = Vec::new();
+                            let mut cut = false;
+                            for entry in entries.flatten() {
+                                if names.len() >= cap {
+                                    cut = true;
+                                    break;
+                                }
+                                names.push(entry.file_name().to_string_lossy().into_owned());
                             }
-                            names.push(entry.file_name().to_string_lossy().into_owned());
+                            if cut {
+                                Listing::Cut
+                            } else {
+                                Listing::Names(std::rc::Rc::new(names))
+                            }
                         }
-                        Some(std::rc::Rc::new(names))
-                    });
+                    };
                     if cache.len() < LISTING_CACHE_CAP {
                         cache.insert(dir.to_path_buf(), read.clone());
                     }
@@ -1985,8 +2016,24 @@ impl<'a> Resolver<'a> {
                 }
             }
         };
-        let Some(names) = listing else {
-            return Spelling::Unknown;
+        let names = match listing {
+            Listing::Names(names) => names,
+            Listing::Unreadable => return Spelling::Unknown,
+            Listing::Cut => {
+                // Not checked, and said so: the directory and the cap reach the
+                // report instead of the check quietly stopping.
+                self.unchecked_lookups.set(self.unchecked_lookups.get() + 1);
+                let shown = dir
+                    .strip_prefix(self.root)
+                    .map(|inside| inside.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_default();
+                self.unlisted.borrow_mut().insert(if shown.is_empty() {
+                    ".".to_string()
+                } else {
+                    shown
+                });
+                return Spelling::Unknown;
+            }
         };
         if names.iter().any(|entry| entry == name) {
             return Spelling::Exact;
@@ -3347,6 +3394,8 @@ pub fn doc_drift_report_with(
         declared: HashSet::new(),
         in_repo: HashSet::new(),
         listings: std::cell::RefCell::new(HashMap::new()),
+        unchecked_lookups: std::cell::Cell::new(0),
+        unlisted: std::cell::RefCell::new(BTreeSet::new()),
         root_aliases: recorded_root
             .into_iter()
             .map(|r| r.replace('\\', "/").trim_end_matches('/').to_string())
@@ -3451,6 +3500,28 @@ pub fn doc_drift_report_with(
             format!(
                 "{} reference(s) could not be fully checked because the target could not be read",
                 resolver.unreadable_targets
+            ),
+        );
+    }
+    let unchecked = resolver.unchecked_lookups.get();
+    if unchecked > 0 {
+        let directories: Vec<String> = resolver.unlisted.borrow().iter().cloned().collect();
+        resolver
+            .skipped
+            .insert("spelling_unchecked".to_string(), unchecked);
+        push_reason(
+            &mut reasons,
+            format!(
+                "{} directory listing(s) exceeded the cap of {} entries, so the case of {unchecked} path lookup(s) was not checked there: {}{}",
+                directories.len(),
+                options.limits.max_dir_entries,
+                directories
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if directories.len() > 5 { ", ..." } else { "" }
             ),
         );
     }
