@@ -530,14 +530,23 @@ What the report cannot see, each surfaced as a `skipped` count rather than hidde
   unreported.
 - `qualifier_unmatched` hides references to a renamed owner: `OldType::method` is not reported
   while `method` exists under another type.
-- `external_qualifier`: `serde_json::Value`, `tokio::spawn`, `React.Component` — a qualifier
-  the repository's own manifests declare (`Cargo.toml` dependency tables including renamed
-  `package =`, `go.mod` requires, `package.json` dependencies, read only from indexed files) or
-  a language standard root listed in the code. A qualifier nothing declares and nothing defines
-  (`oldmod::run_task`) is a vanished module and is reported as `missing_symbol`.
+- `external_qualifier`: `serde_json::Value`, `tokio::spawn` — a qualifier the repository's own
+  manifests declare (`Cargo.toml` dependency tables including `name.workspace = true` and
+  renamed `package =`, `go.mod` requires, `package.json` dependencies, read only from indexed
+  files; a malformed one is named in `walk_incomplete`) or a standard root listed in the code.
+  Compared as written, `-` as `_`: `Store` is not the `store` crate. A path dependency, a local
+  `replace`, a `file:`/`workspace:` package, or a name that is a symbol, directory, file stem or
+  crate of this repository is never external, even if a dependency or a standard root shares
+  the name. A qualifier nothing declares and nothing defines (`oldmod::run_task`) is a vanished
+  module and is reported as `missing_symbol`.
 - A target path written with backslashes is `backslash_path`: never resolved, on any platform.
-- A link that is a symlink is judged by where it lands: into the repository at nothing is
-  `missing_file`; out of the repository, or a loop, is `outside_repo`.
+- Symlinks are resolved the way the operating system does, a component at a time with `..`
+  applying to the physical directory a link led to. Leaving the repository (or 40 links) is
+  `outside_repo` with nothing past it examined, so the report cannot tell a host path that
+  exists from one that does not; inside, a missing component, a dangling link included, is
+  `missing_file`.
+- A heading that cannot be rendered within bounds (a long link destination, a tag too long to
+  close) makes that document's anchors incomplete: `anchor_target_unscanned`, not a wrong slug.
 - A directive counts only on a prose line: not fenced, not indented code, not inside an HTML
   comment.
 - Links and spans differ on a missing top-level directory: `[x](oldpkg/main.go)` is

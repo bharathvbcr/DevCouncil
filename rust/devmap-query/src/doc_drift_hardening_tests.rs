@@ -245,6 +245,9 @@ mod checkout {
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();
             std::fs::write(file, text).unwrap();
         }
+        // The canonical path, so absolute link targets written with it are
+        // recognised as inside the repository.
+        let root = root.canonicalize().unwrap();
         let extractions: Vec<_> = files
             .iter()
             .map(|(path, text)| devmap_extract::extract_file(path, text))
@@ -718,100 +721,259 @@ fn a_directive_counts_only_on_a_prose_line() {
     assert!(extract_references(&prose).references.is_empty());
 }
 
-#[test]
-fn manifests_name_their_dependencies() {
-    let cargo = "[package]\nname = \"x\"\n\n[workspace.dependencies]\nserde_json = \"1\"\n\n[dependencies]\ntokio = { version = \"1\" }\nmy-lib = { package = \"real_name\", version = \"1\" }\n# commented = \"1\"\n\n[dev-dependencies.anyhow]\nversion = \"1\"\n\n[dependencies.renamed]\npackage = \"origin\"\n\n[target.'cfg(unix)'.dependencies]\nlibc = \"0.2\"\n\n[features]\nnot_a_dependency = []\n";
-    let mut found = cargo_dependencies(cargo);
+fn deps(manifest: &Manifest) -> Vec<(String, bool)> {
+    let mut found: Vec<(String, bool)> = manifest
+        .dependencies
+        .iter()
+        .map(|d| (d.name.clone(), d.local))
+        .collect();
     found.sort();
+    found.dedup();
+    found
+}
+
+fn pair(name: &str, local: bool) -> (String, bool) {
+    (name.to_string(), local)
+}
+
+#[test]
+fn a_cargo_manifest_names_its_dependencies_and_which_are_local() {
+    let cargo = "[package]\nname = \"x-app\"\n\n[workspace.dependencies]\nserde_json = \"1\"\ndevmap-store = { path = \"devmap-store\" }\n\n[dependencies]\ntokio = \"1\"\nfoo.workspace = true\nbar = { workspace = true }\nmy-lib = { package = \"real_name\", version = \"1\" }\nlocal-pkg = { package = \"origin\", path = \"../l\" }\n# commented = \"1\"\n\n[dev-dependencies.anyhow]\nversion = \"1\"\n\n[dependencies.renamed]\npackage = \"orig\"\npath = \"../r\"\n\n[target.'cfg(unix)'.dependencies]\nlibc = \"0.2\"\n\n[features]\nnot_a_dependency = []\n";
+    let manifest = parse_cargo(cargo).unwrap();
     assert_eq!(
-        found,
+        deps(&manifest),
         vec![
-            "anyhow",
-            "libc",
-            "my-lib",
-            "origin",
-            "real_name",
-            "renamed",
-            "serde_json",
-            "tokio"
+            pair("anyhow", false),
+            pair("bar", false),
+            pair("devmap-store", true),
+            pair("foo", false),
+            pair("libc", false),
+            pair("local-pkg", true),
+            pair("my-lib", false),
+            pair("orig", true),
+            pair("origin", true),
+            pair("real_name", false),
+            pair("renamed", true),
+            pair("serde_json", false),
+            pair("tokio", false),
         ]
     );
+    assert_eq!(manifest.own_names, vec!["x-app"]);
+}
 
-    let go = "module x\n\ngo 1.22\n\nrequire (\n\tgolang.org/x/sync v0.1.0 // indirect\n\tgithub.com/stretchr/testify/v2 v2.0.0\n\tgopkg.in/yaml.v3 v3.0.1\n)\n\nrequire github.com/google/go-cmp v0.6.0\n";
-    let mut found = go_module_names(go);
-    found.sort();
-    assert_eq!(found, vec!["go-cmp", "sync", "testify", "yaml", "yaml.v3"]);
-
-    let npm = r#"{"name":"x","dependencies":{"react":"18"},"devDependencies":{"@scope/widgets":"1"},"peerDependencies":{"left-pad":"1"},"scripts":{"build":"x"}}"#;
-    let mut found = package_json_dependencies(npm);
-    found.sort();
+#[test]
+fn go_and_npm_manifests_name_their_dependencies_and_which_are_local() {
+    let go = "module example.com/x\n\ngo 1.22\n\nrequire (\n\tgolang.org/x/sync v0.1.0 // indirect\n\texample.com/localmod v1.0.0\n\tgithub.com/stretchr/testify/v2 v2.0.0\n\tgopkg.in/yaml.v3 v3.0.1\n)\n\nreplace example.com/localmod => ./localmod\n\nreplace (\n\tgithub.com/a/b v1 => ../b\n\tgithub.com/c/d => github.com/e/d v2\n)\n";
+    let manifest = parse_go_mod(go).unwrap();
     assert_eq!(
-        found,
-        vec!["@scope/widgets", "left-pad", "react", "widgets"]
+        deps(&manifest),
+        vec![
+            pair("b", true),
+            pair("d", false),
+            pair("localmod", false),
+            pair("localmod", true),
+            pair("sync", false),
+            pair("testify", false),
+            pair("yaml", false),
+            pair("yaml.v3", false),
+        ]
     );
-    assert!(package_json_dependencies("not json").is_empty());
+    assert_eq!(manifest.own_names, vec!["x"]);
+
+    let npm = r#"{"name":"web","dependencies":{"react":"18","shared":"workspace:*","loc":"file:../loc"},"devDependencies":{"@scope/widgets":"1"},"peerDependencies":{"left-pad":"1"},"scripts":{"build":"x"}}"#;
+    let manifest = parse_package_json(npm).unwrap();
+    assert_eq!(
+        deps(&manifest),
+        vec![
+            pair("@scope/widgets", false),
+            pair("left-pad", false),
+            pair("loc", true),
+            pair("react", false),
+            pair("shared", true),
+            pair("widgets", false),
+        ]
+    );
+    assert_eq!(manifest.own_names, vec!["web"]);
+}
+
+#[test]
+fn a_malformed_manifest_is_an_error_not_an_empty_declaration() {
+    assert!(parse_cargo("[dependencies\nfoo = \"1\"\n").is_err());
+    assert!(parse_cargo("[dependencies]\nfoo = { path = \"x\"\n").is_err());
+    assert!(parse_cargo("[dependencies]\nfoo = \"1\n").is_err());
+    assert!(parse_go_mod("require (\n\ta v1\n").is_err());
+    assert!(parse_go_mod("require a\n").is_err());
+    assert!(parse_package_json("{not json").is_err());
+    assert!(parse_package_json("[]").is_err());
+    // A multi-line string or array is not an error.
+    assert!(parse_cargo(
+        "[package]\nname = \"x\"\ndescription = \"\"\"a\nb\"\"\"\n[dependencies]\nf = [\n  1,\n]\n"
+    )
+    .is_ok());
 }
 
 #[cfg(feature = "parse")]
 #[test]
-fn external_means_declared_and_a_vanished_module_is_reported() {
+fn a_malformed_manifest_names_itself_in_the_walk() {
+    let f = fixture(
+        "malformed",
+        &[
+            ("a/package.json", "{not json"),
+            ("b/Cargo.toml", "[dependencies\nfoo = 1\n"),
+            ("c/go.mod", "require (\n\tx v1\n"),
+            ("docs/guide.md", "fine\n"),
+        ],
+    );
+    let report = run(&f);
+    let reason = report.walk_incomplete.as_deref().unwrap_or("");
+    assert!(reason.contains("3 manifest(s) are malformed"), "{reason}");
+    for file in ["a/package.json", "b/Cargo.toml", "c/go.mod"] {
+        assert!(reason.contains(file), "{file} not named in {reason}");
+    }
+}
+
+#[cfg(feature = "parse")]
+#[test]
+fn external_means_declared_and_nothing_of_the_repositorys_own_is_external() {
     let f = fixture(
         "declared",
         &[
             (
                 "Cargo.toml",
-                "[workspace.dependencies]\nserde_json = \"1\"\n[dependencies]\ntokio = \"1\"\nmy-lib = { package = \"real_name\" }\n[dev-dependencies.anyhow]\nversion = \"1\"\n[target.'cfg(unix)'.dependencies]\nlibc = \"0.2\"\n",
+                "[workspace.dependencies]\ndevmap-store = { path = \"devmap-store\" }\nstore = \"1\"\nlog = \"0.4\"\nserde_json = \"1\"\n[dependencies]\ntokio = \"1\"\n",
             ),
             (
-                "web/package.json",
-                "{\"dependencies\":{\"react\":\"18\"},\"devDependencies\":{\"@scope/widgets\":\"1\"}}",
+                "devmap-store/Cargo.toml",
+                "[package]\nname = \"devmap-store\"\n[dependencies]\nserde_json.workspace = true\ndevmap-store.workspace = true\n",
             ),
+            ("devmap-store/src/lib.rs", "pub struct Real;\n"),
             (
                 "go.mod",
-                "module x\nrequire (\n\tgolang.org/x/sync v0.1.0\n)\n",
+                "module x\nrequire example.com/localmod v1.0.0\nrequire golang.org/x/sync v0.1.0\nreplace example.com/localmod => ./localmod\n",
             ),
-            ("src/store.rs", "pub struct Store;\nimpl Store {\n    pub fn build() {}\n}\n"),
+            ("src/model.rs", "pub struct Store;\npub struct Log;\n"),
+            ("runtime/mod.rs", "pub fn spawn_task() {}\n"),
             (
                 "docs/guide.md",
-                "`serde_json::Value` `tokio::spawn()` `anyhow::Result` `my_lib::Thing()` `real_name::Other()` `libc::getpid()` `React.Component` `Widgets.Button` `Sync.Mutex` `std::fmt::Debug`\n\
-                 `oldmod::run_task()` `oldmod::RunTask` `undeclared_crate::Thing` `Store::missingMethod()` `Store::build`\n",
+                "`devmap_store::Gone()` `devmap_store::Real` `localmod.Gone()` `sync.Mutex` `Store::missingMethod()` `Log::gone_method()` `runtime::spawn_task()` `runtime::gone_task()` `template::render()` `tokio::spawn()` `serde_json::Value` `std::fmt::Debug` `oldmod::run_task()`\n",
             ),
         ],
     );
     let report = run(&f);
-    // Ten qualifiers are external by a positive fact: nine a manifest declares
-    // (a renamed dependency by either name) and `std`.
-    assert_eq!(skipped(&report, "external_qualifier"), 10, "{report:?}");
-    // A module nothing declares and nothing defines is a vanished module, not
-    // somebody else's code.
+    // External by a positive fact: declared and not the repository's own
+    // (`sync`, `tokio`, `serde_json`), the standard `std`, and `template`, a
+    // standard root of a language with nothing of that name here.
+    assert_eq!(skipped(&report, "external_qualifier"), 5, "{report:?}");
+    // Reported: a path dependency and a local `replace` are this repository's
+    // own code; a dependency named `store` or `log` is not `Store` or `Log`; a
+    // directory called `runtime` is not the Go standard library's; and a module
+    // nothing declares or defines is gone.
+    let names: Vec<String> = found(&report).into_iter().map(|f| f.3).collect();
+    assert_eq!(
+        names,
+        vec![
+            "devmap_store::Gone()",
+            "localmod.Gone()",
+            "Store::missingMethod()",
+            "Log::gone_method()",
+            "runtime::gone_task()",
+            "oldmod::run_task()",
+        ],
+        "{report:?}"
+    );
+}
+
+#[cfg(all(feature = "parse", unix))]
+#[test]
+fn resolution_follows_the_operating_system_not_the_path_as_written() {
+    let outside =
+        std::env::temp_dir().join(format!("devmap-doc-drift-probe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&outside);
+    std::fs::create_dir_all(outside.join("sub")).unwrap();
+    std::fs::write(outside.join("real.txt"), "host file\n").unwrap();
+
+    let f = fixture(
+        "probe",
+        &[
+            (
+                "docs/guide.md",
+                "[a](probe1) [b](probe2) [c](probe3) [d](probe4) [e](probe5)\n",
+            ),
+            ("ok.md", "# Ok\n"),
+            ("other/keep.md", "# Keep\n"),
+            ("docs/subdir/x.md", "# X\n"),
+        ],
+    );
+    let link = |target: &str, name: &str| {
+        std::os::unix::fs::symlink(target, f.root.join("docs").join(name)).unwrap();
+    };
+    link(&outside.join("sub").to_string_lossy(), "out");
+    // `out` leads to the host; `..` then applies to the host's directory, so
+    // the first points at a file that exists there and the second at one that
+    // does not. Neither may be told apart from the other.
+    link("out/../real.txt", "probe1");
+    link("out/../nope_xyz_123", "probe2");
+    // Inside the repository the same shapes are judged: a missing target is
+    // missing, and `inner/..` is the physical parent of where `inner` leads,
+    // the repository root, where `ok.md` exists.
+    link("../other", "inner");
+    link("inner/../nowhere.md", "probe3");
+    link("inner/../ok.md", "probe4");
+    link("subdir/../subdir/x.md", "probe5");
+
+    let report = run(&f);
+    let _ = std::fs::remove_dir_all(&outside);
     assert_eq!(
         found(&report),
-        vec![
+        vec![("docs/guide.md".into(), 1, "missing_file", "probe3".into())],
+        "{report:?}"
+    );
+    assert_eq!(skipped(&report, "outside_repo"), 2, "{report:?}");
+}
+
+#[test]
+fn a_heading_that_cannot_be_rendered_in_bounds_makes_the_anchors_incomplete() {
+    let long_destination = format!("# Intro [link](http://x/{}) Heading\n", "a".repeat(600));
+    let found = heading_anchors(&long_destination, None).unwrap();
+    assert!(found.incomplete, "{found:?}");
+    assert!(
+        found.slugs.is_empty(),
+        "a wrong slug must not be entered: {found:?}"
+    );
+
+    let long_tag = format!("# <a href=\"{}\"> Tag\n", "b".repeat(300));
+    assert!(heading_anchors(&long_tag, None).unwrap().incomplete);
+
+    // Ordinary headings with links and tags are complete.
+    let fine = heading_anchors("# See [docs](x.md) and <b>bold</b>\n", None).unwrap();
+    assert!(!fine.incomplete);
+    assert!(fine.slugs.contains("see-docs-and-bold"), "{fine:?}");
+}
+
+#[cfg(feature = "parse")]
+#[test]
+fn an_anchor_into_an_unrenderable_heading_is_skipped_not_reported() {
+    let f = fixture(
+        "long-destination",
+        &[
             (
-                "docs/guide.md".into(),
-                2,
-                "missing_symbol",
-                "oldmod::run_task()".into()
+                "docs/guide.md",
+                "[a](t.md#intro-link-heading) [b](t.md#other)\n",
             ),
             (
-                "docs/guide.md".into(),
-                2,
-                "missing_symbol",
-                "oldmod::RunTask".into()
-            ),
-            (
-                "docs/guide.md".into(),
-                2,
-                "missing_symbol",
-                "undeclared_crate::Thing".into()
-            ),
-            (
-                "docs/guide.md".into(),
-                2,
-                "missing_symbol",
-                "Store::missingMethod()".into()
+                "docs/t.md",
+                &format!("# Intro [link](http://x/{}) Heading\n", "a".repeat(600)),
             ),
         ],
+    );
+    let report = run(&f);
+    assert_eq!(found(&report), Vec::new(), "{report:?}");
+    assert_eq!(skipped(&report, "anchor_target_unscanned"), 2, "{report:?}");
+    assert!(
+        report
+            .walk_incomplete
+            .as_deref()
+            .is_some_and(|r| r.contains("may hold the heading")),
         "{report:?}"
     );
 }

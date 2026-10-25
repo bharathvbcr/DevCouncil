@@ -68,16 +68,31 @@
 //!   reported: a stale qualifier cannot be told from a spelling the extractor
 //!   does not share. For a link, a symbol defined in the target file under
 //!   another owner is the same skip.
-//! * **`external_qualifier`** is a positive fact: the qualifier's first segment
-//!   is a dependency the repository's manifests declare (`Cargo.toml` tables
-//!   incl. renamed `package =`, `go.mod` requires, `package.json`
-//!   dependencies, read from indexed files only, at most 256) or a language
-//!   standard root listed in the code. `oldmod::run_task`, where nothing
-//!   declares or defines `oldmod`, is a vanished module and `missing_symbol`.
-//! * **Backslash targets** are `backslash_path`, never resolved. A symlink's
-//!   target is judged where it lands: inside the repo at nothing is
-//!   `missing_file`, outside or a loop is `outside_repo`. A directive counts
-//!   only on a prose line (not fenced, not indented code, not in a comment).
+//! * **`external_qualifier`** is a positive fact, and never the repository's own
+//!   code. The qualifier's first segment (compared as written, `-` read as `_`,
+//!   so `Store` is not `store`) is a dependency the repository's manifests
+//!   declare (`Cargo.toml` tables incl. `name.workspace = true` and renamed
+//!   `package =`, `go.mod` requires, `package.json` dependencies; indexed files
+//!   only, at most 256; a malformed one is named in `walk_incomplete`), or a
+//!   standard root listed in the code. A dependency that resolves into the
+//!   repository (`path =`, a `replace` to a local directory, a `file:` or
+//!   `workspace:` package) is not external, and a qualifier that names a symbol,
+//!   directory, file stem or crate of the repository is never external, whatever
+//!   dependency or standard root shares the name. `oldmod::run_task`, where
+//!   nothing declares or defines `oldmod`, is a vanished module and
+//!   `missing_symbol`.
+//! * **Symlinks are resolved the way the operating system resolves them**, a
+//!   component at a time, `..` applying to the physical directory a link led to.
+//!   The moment a step leaves the repository, or after 40 links, the answer is
+//!   `outside_repo` and nothing further is looked at, so the report cannot tell
+//!   a host path that exists from one that does not. Inside, a missing
+//!   component, a dangling link included, is `missing_file`. An absolute target
+//!   is judged lexically against the root as indexed or canonical.
+//! * **Backslash targets** are `backslash_path`, never resolved. A directive
+//!   counts only on a prose line (not fenced, not indented code, not in a
+//!   comment). A heading that cannot be rendered within bounds (a link
+//!   destination past the lookahead, a tag too long to close) makes its
+//!   document's anchors incomplete rather than yielding a wrong slug.
 //! * **Spans and links differ on a missing top-level directory.** A link is
 //!   resolved against its document, so a missing target is certainly broken:
 //!   `[main](oldpkg/main.go)` is `missing_file`. A span's root is ambiguous, so
@@ -160,6 +175,9 @@ pub const MAX_FINDINGS: usize = 10_000;
 const LINK_LOOKAHEAD: usize = 512;
 /// Target facts kept between references.
 const TARGET_CACHE_CAP: usize = 512;
+/// Symlinks followed to resolve one path before it is called a loop (the
+/// operating system's own limit is 40 on Linux).
+const MAX_LINK_HOPS: usize = 40;
 /// Source bytes the word search for unindexed names reads at most.
 const MAX_WORD_SEARCH_BYTES: u64 = 64 * 1024 * 1024;
 /// Directory prefixes left out unless asked for by name: archived documents
@@ -181,98 +199,46 @@ const DOC_EXTENSIONS: [&str; 12] = [
 ];
 
 /// Qualifier roots that are no code of this repository by the language's own
-/// definition, listed here so "external" is a fact and not a guess. Everything
-/// else is external only when a manifest declares it (see
-/// [`declared_dependencies`]); a name nothing declares and nothing defines is
-/// `missing_symbol`.
-///
-/// * Rust: the standard roots and the tool namespaces that qualify lints.
-/// * Go: the standard library's top-level packages (a bounded list, not every
-///   package).
-/// * JS and TS: the language's global objects; Node built-ins are written with
-///   a `node:` prefix, which is not an identifier and never reaches here.
-/// * Relative roots (`self`, `Self`, `this`, `crate`, `super`) name the current
-///   scope, which a document cannot pin down.
-const STANDARD_ROOTS: &[&str] = &[
-    // Rust
+/// definition, skipped as soon as they are read. Deliberately few and
+/// unambiguous: the Rust standard roots and lint namespaces, and the relative
+/// roots (`self`, `Self`, `this`, `crate`, `super`) that name the current scope,
+/// which a document cannot pin down.
+const UNAMBIGUOUS_ROOTS: &[&str] = &[
     "std",
     "core",
     "alloc",
     "proc_macro",
-    "test",
-    "Vec",
-    "Option",
-    "Result",
     "clippy",
     "rustc",
     "rustfmt",
-    // Go standard library, top level
-    "fmt",
-    "os",
-    "io",
-    "fs",
-    "sys",
-    "bufio",
-    "bytes",
-    "strings",
-    "strconv",
-    "errors",
-    "time",
-    "context",
-    "sync",
-    "sort",
-    "math",
-    "regexp",
-    "path",
-    "filepath",
-    "net",
-    "http",
-    "json",
-    "log",
-    "flag",
-    "reflect",
-    "runtime",
-    "testing",
-    "unicode",
-    "unsafe",
-    "embed",
-    "slog",
-    "maps",
-    "slices",
-    "cmp",
-    "crypto",
-    "hash",
-    "binary",
-    "base64",
-    "hex",
-    "csv",
-    "xml",
-    "html",
-    "template",
-    "url",
-    "exec",
-    "signal",
-    "syscall",
-    "atomic",
-    "rand",
-    "utf8",
-    "ioutil",
-    // JS and TS globals
-    "console",
-    "process",
-    "window",
-    "document",
-    "Math",
-    "JSON",
-    "Object",
-    "Array",
-    // Relative roots
     "self",
     "Self",
     "this",
     "crate",
     "super",
 ];
+
+/// Roots that are standard in some language but are also ordinary words for a
+/// module: the Rust `test` crate, the top-level packages of the Go standard
+/// library (a bounded list), the JS and TS global objects, and Rust's prelude
+/// types. They are external only when the repository has nothing of that name:
+/// no symbol, directory, file stem or crate called `runtime` makes
+/// `runtime::spawn` the standard library's. Node built-ins are written with a
+/// `node:` prefix, which is not an identifier and never reaches here.
+const AMBIGUOUS_ROOTS: &[&str] = &[
+    "test", "Vec", "Option", "Result", "fmt", "os", "io", "fs", "sys", "bufio", "bytes", "strings",
+    "strconv", "errors", "time", "context", "sync", "sort", "math", "regexp", "path", "filepath",
+    "net", "http", "json", "log", "flag", "reflect", "runtime", "testing", "unicode", "unsafe",
+    "embed", "slog", "maps", "slices", "cmp", "crypto", "hash", "binary", "base64", "hex", "csv",
+    "xml", "html", "template", "url", "exec", "signal", "syscall", "atomic", "rand", "utf8",
+    "ioutil", "console", "process", "window", "document", "Math", "JSON", "Object", "Array",
+];
+
+/// A crate, module or package name as the language compares it: `-` is `_`,
+/// and case counts (`Store` is not `store`).
+fn crate_key(name: &str) -> String {
+    name.replace('-', "_")
+}
 
 /// Product and language names that are PascalCase without being symbols.
 const KNOWN_TERMS: [&str; 30] = [
@@ -625,13 +591,15 @@ fn entity(rest: &[char]) -> Option<(char, usize)> {
 /// go, entities decode, a backslash escape is its character. `_` is an
 /// emphasis delimiter only when a flanking pair matches (`_Emphasis_`, the
 /// `__` of `__init__`); inside a word (`snake_case`) it stays.
-fn heading_text(heading: &str) -> String {
+fn heading_text(heading: &str) -> (String, bool) {
     let src: Vec<char> = heading.trim().chars().collect();
     let mut out: Vec<char> = Vec::with_capacity(src.len());
     // (index into `out`, can open, can close)
     let mut underscores: Vec<(usize, bool, bool)> = Vec::new();
     let mut unclosed: u64 = 0;
     let mut budget = src.len() * 32 + 4096;
+    let mut gave_up = false;
+    let last_gt = src.iter().rposition(|c| *c == '>');
     let mut i = 0;
     while i < src.len() {
         let ch = src[i];
@@ -708,6 +676,13 @@ fn heading_text(heading: &str) -> String {
                 match end {
                     Some(j) => i = j + 1,
                     None => {
+                        // Stopped by the window or the allowance, not by the end
+                        // of the heading: this may well be a link whose
+                        // destination is long, and then the text is not what
+                        // was rendered here.
+                        if j < src.len() {
+                            gave_up = true;
+                        }
                         out.push(ch);
                         i += 1;
                     }
@@ -722,15 +697,19 @@ fn heading_text(heading: &str) -> String {
                 } else {
                     None
                 };
+                let taglike = src
+                    .get(i + 1)
+                    .is_some_and(|c| c.is_alphabetic() || *c == '/');
                 match found {
-                    Some(offset)
-                        if src
-                            .get(i + 1)
-                            .is_some_and(|c| c.is_alphabetic() || *c == '/') =>
-                    {
+                    Some(offset) if taglike => {
                         i += offset + 1;
                     }
                     _ => {
+                        // A tag that does not close within what was looked at,
+                        // though a `>` follows: its text is unknown.
+                        if taglike && last_gt.is_some_and(|gt| gt >= i + 256 || gt > i + reach) {
+                            gave_up = true;
+                        }
                         out.push(ch);
                         i += 1;
                     }
@@ -779,11 +758,13 @@ fn heading_text(heading: &str) -> String {
             open.push(at);
         }
     }
-    out.iter()
+    let text = out
+        .iter()
         .enumerate()
         .filter(|(at, _)| !dropped.contains(at))
         .map(|(_, c)| *c)
-        .collect()
+        .collect();
+    (text, gave_up)
 }
 
 /// Combining marks, which github-slugger keeps (`\p{M}`).
@@ -798,16 +779,21 @@ fn is_mark(ch: char) -> bool {
 /// rendered text lowercased, everything but letters, marks, numbers, `-` and
 /// `_` removed, and each ASCII space a `-`. Nothing is collapsed or trimmed:
 /// `Tom & Jerry` is `tom--jerry`.
-fn slugify(heading: &str) -> String {
+///
+/// The flag is true when the heading could not be rendered within its bounds
+/// (a link destination past the lookahead window, a tag too long to close, or
+/// the allowance spent): the slug is then not trustworthy.
+fn slugify(heading: &str) -> (String, bool) {
+    let (text, gave_up) = heading_text(heading);
     let mut slug = String::new();
-    for ch in heading_text(heading).chars() {
+    for ch in text.chars() {
         if ch == ' ' {
             slug.push('-');
         } else if ch == '-' || ch == '_' || ch.is_alphanumeric() || is_mark(ch) {
             slug.extend(ch.to_lowercase());
         }
     }
-    slug
+    (slug, gave_up)
 }
 
 /// The anchors named by `id="…"` and `name="…"` attributes of the HTML tags on
@@ -928,8 +914,13 @@ pub struct Anchors {
 pub fn heading_anchors(text: &str, cancel: Option<&Cancel>) -> Result<Anchors, QueryCancelled> {
     let mut anchors = Anchors::default();
     let mut occurrences: HashMap<String, u32> = HashMap::new();
-    let mut add = |heading: &str, slugs: &mut BTreeSet<String>| {
-        let original = slugify(heading);
+    // Returns true when the heading could not be rendered within bounds: its
+    // slug is then not entered, and the set is incomplete.
+    let mut add = |heading: &str, slugs: &mut BTreeSet<String>| -> bool {
+        let (original, gave_up) = slugify(heading);
+        if gave_up {
+            return true;
+        }
         let mut slug = original.clone();
         while occurrences.contains_key(&slug) {
             let count = occurrences.entry(original.clone()).or_insert(0);
@@ -938,6 +929,7 @@ pub fn heading_anchors(text: &str, cancel: Option<&Cancel>) -> Result<Anchors, Q
         }
         occurrences.insert(slug.clone(), 0);
         slugs.insert(slug);
+        false
     };
     let (lines, _) = prose_lines(text, cancel)?;
     let mut paragraph: Option<String> = None;
@@ -959,7 +951,7 @@ pub fn heading_anchors(text: &str, cancel: Option<&Cancel>) -> Result<Anchors, Q
         }
         tag_anchors(&line.text, &mut anchors.slugs);
         if let Some(heading) = atx_heading(peeled) {
-            add(heading, &mut anchors.slugs);
+            anchors.incomplete |= add(heading, &mut anchors.slugs);
             paragraph = None;
             previous = None;
             continue;
@@ -971,7 +963,7 @@ pub fn heading_anchors(text: &str, cancel: Option<&Cancel>) -> Result<Anchors, Q
             }
             if consecutive.is_some() {
                 if let Some(heading) = paragraph.take() {
-                    add(&heading, &mut anchors.slugs);
+                    anchors.incomplete |= add(&heading, &mut anchors.slugs);
                     previous = None;
                     continue;
                 }
@@ -1188,7 +1180,7 @@ fn classify_symbol(span: &str) -> Classified {
         .iter()
         .map(|s| (*s).to_string())
         .collect();
-    if segments.len() > 1 && STANDARD_ROOTS.contains(&segments[0]) {
+    if segments.len() > 1 && UNAMBIGUOUS_ROOTS.contains(&segments[0]) {
         return Classified::Skip("external_qualifier");
     }
     if KNOWN_TERMS.contains(&body) {
@@ -1767,6 +1759,11 @@ struct Resolver<'a> {
     /// qualifier in it names somebody else's code: that is a fact the
     /// manifests state. Nothing else is external.
     declared: HashSet<String>,
+    /// Names of the repository's own code, as written; see `load_declared`.
+    in_repo: HashSet<String>,
+    /// The root as the index recorded it, when that differs from the canonical
+    /// path: absolute link targets may be written either way.
+    root_aliases: Vec<String>,
     /// Symbols the index does not define, awaiting the word search.
     pending: Vec<PendingSymbol>,
 }
@@ -1821,38 +1818,81 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    /// What `rel` is on disk, walking it one component at a time so a link
-    /// that leaves the repository is refused before anything past it is looked
-    /// at. `rel` is normalised and relative to the root.
+    /// What `rel` is on disk, resolved the way the operating system resolves
+    /// it, one component at a time from the root, and never looking past the
+    /// repository.
+    ///
+    /// `current` is always a physical path inside the root. A symlink met on
+    /// the way is replaced by its target: a relative one pushes its components
+    /// in front of what is left (so a later `..` applies to the physical
+    /// directory the link led to, not to the path as written), an absolute one
+    /// must itself lie under the root. The moment a step would leave the root,
+    /// or after [`MAX_LINK_HOPS`] links, the answer is `Outside` and nothing
+    /// further is stat'd: whether a path exists past that point is a fact about
+    /// the host. A component that does not exist inside the repository is
+    /// `Missing`, a dangling link included. `rel` is relative to the root.
     fn state(&self, rel: &str) -> PathState {
+        use std::collections::VecDeque;
+        let mut queue: VecDeque<String> = rel
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .map(str::to_string)
+            .collect();
         let mut current = self.root.to_path_buf();
-        let mut parts = rel.split('/').filter(|part| !part.is_empty()).peekable();
-        while let Some(part) = parts.next() {
-            current.push(part);
-            let Ok(meta) = std::fs::symlink_metadata(&current) else {
+        let mut hops = 0usize;
+        while let Some(part) = queue.pop_front() {
+            if part == "." {
+                continue;
+            }
+            if part == ".." {
+                if current == self.root {
+                    return PathState::Outside;
+                }
+                current.pop();
+                continue;
+            }
+            let next = current.join(&part);
+            let Ok(meta) = std::fs::symlink_metadata(&next) else {
                 return PathState::Missing;
             };
-            let meta = if meta.file_type().is_symlink() {
-                match current.canonicalize() {
-                    Ok(real) if real.starts_with(self.root) => match std::fs::metadata(&real) {
-                        Ok(meta) => {
-                            current = real;
-                            meta
-                        }
-                        Err(_) => return PathState::Missing,
-                    },
-                    // Dangling: judged by where it points, so a link into the
-                    // repository at nothing is missing, not unreadable.
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        return self.dangling(&current);
-                    }
-                    // Out of the tree, or a loop: not followed.
-                    _ => return PathState::Outside,
+            if meta.file_type().is_symlink() {
+                hops += 1;
+                if hops > MAX_LINK_HOPS {
+                    return PathState::Outside;
                 }
-            } else {
-                meta
-            };
-            if parts.peek().is_none() {
+                let Ok(target) = std::fs::read_link(&next) else {
+                    return PathState::Outside;
+                };
+                let target = target.to_string_lossy().replace('\\', "/");
+                if target.starts_with('/') {
+                    // Absolute: only a target under the root is looked at, and
+                    // it is judged lexically, so no host path is stat'd.
+                    // The root is known by its canonical path and by the path the
+                    // index recorded, which may go through a link (`/var` for
+                    // `/private/var`); a target written either way is inside.
+                    let canonical = self.root.to_string_lossy().replace('\\', "/");
+                    let inside = std::iter::once(&canonical)
+                        .chain(self.root_aliases.iter())
+                        .find_map(|root| {
+                            target
+                                .strip_prefix(root.as_str())
+                                .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+                        });
+                    let Some(inside) = inside else {
+                        return PathState::Outside;
+                    };
+                    current = self.root.to_path_buf();
+                    for component in inside.rsplit('/').filter(|c| !c.is_empty()) {
+                        queue.push_front(component.to_string());
+                    }
+                } else {
+                    for component in target.rsplit('/').filter(|c| !c.is_empty()) {
+                        queue.push_front(component.to_string());
+                    }
+                }
+                continue;
+            }
+            if queue.iter().all(|rest| rest == ".") {
                 return if meta.is_dir() {
                     PathState::Dir
                 } else {
@@ -1862,48 +1902,9 @@ impl<'a> Resolver<'a> {
             if !meta.is_dir() {
                 return PathState::Missing;
             }
+            current = next;
         }
         PathState::Dir
-    }
-
-    /// A symlink whose target does not exist. Missing when it points inside the
-    /// repository, outside otherwise: the nearest ancestor of the (lexically
-    /// normalised) target that does exist decides, because that is the part of
-    /// the host the link would have us look at.
-    fn dangling(&self, link: &Path) -> PathState {
-        use std::path::Component;
-        let Ok(target) = std::fs::read_link(link) else {
-            return PathState::Outside;
-        };
-        let joined = if target.is_absolute() {
-            target
-        } else {
-            link.parent().unwrap_or(self.root).join(target)
-        };
-        let mut normal = std::path::PathBuf::new();
-        for component in joined.components() {
-            match component {
-                Component::ParentDir => {
-                    normal.pop();
-                }
-                Component::CurDir => {}
-                other => normal.push(other.as_os_str()),
-            }
-        }
-        let mut ancestor = normal.as_path();
-        loop {
-            if let Ok(real) = ancestor.canonicalize() {
-                return if real.starts_with(self.root) && normal.starts_with(self.root) {
-                    PathState::Missing
-                } else {
-                    PathState::Outside
-                };
-            }
-            match ancestor.parent() {
-                Some(parent) => ancestor = parent,
-                None => return PathState::Outside,
-            }
-        }
     }
 
     /// `rel` with its links resolved, relative to the root. `None` when it does
@@ -2041,7 +2042,13 @@ impl<'a> Resolver<'a> {
         // absence from the index is no drift. A qualifier nothing declares and
         // nothing defines (`oldmod::run_task`) is a deleted or renamed module.
         if let Some(first) = qualifier.first() {
-            if self.declared.contains(&normalise_segment(first)) {
+            let key = crate_key(first);
+            // Never external when it names this repository's own crate, module
+            // directory, file stem or symbol, whatever a dependency or a
+            // standard root shares the name with.
+            if !self.in_repo.contains(&key)
+                && (self.declared.contains(&key) || AMBIGUOUS_ROOTS.contains(&first.as_str()))
+            {
                 self.skip("external_qualifier");
                 return;
             }
@@ -2291,20 +2298,28 @@ impl<'a> Resolver<'a> {
     }
 
     /// Read the indexed `Cargo.toml`, `go.mod` and `package.json` files, at most
-    /// [`MAX_MANIFESTS`], and collect what they declare. Secret paths are not
-    /// read. Returns a `walk_incomplete` reason when a manifest could not be
-    /// read or the bound cut the list: a dependency it declares would then be
-    /// reported as a missing module.
+    /// [`MAX_MANIFESTS`], and work out which names are external and which are
+    /// the repository's own.
+    ///
+    /// External (`declared`): a dependency some manifest declares that no
+    /// manifest resolves to a directory of this repository. Own (`in_repo`):
+    /// every symbol name, directory name, file stem and manifest-given name,
+    /// compared as written (case-sensitive, `-` read as `_`). Secret paths are
+    /// not read. Returns a `walk_incomplete` reason when a manifest could not be
+    /// read, is malformed (and so declares nothing), or the bound cut the list:
+    /// a dependency it declares would then be reported as a missing module.
     fn load_declared(&mut self, files: &[(String, String)]) -> anyhow::Result<Option<String>> {
         let mut read = 0usize;
-        let mut unreadable = 0u32;
+        let mut unreadable: Vec<&str> = Vec::new();
+        let mut malformed: Vec<String> = Vec::new();
         let mut cut = false;
+        let mut dependencies: Vec<Dependency> = Vec::new();
         for (path, _) in files {
             let name = path.rsplit('/').next().unwrap_or(path);
-            let parse: fn(&str) -> Vec<String> = match name {
-                "Cargo.toml" => cargo_dependencies,
-                "go.mod" => go_module_names,
-                "package.json" => package_json_dependencies,
+            let parse: fn(&str) -> Result<Manifest, String> = match name {
+                "Cargo.toml" => parse_cargo,
+                "go.mod" => parse_go_mod,
+                "package.json" => parse_package_json,
                 _ => continue,
             };
             if self.is_secret(path) {
@@ -2316,17 +2331,47 @@ impl<'a> Resolver<'a> {
             }
             self.cancel.check()?;
             read += 1;
-            match devmap_extract::safe_fs::read_repo_source(
+            let text = match devmap_extract::safe_fs::read_repo_source(
                 Some(self.root),
                 path,
                 devmap_extract::MAX_SOURCE_BYTES,
             ) {
-                Ok(text) => {
-                    for dependency in parse(&text) {
-                        self.declared.insert(normalise_segment(&dependency));
+                Ok(text) => text,
+                Err(_) => {
+                    unreadable.push(path);
+                    continue;
+                }
+            };
+            match parse(&text) {
+                Ok(manifest) => {
+                    dependencies.extend(manifest.dependencies);
+                    for own in manifest.own_names {
+                        self.in_repo.insert(crate_key(&own));
                     }
                 }
-                Err(_) => unreadable += 1,
+                Err(why) => malformed.push(format!("{path} ({why})")),
+            }
+        }
+        let local: HashSet<String> = dependencies
+            .iter()
+            .filter(|d| d.local)
+            .map(|d| crate_key(&d.name))
+            .collect();
+        for dependency in &dependencies {
+            let key = crate_key(&dependency.name);
+            if !local.contains(&key) {
+                self.declared.insert(key);
+            }
+        }
+        for name in self.by_name.keys() {
+            self.in_repo.insert((*name).to_string());
+        }
+        for path in self.languages.keys() {
+            for part in path.split('/') {
+                self.in_repo.insert(crate_key(part));
+                if let Some((stem, _)) = part.rsplit_once('.') {
+                    self.in_repo.insert(crate_key(stem));
+                }
             }
         }
         let mut reasons = Vec::new();
@@ -2335,9 +2380,18 @@ impl<'a> Resolver<'a> {
                 "manifest bound of {MAX_MANIFESTS} cut the list; dependencies in the rest are not recognised as external"
             ));
         }
-        if unreadable > 0 {
+        if !unreadable.is_empty() {
             reasons.push(format!(
-                "{unreadable} manifest(s) could not be read; a dependency one declares may be reported as a missing module"
+                "{} manifest(s) could not be read ({}); a dependency one declares may be reported as a missing module",
+                unreadable.len(),
+                unreadable.join(", ")
+            ));
+        }
+        if !malformed.is_empty() {
+            reasons.push(format!(
+                "{} manifest(s) are malformed and declare nothing: {}",
+                malformed.len(),
+                malformed.join(", ")
             ));
         }
         Ok((!reasons.is_empty()).then(|| reasons.join("; ")))
@@ -2609,6 +2663,24 @@ fn path_suffixes(paths: impl Iterator<Item = impl AsRef<str>>) -> HashSet<String
 /// Manifests read per call.
 const MAX_MANIFESTS: usize = 256;
 
+/// One dependency a manifest declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dependency {
+    pub name: String,
+    /// It resolves to a directory of this repository (a path dependency, a
+    /// `replace` to a local directory, a `file:` or `workspace:` package), so
+    /// it is the repository's own code and not external.
+    pub local: bool,
+}
+
+/// What a manifest says about names.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Manifest {
+    pub dependencies: Vec<Dependency>,
+    /// Names the manifest gives the code it describes: crate, module, package.
+    pub own_names: Vec<String>,
+}
+
 /// The text of a quoted TOML string that starts `text` (after whitespace).
 fn quoted(text: &str) -> Option<&str> {
     let text = text.trim_start();
@@ -2622,146 +2694,341 @@ fn toml_key(key: &str) -> &str {
     key.trim().trim_matches(['"', '\''])
 }
 
-/// Dependency names a `Cargo.toml` declares: the keys of `[dependencies]`,
-/// `[dev-dependencies]`, `[build-dependencies]`, `[workspace.dependencies]` and
-/// their `[target.….dependencies]` forms, the `[dependencies.name]` sub-table
-/// form, and the real crate behind a renamed dependency (`package = "…"`).
-/// Line-based, which is exact for the shapes Cargo itself writes.
-pub fn cargo_dependencies(text: &str) -> Vec<String> {
-    enum Section {
-        None,
-        Table,
-        Named,
+/// The text after `key =` in an inline table (`{ path = "x", package = "y" }`).
+fn inline_value<'a>(value: &'a str, key: &str) -> Option<&'a str> {
+    let mut from = 0;
+    while let Some(at) = value[from..].find(key) {
+        let start = from + at;
+        let end = start + key.len();
+        let before = value[..start].trim_end().chars().last();
+        let after = value[end..].trim_start();
+        if matches!(before, None | Some('{') | Some(',')) && after.starts_with('=') {
+            return Some(after[1..].trim_start());
+        }
+        from = end;
     }
+    None
+}
+
+/// Whether one TOML line closes every quote and brace it opens. A line with a
+/// multi-line string is not judged.
+fn toml_line_balanced(line: &str) -> bool {
+    if line.contains("\"\"\"") || line.contains("'''") {
+        return true;
+    }
+    let mut quote: Option<char> = None;
+    let mut depth = 0i32;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                if c == '\\' && q == '"' {
+                    chars.next();
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '"' | '\'' => quote = Some(c),
+                '#' => break,
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            },
+        }
+    }
+    quote.is_none() && depth == 0
+}
+
+/// A `Cargo.toml`: the keys of `[dependencies]`, `[dev-dependencies]`,
+/// `[build-dependencies]`, `[workspace.dependencies]` and their
+/// `[target.….dependencies]` forms, the `[dependencies.name]` sub-table form and
+/// the dotted `name.workspace = true` form, with the real crate behind a
+/// renamed one (`package = "…"`), and which of them are `path` dependencies.
+/// Line-based, exact for the shapes Cargo itself writes; a line that cannot be
+/// read (an unclosed header, quote or brace) makes the manifest malformed.
+pub fn parse_cargo(text: &str) -> Result<Manifest, String> {
     const KINDS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
-    let mut names = Vec::new();
-    let mut section = Section::None;
-    for line in text.lines() {
+    enum Section {
+        Other,
+        Package,
+        Table,
+        Named(Vec<usize>),
+    }
+    let mut manifest = Manifest::default();
+    let mut section = Section::Other;
+    for (index, line) in text.lines().enumerate() {
+        let number = index + 1;
         let line = line.trim();
         if line.starts_with('#') || line.is_empty() {
             continue;
         }
         if let Some(header) = line.strip_prefix('[') {
             let header = header.trim_start_matches('[');
-            let header = header.split(']').next().unwrap_or("").trim();
-            section = Section::None;
-            if header == "workspace.dependencies"
+            let Some((header, _)) = header.split_once(']') else {
+                return Err(format!("line {number}: a table header is not closed"));
+            };
+            let header = header.trim();
+            section = Section::Other;
+            if header == "package" {
+                section = Section::Package;
+            } else if header == "workspace.dependencies"
                 || KINDS
                     .iter()
                     .any(|kind| header == *kind || header.ends_with(&format!(".{kind}")))
             {
                 section = Section::Table;
-                continue;
-            }
-            for kind in KINDS {
-                let named = header
-                    .strip_prefix(&format!("{kind}."))
-                    .or_else(|| {
-                        header
-                            .find(&format!(".{kind}."))
-                            .map(|at| &header[at + kind.len() + 2..])
-                    })
-                    .or_else(|| header.strip_prefix("workspace.dependencies."));
-                if let Some(name) = named {
-                    names.push(toml_key(name).to_string());
-                    section = Section::Named;
-                    break;
+            } else {
+                for kind in KINDS {
+                    let named = header
+                        .strip_prefix(&format!("{kind}."))
+                        .or_else(|| {
+                            header
+                                .find(&format!(".{kind}."))
+                                .map(|at| &header[at + kind.len() + 2..])
+                        })
+                        .or_else(|| header.strip_prefix("workspace.dependencies."));
+                    if let Some(name) = named {
+                        manifest.dependencies.push(Dependency {
+                            name: toml_key(name).to_string(),
+                            local: false,
+                        });
+                        section = Section::Named(vec![manifest.dependencies.len() - 1]);
+                        break;
+                    }
                 }
             }
             continue;
+        }
+        if !toml_line_balanced(line) {
+            return Err(format!("line {number}: a quote or brace is not closed"));
         }
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        match section {
+        let key = toml_key(key);
+        match &mut section {
+            Section::Package if key == "name" => {
+                if let Some(name) = quoted(value) {
+                    manifest.own_names.push(name.to_string());
+                }
+            }
             Section::Table => {
-                names.push(toml_key(key).to_string());
-                if let Some(at) = value.find("package") {
-                    let after = value[at + "package".len()..].trim_start();
-                    if let Some(real) = after.strip_prefix('=').and_then(quoted) {
-                        names.push(real.to_string());
+                if let Some((name, attribute)) = key.split_once('.') {
+                    // `name.workspace = true`, `name.path = "…"`, `name.package = "…"`.
+                    let (name, attribute) = (toml_key(name), toml_key(attribute));
+                    match attribute {
+                        "package" => {
+                            if let Some(real) = quoted(value) {
+                                manifest.dependencies.push(Dependency {
+                                    name: real.to_string(),
+                                    local: false,
+                                });
+                            }
+                        }
+                        _ => manifest.dependencies.push(Dependency {
+                            name: name.to_string(),
+                            local: attribute == "path",
+                        }),
+                    }
+                    continue;
+                }
+                let local = inline_value(value, "path").is_some();
+                manifest.dependencies.push(Dependency {
+                    name: key.to_string(),
+                    local,
+                });
+                if let Some(real) = inline_value(value, "package").and_then(quoted) {
+                    manifest.dependencies.push(Dependency {
+                        name: real.to_string(),
+                        local,
+                    });
+                }
+            }
+            Section::Named(group) => match key {
+                "path" => {
+                    for at in group.iter() {
+                        manifest.dependencies[*at].local = true;
                     }
                 }
-            }
-            Section::Named if toml_key(key) == "package" => {
-                if let Some(real) = quoted(value) {
-                    names.push(real.to_string());
+                "package" => {
+                    if let Some(real) = quoted(value) {
+                        let local = manifest.dependencies[group[0]].local;
+                        manifest.dependencies.push(Dependency {
+                            name: real.to_string(),
+                            local,
+                        });
+                        group.push(manifest.dependencies.len() - 1);
+                    }
                 }
-            }
+                _ => {}
+            },
             _ => {}
         }
     }
-    names.retain(|name| !name.is_empty());
-    names
+    manifest.dependencies.retain(|d| !d.name.is_empty());
+    Ok(manifest)
 }
 
-/// The names a `go.mod` makes importable: each required module path's last
-/// element, without a `/vN` major-version tail or a `.vN` suffix, and the
-/// element before a `/vN`.
-pub fn go_module_names(text: &str) -> Vec<String> {
-    let mut paths: Vec<&str> = Vec::new();
-    let mut in_block = false;
-    for line in text.lines() {
-        let line = line.split("//").next().unwrap_or("").trim();
-        if in_block {
-            if line.starts_with(')') {
-                in_block = false;
-            } else if let Some(path) = line.split_whitespace().next() {
-                paths.push(path);
-            }
-        } else if let Some(rest) = line.strip_prefix("require") {
-            let rest = rest.trim();
-            if rest.starts_with('(') {
-                in_block = true;
-            } else if let Some(path) = rest.split_whitespace().next() {
-                paths.push(path);
-            }
-        }
-    }
+/// The names a Go module path makes importable: its last element, without a
+/// `/vN` major-version tail or a `.vN` suffix, and the element before a `/vN`.
+fn go_names(path: &str) -> Vec<String> {
     let is_major = |part: &str| {
         part.len() > 1 && part.starts_with('v') && part[1..].chars().all(|c| c.is_ascii_digit())
     };
+    let mut parts: Vec<&str> = path.split('/').collect();
+    while parts.len() > 1 && parts.last().is_some_and(|last| is_major(last)) {
+        parts.pop();
+    }
     let mut names = Vec::new();
-    for path in paths {
-        let mut parts: Vec<&str> = path.split('/').collect();
-        while parts.len() > 1 && parts.last().is_some_and(|last| is_major(last)) {
-            parts.pop();
-        }
-        if let Some(last) = parts.last() {
-            names.push((*last).to_string());
-            if let Some((stem, version)) = last.rsplit_once('.') {
-                if is_major(version) {
-                    names.push(stem.to_string());
-                }
+    if let Some(last) = parts.last() {
+        names.push((*last).to_string());
+        if let Some((stem, version)) = last.rsplit_once('.') {
+            if is_major(version) {
+                names.push(stem.to_string());
             }
         }
     }
     names
 }
 
-/// The package names a `package.json` declares, scoped names as written and by
-/// their bare part.
-pub fn package_json_dependencies(text: &str) -> Vec<String> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-        return Vec::new();
+/// A `go.mod`: the modules it requires, and which of them a `replace` points at
+/// a local directory. An unclosed block, or a `require` line with no version,
+/// makes it malformed.
+pub fn parse_go_mod(text: &str) -> Result<Manifest, String> {
+    #[derive(PartialEq)]
+    enum Block {
+        None,
+        Require,
+        Replace,
+        Other,
+    }
+    let local_target = |target: &str| {
+        target.starts_with("./")
+            || target.starts_with("../")
+            || target.starts_with('/')
+            || target == "."
+            || target == ".."
     };
-    let mut names = Vec::new();
+    let mut manifest = Manifest::default();
+    let mut block = Block::None;
+    let push_replace = |manifest: &mut Manifest, spec: &str| {
+        if let Some((left, right)) = spec.split_once("=>") {
+            if let (Some(module), Some(target)) = (
+                left.split_whitespace().next(),
+                right.split_whitespace().next(),
+            ) {
+                for name in go_names(module) {
+                    manifest.dependencies.push(Dependency {
+                        name,
+                        local: local_target(target),
+                    });
+                }
+            }
+        }
+    };
+    for (index, line) in text.lines().enumerate() {
+        let number = index + 1;
+        let line = line.split("//").next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if block != Block::None {
+            if line.starts_with(')') {
+                block = Block::None;
+            } else if block == Block::Require {
+                let mut tokens = line.split_whitespace();
+                let (Some(path), Some(_version)) = (tokens.next(), tokens.next()) else {
+                    return Err(format!("line {number}: a require has no version"));
+                };
+                for name in go_names(path) {
+                    manifest
+                        .dependencies
+                        .push(Dependency { name, local: false });
+                }
+            } else if block == Block::Replace {
+                push_replace(&mut manifest, line);
+            }
+            continue;
+        }
+        let (keyword, rest) = match line.split_once(char::is_whitespace) {
+            Some((keyword, rest)) => (keyword, rest.trim()),
+            None => (line, ""),
+        };
+        match keyword {
+            "module" => {
+                if let Some(path) = rest.split_whitespace().next() {
+                    manifest.own_names.extend(go_names(path.trim_matches('"')));
+                }
+            }
+            "require" | "replace" if rest.starts_with('(') => {
+                block = if keyword == "require" {
+                    Block::Require
+                } else {
+                    Block::Replace
+                };
+            }
+            "require" => {
+                let mut tokens = rest.split_whitespace();
+                let (Some(path), Some(_version)) = (tokens.next(), tokens.next()) else {
+                    return Err(format!("line {number}: a require has no version"));
+                };
+                for name in go_names(path) {
+                    manifest
+                        .dependencies
+                        .push(Dependency { name, local: false });
+                }
+            }
+            "replace" => push_replace(&mut manifest, rest),
+            _ if rest.starts_with('(') => block = Block::Other,
+            _ => {}
+        }
+    }
+    if block != Block::None {
+        return Err("a parenthesised block is never closed".to_string());
+    }
+    Ok(manifest)
+}
+
+/// A `package.json`: the packages it depends on, which of them are local
+/// (`file:`, `link:`, `workspace:` or a relative path), and its own name.
+pub fn parse_package_json(text: &str) -> Result<Manifest, String> {
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let Some(object) = value.as_object() else {
+        return Err("the top level is not an object".to_string());
+    };
+    let mut manifest = Manifest::default();
+    if let Some(name) = object.get("name").and_then(|v| v.as_str()) {
+        manifest.own_names.push(name.to_string());
+    }
     for field in [
         "dependencies",
         "devDependencies",
         "peerDependencies",
         "optionalDependencies",
     ] {
-        if let Some(map) = value.get(field).and_then(|v| v.as_object()) {
-            for name in map.keys() {
-                names.push(name.clone());
-                if let Some((_, bare)) = name.strip_prefix('@').and_then(|s| s.split_once('/')) {
-                    names.push(bare.to_string());
-                }
+        let Some(map) = object.get(field).and_then(|v| v.as_object()) else {
+            continue;
+        };
+        for (name, version) in map {
+            let local = version.as_str().is_some_and(|v| {
+                ["file:", "link:", "workspace:", "./", "../", "/"]
+                    .iter()
+                    .any(|prefix| v.starts_with(prefix))
+            });
+            manifest.dependencies.push(Dependency {
+                name: name.clone(),
+                local,
+            });
+            if let Some((_, bare)) = name.strip_prefix('@').and_then(|s| s.split_once('/')) {
+                manifest.dependencies.push(Dependency {
+                    name: bare.to_string(),
+                    local,
+                });
             }
         }
     }
-    names
+    Ok(manifest)
 }
 
 fn push_reason(reasons: &mut Vec<String>, reason: String) {
@@ -2840,6 +3107,7 @@ pub fn doc_drift_report_with(
     let Some((page, files)) = store.all_symbols_page_with_files()? else {
         return Ok(unavailable("no persisted generation is available"));
     };
+    let recorded_root = page.repo_root.clone();
     let root = match page.repo_root.as_deref() {
         Some(root) => std::path::PathBuf::from(root),
         None => std::env::current_dir()?,
@@ -2938,6 +3206,11 @@ pub fn doc_drift_report_with(
         unscanned_anchor_targets: 0,
         limits: options.limits,
         declared: HashSet::new(),
+        in_repo: HashSet::new(),
+        root_aliases: recorded_root
+            .into_iter()
+            .map(|r| r.replace('\\', "/").trim_end_matches('/').to_string())
+            .collect(),
         pending: Vec::new(),
     };
     if let Some(reason) = resolver.load_declared(&files)? {

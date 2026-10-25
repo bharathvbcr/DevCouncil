@@ -219,11 +219,19 @@ fn symbol_shapes_are_checked_and_ambiguous_names_are_skipped() {
     let skipped_text = "`word` `Store` `ALL_CAPS` `snake_case` `foo.bar` `Cargo.toml` `main.rs` `std::mem::take` `fmt.Println` `GitHub` `FOO_BAR()`\n";
     let extraction = extract_references(skipped_text);
     let kept: Vec<&RefSpec> = extraction.references.iter().map(|r| &r.spec).collect();
-    // `FOO_BAR()` ends in `()`, so it is a call and is checked.
-    assert_eq!(kept, vec![&symbol(&[], "FOO_BAR", "FOO_BAR()")]);
+    // `FOO_BAR()` ends in `()`, so it is a call and is checked. `fmt.Println`
+    // has an ambiguous standard root: whether it is the standard library's or
+    // the repository's is the resolver's call, so it is a reference here.
+    assert_eq!(
+        kept,
+        vec![
+            &symbol(&["fmt"], "Println", "fmt.Println"),
+            &symbol(&[], "FOO_BAR", "FOO_BAR()")
+        ]
+    );
     assert_eq!(extraction.skipped.get("ambiguous_identifier"), Some(&5));
     assert_eq!(extraction.skipped.get("bare_filename"), Some(&2));
-    assert_eq!(extraction.skipped.get("external_qualifier"), Some(&2));
+    assert_eq!(extraction.skipped.get("external_qualifier"), Some(&1));
     assert_eq!(extraction.skipped.get("known_term"), Some(&1));
 }
 
