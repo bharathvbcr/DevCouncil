@@ -1120,10 +1120,17 @@ type shellWord struct {
 	// `FOO="a b" eval …` as a quoted literal and stopped looking for the
 	// command word.
 	quotedHead bool
+	// expands reports whether any character sh would expand — `$`, a
+	// backtick, `{`, `}`, `*`, `?`, `[` — appears where sh expands it: outside
+	// single quotes and not backslash-escaped (inside double quotes only `$`
+	// and the backtick do). `'*.go'` is a literal; `*.go` is a glob.
+	expands bool
 }
 
 // shellWords splits a command line into the words sh would produce, honouring
-// quotes and backslash escapes and performing no expansion.
+// quotes and backslash escapes and performing no expansion. A backslash before
+// a newline, outside single quotes, is a line continuation and is removed, as
+// sh removes it: `rev\<newline>iew` is the word `review`.
 //
 // strings.Fields is not a substitute, and using it here was a defect this
 // function exists to fix: it split `FOO="a b" eval "…"` into four pieces, the
@@ -1134,12 +1141,15 @@ type shellWord struct {
 func shellWords(command string) []shellWord {
 	var words []shellWord
 	var cur strings.Builder
-	started, quotedHead := false, false
+	started, quotedHead, expands := false, false, false
 	quote := rune(0)
 	runes := []rune(command)
 	for i := 0; i < len(runes); i++ {
 		r := runes[i]
 		switch {
+		case quote != '\'' && r == '\\' && i+1 < len(runes) && runes[i+1] == '\n':
+			// Line continuation: both characters vanish.
+			i++
 		case quote == 0 && r == '\\' && i+1 < len(runes):
 			quotedHead = quotedHead || !started
 			cur.WriteRune(runes[i+1])
@@ -1156,20 +1166,26 @@ func shellWords(command string) []shellWord {
 			cur.WriteRune(runes[i+1])
 			i++
 		case quote != 0:
+			if quote == '"' && (r == '$' || r == '`') {
+				expands = true
+			}
 			cur.WriteRune(r)
 		case r == ' ' || r == '\t' || r == '\n' || r == '\r':
 			if started {
-				words = append(words, shellWord{text: cur.String(), quotedHead: quotedHead})
+				words = append(words, shellWord{text: cur.String(), quotedHead: quotedHead, expands: expands})
 				cur.Reset()
-				started, quotedHead = false, false
+				started, quotedHead, expands = false, false, false
 			}
 		default:
+			if strings.ContainsRune("$`{}*?[", r) {
+				expands = true
+			}
 			cur.WriteRune(r)
 			started = true
 		}
 	}
 	if started {
-		words = append(words, shellWord{text: cur.String(), quotedHead: quotedHead})
+		words = append(words, shellWord{text: cur.String(), quotedHead: quotedHead, expands: expands})
 	}
 	return words
 }

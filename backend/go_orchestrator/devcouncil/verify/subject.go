@@ -19,9 +19,9 @@ import (
 )
 
 // SubjectPrefix marks a subject hash computed by WorkingTreeSubject.
-const SubjectPrefix = "git-tree:"
+const SubjectPrefix = "tree-sha256:"
 
-// subjectBound bounds the whole computation. Staging a working tree hashes
+// subjectBound bounds the whole computation. Naming a working tree reads
 // every file, so it is given longer than one git read.
 const subjectBound = 5 * time.Minute
 
@@ -29,39 +29,50 @@ const subjectBound = 5 * time.Minute
 const maxIgnoreSource = 1 << 20
 
 // WorkingTreeSubject names the exact content of root's working tree, for a
-// review to be bound to: "git-tree:" and the object id of the tree git would
-// commit if every change — tracked, untracked and deleted, minus what the
-// ignore rules exclude and minus the tool state verification never judges
-// (policy.ToolStateDirs) — were staged. When the repository's own exclude
-// files (.git/info/exclude, a local core.excludesFile) carry rules, a digest of those
-// rules is appended ("git-tree:<id>-x<digest>"), because they decide which
-// files the tree leaves out.
+// review to be bound to: "tree-sha256:" and a SHA-256 over every file verify
+// would judge — its path, its kind, its executable bit and the SHA-256 of its
+// bytes as they are on disk (a symlink's target text, a submodule's commit).
+// When the exclude files outside the tree carry rules, a digest of them is
+// appended ("tree-sha256:<digest>-x<rules>"), because they decide which files
+// are in the set.
 //
-// A tree id rather than a hash of the diff, because the diff moves when the
-// content does not: the same content reviewed before a commit and verified
-// after it has a different diff against a different HEAD, and the same tree.
-// A clean tree with no exclude rules has its HEAD's tree as its subject.
+// Which files: the ones git would commit if every change were staged —
+// tracked, untracked and deleted, minus what the ignore rules exclude and
+// minus the tool state verification never judges (policy.ToolStateDirs).
+// That set is git's, read through a scratch index built from HEAD's tree
+// (never a copy of the person's own, whose assume-unchanged, skip-worktree
+// and staged state are not the content), with core.ignorecase off so a
+// case-only rename is a different set.
+//
+// What each file holds is not git's. Hashing what `git add` would store
+// inherits every transformation it applies on the way in — line-ending
+// conversion (text, eol, autocrlf), ident expansion, working-tree-encoding,
+// core.fileMode, core.symlinks — each of which can make different bytes on
+// disk store as the same object. So the bytes are read from disk and hashed
+// here, and none of those settings decides the subject. The same content has
+// the same subject whether it is committed or not, and in any checkout.
 //
 // The subject is an answer only when it can see everything verify judges, so
 // it is refused — an error, never a subject that might match — when part of
-// the tree is beyond it:
-//   - a gitlink (submodule or nested repository) that HEAD does not have, or
-//     any submodule with changes of its own: its files are not in the tree,
-//     so an edit to them would not move the subject. A planted `.git` file is
-//     the same case;
+// the content is beyond it:
+//   - a gitlink (submodule or nested repository) that HEAD does not have; a
+//     submodule with changes of its own; a gitlink directory populated
+//     without its own repository, or whose repository's working tree is
+//     elsewhere. A planted `.git` file is the first case;
+//   - a tracked symlink whose target lies outside the repository, inside
+//     `.git`, in tool state, or on an ignored path: the subject holds only
+//     the link text;
 //   - an ignored `.gitignore` in a directory that is not itself ignored: a
-//     self-ignoring rules file could hide new source from the tree while the
-//     build still compiles it;
+//     self-ignoring rules file could hide new source while the build still
+//     compiles it;
 //   - a sparse checkout, whose missing files would read as deletions.
 //
-// It runs against a scratch index built from HEAD's tree — never a copy of
-// the repository's own, whose assume-unchanged, skip-worktree and stat-cache
-// state would let a modified file keep its old blob — so the person's staged
-// state is untouched and plays no part. Staging writes blob objects for
-// changed files into the object store, unreferenced and pruned by git's
-// ordinary gc; nothing else is written. Every git call goes through
-// proc.GitSession, so the repository's filter drivers and fsmonitor are
-// neutralised as for every other read here.
+// What the ignore rules leave out (generated files, build output) and tool
+// state are not part of the subject, as they are not part of what verify's
+// own gates read. Staging writes blob objects for changed files into the
+// object store, unreferenced and pruned by git's ordinary gc; nothing else is
+// written. Every git call goes through proc.GitSession, so the repository's
+// filter drivers and fsmonitor are neutralised as for every other read here.
 func WorkingTreeSubject(ctx context.Context, root string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, subjectBound)
 	defer cancel()
@@ -85,9 +96,6 @@ func WorkingTreeSubject(ctx context.Context, root string) (string, error) {
 			return "", fmt.Errorf("reading HEAD into a scratch index: %w", err)
 		}
 	}
-	// Staged with core.ignorecase off, so a case-only rename on a
-	// case-insensitive filesystem (z_test.go -> z_Test.go, which moves a file
-	// from test-only into the package) is a different tree, not the same one.
 	addEnv := append([]string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=core.ignorecase", "GIT_CONFIG_VALUE_0=false"}, env...)
 	if _, err := runGitEnv(ctx, git, 1<<20, subjectBound, addEnv, append([]string{"add", "--all"}, toolStateExcludes()...)...); err != nil {
 		return "", fmt.Errorf("staging the working tree into a scratch index: %w", err)
@@ -98,25 +106,100 @@ func WorkingTreeSubject(ctx context.Context, root string) (string, error) {
 	if err := checkSymlinks(ctx, git, env, root); err != nil {
 		return "", err
 	}
-	if err := checkIgnoredRulesFiles(ctx, git); err != nil {
+	if err := checkIgnoredRulesFiles(ctx, git, env); err != nil {
 		return "", err
 	}
-	treeOut, err := runGitEnv(ctx, git, 1<<10, subjectBound, env, "write-tree")
+	content, err := contentDigest(ctx, git, env, root)
 	if err != nil {
-		return "", fmt.Errorf("writing the working tree's tree: %w", err)
-	}
-	tree := strings.TrimSpace(string(treeOut))
-	if !isObjectID(tree) {
-		return "", fmt.Errorf("git write-tree answered %q, which is not an object id", tree)
+		return "", err
 	}
 	rules, err := excludeRulesDigest(ctx, git, root)
 	if err != nil {
 		return "", err
 	}
 	if rules != "" {
-		return SubjectPrefix + tree + "-x" + rules, nil
+		return SubjectPrefix + content + "-x" + rules, nil
 	}
-	return SubjectPrefix + tree, nil
+	return SubjectPrefix + content, nil
+}
+
+// contentDigest hashes every entry of the scratch index from disk: path,
+// kind, executable bit and the SHA-256 of the bytes for a file; the target
+// text for a symlink; the commit for a gitlink. Entries come in index order,
+// which is byte order of path, so the digest is independent of how the set
+// was produced.
+func contentDigest(ctx context.Context, git *proc.GitSession, env []string, root string) (string, error) {
+	staged, err := runGitEnv(ctx, git, gitListingLimit, subjectBound, env, "ls-files", "--stage", "-z")
+	if err != nil {
+		return "", fmt.Errorf("listing the scratch index: %w", err)
+	}
+	h := sha256.New()
+	for _, entry := range strings.Split(string(staged), "\x00") {
+		if entry == "" {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		meta, p, ok := strings.Cut(entry, "\t")
+		if !ok {
+			return "", fmt.Errorf("unreadable index entry %q", entry)
+		}
+		fields := strings.Fields(meta) // mode, object, stage
+		if len(fields) != 3 {
+			return "", fmt.Errorf("unreadable index entry %q", entry)
+		}
+		// Tool state tracked in HEAD is still in the scratch index (staging
+		// excludes it only from what is added), and verification never
+		// judges it.
+		if ToolOwned(p) {
+			continue
+		}
+		full := filepath.Join(root, filepath.FromSlash(p))
+		switch fields[0] {
+		case "160000":
+			fmt.Fprintf(h, "L\x00%s\x00%s\n", p, fields[1])
+		default:
+			info, err := os.Lstat(full)
+			if err != nil {
+				return "", fmt.Errorf("%s changed while it was being named: %w", p, err)
+			}
+			switch {
+			case info.Mode()&os.ModeSymlink != 0:
+				target, err := os.Readlink(full)
+				if err != nil {
+					return "", fmt.Errorf("%s: %w", p, err)
+				}
+				fmt.Fprintf(h, "S\x00%s\x00%s\n", p, target)
+			case info.Mode().IsRegular():
+				sum, err := fileSHA256(full)
+				if err != nil {
+					return "", fmt.Errorf("%s: %w", p, err)
+				}
+				exec := "-"
+				if info.Mode().Perm()&0o111 != 0 {
+					exec = "x"
+				}
+				fmt.Fprintf(h, "F\x00%s\x00%s\x00%s\n", p, exec, sum)
+			default:
+				return "", fmt.Errorf("%s is neither a file nor a symlink on disk (%s)", p, info.Mode().Type())
+			}
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func fileSHA256(p string) (string, error) {
+	f, err := os.Open(p)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // checkGitlinks refuses a tree with a gitlink HEAD does not have, or with a
@@ -194,9 +277,29 @@ func gitlinkHasChanges(ctx context.Context, dir string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	// A populated gitlink directory must be its own repository's working
+	// tree. Without a `.git`, git would answer for the enclosing repository;
+	// with one whose working tree is elsewhere (core.worktree, a decoy
+	// gitfile), the status would describe other files.
+	if _, err := os.Lstat(filepath.Join(dir, ".git")); err != nil {
+		return false, fmt.Errorf("the directory holds files but no repository of its own, so its content " +
+			"is neither in the tree nor in a submodule")
+	}
 	sub, err := proc.NewGitSession(dir)
 	if err != nil {
 		return false, err
+	}
+	top, err := runGit(ctx, sub, 1<<12, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return false, err
+	}
+	realDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return false, err
+	}
+	realTop, err := filepath.EvalSymlinks(strings.TrimSpace(string(top)))
+	if err != nil || realTop != realDir {
+		return false, fmt.Errorf("its repository's working tree is %s, not this directory", strings.TrimSpace(string(top)))
 	}
 	out, err := runGit(ctx, sub, gitListingLimit, "status", "--porcelain=v1", "-z",
 		"--untracked-files=all", "--ignore-submodules=none")
@@ -238,6 +341,10 @@ func checkSymlinks(ctx context.Context, git *proc.GitSession, env []string, root
 			return fmt.Errorf("%s is a symlink to %s, outside the repository, whose content the tree cannot name", p, target)
 		}
 		rel = filepath.ToSlash(rel)
+		if rel == ".git" || strings.HasPrefix(rel, ".git/") || strings.Contains(rel, "/.git/") ||
+			strings.HasSuffix(rel, "/.git") {
+			return fmt.Errorf("%s is a symlink into a repository's .git directory (%s), which the tree leaves out", p, rel)
+		}
 		if ToolOwned(rel) {
 			return fmt.Errorf("%s is a symlink into tool state (%s), which the tree leaves out", p, rel)
 		}
@@ -269,10 +376,11 @@ func gitlinkPaths(listing []byte, split func(string) (mode, p string, ok bool)) 
 
 // checkIgnoredRulesFiles refuses a tree in which a `.gitignore` is itself
 // ignored while its directory is not: such a file can hide new source from
-// the tree, and nothing in the tree records that it did.
-func checkIgnoredRulesFiles(ctx context.Context, git *proc.GitSession) error {
-	ignored, err := runGit(ctx, git, gitListingLimit, "ls-files", "--others", "--ignored", "--exclude-standard",
-		"-z", "--", ":(glob,icase)**/.gitignore")
+// the tree, and nothing in the tree records that it did. Read through the
+// scratch index, so one staged in the person's own index is still "other".
+func checkIgnoredRulesFiles(ctx context.Context, git *proc.GitSession, env []string) error {
+	ignored, err := runGitEnv(ctx, git, gitListingLimit, subjectBound, env, "ls-files", "--others", "--ignored",
+		"--exclude-standard", "-z", "--", ":(glob,icase)**/.gitignore")
 	if err != nil {
 		return fmt.Errorf("listing ignored rules files: %w", err)
 	}
@@ -408,18 +516,4 @@ func readSmall(p string, limit int64) ([]byte, error) {
 		return nil, fmt.Errorf("over %d bytes", limit)
 	}
 	return body, nil
-}
-
-// isObjectID reports whether s is a SHA-1 or SHA-256 object id in lowercase
-// hex.
-func isObjectID(s string) bool {
-	if len(s) != 40 && len(s) != 64 {
-		return false
-	}
-	for _, c := range s {
-		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
-			return false
-		}
-	}
-	return true
 }

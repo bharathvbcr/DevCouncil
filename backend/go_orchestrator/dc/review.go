@@ -35,7 +35,7 @@ type ReviewRecord struct {
 	TaskID                string `json:"task_id"`
 	AcceptanceCriterionID string `json:"acceptance_criterion_id"`
 	// SubjectHash names the exact content reviewed, in the form
-	// verify.WorkingTreeSubject computes ("git-tree:<object id>").
+	// verify.WorkingTreeSubject computes ("tree-sha256:<digest>").
 	SubjectHash string `json:"subject_hash"`
 	// CriterionSHA256 is CriterionDigest of the criterion as it read when it
 	// was reviewed. A criterion re-planned after the review — its text or

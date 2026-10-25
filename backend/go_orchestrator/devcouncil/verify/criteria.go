@@ -67,6 +67,11 @@ type ReviewEvidence struct {
 	// Subject is WorkingTreeSubject for the content under verification.
 	Subject    string
 	SubjectErr error
+	// Recheck names the content again after the verification commands have
+	// run. Nil skips the recheck (a caller that runs none). A command that
+	// changes the tree — a generator, a formatter — would otherwise have its
+	// output judged against a review of what came before.
+	Recheck func() (string, error)
 	// ByCriterion is each llm_review criterion's reviews, newest first.
 	ByCriterion map[string][]store.StoredReview
 	ReadErr     error
@@ -159,6 +164,16 @@ func judgeReview(criterion dc.AcceptanceCriterion, ev ReviewEvidence) (reasons [
 		return []string{fmt.Sprintf("review %d of this content cannot be read: %v", match.ID, match.Err)}, nil
 	}
 	r := match.Record
+	// Checked here as well as when the store's reply was decoded: this is the
+	// function that discharges, and it must not depend on its caller having
+	// validated what it is handed.
+	if err := r.Validate(); err != nil {
+		return []string{fmt.Sprintf("review %d is not a valid record: %v", match.ID, err)}, nil
+	}
+	if r.SubjectHash != match.SubjectHash || r.AcceptanceCriterionID != acID {
+		return []string{fmt.Sprintf("review %d names %s/%s but is filed under %s/%s",
+			match.ID, r.AcceptanceCriterionID, r.SubjectHash, acID, match.SubjectHash)}, nil
+	}
 	if want := dc.CriterionDigest(criterion); r.CriterionSHA256 != want {
 		reasons = append(reasons, fmt.Sprintf("review %d answered a different version of %s (criterion "+
 			"sha256 %s, now %s): it was re-planned after the review", match.ID, acID, r.CriterionSHA256, want))

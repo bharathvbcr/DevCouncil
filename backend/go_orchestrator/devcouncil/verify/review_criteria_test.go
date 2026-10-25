@@ -175,6 +175,28 @@ func TestAReviewThatCannotVouchForThisContentBlocks(t *testing.T) {
 			in.Requirements.Requirements[0].AcceptanceCriteria[0].Description = "adds, and is fast"
 			return in
 		}, "re-planned after the review"},
+		"content changed while the commands ran": {func(t *testing.T) verify.Input {
+			in := reviewInput(t, true, stored(1, goodReview()))
+			in.Reviews.Recheck = func() (string, error) { return "tree-sha256:bbbb", nil }
+			return in
+		}, "changed while the verification commands ran"},
+		"content could not be named again": {func(t *testing.T) verify.Input {
+			in := reviewInput(t, true, stored(1, goodReview()))
+			in.Reviews.Recheck = func() (string, error) { return "", errors.New("git vanished") }
+			return in
+		}, "git vanished"},
+		"a record that does not validate": {func(t *testing.T) verify.Input {
+			r := goodReview()
+			r.Reviewers[1].ID = r.Reviewers[0].ID
+			return reviewInput(t, true, stored(1, r))
+		}, "not a valid record"},
+		"a record filed under another subject": {func(t *testing.T) verify.Input {
+			r := goodReview()
+			r.SubjectHash = "tree-sha256:cccc"
+			s := stored(1, r)
+			s.SubjectHash = reviewedSubject
+			return reviewInput(t, true, s)
+		}, "is filed under"},
 		"no evidence read at all": {func(t *testing.T) verify.Input {
 			in := criterionInput(dc.VerifyLLMReview, true, 0, "go test ./...")
 			return in

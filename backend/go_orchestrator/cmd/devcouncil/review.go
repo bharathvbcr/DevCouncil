@@ -21,7 +21,7 @@ agent shells: an agent cannot vouch for its own work.
 
 Usage:
   devcouncil review subject [--json] [--project-root DIR]
-      Name the working tree's content, as a review must ("git-tree:<id>").
+      Name the working tree's content, as a review must ("tree-sha256:<digest>").
   devcouncil review record --file RECORD.json [--json] [--project-root DIR]
       Record one review (a dc.ReviewRecord, schema 1). Run by the harness or a
       person, never by the agent whose work was reviewed.

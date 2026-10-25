@@ -67,12 +67,15 @@ func (r *subjectRepo) subject() string {
 	return s
 }
 
-// A clean tree's subject is its HEAD's tree: the subject names content, and
-// the committed content is the content.
-func TestACleanTreesSubjectIsItsHeadTree(t *testing.T) {
+// The subject names content, not a checkout: a separate clone of the same
+// commit has the same subject, and so does the same content made by hand.
+func TestTheSameContentHasTheSameSubjectInAnyCheckout(t *testing.T) {
 	r := newSubjectRepo(t)
-	if got, want := r.subject(), verify.SubjectPrefix+r.run("rev-parse", "HEAD^{tree}"); got != want {
-		t.Fatalf("subject = %s, want %s", got, want)
+	want := r.subject()
+	clone := &subjectRepo{t: t, root: filepath.Join(t.TempDir(), "clone"), git: r.git}
+	r.run("clone", "-q", r.root, clone.root)
+	if got := clone.subject(); got != want {
+		t.Fatalf("a clone's subject = %s, want %s", got, want)
 	}
 }
 
@@ -285,11 +288,145 @@ func TestExcludeRulesOutsideTheTreeArePartOfTheSubject(t *testing.T) {
 	r.write("evil.go", "package a\nfunc init() { panic(1) }\n")
 	r.write(".git/info/exclude", "# comment\nevil.go\n")
 	r.mustNotCollide(before, "a new file hidden by .git/info/exclude")
-	// Comments alone are no rules: the clean subject is still HEAD's tree.
+	// Comments alone are no rules: the subject carries no rules digest.
 	r2 := newSubjectRepo(t)
+	clean := r2.subject()
 	r2.write(".git/info/exclude", "# only a comment\n\n")
-	if got, want := r2.subject(), verify.SubjectPrefix+r2.run("rev-parse", "HEAD^{tree}"); got != want {
-		t.Errorf("subject = %s, want %s", got, want)
+	if got := r2.subject(); got != clean || strings.Contains(got, "-x") {
+		t.Errorf("subject = %s, want %s with no rules digest", got, clean)
+	}
+}
+
+// Round 4 on 14178f9d. The bytes on disk decide the subject, whatever git
+// would store for them.
+func TestGitsContentTransformsCannotHideAnEdit(t *testing.T) {
+	cases := map[string]struct {
+		setup  func(r *subjectRepo)
+		edit   func(r *subjectRepo)
+		stored string
+	}{
+		"crlf under text=auto": {
+			setup: func(r *subjectRepo) {
+				r.write(".gitattributes", "* text=auto\n")
+				r.write("data.txt", "a\nb\n")
+			},
+			edit: func(r *subjectRepo) { r.write("data.txt", "a\r\nb\r\n") },
+		},
+		"crlf under core.autocrlf": {
+			setup: func(r *subjectRepo) {
+				r.run("config", "core.autocrlf", "true")
+				r.write("data.txt", "a\nb\n")
+			},
+			edit: func(r *subjectRepo) { r.write("data.txt", "a\r\nb\r\n") },
+		},
+		"ident expansion from info/attributes": {
+			setup: func(r *subjectRepo) {
+				r.write("v.go", "package a\n\nconst V = \"$Id$\"\n")
+			},
+			edit: func(r *subjectRepo) {
+				r.write(".git/info/attributes", "*.go ident\n")
+				r.write("v.go", "package a\n\nconst V = \"$Id: evil $\"\n")
+			},
+		},
+		"exec bit with core.fileMode off": {
+			setup: func(r *subjectRepo) {
+				r.run("config", "core.fileMode", "false")
+				r.write("run.sh", "#!/bin/sh\necho hi\n")
+			},
+			edit: func(r *subjectRepo) {
+				if err := os.Chmod(filepath.Join(r.root, "run.sh"), 0o755); err != nil {
+					r.t.Fatal(err)
+				}
+			},
+		},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			r := newSubjectRepo(t)
+			c.setup(r)
+			r.run("add", ".")
+			r.run("commit", "-qm", "setup")
+			before := r.subject()
+			c.edit(r)
+			r.mustNotCollide(before, name)
+		})
+	}
+}
+
+// A symlink stored as a plain file (core.symlinks off) holding the same text
+// is a different thing on disk, and so a different subject.
+func TestASymlinkReplacedByItsTextIsADifferentSubject(t *testing.T) {
+	r := newSubjectRepo(t)
+	if err := os.Symlink("a.go", filepath.Join(r.root, "alias.go")); err != nil {
+		t.Fatal(err)
+	}
+	r.run("add", ".")
+	r.run("commit", "-qm", "link")
+	before := r.subject()
+	r.run("config", "core.symlinks", "false")
+	if err := os.Remove(filepath.Join(r.root, "alias.go")); err != nil {
+		t.Fatal(err)
+	}
+	r.write("alias.go", "a.go")
+	r.mustNotCollide(before, "a symlink replaced by a file holding its target text")
+}
+
+func TestASelfIgnoringRulesFileStagedInTheRealIndexIsRefused(t *testing.T) {
+	r := newSubjectRepo(t)
+	r.write("pkg/ok.go", "package pkg\n")
+	r.run("add", ".")
+	r.run("commit", "-qm", "pkg")
+	before := r.subject()
+	r.write("pkg/.gitignore", "evil.go\n.gitignore\n")
+	r.run("add", "-f", "pkg/.gitignore")
+	r.write("pkg/evil.go", "package pkg\nfunc init() { panic(1) }\n")
+	r.mustNotCollide(before, "a self-ignoring rules file staged in the person's index")
+}
+
+func TestAGitlinkDirectoryMustBeItsOwnRepository(t *testing.T) {
+	setup := func(t *testing.T) (*subjectRepo, *subjectRepo) {
+		r := newSubjectRepo(t)
+		inner := &subjectRepo{t: t, root: filepath.Join(r.root, "sub"), git: r.git}
+		inner.write("x.go", "package sub\n")
+		inner.run("init", "-q", inner.root)
+		inner.run("add", ".")
+		inner.run("commit", "-qm", "inner")
+		r.run("add", ".")
+		r.run("commit", "-qm", "gitlink")
+		return r, inner
+	}
+	t.Run("populated without a repository", func(t *testing.T) {
+		r, inner := setup(t)
+		before := r.subject()
+		if err := os.RemoveAll(filepath.Join(inner.root, ".git")); err != nil {
+			t.Fatal(err)
+		}
+		r.write("sub/evil.go", "package sub\n")
+		r.mustNotCollide(before, "files in a gitlink directory with no repository")
+	})
+	t.Run("a decoy gitfile", func(t *testing.T) {
+		r, inner := setup(t)
+		before := r.subject()
+		decoy := filepath.Join(t.TempDir(), "decoy.git")
+		r.run("clone", "-q", "--bare", inner.root, decoy)
+		r.run("--git-dir", decoy, "config", "core.worktree", t.TempDir())
+		if err := os.RemoveAll(filepath.Join(inner.root, ".git")); err != nil {
+			t.Fatal(err)
+		}
+		r.write("sub/.git", "gitdir: "+decoy+"\n")
+		r.write("sub/x.go", "package sub\n// changed\n")
+		r.mustNotCollide(before, "a gitlink whose repository's working tree is elsewhere")
+	})
+}
+
+func TestASymlinkIntoGitIsRefused(t *testing.T) {
+	r := newSubjectRepo(t)
+	r.write(".git/payload.go.txt", "package a\n")
+	if err := os.Symlink(".git/payload.go.txt", filepath.Join(r.root, "impl.go")); err != nil {
+		t.Fatal(err)
+	}
+	if s, err := r.subjectOrErr(); err == nil {
+		t.Fatalf("a symlink into .git was named %s", s)
 	}
 }
 

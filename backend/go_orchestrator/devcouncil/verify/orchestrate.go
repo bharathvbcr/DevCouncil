@@ -135,6 +135,16 @@ func Run(ctx context.Context, in Input) (gaps []Gap, meta runMeta) {
 		}
 	}
 	commandGaps, commandRecords := runVerificationCommands(taskID, commands, in.RunCommand)
+	if in.Reviews.Recheck != nil && in.Reviews.SubjectErr == nil && in.Reviews.Subject != "" {
+		after, err := in.Reviews.Recheck()
+		switch {
+		case err != nil:
+			in.Reviews.SubjectErr = fmt.Errorf("the content could not be named again after the verification commands: %w", err)
+		case after != in.Reviews.Subject:
+			in.Reviews.SubjectErr = fmt.Errorf("the content changed while the verification commands ran "+
+				"(%s before, %s after), so no review can be matched to what was verified", in.Reviews.Subject, after)
+		}
+	}
 	gaps = append(gaps, commandGaps...)
 	meta.Commands = commandRecords
 
@@ -696,6 +706,7 @@ func VerifyTask(ctx context.Context, root string, client *store.Client, taskID s
 	if linkedErr == nil {
 		if ids := ReviewsNeeded(task.AcceptanceCriterionIDs, linked); len(ids) > 0 {
 			reviews = LoadReviewEvidence(ctx, root, client, taskID, ids)
+			reviews.Recheck = func() (string, error) { return WorkingTreeSubject(ctx, root) }
 		}
 	}
 	envPolicy := LoadEnvPolicy(root)

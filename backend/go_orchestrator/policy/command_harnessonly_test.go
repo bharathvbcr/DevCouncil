@@ -74,6 +74,17 @@ func TestRecordingAReviewIsRefusedInEveryAgentShell(t *testing.T) {
 		`node --eval "require('child_process').execSync('devcouncil review record')"`,
 		`timeout 5 bash -c 'devcouncil review record'`,
 		`find . -maxdepth 0 -exec sh -c 'devcouncil review record' \;`,
+		// Round 4 on 14178f9d: a line continuation, which sh removes.
+		"devcouncil review\\\n record --file r.json",
+		"devcouncil rev\\\niew record --file r.json",
+		"dev review\\\n record --file r.json",
+		"dcstore review-\\\nappend --task T --acceptance-criterion-id AC --subject-hash h --record r.json",
+		"dcstore ser\\\nve",
+		`sh -c "devcouncil review\` + "\n" + ` record"`,
+		`perl -E 'system("devcouncil review record")'`,
+		`pwsh -Command "devcouncil review record"`,
+		`env --split-string='devcouncil review record'`,
+		`find . -exec devcouncil review record \;`,
 	}
 	for name, gate := range gates {
 		for _, command := range refused {
@@ -111,6 +122,19 @@ func TestReadingReviewsAndLookalikesAreNotHarnessOnly(t *testing.T) {
 		"npm run dev -- --host $HOST",
 		"git commit -c HEAD",
 		`python3 -c "print('devcouncil review list')"`,
+		// Round 4: an argument that names a binary is not a run of it, and a
+		// quoted glob is a literal.
+		"rg -e dcstore -e serve",
+		"echo dev review record",
+		"ls dev review record",
+		"npm run dev $ARGS",
+		"yarn dev ${PORT}",
+		"docker compose run dev $CMD",
+		"grep -n dev *.md",
+		"rg devcouncil '*.go'",
+		"rg -n 'dcstore' -g '*.go'",
+		`grep -rn dcstore "$ROOT"`,
+		"git log -S dcstore -- '*.rs'",
 	} {
 		if reason := harnessOnlyViolation(command); reason != "" {
 			t.Errorf("%q refused as harness-only: %s", command, reason)

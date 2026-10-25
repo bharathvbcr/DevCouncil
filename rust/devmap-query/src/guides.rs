@@ -621,6 +621,10 @@ fn html_block_opening(line: &str) -> Option<&'static str> {
     }
     let lower = rest.to_ascii_lowercase();
     if let Some(after) = lower.strip_prefix("<!--") {
+        // `<!-->` and `<!--->` are complete (empty) comments in CommonMark.
+        if after.starts_with('>') || after.starts_with("->") {
+            return None;
+        }
         return (!after.contains("-->")).then_some("-->");
     }
     for (tag, close) in [
@@ -646,7 +650,8 @@ fn html_block_opening(line: &str) -> Option<&'static str> {
 /// of indent (four is an indented code block) and nothing else but trailing
 /// whitespace.
 fn is_marker_line(line: &str, marker: &str) -> bool {
-    let (cols, rest) = indentation(line);
+    // A byte-order mark an editor left at the head of the file is not text.
+    let (cols, rest) = indentation(line.strip_prefix('\u{feff}').unwrap_or(line));
     cols <= 3 && rest.trim_end() == marker
 }
 
@@ -696,7 +701,9 @@ fn ownership(existing: &str) -> Ownership<'_> {
             continue;
         }
         if is_marker_line(bare, AGENT_GUIDE_BLOCK_BEGIN) {
-            begins.push(start);
+            // A byte-order mark before the begin line belongs to the file, not
+            // the block, and is kept.
+            begins.push(start + if bare.starts_with('\u{feff}') { 3 } else { 0 });
         } else if is_marker_line(bare, AGENT_GUIDE_BLOCK_END) {
             ends.push((start, offset, &line[bare.len()..]));
         } else if is_marker_line(bare, AGENT_GUIDE_MARKER)
@@ -2087,5 +2094,39 @@ mod tests {
         ));
         assert_eq!(std::fs::read_to_string(&claude).unwrap(), text);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Round 4: an empty comment is no open block, and a byte-order mark
+    /// before the begin line does not hide it.
+    #[test]
+    fn an_empty_comment_and_a_byte_order_mark_do_not_hide_a_block() {
+        let b = AGENT_GUIDE_BLOCK_BEGIN;
+        let e = AGENT_GUIDE_BLOCK_END;
+        for (label, prefix) in [
+            ("empty comment", "<!-->\n"),
+            ("dash comment", "<!--->\n"),
+            ("bom", "\u{feff}"),
+        ] {
+            let dir = scratch("empty-comment");
+            let claude = dir.join("CLAUDE.md");
+            let text = format!("{prefix}{b}\nold\n{e}\n");
+            std::fs::write(&claude, &text).unwrap();
+            assert_eq!(
+                disposition_of(&dir, HandWrittenGuides::Preserve),
+                GuideDisposition::Updated,
+                "{label}"
+            );
+            let after = std::fs::read_to_string(&claude).unwrap();
+            assert!(
+                after.starts_with(prefix),
+                "{label}: the prefix was not kept"
+            );
+            assert_eq!(
+                disposition_of(&dir, HandWrittenGuides::Preserve),
+                GuideDisposition::Unchanged,
+                "{label}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
