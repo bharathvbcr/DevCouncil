@@ -73,6 +73,24 @@ func writeRecord(t *testing.T, subject string) string {
 	return path
 }
 
+// reviewKey makes a signing key with `review keygen` and returns its path.
+func reviewKey(t *testing.T) string {
+	t.Helper()
+	keyPath := filepath.Join(t.TempDir(), "k.json")
+	code, out := cli(t, "review", "keygen", "--key-id", "test", "--out", keyPath)
+	if code != 0 {
+		t.Fatalf("keygen: %d %s", code, out)
+	}
+	info, err := os.Stat(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("key file mode %o, want 600", info.Mode().Perm())
+	}
+	return keyPath
+}
+
 func TestReviewSubjectNamesTheWorkingTree(t *testing.T) {
 	root := reviewRepo(t)
 	want, err := verify.WorkingTreeSubject(context.Background(), root)
@@ -93,7 +111,8 @@ func TestReviewRecordAndListRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	code, out := cli(t, "review", "record", "--file", writeRecord(t, subject), "--json", "--project-root", root)
+	key := reviewKey(t)
+	code, out := cli(t, "review", "record", "--file", writeRecord(t, subject), "--sign-key", key, "--json", "--project-root", root)
 	if code != 0 {
 		t.Fatalf("record: %d %s", code, out)
 	}
@@ -109,7 +128,7 @@ func TestReviewRecordAndListRoundTrip(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package a // edited\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	code, out = cli(t, "review", "record", "--file", writeRecord(t, subject), "--project-root", root)
+	code, out = cli(t, "review", "record", "--file", writeRecord(t, subject), "--sign-key", key, "--project-root", root)
 	if code != 0 || !strings.Contains(out, "verify will not use this review") {
 		t.Fatalf("a record of content that has moved was not flagged: %d %s", code, out)
 	}
@@ -128,6 +147,23 @@ func TestReviewRecordAndListRoundTrip(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &listed); err != nil || len(listed.Reviews) != 2 ||
 		listed.Reviews[1].ID != receipt.ID || listed.Reviews[0].Subject != subject || len(listed.Reviews[0].Record) == 0 {
 		t.Fatalf("list %s (%v)", out, err)
+	}
+}
+
+// An unsigned record with no --sign-key is refused: the stored record must
+// carry a signature verify can check.
+func TestAnUnsignedRecordWithoutASigningKeyIsRefused(t *testing.T) {
+	root := reviewRepo(t)
+	subject, err := verify.WorkingTreeSubject(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, out := cli(t, "review", "record", "--file", writeRecord(t, subject), "--project-root", root)
+	if code != 1 || !(strings.Contains(out, "signature") || strings.Contains(out, "key_id")) {
+		t.Fatalf("an unsigned record was not refused: exit %d: %s", code, out)
+	}
+	if code, out := cli(t, "review", "list", "--task", "TASK-1", "--project-root", root); code != 0 || !strings.Contains(out, "no reviews recorded") {
+		t.Fatalf("exit %d: %s", code, out)
 	}
 }
 

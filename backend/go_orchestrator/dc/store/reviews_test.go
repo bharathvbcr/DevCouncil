@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"crypto/ed25519"
 	"os/exec"
 	"strings"
 	"testing"
@@ -10,8 +11,15 @@ import (
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
 
+// storePriv signs the store tests' records. The store stores and returns
+// records without verifying them (verification is the verifier's job), but
+// ReviewAppend validates shape, which requires a well-formed signature.
+var storePriv ed25519.PrivateKey
+
+func init() { _, storePriv, _ = ed25519.GenerateKey(nil) }
+
 func reviewRecord(task, criterion, subject string) dc.ReviewRecord {
-	return dc.ReviewRecord{
+	r := dc.ReviewRecord{
 		Schema:                dc.ReviewRecordSchema,
 		TaskID:                task,
 		AcceptanceCriterionID: criterion,
@@ -26,6 +34,10 @@ func reviewRecord(task, criterion, subject string) dc.ReviewRecord {
 		},
 		Findings: []dc.ReviewFinding{},
 	}
+	if err := r.Sign("store-test", storePriv); err != nil {
+		panic(err)
+	}
+	return r
 }
 
 // A review the harness records is the one verify reads back, field for field,

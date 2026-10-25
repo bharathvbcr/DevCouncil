@@ -77,6 +77,12 @@ type ReviewEvidence struct {
 	ReadErr     error
 	// Root is where the rubric a review names is read from.
 	Root string
+	// Signers are the keys the repository trusts to sign reviews. A record
+	// discharges only when its signature checks against one of them, so a
+	// record the agent wrote without the harness's key does not. SignersErr
+	// is set when they could not be loaded, and then every criterion blocks.
+	Signers    dc.ReviewSigners
+	SignersErr error
 }
 
 // ReviewsNeeded names the claimed criteria that are llm_review criteria in
@@ -104,6 +110,7 @@ func ReviewsNeeded(claimed []string, linked store.LinkedRequirements) []string {
 func LoadReviewEvidence(ctx context.Context, root string, client *store.Client, taskID string, criteria []string) ReviewEvidence {
 	ev := ReviewEvidence{Root: root, ByCriterion: make(map[string][]store.StoredReview, len(criteria))}
 	ev.Subject, ev.SubjectErr = WorkingTreeSubject(ctx, root)
+	ev.Signers, ev.SignersErr = dc.LoadReviewSigners(root)
 	if client == nil {
 		ev.ReadErr = fmt.Errorf("store unavailable")
 		return ev
@@ -173,6 +180,18 @@ func judgeReview(taskID string, criterion dc.AcceptanceCriterion, ev ReviewEvide
 	if r.SubjectHash != match.SubjectHash || r.AcceptanceCriterionID != acID || r.TaskID != taskID {
 		return []string{fmt.Sprintf("review %d names %s/%s/%s but is filed under %s/%s/%s",
 			match.ID, r.TaskID, r.AcceptanceCriterionID, r.SubjectHash, taskID, acID, match.SubjectHash)}, nil
+	}
+	// The signature is the boundary. A record the harness did not sign — one
+	// an agent wrote by any of the ways it can reach the writer — does not
+	// discharge, whatever else it says. A loader error blocks rather than
+	// opening the gate: a run that could not read the trusted keys has not
+	// shown the review is trusted.
+	if ev.SignersErr != nil {
+		return []string{fmt.Sprintf("the trusted review signers could not be read, so review %d cannot be "+
+			"trusted: %v", match.ID, ev.SignersErr)}, nil
+	}
+	if err := r.VerifySignature(ev.Signers); err != nil {
+		return []string{fmt.Sprintf("review %d is not a trusted review: %v", match.ID, err)}, nil
 	}
 	if want := dc.CriterionDigest(criterion); r.CriterionSHA256 != want {
 		reasons = append(reasons, fmt.Sprintf("review %d answered a different version of %s (criterion "+

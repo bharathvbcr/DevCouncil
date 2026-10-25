@@ -1,6 +1,8 @@
 package dc
 
 import (
+	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -28,6 +30,11 @@ func validReviewRecord() map[string]any {
 		"findings": []any{
 			map[string]any{"id": "F1", "severity": "major", "summary": "unstated retry bound", "resolution": "fixed"},
 		},
+		// A valid-shape signature (64 zero bytes) under a key id. Validate
+		// checks only the shape; whether it verifies is VerifySignature's
+		// question, tested separately.
+		"key_id":    "manvi-prod",
+		"signature": base64.StdEncoding.EncodeToString(make([]byte, ed25519.SignatureSize)),
 	}
 }
 
@@ -96,6 +103,12 @@ func TestAMalformedReviewRecordIsRefusedNamingTheField(t *testing.T) {
 		{"oversized text", func(m map[string]any) {
 			m["findings"].([]any)[0].(map[string]any)["summary"] = strings.Repeat("x", 5000)
 		}, "over 4096"},
+		{"blank key_id", func(m map[string]any) { m["key_id"] = " " }, "key_id"},
+		{"no signature", func(m map[string]any) { m["signature"] = "" }, "signature is 0 bytes"},
+		{"signature not base64", func(m map[string]any) { m["signature"] = "!!!!" }, "not base64"},
+		{"signature wrong length", func(m map[string]any) {
+			m["signature"] = base64.StdEncoding.EncodeToString(make([]byte, 10))
+		}, "not 64"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

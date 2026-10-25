@@ -48,6 +48,15 @@ type ReviewRecord struct {
 	Isolation ReviewIsolation `json:"isolation"`
 	Reviewers []ReviewerRun   `json:"reviewers"`
 	Findings  []ReviewFinding `json:"findings"`
+	// KeyID names the signing key, and Signature is its ed25519 signature
+	// over the rest of the record. They are what makes a record the harness's
+	// word rather than anyone's: verify discharges only a record whose
+	// signature checks against a key the repository trusts (SigningKeyID and
+	// Signature in review_signing.go). They are the last fields and are
+	// cleared before the signed bytes are computed, so a record signs
+	// everything but them.
+	KeyID     string `json:"key_id"`
+	Signature string `json:"signature"`
 }
 
 // ReviewRubric is the standard the reviewers judged against: a file in the
@@ -187,10 +196,14 @@ func (r ReviewRecord) Validate() error {
 		{"subject_hash", r.SubjectHash},
 		{"harness", r.Harness},
 		{"rubric.path", r.Rubric.Path},
+		{"key_id", r.KeyID},
 	} {
 		if err := checkReviewID(field.name, field.value); err != nil {
 			return err
 		}
+	}
+	if err := validSignatureShape(r.Signature); err != nil {
+		return err
 	}
 	if !ValidSubjectHash(r.SubjectHash) {
 		return fmt.Errorf("review record subject_hash %q may hold only a-z, 0-9, ':' and '-'", r.SubjectHash)

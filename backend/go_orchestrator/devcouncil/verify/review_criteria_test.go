@@ -7,6 +7,7 @@ package verify_test
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -21,9 +22,45 @@ import (
 )
 
 const (
-	reviewedSubject = "git-tree:aaaa"
+	reviewedSubject = "tree-sha256:aaaa"
 	rubricBody      = "# Feature spec standard\nEvery failure mode is named.\n"
+	testKeyID       = "test-signer"
 )
+
+// testPriv is the key the repository trusts in these tests; untrustedPriv is a
+// second key it does not, for the forged-review cases.
+var testPriv, untrustedPriv ed25519.PrivateKey
+
+func init() {
+	_, testPriv, _ = ed25519.GenerateKey(nil)
+	_, untrustedPriv, _ = ed25519.GenerateKey(nil)
+}
+
+// writeSigners installs the trusted-signers file naming keyID under root, the
+// way an operator installs it.
+func writeSigners(t *testing.T, root, keyID string, priv ed25519.PrivateKey) {
+	t.Helper()
+	line, err := dc.PublicSignerLine(keyID, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, ".devcouncil")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "review_signers.json"), []byte(`{"signers":[`+line+`]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// signed signs r with the trusted key, as the harness would before recording.
+func signed(t *testing.T, r dc.ReviewRecord) dc.ReviewRecord {
+	t.Helper()
+	if err := r.Sign(testKeyID, testPriv); err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
 
 func rubricSum(body string) string {
 	sum := sha256.Sum256([]byte(body))
@@ -56,16 +93,28 @@ func reviewInput(t *testing.T, required bool, reviews ...store.StoredReview) ver
 	if err := os.WriteFile(filepath.Join(root, "docs/rubric.md"), []byte(rubricBody), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	writeSigners(t, root, testKeyID, testPriv)
+	signers, err := dc.LoadReviewSigners(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	in := criterionInput(dc.VerifyLLMReview, required, 0, "go test ./...")
 	in.Reviews = verify.ReviewEvidence{
 		Subject:     reviewedSubject,
 		ByCriterion: map[string][]store.StoredReview{"AC-1": reviews},
 		Root:        root,
+		Signers:     signers,
 	}
 	return in
 }
 
+// stored wraps a record signed by the trusted key, as the store would return
+// it. A test that needs an unsigned, tampered or wrongly-signed record builds
+// store.StoredReview itself.
 func stored(id int64, r dc.ReviewRecord) store.StoredReview {
+	if err := r.Sign(testKeyID, testPriv); err != nil {
+		panic(err)
+	}
 	return store.StoredReview{ID: id, SubjectHash: r.SubjectHash, RecordedAt: "2026-10-25T00:00:00Z", Record: r}
 }
 
@@ -202,6 +251,28 @@ func TestAReviewThatCannotVouchForThisContentBlocks(t *testing.T) {
 			r.TaskID = "TASK-OTHER"
 			return reviewInput(t, true, stored(1, r))
 		}, "is filed under"},
+		"a review signed by an untrusted key": {func(t *testing.T) verify.Input {
+			r := goodReview()
+			if err := r.Sign("rogue", untrustedPriv); err != nil {
+				t.Fatal(err)
+			}
+			return reviewInput(t, true, store.StoredReview{ID: 1, SubjectHash: r.SubjectHash, Record: r})
+		}, "not a trusted review"},
+		"a review whose bytes were changed after signing": {func(t *testing.T) verify.Input {
+			r := signed(t, goodReview())
+			r.Findings = []dc.ReviewFinding{{ID: "X", Severity: dc.SeverityNit, Summary: "snuck in", Resolution: dc.ResolutionOpen}}
+			return reviewInput(t, true, store.StoredReview{ID: 1, SubjectHash: r.SubjectHash, Record: r})
+		}, "does not verify"},
+		"no signers configured": {func(t *testing.T) verify.Input {
+			in := reviewInput(t, true, stored(1, goodReview()))
+			in.Reviews.Signers = dc.ReviewSigners{}
+			return in
+		}, "no review signers are configured"},
+		"the signers could not be read": {func(t *testing.T) verify.Input {
+			in := reviewInput(t, true, stored(1, goodReview()))
+			in.Reviews.SignersErr = errors.New("review_signers.json is a directory")
+			return in
+		}, "trusted review signers could not be read"},
 		"no evidence read at all": {func(t *testing.T) verify.Input {
 			in := criterionInput(dc.VerifyLLMReview, true, 0, "go test ./...")
 			return in

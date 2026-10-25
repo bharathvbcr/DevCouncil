@@ -16,20 +16,27 @@ An acceptance criterion whose verification_method is llm_review is discharged
 by a recorded review of exactly the content under verification: reviewers that
 provably did not see the author's context (isolation probe passed), at least
 two of them, against a rubric file in this repository, with no blocker left
-open. The harness that ran the reviewers records it. Recording is refused in
-agent shells: an agent cannot vouch for its own work.
+open, and signed by a key the repository trusts. The harness that ran the
+reviewers signs and records it; the private key lives outside the repository.
+An agent cannot forge a review it cannot sign.
 
 Usage:
   devcouncil review subject [--json] [--project-root DIR]
       Name the working tree's content, as a review must ("tree-sha256:<digest>").
-  devcouncil review record --file RECORD.json [--json] [--project-root DIR]
-      Record one review (a dc.ReviewRecord, schema 1). Run by the harness or a
-      person, never by the agent whose work was reviewed.
+  devcouncil review keygen --key-id ID --out KEY.json
+      Make a signing key. Writes the private key to KEY.json (0600, keep it
+      outside the repository) and prints the line to add to
+      .devcouncil/review_signers.json.
+  devcouncil review record --file RECORD.json [--sign-key KEY.json] [--json] [--project-root DIR]
+      Record one review (a dc.ReviewRecord, schema 1). --sign-key signs an
+      unsigned record; without it the record must already carry the harness's
+      signature. Run by the harness or a person, never by the agent reviewed.
   devcouncil review list --task ID [--criterion AC] [--json] [--project-root DIR]
       List a task's reviews, newest first.
 
 A record names its subject_hash; verify uses only a review whose subject is the
-content it is verifying, so a change made after a review needs a new one.
+content it is verifying and whose signature checks against a trusted key, so a
+change made after a review needs a new one.
 `
 
 // maxReviewFile bounds the record read; the store refuses a larger one anyway.
@@ -50,6 +57,8 @@ func runReview(args []string) int {
 		return runReviewRecord(args[1:])
 	case "list":
 		return runReviewList(args[1:])
+	case "keygen":
+		return runReviewKeygen(args[1:])
 	default:
 		console.Errorf("unknown review subcommand: %s\n", args[0])
 		console.Error(reviewHelp)
@@ -87,13 +96,13 @@ func runReviewSubject(args []string) int {
 }
 
 func runReviewRecord(args []string) int {
-	f, ok := parseTaskFlags(args, "--file")
+	f, ok := parseTaskFlags(args, "--file", "--sign-key")
 	if !ok {
 		return 2
 	}
 	path := f.named["--file"]
 	if path == "" || len(f.rest) != 0 {
-		console.Errorln("usage: devcouncil review record --file RECORD.json")
+		console.Errorln("usage: devcouncil review record --file RECORD.json [--sign-key KEY.json]")
 		return 2
 	}
 	data, err := readBounded(path, maxReviewFile)
@@ -101,8 +110,22 @@ func runReviewRecord(args []string) int {
 		console.Errorf("review record: %v\n", err)
 		return 1
 	}
-	record, err := dc.DecodeReviewRecord(data)
-	if err != nil {
+	// With --sign-key the record arrives unsigned and is signed here; without
+	// it, the record must already carry the harness's signature. Either way
+	// the stored record is signed, and verify discharges only a signed one.
+	var record dc.ReviewRecord
+	if keyPath := f.named["--sign-key"]; keyPath != "" {
+		keyID, priv, err := dc.LoadSigningKey(keyPath)
+		if err != nil {
+			console.Errorf("review record: %v\n", err)
+			return 1
+		}
+		record, err = dc.DecodeAndSign(data, keyID, priv)
+		if err != nil {
+			console.Errorf("review record: %v\n", err)
+			return 1
+		}
+	} else if record, err = dc.DecodeReviewRecord(data); err != nil {
 		console.Errorf("review record: %v\n", err)
 		return 1
 	}
@@ -198,6 +221,48 @@ func runReviewList(args []string) int {
 			r.ID, r.RecordedAt, rec.AcceptanceCriterionID, r.SubjectHash, rec.Isolation.Probe,
 			rec.CompletedReviewers(), len(rec.Reviewers), len(rec.Findings))
 	}
+	return 0
+}
+
+func runReviewKeygen(args []string) int {
+	f, ok := parseTaskFlags(args, "--key-id", "--out")
+	if !ok {
+		return 2
+	}
+	keyID, out := f.named["--key-id"], f.named["--out"]
+	if keyID == "" || out == "" || len(f.rest) != 0 {
+		console.Errorln("usage: devcouncil review keygen --key-id ID --out KEY.json")
+		return 2
+	}
+	keyFile, signerLine, err := dc.GenerateSigningKey(keyID)
+	if err != nil {
+		console.Errorf("review keygen: %v\n", err)
+		return 1
+	}
+	// O_EXCL so an existing key is never overwritten; 0600 so it is not
+	// group- or world-readable, which LoadSigningKey also enforces on read.
+	file, err := os.OpenFile(out, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		console.Errorf("review keygen: %v\n", err)
+		return 1
+	}
+	if _, err := file.Write(keyFile); err != nil {
+		file.Close()
+		console.Errorf("review keygen: %v\n", err)
+		return 1
+	}
+	if err := file.Close(); err != nil {
+		console.Errorf("review keygen: %v\n", err)
+		return 1
+	}
+	if f.json {
+		if err := console.JSON(map[string]any{"ok": true, "key_id": keyID, "key_file": out, "signer_line": signerLine}); err != nil {
+			return 1
+		}
+		return 0
+	}
+	console.Printf("wrote the private key to %s (keep it outside the repository)\n", out)
+	console.Printf("add this to %s:\n  %s\n", dc.ReviewSignersRel, signerLine)
 	return 0
 }
 

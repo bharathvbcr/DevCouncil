@@ -7,6 +7,7 @@ package stopgate_test
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
@@ -20,6 +21,23 @@ import (
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/verify"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
 )
+
+// installSigner writes the trusted-signers file naming keyID under root, as an
+// operator installs it. It lives in `.devcouncil/`, which the subject excludes.
+func installSigner(t *testing.T, root, keyID string, priv ed25519.PrivateKey) {
+	t.Helper()
+	line, err := dc.PublicSignerLine(keyID, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, ".devcouncil")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "review_signers.json"), []byte(`{"signers":[`+line+`]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func linkCriterion(t *testing.T, db, taskID, method string) {
 	t.Helper()
@@ -98,8 +116,13 @@ func TestARecordedReviewDischargesLLMReviewUntilTheContentMoves(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The harness holds a signing key outside the repository and installs its
+	// public half in the trusted-signers file; verify discharges only a
+	// review signed by it.
+	_, priv, _ := ed25519.GenerateKey(nil)
+	installSigner(t, root, "harness", priv)
 	sum := sha256.Sum256([]byte(rubric))
-	if _, err := client.ReviewAppend(ctx, dc.ReviewRecord{
+	record := dc.ReviewRecord{
 		Schema: dc.ReviewRecordSchema, TaskID: "TASK-AC", AcceptanceCriterionID: "AC-1",
 		SubjectHash: subject, Harness: "end-to-end",
 		CriterionSHA256: dc.CriterionDigest(dc.AcceptanceCriterion{ID: "AC-1", Description: "d", Method: dc.VerifyLLMReview}),
@@ -109,7 +132,11 @@ func TestARecordedReviewDischargesLLMReviewUntilTheContentMoves(t *testing.T) {
 			{ID: "a", Persona: "design_critic", Status: dc.ReviewerCompleted},
 			{ID: "b", Persona: "design_critic", Status: dc.ReviewerCompleted},
 		},
-	}); err != nil {
+	}
+	if err := record.Sign("harness", priv); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ReviewAppend(ctx, record); err != nil {
 		t.Fatal(err)
 	}
 
