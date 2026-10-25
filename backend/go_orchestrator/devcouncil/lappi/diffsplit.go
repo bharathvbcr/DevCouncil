@@ -2,6 +2,7 @@ package lappi
 
 import (
 	"bytes"
+	"math"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -205,9 +206,10 @@ func headerPath(rest []byte, prefix string) (path string, quoted, devNull bool) 
 
 type hunkCounts struct{ hunks, added, deleted int }
 
-// maxHunkCount bounds a header's declared counts; a larger number is not a
-// diff this client produced from a working tree.
-const maxHunkCount = 1 << 31
+// maxHunkCount bounds a header's declared numbers; a larger number is not a
+// diff this client produced from a working tree. It is the largest int32, so
+// the int conversion in hunkRange cannot wrap on a 32-bit build.
+const maxHunkCount = math.MaxInt32
 
 // checkHunks holds every hunk body to its header, the rules of admission.rs
 // admit_defect_context: a header `@@ -a[,b] +c[,d] @@[ section]`, body lines
