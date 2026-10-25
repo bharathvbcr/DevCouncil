@@ -545,7 +545,7 @@ What the report cannot see, each surfaced as a `skipped` count rather than hidde
   `outside_repo` with nothing past it examined, so the report cannot tell a host path that
   exists from one that does not; inside, a missing component, a dangling link included, is
   `missing_file`.
-- A path whose spelling differs from the on-disk entry only in case (`../guide.md` for
+- A path whose spelling differs from the on-disk entry only in case (`guide.md` for
   `GUIDE.md`) is `missing_file` with the on-disk spelling in its detail, on case-sensitive and
   case-insensitive file systems alike (each component is checked against its directory's
   entries, up to 20 000 per directory).
