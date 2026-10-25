@@ -1388,6 +1388,30 @@ async fn the_doc_drift_tool_reports_drift_over_mcp() {
 
     let escaping = tool(&store, "devmap_doc_drift", json!({"paths": ["../x.md"]})).await;
     assert_eq!(escaping["isError"], json!(true), "{escaping}");
+    // Each refusal names its own problem rather than one catch-all.
+    for (path, word) in [
+        ("/etc", "absolute"),
+        ("docs\\x", "backslash"),
+        ("../x", ".."),
+    ] {
+        let refused = tool(&store, "devmap_doc_drift", json!({"paths": [path]})).await;
+        assert_eq!(refused["isError"], json!(true), "{refused}");
+        let text = refused["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains(word), "{path}: {text}");
+        assert!(!text.contains("without `..`"), "{path}: {text}");
+    }
+    // The archive default is a published argument and is reported.
+    let defaults = tool(
+        &store,
+        "devmap_doc_drift",
+        json!({"default_excludes": false}),
+    )
+    .await;
+    assert_eq!(defaults["isError"], json!(false), "{defaults}");
+    assert_eq!(
+        defaults["structuredContent"]["docs_excluded_by_default"], 0,
+        "{defaults}"
+    );
 
     let empty = Arc::new(StoreSlot::ready(
         "empty",

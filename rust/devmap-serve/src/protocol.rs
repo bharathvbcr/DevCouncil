@@ -241,6 +241,10 @@ pub struct ServeState {
     pub unapplied: UnappliedEdits,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_budget() -> u32 {
     2_000
 }
@@ -578,6 +582,10 @@ pub enum IpcCommand {
         exclude: Vec<String>,
         #[serde(default = "default_budget")]
         budget: u32,
+        /// Leave out the default exclusions (`docs/archive`) unless a path
+        /// names something inside one. False scans everything.
+        #[serde(default = "default_true")]
+        default_excludes: bool,
     },
     /// Test files reachable through the inbound blast radius of some targets.
     Affected {
@@ -1043,6 +1051,7 @@ pub(crate) fn validate_request(request: &IpcRequest) -> Result<(), String> {
             paths,
             exclude,
             budget,
+            ..
         } => {
             // Refused, not trimmed, for the reason `neighbors` refuses: a
             // silently shortened list reads exactly like the whole request.
@@ -1619,8 +1628,9 @@ pub(crate) fn dispatch(
             paths,
             exclude,
             budget,
+            default_excludes,
         } => Ok(serde_json::to_value(
-            engine.doc_drift(&paths, &exclude, budget)?,
+            engine.doc_drift(&paths, &exclude, budget, default_excludes)?,
         )?),
         IpcCommand::Affected {
             targets,

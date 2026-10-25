@@ -2684,8 +2684,19 @@ impl<'a> StoreQueryEngine<'a> {
         paths: &[String],
         exclude: &[String],
         token_budget: u32,
+        default_excludes: bool,
     ) -> anyhow::Result<crate::doc_drift::DocDriftReport> {
-        crate::doc_drift::doc_drift_report(self.store, &self.cancel, paths, exclude, token_budget)
+        crate::doc_drift::doc_drift_report_with(
+            self.store,
+            &self.cancel,
+            &crate::doc_drift::DocDriftOptions {
+                paths,
+                exclude,
+                token_budget,
+                default_excludes,
+                limits: crate::doc_drift::Limits::default(),
+            },
+        )
     }
 
     /// The symbol rows a ranking runs over: the whole latest generation, or

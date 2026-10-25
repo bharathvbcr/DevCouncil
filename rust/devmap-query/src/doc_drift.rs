@@ -53,6 +53,66 @@
 //! under another qualifier is still `missing_symbol`, with the places it does
 //! exist in `current_locations`.
 //!
+//! # What the report cannot see, and says so
+//!
+//! Each of these is a counted skip, never a finding:
+//!
+//! * **A name that survives in a comment or a string suppresses
+//!   `missing_symbol`.** The index models functions, types and methods, not
+//!   enum variants, fields, config keys or other people's libraries, so a name
+//!   it does not define is reported only when it also appears as a word in no
+//!   indexed non-Markdown file. A deleted function still named in a comment
+//!   therefore goes unreported. Counted as `defined_outside_symbol_index`.
+//! * **`qualifier_unmatched` hides references to a renamed owner.**
+//!   `OldType::method`, where `method` still exists under another type, is not
+//!   reported: a stale qualifier cannot be told from a spelling the extractor
+//!   does not share. For a link, a symbol defined in the target file under
+//!   another owner is the same skip.
+//! * **`external_qualifier`**: a qualified name whose first segment is no
+//!   symbol, directory or file stem of this repository (`serde_json::Value`,
+//!   `tokio::spawn`, `React.Component`) names somebody else's code. Bare
+//!   well-known external names cannot be told apart and stay checked.
+//! * **Spans and links differ on a missing top-level directory.** A link is
+//!   resolved against its document, so a missing target is certainly broken:
+//!   `[main](oldpkg/main.go)` is `missing_file`. A span's root is ambiguous, so
+//!   `` `oldpkg/main.go` `` whose first directory exists nowhere in the tree
+//!   may belong to another repository and is counted as `unrooted_path`. A
+//!   deleted top-level directory is therefore reported through its links and
+//!   missed through its spans. Likewise `generated_path` (`tmp/`, `target/`,
+//!   tool dot-directories, `*.log`), `partial_path`, `not_a_path`,
+//!   `outside_repo`.
+//! * **Links through a symlink that leaves the repository** are `outside_repo`
+//!   and never stat past the link, so the report is no existence oracle for the
+//!   host. Secret paths are judged after links are resolved: an alias of
+//!   `.env` is `.env`.
+//! * **Opt-outs**: a whole-line comment outside a fence,
+//!   `<!-- devmap:doc-drift ignore-next-line -->` or
+//!   `<!-- devmap:doc-drift ignore-file -->`, drops the references on the next
+//!   line or in the file. What they hid is `skipped.ignored_by_comment`.
+//! * **`docs/archive/` is excluded by default** (`default_excludes`,
+//!   `docs_excluded_by_default` say so), lifted by naming a path inside it or
+//!   by `--no-default-excludes` / `default_excludes: false`.
+//!
+//! # Anchors
+//!
+//! Slugs follow github-slugger: the rendered heading text (inline code, link
+//! text, image alt, emphasis markers dropped, entities decoded), lowercased,
+//! everything but letters, marks, numbers, `-` and `_` removed, each space a
+//! `-`. A repeated slug takes the first free `-N`, skipping suffixes already
+//! taken. `id` and `name` attributes of HTML tags are anchors; headings inside
+//! blockquotes and list items count; `file.md#` and `#top` are the top of the
+//! page. A heading line too long to scan makes the target's anchors incomplete:
+//! a missing anchor there is `anchor_target_unscanned`, not a finding.
+//!
+//! # Bounds
+//!
+//! Extraction is linear in the document (comment stripping is one pass, bracket
+//! lookahead is budgeted per line) and checks for cancellation every few
+//! hundred lines. The unindexed-name word search reads at most 64 MiB of
+//! source, honours cancellation per file, and says when it was cut. The
+//! finding cap keeps the first 10 000 findings by (document, line), whichever
+//! pass found them, and reports both numbers.
+//!
 //! # Honesty
 //!
 //! Every cap carries both numbers and sets `walk_incomplete`: documents over
@@ -70,11 +130,15 @@ use std::path::Path;
 use devmap_store::{Store, StoredSymbol};
 use serde::{Deserialize, Serialize};
 
-use crate::cancel::Cancel;
+use crate::cancel::{Cancel, QueryCancelled};
 
 #[cfg(test)]
 #[path = "doc_drift_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "doc_drift_hardening_tests.rs"]
+mod hardening_tests;
 
 /// Lines longer than this are not scanned (counted under `line_too_long`). The
 /// inline scanner is bounded per line, so a hostile one-line document cannot
@@ -91,7 +155,10 @@ const LINK_LOOKAHEAD: usize = 512;
 /// Target facts kept between references.
 const TARGET_CACHE_CAP: usize = 512;
 /// Source bytes the word search for unindexed names reads at most.
-const MAX_WORD_SEARCH_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_WORD_SEARCH_BYTES: u64 = 64 * 1024 * 1024;
+/// Directory prefixes left out unless asked for by name: archived documents
+/// are historical records of what was true then.
+pub const DEFAULT_EXCLUDES: [&str; 1] = ["docs/archive"];
 /// Locations named on a moved-symbol finding.
 const MAX_LOCATIONS: usize = 5;
 
@@ -209,6 +276,8 @@ impl Extraction {
 struct Line {
     no: u32,
     text: String,
+    /// Named by an `ignore-next-line` comment.
+    ignored: bool,
 }
 
 fn is_blank(text: &str) -> bool {
@@ -274,29 +343,41 @@ fn fence_closes(text: &str, fence: (u8, usize)) -> bool {
 
 /// `text` with HTML comments removed. `in_comment` carries an open comment
 /// across lines. A `<!--` inside an inline code span is not a comment.
+///
+/// One pass: the backtick parity is carried forward from where the last
+/// marker was looked at, so a line of `<!--` after a stray backtick costs one
+/// visit per byte, not one recount of the line per marker.
 fn strip_comments(text: &str, in_comment: &mut bool) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
+    let mut pos = 0;
+    let mut counted_to = 0;
+    let mut odd = false;
     loop {
         if *in_comment {
-            match rest.find("-->") {
+            match text[pos..].find("-->") {
                 Some(end) => {
                     *in_comment = false;
-                    rest = &rest[end + 3..];
+                    pos += end + 3;
                 }
                 None => return out,
             }
             continue;
         }
-        let consumed = text.len() - rest.len();
-        let mut from = 0;
+        let mut from = pos;
         let start = loop {
-            match rest[from..].find("<!--") {
+            match text[from..].find("<!--") {
                 None => break None,
                 Some(offset) => {
                     let at = from + offset;
-                    let before = &text[..consumed + at];
-                    if before.bytes().filter(|b| *b == b'`').count() % 2 == 1 {
+                    if counted_to < at {
+                        let ticks = text.as_bytes()[counted_to..at]
+                            .iter()
+                            .filter(|b| **b == b'`')
+                            .count();
+                        odd ^= ticks % 2 == 1;
+                        counted_to = at;
+                    }
+                    if odd {
                         from = at + 4;
                     } else {
                         break Some(at);
@@ -306,13 +387,13 @@ fn strip_comments(text: &str, in_comment: &mut bool) -> String {
         };
         match start {
             None => {
-                out.push_str(rest);
+                out.push_str(&text[pos..]);
                 return out;
             }
             Some(at) => {
-                out.push_str(&rest[..at]);
+                out.push_str(&text[pos..at]);
                 *in_comment = true;
-                rest = &rest[at + 4..];
+                pos = at + 4;
             }
         }
     }
@@ -320,14 +401,26 @@ fn strip_comments(text: &str, in_comment: &mut bool) -> String {
 
 /// Every line of `text` that is prose: outside fences, indented code and HTML
 /// comments.
-fn prose_lines(text: &str) -> Vec<Line> {
+fn prose_lines(text: &str, cancel: Option<&Cancel>) -> Result<(Vec<Line>, bool), QueryCancelled> {
     let mut lines = Vec::new();
     let mut fence: Option<(u8, usize)> = None;
     let mut in_comment = false;
     let mut previous_blank = true;
     let mut previous_indented_code = false;
+    let mut ignore_line: Option<u32> = None;
+    let mut ignore_file = false;
     for (index, raw) in text.lines().enumerate() {
+        if let Some(cancel) = cancel {
+            cancel.check_every(index)?;
+        }
         let no = u32::try_from(index + 1).unwrap_or(u32::MAX);
+        if fence.is_none() {
+            match suppression(raw) {
+                Some(Suppression::NextLine) => ignore_line = Some(no.saturating_add(1)),
+                Some(Suppression::File) => ignore_file = true,
+                None => {}
+            }
+        }
         if let Some(open) = fence {
             if fence_closes(raw, open) {
                 fence = None;
@@ -357,9 +450,31 @@ fn prose_lines(text: &str) -> Vec<Line> {
         if indented_code {
             continue;
         }
-        lines.push(Line { no, text: visible });
+        lines.push(Line {
+            no,
+            text: visible,
+            ignored: ignore_line == Some(no),
+        });
     }
-    lines
+    Ok((lines, ignore_file))
+}
+
+/// The two deliberate opt-outs, each a whole-line HTML comment:
+/// `<!-- devmap:doc-drift ignore-next-line -->` and
+/// `<!-- devmap:doc-drift ignore-file -->`.
+enum Suppression {
+    NextLine,
+    File,
+}
+
+fn suppression(raw: &str) -> Option<Suppression> {
+    let trimmed = raw.trim();
+    let inner = trimmed.strip_prefix("<!--")?.strip_suffix("-->")?.trim();
+    match inner {
+        "devmap:doc-drift ignore-next-line" => Some(Suppression::NextLine),
+        "devmap:doc-drift ignore-file" => Some(Suppression::File),
+        _ => None,
+    }
 }
 
 fn percent_decode(text: &str) -> String {
@@ -384,59 +499,272 @@ fn percent_decode(text: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| text.to_string())
 }
 
-/// The GitHub slug of one heading's text.
-fn slugify(heading: &str) -> String {
-    let mut plain = String::with_capacity(heading.len());
-    let mut chars = heading.chars().peekable();
-    while let Some(ch) = chars.next() {
+/// A character entity (`&amp;`, `&#38;`, `&#x26;`) at the start of `rest`, as
+/// the character and the bytes it took. Only the handful a heading uses.
+fn entity(rest: &[char]) -> Option<(char, usize)> {
+    if rest.first() != Some(&'&') {
+        return None;
+    }
+    let end = rest.iter().take(12).position(|c| *c == ';')?;
+    let body: String = rest[1..end].iter().collect();
+    let decoded = match body.as_str() {
+        "amp" => '&',
+        "lt" => '<',
+        "gt" => '>',
+        "quot" => '"',
+        "apos" => '\'',
+        "nbsp" => '\u{a0}',
+        _ => {
+            let digits = body.strip_prefix('#')?;
+            let code = match digits.strip_prefix(['x', 'X']) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                None => digits.parse().ok()?,
+            };
+            char::from_u32(code)?
+        }
+    };
+    Some((decoded, end + 1))
+}
+
+/// The text a heading renders, which is what GitHub slugs: inline code keeps
+/// its content, a link or image keeps its text, emphasis markers and HTML tags
+/// go, entities decode, a backslash escape is its character. `_` is an
+/// emphasis delimiter only when a flanking pair matches (`_Emphasis_`, the
+/// `__` of `__init__`); inside a word (`snake_case`) it stays.
+fn heading_text(heading: &str) -> String {
+    let src: Vec<char> = heading.trim().chars().collect();
+    let mut out: Vec<char> = Vec::with_capacity(src.len());
+    // (index into `out`, can open, can close)
+    let mut underscores: Vec<(usize, bool, bool)> = Vec::new();
+    let mut unclosed: u64 = 0;
+    let mut i = 0;
+    while i < src.len() {
+        let ch = src[i];
         match ch {
-            // `[text](url)` keeps the text.
-            ']' if chars.peek() == Some(&'(') => {
-                let mut depth = 0u32;
-                for next in chars.by_ref() {
-                    match next {
-                        '(' => depth += 1,
-                        ')' => {
-                            depth = depth.saturating_sub(1);
-                            if depth == 0 {
+            '\\' if src.get(i + 1).is_some_and(char::is_ascii_punctuation) => {
+                out.push(src[i + 1]);
+                i += 2;
+            }
+            '`' => {
+                let run = src[i..].iter().take_while(|c| **c == '`').count();
+                let close = if run < 64 && unclosed & (1 << run) != 0 {
+                    None
+                } else {
+                    let mut j = i + run;
+                    let mut found = None;
+                    while j < src.len() {
+                        if src[j] == '`' {
+                            let n = src[j..].iter().take_while(|c| **c == '`').count();
+                            if n == run {
+                                found = Some(j);
                                 break;
                             }
+                            j += n;
+                        } else {
+                            j += 1;
                         }
-                        _ => {}
+                    }
+                    found
+                };
+                match close {
+                    Some(j) => {
+                        out.extend(&src[i + run..j]);
+                        i = j + run;
+                    }
+                    None => {
+                        if run < 64 {
+                            unclosed |= 1 << run;
+                        }
+                        i += run;
+                    }
+                }
+            }
+            ']' if matches!(src.get(i + 1), Some('(' | '[')) => {
+                // `](destination)` and `][label]` are not text.
+                let (open, shut) = if src[i + 1] == '(' {
+                    ('(', ')')
+                } else {
+                    ('[', ']')
+                };
+                let mut depth = 0u32;
+                let mut j = i + 1;
+                let mut end = None;
+                while j < src.len() {
+                    if src[j] == '\\' {
+                        j += 2;
+                        continue;
+                    }
+                    if src[j] == open {
+                        depth += 1;
+                    } else if src[j] == shut {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(j);
+                            break;
+                        }
+                    }
+                    j += 1;
+                }
+                match end {
+                    Some(j) => i = j + 1,
+                    None => {
+                        out.push(ch);
+                        i += 1;
                     }
                 }
             }
             '<' => {
                 // An inline HTML tag contributes nothing.
-                let mut tag = String::new();
-                let mut closed = false;
-                for next in chars.by_ref() {
-                    if next == '>' {
-                        closed = true;
-                        break;
+                match src[i..].iter().take(256).position(|c| *c == '>') {
+                    Some(offset)
+                        if src
+                            .get(i + 1)
+                            .is_some_and(|c| c.is_alphabetic() || *c == '/') =>
+                    {
+                        i += offset + 1;
                     }
-                    tag.push(next);
-                    if tag.len() > 256 {
-                        break;
+                    _ => {
+                        out.push(ch);
+                        i += 1;
                     }
-                }
-                if !closed {
-                    plain.push('<');
-                    plain.push_str(&tag);
                 }
             }
-            _ => plain.push(ch),
+            '&' => match entity(&src[i..]) {
+                Some((decoded, used)) => {
+                    out.push(decoded);
+                    i += used;
+                }
+                None => {
+                    out.push(ch);
+                    i += 1;
+                }
+            },
+            '_' => {
+                let before = i.checked_sub(1).map(|j| src[j]);
+                let after = src.get(i + 1).copied();
+                let before_space = before.is_none_or(char::is_whitespace);
+                let after_space = after.is_none_or(char::is_whitespace);
+                let before_word = before.is_some_and(char::is_alphanumeric);
+                let after_word = after.is_some_and(char::is_alphanumeric);
+                underscores.push((
+                    out.len(),
+                    !after_space && !before_word,
+                    !before_space && !after_word,
+                ));
+                out.push('_');
+                i += 1;
+            }
+            _ => {
+                out.push(ch);
+                i += 1;
+            }
         }
     }
-    let mut slug = String::with_capacity(plain.len());
-    for ch in plain.trim().chars() {
+    let mut dropped: HashSet<usize> = HashSet::new();
+    let mut open: Vec<usize> = Vec::new();
+    for (at, can_open, can_close) in underscores {
+        if can_close && !open.is_empty() {
+            if let Some(opener) = open.pop() {
+                dropped.insert(opener);
+                dropped.insert(at);
+            }
+        } else if can_open {
+            open.push(at);
+        }
+    }
+    out.iter()
+        .enumerate()
+        .filter(|(at, _)| !dropped.contains(at))
+        .map(|(_, c)| *c)
+        .collect()
+}
+
+/// Combining marks, which github-slugger keeps (`\p{M}`).
+fn is_mark(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF | 0xFE20..=0xFE2F
+    )
+}
+
+/// The GitHub slug of one heading's source text (github-slugger): the
+/// rendered text lowercased, everything but letters, marks, numbers, `-` and
+/// `_` removed, and each ASCII space a `-`. Nothing is collapsed or trimmed:
+/// `Tom & Jerry` is `tom--jerry`.
+fn slugify(heading: &str) -> String {
+    let mut slug = String::new();
+    for ch in heading_text(heading).chars() {
         if ch == ' ' {
             slug.push('-');
-        } else if ch == '-' || ch == '_' || ch.is_alphanumeric() {
+        } else if ch == '-' || ch == '_' || ch.is_alphanumeric() || is_mark(ch) {
             slug.extend(ch.to_lowercase());
         }
     }
     slug
+}
+
+/// The anchors named by `id="…"` and `name="…"` attributes of the HTML tags on
+/// `line` (`<a name="top"></a>`), lowercased.
+fn tag_anchors(line: &str, into: &mut BTreeSet<String>) {
+    if !line.contains('<') {
+        return;
+    }
+    let bytes = line.as_bytes();
+    let mut at = 0;
+    let mut failures = 0;
+    while let Some(offset) = line[at..].find('<') {
+        let start = at + offset;
+        let window = &bytes[start..bytes.len().min(start + 1024)];
+        let Some(len) = window.iter().position(|b| *b == b'>') else {
+            failures += 1;
+            if failures > 64 {
+                return;
+            }
+            at = start + 1;
+            continue;
+        };
+        let tag = &line[start..start + len];
+        let lower = tag.to_ascii_lowercase();
+        for attribute in [" id=", " name="] {
+            let Some(found) = lower.find(attribute) else {
+                continue;
+            };
+            let value = &tag[found + attribute.len()..];
+            let value = match value.chars().next() {
+                Some(quote @ ('"' | '\'')) => {
+                    let inner = &value[1..];
+                    inner.find(quote).map(|end| &inner[..end])
+                }
+                Some(_) => Some(value.split_whitespace().next().unwrap_or("")),
+                None => None,
+            };
+            if let Some(value) = value.filter(|v| !v.is_empty()) {
+                into.insert(value.to_lowercase());
+            }
+        }
+        at = start + len + 1;
+    }
+}
+
+/// `text` with block prefixes (blockquote `>`, list markers) peeled, so a
+/// heading inside either is seen as the heading it is.
+fn peel_block_prefixes(text: &str) -> &str {
+    let mut rest = text;
+    for _ in 0..8 {
+        let trimmed = rest.trim_start();
+        if let Some(after) = trimmed.strip_prefix('>') {
+            rest = after;
+        } else if starts_list_item(trimmed) {
+            let skip = trimmed
+                .find([' ', '\t'])
+                .map(|at| at + 1)
+                .unwrap_or(trimmed.len());
+            rest = &trimmed[skip..];
+        } else {
+            return rest;
+        }
+    }
+    rest
 }
 
 fn atx_heading(text: &str) -> Option<&str> {
@@ -475,44 +803,68 @@ fn setext_underline(text: &str) -> bool {
         && (trimmed.bytes().all(|b| b == b'=') || trimmed.bytes().all(|b| b == b'-'))
 }
 
-/// Every anchor the headings of `text` produce, GitHub style: lowercase, no
-/// punctuation but `-` and `_`, spaces as `-`, and the second heading with the
-/// same slug `slug-1`, the third `slug-2`.
-pub fn heading_slugs(text: &str) -> BTreeSet<String> {
-    let mut slugs = BTreeSet::new();
-    let mut seen: HashMap<String, u32> = HashMap::new();
-    let mut add = |heading: &str| {
-        let base = slugify(heading);
-        let count = seen.entry(base.clone()).or_insert(0);
-        let slug = if *count == 0 {
-            base
-        } else {
-            format!("{base}-{count}")
-        };
-        *count += 1;
+/// The anchors of one document.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Anchors {
+    pub slugs: BTreeSet<String>,
+    /// A line too long to scan could have been a heading: the set may be
+    /// missing an anchor, so an absent one is not proof.
+    pub incomplete: bool,
+}
+
+/// Every anchor the headings of `text` produce, as github-slugger does, plus
+/// the `id` and `name` of HTML tags. Headings count inside blockquotes and list
+/// items, ATX and setext, with inline code, links and emphasis reduced to
+/// their text. A repeated slug takes the first free `-N`: `# Foo`, `# Foo-1`,
+/// `# Foo`, `# Foo` give `foo`, `foo-1`, `foo-2`, `foo-3`, because a suffix
+/// already taken is skipped, exactly as the slugger's occurrence table does.
+pub fn heading_anchors(text: &str, cancel: Option<&Cancel>) -> Result<Anchors, QueryCancelled> {
+    let mut anchors = Anchors::default();
+    let mut occurrences: HashMap<String, u32> = HashMap::new();
+    let mut add = |heading: &str, slugs: &mut BTreeSet<String>| {
+        let original = slugify(heading);
+        let mut slug = original.clone();
+        while occurrences.contains_key(&slug) {
+            let count = occurrences.entry(original.clone()).or_insert(0);
+            *count += 1;
+            slug = format!("{original}-{count}");
+        }
+        occurrences.insert(slug.clone(), 0);
         slugs.insert(slug);
     };
-    let mut previous: Option<(u32, &str)> = None;
-    let lines = prose_lines(text);
+    let (lines, _) = prose_lines(text, cancel)?;
     let mut paragraph: Option<String> = None;
+    let mut previous: Option<(u32, bool)> = None;
     for line in &lines {
-        if line.text.len() > MAX_LINE_BYTES {
+        let long = line.text.len() > MAX_LINE_BYTES;
+        let peeled = peel_block_prefixes(&line.text);
+        if long {
+            // A long line is only a problem if it is, or may become, a heading.
+            if peeled.trim_start().starts_with('#') {
+                anchors.incomplete = true;
+            }
+            paragraph = None;
+            previous = Some((line.no, true));
+            continue;
+        }
+        tag_anchors(&line.text, &mut anchors.slugs);
+        if let Some(heading) = atx_heading(peeled) {
+            add(heading, &mut anchors.slugs);
             paragraph = None;
             previous = None;
             continue;
         }
-        if let Some(heading) = atx_heading(&line.text) {
-            add(heading);
-            paragraph = None;
-            previous = None;
-            continue;
-        }
-        let consecutive = previous.is_some_and(|(no, _)| no + 1 == line.no);
-        if setext_underline(&line.text) && consecutive {
-            if let Some(heading) = paragraph.take() {
-                add(&heading);
-                previous = None;
-                continue;
+        let consecutive = previous.filter(|(no, _)| no + 1 == line.no);
+        if setext_underline(&line.text) {
+            if let Some((_, true)) = consecutive {
+                anchors.incomplete = true;
+            }
+            if consecutive.is_some() {
+                if let Some(heading) = paragraph.take() {
+                    add(&heading, &mut anchors.slugs);
+                    previous = None;
+                    continue;
+                }
             }
         }
         let trimmed = line.text.trim();
@@ -521,9 +873,16 @@ pub fn heading_slugs(text: &str) -> BTreeSet<String> {
             && !starts_list_item(trimmed)
             && !trimmed.starts_with(['>', '|']);
         paragraph = plain_paragraph.then(|| trimmed.to_string());
-        previous = Some((line.no, ""));
+        previous = Some((line.no, false));
     }
-    slugs
+    Ok(anchors)
+}
+
+/// The slugs of `text`'s anchors, with no cancellation. See [`heading_anchors`].
+pub fn heading_slugs(text: &str) -> BTreeSet<String> {
+    heading_anchors(text, None)
+        .map(|anchors| anchors.slugs)
+        .unwrap_or_default()
 }
 
 /// `target` read from the document at `doc`, as a normalised repo-relative
@@ -776,18 +1135,36 @@ fn span_content(inner: &str) -> &str {
 
 /// The index of the `]` matching the `[` at `open`, looking at most
 /// [`LINK_LOOKAHEAD`] bytes ahead and stepping over code spans and escapes.
-fn matching_bracket(bytes: &[u8], open: usize) -> Option<usize> {
+///
+/// `budget` is the line's remaining scan allowance, charged a unit per byte
+/// looked at: a line of unmatched `[` would otherwise cost the lookahead once
+/// per bracket.
+fn matching_bracket(bytes: &[u8], open: usize, budget: &mut usize) -> Option<usize> {
     let limit = bytes.len().min(open + LINK_LOOKAHEAD);
     let mut depth = 0usize;
     let mut i = open;
+    let mut unclosed: u64 = 0;
     while i < limit {
+        if *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
         match bytes[i] {
             b'\\' => i += 1,
             b'`' => {
                 let run = bytes[i..].iter().take_while(|b| **b == b'`').count();
-                if let Some(close) = find_closing(&bytes[..limit], i + run, run) {
+                let closing = if run < 64 && unclosed & (1 << run) != 0 {
+                    None
+                } else {
+                    find_closing(&bytes[..limit], i + run, run)
+                };
+                if let Some(close) = closing {
+                    *budget = budget.saturating_sub(close - i);
                     i = close + run - 1;
                 } else {
+                    if run < 64 {
+                        unclosed |= 1 << run;
+                    }
                     i += run - 1;
                 }
             }
@@ -807,9 +1184,20 @@ fn matching_bracket(bytes: &[u8], open: usize) -> Option<usize> {
 
 /// The destination of the link whose `(` is at `open`, and the index after the
 /// closing `)`.
-fn link_destination(line: &str, open: usize) -> Option<(&str, usize)> {
+fn link_destination<'a>(
+    line: &'a str,
+    open: usize,
+    budget: &mut usize,
+) -> Option<(&'a str, usize)> {
     let bytes = line.as_bytes();
     let limit = bytes.len().min(open + LINK_LOOKAHEAD);
+    // Charged up front for the whole window it may read.
+    let cost = limit.saturating_sub(open);
+    if *budget < cost {
+        *budget = 0;
+        return None;
+    }
+    *budget -= cost;
     let mut i = open + 1;
     while i < limit && matches!(bytes[i], b' ' | b'\t') {
         i += 1;
@@ -875,6 +1263,8 @@ struct Scan<'a> {
     /// found none means no later run of that length can, so each length is
     /// searched for failure at most once and the scan stays linear.
     unclosed: u64,
+    /// Bytes of bracket and destination lookahead this line may still spend.
+    budget: usize,
 }
 
 impl Scan<'_> {
@@ -949,9 +1339,10 @@ impl Scan<'_> {
                     }
                 }
                 b'[' => {
-                    let end = matching_bracket(bytes, i).and_then(|close| {
+                    let budget = &mut self.budget;
+                    let end = matching_bracket(bytes, i, budget).and_then(|close| {
                         (bytes.get(close + 1) == Some(&b'('))
-                            .then(|| link_destination(line, close + 1).map(|d| (close, d)))
+                            .then(|| link_destination(line, close + 1, budget).map(|d| (close, d)))
                             .flatten()
                     });
                     match end {
@@ -999,27 +1390,61 @@ fn reference_definition(text: &str) -> Option<&str> {
 
 /// Every reference in `text`. Pure: no store, no file system.
 pub fn extract_references(text: &str) -> Extraction {
+    extract_references_cancellable(text, None).unwrap_or_default()
+}
+
+/// [`extract_references`], consulting `cancel` every few hundred lines so an
+/// abandoned scan of a large document stops promptly. Everything in it is
+/// linear in the document: comment stripping, fence tracking and the inline
+/// scan, whose bracket lookahead is budgeted per line.
+///
+/// Two deliberate opt-outs, each a whole-line HTML comment outside a fence:
+/// `<!-- devmap:doc-drift ignore-next-line -->` drops every reference on the
+/// next line, `<!-- devmap:doc-drift ignore-file -->` every reference in the
+/// document. What they hide is counted under `skipped.ignored_by_comment`, so
+/// the opt-out stays visible.
+pub fn extract_references_cancellable(
+    text: &str,
+    cancel: Option<&Cancel>,
+) -> Result<Extraction, QueryCancelled> {
     let mut out = Extraction::default();
-    for line in prose_lines(text) {
+    let (lines, ignore_file) = prose_lines(text, cancel)?;
+    let mut hidden = 0u32;
+    for line in lines {
         if line.text.len() > MAX_LINE_BYTES {
             out.skip("line_too_long");
             continue;
         }
+        // An ignored line is scanned into a scratch extraction so that what the
+        // comment hid is counted rather than lost.
+        let mut scratch = Extraction::default();
+        let target = if line.ignored { &mut scratch } else { &mut out };
         let mut scan = Scan {
-            out: &mut out,
+            out: target,
             line: line.no,
             unclosed: 0,
+            budget: line.text.len() * 32 + 4096,
         };
-        if let Some(destination) = reference_definition(&line.text) {
-            scan.link(destination, Vec::new());
-            continue;
+        match reference_definition(&line.text) {
+            Some(destination) => scan.link(destination, Vec::new()),
+            None => scan.scan(&line.text, false),
         }
-        scan.scan(&line.text, false);
-        if scan.out.truncated {
+        let stop = scan.out.truncated && !line.ignored;
+        if line.ignored {
+            hidden += scratch.candidates();
+        }
+        if stop {
             break;
         }
     }
-    out
+    if ignore_file {
+        hidden += out.candidates();
+        out = Extraction::default();
+    }
+    if hidden > 0 {
+        *out.skipped.entry("ignored_by_comment").or_insert(0) += hidden;
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1076,6 +1501,13 @@ pub struct DocDriftReport {
     pub docs_scanned: u32,
     /// Markdown documents the request matched, before the document cap.
     pub docs_total: u32,
+    /// The default exclusions that left documents out of this scan (empty when
+    /// none did, or when the call lifted them). They are not in `docs_total`.
+    #[serde(default)]
+    pub default_excludes: Vec<String>,
+    /// How many documents those exclusions left out.
+    #[serde(default)]
+    pub docs_excluded_by_default: u32,
     /// Candidates found: checked, skipped and those that held.
     pub references: u32,
     /// Checks made, by kind: `link`, `path`, `line`, `anchor`, `symbol`.
@@ -1115,11 +1547,14 @@ fn clean_prefixes(values: &[String], what: &str) -> anyhow::Result<Vec<String>> 
         if trimmed.is_empty() {
             anyhow::bail!("{what} entries must not be empty");
         }
-        if trimmed.starts_with('/')
-            || trimmed.contains('\\')
-            || trimmed.split('/').any(|part| part == "..")
-        {
-            anyhow::bail!("{what} {trimmed:?} must be a repo-relative path without `..`");
+        if trimmed.starts_with('/') {
+            anyhow::bail!("{what} {trimmed:?} is an absolute path; give a repo-relative one");
+        }
+        if trimmed.contains('\\') {
+            anyhow::bail!("{what} {trimmed:?} contains a backslash; separate directories with `/`");
+        }
+        if trimmed.split('/').any(|part| part == "..") {
+            anyhow::bail!("{what} {trimmed:?} contains `..`, which could leave the repository");
         }
         let cleaned = trimmed
             .trim_start_matches("./")
@@ -1149,13 +1584,42 @@ fn is_markdown_path(path: &str) -> bool {
 /// Facts about a file that a reference into it needs.
 struct TargetFacts {
     lines: usize,
-    slugs: Option<BTreeSet<String>>,
+    anchors: Option<Anchors>,
 }
 
 enum PathState {
     Missing,
+    /// Some component is a link whose real location is outside the repository
+    /// (or cannot be resolved). Never stat beyond it: whether a path past the
+    /// link exists is a fact about the host, not about this repository.
+    Outside,
     Dir,
     File,
+}
+
+impl PathState {
+    fn exists(&self) -> bool {
+        matches!(self, Self::Dir | Self::File)
+    }
+}
+
+/// The bounds one call works inside. Tests lower them; callers get
+/// [`Limits::default`].
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// Findings kept; the first ones by (document, line).
+    pub max_findings: usize,
+    /// Source bytes the word search for unindexed names reads.
+    pub max_word_search_bytes: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_findings: MAX_FINDINGS,
+            max_word_search_bytes: MAX_WORD_SEARCH_BYTES,
+        }
+    }
 }
 
 struct Resolver<'a> {
@@ -1167,9 +1631,19 @@ struct Resolver<'a> {
     facts: HashMap<String, Option<std::rc::Rc<TargetFacts>>>,
     checked: BTreeMap<String, u32>,
     skipped: BTreeMap<String, u32>,
-    findings: Vec<DocDriftFinding>,
+    /// Kept findings, ordered by (document, line, emission): the cap drops the
+    /// last ones in that order, whichever pass found them.
+    findings: BTreeMap<(String, u32, u64), DocDriftFinding>,
+    sequence: u64,
     total_findings: u32,
     unreadable_targets: u32,
+    /// Targets whose heading scan skipped a line that may have been a heading.
+    unscanned_anchor_targets: u32,
+    limits: Limits,
+    /// Names a document could qualify a symbol with: every symbol name and every
+    /// directory and file stem, normalised. A qualifier outside it names
+    /// somebody else's code.
+    known_qualifiers: HashSet<String>,
     /// Symbols the index does not define, awaiting the word search.
     pending: Vec<PendingSymbol>,
 }
@@ -1207,27 +1681,77 @@ impl<'a> Resolver<'a> {
         current_locations: Vec<String>,
     ) {
         self.total_findings = self.total_findings.saturating_add(1);
-        if self.findings.len() < MAX_FINDINGS {
-            self.findings.push(DocDriftFinding {
+        self.sequence += 1;
+        self.findings.insert(
+            (doc.to_string(), line, self.sequence),
+            DocDriftFinding {
                 doc: doc.to_string(),
                 line,
                 kind,
                 reference: reference.to_string(),
                 detail,
                 current_locations,
-            });
+            },
+        );
+        while self.findings.len() > self.limits.max_findings {
+            self.findings.pop_last();
         }
     }
 
+    /// What `rel` is on disk, walking it one component at a time so a link
+    /// that leaves the repository is refused before anything past it is looked
+    /// at. `rel` is normalised and relative to the root.
     fn state(&self, rel: &str) -> PathState {
-        if rel.is_empty() {
-            return PathState::Dir;
+        let mut current = self.root.to_path_buf();
+        let mut parts = rel.split('/').filter(|part| !part.is_empty()).peekable();
+        while let Some(part) = parts.next() {
+            current.push(part);
+            let Ok(meta) = std::fs::symlink_metadata(&current) else {
+                return PathState::Missing;
+            };
+            let meta = if meta.file_type().is_symlink() {
+                match current.canonicalize() {
+                    Ok(real) if real.starts_with(self.root) => match std::fs::metadata(&real) {
+                        Ok(meta) => {
+                            current = real;
+                            meta
+                        }
+                        Err(_) => return PathState::Missing,
+                    },
+                    // Out of the tree, dangling, or a loop: not followed.
+                    _ => return PathState::Outside,
+                }
+            } else {
+                meta
+            };
+            if parts.peek().is_none() {
+                return if meta.is_dir() {
+                    PathState::Dir
+                } else {
+                    PathState::File
+                };
+            }
+            if !meta.is_dir() {
+                return PathState::Missing;
+            }
         }
-        match std::fs::metadata(self.root.join(rel)) {
-            Ok(meta) if meta.is_dir() => PathState::Dir,
-            Ok(_) => PathState::File,
-            Err(_) => PathState::Missing,
+        PathState::Dir
+    }
+
+    /// Whether `rel` is a secret path as written or once its links are
+    /// resolved: `docs/alias -> ../.env` is `.env`.
+    fn is_secret(&self, rel: &str) -> bool {
+        if devmap_extract::secret::is_secret_path(rel) {
+            return true;
         }
+        std::fs::canonicalize(self.root.join(rel))
+            .ok()
+            .and_then(|real| {
+                real.strip_prefix(self.root)
+                    .ok()
+                    .map(|inside| inside.to_string_lossy().replace('\\', "/"))
+            })
+            .is_some_and(|real| devmap_extract::secret::is_secret_path(&real))
     }
 
     /// Line count and heading slugs of `rel`. `None` when the file cannot be
@@ -1237,18 +1761,23 @@ impl<'a> Resolver<'a> {
             return Ok(cached.clone());
         }
         self.cancel.check()?;
-        let facts = devmap_extract::safe_fs::read_repo_source(
+        let text = devmap_extract::safe_fs::read_repo_source(
             Some(self.root),
             rel,
             devmap_extract::MAX_SOURCE_BYTES,
         )
-        .ok()
-        .map(|text| {
-            std::rc::Rc::new(TargetFacts {
+        .ok();
+        let facts = match text {
+            None => None,
+            Some(text) => Some(std::rc::Rc::new(TargetFacts {
                 lines: text.lines().count(),
-                slugs: is_markdown_path(rel).then(|| heading_slugs(&text)),
-            })
-        });
+                anchors: if is_markdown_path(rel) {
+                    Some(heading_anchors(&text, Some(self.cancel))?)
+                } else {
+                    None
+                },
+            })),
+        };
         if self.facts.len() < TARGET_CACHE_CAP {
             self.facts.insert(rel.to_string(), facts.clone());
         }
@@ -1264,7 +1793,7 @@ impl<'a> Resolver<'a> {
         rel: &str,
         wanted: (u32, u32),
     ) -> anyhow::Result<()> {
-        if devmap_extract::secret::is_secret_path(rel) {
+        if self.is_secret(rel) {
             self.skip("secret_path");
             return Ok(());
         }
@@ -1325,6 +1854,15 @@ impl<'a> Resolver<'a> {
         name: &str,
         written: &str,
     ) {
+        // `serde_json::Value`, `tokio::spawn`: a qualifier that is no type,
+        // module, crate, package or directory of this repository names
+        // somebody else's code, whose absence from the index is no drift.
+        if let Some(first) = qualifier.first() {
+            if !self.known_qualifiers.contains(&normalise_segment(first)) {
+                self.skip("external_qualifier");
+                return;
+            }
+        }
         self.check("symbol");
         if !self.matches(qualifier, name).is_empty() {
             return;
@@ -1365,13 +1903,14 @@ impl<'a> Resolver<'a> {
             if remaining == 0 {
                 break;
             }
-            if language == "markdown" || devmap_extract::secret::is_secret_path(path) {
+            if language == "markdown" || self.is_secret(path) {
                 continue;
             }
-            if bytes_read >= MAX_WORD_SEARCH_BYTES {
+            if bytes_read >= self.limits.max_word_search_bytes {
                 cut = Some(format!(
-                    "the word search over source files stopped at {MAX_WORD_SEARCH_BYTES} bytes; \
-                     names it had not found were left unchecked"
+                    "the word search over source files stopped after {bytes_read} bytes (its bound is {}); \
+                     names it had not found by then were left unchecked, not reported",
+                    self.limits.max_word_search_bytes
                 ));
                 break;
             }
@@ -1446,8 +1985,18 @@ impl<'a> Resolver<'a> {
             self.skip("outside_repo");
             return Ok(());
         };
+        // `file.md#` is the top of the page, and GitHub reads `#top` the same.
+        let anchor = anchor.filter(|a| !a.is_empty() && !a.eq_ignore_ascii_case("top"));
+        let state = self.state(&rel);
+        if matches!(state, PathState::Outside) {
+            // Through a link that leaves the repository: not followed, not
+            // judged.
+            self.skip("outside_repo");
+            return Ok(());
+        }
         self.check("link");
-        match self.state(&rel) {
+        match state {
+            PathState::Outside => {}
             PathState::Missing => {
                 if is_generated_path(&rel) {
                     // A link to a log or a build output that a clean checkout
@@ -1482,12 +2031,42 @@ impl<'a> Resolver<'a> {
         }
         if self.is_code_file(&rel) {
             for written in symbols {
-                // The link names the file, so the qualifier adds nothing.
-                let (_, name) = split_written(written);
+                let (qualifier, name) = split_written(written);
                 self.check("symbol");
                 let all = self.by_name.get(name.as_str()).cloned().unwrap_or_default();
-                if all.iter().any(|symbol| symbol.path == rel) {
+                let here: Vec<&StoredSymbol> = all
+                    .iter()
+                    .filter(|symbol| symbol.path == rel)
+                    .copied()
+                    .collect();
+                if !here.is_empty() {
+                    if qualifier.is_empty() || here.iter().any(|s| qualifier_matches(s, &qualifier))
+                    {
+                        continue;
+                    }
+                    // Defined in the file, under another owner than the link
+                    // text names: renamed type or different spelling, unknowable.
+                    self.skip("qualifier_unmatched");
                     continue;
+                }
+                // The index has no such symbol in the file. That is not yet
+                // "moved": enum variants, fields and the like are not indexed.
+                // Only a name that appears nowhere in the file may be reported.
+                if self.is_secret(&rel) {
+                    self.skip("secret_path");
+                    continue;
+                }
+                match self.file_mentions(&rel, &name)? {
+                    None => {
+                        self.unreadable_targets += 1;
+                        self.skip("unreadable_target");
+                        continue;
+                    }
+                    Some(true) => {
+                        self.skip("defined_outside_symbol_index");
+                        continue;
+                    }
+                    Some(false) => {}
                 }
                 let elsewhere: Vec<&StoredSymbol> = all
                     .iter()
@@ -1521,6 +2100,19 @@ impl<'a> Resolver<'a> {
         Ok(())
     }
 
+    /// Whether `name` appears as a word anywhere in `rel`. `None` when the file
+    /// cannot be read.
+    fn file_mentions(&self, rel: &str, name: &str) -> anyhow::Result<Option<bool>> {
+        self.cancel.check()?;
+        Ok(devmap_extract::safe_fs::read_repo_source(
+            Some(self.root),
+            rel,
+            devmap_extract::MAX_SOURCE_BYTES,
+        )
+        .ok()
+        .map(|text| words(&text).any(|word| word == name)))
+    }
+
     /// Link-text symbols whose target is not a code file stand on their own.
     fn standalone_symbols(&mut self, doc: &str, line: u32, symbols: &[String]) {
         for written in symbols {
@@ -1537,7 +2129,7 @@ impl<'a> Resolver<'a> {
         rel: &str,
         anchor: &str,
     ) -> anyhow::Result<()> {
-        if devmap_extract::secret::is_secret_path(rel) {
+        if self.is_secret(rel) {
             self.skip("secret_path");
             return Ok(());
         }
@@ -1554,9 +2146,9 @@ impl<'a> Resolver<'a> {
         };
         let slug = percent_decode(anchor).to_lowercase();
         let heading_exists = facts
-            .slugs
+            .anchors
             .as_ref()
-            .is_some_and(|slugs| slugs.contains(&slug));
+            .is_some_and(|anchors| anchors.slugs.contains(&slug));
         if heading_exists {
             self.check("anchor");
             return Ok(());
@@ -1579,6 +2171,12 @@ impl<'a> Resolver<'a> {
                 }
             }
             None => {
+                // A line too long to scan could have held the heading.
+                if facts.anchors.as_ref().is_some_and(|a| a.incomplete) {
+                    self.unscanned_anchor_targets += 1;
+                    self.skip("anchor_target_unscanned");
+                    return Ok(());
+                }
                 self.check("anchor");
                 self.find(
                     doc,
@@ -1618,11 +2216,18 @@ impl<'a> Resolver<'a> {
             Some((first, last)) => format!("{path}:{first}-{last}"),
             None => path.to_string(),
         };
-        let existing = candidates
+        let states: Vec<PathState> = candidates.iter().map(|c| self.state(c)).collect();
+        let existing = states
             .iter()
-            .find(|candidate| !matches!(self.state(candidate), PathState::Missing))
-            .cloned();
+            .position(PathState::exists)
+            .map(|at| candidates[at].clone());
         let Some(existing) = existing else {
+            // Through a link that leaves the repository, nothing was looked
+            // at and nothing is claimed: neither "exists" nor "is missing".
+            if states.iter().any(|s| matches!(s, PathState::Outside)) {
+                self.skip("outside_repo");
+                return Ok(());
+            }
             // `db/query.rs` for a file the index knows by a longer path.
             if candidates.iter().any(|c| self.suffixes.contains(c)) {
                 self.skip("partial_path");
@@ -1640,9 +2245,8 @@ impl<'a> Resolver<'a> {
             // against some other root: a sibling repository, a crate directory,
             // an example. Not checkable, not drift.
             let first = path.split('/').next().unwrap_or("");
-            let rooted = !matches!(self.state(first), PathState::Missing)
-                || resolve_relative(doc, first)
-                    .is_some_and(|rel| !matches!(self.state(&rel), PathState::Missing));
+            let rooted = self.state(first).exists()
+                || resolve_relative(doc, first).is_some_and(|rel| self.state(&rel).exists());
             if !rooted {
                 self.skip("unrooted_path");
                 return Ok(());
@@ -1772,9 +2376,51 @@ pub fn doc_drift_report(
     exclude: &[String],
     token_budget: u32,
 ) -> anyhow::Result<DocDriftReport> {
-    let include = clean_prefixes(paths, "path")?;
-    let exclude = clean_prefixes(exclude, "exclude")?;
+    doc_drift_report_with(
+        store,
+        cancel,
+        &DocDriftOptions {
+            paths,
+            exclude,
+            token_budget,
+            default_excludes: true,
+            limits: Limits::default(),
+        },
+    )
+}
+
+/// What one call asks. `default_excludes` leaves out the [`DEFAULT_EXCLUDES`]
+/// unless a path names something inside one.
+pub struct DocDriftOptions<'a> {
+    pub paths: &'a [String],
+    pub exclude: &'a [String],
+    pub token_budget: u32,
+    pub default_excludes: bool,
+    pub limits: Limits,
+}
+
+/// [`doc_drift_report`] with every knob.
+pub fn doc_drift_report_with(
+    store: &Store,
+    cancel: &Cancel,
+    options: &DocDriftOptions<'_>,
+) -> anyhow::Result<DocDriftReport> {
+    let token_budget = options.token_budget;
+    let include = clean_prefixes(options.paths, "path")?;
+    let exclude = clean_prefixes(options.exclude, "exclude")?;
+    // A default exclusion is lifted by naming a path inside it.
+    let defaults: Vec<&str> = if options.default_excludes {
+        DEFAULT_EXCLUDES
+            .iter()
+            .filter(|prefix| !include.iter().any(|p| under_prefix(p, prefix)))
+            .copied()
+            .collect()
+    } else {
+        Vec::new()
+    };
     let unavailable = |reason: &str| DocDriftReport {
+        default_excludes: Vec::new(),
+        docs_excluded_by_default: 0,
         available: false,
         docs_scanned: 0,
         docs_total: 0,
@@ -1808,6 +2454,7 @@ pub fn doc_drift_report(
 
     let mut reasons: Vec<String> = Vec::new();
     let mut docs: Vec<&str> = Vec::new();
+    let mut excluded_by_default = 0u32;
     for (path, language) in &files {
         if language != "markdown" {
             continue;
@@ -1816,6 +2463,10 @@ pub fn doc_drift_report(
             continue;
         }
         if exclude.iter().any(|p| under_prefix(path, p)) {
+            continue;
+        }
+        if defaults.iter().any(|p| under_prefix(path, p)) {
+            excluded_by_default += 1;
             continue;
         }
         docs.push(path);
@@ -1866,6 +2517,16 @@ pub fn doc_drift_report(
             .or_default()
             .push(symbol);
     }
+    let mut known_qualifiers: HashSet<String> =
+        by_name.keys().map(|name| normalise_segment(name)).collect();
+    for (path, _) in &files {
+        for part in path.split('/') {
+            known_qualifiers.insert(normalise_segment(part));
+            if let Some((stem, _)) = part.rsplit_once('.') {
+                known_qualifiers.insert(normalise_segment(stem));
+            }
+        }
+    }
     let mut resolver = Resolver {
         root: &root,
         cancel,
@@ -1878,9 +2539,13 @@ pub fn doc_drift_report(
             .map(|kind| (kind.to_string(), 0))
             .collect(),
         skipped: BTreeMap::new(),
-        findings: Vec::new(),
+        findings: BTreeMap::new(),
+        sequence: 0,
         total_findings: 0,
         unreadable_targets: 0,
+        unscanned_anchor_targets: 0,
+        limits: options.limits,
+        known_qualifiers,
         pending: Vec::new(),
     };
 
@@ -1891,7 +2556,7 @@ pub fn doc_drift_report(
     let mut capped_docs = 0u32;
     for doc in docs {
         cancel.check()?;
-        if devmap_extract::secret::is_secret_path(doc) {
+        if resolver.is_secret(doc) {
             withheld += 1;
             continue;
         }
@@ -1907,7 +2572,7 @@ pub fn doc_drift_report(
             }
         };
         docs_scanned += 1;
-        let extraction = extract_references(&text);
+        let extraction = extract_references_cancellable(&text, Some(cancel))?;
         references = references.saturating_add(extraction.candidates());
         if extraction.truncated {
             capped_docs += 1;
@@ -1981,22 +2646,31 @@ pub fn doc_drift_report(
             ),
         );
     }
+    if resolver.unscanned_anchor_targets > 0 {
+        push_reason(
+            &mut reasons,
+            format!(
+                "{} anchor reference(s) were not judged because the target has a line over {MAX_LINE_BYTES} bytes that may hold the heading",
+                resolver.unscanned_anchor_targets
+            ),
+        );
+    }
     let total = resolver.total_findings;
     if usize::try_from(total).unwrap_or(usize::MAX) > resolver.findings.len() {
         push_reason(
             &mut reasons,
             format!(
-                "finding cap of {MAX_FINDINGS} cut the list; {total} references drifted and {} were kept",
+                "finding cap of {} cut the list; {total} references drifted and the first {} by document and line were kept",
+                options.limits.max_findings,
                 resolver.findings.len()
             ),
         );
     }
 
-    let mut findings = std::mem::take(&mut resolver.findings);
-    findings.sort_by(|a, b| (&a.doc, a.line).cmp(&(&b.doc, b.line)));
+    let findings = std::mem::take(&mut resolver.findings);
     let mut shown_findings = Vec::new();
     let mut tokens_used = 0u32;
-    for finding in findings {
+    for finding in findings.into_values() {
         let cost = finding_tokens(&finding);
         if cost > token_budget.saturating_sub(tokens_used) {
             break;
@@ -2007,6 +2681,12 @@ pub fn doc_drift_report(
     let shown = u32::try_from(shown_findings.len()).unwrap_or(u32::MAX);
     let hidden = total.saturating_sub(shown);
     Ok(DocDriftReport {
+        default_excludes: if excluded_by_default > 0 {
+            defaults.iter().map(|p| (*p).to_string()).collect()
+        } else {
+            Vec::new()
+        },
+        docs_excluded_by_default: excluded_by_default,
         available: true,
         docs_scanned,
         docs_total,

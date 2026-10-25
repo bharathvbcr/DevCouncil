@@ -1557,6 +1557,8 @@ exists and nothing was checked.",
                         "maxItems": crate::protocol::MAX_DOC_DRIFT_PREFIXES,
                         "description": "Repo-relative prefixes to leave out."
                     },
+                    "default_excludes": {"type": "boolean", "default": true,
+                        "description": "Leave out docs/archive, which records what was true then, unless a path names something inside it. False scans it too. The report names the exclusion in default_excludes when it applied."},
                     "budget": budget_prop(2000)
                 },
                 "additionalProperties": false
@@ -2107,6 +2109,9 @@ Candidate list to verify, not a delete list.",
                 "docs_scanned": {"type": "integer"},
                 "docs_total": {"type": "integer",
                     "description": "Markdown documents the request matched, before the document cap."},
+                "default_excludes": {"type": "array", "items": {"type": "string"},
+                    "description": "Default exclusions that left documents out of this scan; empty when none did."},
+                "docs_excluded_by_default": {"type": "integer"},
                 "references": {"type": "integer",
                     "description": "Candidates found: checked, skipped and those that held."},
                 "checked": {"type": "object",
