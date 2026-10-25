@@ -371,6 +371,14 @@ func TestASymlinkWhoseTargetTheTreeLacksIsRefused(t *testing.T) {
 	if s, err := r.subjectOrErr(); err == nil {
 		t.Fatalf("a symlink into an ignored directory was named %s", s)
 	}
+	rd := newSubjectRepo(t)
+	rd.write("build/impl.go", "package a\n")
+	if err := os.Symlink("build", filepath.Join(rd.root, "gen")); err != nil {
+		t.Fatal(err)
+	}
+	if s, err := rd.subjectOrErr(); err == nil {
+		t.Fatalf("a symlinked directory onto an ignored directory was named %s", s)
+	}
 	r2 := newSubjectRepo(t)
 	if err := os.Symlink(t.TempDir(), filepath.Join(r2.root, "out")); err != nil {
 		t.Fatal(err)

@@ -859,6 +859,7 @@ fn linked_sibling(repo_root: &Path, path: &Path) -> Option<String> {
     }
     let target = std::fs::read_link(path).ok()?;
     let name = target.to_str()?;
+    let name = name.strip_prefix("./").unwrap_or(name);
     let own = path.file_name()?.to_str()?;
     if name == own || !GUIDE_FILENAMES.contains(&name) {
         return None;
@@ -1986,6 +1987,45 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// `./AGENTS.md` is the same sibling. Two guides linked to each other are
+    /// not a sibling link (neither is a file), and stay refused.
+    #[cfg(unix)]
+    #[test]
+    fn sibling_link_spellings_and_a_link_cycle() {
+        let dir = scratch("linked-dot");
+        std::fs::write(dir.join("AGENTS.md"), "# hand written\n").unwrap();
+        std::os::unix::fs::symlink("./AGENTS.md", dir.join("CLAUDE.md")).unwrap();
+        let outcomes = write_with(&dir, HandWrittenGuides::Preserve);
+        assert_eq!(
+            outcome_for(&outcomes, &dir.join("CLAUDE.md")).disposition,
+            GuideDisposition::Linked("AGENTS.md".into())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = scratch("linked-cycle");
+        std::os::unix::fs::symlink("CLAUDE.md", dir.join("AGENTS.md")).unwrap();
+        std::os::unix::fs::symlink("AGENTS.md", dir.join("CLAUDE.md")).unwrap();
+        assert!(
+            write_with_result(&dir).is_err(),
+            "a link cycle was written through"
+        );
+        let plan = agent_guides(
+            &dir,
+            &computed_map(),
+            "m.json",
+            "g.json",
+            "s.sqlite",
+            HandWrittenGuides::Preserve,
+            GuidePass::Plan,
+        )
+        .unwrap();
+        assert!(plan
+            .iter()
+            .filter(|o| o.path.ends_with("AGENTS.md") || o.path.ends_with("CLAUDE.md"))
+            .all(|o| matches!(o.disposition, GuideDisposition::Refused(_))));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

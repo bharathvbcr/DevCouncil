@@ -68,6 +68,14 @@ func harnessOnlyIn(clause string, depth int) string {
 	words := shellWords(clause)
 	runner := false
 	for i, word := range words {
+		// A quoted multi-word argument is read as a command line when
+		// something before it may run one: a runner, a program named by a
+		// variable (`$SHELL -c '…'`), or a code flag just before it
+		// (`-c`, `-lc`, `-e`, `--command`, `--eval`) — which is also how an
+		// interpreter is handed code (`python3 -c "…os.system('…')"`).
+		if i > 0 && (expands(words[0].text) || codeFlag(words[i-1].text)) {
+			runner = true
+		}
 		switch binaryOf(word.text) {
 		case "host":
 			if reason := hostReviewWrite(words[i+1:]); reason != "" {
@@ -83,7 +91,7 @@ func harnessOnlyIn(clause string, depth int) string {
 				return "a command line nested more than four levels deep cannot be read to the end, so " +
 					"whether it records a review — which only the harness may — cannot be told."
 			}
-			if reason := harnessOnlyIn(word.text, depth+1); reason != "" {
+			if reason := harnessOnlyIn(codeWords(word.text), depth+1); reason != "" {
 				return reason
 			}
 		}
@@ -149,6 +157,39 @@ func binaryOf(word string) string {
 		return "store"
 	}
 	return ""
+}
+
+// codeFlag reports whether a word is the flag that hands the next argument to
+// a shell or interpreter as code: a short-option cluster holding c or e
+// (`-c`, `-lc`, `-ec`, `-e`), or --command / --eval / --exec.
+func codeFlag(word string) bool {
+	switch word {
+	case "--command", "--eval", "--exec":
+		return true
+	}
+	if len(word) < 2 || word[0] != '-' || word[1] == '-' {
+		return false
+	}
+	for _, c := range word[1:] {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z') {
+			return false
+		}
+	}
+	return strings.ContainsAny(word[1:], "ce")
+}
+
+// codeWords reads a command line that may be code in another language: the
+// punctuation that separates a call from its arguments there (`(`, `)`, `,`,
+// `;`, `[`, `]`, quotes) separates words here, so
+// `os.system('devcouncil review record')` reads as `devcouncil review record`.
+func codeWords(text string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '(', ')', ',', ';', '[', ']', '\'', '"', '`':
+			return ' '
+		}
+		return r
+	}, text)
 }
 
 // expands reports whether the shell would rewrite this word before the

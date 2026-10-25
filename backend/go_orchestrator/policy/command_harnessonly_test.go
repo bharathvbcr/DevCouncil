@@ -64,6 +64,16 @@ func TestRecordingAReviewIsRefusedInEveryAgentShell(t *testing.T) {
 		"watch 'dev review record --file r.json'",
 		`sh -c "sh -c 'devcouncil review record'"`,
 		`env -S 'devcouncil review record --file r.json'`,
+		// Round 3 on 1535bb95: a shell named by a variable, and code handed
+		// to an interpreter.
+		`$SHELL -c 'devcouncil review record --file r.json'`,
+		`"$SHELL" -c "devcouncil review record"`,
+		`${SHELL} -lc 'dev review record'`,
+		`python3 -c "import os; os.system('devcouncil review record')"`,
+		`perl -e 'system("devcouncil review record")'`,
+		`node --eval "require('child_process').execSync('devcouncil review record')"`,
+		`timeout 5 bash -c 'devcouncil review record'`,
+		`find . -maxdepth 0 -exec sh -c 'devcouncil review record' \;`,
 	}
 	for name, gate := range gates {
 		for _, command := range refused {
@@ -99,6 +109,8 @@ func TestReadingReviewsAndLookalikesAreNotHarnessOnly(t *testing.T) {
 		`grep -n "dcstore serve" docs/cli-reference.md`,
 		"pnpm dev --port $PORT",
 		"npm run dev -- --host $HOST",
+		"git commit -c HEAD",
+		`python3 -c "print('devcouncil review list')"`,
 	} {
 		if reason := harnessOnlyViolation(command); reason != "" {
 			t.Errorf("%q refused as harness-only: %s", command, reason)
