@@ -127,7 +127,8 @@ const maxRubricBytes = 1 << 20
 // state after a fix — but never consulted. A newest-matching row that could
 // not be read blocks rather than falling through to an older one: an
 // unreadable record is not a missing one.
-func judgeReview(acID string, ev ReviewEvidence) (reasons []string, record *dc.ReviewRecord) {
+func judgeReview(criterion dc.AcceptanceCriterion, ev ReviewEvidence) (reasons []string, record *dc.ReviewRecord) {
+	acID := criterion.ID
 	if ev.ReadErr != nil {
 		return []string{"the reviews could not be read: " + ev.ReadErr.Error()}, nil
 	}
@@ -158,6 +159,10 @@ func judgeReview(acID string, ev ReviewEvidence) (reasons []string, record *dc.R
 		return []string{fmt.Sprintf("review %d of this content cannot be read: %v", match.ID, match.Err)}, nil
 	}
 	r := match.Record
+	if want := dc.CriterionDigest(criterion); r.CriterionSHA256 != want {
+		reasons = append(reasons, fmt.Sprintf("review %d answered a different version of %s (criterion "+
+			"sha256 %s, now %s): it was re-planned after the review", match.ID, acID, r.CriterionSHA256, want))
+	}
 	if r.Isolation.Probe != dc.IsolationPassed {
 		reasons = append(reasons, fmt.Sprintf("review %d: the isolation probe %s (%s), so the "+
 			"reviewers may have seen the author's context", match.ID, r.Isolation.Probe, r.Isolation.Detail))
@@ -276,10 +281,26 @@ func dispatchCriteria(taskID string, claimed []string, linked store.LinkedRequir
 		requirementID string
 		criterion     dc.AcceptanceCriterion
 	}
+	// One id defined twice the same way is one criterion. Defined twice
+	// differently — another method, text or required flag under the same id —
+	// it is two claims with one name, and dispatching on either would let the
+	// other pass unproven (an llm_review criterion discharged by a unit_test
+	// twin's commands). It blocks instead.
 	byID := make(map[string]located)
+	conflicting := make(map[string][]string)
 	for _, req := range linked.Requirements {
 		for _, ac := range req.AcceptanceCriteria {
-			byID[ac.ID] = located{requirementID: req.ID, criterion: ac}
+			prev, seen := byID[ac.ID]
+			if !seen {
+				byID[ac.ID] = located{requirementID: req.ID, criterion: ac}
+				continue
+			}
+			if prev.criterion != ac {
+				if len(conflicting[ac.ID]) == 0 {
+					conflicting[ac.ID] = []string{prev.requirementID + " (" + string(prev.criterion.Method) + ")"}
+				}
+				conflicting[ac.ID] = append(conflicting[ac.ID], req.ID+" ("+string(ac.Method)+")")
+			}
 		}
 	}
 
@@ -292,6 +313,13 @@ func dispatchCriteria(taskID string, claimed []string, linked store.LinkedRequir
 				"The task's requirements could not be read, so acceptance criterion "+acID+
 					" cannot be dispatched on its verification method.",
 				[]string{"requirements could not be read: " + readErr.Error()}))
+			continue
+		}
+		if defs := conflicting[acID]; len(defs) > 0 {
+			gaps = append(gaps, unprovenCriterion(taskID, acID, nil, nil, true,
+				"Acceptance criterion "+acID+" is defined differently by more than one linked requirement, "+
+					"so which of them the task must prove is ambiguous.",
+				[]string{"defined by: " + strings.Join(defs, ", ")}))
 			continue
 		}
 		found, ok := byID[acID]
@@ -326,7 +354,7 @@ func dispatchCriteria(taskID string, claimed []string, linked store.LinkedRequir
 				ExpectedVerificationMethod: &method,
 			})
 		case executor == executorReview:
-			reasons, record := judgeReview(acID, reviews)
+			reasons, record := judgeReview(found.criterion, reviews)
 			if len(reasons) > 0 {
 				gaps = append(gaps, Gap{
 					ID:       StableGapID(taskID, "AC", "ac:"+acID),

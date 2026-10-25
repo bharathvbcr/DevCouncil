@@ -125,6 +125,10 @@ pub enum GuideDisposition {
     /// span is ours could delete somebody's text. The reason names what was
     /// found.
     MalformedBlock(String),
+    /// A plan pass could not read the file (a symlink, a file over the read
+    /// limit, no permission); a write would refuse it too. The reason is the
+    /// error.
+    Refused(String),
 }
 
 impl GuideDisposition {
@@ -137,6 +141,15 @@ impl GuideDisposition {
             Self::NotOurs => "not_ours",
             Self::Adopted => "adopted",
             Self::MalformedBlock(_) => "malformed_block",
+            Self::Refused(_) => "refused",
+        }
+    }
+
+    /// Why the file was left alone, when that needs a person.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::MalformedBlock(reason) | Self::Refused(reason) => Some(reason),
+            _ => None,
         }
     }
 }
@@ -162,7 +175,10 @@ impl GuideOutcome {
     /// a guide that asked to be maintained and cannot be, so a `--check` must
     /// not read it as clean.
     pub fn needs_attention(&self) -> bool {
-        matches!(self.disposition, GuideDisposition::MalformedBlock(_))
+        matches!(
+            self.disposition,
+            GuideDisposition::MalformedBlock(_) | GuideDisposition::Refused(_)
+        )
     }
 }
 
@@ -537,51 +553,114 @@ enum Ownership<'a> {
         end: usize,
         terminator: &'a str,
     },
-    /// No marker of any kind.
-    HandWritten,
+    /// No marker of any kind. `ends_in_code` is true when the file ends inside
+    /// a code fence it never closes, where an appended block would be code.
+    HandWritten { ends_in_code: bool },
     /// Block marker lines that do not delimit exactly one block.
     Malformed(String),
 }
 
-/// Find the block marker lines in `existing`, outside fenced code.
+/// An open code fence: its character and how many of them opened it.
+struct Fence {
+    marker: char,
+    len: usize,
+}
+
+/// Columns of leading indentation (a tab advances to the next multiple of
+/// four, as CommonMark counts it) and the rest of the line.
+fn indentation(line: &str) -> (usize, &str) {
+    let mut cols = 0;
+    for (i, c) in line.char_indices() {
+        match c {
+            ' ' => cols += 1,
+            '\t' => cols += 4 - cols % 4,
+            _ => return (cols, &line[i..]),
+        }
+    }
+    (cols, "")
+}
+
+/// The fence a line opens, if it opens one: at most three columns of indent,
+/// then three or more backticks or tildes; a backtick fence's info string may
+/// not hold a backtick.
+fn fence_opening(line: &str) -> Option<Fence> {
+    let (cols, rest) = indentation(line);
+    if cols > 3 {
+        return None;
+    }
+    let marker = rest.chars().next().filter(|c| *c == '`' || *c == '~')?;
+    let len = rest.chars().take_while(|c| *c == marker).count();
+    if len < 3 || (marker == '`' && rest[len..].contains('`')) {
+        return None;
+    }
+    Some(Fence { marker, len })
+}
+
+/// Whether a line closes `fence`: at most three columns of indent, at least as
+/// many of the same character, and nothing after them but whitespace.
+fn closes(line: &str, fence: &Fence) -> bool {
+    let (cols, rest) = indentation(line);
+    let len = rest.chars().take_while(|c| *c == fence.marker).count();
+    cols <= 3 && len >= fence.len && rest[len * fence.marker.len_utf8()..].trim().is_empty()
+}
+
+/// Whether a line, outside code, is exactly `marker`: at most three columns
+/// of indent (four is an indented code block) and nothing else but trailing
+/// whitespace.
+fn is_marker_line(line: &str, marker: &str) -> bool {
+    let (cols, rest) = indentation(line);
+    cols <= 3 && rest.trim_end() == marker
+}
+
+/// Find the marker lines in `existing` that are not code.
+///
+/// Code follows CommonMark closely enough that a guide quoting the markers in
+/// an example is never taken over: a fenced block runs from an opening fence
+/// to a closing one of the same character and at least the same length (so a
+/// four-backtick fence can quote a three-backtick example), or to the end of
+/// the file when it is never closed; a line indented four columns or more is
+/// never a marker. The whole-file marker counts only on such a line too — a
+/// guide that quotes it inside a fence is not thereby wholly ours.
 ///
 /// Block markers win over the whole-file marker: a file that has both is a
 /// hand-written file with a block in it (the block body never carries the
 /// whole-file marker, so only a person put it there), and the narrower claim
 /// is the one that cannot delete their text.
-fn ownership(existing: &str, whole_file_marked: bool) -> Ownership<'_> {
+fn ownership(existing: &str) -> Ownership<'_> {
     let mut begins = Vec::new();
     let mut ends = Vec::new();
-    let mut fence: Option<&str> = None;
+    let mut whole_file_marked = false;
+    let mut fence: Option<Fence> = None;
     let mut offset = 0;
     for line in existing.split_inclusive('\n') {
         let start = offset;
         offset += line.len();
         let bare = line.trim_end_matches(['\n', '\r']);
-        let trimmed = bare.trim();
-        if let Some(open) = fence {
-            if trimmed.starts_with(open) {
+        if let Some(open) = &fence {
+            if closes(bare, open) {
                 fence = None;
             }
             continue;
         }
-        if trimmed.starts_with("```") {
-            fence = Some("```");
+        if let Some(open) = fence_opening(bare) {
+            fence = Some(open);
             continue;
         }
-        if trimmed.starts_with("~~~") {
-            fence = Some("~~~");
-            continue;
-        }
-        if trimmed == AGENT_GUIDE_BLOCK_BEGIN {
+        if is_marker_line(bare, AGENT_GUIDE_BLOCK_BEGIN) {
             begins.push(start);
-        } else if trimmed == AGENT_GUIDE_BLOCK_END {
+        } else if is_marker_line(bare, AGENT_GUIDE_BLOCK_END) {
             ends.push((start, offset, &line[bare.len()..]));
+        } else if is_marker_line(bare, AGENT_GUIDE_MARKER)
+            || is_marker_line(bare, LEGACY_AGENT_GUIDE_MARKER)
+        {
+            whole_file_marked = true;
         }
     }
     match (begins.as_slice(), ends.as_slice()) {
         ([], []) if whole_file_marked => Ownership::WholeFile,
-        ([], []) => Ownership::HandWritten,
+        ([], []) => Ownership::HandWritten {
+            ends_in_code: fence.is_some(),
+        },
         ([begin], [(end_start, end, terminator)]) if begin < end_start => Ownership::Block {
             start: *begin,
             end: *end,
@@ -648,9 +727,7 @@ fn decide_guide(
     body: &str,
     hand_written: HandWrittenGuides,
 ) -> Decision {
-    let whole_file_marked =
-        existing.contains(AGENT_GUIDE_MARKER) || existing.contains(LEGACY_AGENT_GUIDE_MARKER);
-    match ownership(existing, whole_file_marked) {
+    match ownership(existing) {
         Ownership::Malformed(reason) => {
             Decision::leave(GuideDisposition::MalformedBlock(reason), true)
         }
@@ -668,8 +745,19 @@ fn decide_guide(
             Decision::compare(existing, content, true)
         }
         Ownership::WholeFile => Decision::compare(existing, whole.to_string(), false),
-        Ownership::HandWritten => match hand_written {
+        Ownership::HandWritten { ends_in_code } => match hand_written {
             HandWrittenGuides::Preserve => Decision::leave(GuideDisposition::NotOurs, false),
+            // Appended after an unclosed fence, the block would be code: not
+            // found by the next run, which would append another.
+            HandWrittenGuides::Adopt if ends_in_code => Decision::leave(
+                GuideDisposition::MalformedBlock(
+                    "the file ends inside a code fence it never closes, so a block appended \
+                     there would be code; close the fence or add the devmap:begin/devmap:end \
+                     lines yourself"
+                        .to_string(),
+                ),
+                false,
+            ),
             HandWrittenGuides::Adopt => {
                 let separator = if existing.is_empty() {
                     ""
@@ -706,7 +794,32 @@ struct Prepared {
     step: Step,
 }
 
+/// Inspect one destination. A plan pass that cannot read it — a symlink, a file
+/// over the read limit, no permission — reports it as
+/// [`GuideDisposition::Refused`] rather than failing the whole plan: a
+/// `--check` must say which file needs a person, and a write would refuse the
+/// same file. A write pass still fails, before anything is written.
 fn prepare_destination(
+    path: PathBuf,
+    pass: GuidePass,
+    create: &str,
+    decide: impl FnOnce(&str) -> Decision,
+) -> std::io::Result<Prepared> {
+    match (
+        inspect_destination(path.clone(), pass, create, decide),
+        pass,
+    ) {
+        (Err(error), GuidePass::Plan) => Ok(Prepared {
+            path,
+            disposition: GuideDisposition::Refused(error.to_string()),
+            block: false,
+            step: Step::Leave,
+        }),
+        (result, _) => result,
+    }
+}
+
+fn inspect_destination(
     path: PathBuf,
     pass: GuidePass,
     create: &str,
@@ -1543,8 +1656,203 @@ mod tests {
         let text = agent_guide_body(&map, &hostile, &hostile, &hostile);
         assert!(!text.contains("<!--"), "{text}");
         assert!(matches!(
-            ownership(&block_text(&text, "\n"), false),
+            ownership(&block_text(&text, "\n")),
             Ownership::Block { .. }
         ));
+    }
+
+    // The rest were found in the adversarial round on 48a66ac3.
+
+    fn disposition_of(dir: &Path, hand_written: HandWrittenGuides) -> GuideDisposition {
+        let claude = dir.join("CLAUDE.md");
+        let outcomes = write_with(dir, hand_written);
+        outcome_for(&outcomes, &claude).disposition.clone()
+    }
+
+    #[test]
+    fn a_longer_fence_quoting_an_example_with_markers_is_not_taken_over() {
+        let dir = scratch("long-fence");
+        let claude = dir.join("CLAUDE.md");
+        let text = format!(
+            "# How to add a block\n\n````markdown\n```\n{AGENT_GUIDE_BLOCK_BEGIN}\nEXAMPLE\n\
+             {AGENT_GUIDE_BLOCK_END}\n```\n````\n"
+        );
+        std::fs::write(&claude, &text).unwrap();
+        assert_eq!(
+            disposition_of(&dir, HandWrittenGuides::Preserve),
+            GuideDisposition::NotOurs
+        );
+        assert_eq!(std::fs::read_to_string(&claude).unwrap(), text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn markers_in_an_indented_code_block_are_not_taken_over() {
+        let dir = scratch("indented");
+        let claude = dir.join("CLAUDE.md");
+        let text = format!(
+            "# Example\n\n    {AGENT_GUIDE_BLOCK_BEGIN}\n    EXAMPLE\n    {AGENT_GUIDE_BLOCK_END}\n\nNotes.\n"
+        );
+        std::fs::write(&claude, &text).unwrap();
+        assert_eq!(
+            disposition_of(&dir, HandWrittenGuides::Preserve),
+            GuideDisposition::NotOurs
+        );
+        assert_eq!(std::fs::read_to_string(&claude).unwrap(), text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adopting_is_idempotent_after_an_indented_fence_line() {
+        let dir = scratch("adopt-indented-fence");
+        let claude = dir.join("CLAUDE.md");
+        std::fs::write(
+            &claude,
+            "# Notes\n\n    ```\n    indented code, not a fence\n\nmore notes\n",
+        )
+        .unwrap();
+        for _ in 0..3 {
+            write_with(&dir, HandWrittenGuides::Adopt);
+        }
+        let text = std::fs::read_to_string(&claude).unwrap();
+        assert_eq!(text.matches(AGENT_GUIDE_BLOCK_BEGIN).count(), 1, "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adopting_into_an_unclosed_fence_is_refused() {
+        let dir = scratch("adopt-unclosed");
+        let claude = dir.join("CLAUDE.md");
+        let text = "# Notes\n\n```sh\nmake all\n";
+        std::fs::write(&claude, text).unwrap();
+        for _ in 0..2 {
+            match disposition_of(&dir, HandWrittenGuides::Adopt) {
+                GuideDisposition::MalformedBlock(reason) => {
+                    assert!(reason.contains("code fence"), "{reason}")
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(std::fs::read_to_string(&claude).unwrap(), text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_whole_file_marker_quoted_in_code_does_not_make_the_file_ours() {
+        let dir = scratch("quoted-whole");
+        let claude = dir.join("CLAUDE.md");
+        let text = format!(
+            "# My notes\n\nDevMap marks its files with:\n\n```\n{AGENT_GUIDE_MARKER}\n```\n\n    \
+             {LEGACY_AGENT_GUIDE_MARKER}\n"
+        );
+        std::fs::write(&claude, &text).unwrap();
+        assert_eq!(
+            disposition_of(&dir, HandWrittenGuides::Preserve),
+            GuideDisposition::NotOurs
+        );
+        assert_eq!(std::fs::read_to_string(&claude).unwrap(), text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn marker_lines_with_trailing_whitespace_or_crlf_refresh_idempotently() {
+        for (label, begin, end, tail) in [
+            (
+                "trailing-space",
+                format!("{AGENT_GUIDE_BLOCK_BEGIN}   "),
+                format!("{AGENT_GUIDE_BLOCK_END}\t"),
+                "\npost\n",
+            ),
+            (
+                "crlf",
+                format!("{AGENT_GUIDE_BLOCK_BEGIN}\r"),
+                format!("{AGENT_GUIDE_BLOCK_END}\r"),
+                "\npost\n",
+            ),
+            (
+                "no-final-newline",
+                AGENT_GUIDE_BLOCK_BEGIN.to_string(),
+                AGENT_GUIDE_BLOCK_END.to_string(),
+                "",
+            ),
+        ] {
+            let dir = scratch(label);
+            let claude = dir.join("CLAUDE.md");
+            std::fs::write(&claude, format!("pre\n{begin}\nold\n{end}{tail}")).unwrap();
+            write_with(&dir, HandWrittenGuides::Preserve);
+            let first = std::fs::read_to_string(&claude).unwrap();
+            assert!(
+                first.starts_with("pre\n") && first.ends_with(tail),
+                "{label}: {first:?}"
+            );
+            assert_eq!(
+                disposition_of(&dir, HandWrittenGuides::Preserve),
+                GuideDisposition::Unchanged,
+                "{label}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A plan (`integrate --check` / `--dry-run`) names a guide it cannot read
+    /// instead of failing the whole plan; a write still refuses it.
+    #[cfg(unix)]
+    #[test]
+    fn a_plan_reports_a_guide_it_cannot_read_and_a_write_refuses_it() {
+        let dir = scratch("plan-refused");
+        std::fs::write(dir.join("AGENTS.md"), "# hand written\n").unwrap();
+        std::os::unix::fs::symlink("AGENTS.md", dir.join("CLAUDE.md")).unwrap();
+        let plan = agent_guides(
+            &dir,
+            &computed_map(),
+            "m.json",
+            "g.json",
+            "s.sqlite",
+            HandWrittenGuides::Preserve,
+            GuidePass::Plan,
+        )
+        .expect("a plan reports, it does not fail");
+        let claude = outcome_for(&plan, &dir.join("CLAUDE.md"));
+        assert!(
+            matches!(claude.disposition, GuideDisposition::Refused(_)),
+            "{claude:?}"
+        );
+        assert!(claude.needs_attention() && claude.disposition.reason().is_some());
+        assert!(
+            write_with_result(&dir).is_err(),
+            "a write followed the link"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = scratch("plan-huge");
+        let huge = "x".repeat(devmap_extract::MAX_SOURCE_BYTES as usize + 10);
+        std::fs::write(dir.join("CLAUDE.md"), &huge).unwrap();
+        let plan = agent_guides(
+            &dir,
+            &computed_map(),
+            "m.json",
+            "g.json",
+            "s.sqlite",
+            HandWrittenGuides::Preserve,
+            GuidePass::Plan,
+        )
+        .expect("a plan reports, it does not fail");
+        assert!(matches!(
+            outcome_for(&plan, &dir.join("CLAUDE.md")).disposition,
+            GuideDisposition::Refused(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_with_result(dir: &Path) -> std::io::Result<Vec<GuideOutcome>> {
+        agent_guides(
+            dir,
+            &computed_map(),
+            "m.json",
+            "g.json",
+            "s.sqlite",
+            HandWrittenGuides::Preserve,
+            GuidePass::Write,
+        )
     }
 }

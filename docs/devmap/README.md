@@ -895,11 +895,17 @@ unasked. What DevMap may rewrite depends on the markers the file carries
 So a person can keep their own notes in `CLAUDE.md` and still have a current
 DevMap section: put the two block lines where the section should go, or run
 `devmap manifest . --guides --adopt-guides` once. Later runs refresh the block
-without the flag. Block lines inside fenced code are ignored, so a guide that
-quotes them as an example is not taken over. The JSON report carries
-`disposition`, `block`, `changed`, `needs_attention` and, for a malformed
-block, `reason`. `devmap integrate <host>` plans and writes through the same
-code and takes the same `--adopt-guides` flag.
+without the flag. Marker lines — the whole-file marker too — count only where
+CommonMark would not read them as code: not inside a fence (closed only by the
+same character, at least as many of them), not indented four columns or more.
+So a guide that quotes the markers as an example is never taken over, and
+`--adopt-guides` refuses a file that ends inside a fence it never closes rather
+than appending a block that would be code. The JSON report carries
+`disposition`, `block`, `changed`, `needs_attention` and, for `malformed_block`
+or `refused`, `reason`. `refused` is what a plan (`integrate --check` /
+`--dry-run`) reports for a guide it cannot read — a symlink, a file over the read
+limit — where a write would fail. `devmap integrate <host>` plans and writes
+through the same code and takes the same `--adopt-guides` flag.
 
 The guide states which fields this map actually *computed*. An agent told to use
 `role_files` when the producer left it empty reads the emptiness as "this

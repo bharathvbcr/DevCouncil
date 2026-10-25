@@ -33,7 +33,7 @@ import (
 // that are *not* in that map.
 var storeCommands = []string{
 	"acquire", "diagnose", "release", "renew", "active", "list", "task", "ready", "health", "scope-append",
-	"requirements",
+	"requirements", "review-append", "reviews",
 }
 
 // FuzzStoreReplyIsNeverAZeroValueReadAsSuccess fuzzes the Go side of the store
@@ -79,6 +79,11 @@ func FuzzStoreReplyIsNeverAZeroValueReadAsSuccess(f *testing.F) {
 		`{"ok":false,"error":"no such task"}`,
 		`{"ok":false,"code":"held_by_other","holder":"builder-2"}`,
 		`{"ok":true,"store":"dc-store","schema_version":10,"exclusion_index":"verified"}`,
+		`{"ok":true,"store":"dc-store","schema_version":11,"exclusion_index":"verified"}`,
+		`{"ok":true,"review_id":1}`,
+		`{"ok":true,"review_id":"1"}`,
+		`{"ok":true,"reviews":[{"id":1,"record":null,"record_error":"bad"}],"truncated":false,"shown":1}`,
+		`{"ok":true,"reviews":null}`,
 		`{"ok":true,"store":"dc-store","schema_version":0,"exclusion_index":""}`,
 		`{"ok":true,"lease":{"id":"1","task_id":"T","owner":"o","token":"tok","status":"active"}}`,
 		`{"ok":true,"lease":null}`,

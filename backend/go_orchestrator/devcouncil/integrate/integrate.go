@@ -69,7 +69,7 @@ type Receipt struct {
 	Backups     map[string]string `json:"backups,omitempty"`      // original relative path -> recoverable backup
 	Host        string            `json:"host"`
 	Mode        string            `json:"mode"`
-	Files       map[string]string `json:"files"` // path -> wrote|unchanged|would_write|drift|not_ours
+	Files       map[string]string `json:"files"` // path -> wrote|unchanged|would_write|drift|not_ours|needs_attention|unknown:<disposition>
 	Spawned     []string          `json:"spawned,omitempty"`
 	Notes       []string          `json:"notes,omitempty"`
 }
@@ -249,8 +249,16 @@ func foldReport(receipt *Receipt, root string, mode Mode, report *devmap.Integra
 			receipt.Files[rel(guide.Path)] = "not_ours"
 		case "unchanged":
 			receipt.Files[rel(guide.Path)] = "unchanged"
-		default:
+		case "created", "updated", "adopted":
 			receipt.Files[rel(guide.Path)] = action(true)
+		case "malformed_block", "refused":
+			// DevMap left the file alone and a person must act: neither
+			// written nor current.
+			receipt.Files[rel(guide.Path)] = "needs_attention"
+		default:
+			// A disposition this host does not know is reported as such,
+			// never as a write: Drifted reads it as not current.
+			receipt.Files[rel(guide.Path)] = "unknown:" + guide.Disposition
 		}
 	}
 	for _, written := range report.SkillsWritten {

@@ -102,8 +102,9 @@ func TestARecordedReviewDischargesLLMReviewUntilTheContentMoves(t *testing.T) {
 	if _, err := client.ReviewAppend(ctx, dc.ReviewRecord{
 		Schema: dc.ReviewRecordSchema, TaskID: "TASK-AC", AcceptanceCriterionID: "AC-1",
 		SubjectHash: subject, Harness: "end-to-end",
-		Rubric:    dc.ReviewRubric{Path: "docs/rubric.md", SHA256: hex.EncodeToString(sum[:])},
-		Isolation: dc.ReviewIsolation{Probe: dc.IsolationPassed},
+		CriterionSHA256: dc.CriterionDigest(dc.AcceptanceCriterion{ID: "AC-1", Description: "d", Method: dc.VerifyLLMReview}),
+		Rubric:          dc.ReviewRubric{Path: "docs/rubric.md", SHA256: hex.EncodeToString(sum[:])},
+		Isolation:       dc.ReviewIsolation{Probe: dc.IsolationPassed},
 		Reviewers: []dc.ReviewerRun{
 			{ID: "a", Persona: "design_critic", Status: dc.ReviewerCompleted},
 			{ID: "b", Persona: "design_critic", Status: dc.ReviewerCompleted},

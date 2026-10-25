@@ -34,8 +34,9 @@ func goodReview() dc.ReviewRecord {
 	return dc.ReviewRecord{
 		Schema: dc.ReviewRecordSchema, TaskID: "TASK-AC", AcceptanceCriterionID: "AC-1",
 		SubjectHash: reviewedSubject, Harness: "test",
-		Rubric:    dc.ReviewRubric{Path: "docs/rubric.md", SHA256: rubricSum(rubricBody)},
-		Isolation: dc.ReviewIsolation{Probe: dc.IsolationPassed},
+		CriterionSHA256: dc.CriterionDigest(dc.AcceptanceCriterion{ID: "AC-1", Description: "adds", Method: dc.VerifyLLMReview}),
+		Rubric:          dc.ReviewRubric{Path: "docs/rubric.md", SHA256: rubricSum(rubricBody)},
+		Isolation:       dc.ReviewIsolation{Probe: dc.IsolationPassed},
 		Reviewers: []dc.ReviewerRun{
 			{ID: "a", Persona: "critic", Status: dc.ReviewerCompleted},
 			{ID: "b", Persona: "critic", Status: dc.ReviewerCompleted},
@@ -169,6 +170,11 @@ func TestAReviewThatCannotVouchForThisContentBlocks(t *testing.T) {
 			in.Reviews.Subject, in.Reviews.SubjectErr = "", errors.New("not a git repository")
 			return in
 		}, "not a git repository"},
+		"criterion re-planned after the review": {func(t *testing.T) verify.Input {
+			in := reviewInput(t, true, stored(1, goodReview()))
+			in.Requirements.Requirements[0].AcceptanceCriteria[0].Description = "adds, and is fast"
+			return in
+		}, "re-planned after the review"},
 		"no evidence read at all": {func(t *testing.T) verify.Input {
 			in := criterionInput(dc.VerifyLLMReview, true, 0, "go test ./...")
 			return in
@@ -241,6 +247,44 @@ func TestAnOptionalReviewCriterionDoesNotBlock(t *testing.T) {
 	}
 	if status != "verified" {
 		t.Errorf("status = %s", status)
+	}
+}
+
+// One id defined as llm_review by one requirement and as unit_test by another
+// is ambiguous, and passing commands must not settle it by discharging the
+// unit_test twin. (Adversarial round on 48a66ac3.) The same definition twice
+// is one criterion.
+func TestACriterionDefinedTwoWaysBlocks(t *testing.T) {
+	for _, order := range [][2]dc.VerificationMethod{
+		{dc.VerifyLLMReview, dc.VerifyUnitTest},
+		{dc.VerifyUnitTest, dc.VerifyLLMReview},
+	} {
+		in := criterionInput(order[0], true, 0, "go test ./...")
+		in.Requirements.Requirements = append(in.Requirements.Requirements, dc.Requirement{
+			ID: "REQ-2", Priority: dc.PriorityHigh, Source: dc.SourceUser,
+			AcceptanceCriteria: []dc.AcceptanceCriterion{{ID: "AC-1", Description: "adds", Method: order[1], Required: true}},
+		})
+		gaps, status := run(t, in)
+		if status != "blocked" {
+			t.Errorf("%v: status %s, want blocked: %+v", order, status, gaps)
+		}
+		found := false
+		for _, g := range gapsOfType(gaps, "acceptance_criteria_unproven") {
+			if g.Blocking && strings.Contains(strings.Join(g.Evidence, " "), "REQ-2") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%v: no blocking gap naming both definitions: %+v", order, gaps)
+		}
+	}
+	same := criterionInput(dc.VerifyUnitTest, true, 0, "go test ./...")
+	same.Requirements.Requirements = append(same.Requirements.Requirements, dc.Requirement{
+		ID: "REQ-2", Priority: dc.PriorityHigh, Source: dc.SourceUser,
+		AcceptanceCriteria: same.Requirements.Requirements[0].AcceptanceCriteria,
+	})
+	if _, status := run(t, same); status != "verified" {
+		t.Errorf("one criterion defined identically twice did not verify: %s", status)
 	}
 }
 

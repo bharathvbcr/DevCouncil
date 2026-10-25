@@ -2,6 +2,8 @@ package dc
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -35,6 +37,11 @@ type ReviewRecord struct {
 	// SubjectHash names the exact content reviewed, in the form
 	// verify.WorkingTreeSubject computes ("git-tree:<object id>").
 	SubjectHash string `json:"subject_hash"`
+	// CriterionSHA256 is CriterionDigest of the criterion as it read when it
+	// was reviewed. A criterion re-planned after the review — its text or
+	// method changed under the same id — is a different question, and the
+	// old answer does not discharge it.
+	CriterionSHA256 string `json:"criterion_sha256"`
 	// Harness names what ran the reviewers, for the reader of the record.
 	Harness   string          `json:"harness"`
 	Rubric    ReviewRubric    `json:"rubric"`
@@ -188,6 +195,9 @@ func (r ReviewRecord) Validate() error {
 	if !ValidSubjectHash(r.SubjectHash) {
 		return fmt.Errorf("review record subject_hash %q may hold only a-z, 0-9, ':' and '-'", r.SubjectHash)
 	}
+	if !validSHA256(r.CriterionSHA256) {
+		return fmt.Errorf("review record criterion_sha256 %q is not 64 lowercase hex digits", r.CriterionSHA256)
+	}
 	if !validSHA256(r.Rubric.SHA256) {
 		return fmt.Errorf("review record rubric.sha256 %q is not 64 lowercase hex digits", r.Rubric.SHA256)
 	}
@@ -262,6 +272,13 @@ func (r ReviewRecord) Validate() error {
 		}
 	}
 	return nil
+}
+
+// CriterionDigest is the SHA-256, in lowercase hex, of what a review of ac
+// answers: its id, its method and its description, each NUL-terminated.
+func CriterionDigest(ac AcceptanceCriterion) string {
+	sum := sha256.Sum256([]byte(ac.ID + "\x00" + string(ac.Method) + "\x00" + ac.Description + "\x00"))
+	return hex.EncodeToString(sum[:])
 }
 
 // CompletedReviewers counts the reviewer runs that finished.

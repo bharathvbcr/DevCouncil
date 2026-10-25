@@ -190,10 +190,7 @@ fn run_integrate(
                     "path": g.path.display().to_string(),
                     "disposition": g.disposition.as_str(),
                     "block": g.block,
-                    "reason": match &g.disposition {
-                        devmap_query::guides::GuideDisposition::MalformedBlock(reason) => Some(reason.as_str()),
-                        _ => None,
-                    },
+                    "reason": g.disposition.reason(),
                 })).collect::<Vec<_>>(),
                 "skills_written": report.skills_written.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                 "skills_differing": report.skills_differing.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),

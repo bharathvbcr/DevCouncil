@@ -34,6 +34,28 @@ func TestRecordingAReviewIsRefusedInEveryAgentShell(t *testing.T) {
 		"dcstore --db state.sqlite review-append --task T --acceptance-criterion-id AC --subject-hash h --record {}",
 		"/usr/local/bin/dcstore review-append --task T",
 		"dcstore --db=x review-append",
+		// What the shell expands into `review record` without the line
+		// containing it (adversarial round on 48a66ac3).
+		"devcouncil review {record,}",
+		"dev review {record,} --file r.json",
+		"devcouncil review rec{o,}rd --file r.json",
+		"devcouncil review rec?rd --file r.json",
+		"devcouncil review rec[o]rd --file r.json",
+		"devcouncil review $'record' --file r.json",
+		`devcouncil review $'\x72ecord' --file r.json`,
+		`devcouncil review "$(echo record)" --file r.json`,
+		"a=rec; devcouncil review ${a}ord --file r.json",
+		"devcouncil {review,} record --file r.json",
+		"devcouncil $SUB record --file r.json",
+		"DEVCOUNCIL review record --file r.json",
+		`C:\bin\devcouncil.exe review record --file r.json`,
+		"x;devcouncil review record --file r.json",
+		"(devcouncil review record --file r.json)",
+		"dcstore {review-append,} --task T --acceptance-criterion-id AC --subject-hash h --record r",
+		"dcstore review-ap{p,}end --task T",
+		"dcstore\treview-append --task T",
+		"rust/target/debug/dcstore review-append --task T",
+		"sh -c 'devcouncil review record --file r.json'",
 	}
 	for name, gate := range gates {
 		for _, command := range refused {
@@ -59,6 +81,10 @@ func TestReadingReviewsAndLookalikesAreNotHarnessOnly(t *testing.T) {
 		"dcstore reviews --task T",
 		"grep -r review-append docs",
 		"git log --grep 'review record'",
+		"devcouncil review --help",
+		"devcouncil review list --task 'TASK-1' --json",
+		"dcstore --db s.sqlite reviews --task T",
+		"devcouncil task show TASK-1",
 	} {
 		if reason := harnessOnlyViolation(command); reason != "" {
 			t.Errorf("%q refused as harness-only: %s", command, reason)

@@ -489,6 +489,9 @@ pub(crate) fn report_manifest(cli: &Cli, outcome: &ManifestOutcome) -> anyhow::R
             devmap_query::guides::GuideDisposition::MalformedBlock(reason) => {
                 format!("left alone, NOT refreshed: malformed devmap block ({reason})")
             }
+            devmap_query::guides::GuideDisposition::Refused(reason) => {
+                format!("left alone, NOT refreshed: could not be read ({reason})")
+            }
         };
         outln!("  guide {}: {note}", guide.path.display());
     }
@@ -525,10 +528,7 @@ pub(crate) fn manifest_json(outcome: &ManifestOutcome) -> serde_json::Value {
             "path": guide.path,
             "disposition": guide.disposition.as_str(),
             "block": guide.block,
-            "reason": match &guide.disposition {
-                devmap_query::guides::GuideDisposition::MalformedBlock(reason) => Some(reason.as_str()),
-                _ => None,
-            },
+            "reason": guide.disposition.reason(),
             "changed": guide.changed(),
             "needs_attention": guide.needs_attention(),
         })).collect::<Vec<_>>(),

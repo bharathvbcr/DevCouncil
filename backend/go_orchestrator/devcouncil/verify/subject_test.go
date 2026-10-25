@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/verify"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/testsupport"
@@ -177,5 +178,141 @@ func TestARepositoryWithNoCommitHasASubject(t *testing.T) {
 func TestNoRepositoryIsAnError(t *testing.T) {
 	if s, err := verify.WorkingTreeSubject(context.Background(), t.TempDir()); err == nil {
 		t.Fatalf("subject %q outside a repository", s)
+	}
+}
+
+// subjectOrErr is the subject, or "" and the error when none can be named.
+func (r *subjectRepo) subjectOrErr() (string, error) {
+	r.t.Helper()
+	return verify.WorkingTreeSubject(context.Background(), r.root)
+}
+
+// mustNotCollide holds the one property a subject owes a review: after a
+// change verify would judge, the subject either moves or cannot be named.
+// Naming the same subject is the failure — an old review would vouch for new
+// code.
+func (r *subjectRepo) mustNotCollide(before string, change string) {
+	r.t.Helper()
+	after, err := r.subjectOrErr()
+	if err == nil && after == before {
+		r.t.Errorf("%s: the subject stayed %s, so a review of the old content would vouch for the new", change, before)
+	}
+}
+
+// What git keeps in the person's index — assume-unchanged, skip-worktree, a
+// stat cache it is told to trust — is not the content, and must not decide
+// the subject. (Found in the adversarial round on 48a66ac3.)
+func TestIndexStateCannotHideAModifiedFile(t *testing.T) {
+	for name, setup := range map[string]func(r *subjectRepo){
+		"assume-unchanged": func(r *subjectRepo) { r.run("update-index", "--assume-unchanged", "a.go") },
+		"skip-worktree":    func(r *subjectRepo) { r.run("update-index", "--skip-worktree", "a.go") },
+		"trusted stat cache": func(r *subjectRepo) {
+			r.run("config", "core.trustctime", "false")
+			r.run("config", "core.checkStat", "minimal")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newSubjectRepo(t)
+			old := time.Now().Add(-time.Hour)
+			path := filepath.Join(r.root, "a.go")
+			if err := os.Chtimes(path, old, old); err != nil {
+				t.Fatal(err)
+			}
+			r.run("update-index", "--refresh")
+			setup(r)
+			before := r.subject()
+			r.write("a.go", "package b\n") // the same size as "package a\n"
+			if err := os.Chtimes(path, old, old); err != nil {
+				t.Fatal(err)
+			}
+			r.mustNotCollide(before, "a same-size edit with the old mtime")
+		})
+	}
+}
+
+// A directory turned into a gitlink — by a nested repository, or by nothing
+// more than a planted `.git` file — has files the tree does not hold.
+func TestAGitlinkTheTreeCannotSeeIntoIsRefused(t *testing.T) {
+	t.Run("planted gitfile", func(t *testing.T) {
+		r := newSubjectRepo(t)
+		r.write("pkg/sub/x.go", "package sub\n")
+		r.write("pkg/sub/.git", "gitdir: "+filepath.Join(r.root, ".git")+"\n")
+		if s, err := r.subjectOrErr(); err == nil {
+			t.Fatalf("a directory hidden behind a planted .git file was named %s", s)
+		} else if !strings.Contains(err.Error(), "pkg/sub") {
+			t.Errorf("the refusal does not name the directory: %v", err)
+		}
+	})
+	t.Run("nested repository", func(t *testing.T) {
+		r := newSubjectRepo(t)
+		r.write("sub/x.go", "package sub\n")
+		inner := &subjectRepo{t: t, root: filepath.Join(r.root, "sub"), git: r.git}
+		inner.run("init", "-q", inner.root)
+		inner.run("add", ".")
+		inner.run("commit", "-qm", "inner")
+		if s, err := r.subjectOrErr(); err == nil {
+			t.Fatalf("a nested repository's files were named %s", s)
+		}
+	})
+}
+
+// A rules file that ignores itself can hide new source from the tree while
+// the build still compiles it.
+func TestASelfIgnoringRulesFileIsRefused(t *testing.T) {
+	r := newSubjectRepo(t)
+	r.write("pkg/ok.go", "package pkg\n")
+	before := r.subject()
+	r.write("pkg/evil.go", "package pkg\nfunc init() { panic(1) }\n")
+	r.write("pkg/.gitignore", "evil.go\n.gitignore\n")
+	r.mustNotCollide(before, "a new file hidden by a self-ignoring .gitignore")
+	if _, err := r.subjectOrErr(); err == nil || !strings.Contains(err.Error(), "pkg/.gitignore") {
+		t.Errorf("err = %v, want a refusal naming pkg/.gitignore", err)
+	}
+	// A rules file inside a directory already ignored hides nothing new.
+	r2 := newSubjectRepo(t) // .gitignore holds build/
+	r2.write("build/.gitignore", "*\n")
+	if _, err := r2.subjectOrErr(); err != nil {
+		t.Errorf("a rules file inside an ignored directory was refused: %v", err)
+	}
+}
+
+// Rules outside the tree decide what it leaves out, so they are part of the
+// subject.
+func TestExcludeRulesOutsideTheTreeArePartOfTheSubject(t *testing.T) {
+	r := newSubjectRepo(t)
+	before := r.subject()
+	r.write("evil.go", "package a\nfunc init() { panic(1) }\n")
+	r.write(".git/info/exclude", "# comment\nevil.go\n")
+	r.mustNotCollide(before, "a new file hidden by .git/info/exclude")
+	// Comments alone are no rules: the clean subject is still HEAD's tree.
+	r2 := newSubjectRepo(t)
+	r2.write(".git/info/exclude", "# only a comment\n\n")
+	if got, want := r2.subject(), verify.SubjectPrefix+r2.run("rev-parse", "HEAD^{tree}"); got != want {
+		t.Errorf("subject = %s, want %s", got, want)
+	}
+}
+
+// Tool state is never judged, whether edited or staged.
+func TestStagedToolStateDoesNotMoveTheSubject(t *testing.T) {
+	r := newSubjectRepo(t)
+	r.write(".devcouncil/config.yaml", "a: 1\n")
+	r.run("add", "-f", ".devcouncil/config.yaml")
+	r.run("commit", "-qm", "tool state")
+	before := r.subject()
+	r.write(".devcouncil/config.yaml", "a: 2\n")
+	if s := r.subject(); s != before {
+		t.Errorf("an edit to tool state moved the subject %s -> %s", before, s)
+	}
+	r.run("add", "-f", ".devcouncil/config.yaml")
+	if s := r.subject(); s != before {
+		t.Errorf("staging tool state moved the subject %s -> %s", before, s)
+	}
+}
+
+func TestASparseCheckoutIsRefused(t *testing.T) {
+	r := newSubjectRepo(t)
+	r.run("config", "core.sparseCheckout", "true")
+	if s, err := r.subjectOrErr(); err == nil {
+		t.Fatalf("a sparse checkout was named %s", s)
 	}
 }

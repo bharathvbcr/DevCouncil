@@ -17,6 +17,7 @@ func reviewRecord(task, criterion, subject string) dc.ReviewRecord {
 		AcceptanceCriterionID: criterion,
 		SubjectHash:           subject,
 		Harness:               "test-harness",
+		CriterionSHA256:       strings.Repeat("d", 64),
 		Rubric:                dc.ReviewRubric{Path: "docs/rubric.md", SHA256: strings.Repeat("b", 64)},
 		Isolation:             dc.ReviewIsolation{Probe: dc.IsolationPassed},
 		Reviewers: []dc.ReviewerRun{

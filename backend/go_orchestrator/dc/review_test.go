@@ -15,6 +15,7 @@ func validReviewRecord() map[string]any {
 		"acceptance_criterion_id": "AC-1",
 		"subject_hash":            "git-tree:4b825dc642cb6eb9a060e54bf8d69288fbee4904",
 		"harness":                 "manvi 0.4.0",
+		"criterion_sha256":        strings.Repeat("d", 64),
 		"rubric": map[string]any{
 			"path":   "docs/standards/feature-spec.md",
 			"sha256": strings.Repeat("a", 64),

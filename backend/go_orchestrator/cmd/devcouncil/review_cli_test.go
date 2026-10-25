@@ -54,7 +54,7 @@ func writeRecord(t *testing.T, subject string) string {
 	path := filepath.Join(t.TempDir(), "review.json")
 	record := map[string]any{
 		"schema": 1, "task_id": "TASK-1", "acceptance_criterion_id": "AC-1",
-		"subject_hash": subject, "harness": "test",
+		"subject_hash": subject, "harness": "test", "criterion_sha256": strings.Repeat("e", 64),
 		"rubric":    map[string]any{"path": "docs/rubric.md", "sha256": strings.Repeat("c", 64)},
 		"isolation": map[string]any{"probe": "passed"},
 		"reviewers": []any{
