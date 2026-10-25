@@ -881,8 +881,25 @@ devmap manifest . --guides
 
 Writes `AGENTS.md` and `CLAUDE.md` pointing agents at the map. Opt-in, because
 creating files in somebody's repository is not a thing an index should do
-unasked, and a guide that carries no `Managed by devmap` marker is treated as
-hand-written and never touched.
+unasked. What DevMap may rewrite depends on the markers the file carries
+(`rust/devmap-query/src/guides.rs`, `agent_guides`):
+
+| The guide file | What `--guides` does |
+|---|---|
+| absent | creates it, wholly DevMap's (`Managed by devmap` marker) |
+| carries the `Managed by devmap` marker | rewrites the whole file |
+| carries one `<!-- devmap:begin … -->` line followed by one `<!-- devmap:end -->` line | rewrites only the lines between them; every byte outside is kept |
+| carries block lines in any other count or order | leaves it alone and reports `malformed_block` with the reason; `integrate --check` fails on it |
+| carries no marker | hand-written: left alone (`not_ours`), unless `--adopt-guides` is given, which appends a block after the existing text (`adopted`) |
+
+So a person can keep their own notes in `CLAUDE.md` and still have a current
+DevMap section: put the two block lines where the section should go, or run
+`devmap manifest . --guides --adopt-guides` once. Later runs refresh the block
+without the flag. Block lines inside fenced code are ignored, so a guide that
+quotes them as an example is not taken over. The JSON report carries
+`disposition`, `block`, `changed`, `needs_attention` and, for a malformed
+block, `reason`. `devmap integrate <host>` plans and writes through the same
+code and takes the same `--adopt-guides` flag.
 
 The guide states which fields this map actually *computed*. An agent told to use
 `role_files` when the producer left it empty reads the emptiness as "this

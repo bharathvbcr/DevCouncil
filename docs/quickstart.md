@@ -93,6 +93,9 @@ devmap status --json
 
 `--manifest` exports the repository map and graph. `--guides` additionally writes
 marker-managed workspace guides; it does not overwrite an unrelated guide.
+To keep a hand-written `CLAUDE.md` and still get a current DevMap section, add
+`--adopt-guides` once: it appends a `devmap:begin`/`devmap:end` block and later
+runs rewrite only that block ([agent guides](devmap/README.md#agent-guides)).
 The Go-host shorthand `dev map` forwards to `devmap build --manifest` and does
 not implicitly add `--guides`.
 

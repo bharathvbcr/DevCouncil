@@ -199,6 +199,7 @@ pub fn integrate(
     servers: &[ServerSpec],
     dry_run: bool,
     check: bool,
+    hand_written: devmap_query::guides::HandWrittenGuides,
 ) -> anyhow::Result<IntegrateReport> {
     let writes = !dry_run && !check;
     if writes {
@@ -213,6 +214,7 @@ pub fn integrate(
             servers,
             true,
             false,
+            hand_written,
         )
         .context("nothing was written: the plan was refused")?;
     }
@@ -228,6 +230,7 @@ pub fn integrate(
         servers,
         dry_run,
         check,
+        hand_written,
         &mut report,
     ) {
         Ok(()) => Ok(report),
@@ -262,6 +265,7 @@ fn integrate_into(
     servers: &[ServerSpec],
     dry_run: bool,
     check: bool,
+    hand_written: devmap_query::guides::HandWrittenGuides,
     report: &mut IntegrateReport,
 ) -> anyhow::Result<()> {
     let root = project_root
@@ -275,56 +279,28 @@ fn integrate_into(
         register_server(host, &root, spec, true)?;
     }
 
-    if dry_run || check {
-        // Guides: compare without writing.
-        let guide_text =
-            devmap_query::guides::agent_guide_text(map, map_rel, graph_rel, store_rel) + "\n";
-        for name in devmap_query::guides::GUIDE_FILENAMES {
-            let path = root.join(name);
-            let disposition = match read_host_config(&path) {
-                Ok(existing)
-                    if existing.contains(devmap_query::guides::AGENT_GUIDE_MARKER)
-                        || existing.contains(devmap_query::guides::LEGACY_AGENT_GUIDE_MARKER) =>
-                {
-                    if existing == guide_text {
-                        devmap_query::guides::GuideDisposition::Unchanged
-                    } else {
-                        devmap_query::guides::GuideDisposition::Updated
-                    }
-                }
-                Ok(_) => devmap_query::guides::GuideDisposition::NotOurs,
-                Err(_) if !path.exists() => devmap_query::guides::GuideDisposition::Created,
-                Err(_) => devmap_query::guides::GuideDisposition::NotOurs,
-            };
-            if matches!(
-                disposition,
-                devmap_query::guides::GuideDisposition::Created
-                    | devmap_query::guides::GuideDisposition::Updated
-            ) {
-                report
-                    .guides
-                    .push(devmap_query::guides::GuideOutcome { path, disposition });
-            }
-        }
-        let rule_path = root.join(devmap_query::guides::CURSOR_RULE_REL);
-        let rule_text = devmap_query::guides::cursor_rule_text(map_rel);
-        let rule_differs = read_host_config(&rule_path)
-            .map(|existing| existing != rule_text)
-            .unwrap_or(true);
-        if rule_differs {
-            report.guides.push(devmap_query::guides::GuideOutcome {
-                path: rule_path.clone(),
-                disposition: if rule_path.exists() {
-                    devmap_query::guides::GuideDisposition::Updated
-                } else {
-                    devmap_query::guides::GuideDisposition::Created
-                },
-            });
-        }
+    // Guides go through the one planner the writer uses, so a `--check` and
+    // an apply cannot disagree about what a file's markers mean. A plan
+    // reports only what an apply would change or what needs a person; an
+    // apply reports every file it considered.
+    let pass = if dry_run || check {
+        devmap_query::guides::GuidePass::Plan
     } else {
-        report.guides =
-            devmap_query::guides::write_agent_guides(&root, map, map_rel, graph_rel, store_rel)?;
+        devmap_query::guides::GuidePass::Write
+    };
+    let mut guides = devmap_query::guides::agent_guides(
+        &root,
+        map,
+        map_rel,
+        graph_rel,
+        store_rel,
+        hand_written,
+        pass,
+    )?;
+    if pass == devmap_query::guides::GuidePass::Plan {
+        guides.retain(|g| g.changed() || g.needs_attention());
     }
+    report.guides = guides;
 
     // A host with no documented project skill directory installs no skills.
     // That is a state, not a malformed request: the installer's 1-16
@@ -460,7 +436,10 @@ fn integrate_into(
             .push(register_server(host, &root, spec, dry_run || check)?);
     }
 
-    let guides_dirty = report.guides.iter().any(|g| g.changed());
+    let guides_dirty = report
+        .guides
+        .iter()
+        .any(|g| g.changed() || g.needs_attention());
     let skills_dirty = !report.skills_differing.is_empty();
     let mcp_dirty = report
         .global_mcp
@@ -3569,6 +3548,7 @@ command = \"x\"\n";
             std::slice::from_ref(&devcouncil_spec(&root)),
             false,
             false,
+            devmap_query::guides::HandWrittenGuides::Preserve,
         );
         assert!(
             result.is_err(),
@@ -3606,6 +3586,7 @@ command = \"x\"\n";
             std::slice::from_ref(&spec),
             false,
             true,
+            devmap_query::guides::HandWrittenGuides::Preserve,
         )
         .unwrap();
         assert!(!check.check_ok, "a missing server is drift");
@@ -3626,6 +3607,7 @@ command = \"x\"\n";
             std::slice::from_ref(&spec),
             false,
             false,
+            devmap_query::guides::HandWrittenGuides::Preserve,
         )
         .unwrap();
         assert!(registered(Host::Warp, &root, "devcouncil").is_some());
@@ -3641,6 +3623,7 @@ command = \"x\"\n";
             std::slice::from_ref(&spec),
             false,
             true,
+            devmap_query::guides::HandWrittenGuides::Preserve,
         )
         .unwrap();
         assert!(

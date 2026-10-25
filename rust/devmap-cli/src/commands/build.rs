@@ -75,6 +75,10 @@ pub(crate) struct Args {
     /// Also write the marker-guarded agent guides. See `manifest --guides`.
     #[arg(long, requires = "manifest")]
     pub(crate) guides: bool,
+    /// With `--guides`: also append a DevMap block to a hand-written guide.
+    /// See `manifest --adopt-guides`.
+    #[arg(long, requires = "guides")]
+    pub(crate) adopt_guides: bool,
     /// Replace a Python-schema or otherwise foreign repo map / code graph.
     #[arg(long, requires = "manifest", default_value_t = false)]
     pub(crate) force: bool,
@@ -128,6 +132,7 @@ pub(crate) fn run(
         output,
         graph_output,
         guides,
+        adopt_guides,
         force,
         lsp,
         stamps,
@@ -510,7 +515,7 @@ pub(crate) fn run(
                 path,
                 &resolve_map_output(output, path),
                 &resolve_graph_output(graph_output, path),
-                *guides,
+                crate::commands::manifest::guide_request(*guides, *adopt_guides),
                 *force,
                 stamps,
                 *inventory,
@@ -922,7 +927,7 @@ pub(crate) fn run(
         path,
         &resolve_map_output(output, path),
         &resolve_graph_output(graph_output, path),
-        *guides,
+        crate::commands::manifest::guide_request(*guides, *adopt_guides),
         *force,
         stamps,
         *inventory,
@@ -1145,7 +1150,7 @@ fn build_manifest_payload(
     path: &std::path::Path,
     output: &std::path::Path,
     graph_output: &std::path::Path,
-    guides: bool,
+    guides: Option<devmap_query::guides::HandWrittenGuides>,
     force: bool,
     stamps: &StampFlags,
     inventory: InventoryFlags,

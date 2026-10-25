@@ -47,10 +47,18 @@ pub(crate) struct Args {
     /// `CLAUDE.md`.
     ///
     /// Opt-in: creating two files in somebody's repository is not a thing a
-    /// code index should do unasked. A guide that exists but carries no
-    /// `Managed by devmap` marker is hand-written and is never touched.
+    /// code index should do unasked. A guide carrying the `Managed by devmap`
+    /// marker is rewritten whole; one carrying a `devmap:begin` / `devmap:end`
+    /// line pair has only the lines between them rewritten, every byte
+    /// outside kept; a guide with neither is hand-written and is never
+    /// touched unless `--adopt-guides` is given.
     #[arg(long)]
     pub(crate) guides: bool,
+    /// With `--guides`: append a DevMap block to a hand-written `AGENTS.md` /
+    /// `CLAUDE.md`, keeping its existing text byte for byte. Later runs
+    /// refresh only the block and need no flag.
+    #[arg(long, requires = "guides")]
+    pub(crate) adopt_guides: bool,
     /// Replace a Python-schema or otherwise foreign repo map / code graph.
     #[arg(long, default_value_t = false)]
     pub(crate) force: bool,
@@ -67,6 +75,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         graph_output,
         compact_graph_output,
         guides,
+        adopt_guides,
         force,
         stamps,
         inventory,
@@ -84,11 +93,23 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
             force: *force,
             stamps,
             inventory: (*inventory).into(),
-            guides: *guides,
+            guides: guide_request(*guides, *adopt_guides),
         },
     )?;
     report_manifest(cli, &outcome)?;
     Ok(())
+}
+
+/// The guide request `--guides` / `--adopt-guides` make.
+pub(crate) fn guide_request(
+    guides: bool,
+    adopt_guides: bool,
+) -> Option<devmap_query::guides::HandWrittenGuides> {
+    guides.then_some(if adopt_guides {
+        devmap_query::guides::HandWrittenGuides::Adopt
+    } else {
+        devmap_query::guides::HandWrittenGuides::Preserve
+    })
 }
 
 /// Everything one `manifest` write needs, whether it was asked for on its own
@@ -105,8 +126,9 @@ pub(crate) struct ManifestRequest<'a> {
     pub(crate) force: bool,
     pub(crate) stamps: &'a StampFlags,
     pub(crate) inventory: InventoryLimits,
-    /// Write the marker-guarded agent guides from this generation.
-    pub(crate) guides: bool,
+    /// Write the marker-guarded agent guides from this generation, and what to
+    /// do with a hand-written one. `None`: guides were not asked for.
+    pub(crate) guides: Option<devmap_query::guides::HandWrittenGuides>,
 }
 
 /// What a `manifest` write did, for the caller's `--json` payload.
@@ -160,9 +182,9 @@ fn write_guides_if_requested(
     request: &ManifestRequest<'_>,
     tree: &std::path::Path,
 ) -> anyhow::Result<Vec<devmap_query::guides::GuideOutcome>> {
-    if !request.guides {
+    let Some(hand_written) = request.guides else {
         return Ok(Vec::new());
-    }
+    };
     let extractions = store.latest_extractions()?;
     let analysis = store
         .latest_analysis()?
@@ -197,12 +219,14 @@ fn write_guides_if_requested(
         // copies; a stray `./` is noise in every line that quotes a path.
         text.strip_prefix("./").unwrap_or(&text).to_string()
     };
-    Ok(devmap_query::guides::write_agent_guides(
+    Ok(devmap_query::guides::agent_guides(
         tree,
         &map,
         &relative(&devmap_extract::paths::repo_map_path(tree)),
         &relative(&devmap_extract::paths::code_graph_path(tree)),
         &relative(request.db),
+        hand_written,
+        devmap_query::guides::GuidePass::Write,
     )?)
 }
 
@@ -450,12 +474,20 @@ pub(crate) fn report_manifest(cli: &Cli, outcome: &ManifestOutcome) -> anyhow::R
         }
     }
     for guide in &outcome.guides {
-        let note = match guide.disposition {
-            devmap_query::guides::GuideDisposition::Created => "created",
-            devmap_query::guides::GuideDisposition::Updated => "updated",
-            devmap_query::guides::GuideDisposition::Unchanged => "already current",
-            devmap_query::guides::GuideDisposition::NotOurs => {
-                "left alone (no `Managed by devmap` marker)"
+        let scope = if guide.block { " (devmap block)" } else { "" };
+        let note = match &guide.disposition {
+            devmap_query::guides::GuideDisposition::Created => "created".to_string(),
+            devmap_query::guides::GuideDisposition::Updated => format!("updated{scope}"),
+            devmap_query::guides::GuideDisposition::Unchanged => format!("already current{scope}"),
+            devmap_query::guides::GuideDisposition::NotOurs => "left alone (hand-written: no \
+                `Managed by devmap` marker and no devmap:begin/devmap:end block; \
+                `--adopt-guides` appends a block)"
+                .to_string(),
+            devmap_query::guides::GuideDisposition::Adopted => {
+                "devmap block appended after the hand-written text".to_string()
+            }
+            devmap_query::guides::GuideDisposition::MalformedBlock(reason) => {
+                format!("left alone, NOT refreshed: malformed devmap block ({reason})")
             }
         };
         outln!("  guide {}: {note}", guide.path.display());
@@ -491,13 +523,14 @@ pub(crate) fn manifest_json(outcome: &ManifestOutcome) -> serde_json::Value {
         // a guide that silently stopped tracking the map.
         "guides": outcome.guides.iter().map(|guide| serde_json::json!({
             "path": guide.path,
-            "disposition": match guide.disposition {
-                devmap_query::guides::GuideDisposition::Created => "created",
-                devmap_query::guides::GuideDisposition::Updated => "updated",
-                devmap_query::guides::GuideDisposition::Unchanged => "unchanged",
-                devmap_query::guides::GuideDisposition::NotOurs => "not_ours",
+            "disposition": guide.disposition.as_str(),
+            "block": guide.block,
+            "reason": match &guide.disposition {
+                devmap_query::guides::GuideDisposition::MalformedBlock(reason) => Some(reason.as_str()),
+                _ => None,
             },
             "changed": guide.changed(),
+            "needs_attention": guide.needs_attention(),
         })).collect::<Vec<_>>(),
     })
 }

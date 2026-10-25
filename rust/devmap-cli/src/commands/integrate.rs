@@ -43,6 +43,12 @@ pub(crate) struct Args {
     /// names them. A document not listed is never read.
     #[arg(long, value_name = "PATH")]
     pub(crate) only_path: Vec<PathBuf>,
+    /// Append a DevMap block to a hand-written `AGENTS.md` / `CLAUDE.md`
+    /// (one with no marker), keeping its text byte for byte. Without it a
+    /// hand-written guide is left alone. Once the block exists, later runs
+    /// refresh only the block and need no flag.
+    #[arg(long, conflicts_with = "remove")]
+    pub(crate) adopt_guides: bool,
 }
 
 pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
@@ -55,6 +61,7 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         servers_stdin,
         remove,
         only_path,
+        adopt_guides,
     } = args;
     if *remove {
         return run_remove(
@@ -75,6 +82,11 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         *check,
         binary.as_deref(),
         *servers_stdin,
+        if *adopt_guides {
+            devmap_query::guides::HandWrittenGuides::Adopt
+        } else {
+            devmap_query::guides::HandWrittenGuides::Preserve
+        },
     )
 }
 
@@ -134,6 +146,7 @@ fn run_remove(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_integrate(
     cli: &Cli,
     host: integrate::Host,
@@ -142,6 +155,7 @@ fn run_integrate(
     check: bool,
     binary: Option<&Path>,
     servers_stdin: bool,
+    hand_written: devmap_query::guides::HandWrittenGuides,
 ) -> anyhow::Result<()> {
     // Read and validated before anything is written: a malformed request must
     // not leave DevMap's half applied and the caller's half missing.
@@ -165,6 +179,7 @@ fn run_integrate(
         &servers,
         dry_run,
         check,
+        hand_written,
     )?;
     if cli.json {
         emit_json(
@@ -173,11 +188,11 @@ fn run_integrate(
                 "host": host.as_str(),
                 "guides": report.guides.iter().map(|g| serde_json::json!({
                     "path": g.path.display().to_string(),
-                    "disposition": match g.disposition {
-                        devmap_query::guides::GuideDisposition::Created => "created",
-                        devmap_query::guides::GuideDisposition::Updated => "updated",
-                        devmap_query::guides::GuideDisposition::Unchanged => "unchanged",
-                        devmap_query::guides::GuideDisposition::NotOurs => "not_ours",
+                    "disposition": g.disposition.as_str(),
+                    "block": g.block,
+                    "reason": match &g.disposition {
+                        devmap_query::guides::GuideDisposition::MalformedBlock(reason) => Some(reason.as_str()),
+                        _ => None,
                     },
                 })).collect::<Vec<_>>(),
                 "skills_written": report.skills_written.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
