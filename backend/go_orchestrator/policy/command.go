@@ -251,6 +251,11 @@ func (g CommandGate) evaluateSingleCommand(command string, task *dc.Task, depth 
 		if reason := secretOperandViolation(command, g.Root); reason != "" {
 			return g.noteHardRules(deny(RuleCommandSecretRead, reason, normalized, taskID))
 		}
+		// A write of evidence about the agent's own work. See
+		// RuleCommandHarnessOnly.
+		if reason := harnessOnlyViolation(command); reason != "" {
+			return g.noteHardRules(deny(RuleCommandHarnessOnly, reason, normalized, taskID))
+		}
 	}
 
 	var f clauseFindings

@@ -553,7 +553,7 @@ fn the_legacy_tasks_table_is_archived_as_items_and_dropped() {
         .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(version, i64::from(SCHEMA_VERSION));
-    assert_eq!(SCHEMA_VERSION, 10);
+    assert_eq!(SCHEMA_VERSION, 11);
 
     assert_eq!(item_state(conn, "TASK-1"), ("done".into(), 1));
     assert_eq!(item_state(conn, "TASK-2"), ("done".into(), 1));
@@ -684,7 +684,7 @@ fn a_half_migrated_store_is_finished_not_duplicated() {
         .connection()
         .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, i64::from(SCHEMA_VERSION));
 }
 
 #[test]
@@ -739,23 +739,30 @@ fn a_store_that_still_needs_migrating_is_not_read_as_empty() {
 fn an_older_reader_fails_closed_and_a_newer_one_migrates() {
     let path = pre_migration("tasks-versions");
     let conn = Connection::open(&path).unwrap();
-    // A build that knows schema 9 reads the stamp this migration leaves (10)
-    // and refuses it, before touching a table it cannot read.
+    // A build that knows an older schema reads the stamp this migration
+    // leaves (the current one) and refuses it, before touching a table it
+    // cannot read. Both 9 (before the tasks table was retired) and 10 (before
+    // reviews) are such builds.
     drop(Store::open(&path).unwrap());
-    assert!(
-        schema::ensure_schema_version(&conn, 9)
-            .unwrap_err()
-            .contains("unsupported DevCouncil schema version 10")
-    );
+    for older in [9, SCHEMA_VERSION - 1] {
+        assert!(
+            schema::ensure_schema_version(&conn, older)
+                .unwrap_err()
+                .contains(&format!(
+                    "unsupported DevCouncil schema version {SCHEMA_VERSION}"
+                ))
+        );
+    }
     // This build refuses what is newer than it, and leaves it untouched.
-    conn.execute("UPDATE schema_version SET version = 11", [])
-        .unwrap();
+    conn.execute(
+        "UPDATE schema_version SET version = ?1",
+        [SCHEMA_VERSION + 1],
+    )
+    .unwrap();
     assert!(matches!(
         Store::open(&path),
-        Err(StoreError::SchemaTooNew {
-            found: 11,
-            known: 10
-        })
+        Err(StoreError::SchemaTooNew { found, known })
+            if found == SCHEMA_VERSION + 1 && known == SCHEMA_VERSION
     ));
 }
 

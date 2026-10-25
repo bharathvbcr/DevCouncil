@@ -146,7 +146,7 @@ func Run(ctx context.Context, in Input) (gaps []Gap, meta runMeta) {
 		claimed = in.Task.AcceptanceCriterionIDs
 	}
 	commandsPassed := len(commands) > 0 && len(commandGaps) == 0
-	gaps = append(gaps, dispatchCriteria(taskID, claimed, in.Requirements, in.RequirementsErr, commands, commandsPassed)...)
+	gaps = append(gaps, dispatchCriteria(taskID, claimed, in.Requirements, in.RequirementsErr, commands, commandsPassed, in.Reviews)...)
 
 	// Stub detection, secret scanning and diff∩coverage, all of which live in
 	// dcverify. The outcome carries its own account of what ran: never
@@ -498,9 +498,15 @@ var ErrGitOutputTruncated = errors.New("git output exceeded the verification cap
 // a program its .git/config names — could report any diff it likes,
 // including none.
 func runGit(ctx context.Context, git *proc.GitSession, limit int, args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	return runGitEnv(ctx, git, limit, 60*time.Second, nil, args...)
+}
+
+// runGitEnv is runGit with its own time bound and env added to git's
+// environment (see proc.GitSession.RunEnv).
+func runGitEnv(ctx context.Context, git *proc.GitSession, limit int, bound time.Duration, env []string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, bound)
 	defer cancel()
-	res, err := git.Run(ctx, limit, args...)
+	res, err := git.RunEnv(ctx, limit, env, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -683,10 +689,20 @@ func VerifyTask(ctx context.Context, root string, client *store.Client, taskID s
 	if len(task.AcceptanceCriterionIDs) > 0 {
 		linked, linkedErr = client.Requirements(ctx, taskID)
 	}
+	// The subject and the reviews are read only for a task that claims an
+	// llm_review criterion: naming the working tree stages it into a scratch
+	// index, which a task with nothing to review should not pay for.
+	var reviews ReviewEvidence
+	if linkedErr == nil {
+		if ids := ReviewsNeeded(task.AcceptanceCriterionIDs, linked); len(ids) > 0 {
+			reviews = LoadReviewEvidence(ctx, root, client, taskID, ids)
+		}
+	}
 	envPolicy := LoadEnvPolicy(root)
 	in := Input{
 		Requirements:    linked,
 		RequirementsErr: linkedErr,
+		Reviews:         reviews,
 		Root:            root,
 		Task:            task,
 		GateMode:        gate.Mode,

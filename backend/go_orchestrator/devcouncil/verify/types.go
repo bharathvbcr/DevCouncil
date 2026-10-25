@@ -173,6 +173,10 @@ type Input struct {
 	// claimed criterion blocks (criteria.go).
 	Requirements    store.LinkedRequirements
 	RequirementsErr error
+	// Reviews is what verify read to judge the task's llm_review criteria.
+	// Left zero by a caller whose task claims none; a claimed llm_review
+	// criterion with zero evidence blocks, it is never discharged.
+	Reviews ReviewEvidence
 
 	// Rigor runs the stub, secret and diff∩coverage gates by spawning
 	// dcverify. Nil means they do not run, which is reported as

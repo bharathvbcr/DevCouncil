@@ -137,6 +137,11 @@ type response struct {
 	History      []GapHistoryRow  `json:"history"`
 	Truncated    bool             `json:"truncated"`
 	Shown        int              `json:"shown"`
+	// ReviewID is review-append's answer and Reviews the `reviews` reply.
+	// ReviewID is its own key for the reason GapID is: `id` is the evidence
+	// row's integer.
+	ReviewID int64       `json:"review_id"`
+	Reviews  []reviewRow `json:"reviews"`
 }
 
 func (r *response) UnmarshalJSON(data []byte) error {
@@ -715,7 +720,8 @@ const exclusionIndexVerified = "verified"
 
 // SchemaVersion is the lease-schema revision this harness understands. It must
 // match dc_store::SCHEMA_VERSION; Available refuses to proceed when it does not.
-const SchemaVersion = 10
+// 11 is the store that records and lists reviews (ReviewAppend, Reviews).
+const SchemaVersion = 11
 
 // storeIdentity is the name the real store answers to.
 const storeIdentity = "dc-store"
@@ -902,6 +908,115 @@ func (c *Client) Requirements(ctx context.Context, taskID string) (LinkedRequire
 		linked.Requirements = append(linked.Requirements, req)
 	}
 	return linked, nil
+}
+
+// reviewRow is one `reviews` row as the store sends it. The record arrives
+// embedded as the JSON object it was stored as, or as null beside a
+// record_error when the stored bytes no longer parse.
+type reviewRow struct {
+	ID                    int64           `json:"id"`
+	TaskID                string          `json:"task_id"`
+	AcceptanceCriterionID string          `json:"acceptance_criterion_id"`
+	SubjectHash           string          `json:"subject_hash"`
+	Record                json.RawMessage `json:"record"`
+	RecordError           string          `json:"record_error"`
+	RecordedAt            string          `json:"recorded_at"`
+}
+
+// StoredReview is one recorded review as read back, with the record decoded
+// and validated. A row whose record could not be decoded carries the reason in
+// Err and no Record: it is reported, never skipped, so the newest review that
+// is unreadable is not silently replaced by an older readable one.
+type StoredReview struct {
+	ID          int64
+	SubjectHash string
+	RecordedAt  string
+	Record      dc.ReviewRecord
+	Err         error
+}
+
+// ReviewAppend records one review. The record is validated here before it is
+// sent (dc.ReviewRecord.Validate), so a malformed record is refused by the
+// writer rather than stored for every reader to refuse.
+//
+// This is the harness's write. Nothing that serves the agent being verified —
+// its shell (the gate refuses the command, policy.RuleCommandHarnessOnly) or
+// the host's MCP tools — reaches it.
+func (c *Client) ReviewAppend(ctx context.Context, record dc.ReviewRecord) (int64, error) {
+	if err := record.Validate(); err != nil {
+		return 0, err
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		return 0, fmt.Errorf("review record: %w", err)
+	}
+	out, err := c.run(ctx, "review-append",
+		"--task", record.TaskID,
+		"--acceptance-criterion-id", record.AcceptanceCriterionID,
+		"--subject-hash", record.SubjectHash,
+		"--record", string(data))
+	if err != nil {
+		return 0, err
+	}
+	if !out.OK {
+		return 0, fmt.Errorf("review-append refused: %s", out.Error)
+	}
+	if out.ReviewID <= 0 {
+		return 0, fmt.Errorf("store: review-append reply carries no review_id")
+	}
+	return out.ReviewID, nil
+}
+
+// Reviews reads a task's reviews, newest first, for one criterion or (with
+// criterionID empty) all of them.
+//
+// A truncated reply is an error rather than a shorter list: the newest rows
+// come first, so a cut list would still hold the one verify reads, but a
+// caller listing reviews for a person must not show part of them as all.
+func (c *Client) Reviews(ctx context.Context, taskID, criterionID string) ([]StoredReview, error) {
+	args := []string{"reviews", "--task", taskID}
+	if criterionID != "" {
+		args = append(args, "--acceptance-criterion-id", criterionID)
+	}
+	out, err := c.run(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	if !out.OK {
+		return nil, fmt.Errorf("reviews refused: %s", out.Error)
+	}
+	if out.Reviews == nil {
+		return nil, fmt.Errorf("store: reviews reply for %s carries no reviews", taskID)
+	}
+	if out.Truncated {
+		return nil, fmt.Errorf("store: task %s has more reviews than one reply carries", taskID)
+	}
+	reviews := make([]StoredReview, 0, len(out.Reviews))
+	for _, row := range out.Reviews {
+		stored := StoredReview{ID: row.ID, SubjectHash: row.SubjectHash, RecordedAt: row.RecordedAt}
+		switch {
+		case row.RecordError != "" || len(row.Record) == 0 || string(row.Record) == "null":
+			stored.Err = fmt.Errorf("review %d: the stored record does not parse: %s", row.ID, row.RecordError)
+		default:
+			record, err := dc.DecodeReviewRecord(row.Record)
+			switch {
+			case err != nil:
+				stored.Err = fmt.Errorf("review %d: %w", row.ID, err)
+			case record.TaskID != row.TaskID || record.AcceptanceCriterionID != row.AcceptanceCriterionID ||
+				record.SubjectHash != row.SubjectHash:
+				// The row's keys are what the store indexes and the record's
+				// are what the harness wrote; a disagreement is a record filed
+				// under someone else's name.
+				stored.Err = fmt.Errorf("review %d: the record names %s/%s/%s but is stored under %s/%s/%s",
+					row.ID, record.TaskID, record.AcceptanceCriterionID, record.SubjectHash,
+					row.TaskID, row.AcceptanceCriterionID, row.SubjectHash)
+			default:
+				stored.Record = record
+			}
+		}
+		reviews = append(reviews, stored)
+	}
+	return reviews, nil
 }
 
 // EvidenceList returns evidence rows (newest first), optionally for one task.

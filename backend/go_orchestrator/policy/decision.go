@@ -143,6 +143,16 @@ const (
 	// cannot see (a script on disk, an interpreter's own argument) stays the
 	// documented boundary of every rung that reads the line.
 	RuleCommandSecretRead RuleID = "command.secret_read"
+	// RuleCommandHarnessOnly refuses, in an agent's shell, a command whose
+	// write is evidence about that agent's own work: recording the independent
+	// review an llm_review acceptance criterion is discharged by
+	// (`devcouncil review record`, or `dcstore review-append` underneath it).
+	// An agent that could record its review could discharge a criterion by
+	// asserting it had been reviewed. The harness that ran the reviewers writes
+	// the record in process, and a person writes it from a terminal; neither
+	// goes through this gate. Hard, so no lease, allowlist entry (`dev *`),
+	// grant or posture but yolo negotiates it.
+	RuleCommandHarnessOnly RuleID = "command.harness_only"
 	// RuleCommandGitReadArgument refuses a read-only git subcommand (diff, log,
 	// show, status, whatchanged) whose arguments do more than read the working
 	// tree: an argument carrying an expansion only the shell can resolve, a
@@ -203,6 +213,7 @@ var severities = map[RuleID]Severity{
 	RuleCommandDirectoryChange:     Hard,
 	RuleSecretRead:                 Hard,
 	RuleCommandSecretRead:          Hard,
+	RuleCommandHarnessOnly:         Hard,
 	RuleCommandGitReadArgument:     Hard,
 	RuleCommandOperandUnverifiable: Hard,
 	RulePathEngineUnavailable:      Hard,
@@ -263,8 +274,9 @@ var subjects = map[RuleID]Subject{
 	RuleCommandGitReadArgument:     SubjectCommand,
 	RuleCommandOperandUnverifiable: SubjectCommand,
 
-	RuleSecretRead:        SubjectPath,
-	RuleCommandSecretRead: SubjectCommand,
+	RuleSecretRead:         SubjectPath,
+	RuleCommandSecretRead:  SubjectCommand,
+	RuleCommandHarnessOnly: SubjectCommand,
 
 	RulePathEngineUnavailable:    SubjectPath,
 	RuleCommandEngineUnavailable: SubjectCommand,

@@ -2,6 +2,7 @@ package dc
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -57,23 +58,28 @@ func TestAnUnknownVerificationMethodIsRefused(t *testing.T) {
 	}
 }
 
-// llm_review used to be accepted here and dispatched on nowhere: no gate, no
-// harness, no executor. A criterion carrying it read as checkable and could
-// never fail. It is refused at validation like any other method nothing
-// discharges, until a consuming harness (Manvi) implements it.
-func TestLLMReviewIsRefusedBecauseNothingDischargesIt(t *testing.T) {
+// llm_review was refused here while nothing discharged it. It decodes again
+// because a ReviewRecord now does; that it is dispatched to the review
+// executor, never to the command one, is held by
+// verify.TestLLMReviewIsDischargedOnlyByAReviewOfThisContent.
+func TestLLMReviewDecodesNowThatAReviewRecordDischargesIt(t *testing.T) {
 	var ac AcceptanceCriterion
-	err := json.Unmarshal([]byte(
-		`{"id":"AC-7","description":"reads well","verification_method":"llm_review"}`), &ac)
-	if err == nil {
-		t.Fatal("llm_review decoded, but no executor in this tree can discharge it")
+	if err := json.Unmarshal([]byte(
+		`{"id":"AC-7","description":"reads well","verification_method":"llm_review"}`), &ac); err != nil {
+		t.Fatalf("llm_review did not decode: %v", err)
 	}
-	if !strings.Contains(err.Error(), "AC-7") || !strings.Contains(err.Error(), "llm_review") {
-		t.Errorf("the refusal must name the criterion and the method: %v", err)
+	if ac.Method != VerifyLLMReview || !ac.Required {
+		t.Errorf("decoded as %+v", ac)
 	}
-	for _, m := range VerificationMethods() {
-		if m == "llm_review" {
-			t.Errorf("VerificationMethods still lists llm_review")
+	if !slices.Contains(VerificationMethods(), VerifyLLMReview) {
+		t.Error("VerificationMethods does not list llm_review")
+	}
+	// A near miss is still refused: only the exact member is a method.
+	for _, near := range []string{"LLM_REVIEW", "llm-review", "llm_review "} {
+		err := json.Unmarshal([]byte(
+			`{"id":"AC-8","description":"x","verification_method":"`+near+`"}`), &ac)
+		if err == nil || !strings.Contains(err.Error(), "AC-8") {
+			t.Errorf("%q: err = %v, want a refusal naming AC-8", near, err)
 		}
 	}
 }

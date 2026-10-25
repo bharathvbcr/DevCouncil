@@ -81,6 +81,7 @@ var commands = map[string]func(args []string) int{
 	"enable":       runEnable,
 	"gate":         runGate,
 	"task":         runTask,
+	"review":       runReview,
 	"doctor":       runDoctor,
 	"hook":         runHook,
 	"map":          func(args []string) int { return runDevmap(mapArgs(args)) },
@@ -130,6 +131,11 @@ Usage:
   devcouncil task status ID --to inbox|backlog|ready|in_progress|review|done [--project-root DIR]
   devcouncil task show ID [--json] [--project-root DIR]
                                    Tasks are workbench items; these wrap ` + "`dcstore work`" + `
+  devcouncil review subject [--json] [--project-root DIR]
+  devcouncil review record --file RECORD.json [--json] [--project-root DIR]
+  devcouncil review list --task ID [--criterion AC] [--json] [--project-root DIR]
+                                   Independent reviews that prove llm_review criteria; record is the
+                                   harness's (refused in agent shells)
   devcouncil doctor [--json] [--project-root DIR]
                                    Which store next_task reads, and how many ready items it holds
   devcouncil hook <event>     Retired lifecycle compatibility (silent no-op)

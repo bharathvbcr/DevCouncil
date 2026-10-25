@@ -27,17 +27,17 @@ import (
 // everywhere else.
 type VerificationMethod string
 
-// `llm_review` is deliberately absent. It used to be accepted here and was
-// dispatched on nowhere: no gate, harness or executor in this tree discharges
-// it, so a criterion carrying it read as checkable and could never fail. It is
-// refused at decode until a consuming harness (Manvi) implements it, at which
-// point it is added back here together with its executor in
-// devcouncil/verify/criteria.go.
+// `llm_review` was once accepted here and dispatched on nowhere, so a criterion
+// carrying it read as checkable and could never fail; it was refused at decode
+// until something could discharge it. It is back together with its executor
+// (devcouncil/verify/criteria.go): a ReviewRecord in the store, made by the
+// harness that ran the reviewers, for exactly the content verify is looking at.
 const (
 	VerifyUnitTest        VerificationMethod = "unit_test"
 	VerifyIntegrationTest VerificationMethod = "integration_test"
 	VerifyManual          VerificationMethod = "manual"
 	VerifyStaticCheck     VerificationMethod = "static_check"
+	VerifyLLMReview       VerificationMethod = "llm_review"
 )
 
 // VerificationMethods is every method a criterion may carry. The verifier's
@@ -45,7 +45,7 @@ const (
 // an executor or an explicit unsupported gap fails a test rather than passing
 // silently.
 func VerificationMethods() []VerificationMethod {
-	return []VerificationMethod{VerifyUnitTest, VerifyIntegrationTest, VerifyManual, VerifyStaticCheck}
+	return []VerificationMethod{VerifyUnitTest, VerifyIntegrationTest, VerifyManual, VerifyStaticCheck, VerifyLLMReview}
 }
 
 func (m VerificationMethod) valid() bool {

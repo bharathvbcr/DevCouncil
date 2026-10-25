@@ -127,15 +127,17 @@ func TestRequirementsCrossTheBoundaryDecoded(t *testing.T) {
 }
 
 // A stored criterion no gate can discharge is an error, not a criterion
-// quietly left out of the list the verifier dispatches on.
+// quietly left out of the list the verifier dispatches on. (This used to be
+// spelled with llm_review, refused while nothing discharged it; it is a
+// method now, and the case is any name that is not one.)
 func TestARequirementCarryingAnUndischargeableMethodIsAnError(t *testing.T) {
 	c, db := plantTaskWithLinks(t, `[]`, `["AC-1"]`)
 	plantRequirements(t, db, `["REQ-1"]`,
-		`('REQ-1','reads well','','high','user','[{"id":"AC-1","description":"x","verification_method":"llm_review"}]')`)
+		`('REQ-1','reads well','','high','user','[{"id":"AC-1","description":"x","verification_method":"vibe_check"}]')`)
 
 	if _, err := c.Requirements(context.Background(), "TASK-1"); err == nil ||
-		!strings.Contains(err.Error(), "llm_review") {
-		t.Fatalf("err = %v, want a refusal naming llm_review", err)
+		!strings.Contains(err.Error(), "vibe_check") {
+		t.Fatalf("err = %v, want a refusal naming vibe_check", err)
 	}
 	if _, err := c.Requirements(context.Background(), "NO-SUCH-TASK"); err == nil {
 		t.Fatal("an unknown task read as one with no requirements")

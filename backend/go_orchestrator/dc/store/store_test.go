@@ -315,7 +315,7 @@ func TestAvailableNeverManufacturesTheStoreItChecks(t *testing.T) {
 func TestAvailableRequiresTheExclusionIndexAssertion(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "old-store.sh")
-	body := "#!/bin/sh\necho '{\"ok\":true,\"store\":\"dc-store\",\"schema_version\":10,\"active_leases\":0}'\n"
+	body := fmt.Sprintf("#!/bin/sh\necho '{\"ok\":true,\"store\":\"dc-store\",\"schema_version\":%d,\"active_leases\":0}'\n", SchemaVersion)
 	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
 		t.Fatal(err)
 	}

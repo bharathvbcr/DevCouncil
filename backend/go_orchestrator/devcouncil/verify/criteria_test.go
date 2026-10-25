@@ -61,7 +61,20 @@ func TestEveryVerificationMethodIsDischargedOrBlocks(t *testing.T) {
 			unproven := gapsOfType(gaps, "acceptance_criteria_unproven")
 			coarse := gapsOfType(gaps, "coarse_acceptance_proof")
 
-			if _, ok := verify.CriterionExecutor(method); ok {
+			executor, ok := verify.CriterionExecutor(method)
+			if ok && executor == "review_record" {
+				// Discharged only by a recorded review: a passing command,
+				// and no review, blocks.
+				reviewGaps := gapsOfType(gaps, "llm_review_unproven")
+				if len(reviewGaps) != 1 || !reviewGaps[0].Blocking || len(coarse) != 0 {
+					t.Fatalf("a passing command discharged %s with no review: %+v", method, gaps)
+				}
+				if status, _ := verify.StatusFromGaps(gaps, meta.GateMode); status != "blocked" {
+					t.Errorf("status = %s with no review", status)
+				}
+				return
+			}
+			if ok {
 				// Discharged by the passing command, and labelled as the
 				// task-level proof it is.
 				if len(unsupported)+len(unproven) != 0 {

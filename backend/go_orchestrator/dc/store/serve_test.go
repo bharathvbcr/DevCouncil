@@ -121,7 +121,7 @@ func TestAServedConflictIsStillAnOutcome(t *testing.T) {
 func TestABinaryWithoutServeIsAnsweredOneShot(t *testing.T) {
 	// No framing: the whole answer is the JSON object an older store prints,
 	// whatever it was asked.
-	c := fakeClient(t, `{"ok":true,"store":"dc-store","schema_version":10,"exclusion_index":"verified","active_leases":0}`)
+	c := fakeClient(t, fmt.Sprintf(`{"ok":true,"store":"dc-store","schema_version":%d,"exclusion_index":"verified","active_leases":0}`, SchemaVersion))
 
 	if err := c.Available(context.Background()); err != nil {
 		t.Fatalf("a store that does not speak serve was reported unavailable: %v", err)

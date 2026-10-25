@@ -35,6 +35,8 @@ var categoryByGapType = map[string]string{
 	"architecture_check_unavailable":  "review",
 	"rigor_check_unavailable":         "fix_verification",
 	"unsupported_verification_method": "fix_verification",
+	"llm_review_unproven":             "review",
+	"llm_review_findings":             "review",
 	GateConfigInvalid:                 "fix_config",
 	VerifyEnvConfigInvalid:            "fix_config",
 }
@@ -151,6 +153,19 @@ func actionText(g Gap, file *string) string {
 		}
 		return "Verify cannot check " + criterion + " (" + method + "). Have a person confirm it and " +
 			"re-plan it with unit_test, integration_test or static_check, or mark it required: false."
+	case "llm_review_unproven":
+		criterion := "this acceptance criterion"
+		if g.AcceptanceCriterionID != nil {
+			criterion = *g.AcceptanceCriterionID
+		}
+		return criterion + " is proved by an independent review of exactly this content, which " +
+			"you cannot record yourself. Finish the change, then ask for the review: the harness " +
+			"that runs the reviewers records it (`devcouncil review record`, refused in agent " +
+			"shells). If the reasons name open blocker findings, fix them first."
+	case "llm_review_findings":
+		return "The review that discharged this criterion left major findings open or set " +
+			"findings aside; read them in the evidence and fix or answer each before the task is " +
+			"accepted."
 	case "stale_map":
 		return "Run `dev map` to regenerate the repository map, then re-verify."
 	default:

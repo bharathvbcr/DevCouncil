@@ -41,10 +41,19 @@ const gitWaitDelay = 2 * time.Second
 // reported as TimedOut with ctx's error. A read that Command refuses, or a git
 // that cannot start, is returned as it came: an *exec.Error.
 func (s *GitSession) Run(ctx context.Context, limit int, args ...string) (GitResult, error) {
+	return s.RunEnv(ctx, limit, nil, args...)
+}
+
+// RunEnv is Run with env (KEY=VALUE entries) added to git's environment, for
+// the one kind of read that needs it: one that must work against a scratch
+// index (GIT_INDEX_FILE) rather than the repository's own. The guards, caps
+// and failure classification are Run's.
+func (s *GitSession) RunEnv(ctx context.Context, limit int, env []string, args ...string) (GitResult, error) {
 	cmd, err := s.Command(ctx, args...)
 	if err != nil {
 		return GitResult{ExitCode: -1}, err
 	}
+	cmd.Env = append(cmd.Env, env...)
 	stdout := &CappedBuffer{Limit: limit}
 	stderr := &CappedBuffer{Limit: limit}
 	cmd.Stdout = stdout

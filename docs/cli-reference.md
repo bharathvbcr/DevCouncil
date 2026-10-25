@@ -211,8 +211,25 @@ Verifies the working-tree diff for `TASK_ID` through Go `verify.Run()`: no-work,
 - `dcverify` is discovered on `PATH`, excluding any candidate inside the repository under analysis (`proc.LookPathOutside`); `MANVI_VERIFY_BINARY` overrides discovery. It remains a separately installed component (`devcouncil install --only=dcverify`).
 - `--mode`: `off` (default when unset) skips quality verification and reports `status: "skipped"`, `passed: false`, and `verification_skipped: true`; `advisory` still blocks hard-safety gaps; `enforce` blocks every `Blocking` gap. Hard-safety write policy is unchanged.
 - `--json`: Output machine-readable verification results and typed `next_actions` for agent self-repair. Skipped tasks increment `completed_without_verification`, not `verified_tasks`. Completion and verification remain separate outcomes.
-- Acceptance criteria: each criterion the task claims is dispatched on its requirement's `verification_method` (`devcouncil/verify/criteria.go`). `unit_test`, `integration_test` and `static_check` are discharged when the task's verification commands all ran and passed, and are then also reported as a non-blocking `coarse_acceptance_proof`; otherwise they are `acceptance_criteria_unproven`. `manual` has no executor and is a hard-safety `unsupported_verification_method` gap (blocking when `required`, in advisory mode too). `llm_review` is refused when the requirement is read, so a criterion carrying it blocks. A criterion no linked requirement defines, or requirements the store could not return, also block.
+- Acceptance criteria: each criterion the task claims is dispatched on its requirement's `verification_method` (`devcouncil/verify/criteria.go`). `unit_test`, `integration_test` and `static_check` are discharged when the task's verification commands all ran and passed, and are then also reported as a non-blocking `coarse_acceptance_proof`; otherwise they are `acceptance_criteria_unproven`. `manual` has no executor and is a hard-safety `unsupported_verification_method` gap (blocking when `required`, in advisory mode too). `llm_review` is discharged only by a recorded independent review of exactly the content under verification (see [Independent reviews](#independent-reviews-llm_review)); with none, or with one that cannot vouch for this content, it is a blocking `llm_review_unproven` gap whose evidence says why, and a discharging review's open major or contested findings are reported as a non-blocking `llm_review_findings` gap. Passing commands never discharge it. A criterion no linked requirement defines, or requirements the store could not return, also block.
 - `--sandbox`: Only `local` exists: verification commands run on the host (`/bin/sh -c` in the project root), and the report's `sandbox` field is always `local` because that is where they ran. Any other value (`docker`, `nix`, anything) is refused with exit 2 before a store is opened or a command runs (TASK-P7-2). MCP `devcouncil_verify_task` takes no sandbox argument and refuses one with `code: invalid_argument`.
+
+### Independent reviews (`llm_review`)
+
+```bash
+devcouncil review subject [--json] [--project-root DIR]
+devcouncil review record --file RECORD.json [--json] [--project-root DIR]
+devcouncil review list --task ID [--criterion AC] [--json] [--project-root DIR]
+```
+
+An `llm_review` acceptance criterion is proved the way the Elephant-Goldfish Model proves a design: reviewers in fresh contexts that never saw the author's deliberation, judging against a written standard. DevCouncil does not run reviewers (that is the harness's job, for example Manvi); it records what a harness reports and decides whether that report vouches for the content being verified.
+
+- `subject` names the working tree's content: `git-tree:<id>`, the tree git would commit if every judged change were staged — tracked, untracked and deleted files, minus `.gitignore` and tool state (`.devcouncil/`, `.devmap/`). It is computed against a scratch index, so the real index is untouched; a clean tree's subject is `HEAD^{tree}`, and committing reviewed content keeps its subject (`devcouncil/verify/subject.go`).
+- `record` stores one review (`dc.ReviewRecord`, schema 1, `dc/review.go`): `task_id`, `acceptance_criterion_id`, `subject_hash`, `harness`, `rubric` (`path` in the repository and the `sha256` of its bytes), `isolation.probe` (`passed` / `failed` / `not_run`), `reviewers` (distinct ids, each `completed` / `failed` / `cancelled`) and `findings` (`blocker` / `major` / `nit`, each `open` / `fixed` / `contested`; contested needs a `note`). Unknown fields, enum near-misses and a contested finding without a note are refused before anything is stored. The receipt says whether the record's subject is the working tree now (`matches_working_tree`).
+- `list` shows a task's reviews, newest first; a row whose stored bytes no longer decode is shown with its error, never skipped.
+- **When a review discharges a criterion:** verify computes the subject and uses the newest review of that criterion whose `subject_hash` equals it. It discharges only if the isolation probe `passed`, at least two reviewers `completed`, the rubric at `rubric.path` resolves inside the repository and hashes to `rubric.sha256`, and no `blocker` finding is `open`. Any other outcome — no review, only reviews of other content (named in the evidence), an unreadable newest match, a store or subject error — is a `llm_review_unproven` gap, blocking when the criterion is required.
+- **Who may record:** the harness that ran the reviewers (in process, through `store.Client.ReviewAppend`) or a person at a terminal. In an agent's shell `devcouncil review record` and `dcstore … review-append` are refused by the hard policy rule `command.harness_only`, whatever the task's `allowed_commands` say, and no MCP tool records a review. An agent that could record its own review could discharge its criterion by asserting it.
+- Reviews are stored append-only in dc-store's `reviews` table (dc-store schema 11).
 
 ### DevMap Shorthands
 
@@ -295,7 +312,11 @@ dcstore --db <PATH> renew --task <ID> --token <TOKEN> --ttl-seconds <N>
 dcstore --db <PATH> release --task <ID> --token <TOKEN>
 dcstore --db <PATH> task --task <ID>
 dcstore --db <PATH> ready
+dcstore --db <PATH> review-append --task <ID> --acceptance-criterion-id <AC> --subject-hash <SUBJECT> --record <JSON>
+dcstore --db <PATH> reviews --task <ID> [--acceptance-criterion-id <AC>]
 ```
+
+`review-append` and `reviews` are the [independent review](#independent-reviews-llm_review) record (schema 11). `review-append` refuses an unknown task, a subject hash outside `a-z0-9:-`, and a record that is not one JSON object; `reviews` embeds each record as the object it was stored as, or `null` beside a `record_error`.
 
 ### Deterministic Verifier (`dcverify`)
 
