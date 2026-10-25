@@ -42,7 +42,7 @@ Old Python 0.4.x release notes belong to a different runtime lineage.
 
 ## Evidence and open work
 
-The [native migration ledger](PHASE7_LONG_TAIL.md), [task ledger](TODO.md),
+The [native migration ledger](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/PHASE7_LONG_TAIL.md), [task ledger](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/TODO.md),
 [Rust status](../rust/STATUS.md), and dated audit reports retain detailed
 qualification history. Old fixture counts and “certified” Python workflows
 must not be reused as certification of the current task MCP loop.

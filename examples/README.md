@@ -5,7 +5,7 @@ report snippets when documenting or judging DevCouncil.
 
 | Path | Role | How to run |
 | :--- | :--- | :--- |
-| [`build-week-demo/`](build-week-demo/) | Calculator fixture files (`calc.py`, `broken_calc.py`, `test_calc.py`); the red→green demo that drove them was retired with the Python package | Not a product CLI; see [docs/archive/build-week-demo.md](../docs/archive/build-week-demo.md) |
+| [`build-week-demo/`](build-week-demo/) | Calculator fixture files (`calc.py`, `broken_calc.py`, `test_calc.py`); the red→green demo that drove them was retired with the Python package | Not a product CLI; see [docs/archive/build-week-demo.md](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/archive/build-week-demo.md) |
 
 ## Documentation smoke (checkout)
 
@@ -22,4 +22,4 @@ dev map
 ```
 
 Maturity labels for public surfaces: [docs/project-status.md](../docs/project-status.md).
-Walkthrough: [docs/archive/build-week-demo.md](../docs/archive/build-week-demo.md).
+Walkthrough: [docs/archive/build-week-demo.md](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/archive/build-week-demo.md).

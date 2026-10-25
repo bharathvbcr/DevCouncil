@@ -66,10 +66,32 @@ type RedirectSet struct {
 // RedirectWrites is RedirectTargets with the scope-dependent half reported
 // beside the targets, so the one caller that knows whether a scope is bound
 // can decide what Unjudged means.
+//
+// Every reading of the line with its variables bound (expandBindings) is
+// scanned, and the writes are their union: a file one reading writes is a file
+// the line may write.
 func RedirectWrites(command string) (RedirectSet, error) {
-	found, err := redirectTargets(command, 0)
-	if err != nil {
-		return RedirectSet{}, err
+	var found redirectFindings
+	for i, reading := range expandBindings(command) {
+		one, err := redirectTargets(reading, 0)
+		if err != nil {
+			return RedirectSet{}, err
+		}
+		if i == 0 {
+			found = one
+			continue
+		}
+		found.targets = append(found.targets, one.targets...)
+		found.opaque = found.opaque || one.opaque
+		if found.unjudged == "" {
+			found.unjudged = one.unjudged
+		}
+		if len(one.deleted) > 0 && found.deleted == nil {
+			found.deleted = make(map[string]int, len(one.deleted))
+		}
+		for target, count := range one.deleted {
+			found.deleted[target] += count
+		}
 	}
 	targets, opaque, unjudged := found.targets, found.opaque, found.unjudged
 	named := make(map[string]int, len(found.deleted))
@@ -623,10 +645,19 @@ const substitutionPlaceholder = "$()"
 // `tee >(gzip > out.gz)` — names no file beyond what the span itself writes.
 const processSubstitutionPlaceholder = "/dev/fd/63"
 
-// unresolvableWord reports whether a write target names a path only the shell
-// can compute: it carries a parameter expansion ($HOME, ${X}, or a
-// substitution's placeholder) or a tilde. One predicate for redirection targets
-// and argument operands, so the two cannot disagree about what is nameable.
+// unresolvableWord reports whether a write target names a path only running a
+// command can compute: it carries a substitution or a substitution's
+// placeholder. One predicate for redirection targets and argument operands, so
+// the two cannot disagree about what is nameable.
+//
+// It used to be any `$` or `~`. expandBindings now rewrites the tilde, $HOME,
+// $TMPDIR and every variable the line itself assigns before any rung reads the
+// line, and a variable it could not bind is judged by its literal text (owner
+// decision, 2026-10-24; see carriesSubstitution), so `> $OUT` and `cp a
+// $W/b` are judged as the paths they spell rather than refused as opaque.
+//
+// A word ending in a bare `$` is one the scan stopped inside a construct it
+// does not read to the end — a nested `$(…)` it cut short — and stays opaque.
 func unresolvableWord(word string) bool {
-	return strings.ContainsAny(word, "$~")
+	return carriesSubstitution(word) || strings.HasSuffix(word, "$")
 }

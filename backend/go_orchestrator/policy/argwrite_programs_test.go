@@ -42,7 +42,8 @@ func TestArgumentWriteTargetsNameWhatEachProgramWrites(t *testing.T) {
 		{line: "curl -o - http://h/x"},
 		{line: "curl -sSL http://h/x"},
 		{line: "curl -H 'X-A: b' http://h/x"},
-		{line: "curl -o \"$F\" http://h/x", opaque: true},
+		{line: "curl -o \"$F\" http://h/x", targets: []string{"$F"}},
+		{line: "curl -o \"$(pick)\" http://h/x", opaque: true},
 		{line: "curl -K cfg http://h/x", unjudged: true},
 		// wget
 		{line: "wget -O .env http://h/x", targets: []string{".env"}},

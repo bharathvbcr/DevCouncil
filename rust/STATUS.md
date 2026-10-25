@@ -2,9 +2,9 @@
 
 > **This is not the kernel ledger.** The kernel crates (`devmap-*`) now live
 > in this same workspace. Open work for both planes is indexed in
-> [`docs/archive/devmap/AGENT_PLAN.md` → Consolidated open-work register](../docs/archive/devmap/AGENT_PLAN.md#consolidated-open-work-register-2026-09-02)
+> [`docs/archive/devmap/AGENT_PLAN.md` → Consolidated open-work register](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/archive/devmap/AGENT_PLAN.md#consolidated-open-work-register-2026-09-02)
 > (section E covers this plane). This file stays authoritative for the analysis-plane
-> detail; the kernel port ledger is archived at [`docs/archive/devmap/STATUS.md`](../docs/archive/devmap/STATUS.md). Live follow-ups: [`docs/TODO.md`](../docs/TODO.md).
+> detail; the kernel port ledger is archived at [`docs/archive/devmap/STATUS.md`](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/archive/devmap/STATUS.md). Follow-up ledger (frozen at its last tracked commit): [`docs/TODO.md`](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/TODO.md).
 
 **What this is:** the six `dc-*` crates MANVI also carries (`dc-evidence`,
 `dc-glob`, `dc-grep`, `dc-proc`, `dc-store`, `dc-verify`) and their Go clients,

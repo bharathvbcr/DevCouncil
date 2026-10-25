@@ -43,7 +43,7 @@ without executing it. `devmap repair --fts --pending --page-size --json`
 returns one combined receipt; `--schema` remains exclusive. Raw GraphML
 (`devmap export --out -`) cannot also request `--json`.
 
-See [CLI presentation audit](archive/CLI_PRESENTATION_AUDIT.md) for reproductions,
+See [CLI presentation audit](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/archive/CLI_PRESENTATION_AUDIT.md) for reproductions,
 verification commands, measured coverage, and platform limits.
 
 ---
@@ -184,7 +184,7 @@ Compound/custom hook commands whose ownership cannot be proven are preserved.
 Plugin caches and Git map-refresh hooks are outside this lifecycle cleanup scope.
 Reload the host session to discard cached registrations. `dev hook enable` reports
 that lifecycle hooks are retired. DevMap's separate hooks remain available for
-index maintenance. See [the migration audit](archive/hook-migration-audit.md) for test
+index maintenance. See [the migration audit](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/archive/hook-migration-audit.md) for test
 coverage and remaining platform limits.
 
 ### Agent Skills Distribution
@@ -364,4 +364,4 @@ With Phase 7 and the transition to native Go and Rust binaries, legacy Python CL
 | `dev dashboard` | Textual dashboard UI | Use DevMap HTML exports (`devmap html`, `devmap map-html`) or the consuming harness UI. |
 | `dev cost` | Python model pricing ledger | Retired. (`devcouncil doctor` is a different, live command: it reports the task store.) Environment health checks: `devmap doctor` and binary health flags. |
 
-For detailed rationale on the retirement decisions, see [PHASE7_LONG_TAIL.md](PHASE7_LONG_TAIL.md). Open follow-ups: [TODO.md](TODO.md).
+For detailed rationale on the retirement decisions, see [PHASE7_LONG_TAIL.md](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/PHASE7_LONG_TAIL.md). The follow-up ledger, frozen at its last tracked commit, is [TODO.md](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/TODO.md); open rows live in the task store.

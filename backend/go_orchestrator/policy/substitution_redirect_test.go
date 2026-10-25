@@ -24,14 +24,17 @@ import (
 // either construct. All four forms are now descended into deliberately.
 
 func TestRedirectInsideSubstitutionIsFound(t *testing.T) {
+	t.Setenv("HOME", "/home/agent")
 	tests := []struct {
 		command string
 		targets []string
 		opaque  bool
 	}{
-		// The reported bypass and its control must agree.
-		{`echo $(git diff > ~/.ssh/authorized_keys)`, nil, true},
-		{`git diff > ~/.ssh/authorized_keys`, nil, true},
+		// The reported bypass and its control must agree. The tilde resolves
+		// (expandBindings), so both name the file the write gate then refuses
+		// as outside the root.
+		{`echo $(git diff > ~/.ssh/authorized_keys)`, []string{"/home/agent/.ssh/authorized_keys"}, false},
+		{`git diff > ~/.ssh/authorized_keys`, []string{"/home/agent/.ssh/authorized_keys"}, false},
 
 		// A literal target inside a substitution is named, not swallowed.
 		{`echo $(git diff > out.patch)`, []string{"out.patch"}, false},
@@ -44,7 +47,8 @@ func TestRedirectInsideSubstitutionIsFound(t *testing.T) {
 
 		// Live inside double quotes too — sh executes the substitution there.
 		{`echo "$(git diff > out.patch)"`, []string{"out.patch"}, false},
-		{`echo "$(git diff > ~/.ssh/authorized_keys)"`, nil, true},
+		{`echo "$(git diff > ~/.ssh/authorized_keys)"`, []string{"/home/agent/.ssh/authorized_keys"}, false},
+		{`echo "$(git diff > $(pick))"`, nil, true},
 
 		// Data inside single quotes: nothing executes, nothing is written.
 		{`echo '$(git diff > out.patch)'`, nil, false},

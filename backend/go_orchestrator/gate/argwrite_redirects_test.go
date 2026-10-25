@@ -1,6 +1,7 @@
 package gate
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
@@ -65,15 +66,25 @@ func TestEvaluateRedirectsJudgesArgumentWrites(t *testing.T) {
 		}
 	}
 
-	// An operand only the shell can resolve is refused the way `> $VAR` is,
+	// An operand a substitution chooses is refused the way `> $(pick)` is,
 	// without the evaluator being asked to judge a path nobody can name.
 	var asked []string
-	refusal, err := EvaluateRedirects(`sed -i s/a/b/ "$F"`, "TASK-1", true, refuseOther(&asked))
+	refusal, err := EvaluateRedirects(`sed -i s/a/b/ "$(pick)"`, "TASK-1", true, refuseOther(&asked))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !refusal.Refused || refusal.FromTarget || refusal.Decision.Rule != policy.RuleCommandSubstitution {
-		t.Errorf("expansion operand: got %+v, want a synthesised command.substitution refusal", refusal)
+		t.Errorf("substituted operand: got %+v, want a synthesised command.substitution refusal", refusal)
+	}
+
+	// A variable the line binds is asked about as its value; one it does not
+	// is asked about by its spelling (owner decision, 2026-10-24).
+	asked = nil
+	if _, err := EvaluateRedirects(`F=docs/a.md; sed -i s/a/b/ "$F" "$G"`, "TASK-1", true, refuseOther(&asked)); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(asked, "|") != "docs/a.md|$G" {
+		t.Errorf("variable operands: the evaluator was asked about %q, want docs/a.md and $G", asked)
 	}
 }
 

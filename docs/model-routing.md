@@ -1,6 +1,6 @@
 # Model Routing
 
-> **Architectural boundary:** LLM provider routing (OpenRouter, Vertex AI, Doubleword, Ollama) and role models are owned by upstream agent harnesses such as **Manvi**. See [PHASE7_LONG_TAIL.md](PHASE7_LONG_TAIL.md). DevCouncil is the native Go/Rust verification and code intelligence substrate; it does not require model provider keys.
+> **Architectural boundary:** LLM provider routing (OpenRouter, Vertex AI, Doubleword, Ollama) and role models are owned by upstream agent harnesses such as **Manvi**. See [PHASE7_LONG_TAIL.md](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/PHASE7_LONG_TAIL.md). DevCouncil is the native Go/Rust verification and code intelligence substrate; it does not require model provider keys.
 
 The Python `ModelRouter`, `src/devcouncil/llm/model_defaults.yaml`, and the `dev setup` / `dev doctor` / `dev cost` commands were deleted with the Phase 7 orchestrator cut (`3286db5`). There is no `ModelRouter` in the Go host.
 

@@ -19,8 +19,8 @@ func TestFileWriterTargets(t *testing.T) {
 		{"rm a b", []string{"a", "b"}, false, false},
 		{"rm -rf -- -weird dir/", []string{"-weird", "dir/"}, false, false},
 		{"rm -f", nil, false, false},
-		{"rm $X", nil, true, false},
-		{"rm -rf ~/x", nil, true, false},
+		{"rm $X", []string{"$X"}, false, false},
+		{"rm -rf ~/x", []string{"/home/agent/x"}, false, false},
 		{"rm -r build/*", []string{"build/*"}, false, true},
 		{"rm build/*", []string{"build/*"}, false, false},
 		{"truncate -s 0 a b", []string{"a", "b"}, false, false},
@@ -47,7 +47,7 @@ func TestFileWriterTargets(t *testing.T) {
 		{"rsync -e ssh --exclude x a b", []string{"b"}, false, false},
 		{"rsync --backup-dir=bk a b", []string{"bk", "b"}, false, false},
 		{"rsync --remove-source-files a b", []string{"a", "b"}, false, false},
-		{"rsync -a a $D", nil, true, false},
+		{"rsync -a a $D", []string{"$D"}, false, false},
 		{"patch f fix.diff", []string{"f"}, false, false},
 		{"patch f < fix.diff", []string{"f"}, false, false},
 		{"patch -p1 -o out < fix.diff", []string{"out"}, false, false},
@@ -56,14 +56,15 @@ func TestFileWriterTargets(t *testing.T) {
 		{"patch -d sub f", nil, false, true},
 		{"patch --dry-run -p1 < fix.diff", nil, false, false},
 		{"dd if=a of=b", []string{"b"}, false, false},
-		{"dd if=a of=$X", nil, true, false},
+		{"dd if=a of=$X", []string{"$X"}, false, false},
 		{"dd if=a", nil, false, false},
 		{"perl -pi -e s/a/b/ f", []string{"f"}, false, false},
 		{"perl -i.bak -pe s/a/b/ f", []string{"f", "f.bak"}, false, false},
 		{"perl -0777 -pi -e s/a/b/ f g", []string{"f", "g"}, false, false},
 		{"perl -i script.pl f", []string{"f"}, false, false},
 		{"perl -pe s/a/b/ f", nil, false, false},
-		{"perl -i -e 1 $F", nil, true, false},
+		{"perl -i -e 1 $F", []string{"$F"}, false, false},
+		{"perl -i -e 1 $(pick)", nil, true, false},
 		{"git apply fix.diff", nil, false, true},
 		{"git -C d apply --index fix.diff", nil, false, true},
 		{"git apply --check fix.diff", nil, false, false},
@@ -88,6 +89,7 @@ func TestFileWriterTargets(t *testing.T) {
 		{"echo $(find . -delete)", nil, false, true},
 		{"sudo rm a", []string{"a"}, false, false},
 	}
+	t.Setenv("HOME", "/home/agent")
 	for _, tc := range tests {
 		set, err := RedirectWrites(tc.input)
 		if err != nil {

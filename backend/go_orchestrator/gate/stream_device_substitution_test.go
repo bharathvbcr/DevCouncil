@@ -115,7 +115,7 @@ func TestASubstitutionCannotLaunderAHardRefusal(t *testing.T) {
 	task.AllowedCommands = []string{"echo *", "git *"}
 	for _, cmd := range []string{
 		`echo "$(git push --force origin main)"`,
-		"echo `git commit --no-verify -m x`",
+		"echo `git commit --no-gpg-sign -m x`",
 		"echo $(echo $(git push -f))",
 	} {
 		g := newGate(t, map[string]string{flags.HarnessPosture: flags.PostureDev})

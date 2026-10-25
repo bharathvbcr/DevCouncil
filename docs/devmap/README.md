@@ -1,7 +1,7 @@
 # Dev Map
 
 This folder is the **live** DevMap guide and contracts. Port ledgers, dated
-audits, and qualification dumps are in [archive/devmap/](../archive/devmap/).
+audits, and qualification dumps are in [archive/devmap/](https://github.com/bharathvbcr/DevCouncil/tree/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/archive/devmap).
 
 [Repository input and verification boundaries](../SECURITY_BOUNDARIES.md)
 cover unsafe paths, passive diagnostics, bounded analysis and unavailable
@@ -10,17 +10,17 @@ source evidence, including Rust API changes for embedders.
 Kernel sources live under [`rust/`](../../rust/) (`devmap-*` crates, `vendor/`,
 `testdata/`, `verify.sh`). Older archived pages still say `rust-port/`.
 
-Concurrent agent worktrees: [design, audit and rollout contract](AGENTIC_WORKTREE_DESIGN.md), with archived [native qualification and schema-20 cutover](../archive/devmap/SCHEMA20_QUALIFICATION_2026-09-09.md). Navigation is read-only; use explicit `devmap repair --schema` only after coordinating all installed readers and writers.
+Concurrent agent worktrees: [design, audit and rollout contract](AGENTIC_WORKTREE_DESIGN.md), with archived [native qualification and schema-20 cutover](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/archive/devmap/SCHEMA20_QUALIFICATION_2026-09-09.md). Navigation is read-only; use explicit `devmap repair --schema` only after coordinating all installed readers and writers.
 
-Latest dated reviews: [extraction and resolver audit, 2026-10-02](../archive/devmap/EXTRACTION_RESOLVE_AUDIT_2026-10-02.md) and [resolver precision A/B, 2026-10-07](../archive/devmap/RESOLVER_PRECISION_AB_2026-10-07.md).
+Latest dated reviews: [extraction and resolver audit, 2026-10-02](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/archive/devmap/EXTRACTION_RESOLVE_AUDIT_2026-10-02.md) and [resolver precision A/B, 2026-10-07](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/archive/devmap/RESOLVER_PRECISION_AB_2026-10-07.md).
 
 Host applications can link the query crate or use the versioned JSON and HTML
 process contract in [HOST_INTEGRATION.md](HOST_INTEGRATION.md).
 
 **Components cutover (2026-09-10):** DevCouncil ships `devmap` + Go `devcouncil` +
 `dcstore` as the binary plugin contract. Python map/orchestration consumers are
-deleted — see [../PHASE7_LONG_TAIL.md](../PHASE7_LONG_TAIL.md). The Python
-consumer ledger is archived at [../archive/devmap/CONSUMERS.md](../archive/devmap/CONSUMERS.md).
+deleted — see [../PHASE7_LONG_TAIL.md](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/PHASE7_LONG_TAIL.md). The Python
+consumer ledger is archived at [../archive/devmap/CONSUMERS.md](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/archive/devmap/CONSUMERS.md).
 
 Symbol-level code intelligence for coding agents and the people who supervise
 them. One binary, one SQLite store, no daemon required and no network.
@@ -155,9 +155,9 @@ covers deep packages without a depth ceiling; non-Git discovery remains bounded
 in depth, directories, frontier size, entries and cooperative elapsed time.
 `*_computed` alone never proves completeness, and marker completeness does
 not imply complete language or call-graph coverage.
-See the [coverage and robustness audit](../archive/devmap/RELIABILITY_AUDIT_2026-09-09.md) for
+See the [coverage and robustness audit](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/archive/devmap/RELIABILITY_AUDIT_2026-09-09.md) for
 current fixes, measured stress results, and remaining language/platform limits.
-The [earlier reliability audit](../archive/devmap/RELIABILITY_AUDIT_2026-09-08.md) records the
+The [earlier reliability audit](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/archive/devmap/RELIABILITY_AUDIT_2026-09-08.md) records the
 previous binding and source-read repairs.
 
 An incomplete query can have several independent causes:
@@ -354,7 +354,7 @@ by Git. A missing store is an uninitialized checkout, not an empty graph.
 Run `devmap build --manifest` to create both the database and exported maps;
 use the same command to restore a missing map beside an existing database.
 Read-only discovery never creates or copies state from another worktree.
-See the [state-discovery audit](../archive/devmap/STATE_DISCOVERY_AUDIT_2026-09-09.md) for
+See the [state-discovery audit](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/archive/devmap/STATE_DISCOVERY_AUDIT_2026-09-09.md) for
 reproduced failures, regression evidence, and qualification limits.
 
 ```mermaid
@@ -447,7 +447,7 @@ JSON `file_progress` carries scan and extraction counters plus source deltas.
 An extraction value of `null` means it was skipped; zero cache hits means it ran
 without a hit. Removed sources are absent from the readable scan compared with
 the previous generation; discovery refusals are counted separately. See
-[PROGRESS_AUDIT.md](../archive/devmap/PROGRESS_AUDIT.md) for verification evidence and platform limits.
+[PROGRESS_AUDIT.md](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/archive/devmap/PROGRESS_AUDIT.md) for verification evidence and platform limits.
 
 Runtime failures include `diagnostic_context` in JSON and a `DevMap context:`
 line on stderr: command, binary/version, PID, timestamp, repository root, selected
@@ -462,7 +462,7 @@ remain unavailable, with skipped execution explained in `probe_error`. An
 unavailable version is not evidence that two installations match. See
 [SECURITY_BOUNDARIES.md](../SECURITY_BOUNDARIES.md) for the execution and source
 access contracts.
-See [CLI_PRESENTATION_AUDIT.md](../archive/CLI_PRESENTATION_AUDIT.md) for the command-wide
+See [CLI_PRESENTATION_AUDIT.md](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/archive/CLI_PRESENTATION_AUDIT.md) for the command-wide
 audit and verification limits.
 
 To capture a diagnosable build while keeping machine output separate:
@@ -948,7 +948,7 @@ Codex discovers repository skills in `.agents/skills/<name>/SKILL.md`. The five
 DevMap skills also ship in the existing DevCouncil registry; install them with
 `dev skills scaffold --destination .agents/skills` and repeat `--skill` for the
 desired names. This does not install MCP settings or hooks. See the exact
-[installation and verification commands](../DEVMAP_SKILL_DELIVERY.md).
+[installation and verification commands](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/DEVMAP_SKILL_DELIVERY.md).
 The Claude plugin and registry distributions have a content-parity regression
 test. Both prefer DevMap while allowing capability-based fallback and explicit
 user/repository instructions.
@@ -1126,7 +1126,7 @@ cargo clippy --workspace --exclude dc-glob --exclude dc-grep --exclude dc-store 
 ```
 
 `DIVERGENCES.md` in this folder is the live divergence ledger. Port history
-(`AGENT_PLAN.md`, `STATUS.md`, `PLAN.md`) is under [archive/devmap/](../archive/devmap/).
+(`AGENT_PLAN.md`, `STATUS.md`, `PLAN.md`) is under [archive/devmap/](https://github.com/bharathvbcr/DevCouncil/tree/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/archive/devmap).
 
 ## License
 

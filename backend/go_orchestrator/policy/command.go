@@ -158,7 +158,25 @@ func (g CommandGate) EvaluateCommand(command string, task *dc.Task) (d Decision)
 			// transcripts and the TUI.
 			fmt.Sprintf("<%d-byte command>", len(command)), taskID))
 	}
-	return g.evaluate(command, task, 0)
+	// Each reading of the line with its variables bound (expandBindings) is
+	// judged in full, and the most important refusal among them is the answer,
+	// ranked exactly as evaluate ranks clauses.
+	readings := expandBindings(command)
+	if len(readings) == 1 {
+		return g.evaluate(readings[0], task, 0)
+	}
+	decisions := make([]Decision, 0, len(readings))
+	for _, reading := range readings {
+		d := g.evaluate(reading, task, 0)
+		decisions = append(decisions, d)
+		if refusesForWhatItDoes(d) {
+			break
+		}
+	}
+	if d, refused := mostImportant(decisions); refused {
+		return d
+	}
+	return decisions[0]
 }
 
 // maxCommandBytes bounds the command line the ladder will read.
@@ -181,32 +199,16 @@ func (g CommandGate) evaluate(command string, task *dc.Task, depth int) Decision
 		// than "forbidden". The order is: a hard refusal for what a clause
 		// does, then one for what the gate could not read (IsUnreadableRule),
 		// then a soft one, then a warning.
-		var warnDecision, unreadable, soft *Decision
+		decisions := make([]Decision, 0, len(parts))
 		for _, part := range parts {
 			d := g.evaluateSingleCommand(part, task, depth)
-			switch {
-			case d.Action == Deny && IsUnreadableRule(d.Rule):
-				if unreadable == nil {
-					unreadable = &d
-				}
-			case d.Action == Deny && d.Severity == Hard:
-				return d
-			case d.Action == Deny:
-				if soft == nil {
-					soft = &d
-				}
-			case d.Action == Warn && warnDecision == nil:
-				warnDecision = &d
+			decisions = append(decisions, d)
+			if refusesForWhatItDoes(d) {
+				break
 			}
 		}
-		if unreadable != nil {
-			return *unreadable
-		}
-		if soft != nil {
-			return *soft
-		}
-		if warnDecision != nil {
-			return *warnDecision
+		if d, refused := mostImportant(decisions); refused {
+			return d
 		}
 		taskID := ""
 		if task != nil {
@@ -771,8 +773,12 @@ func stripGitGlobalOptions(command string) string {
 }
 
 func gitSafetyVariant(lowered, taskID string) (Decision, bool) {
-	if strings.Contains(lowered, "--no-verify") || strings.Contains(lowered, "--no-gpg-sign") {
-		return deny(RuleCommandBypassFlag, "Verification bypass flags are not allowed.", lowered, taskID), true
+	// --no-verify is not refused here: skipping the repository's own commit and
+	// push hooks is the person's call (owner decision, 2026-10-24), and an agent
+	// working inside a gate already judged the commands those hooks would have
+	// run. Commit signing is not a hook, and skipping it stays refused.
+	if strings.Contains(lowered, "--no-gpg-sign") {
+		return deny(RuleCommandBypassFlag, "Skipping commit signing (--no-gpg-sign) is not allowed.", lowered, taskID), true
 	}
 	if hardResetProtectedRe.MatchString(lowered) {
 		return deny(RuleCommandProtectedReset, "Protected branch hard resets are not allowed.", lowered, taskID), true

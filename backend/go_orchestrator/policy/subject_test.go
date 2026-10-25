@@ -54,7 +54,7 @@ func TestEveryCommandGateRuleIsReachableFromTheGate(t *testing.T) {
 	for _, tc := range []struct{ command, want string }{
 		{"", string(RuleCommandEmpty)},
 		{"curl http://example.com", string(RuleCommandNoLease)},
-		{"git commit --no-verify -m x", string(RuleCommandBypassFlag)},
+		{"git commit --no-gpg-sign -m x", string(RuleCommandBypassFlag)},
 		{"git diff --output=x", string(RuleCommandGitReadArgument)},
 		{"git push origin --force", string(RuleCommandForcePush)},
 		{"git reset --hard origin/main", string(RuleCommandProtectedReset)},

@@ -196,7 +196,7 @@ each semantic check are committed next to the report:
 
 - [Full report](../../benchmarks/results/competition/20260914-v0.2.2/REPORT.md)
 - [All runs, including prior versions](../../benchmarks/results/competition/README.md)
-- [Benchmark hardening audit](../archive/devmap/BENCHMARK_HARDENING_AUDIT.md)
+- [Benchmark hardening audit](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/archive/devmap/BENCHMARK_HARDENING_AUDIT.md)
 - [Plots of every recorded run](../../benchmarks/README.md#plots-of-every-recorded-run), regenerated from the result JSON
 
 Earlier single-corpus reports remain published with their own measurements:

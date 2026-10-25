@@ -11,4 +11,4 @@ Tiny provider-free calculator fixture. The demo script that drove it,
 
 The retired demo copied these into an isolated git repository, ran
 `dev check --verify` (no API keys), applied the repair, and reran to a
-compiled zero-gap pass. See [docs/archive/build-week-demo.md](../../docs/archive/build-week-demo.md) and the fixture index in [examples/README.md](../README.md).
+compiled zero-gap pass. See [docs/archive/build-week-demo.md](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/archive/build-week-demo.md) and the fixture index in [examples/README.md](../README.md).

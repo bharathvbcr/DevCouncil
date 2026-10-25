@@ -29,7 +29,7 @@ CLI. [Project overview](../README.md) · [Website](https://devcouncil.vbcr.dev/)
 - [Analysis reads security impact](git-analysis-security-impact.md): what a repository under analysis can no longer make DevCouncil run, and the owner decisions behind it (ft-ff2153d9).
 - [Model routing boundary](model-routing.md): configure models in the consuming harness.
 - [Rust workspace](../rust/README.md): native engine development and verification.
-- [Native migration follow-ups](PHASE7_LONG_TAIL.md) and [task ledger](TODO.md).
+- [Native migration decisions](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/PHASE7_LONG_TAIL.md) and [task ledger](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/TODO.md), frozen at their last tracked commit; open rows live in the task store.
 
 ## Reading status correctly
 
@@ -38,7 +38,7 @@ cases they exercise. Neither alone certifies an editor session, every platform,
 or a live release. Query results can be fresh and still have coverage gaps.
 Verification can return a result with checks skipped; inspect that metadata.
 
-Files under [archive](archive/), dated audit reports, and release notes retain
+The [archived audits](https://github.com/bharathvbcr/DevCouncil/tree/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/archive) (no longer in the tree), dated audit reports, and release notes retain
 historical evidence. Prefer the guides above for current setup. In particular,
 old Python versions and old benchmark binaries are not the native runtime's
 current version. Resolve installed identity with `devmap --version` and

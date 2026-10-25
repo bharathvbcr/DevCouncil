@@ -123,9 +123,9 @@ func TestGitSafetyRunsEvenWhenTheAllowlistWouldPass(t *testing.T) {
 		t.Fatal("force push must be a hard rule; it can erase the evidence the gates reason about")
 	}
 
-	bypass := gate.EvaluateCommand("git commit --no-verify -m x", permissive)
+	bypass := gate.EvaluateCommand("git commit --no-gpg-sign -m x", permissive)
 	if !bypass.Blocked() || bypass.Rule != RuleCommandBypassFlag {
-		t.Fatalf("a verification-bypass flag must be denied under `git *`, got %+v", bypass)
+		t.Fatalf("a signing-bypass flag must be denied under `git *`, got %+v", bypass)
 	}
 
 	// An ordinary allowed git command still passes.
