@@ -582,6 +582,7 @@ async fn every_tool_result_conforms_to_the_output_schema_it_declared() {
         ),
         ("devmap_explore", json!({"query": "helper"})),
         ("devmap_literals", json!({"query": "session."})),
+        ("devmap_doc_drift", json!({})),
         ("devmap_affected_tests", json!({"targets": ["helper"]})),
         (
             "devmap_cypher",
@@ -1287,5 +1288,123 @@ async fn a_cancellation_that_carries_an_id_is_a_request_and_is_answered() {
         .await
         .is_none(),
         "a well-formed cancellation is a notification and must not be answered"
+    );
+}
+
+/// A checkout on disk with one indexed Markdown document: a valid symbol, a
+/// symbol that was renamed, a link to a file that is gone, and a valid link.
+fn doc_drift_corpus() -> (Arc<StoreSlot>, tempdir::Dir) {
+    let dir = tempdir::Dir::new("mcp-doc-drift").expect("a temp dir");
+    let root = dir.path().to_path_buf();
+    let files = [
+        ("core.py", "def helper(rows):\n    return sum(rows)\n"),
+        (
+            "NOTES.md",
+            "# Notes\n\nCall `helper()` and not `renamedHelper()`.\nSee [core](core.py) and [gone](gone.md).\n",
+        ),
+    ];
+    for (path, source) in files {
+        std::fs::write(root.join(path), source).expect("write fixture");
+    }
+    let extractions: Vec<_> = files
+        .iter()
+        .map(|(path, source)| devmap_extract::extract_file(path, source))
+        .collect();
+    let mut resolver = devmap_resolve::Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions).expect("resolves");
+    let analysis = devmap_analyze::analyze(&extractions, &resolution);
+    let store = Store::open_in_memory().expect("store");
+    store
+        .save_generation_with_opts(
+            &extractions,
+            &resolution,
+            &analysis,
+            devmap_store::GenerationWriteOpts {
+                repo_root: Some(root.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        )
+        .expect("save");
+    (
+        Arc::new(StoreSlot::ready("doc-drift-corpus", Arc::new(store))),
+        dir,
+    )
+}
+
+/// `devmap_doc_drift` answers over MCP with content, not merely a conforming
+/// shape: it names the renamed symbol and the missing file, leaves the valid
+/// references alone, refuses a path that escapes the repository, and with no
+/// generation says it is unavailable instead of returning a clean empty list.
+#[tokio::test]
+async fn the_doc_drift_tool_reports_drift_over_mcp() {
+    let (store, _dir) = doc_drift_corpus();
+
+    let answer = tool(&store, "devmap_doc_drift", json!({})).await;
+    assert_eq!(answer["isError"], json!(false), "{answer}");
+    let report = &answer["structuredContent"];
+    assert_eq!(report["available"], true, "{report}");
+    assert_eq!(report["docs_scanned"], 1, "{report}");
+    let findings: Vec<(String, u64, String)> = report["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .map(|f| {
+            (
+                f["kind"].as_str().unwrap().to_string(),
+                f["line"].as_u64().unwrap(),
+                f["reference"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        findings,
+        vec![
+            (
+                "missing_symbol".to_string(),
+                3,
+                "renamedHelper()".to_string()
+            ),
+            ("missing_file".to_string(), 4, "gone.md".to_string()),
+        ],
+        "{report}"
+    );
+    assert_eq!(report["total"], 2, "{report}");
+    assert!(report.get("walk_incomplete").is_none(), "{report}");
+
+    let narrowed = tool(
+        &store,
+        "devmap_doc_drift",
+        json!({"paths": ["NOTES.md"], "exclude": ["docs"]}),
+    )
+    .await;
+    assert_eq!(narrowed["structuredContent"]["total"], 2, "{narrowed}");
+
+    let excluded = tool(
+        &store,
+        "devmap_doc_drift",
+        json!({"exclude": ["NOTES.md"]}),
+    )
+    .await;
+    assert_eq!(
+        excluded["structuredContent"]["docs_scanned"], 0,
+        "{excluded}"
+    );
+
+    let escaping = tool(&store, "devmap_doc_drift", json!({"paths": ["../x.md"]})).await;
+    assert_eq!(escaping["isError"], json!(true), "{escaping}");
+
+    let empty = Arc::new(StoreSlot::ready(
+        "empty",
+        Arc::new(Store::open_in_memory().expect("store")),
+    ));
+    let unavailable = tool(&empty, "devmap_doc_drift", json!({})).await;
+    let report = &unavailable["structuredContent"];
+    assert_eq!(report["available"], false, "{unavailable}");
+    assert!(
+        report["walk_incomplete"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("no persisted generation")),
+        "{unavailable}"
     );
 }

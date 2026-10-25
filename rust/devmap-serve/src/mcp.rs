@@ -874,6 +874,7 @@ const TOOLS: &[(&str, &str)] = &[
     ("devmap_preview", "preview"),
     ("devmap_explore", "explore"),
     ("devmap_literals", "literals"),
+    ("devmap_doc_drift", "doc_drift"),
     ("devmap_affected_tests", "affected"),
     ("devmap_suspects", "suspects"),
     ("devmap_blast", "blast"),
@@ -1532,6 +1533,35 @@ read before the budget did.",
                 "additionalProperties": false
             }),
         ),
+        "doc_drift" => (
+            "Markdown documentation that references code which no longer exists or has moved. \
+Deterministic, no model: links, backticked paths (with :N line suffixes) and symbol-shaped names \
+in the indexed Markdown files are resolved against the latest generation and the working tree. \
+Findings are missing_file, line_out_of_range, missing_anchor, symbol_moved and missing_symbol, \
+each with the doc, the 1-based line and the reference. Ambiguous spans (plain words, ALL_CAPS, \
+flags) are counted under skipped and never checked. Read walk_incomplete before treating an \
+empty findings list as clean, and available before anything else: false means no generation \
+exists and nothing was checked.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string", "maxLength": 4096},
+                        "maxItems": crate::protocol::MAX_DOC_DRIFT_PREFIXES,
+                        "description": "Repo-relative Markdown files or directory prefixes to scan. Omit for every indexed Markdown file."
+                    },
+                    "exclude": {
+                        "type": "array",
+                        "items": {"type": "string", "maxLength": 4096},
+                        "maxItems": crate::protocol::MAX_DOC_DRIFT_PREFIXES,
+                        "description": "Repo-relative prefixes to leave out."
+                    },
+                    "budget": budget_prop(2000)
+                },
+                "additionalProperties": false
+            }),
+        ),
         other => unreachable!("command tag {other} has no schema"),
     };
     (description, with_repo_scope_args(schema))
@@ -2067,6 +2097,38 @@ Candidate list to verify, not a delete list.",
             },
             "required": ["query", "exact", "items", "shown", "hidden", "total", "truncated",
                 "tokens_used"],
+            "additionalProperties": true
+        }),
+        "doc_drift" => json!({
+            "type": "object",
+            "properties": {
+                "available": {"type": "boolean",
+                    "description": "False when no generation is persisted: nothing was checked."},
+                "docs_scanned": {"type": "integer"},
+                "docs_total": {"type": "integer",
+                    "description": "Markdown documents the request matched, before the document cap."},
+                "references": {"type": "integer",
+                    "description": "Candidates found: checked, skipped and those that held."},
+                "checked": {"type": "object",
+                    "description": "Checks made, by kind: link, path, line, anchor, symbol."},
+                "skipped": {"type": "object",
+                    "description": "Candidates and sub-checks left unchecked, by reason."},
+                "findings": {"type": "array",
+                    "description": "doc, line (1-based), kind, reference, detail and, for a moved \
+        symbol, current_locations. Sorted by doc then line."},
+                "shown": {"type": "integer"},
+                "hidden": {"type": "integer"},
+                "total": {"type": "integer",
+                    "description": "Every reference that drifted, before the budget."},
+                "truncated": {"type": "boolean"},
+                "tokens_used": {"type": "integer"},
+                "walk_incomplete": {"type": "string",
+                    "description": "Set when anything was not checked for a reason other than the \
+        deliberate skips: a cap, an unreadable document or target, a line too long to scan, or no \
+        generation. An empty findings list is clean only when this is absent."}
+            },
+            "required": ["available", "docs_scanned", "docs_total", "references", "checked",
+                "skipped", "findings", "shown", "hidden", "total", "truncated", "tokens_used"],
             "additionalProperties": true
         }),
         other => unreachable!("command tag {other} has no output schema"),

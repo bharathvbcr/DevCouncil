@@ -77,7 +77,7 @@ fn every_declared_tool_maps_to_a_command() {
     let specs = tool_specs();
     assert_eq!(
         specs.len(),
-        20,
+        21,
         "the tool surface changed; update this count"
     );
     for spec in &specs {
@@ -96,6 +96,7 @@ fn every_declared_tool_maps_to_a_command() {
             "devmap_preview" => json!({"file": "core.py", "content": "def helper():\n    pass\n"}),
             "devmap_explore" => json!({"query": "helper"}),
             "devmap_literals" => json!({"query": "session."}),
+            "devmap_doc_drift" => json!({}),
             "devmap_affected_tests" => json!({"targets": ["helper"]}),
             "devmap_suspects" => json!({"symptom": "helper", "since": "HEAD~1"}),
             // `since` rather than no arguments: this test proves a declared
@@ -363,6 +364,19 @@ async fn the_shared_validator_bounds_apply_to_tool_calls() {
         json!(true),
         "a depth past the traversal cap must be refused"
     );
+
+    // doc_drift refuses over-many prefixes the same way, in either list.
+    let too_many: Vec<String> = (0..devmap_serve::protocol::MAX_DOC_DRIFT_PREFIXES + 1)
+        .map(|i| format!("docs/{i}"))
+        .collect();
+    for field in ["paths", "exclude"] {
+        let response = call(&store, "devmap_doc_drift", json!({ field: too_many })).await;
+        assert_eq!(
+            response["result"]["isError"],
+            json!(true),
+            "{field}: over-many prefixes must be refused, not trimmed"
+        );
+    }
 }
 
 /// A bad argument is the agent's mistake to fix, so it must reach the agent.

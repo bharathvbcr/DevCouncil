@@ -345,6 +345,7 @@ async fn every_published_default_is_the_default_that_is_applied() {
             }
             "devmap_explore" => json!({"query": "helper"}),
             "devmap_literals" => json!({"query": "session."}),
+            "devmap_doc_drift" => json!({}),
             "devmap_affected_tests" => json!({"targets": ["helper"]}),
             // Same base shapes as `mcp_protocol` / `mcp_spec_conformance`: ask
             // needs a query; skeleton needs a path the corpus may or may not
