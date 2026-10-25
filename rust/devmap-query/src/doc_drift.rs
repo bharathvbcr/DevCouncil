@@ -1180,7 +1180,10 @@ fn classify_symbol(span: &str) -> Classified {
         .iter()
         .map(|s| (*s).to_string())
         .collect();
-    if segments.len() > 1 && UNAMBIGUOUS_ROOTS.contains(&segments[0]) {
+    // `crate::`, `self::` and `super::` name the repository's own modules and are
+    // resolved by the resolver; `self.x` and `this.x` are instances.
+    let own_path_root = separators_colon && matches!(segments[0], "crate" | "self" | "super");
+    if segments.len() > 1 && UNAMBIGUOUS_ROOTS.contains(&segments[0]) && !own_path_root {
         return Classified::Skip("external_qualifier");
     }
     if KNOWN_TERMS.contains(&body) {
@@ -1710,13 +1713,39 @@ enum PathState {
     Outside,
     Dir,
     File,
+    /// Nothing by that spelling, but an entry that matches ignoring case:
+    /// `actual` is the path as it is spelled on disk. On GitHub, and on any
+    /// case-sensitive file system, the reference is broken.
+    Case {
+        actual: String,
+    },
 }
 
 impl PathState {
     fn exists(&self) -> bool {
         matches!(self, Self::Dir | Self::File)
     }
+
+    /// Something is there, under a spelling that differs only in case.
+    fn present(&self) -> bool {
+        matches!(self, Self::Dir | Self::File | Self::Case { .. })
+    }
 }
+
+/// How a name is spelled in its directory.
+enum Spelling {
+    Exact,
+    /// Another entry matches ignoring case: its on-disk name.
+    Differs(String),
+    Absent,
+    /// The directory could not be listed within bounds.
+    Unknown,
+}
+
+/// Entries read from one directory when checking spelling.
+const MAX_DIR_ENTRIES: usize = 20_000;
+/// Directory listings kept between lookups.
+const LISTING_CACHE_CAP: usize = 512;
 
 /// The bounds one call works inside. Tests lower them; callers get
 /// [`Limits::default`].
@@ -1761,6 +1790,9 @@ struct Resolver<'a> {
     declared: HashSet<String>,
     /// Names of the repository's own code, as written; see `load_declared`.
     in_repo: HashSet<String>,
+    /// Directory listings read to check spelling, by directory.
+    #[allow(clippy::type_complexity)]
+    listings: std::cell::RefCell<HashMap<std::path::PathBuf, Option<std::rc::Rc<Vec<String>>>>>,
     /// The root as the index recorded it, when that differs from the canonical
     /// path: absolute link targets may be written either way.
     root_aliases: Vec<String>,
@@ -1831,6 +1863,11 @@ impl<'a> Resolver<'a> {
     /// further is stat'd: whether a path exists past that point is a fact about
     /// the host. A component that does not exist inside the repository is
     /// `Missing`, a dangling link included. `rel` is relative to the root.
+    ///
+    /// Every component's spelling is checked against its directory's entries,
+    /// so a path that only resolves because the file system ignores case
+    /// (`guide.md` for `GUIDE.md`) is `Case`, as it is on a case-sensitive one,
+    /// where the lookup fails and the same listing finds the other spelling.
     fn state(&self, rel: &str) -> PathState {
         use std::collections::VecDeque;
         let mut queue: VecDeque<String> = rel
@@ -1852,6 +1889,23 @@ impl<'a> Resolver<'a> {
                 continue;
             }
             let next = current.join(&part);
+            match self.spelling(&current, &part) {
+                Spelling::Differs(actual) => {
+                    let mut corrected = current
+                        .strip_prefix(self.root)
+                        .map(|inside| inside.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_default();
+                    for piece in std::iter::once(actual).chain(queue.iter().cloned()) {
+                        if !corrected.is_empty() {
+                            corrected.push('/');
+                        }
+                        corrected.push_str(&piece);
+                    }
+                    return PathState::Case { actual: corrected };
+                }
+                Spelling::Absent => return PathState::Missing,
+                Spelling::Exact | Spelling::Unknown => {}
+            }
             let Ok(meta) = std::fs::symlink_metadata(&next) else {
                 return PathState::Missing;
             };
@@ -1905,6 +1959,43 @@ impl<'a> Resolver<'a> {
             current = next;
         }
         PathState::Dir
+    }
+
+    /// How `name` is spelled among the entries of `dir`.
+    fn spelling(&self, dir: &Path, name: &str) -> Spelling {
+        let listing = {
+            let mut cache = self.listings.borrow_mut();
+            match cache.get(dir) {
+                Some(cached) => cached.clone(),
+                None => {
+                    let read = std::fs::read_dir(dir).ok().and_then(|entries| {
+                        let mut names = Vec::new();
+                        for entry in entries.flatten() {
+                            if names.len() >= MAX_DIR_ENTRIES {
+                                return None;
+                            }
+                            names.push(entry.file_name().to_string_lossy().into_owned());
+                        }
+                        Some(std::rc::Rc::new(names))
+                    });
+                    if cache.len() < LISTING_CACHE_CAP {
+                        cache.insert(dir.to_path_buf(), read.clone());
+                    }
+                    read
+                }
+            }
+        };
+        let Some(names) = listing else {
+            return Spelling::Unknown;
+        };
+        if names.iter().any(|entry| entry == name) {
+            return Spelling::Exact;
+        }
+        let folded = name.to_lowercase();
+        match names.iter().find(|entry| entry.to_lowercase() == folded) {
+            Some(actual) => Spelling::Differs(actual.clone()),
+            None => Spelling::Absent,
+        }
     }
 
     /// `rel` with its links resolved, relative to the root. `None` when it does
@@ -2037,6 +2128,23 @@ impl<'a> Resolver<'a> {
         name: &str,
         written: &str,
     ) {
+        // `crate::a::b`, `self::b`, `super::b` are the repository's own: drop
+        // the relative root and check what is left like any qualified name.
+        let own_path: Vec<String>;
+        let qualifier = if written.contains("::")
+            && qualifier
+                .first()
+                .is_some_and(|first| matches!(first.as_str(), "crate" | "self" | "super"))
+        {
+            let skip = qualifier
+                .iter()
+                .take_while(|part| matches!(part.as_str(), "crate" | "self" | "super"))
+                .count();
+            own_path = qualifier[skip..].to_vec();
+            &own_path[..]
+        } else {
+            qualifier
+        };
         // `serde_json::Value`, `tokio::spawn`: a qualifier the repository's
         // manifests declare as a dependency names somebody else's code, whose
         // absence from the index is no drift. A qualifier nothing declares and
@@ -2194,19 +2302,20 @@ impl<'a> Resolver<'a> {
         self.check("link");
         match state {
             PathState::Outside => {}
-            PathState::Missing => {
+            PathState::Missing | PathState::Case { .. } => {
                 if is_generated_path(&rel) {
                     // A link to a log or a build output that a clean checkout
                     // does not carry.
                     self.skip("generated_path");
                     return Ok(());
                 }
+                let detail = missing_detail(&rel, &state);
                 self.find(
                     doc,
                     line,
                     DriftKind::MissingFile,
                     target,
-                    format!("{rel} does not exist"),
+                    detail,
                     Vec::new(),
                 );
                 return Ok(());
@@ -2314,6 +2423,9 @@ impl<'a> Resolver<'a> {
         let mut malformed: Vec<String> = Vec::new();
         let mut cut = false;
         let mut dependencies: Vec<Dependency> = Vec::new();
+        // `name` of every package.json in the repository: npm and yarn
+        // workspace members, which a sibling depends on by plain version.
+        let mut members: HashSet<String> = HashSet::new();
         for (path, _) in files {
             let name = path.rsplit('/').next().unwrap_or(path);
             let parse: fn(&str) -> Result<Manifest, String> = match name {
@@ -2347,6 +2459,16 @@ impl<'a> Resolver<'a> {
                     dependencies.extend(manifest.dependencies);
                     for own in manifest.own_names {
                         self.in_repo.insert(crate_key(&own));
+                        if name == "package.json" {
+                            // A workspace member: its full and its bare
+                            // (scope stripped) name are the repository's own.
+                            let bare = own.strip_prefix('@').and_then(|s| s.split_once('/'));
+                            if let Some((_, bare)) = bare {
+                                self.in_repo.insert(crate_key(bare));
+                                members.insert(crate_key(bare));
+                            }
+                            members.insert(crate_key(&own));
+                        }
                     }
                 }
                 Err(why) => malformed.push(format!("{path} ({why})")),
@@ -2354,7 +2476,7 @@ impl<'a> Resolver<'a> {
         }
         let local: HashSet<String> = dependencies
             .iter()
-            .filter(|d| d.local)
+            .filter(|d| d.local || members.contains(&crate_key(&d.name)))
             .map(|d| crate_key(&d.name))
             .collect();
         for dependency in &dependencies {
@@ -2542,19 +2664,25 @@ impl<'a> Resolver<'a> {
             // against some other root: a sibling repository, a crate directory,
             // an example. Not checkable, not drift.
             let first = path.split('/').next().unwrap_or("");
-            let rooted = self.state(first).exists()
-                || resolve_relative(doc, first).is_some_and(|rel| self.state(&rel).exists());
+            let rooted = self.state(first).present()
+                || resolve_relative(doc, first).is_some_and(|rel| self.state(&rel).present());
             if !rooted {
                 self.skip("unrooted_path");
                 return Ok(());
             }
             self.check("path");
+            // A spelling that differs only in case names the on-disk one.
+            let at = states
+                .iter()
+                .position(|s| matches!(s, PathState::Case { .. }))
+                .unwrap_or(0);
+            let detail = missing_detail(&candidates[at], &states[at]);
             self.find(
                 doc,
                 line,
                 DriftKind::MissingFile,
                 &written,
-                format!("{} does not exist", candidates[0]),
+                detail,
                 Vec::new(),
             );
             return Ok(());
@@ -2568,6 +2696,17 @@ impl<'a> Resolver<'a> {
             }
         }
         Ok(())
+    }
+}
+
+/// Why `rel` is missing: absent, or present under a spelling that differs in
+/// case (broken on GitHub and on any case-sensitive file system).
+fn missing_detail(rel: &str, state: &PathState) -> String {
+    match state {
+        PathState::Case { actual } => {
+            format!("{rel} does not exist: {actual} exists, but the case differs")
+        }
+        _ => format!("{rel} does not exist"),
     }
 }
 
@@ -3207,6 +3346,7 @@ pub fn doc_drift_report_with(
         limits: options.limits,
         declared: HashSet::new(),
         in_repo: HashSet::new(),
+        listings: std::cell::RefCell::new(HashMap::new()),
         root_aliases: recorded_root
             .into_iter()
             .map(|r| r.replace('\\', "/").trim_end_matches('/').to_string())

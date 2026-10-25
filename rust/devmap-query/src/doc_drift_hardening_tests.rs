@@ -1150,3 +1150,148 @@ fn the_heading_loop_stops_when_cancelled() {
         calls.load(Ordering::SeqCst)
     );
 }
+
+// Round four -----------------------------------------------------------------
+
+#[cfg(feature = "parse")]
+#[test]
+fn a_spelling_that_differs_only_in_case_is_broken_on_every_file_system() {
+    // On a case-insensitive file system `guide.md` opens `GUIDE.md`; on GitHub
+    // and on Linux it is a 404. The report must say the same on both, and name
+    // the spelling that exists.
+    let f = fixture(
+        "case",
+        &[
+            ("GUIDE.md", "# Guide\n"),
+            ("README.md", "# Readme\n"),
+            ("src/Lib.rs", "pub fn f() {}\n"),
+            (
+                "docs/index.md",
+                "[a](../guide.md) [b](../GUIDE.md) `../readme.md` `../README.md` [c](../src/lib.rs) [d](../SRC/Lib.rs)\n",
+            ),
+        ],
+    );
+    let report = run(&f);
+    assert_eq!(
+        found(&report),
+        vec![
+            (
+                "docs/index.md".into(),
+                1,
+                "missing_file",
+                "../guide.md".into()
+            ),
+            (
+                "docs/index.md".into(),
+                1,
+                "missing_file",
+                "../readme.md".into()
+            ),
+            (
+                "docs/index.md".into(),
+                1,
+                "missing_file",
+                "../src/lib.rs".into()
+            ),
+            (
+                "docs/index.md".into(),
+                1,
+                "missing_file",
+                "../SRC/Lib.rs".into()
+            ),
+        ],
+        "{report:?}"
+    );
+    let detail = |at: usize| report.findings[at].detail.clone();
+    assert!(
+        detail(0).contains("GUIDE.md exists, but the case differs"),
+        "{}",
+        detail(0)
+    );
+    assert!(
+        detail(1).contains("README.md exists, but the case differs"),
+        "{}",
+        detail(1)
+    );
+    assert!(detail(2).contains("src/Lib.rs exists"), "{}", detail(2));
+    assert!(detail(3).contains("src/Lib.rs exists"), "{}", detail(3));
+}
+
+#[cfg(feature = "parse")]
+#[test]
+fn a_package_that_a_sibling_workspace_member_names_is_the_repositorys_own() {
+    let f = fixture(
+        "npm-workspace",
+        &[
+            (
+                "packages/shared/package.json",
+                "{\"name\":\"@fx/sharedpkg\"}",
+            ),
+            (
+                "web/package.json",
+                "{\"name\":\"web\",\"dependencies\":{\"@fx/sharedpkg\":\"*\",\"react\":\"18\"}}",
+            ),
+            (
+                "docs/guide.md",
+                "`sharedpkg.Gone()` `react.Component` `web.AlsoGone()`\n",
+            ),
+        ],
+    );
+    let report = run(&f);
+    // `react` is declared and external. `sharedpkg` is a member of this
+    // workspace though it is depended on by plain version, so it is the
+    // repository's own code, as is `web`.
+    assert_eq!(skipped(&report, "external_qualifier"), 1, "{report:?}");
+    let names: Vec<String> = found(&report).into_iter().map(|f| f.3).collect();
+    assert_eq!(
+        names,
+        vec!["sharedpkg.Gone()", "web.AlsoGone()"],
+        "{report:?}"
+    );
+}
+
+#[cfg(feature = "parse")]
+#[test]
+fn crate_self_and_super_paths_are_the_repositorys_own() {
+    let f = fixture(
+        "own-paths",
+        &[
+            ("src/store.rs", "pub fn real_fn() {}\n"),
+            (
+                "docs/guide.md",
+                "`crate::real_fn()` `crate::gone_fn()` `self::real_fn()` `super::gone_two()` `crate::store::real_fn()` `crate::store::gone_three()` `Self::new()` `self.run()`\n",
+            ),
+        ],
+    );
+    let report = run(&f);
+    let names: Vec<String> = found(&report).into_iter().map(|f| f.3).collect();
+    assert_eq!(
+        names,
+        vec![
+            "crate::gone_fn()",
+            "super::gone_two()",
+            "crate::store::gone_three()"
+        ],
+        "{report:?}"
+    );
+    // `Self` and `self.run()` are instances and types a document cannot pin
+    // down: still skipped.
+    assert_eq!(skipped(&report, "external_qualifier"), 2, "{report:?}");
+}
+
+#[test]
+fn relative_path_roots_are_references_and_instance_roots_are_not() {
+    let extraction = extract_references(
+        "`crate::a::b()` `self::b()` `super::b()` `self.b()` `this.b()` `Self::b()`\n",
+    );
+    let written: Vec<String> = extraction
+        .references
+        .iter()
+        .filter_map(|r| match &r.spec {
+            RefSpec::Symbol { written, .. } => Some(written.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(written, vec!["crate::a::b()", "self::b()", "super::b()"]);
+    assert_eq!(extraction.skipped.get("external_qualifier"), Some(&3));
+}

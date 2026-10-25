@@ -545,6 +545,15 @@ What the report cannot see, each surfaced as a `skipped` count rather than hidde
   `outside_repo` with nothing past it examined, so the report cannot tell a host path that
   exists from one that does not; inside, a missing component, a dangling link included, is
   `missing_file`.
+- A path whose spelling differs from the on-disk entry only in case (`../guide.md` for
+  `GUIDE.md`) is `missing_file` with the on-disk spelling in its detail, on case-sensitive and
+  case-insensitive file systems alike (each component is checked against its directory's
+  entries, up to 20 000 per directory).
+- A dependency on a sibling npm or yarn workspace member (a package whose `name` some
+  `package.json` in the repository gives) is the repository's own even when declared by plain
+  version. `crate::`, `self::` and `super::` paths are the repository's own: the relative root
+  is dropped and the rest is checked like any qualified name (`self.x` and `Self::x` stay
+  skipped).
 - A heading that cannot be rendered within bounds (a long link destination, a tag too long to
   close) makes that document's anchors incomplete: `anchor_target_unscanned`, not a wrong slug.
 - A directive counts only on a prose line: not fenced, not indented code, not inside an HTML
