@@ -84,6 +84,7 @@ fn profile(command: &Commands) -> Option<(&'static str, &'static str)> {
         Commands::Blast(_) => ("Blast radius", "Following what this change reaches"),
         Commands::Search(_) => ("Search", "Looking for the right thread"),
         Commands::Literals(_) => ("Literals", "Finding where a string is written"),
+        Commands::DocDrift(_) => ("Doc drift", "Checking the docs against the code"),
         Commands::Deps(_) => ("Dependencies", "Following the connections"),
         Commands::Impact(_) => ("Impact", "Tracing the ripples"),
         Commands::Neighbors(_) => ("Neighbors", "Meeting the neighbors"),

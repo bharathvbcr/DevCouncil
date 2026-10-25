@@ -238,7 +238,7 @@ def main():
             ["repair", "--fts", "--pending", "--page-size"],
             ["ask", "where is needle defined"], ["skeleton", "example.py"],
             ["suspects", "needle", "--since", "HEAD"], ["blast", "--since", "HEAD"],
-            ["literals", "needle"], ["version"],
+            ["literals", "needle"], ["doc-drift"], ["version"],
             ["gap-record", "--tool", "stress", "--gap-id", "stress", "--reason", "stress fixture"],
         ]
         for query in queries:

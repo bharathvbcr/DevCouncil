@@ -61,6 +61,8 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 /// exit, not a silent spin. Each failure backs off exponentially.
 const MAX_CONSECUTIVE_ACCEPT_ERRORS: u32 = 30;
 const MAX_QUERY_BYTES: usize = 4 * 1024;
+/// Most `paths` entries, and most `exclude` entries, one `doc_drift` call takes.
+pub const MAX_DOC_DRIFT_PREFIXES: usize = 64;
 // The token-budget and traversal-depth ceilings are `devmap_query`'s: the
 // engine applies them, so the transport that fronts it imports them rather
 // than keeping a second spelling that can drift.
@@ -237,6 +239,10 @@ establish — run `devmap build`, or restart the daemon once the store accepts w
 pub struct ServeState {
     pub activity: Activity,
     pub unapplied: UnappliedEdits,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_budget() -> u32 {
@@ -562,6 +568,24 @@ pub enum IpcCommand {
         exact: bool,
         #[serde(default = "default_budget")]
         budget: u32,
+    },
+    /// Markdown references to code that no longer exists or has moved.
+    ///
+    /// `paths` are repo-relative Markdown files or directory prefixes (none:
+    /// every indexed Markdown file); `exclude` are prefixes to leave out.
+    /// Answered from the store and the working tree; see
+    /// `devmap_query::doc_drift`.
+    DocDrift {
+        #[serde(default)]
+        paths: Vec<String>,
+        #[serde(default)]
+        exclude: Vec<String>,
+        #[serde(default = "default_budget")]
+        budget: u32,
+        /// Leave out the default exclusions (`docs/archive`) unless a path
+        /// names something inside one. False scans everything.
+        #[serde(default = "default_true")]
+        default_excludes: bool,
     },
     /// Test files reachable through the inbound blast radius of some targets.
     Affected {
@@ -1022,6 +1046,30 @@ pub(crate) fn validate_request(request: &IpcRequest) -> Result<(), String> {
                 return Err("literals requires a non-empty query".to_string());
             }
             (query.as_str(), *budget, 1, None)
+        }
+        IpcCommand::DocDrift {
+            paths,
+            exclude,
+            budget,
+            ..
+        } => {
+            // Refused, not trimmed, for the reason `neighbors` refuses: a
+            // silently shortened list reads exactly like the whole request.
+            for (what, list) in [("paths", paths), ("exclude", exclude)] {
+                if list.len() > MAX_DOC_DRIFT_PREFIXES {
+                    return Err(format!(
+                        "doc_drift accepts at most {MAX_DOC_DRIFT_PREFIXES} {what}, got {}",
+                        list.len()
+                    ));
+                }
+                if let Some(oversized) = list.iter().find(|p| p.len() > MAX_QUERY_BYTES) {
+                    return Err(format!(
+                        "doc_drift {what} entry exceeds {MAX_QUERY_BYTES} bytes: {} bytes",
+                        oversized.len()
+                    ));
+                }
+            }
+            ("", *budget, 1, None)
         }
         IpcCommand::Affected {
             targets,
@@ -1575,6 +1623,14 @@ pub(crate) fn dispatch(
             budget,
         } => Ok(serde_json::to_value(
             engine.literals(&query, exact, budget)?,
+        )?),
+        IpcCommand::DocDrift {
+            paths,
+            exclude,
+            budget,
+            default_excludes,
+        } => Ok(serde_json::to_value(
+            engine.doc_drift(&paths, &exclude, budget, default_excludes)?,
         )?),
         IpcCommand::Affected {
             targets,

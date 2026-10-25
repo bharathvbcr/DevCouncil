@@ -488,6 +488,7 @@ diagnostics with the panel state and its existing rotating logs.
 | `devmap affected <targets…>` | Files holding tests the change reaches, nearest first — test-path files, and runner-invoked tests (`#[test]`, pytest `test_*`, JUnit `@Test`) beside the code |
 | `devmap dead` | Dead-symbol candidates: confident vs unconfirmed, each with reason and site evidence, plus what was never examined |
 | `devmap clones` | Duplicated and structurally similar bodies |
+| `devmap doc-drift [PATH…]` | Markdown references to code that no longer exists or has moved — see below |
 | `devmap preview --file f --content -` | What an *unsaved* edit would break |
 | `devmap savings` | What the index cost against reading the files |
 | `devmap cypher '<query>'` | A small openCypher subset over the graph |
@@ -499,6 +500,83 @@ diagnostics with the panel state and its existing rotating logs.
 | `devmap export` | The graph as GraphML, for Gephi, yEd, Cytoscape or networkx |
 | `devmap blast [--since <rev>] [--at <loc>]` | Forward change impact: downstream symbols, files, modules, and tests |
 | `devmap suspects <symptom> --since <rev>` | Backward regression: which commits caused this failure |
+
+`devmap doc-drift [PATH…] [--exclude PREFIX]… [--budget N]` is a deterministic report, no model,
+of Markdown that names code which is gone or has moved. It reads the indexed Markdown files (or
+the PATHs given: files or directory prefixes) and resolves three kinds of reference against the
+latest generation and the working tree: links `[text](target)` and `[x]: target` definitions
+(missing file, `#L10` past the end of the file, `#heading` no heading produces, a symbol named in
+the link text that no longer lives in the target — `symbol_moved` with the current files, or
+`missing_symbol`), backticked paths such as `src/lib.rs:12-30` (`missing_file`,
+`line_out_of_range`), and symbol-shaped backticked names such as `VerifyTask`, `run()` or
+`Store::latest_file` (`missing_symbol`). Fenced and indented code and HTML comments are not
+scanned. Precision beats recall: plain words, ALL_CAPS, flags, bare file names, URLs, absolute and
+home paths, generated paths (`tmp/`, `target/`, tool dot-directories, `.log`), paths whose first
+directory is not in this tree, and names that appear as a word in some source file although the
+index defines no symbol of that name (enum variants, fields, config keys) are counted under
+`skipped` with a reason and never reported. `--json` and the `devmap_doc_drift` MCP tool carry
+`docs_scanned`, `references`, `checked` and `skipped` counts and `findings`
+(`doc`, `line`, `kind`, `reference`, `detail`, `current_locations`), with the usual
+`shown`/`hidden`/`total`/`truncated`. `available: false` means no generation exists and nothing was
+checked; an empty `findings` list is clean only when `walk_incomplete` is absent. The exit status
+is 0 with findings: it is a report. Documents the index never read (over the size limit,
+ignored) are not scanned, and secret paths are never opened (judged after symlinks are
+resolved; a link that leaves the repository is `outside_repo` and never stat'd past).
+
+What the report cannot see, each surfaced as a `skipped` count rather than hidden:
+
+- A name that survives in a comment or a string suppresses `missing_symbol`
+  (`defined_outside_symbol_index`): a deleted function still mentioned in a comment goes
+  unreported.
+- `qualifier_unmatched` hides references to a renamed owner: `OldType::method` is not reported
+  while `method` exists under another type.
+- `external_qualifier`: `serde_json::Value`, `tokio::spawn` — a qualifier the repository's own
+  manifests declare (`Cargo.toml` dependency tables including `name.workspace = true` and
+  renamed `package =`, `go.mod` requires, `package.json` dependencies, read only from indexed
+  files; a malformed one is named in `walk_incomplete`) or a standard root listed in the code.
+  Compared as written, `-` as `_`: `Store` is not the `store` crate. A path dependency, a local
+  `replace`, a `file:`/`workspace:` package, or a name that is a symbol, directory, file stem or
+  crate of this repository is never external, even if a dependency or a standard root shares
+  the name. A qualifier nothing declares and nothing defines (`oldmod::run_task`) is a vanished
+  module and is reported as `missing_symbol`.
+- A target path written with backslashes is `backslash_path`: never resolved, on any platform.
+- Symlinks are resolved the way the operating system does, a component at a time with `..`
+  applying to the physical directory a link led to. Leaving the repository (or 40 links) is
+  `outside_repo` with nothing past it examined, so the report cannot tell a host path that
+  exists from one that does not; inside, a missing component, a dangling link included, is
+  `missing_file`.
+- A path whose spelling differs from the on-disk entry only in case (`guide.md` for
+  `GUIDE.md`) is `missing_file` with the on-disk spelling in its detail, on case-sensitive and
+  case-insensitive file systems alike (each component is checked against its directory's
+  entries, up to 20 000 per directory; a directory past the cap is named in `walk_incomplete`
+  and counted as `skipped.spelling_unchecked`). A difference in Unicode normalisation only is
+  not case: it is reported only when some entry equals the reference ignoring case.
+- A dependency on a sibling npm or yarn workspace member (a package whose `name` some
+  `package.json` in the repository gives) is the repository's own even when declared by plain
+  version. `crate::`, `self::` and `super::` paths are the repository's own: the relative root
+  is dropped and the rest is checked like any qualified name (`self.x` and `Self::x` stay
+  skipped).
+- A heading that cannot be rendered within bounds (a long link destination, a tag too long to
+  close) makes that document's anchors incomplete: `anchor_target_unscanned`, not a wrong slug.
+- A directive counts only on a prose line: not fenced, not indented code, not inside an HTML
+  comment.
+- Links and spans differ on a missing top-level directory: `[x](oldpkg/main.go)` is
+  `missing_file`, `` `oldpkg/main.go` `` is `unrooted_path`, because a span's root is ambiguous.
+- `docs/archive/` is excluded by default (`default_excludes`, `docs_excluded_by_default` and a
+  plain `scope_note` in the report, and a `note:` line in the text output): an empty findings
+  list then covers only the scanned documents, with the excluded count beside it. It is not a
+  `walk_incomplete` reason. Name a path inside it, or pass `--no-default-excludes` /
+  `default_excludes: false`.
+- A document opts out deliberately with a whole-line comment outside a fence:
+  `<!-- devmap:doc-drift ignore-next-line -->` or `<!-- devmap:doc-drift ignore-file -->`; what
+  it hid is `skipped.ignored_by_comment`.
+
+Heading anchors follow github-slugger (emphasis, entities, inline code and links reduced to text;
+a taken `-N` suffix is skipped; `id`/`name` attributes count; headings in blockquotes and list
+items count). A target with a line too long to scan makes a missing anchor
+`anchor_target_unscanned`, not a finding. Extraction is linear and cancellable; the unindexed-name
+word search reads at most 64 MiB and says when it was cut; the finding cap keeps the first 10 000
+by document and line.
 
 ```mermaid
 flowchart TD
@@ -700,11 +778,11 @@ devmap serve .    # index over IPC, watching the tree for changes
 devmap mcp        # speak MCP on stdin/stdout, for an agent host
 ```
 
-`devmap mcp` publishes nineteen read-only tools: `devmap_status`, `devmap_search`,
+`devmap mcp` publishes twenty-one read-only tools: `devmap_status`, `devmap_search`,
 `devmap_ask`, `devmap_ask_evidence`, `devmap_dependencies`, `devmap_impact`,
 `devmap_trace`, `devmap_neighbors`, `devmap_dead_symbols`, `devmap_skeleton`,
-`devmap_clones`, `devmap_preview`, `devmap_explore`, `devmap_affected_tests`,
-`devmap_blast`, `devmap_suspects`, `devmap_routes`, `devmap_api_impact` and
+`devmap_clones`, `devmap_preview`, `devmap_explore`, `devmap_literals`,
+`devmap_doc_drift`, `devmap_affected_tests`, `devmap_blast`, `devmap_suspects`, `devmap_routes`, `devmap_api_impact` and
 `devmap_cypher`. Every one declares an `outputSchema`, and the
 server validates its own answers against the schema it published before emitting them.
 `devmap_dependencies`, `devmap_impact`, `devmap_trace` and `devmap_neighbors` take

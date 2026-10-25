@@ -15,6 +15,7 @@ pub(crate) mod clones;
 pub(crate) mod cypher;
 pub(crate) mod dead;
 pub(crate) mod deps;
+pub(crate) mod doc_drift;
 pub(crate) mod doctor;
 pub(crate) mod explore;
 pub(crate) mod export;
@@ -64,6 +65,7 @@ pub(crate) async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyho
         Commands::Blast(args) => blast::run(cli, args),
         Commands::Explore(args) => explore::run(cli, args),
         Commands::Literals(args) => literals::run(cli, args),
+        Commands::DocDrift(args) => doc_drift::run(cli, args),
         Commands::Affected(args) => affected::run(cli, args),
         Commands::Preview(args) => preview::run(cli, args),
         Commands::Workspace(args) => workspace::run(cli, args),

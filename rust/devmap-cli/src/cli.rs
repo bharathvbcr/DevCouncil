@@ -403,6 +403,17 @@ pub(crate) enum Commands {
     /// Each site names the file, line and enclosing symbol. A Rust
     /// module-level const's value is also reported at each use of that const.
     Literals(commands::literals::Args),
+    /// Markdown references to code that is gone or has moved.
+    ///
+    /// Deterministic, no model. Resolves links, backticked paths
+    /// (`src/lib.rs:12`) and symbol-shaped names in the Markdown files of the
+    /// latest generation against the store and the working tree. Reports
+    /// `missing_file`, `line_out_of_range`, `missing_anchor`, `symbol_moved`
+    /// and `missing_symbol`. Ambiguous spans (plain words, ALL_CAPS, flags) are
+    /// counted under `skipped`, never checked. PATHs are Markdown files or
+    /// directory prefixes. An empty list is clean only when `walk_incomplete`
+    /// is absent. Exit status is 0 even with findings.
+    DocDrift(commands::doc_drift::Args),
     /// Test files reachable through the inbound blast radius of some targets.
     ///
     /// Ranked nearest-first: a budget-trimmed list keeps the tests closest to
@@ -688,6 +699,7 @@ pub(crate) fn validate_limits(command: &Commands) -> Result<(), String> {
     match command {
         Commands::Search(commands::search::Args { budget, .. })
         | Commands::Literals(commands::literals::Args { budget, .. })
+        | Commands::DocDrift(commands::doc_drift::Args { budget, .. })
         | Commands::Snapshots(commands::snapshots::Args { budget, .. })
         | Commands::Savings(commands::savings::Args { budget, .. }) => check_budget(*budget),
         Commands::Ask(commands::ask::Args {
