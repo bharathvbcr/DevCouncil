@@ -175,7 +175,25 @@ func decodeEd25519Public(s string) (ed25519.PublicKey, error) {
 	if len(raw) != ed25519.PublicKeySize {
 		return nil, fmt.Errorf("public key is %d bytes, not %d", len(raw), ed25519.PublicKeySize)
 	}
+	// Reject the all-zero key: it is not a real signer's key, only a thing a
+	// blank or truncated config pastes in, and refusing it keeps a degenerate
+	// key out of the trust set rather than relying on Verify to reject every
+	// signature under it. The boundary does not depend on this — key_id is
+	// signed and the private key is still needed — but a trust anchor should
+	// not hold an obvious non-key.
+	if allZero(raw) {
+		return nil, fmt.Errorf("public key is all zero, which is not a signing key")
+	}
 	return ed25519.PublicKey(raw), nil
+}
+
+func allZero(b []byte) bool {
+	for _, c := range b {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // SigningKey is a private signing key and the id it signs under, as the

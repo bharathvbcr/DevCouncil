@@ -2,6 +2,7 @@ package dc
 
 import (
 	"crypto/ed25519"
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"testing"
@@ -160,6 +161,24 @@ func TestALoosePrivateKeyIsRefused(t *testing.T) {
 	}
 	if _, _, err := LoadSigningKey(path); err == nil {
 		t.Error("a group/world-readable signing key was accepted")
+	}
+}
+
+// An all-zero public key — what a blank or truncated config pastes in — is
+// refused by the loader rather than entering the trust set.
+func TestAnAllZeroPublicKeyIsRefused(t *testing.T) {
+	zero := base64.StdEncoding.EncodeToString(make([]byte, ed25519.PublicKeySize))
+	root := t.TempDir()
+	dir := filepath.Join(root, ".devcouncil")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	line := `{"key_id":"zero","public_key":"` + zero + `"}`
+	if err := os.WriteFile(filepath.Join(dir, "review_signers.json"), []byte(`{"signers":[`+line+`]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadReviewSigners(root); err == nil {
+		t.Error("an all-zero public key was accepted into the trust set")
 	}
 }
 
