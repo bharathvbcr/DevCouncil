@@ -30,12 +30,15 @@ fn request(store: &Store, method: &str, input: &str) -> Result<String, dc_store:
 
 /// POSIX fixture paths (`/checkout`, `/worktrees/…`, `local:/moved/.git`) are
 /// absolute on Unix. On Windows `Path::is_absolute` is false for them, and
-/// `runs.prepare` refuses the cwd before the test's own assertion. A drive
-/// prefix keeps the forward slashes the fixtures compare.
+/// `runs.prepare` refuses the cwd before the test's own assertion. The same
+/// paths are embedded inside `effective_configuration` as `\"/checkout`, which
+/// the plain `:"/` rewrite never sees. A drive prefix keeps the forward
+/// slashes the fixtures compare.
 fn fixture_input(input: &str) -> String {
     if cfg!(windows) {
         input
             .replace("local:/", "local:C:/")
+            .replace(r#":\"/"#, r#":\"C:/"#)
             .replace(":\"/", ":\"C:/")
     } else {
         input.to_owned()
@@ -44,13 +47,13 @@ fn fixture_input(input: &str) -> String {
 
 #[test]
 fn a_posix_fixture_path_is_drive_absolute_on_windows() {
-    let raw =
-        r#"{"cwd":"/worktrees/a","git_dir":"/checkout/.git","identity_key":"local:/moved/.git"}"#;
+    let raw = r#"{"cwd":"/worktrees/a","git_dir":"/checkout/.git","identity_key":"local:/moved/.git","effective_configuration":"{\"cwd\":\"/checkout\"}"}"#;
     let got = fixture_input(raw);
     if cfg!(windows) {
         assert!(got.contains(r#""cwd":"C:/worktrees/a""#), "{got}");
         assert!(got.contains(r#""git_dir":"C:/checkout/.git""#), "{got}");
         assert!(got.contains("local:C:/moved/.git"), "{got}");
+        assert!(got.contains(r#"{\"cwd\":\"C:/checkout\"}"#), "{got}");
         assert!(std::path::Path::new("C:/worktrees/a").is_absolute());
     } else {
         assert_eq!(got, raw);
