@@ -591,6 +591,18 @@ pub(super) fn rust_use_is_public(node: Node, source: &str) -> bool {
     public
 }
 
+/// Whether the generic declaration arm binds a callable's parameters to their
+/// declared types through [`param_type_bindings`].
+///
+/// The one predicate `extract_node` asks, so adding a language is an arm in
+/// `param_type_bindings` and a line here, and never an edit to the arm that
+/// asks. Rust and Go take their own arms and call `param_type_bindings`
+/// directly; this is the answer for the languages the generic arm serves, which
+/// is the C family today.
+pub(super) fn binds_param_types_in_generic_arm(lang: &str) -> bool {
+    is_c_family_grammar(lang)
+}
+
 /// Parameter name → declared type, for languages whose parameters carry one.
 ///
 /// A parameter's declared type binds its name to that type just as firmly as a

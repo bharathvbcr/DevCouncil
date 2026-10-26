@@ -20,7 +20,12 @@ fn property_symbols(ext: &devmap_extract::model::Extraction) -> usize {
 #[test]
 fn the_current_extraction_carries_the_property_symbols() {
     assert_eq!(property_symbols(&extract_file("s.swift", SOURCE)), 2);
-    assert_eq!(EXTRACTION_SCHEMA_VERSION, "97");
+    // The claim is the stored identity, not the number: a later bump must not
+    // break this test.
+    assert!(
+        EXTRACTION_SCHEMA_VERSION.parse::<u32>().unwrap() >= 97,
+        "{EXTRACTION_SCHEMA_VERSION}"
+    );
 }
 
 #[test]
@@ -44,11 +49,12 @@ fn a_payload_stored_under_the_v96_identity_is_not_served_to_a_v97_key() {
 }
 
 #[test]
-fn the_stored_identity_names_v97() {
+fn the_stored_identity_names_the_current_extraction_schema() {
     let key = CacheKey::for_extraction(&extract_file("s.swift", SOURCE));
+    let expected = format!(":extract-v{EXTRACTION_SCHEMA_VERSION}");
     assert!(
-        key.analyzer_version.ends_with(":extract-v97"),
-        "{}",
+        key.analyzer_version.ends_with(&expected),
+        "{} does not end with {expected}",
         key.analyzer_version
     );
 }

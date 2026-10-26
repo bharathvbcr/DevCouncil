@@ -900,6 +900,18 @@ pub(super) fn extract_treesitter_before_deadline(
                     } else {
                         (Vec::new(), Vec::new(), Vec::new())
                     };
+                // One call per fact family, each answering for its own
+                // languages and returning an empty set for the rest, so a new
+                // fact is added in `jvmfacts` or `pyfacts` and never here.
+                let jvm_facts = crate::jvmfacts::collect(
+                    root,
+                    source,
+                    lang,
+                    &symbols,
+                    &parse_outcome,
+                    deadline,
+                );
+                let py_facts = crate::pyfacts::collect(root, source, lang, &symbols, deadline);
                 // Bound rather than returned: the embedded-script merge below
                 // still has to run, and it mutates this value in place.
                 let mut extraction = Extraction {
@@ -962,6 +974,11 @@ pub(super) fn extract_treesitter_before_deadline(
                     } else {
                         Vec::new()
                     },
+                    jvm_decls: jvm_facts.jvm_decls,
+                    package_scopes: jvm_facts.package_scopes,
+                    local_extents: jvm_facts.local_extents,
+                    decl_gaps: jvm_facts.decl_gaps,
+                    dynamic_dispatch: py_facts.dynamic_dispatch,
                 };
 
                 // The code inside a template language's `<script>` blocks, in

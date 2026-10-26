@@ -78,6 +78,14 @@ mod literals;
 // Walks a parse tree; its one caller is `treesitter::extract_treesitter`.
 #[cfg(feature = "parse")]
 mod jsobjects;
+// The JVM-family declaration facts (Kotlin, Java, Scala, C#). Walks a parse
+// tree; its one caller is `treesitter::extract_treesitter`.
+#[cfg(feature = "parse")]
+mod jvmfacts;
+// Python-only facts (dynamic dispatch). Walks a parse tree; its one caller is
+// `treesitter::extract_treesitter`.
+#[cfg(feature = "parse")]
+mod pyfacts;
 pub mod pyproject;
 #[cfg(feature = "parse")]
 mod rustlocal;

@@ -1607,7 +1607,9 @@ pub(super) fn extract_node(
                 // declared type is the only typed binding available when the
                 // function did not construct the value. Without it, C-family
                 // method calls on parameters (`s.compute(1)`) stay uninferred.
-                if c_family && declaration.declared_kind == SymbolKind::Function {
+                if binds_param_types_in_generic_arm(lang)
+                    && declaration.declared_kind == SymbolKind::Function
+                {
                     for (param, type_name, qualifier) in param_type_bindings(node, source, lang) {
                         let scope = node.child_by_field_name("body").and_then(|body| {
                             enclosing_callable_qualified(body, source, file_symbol_name)

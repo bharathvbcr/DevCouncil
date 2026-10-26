@@ -18,7 +18,12 @@ fn field_binding(ext: &devmap_extract::model::Extraction) -> bool {
 #[test]
 fn the_current_extraction_carries_the_field_binding() {
     assert!(field_binding(&extract_file("h.py", SOURCE)));
-    assert_eq!(EXTRACTION_SCHEMA_VERSION, "97");
+    // The claim is the stored identity, not the number: a later bump must not
+    // break this test.
+    assert!(
+        EXTRACTION_SCHEMA_VERSION.parse::<u32>().unwrap() >= 97,
+        "{EXTRACTION_SCHEMA_VERSION}"
+    );
 }
 
 #[test]
@@ -44,9 +49,10 @@ fn a_payload_stored_under_the_v94_identity_is_not_served_to_a_v95_key() {
 #[test]
 fn the_stored_identity_names_the_current_version() {
     let key = CacheKey::for_extraction(&extract_file("h.py", SOURCE));
+    let expected = format!(":extract-v{EXTRACTION_SCHEMA_VERSION}");
     assert!(
-        key.analyzer_version.ends_with(":extract-v97"),
-        "{}",
+        key.analyzer_version.ends_with(&expected),
+        "{} does not end with {expected}",
         key.analyzer_version
     );
 }
