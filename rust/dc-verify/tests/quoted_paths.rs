@@ -56,7 +56,12 @@ fn quoted_names_from_real_git_output_are_decoded() {
     git(&dir, &["commit", "-qm", "base"]);
 
     write(&dir, "café.go", "package cafe\n");
-    write(&dir, "tab\tname.go", "package tab\n");
+    // A tab is a quoted name git will emit, and it is not a legal Windows
+    // filename (error 123). café.go and née.go are quoted too, and Windows
+    // can store them, so the decode still runs there.
+    if cfg!(unix) {
+        write(&dir, "tab\tname.go", "package tab\n");
+    }
     std::fs::remove_file(dir.join("dir b/gone.go")).unwrap();
     std::fs::remove_file(dir.join("x b/secret.go")).unwrap();
     git(&dir, &["mv", "old name.go", "née.go"]);
@@ -73,31 +78,31 @@ fn quoted_names_from_real_git_output_are_decoded() {
     let mut paths: Vec<(&str, ChangeStatus)> =
         files.iter().map(|f| (f.path.as_str(), f.status)).collect();
     paths.sort_by_key(|(p, _)| *p);
-    assert_eq!(
-        paths,
-        vec![
-            ("café.go", ChangeStatus::Added),
-            ("dir b/gone.go", ChangeStatus::Deleted),
-            ("née.go", ChangeStatus::Renamed),
-            ("tab\tname.go", ChangeStatus::Added),
-            ("x b/secret.go", ChangeStatus::Deleted),
-        ]
-    );
+    let mut expected = vec![
+        ("café.go", ChangeStatus::Added),
+        ("dir b/gone.go", ChangeStatus::Deleted),
+        ("née.go", ChangeStatus::Renamed),
+        ("x b/secret.go", ChangeStatus::Deleted),
+    ];
+    if cfg!(unix) {
+        expected.push(("tab\tname.go", ChangeStatus::Added));
+    }
+    expected.sort_by_key(|(p, _)| *p);
+    assert_eq!(paths, expected);
     let renamed = files.iter().find(|f| f.path == "née.go").unwrap();
     assert_eq!(renamed.old_path.as_deref(), Some("old name.go"));
 
     // Planned exactly as the files are named, nothing is an orphan.
-    let planned: Vec<String> = [
-        "café.go",
-        "tab\tname.go",
-        "dir b/gone.go",
-        "x b/secret.go",
-        "née.go",
-        "old name.go",
-    ]
-    .iter()
-    .map(|s| (*s).to_string())
-    .collect();
+    let mut planned = vec![
+        "café.go".to_string(),
+        "dir b/gone.go".to_string(),
+        "x b/secret.go".to_string(),
+        "née.go".to_string(),
+        "old name.go".to_string(),
+    ];
+    if cfg!(unix) {
+        planned.push("tab\tname.go".to_string());
+    }
     let report = classify_scope(&files, &planned);
     assert!(report.orphans.is_empty(), "orphans: {:?}", report.orphans);
     let _ = std::fs::remove_dir_all(&dir);
