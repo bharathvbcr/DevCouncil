@@ -82,6 +82,17 @@ struct FileIndex {
     /// (qualified type, method name) → its written return type, under the same
     /// rule as `returns`.
     methods: HashMap<(String, String), Option<String>>,
+    /// (qualified type, method name) → every direct method's written return,
+    /// parameterized ones included. A qualified initializer shape is refused
+    /// when two of them disagree. This is not a type for the call: `methods`
+    /// still forgets a parameterized return, so a bare `name()` cannot read it.
+    method_results: HashMap<(String, String), Vec<Option<String>>>,
+    /// How many functions of each bare name this file declares. A tuple
+    /// destructure needs exactly one, methods and nested functions included.
+    function_count: HashMap<String, u32>,
+    /// File-level function → the tuple it returns, when every element is one
+    /// plain nominal type. Never written into `returns` or `methods`.
+    tuple_returns: HashMap<String, Vec<(Option<String>, String)>>,
     /// Short type name → the qualified name of every non-extension declaration
     /// that carries it. More than one makes the short name unreadable, and one
     /// nested declaration is readable only from inside the type that holds it.
@@ -465,6 +476,7 @@ fn index_function(node: Node, source: &str, built: &mut FileIndex) {
     };
     let bounds = generic_bounds(node, source);
     let mut returned = None;
+    let mut return_node = None;
     for index in 0..node.child_count() {
         let Some(child) = node.child(index) else {
             continue;
@@ -473,6 +485,7 @@ fn index_function(node: Node, source: &str, built: &mut FileIndex) {
             && child.kind() != "simple_identifier"
         {
             returned = normalize(child, source, &bounds);
+            return_node = Some(child);
             break;
         }
     }
@@ -489,6 +502,9 @@ fn index_function(node: Node, source: &str, built: &mut FileIndex) {
     {
         returned = None;
     }
+    // Kept before the parameter wipe: two overloads of one method can return
+    // different types, and the wipe would make them indistinguishable.
+    let shape_return = returned.clone();
     // A function with parameters never states what a bare `name()` returns.
     let mut cursor = node.walk();
     let takes_parameters = node
@@ -508,13 +524,119 @@ fn index_function(node: Node, source: &str, built: &mut FileIndex) {
         })
         .and_then(|owner| type_path(owner, source));
     if let Some((qualified, _)) = direct_owner {
+        built
+            .method_results
+            .entry((qualified.clone(), name.clone()))
+            .or_default()
+            .push(shape_return);
         merge_declared(
             &mut built.methods,
             (qualified, name.clone()),
             returned.clone(),
         );
     }
+    if is_file_level_function(node) {
+        if let Some(ret) = return_node {
+            if let Some(slots) = nominal_tuple(ret, source, &bounds) {
+                built.tuple_returns.entry(name.clone()).or_insert(slots);
+            }
+        }
+    }
+    *built.function_count.entry(name.clone()).or_default() += 1;
     merge_declared(&mut built.returns, name, returned);
+}
+
+/// A function whose body is not inside a type or another callable. A method's
+/// tuple is not what a bare call outside that type returns.
+fn is_file_level_function(node: Node) -> bool {
+    let mut ancestor = bounded_parent(node);
+    while let Some(outer) = ancestor {
+        if matches!(
+            outer.kind(),
+            "function_declaration"
+                | "init_declaration"
+                | "deinit_declaration"
+                | "lambda_literal"
+                | "class_declaration"
+                | "computed_property"
+        ) {
+            return false;
+        }
+        ancestor = bounded_parent(outer);
+    }
+    true
+}
+
+/// `(Store, Svc)` or `(store: Store, svc: Svc)` when every element is one plain
+/// nominal type. An optional, an array, a generic, a typealias or a nested
+/// tuple is not: destructuring it would name a type the value does not have.
+fn nominal_tuple(
+    node: Node,
+    source: &str,
+    bounds: &BTreeMap<String, String>,
+) -> Option<Vec<(Option<String>, String)>> {
+    if node.kind() != "tuple_type" {
+        return None;
+    }
+    let mut slots = Vec::new();
+    let mut cursor = node.walk();
+    for item in node.named_children(&mut cursor) {
+        if item.kind() != "tuple_type_item" {
+            continue;
+        }
+        let (label, written) = tuple_item(item, source)?;
+        let ty = plain_nominal(written, source, bounds)?;
+        slots.push((label, ty));
+    }
+    (!slots.is_empty()).then_some(slots)
+}
+
+/// The label and the written type of one tuple element. The grammar stores both
+/// on `name`: a label is a `simple_identifier` before the type.
+fn tuple_item<'a>(item: Node<'a>, source: &str) -> Option<(Option<String>, Node<'a>)> {
+    let mut inner = item.walk();
+    let parts: Vec<Node> = item.named_children(&mut inner).collect();
+    match parts.as_slice() {
+        [label, written] if label.kind() == "simple_identifier" => {
+            Some((Some(get_node_text(*label, source)), *written))
+        }
+        [written] => Some((None, *written)),
+        _ => None,
+    }
+}
+
+/// A written type that is one bare nominal name: not optional, not an array,
+/// not generic, not a typealias this file declares, not a generic parameter.
+fn plain_nominal(node: Node, source: &str, bounds: &BTreeMap<String, String>) -> Option<String> {
+    if node.kind() != "user_type" || !single_segment(node) {
+        return None;
+    }
+    let mut cursor = node.walk();
+    if node
+        .named_children(&mut cursor)
+        .any(|child| child.kind() == "type_arguments")
+    {
+        return None;
+    }
+    let name = user_type_name(node, source)?;
+    if !is_plain_nominal(&name)
+        || names_alias(node, source, &name)
+        || is_generic_parameter(node, source, &name)
+    {
+        return None;
+    }
+    let ty = normalize(node, source, bounds)?;
+    is_plain_nominal(&ty).then_some(ty)
+}
+
+/// One identifier, the only shape a receiver map can dispatch on.
+fn is_plain_nominal(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Record `value` under `key`; a second declaration that does not say the same
@@ -668,6 +790,8 @@ fn index_type(node: Node, source: &str, built: &mut FileIndex) {
 
 /// The names a `property_declaration` binds and the type each one is written
 /// with. A pattern that binds several names (`let (a, b)`) types none of them.
+/// One name and no annotation is the wrapped type of a property wrapper this
+/// file itself declares, when that wrapper states exactly one.
 fn declared_properties(
     node: Node,
     source: &str,
@@ -702,7 +826,151 @@ fn declared_properties(
         }
     }
     flush(&mut pending, &mut typed);
+    if found.len() == 1 && found[0].1.is_none() {
+        if let Some(wrapped) = property_wrapper_wrapped_type(node, source) {
+            found[0].1 = Some(wrapped);
+        }
+    }
     found
+}
+
+/// The nominal type a property wrapper stores, for a property written
+/// `@Env(Client.self) private var client` with no annotation of its own.
+///
+/// Walks the file's own declarations. It does not consult [`file_index`]: that
+/// index is what calls this, through [`declared_properties`], and asking it
+/// again would re-enter the build.
+pub(crate) fn property_wrapper_wrapped_type(property: Node, source: &str) -> Option<String> {
+    if property.kind() != "property_declaration" {
+        return None;
+    }
+    let mut patterns = 0usize;
+    for index in 0..property.child_count() {
+        if property.field_name_for_child(index as u32) == Some("name") {
+            patterns += 1;
+        }
+    }
+    let pattern = property.child_by_field_name("name")?;
+    let slots = binding_slots(pattern, source);
+    if patterns != 1 || slots.len() != 1 || slots[0].1 == "_" {
+        return None;
+    }
+    let attributes = attribute_nodes(property);
+    let [attribute] = attributes.as_slice() else {
+        return None;
+    };
+    let wrapper = attribute_nominal(*attribute, source)?;
+    let declaration = unique_wrapper_type(property, source, &wrapper)?;
+    stored_wrapped_type(declaration, source)
+}
+
+/// `@` attributes of `node` itself: a direct `attribute`, or one inside its
+/// `modifiers`. An attribute nested in an argument is not one of them.
+fn attribute_nodes(node: Node) -> Vec<Node> {
+    let mut found = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "attribute" {
+            found.push(child);
+        } else if child.kind() == "modifiers" {
+            let mut inner = child.walk();
+            for item in child.named_children(&mut inner) {
+                if item.kind() == "attribute" {
+                    found.push(item);
+                }
+            }
+        }
+    }
+    found
+}
+
+/// The plain type an attribute names. `@Env(Client.self)` names `Env`; the
+/// argument list is not part of the name.
+fn attribute_nominal(attribute: Node, source: &str) -> Option<String> {
+    let mut cursor = attribute.walk();
+    let user = attribute
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "user_type")?;
+    if !single_segment(user) {
+        return None;
+    }
+    let mut inner = user.walk();
+    if user
+        .named_children(&mut inner)
+        .any(|child| child.kind() == "type_arguments")
+    {
+        return None;
+    }
+    let name = user_type_name(user, source)?;
+    is_plain_nominal(&name).then_some(name)
+}
+
+/// The one non-extension type this file declares called `name`, and only when
+/// that declaration is itself marked `@propertyWrapper`.
+fn unique_wrapper_type<'a>(from: Node<'a>, source: &str, name: &str) -> Option<Node<'a>> {
+    let root = file_root(from)?;
+    let mut found: Vec<Node> = Vec::new();
+    let mut stack = vec![root];
+    let mut seen = 0usize;
+    while let Some(node) = stack.pop() {
+        seen += 1;
+        if seen > 20_000 {
+            return None;
+        }
+        if node.kind() == "class_declaration" {
+            if let Some((path, extension)) = type_path(node, source) {
+                if !extension && short_name(&path) == name {
+                    found.push(node);
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    let [only] = found.as_slice() else {
+        return None;
+    };
+    attribute_nodes(*only)
+        .iter()
+        .any(|attribute| {
+            attribute_nominal(*attribute, source).as_deref() == Some("propertyWrapper")
+        })
+        .then_some(*only)
+}
+
+/// The written type of the one stored `wrappedValue` on a property wrapper.
+fn stored_wrapped_type(declaration: Node, source: &str) -> Option<String> {
+    let body = declaration.child_by_field_name("body")?;
+    let mut found = Vec::new();
+    let mut cursor = body.walk();
+    for member in body.named_children(&mut cursor) {
+        if member.kind() != "property_declaration" || is_computed_property(member) {
+            continue;
+        }
+        let pattern = member.child_by_field_name("name")?;
+        let slots = binding_slots(pattern, source);
+        if slots.len() == 1 && slots[0].1 == "wrappedValue" {
+            found.push(member);
+        }
+    }
+    let [only] = found.as_slice() else {
+        return None;
+    };
+    let mut cursor = only.walk();
+    let annotation = only
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "type_annotation")?;
+    let mut inner = annotation.walk();
+    let written = annotation.named_children(&mut inner).next()?;
+    plain_nominal(written, source, &BTreeMap::new())
+}
+
+/// A property with a getter is not a stored `wrappedValue`.
+fn is_computed_property(node: Node) -> bool {
+    node.child_by_field_name("computed_value").is_some()
+        || node
+            .named_children(&mut node.walk())
+            .any(|child| child.kind() == "computed_property")
 }
 
 /// Whether `node` opens a Swift scope that binds names.
@@ -1037,24 +1305,38 @@ fn lambda_parameters(
 }
 
 fn property(node: Node, source: &str, bounds: &BTreeMap<String, String>, out: &mut Bindings) {
-    let mut pending: Vec<String> = Vec::new();
+    let mut pending: Vec<(Option<String>, String)> = Vec::new();
     let mut typed: Option<String> = None;
     let mut init: Option<String> = None;
-    let flush = |pending: &mut Vec<String>,
+    let mut value: Option<Node> = None;
+    let flush = |pending: &mut Vec<(Option<String>, String)>,
                  typed: &mut Option<String>,
                  init: &mut Option<String>,
+                 value: &mut Option<Node>,
                  out: &mut Bindings| {
         let single = pending.len() == 1;
-        for name in pending.drain(..) {
-            bind(out, name.clone(), if single { typed.clone() } else { None });
-            if let Some(entry) = out.get_mut(&name) {
-                if single && entry.init.is_none() && entry.ty.is_none() {
-                    entry.init = init.clone();
+        if !single && pending.len() > 1 {
+            let types = value.and_then(|call| tuple_local_types(call, source, pending, out));
+            for (index, (_, name)) in pending.drain(..).enumerate() {
+                let ty = types
+                    .as_ref()
+                    .and_then(|all| all.get(index).cloned())
+                    .flatten();
+                bind(out, name, ty);
+            }
+        } else {
+            for (_, name) in pending.drain(..) {
+                bind(out, name.clone(), if single { typed.clone() } else { None });
+                if let Some(entry) = out.get_mut(&name) {
+                    if single && entry.init.is_none() && entry.ty.is_none() {
+                        entry.init = init.clone();
+                    }
                 }
             }
         }
         *typed = None;
         *init = None;
+        *value = None;
     };
     for index in 0..node.child_count() {
         let Some(child) = node.child(index) else {
@@ -1062,8 +1344,8 @@ fn property(node: Node, source: &str, bounds: &BTreeMap<String, String>, out: &m
         };
         match (node.field_name_for_child(index as u32), child.kind()) {
             (Some("name"), "pattern") => {
-                flush(&mut pending, &mut typed, &mut init, out);
-                collect_bound(child, source, &mut pending);
+                flush(&mut pending, &mut typed, &mut init, &mut value, out);
+                pending = binding_slots(child, source);
             }
             (_, "type_annotation") => {
                 let mut cursor = child.walk();
@@ -1075,11 +1357,14 @@ fn property(node: Node, source: &str, bounds: &BTreeMap<String, String>, out: &m
                 typed = lookup_outer(node, source, &get_node_text(child, source), out);
             }
             (Some("value"), "call_expression") if pending.len() == 1 => {
-                init = call_shape(child, source);
+                init = initializer_shape(child, source, node, out);
                 if typed.is_none() {
                     typed = collection_type(child, source, out)
                         .or_else(|| own_method_call_type(child, source, out));
                 }
+            }
+            (Some("value"), "call_expression") if pending.len() > 1 => {
+                value = Some(child);
             }
             // `let xs = (try? load()) ?? []`, `let xs = (opt?.items ?? [])`: a
             // collection the initializer's own text types.
@@ -1102,7 +1387,226 @@ fn property(node: Node, source: &str, bounds: &BTreeMap<String, String>, out: &m
             _ => {}
         }
     }
-    flush(&mut pending, &mut typed, &mut init, out);
+    flush(&mut pending, &mut typed, &mut init, &mut value, out);
+}
+
+/// Names a pattern binds, in source order, with the tuple label written on each
+/// when it has one. `_` is a slot so a later name keeps its element index.
+/// A plain `let s` is one unlabelled slot.
+fn binding_slots(pattern: Node, source: &str) -> Vec<(Option<String>, String)> {
+    if let Some(identifier) = pattern.child_by_field_name("bound_identifier") {
+        return vec![(None, get_node_text(identifier, source))];
+    }
+    let mut slots = Vec::new();
+    let mut label: Option<String> = None;
+    let mut cursor = pattern.walk();
+    for child in pattern.named_children(&mut cursor) {
+        match child.kind() {
+            "simple_identifier" => label = Some(get_node_text(child, source)),
+            "wildcard_pattern" => slots.push((label.take(), "_".to_string())),
+            "pattern" => {
+                let name = nested_binding_name(child, source);
+                slots.push((label.take(), name));
+            }
+            _ => {}
+        }
+    }
+    if slots.is_empty() {
+        let mut names = Vec::new();
+        collect_bound(pattern, source, &mut names);
+        return names.into_iter().map(|name| (None, name)).collect();
+    }
+    slots
+}
+
+/// The name a nested pattern binds, or `_` when it binds nothing readable.
+fn nested_binding_name(pattern: Node, source: &str) -> String {
+    if let Some(identifier) = pattern.child_by_field_name("bound_identifier") {
+        return get_node_text(identifier, source);
+    }
+    let mut cursor = pattern.walk();
+    let children: Vec<Node> = pattern.named_children(&mut cursor).collect();
+    match children.as_slice() {
+        [identifier] if identifier.kind() == "simple_identifier" => {
+            get_node_text(*identifier, source)
+        }
+        [wildcard] if wildcard.kind() == "wildcard_pattern" => "_".to_string(),
+        _ => "_".to_string(),
+    }
+}
+
+/// `make(…)` / `store.snapshot(…)` as the resolver should see it. A navigation
+/// whose receiver binding is one plain nominal type is `Type.method`, so a
+/// parameter named `store` does not hide `Store.snapshot`. The value shape
+/// stays when the type is unknown, optional-chained, declared twice in this
+/// file, or the file's own overloads of the method return different types.
+fn initializer_shape(call: Node, source: &str, from: Node, current: &Bindings) -> Option<String> {
+    let shape = call_shape(call, source)?;
+    let Some((receiver, method)) = shape.split_once('.') else {
+        return Some(shape);
+    };
+    if !is_plain_nominal(receiver)
+        || !is_plain_nominal(method)
+        || navigation_is_optional(call, source)
+    {
+        return Some(shape);
+    }
+    let Some(Some(ty)) = lookup_scoped(from, source, receiver, current) else {
+        return Some(shape);
+    };
+    if !is_plain_nominal(&ty) {
+        return Some(shape);
+    }
+    let Some(index) = file_index(from, source) else {
+        return Some(shape);
+    };
+    if index.declared.get(&ty).is_some_and(|all| all.len() > 1) {
+        return Some(shape);
+    }
+    if method_returns_disagree(&index, &ty, method) {
+        return Some(shape);
+    }
+    Some(format!("{ty}.{method}"))
+}
+
+/// `store?.snapshot`: tree-sitter-swift drops the `?`, so the source between
+/// the receiver and the member is what says the call is optional.
+fn navigation_is_optional(call: Node, source: &str) -> bool {
+    let mut cursor = call.walk();
+    let Some(callee) = call
+        .named_children(&mut cursor)
+        .find(|child| child.kind() != "call_suffix")
+    else {
+        return false;
+    };
+    if callee.kind() != "navigation_expression" {
+        return false;
+    }
+    let Some(target) = callee.child_by_field_name("target") else {
+        return true;
+    };
+    let Some(suffix) = callee.child_by_field_name("suffix") else {
+        return true;
+    };
+    let start = target.end_byte();
+    let end = suffix.start_byte();
+    if start > end
+        || end > source.len()
+        || !source.is_char_boundary(start)
+        || !source.is_char_boundary(end)
+    {
+        return true;
+    }
+    source[start..end].contains('?')
+}
+
+/// This file's direct methods of `method` on `ty` do not all write the same
+/// return. No method here is not a disagreement: another file may declare it.
+fn method_returns_disagree(index: &FileIndex, ty: &str, method: &str) -> bool {
+    let mut seen: Option<Option<String>> = None;
+    for ((owner, name), returns) in &index.method_results {
+        if name != method || (owner != ty && short_name(owner) != ty) {
+            continue;
+        }
+        for returned in returns {
+            match &seen {
+                None => seen = Some(returned.clone()),
+                Some(previous) if previous != returned => return true,
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+/// Types for a `let (a, b) = name(…)` whose one file-level function returns a
+/// tuple of the same arity. `None` binds every name untyped: a wrong element
+/// type is worse than no type. Labels on the pattern must match; an unlabelled
+/// pattern binds by position even when the type has labels.
+fn tuple_local_types(
+    call: Node,
+    source: &str,
+    slots: &[(Option<String>, String)],
+    current: &Bindings,
+) -> Option<Vec<Option<String>>> {
+    if call.kind() != "call_expression" || swift_is_subscript_call(call) {
+        return None;
+    }
+    let mut cursor = call.walk();
+    let callee = call
+        .named_children(&mut cursor)
+        .find(|child| child.kind() != "call_suffix")?;
+    if callee.kind() != "simple_identifier" {
+        return None;
+    }
+    let name = get_node_text(callee, source);
+    if name_shadows_function(call, source, &name, current) {
+        return None;
+    }
+    let index = file_index(call, source)?;
+    if index.function_count.get(&name).copied() != Some(1) {
+        return None;
+    }
+    let elements = index.tuple_returns.get(&name)?;
+    if elements.len() != slots.len() {
+        return None;
+    }
+    for (slot, element) in slots.iter().zip(elements.iter()) {
+        if let Some(label) = &slot.0 {
+            if element.0.as_ref() != Some(label) {
+                return None;
+            }
+        }
+    }
+    Some(elements.iter().map(|(_, ty)| Some(ty.clone())).collect())
+}
+
+/// A parameter, an earlier local, or a nested function of `name` is what the
+/// call names, not the file-level function.
+fn name_shadows_function(at: Node, source: &str, name: &str, current: &Bindings) -> bool {
+    if lookup_scoped(at, source, name, current).is_some() {
+        return true;
+    }
+    let mut ancestor = bounded_parent(at);
+    while let Some(scope) = ancestor {
+        if is_scope(scope) {
+            return scope_declares_function(scope, source, name);
+        }
+        ancestor = bounded_parent(scope);
+    }
+    false
+}
+
+/// A nested `func name` anywhere in `scope`. Too large to read is treated as a
+/// shadow: not knowing must not bind the file-level function's types.
+fn scope_declares_function(scope: Node, source: &str, name: &str) -> bool {
+    let mut stack = Vec::new();
+    let mut cursor = scope.walk();
+    stack.extend(scope.named_children(&mut cursor));
+    let mut seen = 0usize;
+    while let Some(node) = stack.pop() {
+        seen += 1;
+        if seen > 20_000 {
+            return true;
+        }
+        if node.kind() == "function_declaration" {
+            if node.child_by_field_name("name").is_some_and(|each| {
+                each.kind() == "simple_identifier" && get_node_text(each, source) == name
+            }) {
+                return true;
+            }
+            continue;
+        }
+        if matches!(
+            node.kind(),
+            "class_declaration" | "lambda_literal" | "init_declaration" | "deinit_declaration"
+        ) {
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    false
 }
 
 /// `make(…)` → `make`; `Factory.make(…)` → `Factory.make`: the shapes the
@@ -3287,5 +3791,221 @@ mod tests {
         reset();
         let found = bound("func outer() { func helper() {} helper() }", "outer");
         assert!(found.contains_key("helper"));
+    }
+
+    fn init_of(found: &Bindings, name: &str) -> Option<String> {
+        found.get(name).and_then(|bound| bound.init.clone())
+    }
+
+    #[test]
+    fn a_parameter_receiver_qualifies_its_method_without_typing_the_local() {
+        let source = "struct Snap { func usage() {} }\n\
+             struct Store { func snapshot(_ p: Int) -> Snap { Snap() } }\n\
+             func t(_ store: Store) { let s = store.snapshot(1) }";
+        let found = bound(source, "t");
+        assert_eq!(init_of(&found, "s").as_deref(), Some("Store.snapshot"));
+        assert_eq!(
+            ty_of(&found, "s"),
+            None,
+            "a call with arguments stays untyped"
+        );
+        // The method lives in another file's worth of text: this file does not
+        // declare Store, and the shape is still the type's.
+        let elsewhere = "func t(_ store: Store) { let s = store.snapshot(1) }";
+        let found = bound(elsewhere, "t");
+        assert_eq!(init_of(&found, "s").as_deref(), Some("Store.snapshot"));
+        assert_eq!(ty_of(&found, "s"), None);
+        // Two overloads that return the same type may qualify. They are not a
+        // wrong type; the resolver abstains when the corpus lists both.
+        let same = "struct Snap {}\nstruct Store {\n\
+             func snapshot() -> Snap { Snap() }\n\
+             func snapshot(_ p: Int) -> Snap { Snap() } }\n\
+             func t(_ store: Store) { let s = store.snapshot(1) }";
+        assert_eq!(
+            init_of(&bound(same, "t"), "s").as_deref(),
+            Some("Store.snapshot")
+        );
+        // A bare parameterized call is not that return, and not a qualified shape.
+        let bare = "struct Snap {}\nfunc snapshot(_ p: Int) -> Snap { Snap() }\n\
+             func t() { let s = snapshot(1) }";
+        let found = bound(bare, "t");
+        assert_eq!(ty_of(&found, "s"), None);
+        assert_eq!(init_of(&found, "s").as_deref(), Some("snapshot"));
+    }
+
+    #[test]
+    fn a_qualified_initializer_abstains_when_it_would_name_the_wrong_method() {
+        let overloaded = "struct Snap {}\nstruct Other {}\nstruct Store {\n\
+             func snapshot() -> Snap { Snap() }\n\
+             func snapshot(_ p: Int) -> Other { Other() } }\n\
+             func t(_ store: Store) { let s = store.snapshot(1) }";
+        let found = bound(overloaded, "t");
+        assert_eq!(init_of(&found, "s").as_deref(), Some("store.snapshot"));
+        assert_eq!(ty_of(&found, "s"), None);
+        let shadow =
+            "struct Snap {}\nstruct Store { func snapshot(_ p: Int) -> Snap { Snap() } }\n\
+             func t(_ store: Store) { let store = 1; let s = store.snapshot(1) }";
+        let found = bound(shadow, "t");
+        assert_eq!(init_of(&found, "s").as_deref(), Some("store.snapshot"));
+        assert_ne!(init_of(&found, "s").as_deref(), Some("Store.snapshot"));
+        let optional = "struct Snap {}\n\
+             func t(_ store: Store?) { let s = store?.snapshot(1) }";
+        let found = bound(optional, "t");
+        assert_eq!(init_of(&found, "s").as_deref(), Some("store.snapshot"));
+        assert_eq!(ty_of(&found, "s"), None);
+        let twice = "struct Snap {}\nstruct Store { func snapshot(_ p: Int) -> Snap { Snap() } }\n\
+             struct Store { func snapshot(_ p: Int) -> Snap { Snap() } }\n\
+             func t(_ store: Store) { let s = store.snapshot(1) }";
+        let found = bound(twice, "t");
+        assert_eq!(init_of(&found, "s").as_deref(), Some("store.snapshot"));
+        let unknown = "func t() { let s = store.snapshot(1) }";
+        assert_eq!(
+            init_of(&bound(unknown, "t"), "s").as_deref(),
+            Some("store.snapshot")
+        );
+    }
+
+    #[test]
+    fn a_tuple_destructure_is_typed_by_the_one_file_level_function() {
+        let source = "struct Store { func keep() {} }\nstruct Svc { func stash() {} }\n\
+             func makePair() -> (Store, Svc) { (Store(), Svc()) }\n\
+             func t() { let (store, svc) = makePair() }";
+        let found = bound(source, "t");
+        assert_eq!(ty_of(&found, "store").as_deref(), Some("Store"));
+        assert_eq!(ty_of(&found, "svc").as_deref(), Some("Svc"));
+        // Labels on the type do not stop an unlabelled pattern.
+        let labelled = "struct Store {}\nstruct Svc {}\n\
+             func makePair() -> (store: Store, svc: Svc) { (Store(), Svc()) }\n\
+             func t() { let (store, svc) = makePair() }";
+        let found = bound(labelled, "t");
+        assert_eq!(ty_of(&found, "store").as_deref(), Some("Store"));
+        assert_eq!(ty_of(&found, "svc").as_deref(), Some("Svc"));
+        // `_` keeps the later name on its own element.
+        let skipped = "struct Store {}\nstruct Svc {}\n\
+             func makePair() -> (Store, Svc) { (Store(), Svc()) }\n\
+             func t() { let (_, svc) = makePair() }";
+        let found = bound(skipped, "t");
+        assert!(!found.contains_key("_"));
+        assert_eq!(ty_of(&found, "svc").as_deref(), Some("Svc"));
+        // A matching label binds, and the whole call stays out of `returns`:
+        // one name initialised from it is not a nominal type.
+        let matched = "struct Store {}\nstruct Svc {}\n\
+             func makePair() -> (store: Store, svc: Svc) { (Store(), Svc()) }\n\
+             func t() { let (store: store, svc: svc) = makePair(); let whole = makePair() }";
+        let found = bound(matched, "t");
+        assert_eq!(ty_of(&found, "store").as_deref(), Some("Store"));
+        assert_eq!(ty_of(&found, "svc").as_deref(), Some("Svc"));
+        assert_eq!(ty_of(&found, "whole"), None);
+    }
+
+    #[test]
+    fn a_tuple_destructure_abstains_instead_of_binding_a_wrong_element() {
+        let disagree = "struct Store {}\nstruct Svc {}\n\
+             func makePair() -> (store: Store, svc: Svc) { (Store(), Svc()) }\n\
+             func t() { let (svc: store, store: svc) = makePair() }";
+        let found = bound(disagree, "t");
+        assert!(found.contains_key("store"));
+        assert_eq!(ty_of(&found, "store"), None);
+        assert_eq!(ty_of(&found, "svc"), None);
+        let arity = "struct Store {}\nstruct Svc {}\n\
+             func makePair() -> (Store, Svc) { (Store(), Svc()) }\n\
+             func t() { let (store, svc, extra) = makePair() }";
+        let found = bound(arity, "t");
+        assert_eq!(ty_of(&found, "store"), None);
+        assert_eq!(ty_of(&found, "svc"), None);
+        assert_eq!(ty_of(&found, "extra"), None);
+        let optional = "struct Store {}\nstruct Svc {}\n\
+             func makePair() -> (Store?, Svc) { (nil, Svc()) }\n\
+             func t() { let (store, svc) = makePair() }";
+        let found = bound(optional, "t");
+        assert_eq!(ty_of(&found, "store"), None);
+        assert_eq!(ty_of(&found, "svc"), None);
+        let overloads = "struct Store {}\nstruct Svc {}\n\
+             func makePair() -> (Store, Svc) { (Store(), Svc()) }\n\
+             func makePair(_ n: Int) -> (Svc, Store) { (Svc(), Store()) }\n\
+             func t() { let (store, svc) = makePair() }";
+        let found = bound(overloads, "t");
+        assert_eq!(ty_of(&found, "store"), None);
+        assert_eq!(ty_of(&found, "svc"), None);
+        let shadow = "struct Store {}\nstruct Svc {}\n\
+             func makePair() -> (Store, Svc) { (Store(), Svc()) }\n\
+             func t(_ makePair: Int) { let (store, svc) = makePair() }";
+        let found = bound(shadow, "t");
+        assert_eq!(ty_of(&found, "store"), None);
+        assert_eq!(ty_of(&found, "svc"), None);
+        let nested = "struct Store {}\nstruct Svc {}\n\
+             func makePair() -> (Store, Svc) { (Store(), Svc()) }\n\
+             func t() { func makePair() -> (Svc, Store) { (Svc(), Store()) }\n\
+             let (store, svc) = makePair() }";
+        let found = bound(nested, "t");
+        assert_eq!(ty_of(&found, "store"), None);
+        assert_eq!(ty_of(&found, "svc"), None);
+    }
+
+    #[test]
+    fn a_property_wrapper_states_only_its_own_stored_wrapped_value() {
+        let source = "@propertyWrapper struct Env { var wrappedValue: Client }\n\
+             struct R { @Env(Client.self) private var client\n\
+             func t() { let c = client } }";
+        assert_eq!(ty_of(&bound(source, "t"), "c").as_deref(), Some("Client"));
+        with_property(source, "client", |client| {
+            assert_eq!(
+                property_wrapper_wrapped_type(client, source).as_deref(),
+                Some("Client")
+            );
+        });
+        let environment = "struct R { @Environment(\\.modelContext) private var context }";
+        with_property(environment, "context", |context| {
+            assert_eq!(property_wrapper_wrapped_type(context, environment), None);
+        });
+        let two = "@propertyWrapper struct Env { var wrappedValue: Client }\n\
+             @propertyWrapper struct Env { var wrappedValue: Other }\n\
+             struct R { @Env(Client.self) private var client }";
+        with_property(two, "client", |client| {
+            assert_eq!(property_wrapper_wrapped_type(client, two), None);
+        });
+        let cases = [
+            "struct Env { var wrappedValue: Client }\nstruct R { @Env(Client.self) var client }",
+            "@propertyWrapper struct Env { var wrappedValue: Client\n var wrappedValue: Other }\nstruct R { @Env(Client.self) var client }",
+            "@propertyWrapper struct Env { var wrappedValue: Client? }\nstruct R { @Env(Client.self) var client }",
+            "@propertyWrapper struct Env { var wrappedValue: [Client] }\nstruct R { @Env(Client.self) var client }",
+            "@propertyWrapper struct Env { var wrappedValue: (Client, Client) }\nstruct R { @Env(Client.self) var client }",
+            "@propertyWrapper struct Env { var wrappedValue: Client { Client() } }\nstruct R { @Env(Client.self) var client }",
+            "typealias Client = Other\n@propertyWrapper struct Env { var wrappedValue: Client }\nstruct R { @Env(Client.self) var client }",
+            "@propertyWrapper struct Env<T> { var wrappedValue: T }\nstruct R { @Env(Client.self) var client }",
+            "@propertyWrapper struct Env { var wrappedValue: Client }\nstruct R { @Env(Client.self) @Other var client }",
+            "@propertyWrapper struct Env { }\nstruct R { @Env(Client.self) var client }",
+        ];
+        for source in cases {
+            with_property(source, "client", |client| {
+                assert_eq!(
+                    property_wrapper_wrapped_type(client, source),
+                    None,
+                    "{source}"
+                );
+            });
+        }
+    }
+
+    fn with_property(source: &str, name: &str, check: impl Fn(tree_sitter::Node)) {
+        reset();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_swift::LANGUAGE.into())
+            .expect("swift grammar");
+        let tree = parser.parse(source, None).expect("parse");
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "property_declaration" {
+                let text = get_node_text(node, source);
+                if text.contains(&format!("var {name}")) || text.contains(&format!("let {name}")) {
+                    check(node);
+                    return;
+                }
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        panic!("no property {name} in {source}");
     }
 }
