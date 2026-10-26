@@ -144,9 +144,10 @@ mod every_test_file_is_a_module {
         let declared: BTreeSet<String> = include_str!("it.rs")
             .lines()
             .filter_map(|line| line.trim().strip_prefix("mod ")?.strip_suffix(';'))
-            // `common` is the shared helper module, a directory
-            // (tests/common/mod.rs) and not a test file.
-            .filter(|name| *name != "common")
+            // `common` and `support_ignored` are shared helper directories
+            // (tests/<name>/mod.rs), loaded once for the binary. They are not
+            // tests/*.rs files, so they are not part of the on-disk set.
+            .filter(|name| !matches!(*name, "common" | "support_ignored"))
             .map(str::to_string)
             .collect();
         let isolated: BTreeSet<String> = super::ISOLATED
