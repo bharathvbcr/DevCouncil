@@ -15,13 +15,19 @@
 //!   included. Row ids are assigned by insertion order, so identical tables are
 //!   the proof that the insert order did not move.
 
-use super::write::{serialize_payload, PayloadJson, PayloadTuning};
+use super::write::{
+    estimated_payload_bytes, plan_chunks, serialize_payload, PayloadJson, PayloadTuning,
+};
 use super::*;
 use devmap_analyze::analyze;
 use devmap_extract::extract_file;
 use devmap_extract::model::Extraction;
 use devmap_resolve::Resolver;
+use rayon::prelude::*;
 use rusqlite::params;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
 /// One generation's input: the extractions to write and what is declared
 /// about them.
@@ -338,7 +344,7 @@ fn pool(threads: usize) -> rayon::ThreadPool {
         .expect("thread pool")
 }
 
-fn write_step_tuned(store: &Store, step: &Step, tuning: &PayloadTuning<'_>) -> Result<u32> {
+fn write_step_tuned(store: &Store, step: &Step, tuning: &PayloadTuning) -> Result<u32> {
     let (resolution, analysis) = resolve_and_analyze(&step.extractions);
     store
         .save_generation_tuned(
@@ -352,15 +358,15 @@ fn write_step_tuned(store: &Store, step: &Step, tuning: &PayloadTuning<'_>) -> R
         .map(|(generation, _)| generation)
 }
 
-fn tuned<'pool>(chunk: usize, pool: &'pool rayon::ThreadPool) -> PayloadTuning<'pool> {
+fn tuned(chunk: usize, threads: usize) -> PayloadTuning {
     PayloadTuning {
         chunk,
-        pool: Some(pool),
-        serialize: serialize_payload,
+        threads,
+        ..PayloadTuning::default()
     }
 }
 
-fn dump_after(steps: &[Step], tuning: &PayloadTuning<'_>) -> Vec<(String, Vec<String>)> {
+fn dump_after(steps: &[Step], tuning: &PayloadTuning) -> Vec<(String, Vec<String>)> {
     let store = Store::open_in_memory().expect("store");
     for step in steps {
         write_step_tuned(&store, step, tuning).expect("write");
@@ -386,11 +392,7 @@ fn empty_scenario() -> Vec<Step> {
 /// and a chunk plus one, for chunks of 4 and for the production chunk of 64.
 #[test]
 fn the_tables_do_not_depend_on_thread_count_or_chunk_size() {
-    let serial_pool = pool(1);
-    let serial = tuned(1, &serial_pool);
-    let wide_pool = pool(8);
-    let two_pool = pool(2);
-
+    let serial = tuned(1, 1);
     let production = PayloadTuning::default().chunk;
     let mut cases: Vec<(String, Vec<Step>)> = vec![("empty".to_string(), empty_scenario())];
     for fresh in [1, 3, 4, 5, 8, 9, production, production + 1] {
@@ -400,19 +402,18 @@ fn the_tables_do_not_depend_on_thread_count_or_chunk_size() {
 
     for (label, steps) in &cases {
         let want = dump_after(steps, &serial);
-        for (chunk, pool) in [
-            (1, &wide_pool),
-            (2, &two_pool),
-            (4, &wide_pool),
-            (4, &serial_pool),
-            (production, &wide_pool),
-            (usize::MAX, &wide_pool),
+        for (chunk, threads) in [
+            (1, 8),
+            (2, 2),
+            (4, 8),
+            (4, 1),
+            (production, 8),
+            (usize::MAX, 8),
         ] {
             assert_eq!(
-                dump_after(steps, &tuned(chunk, pool)),
+                dump_after(steps, &tuned(chunk, threads)),
                 want,
-                "{label}: chunk {chunk} on {} threads wrote different rows than the serial loop",
-                pool.current_num_threads()
+                "{label}: chunk {chunk} on {threads} threads wrote different rows than the serial loop"
             );
         }
         assert_eq!(
@@ -468,20 +469,12 @@ fn nothing_was_written(store: &Store) {
 #[test]
 fn a_serialization_failure_names_the_first_failing_extraction_and_rolls_back() {
     let steps = scenario(8);
-    let serial_pool = pool(1);
-    let wide_pool = pool(8);
     let mut seen = Vec::new();
-    for (chunk, pool) in [
-        (1, &serial_pool),
-        (2, &wide_pool),
-        (4, &wide_pool),
-        (usize::MAX, &wide_pool),
-        (usize::MAX, &serial_pool),
-    ] {
+    for (chunk, threads) in [(1, 1), (2, 8), (4, 8), (usize::MAX, 8), (usize::MAX, 1)] {
         let store = Store::open_in_memory().expect("store");
         let tuning = PayloadTuning {
             serialize: fails_on_mod_3_and_mod_5,
-            ..tuned(chunk, pool)
+            ..tuned(chunk, threads)
         };
         let error = write_step_tuned(&store, &steps[0], &tuning)
             .expect_err("a failing serializer must fail the write")
@@ -496,7 +489,7 @@ fn a_serialization_failure_names_the_first_failing_extraction_and_rolls_back() {
         );
         nothing_was_written(&store);
         // The store is usable after the failed write.
-        write_step_tuned(&store, &steps[0], &tuned(chunk, pool))
+        write_step_tuned(&store, &steps[0], &tuned(chunk, threads))
             .expect("a good write after a failed one");
         seen.push(error);
     }
@@ -512,12 +505,11 @@ fn a_serialization_failure_names_the_first_failing_extraction_and_rolls_back() {
 #[test]
 fn a_panic_in_the_serializer_is_a_failed_write_not_a_poisoned_store() {
     let steps = scenario(8);
-    let wide_pool = pool(8);
     for chunk in [1, 4, usize::MAX] {
         let store = Store::open_in_memory().expect("store");
         let tuning = PayloadTuning {
             serialize: panics_on_mod_2_and_mod_4,
-            ..tuned(chunk, &wide_pool)
+            ..tuned(chunk, 8)
         };
         let error = write_step_tuned(&store, &steps[0], &tuning)
             .expect_err("a panicking serializer must fail the write")
@@ -527,7 +519,7 @@ fn a_panic_in_the_serializer_is_a_failed_write_not_a_poisoned_store() {
             "chunk {chunk}: the first panicking extraction is named with its reason: {error}"
         );
         nothing_was_written(&store);
-        write_step_tuned(&store, &steps[0], &tuned(chunk, &wide_pool))
+        write_step_tuned(&store, &steps[0], &tuned(chunk, 8))
             .expect("the store is not poisoned by the caught panic");
         assert_eq!(payload_order(&store).len(), 9);
     }
@@ -540,7 +532,6 @@ fn a_panic_in_the_serializer_is_a_failed_write_not_a_poisoned_store() {
 #[test]
 fn an_earlier_insert_failure_is_not_pre_empted_by_a_later_serialization_failure() {
     let steps = scenario(8);
-    let wide_pool = pool(8);
     let mut seen = Vec::new();
     for chunk in [1, 4, usize::MAX] {
         let store = Store::open_in_memory().expect("store");
@@ -554,7 +545,7 @@ fn an_earlier_insert_failure_is_not_pre_empted_by_a_later_serialization_failure(
             .unwrap();
         let tuning = PayloadTuning {
             serialize: fails_on_mod_3_and_mod_5,
-            ..tuned(chunk, &wide_pool)
+            ..tuned(chunk, 8)
         };
         let error = write_step_tuned(&store, &steps[0], &tuning)
             .expect_err("both failures are armed")
@@ -574,10 +565,585 @@ fn an_earlier_insert_failure_is_not_pre_empted_by_a_later_serialization_failure(
 fn a_zero_chunk_is_refused_not_a_panic() {
     let store = Store::open_in_memory().expect("store");
     let steps = scenario(3);
-    let one = pool(1);
-    let error = write_step_tuned(&store, &steps[0], &tuned(0, &one))
+    let error = write_step_tuned(&store, &steps[0], &tuned(0, 1))
         .expect_err("a zero chunk")
         .to_string();
     assert!(error.contains("at least one extraction"), "{error}");
     nothing_was_written(&store);
+    let error = write_step_tuned(&store, &steps[0], &tuned(4, 0))
+        .expect_err("no thread to serialize on")
+        .to_string();
+    assert!(error.contains("at least one thread"), "{error}");
+    nothing_was_written(&store);
+}
+
+// --- Deadlock: the write holds the connection mutex while it waits ---------
+
+/// Runs `work` on its own thread and fails, rather than hangs, when it has not
+/// returned within `limit`. A timed-out thread is leaked on purpose: it is the
+/// deadlock. The only clock in these tests; every assertion is on an outcome.
+fn bounded<T: Send + 'static>(
+    what: &str,
+    limit: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(work());
+    });
+    match receiver.recv_timeout(limit) {
+        Ok(value) => value,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            panic!("DEADLOCK: {what} did not return within {limit:?}")
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("{what}: the worker thread died without a result")
+        }
+    }
+}
+
+/// The write holds the store's connection mutex while it waits for its chunk.
+/// If the chunk were serialized on a rayon pool, a job already running on that
+/// pool that wants the same mutex -- the extraction pass's cache lookups are
+/// exactly that, on rayon's global pool -- would block behind a holder that is
+/// waiting for the pool, and nothing could make progress.
+///
+/// Built deterministically on a rayon pool of two: two blockers occupy both
+/// workers and wait for a flag; the flag is raised only once the writer is seen
+/// holding the mutex; then the blockers go for the mutex. The write must finish
+/// anyway, because it does not use that pool.
+#[test]
+fn a_pool_job_that_needs_the_store_mutex_cannot_deadlock_the_write_that_holds_it() {
+    assert_eq!(pool_blocked_write(true), Ok(1));
+}
+
+/// Control for the scaffolding above: the same blockers and the same pool, but
+/// they never ask for the mutex, so a hang above comes from the mutex and not
+/// from the construction.
+#[test]
+fn the_same_scaffolding_without_the_mutex_completes() {
+    assert_eq!(pool_blocked_write(false), Ok(1));
+}
+
+fn pool_blocked_write(blockers_take_mutex: bool) -> std::result::Result<u32, String> {
+    let store = Arc::new(Store::open_in_memory().expect("store"));
+    let steps = scenario(7);
+    let extractions = Arc::new(steps.into_iter().next().expect("a cold step").extractions);
+    let (resolution, analysis) = resolve_and_analyze(&extractions);
+    let the_pool = Arc::new(pool(2));
+    let go = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(AtomicUsize::new(0));
+    for _ in 0..2 {
+        let (store, go, started) = (Arc::clone(&store), Arc::clone(&go), Arc::clone(&started));
+        the_pool.spawn(move || {
+            started.fetch_add(1, Ordering::SeqCst);
+            while !go.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if blockers_take_mutex {
+                let _guard = lock_conn(&store.conn);
+            }
+        });
+    }
+    while started.load(Ordering::SeqCst) < 2 {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    {
+        let (store, go) = (Arc::clone(&store), Arc::clone(&go));
+        std::thread::spawn(move || {
+            // Raised only once somebody holds the mutex, which can only be the
+            // writer: both pool workers are still spinning on the flag.
+            loop {
+                match store.conn.try_lock() {
+                    Err(std::sync::TryLockError::WouldBlock) => break,
+                    _ => std::thread::sleep(Duration::from_millis(1)),
+                }
+            }
+            go.store(true, Ordering::SeqCst);
+        });
+    }
+    let writer_store = Arc::clone(&store);
+    bounded(
+        "a generation write whose rayon pool is busy waiting for the store mutex",
+        Duration::from_secs(20),
+        move || {
+            let outcome = writer_store
+                .save_generation_tuned(
+                    &extractions,
+                    &resolution,
+                    &analysis,
+                    GenerationWriteOpts::default(),
+                    "unknown",
+                    &tuned(4, 4),
+                )
+                .map(|(generation, _)| generation)
+                .map_err(|error| error.to_string());
+            drop(the_pool);
+            outcome
+        },
+    )
+}
+
+/// The same hazard without a second thread: the write is issued from inside a
+/// rayon worker. The sibling writes queued on that pool are jobs that want the
+/// same mutex; a write that waited for its chunk by stealing work would run one
+/// of them on top of its own stack and block on a mutex it already holds.
+#[test]
+fn writes_issued_from_rayon_workers_do_not_steal_each_other_and_self_deadlock() {
+    fn slow(extraction: &Extraction) -> Result<PayloadJson> {
+        std::thread::sleep(Duration::from_millis(3));
+        serialize_payload(extraction)
+    }
+    let store = Arc::new(Store::open_in_memory().expect("store"));
+    let steps = scenario(7);
+    let extractions = Arc::new(steps.into_iter().next().expect("a cold step").extractions);
+    let (resolution, analysis) = resolve_and_analyze(&extractions);
+    let resolution = Arc::new(resolution);
+    let analysis = Arc::new(analysis);
+    let finished = bounded(
+        "sibling store writes issued from rayon workers",
+        Duration::from_secs(60),
+        move || {
+            let writes = AtomicUsize::new(0);
+            pool(2).install(|| {
+                (0..16usize).into_par_iter().for_each(|_| {
+                    store
+                        .save_generation_tuned(
+                            &extractions,
+                            &resolution,
+                            &analysis,
+                            GenerationWriteOpts::default(),
+                            "unknown",
+                            &PayloadTuning {
+                                serialize: slow,
+                                ..tuned(2, 4)
+                            },
+                        )
+                        .expect("write");
+                    writes.fetch_add(1, Ordering::SeqCst);
+                });
+            });
+            writes.load(Ordering::SeqCst)
+        },
+    );
+    assert_eq!(finished, 16);
+}
+
+static MOD_1_RUNNING: AtomicBool = AtomicBool::new(false);
+static MOD_1_RELEASE: AtomicBool = AtomicBool::new(false);
+
+/// `mod_1` holds its thread until released (or for a second), and says so;
+/// `mod_0` waits for it, so the two are in flight on two threads at once.
+fn holds_mod_1(extraction: &Extraction) -> Result<PayloadJson> {
+    if extraction.file_path.ends_with("/mod_0.py") {
+        let waited = std::time::Instant::now();
+        while !MOD_1_RUNNING.load(Ordering::SeqCst) && waited.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    if extraction.file_path.ends_with("/mod_1.py") {
+        MOD_1_RUNNING.store(true, Ordering::SeqCst);
+        let waited = std::time::Instant::now();
+        while !MOD_1_RELEASE.load(Ordering::SeqCst) && waited.elapsed() < Duration::from_secs(1) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    serialize_payload(extraction)
+}
+
+/// Deterministic form of the above. The write runs on a rayon worker, with two
+/// of its extractions in flight and an unrelated job queued on the same pool
+/// that only wants the store mutex, which the write is holding. A write whose
+/// waiting thread stole work would run that job on top of its own stack and
+/// never get the lock. Here the pool's other worker runs it, and it waits its
+/// turn behind the write.
+#[test]
+fn a_write_on_a_pool_worker_runs_no_queued_work_on_top_of_its_held_mutex() {
+    assert_eq!(
+        queued_job_beside_a_pool_worker_write(false),
+        Ok(1),
+        "control"
+    );
+    assert_eq!(queued_job_beside_a_pool_worker_write(true), Ok(1));
+}
+
+fn queued_job_beside_a_pool_worker_write(
+    queued_job_takes_the_mutex: bool,
+) -> std::result::Result<u32, String> {
+    MOD_1_RUNNING.store(false, Ordering::SeqCst);
+    MOD_1_RELEASE.store(false, Ordering::SeqCst);
+    let store = Arc::new(Store::open_in_memory().expect("store"));
+    let two = Arc::new(extract_all(&[
+        (
+            "pkg/mod_0.py".to_string(),
+            "def a():\n    return 0\n".to_string(),
+        ),
+        (
+            "pkg/mod_1.py".to_string(),
+            "def b():\n    return 1\n".to_string(),
+        ),
+    ]));
+    let (resolution, analysis) = resolve_and_analyze(&two);
+    let the_pool = Arc::new(pool(2));
+    {
+        let (store, the_pool) = (Arc::clone(&store), Arc::clone(&the_pool));
+        std::thread::spawn(move || {
+            while !MOD_1_RUNNING.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // Queued from outside the pool, so it lands in the injector.
+            the_pool.spawn(move || {
+                if queued_job_takes_the_mutex {
+                    let _guard = lock_conn(&store.conn);
+                }
+                MOD_1_RELEASE.store(true, Ordering::SeqCst);
+            });
+        });
+    }
+    let (writer_store, writer_pool) = (Arc::clone(&store), Arc::clone(&the_pool));
+    bounded(
+        &format!(
+            "a write issued on a pool worker beside a queued job (that takes the mutex: {queued_job_takes_the_mutex})"
+        ),
+        Duration::from_secs(20),
+        move || {
+            writer_pool.install(|| {
+                writer_store
+                    .save_generation_tuned(
+                        &two,
+                        &resolution,
+                        &analysis,
+                        GenerationWriteOpts::default(),
+                        "unknown",
+                        &PayloadTuning {
+                            serialize: holds_mod_1,
+                            ..tuned(2, 2)
+                        },
+                    )
+                    .map(|(generation, _)| generation)
+                    .map_err(|error| error.to_string())
+            })
+        },
+    )
+}
+
+// --- Threads: once per write, never the inserting thread -------------------
+
+static SEEN: Mutex<Vec<(String, std::thread::ThreadId)>> = Mutex::new(Vec::new());
+
+fn records_its_thread(extraction: &Extraction) -> Result<PayloadJson> {
+    SEEN.lock()
+        .unwrap()
+        .push((extraction.file_path.clone(), std::thread::current().id()));
+    serialize_payload(extraction)
+}
+
+fn threads_that_serialized(paths: &[String]) -> std::collections::BTreeSet<String> {
+    SEEN.lock()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| paths.contains(path))
+        .map(|(_, thread)| format!("{thread:?}"))
+        .collect()
+}
+
+/// A write starts its serializer threads once, not once per chunk, and the
+/// thread that inserts never serializes while they exist. Nine fresh
+/// extractions in chunks of two are five chunks: a thread per chunk would show
+/// up as up to twenty distinct serializing threads, not four.
+#[test]
+fn a_write_starts_its_serializer_threads_once_and_the_inserting_thread_runs_none_of_them() {
+    let me = format!("{:?}", std::thread::current().id());
+    let tuning = PayloadTuning {
+        serialize: records_its_thread,
+        ..tuned(2, 4)
+    };
+
+    let steps = scenario(8);
+    let nine: Vec<String> = steps[0]
+        .extractions
+        .iter()
+        .map(|extraction| extraction.file_path.clone())
+        .collect();
+    assert_eq!(nine.len(), 9);
+    let store = Store::open_in_memory().expect("store");
+    write_step_tuned(&store, &steps[0], &tuning).expect("write");
+    let used = threads_that_serialized(&nine);
+    assert!(
+        !used.is_empty() && used.len() <= 4,
+        "five chunks on four threads started {} serializing threads: {used:?}",
+        used.len()
+    );
+    assert!(!used.contains(&me), "the inserting thread serialized");
+
+    // One thread asked for: no thread started, the writer serializes inline.
+    let inline_steps = scenario(5);
+    let inline_paths: Vec<String> = inline_steps[0]
+        .extractions
+        .iter()
+        .map(|extraction| extraction.file_path.clone())
+        .collect();
+    SEEN.lock().unwrap().clear();
+    let store = Store::open_in_memory().expect("store");
+    let one_thread = PayloadTuning {
+        serialize: records_its_thread,
+        ..tuned(2, 1)
+    };
+    write_step_tuned(&store, &inline_steps[0], &one_thread).expect("write");
+    assert_eq!(
+        threads_that_serialized(&inline_paths),
+        std::collections::BTreeSet::from([me.clone()]),
+        "one thread means the writing thread"
+    );
+
+    // One extraction and many threads asked for: nothing to spread, so no
+    // thread is started for it either -- the shape of a one-file edit.
+    let single = vec![inline_steps[0].extractions[0].clone()];
+    let single_paths = vec![single[0].file_path.clone()];
+    SEEN.lock().unwrap().clear();
+    let store = Store::open_in_memory().expect("store");
+    let many = PayloadTuning {
+        serialize: records_its_thread,
+        ..tuned(64, 16)
+    };
+    let step = Step {
+        extractions: single,
+        opts: GenerationWriteOpts::default(),
+    };
+    write_step_tuned(&store, &step, &many).expect("write");
+    assert_eq!(
+        threads_that_serialized(&single_paths),
+        std::collections::BTreeSet::from([me]),
+        "a lone extraction is serialized inline"
+    );
+}
+
+// --- Panic payloads --------------------------------------------------------
+
+/// A panic payload whose own `Drop` panics. The catch is `catch_unwind` around
+/// the serializer only; a payload dropped afterwards, outside it, would unwind
+/// through the held connection guard.
+struct DropBomb;
+impl Drop for DropBomb {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            panic!("the payload's drop panicked");
+        }
+    }
+}
+
+fn panics_with_a_drop_bomb(extraction: &Extraction) -> Result<PayloadJson> {
+    if extraction.file_path.ends_with("/mod_2.py") {
+        std::panic::panic_any(DropBomb);
+    }
+    serialize_payload(extraction)
+}
+
+fn write_with_a_drop_bomb(
+    store: &Store,
+    threads: usize,
+) -> std::thread::Result<std::result::Result<u32, String>> {
+    let steps = scenario(5);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        write_step_tuned(
+            store,
+            &steps[0],
+            &PayloadTuning {
+                serialize: panics_with_a_drop_bomb,
+                ..tuned(2, threads)
+            },
+        )
+        .map_err(|error| error.to_string())
+    }))
+}
+
+/// "A panic in the serializer is a refusal naming the file" holds for a payload
+/// whose drop panics too, on a worker thread and inline.
+#[test]
+fn a_panic_payload_that_panics_on_drop_is_still_a_refusal() {
+    for threads in [1, 4] {
+        let store = Store::open_in_memory().unwrap();
+        let outcome = write_with_a_drop_bomb(&store, threads);
+        let refusal = outcome.expect("the write unwound instead of returning a refusal");
+        assert!(
+            refusal.is_err_and(|text| text.contains("pkg/mod_2.py")),
+            "{threads} threads: a refusal naming the file"
+        );
+    }
+}
+
+/// The consequence the catch exists to prevent: the unwind crosses the held
+/// connection guard and poisons the store for every later write.
+#[test]
+fn a_panic_payload_that_panics_on_drop_does_not_poison_the_store() {
+    for threads in [1, 4] {
+        let store = Store::open_in_memory().unwrap();
+        let _ = write_with_a_drop_bomb(&store, threads);
+        let steps = scenario(5);
+        let second = write_step_tuned(&store, &steps[0], &tuned(2, threads));
+        assert_eq!(
+            second.map_err(|error| error.to_string()),
+            Ok(1),
+            "{threads} threads: the store must still accept a write"
+        );
+    }
+}
+
+// --- The byte budget -------------------------------------------------------
+
+/// A Python source of roughly `bytes` bytes, dense in literals, symbols and
+/// references: the shape that makes the largest payloads.
+fn dense_source(bytes: usize) -> String {
+    let mut source = String::new();
+    let mut index = 0usize;
+    while source.len() < bytes {
+        source.push_str(&format!(
+            "CONST_{index:06} = 'literal value number {index}'\n"
+        ));
+        if index & 3 == 0 {
+            source.push_str(&format!(
+                "def fn_{index}(a):\n    return CONST_{index:06} + helper_{index}(a)\n"
+            ));
+        }
+        index += 1;
+    }
+    source
+}
+
+fn json_bytes(extraction: &Extraction) -> usize {
+    let (parse, engine, body) = expected_documents(extraction);
+    parse.len() + engine.len() + body.len()
+}
+
+/// The estimate the chunk budget is cut by is a ceiling on what the documents
+/// actually come to, for the dense shape that makes the largest payloads, and
+/// for a small file. A chunk bounded by the estimate is then bounded in bytes.
+#[test]
+fn the_json_estimate_is_a_ceiling_on_what_the_documents_come_to() {
+    let dense = extract_file("heavy/h.py", &dense_source(150_000));
+    let small = extract_file("tiny/t.py", "x = 1\n");
+    for extraction in [&dense, &small] {
+        let actual = json_bytes(extraction);
+        let estimate = estimated_payload_bytes(extraction);
+        assert!(
+            estimate >= actual,
+            "{}: the estimate {estimate} is below the {actual} bytes of JSON",
+            extraction.file_path
+        );
+    }
+}
+
+/// Chunks are cut by the byte budget as well as the count, cover the input
+/// exactly and in order, and always hold at least one extraction.
+#[test]
+fn chunks_are_cut_by_the_byte_budget_as_well_as_the_count() {
+    let heavy: Vec<Extraction> = (0..6)
+        .map(|index| extract_file(&format!("heavy/h_{index}.py"), &dense_source(20_000)))
+        .collect();
+    let weight = estimated_payload_bytes(&heavy[0]);
+    let refs: Vec<&Extraction> = heavy.iter().collect();
+    let lengths =
+        |chunks: &[&[&Extraction]]| chunks.iter().map(|chunk| chunk.len()).collect::<Vec<_>>();
+    let order = |chunks: &[&[&Extraction]]| {
+        chunks
+            .iter()
+            .flat_map(|chunk| chunk.iter().map(|extraction| extraction.file_path.clone()))
+            .collect::<Vec<_>>()
+    };
+    let want_order: Vec<String> = heavy.iter().map(|e| e.file_path.clone()).collect();
+
+    // The count alone: a budget nothing reaches.
+    let by_count = plan_chunks(&refs, 4, usize::MAX);
+    assert_eq!(lengths(&by_count), vec![4, 2]);
+
+    // The budget alone: two members fit, a third would pass it.
+    let budget = 2 * weight + weight / 2;
+    let by_bytes = plan_chunks(&refs, usize::MAX, budget);
+    assert_eq!(lengths(&by_bytes), vec![2, 2, 2]);
+
+    // Both: whichever binds first.
+    let both = plan_chunks(&refs, 1, budget);
+    assert_eq!(lengths(&both), vec![1; 6]);
+
+    // A budget below one extraction still makes progress, one at a time.
+    let tiny = plan_chunks(&refs, usize::MAX, 0);
+    assert_eq!(lengths(&tiny), vec![1; 6]);
+
+    // One extraction over the budget is alone, and the others keep their place.
+    let mixed = vec![&heavy[0], &heavy[1], &heavy[2]];
+    let small = extract_file("tiny/t.py", "x = 1\n");
+    let mut with_small: Vec<&Extraction> = mixed;
+    with_small.insert(1, &small);
+    let cut = plan_chunks(
+        &with_small,
+        usize::MAX,
+        weight + estimated_payload_bytes(&small),
+    );
+    assert_eq!(lengths(&cut), vec![2, 1, 1], "{:?}", lengths(&cut));
+
+    for chunks in [&by_count, &by_bytes, &both, &tiny] {
+        assert_eq!(
+            order(chunks),
+            want_order,
+            "the chunks cover the input in order"
+        );
+    }
+    assert!(plan_chunks(&[], 4, 4).is_empty());
+}
+
+/// In the real configuration no chunk of hostile extractions holds more than
+/// the budget by the estimate, unless it is a single extraction, and none
+/// holds more than the count.
+#[test]
+fn a_hostile_chunk_stays_inside_the_byte_budget() {
+    let template = extract_file("heavy/h.py", &dense_source(150_000));
+    let estimate = estimated_payload_bytes(&template);
+    let production = PayloadTuning::default();
+    // Enough copies that the budget, not the count, is what cuts them.
+    let copies = (production.chunk_bytes / estimate + 2).min(500);
+    let hostile: Vec<Extraction> = (0..copies)
+        .map(|index| {
+            let mut copy = template.clone();
+            copy.file_path = format!("heavy/h_{index:03}.py");
+            copy
+        })
+        .collect();
+    let refs: Vec<&Extraction> = hostile.iter().collect();
+    let chunks = plan_chunks(&refs, production.chunk, production.chunk_bytes);
+    assert!(
+        chunks.len() > 1,
+        "{copies} copies of {estimate} B were not cut"
+    );
+    for chunk in &chunks {
+        let held: usize = chunk.iter().map(|e| estimated_payload_bytes(e)).sum();
+        assert!(chunk.len() <= production.chunk);
+        assert!(
+            chunk.len() == 1 || held <= production.chunk_bytes,
+            "a chunk of {} holds {held} B by the estimate, over {}",
+            chunk.len(),
+            production.chunk_bytes
+        );
+    }
+}
+
+/// The tables do not move when the chunks are cut by bytes instead of by
+/// count, in every place a cut can fall.
+#[test]
+fn the_tables_do_not_depend_on_where_the_byte_budget_cuts() {
+    let steps = scenario(20);
+    let want = dump_after(&steps, &tuned(1, 1));
+    let typical = estimated_payload_bytes(&steps[0].extractions[0]);
+    for chunk_bytes in [0, 1, typical, 3 * typical, 7 * typical + 1, usize::MAX] {
+        for threads in [1, 3, 8] {
+            let tuning = PayloadTuning {
+                chunk_bytes,
+                ..tuned(64, threads)
+            };
+            assert_eq!(
+                dump_after(&steps, &tuning),
+                want,
+                "a {chunk_bytes} B budget on {threads} threads wrote different rows"
+            );
+        }
+    }
 }

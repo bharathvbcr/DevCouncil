@@ -14,15 +14,15 @@ use devmap_extract::model::{confidence_millis, EdgeKind, Extraction};
 #[cfg(feature = "parse")]
 use devmap_resolve::model::ResolutionResult;
 #[cfg(feature = "parse")]
-use rayon::prelude::*;
-#[cfg(feature = "parse")]
 use rusqlite::OptionalExtension;
 #[cfg(feature = "parse")]
 use rusqlite::{params, Connection, Result};
 #[cfg(feature = "parse")]
 use std::path::Path;
+#[cfg(feature = "parse")]
+use std::sync::{mpsc, Mutex, PoisonError};
 
-/// How many fresh extractions are serialized in parallel before their rows are
+/// The most fresh extractions serialized together before their rows are
 /// inserted. See [`Store::save_generation_tuned`] for what the chunking is for.
 ///
 /// 64 because of what each end of the trade costs. Too small and every chunk is
@@ -30,12 +30,46 @@ use std::path::Path;
 /// 18-core machine three or four files per thread per barrier, where 16 would
 /// leave most of them idle for the tail. Too large and the documents of a chunk
 /// stop being a bounded buffer: a payload averages 54 KB, so a chunk of 64 is
-/// about 3.5 MB of JSON, against the 137 MB a cold build of the main
-/// repository would hold if it serialized everything first. The bound is on
-/// *count*, not bytes, so the ceiling is 64 times the largest payload, and
-/// payloads are bounded by the file size limit discovery already enforces.
+/// about 3.5 MB of JSON. The count alone does not bound a hostile chunk, which
+/// is what [`PAYLOAD_CHUNK_JSON_BYTES`] is for.
 #[cfg(feature = "parse")]
 const PAYLOAD_SERIALIZE_CHUNK: usize = 64;
+
+/// The most estimated JSON a chunk may hold, whatever its count.
+///
+/// A near-cap Python file (1.04 MB of source, 22,484 symbols, 17,988
+/// references, 4,096 literals) serializes to a 7.6 MB payload, so 64 of them
+/// would be about 486 MB in flight where the serial loop held one. A chunk is
+/// therefore cut when the next member would carry the estimate past 64 MiB,
+/// which is the most JSON a chunk of any extractions can hold by the estimate
+/// below; a typical chunk (54 KB a payload, 64 of them) never reaches it. A
+/// chunk always holds at least one extraction, so a single payload larger than
+/// the budget is serialized alone, as the serial loop did.
+#[cfg(feature = "parse")]
+const PAYLOAD_CHUNK_JSON_BYTES: usize = 64 * 1024 * 1024;
+
+/// What an extraction's three documents cost in JSON before a byte of it
+/// exists: a fixed part plus a price per structural item (symbols, imports,
+/// calls, exports, references, literals, routes and wiring).
+///
+/// The count of items, and not the length of the source, because the source
+/// length is a poor guide: measured on this repository's `rust/` (1,052 files,
+/// 18.6 MB of source, 141.2 MB of JSON), JSON bytes per source byte average 7.6
+/// but reach 22 for a small file of dense literals, while JSON bytes per item
+/// run 58 to 285 across files of more than 20 items (median 195, 99th
+/// percentile 257, average 192). The near-cap file above is 170 per item. 300
+/// is above every measured value, so the estimate is a ceiling on that sample.
+/// It is measured, not guaranteed: a document shaped unlike anything in the
+/// sample can exceed it, and the budget is then a bound on the estimate, not on
+/// the bytes. Unlike the source, the items are on every extraction, including
+/// one read back from the store, which carries no `source_code`.
+#[cfg(feature = "parse")]
+const PAYLOAD_JSON_BYTES_PER_ITEM: usize = 300;
+
+/// The part of a payload that does not scale with items: the parse outcome,
+/// the engine and the extraction's scalar fields.
+#[cfg(feature = "parse")]
+const PAYLOAD_JSON_BASE_BYTES: usize = 1024;
 
 /// The three JSON documents a fresh `file_payloads` row holds for one
 /// extraction.
@@ -53,20 +87,28 @@ pub(super) type PayloadSerializer = fn(&Extraction) -> Result<PayloadJson>;
 
 /// How a write serializes its fresh payloads. `default()` is production.
 #[cfg(feature = "parse")]
-pub(super) struct PayloadTuning<'pool> {
-    /// Extractions per chunk. Must be at least one.
+pub(super) struct PayloadTuning {
+    /// Most extractions per chunk. Must be at least one.
     pub(super) chunk: usize,
-    /// The pool a chunk is serialized on; `None` is rayon's global pool.
-    pub(super) pool: Option<&'pool rayon::ThreadPool>,
+    /// Most estimated JSON bytes per chunk (see [`PAYLOAD_CHUNK_JSON_BYTES`]).
+    pub(super) chunk_bytes: usize,
+    /// Serializer threads the write starts, once. Must be at least one; one
+    /// serializes on the writing thread and starts none.
+    pub(super) threads: usize,
     pub(super) serialize: PayloadSerializer,
 }
 
 #[cfg(feature = "parse")]
-impl Default for PayloadTuning<'_> {
+impl Default for PayloadTuning {
+    /// Sized the way the pool this replaces was: rayon's thread count, which is
+    /// the machine's parallelism unless `RAYON_NUM_THREADS` lowers it (the
+    /// stress harness runs its children with it set to 2). It is asked only
+    /// for the number; no job is run, queued or stolen.
     fn default() -> Self {
         Self {
             chunk: PAYLOAD_SERIALIZE_CHUNK,
-            pool: None,
+            chunk_bytes: PAYLOAD_CHUNK_JSON_BYTES,
+            threads: rayon::current_num_threads(),
             serialize: serialize_payload,
         }
     }
@@ -76,7 +118,7 @@ impl Default for PayloadTuning<'_> {
 ///
 /// `for_durable_store` is a full clone plus the secret-value withholding, so
 /// this allocates one extraction's worth of memory per call: bounded by the
-/// number of threads serializing, not by the chunk.
+/// number of threads serializing, not by the chunk. Takes no lock.
 #[cfg(feature = "parse")]
 pub(super) fn serialize_payload(extraction: &Extraction) -> Result<PayloadJson> {
     let parse_outcome = serde_json::to_string(&extraction.parse_outcome).map_err(|error| {
@@ -106,39 +148,158 @@ pub(super) fn serialize_payload(extraction: &Extraction) -> Result<PayloadJson> 
     })
 }
 
-/// Serializes `chunk` in parallel, one result per extraction, in the order of
-/// `chunk`.
-///
-/// A panic in the serializer is caught here, per extraction, and becomes that
-/// extraction's error. Left to unwind it would cross rayon, then the held
-/// connection guard, which poisons the store's mutex and refuses every later
-/// write of the process; caught, it is an ordinary failed write that rolls its
-/// transaction back and names the file. Catching per extraction rather than per
-/// chunk is also what keeps the error deterministic: the first failing
-/// extraction in iteration order is reported, not whichever panic rayon
-/// happened to propagate.
+/// What [`serialize_payload`] is expected to produce for `extraction`, in
+/// bytes, before it runs. See [`PAYLOAD_JSON_BYTES_PER_ITEM`].
 #[cfg(feature = "parse")]
-fn serialize_chunk(chunk: &[&Extraction], tuning: &PayloadTuning<'_>) -> Vec<Result<PayloadJson>> {
-    let one = |extraction: &&Extraction| {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            (tuning.serialize)(extraction)
-        }))
-        .unwrap_or_else(|panic| {
-            let reason = panic
+pub(super) fn estimated_payload_bytes(extraction: &Extraction) -> usize {
+    let items = extraction.symbols.len()
+        + extraction.imports.len()
+        + extraction.calls.len()
+        + extraction.exports.len()
+        + extraction.references.len()
+        + extraction.literals.len()
+        + extraction.routes.len()
+        + extraction.wiring.len();
+    PAYLOAD_JSON_BASE_BYTES.saturating_add(PAYLOAD_JSON_BYTES_PER_ITEM.saturating_mul(items))
+}
+
+/// Cuts `fresh` into consecutive chunks of at most `max_items` extractions
+/// whose estimated JSON stays within `max_bytes`, except that a chunk always
+/// holds at least one extraction. The chunks cover `fresh` exactly, in order.
+#[cfg(feature = "parse")]
+pub(super) fn plan_chunks<'a, 'e>(
+    fresh: &'a [&'e Extraction],
+    max_items: usize,
+    max_bytes: usize,
+) -> Vec<&'a [&'e Extraction]> {
+    let mut chunks = Vec::new();
+    let (mut start, mut bytes) = (0usize, 0usize);
+    for (index, extraction) in fresh.iter().enumerate() {
+        let weight = estimated_payload_bytes(extraction);
+        let held = index - start;
+        if held > 0 && (held >= max_items || bytes.saturating_add(weight) > max_bytes) {
+            chunks.push(&fresh[start..index]);
+            start = index;
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(weight);
+    }
+    if start < fresh.len() {
+        chunks.push(&fresh[start..]);
+    }
+    chunks
+}
+
+/// Runs `serialize` on `extraction`, turning a panic into the extraction's
+/// error.
+///
+/// Left to unwind, a panic would cross the connection guard the write holds,
+/// which poisons the store's mutex and refuses every later write of the
+/// process; caught, it is an ordinary failed write that rolls its transaction
+/// back and names the file. Catching per extraction rather than per chunk is
+/// also what keeps the error deterministic: the first failing extraction in
+/// iteration order is reported, not whichever panic happened to arrive first.
+///
+/// The payload is read for its message inside the catch and then **leaked**
+/// with `mem::forget`, never dropped. A payload is arbitrary user code
+/// (`panic_any`), and one whose `Drop` panics would, dropped here, unwind out of
+/// the catch it was caught by. Leaking the few bytes of a panic that is
+/// already a bug is the price of no foreign `Drop` ever running on this path.
+#[cfg(feature = "parse")]
+fn serialize_guarded(serialize: PayloadSerializer, extraction: &Extraction) -> Result<PayloadJson> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| serialize(extraction))) {
+        Ok(outcome) => outcome,
+        Err(payload) => {
+            let reason = payload
                 .downcast_ref::<&str>()
                 .map(|message| (*message).to_string())
-                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "a non-string panic payload".to_string());
+            std::mem::forget(payload);
             Err(refusal(format!(
                 "payload serialization panicked for {}: {reason}",
                 extraction.file_path
             )))
-        })
-    };
-    let run = || chunk.par_iter().map(one).collect::<Vec<_>>();
-    match tuning.pool {
-        Some(pool) => pool.install(run),
-        None => run(),
+        }
+    }
+}
+
+/// One extraction to serialize, numbered by its place in its chunk.
+#[cfg(feature = "parse")]
+type PayloadJob<'e> = (usize, &'e Extraction);
+
+/// A serialized extraction, with the number of the job it answers.
+#[cfg(feature = "parse")]
+type PayloadDone = (usize, Result<PayloadJson>);
+
+/// What a serializer thread does for as long as the write keeps the job channel
+/// open: take the next job, serialize it, report it.
+///
+/// The thread runs nothing but [`serialize_guarded`]. It takes no store lock
+/// and no work-stealing scheduler is involved, which is the whole reason these
+/// are `std` threads and not a rayon pool: see
+/// [`Store::save_generation_tuned`].
+#[cfg(feature = "parse")]
+fn payload_worker(
+    jobs: &Mutex<mpsc::Receiver<PayloadJob<'_>>>,
+    done: mpsc::Sender<PayloadDone>,
+    serialize: PayloadSerializer,
+) {
+    loop {
+        // The guard is held across the blocking `recv`, so idle workers queue on
+        // the mutex and the one holding it queues on the channel; it is released
+        // before the job runs.
+        let next = jobs.lock().unwrap_or_else(PoisonError::into_inner).recv();
+        let Ok((index, extraction)) = next else {
+            return;
+        };
+        if done
+            .send((index, serialize_guarded(serialize, extraction)))
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// The write's serializer threads, as the inserting thread sees them.
+#[cfg(feature = "parse")]
+struct PayloadWorkers<'a, 'e> {
+    jobs: &'a mpsc::Sender<PayloadJob<'e>>,
+    done: &'a mpsc::Receiver<PayloadDone>,
+}
+
+#[cfg(feature = "parse")]
+impl<'e> PayloadWorkers<'_, 'e> {
+    /// Hands `chunk` to the workers and waits for every document, returned in
+    /// the order of `chunk` whatever order they finished in.
+    ///
+    /// The wait is a plain blocking `recv`: the thread does nothing but wait,
+    /// so it can never run a job that wants the lock it holds.
+    fn serialize_chunk(&self, chunk: &[&'e Extraction]) -> Result<Vec<Result<PayloadJson>>> {
+        const STOPPED: &str = "payload serializer threads stopped before returning every document";
+        for (index, extraction) in chunk.iter().copied().enumerate() {
+            self.jobs
+                .send((index, extraction))
+                .map_err(|_| refusal(STOPPED))?;
+        }
+        let mut slots: Vec<Option<Result<PayloadJson>>> = (0..chunk.len()).map(|_| None).collect();
+        for _ in 0..chunk.len() {
+            let (index, outcome) = self.done.recv().map_err(|_| refusal(STOPPED))?;
+            if let Some(slot) = slots.get_mut(index) {
+                *slot = Some(outcome);
+            }
+        }
+        Ok(slots
+            .into_iter()
+            .map(|slot| {
+                slot.unwrap_or_else(|| {
+                    Err(refusal(
+                        "a payload serializer thread returned no document for one extraction",
+                    ))
+                })
+            })
+            .collect())
     }
 }
 
@@ -419,7 +580,7 @@ impl Store {
     }
 
     /// [`save_generation_timed`](Self::save_generation_timed) with the payload
-    /// serialization's chunk size, thread pool and serializer named by the
+    /// serialization's chunk bounds, thread count and serializer named by the
     /// caller. The only caller that names anything but the defaults is a test:
     /// the writes it compares must differ in thread count and chunk boundary
     /// and nothing else, and a chunk of one, a chunk that fits the whole input
@@ -437,15 +598,33 @@ impl Store {
     /// lock held. The inserts that consume the documents are a different cost:
     /// SQLite has one writer, so they stay on this thread, in order.
     ///
-    /// The fresh extractions are therefore taken `tuning.chunk` at a time: a
-    /// chunk is serialized in parallel, then its rows are inserted one by one,
-    /// then the next chunk. Two properties are load-bearing.
+    /// The fresh extractions are therefore cut into chunks (by count, and by an
+    /// estimate of their JSON, see [`plan_chunks`]): a chunk is serialized on
+    /// `tuning.threads` threads, then its rows are inserted one by one, then
+    /// the next chunk. The load-bearing properties follow.
     ///
-    /// **Ordering.** The documents of a chunk come back in the order of the
-    /// chunk (`par_iter().map().collect()` preserves it) and are inserted in
-    /// exactly the order the serial loop did, so every `payload_id`, every
-    /// `generation_file_rows` row and every path id, which are all handed out by
-    /// insertion order, are what they were. Nothing here depends on which
+    /// **No foreign work while the connection is held.** The write holds the
+    /// store's connection mutex from the opening of its transaction to its
+    /// commit, and the mutex is not reentrant. A thread that waited for its
+    /// chunk on a work-stealing pool would, while it waited, run whatever the
+    /// pool had queued, and a queued job that locks this mutex -- the extraction
+    /// pass's cache lookups do, on rayon's global pool -- then blocks on a
+    /// holder that is waiting for it. A private pool does not cure that: a write
+    /// issued from inside another pool's worker steals from that pool while it
+    /// waits. So the serialization does not use rayon. The write starts
+    /// `tuning.threads` scoped `std` threads **once**, before its first chunk
+    /// (none when there are fewer than two extractions or one thread, and the
+    /// writing thread serializes inline), feeds them the chunk's extractions
+    /// over a channel, and waits for the results on a channel. A scoped thread
+    /// runs only the job it was handed; it does no stealing, and the serializer
+    /// takes no lock. The waiting thread does nothing but wait, so neither
+    /// deadlock can form. Spawning once per write, not per chunk, is
+    /// `threads` spawns on a cold build and none on a one-file edit.
+    ///
+    /// **Ordering.** The documents of a chunk are gathered by position and
+    /// inserted in exactly the order the serial loop did, so every `payload_id`,
+    /// every `generation_file_rows` row and every path id, which are all handed
+    /// out by insertion order, are what they were. Nothing here depends on which
     /// thread finished first.
     ///
     /// **Errors.** A serialization failure -- or a panic in the serializer,
@@ -460,8 +639,13 @@ impl Store {
     /// that was caught here never unwinds through the connection mutex, so the
     /// store is not poisoned.
     ///
-    /// **Memory.** Only one chunk's documents exist at a time, never the whole
-    /// generation's (137 MB on a cold build of the main repository).
+    /// **Memory.** The most the write holds beyond what it held before is one
+    /// chunk's JSON plus `threads` times one extraction clone: at most 64
+    /// extractions and at most [`PAYLOAD_CHUNK_JSON_BYTES`] of *estimated* JSON
+    /// (a chunk always holds one extraction, however large), never the
+    /// generation's whole 137 MB on a cold build of the main repository.
+    /// The in-flight clones are the `for_durable_store` copies the workers are
+    /// serializing at that moment; a worker holds one at a time.
     ///
     /// **Why inside the transaction.** For a differential write which extractions
     /// are fresh is decided by `carry`, which is read from the previous
@@ -482,11 +666,16 @@ impl Store {
         analysis: &AnalysisSummary,
         opts: GenerationWriteOpts,
         head_sha: &str,
-        tuning: &PayloadTuning<'_>,
+        tuning: &PayloadTuning,
     ) -> Result<(u32, WriteBreakdown)> {
         if tuning.chunk == 0 {
             return Err(refusal(
                 "payload serialization chunk must hold at least one extraction",
+            ));
+        }
+        if tuning.threads == 0 {
+            return Err(refusal(
+                "payload serialization needs at least one thread to serialize on",
             ));
         }
         let mut spent = WriteBreakdown::default();
@@ -711,56 +900,99 @@ impl Store {
             })
             .collect();
 
-        for chunk in fresh.chunks(tuning.chunk) {
-            // The whole chunk's documents, serialized in parallel and held
-            // until its rows are inserted. See `save_generation_tuned` for why
-            // the insert below still walks them one at a time, in order.
-            let serialized = {
-                let _charge = charge(&mut spent.serialize);
-                serialize_chunk(chunk, tuning)
-            };
-            for (extraction, documents) in chunk.iter().copied().zip(serialized) {
-                // SQLite has no unsigned integer type. Preserve all 64 bits using
-                // the same two's-complement representation as the extraction cache.
-                let content_hash = extraction.content_hash as i64;
-                let PayloadJson {
-                    parse_outcome: parse_json,
-                    engine: engine_json,
-                    extraction: extraction_json,
-                } = documents?;
-                let file_id =
-                    Self::ensure_path_id_cached(&tx, &mut path_ids, &extraction.file_path)?;
-                // The identity this payload was produced with, so a stored row is
-                // usable as a cache fallback without discarding the staleness
-                // guarantee the cache key exists to enforce (SC8). Since v17 it is
-                // also the payload's own key.
-                let identity = devmap_extract::cache::CacheKey::for_extraction(extraction);
-                let payload_id = {
-                    let _charge = charge(&mut spent.payloads);
-                    Self::ensure_payload_id(
-                        &tx,
-                        StoredPayload {
-                            file_id,
-                            content_hash,
-                            language: &extraction.language,
-                            grammar_version: &identity.grammar_version,
-                            analyzer_version: &identity.analyzer_version,
-                            parse_outcome_json: &parse_json,
-                            engine_json: &engine_json,
-                            extraction_json: &extraction_json,
-                        },
-                    )?
-                };
-                {
-                    let _charge = charge(&mut spent.file_rows);
-                    tx.execute(
-                        "INSERT INTO generation_file_rows (generation_id, file_id, payload_id)
-                         VALUES (?1, ?2, ?3)",
-                        params![gen_id, file_id, payload_id],
-                    )?;
+        // The serializer threads, started once for the whole write and only
+        // when there is more than one extraction and more than one thread to
+        // give it. `job_tx` and `done_tx` are moved into the scope below, so
+        // they are dropped when it ends on any path, which is what stops the
+        // threads; the scope then joins them before the write goes on.
+        let chunks = plan_chunks(&fresh, tuning.chunk, tuning.chunk_bytes);
+        let threads = tuning.threads.min(fresh.len());
+        let (job_tx, job_rx) = mpsc::channel::<PayloadJob<'_>>();
+        let job_rx = Mutex::new(job_rx);
+        let (done_tx, done_rx) = mpsc::channel::<PayloadDone>();
+        std::thread::scope(|scope| -> Result<()> {
+            let job_tx = job_tx;
+            let mut started = 0usize;
+            if threads > 1 {
+                for number in 0..threads {
+                    let done = done_tx.clone();
+                    let jobs = &job_rx;
+                    let serialize = tuning.serialize;
+                    // A thread the OS will not give is not an error: the write
+                    // goes on with the threads it has, or inline with none.
+                    let spawned = std::thread::Builder::new()
+                        .name(format!("devmap-payload-{number}"))
+                        .spawn_scoped(scope, move || payload_worker(jobs, done, serialize));
+                    if spawned.is_err() {
+                        break;
+                    }
+                    started += 1;
                 }
             }
-        }
+            drop(done_tx);
+            let workers = (started > 0).then_some(PayloadWorkers {
+                jobs: &job_tx,
+                done: &done_rx,
+            });
+            for chunk in chunks {
+                // The whole chunk's documents, serialized in parallel and held
+                // until its rows are inserted. See `save_generation_tuned` for why
+                // the insert below still walks them one at a time, in order, and
+                // why the thread waiting here runs nothing but its own inserts.
+                let serialized = {
+                    let _charge = charge(&mut spent.serialize);
+                    match &workers {
+                        Some(workers) => workers.serialize_chunk(chunk)?,
+                        None => chunk
+                            .iter()
+                            .map(|extraction| serialize_guarded(tuning.serialize, extraction))
+                            .collect(),
+                    }
+                };
+                for (extraction, documents) in chunk.iter().copied().zip(serialized) {
+                    // SQLite has no unsigned integer type. Preserve all 64 bits using
+                    // the same two's-complement representation as the extraction cache.
+                    let content_hash = extraction.content_hash as i64;
+                    let PayloadJson {
+                        parse_outcome: parse_json,
+                        engine: engine_json,
+                        extraction: extraction_json,
+                    } = documents?;
+                    let file_id =
+                        Self::ensure_path_id_cached(&tx, &mut path_ids, &extraction.file_path)?;
+                    // The identity this payload was produced with, so a stored row is
+                    // usable as a cache fallback without discarding the staleness
+                    // guarantee the cache key exists to enforce (SC8). Since v17 it is
+                    // also the payload's own key.
+                    let identity = devmap_extract::cache::CacheKey::for_extraction(extraction);
+                    let payload_id = {
+                        let _charge = charge(&mut spent.payloads);
+                        Self::ensure_payload_id(
+                            &tx,
+                            StoredPayload {
+                                file_id,
+                                content_hash,
+                                language: &extraction.language,
+                                grammar_version: &identity.grammar_version,
+                                analyzer_version: &identity.analyzer_version,
+                                parse_outcome_json: &parse_json,
+                                engine_json: &engine_json,
+                                extraction_json: &extraction_json,
+                            },
+                        )?
+                    };
+                    {
+                        let _charge = charge(&mut spent.file_rows);
+                        tx.execute(
+                            "INSERT INTO generation_file_rows (generation_id, file_id, payload_id)
+                         VALUES (?1, ?2, ?3)",
+                            params![gen_id, file_id, payload_id],
+                        )?;
+                    }
+                }
+            }
+            Ok(())
+        })?;
 
         let mut node_ord: u32 = 0;
 
