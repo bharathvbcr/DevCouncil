@@ -379,6 +379,12 @@ func EvaluateRedirectsOps(command, taskID string, scopeBound bool, evalWrite Ope
 	for _, target := range set.Deletes {
 		deleted[target] = true
 	}
+	// Ranked like a compound command's clauses. Returning the first blocked
+	// target let `cp -t . src/calc.go` — an unplanned `./calc.go`, soft — hide
+	// the `mv calc.go .env` after it, and a posture that demotes scope then
+	// reached the credential file. A hard refusal for what a write does cannot
+	// be outranked, so judging stops there.
+	var blocked []policy.Decision
 	for _, target := range targets {
 		op := dc.OpWrite
 		if deleted[target] {
@@ -388,11 +394,19 @@ func EvaluateRedirectsOps(command, taskID string, scopeBound bool, evalWrite Ope
 		if err != nil {
 			return RedirectRefusal{}, err
 		}
-		if written.Blocked() {
-			written.Reason = fmt.Sprintf("Command writes a file the write gate refuses (%s): %s",
-				target, written.Reason)
-			return RedirectRefusal{Decision: written, Refused: true, FromTarget: true}, nil
+		if !written.Blocked() {
+			continue
 		}
+		written.Reason = fmt.Sprintf("Command writes a file the write gate refuses (%s): %s",
+			target, written.Reason)
+		stop := written.Severity == policy.Hard && !policy.IsUnreadableRule(written.Rule)
+		blocked = append(blocked, written)
+		if stop {
+			break
+		}
+	}
+	if chosen, refused := policy.MostImportant(blocked); refused {
+		return RedirectRefusal{Decision: chosen, Refused: true, FromTarget: true}, nil
 	}
 	if scopeBound && set.Unjudged != "" {
 		return RedirectRefusal{

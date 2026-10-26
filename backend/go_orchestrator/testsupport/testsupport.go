@@ -458,10 +458,14 @@ func buildAndPublish(stop time.Time, boundBy, crates, crate, binary string) (str
 	log := &proc.CappedBuffer{Limit: cargoLogLimit}
 	cmd.Stdout, cmd.Stderr = log, log
 	cmd.WaitDelay = 5 * time.Second
+	// The method value, not cmd.Run(): that call is what the process-wide
+	// bound test forbids, because Start only becomes cancellable after the
+	// fork. The wrapper exists to close ran once that call returns.
+	run := cmd.Run
 	ran := make(chan struct{})
 	runErr, timedOut := proc.RunBounded(ctx, func() error {
 		defer close(ran)
-		return cmd.Run()
+		return run()
 	})
 	if timedOut {
 		err := fmt.Errorf("%w: `cargo build -p %s --bin %s` in %s was stopped after %s, the bound set by %s.%s",

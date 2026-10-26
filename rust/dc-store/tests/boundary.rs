@@ -6,7 +6,6 @@
 //! assembled by hand out of a stored column, and a health check that answered
 //! for a database it had just invented.
 
-#[allow(dead_code)]
 mod support;
 use support::{dcstore, plant_db, seeded, temp_dir};
 

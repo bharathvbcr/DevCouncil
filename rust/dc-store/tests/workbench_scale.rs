@@ -3,7 +3,6 @@
 
 use dc_store::Store;
 
-#[allow(dead_code)]
 mod support;
 
 fn call(s: &Store, method: &str, raw: &str) -> String {

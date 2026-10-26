@@ -8,7 +8,6 @@ use dc_store::{AcquireRequest, ReadyMode, SCHEMA_VERSION, Store, StoreError, sch
 use rusqlite::Connection;
 use std::path::Path;
 
-#[allow(dead_code)]
 mod support;
 use support::{LEGACY_TASKS, dcstore, item_request, plant, plant_db, seeded, temp_dir};
 

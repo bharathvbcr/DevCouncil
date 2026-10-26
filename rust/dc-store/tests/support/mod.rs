@@ -8,6 +8,8 @@
 //! "seeded" — would be invisible until two suites disagreed about a failure.
 
 // Each suite compiles its own copy of this module and uses a subset of it.
+// The allow stays on this module. An outer `#[allow(dead_code)]` on
+// `mod support` is the same attribute again, and rustc rejects the duplicate.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};

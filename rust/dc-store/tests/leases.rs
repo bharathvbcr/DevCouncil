@@ -10,7 +10,6 @@ use std::sync::{Arc, Barrier};
 
 use dc_store::{AcquireRequest, LeaseCode, Store, StoreError, format_iso_utc, parse_iso_utc};
 
-#[allow(dead_code)]
 mod support;
 
 /// The tasks these cases lease, planted as the workbench items they are.

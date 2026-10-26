@@ -1,6 +1,5 @@
 use dc_store::{AcquireRequest, Store};
 
-#[allow(dead_code)]
 mod support;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};

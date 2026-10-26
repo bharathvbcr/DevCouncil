@@ -10,7 +10,6 @@
 use dc_store::json::check_object;
 use rusqlite::Connection;
 
-#[allow(dead_code)]
 mod support;
 use support::{dcstore, plant_db, seeded};
 

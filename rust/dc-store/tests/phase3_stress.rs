@@ -7,7 +7,6 @@ use dc_store::{AcquireRequest, SCHEMA_VERSION, Store, schema};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-#[allow(dead_code)]
 mod support;
 
 #[test]

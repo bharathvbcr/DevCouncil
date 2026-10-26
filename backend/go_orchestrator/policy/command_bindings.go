@@ -309,6 +309,13 @@ func renderBindings(command string, segments []bindingSegment, values map[string
 // something does, else the first refusal for what the gate could not read
 // (IsUnreadableRule), else the first soft refusal, else the first warning. ok
 // is false when every decision allowed.
+// MostImportant is [mostImportant] for a caller outside this package. The
+// redirect rung ranks a command's write targets with the same order the
+// clause rung uses, so a soft scope refusal cannot hide a later hard one.
+func MostImportant(decisions []Decision) (Decision, bool) {
+	return mostImportant(decisions)
+}
+
 func mostImportant(decisions []Decision) (Decision, bool) {
 	var unreadable, soft, warned *Decision
 	for i := range decisions {

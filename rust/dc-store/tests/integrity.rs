@@ -10,7 +10,6 @@ use dc_store::{AcquireRequest, ScopeWrite, Store, schema};
 use rusqlite::{Connection, OptionalExtension};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-#[allow(dead_code)]
 mod support;
 use support::{dcstore, plant, seeded, temp_dir};
 

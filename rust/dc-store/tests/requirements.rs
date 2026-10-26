@@ -22,7 +22,6 @@
 
 use dc_store::Store;
 
-#[allow(dead_code)]
 mod support;
 use support::{dcstore, plant, plant_db, seeded};
 

@@ -5,7 +5,6 @@ use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[allow(dead_code)]
 mod support;
 
 static NEXT: AtomicU64 = AtomicU64::new(1);

@@ -9,7 +9,6 @@
 use dc_store::Store;
 use std::time::{Duration, Instant};
 
-#[allow(dead_code)]
 mod support;
 
 fn call(s: &Store, method: &str, raw: &str) -> String {
