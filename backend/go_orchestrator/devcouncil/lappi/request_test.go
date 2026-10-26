@@ -158,6 +158,19 @@ func TestAHunkThatDoesNotMatchItsHeaderIsNotSent(t *testing.T) {
 	}
 }
 
+// A declared number must fit an int on a 32-bit build, where 1<<31 would wrap
+// to a negative count. The largest int32 is the last number admitted.
+func TestAHunkNumberPastInt32IsRefused(t *testing.T) {
+	if n, _, ok := hunkRange([]byte("1,2147483647")); !ok || n != 2147483647 {
+		t.Errorf("the largest int32 count: got %d, %v", n, ok)
+	}
+	for _, s := range []string{"1,2147483648", "2147483648,1", "2147483648"} {
+		if n, _, ok := hunkRange([]byte(s)); ok {
+			t.Errorf("%s: admitted as %d", s, n)
+		}
+	}
+}
+
 func TestAContextOverTheRuntimeCapIsNotSent(t *testing.T) {
 	var b strings.Builder
 	b.WriteString("diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -0,0 +1,2000 @@\n")
