@@ -13,7 +13,7 @@ import {
   tagVerdict,
 } from "./ci-local-checks.mjs";
 
-const PIN = "984209b542885b10b43e3d9aaf2073fd871e9eb9";
+const PIN = "320c56c27e1098f7e0a26e9854ff80c4f4354ef9";
 
 function repo() {
   const dir = mkdtempSync(path.join(tmpdir(), "ci-local-test-"));
@@ -87,7 +87,7 @@ describe("ci:local Gusset pin", () => {
   it("FAILs, not warns, when the sibling is off the pin", () => {
     const v = gussetPinVerdict(PIN, "92c205609f02ab116a12844a074a8b424c121359");
     assert.equal(v.ok, false);
-    assert.match(v.message, /pins 984209b54288/);
+    assert.match(v.message, /pins 320c56c27e10/);
   });
 
   it("FAILs when the pin or the sibling HEAD cannot be read", () => {
@@ -135,7 +135,7 @@ describe("rust/gusset-engine/check-pin.sh (used by rust/verify.sh)", () => {
     try {
       const r = run(f.action, f.sibling.dir);
       assert.equal(r.status, 1);
-      assert.match(r.stderr, /CI pins 984209b54288/);
+      assert.match(r.stderr, /CI pins 320c56c27e10/);
     } finally {
       rmSync(f.action, { force: true });
       f.sibling.cleanup();
