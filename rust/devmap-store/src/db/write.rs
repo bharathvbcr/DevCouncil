@@ -655,9 +655,9 @@ impl Store {
     /// transaction means holding every document at once, which is the memory
     /// bound this exists to keep.
     ///
-    /// **The `serialize` span** is the wall time of the chunk's parallel
-    /// serialization, the time the write was waiting for documents, not the
-    /// CPU time spent on them.
+    /// **The `serialize` span** is the wall time of the chunks' parallel
+    /// serialization plus starting and joining the threads, the time the write
+    /// was waiting for documents, not the CPU time spent on them.
     #[cfg(feature = "parse")]
     pub(super) fn save_generation_tuned(
         &self,
@@ -912,25 +912,30 @@ impl Store {
         let (done_tx, done_rx) = mpsc::channel::<PayloadDone>();
         std::thread::scope(|scope| -> Result<()> {
             let job_tx = job_tx;
-            let mut started = 0usize;
+            let mut handles = Vec::new();
             if threads > 1 {
+                // Starting and joining the threads is serialization machinery
+                // and is charged to `serialize` with the work it exists for;
+                // left out, it would be an unattributed remainder that grows
+                // with the thread count and with the load the OS is under.
+                let _charge = charge(&mut spent.serialize);
                 for number in 0..threads {
                     let done = done_tx.clone();
                     let jobs = &job_rx;
                     let serialize = tuning.serialize;
                     // A thread the OS will not give is not an error: the write
                     // goes on with the threads it has, or inline with none.
-                    let spawned = std::thread::Builder::new()
+                    match std::thread::Builder::new()
                         .name(format!("devmap-payload-{number}"))
-                        .spawn_scoped(scope, move || payload_worker(jobs, done, serialize));
-                    if spawned.is_err() {
-                        break;
+                        .spawn_scoped(scope, move || payload_worker(jobs, done, serialize))
+                    {
+                        Ok(handle) => handles.push(handle),
+                        Err(_) => break,
                     }
-                    started += 1;
                 }
             }
             drop(done_tx);
-            let workers = (started > 0).then_some(PayloadWorkers {
+            let workers = (!handles.is_empty()).then_some(PayloadWorkers {
                 jobs: &job_tx,
                 done: &done_rx,
             });
@@ -989,6 +994,17 @@ impl Store {
                             params![gen_id, file_id, payload_id],
                         )?;
                     }
+                }
+            }
+            // Every chunk is in. Closing the job channel is what ends the
+            // threads; they are joined here, charged, rather than left to the
+            // end of the scope. A thread that ended in a panic of its own (the
+            // serializer's are caught) fails the write rather than passing.
+            drop(job_tx);
+            let _charge = charge(&mut spent.serialize);
+            for handle in handles {
+                if handle.join().is_err() {
+                    return Err(refusal("a payload serializer thread panicked"));
                 }
             }
             Ok(())
