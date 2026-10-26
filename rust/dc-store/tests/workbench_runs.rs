@@ -25,14 +25,36 @@ fn call(store: &Store, method: &str, input: &str) -> String {
     request(store, method, input).unwrap_or_else(|e| panic!("{method}: {e}"))
 }
 fn request(store: &Store, method: &str, input: &str) -> Result<String, dc_store::workbench::Error> {
-    // Forward slashes are accepted in absolute Windows paths and avoid adding
-    // fixture-specific JSON escaping to every protocol case.
-    let raw = if cfg!(windows) {
-        input.replace("/checkout", "C:/checkout")
+    store.workbench_request(method, &fixture_input(input))
+}
+
+/// POSIX fixture paths (`/checkout`, `/worktrees/…`, `local:/moved/.git`) are
+/// absolute on Unix. On Windows `Path::is_absolute` is false for them, and
+/// `runs.prepare` refuses the cwd before the test's own assertion. A drive
+/// prefix keeps the forward slashes the fixtures compare.
+fn fixture_input(input: &str) -> String {
+    if cfg!(windows) {
+        input
+            .replace("local:/", "local:C:/")
+            .replace(":\"/", ":\"C:/")
     } else {
         input.to_owned()
-    };
-    store.workbench_request(method, &raw)
+    }
+}
+
+#[test]
+fn a_posix_fixture_path_is_drive_absolute_on_windows() {
+    let raw =
+        r#"{"cwd":"/worktrees/a","git_dir":"/checkout/.git","identity_key":"local:/moved/.git"}"#;
+    let got = fixture_input(raw);
+    if cfg!(windows) {
+        assert!(got.contains(r#""cwd":"C:/worktrees/a""#), "{got}");
+        assert!(got.contains(r#""git_dir":"C:/checkout/.git""#), "{got}");
+        assert!(got.contains("local:C:/moved/.git"), "{got}");
+        assert!(std::path::Path::new("C:/worktrees/a").is_absolute());
+    } else {
+        assert_eq!(got, raw);
+    }
 }
 fn text(store: &Store, raw: &str, path: &str) -> String {
     store
