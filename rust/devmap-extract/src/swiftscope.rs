@@ -861,7 +861,41 @@ pub(crate) fn property_wrapper_wrapped_type(property: Node, source: &str) -> Opt
     };
     let wrapper = attribute_nominal(*attribute, source)?;
     let declaration = unique_wrapper_type(property, source, &wrapper)?;
-    stored_wrapped_type(declaration, source)
+    let wrapped = stored_wrapped_type(declaration, source)?;
+    // Two nested `struct Client` make the spelling ambiguous. Zero or one does
+    // not: a name this file never declares is still the other file's type.
+    match non_extension_declarations(property, source, &wrapped) {
+        Some(count) if count <= 1 => Some(wrapped),
+        _ => None,
+    }
+}
+
+/// How many non-extension types this file declares with short name `name`.
+///
+/// The same walk as [`unique_wrapper_type`]: `class_declaration` nodes only,
+/// extensions excluded, capped at 20_000 nodes. `None` is the cap or a tree
+/// with no root, and the caller abstains. This does not read [`file_index`].
+fn non_extension_declarations(from: Node, source: &str, name: &str) -> Option<usize> {
+    let root = file_root(from)?;
+    let mut count = 0usize;
+    let mut stack = vec![root];
+    let mut seen = 0usize;
+    while let Some(node) = stack.pop() {
+        seen += 1;
+        if seen > 20_000 {
+            return None;
+        }
+        if node.kind() == "class_declaration" {
+            if let Some((path, extension)) = type_path(node, source) {
+                if !extension && short_name(&path) == name {
+                    count += 1;
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    Some(count)
 }
 
 /// `@` attributes of `node` itself: a direct `attribute`, or one inside its
@@ -1557,6 +1591,16 @@ fn tuple_local_types(
                 return None;
             }
         }
+    }
+    // A short name this file declares twice is not one element type. Zero or
+    // one declaration still is: the other file's type is the resolver's.
+    if elements.iter().any(|(_, ty)| {
+        index
+            .declared
+            .get(short_name(ty))
+            .is_some_and(|all| all.len() > 1)
+    }) {
+        return None;
     }
     Some(elements.iter().map(|(_, ty)| Some(ty.clone())).collect())
 }
@@ -3985,6 +4029,215 @@ mod tests {
                 );
             });
         }
+    }
+
+    /// A qualified call shape may name the receiver's type, or stay the value
+    /// spelling. It must not name some other type.
+    fn assert_snapshot_shape(source: &str, param: &str, local: &str) {
+        let found = bound(source, "t");
+        let nominal = param.trim_end_matches(['?', '!']);
+        if let Some(ty) = ty_of(&found, "s") {
+            assert_eq!(ty, nominal, "bound a type other than {param}: {source}");
+        }
+        let Some(shape) = init_of(&found, "s") else {
+            return;
+        };
+        let Some(head) = shape.strip_suffix(".snapshot") else {
+            panic!("shape {shape} is not a snapshot call in {source}");
+        };
+        if head.chars().next().is_some_and(char::is_uppercase) {
+            if head == "Store" {
+                assert!(
+                    param == "Store" || param == "Store?",
+                    "{shape} from parameter {param}"
+                );
+            } else {
+                assert_eq!(head, nominal, "{shape} from parameter {param}");
+            }
+        } else {
+            let bare = head.strip_suffix('!').unwrap_or(head);
+            assert_eq!(bare, local, "shape {shape} from {source}");
+        }
+    }
+
+    #[test]
+    fn a_unicode_receiver_does_not_qualify_a_different_ascii_type() {
+        let source = "struct Snap {}\n\
+             struct Store { func snapshot(_ p: Int) -> Snap { Snap() } }\n\
+             struct Støre { func snapshot(_ p: Int) -> Snap { Snap() } }\n\
+             func t(_ støre: Støre) { let s = støre.snapshot(1) }";
+        assert_snapshot_shape(source, "Støre", "støre");
+        let found = bound(source, "t");
+        if let Some(ty) = ty_of(&found, "s") {
+            assert!(
+                !ty.chars().all(|c| c.is_ascii()),
+                "typed the local as ASCII {ty}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tuple_destructure_abstains_when_an_element_name_is_declared_twice() {
+        let source = "struct A { struct Store {} }\nstruct B { struct Store {} }\n\
+             struct Svc {}\n\
+             func makePair() -> (Store, Svc) { (Store(), Svc()) }\n\
+             func t() { let (store, svc) = makePair() }";
+        let found = bound(source, "t");
+        assert!(found.contains_key("store"));
+        assert!(found.contains_key("svc"));
+        assert_eq!(ty_of(&found, "store"), None);
+        assert_eq!(ty_of(&found, "svc"), None);
+    }
+
+    #[test]
+    fn a_tuple_destructure_keeps_the_first_element_when_the_second_is_skipped() {
+        let source = "struct Store {}\nstruct Svc {}\n\
+             func makePair() -> (Store, Svc) { (Store(), Svc()) }\n\
+             func t() { let (store, _) = makePair() }";
+        let found = bound(source, "t");
+        assert_eq!(ty_of(&found, "store").as_deref(), Some("Store"));
+        assert!(!found.contains_key("_"));
+        assert_eq!(ty_of(&found, "svc"), None);
+    }
+
+    #[test]
+    fn a_one_element_tuple_does_not_type_a_two_name_pattern() {
+        let source = "struct Store {}\nstruct Svc {}\n\
+             func makePair() -> (Store) { Store() }\n\
+             func t() { let (store, svc) = makePair() }";
+        let found = bound(source, "t");
+        assert!(found.contains_key("store"), "the first name is still bound");
+        assert!(found.contains_key("svc"), "the second name is still bound");
+        assert_eq!(
+            ty_of(&found, "store"),
+            None,
+            "a one-element tuple must abstain"
+        );
+        assert_eq!(
+            ty_of(&found, "svc"),
+            None,
+            "a one-element tuple must abstain"
+        );
+    }
+
+    #[test]
+    fn a_force_unwrap_does_not_qualify_a_different_type() {
+        let preamble = "struct Snap {}\n\
+             struct Store { func snapshot(_ p: Int) -> Snap { Snap() } }\n\
+             struct Other { func snapshot(_ p: Int) -> Snap { Snap() } }\n";
+        for param in ["Store", "Store?", "Other", "Other?"] {
+            let source =
+                format!("{preamble}func t(_ store: {param}) {{ let s = store!.snapshot(1) }}");
+            assert_snapshot_shape(&source, param, "store");
+        }
+        // An untyped shadow has no written type, so neither Store nor Other.
+        let shadow = format!(
+            "{preamble}func t(_ store: Other) {{ let store = make(); let s = store!.snapshot(1) }}"
+        );
+        let found = bound(&shadow, "t");
+        assert_eq!(ty_of(&found, "s"), None);
+        if let Some(shape) = init_of(&found, "s") {
+            assert_eq!(shape, "store.snapshot", "shadow qualified {shape}");
+        }
+    }
+
+    #[test]
+    fn an_extension_only_property_wrapper_types_nothing() {
+        let source = "@propertyWrapper\nextension Env { var wrappedValue: Client }\n\
+             struct R { @Env(Client.self) var client }";
+        with_property(source, "client", |client| {
+            assert_eq!(property_wrapper_wrapped_type(client, source), None);
+        });
+        let use_it = "@propertyWrapper\nextension Env { var wrappedValue: Client }\n\
+             struct R { @Env(Client.self) var client\n func t() { let c = client } }";
+        assert_eq!(ty_of(&bound(use_it, "t"), "c"), None);
+    }
+
+    #[test]
+    fn a_wrapped_value_named_twice_as_a_nested_type_types_nothing() {
+        // `Client` is a nested type twice in this file. Emitting that spelling
+        // would pick neither declaration.
+        let source = "struct A { struct Client {} }\nstruct B { struct Client {} }\n\
+             @propertyWrapper struct Env { var wrappedValue: Client }\n\
+             struct R { @Env(Client.self) var client }";
+        with_property(source, "client", |client| {
+            assert_eq!(
+                property_wrapper_wrapped_type(client, source),
+                None,
+                "two nested Clients must not type the property"
+            );
+        });
+        let use_it = "struct A { struct Client {} }\nstruct B { struct Client {} }\n\
+             @propertyWrapper struct Env { var wrappedValue: Client }\n\
+             struct R { @Env(Client.self) var client\n func t() { let c = client } }";
+        assert_eq!(ty_of(&bound(use_it, "t"), "c"), None);
+    }
+
+    #[test]
+    fn hostile_swift_inputs_do_not_panic() {
+        let carrier = "struct R { var client }";
+        with_property(carrier, "client", |client| {
+            assert_eq!(property_wrapper_wrapped_type(client, ""), None);
+        });
+        let nameless = "@propertyWrapper struct Env { var wrappedValue: Client }\n\
+             struct R { @Env(Client.self) var }\n\
+             func t(_ store: Store) { let s = store.snapshot(1) }";
+        let found = bound(nameless, "t");
+        assert_eq!(ty_of(&found, "s"), None);
+        assert_ne!(
+            init_of(&found, "s").as_deref(),
+            Some("Client.snapshot"),
+            "a nameless wrapper property typed the call"
+        );
+        let only_question = "func t() { let s = ?.snapshot(1) }";
+        let found = bound(only_question, "t");
+        assert_eq!(ty_of(&found, "s"), None);
+        if let Some(shape) = init_of(&found, "s") {
+            assert!(
+                shape == "?.snapshot" || !shape.chars().next().is_some_and(char::is_uppercase),
+                "receiver `?` qualified {shape}"
+            );
+        }
+    }
+
+    /// Neither name wears the other element's type. Abstaining both is fine.
+    fn assert_tuple_not_crossed(source: &str) {
+        let found = bound(source, "t");
+        assert_ne!(
+            ty_of(&found, "store").as_deref(),
+            Some("Svc"),
+            "store took Svc in {source}"
+        );
+        assert_ne!(
+            ty_of(&found, "svc").as_deref(),
+            Some("Store"),
+            "svc took Store in {source}"
+        );
+    }
+
+    #[test]
+    fn tuple_labels_with_unicode_or_an_empty_label_do_not_shift() {
+        let unicode = "struct Store {}\nstruct Svc {}\n\
+             func makePair() -> (støre: Store, svc: Svc) { (Store(), Svc()) }\n\
+             func t() { let (støre: store, svc: svc) = makePair() }";
+        let found = bound(unicode, "t");
+        // Matching labels keep their elements; a miss must not swap them.
+        if ty_of(&found, "store").is_some() || ty_of(&found, "svc").is_some() {
+            assert_eq!(ty_of(&found, "store").as_deref(), Some("Store"));
+            assert_eq!(ty_of(&found, "svc").as_deref(), Some("Svc"));
+        }
+        let empty_on_type = "struct Store {}\nstruct Svc {}\n\
+             func makePair() -> (_: Store, svc: Svc) { (Store(), Svc()) }\n\
+             func t() { let (store, svc) = makePair() }";
+        assert_tuple_not_crossed(empty_on_type);
+        let empty_on_pattern = "struct Store {}\nstruct Svc {}\n\
+             func makePair() -> (store: Store, svc: Svc) { (Store(), Svc()) }\n\
+             func t() { let (_: store, svc: svc) = makePair() }";
+        assert_tuple_not_crossed(empty_on_pattern);
+        let unicode_and_blank = "struct Store {}\nstruct Svc {}\n\
+             func makePair() -> (støre: Store, _: Svc) { (Store(), Svc()) }\n\
+             func t() { let (støre: store, _: svc) = makePair() }";
+        assert_tuple_not_crossed(unicode_and_blank);
     }
 
     fn with_property(source: &str, name: &str, check: impl Fn(tree_sitter::Node)) {

@@ -553,6 +553,13 @@ fn a_swift_property_wrapper_states_its_wrapped_type_or_nothing() {
         names_a_field("a.swift", wrapped, "client").as_deref(),
         Some("Client")
     );
+    let once = "struct Client {}\n@propertyWrapper struct Env {\n    var wrappedValue: Client\n}\n\
+         struct R {\n    @Env(Client.self) private var client\n}\n";
+    assert_eq!(
+        names_a_field("a.swift", once, "client").as_deref(),
+        Some("Client"),
+        "one Client in this file is still Client"
+    );
     let abstain = [
         "struct R {\n    @Environment(\\.modelContext) private var context\n}\n",
         "@propertyWrapper struct Env { var wrappedValue: Client }\n\
@@ -565,6 +572,9 @@ fn a_swift_property_wrapper_states_its_wrapped_type_or_nothing() {
          struct R { @Env(Client.self) var client }\n",
         "@propertyWrapper struct Env { var wrappedValue: Client }\n\
          struct R { @Env(Client.self) @Other var client }\n",
+        "struct A { struct Client {} }\nstruct B { struct Client {} }\n\
+         @propertyWrapper struct Env { var wrappedValue: Client }\n\
+         struct R { @Env(Client.self) var client }\n",
     ];
     for (index, source) in abstain.iter().enumerate() {
         let field = if index == 0 { "context" } else { "client" };
