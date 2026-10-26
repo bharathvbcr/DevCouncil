@@ -29,9 +29,7 @@ use devmap_store::Store;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-#[allow(dead_code)] // only `scratch` and `json` are used here
-#[path = "support_ignored/mod.rs"]
-mod support_ignored;
+use crate::support_ignored;
 
 const CYCLES: usize = 20;
 const SETTLE_BOUND: Duration = Duration::from_secs(30);

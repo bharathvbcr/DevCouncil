@@ -1284,8 +1284,8 @@ fn s01_thousands_of_factories_bounded_and_correct() {
 #[ignore = "pre-existing, ft-c0afdfef follow-up"]
 fn s02_recursive_factory_return_types_terminate() {
     let mut chain = String::from("A.make()");
-    for i in 0..200 {
-        chain.push_str(if i % 2 == 0 { ".make()" } else { ".make()" });
+    for _ in 0..200 {
+        chain.push_str(".make()");
     }
     let src = format!(
         "class A:\n    @staticmethod\n    def make() -> \"B\":\n        return B()\n    def run(self):\n        return 1\n\nclass B:\n    @staticmethod\n    def make() -> A:\n        return A()\n    def run(self):\n        return 2\n\ndef use():\n    return {chain}.run()\n"
@@ -1695,7 +1695,7 @@ fn s06_many_dotted_module_calls_resolve_cost() {
 /// Characterisation: print the tier of the wrong edges the probes above catch.
 #[test]
 fn z_confidence_report() {
-    let cases: Vec<(&str, Vec<(&str, String)>, &str)> = vec![
+    let cases = vec![
         (
             "b12 untyped param",
             vec![

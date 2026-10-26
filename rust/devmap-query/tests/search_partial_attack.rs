@@ -380,7 +380,7 @@ fn p3_invalid_utf8_file_unscoped_is_not_silent() {
 fn p3_a_ten_megabyte_file_scoped_is_unavailable_and_fast() {
     let indexed = "pub const KEPT: u32 = 1;\npub const LOST: u32 = 2;\n";
     let mut big = indexed.as_bytes().to_vec();
-    big.extend(std::iter::repeat(b' ').take(10 * 1024 * 1024));
+    big.extend(std::iter::repeat_n(b' ', 10 * 1024 * 1024));
     let (store, root) = corpus(
         "p3big",
         vec![F::hole("consts.rs", indexed, "pub const LOST: u32 = 2;", "LOST").on_disk(&big)],

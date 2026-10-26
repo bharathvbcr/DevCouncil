@@ -351,9 +351,8 @@ fn d07b_decorator_directly_after_previous_symbol_no_blank_line() {
 #[test]
 fn d07c_decorator_is_the_first_statement_after_imports_only() {
     // No previous symbol at all: the decorator is the first thing in the file.
-    let g = format!(
-        "import deco\nfrom deco import A\n\n@deco.many\ndef make() -> A:\n    return A()\n"
-    );
+    let g = "import deco\nfrom deco import A\n\n@deco.many\ndef make() -> A:\n    return A()\n"
+        .to_string();
     let res = resolve(&[
         ("deco.py", "from typing import List\n\nclass A:\n    def append(self, x):\n        return 1\n\ndef many(fn):\n    def inner(*a) -> List[A]:\n        return [fn(*a)]\n    return inner\n"),
         ("f.py", &g),

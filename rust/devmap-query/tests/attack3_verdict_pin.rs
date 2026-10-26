@@ -126,14 +126,8 @@ fn an_empty_store_answer_is_unverified_with_no_generation() {
 mod autotraits {
     use std::marker::PhantomData;
     pub struct W<T>(PhantomData<T>);
-    pub trait FallbackSend {
-        const IS_SEND: bool = false;
-    }
-    impl<T> FallbackSend for W<T> {}
-    pub trait FallbackSync {
-        const IS_SYNC: bool = false;
-    }
-    impl<T> FallbackSync for W<T> {}
+    // Inherent, so `W::<T>::IS_SEND` exists only when `T: Send`. A blanket
+    // trait const of `false` was never consulted by that path.
     impl<T: Send> W<T> {
         pub const IS_SEND: bool = true;
     }

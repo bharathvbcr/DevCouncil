@@ -183,7 +183,8 @@ fn an_answer_never_carries_another_generations_verified_verdict() {
     let writer = Store::open(&db).unwrap();
     let stop = AtomicBool::new(false);
     // (callers in the answer == generation it was built from, verdict gen, fresh)
-    let seen: Mutex<Vec<(usize, Option<u32>, Option<bool>)>> = Mutex::new(Vec::new());
+    type Seen = (usize, Option<u32>, Option<bool>);
+    let seen: Mutex<Vec<Seen>> = Mutex::new(Vec::new());
     std::thread::scope(|scope| {
         scope.spawn(|| {
             while !stop.load(Ordering::Relaxed) {

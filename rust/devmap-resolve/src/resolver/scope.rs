@@ -313,10 +313,7 @@ impl Resolver {
                 if !climbed.insert(identity.clone()) {
                     continue;
                 }
-                if identity
-                    .strip_prefix(&file_prefix)
-                    .is_some_and(|qualified| inside(qualified))
-                {
+                if identity.strip_prefix(&file_prefix).is_some_and(inside) {
                     return false;
                 }
                 if let Some(parent) = self

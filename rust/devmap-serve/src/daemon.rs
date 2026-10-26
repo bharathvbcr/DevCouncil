@@ -1689,6 +1689,10 @@ impl Daemon {
     /// [`Self::freshness_walk_blocked`]), so a storm costs one walk. The walk
     /// reads `walk_cancel` and returns an error, recording no verdict, when
     /// the daemon is leaving.
+    /// Test entry. Production drains call [`Self::refresh_freshness_verdict_with`]
+    /// with the walk token; this wrapper only exists so a test can ask for the
+    /// daemon's own cancel without threading it through.
+    #[cfg(test)]
     fn refresh_freshness_verdict(&self) -> anyhow::Result<Duration> {
         self.refresh_freshness_verdict_with(&self.walk_cancel)
     }
@@ -1721,11 +1725,7 @@ impl Daemon {
     /// A queue that cannot be read counts as not quiet: a check that could not
     /// run must not start the expensive one.
     fn freshness_walk_blocked(&self) -> bool {
-        self.watch_backlog.is_busy()
-            || self
-                .store
-                .queued_path_count()
-                .map_or(true, |queued| queued != 0)
+        self.watch_backlog.is_busy() || !matches!(self.store.queued_path_count(), Ok(0))
     }
 
     /// Discovery, hashing and SQLite work must not occupy the IPC executor.
@@ -6095,7 +6095,7 @@ mod tests {
         let daemon = Daemon::new(Store::open_in_memory().unwrap(), root.clone());
         daemon
             .store
-            .enqueue_pending_paths_under_root(&root, &[a.clone()])
+            .enqueue_pending_paths_under_root(&root, std::slice::from_ref(&a))
             .unwrap();
         assert_eq!(daemon.drain_pending_batch().unwrap(), 1);
         assert_eq!(
@@ -6111,7 +6111,7 @@ mod tests {
         fs::write(root.join("src/a.py"), "def a():\n    return 2\n").unwrap();
         daemon
             .store
-            .enqueue_pending_paths_under_root(&root, &[a.clone()])
+            .enqueue_pending_paths_under_root(&root, std::slice::from_ref(&a))
             .unwrap();
         let sha = "c".repeat(40);
         let store = daemon.store.clone();
@@ -6121,7 +6121,7 @@ mod tests {
             .drain_pending_batch_with_head(&move |_: &std::path::Path| {
                 fs::write(root_in_drain.join("src/a.py"), "def a():\n    return 3\n").unwrap();
                 store
-                    .enqueue_pending_paths_under_root(&root_in_drain, &[racing.clone()])
+                    .enqueue_pending_paths_under_root(&root_in_drain, std::slice::from_ref(&racing))
                     .unwrap();
                 Ok(sha.clone())
             })

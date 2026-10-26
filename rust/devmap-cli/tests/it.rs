@@ -15,6 +15,11 @@
 //!   as a separate target or silently skipped: `every_test_file_is_a_module`
 //!   fails until it is declared here or isolated.
 
+// One load of the daemon-ignore helpers. The suites below used to each
+// `mod` this file, and clippy::duplicate_mod rejects that in one test binary.
+#[path = "support_ignored/mod.rs"]
+mod support_ignored;
+
 mod a_budget_refused_file_is_re_extracted_by_the_next_build;
 mod a_dead_verdict_lands_on_an_unchanged_file_under_a_narrowed_write;
 mod a_message_literal_has_no_run_of_spaces;

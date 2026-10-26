@@ -315,9 +315,7 @@ fn a_block_scoped_const_is_not_the_module_object() {
     // `{ const w = ...core }` is block scope; the module-level `w` the call
     // reads is the import, whose object is `other`.
     let holder = "import { other } from './core';\nexport const w = { ...other };\n";
-    let user = format!(
-        "import {{ core }} from './core';\nimport {{ w }} from './holder';\n{{ const w = {{ ...core }}; }}\nexport function run() {{ w.info(); }}\n"
-    );
+    let user = "import { core } from './core';\nimport { w } from './holder';\n{ const w = { ...core }; }\nexport function run() { w.info(); }\n".to_string();
     let result = resolve(&[
         ("src/core.ts", CORE),
         ("src/holder.ts", holder),

@@ -110,10 +110,7 @@ fn every_public_answer_method_leaves_through_the_one_exit() {
 /// Method name of a sweep label: `impact("a")` -> `impact`, `clones.groups` ->
 /// `clones`, `neighbors_at_rung([..]).x.callers` -> `neighbors_at_rung`.
 fn method_of(label: &str) -> &str {
-    label
-        .split(|c| c == '(' || c == '.')
-        .next()
-        .unwrap_or(label)
+    label.split(['(', '.']).next().unwrap_or(label)
 }
 
 #[test]

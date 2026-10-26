@@ -235,8 +235,8 @@ fn parse_pins(raw: &str, path: &Path) -> (Vec<Pin>, Gates) {
         })
         .collect();
     let gates = Gates {
-        floors: rates(&value, "recall_floors_percent", &path),
-        targets: rates(&value, "recall_targets_percent", &path),
+        floors: rates(&value, "recall_floors_percent", path),
+        targets: rates(&value, "recall_targets_percent", path),
         must_include,
         parse_failed,
     };
