@@ -2136,9 +2136,8 @@ mod session_bounds {
             Instant::now() + Duration::from_secs(5),
         )
         .unwrap_or_else(|e| panic!("initialize was answered: {e:?}"));
-        let message = |text: &str| {
-            json!({ "jsonrpc": "2.0", "method": "m", "params": { "text": text } })
-        };
+        let message =
+            |text: &str| json!({ "jsonrpc": "2.0", "method": "m", "params": { "text": text } });
         let framing = serde_json::to_vec(&message("")).unwrap().len();
         let at_cap = "A".repeat(LSP_PAYLOAD_CAP - framing);
         assert!(

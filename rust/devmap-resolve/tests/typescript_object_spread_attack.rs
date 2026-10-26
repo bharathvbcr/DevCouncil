@@ -119,7 +119,9 @@ fn a_setter_after_a_spread_never_binds_the_spread_member() {
 #[test]
 fn method_shorthand_beside_a_spread_wins() {
     binds_exactly(
-        &format!("{HEAD}const w = {{ ...core, info() {{}} }};\nexport function run() {{ w.info(); }}\n"),
+        &format!(
+            "{HEAD}const w = {{ ...core, info() {{}} }};\nexport function run() {{ w.info(); }}\n"
+        ),
         &["src/user.ts::w.info"],
     );
 }
@@ -143,7 +145,9 @@ fn proto_key_is_never_a_wrong_bind() {
 #[test]
 fn spread_of_this_after_a_known_spread_abstains() {
     never_binds(
-        &format!("{HEAD}const w = {{ ...core, ...this }};\nexport function run() {{ w.info(); }}\n"),
+        &format!(
+            "{HEAD}const w = {{ ...core, ...this }};\nexport function run() {{ w.info(); }}\n"
+        ),
         &[CORE_INFO],
     );
 }
@@ -151,7 +155,9 @@ fn spread_of_this_after_a_known_spread_abstains() {
 #[test]
 fn spread_of_arguments_after_a_known_spread_abstains() {
     never_binds(
-        &format!("{HEAD}const w = {{ ...core, ...arguments }};\nexport function run() {{ w.info(); }}\n"),
+        &format!(
+            "{HEAD}const w = {{ ...core, ...arguments }};\nexport function run() {{ w.info(); }}\n"
+        ),
         &[CORE_INFO],
     );
 }
@@ -494,7 +500,8 @@ fn a_default_import_spread_never_binds_a_same_named_module_function() {
 
 #[test]
 fn a_default_import_alias_never_binds_a_same_named_module_function() {
-    let m = "export function info(): void {}\nconst obj = { info(): void {} };\nexport default obj;\n";
+    let m =
+        "export function info(): void {}\nconst obj = { info(): void {} };\nexport default obj;\n";
     let user = "import lg from './m';\nconst w = lg;\nexport function run() { w.info(); }\n";
     let result = resolve(&[("src/m.ts", m), ("src/user.ts", user)]);
     let found: Vec<String> = calls_in(&result, "src/user.ts")
@@ -544,7 +551,10 @@ fn an_object_prototype_method_never_binds_an_in_repo_namesake() {
         .into_iter()
         .map(|(_, t)| t)
         .collect();
-    assert!(found.is_empty(), "a prototype method bound in-repo: {found:?}");
+    assert!(
+        found.is_empty(),
+        "a prototype method bound in-repo: {found:?}"
+    );
 }
 
 #[test]
@@ -582,7 +592,8 @@ fn an_unknown_earlier_spread_never_lets_a_global_namesake_answer_an_undefined_ke
 #[test]
 fn a_key_nothing_defines_never_binds_a_global_namesake() {
     let nothing = "export function nothing(): void {}\n";
-    let user = format!("{HEAD}const w = {{ ...core }};\nexport function run() {{ w.nothing(); }}\n");
+    let user =
+        format!("{HEAD}const w = {{ ...core }};\nexport function run() {{ w.nothing(); }}\n");
     let result = resolve(&[
         ("src/core.ts", CORE),
         ("src/nothing.ts", nothing),
@@ -609,7 +620,10 @@ fn an_unreadable_mutation_after_a_known_spread_abstains_for_unanswered_keys_only
 #[test]
 fn a_payload_cached_before_js_objects_existed_is_not_servable() {
     let user = format!("{HEAD}const w = {{ ...core }};\nexport function run() {{ w.info(); }}\n");
-    let fresh: Vec<Extraction> = vec![extract_file("src/core.ts", CORE), extract_file("src/user.ts", &user)];
+    let fresh: Vec<Extraction> = vec![
+        extract_file("src/core.ts", CORE),
+        extract_file("src/user.ts", &user),
+    ];
     let mut stale = fresh.clone();
     for ext in &mut stale {
         let mut json: serde_json::Value = serde_json::to_value(&*ext).unwrap();
@@ -680,7 +694,11 @@ fn a_vue_script_block_spread_binds_like_a_ts_file() {
         .into_iter()
         .map(|(_, t)| t)
         .collect();
-    assert_eq!(found, vec![CORE_INFO.to_string()], "embedded script behaviour");
+    assert_eq!(
+        found,
+        vec![CORE_INFO.to_string()],
+        "embedded script behaviour"
+    );
 }
 
 #[test]
@@ -691,7 +709,11 @@ fn a_svelte_script_block_spread_binds_like_a_ts_file() {
         .into_iter()
         .map(|(_, t)| t)
         .collect();
-    assert_eq!(found, vec![CORE_INFO.to_string()], "embedded script behaviour");
+    assert_eq!(
+        found,
+        vec![CORE_INFO.to_string()],
+        "embedded script behaviour"
+    );
 }
 
 // -------------------------------------------------------------- hostile input
@@ -710,7 +732,9 @@ fn hostile_100k_member_literal_with_many_member_calls_is_bounded() {
         body.push_str(&format!("  m{i}() {{}},\n"));
     }
     body.push_str("};\n");
-    let mut user = String::from("import { big } from './big';\nconst w = { ...big };\nexport function run() {\n");
+    let mut user = String::from(
+        "import { big } from './big';\nconst w = { ...big };\nexport function run() {\n",
+    );
     for i in (0..100_000).step_by(10) {
         user.push_str(&format!("  w.m{i}();\n"));
     }
@@ -753,7 +777,9 @@ fn hostile_many_module_consts_with_calls_is_not_quadratic() {
     }
     body.push_str("}\n");
     let start = Instant::now();
-    let _ = timed("30k-consts+30k-calls", || resolve(&[("src/user.ts", &body)]));
+    let _ = timed("30k-consts+30k-calls", || {
+        resolve(&[("src/user.ts", &body)])
+    });
     assert!(start.elapsed().as_secs() < 30, "{:?}", start.elapsed());
 }
 
@@ -779,7 +805,9 @@ fn hostile_5k_deep_nested_spreads_do_not_overflow_the_stack() {
             })
         })
         .unwrap();
-    let found = handle.join().expect("stack overflow or panic on deep spreads");
+    let found = handle
+        .join()
+        .expect("stack overflow or panic on deep spreads");
     assert!(found.iter().all(|(_, t)| t == CORE_INFO));
 }
 
@@ -788,7 +816,9 @@ fn hostile_5mib_single_line_minified_file_finishes() {
     let mut body = String::from("import{core}from'./core';const w={...core};");
     let mut i = 0;
     while body.len() < 5 * 1024 * 1024 {
-        body.push_str(&format!("const k{i}={{...core,a{i}(){{}}}};Object.assign(k{i},core);"));
+        body.push_str(&format!(
+            "const k{i}={{...core,a{i}(){{}}}};Object.assign(k{i},core);"
+        ));
         i += 1;
     }
     body.push_str("export function run(){w.info()}");
@@ -808,8 +838,15 @@ fn read_ts_tree(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(St
         let path = entry.path();
         if path.is_dir() {
             read_ts_tree(&path, root, out);
-        } else if matches!(path.extension().and_then(|e| e.to_str()), Some("ts" | "tsx" | "js")) {
-            let rel = path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+        } else if matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("ts" | "tsx" | "js")
+        ) {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
             out.push((rel, std::fs::read_to_string(&path).unwrap()));
         }
     }
@@ -822,7 +859,10 @@ fn the_ts_fixture_resolves_identically_on_one_thread_and_four() {
     read_ts_tree(&root, &root, &mut files);
     assert!(files.len() > 10, "fixture not found at {root:?}");
     let run = |threads: usize| -> Vec<String> {
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
         pool.install(|| {
             use rayon::prelude::*;
             let exts: Vec<Extraction> = files.par_iter().map(|(p, s)| extract_file(p, s)).collect();
@@ -831,7 +871,17 @@ fn the_ts_fixture_resolves_identically_on_one_thread_and_four() {
             let res = r.resolve_all(&exts).unwrap();
             res.edges
                 .iter()
-                .map(|e| format!("{}|{}|{}|{}|{:?}|{:?}", e.source_file, e.source_symbol, e.target_file, e.target_symbol, e.edge_kind, e.details))
+                .map(|e| {
+                    format!(
+                        "{}|{}|{}|{}|{:?}|{:?}",
+                        e.source_file,
+                        e.source_symbol,
+                        e.target_file,
+                        e.target_symbol,
+                        e.edge_kind,
+                        e.details
+                    )
+                })
                 .collect()
         })
     };

@@ -77,7 +77,9 @@ fn p5_time_100_refusals_on_a_repo_sized_store() {
             .unwrap();
     });
     let layered = min_of_5(|| {
-        engine.impact_layered(req("zz_no_such_symbol_anywhere")).unwrap();
+        engine
+            .impact_layered(req("zz_no_such_symbol_anywhere"))
+            .unwrap();
     });
     let finish_only = min_of_5(|| {
         let _ = store.query_source_freshness();

@@ -10,7 +10,12 @@ const OPAQUE_BASE: &str = "<opaque>";
 
 /// Exempt, with a reason that names the contract.
 fn names_contract(report: &DeadSymbolReport, word: &str) -> bool {
-    report.is_exempt && report.exemption_reason.as_deref().unwrap_or_default().contains(word)
+    report.is_exempt
+        && report
+            .exemption_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains(word)
 }
 use devmap_resolve::model::ResolutionResult;
 use devmap_resolve::Resolver;

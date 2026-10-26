@@ -600,7 +600,8 @@ mod tests {
         assert!(error.is::<devmap_extract::BuildCancelled>(), "{error:#}");
     }
 
-    static WORKERS: std::sync::Mutex<Vec<std::thread::ThreadId>> = std::sync::Mutex::new(Vec::new());
+    static WORKERS: std::sync::Mutex<Vec<std::thread::ThreadId>> =
+        std::sync::Mutex::new(Vec::new());
 
     /// An extractor that takes long enough for every idle worker to join in,
     /// and records which threads ran it.
@@ -662,7 +663,8 @@ mod tests {
         );
         let used = WORKERS.lock().unwrap().len();
         assert_eq!(
-            used, expected,
+            used,
+            expected,
             "{} files ran on {used} workers of a {expected}-wide pool",
             scanned.sources.len()
         );

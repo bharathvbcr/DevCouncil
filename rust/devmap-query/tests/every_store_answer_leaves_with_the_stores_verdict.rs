@@ -134,9 +134,7 @@ fn the_sweep_reaches_every_public_answer_method() {
         .map(|(name, _, body)| {
             let targets = answers
                 .iter()
-                .filter(|(other, _, _)| {
-                    other != name && body.contains(&format!("self.{other}("))
-                })
+                .filter(|(other, _, _)| other != name && body.contains(&format!("self.{other}(")))
                 .map(|(other, _, _)| other.as_str())
                 .collect();
             (name.as_str(), targets)
@@ -170,7 +168,11 @@ fn no_part_of_any_answer_says_not_checked_beside_a_stale_verdict() {
     let fx = fixture("guard-stale", None);
     fx.store.status("t").unwrap();
     fs::write(fx.root.join("chain.py"), "def a():\n    return 2\n").unwrap();
-    fs::write(fx.root.join("brand_new_file.py"), "def z():\n    return 0\n").unwrap();
+    fs::write(
+        fx.root.join("brand_new_file.py"),
+        "def z():\n    return 0\n",
+    )
+    .unwrap();
     let status = fx.store.status("t").unwrap();
     assert_eq!(status.source_freshness, Some(false), "{status:?}");
     let want = expected(&fx.store);
@@ -181,9 +183,18 @@ fn no_part_of_any_answer_says_not_checked_beside_a_stale_verdict() {
         .iter()
         .filter(|(_, got)| {
             got.fresh != Some(false)
-                || got.reason.as_deref().unwrap_or_default().contains("not checked")
+                || got
+                    .reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("not checked")
         })
         .map(|(label, got)| format!("{label}: {got:?}"))
         .collect();
-    assert!(bad.is_empty(), "{} parts lost the verdict:\n{}", bad.len(), bad.join("\n"));
+    assert!(
+        bad.is_empty(),
+        "{} parts lost the verdict:\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
 }

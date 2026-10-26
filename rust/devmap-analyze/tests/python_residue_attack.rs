@@ -31,7 +31,11 @@ fn find<'a>(reports: &'a [DeadSymbolReport], symbol: &str) -> Option<&'a DeadSym
 
 fn contract(reports: &[DeadSymbolReport], symbol: &str, word: &str) -> bool {
     find(reports, symbol).is_some_and(|r| {
-        r.is_exempt && r.exemption_reason.as_deref().unwrap_or_default().contains(word)
+        r.is_exempt
+            && r.exemption_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains(word)
     })
 }
 
@@ -47,7 +51,11 @@ fn local_make_basedead_method_private_method_is_still_reported() {
         "c.py",
         "def make_base():\n    return object\n\nclass D(make_base()):\n    def dead_method(self):\n        return 1\n",
     )]);
-    assert!(not_exempt(&r, "D.dead_method"), "{:?}", find(&r, "D.dead_method"));
+    assert!(
+        not_exempt(&r, "D.dead_method"),
+        "{:?}",
+        find(&r, "D.dead_method")
+    );
 }
 
 #[test]
@@ -62,9 +70,16 @@ fn finding_local_make_basedead_method_private_method_keeps_the_confident_tier() 
         "c.py",
         "def make_base():\n    return object\n\nclass D(make_base()):\n    def dead_method(self):\n        return 1\n",
     )]);
-    let k = find(&known, "D.dead_method").expect("known-base row").confidence;
-    let o = find(&opaque, "D.dead_method").expect("opaque-base row").confidence;
-    assert!(o >= k, "opaque base lowered a dead private method from {k} to {o}");
+    let k = find(&known, "D.dead_method")
+        .expect("known-base row")
+        .confidence;
+    let o = find(&opaque, "D.dead_method")
+        .expect("opaque-base row")
+        .confidence;
+    assert!(
+        o >= k,
+        "opaque base lowered a dead private method from {k} to {o}"
+    );
 }
 
 #[test]
@@ -73,7 +88,11 @@ fn star_args_basedead_method_private_method_is_still_reported() {
         "c.py",
         "class D(*mixins):\n    def dead_method(self):\n        return 1\n",
     )]);
-    assert!(not_exempt(&r, "D.dead_method"), "{:?}", find(&r, "D.dead_method"));
+    assert!(
+        not_exempt(&r, "D.dead_method"),
+        "{:?}",
+        find(&r, "D.dead_method")
+    );
 }
 
 #[test]
@@ -82,7 +101,11 @@ fn opaque_base_on_a_nested_class_does_not_exempt_the_outer_classs_methods() {
         "c.py",
         "def make_base():\n    return object\n\nclass Outer:\n    class Inner(make_base()):\n        pass\n\n    def dead_method(self):\n        return 1\n",
     )]);
-    assert!(not_exempt(&r, "Outer.dead_method"), "{:?}", find(&r, "Outer.dead_method"));
+    assert!(
+        not_exempt(&r, "Outer.dead_method"),
+        "{:?}",
+        find(&r, "Outer.dead_method")
+    );
 }
 
 #[test]
@@ -91,7 +114,11 @@ fn opaque_base_on_a_subclass_does_not_exempt_the_unrelated_sibling() {
         "c.py",
         "def make_base():\n    return object\n\nclass A(make_base()):\n    pass\n\nclass B:\n    def dead_method(self):\n        return 1\n",
     )]);
-    assert!(not_exempt(&r, "B.dead_method"), "{:?}", find(&r, "B.dead_method"));
+    assert!(
+        not_exempt(&r, "B.dead_method"),
+        "{:?}",
+        find(&r, "B.dead_method")
+    );
 }
 
 #[test]
@@ -102,7 +129,11 @@ fn opaque_base_two_levels_up_confines_exemption_to_descendants() {
         "c.py",
         "def make_base():\n    return object\n\nclass Mid(make_base()):\n    pass\n\nclass Leaf(Mid):\n    def dead_method(self):\n        return 1\n\nclass Alone:\n    def dead_method(self):\n        return 1\n",
     )]);
-    assert!(not_exempt(&r, "Alone.dead_method"), "{:?}", find(&r, "Alone.dead_method"));
+    assert!(
+        not_exempt(&r, "Alone.dead_method"),
+        "{:?}",
+        find(&r, "Alone.dead_method")
+    );
 }
 
 #[test]
@@ -232,8 +263,16 @@ fn nn_module_through_a_subscripted_and_parenthesised_base() {
         "net.py",
         "import torch.nn as nn\n\nclass A((nn.Module)):\n    def forward(self, x):\n        return x\n\nclass B(nn.Module, metaclass=type):\n    def forward(self, x):\n        return x\n",
     )]);
-    assert!(contract(&r, "A.forward", "torch"), "{:?}", find(&r, "A.forward"));
-    assert!(contract(&r, "B.forward", "torch"), "{:?}", find(&r, "B.forward"));
+    assert!(
+        contract(&r, "A.forward", "torch"),
+        "{:?}",
+        find(&r, "A.forward")
+    );
+    assert!(
+        contract(&r, "B.forward", "torch"),
+        "{:?}",
+        find(&r, "B.forward")
+    );
 }
 
 #[test]
@@ -257,7 +296,10 @@ fn nn_module_in_a_class_that_a_second_local_class_of_the_same_name_shadows() {
         "net.py",
         "import torch.nn as nn\n\nclass M(nn.Module):\n    def forward(self, x):\n        return x\n\nclass M:\n    def forward(self, x):\n        return x\n",
     )]);
-    let plain: Vec<_> = r.iter().filter(|row| row.symbol_name == "M.forward").collect();
+    let plain: Vec<_> = r
+        .iter()
+        .filter(|row| row.symbol_name == "M.forward")
+        .collect();
     assert!(
         plain.iter().any(|row| !row.is_exempt) || plain.len() <= 1,
         "{plain:?}"

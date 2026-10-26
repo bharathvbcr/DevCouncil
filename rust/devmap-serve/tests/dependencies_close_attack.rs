@@ -12,14 +12,18 @@ fn corpus() -> Arc<Store> {
         ("lib.py", "RETRY = 2\n\n\ndef helper():\n    return 1\n\n\ndef worker():\n    helper()\n    return RETRY\n"),
         ("callers.py", "from lib import worker\n\n\ndef caller():\n    return worker()\n"),
     ];
-    let extractions: Vec<_> =
-        files.iter().map(|(p, s)| devmap_extract::extract_file(p, s)).collect();
+    let extractions: Vec<_> = files
+        .iter()
+        .map(|(p, s)| devmap_extract::extract_file(p, s))
+        .collect();
     let mut resolver = devmap_resolve::Resolver::new();
     resolver.index_extractions(&extractions);
     let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = devmap_analyze::analyze(&extractions, &resolution);
     let store = Store::open_in_memory().unwrap();
-    store.save_generation(&extractions, &resolution, &analysis).unwrap();
+    store
+        .save_generation(&extractions, &resolution, &analysis)
+        .unwrap();
     Arc::new(store)
 }
 
@@ -43,7 +47,11 @@ async fn p1_note_appears_only_on_dependencies_and_never_as_null() {
         let name = tool["name"].as_str().unwrap().to_string();
         let mut args = serde_json::Map::new();
         let props = &tool["inputSchema"]["properties"];
-        for req in tool["inputSchema"]["required"].as_array().cloned().unwrap_or_default() {
+        for req in tool["inputSchema"]["required"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
             let key = req.as_str().unwrap();
             let value = match props[key]["type"].as_str() {
                 Some("array") => json!(["worker"]),
@@ -55,13 +63,22 @@ async fn p1_note_appears_only_on_dependencies_and_never_as_null() {
         if name == "devmap_dependencies" {
             args.insert("target".into(), json!("RETRY"));
         }
-        let reply = call(&slot, 2, "tools/call", json!({"name": name, "arguments": args})).await;
+        let reply = call(
+            &slot,
+            2,
+            "tools/call",
+            json!({"name": name, "arguments": args}),
+        )
+        .await;
         let result = &reply["result"];
         if name == "devmap_dependencies" {
             if result["isError"] == json!(true) {
                 report.push_str(&format!("{name}: refused its own note: {result}\n"));
             } else if !result["structuredContent"]["note"].is_string() {
-                report.push_str(&format!("{name}: no string note: {}\n", result["structuredContent"]));
+                report.push_str(&format!(
+                    "{name}: no string note: {}\n",
+                    result["structuredContent"]
+                ));
             }
             continue;
         }

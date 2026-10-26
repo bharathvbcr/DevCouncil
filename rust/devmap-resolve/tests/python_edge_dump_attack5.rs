@@ -35,7 +35,11 @@ fn collect(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String,
             .is_some_and(|e| !matches!(e, "py" | "json" | "md" | "tsv" | "txt" | "lock"))
         {
             if let Ok(text) = std::fs::read_to_string(&path) {
-                let rel = path.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
                 out.push((rel, text));
             }
         }

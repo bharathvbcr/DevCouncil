@@ -30,7 +30,11 @@ fn collect(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String,
             collect(&path, root, out);
         } else if path.extension().is_some_and(|e| e == "py") {
             if let Ok(text) = std::fs::read_to_string(&path) {
-                let rel = path.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
                 out.push((rel, text));
             }
         }

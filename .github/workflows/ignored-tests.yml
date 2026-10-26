@@ -98,9 +98,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          npm install --global --no-audit --no-fund @anthropic-ai/claude-code
+          # Pinned. An unpinned install on 2026-10-26 shipped a CLI whose
+          # `plugin validate` had no `--json`, and the ignored test failed
+          # closed on `unknown option '--json'`. 2.1.310 is the release whose
+          # `--help` documents `--json` and `--strict` together.
+          npm install --global --no-audit --no-fund @anthropic-ai/claude-code@2.1.310
           command -v claude || { echo "::error::the claude CLI is not on PATH after install"; exit 1; }
           claude --version
+          claude plugin validate --help | grep -q -- '--json' || {
+            echo "::error::claude plugin validate has no --json; the ignored test cannot read its report"
+            exit 1
+          }
       - name: Validate the emitted bundle
         working-directory: rust
         run: "cargo test --locked -p devmap-cli --test it -- claude_integration:: --ignored --nocapture"

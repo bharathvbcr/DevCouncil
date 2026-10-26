@@ -78,8 +78,7 @@ fn a_reused_generation_id_does_not_keep_a_verified_verdict() {
         raw.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
         for t in tables {
             let keep = t.starts_with("sqlite_")
-                || t.starts_with("nodes_fts")
-                    && t != "nodes_fts_map"
+                || t.starts_with("nodes_fts") && t != "nodes_fts_map"
                 || t == "paths"
                 || t == "reader_compat"
                 || t == "pending_state"
@@ -92,15 +91,21 @@ fn a_reused_generation_id_does_not_keep_a_verified_verdict() {
             }
         }
         raw.execute("DELETE FROM nodes_fts", []).unwrap();
-        raw.execute("DELETE FROM sqlite_sequence WHERE name = 'generations'", []).unwrap();
+        raw.execute("DELETE FROM sqlite_sequence WHERE name = 'generations'", [])
+            .unwrap();
         land_generation(&fx.root, &writer, 5);
         reader.status("t").unwrap();
     });
     let answer = engine.impact(req("d", 1)).unwrap();
-    assert_eq!(reader.latest_generation_id().unwrap(), Some(1), "id was not reused");
+    assert_eq!(
+        reader.latest_generation_id().unwrap(),
+        Some(1),
+        "id was not reused"
+    );
     let verdict = &answer.source_freshness;
     assert_eq!(
-        verdict.fresh, None,
+        verdict.fresh,
+        None,
         "verified verdict {verdict:?} kept for an answer read from the pre-wipe generation 1 \
          ({} caller(s); id 1 now names a 5-caller generation)",
         answer.items.len(),
@@ -173,7 +178,9 @@ fn eight_readers_never_get_a_mis_verified_answer() {
                 scope.spawn(|| {
                     let engine = StoreQueryEngine::new(&reader);
                     for _ in 0..PER_READER {
-                        let Ok(r) = engine.impact(req("d", 1)) else { continue };
+                        let Ok(r) = engine.impact(req("d", 1)) else {
+                            continue;
+                        };
                         total.fetch_add(1, Ordering::Relaxed);
                         let v = &r.source_freshness;
                         if v.fresh.is_some() {
@@ -208,8 +215,17 @@ fn eight_readers_never_get_a_mis_verified_answer() {
         moved.load(Ordering::Relaxed),
         wrong.len()
     );
-    assert!(total.load(Ordering::Relaxed) >= 5000, "only {} queries", total.load(Ordering::Relaxed));
-    assert!(wrong.is_empty(), "{} mis-verified: {:?}", wrong.len(), &wrong[..wrong.len().min(8)]);
+    assert!(
+        total.load(Ordering::Relaxed) >= 5000,
+        "only {} queries",
+        total.load(Ordering::Relaxed)
+    );
+    assert!(
+        wrong.is_empty(),
+        "{} mis-verified: {:?}",
+        wrong.len(),
+        &wrong[..wrong.len().min(8)]
+    );
 }
 
 /// Probe 6: the reason names both ids and is short and control-free.
@@ -227,6 +243,12 @@ fn the_moved_reason_names_both_ids_and_stays_short() {
     });
     let answer = engine.impact(req("d", 1)).unwrap();
     let reason = answer.source_freshness.reason.clone().unwrap_or_default();
-    assert!(reason.contains("generation 1") && reason.contains("to 2"), "{reason}");
-    assert!(reason.len() < 200 && !reason.chars().any(|c| c.is_control()), "{reason}");
+    assert!(
+        reason.contains("generation 1") && reason.contains("to 2"),
+        "{reason}"
+    );
+    assert!(
+        reason.len() < 200 && !reason.chars().any(|c| c.is_control()),
+        "{reason}"
+    );
 }

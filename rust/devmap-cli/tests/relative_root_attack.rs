@@ -60,7 +60,8 @@ fn ok(out: &Output, what: &str) {
 
 fn json(out: &Output, what: &str) -> serde_json::Value {
     ok(out, what);
-    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{what}: not json ({e}): {}", text(out)))
+    serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{what}: not json ({e}): {}", text(out)))
 }
 
 fn field(value: &serde_json::Value, key: &str) -> String {
@@ -80,8 +81,7 @@ fn files(root: &Path) -> BTreeSet<String> {
     }
     let mut into = BTreeSet::new();
     walk(root, root, &mut into);
-    into
-        .into_iter()
+    into.into_iter()
         .filter(|n| !n.ends_with(".writer.lock"))
         .collect()
 }
@@ -95,7 +95,10 @@ fn files(root: &Path) -> BTreeSet<String> {
 fn p1_a_dotdot_spelling_reports_the_same_store_path_as_the_plain_one() {
     let base = scratch("p1paths");
     repo(&base, "x");
-    ok(&run(&base, &["build", "--manifest", "--full", "x"]), "build");
+    ok(
+        &run(&base, &["build", "--manifest", "--full", "x"]),
+        "build",
+    );
     let plain = json(&run(&base, &["paths", "--json", "x"]), "paths x");
     let dotdot = json(&run(&base, &["paths", "--json", "x/../x"]), "paths x/../x");
     assert_eq!(field(&plain, "root"), field(&dotdot, "root"));
@@ -111,13 +114,22 @@ fn p1_a_dotdot_spelling_reports_the_same_store_path_as_the_plain_one() {
 fn p1_status_db_path_is_the_same_for_a_dotdot_root() {
     let base = scratch("p1status");
     repo(&base, "x");
-    ok(&run(&base, &["build", "--manifest", "--full", "x"]), "build");
-    let plain = json(&run(&base, &["--root", "x", "--json", "status"]), "status x");
+    ok(
+        &run(&base, &["build", "--manifest", "--full", "x"]),
+        "build",
+    );
+    let plain = json(
+        &run(&base, &["--root", "x", "--json", "status"]),
+        "status x",
+    );
     let dotdot = json(
         &run(&base, &["--root", "x/../x", "--json", "status"]),
         "status x/../x",
     );
-    assert_eq!(field(&plain, "generation_id"), field(&dotdot, "generation_id"));
+    assert_eq!(
+        field(&plain, "generation_id"),
+        field(&dotdot, "generation_id")
+    );
     assert_eq!(
         field(&plain, "db_path"),
         field(&dotdot, "db_path"),
@@ -156,7 +168,10 @@ fn p1_the_recorded_repo_root_does_not_depend_on_the_spelling() {
     let b = repo(&base, "b");
     repo(&base, "y");
     ok(&run(&base, &["build", "--full", "a"]), "build a");
-    ok(&run(&base, &["build", "--full", "y/../b"]), "build b via ..");
+    ok(
+        &run(&base, &["build", "--full", "y/../b"]),
+        "build b via ..",
+    );
     let open = |root: &Path| {
         let db = devmap_extract::paths::store_path(root);
         devmap_store::Store::open_read_only(&db)
@@ -172,7 +187,10 @@ fn p1_the_recorded_repo_root_does_not_depend_on_the_spelling() {
         dotdot.replace("/b", ""),
         "recorded roots differ in shape: {plain} vs {dotdot}"
     );
-    assert!(!dotdot.contains(".."), "a `..` was stored as the repo root: {dotdot}");
+    assert!(
+        !dotdot.contains(".."),
+        "a `..` was stored as the repo root: {dotdot}"
+    );
 }
 
 // ---- Probe 2: symlinked parent ----------------------------------------------
@@ -187,15 +205,24 @@ fn p2_dot_from_a_symlinked_cwd_is_the_canonical_identity() {
     let real = repo(&base, "x");
     std::os::unix::fs::symlink(&base, home.join("lnk")).unwrap();
     let via_link = home.join("lnk").join("x");
-    ok(&run(&via_link, &["build", "--manifest", "--full", "--root", "."]), "build .");
-    let dot = json(&run(&via_link, &["--root", ".", "--json", "paths"]), "paths .");
+    ok(
+        &run(&via_link, &["build", "--manifest", "--full", "--root", "."]),
+        "build .",
+    );
+    let dot = json(
+        &run(&via_link, &["--root", ".", "--json", "paths"]),
+        "paths .",
+    );
     let canon = json(
         &run(&base, &["--json", "paths", real.to_str().unwrap()]),
         "paths canonical",
     );
     assert_eq!(field(&dot, "root"), field(&canon, "root"));
     assert_eq!(field(&dot, "db_path"), field(&canon, "db_path"));
-    assert!(real.join(".devmap").is_dir(), "state must land in the real tree");
+    assert!(
+        real.join(".devmap").is_dir(),
+        "state must land in the real tree"
+    );
     assert!(!home.join("lnk/x/x").exists());
 }
 
@@ -213,7 +240,10 @@ fn p2_symlinked_absolute_and_canonical_absolute_roots_share_one_store() {
     let via_link = home.join("lnk").join("x");
     // The store refuses a link-spelled absolute root ("use its real path"), so
     // two spellings cannot make two stores: the link spelling makes none.
-    let out = run(&home, &["build", "--manifest", "--full", via_link.to_str().unwrap()]);
+    let out = run(
+        &home,
+        &["build", "--manifest", "--full", via_link.to_str().unwrap()],
+    );
     assert!(
         !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("real path"),
         "{}",
@@ -225,7 +255,10 @@ fn p2_symlinked_absolute_and_canonical_absolute_roots_share_one_store() {
         files(&real)
     );
     ok(
-        &run(&home, &["build", "--manifest", "--full", real.to_str().unwrap()]),
+        &run(
+            &home,
+            &["build", "--manifest", "--full", real.to_str().unwrap()],
+        ),
         "canonical build",
     );
 }
@@ -241,18 +274,36 @@ fn p2_a_store_built_through_a_link_answers_the_canonical_spelling() {
     let real = repo(&base, "x");
     std::os::unix::fs::symlink(&base, home.join("lnk")).unwrap();
     let via_link = home.join("lnk").join("x");
-    ok(&run(&home, &["build", "--full", real.to_str().unwrap()]), "build canonical");
+    ok(
+        &run(&home, &["build", "--full", real.to_str().unwrap()]),
+        "build canonical",
+    );
     // A read through the link spelling must be refused or agree with the
     // canonical answer, never report a different (empty) store.
-    let by_link = run(&home, &["--root", via_link.to_str().unwrap(), "--json", "search", "a"]);
-    let canon = run(&home, &["--root", real.to_str().unwrap(), "--json", "search", "a"]);
+    let by_link = run(
+        &home,
+        &[
+            "--root",
+            via_link.to_str().unwrap(),
+            "--json",
+            "search",
+            "a",
+        ],
+    );
+    let canon = run(
+        &home,
+        &["--root", real.to_str().unwrap(), "--json", "search", "a"],
+    );
     ok(&canon, "canonical query");
     assert!(
         !by_link.status.success() || by_link.stdout == canon.stdout,
         "link spelling answered differently from canonical: {}",
         text(&by_link)
     );
-    ok(&run(&via_link, &["--root", ".", "--json", "search", "a"]), "dot query");
+    ok(
+        &run(&via_link, &["--root", ".", "--json", "search", "a"]),
+        "dot query",
+    );
 }
 
 // ---- Probe 3: serve ---------------------------------------------------------
@@ -347,13 +398,20 @@ fn pair(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
 }
 
 fn no_doubling(base: &Path, rel: &Path, what: &str) {
-    assert!(!rel.join("rel").exists(), "{what}: doubled directory {:?}", files(rel));
+    assert!(
+        !rel.join("rel").exists(),
+        "{what}: doubled directory {:?}",
+        files(rel)
+    );
     assert!(!base.join("rel").join("rel").exists());
     let stray: Vec<_> = files(base)
         .into_iter()
         .filter(|f| !(f.starts_with("rel/") || f.starts_with("abs/")))
         .collect();
-    assert!(stray.is_empty(), "{what}: wrote outside both repositories: {stray:?}");
+    assert!(
+        stray.is_empty(),
+        "{what}: wrote outside both repositories: {stray:?}"
+    );
 }
 
 #[test]
@@ -384,7 +442,10 @@ fn p4_html_export_map_html_agree_with_the_absolute_spelling() {
             serde_json::from_str(&strip(&r, &rel, "rel")).unwrap_or_default(),
             serde_json::from_str(&strip(&s, &abs, "abs")).unwrap_or_default(),
         );
-        assert_eq!(r_json["output"], s_json["output"], "{cmd} {extra:?}: output path differs");
+        assert_eq!(
+            r_json["output"], s_json["output"],
+            "{cmd} {extra:?}: output path differs"
+        );
         assert_eq!(
             r_json["written"], s_json["written"],
             "{cmd} {extra:?}: written differs"
@@ -453,9 +514,15 @@ fn p4_a_sibling_relative_root_from_another_cwd_is_not_doubled() {
         ok(&run(&other, &a), &cmd.join(" "));
     }
     assert!(!rel.join("..").join("rel").join("rel").exists());
-    assert!(!files(&rel).iter().any(|f| f.contains("rel/")), "{:?}", files(&rel));
     assert!(
-        !files(&abs).iter().any(|f| f.starts_with("..") || f.contains("rel")),
+        !files(&rel).iter().any(|f| f.contains("rel/")),
+        "{:?}",
+        files(&rel)
+    );
+    assert!(
+        !files(&abs)
+            .iter()
+            .any(|f| f.starts_with("..") || f.contains("rel")),
         "the cwd repository was written to: {:?}",
         files(&abs)
     );
@@ -468,8 +535,14 @@ fn p4_integrate_project_root_relative_matches_absolute() {
     let base = scratch("p4integrate");
     let rel = repo(&base, "rel");
     let abs = repo(&base, "abs");
-    ok(&run(&base, &["build", "--manifest", "--full", "rel"]), "build rel");
-    ok(&run(&base, &["build", "--manifest", "--full", "abs"]), "build abs");
+    ok(
+        &run(&base, &["build", "--manifest", "--full", "rel"]),
+        "build rel",
+    );
+    ok(
+        &run(&base, &["build", "--manifest", "--full", "abs"]),
+        "build abs",
+    );
     let r = run(
         &base,
         &["integrate", "claude", "--dry-run", "--project-root", "rel"],
@@ -484,7 +557,13 @@ fn p4_integrate_project_root_relative_matches_absolute() {
             abs.to_str().unwrap(),
         ],
     );
-    assert_eq!(r.status.code(), s.status.code(), "REL {}\nABS {}", text(&r), text(&s));
+    assert_eq!(
+        r.status.code(),
+        s.status.code(),
+        "REL {}\nABS {}",
+        text(&r),
+        text(&s)
+    );
     assert_eq!(
         normalised(&r, &base, &rel, "rel"),
         normalised(&s, &base, &abs, "abs"),
@@ -514,7 +593,11 @@ fn p5_an_empty_root_is_refused_by_every_root_taking_command() {
             text(&out)
         );
     }
-    assert!(files(&base).iter().all(|f| f == "x/a.rs"), "{:?}", files(&base));
+    assert!(
+        files(&base).iter().all(|f| f == "x/a.rs"),
+        "{:?}",
+        files(&base)
+    );
 }
 
 #[test]
@@ -554,7 +637,10 @@ fn p5_a_dash_root_names_itself_in_the_refusal() {
     let out = run(&base, &["build", "--", "-"]);
     assert!(!out.status.success(), "{}", text(&out));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("No such file") || err.contains("not a directory"), "{err}");
+    assert!(
+        err.contains("No such file") || err.contains("not a directory"),
+        "{err}"
+    );
 }
 
 /// Validation of `.` is unchanged: still accepted in a plain directory.

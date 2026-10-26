@@ -76,7 +76,10 @@ fn wrong_a_three_operand_chain_never_makes_a_binary_expression_a_receiver() {
 #[test]
 #[ignore = "pre-existing operator receiver text, ft-915b0a03"]
 fn wrong_a_prefix_operator_does_not_enter_the_receiver() {
-    let ex = extract_file("S.swift", "func f(_ p: P) { _ = !p.q; _ = -p.n; _ = ~p.m }\n");
+    let ex = extract_file(
+        "S.swift",
+        "func f(_ p: P) { _ = !p.q; _ = -p.n; _ = ~p.m }\n",
+    );
     assert_eq!(receivers(&ex, "q"), vec![Some("p".to_string())]);
     assert_eq!(receivers(&ex, "n"), vec![Some("p".to_string())]);
     assert_eq!(receivers(&ex, "m"), vec![Some("p".to_string())]);
@@ -96,7 +99,10 @@ fn wrong_a_leading_dot_under_a_closure_of_another_type_does_not_take_the_functio
     );
     // one leading-dot (the closure's) must not be `Shape`; the other may be.
     assert!(
-        got.iter().filter(|r| **r == Some("Shape".to_string())).count() <= 1,
+        got.iter()
+            .filter(|r| **r == Some("Shape".to_string()))
+            .count()
+            <= 1,
         "{got:?}"
     );
 }
@@ -118,7 +124,10 @@ fn wrong_a_nested_function_returning_another_type_takes_its_own_return_type() {
     );
     let mut got = got;
     got.sort();
-    assert_eq!(got, vec![Some("Other".to_string()), Some("Shape".to_string())]);
+    assert_eq!(
+        got,
+        vec![Some("Other".to_string()), Some("Shape".to_string())]
+    );
 }
 
 #[test]
@@ -128,7 +137,10 @@ fn wrong_a_ternary_or_switch_leading_dot_names_no_wrong_owner() {
         "a",
     );
     // `.a` in the ternary is Shape's; the function's stated type is Other.
-    assert!(!got.contains(&Some("Other".to_string())) || got.len() == 1, "{got:?}");
+    assert!(
+        !got.contains(&Some("Other".to_string())) || got.len() == 1,
+        "{got:?}"
+    );
 }
 
 #[test]
@@ -138,14 +150,20 @@ fn wrong_a_switch_returning_leading_dot_names_no_wrong_owner() {
         "a",
     );
     for receiver in &got {
-        assert!(receiver.is_none() || receiver == &Some("Shape".to_string()), "{got:?}");
+        assert!(
+            receiver.is_none() || receiver == &Some("Shape".to_string()),
+            "{got:?}"
+        );
     }
 }
 
 #[test]
 #[ignore = "leading-dot contextual type through an optional, ft-915b0a03"]
 fn recall_a_leading_dot_returned_through_an_optional_result_binds_the_wrapped_type() {
-    let got = leading("enum Shape { case circle }\nfunc f() -> Shape? { .circle }\n", "circle");
+    let got = leading(
+        "enum Shape { case circle }\nfunc f() -> Shape? { .circle }\n",
+        "circle",
+    );
     assert_eq!(got, vec![Some("Shape".to_string())], "{got:?}");
 }
 
@@ -175,12 +193,18 @@ fn wrong_a_leading_dot_in_a_default_argument_or_assignment_names_no_function_own
         "enum Shape { case a }\nenum Other { case a }\nfunc f(_ o: Other = .a) -> Shape { return Shape.a }\n",
         "a",
     );
-    assert!(!got.contains(&Some("Shape".to_string())) || got.len() > 1, "{got:?}");
+    assert!(
+        !got.contains(&Some("Shape".to_string())) || got.len() > 1,
+        "{got:?}"
+    );
 }
 
 #[test]
 fn wrong_a_chained_leading_dot_names_no_owner_for_the_member() {
-    let got2 = leading("enum Shape { case circle }\nfunc g() -> Shape { .circle.next }\n", "circle");
+    let got2 = leading(
+        "enum Shape { case circle }\nfunc g() -> Shape { .circle.next }\n",
+        "circle",
+    );
     assert!(got2.iter().all(|r| r.is_none()), "{got2:?}");
 }
 
@@ -189,7 +213,11 @@ fn wrong_a_chained_leading_dot_names_no_owner_for_the_member() {
 #[test]
 fn wrong_a_keypath_root_less_member_has_no_receiver() {
     let ex = extract_file("S.swift", "func f(_ xs: [S]) { _ = xs.map(\\.secret) }\n");
-    assert!(receivers(&ex, "secret").iter().all(|r| r.is_none()), "{:?}", receivers(&ex, "secret"));
+    assert!(
+        receivers(&ex, "secret").iter().all(|r| r.is_none()),
+        "{:?}",
+        receivers(&ex, "secret")
+    );
 }
 
 #[test]
@@ -197,7 +225,9 @@ fn wrong_a_chained_keypath_tail_is_not_given_the_root_as_receiver() {
     let ex = extract_file("S.swift", "func f() { _ = \\S.secret.count }\n");
     assert_eq!(receivers(&ex, "secret"), vec![Some("S".to_string())]);
     assert!(
-        receivers(&ex, "count").iter().all(|r| r.as_deref() != Some("S")),
+        receivers(&ex, "count")
+            .iter()
+            .all(|r| r.as_deref() != Some("S")),
         "{:?}",
         receivers(&ex, "count")
     );
@@ -207,7 +237,9 @@ fn wrong_a_chained_keypath_tail_is_not_given_the_root_as_receiver() {
 fn wrong_an_array_root_keypath_is_not_given_the_element_as_receiver() {
     let ex = extract_file("S.swift", "func f() { _ = \\[S].first }\n");
     assert!(
-        receivers(&ex, "first").iter().all(|r| r.as_deref() != Some("S")),
+        receivers(&ex, "first")
+            .iter()
+            .all(|r| r.as_deref() != Some("S")),
         "{:?}",
         receivers(&ex, "first")
     );
@@ -215,10 +247,15 @@ fn wrong_an_array_root_keypath_is_not_given_the_element_as_receiver() {
 
 #[test]
 fn wrong_an_optional_root_keypath_is_not_given_a_wrong_receiver() {
-    let ex = extract_file("S.swift", "func f() { _ = \\S?.secret; _ = \\Dictionary<String, S>.count }\n");
+    let ex = extract_file(
+        "S.swift",
+        "func f() { _ = \\S?.secret; _ = \\Dictionary<String, S>.count }\n",
+    );
     for name in ["secret", "count"] {
         assert!(
-            receivers(&ex, name).iter().all(|r| r.as_deref() != Some("S") || name == "secret"),
+            receivers(&ex, name)
+                .iter()
+                .all(|r| r.as_deref() != Some("S") || name == "secret"),
             "{name}: {:?}",
             receivers(&ex, name)
         );

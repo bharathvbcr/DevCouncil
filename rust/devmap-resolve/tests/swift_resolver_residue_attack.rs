@@ -40,7 +40,8 @@ fn uses(result: &ResolutionResult, caller: &str) -> Vec<String> {
 }
 
 fn has(u: &[String], target: &str) -> bool {
-    u.iter().any(|t| t.split('|').next().unwrap_or("").ends_with(target))
+    u.iter()
+        .any(|t| t.split('|').next().unwrap_or("").ends_with(target))
 }
 
 fn all_edges(files: &[(&str, &str)]) -> Vec<String> {
@@ -92,7 +93,10 @@ fn wrong_two_same_named_protocols_in_two_modules_type_nothing() {
     ]);
     let u = uses(&r, "S.f");
     // Whatever binds, it must not be the OTHER module's protocol: S sees AB -> A.View only.
-    assert!(!has(&u, "B.swift::View.badge") && !has(&u, "B.swift::View.padding"), "{u:?}");
+    assert!(
+        !has(&u, "B.swift::View.badge") && !has(&u, "B.swift::View.padding"),
+        "{u:?}"
+    );
 }
 
 #[test]
@@ -175,7 +179,8 @@ fn wrong_direct_protocol_typed_call_does_not_reach_a_swiftui_conformer() {
 
 #[test]
 fn recall_private_file_scope_type_is_visible_in_its_own_file() {
-    let src = "private struct Helper {\n func go() {}\n}\nfunc run() {\n var h = Helper()\n h.go()\n}\n";
+    let src =
+        "private struct Helper {\n func go() {}\n}\nfunc run() {\n var h = Helper()\n h.go()\n}\n";
     let u = uses(&one(src), "run");
     assert!(has(&u, "Helper.go"), "{u:?}");
 }
@@ -199,7 +204,11 @@ fn recall_internal_extension_member_in_another_file_binds() {
     let a = "struct Rng {}\n";
     let b = "extension Rng { func extra() {} }\n";
     let c = "func run() {\n var r = Rng()\n r.extra()\n}\n";
-    let r = resolve(&[("Sources/M/A.swift", a), ("Sources/M/B.swift", b), ("Sources/M/C.swift", c)]);
+    let r = resolve(&[
+        ("Sources/M/A.swift", a),
+        ("Sources/M/B.swift", b),
+        ("Sources/M/C.swift", c),
+    ]);
     let u = uses(&r, "run");
     assert!(has(&u, "B.swift::Rng.extra"), "{u:?}");
 }
@@ -228,7 +237,11 @@ fn wrong_file_scope_private_function_of_another_file_is_not_a_candidate() {
     let a = "private func helper() {}\n";
     let b = "func helper() {}\n";
     let c = "func run() { helper() }\n";
-    let r = resolve(&[("Sources/M/A.swift", a), ("Sources/M/B.swift", b), ("Sources/M/C.swift", c)]);
+    let r = resolve(&[
+        ("Sources/M/A.swift", a),
+        ("Sources/M/B.swift", b),
+        ("Sources/M/C.swift", c),
+    ]);
     let u = uses(&r, "run");
     assert!(!has(&u, "A.swift::helper"), "{u:?}");
 }
@@ -248,7 +261,11 @@ fn wrong_private_type_in_other_file_does_not_make_the_reached_member_hit_vanish(
     let a = "private struct Rng { func next() {} }\n";
     let b = "struct Rng { func next() {} }\n";
     let c = "func run() {\n var r = Rng()\n r.next()\n}\n";
-    let r = resolve(&[("Sources/M/A.swift", a), ("Sources/M/B.swift", b), ("Sources/M/C.swift", c)]);
+    let r = resolve(&[
+        ("Sources/M/A.swift", a),
+        ("Sources/M/B.swift", b),
+        ("Sources/M/C.swift", c),
+    ]);
     let u = uses(&r, "run");
     assert!(has(&u, "B.swift::Rng.next"), "{u:?}");
     assert!(!has(&u, "A.swift::Rng.next"), "{u:?}");
@@ -341,7 +358,13 @@ fn wrong_a_swiftui_modifier_named_like_a_stored_property_in_a_view_body_binds_no
         .iter()
         .filter(|e| e.target_symbol.ends_with("Card.opacity") && e.source_symbol.contains("Screen"))
         .collect();
-    assert!(bad.is_empty(), "{:?}", bad.iter().map(|e| (&e.source_symbol, &e.target_symbol)).collect::<Vec<_>>());
+    assert!(
+        bad.is_empty(),
+        "{:?}",
+        bad.iter()
+            .map(|e| (&e.source_symbol, &e.target_symbol))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -353,7 +376,11 @@ fn recall_qualified_nested_type_in_a_property_and_generic_annotation_binds() {
         .iter()
         .filter(|e| e.target_symbol.ends_with("A.Inner") && e.source_symbol.contains("H"))
         .count();
-    assert!(hits >= 1, "no edge from H to A.Inner: {:?}", all_edges(&[("Sources/M/A.swift", src)]));
+    assert!(
+        hits >= 1,
+        "no edge from H to A.Inner: {:?}",
+        all_edges(&[("Sources/M/A.swift", src)])
+    );
 }
 
 #[test]
@@ -439,17 +466,29 @@ fn recall_property_initializer_names_a_nested_type() {
     let src = "struct A {\n struct Inner {}\n static let shared = Inner()\n var made = Inner()\n func f(x: Inner = Inner()) {}\n}\n";
     let r = one(src);
     let all = all_edges(&[("Sources/M/A.swift", src)]);
-    let touched = all.iter().any(|e| e.contains("-> ") && e.contains("A.Inner") && !e.contains("Inner ->"));
-    assert!(touched, "no edge reaches A.Inner from property initializers: {all:#?} {:?}", r.edges.len());
+    let touched = all
+        .iter()
+        .any(|e| e.contains("-> ") && e.contains("A.Inner") && !e.contains("Inner ->"));
+    assert!(
+        touched,
+        "no edge reaches A.Inner from property initializers: {all:#?} {:?}",
+        r.edges.len()
+    );
 }
 
 #[test]
-fn recall_nested_type_in_a_protocol_extension_conformer_is_named_from_an_extension_of_the_outer_in_another_file() {
+fn recall_nested_type_in_a_protocol_extension_conformer_is_named_from_an_extension_of_the_outer_in_another_file(
+) {
     let a = "class A { class Inner {} }\n";
-    let b = "extension A {\n func f() { _ = Inner() }\n}\nclass Sub: A { func g() { _ = Inner() } }\n";
+    let b =
+        "extension A {\n func f() { _ = Inner() }\n}\nclass Sub: A { func g() { _ = Inner() } }\n";
     let r = resolve(&[("Sources/M/A.swift", a), ("Sources/M/B.swift", b)]);
     assert!(has(&uses(&r, "A.f"), "A.Inner"), "{:?}", uses(&r, "A.f"));
-    assert!(has(&uses(&r, "Sub.g"), "A.Inner"), "{:?}", uses(&r, "Sub.g"));
+    assert!(
+        has(&uses(&r, "Sub.g"), "A.Inner"),
+        "{:?}",
+        uses(&r, "Sub.g")
+    );
 }
 
 // ============================================================ 6. cross-file extension member bare call
@@ -469,7 +508,11 @@ fn wrong_bare_call_prefers_the_free_function_over_an_unrelated_types_extension_m
     let a = "struct A {\n func f() { helper() }\n}\nstruct B {}\n";
     let b = "extension B { func helper() {} }\n";
     let c = "func helper() {}\n";
-    let r = resolve(&[("Sources/M/A.swift", a), ("Sources/M/B.swift", b), ("Sources/M/C.swift", c)]);
+    let r = resolve(&[
+        ("Sources/M/A.swift", a),
+        ("Sources/M/B.swift", b),
+        ("Sources/M/C.swift", c),
+    ]);
     let u = uses(&r, "A.f");
     assert!(!has(&u, "B.helper"), "{u:?}");
     assert!(has(&u, "C.swift::helper"), "{u:?}");
@@ -480,7 +523,11 @@ fn recall_own_extension_member_in_another_file_shadows_the_free_function() {
     let a = "struct A {\n func f() { helper() }\n}\n";
     let b = "extension A { func helper() {} }\n";
     let c = "func helper() {}\n";
-    let r = resolve(&[("Sources/M/A.swift", a), ("Sources/M/B.swift", b), ("Sources/M/C.swift", c)]);
+    let r = resolve(&[
+        ("Sources/M/A.swift", a),
+        ("Sources/M/B.swift", b),
+        ("Sources/M/C.swift", c),
+    ]);
     let u = uses(&r, "A.f");
     assert!(has(&u, "B.swift::A.helper"), "{u:?}");
     assert!(!has(&u, "C.swift::helper"), "{u:?}");
@@ -626,7 +673,11 @@ fn dump_accuracy_fixture_edges() {
         let result = resolver.resolve_all(&extractions).unwrap();
         let mut lines: Vec<String> = result.edges.iter().map(|e| format!("{e:?}")).collect();
         lines.sort();
-        out.push_str(&format!("=== {name}: {} files, {} edges\n", extractions.len(), lines.len()));
+        out.push_str(&format!(
+            "=== {name}: {} files, {} edges\n",
+            extractions.len(),
+            lines.len()
+        ));
         for l in lines {
             out.push_str(&l);
             out.push('\n');

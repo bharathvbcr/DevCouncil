@@ -85,7 +85,11 @@ fn audit(value: &Value, path: &str, bad: &mut Vec<String>, seen: &mut usize) {
                 }
             }
             if let Some(f) = map.get("source_freshness") {
-                if f["reason"].as_str().unwrap_or_default().contains("not checked") {
+                if f["reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("not checked")
+                {
                     bad.push(format!("{path}.source_freshness says not checked: {f}"));
                 }
             }
@@ -126,7 +130,9 @@ async fn mcp(slot: &Arc<StoreSlot>, tool: &str, arguments: Value) -> Value {
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": {"name": tool, "arguments": arguments}
     });
-    handle_line(slot, &frame.to_string()).await.expect("a frame")
+    handle_line(slot, &frame.to_string())
+        .await
+        .expect("a frame")
 }
 
 #[tokio::test]
@@ -135,25 +141,93 @@ async fn every_part_of_every_daemon_and_mcp_answer_carries_the_stale_verdict() {
     let slot = Arc::new(StoreSlot::ready("in-memory", Arc::clone(&store)));
     // (mcp tool, mcp args, ipc command)
     let cases: Vec<(&str, Value, Value)> = vec![
-        ("devmap_search", json!({"query": "helper"}), json!({"cmd": "search", "query": "helper"})),
-        ("devmap_search", json!({"query": "nothing_zzz"}), json!({"cmd": "search", "query": "nothing_zzz"})),
-        ("devmap_explore", json!({"query": "helper"}), json!({"cmd": "explore", "query": "helper"})),
-        ("devmap_explore", json!({"query": "nope_unknown"}), json!({"cmd": "explore", "query": "nope_unknown"})),
-        ("devmap_impact", json!({"target": "helper"}), json!({"cmd": "impact", "target": "helper"})),
-        ("devmap_impact", json!({"target": "helper", "layers": true}), json!({"cmd": "impact", "target": "helper", "layers": true})),
-        ("devmap_impact", json!({"target": "nope_unknown"}), json!({"cmd": "impact", "target": "nope_unknown"})),
-        ("devmap_trace", json!({"from": "helper"}), json!({"cmd": "trace", "from": "helper"})),
-        ("devmap_trace", json!({"from": "run", "to": "helper"}), json!({"cmd": "trace", "from": "run", "to": "helper"})),
-        ("devmap_dependencies", json!({"target": "run"}), json!({"cmd": "deps", "target": "run"})),
-        ("devmap_neighbors", json!({"targets": ["helper", "run", "nope_unknown"]}), json!({"cmd": "neighbors", "targets": ["helper", "run", "nope_unknown"]})),
+        (
+            "devmap_search",
+            json!({"query": "helper"}),
+            json!({"cmd": "search", "query": "helper"}),
+        ),
+        (
+            "devmap_search",
+            json!({"query": "nothing_zzz"}),
+            json!({"cmd": "search", "query": "nothing_zzz"}),
+        ),
+        (
+            "devmap_explore",
+            json!({"query": "helper"}),
+            json!({"cmd": "explore", "query": "helper"}),
+        ),
+        (
+            "devmap_explore",
+            json!({"query": "nope_unknown"}),
+            json!({"cmd": "explore", "query": "nope_unknown"}),
+        ),
+        (
+            "devmap_impact",
+            json!({"target": "helper"}),
+            json!({"cmd": "impact", "target": "helper"}),
+        ),
+        (
+            "devmap_impact",
+            json!({"target": "helper", "layers": true}),
+            json!({"cmd": "impact", "target": "helper", "layers": true}),
+        ),
+        (
+            "devmap_impact",
+            json!({"target": "nope_unknown"}),
+            json!({"cmd": "impact", "target": "nope_unknown"}),
+        ),
+        (
+            "devmap_trace",
+            json!({"from": "helper"}),
+            json!({"cmd": "trace", "from": "helper"}),
+        ),
+        (
+            "devmap_trace",
+            json!({"from": "run", "to": "helper"}),
+            json!({"cmd": "trace", "from": "run", "to": "helper"}),
+        ),
+        (
+            "devmap_dependencies",
+            json!({"target": "run"}),
+            json!({"cmd": "deps", "target": "run"}),
+        ),
+        (
+            "devmap_neighbors",
+            json!({"targets": ["helper", "run", "nope_unknown"]}),
+            json!({"cmd": "neighbors", "targets": ["helper", "run", "nope_unknown"]}),
+        ),
         ("devmap_dead_symbols", json!({}), json!({"cmd": "dead"})),
         ("devmap_clones", json!({}), json!({"cmd": "clones"})),
-        ("devmap_affected_tests", json!({"targets": ["helper"]}), json!({"cmd": "affected", "targets": ["helper"]})),
-        ("devmap_affected_tests", json!({"targets": ["nope_unknown"]}), json!({"cmd": "affected", "targets": ["nope_unknown"]})),
-        ("devmap_ask", json!({"query": "helper sums rows"}), json!({"cmd": "ask", "query": "helper sums rows"})),
-        ("devmap_ask_evidence", json!({"query": "helper sums rows"}), json!({"cmd": "ask_evidence", "query": "helper sums rows"})),
-        ("devmap_preview", json!({"file": "core.py", "content": "def gone():\n    pass\n"}), json!({"cmd": "preview", "file": "core.py", "content": "def gone():\n    pass\n"})),
-        ("devmap_skeleton", json!({"file": "core.py"}), json!({"cmd": "skeleton", "file": "core.py"})),
+        (
+            "devmap_affected_tests",
+            json!({"targets": ["helper"]}),
+            json!({"cmd": "affected", "targets": ["helper"]}),
+        ),
+        (
+            "devmap_affected_tests",
+            json!({"targets": ["nope_unknown"]}),
+            json!({"cmd": "affected", "targets": ["nope_unknown"]}),
+        ),
+        (
+            "devmap_ask",
+            json!({"query": "helper sums rows"}),
+            json!({"cmd": "ask", "query": "helper sums rows"}),
+        ),
+        (
+            "devmap_ask_evidence",
+            json!({"query": "helper sums rows"}),
+            json!({"cmd": "ask_evidence", "query": "helper sums rows"}),
+        ),
+        (
+            "devmap_preview",
+            json!({"file": "core.py", "content": "def gone():\n    pass\n"}),
+            json!({"cmd": "preview", "file": "core.py", "content": "def gone():\n    pass\n"}),
+        ),
+        (
+            "devmap_skeleton",
+            json!({"file": "core.py"}),
+            json!({"cmd": "skeleton", "file": "core.py"}),
+        ),
     ];
     let mut failures = Vec::new();
     let mut total_parts = 0usize;
@@ -171,7 +245,9 @@ async fn every_part_of_every_daemon_and_mcp_answer_carries_the_stale_verdict() {
             // A skeleton is one report with its own top-level verdict.
             let own_verdict = body["source_freshness"]["fresh"] == json!(false);
             if seen == 0 && !own_verdict {
-                failures.push(format!("MCP {label}: no Response-shaped part found (probe blind): {body}"));
+                failures.push(format!(
+                    "MCP {label}: no Response-shaped part found (probe blind): {body}"
+                ));
             }
             failures.extend(bad.into_iter().map(|b| format!("MCP {label}: {b}")));
         }
@@ -187,5 +263,10 @@ async fn every_part_of_every_daemon_and_mcp_answer_carries_the_stale_verdict() {
         failures.extend(bad.into_iter().map(|b| format!("IPC {label}: {b}")));
     }
     assert!(total_parts > 40, "audit saw only {total_parts} parts");
-    assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "{} failures:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }

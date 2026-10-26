@@ -67,7 +67,11 @@ fn headline(text: &str) -> String {
 fn p2_printed_totals_reproduce_the_printed_headline() {
     let root = fixture(
         "p2",
-        &[("lib.py", PY), ("vendor/dep.py", &misses(30)), ("index.html", "<a href=\"x.html\">x</a>\n")],
+        &[
+            ("lib.py", PY),
+            ("vendor/dep.py", &misses(30)),
+            ("index.html", "<a href=\"x.html\">x</a>\n"),
+        ],
     );
     let text = run(&root, &["--verbose", "build", "."]);
     let line = headline(&text);
@@ -101,13 +105,19 @@ fn p2_printed_totals_reproduce_the_printed_headline() {
 fn p5_all_excluded_prints_no_nan_and_no_percent() {
     let root = fixture(
         "p5",
-        &[("vendor/dep.py", &misses(5)), ("index.html", "<a href=\"x.html\">x</a>\n")],
+        &[
+            ("vendor/dep.py", &misses(5)),
+            ("index.html", "<a href=\"x.html\">x</a>\n"),
+        ],
     );
     let text = run(&root, &["--verbose", "build", "."]);
     eprintln!("{text}");
     let line = headline(&text);
     assert!(!line.contains("NaN"), "{line}");
-    assert!(!line.contains("% net"), "no measured site, so no percent: {line}");
+    assert!(
+        !line.contains("% net"),
+        "no measured site, so no percent: {line}"
+    );
     assert!(line.contains("not measured"), "{line}");
 }
 
@@ -144,7 +154,11 @@ fn p2_json_lets_a_consumer_reproduce_the_headline() {
         rr["measured_unresolved_sites"].as_u64().unwrap(),
         rr["measured_explained_sites"].as_u64().unwrap(),
     );
-    assert_eq!(net, r * 1000 / (r + u - e), "per-language rows reproduce it");
+    assert_eq!(
+        net,
+        r * 1000 / (r + u - e),
+        "per-language rows reproduce it"
+    );
     assert_eq!(
         net,
         tr * 1000 / (tr + tu - te),

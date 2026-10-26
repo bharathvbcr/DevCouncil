@@ -57,6 +57,7 @@ pub use code_graph::{
     CODE_GRAPH_COMPACT_ENCODING, CODE_GRAPH_EXPORT_MAX_BYTES, CODE_GRAPH_SCHEMA_VERSION,
     CODE_GRAPH_TOP_LEVEL_KEYS, EDGE_KIND_LABELS,
 };
+pub use doc_drift::{DocDriftFinding, DocDriftReport, DriftKind};
 pub use engine::{
     budget_take, clone_group_tokens, graph_core_for_store, graph_core_for_store_cancellable,
     is_test_path, link_candidates, parse_clone_kind, resolved_edge_from_stored, traversal_starts,
@@ -64,7 +65,6 @@ pub use engine::{
     StoreQueryEngine, BYTES_PER_TOKEN, EVIDENCE_TEST_BUDGET_SHARE, EVIDENCE_TEST_DEPTH,
     MAX_NEIGHBOR_TARGETS, MAX_TOKEN_BUDGET, MAX_TRAVERSAL_DEPTH, PREVIEW_CALLER_MIN_CONFIDENCE,
 };
-pub use doc_drift::{DocDriftFinding, DocDriftReport, DriftKind};
 pub use escape::{html_escape, render_symbol_label};
 pub use evidence::{EvidenceFile, EvidencePack, EvidenceRole, EvidenceUnit};
 pub use linguist::{palette, swatch, Swatch, LINGUIST_VERSION, NEUTRAL_COLOR};

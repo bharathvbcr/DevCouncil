@@ -48,7 +48,8 @@ fn has(u: &[String], target: &str) -> bool {
 
 #[test]
 fn wrong_a_real_local_named_like_a_case_binds_nothing() {
-    let r = one("enum E { case a }\nstruct S { var a = 1 }\nfunc f() -> Int { let a = 2; return a }\n");
+    let r =
+        one("enum E { case a }\nstruct S { var a = 1 }\nfunc f() -> Int { let a = 2; return a }\n");
     let u = uses(&r, "f");
     assert!(!has(&u, "S.a") && !has(&u, "E.a"), "{u:?}");
 }
@@ -78,7 +79,8 @@ fn wrong_a_property_initializer_reading_a_name_shared_with_a_case_binds_the_prop
 
 #[test]
 fn wrong_a_local_in_a_property_initializer_closure_named_like_a_case() {
-    let r = one("enum E { case a }\nstruct S { var a = 1\n var b: Int = { let a = 3; return a }() }\n");
+    let r =
+        one("enum E { case a }\nstruct S { var a = 1\n var b: Int = { let a = 3; return a }() }\n");
     let u = uses(&r, "b");
     assert!(!has(&u, "E.a") && !has(&u, "S.a"), "{u:?}");
 }
@@ -163,7 +165,8 @@ fn crash_more_dangling_target_shapes_do_not_panic() {
 
 #[test]
 fn recall_a_method_read_as_a_value_binds_the_method() {
-    let r = one("struct O { func size() -> Int { 1 } }\nfunc g(_ o: O) { let f = o.size; _ = f }\n");
+    let r =
+        one("struct O { func size() -> Int { 1 } }\nfunc g(_ o: O) { let f = o.size; _ = f }\n");
     let u = uses(&r, "g");
     assert!(has(&u, "O.size"), "{u:?}");
 }
@@ -223,7 +226,8 @@ fn wrong_a_qualified_case_and_a_static_property_of_the_same_name_bind_their_own_
 
 #[test]
 fn wrong_a_local_function_does_not_leak_into_a_sibling_method() {
-    let r = one("struct S {\n func m() { func helper() {}; helper() }\n func n() { helper() }\n}\n");
+    let r =
+        one("struct S {\n func m() { func helper() {}; helper() }\n func n() { helper() }\n}\n");
     let u = uses(&r, "n");
     assert!(!has(&u, "helper"), "{u:?}");
 }
@@ -295,14 +299,17 @@ fn wrong_a_keypath_without_a_root_outside_its_type_binds_nothing() {
 #[test]
 #[ignore = "needs extractor change (schema frozen at 97): `\\.count` is emitted as a bare `count` read with no key-path marker, indistinguishable from an implicit-self read, ft-915b0a03"]
 fn wrong_a_contextual_keypath_inside_another_type_does_not_bind_that_types_member() {
-    let r = one("struct Foo { var count = 0\n func f(_ xs: [String]) -> [Int] { xs.map(\\.count) } }\n");
+    let r = one(
+        "struct Foo { var count = 0\n func f(_ xs: [String]) -> [Int] { xs.map(\\.count) } }\n",
+    );
     let u = uses(&r, "f");
     assert!(!has(&u, "Foo.count"), "{u:?}");
 }
 
 #[test]
 fn wrong_a_chained_keypath_does_not_bind_the_tail_to_the_root() {
-    let r = one("struct S { var secret = [1]\n var count = 5 }\nfunc f() { _ = \\S.secret.count }\n");
+    let r =
+        one("struct S { var secret = [1]\n var count = 5 }\nfunc f() { _ = \\S.secret.count }\n");
     let u = uses(&r, "f");
     assert!(has(&u, "S.secret"), "recall: {u:?}");
     assert!(!has(&u, "S.count"), "wrong: {u:?}");
@@ -328,12 +335,18 @@ fn wrong_a_generic_root_keypath_binds_nothing_of_the_argument() {
 fn wrong_a_bare_read_in_a_free_function_of_an_extension_file_binds_nothing() {
     let r = resolve(&[
         ("Sources/M/A.swift", "struct T { var count = 1 }\n"),
-        ("Sources/M/B.swift", "extension T { func m() -> Int { count } }\nfunc free() -> Int { count }\n"),
+        (
+            "Sources/M/B.swift",
+            "extension T { func m() -> Int { count } }\nfunc free() -> Int { count }\n",
+        ),
     ]);
     let m = uses(&r, "T.m");
     let m2 = uses(&r, "m");
     let free = uses(&r, "free");
-    assert!(has(&m, "T.count") || has(&m2, "T.count"), "recall: {m:?} {m2:?}");
+    assert!(
+        has(&m, "T.count") || has(&m2, "T.count"),
+        "recall: {m:?} {m2:?}"
+    );
     assert!(!has(&free, "T.count"), "wrong: {free:?}");
 }
 
@@ -348,7 +361,9 @@ fn wrong_a_global_sharing_a_name_with_an_inherited_property_binds_by_scope() {
 
 #[test]
 fn control_an_inherited_property_read_without_a_global_binds() {
-    let r = one("class Base { var name = \"b\" }\nclass Derived: Base { func m() -> String { name } }\n");
+    let r = one(
+        "class Base { var name = \"b\" }\nclass Derived: Base { func m() -> String { name } }\n",
+    );
     let m = uses(&r, "m");
     assert!(has(&m, "Base.name"), "{m:?}");
 }

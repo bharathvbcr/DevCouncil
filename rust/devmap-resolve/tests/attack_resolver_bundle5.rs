@@ -54,18 +54,30 @@ fn to_file(e: &E, from: &str, file: &str) -> bool {
 #[test]
 fn j1_scala_sbt_multimodule_import_binds() {
     let foo = "package com.x\n\nobject Foo {\n  def f(): Int = 1\n}\n";
-    let main = "package com.y\n\nimport com.x.Foo\n\nobject Main {\n  def run(): Int = Foo.f()\n}\n";
+    let main =
+        "package com.y\n\nimport com.x.Foo\n\nobject Main {\n  def run(): Int = Foo.f()\n}\n";
     let files = [
         ("core/src/main/scala/com/x/Foo.scala", foo),
         ("app/src/main/scala/com/y/Main.scala", main),
     ];
     let i = imports(&files);
     assert!(
-        to_file(&i, "app/src/main/scala/com/y/Main.scala", "core/src/main/scala/com/x/Foo.scala"),
+        to_file(
+            &i,
+            "app/src/main/scala/com/y/Main.scala",
+            "core/src/main/scala/com/x/Foo.scala"
+        ),
         "scala import lost: {i:?}"
     );
     let c = calls(&files);
-    assert!(to_file(&c, "app/src/main/scala/com/y/Main.scala::Main.run", "core/src/main/scala/com/x/Foo.scala::Foo.f"), "{c:?}");
+    assert!(
+        to_file(
+            &c,
+            "app/src/main/scala/com/y/Main.scala::Main.run",
+            "core/src/main/scala/com/x/Foo.scala::Foo.f"
+        ),
+        "{c:?}"
+    );
 }
 
 #[test]
@@ -75,7 +87,10 @@ fn j2_kotlin_object_member_import_dir_mismatch() {
     let m = "package b\n\nimport a.Util.go\n\nfun run(): Int = go()\n";
     let files = [("lib/Util.kt", u), ("app/M.kt", m)];
     let c = calls(&files);
-    assert!(to_file(&c, "app/M.kt::run", "lib/Util.kt::Util.go"), "{c:?}");
+    assert!(
+        to_file(&c, "app/M.kt::run", "lib/Util.kt::Util.go"),
+        "{c:?}"
+    );
 }
 
 #[test]
@@ -95,7 +110,10 @@ fn j4_kotlin_nested_class_import_dir_mismatch() {
     let i = imports(&files);
     assert!(to_file(&i, "app/M.kt", "lib/Outer.kt"), "import lost {i:?}");
     let c = calls(&files);
-    assert!(to_file(&c, "app/M.kt::run", "lib/Outer.kt::Outer.Inner.go"), "{c:?}");
+    assert!(
+        to_file(&c, "app/M.kt::run", "lib/Outer.kt::Outer.Inner.go"),
+        "{c:?}"
+    );
 }
 
 #[test]
@@ -115,7 +133,10 @@ fn j6_java_import_of_kotlin_file_dir_mismatch() {
     let m = "package b;\n\nimport a.Foo;\n\npublic class M {\n    int run(Foo f) { return f.go(); }\n}\n";
     let files = [("lib/Foo.kt", u), ("app/M.java", m)];
     let c = calls(&files);
-    assert!(to_file(&c, "app/M.java::M.run", "lib/Foo.kt::Foo.go"), "{c:?}");
+    assert!(
+        to_file(&c, "app/M.java::M.run", "lib/Foo.kt::Foo.go"),
+        "{c:?}"
+    );
 }
 
 #[test]
@@ -133,7 +154,10 @@ fn j8_scala_nested_package_blocks_import() {
     let m = "package z\n\nimport a.b.Foo\n\nobject M {\n  def run(): Int = Foo.f()\n}\n";
     let files = [("lib/Foo.scala", u), ("app/M.scala", m)];
     let c = calls(&files);
-    assert!(to_file(&c, "app/M.scala::M.run", "lib/Foo.scala::Foo.f"), "{c:?}");
+    assert!(
+        to_file(&c, "app/M.scala::M.run", "lib/Foo.scala::Foo.f"),
+        "{c:?}"
+    );
 }
 
 #[test]
@@ -153,7 +177,11 @@ fn j10_kotlin_import_of_package_declared_only_by_other_file_binds_stem() {
     let al = "package a\n\ntypealias Foo = a.impl.Foo\n";
     let foo = "package a.impl\n\nclass Foo {\n    fun go(): Int = 1\n}\n";
     let m = "package b\n\nimport a.Foo\n\nfun run(f: Foo): Int = f.go()\n";
-    let files = [("lib/Aliases.kt", al), ("impl/Foo.kt", foo), ("app/M.kt", m)];
+    let files = [
+        ("lib/Aliases.kt", al),
+        ("impl/Foo.kt", foo),
+        ("app/M.kt", m),
+    ];
     let c = calls(&files);
     assert!(to_file(&c, "app/M.kt::run", "impl/Foo.kt::Foo.go"), "{c:?}");
 }
@@ -173,15 +201,22 @@ fn s1_explicit_repo_import_beats_star_of_other_repo_pkg_either_order() {
         };
         let files = [("a/Repo.kt", a), ("b/Repo.kt", b), ("c/M.kt", m)];
         let c = calls(&files);
-        assert!(to_file(&c, "c/M.kt::run", "a/Repo.kt::Repo.find"), "order {order}: {c:?}");
-        assert!(!to_file(&c, "c/M.kt::run", "b/Repo.kt"), "order {order}: {c:?}");
+        assert!(
+            to_file(&c, "c/M.kt::run", "a/Repo.kt::Repo.find"),
+            "order {order}: {c:?}"
+        );
+        assert!(
+            !to_file(&c, "c/M.kt::run", "b/Repo.kt"),
+            "order {order}: {c:?}"
+        );
     }
 }
 
 #[test]
 fn s2_star_import_kept_when_unrelated_external_name_imported() {
     let a = "package a\n\nclass Repo {\n    fun find(): Int = 1\n}\n";
-    let m = "package c\n\nimport a.*\nimport ext.Other\n\nfun run(r: Repo, o: Other): Int = r.find()\n";
+    let m =
+        "package c\n\nimport a.*\nimport ext.Other\n\nfun run(r: Repo, o: Other): Int = r.find()\n";
     let files = [("a/Repo.kt", a), ("c/M.kt", m)];
     let c = calls(&files);
     assert!(to_file(&c, "c/M.kt::run", "a/Repo.kt::Repo.find"), "{c:?}");
@@ -197,7 +232,10 @@ fn s3_java_star_import_plus_external_same_name_function_static() {
     let m = "package c;\n\nimport a.*;\nimport static org.junit.Assert.help;\n\npublic class M {\n    int run() { return Helper.help(); }\n}\n";
     let files = [("a/Helper.java", a), ("c/M.java", m)];
     let c = calls(&files);
-    assert!(to_file(&c, "c/M.java::M.run", "a/Helper.java::Helper.help"), "{c:?}");
+    assert!(
+        to_file(&c, "c/M.java::M.run", "a/Helper.java::Helper.help"),
+        "{c:?}"
+    );
 }
 
 #[test]
@@ -263,7 +301,10 @@ fn r3_java_repo_import_same_name_as_library_class_binds() {
     let m = "package b;\n\nimport a.Task;\n\npublic class M {\n    int run(Task t) { return t.find(); }\n}\n";
     let files = [("a/Task.java", a), ("b/M.java", m)];
     let c = calls(&files);
-    assert!(to_file(&c, "b/M.java::M.run", "a/Task.java::Task.find"), "{c:?}");
+    assert!(
+        to_file(&c, "b/M.java::M.run", "a/Task.java::Task.find"),
+        "{c:?}"
+    );
 }
 
 #[test]
@@ -273,16 +314,23 @@ fn r4_scala_repo_import_same_name_binds() {
     let m = "package b\n\nimport a.Task\n\nobject M {\n  def run(t: Task): Int = t.find()\n}\n";
     let files = [("a/Task.scala", a), ("b/M.scala", m)];
     let c = calls(&files);
-    assert!(to_file(&c, "b/M.scala::M.run", "a/Task.scala::Task.find"), "{c:?}");
+    assert!(
+        to_file(&c, "b/M.scala::M.run", "a/Task.scala::Task.find"),
+        "{c:?}"
+    );
 }
 
 #[test]
 fn r5_repo_class_nested_in_object_imported() {
-    let a = "package a\n\nobject Api {\n    class Result {\n        fun find(): Int = 1\n    }\n}\n";
+    let a =
+        "package a\n\nobject Api {\n    class Result {\n        fun find(): Int = 1\n    }\n}\n";
     let m = "package b\n\nimport a.Api.Result\n\nfun run(r: Result): Int = r.find()\n";
     let files = [("a/Api.kt", a), ("b/M.kt", m)];
     let c = calls(&files);
-    assert!(to_file(&c, "b/M.kt::run", "a/Api.kt::Api.Result.find"), "{c:?}");
+    assert!(
+        to_file(&c, "b/M.kt::run", "a/Api.kt::Api.Result.find"),
+        "{c:?}"
+    );
 }
 
 #[test]
@@ -294,7 +342,10 @@ fn r6_import_of_repo_class_through_typealias_or_two_same_names() {
     let m = "package c\n\nimport b.Result\n\nfun run(r: Result): Int = r.find()\n";
     let files = [("a/Result.kt", a), ("b/Result.kt", b), ("c/M.kt", m)];
     let c = calls(&files);
-    assert!(to_file(&c, "c/M.kt::run", "b/Result.kt::Result.find"), "{c:?}");
+    assert!(
+        to_file(&c, "c/M.kt::run", "b/Result.kt::Result.find"),
+        "{c:?}"
+    );
 }
 
 #[test]
@@ -309,7 +360,14 @@ fn r7_kotlin_import_resolved_but_same_basename_in_two_modules() {
         ("m1/src/main/kotlin/a/M.kt", m),
     ];
     let c = calls(&files);
-    assert!(to_file(&c, "m1/src/main/kotlin/a/M.kt::run", "m1/src/main/kotlin/a/Result.kt::Result.find"), "{c:?}");
+    assert!(
+        to_file(
+            &c,
+            "m1/src/main/kotlin/a/M.kt::run",
+            "m1/src/main/kotlin/a/Result.kt::Result.find"
+        ),
+        "{c:?}"
+    );
 }
 
 #[test]
@@ -319,7 +377,10 @@ fn r8_receiver_with_import_of_same_named_repo_class_in_same_package_file() {
     let m = "package a\n\nimport a.Event\n\nfun run(r: Event): Int = r.find()\n";
     let files = [("src/Event.kt", a), ("src/M.kt", m)];
     let c = calls(&files);
-    assert!(to_file(&c, "src/M.kt::run", "src/Event.kt::Event.find"), "{c:?}");
+    assert!(
+        to_file(&c, "src/M.kt::run", "src/Event.kt::Event.find"),
+        "{c:?}"
+    );
 }
 
 // ------------------------------ (4) enclosing member ------------------------------
@@ -332,7 +393,10 @@ fn e1_inherited_member_is_not_declared_so_factory_binds() {
     // typed as Repo. Abstain or bind to Other, never Repo.
     let src = "package p\n\nclass Repo { fun find(): Int = 1 }\nclass Other { fun find(): Int = 2 }\n\nfun make(): Repo = Repo()\n\nopen class Base {\n    fun make(): Other = Other()\n}\n\nclass Sub : Base() {\n    fun use(): Int {\n        val r = make()\n        return r.find()\n    }\n}\n";
     let c = calls(&[("p/Z.kt", src)]);
-    assert!(!to_file(&c, "p/Z.kt::Sub.use", "p/Z.kt::Repo.find"), "{c:?}");
+    assert!(
+        !to_file(&c, "p/Z.kt::Sub.use", "p/Z.kt::Repo.find"),
+        "{c:?}"
+    );
 }
 
 #[test]
@@ -356,7 +420,10 @@ fn e3_same_simple_type_name_in_other_file_does_not_block() {
 fn e4_nested_class_member_of_inner_blocks_factory() {
     let src = "package p\n\nclass Repo { fun find(): Int = 1 }\nclass Other { fun find(): Int = 2 }\n\nfun make(): Repo = Repo()\n\nclass Outer {\n    class Inner {\n        fun make(): Other = Other()\n        fun use(): Int {\n            val r = make()\n            return r.find()\n        }\n    }\n}\n";
     let c = calls(&[("p/Z.kt", src)]);
-    assert!(!to_file(&c, "p/Z.kt::Outer.Inner.use", "p/Z.kt::Repo.find"), "{c:?}");
+    assert!(
+        !to_file(&c, "p/Z.kt::Outer.Inner.use", "p/Z.kt::Repo.find"),
+        "{c:?}"
+    );
 }
 
 #[test]
@@ -364,7 +431,10 @@ fn e4_nested_class_member_of_inner_blocks_factory() {
 fn e5_companion_member_vs_toplevel() {
     let src = "package p\n\nclass Repo { fun find(): Int = 1 }\nclass Other { fun find(): Int = 2 }\n\nfun make(): Repo = Repo()\n\nclass Host {\n    companion object {\n        fun make(): Other = Other()\n    }\n    fun use(): Int {\n        val r = make()\n        return r.find()\n    }\n}\n";
     let c = calls(&[("p/Z.kt", src)]);
-    assert!(!to_file(&c, "p/Z.kt::Host.use", "p/Z.kt::Repo.find"), "{c:?}");
+    assert!(
+        !to_file(&c, "p/Z.kt::Host.use", "p/Z.kt::Repo.find"),
+        "{c:?}"
+    );
 }
 
 #[test]
@@ -373,17 +443,24 @@ fn e6_swift_extension_member_blocks_toplevel() {
     let a = "struct Repo { func find() -> Int { 1 } }\nstruct Other { func find() -> Int { 2 } }\n\nfunc make() -> Repo { Repo() }\n\nstruct Host {}\n";
     let b = "extension Host {\n    func make() -> Other { Other() }\n    func use() -> Int {\n        let r = make()\n        return r.find()\n    }\n}\n";
     let c = calls(&[("A.swift", a), ("B.swift", b)]);
-    assert!(!to_file(&c, "B.swift::Host.use", "A.swift::Repo.find"), "{c:?}");
+    assert!(
+        !to_file(&c, "B.swift::Host.use", "A.swift::Repo.find"),
+        "{c:?}"
+    );
 }
 
 #[test]
 #[ignore = "ft-2c800986: pre-existing, reverted per Fable 2026-10-21"]
 fn e7_java_method_vs_static_import_factory() {
     let a = "package p;\n\npublic class Repo { public int find() { return 1; } }\n";
-    let u = "package p;\n\npublic class U {\n    public static Repo make() { return new Repo(); }\n}\n";
+    let u =
+        "package p;\n\npublic class U {\n    public static Repo make() { return new Repo(); }\n}\n";
     let m = "package q;\n\nimport p.Repo;\nimport static p.U.make;\n\npublic class M {\n    int use() {\n        Repo r = make();\n        return r.find();\n    }\n}\n";
     let c = calls(&[("p/Repo.java", a), ("p/U.java", u), ("q/M.java", m)]);
-    assert!(to_file(&c, "q/M.java::M.use", "p/Repo.java::Repo.find"), "{c:?}");
+    assert!(
+        to_file(&c, "q/M.java::M.use", "p/Repo.java::Repo.find"),
+        "{c:?}"
+    );
 }
 
 // ------------------------------ (5) split_types ------------------------------
@@ -394,11 +471,13 @@ fn t1_swift_two_distinct_types_same_name_keep_their_recursion() {
     let b = "struct Node {\n    func walk(_ n: Int) -> Int {\n        if n == 0 { return 0 }\n        return walk(n - 1)\n    }\n}\n";
     let c = calls(&[("ModA/Node.swift", a), ("ModB/Node.swift", b)]);
     assert!(
-        c.iter().any(|(f, t)| f == "ModA/Node.swift::Node.walk" && t == "ModA/Node.swift::Node.walk"),
+        c.iter()
+            .any(|(f, t)| f == "ModA/Node.swift::Node.walk" && t == "ModA/Node.swift::Node.walk"),
         "A recursion lost: {c:?}"
     );
     assert!(
-        c.iter().any(|(f, t)| f == "ModB/Node.swift::Node.walk" && t == "ModB/Node.swift::Node.walk"),
+        c.iter()
+            .any(|(f, t)| f == "ModB/Node.swift::Node.walk" && t == "ModB/Node.swift::Node.walk"),
         "B recursion lost: {c:?}"
     );
 }
@@ -408,7 +487,8 @@ fn t2_swift_toplevel_functions_same_name_two_files_keep_their_recursion() {
     let a = "func walk(_ n: Int) -> Int {\n    if n == 0 { return 0 }\n    return walk(n - 1)\n}\n";
     let c = calls(&[("A.swift", a), ("B.swift", a)]);
     assert!(
-        c.iter().any(|(f, t)| f == "A.swift::walk" && t == "A.swift::walk"),
+        c.iter()
+            .any(|(f, t)| f == "A.swift::walk" && t == "A.swift::walk"),
         "recursion lost: {c:?}"
     );
 }
@@ -419,7 +499,8 @@ fn t3_csharp_partials_in_different_namespaces_do_not_merge() {
     let b = "namespace B {\n    partial class X {\n        int Walk(int n) {\n            if (n == 0) return 0;\n            return Walk(n - 1);\n        }\n    }\n}\n";
     let c = calls(&[("A/X.cs", a), ("B/X.cs", b)]);
     assert!(
-        c.iter().any(|(f, t)| f.starts_with("A/X.cs") && t.starts_with("A/X.cs")),
+        c.iter()
+            .any(|(f, t)| f.starts_with("A/X.cs") && t.starts_with("A/X.cs")),
         "A recursion lost: {c:?}"
     );
 }
@@ -428,7 +509,8 @@ fn t3_csharp_partials_in_different_namespaces_do_not_merge() {
 fn t4_swift_true_extension_overload_still_abstains() {
     // baseline: extension across files with overloads; self-edge abstains.
     let a = "struct Foo {\n    func add(_ x: Int) -> Int { x }\n}\n";
-    let b = "extension Foo {\n    func add(_ x: String) -> Int {\n        return add(1)\n    }\n}\n";
+    let b =
+        "extension Foo {\n    func add(_ x: String) -> Int {\n        return add(1)\n    }\n}\n";
     let c = calls(&[("A.swift", a), ("B.swift", b)]);
     println!("t4 {c:?}");
 }
@@ -442,7 +524,8 @@ fn p1_function_imports_x_locally_other_function_uses_module_level_x() {
     let user = "from helper import x as _unused_alias\n\ndef x():\n    return 2\n\ndef a():\n    from helper import x\n    return x()\n\ndef b():\n    return x()\n";
     let c = calls(&[("helper.py", helper), ("user.py", user)]);
     assert!(
-        c.iter().any(|(f, t)| f == "user.py::b" && t == "user.py::x"),
+        c.iter()
+            .any(|(f, t)| f == "user.py::b" && t == "user.py::x"),
         "module-level x not bound: {c:?}"
     );
 }
@@ -454,7 +537,8 @@ fn p2_function_imports_x_locally_other_function_uses_same_file_x() {
     let user = "def x():\n    return 2\n\ndef a():\n    from helper import x\n    return x()\n\ndef b():\n    return x()\n";
     let c = calls(&[("helper.py", helper), ("user.py", user)]);
     assert!(
-        c.iter().any(|(f, t)| f == "user.py::b" && t == "user.py::x"),
+        c.iter()
+            .any(|(f, t)| f == "user.py::b" && t == "user.py::x"),
         "same-file x not bound in b: {c:?}"
     );
 }
@@ -469,10 +553,15 @@ fn p3_function_imports_x_locally_other_function_uses_global_unique_x() {
     let user = "def a():\n    from helper import x\n    return x()\n\ndef b():\n    return x()\n";
     let c = calls(&[("helper.py", helper), ("user.py", user)]);
     assert!(
-        c.iter().any(|(f, t)| f == "user.py::a" && t == "helper.py::x"),
+        c.iter()
+            .any(|(f, t)| f == "user.py::a" && t == "helper.py::x"),
         "a lost: {c:?}"
     );
-    assert!(!c.iter().any(|(f, t)| f == "user.py::b" && t == "helper.py::x"), "{c:?}");
+    assert!(
+        !c.iter()
+            .any(|(f, t)| f == "user.py::b" && t == "helper.py::x"),
+        "{c:?}"
+    );
 }
 
 #[test]
@@ -484,10 +573,15 @@ fn p4_function_local_import_shadows_builtin_name_other_function_uses_builtin() {
     let user = "def a():\n    from other import open\n    return open('x')\n\ndef b():\n    return open('y')\n";
     let c = calls(&[("other.py", other), ("user.py", user)]);
     assert!(
-        !c.iter().any(|(f, t)| f == "user.py::b" && t == "other.py::open"),
+        !c.iter()
+            .any(|(f, t)| f == "user.py::b" && t == "other.py::open"),
         "builtin open mis-bound: {c:?}"
     );
-    assert!(c.iter().any(|(f, t)| f == "user.py::a" && t == "other.py::open"), "a lost {c:?}");
+    assert!(
+        c.iter()
+            .any(|(f, t)| f == "user.py::a" && t == "other.py::open"),
+        "a lost {c:?}"
+    );
 }
 
 #[test]
@@ -497,8 +591,16 @@ fn p5_function_local_import_in_method_class_attr_x_elsewhere() {
     let helper = "def x():\n    return 1\n";
     let user = "class C:\n    def a(self):\n        from helper import x\n        return x()\n\n    def b(self):\n        return x()\n";
     let c = calls(&[("helper.py", helper), ("user.py", user)]);
-    assert!(c.iter().any(|(f, t)| f == "user.py::C.a" && t == "helper.py::x"), "{c:?}");
-    assert!(!c.iter().any(|(f, t)| f == "user.py::C.b" && t == "helper.py::x"), "{c:?}");
+    assert!(
+        c.iter()
+            .any(|(f, t)| f == "user.py::C.a" && t == "helper.py::x"),
+        "{c:?}"
+    );
+    assert!(
+        !c.iter()
+            .any(|(f, t)| f == "user.py::C.b" && t == "helper.py::x"),
+        "{c:?}"
+    );
 }
 
 #[test]
@@ -508,7 +610,11 @@ fn p6_python_local_import_by_try_except_toplevel_in_function() {
     let helper = "def x():\n    return 1\n";
     let user = "def a():\n    from helper import x\n    return x()\n\ndef b(x):\n    return x()\n";
     let c = calls(&[("helper.py", helper), ("user.py", user)]);
-    assert!(!c.iter().any(|(f, t)| f == "user.py::b" && t == "helper.py::x"), "{c:?}");
+    assert!(
+        !c.iter()
+            .any(|(f, t)| f == "user.py::b" && t == "helper.py::x"),
+        "{c:?}"
+    );
 }
 
 #[test]
@@ -575,8 +681,16 @@ fn p9_star_import_binding_kept_when_another_function_imports_same_name_locally()
     let helper = "def x():\n    return 1\n";
     let other = "def x():\n    return 2\n";
     let user = "from helper import *\n\ndef a():\n    from other import x\n    return x()\n\ndef b():\n    return x()\n";
-    let c = calls(&[("helper.py", helper), ("other.py", other), ("user.py", user)]);
-    assert!(c.iter().any(|(f, t)| f == "user.py::b" && t == "helper.py::x"), "{c:?}");
+    let c = calls(&[
+        ("helper.py", helper),
+        ("other.py", other),
+        ("user.py", user),
+    ]);
+    assert!(
+        c.iter()
+            .any(|(f, t)| f == "user.py::b" && t == "helper.py::x"),
+        "{c:?}"
+    );
 }
 
 #[test]
@@ -584,5 +698,9 @@ fn p10_module_level_conditional_import_other_function_local_import_same_name() {
     let helper = "def x():\n    return 1\n";
     let user = "try:\n    from helper import x\nexcept ImportError:\n    x = None\n\ndef a():\n    from helper import x\n    return x()\n\ndef b():\n    return x()\n";
     let c = calls(&[("helper.py", helper), ("user.py", user)]);
-    assert!(c.iter().any(|(f, t)| f == "user.py::b" && t == "helper.py::x"), "{c:?}");
+    assert!(
+        c.iter()
+            .any(|(f, t)| f == "user.py::b" && t == "helper.py::x"),
+        "{c:?}"
+    );
 }

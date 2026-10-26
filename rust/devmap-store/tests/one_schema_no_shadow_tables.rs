@@ -18,10 +18,7 @@ fn shadow_names(path: &std::path::Path) -> Vec<String> {
         .expect("read names")
         .collect::<Result<_, _>>()
         .expect("every name reads");
-    names
-        .into_iter()
-        .filter(|name| is_shadow(name))
-        .collect()
+    names.into_iter().filter(|name| is_shadow(name)).collect()
 }
 
 fn is_shadow(name: &str) -> bool {
@@ -55,10 +52,20 @@ fn d2_a_fresh_store_and_its_reopen_carry_no_shadow_table() {
 
 #[test]
 fn d2_the_shadow_detector_is_not_vacuous() {
-    for name in ["extraction_cache_v4", "unresolved_rows_v22", "nodes_old", "x_backup"] {
+    for name in [
+        "extraction_cache_v4",
+        "unresolved_rows_v22",
+        "nodes_old",
+        "x_backup",
+    ] {
         assert!(is_shadow(name), "{name} must read as a shadow table");
     }
-    for name in ["generation_nodes", "reader_compat", "paths", "pending_state"] {
+    for name in [
+        "generation_nodes",
+        "reader_compat",
+        "paths",
+        "pending_state",
+    ] {
         assert!(!is_shadow(name), "{name} is a live table");
     }
 }

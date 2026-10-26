@@ -77,7 +77,10 @@ fn conditional_base_before_base_does_not_bind_base() {
     let got = super_in(&format!(
         "X = 1\nclass Other:\n    def m(self):\n        return 3\nclass C(Other if X else object, Base):\n{CM}"
     ));
-    assert!(got.is_empty(), "dropped ternary base, bound Base.m: {got:?}");
+    assert!(
+        got.is_empty(),
+        "dropped ternary base, bound Base.m: {got:?}"
+    );
 }
 
 #[test]
@@ -204,7 +207,10 @@ fn two_dotted_bases_sharing_a_root_are_two_bases() {
 #[test]
 fn two_module_alias_bases_sharing_a_root() {
     let r = resolve(&[
-        ("one.py", "class X:\n    pass\nclass Y:\n    def m(self):\n        return 1\n"),
+        (
+            "one.py",
+            "class X:\n    pass\nclass Y:\n    def m(self):\n        return 1\n",
+        ),
         (
             "c.py",
             "import one as o\n\nclass C(o.X, o.Y):\n    def m(self):\n        return super().m()\n",
@@ -248,7 +254,11 @@ fn c3_failure_abstains() {
         "c.py",
         "class A:\n    def m(self):\n        return 1\nclass B:\n    def m(self):\n        return 2\nclass X(A, B):\n    pass\nclass Y(B, A):\n    pass\nclass C(X, Y):\n    def m(self):\n        return super().m()\n",
     )]);
-    assert!(methods(&r, "c.py::C.m").is_empty(), "{:?}", methods(&r, "c.py::C.m"));
+    assert!(
+        methods(&r, "c.py::C.m").is_empty(),
+        "{:?}",
+        methods(&r, "c.py::C.m")
+    );
 }
 
 #[test]
@@ -296,9 +306,7 @@ fn opaque_before_declaring_class_abstains() {
 #[test]
 fn inherited_self_call_through_opaque_later_base() {
     // `self.m()` in a method of C resolves through the same MRO.
-    let src = format!(
-        "{BASE}\nclass C(Base, dict):\n    def go(self):\n        return self.m()\n"
-    );
+    let src = format!("{BASE}\nclass C(Base, dict):\n    def go(self):\n        return self.m()\n");
     let r = resolve(&[("c.py", src.as_str())]);
     assert_eq!(methods(&r, "c.py::C.go"), ["c.py::Base.m"]);
 }
@@ -336,13 +344,20 @@ fn module_member_reexported_by_package_init() {
 fn module_member_missing_in_module_never_uses_flat_table() {
     let r = resolve(&[
         ("one.py", "X = 1\n"),
-        ("two.py", "class Base:\n    def m(self):\n        return 2\n"),
+        (
+            "two.py",
+            "class Base:\n    def m(self):\n        return 2\n",
+        ),
         (
             "c.py",
             "import one as o\n\nclass C(o.Base):\n    def m(self):\n        return super().m()\n",
         ),
     ]);
-    assert!(methods(&r, "c.py::C.m").is_empty(), "{:?}", methods(&r, "c.py::C.m"));
+    assert!(
+        methods(&r, "c.py::C.m").is_empty(),
+        "{:?}",
+        methods(&r, "c.py::C.m")
+    );
 }
 
 #[test]
@@ -394,7 +409,11 @@ fn module_level_rebinding_of_callee_poisons() {
     let h = "from a import A\nA = None\n\nclass H:\n    def __init__(self):\n        self.x = A()\n    def go(self):\n        return self.x.run()\n";
     let r = resolve(&[("a.py", a), ("h.py", h)]);
     // `A` is None by the time __init__ runs; the field is not an `a.A`.
-    assert!(methods(&r, "h.py::H.go").is_empty(), "{:?}", methods(&r, "h.py::H.go"));
+    assert!(
+        methods(&r, "h.py::H.go").is_empty(),
+        "{:?}",
+        methods(&r, "h.py::H.go")
+    );
 }
 
 #[test]
@@ -402,7 +421,11 @@ fn nonlocal_callee_in_closure() {
     let a = "class A:\n    def run(self):\n        return 1\n";
     let h = "from a import A\n\nclass H:\n    def __init__(self):\n        A = object\n        def inner():\n            nonlocal A\n            self.x = A()\n        inner()\n    def go(self):\n        return self.x.run()\n";
     let r = resolve(&[("a.py", a), ("h.py", h)]);
-    assert!(methods(&r, "h.py::H.go").is_empty(), "{:?}", methods(&r, "h.py::H.go"));
+    assert!(
+        methods(&r, "h.py::H.go").is_empty(),
+        "{:?}",
+        methods(&r, "h.py::H.go")
+    );
 }
 
 #[test]
@@ -419,7 +442,10 @@ fn method_local_import_of_same_name_shadows() {
     let h = "from a import A\n\nclass H:\n    def __init__(self):\n        from b import A\n        self.x = A()\n    def go(self):\n        return self.x.run()\n";
     let r = resolve(&[("a.py", a), ("b.py", b), ("h.py", h)]);
     let got = methods(&r, "h.py::H.go");
-    assert!(!got.contains(&"a.py::A.run".to_string()), "bound the module import, not the local: {got:?}");
+    assert!(
+        !got.contains(&"a.py::A.run".to_string()),
+        "bound the module import, not the local: {got:?}"
+    );
 }
 
 #[test]
@@ -456,7 +482,8 @@ fn custom_decorator_over_instance_method_binds() {
 #[test]
 fn custom_decorator_wrapping_staticmethod_is_not_an_instance() {
     // @deco over @staticmethod: still a static method; `self` is a plain arg.
-    let got = field_in_method("    @deco\n    @staticmethod\n    def make(self):\n        self.x = A()");
+    let got =
+        field_in_method("    @deco\n    @staticmethod\n    def make(self):\n        self.x = A()");
     assert!(got.is_empty(), "{got:?}");
 }
 
@@ -473,12 +500,17 @@ fn builtins_dotted_staticmethod_is_not_an_instance() {
     let a = "class A:\n    def run(self):\n        return 1\n";
     let h = "import builtins\nfrom a import A\n\nclass H:\n    @builtins.staticmethod\n    def make(self):\n        self.x = A()\n    def go(self):\n        return self.x.run()\n";
     let r = resolve(&[("a.py", a), ("h.py", h)]);
-    assert!(methods(&r, "h.py::H.go").is_empty(), "{:?}", methods(&r, "h.py::H.go"));
+    assert!(
+        methods(&r, "h.py::H.go").is_empty(),
+        "{:?}",
+        methods(&r, "h.py::H.go")
+    );
 }
 
 #[test]
 fn classmethod_with_comment_or_call_decorator() {
-    let got = field_in_method("    @classmethod  # build\n    def make(self):\n        self.x = A()");
+    let got =
+        field_in_method("    @classmethod  # build\n    def make(self):\n        self.x = A()");
     assert!(got.is_empty(), "{got:?}");
 }
 
@@ -559,7 +591,10 @@ fn nested_class_in_method_writing_same_field_does_not_type_outer() {
     let h = "from a import A\nfrom b import B\n\nclass H:\n    def __init__(self):\n        class Inner:\n            def __init__(self):\n                self.x = B()\n        self.inner = Inner()\n    def go(self):\n        return self.x.run()\n";
     let r = resolve(&[("a.py", a), ("b.py", b), ("h.py", h)]);
     let got = methods(&r, "h.py::H.go");
-    assert!(!got.contains(&"b.py::B.run".to_string()), "Inner.x typed H.x: {got:?}");
+    assert!(
+        !got.contains(&"b.py::B.run".to_string()),
+        "Inner.x typed H.x: {got:?}"
+    );
 }
 
 #[test]

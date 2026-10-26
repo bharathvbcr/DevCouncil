@@ -147,7 +147,8 @@ fn all_reassigned_to_a_different_literal_drops_the_first() {
 #[test]
 fn all_with_a_fstring_entry_is_dynamic() {
     // `f"{prefix}elper"` evaluates to `helper`: star import rebinds it.
-    let got = star_case("prefix = 'B'\n__all__ = [f\"{prefix}ase\"]\ndef helper():\n    return 2\n");
+    let got =
+        star_case("prefix = 'B'\n__all__ = [f\"{prefix}ase\"]\ndef helper():\n    return 2\n");
     assert!(!has(&got, "a.py::Base.run"), "{got:?}");
 }
 
@@ -159,7 +160,9 @@ fn all_concatenation_is_dynamic() {
 
 #[test]
 fn all_extend_is_dynamic() {
-    let got = star_case("__all__ = [\"x\"]\n__all__.extend([\"helper\"])\nx = 1\ndef helper():\n    return 2\n");
+    let got = star_case(
+        "__all__ = [\"x\"]\n__all__.extend([\"helper\"])\nx = 1\ndef helper():\n    return 2\n",
+    );
     assert!(!has(&got, "a.py::Base.run"), "{got:?}");
 }
 
@@ -207,9 +210,7 @@ fn all_augmented_with_a_name_reference_is_dynamic() {
 
 #[test]
 fn all_assigned_a_name_reference_is_dynamic() {
-    let got = star_case(
-        "_names = [\"helper\"]\n__all__ = _names\ndef helper():\n    return 2\n",
-    );
+    let got = star_case("_names = [\"helper\"]\n__all__ = _names\ndef helper():\n    return 2\n");
     assert!(!has(&got, "a.py::Base.run"), "{got:?}");
 }
 
@@ -217,18 +218,14 @@ fn all_assigned_a_name_reference_is_dynamic() {
 fn all_class_body_all_does_not_make_a_module_all() {
     // `class K: __all__ = ['helper']` is a class attribute; the module has no
     // `__all__`, so star imports every public name (helper included).
-    let got = star_case(
-        "class K:\n    __all__ = [\"x\"]\n\ndef helper():\n    return 2\n",
-    );
+    let got = star_case("class K:\n    __all__ = [\"x\"]\n\ndef helper():\n    return 2\n");
     assert!(!has(&got, "a.py::Base.run"), "{got:?}");
 }
 
 #[test]
 fn all_in_a_function_body_does_not_make_a_module_all() {
     // Module has no `__all__`: `import *` takes `helper`.
-    let got = star_case(
-        "def f():\n    __all__ = [\"x\"]\n\ndef helper():\n    return 2\n",
-    );
+    let got = star_case("def f():\n    __all__ = [\"x\"]\n\ndef helper():\n    return 2\n");
     assert!(!has(&got, "a.py::Base.run"), "{got:?}");
 }
 
@@ -237,17 +234,15 @@ fn all_name_with_a_matching_module_literal_elsewhere_is_not_a_module_all() {
     // The function-body `__all__` is text-scanned. A module-level string that
     // happens to equal the scanned name satisfies the "has a module-level
     // literal" test. CPython: no module `__all__`, so `helper` is exported.
-    let got = star_case(
-        "TAG = \"x\"\ndef f():\n    __all__ = [\"x\"]\n\ndef helper():\n    return 2\n",
-    );
+    let got =
+        star_case("TAG = \"x\"\ndef f():\n    __all__ = [\"x\"]\n\ndef helper():\n    return 2\n");
     assert!(!has(&got, "a.py::Base.run"), "{got:?}");
 }
 
 #[test]
 fn all_docstring_assignment_with_a_module_literal_is_not_a_module_all() {
-    let got = star_case(
-        "\"\"\"\n__all__ = ['x']\n\"\"\"\nTAG = \"x\"\n\ndef helper():\n    return 2\n",
-    );
+    let got =
+        star_case("\"\"\"\n__all__ = ['x']\n\"\"\"\nTAG = \"x\"\n\ndef helper():\n    return 2\n");
     assert!(!has(&got, "a.py::Base.run"), "{got:?}");
 }
 
@@ -273,7 +268,10 @@ fn method_local_unaliased_import_types_a_self_field() {
         ),
     ]);
     let got = calls(&r, "c.py::C.go");
-    assert!(!has(&got, "other.py::A.hi"), "leaked the module import: {got:?}");
+    assert!(
+        !has(&got, "other.py::A.hi"),
+        "leaked the module import: {got:?}"
+    );
 }
 
 #[test]
@@ -344,7 +342,10 @@ fn function_import_of_a_dotted_module_binds_its_first_name() {
     let r = resolve(&[
         ("pkg/__init__.py", ""),
         ("pkg/sub.py", "def run():\n    return 1\n"),
-        ("c.py", "def f():\n    import pkg.sub\n    return pkg.sub.run()\n"),
+        (
+            "c.py",
+            "def f():\n    import pkg.sub\n    return pkg.sub.run()\n",
+        ),
     ]);
     assert_eq!(calls(&r, "c.py::f"), ["pkg/sub.py::run"]);
 }
@@ -421,7 +422,11 @@ fn import_inside_a_lambda_free_comprehension_default_scope() {
             "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    from m import A\n\ndef f():\n    x = A()\n    return x.hi()\n",
         ),
     ]);
-    assert!(has(&calls(&r, "c.py::f"), "m.py::A.hi"), "{:?}", calls(&r, "c.py::f"));
+    assert!(
+        has(&calls(&r, "c.py::f"), "m.py::A.hi"),
+        "{:?}",
+        calls(&r, "c.py::f")
+    );
 }
 
 #[test]
@@ -450,7 +455,11 @@ fn module_import_after_a_function_import_of_the_same_name_still_types_other_func
             "from m import A\n\ndef one():\n    from other import A\n    return A()\n\ndef two():\n    x = A()\n    return x.hi()\n",
         ),
     ]);
-    assert!(has(&calls(&r, "c.py::two"), "m.py::A.hi"), "{:?}", calls(&r, "c.py::two"));
+    assert!(
+        has(&calls(&r, "c.py::two"), "m.py::A.hi"),
+        "{:?}",
+        calls(&r, "c.py::two")
+    );
 }
 
 #[test]
@@ -479,7 +488,10 @@ fn structural_unaliased_and_aliased_local_imports_answer_alike() {
         );
         let r = resolve(&[
             ("m.py", "class A:\n    def hi(self):\n        return 1\n"),
-            ("other.py", "class A:\n    def hi(self):\n        return 2\n"),
+            (
+                "other.py",
+                "class A:\n    def hi(self):\n        return 2\n",
+            ),
             ("c.py", &src),
         ]);
         has(&calls(&r, "c.py::go"), "other.py::A.hi")
@@ -507,7 +519,8 @@ fn function_local_base_shadowing_a_module_class_is_not_the_module_class() {
 }
 
 #[test]
-fn function_local_base_shadowing_with_a_module_class_that_has_the_method_and_a_local_that_overrides() {
+fn function_local_base_shadowing_with_a_module_class_that_has_the_method_and_a_local_that_overrides(
+) {
     let r = resolve(&[(
         "c.py",
         "class Base:\n    def m(self):\n        return 'module'\n\ndef make():\n    class Base:\n        def m(self):\n            return 'local'\n    class D(Base):\n        def go(self):\n            return self.m()\n    return D\n",
@@ -569,7 +582,8 @@ fn function_local_chain_with_a_diamond_in_the_middle_abstains_or_is_c3() {
 
 #[test]
 fn function_local_chain_past_the_cap_makes_no_wrong_edge() {
-    let mut src = String::from("def make():\n    class C0:\n        def m(self):\n            return 1\n");
+    let mut src =
+        String::from("def make():\n    class C0:\n        def m(self):\n            return 1\n");
     for i in 1..80 {
         src.push_str(&format!("    class C{i}(C{}):\n        pass\n", i - 1));
     }
@@ -587,7 +601,10 @@ const GEN_C: &str = "class Base:\n    def m(self):\n        return 1\n\nclass C(
 fn package_sibling_typing_does_not_shadow_the_stdlib_absolute_import() {
     let r = resolve(&[
         ("pkg/__init__.py", ""),
-        ("pkg/typing.py", "class Generic:\n    def m(self):\n        return 0\n"),
+        (
+            "pkg/typing.py",
+            "class Generic:\n    def m(self):\n        return 0\n",
+        ),
         (
             "pkg/c.py",
             &format!("from typing import Generic\n\n{GEN_C}"),
@@ -600,7 +617,10 @@ fn package_sibling_typing_does_not_shadow_the_stdlib_absolute_import() {
 fn package_relative_typing_import_is_the_local_module() {
     let r = resolve(&[
         ("pkg/__init__.py", ""),
-        ("pkg/typing.py", "class Generic:\n    def m(self):\n        return 0\n"),
+        (
+            "pkg/typing.py",
+            "class Generic:\n    def m(self):\n        return 0\n",
+        ),
         (
             "pkg/c.py",
             &format!("from .typing import Generic\n\n{GEN_C}"),
@@ -641,7 +661,10 @@ fn package_import_typing_attribute_is_stdlib_even_with_a_sibling() {
 fn namespace_directory_typing_shadows_conservatively() {
     // No `__init__.py`: run as a script, the directory is on sys.path.
     let r = resolve(&[
-        ("ns/typing.py", "class Generic:\n    def m(self):\n        return 0\n"),
+        (
+            "ns/typing.py",
+            "class Generic:\n    def m(self):\n        return 0\n",
+        ),
         ("ns/c.py", &format!("from typing import Generic\n\n{GEN_C}")),
     ]);
     let got = calls(&r, "ns/c.py::C.m");
@@ -651,9 +674,15 @@ fn namespace_directory_typing_shadows_conservatively() {
 #[test]
 fn root_level_typing_shadows_even_for_a_package_file() {
     let r = resolve(&[
-        ("typing.py", "class Generic:\n    def m(self):\n        return 0\n"),
+        (
+            "typing.py",
+            "class Generic:\n    def m(self):\n        return 0\n",
+        ),
         ("pkg/__init__.py", ""),
-        ("pkg/c.py", &format!("from typing import Generic\n\n{GEN_C}")),
+        (
+            "pkg/c.py",
+            &format!("from typing import Generic\n\n{GEN_C}"),
+        ),
     ]);
     let got = calls(&r, "pkg/c.py::C.m");
     assert!(!has(&got, "pkg/c.py::Base.m"), "{got:?}");
@@ -662,9 +691,15 @@ fn root_level_typing_shadows_even_for_a_package_file() {
 #[test]
 fn src_level_typing_shadows_even_for_a_package_file() {
     let r = resolve(&[
-        ("src/typing.py", "class Generic:\n    def m(self):\n        return 0\n"),
+        (
+            "src/typing.py",
+            "class Generic:\n    def m(self):\n        return 0\n",
+        ),
         ("src/pkg/__init__.py", ""),
-        ("src/pkg/c.py", &format!("from typing import Generic\n\n{GEN_C}")),
+        (
+            "src/pkg/c.py",
+            &format!("from typing import Generic\n\n{GEN_C}"),
+        ),
     ]);
     let got = calls(&r, "src/pkg/c.py::C.m");
     assert!(!has(&got, "src/pkg/c.py::Base.m"), "{got:?}");
@@ -692,8 +727,14 @@ fn nested_package_dir_typing_with_init_is_stdlib_for_deep_importer() {
     let r = resolve(&[
         ("a/__init__.py", ""),
         ("a/b/__init__.py", ""),
-        ("a/b/typing.py", "class Generic:\n    def m(self):\n        return 0\n"),
-        ("a/b/c.py", &format!("from typing import Generic\n\n{GEN_C}")),
+        (
+            "a/b/typing.py",
+            "class Generic:\n    def m(self):\n        return 0\n",
+        ),
+        (
+            "a/b/c.py",
+            &format!("from typing import Generic\n\n{GEN_C}"),
+        ),
     ]);
     assert_eq!(calls(&r, "a/b/c.py::C.m"), ["a/b/c.py::Base.m"]);
 }
@@ -702,8 +743,14 @@ fn nested_package_dir_typing_with_init_is_stdlib_for_deep_importer() {
 fn package_typing_package_directory_is_stdlib_too() {
     let r = resolve(&[
         ("pkg/__init__.py", ""),
-        ("pkg/typing/__init__.py", "class Generic:\n    def m(self):\n        return 0\n"),
-        ("pkg/c.py", &format!("from typing import Generic\n\n{GEN_C}")),
+        (
+            "pkg/typing/__init__.py",
+            "class Generic:\n    def m(self):\n        return 0\n",
+        ),
+        (
+            "pkg/c.py",
+            &format!("from typing import Generic\n\n{GEN_C}"),
+        ),
     ]);
     assert_eq!(calls(&r, "pkg/c.py::C.m"), ["pkg/c.py::Base.m"]);
 }
@@ -832,7 +879,8 @@ fn super_with_a_nested_super_in_the_arguments() {
     let src = "class Base:\n    def m(self):\n        return 1\n    def n(self, x):\n        return x\n\nclass Child(Base):\n    def m(self):\n        return super(Child, self).n(super(Child, self).m())\n";
     let got = calls(&resolve(&[("m.py", src)]), "m.py::Child.m");
     assert!(
-        got.iter().all(|t| t == "m.py::Base.m" || t == "m.py::Base.n"),
+        got.iter()
+            .all(|t| t == "m.py::Base.m" || t == "m.py::Base.n"),
         "{got:?}"
     );
 }
@@ -854,7 +902,10 @@ fn class_redefined_without_the_method_binds_no_method() {
         "class A:\n    def m(self):\n        return 1\n\nclass A:\n    pass\n\nclass B(A):\n    def go(self):\n        return self.m()\n",
     )]);
     let got = calls(&r, "c.py::B.go");
-    assert!(got.is_empty(), "CPython binds the second A, which has no m: {got:?}");
+    assert!(
+        got.is_empty(),
+        "CPython binds the second A, which has no m: {got:?}"
+    );
 }
 
 #[test]
@@ -885,7 +936,10 @@ fn class_and_function_with_one_name_as_a_base() {
         "class A:\n    def m(self):\n        return 1\n\ndef A():\n    return object\n\nclass B(A):\n    def go(self):\n        return self.m()\n",
     )]);
     let got = calls(&r, "c.py::B.go");
-    assert!(got.is_empty(), "A is the function at class-statement time: {got:?}");
+    assert!(
+        got.is_empty(),
+        "A is the function at class-statement time: {got:?}"
+    );
 }
 
 #[test]
@@ -917,10 +971,7 @@ fn two_files_declare_base_and_a_dynamic_star_module_supplies_neither_name() {
     let r = resolve(&[
         ("a.py", "class Base:\n    def m(self):\n        return 1\n"),
         ("b.py", "class Base:\n    def m(self):\n        return 2\n"),
-        (
-            "dyn.py",
-            "from b import Base\n__all__ = [\"Base\"] + []\n",
-        ),
+        ("dyn.py", "from b import Base\n__all__ = [\"Base\"] + []\n"),
         (
             "c.py",
             "from dyn import *\n\nclass C(Base):\n    def go(self):\n        return self.m()\n",
@@ -954,7 +1005,10 @@ fn two_files_declare_base_and_c_imports_neither_but_has_its_own_star() {
     let r = resolve(&[
         ("a.py", "class Base:\n    def m(self):\n        return 1\n"),
         ("b.py", "class Base:\n    def m(self):\n        return 2\n"),
-        ("c.py", "from nowhere import *\n\nclass C(Base):\n    def go(self):\n        return self.m()\n"),
+        (
+            "c.py",
+            "from nowhere import *\n\nclass C(Base):\n    def go(self):\n        return self.m()\n",
+        ),
     ]);
     let got = calls(&r, "c.py::C.go");
     assert!(got.is_empty(), "{got:?}");
@@ -965,7 +1019,10 @@ fn same_class_name_two_files_super_zero_arg_no_import() {
     let r = resolve(&[
         ("a.py", "class Base:\n    def m(self):\n        return 1\n"),
         ("b.py", "class Base:\n    def m(self):\n        return 2\n"),
-        ("c.py", "class C(Base):\n    def m(self):\n        return super().m()\n"),
+        (
+            "c.py",
+            "class C(Base):\n    def m(self):\n        return super().m()\n",
+        ),
     ]);
     let got = calls(&r, "c.py::C.m");
     assert!(got.is_empty(), "{got:?}");
@@ -986,7 +1043,12 @@ fn rows_naming_the_cap(r: &ResolutionResult) -> Vec<String> {
     r.unresolved
         .iter()
         .filter(|row| format!("{:?}", row.resolution).contains("python heritage walk stopped"))
-        .map(|row| format!("{}|{}|{:?}", row.source_symbol, row.callee_name, row.resolution))
+        .map(|row| {
+            format!(
+                "{}|{}|{:?}",
+                row.source_symbol, row.callee_name, row.resolution
+            )
+        })
         .collect()
 }
 
@@ -995,7 +1057,9 @@ fn rows_naming_the_cap(r: &ResolutionResult) -> Vec<String> {
 fn finding_super_call_on_a_capped_chain_records_the_cap() {
     let r = resolve(&[("c.py", &chain80())]);
     assert!(
-        rows_naming_the_cap(&r).iter().any(|row| row.starts_with("c.py::Leaf.run|m|")),
+        rows_naming_the_cap(&r)
+            .iter()
+            .any(|row| row.starts_with("c.py::Leaf.run|m|")),
         "super().m() abstains with no ledger row naming the cap: {:?}",
         rows_naming_the_cap(&r)
     );
@@ -1006,7 +1070,9 @@ fn finding_super_call_on_a_capped_chain_records_the_cap() {
 fn finding_typed_receiver_on_a_capped_chain_records_the_cap() {
     let r = resolve(&[("c.py", &chain80())]);
     assert!(
-        rows_naming_the_cap(&r).iter().any(|row| row.starts_with("c.py::typed|m|")),
+        rows_naming_the_cap(&r)
+            .iter()
+            .any(|row| row.starts_with("c.py::typed|m|")),
         "x.m() on a typed receiver abstains with no ledger row naming the cap: {:?}",
         rows_naming_the_cap(&r)
     );

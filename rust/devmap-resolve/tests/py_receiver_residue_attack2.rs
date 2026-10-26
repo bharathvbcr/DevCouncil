@@ -49,7 +49,8 @@ fn edge(res: &ResolutionResult, caller: &str, target: &str, what: &str) {
     );
 }
 
-const AC: &str = "class A:\n    def run(self):\n        return 1\n    def append(self, x):\n        return 2\n";
+const AC: &str =
+    "class A:\n    def run(self):\n        return 1\n    def append(self, x):\n        return 2\n";
 const USE: &str = "from f import make\n\ndef use():\n    make().run()\n";
 const USE_APPEND: &str = "from f import make\n\ndef use():\n    make().append(1)\n";
 
@@ -64,34 +65,61 @@ fn factory(src_between: &str) -> ResolutionResult {
 #[test]
 fn d01_lru_cache_with_args_is_transparent() {
     let res = factory("@functools.lru_cache(maxsize=None)\n");
-    edge(&res, "app.py::use", "f.py::A.run", "d01 @functools.lru_cache(maxsize=None) recall");
+    edge(
+        &res,
+        "app.py::use",
+        "f.py::A.run",
+        "d01 @functools.lru_cache(maxsize=None) recall",
+    );
 }
 
 #[test]
 fn d01b_functools_dot_cache_bare() {
     let res = factory("@functools.cache\n");
-    edge(&res, "app.py::use", "f.py::A.run", "d01b @functools.cache recall");
+    edge(
+        &res,
+        "app.py::use",
+        "f.py::A.run",
+        "d01b @functools.cache recall",
+    );
 }
 
 #[test]
 fn d01c_lru_cache_maxsize_128() {
     let res = factory("@lru_cache(maxsize=128)\n");
-    edge(&res, "app.py::use", "f.py::A.run", "d01c @lru_cache(maxsize=128) recall");
+    edge(
+        &res,
+        "app.py::use",
+        "f.py::A.run",
+        "d01c @lru_cache(maxsize=128) recall",
+    );
 }
 
 #[test]
 fn d01d_bare_forms() {
     for dec in ["@lru_cache\n", "@lru_cache()\n", "@cache\n"] {
         let res = factory(dec);
-        edge(&res, "app.py::use", "f.py::A.run", &format!("d01d {dec:?} recall"));
+        edge(
+            &res,
+            "app.py::use",
+            "f.py::A.run",
+            &format!("d01d {dec:?} recall"),
+        );
     }
 }
 
 #[test]
 fn d02_aliased_cache_recall() {
-    let f = format!("from functools import cache as memo\n\n{AC}\n@memo\ndef make() -> A:\n    return A()\n");
+    let f = format!(
+        "from functools import cache as memo\n\n{AC}\n@memo\ndef make() -> A:\n    return A()\n"
+    );
     let res = resolve(&[("f.py", &f), ("app.py", USE)]);
-    edge(&res, "app.py::use", "f.py::A.run", "d02 @memo (functools.cache alias) recall");
+    edge(
+        &res,
+        "app.py::use",
+        "f.py::A.run",
+        "d02 @memo (functools.cache alias) recall",
+    );
 }
 
 #[test]
@@ -100,7 +128,12 @@ fn d03_user_defined_cache_that_wraps_into_list() {
         "from typing import List\n\n{AC}\ndef cache(fn):\n    def inner(*a) -> List[A]:\n        return [fn(*a)]\n    return inner\n\n@cache\ndef make() -> A:\n    return A()\n"
     );
     let res = resolve(&[("f.py", &f), ("app.py", USE_APPEND)]);
-    no_edge(&res, "app.py::use", "f.py::A.append", "d03 user-defined @cache wraps to List[A]");
+    no_edge(
+        &res,
+        "app.py::use",
+        "f.py::A.append",
+        "d03 user-defined @cache wraps to List[A]",
+    );
 }
 
 #[test]
@@ -109,7 +142,12 @@ fn d03b_user_defined_lru_cache_that_wraps_into_list() {
         "from typing import List\n\n{AC}\ndef lru_cache(fn):\n    def inner(*a) -> List[A]:\n        return [fn(*a)]\n    return inner\n\n@lru_cache\ndef make() -> A:\n    return A()\n"
     );
     let res = resolve(&[("f.py", &f), ("app.py", USE_APPEND)]);
-    no_edge(&res, "app.py::use", "f.py::A.append", "d03b user-defined @lru_cache wraps to List[A]");
+    no_edge(
+        &res,
+        "app.py::use",
+        "f.py::A.append",
+        "d03b user-defined @lru_cache wraps to List[A]",
+    );
 }
 
 #[test]
@@ -125,7 +163,12 @@ fn d03c_imported_user_cache_that_wraps_into_list() {
         ),
         ("app.py", USE_APPEND),
     ]);
-    no_edge(&res, "app.py::use", "deco.py::A.append", "d03c imported user @cache");
+    no_edge(
+        &res,
+        "app.py::use",
+        "deco.py::A.append",
+        "d03c imported user @cache",
+    );
 }
 
 #[test]
@@ -141,7 +184,12 @@ fn d03d_attribute_decorator_named_cache_from_user_module() {
         ),
         ("app.py", USE_APPEND),
     ]);
-    no_edge(&res, "app.py::use", "deco.py::A.append", "d03d @deco.cache (user module attribute)");
+    no_edge(
+        &res,
+        "app.py::use",
+        "deco.py::A.append",
+        "d03d @deco.cache (user module attribute)",
+    );
 }
 
 #[test]
@@ -151,7 +199,12 @@ fn d04_property_on_factory_method_is_not_a_call() {
         "m.py",
         "class A:\n    def run(self):\n        return 1\n\nclass H:\n    @property\n    def make(self) -> A:\n        return A()\n\ndef use(h: H):\n    h.make().run()\n",
     )]);
-    no_edge(&res, "m.py::use", "m.py::A.run", "d04 @property make() call");
+    no_edge(
+        &res,
+        "m.py::use",
+        "m.py::A.run",
+        "d04 @property make() call",
+    );
 }
 
 #[test]
@@ -160,7 +213,12 @@ fn d04b_cached_property_factory_method_not_a_call() {
         "m.py",
         "from functools import cached_property\n\nclass A:\n    def run(self):\n        return 1\n\nclass H:\n    @cached_property\n    def make(self) -> A:\n        return A()\n\ndef use(h: H):\n    h.make().run()\n",
     )]);
-    no_edge(&res, "m.py::use", "m.py::A.run", "d04b @cached_property make() call");
+    no_edge(
+        &res,
+        "m.py::use",
+        "m.py::A.run",
+        "d04b @cached_property make() call",
+    );
 }
 
 #[test]
@@ -169,7 +227,12 @@ fn d05_stacked_transparent_then_opaque() {
         "import functools\nfrom typing import List\n\n{AC}\ndef many(fn):\n    def inner(*a) -> List[A]:\n        return [fn(*a)]\n    return inner\n\n@functools.lru_cache(maxsize=None)\n@many\ndef make() -> A:\n    return A()\n"
     );
     let res = resolve(&[("f.py", &f), ("app.py", USE_APPEND)]);
-    no_edge(&res, "app.py::use", "f.py::A.append", "d05 lru_cache stacked on @many");
+    no_edge(
+        &res,
+        "app.py::use",
+        "f.py::A.append",
+        "d05 lru_cache stacked on @many",
+    );
 }
 
 #[test]
@@ -178,7 +241,12 @@ fn d05b_opaque_then_transparent_stacked() {
         "import functools\nfrom typing import List\n\n{AC}\ndef many(fn):\n    def inner(*a) -> List[A]:\n        return [fn(*a)]\n    return inner\n\n@many\n@functools.lru_cache(maxsize=None)\ndef make() -> A:\n    return A()\n"
     );
     let res = resolve(&[("f.py", &f), ("app.py", USE_APPEND)]);
-    no_edge(&res, "app.py::use", "f.py::A.append", "d05b @many stacked on lru_cache");
+    no_edge(
+        &res,
+        "app.py::use",
+        "f.py::A.append",
+        "d05b @many stacked on lru_cache",
+    );
 }
 
 #[test]
@@ -186,11 +254,21 @@ fn d05c_staticmethod_on_a_class_factory_recall() {
     let res = resolve(&[
         (
             "f.py",
-            &format!("{AC}\nclass Fx:\n    @staticmethod\n    def make() -> A:\n        return A()\n"),
+            &format!(
+                "{AC}\nclass Fx:\n    @staticmethod\n    def make() -> A:\n        return A()\n"
+            ),
         ),
-        ("app.py", "from f import Fx\n\ndef use():\n    Fx.make().run()\n"),
+        (
+            "app.py",
+            "from f import Fx\n\ndef use():\n    Fx.make().run()\n",
+        ),
     ]);
-    edge(&res, "app.py::use", "f.py::A.run", "d05c @staticmethod factory recall");
+    edge(
+        &res,
+        "app.py::use",
+        "f.py::A.run",
+        "d05c @staticmethod factory recall",
+    );
 }
 
 #[test]
@@ -202,14 +280,24 @@ fn d05d_staticmethod_stacked_on_opaque() {
         ),
         ("app.py", "from f import Fx\n\ndef use():\n    Fx.make().append(1)\n"),
     ]);
-    no_edge(&res, "app.py::use", "f.py::A.append", "d05d @staticmethod @many");
+    no_edge(
+        &res,
+        "app.py::use",
+        "f.py::A.append",
+        "d05d @staticmethod @many",
+    );
 }
 
 #[test]
 fn d06_class_decorator_does_not_block_its_factory() {
     let f = "from dataclasses import dataclass\n\n@dataclass\nclass A:\n    x: int = 0\n    def run(self):\n        return 1\n\ndef make() -> A:\n    return A()\n";
     let res = resolve(&[("f.py", f), ("app.py", USE)]);
-    edge(&res, "app.py::use", "f.py::A.run", "d06 class decorator recall");
+    edge(
+        &res,
+        "app.py::use",
+        "f.py::A.run",
+        "d06 class decorator recall",
+    );
 }
 
 #[test]
@@ -217,8 +305,19 @@ fn d06b_class_decorator_directly_before_a_method_factory_class() {
     // The class decorator sits between the previous symbol and the class; the
     // first method must not be read as decorated by it.
     let f = "class A:\n    def run(self):\n        return 1\n\ndef register(c):\n    return c\n\n@register\nclass Fx:\n    @staticmethod\n    def make() -> A:\n        return A()\n";
-    let res = resolve(&[("f.py", f), ("app.py", "from f import Fx\n\ndef use():\n    Fx.make().run()\n")]);
-    edge(&res, "app.py::use", "f.py::A.run", "d06b class decorator then staticmethod recall");
+    let res = resolve(&[
+        ("f.py", f),
+        (
+            "app.py",
+            "from f import Fx\n\ndef use():\n    Fx.make().run()\n",
+        ),
+    ]);
+    edge(
+        &res,
+        "app.py::use",
+        "f.py::A.run",
+        "d06b class decorator then staticmethod recall",
+    );
 }
 
 #[test]
@@ -227,7 +326,12 @@ fn d07_multiline_decorator_call_spanning_previous_symbol() {
         "from typing import List\n\n{AC}\ndef prev():\n    return 1\n\ndef many(*xs):\n    def deco(fn):\n        def inner(*a) -> List[A]:\n            return [fn(*a)]\n        return inner\n    return deco\n\n@many(\n    prev,\n    1,\n)\ndef make() -> A:\n    return A()\n"
     );
     let res = resolve(&[("f.py", &f), ("app.py", USE_APPEND)]);
-    no_edge(&res, "app.py::use", "f.py::A.append", "d07 multi-line decorator call");
+    no_edge(
+        &res,
+        "app.py::use",
+        "f.py::A.append",
+        "d07 multi-line decorator call",
+    );
 }
 
 #[test]
@@ -236,19 +340,31 @@ fn d07b_decorator_directly_after_previous_symbol_no_blank_line() {
         "from typing import List\n\n{AC}\ndef many(fn):\n    def inner(*a) -> List[A]:\n        return [fn(*a)]\n    return inner\ndef prev():\n    return 1\n@many\ndef make() -> A:\n    return A()\n"
     );
     let res = resolve(&[("f.py", &f), ("app.py", USE_APPEND)]);
-    no_edge(&res, "app.py::use", "f.py::A.append", "d07b decorator with no blank line");
+    no_edge(
+        &res,
+        "app.py::use",
+        "f.py::A.append",
+        "d07b decorator with no blank line",
+    );
 }
 
 #[test]
 fn d07c_decorator_is_the_first_statement_after_imports_only() {
     // No previous symbol at all: the decorator is the first thing in the file.
-    let g = format!("import deco\nfrom deco import A\n\n@deco.many\ndef make() -> A:\n    return A()\n");
+    let g = format!(
+        "import deco\nfrom deco import A\n\n@deco.many\ndef make() -> A:\n    return A()\n"
+    );
     let res = resolve(&[
         ("deco.py", "from typing import List\n\nclass A:\n    def append(self, x):\n        return 1\n\ndef many(fn):\n    def inner(*a) -> List[A]:\n        return [fn(*a)]\n    return inner\n"),
         ("f.py", &g),
         ("app.py", USE_APPEND),
     ]);
-    no_edge(&res, "app.py::use", "deco.py::A.append", "d07c first-in-file decorator");
+    no_edge(
+        &res,
+        "app.py::use",
+        "deco.py::A.append",
+        "d07c first-in-file decorator",
+    );
 }
 
 // ---- cost side: recall lost, to be recorded as LOW ---------------------
@@ -280,7 +396,12 @@ fn d08d_constant_assignment_between_functions() {
 #[test]
 fn d08e_assigned_call_between_functions() {
     let res = factory("LOG = dict()\nREG = list(range(3))\n\n");
-    edge(&res, "app.py::use", "f.py::A.run", "d08e module-level assigned calls recall");
+    edge(
+        &res,
+        "app.py::use",
+        "f.py::A.run",
+        "d08e module-level assigned calls recall",
+    );
 }
 
 #[test]
@@ -288,9 +409,17 @@ fn d08f_method_factory_in_class_with_base_class() {
     let f = format!("class Base:\n    pass\n\n{AC}\nclass Fx(Base):\n    def make(self) -> A:\n        return A()\n");
     let res = resolve(&[
         ("f.py", &f),
-        ("app.py", "from f import Fx\n\ndef use():\n    Fx().make().run()\n"),
+        (
+            "app.py",
+            "from f import Fx\n\ndef use():\n    Fx().make().run()\n",
+        ),
     ]);
-    edge(&res, "app.py::use", "f.py::A.run", "d08f method in class with a base (class header Name is not a decorator)");
+    edge(
+        &res,
+        "app.py::use",
+        "f.py::A.run",
+        "d08f method in class with a base (class header Name is not a decorator)",
+    );
 }
 
 #[test]
@@ -298,7 +427,12 @@ fn d08f_method_factory_in_class_with_base_class() {
 fn d08g_nested_factory_after_outer_annotation() {
     let f = format!("{AC}\ndef outer(x: int = 3) -> A:\n    def make() -> A:\n        return A()\n    return make().run() and A()\n");
     let res = resolve(&[("f.py", &f)]);
-    edge(&res, "f.py::outer", "f.py::A.run", "d08g nested factory after outer signature");
+    edge(
+        &res,
+        "f.py::outer",
+        "f.py::A.run",
+        "d08g nested factory after outer signature",
+    );
 }
 
 #[test]
@@ -306,9 +440,17 @@ fn d08h_class_attribute_between_methods() {
     let f = format!("{AC}\nclass Fx:\n    NAME = 'x'\n    count: int = 0\n\n    def make(self) -> A:\n        return A()\n");
     let res = resolve(&[
         ("f.py", &f),
-        ("app.py", "from f import Fx\n\ndef use():\n    Fx().make().run()\n"),
+        (
+            "app.py",
+            "from f import Fx\n\ndef use():\n    Fx().make().run()\n",
+        ),
     ]);
-    edge(&res, "app.py::use", "f.py::A.run", "d08h class attrs before method recall");
+    edge(
+        &res,
+        "app.py::use",
+        "f.py::A.run",
+        "d08h class attrs before method recall",
+    );
 }
 
 #[test]
@@ -316,9 +458,17 @@ fn d08i_method_after_method_with_default_ref() {
     let f = format!("{AC}\nclass Fx:\n    def first(self, x=A):\n        return x\n\n    def make(self) -> A:\n        return A()\n");
     let res = resolve(&[
         ("f.py", &f),
-        ("app.py", "from f import Fx\n\ndef use():\n    Fx().make().run()\n"),
+        (
+            "app.py",
+            "from f import Fx\n\ndef use():\n    Fx().make().run()\n",
+        ),
     ]);
-    edge(&res, "app.py::use", "f.py::A.run", "d08i sibling method default arg recall");
+    edge(
+        &res,
+        "app.py::use",
+        "f.py::A.run",
+        "d08i sibling method default arg recall",
+    );
 }
 
 // =================== annotation through imports ===========================
@@ -331,10 +481,18 @@ fn n01_from_dot_import_module_attribute_annotation() {
     let res = resolve(&[
         ("pkg/__init__.py", ""),
         ("pkg/models.py", LOGS),
-        ("pkg/fac.py", "from . import models\n\ndef make() -> models.Log:\n    return models.Log()\n"),
+        (
+            "pkg/fac.py",
+            "from . import models\n\ndef make() -> models.Log:\n    return models.Log()\n",
+        ),
         ("app.py", APP_LOG),
     ]);
-    edge(&res, "app.py::use", "pkg/models.py::Log.write", "n01 recall via module attribute");
+    edge(
+        &res,
+        "app.py::use",
+        "pkg/models.py::Log.write",
+        "n01 recall via module attribute",
+    );
 }
 
 #[test]
@@ -342,11 +500,25 @@ fn n01b_module_attribute_annotation_does_not_pick_namesake() {
     let res = resolve(&[
         ("pkg/__init__.py", ""),
         ("pkg/models.py", LOGS),
-        ("other.py", "class Log:\n    def write(self):\n        return 9\n"),
-        ("pkg/fac.py", "from . import models\n\ndef make() -> models.Log:\n    return models.Log()\n"),
-        ("app.py", "from pkg.fac import make\nfrom other import Log\n\ndef use():\n    make().write()\n"),
+        (
+            "other.py",
+            "class Log:\n    def write(self):\n        return 9\n",
+        ),
+        (
+            "pkg/fac.py",
+            "from . import models\n\ndef make() -> models.Log:\n    return models.Log()\n",
+        ),
+        (
+            "app.py",
+            "from pkg.fac import make\nfrom other import Log\n\ndef use():\n    make().write()\n",
+        ),
     ]);
-    no_edge(&res, "app.py::use", "other.py::Log.write", "n01b reader's Log is the other class");
+    no_edge(
+        &res,
+        "app.py::use",
+        "other.py::Log.write",
+        "n01b reader's Log is the other class",
+    );
 }
 
 #[test]
@@ -354,10 +526,18 @@ fn n02_import_as_module_attribute_annotation() {
     let res = resolve(&[
         ("pkg/__init__.py", ""),
         ("pkg/mod.py", LOGS),
-        ("pkg/fac.py", "import pkg.mod as m\n\ndef make() -> m.Log:\n    return m.Log()\n"),
+        (
+            "pkg/fac.py",
+            "import pkg.mod as m\n\ndef make() -> m.Log:\n    return m.Log()\n",
+        ),
         ("app.py", APP_LOG),
     ]);
-    edge(&res, "app.py::use", "pkg/mod.py::Log.write", "n02 recall via import-as");
+    edge(
+        &res,
+        "app.py::use",
+        "pkg/mod.py::Log.write",
+        "n02 recall via import-as",
+    );
 }
 
 #[test]
@@ -368,7 +548,12 @@ fn n03_string_annotation_defined_later_in_owner() {
         ("pkg/fac.py", &fac_src),
         ("app.py", APP_LOG),
     ]);
-    edge(&res, "app.py::use", "pkg/fac.py::Log.write", "n03 recall for forward-ref string");
+    edge(
+        &res,
+        "app.py::use",
+        "pkg/fac.py::Log.write",
+        "n03 recall for forward-ref string",
+    );
 }
 
 #[test]
@@ -376,11 +561,22 @@ fn n03b_string_annotation_defined_later_not_a_namesake_elsewhere() {
     let fac_src = format!("def make() -> \"Log\":\n    return Log()\n\n{LOGS}");
     let res = resolve(&[
         ("pkg/__init__.py", ""),
-        ("other.py", "class Log:\n    def write(self):\n        return 9\n"),
+        (
+            "other.py",
+            "class Log:\n    def write(self):\n        return 9\n",
+        ),
         ("pkg/fac.py", &fac_src),
-        ("app.py", "from pkg.fac import make\nfrom other import Log\n\ndef use():\n    make().write()\n"),
+        (
+            "app.py",
+            "from pkg.fac import make\nfrom other import Log\n\ndef use():\n    make().write()\n",
+        ),
     ]);
-    no_edge(&res, "app.py::use", "other.py::Log.write", "n03b forward ref resolved in owner file");
+    no_edge(
+        &res,
+        "app.py::use",
+        "other.py::Log.write",
+        "n03b forward ref resolved in owner file",
+    );
 }
 
 #[test]
@@ -394,7 +590,12 @@ fn n04_type_checking_only_import() {
         ),
         ("app.py", "from fac import make\n\ndef use():\n    make().write()\n"),
     ]);
-    edge(&res, "app.py::use", "logs.py::Log.write", "n04 TYPE_CHECKING import recall");
+    edge(
+        &res,
+        "app.py::use",
+        "logs.py::Log.write",
+        "n04 TYPE_CHECKING import recall",
+    );
 }
 
 #[test]
@@ -422,7 +623,12 @@ fn n05_future_annotations() {
         ),
         ("app.py", "from fac import make\n\ndef use():\n    make().write()\n"),
     ]);
-    edge(&res, "app.py::use", "logs.py::Log.write", "n05 __future__ annotations recall");
+    edge(
+        &res,
+        "app.py::use",
+        "logs.py::Log.write",
+        "n05 __future__ annotations recall",
+    );
 }
 
 #[test]
@@ -435,7 +641,12 @@ fn n06_owner_local_class_shadows_imported_name() {
         ),
         ("app.py", "from fac import make\n\ndef use():\n    make().write()\n"),
     ]);
-    no_edge(&res, "app.py::use", "logs.py::Log.write", "n06 local class Log shadows import");
+    no_edge(
+        &res,
+        "app.py::use",
+        "logs.py::Log.write",
+        "n06 local class Log shadows import",
+    );
 }
 
 #[test]
@@ -450,7 +661,12 @@ fn n06b_import_after_local_class_wins() {
     ]);
     let local = reaches(&res, "app.py::use", "fac.py::Log.write");
     let imported = reaches(&res, "app.py::use", "logs.py::Log.write");
-    assert_eq!(local, imported, "n06b: rebound class + import picks one: {:?}", calls_from(&res, "app.py::use"));
+    assert_eq!(
+        local,
+        imported,
+        "n06b: rebound class + import picks one: {:?}",
+        calls_from(&res, "app.py::use")
+    );
 }
 
 #[test]
@@ -464,48 +680,91 @@ fn n07_optional_string_annotation() {
         ),
         ("app.py", "from fac import make\n\ndef use():\n    make().write()\n"),
     ]);
-    edge(&res, "app.py::use", "logs.py::Log.write", "n07 Optional[\"Log\"] recall");
+    edge(
+        &res,
+        "app.py::use",
+        "logs.py::Log.write",
+        "n07 Optional[\"Log\"] recall",
+    );
 }
 
 #[test]
 fn n08_unfollowable_import_does_not_fall_to_unique_corpus_name() {
     let res = resolve(&[
-        ("other.py", "class Log:\n    def write(self):\n        return 9\n"),
+        (
+            "other.py",
+            "class Log:\n    def write(self):\n        return 9\n",
+        ),
         (
             "fac.py",
             "from thirdparty import Log\n\ndef make() -> Log:\n    return Log()\n",
         ),
-        ("app.py", "from fac import make\n\ndef use():\n    make().write()\n"),
+        (
+            "app.py",
+            "from fac import make\n\ndef use():\n    make().write()\n",
+        ),
     ]);
-    no_edge(&res, "app.py::use", "other.py::Log.write", "n08 external Log vs corpus Log");
+    no_edge(
+        &res,
+        "app.py::use",
+        "other.py::Log.write",
+        "n08 external Log vs corpus Log",
+    );
 }
 
 #[test]
 fn n09_star_import_in_owner_abstains_not_unique_name() {
     let res = resolve(&[
-        ("other.py", "class Log:\n    def write(self):\n        return 9\n"),
+        (
+            "other.py",
+            "class Log:\n    def write(self):\n        return 9\n",
+        ),
         (
             "fac.py",
             "from thirdparty import *\n\ndef make() -> Log:\n    return Log()\n",
         ),
-        ("app.py", "from fac import make\n\ndef use():\n    make().write()\n"),
+        (
+            "app.py",
+            "from fac import make\n\ndef use():\n    make().write()\n",
+        ),
     ]);
-    no_edge(&res, "app.py::use", "other.py::Log.write", "n09 star import in owner");
+    no_edge(
+        &res,
+        "app.py::use",
+        "other.py::Log.write",
+        "n09 star import in owner",
+    );
 }
 
 #[test]
 fn n10_field_annotation_through_owner_imports() {
     let res = resolve(&[
         ("logs.py", LOGS),
-        ("other.py", "class Log:\n    def write(self):\n        return 9\n"),
+        (
+            "other.py",
+            "class Log:\n    def write(self):\n        return 9\n",
+        ),
         (
             "holder.py",
             "from thirdparty import Log\n\nclass Holder:\n    log: Log\n",
         ),
-        ("app.py", "from holder import Holder\n\ndef use(h: Holder):\n    h.log.write()\n"),
+        (
+            "app.py",
+            "from holder import Holder\n\ndef use(h: Holder):\n    h.log.write()\n",
+        ),
     ]);
-    no_edge(&res, "app.py::use", "logs.py::Log.write", "n10 external field type, logs.py");
-    no_edge(&res, "app.py::use", "other.py::Log.write", "n10 external field type, other.py");
+    no_edge(
+        &res,
+        "app.py::use",
+        "logs.py::Log.write",
+        "n10 external field type, logs.py",
+    );
+    no_edge(
+        &res,
+        "app.py::use",
+        "other.py::Log.write",
+        "n10 external field type, other.py",
+    );
 }
 
 #[test]
@@ -514,10 +773,21 @@ fn n10b_field_annotation_module_attribute() {
     let res = resolve(&[
         ("pkg/__init__.py", ""),
         ("pkg/models.py", LOGS),
-        ("pkg/holder.py", "from . import models\n\nclass Holder:\n    log: models.Log\n"),
-        ("app.py", "from pkg.holder import Holder\n\ndef use(h: Holder):\n    h.log.write()\n"),
+        (
+            "pkg/holder.py",
+            "from . import models\n\nclass Holder:\n    log: models.Log\n",
+        ),
+        (
+            "app.py",
+            "from pkg.holder import Holder\n\ndef use(h: Holder):\n    h.log.write()\n",
+        ),
     ]);
-    edge(&res, "app.py::use", "pkg/models.py::Log.write", "n10b field module attribute recall");
+    edge(
+        &res,
+        "app.py::use",
+        "pkg/models.py::Log.write",
+        "n10b field module attribute recall",
+    );
 }
 
 // =================== scope shadow =========================================
@@ -528,7 +798,10 @@ fn shadow_files(app_tail: &str) -> ResolutionResult {
     );
     resolve(&[
         ("logs.py", LOGS),
-        ("holder.py", "from logs import Log\n\nclass Holder:\n    log: Log\n"),
+        (
+            "holder.py",
+            "from logs import Log\n\nclass Holder:\n    log: Log\n",
+        ),
         ("app.py", &app),
     ])
 }
@@ -536,14 +809,23 @@ fn shadow_files(app_tail: &str) -> ResolutionResult {
 fn shadow(label: &str, caller: &str, tail: &str) {
     let res = shadow_files(tail);
     // sanity: the typed function itself still resolves (the probe is live)
-    edge(&res, "app.py::typed", "logs.py::Log.write", &format!("{label} sanity"));
+    edge(
+        &res,
+        "app.py::typed",
+        "logs.py::Log.write",
+        &format!("{label} sanity"),
+    );
     no_edge(&res, caller, "logs.py::Log.write", label);
 }
 
 #[test]
 #[ignore = "pre-existing, ft-c0afdfef follow-up: a global declaration or class-body binding is not a scope fact the scope lookup holds"]
 fn s01_global_declaration() {
-    shadow("s01 global h", "app.py::other", "def other():\n    global h\n    h.log.write()\n");
+    shadow(
+        "s01 global h",
+        "app.py::other",
+        "def other():\n    global h\n    h.log.write()\n",
+    );
 }
 
 #[test]
@@ -558,41 +840,69 @@ fn s02_nonlocal_declaration() {
 #[test]
 #[ignore = "pre-existing, ft-c0afdfef follow-up: match/case captures need extractor binding facts for match patterns (schema frozen at 97)"]
 fn s03_match_capture_pattern() {
-    shadow("s03 match capture", "app.py::other", "def other(x):\n    match x:\n        case [h, *_]:\n            h.log.write()\n");
+    shadow(
+        "s03 match capture",
+        "app.py::other",
+        "def other(x):\n    match x:\n        case [h, *_]:\n            h.log.write()\n",
+    );
 }
 
 #[test]
 #[ignore = "pre-existing, ft-c0afdfef follow-up: match/case captures need extractor binding facts for match patterns (schema frozen at 97)"]
 fn s03b_match_class_pattern() {
-    shadow("s03b Foo(h)", "app.py::other", "def other(x):\n    match x:\n        case Foo(h):\n            h.log.write()\n");
+    shadow(
+        "s03b Foo(h)",
+        "app.py::other",
+        "def other(x):\n    match x:\n        case Foo(h):\n            h.log.write()\n",
+    );
 }
 
 #[test]
 #[ignore = "pre-existing, ft-c0afdfef follow-up: match/case captures need extractor binding facts for match patterns (schema frozen at 97)"]
 fn s03c_match_mapping_pattern() {
-    shadow("s03c {k: h}", "app.py::other", "def other(x):\n    match x:\n        case {\"k\": h}:\n            h.log.write()\n");
+    shadow(
+        "s03c {k: h}",
+        "app.py::other",
+        "def other(x):\n    match x:\n        case {\"k\": h}:\n            h.log.write()\n",
+    );
 }
 
 #[test]
 #[ignore = "pre-existing, ft-c0afdfef follow-up: match/case captures need extractor binding facts for match patterns (schema frozen at 97)"]
 fn s03d_match_as_pattern() {
-    shadow("s03d as h", "app.py::other", "def other(x):\n    match x:\n        case (1 | 2) as h:\n            h.log.write()\n");
+    shadow(
+        "s03d as h",
+        "app.py::other",
+        "def other(x):\n    match x:\n        case (1 | 2) as h:\n            h.log.write()\n",
+    );
 }
 
 #[test]
 #[ignore = "pre-existing, ft-c0afdfef follow-up: match/case captures need extractor binding facts for match patterns (schema frozen at 97)"]
 fn s03e_match_star_pattern() {
-    shadow("s03e [*h]", "app.py::other", "def other(x):\n    match x:\n        case [*h]:\n            h.log.write()\n");
+    shadow(
+        "s03e [*h]",
+        "app.py::other",
+        "def other(x):\n    match x:\n        case [*h]:\n            h.log.write()\n",
+    );
 }
 
 #[test]
 fn s04_del_then_reuse() {
-    shadow("s04 del h", "app.py::other", "def other(h):\n    del h\n    h = make()\n    h.log.write()\n");
+    shadow(
+        "s04 del h",
+        "app.py::other",
+        "def other(h):\n    del h\n    h = make()\n    h.log.write()\n",
+    );
 }
 
 #[test]
 fn s05_lambda_parameter() {
-    shadow("s05 lambda param", "app.py::other", "def other():\n    return (lambda h: h.log.write())\n");
+    shadow(
+        "s05 lambda param",
+        "app.py::other",
+        "def other():\n    return (lambda h: h.log.write())\n",
+    );
 }
 
 #[test]
@@ -617,15 +927,35 @@ fn s06b_class_body_variable_is_not_visible_in_method() {
 
 #[test]
 fn s07_star_args_and_kwargs_named_h() {
-    shadow("s07 *h", "app.py::other", "def other(*h):\n    return h.log.write()\n");
-    shadow("s07 **h", "app.py::other", "def other(**h):\n    return h.log.write()\n");
+    shadow(
+        "s07 *h",
+        "app.py::other",
+        "def other(*h):\n    return h.log.write()\n",
+    );
+    shadow(
+        "s07 **h",
+        "app.py::other",
+        "def other(**h):\n    return h.log.write()\n",
+    );
 }
 
 #[test]
 fn s08_positional_only_and_keyword_only() {
-    shadow("s08 posonly", "app.py::other", "def other(h, /):\n    return h.log.write()\n");
-    shadow("s08 kwonly", "app.py::other", "def other(*, h):\n    return h.log.write()\n");
-    shadow("s08 kwonly default", "app.py::other", "def other(*, h=None):\n    return h.log.write()\n");
+    shadow(
+        "s08 posonly",
+        "app.py::other",
+        "def other(h, /):\n    return h.log.write()\n",
+    );
+    shadow(
+        "s08 kwonly",
+        "app.py::other",
+        "def other(*, h):\n    return h.log.write()\n",
+    );
+    shadow(
+        "s08 kwonly default",
+        "app.py::other",
+        "def other(*, h=None):\n    return h.log.write()\n",
+    );
 }
 
 #[test]
@@ -639,7 +969,12 @@ fn s09_same_function_name_in_two_classes() {
         ),
     ]);
     edge(&res, "app.py::P.go", "logs.py::Log.write", "s09 sanity");
-    no_edge(&res, "app.py::Q.go", "logs.py::Log.write", "s09 Q.go untyped h");
+    no_edge(
+        &res,
+        "app.py::Q.go",
+        "logs.py::Log.write",
+        "s09 Q.go untyped h",
+    );
 }
 
 #[test]
@@ -652,7 +987,12 @@ fn s10_closure_over_typed_param_recall() {
             "from holder import Holder\n\ndef typed(h: Holder):\n    def inner():\n        return h.log.write()\n    return inner\n",
         ),
     ]);
-    edge(&res, "app.py::typed.inner", "logs.py::Log.write", "s10 closure over typed param (recall)");
+    edge(
+        &res,
+        "app.py::typed.inner",
+        "logs.py::Log.write",
+        "s10 closure over typed param (recall)",
+    );
 }
 
 #[test]
@@ -665,19 +1005,33 @@ fn s10b_lambda_closure_over_typed_param_recall() {
             "from holder import Holder\n\ndef typed(h: Holder):\n    return (lambda: h.log.write())\n",
         ),
     ]);
-    edge(&res, "app.py::typed", "logs.py::Log.write", "s10b lambda closure over typed param (recall)");
+    edge(
+        &res,
+        "app.py::typed",
+        "logs.py::Log.write",
+        "s10b lambda closure over typed param (recall)",
+    );
 }
 
 #[test]
 fn s11_typed_keyword_only_and_posonly_recall() {
     for sig in ["h: Holder, /", "*, h: Holder", "x=1, *, h: Holder = None"] {
-        let app = format!("from holder import Holder\n\ndef typed({sig}):\n    return h.log.write()\n");
+        let app =
+            format!("from holder import Holder\n\ndef typed({sig}):\n    return h.log.write()\n");
         let res = resolve(&[
             ("logs.py", LOGS),
-            ("holder.py", "from logs import Log\n\nclass Holder:\n    log: Log\n"),
+            (
+                "holder.py",
+                "from logs import Log\n\nclass Holder:\n    log: Log\n",
+            ),
             ("app.py", &app),
         ]);
-        edge(&res, "app.py::typed", "logs.py::Log.write", &format!("s11 typed sig `{sig}` recall"));
+        edge(
+            &res,
+            "app.py::typed",
+            "logs.py::Log.write",
+            &format!("s11 typed sig `{sig}` recall"),
+        );
     }
 }
 
@@ -717,16 +1071,29 @@ fn i01_same_module_imported_twice_does_not_abstain() {
         ("a.py", "def f():\n    return 1\n"),
         ("app.py", "import a\nimport a\n\ndef use():\n    a.f()\n"),
     ]);
-    edge(&res, "app.py::use", "a.py::f", "i01 import a; import a (recall)");
+    edge(
+        &res,
+        "app.py::use",
+        "a.py::f",
+        "i01 import a; import a (recall)",
+    );
 }
 
 #[test]
 fn i01b_same_from_import_twice_does_not_abstain() {
     let res = resolve(&[
         ("f.py", &format!("{AC}\ndef make() -> A:\n    return A()\n")),
-        ("app.py", "from f import make\nfrom f import make\n\ndef use():\n    make().run()\n"),
+        (
+            "app.py",
+            "from f import make\nfrom f import make\n\ndef use():\n    make().run()\n",
+        ),
     ]);
-    edge(&res, "app.py::use", "f.py::A.run", "i01b same from-import twice (recall)");
+    edge(
+        &res,
+        "app.py::use",
+        "f.py::A.run",
+        "i01b same from-import twice (recall)",
+    );
 }
 
 #[test]
@@ -738,7 +1105,12 @@ fn i02_same_from_import_in_both_branches() {
             "import sys\nif sys.platform == 'win32':\n    from f import make\nelse:\n    from f import make\n\ndef use():\n    make().run()\n",
         ),
     ]);
-    edge(&res, "app.py::use", "f.py::A.run", "i02 same target in both branches (recall)");
+    edge(
+        &res,
+        "app.py::use",
+        "f.py::A.run",
+        "i02 same target in both branches (recall)",
+    );
 }
 
 #[test]
@@ -750,7 +1122,12 @@ fn i02b_try_except_same_target() {
             "try:\n    from f import make\nexcept ImportError:\n    from f import make\n\ndef use():\n    make().run()\n",
         ),
     ]);
-    edge(&res, "app.py::use", "f.py::A.run", "i02b try/except same target (recall)");
+    edge(
+        &res,
+        "app.py::use",
+        "f.py::A.run",
+        "i02b try/except same target (recall)",
+    );
 }
 
 #[test]
@@ -758,13 +1135,21 @@ fn i02b_try_except_same_target() {
 fn i03_reexport_chain_to_the_same_declaration() {
     let res = resolve(&[
         ("pkg/__init__.py", "from .impl import make\n"),
-        ("pkg/impl.py", &format!("{AC}\ndef make() -> A:\n    return A()\n")),
+        (
+            "pkg/impl.py",
+            &format!("{AC}\ndef make() -> A:\n    return A()\n"),
+        ),
         (
             "app.py",
             "from pkg import make\nfrom pkg.impl import make\n\ndef use():\n    make().run()\n",
         ),
     ]);
-    edge(&res, "app.py::use", "pkg/impl.py::A.run", "i03 two imports to the same declaration (recall)");
+    edge(
+        &res,
+        "app.py::use",
+        "pkg/impl.py::A.run",
+        "i03 two imports to the same declaration (recall)",
+    );
 }
 
 #[test]
@@ -772,9 +1157,17 @@ fn i04_two_stars_second_defines_nothing_of_the_name() {
     let res = resolve(&[
         ("a.py", &format!("{AC}\ndef make() -> A:\n    return A()\n")),
         ("b.py", "def other():\n    return 1\n"),
-        ("app.py", "from a import *\nfrom b import *\n\ndef use():\n    make().run()\n"),
+        (
+            "app.py",
+            "from a import *\nfrom b import *\n\ndef use():\n    make().run()\n",
+        ),
     ]);
-    edge(&res, "app.py::use", "a.py::A.run", "i04 only one star defines make (recall)");
+    edge(
+        &res,
+        "app.py::use",
+        "a.py::A.run",
+        "i04 only one star defines make (recall)",
+    );
 }
 
 #[test]
@@ -783,9 +1176,17 @@ fn i04b_two_stars_reexporting_the_same_declaration() {
     let res = resolve(&[
         ("a.py", &format!("{AC}\ndef make() -> A:\n    return A()\n")),
         ("b.py", "from a import make\n"),
-        ("app.py", "from a import *\nfrom b import *\n\ndef use():\n    make().run()\n"),
+        (
+            "app.py",
+            "from a import *\nfrom b import *\n\ndef use():\n    make().run()\n",
+        ),
     ]);
-    edge(&res, "app.py::use", "a.py::A.run", "i04b same declaration via two stars (recall)");
+    edge(
+        &res,
+        "app.py::use",
+        "a.py::A.run",
+        "i04b same declaration via two stars (recall)",
+    );
 }
 
 // =================== 3-segment and ordinary import resolution =============
@@ -802,12 +1203,18 @@ fn src_layout(app: &'static str) -> ResolutionResult {
 #[test]
 fn t01_src_layout_three_segment() {
     let res = src_layout("import a.b.c\n\ndef use():\n    a.b.c.f()\n");
-    edge(&res, "app.py::use", "src/a/b/c.py::f", "t01 src layout, one root");
+    edge(
+        &res,
+        "app.py::use",
+        "src/a/b/c.py::f",
+        "t01 src layout, one root",
+    );
 }
 
 #[test]
 fn t01b_src_layout_from_forms() {
-    let res = src_layout("from a.b import c\nfrom a.b.c import f\n\ndef use():\n    c.f()\n    f()\n");
+    let res =
+        src_layout("from a.b import c\nfrom a.b.c import f\n\ndef use():\n    c.f()\n    f()\n");
     assert!(
         reaches(&res, "app.py::use", "src/a/b/c.py::f"),
         "t01b: {:?}",
@@ -818,9 +1225,19 @@ fn t01b_src_layout_from_forms() {
 #[test]
 fn t01c_from_form_edges_equal_import_form() {
     let res = src_layout("from a.b.c import f\n\ndef use():\n    f()\n");
-    edge(&res, "app.py::use", "src/a/b/c.py::f", "t01c from a.b.c import f");
+    edge(
+        &res,
+        "app.py::use",
+        "src/a/b/c.py::f",
+        "t01c from a.b.c import f",
+    );
     let res = src_layout("from a.b import c\n\ndef use():\n    c.f()\n");
-    edge(&res, "app.py::use", "src/a/b/c.py::f", "t01c from a.b import c");
+    edge(
+        &res,
+        "app.py::use",
+        "src/a/b/c.py::f",
+        "t01c from a.b import c",
+    );
 }
 
 #[test]
@@ -836,7 +1253,12 @@ fn t02_relative_imports_resolve() {
         ),
     ]);
     edge(&res, "pkg/app.py::use", "pkg/c.py::f", "t02 relative");
-    edge(&res, "pkg/app.py::use", "pkg/sub/g.py::g", "t02 relative nested");
+    edge(
+        &res,
+        "pkg/app.py::use",
+        "pkg/sub/g.py::g",
+        "t02 relative nested",
+    );
 }
 
 #[test]
@@ -844,9 +1266,17 @@ fn t03_importer_directory_candidate_still_resolves() {
     let res = resolve(&[
         ("tool/sub/__init__.py", ""),
         ("tool/sub/mod.py", "def f():\n    return 1\n"),
-        ("tool/run.py", "import sub.mod\n\ndef use():\n    sub.mod.f()\n"),
+        (
+            "tool/run.py",
+            "import sub.mod\n\ndef use():\n    sub.mod.f()\n",
+        ),
     ]);
-    edge(&res, "tool/run.py::use", "tool/sub/mod.py::f", "t03 importer-relative absolute import");
+    edge(
+        &res,
+        "tool/run.py::use",
+        "tool/sub/mod.py::f",
+        "t03 importer-relative absolute import",
+    );
 }
 
 #[test]
@@ -859,7 +1289,12 @@ fn t04_importer_in_src_does_not_double_count_its_own_root() {
         ("src/a/b/c.py", "def f():\n    return 1\n"),
         ("src/x.py", "import a.b.c\n\ndef use():\n    a.b.c.f()\n"),
     ]);
-    edge(&res, "src/x.py::use", "src/a/b/c.py::f", "t04 importer inside the root");
+    edge(
+        &res,
+        "src/x.py::use",
+        "src/a/b/c.py::f",
+        "t04 importer inside the root",
+    );
 }
 
 #[test]
@@ -874,8 +1309,18 @@ fn t05_two_submodules_of_one_package_imported_together() {
             "import a.b.c\nimport a.b.d\n\ndef use():\n    a.b.c.f()\n    a.b.d.g()\n",
         ),
     ]);
-    edge(&res, "app.py::use", "a/b/c.py::f", "t05 import a.b.c + import a.b.d (recall)");
-    edge(&res, "app.py::use", "a/b/d.py::g", "t05 import a.b.c + import a.b.d (recall)");
+    edge(
+        &res,
+        "app.py::use",
+        "a/b/c.py::f",
+        "t05 import a.b.c + import a.b.d (recall)",
+    );
+    edge(
+        &res,
+        "app.py::use",
+        "a/b/d.py::g",
+        "t05 import a.b.c + import a.b.d (recall)",
+    );
 }
 
 #[test]
@@ -884,9 +1329,17 @@ fn t05b_package_and_submodule_imported_together() {
         ("a/__init__.py", "def top():\n    return 0\n"),
         ("a/b/__init__.py", ""),
         ("a/b/c.py", "def f():\n    return 1\n"),
-        ("app.py", "import a\nimport a.b.c\n\ndef use():\n    a.b.c.f()\n    a.top()\n"),
+        (
+            "app.py",
+            "import a\nimport a.b.c\n\ndef use():\n    a.b.c.f()\n    a.top()\n",
+        ),
     ]);
-    edge(&res, "app.py::use", "a/b/c.py::f", "t05b import a + import a.b.c (recall)");
+    edge(
+        &res,
+        "app.py::use",
+        "a/b/c.py::f",
+        "t05b import a + import a.b.c (recall)",
+    );
 }
 
 #[test]
@@ -900,7 +1353,12 @@ fn t06_unrelated_function_local_named_like_root() {
             "import a.b.c\n\ndef other():\n    a = 3\n    return a\n\ndef use():\n    a.b.c.f()\n",
         ),
     ]);
-    edge(&res, "app.py::use", "a/b/c.py::f", "t06 unrelated function's local `a` (recall)");
+    edge(
+        &res,
+        "app.py::use",
+        "a/b/c.py::f",
+        "t06 unrelated function's local `a` (recall)",
+    );
 }
 
 #[test]
@@ -913,7 +1371,12 @@ fn t07_unrelated_same_tail_elsewhere_in_corpus() {
         ("docs/examples/a/b/c.py", "def f():\n    return 2\n"),
         ("app.py", "import a.b.c\n\ndef use():\n    a.b.c.f()\n"),
     ]);
-    edge(&res, "app.py::use", "a/b/c.py::f", "t07 docs copy of the tail (recall)");
+    edge(
+        &res,
+        "app.py::use",
+        "a/b/c.py::f",
+        "t07 docs copy of the tail (recall)",
+    );
 }
 
 #[test]
@@ -927,7 +1390,12 @@ fn t08_three_segment_with_conditional_import_same_target() {
             "try:\n    import a.b.c\nexcept ImportError:\n    import a.b.c\n\ndef use():\n    a.b.c.f()\n",
         ),
     ]);
-    edge(&res, "app.py::use", "a/b/c.py::f", "t08 same import in try and except (recall)");
+    edge(
+        &res,
+        "app.py::use",
+        "a/b/c.py::f",
+        "t08 same import in try and except (recall)",
+    );
 }
 
 // =================== regression harness: edge dump =======================
@@ -946,8 +1414,7 @@ fn z_edge_dump_for_diffing() {
         let mut files: Vec<(String, String)> = Vec::new();
         walk(&corpus.path(), &corpus.path(), &mut files);
         files.sort();
-        let extractions: Vec<Extraction> =
-            files.iter().map(|(p, s)| extract_file(p, s)).collect();
+        let extractions: Vec<Extraction> = files.iter().map(|(p, s)| extract_file(p, s)).collect();
         let mut resolver = Resolver::new();
         resolver.index_extractions(&extractions);
         let res = resolver.resolve_all(&extractions).unwrap();
@@ -955,7 +1422,12 @@ fn z_edge_dump_for_diffing() {
         for e in &res.edges {
             lines.push(format!(
                 "{name}\t{:?}\t{}\t{}\t{}\t{}\t{:?}",
-                e.edge_kind, e.source_symbol, e.target_symbol, e.source_file, e.target_file, e.confidence
+                e.edge_kind,
+                e.source_symbol,
+                e.target_symbol,
+                e.source_file,
+                e.target_file,
+                e.confidence
             ));
         }
     }

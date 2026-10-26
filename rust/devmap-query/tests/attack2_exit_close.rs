@@ -78,8 +78,14 @@ fn exit_is_the_whole_body() {
         }
         let body = text[open + 1..end].trim();
         let answers = [
-            "Response<", "LayeredImpact", "Vec<Neighbors>", "ExploreReport",
-            "AffectedTestsReport", "CloneReport", "SkeletonReport", "EvidencePack",
+            "Response<",
+            "LayeredImpact",
+            "Vec<Neighbors>",
+            "ExploreReport",
+            "AffectedTestsReport",
+            "CloneReport",
+            "SkeletonReport",
+            "EvidencePack",
             "PreviewReport",
         ]
         .iter()
@@ -188,9 +194,11 @@ fn an_answer_never_carries_another_generations_verified_verdict() {
             let engine = StoreQueryEngine::new(&reader);
             while !stop.load(Ordering::Relaxed) {
                 if let Ok(r) = engine.impact(req("d", 1)) {
-                    seen.lock()
-                        .unwrap()
-                        .push((r.items.len(), r.source_freshness.generation_id, r.source_freshness.fresh));
+                    seen.lock().unwrap().push((
+                        r.items.len(),
+                        r.source_freshness.generation_id,
+                        r.source_freshness.fresh,
+                    ));
                 }
             }
         });
@@ -246,17 +254,26 @@ fn a_verdict_for_another_generation_is_never_attached_as_verified() {
         moved.store(true, Ordering::Relaxed);
     });
     let answer = engine.impact(req("d", 1)).unwrap();
-    assert!(moved.load(Ordering::Relaxed), "the interleave hook never ran");
+    assert!(
+        moved.load(Ordering::Relaxed),
+        "the interleave hook never ran"
+    );
     assert_eq!(
         reader.latest_generation_id().unwrap(),
         Some(3),
         "the hook did not land the generations"
     );
     let verdict = &answer.source_freshness;
-    assert_eq!(verdict.fresh, None, "claimed {verdict:?} for a generation not read");
+    assert_eq!(
+        verdict.fresh, None,
+        "claimed {verdict:?} for a generation not read"
+    );
     assert_eq!(verdict.generation_id, None, "{verdict:?}");
     let reason = verdict.reason.as_deref().unwrap_or_default();
-    assert!(reason.contains("index moved from generation 1 to 3"), "{reason}");
+    assert!(
+        reason.contains("index moved from generation 1 to 3"),
+        "{reason}"
+    );
 }
 
 /// The guard above must not degrade every answer: when no generation lands
@@ -277,6 +294,12 @@ fn a_verdict_for_the_generation_read_stays_verified() {
     assert!(hooked.load(Ordering::Relaxed));
     let _ = &fx;
     let verdict = &answer.source_freshness;
-    assert!(verdict.fresh.is_some(), "matching generations lost their verdict: {verdict:?}");
-    assert_eq!(verdict.generation_id, reader.latest_generation_id().unwrap());
+    assert!(
+        verdict.fresh.is_some(),
+        "matching generations lost their verdict: {verdict:?}"
+    );
+    assert_eq!(
+        verdict.generation_id,
+        reader.latest_generation_id().unwrap()
+    );
 }

@@ -49,7 +49,8 @@ fn edge(res: &ResolutionResult, caller: &str, target: &str, what: &str) {
     );
 }
 
-const A_RUN: &str = "class A:\n    def run(self):\n        return 1\n    def append(self, x):\n        return 2\n";
+const A_RUN: &str =
+    "class A:\n    def run(self):\n        return 1\n    def append(self, x):\n        return 2\n";
 const B_RUN: &str = "class B:\n    def run(self):\n        return 2\n";
 
 // =================== (a) call-result receivers ===========================
@@ -57,9 +58,18 @@ const B_RUN: &str = "class B:\n    def run(self):\n        return 2\n";
 #[test]
 fn a01_namesake_factories_import_picks_the_imported_one() {
     let res = resolve(&[
-        ("a.py", &format!("{A_RUN}\ndef make() -> A:\n    return A()\n")),
-        ("b.py", &format!("{B_RUN}\ndef make() -> B:\n    return B()\n")),
-        ("app.py", "from b import make\n\ndef use():\n    make().run()\n"),
+        (
+            "a.py",
+            &format!("{A_RUN}\ndef make() -> A:\n    return A()\n"),
+        ),
+        (
+            "b.py",
+            &format!("{B_RUN}\ndef make() -> B:\n    return B()\n"),
+        ),
+        (
+            "app.py",
+            "from b import make\n\ndef use():\n    make().run()\n",
+        ),
     ]);
     no_edge(&res, "app.py::use", "a.py::A.run", "a01");
     edge(&res, "app.py::use", "b.py::B.run", "a01");
@@ -68,9 +78,18 @@ fn a01_namesake_factories_import_picks_the_imported_one() {
 #[test]
 fn a02_star_import_last_binding_wins() {
     let res = resolve(&[
-        ("a.py", &format!("{A_RUN}\ndef make() -> A:\n    return A()\n")),
-        ("b.py", &format!("{B_RUN}\ndef make() -> B:\n    return B()\n")),
-        ("app.py", "from a import *\nfrom b import *\n\ndef use():\n    make().run()\n"),
+        (
+            "a.py",
+            &format!("{A_RUN}\ndef make() -> A:\n    return A()\n"),
+        ),
+        (
+            "b.py",
+            &format!("{B_RUN}\ndef make() -> B:\n    return B()\n"),
+        ),
+        (
+            "app.py",
+            "from a import *\nfrom b import *\n\ndef use():\n    make().run()\n",
+        ),
     ]);
     no_edge(&res, "app.py::use", "a.py::A.run", "a02");
 }
@@ -79,8 +98,14 @@ fn a02_star_import_last_binding_wins() {
 fn a03_reexport_through_init_recall() {
     let res = resolve(&[
         ("pkg/__init__.py", "from .impl import make\n"),
-        ("pkg/impl.py", &format!("{A_RUN}\ndef make() -> A:\n    return A()\n")),
-        ("app.py", "from pkg import make\n\ndef use():\n    make().run()\n"),
+        (
+            "pkg/impl.py",
+            &format!("{A_RUN}\ndef make() -> A:\n    return A()\n"),
+        ),
+        (
+            "app.py",
+            "from pkg import make\n\ndef use():\n    make().run()\n",
+        ),
     ]);
     edge(&res, "app.py::use", "pkg/impl.py::A.run", "a03 (recall)");
 }
@@ -96,20 +121,41 @@ fn a04_union_return_does_not_pick_one_member() {
     ]);
     let a = reaches(&res, "app.py::use", "a.py::A.run");
     let b = reaches(&res, "app.py::use", "a.py::B.run");
-    assert_eq!(a, b, "a04: Union[A, B] picked one member: {:?}", calls_from(&res, "app.py::use"));
+    assert_eq!(
+        a,
+        b,
+        "a04: Union[A, B] picked one member: {:?}",
+        calls_from(&res, "app.py::use")
+    );
 }
 
 #[test]
 fn a04b_list_return_is_not_the_element() {
-    for ann in ["List[A]", "list[A]", "Iterator[A]", "Type[A]", "Callable[[], A]", "Awaitable[A]", "Dict[str, A]"] {
+    for ann in [
+        "List[A]",
+        "list[A]",
+        "Iterator[A]",
+        "Type[A]",
+        "Callable[[], A]",
+        "Awaitable[A]",
+        "Dict[str, A]",
+    ] {
         let res = resolve(&[
             (
                 "a.py",
                 &format!("from typing import *\n{A_RUN}\ndef make() -> {ann}:\n    return []\n"),
             ),
-            ("app.py", "from a import make\n\ndef use():\n    make().append(1)\n"),
+            (
+                "app.py",
+                "from a import make\n\ndef use():\n    make().append(1)\n",
+            ),
         ]);
-        no_edge(&res, "app.py::use", "a.py::A.append", &format!("a04b `-> {ann}`"));
+        no_edge(
+            &res,
+            "app.py::use",
+            "a.py::A.append",
+            &format!("a04b `-> {ann}`"),
+        );
     }
 }
 
@@ -195,8 +241,14 @@ fn a09_local_lambda_shadows_factory() {
 #[test]
 fn a10_factory_name_is_a_parameter() {
     let res = resolve(&[
-        ("a.py", &format!("{A_RUN}\ndef make() -> A:\n    return A()\n")),
-        ("app.py", "from a import make\n\ndef use(make):\n    make().run()\n"),
+        (
+            "a.py",
+            &format!("{A_RUN}\ndef make() -> A:\n    return A()\n"),
+        ),
+        (
+            "app.py",
+            "from a import make\n\ndef use(make):\n    make().run()\n",
+        ),
     ]);
     no_edge(&res, "app.py::use", "a.py::A.run", "a10");
 }
@@ -221,14 +273,25 @@ fn a10b_factory_name_is_a_comprehension_or_lambda_param() {
 #[test]
 fn a11_module_level_reassignment_of_factory() {
     let res = resolve(&[
-        ("a.py", &format!("{A_RUN}\ndef make() -> A:\n    return A()\n")),
-        ("b.py", &format!("{B_RUN}\ndef other() -> B:\n    return B()\n")),
+        (
+            "a.py",
+            &format!("{A_RUN}\ndef make() -> A:\n    return A()\n"),
+        ),
+        (
+            "b.py",
+            &format!("{B_RUN}\ndef other() -> B:\n    return B()\n"),
+        ),
         (
             "app.py",
             "from a import make\nimport b\n\nmake = b.other\n\ndef use():\n    make().run()\n",
         ),
     ]);
-    no_edge(&res, "app.py::use", "a.py::A.run", "a11 (make rebound to b.other)");
+    no_edge(
+        &res,
+        "app.py::use",
+        "a.py::A.run",
+        "a11 (make rebound to b.other)",
+    );
 }
 
 #[test]
@@ -243,14 +306,25 @@ fn a12_try_except_import_two_factories() {
     ]);
     let a = reaches(&res, "app.py::use", "fast.py::A.run");
     let b = reaches(&res, "app.py::use", "slow.py::B.run");
-    assert_eq!(a, b, "a12: conditional import picked one: {:?}", calls_from(&res, "app.py::use"));
+    assert_eq!(
+        a,
+        b,
+        "a12: conditional import picked one: {:?}",
+        calls_from(&res, "app.py::use")
+    );
 }
 
 #[test]
 fn a13_nested_call_in_args_types_the_outer_factory_only() {
     let res = resolve(&[
-        ("a.py", &format!("{A_RUN}\ndef make(x) -> A:\n    return A()\n")),
-        ("b.py", &format!("{B_RUN}\ndef other(x) -> B:\n    return B()\n")),
+        (
+            "a.py",
+            &format!("{A_RUN}\ndef make(x) -> A:\n    return A()\n"),
+        ),
+        (
+            "b.py",
+            &format!("{B_RUN}\ndef other(x) -> B:\n    return B()\n"),
+        ),
         (
             "app.py",
             "from a import make\nfrom b import other\n\ndef use():\n    make(other(1)).run()\n",
@@ -300,7 +374,12 @@ fn a16_or_expression_receiver() {
     ]);
     let a = reaches(&res, "app.py::use", "a.py::A.run");
     let b = reaches(&res, "app.py::use", "b.py::B.run");
-    assert_eq!(a, b, "a16: `(f() or g()).m()` picked one side: {:?}", calls_from(&res, "app.py::use"));
+    assert_eq!(
+        a,
+        b,
+        "a16: `(f() or g()).m()` picked one side: {:?}",
+        calls_from(&res, "app.py::use")
+    );
 }
 
 #[test]
@@ -330,7 +409,12 @@ fn a19_constructor_receiver_still_binds() {
         ("a.py", A_RUN),
         ("app.py", "from a import A\n\ndef use():\n    A().run()\n"),
     ]);
-    edge(&res, "app.py::use", "a.py::A.run", "a19 A().run() constructor chain regression");
+    edge(
+        &res,
+        "app.py::use",
+        "a.py::A.run",
+        "a19 A().run() constructor chain regression",
+    );
 }
 
 #[test]
@@ -350,7 +434,12 @@ fn a20_self_method_call_result() {
         "m.py",
         "class B:\n    def run(self):\n        return 1\n\nclass C:\n    def make(self) -> B:\n        return B()\n    def go(self):\n        return self.make().run()\n",
     )]);
-    edge(&res, "m.py::C.go", "m.py::B.run", "a20 self.make().run() regression");
+    edge(
+        &res,
+        "m.py::C.go",
+        "m.py::B.run",
+        "a20 self.make().run() regression",
+    );
 }
 
 #[test]
@@ -360,13 +449,21 @@ fn a21_typed_param_method_call_result() {
         "m.py",
         "class B:\n    def run(self):\n        return 1\n\nclass C:\n    def make(self) -> B:\n        return B()\n\ndef go(c: C):\n    return c.make().run()\n",
     )]);
-    edge(&res, "m.py::go", "m.py::B.run", "a21 c.make().run() regression");
+    edge(
+        &res,
+        "m.py::go",
+        "m.py::B.run",
+        "a21 c.make().run() regression",
+    );
 }
 
 #[test]
 fn a22_module_qualified_factory() {
     let res = resolve(&[
-        ("a.py", &format!("{A_RUN}\ndef make() -> A:\n    return A()\n")),
+        (
+            "a.py",
+            &format!("{A_RUN}\ndef make() -> A:\n    return A()\n"),
+        ),
         ("app.py", "import a\n\ndef use():\n    a.make().run()\n"),
     ]);
     edge(&res, "app.py::use", "a.py::A.run", "a22 (recall)");
@@ -375,11 +472,25 @@ fn a22_module_qualified_factory() {
 #[test]
 fn a23_module_qualified_factory_local_shadow() {
     let res = resolve(&[
-        ("a.py", &format!("{A_RUN}\ndef make() -> A:\n    return A()\n")),
-        ("b.py", &format!("{B_RUN}\ndef make() -> B:\n    return B()\n")),
-        ("app.py", "import a\nimport b\n\ndef use():\n    a = b\n    a.make().run()\n"),
+        (
+            "a.py",
+            &format!("{A_RUN}\ndef make() -> A:\n    return A()\n"),
+        ),
+        (
+            "b.py",
+            &format!("{B_RUN}\ndef make() -> B:\n    return B()\n"),
+        ),
+        (
+            "app.py",
+            "import a\nimport b\n\ndef use():\n    a = b\n    a.make().run()\n",
+        ),
     ]);
-    no_edge(&res, "app.py::use", "a.py::A.run", "a23 (a rebound to module b)");
+    no_edge(
+        &res,
+        "app.py::use",
+        "a.py::A.run",
+        "a23 (a rebound to module b)",
+    );
 }
 
 #[test]
@@ -392,7 +503,12 @@ fn a24_instance_variable_named_like_function_is_not_a_call_result() {
             "from a import make\n\ndef use():\n    try:\n        make = int\n    except Exception:\n        pass\n    make().run()\n",
         ),
     ]);
-    no_edge(&res, "app.py::use", "a.py::A.run", "a24 local rebinding in try");
+    no_edge(
+        &res,
+        "app.py::use",
+        "a.py::A.run",
+        "a24 local rebinding in try",
+    );
 }
 
 #[test]
@@ -402,7 +518,12 @@ fn a25_decorated_factory_that_wraps() {
         "m.py",
         "from typing import List\n\nclass A:\n    def run(self):\n        return 1\n    def append(self, x):\n        return 2\n\ndef many(fn):\n    def inner(*a) -> List[A]:\n        return [fn(*a)]\n    return inner\n\n@many\ndef make() -> A:\n    return A()\n\ndef use():\n    make().append(1)\n",
     )]);
-    no_edge(&res, "m.py::use", "m.py::A.append", "a25 @many turns make() into List[A]");
+    no_edge(
+        &res,
+        "m.py::use",
+        "m.py::A.append",
+        "a25 @many turns make() into List[A]",
+    );
 }
 
 #[test]
@@ -412,15 +533,26 @@ fn a26_property_is_not_a_factory_call() {
         "m.py",
         "class A:\n    def run(self):\n        return 1\n\nclass H:\n    @property\n    def a(self) -> A:\n        return A()\n\ndef use(h: H):\n    h.a.run()\n",
     )]);
-    edge(&res, "m.py::use", "m.py::A.run", "a26 (recall; property read)");
+    edge(
+        &res,
+        "m.py::use",
+        "m.py::A.run",
+        "a26 (recall; property read)",
+    );
 }
 
 #[test]
 #[ignore = "pre-existing, ft-c0afdfef follow-up"]
 fn a27_async_factory_awaited_receiver() {
     let res = resolve(&[
-        ("a.py", &format!("{A_RUN}\nasync def make() -> A:\n    return A()\n")),
-        ("app.py", "from a import make\n\nasync def use():\n    return (await make()).run()\n"),
+        (
+            "a.py",
+            &format!("{A_RUN}\nasync def make() -> A:\n    return A()\n"),
+        ),
+        (
+            "app.py",
+            "from a import make\n\nasync def use():\n    return (await make()).run()\n",
+        ),
     ]);
     edge(&res, "app.py::use", "a.py::A.run", "a27 (recall)");
 }
@@ -428,11 +560,25 @@ fn a27_async_factory_awaited_receiver() {
 #[test]
 fn a28_async_factory_unawaited_is_a_coroutine() {
     let res = resolve(&[
-        ("a.py", &format!("{A_RUN}\nasync def make() -> A:\n    return A()\n")),
-        ("app.py", "from a import make\n\nasync def use():\n    c = make()\n    return c.close()\n"),
-        ("app2.py", "from a import make\n\ndef use2():\n    return make().close()\n"),
+        (
+            "a.py",
+            &format!("{A_RUN}\nasync def make() -> A:\n    return A()\n"),
+        ),
+        (
+            "app.py",
+            "from a import make\n\nasync def use():\n    c = make()\n    return c.close()\n",
+        ),
+        (
+            "app2.py",
+            "from a import make\n\ndef use2():\n    return make().close()\n",
+        ),
     ]);
-    no_edge(&res, "app2.py::use2", "a.py::A.run", "a28 unawaited coroutine is no A");
+    no_edge(
+        &res,
+        "app2.py::use2",
+        "a.py::A.run",
+        "a28 unawaited coroutine is no A",
+    );
 }
 
 #[test]
@@ -456,15 +602,29 @@ fn a29_factory_returning_a_class_namesake_of_param_scope() {
 fn a30_aliased_return_type_collides_with_unrelated_unique_class() {
     // factory.py: `from real import Log as L`; `-> L`. other.py has an unrelated unique `L`.
     let res = resolve(&[
-        ("real.py", "class Log:\n    def write(self):\n        return 1\n"),
-        ("other.py", "class L:\n    def write(self):\n        return 2\n"),
+        (
+            "real.py",
+            "class Log:\n    def write(self):\n        return 1\n",
+        ),
+        (
+            "other.py",
+            "class L:\n    def write(self):\n        return 2\n",
+        ),
         (
             "factory.py",
             "from real import Log as L\n\ndef make() -> L:\n    return L()\n",
         ),
-        ("app.py", "from factory import make\n\ndef use():\n    make().write()\n"),
+        (
+            "app.py",
+            "from factory import make\n\ndef use():\n    make().write()\n",
+        ),
     ]);
-    no_edge(&res, "app.py::use", "other.py::L.write", "a30 `-> L` is real.Log, not other.L");
+    no_edge(
+        &res,
+        "app.py::use",
+        "other.py::L.write",
+        "a30 `-> L` is real.Log, not other.L",
+    );
 }
 
 // =================== (b) class-body field annotations ====================
@@ -479,7 +639,10 @@ fn b01_field_read_through_other_file_recall() {
     let res = resolve(&[
         ("logs.py", LOGS),
         ("holder.py", &holder("Log")),
-        ("app.py", "from holder import Holder\n\ndef use(h: Holder):\n    h.log.write()\n"),
+        (
+            "app.py",
+            "from holder import Holder\n\ndef use(h: Holder):\n    h.log.write()\n",
+        ),
     ]);
     edge(&res, "app.py::use", "logs.py::Log.write", "b01 (recall)");
 }
@@ -495,16 +658,27 @@ fn b02_field_type_namesake_in_second_file() {
             "from holder import Holder\nfrom logs2 import Log\n\ndef use(h: Holder):\n    h.log.write()\n",
         ),
     ]);
-    no_edge(&res, "app.py::use", "logs2.py::Log.write", "b02 reader imports the other Log");
+    no_edge(
+        &res,
+        "app.py::use",
+        "logs2.py::Log.write",
+        "b02 reader imports the other Log",
+    );
 }
 
 #[test]
 fn b02b_field_type_namesake_unimported_by_reader() {
     let res = resolve(&[
         ("logs.py", LOGS),
-        ("logs2.py", "class Log:\n    def write(self):\n        return 9\n"),
+        (
+            "logs2.py",
+            "class Log:\n    def write(self):\n        return 9\n",
+        ),
         ("holder.py", &holder("Log")),
-        ("app.py", "from holder import Holder\n\ndef use(h: Holder):\n    h.log.write()\n"),
+        (
+            "app.py",
+            "from holder import Holder\n\ndef use(h: Holder):\n    h.log.write()\n",
+        ),
     ]);
     no_edge(&res, "app.py::use", "logs2.py::Log.write", "b02b");
 }
@@ -513,14 +687,25 @@ fn b02b_field_type_namesake_unimported_by_reader() {
 fn b03_field_type_alias_collides_with_unrelated_unique_class() {
     let res = resolve(&[
         ("logs.py", LOGS),
-        ("other.py", "class L:\n    def write(self):\n        return 2\n"),
+        (
+            "other.py",
+            "class L:\n    def write(self):\n        return 2\n",
+        ),
         (
             "holder.py",
             "from logs import Log as L\n\nclass Holder:\n    log: L\n",
         ),
-        ("app.py", "from holder import Holder\n\ndef use(h: Holder):\n    h.log.write()\n"),
+        (
+            "app.py",
+            "from holder import Holder\n\ndef use(h: Holder):\n    h.log.write()\n",
+        ),
     ]);
-    no_edge(&res, "app.py::use", "other.py::L.write", "b03 `log: L` is logs.Log");
+    no_edge(
+        &res,
+        "app.py::use",
+        "other.py::L.write",
+        "b03 `log: L` is logs.Log",
+    );
 }
 
 #[test]
@@ -539,9 +724,17 @@ fn b04_container_annotations_are_not_the_element() {
         let res = resolve(&[
             ("logs.py", LOGS),
             ("holder.py", &holder(ann)),
-            ("app.py", "from holder import Holder\n\ndef use(h: Holder):\n    h.log.append(1)\n"),
+            (
+                "app.py",
+                "from holder import Holder\n\ndef use(h: Holder):\n    h.log.append(1)\n",
+            ),
         ]);
-        no_edge(&res, "app.py::use", "logs.py::Log.append", &format!("b04 `log: {ann}`"));
+        no_edge(
+            &res,
+            "app.py::use",
+            "logs.py::Log.append",
+            &format!("b04 `log: {ann}`"),
+        );
     }
 }
 
@@ -562,15 +755,29 @@ fn b05_union_field_does_not_pick_one() {
 fn b06_subclass_redefines_field_with_a_different_type() {
     let res = resolve(&[
         ("logs.py", LOGS),
-        ("logs3.py", "class Log3:\n    def write(self):\n        return 3\n"),
-        ("base.py", "from logs import Log\n\nclass Base:\n    log: Log\n"),
+        (
+            "logs3.py",
+            "class Log3:\n    def write(self):\n        return 3\n",
+        ),
+        (
+            "base.py",
+            "from logs import Log\n\nclass Base:\n    log: Log\n",
+        ),
         (
             "sub.py",
             "from base import Base\nfrom logs3 import Log3\n\nclass Sub(Base):\n    log: Log3\n",
         ),
-        ("app.py", "from sub import Sub\n\ndef use(s: Sub):\n    s.log.write()\n"),
+        (
+            "app.py",
+            "from sub import Sub\n\ndef use(s: Sub):\n    s.log.write()\n",
+        ),
     ]);
-    no_edge(&res, "app.py::use", "logs.py::Log.write", "b06 Sub.log is Log3");
+    no_edge(
+        &res,
+        "app.py::use",
+        "logs.py::Log.write",
+        "b06 Sub.log is Log3",
+    );
     edge(&res, "app.py::use", "logs3.py::Log3.write", "b06 (recall)");
 }
 
@@ -579,9 +786,18 @@ fn b06_subclass_redefines_field_with_a_different_type() {
 fn b07_base_field_read_through_subclass_recall() {
     let res = resolve(&[
         ("logs.py", LOGS),
-        ("base.py", "from logs import Log\n\nclass Base:\n    log: Log\n"),
-        ("sub.py", "from base import Base\n\nclass Sub(Base):\n    pass\n"),
-        ("app.py", "from sub import Sub\n\ndef use(s: Sub):\n    s.log.write()\n"),
+        (
+            "base.py",
+            "from logs import Log\n\nclass Base:\n    log: Log\n",
+        ),
+        (
+            "sub.py",
+            "from base import Base\n\nclass Sub(Base):\n    pass\n",
+        ),
+        (
+            "app.py",
+            "from sub import Sub\n\ndef use(s: Sub):\n    s.log.write()\n",
+        ),
     ]);
     edge(&res, "app.py::use", "logs.py::Log.write", "b07 (recall)");
 }
@@ -599,8 +815,18 @@ fn b08_dataclass_vs_plain_and_slots() {
             "from holder import D, S\n\ndef use_d(h: D):\n    h.log.write()\n\ndef use_s(h: S):\n    h.log.write()\n",
         ),
     ]);
-    edge(&res, "app.py::use_d", "logs.py::Log.write", "b08 dataclass (recall)");
-    edge(&res, "app.py::use_s", "logs.py::Log.write", "b08 slots (recall)");
+    edge(
+        &res,
+        "app.py::use_d",
+        "logs.py::Log.write",
+        "b08 dataclass (recall)",
+    );
+    edge(
+        &res,
+        "app.py::use_s",
+        "logs.py::Log.write",
+        "b08 slots (recall)",
+    );
 }
 
 #[test]
@@ -616,7 +842,12 @@ fn b09_classvar_and_annotation_without_value_and_protocol() {
             "from holder import C, P\n\ndef use_c(h: C):\n    h.log.write()\n\ndef use_p(h: P):\n    h.log.write()\n",
         ),
     ]);
-    edge(&res, "app.py::use_p", "logs.py::Log.write", "b09 Protocol field (recall)");
+    edge(
+        &res,
+        "app.py::use_p",
+        "logs.py::Log.write",
+        "b09 Protocol field (recall)",
+    );
 }
 
 #[test]
@@ -637,24 +868,58 @@ fn b10_type_checking_import_in_owner() {
 fn b11_two_holders_same_class_name_in_two_files() {
     let res = resolve(&[
         ("logs.py", LOGS),
-        ("logs3.py", "class Log3:\n    def write(self):\n        return 3\n"),
-        ("h1.py", "from logs import Log\n\nclass Holder:\n    log: Log\n"),
-        ("h2.py", "from logs3 import Log3\n\nclass Holder:\n    log: Log3\n"),
-        ("app.py", "from h2 import Holder\n\ndef use(h: Holder):\n    h.log.write()\n"),
+        (
+            "logs3.py",
+            "class Log3:\n    def write(self):\n        return 3\n",
+        ),
+        (
+            "h1.py",
+            "from logs import Log\n\nclass Holder:\n    log: Log\n",
+        ),
+        (
+            "h2.py",
+            "from logs3 import Log3\n\nclass Holder:\n    log: Log3\n",
+        ),
+        (
+            "app.py",
+            "from h2 import Holder\n\ndef use(h: Holder):\n    h.log.write()\n",
+        ),
     ]);
-    no_edge(&res, "app.py::use", "logs.py::Log.write", "b11 Holder is h2.Holder");
+    no_edge(
+        &res,
+        "app.py::use",
+        "logs.py::Log.write",
+        "b11 Holder is h2.Holder",
+    );
 }
 
 #[test]
 fn b11b_two_holders_reader_binds_local_name_to_one() {
     let res = resolve(&[
         ("logs.py", LOGS),
-        ("logs3.py", "class Log3:\n    def write(self):\n        return 3\n"),
-        ("h1.py", "from logs import Log\n\nclass Holder:\n    log: Log\n"),
-        ("h2.py", "from logs3 import Log3\n\nclass Holder:\n    log: Log3\n"),
-        ("app.py", "from h1 import Holder\nimport h2\n\ndef use(h: Holder):\n    h.log.write()\n"),
+        (
+            "logs3.py",
+            "class Log3:\n    def write(self):\n        return 3\n",
+        ),
+        (
+            "h1.py",
+            "from logs import Log\n\nclass Holder:\n    log: Log\n",
+        ),
+        (
+            "h2.py",
+            "from logs3 import Log3\n\nclass Holder:\n    log: Log3\n",
+        ),
+        (
+            "app.py",
+            "from h1 import Holder\nimport h2\n\ndef use(h: Holder):\n    h.log.write()\n",
+        ),
     ]);
-    no_edge(&res, "app.py::use", "logs3.py::Log3.write", "b11b Holder is h1.Holder");
+    no_edge(
+        &res,
+        "app.py::use",
+        "logs3.py::Log3.write",
+        "b11b Holder is h1.Holder",
+    );
 }
 
 #[test]
@@ -667,7 +932,12 @@ fn b12_param_shadow_does_not_read_other_functions_declared_type() {
             "from holder import Holder\n\ndef typed(h: Holder):\n    return h.log.write()\n\ndef untyped(h):\n    return h.log.write()\n",
         ),
     ]);
-    no_edge(&res, "app.py::untyped", "logs.py::Log.write", "b12 untyped param named like another fn's typed param");
+    no_edge(
+        &res,
+        "app.py::untyped",
+        "logs.py::Log.write",
+        "b12 untyped param named like another fn's typed param",
+    );
 }
 
 #[test]
@@ -681,7 +951,12 @@ fn b13_local_from_factory_is_the_functions_own() {
             "from holder import Holder\nfrom other import Other\n\ndef typed(h: Holder):\n    return h.log.write()\n\ndef rebound():\n    h = Other()\n    return h.log.write()\n",
         ),
     ]);
-    no_edge(&res, "app.py::rebound", "logs.py::Log.write", "b13 local h is Other");
+    no_edge(
+        &res,
+        "app.py::rebound",
+        "logs.py::Log.write",
+        "b13 local h is Other",
+    );
 }
 
 #[test]
@@ -709,7 +984,12 @@ fn b15_field_through_factory_local_namesake_function() {
         ),
     ]);
     edge(&res, "app.py::a", "logs.py::Log.write", "b15 (recall)");
-    no_edge(&res, "app.py::b", "logs.py::Log.write", "b15 untyped r in b");
+    no_edge(
+        &res,
+        "app.py::b",
+        "logs.py::Log.write",
+        "b15 untyped r in b",
+    );
 }
 
 #[test]
@@ -723,7 +1003,12 @@ fn b16_field_annotation_inside_method_scope_class() {
             "from logs import Log\nfrom other import Other\n\nclass Holder:\n    log: Log\n\ndef use():\n    class Holder:\n        log: Other\n    h = Holder()\n    return h.log.write()\n",
         ),
     ]);
-    no_edge(&res, "app.py::use", "logs.py::Log.write", "b16 local Holder.log is Other");
+    no_edge(
+        &res,
+        "app.py::use",
+        "logs.py::Log.write",
+        "b16 local Holder.log is Other",
+    );
 }
 
 // =================== (c) 3-segment module paths ==========================
@@ -755,18 +1040,31 @@ fn c02_function_level_import_recall() {
 #[test]
 fn c03_two_segment_import_does_not_reach_three() {
     let res = tree(&[], "import a.b\n\ndef use():\n    a.b.c.f()\n");
-    no_edge(&res, "app.py::use", "a/b/c.py::f", "c03 submodule never imported");
+    no_edge(
+        &res,
+        "app.py::use",
+        "a/b/c.py::f",
+        "c03 submodule never imported",
+    );
 }
 
 #[test]
 fn c03b_two_segment_import_where_c_is_a_variable() {
     let res = resolve(&[
         ("a/__init__.py", ""),
-        ("a/b/__init__.py", "class Obj:\n    def f(self):\n        return 2\n\nc = Obj()\n"),
+        (
+            "a/b/__init__.py",
+            "class Obj:\n    def f(self):\n        return 2\n\nc = Obj()\n",
+        ),
         ("a/b/c.py", "def f():\n    return 1\n"),
         ("app.py", "import a.b\n\ndef use():\n    a.b.c.f()\n"),
     ]);
-    no_edge(&res, "app.py::use", "a/b/c.py::f", "c03b a.b.c is the Obj instance");
+    no_edge(
+        &res,
+        "app.py::use",
+        "a/b/c.py::f",
+        "c03b a.b.c is the Obj instance",
+    );
 }
 
 #[test]
@@ -795,7 +1093,12 @@ fn c06_module_level_rebind_after_import() {
         &[("o.py", "class O:\n    def f(self):\n        return 1\n")],
         "import a.b.c\nfrom o import O\n\na = O()\n\ndef use():\n    a.b.c.f()\n",
     );
-    no_edge(&res, "app.py::use", "a/b/c.py::f", "c06 a rebound at module level");
+    no_edge(
+        &res,
+        "app.py::use",
+        "a/b/c.py::f",
+        "c06 a rebound at module level",
+    );
 }
 
 #[test]
@@ -819,7 +1122,12 @@ fn c06b_rebind_by_for_with_except_and_def() {
             ];
             resolve(&files)
         };
-        no_edge(&res, "app.py::use", "a/b/c.py::f", &format!("c06b rebind via {label}"));
+        no_edge(
+            &res,
+            "app.py::use",
+            "a/b/c.py::f",
+            &format!("c06b rebind via {label}"),
+        );
     }
 }
 
@@ -855,7 +1163,12 @@ fn c09_conditional_import_other_branch_binds_root_differently() {
             "try:\n    import a.b.c\nexcept ImportError:\n    import z as a\n\ndef use():\n    a.b.c.f()\n",
         ),
     ]);
-    no_edge(&res, "app.py::use", "a/b/c.py::f", "c09 `import z as a` is the other binding");
+    no_edge(
+        &res,
+        "app.py::use",
+        "a/b/c.py::f",
+        "c09 `import z as a` is the other binding",
+    );
 }
 
 #[test]
@@ -875,7 +1188,12 @@ fn c11_third_party_name_collides_with_vendored_tree() {
         ("tests/data/a/b/c.py", "def f():\n    return 1\n"),
         ("src/app.py", "import a.b.c\n\ndef use():\n    a.b.c.f()\n"),
     ]);
-    no_edge(&res, "src/app.py::use", "tests/data/a/b/c.py::f", "c11 unrelated tree");
+    no_edge(
+        &res,
+        "src/app.py::use",
+        "tests/data/a/b/c.py::f",
+        "c11 unrelated tree",
+    );
 }
 
 #[test]
@@ -898,7 +1216,12 @@ fn c13_package_c_with_init_and_module_namesake() {
         ("a/b/c/__init__.py", "def f():\n    return 2\n"),
         ("app.py", "import a.b.c\n\ndef use():\n    a.b.c.f()\n"),
     ]);
-    no_edge(&res, "app.py::use", "a/b/c.py::f", "c13 package shadows module");
+    no_edge(
+        &res,
+        "app.py::use",
+        "a/b/c.py::f",
+        "c13 package shadows module",
+    );
 }
 
 #[test]
@@ -907,8 +1230,14 @@ fn c14_member_is_a_class_not_a_function_call() {
     let res = resolve(&[
         ("a/__init__.py", ""),
         ("a/b/__init__.py", ""),
-        ("a/b/c.py", "class K:\n    def run(self):\n        return 1\n\ndef f():\n    return 1\n"),
-        ("app.py", "import a.b.c\n\ndef use():\n    a.b.c.K().run()\n"),
+        (
+            "a/b/c.py",
+            "class K:\n    def run(self):\n        return 1\n\ndef f():\n    return 1\n",
+        ),
+        (
+            "app.py",
+            "import a.b.c\n\ndef use():\n    a.b.c.K().run()\n",
+        ),
     ]);
     edge(&res, "app.py::use", "a/b/c.py::K.run", "c14 (recall)");
 }
@@ -933,7 +1262,11 @@ fn s01_thousands_of_factories_bounded_and_correct() {
     eprintln!("S01_ELAPSED_MS {}", took.as_millis());
     let mut hit = 0;
     for i in 0..n {
-        if reaches(&res, &format!("big.py::use{i}"), &format!("big.py::C{i}.run")) {
+        if reaches(
+            &res,
+            &format!("big.py::use{i}"),
+            &format!("big.py::C{i}.run"),
+        ) {
             hit += 1;
         }
         for j in [0usize, 7] {
@@ -998,8 +1331,16 @@ fn s04_many_calls_sharing_a_start_offset() {
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
     let _ = resolver.resolve_all(&extractions).unwrap();
-    eprintln!("S04_EXTRACT_MS {} RESOLVE_MS {}", ex.as_millis(), t2.elapsed().as_millis());
-    assert!(t2.elapsed().as_secs() < 20, "resolve took {:?}", t2.elapsed());
+    eprintln!(
+        "S04_EXTRACT_MS {} RESOLVE_MS {}",
+        ex.as_millis(),
+        t2.elapsed().as_millis()
+    );
+    assert!(
+        t2.elapsed().as_secs() < 20,
+        "resolve took {:?}",
+        t2.elapsed()
+    );
 }
 
 // =================== regression harness: edge dump =======================
@@ -1020,10 +1361,7 @@ fn z_edge_dump_for_diffing() {
         let mut files: Vec<(String, String)> = Vec::new();
         walk(&corpus.path(), &corpus.path(), &mut files);
         files.sort();
-        let extractions: Vec<Extraction> = files
-            .iter()
-            .map(|(p, s)| extract_file(p, s))
-            .collect();
+        let extractions: Vec<Extraction> = files.iter().map(|(p, s)| extract_file(p, s)).collect();
         let mut resolver = Resolver::new();
         resolver.index_extractions(&extractions);
         let res = resolver.resolve_all(&extractions).unwrap();
@@ -1031,11 +1369,19 @@ fn z_edge_dump_for_diffing() {
         for e in &res.edges {
             lines.push(format!(
                 "{name}\t{:?}\t{}\t{}\t{}\t{}\t{:?}",
-                e.edge_kind, e.source_symbol, e.target_symbol, e.source_file, e.target_file, e.confidence
+                e.edge_kind,
+                e.source_symbol,
+                e.target_symbol,
+                e.source_file,
+                e.target_file,
+                e.confidence
             ));
         }
         for u in &res.unresolved {
-            lines.push(format!("{name}\tUNRES\t{}\t{}", u.source_symbol, u.callee_name));
+            lines.push(format!(
+                "{name}\tUNRES\t{}\t{}",
+                u.source_symbol, u.callee_name
+            ));
         }
     }
     lines.sort();
@@ -1063,7 +1409,12 @@ fn a21b_local_instance_method_call_result() {
         "m.py",
         "class B:\n    def run(self):\n        return 1\n\nclass C:\n    def make(self) -> B:\n        return B()\n\ndef go():\n    c = C()\n    return c.make().run()\n",
     )]);
-    edge(&res, "m.py::go", "m.py::B.run", "a21b local c = C(); c.make().run() regression");
+    edge(
+        &res,
+        "m.py::go",
+        "m.py::B.run",
+        "a21b local c = C(); c.make().run() regression",
+    );
 }
 
 #[test]
@@ -1073,7 +1424,12 @@ fn a21c_module_global_instance_method_call_result() {
         "m.py",
         "class B:\n    def run(self):\n        return 1\n\nclass C:\n    def make(self) -> B:\n        return B()\n\nc: C = C()\n\ndef go():\n    return c.make().run()\n",
     )]);
-    edge(&res, "m.py::go", "m.py::B.run", "a21c global c: C; c.make().run() regression");
+    edge(
+        &res,
+        "m.py::go",
+        "m.py::B.run",
+        "a21c global c: C; c.make().run() regression",
+    );
 }
 
 #[test]
@@ -1082,16 +1438,33 @@ fn a25b_decorated_factory_assignment_form_classifies_preexisting() {
         "m.py",
         "from typing import List\n\nclass A:\n    def run(self):\n        return 1\n    def append(self, x):\n        return 2\n\ndef many(fn):\n    def inner(*a) -> List[A]:\n        return [fn(*a)]\n    return inner\n\n@many\ndef make() -> A:\n    return A()\n\ndef use():\n    x = make()\n    x.append(1)\n",
     )]);
-    no_edge(&res, "m.py::use", "m.py::A.append", "a25b x = make() with @many");
+    no_edge(
+        &res,
+        "m.py::use",
+        "m.py::A.append",
+        "a25b x = make() with @many",
+    );
 }
 
 #[test]
 fn a30b_aliased_return_type_assignment_form_classifies_preexisting() {
     let res = resolve(&[
-        ("real.py", "class Log:\n    def write(self):\n        return 1\n"),
-        ("other.py", "class L:\n    def write(self):\n        return 2\n"),
-        ("factory.py", "from real import Log as L\n\ndef make() -> L:\n    return L()\n"),
-        ("app.py", "from factory import make\n\ndef use():\n    x = make()\n    x.write()\n"),
+        (
+            "real.py",
+            "class Log:\n    def write(self):\n        return 1\n",
+        ),
+        (
+            "other.py",
+            "class L:\n    def write(self):\n        return 2\n",
+        ),
+        (
+            "factory.py",
+            "from real import Log as L\n\ndef make() -> L:\n    return L()\n",
+        ),
+        (
+            "app.py",
+            "from factory import make\n\ndef use():\n    x = make()\n    x.write()\n",
+        ),
     ]);
     no_edge(&res, "app.py::use", "other.py::L.write", "a30b x = make()");
 }
@@ -1099,9 +1472,18 @@ fn a30b_aliased_return_type_assignment_form_classifies_preexisting() {
 #[test]
 fn a02b_star_import_assignment_form_classifies_preexisting() {
     let res = resolve(&[
-        ("a.py", &format!("{A_RUN}\ndef make() -> A:\n    return A()\n")),
-        ("b.py", &format!("{B_RUN}\ndef make() -> B:\n    return B()\n")),
-        ("app.py", "from a import *\nfrom b import *\n\ndef use():\n    x = make()\n    x.run()\n"),
+        (
+            "a.py",
+            &format!("{A_RUN}\ndef make() -> A:\n    return A()\n"),
+        ),
+        (
+            "b.py",
+            &format!("{B_RUN}\ndef make() -> B:\n    return B()\n"),
+        ),
+        (
+            "app.py",
+            "from a import *\nfrom b import *\n\ndef use():\n    x = make()\n    x.run()\n",
+        ),
     ]);
     no_edge(&res, "app.py::use", "a.py::A.run", "a02b x = make() star");
 }
@@ -1149,7 +1531,12 @@ fn b12c_untyped_method_param_other_file_holder() {
             "from holder import Holder\n\ndef typed(h: Holder):\n    return 1\n\nclass Svc:\n    def go(self, h):\n        return h.log.write()\n",
         ),
     ]);
-    no_edge(&res, "app.py::Svc.go", "logs.py::Log.write", "b12c untyped method param h");
+    no_edge(
+        &res,
+        "app.py::Svc.go",
+        "logs.py::Log.write",
+        "b12c untyped method param h",
+    );
 }
 
 #[test]
@@ -1175,7 +1562,12 @@ fn b14c_comprehension_var() {
             "from holder import Holder\n\ndef typed(h: Holder):\n    return h.log.write()\n\ndef comp(xs):\n    return [h.log.write() for h in xs]\n",
         ),
     ]);
-    no_edge(&res, "app.py::comp", "logs.py::Log.write", "b14c comprehension var");
+    no_edge(
+        &res,
+        "app.py::comp",
+        "logs.py::Log.write",
+        "b14c comprehension var",
+    );
 }
 
 fn c06b_case(label: &str, tail: &str) {
@@ -1187,29 +1579,57 @@ fn c06b_case(label: &str, tail: &str) {
         ("app.py", &src),
     ];
     let res = resolve(&files);
-    no_edge(&res, "app.py::use", "a/b/c.py::f", &format!("c06b rebind via {label}"));
+    no_edge(
+        &res,
+        "app.py::use",
+        "a/b/c.py::f",
+        &format!("c06b rebind via {label}"),
+    );
 }
 
 #[test]
-fn c06c_rebind_for() { c06b_case("for", "for a in []:\n    pass\n"); }
+fn c06c_rebind_for() {
+    c06b_case("for", "for a in []:\n    pass\n");
+}
 #[test]
-fn c06d_rebind_with() { c06b_case("with", "with open('x') as a:\n    pass\n"); }
+fn c06d_rebind_with() {
+    c06b_case("with", "with open('x') as a:\n    pass\n");
+}
 #[test]
-fn c06e_rebind_def() { c06b_case("def", "def a():\n    pass\n"); }
+fn c06e_rebind_def() {
+    c06b_case("def", "def a():\n    pass\n");
+}
 #[test]
-fn c06f_rebind_class() { c06b_case("class", "class a:\n    pass\n"); }
+fn c06f_rebind_class() {
+    c06b_case("class", "class a:\n    pass\n");
+}
 #[test]
-fn c06g_rebind_del() { c06b_case("del", "del a\n"); }
+fn c06g_rebind_del() {
+    c06b_case("del", "del a\n");
+}
 #[test]
-fn c06h_rebind_walrus() { c06b_case("walrus", "(a := 3)\n"); }
+fn c06h_rebind_walrus() {
+    c06b_case("walrus", "(a := 3)\n");
+}
 #[test]
-fn c06i_rebind_import_as() { c06b_case("import-as", "import os as a\n"); }
+fn c06i_rebind_import_as() {
+    c06b_case("import-as", "import os as a\n");
+}
 #[test]
-fn c06j_rebind_try_except_as() { c06b_case("except-as", "try:\n    pass\nexcept Exception as a:\n    pass\n"); }
+fn c06j_rebind_try_except_as() {
+    c06b_case(
+        "except-as",
+        "try:\n    pass\nexcept Exception as a:\n    pass\n",
+    );
+}
 #[test]
-fn c06k_rebind_assign_later() { c06b_case("later-assign", "a = object()\n"); }
+fn c06k_rebind_assign_later() {
+    c06b_case("later-assign", "a = object()\n");
+}
 #[test]
-fn c06l_rebind_from_import() { c06b_case("from-import", "from os import path as a\n"); }
+fn c06l_rebind_from_import() {
+    c06b_case("from-import", "from os import path as a\n");
+}
 
 #[test]
 fn c15_global_declaration_rebind_in_other_function() {
@@ -1217,7 +1637,12 @@ fn c15_global_declaration_rebind_in_other_function() {
         &[("o.py", "class O:\n    def f(self):\n        return 1\n")],
         "import a.b.c\nfrom o import O\n\ndef setup():\n    global a\n    a = O()\n\ndef use():\n    a.b.c.f()\n",
     );
-    no_edge(&res, "app.py::use", "a/b/c.py::f", "c15 global a rebound in setup()");
+    no_edge(
+        &res,
+        "app.py::use",
+        "a/b/c.py::f",
+        "c15 global a rebound in setup()",
+    );
 }
 
 #[test]
@@ -1243,7 +1668,10 @@ fn s06_many_dotted_module_calls_resolve_cost() {
     for i in 0..300 {
         files.push((format!("pk{i}/__init__.py"), String::new()));
         files.push((format!("pk{i}/sub/__init__.py"), String::new()));
-        files.push((format!("pk{i}/sub/mod.py"), "def f():\n    return 1\n".to_string()));
+        files.push((
+            format!("pk{i}/sub/mod.py"),
+            "def f():\n    return 1\n".to_string(),
+        ));
         src.push_str(&format!("import pk{i}.sub.mod\n"));
     }
     src.push_str("\ndef use():\n");
@@ -1253,7 +1681,10 @@ fn s06_many_dotted_module_calls_resolve_cost() {
         }
     }
     files.push(("app.py".to_string(), src));
-    let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
     let t = Instant::now();
     let res = resolve(&refs);
     eprintln!("S06_ELAPSED_MS {}", t.elapsed().as_millis());
@@ -1316,8 +1747,15 @@ fn z_confidence_report() {
     for (label, files, caller) in cases {
         let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (*a, b.as_str())).collect();
         let res = resolve(&refs);
-        for e in res.edges.iter().filter(|e| e.edge_kind == EdgeKind::Calls && e.source_symbol == caller) {
-            eprintln!("CONF {label}: {} -> {} {:?}", e.source_symbol, e.target_symbol, e.confidence);
+        for e in res
+            .edges
+            .iter()
+            .filter(|e| e.edge_kind == EdgeKind::Calls && e.source_symbol == caller)
+        {
+            eprintln!(
+                "CONF {label}: {} -> {} {:?}",
+                e.source_symbol, e.target_symbol, e.confidence
+            );
         }
     }
 }
@@ -1335,13 +1773,23 @@ fn ab_hops(hops: usize) -> String {
 #[test]
 fn t01_one_hop_lands_on_b() {
     let res = resolve(&[("m.py", &ab_hops(1))]);
-    no_edge(&res, "m.py::use", "m.py::A.run", "t01 A.make().run() is a B");
+    no_edge(
+        &res,
+        "m.py::use",
+        "m.py::A.run",
+        "t01 A.make().run() is a B",
+    );
 }
 
 #[test]
 fn t02_two_hops_land_on_a() {
     let res = resolve(&[("m.py", &ab_hops(2))]);
-    no_edge(&res, "m.py::use", "m.py::B.run", "t02 A.make().make().run() is an A");
+    no_edge(
+        &res,
+        "m.py::use",
+        "m.py::B.run",
+        "t02 A.make().make().run() is an A",
+    );
 }
 
 #[test]

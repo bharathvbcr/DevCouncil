@@ -422,6 +422,20 @@
     },
     {
       "language": "go",
+      "construct": "bare same-package",
+      "caller": "app/svc/probes3.go::Probes3",
+      "name": "bareRawUser",
+      "truth": "app/svc/probes3.go::bareRawUser"
+    },
+    {
+      "language": "go",
+      "construct": "bare same-package",
+      "caller": "app/svc/probes3.go::Probes3",
+      "name": "budgetOf",
+      "truth": "app/svc/probes3.go::budgetOf"
+    },
+    {
+      "language": "go",
       "construct": "package-qualified",
       "caller": "app/svc/svc.go::Caller01",
       "name": "Target01",
@@ -828,6 +842,10 @@
         "app/svc/probes2.go::shadowedLocalTypeUser",
         "app/svc/probes2.go::twinLocalTypeUser",
         "app/svc/probes2.go::writer.clear",
+        "app/svc/probes3.go",
+        "app/svc/probes3.go::Probes3",
+        "app/svc/probes3.go::bareRawUser",
+        "app/svc/probes3.go::budgetOf",
         "app/svc/svc.go",
         "app/svc/svc.go::Caller01",
         "app/svc/svc.go::Caller03",
@@ -1178,6 +1196,16 @@
         {
           "caller": "app/svc/probes2.go::methodReturnCaller",
           "callee": "app/svc/probes2.go::factory.Make",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes3.go::Probes3",
+          "callee": "app/svc/probes3.go::bareRawUser",
+          "impls": []
+        },
+        {
+          "caller": "app/svc/probes3.go::Probes3",
+          "callee": "app/svc/probes3.go::budgetOf",
           "impls": []
         },
         {

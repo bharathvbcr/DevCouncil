@@ -49,7 +49,16 @@ fn a_review_round_trips_with_its_record_embedded_as_an_object() {
     );
     assert_eq!(append(&db, "TASK-1", "AC-2", RECORD).code, 0);
 
-    let listed = dcstore(&db, &["reviews", "--task", "TASK-1", "--acceptance-criterion-id", "AC-1"]);
+    let listed = dcstore(
+        &db,
+        &[
+            "reviews",
+            "--task",
+            "TASK-1",
+            "--acceptance-criterion-id",
+            "AC-1",
+        ],
+    );
     assert_eq!(listed.code, 0, "{}", listed.stdout);
     check_object(&listed.stdout).unwrap_or_else(|why| panic!("{why}: {}", listed.stdout));
     assert!(
@@ -85,7 +94,13 @@ fn refusals_leave_no_row_and_say_why() {
     }
     let missing = dcstore(
         &db,
-        &["review-append", "--task", "TASK-1", "--acceptance-criterion-id", "AC-1"],
+        &[
+            "review-append",
+            "--task",
+            "TASK-1",
+            "--acceptance-criterion-id",
+            "AC-1",
+        ],
     );
     assert_ne!(missing.code, 0);
     assert!(

@@ -197,7 +197,11 @@ fn p2_clean_store_is_null_and_no_reason_is_empty() {
                     let db = build_store(&dir, status.clone(), Shape { stale, budget });
                     let cli = cli_status(&dir, &db);
                     let (reason, _) = daemon(&db, &unapplied(un));
-                    assert_ne!(cli["degraded_reason"], json!(""), "{label} {stale} {budget}");
+                    assert_ne!(
+                        cli["degraded_reason"],
+                        json!(""),
+                        "{label} {stale} {budget}"
+                    );
                     assert_ne!(reason.as_deref(), Some(""), "{label} {stale} {budget} {un}");
                     let _ = std::fs::remove_dir_all(&dir);
                 }
@@ -277,7 +281,10 @@ fn p4_stale_then_partial_then_budget_then_also_with_single_separators() {
     let partial = r.find("partial: ").expect(&r);
     let budget = r.find("budget-degraded: ").expect(&r);
     let also = r.find(" Also: ").expect(&r);
-    assert!(pending < partial && partial < budget && budget < also, "{r}");
+    assert!(
+        pending < partial && partial < budget && budget < also,
+        "{r}"
+    );
     for bad in [";;", "; ;", "Also: Also:", "  ", "; Also", ";  "] {
         assert!(!r.contains(bad), "doubled separator {bad:?} in {r}");
     }
@@ -344,7 +351,10 @@ fn p5c_human_status_output_carries_no_raw_escape_byte() {
         .current_dir(&dir)
         .output()
         .unwrap();
-    assert!(!out.stdout.contains(&0x1b), "raw ESC in human status output");
+    assert!(
+        !out.stdout.contains(&0x1b),
+        "raw ESC in human status output"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -364,7 +374,11 @@ fn p6_a_partial_reason_never_flips_is_fresh() {
             );
             let cli = cli_status(&dir, &db);
             let (reason, fresh) = daemon(&db, &unapplied(false));
-            assert_eq!(cli["is_fresh"], json!(true), "{label} budget={budget} {cli}");
+            assert_eq!(
+                cli["is_fresh"],
+                json!(true),
+                "{label} budget={budget} {cli}"
+            );
             assert!(fresh, "{label} budget={budget}: daemon flipped is_fresh");
             assert_eq!(cli["pending_count"], json!(0));
             if label != "complete" {
@@ -373,7 +387,14 @@ fn p6_a_partial_reason_never_flips_is_fresh() {
             let _ = std::fs::remove_dir_all(&dir);
 
             let dir = scratch("p6s");
-            let db = build_store(&dir, status.clone(), Shape { stale: true, budget });
+            let db = build_store(
+                &dir,
+                status.clone(),
+                Shape {
+                    stale: true,
+                    budget,
+                },
+            );
             let cli = cli_status(&dir, &db);
             let (_, fresh) = daemon(&db, &unapplied(false));
             assert_eq!(cli["is_fresh"], json!(false), "{label} stale {cli}");

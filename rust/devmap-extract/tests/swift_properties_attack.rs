@@ -46,7 +46,10 @@ fn an_argument_value_equal_to_its_label_is_still_a_name_ref() {
     let f = names(&ex, ReferenceKind::Name, "::f");
     assert_eq!(f.iter().filter(|n| *n == "total").count(), 1, "f: {f:?}");
     let g = names(&ex, ReferenceKind::Name, "::g");
-    assert!(!g.iter().any(|n| n == "total"), "g: label recorded as a read: {g:?}");
+    assert!(
+        !g.iter().any(|n| n == "total"),
+        "g: label recorded as a read: {g:?}"
+    );
 }
 
 #[test]
@@ -56,10 +59,19 @@ fn a_dictionary_literal_key_and_a_tuple_value_stay_name_refs() {
         "struct S {\n    var key: String\n    var a: Int\n    var b: Int\n    func f() -> [String: Int] { [key: 1] }\n    func g() -> (x: Int, y: Int) { (x: a, y: b) }\n}\n",
     );
     let f = names(&ex, ReferenceKind::Name, "S.f");
-    assert!(f.iter().any(|n| n == "key"), "dictionary key is a read: {f:?}");
+    assert!(
+        f.iter().any(|n| n == "key"),
+        "dictionary key is a read: {f:?}"
+    );
     let g = names(&ex, ReferenceKind::Name, "S.g");
-    assert!(g.iter().any(|n| n == "a") && g.iter().any(|n| n == "b"), "{g:?}");
-    assert!(!g.iter().any(|n| n == "x" || n == "y"), "tuple labels recorded: {g:?}");
+    assert!(
+        g.iter().any(|n| n == "a") && g.iter().any(|n| n == "b"),
+        "{g:?}"
+    );
+    assert!(
+        !g.iter().any(|n| n == "x" || n == "y"),
+        "tuple labels recorded: {g:?}"
+    );
 }
 
 #[test]
@@ -70,7 +82,10 @@ fn a_subscript_label_and_a_statement_label_are_not_reads_but_their_values_are() 
         "struct S {\n    var key: Int\n    var v: Int\n    subscript(key k: Int) -> Int { k }\n    func f(_ s: S) -> Int { s[key: v] }\n    func g() {\n        outer: for _ in 0..<2 { break outer }\n    }\n}\n",
     );
     let f = names(&ex, ReferenceKind::Name, "S.f");
-    assert!(f.iter().any(|n| n == "v"), "subscript argument value: {f:?}");
+    assert!(
+        f.iter().any(|n| n == "v"),
+        "subscript argument value: {f:?}"
+    );
     assert!(!f.iter().any(|n| n == "key"), "subscript label: {f:?}");
     let g = names(&ex, ReferenceKind::Name, "S.g");
     assert!(!g.iter().any(|n| n == "outer"), "statement label: {g:?}");
@@ -91,7 +106,10 @@ fn a_leading_dot_member_is_not_a_name_but_a_dotted_chain_base_is() {
         .references
         .iter()
         .filter(|r| {
-            r.enclosing_symbol.as_deref().is_some_and(|s| s.ends_with("::g")) && r.name == "shared"
+            r.enclosing_symbol
+                .as_deref()
+                .is_some_and(|s| s.ends_with("::g"))
+                && r.name == "shared"
         })
         .collect();
     assert!(!g.is_empty(), "Cfg.shared lost its reference");
@@ -151,7 +169,11 @@ fn a_property_inside_a_conditional_compilation_block_in_a_type_is_a_field() {
         "A.swift",
         "struct S {\n#if DEBUG\n    var dbg = 1\n#else\n    var rel = 2\n#endif\n}\n",
     );
-    assert!(is_field(&ex, "S.dbg") && is_field(&ex, "S.rel"), "{:?}", field_names(&ex));
+    assert!(
+        is_field(&ex, "S.dbg") && is_field(&ex, "S.rel"),
+        "{:?}",
+        field_names(&ex)
+    );
 }
 
 #[test]
@@ -178,7 +200,10 @@ fn locals_in_a_property_initializer_closure_are_not_fields() {
     );
     let f = field_names(&ex);
     for bad in ["tmp", "acc", "local", "z", "inner"] {
-        assert!(!f.iter().any(|q| q.ends_with(&format!(".{bad}"))), "{bad} became a Field: {f:?}");
+        assert!(
+            !f.iter().any(|q| q.ends_with(&format!(".{bad}"))),
+            "{bad} became a Field: {f:?}"
+        );
     }
     for good in ["S.a", "S.b", "S.c", "S.d"] {
         assert!(f.iter().any(|q| q.ends_with(good)), "{good}: {f:?}");
@@ -194,7 +219,8 @@ fn an_unmatched_or_garbage_type_body_does_not_invent_fields() {
     let f = field_names(&ex);
     assert!(f.iter().any(|q| q.ends_with("S.ok")), "{f:?}");
     assert!(
-        !f.iter().any(|q| q.ends_with("S.=") || q.ends_with("S.") || q.ends_with("S.let")),
+        !f.iter()
+            .any(|q| q.ends_with("S.=") || q.ends_with("S.") || q.ends_with("S.let")),
         "{f:?}"
     );
 }
@@ -243,7 +269,14 @@ fn hostile_fifty_thousand_properties_extract_in_bounded_time() {
     let t = std::time::Instant::now();
     let ex = extract_file("Big.swift", &s);
     let el = t.elapsed();
-    let n = ex.symbols.iter().filter(|x| x.kind == SymbolKind::Field).count();
-    assert!(n >= 29_900, "only {n} of 30000 properties extracted (silent cap?)");
+    let n = ex
+        .symbols
+        .iter()
+        .filter(|x| x.kind == SymbolKind::Field)
+        .count();
+    assert!(
+        n >= 29_900,
+        "only {n} of 30000 properties extracted (silent cap?)"
+    );
     assert!(el.as_secs() < 20, "took {el:?}");
 }

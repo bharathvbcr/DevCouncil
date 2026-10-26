@@ -1679,7 +1679,10 @@ mod tests {
     fn a_review_that_could_vouch_for_nothing_is_refused() {
         let store = Store::open_in_memory().expect("open store");
         plant_task(&store, "TASK-R", "[]", "[]");
-        let huge = format!(r#"{{"x":"{}"}}"#, "a".repeat(records::MAX_REVIEW_RECORD_BYTES));
+        let huge = format!(
+            r#"{{"x":"{}"}}"#,
+            "a".repeat(records::MAX_REVIEW_RECORD_BYTES)
+        );
         for (task, criterion, subject, record, why) in [
             ("TASK-NONE", "AC-1", SUBJECT, REVIEW, "no task"),
             ("", "AC-1", SUBJECT, REVIEW, "task id"),

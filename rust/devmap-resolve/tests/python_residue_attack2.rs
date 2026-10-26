@@ -81,7 +81,10 @@ fn p1_g_still_binds_b() {
 #[test]
 fn p1_lambda_at_module_scope() {
     let e = conflict_src("f = lambda: helper()\n");
-    assert!(e.iter().any(|(s, t)| s != "u.py::g" && t == "a.py::helper"), "{e:?}");
+    assert!(
+        e.iter().any(|(s, t)| s != "u.py::g" && t == "a.py::helper"),
+        "{e:?}"
+    );
 }
 
 #[test]
@@ -132,7 +135,10 @@ fn p1_class_base_conflict() {
     let src = "from a import Base\nclass C(Base):\n    def go(self):\n        return self.run()\ndef g():\n    from b import Base\n    class D(Base):\n        def go(self):\n            return self.run()\n";
     let r = resolve(&[("a.py", a), ("b.py", b), ("u.py", src)]);
     let e = all_calls(&r);
-    assert!(edge_from(&e, |s| s == "u.py::C.go", "a.py::Base.run"), "{e:?}");
+    assert!(
+        edge_from(&e, |s| s == "u.py::C.go", "a.py::Base.run"),
+        "{e:?}"
+    );
 }
 
 // ------------------------------------------------------------ 2. __all__
@@ -151,7 +157,10 @@ fn star_binding(m_src: &str) -> Vec<String> {
 
 fn keeps(m_src: &str) {
     let got = star_binding(m_src);
-    assert!(has(&got, "a.py::Base.run"), "star import went dynamic: {got:?}\n{m_src}");
+    assert!(
+        has(&got, "a.py::Base.run"),
+        "star import went dynamic: {got:?}\n{m_src}"
+    );
 }
 
 #[test]
@@ -227,7 +236,10 @@ fn p3_nested_class_not_module_a() {
     let src = "import a\nclass K:\n    class A:\n        def __init__(self):\n            pass\n\ndef f():\n    return K.A()\n";
     let r = resolve(&[("a.py", a), ("u.py", src)]);
     let got = calls(&r, "u.py::f");
-    assert!(!got.iter().any(|t| t.starts_with("a.py")), "K.A() bound the module's A: {got:?}");
+    assert!(
+        !got.iter().any(|t| t.starts_with("a.py")),
+        "K.A() bound the module's A: {got:?}"
+    );
 }
 
 #[test]
@@ -236,7 +248,10 @@ fn p3_nested_class_binds_inner() {
     let src = "class K:\n    class A:\n        def __init__(self):\n            pass\n\ndef f():\n    return K.A()\n";
     let r = resolve(&[("u.py", src)]);
     let got = calls(&r, "u.py::f");
-    assert!(has(&got, "u.py::A.__init__") || has(&got, "u.py::A"), "{got:?}");
+    assert!(
+        has(&got, "u.py::A.__init__") || has(&got, "u.py::A"),
+        "{got:?}"
+    );
 }
 
 #[test]
@@ -254,7 +269,10 @@ fn p3_class_attr_alias_wrong_module_a() {
     let src = "import a\nfrom c import SomeClass\nclass K:\n    A = SomeClass\n\ndef f():\n    x = K.A()\n    return x.run()\n";
     let r = resolve(&[("a.py", a), ("c.py", c), ("u.py", src)]);
     let got = calls(&r, "u.py::f");
-    assert!(!has(&got, "a.py::A.run"), "K.A() typed as module a's A: {got:?}");
+    assert!(
+        !has(&got, "a.py::A.run"),
+        "K.A() typed as module a's A: {got:?}"
+    );
 }
 
 #[test]
@@ -273,7 +291,10 @@ fn p3_imported_k_does_not_bind_module_level_a() {
     let src = "from k import K\n\ndef f():\n    x = K.A()\n    return x.run()\n";
     let r = resolve(&[("k.py", k), ("u.py", src)]);
     let got = calls(&r, "u.py::f");
-    assert!(!has(&got, "k.py::A.run"), "imported K.A() bound the module-level A: {got:?}");
+    assert!(
+        !has(&got, "k.py::A.run"),
+        "imported K.A() bound the module-level A: {got:?}"
+    );
 }
 
 #[test]
@@ -297,10 +318,14 @@ fn p3_module_alias_k_still_binds() {
 #[test]
 fn p3_function_local_module_shadows_same_file_class() {
     let m = "class A:\n    def run(self):\n        return 0\n";
-    let src = "class K:\n    pass\n\ndef g():\n    import m as K\n    x = K.A()\n    return x.run()\n";
+    let src =
+        "class K:\n    pass\n\ndef g():\n    import m as K\n    x = K.A()\n    return x.run()\n";
     let r = resolve(&[("m.py", m), ("u.py", src)]);
     let got = calls(&r, "u.py::g");
-    assert!(has(&got, "m.py::A.run"), "function-local module K shadows the class: {got:?}");
+    assert!(
+        has(&got, "m.py::A.run"),
+        "function-local module K shadows the class: {got:?}"
+    );
 }
 
 #[test]
@@ -309,7 +334,10 @@ fn p3_module_level_class_k_and_module_k_param() {
     let src = "import m\nclass m:\n    pass\n\ndef g():\n    x = m.A()\n    return x.run()\n";
     let r = resolve(&[("m.py", m), ("u.py", src)]);
     let got = calls(&r, "u.py::g");
-    assert!(!has(&got, "m.py::A.run"), "class m rebinds the name: {got:?}");
+    assert!(
+        !has(&got, "m.py::A.run"),
+        "class m rebinds the name: {got:?}"
+    );
 }
 
 #[test]
@@ -317,7 +345,10 @@ fn p3_self_a_does_not_bind_module_a() {
     let src = "class A:\n    def run(self):\n        return 0\nclass K:\n    class A:\n        def run(self):\n            return 1\n    def m(self):\n        x = self.A()\n        return x.run()\n";
     let r = resolve(&[("u.py", src)]);
     let got = calls(&r, "u.py::K.m");
-    assert!(!has(&got, "u.py::A.run"), "self.A() bound module A: {got:?}");
+    assert!(
+        !has(&got, "u.py::A.run"),
+        "self.A() bound module A: {got:?}"
+    );
 }
 
 #[test]
@@ -348,21 +379,30 @@ fn run2(src: &str) -> ResolutionResult {
 fn p4_comprehension_binding() {
     let r = run2("from a import helper\ndef g():\n    from b import helper\n    return [helper() for _ in range(2)]\n");
     let got = calls(&r, "u.py::g");
-    assert!(has(&got, "b.py::helper") && !has(&got, "a.py::helper"), "{got:?}");
+    assert!(
+        has(&got, "b.py::helper") && !has(&got, "a.py::helper"),
+        "{got:?}"
+    );
 }
 
 #[test]
 fn p4_comprehension_variable_shadows_import() {
     let r = run2("from a import helper\ndef g(fs):\n    return [helper() for helper in fs]\n");
     let got = calls(&r, "u.py::g");
-    assert!(!has(&got, "a.py::helper"), "comprehension var shadows: {got:?}");
+    assert!(
+        !has(&got, "a.py::helper"),
+        "comprehension var shadows: {got:?}"
+    );
 }
 
 #[test]
 fn p4_generator_expression() {
     let r = run2("from a import helper\ndef g():\n    from b import helper\n    return sum(helper() for _ in range(2))\n");
     let got = calls(&r, "u.py::g");
-    assert!(has(&got, "b.py::helper") && !has(&got, "a.py::helper"), "{got:?}");
+    assert!(
+        has(&got, "b.py::helper") && !has(&got, "a.py::helper"),
+        "{got:?}"
+    );
 }
 
 #[test]
@@ -383,36 +423,56 @@ fn p4_lambda_default_capturing() {
 fn p4_nested_class_in_function_in_class() {
     let r = run2("from a import helper\nclass Outer:\n    def f(self):\n        from b import helper\n        class Inner:\n            def m(self):\n                return helper()\n        return Inner\n");
     let e = all_calls(&r);
-    assert!(!e.iter().any(|(s, t)| s.contains("Inner") && t == "a.py::helper"), "{e:?}");
-    assert!(e.iter().any(|(s, t)| s.contains("Inner") && t == "b.py::helper"), "{e:?}");
+    assert!(
+        !e.iter()
+            .any(|(s, t)| s.contains("Inner") && t == "a.py::helper"),
+        "{e:?}"
+    );
+    assert!(
+        e.iter()
+            .any(|(s, t)| s.contains("Inner") && t == "b.py::helper"),
+        "{e:?}"
+    );
 }
 
 #[test]
 fn p4_class_body_name_not_visible_in_method() {
     let r = run2("from a import helper\nclass C:\n    from b import helper\n    def m(self):\n        return helper()\n");
     let got = calls(&r, "u.py::C.m");
-    assert!(has(&got, "a.py::helper") && !has(&got, "b.py::helper"), "{got:?}");
+    assert!(
+        has(&got, "a.py::helper") && !has(&got, "b.py::helper"),
+        "{got:?}"
+    );
 }
 
 #[test]
 fn p4_class_body_import_visible_in_class_body() {
     let r = run2("from a import helper\nclass C:\n    from b import helper\n    x = helper()\n");
     let e = all_calls(&r);
-    assert!(!e.iter().any(|(_, t)| t == "a.py::helper"), "class body reads its own import: {e:?}");
+    assert!(
+        !e.iter().any(|(_, t)| t == "a.py::helper"),
+        "class body reads its own import: {e:?}"
+    );
 }
 
 #[test]
 fn p4_nonlocal_interplay() {
     let r = run2("from a import helper\ndef outer():\n    from b import helper\n    def inner():\n        nonlocal helper\n        return helper()\n    return inner\n");
     let got = calls(&r, "u.py::outer.inner");
-    assert!(!has(&got, "a.py::helper"), "nonlocal reads outer's import: {got:?}");
+    assert!(
+        !has(&got, "a.py::helper"),
+        "nonlocal reads outer's import: {got:?}"
+    );
 }
 
 #[test]
 fn p4_global_rebinds_module_name() {
     let r = run2("from a import helper\ndef g():\n    global helper\n    from b import helper\n    return helper()\n");
     let got = calls(&r, "u.py::g");
-    assert!(has(&got, "b.py::helper") && !has(&got, "a.py::helper"), "{got:?}");
+    assert!(
+        has(&got, "b.py::helper") && !has(&got, "a.py::helper"),
+        "{got:?}"
+    );
 }
 
 #[test]
@@ -420,22 +480,34 @@ fn p4_global_rebinds_module_name() {
 fn p4_global_declared_in_inner_reads_module() {
     let r = run2("from a import helper\ndef g():\n    from b import helper\n    def inner():\n        global helper\n        return helper()\n    return inner\n");
     let got = calls(&r, "u.py::g.inner");
-    assert!(has(&got, "a.py::helper") && !has(&got, "b.py::helper"), "{got:?}");
+    assert!(
+        has(&got, "a.py::helper") && !has(&got, "b.py::helper"),
+        "{got:?}"
+    );
 }
 
 #[test]
 fn p4_try_import_with_except_fallback() {
     let r = run2("from a import helper as fallback\ndef g():\n    try:\n        from b import helper\n    except ImportError:\n        helper = fallback\n    return helper()\n");
     let got = calls(&r, "u.py::g");
-    assert!(!(has(&got, "b.py::helper") && !has(&got, "a.py::helper")), "only one branch bound: {got:?}");
+    assert!(
+        !(has(&got, "b.py::helper") && !has(&got, "a.py::helper")),
+        "only one branch bound: {got:?}"
+    );
 }
 
 #[test]
 fn p4_try_import_except_import() {
     let r = run2("def g():\n    try:\n        from b import helper\n    except ImportError:\n        from a import helper\n    return helper()\n");
     let got = calls(&r, "u.py::g");
-    assert!(!(has(&got, "b.py::helper") && !has(&got, "a.py::helper")), "only first import bound: {got:?}");
-    assert!(!(has(&got, "a.py::helper") && !has(&got, "b.py::helper")), "only last import bound: {got:?}");
+    assert!(
+        !(has(&got, "b.py::helper") && !has(&got, "a.py::helper")),
+        "only first import bound: {got:?}"
+    );
+    assert!(
+        !(has(&got, "a.py::helper") && !has(&got, "b.py::helper")),
+        "only last import bound: {got:?}"
+    );
 }
 
 #[test]
@@ -455,22 +527,37 @@ fn p4_sibling_functions_same_import() {
 #[test]
 fn p4_sibling_functions_different_imports() {
     let r = run2("def f():\n    from a import helper\n    return helper()\ndef g():\n    from b import helper\n    return helper()\n");
-    assert!(has(&calls(&r, "u.py::f"), "a.py::helper"), "{:?}", all_calls(&r));
-    assert!(has(&calls(&r, "u.py::g"), "b.py::helper"), "{:?}", all_calls(&r));
+    assert!(
+        has(&calls(&r, "u.py::f"), "a.py::helper"),
+        "{:?}",
+        all_calls(&r)
+    );
+    assert!(
+        has(&calls(&r, "u.py::g"), "b.py::helper"),
+        "{:?}",
+        all_calls(&r)
+    );
 }
 
 #[test]
 fn p4_deep_enclosure_import_in_middle() {
     let r = run2("from a import helper\ndef f1():\n    from b import helper\n    def f2():\n        def f3():\n            return helper()\n        return f3\n    return f2\n");
     let got = calls(&r, "u.py::f1.f2.f3");
-    assert!(has(&got, "b.py::helper") && !has(&got, "a.py::helper"), "{got:?}");
+    assert!(
+        has(&got, "b.py::helper") && !has(&got, "a.py::helper"),
+        "{got:?}"
+    );
 }
 
 #[test]
 fn p4_method_in_class_in_function() {
     let r = run2("from a import helper\ndef f():\n    from b import helper\n    class C:\n        def m(self):\n            return helper()\n    return C\n");
     let e = all_calls(&r);
-    assert!(e.iter().any(|(s, t)| s.contains("C.m") && t == "b.py::helper"), "{e:?}");
+    assert!(
+        e.iter()
+            .any(|(s, t)| s.contains("C.m") && t == "b.py::helper"),
+        "{e:?}"
+    );
 }
 
 // ------------------------------------------------- 6. dotted import in func
@@ -479,7 +566,11 @@ fn p4_method_in_class_in_function() {
 #[ignore = "pre-existing, ft-572bb69d"]
 fn p6_dotted_import_in_function_a_b_f() {
     let src = "def g():\n    import a.b\n    return a.b.f()\n";
-    let r = resolve(&[("a/__init__.py", ""), ("a/b.py", "def f():\n    return 1\n"), ("u.py", src)]);
+    let r = resolve(&[
+        ("a/__init__.py", ""),
+        ("a/b.py", "def f():\n    return 1\n"),
+        ("u.py", src),
+    ]);
     let got = calls(&r, "u.py::g");
     assert!(has(&got, "a/b.py::f"), "{got:?}");
 }
@@ -488,7 +579,11 @@ fn p6_dotted_import_in_function_a_b_f() {
 #[ignore = "pre-existing, ft-572bb69d"]
 fn p6_dotted_import_module_scope_baseline() {
     let src = "import a.b\ndef g():\n    return a.b.f()\n";
-    let r = resolve(&[("a/__init__.py", ""), ("a/b.py", "def f():\n    return 1\n"), ("u.py", src)]);
+    let r = resolve(&[
+        ("a/__init__.py", ""),
+        ("a/b.py", "def f():\n    return 1\n"),
+        ("u.py", src),
+    ]);
     let got = calls(&r, "u.py::g");
     assert!(has(&got, "a/b.py::f"), "{got:?}");
 }
@@ -496,7 +591,11 @@ fn p6_dotted_import_module_scope_baseline() {
 #[test]
 fn p6_module_import_a_then_function_dotted() {
     let src = "import a\ndef g():\n    import a.b\n    return a.x()\n";
-    let r = resolve(&[("a/__init__.py", "def x():\n    return 1\n"), ("a/b.py", "def f():\n    return 1\n"), ("u.py", src)]);
+    let r = resolve(&[
+        ("a/__init__.py", "def x():\n    return 1\n"),
+        ("a/b.py", "def f():\n    return 1\n"),
+        ("u.py", src),
+    ]);
     let got = calls(&r, "u.py::g");
     assert!(has(&got, "a/__init__.py::x"), "a.x() abstained: {got:?}");
 }
@@ -504,23 +603,41 @@ fn p6_module_import_a_then_function_dotted() {
 #[test]
 fn p6_dotted_in_function_a_x() {
     let src = "def g():\n    import a.b\n    return a.x()\n";
-    let r = resolve(&[("a/__init__.py", "def x():\n    return 1\n"), ("a/b.py", "def f():\n    return 1\n"), ("u.py", src)]);
+    let r = resolve(&[
+        ("a/__init__.py", "def x():\n    return 1\n"),
+        ("a/b.py", "def f():\n    return 1\n"),
+        ("u.py", src),
+    ]);
     let got = calls(&r, "u.py::g");
-    assert!(has(&got, "a/__init__.py::x"), "a.x() after dotted import: {got:?}");
+    assert!(
+        has(&got, "a/__init__.py::x"),
+        "a.x() after dotted import: {got:?}"
+    );
 }
 
 #[test]
 fn p6_other_function_unaffected() {
     let src = "import a\ndef g():\n    import a.b\n    return 1\ndef h():\n    return a.x()\n";
-    let r = resolve(&[("a/__init__.py", "def x():\n    return 1\n"), ("a/b.py", "def f():\n    return 1\n"), ("u.py", src)]);
+    let r = resolve(&[
+        ("a/__init__.py", "def x():\n    return 1\n"),
+        ("a/b.py", "def f():\n    return 1\n"),
+        ("u.py", src),
+    ]);
     let got = calls(&r, "u.py::h");
-    assert!(has(&got, "a/__init__.py::x"), "h's a.x() abstained: {got:?}");
+    assert!(
+        has(&got, "a/__init__.py::x"),
+        "h's a.x() abstained: {got:?}"
+    );
 }
 
 #[test]
 fn p6_module_level_call_unaffected() {
     let src = "import a\na.x()\ndef g():\n    import a.b\n    return 1\n";
-    let r = resolve(&[("a/__init__.py", "def x():\n    return 1\n"), ("a/b.py", "def f():\n    return 1\n"), ("u.py", src)]);
+    let r = resolve(&[
+        ("a/__init__.py", "def x():\n    return 1\n"),
+        ("a/b.py", "def f():\n    return 1\n"),
+        ("u.py", src),
+    ]);
     let e = all_calls(&r);
     assert!(edge_from(&e, |s| s == "u.py", "a/__init__.py::x"), "{e:?}");
 }
@@ -584,14 +701,26 @@ fn chain_src(depth: usize) -> String {
 
 #[test]
 fn p5_deep_chain_50_binds() {
-    let r = resolve(&[("m0.py", "def helper():\n    return 1\n"), ("u.py", &chain_src(50))]);
+    let r = resolve(&[
+        ("m0.py", "def helper():\n    return 1\n"),
+        ("u.py", &chain_src(50)),
+    ]);
     let e = all_calls(&r);
-    assert!(e.iter().any(|(_, t)| t == "m0.py::helper"), "50-deep chain lost the import: {e:?}");
+    assert!(
+        e.iter().any(|(_, t)| t == "m0.py::helper"),
+        "50-deep chain lost the import: {e:?}"
+    );
 }
 
 #[test]
 fn p5_deep_chain_70_binds() {
-    let r = resolve(&[("m0.py", "def helper():\n    return 1\n"), ("u.py", &chain_src(70))]);
+    let r = resolve(&[
+        ("m0.py", "def helper():\n    return 1\n"),
+        ("u.py", &chain_src(70)),
+    ]);
     let e = all_calls(&r);
-    assert!(e.iter().any(|(_, t)| t == "m0.py::helper"), "70-deep chain lost the import: {e:?}");
+    assert!(
+        e.iter().any(|(_, t)| t == "m0.py::helper"),
+        "70-deep chain lost the import: {e:?}"
+    );
 }

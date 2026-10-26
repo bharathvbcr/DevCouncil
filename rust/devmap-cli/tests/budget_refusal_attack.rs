@@ -84,7 +84,10 @@ fn seed_refusal(root: &Path, db: &Path, files: &[(&str, &str)], refused: &[&str]
 }
 
 const FILES: [(&str, &str); 4] = [
-    ("lib.py", "def alpha():\n    return beta()\n\ndef beta():\n    return 1\n"),
+    (
+        "lib.py",
+        "def alpha():\n    return beta()\n\ndef beta():\n    return 1\n",
+    ),
     ("a.py", "def a():\n    return 1\n"),
     ("b.go", "package p\n\nfunc B() int { return 2 }\n"),
     ("c.rs", "fn c() -> i32 { 3 }\n"),
@@ -99,7 +102,10 @@ fn every_surface_carries_the_cause_and_count_clause() {
     // CLI status.
     let status = json(&root, &db, &["status"]);
     let cli = status["degraded_reason"].as_str().unwrap_or("").to_string();
-    assert!(cli.contains(&format!("2 {CLAUSE}")), "CLI status lacks the clause: {cli}");
+    assert!(
+        cli.contains(&format!("2 {CLAUSE}")),
+        "CLI status lacks the clause: {cli}"
+    );
 
     // Shared join (MCP status path) and daemon status.
     let store = Store::open_existing(&db).unwrap().unwrap();
@@ -108,7 +114,10 @@ fn every_surface_carries_the_cause_and_count_clause() {
     let joined = store_degraded_reason(&store, &st, budget.as_ref())
         .unwrap()
         .unwrap();
-    assert!(joined.contains(&format!("2 {CLAUSE}")), "join lacks it: {joined}");
+    assert!(
+        joined.contains(&format!("2 {CLAUSE}")),
+        "join lacks it: {joined}"
+    );
     let daemon = daemon_status_reason(&store, &st, &UnappliedEdits::default())
         .unwrap()
         .unwrap();
@@ -136,7 +145,10 @@ fn the_clause_vanishes_when_the_next_plain_build_re_extracts() {
     seed_refusal(&root, &db, &FILES, &["lib.py", "c.rs"]);
     let before = json(&root, &db, &["status"]);
     assert!(
-        before["degraded_reason"].as_str().unwrap_or("").contains(CLAUSE),
+        before["degraded_reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains(CLAUSE),
         "{before}"
     );
 
@@ -161,6 +173,9 @@ fn a_second_plain_build_is_unchanged_once_the_refusal_is_cured() {
     seed_refusal(&root, &db, &FILES, &["lib.py"]);
     json(&root, &db, &["build", "."]);
     let again = json(&root, &db, &["build", "."]);
-    assert_eq!(again["unchanged"], true, "cured corpus keeps rebuilding: {again}");
+    assert_eq!(
+        again["unchanged"], true,
+        "cured corpus keeps rebuilding: {again}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }

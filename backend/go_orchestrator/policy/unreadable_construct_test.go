@@ -30,7 +30,7 @@ func TestABehaviouralRefusalIsNeverHiddenBehindAnUnreadableOne(t *testing.T) {
 		"git -C src push --force":                       RuleCommandForcePush,
 		// A soft refusal in front is the same masking, and worse: soft is
 		// demotable, so `date` hid the push from every posture that demotes.
-		"date; git push --force origin main":  RuleCommandForcePush,
+		"date; git push --force origin main":    RuleCommandForcePush,
 		"nope && git commit --no-gpg-sign -m x": RuleCommandBypassFlag,
 	} {
 		d := gate.EvaluateCommand(cmd, task)

@@ -34,10 +34,8 @@ fn git_as(repo: &Path, author: &str, args: &[&str]) {
 }
 
 fn temp_root(label: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "dc-regress-literal-{label}-{}",
-        std::process::id()
-    ));
+    let root =
+        std::env::temp_dir().join(format!("dc-regress-literal-{label}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("temp root");
     root

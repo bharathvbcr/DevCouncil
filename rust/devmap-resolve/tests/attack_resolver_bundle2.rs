@@ -10,8 +10,15 @@ fn calls(files: &[(&str, &str)]) -> E {
     let mut resolver = Resolver::new();
     resolver.index_extractions(&extractions);
     let result = resolver.resolve_all(&extractions).unwrap();
-    for e in result.edges.iter().filter(|e| e.edge_kind == EdgeKind::Calls) {
-        println!("EDGE {} -> {} conf={:?}", e.source_symbol, e.target_symbol, e.confidence);
+    for e in result
+        .edges
+        .iter()
+        .filter(|e| e.edge_kind == EdgeKind::Calls)
+    {
+        println!(
+            "EDGE {} -> {} conf={:?}",
+            e.source_symbol, e.target_symbol, e.confidence
+        );
     }
     let mut v: E = result
         .edges
@@ -30,10 +37,20 @@ const T5: &str = "package p\n\ninterface Repo {\n    fun find(id: Int): String\n
 
 #[test]
 fn z5_cast_to_unrelated_type_is_not_repo() {
-    for init in ["mock<Repo>() as Unrelated", "(mock<Repo>() as Unrelated)", "mock<Repo>() ?: Unrelated()", "mock<Repo>().let { Unrelated() }"] {
-        let s = format!("{T5}fun use(): String {{\n    val repo = {init}\n    return repo.find(1)\n}}\n");
+    for init in [
+        "mock<Repo>() as Unrelated",
+        "(mock<Repo>() as Unrelated)",
+        "mock<Repo>() ?: Unrelated()",
+        "mock<Repo>().let { Unrelated() }",
+    ] {
+        let s = format!(
+            "{T5}fun use(): String {{\n    val repo = {init}\n    return repo.find(1)\n}}\n"
+        );
         let e = calls(&[("p/Z.kt", &s)]);
-        assert!(!has(&e, "p/Z.kt::use", "p/Z.kt::Repo.find"), "{init}: {e:?}");
+        assert!(
+            !has(&e, "p/Z.kt::use", "p/Z.kt::Repo.find"),
+            "{init}: {e:?}"
+        );
     }
 }
 
@@ -41,7 +58,10 @@ fn z5_cast_to_unrelated_type_is_not_repo() {
 fn z5_name_of_returns_string() {
     let s = "package p\n\nclass Foo {\n    override fun toString(): String = \"foo\"\n    fun trim(): Int = 1\n}\n\ninline fun <reified T> nameOf(): String = T::class.simpleName!!\n\nfun use(): String {\n    val n = nameOf<Foo>()\n    return n.trim().toString()\n}\n";
     let e = calls(&[("p/Z.kt", s)]);
-    assert!(!has(&e, "p/Z.kt::use", "p/Z.kt::Foo.trim"), "String-typed local bound to Foo: {e:?}");
+    assert!(
+        !has(&e, "p/Z.kt::use", "p/Z.kt::Foo.trim"),
+        "String-typed local bound to Foo: {e:?}"
+    );
 }
 
 #[test]
@@ -86,10 +106,21 @@ fn z3_generic_return_unique_class_correct() {
 
 #[test]
 fn z3_function_type_and_suspend_returns() {
-    for ret in ["(Int) -> List<String>", "List<String>.() -> Unit", "Map<String, Int>?", "Array<String>", "Pair<List<A>, B>"] {
+    for ret in [
+        "(Int) -> List<String>",
+        "List<String>.() -> Unit",
+        "Map<String, Int>?",
+        "Array<String>",
+        "Pair<List<A>, B>",
+    ] {
         let s = format!("package p\n\nclass A\nclass B\n\nclass Pair<X, Y> {{\n    fun first(): Int = 1\n}}\n\nclass Array<X> {{\n    fun first(): Int = 1\n}}\n\nfun names(): {ret} = TODO()\n\nfun use(): Int {{\n    val v = names()\n    return v.first()\n}}\n");
         let e = calls(&[("p/Z.kt", &s)]);
-        println!("{ret}: {:?}", e.iter().filter(|(a, _)| a == "p/Z.kt::use").collect::<Vec<_>>());
+        println!(
+            "{ret}: {:?}",
+            e.iter()
+                .filter(|(a, _)| a == "p/Z.kt::use")
+                .collect::<Vec<_>>()
+        );
     }
 }
 
@@ -123,8 +154,14 @@ fn ov_swift_extension_in_same_file_with_same_member_name() {
     let a = "class Calc {\n    func add(_ x: Int) -> Int { return x }\n}\nextension Calc {\n    func add(_ s: String) -> Int { return add(s.count) }\n    func count(_ n: Int) -> Int { return n > 0 ? count(n - 1) : 0 }\n}\n";
     let e = calls(&[("a/C.swift", a)]);
     println!("{e:?}");
-    assert!(!has(&e, "a/C.swift::Calc.add", "a/C.swift::Calc.add"), "{e:?}");
-    assert!(has(&e, "a/C.swift::Calc.count", "a/C.swift::Calc.count"), "{e:?}");
+    assert!(
+        !has(&e, "a/C.swift::Calc.add", "a/C.swift::Calc.add"),
+        "{e:?}"
+    );
+    assert!(
+        has(&e, "a/C.swift::Calc.count", "a/C.swift::Calc.count"),
+        "{e:?}"
+    );
 }
 
 #[test]

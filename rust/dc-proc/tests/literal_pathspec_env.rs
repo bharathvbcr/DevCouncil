@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use dc_proc::{git_with_program, run_bounded, Bounds};
+use dc_proc::{Bounds, git_with_program, run_bounded};
 
 fn setup(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
@@ -20,7 +20,11 @@ fn setup(dir: &Path, args: &[&str]) {
         .stdin(Stdio::null())
         .output()
         .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 fn fixture(label: &str) -> PathBuf {
@@ -41,10 +45,17 @@ fn fixture(label: &str) -> PathBuf {
 #[test]
 fn an_inherited_global_pathspec_switch_does_not_break_a_literal_read() {
     let root = fixture("inherit");
-    for var in ["GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS"] {
-        let mut command =
-            git_with_program(OsStr::new("git"), &root, ["log", "--format=%s", "--", "a.txt"])
-                .unwrap();
+    for var in [
+        "GIT_GLOB_PATHSPECS",
+        "GIT_NOGLOB_PATHSPECS",
+        "GIT_ICASE_PATHSPECS",
+    ] {
+        let mut command = git_with_program(
+            OsStr::new("git"),
+            &root,
+            ["log", "--format=%s", "--", "a.txt"],
+        )
+        .unwrap();
         // git_env must have recorded the variable as removed, so a copy in the
         // kernel process's own environment is not inherited. (dc-proc forbids
         // `unsafe`, so the test cannot set the process environment itself;
@@ -81,16 +92,30 @@ fn an_inherited_global_pathspec_switch_does_not_break_a_literal_read() {
 #[test]
 fn a_textconv_child_inherits_the_literal_switch() {
     let root = fixture("child");
-    let marker = root.join("..").join(format!("dc-proc-lit-env-{}.txt", std::process::id()));
-    let script = root.join("..").join(format!("dc-proc-lit-tc-{}.sh", std::process::id()));
+    let marker = root
+        .join("..")
+        .join(format!("dc-proc-lit-env-{}.txt", std::process::id()));
+    let script = root
+        .join("..")
+        .join(format!("dc-proc-lit-tc-{}.sh", std::process::id()));
     std::fs::write(
         &script,
-        format!("#!/bin/sh\necho \"LIT=$GIT_LITERAL_PATHSPECS\" >> '{}'\ncat \"$1\"\n", marker.display()),
+        format!(
+            "#!/bin/sh\necho \"LIT=$GIT_LITERAL_PATHSPECS\" >> '{}'\ncat \"$1\"\n",
+            marker.display()
+        ),
     )
     .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::write(root.join(".gitattributes"), "*.txt diff=probe\n").unwrap();
-    setup(&root, &["config", "diff.probe.textconv", &script.display().to_string()]);
+    setup(
+        &root,
+        &[
+            "config",
+            "diff.probe.textconv",
+            &script.display().to_string(),
+        ],
+    );
     std::fs::write(root.join("a.txt"), "two\n").unwrap();
     let mut command = git_with_program(OsStr::new("git"), &root, ["diff", "HEAD"]).unwrap();
     let _ = run_bounded(

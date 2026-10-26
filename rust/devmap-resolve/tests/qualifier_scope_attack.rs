@@ -25,7 +25,10 @@ fn dump(path: &str, source: &str) -> String {
     }
     let res = resolve(path, source);
     for e in &res.edges {
-        out.push_str(&format!("EDGE {} -> {}\n", e.source_symbol, e.target_symbol));
+        out.push_str(&format!(
+            "EDGE {} -> {}\n",
+            e.source_symbol, e.target_symbol
+        ));
     }
     for u in &res.unresolved {
         out.push_str(&format!("UNRES {} {:?}\n", u.callee_name, u.class));
@@ -49,7 +52,10 @@ fn classes(res: &ResolutionResult, callee: &str) -> Vec<UnresolvedClass> {
 }
 
 fn all_external(cs: &[UnresolvedClass]) -> bool {
-    !cs.is_empty() && cs.iter().all(|c| matches!(c, UnresolvedClass::External { .. }))
+    !cs.is_empty()
+        && cs
+            .iter()
+            .all(|c| matches!(c, UnresolvedClass::External { .. }))
 }
 
 // ---------------------------------------------------------------- probe 1
@@ -94,11 +100,16 @@ const GO_SHADOW: &str = "package p\n\nimport \"encoding/json\"\n\ntype t struct{
 #[test]
 fn p1_go_local_shadowing_qualified_package_var_binds_bare_type() {
     let res = resolve("p/p.go", GO_SHADOW);
-    assert!(has_edge(&res, "shadow", "t"), "{}", dump("p/p.go", GO_SHADOW));
+    assert!(
+        has_edge(&res, "shadow", "t"),
+        "{}",
+        dump("p/p.go", GO_SHADOW)
+    );
 }
 
 // ---------------------------------------------------------------- probe 3
-const GO_PKG_LEVEL: &str = "package p\n\nimport \"encoding/json\"\n\nvar a json.RawMessage\nvar b = json.RawMessage{}\n";
+const GO_PKG_LEVEL: &str =
+    "package p\n\nimport \"encoding/json\"\n\nvar a json.RawMessage\nvar b = json.RawMessage{}\n";
 
 #[test]
 fn p3_go_package_level_qualified_type_is_external() {
@@ -205,7 +216,8 @@ fn p3_python_module_level_annotation_stays_external() {
 // hands to `qualifier_declared_in` as `Some(file_path)`: the scope key
 // `{file}:{file}:{typed}@mod` is never written, so the file-wide slot that the
 // helper's own doc says answers unscoped references is unreachable here.
-const GO_BODILESS: &str = "package p\n\nimport \"encoding/json\"\n\nfunc native(params json.RawMessage) int\n";
+const GO_BODILESS: &str =
+    "package p\n\nimport \"encoding/json\"\n\nfunc native(params json.RawMessage) int\n";
 
 const GO_IFACE: &str = "package p\n\nimport \"encoding/json\"\n\ntype I interface {\n\tM(params json.RawMessage) int\n}\n\nfunc native2(a, b json.RawMessage, c *json.RawMessage) int\n";
 
@@ -215,11 +227,7 @@ const GO_IFACE: &str = "package p\n\nimport \"encoding/json\"\n\ntype I interfac
 fn p3_go_bodiless_func_every_param_form_is_external() {
     let res = resolve("p/p.go", GO_IFACE);
     let cs = classes(&res, "RawMessage");
-    assert!(
-        all_external(&cs),
-        "{cs:?}\n{}",
-        dump("p/p.go", GO_IFACE)
-    );
+    assert!(all_external(&cs), "{cs:?}\n{}", dump("p/p.go", GO_IFACE));
 }
 
 #[test]

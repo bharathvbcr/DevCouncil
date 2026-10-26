@@ -42,7 +42,10 @@ fn p1_count_never_exceeds_parse_failed_across_languages() {
         extract_file("ok.go", GO),
     ];
     let cov = extraction_coverage(&exts);
-    assert!(cov.budget_refused_files <= cov.parse_failed_files, "{cov:?}");
+    assert!(
+        cov.budget_refused_files <= cov.parse_failed_files,
+        "{cov:?}"
+    );
     assert_eq!(cov.budget_refused_files, 4, "{cov:?}");
     assert_eq!(cov.parse_failed_files, 4, "{cov:?}");
 }
@@ -143,13 +146,7 @@ fn p2_zero_refused_has_no_budget_clause() {
 fn p2_ten_thousand_refused_stay_bounded() {
     let one = reason_of(&extraction_coverage(&[refused("a.go", GO)]));
     let exts: Vec<Extraction> = (0..10_000)
-        .map(|i| {
-            failed_with(
-                &format!("f{i}.go"),
-                GO,
-                format!("{BUDGET_REFUSAL_PREFIX}x"),
-            )
-        })
+        .map(|i| failed_with(&format!("f{i}.go"), GO, format!("{BUDGET_REFUSAL_PREFIX}x")))
         .collect();
     let cov = extraction_coverage(&exts);
     let r = reason_of(&cov);

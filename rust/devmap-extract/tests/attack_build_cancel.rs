@@ -100,7 +100,8 @@ fn a_cancel_after_the_last_retryable_file_does_not_cancel_cap_refused_files() {
     );
     assert_eq!(report.retried, MAX_BUDGET_RETRIES);
     assert_eq!(
-        report.cancelled, 0,
+        report.cancelled,
+        0,
         "all {MAX_BUDGET_RETRIES} retry slots were used before the cancel; the {} remaining \
          refusals were never going to be retried, yet the report calls them cancelled: {report:?}",
         n - MAX_BUDGET_RETRIES

@@ -34,7 +34,13 @@ fn dump_edges() {
         let result = resolver.resolve_all(&extractions).unwrap();
         let mut lines: Vec<String> = result.edges.iter().map(|e| format!("{e:?}")).collect();
         lines.sort();
-        writeln!(out, "=== {name}: {} files, {} edges", extractions.len(), lines.len()).unwrap();
+        writeln!(
+            out,
+            "=== {name}: {} files, {} edges",
+            extractions.len(),
+            lines.len()
+        )
+        .unwrap();
         for line in lines {
             writeln!(out, "{line}").unwrap();
         }

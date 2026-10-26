@@ -44,5 +44,9 @@ fn a_payload_stored_under_the_v94_identity_is_not_served_to_a_v95_key() {
 #[test]
 fn the_stored_identity_names_the_current_version() {
     let key = CacheKey::for_extraction(&extract_file("h.py", SOURCE));
-    assert!(key.analyzer_version.ends_with(":extract-v97"), "{}", key.analyzer_version);
+    assert!(
+        key.analyzer_version.ends_with(":extract-v97"),
+        "{}",
+        key.analyzer_version
+    );
 }

@@ -13,13 +13,24 @@ fn git(repo: &Path, args: &[&str]) {
     let out = Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["-c", "commit.gpgsign=false", "-c", "user.email=ada@example.com", "-c", "user.name=Ada"])
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "user.email=ada@example.com",
+            "-c",
+            "user.name=Ada",
+        ])
         .args(args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .output()
         .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -41,6 +52,9 @@ fn owner_lookup_survives_a_users_icase_pathspec_switch() {
         Duration::from_secs(10),
     );
     std::env::remove_var("GIT_ICASE_PATHSPECS");
-    assert!(gaps.is_empty(), "owner lookup gapped under GIT_ICASE_PATHSPECS=1: {gaps:?}");
+    assert!(
+        gaps.is_empty(),
+        "owner lookup gapped under GIT_ICASE_PATHSPECS=1: {gaps:?}"
+    );
     assert_eq!(owners.len(), 1, "owners: {owners:?}");
 }

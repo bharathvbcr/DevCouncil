@@ -60,7 +60,11 @@ fn disagree(body: &str) -> String {
 fn control_self_call_single_chain_resolves() {
     let src = "class A:\n    def m(self):\n        return 1\n\nclass B(A):\n    def go(self):\n        return self.m()\n";
     let r = resolve(&[("c.py", src)]);
-    assert!(hits(&calls(&r, "c.py::B.go"), "A.m"), "{:?}", calls(&r, "c.py::B.go"));
+    assert!(
+        hits(&calls(&r, "c.py::B.go"), "A.m"),
+        "{:?}",
+        calls(&r, "c.py::B.go")
+    );
 }
 
 #[test]
@@ -125,7 +129,11 @@ fn self_method_bare_attribute_bfs_c3_disagree() {
 fn disagreement_inside_a_function_scoped_class() {
     let src = "class A:\n    def m(self):\n        return 1\n\nclass Z:\n    pass\n\nclass C(Z):\n    def m(self):\n        return 2\n\ndef build():\n    class B(A):\n        pass\n    class D(B, C):\n        def go(self):\n            return self.m()\n    return D\n";
     let r = resolve(&[("c.py", src)]);
-    let all: Vec<String> = r.edges.iter().map(|e| format!("{} -> {}", e.source_symbol, e.target_symbol)).collect();
+    let all: Vec<String> = r
+        .edges
+        .iter()
+        .map(|e| format!("{} -> {}", e.source_symbol, e.target_symbol))
+        .collect();
     assert!(
         !all.iter().any(|e| e.contains("go") && e.ends_with("C.m")),
         "{all:?}"
@@ -136,7 +144,11 @@ fn disagreement_inside_a_function_scoped_class() {
 fn disagreement_inside_a_class_nested_class() {
     let src = "class A:\n    def m(self):\n        return 1\n\nclass Z:\n    pass\n\nclass C(Z):\n    def m(self):\n        return 2\n\nclass Outer:\n    class B(A):\n        pass\n    class D(B, C):\n        def go(self):\n            return self.m()\n";
     let r = resolve(&[("c.py", src)]);
-    let all: Vec<String> = r.edges.iter().map(|e| format!("{} -> {}", e.source_symbol, e.target_symbol)).collect();
+    let all: Vec<String> = r
+        .edges
+        .iter()
+        .map(|e| format!("{} -> {}", e.source_symbol, e.target_symbol))
+        .collect();
     assert!(
         !all.iter().any(|e| e.contains("go") && e.ends_with("C.m")),
         "{all:?}"
@@ -205,23 +217,32 @@ fn decorator_function_rebinds_its_own_name_after_use() {
         "@staticmethod\ndef staticmethod(f):\n    return f\n\n{}",
         static_class("")
     );
-    assert!(field_recorded(&src), "second decorator reads the rebound name");
+    assert!(
+        field_recorded(&src),
+        "second decorator reads the rebound name"
+    );
     let first = "class H:\n    @staticmethod\n    def make(self):\n        self.x = A()\n\n@staticmethod\ndef staticmethod(f):\n    return f\n";
-    assert!(!field_recorded(first), "class body ran before the rebinding");
+    assert!(
+        !field_recorded(first),
+        "class body ran before the rebinding"
+    );
 }
 
 #[test]
 fn if_guarded_rebinding_before_decorator() {
-    let src = static_class("import sys\nif sys.platform == 'win32':\n    staticmethod = lambda f: f\n");
+    let src =
+        static_class("import sys\nif sys.platform == 'win32':\n    staticmethod = lambda f: f\n");
     assert!(field_recorded(&src), "a guarded rebinding may have run");
 }
 
 #[test]
 fn try_except_importerror_rebinding() {
-    let src = static_class(
-        "try:\n    from compat import staticmethod\nexcept ImportError:\n    pass\n",
+    let src =
+        static_class("try:\n    from compat import staticmethod\nexcept ImportError:\n    pass\n");
+    assert!(
+        field_recorded(&src),
+        "an import may have rebound staticmethod"
     );
-    assert!(field_recorded(&src), "an import may have rebound staticmethod");
 }
 
 #[test]
@@ -231,8 +252,14 @@ fn rebinding_in_except_importerror_branch_for_a_torch_name() {
     // A runtime name that is `None` on one path is not torch's; the exemption
     // should not apply (low: only suppresses a dead-code report).
     let ext = extract_file("m.py", src);
-    let wired = ext.wiring.iter().any(|w| w.kind == WiringKind::RuntimeEntryPoint && w.target_symbol.contains("forward"));
-    assert!(!wired, "nn rebound to None on the except path still exempted");
+    let wired = ext
+        .wiring
+        .iter()
+        .any(|w| w.kind == WiringKind::RuntimeEntryPoint && w.target_symbol.contains("forward"));
+    assert!(
+        !wired,
+        "nn rebound to None on the except path still exempted"
+    );
 }
 
 #[test]
@@ -241,7 +268,10 @@ fn function_body_decorator_runs_after_later_module_rebinding() {
     // The class statement inside `build` runs when build() is called, after the
     // module-level rebinding below it. Textual order is not execution order.
     let src = "def build():\n    class H:\n        @staticmethod\n        def make(self):\n            self.x = A()\n    return H\n\nstaticmethod = lambda f: f\nH = build()\n";
-    assert!(field_recorded(src), "decorator inside a function reads the rebound name");
+    assert!(
+        field_recorded(src),
+        "decorator inside a function reads the rebound name"
+    );
 }
 
 // ------------------------------------------------------------ 3. star import
@@ -263,7 +293,11 @@ fn star_abstains(m: &str) -> Result<(), Vec<String>> {
 
 #[test]
 fn control_star_from_unrelated_module_keeps_the_edge() {
-    let r = resolve(&[("base.py", BASE), ("m.py", "def other():\n    return 1\n"), ("c.py", USER)]);
+    let r = resolve(&[
+        ("base.py", BASE),
+        ("m.py", "def other():\n    return 1\n"),
+        ("c.py", USER),
+    ]);
     assert!(hits(&targets(&r, "c.py::C.go"), "base.py::Base.run"));
 }
 
@@ -300,16 +334,29 @@ fn all_extend_call_after_a_literal_prefix_name_from_elsewhere() {
 fn all_is_base_all_plus_literal() {
     let other = "class Base:\n    pass\n__all__ = ['Base']\n";
     let m = "import other\nfrom other import *\n__all__ = other.__all__ + ['x']\nx = 1\n";
-    let r = resolve(&[("base.py", BASE), ("other.py", other), ("m.py", m), ("c.py", USER)]);
+    let r = resolve(&[
+        ("base.py", BASE),
+        ("other.py", other),
+        ("m.py", m),
+        ("c.py", USER),
+    ]);
     let t = targets(&r, "c.py::C.go");
-    assert!(!hits(&t, "base.py::Base.run"), "m re-exports other.Base through __all__: {t:?}");
+    assert!(
+        !hits(&t, "base.py::Base.run"),
+        "m re-exports other.Base through __all__: {t:?}"
+    );
 }
 
 #[test]
 fn all_is_literal_plus_base_all() {
     let other = "class Base:\n    pass\n__all__ = ['Base']\n";
     let m = "import other\nfrom other import *\n__all__ = ['x'] + other.__all__\nx = 1\n";
-    let r = resolve(&[("base.py", BASE), ("other.py", other), ("m.py", m), ("c.py", USER)]);
+    let r = resolve(&[
+        ("base.py", BASE),
+        ("other.py", other),
+        ("m.py", m),
+        ("c.py", USER),
+    ]);
     let t = targets(&r, "c.py::C.go");
     assert!(!hits(&t, "base.py::Base.run"), "{t:?}");
 }
@@ -340,7 +387,8 @@ fn all_annotated_assignment() {
 
 #[test]
 fn all_assigned_from_a_list_comprehension() {
-    star_abstains("class Base:\n    pass\n__all__ = [n for n in dir() if n[0].isupper()]\n").unwrap();
+    star_abstains("class Base:\n    pass\n__all__ = [n for n in dir() if n[0].isupper()]\n")
+        .unwrap();
 }
 
 #[test]
@@ -383,7 +431,12 @@ fn all_with_parenthesised_call_then_name() {
 fn star_chain_a_b_c_where_c_defines_the_name() {
     let c = "class Base:\n    pass\n";
     let b = "from c import *\n";
-    let r = resolve(&[("base.py", BASE), ("c_mod.py", c), ("m.py", "from c_mod import *\n"), ("c.py", USER)]);
+    let r = resolve(&[
+        ("base.py", BASE),
+        ("c_mod.py", c),
+        ("m.py", "from c_mod import *\n"),
+        ("c.py", USER),
+    ]);
     let _ = b;
     assert!(!hits(&targets(&r, "c.py::C.go"), "base.py::Base.run"));
 }
@@ -392,7 +445,12 @@ fn star_chain_a_b_c_where_c_defines_the_name() {
 fn star_chain_with_middle_all_not_listing_the_name() {
     // m has __all__ = ['y']; c_mod's Base is not exported by m (correct to keep).
     let m = "from c_mod import *\n__all__ = ['y']\ny = 1\n";
-    let r = resolve(&[("base.py", BASE), ("c_mod.py", "class Base:\n    pass\n"), ("m.py", m), ("c.py", USER)]);
+    let r = resolve(&[
+        ("base.py", BASE),
+        ("c_mod.py", "class Base:\n    pass\n"),
+        ("m.py", m),
+        ("c.py", USER),
+    ]);
     assert!(hits(&targets(&r, "c.py::C.go"), "base.py::Base.run"));
 }
 
@@ -412,12 +470,16 @@ fn star_from_module_with_plain_assignment_of_name() {
 
 #[test]
 fn star_from_module_with_guarded_class_of_name() {
-    star_abstains("import sys\nif sys.platform == 'win32':\n    class Base:\n        pass\n").unwrap();
+    star_abstains("import sys\nif sys.platform == 'win32':\n    class Base:\n        pass\n")
+        .unwrap();
 }
 
 #[test]
 fn star_from_module_with_try_def_of_name() {
-    star_abstains("try:\n    from other import Base\nexcept ImportError:\n    class Base:\n        pass\n").unwrap();
+    star_abstains(
+        "try:\n    from other import Base\nexcept ImportError:\n    class Base:\n        pass\n",
+    )
+    .unwrap();
 }
 
 #[test]
@@ -455,7 +517,10 @@ fn star_relative_import_defining_name() {
         ("pkg/m.py", "class Base:\n    pass\n"),
         ("pkg/c.py", &user.replace("from base", "from pkg.base")),
     ]);
-    assert!(!hits(&targets(&r, "pkg/c.py::C.go"), "pkg/base.py::Base.run"));
+    assert!(!hits(
+        &targets(&r, "pkg/c.py::C.go"),
+        "pkg/base.py::Base.run"
+    ));
 }
 
 /// A real function named `__all__` files its locals under `{m}::__all__`,
@@ -477,12 +542,20 @@ fn all_scope_key_is_not_a_symbol_or_edge() {
     let m = "class Base:\n    pass\n__all__ = ['Base']\n";
     let ex = extract_file("m.py", m);
     assert!(
-        !ex.symbols.iter().any(|s| s.qualified_name.contains("__all__") || s.name.contains("__all__")),
+        !ex.symbols
+            .iter()
+            .any(|s| s.qualified_name.contains("__all__") || s.name.contains("__all__")),
         "{:?}",
-        ex.symbols.iter().map(|s| &s.qualified_name).collect::<Vec<_>>()
+        ex.symbols
+            .iter()
+            .map(|s| &s.qualified_name)
+            .collect::<Vec<_>>()
     );
     let r = resolve(&[("m.py", m)]);
-    assert!(!r.edges.iter().any(|e| e.source_symbol.contains("__all__") || e.target_symbol.contains("__all__")));
+    assert!(!r
+        .edges
+        .iter()
+        .any(|e| e.source_symbol.contains("__all__") || e.target_symbol.contains("__all__")));
 }
 
 // ------------------------------------------------------------ 4. ambiguity
@@ -502,7 +575,11 @@ fn monkeypatched_attribute_on_imported_base_still_binds() {
 fn monkeypatched_attribute_on_local_base_still_binds() {
     let src = "class Base:\n    def run(self):\n        return 1\n\nBase.x = 1\n\nclass C(Base):\n    def go(self):\n        return self.run()\n";
     let r = resolve(&[("c.py", src)]);
-    assert!(hits(&targets(&r, "c.py::C.go"), "Base.run"), "{:?}", targets(&r, "c.py::C.go"));
+    assert!(
+        hits(&targets(&r, "c.py::C.go"), "Base.run"),
+        "{:?}",
+        targets(&r, "c.py::C.go")
+    );
 }
 
 #[test]
@@ -510,7 +587,11 @@ fn dataclass_rewrap_rebinding_characterised() {
     // `Base = dataclass(Base)` is a rebinding to (in practice) the same class.
     let src = "from dataclasses import dataclass\n\nclass Base:\n    def run(self):\n        return 1\n\nBase = dataclass(Base)\n\nclass C(Base):\n    def go(self):\n        return self.run()\n";
     let r = resolve(&[("c.py", src)]);
-    assert!(hits(&targets(&r, "c.py::C.go"), "Base.run"), "recall: {:?}", targets(&r, "c.py::C.go"));
+    assert!(
+        hits(&targets(&r, "c.py::C.go"), "Base.run"),
+        "recall: {:?}",
+        targets(&r, "c.py::C.go")
+    );
 }
 
 #[test]
@@ -536,7 +617,10 @@ fn name_bound_twice_by_import_and_class_is_unknown_base() {
 #[test]
 fn name_bound_twice_by_import_and_assignment_is_unknown_base() {
     let c = "try:\n    from base import Base\nexcept ImportError:\n    Base = object\n\nclass C(Base):\n    def go(self):\n        return self.run()\n";
-    assert!(!base_run_edge(c), "assignment fallback makes Base ambiguous");
+    assert!(
+        !base_run_edge(c),
+        "assignment fallback makes Base ambiguous"
+    );
 }
 
 #[test]
@@ -558,12 +642,16 @@ const MODULE_BODY: &str = "\nclass M(nn.Module):\n    def forward(self, x):\n   
 
 #[test]
 fn torch_import_as_nn_is_wired() {
-    assert!(forward_wired(&format!("import torch.nn as nn\n{MODULE_BODY}")));
+    assert!(forward_wired(&format!(
+        "import torch.nn as nn\n{MODULE_BODY}"
+    )));
 }
 
 #[test]
 fn torch_from_import_nn_is_wired() {
-    assert!(forward_wired(&format!("from torch import nn\n{MODULE_BODY}")));
+    assert!(forward_wired(&format!(
+        "from torch import nn\n{MODULE_BODY}"
+    )));
 }
 
 #[test]
@@ -577,13 +665,17 @@ fn torch_from_import_nn_then_rebound_is_not_wired() {
 #[test]
 #[ignore = "needs extractor change (schema frozen at 97), ft-572bb69d"]
 fn torch_nn_rebound_by_plain_assignment_is_not_wired() {
-    assert!(!forward_wired(&format!("import torch.nn as nn\nnn = object()\n{MODULE_BODY}")));
+    assert!(!forward_wired(&format!(
+        "import torch.nn as nn\nnn = object()\n{MODULE_BODY}"
+    )));
 }
 
 #[test]
 #[ignore = "needs extractor change (schema frozen at 97), ft-572bb69d"]
 fn torch_nn_rebound_by_def_is_not_wired() {
-    assert!(!forward_wired(&format!("import torch.nn as nn\ndef nn():\n    pass\n{MODULE_BODY}")));
+    assert!(!forward_wired(&format!(
+        "import torch.nn as nn\ndef nn():\n    pass\n{MODULE_BODY}"
+    )));
 }
 
 #[test]
@@ -596,8 +688,12 @@ fn torch_imported_only_under_type_checking_is_not_runtime_wired() {
 
 #[test]
 fn torch_alias_is_a_local_package_is_not_wired() {
-    assert!(!forward_wired(&format!("from torchlike import nn\n{MODULE_BODY}")));
-    assert!(!forward_wired(&format!("import torch_geometric.nn as nn\n{MODULE_BODY}")));
+    assert!(!forward_wired(&format!(
+        "from torchlike import nn\n{MODULE_BODY}"
+    )));
+    assert!(!forward_wired(&format!(
+        "import torch_geometric.nn as nn\n{MODULE_BODY}"
+    )));
 }
 
 // ------------------------------------------- 3b. star import, dotted base
@@ -632,8 +728,16 @@ fn dotted_star_all_literal_without_root_keeps_edge() {
 fn dotted_star_all_literal_plus_other_all_must_abstain() {
     let other = "mod = None\n__all__ = ['mod']\n";
     let m = "import other\nfrom other import *\n__all__ = ['x'] + other.__all__\nx = 1\n";
-    let r = resolve(&[("mod.py", DOT_MOD), ("other.py", other), ("m.py", m), ("c.py", DOT_USER)]);
-    assert!(!hits(&targets(&r, "c.py::C.go"), "mod.py::Base.run"), "m exports `mod` through other.__all__");
+    let r = resolve(&[
+        ("mod.py", DOT_MOD),
+        ("other.py", other),
+        ("m.py", m),
+        ("c.py", DOT_USER),
+    ]);
+    assert!(
+        !hits(&targets(&r, "c.py::C.go"), "mod.py::Base.run"),
+        "m exports `mod` through other.__all__"
+    );
 }
 
 #[test]
@@ -661,13 +765,18 @@ fn dotted_star_all_is_tuple_with_root() {
 
 #[test]
 fn dotted_star_all_concatenated_two_literals() {
-    assert!(!dotted_star_edge("mod = None\n__all__ = ['x'] + ['mod']\nx = 1\n"));
+    assert!(!dotted_star_edge(
+        "mod = None\n__all__ = ['x'] + ['mod']\nx = 1\n"
+    ));
 }
 
 #[test]
 fn dotted_star_all_in_a_conditional_second_assignment() {
     let m = "import sys\nmod = None\n__all__ = ['x']\nx = 1\nif sys.platform == 'win32':\n    __all__ = ['mod']\n";
-    assert!(!dotted_star_edge(m), "the guarded `__all__` may be the live one");
+    assert!(
+        !dotted_star_edge(m),
+        "the guarded `__all__` may be the live one"
+    );
 }
 
 #[test]
@@ -679,7 +788,10 @@ fn dotted_star_all_unlisted_name_defined_in_module_is_not_exported() {
 #[test]
 fn dotted_star_function_named_all_collides_with_the_export_key() {
     let m = "mod = None\n\ndef __all__():\n    tmp = 1\n    return tmp\n";
-    assert!(!dotted_star_edge(m), "`def __all__` locals read as the export list");
+    assert!(
+        !dotted_star_edge(m),
+        "`def __all__` locals read as the export list"
+    );
 }
 
 #[test]
@@ -692,7 +804,12 @@ fn dotted_star_function_named_all_with_local_named_like_root() {
 fn dotted_star_chain_a_b_c() {
     let b = "from c_mod import *\n";
     let c = "mod = None\n";
-    let r = resolve(&[("mod.py", DOT_MOD), ("c_mod.py", c), ("m.py", b), ("c.py", DOT_USER)]);
+    let r = resolve(&[
+        ("mod.py", DOT_MOD),
+        ("c_mod.py", c),
+        ("m.py", b),
+        ("c.py", DOT_USER),
+    ]);
     assert!(!hits(&targets(&r, "c.py::C.go"), "mod.py::Base.run"));
 }
 
@@ -700,7 +817,12 @@ fn dotted_star_chain_a_b_c() {
 fn dotted_star_chain_through_all_bearing_middle_reexport() {
     // m lists `mod` in __all__ and gets it from c_mod by star.
     let m = "from c_mod import *\n__all__ = ['mod']\n";
-    let r = resolve(&[("mod.py", DOT_MOD), ("c_mod.py", "mod = None\n"), ("m.py", m), ("c.py", DOT_USER)]);
+    let r = resolve(&[
+        ("mod.py", DOT_MOD),
+        ("c_mod.py", "mod = None\n"),
+        ("m.py", m),
+        ("c.py", DOT_USER),
+    ]);
     assert!(!hits(&targets(&r, "c.py::C.go"), "mod.py::Base.run"));
 }
 
@@ -754,7 +876,11 @@ fn dotted_base_100k_segments_does_not_crash_or_go_quadratic() {
 #[test]
 fn dotted_base_100k_parens_does_not_crash() {
     let depth = 100_000;
-    let src = format!("class C({}a{}):\n    pass\n", "(".repeat(depth), ")".repeat(depth));
+    let src = format!(
+        "class C({}a{}):\n    pass\n",
+        "(".repeat(depth),
+        ")".repeat(depth)
+    );
     std::thread::Builder::new()
         .stack_size(2 * 1024 * 1024)
         .spawn(move || {

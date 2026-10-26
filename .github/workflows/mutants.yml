@@ -82,6 +82,11 @@ jobs:
   shard:
     name: full run, ${{ matrix.crate }}
     if: github.event_name != 'pull_request'
+    # The missed-mutant artifact is the only thing this job writes. Checkout
+    # and the cache restore with contents: read; the upload needs actions: write.
+    permissions:
+      contents: read
+      actions: write
     runs-on: ubuntu-latest
     timeout-minutes: 350
     strategy:

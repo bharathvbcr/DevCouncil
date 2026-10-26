@@ -141,7 +141,8 @@ fn inbound_count(note: &Option<String>) -> Option<u64> {
 /// all fail on the one count disagreement that `p1_inbound_counts_agree` owns.
 fn blank_count(note: &Option<String>) -> Option<String> {
     let count = inbound_count(note)?;
-    note.as_ref().map(|n| n.replace(&format!("{count} inbound"), "N inbound"))
+    note.as_ref()
+        .map(|n| n.replace(&format!("{count} inbound"), "N inbound"))
 }
 
 /// Describe every field on which the engines differ ("" when they agree).
@@ -181,18 +182,44 @@ fn diff_with(store: &Outcome, memory: &Outcome, strict: bool) -> String {
     field(
         "item set",
         (!strict && store.truncated) || (a == b && store.items.len() == memory.items.len()),
-        format!("{} items, only-store {:?}", store.items.len(), a.difference(&b).collect::<Vec<_>>()),
-        format!("{} items, only-memory {:?}", memory.items.len(), b.difference(&a).collect::<Vec<_>>()),
+        format!(
+            "{} items, only-store {:?}",
+            store.items.len(),
+            a.difference(&b).collect::<Vec<_>>()
+        ),
+        format!(
+            "{} items, only-memory {:?}",
+            memory.items.len(),
+            b.difference(&a).collect::<Vec<_>>()
+        ),
     );
     field(
         "item order",
         !strict || a != b || store.items == memory.items,
         format!("{:?}", store.items.iter().map(|r| &r.3).collect::<Vec<_>>()),
-        format!("{:?}", memory.items.iter().map(|r| &r.3).collect::<Vec<_>>()),
+        format!(
+            "{:?}",
+            memory.items.iter().map(|r| &r.3).collect::<Vec<_>>()
+        ),
     );
-    field("shown", store.shown == memory.shown, store.shown.to_string(), memory.shown.to_string());
-    field("hidden", store.hidden == memory.hidden, store.hidden.to_string(), memory.hidden.to_string());
-    field("total", store.total == memory.total, store.total.to_string(), memory.total.to_string());
+    field(
+        "shown",
+        store.shown == memory.shown,
+        store.shown.to_string(),
+        memory.shown.to_string(),
+    );
+    field(
+        "hidden",
+        store.hidden == memory.hidden,
+        store.hidden.to_string(),
+        memory.hidden.to_string(),
+    );
+    field(
+        "total",
+        store.total == memory.total,
+        store.total.to_string(),
+        memory.total.to_string(),
+    );
     field(
         "truncated",
         store.truncated == memory.truncated,
@@ -205,7 +232,12 @@ fn diff_with(store: &Outcome, memory: &Outcome, strict: bool) -> String {
         format!("{:?}", store.walk_incomplete),
         format!("{:?}", memory.walk_incomplete),
     );
-    field("note", store.note == memory.note, format!("{:?}", store.note), format!("{:?}", memory.note));
+    field(
+        "note",
+        store.note == memory.note,
+        format!("{:?}", store.note),
+        format!("{:?}", memory.note),
+    );
     out
 }
 
@@ -213,7 +245,10 @@ fn assert_parity(fx: &Fixture, queries: &[&str], budgets: &[u32]) {
     let mut report = String::new();
     for query in queries {
         for budget in budgets {
-            let d = diff(&store_answer(fx, query, *budget), &memory_answer(fx, query, *budget));
+            let d = diff(
+                &store_answer(fx, query, *budget),
+                &memory_answer(fx, query, *budget),
+            );
             if !d.is_empty() {
                 report.push_str(&format!("  query {query:?} budget {budget}:\n{d}"));
             }
@@ -271,7 +306,10 @@ fn standard() -> Fixture {
         ("a.py", AMBIG_A),
         ("b.py", AMBIG_B),
         ("caf.py", UNI),
-        ("pkg/mod.py", "def inner():\n    return 1\n\n\ndef outer():\n    return inner()\n"),
+        (
+            "pkg/mod.py",
+            "def inner():\n    return 1\n\n\ndef outer():\n    return inner()\n",
+        ),
     ])
 }
 
@@ -362,7 +400,9 @@ fn p1_a_non_canonical_spelling_is_never_a_silent_empty_answer() {
             ("memory", memory_answer(&fx, query, 8_000)),
         ] {
             if o.available && o.items.is_empty() && o.walk_incomplete.is_none() {
-                report.push_str(&format!("  {engine} {query:?}: Available, empty, no note\n"));
+                report.push_str(&format!(
+                    "  {engine} {query:?}: Available, empty, no note\n"
+                ));
             }
         }
     }
@@ -407,13 +447,19 @@ fn p2_a_file_that_shadows_a_symbol_says_so() {
         ("memory", memory_answer(&fx, "Svc.py", 8_000)),
     ] {
         assert!(o.available, "{engine}: {o:?}");
-        assert!(o.items.iter().all(|r| r.0 == "Svc.py"), "{engine}: file must win: {o:?}");
+        assert!(
+            o.items.iter().all(|r| r.0 == "Svc.py"),
+            "{engine}: file must win: {o:?}"
+        );
         let announced = o
             .note
             .as_deref()
             .is_some_and(|n| n.contains("symbol") || n.contains("shadow"));
         if !announced {
-            report.push_str(&format!("  {engine}: file wins silently; note={:?}\n", o.note));
+            report.push_str(&format!(
+                "  {engine}: file wins silently; note={:?}\n",
+                o.note
+            ));
         }
     }
     assert!(report.is_empty(), "shadowing not announced:\n{report}");
@@ -428,9 +474,16 @@ fn p2_an_unindexed_path_is_not_indexed_in_both_engines() {
     for query in ["ghost.py", "ghost.py::helper2", "other.py::ghost"] {
         let s = store_answer(&fx, query, 8_000);
         let m = memory_answer(&fx, query, 8_000);
-        assert!(!s.available && !m.available, "{query}: store={s:?} memory={m:?}");
+        assert!(
+            !s.available && !m.available,
+            "{query}: store={s:?} memory={m:?}"
+        );
     }
-    assert_parity(&fx, &["ghost.py", "ghost.py::helper2", "other.py::ghost"], &[8_000]);
+    assert_parity(
+        &fx,
+        &["ghost.py", "ghost.py::helper2", "other.py::ghost"],
+        &[8_000],
+    );
 }
 
 // ---------------------------------------------------------------- probe 3
@@ -531,7 +584,11 @@ fn raw_rows(fx: &Fixture) -> Vec<devmap_store::StoredEdge> {
 fn p3_symbol_dependencies_equal_the_stored_outbound_rows() {
     let fx = kinds_fixture();
     let raw = raw_rows(&fx);
-    assert!(raw.len() > 20, "fixture must produce a real graph: {}", raw.len());
+    assert!(
+        raw.len() > 20,
+        "fixture must produce a real graph: {}",
+        raw.len()
+    );
     let kinds: BTreeSet<&str> = raw.iter().map(|e| e.edge_kind.as_str()).collect();
     eprintln!("edge kinds in fixture: {kinds:?}");
     let sources: BTreeSet<(String, String)> = raw
@@ -544,7 +601,13 @@ fn p3_symbol_dependencies_equal_the_stored_outbound_rows() {
             let mut v: Vec<_> = raw
                 .iter()
                 .filter(|e| &e.source_file == file && &e.source_symbol == symbol)
-                .map(|e| (e.target_file.clone(), e.target_symbol.clone(), e.edge_kind.clone()))
+                .map(|e| {
+                    (
+                        e.target_file.clone(),
+                        e.target_symbol.clone(),
+                        e.edge_kind.clone(),
+                    )
+                })
                 .collect();
             v.sort();
             v
@@ -562,7 +625,10 @@ fn p3_symbol_dependencies_equal_the_stored_outbound_rows() {
             ("memory", memory_answer(&fx, &query, 200_000)),
         ] {
             if !o.available {
-                report.push_str(&format!("  {engine} {query}: unavailable {:?}\n", o.refusal));
+                report.push_str(&format!(
+                    "  {engine} {query}: unavailable {:?}\n",
+                    o.refusal
+                ));
                 continue;
             }
             let got: BTreeSet<(String, String, String)> = o
@@ -580,7 +646,10 @@ fn p3_symbol_dependencies_equal_the_stored_outbound_rows() {
                 ));
             }
             if o.total as usize != expected_len {
-                report.push_str(&format!("  {engine} {query}: total {} want {}\n", o.total, expected_len));
+                report.push_str(&format!(
+                    "  {engine} {query}: total {} want {}\n",
+                    o.total, expected_len
+                ));
             }
         }
     }
@@ -671,7 +740,10 @@ fn p4_zero_outbound_many_inbound_is_not_truncated() {
             ("memory", memory_answer(&fx, query, 1)),
         ] {
             assert!(o.available, "{engine} {query}: {o:?}");
-            assert!(!o.truncated, "{engine} {query}: truncated with nothing hidden: {o:?}");
+            assert!(
+                !o.truncated,
+                "{engine} {query}: truncated with nothing hidden: {o:?}"
+            );
             assert_eq!((o.total, o.hidden, o.shown), (0, 0, 0), "{engine} {query}");
             let note = o.note.clone().unwrap_or_default();
             let truth = raw_rows(&fx)
@@ -686,7 +758,11 @@ fn p4_zero_outbound_many_inbound_is_not_truncated() {
             );
         }
     }
-    assert_parity(&fx, &["hub", "hub.py::hub", "hub.py", "users.py"], &[1, 25, 8_000]);
+    assert_parity(
+        &fx,
+        &["hub", "hub.py::hub", "hub.py", "users.py"],
+        &[1, 25, 8_000],
+    );
 }
 
 /// Probe 4. An all-inbound *file* at budget 1 (the lane's own test uses 8000).
@@ -699,7 +775,12 @@ fn p4_an_all_inbound_file_at_budget_one_is_not_truncated() {
     let analysis = devmap_analyze::analyze(&fx.extractions, &resolution);
     let store = Store::open_in_memory().unwrap();
     store
-        .save_generation_with_opts(&fx.extractions, &resolution, &analysis, GenerationWriteOpts::default())
+        .save_generation_with_opts(
+            &fx.extractions,
+            &resolution,
+            &analysis,
+            GenerationWriteOpts::default(),
+        )
         .unwrap();
     let stripped = Fixture {
         extractions: fx.extractions.clone(),
@@ -711,7 +792,10 @@ fn p4_an_all_inbound_file_at_budget_one_is_not_truncated() {
         ("memory", memory_answer(&stripped, "hub.py", 1)),
     ] {
         assert!(o.available && o.items.is_empty(), "{engine}: {o:?}");
-        assert!(!o.truncated && o.hidden == 0 && o.total == 0, "{engine}: {o:?}");
+        assert!(
+            !o.truncated && o.hidden == 0 && o.total == 0,
+            "{engine}: {o:?}"
+        );
         let truth = stripped
             .resolution
             .edges
@@ -745,7 +829,11 @@ fn p4_truncated_means_outbound_items_are_hidden() {
             assert_eq!(o.items.len() as u32, o.shown, "{engine} budget {budget}");
         }
     }
-    assert_parity(&fx, &["lib.py", "worker", "lib.py::worker"], &[1, 24, 25, 26, 49, 50, 51, 99, 100, 8_000]);
+    assert_parity(
+        &fx,
+        &["lib.py", "worker", "lib.py::worker"],
+        &[1, 24, 25, 26, 49, 50, 51, 99, 100, 8_000],
+    );
 }
 
 /// Probe 4. 5 000 outbound edges stay bounded in time and in output size, at
@@ -768,19 +856,32 @@ fn p4_a_five_thousand_edge_answer_stays_bounded() {
         .iter()
         .filter(|e| e.source_file == "big.py")
         .count();
-    assert!(outbound >= n, "fixture must hold the outbound set: {outbound}");
+    assert!(
+        outbound >= n,
+        "fixture must hold the outbound set: {outbound}"
+    );
     for query in ["big.py", "fan", "big.py::fan"] {
         for (engine, run) in [
             ("store", store_answer as fn(&Fixture, &str, u32) -> Outcome),
-            ("memory", memory_answer as fn(&Fixture, &str, u32) -> Outcome),
+            (
+                "memory",
+                memory_answer as fn(&Fixture, &str, u32) -> Outcome,
+            ),
         ] {
             let started = Instant::now();
             let o = run(&fx, query, 2_000);
             let took = started.elapsed();
             assert!(took < Duration::from_secs(5), "{engine} {query}: {took:?}");
             assert!(o.available, "{engine} {query}: {o:?}");
-            assert!(o.truncated && o.hidden > 0, "{engine} {query}: must page, {o:?}");
-            assert!(o.items.len() <= 200, "{engine} {query}: {} items for a 2000 budget", o.items.len());
+            assert!(
+                o.truncated && o.hidden > 0,
+                "{engine} {query}: must page, {o:?}"
+            );
+            assert!(
+                o.items.len() <= 200,
+                "{engine} {query}: {} items for a 2000 budget",
+                o.items.len()
+            );
             assert!(o.total as usize >= n, "{engine} {query}: total {}", o.total);
             assert_eq!(o.shown + o.hidden, o.total, "{engine} {query}");
         }
@@ -803,7 +904,10 @@ fn p5_a_complete_answer_carries_no_walk_incomplete() {
         ("store", store_answer(&fx, "RETRY_BUDGET_FACTOR", 8_000)),
         ("memory", memory_answer(&fx, "RETRY_BUDGET_FACTOR", 8_000)),
     ] {
-        assert!(o.available && o.items.is_empty() && !o.truncated, "{engine}: {o:?}");
+        assert!(
+            o.available && o.items.is_empty() && !o.truncated,
+            "{engine}: {o:?}"
+        );
         assert!(
             o.walk_incomplete.is_none(),
             "{engine}: complete answer flagged walk_incomplete={:?}",
@@ -821,7 +925,9 @@ fn p5_the_inbound_count_equals_the_stored_inbound_rows() {
     let raw = raw_rows(&fx);
     let inbound = raw
         .iter()
-        .filter(|e| e.target_symbol.ends_with("RETRY_BUDGET_FACTOR") && e.source_symbol != e.target_symbol)
+        .filter(|e| {
+            e.target_symbol.ends_with("RETRY_BUDGET_FACTOR") && e.source_symbol != e.target_symbol
+        })
         .count();
     assert!(inbound > 0);
     for (engine, o) in [
@@ -829,7 +935,10 @@ fn p5_the_inbound_count_equals_the_stored_inbound_rows() {
         ("memory", memory_answer(&fx, "RETRY_BUDGET_FACTOR", 8_000)),
     ] {
         let note = o.note.unwrap_or_default();
-        assert!(note.contains(&format!("{inbound} inbound edge(s)")), "{engine}: want {inbound}: {note:?}");
+        assert!(
+            note.contains(&format!("{inbound} inbound edge(s)")),
+            "{engine}: want {inbound}: {note:?}"
+        );
         assert!(note.contains("`impact`"), "{engine}: {note:?}");
     }
 }
@@ -868,10 +977,15 @@ fn p5_a_call_blind_leaf_is_not_an_available_empty_answer_in_either_engine() {
     let store = store_answer(&fx, "main.tf::variable.region", 8_000);
     let memory = memory_answer(&fx, "main.tf::variable.region", 8_000);
     assert!(
-        !(memory.available && memory.items.is_empty()) || (store.available && store.items.is_empty()),
+        !(memory.available && memory.items.is_empty())
+            || (store.available && store.items.is_empty()),
         "engines disagree on a call-blind leaf: store={store:?} memory={memory:?}"
     );
-    assert_parity(&fx, &["main.tf::variable.region", "main.tf", "variable.region"], &[8_000]);
+    assert_parity(
+        &fx,
+        &["main.tf::variable.region", "main.tf", "variable.region"],
+        &[8_000],
+    );
 }
 
 // ---------------------------------------------------------------- probe 6
@@ -882,16 +996,25 @@ fn p5_a_call_blind_leaf_is_not_an_available_empty_answer_in_either_engine() {
 #[test]
 fn p6_namesakes_where_only_one_has_outbound_edges() {
     let fx = fixture(&[
-        ("a.py", "def thing():\n    return b()\n\n\ndef b():\n    return 1\n"),
+        (
+            "a.py",
+            "def thing():\n    return b()\n\n\ndef b():\n    return 1\n",
+        ),
         ("b.py", "thing = 3\n"),
-        ("c.py", "from b import thing\n\n\ndef use():\n    return thing\n"),
+        (
+            "c.py",
+            "from b import thing\n\n\ndef use():\n    return thing\n",
+        ),
     ]);
     let s = store_answer(&fx, "thing", 8_000);
     let m = memory_answer(&fx, "thing", 8_000);
     for (engine, o) in [("store", &s), ("memory", &m)] {
         assert!(!o.available, "{engine}: must refuse: {o:?}");
         let reason = o.refusal.clone().unwrap_or_default();
-        assert!(reason.contains("a.py::thing") && reason.contains("b.py::thing"), "{engine}: {reason}");
+        assert!(
+            reason.contains("a.py::thing") && reason.contains("b.py::thing"),
+            "{engine}: {reason}"
+        );
     }
     for (engine, o) in [
         ("store", store_answer(&fx, "a.py::thing", 8_000)),
@@ -913,9 +1036,18 @@ fn p6_namesakes_where_only_one_has_outbound_edges() {
 #[test]
 fn p6_a_name_shared_across_languages_is_refused_with_both_candidates() {
     let fx = fixture(&[
-        ("x.py", "def render():\n    return 1\n\n\ndef go():\n    return render()\n"),
-        ("y.ts", "export function render() { return 2 }\nexport function go() { return render() }\n"),
-        ("z.go", "package z\n\nfunc render() int { return 3 }\n\nfunc Go() int { return render() }\n"),
+        (
+            "x.py",
+            "def render():\n    return 1\n\n\ndef go():\n    return render()\n",
+        ),
+        (
+            "y.ts",
+            "export function render() { return 2 }\nexport function go() { return render() }\n",
+        ),
+        (
+            "z.go",
+            "package z\n\nfunc render() int { return 3 }\n\nfunc Go() int { return render() }\n",
+        ),
     ]);
     for (engine, o) in [
         ("store", store_answer(&fx, "render", 8_000)),
@@ -927,7 +1059,17 @@ fn p6_a_name_shared_across_languages_is_refused_with_both_candidates() {
             assert!(reason.contains(f), "{engine} missing {f}: {reason}");
         }
     }
-    assert_parity(&fx, &["render", "go", "x.py::render", "y.ts::render", "z.go::render"], &[8_000]);
+    assert_parity(
+        &fx,
+        &[
+            "render",
+            "go",
+            "x.py::render",
+            "y.ts::render",
+            "z.go::render",
+        ],
+        &[8_000],
+    );
 }
 
 /// Probe 6. A name that is ambiguous only on the inbound side (a symbol that
@@ -938,7 +1080,10 @@ fn p6_a_callee_only_namesake_pair_is_refused() {
     let fx = fixture(&[
         ("a.py", "def shared():\n    return 1\n"),
         ("b.py", "def shared():\n    return 2\n"),
-        ("c.py", "from a import shared\n\n\ndef use():\n    return shared()\n"),
+        (
+            "c.py",
+            "from a import shared\n\n\ndef use():\n    return shared()\n",
+        ),
     ]);
     assert_parity(&fx, &["shared", "a.py::shared", "b.py::shared"], &[8_000]);
 }
@@ -952,7 +1097,12 @@ fn p1_engines_agree_under_a_confidence_floor() {
     let fx = standard();
     let mut report = String::new();
     for floor in [0.0f32, 0.5, 0.9, 1.0] {
-        for query in ["lib.py", "worker", "RETRY_BUDGET_FACTOR", "callers.py::caller_one"] {
+        for query in [
+            "lib.py",
+            "worker",
+            "RETRY_BUDGET_FACTOR",
+            "callers.py::caller_one",
+        ] {
             let req = |q: &str| Request {
                 query: q.to_string(),
                 token_budget: 8_000,
@@ -998,15 +1148,28 @@ fn p5_a_rung_that_filters_every_edge_does_not_claim_the_target_depends_on_nothin
     let analysis = devmap_analyze::analyze(&extractions, &resolution);
     let store = Store::open_in_memory().unwrap();
     store
-        .save_generation_with_opts(&extractions, &resolution, &analysis, GenerationWriteOpts::default())
+        .save_generation_with_opts(
+            &extractions,
+            &resolution,
+            &analysis,
+            GenerationWriteOpts::default(),
+        )
         .unwrap();
     let engine = StoreQueryEngine::new(&store);
-    let open = engine.dependencies(request("app.py::helper", 8_000)).unwrap();
-    assert!(!open.items.is_empty(), "fixture: helper must have dispatch edges: {open:?}");
+    let open = engine
+        .dependencies(request("app.py::helper", 8_000))
+        .unwrap();
+    assert!(
+        !open.items.is_empty(),
+        "fixture: helper must have dispatch edges: {open:?}"
+    );
     let floored = engine
         .dependencies_at_rung(request("app.py::helper", 8_000), Some(Rung::Deterministic))
         .unwrap();
-    assert!(floored.items.is_empty(), "fixture: the floor must remove them: {floored:?}");
+    assert!(
+        floored.items.is_empty(),
+        "fixture: the floor must remove them: {floored:?}"
+    );
     let filtered = floored.rungs.as_ref().map_or(0, |h| h.filtered_out);
     assert!(filtered > 0, "histogram must show what the rung hid");
     let note = floored.note.clone().unwrap_or_default();
@@ -1025,20 +1188,32 @@ fn p1_inbound_counts_agree_between_engines_and_with_the_store() {
     let fx = standard();
     let raw = raw_rows(&fx);
     let mut report = String::new();
-    for query in ["RETRY_BUDGET_FACTOR", "lib.py::RETRY_BUDGET_FACTOR", "b.py::dup", "lib.py::Svc.run"] {
+    for query in [
+        "RETRY_BUDGET_FACTOR",
+        "lib.py::RETRY_BUDGET_FACTOR",
+        "b.py::dup",
+        "lib.py::Svc.run",
+    ] {
         let s = store_answer(&fx, query, 8_000);
         let m = memory_answer(&fx, query, 8_000);
         let (sc, mc) = (inbound_count(&s.note), inbound_count(&m.note));
         let want = raw
             .iter()
             .filter(|e| {
-                (e.target_symbol == query || format!("{}::{}", e.target_file, e.target_symbol.rsplit("::").next().unwrap_or("")) == query
+                (e.target_symbol == query
+                    || format!(
+                        "{}::{}",
+                        e.target_file,
+                        e.target_symbol.rsplit("::").next().unwrap_or("")
+                    ) == query
                     || e.target_symbol.ends_with(&format!("::{query}")))
                     && e.source_symbol != e.target_symbol
             })
             .count() as u64;
         if sc != mc || (sc.is_some() && sc != Some(want)) {
-            report.push_str(&format!("  {query}: store={sc:?} memory={mc:?} stored-rows={want}\n"));
+            report.push_str(&format!(
+                "  {query}: store={sc:?} memory={mc:?} stored-rows={want}\n"
+            ));
         }
     }
     assert!(report.is_empty(), "inbound counts:\n{report}");
@@ -1051,7 +1226,11 @@ fn p1_item_order_agrees_between_engines() {
     let fx = standard();
     let mut report = String::new();
     for query in ["lib.py", "callers.py", "worker", "pkg/mod.py"] {
-        let d = diff_with(&store_answer(&fx, query, 200_000), &memory_answer(&fx, query, 200_000), true);
+        let d = diff_with(
+            &store_answer(&fx, query, 200_000),
+            &memory_answer(&fx, query, 200_000),
+            true,
+        );
         if d.contains("item order") {
             report.push_str(&format!("  {query}:\n{d}"));
         }
@@ -1068,7 +1247,11 @@ fn p1_a_truncated_page_has_the_same_rows_in_both_engines() {
     let mut report = String::new();
     for query in ["lib.py", "callers.py"] {
         for budget in [25, 50, 100] {
-            let d = diff_with(&store_answer(&fx, query, budget), &memory_answer(&fx, query, budget), true);
+            let d = diff_with(
+                &store_answer(&fx, query, budget),
+                &memory_answer(&fx, query, budget),
+                true,
+            );
             if d.contains("item set") {
                 report.push_str(&format!("  {query} b={budget}:\n{d}"));
             }
@@ -1111,10 +1294,23 @@ fn p4_a_large_inbound_population_is_counted_once_and_cheaply() {
     let started = Instant::now();
     let s = store_answer(&fx, "hub", 8_000);
     let took = started.elapsed();
-    assert!(took < Duration::from_secs(2), "store took {took:?} for {truth} inbound edges");
-    assert_eq!(inbound_count(&s.note), Some(truth), "{:?}", s.walk_incomplete);
+    assert!(
+        took < Duration::from_secs(2),
+        "store took {took:?} for {truth} inbound edges"
+    );
+    assert_eq!(
+        inbound_count(&s.note),
+        Some(truth),
+        "{:?}",
+        s.walk_incomplete
+    );
     let m = memory_answer(&fx, "hub", 8_000);
-    assert_eq!(inbound_count(&m.note), Some(truth), "{:?}", m.walk_incomplete);
+    assert_eq!(
+        inbound_count(&m.note),
+        Some(truth),
+        "{:?}",
+        m.walk_incomplete
+    );
 }
 
 /// Probe 3. A self edge (recursion) is outbound from the symbol exactly once
@@ -1124,19 +1320,41 @@ fn p4_a_large_inbound_population_is_counted_once_and_cheaply() {
 fn p3_recursion_and_nested_module_symbols_resolve() {
     let fx = kinds_fixture();
     let mut report = String::new();
-    for query in ["kinds.rs::recurse", "recurse", "kinds.rs::outer", "outer", "deep", "kinds.rs::inner::deep", "kinds.rs::inner.deep"] {
+    for query in [
+        "kinds.rs::recurse",
+        "recurse",
+        "kinds.rs::outer",
+        "outer",
+        "deep",
+        "kinds.rs::inner::deep",
+        "kinds.rs::inner.deep",
+    ] {
         let s = store_answer(&fx, query, 8_000);
         let m = memory_answer(&fx, query, 8_000);
-        report.push_str(&format!("  {query}: store avail={} items={:?} / memory avail={} items={}\n",
-            s.available, s.items.iter().map(|r| (&r.1, &r.3, &r.4)).collect::<Vec<_>>(), m.available, m.items.len()));
+        report.push_str(&format!(
+            "  {query}: store avail={} items={:?} / memory avail={} items={}\n",
+            s.available,
+            s.items
+                .iter()
+                .map(|r| (&r.1, &r.3, &r.4))
+                .collect::<Vec<_>>(),
+            m.available,
+            m.items.len()
+        ));
         if !s.available || s.items.is_empty() {
-            report.push_str(&format!("    ^ no outbound edges for {query}: {:?}\n", s.refusal));
+            report.push_str(&format!(
+                "    ^ no outbound edges for {query}: {:?}\n",
+                s.refusal
+            ));
         }
     }
     eprintln!("{report}");
     let recurse = store_answer(&fx, "kinds.rs::recurse", 8_000);
     assert!(
-        recurse.items.iter().any(|r| r.1.ends_with("recurse") && r.3.ends_with("recurse")),
+        recurse
+            .items
+            .iter()
+            .any(|r| r.1.ends_with("recurse") && r.3.ends_with("recurse")),
         "the self-call must be an outbound edge of recurse: {recurse:?}"
     );
     let outer = store_answer(&fx, "outer", 8_000);
@@ -1144,5 +1362,9 @@ fn p3_recursion_and_nested_module_symbols_resolve() {
         outer.available && outer.items.iter().any(|r| r.3.ends_with("deep")),
         "outer calls inner::deep: {outer:?}"
     );
-    assert_parity(&fx, &["kinds.rs::recurse", "recurse", "outer", "deep"], &[8_000]);
+    assert_parity(
+        &fx,
+        &["kinds.rs::recurse", "recurse", "outer", "deep"],
+        &[8_000],
+    );
 }

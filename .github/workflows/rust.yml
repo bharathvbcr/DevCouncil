@@ -59,7 +59,6 @@ on:
 
 permissions:
   contents: read
-  actions: write
 
 defaults:
   run:
@@ -81,6 +80,12 @@ concurrency:
 jobs:
   test:
     name: test (${{ matrix.os }})
+    timeout-minutes: 120
+    # upload-artifact writes a run artifact. Cache saves on the other jobs
+    # succeed with contents: read; this is the only job that uploads.
+    permissions:
+      contents: read
+      actions: write
     env:
       RAYON_NUM_THREADS: "2"
     runs-on: ${{ matrix.os }}
@@ -171,6 +176,7 @@ jobs:
   # feature-off are the only ones proving that configuration works at all.
   feature-off:
     name: embedder shape (--no-default-features)
+    timeout-minutes: 60
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -216,6 +222,7 @@ jobs:
 
   gates:
     name: verify.sh gates
+    timeout-minutes: 90
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -254,6 +261,7 @@ jobs:
   # green run here means the check can see the defect it guards against.
   static-musl:
     name: static musl host (engine + panic firewall)
+    timeout-minutes: 45
     runs-on: ubuntu-latest
     # The workflow defaults run steps to rust/; these paths are repo-root.
     defaults:
@@ -314,6 +322,7 @@ jobs:
   # toolchain, a pre-26 SDK or no Metal device; every other failure fails.
   sparse-encode:
     name: dc-sparse-encode (macos-15)
+    timeout-minutes: 45
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7

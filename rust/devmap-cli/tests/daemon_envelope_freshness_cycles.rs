@@ -116,7 +116,10 @@ fn edit(root: &Path, cycle: usize) {
             format!("def added_{cycle}(x):\n    return x * {cycle}\n"),
         ),
         _ => std::fs::remove_file(src.join("m2.py")).or_else(|_| {
-            std::fs::write(src.join("m2.py"), format!("def back_{cycle}():\n    return 1\n"))
+            std::fs::write(
+                src.join("m2.py"),
+                format!("def back_{cycle}():\n    return 1\n"),
+            )
         }),
     }
     .unwrap_or_else(|error| panic!("cycle {cycle}: the edit failed: {error}"));
@@ -173,7 +176,11 @@ async fn the_daemon_envelope_never_lies_about_freshness_across_edit_rebuild_cycl
         // Quiescent: ask for a verified verdict, then query. `status` verifies,
         // so the next query may say `true`, and it is what makes (1) possible.
         let status = ipc(&socket, json!({"cmd": "status"})).await;
-        assert_eq!(status["result"]["source_freshness"], json!(true), "cycle {cycle}: {status}");
+        assert_eq!(
+            status["result"]["source_freshness"],
+            json!(true),
+            "cycle {cycle}: {status}"
+        );
         let (fresh, _) = verdict(&ipc(&socket, json!({"cmd": "search", "query": "base_0"})).await);
         if fresh != Some(true) {
             tally.violations.push(format!(
@@ -184,7 +191,10 @@ async fn the_daemon_envelope_never_lies_about_freshness_across_edit_rebuild_cycl
         let before_generation = generation(&reader);
         edit(&root, cycle);
         let differs_before = tree_differs(&root, &reader);
-        assert!(differs_before || generation(&reader) != before_generation, "cycle {cycle}: the edit changed nothing the oracle can see");
+        assert!(
+            differs_before || generation(&reader) != before_generation,
+            "cycle {cycle}: the edit changed nothing the oracle can see"
+        );
 
         // Racy query: the daemon may or may not have rebuilt yet.
         let query = if cycle % 2 == 0 {

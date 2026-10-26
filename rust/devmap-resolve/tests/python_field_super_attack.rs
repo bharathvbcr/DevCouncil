@@ -75,7 +75,10 @@ const B_RUN: &str = "b.py::B.run";
 fn assert_no_wrong(res: &ResolutionResult, caller: &str, wrong: &[&str]) {
     let got = methods(res, caller);
     for w in wrong {
-        assert!(!got.iter().any(|g| g == w), "bound wrong target {w}: {got:?}");
+        assert!(
+            !got.iter().any(|g| g == w),
+            "bound wrong target {w}: {got:?}"
+        );
     }
 }
 
@@ -145,7 +148,10 @@ fn field_ternary_binds_nothing() {
 fn field_tuple_assign_binds_nothing_wrong() {
     // x is B, y is A: x must not be typed A.
     let got = run_holder("        self.x, self.y = B(), A()");
-    assert!(!got.contains(&A_RUN.to_string()), "x is B, bound A: {got:?}");
+    assert!(
+        !got.contains(&A_RUN.to_string()),
+        "x is B, bound A: {got:?}"
+    );
 }
 
 #[test]
@@ -176,7 +182,10 @@ fn field_walrus_rhs_binds_nothing_wrong() {
 fn field_attribute_call_rhs_is_not_a_constructor() {
     // `self.x = A().build()` returns whatever build returns, not A.
     let got = run_holder("        self.x = A().build()");
-    assert!(!got.contains(&A_RUN.to_string()), "typed field as A: {got:?}");
+    assert!(
+        !got.contains(&A_RUN.to_string()),
+        "typed field as A: {got:?}"
+    );
 }
 
 #[test]
@@ -195,7 +204,10 @@ fn field_subscript_rhs() {
 fn field_method_call_on_constructor_arg_rhs() {
     // callee-position call inside arguments of a different callee
     let got = run_holder("        self.x = B(A())");
-    assert!(!got.contains(&A_RUN.to_string()), "typed as the argument's class: {got:?}");
+    assert!(
+        !got.contains(&A_RUN.to_string()),
+        "typed as the argument's class: {got:?}"
+    );
 }
 
 #[test]
@@ -221,7 +233,10 @@ fn field_annotation_wins_over_later_initializer() {
         ),
     ]);
     let got = methods(&r, "h.py::H.go");
-    assert!(!got.contains(&B_RUN.to_string()), "initializer beat annotation: {got:?}");
+    assert!(
+        !got.contains(&B_RUN.to_string()),
+        "initializer beat annotation: {got:?}"
+    );
 }
 
 #[test]
@@ -235,7 +250,10 @@ fn field_class_level_annotation_wins_over_none_and_initializer() {
         ),
     ]);
     let got = methods(&r, "h.py::H.go");
-    assert!(!got.contains(&B_RUN.to_string()), "initializer beat class annotation: {got:?}");
+    assert!(
+        !got.contains(&B_RUN.to_string()),
+        "initializer beat class annotation: {got:?}"
+    );
 }
 
 #[test]
@@ -263,7 +281,10 @@ fn field_assigned_in_nested_function_counts_as_a_second_shape() {
         ),
     ]);
     let got = methods(&r, "h.py::H.go");
-    assert!(got.is_empty(), "field assigned two shapes (one in a closure) still typed: {got:?}");
+    assert!(
+        got.is_empty(),
+        "field assigned two shapes (one in a closure) still typed: {got:?}"
+    );
 }
 
 #[test]
@@ -401,8 +422,14 @@ fn field_same_name_in_nested_classes_in_one_file() {
     ]);
     let one = methods(&r, "h.py::One.Inner.go");
     let two = methods(&r, "h.py::Two.Inner.go");
-    assert!(!one.contains(&B_RUN.to_string()), "One.Inner typed B: {one:?}");
-    assert!(!two.contains(&A_RUN.to_string()), "Two.Inner typed A: {two:?}");
+    assert!(
+        !one.contains(&B_RUN.to_string()),
+        "One.Inner typed B: {one:?}"
+    );
+    assert!(
+        !two.contains(&A_RUN.to_string()),
+        "Two.Inner typed A: {two:?}"
+    );
 }
 
 #[test]
@@ -441,7 +468,11 @@ fn field_same_class_and_field_in_two_files_does_not_leak() {
         ("h3.py", "class H:\n    def go(self):\n        return self.e.run()\n"),
     ]);
     assert_eq!(methods(&r, "h2.py::H.go"), [B_RUN]);
-    assert!(methods(&r, "h3.py::H.go").is_empty(), "{:?}", methods(&r, "h3.py::H.go"));
+    assert!(
+        methods(&r, "h3.py::H.go").is_empty(),
+        "{:?}",
+        methods(&r, "h3.py::H.go")
+    );
 }
 
 #[test]
@@ -507,7 +538,10 @@ fn field_walrus_target_is_not_an_attribute_assignment() {
 fn field_dunder_slots_or_with_target() {
     // `with A() as self.x` binds the context manager's __enter__ result.
     let got = run_holder("        with A() as self.x:\n            pass");
-    assert!(!got.contains(&A_RUN.to_string()), "with-target typed as A: {got:?}");
+    assert!(
+        !got.contains(&A_RUN.to_string()),
+        "with-target typed as A: {got:?}"
+    );
 }
 
 #[test]
@@ -562,7 +596,10 @@ fn factory_string_annotation_binds_or_abstains() {
 
 #[test]
 fn factory_optional_binds_or_abstains() {
-    let got = factory_case("def make() -> Optional[A]:\n    ...", "from typing import Optional\n");
+    let got = factory_case(
+        "def make() -> Optional[A]:\n    ...",
+        "from typing import Optional\n",
+    );
     assert!(is_a_or_nothing(&got), "{got:?}");
 }
 
@@ -581,7 +618,10 @@ fn factory_list_return_does_not_type_as_element() {
 #[test]
 fn factory_type_of_return_does_not_type_as_instance() {
     let got = factory_case("def make() -> type[A]:\n    ...", "");
-    assert!(got.is_empty(), "type[A] factory typed as instance A: {got:?}");
+    assert!(
+        got.is_empty(),
+        "type[A] factory typed as instance A: {got:?}"
+    );
 }
 
 #[test]
@@ -638,7 +678,10 @@ fn factory_name_colliding_across_files_uses_the_imported_one() {
         ),
     ]);
     let got = methods(&r, "h.py::H.go");
-    assert!(!got.contains(&B_RUN.to_string()), "bound the namesake factory's type: {got:?}");
+    assert!(
+        !got.contains(&B_RUN.to_string()),
+        "bound the namesake factory's type: {got:?}"
+    );
 }
 
 #[test]
@@ -706,7 +749,10 @@ fn super_via_dotted_module_alias_base_collision() {
         ),
     ]);
     let got = methods(&r, "c.py::C.m");
-    assert!(!got.contains(&"other/mod.py::Base.m".to_string()), "bound wrong namesake: {got:?}");
+    assert!(
+        !got.contains(&"other/mod.py::Base.m".to_string()),
+        "bound wrong namesake: {got:?}"
+    );
 }
 
 #[test]
@@ -761,8 +807,14 @@ fn inherited_call_external_base_named_like_in_repo_class() {
 fn super_circular_inheritance_across_files_terminates() {
     let r = resolve_within(
         &[
-            ("a.py", "from b import B\n\nclass A(B):\n    def m(self):\n        return super().m()\n"),
-            ("b.py", "from a import A\n\nclass B(A):\n    def m(self):\n        return super().m()\n"),
+            (
+                "a.py",
+                "from b import B\n\nclass A(B):\n    def m(self):\n        return super().m()\n",
+            ),
+            (
+                "b.py",
+                "from a import A\n\nclass B(A):\n    def m(self):\n        return super().m()\n",
+            ),
         ],
         20,
     )
@@ -773,11 +825,18 @@ fn super_circular_inheritance_across_files_terminates() {
 #[test]
 fn super_self_inheritance_terminates() {
     let r = resolve_within(
-        &[("a.py", "class A(A):\n    def m(self):\n        return super().m()\n")],
+        &[(
+            "a.py",
+            "class A(A):\n    def m(self):\n        return super().m()\n",
+        )],
         20,
     )
     .expect("self inheritance hung");
-    assert!(methods(&r, "a.py::A.m").is_empty(), "{:?}", methods(&r, "a.py::A.m"));
+    assert!(
+        methods(&r, "a.py::A.m").is_empty(),
+        "{:?}",
+        methods(&r, "a.py::A.m")
+    );
 }
 
 fn deep_chain(n: usize) -> Vec<(String, String)> {
@@ -841,7 +900,10 @@ fn super_star_import_base_with_namesake_does_not_bind_namesake() {
         ),
     ]);
     let got = methods(&r, "c.py::C.m");
-    assert!(!got.contains(&"one.py::Base.m".to_string()), "star import bound the wrong Base: {got:?}");
+    assert!(
+        !got.contains(&"one.py::Base.m".to_string()),
+        "star import bound the wrong Base: {got:?}"
+    );
 }
 
 #[test]
@@ -852,7 +914,10 @@ fn super_base_reassigned_alias() {
         "class Base:\n    def m(self):\n        return 1\n\nclass Other:\n    def m(self):\n        return 2\n\nBase = Other\n\nclass C(Base):\n    def m(self):\n        return super().m()\n",
     )]);
     let got = methods(&r, "c.py::C.m");
-    assert!(!got.contains(&"c.py::Base.m".to_string()), "base was rebound to Other: {got:?}");
+    assert!(
+        !got.contains(&"c.py::Base.m".to_string()),
+        "base was rebound to Other: {got:?}"
+    );
 }
 
 #[test]
@@ -879,7 +944,11 @@ fn super_metaclass_only_class_has_no_base() {
         "c.py",
         "class M(type):\n    def m(cls):\n        return 9\n\nclass C(metaclass=M):\n    def m(self):\n        return super().m()\n",
     )]);
-    assert!(methods(&r, "c.py::C.m").is_empty(), "{:?}", methods(&r, "c.py::C.m"));
+    assert!(
+        methods(&r, "c.py::C.m").is_empty(),
+        "{:?}",
+        methods(&r, "c.py::C.m")
+    );
 }
 
 #[test]
@@ -888,7 +957,11 @@ fn super_conditional_class_definitions_abstain() {
         "c.py",
         "import os\nif os.name == 'nt':\n    class Base:\n        def m(self):\n            return 1\nelse:\n    class Base:\n        def m(self):\n            return 2\n\nclass C(Base):\n    def m(self):\n        return super().m()\n",
     )]);
-    assert!(methods(&r, "c.py::C.m").is_empty(), "{:?}", methods(&r, "c.py::C.m"));
+    assert!(
+        methods(&r, "c.py::C.m").is_empty(),
+        "{:?}",
+        methods(&r, "c.py::C.m")
+    );
 }
 
 #[test]
@@ -918,19 +991,29 @@ fn super_bfs_level_order_disagrees_with_c3_mro() {
         "class Y:\n    def m(self):\n        return 1\n\nclass X(Y):\n    pass\n\nclass B(X):\n    pass\n\nclass C:\n    def m(self):\n        return 3\n\nclass D(B, C):\n    def m(self):\n        return super().m()\n",
     )]);
     let got = methods(&r, "c.py::D.m");
-    assert!(!got.contains(&"c.py::C.m".to_string()), "BFS picked C.m but Python's MRO reaches Y.m first: {got:?}");
+    assert!(
+        !got.contains(&"c.py::C.m".to_string()),
+        "BFS picked C.m but Python's MRO reaches Y.m first: {got:?}"
+    );
 }
 
 #[test]
 fn super_builtin_base_makes_no_in_repo_edge() {
     let r = resolve(&[
-        ("lib.py", "class Reg:\n    def get(self, k):\n        return k\n"),
+        (
+            "lib.py",
+            "class Reg:\n    def get(self, k):\n        return k\n",
+        ),
         (
             "c.py",
             "class C(dict):\n    def get(self, k):\n        return super().get(k)\n",
         ),
     ]);
-    assert!(methods(&r, "c.py::C.get").is_empty(), "{:?}", methods(&r, "c.py::C.get"));
+    assert!(
+        methods(&r, "c.py::C.get").is_empty(),
+        "{:?}",
+        methods(&r, "c.py::C.get")
+    );
 }
 
 #[test]
@@ -940,7 +1023,11 @@ fn super_builtin_base_alongside_in_repo_base() {
         "c.py",
         "class Mixin:\n    def get(self, k):\n        return k\n\nclass C(dict, Mixin):\n    def get(self, k):\n        return super().get(k)\n",
     )]);
-    assert!(methods(&r, "c.py::C.get").is_empty(), "dict precedes Mixin in the MRO: {:?}", methods(&r, "c.py::C.get"));
+    assert!(
+        methods(&r, "c.py::C.get").is_empty(),
+        "dict precedes Mixin in the MRO: {:?}",
+        methods(&r, "c.py::C.get")
+    );
 }
 
 #[test]
@@ -963,7 +1050,10 @@ fn super_nested_same_name_classes_do_not_merge_bases() {
         "class BaseA:\n    def m(self):\n        return 1\n\nclass BaseB:\n    pass\n\nclass One:\n    class Inner(BaseA):\n        pass\n\nclass Two:\n    class Inner(BaseB):\n        def m(self):\n            return super().m()\n",
     )]);
     let got = methods(&r, "c.py::Two.Inner.m");
-    assert!(got.is_empty(), "Two.Inner(BaseB) reached BaseA through the other Inner: {got:?}");
+    assert!(
+        got.is_empty(),
+        "Two.Inner(BaseB) reached BaseA through the other Inner: {got:?}"
+    );
 }
 
 #[test]
@@ -983,7 +1073,11 @@ fn super_child_name_collision_across_files_uses_own_file_bases() {
         ("two.py", "class Other:\n    pass\n\nclass C(Other):\n    def m(self):\n        return super().m()\n"),
     ]);
     assert_eq!(methods(&r, "one.py::C.m"), ["one.py::Base.m"]);
-    assert!(methods(&r, "two.py::C.m").is_empty(), "{:?}", methods(&r, "two.py::C.m"));
+    assert!(
+        methods(&r, "two.py::C.m").is_empty(),
+        "{:?}",
+        methods(&r, "two.py::C.m")
+    );
 }
 
 #[test]
@@ -996,7 +1090,10 @@ fn super_in_class_defined_inside_function_with_namesake_elsewhere() {
         ),
     ]);
     let got = methods(&r, "c.py::f.C.m");
-    assert!(!got.contains(&"other.py::Base.m".to_string()), "local class resolved to the namesake: {got:?}");
+    assert!(
+        !got.contains(&"other.py::Base.m".to_string()),
+        "local class resolved to the namesake: {got:?}"
+    );
 }
 
 #[test]
@@ -1037,14 +1134,19 @@ fn stress_time(n: usize, prefix: &str) -> Duration {
     for i in 0..n {
         src.push_str(&format!("        {prefix}f{i} = A()\n"));
     }
-    src.push_str(&format!("    def go(self):\n        return {prefix}f{}.run()\n", n - 1));
+    src.push_str(&format!(
+        "    def go(self):\n        return {prefix}f{}.run()\n",
+        n - 1
+    ));
     (0..3)
         .map(|_| {
             let owned = vec![
                 ("a.py".to_string(), A_SRC.to_string()),
                 ("big.py".to_string(), src.clone()),
             ];
-            resolve_owned_within(owned, 300).expect("stress input hung").1
+            resolve_owned_within(owned, 300)
+                .expect("stress input hung")
+                .1
         })
         .min()
         .unwrap()

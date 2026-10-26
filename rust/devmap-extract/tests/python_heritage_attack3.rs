@@ -9,13 +9,21 @@ fn heritage(path: &str, source: &str) -> Vec<(String, usize, usize)> {
     extract_file(path, source)
         .references
         .iter()
-        .filter(|r| matches!(r.kind, ReferenceKind::Heritage | ReferenceKind::HeritageInterface))
+        .filter(|r| {
+            matches!(
+                r.kind,
+                ReferenceKind::Heritage | ReferenceKind::HeritageInterface
+            )
+        })
         .map(|r| (r.name.clone(), r.span.start_byte, r.span.end_byte))
         .collect()
 }
 
 fn names(path: &str, source: &str) -> Vec<String> {
-    heritage(path, source).into_iter().map(|(n, _, _)| n).collect()
+    heritage(path, source)
+        .into_iter()
+        .map(|(n, _, _)| n)
+        .collect()
 }
 
 fn key(r: &ExtractedReference) -> (usize, usize, String) {
@@ -26,19 +34,49 @@ fn key(r: &ExtractedReference) -> (usize, usize, String) {
 /// them must still be ordered `(start, end, name)`: the base sort, which the
 /// Python tie-break must not have touched.
 const NON_PYTHON: &[(&str, &str)] = &[
-    ("w.ts", "class A extends a.b.C implements p.q.I {}\nclass B extends Zed.mid.base {}\n"),
-    ("w.tsx", "class A extends React.Component {}\nclass B extends Zed.mid.base {}\n"),
-    ("W.java", "class A extends a.b.C implements p.q.I, z.y.J {}\nclass B extends Zed.mid.base {}\n"),
-    ("W.kt", "class A : a.b.C(), p.q.I\nclass B : Zed.mid.base()\n"),
-    ("W.cs", "class A : a.b.C, N.M.I {}\nclass B : Zed.mid.base {}\n"),
-    ("w.rb", "class A < Zed::mid::Base\nend\nclass B < A::B::C\nend\n"),
-    ("W.scala", "class A extends a.b.C with p.q.T\nclass B extends Zed.mid.base\n"),
-    ("w.swift", "class A: a.b.C, p.Proto {}\nclass B: Zed.mid.base {}\n"),
-    ("w.php", "<?php\nclass A extends \\a\\b\\C implements \\p\\I {}\n"),
+    (
+        "w.ts",
+        "class A extends a.b.C implements p.q.I {}\nclass B extends Zed.mid.base {}\n",
+    ),
+    (
+        "w.tsx",
+        "class A extends React.Component {}\nclass B extends Zed.mid.base {}\n",
+    ),
+    (
+        "W.java",
+        "class A extends a.b.C implements p.q.I, z.y.J {}\nclass B extends Zed.mid.base {}\n",
+    ),
+    (
+        "W.kt",
+        "class A : a.b.C(), p.q.I\nclass B : Zed.mid.base()\n",
+    ),
+    (
+        "W.cs",
+        "class A : a.b.C, N.M.I {}\nclass B : Zed.mid.base {}\n",
+    ),
+    (
+        "w.rb",
+        "class A < Zed::mid::Base\nend\nclass B < A::B::C\nend\n",
+    ),
+    (
+        "W.scala",
+        "class A extends a.b.C with p.q.T\nclass B extends Zed.mid.base\n",
+    ),
+    (
+        "w.swift",
+        "class A: a.b.C, p.Proto {}\nclass B: Zed.mid.base {}\n",
+    ),
+    (
+        "w.php",
+        "<?php\nclass A extends \\a\\b\\C implements \\p\\I {}\n",
+    ),
     ("w.cpp", "class A : public a::b::C, private z::D {};\n"),
     ("w.dart", "class A extends a.C with M implements I {}\n"),
     ("w.rs", "struct S;\nimpl a::b::T for S {}\n"),
-    ("w.go", "package w\ntype A struct {\n    pkg.Base\n    *other.Ptr\n}\n"),
+    (
+        "w.go",
+        "package w\ntype A struct {\n    pkg.Base\n    *other.Ptr\n}\n",
+    ),
     ("w.sol", "contract A is a.B, C {}\n"),
 ];
 
@@ -49,7 +87,10 @@ fn non_python_references_keep_the_start_end_name_sort() {
         let keys: Vec<_> = refs.iter().map(key).collect();
         let mut sorted = keys.clone();
         sorted.sort();
-        assert_eq!(keys, sorted, "{path}: references are no longer name-sorted on a tie");
+        assert_eq!(
+            keys, sorted,
+            "{path}: references are no longer name-sorted on a tie"
+        );
     }
 }
 
@@ -125,9 +166,15 @@ fn a_dotted_base_whose_member_is_the_class_name_keeps_every_segment() {
     // the member shares the declarer's name. The self-reference skip must not
     // delete the member (or a qualifier segment) of a dotted base, or the
     // resolver reads `torch.autograd` / `models` as the base.
-    assert_eq!(names("w.py", "class Model(models.Model):\n    pass\n"), ["Model", "models"]);
     assert_eq!(
-        names("w.py", "class Function(torch.autograd.Function):\n    pass\n"),
+        names("w.py", "class Model(models.Model):\n    pass\n"),
+        ["Model", "models"]
+    );
+    assert_eq!(
+        names(
+            "w.py",
+            "class Function(torch.autograd.Function):\n    pass\n"
+        ),
         ["Function", "torch", "autograd"]
     );
 }
@@ -146,7 +193,10 @@ fn a_dotted_base_with_a_qualifier_named_like_the_class_keeps_every_segment() {
 
 #[test]
 fn comment_inside_a_dotted_base_is_still_a_dotted_base() {
-    let n = names("w.py", "class C(\n    a  # the module\n    .Base\n):\n    pass\n");
+    let n = names(
+        "w.py",
+        "class C(\n    a  # the module\n    .Base\n):\n    pass\n",
+    );
     assert_eq!(n, ["Base", "a"], "{n:?}");
 }
 
@@ -167,7 +217,12 @@ fn opaque_marker_is_never_a_name_in_a_non_python_language() {
 
 #[test]
 fn a_class_named_in_a_string_base_or_none_is_opaque_not_a_name() {
-    for head in ["class C(None):", "class C(\"Base\"):", "class C(lambda: 1):", "class C((a, b)):"] {
+    for head in [
+        "class C(None):",
+        "class C(\"Base\"):",
+        "class C(lambda: 1):",
+        "class C((a, b)):",
+    ] {
         let n = names("w.py", &format!("{head}\n    pass\n"));
         assert_eq!(n, [devmap_extract::model::OPAQUE_BASE], "{head}: {n:?}");
     }

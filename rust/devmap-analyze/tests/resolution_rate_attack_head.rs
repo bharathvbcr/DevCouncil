@@ -56,7 +56,10 @@ fn p2_top_level_fields_reproduce_the_headline() {
     for i in 0..30 {
         vendored.push_str(&format!("def v{i}():\n    return m{i}()\n"));
     }
-    let ex = vec![extract_file("lib.py", PY), extract_file("vendor/d.py", &vendored)];
+    let ex = vec![
+        extract_file("lib.py", PY),
+        extract_file("vendor/d.py", &vendored),
+    ];
     let rate = rate_of(&ex);
     eprintln!("{rate:#?}");
     // Repointed to measured_* by Opus ruling 2026-10-19: the raw totals are a public contract kept for attribution coverage; the headline's denominators are the additive measured_* fields.

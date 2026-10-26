@@ -55,6 +55,7 @@ concurrency:
 jobs:
   rust:
     name: components (${{ matrix.os }})
+    timeout-minutes: 90
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -111,6 +112,7 @@ jobs:
 
   go:
     name: clients (${{ matrix.os }})
+    timeout-minutes: 120
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -255,6 +257,7 @@ jobs:
   # gussetfn is build-tagged and answers ErrUnsupported there.
   go-windows:
     name: clients (windows-latest)
+    timeout-minutes: 120
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
@@ -290,6 +293,7 @@ jobs:
   # Known advisories in the Cargo.lock the kernel and the dc-* crates ship with.
   supply-chain:
     name: cargo advisories
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

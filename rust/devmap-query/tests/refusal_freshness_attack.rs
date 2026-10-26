@@ -152,7 +152,10 @@ pub(crate) fn sweep(engine: &StoreQueryEngine) -> (Seen, Vec<String>) {
     }
 
     for q in ["a", "chain.py", "nope_unknown", "test_chain.py"] {
-        resp!(format!("dependencies({q:?})"), engine.dependencies(req(q, 3)));
+        resp!(
+            format!("dependencies({q:?})"),
+            engine.dependencies(req(q, 3))
+        );
         resp!(
             format!("dependencies_at_rung({q:?})"),
             engine.dependencies_at_rung(req(q, 3), Some(Rung::Deterministic))
@@ -169,7 +172,10 @@ pub(crate) fn sweep(engine: &StoreQueryEngine) -> (Seen, Vec<String>) {
         );
         match engine.impact_layered(req(q, 3)) {
             Ok(l) => {
-                rec!(format!("impact_layered({q:?}).edges"), l.edges.source_freshness);
+                rec!(
+                    format!("impact_layered({q:?}).edges"),
+                    l.edges.source_freshness
+                );
                 rec!(
                     format!("impact_layered({q:?}).layers"),
                     l.blast_radius.layers.source_freshness
@@ -192,12 +198,22 @@ pub(crate) fn sweep(engine: &StoreQueryEngine) -> (Seen, Vec<String>) {
             engine.trace_between(pair(from, to, depth))
         );
     }
-    for targets in [vec!["a", "nope_unknown"], vec!["nope_unknown"], vec!["chain.py"]] {
+    for targets in [
+        vec!["a", "nope_unknown"],
+        vec!["nope_unknown"],
+        vec!["chain.py"],
+    ] {
         match engine.neighbors(&s(&targets), 4_000, 0.0, 2) {
             Ok(list) => {
                 for n in list {
-                    rec!(format!("neighbors({targets:?}).{}.callers", n.target), n.callers.source_freshness);
-                    rec!(format!("neighbors({targets:?}).{}.callees", n.target), n.callees.source_freshness);
+                    rec!(
+                        format!("neighbors({targets:?}).{}.callers", n.target),
+                        n.callers.source_freshness
+                    );
+                    rec!(
+                        format!("neighbors({targets:?}).{}.callees", n.target),
+                        n.callees.source_freshness
+                    );
                 }
             }
             Err(e) => errored.push(format!("neighbors({targets:?}): {e}")),
@@ -205,8 +221,14 @@ pub(crate) fn sweep(engine: &StoreQueryEngine) -> (Seen, Vec<String>) {
         match engine.neighbors_at_rung(&s(&targets), 4_000, 0.0, 2, Some(Rung::Deterministic)) {
             Ok(list) => {
                 for n in list {
-                    rec!(format!("neighbors_at_rung({targets:?}).{}.callers", n.target), n.callers.source_freshness);
-                    rec!(format!("neighbors_at_rung({targets:?}).{}.callees", n.target), n.callees.source_freshness);
+                    rec!(
+                        format!("neighbors_at_rung({targets:?}).{}.callers", n.target),
+                        n.callers.source_freshness
+                    );
+                    rec!(
+                        format!("neighbors_at_rung({targets:?}).{}.callees", n.target),
+                        n.callees.source_freshness
+                    );
                 }
             }
             Err(e) => errored.push(format!("neighbors_at_rung({targets:?}): {e}")),
@@ -215,11 +237,23 @@ pub(crate) fn sweep(engine: &StoreQueryEngine) -> (Seen, Vec<String>) {
     for q in ["a", "nope_unknown", "  "] {
         match engine.explore(q, 5, 8_000, 0.0, 2) {
             Ok(r) => {
-                rec!(format!("explore({q:?}).definitions"), r.definitions.source_freshness);
-                rec!(format!("explore({q:?}).layers"), r.blast_radius.layers.source_freshness);
+                rec!(
+                    format!("explore({q:?}).definitions"),
+                    r.definitions.source_freshness
+                );
+                rec!(
+                    format!("explore({q:?}).layers"),
+                    r.blast_radius.layers.source_freshness
+                );
                 for d in &r.definitions.items {
-                    rec!(format!("explore({q:?}).{}.callers", d.symbol_name), d.callers.source_freshness);
-                    rec!(format!("explore({q:?}).{}.callees", d.symbol_name), d.callees.source_freshness);
+                    rec!(
+                        format!("explore({q:?}).{}.callers", d.symbol_name),
+                        d.callers.source_freshness
+                    );
+                    rec!(
+                        format!("explore({q:?}).{}.callees", d.symbol_name),
+                        d.callees.source_freshness
+                    );
                 }
             }
             Err(e) => errored.push(format!("explore({q:?}): {e}")),
@@ -228,8 +262,14 @@ pub(crate) fn sweep(engine: &StoreQueryEngine) -> (Seen, Vec<String>) {
     for targets in [vec!["chain.py"], vec!["d"], vec!["nope_unknown"], vec![]] {
         match engine.affected_tests(&s(&targets), 4_000, 0.0, 3) {
             Ok(r) => {
-                rec!(format!("affected_tests({targets:?}).tests"), r.tests.source_freshness);
-                rec!(format!("affected_tests({targets:?}).layers"), r.blast_radius.layers.source_freshness);
+                rec!(
+                    format!("affected_tests({targets:?}).tests"),
+                    r.tests.source_freshness
+                );
+                rec!(
+                    format!("affected_tests({targets:?}).layers"),
+                    r.blast_radius.layers.source_freshness
+                );
             }
             Err(e) => errored.push(format!("affected_tests({targets:?}): {e}")),
         }
@@ -240,12 +280,18 @@ pub(crate) fn sweep(engine: &StoreQueryEngine) -> (Seen, Vec<String>) {
         Err(e) => errored.push(format!("clones: {e}")),
     }
     for q in ["chain", "zzzqqq_nothing", "   "] {
-        resp!(format!("search_semantic({q:?})"), engine.search_semantic(q, 4_000));
+        resp!(
+            format!("search_semantic({q:?})"),
+            engine.search_semantic(q, 4_000)
+        );
         resp!(format!("ask({q:?})"), engine.ask(q, 4_000, 0.0));
         match engine.ask_evidence(q, 4_000, 0.0) {
             Ok(p) => {
                 rec!(format!("ask_evidence({q:?}).pack"), p.source_freshness);
-                rec!(format!("ask_evidence({q:?}).related_tests"), p.related_tests.source_freshness);
+                rec!(
+                    format!("ask_evidence({q:?}).related_tests"),
+                    p.related_tests.source_freshness
+                );
             }
             Err(e) => errored.push(format!("ask_evidence({q:?}): {e}")),
         }
@@ -259,11 +305,17 @@ pub(crate) fn sweep(engine: &StoreQueryEngine) -> (Seen, Vec<String>) {
         Err(e) => errored.push(format!("skeleton(not_there.py): {e}")),
     }
     match engine.preview("chain.py", "def a():\n    return 2\n", 4_000, 0.0) {
-        Ok(r) => rec!("preview(chain.py).broken_callers", r.broken_callers.source_freshness),
+        Ok(r) => rec!(
+            "preview(chain.py).broken_callers",
+            r.broken_callers.source_freshness
+        ),
         Err(e) => errored.push(format!("preview: {e}")),
     }
     match engine.preview("brand_new.py", "def n():\n    return 2\n", 4_000, 0.0) {
-        Ok(r) => rec!("preview(new).broken_callers", r.broken_callers.source_freshness),
+        Ok(r) => rec!(
+            "preview(new).broken_callers",
+            r.broken_callers.source_freshness
+        ),
         Err(e) => errored.push(format!("preview(new): {e}")),
     }
     (seen, errored)
@@ -281,7 +333,11 @@ fn offenders(seen: &Seen, want: &SourceFreshness) -> Vec<String> {
 }
 
 fn assert_all_match(seen: &Seen, want: &SourceFreshness, scenario: &str) {
-    assert!(seen.len() > 60, "sweep too thin to mean anything: {}", seen.len());
+    assert!(
+        seen.len() > 60,
+        "sweep too thin to mean anything: {}",
+        seen.len()
+    );
     let bad = offenders(seen, want);
     assert!(
         bad.is_empty(),
@@ -299,12 +355,20 @@ fn p1_every_response_carries_the_stores_verified_verdict() {
     let status = fx.store.status("t").unwrap();
     assert_eq!(status.source_freshness, Some(true), "{status:?}");
     let want = expected(&fx.store);
-    assert_eq!(want.fresh, Some(true), "precondition: a real verdict {want:?}");
+    assert_eq!(
+        want.fresh,
+        Some(true),
+        "precondition: a real verdict {want:?}"
+    );
     let engine = StoreQueryEngine::new(&fx.store);
     let (seen, errored) = sweep(&engine);
     eprintln!("errored (no Response to inspect): {errored:#?}");
     assert_all_match(&seen, &want, "fresh");
-    assert!(seen.iter().all(|(_, f)| !f.reason.clone().unwrap_or_default().contains(NO_GENERATION)));
+    assert!(seen.iter().all(|(_, f)| !f
+        .reason
+        .clone()
+        .unwrap_or_default()
+        .contains(NO_GENERATION)));
 }
 
 // Probe 1b: with the cache never primed, "not checked" is the store's own
@@ -314,7 +378,10 @@ fn p1b_unprimed_store_every_response_says_not_checked_never_no_generation() {
     let fx = fixture("p1b", None);
     let want = expected(&fx.store);
     assert_eq!(want.fresh, None);
-    assert!(want.reason.clone().unwrap().contains("not checked"), "{want:?}");
+    assert!(
+        want.reason.clone().unwrap().contains("not checked"),
+        "{want:?}"
+    );
     let (seen, _) = sweep(&StoreQueryEngine::new(&fx.store));
     assert_all_match(&seen, &want, "unprimed");
 }
@@ -324,12 +391,24 @@ fn p1b_unprimed_store_every_response_says_not_checked_never_no_generation() {
 fn p3_stale_store_refusals_report_stale_like_successes() {
     let fx = fixture("p3", None);
     fx.store.status("t").unwrap();
-    fs::write(fx.root.join("chain.py"), format!("{CHAIN}\n\ndef extra():\n    return 9\n")).unwrap();
-    fs::write(fx.root.join("brand_new_file.py"), "def z():\n    return 0\n").unwrap();
+    fs::write(
+        fx.root.join("chain.py"),
+        format!("{CHAIN}\n\ndef extra():\n    return 9\n"),
+    )
+    .unwrap();
+    fs::write(
+        fx.root.join("brand_new_file.py"),
+        "def z():\n    return 0\n",
+    )
+    .unwrap();
     let status = fx.store.status("t").unwrap();
     assert_eq!(status.source_freshness, Some(false), "{status:?}");
     let want = expected(&fx.store);
-    assert_eq!(want.fresh, Some(false), "precondition: stale verdict {want:?}");
+    assert_eq!(
+        want.fresh,
+        Some(false),
+        "precondition: stale verdict {want:?}"
+    );
     assert!(want.reason.is_some());
     let (seen, _) = sweep(&StoreQueryEngine::new(&fx.store));
     assert_all_match(&seen, &want, "stale");
@@ -375,7 +454,13 @@ fn p3c_newer_generation_than_the_cache_refusals_say_so_too() {
         )
         .unwrap();
     let want = expected(&fx.store);
-    assert!(want.reason.clone().unwrap_or_default().contains("cached source freshness"), "{want:?}");
+    assert!(
+        want.reason
+            .clone()
+            .unwrap_or_default()
+            .contains("cached source freshness"),
+        "{want:?}"
+    );
     let (seen, _) = sweep(&StoreQueryEngine::new(&fx.store));
     assert_all_match(&seen, &want, "cache-older-than-generation");
 }
@@ -422,20 +507,32 @@ fn p2b_generation_deleted_mid_session_is_never_fresh() {
         conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
         conn.execute_batch("DELETE FROM generations;").unwrap();
     }
-    assert_eq!(fx.store.latest_generation_id().unwrap(), None, "precondition");
+    assert_eq!(
+        fx.store.latest_generation_id().unwrap(),
+        None,
+        "precondition"
+    );
     let (seen, _) = sweep(&engine);
     let bad: Vec<String> = seen
         .iter()
         .filter(|(_, f)| f.fresh == Some(true) || f.generation_id.is_some())
         .map(|(n, f)| format!("{n}: {f:?}"))
         .collect();
-    assert!(bad.is_empty(), "claims a generation after it was deleted:\n{}", bad.join("\n"));
+    assert!(
+        bad.is_empty(),
+        "claims a generation after it was deleted:\n{}",
+        bad.join("\n")
+    );
     let canned: Vec<String> = seen
         .iter()
         .filter(|(_, f)| !f.reason.clone().unwrap_or_default().contains(NO_GENERATION))
         .map(|(n, f)| format!("{n}: {f:?}"))
         .collect();
-    assert!(canned.is_empty(), "deleted generation not reported:\n{}", canned.join("\n"));
+    assert!(
+        canned.is_empty(),
+        "deleted generation not reported:\n{}",
+        canned.join("\n")
+    );
 }
 
 // Probe 4: both halves of a layered impact carry the same freshness, on every
@@ -471,7 +568,12 @@ fn p4b_halves_with_different_outcomes_still_share_freshness() {
     let fx = fixture("p4c", None);
     fx.store.status("t").unwrap();
     let engine = StoreQueryEngine::new(&fx.store);
-    for (q, depth, budget) in [("a", 0usize, 8_000u32), ("a", 3, 0), ("a", 3, 1), ("a", 3, 2)] {
+    for (q, depth, budget) in [
+        ("a", 0usize, 8_000u32),
+        ("a", 3, 0),
+        ("a", 3, 1),
+        ("a", 3, 2),
+    ] {
         let mut r = req(q, depth);
         r.token_budget = budget;
         let layered = engine.impact_layered(r).unwrap();
@@ -501,13 +603,21 @@ fn p7_in_memory_engine_never_implies_a_generation() {
     let mut all: Vec<(String, SourceFreshness, bool)> = Vec::new();
     for q in ["a", "d", "nope_unknown", "chain.py", "  "] {
         let r = engine.search(req(q, 3));
-        all.push((format!("search({q:?})"), r.source_freshness, r.unresolved_namesakes.is_some()));
+        all.push((
+            format!("search({q:?})"),
+            r.source_freshness,
+            r.unresolved_namesakes.is_some(),
+        ));
         for (name, r) in [
             ("impact", engine.impact(req(q, 3))),
             ("trace", engine.trace(req(q, 3))),
             ("dependencies", engine.dependencies(req(q, 3))),
         ] {
-            all.push((format!("{name}({q:?})"), r.source_freshness, r.unresolved_namesakes.is_some()));
+            all.push((
+                format!("{name}({q:?})"),
+                r.source_freshness,
+                r.unresolved_namesakes.is_some(),
+            ));
         }
     }
     let bad: Vec<String> = all
@@ -520,7 +630,11 @@ fn p7_in_memory_engine_never_implies_a_generation() {
         })
         .map(|(n, f, ns)| format!("{n}: {f:?} namesakes={ns}"))
         .collect();
-    assert!(bad.is_empty(), "in-memory freshness implies a generation:\n{}", bad.join("\n"));
+    assert!(
+        bad.is_empty(),
+        "in-memory freshness implies a generation:\n{}",
+        bad.join("\n")
+    );
 }
 
 // Probe 1 (store side): the refusal's unresolved_namesakes, when present, must
@@ -545,7 +659,11 @@ fn p1c_namesakes_generation_and_freshness_never_contradict() {
         }
         let l = engine.impact_layered(req(q, 3)).unwrap();
         if let Some(n) = &l.edges.unresolved_namesakes {
-            assert_eq!(l.edges.source_freshness.generation_id, Some(n.generation_id), "{q:?} layered");
+            assert_eq!(
+                l.edges.source_freshness.generation_id,
+                Some(n.generation_id),
+                "{q:?} layered"
+            );
         }
         if let Some(n) = &l.blast_radius.layers.unresolved_namesakes {
             assert_eq!(
@@ -558,7 +676,10 @@ fn p1c_namesakes_generation_and_freshness_never_contradict() {
 }
 
 fn refused<T>(r: &devmap_query::Response<T>) -> bool {
-    matches!(r.resolution, devmap_query::ResolutionAvailability::Unavailable { .. })
+    matches!(
+        r.resolution,
+        devmap_query::ResolutionAvailability::Unavailable { .. }
+    )
 }
 
 /// Collect (name, refused, freshness) for the surfaces the sweep flagged.
@@ -566,19 +687,45 @@ fn flagged_surfaces(engine: &StoreQueryEngine) -> Vec<(String, bool, SourceFresh
     let mut out = Vec::new();
     for q in ["a", "nope_unknown", "  "] {
         let r = engine.explore(q, 5, 8_000, 0.0, 2).unwrap();
-        out.push((format!("explore({q:?}).definitions"), refused(&r.definitions), r.definitions.source_freshness.clone()));
-        out.push((format!("explore({q:?}).layers"), refused(&r.blast_radius.layers), r.blast_radius.layers.source_freshness.clone()));
+        out.push((
+            format!("explore({q:?}).definitions"),
+            refused(&r.definitions),
+            r.definitions.source_freshness.clone(),
+        ));
+        out.push((
+            format!("explore({q:?}).layers"),
+            refused(&r.blast_radius.layers),
+            r.blast_radius.layers.source_freshness.clone(),
+        ));
     }
     for targets in [vec!["chain.py"], vec!["nope_unknown"], vec![]] {
         if let Ok(r) = engine.affected_tests(&s(&targets), 4_000, 0.0, 3) {
-            out.push((format!("affected_tests({targets:?}).tests"), refused(&r.tests), r.tests.source_freshness.clone()));
-            out.push((format!("affected_tests({targets:?}).layers"), refused(&r.blast_radius.layers), r.blast_radius.layers.source_freshness.clone()));
+            out.push((
+                format!("affected_tests({targets:?}).tests"),
+                refused(&r.tests),
+                r.tests.source_freshness.clone(),
+            ));
+            out.push((
+                format!("affected_tests({targets:?}).layers"),
+                refused(&r.blast_radius.layers),
+                r.blast_radius.layers.source_freshness.clone(),
+            ));
         }
     }
     let r = engine.clones(4_000, None, 3).unwrap();
-    out.push(("clones.groups".to_string(), refused(&r.groups), r.groups.source_freshness.clone()));
-    let r = engine.preview("chain.py", "def a():\n    return 2\n", 4_000, 0.0).unwrap();
-    out.push(("preview.broken_callers".to_string(), refused(&r.broken_callers), r.broken_callers.source_freshness.clone()));
+    out.push((
+        "clones.groups".to_string(),
+        refused(&r.groups),
+        r.groups.source_freshness.clone(),
+    ));
+    let r = engine
+        .preview("chain.py", "def a():\n    return 2\n", 4_000, 0.0)
+        .unwrap();
+    out.push((
+        "preview.broken_callers".to_string(),
+        refused(&r.broken_callers),
+        r.broken_callers.source_freshness.clone(),
+    ));
     out
 }
 
@@ -594,7 +741,11 @@ fn p1d_success_arms_of_explore_affected_clones_preview_carry_the_verdict() {
         .filter(|(_, refused, f)| !refused && f != &want)
         .map(|(n, _, f)| format!("{n}: {f:?}"))
         .collect();
-    assert!(bad.is_empty(), "success arms say 'not checked' beside {want:?}:\n{}", bad.join("\n"));
+    assert!(
+        bad.is_empty(),
+        "success arms say 'not checked' beside {want:?}:\n{}",
+        bad.join("\n")
+    );
 }
 
 // The refusal half: a response whose resolution is Unavailable, on a store
@@ -607,13 +758,20 @@ fn p1e_refusal_arms_of_explore_affected_clones_preview_carry_the_verdict() {
     let rows = flagged_surfaces(&StoreQueryEngine::new(&fx.store));
     eprintln!("{rows:#?}");
     let refusals = rows.iter().filter(|(_, refused, _)| *refused).count();
-    assert!(refusals >= 2, "probe reached too few refusal arms: {refusals}");
+    assert!(
+        refusals >= 2,
+        "probe reached too few refusal arms: {refusals}"
+    );
     let bad: Vec<String> = rows
         .iter()
         .filter(|(_, refused, f)| *refused && f != &want)
         .map(|(n, _, f)| format!("{n}: {f:?}"))
         .collect();
-    assert!(bad.is_empty(), "refusal arms say 'not checked' beside {want:?}:\n{}", bad.join("\n"));
+    assert!(
+        bad.is_empty(),
+        "refusal arms say 'not checked' beside {want:?}:\n{}",
+        bad.join("\n")
+    );
 }
 
 // preview on a store with no generation: the canned sentence belongs here.
@@ -623,6 +781,15 @@ fn p2c_preview_on_an_empty_store_says_no_generation() {
     let r = StoreQueryEngine::new(&store)
         .preview("chain.py", "def a():\n    return 2\n", 4_000, 0.0)
         .unwrap();
-    let reason = r.broken_callers.source_freshness.reason.clone().unwrap_or_default();
-    assert!(reason.contains(NO_GENERATION), "{:?}", r.broken_callers.source_freshness);
+    let reason = r
+        .broken_callers
+        .source_freshness
+        .reason
+        .clone()
+        .unwrap_or_default();
+    assert!(
+        reason.contains(NO_GENERATION),
+        "{:?}",
+        r.broken_callers.source_freshness
+    );
 }

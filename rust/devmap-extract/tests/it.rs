@@ -33,6 +33,8 @@ mod adversarial_corpus;
 mod allow_unwired_and_dynamic_imports;
 mod an_unreadable_subtree_is_a_hole_not_a_dead_build;
 #[cfg(feature = "parse")]
+mod attack_build_cancel;
+#[cfg(feature = "parse")]
 mod budget_attack;
 #[cfg(feature = "parse")]
 mod budget_characterization;
@@ -40,8 +42,6 @@ mod budget_characterization;
 mod budget_is_a_real_bound;
 #[cfg(feature = "parse")]
 mod budget_retry;
-#[cfg(feature = "parse")]
-mod attack_build_cancel;
 #[cfg(feature = "parse")]
 mod c_family;
 mod cache_tag_security;
@@ -106,6 +106,8 @@ mod mutation_fuzz;
 #[cfg(feature = "parse")]
 mod nested_source_limits;
 #[cfg(feature = "parse")]
+mod non_swift_byte_compare;
+#[cfg(feature = "parse")]
 mod notebook_completeness;
 mod one_ignore_owner;
 #[cfg(feature = "parse")]
@@ -132,13 +134,11 @@ mod sql_check_constraint_parse;
 #[cfg(feature = "parse")]
 mod stress_hardening;
 #[cfg(feature = "parse")]
-mod non_swift_byte_compare;
+mod swift_close_attack;
 #[cfg(feature = "parse")]
 mod swift_properties;
 #[cfg(feature = "parse")]
 mod swift_properties_attack;
-#[cfg(feature = "parse")]
-mod swift_close_attack;
 #[cfg(feature = "parse")]
 mod swift_property_read_shapes;
 #[cfg(feature = "parse")]

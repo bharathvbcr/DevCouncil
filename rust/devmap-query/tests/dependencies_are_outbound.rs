@@ -6,11 +6,9 @@
 //! "<name> is not indexed" for a symbol `impact` and `search` resolve. Every
 //! test here runs against both engines, which share the contract.
 
-use devmap_extract::model::Extraction;
 use devmap_extract::extract_file;
-use devmap_query::{
-    QueryEngine, Request, ResolutionAvailability, Response, StoreQueryEngine,
-};
+use devmap_extract::model::Extraction;
+use devmap_query::{QueryEngine, Request, ResolutionAvailability, Response, StoreQueryEngine};
 use devmap_resolve::model::{ResolutionResult, ResolvedEdge};
 use devmap_resolve::Resolver;
 use devmap_store::{GenerationWriteOpts, Store};
@@ -28,10 +26,7 @@ fn fixture(files: &[(&str, &str)]) -> Fixture {
 /// `edit` reshapes the resolution before both engines see it, for a population
 /// the extractor will not produce on its own (a file with callers and no edge
 /// leaving it — the extractor always writes a declaration edge for a symbol).
-fn fixture_with(
-    files: &[(&str, &str)],
-    edit: impl FnOnce(&mut ResolutionResult),
-) -> Fixture {
+fn fixture_with(files: &[(&str, &str)], edit: impl FnOnce(&mut ResolutionResult)) -> Fixture {
     let extractions: Vec<_> = files
         .iter()
         .map(|(path, body)| extract_file(path, body))
@@ -69,12 +64,16 @@ fn request(query: &str, budget: u32) -> Request<String> {
 /// The same question to both engines. A refusal (an ambiguous bare name) is an
 /// `Err` from the store engine and an `Unavailable` answer from the in-memory
 /// one, so both are folded to `Result<Response, String>`.
-fn ask_both(fx: &Fixture, query: &str, budget: u32) -> [(&'static str, Result<Response<ResolvedEdge>, String>); 2] {
+fn ask_both(
+    fx: &Fixture,
+    query: &str,
+    budget: u32,
+) -> [(&'static str, Result<Response<ResolvedEdge>, String>); 2] {
     let store = StoreQueryEngine::new(&fx.store)
         .dependencies(request(query, budget))
         .map_err(|e| e.to_string());
-    let memory = Ok(QueryEngine::new(&fx.extractions, &fx.resolution)
-        .dependencies(request(query, budget)));
+    let memory =
+        Ok(QueryEngine::new(&fx.extractions, &fx.resolution).dependencies(request(query, budget)));
     [("store", store), ("memory", memory)]
 }
 
@@ -138,14 +137,22 @@ fn a_symbol_answers_its_outbound_edges_not_its_callers() {
     for (engine, answer) in ask_both(&fx, "worker", 8_000) {
         let answer = answer.unwrap();
         assert!(available(&answer), "{engine}: {}", reason(&answer));
-        let targets: Vec<&str> = answer.items.iter().map(|e| e.target_symbol.as_str()).collect();
+        let targets: Vec<&str> = answer
+            .items
+            .iter()
+            .map(|e| e.target_symbol.as_str())
+            .collect();
         assert!(
-            answer.items.iter().all(|e| e.source_symbol.ends_with("worker")),
+            answer
+                .items
+                .iter()
+                .all(|e| e.source_symbol.ends_with("worker")),
             "{engine}: every edge must leave worker, got {:?}",
             answer.items
         );
         assert!(
-            targets.iter().any(|t| t.ends_with("helper")) && targets.iter().any(|t| t.ends_with("other_helper")),
+            targets.iter().any(|t| t.ends_with("helper"))
+                && targets.iter().any(|t| t.ends_with("other_helper")),
             "{engine}: {targets:?}"
         );
         assert_eq!(answer.total as usize, answer.items.len(), "{engine}");
@@ -239,7 +246,10 @@ fn an_all_inbound_file_is_withheld_and_labelled() {
     let fx = fixture_with(
         &[
             ("defs.py", "VALUE = 1\n"),
-            ("user.py", "from defs import VALUE\n\n\ndef use():\n    return VALUE\n"),
+            (
+                "user.py",
+                "from defs import VALUE\n\n\ndef use():\n    return VALUE\n",
+            ),
         ],
         |resolution| resolution.edges.retain(|e| e.source_file != "defs.py"),
     );
@@ -277,12 +287,18 @@ fn a_qualified_method_resolves() {
         let answer = answer.unwrap();
         assert!(available(&answer), "{engine}: {}", reason(&answer));
         assert!(
-            answer.items.iter().any(|e| e.target_symbol.ends_with("helper")),
+            answer
+                .items
+                .iter()
+                .any(|e| e.target_symbol.ends_with("helper")),
             "{engine}: {:?}",
             answer.items
         );
         assert!(
-            answer.items.iter().all(|e| e.source_symbol.ends_with("Svc.run")),
+            answer
+                .items
+                .iter()
+                .all(|e| e.source_symbol.ends_with("Svc.run")),
             "{engine}: {:?}",
             answer.items
         );
@@ -300,7 +316,10 @@ fn a_unicode_name_resolves() {
         let answer = answer.unwrap();
         assert!(available(&answer), "{engine}: {}", reason(&answer));
         assert!(
-            answer.items.iter().any(|e| e.target_symbol.ends_with("aide")),
+            answer
+                .items
+                .iter()
+                .any(|e| e.target_symbol.ends_with("aide")),
             "{engine}: {:?}",
             answer.items
         );
@@ -312,19 +331,30 @@ fn a_unicode_name_resolves() {
 #[test]
 fn an_ambiguous_name_lists_its_candidates() {
     let fx = fixture(&[
-        ("a.py", "def target():\n    return 1\n\n\ndef dup():\n    return target()\n"),
-        ("b.py", "def target():\n    return 2\n\n\ndef dup():\n    return target()\n"),
+        (
+            "a.py",
+            "def target():\n    return 1\n\n\ndef dup():\n    return target()\n",
+        ),
+        (
+            "b.py",
+            "def target():\n    return 2\n\n\ndef dup():\n    return target()\n",
+        ),
     ]);
     let [(_, store), (_, memory)] = ask_both(&fx, "dup", 8_000);
     let store_error = store.expect_err("the store engine refuses an ambiguous name");
     assert!(
-        store_error.contains("ambiguous") && store_error.contains("a.py::dup") && store_error.contains("b.py::dup"),
+        store_error.contains("ambiguous")
+            && store_error.contains("a.py::dup")
+            && store_error.contains("b.py::dup"),
         "{store_error}"
     );
     let memory = memory.unwrap();
     assert!(!available(&memory));
     let memory_reason = reason(&memory);
-    assert!(memory_reason.contains("ambiguous") && memory_reason.contains("a.py::dup"), "{memory_reason}");
+    assert!(
+        memory_reason.contains("ambiguous") && memory_reason.contains("a.py::dup"),
+        "{memory_reason}"
+    );
     for (engine, answer) in ask_both(&fx, "a.py::dup", 8_000) {
         let answer = answer.unwrap();
         assert!(available(&answer), "{engine}: {}", reason(&answer));

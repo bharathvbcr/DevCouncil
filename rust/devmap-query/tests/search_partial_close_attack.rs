@@ -62,7 +62,11 @@ fn corpus(name: &str, files: Vec<F>) -> (Store, PathBuf) {
     for file in &files {
         let full = root.join(&file.path);
         std::fs::create_dir_all(full.parent().unwrap()).unwrap();
-        std::fs::write(&full, file.disk.as_deref().unwrap_or(file.indexed.as_bytes())).unwrap();
+        std::fs::write(
+            &full,
+            file.disk.as_deref().unwrap_or(file.indexed.as_bytes()),
+        )
+        .unwrap();
         if file.mtime_back {
             let handle = std::fs::OpenOptions::new().write(true).open(&full).unwrap();
             handle
@@ -183,7 +187,10 @@ fn p1_unchanged_content_with_a_new_mtime_is_still_checked() {
     let a = ask(&store, "LOST_IN_HOLE", &["consts.rs"], &[]);
     let why = reason(&a);
     assert!(why.contains("lines 2-2"), "{why}");
-    assert!(!why.contains("changed since the build"), "false changed: {why}");
+    assert!(
+        !why.contains("changed since the build"),
+        "false changed: {why}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -197,7 +204,10 @@ fn p1_crlf_file_is_checked_and_not_called_changed() {
     );
     let a = ask(&store, "LOST_IN_HOLE", &["consts.rs"], &[]);
     let why = reason(&a);
-    assert!(why.contains("lines 2-2") && !why.contains("changed since"), "{why}");
+    assert!(
+        why.contains("lines 2-2") && !why.contains("changed since"),
+        "{why}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -211,7 +221,10 @@ fn p1_bom_file_is_checked_and_not_called_changed() {
     );
     let a = ask(&store, "LOST_IN_HOLE", &["consts.rs"], &[]);
     let why = reason(&a);
-    assert!(why.contains("lines 2-2") && !why.contains("changed since"), "{why}");
+    assert!(
+        why.contains("lines 2-2") && !why.contains("changed since"),
+        "{why}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -339,7 +352,12 @@ fn p2_php_function_names_ignore_case_so_a_lower_case_query_matches() {
     let src = "<?php\nfunction kept() {}\nfunction LostInHole() {}\n";
     let (store, root) = corpus(
         "p2php",
-        vec![F::hole("a.php", src, "function LostInHole() {}", "LostInHole")],
+        vec![F::hole(
+            "a.php",
+            src,
+            "function LostInHole() {}",
+            "LostInHole",
+        )],
     );
     let a = ask(&store, "lostinhole", &["a.php"], &[]);
     let _ = std::fs::remove_dir_all(&root);
@@ -644,6 +662,9 @@ fn p6_timing_hit_and_miss_on_2000_partial_files() {
     println!("TIMING hit            {:?}", time("KEPT_0042", &[]));
     println!("TIMING hit scoped     {:?}", time("KEPT_0042", &["d2"]));
     println!("TIMING miss unscoped  {:?}", time("NOSUCHNAMEATALL", &[]));
-    println!("TIMING miss scoped    {:?}", time("NOSUCHNAMEATALL", &["d2"]));
+    println!(
+        "TIMING miss scoped    {:?}",
+        time("NOSUCHNAMEATALL", &["d2"])
+    );
     let _ = std::fs::remove_dir_all(&root);
 }

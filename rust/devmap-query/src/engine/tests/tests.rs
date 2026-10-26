@@ -561,7 +561,10 @@ fn assert_proven_callers_fill_the_page(
 ) {
     assert_eq!(total, 12, "every caller is counted before truncation");
     assert_eq!(shown, 4, "a 100-token budget at 25 per edge holds four");
-    assert!(truncated, "eight callers did not fit, and the answer says so");
+    assert!(
+        truncated,
+        "eight callers did not fit, and the answer says so"
+    );
     assert!(
         confidences.iter().all(|confidence| *confidence == 1.0),
         "truncation kept an ambiguous caller over a proven one: {confidences:?}"
@@ -596,7 +599,7 @@ fn g24_the_store_engine_truncates_callers_in_the_same_order() {
     let resolution = confidence_fixture();
     let analysis = devmap_analyze::analyze(&[], &resolution);
     let store = Store::open_in_memory().unwrap();
-    store.save_generation(&[],&resolution, &analysis).unwrap();
+    store.save_generation(&[], &resolution, &analysis).unwrap();
     let response = StoreQueryEngine::new(&store)
         .impact(Request {
             query: "hub".to_string(),

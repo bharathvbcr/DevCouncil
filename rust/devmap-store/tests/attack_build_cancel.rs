@@ -1,7 +1,7 @@
 //! Adversarial probes for the build cancellation in `extract_scanned_for_generation`.
 
-use devmap_extract::{detect_language, extract_file, BuildCancelled, Extraction, ScannedTree};
 use devmap_extract::cache::CacheKey;
+use devmap_extract::{detect_language, extract_file, BuildCancelled, Extraction, ScannedTree};
 use devmap_store::{extract_scanned_for_generation, Store};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -136,7 +136,8 @@ fn a_cancelled_build_does_not_report_unextracted_files_as_completed() {
     assert!(out.is_err());
     let snap = progress.snapshot();
     assert_eq!(
-        snap.completed, 0,
+        snap.completed,
+        0,
         "a pre-cancelled build reports {} of {} files completed: {snap:?}",
         snap.completed,
         scanned.sources.len()

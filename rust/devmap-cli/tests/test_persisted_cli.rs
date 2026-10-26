@@ -122,8 +122,7 @@ fn staleness_audit_navigation_survives_repeated_edits_and_rebuilds() {
         assert_eq!(staleness_query(&root, &["status"])["is_fresh"], true);
         let rebuilt = staleness_query(&root, &["search", "renamed_symbol"]);
         assert_ne!(
-            rebuilt["source_freshness"]["fresh"],
-            false,
+            rebuilt["source_freshness"]["fresh"], false,
             "cycle {cycle}: a just-rebuilt store must never report fresh=false: {rebuilt}"
         );
         assert_eq!(

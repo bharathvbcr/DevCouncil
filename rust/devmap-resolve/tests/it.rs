@@ -18,8 +18,6 @@
 #[cfg(feature = "parse")]
 mod a_field_types_its_receiver;
 #[cfg(feature = "parse")]
-mod qualifier_scope_attack;
-#[cfg(feature = "parse")]
 mod a_prelude_type_receiver_is_not_a_value;
 #[cfg(feature = "parse")]
 mod a_receiver_call_never_binds_by_bare_name;
@@ -58,8 +56,6 @@ mod go_package_scope;
 #[cfg(feature = "parse")]
 mod go_qualifier_scope;
 #[cfg(feature = "parse")]
-mod qualifier_scope_other_families;
-#[cfg(feature = "parse")]
 mod go_unexported_selector;
 #[cfg(feature = "parse")]
 mod host_global_objects;
@@ -74,8 +70,6 @@ mod imports_stay_in_the_named_tree;
 #[cfg(feature = "parse")]
 mod kotlin_receivers_and_packages;
 #[cfg(feature = "parse")]
-mod overload_self_edges;
-#[cfg(feature = "parse")]
 mod kotlin_written_types;
 #[cfg(feature = "parse")]
 mod language_server_edges;
@@ -84,11 +78,25 @@ mod markup_selectors_resolve;
 #[cfg(feature = "parse")]
 mod module_singleton_receivers;
 #[cfg(feature = "parse")]
+mod non_swift_edge_compare;
+#[cfg(feature = "parse")]
+mod overload_self_edges;
+#[cfg(feature = "parse")]
 mod parallel_determinism;
 #[cfg(feature = "parse")]
 mod primary_languages;
 #[cfg(feature = "parse")]
+mod py_receiver_residue_attack;
+#[cfg(feature = "parse")]
+mod py_receiver_residue_attack2;
+#[cfg(feature = "parse")]
+mod py_relative_imports_attack;
+#[cfg(feature = "parse")]
 mod python_class_identity;
+#[cfg(feature = "parse")]
+mod python_edge_dump_attack4;
+#[cfg(feature = "parse")]
+mod python_edge_dump_attack5;
 #[cfg(feature = "parse")]
 mod python_field_super_attack;
 #[cfg(feature = "parse")]
@@ -98,19 +106,9 @@ mod python_field_super_attack3;
 #[cfg(feature = "parse")]
 mod python_field_super_attack4;
 #[cfg(feature = "parse")]
-mod python_edge_dump_attack4;
-#[cfg(feature = "parse")]
 mod python_field_super_attack5;
 #[cfg(feature = "parse")]
-mod python_edge_dump_attack5;
-#[cfg(feature = "parse")]
 mod python_heritage_residue;
-#[cfg(feature = "parse")]
-mod python_residue_attack;
-#[cfg(feature = "parse")]
-mod python_residue_attack2;
-#[cfg(feature = "parse")]
-mod python_receiver_residue;
 #[cfg(feature = "parse")]
 mod python_import_module_literal;
 #[cfg(feature = "parse")]
@@ -120,15 +118,19 @@ mod python_modules_loaded_by_path;
 #[cfg(feature = "parse")]
 mod python_path_constants_and_loaders;
 #[cfg(feature = "parse")]
+mod python_receiver_residue;
+#[cfg(feature = "parse")]
+mod python_residue_attack;
+#[cfg(feature = "parse")]
+mod python_residue_attack2;
+#[cfg(feature = "parse")]
 mod python_sys_path_imports;
 #[cfg(feature = "parse")]
-mod py_relative_imports_attack;
-#[cfg(feature = "parse")]
-mod py_receiver_residue_attack;
-#[cfg(feature = "parse")]
-mod py_receiver_residue_attack2;
-#[cfg(feature = "parse")]
 mod qualified_module_paths;
+#[cfg(feature = "parse")]
+mod qualifier_scope_attack;
+#[cfg(feature = "parse")]
+mod qualifier_scope_other_families;
 #[cfg(feature = "parse")]
 mod real_corpus_resolution;
 #[cfg(feature = "parse")]
@@ -163,23 +165,21 @@ mod semantic_scope_and_identity;
 #[cfg(feature = "parse")]
 mod shell_source_resolves;
 #[cfg(feature = "parse")]
-mod non_swift_edge_compare;
+mod swift_close_attack;
 #[cfg(feature = "parse")]
 mod swift_modules;
 #[cfg(feature = "parse")]
 mod swift_properties_attack;
 #[cfg(feature = "parse")]
-mod swift_close_attack;
+mod swift_property_reads;
+#[cfg(feature = "parse")]
+mod swift_protocol_dispatch;
 #[cfg(feature = "parse")]
 mod swift_resolver_residue;
 #[cfg(feature = "parse")]
 mod swift_resolver_residue_attack;
 #[cfg(feature = "parse")]
 mod swift_resolver_residue_attack2;
-#[cfg(feature = "parse")]
-mod swift_property_reads;
-#[cfg(feature = "parse")]
-mod swift_protocol_dispatch;
 #[cfg(feature = "parse")]
 mod test_phase3_hardening;
 #[cfg(feature = "parse")]
@@ -263,6 +263,6 @@ mod attack_resolver_bundle3;
 #[cfg(feature = "parse")]
 mod attack_resolver_bundle4;
 #[cfg(feature = "parse")]
-mod corpus_dump_attack;
-#[cfg(feature = "parse")]
 mod attack_resolver_bundle5;
+#[cfg(feature = "parse")]
+mod corpus_dump_attack;

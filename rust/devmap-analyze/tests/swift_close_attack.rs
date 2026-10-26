@@ -43,7 +43,10 @@ fn control_an_unrelated_plain_type_private_property_is_reported() {
 #[ignore = "needs module identity from the manifest targets: the path-derived module is not a sound join key for an Xcode target spanning folders, and a wrong key un-exempts a conforming type (fail-closed), ft-915b0a03"]
 fn wrong_an_unrelated_type_of_the_same_name_in_another_module_exempts_nothing() {
     let r = reports(&files(&[
-        ("Sources/A/Cfg.swift", "struct Cfg { private var secret = 1 }\n"),
+        (
+            "Sources/A/Cfg.swift",
+            "struct Cfg { private var secret = 1 }\n",
+        ),
         ("Sources/B/Cfg.swift", "struct Cfg: Codable { var x = 1 }\n"),
     ]));
     assert!(
@@ -86,8 +89,14 @@ fn wrong_a_non_synthesising_supertype_does_not_exempt() {
 #[test]
 fn wrong_a_property_of_a_type_declared_inside_a_function_scope_type_is_not_exempt_by_name_only() {
     let r = reports(&files(&[
-        ("Sources/A/X.swift", "struct Cfg { private var secret = 1 }\n"),
-        ("Sources/A/Y.swift", "enum Mode: String { case a }\nextension Cfg {}\nextension Mode: Equatable {}\n"),
+        (
+            "Sources/A/X.swift",
+            "struct Cfg { private var secret = 1 }\n",
+        ),
+        (
+            "Sources/A/Y.swift",
+            "enum Mode: String { case a }\nextension Cfg {}\nextension Mode: Equatable {}\n",
+        ),
     ]));
     assert!(reported(&r, "secret"));
 }

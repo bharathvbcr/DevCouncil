@@ -57,7 +57,11 @@ fn corpus(name: &str, files: Vec<F>) -> (Store, PathBuf) {
     for file in &files {
         let full = root.join(&file.path);
         std::fs::create_dir_all(full.parent().unwrap()).unwrap();
-        std::fs::write(&full, file.disk.as_deref().unwrap_or(file.indexed.as_bytes())).unwrap();
+        std::fs::write(
+            &full,
+            file.disk.as_deref().unwrap_or(file.indexed.as_bytes()),
+        )
+        .unwrap();
         let mut ext = extract_file(&file.path, &file.indexed);
         if !file.ranges.is_empty() {
             ext.symbols.retain(|s| !file.drop.contains(&s.name));
@@ -190,10 +194,7 @@ fn p1_python_range_with_capitalised_class_is_not_blamed_for_a_lower_case_query()
 #[test]
 fn p1_go_range_with_exported_name_is_not_blamed_for_the_unexported_query() {
     let src = "package p\n\nfunc kept() {}\n\nfunc Foo() {}\n";
-    let (store, root) = corpus(
-        "p1go",
-        vec![F::hole("p.go", src, "func Foo() {}", "Foo")],
-    );
+    let (store, root) = corpus("p1go", vec![F::hole("p.go", src, "func Foo() {}", "Foo")]);
     let a = ask(&store, "foo", &["p.go"], &[]);
     let verdict = if is_unavailable(&a) {
         unavailable_reason(&a)
@@ -215,7 +216,12 @@ fn p1b_a_dotted_non_identifier_query_does_not_collapse_to_its_last_segment() {
     let src = "pub const KEPT: u32 = 1;\npub const LOST: u32 = 0;\n";
     let (store, root) = corpus(
         "p1b",
-        vec![F::hole("consts.rs", src, "pub const LOST: u32 = 0;", "LOST")],
+        vec![F::hole(
+            "consts.rs",
+            src,
+            "pub const LOST: u32 = 0;",
+            "LOST",
+        )],
     );
     let a = ask(&store, "release.0", &["consts.rs"], &[]);
     let verdict = if is_unavailable(&a) {
@@ -318,8 +324,10 @@ fn p3_nul_bytes_in_the_range_do_not_panic_and_still_match() {
     let same_len = "pub const KEPT: u32 = 1;\npub \0\0\0\0\0 LOST\0 u32 = 2;\n";
     let (store, root) = corpus(
         "p3nul",
-        vec![F::hole("consts.rs", indexed, "pub const LOST: u32 = 2;", "LOST")
-            .on_disk(same_len.as_bytes())],
+        vec![
+            F::hole("consts.rs", indexed, "pub const LOST: u32 = 2;", "LOST")
+                .on_disk(same_len.as_bytes()),
+        ],
     );
     let a = ask(&store, "LOST", &["consts.rs"], &[]);
     let reason = if is_unavailable(&a) {
@@ -392,8 +400,10 @@ fn p3_range_end_beyond_eof_is_carried_not_dropped() {
     let truncated = "pub const KEPT: u32 = 1;\n";
     let (store, root) = corpus(
         "p3eof",
-        vec![F::hole("consts.rs", indexed, "pub const LOST: u32 = 2;", "LOST")
-            .on_disk(truncated.as_bytes())],
+        vec![
+            F::hole("consts.rs", indexed, "pub const LOST: u32 = 2;", "LOST")
+                .on_disk(truncated.as_bytes()),
+        ],
     );
     let a = ask(&store, "LOST", &["consts.rs"], &[]);
     assert!(is_unavailable(&a), "{}", describe(&a));
@@ -431,7 +441,12 @@ fn p3_control_characters_in_a_path_are_escaped() {
     let src = "pub const KEPT: u32 = 1;\npub const LOST: u32 = 2;\n";
     let (store, root) = corpus(
         "p3ctl",
-        vec![F::hole("we\nird\u{1b}[31m.rs", src, "pub const LOST: u32 = 2;", "LOST")],
+        vec![F::hole(
+            "we\nird\u{1b}[31m.rs",
+            src,
+            "pub const LOST: u32 = 2;",
+            "LOST",
+        )],
     );
     let a = ask(&store, "LOST", &[], &[]);
     let reason = unavailable_reason(&a);
@@ -517,7 +532,10 @@ fn p4_name_in_the_ninth_of_nine_ranges_is_carried_as_unchecked() {
     let (store, root) = many(9, 8);
     let a = ask(&store, "TARGET_NAME", &["consts.rs"], &[]);
     let reason = unavailable_reason(&a);
-    assert!(reason.contains("not listed in the stored reason"), "{reason}");
+    assert!(
+        reason.contains("not listed in the stored reason"),
+        "{reason}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -525,7 +543,10 @@ fn p4_name_in_the_ninth_of_nine_ranges_is_carried_as_unchecked() {
 fn p4_one_charged_range_is_found() {
     let (store, root) = many(1, 0);
     let reason = unavailable_reason(&ask(&store, "TARGET_NAME", &["consts.rs"], &[]));
-    assert!(reason.contains("1 charged partial-parse range(s)"), "{reason}");
+    assert!(
+        reason.contains("1 charged partial-parse range(s)"),
+        "{reason}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -575,13 +596,17 @@ fn p5_timing_miss_on_2000_partial_files() {
     let mut files = Vec::new();
     for i in 0..2000 {
         let body = "x".repeat(400);
-        let src = format!("pub const KEPT_{i:04}: u32 = 1;\n// {body}\npub const FILL_{i:04}: u32 = 2;\n");
+        let src = format!(
+            "pub const KEPT_{i:04}: u32 = 1;\n// {body}\npub const FILL_{i:04}: u32 = 2;\n"
+        );
         let hole = format!("pub const FILL_{i:04}: u32 = 2;");
         let name = format!("FILL_{i:04}");
         files.push(F::hole(&format!("d/m{i:04}.rs"), &src, &hole, &name));
     }
     let (store, root) = corpus("p5time", files);
-    let prefixes = ["z", "zq", "zqx", "zqxv", "zqxvw", "zqxvwk", "zqxvwkj", "zqxvwkjy"];
+    let prefixes = [
+        "z", "zq", "zqx", "zqxv", "zqxvw", "zqxvwk", "zqxvwkj", "zqxvwkjy",
+    ];
     let mut best = std::time::Duration::MAX;
     for _ in 0..5 {
         let t = std::time::Instant::now();
@@ -629,9 +654,21 @@ fn p6_directory_scope_containing_the_holed_file_names_it() {
     let src = "pub const KEPT: u32 = 1;\npub const LOST: u32 = 2;\n";
     let (store, root) = corpus(
         "p6dir",
-        vec![F::hole("sub/deep/consts.rs", src, "pub const LOST: u32 = 2;", "LOST")],
+        vec![F::hole(
+            "sub/deep/consts.rs",
+            src,
+            "pub const LOST: u32 = 2;",
+            "LOST",
+        )],
     );
-    for scope in ["sub", "sub/", "sub/deep", "./sub", "sub/deep/consts.rs", "sub/deep/consts.rs/"] {
+    for scope in [
+        "sub",
+        "sub/",
+        "sub/deep",
+        "./sub",
+        "sub/deep/consts.rs",
+        "sub/deep/consts.rs/",
+    ] {
         let a = ask(&store, "LOST", &[scope], &[]);
         assert!(
             is_unavailable(&a) && unavailable_reason(&a).contains("sub/deep/consts.rs"),
@@ -649,7 +686,12 @@ fn p6_absolute_path_scope_names_the_hole() {
     let src = "pub const KEPT: u32 = 1;\npub const LOST: u32 = 2;\n";
     let (store, root) = corpus(
         "p6abs",
-        vec![F::hole("consts.rs", src, "pub const LOST: u32 = 2;", "LOST")],
+        vec![F::hole(
+            "consts.rs",
+            src,
+            "pub const LOST: u32 = 2;",
+            "LOST",
+        )],
     );
     let abs = root.join("consts.rs");
     let a = ask(&store, "LOST", &[abs.to_str().unwrap()], &[]);
@@ -664,7 +706,12 @@ fn p6_glob_scope_characterisation() {
     let src = "pub const KEPT: u32 = 1;\npub const LOST: u32 = 2;\n";
     let (store, root) = corpus(
         "p6glob",
-        vec![F::hole("consts.rs", src, "pub const LOST: u32 = 2;", "LOST")],
+        vec![F::hole(
+            "consts.rs",
+            src,
+            "pub const LOST: u32 = 2;",
+            "LOST",
+        )],
     );
     let paths = vec!["*.rs".to_string()];
     let filter = NameQueryFilter::new(&paths, &[], &[]);
@@ -696,7 +743,12 @@ fn p7_explore_of_a_missing_name_never_returns_available_over_a_matching_range() 
     let src = "pub const KEPT: u32 = 1;\npub const LOST: u32 = 2;\n";
     let (store, root) = corpus(
         "p7",
-        vec![F::hole("consts.rs", src, "pub const LOST: u32 = 2;", "LOST")],
+        vec![F::hole(
+            "consts.rs",
+            src,
+            "pub const LOST: u32 = 2;",
+            "LOST",
+        )],
     );
     for (query, paths) in [("LOST", vec![]), ("LOST", vec!["consts.rs".to_string()])] {
         let filter = NameQueryFilter::new(&paths, &[], &[]).unwrap();
@@ -726,7 +778,12 @@ fn p7_explore_of_a_plain_miss_stays_available() {
     let src = "pub const KEPT: u32 = 1;\npub const LOST: u32 = 2;\n";
     let (store, root) = corpus(
         "p7b",
-        vec![F::hole("consts.rs", src, "pub const LOST: u32 = 2;", "LOST")],
+        vec![F::hole(
+            "consts.rs",
+            src,
+            "pub const LOST: u32 = 2;",
+            "LOST",
+        )],
     );
     let report = StoreQueryEngine::new(&store)
         .explore_filtered("NOTHING_LIKE_IT", 5, 8_000, 0.0, 1, None)

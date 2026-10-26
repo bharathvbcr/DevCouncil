@@ -49,7 +49,10 @@ const PRIVATE_RNG: &str =
 
 #[test]
 fn a_private_nested_namesake_in_another_file_does_not_hide_the_visible_type() {
-    let r = resolve(&[("Sources/M/Q6.swift", RNG), ("Sources/M/Q7.swift", PRIVATE_RNG)]);
+    let r = resolve(&[
+        ("Sources/M/Q6.swift", RNG),
+        ("Sources/M/Q7.swift", PRIVATE_RNG),
+    ]);
     let u = uses(&r, "roll");
     assert!(has(&u, "Q6.swift::Rng.next"), "{u:?}");
     assert!(!has(&u, "Q7.swift::Rng.next"), "{u:?}");
@@ -58,7 +61,10 @@ fn a_private_nested_namesake_in_another_file_does_not_hide_the_visible_type() {
 #[test]
 fn a_private_nested_type_alone_in_another_file_is_not_the_receivers_type() {
     let caller = "func roll() -> Int {\n var r = Rng()\n return r.next()\n}\n";
-    let r = resolve(&[("Sources/M/Q7.swift", PRIVATE_RNG), ("Sources/M/Q8.swift", caller)]);
+    let r = resolve(&[
+        ("Sources/M/Q7.swift", PRIVATE_RNG),
+        ("Sources/M/Q8.swift", caller),
+    ]);
     let u = uses(&r, "roll");
     assert!(!has(&u, "Rng.next"), "{u:?}");
 }
@@ -232,11 +238,17 @@ fn two_modules_declaring_one_nested_type_name_bind_neither_from_outside() {
 fn a_deinit_body_reaches_an_extension_member_declared_in_another_file() {
     let class = "final class Session {\n deinit {\n  cleanup()\n  self.drain()\n }\n}\nclass Other { func cleanup() {}\n func drain() {} }\n";
     let ext = "extension Session {\n func cleanup() {}\n func drain() {}\n}\n";
-    let r = resolve(&[("Sources/M/Session.swift", class), ("Sources/M/SessionExt.swift", ext)]);
+    let r = resolve(&[
+        ("Sources/M/Session.swift", class),
+        ("Sources/M/SessionExt.swift", ext),
+    ]);
     let u = uses(&r, "Session");
     assert!(has(&u, "SessionExt.swift::Session.cleanup"), "{u:?}");
     assert!(has(&u, "SessionExt.swift::Session.drain"), "{u:?}");
-    assert!(!has(&u, "Other.cleanup") && !has(&u, "Other.drain"), "{u:?}");
+    assert!(
+        !has(&u, "Other.cleanup") && !has(&u, "Other.drain"),
+        "{u:?}"
+    );
 }
 
 // ------------------------------------------- a nested type is named from inside
@@ -247,7 +259,10 @@ const OUTER: &str = "struct A {\n struct Inner {}\n func f() { _ = Inner() }\n}\
 fn a_nested_type_does_not_leak_into_an_unrelated_type_or_function() {
     let other = "struct B { func g() { _ = Inner() } }\nfunc free() { _ = Inner() }\n";
     let r = resolve(&[("Sources/M/A.swift", OUTER), ("Sources/M/B.swift", other)]);
-    assert!(has(&uses(&r, "f"), "A.Inner"), "control: the outer type still binds");
+    assert!(
+        has(&uses(&r, "f"), "A.Inner"),
+        "control: the outer type still binds"
+    );
     assert!(!has(&uses(&r, "B.g"), "A.Inner"), "{:?}", uses(&r, "B.g"));
     assert!(!has(&uses(&r, "free"), "A.Inner"), "{:?}", uses(&r, "free"));
 }
@@ -263,7 +278,11 @@ fn a_nested_type_is_still_named_from_an_extension_in_another_file() {
 fn a_nested_type_is_still_named_from_a_sibling_nested_type_and_a_subclass() {
     let src = "class A {\n class Inner {}\n class Other { func k() { _ = Inner() } }\n}\nclass Sub: A { func m() { _ = Inner() } }\n";
     let r = resolve(&[("Sources/M/A.swift", src)]);
-    assert!(has(&uses(&r, "Sub.m"), "A.Inner"), "{:?}", uses(&r, "Sub.m"));
+    assert!(
+        has(&uses(&r, "Sub.m"), "A.Inner"),
+        "{:?}",
+        uses(&r, "Sub.m")
+    );
     assert!(has(&uses(&r, "k"), "A.Inner"), "{:?}", uses(&r, "k"));
 }
 

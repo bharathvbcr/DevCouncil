@@ -5,14 +5,25 @@ use devmap_resolve::Resolver;
 use std::fmt::Write as _;
 
 fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in rd.flatten() {
         let p = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
         if p.is_dir() {
             if matches!(
                 name.as_str(),
-                ".venv" | "venv" | "site-packages" | "node_modules" | "target" | "__pycache__" | ".git" | "build" | "dist" | ".tox"
+                ".venv"
+                    | "venv"
+                    | "site-packages"
+                    | "node_modules"
+                    | "target"
+                    | "__pycache__"
+                    | ".git"
+                    | "build"
+                    | "dist"
+                    | ".tox"
             ) || name.starts_with("target-")
             {
                 continue;
@@ -35,7 +46,9 @@ fn corpus_dump_attack() {
     files.sort();
     let mut extractions = Vec::new();
     for f in &files {
-        let Ok(src) = std::fs::read_to_string(f) else { continue };
+        let Ok(src) = std::fs::read_to_string(f) else {
+            continue;
+        };
         if src.len() > 400_000 {
             continue;
         }

@@ -50,6 +50,10 @@ mod ask_evidence;
 mod ask_ranking;
 #[cfg(feature = "parse")]
 mod ask_scope;
+#[cfg(feature = "parse")]
+mod attack2_exit_close;
+#[cfg(feature = "parse")]
+mod attack3_verdict_pin;
 mod common;
 #[cfg(feature = "parse")]
 mod coupling_spans_inheritance;
@@ -111,10 +115,6 @@ mod query_cancellation;
 mod refusal_cost_probe;
 #[cfg(feature = "parse")]
 mod refusal_freshness_attack;
-#[cfg(feature = "parse")]
-mod attack2_exit_close;
-#[cfg(feature = "parse")]
-mod attack3_verdict_pin;
 mod repository_git_config;
 #[cfg(feature = "parse")]
 mod retired_python_claims_have_kernel_tests;

@@ -118,7 +118,11 @@ fn go_unbound_mention_only_in_dead_function_is_hidden_characterise() {
     let rows = reports(&[(P, src.as_str())]);
     eprintln!("CHARACTERISE shadow+dead user:\n{}", dump(&rows));
     assert!(confident(row(&rows, "dead")), "{}", dump(&rows));
-    assert!(confident(row(&rows, "t")), "t only reachable via dead(): {}", dump(&rows));
+    assert!(
+        confident(row(&rows, "t")),
+        "t only reachable via dead(): {}",
+        dump(&rows)
+    );
 }
 
 #[test]
@@ -354,7 +358,11 @@ fn sentence_absent_when_complete() {
 
 #[test]
 fn sentence_capped_list_matches_cap_for_per_language() {
-    let c = cov(1, &[("python", 1)], &[("rust", 3), ("python", 2), ("go", 1)]);
+    let c = cov(
+        1,
+        &[("python", 1)],
+        &[("rust", 3), ("python", 2), ("go", 1)],
+    );
     let reason = c.degraded_reason().unwrap();
     for lang in ["rust", "go", "python"] {
         let capped_for = c.cap_for(lang, 0.9) < 0.9;
@@ -468,7 +476,10 @@ fn mixed_outcome() -> LivenessOutcome {
         ("g/a.go", "package g\nfunc orphan() {}\nfunc main() {}\n"),
         ("r/a.rs", "fn orphan() {}\nfn main() {}\n"),
         ("p/a.py", "def orphan():\n    pass\n"),
-        ("t/a.ts", "function orphan() {}\nexport function main() {}\n"),
+        (
+            "t/a.ts",
+            "function orphan() {}\nexport function main() {}\n",
+        ),
         ("j/a.js", "function orphan() {}\n"),
         ("k/a.kt", "fun orphan() {}\nfun main() {}\n"),
         ("s/a.swift", "func orphan() {}\n"),

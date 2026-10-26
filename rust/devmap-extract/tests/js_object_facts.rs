@@ -67,10 +67,9 @@ fn an_alias_and_an_object_assign_record_their_source() {
     );
     assert_eq!(declared(&all, "d").alias_of.as_deref(), Some("core"));
     // `Object.assign(core, other)` also writes into `core`.
-    assert!(
-        all.iter()
-            .any(|f| !f.declaration && f.name == "core" && f.parts == vec![spread("other")])
-    );
+    assert!(all
+        .iter()
+        .any(|f| !f.declaration && f.name == "core" && f.parts == vec![spread("other")]));
 }
 
 #[test]

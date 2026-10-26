@@ -11,7 +11,10 @@ fn run(files: &[(&str, &str)], kind: EdgeKind) -> E {
     resolver.index_extractions(&extractions);
     let result = resolver.resolve_all(&extractions).unwrap();
     for e in result.edges.iter().filter(|e| e.edge_kind == kind) {
-        println!("EDGE {} -> {} conf={:?}", e.source_symbol, e.target_symbol, e.confidence);
+        println!(
+            "EDGE {} -> {} conf={:?}",
+            e.source_symbol, e.target_symbol, e.confidence
+        );
     }
     let mut v: E = result
         .edges
@@ -99,7 +102,10 @@ fn py_class_body_import_read_in_class_body() {
 fn py_class_body_import_not_visible_in_method() {
     let m = "class C:\n    import lib\n    def m(self):\n        return lib.helper()\n";
     let e = calls(&[LIB, ("mainx.py", m)]);
-    assert!(!has(&e, "mainx.py::C.m", H), "methods do not see class scope: {e:?}");
+    assert!(
+        !has(&e, "mainx.py::C.m", H),
+        "methods do not see class scope: {e:?}"
+    );
 }
 
 #[test]
@@ -120,7 +126,10 @@ fn py_init_reexport_function_level_import() {
     let e = calls(&[init, imp, ("mainx.py", m)]);
     // `a`'s own import binds only through the call ladder's function-local
     // alias rung (recall, recorded); `d` imports nothing and binds nothing.
-    assert!(!has(&e, "mainx.py::d", "pkg/impl.py::helper"), "d does not import: {e:?}");
+    assert!(
+        !has(&e, "mainx.py::d", "pkg/impl.py::helper"),
+        "d does not import: {e:?}"
+    );
 }
 
 #[test]
@@ -128,8 +137,14 @@ fn py_same_name_two_functions_different_modules() {
     let m = "def a():\n    import lib as m\n    return m.helper()\n\ndef b():\n    import lib2 as m\n    return m.helper()\n\ndef d():\n    return m.helper()\n";
     let e = calls(&[LIB, LIB2, ("mainx.py", m)]);
     // Function-local aliases are recall only for calls (not bound; extract-v98).
-    assert!(!has(&e, "mainx.py::a", H2) && !has(&e, "mainx.py::b", H), "cross-wise: {e:?}");
-    assert!(!e.iter().any(|(f, _)| f == "mainx.py::d"), "d binds nothing: {e:?}");
+    assert!(
+        !has(&e, "mainx.py::a", H2) && !has(&e, "mainx.py::b", H),
+        "cross-wise: {e:?}"
+    );
+    assert!(
+        !e.iter().any(|(f, _)| f == "mainx.py::d"),
+        "d binds nothing: {e:?}"
+    );
 }
 
 #[test]
@@ -160,7 +175,13 @@ fn py_decorator_on_nested_def() {
     let e = calls(&[deco, ("mainx.py", m)]);
     let r = refs(&[deco, ("mainx.py", m)]);
     println!("deco calls={e:?} refs={r:?}");
-    assert!(has(&e, "mainx.py::a", "lib3.py::deco") || has(&e, "mainx.py::a.inner", "lib3.py::deco") || has(&r, "mainx.py::a", "lib3.py::deco") || has(&r, "mainx.py::a.inner", "lib3.py::deco"), "decorator edge lost: calls={e:?} refs={r:?}");
+    assert!(
+        has(&e, "mainx.py::a", "lib3.py::deco")
+            || has(&e, "mainx.py::a.inner", "lib3.py::deco")
+            || has(&r, "mainx.py::a", "lib3.py::deco")
+            || has(&r, "mainx.py::a.inner", "lib3.py::deco"),
+        "decorator edge lost: calls={e:?} refs={r:?}"
+    );
 }
 
 #[test]
@@ -169,7 +190,10 @@ fn py_function_only_import_read_at_module_scope_is_unbound() {
     let m = "def a():\n    import lib\n    return lib.helper()\n\nlib.helper()\n";
     let e = calls(&[LIB, ("mainx.py", m)]);
     assert!(has(&e, "mainx.py::a", H), "{e:?}");
-    assert!(!e.iter().any(|(f, t)| f == "mainx.py" && t == H), "module scope unbound: {e:?}");
+    assert!(
+        !e.iter().any(|(f, t)| f == "mainx.py" && t == H),
+        "module scope unbound: {e:?}"
+    );
 }
 
 #[test]
@@ -196,14 +220,20 @@ fn py_from_import_value_function_only_and_global_unique_name() {
     // a bare call with no import in d must not bind.
     let m = "def a():\n    from lib import helper\n    return helper()\n\ndef d():\n    return helper()\n";
     let e = calls(&[LIB, ("mainx.py", m)]);
-    assert!(!e.iter().any(|(f, _)| f == "mainx.py::d"), "d bound something: {e:?}");
+    assert!(
+        !e.iter().any(|(f, _)| f == "mainx.py::d"),
+        "d bound something: {e:?}"
+    );
 }
 
 #[test]
 fn py_module_import_after_function_import_same_name() {
     let m = "def a():\n    import lib\n    return lib.helper()\n\nimport lib\n\ndef d():\n    return lib.helper()\n";
     let e = calls(&[LIB, ("mainx.py", m)]);
-    assert!(has(&e, "mainx.py::a", H) && has(&e, "mainx.py::d", H), "{e:?}");
+    assert!(
+        has(&e, "mainx.py::a", H) && has(&e, "mainx.py::d", H),
+        "{e:?}"
+    );
 }
 
 #[test]
@@ -213,7 +243,10 @@ fn py_import_dotted_module_level_and_function_root() {
     let m = "import pkg.sub\n\ndef a():\n    import pkg\n    return pkg\n\ndef d():\n    return pkg.sub.helper()\n";
     let e = calls(&[init, sub, ("mainx.py", m)]);
     println!("dotted: {e:?}");
-    assert!(has(&e, "mainx.py::d", "pkg/sub.py::helper"), "module-level `import pkg.sub` lost: {e:?}");
+    assert!(
+        has(&e, "mainx.py::d", "pkg/sub.py::helper"),
+        "module-level `import pkg.sub` lost: {e:?}"
+    );
 }
 
 #[test]
@@ -249,7 +282,10 @@ fn py_aliased_module_level_alias_function_other() {
 
 #[test]
 fn py_relative_import_module_level_and_function() {
-    let m = ("pkg/mainx.py", "from . import lib\n\ndef d():\n    return lib.helper()\n");
+    let m = (
+        "pkg/mainx.py",
+        "from . import lib\n\ndef d():\n    return lib.helper()\n",
+    );
     let lib = ("pkg/lib.py", "def helper():\n    return 1\n");
     let init = ("pkg/__init__.py", "");
     let e = calls(&[init, lib, m]);
@@ -268,7 +304,11 @@ fn py_default_argument_and_decorator_at_module_scope_with_function_only_import()
     // decorator/default evaluated at module level: a function-only import must NOT bind.
     let m = "def a():\n    import lib\n    return lib.helper()\n\n@lib.helper\ndef d(x=lib.VALUE):\n    return x\n";
     let e = calls(&[LIB, ("mainx.py", m)]);
-    assert!(!e.iter().any(|(f, t)| (f == "mainx.py" || f == "mainx.py::d") && t == H), "{e:?}");
+    assert!(
+        !e.iter()
+            .any(|(f, t)| (f == "mainx.py" || f == "mainx.py::d") && t == H),
+        "{e:?}"
+    );
 }
 
 #[test]
@@ -286,7 +326,10 @@ fn py_from_imports_same_name_two_functions_different_modules() {
     let e = calls(&[LIB, LIB2, ("mainx.py", m)]);
     assert!(has(&e, "mainx.py::a", H), "{e:?}");
     assert!(has(&e, "mainx.py::b", H2), "{e:?}");
-    assert!(!has(&e, "mainx.py::a", H2) && !has(&e, "mainx.py::b", H), "cross-wise: {e:?}");
+    assert!(
+        !has(&e, "mainx.py::a", H2) && !has(&e, "mainx.py::b", H),
+        "cross-wise: {e:?}"
+    );
 }
 
 #[test]
@@ -296,7 +339,10 @@ fn py_from_import_function_and_module_level_other_function_same_name() {
     let e = calls(&[LIB, LIB2, ("mainx.py", m)]);
     assert!(has(&e, "mainx.py::a", H2), "{e:?}");
     assert!(has(&e, "mainx.py::d", H), "{e:?}");
-    assert!(!has(&e, "mainx.py::a", H) && !has(&e, "mainx.py::d", H2), "{e:?}");
+    assert!(
+        !has(&e, "mainx.py::a", H) && !has(&e, "mainx.py::d", H2),
+        "{e:?}"
+    );
 }
 
 #[test]
@@ -304,7 +350,10 @@ fn py_module_level_import_in_function_scoped_flat_table_ordering() {
     // function import appears BEFORE the module-level import in file order.
     let m = "def a():\n    from lib2 import helper\n    return helper()\n\nfrom lib import helper\n\ndef d():\n    return helper()\n";
     let e = calls(&[LIB, LIB2, ("mainx.py", m)]);
-    assert!(has(&e, "mainx.py::a", H2) && has(&e, "mainx.py::d", H), "{e:?}");
+    assert!(
+        has(&e, "mainx.py::a", H2) && has(&e, "mainx.py::d", H),
+        "{e:?}"
+    );
 }
 
 #[test]
@@ -338,5 +387,8 @@ fn py_module_level_unresolved_import_then_function_import() {
     let m = "import missing as lib\n\ndef a():\n    import lib\n    return lib.helper()\n\ndef d():\n    return lib.helper()\n";
     let e = calls(&[LIB, ("mainx.py", m)]);
     assert!(has(&e, "mainx.py::a", H), "{e:?}");
-    assert!(!has(&e, "mainx.py::d", H), "d's lib is the external one: {e:?}");
+    assert!(
+        !has(&e, "mainx.py::d", H),
+        "d's lib is the external one: {e:?}"
+    );
 }

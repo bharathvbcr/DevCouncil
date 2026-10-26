@@ -40,7 +40,14 @@ fn super_with(extra: &[(&str, &str)], c_source: &str) -> Vec<String> {
     files.push(("c.py", c_source));
     let r = resolve(&files);
     let mut out: Vec<String> = Vec::new();
-    for name in ["m", "most_common", "move_to_end", "appendleft", "send", "_dump_registry"] {
+    for name in [
+        "m",
+        "most_common",
+        "move_to_end",
+        "appendleft",
+        "send",
+        "_dump_registry",
+    ] {
         out.extend(methods(&r, &format!("c.py::C.{name}")));
     }
     out.sort();
@@ -127,16 +134,18 @@ fn function_scope_import_of_other_module_does_not_change_module_level_reading() 
         ),
     );
     assert!(got.is_empty() || got == ["one.py::Base.m"], "{got:?}");
-    assert_eq!(got, ["one.py::Base.m"], "recall loss vs module-level reading");
+    assert_eq!(
+        got,
+        ["one.py::Base.m"],
+        "recall loss vs module-level reading"
+    );
 }
 
 // ---------------------------------------------------- 4. name is rebound
 
 fn field_go_files(extra: &[(&str, &str)], h: &str) -> Vec<String> {
-    let mut files: Vec<(&str, &str)> = vec![(
-        "a.py",
-        "class A:\n    def run(self):\n        return 1\n",
-    )];
+    let mut files: Vec<(&str, &str)> =
+        vec![("a.py", "class A:\n    def run(self):\n        return 1\n")];
     files.extend_from_slice(extra);
     files.push(("h.py", h));
     let r = resolve(&files);
@@ -148,7 +157,10 @@ const H_TAIL: &str =
 
 fn h_with(prefix: &str) -> Vec<String> {
     field_go_files(
-        &[("b.py", "class A:\n    def run(self):\n        return 2\n\nclass B(A):\n    pass\n")],
+        &[(
+            "b.py",
+            "class A:\n    def run(self):\n        return 2\n\nclass B(A):\n    pass\n",
+        )],
         &format!("from a import A\n{prefix}{H_TAIL}"),
     )
 }
@@ -159,7 +171,11 @@ fn class_body_rebinding_of_callee_does_not_poison() {
         &[],
         "from a import A\n\nclass H:\n    A = object\n    def __init__(self):\n        self.x = A()\n    def go(self):\n        return self.x.run()\n",
     );
-    assert_eq!(got, ["a.py::A.run"], "class body is no closure scope: {got:?}");
+    assert_eq!(
+        got,
+        ["a.py::A.run"],
+        "class body is no closure scope: {got:?}"
+    );
 }
 
 #[test]
@@ -316,7 +332,11 @@ fn decorator_attribute_named_like_a_custom_object_stays_an_instance() {
     // last segment calls it the builtin.
     let a = "class A:\n    def run(self):\n        return 1\n";
     let h = "from a import A\nimport deco\n\nclass H:\n    @deco.staticmethod\n    def start(self):\n        self.x = A()\n    def go(self):\n        return self.x.run()\n";
-    let r = resolve(&[("a.py", a), ("deco.py", "def staticmethod(f):\n    return f\n"), ("h.py", h)]);
+    let r = resolve(&[
+        ("a.py", a),
+        ("deco.py", "def staticmethod(f):\n    return f\n"),
+        ("h.py", h),
+    ]);
     assert_eq!(methods(&r, "h.py::H.go"), ["a.py::A.run"]);
 }
 
@@ -326,10 +346,15 @@ fn decorator_attribute_named_like_a_custom_object_stays_an_instance() {
 fn local_typing_module_disables_the_skip() {
     let got = super_with(
         &[
-            ("typing.py", "class Generic:\n    def m(self):\n        return 0\n"),
+            (
+                "typing.py",
+                "class Generic:\n    def m(self):\n        return 0\n",
+            ),
             ("base.py", BASE),
         ],
-        &format!("from typing import Generic\nfrom base import Base\n\nclass C(Generic, Base):\n{CM}"),
+        &format!(
+            "from typing import Generic\nfrom base import Base\n\nclass C(Generic, Base):\n{CM}"
+        ),
     );
     assert_eq!(got, ["typing.py::Generic.m"], "{got:?}");
 }
@@ -353,7 +378,10 @@ fn collections_abc_module_alias_is_not_the_abc_module() {
         &[],
         "from collections import abc\n\nclass Base:\n    def __contains__(self):\n        return 1\n\nclass C(abc.Mapping, Base):\n    def __contains__(self):\n        return super().__contains__()\n",
     );
-    assert!(got.is_empty(), "collections.abc.Mapping.get precedes Base: {got:?}");
+    assert!(
+        got.is_empty(),
+        "collections.abc.Mapping.get precedes Base: {got:?}"
+    );
 }
 
 #[test]
@@ -364,7 +392,10 @@ fn typing_counter_alias_has_methods_and_precedes_base() {
         &[],
         "from typing import Counter\n\nclass Base:\n    def most_common(self):\n        return 1\n\nclass C(Counter, Base):\n    def most_common(self):\n        return super().most_common()\n",
     );
-    assert!(got.is_empty(), "skipped typing.Mapping, bound Base.get: {got:?}");
+    assert!(
+        got.is_empty(),
+        "skipped typing.Mapping, bound Base.get: {got:?}"
+    );
 }
 
 #[test]
@@ -374,7 +405,10 @@ fn typing_ordereddict_subscripted_has_methods_and_precedes_base() {
         &[],
         "from typing import OrderedDict\n\nclass Base:\n    def move_to_end(self):\n        return 1\n\nclass C(OrderedDict[str, int], Base):\n    def move_to_end(self):\n        return super().move_to_end()\n",
     );
-    assert!(got.is_empty(), "skipped typing.Dict, bound Base.update: {got:?}");
+    assert!(
+        got.is_empty(),
+        "skipped typing.Dict, bound Base.update: {got:?}"
+    );
 }
 
 #[test]
@@ -570,7 +604,10 @@ fn parent_relative_import_module_binds() {
             &format!("from .. import base\n\nclass C(base.Base):\n{CM}"),
         ),
     ]);
-    assert_eq!(methods(&r, "pkg/sub/child.py::C.m"), ["pkg/base.py::Base.m"]);
+    assert_eq!(
+        methods(&r, "pkg/sub/child.py::C.m"),
+        ["pkg/base.py::Base.m"]
+    );
 }
 
 #[test]
@@ -613,7 +650,9 @@ fn super_inside_nested_class_method_binds_its_base() {
 fn import_at_module_level_inside_if_binds_once() {
     let got = super_with(
         &[("a.py", BASE)],
-        &format!("import sys\nif sys.version_info >= (3,):\n    import a\n\nclass C(a.Base):\n{CM}"),
+        &format!(
+            "import sys\nif sys.version_info >= (3,):\n    import a\n\nclass C(a.Base):\n{CM}"
+        ),
     );
     assert!(got.is_empty() || got == ["a.py::Base.m"], "{got:?}");
 }
@@ -624,7 +663,11 @@ fn dotted_base_with_comment_inside_parens_is_still_the_base() {
         &[("a.py", BASE)],
         &format!("import a\n\nclass C(\n    a  # the module\n    .Base\n):\n{CM}"),
     );
-    assert_eq!(got, ["a.py::Base.m"], "recall lost to the opaque marker: {got:?}");
+    assert_eq!(
+        got,
+        ["a.py::Base.m"],
+        "recall lost to the opaque marker: {got:?}"
+    );
 }
 
 #[test]
@@ -652,5 +695,9 @@ fn dotted_base_with_backslash_continuation_is_still_the_base() {
         &[("a.py", BASE)],
         &format!("import a\n\nclass C(a \\\n    .Base):\n{CM}"),
     );
-    assert_eq!(got, ["a.py::Base.m"], "recall lost to the opaque marker: {got:?}");
+    assert_eq!(
+        got,
+        ["a.py::Base.m"],
+        "recall lost to the opaque marker: {got:?}"
+    );
 }

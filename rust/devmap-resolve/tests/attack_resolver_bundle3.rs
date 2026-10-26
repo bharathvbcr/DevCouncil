@@ -13,7 +13,10 @@ fn run(files: &[(&str, &str)], kind: EdgeKind) -> E {
     resolver.index_extractions(&extractions);
     let result = resolver.resolve_all(&extractions).unwrap();
     for e in result.edges.iter().filter(|e| e.edge_kind == kind) {
-        println!("EDGE {} -> {} conf={:?}", e.source_symbol, e.target_symbol, e.confidence);
+        println!(
+            "EDGE {} -> {} conf={:?}",
+            e.source_symbol, e.target_symbol, e.confidence
+        );
     }
     let mut v: E = result
         .edges
@@ -43,15 +46,23 @@ const FIND: &str = "a/Repo.kt::Repo.find";
 fn z3_alias_named_like_a_repo_type_is_not_the_repo_type() {
     let callee = "package a\n\nimport ext.Thing as Repo\n\nfun make(): Repo<String> = TODO()\n\nfun use(): Int {\n    val r = make()\n    return r.find()\n}\n";
     let e = calls(&[REPO_A, ("a/F.kt", callee)]);
-    assert!(!has(&e, "a/F.kt::use", FIND), "alias bound to repo type: {e:?}");
+    assert!(
+        !has(&e, "a/F.kt::use", FIND),
+        "alias bound to repo type: {e:?}"
+    );
 }
 
 #[test]
 fn z3_nested_class_is_not_a_top_level_name() {
-    let outer = "package a\n\nclass Outer {\n    class Repo<T> {\n        fun find(): Int = 1\n    }\n}\n";
+    let outer =
+        "package a\n\nclass Outer {\n    class Repo<T> {\n        fun find(): Int = 1\n    }\n}\n";
     let callee = "package a\n\nimport ext.*\n\nfun make(): Repo<String> = TODO()\n\nfun use(): Int {\n    val r = make()\n    return r.find()\n}\n";
     let e = calls(&[("a/Outer.kt", outer), ("a/F.kt", callee)]);
-    assert!(!e.iter().any(|(f, t)| f == "a/F.kt::use" && t.contains("Repo.find")), "{e:?}");
+    assert!(
+        !e.iter()
+            .any(|(f, t)| f == "a/F.kt::use" && t.contains("Repo.find")),
+        "{e:?}"
+    );
 }
 
 #[test]
@@ -92,15 +103,24 @@ fn z3_member_shadows_toplevel_generic_factory() {
 #[test]
 #[ignore = "ft-2c800986: pre-existing, reverted per Fable 2026-10-21"]
 fn z3_default_import_name_repo_declared_and_explicitly_imported_binds() {
-    let res = ("a/Result.kt", "package a\n\nclass Result<T> {\n    fun get(): Int = 1\n}\n");
+    let res = (
+        "a/Result.kt",
+        "package a\n\nclass Result<T> {\n    fun get(): Int = 1\n}\n",
+    );
     let f = "package b\n\nimport a.Result\n\nfun make(): Result<String> = TODO()\n\nfun use(): Int {\n    val r = make()\n    return r.get()\n}\n";
     let e = calls(&[res, ("b/F.kt", f)]);
-    assert!(has(&e, "b/F.kt::use", "a/Result.kt::Result.get"), "recall: {e:?}");
+    assert!(
+        has(&e, "b/F.kt::use", "a/Result.kt::Result.get"),
+        "recall: {e:?}"
+    );
 }
 
 #[test]
 fn z3_default_import_name_not_imported_does_not_bind() {
-    let res = ("a/Result.kt", "package a\n\nclass Result<T> {\n    fun get(): Int = 1\n}\n");
+    let res = (
+        "a/Result.kt",
+        "package a\n\nclass Result<T> {\n    fun get(): Int = 1\n}\n",
+    );
     let f = "package b\n\nfun make(): Result<String> = TODO()\n\nfun use(): Int {\n    val r = make()\n    return r.get()\n}\n";
     let e = calls(&[res, ("b/F.kt", f)]);
     assert!(!has(&e, "b/F.kt::use", "a/Result.kt::Result.get"), "{e:?}");
@@ -122,17 +142,28 @@ fn z3_two_files_different_directories_same_package_recall() {
     // directory, not by Kotlin package, so a same-package callee in another
     // directory is not reached for nominal and generic factories alike. No
     // wrong edge may appear.
-    assert!(!e.iter().any(|(f, t)| f == "z/U.kt::use" && t != "x/y/F.kt::make"), "{e:?}");
+    assert!(
+        !e.iter()
+            .any(|(f, t)| f == "z/U.kt::use" && t != "x/y/F.kt::make"),
+        "{e:?}"
+    );
 }
 
 #[test]
 fn z3_use_file_imports_other_repo_type_of_same_name() {
-    let other = ("q2/Repo.kt", "package q2\n\nclass Repo<T> {\n    fun find(): Int = 1\n}\n");
+    let other = (
+        "q2/Repo.kt",
+        "package q2\n\nclass Repo<T> {\n    fun find(): Int = 1\n}\n",
+    );
     let callee = "package a\n\nfun make(): Repo<String> = TODO()\n";
     let user = "package q\n\nimport q2.Repo\nimport a.make\n\nfun use(): Int {\n    val r = make()\n    return r.find()\n}\n";
     let e = calls(&[REPO_A, other, ("a/F.kt", callee), ("q/U.kt", user)]);
     // `use -> make` is the legitimate call; only a bound `find` would be wrong.
-    assert!(!e.iter().any(|(f, t)| f == "q/U.kt::use" && t.ends_with("find")), "{e:?}");
+    assert!(
+        !e.iter()
+            .any(|(f, t)| f == "q/U.kt::use" && t.ends_with("find")),
+        "{e:?}"
+    );
 }
 
 #[test]
@@ -140,7 +171,10 @@ fn z3_two_libs_same_stdlib_name_two_files() {
     let callee = "package b\n\nimport lib1.Foo\n\nfun make(): Foo<String> = TODO()\n";
     let user = "package c\n\nimport b.make\nimport lib2.Foo\n\nprivate fun Foo<String>.ping(): Int = 1\n\nfun use(): Int {\n    val r = make()\n    return r.ping()\n}\n";
     let e = calls(&[("b/F.kt", callee), ("c/U.kt", user)]);
-    assert!(!has(&e, "c/U.kt::use", "c/U.kt::Foo.ping"), "lib1.Foo is not lib2.Foo: {e:?}");
+    assert!(
+        !has(&e, "c/U.kt::use", "c/U.kt::Foo.ping"),
+        "lib1.Foo is not lib2.Foo: {e:?}"
+    );
 }
 
 #[test]
@@ -148,7 +182,10 @@ fn z3_two_libs_same_stdlib_name_two_files() {
 fn z3_same_file_local_class_list_recall() {
     let src = "package p\n\nclass List<T> { fun total(): Int = 1 }\n\nfun names(): List<String> = List()\n\nfun use(): Int {\n    val n = names()\n    return n.total()\n}\n";
     let e = calls(&[("p/Z.kt", src)]);
-    assert!(has(&e, "p/Z.kt::use", "p/Z.kt::List.total"), "recall: {e:?}");
+    assert!(
+        has(&e, "p/Z.kt::use", "p/Z.kt::List.total"),
+        "recall: {e:?}"
+    );
 }
 
 #[test]
@@ -241,7 +278,10 @@ fn z3_no_package_clause_vs_packaged_repo() {
 
 #[test]
 fn z3_java_class_same_name_imported_explicitly() {
-    let java = ("ext/Repo.java", "package ext;\n\npublic class Repo<T> {\n    public int find() { return 1; }\n}\n");
+    let java = (
+        "ext/Repo.java",
+        "package ext;\n\npublic class Repo<T> {\n    public int find() { return 1; }\n}\n",
+    );
     let callee = "package a\n\nimport ext.Repo\n\nfun make(): Repo<String> = TODO()\n\nfun use(): Int {\n    val r = make()\n    return r.find()\n}\n";
     let e = calls(&[REPO_A, java, ("a/F.kt", callee)]);
     assert!(!has(&e, "a/F.kt::use", FIND), "{e:?}");
@@ -249,7 +289,10 @@ fn z3_java_class_same_name_imported_explicitly() {
 
 #[test]
 fn z3_explicit_import_of_nested_type() {
-    let outer = ("a/Outer.kt", "package a\n\nclass Outer {\n    class Repo<T> { fun find(): Int = 1 }\n}\n");
+    let outer = (
+        "a/Outer.kt",
+        "package a\n\nclass Outer {\n    class Repo<T> { fun find(): Int = 1 }\n}\n",
+    );
     let callee = "package b\n\nimport a.Outer.Repo\n\nfun make(): Repo<String> = TODO()\n\nfun use(): Int {\n    val r = make()\n    return r.find()\n}\n";
     let e = calls(&[REPO_A, outer, ("b/F.kt", callee)]);
     assert!(!has(&e, "b/F.kt::use", FIND), "{e:?}");
@@ -272,8 +315,14 @@ fn ov_java_inner_classes_same_name_methods_keep_recursion() {
     println!("java inner 2 files: {e:?}");
     let one = "package p;\n\nclass A {\n    static class Inner {\n        int run(int n) { return n > 0 ? run(n - 1) : 0; }\n    }\n    static class Other {\n        int run(int n) { return n > 0 ? run(n - 1) : 0; }\n    }\n}\n";
     let e = calls(&[("p/A.java", one)]);
-    assert!(e.iter().any(|(f, t)| f == t && f.contains("Inner")), "Inner.run recursion lost: {e:?}");
-    assert!(e.iter().any(|(f, t)| f == t && f.contains("Other")), "Other.run recursion lost: {e:?}");
+    assert!(
+        e.iter().any(|(f, t)| f == t && f.contains("Inner")),
+        "Inner.run recursion lost: {e:?}"
+    );
+    assert!(
+        e.iter().any(|(f, t)| f == t && f.contains("Other")),
+        "Other.run recursion lost: {e:?}"
+    );
 }
 
 /// Recorded for extract-v98 (the extractor mints one id for `A.Inner.run` and
@@ -285,7 +334,10 @@ fn ov_java_two_outer_each_with_inner_same_name_one_file() {
     let one = "package p;\n\nclass A {\n    static class Inner {\n        int run(int n) { return n > 0 ? run(n - 1) : 0; }\n    }\n}\n\nclass B {\n    static class Inner {\n        int run(int n) { return n > 0 ? run(n - 2) : 0; }\n    }\n}\n";
     let e = calls(&[("p/A.java", one)]);
     println!("two Inner one file: {e:?}");
-    assert!(e.iter().all(|(f, t)| f != t || f.contains("Inner")), "{e:?}");
+    assert!(
+        e.iter().all(|(f, t)| f != t || f.contains("Inner")),
+        "{e:?}"
+    );
 }
 
 #[test]
@@ -299,10 +351,14 @@ fn ov_java_instance_and_static_nested_overload_recursion_true_pair() {
 #[ignore = "ft-2c800986: pre-existing, reverted per Fable 2026-10-21"]
 fn ov_csharp_partial_classes_across_files_sibling_call_not_self() {
     let a = "namespace N {\n  partial class C {\n    int F(int a) { return a; }\n  }\n}\n";
-    let b = "namespace N {\n  partial class C {\n    int F(string s) { return F(s.Length); }\n  }\n}\n";
+    let b =
+        "namespace N {\n  partial class C {\n    int F(string s) { return F(s.Length); }\n  }\n}\n";
     let e = calls(&[("N/A.cs", a), ("N/B.cs", b)]);
     println!("partial: {e:?}");
-    assert!(!e.iter().any(|(f, t)| f == t), "self edge for a call to the other partial's F(int): {e:?}");
+    assert!(
+        !e.iter().any(|(f, t)| f == t),
+        "self edge for a call to the other partial's F(int): {e:?}"
+    );
 }
 
 #[test]
@@ -312,7 +368,10 @@ fn ov_swift_extensions_across_files_sibling_call_not_self() {
     let b = "extension T {\n  func f(_ s: String) -> Int { return f(s.count) }\n}\n";
     let e = calls(&[("A.swift", a), ("B.swift", b)]);
     println!("swift ext files: {e:?}");
-    assert!(!e.iter().any(|(f, t)| f == t), "self edge for call to the other file's f(Int): {e:?}");
+    assert!(
+        !e.iter().any(|(f, t)| f == t),
+        "self edge for call to the other file's f(Int): {e:?}"
+    );
 }
 
 #[test]
@@ -326,7 +385,10 @@ fn ov_swift_extensions_same_file_overload_siblings() {
 fn ov_swift_extension_real_recursion_single_decl() {
     let a = "extension Int {\n  func fact() -> Int { return self <= 1 ? 1 : self * (self - 1).fact() }\n}\nstruct S { func g(_ n: Int) -> Int { return n > 0 ? g(n - 1) : 0 } }\n";
     let e = calls(&[("A.swift", a)]);
-    assert!(e.iter().any(|(f, t)| f == t && f.contains("g")), "S.g recursion lost: {e:?}");
+    assert!(
+        e.iter().any(|(f, t)| f == t && f.contains("g")),
+        "S.g recursion lost: {e:?}"
+    );
 }
 
 #[test]
@@ -343,7 +405,11 @@ fn ov_swift_protocol_default_impl_and_requirement_same_name_recursion_through_ot
     let a = "protocol P {\n  func f()\n}\nextension P {\n  func f() {}\n  func h() { f() }\n}\nstruct S: P {\n  func f() {}\n}\n";
     let e = calls(&[("A.swift", a)]);
     println!("proto req+default: {e:?}");
-    assert!(e.iter().any(|(f, t)| f.ends_with("P.h") && t.ends_with("S.f")), "fan-out lost: {e:?}");
+    assert!(
+        e.iter()
+            .any(|(f, t)| f.ends_with("P.h") && t.ends_with("S.f")),
+        "fan-out lost: {e:?}"
+    );
 }
 
 #[test]
@@ -380,7 +446,10 @@ fn ov_kotlin_two_extension_overloads_on_different_receivers_recursion() {
     let src = "package p\n\nclass A\nclass B\n\nfun A.go(n: Int): Int = if (n > 0) go(n - 1) else 0\n\nfun B.go(n: Int): Int = if (n > 0) go(n - 1) else 0\n";
     let e = calls(&[("p/Z.kt", src)]);
     println!("two ext receivers: {e:?}");
-    assert!(e.iter().filter(|(f, t)| f == t).count() == 2, "true recursion lost on distinct receivers: {e:?}");
+    assert!(
+        e.iter().filter(|(f, t)| f == t).count() == 2,
+        "true recursion lost on distinct receivers: {e:?}"
+    );
 }
 
 #[test]
@@ -422,7 +491,8 @@ fn m1_protocol_extension_overload_delegating_to_other_conformers() {
     println!("m1 conformers: {e:?}");
     // The call `add(a.count)` is add(Int): a true edge to each conformer's add exists.
     assert!(
-        e.iter().any(|(f, t)| f.ends_with("Adder.add") && t.ends_with("Calc.add")),
+        e.iter()
+            .any(|(f, t)| f.ends_with("Adder.add") && t.ends_with("Calc.add")),
         "cross-conformer fan-out lost: {e:?}"
     );
 }
@@ -431,8 +501,16 @@ fn m1_protocol_extension_overload_delegating_to_other_conformers() {
 fn m1_protocol_extension_nonoverloaded_fan_out_kept() {
     let a = "protocol Greeter {\n  func name() -> String\n}\n\nextension Greeter {\n  func greet() -> String { return name() }\n}\n\nclass A: Greeter {\n  func name() -> String { return \"a\" }\n}\n\nclass B: Greeter {\n  func name() -> String { return \"b\" }\n}\n";
     let e = calls(&[("A.swift", a)]);
-    assert!(e.iter().any(|(f, t)| f.ends_with("Greeter.greet") && t.ends_with("A.name")), "{e:?}");
-    assert!(e.iter().any(|(f, t)| f.ends_with("Greeter.greet") && t.ends_with("B.name")), "{e:?}");
+    assert!(
+        e.iter()
+            .any(|(f, t)| f.ends_with("Greeter.greet") && t.ends_with("A.name")),
+        "{e:?}"
+    );
+    assert!(
+        e.iter()
+            .any(|(f, t)| f.ends_with("Greeter.greet") && t.ends_with("B.name")),
+        "{e:?}"
+    );
 }
 
 #[test]
@@ -441,7 +519,11 @@ fn m1_conformer_overloads_call_each_other() {
     let e = calls(&[("A.swift", a)]);
     println!("m1 conformer: {e:?}");
     assert!(!e.iter().any(|(f, t)| f == t), "{e:?}");
-    assert!(e.iter().any(|(f, t)| f.ends_with("::go") && t.ends_with("Calc.add")), "{e:?}");
+    assert!(
+        e.iter()
+            .any(|(f, t)| f.ends_with("::go") && t.ends_with("Calc.add")),
+        "{e:?}"
+    );
 }
 
 // ---- baselines / blame ----
@@ -457,7 +539,10 @@ fn base_member_shadows_toplevel_nominal_factory() {
 #[test]
 #[ignore = "ft-2c800986: pre-existing, reverted per Fable 2026-10-21"]
 fn base_star_import_after_explicit_nominal() {
-    let repo = ("a/Repo.kt", "package a\n\nclass Repo {\n    fun find(): Int = 1\n}\n");
+    let repo = (
+        "a/Repo.kt",
+        "package a\n\nclass Repo {\n    fun find(): Int = 1\n}\n",
+    );
     let src = "package b\n\nimport ext.Repo\nimport a.*\n\nfun use(r: Repo): Int {\n    return r.find()\n}\n";
     let e = calls(&[repo, ("b/F.kt", src)]);
     assert!(!has(&e, "b/F.kt::use", "a/Repo.kt::Repo.find"), "{e:?}");
@@ -476,7 +561,11 @@ fn base_nested_class_nominal_factory() {
     let outer = "package a\n\nclass Outer {\n    class Repo { fun find(): Int = 1 }\n}\n";
     let callee = "package a\n\nimport ext.*\n\nfun make(): Repo = TODO()\n\nfun use(): Int {\n    val r = make()\n    return r.find()\n}\n";
     let e = calls(&[("a/Outer.kt", outer), ("a/F.kt", callee)]);
-    assert!(!e.iter().any(|(f, t)| f == "a/F.kt::use" && t.contains("Repo.find")), "{e:?}");
+    assert!(
+        !e.iter()
+            .any(|(f, t)| f == "a/F.kt::use" && t.contains("Repo.find")),
+        "{e:?}"
+    );
 }
 
 #[test]

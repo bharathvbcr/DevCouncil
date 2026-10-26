@@ -84,75 +84,495 @@ macro_rules! alias_case {
     };
 }
 
-alias_case!(typing_counter_methods, "import typing", "typing.Counter",
-    ["most_common", "elements", "subtract", "total", "update", "copy", "fromkeys", "get", "items", "keys", "values", "pop", "popitem", "setdefault", "clear"]);
-alias_case!(typing_ordered_dict_methods, "import typing", "typing.OrderedDict",
-    ["move_to_end", "popitem", "copy", "fromkeys", "update", "setdefault", "pop", "get", "keys", "items", "values", "clear"]);
-alias_case!(typing_deque_methods, "import typing", "typing.Deque",
-    ["append", "appendleft", "rotate", "extendleft", "extend", "popleft", "pop", "maxlen", "copy", "count", "index", "insert", "remove", "reverse", "clear"]);
-alias_case!(typing_defaultdict_methods, "import typing", "typing.DefaultDict",
-    ["default_factory", "copy", "fromkeys", "get", "items", "keys", "values", "pop", "popitem", "setdefault", "update", "clear"]);
-alias_case!(typing_defaultdict_dunder_missing, "import typing", "typing.DefaultDict", ["__missing__"]);
-alias_case!(typing_chainmap_methods, "import typing", "typing.ChainMap",
-    ["new_child", "parents", "maps", "copy", "get", "items", "keys", "values", "pop", "popitem", "setdefault", "update", "clear", "fromkeys"]);
-alias_case!(typing_dict_methods, "import typing", "typing.Dict",
-    ["clear", "copy", "fromkeys", "get", "items", "keys", "pop", "popitem", "setdefault", "update", "values"]);
-alias_case!(typing_list_methods, "import typing", "typing.List",
-    ["append", "clear", "copy", "count", "extend", "index", "insert", "pop", "remove", "reverse", "sort"]);
-alias_case!(typing_set_methods, "import typing", "typing.Set",
-    ["add", "clear", "copy", "difference", "difference_update", "discard", "intersection", "intersection_update", "isdisjoint", "issubset", "issuperset", "pop", "remove", "symmetric_difference", "symmetric_difference_update", "union", "update"]);
-alias_case!(typing_frozenset_methods, "import typing", "typing.FrozenSet",
-    ["copy", "difference", "intersection", "isdisjoint", "issubset", "issuperset", "symmetric_difference", "union"]);
-alias_case!(typing_tuple_methods, "import typing", "typing.Tuple", ["count", "index"]);
-alias_case!(typing_mapping_mixins, "import typing", "typing.Mapping", ["get", "keys", "items", "values"]);
-alias_case!(typing_mutable_mapping_mixins, "import typing", "typing.MutableMapping",
-    ["get", "keys", "items", "values", "pop", "popitem", "clear", "update", "setdefault"]);
-alias_case!(typing_sequence_mixins, "import typing", "typing.Sequence", ["index", "count"]);
-alias_case!(typing_mutable_sequence_mixins, "import typing", "typing.MutableSequence",
-    ["index", "count", "insert", "append", "reverse", "extend", "pop", "remove", "clear"]);
-alias_case!(typing_mutable_sequence_iadd, "import typing", "typing.MutableSequence", ["__iadd__"]);
-alias_case!(typing_abstract_set_private_mixins, "import typing", "typing.AbstractSet", ["_hash", "_from_iterable"]);
-alias_case!(typing_mutable_set_mixins, "import typing", "typing.MutableSet",
-    ["add", "discard", "remove", "pop", "clear", "isdisjoint", "_hash", "_from_iterable"]);
-alias_case!(typing_keys_view_private, "import typing", "typing.KeysView", ["isdisjoint", "_from_iterable", "_hash"]);
-alias_case!(typing_iterator_generator_methods, "import typing", "typing.Generator", ["send", "throw", "close"]);
-alias_case!(typing_iterator_dunders, "import typing", "typing.Iterator", ["__next__", "__iter__"]);
-alias_case!(typing_async_generator_methods, "import typing", "typing.AsyncGenerator", ["asend", "athrow", "aclose"]);
-alias_case!(typing_coroutine_methods, "import typing", "typing.Coroutine", ["send", "throw", "close"]);
-alias_case!(typing_namedtuple_methods, "import typing", "typing.NamedTuple",
-    ["_asdict", "_replace", "_fields", "_make", "_field_defaults", "count", "index"]);
-alias_case!(typing_typeddict_methods, "import typing", "typing.TypedDict",
-    ["copy", "get", "items", "keys", "pop", "popitem", "setdefault", "update", "values", "clear", "fromkeys"]);
-alias_case!(typing_io_methods, "import typing", "typing.IO",
-    ["read", "write", "readline", "readlines", "writelines", "seek", "tell", "flush", "fileno", "isatty", "readable", "seekable", "writable", "truncate", "close", "closed", "mode", "name"]);
-alias_case!(typing_textio_methods, "import typing", "typing.TextIO",
-    ["read", "write", "readline", "seek", "buffer", "encoding", "errors", "line_buffering", "newlines"]);
-alias_case!(typing_binaryio_methods, "import typing", "typing.BinaryIO", ["read", "write", "readline", "seek", "close"]);
-alias_case!(typing_pattern_methods, "import typing", "typing.Pattern",
-    ["search", "match", "fullmatch", "split", "findall", "finditer", "sub", "subn", "pattern", "flags", "groups", "groupindex"]);
-alias_case!(typing_match_methods, "import typing", "typing.Match",
-    ["group", "groups", "groupdict", "start", "end", "span", "expand", "string", "re", "pos", "endpos", "lastindex", "lastgroup", "regs"]);
-alias_case!(typing_text_is_str, "import typing", "typing.Text",
-    ["upper", "lower", "split", "strip", "join", "replace", "format", "encode", "startswith", "endswith", "find", "title"]);
+alias_case!(
+    typing_counter_methods,
+    "import typing",
+    "typing.Counter",
+    [
+        "most_common",
+        "elements",
+        "subtract",
+        "total",
+        "update",
+        "copy",
+        "fromkeys",
+        "get",
+        "items",
+        "keys",
+        "values",
+        "pop",
+        "popitem",
+        "setdefault",
+        "clear"
+    ]
+);
+alias_case!(
+    typing_ordered_dict_methods,
+    "import typing",
+    "typing.OrderedDict",
+    [
+        "move_to_end",
+        "popitem",
+        "copy",
+        "fromkeys",
+        "update",
+        "setdefault",
+        "pop",
+        "get",
+        "keys",
+        "items",
+        "values",
+        "clear"
+    ]
+);
+alias_case!(
+    typing_deque_methods,
+    "import typing",
+    "typing.Deque",
+    [
+        "append",
+        "appendleft",
+        "rotate",
+        "extendleft",
+        "extend",
+        "popleft",
+        "pop",
+        "maxlen",
+        "copy",
+        "count",
+        "index",
+        "insert",
+        "remove",
+        "reverse",
+        "clear"
+    ]
+);
+alias_case!(
+    typing_defaultdict_methods,
+    "import typing",
+    "typing.DefaultDict",
+    [
+        "default_factory",
+        "copy",
+        "fromkeys",
+        "get",
+        "items",
+        "keys",
+        "values",
+        "pop",
+        "popitem",
+        "setdefault",
+        "update",
+        "clear"
+    ]
+);
+alias_case!(
+    typing_defaultdict_dunder_missing,
+    "import typing",
+    "typing.DefaultDict",
+    ["__missing__"]
+);
+alias_case!(
+    typing_chainmap_methods,
+    "import typing",
+    "typing.ChainMap",
+    [
+        "new_child",
+        "parents",
+        "maps",
+        "copy",
+        "get",
+        "items",
+        "keys",
+        "values",
+        "pop",
+        "popitem",
+        "setdefault",
+        "update",
+        "clear",
+        "fromkeys"
+    ]
+);
+alias_case!(
+    typing_dict_methods,
+    "import typing",
+    "typing.Dict",
+    [
+        "clear",
+        "copy",
+        "fromkeys",
+        "get",
+        "items",
+        "keys",
+        "pop",
+        "popitem",
+        "setdefault",
+        "update",
+        "values"
+    ]
+);
+alias_case!(
+    typing_list_methods,
+    "import typing",
+    "typing.List",
+    [
+        "append", "clear", "copy", "count", "extend", "index", "insert", "pop", "remove",
+        "reverse", "sort"
+    ]
+);
+alias_case!(
+    typing_set_methods,
+    "import typing",
+    "typing.Set",
+    [
+        "add",
+        "clear",
+        "copy",
+        "difference",
+        "difference_update",
+        "discard",
+        "intersection",
+        "intersection_update",
+        "isdisjoint",
+        "issubset",
+        "issuperset",
+        "pop",
+        "remove",
+        "symmetric_difference",
+        "symmetric_difference_update",
+        "union",
+        "update"
+    ]
+);
+alias_case!(
+    typing_frozenset_methods,
+    "import typing",
+    "typing.FrozenSet",
+    [
+        "copy",
+        "difference",
+        "intersection",
+        "isdisjoint",
+        "issubset",
+        "issuperset",
+        "symmetric_difference",
+        "union"
+    ]
+);
+alias_case!(
+    typing_tuple_methods,
+    "import typing",
+    "typing.Tuple",
+    ["count", "index"]
+);
+alias_case!(
+    typing_mapping_mixins,
+    "import typing",
+    "typing.Mapping",
+    ["get", "keys", "items", "values"]
+);
+alias_case!(
+    typing_mutable_mapping_mixins,
+    "import typing",
+    "typing.MutableMapping",
+    [
+        "get",
+        "keys",
+        "items",
+        "values",
+        "pop",
+        "popitem",
+        "clear",
+        "update",
+        "setdefault"
+    ]
+);
+alias_case!(
+    typing_sequence_mixins,
+    "import typing",
+    "typing.Sequence",
+    ["index", "count"]
+);
+alias_case!(
+    typing_mutable_sequence_mixins,
+    "import typing",
+    "typing.MutableSequence",
+    ["index", "count", "insert", "append", "reverse", "extend", "pop", "remove", "clear"]
+);
+alias_case!(
+    typing_mutable_sequence_iadd,
+    "import typing",
+    "typing.MutableSequence",
+    ["__iadd__"]
+);
+alias_case!(
+    typing_abstract_set_private_mixins,
+    "import typing",
+    "typing.AbstractSet",
+    ["_hash", "_from_iterable"]
+);
+alias_case!(
+    typing_mutable_set_mixins,
+    "import typing",
+    "typing.MutableSet",
+    [
+        "add",
+        "discard",
+        "remove",
+        "pop",
+        "clear",
+        "isdisjoint",
+        "_hash",
+        "_from_iterable"
+    ]
+);
+alias_case!(
+    typing_keys_view_private,
+    "import typing",
+    "typing.KeysView",
+    ["isdisjoint", "_from_iterable", "_hash"]
+);
+alias_case!(
+    typing_iterator_generator_methods,
+    "import typing",
+    "typing.Generator",
+    ["send", "throw", "close"]
+);
+alias_case!(
+    typing_iterator_dunders,
+    "import typing",
+    "typing.Iterator",
+    ["__next__", "__iter__"]
+);
+alias_case!(
+    typing_async_generator_methods,
+    "import typing",
+    "typing.AsyncGenerator",
+    ["asend", "athrow", "aclose"]
+);
+alias_case!(
+    typing_coroutine_methods,
+    "import typing",
+    "typing.Coroutine",
+    ["send", "throw", "close"]
+);
+alias_case!(
+    typing_namedtuple_methods,
+    "import typing",
+    "typing.NamedTuple",
+    [
+        "_asdict",
+        "_replace",
+        "_fields",
+        "_make",
+        "_field_defaults",
+        "count",
+        "index"
+    ]
+);
+alias_case!(
+    typing_typeddict_methods,
+    "import typing",
+    "typing.TypedDict",
+    [
+        "copy",
+        "get",
+        "items",
+        "keys",
+        "pop",
+        "popitem",
+        "setdefault",
+        "update",
+        "values",
+        "clear",
+        "fromkeys"
+    ]
+);
+alias_case!(
+    typing_io_methods,
+    "import typing",
+    "typing.IO",
+    [
+        "read",
+        "write",
+        "readline",
+        "readlines",
+        "writelines",
+        "seek",
+        "tell",
+        "flush",
+        "fileno",
+        "isatty",
+        "readable",
+        "seekable",
+        "writable",
+        "truncate",
+        "close",
+        "closed",
+        "mode",
+        "name"
+    ]
+);
+alias_case!(
+    typing_textio_methods,
+    "import typing",
+    "typing.TextIO",
+    [
+        "read",
+        "write",
+        "readline",
+        "seek",
+        "buffer",
+        "encoding",
+        "errors",
+        "line_buffering",
+        "newlines"
+    ]
+);
+alias_case!(
+    typing_binaryio_methods,
+    "import typing",
+    "typing.BinaryIO",
+    ["read", "write", "readline", "seek", "close"]
+);
+alias_case!(
+    typing_pattern_methods,
+    "import typing",
+    "typing.Pattern",
+    [
+        "search",
+        "match",
+        "fullmatch",
+        "split",
+        "findall",
+        "finditer",
+        "sub",
+        "subn",
+        "pattern",
+        "flags",
+        "groups",
+        "groupindex"
+    ]
+);
+alias_case!(
+    typing_match_methods,
+    "import typing",
+    "typing.Match",
+    [
+        "group",
+        "groups",
+        "groupdict",
+        "start",
+        "end",
+        "span",
+        "expand",
+        "string",
+        "re",
+        "pos",
+        "endpos",
+        "lastindex",
+        "lastgroup",
+        "regs"
+    ]
+);
+alias_case!(
+    typing_text_is_str,
+    "import typing",
+    "typing.Text",
+    [
+        "upper",
+        "lower",
+        "split",
+        "strip",
+        "join",
+        "replace",
+        "format",
+        "encode",
+        "startswith",
+        "endswith",
+        "find",
+        "title"
+    ]
+);
 alias_case!(typing_type_is_type, "import typing", "typing.Type", ["mro"]);
-alias_case!(typing_awaitable_dunder, "import typing", "typing.Awaitable", ["__await__"]);
-alias_case!(typing_context_manager_dunder, "import typing", "typing.ContextManager", ["__enter__", "__exit__"]);
+alias_case!(
+    typing_awaitable_dunder,
+    "import typing",
+    "typing.Awaitable",
+    ["__await__"]
+);
+alias_case!(
+    typing_context_manager_dunder,
+    "import typing",
+    "typing.ContextManager",
+    ["__enter__", "__exit__"]
+);
 
 // Spellings of the same member.
-alias_case!(from_import_spelling_most_common, "from typing import Counter", "Counter", ["most_common"]);
-alias_case!(aliased_module_spelling_pattern, "import typing as t", "t.Pattern", ["search"]);
-alias_case!(subscripted_spelling_default_factory, "import typing", "typing.DefaultDict[str, int]", ["default_factory"]);
-alias_case!(typing_extensions_counter_total, "import typing_extensions as te", "te.Counter", ["total", "most_common"]);
-alias_case!(typing_extensions_text, "import typing_extensions as te", "te.Text", ["upper"]);
+alias_case!(
+    from_import_spelling_most_common,
+    "from typing import Counter",
+    "Counter",
+    ["most_common"]
+);
+alias_case!(
+    aliased_module_spelling_pattern,
+    "import typing as t",
+    "t.Pattern",
+    ["search"]
+);
+alias_case!(
+    subscripted_spelling_default_factory,
+    "import typing",
+    "typing.DefaultDict[str, int]",
+    ["default_factory"]
+);
+alias_case!(
+    typing_extensions_counter_total,
+    "import typing_extensions as te",
+    "te.Counter",
+    ["total", "most_common"]
+);
+alias_case!(
+    typing_extensions_text,
+    "import typing_extensions as te",
+    "te.Text",
+    ["upper"]
+);
 
 // A typing name the table has no row for must stay fully opaque: nothing is
 // known about what it defines, so the walk may never pass it.
-alias_case!(unknown_typing_name_is_opaque, "import typing", "typing.NoSuchTypingName", ["m"]);
-alias_case!(typing_extensions_doc_is_opaque, "import typing_extensions as te", "te.Doc", ["documentation"]);
-alias_case!(typing_extensions_future_name_is_opaque, "import typing_extensions as te", "te.FutureNamedThing", ["m"]);
-alias_case!(typing_newtype_is_opaque, "import typing", "typing.NewType", ["m"]);
+alias_case!(
+    unknown_typing_name_is_opaque,
+    "import typing",
+    "typing.NoSuchTypingName",
+    ["m"]
+);
+alias_case!(
+    typing_extensions_doc_is_opaque,
+    "import typing_extensions as te",
+    "te.Doc",
+    ["documentation"]
+);
+alias_case!(
+    typing_extensions_future_name_is_opaque,
+    "import typing_extensions as te",
+    "te.FutureNamedThing",
+    ["m"]
+);
+alias_case!(
+    typing_newtype_is_opaque,
+    "import typing",
+    "typing.NewType",
+    ["m"]
+);
 alias_case!(typing_any_is_opaque, "import typing", "typing.Any", ["m"]);
-alias_case!(typing_forward_ref_is_opaque, "import typing", "typing.ForwardRef", ["_evaluate"]);
+alias_case!(
+    typing_forward_ref_is_opaque,
+    "import typing",
+    "typing.ForwardRef",
+    ["_evaluate"]
+);
 
 /// `self.most_common()` in a `Counter` subclass that lists an in-repo class
 /// after it: the MRO stops at `Counter`. (Checked against 103272ea to say
@@ -220,8 +640,18 @@ fn protocol_spellings_are_all_structural() {
         let src = format!(
             "{import}\nfrom base import Base\n\nclass C({head}, Base):\n    def m(self):\n        return super().m()\n"
         );
-        let r = resolve(&[("base.py", "class Base:\n    def m(self):\n        return 1\n"), ("c.py", src.as_str())]);
-        assert_eq!(methods(&r, "c.py::C.m"), ["base.py::Base.m"], "{import_and_head:?}");
+        let r = resolve(&[
+            (
+                "base.py",
+                "class Base:\n    def m(self):\n        return 1\n",
+            ),
+            ("c.py", src.as_str()),
+        ]);
+        assert_eq!(
+            methods(&r, "c.py::C.m"),
+            ["base.py::Base.m"],
+            "{import_and_head:?}"
+        );
     }
 }
 
@@ -231,7 +661,10 @@ fn abc_init_subclass_reaches_base() {
     let base = "class Base:\n    def __init_subclass__(cls, **kw):\n        pass\n";
     let c = "import abc\nfrom base import Base\n\nclass C(abc.ABC, Base):\n    def __init_subclass__(cls, **kw):\n        super().__init_subclass__(**kw)\n";
     let r = resolve(&[("base.py", base), ("c.py", c)]);
-    assert_eq!(methods(&r, "c.py::C.__init_subclass__"), ["base.py::Base.__init_subclass__"]);
+    assert_eq!(
+        methods(&r, "c.py::C.__init_subclass__"),
+        ["base.py::Base.__init_subclass__"]
+    );
 }
 
 #[test]
@@ -247,7 +680,14 @@ fn a_local_typing_module_is_not_the_stdlib_structural_marker() {
     // `typing.py` is in the corpus, and `Generic` there is a real class with `m`.
     let typing = "class Generic:\n    def m(self):\n        return 1\n";
     let c = "from typing import Generic\nfrom base import Base\n\nclass C(Generic, Base):\n    def m(self):\n        return super().m()\n";
-    let r = resolve(&[("base.py", "class Base:\n    def m(self):\n        return 2\n"), ("typing.py", typing), ("c.py", c)]);
+    let r = resolve(&[
+        (
+            "base.py",
+            "class Base:\n    def m(self):\n        return 2\n",
+        ),
+        ("typing.py", typing),
+        ("c.py", c),
+    ]);
     assert_eq!(methods(&r, "c.py::C.m"), ["typing.py::Generic.m"]);
 }
 
@@ -295,7 +735,10 @@ fn del_inside_a_function_does_not_mark_module_scope() {
 
 #[test]
 fn for_inside_a_function_does_not_mark_module_scope() {
-    assert_eq!(h_with("def f(xs):\n    for A in xs:\n        pass\n"), A_RUN);
+    assert_eq!(
+        h_with("def f(xs):\n    for A in xs:\n        pass\n"),
+        A_RUN
+    );
 }
 
 #[test]
@@ -310,7 +753,10 @@ fn comprehension_target_does_not_mark_module_scope() {
 
 #[test]
 fn with_alias_in_a_function_does_not_mark_module_scope() {
-    assert_eq!(h_with("def f():\n    with g() as A:\n        pass\n"), A_RUN);
+    assert_eq!(
+        h_with("def f():\n    with g() as A:\n        pass\n"),
+        A_RUN
+    );
 }
 
 #[test]
@@ -320,7 +766,10 @@ fn dunder_all_does_not_rebind() {
 
 #[test]
 fn class_body_for_does_not_mark_module_scope() {
-    assert_eq!(h_with("class K:\n    for A in range(3):\n        pass\n"), A_RUN);
+    assert_eq!(
+        h_with("class K:\n    for A in range(3):\n        pass\n"),
+        A_RUN
+    );
 }
 
 #[test]
@@ -339,7 +788,10 @@ fn star_import_of_a_module_that_cannot_define_the_name_still_binds() {
         &[("m.py", "__all__ = ['X']\nX = 1\nA = 2\n")],
         &format!("from a import A\nfrom m import *\n{H_TAIL}"),
     );
-    assert_eq!(got, A_RUN, "recall loss: star after the import abstains the whole file");
+    assert_eq!(
+        got, A_RUN,
+        "recall loss: star after the import abstains the whole file"
+    );
 }
 
 #[test]
@@ -348,7 +800,10 @@ fn star_import_of_an_unrelated_module_does_not_poison_a_typing_skip() {
     // `Generic`: the skip over `Generic` must still hold.
     let src = "from typing import Generic, TypeVar\nfrom m import *\nfrom base import Base\nT = TypeVar('T')\n\nclass C(Generic[T], Base):\n    def m(self):\n        return super().m()\n";
     let r = resolve(&[
-        ("base.py", "class Base:\n    def m(self):\n        return 2\n"),
+        (
+            "base.py",
+            "class Base:\n    def m(self):\n        return 2\n",
+        ),
         ("m.py", "X = 1\n"),
         ("c.py", src),
     ]);
@@ -359,15 +814,26 @@ fn star_import_of_an_unrelated_module_does_not_poison_a_typing_skip() {
 
 #[test]
 fn match_capture_pattern_rebinds_the_name() {
-    for case in ["[A, _]", "{'k': A}", "P(x=A)", "_ as A", "(1, A)", "[*A]", "{**A}"] {
+    for case in [
+        "[A, _]", "{'k': A}", "P(x=A)", "_ as A", "(1, A)", "[*A]", "{**A}",
+    ] {
         let got = h_with(&format!("match V:\n    case {case}:\n        pass\n"));
-        assert!(got.is_empty(), "`case {case}` binds A at module scope: {got:?}");
+        assert!(
+            got.is_empty(),
+            "`case {case}` binds A at module scope: {got:?}"
+        );
     }
 }
 
 #[test]
 fn annotated_and_chained_and_augmented_assignment_rebind() {
-    for prefix in ["A: type = object\n", "A = B = object\n", "B, A = 1, object\n", "A, = (object,)\n", "[A] = [object]\n"] {
+    for prefix in [
+        "A: type = object\n",
+        "A = B = object\n",
+        "B, A = 1, object\n",
+        "A, = (object,)\n",
+        "[A] = [object]\n",
+    ] {
         let got = h_with(prefix);
         assert!(got.is_empty(), "{prefix:?}: {got:?}");
     }
@@ -442,7 +908,10 @@ fn function_build_and_module_class_build_with_nested_h_collide() {
         &[],
         "from a import A\n\ndef build():\n    A = object\n    class H:\n        def __init__(self):\n            self.x = A()\n        def go(self):\n            return self.x.run()\n    return H\n\nclass build:\n    class H:\n        def go(self):\n            return 1\n",
     );
-    assert!(got.is_empty(), "the function's H reads its local A: {got:?}");
+    assert!(
+        got.is_empty(),
+        "the function's H reads its local A: {got:?}"
+    );
 }
 
 #[test]
@@ -450,7 +919,10 @@ fn module_class_build_nested_h_does_not_inherit_a_functions_local() {
     // Module-level `class build: class H` reads the MODULE `A`. A sibling
     // function `build` with a local `A` must not poison it (recall).
     let src = "from a import A\n\ndef build():\n    A = object\n    return A\n\nclass build:\n    class H:\n        def __init__(self):\n            self.x = A()\n        def go(self):\n            return self.x.run()\n";
-    let r = resolve(&[("a.py", "class A:\n    def run(self):\n        return 1\n"), ("h.py", src)]);
+    let r = resolve(&[
+        ("a.py", "class A:\n    def run(self):\n        return 1\n"),
+        ("h.py", src),
+    ]);
     assert_eq!(go_edges(&r), A_RUN);
 }
 
@@ -470,7 +942,10 @@ fn a_function_named_like_a_module_class_keeps_its_locals() {
 fn redefined_function_build_second_has_no_local_binds() {
     // Two `build` functions; `H` lives in the second, which has no local `A`.
     let src = "from a import A\n\ndef build():\n    A = object\n    return A\n\ndef build():\n    class H:\n        def __init__(self):\n            self.x = A()\n        def go(self):\n            return self.x.run()\n    return H\n";
-    let r = resolve(&[("a.py", "class A:\n    def run(self):\n        return 1\n"), ("h.py", src)]);
+    let r = resolve(&[
+        ("a.py", "class A:\n    def run(self):\n        return 1\n"),
+        ("h.py", src),
+    ]);
     assert_eq!(go_edges(&r), A_RUN);
 }
 
@@ -499,14 +974,26 @@ fn class_in_one_branch_function_in_the_other_is_not_one_class() {
 #[test]
 fn type_checking_import_with_no_else_still_binds() {
     let src = "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    from base import Base\n\nclass C(Base):\n    def m(self):\n        return super().m()\n";
-    let r = resolve(&[("base.py", "class Base:\n    def m(self):\n        return 1\n"), ("c.py", src)]);
+    let r = resolve(&[
+        (
+            "base.py",
+            "class Base:\n    def m(self):\n        return 1\n",
+        ),
+        ("c.py", src),
+    ]);
     assert_eq!(methods(&r, "c.py::C.m"), ["base.py::Base.m"]);
 }
 
 #[test]
 fn type_checking_import_else_assignment_abstains() {
     let src = "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    from base import Base\nelse:\n    Base = object\n\nclass C(Base):\n    def m(self):\n        return super().m()\n";
-    let r = resolve(&[("base.py", "class Base:\n    def m(self):\n        return 1\n"), ("c.py", src)]);
+    let r = resolve(&[
+        (
+            "base.py",
+            "class Base:\n    def m(self):\n        return 1\n",
+        ),
+        ("c.py", src),
+    ]);
     assert!(methods(&r, "c.py::C.m").is_empty());
 }
 
@@ -514,17 +1001,33 @@ fn type_checking_import_else_assignment_abstains() {
 fn type_checking_import_else_other_import_abstains() {
     let src = "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    from base import Base\nelse:\n    from other import Base\n\nclass C(Base):\n    def m(self):\n        return super().m()\n";
     let r = resolve(&[
-        ("base.py", "class Base:\n    def m(self):\n        return 1\n"),
-        ("other.py", "class Base:\n    def m(self):\n        return 2\n"),
+        (
+            "base.py",
+            "class Base:\n    def m(self):\n        return 1\n",
+        ),
+        (
+            "other.py",
+            "class Base:\n    def m(self):\n        return 2\n",
+        ),
         ("c.py", src),
     ]);
-    assert!(methods(&r, "c.py::C.m").is_empty(), "{:?}", methods(&r, "c.py::C.m"));
+    assert!(
+        methods(&r, "c.py::C.m").is_empty(),
+        "{:?}",
+        methods(&r, "c.py::C.m")
+    );
 }
 
 #[test]
 fn type_checking_import_else_def_with_self_call_abstains() {
     // The same, through a `self.m()` call rather than `super()`.
     let src = "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    from base import Base\nelse:\n    def Base():\n        pass\n\nclass C(Base):\n    def go(self):\n        return self.m()\n";
-    let r = resolve(&[("base.py", "class Base:\n    def m(self):\n        return 1\n"), ("c.py", src)]);
+    let r = resolve(&[
+        (
+            "base.py",
+            "class Base:\n    def m(self):\n        return 1\n",
+        ),
+        ("c.py", src),
+    ]);
     assert!(methods(&r, "c.py::C.go").is_empty());
 }

@@ -1629,9 +1629,12 @@ pub(crate) fn dispatch(
             exclude,
             budget,
             default_excludes,
-        } => Ok(serde_json::to_value(
-            engine.doc_drift(&paths, &exclude, budget, default_excludes)?,
-        )?),
+        } => Ok(serde_json::to_value(engine.doc_drift(
+            &paths,
+            &exclude,
+            budget,
+            default_excludes,
+        )?)?),
         IpcCommand::Affected {
             targets,
             budget,

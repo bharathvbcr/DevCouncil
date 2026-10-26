@@ -13,7 +13,9 @@ fn field_recorded(source: &str) -> bool {
 }
 
 fn static_method(decorator: &str, prefix: &str, suffix: &str) -> String {
-    format!("{prefix}class H:\n    {decorator}\n    def make(self):\n        self.x = A()\n{suffix}")
+    format!(
+        "{prefix}class H:\n    {decorator}\n    def make(self):\n        self.x = A()\n{suffix}"
+    )
 }
 
 // ------------------------------------------------------------ 3. decorators
@@ -33,7 +35,10 @@ fn dunder_import_builtins_attribute_is_the_builtin() {
         "@__import__(\"builtins\").classmethod",
         "@__import__( 'builtins' ).classmethod",
     ] {
-        assert!(!field_recorded(&static_method(decorator, "", "")), "{decorator}");
+        assert!(
+            !field_recorded(&static_method(decorator, "", "")),
+            "{decorator}"
+        );
     }
 }
 
@@ -44,7 +49,10 @@ fn builtins_name_rebound_locally_is_not_the_builtins_module() {
         "import builtins\nclass Fake:\n    staticmethod = None\nbuiltins = Fake()\n",
         "",
     );
-    assert!(field_recorded(&src), "`builtins` was rebound to a Fake: instance method");
+    assert!(
+        field_recorded(&src),
+        "`builtins` was rebound to a Fake: instance method"
+    );
 }
 
 #[test]
@@ -54,14 +62,24 @@ fn builtins_alias_rebound_is_not_the_builtins_module() {
         "import builtins as b\nimport functools\nb = functools\n",
         "",
     );
-    assert!(field_recorded(&src), "`b` was rebound to functools: instance method");
+    assert!(
+        field_recorded(&src),
+        "`b` was rebound to functools: instance method"
+    );
 }
 
 #[test]
 fn staticmethod_rebound_only_after_the_class_is_still_the_builtin() {
     // The class body runs before the later `def staticmethod`: builtin.
-    let src = static_method("@staticmethod", "", "\ndef staticmethod(f):\n    return f\n");
-    assert!(!field_recorded(&src), "order matters: the decorator ran with the builtin");
+    let src = static_method(
+        "@staticmethod",
+        "",
+        "\ndef staticmethod(f):\n    return f\n",
+    );
+    assert!(
+        !field_recorded(&src),
+        "order matters: the decorator ran with the builtin"
+    );
 }
 
 #[test]
@@ -75,7 +93,10 @@ fn staticmethod_rebound_in_another_scope_only_is_the_builtin() {
         "\ndef w():\n    from deco import staticmethod\n",
     ] {
         let src = static_method("@staticmethod", "", suffix);
-        assert!(!field_recorded(&src), "{suffix:?}: another scope's name changed the module's");
+        assert!(
+            !field_recorded(&src),
+            "{suffix:?}: another scope's name changed the module's"
+        );
     }
 }
 
@@ -102,7 +123,10 @@ fn many_static_methods_in_one_file_extract_in_bounded_time() {
     let ex = extract_file("h.py", &src);
     let took = start.elapsed();
     assert!(!ex.symbols.is_empty());
-    assert!(took.as_secs_f64() < 5.0, "3000 decorators took {took:?} (quadratic file walks)");
+    assert!(
+        took.as_secs_f64() < 5.0,
+        "3000 decorators took {took:?} (quadratic file walks)"
+    );
 }
 
 // -------------------------------------------------------- 4. dotted segments
@@ -111,7 +135,12 @@ fn heritage_names(source: &str) -> Vec<String> {
     extract_file("w.py", source)
         .references
         .iter()
-        .filter(|r| matches!(r.kind, ReferenceKind::Heritage | ReferenceKind::HeritageInterface))
+        .filter(|r| {
+            matches!(
+                r.kind,
+                ReferenceKind::Heritage | ReferenceKind::HeritageInterface
+            )
+        })
         .map(|r| r.name.clone())
         .collect()
 }
@@ -120,27 +149,56 @@ const OPAQUE: &str = devmap_extract::model::OPAQUE_BASE;
 
 #[test]
 fn spaces_around_dots_are_the_same_dotted_base() {
-    assert_eq!(heritage_names("class X(a .b . C):\n    pass\n"), ["C", "a", "b"]);
-    assert_eq!(heritage_names("class X(a. b .C):\n    pass\n"), ["C", "a", "b"]);
+    assert_eq!(
+        heritage_names("class X(a .b . C):\n    pass\n"),
+        ["C", "a", "b"]
+    );
+    assert_eq!(
+        heritage_names("class X(a. b .C):\n    pass\n"),
+        ["C", "a", "b"]
+    );
 }
 
 #[test]
 fn indexed_or_called_qualifier_is_opaque_not_a_dotted_base() {
-    for head in ["a.b[0].C", "getattr(a, 'b').C", "a().b.C", "a.b().C", "(a or b).C", "a[0].C"] {
-        assert_eq!(heritage_names(&format!("class X({head}):\n    pass\n")), [OPAQUE], "{head}");
+    for head in [
+        "a.b[0].C",
+        "getattr(a, 'b').C",
+        "a().b.C",
+        "a.b().C",
+        "(a or b).C",
+        "a[0].C",
+    ] {
+        assert_eq!(
+            heritage_names(&format!("class X({head}):\n    pass\n")),
+            [OPAQUE],
+            "{head}"
+        );
     }
 }
 
 #[test]
 fn parenthesised_dotted_base_is_the_dotted_base() {
-    assert_eq!(heritage_names("class X((a.b.C)):\n    pass\n"), ["C", "a", "b"]);
-    assert_eq!(heritage_names("class X((a).b.C):\n    pass\n"), ["C", "a", "b"]);
+    assert_eq!(
+        heritage_names("class X((a.b.C)):\n    pass\n"),
+        ["C", "a", "b"]
+    );
+    assert_eq!(
+        heritage_names("class X((a).b.C):\n    pass\n"),
+        ["C", "a", "b"]
+    );
 }
 
 #[test]
 fn unicode_identifiers_are_dotted_segments() {
-    assert_eq!(heritage_names("class X(módulo.Basé):\n    pass\n"), ["Basé", "módulo"]);
-    assert_eq!(heritage_names("class X(日本.基底.クラス):\n    pass\n"), ["クラス", "日本", "基底"]);
+    assert_eq!(
+        heritage_names("class X(módulo.Basé):\n    pass\n"),
+        ["Basé", "módulo"]
+    );
+    assert_eq!(
+        heritage_names("class X(日本.基底.クラス):\n    pass\n"),
+        ["クラス", "日本", "基底"]
+    );
 }
 
 #[test]
@@ -158,13 +216,26 @@ fn a_500_segment_dotted_base_keeps_every_segment() {
 fn a_parameterised_base_with_a_numeric_type_argument_is_still_a_named_base() {
     // `Array[float, 3]` is a generic parameterisation, not an index into a
     // runtime value.
-    assert_eq!(heritage_names("class X(Array[float, 3]):\n    pass\n"), ["Array"]);
-    assert_eq!(heritage_names("class X(Annotated[int, 3]):\n    pass\n"), ["Annotated"]);
+    assert_eq!(
+        heritage_names("class X(Array[float, 3]):\n    pass\n"),
+        ["Array"]
+    );
+    assert_eq!(
+        heritage_names("class X(Annotated[int, 3]):\n    pass\n"),
+        ["Annotated"]
+    );
 }
 
 #[test]
 fn index_expressions_are_opaque() {
-    for head in ["bases[0]", "bases[-1]", "bases[1:]", "bases[i + 1]", "bases[1.5]", "bases[i][0]"] {
+    for head in [
+        "bases[0]",
+        "bases[-1]",
+        "bases[1:]",
+        "bases[i + 1]",
+        "bases[1.5]",
+        "bases[i][0]",
+    ] {
         let got = heritage_names(&format!("class X({head}):\n    pass\n"));
         assert_eq!(got, [OPAQUE], "{head}");
     }
@@ -232,7 +303,8 @@ fn a_non_torch_package_with_a_torch_prefix_is_not_torch() {
         "from .torch import nn",
         "from torch_ext import nn",
     ] {
-        let src = format!("{import}\nclass M(nn.Module):\n    def forward(self, x):\n        return x\n");
+        let src =
+            format!("{import}\nclass M(nn.Module):\n    def forward(self, x):\n        return x\n");
         assert!(!dispatched(&src), "{import}");
     }
 }
@@ -249,7 +321,10 @@ fn many_torch_methods_in_one_file_extract_in_bounded_time() {
     let ex = extract_file("m.py", &src);
     let took = start.elapsed();
     assert!(!ex.symbols.is_empty());
-    assert!(took.as_secs_f64() < 5.0, "1500 torch classes took {took:?} (per-method whole-file walks)");
+    assert!(
+        took.as_secs_f64() < 5.0,
+        "1500 torch classes took {took:?} (per-method whole-file walks)"
+    );
 }
 
 // --------------------------------------------------------- 9. hostile input
@@ -320,9 +395,17 @@ fn non_python_fixture_extraction_is_deterministic_and_dumpable() {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let rel = path.strip_prefix(&root).unwrap().to_string_lossy().into_owned();
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let first = serde_json::to_string(&extract_file(&rel, &text)).unwrap();
-        assert_eq!(first, serde_json::to_string(&extract_file(&rel, &text)).unwrap(), "{rel}");
+        assert_eq!(
+            first,
+            serde_json::to_string(&extract_file(&rel, &text)).unwrap(),
+            "{rel}"
+        );
         if let Some(dir) = &dump {
             let flat = rel.replace('/', "__");
             std::fs::write(std::path::Path::new(dir).join(flat), first).unwrap();

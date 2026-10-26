@@ -256,14 +256,14 @@ impl Resolver {
                 SymbolKind::Class | SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Interface
             )
         };
-        let target_is_a_type = self
-            .symbol_index
-            .get(target)
-            .into_iter()
-            .flatten()
-            .any(|(path, kind, _, identity)| {
-                path == target_file && **identity == *target && is_type(*kind)
-            });
+        let target_is_a_type =
+            self.symbol_index
+                .get(target)
+                .into_iter()
+                .flatten()
+                .any(|(path, kind, _, identity)| {
+                    path == target_file && **identity == *target && is_type(*kind)
+                });
         let Some(outer) = self
             .declaring_type_of(target_file, target)
             .filter(|_| target_is_a_type)

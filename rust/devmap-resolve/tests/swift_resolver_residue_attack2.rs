@@ -39,7 +39,8 @@ fn uses(result: &ResolutionResult, caller: &str) -> Vec<String> {
 }
 
 fn has(u: &[String], target: &str) -> bool {
-    u.iter().any(|t| t.split('|').next().unwrap_or("").ends_with(target))
+    u.iter()
+        .any(|t| t.split('|').next().unwrap_or("").ends_with(target))
 }
 
 // ============================================================ 1. inferred / computed / static properties
@@ -68,7 +69,8 @@ fn wrong_lazy_inferred_property_is_not_callable() {
 
 #[test]
 fn wrong_computed_some_view_property_is_not_callable() {
-    let src = "struct C {\n var padding: some View { Text(\"\") }\n}\nfunc f(c: C) {\n c.padding(4)\n}\n";
+    let src =
+        "struct C {\n var padding: some View { Text(\"\") }\n}\nfunc f(c: C) {\n c.padding(4)\n}\n";
     let u = uses(&one(src), "f");
     assert!(!has(&u, "C.padding"), "{u:?}");
 }
@@ -171,7 +173,8 @@ fn recall_unannotated_closure_literal_property() {
 
 // ============================================================ 4. -> Self
 
-const SELF_P: &str = "protocol P {}\nextension P {\n func a() -> Self { self }\n func tag() {}\n}\n";
+const SELF_P: &str =
+    "protocol P {}\nextension P {\n func a() -> Self { self }\n func tag() {}\n}\n";
 
 #[test]
 fn recall_self_chain_without_override_binds_the_extension_default() {
@@ -188,7 +191,8 @@ fn wrong_self_chain_on_an_unknown_receiver_binds_nothing() {
 
 #[test]
 fn wrong_two_self_steps_keep_the_concrete_override() {
-    let src = format!("{SELF_P}struct B: P {{ func tag() {{}} }}\nfunc f(b: B) {{ b.a().a().tag() }}\n");
+    let src =
+        format!("{SELF_P}struct B: P {{ func tag() {{}} }}\nfunc f(b: B) {{ b.a().a().tag() }}\n");
     let u = uses(&one(&src), "f");
     assert!(has(&u, "B.tag"), "{u:?}");
     assert!(!has(&u, "P.tag"), "{u:?}");
@@ -196,7 +200,9 @@ fn wrong_two_self_steps_keep_the_concrete_override() {
 
 #[test]
 fn wrong_three_self_steps_keep_the_concrete_override() {
-    let src = format!("{SELF_P}struct B: P {{ func tag() {{}} }}\nfunc f(b: B) {{ b.a().a().a().tag() }}\n");
+    let src = format!(
+        "{SELF_P}struct B: P {{ func tag() {{}} }}\nfunc f(b: B) {{ b.a().a().a().tag() }}\n"
+    );
     let u = uses(&one(&src), "f");
     assert!(has(&u, "B.tag"), "{u:?}");
     assert!(!has(&u, "P.tag"), "{u:?}");
@@ -223,7 +229,8 @@ fn wrong_self_from_a_class_extension_is_the_subclass() {
 
 #[test]
 fn wrong_self_chain_through_an_optional_receiver_keeps_the_override() {
-    let src = format!("{SELF_P}struct B: P {{ func tag() {{}} }}\nfunc f(b: B?) {{ b?.a().tag() }}\n");
+    let src =
+        format!("{SELF_P}struct B: P {{ func tag() {{}} }}\nfunc f(b: B?) {{ b?.a().tag() }}\n");
     let u = uses(&one(&src), "f");
     assert!(!has(&u, "P.tag"), "{u:?}");
 }
@@ -241,7 +248,8 @@ fn wrong_generic_type_param_return_does_not_bind_a_same_named_type_in_another_fi
 
 #[test]
 fn wrong_generic_method_param_return_does_not_bind_a_same_named_type_in_another_file() {
-    let a = "struct S {\n func id<Item>(_ x: Item) -> Item { x }\n}\nfunc f(s: S) { s.id(3).m() }\n";
+    let a =
+        "struct S {\n func id<Item>(_ x: Item) -> Item { x }\n}\nfunc f(s: S) { s.id(3).m() }\n";
     let b = "struct Item { func m() {} }\n";
     let r = resolve(&[("Sources/M/A.swift", a), ("Sources/M/B.swift", b)]);
     let u = uses(&r, "f");
@@ -377,7 +385,10 @@ fn dump_swift_fixture_edges() {
                 (rel, std::fs::read_to_string(p).unwrap())
             })
             .collect();
-        let refs: Vec<(&str, &str)> = owned.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let refs: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
         let r = resolve(&refs);
         for e in &r.edges {
             let kind = e

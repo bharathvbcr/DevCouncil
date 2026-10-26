@@ -74,7 +74,10 @@ fn an_interpolation_inout_and_compound_assignment_are_uses() {
         "    init() { _ = secret }",
         "    var n: Int = 0 { didSet { _ = secret } }",
     ] {
-        assert!(secret_is_live(body, ""), "read shape was reported dead: {body}");
+        assert!(
+            secret_is_live(body, ""),
+            "read shape was reported dead: {body}"
+        );
     }
 }
 
@@ -88,10 +91,7 @@ fn a_same_file_extension_read_of_a_private_property_is_a_use() {
         "",
         "extension S { var e2: Int { self.secret } }"
     ));
-    assert!(secret_is_live(
-        "",
-        "func free(_ s: S) -> Int { s.secret }"
-    ));
+    assert!(secret_is_live("", "func free(_ s: S) -> Int { s.secret }"));
 }
 
 #[test]
@@ -102,7 +102,9 @@ fn an_explicit_self_read_is_a_use_when_another_type_has_a_property_of_that_name(
     assert!(
         !reported(&r, "S.secret") && !reported(&r, "T.secret"),
         "a `self.x` read was lost to a same-named property: {:?}",
-        r.iter().map(|x| (&x.symbol_name, x.confidence)).collect::<Vec<_>>()
+        r.iter()
+            .map(|x| (&x.symbol_name, x.confidence))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -160,7 +162,11 @@ fn a_didset_only_private_property_is_not_dead_code() {
     // An observer is a side effect: `watched = 1` is a use even with no read.
     let src = "struct S {\n    private var watched = 0 { didSet { log() } }\n    mutating func poke() { watched = 1 }\n    func log() {}\n}\n";
     let r = reports(&[("Sources/M/S.swift", src)]);
-    assert!(!reported(&r, "watched"), "{:?}", r.iter().map(|x| &x.symbol_name).collect::<Vec<_>>());
+    assert!(
+        !reported(&r, "watched"),
+        "{:?}",
+        r.iter().map(|x| &x.symbol_name).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -169,7 +175,10 @@ fn a_private_stored_property_of_a_codable_via_extension_is_not_reported() {
     // stored property, but the type's own declaration has no supertype.
     let src = "struct S {\n    private var secret = 1\n}\nextension S: Codable {}\n";
     let r = reports(&[("Sources/M/S.swift", src)]);
-    assert!(!reported(&r, "secret"), "Codable-by-extension stored property reported dead");
+    assert!(
+        !reported(&r, "secret"),
+        "Codable-by-extension stored property reported dead"
+    );
 }
 
 #[test]
@@ -183,7 +192,10 @@ fn a_private_stored_property_of_a_codable_struct_is_not_reported() {
 fn a_private_stored_property_of_a_hashable_or_equatable_via_extension_is_not_reported() {
     let src = "struct S {\n    private var secret = 1\n}\nextension S: Hashable {}\n";
     let r = reports(&[("Sources/M/S.swift", src)]);
-    assert!(!reported(&r, "secret"), "synthesized Hashable reads every stored property");
+    assert!(
+        !reported(&r, "secret"),
+        "synthesized Hashable reads every stored property"
+    );
 }
 
 #[test]
@@ -207,7 +219,10 @@ fn a_property_wrapper_projected_value_read_is_a_use_of_the_wrapper_property() {
 fn a_private_computed_property_used_only_by_a_property_wrapper_argument() {
     let src = "struct S {\n    private static var limit: Int { 3 }\n    var capped: Int { min(1, Self.limit) }\n}\nfunc use(_ s: S) -> Int { s.capped }\n";
     let r = reports(&[("Sources/M/S.swift", src)]);
-    assert!(!reported(&r, "limit"), "Self.limit read in a computed body is a use");
+    assert!(
+        !reported(&r, "limit"),
+        "Self.limit read in a computed body is a use"
+    );
 }
 
 #[test]

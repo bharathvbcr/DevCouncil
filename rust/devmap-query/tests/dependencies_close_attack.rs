@@ -28,17 +28,33 @@ fn fx_with(files: &[(&str, String)], dispatch: bool) -> Fx {
     let analysis = devmap_analyze::analyze(&extractions, &resolution);
     let store = Store::open_in_memory().unwrap();
     store
-        .save_generation_with_opts(&extractions, &resolution, &analysis, GenerationWriteOpts::default())
+        .save_generation_with_opts(
+            &extractions,
+            &resolution,
+            &analysis,
+            GenerationWriteOpts::default(),
+        )
         .unwrap();
-    Fx { extractions, resolution, store }
+    Fx {
+        extractions,
+        resolution,
+        store,
+    }
 }
 
 fn req(q: &str, budget: u32) -> Request<String> {
-    Request { query: q.to_string(), token_budget: budget, min_confidence: 0.0, max_depth: 1 }
+    Request {
+        query: q.to_string(),
+        token_budget: budget,
+        min_confidence: 0.0,
+        max_depth: 1,
+    }
 }
 
 fn store_ans(fx: &Fx, q: &str, budget: u32) -> Result<Response<ResolvedEdge>, String> {
-    StoreQueryEngine::new(&fx.store).dependencies(req(q, budget)).map_err(|e| e.to_string())
+    StoreQueryEngine::new(&fx.store)
+        .dependencies(req(q, budget))
+        .map_err(|e| e.to_string())
 }
 
 fn store_rung(fx: &Fx, q: &str, rung: Rung) -> Response<ResolvedEdge> {
@@ -62,7 +78,13 @@ const LIB: &str = "RETRY = 2\n\n\ndef helper():\n    return 1\n\n\ndef worker():
 const CALLERS: &str = "from lib import worker, helper\n\ncb = helper\n\n\ndef c1():\n    return worker()\n\n\ndef c2():\n    cb2 = helper\n    return helper() + worker()\n";
 
 fn std_fx() -> Fx {
-    fx_with(&[("lib.py", LIB.to_string()), ("callers.py", CALLERS.to_string())], false)
+    fx_with(
+        &[
+            ("lib.py", LIB.to_string()),
+            ("callers.py", CALLERS.to_string()),
+        ],
+        false,
+    )
 }
 
 fn control_free(s: &str) -> bool {
@@ -95,7 +117,10 @@ fn p7_a_control_character_in_the_query_is_escaped_in_the_note() {
             }
         }
     }
-    assert!(report.is_empty(), "raw control characters reach the note:\n{report}");
+    assert!(
+        report.is_empty(),
+        "raw control characters reach the note:\n{report}"
+    );
 }
 
 /// Probe 7b. The note quotes the query verbatim; a query padded with whitespace
@@ -108,11 +133,20 @@ fn p7_the_note_has_a_length_cap() {
     if let Ok(r) = store_ans(&fx, &q, 8_000) {
         lens.push(("store", r.note.map_or(0, |n| n.len())));
     }
-    lens.push(("memory", mem_ans(&fx, &q, 8_000).note.map_or(0, |n| n.len())));
+    lens.push((
+        "memory",
+        mem_ans(&fx, &q, 8_000).note.map_or(0, |n| n.len()),
+    ));
     for (engine, len) in &lens {
-        assert!(*len < 4_096, "{engine} note is {len} bytes for a padded query");
+        assert!(
+            *len < 4_096,
+            "{engine} note is {len} bytes for a padded query"
+        );
     }
-    assert!(lens.iter().any(|(_, l)| *l > 0), "the probe did not reach the note: {lens:?}");
+    assert!(
+        lens.iter().any(|(_, l)| *l > 0),
+        "the probe did not reach the note: {lens:?}"
+    );
 }
 
 // ------------------------------------------------------------- probe 5
@@ -145,7 +179,10 @@ fn p5_a_partially_filtered_answer_states_the_hidden_count_in_the_note() {
     let fx = rung_fx();
     let r = store_rung(&fx, "app.py", Rung::Deterministic);
     let hist = r.rungs.clone().expect("rungs");
-    assert!(hist.filtered_out > 0 && !r.items.is_empty(), "fixture is not partial: {hist:?}");
+    assert!(
+        hist.filtered_out > 0 && !r.items.is_empty(),
+        "fixture is not partial: {hist:?}"
+    );
     let note = r.note.clone().unwrap_or_default();
     assert!(
         note.contains(&hist.filtered_out.to_string()),
@@ -180,10 +217,17 @@ fn p5_a_file_query_emptied_by_the_rung_says_so() {
     );
     let open = store_ans(&fx, "app.py", 8_000).unwrap();
     let floored = store_rung(&fx, "app.py", Rung::Deterministic);
-    assert!(!open.items.is_empty(), "fixture has no outbound edges: {open:?}");
+    assert!(
+        !open.items.is_empty(),
+        "fixture has no outbound edges: {open:?}"
+    );
     if floored.items.is_empty() {
         let note = floored.note.clone().unwrap_or_default();
-        assert!(note.contains("hidden by min_rung"), "emptied by the rung, note={:?}", floored.note);
+        assert!(
+            note.contains("hidden by min_rung"),
+            "emptied by the rung, note={:?}",
+            floored.note
+        );
     }
 }
 
@@ -209,12 +253,20 @@ fn wide(n: usize) -> Fx {
 fn p4_order_is_total_and_engine_independent() {
     let fx = wide(1000);
     for q in ["app.py::main", "app.py"] {
-        let first: Vec<String> =
-            store_ans(&fx, q, 10_000_000).unwrap().items.iter().map(key).collect();
+        let first: Vec<String> = store_ans(&fx, q, 10_000_000)
+            .unwrap()
+            .items
+            .iter()
+            .map(key)
+            .collect();
         assert!(first.len() >= 1000, "{q}: {} items", first.len());
         for run in 0..3 {
-            let again: Vec<String> =
-                store_ans(&fx, q, 10_000_000).unwrap().items.iter().map(key).collect();
+            let again: Vec<String> = store_ans(&fx, q, 10_000_000)
+                .unwrap()
+                .items
+                .iter()
+                .map(key)
+                .collect();
             assert_eq!(first, again, "{q}: store run {run} reordered");
             let mem: Vec<String> = mem_ans(&fx, q, 10_000_000).items.iter().map(key).collect();
             assert_eq!(first, mem, "{q}: engines order differently");
@@ -222,7 +274,10 @@ fn p4_order_is_total_and_engine_independent() {
         let mut seen_decl = false;
         for k in &first {
             let decl = k.contains("|Contains|") || k.contains("|MemberOf|");
-            assert!(!(seen_decl && !decl), "{q}: a real dependency follows a declaration: {k}");
+            assert!(
+                !(seen_decl && !decl),
+                "{q}: a real dependency follows a declaration: {k}"
+            );
             seen_decl |= decl;
         }
     }
@@ -234,7 +289,12 @@ fn p4_a_truncated_page_is_the_same_page_in_both_engines() {
     let fx = wide(300);
     for q in ["app.py::main", "app.py"] {
         for budget in [50u32, 400, 1_500] {
-            let s: Vec<String> = store_ans(&fx, q, budget).unwrap().items.iter().map(key).collect();
+            let s: Vec<String> = store_ans(&fx, q, budget)
+                .unwrap()
+                .items
+                .iter()
+                .map(key)
+                .collect();
             let m: Vec<String> = mem_ans(&fx, q, budget).items.iter().map(key).collect();
             assert_eq!(s, m, "{q} budget {budget}: truncated pages differ");
         }
@@ -269,7 +329,11 @@ fn p3_inbound_count_is_the_raw_row_count() {
             continue;
         }
         let query = format!("{file}::{symbol}");
-        let query = if symbol.contains("::") { symbol.clone() } else { query };
+        let query = if symbol.contains("::") {
+            symbol.clone()
+        } else {
+            query
+        };
         let raw = fx
             .resolution
             .edges
@@ -306,7 +370,10 @@ fn p3_inbound_count_is_the_raw_row_count() {
         }
     }
     assert!(checked >= 2, "the probe covered {checked} symbols");
-    assert!(report.is_empty(), "inbound counts differ from raw rows:\n{report}");
+    assert!(
+        report.is_empty(),
+        "inbound counts differ from raw rows:\n{report}"
+    );
 }
 
 /// Probe 3b. A name two files define: two start nodes reachable from one query;
@@ -331,12 +398,25 @@ fn p3_two_starts_one_edge_counts_once() {
     let s = store_ans(&fx, "dup", 8_000);
     let count = |n: &Option<String>| -> Option<usize> {
         let n = n.as_deref()?;
-        n[..n.find(" inbound edge(s)")?].rsplit(' ').next()?.parse().ok()
+        n[..n.find(" inbound edge(s)")?]
+            .rsplit(' ')
+            .next()?
+            .parse()
+            .ok()
     };
     let s_note = s.as_ref().ok().and_then(|r| r.note.clone());
-    assert_eq!(count(&m.note), count(&s_note), "memory={:?} store={:?} raw={raw_total}", m.note, s_note);
+    assert_eq!(
+        count(&m.note),
+        count(&s_note),
+        "memory={:?} store={:?} raw={raw_total}",
+        m.note,
+        s_note
+    );
     if let Some(c) = count(&m.note) {
-        assert!(c <= raw_total, "{c} stated for {raw_total} raw inbound rows");
+        assert!(
+            c <= raw_total,
+            "{c} stated for {raw_total} raw inbound rows"
+        );
     }
 }
 
@@ -348,9 +428,12 @@ fn p1_other_tools_do_not_serialize_note() {
     let fx = std_fx();
     let engine = StoreQueryEngine::new(&fx.store);
     let mut seen = vec![];
-    let impact = serde_json::to_value(engine.impact(req("lib.py::worker", 8_000)).unwrap()).unwrap();
+    let impact =
+        serde_json::to_value(engine.impact(req("lib.py::worker", 8_000)).unwrap()).unwrap();
     let neighbors = serde_json::to_value(
-        engine.neighbors(&["lib.py::worker".to_string()], 8_000, 0.0, 1).unwrap(),
+        engine
+            .neighbors(&["lib.py::worker".to_string()], 8_000, 0.0, 1)
+            .unwrap(),
     )
     .unwrap();
     for (name, v) in [("impact", impact), ("neighbors", neighbors)] {
@@ -359,10 +442,13 @@ fn p1_other_tools_do_not_serialize_note() {
         }
     }
     let deps = serde_json::to_value(store_ans(&fx, "lib.py", 8_000).unwrap()).unwrap();
-    let silent = !deps.as_object().unwrap().contains_key("note")
-        || deps["note"].is_string();
+    let silent = !deps.as_object().unwrap().contains_key("note") || deps["note"].is_string();
     assert!(seen.is_empty(), "note leaked into {seen:?}");
-    assert!(silent, "deps serialises a non-string note: {}", deps["note"]);
+    assert!(
+        silent,
+        "deps serialises a non-string note: {}",
+        deps["note"]
+    );
 }
 
 // ------------------------------------------------------------- probe 3, live
@@ -385,7 +471,9 @@ fn p3_live_inbound_counts_match_raw_stored_rows() {
     }
     for e in &rows {
         if e.source_symbol != e.target_symbol {
-            *inbound.entry((e.target_symbol.clone(), e.target_file.clone())).or_default() += 1;
+            *inbound
+                .entry((e.target_symbol.clone(), e.target_file.clone()))
+                .or_default() += 1;
         }
     }
     let mut names: std::collections::BTreeMap<&str, usize> = Default::default();
@@ -395,10 +483,17 @@ fn p3_live_inbound_counts_match_raw_stored_rows() {
     let candidates: Vec<_> = inbound
         .iter()
         .filter(|((s, f), n)| {
-            **n >= 2 && s.contains("::") && !outbound.contains(&(s.clone(), f.clone())) && names[s.as_str()] == 1
+            **n >= 2
+                && s.contains("::")
+                && !outbound.contains(&(s.clone(), f.clone()))
+                && names[s.as_str()] == 1
         })
         .collect();
-    assert!(candidates.len() >= 10, "only {} candidates", candidates.len());
+    assert!(
+        candidates.len() >= 10,
+        "only {} candidates",
+        candidates.len()
+    );
     let stride = candidates.len() / 10;
     let engine = StoreQueryEngine::new(&store);
     let mut report = String::new();
@@ -413,7 +508,11 @@ fn p3_live_inbound_counts_match_raw_stored_rows() {
         };
         checked += 1;
         let stated: Option<usize> = r.note.as_deref().and_then(|n| {
-            n[..n.find(" inbound edge(s)")?].rsplit(' ').next()?.parse().ok()
+            n[..n.find(" inbound edge(s)")?]
+                .rsplit(' ')
+                .next()?
+                .parse()
+                .ok()
         });
         if stated != Some(**raw) {
             report.push_str(&format!(

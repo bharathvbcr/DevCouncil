@@ -82,7 +82,10 @@ fn wrong_a_leading_dot_case_never_binds_a_same_named_method() {
     ));
     for c in ["h", "h2"] {
         let u = uses(&r, c);
-        assert!(!has(&u, "Runner.fast") && !has(&u, "Runner.load"), "{c}: {u:?}");
+        assert!(
+            !has(&u, "Runner.fast") && !has(&u, "Runner.load"),
+            "{c}: {u:?}"
+        );
     }
 }
 
@@ -146,7 +149,10 @@ fn wrong_a_nested_func_and_capture_list_shadow_the_property() {
     let c = uses(&r, "S.capture");
     assert!(!has(&c, "S.count"), "capture: {c:?}");
     let l = uses(&r, "S.letSelf");
-    assert!(has(&l, "S.count"), "self.count on RHS must still bind: {l:?}");
+    assert!(
+        has(&l, "S.count"),
+        "self.count on RHS must still bind: {l:?}"
+    );
 }
 
 #[test]
@@ -184,7 +190,10 @@ fn wrong_a_local_shadow_ends_with_its_scope() {
         "struct S {\n  var count: Int\n  func f() -> Int {\n    do { let count = 1; _ = count }\n    return count\n  }\n}\n",
     );
     let u = uses(&r, "S.f");
-    assert!(has(&u, "S.count"), "the read after the block is the property: {u:?}");
+    assert!(
+        has(&u, "S.count"),
+        "the read after the block is the property: {u:?}"
+    );
 }
 
 #[test]
@@ -269,7 +278,10 @@ fn wrong_a_keypath_never_binds_a_same_named_property_of_the_wrong_type() {
         "struct Task { var isPaused: Bool }\nstruct Player { var isPaused: Bool }\nfunc a() -> KeyPath<Task, Bool> { \\Task.isPaused }\nfunc b() -> KeyPath<Player, Bool> { \\.isPaused }\n",
     );
     let a = uses(&r, "a");
-    assert!(!has(&a, "Player.isPaused"), "\\Task.isPaused bound Player: {a:?}");
+    assert!(
+        !has(&a, "Player.isPaused"),
+        "\\Task.isPaused bound Player: {a:?}"
+    );
     let b = uses(&r, "b");
     assert!(
         !has(&b, "Task.isPaused") || !has(&b, "Player.isPaused"),
@@ -290,8 +302,14 @@ fn recall_a_qualified_keypath_reads_the_property() {
 fn recall_extension_in_another_file() {
     let r = resolve(&[
         ("Sources/M/Decl.swift", "struct Box { var a: Int }\n"),
-        ("Sources/M/Ext.swift", "extension Box { var b: Int { a + 1 } }\n"),
-        ("Sources/M/Use.swift", "func f(_ x: Box) -> Int { x.b + x.a }\n"),
+        (
+            "Sources/M/Ext.swift",
+            "extension Box { var b: Int { a + 1 } }\n",
+        ),
+        (
+            "Sources/M/Use.swift",
+            "func f(_ x: Box) -> Int { x.b + x.a }\n",
+        ),
     ]);
     let u = uses(&r, "f");
     assert!(has(&u, "Box.b") && has(&u, "Box.a"), "{u:?}");
@@ -427,7 +445,10 @@ fn wrong_static_member_read_bare_from_instance_context_is_not_the_instance_prope
     );
     // A static method has no instance: `limit2` is not S.limit2.
     let u = uses(&r, "S.f");
-    assert!(!has(&u, "S.limit2"), "static func read an instance property: {u:?}");
+    assert!(
+        !has(&u, "S.limit2"),
+        "static func read an instance property: {u:?}"
+    );
 }
 
 // ------------------------------------------------------------- calls/reads in bodies
@@ -451,7 +472,10 @@ fn recall_an_initializer_expression_reads_through_self_less_names() {
         "func mk() -> Int { 1 }\nstruct S {\n  var a: Int = mk()\n  lazy var b: Int = self.a + 1\n}\n",
     );
     let any = r.edges.iter().any(|e| e.target_symbol.ends_with("::mk"));
-    assert!(any, "a property initializer's call to a free function is an edge");
+    assert!(
+        any,
+        "a property initializer's call to a free function is an edge"
+    );
 }
 
 // ------------------------------------------------------------- labels / leading dot
@@ -462,7 +486,10 @@ fn recall_a_bare_identifier_equal_to_a_label_elsewhere_still_binds() {
         "func total() -> Int { 1 }\nfunc make(total: Int) -> Int { total }\nfunc f() -> Int { total() + make(total: 2) }\nlet total2 = 1\nfunc g() -> Int { let total = 2; return make(total: total) }\n",
     );
     let f = uses(&r, "::f");
-    assert!(has(&f, "::total"), "the call `total()` is a real call: {f:?}");
+    assert!(
+        has(&f, "::total"),
+        "the call `total()` is a real call: {f:?}"
+    );
     let g = uses(&r, "::g");
     assert!(g.is_empty() || !has(&g, "::total"), "{g:?}");
 }
@@ -497,7 +524,10 @@ fn recall_a_label_inside_a_closure_value_still_reads_the_property() {
     );
     for c in ["S.make", "S.make2"] {
         let u = uses(&r, c);
-        assert!(has(&u, "S.count"), "{c}: the VALUE of the argument is a read: {u:?}");
+        assert!(
+            has(&u, "S.count"),
+            "{c}: the VALUE of the argument is a read: {u:?}"
+        );
         assert!(!has(&u, "T.count"), "{c}: the label is not a read: {u:?}");
     }
 }
@@ -508,7 +538,10 @@ fn recall_a_ternary_and_a_dictionary_literal_key_are_still_reads() {
         "struct S {\n  var key: String\n  var flag: Bool\n  func f() -> [String: Int] { [key: 1] }\n  func g() -> Int { flag ? 1 : 0 }\n}\n",
     );
     assert!(has(&uses(&r, "S.f"), "S.key"), "dict literal key is a read");
-    assert!(has(&uses(&r, "S.g"), "S.flag"), "ternary condition is a read");
+    assert!(
+        has(&uses(&r, "S.g"), "S.flag"),
+        "ternary condition is a read"
+    );
 }
 
 #[test]
@@ -529,9 +562,16 @@ fn recall_tuple_pattern_member_properties_are_symbols() {
         "A.swift",
         "struct S {\n  let (a, b) = (1, 2)\n  var (c, d): (Int, Int) = (3, 4)\n  func f() -> Int { a + b + c + d }\n}\n",
     );
-    let names: Vec<&str> = ex.symbols.iter().map(|s| s.qualified_name.as_str()).collect();
+    let names: Vec<&str> = ex
+        .symbols
+        .iter()
+        .map(|s| s.qualified_name.as_str())
+        .collect();
     for n in ["S.a", "S.b", "S.c", "S.d"] {
-        assert!(names.iter().any(|q| q.ends_with(n)), "{n} missing: {names:?}");
+        assert!(
+            names.iter().any(|q| q.ends_with(n)),
+            "{n} missing: {names:?}"
+        );
     }
 }
 
@@ -544,7 +584,10 @@ fn wrong_tuple_pattern_member_does_not_poison_the_bare_name_of_a_free_function()
         "func a() -> Int { 1 }\nstruct S {\n  let (a, b) = (1, 2)\n  func f() -> Int { a }\n}\n",
     );
     let u = uses(&r, "S.f");
-    assert!(!has(&u, "::a"), "implicit-self `a` bound the free function a(): {u:?}");
+    assert!(
+        !has(&u, "::a"),
+        "implicit-self `a` bound the free function a(): {u:?}"
+    );
 }
 
 // ------------------------------------------------------------- right operands
@@ -555,7 +598,15 @@ fn wrong_tuple_pattern_member_does_not_poison_the_bare_name_of_a_free_function()
 #[test]
 fn recall_a_property_read_as_the_right_operand_of_an_infix_operator() {
     let mut missed = Vec::new();
-    for (op, ret) in [("+", "Int"), ("*", "Int"), ("-", "Int"), ("==", "Bool"), ("<", "Bool"), ("&&", "Bool"), ("??", "Int")] {
+    for (op, ret) in [
+        ("+", "Int"),
+        ("*", "Int"),
+        ("-", "Int"),
+        ("==", "Bool"),
+        ("<", "Bool"),
+        ("&&", "Bool"),
+        ("??", "Int"),
+    ] {
         let (lhs, rhs) = match op {
             "&&" => ("true", "q.flag"),
             "??" => ("nil as Int?", "q.b"),
@@ -571,7 +622,10 @@ fn recall_a_property_read_as_the_right_operand_of_an_infix_operator() {
             missed.push(format!("`{lhs} {op} {rhs}`: {u:?}"));
         }
     }
-    assert!(missed.is_empty(), "right operand lost its receiver: {missed:#?}");
+    assert!(
+        missed.is_empty(),
+        "right operand lost its receiver: {missed:#?}"
+    );
 }
 
 #[test]
@@ -601,7 +655,11 @@ fn wrong_explicit_self_read_with_a_same_named_property_on_another_type_binds_the
     );
     let u = uses(&r, "B.viaSelf");
     assert!(has(&u, "B.x"), "self.x in B must bind B.x: {u:?}");
-    assert!(dangling_targets(&r).is_empty(), "{:?}", dangling_targets(&r));
+    assert!(
+        dangling_targets(&r).is_empty(),
+        "{:?}",
+        dangling_targets(&r)
+    );
 }
 
 /// REGRESSION vs 9030d08c (where the same read was an honest unresolved row):
@@ -611,7 +669,11 @@ fn wrong_explicit_self_read_on_a_duplicated_name_emits_no_dangling_edge() {
     let r = one(
         "struct A { var x: Int }\nstruct B {\n    var x: Int\n    func viaSelf() -> Int { self.x }\n}\n",
     );
-    assert!(dangling_targets(&r).is_empty(), "{:?}", dangling_targets(&r));
+    assert!(
+        dangling_targets(&r).is_empty(),
+        "{:?}",
+        dangling_targets(&r)
+    );
 }
 
 #[test]
@@ -621,7 +683,11 @@ fn wrong_explicit_self_read_in_an_extension_with_a_same_named_property_elsewhere
     );
     let u = uses(&r, "B.viaSelf");
     assert!(has(&u, "B.x"), "{u:?}");
-    assert!(dangling_targets(&r).is_empty(), "{:?}", dangling_targets(&r));
+    assert!(
+        dangling_targets(&r).is_empty(),
+        "{:?}",
+        dangling_targets(&r)
+    );
 }
 
 #[test]
@@ -631,7 +697,11 @@ fn wrong_explicit_self_enum_case_with_a_same_named_property_elsewhere() {
     );
     let u = uses(&r, "Mode.me");
     assert!(has(&u, "Mode.fast"), "{u:?}");
-    assert!(dangling_targets(&r).is_empty(), "{:?}", dangling_targets(&r));
+    assert!(
+        dangling_targets(&r).is_empty(),
+        "{:?}",
+        dangling_targets(&r)
+    );
 }
 
 #[test]
@@ -643,7 +713,11 @@ fn wrong_no_edge_target_is_ever_a_bare_member_name_across_five_same_named_types(
         ));
     }
     let r = one(&src);
-    assert!(dangling_targets(&r).is_empty(), "{:?}", dangling_targets(&r));
+    assert!(
+        dangling_targets(&r).is_empty(),
+        "{:?}",
+        dangling_targets(&r)
+    );
     for t in ["A", "B", "C", "D", "E"] {
         let u = uses(&r, &format!("{t}.me"));
         assert!(has(&u, &format!("{t}.id")), "{t}.me: {u:?}");
@@ -680,9 +754,7 @@ fn recall_self_read_in_an_extension_computed_property_binds_the_types_property()
 fn wrong_a_property_initializer_edge_is_not_attributed_to_the_wrong_type() {
     // Property bodies keep the *enclosing type* as caller: with two types the
     // read must not leak across them.
-    let r = one(
-        "struct A { var x: Int = 0 }\nstruct B { var x: Int = 1\n  var y: Int { x } }\n",
-    );
+    let r = one("struct A { var x: Int = 0 }\nstruct B { var x: Int = 1\n  var y: Int { x } }\n");
     let from_a = r
         .edges
         .iter()
@@ -765,14 +837,18 @@ fn hostile_a_ten_thousand_deep_getter_expression() {
             uses(&r, "D").len() + r.edges.len()
         })
         .unwrap();
-    handle.join().expect("a deeply nested getter must not crash the extractor");
+    handle
+        .join()
+        .expect("a deeply nested getter must not crash the extractor");
 }
 
 #[test]
 fn hostile_five_thousand_extensions_of_one_type() {
     let mut s = String::from("struct T { var base: Int }\n");
     for i in 0..5_000 {
-        s.push_str(&format!("extension T {{ var e{i}: Int {{ base + {i} }} }}\n"));
+        s.push_str(&format!(
+            "extension T {{ var e{i}: Int {{ base + {i} }} }}\n"
+        ));
     }
     s.push_str("func g(_ t: T) -> Int { t.e4999 + t.e0 }\n");
     let t = std::time::Instant::now();
@@ -809,21 +885,66 @@ macro_rules! recv_case {
     };
 }
 
-recv_case!(recall_optional_chain, "Player?", "v?.isPaused ?? false", "Player.isPaused");
+recv_case!(
+    recall_optional_chain,
+    "Player?",
+    "v?.isPaused ?? false",
+    "Player.isPaused"
+);
 recv_case!(recall_force_unwrap, "Player?", "v!.isPaused", "Player.isPaused", ignore "receiver typing, ft-80c5d100");
-recv_case!(recall_implicitly_unwrapped, "Player!", "v.isPaused", "Player.isPaused");
-recv_case!(recall_array_contains, "[Task]", "v.contains { $0.isCompleted }", "Task.isCompleted");
-recv_case!(recall_optional_array_coalesced, "[Task]?", "(v ?? []).contains { $0.isCompleted }", "Task.isCompleted");
-recv_case!(recall_optional_array_chain, "[Task]?", "v?.contains { $0.isCompleted } ?? false", "Task.isCompleted");
+recv_case!(
+    recall_implicitly_unwrapped,
+    "Player!",
+    "v.isPaused",
+    "Player.isPaused"
+);
+recv_case!(
+    recall_array_contains,
+    "[Task]",
+    "v.contains { $0.isCompleted }",
+    "Task.isCompleted"
+);
+recv_case!(
+    recall_optional_array_coalesced,
+    "[Task]?",
+    "(v ?? []).contains { $0.isCompleted }",
+    "Task.isCompleted"
+);
+recv_case!(
+    recall_optional_array_chain,
+    "[Task]?",
+    "v?.contains { $0.isCompleted } ?? false",
+    "Task.isCompleted"
+);
 recv_case!(recall_set_contains, "Set<Task>", "v.contains { $0.isCompleted }", "Task.isCompleted", ignore "receiver typing, ft-80c5d100");
-recv_case!(recall_array_generic_spelling, "Array<Task>", "v.contains { $0.isCompleted }", "Task.isCompleted");
-recv_case!(recall_array_filter_chain, "[Task]", "v.filter { $0.isCompleted }.isEmpty", "Task.isCompleted");
+recv_case!(
+    recall_array_generic_spelling,
+    "Array<Task>",
+    "v.contains { $0.isCompleted }",
+    "Task.isCompleted"
+);
+recv_case!(
+    recall_array_filter_chain,
+    "[Task]",
+    "v.filter { $0.isCompleted }.isEmpty",
+    "Task.isCompleted"
+);
 recv_case!(recall_array_first, "[Task]", "v.first?.isCompleted ?? false", "Task.isCompleted", ignore "receiver typing, ft-80c5d100");
-recv_case!(recall_array_for_in, "[Task]", "{ for t in v { if t.isCompleted { return true } }; return false }()", "Task.isCompleted");
+recv_case!(
+    recall_array_for_in,
+    "[Task]",
+    "{ for t in v { if t.isCompleted { return true } }; return false }()",
+    "Task.isCompleted"
+);
 recv_case!(recall_array_subscript, "[Task]", "v[0].isCompleted", "Task.isCompleted", ignore "receiver typing, ft-80c5d100");
 recv_case!(recall_dict_subscript, "[String: Task]", "v[\"a\"]?.isCompleted ?? false", "Task.isCompleted", ignore "receiver typing, ft-80c5d100");
 recv_case!(recall_dict_values_contains, "[String: Task]", "v.values.contains { $0.isCompleted }", "Task.isCompleted", ignore "receiver typing, ft-80c5d100");
-recv_case!(recall_some_protocol_param_type, "Player", "v.isPaused", "Player.isPaused");
+recv_case!(
+    recall_some_protocol_param_type,
+    "Player",
+    "v.isPaused",
+    "Player.isPaused"
+);
 
 macro_rules! proto_case {
     ($name:ident, $sig:expr, $target:expr, ignore $why:literal) => {
@@ -851,12 +972,32 @@ macro_rules! proto_case {
     };
 }
 
-proto_case!(recall_generic_inline_constraint, "func f<T: P>(t: T) -> Int { t.prop }", "P.prop");
+proto_case!(
+    recall_generic_inline_constraint,
+    "func f<T: P>(t: T) -> Int { t.prop }",
+    "P.prop"
+);
 proto_case!(recall_generic_where_constraint, "func f<T>(t: T) -> Int where T: P { t.prop }", "P.prop", ignore "receiver typing, ft-80c5d100");
-proto_case!(recall_some_protocol, "func f(_ t: some P) -> Int { t.prop }", "P.prop");
-proto_case!(recall_any_protocol, "func f(_ t: any P) -> Int { t.prop }", "P.prop");
-proto_case!(recall_bare_protocol_existential, "func f(_ t: P) -> Int { t.prop }", "P.prop");
-proto_case!(recall_concrete_conformer, "func f(_ t: Impl) -> Int { t.prop }", "Impl.prop");
+proto_case!(
+    recall_some_protocol,
+    "func f(_ t: some P) -> Int { t.prop }",
+    "P.prop"
+);
+proto_case!(
+    recall_any_protocol,
+    "func f(_ t: any P) -> Int { t.prop }",
+    "P.prop"
+);
+proto_case!(
+    recall_bare_protocol_existential,
+    "func f(_ t: P) -> Int { t.prop }",
+    "P.prop"
+);
+proto_case!(
+    recall_concrete_conformer,
+    "func f(_ t: Impl) -> Int { t.prop }",
+    "Impl.prop"
+);
 
 #[test]
 fn recall_inherited_implicit_self() {
@@ -878,7 +1019,9 @@ fn recall_inherited_typed_receiver() {
 
 #[test]
 fn recall_inherited_single_level() {
-    let r = one("class Base { var shared: Int = 0 }\nclass Leaf: Base { func f() -> Int { shared } }\n");
+    let r = one(
+        "class Base { var shared: Int = 0 }\nclass Leaf: Base { func f() -> Int { shared } }\n",
+    );
     assert!(has(&uses(&r, "Leaf.f"), "Base.shared"));
 }
 

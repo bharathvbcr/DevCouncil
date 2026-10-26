@@ -79,7 +79,8 @@ fn b6_every_prune_delete_is_an_index_search_not_a_table_scan() {
         "the FTS prune must look members up by generation_id, got {fts:?}"
     );
     assert!(
-        !fts.iter().any(|step| step.starts_with("SCAN nodes_fts_map")),
+        !fts.iter()
+            .any(|step| step.starts_with("SCAN nodes_fts_map")),
         "the FTS prune must not scan the membership map, got {fts:?}"
     );
 }
@@ -94,7 +95,9 @@ fn b6_the_checked_deletes_are_the_ones_prune_issues() {
         .find("pub fn prune_generations_except_latest")
         .expect("prune is defined in maintenance.rs");
     let body = &source[start..];
-    let body = &body[..body[1..].find("\n    pub fn ").map_or(body.len(), |end| end + 1)];
+    let body = &body[..body[1..]
+        .find("\n    pub fn ")
+        .map_or(body.len(), |end| end + 1)];
 
     let suffix = " WHERE generation_id = ?1\"";
     let mut issued: Vec<&str> = body
@@ -203,10 +206,11 @@ fn b6_prune_removes_exactly_the_generations_outside_the_window() {
             &inspect,
             &format!("SELECT COUNT(*) FROM edge_rows WHERE valid_to > {oldest_kept}"),
         );
-        let pruned = store
-            .prune_generations_except_latest(keep)
-            .expect("prune");
-        assert_eq!(pruned, removed, "keep {keep} of 4 generations removes {removed}");
+        let pruned = store.prune_generations_except_latest(keep).expect("prune");
+        assert_eq!(
+            pruned, removed,
+            "keep {keep} of 4 generations removes {removed}"
+        );
 
         let remaining: Vec<u32> = inspect
             .prepare("SELECT id FROM generations ORDER BY id")

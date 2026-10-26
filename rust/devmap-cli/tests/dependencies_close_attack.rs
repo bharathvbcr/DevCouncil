@@ -25,7 +25,10 @@ fn corpus(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
         "devmap-deps-close-{name}-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
     ));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
@@ -34,10 +37,17 @@ fn corpus(name: &str) -> PathBuf {
         "RETRY = 2\n\n\ndef helper():\n    return 1\n\n\ndef worker():\n    helper()\n    return RETRY\n",
     )
     .unwrap();
-    std::fs::write(root.join("callers.py"), "from lib import worker\n\n\ndef caller():\n    return worker()\n")
-        .unwrap();
+    std::fs::write(
+        root.join("callers.py"),
+        "from lib import worker\n\n\ndef caller():\n    return worker()\n",
+    )
+    .unwrap();
     let built = run(&root, &["build", "."]);
-    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
     root
 }
 

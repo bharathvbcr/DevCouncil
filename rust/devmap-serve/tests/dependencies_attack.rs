@@ -79,7 +79,12 @@ async fn mcp_says(store: &Arc<Store>, query: &str, budget: u32) -> Said {
     let response = handle_line(&slot, &frame.to_string()).await.expect("frame");
     let result = &response["result"];
     if result["isError"] == json!(true) {
-        return Said::Refused(result["content"][0]["text"].as_str().unwrap_or_default().to_string());
+        return Said::Refused(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
     }
     Said::Answer(strip_volatile(result["structuredContent"].clone()))
 }
@@ -98,7 +103,12 @@ async fn ipc_says(store: &Arc<Store>, query: &str, budget: u32) -> Said {
     if value["ok"] == json!(true) {
         Said::Answer(strip_volatile(value["result"].clone()))
     } else {
-        Said::Refused(value["error"]["message"].as_str().unwrap_or_default().to_string())
+        Said::Refused(
+            value["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        )
     }
 }
 
