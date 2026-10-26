@@ -248,6 +248,11 @@ Start at the **[documentation index](docs/README.md)**.
 | Implementation and migration limits | [Project status](docs/project-status.md) |
 | Native development | [Rust workspace](rust/README.md) |
 
-[Apache 2.0](LICENSE). The Python CLI, its release lineage and its historical
+## License & Acknowledgements
+
+Licensed under [Apache 2.0](LICENSE). The Python CLI, its release lineage and its historical
 workflow certifications are retired; current native source and installed
 binary identities must be checked separately.
+
+- **[tree-sitter (`tree-sitter/tree-sitter`)](https://github.com/tree-sitter/tree-sitter)** (`Max Brunsfeld & contributors`, MIT) — Multi-language AST parsing in `devmap`.
+- **Code-Intelligence Benchmark Peers** — Comparative evaluation harnesses in `docs/benchmarks/` benchmark against [GitNexus](https://github.com/abhigyanpatwari/GitNexus) (`Abhigyan Patwari`), **CodeGraph**, **Graphify**, **Gortex**, and **codebase-memory-mcp**.
