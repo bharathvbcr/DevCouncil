@@ -158,11 +158,16 @@ fn a_cancelled_suspects_says_it_was_cut_short() {
 
 // ---- the store graph's basis reads through the program it was given ----
 
+#[cfg(unix)]
 use dc_regress::blast::{blast_change_with_program, UnattributedReason};
+#[cfg(unix)]
 use dc_regress::{BlobIdentity, CodeGraph};
+#[cfg(unix)]
 use dc_regress_store::StoreGraph;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+#[cfg(unix)]
 fn script(f: &Fixture, name: &str, body: &str) -> PathBuf {
     let path = f.base.join(name);
     std::fs::write(&path, body).unwrap();
@@ -170,6 +175,7 @@ fn script(f: &Fixture, name: &str, body: &str) -> PathBuf {
     path
 }
 
+#[cfg(unix)]
 fn real_git() -> String {
     let out = Command::new("sh")
         .args(["-c", "command -v git"])
@@ -179,6 +185,7 @@ fn real_git() -> String {
 }
 
 #[test]
+#[cfg(unix)]
 fn the_graphs_basis_is_read_through_the_injected_program() {
     let f = fixture();
     let log = f.base.join("spawns.log");
@@ -208,6 +215,7 @@ fn the_graphs_basis_is_read_through_the_injected_program() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_basis_that_could_not_be_read_is_unavailable_content_not_a_mismatch() {
     let f = fixture();
     let repo = f.base.join("repo");

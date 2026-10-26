@@ -293,6 +293,7 @@ fn slot_modes(root: &Path) -> Vec<(&'static str, Arc<StoreSlot>, Option<String>)
     ]
 }
 
+#[cfg(unix)]
 fn open_generation(slot: &StoreSlot, repo_path: Option<&str>) -> Result<Option<u32>, String> {
     let (store, _) = slot.open_for_call(repo_path)?;
     store

@@ -1932,6 +1932,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     fn write_with_result(dir: &Path) -> std::io::Result<Vec<GuideOutcome>> {
         agent_guides(
             dir,

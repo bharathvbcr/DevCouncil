@@ -520,6 +520,7 @@ fn partial_discovery_failure_still_resolves_the_sibling() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_symlink_outside_the_tree_is_not_a_symbol() {
     let mut tree = TempTree::new("symlink");
     tree.write("go.mod", go_mod());
