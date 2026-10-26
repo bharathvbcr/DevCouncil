@@ -117,6 +117,37 @@ fn the_version_line_names_both_schemas_and_says_which_is_which() {
     );
 }
 
+/// The version line names the extraction schema this binary writes.
+///
+/// GitPulse's schema parity check judges the `devmap` on `PATH` by its
+/// `--version` line alone. Without `extract schema N` there it reported the
+/// binary as unverifiable for the extraction schema, because nothing else a
+/// caller can see says which extractor a build carries. The parity check reads
+/// `/extract schema (\d+)/`, so the phrase is asserted verbatim, with this
+/// binary's own constant, and after the store schema so the first-`schema`
+/// parsers above keep reading the store number.
+#[test]
+fn the_version_line_names_the_extraction_schema() {
+    let root = fixture("version-extract");
+    let output = run(&root, &["--version"]);
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    let phrase = format!(
+        "extract schema {}",
+        devmap_extract::cache::EXTRACTION_SCHEMA_VERSION
+    );
+    let at = text
+        .find(&phrase)
+        .unwrap_or_else(|| panic!("the extraction schema must be named as {phrase:?}: {text:?}"));
+    let store = text
+        .find("store schema")
+        .unwrap_or_else(|| panic!("the store schema must be named: {text:?}"));
+    assert!(
+        store < at,
+        "the store schema must stay first, before the extraction schema: {text:?}"
+    );
+}
+
 /// The no-op build carries `timings` like every other build result.
 ///
 /// The unchanged early return is the most frequent build in the system — a

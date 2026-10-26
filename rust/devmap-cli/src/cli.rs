@@ -44,6 +44,13 @@ fn non_empty(value: &Option<String>) -> Option<String> {
 /// artifact declaring `"schema_version": 2` reads as a contradiction, and the
 /// only way to tell which was meant was to know the codebase.
 ///
+/// A third, `devmap_extract::cache::EXTRACTION_SCHEMA_VERSION`, versions the
+/// per-file extraction rows: a bump makes every cached extraction stale. It is
+/// printed as `extract schema N` because a reader that only has the binary on
+/// `PATH` cannot otherwise tell which extractor it carries; GitPulse's schema
+/// parity check (`check-vendor-schema.mjs`) reads exactly that phrase and
+/// reports a build without it as unverifiable.
+///
 /// The store number stays first. `devmap_health.probe` parses this line by
 /// splitting on the first `"schema"` and taking the first integer after it
 /// (`src/devcouncil/devmap_health.py`), so the store schema must remain the
@@ -57,10 +64,11 @@ pub(crate) fn version_line() -> &'static str {
     static LINE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     LINE.get_or_init(|| {
         format!(
-            "{} (store schema {}, code graph schema {}, build {})",
+            "{} (store schema {}, code graph schema {}, extract schema {}, build {})",
             env!("CARGO_PKG_VERSION"),
             devmap_store::CURRENT_SCHEMA_VERSION,
             devmap_query::CODE_GRAPH_SCHEMA_VERSION,
+            devmap_extract::cache::EXTRACTION_SCHEMA_VERSION,
             env!("DEVMAP_BUILD_ID")
         )
     })
