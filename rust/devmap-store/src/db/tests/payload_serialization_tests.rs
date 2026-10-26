@@ -15,6 +15,7 @@
 //!   included. Row ids are assigned by insertion order, so identical tables are
 //!   the proof that the insert order did not move.
 
+use super::write::{serialize_payload, PayloadJson, PayloadTuning};
 use super::*;
 use devmap_analyze::analyze;
 use devmap_extract::extract_file;
@@ -326,4 +327,257 @@ fn the_table_dump_covers_the_relations_the_write_fills() {
             "{table} is empty, so comparing it proves nothing"
         );
     }
+}
+
+// --- What must not depend on how the documents are produced -----------------
+
+fn pool(threads: usize) -> rayon::ThreadPool {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .expect("thread pool")
+}
+
+fn write_step_tuned(store: &Store, step: &Step, tuning: &PayloadTuning<'_>) -> Result<u32> {
+    let (resolution, analysis) = resolve_and_analyze(&step.extractions);
+    store
+        .save_generation_tuned(
+            &step.extractions,
+            &resolution,
+            &analysis,
+            step.opts.clone(),
+            "unknown",
+            tuning,
+        )
+        .map(|(generation, _)| generation)
+}
+
+fn tuned<'pool>(chunk: usize, pool: &'pool rayon::ThreadPool) -> PayloadTuning<'pool> {
+    PayloadTuning {
+        chunk,
+        pool: Some(pool),
+        serialize: serialize_payload,
+    }
+}
+
+fn dump_after(steps: &[Step], tuning: &PayloadTuning<'_>) -> Vec<(String, Vec<String>)> {
+    let store = Store::open_in_memory().expect("store");
+    for step in steps {
+        write_step_tuned(&store, step, tuning).expect("write");
+    }
+    dump(&store)
+}
+
+/// An empty generation, which has no fresh extraction at all.
+fn empty_scenario() -> Vec<Step> {
+    vec![Step {
+        extractions: Vec::new(),
+        opts: GenerationWriteOpts::default(),
+    }]
+}
+
+/// Two writes of one input hold identical rows in every table, ids included,
+/// whatever the thread count and whatever the chunk size -- on both sides of
+/// every chunk boundary.
+///
+/// The reference is one thread and a chunk of one, which is the serial loop in
+/// all but name. The fresh counts are chosen against the chunk sizes under
+/// test: 0 (nothing to serialize), 1, one short of a chunk, exactly a chunk,
+/// and a chunk plus one, for chunks of 4 and for the production chunk of 64.
+#[test]
+fn the_tables_do_not_depend_on_thread_count_or_chunk_size() {
+    let serial_pool = pool(1);
+    let serial = tuned(1, &serial_pool);
+    let wide_pool = pool(8);
+    let two_pool = pool(2);
+
+    let production = PayloadTuning::default().chunk;
+    let mut cases: Vec<(String, Vec<Step>)> = vec![("empty".to_string(), empty_scenario())];
+    for fresh in [1, 3, 4, 5, 8, 9, production, production + 1] {
+        // A cold write holds `modules + 1` files: the modules and the broken one.
+        cases.push((format!("{fresh} fresh"), scenario(fresh - 1)));
+    }
+
+    for (label, steps) in &cases {
+        let want = dump_after(steps, &serial);
+        for (chunk, pool) in [
+            (1, &wide_pool),
+            (2, &two_pool),
+            (4, &wide_pool),
+            (4, &serial_pool),
+            (production, &wide_pool),
+            (usize::MAX, &wide_pool),
+        ] {
+            assert_eq!(
+                dump_after(steps, &tuned(chunk, pool)),
+                want,
+                "{label}: chunk {chunk} on {} threads wrote different rows than the serial loop",
+                pool.current_num_threads()
+            );
+        }
+        assert_eq!(
+            dump_after(steps, &PayloadTuning::default()),
+            want,
+            "{label}: the production tuning wrote different rows than the serial loop"
+        );
+    }
+}
+
+/// A serializer that fails for two files, so that which one the write names
+/// shows whether the first in iteration order wins.
+fn fails_on_mod_3_and_mod_5(extraction: &Extraction) -> Result<PayloadJson> {
+    if extraction.file_path.ends_with("/mod_3.py") || extraction.file_path.ends_with("/mod_5.py") {
+        return Err(refusal(format!(
+            "injected serialization failure for {}",
+            extraction.file_path
+        )));
+    }
+    serialize_payload(extraction)
+}
+
+fn panics_on_mod_2_and_mod_4(extraction: &Extraction) -> Result<PayloadJson> {
+    if extraction.file_path.ends_with("/mod_2.py") || extraction.file_path.ends_with("/mod_4.py") {
+        panic!("injected panic for {}", extraction.file_path);
+    }
+    serialize_payload(extraction)
+}
+
+fn nothing_was_written(store: &Store) {
+    let conn = lock_conn(&store.conn).expect("connection: the store must not be poisoned");
+    for table in [
+        "generations",
+        "paths",
+        "file_payloads",
+        "generation_file_rows",
+        "generation_nodes",
+        "generation_literals",
+    ] {
+        let rows: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 0, "{table} kept rows of a write that failed");
+    }
+}
+
+/// The write fails at the first failing extraction in iteration order, with
+/// that extraction's message, however the extractions are split into chunks
+/// and however many threads reach the failures first; and the failed write
+/// leaves nothing behind.
+#[test]
+fn a_serialization_failure_names_the_first_failing_extraction_and_rolls_back() {
+    let steps = scenario(8);
+    let serial_pool = pool(1);
+    let wide_pool = pool(8);
+    let mut seen = Vec::new();
+    for (chunk, pool) in [
+        (1, &serial_pool),
+        (2, &wide_pool),
+        (4, &wide_pool),
+        (usize::MAX, &wide_pool),
+        (usize::MAX, &serial_pool),
+    ] {
+        let store = Store::open_in_memory().expect("store");
+        let tuning = PayloadTuning {
+            serialize: fails_on_mod_3_and_mod_5,
+            ..tuned(chunk, pool)
+        };
+        let error = write_step_tuned(&store, &steps[0], &tuning)
+            .expect_err("a failing serializer must fail the write")
+            .to_string();
+        assert!(
+            error.contains("injected serialization failure for pkg/mod_3.py"),
+            "chunk {chunk}: the first failing extraction in iteration order is mod_3: {error}"
+        );
+        assert!(
+            !error.contains("mod_5.py"),
+            "chunk {chunk}: a later failure pre-empted the first: {error}"
+        );
+        nothing_was_written(&store);
+        // The store is usable after the failed write.
+        write_step_tuned(&store, &steps[0], &tuned(chunk, pool))
+            .expect("a good write after a failed one");
+        seen.push(error);
+    }
+    assert!(
+        seen.windows(2).all(|pair| pair[0] == pair[1]),
+        "the refusal text must not depend on the chunking: {seen:?}"
+    );
+}
+
+/// A serializer that panics does not take the process's store with it: the
+/// write fails naming the file, rolls back, and the connection mutex is not
+/// poisoned.
+#[test]
+fn a_panic_in_the_serializer_is_a_failed_write_not_a_poisoned_store() {
+    let steps = scenario(8);
+    let wide_pool = pool(8);
+    for chunk in [1, 4, usize::MAX] {
+        let store = Store::open_in_memory().expect("store");
+        let tuning = PayloadTuning {
+            serialize: panics_on_mod_2_and_mod_4,
+            ..tuned(chunk, &wide_pool)
+        };
+        let error = write_step_tuned(&store, &steps[0], &tuning)
+            .expect_err("a panicking serializer must fail the write")
+            .to_string();
+        assert!(
+            error.contains("panicked for pkg/mod_2.py") && error.contains("injected panic"),
+            "chunk {chunk}: the first panicking extraction is named with its reason: {error}"
+        );
+        nothing_was_written(&store);
+        write_step_tuned(&store, &steps[0], &tuned(chunk, &wide_pool))
+            .expect("the store is not poisoned by the caught panic");
+        assert_eq!(payload_order(&store).len(), 9);
+    }
+}
+
+/// An insert that fails before a later extraction's serialization failure is
+/// the error the write reports, as in the serial loop, where the later
+/// extraction was never reached. A chunk that serialized the later one first
+/// must not change that.
+#[test]
+fn an_earlier_insert_failure_is_not_pre_empted_by_a_later_serialization_failure() {
+    let steps = scenario(8);
+    let wide_pool = pool(8);
+    let mut seen = Vec::new();
+    for chunk in [1, 4, usize::MAX] {
+        let store = Store::open_in_memory().expect("store");
+        lock_conn(&store.conn)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_mod_2 BEFORE INSERT ON file_payloads
+                 WHEN NEW.file_id = (SELECT id FROM paths WHERE path = 'pkg/mod_2.py')
+                 BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END;",
+            )
+            .unwrap();
+        let tuning = PayloadTuning {
+            serialize: fails_on_mod_3_and_mod_5,
+            ..tuned(chunk, &wide_pool)
+        };
+        let error = write_step_tuned(&store, &steps[0], &tuning)
+            .expect_err("both failures are armed")
+            .to_string();
+        assert!(
+            error.contains("injected insert failure"),
+            "chunk {chunk}: mod_2's insert fails before mod_3 is reached: {error}"
+        );
+        seen.push(error);
+    }
+    assert!(seen.windows(2).all(|pair| pair[0] == pair[1]), "{seen:?}");
+}
+
+/// A chunk of nothing is not a tuning. `chunks(0)` would panic; the write
+/// refuses it before it touches the store.
+#[test]
+fn a_zero_chunk_is_refused_not_a_panic() {
+    let store = Store::open_in_memory().expect("store");
+    let steps = scenario(3);
+    let one = pool(1);
+    let error = write_step_tuned(&store, &steps[0], &tuned(0, &one))
+        .expect_err("a zero chunk")
+        .to_string();
+    assert!(error.contains("at least one extraction"), "{error}");
+    nothing_was_written(&store);
 }

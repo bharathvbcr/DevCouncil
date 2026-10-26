@@ -14,11 +14,133 @@ use devmap_extract::model::{confidence_millis, EdgeKind, Extraction};
 #[cfg(feature = "parse")]
 use devmap_resolve::model::ResolutionResult;
 #[cfg(feature = "parse")]
+use rayon::prelude::*;
+#[cfg(feature = "parse")]
 use rusqlite::OptionalExtension;
 #[cfg(feature = "parse")]
 use rusqlite::{params, Connection, Result};
 #[cfg(feature = "parse")]
 use std::path::Path;
+
+/// How many fresh extractions are serialized in parallel before their rows are
+/// inserted. See [`Store::save_generation_tuned`] for what the chunking is for.
+///
+/// 64 because of what each end of the trade costs. Too small and every chunk is
+/// a barrier the slowest file holds the other threads at: 64 files give an
+/// 18-core machine three or four files per thread per barrier, where 16 would
+/// leave most of them idle for the tail. Too large and the documents of a chunk
+/// stop being a bounded buffer: a payload averages 54 KB, so a chunk of 64 is
+/// about 3.5 MB of JSON, against the 137 MB a cold build of the main
+/// repository would hold if it serialized everything first. The bound is on
+/// *count*, not bytes, so the ceiling is 64 times the largest payload, and
+/// payloads are bounded by the file size limit discovery already enforces.
+#[cfg(feature = "parse")]
+const PAYLOAD_SERIALIZE_CHUNK: usize = 64;
+
+/// The three JSON documents a fresh `file_payloads` row holds for one
+/// extraction.
+#[cfg(feature = "parse")]
+pub(super) struct PayloadJson {
+    parse_outcome: String,
+    engine: String,
+    extraction: String,
+}
+
+/// Produces one extraction's [`PayloadJson`]. The signature a serializer must
+/// have to be swapped in through [`PayloadTuning`].
+#[cfg(feature = "parse")]
+pub(super) type PayloadSerializer = fn(&Extraction) -> Result<PayloadJson>;
+
+/// How a write serializes its fresh payloads. `default()` is production.
+#[cfg(feature = "parse")]
+pub(super) struct PayloadTuning<'pool> {
+    /// Extractions per chunk. Must be at least one.
+    pub(super) chunk: usize,
+    /// The pool a chunk is serialized on; `None` is rayon's global pool.
+    pub(super) pool: Option<&'pool rayon::ThreadPool>,
+    pub(super) serialize: PayloadSerializer,
+}
+
+#[cfg(feature = "parse")]
+impl Default for PayloadTuning<'_> {
+    fn default() -> Self {
+        Self {
+            chunk: PAYLOAD_SERIALIZE_CHUNK,
+            pool: None,
+            serialize: serialize_payload,
+        }
+    }
+}
+
+/// The documents of one extraction, as the generation stores them.
+///
+/// `for_durable_store` is a full clone plus the secret-value withholding, so
+/// this allocates one extraction's worth of memory per call: bounded by the
+/// number of threads serializing, not by the chunk.
+#[cfg(feature = "parse")]
+pub(super) fn serialize_payload(extraction: &Extraction) -> Result<PayloadJson> {
+    let parse_outcome = serde_json::to_string(&extraction.parse_outcome).map_err(|error| {
+        refusal(format!(
+            "parse outcome serialization failed for {}: {error}",
+            extraction.file_path
+        ))
+    })?;
+    let engine = serde_json::to_string(&extraction.engine).map_err(|error| {
+        refusal(format!(
+            "extraction engine serialization failed for {}: {error}",
+            extraction.file_path
+        ))
+    })?;
+    let mut durable_extraction = extraction.for_durable_store();
+    durable_extraction.source_code = None;
+    let extraction_json = serde_json::to_string(&durable_extraction).map_err(|error| {
+        refusal(format!(
+            "extraction serialization failed for {}: {error}",
+            extraction.file_path
+        ))
+    })?;
+    Ok(PayloadJson {
+        parse_outcome,
+        engine,
+        extraction: extraction_json,
+    })
+}
+
+/// Serializes `chunk` in parallel, one result per extraction, in the order of
+/// `chunk`.
+///
+/// A panic in the serializer is caught here, per extraction, and becomes that
+/// extraction's error. Left to unwind it would cross rayon, then the held
+/// connection guard, which poisons the store's mutex and refuses every later
+/// write of the process; caught, it is an ordinary failed write that rolls its
+/// transaction back and names the file. Catching per extraction rather than per
+/// chunk is also what keeps the error deterministic: the first failing
+/// extraction in iteration order is reported, not whichever panic rayon
+/// happened to propagate.
+#[cfg(feature = "parse")]
+fn serialize_chunk(chunk: &[&Extraction], tuning: &PayloadTuning<'_>) -> Vec<Result<PayloadJson>> {
+    let one = |extraction: &&Extraction| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (tuning.serialize)(extraction)
+        }))
+        .unwrap_or_else(|panic| {
+            let reason = panic
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "a non-string panic payload".to_string());
+            Err(refusal(format!(
+                "payload serialization panicked for {}: {reason}",
+                extraction.file_path
+            )))
+        })
+    };
+    let run = || chunk.par_iter().map(one).collect::<Vec<_>>();
+    match tuning.pool {
+        Some(pool) => pool.install(run),
+        None => run(),
+    }
+}
 
 impl Store {
     /// The id of the stored payload with this identity, inserting it if new.
@@ -286,6 +408,87 @@ impl Store {
         opts: GenerationWriteOpts,
         head_sha: &str,
     ) -> Result<(u32, WriteBreakdown)> {
+        self.save_generation_tuned(
+            extractions,
+            resolution,
+            analysis,
+            opts,
+            head_sha,
+            &PayloadTuning::default(),
+        )
+    }
+
+    /// [`save_generation_timed`](Self::save_generation_timed) with the payload
+    /// serialization's chunk size, thread pool and serializer named by the
+    /// caller. The only caller that names anything but the defaults is a test:
+    /// the writes it compares must differ in thread count and chunk boundary
+    /// and nothing else, and a chunk of one, a chunk that fits the whole input
+    /// and a serializer that fails or panics are not reachable through the
+    /// public entry points.
+    ///
+    /// # Fresh payloads are serialized ahead of their inserts, in chunks
+    ///
+    /// Every extraction that is neither carried nor deleted gets a fresh
+    /// `file_payloads` row holding three JSON documents: the parse outcome, the
+    /// engine and the durable extraction. Producing them is a
+    /// pure function of one extraction -- `for_durable_store` clones it, so
+    /// nothing is shared -- and on a cold build of this repository's `rust/`
+    /// (1,052 files) it was 0.62 s of a 1.70 s write, serial, with the writer
+    /// lock held. The inserts that consume the documents are a different cost:
+    /// SQLite has one writer, so they stay on this thread, in order.
+    ///
+    /// The fresh extractions are therefore taken `tuning.chunk` at a time: a
+    /// chunk is serialized in parallel, then its rows are inserted one by one,
+    /// then the next chunk. Two properties are load-bearing.
+    ///
+    /// **Ordering.** The documents of a chunk come back in the order of the
+    /// chunk (`par_iter().map().collect()` preserves it) and are inserted in
+    /// exactly the order the serial loop did, so every `payload_id`, every
+    /// `generation_file_rows` row and every path id, which are all handed out by
+    /// insertion order, are what they were. Nothing here depends on which
+    /// thread finished first.
+    ///
+    /// **Errors.** A serialization failure -- or a panic in the serializer,
+    /// which is caught per extraction and becomes a failure naming that file --
+    /// is held in the chunk's result at the failing extraction's position and
+    /// returned when the insert loop reaches it. The write therefore fails at
+    /// the first failing extraction in iteration order, with that extraction's
+    /// message, after having attempted the inserts of every extraction before
+    /// it, exactly as the serial loop did. A later extraction's failure in the
+    /// same chunk cannot pre-empt an earlier insert's own error. The error
+    /// drops the transaction, which rolls the whole generation back; a panic
+    /// that was caught here never unwinds through the connection mutex, so the
+    /// store is not poisoned.
+    ///
+    /// **Memory.** Only one chunk's documents exist at a time, never the whole
+    /// generation's (137 MB on a cold build of the main repository).
+    ///
+    /// **Why inside the transaction.** For a differential write which extractions
+    /// are fresh is decided by `carry`, which is read from the previous
+    /// generation under the writer lock; deciding it earlier would let another
+    /// process commit in between. For a full rewrite the answer is known
+    /// without the store -- all of them -- but serializing them ahead of the
+    /// transaction means holding every document at once, which is the memory
+    /// bound this exists to keep.
+    ///
+    /// **The `serialize` span** is the wall time of the chunk's parallel
+    /// serialization, the time the write was waiting for documents, not the
+    /// CPU time spent on them.
+    #[cfg(feature = "parse")]
+    pub(super) fn save_generation_tuned(
+        &self,
+        extractions: &[Extraction],
+        resolution: &ResolutionResult,
+        analysis: &AnalysisSummary,
+        opts: GenerationWriteOpts,
+        head_sha: &str,
+        tuning: &PayloadTuning<'_>,
+    ) -> Result<(u32, WriteBreakdown)> {
+        if tuning.chunk == 0 {
+            return Err(refusal(
+                "payload serialization chunk must hold at least one extraction",
+            ));
+        }
         let mut spent = WriteBreakdown::default();
         // Started before the first thing the write does, so the residual
         // `attribute_residual` computes below covers the whole call and not
@@ -490,75 +693,72 @@ impl Store {
             }
         }
 
-        for extraction in extractions {
-            // Not "is it affected" but "was it carried". They differ exactly
-            // when a prior payload failed the identity gate: the file is
-            // unaffected, nothing was carried for it, and its fresh rows are
-            // the only ones this generation will have.
-            if !full_rewrite && carry.contains(&extraction.file_path) {
-                continue;
-            }
-            if deleted.contains(&extraction.file_path) {
-                continue;
-            }
-            // SQLite has no unsigned integer type. Preserve all 64 bits using
-            // the same two's-complement representation as the extraction cache.
-            let content_hash = extraction.content_hash as i64;
-            let (parse_json, engine_json, extraction_json) = {
+        // The extractions that get fresh rows, in iteration order.
+        //
+        // Not "is it affected" but "was it carried". They differ exactly when a
+        // prior payload failed the identity gate: the file is unaffected,
+        // nothing was carried for it, and its fresh rows are the only ones this
+        // generation will have.
+        //
+        // Named once and walked by both fresh-row loops below, so the payload
+        // loop and the node loop cannot come to disagree about which files they
+        // are writing.
+        let fresh: Vec<&Extraction> = extractions
+            .iter()
+            .filter(|extraction| {
+                !(!full_rewrite && carry.contains(&extraction.file_path))
+                    && !deleted.contains(&extraction.file_path)
+            })
+            .collect();
+
+        for chunk in fresh.chunks(tuning.chunk) {
+            // The whole chunk's documents, serialized in parallel and held
+            // until its rows are inserted. See `save_generation_tuned` for why
+            // the insert below still walks them one at a time, in order.
+            let serialized = {
                 let _charge = charge(&mut spent.serialize);
-                let parse_json =
-                    serde_json::to_string(&extraction.parse_outcome).map_err(|error| {
-                        refusal(format!(
-                            "parse outcome serialization failed for {}: {error}",
-                            extraction.file_path
-                        ))
-                    })?;
-                let engine_json = serde_json::to_string(&extraction.engine).map_err(|error| {
-                    refusal(format!(
-                        "extraction engine serialization failed for {}: {error}",
-                        extraction.file_path
-                    ))
-                })?;
-                let mut durable_extraction = extraction.for_durable_store();
-                durable_extraction.source_code = None;
-                let extraction_json =
-                    serde_json::to_string(&durable_extraction).map_err(|error| {
-                        refusal(format!(
-                            "extraction serialization failed for {}: {error}",
-                            extraction.file_path
-                        ))
-                    })?;
-                (parse_json, engine_json, extraction_json)
+                serialize_chunk(chunk, tuning)
             };
-            let file_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &extraction.file_path)?;
-            // The identity this payload was produced with, so a stored row is
-            // usable as a cache fallback without discarding the staleness
-            // guarantee the cache key exists to enforce (SC8). Since v17 it is
-            // also the payload's own key.
-            let identity = devmap_extract::cache::CacheKey::for_extraction(extraction);
-            let payload_id = {
-                let _charge = charge(&mut spent.payloads);
-                Self::ensure_payload_id(
-                    &tx,
-                    StoredPayload {
-                        file_id,
-                        content_hash,
-                        language: &extraction.language,
-                        grammar_version: &identity.grammar_version,
-                        analyzer_version: &identity.analyzer_version,
-                        parse_outcome_json: &parse_json,
-                        engine_json: &engine_json,
-                        extraction_json: &extraction_json,
-                    },
-                )?
-            };
-            {
-                let _charge = charge(&mut spent.file_rows);
-                tx.execute(
-                    "INSERT INTO generation_file_rows (generation_id, file_id, payload_id)
-                     VALUES (?1, ?2, ?3)",
-                    params![gen_id, file_id, payload_id],
-                )?;
+            for (extraction, documents) in chunk.iter().copied().zip(serialized) {
+                // SQLite has no unsigned integer type. Preserve all 64 bits using
+                // the same two's-complement representation as the extraction cache.
+                let content_hash = extraction.content_hash as i64;
+                let PayloadJson {
+                    parse_outcome: parse_json,
+                    engine: engine_json,
+                    extraction: extraction_json,
+                } = documents?;
+                let file_id =
+                    Self::ensure_path_id_cached(&tx, &mut path_ids, &extraction.file_path)?;
+                // The identity this payload was produced with, so a stored row is
+                // usable as a cache fallback without discarding the staleness
+                // guarantee the cache key exists to enforce (SC8). Since v17 it is
+                // also the payload's own key.
+                let identity = devmap_extract::cache::CacheKey::for_extraction(extraction);
+                let payload_id = {
+                    let _charge = charge(&mut spent.payloads);
+                    Self::ensure_payload_id(
+                        &tx,
+                        StoredPayload {
+                            file_id,
+                            content_hash,
+                            language: &extraction.language,
+                            grammar_version: &identity.grammar_version,
+                            analyzer_version: &identity.analyzer_version,
+                            parse_outcome_json: &parse_json,
+                            engine_json: &engine_json,
+                            extraction_json: &extraction_json,
+                        },
+                    )?
+                };
+                {
+                    let _charge = charge(&mut spent.file_rows);
+                    tx.execute(
+                        "INSERT INTO generation_file_rows (generation_id, file_id, payload_id)
+                         VALUES (?1, ?2, ?3)",
+                        params![gen_id, file_id, payload_id],
+                    )?;
+                }
             }
         }
 
@@ -657,13 +857,7 @@ impl Store {
         }
 
         // Insert fresh rows for every extraction whose file was not carried.
-        for ext in extractions {
-            if !full_rewrite && carry.contains(&ext.file_path) {
-                continue;
-            }
-            if deleted.contains(&ext.file_path) {
-                continue;
-            }
+        for ext in fresh.iter().copied() {
             let file_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &ext.file_path)?;
             for sym in &ext.symbols {
                 {
