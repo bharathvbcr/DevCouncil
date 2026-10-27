@@ -49,6 +49,61 @@ fn land_generation(root: &std::path::Path, store: &Store, generation: usize) {
         .unwrap();
 }
 
+/// The oracle for "which generation did this answer read". Generation `n` has
+/// `n` callers of `d`, and `total` is what a complete answer holds, so it names
+/// the generation however the token budget trimmed `items`. `items.len()` does
+/// not: it is capped by the budget, so once a generation had more callers than
+/// the budget shows, a correctly pinned verdict for generation 346 sat beside
+/// 320 items and read as "certified an older generation" (19 of 5,600 under
+/// load, every sample `(320, Some(346..364))`). Returns `(callers the answer
+/// read, generation the verdict certified)` when a verified verdict disagrees.
+fn mis_verified(
+    r: &devmap_query::Response<devmap_resolve::model::ResolvedEdge>,
+) -> Option<(usize, Option<u32>)> {
+    let v = &r.source_freshness;
+    (v.fresh.is_some() && v.generation_id.map(|g| g as usize) != Some(r.total as usize))
+        .then_some((r.total as usize, v.generation_id))
+}
+
+/// A quiescent store, no writer and no timing: the answer is trimmed by the
+/// budget (`shown < total`), the verdict is verified and names the generation
+/// the answer read, and `total` -- not `items.len()` -- is what identifies it.
+/// The race-free form of the `eight_readers` failure: it needs no load to show
+/// that an item count is the wrong oracle once an answer is truncated.
+#[test]
+fn a_budget_trimmed_answer_is_still_pinned_to_its_generation() {
+    let db = std::env::temp_dir().join(format!("attack3-trim-{}.sqlite", std::process::id()));
+    let _ = fs::remove_file(&db);
+    let fx = fixture("attack3-trim", Some(&db));
+    let reader = Store::open(&db).unwrap();
+    let writer = Store::open(&db).unwrap();
+    const GENERATIONS: usize = 60;
+    for generation in 2..=GENERATIONS {
+        land_generation(&fx.root, &writer, generation);
+    }
+    reader.status("t").unwrap();
+    let engine = StoreQueryEngine::new(&reader);
+    let tight = Request {
+        token_budget: 200,
+        ..req("d", 1)
+    };
+    let answer = engine.impact(tight).unwrap();
+    assert!(
+        answer.truncated && answer.items.len() < answer.total as usize,
+        "the budget must trim this answer for the probe to mean anything: {} of {}",
+        answer.items.len(),
+        answer.total
+    );
+    assert_eq!(
+        answer.items.len() as u32 + answer.hidden,
+        answer.total,
+        "shown + hidden == total"
+    );
+    let v = &answer.source_freshness;
+    assert!(v.fresh.is_some(), "the verdict must be verified: {v:?}");
+    assert_eq!(mis_verified(&answer), None, "{v:?}");
+}
+
 /// Probe 1: the pin's soundness rests on generation ids never decreasing or
 /// being reused. The answer reads generation 2 (2 callers). The hook rewinds the
 /// sequence (what a restore does) and lands a different generation that gets id
@@ -179,8 +234,8 @@ fn eight_readers_never_get_a_mis_verified_answer() {
                         let v = &r.source_freshness;
                         if v.fresh.is_some() {
                             verified.fetch_add(1, Ordering::Relaxed);
-                            if v.generation_id.map(|g| g as usize) != Some(r.items.len()) {
-                                wrong.lock().unwrap().push((r.items.len(), v.generation_id));
+                            if let Some(wrong_pair) = mis_verified(&r) {
+                                wrong.lock().unwrap().push(wrong_pair);
                             }
                         } else if v.reason.as_deref().unwrap_or("").contains("index moved") {
                             moved.fetch_add(1, Ordering::Relaxed);
