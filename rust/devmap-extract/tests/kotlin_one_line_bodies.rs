@@ -338,6 +338,12 @@ fn a_clean_file_is_not_rewritten() {
 #[test]
 fn repair_is_deterministic() {
     let source = "class C { companion object { fun f() = 1 } }\nfun top() {}\n";
+    assert!(
+        !extract_file("K.kt", source)
+            .recovered_decl_ranges
+            .is_empty(),
+        "the statement was repaired"
+    );
     let first = serde_json::to_string(&extract_file("K.kt", source)).unwrap();
     let second = serde_json::to_string(&extract_file("K.kt", source)).unwrap();
     assert_eq!(first, second);
