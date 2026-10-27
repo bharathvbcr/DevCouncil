@@ -323,18 +323,19 @@ CREATE TABLE nope (id INT
         assert!(names.contains(&present), "missing {present}: {names:?}");
     }
     // A stored function is a callable the extractor already records. A table
-    // that exists only as text inside a comment, a string, or an unterminated
-    // statement is not a schema object. `inner_fake` (trigger body) and
-    // `dollar_fake` (function body) are not asserted either way: the grammar
-    // parses both as tables outside every error range, and recovery removes a
-    // symbol only where the grammar reported an error (see
+    // that exists only as text inside a comment or a string is not a schema
+    // object. `inner_fake` (trigger body), `dollar_fake` (function body) and
+    // `nope` (an unterminated statement) are not asserted either way: the
+    // grammar emits them, and recovery removes a symbol only when it starts
+    // inside a skipped body that ended at a terminator and overlaps a grammar
+    // error. A scan that loses sync at `nope` stops there; it does not rule on
+    // what the grammar read after it (see
     // `recovery_never_removes_a_symbol_the_grammar_parsed_outside_an_error`).
     assert_eq!(relation(&extraction, "f").kind, SymbolKind::Function);
     for absent in [
         "fake",
         "commented",
         "quoted_in_trigger",
-        "nope",
         "tr",
         "docs_fts2_nope",
     ] {
@@ -420,10 +421,11 @@ CREATE TABLE nope_unclosed (id INT
     ] {
         assert!(names.contains(&present), "missing {present}: {names:?}");
     }
-    // `inside_fn`, `inside_block` and `inside_comment` are not asserted: the
-    // grammar parses each as a table outside every error range, so recovery
-    // leaves it (the ruling: removal only inside an error range).
-    for absent in ["nope_unclosed", "a", "Details", "Order"] {
+    // `inside_fn`, `inside_block`, `inside_comment` and `nope_unclosed` are not
+    // asserted: the grammar emits each, and recovery neither removes a symbol
+    // outside a closed skipped body that overlaps an error nor rules on text
+    // after a point where the scan lost sync.
+    for absent in ["a", "Details", "Order"] {
         assert!(!names.contains(&absent), "invented {absent}: {names:?}");
     }
     assert_eq!(relation(&extraction, "g").kind, SymbolKind::Function);
@@ -674,8 +676,8 @@ CREATE TABLE \"work_events\" (id INT CHECK(json_valid(id)));
 /// Recovery is a second reader of the text, so it removes a symbol only where
 /// the grammar itself reported an error. A table the grammar parsed outside
 /// every error range stays even when the scan reads that text as a routine
-/// body; a table inside the unterminated tail, where the grammar's error is,
-/// goes.
+/// body. Where the scan loses sync (an unterminated statement) recovery stops:
+/// the table the grammar read there stays as it read it.
 #[test]
 fn recovery_never_removes_a_symbol_the_grammar_parsed_outside_an_error() {
     let source = "\
@@ -711,8 +713,42 @@ CREATE TABLE tail_open (id INT
         assert!(names.contains(&table), "missing {table}: {names:?}");
     }
     assert!(
-        !names.contains(&"tail_open"),
-        "the unterminated tail is where the error is: {names:?}"
+        names.contains(&"tail_open"),
+        "the unterminated tail keeps the grammar's output: {names:?}"
+    );
+}
+
+/// A scan that loses sync is evidence the scanner is wrong. Recovery stops at
+/// that point: what came before is recovered, what comes after keeps the
+/// grammar's output, with nothing removed and nothing synthesised.
+#[test]
+fn a_scan_that_loses_sync_stops_recovery_there() {
+    let source = "\
+CREATE VIRTUAL TABLE before_lost USING fts5(x);
+CREATE TABLE kept (x TEXT CHECK(json_valid(x)));
+SELECT $$ never closed;
+CREATE VIRTUAL TABLE after_lost USING fts5(x);
+CREATE TABLE after_table (x TEXT CHECK(json_valid(x)));
+";
+    let grammar = grammar_only(source);
+    let extraction = extract_file("lost.sql", source);
+    let names = declared(&extraction);
+    assert!(names.contains(&"before_lost"), "{names:?}");
+    assert!(names.contains(&"kept"), "{names:?}");
+    assert!(
+        !names.contains(&"after_lost"),
+        "synthesised after the scan lost sync: {names:?}"
+    );
+    for symbol in declared(&grammar) {
+        assert!(names.contains(&symbol), "removed `{symbol}`: {names:?}");
+    }
+    assert!(
+        extraction
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("lost sync")),
+        "{:?}",
+        extraction.diagnostics
     );
 }
 

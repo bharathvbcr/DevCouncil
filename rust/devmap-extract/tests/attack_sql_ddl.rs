@@ -257,9 +257,14 @@ CREATE TABLE z (id int);
     let full = extract_file("a.sql", source);
     let found = names(&full);
     assert!(found.contains(&"z"), "{found:?}");
-    assert!(
-        !found.contains(&"ghost"),
-        "`ghost` is inside an outer block comment: {found:?}"
+    // The grammar does not nest comments, so it may read `ghost` as code and
+    // emit it itself; that is its output and recovery leaves it. What recovery
+    // must not do is synthesise a symbol the grammar did not emit.
+    let grammar = grammar(source);
+    assert_eq!(
+        found.contains(&"ghost"),
+        names(&grammar).contains(&"ghost"),
+        "recovery synthesised a symbol from inside an outer block comment: {found:?}"
     );
 }
 
@@ -327,9 +332,11 @@ fn attack_sql_battery_is_deterministic_in_bounds_and_loses_nothing_clean() {
             );
             for kept in &grammar.symbols {
                 assert!(
-                    first.symbols.iter().any(|symbol| symbol.span.start_byte
-                        == kept.span.start_byte
-                        && symbol.span.end_byte == kept.span.end_byte),
+                    first
+                        .symbols
+                        .iter()
+                        .any(|symbol| symbol.span.start_byte == kept.span.start_byte
+                            && symbol.span.end_byte == kept.span.end_byte),
                     "{label}: recovery changed the span of `{}`",
                     kept.name
                 );

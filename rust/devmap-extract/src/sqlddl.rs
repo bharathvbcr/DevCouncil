@@ -13,14 +13,20 @@
 //! `Struct`, the kind every other relation already has. Indexes and triggers
 //! stay non-symbols. Nothing is invented for an unterminated statement, or
 //! for a `CREATE` inside a string, a comment, a dollar quote, a parenthesised
-//! expression, or a `BEGIN`/`END` body.
+//! expression, or a `BEGIN`/`END` body, and a name that cannot be read in full
+//! is not recovered at all.
 //!
 //! The text scan is a second reader of a file the grammar already read, so it
 //! is never trusted over the grammar where the grammar had no complaint: on a
 //! file that parsed `Clean` recovery removes nothing, and on a `Partial` file
-//! it removes only a symbol that touches a grammar error range. It is bounded
-//! by the file's own deadline and by caps, and a cap or deadline leaves the
-//! grammar's output exactly as it was.
+//! it removes only a symbol whose start lies strictly inside a skipped body
+//! (a trigger, routine or dollar-quoted body with a matched terminator) and
+//! that overlaps a grammar error range. A scan that loses sync is evidence the
+//! scanner is wrong, not that the grammar invented declarations: recovery
+//! stops at that point and everything after it keeps the grammar's output,
+//! with no removal and no synthesis. The scan is bounded by the file's own
+//! deadline and by caps, and a cap or deadline leaves the grammar's output
+//! exactly as it was.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -100,24 +106,6 @@ impl ErrorRanges {
             .get(at)
             .is_some_and(|&(range_start, _)| range_start < end)
     }
-
-    /// `[start, end)` shares a byte with a range, or a zero-width range sits
-    /// anywhere in `[start, end]`, edges included. The grammar marks an
-    /// unterminated statement with an empty error at the end of the file, and
-    /// the symbol it invented ends exactly there; a symbol that merely abuts a
-    /// range with width does not touch it.
-    fn touches(&self, start: usize, end: usize) -> bool {
-        if self.overlaps(start, end) {
-            return true;
-        }
-        let first = self
-            .merged
-            .partition_point(|&(_, range_end)| range_end < start);
-        self.merged[first..]
-            .iter()
-            .take_while(|&&(range_start, _)| range_start <= end)
-            .any(|&(range_start, range_end)| range_start == range_end)
-    }
 }
 
 /// Put back relations whose statement overlaps a parse error and whose symbol
@@ -128,12 +116,15 @@ impl ErrorRanges {
 /// already confined stays a recorded error, and a trigger body the grammar
 /// cannot parse stays one too.
 ///
-/// A `CREATE TABLE` the grammar saw inside a trigger body, a routine body, or
-/// an unterminated statement is not a relation in the schema. Such a symbol is
-/// removed only when it touches a grammar error range; on a file the grammar
-/// parsed `Clean` nothing is removed. A stored function itself stays: it is
-/// the callable the call graph already attributes. Quoted identifiers are
-/// stored as the name inside the quotes.
+/// A `CREATE TABLE` the grammar saw inside a trigger body or a routine body is
+/// not a relation in the schema. Such a symbol is removed only when its start
+/// lies strictly inside a skipped body that ended at a terminator and it
+/// overlaps a grammar error range; on a file the grammar parsed `Clean`
+/// nothing is removed. Where the scan loses sync (an unclosed quote, comment
+/// or block) recovery stops: nothing after that point is removed or added. A
+/// stored function itself stays: it is the callable the call graph already
+/// attributes. Quoted identifiers are stored as the name inside the quotes,
+/// unless another symbol already holds that qualified name.
 ///
 /// `deadline` is the instant the file's parse budget ends. Recovery runs after
 /// the grammar pass has disarmed its own clock, so it carries the deadline
@@ -153,7 +144,15 @@ pub(crate) fn recover_lost_relations(extraction: &mut Extraction, source: &str, 
         _ => return,
     };
     match plan(extraction, source, &errors, deadline) {
-        Ok(plan) => apply(extraction, plan, &errors),
+        Ok(plan) => {
+            let stopped = plan.scan.unterminated_at;
+            apply(extraction, plan, &errors);
+            if let Some(at) = stopped {
+                extraction.diagnostics.push(format!(
+                    "SQL relation recovery stopped at byte {at}, where the text scan lost sync; what follows is as the grammar read it"
+                ));
+            }
+        }
         Err(abandon) => extraction.diagnostics.push(abandon.diagnostic()),
     }
 }
@@ -199,15 +198,47 @@ fn plan(
     Ok(Plan { scan, installs })
 }
 
-/// Qualified names that changed, old to new. One pass over the edges applies
-/// them all; a rename per symbol would walk every edge once per symbol.
-type Renames = HashMap<String, String>;
+/// Qualified names that changed, old to new, and the qualified names the
+/// symbols hold. One pass over the edges applies the renames; a rename per
+/// symbol would walk every edge once per symbol. `held` is what keeps a rename
+/// from landing on a name another symbol already carries.
+#[derive(Default)]
+struct Names {
+    renames: HashMap<String, String>,
+    held: HashMap<String, usize>,
+}
+
+impl Names {
+    /// Another symbol than `index` holds `qualified`.
+    fn held_by_other(&self, qualified: &str, index: usize) -> bool {
+        self.held
+            .get(qualified)
+            .is_some_and(|&holder| holder != index)
+    }
+
+    fn moved(&mut self, index: usize, old: &str, new: &str) {
+        if old == new {
+            return;
+        }
+        if self.held.get(old) == Some(&index) {
+            self.held.remove(old);
+        }
+        self.held.entry(new.to_string()).or_insert(index);
+        self.renames
+            .entry(old.to_string())
+            .or_insert_with(|| new.to_string());
+    }
+}
 
 fn apply(extraction: &mut Extraction, plan: Plan, errors: &ErrorRanges) {
     let file = extraction.file_path.clone();
-    let mut renames = Renames::new();
+    let mut names = Names::default();
     let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
     for (index, symbol) in extraction.symbols.iter().enumerate() {
+        names
+            .held
+            .entry(symbol.qualified_name.clone())
+            .or_insert(index);
         if symbol.kind != SymbolKind::File {
             by_name
                 .entry(bare_name(&symbol.name))
@@ -216,11 +247,11 @@ fn apply(extraction: &mut Extraction, plan: Plan, errors: &ErrorRanges) {
         }
     }
     for install in plan.installs {
-        install_symbol(extraction, &mut by_name, &mut renames, install);
+        install_symbol(extraction, &mut by_name, &mut names, install);
     }
-    apply_scanned_names(extraction, &plan.scan.relations, &file, &mut renames);
-    normalize_quoted_names(extraction, &file, &mut renames);
-    retarget(extraction, &renames);
+    apply_scanned_names(extraction, &plan.scan.relations, &file, &mut names);
+    normalize_quoted_names(extraction, &file, &mut names);
+    retarget(extraction, &names.renames);
     drop_spurious(extraction, &plan.scan, errors);
 }
 
@@ -233,7 +264,7 @@ fn apply_scanned_names(
     extraction: &mut Extraction,
     relations: &[Statement],
     file: &str,
-    renames: &mut Renames,
+    names: &mut Names,
 ) {
     let mut order: Vec<usize> = extraction
         .symbols
@@ -249,11 +280,10 @@ fn apply_scanned_names(
         let Some(&index) = order.get(at) else {
             continue;
         };
-        let symbol = &mut extraction.symbols[index];
-        if symbol.span.start_byte >= statement.end {
+        if extraction.symbols[index].span.start_byte >= statement.end {
             continue;
         }
-        set_name(symbol, &statement.name, file, renames);
+        set_name(&mut extraction.symbols, index, &statement.name, file, names);
     }
 }
 
@@ -356,11 +386,12 @@ fn bare_name(name: &str) -> String {
 /// its quotes and the statement scan names it without, and comparing the raw
 /// strings pushed a second copy. A symbol that already has the grammar's span
 /// is left as it is, so a table the grammar parsed — including one whose
-/// `CHECK(...)` is an error inside it — is not rewritten.
+/// `CHECK(...)` is an error inside it — is not rewritten. A qualified name
+/// another symbol already holds is never taken: the install is skipped.
 fn install_symbol(
     extraction: &mut Extraction,
     by_name: &mut HashMap<String, Vec<usize>>,
-    renames: &mut Renames,
+    names: &mut Names,
     install: Install,
 ) {
     let Install {
@@ -375,12 +406,11 @@ fn install_symbol(
         overlaps(symbol.span.start_byte, symbol.span.end_byte, start, end)
     });
     if let Some(index) = overlapping {
-        let existing = &mut extraction.symbols[index];
-        if existing.qualified_name != desired.qualified_name {
-            renames
-                .entry(existing.qualified_name.clone())
-                .or_insert_with(|| desired.qualified_name.clone());
+        if names.held_by_other(&desired.qualified_name, index) {
+            return;
         }
+        let existing = &mut extraction.symbols[index];
+        names.moved(index, &existing.qualified_name, &desired.qualified_name);
         existing.name = desired.name;
         existing.span = desired.span;
         existing.kind = desired.kind;
@@ -394,13 +424,12 @@ fn install_symbol(
         symbol.span.start_byte == desired.span.start_byte
             && symbol.span.end_byte == desired.span.end_byte
     });
-    if duplicate {
+    if duplicate || names.held.contains_key(&desired.qualified_name) {
         return;
     }
-    by_name
-        .entry(key)
-        .or_default()
-        .push(extraction.symbols.len());
+    let index = extraction.symbols.len();
+    names.held.insert(desired.qualified_name.clone(), index);
+    by_name.entry(key).or_default().push(index);
     extraction.symbols.push(desired);
 }
 
@@ -410,13 +439,14 @@ fn overlaps(a_start: usize, a_end: usize, b_start: usize, b_end: usize) -> bool 
 
 struct Scan {
     relations: Vec<Statement>,
-    /// Non-relation statements (`CREATE FUNCTION`, `CREATE TRIGGER`, …),
-    /// start inclusive and end exclusive, in file order and disjoint. A symbol
-    /// strictly inside one of these is a declaration the body text mentioned,
-    /// not a schema object.
+    /// Non-relation statements (`CREATE FUNCTION`, `CREATE TRIGGER`, …) that
+    /// ended at a terminator, start inclusive and end exclusive, in file order
+    /// and disjoint. A symbol that starts strictly inside one of these is a
+    /// declaration the body text mentioned, not a schema object. A statement
+    /// the end of the file closed is not listed: nothing positively ended it.
     skipped: Vec<(usize, usize)>,
-    /// Byte of a `CREATE` whose statement never terminated. Symbols from here
-    /// to the end of the file are the grammar inventing a declaration.
+    /// Where the scan lost sync: a quote, comment or block that never closed.
+    /// Nothing from here on is read, removed or added.
     unterminated_at: Option<usize>,
 }
 
@@ -449,15 +479,19 @@ fn scan(source: &str, backslash: bool, deadline: Instant) -> Result<Scan, Abando
     let mut steps = 0usize;
     let mut paren = 0i32;
     let mut block = 0i32;
-    // Start of the outermost top-level `BEGIN`/`CASE`. A relation the grammar
-    // reports inside that block is not a schema object.
-    let mut block_at: Option<usize> = None;
+    // MySQL's `DELIMITER $$` changes what ends a statement until the next
+    // `DELIMITER`. It is a client directive, not SQL.
+    let mut delimiter = ";";
     while i < bytes.len() {
         steps += 1;
         if steps % DEADLINE_STRIDE == 0 && past(deadline) {
             return Err(Abandon::Deadline);
         }
-        match eat_noise(source, i, backslash) {
+        let ctx = Ctx {
+            backslash,
+            delimiter,
+        };
+        match eat_noise(source, i, ctx) {
             Eat::Unclosed => {
                 unterminated_at = Some(i);
                 break;
@@ -478,30 +512,22 @@ fn scan(source: &str, backslash: bool, deadline: Instant) -> Result<Scan, Abando
             i += 1;
             continue;
         }
+        if paren == 0 && block == 0 {
+            if let Some((token, next)) = delimiter_directive(source, i) {
+                delimiter = token;
+                i = next;
+                continue;
+            }
+        }
         if paren == 0 {
             if let Some((next, delta)) = block_token(source, i, block > 0) {
-                if delta > 0 {
-                    if block == 0 {
-                        block_at = Some(i);
-                    }
-                    block += delta;
-                } else if delta < 0 {
-                    block += delta;
-                    if block == 0 {
-                        if let Some(start) = block_at.take() {
-                            if skipped.len() >= MAX_SKIPPED {
-                                return Err(Abandon::Cap("skipped statement"));
-                            }
-                            skipped.push((start, next));
-                        }
-                    }
-                }
+                block += delta;
                 i = next;
                 continue;
             }
         }
         if paren == 0 && block == 0 && keyword(source, i, "CREATE") {
-            match classify(source, i, backslash) {
+            match classify(source, i, ctx) {
                 Classified::Relation(statement) => {
                     if relations.len() >= MAX_STATEMENTS {
                         return Err(Abandon::Cap("relation statement"));
@@ -509,14 +535,16 @@ fn scan(source: &str, backslash: bool, deadline: Instant) -> Result<Scan, Abando
                     i = statement.end;
                     relations.push(statement);
                 }
-                Classified::Skip(next) if next > i => {
-                    if skipped.len() >= MAX_SKIPPED {
-                        return Err(Abandon::Cap("skipped statement"));
+                Classified::Skip(next, closed) if next > i => {
+                    if closed {
+                        if skipped.len() >= MAX_SKIPPED {
+                            return Err(Abandon::Cap("skipped statement"));
+                        }
+                        skipped.push((i, next));
                     }
-                    skipped.push((i, next));
                     i = next;
                 }
-                Classified::Skip(_) | Classified::Stop => {
+                Classified::Skip(..) | Classified::Stop => {
                     unterminated_at = Some(i);
                     break;
                 }
@@ -532,13 +560,53 @@ fn scan(source: &str, backslash: bool, deadline: Instant) -> Result<Scan, Abando
     })
 }
 
+/// How the text around a statement is read: whether a backslash escapes a
+/// quote, and what ends a statement.
+#[derive(Clone, Copy)]
+struct Ctx<'a> {
+    backslash: bool,
+    delimiter: &'a str,
+}
+
+impl Ctx<'_> {
+    fn custom_delimiter(&self) -> bool {
+        self.delimiter != ";"
+    }
+
+    /// A `$$` that is the delimiter is not the start of a dollar quote.
+    fn dollar_quotes(&self) -> bool {
+        !self.delimiter.contains('$')
+    }
+}
+
+/// A `DELIMITER <token>` line at the start of a line: the token and the byte
+/// after the line.
+fn delimiter_directive(source: &str, i: usize) -> Option<(&str, usize)> {
+    if !keyword(source, i, "DELIMITER")
+        || !source[..i]
+            .rsplit('\n')
+            .next()
+            .is_some_and(|line| line.trim().is_empty())
+    {
+        return None;
+    }
+    let line_end = source[i..]
+        .find('\n')
+        .map_or(source.len(), |offset| i + offset);
+    let token = source[i + "DELIMITER".len()..line_end]
+        .split_whitespace()
+        .next()?;
+    Some((token, (line_end + 1).min(source.len())))
+}
+
 /// What the block keyword at `i` does to the nesting depth, and where the
 /// scan resumes: `+1` for a block opener, `-1` for a closer, `0` for a token
 /// that is consumed and changes nothing.
 ///
-/// * `BEGIN` opens a block unless it starts a transaction: followed by `;`,
+/// * `BEGIN` opens a block unless it starts a transaction (followed by `;`,
 ///   end of file, or `TRANSACTION`, `TRAN`, `WORK`, `DEFERRED`, `IMMEDIATE`,
-///   `EXCLUSIVE`, `ISOLATION` or `READ`.
+///   `EXCLUSIVE`, `ISOLATION` or `READ`) or is a name inside an expression
+///   (`SELECT begin FROM r`, `begin = 1`).
 /// * `CASE` opens one. `END` closes one — but `END IF`, `END LOOP`, `END
 ///   WHILE`, `END REPEAT` and `END FOR` close a construct the scan never
 ///   opened, so they change nothing, and `END CASE` closes the `CASE` and must
@@ -567,6 +635,30 @@ fn begins_block(source: &str, after_begin: usize) -> bool {
     if at >= source.len() || source.as_bytes()[at] == b';' {
         return false;
     }
+    let first = source.as_bytes()[at];
+    // `begin` used as a name: `SELECT begin, end FROM t`, `begin = 1`, `r.begin`.
+    if matches!(
+        first,
+        b',' | b'.'
+            | b')'
+            | b'='
+            | b'<'
+            | b'>'
+            | b'+'
+            | b'-'
+            | b'*'
+            | b'/'
+            | b'%'
+            | b'|'
+            | b'&'
+            | b'^'
+            | b'!'
+            | b'~'
+            | b':'
+            | b'['
+    ) {
+        return false;
+    }
     let Some((word, _)) = read_word(source, at) else {
         return true;
     };
@@ -579,6 +671,36 @@ fn begins_block(source: &str, after_begin: usize) -> bool {
         "EXCLUSIVE",
         "ISOLATION",
         "READ",
+        // `SELECT begin FROM r`: the next word continues an expression.
+        "FROM",
+        "AS",
+        "AND",
+        "OR",
+        "WHERE",
+        "ON",
+        "IS",
+        "IN",
+        "BETWEEN",
+        "LIKE",
+        "ILIKE",
+        "ASC",
+        "DESC",
+        "GROUP",
+        "ORDER",
+        "HAVING",
+        "LIMIT",
+        "UNION",
+        "INTERSECT",
+        "EXCEPT",
+        "JOIN",
+        "LEFT",
+        "RIGHT",
+        "INNER",
+        "OUTER",
+        "CROSS",
+        "USING",
+        "THEN",
+        "ELSE",
     ]
     .iter()
     .any(|transaction| word.eq_ignore_ascii_case(transaction))
@@ -623,20 +745,21 @@ fn end_token(source: &str, after_end: usize) -> (usize, i32) {
 
 enum Classified {
     Relation(Statement),
-    /// A `CREATE` that is not a relation, consumed through its terminator.
-    Skip(usize),
+    /// A `CREATE` that is not a relation, consumed through its end, and
+    /// whether a terminator (rather than the end of the file) ended it.
+    Skip(usize, bool),
     /// No terminator. The tail of the file is not a statement.
     Stop,
 }
 
-fn classify(source: &str, create_at: usize, backslash: bool) -> Classified {
+fn classify(source: &str, create_at: usize, ctx: Ctx) -> Classified {
     let Some(mut cursor) = skip_sep(source, create_at + "CREATE".len()) else {
         return Classified::Stop;
     };
     let mut virtual_table = false;
     let kind = loop {
         let Some((word, next)) = read_word(source, cursor) else {
-            return finish_non_relation(source, create_at, backslash);
+            return finish_non_relation(source, create_at, ctx);
         };
         let upper = word.to_ascii_uppercase();
         match upper.as_str() {
@@ -645,10 +768,10 @@ fn classify(source: &str, create_at: usize, backslash: bool) -> Classified {
                     return Classified::Stop;
                 };
                 let Some((replace, after_replace)) = read_word(source, after) else {
-                    return finish_non_relation(source, create_at, backslash);
+                    return finish_non_relation(source, create_at, ctx);
                 };
                 if !replace.eq_ignore_ascii_case("REPLACE") {
-                    return finish_non_relation(source, create_at, backslash);
+                    return finish_non_relation(source, create_at, ctx);
                 }
                 let Some(after_sep) = skip_sep(source, after_replace) else {
                     return Classified::Stop;
@@ -673,10 +796,10 @@ fn classify(source: &str, create_at: usize, backslash: bool) -> Classified {
                     return Classified::Stop;
                 };
                 let Some((view, _)) = read_word(source, after) else {
-                    return finish_non_relation(source, create_at, backslash);
+                    return finish_non_relation(source, create_at, ctx);
                 };
                 if !view.eq_ignore_ascii_case("VIEW") {
-                    return finish_non_relation(source, create_at, backslash);
+                    return finish_non_relation(source, create_at, ctx);
                 }
                 // Leave the cursor on VIEW so the step below consumes it,
                 // the same way TABLE and VIEW already sit under the cursor.
@@ -685,7 +808,7 @@ fn classify(source: &str, create_at: usize, backslash: bool) -> Classified {
             }
             "TABLE" => break RelationKind::Table,
             "VIEW" => break RelationKind::View,
-            _ => return finish_non_relation(source, create_at, backslash),
+            _ => return finish_non_relation(source, create_at, ctx),
         }
     };
     let Some(mut cursor) = skip_sep(
@@ -708,19 +831,19 @@ fn classify(source: &str, create_at: usize, backslash: bool) -> Classified {
                 return Classified::Stop;
             };
             let Some((not, after_not)) = read_word(source, after_if) else {
-                return finish_non_relation(source, create_at, backslash);
+                return finish_non_relation(source, create_at, ctx);
             };
             if !not.eq_ignore_ascii_case("NOT") {
-                return finish_non_relation(source, create_at, backslash);
+                return finish_non_relation(source, create_at, ctx);
             }
             let Some(after_not_sep) = skip_sep(source, after_not) else {
                 return Classified::Stop;
             };
             let Some((exists, after_exists)) = read_word(source, after_not_sep) else {
-                return finish_non_relation(source, create_at, backslash);
+                return finish_non_relation(source, create_at, ctx);
             };
             if !exists.eq_ignore_ascii_case("EXISTS") {
-                return finish_non_relation(source, create_at, backslash);
+                return finish_non_relation(source, create_at, ctx);
             }
             let Some(after) = skip_sep(source, after_exists) else {
                 return Classified::Stop;
@@ -729,13 +852,13 @@ fn classify(source: &str, create_at: usize, backslash: bool) -> Classified {
         }
     }
     let Some((name, delimited)) = read_qualified_name(source, cursor) else {
-        return finish_non_relation(source, create_at, backslash);
+        return finish_non_relation(source, create_at, ctx);
     };
-    let Some(end) = statement_end(source, create_at, backslash) else {
+    let Some((end, _)) = statement_end(source, create_at, ctx) else {
         return Classified::Stop;
     };
     if name.is_empty() || end <= create_at {
-        return finish_non_relation(source, create_at, backslash);
+        return finish_non_relation(source, create_at, ctx);
     }
     Classified::Relation(Statement {
         start: create_at,
@@ -751,30 +874,37 @@ enum RelationKind {
     View,
 }
 
-fn finish_non_relation(source: &str, create_at: usize, backslash: bool) -> Classified {
-    match statement_end(source, create_at, backslash) {
-        Some(end) if end > create_at => Classified::Skip(end),
+fn finish_non_relation(source: &str, create_at: usize, ctx: Ctx) -> Classified {
+    match statement_end(source, create_at, ctx) {
+        Some((end, closed)) if end > create_at => Classified::Skip(end, closed),
         _ => Classified::Stop,
     }
 }
 
-/// Byte after the terminating semicolon, at parenthesis and `BEGIN`/`CASE`
-/// depth zero. The end of the file ends a statement too — the grammar accepts
-/// a last statement without its `;` — when nothing is open: no parenthesis, no
-/// block, no quote or comment. `None` when the statement never terminates.
-fn statement_end(source: &str, start: usize, backslash: bool) -> Option<usize> {
+/// Byte after the statement's terminator and whether a terminator ended it.
+/// The terminator is a semicolon at parenthesis and `BEGIN`/`CASE` depth zero,
+/// or, after a `DELIMITER` directive, that delimiter wherever it stands outside
+/// a quote or comment. The end of the file ends a statement too — the grammar
+/// accepts a last statement without its `;` — when nothing is open: no
+/// parenthesis, no block, no quote or comment. `None` when the statement never
+/// ends.
+fn statement_end(source: &str, start: usize, ctx: Ctx) -> Option<(usize, bool)> {
     let bytes = source.as_bytes();
+    let custom = ctx.custom_delimiter();
     let mut i = start;
     let mut paren = 0i32;
     let mut block = 0i32;
     while i < bytes.len() {
-        match eat_noise(source, i, backslash) {
+        match eat_noise(source, i, ctx) {
             Eat::Unclosed => return None,
             Eat::Ate(next) if next > i => {
                 i = next;
                 continue;
             }
             Eat::Ate(_) | Eat::No => {}
+        }
+        if custom && source[i..].starts_with(ctx.delimiter) {
+            return Some((i + ctx.delimiter.len(), true));
         }
         match bytes[i] {
             b'(' => {
@@ -785,9 +915,9 @@ fn statement_end(source: &str, start: usize, backslash: bool) -> Option<usize> {
                 paren = paren.saturating_sub(1);
                 i += 1;
             }
-            b';' if paren == 0 && block == 0 => return Some(i + 1),
+            b';' if !custom && paren == 0 && block == 0 => return Some((i + 1, true)),
             _ => {
-                let token = if paren == 0 {
+                let token = if paren == 0 && !custom {
                     block_token(source, i, block > 0)
                 } else {
                     None
@@ -802,11 +932,11 @@ fn statement_end(source: &str, start: usize, backslash: bool) -> Option<usize> {
             }
         }
     }
-    if paren != 0 || block != 0 {
+    if !custom && (paren != 0 || block != 0) {
         return None;
     }
     let end = source[start..].trim_end().len() + start;
-    (end > start).then_some(end)
+    (end > start).then_some((end, false))
 }
 
 /// The last component of a possibly qualified name, and whether it was written
@@ -836,6 +966,10 @@ fn is_delimited_at(source: &str, at: usize) -> bool {
     matches!(source.as_bytes().get(at), Some(b'"' | b'`' | b'['))
 }
 
+/// An identifier at `start`. An unquoted name is read as Unicode letters,
+/// digits, `_` and `$`; if the character after it is a non-ASCII one that is not
+/// part of a word (a combining mark, a symbol), the name cannot be read in full
+/// and this abstains rather than return a prefix.
 fn read_ident(source: &str, start: usize) -> Option<(String, usize)> {
     let bytes = source.as_bytes();
     if start >= bytes.len() {
@@ -845,14 +979,14 @@ fn read_ident(source: &str, start: usize) -> Option<(String, usize)> {
         b'"' => read_quoted(source, start, b'"', b'"'),
         b'`' => read_quoted(source, start, b'`', b'`'),
         b'[' => read_quoted(source, start, b']', b']'),
-        b if is_ident_start(b) => {
-            let mut end = start + 1;
-            while end < bytes.len() && is_ident_continue(bytes[end]) {
-                end += 1;
+        _ => {
+            let end = word_end(source, start)?;
+            let next = source[end..].chars().next();
+            if next.is_some_and(|ch| !ch.is_ascii() && !ch.is_whitespace()) {
+                return None;
             }
             Some((source[start..end].to_string(), end))
         }
-        _ => None,
     }
 }
 
@@ -879,15 +1013,26 @@ fn read_quoted(source: &str, start: usize, closer: u8, escape: u8) -> Option<(St
 }
 
 fn read_word(source: &str, start: usize) -> Option<(&str, usize)> {
-    let bytes = source.as_bytes();
-    if start >= bytes.len() || !is_ident_start(bytes[start]) {
+    let end = word_end(source, start)?;
+    Some((&source[start..end], end))
+}
+
+/// End of the word that starts at `start`: a letter or `_`, then letters,
+/// digits, `_` and `$`, in any script.
+fn word_end(source: &str, start: usize) -> Option<usize> {
+    let mut chars = source.get(start..)?.char_indices();
+    let (_, first) = chars.next()?;
+    if !(first.is_alphabetic() || first == '_') {
         return None;
     }
-    let mut end = start + 1;
-    while end < bytes.len() && is_ident_continue(bytes[end]) {
-        end += 1;
+    let mut end = start + first.len_utf8();
+    for (offset, ch) in chars {
+        if !is_ident_char(ch) {
+            break;
+        }
+        end = start + offset + ch.len_utf8();
     }
-    Some((&source[start..end], end))
+    Some(end)
 }
 
 fn skip_sep(source: &str, mut i: usize) -> Option<usize> {
@@ -909,27 +1054,55 @@ enum Eat {
     Unclosed,
 }
 
-/// Whitespace, comments, strings and dollar quotes. Used inside a statement,
-/// where a quoted semicolon must not end it.
-fn eat_noise(source: &str, i: usize, backslash: bool) -> Eat {
+/// Whitespace, comments, strings, dollar quotes and bracketed names. Used
+/// inside a statement, where a quoted semicolon must not end it.
+fn eat_noise(source: &str, i: usize, ctx: Ctx) -> Eat {
     match eat_separator(source, i) {
         Eat::Unclosed => return Eat::Unclosed,
         Eat::Ate(next) if next > i => return Eat::Ate(next),
         Eat::Ate(_) | Eat::No => {}
     }
     if i < source.len() && source.as_bytes()[i] == b'[' {
-        return match read_quoted(source, i, b']', b']') {
-            Some((_, end)) => Eat::Ate(end),
-            None => Eat::Unclosed,
-        };
+        if let Some(end) = eat_brackets(source.as_bytes(), i) {
+            return Eat::Ate(end);
+        }
+        return Eat::No;
     }
-    if let Some(eaten) = eat_dollar(source, i) {
-        return eaten;
+    if ctx.dollar_quotes() {
+        if let Some(eaten) = eat_dollar(source, i) {
+            return eaten;
+        }
     }
-    if let Some(eaten) = eat_string(source, i, backslash) {
+    if let Some(eaten) = eat_string(source, i, ctx.backslash) {
         return eaten;
     }
     Eat::No
+}
+
+/// Longest bracket run read as one token. A T-SQL name is at most 128
+/// characters; a longer one is read as ordinary text, which only matters if it
+/// hides a quote or a semicolon.
+const MAX_BRACKET_RUN: usize = 256;
+
+/// `[` to its matching `]` as a depth counter, so `a[b[1]]`, `ARRAY[[1,2],[3]]`
+/// and `int[][]` close where they should. `None` when it does not close within
+/// [`MAX_BRACKET_RUN`] bytes.
+fn eat_brackets(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let limit = bytes.len().min(start + MAX_BRACKET_RUN);
+    for (offset, byte) in bytes[start..limit].iter().enumerate() {
+        match byte {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(start + offset + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn eat_separator(source: &str, i: usize) -> Eat {
@@ -960,12 +1133,34 @@ fn eat_separator(source: &str, i: usize) -> Eat {
         return Eat::Ate(end);
     }
     if source[i..].starts_with("/*") {
-        return match source[i + 2..].find("*/") {
-            Some(offset) => Eat::Ate(i + 2 + offset + 2),
-            None => Eat::Unclosed,
-        };
+        return nested_comment_end(bytes, i).map_or(Eat::Unclosed, Eat::Ate);
     }
     Eat::No
+}
+
+/// End of the block comment that starts at `start`. Comments nest, as in
+/// Postgres and the SQL standard: a `/*` inside one needs its own `*/`. SQLite
+/// and MySQL do not nest, so in those files a comment that contains `/*` reads
+/// as longer than it is. That only hides text from the scan; it never adds a
+/// declaration.
+fn nested_comment_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = start;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            depth += 1;
+            i += 2;
+        } else if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+            depth -= 1;
+            i += 2;
+            if depth == 0 {
+                return Some(i);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
 }
 
 /// MySQL's `#` line comment. In Postgres `#>`, `#>>` and `#=` are operators,
@@ -1105,7 +1300,7 @@ fn keyword(source: &str, i: usize, word: &str) -> bool {
 }
 
 fn is_ident_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'
+    ch.is_alphanumeric() || ch == '_' || ch == '$'
 }
 
 fn is_ident_start(byte: u8) -> bool {
@@ -1165,32 +1360,42 @@ fn unquote(name: &str) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-fn normalize_quoted_names(extraction: &mut Extraction, file: &str, renames: &mut Renames) {
-    for symbol in &mut extraction.symbols {
+fn normalize_quoted_names(extraction: &mut Extraction, file: &str, names: &mut Names) {
+    for index in 0..extraction.symbols.len() {
+        let symbol = &extraction.symbols[index];
         if symbol.kind == SymbolKind::File {
             continue;
         }
         let Some(bare) = unquote(&symbol.name) else {
             continue;
         };
-        set_name(symbol, &bare, file, renames);
+        set_name(&mut extraction.symbols, index, &bare, file, names);
     }
 }
 
 /// Give a symbol a new name and record the qualified name it left, so the
-/// edges that named it can follow. The first rename of a qualified name wins.
-fn set_name(symbol: &mut ExtractedSymbol, name: &str, file: &str, renames: &mut Renames) {
+/// edges that named it can follow. A qualified name another symbol already
+/// holds is never taken: the symbol keeps the grammar's name. The first rename
+/// of a qualified name wins.
+fn set_name(
+    symbols: &mut [ExtractedSymbol],
+    index: usize,
+    name: &str,
+    file: &str,
+    names: &mut Names,
+) {
+    let symbol = &mut symbols[index];
     if symbol.name == name {
         return;
     }
     let old_qualified = symbol.qualified_name.clone();
-    symbol.qualified_name = renamed(&old_qualified, &symbol.name, name, file);
-    symbol.name = name.to_string();
-    if old_qualified != symbol.qualified_name {
-        renames
-            .entry(old_qualified)
-            .or_insert_with(|| symbol.qualified_name.clone());
+    let new_qualified = renamed(&old_qualified, &symbol.name, name, file);
+    if names.held_by_other(&new_qualified, index) {
+        return;
     }
+    symbol.qualified_name = new_qualified;
+    symbol.name = name.to_string();
+    names.moved(index, &old_qualified, &symbol.qualified_name);
 }
 
 /// Replace the `::{old_name}` component. A bare `strip_suffix(old_name)` would
@@ -1205,7 +1410,7 @@ fn renamed(qualified: &str, old_name: &str, new_name: &str, file: &str) -> Strin
 
 /// Point every edge whose enclosing symbol was renamed at the new name, in one
 /// pass over the edges.
-fn retarget(extraction: &mut Extraction, renames: &Renames) {
+fn retarget(extraction: &mut Extraction, renames: &HashMap<String, String>) {
     if renames.is_empty() {
         return;
     }
@@ -1229,22 +1434,24 @@ fn retarget(extraction: &mut Extraction, renames: &Renames) {
     }
 }
 
-/// Drop declarations that are not schema objects: a symbol strictly inside a
-/// skipped statement (a table written in a trigger or routine body) and any
-/// symbol that starts in the unterminated tail — but only a symbol that
-/// touches a grammar error range. The scan is a second reader of the text; where
-/// the grammar had no complaint it is not allowed to overrule it, so a file
-/// that parsed `Clean` loses nothing. Edges that named a removed symbol as
-/// their caller go with it. A symbol that begins at the skipped statement
-/// itself — the routine — stays.
+/// Drop declarations that are not schema objects: a symbol whose start lies
+/// strictly inside a skipped body that ended at a terminator (a table written
+/// in a trigger or routine body) and that overlaps a grammar error range. The
+/// start decides, because the grammar can hand a symbol inside a routine a span
+/// that runs on past the routine's end. The scan is a second reader of the
+/// text; where the grammar had no complaint it is not allowed to overrule it,
+/// so a file that parsed `Clean` loses nothing, and a scan that lost sync
+/// removes nothing. Edges that named a removed symbol as their caller go with
+/// it. A symbol that begins at the skipped statement itself — the routine —
+/// stays.
 fn drop_spurious(extraction: &mut Extraction, scan: &Scan, errors: &ErrorRanges) {
-    if errors.is_empty() {
+    if errors.is_empty() || scan.skipped.is_empty() {
         return;
     }
     let mut removed: HashSet<String> = HashSet::new();
     extraction.symbols.retain(|symbol| {
         if symbol.kind == SymbolKind::File
-            || !errors.touches(symbol.span.start_byte, symbol.span.end_byte)
+            || !errors.overlaps(symbol.span.start_byte, symbol.span.end_byte)
         {
             return true;
         }
@@ -1254,11 +1461,8 @@ fn drop_spurious(extraction: &mut Extraction, scan: &Scan, errors: &ErrorRanges)
         let inside_skipped = at
             .checked_sub(1)
             .and_then(|previous| scan.skipped.get(previous))
-            .is_some_and(|&(_, end)| symbol.span.end_byte <= end);
-        let in_tail = scan
-            .unterminated_at
-            .is_some_and(|at| symbol.span.start_byte >= at);
-        if inside_skipped || in_tail {
+            .is_some_and(|&(_, end)| symbol.span.start_byte < end);
+        if inside_skipped {
             removed.insert(symbol.qualified_name.clone());
             return false;
         }
@@ -1382,25 +1586,26 @@ CREATE TABLE work_events (id INT CHECK(json_valid(id)));
     }
 
     #[test]
-    fn error_ranges_overlap_and_touch_at_different_edges() {
+    fn error_ranges_merge_and_overlap_by_shared_bytes() {
         let ranges = ErrorRanges::new([(10, 20), (15, 25), (40, 40)].into_iter());
         assert_eq!(ranges.merged, vec![(10, 25), (40, 40)]);
         assert!(ranges.overlaps(0, 11) && ranges.overlaps(24, 30));
         assert!(!ranges.overlaps(0, 10) && !ranges.overlaps(25, 30));
         assert!(ranges.overlaps(30, 41) && !ranges.overlaps(30, 40));
-        // Abutting a range with width is not touching it; a zero-width range
-        // is touched from either edge.
-        assert!(!ranges.touches(0, 10) && !ranges.touches(25, 30));
-        assert!(ranges.touches(30, 40) && ranges.touches(40, 50) && !ranges.touches(26, 39));
-        assert!(!ErrorRanges::default().touches(0, usize::MAX));
+        assert!(!ErrorRanges::default().overlaps(0, usize::MAX));
     }
+
+    const SEMI: Ctx<'static> = Ctx {
+        backslash: false,
+        delimiter: ";",
+    };
 
     #[test]
     fn the_end_of_the_file_ends_a_statement_only_when_nothing_is_open() {
-        let end = |text: &str| statement_end(text, 0, false);
-        assert_eq!(end("CREATE TABLE a(id int)"), Some(22));
-        assert_eq!(end("CREATE TABLE a(id int)  \n"), Some(22));
-        assert_eq!(end("CREATE TABLE a(id int);"), Some(23));
+        let end = |text: &str| statement_end(text, 0, SEMI);
+        assert_eq!(end("CREATE TABLE a(id int)"), Some((22, false)));
+        assert_eq!(end("CREATE TABLE a(id int)  \n"), Some((22, false)));
+        assert_eq!(end("CREATE TABLE a(id int);"), Some((23, true)));
         assert_eq!(end("CREATE TABLE a(id int"), None);
         assert_eq!(end("CREATE TABLE a(n TEXT DEFAULT 'x"), None);
         assert_eq!(end("CREATE TABLE a(id int) /* open"), None);
@@ -1408,6 +1613,50 @@ CREATE TABLE work_events (id INT CHECK(json_valid(id)));
             end("CREATE TRIGGER t AFTER INSERT ON a BEGIN SELECT 1;"),
             None
         );
+    }
+
+    #[test]
+    fn a_delimiter_directive_ends_a_routine_where_the_client_does() {
+        let source = "DELIMITER $$\nCREATE PROCEDURE p() BEGIN SELECT 1; END$$\nDELIMITER ;\n";
+        let (token, next) = delimiter_directive(source, 0).expect("directive");
+        assert_eq!((token, next), ("$$", 13));
+        let ctx = Ctx {
+            backslash: false,
+            delimiter: "$$",
+        };
+        let create = source.find("CREATE").unwrap();
+        let (end, closed) = statement_end(source, create, ctx).unwrap();
+        assert!(closed);
+        assert_eq!(&source[end - 5..end], "END$$");
+        assert!(delimiter_directive("  x DELIMITER $$\n", 4).is_none());
+    }
+
+    #[test]
+    fn brackets_nest_as_a_depth_and_comments_nest() {
+        for text in ["[[1,2],[3,4]]", "[b[1]]", "[][]", "[a]"] {
+            let bytes = text.as_bytes();
+            let end = eat_brackets(bytes, 0).unwrap();
+            assert!(
+                end == text.len() || text == "[][]" && end == 2,
+                "{text}: {end}"
+            );
+        }
+        assert!(eat_brackets(b"[[1,2]", 0).is_none());
+        assert_eq!(nested_comment_end(b"/* a /* b */ c */ x", 0), Some(17));
+        assert_eq!(nested_comment_end(b"/* a /* b */ c", 0), None);
+    }
+
+    #[test]
+    fn a_name_is_read_in_full_or_not_at_all() {
+        assert_eq!(
+            read_ident("données USING", 0),
+            Some(("données".to_string(), "données".len()))
+        );
+        assert_eq!(read_ident("表 (", 0).map(|n| n.0), Some("表".to_string()));
+        // `e` followed by a combining acute accent: not a word character, so the
+        // name is cut short by the reader and it abstains.
+        assert!(read_ident("cafe\u{301} (", 0).is_none());
+        assert_eq!(read_ident("t(", 0).map(|n| n.0), Some("t".to_string()));
     }
 
     #[test]
@@ -1424,6 +1673,16 @@ CREATE TABLE work_events (id INT CHECK(json_valid(id)));
             "BEGIN -- note\n;",
         ] {
             assert_eq!(token(transaction, false), Some(0), "{transaction}");
+        }
+        for name in [
+            "begin FROM r;",
+            "begin, end FROM r;",
+            "begin = 1",
+            "begin.x",
+            "begin)",
+            "begin AND x",
+        ] {
+            assert_eq!(token(name, false), Some(0), "{name}");
         }
         assert_eq!(token("BEGIN\n  SELECT 1; END;", false), Some(1));
         assert_eq!(token("BEGIN ATOMIC SELECT 1; END;", false), Some(1));
