@@ -214,6 +214,7 @@ fn a_recovered_statement_equals_its_control_twin() {
     let tail = "\nfun helper() = 1\nfun other(x: Int) = x\nfun after() {}\nopen class Base\ninterface Marker\nclass Foo {\n    fun bar() {}\n    fun baz() {}\n    fun run() {}\n    companion object {\n        fun make() = Foo()\n    }\n}\n";
     let mut diffs = Vec::new();
     let mut notes = Vec::new();
+    let mut compared = 0usize;
     for (label, stmt) in twin_cases() {
         for (ann_r, ann_t) in [
             ("@A\n@B\n", "@A\n"),
@@ -227,6 +228,7 @@ fn a_recovered_statement_equals_its_control_twin() {
                 notes.push(format!("[{label}] no recovery happened for {ann_r:?}"));
                 continue;
             }
+            compared += 1;
             diffs.extend(diff_against_twin(
                 &format!("{label}/{}", ann_r.trim().replace('\n', " ")),
                 &rec,
@@ -240,6 +242,10 @@ fn a_recovered_statement_equals_its_control_twin() {
     for d in &diffs {
         println!("{d}");
     }
+    assert!(
+        compared >= 30,
+        "only {compared} swallowed statements were compared; the cases no longer reach the recovery"
+    );
     assert!(
         diffs.is_empty(),
         "{} differences between recovered and control twin",
