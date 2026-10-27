@@ -593,19 +593,27 @@ impl Staged {
             binding.start_byte = shift(binding.start_byte)?;
             staged.local_bindings.push(binding);
         }
-        let residue = serde_json::to_string(&(
-            &staged.symbols,
-            &staged.calls,
-            &staged.references,
-            &staged.exports,
-            &staged.wiring,
-            &staged.scope_locals,
-            &staged.local_bindings,
-        ))
-        .map_err(|error| format!("the recovered items could not be checked: {error}"))?;
-        if residue.contains(WRAPPER_NAME) {
-            return Err("the recovered items still name the recovery wrapper".to_string());
+        // Field by field, so a refusal names what leaked.
+        fn leak<T: serde::Serialize>(label: &str, items: &[T]) -> Result<(), String> {
+            for item in items {
+                let text = serde_json::to_string(item).map_err(|error| {
+                    format!("the recovered {label} could not be checked: {error}")
+                })?;
+                if text.contains(WRAPPER_NAME) {
+                    return Err(format!(
+                        "the recovered {label} still name the recovery wrapper: {text}"
+                    ));
+                }
+            }
+            Ok(())
         }
+        leak("symbols", &staged.symbols)?;
+        leak("calls", &staged.calls)?;
+        leak("references", &staged.references)?;
+        leak("exports", &staged.exports)?;
+        leak("wiring", &staged.wiring)?;
+        leak("scope locals", &staged.scope_locals)?;
+        leak("local bindings", &staged.local_bindings)?;
         Ok(staged)
     }
 

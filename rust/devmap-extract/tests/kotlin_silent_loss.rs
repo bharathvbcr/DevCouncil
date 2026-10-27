@@ -187,6 +187,65 @@ fn calls_inside_a_recovered_body_belong_to_the_recovered_function() {
     );
 }
 
+/// What the extractor derives from a body (its locals and the lambdas inside
+/// it) is filed under the function's own scope, the same string the function's
+/// qualified name and its calls' `caller_symbol` use. A swallowed function and
+/// an ordinary one with the same body must agree on every scope string.
+#[test]
+fn a_recovered_body_is_scoped_exactly_as_an_ordinary_one_is() {
+    let body = "{\n    val tmp = 1\n    MaterialTheme {\n        helper(tmp)\n    }\n}";
+    let swallowed =
+        format!("fun helper(x: Int) {{}}\n@A\n@B\nprivate fun f() {body}\nfun after() {{}}\n");
+    let ordinary =
+        format!("fun helper(x: Int) {{}}\n@A\nprivate fun g() {body}\nfun after() {{}}\n");
+    let recovered = extract_file("A.kt", &swallowed);
+    let plain = extract_file("A.kt", &ordinary);
+    assert!(
+        matches!(recovered.parse_outcome, ParseOutcome::Clean),
+        "{:?}",
+        recovered.diagnostics
+    );
+    assert!(matches!(plain.parse_outcome, ParseOutcome::Clean));
+    let scopes = |extraction: &Extraction,
+                  name: &str|
+     -> (Vec<(String, String)>, Vec<(Option<String>, String)>) {
+        let mut locals: Vec<(String, String)> = extraction
+            .scope_locals
+            .iter()
+            .map(|(scope, local)| (scope.replace(name, "FN"), local.clone()))
+            .collect();
+        locals.sort();
+        let mut calls: Vec<(Option<String>, String)> = extraction
+            .calls
+            .iter()
+            .map(|call| {
+                (
+                    call.caller_symbol
+                        .as_ref()
+                        .map(|caller| caller.replace(name, "FN")),
+                    call.callee_name.clone(),
+                )
+            })
+            .collect();
+        calls.sort();
+        (locals, calls)
+    };
+    assert_eq!(scopes(&recovered, "::f"), scopes(&plain, "::g"));
+    assert!(
+        recovered
+            .scope_locals
+            .iter()
+            .any(|(scope, local)| scope == "A.kt::f" && local == "tmp"),
+        "{:?}",
+        recovered.scope_locals
+    );
+    let json = serde_json::to_string(&recovered).unwrap();
+    assert!(
+        !json.contains("Devmap"),
+        "no trace of the wrapper in the payload"
+    );
+}
+
 /// A recovered property or alias emits no symbol, and the calls in its
 /// initializer keep the file as their caller, as they would had the grammar
 /// read it correctly.
@@ -195,6 +254,11 @@ fn a_recovered_property_initializer_keeps_its_calls_at_file_scope() {
     let source = "fun helper() = 1\n@A\n@B\nprivate val y = helper()\nfun after() {}\n";
     let extraction = extract_file("A.kt", source);
     assert!(matches!(extraction.parse_outcome, ParseOutcome::Clean));
+    assert_eq!(
+        extraction.decl_gaps,
+        vec![range_of(source, "@A\n@B\nprivate val y = helper()")],
+        "the statement was swallowed and recovered, not merely read"
+    );
     let helper_calls: Vec<Option<&str>> = extraction
         .calls
         .iter()
@@ -410,6 +474,11 @@ fn a_swallowed_class_with_a_one_line_body_stays_charged() {
 #[test]
 fn recovery_is_deterministic() {
     let source = "fun helper() {}\n@A\n@B\nprivate fun f() { helper() }\n@A\n@B\nprivate class Q {\n    fun m() = helper()\n}\nfun after() {}\n";
+    assert_eq!(
+        extract_file("A.kt", source).decl_gaps.len(),
+        2,
+        "both recovered"
+    );
     let first = serde_json::to_string(&extract_file("A.kt", source)).unwrap();
     let second = serde_json::to_string(&extract_file("A.kt", source)).unwrap();
     assert_eq!(first, second);
