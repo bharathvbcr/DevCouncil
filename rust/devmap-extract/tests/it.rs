@@ -78,6 +78,8 @@ mod ignore_rule_tolerance;
 #[cfg(feature = "parse")]
 mod js_object_facts;
 #[cfg(feature = "parse")]
+mod kotlin_followups;
+#[cfg(feature = "parse")]
 mod kotlin_one_line_bodies;
 #[cfg(feature = "parse")]
 mod kotlin_recovery_twin;

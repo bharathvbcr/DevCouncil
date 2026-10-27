@@ -512,10 +512,10 @@ pub(super) fn extract_treesitter_before_deadline(
         // that a `;` written over a space repairs without moving a byte. The
         // rewritten tree replaces the failed one only if it is fully clean.
         let (attempt, semi_ranges, semi_note) = match attempt {
-            // Only a tree with an error the walk can see: the grammar also
-            // recovers some of these shapes itself with a hidden zero-width
-            // token, which no node shows and which costs nothing, and such a
-            // file is left exactly as it parsed.
+            // Only a tree `parse_outcome_of` calls `Partial`. That includes the
+            // shapes the grammar recovers itself with a hidden zero-width
+            // token: no node shows it, `has_error()` counts it, and
+            // `parse_outcome_of` charges the node that carries it.
             ParseAttempt::Parsed(tree)
                 if lang == "kotlin"
                     && tree.root_node().has_error()
@@ -1241,9 +1241,11 @@ pub(super) fn parse_outcome_of(
             });
         }
         cursor.reset(node);
+        let mut child_has_error = false;
         if cursor.goto_first_child() {
             loop {
                 let child = cursor.node();
+                child_has_error |= child.has_error();
                 if child.has_error() || is_python {
                     stack.push(child);
                 }
@@ -1251,6 +1253,22 @@ pub(super) fn parse_outcome_of(
                     break;
                 }
             }
+        }
+        // A node that carries an error no node shows: the parser inserted a
+        // zero-width token that is hidden from the tree (a grammar's
+        // `_`-prefixed token), so the cost is on this node and on none of its
+        // children, and the search for an ERROR or MISSING node above comes
+        // back empty. Measured on tree-sitter-kotlin-ng, `class A { fun f() =
+        // if (c) { a() } else { b() } }` is `has_error()` on the file, the
+        // class and its body and on nothing below, and reading what the hidden
+        // token should have separated made the `if` branch a lambda. The
+        // file is not clean and no consumer may be told it is, so the node's
+        // own range is charged.
+        if node.has_error() && !node.is_error() && !node.is_missing() && !child_has_error {
+            error_ranges.push(TextRange {
+                start_byte: node.start_byte(),
+                end_byte: node.end_byte(),
+            });
         }
     }
     if lost.capped {
