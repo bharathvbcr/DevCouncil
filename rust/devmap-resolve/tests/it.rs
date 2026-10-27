@@ -86,6 +86,8 @@ mod parallel_determinism;
 #[cfg(feature = "parse")]
 mod primary_languages;
 #[cfg(feature = "parse")]
+mod private_nested_namesakes_across_files;
+#[cfg(feature = "parse")]
 mod py_receiver_residue_attack;
 #[cfg(feature = "parse")]
 mod py_receiver_residue_attack2;
