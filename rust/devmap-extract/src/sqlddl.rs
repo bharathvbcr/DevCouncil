@@ -232,7 +232,12 @@ fn plan(
 /// onto a name nobody holds.
 #[derive(Default)]
 struct Names {
+    /// Every qualified name that was left, to the name it ended on. A name
+    /// renamed twice (`A` to `B` to `C`) maps both `A` and `B` to `C`, so an
+    /// edge is moved in one hop to where its symbol finally is.
     renames: HashMap<String, String>,
+    /// The inverse: a qualified name to every earlier name that ended on it.
+    renamed_from: HashMap<String, Vec<String>>,
     held: HashMap<String, Vec<usize>>,
 }
 
@@ -251,20 +256,34 @@ impl Names {
             .is_some_and(|holders| !holders.is_empty())
     }
 
-    /// Move `group` from `old` to `new`. The group must be made of symbols that
-    /// hold `old`. Refused (and nothing recorded) unless it is every holder of
-    /// `old` and nothing holds `new`. Linear in the group.
+    /// Move `group` from `old` to `new`. Refused (and nothing recorded) unless
+    /// the group is exactly the set of symbols that hold `old` and nothing holds
+    /// `new`. A name that earlier renames ended on is composed: they now end on
+    /// `new`. Linear in the group.
     fn try_move(&mut self, group: &[usize], old: &str, new: &str) -> bool {
         if old == new {
             return true;
         }
-        let holders = self.held.get(old).map_or(0, Vec::len);
-        if holders != group.len() || self.holds(new) {
+        let members: HashSet<usize> = group.iter().copied().collect();
+        let is_every_holder = self
+            .held
+            .get(old)
+            .is_some_and(|holders| holders.iter().copied().collect::<HashSet<usize>>() == members);
+        if !is_every_holder || self.holds(new) {
             return false;
         }
         self.held.remove(old);
         self.held.insert(new.to_string(), group.to_vec());
+        let mut earlier = self.renamed_from.remove(old).unwrap_or_default();
+        for name in &earlier {
+            self.renames.insert(name.clone(), new.to_string());
+        }
+        earlier.push(old.to_string());
         self.renames.insert(old.to_string(), new.to_string());
+        self.renamed_from
+            .entry(new.to_string())
+            .or_default()
+            .extend(earlier);
         true
     }
 }
@@ -1868,13 +1887,31 @@ CREATE TABLE work_events (id INT CHECK(json_valid(id)));
         assert!(!names.try_move(&[0, 1], "f.sql::old", "f.sql::new"));
         assert!(names.renames.is_empty());
         assert_eq!(names.held["f.sql::old"].len(), 4);
+        // As many members as holders, but not the holders: refused.
+        assert!(!names.try_move(&[0, 1, 2, 7], "f.sql::old", "f.sql::new"));
+        assert!(!names.try_move(&[0, 0, 1, 2], "f.sql::old", "f.sql::new"));
         // The new name is held by someone else: refused.
         assert!(!names.try_move(&[0, 1, 2, 3], "f.sql::old", "f.sql::taken"));
         // Every holder, and the new name free: moved together.
-        assert!(names.try_move(&[0, 1, 2, 3], "f.sql::old", "f.sql::new"));
+        assert!(names.try_move(&[3, 2, 1, 0], "f.sql::old", "f.sql::new"));
         assert!(!names.held.contains_key("f.sql::old"));
-        assert_eq!(names.held["f.sql::new"], vec![0, 1, 2, 3]);
+        assert_eq!(names.held["f.sql::new"], vec![3, 2, 1, 0]);
         assert_eq!(names.renames["f.sql::old"], "f.sql::new");
+    }
+
+    #[test]
+    fn a_name_renamed_twice_ends_every_edge_on_the_last_name() {
+        let mut names = Names::default();
+        names.hold("f.sql::a", 0);
+        assert!(names.try_move(&[0], "f.sql::a", "f.sql::b"));
+        assert!(names.try_move(&[0], "f.sql::b", "f.sql::c"));
+        assert_eq!(names.renames["f.sql::a"], "f.sql::c");
+        assert_eq!(names.renames["f.sql::b"], "f.sql::c");
+        // A third hop composes the same way.
+        assert!(names.try_move(&[0], "f.sql::c", "f.sql::d"));
+        for old in ["f.sql::a", "f.sql::b", "f.sql::c"] {
+            assert_eq!(names.renames[old], "f.sql::d", "{old}");
+        }
     }
 
     #[test]

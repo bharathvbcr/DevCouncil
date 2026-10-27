@@ -604,11 +604,19 @@ fn a_clean_file_never_loses_a_symbol_to_recovery() {
 /// the edges that named the old qualified name, so it is allowed only when the
 /// renamed symbols are every symbol that held that name; otherwise an edge of
 /// one symbol lands on another.
-fn assert_recovery_only_renames_what_it_owns(label: &str, source: &str, clean: bool) -> bool {
+///
+/// `None` when the case was not checked (it was to be Clean and is not);
+/// otherwise how many symbols recovery renamed, so a caller can tell a guard
+/// that compared something from one that compared nothing.
+fn assert_recovery_only_renames_what_it_owns(
+    label: &str,
+    source: &str,
+    clean: bool,
+) -> Option<usize> {
     let path = "guard.sql";
     let grammar = devmap_extract::treesitter::extract_treesitter(path, "sql", source);
     if clean && grammar.parse_outcome != ParseOutcome::Clean {
-        return false;
+        return None;
     }
     let full = extract_file(path, source);
     assert_eq!(full.parse_outcome, grammar.parse_outcome, "{label}");
@@ -624,6 +632,21 @@ fn assert_recovery_only_renames_what_it_owns(label: &str, source: &str, clean: b
         );
         assert_eq!(before.span.start_byte, after.span.start_byte, "{label}");
         assert_eq!(before.span.end_byte, after.span.end_byte, "{label}");
+        // SQL symbols do not nest: a relation's parent is the file, never
+        // another symbol, so a rename has no child whose `parent_symbol` should
+        // follow it. Everything else a rename could disturb is compared too.
+        assert_eq!(before.parent_symbol, after.parent_symbol, "{label}");
+        assert!(
+            after
+                .parent_symbol
+                .as_deref()
+                .is_none_or(|parent| parent == path),
+            "{label}: `{}` has parent {:?}, but SQL symbols are not nested",
+            after.name,
+            after.parent_symbol
+        );
+        assert_eq!(before.is_exported, after.is_exported, "{label}");
+        assert_eq!(before.signature, after.signature, "{label}");
         if before.name == after.name && before.qualified_name == after.qualified_name {
             continue;
         }
@@ -699,27 +722,52 @@ fn assert_recovery_only_renames_what_it_owns(label: &str, source: &str, clean: b
             "{label}"
         );
     }
-    true
+    Some(renamed.values().map(|(_, indices)| indices.len()).sum())
 }
+
+/// How many of the repository's eight SQL files parse `Clean` today, and so are
+/// compared by the guard below: none. Every workbench schema carries the
+/// grammar's confined `CHECK(json_valid(..))` error, and `tools/fanout.sql` a
+/// trigger body. The inline cases carry the weight; this count is pinned with
+/// `assert_eq!` so a file moving in either direction is noticed and the guard's
+/// reach is changed on purpose, never silently.
+const CLEAN_REPOSITORY_FILES: usize = 0;
+
+/// How many battery cases (`attack_sql_ddl::BATTERY`) parse `Clean` today and
+/// are compared. Pinned for the same reason.
+const CLEAN_BATTERY_CASES: usize = 7;
 
 #[test]
 fn recovery_on_a_clean_file_only_renames_what_it_owns() {
+    let mut renamed = 0;
     for (label, source) in CLEAN_CASES {
-        assert!(
-            assert_recovery_only_renames_what_it_owns(label, source, true),
-            "{label}: the grammar no longer parses this Clean, so the guard proves nothing"
-        );
+        renamed +=
+            assert_recovery_only_renames_what_it_owns(label, source, true).unwrap_or_else(|| {
+                panic!(
+                    "{label}: the grammar no longer parses this Clean, so the guard proves nothing"
+                )
+            });
     }
     for (label, source) in RENAME_CASES {
-        assert_recovery_only_renames_what_it_owns(label, source, false);
+        renamed += assert_recovery_only_renames_what_it_owns(label, source, false)
+            .expect("a case that is not required to be Clean is always checked");
     }
+    assert!(
+        renamed > 0,
+        "no case renamed a symbol, so the guard never compared a rename"
+    );
     let mut checked = 0;
     for (label, source) in crate::attack_sql_ddl::BATTERY {
-        if assert_recovery_only_renames_what_it_owns(label, source, true) {
+        if assert_recovery_only_renames_what_it_owns(label, source, true).is_some() {
             checked += 1;
         }
     }
-    assert!(checked > 0, "no battery case parses Clean");
+    eprintln!("{checked} battery cases compared");
+    assert_eq!(
+        checked, CLEAN_BATTERY_CASES,
+        "the number of Clean battery cases the guard compares changed"
+    );
+    let mut clean_repository_files = 0;
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     for relative in [
         "dc-store/src/workbench/attention.sql",
@@ -736,7 +784,51 @@ fn recovery_on_a_clean_file_only_renames_what_it_owns() {
             .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         // A repository file with a grammar error is outside this guard (its
         // recovery is the point of the other tests); one that parses Clean is in.
-        assert_recovery_only_renames_what_it_owns(relative, &source, true);
+        if assert_recovery_only_renames_what_it_owns(relative, &source, true).is_some() {
+            clean_repository_files += 1;
+        }
+    }
+    eprintln!("{clean_repository_files} repository SQL files compared");
+    assert_eq!(
+        clean_repository_files, CLEAN_REPOSITORY_FILES,
+        "the number of Clean repository SQL files the guard compares changed"
+    );
+}
+
+/// A bracketed name that holds doubled quotes is renamed twice: the grammar cuts
+/// it to `""`, the scan renames it to the whole interior `"""x"""`, and quote
+/// normalization then renames that to `"x"`. Edges that named the first name
+/// must end on the last, not on the middle one that no symbol holds.
+#[test]
+fn a_name_renamed_twice_leaves_no_edge_on_the_middle_name() {
+    let source = "CREATE TABLE [\"\"\"x\"\"\"] (v TEXT CHECK(json_valid(v)));\n";
+    let grammar = grammar_only(source);
+    let extraction = extract_file("twice.sql", source);
+    let qualified: std::collections::HashSet<&str> = extraction
+        .symbols
+        .iter()
+        .map(|symbol| symbol.qualified_name.as_str())
+        .collect();
+    assert!(
+        !extraction.calls.is_empty(),
+        "control: the CHECK call is the edge this follows: {:?}",
+        grammar.calls
+    );
+    for call in &extraction.calls {
+        if let Some(caller) = call.caller_symbol.as_deref() {
+            assert!(
+                qualified.contains(caller),
+                "an edge was left on {caller}; symbols are {qualified:?}"
+            );
+        }
+    }
+    for reference in &extraction.references {
+        if let Some(enclosing) = reference.enclosing_symbol.as_deref() {
+            assert!(
+                qualified.contains(enclosing),
+                "a reference was left on {enclosing}; symbols are {qualified:?}"
+            );
+        }
     }
 }
 
