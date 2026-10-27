@@ -122,30 +122,42 @@ func TestSubmoduleFileNamesAreNotTrimmed(t *testing.T) {
 	}
 }
 
-// A git that answers `version` and then never returns on any other call must
-// not hold the walk past the walk's own deadline. Each call is bounded at 60 s
-// and a walk may make up to 256 of them, so the per-call bound is not it.
-func TestTheSubmoduleWalkHasOneOverallDeadline(t *testing.T) {
-	root, _ := repoWithSubmodule(t)
+// fakeGitScript puts a git on PATH that runs body for every call except
+// `version`, which the real git answers, and returns a session using it.
+func fakeGitScript(t *testing.T, root, body string) *GitSession {
+	t.Helper()
 	real, err := exec.LookPath("git")
 	if err != nil {
 		t.Skip(err)
 	}
 	bin := t.TempDir()
-	script := "#!/bin/sh\nif [ \"$1\" = version ] || [ \"$1\" = --version ]; then exec '" + real + "' \"$@\"; fi\nexec sleep 120\n"
+	script := "#!/bin/sh\nif [ \"$1\" = version ] || [ \"$1\" = --version ]; then exec '" + real + "' \"$@\"; fi\n" + body
 	// #nosec G306 -- an executable stand-in; the execute bit is the point.
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	hung, err := NewGitSession(root)
+	session, err := NewGitSession(root)
 	if err != nil {
 		t.Fatal(err)
 	}
+	return session
+}
 
+func shortBudget(t *testing.T, d time.Duration) {
+	t.Helper()
 	old := submoduleWalkBudget
-	submoduleWalkBudget = 2 * time.Second
+	submoduleWalkBudget = d
 	t.Cleanup(func() { submoduleWalkBudget = old })
+}
+
+// A git that answers `version` and then never returns on any other call must
+// not hold the walk past the walk's own deadline. Each call is bounded at 60 s
+// and a walk may make up to 256 of them, so the per-call bound is not it.
+func TestTheSubmoduleWalkHasOneOverallDeadline(t *testing.T) {
+	root, _ := repoWithSubmodule(t)
+	hung := fakeGitScript(t, root, "exec sleep 120\n")
+	shortBudget(t, 2*time.Second)
 
 	start := time.Now()
 	done := make(chan error, 1)
@@ -163,5 +175,76 @@ func TestTheSubmoduleWalkHasOneOverallDeadline(t *testing.T) {
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("the walk ignored its overall deadline for 30s")
+	}
+}
+
+// Several walk calls made under one WithWalkBudget share it. Each starting its
+// own budget made the worst case one budget per call, up to 257 of them.
+func TestWalkCallsUnderOneBudgetShareIt(t *testing.T) {
+	root, _ := repoWithSubmodule(t)
+	hung := fakeGitScript(t, root, "exec sleep 120\n")
+	shortBudget(t, 2*time.Second)
+
+	ctx, cancel := WithWalkBudget(t.Context())
+	defer cancel()
+	start := time.Now()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 3; i++ {
+			if _, err := hung.DirtySubmodules(ctx); err == nil {
+				t.Errorf("call %d: a git that never answered was read as clean", i)
+			}
+		}
+	}()
+	select {
+	case <-done:
+		if took := time.Since(start); took > 4500*time.Millisecond {
+			t.Fatalf("three calls under one 2s budget took %s: each started its own", took)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the calls ignored the shared budget for 30s")
+	}
+}
+
+// An index of some 800 000 files, none of them a gitlink, is not refused for
+// its size: the listing is filtered as it streams, and only gitlink records are
+// kept. (A total cap of 64 MiB failed it.) The listing here is about 75 MiB.
+func TestALargeIndexWithNoSubmoduleIsNotRefused(t *testing.T) {
+	root, _ := repoWithSubmodule(t)
+	if _, err := exec.LookPath("perl"); err != nil {
+		t.Skip(err)
+	}
+	session := fakeGitScript(t, root, `case "$*" in
+*ls-files*--stage*)
+  exec perl -e 'for my $i (0..999999) { print "100644 0123456789abcdef0123456789abcdef01234567 0\tdirectory/file-$i.txt\0" } print "160000 0123456789abcdef0123456789abcdef01234567 0\tabsent\0"'
+  ;;
+esac
+exec `+"'"+mustLookGit(t, root)+"'"+` "$@"
+`)
+	dirty, err := session.DirtySubmodules(t.Context())
+	if err != nil {
+		t.Fatalf("a large index with no checked-out submodule was refused: %v", err)
+	}
+	if len(dirty) != 0 {
+		t.Fatalf("dirty = %q, want none (the one gitlink is not checked out)", dirty)
+	}
+}
+
+// A record that never ends is refused, not buffered whole.
+func TestAnIndexRecordWithoutAnEndIsRefused(t *testing.T) {
+	root, _ := repoWithSubmodule(t)
+	if _, err := exec.LookPath("perl"); err != nil {
+		t.Skip(err)
+	}
+	session := fakeGitScript(t, root, `case "$*" in
+*ls-files*--stage*)
+  exec perl -e 'print "100644 0123456789abcdef0123456789abcdef01234567 0\t" . ("x" x (4 << 20))'
+  ;;
+esac
+exec `+"'"+mustLookGit(t, root)+"'"+` "$@"
+`)
+	if _, err := session.DirtySubmodules(t.Context()); err == nil {
+		t.Fatal("a 4 MiB record was accepted")
 	}
 }

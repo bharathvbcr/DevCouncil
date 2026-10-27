@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc"
@@ -426,6 +427,11 @@ func CollectGitState(ctx context.Context, root string) (changed []string, diff s
 	if err != nil {
 		return nil, "", true, err
 	}
+	// One deadline for the whole collection, submodule walk included: the walk's
+	// calls (DirtySubmodules, then each dirty submodule's files) draw on it
+	// instead of each starting its own.
+	ctx, cancel := proc.WithWalkBudget(ctx)
+	defer cancel()
 	nameOut, err := runGit(ctx, git, gitListingLimit, append([]string{"diff", "HEAD", "--name-status", "-z"}, toolStateExcludes()...)...)
 	headless := false
 	if err != nil {
@@ -470,7 +476,10 @@ func CollectGitState(ctx context.Context, root string) (changed []string, diff s
 		if entry.deleted {
 			info, serr := rootFS.Lstat(entry.path)
 			switch {
-			case errors.Is(serr, fs.ErrNotExist):
+			case errors.Is(serr, fs.ErrNotExist), errors.Is(serr, syscall.ENOTDIR):
+				// Not there. ENOTDIR is "a parent of it is now a file": the
+				// deleted file has no bytes either way, and the parent that
+				// replaced its directory is read as the untracked file it is.
 			case serr != nil:
 				return nil, "", true, fmt.Errorf("cannot tell whether deleted %s is back on disk: %v", entry.path, serr)
 			case !info.IsDir():
@@ -485,6 +494,11 @@ func CollectGitState(ctx context.Context, root string) (changed []string, diff s
 		return nil, "", true, err
 	}
 	for _, name := range strings.Split(string(untracked), "\x00") {
+		// A trailing slash is how git lists a repository nested in the tree that
+		// is neither ignored nor a submodule: its files are in no listing.
+		if strings.HasSuffix(name, "/") {
+			return nil, "", true, proc.NestedRepositoryError(name)
+		}
 		add(name)
 	}
 	// The diff reads pass --ignore-submodules=dirty, so git does not run a

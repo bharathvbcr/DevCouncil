@@ -33,7 +33,40 @@ macro_rules! respond {
     }};
 }
 
+/// Replaces the default panic hook, which prints the panic message.
+///
+/// A message can carry data from the diff: a string-slicing panic prints up to
+/// 256 bytes of the string it sliced, and the Go host copies this process's
+/// stderr into its errors. So the hook prints where the panic happened and
+/// nothing it carried. Writing is best effort: a closed stderr must not turn a
+/// panic into a second one.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        use std::io::Write as _;
+        let place = match info.location() {
+            Some(at) => format!("{}:{}", at.file(), at.line()),
+            None => "an unknown location".to_string(),
+        };
+        let _ = writeln!(std::io::stderr(), "dcverify panicked at {place}");
+    }));
+}
+
+/// Debug builds only: panics with the value of `DCVERIFY_TEST_PANIC_WITH` in
+/// the message, so a test can plant a secret in a panic and look for it on
+/// stderr. Compiled out of release builds, which have no such surface.
+#[cfg(debug_assertions)]
+fn test_panic() {
+    if let Ok(planted) = std::env::var("DCVERIFY_TEST_PANIC_WITH") {
+        panic!("planted payload: {planted}");
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn test_panic() {}
+
 fn main() -> ExitCode {
+    install_panic_hook();
+    test_panic();
     let args = match collect_args() {
         Ok(args) => args,
         Err(message) => {

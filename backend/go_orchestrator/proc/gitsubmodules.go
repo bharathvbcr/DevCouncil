@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -18,8 +19,6 @@ const (
 	maxSubmodules = 256
 	// maxSubmoduleDepth bounds nesting.
 	maxSubmoduleDepth = 8
-	// submoduleListingLimit bounds the index listing gitlinks are read from.
-	submoduleListingLimit = 64 << 20
 )
 
 // submoduleWalkBudget is the one deadline over a whole submodule walk. Each
@@ -29,8 +28,21 @@ const (
 // A var so a test can shorten it.
 var submoduleWalkBudget = 3 * time.Minute
 
-func withWalkBudget(ctx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(ctx, submoduleWalkBudget)
+type walkBudgetKey struct{}
+
+// WithWalkBudget starts the one deadline of a submodule walk. A caller that
+// makes several walk calls (DirtySubmodules, then SubmoduleWorktreeFiles for
+// each dirty one) calls it once and passes the context to all of them: the
+// calls then share one budget instead of each starting its own, which was up
+// to 257 of them end to end. Called on a context that already carries a budget
+// it changes nothing, so DirtySubmodules and SubmoduleWorktreeFiles apply it
+// themselves for the caller that makes only one call.
+func WithWalkBudget(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx.Value(walkBudgetKey{}) != nil {
+		return ctx, func() {}
+	}
+	ctx, cancel := context.WithTimeout(ctx, submoduleWalkBudget)
+	return context.WithValue(ctx, walkBudgetKey{}, struct{}{}), cancel
 }
 
 // DirtySubmodules names the submodules under the session's root (within
@@ -60,7 +72,7 @@ func withWalkBudget(ctx context.Context) (context.Context, context.CancelFunc) {
 //
 // The whole walk runs under submoduleWalkBudget.
 func (s *GitSession) DirtySubmodules(ctx context.Context, pathspecs ...string) ([]string, error) {
-	ctx, cancel := withWalkBudget(ctx)
+	ctx, cancel := WithWalkBudget(ctx)
 	defer cancel()
 	return s.dirtySubmodules(ctx, 0, pathspecs)
 }
@@ -70,25 +82,15 @@ func (s *GitSession) dirtySubmodules(ctx context.Context, depth int, pathspecs [
 	if len(pathspecs) > 0 {
 		args = append(append(args, "--"), pathspecs...)
 	}
-	listing, err := s.output(ctx, submoduleListingLimit, args...)
+	gitlinks, err := s.gitlinks(ctx, args)
 	if err != nil {
 		return nil, err
-	}
-	var gitlinks []string
-	for _, entry := range bytes.Split(listing, []byte{0}) {
-		meta, path, ok := strings.Cut(string(entry), "\t")
-		if ok && strings.HasPrefix(meta, "160000 ") {
-			gitlinks = append(gitlinks, path)
-		}
 	}
 	if len(gitlinks) == 0 {
 		return nil, nil
 	}
 	if depth >= maxSubmoduleDepth {
 		return nil, fmt.Errorf("submodules under %s nest deeper than %d; refusing to report a partial answer", s.root, maxSubmoduleDepth)
-	}
-	if len(gitlinks) > maxSubmodules {
-		return nil, fmt.Errorf("%s has %d submodules, more than the %d one read examines; refusing to report a partial answer", s.root, len(gitlinks), maxSubmodules)
 	}
 	var dirty []string
 	for _, path := range gitlinks {
@@ -127,6 +129,14 @@ func (s *GitSession) dirtySubmodules(ctx context.Context, depth int, pathspecs [
 	return dirty, nil
 }
 
+// NestedRepositoryError is the refusal for an untracked directory git lists
+// with a trailing slash: a repository nested inside the tree that is neither
+// ignored nor a submodule. Its files are in no listing, so none can be scanned;
+// the change is refused, and the message says what to do about it.
+func NestedRepositoryError(dir string) error {
+	return fmt.Errorf("untracked nested repository %s is not scanned: ignore it or add it as a submodule", dir)
+}
+
 // SubmoduleChanges is what a dirty submodule's working tree changed, as
 // superproject-relative paths.
 type SubmoduleChanges struct {
@@ -152,7 +162,7 @@ func (s *GitSession) SubmoduleWorktreeFiles(ctx context.Context, submodulePath s
 	if !filepath.IsLocal(filepath.FromSlash(submodulePath)) {
 		return SubmoduleChanges{}, fmt.Errorf("refusing submodule path %q", submodulePath)
 	}
-	ctx, cancel := withWalkBudget(ctx)
+	ctx, cancel := WithWalkBudget(ctx)
 	defer cancel()
 	return s.submoduleWorktreeFiles(ctx, submodulePath, 1)
 }
@@ -204,6 +214,9 @@ func (s *GitSession) submoduleWorktreeFiles(ctx context.Context, submodulePath s
 		name := string(raw)
 		if name == "" {
 			continue
+		}
+		if strings.HasSuffix(name, "/") {
+			return SubmoduleChanges{}, NestedRepositoryError(pathJoinSlash(submodulePath, name))
 		}
 		if !filepath.IsLocal(filepath.FromSlash(name)) {
 			return SubmoduleChanges{}, fmt.Errorf("submodule %s names %q, which is not a plain path", submodulePath, name)
@@ -331,26 +344,109 @@ func (s *GitSession) submoduleDir(path string) (string, bool, error) {
 // output runs one guarded read and returns its stdout. A read whose output
 // passes limit is refused, never truncated.
 func (s *GitSession) output(ctx context.Context, limit int, args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-	cmd, err := s.Command(ctx, args...)
-	if err != nil {
-		return nil, err
-	}
 	out := &CappedBuffer{Limit: limit}
-	var stderr bytes.Buffer
-	cmd.Stdout = out
-	cmd.Stderr = &stderr
-	cmd.WaitDelay = 2 * time.Second
-	err, timedOut := RunBounded(ctx, cmd.Run)
-	if timedOut {
-		return nil, fmt.Errorf("git %s in %s did not finish: %w", strings.Join(args, " "), s.root, ctx.Err())
-	}
-	if err != nil {
-		return nil, fmt.Errorf("git %s in %s: %w: %s", strings.Join(args, " "), s.root, err, strings.TrimSpace(stderr.String()))
+	if err := s.stream(ctx, out, args...); err != nil {
+		return nil, err
 	}
 	if out.Overflowed() {
 		return nil, fmt.Errorf("git %s in %s wrote more than %d bytes; refusing a truncated answer", strings.Join(args, " "), s.root, limit)
 	}
 	return out.Bytes(), nil
+}
+
+// stream runs one guarded read, writing its stdout to w as it arrives, under
+// the per-call bound.
+func (s *GitSession) stream(ctx context.Context, w io.Writer, args ...string) error {
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	cmd, err := s.Command(ctx, args...)
+	if err != nil {
+		return err
+	}
+	var stderr bytes.Buffer
+	cmd.Stdout = w
+	cmd.Stderr = &stderr
+	cmd.WaitDelay = 2 * time.Second
+	err, timedOut := RunBounded(ctx, cmd.Run)
+	if timedOut {
+		return fmt.Errorf("git %s in %s did not finish: %w", strings.Join(args, " "), s.root, ctx.Err())
+	}
+	if err != nil {
+		return fmt.Errorf("git %s in %s: %w: %s", strings.Join(args, " "), s.root, err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+// maxIndexEntry bounds one NUL-terminated record of the index listing. A path
+// is far shorter; a record past this is not a listing worth believing.
+const maxIndexEntry = 1 << 20
+
+// gitlinks runs the index listing in args (`ls-files --stage -z`) and returns
+// the paths of its mode-160000 entries. The listing is filtered as it streams,
+// so memory is bounded by one record and by the gitlinks kept, not by the size
+// of the index: a listing capped in total failed on a repository of some
+// 800 000 files that had no submodule at all. A record longer than
+// maxIndexEntry, or more gitlinks than maxSubmodules, is refused, never
+// truncated.
+func (s *GitSession) gitlinks(ctx context.Context, args []string) ([]string, error) {
+	f := &gitlinkFilter{}
+	if err := s.stream(ctx, f, args...); err != nil {
+		return nil, err
+	}
+	f.flush()
+	if f.overlong {
+		return nil, fmt.Errorf("git %s in %s wrote a record longer than %d bytes; refusing a truncated answer", strings.Join(args, " "), s.root, maxIndexEntry)
+	}
+	if f.count > maxSubmodules {
+		return nil, fmt.Errorf("%s has %d submodules, more than the %d one read examines; refusing to report a partial answer", s.root, f.count, maxSubmodules)
+	}
+	return f.links, nil
+}
+
+// gitlinkFilter is an io.Writer over `ls-files --stage -z` output that keeps
+// only the paths of mode-160000 records. Like CappedBuffer it always reports a
+// full write: a short one would close the pipe on a child that ran fine.
+type gitlinkFilter struct {
+	pending  []byte
+	links    []string
+	count    int
+	overlong bool
+}
+
+func (f *gitlinkFilter) Write(p []byte) (int, error) {
+	n := len(p)
+	for len(p) > 0 {
+		end := bytes.IndexByte(p, 0)
+		if end < 0 {
+			if len(f.pending)+len(p) > maxIndexEntry {
+				f.overlong, f.pending = true, nil
+			} else if !f.overlong {
+				f.pending = append(f.pending, p...)
+			}
+			return n, nil
+		}
+		if f.overlong || len(f.pending)+end > maxIndexEntry {
+			f.overlong, f.pending = true, nil
+		} else {
+			f.pending = append(f.pending, p[:end]...)
+			f.flush()
+		}
+		p = p[end+1:]
+	}
+	return n, nil
+}
+
+// flush takes the record in pending, if any, and clears it.
+func (f *gitlinkFilter) flush() {
+	if len(f.pending) == 0 {
+		return
+	}
+	meta, path, ok := strings.Cut(string(f.pending), "\t")
+	if ok && strings.HasPrefix(meta, "160000 ") {
+		f.count++
+		if f.count <= maxSubmodules {
+			f.links = append(f.links, path)
+		}
+	}
+	f.pending = f.pending[:0]
 }
