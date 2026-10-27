@@ -993,7 +993,6 @@ fn followup2_an_annotation_with_arguments_before_a_one_line_class_is_repaired() 
 /// Five nested one-line classes, and `open class` with a supertype call around
 /// a local object expression, both hit it.
 #[test]
-#[ignore = "follow-up 4, fixed in its own commit"]
 fn followup4_a_tree_whose_root_is_the_error_node_is_repaired() {
     let mut failures = Vec::new();
     for (label_, source) in [
@@ -1238,4 +1237,64 @@ fn many_sibling_one_liners_equal_their_twin_and_the_cap_stays_partial() {
         "{}",
         note_of(&e)
     );
+}
+
+/// Follow-up 4 keeps true: a file whose tree root is the ERROR node and that
+/// the rewrite repairs equals its fully expanded multi-line twin on every table.
+#[test]
+fn a_root_error_tree_that_is_repaired_equals_its_expanded_twin_on_every_table() {
+    let mut failures = Vec::new();
+    for (label_, one, twin) in [
+        (
+            "supertype call and a local object",
+            "open class A : B() { fun f(): Int { return object { val q = 1 } } }\n",
+            "open class A : B() {\n    fun f(): Int {\n        return object {\n            val q = 1\n        }\n    }\n}\n",
+        ),
+        (
+            "local object expression with a method",
+            "class A { val v = 1; fun f() { val o = object : T { fun g() {} } } }\n",
+            "class A {\n    val v = 1;\n    fun f() {\n        val o = object : T {\n            fun g() {}\n        }\n    }\n}\n",
+        ),
+        (
+            "three nested one-line classes",
+            "class C0 { class C1 { class C2 { val x = 1 } } }\n",
+            "class C0 {\n    class C1 {\n        class C2 {\n            val x = 1\n        }\n    }\n}\n",
+        ),
+    ] {
+        let (one, twin) = (format!("{one}{SUFFIX}"), format!("{twin}{SUFFIX}"));
+        let (a, b) = (ex("A.kt", &one), ex("A.kt", &twin));
+        if !clean(&a) || !clean(&b) {
+            failures.push(format!(
+                "{label_}: one-line {} twin {}",
+                label(&a, &one),
+                label(&b, &twin)
+            ));
+            continue;
+        }
+        if a.recovered_decl_ranges.is_empty() {
+            failures.push(format!("{label_}: not repaired"));
+        }
+        failures.extend(
+            table_diffs(&a, &b)
+                .into_iter()
+                .map(|d| format!("{label_}: {d}")),
+        );
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A root-ERROR tree with a real error is not made Clean by the rewrite.
+#[test]
+fn a_root_error_tree_with_a_real_error_stays_partial() {
+    for source in [
+        "open class A : B() { fun f(): Int { return object { val q = } } }\n",
+        "class C0 { class C1 { class C2 { val x = } } }\n",
+        "class C0 { class C1 { class C2 { val x = 1 } } \n",
+        "class C0 { class C1 { class C2 { val x = 1 } } } }\n",
+    ] {
+        let source = format!("{source}{SUFFIX}");
+        let e = ex("A.kt", &source);
+        assert!(!clean(&e), "{source:?} was reported Clean");
+        assert!(e.recovered_decl_ranges.is_empty(), "{source:?}");
+    }
 }

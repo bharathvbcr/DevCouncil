@@ -145,10 +145,17 @@ fn candidates(root: Node, text: &[u8], done: &[usize]) -> Result<Vec<usize>, Str
     let mut found: Vec<usize> = Vec::new();
     let mut cursor = root.walk();
     let mut stack: Vec<Node> = Vec::new();
-    let mut top = root.walk();
-    for statement in root.children(&mut top) {
-        if statement.is_error() || statement.has_error() {
-            stack.push(statement);
+    if root.is_error() {
+        // A tree whose root is itself the ERROR node (no `source_file` around
+        // it) has the file's tokens as its direct children, and none of them
+        // holds an error of its own, so the walk starts at the root.
+        stack.push(root);
+    } else {
+        let mut top = root.walk();
+        for statement in root.children(&mut top) {
+            if statement.is_error() || statement.has_error() {
+                stack.push(statement);
+            }
         }
     }
     let mut visited = 0u32;
