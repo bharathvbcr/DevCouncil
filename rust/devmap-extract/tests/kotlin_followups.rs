@@ -1422,3 +1422,99 @@ fn thousands_of_comments_before_the_closing_brace_are_read_in_bounded_time() {
         "a budget refusal means the scan was not bounded"
     );
 }
+
+/// Two declarations on one line want a separator between them; the second
+/// mode writes it, and the result equals the same text on separate lines.
+#[test]
+fn declarations_sharing_a_line_equal_their_twin_on_every_table() {
+    let mut failures = Vec::new();
+    for (label_, one, twin) in [
+        (
+            "two classes",
+            "class A { fun f() {} } class B { fun g() {} }\n",
+            "class A {\n    fun f() {}\n}\nclass B {\n    fun g() {}\n}\n",
+        ),
+        (
+            "class then function",
+            "class A { val x = 1 } fun g() { h() }\n",
+            "class A {\n    val x = 1\n}\nfun g() { h() }\n",
+        ),
+        (
+            "class then modifiers",
+            "class A { val x = 1 } private object O { val y = 2 }\n",
+            "class A {\n    val x = 1\n}\nprivate object O {\n    val y = 2\n}\n",
+        ),
+        (
+            "class then annotated class",
+            "class A { val x = 1 } @Ann class B { val y = 2 }\n",
+            "class A {\n    val x = 1\n}\n@Ann class B {\n    val y = 2\n}\n",
+        ),
+        (
+            "bodies over several lines, a class opened on the closing line",
+            "class A {\n    val x = 1\n} class B {\n    val y = 2\n}\n",
+            "class A {\n    val x = 1\n}\nclass B {\n    val y = 2\n}\n",
+        ),
+        (
+            "three classes",
+            "class A { val x = 1 } class B { val y = 2 } class C { val z = 3 }\n",
+            "class A {\n    val x = 1\n}\nclass B {\n    val y = 2\n}\nclass C {\n    val z = 3\n}\n",
+        ),
+    ] {
+        let (one, twin) = (format!("{one}{SUFFIX}"), format!("{twin}{SUFFIX}"));
+        let (a, b) = (ex("A.kt", &one), ex("A.kt", &twin));
+        if !clean(&a) || !clean(&b) {
+            failures.push(format!(
+                "{label_}: one-line {} twin {}",
+                label(&a, &one),
+                label(&b, &twin)
+            ));
+            continue;
+        }
+        failures.extend(
+            table_diffs(&a, &b)
+                .into_iter()
+                .map(|d| format!("{label_}: {d}")),
+        );
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The second mode writes only before a declaration word, and the re-parse
+/// must be fully clean: a `}` followed by anything else, or by a declaration
+/// next to a real error, leaves the file Partial and unrepaired.
+#[test]
+fn a_brace_followed_by_something_else_is_not_given_a_separator() {
+    for source in [
+        "class A { val x = 1 } else\n",
+        "class A { val x = 1 } class B { val y = }\n",
+        "class A { val x = 1 } as B\n",
+    ] {
+        let source = format!("{source}{SUFFIX}");
+        let e = ex("A.kt", &source);
+        assert!(!clean(&e), "{source:?} was reported Clean");
+        assert!(e.recovered_decl_ranges.is_empty(), "{source:?}");
+    }
+}
+
+/// A chain of nested one-line bodies reveals one level per parse. 512 of them
+/// (7.6 KB) took about 6 s in release, past the file budget, so the file came
+/// back refused. The pass limit stops it: Partial, announced, nothing repaired.
+#[test]
+fn a_chain_of_nested_one_liners_past_the_pass_limit_is_partial_not_refused() {
+    let source = nested_shape(0, 512);
+    let e = ex("A.kt", &source);
+    assert!(
+        matches!(e.parse_outcome, ParseOutcome::Partial { .. }),
+        "{}",
+        label(&e, &source)
+    );
+    assert!(e.recovered_decl_ranges.is_empty());
+    assert!(
+        note_of(&e).contains("still an error after"),
+        "{}",
+        note_of(&e)
+    );
+    let shallow = nested_shape(0, 20);
+    let e = ex("A.kt", &shallow);
+    assert!(clean(&e), "{}", label(&e, &shallow));
+}

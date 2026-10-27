@@ -4089,7 +4089,7 @@ fn kotlin_root_outcome(lost: &crate::kotlinloss::LostScan) -> (usize, ParseOutco
     let tree = parser.parse(source, None).expect("tree");
     (
         source.len(),
-        parse_outcome_of(tree.root_node(), source, false, false, lost),
+        parse_outcome_of(tree.root_node(), source, false, false, true, lost),
     )
 }
 

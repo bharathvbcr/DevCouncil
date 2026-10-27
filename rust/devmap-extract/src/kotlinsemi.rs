@@ -27,13 +27,17 @@
 //! comments. They are not all visible to the
 //! first parse (a nested `}` hides inside the ERROR until the outer one is
 //! fixed), so the rewrite repeats, each pass over the top-level statements that
-//! still hold an error. Every pass that goes on has written at least one
-//! separator no earlier pass wrote, and the total is capped at [`MAX_EDITS`], so
-//! the loop ends after at most `MAX_EDITS + 1` parses whatever the file is: the
-//! cost is the number of sites the grammar hides one at a time (a file of ten
-//! sibling one-liners takes ten parses), not a fixed pass count that a plain
-//! file can exceed. The file deadline bounds each parse and the scan between
-//! them.
+//! still hold an error, at most [`MAX_PASSES`] times and with at most
+//! [`MAX_EDITS`] separators (every pass that goes on writes at least one no
+//! earlier pass wrote). Sibling one-liners are revealed in growing batches, so
+//! the pass limit is far above any plain file; a chain of nested one-liners
+//! reveals one level per pass and is what the limit stops. The file deadline
+//! bounds each parse and the scan between them.
+//!
+//! A file the first mode leaves with an error is tried again from the original
+//! with a second mode that also writes a separator after a `}` followed on its
+//! line by a declaration: `class A { .. } class B { .. }` wants one between the
+//! two classes, and the grammar reads the pair as an error until it has it.
 //!
 //! The result is accepted **only if the re-parse is fully clean**. Anything
 //! else, including a deadline, leaves the file exactly as it was: `Partial`.
@@ -54,6 +58,51 @@ use crate::treesitter::{bounded_parent, parse_until, walk_deadline_passed, DEADL
 /// Separators written per file. A file that wants more is not rewritten.
 pub(crate) const MAX_EDITS: usize = 512;
 
+/// Parses after the first one. Measured: sibling one-liners are revealed in
+/// growing batches (7 need 8 parses, 40 and 200 need 11), so this is far above
+/// any plain file, while a chain of nested one-liners reveals one level per
+/// parse and 512 of them (7.6 KB) took about 6 s, past the file budget. No
+/// real file nests 32 one-line bodies.
+pub(crate) const MAX_PASSES: usize = 32;
+
+/// What a declaration may start with after a `}` on the same line. A `;` is
+/// wanted between `class A { .. } class B { .. }`, and only before one of
+/// these (never before `else`, `catch`, `as`, `by`, `.`, an infix name...).
+const DECLARATION_STARTS: [&str; 32] = [
+    "class",
+    "object",
+    "interface",
+    "fun",
+    "val",
+    "var",
+    "typealias",
+    "enum",
+    "sealed",
+    "data",
+    "open",
+    "abstract",
+    "private",
+    "public",
+    "internal",
+    "protected",
+    "inner",
+    "annotation",
+    "companion",
+    "const",
+    "lateinit",
+    "override",
+    "final",
+    "inline",
+    "operator",
+    "infix",
+    "suspend",
+    "tailrec",
+    "external",
+    "expect",
+    "actual",
+    "init",
+];
+
 /// What the rewrite did.
 pub(crate) enum Repair {
     /// The re-parse is clean. `tree` is its tree, on the same offsets as the
@@ -68,36 +117,75 @@ pub(crate) enum Repair {
     Unchanged { tree: Tree, why: String },
 }
 
+/// Why a rewrite stopped without a clean tree.
+enum Stop {
+    /// No candidate was left, or the passes ran out: the other mode may still
+    /// succeed.
+    Retry(String),
+    /// A cap, a deadline or a bad rewrite: nothing else is tried.
+    Final(String),
+}
+
 /// Try to make `tree`, which has an error, parse cleanly by writing `;` over
 /// spaces. `source` is the text `tree` was parsed from.
+///
+/// The first attempt writes a separator before each closing brace that follows
+/// code on its line. A file that still has an error is tried again from the
+/// original with the second mode, which also writes one after a `}` that is
+/// followed on its line by a declaration (`class A { .. } class B { .. }`, a
+/// separator the grammar wants between two declarations on one line). The
+/// second mode runs only where the first has already failed, so it cannot
+/// change a file the first repairs.
 pub(crate) fn repair(parser: &mut Parser, tree: Tree, source: &str, deadline: Instant) -> Repair {
+    let first = match rewrite(parser, &tree, source, deadline, false) {
+        Ok(done) => return done,
+        Err(stop) => stop,
+    };
+    let why = match first {
+        Stop::Final(why) => why,
+        Stop::Retry(why) => match rewrite(parser, &tree, source, deadline, true) {
+            Ok(done) => return done,
+            Err(Stop::Final(later)) => later,
+            Err(Stop::Retry(_)) => why,
+        },
+    };
+    Repair::Unchanged { tree, why }
+}
+
+/// One mode of the rewrite. `Ok` is a fully clean re-parse.
+fn rewrite(
+    parser: &mut Parser,
+    tree: &Tree,
+    source: &str,
+    deadline: Instant,
+    boundaries: bool,
+) -> Result<Repair, Stop> {
     let mut text = source.as_bytes().to_vec();
     let mut edited: Vec<usize> = Vec::new();
     let mut current = tree.clone();
-    loop {
+    for pass in 0..=MAX_PASSES {
         if !current.root_node().has_error() {
             let ranges = touched(&current, &edited);
-            return Repair::Repaired {
+            return Ok(Repair::Repaired {
                 tree: current,
                 ranges,
                 edits: edited.len(),
-            };
+            });
         }
-        let fresh = match candidates(current.root_node(), &text, &edited) {
-            Ok(fresh) => fresh,
-            Err(why) => return Repair::Unchanged { tree, why },
-        };
+        if pass == MAX_PASSES {
+            break;
+        }
+        let fresh =
+            candidates(current.root_node(), &text, &edited, boundaries).map_err(Stop::Final)?;
         if fresh.is_empty() {
-            return Repair::Unchanged {
-                tree,
-                why: "no space before a closing brace is left to write a separator over".into(),
-            };
+            return Err(Stop::Retry(
+                "no space before a closing brace is left to write a separator over".into(),
+            ));
         }
         if edited.len() + fresh.len() > MAX_EDITS {
-            return Repair::Unchanged {
-                tree,
-                why: format!("more than {MAX_EDITS} separators would be written"),
-            };
+            return Err(Stop::Final(format!(
+                "more than {MAX_EDITS} separators would be written"
+            )));
         }
         for at in fresh {
             text[at] = b';';
@@ -105,21 +193,20 @@ pub(crate) fn repair(parser: &mut Parser, tree: Tree, source: &str, deadline: In
         }
         // Only an ASCII space or tab was replaced by an ASCII byte.
         let Ok(rewritten) = std::str::from_utf8(&text) else {
-            return Repair::Unchanged {
-                tree,
-                why: "the rewritten text is not UTF-8".into(),
-            };
+            return Err(Stop::Final("the rewritten text is not UTF-8".into()));
         };
         match parse_until(parser, rewritten, deadline) {
             (Some(next), false) => current = next,
             _ => {
-                return Repair::Unchanged {
-                    tree,
-                    why: "the re-parse did not finish within the budget".into(),
-                }
+                return Err(Stop::Final(
+                    "the re-parse did not finish within the budget".into(),
+                ))
             }
         }
     }
+    Err(Stop::Retry(format!(
+        "still an error after {MAX_PASSES} rewrites"
+    )))
 }
 
 /// The last character of `before`, which is UTF-8 text cut at a character
@@ -158,10 +245,35 @@ fn ends_a_member(before: &[u8]) -> bool {
     }
 }
 
+/// The offset of the space to write `;` over after the `}` at `at`, when the
+/// brace is followed on its line by a space and then a declaration.
+fn boundary_after(text: &[u8], at: usize) -> Option<usize> {
+    let mut next = at + 1;
+    while matches!(text.get(next), Some(b' ' | b'\t')) {
+        next += 1;
+    }
+    if next == at + 1 {
+        return None;
+    }
+    let rest = text.get(next..)?;
+    let word = rest.iter().take_while(|b| b.is_ascii_alphabetic()).count();
+    let starts_a_declaration = rest.first() == Some(&b'@')
+        || std::str::from_utf8(&rest[..word]).is_ok_and(|word| DECLARATION_STARTS.contains(&word))
+            && !rest
+                .get(word)
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+    starts_a_declaration.then_some(at + 1)
+}
+
 /// The offsets of the spaces to write `;` over: one directly before each
 /// closing `}` that follows code on its line, in the top-level statements that
 /// hold an error, outside strings and comments.
-fn candidates(root: Node, text: &[u8], done: &[usize]) -> Result<Vec<usize>, String> {
+fn candidates(
+    root: Node,
+    text: &[u8],
+    done: &[usize],
+    boundaries: bool,
+) -> Result<Vec<usize>, String> {
     let mut found: Vec<usize> = Vec::new();
     let mut cursor = root.walk();
     // Each node waits with the end of the last sibling before it that is not a
@@ -179,6 +291,12 @@ fn candidates(root: Node, text: &[u8], done: &[usize]) -> Result<Vec<usize>, Str
             if statement.is_error() || statement.has_error() {
                 stack.push((statement, None));
             }
+        }
+        // No statement holds the error: it is on the root itself, a hidden
+        // token between two declarations (`class A { .. } class B { .. }` with
+        // each body over several lines), so the scan covers the whole file.
+        if stack.is_empty() {
+            stack.push((root, None));
         }
     }
     let mut visited = 0u32;
@@ -213,6 +331,13 @@ fn candidates(root: Node, text: &[u8], done: &[usize]) -> Result<Vec<usize>, Str
                     && !done.contains(&(at - 1))
                 {
                     found.push(at - 1);
+                }
+            }
+            if boundaries && closes_a_body {
+                if let Some(site) = boundary_after(text, at) {
+                    if !done.contains(&site) {
+                        found.push(site);
+                    }
                 }
             }
             continue;
