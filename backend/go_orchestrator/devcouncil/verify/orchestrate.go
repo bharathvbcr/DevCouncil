@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/policy"
+	"io/fs"
 	"os"
 	"os/exec"
 	"strings"
@@ -415,12 +416,17 @@ func ToCLITask(taskID string, gaps []Gap, meta runMeta) TaskCLIResult {
 // repository with no HEAD yet, which lists its untracked files instead. A
 // missing object in a partial clone — git no longer fetches one on demand —
 // is an error like any other.
+//
+// Path names are compared exactly as git wrote them. Every listing is
+// NUL-delimited (-z), and no name is trimmed or has its separators rewritten:
+// `f.txt ` and `f.txt` are two files, and folding them onto each other let one
+// hide the other's bytes from the scan.
 func CollectGitState(ctx context.Context, root string) (changed []string, diff string, empty bool, err error) {
 	git, err := proc.NewGitSession(root)
 	if err != nil {
 		return nil, "", true, err
 	}
-	nameOut, err := runGit(ctx, git, gitListingLimit, append([]string{"diff", "HEAD", "--name-only", "-z"}, toolStateExcludes()...)...)
+	nameOut, err := runGit(ctx, git, gitListingLimit, append([]string{"diff", "HEAD", "--name-status", "-z"}, toolStateExcludes()...)...)
 	headless := false
 	if err != nil {
 		if !hasNoHead(ctx, git) {
@@ -428,33 +434,59 @@ func CollectGitState(ctx context.Context, root string) (changed []string, diff s
 		}
 		headless, nameOut = true, nil
 	}
+	entries, err := parseNameStatus(nameOut)
+	if err != nil {
+		return nil, "", true, err
+	}
 	seen := map[string]struct{}{}
-	// tracked is the set `git diff HEAD` carries a section for: the paths its
-	// own name-only listing named, spelled the way changed spells them.
-	tracked := map[string]struct{}{}
-	add := func(listing []byte, into map[string]struct{}) {
-		for _, p := range strings.Split(string(listing), "\x00") {
-			p = strings.TrimSpace(strings.ReplaceAll(p, "\\", "/"))
-			// Tool-owned state is not the agent's work; policy.ToolStateDirs
-			// is the list the write policy protects, so the two cannot differ.
-			if p == "" || policy.IsToolState(p) {
-				continue
-			}
-			if into != nil {
-				into[p] = struct{}{}
-			}
-			if _, ok := seen[p]; !ok {
-				changed = append(changed, p)
-				seen[p] = struct{}{}
-			}
+	add := func(path string) {
+		// Tool-owned state is not the agent's work; policy.ToolStateDirs
+		// is the list the write policy protects, so the two cannot differ.
+		if path == "" || policy.IsToolState(path) {
+			return
+		}
+		if _, ok := seen[path]; !ok {
+			changed = append(changed, path)
+			seen[path] = struct{}{}
 		}
 	}
-	add(nameOut, tracked)
+	rootFS, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, "", true, err
+	}
+	defer func() { err = errors.Join(err, rootFS.Close()) }()
+	// tracked is the set `git diff HEAD` carries a section for. A path git
+	// reports as deleted but that exists in the working tree again (removed
+	// from the index, then recreated) is not in it: its section is a deletion,
+	// which carries none of the new bytes, so the diff is asked to leave it out
+	// and the file is read from disk like any untracked one.
+	tracked := map[string]struct{}{}
+	var recreated []string
+	for _, entry := range entries {
+		if policy.IsToolState(entry.path) {
+			continue
+		}
+		add(entry.path)
+		if entry.deleted {
+			info, serr := rootFS.Lstat(entry.path)
+			switch {
+			case errors.Is(serr, fs.ErrNotExist):
+			case serr != nil:
+				return nil, "", true, fmt.Errorf("cannot tell whether deleted %s is back on disk: %v", entry.path, serr)
+			case !info.IsDir():
+				recreated = append(recreated, entry.path)
+				continue
+			}
+		}
+		tracked[entry.path] = struct{}{}
+	}
 	untracked, err := runGit(ctx, git, gitListingLimit, "ls-files", "--others", "--exclude-standard", "-z")
 	if err != nil {
 		return nil, "", true, err
 	}
-	add(untracked, nil)
+	for _, name := range strings.Split(string(untracked), "\x00") {
+		add(name)
+	}
 	// The diff reads pass --ignore-submodules=dirty, so git does not run a
 	// status inside each submodule; dirtiness comes from a guarded read of
 	// each one, and a dirty submodule is a changed path as it was before.
@@ -462,9 +494,15 @@ func CollectGitState(ctx context.Context, root string) (changed []string, diff s
 	if err != nil {
 		return nil, "", true, err
 	}
-	add([]byte(strings.Join(dirty, "\x00")), nil)
+	for _, name := range dirty {
+		add(name)
+	}
 	if !headless {
-		diffBytes, err := runGit(ctx, git, gitDiffLimit, append([]string{"-c", "core.quotePath=false", "diff", "HEAD"}, toolStateExcludes()...)...)
+		args := append([]string{"-c", "core.quotePath=false", "diff", "HEAD"}, toolStateExcludes()...)
+		for _, path := range recreated {
+			args = append(args, ":(top,exclude,literal)"+path)
+		}
+		diffBytes, err := runGit(ctx, git, gitDiffLimit, args...)
 		if err != nil {
 			return nil, "", true, err
 		}
@@ -476,6 +514,45 @@ func CollectGitState(ctx context.Context, root string) (changed []string, diff s
 	}
 	empty = len(changed) == 0 && strings.TrimSpace(diff) == ""
 	return changed, diff, empty, nil
+}
+
+// nameStatus is one path of `git diff --name-status -z`.
+type nameStatus struct {
+	path    string
+	deleted bool
+}
+
+// parseNameStatus reads `git diff --name-status -z`: a status word, then one
+// path (two for a rename or copy, whose destination is the path that changed),
+// each NUL-terminated. A record that stops short is an error, never a shorter
+// list.
+func parseNameStatus(listing []byte) ([]nameStatus, error) {
+	fields := strings.Split(string(listing), "\x00")
+	if n := len(fields); n > 0 && fields[n-1] == "" {
+		fields = fields[:n-1]
+	}
+	var out []nameStatus
+	for i := 0; i < len(fields); {
+		status := fields[i]
+		i++
+		if status == "" {
+			return nil, errors.New("git diff --name-status named a change with no status")
+		}
+		paths := 1
+		if status[0] == 'R' || status[0] == 'C' {
+			paths = 2
+		}
+		if i+paths > len(fields) {
+			return nil, fmt.Errorf("git diff --name-status ended inside a %q record", status)
+		}
+		path := fields[i+paths-1]
+		i += paths
+		if path == "" {
+			return nil, fmt.Errorf("git diff --name-status named a %q change with no path", status)
+		}
+		out = append(out, nameStatus{path: path, deleted: status[0] == 'D'})
+	}
+	return out, nil
 }
 
 // ToolOwned reports whether a changed path is state a DevCouncil tool wrote,

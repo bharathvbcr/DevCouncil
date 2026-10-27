@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
@@ -175,10 +176,11 @@ func appendDeletion(ctx context.Context, rel string, b *strings.Builder) error {
 	if !pathOK(rel) {
 		return fmt.Errorf("cannot include %q in the diff", rel)
 	}
+	a := quoteDiffPath("a/", rel)
 	fragment := strings.Join([]string{
-		fmt.Sprintf("diff --git a/%s b/%s", rel, rel),
+		fmt.Sprintf("diff --git %s %s", a, quoteDiffPath("b/", rel)),
 		"deleted file mode 100644",
-		fmt.Sprintf("--- a/%s", rel),
+		"--- " + a,
 		"+++ /dev/null",
 	}, "\n")
 	return appendFragment(ctx, b, fragment)
@@ -233,7 +235,7 @@ func readCappedFile(rootFS *os.Root, rel string, limit int64) (raw []byte, err e
 		return nil, fmt.Errorf("cannot include %s: %v", rel, err)
 	}
 	if links != 1 {
-		return nil, fmt.Errorf("cannot include %s: hard-linked files are not read", rel)
+		return nil, fmt.Errorf("cannot include %s: refused: hard-linked file", rel)
 	}
 	raw, err = io.ReadAll(io.LimitReader(f, limit+1))
 	if err != nil {
@@ -245,26 +247,78 @@ func readCappedFile(rootFS *os.Root, rel string, limit int64) (raw []byte, err e
 	return raw, nil
 }
 
+// pathOK reports whether rel is a plain relative path inside the root. Which
+// characters its name holds does not matter here: a name with a newline, a
+// quote or a backslash is written into the synthetic diff C-quoted, as git
+// writes it, so it is read back as the one file it names.
 func pathOK(rel string) bool {
-	if rel == "" || strings.ContainsAny(rel, "\n\r\"") {
-		return false
+	return rel != "" && !strings.ContainsRune(rel, 0) && filepath.IsLocal(filepath.FromSlash(rel))
+}
+
+// quoteDiffPath spells prefix+name the way git spells it in a diff header: raw
+// unless the name holds a control character, a quote or a backslash, in which
+// case it is C-quoted. (Non-ASCII bytes stay raw: the diffs git is asked for
+// carry core.quotePath=false.)
+func quoteDiffPath(prefix, name string) string {
+	full := prefix + name
+	plain := true
+	for i := 0; i < len(full); i++ {
+		if c := full[i]; c < 0x20 || c == 0x7f || c == '"' || c == '\\' {
+			plain = false
+			break
+		}
 	}
-	return !strings.HasPrefix(rel, "/") && !strings.Contains(rel, "../") && rel != ".."
+	if plain {
+		return full
+	}
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(full); i++ {
+		switch c := full[i]; c {
+		case '\a':
+			b.WriteString(`\a`)
+		case '\b':
+			b.WriteString(`\b`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\v':
+			b.WriteString(`\v`)
+		case '\f':
+			b.WriteString(`\f`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		default:
+			if c < 0x20 || c == 0x7f {
+				fmt.Fprintf(&b, `\%03o`, c)
+			} else {
+				b.WriteByte(c)
+			}
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 func formatSyntheticDiff(rel string, raw []byte) string {
+	a, b := quoteDiffPath("a/", rel), quoteDiffPath("b/", rel)
 	header := []string{
-		fmt.Sprintf("diff --git a/%s b/%s", rel, rel),
+		fmt.Sprintf("diff --git %s %s", a, b),
 		"new file mode 100644",
 		"--- /dev/null",
-		fmt.Sprintf("+++ b/%s", rel),
+		"+++ " + b,
 	}
 	probe := raw
 	if len(probe) > binaryProbeBytes {
 		probe = probe[:binaryProbeBytes]
 	}
 	if bytes.IndexByte(probe, 0) >= 0 {
-		header = append(header, fmt.Sprintf("Binary files a/%s and b/%s differ", rel, rel))
+		header = append(header, fmt.Sprintf("Binary files %s and %s differ", a, b))
 		return strings.Join(header, "\n")
 	}
 	text := string(raw)

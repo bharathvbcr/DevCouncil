@@ -42,6 +42,7 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/safefile"
@@ -374,6 +375,23 @@ type wireResult struct {
 	Substance *Substance `json:"substance"`
 }
 
+// stderrEchoLimit bounds how much of the verifier's stderr an error carries.
+const stderrEchoLimit = 512
+
+// boundedHead is the first limit bytes of b, trimmed and cut on a rune
+// boundary, marked when it was cut.
+func boundedHead(b []byte, limit int) string {
+	b = bytes.TrimSpace(b)
+	if len(b) <= limit {
+		return string(b)
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(b[cut]) {
+		cut--
+	}
+	return string(b[:cut]) + "…"
+}
+
 // BinaryScanSkippedMarker is what dcverify writes between a path and its
 // reason when the secret scan could not read a binary file. The wire's one
 // degradation list, stub_ast_degraded, carries both kinds of entry, and the
@@ -569,10 +587,15 @@ func (c *Client) run(ctx context.Context, args []string, stdin string, out any) 
 	}
 
 	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), out); err != nil {
+		// Neither stream is echoed whole. The verifier reads a diff that may
+		// hold a credential, and what it printed instead of JSON is not known
+		// to be free of it; the error reaches the agent and the JSON report.
+		// A bounded head of stderr stays, because that is where the verifier's
+		// own diagnostics (a panic message) go, and the sizes say the rest.
 		if runErr != nil {
-			return fmt.Errorf("verifier failed: %w (stderr: %s)", runErr, bytes.TrimSpace(stderr.Bytes()))
+			return fmt.Errorf("verifier failed: %w (stderr, %d bytes: %s)", runErr, stderr.Len(), boundedHead(stderr.Bytes(), stderrEchoLimit))
 		}
-		return fmt.Errorf("verifier returned unparseable output: %w (%q)", err, stdout.String())
+		return fmt.Errorf("verifier returned unparseable output: %w (%d bytes on stdout)", err, stdout.Len())
 	}
 	// The OK flag is the only thing separating a real clean answer from a reply
 	// that decoded into a zero value — `null` and `{}` both unmarshal without

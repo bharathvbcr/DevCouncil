@@ -183,19 +183,27 @@ func TestAttackLegitUntrackedNamesAreCollected(t *testing.T) {
 	}
 }
 
-// A hard-linked file inside the repo is an ordinary change.
+// A hard-linked file is refused, and the refusal says why. A hard link can
+// share an inode with a file outside the repository, so reading it is a read
+// outside the root; refusing is the security fail-closed choice. The operator
+// has to be able to tell that from a read that failed, so the message names
+// the reason. (Round 1 of the attack expected the bytes to be collected; the
+// owner decided the refusal stays and its message is what is pinned.)
 func TestAttackHardLinkedUntrackedFileIsCollected(t *testing.T) {
 	root := gitRepo(t)
 	writeFile(t, root, "one.txt", "INNOCENT-CONTENT\n")
 	if err := os.Link(filepath.Join(root, "one.txt"), filepath.Join(root, "two.txt")); err != nil {
 		t.Skipf("hard links unsupported: %v", err)
 	}
-	_, diff, _, err := verify.CollectGitState(context.Background(), root)
-	if err != nil {
-		t.Fatalf("hard-linked untracked files inside the repo were refused: %v", err)
+	_, _, _, err := verify.CollectGitState(context.Background(), root)
+	if err == nil {
+		t.Fatal("a hard-linked untracked file was collected without a refusal")
 	}
-	if !strings.Contains(diff, "INNOCENT-CONTENT") {
-		t.Fatal("the bytes are not in the diff")
+	if !strings.Contains(err.Error(), "refused: hard-linked file") {
+		t.Fatalf("the refusal does not say why: %v", err)
+	}
+	if strings.Contains(err.Error(), "INNOCENT-CONTENT") {
+		t.Fatal("the refusal quotes the file's bytes")
 	}
 }
 
@@ -573,4 +581,3 @@ func TestAttackSecretUnderToolStateDirIsNotInvisible(t *testing.T) {
 		benignChange(t, root))
 	requireLooked(t, key, o)
 }
-
