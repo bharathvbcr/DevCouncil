@@ -226,3 +226,52 @@ pub fn f() {
         "a stub after a non-ASCII identifier was not found"
     );
 }
+
+#[test]
+fn a_multiline_block_comment_naming_a_stub_is_not_code() {
+    let body = "\
+macro_rules! work {
+    ($($t:tt)*) => {};
+}
+pub fn f() -> i32 {
+    work!(1, /* a note
+        todo!() would go here
+    */ 2);
+    3
+}
+";
+    assert!(
+        !adv_blocking(body),
+        "text inside a multi-line block comment was read as code"
+    );
+}
+
+#[test]
+fn a_comparison_with_a_todo_identifier_is_not_a_stub() {
+    let body = "\
+macro_rules! work {
+    ($($t:tt)*) => {};
+}
+pub fn f(todo: i32) -> i32 {
+    work!(todo != 3);
+    todo
+}
+";
+    assert!(
+        !adv_blocking(body),
+        "`todo != 3` was read as the todo! macro"
+    );
+}
+
+#[test]
+fn trivia_between_the_macro_name_and_its_bang_is_still_the_macro() {
+    let body = "\
+macro_rules! work {
+    ($($t:tt)*) => {};
+}
+pub fn f() {
+    work!(todo /* why */ !());
+}
+";
+    assert!(adv_blocking(body), "a comment before the bang hid todo!()");
+}

@@ -202,8 +202,10 @@ fn check(
 
     let files = parse_unified(&diff).map_err(|e| {
         format!(
-            "the diff could not be parsed at line {}: {} ({:?})",
-            e.line_number, e.reason, e.line
+            // Never the line: it is diff content, and a diff can hold a
+            // credential. The number and the reason are what is actionable.
+            "the diff could not be parsed at line {}: {}",
+            e.line_number, e.reason
         )
     })?;
 
@@ -351,6 +353,13 @@ fn binary_scan_skipped(path: &str, reason: &str) -> String {
 /// cannot be read degrades the verdict instead of scanning clean. A path the
 /// diff deletes has no working-tree file, so there is nothing to read and it
 /// is not asked for.
+///
+/// A file in a language the stub checks parse is also stub-scanned, from the
+/// bytes just read. git marks a source file binary when it holds a NUL byte or
+/// when `.gitattributes` says `-diff`, and then prints no hunk, so the stub
+/// scan the diff feeds would otherwise never see it. The file's lines are all
+/// treated as added: the diff does not say which changed. A file the tree
+/// could not analyse, or too large for it, is reported degraded like any other.
 fn scan_binary_paths(
     diff: &str,
     files: &[dc_verify::FileDiff],
@@ -359,81 +368,122 @@ fn scan_binary_paths(
     findings: &mut Vec<Finding>,
     degraded: &mut Vec<String>,
 ) {
-    for path in binary_paths_without_hunks(diff) {
-        let normalized = normalize_candidate(&path);
+    for section in binary_sections_without_hunks(diff) {
+        // The diff parser makes one entry per `diff --git` line, in order, and
+        // has already named the file (rename and copy lines included), so the
+        // path comes from there and not from re-reading the header.
+        let Some(parsed) = files.get(section) else {
+            degraded.push(binary_scan_skipped(
+                "a binary section",
+                "the diff parser did not name it",
+            ));
+            continue;
+        };
+        let normalized = normalize_candidate(&parsed.path);
         if !in_scope.iter().any(|p| p == &normalized) {
             continue;
         }
-        let parsed = files
-            .iter()
-            .find(|f| normalize_candidate(&f.path) == normalized);
-        if parsed.is_some_and(|f| !f.added_lines.is_empty()) {
+        if !parsed.added_lines.is_empty() {
             continue;
         }
         match read_binary_post_image(root, &normalized) {
             Ok(text) => {
-                let mut line_no = 0u32;
-                for line in text.split_inclusive('\n') {
-                    line_no = line_no.saturating_add(1);
-                    let line = line.trim_end_matches(['\n', '\r']);
-                    if let Some(secret) = dc_redact::find_secret(line) {
-                        findings.push(Finding {
-                            gate: "secret_scan",
-                            severity: Severity::Blocking,
-                            strength: Strength::Derived,
-                            path: normalized.clone(),
-                            line: line_no.max(1),
-                            evidence: secret.redacted,
-                            message: format!(
-                                "added line contains what looks like a {}; a credential in a commit is \
-                                 compromised even after it is deleted, because the object stays in history",
-                                secret.name
-                            ),
-                        });
-                    }
-                }
+                scan_binary_text(&normalized, &text, findings, degraded);
             }
             Err(reason) => degraded.push(binary_scan_skipped(&normalized, &reason)),
         }
     }
 }
 
-/// Paths whose `diff --git` section contains a binary marker, no hunk, and
-/// does not delete the file.
-///
-/// A section's path is read with [`dc_verify::git_header_path`], the rule the
-/// diff parser names files by, so a name git quotes (a non-ASCII byte, a quote,
-/// a control character) is scanned under the name the scope check judged. The
-/// parser refuses a header it cannot read, so by the time this runs every
-/// header has a name.
-fn binary_paths_without_hunks(diff: &str) -> Vec<String> {
+/// Secret-scans, and for a source file stub-scans, the bytes of one binary-marked path.
+fn scan_binary_text(
+    path: &str,
+    text: &str,
+    findings: &mut Vec<Finding>,
+    degraded: &mut Vec<String>,
+) {
+    let mut line_no = 0u32;
+    for line in text.split_inclusive('\n') {
+        line_no = line_no.saturating_add(1);
+        let line = line.trim_end_matches(['\n', '\r']);
+        if let Some(secret) = dc_redact::find_secret(line) {
+            findings.push(Finding {
+                gate: "secret_scan",
+                severity: Severity::Blocking,
+                strength: Strength::Derived,
+                path: path.to_string(),
+                line: line_no.max(1),
+                evidence: secret.redacted,
+                message: format!(
+                    "added line contains what looks like a {}; a credential in a commit is \
+                     compromised even after it is deleted, because the object stays in history",
+                    secret.name
+                ),
+            });
+        }
+    }
+    if dc_verify::stub_ast::Lang::for_path(path).is_none() {
+        return;
+    }
+    if text.len() > dc_verify::stub_ast::MAX_SOURCE_BYTES {
+        degraded.push(format!(
+            "{path}: {}",
+            dc_verify::stub_ast::Unparsed::TooLarge.as_str()
+        ));
+        return;
+    }
+    let whole = dc_verify::FileDiff {
+        path: path.to_string(),
+        old_path: None,
+        status: dc_verify::ChangeStatus::Added,
+        added_lines: text
+            .lines()
+            .enumerate()
+            .map(|(i, line)| (u32::try_from(i + 1).unwrap_or(u32::MAX), line.to_string()))
+            .collect(),
+        removed_lines: Vec::new(),
+    };
+    let report = detect_stubs_report(&[whole], &|_| None);
+    findings.extend(report.findings);
+    degraded.extend(
+        report
+            .unparsed
+            .iter()
+            .map(|u| format!("{}: {}", u.path, u.reason)),
+    );
+}
+
+/// Indexes, among a diff's `diff --git` sections, of those that hold a binary
+/// marker and no hunk and do not delete the file.
+fn binary_sections_without_hunks(diff: &str) -> Vec<usize> {
     let mut out = Vec::new();
-    let mut path = String::new();
-    let mut in_file = false;
+    let mut index: Option<usize> = None;
     let mut saw_hunk = false;
     let mut saw_binary = false;
     let mut saw_deleted = false;
-    let flush = |path: &str,
-                 in_file: bool,
+    let flush = |index: Option<usize>,
                  saw_hunk: bool,
                  saw_binary: bool,
                  saw_deleted: bool,
-                 out: &mut Vec<String>| {
-        if in_file && saw_binary && !saw_hunk && !saw_deleted && !path.is_empty() {
-            out.push(path.to_string());
+                 out: &mut Vec<usize>| {
+        if let Some(i) = index
+            && saw_binary
+            && !saw_hunk
+            && !saw_deleted
+        {
+            out.push(i);
         }
     };
     for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git ") {
-            flush(&path, in_file, saw_hunk, saw_binary, saw_deleted, &mut out);
-            path = dc_verify::git_header_path(rest).unwrap_or_default();
-            in_file = true;
+        if line.starts_with("diff --git ") {
+            flush(index, saw_hunk, saw_binary, saw_deleted, &mut out);
+            index = Some(index.map_or(0, |i| i + 1));
             saw_hunk = false;
             saw_binary = false;
             saw_deleted = false;
             continue;
         }
-        if !in_file {
+        if index.is_none() {
             continue;
         }
         if line.starts_with("@@") {
@@ -451,7 +501,7 @@ fn binary_paths_without_hunks(diff: &str) -> Vec<String> {
             }
         }
     }
-    flush(&path, in_file, saw_hunk, saw_binary, saw_deleted, &mut out);
+    flush(index, saw_hunk, saw_binary, saw_deleted, &mut out);
     out
 }
 

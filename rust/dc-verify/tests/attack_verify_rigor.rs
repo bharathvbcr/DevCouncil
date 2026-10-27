@@ -265,7 +265,11 @@ fn attack_binary_marked_source_file_is_stub_scanned_or_degraded() {
     .unwrap();
     let diff = "diff --git a/src/work.rs b/src/work.rs\nindex 111..222 100644\nBinary files a/src/work.rs and b/src/work.rs differ\n";
     let run = check(&root.0, "src/work.rs", diff.as_bytes());
-    assert!(run.stdout.contains("\"ok\":true"), "did not run: {}", run.all());
+    assert!(
+        run.stdout.contains("\"ok\":true"),
+        "did not run: {}",
+        run.all()
+    );
     let seen = run.stdout.contains("\"gate\":\"stub_detection\"") || degraded_nonempty(&run.stdout);
     assert!(
         seen,
@@ -283,9 +287,17 @@ fn attack_binary_renamed_with_edits_is_scanned_or_degraded() {
     std::fs::write(root.0.join("new b/blob.bin"), format!("\0{k}\0")).unwrap();
     let diff = "diff --git a/old.bin b/new b/blob.bin\nsimilarity index 80%\nrename from old.bin\nrename to new b/blob.bin\nBinary files a/old.bin and b/new b/blob.bin differ\n";
     let run = check(&root.0, "new b/blob.bin", diff.as_bytes());
-    assert!(run.stdout.contains("\"ok\":true"), "did not run: {}", run.all());
+    assert!(
+        run.stdout.contains("\"ok\":true"),
+        "did not run: {}",
+        run.all()
+    );
     let seen = run.stdout.contains("\"gate\":\"secret_scan\"") || degraded_nonempty(&run.stdout);
-    assert!(seen, "renamed binary with a credential scanned clean: {}", run.stdout);
+    assert!(
+        seen,
+        "renamed binary with a credential scanned clean: {}",
+        run.stdout
+    );
     assert!(!run.all().contains(&k), "reply quotes the credential");
 }
 
@@ -295,7 +307,8 @@ fn attack_binary_in_a_symlinked_parent_directory_is_not_read() {
     let outside = Root::new();
     std::fs::write(outside.0.join("blob.bin"), "OUTSIDE-SENTINEL-BYTES").unwrap();
     std::os::unix::fs::symlink(&outside.0, root.0.join("d")).unwrap();
-    let diff = "diff --git a/d/blob.bin b/d/blob.bin\nBinary files a/d/blob.bin and b/d/blob.bin differ\n";
+    let diff =
+        "diff --git a/d/blob.bin b/d/blob.bin\nBinary files a/d/blob.bin and b/d/blob.bin differ\n";
     let run = check(&root.0, "d/blob.bin", diff.as_bytes());
     assert!(
         !run.all().contains("OUTSIDE-SENTINEL-BYTES"),
@@ -339,7 +352,11 @@ fn attack_stub_scan_reads_nothing_through_a_symlinked_parent() {
     std::os::unix::fs::symlink(&outside.0, root.0.join("d")).unwrap();
     let diff = whole_file("d/x.rs", "pub fn clean() -> u32 {\n    todo!()\n}\n");
     let run = check(&root.0, "d/x.rs", diff.as_bytes());
-    assert!(run.stdout.contains("\"ok\":true"), "did not run: {}", run.all());
+    assert!(
+        run.stdout.contains("\"ok\":true"),
+        "did not run: {}",
+        run.all()
+    );
     assert!(
         run.stdout.contains("\"gate\":\"stub_detection\""),
         "the added todo!() was not found: {}",

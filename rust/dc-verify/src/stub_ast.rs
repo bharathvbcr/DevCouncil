@@ -254,17 +254,28 @@ fn contains_marker(text: &str) -> bool {
     STUB_MARKERS.iter().any(|m| lowered.contains(m))
 }
 
-/// `todo!` or `unimplemented!` in code position on one line.
+/// The first line, counted from 0 within `text`, that `accept` allows and that
+/// holds `todo!` or `unimplemented!` in code position.
 ///
-/// A small lexer, not a parser: it skips what is not code. String literals,
-/// raw strings (`r#"…"#`) and char literals are skipped whole, so a `'"'` does
-/// not open a string that hides what follows it, and a quote inside a raw
-/// string does not close one early. A tick that is not a char literal is a
-/// lifetime and is skipped alone. Whatever is left of an unterminated string or
-/// raw string on this line is not code.
-fn line_has_visible_stub(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
+/// A small lexer, not a parser, and it reads the whole text so that what spans
+/// lines (a string, a raw string, a block comment) is skipped as one thing. It
+/// skips everything that is not code: string literals; raw strings
+/// (`r#"…"#`); char literals, so a `'"'` does not open a string that hides what
+/// follows it; line comments; and block comments, which nest and are skipped
+/// before a quote inside one is looked at. A tick that is not a char literal is
+/// a lifetime and is skipped alone. The macro name may be separated from its
+/// `!` by whitespace or comments (`todo !()`), and must be followed by a
+/// delimiter, so `todo != x` is not a stub. Something left unterminated is not
+/// code.
+fn first_visible_stub_line(text: &str, accept: &dyn Fn(usize) -> bool) -> Option<usize> {
+    let lower = text.to_ascii_lowercase();
     let bytes = lower.as_bytes();
+    let newlines: Vec<usize> = bytes
+        .iter()
+        .enumerate()
+        .filter_map(|(at, &b)| (b == b'\n').then_some(at))
+        .collect();
+    let line_at = |at: usize| newlines.partition_point(|&n| n < at);
     let mut i = 0;
     let mut in_string = false;
     let mut escaped = false;
@@ -295,19 +306,35 @@ fn line_has_visible_stub(line: &str) -> bool {
                         i += 2 + hashes + len;
                         continue;
                     }
-                    None => break,
+                    None => return None,
                 }
             }
-            b'/' if bytes.get(i + 1) == Some(&b'/') => break,
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i = skip_trivia(bytes, i);
+                continue;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i = skip_trivia(bytes, i);
+                continue;
+            }
             _ => {
-                // Bytes, not `lower[i..]`: `i` need not sit on a char boundary,
-                // and slicing the str there panics.
-                for token in ["todo!", "unimplemented!"] {
-                    if bytes[i..].starts_with(token.as_bytes()) {
-                        let boundary = i == 0
-                            || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
-                        if boundary {
-                            return true;
+                let boundary =
+                    i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+                if boundary {
+                    for name in ["todo", "unimplemented"] {
+                        if !bytes[i..].starts_with(name.as_bytes()) {
+                            continue;
+                        }
+                        let bang = skip_trivia(bytes, i + name.len());
+                        if bytes.get(bang) != Some(&b'!') {
+                            continue;
+                        }
+                        let open = skip_trivia(bytes, bang + 1);
+                        if matches!(bytes.get(open), Some(b'(' | b'[' | b'{')) {
+                            let line = line_at(i);
+                            if accept(line) {
+                                return Some(line);
+                            }
                         }
                     }
                 }
@@ -315,7 +342,38 @@ fn line_has_visible_stub(line: &str) -> bool {
         }
         i += 1;
     }
-    false
+    None
+}
+
+/// The offset of the first byte at or after `at` that is not whitespace or the
+/// inside of a comment. An unterminated block comment runs to the end.
+fn skip_trivia(bytes: &[u8], mut at: usize) -> usize {
+    loop {
+        match bytes.get(at) {
+            Some(c) if c.is_ascii_whitespace() => at += 1,
+            Some(b'/') if bytes.get(at + 1) == Some(&b'/') => {
+                while bytes.get(at).is_some_and(|&c| c != b'\n') {
+                    at += 1;
+                }
+            }
+            Some(b'/') if bytes.get(at + 1) == Some(&b'*') => {
+                let mut depth = 1usize;
+                at += 2;
+                while depth > 0 && at < bytes.len() {
+                    if bytes[at..].starts_with(b"/*") {
+                        depth += 1;
+                        at += 2;
+                    } else if bytes[at..].starts_with(b"*/") {
+                        depth -= 1;
+                        at += 2;
+                    } else {
+                        at += 1;
+                    }
+                }
+            }
+            _ => return at,
+        }
+    }
 }
 
 /// Length of the char literal at the start of `s` (which begins with `'`), or
@@ -649,13 +707,11 @@ impl<'a> Walker<'a> {
     /// An added line of `node` whose code contains `todo!` or `unimplemented!`.
     fn visible_stub_line(&self, node: Node<'_>) -> Option<u32> {
         let start = line_of(node);
-        for (offset, line) in self.text(node).lines().enumerate() {
-            let n = start + u32::try_from(offset).unwrap_or(0);
-            if self.added.contains(&n) && line_has_visible_stub(line) {
-                return Some(n);
-            }
-        }
-        None
+        first_visible_stub_line(self.text(node), &|offset| {
+            self.added
+                .contains(&(start + u32::try_from(offset).unwrap_or(0)))
+        })
+        .map(|offset| start + u32::try_from(offset).unwrap_or(0))
     }
 
     // ---- Go ----

@@ -55,11 +55,9 @@ pub struct CoverageError {
 
 impl std::fmt::Display for CoverageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "line {}: {} ({:?})",
-            self.line_number, self.reason, self.line
-        )
+        // The line is not printed: a coverage file names files and functions,
+        // and an error reaches the agent and the JSON reply.
+        write!(f, "line {}: {}", self.line_number, self.reason)
     }
 }
 
