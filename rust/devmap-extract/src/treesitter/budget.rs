@@ -30,22 +30,31 @@ thread_local! {
 /// only reason it was invisible; extending the bound past the walk — the point
 /// of this type — makes that stale value load-bearing. Tying arm and disarm to
 /// a scope means the invariant cannot be broken by adding a `return`.
-pub(super) struct BudgetGuard;
+///
+/// A guard armed *inside* another one — an embedded script, a Kotlin loss
+/// recovery: an extraction run by an extraction — gives the outer deadline back
+/// when it drops. It used to leave the thread disarmed, so every phase of the
+/// outer file that ran after the inner call checked a clock that was off.
+pub(super) struct BudgetGuard {
+    /// The deadline that was armed when this guard was, if one was.
+    outer: Option<std::time::Instant>,
+}
 
 impl BudgetGuard {
     pub(super) fn arm(deadline: std::time::Instant) -> Self {
+        let outer = WALK_DEADLINE.with(|slot| slot.get());
         reset_scope_locals();
         WALK_DEADLINE.with(|slot| slot.set(Some(deadline)));
         WALK_OVERRAN.with(|slot| slot.set(false));
         PARENT_STEPS.with(|slot| slot.set(0));
         NESTING_CAPS.with(|caps| caps.borrow_mut().clear());
-        BudgetGuard
+        BudgetGuard { outer }
     }
 }
 
 impl Drop for BudgetGuard {
     fn drop(&mut self) {
-        WALK_DEADLINE.with(|slot| slot.set(None));
+        WALK_DEADLINE.with(|slot| slot.set(self.outer));
         // Retain the incomplete-walk signal until the next extraction arms
         // its budget. The publication gate must not lose a helper's refusal.
     }

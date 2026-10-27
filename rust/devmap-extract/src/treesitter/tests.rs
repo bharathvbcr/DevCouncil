@@ -4124,3 +4124,52 @@ fn a_kotlin_loss_scan_stopped_by_the_deadline_fails_the_outcome() {
         "{outcome:?}"
     );
 }
+
+thread_local! {
+    /// Whether the thread's walk deadline was armed when the finalization hook
+    /// ran, which is after the Kotlin loss recovery and every other phase.
+    static DEADLINE_ARMED_AT_FINISH: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn note_deadline_at_finish() {
+    DEADLINE_ARMED_AT_FINISH
+        .with(|seen| seen.set(Some(WALK_DEADLINE.with(|slot| slot.get().is_some()))));
+}
+
+/// A recovery runs an extraction inside the file's extraction. Its budget guard
+/// used to disarm the thread's deadline when it dropped, so every phase of the
+/// outer file after it (and the publication gate's helpers) ran against a clock
+/// that was off. The outer deadline is armed again afterwards. Fails against
+/// `974edaa3`.
+#[test]
+fn the_walk_deadline_is_armed_again_after_a_kotlin_recovery() {
+    struct ClearHook;
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            EXTRACTION_FINISH_HOOK.with(|hook| hook.set(None));
+        }
+    }
+    let _clear = ClearHook;
+    DEADLINE_ARMED_AT_FINISH.with(|seen| seen.set(None));
+    EXTRACTION_FINISH_HOOK.with(|slot| slot.set(Some(note_deadline_at_finish)));
+    let extraction = extract_treesitter_with_budget(
+        "A.kt",
+        "kotlin",
+        "@A\n@B\nprivate fun f() {}\nfun after() {}\n",
+        std::time::Duration::from_secs(30),
+    );
+    assert!(
+        extraction
+            .symbols
+            .iter()
+            .any(|symbol| symbol.qualified_name == "A.kt::f"),
+        "the statement was recovered, so an inner extraction ran: {:?}",
+        extraction.diagnostics
+    );
+    assert_eq!(
+        DEADLINE_ARMED_AT_FINISH.with(|seen| seen.get()),
+        Some(true),
+        "the deadline must be armed when the outer file finishes"
+    );
+}
