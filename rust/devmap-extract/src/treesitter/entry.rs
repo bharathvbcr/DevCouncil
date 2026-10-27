@@ -525,6 +525,7 @@ pub(super) fn extract_treesitter_before_deadline(
                             source,
                             false,
                             false,
+                            true,
                             &crate::kotlinloss::LostScan::default(),
                         ),
                         ParseOutcome::Partial { .. }
@@ -578,8 +579,14 @@ pub(super) fn extract_treesitter_before_deadline(
                         .map(|region| (region.range.start_byte, region.range.end_byte))
                         .collect(),
                 );
-                let parse_outcome =
-                    parse_outcome_of(root, source, is_metal_path(path), lang == "python", &lost);
+                let parse_outcome = parse_outcome_of(
+                    root,
+                    source,
+                    is_metal_path(path),
+                    lang == "python",
+                    lang == "kotlin",
+                    &lost,
+                );
 
                 let mut symbols = Vec::new();
                 let mut imports = Vec::new();
@@ -1185,6 +1192,7 @@ pub(super) fn parse_outcome_of(
     source: &str,
     is_metal: bool,
     is_python: bool,
+    is_kotlin: bool,
     lost: &crate::kotlinloss::LostScan,
 ) -> ParseOutcome {
     if lost.deadline_passed {
@@ -1254,17 +1262,29 @@ pub(super) fn parse_outcome_of(
                 }
             }
         }
-        // A node that carries an error no node shows: the parser inserted a
-        // zero-width token that is hidden from the tree (a grammar's
-        // `_`-prefixed token), so the cost is on this node and on none of its
-        // children, and the search for an ERROR or MISSING node above comes
-        // back empty. Measured on tree-sitter-kotlin-ng, `class A { fun f() =
-        // if (c) { a() } else { b() } }` is `has_error()` on the file, the
-        // class and its body and on nothing below, and reading what the hidden
-        // token should have separated made the `if` branch a lambda. The
-        // file is not clean and no consumer may be told it is, so the node's
-        // own range is charged.
-        if node.has_error() && !node.is_error() && !node.is_missing() && !child_has_error {
+        // Kotlin only: a node that carries an error no node shows. The parser
+        // inserted a zero-width token that is hidden from the tree (a
+        // grammar's `_`-prefixed token), so the cost is on this node and on
+        // none of its children, and the search for an ERROR or MISSING node
+        // above comes back empty. Measured on tree-sitter-kotlin-ng, `class A {
+        // fun f() = if (c) { a() } else { b() } }` is `has_error()` on the
+        // file, the class and its body and on nothing below, and reading what
+        // the hidden token should have separated made the `if` branch a
+        // lambda: phantom `$0` and `it` locals. The file is not clean and no
+        // consumer may be told it is, so the node's own range is charged.
+        //
+        // Not for other grammars: they report `has_error()` with no visible
+        // child in valid code (Swift `b as? String ?? "x"`, a C directive or a
+        // Go declaration at the end of a file with no newline), and charging
+        // those made 4 Vani Swift files and 1 Curio file Partial with no graph
+        // change. Another grammar earns the rule by a measured wrong reading,
+        // not by sharing the blind spot.
+        if is_kotlin
+            && node.has_error()
+            && !node.is_error()
+            && !node.is_missing()
+            && !child_has_error
+        {
             error_ranges.push(TextRange {
                 start_byte: node.start_byte(),
                 end_byte: node.end_byte(),
