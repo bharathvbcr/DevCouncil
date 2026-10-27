@@ -2595,6 +2595,11 @@ fn normalize_within(
     match node.kind() {
         "user_type" => {
             let name = user_type_name(node, source)?;
+            // `Store.Type` and `Store.Protocol` are metatypes. The last segment
+            // is a keyword of the spelling, not a type called `Type`.
+            if !single_segment(node) && matches!(name.as_str(), "Type" | "Protocol") {
+                return None;
+            }
             if resolve && single_segment(node) {
                 if let Some(target) = alias_target(node, source, &name) {
                     return Some(target);
@@ -4158,6 +4163,27 @@ mod tests {
             assert_eq!(ty_of(&found, "store"), None, "{source}");
             assert_eq!(ty_of(&found, "svc"), None, "{source}");
         }
+    }
+
+    #[test]
+    fn a_metatype_is_no_type_named_type() {
+        for written in [
+            "Store.Type",
+            "Store.Protocol",
+            "Store.Type?",
+            "Mod.Store.Type",
+        ] {
+            let source = format!("struct Store {{}}\nfunc t(_ store: {written}) {{ let s = 1 }}");
+            let found = bound(&source, "t");
+            assert!(found.contains_key("store"), "{written}");
+            assert_eq!(ty_of(&found, "store"), None, "{written}");
+        }
+        // A nested type written through its holder keeps its last segment.
+        let nested = "struct Outer { struct Store {} }\nfunc t(_ store: Outer.Store) {}";
+        assert_eq!(
+            ty_of(&bound(nested, "t"), "store").as_deref(),
+            Some("Store")
+        );
     }
 
     #[test]
