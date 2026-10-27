@@ -4,6 +4,8 @@
 //! House contract: a wrong type or edge is worse than an abstention; the lane
 //! must not lose a binding main has; output is deterministic; walks are bounded.
 
+use std::time::Duration;
+
 use devmap_extract::extract_file;
 use devmap_extract::model::{LocalBinding, ReferenceKind};
 
@@ -270,10 +272,6 @@ fn a_users_generic_parameter_is_not_the_wrapped_type() {
 
 // ------------------------------------------- determinism and bounded walks
 
-fn serialized(source: &str) -> String {
-    serde_json::to_string(&extract_file("a.swift", source)).expect("serializes")
-}
-
 /// 8k wrapper-attributed properties (past the 20_000-node cap of the wrapper
 /// index): the same bytes twice, and a clean parse. A small file with the same
 /// declarations does type them, so the abstention is the cap and not the input.
@@ -291,17 +289,24 @@ fn a_file_of_many_wrapper_properties_extracts_the_same_twice_and_abstains_past_t
     let small = build(50);
     assert_eq!(field(&small, "p49").as_deref(), Some("Client"));
     let big = build(8_000);
-    let first = serialized(&big);
-    assert_eq!(first, serialized(&big), "extraction is not deterministic");
+    // A generous budget instead of the 5 s default: the default flaked in a
+    // debug build at load ~19. A per-property walk is quadratic here and still
+    // overruns 120 s; a linear one does not, at any load seen on this machine.
+    let generous =
+        || devmap_extract::extract_file_with_budget("a.swift", &big, Duration::from_secs(120));
+    let first = serde_json::to_string(&generous()).expect("serializes");
+    let second = serde_json::to_string(&generous()).expect("serializes");
+    assert_eq!(first, second, "extraction is not deterministic");
     assert!(
         !first.contains("budget exceeded"),
         "8k properties exhausted the parse budget"
     );
-    assert_eq!(
-        field(&big, "p7999"),
-        None,
-        "past the cap the wrapper index is unreadable"
-    );
+    let typed_last = generous()
+        .references
+        .into_iter()
+        .filter(|reference| reference.kind == ReferenceKind::Type)
+        .any(|reference| reference.assigned_to.as_deref() == Some("p7999"));
+    assert!(!typed_last, "past the cap the wrapper index is unreadable");
 }
 
 /// One function of 1500 `let (a, b) = makePair()` statements (50 KB). Each
