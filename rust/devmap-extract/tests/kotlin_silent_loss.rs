@@ -358,6 +358,54 @@ fn a_source_that_spells_the_wrappers_name_is_left_charged() {
         .any(|symbol| symbol.qualified_name == "A.kt::f"));
 }
 
+/// A file whose own first bytes spell the wrapper's header is an ordinary file
+/// with an ordinary class: the declaration owner stops treating that class as
+/// the wrapper unless a recovery is running.
+#[test]
+fn a_real_class_that_spells_the_wrappers_header_is_an_ordinary_class() {
+    let source = "class DevmapKotlinRecoveryWrapper {\n    fun m() {}\n}\nfun after() {}\n";
+    let extraction = extract_file("A.kt", source);
+    assert!(matches!(extraction.parse_outcome, ParseOutcome::Clean));
+    let mut names: Vec<&str> = extraction
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.kind != SymbolKind::File)
+        .map(|symbol| symbol.qualified_name.as_str())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "A.kt::DevmapKotlinRecoveryWrapper",
+            "A.kt::DevmapKotlinRecoveryWrapper.m",
+            "A.kt::after"
+        ]
+    );
+}
+
+/// A one-line class body with a member is a whole-file grammar ERROR, so a
+/// swallowed statement that holds one cannot be re-parsed: the wrapper has a
+/// syntax error. It stays charged and nothing is emitted for it.
+#[test]
+fn a_swallowed_class_with_a_one_line_body_stays_charged() {
+    let swallowed = format!("{STACK}private class Q {{ fun m() {{}} }}");
+    let source = format!("{swallowed}\nfun after() {{}}\n");
+    let extraction = extract_file("A.kt", &source);
+    assert_eq!(
+        error_ranges(&extraction),
+        vec![range_of(&source, &swallowed)]
+    );
+    assert!(extraction.decl_gaps.is_empty());
+    assert!(
+        extraction
+            .diagnostics
+            .iter()
+            .any(|note| note.contains("not recovered")),
+        "{:?}",
+        extraction.diagnostics
+    );
+}
+
 /// Recovery is a pure function of the source.
 #[test]
 fn recovery_is_deterministic() {

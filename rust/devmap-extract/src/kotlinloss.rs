@@ -152,13 +152,17 @@ pub(crate) fn detect_capped(root: Node, source: &str, cap: usize) -> LostScan {
         let descend = !node.is_error();
         if node.child_count() == 0 && node.kind() == "identifier" {
             let (start, end) = (node.start_byte(), node.end_byte());
-            if end > start && end - start <= LONGEST_KEYWORD && !follows_double_colon(node) {
+            if end > start && end - start <= LONGEST_KEYWORD {
                 let word = bytes.get(start..end).unwrap_or_default();
                 if let Some(keyword) = HARD_KEYWORDS
                     .iter()
                     .find(|keyword| keyword.as_bytes() == word)
                 {
-                    record(node, start, keyword, &mut found);
+                    // After the spelling test, so the sibling hop is paid only
+                    // by an identifier that is spelled like a keyword.
+                    if !follows_double_colon(node) {
+                        record(node, start, keyword, &mut found);
+                    }
                 }
             }
         }
@@ -280,8 +284,15 @@ impl Drop for DepthGuard {
 /// declaration it is: `f`, never `Wrapper.f`. Asking here, in the one place the
 /// declaration identity is decided, is what keeps a recovered symbol's
 /// `qualified_name` and its calls' `caller_symbol` from drifting.
+///
+/// Only while a recovery is running: a file whose own first bytes spell the
+/// wrapper's header is an ordinary file with an ordinary class, and the outer
+/// extraction must not drop it.
 pub(crate) fn is_recovery_wrapper(node: Node, source: &str) -> bool {
-    node.start_byte() == 0 && node.kind() == "class_declaration" && source.starts_with(WRAPPER_OPEN)
+    node.start_byte() == 0
+        && node.kind() == "class_declaration"
+        && source.starts_with(WRAPPER_OPEN)
+        && INSIDE_RECOVERY.with(|inside| inside.get())
 }
 
 /// Re-derive the declarations the grammar swallowed, and merge them.
