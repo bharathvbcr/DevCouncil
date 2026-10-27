@@ -174,21 +174,22 @@ fn names(e: &Extraction) -> Vec<String> {
 const TAIL: &str = "\nfun tail() { helper() }\nfun helper() {}\n";
 const AFTER: &str = "fun after(a: Int) {\n    val loc = 1\n    val d = helper()\n}\n";
 
-/// A swallowed one-line class whose body holds a member. The recovery cannot
-/// prove it (the wrapper reads the one-line body as an expression), so it stays
-/// charged. The expression reading files `m` as a top-level function.
-const U_CLASS: &str = "@A\n@B\nprivate class Q { fun m(a: Int) { val loc = helper() } }";
+/// A swallowed one-line class whose body holds a member and has no space before
+/// its last `}`, so the row 16 rewrite has no room for a separator and the
+/// recovery cannot prove it: it stays charged. The expression reading files `m`
+/// as a top-level function. (With a space there, the wrapper repair reads it.)
+const U_CLASS: &str = "@A\n@B\nprivate class Q { fun m(a: Int) { val loc = helper() }}";
 
 /// Shapes the recovery cannot prove, as (label, swallowed text).
 fn unrecoverable() -> Vec<(&'static str, &'static str)> {
     vec![
         ("one-line-class-member", U_CLASS),
-        ("one-line-interface", "@A\n@B\nprivate interface I { fun m(): Int }"),
-        ("nested-one-liner", "@A\n@B\nprivate class Q { class In { fun d() {} } }"),
-        ("one-line-object-lambda", "@A\n@B\nprivate object O { val x = run { helper() } }"),
+        ("one-line-interface", "@A\n@B\nprivate interface I { fun m(): Int}"),
+        ("nested-one-liner", "@A\n@B\nprivate class Q { class In { fun d() {}}}"),
+        ("one-line-object-lambda", "@A\n@B\nprivate object O { val x = run { helper() }}"),
         (
             "lambda-with-calls",
-            "@A\n@B\nprivate class Q { val x = listOf(1).map { helper(it) }\n fun m() { Foo().apply { bar() } } }",
+            "@A\n@B\nprivate class Q { val x = listOf(1).map { helper(it) }\n fun m() { Foo().apply { bar() }}}",
         ),
         (
             "inner-swallowed-in-fun",
@@ -319,7 +320,7 @@ fn break_attack2_nested_region_leaves_phantom_scopes_and_locals() {
     for (label, shape) in [
         (
             "class member named like the enclosing function",
-            "@A\n@B\nprivate class Q { fun g(a: Int) { val loc = helper() } }",
+            "@A\n@B\nprivate class Q { fun g(a: Int) { val loc = helper() }}",
         ),
         (
             "fun with a trailing lambda",
@@ -337,7 +338,7 @@ fn break_attack2_nested_region_leaves_phantom_scopes_and_locals() {
 /// region leaves a receiver row for a lambda that is no longer published.
 #[test]
 fn break_attack2_phantom_scope_receiver_survives() {
-    let shape = "@A\n@B\nprivate class Q { fun m() { with(Foo()) { bar() } } }";
+    let shape = "@A\n@B\nprivate class Q { fun m() { with(Foo()) { bar() }}}";
     let (_, diffs) = against_control("val before = 1\n", shape, TAIL, &["scope_receivers"]);
     assert!(diffs.is_empty(), "{}", diffs.join("\n"));
 }

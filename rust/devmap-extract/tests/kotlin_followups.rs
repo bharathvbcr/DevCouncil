@@ -947,7 +947,6 @@ fn followup1_a_hidden_missing_separator_reads_an_if_branch_as_a_lambda() {
 /// (announced as Partial, but lost) although `;` before the brace reads it
 /// correctly and the annotation-free spelling is repaired.
 #[test]
-#[ignore = "follow-up 2, fixed in its own commit"]
 fn followup2_an_annotation_with_arguments_before_a_one_line_class_is_repaired() {
     let mut failures = Vec::new();
     for (label_, source, want) in [
@@ -1107,4 +1106,111 @@ fn a_mutated_fragment_is_never_clean_when_its_multi_line_twin_is_not() {
         }
         assert!(masked.is_empty(), "seed {seed}: {}", masked.join("\n"));
     }
+}
+
+/// What follow-up 2 keeps true: an annotated one-line class that is recovered
+/// reads exactly as its multi-line twin on every table, and the rewrite is what
+/// recovered it (a class the grammar read as an expression has no error of its
+/// own to start from).
+#[test]
+fn an_annotated_one_line_class_equals_its_multi_line_twin_on_every_table() {
+    let mut failures = Vec::new();
+    for (label_, one, twin) in [
+        (
+            "string argument",
+            "fun before() {}\n@Suppress(\"unused\") class A { val x = 1 }\n",
+            "fun before() {}\n@Suppress(\"unused\") class A {\n    val x = 1\n}\n",
+        ),
+        (
+            "numeric argument and a method",
+            "@Ann(1) class A { fun f() { g() } }\n",
+            "@Ann(1) class A {\n    fun f() { g() }\n}\n",
+        ),
+        (
+            "stacked annotations",
+            "@A\n@B\nprivate class Q { fun m(a: Int) { val loc = helper() } }\n",
+            "@A\n@B\nprivate class Q {\n    fun m(a: Int) { val loc = helper() }\n}\n",
+        ),
+        (
+            "object with a lambda",
+            "@Suppress(\"unused\") object O { val x = run { helper() } }\n",
+            "@Suppress(\"unused\") object O {\n    val x = run { helper() }\n}\n",
+        ),
+        (
+            "interface",
+            "@Suppress(\"unused\") interface I { fun f() }\n",
+            "@Suppress(\"unused\") interface I {\n    fun f()\n}\n",
+        ),
+        (
+            "two annotated one-liners",
+            "@Ann(1) class A { val x = 1 }\n@Ann(2) class B { val y = 2 }\n",
+            "@Ann(1) class A {\n    val x = 1\n}\n@Ann(2) class B {\n    val y = 2\n}\n",
+        ),
+    ] {
+        let (one, twin) = (format!("{one}{SUFFIX}"), format!("{twin}{SUFFIX}"));
+        let (a, b) = (ex("A.kt", &one), ex("A.kt", &twin));
+        if !clean(&a) || !clean(&b) {
+            failures.push(format!(
+                "{label_}: one-line {} twin {}",
+                label(&a, &one),
+                label(&b, &twin)
+            ));
+            continue;
+        }
+        if a.recovered_decl_ranges.is_empty() {
+            failures.push(format!("{label_}: not recovered by a repair"));
+        }
+        failures.extend(
+            table_diffs(&a, &b)
+                .into_iter()
+                .map(|d| format!("{label_}: {d}")),
+        );
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// An annotated one-line class with a real error stays Partial and publishes
+/// nothing its multi-line twin does not: the repair is kept only when the
+/// re-parse is fully clean.
+#[test]
+fn an_annotated_one_line_class_with_a_real_error_stays_partial() {
+    for (one, twin) in [
+        (
+            "@Ann(1) class A { val x = 1 val y = 2 }\n",
+            "@Ann(1) class A {\n    val x = 1 val y = 2\n}\n",
+        ),
+        (
+            "@Ann(1) class A { val x = }\n",
+            "@Ann(1) class A {\n    val x =\n}\n",
+        ),
+        (
+            "@Ann(1) class A { fun f( }\n",
+            "@Ann(1) class A {\n    fun f(\n}\n",
+        ),
+    ] {
+        let (one, twin) = (format!("{one}{SUFFIX}"), format!("{twin}{SUFFIX}"));
+        let (a, b) = (ex("A.kt", &one), ex("A.kt", &twin));
+        assert!(!clean(&b), "twin {twin:?} was Clean");
+        assert!(!clean(&a), "{one:?} was reported Clean");
+        assert!(a.recovered_decl_ranges.is_empty(), "{one:?}");
+    }
+}
+
+/// A stray `}` after an annotated one-line class is a real error beside a class
+/// that is recovered whole: the file is Partial and the range names the brace.
+#[test]
+fn a_stray_brace_after_an_annotated_one_line_class_is_still_charged() {
+    let source = format!("@Ann(1) class A {{ val x = 1 }} }}\n{SUFFIX}");
+    let e = ex("A.kt", &source);
+    let ParseOutcome::Partial { error_ranges, .. } = &e.parse_outcome else {
+        panic!("reported {}", label(&e, &source));
+    };
+    let stray = source.rfind("} }").unwrap() + 2;
+    assert!(
+        error_ranges
+            .iter()
+            .any(|r| r.start_byte <= stray && stray < r.end_byte.max(r.start_byte + 1)),
+        "no error range covers the stray brace: {}",
+        label(&e, &source)
+    );
 }
