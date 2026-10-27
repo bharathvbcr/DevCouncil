@@ -187,6 +187,9 @@ fn calls_inside_a_recovered_body_belong_to_the_recovered_function() {
     );
 }
 
+/// `(scope, local)` pairs and `(caller, callee)` pairs of an extraction.
+type Scoped = (Vec<(String, String)>, Vec<(Option<String>, String)>);
+
 /// What the extractor derives from a body (its locals and the lambdas inside
 /// it) is filed under the function's own scope, the same string the function's
 /// qualified name and its calls' `caller_symbol` use. A swallowed function and
@@ -206,9 +209,7 @@ fn a_recovered_body_is_scoped_exactly_as_an_ordinary_one_is() {
         recovered.diagnostics
     );
     assert!(matches!(plain.parse_outcome, ParseOutcome::Clean));
-    let scopes = |extraction: &Extraction,
-                  name: &str|
-     -> (Vec<(String, String)>, Vec<(Option<String>, String)>) {
+    let scopes = |extraction: &Extraction, name: &str| -> Scoped {
         let mut locals: Vec<(String, String)> = extraction
             .scope_locals
             .iter()

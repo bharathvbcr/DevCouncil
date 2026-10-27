@@ -4078,3 +4078,49 @@ fn linked_grammar_keys_cover_every_grammar_for_arm() {
     );
     assert_eq!(count, linked_grammar_keys().len());
 }
+
+/// The Kotlin loss detector's two ways of not finishing are reported by the
+/// outcome, never read as "nothing lost".
+fn kotlin_root_outcome(lost: &crate::kotlinloss::LostScan) -> (usize, ParseOutcome) {
+    let source = "fun f() {}\n";
+    let (_, language) = grammar_for("kotlin").expect("kotlin grammar");
+    let mut parser = Parser::new();
+    parser.set_language(&language).expect("load grammar");
+    let tree = parser.parse(source, None).expect("tree");
+    (
+        source.len(),
+        parse_outcome_of(tree.root_node(), source, false, false, lost),
+    )
+}
+
+#[test]
+fn a_kotlin_loss_scan_stopped_by_its_node_cap_charges_the_whole_file() {
+    let lost = crate::kotlinloss::LostScan {
+        capped: true,
+        ..Default::default()
+    };
+    let (len, outcome) = kotlin_root_outcome(&lost);
+    let ParseOutcome::Partial { error_ranges, .. } = outcome else {
+        panic!("a capped scan is not Clean: {outcome:?}");
+    };
+    assert_eq!(
+        error_ranges,
+        vec![TextRange {
+            start_byte: 0,
+            end_byte: len
+        }]
+    );
+}
+
+#[test]
+fn a_kotlin_loss_scan_stopped_by_the_deadline_fails_the_outcome() {
+    let lost = crate::kotlinloss::LostScan {
+        deadline_passed: true,
+        ..Default::default()
+    };
+    let (_, outcome) = kotlin_root_outcome(&lost);
+    assert!(
+        matches!(&outcome, ParseOutcome::Failed { reason } if reason.contains("budget")),
+        "{outcome:?}"
+    );
+}
