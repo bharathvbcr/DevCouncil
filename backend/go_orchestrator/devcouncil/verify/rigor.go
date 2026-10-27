@@ -25,6 +25,7 @@ package verify
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -133,6 +134,30 @@ func runRigorGates(ctx context.Context, in Input, taskID string, planned []strin
 			coverageReason)
 		out.unavailable = true
 		return out
+	}
+	// A name list with an empty body is not "nothing changed". git diff HEAD
+	// omits untracked files and dirty submodules; skipping here used to verify
+	// a tree that had never been scanned. Blocking, not a skip: a check that
+	// could not include those bytes must not look like a check that passed.
+	if strings.TrimSpace(in.DiffContent) == "" && len(in.ChangedFiles) > 0 {
+		return rigorOutcome{
+			gaps: []Gap{{
+				ID:       StableGapID(taskID, "RIGOR"),
+				Severity: "high",
+				GapType:  "rigor_check_unavailable",
+				TaskID:   taskID,
+				Description: "The rigor gates (stub detection, secret scanning, diff coverage) " +
+					"did not run: git named changed paths but the diff body was empty, so those bytes were not scanned.",
+				Evidence: []string{fmt.Sprintf("changed paths with an empty diff: %d", len(in.ChangedFiles))},
+				RecommendedFix: "Re-verify after the diff includes the untracked files and dirty-submodule " +
+					"contents. Until it does, this change has not been scanned for credentials or placeholders.",
+				Blocking: true,
+			}},
+			applied:               []string{},
+			skippedReason:         "",
+			coverageMeasured:      false,
+			coverageSkippedReason: coverageReason,
+		}
 	}
 	if in.DiffEmpty || strings.TrimSpace(in.DiffContent) == "" {
 		// Not a failure. The gates read added lines, and there are none.

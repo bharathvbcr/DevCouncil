@@ -100,6 +100,132 @@ func (s *GitSession) dirtySubmodules(ctx context.Context, depth int, pathspecs [
 	return dirty, nil
 }
 
+// SubmoduleWorktreeFiles names the tracked files a dirty submodule has changed,
+// as superproject-relative paths. The listing is the guarded
+// `diff HEAD --name-only -z` this session already uses: the superproject's
+// git, the submodule's filters and fsmonitor not run, symlink gitlinks refused.
+// A deletion (named, not on disk) is omitted. A symlink, a path that escapes
+// the submodule, or a read that fails is an error — never a followed read and
+// never a partial list reported as complete.
+func (s *GitSession) SubmoduleWorktreeFiles(ctx context.Context, submodulePath string) ([]string, error) {
+	if !filepath.IsLocal(filepath.FromSlash(submodulePath)) {
+		return nil, fmt.Errorf("refusing submodule path %q", submodulePath)
+	}
+	return s.submoduleWorktreeFiles(ctx, submodulePath, 1)
+}
+
+func (s *GitSession) submoduleWorktreeFiles(ctx context.Context, submodulePath string, depth int) ([]string, error) {
+	if depth > maxSubmoduleDepth {
+		return nil, fmt.Errorf("submodules under %s nest deeper than %d; refusing to report a partial answer", s.root, maxSubmoduleDepth)
+	}
+	dir, ok, err := s.submoduleDir(submodulePath)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("submodule %s is not a checked-out directory", submodulePath)
+	}
+	sub := &GitSession{root: dir, git: s.git}
+	listing, err := sub.output(ctx, 1<<20, "diff", "HEAD", "--name-only", "-z")
+	if err != nil {
+		return nil, fmt.Errorf("submodule %s: %w", submodulePath, err)
+	}
+	var out []string
+	seen := map[string]struct{}{}
+	add := func(rel string) {
+		if _, ok := seen[rel]; ok {
+			return
+		}
+		seen[rel] = struct{}{}
+		out = append(out, rel)
+	}
+	for _, raw := range bytes.Split(listing, []byte{0}) {
+		name := strings.TrimSpace(strings.ReplaceAll(string(raw), "\\", "/"))
+		if name == "" {
+			continue
+		}
+		if !filepath.IsLocal(filepath.FromSlash(name)) {
+			return nil, fmt.Errorf("submodule %s names %q, which is not a plain path", submodulePath, name)
+		}
+		info, missing, serr := lstatWithin(dir, name)
+		if serr != nil {
+			return nil, fmt.Errorf("submodule %s: %s", submodulePath, serr.Error())
+		}
+		if missing {
+			continue
+		}
+		rel := pathJoinSlash(submodulePath, name)
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("refusing to follow symlink %s", rel)
+		}
+		if info.IsDir() {
+			nested, nerr := sub.submoduleWorktreeFiles(ctx, name, depth+1)
+			if nerr != nil {
+				return nil, nerr
+			}
+			for _, n := range nested {
+				add(pathJoinSlash(submodulePath, n))
+			}
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("submodule %s: %s is not a regular file", submodulePath, name)
+		}
+		add(rel)
+	}
+	// Name-only is run with --ignore-submodules=dirty, so a nested dirty
+	// submodule is not in the listing above. Ask the same guarded walk
+	// DirtySubmodules uses, one level down, and do not reset its depth.
+	nested, err := sub.dirtySubmodules(ctx, depth, nil)
+	if err != nil {
+		return nil, fmt.Errorf("submodule %s: %w", submodulePath, err)
+	}
+	for _, name := range nested {
+		inner, err := sub.submoduleWorktreeFiles(ctx, name, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		for _, n := range inner {
+			add(pathJoinSlash(submodulePath, n))
+		}
+	}
+	return out, nil
+}
+
+// lstatWithin stats name under dir without following a symlink at any component.
+// missing is a final component that is not on disk (a deletion).
+func lstatWithin(dir, name string) (info fs.FileInfo, missing bool, err error) {
+	current := dir
+	parts := strings.Split(filepath.FromSlash(name), string(filepath.Separator))
+	for i, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return nil, false, fmt.Errorf("%q is not a plain path", name)
+		}
+		current = filepath.Join(current, part)
+		info, err = os.Lstat(current)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) && i == len(parts)-1 {
+				return nil, true, nil
+			}
+			return nil, false, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return info, false, fmt.Errorf("refusing to follow symlink %s", name)
+		}
+		if i < len(parts)-1 && !info.IsDir() {
+			return nil, false, fmt.Errorf("%s is not a directory", name)
+		}
+	}
+	return info, false, nil
+}
+
+func pathJoinSlash(parent, name string) string {
+	if parent == "" {
+		return name
+	}
+	return parent + "/" + strings.TrimPrefix(name, "/")
+}
+
 // submoduleDir returns the checked-out directory of the gitlink at path. ok
 // is false for a gitlink that is not checked out.
 func (s *GitSession) submoduleDir(path string) (string, bool, error) {

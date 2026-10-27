@@ -464,6 +464,10 @@ func CollectGitState(ctx context.Context, root string) (changed []string, diff s
 		}
 		diff = string(diffBytes)
 	}
+	diff, err = attachMissingDiffBytes(ctx, git, root, changed, diff)
+	if err != nil {
+		return nil, "", true, err
+	}
 	empty = len(changed) == 0 && strings.TrimSpace(diff) == ""
 	return changed, diff, empty, nil
 }

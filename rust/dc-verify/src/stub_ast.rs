@@ -254,6 +254,45 @@ fn contains_marker(text: &str) -> bool {
     STUB_MARKERS.iter().any(|m| lowered.contains(m))
 }
 
+/// `todo!` or `unimplemented!` in code position on one line.
+fn line_has_visible_stub(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut i = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            match b {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'/' if bytes.get(i + 1) == Some(&b'/') => break,
+            _ => {
+                for token in ["todo!", "unimplemented!"] {
+                    if lower[i..].starts_with(token) {
+                        let boundary = i == 0
+                            || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+                        if boundary {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Whether a string literal's text reads as "this is not written yet".
 fn placeholder_text(text: &str) -> bool {
     let lowered = text.to_ascii_lowercase();
@@ -403,10 +442,33 @@ impl<'a> Walker<'a> {
                     .unwrap_or("");
                 match name {
                     "todo" | "unimplemented" => self.placeholder(node, &format!("{name}!()")),
-                    "panic" if self.has_placeholder_string(node) => {
+                    "panic" if self.panic_is_placeholder(node) => {
                         self.placeholder(node, "panic!(\"TODO\")")
                     }
+                    // A wrapper whose own name is not a stub, but whose token
+                    // tree still shows `todo!` / `unimplemented!`.
+                    _ if self.visible_stub_line(node).is_some() => {
+                        self.placeholder(node, "wrapper macro")
+                    }
                     _ => {}
+                }
+            }
+            // `macro_rules` bodies are token trees, not expanded invocations,
+            // so `unimplemented!()` inside one is not a `macro_invocation`.
+            // The text is still on an added line; that is the stub.
+            "macro_definition" => {
+                if let Some(line) = self.visible_stub_line(node) {
+                    self.placeholder_finding(
+                        node,
+                        Severity::Blocking,
+                        "added code whose body is a wrapper around `todo!` or `unimplemented!`; the task is not implemented".to_string(),
+                    );
+                    // The finding is anchored on the definition. Move it to
+                    // the line that actually carries the stub when that line
+                    // was added, so a marker above the macro covers it.
+                    if let Some(found) = self.out.last_mut() {
+                        found.line = line;
+                    }
                 }
             }
             "function_item" => self.rust_function(node),
@@ -487,6 +549,36 @@ impl<'a> Walker<'a> {
                 "string_literal" | "raw_string_literal" | "interpreted_string_literal" | "string"
             ) && placeholder_text(self.text(n))
         })
+    }
+
+    /// A panic whose message is a placeholder, including one assembled by
+    /// `concat!` from adjacent string literals. A non-literal argument between
+    /// two literals ends that run, so `concat!("not ", detail, "implemented")`
+    /// is not the phrase `not implemented`.
+    fn panic_is_placeholder(&self, node: Node<'_>) -> bool {
+        if self.has_placeholder_string(node) {
+            return true;
+        }
+        let mut rest = self.text(node);
+        while let Some(at) = rest.find("concat!(") {
+            if crate::rigor::concat_placeholder(&rest[at..]).is_some() {
+                return true;
+            }
+            rest = &rest[at + "concat!(".len()..];
+        }
+        false
+    }
+
+    /// An added line of `node` whose code contains `todo!` or `unimplemented!`.
+    fn visible_stub_line(&self, node: Node<'_>) -> Option<u32> {
+        let start = line_of(node);
+        for (offset, line) in self.text(node).lines().enumerate() {
+            let n = start + u32::try_from(offset).unwrap_or(0);
+            if self.added.contains(&n) && line_has_visible_stub(line) {
+                return Some(n);
+            }
+        }
+        None
     }
 
     // ---- Go ----

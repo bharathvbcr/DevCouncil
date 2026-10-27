@@ -16,6 +16,7 @@
 //! an orphan check reading a silently-empty parse would report a clean scope
 //! for a diff that touched the whole repository.
 
+pub mod bounded;
 pub mod coverage;
 pub mod json_stdout;
 pub mod rigor;

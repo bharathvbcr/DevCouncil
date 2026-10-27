@@ -9,11 +9,13 @@
 //! result: an empty finding list means "these gates ran and found nothing", and
 //! a caller cannot be allowed to read "could not run" as that.
 
-use std::io::Read;
 use std::process::ExitCode;
 
-use dc_verify::rigor::{Finding, Severity, detect_stubs_report, intersect_coverage, scan_secrets};
-use dc_verify::{classify_scope, parse_unified};
+use dc_verify::bounded::{MAX_CHECK_BYTES, decode_lossy, read_bounded};
+use dc_verify::rigor::{
+    Finding, Severity, Strength, detect_stubs_report, intersect_coverage, scan_secrets,
+};
+use dc_verify::{classify_scope, normalize_candidate, parse_unified};
 
 #[path = "../evidence_cli.rs"]
 mod evidence_cli;
@@ -191,11 +193,12 @@ fn check(
     // secrets it matches are ASCII, and U+FFFD replaces the offending bytes
     // in place without adding or removing a line, so both the patterns and the
     // line numbers survive.
-    let mut raw = Vec::new();
-    std::io::stdin()
-        .read_to_end(&mut raw)
-        .map_err(|e| format!("reading the diff from stdin: {e}"))?;
-    let diff = String::from_utf8_lossy(&raw).into_owned();
+    //
+    // The read stops at MAX_CHECK_BYTES (32 MiB, the host's git diff cap).
+    // One byte over is `exceeds N bytes` and is not parsed. Valid UTF-8 is
+    // borrowed; only a lossy decode allocates a second copy.
+    let raw = read_bounded(std::io::stdin(), "the diff")?;
+    let diff = decode_lossy(&raw);
 
     let files = parse_unified(&diff).map_err(|e| {
         format!(
@@ -208,17 +211,34 @@ fn check(
     let mut findings = scan_secrets(&files);
     let stubs = detect_stubs_report(&files, &|file| read_post_image(root, &file.path));
     findings.extend(stubs.findings);
+    // A binary marker with no hunk carries none of the file's bytes. A text
+    // hunk elsewhere in the same diff does not make that path scanned.
+    let mut binary_degraded = Vec::new();
+    scan_binary_paths(
+        &diff,
+        &files,
+        &scope.in_scope,
+        root,
+        &mut findings,
+        &mut binary_degraded,
+    );
 
     // Coverage measurements, when the caller supplied them. A missing file is
     // fatal rather than silently treated as "no coverage": a caller that asked
     // for coverage and got "everything unmeasured" because of a typo'd path
     // would read the same report as one whose tests genuinely ran nothing.
+    //
+    // Read as bytes under MAX_CHECK_BYTES and decoded lossily. A non-UTF-8
+    // `SF:` path must not drop findings already computed; the path that no
+    // longer matches lands in coverage_unmeasured. Past the cap is an error,
+    // and that error is named before the file is parsed — a parse error would
+    // quote the body.
     let measurements = match coverage_path {
         None => Vec::new(),
         Some(path) => {
-            let raw = std::fs::read_to_string(path)
-                .map_err(|e| format!("reading the coverage file {path}: {e}"))?;
-            dc_verify::coverage::parse_with_root(&raw, root)
+            let raw = read_capped_file(path)?;
+            let text = decode_lossy(&raw);
+            dc_verify::coverage::parse_with_root(&text, root)
                 .map_err(|e| format!("parsing the coverage file {path}: {e}"))?
         }
     };
@@ -252,14 +272,202 @@ fn check(
         // Files the tree could not analyse, which took the weaker substring
         // checks. Additive: a host that does not read it sees the reply it
         // always did.
-        string_array(
-            &stubs
+        string_array(&{
+            let mut degraded: Vec<String> = stubs
                 .unparsed
                 .iter()
                 .map(|u| format!("{}: {}", u.path, u.reason))
-                .collect::<Vec<_>>()
-        ),
+                .collect();
+            degraded.extend(binary_degraded);
+            degraded
+        }),
     ))
+}
+
+/// Coverage file, bounded by [`MAX_CHECK_BYTES`]. The length of a regular
+/// file is taken from symlink metadata before any read, so a sparse file past
+/// the cap is not allocated. A symlink is refused and not opened: following
+/// one would report the target's measurements as if they were this path.
+/// A character device or fifo has no trustworthy length, so the bounded read
+/// is the cap.
+fn read_capped_file(path: &str) -> Result<Vec<u8>, String> {
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("reading the coverage file {path}: {e}"))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!("refusing to follow a symlink: {path}"));
+    }
+    let kind = meta.file_type();
+    if kind.is_file() {
+        if meta.len() > MAX_CHECK_BYTES as u64 {
+            return Err(format!("the coverage file exceeds {MAX_CHECK_BYTES} bytes"));
+        }
+    } else if !unbounded_device(&kind) {
+        return Err(format!("the coverage file {path} is not a regular file"));
+    }
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("reading the coverage file {path}: {e}"))?;
+    let again = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("reading the coverage file {path}: {e}"))?;
+    if again.file_type().is_symlink() {
+        return Err(format!("refusing to follow a symlink: {path}"));
+    }
+    read_bounded(file, "the coverage file")
+}
+
+/// A character device or fifo has no trustworthy length, so the bounded read
+/// is the cap. Other targets have no such files in this check.
+fn unbounded_device(kind: &std::fs::FileType) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        kind.is_char_device() || kind.is_fifo()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = kind;
+        false
+    }
+}
+
+/// Planned paths whose diff section is a binary marker and no hunk.
+///
+/// Their bytes are not in the diff. Read the working-tree file under the
+/// same cap, without following a symlink, and secret-scan it. A path that
+/// cannot be read degrades the verdict instead of scanning clean.
+fn scan_binary_paths(
+    diff: &str,
+    files: &[dc_verify::FileDiff],
+    in_scope: &[String],
+    root: Option<&std::path::Path>,
+    findings: &mut Vec<Finding>,
+    degraded: &mut Vec<String>,
+) {
+    for path in binary_paths_without_hunks(diff) {
+        let normalized = normalize_candidate(&path);
+        if !in_scope.iter().any(|p| p == &normalized) {
+            continue;
+        }
+        let parsed = files
+            .iter()
+            .find(|f| normalize_candidate(&f.path) == normalized);
+        if parsed.is_some_and(|f| !f.added_lines.is_empty()) {
+            continue;
+        }
+        match read_binary_post_image(root, &normalized) {
+            Ok(text) => {
+                let mut line_no = 0u32;
+                for line in text.split_inclusive('\n') {
+                    line_no = line_no.saturating_add(1);
+                    let line = line.trim_end_matches(['\n', '\r']);
+                    if let Some(secret) = dc_redact::find_secret(line) {
+                        findings.push(Finding {
+                            gate: "secret_scan",
+                            severity: Severity::Blocking,
+                            strength: Strength::Derived,
+                            path: normalized.clone(),
+                            line: line_no.max(1),
+                            evidence: secret.redacted,
+                            message: format!(
+                                "added line contains what looks like a {}; a credential in a commit is \
+                                 compromised even after it is deleted, because the object stays in history",
+                                secret.name
+                            ),
+                        });
+                    }
+                }
+            }
+            Err(reason) => degraded.push(format!("{normalized}: {reason}")),
+        }
+    }
+}
+
+/// Paths whose `diff --git` section contains a binary marker and no hunk.
+fn binary_paths_without_hunks(diff: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut path = String::new();
+    let mut in_file = false;
+    let mut saw_hunk = false;
+    let mut saw_binary = false;
+    let flush =
+        |path: &str, in_file: bool, saw_hunk: bool, saw_binary: bool, out: &mut Vec<String>| {
+            if in_file && saw_binary && !saw_hunk && !path.is_empty() {
+                out.push(path.to_string());
+            }
+        };
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            flush(&path, in_file, saw_hunk, saw_binary, &mut out);
+            path = diff_header_b_path(rest).unwrap_or_default();
+            in_file = true;
+            saw_hunk = false;
+            saw_binary = false;
+            continue;
+        }
+        if !in_file {
+            continue;
+        }
+        if line.starts_with("@@") {
+            saw_hunk = true;
+        }
+        if line.starts_with("Binary files ") || line.starts_with("GIT binary patch") {
+            saw_binary = true;
+        }
+    }
+    flush(&path, in_file, saw_hunk, saw_binary, &mut out);
+    out
+}
+
+/// The post-change path in an unquoted `diff --git a/P b/P` header.
+fn diff_header_b_path(rest: &str) -> Option<String> {
+    let at = rest.rfind(" b/")?;
+    let name = &rest[at + 3..];
+    if name.is_empty() || name.contains('"') {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Working-tree bytes of a binary path, or why they could not be scanned.
+///
+/// A symlink is refused and not opened. The read is bounded by
+/// [`MAX_CHECK_BYTES`] before the file is pulled in: metadata length first,
+/// then `take`. The result is lossy-decoded so a NUL does not hide a credential
+/// that sits in the same file.
+fn read_binary_post_image(root: Option<&std::path::Path>, path: &str) -> Result<String, String> {
+    use std::io::Read as _;
+    use std::path::Component;
+    let root = root.ok_or_else(|| "no working tree root".to_string())?;
+    let rel = std::path::Path::new(path);
+    if path.is_empty() || !rel.components().all(|c| matches!(c, Component::Normal(_))) {
+        return Err("path escapes the working tree".to_string());
+    }
+    let full = root.join(rel);
+    let meta = std::fs::symlink_metadata(&full).map_err(|e| format!("cannot read: {e}"))?;
+    if meta.file_type().is_symlink() {
+        return Err("refusing to follow a symlink".to_string());
+    }
+    if !meta.is_file() {
+        return Err("not a regular file".to_string());
+    }
+    if meta.len() > MAX_CHECK_BYTES as u64 {
+        return Err(format!("exceeds {MAX_CHECK_BYTES} bytes"));
+    }
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(&full)
+        .map_err(|e| format!("cannot read: {e}"))?
+        .take(MAX_CHECK_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot read: {e}"))?;
+    if read > MAX_CHECK_BYTES {
+        return Err(format!("exceeds {MAX_CHECK_BYTES} bytes"));
+    }
+    // The symlink check above is the open we refused. Re-check before believing
+    // the bytes, in case the path was replaced with a link.
+    let again = std::fs::symlink_metadata(&full).map_err(|e| format!("cannot read: {e}"))?;
+    if again.file_type().is_symlink() || !again.is_file() {
+        return Err("refusing to follow a symlink".to_string());
+    }
+    Ok(decode_lossy(&bytes).into_owned())
 }
 
 /// Reads a changed file as it stands in the working tree under `root`, for
