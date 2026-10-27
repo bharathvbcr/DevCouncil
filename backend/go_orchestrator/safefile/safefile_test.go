@@ -1,9 +1,13 @@
 package safefile
 
 import (
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestPinnedIdentitySurvivesPathReplacement(t *testing.T) {
@@ -184,5 +188,66 @@ func TestWriteAtomicLeavesNoTemp(t *testing.T) {
 	got, err := os.ReadFile(path)
 	if err != nil || string(got) != "payload" {
 		t.Fatalf("got %q %v", got, err)
+	}
+}
+
+// A rooted open samples the name after the kernel open. Publishers replace
+// that name by rename, so the sample can name a different regular file than
+// the handle. That is the file the caller asked for, not a symlink os.Root
+// followed. This fails while OpenNoFollow reports the mismatch as an attack.
+func TestOpenNoFollowReadsThroughAConcurrentRename(t *testing.T) {
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if err := os.WriteFile(filepath.Join(dir, "a.md"), []byte("v0"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for n := 0; ; n++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			tmp := filepath.Join(dir, "next")
+			if err := os.WriteFile(tmp, []byte(fmt.Sprintf("v%d", n)), 0o600); err != nil {
+				return
+			}
+			if err := os.Rename(tmp, filepath.Join(dir, "a.md")); err != nil {
+				return
+			}
+		}
+	}()
+	defer func() {
+		close(stop)
+		wg.Wait()
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	var reads int
+	for time.Now().Before(deadline) {
+		f, err := OpenNoFollow(root, "a.md", os.O_RDONLY, 0)
+		if err != nil {
+			t.Fatalf("replaced regular file refused: %v", err)
+		}
+		buf, readErr := io.ReadAll(f)
+		closeErr := f.Close()
+		if readErr != nil || closeErr != nil {
+			t.Fatalf("read %v close %v", readErr, closeErr)
+		}
+		if len(buf) == 0 || buf[0] != 'v' {
+			t.Fatalf("content %q", buf)
+		}
+		reads++
+	}
+	if reads < 100 {
+		t.Fatalf("only %d reads; the race was not exercised", reads)
 	}
 }
