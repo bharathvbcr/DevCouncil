@@ -1375,7 +1375,7 @@ pub(super) fn collect_scope_locals(
                         entry.extend(
                             crate::swiftscope::bindings(node, source)
                                 .keys()
-                                .filter(|name| !name.contains('.'))
+                                .filter(|name| !name.contains('.') && !name.starts_with('\u{1}'))
                                 .cloned(),
                         );
                     }
