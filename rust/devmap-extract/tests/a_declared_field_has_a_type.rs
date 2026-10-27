@@ -541,3 +541,69 @@ fn a_registry_language_routed_to_a_covered_grammar_reads_its_fields() {
         "{path}: a borrowed grammar must still reach the field walk"
     );
 }
+
+/// `@Env(Client.self) var client` is a `Client` when this file's `@propertyWrapper`
+/// says so. Anything else — two wrappers, no `propertyWrapper`, an optional or
+/// a collection `wrappedValue`, `@Environment` — states no type.
+#[test]
+fn a_swift_property_wrapper_states_its_wrapped_type_or_nothing() {
+    let wrapped = "@propertyWrapper struct Env {\n    var wrappedValue: Client\n}\n\
+         struct R {\n    @Env(Client.self) private var client\n}\n";
+    assert_eq!(
+        names_a_field("a.swift", wrapped, "client").as_deref(),
+        Some("Client")
+    );
+    let once = "struct Client {}\n@propertyWrapper struct Env {\n    var wrappedValue: Client\n}\n\
+         struct R {\n    @Env(Client.self) private var client\n}\n";
+    assert_eq!(
+        names_a_field("a.swift", once, "client").as_deref(),
+        Some("Client"),
+        "one Client in this file is still Client"
+    );
+    let abstain = [
+        "struct R {\n    @Environment(\\.modelContext) private var context\n}\n",
+        "@propertyWrapper struct Env { var wrappedValue: Client }\n\
+         @propertyWrapper struct Env { var wrappedValue: Other }\n\
+         struct R { @Env(Client.self) var client }\n",
+        "struct Env { var wrappedValue: Client }\nstruct R { @Env(Client.self) var client }\n",
+        "@propertyWrapper struct Env { var wrappedValue: Client? }\n\
+         struct R { @Env(Client.self) var client }\n",
+        "@propertyWrapper struct Env { var wrappedValue: [Client] }\n\
+         struct R { @Env(Client.self) var client }\n",
+        "@propertyWrapper struct Env { var wrappedValue: Client }\n\
+         struct R { @Env(Client.self) @Other var client }\n",
+        "struct A { struct Client {} }\nstruct B { struct Client {} }\n\
+         @propertyWrapper struct Env { var wrappedValue: Client }\n\
+         struct R { @Env(Client.self) var client }\n",
+    ];
+    for (index, source) in abstain.iter().enumerate() {
+        let field = if index == 0 { "context" } else { "client" };
+        assert_eq!(
+            names_a_field("a.swift", source, field),
+            None,
+            "case {index} must not invent a type"
+        );
+    }
+}
+
+/// The wrapper's `wrappedValue: Client` is read inside the wrapper. A `Client`
+/// nested in the wrapper, or in the type that uses it, is a different type from
+/// the one the field's owner would name, so the field states none.
+#[test]
+fn a_swift_wrapped_type_nested_in_the_wrapper_or_the_user_is_not_the_fields_type() {
+    let in_wrapper =
+        "@propertyWrapper struct Env {\n    struct Client {}\n    var wrappedValue: Client\n}\n\
+         struct R {\n    @Env(Client.self) private var client\n}\n";
+    assert_eq!(
+        names_a_field("a.swift", in_wrapper, "client"),
+        None,
+        "a Client nested in the wrapper is Env.Client, not the field's Client"
+    );
+    let in_user = "@propertyWrapper struct Env {\n    var wrappedValue: Client\n}\n\
+         struct R {\n    struct Client {}\n    @Env(Client.self) private var client\n}\n";
+    assert_eq!(
+        names_a_field("a.swift", in_user, "client"),
+        None,
+        "a Client nested in the using type is R.Client, not the wrapper's"
+    );
+}

@@ -394,6 +394,66 @@ fn a_swift_binding_is_not_a_local_in_its_own_initializer() {
     );
 }
 
+/// `let (a, b) = a.pair()` reads the `a` that was bound before it, as `let a = a`
+/// does. The destructured name is the local only after the initializer.
+#[test]
+fn a_swift_tuple_destructure_is_not_a_local_in_its_own_initializer() {
+    let source = "struct P { func pair() -> (Int, Int) { (1, 2) } }\n\
+         final class D {\n    func go(_ a: P) {\n        let (a, (b, c)) = a.pair()\n        a.pair()\n    }\n}\n";
+    let extraction = extract_file("a.swift", source);
+    let at = |start: usize| {
+        extraction
+            .local_bindings
+            .iter()
+            .any(|b| b.name == "a" && b.start_byte == start)
+    };
+    let in_initializer = source
+        .find("a.pair()\n        a.pair()")
+        .expect("initializer");
+    let later = source.rfind("a.pair()").expect("later use");
+    assert!(
+        !at(in_initializer),
+        "the initializer's `a` is not the destructured local: {:?}",
+        extraction.local_bindings
+    );
+    assert!(
+        at(later),
+        "a use after the pattern is the local: {:?}",
+        extraction.local_bindings
+    );
+}
+
+/// `let (a, (b, c)) = pair()` binds `b` and `c` as locals, so a call on `c` is a
+/// call on the local and not on the same-named member of the class. A nested
+/// pattern names every inner binding even though it types none of them.
+#[test]
+fn a_nested_swift_tuple_destructure_shadows_a_member_of_the_same_name() {
+    let source = "struct Svc { func run() {} }\nstruct Other { func run() {} }\n\
+         func pair() -> (Int, (Svc, Other)) { (1, (Svc(), Other())) }\n\
+         final class H {\n    var c: Svc = Svc()\n    var b: Other = Other()\n\
+         \x20   func go() {\n        let (a, (b, c)) = pair()\n        c.run()\n        b.run()\n    }\n}\n";
+    let extraction = extract_file("a.swift", source);
+    for name in ["b", "c"] {
+        let call = source
+            .find(&format!("{name}.run()"))
+            .expect("the call on the local");
+        let binding = extraction
+            .local_bindings
+            .iter()
+            .find(|each| each.name == name && each.start_byte == call);
+        let binding = binding.unwrap_or_else(|| {
+            panic!(
+                "`{name}` in `{name}.run()` must be the destructured local: {:?}",
+                extraction.local_bindings
+            )
+        });
+        assert_eq!(
+            binding.declared_type, None,
+            "a nested pattern states no type for `{name}`: {binding:?}"
+        );
+    }
+}
+
 /// `self.engine = Engine()` assigns a field, not a local, and the extractor
 /// says so with the `self.` spelling no local can have. Only a call that is the
 /// whole right-hand side is stamped: a wrapped, nested or conditional value is
