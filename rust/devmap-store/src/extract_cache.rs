@@ -36,11 +36,10 @@ pub fn extract_tree_cached_with_report(
 
 /// Extract a tree that has already been scanned, consulting `store` for hits.
 ///
-/// The split exists so a caller can decide *whether* to extract. Every lookup
-/// here goes through the store's single guarded connection, so this loop is
-/// serial on the SQLite mutex however many rayon threads enter it, and it
-/// deserializes one full extraction payload per file: measured on this
-/// repository, 213–254 ms for 1,311 unchanged files. A build that only needs to
+/// The split exists so a caller can decide *whether* to extract. Each lookup
+/// holds the store connection only for its SELECT. The payload is parsed after
+/// that guard is released, so cached files decode in parallel; the selects
+/// themselves still queue on the one connection. A build that only needs to
 /// know whether the tree moved gets that from
 /// [`devmap_extract::ScannedTree::matches_file_hashes`] instead and never calls
 /// this at all.
