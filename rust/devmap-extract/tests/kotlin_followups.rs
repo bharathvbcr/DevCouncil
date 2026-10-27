@@ -1139,6 +1139,21 @@ fn an_annotated_one_line_class_equals_its_multi_line_twin_on_every_table() {
             "@Suppress(\"unused\") interface I {\n    fun f()\n}\n",
         ),
         (
+            "nested one-liner",
+            "@A\n@B\nprivate class Q { class In { fun d() {} } }\n",
+            "@A\n@B\nprivate class Q {\n    class In {\n        fun d() {}\n    }\n}\n",
+        ),
+        (
+            "lambdas with calls",
+            "@A\n@B\nprivate class Q { val x = listOf(1).map { helper(it) }\n fun m() { Foo().apply { bar() } } }\n",
+            "@A\n@B\nprivate class Q {\n    val x = listOf(1).map { helper(it) }\n    fun m() { Foo().apply { bar() } }\n}\n",
+        ),
+        (
+            "with and a lambda body",
+            "@A\n@B\nprivate class Q { fun m() { with(Foo()) { bar() } } }\n",
+            "@A\n@B\nprivate class Q {\n    fun m() { with(Foo()) { bar() } }\n}\n",
+        ),
+        (
             "two annotated one-liners",
             "@Ann(1) class A { val x = 1 }\n@Ann(2) class B { val y = 2 }\n",
             "@Ann(1) class A {\n    val x = 1\n}\n@Ann(2) class B {\n    val y = 2\n}\n",
@@ -1428,36 +1443,42 @@ fn thousands_of_comments_before_the_closing_brace_are_read_in_bounded_time() {
 #[test]
 fn declarations_sharing_a_line_equal_their_twin_on_every_table() {
     let mut failures = Vec::new();
-    for (label_, one, twin) in [
+    for (label_, one, twin, second) in [
         (
             "two classes",
             "class A { fun f() {} } class B { fun g() {} }\n",
             "class A {\n    fun f() {}\n}\nclass B {\n    fun g() {}\n}\n",
+            "class B",
         ),
         (
             "class then function",
             "class A { val x = 1 } fun g() { h() }\n",
             "class A {\n    val x = 1\n}\nfun g() { h() }\n",
+            "fun g",
         ),
         (
             "class then modifiers",
             "class A { val x = 1 } private object O { val y = 2 }\n",
             "class A {\n    val x = 1\n}\nprivate object O {\n    val y = 2\n}\n",
+            "private object",
         ),
         (
             "class then annotated class",
             "class A { val x = 1 } @Ann class B { val y = 2 }\n",
             "class A {\n    val x = 1\n}\n@Ann class B {\n    val y = 2\n}\n",
+            "@Ann class B",
         ),
         (
             "bodies over several lines, a class opened on the closing line",
             "class A {\n    val x = 1\n} class B {\n    val y = 2\n}\n",
             "class A {\n    val x = 1\n}\nclass B {\n    val y = 2\n}\n",
+            "class B",
         ),
         (
             "three classes",
             "class A { val x = 1 } class B { val y = 2 } class C { val z = 3 }\n",
             "class A {\n    val x = 1\n}\nclass B {\n    val y = 2\n}\nclass C {\n    val z = 3\n}\n",
+            "class C",
         ),
     ] {
         let (one, twin) = (format!("{one}{SUFFIX}"), format!("{twin}{SUFFIX}"));
@@ -1469,6 +1490,19 @@ fn declarations_sharing_a_line_equal_their_twin_on_every_table() {
                 label(&b, &twin)
             ));
             continue;
+        }
+        // The separator joined two declarations, so the one after it was read
+        // through the rewrite and its range is recorded.
+        let at = one.find(second).expect("the second declaration is in the source");
+        if !a
+            .recovered_decl_ranges
+            .iter()
+            .any(|r| r.start_byte <= at && at < r.end_byte)
+        {
+            failures.push(format!(
+                "{label_}: `{second}` at {at} is in no recovered range {:?}",
+                a.recovered_decl_ranges
+            ));
         }
         failures.extend(
             table_diffs(&a, &b)
