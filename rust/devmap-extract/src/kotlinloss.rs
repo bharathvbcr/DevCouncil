@@ -650,8 +650,8 @@ impl Staged {
         };
         for mut fact in inner.jvm_decls {
             fact.start_byte = shift(fact.start_byte)?;
-            fact.header = fact.header.as_ref().map(&shift_range).transpose()?;
-            fact.body = fact.body.as_ref().map(&shift_range).transpose()?;
+            fact.header = fact.header.as_ref().map(shift_range).transpose()?;
+            fact.body = fact.body.as_ref().map(shift_range).transpose()?;
             staged.jvm_decls.push(fact);
         }
         for mut extent in inner.local_extents {
