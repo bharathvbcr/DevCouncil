@@ -79,6 +79,7 @@ func OpenNoFollow(root *os.Root, name string, flag int, perm fs.FileMode) (*os.F
 		if err := validateHandle(f); err != nil {
 			return nil, errors.Join(err, f.Close())
 		}
+		afterRootedOpen(attempt)
 		named, err := root.Lstat(name)
 		if err != nil {
 			return nil, errors.Join(err, f.Close())
@@ -90,7 +91,9 @@ func OpenNoFollow(root *os.Root, name string, flag int, perm fs.FileMode) (*os.F
 		if os.SameFile(named, opened) {
 			return f, nil
 		}
-		replacedRegular := named.Mode().IsRegular() && opened.Mode().IsRegular() && named.Mode()&fs.ModeSymlink == 0
+		// IsRegular is true only when no type bit is set, so it already
+		// excludes a symlink; a separate ModeSymlink test would be redundant.
+		replacedRegular := named.Mode().IsRegular() && opened.Mode().IsRegular()
 		last = errors.Join(errors.New("opened entry changed identity or is a symbolic link"), f.Close())
 		if !replacedRegular {
 			return nil, last
@@ -211,9 +214,13 @@ func WriteAtomic(path string, content []byte, perm fs.FileMode) error {
 }
 
 // syncFile, syncDir and renameFile are variables so a test can make a
-// durability or publish step fail.
+// durability or publish step fail. afterRootedOpen runs between a rooted open
+// and the Lstat that samples its name, with the zero-based attempt number, so a
+// test can place the publisher's rename in that window deterministically. It is
+// a no-op in production and is assigned only from tests in this package.
 var (
-	renameFile = os.Rename
-	syncFile   = func(f *os.File) error { return f.Sync() }
-	syncDir    = syncDirectory
+	afterRootedOpen = func(attempt int) {}
+	renameFile      = os.Rename
+	syncFile        = func(f *os.File) error { return f.Sync() }
+	syncDir         = syncDirectory
 )
