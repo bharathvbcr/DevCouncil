@@ -773,8 +773,11 @@ fn extract_file_unfiltered(path: &str, source: &str, budget: std::time::Duration
         return notebook::extract_notebook_bounded(path, source, budget);
     }
     let lang = detect_language(Path::new(path));
+    // The grammar pass disarms its own clock when it returns, so recovery is
+    // handed the same instant the file's budget ends.
+    let deadline = std::time::Instant::now() + budget;
     let mut extraction = treesitter::extract_treesitter_with_budget(path, lang, source, budget);
-    sqlddl::recover_lost_relations(&mut extraction, source);
+    sqlddl::recover_lost_relations(&mut extraction, source, deadline);
     extraction
 }
 

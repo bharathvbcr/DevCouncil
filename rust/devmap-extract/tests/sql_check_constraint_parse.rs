@@ -323,15 +323,17 @@ CREATE TABLE nope (id INT
         assert!(names.contains(&present), "missing {present}: {names:?}");
     }
     // A stored function is a callable the extractor already records. A table
-    // that exists only as text inside that body, a trigger body, a comment,
-    // a string, or an unterminated statement is not a schema object.
+    // that exists only as text inside a comment, a string, or an unterminated
+    // statement is not a schema object. `inner_fake` (trigger body) and
+    // `dollar_fake` (function body) are not asserted either way: the grammar
+    // parses both as tables outside every error range, and recovery removes a
+    // symbol only where the grammar reported an error (see
+    // `recovery_never_removes_a_symbol_the_grammar_parsed_outside_an_error`).
     assert_eq!(relation(&extraction, "f").kind, SymbolKind::Function);
     for absent in [
         "fake",
         "commented",
         "quoted_in_trigger",
-        "inner_fake",
-        "dollar_fake",
         "nope",
         "tr",
         "docs_fts2_nope",
@@ -418,15 +420,10 @@ CREATE TABLE nope_unclosed (id INT
     ] {
         assert!(names.contains(&present), "missing {present}: {names:?}");
     }
-    for absent in [
-        "inside_fn",
-        "inside_block",
-        "inside_comment",
-        "nope_unclosed",
-        "a",
-        "Details",
-        "Order",
-    ] {
+    // `inside_fn`, `inside_block` and `inside_comment` are not asserted: the
+    // grammar parses each as a table outside every error range, so recovery
+    // leaves it (the ruling: removal only inside an error range).
+    for absent in ["nope_unclosed", "a", "Details", "Order"] {
         assert!(!names.contains(&absent), "invented {absent}: {names:?}");
     }
     assert_eq!(relation(&extraction, "g").kind, SymbolKind::Function);
@@ -453,6 +450,327 @@ fn a_quoted_name_on_a_clean_statement_loses_the_quotes() {
     let symbol = relation(&extraction, "Weird Name");
     assert_eq!(symbol.kind, SymbolKind::Struct);
     assert_eq!(symbol.qualified_name, "q.sql::Weird Name");
+}
+
+/// What the grammar alone says about `source`, before any recovery.
+fn grammar_only(source: &str) -> Extraction {
+    devmap_extract::treesitter::extract_treesitter("recover.sql", "sql", source)
+}
+
+fn bare(name: &str) -> &str {
+    name.trim_matches(|c| c == '"' || c == '`')
+}
+
+/// The ruling: on a file the grammar parsed `Clean`, recovery never removes a
+/// symbol, a call or a reference. Every grammar symbol is still there under
+/// its (unquoted) name with its span, and no edge went missing.
+fn assert_clean_file_loses_nothing(label: &str, source: &str) {
+    let grammar = grammar_only(source);
+    assert_eq!(
+        grammar.parse_outcome,
+        ParseOutcome::Clean,
+        "{label}: the grammar no longer parses this cleanly, so the case proves nothing"
+    );
+    let full = extract_file("recover.sql", source);
+    assert_eq!(full.parse_outcome, ParseOutcome::Clean, "{label}");
+    for symbol in grammar
+        .symbols
+        .iter()
+        .filter(|s| s.kind != SymbolKind::File)
+    {
+        assert!(
+            full.symbols
+                .iter()
+                .any(|kept| kept.name == bare(&symbol.name)
+                    && kept.span.start_byte == symbol.span.start_byte
+                    && kept.span.end_byte == symbol.span.end_byte),
+            "{label}: recovery removed `{}`: {:?}",
+            symbol.name,
+            declared(&full)
+        );
+    }
+    assert_eq!(full.symbols.len(), grammar.symbols.len(), "{label}");
+    assert_eq!(full.calls.len(), grammar.calls.len(), "{label}: calls");
+    assert_eq!(
+        full.references.len(),
+        grammar.references.len(),
+        "{label}: references"
+    );
+}
+
+#[test]
+fn a_clean_file_never_loses_a_symbol_to_recovery() {
+    for (label, source) in [
+        (
+            "last statement has no semicolon",
+            "CREATE TABLE a(id int);\nCREATE TABLE b(id int)",
+        ),
+        (
+            "last statement has no semicolon and a trailing comment",
+            "CREATE TABLE a(id int);\nCREATE TABLE b(id int) -- end\n",
+        ),
+        (
+            "postgres transaction",
+            "BEGIN;\nCREATE TABLE t1 (id INT);\nEND;\nCREATE TABLE t2 (id INT);\n",
+        ),
+        (
+            "sqlite dump transaction",
+            "BEGIN TRANSACTION;\nCREATE TABLE t1 (id INT);\nCOMMIT;\nCREATE TABLE t2 (id INT);\n",
+        ),
+        (
+            "backslash that is a literal in a standard string",
+            "CREATE TABLE a (n TEXT DEFAULT 'C:\\');\nCREATE TABLE b (id INT);\n",
+        ),
+        (
+            "quoted names",
+            "CREATE TABLE \"a\" (id INT);\nCREATE TABLE `b` (id INT);\nCREATE TABLE c (id INT)",
+        ),
+    ] {
+        assert_clean_file_loses_nothing(label, source);
+    }
+}
+
+#[test]
+fn a_last_statement_without_a_semicolon_is_a_table() {
+    let source = "CREATE TABLE a(id int);\nCREATE TABLE b(id int)";
+    let extraction = extract_file("nosemi.sql", source);
+    assert_eq!(declared(&extraction), vec!["a", "b"]);
+    let b = relation(&extraction, "b");
+    assert_eq!(
+        &source[b.span.start_byte..b.span.end_byte],
+        "CREATE TABLE b(id int)"
+    );
+}
+
+/// MySQL `#` comments and backslash-escaped quotes. A `'` in a comment, or the
+/// quote in `'O\'Brien'`, must not pair with a quote three statements later.
+#[test]
+fn mysql_comments_and_escaped_quotes_do_not_unpair_the_quotes() {
+    let hash = "\
+# dump header
+CREATE TABLE a (id INT); # trailing
+# it's an apostrophe in a comment
+CREATE TABLE b (id INT);
+CREATE TABLE c (id INT);
+";
+    let extraction = extract_file("hash.sql", hash);
+    let names = declared(&extraction);
+    for table in ["a", "b", "c"] {
+        assert!(names.contains(&table), "missing {table}: {names:?}");
+    }
+
+    let escaped = "\
+CREATE TABLE a (n TEXT DEFAULT 'O\\'Brien');
+CREATE TABLE b (id INT);
+CREATE TABLE c (n TEXT DEFAULT 'it\\'s');
+CREATE TABLE d (id INT);
+";
+    let extraction = extract_file("escaped.sql", escaped);
+    let names = declared(&extraction);
+    for table in ["b", "d"] {
+        assert!(names.contains(&table), "missing {table}: {names:?}");
+    }
+}
+
+/// `END CASE` reopened the block it had just closed, so the procedure never
+/// ended and every table after it was dropped.
+#[test]
+fn end_if_end_case_and_end_loop_close_a_procedure_body_once() {
+    for (label, body) in [
+        ("case", "CASE x WHEN 1 THEN SELECT 1; END CASE;"),
+        ("if", "IF 1 THEN SELECT 1; END IF;"),
+        ("loop", "lp: LOOP SELECT 1; LEAVE lp; END LOOP lp;"),
+        ("while", "WHILE 1 DO SELECT 1; END WHILE;"),
+        ("repeat", "REPEAT SELECT 1; UNTIL 1 END REPEAT;"),
+        (
+            "nested",
+            "IF 1 THEN CASE x WHEN 1 THEN SELECT 1; END CASE; END IF; SELECT CASE WHEN 1 THEN 2 END;",
+        ),
+    ] {
+        let source = format!(
+            "CREATE PROCEDURE p() BEGIN {body} END;\nCREATE TABLE after_proc (id INT);\nCREATE TABLE last_one (id INT);\n"
+        );
+        let extraction = extract_file("proc.sql", &source);
+        let names = declared(&extraction);
+        for table in ["after_proc", "last_one"] {
+            assert!(
+                names.contains(&table),
+                "{label}: `{table}` was dropped: {names:?}"
+            );
+        }
+    }
+}
+
+/// `BEGIN TRANSACTION; … COMMIT;` is how `sqlite3 .dump` frames a schema. It is
+/// not a block, so the fts5 table inside it is recovered like any other.
+#[test]
+fn a_dump_transaction_is_not_a_block_and_its_tables_are_recovered() {
+    for begin in [
+        "BEGIN TRANSACTION;",
+        "BEGIN;",
+        "BEGIN DEFERRED TRANSACTION;",
+        "BEGIN IMMEDIATE;",
+        "BEGIN EXCLUSIVE TRANSACTION;",
+        "BEGIN WORK;",
+    ] {
+        let source = format!(
+            "{begin}\nCREATE VIRTUAL TABLE docs_fts USING fts5(title);\nCREATE TABLE t (id INT);\nCOMMIT;\n"
+        );
+        let extraction = extract_file("dump.sql", &source);
+        let names = declared(&extraction);
+        assert!(names.contains(&"docs_fts"), "{begin}: {names:?}");
+        let t = relation(&extraction, "t");
+        assert_eq!(
+            &source[t.span.start_byte..t.span.end_byte],
+            "CREATE TABLE t (id INT)",
+            "{begin}"
+        );
+        let fts = relation(&extraction, "docs_fts");
+        assert!(
+            source[fts.span.start_byte..fts.span.end_byte].contains("fts5"),
+            "{begin}"
+        );
+        assert_eq!(names.len(), 2, "{begin}: {names:?}");
+    }
+}
+
+/// The grammar names the table after a swallowed `fts5` statement `"work_events"`
+/// with the quotes, wearing the virtual table's span. Matching on the raw name
+/// missed it, pushed a second copy, and renamed the original to `lead`.
+#[test]
+fn a_quoted_name_after_a_dialect_error_is_one_symbol() {
+    let source = "\
+CREATE VIRTUAL TABLE lead USING fts5(x);
+CREATE TABLE \"work_events\" (id INT CHECK(json_valid(id)));
+";
+    let extraction = extract_file("quoted.sql", source);
+    let names = declared(&extraction);
+    assert_eq!(names.len(), 2, "{names:?}");
+    for name in ["lead", "work_events"] {
+        assert_eq!(
+            names.iter().filter(|n| **n == name).count(),
+            1,
+            "{name} is not exactly one symbol: {names:?}"
+        );
+    }
+    let lead = relation(&extraction, "lead");
+    assert!(source[lead.span.start_byte..lead.span.end_byte].contains("fts5"));
+    let events = relation(&extraction, "work_events");
+    assert!(source[events.span.start_byte..events.span.end_byte].starts_with("CREATE TABLE"));
+    assert_eq!(events.qualified_name, "quoted.sql::work_events");
+    assert!(
+        !extraction.calls.is_empty(),
+        "the CHECK call is the edge this case follows"
+    );
+    for call in &extraction.calls {
+        assert_eq!(
+            call.caller_symbol.as_deref(),
+            Some("quoted.sql::work_events"),
+            "{call:?}"
+        );
+    }
+}
+
+/// Recovery is a second reader of the text, so it removes a symbol only where
+/// the grammar itself reported an error. A table the grammar parsed outside
+/// every error range stays even when the scan reads that text as a routine
+/// body; a table inside the unterminated tail, where the grammar's error is,
+/// goes.
+#[test]
+fn recovery_never_removes_a_symbol_the_grammar_parsed_outside_an_error() {
+    let source = "\
+CREATE VIRTUAL TABLE docs_fts USING fts5(title);
+CREATE FUNCTION f() RETURNS int AS $$ CREATE TABLE in_body (id INT); $$ LANGUAGE sql;
+CREATE TABLE kept (id INT);
+CREATE TABLE tail_open (id INT
+";
+    let grammar = grammar_only(source);
+    assert!(
+        matches!(grammar.parse_outcome, ParseOutcome::Partial { .. }),
+        "{:?}",
+        grammar.parse_outcome
+    );
+    let in_body = grammar
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "in_body")
+        .expect("the grammar reads the function body as a table");
+    let touches_error = match &grammar.parse_outcome {
+        ParseOutcome::Partial { error_ranges, .. } => error_ranges.iter().any(|range| {
+            range.start_byte <= in_body.span.end_byte && in_body.span.start_byte <= range.end_byte
+        }),
+        _ => unreachable!(),
+    };
+    assert!(
+        !touches_error,
+        "the case needs a grammar symbol outside every error range"
+    );
+    let extraction = extract_file("partial.sql", source);
+    let names = declared(&extraction);
+    for table in ["docs_fts", "in_body", "kept"] {
+        assert!(names.contains(&table), "missing {table}: {names:?}");
+    }
+    assert!(
+        !names.contains(&"tail_open"),
+        "the unterminated tail is where the error is: {names:?}"
+    );
+}
+
+/// Twenty thousand backticked tables (a MySQL dump), each with the function
+/// `CHECK` the grammar rejects, so the file is `Partial` with twenty thousand
+/// error ranges. Every name loses its backticks, every edge follows its table,
+/// and the file finishes: the work is bounded by the file, not by renames
+/// times edges.
+#[test]
+fn twenty_thousand_backticked_tables_finish_with_every_name_and_edge_intact() {
+    const TABLES: usize = 20_000;
+    let mut source = String::new();
+    for index in 0..TABLES {
+        source.push_str(&format!(
+            "CREATE TABLE `t{index}` (a INT CHECK(abs(a)>0));\n"
+        ));
+    }
+    assert!(source.len() < 1024 * 1024, "{} bytes", source.len());
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let extraction = devmap_extract::extract_file_with_budget(
+            "dump.sql",
+            &source,
+            std::time::Duration::from_secs(60),
+        );
+        let _ = sender.send(extraction);
+    });
+    let extraction = receiver
+        .recv_timeout(std::time::Duration::from_secs(90))
+        .expect("a 20,000-table dump did not finish within the hard timeout");
+    handle.join().expect("extraction thread");
+    assert!(
+        matches!(
+            extraction.parse_outcome,
+            ParseOutcome::Clean | ParseOutcome::Partial { .. }
+        ),
+        "{:?}",
+        extraction.parse_outcome
+    );
+    let tables: Vec<&str> = declared(&extraction);
+    assert_eq!(tables.len(), TABLES);
+    let mut seen = std::collections::HashSet::new();
+    for name in &tables {
+        assert!(!name.contains('`'), "quotes left on {name}");
+        assert!(seen.insert(*name), "duplicate {name}");
+    }
+    assert!(seen.contains("t0") && seen.contains("t19999"));
+    let qualified: std::collections::HashSet<&str> = extraction
+        .symbols
+        .iter()
+        .map(|symbol| symbol.qualified_name.as_str())
+        .collect();
+    assert!(!extraction.calls.is_empty());
+    for call in &extraction.calls {
+        if let Some(caller) = call.caller_symbol.as_deref() {
+            assert!(qualified.contains(caller), "dangling caller {caller}");
+        }
+    }
 }
 
 fn relation<'a>(
