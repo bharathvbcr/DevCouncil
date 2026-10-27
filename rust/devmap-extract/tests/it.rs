@@ -35,6 +35,8 @@ mod an_unreadable_subtree_is_a_hole_not_a_dead_build;
 #[cfg(feature = "parse")]
 mod attack_build_cancel;
 #[cfg(feature = "parse")]
+mod attack_sql_ddl;
+#[cfg(feature = "parse")]
 mod attack_swift_residue;
 #[cfg(feature = "parse")]
 mod budget_attack;

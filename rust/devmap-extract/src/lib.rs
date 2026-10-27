@@ -97,6 +97,10 @@ mod pyfacts;
 pub mod pyproject;
 #[cfg(feature = "parse")]
 mod rustlocal;
+// SQL relations a dialect ERROR swallowed. Reads the source text; its one
+// caller is `extract_file_unfiltered`, after the grammar pass.
+#[cfg(feature = "parse")]
+mod sqlddl;
 // The names a Swift callable binds and the types it writes for them. Walks a
 // parse tree; its callers are `treesitter::collect_site_bindings` and
 // `treesitter::collect_scope_locals`.
@@ -785,7 +789,12 @@ fn extract_file_unfiltered(path: &str, source: &str, budget: std::time::Duration
         return notebook::extract_notebook_bounded(path, source, budget);
     }
     let lang = detect_language(Path::new(path));
-    treesitter::extract_treesitter_with_budget(path, lang, source, budget)
+    // The grammar pass disarms its own clock when it returns, so recovery is
+    // handed the same instant the file's budget ends.
+    let deadline = std::time::Instant::now() + budget;
+    let mut extraction = treesitter::extract_treesitter_with_budget(path, lang, source, budget);
+    sqlddl::recover_lost_relations(&mut extraction, source, deadline);
+    extraction
 }
 
 #[cfg(feature = "parse")]
