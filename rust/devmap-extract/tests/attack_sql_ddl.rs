@@ -268,15 +268,9 @@ CREATE TABLE z (id int);
     );
 }
 
-/// Contracts 3, 4, 5 over a spread of dialects: the same input gives the same
-/// extraction twice, every span is inside the file on char boundaries, and a
-/// file the grammar parsed `Clean` keeps every symbol with its span.
-///
-/// Written as a battery so a regression names the input. It is expected to
-/// pass today; it is the record of what held.
-#[test]
-fn attack_sql_battery_is_deterministic_in_bounds_and_loses_nothing_clean() {
-    let corpus: &[(&str, &str)] = &[
+/// The battery below, shared with the recovery-versus-grammar guard in
+/// `sql_check_constraint_parse.rs`.
+pub(crate) const BATTERY: &[(&str, &str)] = &[
         ("crlf", "CREATE VIRTUAL TABLE d USING fts5(x);\r\nCREATE TABLE z (id int);\r\n"),
         ("bom", "\u{feff}CREATE VIRTUAL TABLE d USING fts5(x);\nCREATE TABLE z (id int);\n"),
         ("unicode names", "CREATE TABLE \"表\" (id int);\nCREATE TABLE é (id int);\n"),
@@ -295,8 +289,17 @@ fn attack_sql_battery_is_deterministic_in_bounds_and_loses_nothing_clean() {
         ("hash comment", "# it's a comment\nCREATE VIRTUAL TABLE d USING fts5(x);\nCREATE TABLE z (id int);\n"),
         ("escaped string", "SELECT E'it\\'s';\nCREATE VIRTUAL TABLE d USING fts5(x);\nCREATE TABLE z (id int);\n"),
         ("multibyte near keyword", "CREATE TABLE t (CREATÉ INT);\nCREATE TABLE after_unicode (id INT);\n"),
-    ];
-    for (label, source) in corpus {
+];
+
+/// Contracts 3, 4, 5 over a spread of dialects: the same input gives the same
+/// extraction twice, every span is inside the file on char boundaries, and a
+/// file the grammar parsed `Clean` keeps every symbol with its span.
+///
+/// Written as a battery so a regression names the input. It is expected to
+/// pass today; it is the record of what held.
+#[test]
+fn attack_sql_battery_is_deterministic_in_bounds_and_loses_nothing_clean() {
+    for (label, source) in BATTERY {
         let first = extract_file("a.sql", source);
         let second = extract_file("a.sql", source);
         assert_eq!(

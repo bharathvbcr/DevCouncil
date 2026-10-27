@@ -515,9 +515,11 @@ fn assert_clean_file_loses_nothing(label: &str, source: &str) {
         assert!(
             full.symbols
                 .iter()
-                .any(|kept| kept.name == bare(&symbol.name)
-                    && kept.span.start_byte == symbol.span.start_byte
-                    && kept.span.end_byte == symbol.span.end_byte),
+                .any(
+                    |kept| (kept.name == bare(&symbol.name) || kept.name == symbol.name)
+                        && kept.span.start_byte == symbol.span.start_byte
+                        && kept.span.end_byte == symbol.span.end_byte
+                ),
             "{label}: recovery removed `{}`: {:?}",
             symbol.name,
             declared(&full)
@@ -532,35 +534,209 @@ fn assert_clean_file_loses_nothing(label: &str, source: &str) {
     );
 }
 
+/// Inline SQL the grammar parses `Clean`. Every case is checked against the
+/// grammar alone by `recovery_on_a_clean_file_only_renames_what_it_owns`, and
+/// each is also one where a rename could go wrong.
+pub(crate) const CLEAN_CASES: &[(&str, &str)] = &[
+    (
+        "last statement has no semicolon",
+        "CREATE TABLE a(id int);\nCREATE TABLE b(id int)",
+    ),
+    (
+        "last statement has no semicolon and a trailing comment",
+        "CREATE TABLE a(id int);\nCREATE TABLE b(id int) -- end\n",
+    ),
+    (
+        "postgres transaction",
+        "BEGIN;\nCREATE TABLE t1 (id INT);\nEND;\nCREATE TABLE t2 (id INT);\n",
+    ),
+    (
+        "sqlite dump transaction",
+        "BEGIN TRANSACTION;\nCREATE TABLE t1 (id INT);\nCOMMIT;\nCREATE TABLE t2 (id INT);\n",
+    ),
+    (
+        "backslash that is a literal in a standard string",
+        "CREATE TABLE a (n TEXT DEFAULT 'C:\\');\nCREATE TABLE b (id INT);\n",
+    ),
+    (
+        "quoted names",
+        "CREATE TABLE \"a\" (id INT);\nCREATE TABLE `b` (id INT);\nCREATE TABLE c (id INT)",
+    ),
+    (
+        "a quoted name beside an unquoted one in another schema",
+        "CREATE TABLE s1.\"t\" (id INT);\nCREATE TABLE s2.t (id INT);\n",
+    ),
+];
+
+/// Inline SQL where quote normalization renames a symbol whose grammar name
+/// another symbol also carries. The grammar flags some of these (it cuts a
+/// bracketed name at the space), so they are not `Clean`; recovery's output
+/// still equals the grammar's except for anchored renames.
+pub(crate) const RENAME_CASES: &[(&str, &str)] = &[
+    (
+        "a bracketed name the grammar cuts short beside a view of that short name",
+        "CREATE TABLE [Order Details] (id int);\nCREATE VIEW Details AS SELECT id FROM src;\n",
+    ),
+    (
+        "two bracketed tables that the grammar names alike",
+        "CREATE TABLE [Order Details] (id int);\nCREATE TABLE [Order Details] (id int);\nCREATE VIEW Details AS SELECT id FROM src;\n",
+    ),
+    (
+        "a doubled quote in a name",
+        "CREATE TABLE \"a\"\"b\" (id int);\nCREATE VIEW a AS SELECT id FROM src;\n",
+    ),
+    (
+        "schema-qualified quoted names",
+        "CREATE TABLE \"s\".\"t\" (id int);\nCREATE VIEW t AS SELECT id FROM src;\n",
+    ),
+];
+
 #[test]
 fn a_clean_file_never_loses_a_symbol_to_recovery() {
-    for (label, source) in [
-        (
-            "last statement has no semicolon",
-            "CREATE TABLE a(id int);\nCREATE TABLE b(id int)",
-        ),
-        (
-            "last statement has no semicolon and a trailing comment",
-            "CREATE TABLE a(id int);\nCREATE TABLE b(id int) -- end\n",
-        ),
-        (
-            "postgres transaction",
-            "BEGIN;\nCREATE TABLE t1 (id INT);\nEND;\nCREATE TABLE t2 (id INT);\n",
-        ),
-        (
-            "sqlite dump transaction",
-            "BEGIN TRANSACTION;\nCREATE TABLE t1 (id INT);\nCOMMIT;\nCREATE TABLE t2 (id INT);\n",
-        ),
-        (
-            "backslash that is a literal in a standard string",
-            "CREATE TABLE a (n TEXT DEFAULT 'C:\\');\nCREATE TABLE b (id INT);\n",
-        ),
-        (
-            "quoted names",
-            "CREATE TABLE \"a\" (id INT);\nCREATE TABLE `b` (id INT);\nCREATE TABLE c (id INT)",
-        ),
-    ] {
+    for (label, source) in CLEAN_CASES {
         assert_clean_file_loses_nothing(label, source);
+    }
+}
+
+/// The strongest guard on a file the grammar parsed `Clean`: recovery's output
+/// equals the grammar's, symbol for symbol and edge for edge, except for a
+/// symbol whose name quote normalization anchored and renamed. A rename moves
+/// the edges that named the old qualified name, so it is allowed only when the
+/// renamed symbols are every symbol that held that name; otherwise an edge of
+/// one symbol lands on another.
+fn assert_recovery_only_renames_what_it_owns(label: &str, source: &str, clean: bool) -> bool {
+    let path = "guard.sql";
+    let grammar = devmap_extract::treesitter::extract_treesitter(path, "sql", source);
+    if clean && grammar.parse_outcome != ParseOutcome::Clean {
+        return false;
+    }
+    let full = extract_file(path, source);
+    assert_eq!(full.parse_outcome, grammar.parse_outcome, "{label}");
+    assert_eq!(full.symbols.len(), grammar.symbols.len(), "{label}");
+    // old qualified name -> (new qualified name, indices renamed)
+    let mut renamed: std::collections::HashMap<String, (String, Vec<usize>)> =
+        std::collections::HashMap::new();
+    for (index, (before, after)) in grammar.symbols.iter().zip(&full.symbols).enumerate() {
+        assert_eq!(
+            before.kind, after.kind,
+            "{label}: kind of `{}`",
+            before.name
+        );
+        assert_eq!(before.span.start_byte, after.span.start_byte, "{label}");
+        assert_eq!(before.span.end_byte, after.span.end_byte, "{label}");
+        if before.name == after.name && before.qualified_name == after.qualified_name {
+            continue;
+        }
+        assert!(
+            after.name.contains(bare(&before.name)),
+            "{label}: `{}` was renamed to `{}`, which is not an anchored form of it",
+            before.name,
+            after.name
+        );
+        let entry = renamed
+            .entry(before.qualified_name.clone())
+            .or_insert_with(|| (after.qualified_name.clone(), Vec::new()));
+        assert_eq!(
+            entry.0, after.qualified_name,
+            "{label}: one qualified name renamed two ways"
+        );
+        entry.1.push(index);
+    }
+    for (old, (_, renamed_indices)) in &renamed {
+        let holders: Vec<usize> = grammar
+            .symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, symbol)| &symbol.qualified_name == old)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            &holders, renamed_indices,
+            "{label}: `{old}` was renamed for some of its holders only, so the edges of \
+             the others moved with it"
+        );
+    }
+    let moved = |before: &Option<String>, after: &Option<String>| match (before, after) {
+        (a, b) if a == b => true,
+        (Some(old), Some(new)) => renamed.get(old).is_some_and(|(to, _)| to == new),
+        _ => false,
+    };
+    assert_eq!(full.calls.len(), grammar.calls.len(), "{label}: calls");
+    for (before, after) in grammar.calls.iter().zip(&full.calls) {
+        assert!(
+            moved(&before.caller_symbol, &after.caller_symbol),
+            "{label}: call caller {:?} became {:?}",
+            before.caller_symbol,
+            after.caller_symbol
+        );
+        let (mut a, mut b) = (before.clone(), after.clone());
+        a.caller_symbol = None;
+        b.caller_symbol = None;
+        assert_eq!(
+            serde_json::to_value(&a).unwrap(),
+            serde_json::to_value(&b).unwrap(),
+            "{label}"
+        );
+    }
+    assert_eq!(
+        full.references.len(),
+        grammar.references.len(),
+        "{label}: references"
+    );
+    for (before, after) in grammar.references.iter().zip(&full.references) {
+        assert!(
+            moved(&before.enclosing_symbol, &after.enclosing_symbol),
+            "{label}: reference enclosing {:?} became {:?}",
+            before.enclosing_symbol,
+            after.enclosing_symbol
+        );
+        let (mut a, mut b) = (before.clone(), after.clone());
+        a.enclosing_symbol = None;
+        b.enclosing_symbol = None;
+        assert_eq!(
+            serde_json::to_value(&a).unwrap(),
+            serde_json::to_value(&b).unwrap(),
+            "{label}"
+        );
+    }
+    true
+}
+
+#[test]
+fn recovery_on_a_clean_file_only_renames_what_it_owns() {
+    for (label, source) in CLEAN_CASES {
+        assert!(
+            assert_recovery_only_renames_what_it_owns(label, source, true),
+            "{label}: the grammar no longer parses this Clean, so the guard proves nothing"
+        );
+    }
+    for (label, source) in RENAME_CASES {
+        assert_recovery_only_renames_what_it_owns(label, source, false);
+    }
+    let mut checked = 0;
+    for (label, source) in crate::attack_sql_ddl::BATTERY {
+        if assert_recovery_only_renames_what_it_owns(label, source, true) {
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "no battery case parses Clean");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    for relative in [
+        "dc-store/src/workbench/attention.sql",
+        "dc-store/src/workbench/automation.sql",
+        "dc-store/src/workbench/decisions.sql",
+        "dc-store/src/workbench/enhancements.sql",
+        "dc-store/src/workbench/notifications.sql",
+        "dc-store/src/workbench/runs.sql",
+        "dc-store/src/workbench/schema.sql",
+        "tools/fanout.sql",
+    ] {
+        let path = root.join(relative);
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        // A repository file with a grammar error is outside this guard (its
+        // recovery is the point of the other tests); one that parses Clean is in.
+        assert_recovery_only_renames_what_it_owns(relative, &source, true);
     }
 }
 
@@ -823,6 +999,85 @@ CREATE TABLE after_go (id int);
     for table in ["Orders", "after_go"] {
         assert!(names.contains(&table), "missing {table}: {names:?}");
     }
+}
+
+/// A lone `go` (a column name) at depth zero inside a `BEGIN` body is not a
+/// T-SQL batch separator: honouring it ended the body there and read the next
+/// `CREATE` in it as top-level.
+#[test]
+fn a_go_inside_a_begin_body_does_not_end_the_body() {
+    let source = "\
+CREATE PROCEDURE p() BEGIN
+  SELECT 1;
+  go
+  ;
+  CREATE TABLE inside_body (id INT CHECK(json_valid(id)));
+END;
+CREATE TABLE after_p (id INT);
+";
+    let grammar = grammar_only(source);
+    assert!(
+        declared(&grammar).contains(&"inside_body"),
+        "control: the grammar reads the body's table: {:?}",
+        declared(&grammar)
+    );
+    let extraction = extract_file("body.sql", source);
+    let names = declared(&extraction);
+    assert!(names.contains(&"after_p"), "{names:?}");
+    assert!(
+        !names.contains(&"inside_body"),
+        "a table written inside the procedure body is not a schema object: {names:?}"
+    );
+}
+
+/// A name with a quote in the middle is not one delimited identifier, so it is
+/// left as the grammar wrote it.
+#[test]
+fn a_schema_qualified_quoted_name_is_not_mangled() {
+    let source = "CREATE TABLE \"s\".\"t\" (id int);\nCREATE TABLE \"u\".\"v\" (id int);\n";
+    let extraction = extract_file("qualified.sql", source);
+    for name in declared(&extraction) {
+        assert!(
+            !name.contains("\".\""),
+            "a qualified name was cut at its inner quotes: {name:?}"
+        );
+    }
+}
+
+/// Many symbols that share one qualified name are renamed as one group, in one
+/// pass: 5,000 overloads of a quoted function finish, and all share one name.
+#[test]
+fn thousands_of_quoted_overloads_are_unquoted_together() {
+    let mut source = String::new();
+    for index in 0..5_000 {
+        source.push_str(&format!(
+            "CREATE FUNCTION \"f\"(int{index}) RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;\n"
+        ));
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(devmap_extract::extract_file_with_budget(
+            "over.sql",
+            &source,
+            std::time::Duration::from_secs(60),
+        ));
+    });
+    let extraction = receiver
+        .recv_timeout(std::time::Duration::from_secs(90))
+        .expect("5,000 overloads did not finish within the hard timeout");
+    let functions: Vec<_> = extraction
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.kind == SymbolKind::Function)
+        .collect();
+    assert_eq!(functions.len(), 5_000);
+    let first = &functions[0];
+    assert!(
+        functions.iter().all(
+            |symbol| symbol.name == first.name && symbol.qualified_name == first.qualified_name
+        ),
+        "the overloads were split between two names"
+    );
 }
 
 /// Postgres overloads share one quoted name. They are normalised together or

@@ -145,6 +145,9 @@ pub(crate) fn recover_lost_relations(extraction: &mut Extraction, source: &str, 
         _ => return,
     };
     match plan(extraction, source, &errors, deadline) {
+        // Applying is linear but not interruptible, so the last look at the
+        // clock is here: a hit leaves the grammar's output as it was.
+        Ok(_) if past(deadline) => extraction.diagnostics.push(Abandon::Deadline.diagnostic()),
         Ok(plan) => {
             let stopped = plan.scan.unterminated_at;
             apply(extraction, plan, &errors);
@@ -176,6 +179,17 @@ fn plan(
     deadline: Instant,
 ) -> Result<Plan, Abandon> {
     let scan = scan_source(source, deadline)?;
+    // Symbols by start byte, so asking "did the grammar anchor a table here" is
+    // a lookup and not a walk over every symbol per statement.
+    let mut anchors: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (index, symbol) in extraction.symbols.iter().enumerate() {
+        if symbol.kind != SymbolKind::File {
+            anchors
+                .entry(symbol.span.start_byte)
+                .or_default()
+                .push(index);
+        }
+    }
     let mut installs = Vec::new();
     let mut reparses = 0usize;
     for statement in &scan.relations {
@@ -185,7 +199,15 @@ fn plan(
         if past(deadline) {
             return Err(Abandon::Deadline);
         }
-        if let Some(desired) = symbol_for(extraction, source, statement, &mut reparses, deadline)? {
+        let desired = symbol_for(
+            extraction,
+            &anchors,
+            source,
+            statement,
+            &mut reparses,
+            deadline,
+        )?;
+        if let Some(desired) = desired {
             installs.push(Install {
                 start: statement.start,
                 end: statement.end,
@@ -199,10 +221,15 @@ fn plan(
     Ok(Plan { scan, installs })
 }
 
-/// Qualified names that changed, old to new, and the qualified names the
-/// symbols hold. One pass over the edges applies the renames; a rename per
-/// symbol would walk every edge once per symbol. `held` is what keeps a rename
-/// from landing on a name another symbol already carries.
+/// Qualified names that changed, old to new, and the symbols that hold each
+/// qualified name. One pass over the edges applies the renames; a rename per
+/// symbol would walk every edge once per symbol.
+///
+/// An edge names its enclosing symbol by qualified name alone, so a rename that
+/// moves the edges of `old` moves them for every symbol that holds `old`. That
+/// is why [`Names::try_move`] is the only way a qualified name changes: it
+/// allows a move only for a set that is every holder of the old name, and only
+/// onto a name nobody holds.
 #[derive(Default)]
 struct Names {
     renames: HashMap<String, String>,
@@ -210,13 +237,6 @@ struct Names {
 }
 
 impl Names {
-    /// A symbol outside `group` holds `qualified`.
-    fn held_outside(&self, qualified: &str, group: &[usize]) -> bool {
-        self.held
-            .get(qualified)
-            .is_some_and(|holders| holders.iter().any(|holder| !group.contains(holder)))
-    }
-
     fn hold(&mut self, qualified: &str, index: usize) {
         self.held
             .entry(qualified.to_string())
@@ -224,17 +244,28 @@ impl Names {
             .push(index);
     }
 
-    fn moved(&mut self, index: usize, old: &str, new: &str) {
+    /// Some symbol holds `qualified`.
+    fn holds(&self, qualified: &str) -> bool {
+        self.held
+            .get(qualified)
+            .is_some_and(|holders| !holders.is_empty())
+    }
+
+    /// Move `group` from `old` to `new`. The group must be made of symbols that
+    /// hold `old`. Refused (and nothing recorded) unless it is every holder of
+    /// `old` and nothing holds `new`. Linear in the group.
+    fn try_move(&mut self, group: &[usize], old: &str, new: &str) -> bool {
         if old == new {
-            return;
+            return true;
         }
-        if let Some(holders) = self.held.get_mut(old) {
-            holders.retain(|holder| *holder != index);
+        let holders = self.held.get(old).map_or(0, Vec::len);
+        if holders != group.len() || self.holds(new) {
+            return false;
         }
-        self.hold(new, index);
-        self.renames
-            .entry(old.to_string())
-            .or_insert_with(|| new.to_string());
+        self.held.remove(old);
+        self.held.insert(new.to_string(), group.to_vec());
+        self.renames.insert(old.to_string(), new.to_string());
+        true
     }
 }
 
@@ -283,6 +314,10 @@ fn apply_scanned_names(
         .map(|(index, _)| index)
         .collect();
     order.sort_by_key(|&index| extraction.symbols[index].span.start_byte);
+    // Symbols to rename, grouped by the qualified name they hold and the name
+    // they are to take, so a rename that has to move every holder can.
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    let mut group_of: HashMap<(String, String), usize> = HashMap::new();
     for statement in relations.iter().filter(|statement| statement.delimited) {
         let first = order
             .partition_point(|&index| extraction.symbols[index].span.start_byte < statement.start);
@@ -291,9 +326,23 @@ fn apply_scanned_names(
             .copied()
             .take_while(|&index| extraction.symbols[index].span.start_byte == statement.start)
             .find(|&index| is_fragment_of(&extraction.symbols[index].name, &statement.name));
-        if let Some(index) = anchored {
-            set_name(&mut extraction.symbols, index, &statement.name, file, names);
+        let Some(index) = anchored else {
+            continue;
+        };
+        let key = (
+            extraction.symbols[index].qualified_name.clone(),
+            statement.name.clone(),
+        );
+        match group_of.get(&key) {
+            Some(&group) => groups[group].1.push(index),
+            None => {
+                group_of.insert(key, groups.len());
+                groups.push((statement.name.clone(), vec![index]));
+            }
         }
+    }
+    for (name, group) in groups {
+        rename_group(&mut extraction.symbols, &group, &name, file, names);
     }
 }
 
@@ -316,6 +365,7 @@ struct Statement {
 
 fn symbol_for(
     extraction: &Extraction,
+    anchors: &HashMap<usize, Vec<usize>>,
     source: &str,
     statement: &Statement,
     reparses: &mut usize,
@@ -326,12 +376,13 @@ fn symbol_for(
     }
     // The grammar already anchored this table at its own `CREATE`. A confined
     // error inside it (`CHECK(abs(a)>0)`) is not a reason to read it again.
-    if extraction.symbols.iter().any(|symbol| {
-        symbol.kind != SymbolKind::File
-            && symbol.span.start_byte == statement.start
-            && symbol.span.end_byte <= statement.end
-            && same_name(&symbol.name, &statement.name)
-    }) {
+    let anchored = anchors.get(&statement.start).is_some_and(|indices| {
+        indices.iter().any(|&index| {
+            let symbol = &extraction.symbols[index];
+            symbol.span.end_byte <= statement.end && same_name(&symbol.name, &statement.name)
+        })
+    });
+    if anchored {
         return Ok(None);
     }
     if *reparses >= MAX_REPARSES {
@@ -423,11 +474,10 @@ fn install_symbol(
         overlaps(symbol.span.start_byte, symbol.span.end_byte, start, end)
     });
     if let Some(index) = overlapping {
-        if names.held_outside(&desired.qualified_name, &[index]) {
+        let existing = &mut extraction.symbols[index];
+        if !names.try_move(&[index], &existing.qualified_name, &desired.qualified_name) {
             return;
         }
-        let existing = &mut extraction.symbols[index];
-        names.moved(index, &existing.qualified_name, &desired.qualified_name);
         existing.name = desired.name;
         existing.span = desired.span;
         existing.kind = desired.kind;
@@ -441,7 +491,7 @@ fn install_symbol(
         symbol.span.start_byte == desired.span.start_byte
             && symbol.span.end_byte == desired.span.end_byte
     });
-    if duplicate || names.held_outside(&desired.qualified_name, &[]) {
+    if duplicate || names.holds(&desired.qualified_name) {
         return;
     }
     let index = extraction.symbols.len();
@@ -532,9 +582,10 @@ fn scan(source: &str, backslash: bool, deadline: Instant) -> Result<Scan, Abando
             i += 1;
             continue;
         }
-        if paren == 0 {
+        // `GO` is T-SQL's batch separator and T-SQL forbids it inside a
+        // `BEGIN`; a lone `go` in a body elsewhere is a name.
+        if paren == 0 && block == 0 {
             if let Some(next) = go_line(source, i) {
-                block = 0;
                 i = next;
                 continue;
             }
@@ -970,7 +1021,7 @@ fn statement_end(source: &str, start: usize, ctx: Ctx) -> Option<(usize, bool)> 
             return Some((i + ctx.delimiter.len(), true));
         }
         // A `GO` line ends a T-SQL batch, and so the statement before it.
-        if paren == 0 && go_line(source, i).is_some() {
+        if paren == 0 && block == 0 && go_line(source, i).is_some() {
             let end = source[start..i].trim_end().len() + start;
             return (end > start).then_some((end, true));
         }
@@ -1400,8 +1451,10 @@ fn same_name(found: &str, wanted: &str) -> bool {
     found == wanted || unquote(found).as_deref() == Some(wanted)
 }
 
-/// Strip one pair of `"`, `` ` `` or `[]` quotes. Doubled closers are one
-/// character of the name. `None` when `name` is not a quoted identifier.
+/// Strip the quotes of a name that is one delimited identifier: `"a"`,
+/// `` `a` `` or `[a]`, where a doubled closer is one character of the name.
+/// `None` for anything else, including `"s"."t"` (a closing quote in the middle
+/// ends the identifier early, so the whole is not one).
 fn unquote(name: &str) -> Option<String> {
     let bytes = name.as_bytes();
     if bytes.len() < 2 {
@@ -1419,10 +1472,14 @@ fn unquote(name: &str) -> Option<String> {
     let mut out = String::new();
     let mut i = 1usize;
     while i < end {
-        if bytes[i] == closer && i + 1 < end && bytes[i + 1] == closer {
-            out.push(closer as char);
-            i += 2;
-            continue;
+        if bytes[i] == closer {
+            // Only a doubled closer is a character of the name.
+            if i + 1 < end && bytes[i + 1] == closer {
+                out.push(closer as char);
+                i += 2;
+                continue;
+            }
+            return None;
         }
         let ch = name.get(i..)?.chars().next()?;
         if i + ch.len_utf8() > end {
@@ -1463,21 +1520,11 @@ fn normalize_quoted_names(extraction: &mut Extraction, file: &str, names: &mut N
     }
 }
 
-fn set_name(
-    symbols: &mut [ExtractedSymbol],
-    index: usize,
-    name: &str,
-    file: &str,
-    names: &mut Names,
-) {
-    rename_group(symbols, &[index], name, file, names);
-}
-
 /// Give symbols that share a name and a qualified name a new name, and record
-/// the qualified name they left so the edges that named them can follow. A
-/// qualified name a symbol outside the group already holds is never taken: the
-/// whole group keeps the grammar's name. The first rename of a qualified name
-/// wins.
+/// the qualified name they left so the edges that named them can follow. The
+/// group must be every symbol that holds that qualified name, and nothing may
+/// hold the new one ([`Names::try_move`]); otherwise nothing changes and the
+/// symbols keep the grammar's name. This is the one place a name is rewritten.
 fn rename_group(
     symbols: &mut [ExtractedSymbol],
     group: &[usize],
@@ -1493,13 +1540,12 @@ fn rename_group(
     }
     let old_qualified = symbols[lead].qualified_name.clone();
     let new_qualified = renamed(&old_qualified, &symbols[lead].name, name, file);
-    if names.held_outside(&new_qualified, group) {
+    if !names.try_move(group, &old_qualified, &new_qualified) {
         return;
     }
     for &index in group {
         symbols[index].qualified_name = new_qualified.clone();
         symbols[index].name = name.to_string();
-        names.moved(index, &old_qualified, &new_qualified);
     }
 }
 
@@ -1795,6 +1841,40 @@ CREATE TABLE work_events (id INT CHECK(json_valid(id)));
         assert!(eat_brackets(b"[[1,2]", 0).is_none());
         assert_eq!(nested_comment_end(b"/* a /* b */ c */ x", 0), Some(17));
         assert_eq!(nested_comment_end(b"/* a /* b */ c", 0), None);
+    }
+
+    #[test]
+    fn a_name_is_unquoted_only_when_it_is_one_delimited_identifier() {
+        assert_eq!(unquote("\"a\"").as_deref(), Some("a"));
+        assert_eq!(unquote("`a`").as_deref(), Some("a"));
+        assert_eq!(unquote("[a b]").as_deref(), Some("a b"));
+        assert_eq!(unquote("\"a\"\"b\"").as_deref(), Some("a\"b"));
+        assert_eq!(unquote("\"s\".\"t\""), None);
+        assert_eq!(unquote("\"s\"x\"t\""), None);
+        assert_eq!(unquote("`a`.`b`"), None);
+        assert_eq!(unquote("[a].[b]"), None);
+        assert_eq!(unquote("\"\""), None);
+        assert_eq!(unquote("plain"), None);
+    }
+
+    #[test]
+    fn a_group_moves_only_when_it_is_every_holder_of_the_old_name() {
+        let mut names = Names::default();
+        for index in 0..4 {
+            names.hold("f.sql::old", index);
+        }
+        names.hold("f.sql::taken", 9);
+        // Two of four holders: refused, nothing recorded.
+        assert!(!names.try_move(&[0, 1], "f.sql::old", "f.sql::new"));
+        assert!(names.renames.is_empty());
+        assert_eq!(names.held["f.sql::old"].len(), 4);
+        // The new name is held by someone else: refused.
+        assert!(!names.try_move(&[0, 1, 2, 3], "f.sql::old", "f.sql::taken"));
+        // Every holder, and the new name free: moved together.
+        assert!(names.try_move(&[0, 1, 2, 3], "f.sql::old", "f.sql::new"));
+        assert!(!names.held.contains_key("f.sql::old"));
+        assert_eq!(names.held["f.sql::new"], vec![0, 1, 2, 3]);
+        assert_eq!(names.renames["f.sql::old"], "f.sql::new");
     }
 
     #[test]
