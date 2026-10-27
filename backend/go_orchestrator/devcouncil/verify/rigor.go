@@ -201,10 +201,20 @@ func runRigorGates(ctx context.Context, in Input, taskID string, planned []strin
 		applied:          result.GatesRun(),
 		coverageMeasured: result.Coverage().Measured,
 	}
-	if len(result.StubASTDegraded) > 0 {
-		out.degradedReasons = append(out.degradedReasons, "stub detection read "+itoa(len(result.StubASTDegraded))+
+	stubDegraded, binaryScanDegraded := dcverify.SplitDegraded(result.StubASTDegraded)
+	if len(stubDegraded) > 0 {
+		out.degradedReasons = append(out.degradedReasons, "stub detection read "+itoa(len(stubDegraded))+
 			" file(s) with the weaker line checks because the syntax tree could not analyse them: "+
-			strings.Join(result.StubASTDegraded, "; "))
+			strings.Join(stubDegraded, "; "))
+	}
+	if len(binaryScanDegraded) > 0 {
+		// A different check from the stub fallback above, named as itself: these
+		// binary files carry no bytes in the diff, and the secret scan could not
+		// read them from the working tree. They have not been scanned for
+		// credentials.
+		out.degradedReasons = append(out.degradedReasons, "secret scan did not read "+itoa(len(binaryScanDegraded))+
+			" binary file(s), so they have not been scanned for credentials: "+
+			strings.Join(binaryScanDegraded, "; "))
 	}
 	if out.coverageMeasured {
 		cov := result.Coverage()

@@ -100,44 +100,66 @@ func (s *GitSession) dirtySubmodules(ctx context.Context, depth int, pathspecs [
 	return dirty, nil
 }
 
+// SubmoduleChanges is what a dirty submodule's working tree changed, as
+// superproject-relative paths.
+type SubmoduleChanges struct {
+	// Files are changed files that are on disk, and so have bytes to read.
+	Files []string
+	// Deleted are changed files that are named but no longer on disk. A
+	// deletion has no bytes: it is a change with nothing to scan, which is not
+	// the same as a read that failed.
+	Deleted []string
+}
+
+// Empty reports that git named no change at all.
+func (c SubmoduleChanges) Empty() bool { return len(c.Files) == 0 && len(c.Deleted) == 0 }
+
 // SubmoduleWorktreeFiles names the tracked files a dirty submodule has changed,
 // as superproject-relative paths. The listing is the guarded
 // `diff HEAD --name-only -z` this session already uses: the superproject's
 // git, the submodule's filters and fsmonitor not run, symlink gitlinks refused.
-// A deletion (named, not on disk) is omitted. A symlink, a path that escapes
-// the submodule, or a read that fails is an error — never a followed read and
-// never a partial list reported as complete.
-func (s *GitSession) SubmoduleWorktreeFiles(ctx context.Context, submodulePath string) ([]string, error) {
+// A deletion (named, not on disk) is reported in Deleted. A symlink, a path
+// that escapes the submodule, or a read that fails is an error — never a
+// followed read and never a partial list reported as complete.
+func (s *GitSession) SubmoduleWorktreeFiles(ctx context.Context, submodulePath string) (SubmoduleChanges, error) {
 	if !filepath.IsLocal(filepath.FromSlash(submodulePath)) {
-		return nil, fmt.Errorf("refusing submodule path %q", submodulePath)
+		return SubmoduleChanges{}, fmt.Errorf("refusing submodule path %q", submodulePath)
 	}
 	return s.submoduleWorktreeFiles(ctx, submodulePath, 1)
 }
 
-func (s *GitSession) submoduleWorktreeFiles(ctx context.Context, submodulePath string, depth int) ([]string, error) {
+func (s *GitSession) submoduleWorktreeFiles(ctx context.Context, submodulePath string, depth int) (SubmoduleChanges, error) {
 	if depth > maxSubmoduleDepth {
-		return nil, fmt.Errorf("submodules under %s nest deeper than %d; refusing to report a partial answer", s.root, maxSubmoduleDepth)
+		return SubmoduleChanges{}, fmt.Errorf("submodules under %s nest deeper than %d; refusing to report a partial answer", s.root, maxSubmoduleDepth)
 	}
 	dir, ok, err := s.submoduleDir(submodulePath)
 	if err != nil {
-		return nil, err
+		return SubmoduleChanges{}, err
 	}
 	if !ok {
-		return nil, fmt.Errorf("submodule %s is not a checked-out directory", submodulePath)
+		return SubmoduleChanges{}, fmt.Errorf("submodule %s is not a checked-out directory", submodulePath)
 	}
 	sub := &GitSession{root: dir, git: s.git}
 	listing, err := sub.output(ctx, 1<<20, "diff", "HEAD", "--name-only", "-z")
 	if err != nil {
-		return nil, fmt.Errorf("submodule %s: %w", submodulePath, err)
+		return SubmoduleChanges{}, fmt.Errorf("submodule %s: %w", submodulePath, err)
 	}
-	var out []string
+	var out SubmoduleChanges
 	seen := map[string]struct{}{}
-	add := func(rel string) {
+	add := func(into *[]string, rel string) {
 		if _, ok := seen[rel]; ok {
 			return
 		}
 		seen[rel] = struct{}{}
-		out = append(out, rel)
+		*into = append(*into, rel)
+	}
+	merge := func(from SubmoduleChanges, prefix string) {
+		for _, n := range from.Files {
+			add(&out.Files, pathJoinSlash(prefix, n))
+		}
+		for _, n := range from.Deleted {
+			add(&out.Deleted, pathJoinSlash(prefix, n))
+		}
 	}
 	for _, raw := range bytes.Split(listing, []byte{0}) {
 		name := strings.TrimSpace(strings.ReplaceAll(string(raw), "\\", "/"))
@@ -145,49 +167,46 @@ func (s *GitSession) submoduleWorktreeFiles(ctx context.Context, submodulePath s
 			continue
 		}
 		if !filepath.IsLocal(filepath.FromSlash(name)) {
-			return nil, fmt.Errorf("submodule %s names %q, which is not a plain path", submodulePath, name)
+			return SubmoduleChanges{}, fmt.Errorf("submodule %s names %q, which is not a plain path", submodulePath, name)
 		}
 		info, missing, serr := lstatWithin(dir, name)
 		if serr != nil {
-			return nil, fmt.Errorf("submodule %s: %s", submodulePath, serr.Error())
-		}
-		if missing {
-			continue
+			return SubmoduleChanges{}, fmt.Errorf("submodule %s: %s", submodulePath, serr.Error())
 		}
 		rel := pathJoinSlash(submodulePath, name)
+		if missing {
+			add(&out.Deleted, rel)
+			continue
+		}
 		if info.Mode()&os.ModeSymlink != 0 {
-			return nil, fmt.Errorf("refusing to follow symlink %s", rel)
+			return SubmoduleChanges{}, fmt.Errorf("refusing to follow symlink %s", rel)
 		}
 		if info.IsDir() {
 			nested, nerr := sub.submoduleWorktreeFiles(ctx, name, depth+1)
 			if nerr != nil {
-				return nil, nerr
+				return SubmoduleChanges{}, nerr
 			}
-			for _, n := range nested {
-				add(pathJoinSlash(submodulePath, n))
-			}
+			merge(nested, submodulePath)
 			continue
 		}
 		if !info.Mode().IsRegular() {
-			return nil, fmt.Errorf("submodule %s: %s is not a regular file", submodulePath, name)
+			return SubmoduleChanges{}, fmt.Errorf("submodule %s: %s is not a regular file", submodulePath, name)
 		}
-		add(rel)
+		add(&out.Files, rel)
 	}
 	// Name-only is run with --ignore-submodules=dirty, so a nested dirty
 	// submodule is not in the listing above. Ask the same guarded walk
 	// DirtySubmodules uses, one level down, and do not reset its depth.
 	nested, err := sub.dirtySubmodules(ctx, depth, nil)
 	if err != nil {
-		return nil, fmt.Errorf("submodule %s: %w", submodulePath, err)
+		return SubmoduleChanges{}, fmt.Errorf("submodule %s: %w", submodulePath, err)
 	}
 	for _, name := range nested {
 		inner, err := sub.submoduleWorktreeFiles(ctx, name, depth+1)
 		if err != nil {
-			return nil, err
+			return SubmoduleChanges{}, err
 		}
-		for _, n := range inner {
-			add(pathJoinSlash(submodulePath, n))
-		}
+		merge(inner, submodulePath)
 	}
 	return out, nil
 }

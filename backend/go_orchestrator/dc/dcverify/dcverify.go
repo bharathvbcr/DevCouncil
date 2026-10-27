@@ -326,6 +326,10 @@ type Result struct {
 	// checks instead. A file listed here has not had the examination an
 	// unlisted one has, so the host reports the run degraded. An older
 	// verifier sends none, which reads as no degradation reported.
+	//
+	// The list also carries a binary file the secret scan could not read, as
+	// "path: secret scan skipped (binary file not read: reason)". SplitDegraded
+	// tells the two kinds apart.
 	StubASTDegraded []string `json:"stub_ast_degraded"`
 
 	// The coverage arrays as they arrive. Callers read Coverage instead, which
@@ -368,6 +372,30 @@ type wireResult struct {
 	// cost the additive rule exists to avoid. Detecting the absent key is
 	// exact, and it fails in only the direction that is actually unsafe.
 	Substance *Substance `json:"substance"`
+}
+
+// BinaryScanSkippedMarker is what dcverify writes between a path and its
+// reason when the secret scan could not read a binary file. The wire's one
+// degradation list, stub_ast_degraded, carries both kinds of entry, and the
+// public JSON contract has no second key for them, so the kind is in the text.
+// It is the exact text of rust/dc-verify/src/bin/dcverify.rs
+// (BINARY_SCAN_SKIPPED); a test in this package pins the two together.
+const BinaryScanSkippedMarker = ": secret scan skipped ("
+
+// SplitDegraded separates StubASTDegraded into the files the stub checks read
+// with the weaker line checks and the binary files the secret scan could not
+// read. Both are degradations; they are different checks, and an operator told
+// "stub detection read N files" about a skipped credential scan cannot tell
+// that a binary file was never looked at.
+func SplitDegraded(entries []string) (stub, binaryScan []string) {
+	for _, entry := range entries {
+		if strings.Contains(entry, BinaryScanSkippedMarker) {
+			binaryScan = append(binaryScan, entry)
+		} else {
+			stub = append(stub, entry)
+		}
+	}
+	return stub, binaryScan
 }
 
 // Coverage returns the coverage answer together with whether it was measured.

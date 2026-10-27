@@ -153,55 +153,64 @@ func TestAnUntrackedSymlinkIsNotFollowed(t *testing.T) {
 	}
 }
 
-func TestADirtySubmoduleFileIsScanned(t *testing.T) {
-	key := exampleAWSKey()
-	git := testsupport.Tool(t, "git")
-	root := gitRepo(t)
-	src := filepath.Join(t.TempDir(), "sub-src")
-	run := func(dir string, args ...string) {
-		t.Helper()
-		cmd := exec.Command(git, args...)
-		cmd.Dir = dir
-		cmd.Env = append(os.Environ(),
-			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.invalid",
-			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.invalid",
-			"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("git %v in %s: %v %s", args, dir, err, out)
-		}
+func runGitIn(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command(testsupport.Tool(t, "git"), args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.invalid",
+		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.invalid",
+		"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v in %s: %v %s", args, dir, err, out)
 	}
+}
+
+// submoduleRepo returns a repository whose committed submodule `sub` holds
+// s.txt and keep.txt, both clean.
+func submoduleRepo(t *testing.T) (root, subDir string) {
+	t.Helper()
+	root = gitRepo(t)
+	src := filepath.Join(t.TempDir(), "sub-src")
 	if err := os.MkdirAll(src, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	run(src, "init", "-q")
+	runGitIn(t, src, "init", "-q")
 	writeFile(t, src, "s.txt", "ok\n")
-	run(src, "add", "s.txt")
-	run(src, "commit", "-qm", "s")
-	run(root, "-c", "protocol.file.allow=always", "submodule", "add", "-q", src, "sub")
-	run(root, "commit", "-qm", "sub")
-	writeFile(t, filepath.Join(root, "sub"), "s.txt", "let aws_key = \""+key+"\";\n")
+	writeFile(t, src, "keep.txt", "keep\n")
+	runGitIn(t, src, "add", "s.txt", "keep.txt")
+	runGitIn(t, src, "commit", "-qm", "s")
+	runGitIn(t, root, "-c", "protocol.file.allow=always", "submodule", "add", "-q", src, "sub")
+	runGitIn(t, root, "commit", "-qm", "sub")
+	return root, filepath.Join(root, "sub")
+}
 
+// verifyPlanned collects the tree and runs the gates over it with the given
+// planned paths, the way the host does.
+func verifyPlanned(t *testing.T, root, id string, planned ...dc.PlannedFile) ([]verify.Gap, verify.MCPResult) {
+	t.Helper()
 	changed, diff, empty, err := verify.CollectGitState(context.Background(), root)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("CollectGitState: %v", err)
 	}
 	if empty {
-		t.Fatal("dirty submodule collected as an empty tree")
-	}
-	if strings.Contains(diff, key) {
-		// The bytes were included, which is what the scanner needs. The
-		// report below must still not quote them.
+		t.Fatal("the change was collected as an empty tree")
 	}
 	in := verify.Input{
-		Task: &store.Task{
-			ID: "TASK-SUB", Difficulty: "easy",
-			PlannedFiles: []dc.PlannedFile{{Path: "sub/s.txt", AllowedChange: dc.ChangeModify}},
-		},
+		Task:     &store.Task{ID: id, Difficulty: "easy", PlannedFiles: planned},
 		GateMode: "enforce", ChangedFiles: changed, DiffContent: diff, DiffEmpty: empty,
 		WorkPresent: !empty, Rigor: dcverify.New(testsupport.DCVerify(t), root),
 	}
 	gaps, meta := verify.Run(context.Background(), in)
-	result := verify.ToMCP("TASK-SUB", gaps, meta)
+	return gaps, verify.ToMCP(id, gaps, meta)
+}
+
+// requireSecretFinding fails unless the run is not verified and carries a
+// security_risk gap: the credential was read and found. An
+// unavailable-rigor gap is a different fact and is not accepted here — that is
+// "could not look", and the point of the test is that it looked.
+func requireSecretFinding(t *testing.T, result verify.MCPResult, gaps []verify.Gap, key string) {
+	t.Helper()
 	reportLeaks(t, result, gaps, key)
 	if result.RigorSkippedReason != "" {
 		t.Fatalf("rigor skipped: %q", result.RigorSkippedReason)
@@ -209,14 +218,76 @@ func TestADirtySubmoduleFileIsScanned(t *testing.T) {
 	if result.Passed || result.Status == "verified" {
 		t.Fatalf("status=%s passed=%v", result.Status, result.Passed)
 	}
-	found := false
 	for _, g := range gaps {
-		if g.GapType == "security_risk" || g.GapType == "rigor_check_unavailable" {
-			found = true
+		if g.GapType == "security_risk" {
+			return
 		}
 	}
-	if !found {
-		t.Fatal("dirty submodule bytes produced neither a secret finding nor an unavailable gap")
+	t.Fatal("the credential in the submodule file was not found: no security_risk gap")
+}
+
+func TestADirtySubmoduleFileIsScanned(t *testing.T) {
+	key := exampleAWSKey()
+	secret := "let aws_key = \"" + key + "\";\n"
+	planned := []dc.PlannedFile{
+		{Path: "sub", AllowedChange: dc.ChangeModify},
+		{Path: "sub/s.txt", AllowedChange: dc.ChangeModify},
+	}
+
+	t.Run("worktree only", func(t *testing.T) {
+		root, subDir := submoduleRepo(t)
+		writeFile(t, subDir, "s.txt", secret)
+		_, diff, _, err := verify.CollectGitState(context.Background(), root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(diff, key) {
+			t.Fatal("the submodule file's bytes were not read into the diff")
+		}
+		gaps, result := verifyPlanned(t, root, "TASK-SUB", planned...)
+		requireSecretFinding(t, result, gaps, key)
+	})
+
+	// The submodule's checked-out commit moved, so the superproject diff already
+	// carries a header for `sub` (a Subproject commit hunk). The uncommitted
+	// bytes inside it are still unscanned unless that header is ignored.
+	t.Run("pointer moved", func(t *testing.T) {
+		root, subDir := submoduleRepo(t)
+		writeFile(t, subDir, "keep.txt", "keep two\n")
+		runGitIn(t, subDir, "commit", "-qam", "move the pointer")
+		writeFile(t, subDir, "s.txt", secret)
+		_, diff, _, err := verify.CollectGitState(context.Background(), root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(diff, "Subproject commit") {
+			t.Fatal("fixture did not move the submodule pointer")
+		}
+		if !strings.Contains(diff, key) {
+			t.Fatal("the submodule file's uncommitted bytes were not read into the diff")
+		}
+		gaps, result := verifyPlanned(t, root, "TASK-SUB-MOVED", planned...)
+		requireSecretFinding(t, result, gaps, key)
+	})
+}
+
+// A submodule whose only change is a deleted file has no bytes to scan. That
+// is a change with nothing to read, not a read that failed.
+func TestADeletionOnlySubmoduleIsNotAnUnreadableRead(t *testing.T) {
+	root, subDir := submoduleRepo(t)
+	if err := os.Remove(filepath.Join(subDir, "s.txt")); err != nil {
+		t.Fatal(err)
+	}
+	gaps, result := verifyPlanned(t, root, "TASK-SUB-DEL",
+		dc.PlannedFile{Path: "sub", AllowedChange: dc.ChangeModify},
+		dc.PlannedFile{Path: "sub/s.txt", AllowedChange: dc.ChangeDelete})
+	for _, g := range gaps {
+		if g.GapType == "rigor_check_unavailable" {
+			t.Fatalf("a deletion-only submodule change blocked as an unreadable read: %s", g.Description)
+		}
+	}
+	if result.RigorSkippedReason != "" {
+		t.Fatalf("rigor skipped: %q", result.RigorSkippedReason)
 	}
 }
 

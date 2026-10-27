@@ -429,7 +429,10 @@ func CollectGitState(ctx context.Context, root string) (changed []string, diff s
 		headless, nameOut = true, nil
 	}
 	seen := map[string]struct{}{}
-	add := func(listing []byte) {
+	// tracked is the set `git diff HEAD` carries a section for: the paths its
+	// own name-only listing named, spelled the way changed spells them.
+	tracked := map[string]struct{}{}
+	add := func(listing []byte, into map[string]struct{}) {
 		for _, p := range strings.Split(string(listing), "\x00") {
 			p = strings.TrimSpace(strings.ReplaceAll(p, "\\", "/"))
 			// Tool-owned state is not the agent's work; policy.ToolStateDirs
@@ -437,18 +440,21 @@ func CollectGitState(ctx context.Context, root string) (changed []string, diff s
 			if p == "" || policy.IsToolState(p) {
 				continue
 			}
+			if into != nil {
+				into[p] = struct{}{}
+			}
 			if _, ok := seen[p]; !ok {
 				changed = append(changed, p)
 				seen[p] = struct{}{}
 			}
 		}
 	}
-	add(nameOut)
+	add(nameOut, tracked)
 	untracked, err := runGit(ctx, git, gitListingLimit, "ls-files", "--others", "--exclude-standard", "-z")
 	if err != nil {
 		return nil, "", true, err
 	}
-	add(untracked)
+	add(untracked, nil)
 	// The diff reads pass --ignore-submodules=dirty, so git does not run a
 	// status inside each submodule; dirtiness comes from a guarded read of
 	// each one, and a dirty submodule is a changed path as it was before.
@@ -456,7 +462,7 @@ func CollectGitState(ctx context.Context, root string) (changed []string, diff s
 	if err != nil {
 		return nil, "", true, err
 	}
-	add([]byte(strings.Join(dirty, "\x00")))
+	add([]byte(strings.Join(dirty, "\x00")), nil)
 	if !headless {
 		diffBytes, err := runGit(ctx, git, gitDiffLimit, append([]string{"-c", "core.quotePath=false", "diff", "HEAD"}, toolStateExcludes()...)...)
 		if err != nil {
@@ -464,7 +470,7 @@ func CollectGitState(ctx context.Context, root string) (changed []string, diff s
 		}
 		diff = string(diffBytes)
 	}
-	diff, err = attachMissingDiffBytes(ctx, git, root, changed, diff)
+	diff, err = attachMissingDiffBytes(ctx, git, root, changed, tracked, dirty, diff)
 	if err != nil {
 		return nil, "", true, err
 	}

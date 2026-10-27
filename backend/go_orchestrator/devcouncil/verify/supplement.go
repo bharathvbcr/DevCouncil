@@ -23,16 +23,35 @@ const binaryProbeBytes = 8192
 // files inside a dirty submodule (that diff is run with
 // --ignore-submodules=dirty).
 //
+// tracked is the set of paths `git diff HEAD --name-only -z` named, which is
+// exactly the set of paths the diff carries a section for. It is read from that
+// NUL-delimited listing rather than parsed out of `diff --git` headers, which
+// quote some names and are ambiguous for others (a name holding " b/").
+//
+// dirty names the submodules whose working trees hold uncommitted changes. A
+// dirty submodule is never "present" because it is tracked: when its checked-out
+// commit moved, the diff carries a header for it — a `Subproject commit` hunk
+// that holds none of the bytes of the files edited inside it.
+//
 // The result is what dcverify already scans. It is capped by gitDiffLimit,
 // including the diff git already returned. A path that is a symlink, escapes
 // the root, or cannot be read fails the whole read — a gap, not a skip, and
 // not a partial diff that looks complete. Secret paths are included; the
 // host withholds their values when it builds gap evidence.
-func attachMissingDiffBytes(ctx context.Context, git *proc.GitSession, root string, changed []string, diff string) (out string, err error) {
+func attachMissingDiffBytes(ctx context.Context, git *proc.GitSession, root string, changed []string, tracked map[string]struct{}, dirty []string, diff string) (out string, err error) {
 	if len(changed) == 0 {
 		return diff, nil
 	}
-	present := diffHeaderPaths(diff)
+	isDirty := make(map[string]struct{}, len(dirty))
+	for _, path := range dirty {
+		isDirty[path] = struct{}{}
+	}
+	present := make(map[string]struct{}, len(tracked))
+	for path := range tracked {
+		if _, ok := isDirty[path]; !ok {
+			present[path] = struct{}{}
+		}
+	}
 	var missing []string
 	for _, path := range changed {
 		if _, ok := present[path]; ok {
@@ -85,14 +104,18 @@ func appendMissingPath(ctx context.Context, git *proc.GitSession, rootFS *os.Roo
 		return fmt.Errorf("refusing to follow symlink %s", path)
 	}
 	if info.IsDir() {
-		files, err := git.SubmoduleWorktreeFiles(ctx, path)
+		changes, err := git.SubmoduleWorktreeFiles(ctx, path)
 		if err != nil {
 			return err
 		}
-		if len(files) == 0 {
-			return fmt.Errorf("cannot include %s: no file bytes were readable", path)
+		// A dirty submodule for which git names no change at all is a
+		// disagreement between two reads, not a deletion: nothing is known about
+		// its bytes. A submodule whose every change is a deletion is different —
+		// those changes have no bytes, and each is recorded as a deletion below.
+		if changes.Empty() {
+			return fmt.Errorf("cannot include %s: the submodule is dirty but git named no changed file in it", path)
 		}
-		for _, file := range files {
+		for _, file := range changes.Files {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -100,6 +123,18 @@ func appendMissingPath(ctx context.Context, git *proc.GitSession, rootFS *os.Roo
 				continue
 			}
 			if err := appendRegularFile(ctx, rootFS, file, b); err != nil {
+				return err
+			}
+			present[file] = struct{}{}
+		}
+		for _, file := range changes.Deleted {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if _, ok := present[file]; ok {
+				continue
+			}
+			if err := appendDeletion(ctx, file, b); err != nil {
 				return err
 			}
 			present[file] = struct{}{}
@@ -130,7 +165,27 @@ func appendRegularFile(ctx context.Context, rootFS *os.Root, rel string, b *stri
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	fragment := formatSyntheticDiff(rel, raw)
+	return appendFragment(ctx, b, formatSyntheticDiff(rel, raw))
+}
+
+// appendDeletion records a file deleted inside a dirty submodule as a
+// header-only deletion section. There are no bytes to scan, but the change is
+// named, so a diff that carries nothing else is not read as "nothing changed".
+func appendDeletion(ctx context.Context, rel string, b *strings.Builder) error {
+	if !pathOK(rel) {
+		return fmt.Errorf("cannot include %q in the diff", rel)
+	}
+	fragment := strings.Join([]string{
+		fmt.Sprintf("diff --git a/%s b/%s", rel, rel),
+		"deleted file mode 100644",
+		fmt.Sprintf("--- a/%s", rel),
+		"+++ /dev/null",
+	}, "\n")
+	return appendFragment(ctx, b, fragment)
+}
+
+// appendFragment writes one diff section under the diff cap.
+func appendFragment(ctx context.Context, b *strings.Builder, fragment string) error {
 	if !strings.HasSuffix(fragment, "\n") {
 		fragment += "\n"
 	}
@@ -195,32 +250,6 @@ func pathOK(rel string) bool {
 		return false
 	}
 	return !strings.HasPrefix(rel, "/") && !strings.Contains(rel, "../") && rel != ".."
-}
-
-func diffHeaderPaths(diff string) map[string]struct{} {
-	set := map[string]struct{}{}
-	for _, line := range strings.Split(diff, "\n") {
-		rest, ok := strings.CutPrefix(line, "diff --git ")
-		if !ok {
-			continue
-		}
-		if path, ok := headerBPath(rest); ok {
-			set[path] = struct{}{}
-		}
-	}
-	return set
-}
-
-func headerBPath(rest string) (string, bool) {
-	at := strings.LastIndex(rest, " b/")
-	if at < 0 {
-		return "", false
-	}
-	name := rest[at+3:]
-	if name == "" || strings.Contains(name, "\"") {
-		return "", false
-	}
-	return name, true
 }
 
 func formatSyntheticDiff(rel string, raw []byte) string {
