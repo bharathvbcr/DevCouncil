@@ -1094,8 +1094,7 @@ fn compute(scope: Node, source: &str) -> Bindings {
             Vec::new()
         };
         for name in tuple_names {
-            hide_members(&mut out, &name);
-            out.entry(name).or_default().plain = false;
+            mark_rebound(&mut out, name);
         }
         named.reverse();
         for child in named {
@@ -1161,6 +1160,27 @@ fn bind(out: &mut Bindings, name: String, ty: Option<String>) {
             );
         }
     }
+}
+
+/// The key a name a tuple pattern binds is recorded under. It starts with a
+/// control character no Swift name has, so no lookup by a name reads it.
+fn rebound_key(name: &str) -> String {
+    format!("\u{1}{name}")
+}
+
+/// A tuple pattern (`for (i, b) in`, `let (a, b) =`, `case let (a, _)`) binds
+/// `name`, and no `LocalBinding` is emitted for it: the resolver reads the name
+/// as it did before, by the one member of that name. The mark is only for
+/// [`lookup_bound`] with `rebinding`, so a parameter the pattern hides stops
+/// being the plain, once-bound type a receiver may be qualified by.
+fn mark_rebound(out: &mut Bindings, name: String) {
+    if name.is_empty() || name == "_" {
+        return;
+    }
+    if let Some(existing) = out.get_mut(&name) {
+        existing.plain = false;
+    }
+    out.insert(rebound_key(&name), Bound::default());
 }
 
 /// Drop the member paths (`name.label`, `name.0`) a name was typed through.
@@ -1352,9 +1372,13 @@ fn property(node: Node, source: &str, bounds: &BTreeMap<String, String>, out: &m
                  init: &mut Option<String>,
                  out: &mut Bindings| {
         for name in pending.drain(..) {
-            bind(out, name.clone(), if single { typed.clone() } else { None });
+            if !single {
+                mark_rebound(out, name);
+                continue;
+            }
+            bind(out, name.clone(), typed.clone());
             if let Some(entry) = out.get_mut(&name) {
-                if single && entry.init.is_none() && entry.ty.is_none() {
+                if entry.init.is_none() && entry.ty.is_none() {
                     entry.init = init.clone();
                 }
             }
@@ -1467,7 +1491,7 @@ fn initializer_shape(call: Node, source: &str, from: Node, current: &Bindings) -
         ty: Some(ty),
         plain: true,
         ..
-    }) = lookup_bound(from, source, receiver, current)
+    }) = lookup_bound(from, source, receiver, current, true)
     else {
         return Some(shape);
     };
@@ -1601,7 +1625,11 @@ fn for_statement(node: Node, source: &str, _bounds: &BTreeMap<String, String>, o
                 .map(str::to_string)
         });
     for name in names {
-        bind(out, name, if single { element.clone() } else { None });
+        if single {
+            bind(out, name, element.clone());
+        } else {
+            mark_rebound(out, name);
+        }
     }
 }
 
@@ -1685,13 +1713,26 @@ fn lookup_scoped(
     name: &str,
     current: &Bindings,
 ) -> Option<Option<String>> {
-    lookup_bound(from, source, name, current).map(|found| found.ty)
+    lookup_bound(from, source, name, current, false).map(|found| found.ty)
 }
 
 /// [`lookup_scoped`], with everything the nearest binding of `name` records.
-fn lookup_bound(from: Node, source: &str, name: &str, current: &Bindings) -> Option<Bound> {
+/// With `rebinding`, a name a tuple pattern binds counts as a binding of no
+/// type; without it the name is not bound, as it was before tuple patterns were
+/// read at all.
+fn lookup_bound(
+    from: Node,
+    source: &str,
+    name: &str,
+    current: &Bindings,
+    rebinding: bool,
+) -> Option<Bound> {
+    let key = rebound_key(name);
     if let Some(found) = current.get(name) {
         return Some(found.clone());
+    }
+    if rebinding && current.contains_key(&key) {
+        return Some(Bound::default());
     }
     let mut ancestor = bounded_parent(from);
     while let Some(scope) = ancestor {
@@ -1700,6 +1741,9 @@ fn lookup_bound(from: Node, source: &str, name: &str, current: &Bindings) -> Opt
             let found = bindings(scope, source);
             if let Some(found) = found.get(name) {
                 return Some(found.clone());
+            }
+            if rebinding && found.contains_key(&key) {
+                return Some(Bound::default());
             }
         }
         ancestor = bounded_parent(scope);
@@ -3852,7 +3896,10 @@ mod tests {
              func makePair() -> (store: Store, svc: Svc) { (Store(), Svc()) }\n\
              func t() { let (svc: store, store: svc) = makePair() }";
         let found = bound(disagree, "t");
-        assert!(found.contains_key("store"));
+        assert!(
+            !found.contains_key("store"),
+            "a tuple name is no local binding"
+        );
         assert_eq!(ty_of(&found, "store"), None);
         assert_eq!(ty_of(&found, "svc"), None);
         let arity = "struct Store {}\nstruct Svc {}\n\
@@ -3987,19 +4034,28 @@ mod tests {
              func makePair() -> (Store, Svc) { (Store(), Svc()) }\n\
              func t() { let (store, svc) = makePair() }";
         let found = bound(source, "t");
-        assert!(found.contains_key("store"));
-        assert!(found.contains_key("svc"));
+        assert!(
+            !found.contains_key("store"),
+            "a tuple name is no local binding"
+        );
+        assert!(
+            !found.contains_key("svc"),
+            "a tuple name is no local binding"
+        );
         assert_eq!(ty_of(&found, "store"), None);
         assert_eq!(ty_of(&found, "svc"), None);
     }
 
     #[test]
-    fn a_tuple_destructure_with_a_skipped_element_binds_the_rest_untyped() {
+    fn a_tuple_destructure_with_a_skipped_element_binds_no_local() {
         let source = "struct Store {}\nstruct Svc {}\n\
              func makePair() -> (Store, Svc) { (Store(), Svc()) }\n\
              func t() { let (store, _) = makePair() }";
         let found = bound(source, "t");
-        assert!(found.contains_key("store"));
+        assert!(
+            !found.contains_key("store"),
+            "a tuple name is no local binding"
+        );
         assert_eq!(ty_of(&found, "store"), None);
         assert!(!found.contains_key("_"));
         assert!(!found.contains_key("svc"));
@@ -4011,8 +4067,14 @@ mod tests {
              func makePair() -> (Store) { Store() }\n\
              func t() { let (store, svc) = makePair() }";
         let found = bound(source, "t");
-        assert!(found.contains_key("store"), "the first name is still bound");
-        assert!(found.contains_key("svc"), "the second name is still bound");
+        assert!(
+            !found.contains_key("store"),
+            "a tuple name is no local binding"
+        );
+        assert!(
+            !found.contains_key("svc"),
+            "a tuple name is no local binding"
+        );
         assert_eq!(
             ty_of(&found, "store"),
             None,
@@ -4159,7 +4221,7 @@ mod tests {
     }
 
     #[test]
-    fn a_nested_tuple_destructure_binds_every_inner_name_untyped() {
+    fn a_nested_tuple_destructure_marks_every_inner_name_without_binding_it() {
         let preamble = "struct Store {}\nstruct Svc {}\nstruct Other {}\n\
              func makePair() -> (Store, (Svc, Other)) { (Store(), (Svc(), Other())) }\n";
         // pattern, every name it binds, the names nested one level or more down.
@@ -4191,11 +4253,22 @@ mod tests {
         for (pattern, names, nested) in cases {
             let source = format!("{preamble}func t() {{ {pattern} }}");
             let found = bound(&source, "t");
-            let mut keys: Vec<&str> = found.keys().map(String::as_str).collect();
-            keys.sort_unstable();
+            // No name is bound; each is only marked, for the receiver check.
+            let mut bound_names: Vec<&str> = found
+                .keys()
+                .map(String::as_str)
+                .filter(|key| !key.starts_with('\u{1}'))
+                .collect();
+            bound_names.sort_unstable();
+            assert_eq!(bound_names, Vec::<&str>::new(), "bound by `{pattern}`");
+            let mut marked: Vec<&str> = found
+                .keys()
+                .filter_map(|key| key.strip_prefix('\u{1}'))
+                .collect();
+            marked.sort_unstable();
             let mut want = names.to_vec();
             want.sort_unstable();
-            assert_eq!(keys, want, "names bound by `{pattern}`");
+            assert_eq!(marked, want, "names marked by `{pattern}`");
             for name in nested {
                 assert_eq!(ty_of(&found, name), None, "`{name}` in `{pattern}`");
             }
@@ -4203,8 +4276,9 @@ mod tests {
     }
 
     #[test]
-    fn a_destructure_binds_untyped_whatever_it_calls() {
-        // No function types a destructured name: not a file-level function, not
+    fn a_destructure_binds_no_local_whatever_it_calls() {
+        // A destructured name is no local, and no function types it: not a
+        // file-level function, not
         // a same-named closure property, not one that disagrees with the pattern.
         let preamble = "struct Store {}\nstruct Svc {}\n\
              func makePair() -> (Store, Svc) { (Store(), Svc()) }\n";
@@ -4227,8 +4301,8 @@ mod tests {
         for body in bodies {
             let source = format!("{preamble}{body}");
             let found = bound(&source, "t");
-            assert!(found.contains_key("store"), "{source}");
-            assert!(found.contains_key("svc"), "{source}");
+            assert!(!found.contains_key("store"), "{source}");
+            assert!(!found.contains_key("svc"), "{source}");
             assert_eq!(ty_of(&found, "store"), None, "{source}");
             assert_eq!(ty_of(&found, "svc"), None, "{source}");
         }
