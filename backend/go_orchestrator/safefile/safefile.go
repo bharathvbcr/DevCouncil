@@ -54,22 +54,32 @@ func OpenNoFollow(root *os.Root, name string, flag int, perm fs.FileMode) (*os.F
 		}
 		name = leaf
 	}
-	var f *os.File
-	var err error
 	if root == nil {
-		f, err = os.OpenFile(name, flag|noFollowFlags, perm)
-	} else {
-		f, err = root.OpenFile(name, flag|noFollowFlags, perm)
+		f, err := os.OpenFile(name, flag|noFollowFlags, perm)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateHandle(f); err != nil {
+			return nil, errors.Join(err, f.Close())
+		}
+		return f, nil
 	}
-	if err != nil {
-		return nil, err
-	}
-	if err := validateHandle(f); err != nil {
-		return nil, errors.Join(err, f.Close())
-	}
-	if root != nil {
-		// os.Root can resolve an in-root symlink itself after the kernel
-		// refuses it. Reject that resolution before exposing the handle.
+	// os.Root can resolve an in-root symlink itself after the kernel refuses
+	// it. The name is sampled after the open, so a publisher that renames a
+	// new regular file onto that name makes the sample disagree with the
+	// handle. That handle is still the regular file the caller named. Retry
+	// the open; never return a handle that is not the name's current file,
+	// and never retry a symlink or a non-regular name.
+	var last error
+	for attempt := 0; attempt < rootedIdentityAttempts; attempt++ {
+		f, err := root.OpenFile(name, flag|noFollowFlags, perm)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateHandle(f); err != nil {
+			return nil, errors.Join(err, f.Close())
+		}
+		afterRootedOpen(attempt)
 		named, err := root.Lstat(name)
 		if err != nil {
 			return nil, errors.Join(err, f.Close())
@@ -78,12 +88,23 @@ func OpenNoFollow(root *os.Root, name string, flag int, perm fs.FileMode) (*os.F
 		if err != nil {
 			return nil, errors.Join(err, f.Close())
 		}
-		if named.Mode()&fs.ModeSymlink != 0 || !os.SameFile(named, opened) {
-			return nil, errors.Join(errors.New("opened entry changed identity or is a symbolic link"), f.Close())
+		if os.SameFile(named, opened) {
+			return f, nil
+		}
+		// IsRegular is true only when no type bit is set, so it already
+		// excludes a symlink; a separate ModeSymlink test would be redundant.
+		replacedRegular := named.Mode().IsRegular() && opened.Mode().IsRegular()
+		last = errors.Join(errors.New("opened entry changed identity or is a symbolic link"), f.Close())
+		if !replacedRegular {
+			return nil, last
 		}
 	}
-	return f, nil
+	return nil, last
 }
+
+// rootedIdentityAttempts bounds retries when a regular file is renamed onto
+// the opened name between OpenFile and Lstat. A symlink is not retried.
+const rootedIdentityAttempts = 16
 
 // noFollowParent pins each native path component before advancing. Comparing
 // the named and opened directory prevents an in-root link swap from changing
@@ -193,9 +214,13 @@ func WriteAtomic(path string, content []byte, perm fs.FileMode) error {
 }
 
 // syncFile, syncDir and renameFile are variables so a test can make a
-// durability or publish step fail.
+// durability or publish step fail. afterRootedOpen runs between a rooted open
+// and the Lstat that samples its name, with the zero-based attempt number, so a
+// test can place the publisher's rename in that window deterministically. It is
+// a no-op in production and is assigned only from tests in this package.
 var (
-	renameFile = os.Rename
-	syncFile   = func(f *os.File) error { return f.Sync() }
-	syncDir    = syncDirectory
+	afterRootedOpen = func(attempt int) {}
+	renameFile      = os.Rename
+	syncFile        = func(f *os.File) error { return f.Sync() }
+	syncDir         = syncDirectory
 )
