@@ -31,85 +31,75 @@ fn is_clean(extraction: &Extraction) -> bool {
 }
 
 /// `(label, the one-line file, the same file over several lines)`.
-fn shapes() -> Vec<(&'static str, &'static str, &'static str, bool)> {
+fn shapes() -> Vec<(&'static str, &'static str, &'static str)> {
     vec![
         (
             "companion object",
             "class C { companion object { fun f() = 1 } }\nfun top() {}\nfun top2() = 2\n",
             "class C {\n    companion object {\n        fun f() = 1\n    }\n}\nfun top() {}\nfun top2() = 2\n",
-            true,
         ),
         (
             "named companion object",
             "class C { companion object Factory { fun f() = 1 } }\nfun top() {}\n",
             "class C {\n    companion object Factory {\n        fun f() = 1\n    }\n}\nfun top() {}\n",
-            true,
         ),
         (
             "class with a property",
             "class A { val x = 1 }\nfun top() {}\n",
             "class A {\n    val x = 1\n}\nfun top() {}\n",
-            true,
         ),
         (
             "interface",
             "interface Cb { fun call() }\nfun top() {}\n",
             "interface Cb {\n    fun call()\n}\nfun top() {}\n",
-            true,
         ),
         (
             "anonymous object",
             "val o = object { val x = 1 }\nfun top() {}\n",
             "val o = object {\n    val x = 1\n}\nfun top() {}\n",
-            true,
         ),
         (
             "object after a package header",
             "package p\nobject O { fun g() = 2 }\nfun top() {}\n",
             "package p\nobject O {\n    fun g() = 2\n}\nfun top() {}\n",
-            false,
         ),
         (
             "functional interface",
             "fun interface Cb { fun call() }\nfun top() {}\n",
             "fun interface Cb {\n    fun call()\n}\nfun top() {}\n",
-            true,
         ),
         (
             "object expression with a supertype",
             "val o = object : Runnable { override fun run() {} }\nfun top() {}\n",
             "val o = object : Runnable {\n    override fun run() {}\n}\nfun top() {}\n",
-            false,
         ),
         (
             "nested class",
             "class A { class B { fun f() {} } }\nfun top() {}\n",
             "class A {\n    class B {\n        fun f() {}\n    }\n}\nfun top() {}\n",
-            true,
         ),
         (
             "members separated by semicolons",
             "class A { val x = 1; val y = 2 }\nfun top() {}\n",
             "class A {\n    val x = 1; val y = 2\n}\nfun top() {}\n",
-            false,
         ),
         (
             "one-line lambdas around the class",
             "fun ui() { Button { click() } }\nclass A { fun m() { run { 1 } } }\nfun top() { if (a) { b() } else { c() } }\n",
             "fun ui() { Button { click() } }\nclass A {\n    fun m() { run { 1 } }\n}\nfun top() { if (a) { b() } else { c() } }\n",
-            false,
         ),
     ]
 }
 
-/// Each shape comes back `Clean` and names what the multi-line twin names. The
-/// grammar reads some of them as a visible ERROR (repaired by a `;`, recorded in
-/// `recovered_decl_ranges`) and some it recovers by itself with a hidden
-/// zero-width token (left as parsed, nothing recorded); which one it does
-/// depends on the file, not on the shape alone, so the table says which.
+/// Each shape comes back `Clean`, names what the multi-line twin names, and is
+/// a repair recorded in `recovered_decl_ranges`. The grammar reads some of them
+/// as a visible ERROR and some it recovers by itself with a hidden zero-width
+/// token that no node shows but that `has_error()` counts; that second reading
+/// was once left as parsed, and read an `if` branch as a lambda (see
+/// `kotlin_followups.rs`), so both are repaired with a `;` now.
 #[test]
 fn every_one_line_body_is_clean_and_equals_its_multi_line_twin() {
-    for (label, one_line, twin, error_mode) in shapes() {
+    for (label, one_line, twin) in shapes() {
         let extraction = extract_file("A.kt", one_line);
         assert!(
             is_clean(&extraction),
@@ -117,10 +107,9 @@ fn every_one_line_body_is_clean_and_equals_its_multi_line_twin() {
             extraction.parse_outcome,
             extraction.diagnostics
         );
-        assert_eq!(
+        assert!(
             !extraction.recovered_decl_ranges.is_empty(),
-            error_mode,
-            "{label}: a repair is recorded exactly when the grammar reported an error"
+            "{label}: the grammar reported an error, so a repair is recorded"
         );
         let diffs = diff_against_twin(label, one_line, twin);
         assert!(diffs.is_empty(), "{}", diffs.join("\n"));
@@ -262,14 +251,18 @@ fn a_file_that_wants_too_many_separators_is_left_alone() {
 }
 
 /// The grammar recovers some of these shapes by itself with a hidden zero-width
-/// token that no node shows: the class and every member are parsed and owned
-/// correctly, and the file reads `Clean`. Such a file is not rewritten.
+/// token that no node shows but that `has_error()` counts: the class and every
+/// member are parsed and owned correctly, but the file is no longer trusted as
+/// `Clean` on that reading, because the same token made an `if` branch a lambda
+/// in `kotlin_followups.rs`. It is rewritten like a visible error, and the
+/// repaired file names what the multi-line twin names.
 #[test]
-fn a_file_the_grammar_recovered_by_itself_is_left_as_it_parsed() {
+fn a_file_the_grammar_recovered_by_itself_is_repaired_not_trusted() {
     let source = "class A {\n    fun a() { x() }\n    fun last() { x() } }\nfun top() {}\n";
+    let twin = "class A {\n    fun a() { x() }\n    fun last() { x() }\n}\nfun top() {}\n";
     let extraction = extract_file("A.kt", source);
     assert!(is_clean(&extraction));
-    assert!(extraction.recovered_decl_ranges.is_empty());
+    assert!(!extraction.recovered_decl_ranges.is_empty());
     assert_eq!(
         names(&extraction),
         ["A.kt::A", "A.kt::A.a", "A.kt::A.last", "A.kt::top"]
@@ -277,7 +270,9 @@ fn a_file_the_grammar_recovered_by_itself_is_left_as_it_parsed() {
     assert!(extraction
         .diagnostics
         .iter()
-        .all(|note| !note.contains("one-line class body")));
+        .any(|note| note.contains("one-line class body")));
+    let diffs = diff_against_twin("hidden separator", source, twin);
+    assert!(diffs.is_empty(), "{}", diffs.join("\n"));
 }
 
 /// A swallowed declaration (row 15) and a one-line body (row 16) in one file:

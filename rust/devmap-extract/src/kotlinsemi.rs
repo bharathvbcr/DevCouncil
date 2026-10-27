@@ -26,8 +26,14 @@
 //! tree of the failed parse, which still holds them, outside strings and
 //! comments. They are not all visible to the
 //! first parse (a nested `}` hides inside the ERROR until the outer one is
-//! fixed), so the rewrite repeats, at most [`MAX_PASSES`] times, each pass over
-//! the top-level statements that still hold an error.
+//! fixed), so the rewrite repeats, each pass over the top-level statements that
+//! still hold an error. Every pass that goes on has written at least one
+//! separator no earlier pass wrote, and the total is capped at [`MAX_EDITS`], so
+//! the loop ends after at most `MAX_EDITS + 1` parses whatever the file is: the
+//! cost is the number of sites the grammar hides one at a time (a file of ten
+//! sibling one-liners takes ten parses), not a fixed pass count that a plain
+//! file can exceed. The file deadline bounds each parse and the scan between
+//! them.
 //!
 //! The result is accepted **only if the re-parse is fully clean**. Anything
 //! else, including a deadline, leaves the file exactly as it was: `Partial`.
@@ -44,9 +50,6 @@ use tree_sitter::{Node, Parser, Tree};
 
 use crate::model::TextRange;
 use crate::treesitter::{bounded_parent, parse_until, walk_deadline_passed, DEADLINE_CHECK_STRIDE};
-
-/// Parses after the first one. Each pass reveals the `}` the previous ERROR hid.
-pub(crate) const MAX_PASSES: usize = 6;
 
 /// Separators written per file. A file that wants more is not rewritten.
 pub(crate) const MAX_EDITS: usize = 512;
@@ -71,7 +74,7 @@ pub(crate) fn repair(parser: &mut Parser, tree: Tree, source: &str, deadline: In
     let mut text = source.as_bytes().to_vec();
     let mut edited: Vec<usize> = Vec::new();
     let mut current = tree.clone();
-    for pass in 0..=MAX_PASSES {
+    loop {
         if !current.root_node().has_error() {
             let ranges = touched(&current, &edited);
             return Repair::Repaired {
@@ -79,9 +82,6 @@ pub(crate) fn repair(parser: &mut Parser, tree: Tree, source: &str, deadline: In
                 ranges,
                 edits: edited.len(),
             };
-        }
-        if pass == MAX_PASSES {
-            break;
         }
         let fresh = match candidates(current.root_node(), &text, &edited) {
             Ok(fresh) => fresh,
@@ -120,25 +120,41 @@ pub(crate) fn repair(parser: &mut Parser, tree: Tree, source: &str, deadline: In
             }
         }
     }
-    Repair::Unchanged {
-        tree,
-        why: format!("still an error after {MAX_PASSES} rewrites"),
-    }
 }
 
-/// Bytes a token of these kinds may end with when a `;` is wanted after it.
-/// An arrow, an operator or an opening bracket before `}` is not a member.
+/// The last character of `before`, which is UTF-8 text cut at a character
+/// boundary: the shortest suffix of at most four bytes that decodes.
+fn last_char(before: &[u8]) -> Option<char> {
+    let tail = &before[before.len().saturating_sub(4)..];
+    (0..tail.len()).rev().find_map(|from| {
+        std::str::from_utf8(&tail[from..])
+            .ok()
+            .and_then(|text| text.chars().next_back())
+    })
+}
+
+/// Whether the code `before` ends a member, so that a `;` is wanted after it.
+/// An arrow, an operator or an opening bracket before `}` is not a member. A
+/// letter or digit of any script ends one (`café`), and so does a postfix
+/// `++` or `--` that follows an operand (`x++`, `a[0]--`).
 fn ends_a_member(before: &[u8]) -> bool {
-    match before.last() {
-        Some(b'>') => before.len() < 2 || before[before.len() - 2] != b'-',
-        Some(byte) => {
-            byte.is_ascii_alphanumeric()
-                || matches!(
-                    byte,
-                    b'_' | b')' | b']' | b'}' | b'"' | b'\'' | b'`' | b'!' | b'?'
-                )
+    let Some(last) = last_char(before) else {
+        return false;
+    };
+    match last {
+        '>' => before.len() < 2 || before[before.len() - 2] != b'-',
+        '+' | '-' => {
+            let operator = last as u8;
+            let stem = &before[..before.len() - 1];
+            stem.last() == Some(&operator)
+                && last_char(&stem[..stem.len() - 1]).is_some_and(|operand| {
+                    operand.is_alphanumeric() || matches!(operand, '_' | ')' | ']')
+                })
         }
-        None => false,
+        other => {
+            other.is_alphanumeric()
+                || matches!(other, '_' | ')' | ']' | '}' | '"' | '\'' | '`' | '!' | '?')
+        }
     }
 }
 
@@ -148,15 +164,25 @@ fn ends_a_member(before: &[u8]) -> bool {
 fn candidates(root: Node, text: &[u8], done: &[usize]) -> Result<Vec<usize>, String> {
     let mut found: Vec<usize> = Vec::new();
     let mut cursor = root.walk();
-    let mut stack: Vec<Node> = Vec::new();
-    let mut top = root.walk();
-    for statement in root.children(&mut top) {
-        if statement.is_error() || statement.has_error() {
-            stack.push(statement);
+    // Each node waits with the end of the last sibling before it that is not a
+    // comment, read while its parent's children are pushed, so no ancestor or
+    // sibling lookup (the unbounded native parent walk) is made for it.
+    let mut stack: Vec<(Node, Option<usize>)> = Vec::new();
+    if root.is_error() {
+        // A tree whose root is itself the ERROR node (no `source_file` around
+        // it) has the file's tokens as its direct children, and none of them
+        // holds an error of its own, so the walk starts at the root.
+        stack.push((root, None));
+    } else {
+        let mut top = root.walk();
+        for statement in root.children(&mut top) {
+            if statement.is_error() || statement.has_error() {
+                stack.push((statement, None));
+            }
         }
     }
     let mut visited = 0u32;
-    while let Some(node) = stack.pop() {
+    while let Some((node, code_end)) = stack.pop() {
         visited += 1;
         if visited >= DEADLINE_CHECK_STRIDE {
             visited = 0;
@@ -174,13 +200,16 @@ fn candidates(root: Node, text: &[u8], done: &[usize]) -> Result<Vec<usize>, Str
                 parent.is_error() || matches!(parent.kind(), "class_body" | "enum_class_body")
             });
             if closes_a_body && at > 0 && matches!(text.get(at - 1), Some(b' ' | b'\t')) {
-                let mut start = at;
-                while start > 0 && matches!(text[start - 1], b' ' | b'\t') {
-                    start -= 1;
+                // The member ends at the last node that is not a comment, and
+                // the brace shares its line: a brace that starts its line, or
+                // follows a comment on a line of its own, is already apart.
+                let mut end = code_end.map_or(0, |end| end.min(at));
+                while end > 0 && matches!(text[end - 1], b' ' | b'\t') {
+                    end -= 1;
                 }
-                if start > 0
-                    && ends_a_member(&text[..start])
-                    && !matches!(text[start - 1], b'\n' | b'\r')
+                if end > 0
+                    && !text[end..at].iter().any(|b| matches!(b, b'\n' | b'\r'))
+                    && ends_a_member(&text[..end])
                     && !done.contains(&(at - 1))
                 {
                     found.push(at - 1);
@@ -190,8 +219,13 @@ fn candidates(root: Node, text: &[u8], done: &[usize]) -> Result<Vec<usize>, Str
         }
         cursor.reset(node);
         if cursor.goto_first_child() {
+            let mut code_end: Option<usize> = None;
             loop {
-                stack.push(cursor.node());
+                let child = cursor.node();
+                stack.push((child, code_end));
+                if !child.kind().ends_with("comment") {
+                    code_end = Some(child.end_byte());
+                }
                 if !cursor.goto_next_sibling() {
                     break;
                 }
@@ -227,4 +261,60 @@ fn touched(tree: &Tree, edits: &[usize]) -> Vec<TextRange> {
     ranges.sort();
     ranges.dedup();
     ranges
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_last_character_is_decoded_not_taken_as_a_byte() {
+        assert_eq!(last_char("val x = café".as_bytes()), Some('é'));
+        assert_eq!(last_char("val x = 日本".as_bytes()), Some('本'));
+        assert_eq!(last_char("val x = 😀".as_bytes()), Some('😀'));
+        assert_eq!(last_char(b"x"), Some('x'));
+        assert_eq!(last_char(b""), None);
+    }
+
+    #[test]
+    fn a_member_ends_in_a_letter_of_any_script_a_postfix_or_a_closer() {
+        for member in [
+            "val x = 1",
+            "val x = café",
+            "val x = 日本",
+            "val x = x++",
+            "val x = a[0]--",
+            "val x = f()++",
+            "val x = y!!",
+            "val x: Int?",
+            "val x = \"s\"",
+            "fun f() {}",
+            "val f: () -> List<Int>",
+        ] {
+            assert!(ends_a_member(member.as_bytes()), "{member}");
+        }
+    }
+
+    #[test]
+    fn an_operator_an_arrow_or_an_opener_does_not_end_a_member() {
+        for dangling in [
+            "",
+            "val x =",
+            "val x = a +",
+            "val x = a -",
+            "val x = a + +",
+            "val x = ++",
+            "val f: () ->",
+            "val f = { x ->",
+            "class B(",
+            "class B :",
+            "val x = a.",
+            "val x = [",
+            "val x = 1,",
+            "val x = 1;",
+            "@",
+        ] {
+            assert!(!ends_a_member(dangling.as_bytes()), "{dangling:?}");
+        }
+    }
 }

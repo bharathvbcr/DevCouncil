@@ -466,7 +466,7 @@ fn a_real_class_that_spells_the_wrappers_header_is_an_ordinary_class() {
 /// syntax error. It stays charged and nothing is emitted for it.
 #[test]
 fn a_swallowed_class_with_a_one_line_body_stays_charged() {
-    let swallowed = format!("{STACK}private class Q {{ fun m() {{}} }}");
+    let swallowed = format!("{STACK}private class Q {{ fun m() {{}}}}");
     let source = format!("{swallowed}\nfun after() {{}}\n");
     let extraction = extract_file("A.kt", &source);
     assert_eq!(
@@ -603,7 +603,7 @@ fn qualified(extraction: &Extraction) -> Vec<&str> {
 /// `class` or to `Q`. Fails against `974edaa3`, which kept all of it.
 #[test]
 fn an_unrecovered_region_publishes_nothing_the_expression_reading_made_of_it() {
-    let swallowed = format!("{STACK}private class Q {{ fun m() {{}} }}");
+    let swallowed = format!("{STACK}private class Q {{ fun m() {{}}}}");
     let source = format!("{swallowed}\nfun tail() {{}}\n");
     let extraction = extract_file("A.kt", &source);
     assert_eq!(
@@ -711,7 +711,7 @@ fn an_unrecovered_nested_region_is_dropped_and_its_surroundings_kept() {
 #[test]
 fn dropping_a_phantom_keeps_the_scope_of_a_real_symbol_of_the_same_name() {
     let source = format!(
-        "{STACK}private class Q {{ fun m(a: Int) {{}} }}\nfun m(b: Int) {{\n    val z = 1\n}}\nfun tail() {{}}\n"
+        "{STACK}private class Q {{ fun m(a: Int) {{}}}}\nfun m(b: Int) {{\n    val z = 1\n}}\nfun tail() {{}}\n"
     );
     let extraction = extract_file("A.kt", &source);
     assert!(!error_ranges(&extraction).is_empty());

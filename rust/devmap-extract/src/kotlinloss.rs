@@ -494,10 +494,22 @@ fn check_wrapper(
         Some(tree) if !cancelled => tree,
         _ => return Err("the wrapped text did not parse within the budget".to_string()),
     };
+    // A swallowed statement that is a one-line class (`@Ann(1) class A { val x
+    // = 1 }`) reads as an error inside the wrapper's body, which the row 16
+    // rewrite repairs the way it repairs the file's own. The inner extraction
+    // below repairs the same text the same way, so what is checked here is
+    // what it reads. Kept only when fully clean; otherwise the error stands.
+    let tree = if tree.root_node().has_error() {
+        match crate::kotlinsemi::repair(&mut parser, tree, wrapped, deadline) {
+            crate::kotlinsemi::Repair::Repaired { tree, .. } => tree,
+            crate::kotlinsemi::Repair::Unchanged { .. } => {
+                return Err("the wrapped text has a syntax error".to_string());
+            }
+        }
+    } else {
+        tree
+    };
     let root = tree.root_node();
-    if root.has_error() {
-        return Err("the wrapped text has a syntax error".to_string());
-    }
     let mut cursor = root.walk();
     let mut top = root.named_children(&mut cursor);
     let (Some(class), None) = (top.next(), top.next()) else {
