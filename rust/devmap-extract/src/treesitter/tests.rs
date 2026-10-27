@@ -4126,15 +4126,18 @@ fn a_kotlin_loss_scan_stopped_by_the_deadline_fails_the_outcome() {
 }
 
 thread_local! {
-    /// Whether the thread's walk deadline was armed when the finalization hook
-    /// ran, which is after the Kotlin loss recovery and every other phase.
-    static DEADLINE_ARMED_AT_FINISH: std::cell::Cell<Option<bool>> =
-        const { std::cell::Cell::new(None) };
+    /// Whether the thread's walk deadline was armed each time the finalization
+    /// hook ran, in order. The hook is one-shot and the recovery's inner
+    /// extraction runs first and takes it, so the hook puts itself back: the
+    /// last entry is the outer file's, after the recovery and every other phase.
+    static DEADLINE_ARMED_AT_FINISH: std::cell::RefCell<Vec<bool>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn note_deadline_at_finish() {
-    DEADLINE_ARMED_AT_FINISH
-        .with(|seen| seen.set(Some(WALK_DEADLINE.with(|slot| slot.get().is_some()))));
+    let armed = WALK_DEADLINE.with(|slot| slot.get().is_some());
+    DEADLINE_ARMED_AT_FINISH.with(|seen| seen.borrow_mut().push(armed));
+    EXTRACTION_FINISH_HOOK.with(|slot| slot.set(Some(note_deadline_at_finish)));
 }
 
 /// A recovery runs an extraction inside the file's extraction. Its budget guard
@@ -4151,7 +4154,7 @@ fn the_walk_deadline_is_armed_again_after_a_kotlin_recovery() {
         }
     }
     let _clear = ClearHook;
-    DEADLINE_ARMED_AT_FINISH.with(|seen| seen.set(None));
+    DEADLINE_ARMED_AT_FINISH.with(|seen| seen.borrow_mut().clear());
     EXTRACTION_FINISH_HOOK.with(|slot| slot.set(Some(note_deadline_at_finish)));
     let extraction = extract_treesitter_with_budget(
         "A.kt",
@@ -4167,9 +4170,15 @@ fn the_walk_deadline_is_armed_again_after_a_kotlin_recovery() {
         "the statement was recovered, so an inner extraction ran: {:?}",
         extraction.diagnostics
     );
+    let seen = DEADLINE_ARMED_AT_FINISH.with(|seen| seen.borrow().clone());
     assert_eq!(
-        DEADLINE_ARMED_AT_FINISH.with(|seen| seen.get()),
-        Some(true),
+        seen.len(),
+        2,
+        "the recovery's inner extraction finished, then the outer file: {seen:?}"
+    );
+    assert_eq!(
+        seen.last(),
+        Some(&true),
         "the deadline must be armed when the outer file finishes"
     );
 }
