@@ -185,14 +185,17 @@ fn covers(ranges: &[(usize, usize)], offset: usize) -> bool {
 }
 
 /// ft-5ad86836 AC3. The grammar rejects a one-line `class C { companion object
-/// { .. } }` (an `ERROR` node, not a clean tree), so `C`, its companion function
-/// and the top-level function after it are not extracted. The file must be
-/// listed in `coverage_gaps.partial_parse` with a range that covers every one
-/// of them — the loss is reported even though the declaration is not recovered.
+/// { .. } }` (an `ERROR` node, not a clean tree). extract-v98 repairs that shape
+/// with a same-length separator, so it is no longer the example of a loss that is
+/// not recovered; the same body with no space before its last `}` has no room
+/// for a separator and still is. `C`, its companion function and the top-level
+/// function after it are not extracted, and the file must be listed in
+/// `coverage_gaps.partial_parse` with a range that covers every one of them: the
+/// loss is reported even though the declaration is not recovered.
 #[test]
 fn a_one_line_companion_object_loss_is_listed_with_a_range_covering_it() {
     let root = scratch("companion");
-    let source = "package a\n\nclass C { companion object { fun f() = 1 } }\nfun top() = 2\n";
+    let source = "package a\n\nclass C { companion object { fun f() = 1 }}\nfun top() = 2\n";
     std::fs::write(root.join("Comp.kt"), source).unwrap();
     std::fs::write(root.join("Clean.kt"), "package a\n\nfun tidy() = 3\n").unwrap();
     let _ = json(&root, &["--json", "build", "."]);
@@ -213,6 +216,34 @@ fn a_one_line_companion_object_loss_is_listed_with_a_range_covering_it() {
     assert!(
         rows.iter().all(|(path, _)| path != "Clean.kt"),
         "a clean file is not listed: {rows:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// extract-v98 row 16. The same shape with a space before the last `}` is
+/// repaired, so it is not a coverage gap at all and its declarations are found.
+#[test]
+fn a_one_line_companion_object_with_room_for_a_separator_is_repaired_not_listed() {
+    let root = scratch("companion-repaired");
+    let source = "package a\n\nclass C { companion object { fun f() = 1 } }\nfun top() = 2\n";
+    std::fs::write(root.join("Comp.kt"), source).unwrap();
+    let _ = json(&root, &["--json", "build", "."]);
+    let status = json(&root, &["--json", "status"]);
+    let rows = partial_rows(&status);
+    assert!(
+        rows.iter().all(|(path, _)| path != "Comp.kt"),
+        "a repaired file is not listed as a partial parse: {rows:?}"
+    );
+    let found = json(&root, &["--json", "search", "top"]);
+    assert!(
+        found["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| {
+                item["symbol_name"]
+                    .as_str()
+                    .is_some_and(|name| name.ends_with("top"))
+            })),
+        "the declaration after the class is found: {found}"
     );
     let _ = std::fs::remove_dir_all(&root);
 }
