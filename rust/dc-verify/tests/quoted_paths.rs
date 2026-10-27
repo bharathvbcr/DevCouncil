@@ -145,3 +145,29 @@ fn a_diff_git_never_produces_is_refused() {
         2
     );
 }
+
+#[test]
+fn a_name_is_not_trimmed_and_a_copy_names_its_destination() {
+    let diff = "\
+diff --git a/f.txt  b/f.txt 
+new file mode 100644
+--- /dev/null
++++ b/f.txt 	
+@@ -0,0 +1 @@
++one
+diff --git a/orig.txt b/new b/copy.txt
+similarity index 100%
+copy from orig.txt
+copy to new b/copy.txt
+";
+    let files = parse_unified(diff).expect("parses");
+    assert_eq!(files.len(), 2);
+    assert_eq!(
+        files[0].path, "f.txt ",
+        "the trailing space is part of the name"
+    );
+    assert_eq!(
+        files[1].path, "new b/copy.txt",
+        "a copy is the path it copies to"
+    );
+}

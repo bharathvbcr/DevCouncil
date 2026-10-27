@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -18,14 +19,38 @@ const (
 	maxSubmodules = 256
 	// maxSubmoduleDepth bounds nesting.
 	maxSubmoduleDepth = 8
-	// submoduleListingLimit bounds the index listing gitlinks are read from.
-	submoduleListingLimit = 64 << 20
 )
 
+// submoduleWalkBudget is the one deadline over a whole submodule walk. Each
+// git call also has its own 60 s bound, but up to maxSubmodules calls at that
+// bound each is a walk of hours; the walk as a whole is held to this instead,
+// and the per-call bound is derived from it, so no single call outlives it.
+// A var so a test can shorten it.
+var submoduleWalkBudget = 3 * time.Minute
+
+type walkBudgetKey struct{}
+
+// WithWalkBudget starts the one deadline of a submodule walk. A caller that
+// makes several walk calls (DirtySubmodules, then SubmoduleWorktreeFiles for
+// each dirty one) calls it once and passes the context to all of them: the
+// calls then share one budget instead of each starting its own, which was up
+// to 257 of them end to end. Called on a context that already carries a budget
+// it changes nothing, so DirtySubmodules and SubmoduleWorktreeFiles apply it
+// themselves for the caller that makes only one call.
+func WithWalkBudget(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx.Value(walkBudgetKey{}) != nil {
+		return ctx, func() {}
+	}
+	ctx, cancel := context.WithTimeout(ctx, submoduleWalkBudget)
+	return context.WithValue(ctx, walkBudgetKey{}, struct{}{}), cancel
+}
+
 // DirtySubmodules names the submodules under the session's root (within
-// pathspecs, when any are given) whose working trees have changes to
-// tracked files — what `git diff` reported as `Subproject commit …-dirty`
-// before the guards passed --ignore-submodules=dirty.
+// pathspecs, when any are given) whose working trees hold a change: a change
+// to a tracked file, a file git does not track (git calls both "modified
+// content"), or a dirty submodule of their own. It is what `git diff` reported
+// as `Subproject commit …-dirty` before the guards passed
+// --ignore-submodules=dirty.
 //
 // git answers that question by running status inside each submodule, and
 // that status runs the submodule's own filter drivers and fsmonitor, which
@@ -36,44 +61,42 @@ const (
 // inside the repository under analysis, and the program that reads it is
 // still resolved outside the superproject's root.
 //
-// Gitlinks come from the index; a repository without .gitmodules has no
-// submodule git would describe, and costs no spawn. A gitlink whose path is
-// not a plain directory inside root holding a .git is not read: one with no
-// .git is not checked out, and anything else — a symlink, a path that
-// leaves root — is refused.
+// Gitlinks come from the index (mode 160000), whether or not .gitmodules
+// names them: git describes a gitlink with no .gitmodules entry as a submodule
+// all the same, and a read that skipped it for want of one passed its bytes
+// silently. A gitlink whose path is not a plain directory inside root holding
+// a .git is not read: a missing or empty directory is not checked out, a
+// directory with files in it but no .git is refused (no listing names those
+// files), and anything else — a symlink, a path that leaves root — is
+// refused.
+//
+// The whole walk runs under submoduleWalkBudget.
 func (s *GitSession) DirtySubmodules(ctx context.Context, pathspecs ...string) ([]string, error) {
+	ctx, cancel := WithWalkBudget(ctx)
+	defer cancel()
 	return s.dirtySubmodules(ctx, 0, pathspecs)
 }
 
 func (s *GitSession) dirtySubmodules(ctx context.Context, depth int, pathspecs []string) ([]string, error) {
-	if _, err := os.Lstat(filepath.Join(s.root, ".gitmodules")); errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
-	} else if err != nil {
-		return nil, err
-	}
-	if depth >= maxSubmoduleDepth {
-		return nil, fmt.Errorf("submodules under %s nest deeper than %d; refusing to report a partial answer", s.root, maxSubmoduleDepth)
-	}
 	args := []string{"ls-files", "--stage", "-z"}
 	if len(pathspecs) > 0 {
 		args = append(append(args, "--"), pathspecs...)
 	}
-	listing, err := s.output(ctx, submoduleListingLimit, args...)
+	gitlinks, err := s.gitlinks(ctx, args)
 	if err != nil {
 		return nil, err
 	}
-	var gitlinks []string
-	for _, entry := range bytes.Split(listing, []byte{0}) {
-		meta, path, ok := strings.Cut(string(entry), "\t")
-		if ok && strings.HasPrefix(meta, "160000 ") {
-			gitlinks = append(gitlinks, path)
-		}
+	if len(gitlinks) == 0 {
+		return nil, nil
 	}
-	if len(gitlinks) > maxSubmodules {
-		return nil, fmt.Errorf("%s has %d submodules, more than the %d one read examines; refusing to report a partial answer", s.root, len(gitlinks), maxSubmodules)
+	if depth >= maxSubmoduleDepth {
+		return nil, fmt.Errorf("submodules under %s nest deeper than %d; refusing to report a partial answer", s.root, maxSubmoduleDepth)
 	}
 	var dirty []string
 	for _, path := range gitlinks {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("the submodule walk did not finish within %s: %w", submoduleWalkBudget, err)
+		}
 		dir, ok, err := s.submoduleDir(path)
 		if err != nil {
 			return nil, err
@@ -87,17 +110,191 @@ func (s *GitSession) dirtySubmodules(ctx context.Context, depth int, pathspecs [
 			return nil, fmt.Errorf("submodule %s: %w", path, err)
 		}
 		if len(bytes.Trim(changed, "\x00")) == 0 {
-			nested, err := sub.dirtySubmodules(ctx, depth+1, nil)
+			untracked, err := sub.output(ctx, 1<<20, "ls-files", "--others", "--exclude-standard", "-z")
 			if err != nil {
 				return nil, fmt.Errorf("submodule %s: %w", path, err)
 			}
-			if len(nested) == 0 {
-				continue
+			if len(bytes.Trim(untracked, "\x00")) == 0 {
+				nested, err := sub.dirtySubmodules(ctx, depth+1, nil)
+				if err != nil {
+					return nil, fmt.Errorf("submodule %s: %w", path, err)
+				}
+				if len(nested) == 0 {
+					continue
+				}
 			}
 		}
 		dirty = append(dirty, path)
 	}
 	return dirty, nil
+}
+
+// NestedRepositoryError is the refusal for an untracked directory git lists
+// with a trailing slash: a repository nested inside the tree that is neither
+// ignored nor a submodule. Its files are in no listing, so none can be scanned;
+// the change is refused, and the message says what to do about it.
+func NestedRepositoryError(dir string) error {
+	return fmt.Errorf("untracked nested repository %s is not scanned: ignore it or add it as a submodule", dir)
+}
+
+// SubmoduleChanges is what a dirty submodule's working tree changed, as
+// superproject-relative paths.
+type SubmoduleChanges struct {
+	// Files are changed files that are on disk, and so have bytes to read.
+	Files []string
+	// Deleted are changed files that are named but no longer on disk. A
+	// deletion has no bytes: it is a change with nothing to scan, which is not
+	// the same as a read that failed.
+	Deleted []string
+}
+
+// Empty reports that git named no change at all.
+func (c SubmoduleChanges) Empty() bool { return len(c.Files) == 0 && len(c.Deleted) == 0 }
+
+// SubmoduleWorktreeFiles names the tracked files a dirty submodule has changed,
+// as superproject-relative paths. The listing is the guarded
+// `diff HEAD --name-only -z` this session already uses: the superproject's
+// git, the submodule's filters and fsmonitor not run, symlink gitlinks refused.
+// A deletion (named, not on disk) is reported in Deleted. A symlink, a path
+// that escapes the submodule, or a read that fails is an error — never a
+// followed read and never a partial list reported as complete.
+func (s *GitSession) SubmoduleWorktreeFiles(ctx context.Context, submodulePath string) (SubmoduleChanges, error) {
+	if !filepath.IsLocal(filepath.FromSlash(submodulePath)) {
+		return SubmoduleChanges{}, fmt.Errorf("refusing submodule path %q", submodulePath)
+	}
+	ctx, cancel := WithWalkBudget(ctx)
+	defer cancel()
+	return s.submoduleWorktreeFiles(ctx, submodulePath, 1)
+}
+
+func (s *GitSession) submoduleWorktreeFiles(ctx context.Context, submodulePath string, depth int) (SubmoduleChanges, error) {
+	if depth > maxSubmoduleDepth {
+		return SubmoduleChanges{}, fmt.Errorf("submodules under %s nest deeper than %d; refusing to report a partial answer", s.root, maxSubmoduleDepth)
+	}
+	dir, ok, err := s.submoduleDir(submodulePath)
+	if err != nil {
+		return SubmoduleChanges{}, err
+	}
+	if !ok {
+		return SubmoduleChanges{}, fmt.Errorf("submodule %s is not a checked-out directory", submodulePath)
+	}
+	sub := &GitSession{root: dir, git: s.git}
+	// The tracked changes git names, then the files it does not track: a file
+	// created inside the submodule is "modified content" to git and appears in
+	// neither listing of the superproject.
+	tracked, err := sub.output(ctx, 1<<20, "diff", "HEAD", "--name-only", "-z")
+	if err != nil {
+		return SubmoduleChanges{}, fmt.Errorf("submodule %s: %w", submodulePath, err)
+	}
+	untracked, err := sub.output(ctx, 1<<20, "ls-files", "--others", "--exclude-standard", "-z")
+	if err != nil {
+		return SubmoduleChanges{}, fmt.Errorf("submodule %s: %w", submodulePath, err)
+	}
+	listing := bytes.Join([][]byte{tracked, untracked}, []byte{0})
+	var out SubmoduleChanges
+	seen := map[string]struct{}{}
+	add := func(into *[]string, rel string) {
+		if _, ok := seen[rel]; ok {
+			return
+		}
+		seen[rel] = struct{}{}
+		*into = append(*into, rel)
+	}
+	merge := func(from SubmoduleChanges, prefix string) {
+		for _, n := range from.Files {
+			add(&out.Files, pathJoinSlash(prefix, n))
+		}
+		for _, n := range from.Deleted {
+			add(&out.Deleted, pathJoinSlash(prefix, n))
+		}
+	}
+	for _, raw := range bytes.Split(listing, []byte{0}) {
+		// The name exactly as git wrote it: trimming or folding it would
+		// make `t.txt ` and `t.txt`, or `a\b` and `a/b`, one file.
+		name := string(raw)
+		if name == "" {
+			continue
+		}
+		if strings.HasSuffix(name, "/") {
+			return SubmoduleChanges{}, NestedRepositoryError(pathJoinSlash(submodulePath, name))
+		}
+		if !filepath.IsLocal(filepath.FromSlash(name)) {
+			return SubmoduleChanges{}, fmt.Errorf("submodule %s names %q, which is not a plain path", submodulePath, name)
+		}
+		info, missing, serr := lstatWithin(dir, name)
+		if serr != nil {
+			return SubmoduleChanges{}, fmt.Errorf("submodule %s: %s", submodulePath, serr.Error())
+		}
+		rel := pathJoinSlash(submodulePath, name)
+		if missing {
+			add(&out.Deleted, rel)
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return SubmoduleChanges{}, fmt.Errorf("refusing to follow symlink %s", rel)
+		}
+		if info.IsDir() {
+			nested, nerr := sub.submoduleWorktreeFiles(ctx, name, depth+1)
+			if nerr != nil {
+				return SubmoduleChanges{}, nerr
+			}
+			merge(nested, submodulePath)
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			return SubmoduleChanges{}, fmt.Errorf("submodule %s: %s is not a regular file", submodulePath, name)
+		}
+		add(&out.Files, rel)
+	}
+	// Name-only is run with --ignore-submodules=dirty, so a nested dirty
+	// submodule is not in the listing above. Ask the same guarded walk
+	// DirtySubmodules uses, one level down, and do not reset its depth.
+	nested, err := sub.dirtySubmodules(ctx, depth, nil)
+	if err != nil {
+		return SubmoduleChanges{}, fmt.Errorf("submodule %s: %w", submodulePath, err)
+	}
+	for _, name := range nested {
+		inner, err := sub.submoduleWorktreeFiles(ctx, name, depth+1)
+		if err != nil {
+			return SubmoduleChanges{}, err
+		}
+		merge(inner, submodulePath)
+	}
+	return out, nil
+}
+
+// lstatWithin stats name under dir without following a symlink at any component.
+// missing is a final component that is not on disk (a deletion).
+func lstatWithin(dir, name string) (info fs.FileInfo, missing bool, err error) {
+	current := dir
+	parts := strings.Split(filepath.FromSlash(name), string(filepath.Separator))
+	for i, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return nil, false, fmt.Errorf("%q is not a plain path", name)
+		}
+		current = filepath.Join(current, part)
+		info, err = os.Lstat(current)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) && i == len(parts)-1 {
+				return nil, true, nil
+			}
+			return nil, false, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return info, false, fmt.Errorf("refusing to follow symlink %s", name)
+		}
+		if i < len(parts)-1 && !info.IsDir() {
+			return nil, false, fmt.Errorf("%s is not a directory", name)
+		}
+	}
+	return info, false, nil
+}
+
+func pathJoinSlash(parent, name string) string {
+	if parent == "" {
+		return name
+	}
+	return parent + "/" + strings.TrimPrefix(name, "/")
 }
 
 // submoduleDir returns the checked-out directory of the gitlink at path. ok
@@ -126,6 +323,17 @@ func (s *GitSession) submoduleDir(path string) (string, bool, error) {
 		}
 	}
 	if _, err := os.Lstat(filepath.Join(dir, ".git")); errors.Is(err, fs.ErrNotExist) {
+		// Not checked out. An empty directory is what an uninitialized
+		// submodule leaves. Files here are another matter: git treats the
+		// directory as the gitlink, so no listing of the superproject names
+		// them, and reading none of them would pass their bytes unseen.
+		entries, rerr := os.ReadDir(dir)
+		if rerr != nil {
+			return "", false, rerr
+		}
+		if len(entries) > 0 {
+			return "", false, fmt.Errorf("submodule %s holds files but no git repository; no listing names them, so they cannot be read", path)
+		}
 		return "", false, nil
 	} else if err != nil {
 		return "", false, err
@@ -136,26 +344,109 @@ func (s *GitSession) submoduleDir(path string) (string, bool, error) {
 // output runs one guarded read and returns its stdout. A read whose output
 // passes limit is refused, never truncated.
 func (s *GitSession) output(ctx context.Context, limit int, args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-	cmd, err := s.Command(ctx, args...)
-	if err != nil {
-		return nil, err
-	}
 	out := &CappedBuffer{Limit: limit}
-	var stderr bytes.Buffer
-	cmd.Stdout = out
-	cmd.Stderr = &stderr
-	cmd.WaitDelay = 2 * time.Second
-	err, timedOut := RunBounded(ctx, cmd.Run)
-	if timedOut {
-		return nil, fmt.Errorf("git %s in %s did not finish: %w", strings.Join(args, " "), s.root, ctx.Err())
-	}
-	if err != nil {
-		return nil, fmt.Errorf("git %s in %s: %w: %s", strings.Join(args, " "), s.root, err, strings.TrimSpace(stderr.String()))
+	if err := s.stream(ctx, out, args...); err != nil {
+		return nil, err
 	}
 	if out.Overflowed() {
 		return nil, fmt.Errorf("git %s in %s wrote more than %d bytes; refusing a truncated answer", strings.Join(args, " "), s.root, limit)
 	}
 	return out.Bytes(), nil
+}
+
+// stream runs one guarded read, writing its stdout to w as it arrives, under
+// the per-call bound.
+func (s *GitSession) stream(ctx context.Context, w io.Writer, args ...string) error {
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	cmd, err := s.Command(ctx, args...)
+	if err != nil {
+		return err
+	}
+	var stderr bytes.Buffer
+	cmd.Stdout = w
+	cmd.Stderr = &stderr
+	cmd.WaitDelay = 2 * time.Second
+	err, timedOut := RunBounded(ctx, cmd.Run)
+	if timedOut {
+		return fmt.Errorf("git %s in %s did not finish: %w", strings.Join(args, " "), s.root, ctx.Err())
+	}
+	if err != nil {
+		return fmt.Errorf("git %s in %s: %w: %s", strings.Join(args, " "), s.root, err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+// maxIndexEntry bounds one NUL-terminated record of the index listing. A path
+// is far shorter; a record past this is not a listing worth believing.
+const maxIndexEntry = 1 << 20
+
+// gitlinks runs the index listing in args (`ls-files --stage -z`) and returns
+// the paths of its mode-160000 entries. The listing is filtered as it streams,
+// so memory is bounded by one record and by the gitlinks kept, not by the size
+// of the index: a listing capped in total failed on a repository of some
+// 800 000 files that had no submodule at all. A record longer than
+// maxIndexEntry, or more gitlinks than maxSubmodules, is refused, never
+// truncated.
+func (s *GitSession) gitlinks(ctx context.Context, args []string) ([]string, error) {
+	f := &gitlinkFilter{}
+	if err := s.stream(ctx, f, args...); err != nil {
+		return nil, err
+	}
+	f.flush()
+	if f.overlong {
+		return nil, fmt.Errorf("git %s in %s wrote a record longer than %d bytes; refusing a truncated answer", strings.Join(args, " "), s.root, maxIndexEntry)
+	}
+	if f.count > maxSubmodules {
+		return nil, fmt.Errorf("%s has %d submodules, more than the %d one read examines; refusing to report a partial answer", s.root, f.count, maxSubmodules)
+	}
+	return f.links, nil
+}
+
+// gitlinkFilter is an io.Writer over `ls-files --stage -z` output that keeps
+// only the paths of mode-160000 records. Like CappedBuffer it always reports a
+// full write: a short one would close the pipe on a child that ran fine.
+type gitlinkFilter struct {
+	pending  []byte
+	links    []string
+	count    int
+	overlong bool
+}
+
+func (f *gitlinkFilter) Write(p []byte) (int, error) {
+	n := len(p)
+	for len(p) > 0 {
+		end := bytes.IndexByte(p, 0)
+		if end < 0 {
+			if len(f.pending)+len(p) > maxIndexEntry {
+				f.overlong, f.pending = true, nil
+			} else if !f.overlong {
+				f.pending = append(f.pending, p...)
+			}
+			return n, nil
+		}
+		if f.overlong || len(f.pending)+end > maxIndexEntry {
+			f.overlong, f.pending = true, nil
+		} else {
+			f.pending = append(f.pending, p[:end]...)
+			f.flush()
+		}
+		p = p[end+1:]
+	}
+	return n, nil
+}
+
+// flush takes the record in pending, if any, and clears it.
+func (f *gitlinkFilter) flush() {
+	if len(f.pending) == 0 {
+		return
+	}
+	meta, path, ok := strings.Cut(string(f.pending), "\t")
+	if ok && strings.HasPrefix(meta, "160000 ") {
+		f.count++
+		if f.count <= maxSubmodules {
+			f.links = append(f.links, path)
+		}
+	}
+	f.pending = f.pending[:0]
 }

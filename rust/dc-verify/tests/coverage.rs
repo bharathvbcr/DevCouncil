@@ -85,6 +85,13 @@ fn a_parse_error_names_the_line_so_it_is_actionable() {
     assert_eq!(err.line_number, 2);
     assert!(err.line.contains("many"));
     assert!(!err.reason.is_empty());
+    // The message that reaches the agent names the line, never its content.
+    let shown = err.to_string();
+    assert!(shown.contains("line 2"), "{shown}");
+    assert!(
+        !shown.contains("many"),
+        "the error message quotes the line: {shown}"
+    );
 }
 
 #[test]

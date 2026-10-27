@@ -254,6 +254,180 @@ fn contains_marker(text: &str) -> bool {
     STUB_MARKERS.iter().any(|m| lowered.contains(m))
 }
 
+/// The first line, counted from 0 within `text`, that `accept` allows and that
+/// holds `todo!` or `unimplemented!` in code position.
+///
+/// A small lexer, not a parser, and it reads the whole text so that what spans
+/// lines (a string, a raw string, a block comment) is skipped as one thing. It
+/// skips everything that is not code: string literals; raw strings
+/// (`r#"…"#`); char literals, so a `'"'` does not open a string that hides what
+/// follows it; line comments; and block comments, which nest and are skipped
+/// before a quote inside one is looked at. A tick that is not a char literal is
+/// a lifetime and is skipped alone. The macro name may be separated from its
+/// `!` by whitespace or comments (`todo !()`), and must be followed by a
+/// delimiter, so `todo != x` is not a stub. Something left unterminated is not
+/// code.
+fn first_visible_stub_line(text: &str, accept: &dyn Fn(usize) -> bool) -> Option<usize> {
+    let lower = text.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let newlines: Vec<usize> = bytes
+        .iter()
+        .enumerate()
+        .filter_map(|(at, &b)| (b == b'\n').then_some(at))
+        .collect();
+    let line_at = |at: usize| newlines.partition_point(|&n| n < at);
+    let mut i = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            match b {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'\'' => {
+                if let Some(len) = char_literal_len(&bytes[i..]) {
+                    i += len;
+                    continue;
+                }
+            }
+            b'r' if raw_string_hashes(bytes, i).is_some() => {
+                let hashes = raw_string_hashes(bytes, i).unwrap_or(0);
+                match raw_string_end(&bytes[i + 2 + hashes..], hashes) {
+                    Some(len) => {
+                        i += 2 + hashes + len;
+                        continue;
+                    }
+                    None => return None,
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i = skip_trivia(bytes, i);
+                continue;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i = skip_trivia(bytes, i);
+                continue;
+            }
+            _ => {
+                let boundary =
+                    i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+                if boundary {
+                    for name in ["todo", "unimplemented"] {
+                        if !bytes[i..].starts_with(name.as_bytes()) {
+                            continue;
+                        }
+                        let bang = skip_trivia(bytes, i + name.len());
+                        if bytes.get(bang) != Some(&b'!') {
+                            continue;
+                        }
+                        let open = skip_trivia(bytes, bang + 1);
+                        if matches!(bytes.get(open), Some(b'(' | b'[' | b'{')) {
+                            let line = line_at(i);
+                            if accept(line) {
+                                return Some(line);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The offset of the first byte at or after `at` that is not whitespace or the
+/// inside of a comment. An unterminated block comment runs to the end.
+fn skip_trivia(bytes: &[u8], mut at: usize) -> usize {
+    loop {
+        match bytes.get(at) {
+            Some(c) if c.is_ascii_whitespace() => at += 1,
+            Some(b'/') if bytes.get(at + 1) == Some(&b'/') => {
+                while bytes.get(at).is_some_and(|&c| c != b'\n') {
+                    at += 1;
+                }
+            }
+            Some(b'/') if bytes.get(at + 1) == Some(&b'*') => {
+                let mut depth = 1usize;
+                at += 2;
+                while depth > 0 && at < bytes.len() {
+                    if bytes[at..].starts_with(b"/*") {
+                        depth += 1;
+                        at += 2;
+                    } else if bytes[at..].starts_with(b"*/") {
+                        depth -= 1;
+                        at += 2;
+                    } else {
+                        at += 1;
+                    }
+                }
+            }
+            _ => return at,
+        }
+    }
+}
+
+/// Length of the char literal at the start of `s` (which begins with `'`), or
+/// `None` when the tick is a lifetime. `'x'` is one scalar between ticks and
+/// `'\…'` is an escape (`'\''`, `'\"'`, `'\n'`, `'\u{1F600}'`) closed by the
+/// next tick.
+fn char_literal_len(s: &[u8]) -> Option<usize> {
+    match *s.get(1)? {
+        b'\\' => {
+            // The escaped byte (position 2) may itself be a tick, so the
+            // closing tick is searched for from position 3.
+            let close = s.get(3..)?.iter().take(10).position(|&c| c == b'\'')?;
+            Some(3 + close + 1)
+        }
+        b'\'' => None,
+        lead => {
+            let width = match lead {
+                0x00..=0x7f => 1,
+                0xc0..=0xdf => 2,
+                0xe0..=0xef => 3,
+                0xf0..=0xf7 => 4,
+                _ => return None,
+            };
+            (s.get(1 + width) == Some(&b'\'')).then_some(width + 2)
+        }
+    }
+}
+
+/// How many `#` open the raw string whose `r` is at `bytes[at]`, or `None` when
+/// that `r` does not start one: it ends an identifier (`bar#"`), or is not
+/// followed by `#`* and a quote. A `b` prefix (`br"…"`) is accepted.
+fn raw_string_hashes(bytes: &[u8], at: usize) -> Option<usize> {
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let before = match at.checked_sub(1) {
+        Some(prev) if bytes[prev] == b'b' => prev.checked_sub(1),
+        other => other,
+    };
+    if before.is_some_and(|p| ident(bytes[p])) {
+        return None;
+    }
+    let hashes = bytes[at + 1..].iter().take_while(|&&c| c == b'#').count();
+    (bytes.get(at + 1 + hashes) == Some(&b'"')).then_some(hashes)
+}
+
+/// Length of the raw string body in `rest` (the bytes after the opening quote)
+/// including its closing `"` and `hashes` hashes, or `None` when the string
+/// does not close on this line.
+fn raw_string_end(rest: &[u8], hashes: usize) -> Option<usize> {
+    (0..rest.len()).find_map(|k| {
+        (rest[k] == b'"' && rest.get(k + 1..k + 1 + hashes)?.iter().all(|&c| c == b'#'))
+            .then_some(k + 1 + hashes)
+    })
+}
+
 /// Whether a string literal's text reads as "this is not written yet".
 fn placeholder_text(text: &str) -> bool {
     let lowered = text.to_ascii_lowercase();
@@ -403,10 +577,33 @@ impl<'a> Walker<'a> {
                     .unwrap_or("");
                 match name {
                     "todo" | "unimplemented" => self.placeholder(node, &format!("{name}!()")),
-                    "panic" if self.has_placeholder_string(node) => {
+                    "panic" if self.panic_is_placeholder(node) => {
                         self.placeholder(node, "panic!(\"TODO\")")
                     }
+                    // A wrapper whose own name is not a stub, but whose token
+                    // tree still shows `todo!` / `unimplemented!`.
+                    _ if self.visible_stub_line(node).is_some() => {
+                        self.placeholder(node, "wrapper macro")
+                    }
                     _ => {}
+                }
+            }
+            // `macro_rules` bodies are token trees, not expanded invocations,
+            // so `unimplemented!()` inside one is not a `macro_invocation`.
+            // The text is still on an added line; that is the stub.
+            "macro_definition" => {
+                if let Some(line) = self.visible_stub_line(node) {
+                    self.placeholder_finding(
+                        node,
+                        Severity::Blocking,
+                        "added code whose body is a wrapper around `todo!` or `unimplemented!`; the task is not implemented".to_string(),
+                    );
+                    // The finding is anchored on the definition. Move it to
+                    // the line that actually carries the stub when that line
+                    // was added, so a marker above the macro covers it.
+                    if let Some(found) = self.out.last_mut() {
+                        found.line = line;
+                    }
                 }
             }
             "function_item" => self.rust_function(node),
@@ -487,6 +684,34 @@ impl<'a> Walker<'a> {
                 "string_literal" | "raw_string_literal" | "interpreted_string_literal" | "string"
             ) && placeholder_text(self.text(n))
         })
+    }
+
+    /// A panic whose message is a placeholder, including one assembled by
+    /// `concat!` from adjacent string literals. A non-literal argument between
+    /// two literals ends that run, so `concat!("not ", detail, "implemented")`
+    /// is not the phrase `not implemented`.
+    fn panic_is_placeholder(&self, node: Node<'_>) -> bool {
+        if self.has_placeholder_string(node) {
+            return true;
+        }
+        let mut rest = self.text(node);
+        while let Some(at) = rest.find("concat!(") {
+            if crate::rigor::concat_placeholder(&rest[at..]).is_some() {
+                return true;
+            }
+            rest = &rest[at + "concat!(".len()..];
+        }
+        false
+    }
+
+    /// An added line of `node` whose code contains `todo!` or `unimplemented!`.
+    fn visible_stub_line(&self, node: Node<'_>) -> Option<u32> {
+        let start = line_of(node);
+        first_visible_stub_line(self.text(node), &|offset| {
+            self.added
+                .contains(&(start + u32::try_from(offset).unwrap_or(0)))
+        })
+        .map(|offset| start + u32::try_from(offset).unwrap_or(0))
     }
 
     // ---- Go ----

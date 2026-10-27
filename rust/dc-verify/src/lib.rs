@@ -16,6 +16,7 @@
 //! an orphan check reading a silently-empty parse would report a clean scope
 //! for a diff that touched the whole repository.
 
+pub mod bounded;
 pub mod coverage;
 pub mod json_stdout;
 pub mod rigor;
@@ -79,8 +80,11 @@ impl FileDiff {
     }
 }
 
-/// A diff that could not be parsed. Carries the line so the failure is
-/// actionable rather than a bare "invalid".
+/// A diff that could not be parsed. It names the line number and the reason.
+///
+/// `line` is the offending line itself, kept for a caller that needs to look at
+/// it. It is diff content, and a diff can hold a credential: [`fmt::Display`]
+/// never prints it, and no caller may put it in a message, a log or a reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
     pub line_number: usize,
@@ -92,8 +96,8 @@ impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "unified diff parse failed at line {}: {} ({:?})",
-            self.line_number, self.reason, self.line
+            "unified diff parse failed at line {}: {}",
+            self.line_number, self.reason
         )
     }
 }
@@ -187,6 +191,14 @@ pub fn parse_unified(diff: &str) -> Result<Vec<FileDiff>, ParseError> {
             if let Some(rest) = raw.strip_prefix("rename to ") {
                 file.status = ChangeStatus::Renamed;
                 file.old_path = pending_rename_from.take();
+                file.path = unquote_path(rest);
+                continue;
+            }
+            if raw.starts_with("copy from ") {
+                continue;
+            }
+            if let Some(rest) = raw.strip_prefix("copy to ") {
+                // The copy is the path that changed; its source is unchanged.
                 file.path = unquote_path(rest);
                 continue;
             }
@@ -421,7 +433,9 @@ fn reject_impossible(files: &[FileDiff]) -> Result<(), ParseError> {
 fn unquote_path(raw: &str) -> String {
     let raw = raw.trim_end_matches(['\r']);
     let Some(body) = raw.strip_prefix('"') else {
-        return raw.split('\t').next().unwrap_or(raw).trim().to_string();
+        // Git ends a name that holds a space with a TAB; a name is otherwise
+        // exact, and a space at either end of it is part of it.
+        return raw.split('\t').next().unwrap_or(raw).to_string();
     };
     let bytes = body.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
@@ -491,7 +505,11 @@ fn quoted_token_end(s: &str) -> Option<usize> {
 /// equal for anything that is not a rename (`a/P b/P`), which fixes where the
 /// split is even when `P` itself contains ` b/`; renames, whose two names can
 /// differ, are corrected by the `rename to` line that follows.
-fn git_header_path(rest: &str) -> Option<String> {
+///
+/// Public so a caller that walks a diff's sections itself (the binary-path
+/// scan in `dcverify`) names a file exactly as the parser does, rather than
+/// re-lexing the header with a second, weaker rule.
+pub fn git_header_path(rest: &str) -> Option<String> {
     if let Some(end) = quoted_token_end(rest) {
         // `"a/..." <b>`: the second name is everything after the separator.
         let second = rest[end..].strip_prefix(' ')?;

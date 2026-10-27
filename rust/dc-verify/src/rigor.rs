@@ -429,16 +429,22 @@ fn placeholder_call(path: &str, statement: &str) -> Option<(Severity, String)> {
                 continue;
             }
             let args = statement[at + name.len()..].trim_start();
-            let Some(message) = args.strip_prefix('"') else {
-                continue;
-            };
-            if let Some(phrase) = PLACEHOLDER_MESSAGES.iter().find(|p| {
-                message.starts_with(**p)
-                    && !message[p.len()..]
-                        .chars()
-                        .next()
-                        .is_some_and(char::is_alphanumeric)
-            }) {
+            if let Some(message) = args.strip_prefix('"') {
+                if let Some(phrase) = PLACEHOLDER_MESSAGES.iter().find(|p| {
+                    message.starts_with(**p)
+                        && !message[p.len()..]
+                            .chars()
+                            .next()
+                            .is_some_and(char::is_alphanumeric)
+                }) {
+                    return Some((
+                        Severity::Blocking,
+                        format!("added code panics saying `{phrase}`; the task is not implemented"),
+                    ));
+                }
+            } else if let Some(phrase) = concat_placeholder(args) {
+                // panic!(concat!("not ", "implemented")) is one placeholder
+                // split across literals. Each piece alone is not the phrase.
                 return Some((
                     Severity::Blocking,
                     format!("added code panics saying `{phrase}`; the task is not implemented"),
@@ -461,6 +467,202 @@ fn placeholder_call(path: &str, statement: &str) -> Option<(Severity, String)> {
         return c_family_placeholder(statement);
     }
     None
+}
+
+/// The placeholder phrase assembled by `concat!(...)` at the start of a panic's
+/// arguments, if a contiguous run of string-literal arguments joins into one.
+///
+/// Pieces are taken only from the outermost `concat!` call, and only from
+/// arguments that are nothing but a string literal. A non-literal between two
+/// literals ends the run: `concat!("not ", detail, "implemented")` is not
+/// `concat!("not ", "implemented")`. A real
+/// `panic!("queue invariant violated: len {}", len)` has no `concat!` and
+/// stays clean.
+pub(crate) fn concat_placeholder(args: &str) -> Option<&'static str> {
+    let rest = args.trim_start();
+    let body = rest.strip_prefix("concat!(")?;
+    let mut run = String::new();
+    let mut pieces = 0usize;
+    let mut found: Option<&'static str> = None;
+    for arg in concat_args(body) {
+        if arg.trim().is_empty() {
+            continue;
+        }
+        match sole_string_literal(arg) {
+            Some(content) => {
+                run.push_str(&content);
+                pieces += 1;
+            }
+            None => note_concat_run(&mut run, &mut pieces, &mut found),
+        }
+    }
+    note_concat_run(&mut run, &mut pieces, &mut found);
+    found
+}
+
+fn note_concat_run(run: &mut String, pieces: &mut usize, found: &mut Option<&'static str>) {
+    if *pieces >= 2 && found.is_none() {
+        let lowered = run.to_ascii_lowercase();
+        *found = PLACEHOLDER_MESSAGES
+            .iter()
+            .copied()
+            .find(|phrase| lowered.contains(phrase));
+    }
+    run.clear();
+    *pieces = 0;
+}
+
+/// Top-level arguments of a `concat!(...)` body, split on commas that are
+/// not inside a nested group, a string, or a comment. `body` starts after
+/// the opening `(`.
+fn concat_args(body: &str) -> Vec<&str> {
+    let bytes = body.as_bytes();
+    let mut args = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut depth: i32 = 1;
+    while i < bytes.len() && depth > 0 {
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        if let Some(quote) = rust_string_at(bytes, i) {
+            i = skip_rust_string(bytes, quote);
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    args.push(&body[start..i]);
+                    break;
+                }
+                i += 1;
+            }
+            b',' if depth == 1 => {
+                args.push(&body[start..i]);
+                i += 1;
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    args
+}
+
+/// Index of the opening quote if `bytes[at..]` is a Rust string literal,
+/// including `b`/`c`/`r` prefixes and raw hashes.
+fn rust_string_at(bytes: &[u8], at: usize) -> Option<usize> {
+    let mut j = at;
+    if matches!(bytes.get(j), Some(b'b' | b'c')) {
+        match bytes.get(j + 1) {
+            Some(b'"' | b'r') => j += 1,
+            _ => return None,
+        }
+    }
+    if bytes.get(j) == Some(&b'r') {
+        j += 1;
+        while bytes.get(j) == Some(&b'#') {
+            j += 1;
+        }
+    }
+    if bytes.get(j) == Some(&b'"') {
+        Some(j)
+    } else {
+        None
+    }
+}
+
+fn skip_rust_string(bytes: &[u8], quote: usize) -> usize {
+    let hashes = raw_hashes(bytes, quote);
+    let mut i = quote + 1;
+    if hashes == 0 {
+        while i < bytes.len() && bytes[i] != b'"' {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            i += 1;
+        }
+        return (i + 1).min(bytes.len());
+    }
+    while i < bytes.len() {
+        if bytes[i] == b'"'
+            && i + 1 + hashes <= bytes.len()
+            && bytes[i + 1..i + 1 + hashes].iter().all(|b| *b == b'#')
+        {
+            return i + 1 + hashes;
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+fn raw_hashes(bytes: &[u8], quote: usize) -> usize {
+    let mut hashes = 0usize;
+    let mut k = quote;
+    while k > 0 && bytes[k - 1] == b'#' {
+        hashes += 1;
+        k -= 1;
+    }
+    hashes
+}
+
+/// The contents of `arg` when the argument is one string literal and nothing
+/// else. Anything else — an identifier, an operator, a second token — is not
+/// a piece that can be joined with its neighbours.
+fn sole_string_literal(arg: &str) -> Option<String> {
+    let s = trim_leading_ws_comments(arg);
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let quote = rust_string_at(bytes, 0)?;
+    let content_start = quote + 1;
+    let end = skip_rust_string(bytes, quote);
+    if !trim_leading_ws_comments(&s[end..]).is_empty() {
+        return None;
+    }
+    let inner_end = if raw_hashes(bytes, quote) == 0 {
+        end.saturating_sub(1).max(content_start)
+    } else {
+        let hashes = raw_hashes(bytes, quote);
+        end.saturating_sub(1 + hashes).max(content_start)
+    };
+    Some(s[content_start..inner_end].to_string())
+}
+
+fn trim_leading_ws_comments(mut s: &str) -> &str {
+    loop {
+        s = s.trim_start();
+        if let Some(rest) = s.strip_prefix("/*") {
+            let Some(end) = rest.find("*/") else {
+                return s;
+            };
+            s = &rest[end + 2..];
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("//") {
+            s = rest.split_once('\n').map(|(_, right)| right).unwrap_or("");
+            continue;
+        }
+        return s;
+    }
 }
 
 /// Whether `path` is Java or C#: languages whose placeholders are a thrown
