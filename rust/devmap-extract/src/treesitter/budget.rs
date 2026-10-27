@@ -14,6 +14,10 @@ thread_local! {
     /// and how often. See [`note_nesting_cap`].
     pub(super) static NESTING_CAPS: RefCell<BTreeMap<&'static str, usize>> =
         const { RefCell::new(BTreeMap::new()) };
+    /// Byte ranges of statements the Kotlin loss detector charged, which the
+    /// walks that derive per-scope tables leave out. See [`set_charged_regions`].
+    pub(super) static CHARGED_REGIONS: RefCell<Vec<(usize, usize)>> =
+        const { RefCell::new(Vec::new()) };
     #[cfg(test)]
     pub(super) static NATIVE_PARENT_READS: Cell<usize> = const { Cell::new(0) };
 }
@@ -38,23 +42,33 @@ thread_local! {
 pub(super) struct BudgetGuard {
     /// The deadline that was armed when this guard was, if one was.
     outer: Option<std::time::Instant>,
+    /// The charged regions of the extraction this one runs inside, if any.
+    outer_regions: Vec<(usize, usize)>,
 }
 
 impl BudgetGuard {
     pub(super) fn arm(deadline: std::time::Instant) -> Self {
         let outer = WALK_DEADLINE.with(|slot| slot.get());
+        let outer_regions =
+            CHARGED_REGIONS.with(|regions| std::mem::take(&mut *regions.borrow_mut()));
         reset_scope_locals();
         WALK_DEADLINE.with(|slot| slot.set(Some(deadline)));
         WALK_OVERRAN.with(|slot| slot.set(false));
         PARENT_STEPS.with(|slot| slot.set(0));
         NESTING_CAPS.with(|caps| caps.borrow_mut().clear());
-        BudgetGuard { outer }
+        BudgetGuard {
+            outer,
+            outer_regions,
+        }
     }
 }
 
 impl Drop for BudgetGuard {
     fn drop(&mut self) {
         WALK_DEADLINE.with(|slot| slot.set(self.outer));
+        CHARGED_REGIONS.with(|regions| {
+            *regions.borrow_mut() = std::mem::take(&mut self.outer_regions);
+        });
         // Retain the incomplete-walk signal until the next extraction arms
         // its budget. The publication gate must not lose a helper's refusal.
     }
@@ -136,6 +150,30 @@ pub(super) const PARENT_CHECK_STRIDE: u32 = 64;
 /// is a plain `Cell` read so the loop can consult it on every node.
 pub(super) fn walk_overran() -> bool {
     WALK_OVERRAN.with(|slot| slot.get())
+}
+
+/// Declare the byte ranges of the statements the Kotlin loss detector charged.
+///
+/// The expression reading of such a statement is not what the file declares, so
+/// the walks that derive a table from the tree (declarations and their wiring,
+/// per-scope locals, scope receivers) leave a node inside one out: a table is
+/// derived from what the file declares, never patched afterwards by a name a
+/// phantom shares with a real symbol. A recovered region contributes its own
+/// rows from the re-parse. Empty for every file but a Kotlin file the detector
+/// charged; cleared when the next extraction arms its budget.
+pub(crate) fn set_charged_regions(regions: Vec<(usize, usize)>) {
+    CHARGED_REGIONS.with(|slot| *slot.borrow_mut() = regions);
+}
+
+/// Whether `node` lies inside a statement the loss detector charged.
+pub(crate) fn in_charged_region(node: Node<'_>) -> bool {
+    CHARGED_REGIONS.with(|regions| {
+        let regions = regions.borrow();
+        !regions.is_empty()
+            && regions
+                .iter()
+                .any(|&(start, end)| start <= node.start_byte() && node.end_byte() <= end)
+    })
 }
 
 /// Whether this file's extraction may still publish what it has.

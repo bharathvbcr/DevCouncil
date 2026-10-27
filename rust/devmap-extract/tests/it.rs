@@ -78,6 +78,8 @@ mod kotlin_one_line_bodies;
 #[cfg(feature = "parse")]
 mod kotlin_recovery_twin;
 #[cfg(feature = "parse")]
+mod kotlin_settled_tables;
+#[cfg(feature = "parse")]
 mod kotlin_silent_loss;
 #[cfg(feature = "parse")]
 mod langcalls_erlang_pascal;

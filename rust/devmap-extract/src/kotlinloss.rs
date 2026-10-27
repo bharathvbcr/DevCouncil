@@ -43,8 +43,8 @@ use std::time::Instant;
 use tree_sitter::Node;
 
 use crate::model::{
-    ExtractedCall, ExtractedExport, ExtractedReference, ExtractedSymbol, Extraction, LocalBinding,
-    ParseOutcome, Span, SymbolKind, TextRange, WiringAnnotation,
+    ExtractedCall, ExtractedReference, ExtractedSymbol, Extraction, JvmDeclFact, LocalBinding,
+    LocalExtent, ParseOutcome, ScopeReceiver, Span, SymbolKind, TextRange, WiringAnnotation,
 };
 use crate::treesitter::{
     bounded_parent, extraction_overran, walk_deadline_passed, DEADLINE_CHECK_STRIDE,
@@ -421,6 +421,19 @@ pub(crate) fn recover(
         .symbols
         .sort_by_key(|symbol| symbol.span.start_byte);
     extraction.calls.sort_by_key(|call| call.span.start_byte);
+    extraction
+        .scope_receivers
+        .sort_by_key(|scope| (scope.body_start, scope.body_end));
+    extraction.jvm_decls.sort();
+    extraction.jvm_decls.dedup();
+    extraction.local_extents.sort();
+    extraction.local_extents.dedup();
+    // Derived afresh from the settled symbols, by the pass every file goes
+    // through: the Kotlin walk publishes no export of its own, so this is the
+    // whole of it, and a symbol that is not published cannot have held the slot
+    // of one that is.
+    extraction.exports.clear();
+    crate::treesitter::publish_exports(&extraction.symbols, &mut extraction.exports);
     crate::embedded::reorder_after_merge(extraction);
 }
 
@@ -545,10 +558,12 @@ struct Staged {
     symbols: Vec<ExtractedSymbol>,
     calls: Vec<ExtractedCall>,
     references: Vec<ExtractedReference>,
-    exports: Vec<ExtractedExport>,
     wiring: Vec<WiringAnnotation>,
     scope_locals: Vec<(String, String)>,
     local_bindings: Vec<LocalBinding>,
+    scope_receivers: Vec<ScopeReceiver>,
+    jvm_decls: Vec<JvmDeclFact>,
+    local_extents: Vec<LocalExtent>,
     diagnostics: Vec<String>,
 }
 
@@ -584,10 +599,12 @@ impl Staged {
             symbols: Vec::new(),
             calls: Vec::new(),
             references: Vec::new(),
-            exports: Vec::new(),
             wiring: Vec::new(),
             scope_locals: inner.scope_locals,
             local_bindings: Vec::new(),
+            scope_receivers: Vec::new(),
+            jvm_decls: Vec::new(),
+            local_extents: Vec::new(),
             diagnostics: inner.diagnostics,
         };
         for mut symbol in inner.symbols {
@@ -611,15 +628,6 @@ impl Staged {
             reference.span = shift_span(&reference.span)?;
             staged.references.push(reference);
         }
-        for mut export in inner.exports {
-            // The inner run exported its own `File` node, which the outer
-            // already carries.
-            if export.exported_name == file_path.rsplit('/').next().unwrap_or(file_path) {
-                continue;
-            }
-            export.span = shift_span(&export.span)?;
-            staged.exports.push(export);
-        }
         staged.wiring = inner
             .wiring
             .into_iter()
@@ -628,6 +636,27 @@ impl Staged {
         for mut binding in inner.local_bindings {
             binding.start_byte = shift(binding.start_byte)?;
             staged.local_bindings.push(binding);
+        }
+        for mut receiver in inner.scope_receivers {
+            receiver.body_start = shift(receiver.body_start)?;
+            receiver.body_end = shift(receiver.body_end)?;
+            staged.scope_receivers.push(receiver);
+        }
+        let shift_range = |range: &TextRange| -> Result<TextRange, String> {
+            Ok(TextRange {
+                start_byte: shift(range.start_byte)?,
+                end_byte: shift(range.end_byte)?,
+            })
+        };
+        for mut fact in inner.jvm_decls {
+            fact.start_byte = shift(fact.start_byte)?;
+            fact.header = fact.header.as_ref().map(&shift_range).transpose()?;
+            fact.body = fact.body.as_ref().map(&shift_range).transpose()?;
+            staged.jvm_decls.push(fact);
+        }
+        for mut extent in inner.local_extents {
+            extent.extent = shift_range(&extent.extent)?;
+            staged.local_extents.push(extent);
         }
         // Field by field, so a refusal names what leaked.
         fn leak<T: serde::Serialize>(label: &str, items: &[T]) -> Result<(), String> {
@@ -646,64 +675,69 @@ impl Staged {
         leak("symbols", &staged.symbols)?;
         leak("calls", &staged.calls)?;
         leak("references", &staged.references)?;
-        leak("exports", &staged.exports)?;
         leak("wiring", &staged.wiring)?;
         leak("scope locals", &staged.scope_locals)?;
         leak("local bindings", &staged.local_bindings)?;
+        leak("scope receivers", &staged.scope_receivers)?;
+        leak("jvm decls", &staged.jvm_decls)?;
+        leak("local extents", &staged.local_extents)?;
         Ok(staged)
     }
 
-    /// Replace what the original tree produced inside `region` with these:
-    /// everything it emitted there, by span, and the scope locals of every
-    /// symbol it emitted there, which carry no span of their own.
+    /// Replace what the original tree produced inside `region` with these.
+    ///
+    /// Only by span, and only the rows that have one. What carries no span of
+    /// its own is not patched here: the walks that derive it (declarations and
+    /// their wiring, scope locals, scope receivers) already left the region
+    /// out, so the outer tree published nothing under a name a phantom could
+    /// share with a real symbol, and `exports` is derived afresh from the
+    /// settled symbols by [`recover`]. Every table of an `Extraction` was
+    /// considered:
+    ///
+    /// * `symbols`, `calls`, `references`, `local_bindings`, `scope_receivers`,
+    ///   `jvm_decls` and `local_extents` have spans or start bytes and are
+    ///   replaced by span;
+    /// * `wiring` and `scope_locals` are keyed by names, never emitted inside a
+    ///   region, and contributed by the re-parse for a recovered one;
+    /// * `exports` is derived from `symbols`;
+    /// * `imports`, `routes`, `literals`, `js_objects`, `rust_*`, `go_*` and
+    ///   `dynamic_dispatch` belong to other languages or to nothing a region
+    ///   holds (Kotlin imports are header lines, and Kotlin has no literal
+    ///   decoder yet; the day it has, a literal inside an unrecovered region
+    ///   must be left out by the walk that reads it);
+    /// * `package_scopes` are file-level headers, not region contents;
+    /// * `decl_gaps` and `recovered_decl_ranges` are written by [`recover`].
     fn apply(self, extraction: &mut Extraction, region: &LostRegion) {
         let (start, end) = (region.range.start_byte, region.range.end_byte);
         let inside = |span: &Span| span.start_byte >= start && span.end_byte <= end;
-        let mut dropped: Vec<String> = Vec::new();
-        extraction.symbols.retain(|symbol| {
-            let drop = symbol.kind != SymbolKind::File && inside(&symbol.span);
-            if drop {
-                dropped.push(symbol.qualified_name.clone());
-            }
-            !drop
-        });
+        extraction
+            .symbols
+            .retain(|symbol| symbol.kind == SymbolKind::File || !inside(&symbol.span));
         extraction.calls.retain(|call| !inside(&call.span));
         extraction
             .references
             .retain(|reference| !inside(&reference.span));
-        extraction.exports.retain(|export| !inside(&export.span));
-        extraction
-            .wiring
-            .retain(|annotation| !dropped.contains(&annotation.target_symbol));
         extraction
             .local_bindings
             .retain(|binding| binding.start_byte < start || binding.start_byte >= end);
-        // A scope is the ghost of a dropped symbol only if nothing outside the
-        // region is called by that name too: the expression reading files the
-        // member `m` of a swallowed class as a top-level `A.kt::m`, and a real
-        // top-level `m` elsewhere in the file owns the scope of that name.
-        let surviving: std::collections::HashSet<&str> = extraction
-            .symbols
-            .iter()
-            .map(|symbol| symbol.qualified_name.as_str())
-            .collect();
-        let ghosts: Vec<&String> = dropped
-            .iter()
-            .filter(|name| !surviving.contains(name.as_str()))
-            .collect();
-        extraction.scope_locals.retain(|(scope, _)| {
-            !ghosts.iter().any(|name| {
-                scope == *name
-                    || (scope.starts_with(name.as_str()) && scope[name.len()..].starts_with('.'))
-            })
-        });
+        extraction
+            .scope_receivers
+            .retain(|receiver| receiver.body_start < start || receiver.body_end > end);
+        extraction
+            .jvm_decls
+            .retain(|fact| fact.start_byte < start || fact.start_byte >= end);
+        extraction
+            .local_extents
+            .retain(|extent| extent.extent.start_byte < start || extent.extent.end_byte > end);
         extraction.symbols.extend(self.symbols);
         extraction.calls.extend(self.calls);
         extraction.references.extend(self.references);
-        extraction.exports.extend(self.exports);
         extraction.wiring.extend(self.wiring);
         extraction.scope_locals.extend(self.scope_locals);
         extraction.local_bindings.extend(self.local_bindings);
+        extraction.scope_receivers.extend(self.scope_receivers);
+        extraction.jvm_decls.extend(self.jvm_decls);
+        extraction.local_extents.extend(self.local_extents);
         extraction.diagnostics.extend(self.diagnostics);
     }
 }

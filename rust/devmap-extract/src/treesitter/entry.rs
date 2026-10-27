@@ -569,6 +569,15 @@ pub(super) fn extract_treesitter_before_deadline(
                 } else {
                     crate::kotlinloss::LostScan::default()
                 };
+                // The walks below leave out what the expression reading made of
+                // a charged statement, instead of the settling that follows
+                // taking it out by name.
+                set_charged_regions(
+                    lost.regions
+                        .iter()
+                        .map(|region| (region.range.start_byte, region.range.end_byte))
+                        .collect(),
+                );
                 let parse_outcome =
                     parse_outcome_of(root, source, is_metal_path(path), lang == "python", &lost);
 
@@ -807,49 +816,7 @@ pub(super) fn extract_treesitter_before_deadline(
                     });
                 }
 
-                // The names the exports so far publish, kept as sets so each
-                // exported symbol asks one lookup instead of scanning every
-                // export: a type with tens of thousands of exported members made
-                // this loop quadratic (30,000 Swift properties spent most of
-                // their extraction here).
-                let mut published_as: std::collections::HashSet<String> = exports
-                    .iter()
-                    .map(|export| export.exported_name.clone())
-                    .collect();
-                let mut published_from: std::collections::HashSet<String> = exports
-                    .iter()
-                    .filter(|export| {
-                        export.module_specifier.is_none() && export.exported_name != "default"
-                    })
-                    .filter_map(|export| export.local_name.clone())
-                    .collect();
-                for symbol in symbols.iter().filter(|symbol| symbol.is_exported) {
-                    // A symbol already published under another name —
-                    // `export { local as Public }` — is not also exported as
-                    // itself. Matching on `exported_name` alone fabricated a
-                    // second export, `local`, that the module never declared.
-                    if !published_as.contains(&symbol.name)
-                        && !published_from.contains(&symbol.name)
-                    {
-                        published_as.insert(symbol.name.clone());
-                        if symbol.name != "default" {
-                            published_from.insert(symbol.name.clone());
-                        }
-                        exports.push(ExtractedExport {
-                            exported_name: symbol.name.clone(),
-                            local_name: Some(symbol.name.clone()),
-                            module_specifier: None,
-                            span: symbol.span.clone(),
-                        });
-                    }
-                }
-                exports.sort_by(|a, b| {
-                    (&a.exported_name, &a.module_specifier, a.span.start_byte).cmp(&(
-                        &b.exported_name,
-                        &b.module_specifier,
-                        b.span.start_byte,
-                    ))
-                });
+                publish_exports(&symbols, &mut exports);
                 if lang == "rust" {
                     rust_expand_local_macros(
                         root,
@@ -1151,6 +1118,55 @@ pub(crate) fn push_named_children<'tree>(node: Node<'tree>, worklist: &mut Vec<N
     for child in node.named_children(&mut cursor) {
         worklist.push(child);
     }
+}
+
+/// Publish every exported symbol under its own name unless the module already
+/// publishes that name, and put `exports` in its published order.
+///
+/// The one owner of the answer, called after the walk and again after a Kotlin
+/// loss recovery has settled `symbols`: an export is derived from the symbols
+/// that survive, never patched on the way, so a symbol that is not published
+/// cannot hold the slot of one that is.
+pub(crate) fn publish_exports(symbols: &[ExtractedSymbol], exports: &mut Vec<ExtractedExport>) {
+    // The names the exports so far publish, kept as sets so each
+    // exported symbol asks one lookup instead of scanning every
+    // export: a type with tens of thousands of exported members made
+    // this loop quadratic (30,000 Swift properties spent most of
+    // their extraction here).
+    let mut published_as: std::collections::HashSet<String> = exports
+        .iter()
+        .map(|export| export.exported_name.clone())
+        .collect();
+    let mut published_from: std::collections::HashSet<String> = exports
+        .iter()
+        .filter(|export| export.module_specifier.is_none() && export.exported_name != "default")
+        .filter_map(|export| export.local_name.clone())
+        .collect();
+    for symbol in symbols.iter().filter(|symbol| symbol.is_exported) {
+        // A symbol already published under another name —
+        // `export { local as Public }` — is not also exported as
+        // itself. Matching on `exported_name` alone fabricated a
+        // second export, `local`, that the module never declared.
+        if !published_as.contains(&symbol.name) && !published_from.contains(&symbol.name) {
+            published_as.insert(symbol.name.clone());
+            if symbol.name != "default" {
+                published_from.insert(symbol.name.clone());
+            }
+            exports.push(ExtractedExport {
+                exported_name: symbol.name.clone(),
+                local_name: Some(symbol.name.clone()),
+                module_specifier: None,
+                span: symbol.span.clone(),
+            });
+        }
+    }
+    exports.sort_by(|a, b| {
+        (&a.exported_name, &a.module_specifier, a.span.start_byte).cmp(&(
+            &b.exported_name,
+            &b.module_specifier,
+            b.span.start_byte,
+        ))
+    });
 }
 
 /// The outcome of a parse: `Clean`, or `Partial` with the ranges that are not

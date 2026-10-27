@@ -1542,7 +1542,11 @@ pub(super) fn extract_node(
             // Declaration identity, kind and visibility all come from the
             // language's own module in `langdecl`, which is the single owner of
             // the answer `langcalls::scope` mirrors for caller attribution.
-            if let Some(declaration) = crate::langdecl::declaration_of(lang, node, source) {
+            // Not inside a statement the Kotlin loss detector charged: what the
+            // grammar's expression reading made of it is not a declaration.
+            if let Some(declaration) = crate::langdecl::declaration_of(lang, node, source)
+                .filter(|_| !in_charged_region(node))
+            {
                 let qualified = declaration.qualified(file_symbol_name);
                 let name = declaration.name.clone();
                 if declaration.declared_kind == SymbolKind::Function
