@@ -68,6 +68,11 @@ pub(crate) const MAX_PASSES: usize = 32;
 /// What a declaration may start with after a `}` on the same line. A `;` is
 /// wanted between `class A { .. } class B { .. }`, and only before one of
 /// these (never before `else`, `catch`, `as`, `by`, `.`, an infix name...).
+///
+/// Accepted residual risk: a user-defined infix function named like one of
+/// these (`infix fun init`, `companion`, `data`...) written after a `}` in a
+/// file that has an unrelated error can re-parse clean as a block of its own.
+/// It is rare, the re-parse must be fully clean, and it is accepted.
 const DECLARATION_STARTS: [&str; 32] = [
     "class",
     "object",
@@ -112,6 +117,9 @@ pub(crate) enum Repair {
         tree: Tree,
         ranges: Vec<TextRange>,
         edits: usize,
+        /// The second mode was needed: a separator was written between two
+        /// declarations that share a line.
+        boundaries: bool,
     },
     /// Nothing changed: the original tree is handed back, with the reason.
     Unchanged { tree: Tree, why: String },
@@ -170,6 +178,7 @@ fn rewrite(
                 tree: current,
                 ranges,
                 edits: edited.len(),
+                boundaries,
             });
         }
         if pass == MAX_PASSES {
@@ -363,9 +372,16 @@ fn candidates(
 }
 
 /// The top-level statements of the repaired tree a separator was written into.
+///
+/// A separator written inside a statement lands on a node of it. One written
+/// between two statements (the second mode's, after a `}`) becomes the
+/// grammar's hidden separator token, which no node shows, so the lookup lands
+/// on the root: the statement that ends at the separator and the one that
+/// starts after it are the ones it joined, and both are recorded.
 fn touched(tree: &Tree, edits: &[usize]) -> Vec<TextRange> {
     let root = tree.root_node();
     let mut ranges: Vec<TextRange> = Vec::new();
+    let mut top: Option<Vec<TextRange>> = None;
     for &at in edits {
         let Some(mut node) = root.descendant_for_byte_range(at, at + 1) else {
             continue;
@@ -381,6 +397,25 @@ fn touched(tree: &Tree, edits: &[usize]) -> Vec<TextRange> {
                 start_byte: node.start_byte(),
                 end_byte: node.end_byte(),
             });
+            continue;
+        }
+        let statements = top.get_or_insert_with(|| {
+            let mut cursor = root.walk();
+            root.children(&mut cursor)
+                .map(|child| TextRange {
+                    start_byte: child.start_byte(),
+                    end_byte: child.end_byte(),
+                })
+                .collect()
+        });
+        let after = statements.partition_point(|range| range.end_byte <= at);
+        if let Some(before) = after.checked_sub(1) {
+            ranges.push(statements[before].clone());
+        }
+        if let Some(next) = statements.get(after) {
+            if next.start_byte > at {
+                ranges.push(next.clone());
+            }
         }
     }
     ranges.sort();

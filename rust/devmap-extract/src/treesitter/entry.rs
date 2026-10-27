@@ -536,12 +536,18 @@ pub(super) fn extract_treesitter_before_deadline(
                         tree,
                         ranges,
                         edits,
+                        boundaries,
                     } => (
                         ParseAttempt::Parsed(tree),
                         ranges,
                         Some(format!(
-                            "kotlin one-line class body: {edits} separator(s) written over \
-                             spaces so the file parses; offsets are the file's own"
+                            "kotlin one-line class body{}: {edits} separator(s) written over \
+                             spaces so the file parses; offsets are the file's own",
+                            if boundaries {
+                                " (declarations sharing a line)"
+                            } else {
+                                ""
+                            }
                         )),
                     ),
                     crate::kotlinsemi::Repair::Unchanged { tree, why } => (
