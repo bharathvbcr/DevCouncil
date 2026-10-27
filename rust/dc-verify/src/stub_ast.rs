@@ -255,6 +255,13 @@ fn contains_marker(text: &str) -> bool {
 }
 
 /// `todo!` or `unimplemented!` in code position on one line.
+///
+/// A small lexer, not a parser: it skips what is not code. String literals,
+/// raw strings (`r#"…"#`) and char literals are skipped whole, so a `'"'` does
+/// not open a string that hides what follows it, and a quote inside a raw
+/// string does not close one early. A tick that is not a char literal is a
+/// lifetime and is skipped alone. Whatever is left of an unterminated string or
+/// raw string on this line is not code.
 fn line_has_visible_stub(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     let bytes = lower.as_bytes();
@@ -275,10 +282,28 @@ fn line_has_visible_stub(line: &str) -> bool {
         }
         match b {
             b'"' => in_string = true,
+            b'\'' => {
+                if let Some(len) = char_literal_len(&bytes[i..]) {
+                    i += len;
+                    continue;
+                }
+            }
+            b'r' if raw_string_hashes(bytes, i).is_some() => {
+                let hashes = raw_string_hashes(bytes, i).unwrap_or(0);
+                match raw_string_end(&bytes[i + 2 + hashes..], hashes) {
+                    Some(len) => {
+                        i += 2 + hashes + len;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
             b'/' if bytes.get(i + 1) == Some(&b'/') => break,
             _ => {
+                // Bytes, not `lower[i..]`: `i` need not sit on a char boundary,
+                // and slicing the str there panics.
                 for token in ["todo!", "unimplemented!"] {
-                    if lower[i..].starts_with(token) {
+                    if bytes[i..].starts_with(token.as_bytes()) {
                         let boundary = i == 0
                             || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
                         if boundary {
@@ -291,6 +316,58 @@ fn line_has_visible_stub(line: &str) -> bool {
         i += 1;
     }
     false
+}
+
+/// Length of the char literal at the start of `s` (which begins with `'`), or
+/// `None` when the tick is a lifetime. `'x'` is one scalar between ticks and
+/// `'\…'` is an escape (`'\''`, `'\"'`, `'\n'`, `'\u{1F600}'`) closed by the
+/// next tick.
+fn char_literal_len(s: &[u8]) -> Option<usize> {
+    match *s.get(1)? {
+        b'\\' => {
+            // The escaped byte (position 2) may itself be a tick, so the
+            // closing tick is searched for from position 3.
+            let close = s.get(3..)?.iter().take(10).position(|&c| c == b'\'')?;
+            Some(3 + close + 1)
+        }
+        b'\'' => None,
+        lead => {
+            let width = match lead {
+                0x00..=0x7f => 1,
+                0xc0..=0xdf => 2,
+                0xe0..=0xef => 3,
+                0xf0..=0xf7 => 4,
+                _ => return None,
+            };
+            (s.get(1 + width) == Some(&b'\'')).then_some(width + 2)
+        }
+    }
+}
+
+/// How many `#` open the raw string whose `r` is at `bytes[at]`, or `None` when
+/// that `r` does not start one: it ends an identifier (`bar#"`), or is not
+/// followed by `#`* and a quote. A `b` prefix (`br"…"`) is accepted.
+fn raw_string_hashes(bytes: &[u8], at: usize) -> Option<usize> {
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let before = match at.checked_sub(1) {
+        Some(prev) if bytes[prev] == b'b' => prev.checked_sub(1),
+        other => other,
+    };
+    if before.is_some_and(|p| ident(bytes[p])) {
+        return None;
+    }
+    let hashes = bytes[at + 1..].iter().take_while(|&&c| c == b'#').count();
+    (bytes.get(at + 1 + hashes) == Some(&b'"')).then_some(hashes)
+}
+
+/// Length of the raw string body in `rest` (the bytes after the opening quote)
+/// including its closing `"` and `hashes` hashes, or `None` when the string
+/// does not close on this line.
+fn raw_string_end(rest: &[u8], hashes: usize) -> Option<usize> {
+    (0..rest.len()).find_map(|k| {
+        (rest[k] == b'"' && rest.get(k + 1..k + 1 + hashes)?.iter().all(|&c| c == b'#'))
+            .then_some(k + 1 + hashes)
+    })
 }
 
 /// Whether a string literal's text reads as "this is not written yet".

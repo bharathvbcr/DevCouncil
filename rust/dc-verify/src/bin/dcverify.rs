@@ -329,11 +329,28 @@ fn unbounded_device(kind: &std::fs::FileType) -> bool {
     }
 }
 
+/// What `dcverify` writes between a path and its reason when the secret scan
+/// could not read a binary file's bytes.
+///
+/// `stub_ast_degraded` is the one degradation list on the wire, and the JSON
+/// contract is public, so this kind of entry has no key of its own: the kind is
+/// in the text, and the Go host (`dcverify.BinaryScanSkippedMarker`) reads it
+/// from there. An entry that said only "path: reason" read as a stub-detection
+/// fallback, and an operator could not tell a credential scan had skipped a
+/// file.
+const BINARY_SCAN_SKIPPED: &str = ": secret scan skipped (";
+
+fn binary_scan_skipped(path: &str, reason: &str) -> String {
+    format!("{path}{BINARY_SCAN_SKIPPED}binary file not read: {reason})")
+}
+
 /// Planned paths whose diff section is a binary marker and no hunk.
 ///
 /// Their bytes are not in the diff. Read the working-tree file under the
 /// same cap, without following a symlink, and secret-scan it. A path that
-/// cannot be read degrades the verdict instead of scanning clean.
+/// cannot be read degrades the verdict instead of scanning clean. A path the
+/// diff deletes has no working-tree file, so there is nothing to read and it
+/// is not asked for.
 fn scan_binary_paths(
     diff: &str,
     files: &[dc_verify::FileDiff],
@@ -376,31 +393,44 @@ fn scan_binary_paths(
                     }
                 }
             }
-            Err(reason) => degraded.push(format!("{normalized}: {reason}")),
+            Err(reason) => degraded.push(binary_scan_skipped(&normalized, &reason)),
         }
     }
 }
 
-/// Paths whose `diff --git` section contains a binary marker and no hunk.
+/// Paths whose `diff --git` section contains a binary marker, no hunk, and
+/// does not delete the file.
+///
+/// A section's path is read with [`dc_verify::git_header_path`], the rule the
+/// diff parser names files by, so a name git quotes (a non-ASCII byte, a quote,
+/// a control character) is scanned under the name the scope check judged. The
+/// parser refuses a header it cannot read, so by the time this runs every
+/// header has a name.
 fn binary_paths_without_hunks(diff: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut path = String::new();
     let mut in_file = false;
     let mut saw_hunk = false;
     let mut saw_binary = false;
-    let flush =
-        |path: &str, in_file: bool, saw_hunk: bool, saw_binary: bool, out: &mut Vec<String>| {
-            if in_file && saw_binary && !saw_hunk && !path.is_empty() {
-                out.push(path.to_string());
-            }
-        };
+    let mut saw_deleted = false;
+    let flush = |path: &str,
+                 in_file: bool,
+                 saw_hunk: bool,
+                 saw_binary: bool,
+                 saw_deleted: bool,
+                 out: &mut Vec<String>| {
+        if in_file && saw_binary && !saw_hunk && !saw_deleted && !path.is_empty() {
+            out.push(path.to_string());
+        }
+    };
     for line in diff.lines() {
         if let Some(rest) = line.strip_prefix("diff --git ") {
-            flush(&path, in_file, saw_hunk, saw_binary, &mut out);
-            path = diff_header_b_path(rest).unwrap_or_default();
+            flush(&path, in_file, saw_hunk, saw_binary, saw_deleted, &mut out);
+            path = dc_verify::git_header_path(rest).unwrap_or_default();
             in_file = true;
             saw_hunk = false;
             saw_binary = false;
+            saw_deleted = false;
             continue;
         }
         if !in_file {
@@ -409,43 +439,76 @@ fn binary_paths_without_hunks(diff: &str) -> Vec<String> {
         if line.starts_with("@@") {
             saw_hunk = true;
         }
+        // Before the binary marker only: a `GIT binary patch` body is base85
+        // and cannot spell these words, but the order is what makes it certain.
+        if !saw_binary && line.starts_with("deleted file mode") {
+            saw_deleted = true;
+        }
         if line.starts_with("Binary files ") || line.starts_with("GIT binary patch") {
             saw_binary = true;
+            if line.ends_with(" and /dev/null differ") {
+                saw_deleted = true;
+            }
         }
     }
-    flush(&path, in_file, saw_hunk, saw_binary, &mut out);
+    flush(&path, in_file, saw_hunk, saw_binary, saw_deleted, &mut out);
     out
 }
 
-/// The post-change path in an unquoted `diff --git a/P b/P` header.
-fn diff_header_b_path(rest: &str) -> Option<String> {
-    let at = rest.rfind(" b/")?;
-    let name = &rest[at + 3..];
-    if name.is_empty() || name.contains('"') {
-        return None;
+/// Metadata of `rel` under `root`, reached without following a symlink at any
+/// component: every prefix is `lstat`ed, a symlink anywhere on the way is
+/// refused, and every parent must be a directory. Checking only the last
+/// component let `d -> /elsewhere` carry a read of `d/f` out of the repository.
+///
+/// `root` itself is the caller's choice and is not examined. Only a relative
+/// path of plain names (and `.`) is accepted.
+///
+/// This narrows the window, it does not close it: the open that follows is by
+/// path, and a descriptor-relative walk (`openat` with `O_NOFOLLOW` per
+/// component) needs a dependency this crate does not carry. Callers repeat the
+/// walk after reading, so a path swapped for a link during the read is refused
+/// rather than believed.
+fn lstat_within(
+    root: &std::path::Path,
+    rel: &std::path::Path,
+) -> Result<(std::path::PathBuf, std::fs::Metadata), String> {
+    use std::path::Component;
+    let mut current = root.to_path_buf();
+    let mut last: Option<std::fs::Metadata> = None;
+    let mut components = rel.components().peekable();
+    while let Some(component) = components.next() {
+        match component {
+            Component::CurDir => continue,
+            Component::Normal(part) => current.push(part),
+            _ => return Err("path escapes the working tree".to_string()),
+        }
+        let meta = std::fs::symlink_metadata(&current).map_err(|e| format!("cannot read: {e}"))?;
+        if meta.file_type().is_symlink() {
+            return Err("refusing to follow a symlink".to_string());
+        }
+        if components.peek().is_some() && !meta.is_dir() {
+            return Err("a parent of the path is not a directory".to_string());
+        }
+        last = Some(meta);
     }
-    Some(name.to_string())
+    last.map(|meta| (current, meta))
+        .ok_or_else(|| "path escapes the working tree".to_string())
 }
 
 /// Working-tree bytes of a binary path, or why they could not be scanned.
 ///
-/// A symlink is refused and not opened. The read is bounded by
-/// [`MAX_CHECK_BYTES`] before the file is pulled in: metadata length first,
-/// then `take`. The result is lossy-decoded so a NUL does not hide a credential
-/// that sits in the same file.
+/// A symlink, at the last component or any parent, is refused and not opened.
+/// The read is bounded by [`MAX_CHECK_BYTES`] before the file is pulled in:
+/// metadata length first, then `take`. The result is lossy-decoded so a NUL
+/// does not hide a credential that sits in the same file.
 fn read_binary_post_image(root: Option<&std::path::Path>, path: &str) -> Result<String, String> {
     use std::io::Read as _;
-    use std::path::Component;
     let root = root.ok_or_else(|| "no working tree root".to_string())?;
-    let rel = std::path::Path::new(path);
-    if path.is_empty() || !rel.components().all(|c| matches!(c, Component::Normal(_))) {
+    if path.is_empty() {
         return Err("path escapes the working tree".to_string());
     }
-    let full = root.join(rel);
-    let meta = std::fs::symlink_metadata(&full).map_err(|e| format!("cannot read: {e}"))?;
-    if meta.file_type().is_symlink() {
-        return Err("refusing to follow a symlink".to_string());
-    }
+    let rel = std::path::Path::new(path);
+    let (full, meta) = lstat_within(root, rel)?;
     if !meta.is_file() {
         return Err("not a regular file".to_string());
     }
@@ -461,10 +524,10 @@ fn read_binary_post_image(root: Option<&std::path::Path>, path: &str) -> Result<
     if read > MAX_CHECK_BYTES {
         return Err(format!("exceeds {MAX_CHECK_BYTES} bytes"));
     }
-    // The symlink check above is the open we refused. Re-check before believing
-    // the bytes, in case the path was replaced with a link.
-    let again = std::fs::symlink_metadata(&full).map_err(|e| format!("cannot read: {e}"))?;
-    if again.file_type().is_symlink() || !again.is_file() {
+    // The walk above is the open we refused to follow a link through. Repeat it
+    // before believing the bytes, in case a component was replaced with a link.
+    let (_, again) = lstat_within(root, rel)?;
+    if !again.is_file() {
         return Err("refusing to follow a symlink".to_string());
     }
     Ok(decode_lossy(&bytes).into_owned())
@@ -474,23 +537,14 @@ fn read_binary_post_image(root: Option<&std::path::Path>, path: &str) -> Result<
 /// the AST stub checks.
 ///
 /// `None` sends the file to the substring checks; it is never a clean answer.
-/// The path comes from a diff, so it is refused unless it is relative and
-/// stays inside `root`, and the read is bounded. `detect_stubs_with` then
-/// believes the content only if the diff's added lines are where the diff
-/// says they are.
+/// The path comes from a diff, so it is refused unless it is relative, stays
+/// inside `root` and passes through no symlink, and the read is bounded.
+/// `detect_stubs_with` then believes the content only if the diff's added lines
+/// are where the diff says they are.
 fn read_post_image(root: Option<&std::path::Path>, path: &str) -> Option<String> {
     use std::io::Read as _;
-    use std::path::Component;
     let root = root?;
-    let rel = std::path::Path::new(path);
-    if !rel
-        .components()
-        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
-    {
-        return None;
-    }
-    let full = root.join(rel);
-    let meta = std::fs::symlink_metadata(&full).ok()?;
+    let (full, meta) = lstat_within(root, std::path::Path::new(path)).ok()?;
     if !meta.is_file() || meta.len() > dc_verify::stub_ast::MAX_SOURCE_BYTES as u64 {
         return None;
     }

@@ -147,3 +147,82 @@ fn a_panic_of_a_real_error_stays_clean() {
         report.findings
     );
 }
+
+#[test]
+fn a_char_literal_quote_does_not_hide_a_stub_in_a_wrapper_macro() {
+    let body = "\
+macro_rules! work {
+    ($($t:tt)*) => {};
+}
+pub fn f() {
+    work!('\"', todo!());
+}
+";
+    assert!(
+        adv_blocking(body),
+        "a `'\"'` char literal opened a string that hid the todo!() after it"
+    );
+}
+
+#[test]
+fn an_escaped_quote_char_literal_does_not_hide_a_stub_either() {
+    let body = "\
+macro_rules! work {
+    ($($t:tt)*) => {};
+}
+pub fn f() {
+    work!('\\\"', '\\'', todo!());
+}
+";
+    assert!(
+        adv_blocking(body),
+        "an escaped-quote char literal hid the todo!() after it"
+    );
+}
+
+#[test]
+fn a_raw_string_holding_a_quote_does_not_expose_text_after_it() {
+    let body = "\
+pub fn f() -> usize {
+    println!(r#\"a \" todo!() b\"#);
+    1
+}
+";
+    assert!(
+        !adv_blocking(body),
+        "text inside a raw string was read as code and flagged as a stub"
+    );
+}
+
+#[test]
+fn a_lifetime_is_not_a_char_literal() {
+    let body = "\
+macro_rules! work {
+    ($($t:tt)*) => {};
+}
+pub fn f<'a>(x: &'a str) -> &'a str {
+    work!(x, todo!());
+    x
+}
+";
+    assert!(
+        adv_blocking(body),
+        "a lifetime tick swallowed the rest of the line"
+    );
+}
+
+#[test]
+fn a_non_ascii_identifier_before_a_stub_does_not_panic_the_line_scan() {
+    let body = "\
+macro_rules! work {
+    ($($t:tt)*) => {};
+}
+pub fn f() {
+    work!(café, todo!());
+}
+";
+    assert!(
+        adv_blocking(body),
+        "a stub after a non-ASCII identifier was not found"
+    );
+}

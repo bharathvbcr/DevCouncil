@@ -492,7 +492,11 @@ fn quoted_token_end(s: &str) -> Option<usize> {
 /// equal for anything that is not a rename (`a/P b/P`), which fixes where the
 /// split is even when `P` itself contains ` b/`; renames, whose two names can
 /// differ, are corrected by the `rename to` line that follows.
-fn git_header_path(rest: &str) -> Option<String> {
+///
+/// Public so a caller that walks a diff's sections itself (the binary-path
+/// scan in `dcverify`) names a file exactly as the parser does, rather than
+/// re-lexing the header with a second, weaker rule.
+pub fn git_header_path(rest: &str) -> Option<String> {
     if let Some(end) = quoted_token_end(rest) {
         // `"a/..." <b>`: the second name is everything after the separator.
         let second = rest[end..].strip_prefix(' ')?;
