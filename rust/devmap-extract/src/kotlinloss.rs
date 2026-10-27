@@ -303,92 +303,118 @@ pub(crate) fn is_recovery_wrapper(node: Node, source: &str) -> bool {
         && INSIDE_RECOVERY.with(|inside| inside.get())
 }
 
-/// Re-derive the declarations the grammar swallowed, and merge them.
+/// Re-derive the declarations the grammar swallowed, merge them, and settle
+/// every region the detector charged.
 ///
 /// Each top-level region the detector found is parsed again, wrapped in a
 /// class body. A region is recovered only if the wrapper parses cleanly, is
 /// exactly one class holding declarations, reads every hard keyword of the
 /// region as that declaration's own keyword token, and holds no swallowed
-/// statement of its own. Anything less leaves the region exactly as it was:
-/// `Partial`, with nothing emitted. A symbol that is not in the source is worse
-/// than a symbol that is missing.
+/// statement of its own. A symbol that is not in the source is worse than a
+/// symbol that is missing.
 ///
 /// A recovered region's own symbols, calls, references, exports, wiring,
 /// scope locals and local bindings replace what the original tree produced
 /// inside it. The original tree had read the declaration as an expression, so
 /// its calls were attributed to the file and `f() { .. }` was recorded as a call
-/// to `f`. Where every region of the file is recovered the outcome is `Clean`
-/// again, and the recovered ranges are listed in `decl_gaps`.
+/// to `f`. Recovered ranges are listed in `recovered_decl_ranges`.
+///
+/// A charged region that is **not** recovered is replaced by nothing: the same
+/// replacement runs with an empty result, so no symbol, call, reference, export,
+/// wiring, local binding or scope local the expression reading produced inside
+/// it is published (it would be a top-level `m` for the member of a class, and a
+/// call to `class`). The region stays in `parse_outcome`'s `error_ranges`, so
+/// consumers abstain, and is listed in `decl_gaps`. A region nested inside a
+/// recovered one is not separate: the recovered range replaces it, and its own
+/// charge goes with it. Where nothing is left charged the outcome is `Clean`.
 pub(crate) fn recover(
     extraction: &mut Extraction,
     source: &str,
     lost: &LostScan,
     deadline: Instant,
 ) {
-    if lost.regions.is_empty() || lost.capped || lost.deadline_passed {
+    if lost.deadline_passed || (lost.regions.is_empty() && !lost.capped) {
         return;
     }
     let Some(_guard) = DepthGuard::enter() else {
         return;
     };
+    // Before any inner extraction: the inner call re-arms the thread's budget,
+    // which would clear a latch an earlier phase had already set. A file past
+    // its deadline is refused by the publication gate, so nothing is settled.
+    if extraction_overran(deadline) {
+        return;
+    }
+    let mut recovered: Vec<TextRange> = Vec::new();
     if source.contains(WRAPPER_NAME) {
         extraction.diagnostics.push(
             "kotlin loss recovery skipped: the source spells the recovery wrapper's own name"
                 .to_string(),
         );
-        return;
+    } else if !lost.capped {
+        let mut attempted = 0usize;
+        for region in &lost.regions {
+            if !region.top_level || region.has_error {
+                continue;
+            }
+            if attempted >= MAX_RECOVERY_REGIONS {
+                extraction.diagnostics.push(format!(
+                    "kotlin loss recovery stopped at {MAX_RECOVERY_REGIONS} regions; the \
+                     remaining ones stay in error_ranges and decl_gaps"
+                ));
+                break;
+            }
+            attempted += 1;
+            if Instant::now() >= deadline {
+                extraction.diagnostics.push(
+                    "kotlin loss recovery stopped at the extraction deadline; the remaining \
+                     regions stay in error_ranges and decl_gaps"
+                        .to_string(),
+                );
+                break;
+            }
+            match recover_region(extraction, source, region, deadline) {
+                Ok(()) => recovered.push(region.range.clone()),
+                Err(why) => extraction.diagnostics.push(format!(
+                    "kotlin declaration at bytes {}..{} not recovered: {why}",
+                    region.range.start_byte, region.range.end_byte
+                )),
+            }
+        }
     }
-    // Before any inner extraction: the inner call re-arms the thread's budget,
-    // which would clear a latch an earlier phase had already set.
-    if extraction_overran(deadline) {
-        return;
-    }
-    let mut attempted = 0usize;
-    let mut recovered: Vec<TextRange> = Vec::new();
+    let within = |inner: &TextRange, outer: &TextRange| {
+        outer.start_byte <= inner.start_byte && inner.end_byte <= outer.end_byte
+    };
     for region in &lost.regions {
-        if !region.top_level || region.has_error {
+        if recovered.iter().any(|done| within(&region.range, done)) {
             continue;
         }
-        if attempted >= MAX_RECOVERY_REGIONS {
-            extraction.diagnostics.push(format!(
-                "kotlin loss recovery stopped at {MAX_RECOVERY_REGIONS} regions; the remaining \
-                 {} stay in error_ranges",
-                lost.regions.len() - attempted
-            ));
-            break;
-        }
-        attempted += 1;
-        if Instant::now() >= deadline {
-            extraction.diagnostics.push(
-                "kotlin loss recovery stopped at the extraction deadline; the remaining regions \
-                 stay in error_ranges"
-                    .to_string(),
-            );
-            break;
-        }
-        match recover_region(extraction, source, region, deadline) {
-            Ok(()) => recovered.push(region.range.clone()),
-            Err(why) => extraction.diagnostics.push(format!(
-                "kotlin declaration at bytes {}..{} not recovered: {why}",
-                region.range.start_byte, region.range.end_byte
-            )),
-        }
+        Staged::default().apply(extraction, region);
+        extraction.decl_gaps.push(region.range.clone());
     }
-    if recovered.is_empty() {
-        return;
+    if lost.capped {
+        // The scan stopped early: any declaration of the file may be missing.
+        extraction.decl_gaps.push(TextRange {
+            start_byte: 0,
+            end_byte: source.len(),
+        });
     }
     if let ParseOutcome::Partial {
         error_ranges,
         nameless_ranges,
     } = &mut extraction.parse_outcome
     {
-        error_ranges.retain(|range| !recovered.contains(range));
-        nameless_ranges.retain(|range| !recovered.contains(range));
+        // The wrapper parse of a recovered range was clean, so a statement
+        // charged inside it parsed as the declaration it is.
+        error_ranges.retain(|range| !recovered.iter().any(|done| within(range, done)));
+        nameless_ranges.retain(|range| !recovered.iter().any(|done| within(range, done)));
         if error_ranges.is_empty() {
             extraction.parse_outcome = ParseOutcome::Clean;
         }
     }
-    extraction.decl_gaps.extend(recovered);
+    extraction.recovered_decl_ranges.extend(recovered);
+    extraction.recovered_decl_ranges.sort();
+    extraction.recovered_decl_ranges.dedup();
     extraction.decl_gaps.sort();
     extraction.decl_gaps.dedup();
     extraction
@@ -513,6 +539,8 @@ fn check_wrapper(
 }
 
 /// What one recovered region contributes, in the file's own byte coordinates.
+/// The default is the empty replacement an unrecovered region gets.
+#[derive(Default)]
 struct Staged {
     symbols: Vec<ExtractedSymbol>,
     calls: Vec<ExtractedCall>,
@@ -625,7 +653,9 @@ impl Staged {
         Ok(staged)
     }
 
-    /// Replace what the original tree produced inside `region` with these.
+    /// Replace what the original tree produced inside `region` with these:
+    /// everything it emitted there, by span, and the scope locals of every
+    /// symbol it emitted there, which carry no span of their own.
     fn apply(self, extraction: &mut Extraction, region: &LostRegion) {
         let (start, end) = (region.range.start_byte, region.range.end_byte);
         let inside = |span: &Span| span.start_byte >= start && span.end_byte <= end;
@@ -648,6 +678,25 @@ impl Staged {
         extraction
             .local_bindings
             .retain(|binding| binding.start_byte < start || binding.start_byte >= end);
+        // A scope is the ghost of a dropped symbol only if nothing outside the
+        // region is called by that name too: the expression reading files the
+        // member `m` of a swallowed class as a top-level `A.kt::m`, and a real
+        // top-level `m` elsewhere in the file owns the scope of that name.
+        let surviving: std::collections::HashSet<&str> = extraction
+            .symbols
+            .iter()
+            .map(|symbol| symbol.qualified_name.as_str())
+            .collect();
+        let ghosts: Vec<&String> = dropped
+            .iter()
+            .filter(|name| !surviving.contains(name.as_str()))
+            .collect();
+        extraction.scope_locals.retain(|(scope, _)| {
+            !ghosts.iter().any(|name| {
+                scope == *name
+                    || (scope.starts_with(name.as_str()) && scope[name.len()..].starts_with('.'))
+            })
+        });
         extraction.symbols.extend(self.symbols);
         extraction.calls.extend(self.calls);
         extraction.references.extend(self.references);

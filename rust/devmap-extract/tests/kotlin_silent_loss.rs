@@ -65,9 +65,14 @@ fn every_swallowed_declaration_kind_is_recovered_as_the_declaration_it_is() {
             extraction.diagnostics
         );
         assert_eq!(
-            extraction.decl_gaps,
+            extraction.recovered_decl_ranges,
             vec![range_of(&source, &swallowed)],
-            "{declaration}: the recovered range is recorded"
+            "{declaration}: the repaired range is recorded"
+        );
+        assert!(
+            extraction.decl_gaps.is_empty(),
+            "{declaration}: a repaired range is not a gap: {:?}",
+            extraction.decl_gaps
         );
         let mut got: Vec<(String, SymbolKind)> = extraction
             .symbols
@@ -256,7 +261,7 @@ fn a_recovered_property_initializer_keeps_its_calls_at_file_scope() {
     let extraction = extract_file("A.kt", source);
     assert!(matches!(extraction.parse_outcome, ParseOutcome::Clean));
     assert_eq!(
-        extraction.decl_gaps,
+        extraction.recovered_decl_ranges,
         vec![range_of(source, "@A\n@B\nprivate val y = helper()")],
         "the statement was swallowed and recovered, not merely read"
     );
@@ -287,10 +292,11 @@ fn a_statement_the_reparse_cannot_prove_stays_partial_and_emits_nothing() {
         "the unrecovered statement stays charged: {error_ranges:?}"
     );
     assert!(
-        extraction.decl_gaps.is_empty(),
-        "{:?}",
+        extraction.decl_gaps.contains(&range_of(&source, &outer)),
+        "the unrecovered statement is a gap: {:?}",
         extraction.decl_gaps
     );
+    assert!(extraction.recovered_decl_ranges.is_empty());
     let names: Vec<&str> = extraction
         .symbols
         .iter()
@@ -316,7 +322,8 @@ fn a_swallowed_statement_inside_a_function_stays_charged() {
         error_ranges(&extraction),
         vec![range_of(&source, &swallowed)]
     );
-    assert!(extraction.decl_gaps.is_empty());
+    assert_eq!(extraction.decl_gaps, vec![range_of(&source, &swallowed)]);
+    assert!(extraction.recovered_decl_ranges.is_empty());
 }
 
 /// Each swallowed statement is its own region, recovered on its own.
@@ -328,9 +335,10 @@ fn each_swallowed_statement_is_recovered_on_its_own() {
     let extraction = extract_file("M.kt", &source);
     assert!(matches!(extraction.parse_outcome, ParseOutcome::Clean));
     assert_eq!(
-        extraction.decl_gaps,
+        extraction.recovered_decl_ranges,
         vec![range_of(&source, first), range_of(&source, second)]
     );
+    assert!(extraction.decl_gaps.is_empty());
     let mut names: Vec<&str> = extraction
         .symbols
         .iter()
@@ -388,7 +396,11 @@ fn recovery_stops_at_its_region_cap_and_says_so() {
     let extraction = extract_file("Many.kt", &source);
     let ranges = error_ranges(&extraction);
     assert_eq!(ranges.len(), 6, "70 regions, 64 recovered: {ranges:?}");
-    assert_eq!(extraction.decl_gaps.len(), 64);
+    assert_eq!(extraction.recovered_decl_ranges.len(), 64);
+    assert_eq!(
+        extraction.decl_gaps, ranges,
+        "every unrecovered range is both charged and a gap"
+    );
     assert!(
         extraction
             .diagnostics
@@ -416,7 +428,8 @@ fn a_source_that_spells_the_wrappers_name_is_left_charged() {
         "val DevmapKotlinRecoveryWrapper = 1\n@A\n@B\nprivate fun f() {}\nfun after() {}\n";
     let extraction = extract_file("A.kt", source);
     assert_eq!(error_ranges(&extraction).len(), 1);
-    assert!(extraction.decl_gaps.is_empty());
+    assert_eq!(extraction.decl_gaps, error_ranges(&extraction));
+    assert!(extraction.recovered_decl_ranges.is_empty());
     assert!(!extraction
         .symbols
         .iter()
@@ -460,7 +473,8 @@ fn a_swallowed_class_with_a_one_line_body_stays_charged() {
         error_ranges(&extraction),
         vec![range_of(&source, &swallowed)]
     );
-    assert!(extraction.decl_gaps.is_empty());
+    assert_eq!(extraction.decl_gaps, vec![range_of(&source, &swallowed)]);
+    assert!(extraction.recovered_decl_ranges.is_empty());
     assert!(
         extraction
             .diagnostics
@@ -476,7 +490,7 @@ fn a_swallowed_class_with_a_one_line_body_stays_charged() {
 fn recovery_is_deterministic() {
     let source = "fun helper() {}\n@A\n@B\nprivate fun f() { helper() }\n@A\n@B\nprivate class Q {\n    fun m() = helper()\n}\nfun after() {}\n";
     assert_eq!(
-        extract_file("A.kt", source).decl_gaps.len(),
+        extract_file("A.kt", source).recovered_decl_ranges.len(),
         2,
         "both recovered"
     );
@@ -556,11 +570,209 @@ fn a_genuine_error_is_not_cleared_by_recovering_a_statement_beside_it() {
             .any(|range| range.start_byte >= source.find("fun broken").unwrap()),
         "the genuine error keeps its range: {ranges:?}"
     );
-    assert_eq!(extraction.decl_gaps, vec![range_of(&source, swallowed)]);
+    assert_eq!(
+        extraction.recovered_decl_ranges,
+        vec![range_of(&source, swallowed)]
+    );
+    assert!(
+        extraction.decl_gaps.is_empty(),
+        "the genuine error is charged but is not a swallowed declaration"
+    );
     assert!(extraction
         .symbols
         .iter()
         .any(|symbol| symbol.qualified_name == "E.kt::f"));
+}
+
+// ------------------------------------------- the opus review of 974edaa3
+
+fn qualified(extraction: &Extraction) -> Vec<&str> {
+    let mut names: Vec<&str> = extraction
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.kind != SymbolKind::File)
+        .map(|symbol| symbol.qualified_name.as_str())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A region the recovery cannot prove stays charged, and the expression
+/// reading of it is not published either: the member `m` of a swallowed class
+/// is not a top-level `A.kt::m`, and the swallowed declaration is not a call to
+/// `class` or to `Q`. Fails against `974edaa3`, which kept all of it.
+#[test]
+fn an_unrecovered_region_publishes_nothing_the_expression_reading_made_of_it() {
+    let swallowed = format!("{STACK}private class Q {{ fun m() {{}} }}");
+    let source = format!("{swallowed}\nfun tail() {{}}\n");
+    let extraction = extract_file("A.kt", &source);
+    assert_eq!(
+        error_ranges(&extraction),
+        vec![range_of(&source, &swallowed)]
+    );
+    assert_eq!(extraction.decl_gaps, error_ranges(&extraction));
+    assert_eq!(qualified(&extraction), ["A.kt::tail"]);
+    let region = range_of(&source, &swallowed);
+    let inside = |start: usize, end: usize| region.start_byte <= start && end <= region.end_byte;
+    let calls: Vec<&str> = extraction
+        .calls
+        .iter()
+        .filter(|call| inside(call.span.start_byte, call.span.end_byte))
+        .map(|call| call.callee_name.as_str())
+        .collect();
+    assert!(calls.is_empty(), "calls from the charged region: {calls:?}");
+    let references: Vec<&str> = extraction
+        .references
+        .iter()
+        .filter(|reference| inside(reference.span.start_byte, reference.span.end_byte))
+        .map(|reference| reference.name.as_str())
+        .collect();
+    assert!(
+        references.is_empty(),
+        "references from the charged region: {references:?}"
+    );
+    assert!(extraction
+        .exports
+        .iter()
+        .all(|export| !inside(export.span.start_byte, export.span.end_byte)));
+}
+
+/// No call, anywhere in a Kotlin extraction, is named for a hard keyword: the
+/// grammar's reading of a swallowed declaration as `private fun f() {}` is a call
+/// to `fun`, and whether the region is recovered or not it must not be published.
+#[test]
+fn no_call_is_named_for_a_declaration_keyword() {
+    for declaration in [
+        "private fun f() {}",
+        "private class Q {}",
+        "private object O {}",
+        "private interface I {}",
+        "private val y = 1",
+        "private typealias T = Int",
+        "class Plain {}",
+        "private class Q { fun m() {} }",
+        "private object O { val x = 1 }",
+    ] {
+        let source = format!("{STACK}{declaration}\nfun tail() {{}}\n");
+        let extraction = extract_file("A.kt", &source);
+        let named: Vec<&str> = extraction
+            .calls
+            .iter()
+            .map(|call| call.callee_name.as_str())
+            .filter(|name| {
+                [
+                    "fun",
+                    "class",
+                    "interface",
+                    "object",
+                    "val",
+                    "var",
+                    "typealias",
+                ]
+                .contains(name)
+            })
+            .collect();
+        assert!(named.is_empty(), "{declaration}: {named:?}");
+    }
+}
+
+/// The same holds when the charged region sits inside a function body, where
+/// recovery is never attempted: what the region made is dropped, what the
+/// function does around it is kept.
+#[test]
+fn an_unrecovered_nested_region_is_dropped_and_its_surroundings_kept() {
+    let region = format!("{STACK}private fun h() {{\n        inner()\n    }}");
+    let source =
+        format!("fun g() {{\n    before()\n    {region}\n    after()\n}}\nfun tail() {{}}\n");
+    let extraction = extract_file("A.kt", &source);
+    assert_eq!(error_ranges(&extraction), vec![range_of(&source, &region)]);
+    assert_eq!(extraction.decl_gaps, error_ranges(&extraction));
+    let callees: Vec<(Option<&str>, &str)> = extraction
+        .calls
+        .iter()
+        .map(|call| (call.caller_symbol.as_deref(), call.callee_name.as_str()))
+        .collect();
+    assert!(
+        callees.contains(&(Some("A.kt::g"), "before")),
+        "{callees:?}"
+    );
+    assert!(callees.contains(&(Some("A.kt::g"), "after")), "{callees:?}");
+    for phantom in ["fun", "h", "inner"] {
+        assert!(
+            !callees.iter().any(|(_, callee)| *callee == phantom),
+            "`{phantom}` came from the charged region: {callees:?}"
+        );
+    }
+}
+
+/// A scope the phantom shared with a real symbol belongs to the real one: the
+/// expression reading files the member `m` of a swallowed class as a top-level
+/// `A.kt::m`, and a real top-level `m` keeps its scope locals.
+#[test]
+fn dropping_a_phantom_keeps_the_scope_of_a_real_symbol_of_the_same_name() {
+    let source = format!(
+        "{STACK}private class Q {{ fun m(a: Int) {{}} }}\nfun m(b: Int) {{\n    val z = 1\n}}\nfun tail() {{}}\n"
+    );
+    let extraction = extract_file("A.kt", &source);
+    assert!(!error_ranges(&extraction).is_empty());
+    assert!(
+        extraction
+            .scope_locals
+            .iter()
+            .any(|(scope, local)| scope == "A.kt::m" && local == "z"),
+        "{:?}",
+        extraction.scope_locals
+    );
+}
+
+/// A class recovered whole holds a nested statement the outer tree also reads
+/// as an expression (`companion object { .. }`, a stacked-annotation member).
+/// That range is inside a recovered one, so it is not a separate loss: the file
+/// is `Clean`. Fail against `974edaa3`, which matched ranges exactly.
+#[test]
+fn a_recovered_class_with_a_nested_charged_range_is_clean() {
+    for (name, source) in [
+        (
+            "companion object",
+            "@A\n@B\nprivate class Q {\n    companion object {\n        fun create() = Q()\n    }\n}\nfun after() {}\n",
+        ),
+        (
+            "stacked member",
+            "@A\n@B\nprivate class Q {\n    @X\n    @Y\n    private fun m() {}\n}\nfun after() {}\n",
+        ),
+    ] {
+        let extraction = extract_file("A.kt", source);
+        assert_eq!(extraction.recovered_decl_ranges.len(), 1, "{name}");
+        assert!(extraction.decl_gaps.is_empty(), "{name}");
+        assert!(
+            matches!(extraction.parse_outcome, ParseOutcome::Clean),
+            "{name}: {:?}",
+            extraction.parse_outcome
+        );
+    }
+    let extraction = extract_file(
+        "A.kt",
+        "@A\n@B\nprivate class Q {\n    @X\n    @Y\n    private fun m() {}\n}\nfun after() {}\n",
+    );
+    assert!(qualified(&extraction).contains(&"A.kt::Q.m"));
+}
+
+/// The outer tree's rows for a swallowed class's member are not kept beside the
+/// recovered ones: `scope_locals` names `A.kt::P.m`, never the `A.kt::m` the
+/// expression reading made up.
+#[test]
+fn a_recovered_member_leaves_no_ghost_scope_local() {
+    let source = "@A\n@B\nprivate class P {\n    fun m(x: Foo): Base = x\n}\nfun after() {}\nclass Foo\nopen class Base\n";
+    let extraction = extract_file("A.kt", source);
+    assert_eq!(extraction.recovered_decl_ranges.len(), 1);
+    assert!(
+        extraction
+            .scope_locals
+            .iter()
+            .all(|(scope, _)| scope != "A.kt::m"),
+        "{:?}",
+        extraction.scope_locals
+    );
 }
 
 /// A comment between the colons and `class` does not make a class literal a
