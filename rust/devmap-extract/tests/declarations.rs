@@ -685,7 +685,6 @@ fn kotlin_annotation_stacks_that_still_parse_as_declarations_keep_the_function()
 /// AC2. A one-line companion object: its members belong to the host class
 /// (`langdecl/kotlin.rs` skips the companion node), so `C.f`, not `C.Companion.f`.
 #[test]
-#[ignore = "ft-5ad86836: one-line `class C { companion object { .. } }` drops C, C.f and following top-level funs (ERROR node, Partial); extractor fix needs extract-v98 (schema frozen at 97)"]
 fn kotlin_one_line_companion_object_keeps_the_class_and_later_functions() {
     let shape = "class C { companion object { fun f() = 1 } } on one line";
     let names = kt_names(
@@ -700,7 +699,6 @@ fn kotlin_one_line_companion_object_keeps_the_class_and_later_functions() {
 }
 
 #[test]
-#[ignore = "ft-5ad86836: one-line `class C { companion object Factory { .. } }` drops C, C.f and following top-level funs (ERROR node, Partial); extractor fix needs extract-v98 (schema frozen at 97)"]
 fn kotlin_one_line_named_companion_keeps_the_class_and_later_functions() {
     let shape = "class C { companion object Factory { fun f() = 1 } } on one line";
     let names = kt_names(

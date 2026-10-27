@@ -125,7 +125,7 @@ fn normalized(e: &Extraction) -> std::collections::BTreeMap<String, Vec<String>>
     out
 }
 
-fn diff_against_twin(label: &str, recovered_src: &str, twin_src: &str) -> Vec<String> {
+pub(crate) fn diff_against_twin(label: &str, recovered_src: &str, twin_src: &str) -> Vec<String> {
     let r = extract("A.kt", recovered_src);
     let t = extract("A.kt", twin_src);
     let mut out = Vec::new();

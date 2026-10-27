@@ -508,6 +508,50 @@ pub(super) fn extract_treesitter_before_deadline(
             }
             ParseAttempt::Parsed(_) => {}
         }
+        // Kotlin only: a one-line class body is a whole-file grammar error
+        // that a `;` written over a space repairs without moving a byte. The
+        // rewritten tree replaces the failed one only if it is fully clean.
+        let (attempt, semi_ranges, semi_note) = match attempt {
+            // Only a tree with an error the walk can see: the grammar also
+            // recovers some of these shapes itself with a hidden zero-width
+            // token, which no node shows and which costs nothing, and such a
+            // file is left exactly as it parsed.
+            ParseAttempt::Parsed(tree)
+                if lang == "kotlin"
+                    && tree.root_node().has_error()
+                    && matches!(
+                        parse_outcome_of(
+                            tree.root_node(),
+                            source,
+                            false,
+                            false,
+                            &crate::kotlinloss::LostScan::default(),
+                        ),
+                        ParseOutcome::Partial { .. }
+                    ) =>
+            {
+                match crate::kotlinsemi::repair(&mut parser, tree, source, deadline) {
+                    crate::kotlinsemi::Repair::Repaired {
+                        tree,
+                        ranges,
+                        edits,
+                    } => (
+                        ParseAttempt::Parsed(tree),
+                        ranges,
+                        Some(format!(
+                            "kotlin one-line class body: {edits} separator(s) written over \
+                             spaces so the file parses; offsets are the file's own"
+                        )),
+                    ),
+                    crate::kotlinsemi::Repair::Unchanged { tree, why } => (
+                        ParseAttempt::Parsed(tree),
+                        Vec::new(),
+                        Some(format!("kotlin one-line class body not repaired: {why}")),
+                    ),
+                }
+            }
+            other => (other, Vec::new(), None),
+        };
         if let ParseAttempt::Parsed(tree) = attempt {
             return crate::parent_index::with_index(&tree, deadline, || {
                 // The budget covers parse *and* walk *and* everything after it.
@@ -840,10 +884,11 @@ pub(super) fn extract_treesitter_before_deadline(
                 // failure cannot retroactively turn a successful grammar
                 // parse into a failed parse outcome, but it must remain
                 // visible to downstream diagnostics.
-                let (routes, diagnostics) = match extract_framework_routes(lang, source) {
+                let (routes, mut diagnostics) = match extract_framework_routes(lang, source) {
                     Ok(routes) => (routes, Vec::new()),
                     Err(reason) => (Vec::new(), vec![reason]),
                 };
+                diagnostics.extend(semi_note);
 
                 // Body signatures are stamped here, after every language arm
                 // has finished pushing symbols, rather than inside `walk_tree`.
@@ -986,7 +1031,7 @@ pub(super) fn extract_treesitter_before_deadline(
                     package_scopes: jvm_facts.package_scopes,
                     local_extents: jvm_facts.local_extents,
                     decl_gaps: jvm_facts.decl_gaps,
-                    recovered_decl_ranges: Vec::new(),
+                    recovered_decl_ranges: semi_ranges,
                     dynamic_dispatch: py_facts.dynamic_dispatch,
                 };
 

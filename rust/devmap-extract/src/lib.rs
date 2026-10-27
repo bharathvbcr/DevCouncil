@@ -87,6 +87,9 @@ mod jvmfacts;
 // `treesitter::extract_treesitter`.
 #[cfg(feature = "parse")]
 mod kotlinloss;
+// The same-length `;` rewrite that lets a one-line Kotlin class body parse.
+#[cfg(feature = "parse")]
+mod kotlinsemi;
 // Python-only facts (dynamic dispatch). Walks a parse tree; its one caller is
 // `treesitter::extract_treesitter`.
 #[cfg(feature = "parse")]

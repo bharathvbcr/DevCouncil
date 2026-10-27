@@ -1796,7 +1796,10 @@ pub struct Extraction {
     /// reader need not abstain; the range exists so that a repair is visible
     /// rather than indistinguishable from a file the grammar read correctly.
     /// `parse_outcome` is `Clean` again unless something else is wrong with the
-    /// file. Sorted and deduplicated; empty for every language but Kotlin.
+    /// file. Also the top-level statements of a Kotlin file in which a `;` was
+    /// written over a space so that a one-line class body parses (see
+    /// `kotlinsemi`); the text and every offset are the file's own.
+    /// Sorted and deduplicated; empty for every language but Kotlin.
     ///
     /// Apart from [`Self::decl_gaps`] on purpose: that field means "a resolver
     /// must abstain inside", and a repaired range is the opposite claim.
