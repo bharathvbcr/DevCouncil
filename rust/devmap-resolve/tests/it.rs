@@ -266,3 +266,5 @@ mod attack_resolver_bundle4;
 mod attack_resolver_bundle5;
 #[cfg(feature = "parse")]
 mod corpus_dump_attack;
+#[cfg(feature = "parse")]
+mod attack_swift_residue;
