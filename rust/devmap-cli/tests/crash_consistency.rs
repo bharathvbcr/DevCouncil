@@ -263,9 +263,16 @@ fn a_build_killed_mid_persist_leaves_a_whole_generation() {
         outcomes.push((*delay, killed, mid_write));
 
         // The next build needs no operator: the writer lock died with the
-        // process and the store accepts a writer.
+        // process and the store accepts a writer. When the killed build
+        // committed first, the tree is unchanged since that commit and the
+        // build takes its unchanged early return, so no generation is added.
         build(&db, &root, false);
-        generation = assert_whole_generation(&db, FILES, &[after + 1]);
+        let expected = if after == generation {
+            after + 1
+        } else {
+            after
+        };
+        generation = assert_whole_generation(&db, FILES, &[expected]);
     }
     eprintln!("kill outcomes (delay_ms, killed_by_signal, landed_before_commit): {outcomes:?}");
     assert!(
