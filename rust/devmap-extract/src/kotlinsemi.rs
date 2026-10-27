@@ -122,20 +122,53 @@ pub(crate) fn repair(parser: &mut Parser, tree: Tree, source: &str, deadline: In
     }
 }
 
-/// Bytes a token of these kinds may end with when a `;` is wanted after it.
-/// An arrow, an operator or an opening bracket before `}` is not a member.
+/// The last character of `before`, which is UTF-8 text cut at a character
+/// boundary: the shortest suffix of at most four bytes that decodes.
+fn last_char(before: &[u8]) -> Option<char> {
+    let tail = &before[before.len().saturating_sub(4)..];
+    (0..tail.len()).rev().find_map(|from| {
+        std::str::from_utf8(&tail[from..])
+            .ok()
+            .and_then(|text| text.chars().next_back())
+    })
+}
+
+/// Whether the code `before` ends a member, so that a `;` is wanted after it.
+/// An arrow, an operator or an opening bracket before `}` is not a member. A
+/// letter or digit of any script ends one (`café`), and so does a postfix
+/// `++` or `--` that follows an operand (`x++`, `a[0]--`).
 fn ends_a_member(before: &[u8]) -> bool {
-    match before.last() {
-        Some(b'>') => before.len() < 2 || before[before.len() - 2] != b'-',
-        Some(byte) => {
-            byte.is_ascii_alphanumeric()
-                || matches!(
-                    byte,
-                    b'_' | b')' | b']' | b'}' | b'"' | b'\'' | b'`' | b'!' | b'?'
-                )
+    let Some(last) = last_char(before) else {
+        return false;
+    };
+    match last {
+        '>' => before.len() < 2 || before[before.len() - 2] != b'-',
+        '+' | '-' => {
+            let operator = last as u8;
+            let stem = &before[..before.len() - 1];
+            stem.last() == Some(&operator)
+                && last_char(&stem[..stem.len() - 1]).is_some_and(|operand| {
+                    operand.is_alphanumeric() || matches!(operand, '_' | ')' | ']')
+                })
         }
-        None => false,
+        other => {
+            other.is_alphanumeric()
+                || matches!(other, '_' | ')' | ']' | '}' | '"' | '\'' | '`' | '!' | '?')
+        }
     }
+}
+
+/// The end of the last node before `brace` that is not a comment: where the
+/// member the brace closes stops, however many comments sit between them.
+fn code_before(brace: Node) -> Option<usize> {
+    let mut previous = brace.prev_sibling();
+    while let Some(node) = previous {
+        if !node.kind().ends_with("comment") {
+            return Some(node.end_byte());
+        }
+        previous = node.prev_sibling();
+    }
+    None
 }
 
 /// The offsets of the spaces to write `;` over: one directly before each
@@ -177,13 +210,16 @@ fn candidates(root: Node, text: &[u8], done: &[usize]) -> Result<Vec<usize>, Str
                 parent.is_error() || matches!(parent.kind(), "class_body" | "enum_class_body")
             });
             if closes_a_body && at > 0 && matches!(text.get(at - 1), Some(b' ' | b'\t')) {
-                let mut start = at;
-                while start > 0 && matches!(text[start - 1], b' ' | b'\t') {
-                    start -= 1;
+                // The member ends at the last node that is not a comment, and
+                // the brace shares its line: a brace that starts its line, or
+                // follows a comment on a line of its own, is already apart.
+                let mut end = code_before(node).map_or(0, |end| end.min(at));
+                while end > 0 && matches!(text[end - 1], b' ' | b'\t') {
+                    end -= 1;
                 }
-                if start > 0
-                    && ends_a_member(&text[..start])
-                    && !matches!(text[start - 1], b'\n' | b'\r')
+                if end > 0
+                    && !text[end..at].iter().any(|b| matches!(b, b'\n' | b'\r'))
+                    && ends_a_member(&text[..end])
                     && !done.contains(&(at - 1))
                 {
                     found.push(at - 1);
@@ -230,4 +266,60 @@ fn touched(tree: &Tree, edits: &[usize]) -> Vec<TextRange> {
     ranges.sort();
     ranges.dedup();
     ranges
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_last_character_is_decoded_not_taken_as_a_byte() {
+        assert_eq!(last_char("val x = café".as_bytes()), Some('é'));
+        assert_eq!(last_char("val x = 日本".as_bytes()), Some('本'));
+        assert_eq!(last_char("val x = 😀".as_bytes()), Some('😀'));
+        assert_eq!(last_char(b"x"), Some('x'));
+        assert_eq!(last_char(b""), None);
+    }
+
+    #[test]
+    fn a_member_ends_in_a_letter_of_any_script_a_postfix_or_a_closer() {
+        for member in [
+            "val x = 1",
+            "val x = café",
+            "val x = 日本",
+            "val x = x++",
+            "val x = a[0]--",
+            "val x = f()++",
+            "val x = y!!",
+            "val x: Int?",
+            "val x = \"s\"",
+            "fun f() {}",
+            "val f: () -> List<Int>",
+        ] {
+            assert!(ends_a_member(member.as_bytes()), "{member}");
+        }
+    }
+
+    #[test]
+    fn an_operator_an_arrow_or_an_opener_does_not_end_a_member() {
+        for dangling in [
+            "",
+            "val x =",
+            "val x = a +",
+            "val x = a -",
+            "val x = a + +",
+            "val x = ++",
+            "val f: () ->",
+            "val f = { x ->",
+            "class B(",
+            "class B :",
+            "val x = a.",
+            "val x = [",
+            "val x = 1,",
+            "val x = 1;",
+            "@",
+        ] {
+            assert!(!ends_a_member(dangling.as_bytes()), "{dangling:?}");
+        }
+    }
 }

@@ -1025,7 +1025,6 @@ fn followup4_a_tree_whose_root_is_the_error_node_is_repaired() {
 /// ends in a non-ASCII letter, in `++`/`--`, or in a block comment is never
 /// given a separator, so a one-line body that needs one stays Partial.
 #[test]
-#[ignore = "follow-up 5, fixed in its own commit"]
 fn followup5_a_member_ending_in_a_non_ascii_letter_or_a_comment_is_repaired() {
     let mut failures = Vec::new();
     for (label_, source) in [
@@ -1293,6 +1292,83 @@ fn a_root_error_tree_with_a_real_error_stays_partial() {
         "class C0 { class C1 { class C2 { val x = 1 } } } }\n",
     ] {
         let source = format!("{source}{SUFFIX}");
+        let e = ex("A.kt", &source);
+        assert!(!clean(&e), "{source:?} was reported Clean");
+        assert!(e.recovered_decl_ranges.is_empty(), "{source:?}");
+    }
+}
+
+/// Follow-up 5 keeps true: a member the rewrite reads through (a non-ASCII
+/// identifier, a block comment, `++`) equals its multi-line twin on every table.
+#[test]
+fn a_member_ending_in_a_non_ascii_letter_or_a_comment_equals_its_twin_on_every_table() {
+    let mut failures = Vec::new();
+    for (label_, one, twin) in [
+        (
+            "non-ASCII identifier",
+            "class K { companion object { val k = caf\u{e9} } }\n",
+            "class K {\n    companion object {\n        val k = caf\u{e9}\n    }\n}\n",
+        ),
+        (
+            "non-ASCII property name",
+            "class K { val na\u{ef}ve = 1 }\nclass L { val caf\u{e9} = na\u{ef}ve() }\n",
+            "class K {\n    val na\u{ef}ve = 1\n}\nclass L {\n    val caf\u{e9} = na\u{ef}ve()\n}\n",
+        ),
+        (
+            "post-increment",
+            "class K { val x = 1 }\nclass L { val v = x++ }\n",
+            "class K {\n    val x = 1\n}\nclass L {\n    val v = x++\n}\n",
+        ),
+        (
+            "block comment before the brace",
+            "class A { val x = 1 /* c */ }\n",
+            "class A {\n    val x = 1 /* c */\n}\n",
+        ),
+        (
+            "two block comments before the brace",
+            "class A { fun f() = g() /* a */ /** b */ }\n",
+            "class A {\n    fun f() = g() /* a */ /** b */\n}\n",
+        ),
+        (
+            "comment between members",
+            "class A { val x = 1; /* c */ val y = 2 /* d */ }\n",
+            "class A {\n    val x = 1; /* c */ val y = 2 /* d */\n}\n",
+        ),
+    ] {
+        let (one, twin) = (format!("{one}{SUFFIX}"), format!("{twin}{SUFFIX}"));
+        let (a, b) = (ex("A.kt", &one), ex("A.kt", &twin));
+        if !clean(&a) || !clean(&b) {
+            failures.push(format!(
+                "{label_}: one-line {} twin {}",
+                label(&a, &one),
+                label(&b, &twin)
+            ));
+            continue;
+        }
+        failures.extend(
+            table_diffs(&a, &b)
+                .into_iter()
+                .map(|d| format!("{label_}: {d}")),
+        );
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A dangling operator, arrow or prefix before the brace, with or without a
+/// comment or a non-ASCII word, is not a member: the file stays Partial.
+#[test]
+fn a_dangling_member_with_a_comment_or_a_non_ascii_word_stays_partial() {
+    for member in [
+        "val x = /* c */",
+        "val x = a + /* c */",
+        "val na\u{ef}ve =",
+        "val na\u{ef}ve: /* c */",
+        "val x = caf\u{e9} +",
+        "fun f() = /* c */",
+        "val f: () -> /* c */",
+        "class B : /* c */",
+    ] {
+        let source = format!("class K {{ {member} }}\n{SUFFIX}");
         let e = ex("A.kt", &source);
         assert!(!clean(&e), "{source:?} was reported Clean");
         assert!(e.recovered_decl_ranges.is_empty(), "{source:?}");
