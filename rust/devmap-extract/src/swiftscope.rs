@@ -50,6 +50,9 @@ thread_local! {
     /// One [`AliasIndex`] per file. Kept apart from [`FileIndex`] because reading
     /// a written type consults it, and building the file index reads written types.
     static ALIAS_INDEX: RefCell<HashMap<usize, Rc<AliasIndex>>> = RefCell::new(HashMap::new());
+    /// One [`WrapperIndex`] per file; `None` when the file was too large to read.
+    static WRAPPER_INDEX: RefCell<HashMap<usize, Option<Rc<WrapperIndex>>>> =
+        RefCell::new(HashMap::new());
 }
 
 /// Drop the per-scope cache. Node ids are arena addresses, reused once a tree
@@ -59,6 +62,7 @@ pub(crate) fn reset() {
     IN_PROGRESS.with(|open| open.borrow_mut().clear());
     FILE_INDEX.with(|index| index.borrow_mut().clear());
     ALIAS_INDEX.with(|index| index.borrow_mut().clear());
+    WRAPPER_INDEX.with(|index| index.borrow_mut().clear());
     crate::langdecl::swift::reset_roles();
 }
 
@@ -860,30 +864,59 @@ pub(crate) fn property_wrapper_wrapped_type(property: Node, source: &str) -> Opt
         return None;
     };
     let wrapper = attribute_nominal(*attribute, source)?;
-    let declaration = unique_wrapper_type(property, source, &wrapper)?;
-    let wrapped = stored_wrapped_type(declaration, source)?;
+    let index = wrapper_index(property, source)?;
+    let [declaration] = index.declared.get(&wrapper)?.as_slice() else {
+        return None;
+    };
+    let wrapped = declaration.wrapped.clone()?;
     // `Client` is read inside the wrapper but means something at the property.
     // Zero declarations here is the other file's type from both sites, and one
     // top-level declaration is the same type from both. A nested one is its
     // holder's `Client` only from inside that holder, and two make the spelling
     // ambiguous.
-    match non_extension_declarations(property, source, &wrapped) {
-        Some((0, _)) | Some((1, true)) => Some(wrapped),
+    match index.declared.get(&wrapped).map(Vec::as_slice) {
+        None | Some([]) => Some(wrapped),
+        Some([only]) if only.top_level => Some(wrapped),
         _ => None,
     }
 }
 
-/// How many non-extension types this file declares with short name `name`, and
-/// whether every one of them sits directly in the file rather than in a type or
-/// a callable.
-///
-/// The same walk as [`unique_wrapper_type`]: `class_declaration` nodes only,
-/// extensions excluded, capped at 20_000 nodes. `None` is the cap or a tree
-/// with no root, and the caller abstains. This does not read [`file_index`].
-fn non_extension_declarations(from: Node, source: &str, name: &str) -> Option<(usize, bool)> {
+/// The non-extension types a file declares, by short name, as a property
+/// wrapper's reader needs them. Built in one walk of the file and kept, so a
+/// file with many attributed properties (`@State var x = 0`) is read once.
+#[derive(Debug, Default)]
+struct WrapperIndex {
+    declared: HashMap<String, Vec<WrapperDecl>>,
+}
+
+/// One non-extension type declaration.
+#[derive(Debug)]
+struct WrapperDecl {
+    /// It sits directly in the file, not in a type or a callable.
+    top_level: bool,
+    /// The type of its one stored `wrappedValue`, when it is marked
+    /// `@propertyWrapper` and states one.
+    wrapped: Option<String>,
+}
+
+/// The [`WrapperIndex`] of the file `from` sits in, `None` when the file is too
+/// large to read (capped at 20_000 nodes) or the tree has no root; the caller
+/// abstains. It does not read [`file_index`]: that index calls the property
+/// wrapper's reader while it is being built, and asking it again would
+/// re-enter the build.
+fn wrapper_index(from: Node, source: &str) -> Option<Rc<WrapperIndex>> {
     let root = file_root(from)?;
-    let mut count = 0usize;
-    let mut top_level = true;
+    let id = root.id();
+    if let Some(known) = WRAPPER_INDEX.with(|index| index.borrow().get(&id).cloned()) {
+        return known;
+    }
+    let built = build_wrapper_index(root, source).map(Rc::new);
+    WRAPPER_INDEX.with(|index| index.borrow_mut().insert(id, built.clone()));
+    built
+}
+
+fn build_wrapper_index(root: Node, source: &str) -> Option<WrapperIndex> {
+    let mut built = WrapperIndex::default();
     let mut stack = vec![root];
     let mut seen = 0usize;
     while let Some(node) = stack.pop() {
@@ -892,17 +925,24 @@ fn non_extension_declarations(from: Node, source: &str, name: &str) -> Option<(u
             return None;
         }
         if node.kind() == "class_declaration" {
-            if let Some((path, extension)) = type_path(node, source) {
-                if !extension && short_name(&path) == name {
-                    count += 1;
-                    top_level &= bounded_parent(node).is_some_and(|p| p.kind() == "source_file");
-                }
+            if let Some((path, false)) = type_path(node, source) {
+                let marked = attribute_nodes(node).iter().any(|attribute| {
+                    attribute_nominal(*attribute, source).as_deref() == Some("propertyWrapper")
+                });
+                built
+                    .declared
+                    .entry(short_name(&path).to_string())
+                    .or_default()
+                    .push(WrapperDecl {
+                        top_level: bounded_parent(node).is_some_and(|p| p.kind() == "source_file"),
+                        wrapped: marked.then(|| stored_wrapped_type(node, source)).flatten(),
+                    });
             }
         }
         let mut cursor = node.walk();
         stack.extend(node.named_children(&mut cursor));
     }
-    Some((count, top_level))
+    Some(built)
 }
 
 /// `@` attributes of `node` itself: a direct `attribute`, or one inside its
@@ -944,39 +984,6 @@ fn attribute_nominal(attribute: Node, source: &str) -> Option<String> {
     }
     let name = user_type_name(user, source)?;
     is_plain_nominal(&name).then_some(name)
-}
-
-/// The one non-extension type this file declares called `name`, and only when
-/// that declaration is itself marked `@propertyWrapper`.
-fn unique_wrapper_type<'a>(from: Node<'a>, source: &str, name: &str) -> Option<Node<'a>> {
-    let root = file_root(from)?;
-    let mut found: Vec<Node> = Vec::new();
-    let mut stack = vec![root];
-    let mut seen = 0usize;
-    while let Some(node) = stack.pop() {
-        seen += 1;
-        if seen > 20_000 {
-            return None;
-        }
-        if node.kind() == "class_declaration" {
-            if let Some((path, extension)) = type_path(node, source) {
-                if !extension && short_name(&path) == name {
-                    found.push(node);
-                }
-            }
-        }
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
-    }
-    let [only] = found.as_slice() else {
-        return None;
-    };
-    attribute_nodes(*only)
-        .iter()
-        .any(|attribute| {
-            attribute_nominal(*attribute, source).as_deref() == Some("propertyWrapper")
-        })
-        .then_some(*only)
 }
 
 /// The written type of the one stored `wrappedValue` on a property wrapper.
@@ -4320,6 +4327,35 @@ mod tests {
                     property_wrapper_wrapped_type(property, source).as_deref(),
                     want,
                     "{name}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn a_file_too_large_to_read_types_no_wrapper_property() {
+        // Past the 20_000-node cap the file's declarations are unreadable, which
+        // is not the same as a file that declares nothing.
+        let mut source = String::from(
+            "@propertyWrapper struct Env { var wrappedValue: Client }\n\
+             struct R { @Env(Client.self) var a\n @Env(Client.self) var b }\n",
+        );
+        for index in 0..8000 {
+            source.push_str(&format!("struct Filler{index} {{ var x = 0 }}\n"));
+        }
+        for name in ["a", "b"] {
+            with_property(&source, name, |property| {
+                assert_eq!(property_wrapper_wrapped_type(property, &source), None);
+            });
+        }
+        // The same declarations without the filler do type both.
+        let small = "@propertyWrapper struct Env { var wrappedValue: Client }\n\
+             struct R { @Env(Client.self) var a\n @Env(Client.self) var b }\n";
+        for name in ["a", "b"] {
+            with_property(small, name, |property| {
+                assert_eq!(
+                    property_wrapper_wrapped_type(property, small).as_deref(),
+                    Some("Client")
                 );
             });
         }
