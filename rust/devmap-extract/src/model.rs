@@ -1778,17 +1778,30 @@ pub struct Extraction {
     /// inside one of these ranges must abstain, not conclude the name is
     /// undeclared. Sorted and deduplicated.
     ///
-    /// Kotlin lists here each statement the grammar parsed as an expression and
-    /// that the extractor re-parsed into the declarations `symbols` now holds
-    /// (see `kotlinloss`). Such a range is a loss that was repaired, and
-    /// `parse_outcome` is `Clean` again unless something else is wrong with the
-    /// file; a statement that could not be repaired is not listed here but stays
-    /// in `parse_outcome`'s `error_ranges`.
-    ///
     /// Absence is a claim: `parse_outcome` alone cannot say *where* the loss
     /// is, and a file that parsed clean can still have dropped a declaration.
+    ///
+    /// For Kotlin a range is listed here when the grammar read a declaration as
+    /// an expression and the extractor could **not** repair it: the same range
+    /// is in `parse_outcome`'s `error_ranges`, and nothing the grammar's
+    /// expression reading produced inside it is published. A range that was
+    /// repaired is in [`Self::recovered_decl_ranges`] instead.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub decl_gaps: Vec<TextRange>,
+    /// Byte ranges the grammar read as an expression and the extractor repaired:
+    /// a Kotlin statement such as `@A @B private fun f() {}` that parses with no
+    /// error and no declaration, re-parsed as the declaration it is, whose
+    /// symbols, calls and references replaced what the expression reading
+    /// produced there. Inside one of these ranges `symbols` is complete, so a
+    /// reader need not abstain; the range exists so that a repair is visible
+    /// rather than indistinguishable from a file the grammar read correctly.
+    /// `parse_outcome` is `Clean` again unless something else is wrong with the
+    /// file. Sorted and deduplicated; empty for every language but Kotlin.
+    ///
+    /// Apart from [`Self::decl_gaps`] on purpose: that field means "a resolver
+    /// must abstain inside", and a repaired range is the opposite claim.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recovered_decl_ranges: Vec<TextRange>,
     /// Calls whose target is chosen at run time and that no `calls` row can
     /// name: Python's `getattr(o, 'cmd_' + n)()`. A side table and not an
     /// `ExtractedCall`, so a fake callee name never reaches the resolver.

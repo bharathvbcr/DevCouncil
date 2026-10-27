@@ -1,5 +1,6 @@
-//! Extraction schema v98 adds five side tables to `Extraction`: `jvm_decls`,
-//! `package_scopes`, `local_extents`, `decl_gaps` and `dynamic_dispatch`. A
+//! Extraction schema v98 adds six side tables to `Extraction`: `jvm_decls`,
+//! `package_scopes`, `local_extents`, `decl_gaps`, `recovered_decl_ranges` and
+//! `dynamic_dispatch`. A
 //! cached v97 payload has none of them, and an empty list cannot say "not
 //! collected", so serving it would leave every unchanged file without the fact:
 //! the extractor's new output would only show on files that happened to be
@@ -22,11 +23,12 @@ use devmap_extract::model::{
 use devmap_store::Store;
 
 const KOTLIN: &str = "package app\n\nclass Repo {\n    fun load() {}\n}\n";
-const FIELDS: [&str; 5] = [
+const FIELDS: [&str; 6] = [
     "jvm_decls",
     "package_scopes",
     "local_extents",
     "decl_gaps",
+    "recovered_decl_ranges",
     "dynamic_dispatch",
 ];
 
@@ -65,6 +67,7 @@ fn populated(mut extraction: Extraction) -> Extraction {
         extent: range(40, 55),
     }];
     extraction.decl_gaps = vec![range(70, 90)];
+    extraction.recovered_decl_ranges = vec![range(95, 120)];
     extraction.dynamic_dispatch = vec![DynamicDispatch {
         caller_symbol: Some("h.py::run".into()),
         start_byte: 20,
@@ -80,7 +83,7 @@ fn populated(mut extraction: Extraction) -> Extraction {
 fn the_current_extraction_names_v98_and_carries_the_new_tables_on_the_wire() {
     assert!(schema_version() >= 98, "{EXTRACTION_SCHEMA_VERSION}");
 
-    // A default extraction writes none of the five keys, so a payload stored
+    // A default extraction writes none of the six keys, so a payload stored
     // before the tables existed and one stored without a fact are the same bytes.
     let plain = extract_file("Repo.kt", KOTLIN);
     let json = serde_json::to_value(&plain).unwrap();
@@ -105,6 +108,7 @@ fn the_current_extraction_names_v98_and_carries_the_new_tables_on_the_wire() {
     assert_eq!(back.package_scopes, full.package_scopes);
     assert_eq!(back.local_extents, full.local_extents);
     assert_eq!(back.decl_gaps, full.decl_gaps);
+    assert_eq!(back.recovered_decl_ranges, full.recovered_decl_ranges);
     assert_eq!(back.dynamic_dispatch, full.dynamic_dispatch);
     assert_eq!(serde_json::to_value(&back).unwrap(), json);
 }
@@ -119,6 +123,7 @@ fn a_payload_stored_under_the_v97_identity_is_not_served_to_a_v98_key() {
     old.package_scopes.clear();
     old.local_extents.clear();
     old.decl_gaps.clear();
+    old.recovered_decl_ranges.clear();
     old.dynamic_dispatch.clear();
     let current = CacheKey::for_extraction(&old);
     let mut v97 = current.clone();

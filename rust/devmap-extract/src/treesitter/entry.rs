@@ -986,6 +986,7 @@ pub(super) fn extract_treesitter_before_deadline(
                     package_scopes: jvm_facts.package_scopes,
                     local_extents: jvm_facts.local_extents,
                     decl_gaps: jvm_facts.decl_gaps,
+                    recovered_decl_ranges: Vec::new(),
                     dynamic_dispatch: py_facts.dynamic_dispatch,
                 };
 

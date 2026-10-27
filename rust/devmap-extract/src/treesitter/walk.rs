@@ -62,6 +62,7 @@ pub(super) fn unparsed_extraction(
         package_scopes: Vec::new(),
         local_extents: Vec::new(),
         decl_gaps: Vec::new(),
+        recovered_decl_ranges: Vec::new(),
         dynamic_dispatch: Vec::new(),
     }
 }
@@ -285,6 +286,7 @@ pub(super) fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Ex
         package_scopes: Vec::new(),
         local_extents: Vec::new(),
         decl_gaps: Vec::new(),
+        recovered_decl_ranges: Vec::new(),
         dynamic_dispatch: Vec::new(),
     }
 }
