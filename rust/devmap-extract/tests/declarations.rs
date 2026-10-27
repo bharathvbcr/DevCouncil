@@ -613,7 +613,6 @@ fn assert_emitted(names: &[String], want: &[&str], shape: &str) {
 /// AC1 (audit F7, LiquidBackdrop.kt:884 shape). A property initializer, two
 /// stacked annotations on their own lines, then a private function.
 #[test]
-#[ignore = "ft-5ad86836: stacked annotations + visibility modifier + block-bodied fun drops the fun (parsed as annotated_expression, Clean); extractor fix needs extract-v98 (schema frozen at 97)"]
 fn kotlin_stacked_annotations_after_a_property_initializer_keep_the_function() {
     let shape = "val X = 1; @Preview; @Composable; private fun f()";
     let names = kt_names(
@@ -624,7 +623,6 @@ fn kotlin_stacked_annotations_after_a_property_initializer_keep_the_function() {
 }
 
 #[test]
-#[ignore = "ft-5ad86836: stacked annotations + visibility modifier + block-bodied fun drops the fun (parsed as annotated_expression, Clean); extractor fix needs extract-v98 (schema frozen at 97)"]
 fn kotlin_stacked_annotations_after_a_multiline_initializer_keep_the_function() {
     let shape = "multi-line lambda initializer; stacked annotations; private fun f()";
     let names = kt_names(
@@ -635,7 +633,6 @@ fn kotlin_stacked_annotations_after_a_multiline_initializer_keep_the_function() 
 }
 
 #[test]
-#[ignore = "ft-5ad86836: stacked annotations + visibility modifier + block-bodied fun drops the fun (parsed as annotated_expression, Clean); extractor fix needs extract-v98 (schema frozen at 97)"]
 fn kotlin_annotations_with_arguments_after_a_property_initializer_keep_the_function() {
     let shape = "val X = 1; @Preview(showBackground = true); @Composable; private fun f()";
     let names = kt_names(
@@ -646,7 +643,6 @@ fn kotlin_annotations_with_arguments_after_a_property_initializer_keep_the_funct
 }
 
 #[test]
-#[ignore = "ft-5ad86836: stacked annotations + visibility modifier + block-bodied fun drops the fun (parsed as annotated_expression, Clean); extractor fix needs extract-v98 (schema frozen at 97)"]
 fn kotlin_stacked_annotations_after_a_blank_line_keep_the_function() {
     let shape = "val X = 1; blank line; @Preview; @Composable; private fun f()";
     let names = kt_names(
@@ -656,9 +652,11 @@ fn kotlin_stacked_annotations_after_a_blank_line_keep_the_function() {
     assert_emitted(&names, &["D.kt::f", "D.kt::after"], shape);
 }
 
-/// The boundary of the AC1 loss, pinned so the ignored tests name the trigger
-/// exactly: it needs two annotations, a modifier and a block body. Removing
-/// any one of the three keeps `f`.
+/// The boundary of the AC1 loss, pinned so the tests above name the trigger:
+/// two annotations, one modifier-like word and a declaration that also reads as
+/// an expression. Removing the second annotation, the modifier, or the
+/// expression reading (a return type before `=`) keeps `f` without any
+/// recovery. See `kotlin_silent_loss.rs` for the other declaration kinds.
 #[test]
 fn kotlin_annotation_stacks_that_still_parse_as_declarations_keep_the_function() {
     for (path, source) in [

@@ -1778,6 +1778,13 @@ pub struct Extraction {
     /// inside one of these ranges must abstain, not conclude the name is
     /// undeclared. Sorted and deduplicated.
     ///
+    /// Kotlin lists here each statement the grammar parsed as an expression and
+    /// that the extractor re-parsed into the declarations `symbols` now holds
+    /// (see `kotlinloss`). Such a range is a loss that was repaired, and
+    /// `parse_outcome` is `Clean` again unless something else is wrong with the
+    /// file; a statement that could not be repaired is not listed here but stays
+    /// in `parse_outcome`'s `error_ranges`.
+    ///
     /// Absence is a claim: `parse_outcome` alone cannot say *where* the loss
     /// is, and a file that parsed clean can still have dropped a declaration.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

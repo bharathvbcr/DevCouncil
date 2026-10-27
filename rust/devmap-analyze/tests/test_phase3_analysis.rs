@@ -110,14 +110,19 @@ fn test_x6_partial_error_range_symbol_is_exempt() {
 
 /// extract-v98 row 15. tree-sitter-kotlin-ng reads `@A @B private fun f() {}`
 /// as an expression and reports no error, so the file was `Clean` and `f` was
-/// not in the graph at all. The loss detector makes it `Partial`, and the
-/// swallowed statement is then charged exactly as any other partial parse is:
-/// listed with its region, counted, and denying the file a complete answer.
-/// Fails against `9ceef2dc`, where the file is `Clean` and nothing is charged.
+/// not in the graph at all. The loss detector makes it `Partial`; where the
+/// re-parse cannot prove what the statement is, it stays `Partial` and is
+/// charged exactly as any other partial parse is: listed with its region,
+/// counted, and denying the file a complete answer. Fails against `9ceef2dc`,
+/// where the file is `Clean` and nothing is charged.
+///
+/// The swallowed function here holds a swallowed statement of its own, which
+/// is what keeps recovery from proving it.
 #[test]
 fn a_kotlin_declaration_the_grammar_swallowed_is_charged_like_any_partial_parse() {
-    let source = "private val X = 1\n@Preview\n@Composable\nprivate fun f() {}\nfun after() {}\n";
-    let ext = extract_file("A.kt", source);
+    let outer = "@Preview\n@Composable\nprivate fun f() {\n    @A\n    @B\n    private fun g() {}\n    last()\n}";
+    let source = format!("private val X = 1\n{outer}\nfun after() {{}}\n");
+    let ext = extract_file("A.kt", &source);
     assert!(
         matches!(ext.parse_outcome, ParseOutcome::Partial { .. }),
         "{:?}",
@@ -143,7 +148,7 @@ fn a_kotlin_declaration_the_grammar_swallowed_is_charged_like_any_partial_parse(
         listed[0].reason
     );
     let start = source.find("@Preview").unwrap();
-    let end = source.find("fun after").unwrap() - 1;
+    let end = start + outer.len();
     assert!(
         listed[0].reason.contains(&format!("{start}..{end}")),
         "the region is named by its byte range {start}..{end}: {}",
@@ -154,6 +159,49 @@ fn a_kotlin_declaration_the_grammar_swallowed_is_charged_like_any_partial_parse(
     assert!(
         !coverage.is_complete_for("kotlin"),
         "a file that lost a declaration caps the Kotlin ceiling: {coverage:?}"
+    );
+}
+
+/// extract-v98 row 15, recovered. A private function the grammar swallowed is
+/// a symbol again, so the call to it resolves to it and an uncalled one is a
+/// dead-code finding of an unexempt, `Clean` file. Fails against `9ceef2dc`:
+/// neither function exists there, `used()` resolves to nothing and `unused` is
+/// never reported.
+#[test]
+fn a_recovered_kotlin_function_gets_its_caller_edge_and_its_dead_verdict() {
+    let source = "@A\n@B\nprivate fun used() {}\nfun mid() {}\n@A\n@B\nprivate fun unused() {}\nfun after() {\n    used()\n}\n";
+    let ext = extract_file("A.kt", source);
+    assert!(
+        matches!(ext.parse_outcome, ParseOutcome::Clean),
+        "{:?}\n{:?}",
+        ext.parse_outcome,
+        ext.diagnostics
+    );
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(std::slice::from_ref(&ext));
+    let result = resolver.resolve_all(std::slice::from_ref(&ext)).unwrap();
+    assert!(
+        result.edges.iter().any(|edge| {
+            edge.edge_kind == EdgeKind::Calls
+                && edge.source_symbol.ends_with("after")
+                && edge.target_symbol.ends_with("used")
+                && edge.target_file == "A.kt"
+        }),
+        "after() reaches the recovered `used`: {:?}",
+        result.edges
+    );
+    let reports = analyze_liveness(&[ext], &result);
+    assert!(
+        reports.iter().all(|report| report.symbol_name != "used"),
+        "a called function is not a dead-code finding: {reports:?}"
+    );
+    let unused = reports
+        .iter()
+        .find(|report| report.symbol_name == "unused")
+        .expect("the recovered, uncalled private function is reported");
+    assert!(
+        !unused.is_exempt,
+        "a recovered declaration of a Clean file is judged, not exempted: {unused:?}"
     );
 }
 

@@ -243,7 +243,7 @@ pub(super) enum ParseAttempt {
 /// `parse` on it would *resume* that state instead of starting on the new
 /// text. The probes reuse one parser per thread, so a cancel resets it here
 /// rather than relying on every caller to.
-pub(super) fn parse_until(
+pub(crate) fn parse_until(
     parser: &mut Parser,
     source: &str,
     deadline: std::time::Instant,
@@ -988,6 +988,15 @@ pub(super) fn extract_treesitter_before_deadline(
                     decl_gaps: jvm_facts.decl_gaps,
                     dynamic_dispatch: py_facts.dynamic_dispatch,
                 };
+
+                // Kotlin only, and only for a file the loss detector charged:
+                // re-derive the declarations the grammar read as expressions.
+                // After the extraction is assembled, because the recovered
+                // symbols carry their own stamps from the re-parse, and before
+                // everything below, which reads `extraction.symbols`.
+                if lang == "kotlin" {
+                    crate::kotlinloss::recover(&mut extraction, source, &lost, deadline);
+                }
 
                 // The code inside a template language's `<script>` blocks, in
                 // the outer file's own coordinates. Last, and after

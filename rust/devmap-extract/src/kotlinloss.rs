@@ -37,10 +37,18 @@
 //! node cap marks the whole file as an error range, because a check that could
 //! not finish must never report what a check that ran and found nothing reports.
 
+use std::cell::Cell;
+use std::time::Instant;
+
 use tree_sitter::Node;
 
-use crate::model::TextRange;
-use crate::treesitter::{bounded_parent, walk_deadline_passed, DEADLINE_CHECK_STRIDE};
+use crate::model::{
+    ExtractedCall, ExtractedExport, ExtractedReference, ExtractedSymbol, Extraction, LocalBinding,
+    ParseOutcome, Span, SymbolKind, TextRange, WiringAnnotation,
+};
+use crate::treesitter::{
+    bounded_parent, extraction_overran, walk_deadline_passed, DEADLINE_CHECK_STRIDE,
+};
 
 /// Words that cannot be an `identifier` in valid Kotlin and that open a
 /// declaration.
@@ -209,6 +217,419 @@ fn record(keyword: Node, start: usize, word: &'static str, found: &mut Vec<LostR
         top_level,
         has_error: top.has_error(),
     });
+}
+
+// ------------------------------------------------------------------ recovery
+
+/// Regions re-parsed per file. Far above any real file (the measured corpus
+/// has none past a handful); a region past the cap is not re-parsed, stays in
+/// `error_ranges`, and the cap is recorded in the extraction's diagnostics.
+pub(crate) const MAX_RECOVERY_REGIONS: usize = 64;
+
+/// The class a swallowed statement is wrapped in for the re-parse. A class body
+/// is the one Kotlin context measured to read every swallowed shape as the
+/// declaration it is. The name is not a Kotlin identifier anyone writes; a
+/// source that spells it is not recovered at all.
+const WRAPPER_NAME: &str = "DevmapKotlinRecoveryWrapper";
+const WRAPPER_OPEN: &str = "class DevmapKotlinRecoveryWrapper {\n";
+const WRAPPER_CLOSE: &str = "\n}";
+
+/// Node kinds a recovered statement may be, as members of the wrapper's body.
+const DECLARATION_KINDS: [&str; 5] = [
+    "function_declaration",
+    "class_declaration",
+    "object_declaration",
+    "property_declaration",
+    "type_alias",
+];
+
+thread_local! {
+    /// Whether this thread is already recovering a region. The re-parse is a
+    /// whole extraction, and a wrapper that still held a swallowed statement
+    /// would otherwise recover it in turn without bound.
+    static INSIDE_RECOVERY: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Sets [`INSIDE_RECOVERY`] for its lifetime and clears it on drop, so a panic
+/// in an inner extraction cannot leave a worker thread poisoned.
+struct DepthGuard;
+
+impl DepthGuard {
+    fn enter() -> Option<Self> {
+        INSIDE_RECOVERY.with(|inside| {
+            if inside.get() {
+                None
+            } else {
+                inside.set(true);
+                Some(Self)
+            }
+        })
+    }
+}
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        INSIDE_RECOVERY.with(|inside| inside.set(false));
+    }
+}
+
+/// Whether `node` is the class the recovery wraps a statement in.
+///
+/// `langdecl::kotlin` asks, and answers "declares nothing" for it, so the
+/// wrapper is not an owner and a recovered member is named as the top-level
+/// declaration it is: `f`, never `Wrapper.f`. Asking here, in the one place the
+/// declaration identity is decided, is what keeps a recovered symbol's
+/// `qualified_name` and its calls' `caller_symbol` from drifting.
+pub(crate) fn is_recovery_wrapper(node: Node, source: &str) -> bool {
+    node.start_byte() == 0 && node.kind() == "class_declaration" && source.starts_with(WRAPPER_OPEN)
+}
+
+/// Re-derive the declarations the grammar swallowed, and merge them.
+///
+/// Each top-level region the detector found is parsed again, wrapped in a
+/// class body. A region is recovered only if the wrapper parses cleanly, is
+/// exactly one class holding declarations, reads every hard keyword of the
+/// region as that declaration's own keyword token, and holds no swallowed
+/// statement of its own. Anything less leaves the region exactly as it was:
+/// `Partial`, with nothing emitted. A symbol that is not in the source is worse
+/// than a symbol that is missing.
+///
+/// A recovered region's own symbols, calls, references, exports, wiring,
+/// scope locals and local bindings replace what the original tree produced
+/// inside it. The original tree had read the declaration as an expression, so
+/// its calls were attributed to the file and `f() { .. }` was recorded as a call
+/// to `f`. Where every region of the file is recovered the outcome is `Clean`
+/// again, and the recovered ranges are listed in `decl_gaps`.
+pub(crate) fn recover(
+    extraction: &mut Extraction,
+    source: &str,
+    lost: &LostScan,
+    deadline: Instant,
+) {
+    if lost.regions.is_empty() || lost.capped || lost.deadline_passed {
+        return;
+    }
+    let Some(_guard) = DepthGuard::enter() else {
+        return;
+    };
+    if source.contains(WRAPPER_NAME) {
+        extraction.diagnostics.push(
+            "kotlin loss recovery skipped: the source spells the recovery wrapper's own name"
+                .to_string(),
+        );
+        return;
+    }
+    // Before any inner extraction: the inner call re-arms the thread's budget,
+    // which would clear a latch an earlier phase had already set.
+    if extraction_overran(deadline) {
+        return;
+    }
+    let mut attempted = 0usize;
+    let mut recovered: Vec<TextRange> = Vec::new();
+    for region in &lost.regions {
+        if !region.top_level || region.has_error {
+            continue;
+        }
+        if attempted >= MAX_RECOVERY_REGIONS {
+            extraction.diagnostics.push(format!(
+                "kotlin loss recovery stopped at {MAX_RECOVERY_REGIONS} regions; the remaining \
+                 {} stay in error_ranges",
+                lost.regions.len() - attempted
+            ));
+            break;
+        }
+        attempted += 1;
+        if Instant::now() >= deadline {
+            extraction.diagnostics.push(
+                "kotlin loss recovery stopped at the extraction deadline; the remaining regions \
+                 stay in error_ranges"
+                    .to_string(),
+            );
+            break;
+        }
+        match recover_region(extraction, source, region, deadline) {
+            Ok(()) => recovered.push(region.range.clone()),
+            Err(why) => extraction.diagnostics.push(format!(
+                "kotlin declaration at bytes {}..{} not recovered: {why}",
+                region.range.start_byte, region.range.end_byte
+            )),
+        }
+    }
+    if recovered.is_empty() {
+        return;
+    }
+    if let ParseOutcome::Partial {
+        error_ranges,
+        nameless_ranges,
+    } = &mut extraction.parse_outcome
+    {
+        error_ranges.retain(|range| !recovered.contains(range));
+        nameless_ranges.retain(|range| !recovered.contains(range));
+        if error_ranges.is_empty() {
+            extraction.parse_outcome = ParseOutcome::Clean;
+        }
+    }
+    extraction.decl_gaps.extend(recovered);
+    extraction.decl_gaps.sort();
+    extraction.decl_gaps.dedup();
+    extraction
+        .symbols
+        .sort_by_key(|symbol| symbol.span.start_byte);
+    extraction.calls.sort_by_key(|call| call.span.start_byte);
+    crate::embedded::reorder_after_merge(extraction);
+}
+
+/// Recover one region, or say why not and change nothing.
+fn recover_region(
+    extraction: &mut Extraction,
+    source: &str,
+    region: &LostRegion,
+    deadline: Instant,
+) -> Result<(), String> {
+    let (start, end) = (region.range.start_byte, region.range.end_byte);
+    let text = source
+        .get(start..end)
+        .ok_or_else(|| "the region is not on a character boundary".to_string())?;
+    let wrapped = format!("{WRAPPER_OPEN}{text}{WRAPPER_CLOSE}");
+    let prefix = WRAPPER_OPEN.len();
+    let keywords: Vec<(usize, &str)> = region
+        .keywords
+        .iter()
+        .map(|&(offset, word)| (offset - start + prefix, word))
+        .collect();
+    check_wrapper(&wrapped, &keywords, deadline)?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err("the extraction budget was exhausted".to_string());
+    }
+    let inner = crate::treesitter::extract_treesitter_with_budget(
+        &extraction.file_path,
+        "kotlin",
+        &wrapped,
+        remaining,
+    );
+    if !matches!(inner.parse_outcome, ParseOutcome::Clean) {
+        return Err(format!(
+            "the wrapped text did not extract cleanly: {:?}",
+            inner.parse_outcome
+        ));
+    }
+    let staged = Staged::of(inner, &extraction.file_path, start, prefix, text.len())?;
+    staged.apply(extraction, region);
+    Ok(())
+}
+
+/// Parse the wrapped text and confirm it is what recovery assumes.
+fn check_wrapper(
+    wrapped: &str,
+    keywords: &[(usize, &str)],
+    deadline: Instant,
+) -> Result<(), String> {
+    let (_, language) = crate::treesitter::grammar_for("kotlin")
+        .ok_or_else(|| "no Kotlin grammar is linked".to_string())?;
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&language)
+        .map_err(|_| "the Kotlin grammar failed to load".to_string())?;
+    let (tree, cancelled) = crate::treesitter::parse_until(&mut parser, wrapped, deadline);
+    let tree = match tree {
+        Some(tree) if !cancelled => tree,
+        _ => return Err("the wrapped text did not parse within the budget".to_string()),
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return Err("the wrapped text has a syntax error".to_string());
+    }
+    let mut cursor = root.walk();
+    let mut top = root.named_children(&mut cursor);
+    let (Some(class), None) = (top.next(), top.next()) else {
+        return Err("the wrapped text is not exactly one class".to_string());
+    };
+    if !is_recovery_wrapper(class, wrapped) || class.end_byte() < wrapped.trim_end().len() {
+        return Err("the wrapped text closed the wrapper early".to_string());
+    }
+    let mut inner = class.walk();
+    let body = class
+        .named_children(&mut inner)
+        .find(|child| child.kind() == "class_body")
+        .ok_or_else(|| "the wrapper has no body".to_string())?;
+    let mut members = body.walk();
+    let mut declarations: Vec<(usize, usize)> = Vec::new();
+    for member in body.named_children(&mut members) {
+        if DECLARATION_KINDS.contains(&member.kind()) {
+            declarations.push((member.start_byte(), member.end_byte()));
+        } else if !member.kind().ends_with("comment") {
+            return Err(format!(
+                "the wrapper holds a `{}`, not a declaration",
+                member.kind()
+            ));
+        }
+    }
+    if declarations.is_empty() {
+        return Err("the wrapper holds no declaration".to_string());
+    }
+    for &(at, word) in keywords {
+        let token = root.descendant_for_byte_range(at, at + word.len());
+        let is_the_keyword = !word.is_empty()
+            && token.is_some_and(|token| {
+                !token.is_named()
+                    && token.kind() == word
+                    && token.start_byte() == at
+                    && token.end_byte() == at + word.len()
+            });
+        let owned = declarations
+            .iter()
+            .any(|&(from, to)| from <= at && at + word.len() <= to);
+        if !is_the_keyword || !owned {
+            return Err(format!(
+                "the keyword `{word}` at wrapper byte {at} is not a declaration's own keyword"
+            ));
+        }
+    }
+    let scan = detect(root, wrapped);
+    if scan.capped || scan.deadline_passed || !scan.regions.is_empty() {
+        return Err("the wrapped text still holds a swallowed statement".to_string());
+    }
+    Ok(())
+}
+
+/// What one recovered region contributes, in the file's own byte coordinates.
+struct Staged {
+    symbols: Vec<ExtractedSymbol>,
+    calls: Vec<ExtractedCall>,
+    references: Vec<ExtractedReference>,
+    exports: Vec<ExtractedExport>,
+    wiring: Vec<WiringAnnotation>,
+    scope_locals: Vec<(String, String)>,
+    local_bindings: Vec<LocalBinding>,
+    diagnostics: Vec<String>,
+}
+
+impl Staged {
+    /// Shift an inner extraction of `{WRAPPER_OPEN}{text}{WRAPPER_CLOSE}` back
+    /// to the file. Any span outside the text, or any trace of the wrapper's
+    /// name, means the re-parse said something about bytes that are not the
+    /// region's and nothing is merged.
+    fn of(
+        inner: Extraction,
+        file_path: &str,
+        start: usize,
+        prefix: usize,
+        len: usize,
+    ) -> Result<Self, String> {
+        let shift = |byte: usize| -> Result<usize, String> {
+            if byte >= prefix && byte <= prefix + len {
+                Ok(byte - prefix + start)
+            } else {
+                Err(format!(
+                    "an inner span at byte {byte} lies outside the region"
+                ))
+            }
+        };
+        let shift_span = |span: &Span| -> Result<Span, String> {
+            Ok(Span {
+                start_byte: shift(span.start_byte)?,
+                end_byte: shift(span.end_byte)?,
+            })
+        };
+        let wrapper_symbol = format!("{file_path}::{WRAPPER_NAME}");
+        let mut staged = Staged {
+            symbols: Vec::new(),
+            calls: Vec::new(),
+            references: Vec::new(),
+            exports: Vec::new(),
+            wiring: Vec::new(),
+            scope_locals: inner.scope_locals,
+            local_bindings: Vec::new(),
+            diagnostics: inner.diagnostics,
+        };
+        for mut symbol in inner.symbols {
+            if symbol.kind == SymbolKind::File {
+                continue;
+            }
+            symbol.span = shift_span(&symbol.span)?;
+            staged.symbols.push(symbol);
+        }
+        for mut call in inner.calls {
+            call.span = shift_span(&call.span)?;
+            staged.calls.push(call);
+        }
+        for mut reference in inner.references {
+            // A property's declared type is filed under its owning class, and
+            // the wrapper is a class the source does not have. A top-level
+            // property is owned by nothing, and emits no such reference.
+            if reference.enclosing_symbol.as_deref() == Some(wrapper_symbol.as_str()) {
+                continue;
+            }
+            reference.span = shift_span(&reference.span)?;
+            staged.references.push(reference);
+        }
+        for mut export in inner.exports {
+            // The inner run exported its own `File` node, which the outer
+            // already carries.
+            if export.exported_name == file_path.rsplit('/').next().unwrap_or(file_path) {
+                continue;
+            }
+            export.span = shift_span(&export.span)?;
+            staged.exports.push(export);
+        }
+        staged.wiring = inner
+            .wiring
+            .into_iter()
+            .filter(|annotation| annotation.target_symbol != file_path)
+            .collect();
+        for mut binding in inner.local_bindings {
+            binding.start_byte = shift(binding.start_byte)?;
+            staged.local_bindings.push(binding);
+        }
+        let residue = serde_json::to_string(&(
+            &staged.symbols,
+            &staged.calls,
+            &staged.references,
+            &staged.exports,
+            &staged.wiring,
+            &staged.scope_locals,
+            &staged.local_bindings,
+        ))
+        .map_err(|error| format!("the recovered items could not be checked: {error}"))?;
+        if residue.contains(WRAPPER_NAME) {
+            return Err("the recovered items still name the recovery wrapper".to_string());
+        }
+        Ok(staged)
+    }
+
+    /// Replace what the original tree produced inside `region` with these.
+    fn apply(self, extraction: &mut Extraction, region: &LostRegion) {
+        let (start, end) = (region.range.start_byte, region.range.end_byte);
+        let inside = |span: &Span| span.start_byte >= start && span.end_byte <= end;
+        let mut dropped: Vec<String> = Vec::new();
+        extraction.symbols.retain(|symbol| {
+            let drop = symbol.kind != SymbolKind::File && inside(&symbol.span);
+            if drop {
+                dropped.push(symbol.qualified_name.clone());
+            }
+            !drop
+        });
+        extraction.calls.retain(|call| !inside(&call.span));
+        extraction
+            .references
+            .retain(|reference| !inside(&reference.span));
+        extraction.exports.retain(|export| !inside(&export.span));
+        extraction
+            .wiring
+            .retain(|annotation| !dropped.contains(&annotation.target_symbol));
+        extraction
+            .local_bindings
+            .retain(|binding| binding.start_byte < start || binding.start_byte >= end);
+        extraction.symbols.extend(self.symbols);
+        extraction.calls.extend(self.calls);
+        extraction.references.extend(self.references);
+        extraction.exports.extend(self.exports);
+        extraction.wiring.extend(self.wiring);
+        extraction.scope_locals.extend(self.scope_locals);
+        extraction.local_bindings.extend(self.local_bindings);
+        extraction.diagnostics.extend(self.diagnostics);
+    }
 }
 
 #[cfg(test)]
