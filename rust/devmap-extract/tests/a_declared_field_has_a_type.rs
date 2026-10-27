@@ -585,3 +585,25 @@ fn a_swift_property_wrapper_states_its_wrapped_type_or_nothing() {
         );
     }
 }
+
+/// The wrapper's `wrappedValue: Client` is read inside the wrapper. A `Client`
+/// nested in the wrapper, or in the type that uses it, is a different type from
+/// the one the field's owner would name, so the field states none.
+#[test]
+fn a_swift_wrapped_type_nested_in_the_wrapper_or_the_user_is_not_the_fields_type() {
+    let in_wrapper =
+        "@propertyWrapper struct Env {\n    struct Client {}\n    var wrappedValue: Client\n}\n\
+         struct R {\n    @Env(Client.self) private var client\n}\n";
+    assert_eq!(
+        names_a_field("a.swift", in_wrapper, "client"),
+        None,
+        "a Client nested in the wrapper is Env.Client, not the field's Client"
+    );
+    let in_user = "@propertyWrapper struct Env {\n    var wrappedValue: Client\n}\n\
+         struct R {\n    struct Client {}\n    @Env(Client.self) private var client\n}\n";
+    assert_eq!(
+        names_a_field("a.swift", in_user, "client"),
+        None,
+        "a Client nested in the using type is R.Client, not the wrapper's"
+    );
+}

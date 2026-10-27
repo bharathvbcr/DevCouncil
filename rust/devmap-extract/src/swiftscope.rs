@@ -193,7 +193,7 @@ pub(crate) fn use_is_in_own_initializer(node: Node, source: &str, name: &str) ->
                     if parent.field_name_for_child(index as u32) == Some("name")
                         && child.kind() == "pattern"
                     {
-                        collect_bound(child, source, &mut bound);
+                        bound.extend(pattern_binding_names(child, source));
                     }
                 }
                 return bound.iter().any(|each| each == name);
@@ -862,22 +862,28 @@ pub(crate) fn property_wrapper_wrapped_type(property: Node, source: &str) -> Opt
     let wrapper = attribute_nominal(*attribute, source)?;
     let declaration = unique_wrapper_type(property, source, &wrapper)?;
     let wrapped = stored_wrapped_type(declaration, source)?;
-    // Two nested `struct Client` make the spelling ambiguous. Zero or one does
-    // not: a name this file never declares is still the other file's type.
+    // `Client` is read inside the wrapper but means something at the property.
+    // Zero declarations here is the other file's type from both sites, and one
+    // top-level declaration is the same type from both. A nested one is its
+    // holder's `Client` only from inside that holder, and two make the spelling
+    // ambiguous.
     match non_extension_declarations(property, source, &wrapped) {
-        Some(count) if count <= 1 => Some(wrapped),
+        Some((0, _)) | Some((1, true)) => Some(wrapped),
         _ => None,
     }
 }
 
-/// How many non-extension types this file declares with short name `name`.
+/// How many non-extension types this file declares with short name `name`, and
+/// whether every one of them sits directly in the file rather than in a type or
+/// a callable.
 ///
 /// The same walk as [`unique_wrapper_type`]: `class_declaration` nodes only,
 /// extensions excluded, capped at 20_000 nodes. `None` is the cap or a tree
 /// with no root, and the caller abstains. This does not read [`file_index`].
-fn non_extension_declarations(from: Node, source: &str, name: &str) -> Option<usize> {
+fn non_extension_declarations(from: Node, source: &str, name: &str) -> Option<(usize, bool)> {
     let root = file_root(from)?;
     let mut count = 0usize;
+    let mut top_level = true;
     let mut stack = vec![root];
     let mut seen = 0usize;
     while let Some(node) = stack.pop() {
@@ -889,13 +895,14 @@ fn non_extension_declarations(from: Node, source: &str, name: &str) -> Option<us
             if let Some((path, extension)) = type_path(node, source) {
                 if !extension && short_name(&path) == name {
                     count += 1;
+                    top_level &= bounded_parent(node).is_some_and(|p| p.kind() == "source_file");
                 }
             }
         }
         let mut cursor = node.walk();
         stack.extend(node.named_children(&mut cursor));
     }
-    Some(count)
+    Some((count, top_level))
 }
 
 /// `@` attributes of `node` itself: a direct `attribute`, or one inside its
@@ -1343,14 +1350,20 @@ fn property(node: Node, source: &str, bounds: &BTreeMap<String, String>, out: &m
     let mut typed: Option<String> = None;
     let mut init: Option<String> = None;
     let mut value: Option<Node> = None;
+    // Names a nested pattern (`(b, c)` in `let (a, (b, c))`) binds. They have no
+    // slot of their own, so they are bound untyped and the pattern types nothing.
+    let mut nested: Vec<String> = Vec::new();
     let flush = |pending: &mut Vec<(Option<String>, String)>,
                  typed: &mut Option<String>,
                  init: &mut Option<String>,
                  value: &mut Option<Node>,
+                 nested: &mut Vec<String>,
                  out: &mut Bindings| {
         let single = pending.len() == 1;
         if !single && pending.len() > 1 {
-            let types = value.and_then(|call| tuple_local_types(call, source, pending, out));
+            let types = value
+                .filter(|_| nested.is_empty())
+                .and_then(|call| tuple_local_types(call, source, pending, out));
             for (index, (_, name)) in pending.drain(..).enumerate() {
                 let ty = types
                     .as_ref()
@@ -1368,6 +1381,9 @@ fn property(node: Node, source: &str, bounds: &BTreeMap<String, String>, out: &m
                 }
             }
         }
+        for name in nested.drain(..) {
+            bind(out, name, None);
+        }
         *typed = None;
         *init = None;
         *value = None;
@@ -1378,8 +1394,16 @@ fn property(node: Node, source: &str, bounds: &BTreeMap<String, String>, out: &m
         };
         match (node.field_name_for_child(index as u32), child.kind()) {
             (Some("name"), "pattern") => {
-                flush(&mut pending, &mut typed, &mut init, &mut value, out);
+                flush(
+                    &mut pending,
+                    &mut typed,
+                    &mut init,
+                    &mut value,
+                    &mut nested,
+                    out,
+                );
                 pending = binding_slots(child, source);
+                nested = names_without_a_slot(child, source, &pending);
             }
             (_, "type_annotation") => {
                 let mut cursor = child.walk();
@@ -1421,7 +1445,59 @@ fn property(node: Node, source: &str, bounds: &BTreeMap<String, String>, out: &m
             _ => {}
         }
     }
-    flush(&mut pending, &mut typed, &mut init, &mut value, out);
+    flush(
+        &mut pending,
+        &mut typed,
+        &mut init,
+        &mut value,
+        &mut nested,
+        out,
+    );
+}
+
+/// The names `pattern` binds that none of its `slots` carries: what a nested
+/// tuple pattern binds below the one slot it takes. `binding_slots` keeps an
+/// element index per top-level position, so these are bound untyped by the
+/// caller instead of being lost.
+fn names_without_a_slot(
+    pattern: Node,
+    source: &str,
+    slots: &[(Option<String>, String)],
+) -> Vec<String> {
+    let mut names = pattern_binding_names(pattern, source);
+    names.retain(|name| !slots.iter().any(|(_, slot)| slot == name));
+    names
+}
+
+/// Every name a `let` / `var` pattern binds, in source order, at any tuple
+/// depth. `collect_bound` reads the `bound_identifier` field, which the grammar
+/// sets only on a pattern that is one plain name; the names inside a tuple
+/// pattern are `simple_identifier` leaves of a `pattern` with no other child,
+/// and a `simple_identifier` beside other children is a tuple label.
+fn pattern_binding_names(pattern: Node, source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut stack = vec![pattern];
+    while let Some(node) = stack.pop() {
+        if let Some(identifier) = node.child_by_field_name("bound_identifier") {
+            names.push(get_node_text(identifier, source));
+            continue;
+        }
+        let mut cursor = node.walk();
+        let children: Vec<Node> = node.named_children(&mut cursor).collect();
+        if let [only] = children.as_slice() {
+            if only.kind() == "simple_identifier" {
+                names.push(get_node_text(*only, source));
+                continue;
+            }
+        }
+        stack.extend(
+            children
+                .into_iter()
+                .rev()
+                .filter(|child| child.kind() == "pattern"),
+        );
+    }
+    names
 }
 
 /// Names a pattern binds, in source order, with the tuple label written on each
@@ -1578,7 +1654,9 @@ fn tuple_local_types(
         return None;
     }
     let index = file_index(call, source)?;
-    if index.function_count.get(&name).copied() != Some(1) {
+    if index.function_count.get(&name).copied() != Some(1)
+        || enclosing_type_declares_property(call, source, &index, &name)
+    {
         return None;
     }
     let elements = index.tuple_returns.get(&name)?;
@@ -1603,6 +1681,29 @@ fn tuple_local_types(
         return None;
     }
     Some(elements.iter().map(|(_, ty)| Some(ty.clone())).collect())
+}
+
+/// A stored or computed property called `name` on a type the call sits in, an
+/// extension of it in this file included. An unqualified `name()` inside that
+/// type calls the closure the property holds before it reaches a file-level
+/// function. A type whose name cannot be read is treated as declaring it: not
+/// knowing must not bind the file-level function's types.
+fn enclosing_type_declares_property(at: Node, source: &str, index: &FileIndex, name: &str) -> bool {
+    let mut ancestor = bounded_parent(at);
+    while let Some(node) = ancestor {
+        if node.kind() == "class_declaration" {
+            match type_path(node, source) {
+                Some((path, _)) => {
+                    if index.members.contains_key(&(path, name.to_string())) {
+                        return true;
+                    }
+                }
+                None => return true,
+            }
+        }
+        ancestor = bounded_parent(node);
+    }
+    false
 }
 
 /// A parameter, an earlier local, or a nested function of `name` is what the
@@ -4171,6 +4272,146 @@ mod tests {
              @propertyWrapper struct Env { var wrappedValue: Client }\n\
              struct R { @Env(Client.self) var client\n func t() { let c = client } }";
         assert_eq!(ty_of(&bound(use_it, "t"), "c"), None);
+    }
+
+    #[test]
+    fn a_wrapped_value_named_by_a_nested_type_types_nothing() {
+        // `Client` is read inside `Env`, where it is `Env.Client`. From `R` the
+        // same spelling is another type, so the field may not wear it.
+        let in_wrapper = "@propertyWrapper struct Env { struct Client {}\n\
+             var wrappedValue: Client }\n\
+             struct R { @Env(Client.self) var client\n func t() { let c = client } }";
+        with_property(in_wrapper, "client", |client| {
+            assert_eq!(property_wrapper_wrapped_type(client, in_wrapper), None);
+        });
+        assert_eq!(ty_of(&bound(in_wrapper, "t"), "c"), None);
+        // Nested in the using type: from `R` that is `R.Client`, from `Env` not.
+        let in_user = "@propertyWrapper struct Env { var wrappedValue: Client }\n\
+             struct R { struct Client {}\n@Env(Client.self) var client }";
+        with_property(in_user, "client", |client| {
+            assert_eq!(property_wrapper_wrapped_type(client, in_user), None);
+        });
+        // A top-level declaration is the same type from both sites.
+        let top = "struct Client {}\n@propertyWrapper struct Env { var wrappedValue: Client }\n\
+             struct R { @Env(Client.self) var client }";
+        with_property(top, "client", |client| {
+            assert_eq!(
+                property_wrapper_wrapped_type(client, top).as_deref(),
+                Some("Client")
+            );
+        });
+    }
+
+    #[test]
+    fn many_wrapper_properties_in_one_file_are_each_decided_on_their_own() {
+        let source = "@propertyWrapper struct Env { var wrappedValue: Client }\n\
+             @propertyWrapper struct Opt { var wrappedValue: Client? }\n\
+             struct R {\n @Env(Client.self) var a\n @Opt var b\n @State var c = 0\n\
+             @Env(Client.self) var d\n}";
+        let expect = [
+            ("a", Some("Client")),
+            ("b", None),
+            ("c", None),
+            ("d", Some("Client")),
+        ];
+        for (name, want) in expect {
+            with_property(source, name, |property| {
+                assert_eq!(
+                    property_wrapper_wrapped_type(property, source).as_deref(),
+                    want,
+                    "{name}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn a_nested_tuple_destructure_binds_every_inner_name_untyped() {
+        let preamble = "struct Store {}\nstruct Svc {}\nstruct Other {}\n\
+             func makePair() -> (Store, (Svc, Other)) { (Store(), (Svc(), Other())) }\n";
+        // pattern, every name it binds, the names nested one level or more down.
+        let cases: [(&str, &[&str], &[&str]); 7] = [
+            (
+                "let (a, (b, c)) = makePair()",
+                &["a", "b", "c"],
+                &["b", "c"],
+            ),
+            (
+                "var (a, (b, (c, d))) = makePair()",
+                &["a", "b", "c", "d"],
+                &["b", "c", "d"],
+            ),
+            (
+                "let ((a, b), c) = makePair()",
+                &["a", "b", "c"],
+                &["a", "b"],
+            ),
+            ("let (a, (_, c)) = makePair()", &["a", "c"], &["c"]),
+            ("let (a, (b)) = makePair()", &["a", "b"], &[]),
+            (
+                "let (x: a, y: (b, c)) = makePair()",
+                &["a", "b", "c"],
+                &["b", "c"],
+            ),
+            ("let (_, (b, _)) = makePair()", &["b"], &["b"]),
+        ];
+        for (pattern, names, nested) in cases {
+            let source = format!("{preamble}func t() {{ {pattern} }}");
+            let found = bound(&source, "t");
+            let mut keys: Vec<&str> = found.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            let mut want = names.to_vec();
+            want.sort_unstable();
+            assert_eq!(keys, want, "names bound by `{pattern}`");
+            for name in nested {
+                assert_eq!(ty_of(&found, name), None, "`{name}` in `{pattern}`");
+            }
+        }
+    }
+
+    #[test]
+    fn a_closure_property_of_the_same_name_is_what_the_call_names() {
+        let preamble = "struct Store {}\nstruct Svc {}\n\
+             func makePair() -> (Store, Svc) { (Store(), Svc()) }\n";
+        let shadowed = [
+            "struct H { var makePair = { () -> (Svc, Store) in (Svc(), Store()) }\n\
+             func t() { let (store, svc) = makePair() } }",
+            "struct H { lazy var makePair = { () -> (Svc, Store) in (Svc(), Store()) }\n\
+             func t() { let (store, svc) = makePair() } }",
+            "struct H { var makePair: () -> (Svc, Store) = { (Svc(), Store()) }\n\
+             func t() { let (store, svc) = makePair() } }",
+            "struct H { let makePair: () -> (Svc, Store)\n\
+             func t() { let (store, svc) = makePair() } }",
+            "struct H { var makePair: () -> (Svc, Store) { { (Svc(), Store()) } }\n\
+             func t() { let (store, svc) = makePair() } }",
+            "struct H { static var makePair: () -> (Svc, Store) = { (Svc(), Store()) }\n\
+             static func t() { let (store, svc) = makePair() } }",
+            "struct H { func t() { let (store, svc) = makePair() } }\n\
+             extension H { var makePair: () -> (Svc, Store) { { (Svc(), Store()) } } }",
+            "struct H { var makePair: () -> (Svc, Store) = { (Svc(), Store()) }\n\
+             struct Inner { func t() { let (store, svc) = makePair() } } }",
+        ];
+        for body in shadowed {
+            let source = format!("{preamble}{body}");
+            let found = bound(&source, "t");
+            assert!(found.contains_key("store"), "{source}");
+            assert!(found.contains_key("svc"), "{source}");
+            assert_eq!(ty_of(&found, "store"), None, "{source}");
+            assert_eq!(ty_of(&found, "svc"), None, "{source}");
+        }
+        // A property of another name, or one on a type the call is not in,
+        // leaves the file-level function the only candidate.
+        let free = [
+            "struct H { var other: Int = 0\nfunc t() { let (store, svc) = makePair() } }",
+            "struct G { var makePair: () -> (Svc, Store) = { (Svc(), Store()) } }\n\
+             struct H { func t() { let (store, svc) = makePair() } }",
+        ];
+        for body in free {
+            let source = format!("{preamble}{body}");
+            let found = bound(&source, "t");
+            assert_eq!(ty_of(&found, "store").as_deref(), Some("Store"), "{source}");
+            assert_eq!(ty_of(&found, "svc").as_deref(), Some("Svc"), "{source}");
+        }
     }
 
     #[test]
