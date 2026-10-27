@@ -1374,3 +1374,51 @@ fn a_dangling_member_with_a_comment_or_a_non_ascii_word_stays_partial() {
         assert!(e.recovered_decl_ranges.is_empty(), "{source:?}");
     }
 }
+
+/// Follow-up 1, the side the rewrite cannot reach: the same `if` branch with no
+/// space before the last `}` has no room for a separator. The hidden token still
+/// makes the file Partial, so no consumer is told a lambda reading is Clean, and
+/// nothing is recorded as repaired.
+#[test]
+fn a_hidden_separator_with_no_room_for_a_semicolon_is_partial_not_clean() {
+    for source in [
+        "class A { fun f() = if (c) { a() } else { b() }}\nfun top() {}\n",
+        "class F { val v = if (c) { A() } else { B() }}\nfun top() {}\n",
+    ] {
+        let e = ex("A.kt", source);
+        let ParseOutcome::Partial { error_ranges, .. } = &e.parse_outcome else {
+            panic!("{source:?} reported {}", label(&e, source));
+        };
+        assert!(!error_ranges.is_empty(), "{source:?}");
+        assert!(e.recovered_decl_ranges.is_empty(), "{source:?}");
+        assert!(
+            note_of(&e).contains("not repaired"),
+            "{source:?}: {}",
+            note_of(&e)
+        );
+    }
+}
+
+/// Thousands of comments before the closing brace: the member-end test reads
+/// each sibling once and the scan ends, Clean or Partial, well inside a hard
+/// timeout. (A native sibling lookup per comment is what this guards.)
+#[test]
+fn thousands_of_comments_before_the_closing_brace_are_read_in_bounded_time() {
+    let comments = "/*c*/ ".repeat(5_000);
+    let source = format!("class A {{ val x = 1 {comments}}}\nfun top() {{}}\n");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let e = extract_file_with_budget("A.kt", &source, Duration::from_secs(60));
+        let _ = sender.send((
+            clean(&e),
+            matches!(e.parse_outcome, ParseOutcome::Failed { .. }),
+        ));
+    });
+    let (was_clean, failed) = receiver
+        .recv_timeout(Duration::from_secs(120))
+        .expect("the extraction did not finish inside the hard timeout");
+    assert!(
+        was_clean || !failed,
+        "a budget refusal means the scan was not bounded"
+    );
+}

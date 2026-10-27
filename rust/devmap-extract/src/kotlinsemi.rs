@@ -158,41 +158,31 @@ fn ends_a_member(before: &[u8]) -> bool {
     }
 }
 
-/// The end of the last node before `brace` that is not a comment: where the
-/// member the brace closes stops, however many comments sit between them.
-fn code_before(brace: Node) -> Option<usize> {
-    let mut previous = brace.prev_sibling();
-    while let Some(node) = previous {
-        if !node.kind().ends_with("comment") {
-            return Some(node.end_byte());
-        }
-        previous = node.prev_sibling();
-    }
-    None
-}
-
 /// The offsets of the spaces to write `;` over: one directly before each
 /// closing `}` that follows code on its line, in the top-level statements that
 /// hold an error, outside strings and comments.
 fn candidates(root: Node, text: &[u8], done: &[usize]) -> Result<Vec<usize>, String> {
     let mut found: Vec<usize> = Vec::new();
     let mut cursor = root.walk();
-    let mut stack: Vec<Node> = Vec::new();
+    // Each node waits with the end of the last sibling before it that is not a
+    // comment, read while its parent's children are pushed, so no ancestor or
+    // sibling lookup (the unbounded native parent walk) is made for it.
+    let mut stack: Vec<(Node, Option<usize>)> = Vec::new();
     if root.is_error() {
         // A tree whose root is itself the ERROR node (no `source_file` around
         // it) has the file's tokens as its direct children, and none of them
         // holds an error of its own, so the walk starts at the root.
-        stack.push(root);
+        stack.push((root, None));
     } else {
         let mut top = root.walk();
         for statement in root.children(&mut top) {
             if statement.is_error() || statement.has_error() {
-                stack.push(statement);
+                stack.push((statement, None));
             }
         }
     }
     let mut visited = 0u32;
-    while let Some(node) = stack.pop() {
+    while let Some((node, code_end)) = stack.pop() {
         visited += 1;
         if visited >= DEADLINE_CHECK_STRIDE {
             visited = 0;
@@ -213,7 +203,7 @@ fn candidates(root: Node, text: &[u8], done: &[usize]) -> Result<Vec<usize>, Str
                 // The member ends at the last node that is not a comment, and
                 // the brace shares its line: a brace that starts its line, or
                 // follows a comment on a line of its own, is already apart.
-                let mut end = code_before(node).map_or(0, |end| end.min(at));
+                let mut end = code_end.map_or(0, |end| end.min(at));
                 while end > 0 && matches!(text[end - 1], b' ' | b'\t') {
                     end -= 1;
                 }
@@ -229,8 +219,13 @@ fn candidates(root: Node, text: &[u8], done: &[usize]) -> Result<Vec<usize>, Str
         }
         cursor.reset(node);
         if cursor.goto_first_child() {
+            let mut code_end: Option<usize> = None;
             loop {
-                stack.push(cursor.node());
+                let child = cursor.node();
+                stack.push((child, code_end));
+                if !child.kind().ends_with("comment") {
+                    code_end = Some(child.end_byte());
+                }
                 if !cursor.goto_next_sibling() {
                     break;
                 }
