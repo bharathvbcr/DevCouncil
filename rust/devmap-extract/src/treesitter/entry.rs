@@ -517,8 +517,16 @@ pub(super) fn extract_treesitter_before_deadline(
                 let content_hash = content_hash(source);
 
                 let root = tree.root_node();
+                // Kotlin only: statements the grammar read as expressions,
+                // which parse without an error and so never reach the walk
+                // below that finds error nodes.
+                let lost = if lang == "kotlin" {
+                    crate::kotlinloss::detect(root, source)
+                } else {
+                    crate::kotlinloss::LostScan::default()
+                };
                 let parse_outcome =
-                    parse_outcome_of(root, source, is_metal_path(path), lang == "python");
+                    parse_outcome_of(root, source, is_metal_path(path), lang == "python", &lost);
 
                 let mut symbols = Vec::new();
                 let mut imports = Vec::new();
@@ -1090,13 +1098,32 @@ pub(crate) fn push_named_children<'tree>(node: Node<'tree>, worklist: &mut Vec<N
     }
 }
 
+/// The outcome of a parse: `Clean`, or `Partial` with the ranges that are not
+/// to be trusted.
+///
+/// `lost` is the Kotlin loss detector's answer (see [`crate::kotlinloss`]):
+/// statements the grammar read as an expression without reporting an error. Its
+/// regions are charged as error ranges, so a file that silently dropped a
+/// declaration is `Partial` and every consumer that already treats a partial
+/// parse as unable to prove absence does so here. It is applied in this one
+/// place so the answer has one owner. A detector that did not finish is not a
+/// detector that found nothing: a deadline fails the outcome as this walk's own
+/// deadline does, and a node cap charges the whole file.
 pub(super) fn parse_outcome_of(
     root: Node,
     source: &str,
     is_metal: bool,
     is_python: bool,
+    lost: &crate::kotlinloss::LostScan,
 ) -> ParseOutcome {
-    if !root.has_error() && !is_python {
+    if lost.deadline_passed {
+        return ParseOutcome::Failed {
+            reason: budget_refusal_reason(
+                "parse outcome validation exceeded the extraction budget".to_string(),
+            ),
+        };
+    }
+    if !root.has_error() && !is_python && lost.regions.is_empty() && !lost.capped {
         return ParseOutcome::Clean;
     }
     let mut error_ranges = Vec::new();
@@ -1154,6 +1181,17 @@ pub(super) fn parse_outcome_of(
                 }
             }
         }
+    }
+    if lost.capped {
+        error_ranges.push(TextRange {
+            start_byte: 0,
+            end_byte: source.len(),
+        });
+    }
+    if !lost.regions.is_empty() || lost.capped {
+        error_ranges.extend(lost.ranges());
+        error_ranges.sort_by_key(|range| (range.start_byte, range.end_byte));
+        error_ranges.dedup();
     }
     if error_ranges.is_empty() {
         ParseOutcome::Clean

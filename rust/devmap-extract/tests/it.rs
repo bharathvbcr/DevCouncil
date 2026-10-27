@@ -74,6 +74,8 @@ mod ignore_rule_tolerance;
 #[cfg(feature = "parse")]
 mod js_object_facts;
 #[cfg(feature = "parse")]
+mod kotlin_silent_loss;
+#[cfg(feature = "parse")]
 mod langcalls_erlang_pascal;
 #[cfg(feature = "parse")]
 mod langcalls_jvm_dotnet;

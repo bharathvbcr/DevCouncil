@@ -82,6 +82,11 @@ mod jsobjects;
 // tree; its one caller is `treesitter::extract_treesitter`.
 #[cfg(feature = "parse")]
 mod jvmfacts;
+// The Kotlin declarations the grammar reads as expressions: the loss detector
+// and the recovery. Walks a parse tree; its callers are in
+// `treesitter::extract_treesitter`.
+#[cfg(feature = "parse")]
+mod kotlinloss;
 // Python-only facts (dynamic dispatch). Walks a parse tree; its one caller is
 // `treesitter::extract_treesitter`.
 #[cfg(feature = "parse")]

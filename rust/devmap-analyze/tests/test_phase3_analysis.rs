@@ -108,6 +108,55 @@ fn test_x6_partial_error_range_symbol_is_exempt() {
     );
 }
 
+/// extract-v98 row 15. tree-sitter-kotlin-ng reads `@A @B private fun f() {}`
+/// as an expression and reports no error, so the file was `Clean` and `f` was
+/// not in the graph at all. The loss detector makes it `Partial`, and the
+/// swallowed statement is then charged exactly as any other partial parse is:
+/// listed with its region, counted, and denying the file a complete answer.
+/// Fails against `9ceef2dc`, where the file is `Clean` and nothing is charged.
+#[test]
+fn a_kotlin_declaration_the_grammar_swallowed_is_charged_like_any_partial_parse() {
+    let source = "private val X = 1\n@Preview\n@Composable\nprivate fun f() {}\nfun after() {}\n";
+    let ext = extract_file("A.kt", source);
+    assert!(
+        matches!(ext.parse_outcome, ParseOutcome::Partial { .. }),
+        "{:?}",
+        ext.parse_outcome
+    );
+    assert!(ext.symbols.iter().any(|symbol| symbol.name == "after"));
+    assert!(
+        !ext.symbols.iter().any(|symbol| symbol.name == "f"),
+        "the swallowed function is not a symbol: that is the loss being charged"
+    );
+
+    let listed: Vec<ExtractionGapEntry> = extraction_gaps(std::slice::from_ref(&ext))
+        .into_iter()
+        .filter(|entry| entry.gap == ExtractionGap::PartialParse)
+        .collect();
+    assert_eq!(listed.len(), 1, "the file is listed: {listed:?}");
+    assert!(
+        listed[0].reason.contains("charged")
+            && listed[0]
+                .reason
+                .contains("outside every surviving declaration"),
+        "the swallowed statement is a charged region: {}",
+        listed[0].reason
+    );
+    let start = source.find("@Preview").unwrap();
+    let end = source.find("fun after").unwrap() - 1;
+    assert!(
+        listed[0].reason.contains(&format!("{start}..{end}")),
+        "the region is named by its byte range {start}..{end}: {}",
+        listed[0].reason
+    );
+    let coverage = extraction_coverage(std::slice::from_ref(&ext));
+    assert_eq!(coverage.partial_parse_files, 1);
+    assert!(
+        !coverage.is_complete_for("kotlin"),
+        "a file that lost a declaration caps the Kotlin ceiling: {coverage:?}"
+    );
+}
+
 /// A symbol-scoped exemption must name the check that actually fired.
 ///
 /// The file-wide reason is the wrong answer here twice over: it is not why this
