@@ -1067,6 +1067,36 @@ fn compute(scope: Node, source: &str) -> Bindings {
         if node.kind() == "catch_block" {
             bind(&mut out, "error".to_string(), None);
         }
+        // A tuple pattern (`case let (a, _)`, `if case let (a, b) = p`) leaves its
+        // names bare. They bind like any other, so a parameter they hide is no
+        // longer the plain, once-bound type a receiver may be qualified by.
+        let tuple_names: Vec<String> = if node.kind() == "pattern"
+            && node.child_by_field_name("bound_identifier").is_none()
+            && named
+                .iter()
+                .filter(|child| child.kind() == "pattern")
+                .count()
+                >= 2
+        {
+            pattern_binding_names(node, source)
+        } else if matches!(
+            node.kind(),
+            "if_statement" | "guard_statement" | "while_statement"
+        ) {
+            // `if case let (a, _) = p` flattens the tuple into the statement's
+            // own conditions: one `pattern` per element.
+            named
+                .iter()
+                .filter(|child| child.kind() == "pattern")
+                .flat_map(|child| pattern_binding_names(*child, source))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for name in tuple_names {
+            hide_members(&mut out, &name);
+            out.entry(name).or_default().plain = false;
+        }
         named.reverse();
         for child in named {
             if child.kind() == "simple_identifier"
@@ -1554,8 +1584,12 @@ fn field_of_parent(node: Node) -> Option<&'static str> {
 
 fn for_statement(node: Node, source: &str, _bounds: &BTreeMap<String, String>, out: &mut Bindings) {
     let mut names = Vec::new();
+    // Only a loop variable that is one plain name takes the element type; each
+    // name of a tuple pattern is bound untyped.
+    let mut single = false;
     if let Some(item) = node.child_by_field_name("item") {
-        collect_bound(item, source, &mut names);
+        names = pattern_binding_names(item, source);
+        single = names.len() == 1 && item.child_by_field_name("bound_identifier").is_some();
     }
     let element = node
         .child_by_field_name("collection")
@@ -1566,7 +1600,6 @@ fn for_statement(node: Node, source: &str, _bounds: &BTreeMap<String, String>, o
                 .and_then(|t| t.strip_suffix(']'))
                 .map(str::to_string)
         });
-    let single = names.len() == 1;
     for name in names {
         bind(out, name, if single { element.clone() } else { None });
     }
@@ -3743,6 +3776,42 @@ mod tests {
         let found = bound(bare, "t");
         assert_eq!(ty_of(&found, "s"), None);
         assert_eq!(init_of(&found, "s").as_deref(), Some("snapshot"));
+    }
+
+    #[test]
+    fn a_tuple_pattern_that_rebinds_a_parameter_keeps_the_receiver_unqualified() {
+        let snap = "struct Snap {}\n\
+             struct Store { func snapshot(_ p: Int) -> Snap { Snap() } }\n";
+        let hidden = [
+            // A `for` over pairs binds `store` as the tuple's element.
+            "func t(_ store: Store, _ pairs: [(Store, Int)]) {\n\
+             for (store, n) in pairs { let s = store.snapshot(n) } }",
+            "func t(_ store: Store, _ pairs: [(Int, (Store, Int))]) {\n\
+             for (k, (store, n)) in pairs { let s = store.snapshot(n) } }",
+            // So does a tuple pattern in a condition.
+            "func t(_ store: Store, _ pair: (Store, Int)) {\n\
+             if case let (store, _) = pair { let s = store.snapshot(1) } }",
+            "func t(_ store: Store, _ pair: (Store, Int)) {\n\
+             switch pair { case let (store, _): let s = store.snapshot(1) } }",
+        ];
+        for body in hidden {
+            let found = bound(&format!("{snap}{body}"), "t");
+            assert!(found.contains_key("s"), "{body}");
+            assert_ne!(
+                init_of(&found, "s").as_deref(),
+                Some("Store.snapshot"),
+                "{body}"
+            );
+        }
+        // The same function with nothing rebinding `store` still qualifies.
+        let control = format!(
+            "{snap}func t(_ store: Store, _ pairs: [(Int, Int)]) {{\n\
+             for (k, n) in pairs {{ let s = store.snapshot(n) }} }}"
+        );
+        assert_eq!(
+            init_of(&bound(&control, "t"), "s").as_deref(),
+            Some("Store.snapshot")
+        );
     }
 
     #[test]
