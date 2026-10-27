@@ -341,6 +341,11 @@ CREATE TABLE nope (id INT
     ] {
         assert!(!names.contains(&absent), "invented {absent}: {names:?}");
     }
+    assert_exactly_what_the_grammar_emits(
+        source,
+        &extraction,
+        &["inner_fake", "dollar_fake", "nope"],
+    );
     assert_eq!(
         relation(&extraction, "Weird Name").qualified_name,
         "schema.sql::Weird Name"
@@ -428,6 +433,16 @@ CREATE TABLE nope_unclosed (id INT
     for absent in ["a", "Details", "Order"] {
         assert!(!names.contains(&absent), "invented {absent}: {names:?}");
     }
+    assert_exactly_what_the_grammar_emits(
+        source,
+        &extraction,
+        &[
+            "inside_fn",
+            "inside_block",
+            "inside_comment",
+            "nope_unclosed",
+        ],
+    );
     assert_eq!(relation(&extraction, "g").kind, SymbolKind::Function);
     for name in ["lower_case", "shown", "monthly", "events", "after_unicode"] {
         let symbol = relation(&extraction, name);
@@ -457,6 +472,23 @@ fn a_quoted_name_on_a_clean_statement_loses_the_quotes() {
 /// What the grammar alone says about `source`, before any recovery.
 fn grammar_only(source: &str) -> Extraction {
     devmap_extract::treesitter::extract_treesitter("recover.sql", "sql", source)
+}
+
+/// Each of `names` is a symbol of `extraction` exactly when the grammar alone
+/// emitted it. For text recovery chooses not to rule on, "not asserted" is not
+/// enough: recovery must neither add nor take away what the grammar read.
+fn assert_exactly_what_the_grammar_emits(source: &str, extraction: &Extraction, names: &[&str]) {
+    let grammar = grammar_only(source);
+    // Quotes are not part of the question: recovery unquotes names.
+    let from_grammar: Vec<&str> = declared(&grammar).into_iter().map(bare).collect();
+    let got: Vec<&str> = declared(extraction).into_iter().map(bare).collect();
+    for name in names {
+        assert_eq!(
+            got.contains(name),
+            from_grammar.contains(name),
+            "`{name}`: grammar alone {from_grammar:?}, after recovery {got:?}"
+        );
+    }
 }
 
 fn bare(name: &str) -> &str {
@@ -716,6 +748,110 @@ CREATE TABLE tail_open (id INT
         names.contains(&"tail_open"),
         "the unterminated tail keeps the grammar's output: {names:?}"
     );
+    assert_exactly_what_the_grammar_emits(source, &extraction, &["tail_open", "in_body"]);
+}
+
+/// The scan reads a string differently from the grammar: the grammar takes a
+/// backslash in `E'...'` as an escape, the scan used to take `\'` as one only
+/// before a letter. The `CREATE` it then found "inside" the string became a
+/// statement whose range covered the next real table, which was renamed to it.
+/// A rename is for the declaration that starts at the statement's own CREATE.
+#[test]
+fn a_statement_the_scan_invents_never_renames_a_real_table() {
+    let source =
+        "SELECT E'a\\' CREATE TABLE \"fake\" (id int) -- ';\nCREATE TABLE real_t (id int);\n";
+    let grammar = grammar_only(source);
+    assert_eq!(grammar.parse_outcome, ParseOutcome::Clean, "control");
+    assert_eq!(declared(&grammar), vec!["real_t"], "control");
+    let extraction = extract_file("renamed.sql", source);
+    assert_eq!(extraction.parse_outcome, ParseOutcome::Clean);
+    assert_eq!(declared(&extraction), vec!["real_t"]);
+    assert_eq!(
+        relation(&extraction, "real_t").qualified_name,
+        "renamed.sql::real_t"
+    );
+
+    // Nested comments: the grammar ends the comment at the first `*/`, the scan
+    // at the last. Whatever each reads, a real table keeps its name.
+    let nested = "\
+/* a /* b */ CREATE TABLE \"fake\" (id int); */
+CREATE TABLE real_t (id int CHECK(json_valid(id)));
+";
+    let extraction = extract_file("nested.sql", nested);
+    assert!(
+        declared(&extraction).contains(&"real_t"),
+        "{:?}",
+        declared(&extraction)
+    );
+    assert_exactly_what_the_grammar_emits(nested, &extraction, &["fake", "real_t"]);
+}
+
+/// T-SQL ends a batch with a line holding only `GO`. Without it a procedure
+/// body ran to the next `;`, and the tables after `GO` sat inside it.
+#[test]
+fn a_go_line_ends_the_statement_before_it() {
+    let plain = "\
+CREATE PROCEDURE p AS BEGIN SELECT 1 END
+GO
+CREATE TABLE dbo.Orders (id int) ON [PRIMARY]
+GO
+";
+    let extraction = extract_file("tsql.sql", plain);
+    assert!(
+        declared(&extraction).contains(&"Orders"),
+        "{:?}",
+        declared(&extraction)
+    );
+
+    // Partial: the table has the grammar's confined CHECK error, and a later
+    // `;` is what used to close the procedure's swallowed body.
+    let partial = "\
+CREATE PROCEDURE p AS BEGIN SELECT 1 END
+GO
+CREATE TABLE dbo.Orders (id int, x TEXT CHECK(json_valid(x))) ON [PRIMARY]
+GO
+CREATE TABLE after_go (id int);
+";
+    let grammar = grammar_only(partial);
+    assert!(
+        matches!(grammar.parse_outcome, ParseOutcome::Partial { .. }),
+        "control: {:?}",
+        grammar.parse_outcome
+    );
+    let extraction = extract_file("tsql.sql", partial);
+    let names = declared(&extraction);
+    for table in ["Orders", "after_go"] {
+        assert!(names.contains(&table), "missing {table}: {names:?}");
+    }
+}
+
+/// Postgres overloads share one quoted name. They are normalised together or
+/// not at all: one `f` and one `"f"` would leave the edges on a near-duplicate.
+#[test]
+fn quoted_overloads_are_unquoted_together() {
+    let source = "\
+CREATE FUNCTION \"f\"(int) RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;
+CREATE FUNCTION \"f\"(text) RETURNS int AS $$ SELECT 2 $$ LANGUAGE sql;
+";
+    let extraction = extract_file("overloads.sql", source);
+    let functions: Vec<&devmap_extract::model::ExtractedSymbol> = extraction
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.kind == SymbolKind::Function)
+        .collect();
+    assert_eq!(functions.len(), 2, "{:?}", declared(&extraction));
+    assert_eq!(functions[0].name, functions[1].name);
+    assert_eq!(functions[0].qualified_name, functions[1].qualified_name);
+    let qualified: std::collections::HashSet<&str> = extraction
+        .symbols
+        .iter()
+        .map(|symbol| symbol.qualified_name.as_str())
+        .collect();
+    for call in &extraction.calls {
+        if let Some(caller) = call.caller_symbol.as_deref() {
+            assert!(qualified.contains(caller), "dangling caller {caller}");
+        }
+    }
 }
 
 /// A scan that loses sync is evidence the scanner is wrong. Recovery stops at

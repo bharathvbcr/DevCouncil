@@ -28,6 +28,7 @@
 //! deadline and by caps, and a cap or deadline leaves the grammar's output
 //! exactly as it was.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -205,25 +206,32 @@ fn plan(
 #[derive(Default)]
 struct Names {
     renames: HashMap<String, String>,
-    held: HashMap<String, usize>,
+    held: HashMap<String, Vec<usize>>,
 }
 
 impl Names {
-    /// Another symbol than `index` holds `qualified`.
-    fn held_by_other(&self, qualified: &str, index: usize) -> bool {
+    /// A symbol outside `group` holds `qualified`.
+    fn held_outside(&self, qualified: &str, group: &[usize]) -> bool {
         self.held
             .get(qualified)
-            .is_some_and(|&holder| holder != index)
+            .is_some_and(|holders| holders.iter().any(|holder| !group.contains(holder)))
+    }
+
+    fn hold(&mut self, qualified: &str, index: usize) {
+        self.held
+            .entry(qualified.to_string())
+            .or_default()
+            .push(index);
     }
 
     fn moved(&mut self, index: usize, old: &str, new: &str) {
         if old == new {
             return;
         }
-        if self.held.get(old) == Some(&index) {
-            self.held.remove(old);
+        if let Some(holders) = self.held.get_mut(old) {
+            holders.retain(|holder| *holder != index);
         }
-        self.held.entry(new.to_string()).or_insert(index);
+        self.hold(new, index);
         self.renames
             .entry(old.to_string())
             .or_insert_with(|| new.to_string());
@@ -235,10 +243,7 @@ fn apply(extraction: &mut Extraction, plan: Plan, errors: &ErrorRanges) {
     let mut names = Names::default();
     let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
     for (index, symbol) in extraction.symbols.iter().enumerate() {
-        names
-            .held
-            .entry(symbol.qualified_name.clone())
-            .or_insert(index);
+        names.hold(&symbol.qualified_name, index);
         if symbol.kind != SymbolKind::File {
             by_name
                 .entry(bare_name(&symbol.name))
@@ -258,8 +263,12 @@ fn apply(extraction: &mut Extraction, plan: Plan, errors: &ErrorRanges) {
 /// The grammar's name node ends at the first quote or space inside a delimited
 /// identifier (`"a""b"` becomes `a`, `[Order Details]` becomes `Details`).
 /// The statement scan already read the identifier. Write that name onto the
-/// declaration that starts inside the statement. An undelimited name is the
-/// grammar's own to keep.
+/// declaration that starts at the statement's own `CREATE`, and only when the
+/// grammar's name is a fragment of the scanned one. A scan that reads a string
+/// or comment differently from the grammar can invent a statement whose range
+/// covers a real table; that table starts elsewhere, or is named something
+/// else, and keeps the grammar's name. An undelimited name is the grammar's own
+/// to keep.
 fn apply_scanned_names(
     extraction: &mut Extraction,
     relations: &[Statement],
@@ -275,16 +284,24 @@ fn apply_scanned_names(
         .collect();
     order.sort_by_key(|&index| extraction.symbols[index].span.start_byte);
     for statement in relations.iter().filter(|statement| statement.delimited) {
-        let at = order
+        let first = order
             .partition_point(|&index| extraction.symbols[index].span.start_byte < statement.start);
-        let Some(&index) = order.get(at) else {
-            continue;
-        };
-        if extraction.symbols[index].span.start_byte >= statement.end {
-            continue;
+        let anchored = order[first..]
+            .iter()
+            .copied()
+            .take_while(|&index| extraction.symbols[index].span.start_byte == statement.start)
+            .find(|&index| is_fragment_of(&extraction.symbols[index].name, &statement.name));
+        if let Some(index) = anchored {
+            set_name(&mut extraction.symbols, index, &statement.name, file, names);
         }
-        set_name(&mut extraction.symbols, index, &statement.name, file, names);
     }
+}
+
+/// The grammar's (possibly quoted, possibly cut short) name is part of the
+/// scanned name.
+fn is_fragment_of(grammar_name: &str, scanned: &str) -> bool {
+    let bare = bare_name(grammar_name);
+    !bare.is_empty() && scanned.contains(&bare)
 }
 
 struct Statement {
@@ -406,7 +423,7 @@ fn install_symbol(
         overlaps(symbol.span.start_byte, symbol.span.end_byte, start, end)
     });
     if let Some(index) = overlapping {
-        if names.held_by_other(&desired.qualified_name, index) {
+        if names.held_outside(&desired.qualified_name, &[index]) {
             return;
         }
         let existing = &mut extraction.symbols[index];
@@ -424,11 +441,11 @@ fn install_symbol(
         symbol.span.start_byte == desired.span.start_byte
             && symbol.span.end_byte == desired.span.end_byte
     });
-    if duplicate || names.held.contains_key(&desired.qualified_name) {
+    if duplicate || names.held_outside(&desired.qualified_name, &[]) {
         return;
     }
     let index = extraction.symbols.len();
-    names.held.insert(desired.qualified_name.clone(), index);
+    names.hold(&desired.qualified_name, index);
     by_name.entry(key).or_default().push(index);
     extraction.symbols.push(desired);
 }
@@ -482,6 +499,7 @@ fn scan(source: &str, backslash: bool, deadline: Instant) -> Result<Scan, Abando
     // MySQL's `DELIMITER $$` changes what ends a statement until the next
     // `DELIMITER`. It is a client directive, not SQL.
     let mut delimiter = ";";
+    let timed_out = Cell::new(false);
     while i < bytes.len() {
         steps += 1;
         if steps % DEADLINE_STRIDE == 0 && past(deadline) {
@@ -490,6 +508,8 @@ fn scan(source: &str, backslash: bool, deadline: Instant) -> Result<Scan, Abando
         let ctx = Ctx {
             backslash,
             delimiter,
+            deadline,
+            timed_out: &timed_out,
         };
         match eat_noise(source, i, ctx) {
             Eat::Unclosed => {
@@ -512,6 +532,13 @@ fn scan(source: &str, backslash: bool, deadline: Instant) -> Result<Scan, Abando
             i += 1;
             continue;
         }
+        if paren == 0 {
+            if let Some(next) = go_line(source, i) {
+                block = 0;
+                i = next;
+                continue;
+            }
+        }
         if paren == 0 && block == 0 {
             if let Some((token, next)) = delimiter_directive(source, i) {
                 delimiter = token;
@@ -527,7 +554,11 @@ fn scan(source: &str, backslash: bool, deadline: Instant) -> Result<Scan, Abando
             }
         }
         if paren == 0 && block == 0 && keyword(source, i, "CREATE") {
-            match classify(source, i, ctx) {
+            let classified = classify(source, i, ctx);
+            if timed_out.get() {
+                return Err(Abandon::Deadline);
+            }
+            match classified {
                 Classified::Relation(statement) => {
                     if relations.len() >= MAX_STATEMENTS {
                         return Err(Abandon::Cap("relation statement"));
@@ -566,6 +597,10 @@ fn scan(source: &str, backslash: bool, deadline: Instant) -> Result<Scan, Abando
 struct Ctx<'a> {
     backslash: bool,
     delimiter: &'a str,
+    /// The file's deadline, read inside a long statement. `timed_out` records
+    /// that it was hit, since the reader answers `None` either way.
+    deadline: Instant,
+    timed_out: &'a Cell<bool>,
 }
 
 impl Ctx<'_> {
@@ -579,15 +614,37 @@ impl Ctx<'_> {
     }
 }
 
+/// T-SQL's batch separator: a line holding only `GO`, with an optional repeat
+/// count. It ends the batch whatever is open, so it ends a statement. Returns
+/// the byte after the line.
+fn go_line(source: &str, i: usize) -> Option<usize> {
+    if !keyword(source, i, "GO") || !at_line_start(source, i) {
+        return None;
+    }
+    let line_end = source[i..]
+        .find('\n')
+        .map_or(source.len(), |offset| i + offset);
+    let rest = source[i + "GO".len()..line_end].trim();
+    rest.bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then_some((line_end + 1).min(source.len()))
+}
+
+/// Only blanks stand between `i` and the start of its line. Walks back over the
+/// blanks, not the line, so many `#` or `GO` on one long line cost nothing.
+fn at_line_start(source: &str, i: usize) -> bool {
+    let bytes = source.as_bytes();
+    let mut at = i;
+    while at > 0 && matches!(bytes[at - 1], b' ' | b'\t' | b'\r') {
+        at -= 1;
+    }
+    at == 0 || bytes[at - 1] == b'\n'
+}
+
 /// A `DELIMITER <token>` line at the start of a line: the token and the byte
 /// after the line.
 fn delimiter_directive(source: &str, i: usize) -> Option<(&str, usize)> {
-    if !keyword(source, i, "DELIMITER")
-        || !source[..i]
-            .rsplit('\n')
-            .next()
-            .is_some_and(|line| line.trim().is_empty())
-    {
+    if !keyword(source, i, "DELIMITER") || !at_line_start(source, i) {
         return None;
     }
     let line_end = source[i..]
@@ -892,9 +949,15 @@ fn statement_end(source: &str, start: usize, ctx: Ctx) -> Option<(usize, bool)> 
     let bytes = source.as_bytes();
     let custom = ctx.custom_delimiter();
     let mut i = start;
+    let mut steps = 0usize;
     let mut paren = 0i32;
     let mut block = 0i32;
     while i < bytes.len() {
+        steps += 1;
+        if steps % DEADLINE_STRIDE == 0 && past(ctx.deadline) {
+            ctx.timed_out.set(true);
+            return None;
+        }
         match eat_noise(source, i, ctx) {
             Eat::Unclosed => return None,
             Eat::Ate(next) if next > i => {
@@ -905,6 +968,11 @@ fn statement_end(source: &str, start: usize, ctx: Ctx) -> Option<(usize, bool)> 
         }
         if custom && source[i..].starts_with(ctx.delimiter) {
             return Some((i + ctx.delimiter.len(), true));
+        }
+        // A `GO` line ends a T-SQL batch, and so the statement before it.
+        if paren == 0 && go_line(source, i).is_some() {
+            let end = source[start..i].trim_end().len() + start;
+            return (end > start).then_some((end, true));
         }
         match bytes[i] {
             b'(' => {
@@ -1171,10 +1239,7 @@ fn starts_hash_comment(source: &str, i: usize) -> bool {
     let bytes = source.as_bytes();
     match bytes.get(i + 1) {
         Some(b'>' | b'=') => false,
-        Some(next) if is_ident_start(*next) => source[..i]
-            .rsplit('\n')
-            .next()
-            .is_some_and(|line| line.trim().is_empty()),
+        Some(next) if is_ident_start(*next) => at_line_start(source, i),
         _ => true,
     }
 }
@@ -1211,6 +1276,9 @@ fn eat_string(source: &str, i: usize, backslash: bool) -> Option<Eat> {
         return None;
     }
     let mut quote_at = i;
+    // `E'...'` is an escape string: the grammar reads a backslash in it as an
+    // escape whatever the rest of the file does.
+    let mut escape_string = false;
     if matches!(
         bytes[i],
         b'N' | b'n' | b'X' | b'x' | b'E' | b'e' | b'B' | b'b'
@@ -1219,6 +1287,7 @@ fn eat_string(source: &str, i: usize, backslash: bool) -> Option<Eat> {
         && bytes[i + 1] == b'\''
     {
         quote_at = i + 1;
+        escape_string = matches!(bytes[i], b'E' | b'e');
     } else if (bytes[i] == b'U' || bytes[i] == b'u')
         && (i == 0 || !is_ident_continue(bytes[i - 1]))
         && source[i + 1..].starts_with("&'")
@@ -1233,7 +1302,12 @@ fn eat_string(source: &str, i: usize, backslash: bool) -> Option<Eat> {
     // charge. Inside a statement both still hide semicolons, which is what
     // this eater is for. At the header, `read_ident` runs before the body
     // scan, so consuming the name as noise there never happens.
-    Some(quoted_span(source, quote_at, quote, backslash))
+    Some(quoted_span(
+        source,
+        quote_at,
+        quote,
+        backslash || escape_string,
+    ))
 }
 
 /// A `\'` in the middle of a word (`'O\'Brien'`) cannot end a standard string:
@@ -1360,23 +1434,35 @@ fn unquote(name: &str) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
+/// Strip the quotes off every quoted name. Symbols that share one qualified
+/// name (the overloads `"f"(int)` and `"f"(text)`) are one group: they all
+/// take the unquoted name, or none of them does, so no edge is moved onto a
+/// symbol that is only one of them.
 fn normalize_quoted_names(extraction: &mut Extraction, file: &str, names: &mut Names) {
-    for index in 0..extraction.symbols.len() {
-        let symbol = &extraction.symbols[index];
-        if symbol.kind == SymbolKind::File {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut group_of: HashMap<(String, String), usize> = HashMap::new();
+    for (index, symbol) in extraction.symbols.iter().enumerate() {
+        if symbol.kind == SymbolKind::File || unquote(&symbol.name).is_none() {
             continue;
         }
+        let key = (symbol.qualified_name.clone(), symbol.name.clone());
+        match group_of.get(&key) {
+            Some(&group) => groups[group].push(index),
+            None => {
+                group_of.insert(key, groups.len());
+                groups.push(vec![index]);
+            }
+        }
+    }
+    for group in groups {
+        let symbol = &extraction.symbols[group[0]];
         let Some(bare) = unquote(&symbol.name) else {
             continue;
         };
-        set_name(&mut extraction.symbols, index, &bare, file, names);
+        rename_group(&mut extraction.symbols, &group, &bare, file, names);
     }
 }
 
-/// Give a symbol a new name and record the qualified name it left, so the
-/// edges that named it can follow. A qualified name another symbol already
-/// holds is never taken: the symbol keeps the grammar's name. The first rename
-/// of a qualified name wins.
 fn set_name(
     symbols: &mut [ExtractedSymbol],
     index: usize,
@@ -1384,18 +1470,37 @@ fn set_name(
     file: &str,
     names: &mut Names,
 ) {
-    let symbol = &mut symbols[index];
-    if symbol.name == name {
+    rename_group(symbols, &[index], name, file, names);
+}
+
+/// Give symbols that share a name and a qualified name a new name, and record
+/// the qualified name they left so the edges that named them can follow. A
+/// qualified name a symbol outside the group already holds is never taken: the
+/// whole group keeps the grammar's name. The first rename of a qualified name
+/// wins.
+fn rename_group(
+    symbols: &mut [ExtractedSymbol],
+    group: &[usize],
+    name: &str,
+    file: &str,
+    names: &mut Names,
+) {
+    let Some(&lead) = group.first() else {
+        return;
+    };
+    if symbols[lead].name == name {
         return;
     }
-    let old_qualified = symbol.qualified_name.clone();
-    let new_qualified = renamed(&old_qualified, &symbol.name, name, file);
-    if names.held_by_other(&new_qualified, index) {
+    let old_qualified = symbols[lead].qualified_name.clone();
+    let new_qualified = renamed(&old_qualified, &symbols[lead].name, name, file);
+    if names.held_outside(&new_qualified, group) {
         return;
     }
-    symbol.qualified_name = new_qualified;
-    symbol.name = name.to_string();
-    names.moved(index, &old_qualified, &symbol.qualified_name);
+    for &index in group {
+        symbols[index].qualified_name = new_qualified.clone();
+        symbols[index].name = name.to_string();
+        names.moved(index, &old_qualified, &new_qualified);
+    }
 }
 
 /// Replace the `::{old_name}` component. A bare `strip_suffix(old_name)` would
@@ -1595,14 +1700,19 @@ CREATE TABLE work_events (id INT CHECK(json_valid(id)));
         assert!(!ErrorRanges::default().overlaps(0, usize::MAX));
     }
 
-    const SEMI: Ctx<'static> = Ctx {
-        backslash: false,
-        delimiter: ";",
-    };
+    fn with_ctx<R>(delimiter: &str, run: impl FnOnce(Ctx) -> R) -> R {
+        let timed_out = Cell::new(false);
+        run(Ctx {
+            backslash: false,
+            delimiter,
+            deadline: far(),
+            timed_out: &timed_out,
+        })
+    }
 
     #[test]
     fn the_end_of_the_file_ends_a_statement_only_when_nothing_is_open() {
-        let end = |text: &str| statement_end(text, 0, SEMI);
+        let end = |text: &str| with_ctx(";", |ctx| statement_end(text, 0, ctx));
         assert_eq!(end("CREATE TABLE a(id int)"), Some((22, false)));
         assert_eq!(end("CREATE TABLE a(id int)  \n"), Some((22, false)));
         assert_eq!(end("CREATE TABLE a(id int);"), Some((23, true)));
@@ -1620,15 +1730,56 @@ CREATE TABLE work_events (id INT CHECK(json_valid(id)));
         let source = "DELIMITER $$\nCREATE PROCEDURE p() BEGIN SELECT 1; END$$\nDELIMITER ;\n";
         let (token, next) = delimiter_directive(source, 0).expect("directive");
         assert_eq!((token, next), ("$$", 13));
-        let ctx = Ctx {
-            backslash: false,
-            delimiter: "$$",
-        };
         let create = source.find("CREATE").unwrap();
-        let (end, closed) = statement_end(source, create, ctx).unwrap();
+        let (end, closed) = with_ctx("$$", |ctx| statement_end(source, create, ctx)).unwrap();
         assert!(closed);
         assert_eq!(&source[end - 5..end], "END$$");
         assert!(delimiter_directive("  x DELIMITER $$\n", 4).is_none());
+    }
+
+    #[test]
+    fn a_go_line_ends_a_batch_and_a_hash_scan_costs_nothing_per_hash() {
+        assert_eq!(go_line("GO\nx", 0), Some(3));
+        assert_eq!(go_line("  go 5 \nx", 2), Some(8));
+        assert!(go_line("GOTO x\n", 0).is_none());
+        assert!(go_line("x GO\n", 2).is_none());
+        assert!(go_line("GO x\n", 0).is_none());
+        let source = "CREATE PROCEDURE p AS BEGIN SELECT 1 END\nGO\nCREATE TABLE t (id int)\n";
+        let (end, closed) = with_ctx(";", |ctx| statement_end(source, 0, ctx)).unwrap();
+        assert!(closed);
+        assert_eq!(&source[..end], "CREATE PROCEDURE p AS BEGIN SELECT 1 END");
+        // A `GO` alone on a line inside parentheses is a column, not a batch end.
+        let table = "CREATE TABLE t (\n go\n INT)\n";
+        assert_eq!(
+            with_ctx(";", |ctx| statement_end(table, 0, ctx)),
+            Some((table.trim_end().len(), false))
+        );
+        let long = format!("{}x", "a #".repeat(50_000));
+        assert!(!at_line_start(&long, 2));
+        let timed_out = Cell::new(false);
+        let expired = Ctx {
+            backslash: false,
+            delimiter: ";",
+            deadline: Instant::now(),
+            timed_out: &timed_out,
+        };
+        let big = format!("CREATE TABLE t ({})", "a INT, ".repeat(4096));
+        assert_eq!(statement_end(&big, 0, expired), None);
+        assert!(
+            timed_out.get(),
+            "the deadline is checked inside a statement"
+        );
+    }
+
+    #[test]
+    fn an_e_string_always_escapes_a_backslash() {
+        let source = "E'a\\' CREATE TABLE \"fake\" (id int) -- ';\nCREATE TABLE real_t (id int);";
+        let eaten = eat_string(source, 0, false);
+        assert!(matches!(eaten, Some(Eat::Ate(end)) if source[..end].ends_with("-- '")));
+        // An ordinary string is not: the backslash is a literal and the second
+        // quote ends it.
+        let plain = "'a\\' CREATE";
+        assert!(matches!(eat_string(plain, 0, false), Some(Eat::Ate(4))));
     }
 
     #[test]
