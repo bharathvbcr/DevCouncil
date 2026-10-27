@@ -26,8 +26,14 @@
 //! tree of the failed parse, which still holds them, outside strings and
 //! comments. They are not all visible to the
 //! first parse (a nested `}` hides inside the ERROR until the outer one is
-//! fixed), so the rewrite repeats, at most [`MAX_PASSES`] times, each pass over
-//! the top-level statements that still hold an error.
+//! fixed), so the rewrite repeats, each pass over the top-level statements that
+//! still hold an error. Every pass that goes on has written at least one
+//! separator no earlier pass wrote, and the total is capped at [`MAX_EDITS`], so
+//! the loop ends after at most `MAX_EDITS + 1` parses whatever the file is: the
+//! cost is the number of sites the grammar hides one at a time (a file of ten
+//! sibling one-liners takes ten parses), not a fixed pass count that a plain
+//! file can exceed. The file deadline bounds each parse and the scan between
+//! them.
 //!
 //! The result is accepted **only if the re-parse is fully clean**. Anything
 //! else, including a deadline, leaves the file exactly as it was: `Partial`.
@@ -44,9 +50,6 @@ use tree_sitter::{Node, Parser, Tree};
 
 use crate::model::TextRange;
 use crate::treesitter::{bounded_parent, parse_until, walk_deadline_passed, DEADLINE_CHECK_STRIDE};
-
-/// Parses after the first one. Each pass reveals the `}` the previous ERROR hid.
-pub(crate) const MAX_PASSES: usize = 6;
 
 /// Separators written per file. A file that wants more is not rewritten.
 pub(crate) const MAX_EDITS: usize = 512;
@@ -71,7 +74,7 @@ pub(crate) fn repair(parser: &mut Parser, tree: Tree, source: &str, deadline: In
     let mut text = source.as_bytes().to_vec();
     let mut edited: Vec<usize> = Vec::new();
     let mut current = tree.clone();
-    for pass in 0..=MAX_PASSES {
+    loop {
         if !current.root_node().has_error() {
             let ranges = touched(&current, &edited);
             return Repair::Repaired {
@@ -79,9 +82,6 @@ pub(crate) fn repair(parser: &mut Parser, tree: Tree, source: &str, deadline: In
                 ranges,
                 edits: edited.len(),
             };
-        }
-        if pass == MAX_PASSES {
-            break;
         }
         let fresh = match candidates(current.root_node(), &text, &edited) {
             Ok(fresh) => fresh,
@@ -119,10 +119,6 @@ pub(crate) fn repair(parser: &mut Parser, tree: Tree, source: &str, deadline: In
                 }
             }
         }
-    }
-    Repair::Unchanged {
-        tree,
-        why: format!("still an error after {MAX_PASSES} rewrites"),
     }
 }
 

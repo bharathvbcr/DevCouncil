@@ -767,10 +767,9 @@ fn announced(e: &Extraction, at: usize) -> bool {
 }
 
 /// BREAK (MEDIUM, false Partial). Each pass of the rewrite reveals one more
-/// sibling one-line class, so `MAX_PASSES = 6` is reached by seven plain
+/// sibling one-line class, so a fixed six-pass limit was reached by seven plain
 /// one-line classes, not by an exotic shape. The multi-line twin is Clean.
 #[test]
-#[ignore = "follow-up 3, fixed in its own commit"]
 fn followup3_seven_sibling_one_line_classes_are_repaired() {
     let mut failures = Vec::new();
     for n in [6usize, 7, 8, 10] {
@@ -1212,5 +1211,31 @@ fn a_stray_brace_after_an_annotated_one_line_class_is_still_charged() {
             .any(|r| r.start_byte <= stray && stray < r.end_byte.max(r.start_byte + 1)),
         "no error range covers the stray brace: {}",
         label(&e, &source)
+    );
+}
+
+/// Follow-up 3 keeps true: sibling one-liners the grammar hides one at a time
+/// are all repaired, the result equals the multi-line twin on every table, and
+/// the file that wants more separators than the cap is Partial, with nothing
+/// recovered, never a half-repaired Clean.
+#[test]
+fn many_sibling_one_liners_equal_their_twin_and_the_cap_stays_partial() {
+    for n in [7usize, 40, 200] {
+        let (one, twin) = (many_classes(n, true), many_classes(n, false));
+        let (a, b) = (ex("A.kt", &one), ex("A.kt", &twin));
+        assert!(clean(&b), "twin of {n}: {}", label(&b, &twin));
+        assert!(clean(&a), "{n}: {} ({})", label(&a, &one), note_of(&a));
+        assert!(!a.recovered_decl_ranges.is_empty(), "{n}");
+        let diffs = table_diffs(&a, &b);
+        assert!(diffs.is_empty(), "{n}: {}", diffs.join("\n"));
+    }
+    let over = many_classes(513, true);
+    let e = ex("A.kt", &over);
+    assert!(!clean(&e), "{}", label(&e, &over));
+    assert!(e.recovered_decl_ranges.is_empty());
+    assert!(
+        note_of(&e).contains("separators would be written"),
+        "{}",
+        note_of(&e)
     );
 }
