@@ -562,3 +562,20 @@ fn a_genuine_error_is_not_cleared_by_recovering_a_statement_beside_it() {
         .iter()
         .any(|symbol| symbol.qualified_name == "E.kt::f"));
 }
+
+/// A comment between the colons and `class` does not make a class literal a
+/// lost declaration.
+#[test]
+fn a_comment_between_the_colons_and_class_is_not_a_lost_declaration() {
+    for source in [
+        "val a = String:: /* c */ class\nval b = 1\n",
+        "val a = String::\n// c\nclass\nval b = 1\n",
+    ] {
+        let extraction = extract_file("A.kt", source);
+        assert!(
+            matches!(extraction.parse_outcome, ParseOutcome::Clean),
+            "{source:?}: {:?}",
+            extraction.parse_outcome
+        );
+    }
+}

@@ -197,8 +197,16 @@ pub(crate) fn detect_capped(root: Node, source: &str, cap: usize) -> LostScan {
 /// Whether `node` is the member of a callable or class reference: the `class`
 /// of `String::class`.
 fn follows_double_colon(node: Node) -> bool {
-    node.prev_sibling()
-        .is_some_and(|before| before.kind() == "::")
+    // A comment between the colons and the word (`String:: /* c */ class`) is a
+    // sibling too, and says nothing about what the word is.
+    let mut before = node.prev_sibling();
+    while let Some(sibling) = before {
+        if !sibling.kind().ends_with("comment") {
+            return sibling.kind() == "::";
+        }
+        before = sibling.prev_sibling();
+    }
+    false
 }
 
 /// File the region a keyword `identifier` sits in.
