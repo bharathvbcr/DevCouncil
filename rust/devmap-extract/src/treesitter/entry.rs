@@ -1071,6 +1071,9 @@ pub(super) fn extract_treesitter_before_deadline(
                 extraction
                     .diagnostics
                     .extend(take_swift_unspelled_operator_notes());
+                extraction
+                    .diagnostics
+                    .extend(take_swift_bare_cast_member_notes());
                 #[cfg(test)]
                 EXTRACTION_FINISH_HOOK.with(|hook| {
                     if let Some(finish) = hook.take() {

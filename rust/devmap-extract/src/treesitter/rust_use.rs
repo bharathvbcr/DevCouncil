@@ -26,7 +26,10 @@ pub(crate) fn rust_type_name(node: Node, source: &str, depth: usize) -> Option<S
         "type_identifier" | "scoped_type_identifier" => {
             let text = get_node_text(node, source);
             let bare = text.rsplit("::").next().unwrap_or(&text);
+            // ` a::b::{c};` is a struct expression whose name is `a::b::` and a
+            // MISSING type: no name at all, which is `None`, not an empty one.
             Some(bare.split('<').next().unwrap_or(bare).trim().to_string())
+                .filter(|name| !name.is_empty())
         }
         _ => None,
     }

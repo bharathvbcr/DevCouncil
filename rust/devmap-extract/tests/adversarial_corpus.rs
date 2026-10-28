@@ -269,8 +269,7 @@ const NO_GRAMMAR: &[(&str, &str)] = &[
         "no tree-sitter-vb grammar is linked (treesitter/tests.rs and cache.rs pin it as unavailable)",
     ),
 ];
-const KNOWN_EMPTY: &[(&str, &str, &str)] =
-    &[("rust", "triggers/path_brace_list.rs", "ft-bce92fa0")];
+const KNOWN_EMPTY: &[(&str, &str, &str)] = &[];
 
 fn testdata_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
