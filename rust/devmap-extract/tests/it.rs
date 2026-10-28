@@ -39,6 +39,8 @@ mod attack_kotlin_followups;
 #[cfg(feature = "parse")]
 mod attack_sql_ddl;
 #[cfg(feature = "parse")]
+mod attack2_recovery_residue;
+#[cfg(feature = "parse")]
 mod attack_recovery_residue;
 #[cfg(feature = "parse")]
 mod attack_swift_empty_name;
