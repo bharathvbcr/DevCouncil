@@ -34,17 +34,17 @@ type attackOutcome struct {
 
 func attackRun(t *testing.T, root, id string, planned ...dc.PlannedFile) attackOutcome {
 	t.Helper()
-	changed, diff, empty, err := verify.CollectGitState(context.Background(), root)
+	state, err := verify.CollectGitStateReport(context.Background(), root)
 	if err != nil {
 		return attackOutcome{refused: err}
 	}
 	in := verify.Input{
 		Task:     &store.Task{ID: id, Difficulty: "easy", PlannedFiles: planned},
-		GateMode: "enforce", ChangedFiles: changed, DiffContent: diff, DiffEmpty: empty,
-		WorkPresent: !empty, Rigor: dcverify.New(testsupport.DCVerify(t), root),
+		GateMode: "enforce", Rigor: dcverify.New(testsupport.DCVerify(t), root),
 	}
+	in.WithGitState(state)
 	gaps, meta := verify.Run(context.Background(), in)
-	return attackOutcome{empty: empty, diff: diff, gaps: gaps, result: verify.ToMCP(id, gaps, meta)}
+	return attackOutcome{empty: state.Empty, diff: state.Diff, gaps: gaps, result: verify.ToMCP(id, gaps, meta)}
 }
 
 // requireLooked fails unless the change was refused, or the run found the
@@ -571,9 +571,9 @@ func TestAttackRenameThatGainsASecretIsScanned(t *testing.T) {
 
 // .devmap and .devcouncil are excluded from the changed set and from the diff
 // as "tool-owned state". A credential written there is a byte the change
-// introduced, committed with the rest.
+// introduced, committed with the rest. Owner decision (2026-10-28): tool state
+// is secret-scanned, tracked files and untracked files git does not ignore.
 func TestAttackSecretUnderToolStateDirIsNotInvisible(t *testing.T) {
-	t.Skip("owner decision pending on ft-926e5b45: whether tool-state directories are secret-scanned")
 	key := exampleAWSKey()
 	root := gitRepo(t)
 	writeFile(t, root, ".devmap/notes/keys.txt", attackSecretLine())

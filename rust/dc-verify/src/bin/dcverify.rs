@@ -244,7 +244,36 @@ fn check(
 
     let scope = classify_scope(&files, planned);
     let mut findings = scan_secrets(&files);
-    let stubs = detect_stubs_report(&files, &|file| read_post_image(root, &file.path));
+    // Why each changed source was not available, which the closure cannot say
+    // through `Option`: a modified source is read from disk here, and `None`
+    // alone would leave a file the tree never saw looking like one with nothing
+    // to check. One list and one loop below route every cause the same way.
+    let misses = std::cell::RefCell::new(Vec::<(String, dc_verify::stub_ast::Unparsed)>::new());
+    let mut stubs = detect_stubs_report(&files, &|file| match read_post_image(root, &file.path) {
+        Ok(text) => Some(text),
+        Err(why) => {
+            // A deleted file has no source to read, a file with no added lines
+            // has nothing the tree could have found in it, and a path that is
+            // not in a language the tree parses never had one: none of them is
+            // a degradation. (A deletion is asked for here all the same, by the
+            // library's own post-image step.)
+            if file.status != dc_verify::ChangeStatus::Deleted
+                && !file.added_lines.is_empty()
+                && dc_verify::stub_ast::Lang::for_path(&file.path).is_some()
+            {
+                misses.borrow_mut().push((file.path.clone(), why));
+            }
+            None
+        }
+    });
+    for (path, why) in misses.into_inner() {
+        if !stubs.unparsed.iter().any(|u| u.path == path) {
+            stubs.unparsed.push(dc_verify::rigor::UnparsedFile {
+                path,
+                reason: why.as_str(),
+            });
+        }
+    }
     findings.extend(stubs.findings);
     // A binary marker with no hunk carries none of the file's bytes. A text
     // hunk elsewhere in the same diff does not make that path scanned.
@@ -554,7 +583,7 @@ fn binary_sections_without_hunks(diff: &str) -> Vec<usize> {
 fn lstat_within(
     root: &std::path::Path,
     rel: &std::path::Path,
-) -> Result<(std::path::PathBuf, std::fs::Metadata), String> {
+) -> Result<(std::path::PathBuf, std::fs::Metadata), LstatError> {
     use std::path::Component;
     let mut current = root.to_path_buf();
     let mut last: Option<std::fs::Metadata> = None;
@@ -563,19 +592,60 @@ fn lstat_within(
         match component {
             Component::CurDir => continue,
             Component::Normal(part) => current.push(part),
-            _ => return Err("path escapes the working tree".to_string()),
+            _ => return Err(LstatError::Escapes),
         }
-        let meta = std::fs::symlink_metadata(&current).map_err(|e| format!("cannot read: {e}"))?;
+        let meta = std::fs::symlink_metadata(&current).map_err(LstatError::Io)?;
         if meta.file_type().is_symlink() {
-            return Err("refusing to follow a symlink".to_string());
+            return Err(LstatError::Symlink);
         }
         if components.peek().is_some() && !meta.is_dir() {
-            return Err("a parent of the path is not a directory".to_string());
+            return Err(LstatError::ParentNotDirectory);
         }
         last = Some(meta);
     }
-    last.map(|meta| (current, meta))
-        .ok_or_else(|| "path escapes the working tree".to_string())
+    last.map(|meta| (current, meta)).ok_or(LstatError::Escapes)
+}
+
+/// Why [`lstat_within`] refused a path. Typed so a caller can say which, and so
+/// the messages the binary-path reader has always printed stay in one place.
+#[derive(Debug)]
+enum LstatError {
+    /// The path is empty, absolute, or climbs out of the root.
+    Escapes,
+    /// A component is a symlink, which is never followed.
+    Symlink,
+    /// A component before the last is not a directory.
+    ParentNotDirectory,
+    /// The metadata read failed: the file is not there, or cannot be seen.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for LstatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LstatError::Escapes => f.write_str("path escapes the working tree"),
+            LstatError::Symlink => f.write_str("refusing to follow a symlink"),
+            LstatError::ParentNotDirectory => {
+                f.write_str("a parent of the path is not a directory")
+            }
+            LstatError::Io(e) => write!(f, "cannot read: {e}"),
+        }
+    }
+}
+
+impl LstatError {
+    /// The reason a changed source could not be read, for the report.
+    fn unparsed(&self) -> dc_verify::stub_ast::Unparsed {
+        use dc_verify::stub_ast::Unparsed;
+        match self {
+            LstatError::Escapes | LstatError::Symlink => Unparsed::OutsideRoot,
+            LstatError::ParentNotDirectory => Unparsed::SourceMissing,
+            LstatError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Unparsed::SourceMissing
+            }
+            LstatError::Io(_) => Unparsed::ReadError,
+        }
+    }
 }
 
 /// Working-tree bytes of a binary path, or why they could not be scanned.
@@ -591,7 +661,7 @@ fn read_binary_post_image(root: Option<&std::path::Path>, path: &str) -> Result<
         return Err("path escapes the working tree".to_string());
     }
     let rel = std::path::Path::new(path);
-    let (full, meta) = lstat_within(root, rel)?;
+    let (full, meta) = lstat_within(root, rel).map_err(|e| e.to_string())?;
     if !meta.is_file() {
         return Err("not a regular file".to_string());
     }
@@ -609,7 +679,7 @@ fn read_binary_post_image(root: Option<&std::path::Path>, path: &str) -> Result<
     }
     // The walk above is the open we refused to follow a link through. Repeat it
     // before believing the bytes, in case a component was replaced with a link.
-    let (_, again) = lstat_within(root, rel)?;
+    let (_, again) = lstat_within(root, rel).map_err(|e| e.to_string())?;
     if !again.is_file() {
         return Err("refusing to follow a symlink".to_string());
     }
@@ -619,28 +689,35 @@ fn read_binary_post_image(root: Option<&std::path::Path>, path: &str) -> Result<
 /// Reads a changed file as it stands in the working tree under `root`, for
 /// the AST stub checks.
 ///
-/// `None` sends the file to the substring checks; it is never a clean answer.
-/// The path comes from a diff, so it is refused unless it is relative, stays
-/// inside `root` and passes through no symlink, and the read is bounded.
-/// `detect_stubs_with` then believes the content only if the diff's added lines
-/// are where the diff says they are.
-fn read_post_image(root: Option<&std::path::Path>, path: &str) -> Option<String> {
+/// An error sends the file to the substring checks and names why the tree never
+/// saw it; it is never a clean answer. The path comes from a diff, so it is
+/// refused unless it is relative, stays inside `root` and passes through no
+/// symlink, and the read is bounded. `detect_stubs_with` then believes the
+/// content only if the diff's added lines are where the diff says they are.
+fn read_post_image(
+    root: Option<&std::path::Path>,
+    path: &str,
+) -> Result<String, dc_verify::stub_ast::Unparsed> {
+    use dc_verify::stub_ast::{MAX_SOURCE_BYTES, Unparsed};
     use std::io::Read as _;
-    let root = root?;
-    let (full, meta) = lstat_within(root, std::path::Path::new(path)).ok()?;
-    if !meta.is_file() || meta.len() > dc_verify::stub_ast::MAX_SOURCE_BYTES as u64 {
-        return None;
+    let root = root.ok_or(Unparsed::NoRoot)?;
+    let (full, meta) = lstat_within(root, std::path::Path::new(path)).map_err(|e| e.unparsed())?;
+    if !meta.is_file() {
+        return Err(Unparsed::NotRegular);
+    }
+    if meta.len() > MAX_SOURCE_BYTES as u64 {
+        return Err(Unparsed::TooLarge);
     }
     let mut bytes = Vec::new();
     std::fs::File::open(&full)
-        .ok()?
-        .take(dc_verify::stub_ast::MAX_SOURCE_BYTES as u64 + 1)
+        .map_err(|_| Unparsed::ReadError)?
+        .take(MAX_SOURCE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() > dc_verify::stub_ast::MAX_SOURCE_BYTES {
-        return None;
+        .map_err(|_| Unparsed::ReadError)?;
+    if bytes.len() > MAX_SOURCE_BYTES {
+        return Err(Unparsed::TooLarge);
     }
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Renders the substance measurement.

@@ -145,7 +145,11 @@ func (s *GitSession) repositoryConfig(ctx context.Context) (*repositoryConfig, e
 // every config file:
 //
 //   - before the subcommand: core.fsmonitor=false, core.hooksPath at the null
-//     device (no hook can be found there), log.showSignature=false;
+//     device (no hook can be found there), log.showSignature=false,
+//     core.useReplaceRefs=false. A `git replace` ref rewrites history at read
+//     time, and the repository under analysis can carry one: a commit that adds
+//     a credential, replaced by a clean twin, is read as the twin by every
+//     diff, log and show unless replace refs are switched off;
 //   - after diff, log or show: --no-ext-diff --no-textconv --no-color;
 //   - after blame: --no-textconv;
 //   - after diff and status: --ignore-submodules=dirty. Asked whether a
@@ -171,6 +175,7 @@ func GitArgs(args []string) []string {
 		"-c", "core.fsmonitor=false",
 		"-c", "core.hooksPath="+os.DevNull,
 		"-c", "log.showSignature=false",
+		"-c", "core.useReplaceRefs=false",
 	)
 	i, _ := splitSubcommand(args)
 	out = append(out, args[:i]...)

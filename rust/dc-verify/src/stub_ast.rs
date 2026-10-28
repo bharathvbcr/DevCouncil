@@ -26,7 +26,7 @@
 //! tree, but "this test checks nothing" is not, because the body may call a
 //! helper that asserts.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use tree_sitter::{Language, Node, Parser};
 
@@ -119,6 +119,30 @@ pub enum Unparsed {
     OverBudget,
     /// The tree has syntax errors, so a construct in it could be misread.
     SyntaxError,
+    /// A macro this file uses is imported from another file, so the tree it
+    /// parsed cannot say whether that macro is a stub.
+    UnresolvedMacroImport,
+    /// A macro imported from another file, or an alias of a std stub macro, is
+    /// called inside the token tree of another macro, which the tree does not
+    /// parse into invocations.
+    AliasInTokenTree,
+    /// The alias walk was cut off at its cap, so the aliases it found are not
+    /// all of them.
+    AliasWalkBudget,
+    /// No working-tree root was given, so the file's source was never looked for.
+    NoRoot,
+    /// The path leaves the working tree or runs through a symlink, so the source
+    /// is not read.
+    OutsideRoot,
+    /// The file the diff changed is not in the working tree.
+    SourceMissing,
+    /// The path is not a regular file (a directory, a FIFO, a device).
+    NotRegular,
+    /// The file exists and could not be read.
+    ReadError,
+    /// The source does not hold the added lines where the diff says they are, so
+    /// the working tree has moved on since the diff was taken.
+    SourceStale,
 }
 
 impl Unparsed {
@@ -129,6 +153,17 @@ impl Unparsed {
             Unparsed::NoTree => "parser produced no tree",
             Unparsed::OverBudget => "parse exceeded its time budget",
             Unparsed::SyntaxError => "syntax error",
+            Unparsed::UnresolvedMacroImport => {
+                "macro imported from another file could not be resolved"
+            }
+            Unparsed::AliasInTokenTree => "alias-in-token-tree",
+            Unparsed::AliasWalkBudget => "alias-walk-budget",
+            Unparsed::NoRoot => "source not read: no working-tree root",
+            Unparsed::OutsideRoot => "source not read: path outside the working tree",
+            Unparsed::SourceMissing => "source not read: file missing",
+            Unparsed::NotRegular => "source not read: not a regular file",
+            Unparsed::ReadError => "source not read: unreadable",
+            Unparsed::SourceStale => "source does not match the diff",
         }
     }
 }
@@ -158,6 +193,39 @@ pub fn analyze_within(
     source: &str,
     added: &HashSet<u32>,
     budget: std::time::Duration,
+) -> Result<Vec<AstFinding>, Unparsed> {
+    analyze_capped(
+        lang,
+        source,
+        added,
+        budget,
+        MAX_SCOPE_CHECKS,
+        &mut Steps::default(),
+    )
+}
+
+/// What one analysis spent on the two bounded pre-passes, for a test to assert
+/// on in place of a wall clock: a count is the same on a loaded machine and an
+/// idle one. Never part of any output.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Steps {
+    /// Nodes and leaves the alias walk visited (see `resolve_aliases`).
+    alias_visits: usize,
+    /// Scopes examined answering "is this macro defined here" (see `defined_at`).
+    scope_checks: usize,
+    /// A scope-check question found the cap spent.
+    scope_checks_exhausted: bool,
+}
+
+/// [`analyze_within`] with the per-file scope-check cap as a parameter, so a
+/// test can lower it, and `steps` filled in with what the pre-passes spent.
+fn analyze_capped(
+    lang: Lang,
+    source: &str,
+    added: &HashSet<u32>,
+    budget: std::time::Duration,
+    scope_checks: usize,
+    steps: &mut Steps,
 ) -> Result<Vec<AstFinding>, Unparsed> {
     if source.len() > MAX_SOURCE_BYTES {
         return Err(Unparsed::TooLarge);
@@ -201,10 +269,21 @@ pub fn analyze_within(
     if root.has_error() {
         return Err(Unparsed::SyntaxError);
     }
+    // The imports are read before the walk: the walk visits a call site before
+    // a `use` that comes after it, and a `use` in a function or an inline
+    // module names the macro for the whole file as far as this scan goes.
+    let imports = if lang == Lang::Rust {
+        RustImports::collect(root, source.as_bytes(), added, scope_checks)
+    } else {
+        RustImports::default()
+    };
     let mut walker = Walker {
         lang,
         src: source.as_bytes(),
         added,
+        imports: &imports,
+        unresolved: false,
+        token_tree: false,
         out: Vec::new(),
     };
     let mut stack = vec![root];
@@ -212,6 +291,26 @@ pub fn analyze_within(
         walker.visit(node);
         let mut cursor = node.walk();
         stack.extend(node.named_children(&mut cursor));
+    }
+    *steps = Steps {
+        alias_visits: imports.alias_visits,
+        scope_checks: imports.scope_checks_spent.get(),
+        scope_checks_exhausted: imports.scope_checks_exhausted.get(),
+    };
+    // What the tree proved wins. Only a file with nothing blocking in it is
+    // degraded for a macro it could not read, so a degraded file is never also
+    // one the scan already refused.
+    let blocked = walker.out.iter().any(|f| f.severity == Severity::Blocking);
+    if !blocked {
+        if imports.over_budget || imports.scope_checks_exhausted.get() {
+            return Err(Unparsed::AliasWalkBudget);
+        }
+        if walker.unresolved || imports.unresolved {
+            return Err(Unparsed::UnresolvedMacroImport);
+        }
+        if walker.token_tree {
+            return Err(Unparsed::AliasInTokenTree);
+        }
     }
     walker
         .out
@@ -224,7 +323,569 @@ struct Walker<'a> {
     lang: Lang,
     src: &'a [u8],
     added: &'a HashSet<u32>,
+    imports: &'a RustImports,
+    /// An added invocation named a macro this file imports from another file.
+    unresolved: bool,
+    /// An added line calls such a macro from inside another macro's token tree.
+    token_tree: bool,
     out: Vec<AstFinding>,
+}
+
+/// The crates whose `todo!`, `unimplemented!` and `panic!` are the stubs.
+const STD_ROOTS: [&str; 3] = ["std", "core", "alloc"];
+/// The macros an alias can stand for.
+const STUB_MACROS: [&str; 3] = ["todo", "unimplemented", "panic"];
+/// Bounds on one `use` tree, so a hostile file cannot make the pre-pass cost
+/// more than the parse did. A tree past either is degraded, never half read.
+const MAX_USE_DEPTH: usize = 32;
+const MAX_USE_SEGMENTS: usize = 256;
+
+/// A name as it is written, without the `r#` of a raw identifier.
+fn strip_raw(name: &str) -> &str {
+    name.strip_prefix("r#").unwrap_or(name)
+}
+
+fn node_name(node: Node<'_>, src: &[u8]) -> String {
+    strip_raw(node.utf8_text(src).unwrap_or("")).to_string()
+}
+
+/// The segments of a path node, leading `::` dropped and `r#` stripped:
+/// `::core::r#todo` is `["core", "todo"]`.
+fn path_segments(mut node: Node<'_>, src: &[u8]) -> Vec<String> {
+    let mut reversed = Vec::new();
+    loop {
+        if node.kind() == "scoped_identifier" {
+            if let Some(name) = node.child_by_field_name("name") {
+                reversed.push(node_name(name, src));
+            }
+            match node.child_by_field_name("path") {
+                Some(path) => node = path,
+                None => break,
+            }
+        } else {
+            reversed.push(node_name(node, src));
+            break;
+        }
+    }
+    reversed.reverse();
+    reversed
+}
+
+/// One leaf of a `use` tree, or an `extern crate x as y;`: the path it imports
+/// and the name it binds.
+struct UseRecord {
+    path: Vec<String>,
+    alias: String,
+    added: bool,
+    public: bool,
+}
+
+impl UseRecord {
+    /// The path with a leading `self` dropped: `use self::t as u` and
+    /// `use t as u` name the same item.
+    fn relative(&self) -> &[String] {
+        match self.path.split_first() {
+            Some((first, rest)) if first == "self" => rest,
+            _ => &self.path,
+        }
+    }
+}
+
+/// The `macro_rules!` of one file, indexed for the question "is a macro called
+/// `name` in textual scope at byte `at`".
+///
+/// A macro is visible from its end to the end of the block, module body or file
+/// it is written in. Those scopes nest or are disjoint, so the distinct ones
+/// form a tree; each scope keeps, per name, the end of its earliest definition
+/// (the earliest is the only one that can matter). A question is then answered
+/// by walking the scopes that hold `at` from the inside out, which is as deep
+/// as the nesting and not as many as the definitions.
+#[derive(Default)]
+struct MacroScopes {
+    /// Distinct scopes, by start ascending then end descending.
+    scopes: Vec<std::ops::Range<usize>>,
+    /// The scope each one is nested in.
+    parent: Vec<Option<usize>>,
+    /// Name, then scope, to the end of the earliest definition in that scope.
+    earliest_end: HashMap<String, HashMap<usize, usize>>,
+}
+
+impl MacroScopes {
+    fn build(defs: Vec<(String, std::ops::Range<usize>, usize)>) -> Self {
+        let mut scopes: Vec<std::ops::Range<usize>> =
+            defs.iter().map(|(_, scope, _)| scope.clone()).collect();
+        scopes.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+        scopes.dedup();
+        let mut parent = Vec::with_capacity(scopes.len());
+        let mut open: Vec<usize> = Vec::new();
+        for (index, scope) in scopes.iter().enumerate() {
+            while open.last().is_some_and(|top| scopes[*top].end < scope.end) {
+                open.pop();
+            }
+            parent.push(open.last().copied());
+            open.push(index);
+        }
+        let mut earliest_end: HashMap<String, HashMap<usize, usize>> = HashMap::new();
+        for (name, scope, end) in defs {
+            // Every definition's scope was indexed above, so this always
+            // finds it; a definition it could not find would only leave its
+            // alias in force.
+            let Ok(index) =
+                scopes.binary_search_by(|s| s.start.cmp(&scope.start).then(scope.end.cmp(&s.end)))
+            else {
+                continue;
+            };
+            let slot = earliest_end
+                .entry(name)
+                .or_default()
+                .entry(index)
+                .or_insert(end);
+            *slot = (*slot).min(end);
+        }
+        Self {
+            scopes,
+            parent,
+            earliest_end,
+        }
+    }
+
+    fn defines(&self, name: &str) -> bool {
+        self.earliest_end.contains_key(name)
+    }
+
+    /// Where the walk outward from `at` starts: the last scope that starts at
+    /// or before `at`. If it ends before `at` the scope holding `at` (if any)
+    /// is one it is nested in, so the walk reaches it through `parent`. `None`
+    /// when no indexed scope starts that early.
+    fn innermost_candidate(&self, at: usize) -> Option<usize> {
+        self.scopes
+            .partition_point(|s| s.start <= at)
+            .checked_sub(1)
+    }
+}
+
+/// A cap on the `use` leaves one file is resolved from, and on the nodes the
+/// resolution visits. A file past either is degraded, never half resolved.
+const MAX_USE_RECORDS: usize = 50_000;
+const MAX_ALIAS_VISITS: usize = 500_000;
+/// A cap on the scopes examined answering "is this macro defined here" over one
+/// file, summed over every invocation. A file past it is degraded, and the
+/// question that hit the cap is answered "not defined", so an alias stays in
+/// force: a hostile file can cost this scan at most this many checks.
+const MAX_SCOPE_CHECKS: usize = 1_000_000;
+
+/// What the `use` declarations, `extern crate`s, `mod x;` and `macro_rules!` of
+/// one Rust file say about the macros its invocations name.
+#[derive(Default)]
+struct RustImports {
+    /// An alias of a std stub macro: the name it binds, and the macro it is.
+    aliases: HashMap<String, &'static str>,
+    /// `std`, `core`, `alloc` and every name `use` or `extern crate` binds to
+    /// one of them (`use std as s;`).
+    roots: HashSet<String>,
+    /// Lowercased names of the aliases of `todo!` and `unimplemented!`, which
+    /// the token-tree lexer looks for beside the macros' own names.
+    token_names: HashSet<String>,
+    /// Names imported from `crate`, `super`, `self` or a module this file
+    /// declares with `mod x;`, which is another file.
+    local_names: HashSet<String>,
+    local_mods: HashSet<String>,
+    /// Macros this file defines, by name. A macro's body is scanned where it
+    /// stands, so a call it resolves to is not another file's.
+    macro_defs: MacroScopes,
+    /// An added aliased `pub use` of std's `todo!` or `unimplemented!` makes
+    /// the alias callable from files this scan is not reading, or a `use` tree
+    /// was too large to read in full.
+    unresolved: bool,
+    /// The alias walk was cut off at a cap, so the aliases it found are not all.
+    over_budget: bool,
+    /// The scope-check cap for this file, and how much of it the invocations
+    /// have spent. A query that finds the cap spent sets `scope_checks_exhausted`.
+    scope_check_cap: usize,
+    scope_checks_spent: std::cell::Cell<usize>,
+    /// Visits the alias walk made, for [`Steps`].
+    alias_visits: usize,
+    scope_checks_exhausted: std::cell::Cell<bool>,
+}
+
+/// What a name the resolver has learnt stands for.
+enum Learnt {
+    /// `std`, `core`, `alloc`, or a name bound to one of them.
+    Root,
+    /// A name bound to a std stub macro.
+    Stub(&'static str),
+}
+
+/// How far up a name's binding may move: `panic` is the weakest stub, and
+/// `todo` and `unimplemented` are equal, so the first of them to bind a name
+/// keeps it.
+fn stub_rank(stub: &str) -> u8 {
+    if stub == "panic" { 1 } else { 2 }
+}
+
+/// The macro among [`STUB_MACROS`] that `name` is.
+fn stub_macro(name: &str) -> Option<&'static str> {
+    STUB_MACROS.iter().copied().find(|m| *m == name)
+}
+
+impl RustImports {
+    /// Reads the file's imports in one pass over the tree and one indexed walk
+    /// over the `use` leaves, each leaf visited once per name that triggers it.
+    fn collect(root: Node<'_>, src: &[u8], added: &HashSet<u32>, scope_check_cap: usize) -> Self {
+        let mut records = Vec::new();
+        let mut defs = Vec::new();
+        let mut out = RustImports {
+            scope_check_cap,
+            ..RustImports::default()
+        };
+        // A walk over the named nodes, one at a time: every kind matched below
+        // is a named node, so the anonymous punctuation need not be collected.
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if records.len() > MAX_USE_RECORDS {
+                out.over_budget = true;
+                return out;
+            }
+            match node.kind() {
+                "use_declaration" => {
+                    let mut cursor = node.walk();
+                    let public = node
+                        .named_children(&mut cursor)
+                        .any(|c| c.kind() == "visibility_modifier");
+                    if let Some(argument) = node.child_by_field_name("argument") {
+                        out.unresolved |= collect_use(argument, public, src, added, &mut records);
+                    }
+                }
+                "extern_crate_declaration" => {
+                    if let (Some(name), Some(alias)) = (
+                        node.child_by_field_name("name"),
+                        node.child_by_field_name("alias"),
+                    ) {
+                        records.push(UseRecord {
+                            path: vec![node_name(name, src)],
+                            alias: node_name(alias, src),
+                            added: added.contains(&line_of(node)),
+                            public: false,
+                        });
+                    }
+                }
+                "macro_definition" if !is_cfg_gated(node, src) => {
+                    if let Some(name) = node.child_by_field_name("name") {
+                        defs.push((node_name(name, src), scope_of(node), node.end_byte()));
+                    }
+                }
+                "mod_item" if node.child_by_field_name("body").is_none() => {
+                    if let Some(name) = node.child_by_field_name("name") {
+                        out.local_mods.insert(node_name(name, src));
+                    }
+                }
+                _ => {}
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        out.macro_defs = MacroScopes::build(defs);
+        if records.len() > MAX_USE_RECORDS {
+            out.over_budget = true;
+            return out;
+        }
+        out.alias_visits = out.resolve_aliases(&records, MAX_ALIAS_VISITS);
+        for record in &records {
+            let local = record.path.first().is_some_and(|root| {
+                matches!(root.as_str(), "crate" | "super" | "self") || out.local_mods.contains(root)
+            });
+            if local && record.alias != "_" {
+                out.local_names.insert(record.alias.clone());
+            }
+            if record.public
+                && record.added
+                && record.alias != "_"
+                && matches!(out.stub_of(record), Some("todo" | "unimplemented"))
+                && record.path.last() != Some(&record.alias)
+            {
+                out.unresolved = true;
+            }
+        }
+        out.token_names = out
+            .aliases
+            .iter()
+            .filter(|(_, stub)| **stub != "panic")
+            .map(|(name, _)| name.clone())
+            .collect();
+        out
+    }
+
+    /// Binds every name that comes to stand for a std stub macro.
+    ///
+    /// The leaves are indexed by the first segment of their path, and a name is
+    /// looked up once per thing it is learnt to be: `use std as s; use s::todo
+    /// as t; use self::t as u;` is three lookups however the declarations are
+    /// ordered, where a pass over all leaves per round was quadratic in a
+    /// reverse chain.
+    ///
+    /// A name's binding only moves up ([`stub_rank`]: none, then `panic`, then
+    /// `todo` or `unimplemented`, where a second stub keeps the first), so it
+    /// changes at most twice and each `(name, what it is)` is queued once. A
+    /// binding that could flip back and forth re-queued the name on every flip,
+    /// and every re-queue visited every leaf under it. What is counted against
+    /// `max_visits` is each name taken from the queue and each leaf looked at,
+    /// so the cap bounds the work itself and not just the number of pops. The
+    /// number of visits made is returned.
+    fn resolve_aliases(&mut self, records: &[UseRecord], max_visits: usize) -> usize {
+        let mut by_first: HashMap<&str, Vec<&UseRecord>> = HashMap::new();
+        for record in records {
+            if let Some(first) = record.relative().first() {
+                by_first.entry(first.as_str()).or_default().push(record);
+            }
+        }
+        self.roots = STD_ROOTS.iter().map(|r| (*r).to_string()).collect();
+        let mut queued: HashSet<(String, Option<&'static str>)> = HashSet::new();
+        let mut queue: Vec<(String, Learnt)> = Vec::new();
+        for root in STD_ROOTS {
+            if queued.insert(((*root).to_string(), None)) {
+                queue.push(((*root).to_string(), Learnt::Root));
+            }
+        }
+        let mut visits = 0usize;
+        while let Some((name, learnt)) = queue.pop() {
+            visits += 1;
+            if visits > max_visits {
+                self.over_budget = true;
+                return visits;
+            }
+            let Some(leaves) = by_first.get(name.as_str()) else {
+                continue;
+            };
+            for record in leaves {
+                visits += 1;
+                if visits > max_visits {
+                    self.over_budget = true;
+                    return visits;
+                }
+                if record.alias == "_" {
+                    continue;
+                }
+                let relative = record.relative();
+                let bound = match learnt {
+                    Learnt::Root if relative.len() == 1 => {
+                        if self.roots.insert(record.alias.clone())
+                            && queued.insert((record.alias.clone(), None))
+                        {
+                            queue.push((record.alias.clone(), Learnt::Root));
+                        }
+                        None
+                    }
+                    Learnt::Root => relative.last().and_then(|last| stub_macro(last)),
+                    Learnt::Stub(stub) if relative.len() == 1 => Some(stub),
+                    Learnt::Stub(_) => None,
+                };
+                if let Some(stub) = bound
+                    && self
+                        .aliases
+                        .get(&record.alias)
+                        .is_none_or(|have| stub_rank(stub) > stub_rank(have))
+                {
+                    self.aliases.insert(record.alias.clone(), stub);
+                    if queued.insert((record.alias.clone(), Some(stub))) {
+                        queue.push((record.alias.clone(), Learnt::Stub(stub)));
+                    }
+                }
+            }
+        }
+        visits
+    }
+
+    /// The std macro a leaf re-exports, however it reaches it: a std path, a
+    /// name already bound to one, or such a name through `crate::` or `super::`.
+    fn stub_of(&self, record: &UseRecord) -> Option<&'static str> {
+        match record.relative() {
+            [only] => self.aliases.get(only).copied(),
+            [first, last] if matches!(first.as_str(), "crate" | "super") => {
+                self.aliases.get(last).copied()
+            }
+            [first, .., last] if self.roots.contains(first) => stub_macro(last),
+            _ => None,
+        }
+    }
+
+    /// Whether a `macro_rules!` called `name` is visible at byte `at`: written
+    /// in a block, module or file that holds `at`, and before it. Textual scope
+    /// ends with the module, so a macro in `mod tests` hides nothing outside it.
+    ///
+    /// Each scope examined spends one of the file's [`MAX_SCOPE_CHECKS`]. When
+    /// they are spent this answers `false` (the alias stays in force) and
+    /// records that the file is to be degraded.
+    fn defined_at(&self, name: &str, at: usize) -> bool {
+        let Some(by_scope) = self.macro_defs.earliest_end.get(name) else {
+            return false;
+        };
+        let mut scope = self.macro_defs.innermost_candidate(at);
+        while let Some(index) = scope {
+            if !self.spend_scope_check() {
+                return false;
+            }
+            if self.macro_defs.scopes[index].end > at
+                && by_scope.get(&index).is_some_and(|end| *end <= at)
+            {
+                return true;
+            }
+            scope = self.macro_defs.parent[index];
+        }
+        false
+    }
+
+    /// Spends one scope check, or reports that none are left.
+    fn spend_scope_check(&self) -> bool {
+        let spent = self.scope_checks_spent.get();
+        if spent >= self.scope_check_cap {
+            self.scope_checks_exhausted.set(true);
+            return false;
+        }
+        self.scope_checks_spent.set(spent + 1);
+        true
+    }
+
+    /// The std macro the name written at byte `at` is an alias of, unless a
+    /// `macro_rules!` of that name is in scope there.
+    fn alias_at(&self, name: &str, at: usize) -> Option<&'static str> {
+        self.aliases
+            .get(name)
+            .copied()
+            .filter(|_| !self.defined_at(name, at))
+    }
+
+    /// Whether the invocation named by `segments` at byte `at` is a macro of
+    /// another file of the crate: a name imported from `crate`, `super`, `self`
+    /// or a `mod x;` module, or a path through one. A macro this file defines is
+    /// read from its own body and is not that.
+    fn is_from_elsewhere(&self, segments: &[String], at: usize) -> bool {
+        match segments {
+            [only] => self.local_names.contains(only) && !self.defined_at(only, at),
+            [first, .., last] => {
+                (matches!(first.as_str(), "crate" | "super" | "self")
+                    || self.local_mods.contains(first))
+                    && !self.macro_defs.defines(last)
+            }
+            [] => false,
+        }
+    }
+}
+
+/// Whether a `#[cfg(..)]` or `#[cfg_attr(..)]` stands on `node`. The attributes
+/// are preceding siblings of the item, with doc comments allowed between them.
+///
+/// Such a `macro_rules!` may be compiled out, and then the name is the std alias.
+/// Registering it would let a definition that no build contains shadow that
+/// alias, so it is not registered: the alias stays in force, and some build
+/// compiles the stub it names.
+fn is_cfg_gated(node: Node<'_>, src: &[u8]) -> bool {
+    let mut at = node.prev_named_sibling();
+    while let Some(prev) = at {
+        if prev.kind() == "attribute_item" {
+            let name = prev
+                .named_child(0)
+                .and_then(|attribute| attribute.named_child(0))
+                .map(|first| node_name(first, src));
+            if matches!(name.as_deref(), Some("cfg" | "cfg_attr")) {
+                return true;
+            }
+        } else if !is_comment(prev) {
+            return false;
+        }
+        at = prev.prev_named_sibling();
+    }
+    false
+}
+
+/// The byte range of the block, module body or file that `node` is written in.
+fn scope_of(node: Node<'_>) -> std::ops::Range<usize> {
+    let mut at = node.parent();
+    while let Some(parent) = at {
+        if matches!(parent.kind(), "declaration_list" | "block" | "source_file") {
+            return parent.start_byte()..parent.end_byte();
+        }
+        at = parent.parent();
+    }
+    0..usize::MAX
+}
+
+/// Flattens one `use` argument into leaves. Returns whether the tree was too
+/// large to read in full.
+fn collect_use(
+    argument: Node<'_>,
+    public: bool,
+    src: &[u8],
+    added: &HashSet<u32>,
+    out: &mut Vec<UseRecord>,
+) -> bool {
+    let mut too_large = false;
+    let mut stack = vec![(argument, Vec::<String>::new(), 0usize)];
+    while let Some((node, prefix, depth)) = stack.pop() {
+        if depth > MAX_USE_DEPTH {
+            too_large = true;
+            continue;
+        }
+        // A leaf's own path is `self` for `use a::{self as b}`, which names the
+        // prefix, not a segment called `self`.
+        let leaf_path = |path: Node<'_>| {
+            let mut full = prefix.clone();
+            if path.kind() != "self" {
+                full.extend(path_segments(path, src));
+            }
+            full
+        };
+        let mut record = |path: Vec<String>, alias: String| {
+            out.push(UseRecord {
+                path,
+                alias,
+                added: added.contains(&line_of(node)),
+                public,
+            });
+        };
+        match node.kind() {
+            "use_as_clause" => {
+                let (Some(path), Some(alias)) = (
+                    node.child_by_field_name("path"),
+                    node.child_by_field_name("alias"),
+                ) else {
+                    continue;
+                };
+                let full = leaf_path(path);
+                if full.len() > MAX_USE_SEGMENTS {
+                    too_large = true;
+                    continue;
+                }
+                record(full, node_name(alias, src));
+            }
+            "scoped_use_list" | "use_list" => {
+                let mut next = prefix.clone();
+                if let Some(path) = node.child_by_field_name("path") {
+                    next.extend(path_segments(path, src));
+                }
+                if next.len() > MAX_USE_SEGMENTS {
+                    too_large = true;
+                    continue;
+                }
+                let list = node.child_by_field_name("list").unwrap_or(node);
+                let mut cursor = list.walk();
+                for child in list.named_children(&mut cursor) {
+                    stack.push((child, next.clone(), depth + 1));
+                }
+            }
+            "identifier" | "crate" | "super" | "self" | "scoped_identifier" | "metavariable" => {
+                let full = leaf_path(node);
+                if full.len() > MAX_USE_SEGMENTS {
+                    too_large = true;
+                    continue;
+                }
+                if let Some(last) = full.last().cloned() {
+                    record(full, last);
+                }
+            }
+            _ => {}
+        }
+    }
+    too_large
 }
 
 fn line_of(node: Node<'_>) -> u32 {
@@ -254,8 +915,87 @@ fn contains_marker(text: &str) -> bool {
     STUB_MARKERS.iter().any(|m| lowered.contains(m))
 }
 
-/// The first line, counted from 0 within `text`, that `accept` allows and that
-/// holds `todo!` or `unimplemented!` in code position.
+/// One macro invocation the lexer saw in a token tree: the path it names and
+/// where it starts.
+struct MacroCall {
+    /// The segments of the path, leading `::` dropped and `r#` stripped.
+    segments: Vec<String>,
+    /// Byte offset of the path's first segment within the text.
+    offset: usize,
+    /// Line of it, counted from 0 within the text.
+    line: usize,
+}
+
+/// The most segments the lexer keeps for one invocation's path. A longer path is
+/// still read to its end, so that the invocation is seen and judged like a short
+/// one (it used to be dropped, and a stub reached through 64 `super::` hops
+/// scanned clean), but the segments past the cap are not kept: the path is its
+/// first segments and its last, which is what every consumer reads (the first
+/// says where it starts, the last names the macro). A hostile `a::a::a::…`
+/// still costs no more than the text it is written in.
+const MAX_CALL_PATH_SEGMENTS: usize = 64;
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+}
+
+/// Whether the identifier at `at` is the tail of a path: `::` comes before it,
+/// and an identifier before that. A leading `::` is not.
+fn follows_path_separator(bytes: &[u8], at: usize) -> bool {
+    let back = |mut i: usize| {
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        i
+    };
+    let colons = back(at);
+    if colons < 2 || &bytes[colons - 2..colons] != b"::" {
+        return false;
+    }
+    let before = back(colons - 2);
+    before > 0 && is_ident_byte(bytes[before - 1])
+}
+
+/// The invocation whose path begins at `start`, or `None` when what follows is
+/// not a path and then `!` and an opening delimiter.
+fn read_macro_call(bytes: &[u8], start: usize) -> Option<(Vec<String>, usize)> {
+    let mut segments = Vec::new();
+    let mut at = start;
+    loop {
+        let mut end = at;
+        while bytes.get(end).is_some_and(|&b| is_ident_byte(b)) {
+            end += 1;
+        }
+        if end == at {
+            return None;
+        }
+        let segment = String::from_utf8_lossy(&bytes[at..end]).into_owned();
+        // Past the cap the last slot follows the path, so it is the name the
+        // macro is called by when the path ends.
+        if segments.len() >= MAX_CALL_PATH_SEGMENTS
+            && let Some(last) = segments.last_mut()
+        {
+            *last = segment;
+        } else {
+            segments.push(segment);
+        }
+        let next = skip_trivia(bytes, end);
+        if bytes[next..].starts_with(b"::") {
+            at = skip_trivia(bytes, next + 2);
+            if bytes[at..].starts_with(b"r#") {
+                at += 2;
+            }
+            continue;
+        }
+        if bytes.get(next) != Some(&b'!') {
+            return None;
+        }
+        let open = skip_trivia(bytes, next + 1);
+        return matches!(bytes.get(open), Some(b'(' | b'[' | b'{')).then_some((segments, start));
+    }
+}
+
+/// Every macro invocation in code position in `text`.
 ///
 /// A small lexer, not a parser, and it reads the whole text so that what spans
 /// lines (a string, a raw string, a block comment) is skipped as one thing. It
@@ -265,17 +1005,20 @@ fn contains_marker(text: &str) -> bool {
 /// before a quote inside one is looked at. A tick that is not a char literal is
 /// a lifetime and is skipped alone. The macro name may be separated from its
 /// `!` by whitespace or comments (`todo !()`), and must be followed by a
-/// delimiter, so `todo != x` is not a stub. Something left unterminated is not
-/// code.
-fn first_visible_stub_line(text: &str, accept: &dyn Fn(usize) -> bool) -> Option<usize> {
-    let lower = text.to_ascii_lowercase();
-    let bytes = lower.as_bytes();
+/// delimiter, so `todo != x` is not an invocation. Something left unterminated
+/// is not code.
+///
+/// It is what reads a token tree, which tree-sitter does not parse into
+/// invocations: the arguments of `dbg!(…)` or the body of a `macro_rules!`.
+fn visible_macro_calls(text: &str) -> Vec<MacroCall> {
+    let bytes = text.as_bytes();
     let newlines: Vec<usize> = bytes
         .iter()
         .enumerate()
         .filter_map(|(at, &b)| (b == b'\n').then_some(at))
         .collect();
     let line_at = |at: usize| newlines.partition_point(|&n| n < at);
+    let mut calls = Vec::new();
     let mut i = 0;
     let mut in_string = false;
     let mut escaped = false;
@@ -306,7 +1049,7 @@ fn first_visible_stub_line(text: &str, accept: &dyn Fn(usize) -> bool) -> Option
                         i += 2 + hashes + len;
                         continue;
                     }
-                    None => return None,
+                    None => return calls,
                 }
             }
             b'/' if bytes.get(i + 1) == Some(&b'/') => {
@@ -318,31 +1061,24 @@ fn first_visible_stub_line(text: &str, accept: &dyn Fn(usize) -> bool) -> Option
                 continue;
             }
             _ => {
-                let boundary =
-                    i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
-                if boundary {
-                    for name in ["todo", "unimplemented"] {
-                        if !bytes[i..].starts_with(name.as_bytes()) {
-                            continue;
-                        }
-                        let bang = skip_trivia(bytes, i + name.len());
-                        if bytes.get(bang) != Some(&b'!') {
-                            continue;
-                        }
-                        let open = skip_trivia(bytes, bang + 1);
-                        if matches!(bytes.get(open), Some(b'(' | b'[' | b'{')) {
-                            let line = line_at(i);
-                            if accept(line) {
-                                return Some(line);
-                            }
-                        }
-                    }
+                let boundary = i == 0 || !is_ident_byte(bytes[i - 1]);
+                if boundary
+                    && is_ident_byte(b)
+                    && !b.is_ascii_digit()
+                    && !follows_path_separator(bytes, i)
+                    && let Some((segments, offset)) = read_macro_call(bytes, i)
+                {
+                    calls.push(MacroCall {
+                        segments,
+                        offset,
+                        line: line_at(offset),
+                    });
                 }
             }
         }
         i += 1;
     }
-    None
+    calls
 }
 
 /// The offset of the first byte at or after `at` that is not whitespace or the
@@ -571,10 +1307,18 @@ impl<'a> Walker<'a> {
                 if !self.is_added(node) {
                     return;
                 }
-                let name = node
+                let segments = node
                     .child_by_field_name("macro")
-                    .map(|m| last_segment(self.text(m)))
-                    .unwrap_or("");
+                    .map(|m| path_segments(m, self.src))
+                    .unwrap_or_default();
+                let written = segments.last().map_or("", String::as_str);
+                // The name a `use` gave a std stub macro is that macro, unless
+                // a `macro_rules!` of that name is in scope where it is called.
+                let name = self
+                    .imports
+                    .alias_at(written, node.start_byte())
+                    .unwrap_or(written);
+                let calls = visible_macro_calls(self.text(node));
                 match name {
                     "todo" | "unimplemented" => self.placeholder(node, &format!("{name}!()")),
                     "panic" if self.panic_is_placeholder(node) => {
@@ -582,17 +1326,25 @@ impl<'a> Walker<'a> {
                     }
                     // A wrapper whose own name is not a stub, but whose token
                     // tree still shows `todo!` / `unimplemented!`.
-                    _ if self.visible_stub_line(node).is_some() => {
+                    _ if self.stub_line_in(node, &calls).is_some() => {
                         self.placeholder(node, "wrapper macro")
                     }
-                    _ => {}
+                    _ => {
+                        if self.imports.is_from_elsewhere(&segments, node.start_byte()) {
+                            self.unresolved = true;
+                        }
+                        // The invocation's own path is the call at offset 0.
+                        self.note_token_tree(node, calls.iter().filter(|c| c.offset > 0));
+                    }
                 }
             }
             // `macro_rules` bodies are token trees, not expanded invocations,
             // so `unimplemented!()` inside one is not a `macro_invocation`.
             // The text is still on an added line; that is the stub.
             "macro_definition" => {
-                if let Some(line) = self.visible_stub_line(node) {
+                let calls = visible_macro_calls(self.text(node));
+                self.note_token_tree(node, calls.iter());
+                if let Some(line) = self.stub_line_in(node, &calls) {
                     self.placeholder_finding(
                         node,
                         Severity::Blocking,
@@ -704,14 +1456,41 @@ impl<'a> Walker<'a> {
         false
     }
 
-    /// An added line of `node` whose code contains `todo!` or `unimplemented!`.
-    fn visible_stub_line(&self, node: Node<'_>) -> Option<u32> {
+    /// The first added line of `node` that calls `todo!` or `unimplemented!`, or
+    /// the name a `use` of this file gave one of them, in code position.
+    fn stub_line_in(&self, node: Node<'_>, calls: &[MacroCall]) -> Option<u32> {
         let start = line_of(node);
-        first_visible_stub_line(self.text(node), &|offset| {
-            self.added
-                .contains(&(start + u32::try_from(offset).unwrap_or(0)))
-        })
-        .map(|offset| start + u32::try_from(offset).unwrap_or(0))
+        calls
+            .iter()
+            .filter(|call| {
+                call.segments.last().is_some_and(|name| {
+                    let at = node.start_byte() + call.offset;
+                    (name.eq_ignore_ascii_case("todo")
+                        || name.eq_ignore_ascii_case("unimplemented"))
+                        || (self.imports.token_names.contains(name)
+                            && !self.imports.defined_at(name, at))
+                })
+            })
+            .map(|call| start + u32::try_from(call.line).unwrap_or(0))
+            .find(|line| self.added.contains(line))
+    }
+
+    /// Records that a token tree on an added line calls a macro imported from
+    /// another file of the crate. Tree-sitter does not parse a token tree into
+    /// invocations, so the walker never sees such a call, and what it resolves
+    /// to is not readable here.
+    fn note_token_tree<'c>(&mut self, node: Node<'_>, calls: impl Iterator<Item = &'c MacroCall>) {
+        let start = line_of(node);
+        for call in calls {
+            let line = start + u32::try_from(call.line).unwrap_or(0);
+            if self.added.contains(&line)
+                && self
+                    .imports
+                    .is_from_elsewhere(&call.segments, node.start_byte() + call.offset)
+            {
+                self.token_tree = true;
+            }
+        }
     }
 
     // ---- Go ----
@@ -1174,4 +1953,399 @@ fn asserting_name(name: &str) -> bool {
         .iter()
         .any(|p| lowered.contains(p))
         || matches!(name, "unwrap" | "unwrap_err" | "fatal")
+}
+
+#[cfg(test)]
+mod scope_check_cap_tests {
+    use super::*;
+
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// A block that defines a macro of the name `use` imports, then `calls`
+    /// invocations the definition covers. Every line is added.
+    fn covered_calls(import: &str, calls: usize) -> (String, HashSet<u32>) {
+        let mut body = format!("{import}\npub fn f() {{\n    macro_rules! t {{ () => {{}}; }}\n");
+        for _ in 0..calls {
+            body.push_str("    t!();\n");
+        }
+        body.push_str("}\n");
+        let lines = body.lines().count() as u32;
+        (body, (1..=lines).collect())
+    }
+
+    fn analyze(body: &str, added: &HashSet<u32>, cap: usize) -> Result<Vec<AstFinding>, Unparsed> {
+        analyze_capped(Lang::Rust, body, added, BUDGET, cap, &mut Steps::default())
+    }
+
+    /// The smallest cap under which the file is read to the end, clean, found
+    /// by search: the outcome never gets worse as the cap rises.
+    fn smallest_resolving_cap(body: &str, added: &HashSet<u32>) -> usize {
+        let (mut low, mut high) = (0usize, MAX_SCOPE_CHECKS);
+        let clean = |cap| matches!(analyze(body, added, cap), Ok(f) if f.is_empty());
+        assert!(clean(high));
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if clean(mid) {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+        low
+    }
+
+    #[test]
+    fn a_cap_one_short_degrades_and_the_cap_itself_resolves() {
+        // `crate::inner::t` is another file's macro unless the block's own
+        // `macro_rules!` is in scope, so a file that cannot say is degraded.
+        let (body, added) = covered_calls("use crate::inner::t;", 40);
+        let needed = smallest_resolving_cap(&body, &added);
+        assert!(
+            needed >= 40,
+            "each call spends at least one check: {needed}"
+        );
+        assert_eq!(analyze(&body, &added, needed).unwrap(), Vec::new());
+        assert_eq!(
+            analyze(&body, &added, needed - 1).unwrap_err(),
+            Unparsed::AliasWalkBudget
+        );
+    }
+
+    #[test]
+    fn spent_cap_leaves_the_alias_in_force() {
+        // With no check left the macro is not seen as defined, so the stub
+        // alias is read as the stub it is: blocked, not degraded.
+        let (body, added) = covered_calls("use std::todo as t;", 3);
+        let findings = analyze(&body, &added, 0);
+        assert!(
+            matches!(&findings, Ok(f) if f.iter().any(|f| f.severity == Severity::Blocking)),
+            "{findings:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod alias_walk_tests {
+    use super::*;
+
+    fn record(path: &[&str], alias: &str) -> UseRecord {
+        UseRecord {
+            path: path.iter().map(|s| (*s).to_string()).collect(),
+            alias: alias.to_string(),
+            added: true,
+            public: false,
+        }
+    }
+
+    /// The shape that made one pop cost every leaf under its name: `t` is bound
+    /// to `todo` and `unimplemented` in turn, and `t` and `u` hand each other
+    /// the flip.
+    fn pingpong(k: usize, m: usize) -> Vec<UseRecord> {
+        let mut records = Vec::new();
+        for _ in 0..k {
+            records.push(record(&["std", "todo"], "t"));
+            records.push(record(&["std", "unimplemented"], "t"));
+        }
+        for _ in 0..m {
+            records.push(record(&["t"], "u"));
+        }
+        for _ in 0..m {
+            records.push(record(&["u"], "t"));
+        }
+        records
+    }
+
+    #[test]
+    fn visits_stay_linear_in_the_records_however_the_binding_flips() {
+        let records = pingpong(300, 300);
+        let mut imports = RustImports::default();
+        // A cap the quadratic walk passed by orders of magnitude (it made
+        // ~k*m leaf visits per round): the monotone walk needs a few per leaf.
+        let visits = imports.resolve_aliases(&records, 4 * records.len() + 16);
+        assert!(
+            !imports.over_budget,
+            "visited {visits} for {} records",
+            records.len()
+        );
+        assert!(visits <= 4 * records.len() + 16, "{visits}");
+        assert_eq!(imports.aliases.get("t"), Some(&"todo"));
+        assert_eq!(imports.aliases.get("u"), Some(&"todo"));
+    }
+
+    #[test]
+    fn a_lowered_cap_counts_leaf_visits_and_degrades() {
+        let records = pingpong(50, 50);
+        let mut imports = RustImports::default();
+        let visits = imports.resolve_aliases(&records, 40);
+        assert!(imports.over_budget);
+        assert_eq!(visits, 41, "the walk stops at the first visit past the cap");
+    }
+
+    #[test]
+    fn one_first_segment_with_many_names_is_visited_once_per_binding() {
+        // `use std::todo as a0; ...` under one root: every leaf hangs off
+        // `std`, which is learnt once.
+        let records: Vec<UseRecord> = (0..2_000)
+            .map(|i| record(&["std", "todo"], &format!("a{i}")))
+            .collect();
+        let mut imports = RustImports::default();
+        let visits = imports.resolve_aliases(&records, 4 * records.len() + 16);
+        assert!(!imports.over_budget);
+        assert!(visits <= 4 * records.len() + 16, "{visits}");
+        assert_eq!(imports.aliases.len(), 2_000);
+    }
+
+    #[test]
+    fn a_stronger_stub_replaces_panic_and_never_the_reverse() {
+        let records = vec![
+            record(&["std", "panic"], "t"),
+            record(&["std", "todo"], "t"),
+            record(&["std", "panic"], "t"),
+            record(&["t"], "u"),
+        ];
+        let mut imports = RustImports::default();
+        imports.resolve_aliases(&records, MAX_ALIAS_VISITS);
+        assert_eq!(imports.aliases.get("t"), Some(&"todo"));
+        assert_eq!(imports.aliases.get("u"), Some(&"todo"));
+    }
+}
+
+/// The cost bounds of the alias pre-passes, asserted as step counts.
+///
+/// The integration tests that carried a 2 s wall clock for these shapes measured
+/// the machine as much as the code: under load the same code passed and failed.
+/// A count of the visits the walk made and the scopes the queries examined is
+/// the bound itself, and the same on any machine. The integration tests keep
+/// their verdict assertions and a loose wall-clock backstop.
+#[cfg(test)]
+mod step_count_tests {
+    use super::*;
+
+    const CALL: &str = "pub fn f() -> u32 {\n    t!()\n}\n";
+
+    fn steps_of(body: &str, cap: usize) -> (Result<Vec<AstFinding>, Unparsed>, Steps) {
+        let added: HashSet<u32> = (1..=body.lines().count() as u32).collect();
+        let mut steps = Steps::default();
+        let result = analyze_capped(
+            Lang::Rust,
+            body,
+            &added,
+            std::time::Duration::from_secs(120),
+            cap,
+            &mut steps,
+        );
+        (result, steps)
+    }
+
+    fn blocked(result: &Result<Vec<AstFinding>, Unparsed>) -> bool {
+        matches!(result, Ok(f) if f.iter().any(|f| f.severity == Severity::Blocking))
+    }
+
+    /// A walk visits each leaf a bounded number of times, however the shape
+    /// flips the bindings: at most four visits per `use` leaf.
+    fn assert_linear(label: &str, body: &str, leaves: usize) -> Steps {
+        let (result, steps) = steps_of(body, MAX_SCOPE_CHECKS);
+        assert!(
+            steps.alias_visits <= 4 * leaves,
+            "{label}: {} visits for {leaves} leaves",
+            steps.alias_visits
+        );
+        assert!(!matches!(result, Err(Unparsed::AliasWalkBudget)), "{label}");
+        assert!(steps.alias_visits > 0, "{label}: the walk never ran");
+        steps
+    }
+
+    fn pingpong(k: usize, m: usize) -> String {
+        let mut body = String::new();
+        for _ in 0..k {
+            body.push_str("use std::todo as t;\nuse std::unimplemented as t;\n");
+        }
+        for _ in 0..m {
+            body.push_str("use t as u;\n");
+        }
+        for _ in 0..m {
+            body.push_str("use u as t;\n");
+        }
+        body.push_str(CALL);
+        body
+    }
+
+    // ---- residue2_alias.rs, attack2_round2.rs, attack_verify_rigor.rs ----------
+
+    #[test]
+    fn the_67_second_pingpong_is_linear_in_its_leaves_and_blocks() {
+        let body = pingpong(6_000, 12_000);
+        assert_linear("pingpong 6000/12000", &body, 2 * 6_000 + 2 * 12_000);
+        assert!(blocked(&steps_of(&body, MAX_SCOPE_CHECKS).0));
+    }
+
+    #[test]
+    fn a_smaller_pingpong_is_linear_too() {
+        assert_linear(
+            "pingpong 2000/2000",
+            &pingpong(2_000, 2_000),
+            2 * 2_000 + 2 * 2_000,
+        );
+    }
+
+    #[test]
+    fn ten_times_the_attack_stops_at_the_record_cap_before_the_walk_starts() {
+        let (result, steps) = steps_of(&pingpong(20_000, 20_000), MAX_SCOPE_CHECKS);
+        assert_eq!(
+            steps.alias_visits, 0,
+            "the walk started past the record cap"
+        );
+        assert!(
+            matches!(result, Err(Unparsed::AliasWalkBudget)),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_use_walk_past_the_record_cap_never_starts() {
+        let mut body = String::new();
+        for i in 0..50_100 {
+            body.push_str(&format!("use a{i} as b{i};\n"));
+        }
+        body.push_str("pub fn f() -> u32 {\n    1\n}\n");
+        let (result, steps) = steps_of(&body, MAX_SCOPE_CHECKS);
+        assert_eq!(steps.alias_visits, 0);
+        assert!(
+            matches!(result, Err(Unparsed::AliasWalkBudget)),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn flips_through_panic_are_linear_and_block() {
+        let mut body = String::new();
+        for _ in 0..3_000 {
+            body.push_str("use std::panic as t;\nuse std::todo as t;\n");
+        }
+        for _ in 0..3_000 {
+            body.push_str("use t as u;\nuse u as t;\n");
+        }
+        body.push_str(CALL);
+        assert_linear("panic flips", &body, 2 * 3_000 + 2 * 3_000);
+        assert!(blocked(&steps_of(&body, MAX_SCOPE_CHECKS).0));
+    }
+
+    #[test]
+    fn one_first_segment_with_many_names_is_linear_and_blocks() {
+        let mut body = String::new();
+        for i in 0..20_000 {
+            body.push_str(&format!("use std::todo as a{i};\n"));
+        }
+        body.push_str("use a19999 as t;\n");
+        body.push_str(CALL);
+        assert_linear("many names", &body, 20_001);
+        assert!(blocked(&steps_of(&body, MAX_SCOPE_CHECKS).0));
+    }
+
+    #[test]
+    fn a_long_alias_chain_is_linear_in_either_order() {
+        for n in [2_000usize, 8_000] {
+            for forward in [false, true] {
+                let order: Vec<usize> = if forward {
+                    (1..n).collect()
+                } else {
+                    (1..n).rev().collect()
+                };
+                let mut body = String::new();
+                for i in order {
+                    body.push_str(&format!("use t{} as t{};\n", i - 1, i));
+                }
+                body.push_str(&format!(
+                    "use std::todo as t0;\npub fn f() -> u32 {{\n    t{}!()\n}}\n",
+                    n - 1
+                ));
+                assert_linear(&format!("chain n={n} forward={forward}"), &body, n);
+                assert!(blocked(&steps_of(&body, MAX_SCOPE_CHECKS).0));
+            }
+        }
+    }
+
+    #[test]
+    fn many_aliases_times_many_invocations_spend_no_scope_checks_and_few_visits() {
+        for (aliases, calls) in [(500usize, 2_000usize), (2_000, 8_000)] {
+            let mut body = String::new();
+            for i in 0..aliases {
+                body.push_str(&format!("use std::todo as a{i};\n"));
+            }
+            body.push_str("pub fn f() {\n");
+            for _ in 0..calls {
+                body.push_str("    w!(x);\n");
+            }
+            body.push_str("}\n");
+            let (_, steps) = steps_of(&body, MAX_SCOPE_CHECKS);
+            assert_eq!(
+                steps.scope_checks, 0,
+                "no macro_rules is defined, so no scope is examined"
+            );
+            assert!(
+                steps.alias_visits <= 4 * aliases,
+                "{} visits for {aliases} aliases",
+                steps.alias_visits
+            );
+        }
+    }
+
+    // ---- attack3_round3.rs: defs x calls ---------------------------------------
+
+    /// The probe: 25,000 `macro_rules! t` each in its own block, then 60,000
+    /// calls outside every one of them. Each call examines exactly the one scope
+    /// the search lands on and finds it closed: the count is the number of
+    /// calls, not defs x calls (1.5 x 10^9), and it is far under the cap.
+    #[test]
+    fn the_defs_by_calls_probe_examines_one_scope_per_call() {
+        let mut body = String::from("use std::todo as t;\n");
+        for _ in 0..25_000 {
+            body.push_str("{ macro_rules! t { () => {}; } }\n");
+        }
+        body.push_str("pub fn f() {\n");
+        for _ in 0..60_000 {
+            body.push_str("    t!();\n");
+        }
+        body.push_str("}\n");
+        let (result, steps) = steps_of(&body, MAX_SCOPE_CHECKS);
+        eprintln!("probe steps: {steps:?}");
+        assert_eq!(steps.scope_checks, 60_000, "{steps:?}");
+        assert!(!steps.scope_checks_exhausted);
+        assert!(blocked(&result), "the alias is in force at every call");
+        // The cap is exact: the count that was spent resolves, one fewer is
+        // exhausted, and an exhausted query leaves the alias in force.
+        let spent = steps.scope_checks;
+        let (at_cap, at_cap_steps) = steps_of(&body, spent);
+        assert!(!at_cap_steps.scope_checks_exhausted, "{at_cap_steps:?}");
+        assert!(blocked(&at_cap));
+        let (under, under_steps) = steps_of(&body, spent - 1);
+        assert!(under_steps.scope_checks_exhausted, "{under_steps:?}");
+        assert_eq!(under_steps.scope_checks, spent - 1);
+        assert!(blocked(&under));
+    }
+}
+
+#[cfg(test)]
+mod call_path_cap_tests {
+    use super::*;
+
+    #[test]
+    fn a_path_past_the_segment_cap_is_still_an_invocation_named_by_its_last_segment() {
+        for hops in [
+            MAX_CALL_PATH_SEGMENTS - 1,
+            MAX_CALL_PATH_SEGMENTS,
+            65,
+            100,
+            5_000,
+        ] {
+            let text = format!("dbg!({}t!())", "super::".repeat(hops));
+            let calls = visible_macro_calls(&text);
+            let call = calls
+                .iter()
+                .find(|c| c.segments.last().map(String::as_str) == Some("t"))
+                .unwrap_or_else(|| panic!("{hops} hops: the call was dropped"));
+            assert!(call.segments.len() <= MAX_CALL_PATH_SEGMENTS, "{hops} hops");
+            assert_eq!(call.segments.first().map(String::as_str), Some("super"));
+        }
+    }
 }

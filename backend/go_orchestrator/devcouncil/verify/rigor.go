@@ -111,14 +111,22 @@ func rigorSkipped(reason, coverageReason string) rigorOutcome {
 	}
 }
 
-// runRigorGates spawns dcverify for one task's diff.
+// runRigorGates is the diff's rigor pass, then the secret scan of tool state.
+//
+// Tool state is the only thing the second pass reads, and the secret gate the
+// only gate: see addToolStateSecretScan.
+func runRigorGates(ctx context.Context, in Input, taskID string, planned []string) rigorOutcome {
+	return addToolStateSecretScan(ctx, in, taskID, runDiffRigorGates(ctx, in, taskID, planned))
+}
+
+// runDiffRigorGates spawns dcverify for one task's diff.
 //
 // It never returns a pass it did not earn. The three ways out are: the gates
 // ran (applied names them), the gates were not configured (skippedReason says
 // so), or the gates were configured and failed — which is a blocking gap, not a
 // skip, because a verifier that is present and broken is a different situation
 // from one that was never installed.
-func runRigorGates(ctx context.Context, in Input, taskID string, planned []string) rigorOutcome {
+func runDiffRigorGates(ctx context.Context, in Input, taskID string, planned []string) rigorOutcome {
 	// Coverage's own reason is resolved first, because it is true regardless of
 	// whether the findings gates run: there is nothing to measure in an empty
 	// diff, and nothing to measure against without a profile.
@@ -233,6 +241,78 @@ func runRigorGates(ctx context.Context, in Input, taskID string, planned []strin
 	}
 	if gap, ok := gapFromSubstance(taskID, result.Substance); ok {
 		out.gaps = append(out.gaps, gap)
+	}
+	return out
+}
+
+// addToolStateSecretScan runs dcverify again, over the tool-owned state the diff
+// leaves out, and keeps its secret findings. It reads two views, each its own
+// diff because dcverify refuses a diff that names a path twice: the worktree's
+// (Input.ToolStateDiff) and the index's where the index is not what the worktree
+// holds (Input.ToolStateIndexDiff).
+//
+// Only GateSecretScan findings are kept. Tool state is a file the harness wrote,
+// not work the agent did, so a placeholder in it is not this task's stub, an
+// unplanned file in it is not an orphan, and it is not measured for coverage or
+// substance. A credential in it is committed with the rest, and is.
+//
+// The pass is not gated on the main diff being non-empty: a change that is tool
+// state and nothing else is exactly the one the main pass cannot see. With no
+// dcverify there is no second pass either, and the first already said so. A
+// second pass that cannot run is a blocking gap, like the first: a verifier that
+// is present and broken is not one that was never installed.
+func addToolStateSecretScan(ctx context.Context, in Input, taskID string, out rigorOutcome) rigorOutcome {
+	if in.Rigor == nil {
+		return out
+	}
+	ran := false
+	for _, view := range []struct{ name, diff string }{
+		{"worktree", in.ToolStateDiff},
+		{"index", in.ToolStateIndexDiff},
+	} {
+		if strings.TrimSpace(view.diff) == "" {
+			continue
+		}
+		// Planned names the tool-state paths. dcverify reads the bytes of a binary
+		// section from the working tree, and only for a path that is in scope: with
+		// none planned every binary section was skipped, silently, so a NUL in a
+		// tool-state file (or a `-diff` attribute the agent wrote) hid it. Scope
+		// classification is not read back: only secret findings are kept.
+		result, err := in.Rigor.Check(ctx, dcverify.Request{Diff: view.diff, Planned: in.ToolStateBinaryPaths})
+		if err != nil {
+			out.gaps = append(out.gaps, Gap{
+				ID:       StableGapID(taskID, "RIGOR", "tool-state-"+view.name),
+				Severity: "high",
+				GapType:  "rigor_check_unavailable",
+				TaskID:   taskID,
+				Description: "The secret scan of tool state (.devcouncil, .devmap), " + view.name +
+					" view, was configured but could not run: " + err.Error(),
+				Evidence: []string{"dcverify: " + err.Error()},
+				RecommendedFix: "Repair or reinstall dcverify, then re-verify. Until it answers, " +
+					"files under the tool-state directories have not been scanned for credentials.",
+				Blocking: true,
+			})
+			continue
+		}
+		ran = true
+		// A binary file dcverify was told about but could not read (too large, a
+		// link, gone) was not scanned, and is not the stub fallback.
+		if _, unread := dcverify.SplitDegraded(result.StubASTDegraded); len(unread) > 0 {
+			out.degradedReasons = append(out.degradedReasons, "tool state: secret scan did not read "+itoa(len(unread))+
+				" binary file(s): "+strings.Join(unread, "; "))
+		}
+		var secrets []dcverify.Finding
+		for _, f := range result.Findings {
+			if f.Gate == dcverify.GateSecretScan {
+				secrets = append(secrets, f)
+			}
+		}
+		out.gaps = append(out.gaps, gapsFromFindings(taskID, secrets)...)
+	}
+	// A main pass that had nothing to check ("no diff to check") reports the
+	// gate that did run on tool state, so the report does not claim none ran.
+	if ran && len(out.applied) == 0 && out.skippedReason == "no diff to check" {
+		out.applied, out.skippedReason = []string{dcverify.GateSecretScan}, ""
 	}
 	return out
 }

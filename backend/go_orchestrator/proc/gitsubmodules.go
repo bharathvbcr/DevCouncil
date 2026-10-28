@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -449,4 +450,207 @@ func (f *gitlinkFilter) flush() {
 		}
 	}
 	f.pending = f.pending[:0]
+}
+
+// gitlinkMode is the tree mode of a submodule, and zeroMode the mode git writes
+// for the side of a change where the path does not exist.
+const (
+	gitlinkMode = "160000"
+	zeroMode    = "000000"
+)
+
+// The shapes a change to a gitlink takes. A raw record names a gitlink on one
+// side or both, and these are the only combinations there are.
+const (
+	// GitlinkAdded is a gitlink where there was nothing.
+	GitlinkAdded = "added"
+	// GitlinkDeleted is a gitlink removed.
+	GitlinkDeleted = "deleted"
+	// GitlinkMoved is a gitlink on both sides, at another commit.
+	GitlinkMoved = "moved"
+	// GitlinkFileToSubmodule is a file replaced by a gitlink.
+	GitlinkFileToSubmodule = "typechange: file to submodule"
+	// GitlinkSubmoduleToFile is a gitlink replaced by a file.
+	GitlinkSubmoduleToFile = "typechange: submodule to file"
+)
+
+// GitlinkChange is one gitlink the change touches: the superproject-relative
+// path as git wrote it, and the shape of the change. It carries no commit id:
+// what it names is that the commits between the two sides were not read, not
+// which they were.
+type GitlinkChange struct {
+	Path  string
+	Shape string
+}
+
+// MovedGitlinks lists every gitlink the working tree's change touches, from
+// `git diff HEAD --raw`, which names a gitlink on either side of a record
+// whether or not .gitmodules lists it. It is enumeration and nothing more: the
+// submodule's own history is not opened, so nothing in the submodule's
+// repository (its config, attributes, replace refs, grafts or objects) is
+// consulted.
+//
+// The listing is asked with --ignore-submodules=dirty, which the guards put on
+// every diff, and that overrides `ignore = all` in .gitmodules, in the
+// superproject's config and in diff.ignoreSubmodules: a submodule configured to
+// hide from `git diff` is still listed. A gitlink under a tool-state directory
+// is listed too.
+//
+// headless is a repository with no HEAD yet: it has nothing to compare against,
+// so every gitlink in its index is new.
+//
+// A listing that cannot be believed is an error, never a shorter list: a record
+// that does not parse, one past maxIndexEntry, or more than maxSubmodules
+// gitlinks.
+func (s *GitSession) MovedGitlinks(ctx context.Context, headless bool) ([]GitlinkChange, error) {
+	ctx, cancel := WithWalkBudget(ctx)
+	defer cancel()
+	if headless {
+		paths, err := s.gitlinks(ctx, []string{"ls-files", "--stage", "-z"})
+		if err != nil {
+			return nil, err
+		}
+		moved := make([]GitlinkChange, 0, len(paths))
+		for _, path := range paths {
+			moved = append(moved, GitlinkChange{Path: path, Shape: GitlinkAdded})
+		}
+		return sortedGitlinks(moved), nil
+	}
+	f := &movedGitlinkFilter{}
+	if err := s.stream(ctx, f, "diff", "HEAD", "--raw", "-z", "--no-abbrev", "--no-renames"); err != nil {
+		return nil, err
+	}
+	if err := f.finish(s.root); err != nil {
+		return nil, err
+	}
+	return sortedGitlinks(f.moved), nil
+}
+
+// sortedGitlinks orders a listing by path, so two runs over one change report
+// the same reasons in the same order.
+func sortedGitlinks(moved []GitlinkChange) []GitlinkChange {
+	sort.Slice(moved, func(i, j int) bool {
+		if moved[i].Path != moved[j].Path {
+			return moved[i].Path < moved[j].Path
+		}
+		return moved[i].Shape < moved[j].Shape
+	})
+	return moved
+}
+
+// gitlinkShape names the change a raw record makes to a gitlink, given the
+// modes of its two sides, at least one of which is gitlinkMode.
+func gitlinkShape(oldMode, newMode string) string {
+	switch {
+	case oldMode == gitlinkMode && newMode == gitlinkMode:
+		return GitlinkMoved
+	case oldMode == zeroMode:
+		return GitlinkAdded
+	case newMode == zeroMode:
+		return GitlinkDeleted
+	case oldMode == gitlinkMode:
+		return GitlinkSubmoduleToFile
+	default:
+		return GitlinkFileToSubmodule
+	}
+}
+
+// movedGitlinkFilter is an io.Writer over `diff --raw -z` output that keeps the
+// records in which either side is a gitlink. Like gitlinkFilter it streams, so
+// memory is bounded by one record and the gitlinks kept, not by the size of the
+// diff, and like CappedBuffer it always reports a full write.
+//
+// A record is a `:oldmode newmode oldid newid status` field and then one path
+// (two for a rename or copy, the second of which is the path that changed), each
+// NUL-terminated. A record that does not parse is remembered and refused by
+// finish, never skipped.
+type movedGitlinkFilter struct {
+	pending   []byte
+	header    []string
+	paths     []string
+	want      int
+	moved     []GitlinkChange
+	count     int
+	overlong  bool
+	malformed string
+}
+
+func (f *movedGitlinkFilter) Write(p []byte) (int, error) {
+	n := len(p)
+	for len(p) > 0 {
+		end := bytes.IndexByte(p, 0)
+		if end < 0 {
+			f.hold(p)
+			return n, nil
+		}
+		f.hold(p[:end])
+		f.field()
+		p = p[end+1:]
+	}
+	return n, nil
+}
+
+func (f *movedGitlinkFilter) hold(b []byte) {
+	if f.overlong {
+		return
+	}
+	if len(f.pending)+len(b) > maxIndexEntry {
+		f.overlong, f.pending = true, nil
+		return
+	}
+	f.pending = append(f.pending, b...)
+}
+
+// field takes the NUL-terminated field in pending and clears it.
+func (f *movedGitlinkFilter) field() {
+	text := string(f.pending)
+	f.pending = f.pending[:0]
+	if f.overlong || f.malformed != "" {
+		return
+	}
+	if f.want == 0 {
+		parts := strings.Split(text, " ")
+		if len(parts) != 5 || !strings.HasPrefix(parts[0], ":") || parts[4] == "" {
+			f.malformed = "a record that is not a raw diff header"
+			return
+		}
+		f.header, f.paths, f.want = parts, f.paths[:0], 1
+		if parts[4][0] == 'R' || parts[4][0] == 'C' {
+			f.want = 2
+		}
+		return
+	}
+	f.paths = append(f.paths, text)
+	f.want--
+	if f.want > 0 {
+		return
+	}
+	path := f.paths[len(f.paths)-1]
+	if path == "" {
+		f.malformed = "a change with no path"
+		return
+	}
+	oldMode, newMode := strings.TrimPrefix(f.header[0], ":"), f.header[1]
+	if oldMode != gitlinkMode && newMode != gitlinkMode {
+		return
+	}
+	f.count++
+	if f.count <= maxSubmodules {
+		f.moved = append(f.moved, GitlinkChange{Path: path, Shape: gitlinkShape(oldMode, newMode)})
+	}
+}
+
+// finish reports a listing that cannot be believed.
+func (f *movedGitlinkFilter) finish(root string) error {
+	switch {
+	case f.overlong:
+		return fmt.Errorf("git diff HEAD --raw in %s wrote a record longer than %d bytes; refusing a truncated answer", root, maxIndexEntry)
+	case f.malformed != "":
+		return fmt.Errorf("git diff HEAD --raw in %s wrote %s; refusing to read it as a shorter list", root, f.malformed)
+	case f.want != 0 || len(f.pending) != 0:
+		return fmt.Errorf("git diff HEAD --raw in %s ended inside a record; refusing to read it as a shorter list", root)
+	case f.count > maxSubmodules:
+		return fmt.Errorf("%s moved %d submodules, more than the %d one read examines; refusing to report a partial answer", root, f.count, maxSubmodules)
+	}
+	return nil
 }

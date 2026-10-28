@@ -10,6 +10,7 @@ import (
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/dcverify"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/lappi"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 )
 
 // Gap is one verification finding. Field names and nullability match the
@@ -163,6 +164,17 @@ type Input struct {
 	DiffContent  string
 	DiffEmpty    bool
 	WorkPresent  bool
+	// MovedGitlinks are the submodule gitlinks the change touches. The diff
+	// carries no bytes for the commits a moved one moved across, so Run names
+	// each as not scanned in the degraded reasons.
+	MovedGitlinks []proc.GitlinkChange
+	// ToolStateDiff is the tool-owned state the secret gate reads, apart from
+	// DiffContent: the other gates never see it. ToolStateUnscanned is what it
+	// could not carry, each entry a degraded reason. See toolstate.go.
+	ToolStateDiff        string
+	ToolStateIndexDiff   string
+	ToolStateBinaryPaths []string
+	ToolStateUnscanned   []string
 
 	// Commands are expected_tests, falling back to allowed_commands.
 	Commands []string
@@ -205,6 +217,22 @@ type Input struct {
 	// RunCommand executes one verification command. Nil means commands are
 	// skipped with reason "command runner unavailable".
 	RunCommand func(command string) CommandOutcome
+}
+
+// WithGitState sets the inputs that come from one collection of the working
+// tree: the change the gates judge, and whatever else the collection found.
+// It is the one place the two are joined, so a caller that reads a GitState
+// cannot forget part of it.
+func (in *Input) WithGitState(state GitState) {
+	in.ChangedFiles = state.Changed
+	in.DiffContent = state.Diff
+	in.DiffEmpty = state.Empty
+	in.WorkPresent = !state.Empty
+	in.MovedGitlinks = state.MovedGitlinks
+	in.ToolStateDiff = state.ToolStateDiff
+	in.ToolStateIndexDiff = state.ToolStateIndexDiff
+	in.ToolStateBinaryPaths = state.ToolStateBinaryPaths
+	in.ToolStateUnscanned = state.ToolStateUnscanned
 }
 
 // CommandOutcome is the result of attempting to run one verification command.

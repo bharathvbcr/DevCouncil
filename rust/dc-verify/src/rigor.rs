@@ -163,9 +163,11 @@ pub struct StubReport {
     pub parsed_files: usize,
     /// Files in a language [`stub_ast`] parses, whose source was known, that
     /// the tree did not analyse — a syntax error, a source too large, a parse
-    /// past its budget. They took the substring checks, which see less: a
-    /// report that lists nothing here and one that lists a file are not the
-    /// same report, and the host marks the run degraded for each entry.
+    /// past its budget, or one that calls a macro imported from another file
+    /// ([`stub_ast::Unparsed::UnresolvedMacroImport`]) and so could hide a
+    /// stub the tree cannot see. They took the substring checks, which see
+    /// less: a report that lists nothing here and one that lists a file are not
+    /// the same report, and the host marks the run degraded for each entry.
     pub unparsed: Vec<UnparsedFile>,
 }
 
@@ -186,9 +188,35 @@ pub fn detect_stubs_report(
     let mut parsed_files = 0;
     let mut unparsed = Vec::new();
     for file in files {
-        let post_image = post_image(file, source);
-        let lines: Option<Vec<&str>> = post_image.as_deref().map(|s| s.lines().collect());
         let lang = stub_ast::Lang::for_path(&file.path);
+        let post_image = match post_image(file, source) {
+            Ok(text) => Some(text),
+            Err(PostImageMiss::TooLarge) => {
+                // Not parsed and not read as clean: the substring checks below
+                // still run, and the report says the tree never saw the file.
+                if lang.is_some() {
+                    unparsed.push(UnparsedFile {
+                        path: file.path.clone(),
+                        reason: stub_ast::Unparsed::TooLarge.as_str(),
+                    });
+                }
+                None
+            }
+            Err(PostImageMiss::Stale) => {
+                // A source that is not the one the diff was taken from cannot be
+                // attributed to its lines. The substring checks still run, and
+                // the report says the tree never read the file.
+                if lang.is_some() {
+                    unparsed.push(UnparsedFile {
+                        path: file.path.clone(),
+                        reason: stub_ast::Unparsed::SourceStale.as_str(),
+                    });
+                }
+                None
+            }
+            Err(PostImageMiss::Unknown) => None,
+        };
+        let lines: Option<Vec<&str>> = post_image.as_deref().map(|s| s.lines().collect());
         let ast = match (lang, post_image.as_deref()) {
             (Some(lang), Some(src)) => {
                 let added: HashSet<u32> = file.added_lines.iter().map(|(n, _)| *n).collect();
@@ -249,13 +277,28 @@ pub fn detect_stubs_report(
     }
 }
 
-/// The file as it stands after the change, or `None` when it cannot be known.
+/// Why the post-change file is not known.
+enum PostImageMiss {
+    /// The source is past [`stub_ast::MAX_SOURCE_BYTES`]. It is known, and it is
+    /// not read, which a report must say: nothing was checked.
+    TooLarge,
+    /// No source was given. The caller knows why and reports it; this crate
+    /// cannot.
+    Unknown,
+    /// A source was given and does not agree with the diff.
+    Stale,
+}
+
+/// The file as it stands after the change, or why it cannot be known.
 ///
 /// A file the diff adds whole is its added lines. Anything else comes from
 /// `source`, and is believed only if every added line of the diff is at its
 /// stated line number in it: a working tree that moved on since the diff was
 /// taken would otherwise attribute findings to the wrong lines.
-fn post_image(file: &FileDiff, source: &dyn Fn(&FileDiff) -> Option<String>) -> Option<String> {
+fn post_image(
+    file: &FileDiff,
+    source: &dyn Fn(&FileDiff) -> Option<String>,
+) -> Result<String, PostImageMiss> {
     let whole_file = file.status == ChangeStatus::Added
         && file
             .added_lines
@@ -270,10 +313,10 @@ fn post_image(file: &FileDiff, source: &dyn Fn(&FileDiff) -> Option<String>) -> 
         }
         s
     } else {
-        source(file)?
+        source(file).ok_or(PostImageMiss::Unknown)?
     };
     if text.len() > stub_ast::MAX_SOURCE_BYTES {
-        return None;
+        return Err(PostImageMiss::TooLarge);
     }
     let lines: Vec<&str> = text.lines().collect();
     let agrees = file.added_lines.iter().all(|(n, content)| {
@@ -281,7 +324,11 @@ fn post_image(file: &FileDiff, source: &dyn Fn(&FileDiff) -> Option<String>) -> 
             .get((*n as usize).wrapping_sub(1))
             .is_some_and(|l| l.trim_end_matches('\r') == content.trim_end_matches('\r'))
     });
-    agrees.then_some(text)
+    if agrees {
+        Ok(text)
+    } else {
+        Err(PostImageMiss::Stale)
+    }
 }
 
 /// The line-based checks: placeholder bodies (only when the file was not

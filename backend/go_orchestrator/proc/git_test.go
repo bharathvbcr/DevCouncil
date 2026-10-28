@@ -15,6 +15,7 @@ func TestGitArgsPlacesGuards(t *testing.T) {
 		"-c", "core.fsmonitor=false",
 		"-c", "core.hooksPath=" + os.DevNull,
 		"-c", "log.showSignature=false",
+		"-c", "core.useReplaceRefs=false",
 	}
 	cases := []struct {
 		name string
