@@ -131,7 +131,11 @@ fn deep_scopes_each_defining_the_name_shadowed_call() {
     assert!(took < limit, "took {took:?}");
     // Never anything but clean/blocked/degraded, which the type already says;
     // the point is that it returned.
-    eprintln!("deep shadowed verdict: blocked={} unparsed={:?}", blocked(&r), r.unparsed);
+    eprintln!(
+        "deep shadowed verdict: blocked={} unparsed={:?}",
+        blocked(&r),
+        r.unparsed
+    );
 }
 
 /// Wide scope: one block with very many sibling statements, a macro defined
@@ -284,7 +288,10 @@ fn a_parse_budget_expiry_degrades_and_never_passes() {
             ),
         }
     }
-    assert!(saw_over_budget, "no budget in the sweep expired: the sweep tested nothing");
+    assert!(
+        saw_over_budget,
+        "no budget in the sweep expired: the sweep tested nothing"
+    );
 }
 
 // ------------------------------------------------------- unreadable sources
@@ -436,7 +443,9 @@ mod unreadable {
     fn a_source_longer_than_the_cap_with_a_stub_is_degraded() {
         let root = Root::new();
         let mut text = String::from("// pad\n// pad\npub fn f() -> u32 { todo!() }\n");
-        text.push_str(&"// filler line to push the file past the two MiB source cap\n".repeat(40_000));
+        text.push_str(
+            &"// filler line to push the file past the two MiB source cap\n".repeat(40_000),
+        );
         assert!(text.len() > (2 << 20));
         std::fs::write(root.0.join("src/a.rs"), text).unwrap();
         let out = check(
@@ -489,7 +498,12 @@ fn scaling_probe() {
             ("no alias, no defs, macro call", false, false, "t!();"),
             ("alias, no defs", true, false, "t!();"),
             ("alias + defs", true, true, "t!();"),
-            ("no alias, direct todo!() (the path main has)", false, false, "todo!();"),
+            (
+                "no alias, direct todo!() (the path main has)",
+                false,
+                false,
+                "todo!();",
+            ),
         ] {
             let (took, _) = timed(
                 &format!("depth={depth} calls={calls} {name}"),
