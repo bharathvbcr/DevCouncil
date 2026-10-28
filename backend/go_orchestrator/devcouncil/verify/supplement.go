@@ -14,6 +14,15 @@ import (
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/safefile"
 )
 
+// diffTooLargeError is a diff, or the files being added to one, past
+// gitDiffLimit. It is its own type so a caller that scans a second, separately
+// capped diff can tell the cap from a read that failed.
+type diffTooLargeError struct{}
+
+func (diffTooLargeError) Error() string {
+	return fmt.Sprintf("the diff exceeds %d bytes", gitDiffLimit)
+}
+
 // binaryProbeBytes is how much of a file is inspected for a NUL before the
 // supplemental diff calls it binary. Git's own binary check uses the first
 // 8000 bytes; this matches the untracked-diff reader.
@@ -67,7 +76,7 @@ func attachMissingDiffBytes(ctx context.Context, git *proc.GitSession, root stri
 		return "", err
 	}
 	if len(diff) > gitDiffLimit {
-		return "", fmt.Errorf("the diff exceeds %d bytes", gitDiffLimit)
+		return "", diffTooLargeError{}
 	}
 	rootFS, err := os.OpenRoot(root)
 	if err != nil {
@@ -123,7 +132,7 @@ func appendMissingPath(ctx context.Context, git *proc.GitSession, rootFS *os.Roo
 			if _, ok := present[file]; ok {
 				continue
 			}
-			if err := appendRegularFile(ctx, rootFS, file, b); err != nil {
+			if _, err := appendRegularFile(ctx, rootFS, file, b); err != nil {
 				return err
 			}
 			present[file] = struct{}{}
@@ -145,28 +154,32 @@ func appendMissingPath(ctx context.Context, git *proc.GitSession, rootFS *os.Roo
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("cannot include %s: not a regular file", path)
 	}
-	return appendRegularFile(ctx, rootFS, path, b)
+	_, err = appendRegularFile(ctx, rootFS, path, b)
+	return err
 }
 
-func appendRegularFile(ctx context.Context, rootFS *os.Root, rel string, b *strings.Builder) error {
+// appendRegularFile adds the synthetic diff of one regular file, and reports
+// whether the file was binary, in which case the section names it and carries
+// none of its bytes.
+func appendRegularFile(ctx context.Context, rootFS *os.Root, rel string, b *strings.Builder) (binary bool, err error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return false, err
 	}
 	if !pathOK(rel) {
-		return fmt.Errorf("cannot include %q in the diff", rel)
+		return false, fmt.Errorf("cannot include %q in the diff", rel)
 	}
 	remaining := gitDiffLimit - b.Len()
 	if remaining < 0 {
-		return fmt.Errorf("the diff exceeds %d bytes", gitDiffLimit)
+		return false, diffTooLargeError{}
 	}
 	raw, err := readCappedFile(rootFS, rel, int64(remaining))
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return false, err
 	}
-	return appendFragment(ctx, b, formatSyntheticDiff(rel, raw))
+	return looksBinary(raw), appendFragment(ctx, b, formatSyntheticDiff(rel, raw))
 }
 
 // appendDeletion records a file deleted inside a dirty submodule as a
@@ -192,7 +205,7 @@ func appendFragment(ctx context.Context, b *strings.Builder, fragment string) er
 		fragment += "\n"
 	}
 	if b.Len()+len(fragment) > gitDiffLimit {
-		return fmt.Errorf("the diff exceeds %d bytes", gitDiffLimit)
+		return diffTooLargeError{}
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -216,7 +229,7 @@ func readCappedFile(rootFS *os.Root, rel string, limit int64) (raw []byte, err e
 		return nil, fmt.Errorf("cannot include %s: not a regular file", rel)
 	}
 	if limit < 0 || info.Size() > limit {
-		return nil, fmt.Errorf("the diff exceeds %d bytes", gitDiffLimit)
+		return nil, diffTooLargeError{}
 	}
 	f, err := safefile.OpenNoFollow(rootFS, rel, os.O_RDONLY, 0)
 	if err != nil {
@@ -242,7 +255,7 @@ func readCappedFile(rootFS *os.Root, rel string, limit int64) (raw []byte, err e
 		return nil, fmt.Errorf("cannot include %s: %v", rel, err)
 	}
 	if int64(len(raw)) > limit {
-		return nil, fmt.Errorf("the diff exceeds %d bytes", gitDiffLimit)
+		return nil, diffTooLargeError{}
 	}
 	return raw, nil
 }
@@ -305,6 +318,15 @@ func quoteDiffPath(prefix, name string) string {
 	return b.String()
 }
 
+// looksBinary is git's own test for a binary file, over the first
+// binaryProbeBytes: a NUL.
+func looksBinary(raw []byte) bool {
+	if len(raw) > binaryProbeBytes {
+		raw = raw[:binaryProbeBytes]
+	}
+	return bytes.IndexByte(raw, 0) >= 0
+}
+
 func formatSyntheticDiff(rel string, raw []byte) string {
 	a, b := quoteDiffPath("a/", rel), quoteDiffPath("b/", rel)
 	header := []string{
@@ -313,11 +335,7 @@ func formatSyntheticDiff(rel string, raw []byte) string {
 		"--- /dev/null",
 		"+++ " + b,
 	}
-	probe := raw
-	if len(probe) > binaryProbeBytes {
-		probe = probe[:binaryProbeBytes]
-	}
-	if bytes.IndexByte(probe, 0) >= 0 {
+	if looksBinary(raw) {
 		header = append(header, fmt.Sprintf("Binary files %s and %s differ", a, b))
 		return strings.Join(header, "\n")
 	}

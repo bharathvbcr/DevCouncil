@@ -168,6 +168,11 @@ type Input struct {
 	// carries no bytes for the commits a moved one moved across, so Run names
 	// each as not scanned in the degraded reasons.
 	MovedGitlinks []proc.GitlinkChange
+	// ToolStateDiff is the tool-owned state the secret gate reads, apart from
+	// DiffContent: the other gates never see it. ToolStateUnscanned is what it
+	// could not carry, each entry a degraded reason. See toolstate.go.
+	ToolStateDiff      string
+	ToolStateUnscanned []string
 
 	// Commands are expected_tests, falling back to allowed_commands.
 	Commands []string
@@ -222,6 +227,8 @@ func (in *Input) WithGitState(state GitState) {
 	in.DiffEmpty = state.Empty
 	in.WorkPresent = !state.Empty
 	in.MovedGitlinks = state.MovedGitlinks
+	in.ToolStateDiff = state.ToolStateDiff
+	in.ToolStateUnscanned = state.ToolStateUnscanned
 }
 
 // CommandOutcome is the result of attempting to run one verification command.

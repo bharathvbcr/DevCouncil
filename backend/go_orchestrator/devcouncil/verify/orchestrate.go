@@ -174,6 +174,9 @@ func Run(ctx context.Context, in Input) (gaps []Gap, meta runMeta) {
 	// Independent of the rigor pass: a gitlink's range is not read whether or
 	// not dcverify ran, so the run says so either way.
 	meta.DegradedReasons = append(meta.DegradedReasons, gitlinkReasons(in.MovedGitlinks)...)
+	// Tool state the secret gate could not read as text, named whether or not
+	// the gate ran on the rest of it.
+	meta.DegradedReasons = append(meta.DegradedReasons, in.ToolStateUnscanned...)
 	if rigor.unavailable && !in.AllowNoRigor && modeEnforces(in.GateMode) {
 		// The secret and stub scans never ran. In enforce that is not a pass;
 		// the operator opts out explicitly, or installs dcverify.
@@ -426,6 +429,13 @@ type GitState struct {
 	// `Subproject commit` line, so nothing in Diff says what the submodule's
 	// history holds; Run names each as not scanned.
 	MovedGitlinks []proc.GitlinkChange
+	// ToolStateDiff is the diff of the tool-owned state (policy.ToolStateDirs)
+	// that git sees: tracked files, and untracked files git does not ignore.
+	// It is the secret gate's input and nothing else's: it is never in Diff or
+	// Changed. ToolStateUnscanned names what it could not carry, as degraded
+	// reasons. See toolstate.go for the limit: ignored files are not read.
+	ToolStateDiff      string
+	ToolStateUnscanned []string
 }
 
 // CollectGitState probes the working tree for changed files and unified diff:
@@ -524,11 +534,15 @@ func CollectGitStateReport(ctx context.Context, root string) (state GitState, er
 	if err != nil {
 		return GitState{}, err
 	}
+	var untrackedNames []string
 	for _, name := range strings.Split(string(untracked), "\x00") {
 		// A trailing slash is how git lists a repository nested in the tree that
 		// is neither ignored nor a submodule: its files are in no listing.
 		if strings.HasSuffix(name, "/") {
 			return GitState{}, proc.NestedRepositoryError(name)
+		}
+		if name != "" {
+			untrackedNames = append(untrackedNames, name)
 		}
 		add(name)
 	}
@@ -558,6 +572,10 @@ func CollectGitStateReport(ctx context.Context, root string) (state GitState, er
 		diff = string(diffBytes)
 	}
 	diff, err = attachMissingDiffBytes(ctx, git, root, changed, tracked, dirty, diff)
+	if err != nil {
+		return GitState{}, err
+	}
+	state.ToolStateDiff, state.ToolStateUnscanned, err = collectToolState(ctx, git, rootFS, untrackedNames, headless)
 	if err != nil {
 		return GitState{}, err
 	}
