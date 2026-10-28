@@ -1248,3 +1248,30 @@ fn no_language_publishes_an_empty_name_on_a_damaged_fixture() {
         failures.join("\n")
     );
 }
+
+/// ATTACK 4c. Found by the damaged-source sweep over 1,935 real files from the
+/// user's own trees (23,980 variants, one hit): deleting the `use` keyword from
+/// `use a::b::{self};` leaves a path with a brace list, which the Rust grammar
+/// reads as a struct expression with no spellable type, and the extractor
+/// publishes a `Constructor` reference named `""` (span `a::b::`). The file is
+/// Partial. Not the lane's: it touched only the Swift gate.
+#[test]
+#[ignore = "pre-existing on main: Rust ` a::b::{c};` (a use path missing its keyword) publishes a Constructor reference named \"\""]
+fn a_rust_path_with_a_brace_list_publishes_no_empty_constructor_name() {
+    let mut failures = Vec::new();
+    for source in [
+        " iceoryx2_pal_posix::posix::{self};\n",
+        " a::b::{self};\n",
+        " a::b::{c};\n",
+    ] {
+        let e = ex("a.rs", source);
+        let (calls, refs) = empty_names(&e);
+        if calls != 0 || refs != 0 {
+            failures.push(format!(
+                "{source:?}: {calls} empty call(s), {refs} empty reference(s) ({:?})",
+                e.parse_outcome
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
