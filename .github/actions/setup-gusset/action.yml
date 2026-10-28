@@ -29,7 +29,7 @@ runs:
         # DevCouncil release without a DevCouncil commit. ci:local and
         # rust/verify.sh fail when ../gusset is at another revision
         # (rust/gusset-engine/check-pin.sh).
-        ref: 320c56c27e1098f7e0a26e9854ff80c4f4354ef9
+        ref: e561435afaf6cbfc0331108a14dda4d9595dae54
         path: third_party/gusset
         persist-credentials: false
 
