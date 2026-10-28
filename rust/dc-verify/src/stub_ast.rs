@@ -174,6 +174,18 @@ pub fn analyze_within(
     added: &HashSet<u32>,
     budget: std::time::Duration,
 ) -> Result<Vec<AstFinding>, Unparsed> {
+    analyze_capped(lang, source, added, budget, MAX_SCOPE_CHECKS)
+}
+
+/// [`analyze_within`] with the per-file scope-check cap as a parameter, so a
+/// test can lower it.
+fn analyze_capped(
+    lang: Lang,
+    source: &str,
+    added: &HashSet<u32>,
+    budget: std::time::Duration,
+    scope_checks: usize,
+) -> Result<Vec<AstFinding>, Unparsed> {
     if source.len() > MAX_SOURCE_BYTES {
         return Err(Unparsed::TooLarge);
     }
@@ -220,7 +232,7 @@ pub fn analyze_within(
     // a `use` that comes after it, and a `use` in a function or an inline
     // module names the macro for the whole file as far as this scan goes.
     let imports = if lang == Lang::Rust {
-        RustImports::collect(root, source.as_bytes(), added)
+        RustImports::collect(root, source.as_bytes(), added, scope_checks)
     } else {
         RustImports::default()
     };
@@ -244,7 +256,7 @@ pub fn analyze_within(
     // one the scan already refused.
     let blocked = walker.out.iter().any(|f| f.severity == Severity::Blocking);
     if !blocked {
-        if imports.over_budget {
+        if imports.over_budget || imports.scope_checks_exhausted.get() {
             return Err(Unparsed::AliasWalkBudget);
         }
         if walker.unresolved || imports.unresolved {
@@ -333,17 +345,88 @@ impl UseRecord {
     }
 }
 
-/// A `macro_rules!` and the textual scope it is visible in: the block, module
-/// body or file it is written in, from its end onward.
-struct MacroDef {
-    scope: std::ops::Range<usize>,
-    end: usize,
+/// The `macro_rules!` of one file, indexed for the question "is a macro called
+/// `name` in textual scope at byte `at`".
+///
+/// A macro is visible from its end to the end of the block, module body or file
+/// it is written in. Those scopes nest or are disjoint, so the distinct ones
+/// form a tree; each scope keeps, per name, the end of its earliest definition
+/// (the earliest is the only one that can matter). A question is then answered
+/// by walking the scopes that hold `at` from the inside out, which is as deep
+/// as the nesting and not as many as the definitions.
+#[derive(Default)]
+struct MacroScopes {
+    /// Distinct scopes, by start ascending then end descending.
+    scopes: Vec<std::ops::Range<usize>>,
+    /// The scope each one is nested in.
+    parent: Vec<Option<usize>>,
+    /// Name, then scope, to the end of the earliest definition in that scope.
+    earliest_end: HashMap<String, HashMap<usize, usize>>,
+}
+
+impl MacroScopes {
+    fn build(defs: Vec<(String, std::ops::Range<usize>, usize)>) -> Self {
+        let mut scopes: Vec<std::ops::Range<usize>> =
+            defs.iter().map(|(_, scope, _)| scope.clone()).collect();
+        scopes.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+        scopes.dedup();
+        let mut parent = Vec::with_capacity(scopes.len());
+        let mut open: Vec<usize> = Vec::new();
+        for (index, scope) in scopes.iter().enumerate() {
+            while open.last().is_some_and(|top| scopes[*top].end < scope.end) {
+                open.pop();
+            }
+            parent.push(open.last().copied());
+            open.push(index);
+        }
+        let mut earliest_end: HashMap<String, HashMap<usize, usize>> = HashMap::new();
+        for (name, scope, end) in defs {
+            // Every definition's scope was indexed above, so this always
+            // finds it; a definition it could not find would only leave its
+            // alias in force.
+            let Ok(index) =
+                scopes.binary_search_by(|s| s.start.cmp(&scope.start).then(scope.end.cmp(&s.end)))
+            else {
+                continue;
+            };
+            let slot = earliest_end
+                .entry(name)
+                .or_default()
+                .entry(index)
+                .or_insert(end);
+            *slot = (*slot).min(end);
+        }
+        Self {
+            scopes,
+            parent,
+            earliest_end,
+        }
+    }
+
+    fn defines(&self, name: &str) -> bool {
+        self.earliest_end.contains_key(name)
+    }
+
+    /// Where the walk outward from `at` starts: the last scope that starts at
+    /// or before `at`. If it ends before `at` the scope holding `at` (if any)
+    /// is one it is nested in, so the walk reaches it through `parent`. `None`
+    /// when no indexed scope starts that early.
+    fn innermost_candidate(&self, at: usize) -> Option<usize> {
+        self.scopes
+            .partition_point(|s| s.start <= at)
+            .checked_sub(1)
+    }
 }
 
 /// A cap on the `use` leaves one file is resolved from, and on the steps taken
 /// resolving them. A file past either is degraded, never half resolved.
 const MAX_USE_RECORDS: usize = 50_000;
 const MAX_ALIAS_STEPS: usize = 500_000;
+/// A cap on the scopes examined answering "is this macro defined here" over one
+/// file, summed over every invocation. A file past it is degraded, and the
+/// question that hit the cap is answered "not defined", so an alias stays in
+/// force: a hostile file can cost this scan at most this many checks.
+const MAX_SCOPE_CHECKS: usize = 1_000_000;
 
 /// What the `use` declarations, `extern crate`s, `mod x;` and `macro_rules!` of
 /// one Rust file say about the macros its invocations name.
@@ -363,13 +446,18 @@ struct RustImports {
     local_mods: HashSet<String>,
     /// Macros this file defines, by name. A macro's body is scanned where it
     /// stands, so a call it resolves to is not another file's.
-    macro_defs: HashMap<String, Vec<MacroDef>>,
+    macro_defs: MacroScopes,
     /// An added aliased `pub use` of std's `todo!` or `unimplemented!` makes
     /// the alias callable from files this scan is not reading, or a `use` tree
     /// was too large to read in full.
     unresolved: bool,
     /// The alias walk was cut off at a cap, so the aliases it found are not all.
     over_budget: bool,
+    /// The scope-check cap for this file, and how much of it the invocations
+    /// have spent. A query that finds the cap spent sets `scope_checks_exhausted`.
+    scope_check_cap: usize,
+    scope_checks_spent: std::cell::Cell<usize>,
+    scope_checks_exhausted: std::cell::Cell<bool>,
 }
 
 /// What a name the resolver has learnt stands for.
@@ -388,9 +476,13 @@ fn stub_macro(name: &str) -> Option<&'static str> {
 impl RustImports {
     /// Reads the file's imports in one pass over the tree and one indexed walk
     /// over the `use` leaves, each leaf visited once per name that triggers it.
-    fn collect(root: Node<'_>, src: &[u8], added: &HashSet<u32>) -> Self {
+    fn collect(root: Node<'_>, src: &[u8], added: &HashSet<u32>, scope_check_cap: usize) -> Self {
         let mut records = Vec::new();
-        let mut out = RustImports::default();
+        let mut defs = Vec::new();
+        let mut out = RustImports {
+            scope_check_cap,
+            ..RustImports::default()
+        };
         for node in descendants(root) {
             if records.len() > MAX_USE_RECORDS {
                 out.over_budget = true;
@@ -421,14 +513,7 @@ impl RustImports {
                 }
                 "macro_definition" => {
                     if let Some(name) = node.child_by_field_name("name") {
-                        let scope = scope_of(node);
-                        out.macro_defs
-                            .entry(node_name(name, src))
-                            .or_default()
-                            .push(MacroDef {
-                                scope,
-                                end: node.end_byte(),
-                            });
+                        defs.push((node_name(name, src), scope_of(node), node.end_byte()));
                     }
                 }
                 "mod_item" if node.child_by_field_name("body").is_none() => {
@@ -439,6 +524,7 @@ impl RustImports {
                 _ => {}
             }
         }
+        out.macro_defs = MacroScopes::build(defs);
         if records.len() > MAX_USE_RECORDS {
             out.over_budget = true;
             return out;
@@ -539,10 +625,38 @@ impl RustImports {
     /// Whether a `macro_rules!` called `name` is visible at byte `at`: written
     /// in a block, module or file that holds `at`, and before it. Textual scope
     /// ends with the module, so a macro in `mod tests` hides nothing outside it.
+    ///
+    /// Each scope examined spends one of the file's [`MAX_SCOPE_CHECKS`]. When
+    /// they are spent this answers `false` (the alias stays in force) and
+    /// records that the file is to be degraded.
     fn defined_at(&self, name: &str, at: usize) -> bool {
-        self.macro_defs
-            .get(name)
-            .is_some_and(|defs| defs.iter().any(|d| d.scope.contains(&at) && d.end <= at))
+        let Some(by_scope) = self.macro_defs.earliest_end.get(name) else {
+            return false;
+        };
+        let mut scope = self.macro_defs.innermost_candidate(at);
+        while let Some(index) = scope {
+            if !self.spend_scope_check() {
+                return false;
+            }
+            if self.macro_defs.scopes[index].end > at
+                && by_scope.get(&index).is_some_and(|end| *end <= at)
+            {
+                return true;
+            }
+            scope = self.macro_defs.parent[index];
+        }
+        false
+    }
+
+    /// Spends one scope check, or reports that none are left.
+    fn spend_scope_check(&self) -> bool {
+        let spent = self.scope_checks_spent.get();
+        if spent >= self.scope_check_cap {
+            self.scope_checks_exhausted.set(true);
+            return false;
+        }
+        self.scope_checks_spent.set(spent + 1);
+        true
     }
 
     /// The std macro the name written at byte `at` is an alias of, unless a
@@ -564,7 +678,7 @@ impl RustImports {
             [first, .., last] => {
                 (matches!(first.as_str(), "crate" | "super" | "self")
                     || self.local_mods.contains(first))
-                    && !self.macro_defs.contains_key(last)
+                    && !self.macro_defs.defines(last)
             }
             [] => false,
         }
@@ -1713,4 +1827,73 @@ fn asserting_name(name: &str) -> bool {
         .iter()
         .any(|p| lowered.contains(p))
         || matches!(name, "unwrap" | "unwrap_err" | "fatal")
+}
+
+#[cfg(test)]
+mod scope_check_cap_tests {
+    use super::*;
+
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// A block that defines a macro of the name `use` imports, then `calls`
+    /// invocations the definition covers. Every line is added.
+    fn covered_calls(import: &str, calls: usize) -> (String, HashSet<u32>) {
+        let mut body = format!("{import}\npub fn f() {{\n    macro_rules! t {{ () => {{}}; }}\n");
+        for _ in 0..calls {
+            body.push_str("    t!();\n");
+        }
+        body.push_str("}\n");
+        let lines = body.lines().count() as u32;
+        (body, (1..=lines).collect())
+    }
+
+    fn analyze(body: &str, added: &HashSet<u32>, cap: usize) -> Result<Vec<AstFinding>, Unparsed> {
+        analyze_capped(Lang::Rust, body, added, BUDGET, cap)
+    }
+
+    /// The smallest cap under which the file is read to the end, clean, found
+    /// by search: the outcome never gets worse as the cap rises.
+    fn smallest_resolving_cap(body: &str, added: &HashSet<u32>) -> usize {
+        let (mut low, mut high) = (0usize, MAX_SCOPE_CHECKS);
+        let clean = |cap| matches!(analyze(body, added, cap), Ok(f) if f.is_empty());
+        assert!(clean(high));
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if clean(mid) {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+        low
+    }
+
+    #[test]
+    fn a_cap_one_short_degrades_and_the_cap_itself_resolves() {
+        // `crate::inner::t` is another file's macro unless the block's own
+        // `macro_rules!` is in scope, so a file that cannot say is degraded.
+        let (body, added) = covered_calls("use crate::inner::t;", 40);
+        let needed = smallest_resolving_cap(&body, &added);
+        assert!(
+            needed >= 40,
+            "each call spends at least one check: {needed}"
+        );
+        assert_eq!(analyze(&body, &added, needed).unwrap(), Vec::new());
+        assert_eq!(
+            analyze(&body, &added, needed - 1).unwrap_err(),
+            Unparsed::AliasWalkBudget
+        );
+    }
+
+    #[test]
+    fn spent_cap_leaves_the_alias_in_force() {
+        // With no check left the macro is not seen as defined, so the stub
+        // alias is read as the stub it is: blocked, not degraded.
+        let (body, added) = covered_calls("use std::todo as t;", 3);
+        let findings = analyze(&body, &added, 0);
+        assert!(
+            matches!(&findings, Ok(f) if f.iter().any(|f| f.severity == Severity::Blocking)),
+            "{findings:?}"
+        );
+    }
 }

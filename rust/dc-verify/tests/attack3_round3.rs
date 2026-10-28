@@ -170,9 +170,15 @@ fn a4_many_scoped_definitions_times_many_calls_is_bounded() {
     }
     body.push_str("}\n");
     assert!(body.len() < (2 << 20), "{}", body.len());
-    let (took, _r) = timed(&body);
+    let (took, r) = timed(&body);
     eprintln!("defs x calls: {took:?}");
-    assert!(took < Duration::from_secs(10), "took {took:?}");
+    // The index answers each call from the scopes that hold it, and a file is
+    // capped at `MAX_SCOPE_CHECKS` of them, so this is bounded whatever the
+    // machine; 2 s in debug is the stated bound.
+    assert!(took < Duration::from_secs(2), "took {took:?}");
+    // The probe's calls are outside every definition's scope, so the alias is
+    // in force: the exact verdict is a block, never a clean file.
+    assert!(blocked(&r) || r.unparsed.iter().any(|u| u.reason == "alias-walk-budget"));
 }
 
 // ---- unreadable sources ------------------------------------------------------
