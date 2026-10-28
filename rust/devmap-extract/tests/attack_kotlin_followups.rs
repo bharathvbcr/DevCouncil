@@ -609,24 +609,149 @@ fn the_flipped_files_extract_the_same_tables_as_their_clean_twins() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// BREAK (MEDIUM, a phantom fact). The hidden token that makes `x as? String ??
-/// "d"` a recovery is read as a call with no name: the Swift walk publishes a
-/// `Call` with `callee_name == ""` (and a `Call` reference named `""`) that the
-/// parenthesised spelling of the same expression does not. On main the file
-/// was Clean and carried it; on the lane it is Partial and still carries it.
-/// An empty name can never be a callee, so it should be neither published nor
-/// the reason a file is distrusted.
+/// The diagnostic the Swift gate leaves when it refuses an operator the grammar
+/// inserted with no spelling, for `n` sites.
+fn refusal_note(n: usize) -> String {
+    format!("swift: refused {n} call(s) on an operator the grammar inserted with no spelling")
+}
+
+fn refusal_notes(e: &Extraction) -> Vec<&str> {
+    e.diagnostics
+        .iter()
+        .map(String::as_str)
+        .filter(|d| d.starts_with("swift: refused"))
+        .collect()
+}
+
+fn empty_names(e: &Extraction) -> (usize, usize) {
+    (
+        e.calls
+            .iter()
+            .filter(|c| c.callee_name.trim().is_empty())
+            .count(),
+        e.references
+            .iter()
+            .filter(|r| r.name.trim().is_empty())
+            .count(),
+    )
+}
+
+/// BREAK (MEDIUM, a phantom fact), fixed. tree-sitter-swift reads `x as? String
+/// ?? "d"` as `String??` followed by a hidden, zero-width `custom_operator`
+/// that recovery inserted. Nothing in the tree is an error or missing node, so
+/// the file stays `Clean` (the hidden-error arm is Kotlin-only by design) and
+/// the Swift walk used to publish a `Call` and a `Call` reference named `""`
+/// that the parenthesised spelling of the same expression does not carry. The
+/// gate in `extract_swift_call` now refuses a call with no spelling: the file
+/// stays Clean, the empty pair is gone, the bare spelling's tables equal its
+/// twin's, and the refusal is counted in one diagnostic so it is not silent.
 #[test]
-#[ignore = "pre-existing on main; filed separately"]
 fn a_swift_nil_coalesced_string_cast_publishes_no_call_with_an_empty_name() {
+    // (label, bare spelling, parenthesised twin, refused sites on the bare one)
+    let cases: &[(&str, &str, &str, usize)] = &[
+        (
+            "a as?",
+            "let a = b as? String ?? \"x\"\n",
+            "let a = (b as? String) ?? \"x\"\n",
+            1,
+        ),
+        (
+            "c as!",
+            "let a = b as! String ?? \"x\"\n",
+            "let a = (b as! String) ?? \"x\"\n",
+            1,
+        ),
+        (
+            "g three lines",
+            "let a = b\n    as? String\n    ?? \"x\"\n",
+            "let a = (b\n    as? String)\n    ?? \"x\"\n",
+            1,
+        ),
+        (
+            "h closure",
+            "let a = items.map { $0 as? String ?? \"x\" }\n",
+            "let a = items.map { ($0 as? String) ?? \"x\" }\n",
+            1,
+        ),
+        (
+            "i return",
+            "func f(r: [String: Any]) -> String {\n    return r[\"e\"] as? String ?? \"x\"\n}\n",
+            "func f(r: [String: Any]) -> String {\n    return (r[\"e\"] as? String) ?? \"x\"\n}\n",
+            1,
+        ),
+        // Regression guards: already equal to the twin on main, nothing refused.
+        (
+            "d try?",
+            "let a = try? g() ?? \"x\"\n",
+            "let a = (try? g()) ?? \"x\"\n",
+            0,
+        ),
+        (
+            "f array cast",
+            "let a = b as? [String] ?? []\n",
+            "let a = (b as? [String]) ?? []\n",
+            0,
+        ),
+    ];
+    let mut failures = Vec::new();
+    let outcome_of = label;
+    for (label, bare, paren, refused) in cases {
+        let (e, twin_e) = (ex("a.swift", bare), ex("a.swift", paren));
+        let (calls, refs) = empty_names(&e);
+        if calls != 0 || refs != 0 {
+            failures.push(format!(
+                "{label} {bare:?}: {calls} empty-name call(s), {refs} empty-name reference(s)"
+            ));
+        }
+        if !clean(&e) {
+            failures.push(format!(
+                "{label} {bare:?}: not Clean: {}",
+                outcome_of(&e, bare)
+            ));
+        }
+        if !clean(&twin_e) {
+            failures.push(format!("{label} {paren:?}: the twin is not Clean"));
+        }
+        let want: Vec<String> = if *refused == 0 {
+            Vec::new()
+        } else {
+            vec![refusal_note(*refused)]
+        };
+        let got: Vec<&str> = refusal_notes(&e);
+        if got != want.iter().map(String::as_str).collect::<Vec<_>>() {
+            failures.push(format!(
+                "{label} {bare:?}: refusal diagnostics {got:?}, wanted {want:?} in {:?}",
+                e.diagnostics
+            ));
+        }
+        if *refused == 0 && !e.diagnostics.is_empty() {
+            failures.push(format!(
+                "{label} {bare:?}: a guard case carries diagnostics {:?}",
+                e.diagnostics
+            ));
+        }
+        let diffs = table_diffs(&e, &twin_e);
+        if !diffs.is_empty() {
+            failures.push(format!("{label} {bare:?} vs twin: {}", diffs.join("; ")));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Shapes the grammar already abstains on (a visible `ERROR` node, so Partial)
+/// must not publish an empty name either; case `e` used to emit one.
+#[test]
+fn a_swift_partial_nil_coalesce_shape_publishes_no_empty_name() {
     let mut failures = Vec::new();
     for source in [
-        "let a = b as? String ?? \"x\"\n",
-        "func f(r: [String: Any]) -> String {\n    return r[\"e\"] as? String ?? \"x\"\n}\n",
+        "let a = b as? String ?? f()\n",
+        "let a = b as? String ?? c as? String ?? \"x\"\n",
+        "let a = b as? String ?? Foo()\n",
+        "let a = b as? String ?? x.y()\n",
+        "let a = b as? String ?? 0 + h()\n",
     ] {
         let e = ex("a.swift", source);
-        let calls = e.calls.iter().filter(|c| c.callee_name.is_empty()).count();
-        let refs = e.references.iter().filter(|r| r.name.is_empty()).count();
+        let (calls, refs) = empty_names(&e);
         if calls != 0 || refs != 0 {
             failures.push(format!(
                 "{source:?}: {calls} empty-name call(s), {refs} empty-name reference(s)"
@@ -634,4 +759,28 @@ fn a_swift_nil_coalesced_string_cast_publishes_no_call_with_an_empty_name() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Two bare sites in one file are one diagnostic line carrying N=2, and the
+/// note belongs to that file alone: the next extraction on the same thread
+/// starts with none, and a Clean file without such a site has none.
+#[test]
+fn the_swift_refusal_note_is_one_line_per_file_and_does_not_leak() {
+    let two = "let a = b as? String ?? \"x\"\nlet c = d as! String ?? \"y\"\n";
+    let first = ex("a.swift", two);
+    assert_eq!(
+        refusal_notes(&first),
+        vec![refusal_note(2).as_str()],
+        "diagnostics: {:?}",
+        first.diagnostics
+    );
+    assert_eq!(empty_names(&first), (0, 0));
+
+    let next = ex("b.swift", "func g() {}\nlet a = (b as? String) ?? \"x\"\n");
+    assert!(clean(&next));
+    assert!(
+        next.diagnostics.is_empty(),
+        "the previous file's note leaked: {:?}",
+        next.diagnostics
+    );
 }

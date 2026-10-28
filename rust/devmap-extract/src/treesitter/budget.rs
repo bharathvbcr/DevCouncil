@@ -14,6 +14,9 @@ thread_local! {
     /// and how often. See [`note_nesting_cap`].
     pub(super) static NESTING_CAPS: RefCell<BTreeMap<&'static str, usize>> =
         const { RefCell::new(BTreeMap::new()) };
+    /// Swift calls refused in this file because the grammar's recovery inserted
+    /// an operator with no spelling. See [`note_swift_unspelled_operator`].
+    pub(super) static SWIFT_UNSPELLED_OPERATORS: Cell<usize> = const { Cell::new(0) };
     /// Byte ranges of statements the Kotlin loss detector charged, which the
     /// walks that derive per-scope tables leave out. See [`set_charged_regions`].
     pub(super) static CHARGED_REGIONS: RefCell<Vec<(usize, usize)>> =
@@ -56,6 +59,7 @@ impl BudgetGuard {
         WALK_OVERRAN.with(|slot| slot.set(false));
         PARENT_STEPS.with(|slot| slot.set(0));
         NESTING_CAPS.with(|caps| caps.borrow_mut().clear());
+        SWIFT_UNSPELLED_OPERATORS.with(|count| count.set(0));
         BudgetGuard {
             outer,
             outer_regions,
@@ -236,6 +240,28 @@ pub(super) fn take_nesting_cap_notes() -> Vec<String> {
             })
             .collect()
     })
+}
+
+/// Record that the Swift call gate refused an operator call whose operator has
+/// no spelling.
+///
+/// tree-sitter-swift recovers `x as? String ?? "d"` by inserting a hidden,
+/// zero-width `custom_operator` that is neither an error nor a missing node, so
+/// the file stays `Clean` and nothing else says a site was left out.
+/// [`take_swift_unspelled_operator_notes`] turns the count into a diagnostic.
+pub(crate) fn note_swift_unspelled_operator() {
+    SWIFT_UNSPELLED_OPERATORS.with(|count| count.set(count.get() + 1));
+}
+
+/// The one diagnostic for this file's refused Swift calls, or none.
+pub(super) fn take_swift_unspelled_operator_notes() -> Vec<String> {
+    let count = SWIFT_UNSPELLED_OPERATORS.with(|count| count.replace(0));
+    if count == 0 {
+        return Vec::new();
+    }
+    vec![format!(
+        "swift: refused {count} call(s) on an operator the grammar inserted with no spelling"
+    )]
 }
 
 /// Drop the per-scope local-name cache between files.

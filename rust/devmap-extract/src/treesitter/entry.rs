@@ -1068,6 +1068,9 @@ pub(super) fn extract_treesitter_before_deadline(
                 extraction.literals = literals;
                 extraction.diagnostics.append(&mut notes);
                 extraction.diagnostics.extend(take_nesting_cap_notes());
+                extraction
+                    .diagnostics
+                    .extend(take_swift_unspelled_operator_notes());
                 #[cfg(test)]
                 EXTRACTION_FINISH_HOOK.with(|hook| {
                     if let Some(finish) = hook.take() {
