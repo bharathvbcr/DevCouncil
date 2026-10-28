@@ -1140,3 +1140,59 @@ fn a_long_chain_off_a_bare_cast_publishes_no_cast_text_receiver() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// ATTACK 2, found in real code (2 of 2,615 Swift files under ~/Code): a
+/// nil-coalescing chain with no cast at all, `a ?? rows.map { .. }.max()`,
+/// is read as `(a ?? rows.map { .. }).max()`, so `max` is published on the
+/// receiver `a ?? rows.map { .. }`. The lane's contract names `??` recovery
+/// text, but its predicate only recognises an `as_expression` base.
+#[test]
+#[ignore = "pre-existing on main: a `??` chain with no cast is outside swift_on_bare_cast; main published the same receiver"]
+fn a_coalesce_chain_without_a_cast_publishes_no_coalesce_text_receiver() {
+    let mut failures = Vec::new();
+    for source in [
+        "let m = a ?? rows.map { $0.w }.max()\n",
+        "let m = a ?? rows.map { $0.w }.first\n",
+        "let t = x?.text ?? y.first { $0.k }?.text\n",
+        "let t = a ?? b.c\n",
+        "let t = a ?? b.c()\n",
+        "let t = a ?? Color.make().hash\n",
+    ] {
+        let e = ex("a.swift", source);
+        for leak in leaks(&e) {
+            failures.push(format!("{source:?}: {leak}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// ATTACK 4. Across every damaged and valid Rust probe (the callers of
+/// `rust_type_name`: constructors, implicit drop and from, try conversions,
+/// typed parameters and bindings, deref impls, wrapped values), no table
+/// carries an empty type name, receiver or initializer.
+#[test]
+fn no_rust_probe_publishes_an_empty_type_name_in_any_table() {
+    let mut failures = Vec::new();
+    let mut seen = 0;
+    for (label, path, source) in probes() {
+        if !label.starts_with("rust:") {
+            continue;
+        }
+        seen += 1;
+        let json = serde_json::to_string(&ex(&path, &source)).expect("serialize");
+        for needle in [
+            "\"declared_type\":\"\"",
+            "\"receiver_expr\":\"\"",
+            "\"initializer\":\"\"",
+            "\"initializer\":\"{..}\"",
+            "\"callee_name\":\"\"",
+            "\"name\":\"\"",
+        ] {
+            if json.contains(needle) {
+                failures.push(format!("{label}: {needle}"));
+            }
+        }
+    }
+    assert!(seen > 100, "only {seen} rust probes");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
