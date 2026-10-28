@@ -129,6 +129,20 @@ pub enum Unparsed {
     /// The alias walk was cut off at its cap, so the aliases it found are not
     /// all of them.
     AliasWalkBudget,
+    /// No working-tree root was given, so the file's source was never looked for.
+    NoRoot,
+    /// The path leaves the working tree or runs through a symlink, so the source
+    /// is not read.
+    OutsideRoot,
+    /// The file the diff changed is not in the working tree.
+    SourceMissing,
+    /// The path is not a regular file (a directory, a FIFO, a device).
+    NotRegular,
+    /// The file exists and could not be read.
+    ReadError,
+    /// The source does not hold the added lines where the diff says they are, so
+    /// the working tree has moved on since the diff was taken.
+    SourceStale,
 }
 
 impl Unparsed {
@@ -144,6 +158,12 @@ impl Unparsed {
             }
             Unparsed::AliasInTokenTree => "alias-in-token-tree",
             Unparsed::AliasWalkBudget => "alias-walk-budget",
+            Unparsed::NoRoot => "source not read: no working-tree root",
+            Unparsed::OutsideRoot => "source not read: path outside the working tree",
+            Unparsed::SourceMissing => "source not read: file missing",
+            Unparsed::NotRegular => "source not read: not a regular file",
+            Unparsed::ReadError => "source not read: unreadable",
+            Unparsed::SourceStale => "source does not match the diff",
         }
     }
 }

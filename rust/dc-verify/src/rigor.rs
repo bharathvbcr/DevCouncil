@@ -202,6 +202,18 @@ pub fn detect_stubs_report(
                 }
                 None
             }
+            Err(PostImageMiss::Stale) => {
+                // A source that is not the one the diff was taken from cannot be
+                // attributed to its lines. The substring checks still run, and
+                // the report says the tree never read the file.
+                if lang.is_some() {
+                    unparsed.push(UnparsedFile {
+                        path: file.path.clone(),
+                        reason: stub_ast::Unparsed::SourceStale.as_str(),
+                    });
+                }
+                None
+            }
             Err(PostImageMiss::Unknown) => None,
         };
         let lines: Option<Vec<&str>> = post_image.as_deref().map(|s| s.lines().collect());
@@ -270,8 +282,11 @@ enum PostImageMiss {
     /// The source is past [`stub_ast::MAX_SOURCE_BYTES`]. It is known, and it is
     /// not read, which a report must say: nothing was checked.
     TooLarge,
-    /// No source was given, or it does not agree with the diff.
+    /// No source was given. The caller knows why and reports it; this crate
+    /// cannot.
     Unknown,
+    /// A source was given and does not agree with the diff.
+    Stale,
 }
 
 /// The file as it stands after the change, or why it cannot be known.
@@ -312,7 +327,7 @@ fn post_image(
     if agrees {
         Ok(text)
     } else {
-        Err(PostImageMiss::Unknown)
+        Err(PostImageMiss::Stale)
     }
 }
 
