@@ -418,10 +418,10 @@ impl MacroScopes {
     }
 }
 
-/// A cap on the `use` leaves one file is resolved from, and on the steps taken
-/// resolving them. A file past either is degraded, never half resolved.
+/// A cap on the `use` leaves one file is resolved from, and on the nodes the
+/// resolution visits. A file past either is degraded, never half resolved.
 const MAX_USE_RECORDS: usize = 50_000;
-const MAX_ALIAS_STEPS: usize = 500_000;
+const MAX_ALIAS_VISITS: usize = 500_000;
 /// A cap on the scopes examined answering "is this macro defined here" over one
 /// file, summed over every invocation. A file past it is degraded, and the
 /// question that hit the cap is answered "not defined", so an alias stays in
@@ -468,6 +468,13 @@ enum Learnt {
     Stub(&'static str),
 }
 
+/// How far up a name's binding may move: `panic` is the weakest stub, and
+/// `todo` and `unimplemented` are equal, so the first of them to bind a name
+/// keeps it.
+fn stub_rank(stub: &str) -> u8 {
+    if stub == "panic" { 1 } else { 2 }
+}
+
 /// The macro among [`STUB_MACROS`] that `name` is.
 fn stub_macro(name: &str) -> Option<&'static str> {
     STUB_MACROS.iter().copied().find(|m| *m == name)
@@ -511,7 +518,7 @@ impl RustImports {
                         });
                     }
                 }
-                "macro_definition" => {
+                "macro_definition" if !is_cfg_gated(node, src) => {
                     if let Some(name) = node.child_by_field_name("name") {
                         defs.push((node_name(name, src), scope_of(node), node.end_byte()));
                     }
@@ -529,7 +536,7 @@ impl RustImports {
             out.over_budget = true;
             return out;
         }
-        out.resolve_aliases(&records);
+        out.resolve_aliases(&records, MAX_ALIAS_VISITS);
         for record in &records {
             let local = record.path.first().is_some_and(|root| {
                 matches!(root.as_str(), "crate" | "super" | "self") || out.local_mods.contains(root)
@@ -558,11 +565,20 @@ impl RustImports {
     /// Binds every name that comes to stand for a std stub macro.
     ///
     /// The leaves are indexed by the first segment of their path, and a name is
-    /// looked up once, when it is learnt: `use std as s; use s::todo as t;
-    /// use self::t as u;` is three lookups however the declarations are ordered,
-    /// where a pass over all leaves per round was quadratic in a reverse chain.
-    /// A walk past [`MAX_ALIAS_STEPS`] stops and says so.
-    fn resolve_aliases(&mut self, records: &[UseRecord]) {
+    /// looked up once per thing it is learnt to be: `use std as s; use s::todo
+    /// as t; use self::t as u;` is three lookups however the declarations are
+    /// ordered, where a pass over all leaves per round was quadratic in a
+    /// reverse chain.
+    ///
+    /// A name's binding only moves up ([`stub_rank`]: none, then `panic`, then
+    /// `todo` or `unimplemented`, where a second stub keeps the first), so it
+    /// changes at most twice and each `(name, what it is)` is queued once. A
+    /// binding that could flip back and forth re-queued the name on every flip,
+    /// and every re-queue visited every leaf under it. What is counted against
+    /// `max_visits` is each name taken from the queue and each leaf looked at,
+    /// so the cap bounds the work itself and not just the number of pops. The
+    /// number of visits made is returned.
+    fn resolve_aliases(&mut self, records: &[UseRecord], max_visits: usize) -> usize {
         let mut by_first: HashMap<&str, Vec<&UseRecord>> = HashMap::new();
         for record in records {
             if let Some(first) = record.relative().first() {
@@ -570,28 +586,38 @@ impl RustImports {
             }
         }
         self.roots = STD_ROOTS.iter().map(|r| (*r).to_string()).collect();
-        let mut queue: Vec<(String, Learnt)> = STD_ROOTS
-            .iter()
-            .map(|r| ((*r).to_string(), Learnt::Root))
-            .collect();
-        let mut steps = 0usize;
+        let mut queued: HashSet<(String, Option<&'static str>)> = HashSet::new();
+        let mut queue: Vec<(String, Learnt)> = Vec::new();
+        for root in STD_ROOTS {
+            if queued.insert(((*root).to_string(), None)) {
+                queue.push(((*root).to_string(), Learnt::Root));
+            }
+        }
+        let mut visits = 0usize;
         while let Some((name, learnt)) = queue.pop() {
-            steps += 1;
-            if steps > MAX_ALIAS_STEPS {
+            visits += 1;
+            if visits > max_visits {
                 self.over_budget = true;
-                return;
+                return visits;
             }
             let Some(leaves) = by_first.get(name.as_str()) else {
                 continue;
             };
             for record in leaves {
+                visits += 1;
+                if visits > max_visits {
+                    self.over_budget = true;
+                    return visits;
+                }
                 if record.alias == "_" {
                     continue;
                 }
                 let relative = record.relative();
                 let bound = match learnt {
                     Learnt::Root if relative.len() == 1 => {
-                        if self.roots.insert(record.alias.clone()) {
+                        if self.roots.insert(record.alias.clone())
+                            && queued.insert((record.alias.clone(), None))
+                        {
                             queue.push((record.alias.clone(), Learnt::Root));
                         }
                         None
@@ -601,12 +627,19 @@ impl RustImports {
                     Learnt::Stub(_) => None,
                 };
                 if let Some(stub) = bound
-                    && self.aliases.insert(record.alias.clone(), stub) != Some(stub)
+                    && self
+                        .aliases
+                        .get(&record.alias)
+                        .is_none_or(|have| stub_rank(stub) > stub_rank(have))
                 {
-                    queue.push((record.alias.clone(), Learnt::Stub(stub)));
+                    self.aliases.insert(record.alias.clone(), stub);
+                    if queued.insert((record.alias.clone(), Some(stub))) {
+                        queue.push((record.alias.clone(), Learnt::Stub(stub)));
+                    }
                 }
             }
         }
+        visits
     }
 
     /// The std macro a leaf re-exports, however it reaches it: a std path, a
@@ -683,6 +716,32 @@ impl RustImports {
             [] => false,
         }
     }
+}
+
+/// Whether a `#[cfg(..)]` or `#[cfg_attr(..)]` stands on `node`. The attributes
+/// are preceding siblings of the item, with doc comments allowed between them.
+///
+/// Such a `macro_rules!` may be compiled out, and then the name is the std alias.
+/// Registering it would let a definition that no build contains shadow that
+/// alias, so it is not registered: the alias stays in force, and some build
+/// compiles the stub it names.
+fn is_cfg_gated(node: Node<'_>, src: &[u8]) -> bool {
+    let mut at = node.prev_named_sibling();
+    while let Some(prev) = at {
+        if prev.kind() == "attribute_item" {
+            let name = prev
+                .named_child(0)
+                .and_then(|attribute| attribute.named_child(0))
+                .map(|first| node_name(first, src));
+            if matches!(name.as_deref(), Some("cfg" | "cfg_attr")) {
+                return true;
+            }
+        } else if !is_comment(prev) {
+            return false;
+        }
+        at = prev.prev_named_sibling();
+    }
+    false
 }
 
 /// The byte range of the block, module body or file that `node` is written in.
@@ -1895,5 +1954,91 @@ mod scope_check_cap_tests {
             matches!(&findings, Ok(f) if f.iter().any(|f| f.severity == Severity::Blocking)),
             "{findings:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod alias_walk_tests {
+    use super::*;
+
+    fn record(path: &[&str], alias: &str) -> UseRecord {
+        UseRecord {
+            path: path.iter().map(|s| (*s).to_string()).collect(),
+            alias: alias.to_string(),
+            added: true,
+            public: false,
+        }
+    }
+
+    /// The shape that made one pop cost every leaf under its name: `t` is bound
+    /// to `todo` and `unimplemented` in turn, and `t` and `u` hand each other
+    /// the flip.
+    fn pingpong(k: usize, m: usize) -> Vec<UseRecord> {
+        let mut records = Vec::new();
+        for _ in 0..k {
+            records.push(record(&["std", "todo"], "t"));
+            records.push(record(&["std", "unimplemented"], "t"));
+        }
+        for _ in 0..m {
+            records.push(record(&["t"], "u"));
+        }
+        for _ in 0..m {
+            records.push(record(&["u"], "t"));
+        }
+        records
+    }
+
+    #[test]
+    fn visits_stay_linear_in_the_records_however_the_binding_flips() {
+        let records = pingpong(300, 300);
+        let mut imports = RustImports::default();
+        // A cap the quadratic walk passed by orders of magnitude (it made
+        // ~k*m leaf visits per round): the monotone walk needs a few per leaf.
+        let visits = imports.resolve_aliases(&records, 4 * records.len() + 16);
+        assert!(
+            !imports.over_budget,
+            "visited {visits} for {} records",
+            records.len()
+        );
+        assert!(visits <= 4 * records.len() + 16, "{visits}");
+        assert_eq!(imports.aliases.get("t"), Some(&"todo"));
+        assert_eq!(imports.aliases.get("u"), Some(&"todo"));
+    }
+
+    #[test]
+    fn a_lowered_cap_counts_leaf_visits_and_degrades() {
+        let records = pingpong(50, 50);
+        let mut imports = RustImports::default();
+        let visits = imports.resolve_aliases(&records, 40);
+        assert!(imports.over_budget);
+        assert_eq!(visits, 41, "the walk stops at the first visit past the cap");
+    }
+
+    #[test]
+    fn one_first_segment_with_many_names_is_visited_once_per_binding() {
+        // `use std::todo as a0; ...` under one root: every leaf hangs off
+        // `std`, which is learnt once.
+        let records: Vec<UseRecord> = (0..2_000)
+            .map(|i| record(&["std", "todo"], &format!("a{i}")))
+            .collect();
+        let mut imports = RustImports::default();
+        let visits = imports.resolve_aliases(&records, 4 * records.len() + 16);
+        assert!(!imports.over_budget);
+        assert!(visits <= 4 * records.len() + 16, "{visits}");
+        assert_eq!(imports.aliases.len(), 2_000);
+    }
+
+    #[test]
+    fn a_stronger_stub_replaces_panic_and_never_the_reverse() {
+        let records = vec![
+            record(&["std", "panic"], "t"),
+            record(&["std", "todo"], "t"),
+            record(&["std", "panic"], "t"),
+            record(&["t"], "u"),
+        ];
+        let mut imports = RustImports::default();
+        imports.resolve_aliases(&records, MAX_ALIAS_VISITS);
+        assert_eq!(imports.aliases.get("t"), Some(&"todo"));
+        assert_eq!(imports.aliases.get("u"), Some(&"todo"));
     }
 }
