@@ -926,8 +926,13 @@ struct MacroCall {
     line: usize,
 }
 
-/// The longest path the lexer reads for one invocation. A longer one is not
-/// read, so a hostile `a::a::a::…` costs no more than the text it is written in.
+/// The most segments the lexer keeps for one invocation's path. A longer path is
+/// still read to its end, so that the invocation is seen and judged like a short
+/// one (it used to be dropped, and a stub reached through 64 `super::` hops
+/// scanned clean), but the segments past the cap are not kept: the path is its
+/// first segments and its last, which is what every consumer reads (the first
+/// says where it starts, the last names the macro). A hostile `a::a::a::…`
+/// still costs no more than the text it is written in.
 const MAX_CALL_PATH_SEGMENTS: usize = 64;
 
 fn is_ident_byte(b: u8) -> bool {
@@ -961,10 +966,19 @@ fn read_macro_call(bytes: &[u8], start: usize) -> Option<(Vec<String>, usize)> {
         while bytes.get(end).is_some_and(|&b| is_ident_byte(b)) {
             end += 1;
         }
-        if end == at || segments.len() >= MAX_CALL_PATH_SEGMENTS {
+        if end == at {
             return None;
         }
-        segments.push(String::from_utf8_lossy(&bytes[at..end]).into_owned());
+        let segment = String::from_utf8_lossy(&bytes[at..end]).into_owned();
+        // Past the cap the last slot follows the path, so it is the name the
+        // macro is called by when the path ends.
+        if segments.len() >= MAX_CALL_PATH_SEGMENTS
+            && let Some(last) = segments.last_mut()
+        {
+            *last = segment;
+        } else {
+            segments.push(segment);
+        }
         let next = skip_trivia(bytes, end);
         if bytes[next..].starts_with(b"::") {
             at = skip_trivia(bytes, next + 2);
@@ -2308,5 +2322,30 @@ mod step_count_tests {
         assert!(under_steps.scope_checks_exhausted, "{under_steps:?}");
         assert_eq!(under_steps.scope_checks, spent - 1);
         assert!(blocked(&under));
+    }
+}
+
+#[cfg(test)]
+mod call_path_cap_tests {
+    use super::*;
+
+    #[test]
+    fn a_path_past_the_segment_cap_is_still_an_invocation_named_by_its_last_segment() {
+        for hops in [
+            MAX_CALL_PATH_SEGMENTS - 1,
+            MAX_CALL_PATH_SEGMENTS,
+            65,
+            100,
+            5_000,
+        ] {
+            let text = format!("dbg!({}t!())", "super::".repeat(hops));
+            let calls = visible_macro_calls(&text);
+            let call = calls
+                .iter()
+                .find(|c| c.segments.last().map(String::as_str) == Some("t"))
+                .unwrap_or_else(|| panic!("{hops} hops: the call was dropped"));
+            assert!(call.segments.len() <= MAX_CALL_PATH_SEGMENTS, "{hops} hops");
+            assert_eq!(call.segments.first().map(String::as_str), Some("super"));
+        }
     }
 }
