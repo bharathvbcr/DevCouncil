@@ -697,3 +697,505 @@ fn attack_stub_finding_on_a_line_that_also_holds_a_secret_withholds_the_value() 
         run.all()
     );
 }
+
+// ======================================================================
+// Round 2 (Sonnet adversarial pass on lane/verify-residue @ 6c270782).
+// Each test is one attack; a failure is a finding.
+// ======================================================================
+
+/// Like `whole_file`, but an added line keeps a `\r` when the body has one.
+fn whole_file_raw(path: &str, body: &str) -> String {
+    let lines: Vec<&str> = body.split_terminator('\n').collect();
+    let mut diff = format!(
+        "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{} @@\n",
+        lines.len()
+    );
+    for line in lines {
+        diff.push('+');
+        diff.push_str(line);
+        diff.push('\n');
+    }
+    diff
+}
+
+fn report_raw(path: &str, body: &str) -> StubReport {
+    let diff = whole_file_raw(path, body);
+    let files = parse_unified(&diff).expect("diff parses");
+    let post = body.to_string();
+    detect_stubs_report(&files, &|_| Some(post.clone()))
+}
+
+fn blocked(report: &StubReport) -> bool {
+    report
+        .findings
+        .iter()
+        .any(|f| f.gate == "stub_detection" && f.severity == Severity::Blocking)
+}
+
+// ---- item 1: evasion that must still block or degrade ----
+
+#[test]
+fn adv2_nested_tree_self_alias_then_qualified_call_blocks() {
+    // `s::todo!()` is caught by its last segment.
+    blocks_or_degrades(
+        "src/lib.rs",
+        "use std::{self as s};\npub fn f() -> u32 {\n    s::todo!()\n}\n",
+    );
+    blocks_or_degrades(
+        "src/lib.rs",
+        "extern crate std as s;\npub fn f() -> u32 {\n    s::todo!()\n}\n",
+    );
+    blocks_or_degrades(
+        "src/lib.rs",
+        "use core::panic as p;\npub fn f() -> u32 {\n    p!(\"not implemented\")\n}\n",
+    );
+}
+
+#[test]
+fn adv2_module_alias_then_macro_alias_through_it_is_not_clean() {
+    // `use std as s; use s::todo as t;` binds `t` to std's todo!, through a
+    // module alias. The pre-pass roots an alias only at a literal std/core/alloc.
+    for body in [
+        "use std as s;\nuse s::todo as t;\npub fn f() -> u32 {\n    t!()\n}\n",
+        "use std::{self as s};\nuse s::todo as t;\npub fn f() -> u32 {\n    t!()\n}\n",
+        "extern crate std as s;\nuse s::todo as t;\npub fn f() -> u32 {\n    t!()\n}\n",
+        "extern crate core as c;\nuse c::unimplemented as u;\npub fn f() -> u32 {\n    u!()\n}\n",
+        "use std::prelude::rust_2021::todo as t;\npub fn f() -> u32 {\n    t!()\n}\n",
+    ] {
+        blocks_or_degrades("src/lib.rs", body);
+    }
+}
+
+#[test]
+fn adv2_alias_defined_after_use_blocks() {
+    blocks_proven(
+        "src/lib.rs",
+        "pub fn f() -> u32 {\n    t!()\n}\nuse std::todo as t;\n",
+        2,
+    );
+}
+
+#[test]
+fn adv2_braced_leading_use_list_alias_blocks() {
+    blocks_proven(
+        "src/lib.rs",
+        "use {std::todo as t};\npub fn f() -> u32 {\n    t!()\n}\n",
+        3,
+    );
+}
+
+#[test]
+fn adv2_alias_in_fn_scope_used_in_other_fn_blocks() {
+    blocks_proven(
+        "src/lib.rs",
+        "fn a() {\n    use std::todo as t;\n}\nfn b() -> u32 {\n    t!()\n}\n",
+        5,
+    );
+}
+
+#[test]
+fn adv2_raw_identifier_alias_forms_block() {
+    blocks_proven(
+        "src/lib.rs",
+        "use std::todo as r#t;\npub fn f() -> u32 {\n    r#t!()\n}\n",
+        3,
+    );
+    blocks_proven(
+        "src/lib.rs",
+        "use std::r#todo as r#match;\npub fn f() -> u32 {\n    r#match!()\n}\n",
+        3,
+    );
+    blocks_proven(
+        "src/lib.rs",
+        "use std::todo as t;\npub fn f() -> u32 {\n    r#t!()\n}\n",
+        3,
+    );
+}
+
+#[test]
+fn adv2_unicode_alias_blocks_directly_and_inside_a_wrapper() {
+    blocks_proven(
+        "src/lib.rs",
+        "use std::todo as 世界;\npub fn f() -> u32 {\n    世界!()\n}\n",
+        3,
+    );
+    blocks_proven(
+        "src/lib.rs",
+        "use std::todo as 世界;\npub fn f() -> u32 {\n    wrap!(世界!());\n    1\n}\n",
+        3,
+    );
+    blocks_proven(
+        "src/lib.rs",
+        "use std::todo as é;\npub fn f() -> u32 {\n    wrap!(é!());\n    1\n}\n",
+        3,
+    );
+}
+
+#[test]
+fn adv2_uppercase_alias_blocks_directly_and_in_a_wrapper() {
+    blocks_proven(
+        "src/lib.rs",
+        "use std::todo as T;\npub fn f() -> u32 {\n    T!()\n}\n",
+        3,
+    );
+    blocks_proven(
+        "src/lib.rs",
+        "use std::todo as T;\npub fn f() -> u32 {\n    wrap!(T!());\n    1\n}\n",
+        3,
+    );
+}
+
+#[test]
+fn adv2_crlf_alias_blocks() {
+    let report = report_raw(
+        "src/lib.rs",
+        "use std::todo as t;\r\npub fn f() -> u32 {\r\n    t!()\r\n}\r\n",
+    );
+    assert!(report.unparsed.is_empty(), "{:?}", report.unparsed);
+    assert!(blocked(&report), "{:?}", report.findings);
+}
+
+#[test]
+fn adv2_same_file_wrapper_macro_with_added_definition_blocks() {
+    blocks_or_degrades(
+        "src/lib.rs",
+        "macro_rules! t {\n    () => { todo!() };\n}\npub fn f() -> u32 {\n    t!()\n}\n",
+    );
+    blocks_or_degrades(
+        "src/lib.rs",
+        "#[macro_export]\nmacro_rules! t {\n    () => { todo!() };\n}\n",
+    );
+}
+
+#[test]
+#[ignore = "pre-existing on main: a call of an old, unchanged stub wrapper is not a new stub; main scans it clean too"]
+fn adv2_wrapper_defined_on_unchanged_lines_called_on_added_line() {
+    // The wrapper is old; the added line only calls it. Not a new stub, but a
+    // scan that says "clean" for a call to a stub is worth knowing about.
+    let body = "macro_rules! t {\n    () => { todo!() };\n}\npub fn f() -> u32 {\n    t!()\n}\n";
+    let diff = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,5 +1,6 @@\n macro_rules! t {\n     () => { todo!() };\n }\n pub fn f() -> u32 {\n+    t!()\n }\n";
+    let files = parse_unified(diff).expect("diff parses");
+    let post = body.to_string();
+    let report = detect_stubs_report(&files, &|_| Some(post.clone()));
+    assert!(
+        blocked(&report) || !report.unparsed.is_empty(),
+        "an added call of an old stub wrapper scanned clean: {:?}",
+        report.findings
+    );
+}
+
+#[test]
+fn adv2_macro_named_like_the_alias_in_a_test_module_does_not_hide_the_alias() {
+    // macro_rules `t` lives in `mod tests` (textual scope ends with the module);
+    // the top-level `t!()` is std's todo!.
+    blocks_or_degrades(
+        "src/lib.rs",
+        "use std::todo as t;\npub fn f() -> u32 {\n    t!()\n}\n#[cfg(test)]\nmod tests {\n    macro_rules! t {\n        () => { 1 };\n    }\n}\n",
+    );
+}
+
+#[test]
+fn adv2_alias_of_panic_named_todo_is_still_a_stub() {
+    // `use std::panic as todo;` makes `todo!()` a plain panic!(). Not a TODO
+    // marker, but the old name-based check flagged this `todo!()` on main.
+    blocks_or_degrades(
+        "src/lib.rs",
+        "use std::panic as todo;\npub fn f() -> u32 {\n    todo!()\n}\n",
+    );
+}
+
+#[test]
+fn adv2_syntax_error_with_alias_degrades() {
+    let report = report_whole(
+        "src/lib.rs",
+        "use std::todo as t;\npub fn f( -> u32 {\n    t!()\n",
+    );
+    assert!(
+        !report.unparsed.is_empty() || blocked(&report),
+        "{:?}",
+        report.findings
+    );
+}
+
+#[test]
+#[ignore = "pre-existing on main: a Rust source past MAX_SOURCE_BYTES is not parsed and is not listed in unparsed or stub_ast_degraded; the lane did not touch this path"]
+fn adv2_oversize_rust_source_with_alias_degrades() {
+    let mut body = String::from("use std::todo as t;\npub fn f() -> u32 {\n    t!()\n}\n");
+    while body.len() <= dc_verify::stub_ast::MAX_SOURCE_BYTES {
+        body.push_str("// padding padding padding padding padding padding\n");
+    }
+    let report = report_whole("src/lib.rs", &body);
+    assert!(
+        !report.unparsed.is_empty() || blocked(&report),
+        "an oversize source scanned clean: unparsed={:?}",
+        report.unparsed
+    );
+}
+
+fn degrades_or_blocks(body: &str) {
+    let report = report_whole("src/lib.rs", body);
+    assert!(
+        blocked(&report) || !report.unparsed.is_empty(),
+        "a call of an unresolved macro scanned clean: {body:?}"
+    );
+}
+
+// The call sites sit inside another macro's token tree, which tree-sitter does
+// not parse into macro_invocation nodes, so the walker never sees them.
+#[test]
+fn adv2_imported_macro_inside_dbg_args_degrades() {
+    degrades_or_blocks("use crate::macros::stub;\npub fn f() -> u32 {\n    dbg!(stub!())\n}\n");
+}
+
+#[test]
+fn adv2_imported_macro_inside_vec_args_degrades() {
+    degrades_or_blocks(
+        "use crate::macros::stub;\npub fn f() -> Vec<u32> {\n    vec![stub!()]\n}\n",
+    );
+}
+
+#[test]
+fn adv2_crate_qualified_macro_inside_dbg_args_degrades() {
+    degrades_or_blocks("pub fn f() -> u32 {\n    dbg!(crate::macros::stub!())\n}\n");
+}
+
+#[test]
+fn adv2_mod_qualified_macro_inside_dbg_args_degrades() {
+    degrades_or_blocks("mod macros;\npub fn f() -> u32 {\n    dbg!(macros::stub!())\n}\n");
+}
+
+#[test]
+fn adv2_imported_macro_inside_format_args_in_let_degrades() {
+    degrades_or_blocks(
+        "use crate::macros::stub;\npub fn f() -> String {\n    let s = format!(\"{}\", stub!());\n    s\n}\n",
+    );
+}
+
+#[test]
+fn adv2_pub_use_self_alias_of_std_todo_degrades() {
+    // `pub use std::todo;` is same-name (exempt), the second line re-exports it
+    // under a new name through `self::`.
+    let report = report_whole(
+        "src/lib.rs",
+        "pub use std::todo;\npub use self::todo as t;\n",
+    );
+    assert!(
+        !report.unparsed.is_empty(),
+        "an aliased pub re-export through self:: scanned clean: {:?}",
+        report.findings
+    );
+}
+
+#[test]
+fn adv2_pub_use_alias_of_alias_degrades() {
+    let report = report_whole(
+        "src/lib.rs",
+        "use std::todo as t;\npub use t as u;\n",
+    );
+    assert!(!report.unparsed.is_empty(), "{:?}", report.findings);
+}
+
+#[test]
+fn adv2_pub_use_crate_path_alias_of_alias_degrades() {
+    // an alias re-exported through `crate::`
+    let report = report_whole(
+        "src/lib.rs",
+        "use std::todo as t;\npub use crate::t as u;\n",
+    );
+    assert!(!report.unparsed.is_empty(), "{:?}", report.findings);
+}
+
+#[test]
+fn adv2_pub_use_panic_alias_reexport_documents_gap() {
+    // panic! with a TODO message is a stub too; only todo/unimplemented degrade
+    // on a pub re-export.
+    let report = report_whole("src/lib.rs", "pub use std::panic as p;\n");
+    assert!(
+        !report.unparsed.is_empty(),
+        "an aliased pub re-export of std panic scanned clean"
+    );
+}
+
+#[test]
+#[ignore = "pre-existing on main: `use m::*` brings a crate macro in with no name to resolve; the lane names glob imports as a limit"]
+fn adv2_glob_import_of_crate_macro_is_not_clean() {
+    for body in [
+        "use super::*;\npub fn f() -> u32 {\n    stub!()\n}\n",
+        "use self::macros::*;\npub fn f() -> u32 {\n    stub!()\n}\n",
+        "use crate::macros::*;\npub fn f() -> u32 {\n    stub!()\n}\n",
+    ] {
+        let report = report_whole("src/lib.rs", body);
+        assert!(
+            blocked(&report) || !report.unparsed.is_empty(),
+            "a macro called through a glob import scanned clean: {body:?}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "pre-existing on main: #[macro_use] extern crate is a named limit of the lane"]
+fn adv2_macro_use_extern_crate_is_not_clean() {
+    let report = report_whole(
+        "src/lib.rs",
+        "#[macro_use]\nextern crate helpers;\npub fn f() -> u32 {\n    stub!()\n}\n",
+    );
+    assert!(
+        blocked(&report) || !report.unparsed.is_empty(),
+        "#[macro_use] crate macro scanned clean"
+    );
+}
+
+// ---- item 1: false positives and noise ----
+
+#[test]
+fn adv2_non_std_alias_named_like_a_stub_is_clean_when_not_called_as_stub() {
+    clean_and_parsed(
+        "src/lib.rs",
+        "use log::warn as w;\npub fn f() {\n    w!(\"x\");\n}\n",
+    );
+    clean_and_parsed(
+        "src/lib.rs",
+        "use log::warn as t;\npub fn f() {\n    t!(\"x\");\n}\n",
+    );
+    clean_and_parsed("src/lib.rs", "fn todo() {}\npub fn f() {\n    todo();\n}\n");
+    clean_and_parsed(
+        "src/lib.rs",
+        "use std::fmt::Debug as t;\npub fn f<T: t>() {}\n",
+    );
+    clean_and_parsed("src/lib.rs", "use std::todo as _;\n");
+}
+
+#[test]
+#[ignore = "pre-existing on main: `todo!` is matched by name, so a non-std macro imported as `todo` is flagged; main flags it too"]
+fn adv2_non_std_alias_named_todo_is_not_flagged() {
+    // `use log::warn as todo; todo!("x")` is a different macro that happens to
+    // be called todo. It is flagged by NAME on main too (pre-existing FP).
+    clean_and_parsed(
+        "src/lib.rs",
+        "use log::warn as todo;\npub fn f() {\n    todo!(\"x\");\n}\n",
+    );
+}
+
+#[test]
+fn adv2_std_panic_catch_unwind_imports_are_clean() {
+    clean_and_parsed(
+        "src/lib.rs",
+        "use std::panic::{self, catch_unwind};\npub fn f() {\n    let _ = catch_unwind(|| 1);\n    panic::set_hook(Box::new(|_| {}));\n}\n",
+    );
+    clean_and_parsed(
+        "src/lib.rs",
+        "use std::panic as p;\npub fn f() {\n    let _ = p::catch_unwind(|| 1);\n}\n",
+    );
+    clean_and_parsed(
+        "src/lib.rs",
+        "use std::panic as p;\npub fn f(x: u32) {\n    p!(\"bad value {}\", x);\n}\n",
+    );
+}
+
+#[test]
+fn adv2_glob_pub_use_does_not_degrade_unrelated_edits() {
+    for body in [
+        "pub use foo::*;\npub fn f() -> u32 {\n    1\n}\n",
+        "pub use self::inner::*;\npub use crate::a::b::*;\npub fn f() -> u32 {\n    1\n}\n",
+        "pub use std::{fmt, todo};\npub fn f() -> u32 {\n    1\n}\n",
+        "pub use super::t;\npub fn f() -> u32 {\n    1\n}\n",
+        "mod inner;\npub use inner::Thing;\npub fn f() -> u32 {\n    1\n}\n",
+    ] {
+        clean_and_parsed("src/lib.rs", body);
+    }
+}
+
+#[test]
+fn adv2_crate_import_of_a_non_macro_does_not_degrade_ordinary_macros() {
+    // A crate-local import must not degrade std macros that share no name.
+    clean_and_parsed(
+        "src/lib.rs",
+        "use crate::error::{Error, Result};\nuse super::helper;\npub fn f(x: u32) -> Result<String> {\n    let s = format!(\"{x}\");\n    assert!(!s.is_empty());\n    println!(\"{}\", helper(x));\n    Ok(vec![s].concat())\n}\n",
+    );
+}
+
+#[test]
+fn adv2_crate_import_function_named_like_a_called_macro_does_not_degrade() {
+    // `use crate::util::format;` is a function; the `format!` is std's. Same
+    // namespace-blind match used by (b): this is the noise cost.
+    clean_and_parsed(
+        "src/lib.rs",
+        "use crate::util::vec;\npub fn f() -> Vec<u32> {\n    let a = vec(1);\n    vec![a]\n}\n",
+    );
+}
+
+// ---- item 1: cost bounds ----
+
+fn timed_report(body: &str) -> (std::time::Duration, StubReport) {
+    let start = std::time::Instant::now();
+    let report = report_whole("src/lib.rs", body);
+    (start.elapsed(), report)
+}
+
+#[test]
+fn adv2_reverse_alias_chain_is_bounded_in_time() {
+    // `use t{n} as t{n+1};` written in order is visited by the DFS in reverse, so one name resolves per round of the
+    // pre-pass chain loop, so records x records. Measure at two sizes; both must
+    // stay far below the parse budget.
+    let mut worst = std::time::Duration::ZERO;
+    for n in [1000usize, 2000, 4000] {
+        let mut body = String::new();
+        for i in 1..n {
+            body.push_str(&format!("use t{} as t{};\n", i - 1, i));
+        }
+        body.push_str("use std::todo as t0;\npub fn f() -> u32 {\n    t0!()\n}\n");
+        let (took, _report) = timed_report(&body);
+        eprintln!("reverse alias chain n={n}: {took:?} ({} bytes)", body.len());
+        worst = worst.max(took);
+    }
+    assert!(
+        worst < std::time::Duration::from_secs(2),
+        "alias chain pre-pass took {worst:?}"
+    );
+}
+
+#[test]
+fn adv2_many_aliases_times_many_invocations_is_bounded_in_time() {
+    // Every added macro invocation that is not itself a stub rebuilds the alias
+    // list and scans its text for each alias name.
+    let mut worst = std::time::Duration::ZERO;
+    for (aliases, calls) in [(500usize, 2000usize), (1000, 4000), (2000, 8000)] {
+        let mut body = String::new();
+        for i in 0..aliases {
+            body.push_str(&format!("use std::todo as a{i};\n"));
+        }
+        body.push_str("pub fn f() {\n");
+        for _ in 0..calls {
+            body.push_str("    w!(x);\n");
+        }
+        body.push_str("}\n");
+        let (took, _report) = timed_report(&body);
+        eprintln!(
+            "aliases={aliases} calls={calls}: {took:?} ({} bytes)",
+            body.len()
+        );
+        worst = worst.max(took);
+    }
+    assert!(
+        worst < std::time::Duration::from_secs(2),
+        "alias x invocation scan took {worst:?}"
+    );
+}
+
+#[test]
+#[ignore = "pre-existing on main: a Rust source past MAX_SOURCE_BYTES is not parsed and is not listed in unparsed or stub_ast_degraded; the lane did not touch this path"]
+fn adv2_oversize_rust_source_through_the_binary_is_degraded_not_clean() {
+    let root = Root::new();
+    let mut body = String::from("use std::todo as t;\npub fn f() -> u32 {\n    t!()\n}\n");
+    while body.len() <= dc_verify::stub_ast::MAX_SOURCE_BYTES {
+        body.push_str("// padding padding padding padding padding padding\n");
+    }
+    std::fs::write(root.0.join("src/a.rs"), &body).unwrap();
+    let diff = whole_file("src/a.rs", &body);
+    let run = check(&root.0, "src/a.rs", diff.as_bytes());
+    assert!(
+        degraded_nonempty(&run.stdout) || run.stdout.contains("\"stub_detection\""),
+        "an oversize source was neither degraded nor blocked: {}",
+        run.stdout.chars().filter(|_| true).collect::<String>().split("stub_ast_degraded").nth(1).unwrap_or("NO-DEGRADED-KEY").chars().take(300).collect::<String>()
+    );
+}
