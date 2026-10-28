@@ -59,6 +59,17 @@ pub(super) fn maybe_push_name_reference(
     {
         return;
     }
+    // The member of a chain the grammar hung off a bare cast, counted and
+    // refused here, before every spelling rule below: a member whose name a
+    // local or parameter shadows, or that is backticked, would otherwise return
+    // first and leave the call `swift_navigation_call` refused unrecorded. One
+    // arm with one `return`, so each refused member is counted exactly once by
+    // structure. `b` itself is the target, not the suffix, and stays. The shape
+    // guard is two `bounded_parent` hops, so the cost stays small.
+    if lang == "swift" && swift_member_of_bare_cast(node) {
+        note_swift_bare_cast_member();
+        return;
+    }
     let name = get_node_text(node, source);
     if !is_user_ident(&name) {
         return;
@@ -86,14 +97,6 @@ pub(super) fn maybe_push_name_reference(
     // receiver and has nothing left to distinguish it with.
     if ref_kind == ReferenceKind::Name && lang == "go" && go_struct_literal_field_key(node, source)
     {
-        return;
-    }
-    // The member of a chain the grammar hung off a bare cast. Last, so the
-    // ancestor walk is paid only for a name that would be published, and the
-    // count is of exactly the references this refuses. `b` itself is the
-    // target, not the suffix, and stays.
-    if lang == "swift" && swift_member_of_bare_cast(node) {
-        note_swift_bare_cast_member();
         return;
     }
     references.push(ExtractedReference {

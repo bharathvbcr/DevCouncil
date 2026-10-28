@@ -922,7 +922,7 @@ fn a_refused_call_is_noted_even_when_its_name_is_hidden_by_another_rule() {
 /// and `call_expression` only, and `.foo()!` is a `postfix_expression`. The
 /// refused `foo` is gone, but `.bar` is published on `b as? T ?? .foo()!`.
 #[test]
-#[ignore = "pre-existing on main: swift_on_bare_cast does not walk a postfix_expression, main published these facts too"]
+#[ignore = "follow-up of ft-c0b8696f: Swift walkers (swift_on_bare_cast does not walk a postfix_expression; main published these facts too)"]
 fn a_postfix_chain_off_a_bare_cast_publishes_no_cast_text_receiver() {
     let mut failures = Vec::new();
     let mut seen = 0;
@@ -1119,7 +1119,7 @@ fn a_file_with_refused_members_extracts_to_the_same_bytes_every_time() {
 /// tree nodes, not hops: `.f()` is a `navigation_expression` under a
 /// `call_expression`, two steps per hop, so a call chain is cut at about eight.
 #[test]
-#[ignore = "pre-existing on main: the 16-step bound of swift_on_bare_cast leaves a long chain published; main published every member"]
+#[ignore = "follow-up of ft-f1d5a16e: budget.rs (the 16-step bound of swift_on_bare_cast counts nodes, not hops; main published every member)"]
 fn a_long_chain_off_a_bare_cast_publishes_no_cast_text_receiver() {
     let mut failures = Vec::new();
     for depth in [4usize, 8, 9, 15, 16, 17, 18, 24, 40, 64] {
@@ -1146,7 +1146,7 @@ fn a_long_chain_off_a_bare_cast_publishes_no_cast_text_receiver() {
 /// receiver `a ?? rows.map { .. }`. The lane's contract names `??` recovery
 /// text, but its predicate only recognises an `as_expression` base.
 #[test]
-#[ignore = "pre-existing on main: a `??` chain with no cast is outside swift_on_bare_cast; main published the same receiver"]
+#[ignore = "follow-up of ft-c0b8696f: Swift walkers (a `??` chain with no cast is outside swift_on_bare_cast; main published the same receiver)"]
 fn a_coalesce_chain_without_a_cast_publishes_no_coalesce_text_receiver() {
     let mut failures = Vec::new();
     for source in [

@@ -631,6 +631,45 @@ fn a_member_chain_off_a_bare_cast_is_refused_and_counted_per_member() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// ATTACK 1f, exactly once. The note is raised by the references walk, so a
+/// refused member whose name another rule would drop first (a local or a
+/// parameter of that name, a backticked keyword) must still reach the refusal
+/// and be counted. One file holds a plain member, a `let`-shadowed one, a
+/// parameter-shadowed one and a backticked one: the note counts all four, none
+/// is published, and the leading-dot member with no context is still refused
+/// by its own rule, silently and not counted.
+#[test]
+fn a_refused_member_is_counted_whether_or_not_a_local_or_a_backtick_hides_its_name() {
+    let source = "func f(foo: Int) {\n    let bar = 1\n    let a = b as? Color ?? .plain()\n    let c = b as? Color ?? .bar()\n    let d = b as? Color ?? .foo()\n    let e = b as? Color ?? .`class`()\n    h(.minute)\n}\n";
+    let e = ex("a.swift", source);
+    let mut failures = Vec::new();
+    if member_notes(&e) != [member_note(4).as_str()] {
+        failures.push(format!(
+            "notes {:?}, wanted {:?}",
+            member_notes(&e),
+            member_note(4)
+        ));
+    }
+    for name in ["plain", "bar", "foo", "class", "`class`", "minute"] {
+        if let Some(call) = e.calls.iter().find(|c| c.callee_name == name) {
+            failures.push(format!("published the call {call:?}"));
+        }
+        if let Some(reference) = e.references.iter().find(|r| r.name == name) {
+            failures.push(format!("published the reference {reference:?}"));
+        }
+    }
+    if empty_names(&e) != (0, 0) {
+        failures.push("an empty name".to_string());
+    }
+    assert!(
+        failures.is_empty(),
+        "{} ({:?})\n{}",
+        source,
+        e.parse_outcome,
+        failures.join("\n")
+    );
+}
+
 /// ATTACK 1f, guards. What the refusal must not touch: a parenthesised cast is
 /// a real operand (`(b as? Color)?.foo()` is a call on `Color`), a cast to
 /// `Foo.Type` and a `is` test parse correctly, and a file with no cast has no
@@ -681,7 +720,7 @@ fn a_member_off_a_parenthesised_cast_or_a_correct_parse_is_kept() {
 /// spelling drops the call's `assigned_to`, the twin keeps it, and both files
 /// are Clean. The facts differ in one field of one reference.
 #[test]
-#[ignore = "follow-up of ft-bce92fa0: swift_assignment_binding"]
+#[ignore = "follow-up of ft-c0b8696f: Swift walkers (swift_assignment_binding)"]
 fn a_parenthesised_call_after_the_coalesce_equals_its_twin() {
     let mut tally = Tally::default();
     for cast in CASTS {
@@ -699,7 +738,7 @@ fn a_parenthesised_call_after_the_coalesce_equals_its_twin() {
 /// call's type in one spelling and not the other. Neither is right (`a` is a
 /// `String`), and the file is Clean in both.
 #[test]
-#[ignore = "follow-up of ft-bce92fa0: swift_assignment_binding"]
+#[ignore = "follow-up of ft-c0b8696f: Swift walkers (swift_assignment_binding)"]
 fn a_call_on_the_left_of_the_cast_binds_the_same_in_both_spellings() {
     let mut tally = Tally::default();
     for lhs in ["f()", "x.f()", "f(a)?.g()", "await g()", "Foo()"] {
