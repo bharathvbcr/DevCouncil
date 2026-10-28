@@ -510,7 +510,10 @@ impl RustImports {
             scope_check_cap,
             ..RustImports::default()
         };
-        for node in descendants(root) {
+        // A walk over the named nodes, one at a time: every kind matched below
+        // is a named node, so the anonymous punctuation need not be collected.
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
             if records.len() > MAX_USE_RECORDS {
                 out.over_budget = true;
                 return out;
@@ -550,6 +553,8 @@ impl RustImports {
                 }
                 _ => {}
             }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
         }
         out.macro_defs = MacroScopes::build(defs);
         if records.len() > MAX_USE_RECORDS {
