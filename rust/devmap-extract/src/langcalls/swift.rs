@@ -26,13 +26,18 @@
 //!
 //! Everything that names no identifier is dropped rather than recorded as text:
 //! `split_call_target` returns `Option` and `is_callee_identity` rejects
-//! expressions, which is the SC26/SC32 rule.
+//! expressions, which is the SC26/SC32 rule. A call whose name has no spelling
+//! at all — the zero-width `custom_operator` the grammar inserts when it
+//! recovers `x as? String ?? "d"` — is refused at the same gate and counted in
+//! one per-file diagnostic, because the file stays `Clean` and would otherwise
+//! carry no trace of it.
 
 use tree_sitter::Node;
 
 use crate::model::{ExtractedCall, ExtractedReference, ReferenceKind};
 use crate::treesitter::{
-    get_node_text, is_anonymous_callable, is_callee_identity, node_span, split_call_target,
+    get_node_text, is_anonymous_callable, is_callee_identity, node_span,
+    note_swift_unspelled_operator, split_call_target,
 };
 
 use super::scope::{clamp_receiver, enclosing_emitted_symbol, receiver_from};
@@ -52,6 +57,15 @@ pub fn extract_swift_call(
     let Some(call) = swift_call_identity(node, source) else {
         return;
     };
+    // A call with no spelling names nothing. tree-sitter-swift's recovery of
+    // `x as? String ?? "d"` inserts a hidden zero-width `custom_operator`, which
+    // would otherwise pass the operator exemption below as a call named `""`.
+    // Refused here, before that exemption, because both operator arms bypass
+    // `is_callee_identity`; the file says so in one diagnostic.
+    if call.callee_name.trim().is_empty() || call.name_node.byte_range().is_empty() {
+        note_swift_unspelled_operator();
+        return;
+    }
     // An operator's name is punctuation, which `is_callee_identity` refuses by
     // design for an *expression*. A `custom_operator` node is a declared
     // operator's own spelling, so it is an identity and passes.

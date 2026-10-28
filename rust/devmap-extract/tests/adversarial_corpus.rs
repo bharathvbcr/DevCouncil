@@ -147,6 +147,13 @@ fn no_language_panics_or_fabricates_on_hostile_input() {
                     spec.name
                 );
             }
+            for reference in &extraction.references {
+                assert!(
+                    !reference.name.trim().is_empty(),
+                    "{} / {label}: a reference with an empty name joins on nothing",
+                    spec.name
+                );
+            }
 
             // An input with no identifier characters cannot yield declarations.
             let has_identifier = source.chars().any(|c| c.is_alphanumeric());
@@ -227,4 +234,191 @@ fn a_hostile_file_name_is_echoed_verbatim_not_reinterpreted() {
         assert_eq!(file_nodes.len(), 1, "exactly one File node for {name:?}");
         assert_eq!(file_nodes[0].qualified_name, name);
     }
+}
+
+/// Sources that hold a known trigger for an empty name, extracted alongside the
+/// fixtures. Without one the sweep over `testdata` passes on code that still
+/// has the defect (none of the checked-in fixtures spells it), so this table is
+/// what makes the sweep able to fail. Rows: (language key, path, source).
+const TRIGGERS: &[(&str, &str, &str)] = &[
+    (
+        "swift",
+        "triggers/nil_coalesced_cast.swift",
+        "let a = b as? String ?? \"x\"\n",
+    ),
+    // A use path missing its keyword: the grammar reads a struct expression
+    // with no spellable type and the Rust walk publishes a Constructor named "".
+    ("rust", "triggers/path_brace_list.rs", " a::b::{c};"),
+];
+
+/// Fixture files that still publish an empty name: (language key, path relative
+/// to `testdata`, the card that owns the fix). Consumed exactly: a row that no
+/// longer reproduces fails the test, so the list cannot outlive its defects.
+/// Rows that are not fixtures name their trigger's path.
+///
+/// Fixture language directories no grammar parses, so the sweep says nothing
+/// about their emitters: (directory, why). Sorted by directory and consumed
+/// exactly, like [`KNOWN_EMPTY`]: linking a grammar makes its row fail.
+const NO_GRAMMAR: &[(&str, &str)] = &[
+    (
+        "cobol",
+        "refused before any parser sees it (the vendored grammar does not terminate on malformed input)",
+    ),
+    (
+        "vbnet",
+        "no tree-sitter-vb grammar is linked (treesitter/tests.rs and cache.rs pin it as unavailable)",
+    ),
+];
+const KNOWN_EMPTY: &[(&str, &str, &str)] =
+    &[("rust", "triggers/path_brace_list.rs", "ft-bce92fa0")];
+
+fn testdata_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+        .map(|entry| entry.expect("directory entry").path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            testdata_files(&path, out);
+        } else {
+            out.push(path);
+        }
+    }
+}
+
+/// No language publishes a call or a reference with an empty name.
+///
+/// An empty name is a join on nothing: the resolver keys on it and the graph
+/// grows a node every unresolved call attaches to. The hostile sweep above
+/// cannot see the Swift case (it needs a grammar-recovery shape), so this
+/// extracts every file under `testdata` plus the [`TRIGGERS`] and reports the
+/// language and path of each offender. Coverage is asserted with both numbers:
+/// every `testdata/fixtures/languages/<dir>` must yield at least one extraction.
+#[test]
+fn no_language_publishes_an_empty_name_in_fixture_output() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../testdata");
+    let mut files = Vec::new();
+    testdata_files(&root, &mut files);
+    assert!(!files.is_empty(), "no files under {}", root.display());
+
+    let language_dirs: std::collections::BTreeSet<String> =
+        std::fs::read_dir(root.join("fixtures/languages"))
+            .expect("fixtures/languages")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|p| p.is_dir())
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+    // Per fixture language directory: (sources extracted, sources a grammar parsed).
+    let mut covered_dirs: std::collections::BTreeMap<String, (usize, usize)> =
+        std::collections::BTreeMap::new();
+
+    let mut offenders: Vec<(String, String, usize, usize)> = Vec::new();
+    let mut scanned = 0usize;
+    let mut languages = std::collections::BTreeSet::new();
+    // Returns whether a grammar parsed the source (Clean or Partial), which is
+    // what "an extraction came back" means: a refusal, a failure or a pattern
+    // fallback is not evidence about the language's emitters.
+    let mut check = |language_hint: Option<&str>, rel: &str, source: &str| -> bool {
+        let extraction = extract_file(rel, source);
+        let parsed = matches!(
+            extraction.parse_outcome,
+            ParseOutcome::Clean | ParseOutcome::Partial { .. }
+        );
+        scanned += 1;
+        languages.insert(extraction.language.clone());
+        let calls = extraction
+            .calls
+            .iter()
+            .filter(|c| c.callee_name.trim().is_empty())
+            .count();
+        let refs = extraction
+            .references
+            .iter()
+            .filter(|r| r.name.trim().is_empty())
+            .count();
+        if calls != 0 || refs != 0 {
+            let language = language_hint.unwrap_or(&extraction.language).to_string();
+            offenders.push((language, rel.to_string(), calls, refs));
+        }
+        parsed
+    };
+    for path in &files {
+        // Binary or non-UTF-8 fixtures are not source the extractor reads.
+        let Ok(source) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let rel = path
+            .strip_prefix(&root)
+            .expect("under root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if let Some(dir) = rel
+            .strip_prefix("fixtures/languages/")
+            .and_then(|rest| rest.split('/').next())
+        {
+            let parsed = check(None, &rel, &source);
+            let counts = covered_dirs
+                .entry(dir.to_string())
+                .or_insert((0usize, 0usize));
+            counts.0 += 1;
+            counts.1 += usize::from(parsed);
+        } else {
+            check(None, &rel, &source);
+        }
+    }
+    for (language, rel, source) in TRIGGERS {
+        check(Some(language), rel, source);
+    }
+    eprintln!(
+        "empty-name sweep: extracted {scanned} sources ({} files under testdata, {} triggers) \
+         across {} language keys; {} of {} fixture language directories covered",
+        files.len(),
+        TRIGGERS.len(),
+        languages.len(),
+        covered_dirs.len(),
+        language_dirs.len()
+    );
+    let seen_dirs: std::collections::BTreeSet<String> = covered_dirs.keys().cloned().collect();
+    assert_eq!(
+        seen_dirs, language_dirs,
+        "every fixtures/languages directory must contribute at least one readable file"
+    );
+    let unparsed: Vec<&str> = covered_dirs
+        .iter()
+        .filter(|(_, (_, parsed))| *parsed == 0)
+        .map(|(dir, _)| dir.as_str())
+        .collect();
+    let excluded: Vec<&str> = NO_GRAMMAR.iter().map(|(dir, _)| *dir).collect();
+    assert_eq!(
+        unparsed, excluded,
+        "every fixtures/languages directory must yield at least one extraction a \
+         grammar parsed (Clean or Partial), except the NO_GRAMMAR rows, which must \
+         be exactly the directories that yielded none"
+    );
+
+    let mut unexpected = Vec::new();
+    let mut consumed = vec![false; KNOWN_EMPTY.len()];
+    for (language, rel, calls, refs) in &offenders {
+        match KNOWN_EMPTY
+            .iter()
+            .position(|(l, p, _)| l == language && p == rel)
+        {
+            Some(at) => consumed[at] = true,
+            None => unexpected.push(format!(
+                "{language}: {rel}: {calls} empty-name call(s), {refs} empty-name reference(s)"
+            )),
+        }
+    }
+    let stale: Vec<_> = KNOWN_EMPTY
+        .iter()
+        .zip(&consumed)
+        .filter(|(_, used)| !**used)
+        .map(|(row, _)| row)
+        .collect();
+    assert!(
+        unexpected.is_empty() && stale.is_empty(),
+        "empty names published: {unexpected:#?}; KNOWN_EMPTY rows that no longer \
+         reproduce: {stale:?}"
+    );
 }
