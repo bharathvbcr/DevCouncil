@@ -813,10 +813,9 @@ fn the_real_members_beside_a_cast_survive() {
     ] {
         let e = ex("a.swift", source);
         if !(has_call(&e, member) || has_ref(&e, member)) {
-            let m = ex("a.swift", &source.replace(member, member));
             failures.push(format!(
                 "{source:?}: `{member}` not published (clean {}, calls {:?}, refs {:?}, diag {:?})",
-                clean(&m),
+                clean(&e),
                 e.calls
                     .iter()
                     .map(|c| (&c.callee_name, &c.receiver_expr))
@@ -1195,4 +1194,13 @@ fn no_rust_probe_publishes_an_empty_type_name_in_any_table() {
     }
     assert!(seen > 100, "only {seen} rust probes");
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// ATTACK 3. The member note is a diagnostic of the fresh extraction only: a
+/// durable re-read carries none, as the unspelled-operator note does.
+#[test]
+fn the_member_note_clears_on_a_durable_reread_like_the_other() {
+    let fresh = ex("a.swift", "let a = (b as? Foo.Bar)\n");
+    assert_eq!(member_notes(&fresh), [member_note(1).as_str()]);
+    assert!(fresh.for_durable_store().diagnostics.is_empty());
 }
