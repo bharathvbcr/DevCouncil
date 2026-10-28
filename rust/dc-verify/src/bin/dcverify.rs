@@ -244,7 +244,28 @@ fn check(
 
     let scope = classify_scope(&files, planned);
     let mut findings = scan_secrets(&files);
-    let stubs = detect_stubs_report(&files, &|file| read_post_image(root, &file.path));
+    // The paths whose working-tree source was over the size limit, which the
+    // closure cannot say through `Option`: a modified source is read from disk
+    // here, and `None` alone would leave it looking like a file with nothing to
+    // check.
+    let oversize = std::cell::RefCell::new(Vec::<String>::new());
+    let mut stubs = detect_stubs_report(&files, &|file| match read_post_image(root, &file.path) {
+        Ok(text) => Some(text),
+        Err(PostImageMiss::TooLarge) => {
+            oversize.borrow_mut().push(file.path.clone());
+            None
+        }
+        Err(PostImageMiss::Unreadable) => None,
+    });
+    for path in oversize.into_inner() {
+        let listed = stubs.unparsed.iter().any(|u| u.path == path);
+        if !listed && dc_verify::stub_ast::Lang::for_path(&path).is_some() {
+            stubs.unparsed.push(dc_verify::rigor::UnparsedFile {
+                path,
+                reason: dc_verify::stub_ast::Unparsed::TooLarge.as_str(),
+            });
+        }
+    }
     findings.extend(stubs.findings);
     // A binary marker with no hunk carries none of the file's bytes. A text
     // hunk elsewhere in the same diff does not make that path scanned.
@@ -616,31 +637,48 @@ fn read_binary_post_image(root: Option<&std::path::Path>, path: &str) -> Result<
     Ok(decode_lossy(&bytes).into_owned())
 }
 
+/// Why a changed file's working-tree source is not available to the AST stub
+/// checks.
+enum PostImageMiss {
+    /// Past [`dc_verify::stub_ast::MAX_SOURCE_BYTES`]. The file exists and is
+    /// not read, which the report must say: the tree never saw it.
+    TooLarge,
+    /// No root, a path that escapes it or runs through a symlink, a file that
+    /// is missing, not regular or unreadable. These are not reported as
+    /// unparsed: the substring checks run, and the caller who gave no `--root`
+    /// asked for exactly that.
+    Unreadable,
+}
+
 /// Reads a changed file as it stands in the working tree under `root`, for
 /// the AST stub checks.
 ///
-/// `None` sends the file to the substring checks; it is never a clean answer.
+/// An error sends the file to the substring checks; it is never a clean answer.
 /// The path comes from a diff, so it is refused unless it is relative, stays
 /// inside `root` and passes through no symlink, and the read is bounded.
 /// `detect_stubs_with` then believes the content only if the diff's added lines
 /// are where the diff says they are.
-fn read_post_image(root: Option<&std::path::Path>, path: &str) -> Option<String> {
+fn read_post_image(root: Option<&std::path::Path>, path: &str) -> Result<String, PostImageMiss> {
     use std::io::Read as _;
-    let root = root?;
-    let (full, meta) = lstat_within(root, std::path::Path::new(path)).ok()?;
-    if !meta.is_file() || meta.len() > dc_verify::stub_ast::MAX_SOURCE_BYTES as u64 {
-        return None;
+    let root = root.ok_or(PostImageMiss::Unreadable)?;
+    let (full, meta) =
+        lstat_within(root, std::path::Path::new(path)).map_err(|_| PostImageMiss::Unreadable)?;
+    if !meta.is_file() {
+        return Err(PostImageMiss::Unreadable);
+    }
+    if meta.len() > dc_verify::stub_ast::MAX_SOURCE_BYTES as u64 {
+        return Err(PostImageMiss::TooLarge);
     }
     let mut bytes = Vec::new();
     std::fs::File::open(&full)
-        .ok()?
+        .map_err(|_| PostImageMiss::Unreadable)?
         .take(dc_verify::stub_ast::MAX_SOURCE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
-        .ok()?;
+        .map_err(|_| PostImageMiss::Unreadable)?;
     if bytes.len() > dc_verify::stub_ast::MAX_SOURCE_BYTES {
-        return None;
+        return Err(PostImageMiss::TooLarge);
     }
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Renders the substance measurement.

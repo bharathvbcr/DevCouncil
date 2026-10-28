@@ -1410,3 +1410,68 @@ fn an_oversize_new_rust_file_with_a_stub_is_reported_unparsed() {
     }
     assert!(report_whole("notes.txt", &text).unparsed.is_empty());
 }
+
+// ---- P1, modified files: an oversize working-tree source is unparsed ----
+
+/// A `.rs` body of the given size whose line 3 holds `todo!()`.
+fn oversize_modified_body() -> String {
+    let mut body = String::from("// pad\n// pad\npub fn f() -> u32 { todo!() }\n");
+    while body.len() <= dc_verify::stub_ast::MAX_SOURCE_BYTES {
+        body.push_str("// padding padding padding padding padding padding\n");
+    }
+    body
+}
+
+const ADD_TODO_ON_LINE_3: &str = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,2 +1,3 @@\n // pad\n // pad\n+pub fn f() -> u32 { todo!() }\n";
+
+#[test]
+fn an_oversize_modified_source_handed_to_the_api_is_reported_unparsed() {
+    let files = parse_unified(ADD_TODO_ON_LINE_3).expect("diff parses");
+    let post = oversize_modified_body();
+    let report = detect_stubs_report(&files, &|_| Some(post.clone()));
+    let reasons: Vec<&str> = report.unparsed.iter().map(|u| u.reason).collect();
+    assert_eq!(reasons, vec![Unparsed::TooLarge.as_str()]);
+}
+
+#[test]
+fn an_oversize_modified_source_read_by_the_binary_is_reported_unparsed() {
+    let root = Root::new();
+    std::fs::write(root.0.join("src/a.rs"), oversize_modified_body()).unwrap();
+    let run = check(&root.0, "src/a.rs", ADD_TODO_ON_LINE_3.as_bytes());
+    assert!(
+        run.stdout.contains("\"ok\":true"),
+        "did not run: {}",
+        run.all()
+    );
+    let expected = format!("src/a.rs: {}", Unparsed::TooLarge.as_str());
+    assert!(
+        run.stdout.contains(&expected),
+        "an oversize modified source was not reported unparsed: {}",
+        run.stdout
+            .split("stub_ast_degraded")
+            .nth(1)
+            .unwrap_or("NO-DEGRADED-KEY")
+            .chars()
+            .take(200)
+            .collect::<String>()
+    );
+    // Exactly once: a new file of the same size is reported by the library and
+    // not a second time by the binary.
+    assert_eq!(run.stdout.matches(&expected).count(), 1);
+}
+
+#[test]
+fn an_oversize_new_file_read_by_the_binary_is_reported_once() {
+    let root = Root::new();
+    let body = oversize_modified_body();
+    std::fs::write(root.0.join("src/a.rs"), &body).unwrap();
+    let diff = whole_file("src/a.rs", &body);
+    let run = check(&root.0, "src/a.rs", diff.as_bytes());
+    let expected = format!("src/a.rs: {}", Unparsed::TooLarge.as_str());
+    assert_eq!(
+        run.stdout.matches(&expected).count(),
+        1,
+        "{}",
+        run.stdout.len()
+    );
+}
