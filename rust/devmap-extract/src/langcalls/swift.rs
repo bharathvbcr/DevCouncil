@@ -317,6 +317,11 @@ fn swift_callee_target<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
 
 /// `receiver.method()`, including `receiver?.method()` and `receiver!.method()`.
 fn swift_navigation_call<'tree>(nav: Node<'tree>, source: &str) -> Option<SwiftCall<'tree>> {
+    // `b as? Color ?? .foo()`: the member hangs off a cast, so its receiver is
+    // cast text and no type. Refused, with the mirrored `Call` reference.
+    if swift_on_bare_cast(nav) {
+        return None;
+    }
     let suffix = nav.child_by_field_name("suffix")?;
     let name_node = suffix.child_by_field_name("suffix")?;
     let (callee_name, _) = split_call_target(name_node, source)?;
@@ -354,6 +359,36 @@ fn swift_navigation_call<'tree>(nav: Node<'tree>, source: &str) -> Option<SwiftC
         kind: ReferenceKind::Call,
         operator: false,
     })
+}
+
+/// Whether the member chain `chain` is based on an unparenthesised `as?`/`as!`.
+///
+/// Swift's casts bind looser than postfix `.` and `()`, so a navigation chain
+/// whose base is an `as_expression` is **always** a misparse. tree-sitter-swift
+/// reads `b as? Color ?? .foo()` as `navigation_expression(as_expression
+/// "b as? Color ??", .foo)`, and `(b as? Foo.Bar)` as `(as_expression "b as?
+/// Foo", .Bar)`, without an error node. The member's owner is a type the site
+/// never spells, so a fact about it is refused rather than repaired: reading it
+/// from the leftmost operand would bind `b`'s type, a wrong edge. A parenthesised
+/// cast is a `tuple_expression`, a real operand, and is not this. Bounded at the
+/// same 16 steps as [`swift_sum_tail`]; a chain longer than that is not refused.
+pub(crate) fn swift_on_bare_cast(chain: Node) -> bool {
+    let mut node = chain;
+    for _ in 0..=16 {
+        node = match node.kind() {
+            "as_expression" => return true,
+            "navigation_expression" => match node.child_by_field_name("target") {
+                Some(target) => target,
+                None => return false,
+            },
+            "call_expression" => match swift_callee_target(node) {
+                Some(callee) => callee,
+                None => return false,
+            },
+            _ => return false,
+        };
+    }
+    false
 }
 
 /// The right operand of the sum at the base of a member chain: for

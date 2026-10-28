@@ -17,6 +17,9 @@ thread_local! {
     /// Swift calls refused in this file because the grammar's recovery inserted
     /// an operator with no spelling. See [`note_swift_unspelled_operator`].
     pub(super) static SWIFT_UNSPELLED_OPERATORS: Cell<usize> = const { Cell::new(0) };
+    /// Swift member references refused in this file because the grammar read
+    /// them off a bare `as?`/`as!` cast. See [`note_swift_bare_cast_member`].
+    pub(super) static SWIFT_BARE_CAST_MEMBERS: Cell<usize> = const { Cell::new(0) };
     /// Byte ranges of statements the Kotlin loss detector charged, which the
     /// walks that derive per-scope tables leave out. See [`set_charged_regions`].
     pub(super) static CHARGED_REGIONS: RefCell<Vec<(usize, usize)>> =
@@ -41,12 +44,18 @@ thread_local! {
 /// A guard armed *inside* another one — an embedded script, a Kotlin loss
 /// recovery: an extraction run by an extraction — gives the outer deadline back
 /// when it drops. It used to leave the thread disarmed, so every phase of the
-/// outer file that ran after the inner call checked a clock that was off.
+/// outer file that ran after the inner call checked a clock that was off. The
+/// outer file's Swift refusal counts come back the same way: they were zeroed by
+/// the inner `arm` and never restored, so a script or recovery run inside a
+/// Swift file replaced that file's count with its own.
 pub(super) struct BudgetGuard {
     /// The deadline that was armed when this guard was, if one was.
     outer: Option<std::time::Instant>,
     /// The charged regions of the extraction this one runs inside, if any.
     outer_regions: Vec<(usize, usize)>,
+    /// The Swift refusal counts of the extraction this one runs inside: its
+    /// unspelled-operator calls and its bare-cast members.
+    outer_swift_refusals: (usize, usize),
 }
 
 impl BudgetGuard {
@@ -59,10 +68,14 @@ impl BudgetGuard {
         WALK_OVERRAN.with(|slot| slot.set(false));
         PARENT_STEPS.with(|slot| slot.set(0));
         NESTING_CAPS.with(|caps| caps.borrow_mut().clear());
-        SWIFT_UNSPELLED_OPERATORS.with(|count| count.set(0));
+        let outer_swift_refusals = (
+            SWIFT_UNSPELLED_OPERATORS.with(|count| count.replace(0)),
+            SWIFT_BARE_CAST_MEMBERS.with(|count| count.replace(0)),
+        );
         BudgetGuard {
             outer,
             outer_regions,
+            outer_swift_refusals,
         }
     }
 }
@@ -73,6 +86,8 @@ impl Drop for BudgetGuard {
         CHARGED_REGIONS.with(|regions| {
             *regions.borrow_mut() = std::mem::take(&mut self.outer_regions);
         });
+        SWIFT_UNSPELLED_OPERATORS.with(|count| count.set(self.outer_swift_refusals.0));
+        SWIFT_BARE_CAST_MEMBERS.with(|count| count.set(self.outer_swift_refusals.1));
         // Retain the incomplete-walk signal until the next extraction arms
         // its budget. The publication gate must not lose a helper's refusal.
     }
@@ -266,6 +281,32 @@ pub(super) fn take_swift_unspelled_operator_notes() -> Vec<String> {
     }
     vec![format!(
         "swift: refused {count} call(s) on an operator the grammar inserted with no spelling"
+    )]
+}
+
+/// Record that the references walk refused a Swift member name the grammar
+/// read off a bare cast.
+///
+/// `as?` and `as!` bind looser than postfix `.` and `()`, but tree-sitter-swift
+/// attaches a member to the cast expression itself: `b as? Color ?? .foo()` is
+/// `navigation_expression(as_expression "b as? Color ??", .foo)`, and
+/// `(b as? Foo.Bar)` is `(as_expression "b as? Foo", .Bar)`. There is no error
+/// node, so the file stays `Clean`. The member's real owner is a type the site
+/// never spells, so it is refused rather than given the cast text as receiver,
+/// and counted here because nothing else says a name was left out.
+/// [`take_swift_bare_cast_member_notes`] turns the count into a diagnostic.
+pub(crate) fn note_swift_bare_cast_member() {
+    SWIFT_BARE_CAST_MEMBERS.with(|count| count.set(count.get() + 1));
+}
+
+/// The one diagnostic for this file's refused bare-cast members, or none.
+pub(super) fn take_swift_bare_cast_member_notes() -> Vec<String> {
+    let count = SWIFT_BARE_CAST_MEMBERS.with(|count| count.replace(0));
+    if count == 0 {
+        return Vec::new();
+    }
+    vec![format!(
+        "swift: refused {count} member reference(s) the grammar read off a bare cast"
     )]
 }
 

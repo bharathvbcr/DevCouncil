@@ -88,6 +88,14 @@ pub(super) fn maybe_push_name_reference(
     {
         return;
     }
+    // The member of a chain the grammar hung off a bare cast. Last, so the
+    // ancestor walk is paid only for a name that would be published, and the
+    // count is of exactly the references this refuses. `b` itself is the
+    // target, not the suffix, and stays.
+    if lang == "swift" && swift_member_of_bare_cast(node) {
+        note_swift_bare_cast_member();
+        return;
+    }
     references.push(ExtractedReference {
         name,
         kind: ref_kind,
@@ -109,6 +117,27 @@ pub(super) fn maybe_push_name_reference(
         // `cfg.enabled` from a bare local named `enabled`.
         receiver_expr: member_access_receiver(node, source),
     });
+}
+
+/// Whether `node` is the member name of a navigation chain based on a bare
+/// `as?`/`as!` (see [`crate::langcalls::swift::swift_on_bare_cast`]).
+///
+/// Shape-guarded to the `suffix` field of a `navigation_suffix` under a
+/// `navigation_expression`, as `member_access_receiver` reads a member, so the
+/// cast's own operand is never asked.
+fn swift_member_of_bare_cast(node: Node) -> bool {
+    bounded_parent(node)
+        .filter(|suffix| {
+            suffix.kind() == "navigation_suffix"
+                && suffix
+                    .child_by_field_name("suffix")
+                    .is_some_and(|member| member.id() == node.id())
+        })
+        .and_then(bounded_parent)
+        .is_some_and(|nav| {
+            nav.kind() == "navigation_expression"
+                && crate::langcalls::swift::swift_on_bare_cast(nav)
+        })
 }
 
 /// Whether `node` is the member name of a `recv.name` written inside a macro's
