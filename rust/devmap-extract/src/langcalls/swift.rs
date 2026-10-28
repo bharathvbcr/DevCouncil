@@ -361,7 +361,8 @@ fn swift_navigation_call<'tree>(nav: Node<'tree>, source: &str) -> Option<SwiftC
     })
 }
 
-/// Whether the member chain `chain` is based on an unparenthesised `as?`/`as!`.
+/// Whether the member chain `chain` is based on an unparenthesised cast (`as`,
+/// `as?` or `as!`: any `as_expression`).
 ///
 /// Swift's casts bind looser than postfix `.` and `()`, so a navigation chain
 /// whose base is an `as_expression` is **always** a misparse. tree-sitter-swift
