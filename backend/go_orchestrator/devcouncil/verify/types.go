@@ -207,6 +207,17 @@ type Input struct {
 	RunCommand func(command string) CommandOutcome
 }
 
+// WithGitState sets the inputs that come from one collection of the working
+// tree: the change the gates judge, and whatever else the collection found.
+// It is the one place the two are joined, so a caller that reads a GitState
+// cannot forget part of it.
+func (in *Input) WithGitState(state GitState) {
+	in.ChangedFiles = state.Changed
+	in.DiffContent = state.Diff
+	in.DiffEmpty = state.Empty
+	in.WorkPresent = !state.Empty
+}
+
 // CommandOutcome is the result of attempting to run one verification command.
 type CommandOutcome struct {
 	ExitCode int

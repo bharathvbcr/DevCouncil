@@ -409,7 +409,28 @@ func ToCLITask(taskID string, gaps []Gap, meta runMeta) TaskCLIResult {
 	}
 }
 
-// CollectGitState probes the working tree for changed files and unified diff.
+// GitState is what one collection of the working tree's git state found.
+//
+// Changed, Diff and Empty are the change the gates judge. The rest is what the
+// change touches that the diff cannot carry: see CollectGitStateReport.
+type GitState struct {
+	// Changed, Diff and Empty are CollectGitState's three results.
+	Changed []string
+	Diff    string
+	Empty   bool
+}
+
+// CollectGitState probes the working tree for changed files and unified diff:
+// the three results of CollectGitStateReport that the diff-based gates judge.
+func CollectGitState(ctx context.Context, root string) (changed []string, diff string, empty bool, err error) {
+	state, err := CollectGitStateReport(ctx, root)
+	if err != nil {
+		return nil, "", true, err
+	}
+	return state.Changed, state.Diff, state.Empty, nil
+}
+
+// CollectGitStateReport probes the working tree for changed files and unified diff.
 //
 // Every read goes through one proc.GitSession, so the repository's config is
 // read once for the operation. A read that fails is reported, never read as
@@ -422,10 +443,12 @@ func ToCLITask(taskID string, gaps []Gap, meta runMeta) TaskCLIResult {
 // NUL-delimited (-z), and no name is trimmed or has its separators rewritten:
 // `f.txt ` and `f.txt` are two files, and folding them onto each other let one
 // hide the other's bytes from the scan.
-func CollectGitState(ctx context.Context, root string) (changed []string, diff string, empty bool, err error) {
+func CollectGitStateReport(ctx context.Context, root string) (state GitState, err error) {
+	var changed []string
+	var diff string
 	git, err := proc.NewGitSession(root)
 	if err != nil {
-		return nil, "", true, err
+		return GitState{}, err
 	}
 	// One deadline for the whole collection, submodule walk included: the walk's
 	// calls (DirtySubmodules, then each dirty submodule's files) draw on it
@@ -436,13 +459,13 @@ func CollectGitState(ctx context.Context, root string) (changed []string, diff s
 	headless := false
 	if err != nil {
 		if !hasNoHead(ctx, git) {
-			return nil, "", true, err
+			return GitState{}, err
 		}
 		headless, nameOut = true, nil
 	}
 	entries, err := parseNameStatus(nameOut)
 	if err != nil {
-		return nil, "", true, err
+		return GitState{}, err
 	}
 	seen := map[string]struct{}{}
 	add := func(path string) {
@@ -458,7 +481,7 @@ func CollectGitState(ctx context.Context, root string) (changed []string, diff s
 	}
 	rootFS, err := os.OpenRoot(root)
 	if err != nil {
-		return nil, "", true, err
+		return GitState{}, err
 	}
 	defer func() { err = errors.Join(err, rootFS.Close()) }()
 	// tracked is the set `git diff HEAD` carries a section for. A path git
@@ -481,7 +504,7 @@ func CollectGitState(ctx context.Context, root string) (changed []string, diff s
 				// deleted file has no bytes either way, and the parent that
 				// replaced its directory is read as the untracked file it is.
 			case serr != nil:
-				return nil, "", true, fmt.Errorf("cannot tell whether deleted %s is back on disk: %v", entry.path, serr)
+				return GitState{}, fmt.Errorf("cannot tell whether deleted %s is back on disk: %v", entry.path, serr)
 			case !info.IsDir():
 				recreated = append(recreated, entry.path)
 				continue
@@ -491,13 +514,13 @@ func CollectGitState(ctx context.Context, root string) (changed []string, diff s
 	}
 	untracked, err := runGit(ctx, git, gitListingLimit, "ls-files", "--others", "--exclude-standard", "-z")
 	if err != nil {
-		return nil, "", true, err
+		return GitState{}, err
 	}
 	for _, name := range strings.Split(string(untracked), "\x00") {
 		// A trailing slash is how git lists a repository nested in the tree that
 		// is neither ignored nor a submodule: its files are in no listing.
 		if strings.HasSuffix(name, "/") {
-			return nil, "", true, proc.NestedRepositoryError(name)
+			return GitState{}, proc.NestedRepositoryError(name)
 		}
 		add(name)
 	}
@@ -506,7 +529,7 @@ func CollectGitState(ctx context.Context, root string) (changed []string, diff s
 	// each one, and a dirty submodule is a changed path as it was before.
 	dirty, err := git.DirtySubmodules(ctx)
 	if err != nil {
-		return nil, "", true, err
+		return GitState{}, err
 	}
 	for _, name := range dirty {
 		add(name)
@@ -518,16 +541,17 @@ func CollectGitState(ctx context.Context, root string) (changed []string, diff s
 		}
 		diffBytes, err := runGit(ctx, git, gitDiffLimit, args...)
 		if err != nil {
-			return nil, "", true, err
+			return GitState{}, err
 		}
 		diff = string(diffBytes)
 	}
 	diff, err = attachMissingDiffBytes(ctx, git, root, changed, tracked, dirty, diff)
 	if err != nil {
-		return nil, "", true, err
+		return GitState{}, err
 	}
-	empty = len(changed) == 0 && strings.TrimSpace(diff) == ""
-	return changed, diff, empty, nil
+	state.Changed, state.Diff = changed, diff
+	state.Empty = len(changed) == 0 && strings.TrimSpace(diff) == ""
+	return state, nil
 }
 
 // nameStatus is one path of `git diff --name-status -z`.
@@ -783,13 +807,13 @@ func VerifyTask(ctx context.Context, root string, client *store.Client, taskID s
 	if task == nil {
 		return MCPResult{}, nil, fmt.Errorf("task %s not found", taskID)
 	}
-	changed, diff, empty, gitErr := CollectGitState(ctx, root)
+	state, gitErr := CollectGitStateReport(ctx, root)
 	if gitErr != nil {
 		// Not a git repo, git missing or refused, or a read past its cap: the
 		// diff-based gates have nothing to judge, and Run reports that as a
 		// blocking rigor_check_unavailable gap rather than judging an empty
 		// diff as a clean one.
-		changed, diff, empty = nil, "", true
+		state = GitState{Empty: true}
 	}
 	// Read only when the task claims criteria, so a task without any costs no
 	// extra store round trip. A read error is carried, not returned: it
@@ -823,10 +847,6 @@ func VerifyTask(ctx context.Context, root string, client *store.Client, taskID s
 		GateConfigError: gate.Error,
 		EnvPolicy:       envPolicy,
 		Difficulty:      task.Difficulty,
-		ChangedFiles:    changed,
-		DiffContent:     diff,
-		DiffEmpty:       empty,
-		WorkPresent:     !empty,
 		GitErr:          gitErr,
 		AllowNoRigor:    allowNoRigor(),
 		RunCommand:      RunCommandWithEnv(ctx, root, envPolicy),
@@ -834,6 +854,7 @@ func VerifyTask(ctx context.Context, root string, client *store.Client, taskID s
 		CoveragePath:    coveragePath,
 		Lappi:           LappiAsker(),
 	}
+	in.WithGitState(state)
 	began := time.Now().UTC()
 	gaps, meta := Run(ctx, in)
 	meta.StartedAt, meta.FinishedAt = began, time.Now().UTC()
