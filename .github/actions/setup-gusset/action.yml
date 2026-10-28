@@ -23,8 +23,9 @@ runs:
       with:
         repository: bharathvbcr/gusset
         # Pinned to the sibling revision this tree was linked against, and the
-        # one rust/gusset-engine builds --locked against (register_engine
-        # returns Result there). Bump deliberately, in the same change as the
+        # one rust/gusset-engine builds --locked against (gusset v0.0.3: the I1
+        # WaitBuffer fix, ErrBadArg refusals; needs libc 0.2.191 for Apple
+        # F_SETNOSIGPIPE). Bump deliberately, in the same change as the
         # code that needs it: tracking main would let a Gusset push fail a
         # DevCouncil release without a DevCouncil commit. ci:local and
         # rust/verify.sh fail when ../gusset is at another revision
