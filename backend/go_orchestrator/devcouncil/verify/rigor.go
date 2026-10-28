@@ -278,7 +278,7 @@ func addToolStateSecretScan(ctx context.Context, in Input, taskID string, out ri
 		// none planned every binary section was skipped, silently, so a NUL in a
 		// tool-state file (or a `-diff` attribute the agent wrote) hid it. Scope
 		// classification is not read back: only secret findings are kept.
-		result, err := in.Rigor.Check(ctx, dcverify.Request{Diff: view.diff, Planned: in.ToolStatePaths})
+		result, err := in.Rigor.Check(ctx, dcverify.Request{Diff: view.diff, Planned: in.ToolStateBinaryPaths})
 		if err != nil {
 			out.gaps = append(out.gaps, Gap{
 				ID:       StableGapID(taskID, "RIGOR", "tool-state-"+view.name),
@@ -295,6 +295,12 @@ func addToolStateSecretScan(ctx context.Context, in Input, taskID string, out ri
 			continue
 		}
 		ran = true
+		// A binary file dcverify was told about but could not read (too large, a
+		// link, gone) was not scanned, and is not the stub fallback.
+		if _, unread := dcverify.SplitDegraded(result.StubASTDegraded); len(unread) > 0 {
+			out.degradedReasons = append(out.degradedReasons, "tool state: secret scan did not read "+itoa(len(unread))+
+				" binary file(s): "+strings.Join(unread, "; "))
+		}
 		var secrets []dcverify.Finding
 		for _, f := range result.Findings {
 			if f.Gate == dcverify.GateSecretScan {

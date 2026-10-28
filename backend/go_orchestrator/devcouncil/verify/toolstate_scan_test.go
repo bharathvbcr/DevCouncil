@@ -3,6 +3,7 @@ package verify_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -110,7 +111,7 @@ func TestToolStateBinaryFileIsScannedAndNamed(t *testing.T) {
 		root := gitRepo(t)
 		writeFile(t, root, ".devmap/x.sqlite", "SQLite format 3\x00rows\n")
 		o := attackRun(t, root, "TASK-TS-BIN-U", benignChange(t, root))
-		requireDegraded(t, key, o, "tool state not text-scanned (binary): .devmap/x.sqlite")
+		requireDegraded(t, key, o, "tool state is binary (secret scan ran on raw bytes; no text gates): .devmap/x.sqlite")
 	})
 	t.Run("tracked, no credential", func(t *testing.T) {
 		root := gitRepo(t)
@@ -118,7 +119,7 @@ func TestToolStateBinaryFileIsScannedAndNamed(t *testing.T) {
 		attackCommit(t, root, "track a database")
 		writeFile(t, root, ".devmap/y.sqlite", "SQLite format 3\x00two\n")
 		o := attackRun(t, root, "TASK-TS-BIN-T", benignChange(t, root))
-		requireDegraded(t, key, o, "tool state not text-scanned (binary): .devmap/y.sqlite")
+		requireDegraded(t, key, o, "tool state is binary (secret scan ran on raw bytes; no text gates): .devmap/y.sqlite")
 	})
 	t.Run("untracked, with a credential", func(t *testing.T) {
 		root := gitRepo(t)
@@ -448,10 +449,47 @@ func TestToolStateReasonsAreBoundedAndSayThereAreMore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(state.ToolStateUnscanned) != 101 {
-		t.Fatalf("%d reasons, want 100 listed and one that counts the rest", len(state.ToolStateUnscanned))
+	if len(state.ToolStateUnscanned) != 102 {
+		t.Fatalf("%d reasons, want 100 listed, one that counts the rest, and one that says 20 binary paths were not read as bytes", len(state.ToolStateUnscanned))
 	}
-	if last := state.ToolStateUnscanned[100]; last != "tool state not secret-scanned: 20 further path(s) not listed" {
-		t.Fatalf("the last reason is %q", last)
+	if got := state.ToolStateUnscanned[100]; got != "tool state not secret-scanned: 20 further path(s) not listed" {
+		t.Fatalf("the reason after the listed ones is %q", got)
 	}
+	if got := state.ToolStateUnscanned[101]; got != "tool state not secret-scanned: 20 binary path(s) past the first 100 were not read as bytes" {
+		t.Fatalf("the last reason is %q", got)
+	}
+}
+
+// Only the binary tool-state paths go to dcverify as Planned, because they are the
+// only ones it needs (it reads a binary section's bytes from the working tree for
+// a path in scope). A large tool-state tree of text files must not put every path
+// on the command line: that is an argument past the OS limit, and a false block.
+func TestToolStateManyTextPathsAndFewBinaryOnesStillRun(t *testing.T) {
+	key := exampleAWSKey()
+	root := gitRepo(t)
+	pad := strings.Repeat("p", 70)
+	for i := 0; i < 15_000; i++ {
+		writeFile(t, root, filepath.ToSlash(filepath.Join(".devmap", "bulk", fmt.Sprintf("%s_%05d.txt", pad, i))), "x\n")
+	}
+	writeFile(t, root, ".devmap/bin/a.bin", "\x00clean\n")
+	writeFile(t, root, ".devmap/bin/b.bin", "\x00"+toolStateKeyLine())
+	o := attackRun(t, root, "TASK-TS-MANY", benignChange(t, root))
+	for _, g := range o.gaps {
+		if g.GapType == "rigor_check_unavailable" {
+			t.Fatalf("the tool-state pass could not run: %s", g.Description)
+		}
+	}
+	requireLooked(t, key, o)
+}
+
+// Binary tool-state paths past the cap are named, not dropped: dcverify is only
+// told the first hundred, and the rest say they were not read.
+func TestToolStateBinaryPathsPastTheCapAreNamed(t *testing.T) {
+	key := exampleAWSKey()
+	root := gitRepo(t)
+	for i := 0; i < 130; i++ {
+		writeFile(t, root, fmt.Sprintf(".devmap/bin/%03d.bin", i), "\x00clean\n")
+	}
+	o := attackRun(t, root, "TASK-TS-BINCAP", benignChange(t, root))
+	requireDegraded(t, key, o, "tool state not secret-scanned: 30 binary path(s) past the first 100 were not read as bytes")
 }

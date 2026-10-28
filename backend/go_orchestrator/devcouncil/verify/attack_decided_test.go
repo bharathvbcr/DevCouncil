@@ -214,7 +214,7 @@ func TestDecidedGitlinkIgnoreConfigs(t *testing.T) {
 			runGitIn(t, root, "config", "-f", ".gitmodules", "submodule.sub.ignore", "all")
 		},
 		"diff.submodule=log": func(t *testing.T, root string) {
-			t.Skip("pre-existing on main: diff.submodule=log makes `git diff HEAD` print `Submodule a..b:` lines that dcverify cannot parse, so main blocks with a rigor_check_unavailable gap that names no path; fail-closed, not lane-introduced")
+			t.Skip("ft-c397c278: diff.submodule=log makes `git diff HEAD` print `Submodule a..b:` lines that dcverify cannot parse, so the run is blocked (fail-closed) by a rigor_check_unavailable gap that names no path; asserted and found not to name it, so it stays skipped until the card lands")
 		},
 	}
 	for name, setup := range cases {
@@ -1110,7 +1110,7 @@ func TestDecidedOrdinaryStagedSecretThenRevertedForComparison(t *testing.T) {
 		o := attackRun(t, root, "TASK-D-ORD-REV", benignChange(t, root))
 		t.Logf("ordinary: class=%s empty=%v diffHasKey=%v", decidedClass(o), o.empty, strings.Contains(o.diff, key))
 		if decidedClass(o) == "verified" {
-			t.Skip("pre-existing on main: `git diff HEAD` compares the worktree to HEAD, so a secret staged and then reverted on disk is in the index (and the next commit) and in no diff; the same basis serves tool state below")
+			t.Skip("ft-c397c278 (pre-existing on main a76e963f, verified there): `git diff HEAD` compares the worktree to HEAD, so a secret staged and then reverted on disk is in the index (and the next commit) and in no diff; the same basis serves tool state below")
 		}
 	})
 	t.Run("headless repo, staged secret file", func(t *testing.T) {
@@ -1121,7 +1121,7 @@ func TestDecidedOrdinaryStagedSecretThenRevertedForComparison(t *testing.T) {
 		o := attackRun(t, root, "TASK-D-ORD-HL")
 		t.Logf("headless staged: class=%s empty=%v diffHasKey=%v types=%v", decidedClass(o), o.empty, strings.Contains(o.diff, key), advTypes(o.gaps))
 		if decidedClass(o) == "verified" {
-			t.Skip("pre-existing on main: a repository with no HEAD collects only untracked files and `ls-files --others` omits staged ones, so a staged secret is in no listing (the headless branch of CollectGitStateReport is unchanged by the lane except for tool state)")
+			t.Skip("ft-c397c278 (pre-existing on main): a repository with no HEAD collects only untracked files and `ls-files --others` omits staged ones, so a staged secret is in no listing (the headless branch of CollectGitStateReport is unchanged by the lane except for tool state)")
 		}
 	})
 }
@@ -1282,7 +1282,7 @@ func TestDecidedBinaryLookingSecretOrdinaryVersusToolState(t *testing.T) {
 // reviewer reads, and a byte that is not UTF-8 is replaced when the result is
 // marshalled.
 func TestDecidedGitlinkReasonsAreDisplaySafe(t *testing.T) {
-	t.Skip("not in fix round 1 (ruling 44): raw U+202E and non-UTF-8 bytes in a gitlink reason are filed as a separate follow-up card; this test is the repro and fails until it lands")
+	t.Skip("ft-c397c278: raw U+202E and non-UTF-8 bytes in a gitlink reason are a follow-up (not in fix round 1, ruling 44); this test is the repro and fails until the card lands")
 	root := t.TempDir()
 	runGitIn(t, root, "init", "-q")
 	indexInfo(t, root, [][3]string{{"160000", sha('a'), "x‮)dedda("}, {"160000", sha('a'), "bad\xffbytes"}})

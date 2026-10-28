@@ -171,10 +171,10 @@ type Input struct {
 	// ToolStateDiff is the tool-owned state the secret gate reads, apart from
 	// DiffContent: the other gates never see it. ToolStateUnscanned is what it
 	// could not carry, each entry a degraded reason. See toolstate.go.
-	ToolStateDiff      string
-	ToolStateIndexDiff string
-	ToolStatePaths     []string
-	ToolStateUnscanned []string
+	ToolStateDiff        string
+	ToolStateIndexDiff   string
+	ToolStateBinaryPaths []string
+	ToolStateUnscanned   []string
 
 	// Commands are expected_tests, falling back to allowed_commands.
 	Commands []string
@@ -231,7 +231,7 @@ func (in *Input) WithGitState(state GitState) {
 	in.MovedGitlinks = state.MovedGitlinks
 	in.ToolStateDiff = state.ToolStateDiff
 	in.ToolStateIndexDiff = state.ToolStateIndexDiff
-	in.ToolStatePaths = state.ToolStatePaths
+	in.ToolStateBinaryPaths = state.ToolStateBinaryPaths
 	in.ToolStateUnscanned = state.ToolStateUnscanned
 }
 

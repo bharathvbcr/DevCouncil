@@ -1028,7 +1028,7 @@ fn adv2_pub_use_crate_path_alias_of_alias_degrades() {
 }
 
 #[test]
-#[ignore = "named limit: brief 3.4(a) scopes aliased pub-use degradation to todo/unimplemented; a pub alias of panic lets another file call p!(\"TODO\") unseen"]
+#[ignore = "named limit of ft-011bb644 (brief §3.4a): aliased pub-use degradation is scoped to todo/unimplemented; a pub alias of panic lets another file call p!(\"TODO\") unseen"]
 fn adv2_pub_use_panic_alias_reexport_documents_gap() {
     // panic! with a TODO message is a stub too; only todo/unimplemented degrade
     // on a pub re-export.

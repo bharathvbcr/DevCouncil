@@ -62,7 +62,12 @@ const maxToolStateReasons = 100
 type toolStateReasons struct {
 	list  []string
 	extra int
+	// notices are reasons about the scan itself, not about one path, and are
+	// always listed: they must not be the thing the list cap swallows.
+	notices []string
 }
+
+func (r *toolStateReasons) notice(reason string) { r.notices = append(r.notices, reason) }
 
 func (r *toolStateReasons) add(reason string) {
 	for _, have := range r.list {
@@ -78,16 +83,26 @@ func (r *toolStateReasons) add(reason string) {
 }
 
 func (r *toolStateReasons) all() []string {
+	out := r.list
 	if r.extra > 0 {
-		return append(r.list, fmt.Sprintf("tool state not secret-scanned: %d further path(s) not listed", r.extra))
+		out = append(out, fmt.Sprintf("tool state not secret-scanned: %d further path(s) not listed", r.extra))
 	}
-	return r.list
+	return append(out, r.notices...)
 }
 
 // toolStateCapReason is the reason for tool state that does not fit in its own
 // diff: what was collected is scanned, and the rest is said not to have been.
 func toolStateCapReason() string {
 	return fmt.Sprintf("tool state not secret-scanned: its diff exceeds %d bytes", gitDiffLimit)
+}
+
+// toolStateBinaryReason names a binary tool-state file. The wording is true
+// whether dcverify read its bytes from the working tree (a tracked or untracked
+// file, for a path it was told is in scope) or the host wrote them from the
+// index: the secret scan ran on the raw bytes, and no text gate (stub, assert,
+// skipped test) read them as text.
+func toolStateBinaryReason(rel string) string {
+	return "tool state is binary (secret scan ran on raw bytes; no text gates): " + toolStatePath(rel)
 }
 
 // toolStatePath spells a path for a reason: withheld when it is spelled like a
@@ -110,8 +125,11 @@ type toolStateScan struct {
 	// staged and then reverted or deleted on disk, but it is in the index, and the
 	// next commit.
 	IndexDiff string
-	// Paths are every tool-state path in either diff, as git wrote them.
-	Paths []string
+	// BinaryPaths are the tool-state files dcverify must read from the working
+	// tree because their diff section is a binary marker with no bytes: the only
+	// paths it needs to be told are in scope. At most maxToolStateBinaryPaths; the
+	// rest are named in Unscanned.
+	BinaryPaths []string
 	// Unscanned are the degraded reasons.
 	Unscanned []string
 }
@@ -133,11 +151,10 @@ func collectToolState(ctx context.Context, git *proc.GitSession, rootFS *os.Root
 	var reasons toolStateReasons
 	spec := toolStatePathspecs()
 	names := map[string]struct{}{}
-	paths := map[string]struct{}{}
+	binaryPaths := map[string]struct{}{}
 	for _, name := range untracked {
 		if policy.IsToolState(name) {
 			names[name] = struct{}{}
-			paths[name] = struct{}{}
 		}
 	}
 	if headless {
@@ -151,11 +168,10 @@ func collectToolState(ctx context.Context, git *proc.GitSession, rootFS *os.Root
 		for _, name := range strings.Split(string(listing), "\x00") {
 			if name != "" && policy.IsToolState(name) {
 				names[name] = struct{}{}
-				paths[name] = struct{}{}
 			}
 		}
 	} else {
-		if err := trackedToolState(ctx, git, spec, &b, &reasons, paths); err != nil {
+		if err := trackedToolState(ctx, git, spec, &b, &reasons, binaryPaths); err != nil {
 			return toolStateScan{}, err
 		}
 	}
@@ -182,22 +198,34 @@ func collectToolState(ctx context.Context, git *proc.GitSession, rootFS *os.Root
 		case problem != "":
 			reasons.add("tool state not secret-scanned: " + toolStatePath(name) + " (" + problem + ")")
 		case binary:
-			reasons.add("tool state not text-scanned (binary): " + toolStatePath(name))
+			binaryPaths[name] = struct{}{}
+			reasons.add(toolStateBinaryReason(name))
 		}
 	}
 	var index strings.Builder
 	if !capped {
-		if err := indexToolState(ctx, git, spec, gitDiffLimit-b.Len(), &index, &reasons, paths); err != nil {
+		if err := indexToolState(ctx, git, spec, gitDiffLimit-b.Len(), &index, &reasons); err != nil {
 			return toolStateScan{}, err
 		}
 	}
-	scan = toolStateScan{Diff: b.String(), IndexDiff: index.String(), Unscanned: reasons.all()}
-	for path := range paths {
-		scan.Paths = append(scan.Paths, path)
+	scan = toolStateScan{Diff: b.String(), IndexDiff: index.String()}
+	for path := range binaryPaths {
+		scan.BinaryPaths = append(scan.BinaryPaths, path)
 	}
-	sort.Strings(scan.Paths)
+	sort.Strings(scan.BinaryPaths)
+	if extra := len(scan.BinaryPaths) - maxToolStateBinaryPaths; extra > 0 {
+		// dcverify is told the first maxToolStateBinaryPaths: every planned path
+		// is one more byte on the command line, and a large tree must not put the
+		// run past the OS limit. The rest are not read as bytes, and say so.
+		reasons.notice(fmt.Sprintf("tool state not secret-scanned: %d binary path(s) past the first %d were not read as bytes", extra, maxToolStateBinaryPaths))
+		scan.BinaryPaths = scan.BinaryPaths[:maxToolStateBinaryPaths]
+	}
+	scan.Unscanned = reasons.all()
 	return scan, nil
 }
+
+// maxToolStateBinaryPaths bounds the binary paths handed to dcverify as Planned.
+const maxToolStateBinaryPaths = maxToolStateReasons
 
 // maxToolStateIndexPaths bounds how many index versions are read. The rest are
 // counted in a reason, not skipped quietly.
@@ -253,7 +281,7 @@ func literalSpec(names []string, exclude bool) []string {
 // through the guarded session.
 //
 // budget is what is left of the one cap the two diffs share.
-func indexToolState(ctx context.Context, git *proc.GitSession, spec []string, budget int, b *strings.Builder, reasons *toolStateReasons, paths map[string]struct{}) error {
+func indexToolState(ctx context.Context, git *proc.GitSession, spec []string, budget int, b *strings.Builder, reasons *toolStateReasons) error {
 	staged, ok, err := nameSet(ctx, git, reasons, append([]string{"diff", "--cached", "--name-only", "-z", "--no-renames"}, spec...)...)
 	if err != nil || !ok || len(staged) == 0 {
 		return err
@@ -298,7 +326,6 @@ func indexToolState(ctx context.Context, git *proc.GitSession, spec []string, bu
 		isBinary[parts[2]] = parts[0] == "-" && parts[1] == "-"
 	}
 	for _, name := range want {
-		paths[name] = struct{}{}
 		if isBinary[name] {
 			binary = append(binary, name)
 		} else {
@@ -366,7 +393,7 @@ func indexBinaryToolState(ctx context.Context, git *proc.GitSession, names []str
 		case have[0].mode == "160000":
 			continue
 		}
-		reasons.add("tool state not text-scanned (binary): " + toolStatePath(name))
+		reasons.add(toolStateBinaryReason(name))
 		remaining := budget - b.Len()
 		if remaining <= 0 {
 			reasons.add(toolStateCapReason())
@@ -399,7 +426,7 @@ func indexBinaryToolState(ctx context.Context, git *proc.GitSession, names []str
 // trackedToolState adds the diff of the tracked tool-state files, and names the binary
 // ones. A diff past the cap is not an error: what fits is not collected, and
 // the reason says the rest was not scanned.
-func trackedToolState(ctx context.Context, git *proc.GitSession, spec []string, b *strings.Builder, reasons *toolStateReasons, paths map[string]struct{}) error {
+func trackedToolState(ctx context.Context, git *proc.GitSession, spec []string, b *strings.Builder, reasons *toolStateReasons, binaryPaths map[string]struct{}) error {
 	numstat, err := runGit(ctx, git, gitListingLimit, append([]string{"diff", "HEAD", "--numstat", "-z", "--no-renames"}, spec...)...)
 	switch {
 	case errors.Is(err, ErrGitOutputTruncated):
@@ -416,9 +443,9 @@ func trackedToolState(ctx context.Context, git *proc.GitSession, spec []string, 
 		if len(parts) != 3 || parts[2] == "" {
 			return fmt.Errorf("git diff --numstat named a tool-state change it could not be read as: refusing to read it as a shorter list")
 		}
-		paths[parts[2]] = struct{}{}
 		if parts[0] == "-" && parts[1] == "-" {
-			reasons.add("tool state not text-scanned (binary): " + toolStatePath(parts[2]))
+			binaryPaths[parts[2]] = struct{}{}
+			reasons.add(toolStateBinaryReason(parts[2]))
 		}
 	}
 	diffBytes, err := runGit(ctx, git, gitDiffLimit, append([]string{"-c", "core.quotePath=false", "diff", "HEAD"}, spec...)...)
