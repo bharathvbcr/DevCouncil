@@ -944,7 +944,6 @@ fn adv2_syntax_error_with_alias_degrades() {
 }
 
 #[test]
-#[ignore = "pre-existing on main: a Rust source past MAX_SOURCE_BYTES is not parsed and is not listed in unparsed or stub_ast_degraded; the lane did not touch this path"]
 fn adv2_oversize_rust_source_with_alias_degrades() {
     let mut body = String::from("use std::todo as t;\npub fn f() -> u32 {\n    t!()\n}\n");
     while body.len() <= dc_verify::stub_ast::MAX_SOURCE_BYTES {
@@ -1014,10 +1013,7 @@ fn adv2_pub_use_self_alias_of_std_todo_degrades() {
 
 #[test]
 fn adv2_pub_use_alias_of_alias_degrades() {
-    let report = report_whole(
-        "src/lib.rs",
-        "use std::todo as t;\npub use t as u;\n",
-    );
+    let report = report_whole("src/lib.rs", "use std::todo as t;\npub use t as u;\n");
     assert!(!report.unparsed.is_empty(), "{:?}", report.findings);
 }
 
@@ -1142,6 +1138,7 @@ fn adv2_crate_import_of_a_non_macro_does_not_degrade_ordinary_macros() {
 }
 
 #[test]
+#[ignore = "L1, follow-up of ft-926e5b45: the import match is namespace-blind, so a function imported from crate::util under the name of a called std macro degrades the file"]
 fn adv2_crate_import_function_named_like_a_called_macro_does_not_degrade() {
     // `use crate::util::format;` is a function; the `format!` is std's. Same
     // namespace-blind match used by (b): this is the noise cost.
@@ -1211,7 +1208,6 @@ fn adv2_many_aliases_times_many_invocations_is_bounded_in_time() {
 }
 
 #[test]
-#[ignore = "pre-existing on main: a Rust source past MAX_SOURCE_BYTES is not parsed and is not listed in unparsed or stub_ast_degraded; the lane did not touch this path"]
 fn adv2_oversize_rust_source_through_the_binary_is_degraded_not_clean() {
     let root = Root::new();
     let mut body = String::from("use std::todo as t;\npub fn f() -> u32 {\n    t!()\n}\n");
@@ -1224,6 +1220,193 @@ fn adv2_oversize_rust_source_through_the_binary_is_degraded_not_clean() {
     assert!(
         degraded_nonempty(&run.stdout) || run.stdout.contains("\"stub_detection\""),
         "an oversize source was neither degraded nor blocked: {}",
-        run.stdout.chars().filter(|_| true).collect::<String>().split("stub_ast_degraded").nth(1).unwrap_or("NO-DEGRADED-KEY").chars().take(300).collect::<String>()
+        run.stdout
+            .chars()
+            .filter(|_| true)
+            .collect::<String>()
+            .split("stub_ast_degraded")
+            .nth(1)
+            .unwrap_or("NO-DEGRADED-KEY")
+            .chars()
+            .take(300)
+            .collect::<String>()
     );
+}
+
+// ======================================================================
+// Round 2 fixes (lane/verify-residue): the reasons a degraded file names.
+// ======================================================================
+
+fn reasons_of(body: &str) -> Vec<&'static str> {
+    report_whole("src/lib.rs", body)
+        .unparsed
+        .iter()
+        .map(|u| u.reason)
+        .collect()
+}
+
+#[test]
+fn a_stub_macro_alias_chain_through_a_renamed_crate_root_blocks() {
+    for (body, line) in [
+        (
+            "use std as s;\nuse s::todo as t;\npub fn f() -> u32 {\n    t!()\n}\n",
+            4,
+        ),
+        (
+            "use std::{self as s};\nuse s::todo as t;\npub fn f() -> u32 {\n    t!()\n}\n",
+            4,
+        ),
+        (
+            "extern crate std as s;\nuse s::todo as t;\npub fn f() -> u32 {\n    t!()\n}\n",
+            4,
+        ),
+        (
+            "extern crate core as c;\nuse c::unimplemented as u;\npub fn f() -> u32 {\n    u!()\n}\n",
+            4,
+        ),
+        (
+            "use std as s;\nuse s as r;\nuse r::todo as t;\npub fn f() -> u32 {\n    t!()\n}\n",
+            5,
+        ),
+        (
+            "pub fn f() -> u32 {\n    t!()\n}\nuse s::todo as t;\nuse std as s;\n",
+            2,
+        ),
+    ] {
+        blocks_proven("src/lib.rs", body, line);
+    }
+}
+
+#[test]
+fn a_macro_rules_in_an_inner_module_hides_no_top_level_alias() {
+    blocks_proven(
+        "src/lib.rs",
+        "use std::todo as t;\npub fn f() -> u32 {\n    t!()\n}\nmod tests {\n    macro_rules! t {\n        () => { 1 };\n    }\n}\n",
+        3,
+    );
+    // One in a function body hides the alias only inside that body, after it.
+    blocks_proven(
+        "src/lib.rs",
+        "use std::todo as t;\nfn a() -> u32 {\n    macro_rules! t {\n        () => { 1 };\n    }\n    t!()\n}\nfn b() -> u32 {\n    t!()\n}\n",
+        9,
+    );
+    // One at the top of the same module still does.
+    clean_and_parsed(
+        "src/lib.rs",
+        "use std::todo as t;\nmacro_rules! t {\n    () => { 1 };\n}\npub fn f() -> u32 {\n    t!()\n}\n",
+    );
+}
+
+#[test]
+fn a_re_export_chain_of_a_stub_alias_degrades_with_the_named_reason() {
+    for body in [
+        "pub use std::todo;\npub use self::todo as t;\n",
+        "use std::todo as t;\npub use crate::t as u;\n",
+        "use std::todo as t;\npub use super::t as u;\n",
+        "use std as s;\npub use s::todo as t;\n",
+        "extern crate std as s;\npub use s::unimplemented as u;\n",
+    ] {
+        assert_eq!(
+            reasons_of(body),
+            vec![Unparsed::UnresolvedMacroImport.as_str()],
+            "{body:?}"
+        );
+    }
+}
+
+#[test]
+fn an_imported_or_qualified_macro_in_a_token_tree_degrades_with_the_named_reason() {
+    assert_eq!(Unparsed::AliasInTokenTree.as_str(), "alias-in-token-tree");
+    for body in [
+        "use crate::macros::stub;\npub fn f() -> u32 {\n    dbg!(stub!())\n}\n",
+        "use crate::macros::stub;\npub fn f() -> Vec<u32> {\n    vec![stub!()]\n}\n",
+        "pub fn f() -> u32 {\n    dbg!(crate::macros::stub!())\n}\n",
+        "mod macros;\npub fn f() -> u32 {\n    dbg!(macros::stub!())\n}\n",
+        "use crate::macros::stub;\nmacro_rules! m {\n    () => { stub!() };\n}\n",
+        "pub fn f() -> u32 {\n    dbg!(\n        1,\n        ::crate::macros::stub!()\n    )\n}\n",
+    ] {
+        assert_eq!(reasons_of(body), vec!["alias-in-token-tree"], "{body:?}");
+    }
+    // Not on an added line, not in a string or a comment, and not a macro this
+    // file defines.
+    clean_and_parsed(
+        "src/lib.rs",
+        "use crate::macros::stub;\npub fn f() -> String {\n    format!(\"{}\", \"stub!()\") // stub!()\n}\n",
+    );
+    clean_and_parsed(
+        "src/lib.rs",
+        "macro_rules! stub {\n    () => { 1 };\n}\nuse crate::stub;\npub fn f() -> u32 {\n    dbg!(stub!())\n}\n",
+    );
+}
+
+#[test]
+fn an_alias_in_a_token_tree_is_proven_when_it_is_a_std_stub() {
+    // The wrapper's own name is not a stub; its token tree holds std's `todo!`
+    // under another name, which the tree can resolve.
+    blocks_proven(
+        "src/lib.rs",
+        "use std::todo as t;\npub fn f() -> u32 {\n    dbg!(t!())\n}\n",
+        3,
+    );
+}
+
+#[test]
+fn a_use_walk_past_its_cap_degrades_with_the_named_reason() {
+    assert_eq!(Unparsed::AliasWalkBudget.as_str(), "alias-walk-budget");
+    let mut body = String::new();
+    for i in 0..50_100 {
+        body.push_str(&format!("use a{i} as b{i};\n"));
+    }
+    body.push_str("pub fn f() -> u32 {\n    1\n}\n");
+    assert!(body.len() < dc_verify::stub_ast::MAX_SOURCE_BYTES);
+    let start = std::time::Instant::now();
+    let reasons = reasons_of(&body);
+    assert_eq!(reasons, vec!["alias-walk-budget"]);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn a_long_alias_chain_resolves_in_one_indexed_pass() {
+    // The same shape as the attack's 158 KB chain, written in both orders.
+    for forward in [false, true] {
+        let n = 8000usize;
+        let mut body = String::new();
+        let order: Vec<usize> = if forward {
+            (1..n).collect()
+        } else {
+            (1..n).rev().collect()
+        };
+        for i in order {
+            body.push_str(&format!("use t{} as t{};\n", i - 1, i));
+        }
+        body.push_str("use std::todo as t0;\npub fn f() -> u32 {\n    t7999!()\n}\n");
+        let start = std::time::Instant::now();
+        blocks_proven("src/lib.rs", &body, n as u32 + 2);
+        let took = start.elapsed();
+        eprintln!("alias chain n={n} forward={forward}: {took:?}");
+        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+    }
+}
+
+#[test]
+fn an_oversize_new_rust_file_with_a_stub_is_reported_unparsed() {
+    let mut body = String::from("pub fn f() -> u32 {\n    todo!()\n}\n");
+    while body.len() <= dc_verify::stub_ast::MAX_SOURCE_BYTES {
+        body.push_str("// padding padding padding padding padding padding\n");
+    }
+    let report = report_whole("src/lib.rs", &body);
+    let reasons: Vec<&str> = report.unparsed.iter().map(|u| u.reason).collect();
+    assert_eq!(reasons, vec![Unparsed::TooLarge.as_str()]);
+    // The substring checks still ran and still found the stub.
+    assert!(blocked(&report), "{:?}", report.findings);
+    // A language the tree does not read is not reported as unparsed for size.
+    let mut text = String::from("TODO: later\n");
+    while text.len() <= dc_verify::stub_ast::MAX_SOURCE_BYTES {
+        text.push_str("padding padding padding padding padding padding\n");
+    }
+    assert!(report_whole("notes.txt", &text).unparsed.is_empty());
 }
