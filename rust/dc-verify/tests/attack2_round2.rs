@@ -349,7 +349,9 @@ fn m5_pingpong_alias_flip_is_bounded_in_time() {
         blocked(&r),
         reasons(&r)
     );
-    assert!(took < Duration::from_secs(2), "took {took:?}");
+    // Loose 10 s backstop only: the exact bound is the step count asserted by
+    // stub_ast::step_count_tests, which a loaded machine cannot flake.
+    assert!(took < Duration::from_secs(10), "took {took:?}");
 }
 
 // ---------------------------------------------------------------- P1

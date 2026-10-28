@@ -1173,8 +1173,10 @@ fn adv2_forward_alias_chain_is_bounded_in_time() {
         eprintln!("reverse alias chain n={n}: {took:?} ({} bytes)", body.len());
         worst = worst.max(took);
     }
+    // Loose 10 s backstop only: the exact bound is the step count asserted by
+    // stub_ast::step_count_tests, which a loaded machine cannot flake.
     assert!(
-        worst < std::time::Duration::from_secs(2),
+        worst < std::time::Duration::from_secs(10),
         "alias chain pre-pass took {worst:?}"
     );
 }
@@ -1201,8 +1203,10 @@ fn adv2_many_aliases_times_many_invocations_is_bounded_in_time() {
         );
         worst = worst.max(took);
     }
+    // Loose 10 s backstop only: the exact bound is the step count asserted by
+    // stub_ast::step_count_tests, which a loaded machine cannot flake.
     assert!(
-        worst < std::time::Duration::from_secs(2),
+        worst < std::time::Duration::from_secs(10),
         "alias x invocation scan took {worst:?}"
     );
 }
@@ -1362,8 +1366,10 @@ fn a_use_walk_past_its_cap_degrades_with_the_named_reason() {
     let start = std::time::Instant::now();
     let reasons = reasons_of(&body);
     assert_eq!(reasons, vec!["alias-walk-budget"]);
+    // Loose 10 s backstop only: the exact bound is the step count asserted by
+    // stub_ast::step_count_tests, which a loaded machine cannot flake.
     assert!(
-        start.elapsed() < std::time::Duration::from_secs(2),
+        start.elapsed() < std::time::Duration::from_secs(10),
         "{:?}",
         start.elapsed()
     );
@@ -1388,7 +1394,9 @@ fn a_long_alias_chain_resolves_in_one_indexed_pass() {
         blocks_proven("src/lib.rs", &body, n as u32 + 2);
         let took = start.elapsed();
         eprintln!("alias chain n={n} forward={forward}: {took:?}");
-        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+        // Loose 10 s backstop only: the exact bound is the step count asserted by
+        // stub_ast::step_count_tests, which a loaded machine cannot flake.
+        assert!(took < std::time::Duration::from_secs(10), "{took:?}");
     }
 }
 

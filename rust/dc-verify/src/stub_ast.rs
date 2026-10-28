@@ -194,17 +194,38 @@ pub fn analyze_within(
     added: &HashSet<u32>,
     budget: std::time::Duration,
 ) -> Result<Vec<AstFinding>, Unparsed> {
-    analyze_capped(lang, source, added, budget, MAX_SCOPE_CHECKS)
+    analyze_capped(
+        lang,
+        source,
+        added,
+        budget,
+        MAX_SCOPE_CHECKS,
+        &mut Steps::default(),
+    )
+}
+
+/// What one analysis spent on the two bounded pre-passes, for a test to assert
+/// on in place of a wall clock: a count is the same on a loaded machine and an
+/// idle one. Never part of any output.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Steps {
+    /// Nodes and leaves the alias walk visited (see `resolve_aliases`).
+    alias_visits: usize,
+    /// Scopes examined answering "is this macro defined here" (see `defined_at`).
+    scope_checks: usize,
+    /// A scope-check question found the cap spent.
+    scope_checks_exhausted: bool,
 }
 
 /// [`analyze_within`] with the per-file scope-check cap as a parameter, so a
-/// test can lower it.
+/// test can lower it, and `steps` filled in with what the pre-passes spent.
 fn analyze_capped(
     lang: Lang,
     source: &str,
     added: &HashSet<u32>,
     budget: std::time::Duration,
     scope_checks: usize,
+    steps: &mut Steps,
 ) -> Result<Vec<AstFinding>, Unparsed> {
     if source.len() > MAX_SOURCE_BYTES {
         return Err(Unparsed::TooLarge);
@@ -271,6 +292,11 @@ fn analyze_capped(
         let mut cursor = node.walk();
         stack.extend(node.named_children(&mut cursor));
     }
+    *steps = Steps {
+        alias_visits: imports.alias_visits,
+        scope_checks: imports.scope_checks_spent.get(),
+        scope_checks_exhausted: imports.scope_checks_exhausted.get(),
+    };
     // What the tree proved wins. Only a file with nothing blocking in it is
     // degraded for a macro it could not read, so a degraded file is never also
     // one the scan already refused.
@@ -477,6 +503,8 @@ struct RustImports {
     /// have spent. A query that finds the cap spent sets `scope_checks_exhausted`.
     scope_check_cap: usize,
     scope_checks_spent: std::cell::Cell<usize>,
+    /// Visits the alias walk made, for [`Steps`].
+    alias_visits: usize,
     scope_checks_exhausted: std::cell::Cell<bool>,
 }
 
@@ -561,7 +589,7 @@ impl RustImports {
             out.over_budget = true;
             return out;
         }
-        out.resolve_aliases(&records, MAX_ALIAS_VISITS);
+        out.alias_visits = out.resolve_aliases(&records, MAX_ALIAS_VISITS);
         for record in &records {
             let local = record.path.first().is_some_and(|root| {
                 matches!(root.as_str(), "crate" | "super" | "self") || out.local_mods.contains(root)
@@ -1932,7 +1960,7 @@ mod scope_check_cap_tests {
     }
 
     fn analyze(body: &str, added: &HashSet<u32>, cap: usize) -> Result<Vec<AstFinding>, Unparsed> {
-        analyze_capped(Lang::Rust, body, added, BUDGET, cap)
+        analyze_capped(Lang::Rust, body, added, BUDGET, cap, &mut Steps::default())
     }
 
     /// The smallest cap under which the file is read to the end, clean, found
@@ -2065,5 +2093,220 @@ mod alias_walk_tests {
         imports.resolve_aliases(&records, MAX_ALIAS_VISITS);
         assert_eq!(imports.aliases.get("t"), Some(&"todo"));
         assert_eq!(imports.aliases.get("u"), Some(&"todo"));
+    }
+}
+
+/// The cost bounds of the alias pre-passes, asserted as step counts.
+///
+/// The integration tests that carried a 2 s wall clock for these shapes measured
+/// the machine as much as the code: under load the same code passed and failed.
+/// A count of the visits the walk made and the scopes the queries examined is
+/// the bound itself, and the same on any machine. The integration tests keep
+/// their verdict assertions and a loose wall-clock backstop.
+#[cfg(test)]
+mod step_count_tests {
+    use super::*;
+
+    const CALL: &str = "pub fn f() -> u32 {\n    t!()\n}\n";
+
+    fn steps_of(body: &str, cap: usize) -> (Result<Vec<AstFinding>, Unparsed>, Steps) {
+        let added: HashSet<u32> = (1..=body.lines().count() as u32).collect();
+        let mut steps = Steps::default();
+        let result = analyze_capped(
+            Lang::Rust,
+            body,
+            &added,
+            std::time::Duration::from_secs(120),
+            cap,
+            &mut steps,
+        );
+        (result, steps)
+    }
+
+    fn blocked(result: &Result<Vec<AstFinding>, Unparsed>) -> bool {
+        matches!(result, Ok(f) if f.iter().any(|f| f.severity == Severity::Blocking))
+    }
+
+    /// A walk visits each leaf a bounded number of times, however the shape
+    /// flips the bindings: at most four visits per `use` leaf.
+    fn assert_linear(label: &str, body: &str, leaves: usize) -> Steps {
+        let (result, steps) = steps_of(body, MAX_SCOPE_CHECKS);
+        assert!(
+            steps.alias_visits <= 4 * leaves,
+            "{label}: {} visits for {leaves} leaves",
+            steps.alias_visits
+        );
+        assert!(!matches!(result, Err(Unparsed::AliasWalkBudget)), "{label}");
+        assert!(steps.alias_visits > 0, "{label}: the walk never ran");
+        steps
+    }
+
+    fn pingpong(k: usize, m: usize) -> String {
+        let mut body = String::new();
+        for _ in 0..k {
+            body.push_str("use std::todo as t;\nuse std::unimplemented as t;\n");
+        }
+        for _ in 0..m {
+            body.push_str("use t as u;\n");
+        }
+        for _ in 0..m {
+            body.push_str("use u as t;\n");
+        }
+        body.push_str(CALL);
+        body
+    }
+
+    // ---- residue2_alias.rs, attack2_round2.rs, attack_verify_rigor.rs ----------
+
+    #[test]
+    fn the_67_second_pingpong_is_linear_in_its_leaves_and_blocks() {
+        let body = pingpong(6_000, 12_000);
+        assert_linear("pingpong 6000/12000", &body, 2 * 6_000 + 2 * 12_000);
+        assert!(blocked(&steps_of(&body, MAX_SCOPE_CHECKS).0));
+    }
+
+    #[test]
+    fn a_smaller_pingpong_is_linear_too() {
+        assert_linear(
+            "pingpong 2000/2000",
+            &pingpong(2_000, 2_000),
+            2 * 2_000 + 2 * 2_000,
+        );
+    }
+
+    #[test]
+    fn ten_times_the_attack_stops_at_the_record_cap_before_the_walk_starts() {
+        let (result, steps) = steps_of(&pingpong(20_000, 20_000), MAX_SCOPE_CHECKS);
+        assert_eq!(
+            steps.alias_visits, 0,
+            "the walk started past the record cap"
+        );
+        assert!(
+            matches!(result, Err(Unparsed::AliasWalkBudget)),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_use_walk_past_the_record_cap_never_starts() {
+        let mut body = String::new();
+        for i in 0..50_100 {
+            body.push_str(&format!("use a{i} as b{i};\n"));
+        }
+        body.push_str("pub fn f() -> u32 {\n    1\n}\n");
+        let (result, steps) = steps_of(&body, MAX_SCOPE_CHECKS);
+        assert_eq!(steps.alias_visits, 0);
+        assert!(
+            matches!(result, Err(Unparsed::AliasWalkBudget)),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn flips_through_panic_are_linear_and_block() {
+        let mut body = String::new();
+        for _ in 0..3_000 {
+            body.push_str("use std::panic as t;\nuse std::todo as t;\n");
+        }
+        for _ in 0..3_000 {
+            body.push_str("use t as u;\nuse u as t;\n");
+        }
+        body.push_str(CALL);
+        assert_linear("panic flips", &body, 2 * 3_000 + 2 * 3_000);
+        assert!(blocked(&steps_of(&body, MAX_SCOPE_CHECKS).0));
+    }
+
+    #[test]
+    fn one_first_segment_with_many_names_is_linear_and_blocks() {
+        let mut body = String::new();
+        for i in 0..20_000 {
+            body.push_str(&format!("use std::todo as a{i};\n"));
+        }
+        body.push_str("use a19999 as t;\n");
+        body.push_str(CALL);
+        assert_linear("many names", &body, 20_001);
+        assert!(blocked(&steps_of(&body, MAX_SCOPE_CHECKS).0));
+    }
+
+    #[test]
+    fn a_long_alias_chain_is_linear_in_either_order() {
+        for n in [2_000usize, 8_000] {
+            for forward in [false, true] {
+                let order: Vec<usize> = if forward {
+                    (1..n).collect()
+                } else {
+                    (1..n).rev().collect()
+                };
+                let mut body = String::new();
+                for i in order {
+                    body.push_str(&format!("use t{} as t{};\n", i - 1, i));
+                }
+                body.push_str(&format!(
+                    "use std::todo as t0;\npub fn f() -> u32 {{\n    t{}!()\n}}\n",
+                    n - 1
+                ));
+                assert_linear(&format!("chain n={n} forward={forward}"), &body, n);
+                assert!(blocked(&steps_of(&body, MAX_SCOPE_CHECKS).0));
+            }
+        }
+    }
+
+    #[test]
+    fn many_aliases_times_many_invocations_spend_no_scope_checks_and_few_visits() {
+        for (aliases, calls) in [(500usize, 2_000usize), (2_000, 8_000)] {
+            let mut body = String::new();
+            for i in 0..aliases {
+                body.push_str(&format!("use std::todo as a{i};\n"));
+            }
+            body.push_str("pub fn f() {\n");
+            for _ in 0..calls {
+                body.push_str("    w!(x);\n");
+            }
+            body.push_str("}\n");
+            let (_, steps) = steps_of(&body, MAX_SCOPE_CHECKS);
+            assert_eq!(
+                steps.scope_checks, 0,
+                "no macro_rules is defined, so no scope is examined"
+            );
+            assert!(
+                steps.alias_visits <= 4 * aliases,
+                "{} visits for {aliases} aliases",
+                steps.alias_visits
+            );
+        }
+    }
+
+    // ---- attack3_round3.rs: defs x calls ---------------------------------------
+
+    /// The probe: 25,000 `macro_rules! t` each in its own block, then 60,000
+    /// calls outside every one of them. Each call examines exactly the one scope
+    /// the search lands on and finds it closed: the count is the number of
+    /// calls, not defs x calls (1.5 x 10^9), and it is far under the cap.
+    #[test]
+    fn the_defs_by_calls_probe_examines_one_scope_per_call() {
+        let mut body = String::from("use std::todo as t;\n");
+        for _ in 0..25_000 {
+            body.push_str("{ macro_rules! t { () => {}; } }\n");
+        }
+        body.push_str("pub fn f() {\n");
+        for _ in 0..60_000 {
+            body.push_str("    t!();\n");
+        }
+        body.push_str("}\n");
+        let (result, steps) = steps_of(&body, MAX_SCOPE_CHECKS);
+        eprintln!("probe steps: {steps:?}");
+        assert_eq!(steps.scope_checks, 60_000, "{steps:?}");
+        assert!(!steps.scope_checks_exhausted);
+        assert!(blocked(&result), "the alias is in force at every call");
+        // The cap is exact: the count that was spent resolves, one fewer is
+        // exhausted, and an exhausted query leaves the alias in force.
+        let spent = steps.scope_checks;
+        let (at_cap, at_cap_steps) = steps_of(&body, spent);
+        assert!(!at_cap_steps.scope_checks_exhausted, "{at_cap_steps:?}");
+        assert!(blocked(&at_cap));
+        let (under, under_steps) = steps_of(&body, spent - 1);
+        assert!(under_steps.scope_checks_exhausted, "{under_steps:?}");
+        assert_eq!(under_steps.scope_checks, spent - 1);
+        assert!(blocked(&under));
     }
 }

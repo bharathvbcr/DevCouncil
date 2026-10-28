@@ -139,7 +139,9 @@ fn timed(body: &str) -> (Duration, StubReport) {
 fn m5_the_67_second_pingpong_is_bounded_and_still_blocks() {
     let (took, r) = timed(&pingpong(6_000, 12_000));
     eprintln!("pingpong 6000/12000: {took:?} blocked={}", blocked(&r));
-    assert!(took < Duration::from_secs(2), "took {took:?}");
+    // Loose 10 s backstop only: the exact bound is the step count asserted by
+    // stub_ast::step_count_tests, which a loaded machine cannot flake.
+    assert!(took < Duration::from_secs(10), "took {took:?}");
     assert!(blocked(&r) || !r.unparsed.is_empty());
 }
 
@@ -153,7 +155,9 @@ fn m5_ten_times_the_attack_is_degraded_or_blocked_in_time() {
         blocked(&r),
         r.unparsed
     );
-    assert!(took < Duration::from_secs(2), "took {took:?}");
+    // Loose 10 s backstop only: the exact bound is the step count asserted by
+    // stub_ast::step_count_tests, which a loaded machine cannot flake.
+    assert!(took < Duration::from_secs(10), "took {took:?}");
     assert!(blocked(&r) || !r.unparsed.is_empty());
 }
 
@@ -172,7 +176,9 @@ fn m5_flips_through_panic_end_on_the_strong_stub_and_block() {
     body.push_str(CALL);
     let (took, r) = timed(&body);
     eprintln!("panic flips: {took:?}");
-    assert!(took < Duration::from_secs(2), "took {took:?}");
+    // Loose 10 s backstop only: the exact bound is the step count asserted by
+    // stub_ast::step_count_tests, which a loaded machine cannot flake.
+    assert!(took < Duration::from_secs(10), "took {took:?}");
     assert!(blocked(&r), "{:?} {:?}", r.findings, r.unparsed);
 }
 
@@ -187,6 +193,8 @@ fn m5_one_first_segment_with_many_names_is_linear() {
     body.push_str(CALL);
     let (took, r) = timed(&body);
     eprintln!("many names: {took:?}");
-    assert!(took < Duration::from_secs(2), "took {took:?}");
+    // Loose 10 s backstop only: the exact bound is the step count asserted by
+    // stub_ast::step_count_tests, which a loaded machine cannot flake.
+    assert!(took < Duration::from_secs(10), "took {took:?}");
     assert!(blocked(&r), "{:?} {:?}", r.findings, r.unparsed);
 }

@@ -175,7 +175,9 @@ fn a4_many_scoped_definitions_times_many_calls_is_bounded() {
     // The index answers each call from the scopes that hold it, and a file is
     // capped at `MAX_SCOPE_CHECKS` of them, so this is bounded whatever the
     // machine; 2 s in debug is the stated bound.
-    assert!(took < Duration::from_secs(2), "took {took:?}");
+    // Loose 10 s backstop only: the exact bound is the step count asserted by
+    // stub_ast::step_count_tests, which a loaded machine cannot flake.
+    assert!(took < Duration::from_secs(10), "took {took:?}");
     // The probe's calls are outside every definition's scope, so the alias is
     // in force: the exact verdict is a block, never a clean file.
     assert!(blocked(&r) || r.unparsed.iter().any(|u| u.reason == "alias-walk-budget"));
