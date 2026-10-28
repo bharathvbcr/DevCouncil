@@ -163,9 +163,11 @@ pub struct StubReport {
     pub parsed_files: usize,
     /// Files in a language [`stub_ast`] parses, whose source was known, that
     /// the tree did not analyse — a syntax error, a source too large, a parse
-    /// past its budget. They took the substring checks, which see less: a
-    /// report that lists nothing here and one that lists a file are not the
-    /// same report, and the host marks the run degraded for each entry.
+    /// past its budget, or one that calls a macro imported from another file
+    /// ([`stub_ast::Unparsed::UnresolvedMacroImport`]) and so could hide a
+    /// stub the tree cannot see. They took the substring checks, which see
+    /// less: a report that lists nothing here and one that lists a file are not
+    /// the same report, and the host marks the run degraded for each entry.
     pub unparsed: Vec<UnparsedFile>,
 }
 

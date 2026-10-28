@@ -26,7 +26,7 @@
 //! tree, but "this test checks nothing" is not, because the body may call a
 //! helper that asserts.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use tree_sitter::{Language, Node, Parser};
 
@@ -119,6 +119,9 @@ pub enum Unparsed {
     OverBudget,
     /// The tree has syntax errors, so a construct in it could be misread.
     SyntaxError,
+    /// A macro this file uses is imported from another file, so the tree it
+    /// parsed cannot say whether that macro is a stub.
+    UnresolvedMacroImport,
 }
 
 impl Unparsed {
@@ -129,6 +132,9 @@ impl Unparsed {
             Unparsed::NoTree => "parser produced no tree",
             Unparsed::OverBudget => "parse exceeded its time budget",
             Unparsed::SyntaxError => "syntax error",
+            Unparsed::UnresolvedMacroImport => {
+                "macro imported from another file could not be resolved"
+            }
         }
     }
 }
@@ -201,10 +207,20 @@ pub fn analyze_within(
     if root.has_error() {
         return Err(Unparsed::SyntaxError);
     }
+    // The imports are read before the walk: the walk visits a call site before
+    // a `use` that comes after it, and a `use` in a function or an inline
+    // module names the macro for the whole file as far as this scan goes.
+    let imports = if lang == Lang::Rust {
+        RustImports::collect(root, source.as_bytes(), added)
+    } else {
+        RustImports::default()
+    };
     let mut walker = Walker {
         lang,
         src: source.as_bytes(),
         added,
+        imports: &imports,
+        unresolved: false,
         out: Vec::new(),
     };
     let mut stack = vec![root];
@@ -212,6 +228,13 @@ pub fn analyze_within(
         walker.visit(node);
         let mut cursor = node.walk();
         stack.extend(node.named_children(&mut cursor));
+    }
+    // What the tree proved wins. Only a file with nothing blocking in it is
+    // degraded for a macro it could not read, so a degraded file is never also
+    // one the scan already refused.
+    let blocked = walker.out.iter().any(|f| f.severity == Severity::Blocking);
+    if !blocked && (walker.unresolved || imports.unresolved) {
+        return Err(Unparsed::UnresolvedMacroImport);
     }
     walker
         .out
@@ -224,7 +247,248 @@ struct Walker<'a> {
     lang: Lang,
     src: &'a [u8],
     added: &'a HashSet<u32>,
+    imports: &'a RustImports,
+    /// An added invocation named a macro this file imports from another file.
+    unresolved: bool,
     out: Vec<AstFinding>,
+}
+
+/// The crates whose `todo!`, `unimplemented!` and `panic!` are the stubs.
+const STD_ROOTS: [&str; 3] = ["std", "core", "alloc"];
+/// The macros an alias can stand for.
+const STUB_MACROS: [&str; 3] = ["todo", "unimplemented", "panic"];
+/// Bounds on one `use` tree, so a hostile file cannot make the pre-pass cost
+/// more than the parse did. A tree past either is degraded, never half read.
+const MAX_USE_DEPTH: usize = 32;
+const MAX_USE_SEGMENTS: usize = 256;
+
+/// A name as it is written, without the `r#` of a raw identifier.
+fn strip_raw(name: &str) -> &str {
+    name.strip_prefix("r#").unwrap_or(name)
+}
+
+fn node_name(node: Node<'_>, src: &[u8]) -> String {
+    strip_raw(node.utf8_text(src).unwrap_or("")).to_string()
+}
+
+/// The segments of a path node, leading `::` dropped and `r#` stripped:
+/// `::core::r#todo` is `["core", "todo"]`.
+fn path_segments(mut node: Node<'_>, src: &[u8]) -> Vec<String> {
+    let mut reversed = Vec::new();
+    loop {
+        if node.kind() == "scoped_identifier" {
+            if let Some(name) = node.child_by_field_name("name") {
+                reversed.push(node_name(name, src));
+            }
+            match node.child_by_field_name("path") {
+                Some(path) => node = path,
+                None => break,
+            }
+        } else {
+            reversed.push(node_name(node, src));
+            break;
+        }
+    }
+    reversed.reverse();
+    reversed
+}
+
+/// One leaf of a `use` tree: the path it imports and the name it binds.
+struct UseRecord {
+    path: Vec<String>,
+    alias: String,
+    added: bool,
+    public: bool,
+}
+
+/// What the `use` declarations, `mod x;` and `macro_rules!` of one Rust file
+/// say about the macros its invocations name.
+#[derive(Default)]
+struct RustImports {
+    /// An alias of a std stub macro: the name it binds, and the macro it is.
+    aliases: HashMap<String, &'static str>,
+    /// Names imported from `crate`, `super`, `self` or a module this file
+    /// declares with `mod x;`, which is another file.
+    local_names: HashSet<String>,
+    local_mods: HashSet<String>,
+    /// Macros this file defines, whose bodies are scanned where they stand.
+    macro_defs: HashSet<String>,
+    /// An added aliased `pub use` of std's `todo!` or `unimplemented!` makes
+    /// the alias callable from files this scan is not reading.
+    unresolved: bool,
+}
+
+impl RustImports {
+    fn collect(root: Node<'_>, src: &[u8], added: &HashSet<u32>) -> Self {
+        let mut records = Vec::new();
+        let mut out = RustImports::default();
+        for node in descendants(root) {
+            match node.kind() {
+                "use_declaration" => {
+                    let mut cursor = node.walk();
+                    let public = node
+                        .named_children(&mut cursor)
+                        .any(|c| c.kind() == "visibility_modifier");
+                    if let Some(argument) = node.child_by_field_name("argument") {
+                        out.unresolved |= collect_use(argument, public, src, added, &mut records);
+                    }
+                }
+                "macro_definition" => {
+                    if let Some(name) = node.child_by_field_name("name") {
+                        out.macro_defs.insert(node_name(name, src));
+                    }
+                }
+                "mod_item" if node.child_by_field_name("body").is_none() => {
+                    if let Some(name) = node.child_by_field_name("name") {
+                        out.local_mods.insert(node_name(name, src));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for record in &records {
+            if let Some(stub) = std_stub(&record.path)
+                && record.alias != "_"
+            {
+                out.aliases.insert(record.alias.clone(), stub);
+            }
+        }
+        // `use std::todo as t; use self::t as u;`: each round can bind one more
+        // name, so one round per record settles every chain.
+        for _ in 0..=records.len() {
+            let mut changed = false;
+            for record in &records {
+                let relative = match record.path.split_first() {
+                    Some((first, rest)) if first == "self" => rest,
+                    _ => record.path.as_slice(),
+                };
+                if let [only] = relative
+                    && record.alias != "_"
+                    && let Some(&stub) = out.aliases.get(only)
+                    && out.aliases.insert(record.alias.clone(), stub) != Some(stub)
+                {
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for record in &records {
+            let local = record.path.first().is_some_and(|root| {
+                matches!(root.as_str(), "crate" | "super" | "self") || out.local_mods.contains(root)
+            });
+            if local && record.alias != "_" {
+                out.local_names.insert(record.alias.clone());
+            }
+            let stub = std_stub(&record.path).or_else(|| match record.path.as_slice() {
+                [only] => out.aliases.get(only).copied(),
+                _ => None,
+            });
+            if record.public
+                && record.added
+                && record.alias != "_"
+                && matches!(stub, Some("todo" | "unimplemented"))
+                && record.path.last() != Some(&record.alias)
+            {
+                out.unresolved = true;
+            }
+        }
+        // A macro this file defines is read by its own body, whatever name a
+        // `use` gives it, and shadows a std alias of the same name.
+        let defs = out.macro_defs.clone();
+        out.aliases.retain(|name, _| !defs.contains(name));
+        out
+    }
+}
+
+/// The std stub macro a path names: `std`, `core` or `alloc` first, and one of
+/// [`STUB_MACROS`] last.
+fn std_stub(path: &[String]) -> Option<&'static str> {
+    let (first, last) = (path.first()?, path.last()?);
+    if path.len() < 2 || !STD_ROOTS.contains(&first.as_str()) {
+        return None;
+    }
+    STUB_MACROS.iter().copied().find(|m| *m == last)
+}
+
+/// Flattens one `use` argument into leaves. Returns whether the tree was too
+/// large to read in full.
+fn collect_use(
+    argument: Node<'_>,
+    public: bool,
+    src: &[u8],
+    added: &HashSet<u32>,
+    out: &mut Vec<UseRecord>,
+) -> bool {
+    let mut too_large = false;
+    let mut stack = vec![(argument, Vec::<String>::new(), 0usize)];
+    while let Some((node, prefix, depth)) = stack.pop() {
+        if depth > MAX_USE_DEPTH {
+            too_large = true;
+            continue;
+        }
+        // A leaf's own path is `self` for `use a::{self as b}`, which names the
+        // prefix, not a segment called `self`.
+        let leaf_path = |path: Node<'_>| {
+            let mut full = prefix.clone();
+            if path.kind() != "self" {
+                full.extend(path_segments(path, src));
+            }
+            full
+        };
+        let mut record = |path: Vec<String>, alias: String| {
+            out.push(UseRecord {
+                path,
+                alias,
+                added: added.contains(&line_of(node)),
+                public,
+            });
+        };
+        match node.kind() {
+            "use_as_clause" => {
+                let (Some(path), Some(alias)) = (
+                    node.child_by_field_name("path"),
+                    node.child_by_field_name("alias"),
+                ) else {
+                    continue;
+                };
+                let full = leaf_path(path);
+                if full.len() > MAX_USE_SEGMENTS {
+                    too_large = true;
+                    continue;
+                }
+                record(full, node_name(alias, src));
+            }
+            "scoped_use_list" | "use_list" => {
+                let mut next = prefix.clone();
+                if let Some(path) = node.child_by_field_name("path") {
+                    next.extend(path_segments(path, src));
+                }
+                if next.len() > MAX_USE_SEGMENTS {
+                    too_large = true;
+                    continue;
+                }
+                let list = node.child_by_field_name("list").unwrap_or(node);
+                let mut cursor = list.walk();
+                for child in list.named_children(&mut cursor) {
+                    stack.push((child, next.clone(), depth + 1));
+                }
+            }
+            "identifier" | "crate" | "super" | "self" | "scoped_identifier" | "metavariable" => {
+                let full = leaf_path(node);
+                if full.len() > MAX_USE_SEGMENTS {
+                    too_large = true;
+                    continue;
+                }
+                if let Some(last) = full.last().cloned() {
+                    record(full, last);
+                }
+            }
+            _ => {}
+        }
+    }
+    too_large
 }
 
 fn line_of(node: Node<'_>) -> u32 {
@@ -267,7 +531,15 @@ fn contains_marker(text: &str) -> bool {
 /// `!` by whitespace or comments (`todo !()`), and must be followed by a
 /// delimiter, so `todo != x` is not a stub. Something left unterminated is not
 /// code.
-fn first_visible_stub_line(text: &str, accept: &dyn Fn(usize) -> bool) -> Option<usize> {
+fn first_visible_stub_line(
+    text: &str,
+    aliases: &[String],
+    accept: &dyn Fn(usize) -> bool,
+) -> Option<usize> {
+    let names: Vec<&str> = ["todo", "unimplemented"]
+        .into_iter()
+        .chain(aliases.iter().map(String::as_str))
+        .collect();
     let lower = text.to_ascii_lowercase();
     let bytes = lower.as_bytes();
     let newlines: Vec<usize> = bytes
@@ -321,7 +593,7 @@ fn first_visible_stub_line(text: &str, accept: &dyn Fn(usize) -> bool) -> Option
                 let boundary =
                     i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
                 if boundary {
-                    for name in ["todo", "unimplemented"] {
+                    for name in &names {
                         if !bytes[i..].starts_with(name.as_bytes()) {
                             continue;
                         }
@@ -571,10 +843,18 @@ impl<'a> Walker<'a> {
                 if !self.is_added(node) {
                     return;
                 }
-                let name = node
+                let segments = node
                     .child_by_field_name("macro")
-                    .map(|m| last_segment(self.text(m)))
-                    .unwrap_or("");
+                    .map(|m| path_segments(m, self.src))
+                    .unwrap_or_default();
+                let written = segments.last().map_or("", String::as_str);
+                // The name a `use` gave a std stub macro is that macro.
+                let name = self
+                    .imports
+                    .aliases
+                    .get(written)
+                    .copied()
+                    .unwrap_or(written);
                 match name {
                     "todo" | "unimplemented" => self.placeholder(node, &format!("{name}!()")),
                     "panic" if self.panic_is_placeholder(node) => {
@@ -585,7 +865,7 @@ impl<'a> Walker<'a> {
                     _ if self.visible_stub_line(node).is_some() => {
                         self.placeholder(node, "wrapper macro")
                     }
-                    _ => {}
+                    _ => self.note_unresolved_import(&segments),
                 }
             }
             // `macro_rules` bodies are token trees, not expanded invocations,
@@ -704,14 +984,45 @@ impl<'a> Walker<'a> {
         false
     }
 
-    /// An added line of `node` whose code contains `todo!` or `unimplemented!`.
+    /// An added line of `node` whose code contains `todo!` or `unimplemented!`,
+    /// or the name a `use` of this file gave one of them.
     fn visible_stub_line(&self, node: Node<'_>) -> Option<u32> {
         let start = line_of(node);
-        first_visible_stub_line(self.text(node), &|offset| {
+        let aliases: Vec<String> = self
+            .imports
+            .aliases
+            .iter()
+            .filter(|(_, stub)| **stub != "panic")
+            .map(|(name, _)| name.to_ascii_lowercase())
+            .collect();
+        first_visible_stub_line(self.text(node), &aliases, &|offset| {
             self.added
                 .contains(&(start + u32::try_from(offset).unwrap_or(0)))
         })
         .map(|offset| start + u32::try_from(offset).unwrap_or(0))
+    }
+
+    /// Records that an added invocation names a macro imported from another
+    /// file of the crate, which this scan cannot read. A macro this file
+    /// defines is read from its own body and is not that.
+    fn note_unresolved_import(&mut self, segments: &[String]) {
+        let Some(name) = segments.last() else {
+            return;
+        };
+        if self.imports.macro_defs.contains(name) {
+            return;
+        }
+        let from_elsewhere = match segments {
+            [only] => self.imports.local_names.contains(only),
+            [first, ..] => {
+                matches!(first.as_str(), "crate" | "super" | "self")
+                    || self.imports.local_mods.contains(first)
+            }
+            [] => false,
+        };
+        if from_elsewhere {
+            self.unresolved = true;
+        }
     }
 
     // ---- Go ----

@@ -9,7 +9,8 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dc_verify::parse_unified;
-use dc_verify::rigor::{Severity, detect_stubs_report};
+use dc_verify::rigor::{Severity, Strength, StubReport, detect_stubs_report};
+use dc_verify::stub_ast::Unparsed;
 
 fn key() -> String {
     concat!("AKIA", "IOSFODNN7EXAMPLE").to_string()
@@ -49,14 +50,310 @@ fn blocks_or_degrades(path: &str, body: &str) {
     );
 }
 
+fn report_whole(path: &str, body: &str) -> StubReport {
+    let diff = whole_file(path, body);
+    let files = parse_unified(&diff).expect("diff parses");
+    let post = body.to_string();
+    detect_stubs_report(&files, &|_| Some(post.clone()))
+}
+
+/// A Blocking, Proven `stub_detection` finding on `line`, found by the tree:
+/// the file was parsed, so nothing is reported as degraded.
+fn blocks_proven(path: &str, body: &str, line: u32) {
+    let report = report_whole(path, body);
+    assert!(
+        report.unparsed.is_empty(),
+        "the file was reported unparsed: {:?}",
+        report.unparsed
+    );
+    let hit = report.findings.iter().any(|f| {
+        f.gate == "stub_detection"
+            && f.severity == Severity::Blocking
+            && f.strength == Strength::Proven
+            && f.line == line
+    });
+    assert!(
+        hit,
+        "no Blocking, Proven stub finding on line {line} of {body:?}: {:?}",
+        report.findings
+    );
+}
+
+/// The file is neither blocked nor degraded: it was parsed and is clean.
+fn clean_and_parsed(path: &str, body: &str) {
+    let report = report_whole(path, body);
+    assert!(
+        report.unparsed.is_empty(),
+        "a clean file was reported unparsed: {:?} for {body:?}",
+        report.unparsed
+    );
+    assert!(
+        !report
+            .findings
+            .iter()
+            .any(|f| f.severity == Severity::Blocking),
+        "a clean file was blocked: {:?} for {body:?}",
+        report.findings
+    );
+}
+
+/// Degraded with exactly the named reason, and no Blocking finding.
+fn degrades_unresolved(path: &str, body: &str) {
+    let report = report_whole(path, body);
+    let reasons: Vec<&str> = report.unparsed.iter().map(|u| u.reason).collect();
+    assert_eq!(
+        reasons,
+        vec![Unparsed::UnresolvedMacroImport.as_str()],
+        "wrong degradation for {body:?}: findings={:?}",
+        report.findings
+    );
+}
+
 // ---------------------------------------------------------------- stubs
 
 #[test]
-#[ignore = "known gap ft-926e5b45: the stub scan matches macro names textually, so a `use` alias of todo! passes"]
 fn attack_stub_through_a_use_alias_is_not_clean() {
     blocks_or_degrades(
         "src/lib.rs",
         "use std::todo as t;\npub fn f() -> u32 {\n    t!()\n}\n",
+    );
+}
+
+#[test]
+fn same_file_std_alias_is_detected_proven() {
+    // (body, 1-based line of the finding)
+    let forms: &[(&str, u32)] = &[
+        ("use std::todo as t;\npub fn f() -> u32 {\n    t!()\n}\n", 3),
+        (
+            "use std::{fmt, todo as t};\npub fn f() -> u32 {\n    t!()\n}\n",
+            3,
+        ),
+        (
+            "use ::core::unimplemented as u;\npub fn f() -> u32 {\n    u!()\n}\n",
+            3,
+        ),
+        (
+            "use core::{unimplemented as u};\npub fn f() -> u32 {\n    u!()\n}\n",
+            3,
+        ),
+        (
+            "use ::core::{self, unimplemented as u, panic};\npub fn f() -> u32 {\n    u!()\n}\n",
+            3,
+        ),
+        (
+            "use alloc::todo as t;\npub fn f() -> u32 {\n    t!()\n}\n",
+            3,
+        ),
+        (
+            "pub use std::todo as t;\npub fn f() -> u32 {\n    t!()\n}\n",
+            3,
+        ),
+        (
+            "pub(crate) use std::todo as t;\npub fn f() -> u32 {\n    t!()\n}\n",
+            3,
+        ),
+        (
+            "use std::todo as r#t;\npub fn f() -> u32 {\n    t!()\n}\n",
+            3,
+        ),
+        (
+            "use r#std::r#todo as t;\npub fn f() -> u32 {\n    r#t!()\n}\n",
+            3,
+        ),
+        (
+            "use std::todo as t;\nuse self::t as u;\npub fn f() -> u32 {\n    u!()\n}\n",
+            4,
+        ),
+        (
+            "use std::todo as t;\nuse t as u;\npub fn f() -> u32 {\n    u!()\n}\n",
+            4,
+        ),
+        (
+            "use std::todo as t;\npub fn f() -> u32 {\n    self::t!()\n}\n",
+            3,
+        ),
+        // A `use` inside a function body counts for the whole file.
+        (
+            "pub fn f() -> u32 {\n    use std::todo as t;\n    t!()\n}\n",
+            3,
+        ),
+        (
+            "mod m {\n    use std::todo as t;\n}\npub fn f() -> u32 {\n    t!()\n}\n",
+            5,
+        ),
+        (
+            "use std::panic as p;\npub fn f() -> u32 {\n    p!(\"TODO\")\n}\n",
+            3,
+        ),
+        // The wrapper's own name is not a stub, its token tree holds the alias.
+        (
+            "use std::todo as t;\npub fn f() -> u32 {\n    wrap!(t!());\n    1\n}\n",
+            3,
+        ),
+        (
+            "use std::todo as t;\nmacro_rules! m {\n    () => { t!() };\n}\n",
+            3,
+        ),
+    ];
+    for (body, line) in forms {
+        blocks_proven("src/lib.rs", body, *line);
+    }
+}
+
+#[test]
+fn raw_identifier_todo_is_detected() {
+    blocks_proven("src/lib.rs", "pub fn f() -> u32 {\n    r#todo!()\n}\n", 2);
+    blocks_proven(
+        "src/lib.rs",
+        "pub fn f() -> u32 {\n    ::core::r#unimplemented!()\n}\n",
+        2,
+    );
+    blocks_proven(
+        "src/lib.rs",
+        "pub fn f() -> u32 {\n    std::r#panic!(\"TODO\")\n}\n",
+        2,
+    );
+}
+
+#[test]
+fn alias_declared_on_an_unchanged_line_still_blocks_an_added_call() {
+    let body = "use std::todo as t;\npub fn f() -> u32 {\n    t!()\n}\n";
+    let diff = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,3 +1,4 @@\n use std::todo as t;\n pub fn f() -> u32 {\n+    t!()\n }\n";
+    let files = parse_unified(diff).expect("diff parses");
+    let post = body.to_string();
+    let report = detect_stubs_report(&files, &|_| Some(post.clone()));
+    assert!(report.unparsed.is_empty(), "{:?}", report.unparsed);
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.gate == "stub_detection" && f.severity == Severity::Blocking && f.line == 3),
+        "{:?}",
+        report.findings
+    );
+}
+
+#[test]
+fn alias_used_only_on_unchanged_lines_is_not_reported() {
+    // Only the `use` line is added; the call is somebody else's decision.
+    let body = "use std::todo as t;\npub fn f() -> u32 {\n    t!()\n}\n";
+    let diff = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,3 +1,4 @@\n+use std::todo as t;\n pub fn f() -> u32 {\n     t!()\n }\n";
+    let files = parse_unified(diff).expect("diff parses");
+    let post = body.to_string();
+    let report = detect_stubs_report(&files, &|_| Some(post.clone()));
+    assert!(report.unparsed.is_empty(), "{:?}", report.unparsed);
+    assert!(
+        !report
+            .findings
+            .iter()
+            .any(|f| f.severity == Severity::Blocking),
+        "{:?}",
+        report.findings
+    );
+}
+
+#[test]
+fn a_same_file_macro_rules_shadowing_the_alias_is_not_a_stub() {
+    // `t` is this file's own macro, not std's `todo`.
+    clean_and_parsed(
+        "src/lib.rs",
+        "use std::todo as t;\nmacro_rules! t {\n    () => { 1 };\n}\npub fn f() -> u32 {\n    t!()\n}\n",
+    );
+}
+
+#[test]
+fn crate_macro_import_degrades_with_named_reason() {
+    let forms = [
+        // (b) an import from a crate, super or self path.
+        "use crate::macros::stub as t;\npub fn f() -> u32 {\n    t!()\n}\n",
+        "use crate::macros::stub;\npub fn f() -> u32 {\n    stub!()\n}\n",
+        "use super::stub;\npub fn f() -> u32 {\n    stub!()\n}\n",
+        "use self::inner::{stub};\npub fn f() -> u32 {\n    stub!()\n}\n",
+        // ... or from a module this file declares with `mod x;`.
+        "mod macros;\nuse macros::stub;\npub fn f() -> u32 {\n    stub!()\n}\n",
+        "mod macros;\npub fn f() -> u32 {\n    macros::stub!()\n}\n",
+        // (c) an invocation qualified by crate, super or self.
+        "pub fn f() -> u32 {\n    crate::macros::stub!()\n}\n",
+        "pub fn f() -> u32 {\n    super::stub!()\n}\n",
+        "pub fn f() -> u32 {\n    self::stub!()\n}\n",
+    ];
+    for body in forms {
+        degrades_unresolved("src/lib.rs", body);
+    }
+}
+
+#[test]
+fn aliased_pub_use_reexport_degrades() {
+    degrades_unresolved("src/lib.rs", "pub use std::todo as t;\n");
+    degrades_unresolved("src/lib.rs", "pub(crate) use core::unimplemented as u;\n");
+    degrades_unresolved("src/lib.rs", "pub use std::{fmt, todo as t};\n");
+}
+
+#[test]
+fn imports_that_hide_nothing_stay_clean_and_not_degraded() {
+    // A same-name re-export: `todo!()` is already caught by its own text.
+    clean_and_parsed("src/lib.rs", "pub use std::todo;\n");
+    // A private alias nobody calls.
+    clean_and_parsed("src/lib.rs", "use std::todo as t;\n");
+    // An external crate's macro, which is not another file of this tree.
+    clean_and_parsed(
+        "src/lib.rs",
+        "use serde_json::json;\npub fn f() {\n    let _ = json!({});\n}\n",
+    );
+    // A macro this file defines is read by its body, however it is named.
+    clean_and_parsed(
+        "src/lib.rs",
+        "macro_rules! stub {\n    () => { 1 };\n}\nuse crate::stub;\npub fn f() -> u32 {\n    stub!() + crate::stub!()\n}\n",
+    );
+    clean_and_parsed("src/lib.rs", "use std::*;\n");
+    // The unrelated `mod x;` and a `crate::` path that names no macro call.
+    clean_and_parsed(
+        "src/lib.rs",
+        "mod helpers;\nuse crate::helpers::Thing;\npub fn f() -> Thing {\n    Thing::new()\n}\n",
+    );
+}
+
+#[test]
+fn a_use_tree_nested_past_the_bound_degrades_instead_of_being_half_read() {
+    let depth = 40;
+    let body = format!(
+        "use {}std::todo as t{};\npub fn f() -> u32 {{\n    t!()\n}}\n",
+        "a::{".repeat(depth),
+        "}".repeat(depth)
+    );
+    let report = report_whole("src/lib.rs", &body);
+    let reasons: Vec<&str> = report.unparsed.iter().map(|u| u.reason).collect();
+    assert_eq!(
+        reasons,
+        vec![Unparsed::UnresolvedMacroImport.as_str()],
+        "{:?}",
+        report.findings
+    );
+    assert!(
+        !report
+            .findings
+            .iter()
+            .any(|f| f.severity == Severity::Blocking),
+        "{:?}",
+        report.findings
+    );
+}
+
+#[test]
+fn a_blocking_stub_wins_over_a_degraded_import() {
+    // The file is blocked on what the tree proved; it is not also degraded.
+    let report = report_whole(
+        "src/lib.rs",
+        "use crate::macros::stub;\npub fn f() -> u32 {\n    stub!();\n    todo!()\n}\n",
+    );
+    assert!(report.unparsed.is_empty(), "{:?}", report.unparsed);
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.gate == "stub_detection" && f.severity == Severity::Blocking),
+        "{:?}",
+        report.findings
     );
 }
 
