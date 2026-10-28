@@ -86,7 +86,7 @@ fn never_clean(label: &str, took: Duration, r: Option<StubReport>, limit: Durati
 /// the alias's scope (no `t` macro at the bottom shadows it: the definitions
 /// are in closed sibling blocks along the way), so each is a real stub.
 #[test]
-#[ignore = "pre-existing on main: every finding climbs `enclosing_function` (stub_ast.rs:1216, main:494), and tree-sitter's Node::parent is O(depth), so cost is quadratic in nesting depth per finding: 4000 stubs at depth 200 take 50 s in debug, with or without an alias; the host's 60 s deadline turns it into a blocking rigor_check_unavailable, so it fails closed"]
+#[ignore = "pre-existing on main (verified by timing: direct todo!() with no alias costs the same; the enclosing_function attribution is inferred): every finding climbs `enclosing_function` (stub_ast.rs:1216, main:494) and tree-sitter's Node::parent is O(depth), so cost is quadratic in nesting depth per finding: 4000 stubs at depth 200 take 50 s in debug, with or without an alias; the host's 60 s deadline turns it into a blocking rigor_check_unavailable, so it fails closed"]
 fn deep_scopes_with_sibling_definitions_then_many_calls() {
     for (depth, calls) in [(500usize, 20_000usize), (2_000, 20_000), (4_000, 30_000)] {
         let mut body = String::from(ALIAS);
