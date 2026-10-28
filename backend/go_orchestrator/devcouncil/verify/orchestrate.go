@@ -171,6 +171,9 @@ func Run(ctx context.Context, in Input) (gaps []Gap, meta runMeta) {
 	meta.CoverageMeasured = rigor.coverageMeasured
 	meta.CoverageSkippedReason = rigor.coverageSkippedReason
 	meta.DegradedReasons = append(meta.DegradedReasons, rigor.degradedReasons...)
+	// Independent of the rigor pass: a gitlink's range is not read whether or
+	// not dcverify ran, so the run says so either way.
+	meta.DegradedReasons = append(meta.DegradedReasons, gitlinkReasons(in.MovedGitlinks)...)
 	if rigor.unavailable && !in.AllowNoRigor && modeEnforces(in.GateMode) {
 		// The secret and stub scans never ran. In enforce that is not a pass;
 		// the operator opts out explicitly, or installs dcverify.
@@ -418,6 +421,11 @@ type GitState struct {
 	Changed []string
 	Diff    string
 	Empty   bool
+	// MovedGitlinks is every submodule gitlink the change adds, deletes, moves
+	// or retypes, tool-state paths included. The diff shows a move as one
+	// `Subproject commit` line, so nothing in Diff says what the submodule's
+	// history holds; Run names each as not scanned.
+	MovedGitlinks []proc.GitlinkChange
 }
 
 // CollectGitState probes the working tree for changed files and unified diff:
@@ -533,6 +541,10 @@ func CollectGitStateReport(ctx context.Context, root string) (state GitState, er
 	}
 	for _, name := range dirty {
 		add(name)
+	}
+	state.MovedGitlinks, err = git.MovedGitlinks(ctx, headless)
+	if err != nil {
+		return GitState{}, err
 	}
 	if !headless {
 		args := append([]string{"-c", "core.quotePath=false", "diff", "HEAD"}, toolStateExcludes()...)

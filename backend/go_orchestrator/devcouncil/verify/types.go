@@ -10,6 +10,7 @@ import (
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/dcverify"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/store"
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/lappi"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
 )
 
 // Gap is one verification finding. Field names and nullability match the
@@ -163,6 +164,10 @@ type Input struct {
 	DiffContent  string
 	DiffEmpty    bool
 	WorkPresent  bool
+	// MovedGitlinks are the submodule gitlinks the change touches. The diff
+	// carries no bytes for the commits a moved one moved across, so Run names
+	// each as not scanned in the degraded reasons.
+	MovedGitlinks []proc.GitlinkChange
 
 	// Commands are expected_tests, falling back to allowed_commands.
 	Commands []string
@@ -216,6 +221,7 @@ func (in *Input) WithGitState(state GitState) {
 	in.DiffContent = state.Diff
 	in.DiffEmpty = state.Empty
 	in.WorkPresent = !state.Empty
+	in.MovedGitlinks = state.MovedGitlinks
 }
 
 // CommandOutcome is the result of attempting to run one verification command.
