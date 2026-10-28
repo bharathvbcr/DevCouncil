@@ -752,18 +752,44 @@ fn adv2_nested_tree_self_alias_then_qualified_call_blocks() {
 }
 
 #[test]
-fn adv2_module_alias_then_macro_alias_through_it_is_not_clean() {
-    // `use std as s; use s::todo as t;` binds `t` to std's todo!, through a
-    // module alias. The pre-pass roots an alias only at a literal std/core/alloc.
-    for body in [
+fn adv2_std_as_s_then_use_s_todo_as_t_is_not_clean() {
+    blocks_or_degrades(
+        "src/lib.rs",
         "use std as s;\nuse s::todo as t;\npub fn f() -> u32 {\n    t!()\n}\n",
+    );
+}
+
+#[test]
+fn adv2_self_as_s_then_use_s_todo_as_t_is_not_clean() {
+    blocks_or_degrades(
+        "src/lib.rs",
         "use std::{self as s};\nuse s::todo as t;\npub fn f() -> u32 {\n    t!()\n}\n",
+    );
+}
+
+#[test]
+fn adv2_extern_crate_std_as_s_then_use_s_todo_as_t_is_not_clean() {
+    blocks_or_degrades(
+        "src/lib.rs",
         "extern crate std as s;\nuse s::todo as t;\npub fn f() -> u32 {\n    t!()\n}\n",
+    );
+}
+
+#[test]
+fn adv2_extern_crate_core_as_c_then_use_c_unimplemented_as_u_is_not_clean() {
+    blocks_or_degrades(
+        "src/lib.rs",
         "extern crate core as c;\nuse c::unimplemented as u;\npub fn f() -> u32 {\n    u!()\n}\n",
+    );
+}
+
+#[test]
+fn adv2_prelude_path_alias_blocks() {
+    blocks_proven(
+        "src/lib.rs",
         "use std::prelude::rust_2021::todo as t;\npub fn f() -> u32 {\n    t!()\n}\n",
-    ] {
-        blocks_or_degrades("src/lib.rs", body);
-    }
+        3,
+    );
 }
 
 #[test]
@@ -1006,6 +1032,7 @@ fn adv2_pub_use_crate_path_alias_of_alias_degrades() {
 }
 
 #[test]
+#[ignore = "named limit: brief 3.4(a) scopes aliased pub-use degradation to todo/unimplemented; a pub alias of panic lets another file call p!(\"TODO\") unseen"]
 fn adv2_pub_use_panic_alias_reexport_documents_gap() {
     // panic! with a TODO message is a stub too; only todo/unimplemented degrade
     // on a pub re-export.
@@ -1133,12 +1160,13 @@ fn timed_report(body: &str) -> (std::time::Duration, StubReport) {
 }
 
 #[test]
-fn adv2_reverse_alias_chain_is_bounded_in_time() {
-    // `use t{n} as t{n+1};` written in order is visited by the DFS in reverse, so one name resolves per round of the
-    // pre-pass chain loop, so records x records. Measure at two sizes; both must
-    // stay far below the parse budget.
+fn adv2_forward_alias_chain_is_bounded_in_time() {
+    // `use t{n} as t{n+1};` written in order is visited by the DFS in reverse, so
+    // one name resolves per round of the pre-pass chain loop: records x records.
+    // PARSE_BUDGET covers only the tree-sitter parse, not this pre-pass or the
+    // walk. n=8000 (158 KB) measured 13.5 s in debug against the 2 s budget.
     let mut worst = std::time::Duration::ZERO;
-    for n in [1000usize, 2000, 4000] {
+    for n in [2000usize, 8000] {
         let mut body = String::new();
         for i in 1..n {
             body.push_str(&format!("use t{} as t{};\n", i - 1, i));
