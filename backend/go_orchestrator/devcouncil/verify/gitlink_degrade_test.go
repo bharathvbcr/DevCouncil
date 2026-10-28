@@ -89,7 +89,7 @@ func requireNotPassedAndNamed(t *testing.T, key string, o attackOutcome, path, s
 	}
 	if o.result.Status == "blocked" {
 		for _, g := range o.gaps {
-			if g.Blocking && (g.GapType == "rigor_check_unavailable" || g.GapType == "task_not_implemented") {
+			if g.Blocking && g.GapType == "rigor_check_unavailable" {
 				return
 			}
 		}
