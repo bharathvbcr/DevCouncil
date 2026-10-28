@@ -629,6 +629,9 @@ const RUST_PROBES: &[&str] = &[
     "fn f() { let x = Box::new(a::b::{c}).m(); }\n",
 ];
 
+/// The spelling that marks the one SHADOW probe written as a raw identifier.
+const RAW_IDENTIFIER: &str = "`foo bar`";
+
 /// A refused call whose member name the references walk refuses for another
 /// reason first (a local binding of that name, a reserved spelling): the
 /// refusal must still be noted, because the call is gone either way.
@@ -646,6 +649,11 @@ const SHADOW: &[&str] = &[
     "func f() {\n    _ = b as? T ?? .some(1)\n}\n",
     "func f() {\n    _ = b as? T ?? .Type\n}\n",
     "func f() {\n    _ = b as? T ?? .`class`()\n}\n",
+    // A raw identifier (SE-0451, Swift 6.2: spaces inside backticks). It is valid
+    // Swift, but tree-sitter-swift does not support it: the member becomes an
+    // ERROR region and no call is extracted, so there is nothing to refuse or
+    // note. The file is Partial and the site lies inside the error range, which
+    // is the only case the test accepts without a note (see `RAW_IDENTIFIER`).
     "func f() {\n    _ = b as? T ?? .`foo bar`()\n}\n",
     "func f() {\n    _ = b as? T ?? ._foo()\n}\n",
     "func f() {\n    _ = b as? T ?? .foo(foo: 1)\n}\n",
@@ -898,22 +906,46 @@ fn a_real_member_after_the_coalesce_is_refused_and_noted_not_misbound() {
 #[test]
 fn a_refused_call_is_noted_even_when_its_name_is_hidden_by_another_rule() {
     let mut failures = Vec::new();
+    let mut raw_exempt = 0;
     for source in SHADOW {
         let e = ex("a.swift", source);
         for leak in leaks(&e) {
             failures.push(format!("{source:?}: leaked {leak}"));
         }
-        if member_notes(&e).is_empty() {
+        // Either the refusal is noted, or (raw identifier only) the grammar put
+        // the member site inside an error region and there was nothing to refuse.
+        let site = source.find("?? .").map(|at| at + "?? ".len());
+        let in_error_range = match (&e.parse_outcome, site) {
+            (ParseOutcome::Partial { error_ranges, .. }, Some(site)) => error_ranges
+                .iter()
+                .any(|r| r.start_byte <= site && site < r.end_byte),
+            _ => false,
+        };
+        let raw = source.contains(RAW_IDENTIFIER);
+        // The error-range exemption is taken by the raw identifier alone, so a
+        // regression on a valid probe cannot hide behind it.
+        if raw {
+            raw_exempt += 1;
+            if !(member_notes(&e).is_empty() && in_error_range) {
+                failures.push(format!(
+                    "{source:?}: the raw identifier was expected to be a Partial file with its \
+                     site in an error range and no note ({:?})",
+                    e.parse_outcome
+                ));
+            }
+        } else if member_notes(&e).is_empty() {
             failures.push(format!(
-                "{source:?}: refused unnoted (calls {:?}, diag {:?})",
+                "{source:?}: refused unnoted (calls {:?}, diag {:?}, {:?})",
                 e.calls
                     .iter()
                     .map(|c| (&c.callee_name, &c.receiver_expr))
                     .collect::<Vec<_>>(),
-                e.diagnostics
+                e.diagnostics,
+                e.parse_outcome
             ));
         }
     }
+    assert_eq!(raw_exempt, 1, "exactly one probe is the raw identifier");
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
