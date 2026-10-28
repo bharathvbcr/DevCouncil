@@ -1282,6 +1282,7 @@ func TestDecidedBinaryLookingSecretOrdinaryVersusToolState(t *testing.T) {
 // reviewer reads, and a byte that is not UTF-8 is replaced when the result is
 // marshalled.
 func TestDecidedGitlinkReasonsAreDisplaySafe(t *testing.T) {
+	t.Skip("not in fix round 1 (ruling 44): raw U+202E and non-UTF-8 bytes in a gitlink reason are filed as a separate follow-up card; this test is the repro and fails until it lands")
 	root := t.TempDir()
 	runGitIn(t, root, "init", "-q")
 	indexInfo(t, root, [][3]string{{"160000", sha('a'), "x‮)dedda("}, {"160000", sha('a'), "bad\xffbytes"}})

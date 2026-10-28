@@ -434,7 +434,12 @@ type GitState struct {
 	// It is the secret gate's input and nothing else's: it is never in Diff or
 	// Changed. ToolStateUnscanned names what it could not carry, as degraded
 	// reasons. See toolstate.go for the limit: ignored files are not read.
-	ToolStateDiff      string
+	ToolStateDiff string
+	// ToolStateIndexDiff is the index's version of the tool-state files where the
+	// index is not what the worktree holds, and ToolStatePaths every tool-state
+	// path in either diff. See toolstate.go.
+	ToolStateIndexDiff string
+	ToolStatePaths     []string
 	ToolStateUnscanned []string
 }
 
@@ -575,10 +580,12 @@ func CollectGitStateReport(ctx context.Context, root string) (state GitState, er
 	if err != nil {
 		return GitState{}, err
 	}
-	state.ToolStateDiff, state.ToolStateUnscanned, err = collectToolState(ctx, git, rootFS, untrackedNames, headless)
+	toolState, err := collectToolState(ctx, git, rootFS, untrackedNames, headless)
 	if err != nil {
 		return GitState{}, err
 	}
+	state.ToolStateDiff, state.ToolStateIndexDiff = toolState.Diff, toolState.IndexDiff
+	state.ToolStatePaths, state.ToolStateUnscanned = toolState.Paths, toolState.Unscanned
 	state.Changed, state.Diff = changed, diff
 	state.Empty = len(changed) == 0 && strings.TrimSpace(diff) == ""
 	return state, nil

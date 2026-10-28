@@ -328,6 +328,15 @@ func looksBinary(raw []byte) bool {
 }
 
 func formatSyntheticDiff(rel string, raw []byte) string {
+	return syntheticDiff(rel, raw, true)
+}
+
+// syntheticDiff is the diff of a whole new file. markBinary says what a file
+// with a NUL in it becomes: a `Binary files differ` section that carries none of
+// its bytes (the reader of the working tree is then expected to read them), or,
+// when false, an ordinary section of added lines, so that bytes that exist only
+// in git's object store are in the diff the scanner reads.
+func syntheticDiff(rel string, raw []byte, markBinary bool) string {
 	a, b := quoteDiffPath("a/", rel), quoteDiffPath("b/", rel)
 	header := []string{
 		fmt.Sprintf("diff --git %s %s", a, b),
@@ -335,7 +344,7 @@ func formatSyntheticDiff(rel string, raw []byte) string {
 		"--- /dev/null",
 		"+++ " + b,
 	}
-	if looksBinary(raw) {
+	if markBinary && looksBinary(raw) {
 		header = append(header, fmt.Sprintf("Binary files %s and %s differ", a, b))
 		return strings.Join(header, "\n")
 	}

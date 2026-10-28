@@ -100,23 +100,144 @@ func TestToolStateIsReadByTheSecretGateAlone(t *testing.T) {
 	}
 }
 
-// A binary file under tool state cannot be read as text: it is named.
-func TestToolStateBinaryFileIsNamedNotScanned(t *testing.T) {
+// A binary file under tool state is scanned too, and named: dcverify reads a
+// binary section's bytes from the working tree, for a path it is told is in
+// scope, so a credential in a NUL-bearing file is found. The reason says the
+// file was not read as text, whether or not a credential was in it.
+func TestToolStateBinaryFileIsScannedAndNamed(t *testing.T) {
 	key := exampleAWSKey()
-	t.Run("untracked", func(t *testing.T) {
+	t.Run("untracked, no credential", func(t *testing.T) {
 		root := gitRepo(t)
-		writeFile(t, root, ".devmap/x.sqlite", "SQLite format 3\x00"+toolStateKeyLine())
+		writeFile(t, root, ".devmap/x.sqlite", "SQLite format 3\x00rows\n")
 		o := attackRun(t, root, "TASK-TS-BIN-U", benignChange(t, root))
 		requireDegraded(t, key, o, "tool state not text-scanned (binary): .devmap/x.sqlite")
 	})
-	t.Run("tracked", func(t *testing.T) {
+	t.Run("tracked, no credential", func(t *testing.T) {
+		root := gitRepo(t)
+		writeFile(t, root, ".devmap/y.sqlite", "SQLite format 3\x00one\n")
+		attackCommit(t, root, "track a database")
+		writeFile(t, root, ".devmap/y.sqlite", "SQLite format 3\x00two\n")
+		o := attackRun(t, root, "TASK-TS-BIN-T", benignChange(t, root))
+		requireDegraded(t, key, o, "tool state not text-scanned (binary): .devmap/y.sqlite")
+	})
+	t.Run("untracked, with a credential", func(t *testing.T) {
+		root := gitRepo(t)
+		writeFile(t, root, ".devmap/x.sqlite", "SQLite format 3\x00"+toolStateKeyLine())
+		requireLooked(t, key, attackRun(t, root, "TASK-TS-BIN-UK", benignChange(t, root)))
+	})
+	t.Run("tracked, with a credential", func(t *testing.T) {
 		root := gitRepo(t)
 		writeFile(t, root, ".devmap/y.sqlite", "SQLite format 3\x00one\n")
 		attackCommit(t, root, "track a database")
 		writeFile(t, root, ".devmap/y.sqlite", "SQLite format 3\x00two\n"+toolStateKeyLine())
-		o := attackRun(t, root, "TASK-TS-BIN-T", benignChange(t, root))
-		requireDegraded(t, key, o, "tool state not text-scanned (binary): .devmap/y.sqlite")
+		requireLooked(t, key, attackRun(t, root, "TASK-TS-BIN-TK", benignChange(t, root)))
 	})
+	t.Run("a -diff attribute the agent wrote", func(t *testing.T) {
+		root := gitRepo(t)
+		writeFile(t, root, ".devmap/b.txt", "x\n")
+		attackCommit(t, root, "track")
+		writeFile(t, root, ".gitattributes", ".devmap/* -diff\n")
+		writeFile(t, root, ".devmap/b.txt", "x\n"+toolStateKeyLine())
+		requireLooked(t, key, attackRun(t, root, "TASK-TS-BIN-ATTR", benignChange(t, root)))
+	})
+}
+
+// Planned carries the tool-state paths so a binary section is read, and nothing
+// else: a planned tool-state path that is not in the diff, or a tool-state file
+// no plan names, plants no orphan or planned-file gap, because only secret
+// findings are kept.
+func TestToolStatePlannedPathsLeakNoScopeGap(t *testing.T) {
+	root := gitRepo(t)
+	writeFile(t, root, ".devmap/x.sqlite", "SQLite format 3\x00rows\n")
+	writeFile(t, root, ".devcouncil/notes.txt", "notes\n")
+	o := attackRun(t, root, "TASK-TS-SCOPE", benignChange(t, root))
+	for _, g := range o.gaps {
+		if g.GapType == "orphan_diff" || g.GapType == "planned_file_not_changed" || g.GapType == "task_not_implemented" {
+			t.Fatalf("a scope gap came from the tool-state pass: %s %s", g.GapType, g.Description)
+		}
+	}
+}
+
+// A secret staged and then reverted or deleted on disk is in the index, and so in
+// the next commit, and in no `git diff HEAD`. The index is read too.
+func TestToolStateStagedThenRevertedIsFound(t *testing.T) {
+	key := exampleAWSKey()
+	seed := func(t *testing.T) string {
+		root := gitRepo(t)
+		writeFile(t, root, ".devcouncil/a.txt", "a\n")
+		attackCommit(t, root, "track")
+		return root
+	}
+	t.Run("tracked, staged with the secret, worktree reverted", func(t *testing.T) {
+		root := seed(t)
+		writeFile(t, root, ".devcouncil/a.txt", "a\n"+toolStateKeyLine())
+		runGitIn(t, root, "add", ".devcouncil/a.txt")
+		writeFile(t, root, ".devcouncil/a.txt", "a\n")
+		requireLooked(t, key, attackRun(t, root, "TASK-TS-IDX-1", benignChange(t, root)))
+	})
+	t.Run("new file staged with the secret, overwritten clean", func(t *testing.T) {
+		root := seed(t)
+		writeFile(t, root, ".devcouncil/new.txt", toolStateKeyLine())
+		runGitIn(t, root, "add", ".devcouncil/new.txt")
+		writeFile(t, root, ".devcouncil/new.txt", "clean\n")
+		requireLooked(t, key, attackRun(t, root, "TASK-TS-IDX-2", benignChange(t, root)))
+	})
+	t.Run("new file staged with the secret, deleted from disk", func(t *testing.T) {
+		root := seed(t)
+		writeFile(t, root, ".devcouncil/gone.txt", toolStateKeyLine())
+		runGitIn(t, root, "add", ".devcouncil/gone.txt")
+		if err := os.Remove(filepath.Join(root, ".devcouncil/gone.txt")); err != nil {
+			t.Fatal(err)
+		}
+		requireLooked(t, key, attackRun(t, root, "TASK-TS-IDX-3", benignChange(t, root)))
+	})
+	t.Run("a binary blob staged, then deleted from disk", func(t *testing.T) {
+		root := seed(t)
+		writeFile(t, root, ".devmap/blob.bin", "\x00"+toolStateKeyLine())
+		runGitIn(t, root, "add", ".devmap/blob.bin")
+		if err := os.Remove(filepath.Join(root, ".devmap/blob.bin")); err != nil {
+			t.Fatal(err)
+		}
+		requireLooked(t, key, attackRun(t, root, "TASK-TS-IDX-4", benignChange(t, root)))
+	})
+	t.Run("a repository with no HEAD, staged then reverted", func(t *testing.T) {
+		root := t.TempDir()
+		runGitIn(t, root, "init", "-q")
+		writeFile(t, root, ".devcouncil/k.txt", toolStateKeyLine())
+		runGitIn(t, root, "add", ".devcouncil/k.txt")
+		writeFile(t, root, ".devcouncil/k.txt", "clean\n")
+		requireLooked(t, key, attackRun(t, root, "TASK-TS-IDX-5"))
+	})
+}
+
+// Where the index and the worktree differ both versions are scanned; where they
+// agree the path is read once.
+func TestToolStateIndexAndWorktreeVersionsAreBothScannedAndNotDoubled(t *testing.T) {
+	root := gitRepo(t)
+	writeFile(t, root, ".devcouncil/a.txt", "a\n")
+	writeFile(t, root, ".devcouncil/same.txt", "s\n")
+	attackCommit(t, root, "track")
+	writeFile(t, root, ".devcouncil/a.txt", "a\nindex version\n")
+	runGitIn(t, root, "add", ".devcouncil/a.txt")
+	writeFile(t, root, ".devcouncil/a.txt", "a\nworktree version\n")
+	writeFile(t, root, ".devcouncil/same.txt", "s\nstaged and identical\n")
+	runGitIn(t, root, "add", ".devcouncil/same.txt")
+	state, err := verify.CollectGitStateReport(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(state.ToolStateDiff, "+worktree version") || strings.Contains(state.ToolStateDiff, "+index version") {
+		t.Fatalf("the worktree view is wrong:\n%s", state.ToolStateDiff)
+	}
+	if !strings.Contains(state.ToolStateIndexDiff, "+index version") || strings.Contains(state.ToolStateIndexDiff, "worktree version") {
+		t.Fatalf("the index view is wrong:\n%s", state.ToolStateIndexDiff)
+	}
+	if strings.Contains(state.ToolStateIndexDiff, "same.txt") {
+		t.Fatalf("a path whose index and worktree agree was read twice:\n%s", state.ToolStateIndexDiff)
+	}
+	if strings.Count(state.ToolStateIndexDiff, "diff --git a/.devcouncil/a.txt") != 1 || strings.Count(state.ToolStateDiff, "diff --git a/.devcouncil/a.txt") != 1 {
+		t.Fatalf("a path is named twice in one diff")
+	}
 }
 
 // A tool-state symlink is not followed, and is named.

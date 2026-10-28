@@ -99,7 +99,25 @@ func toolStatePath(rel string) string {
 	return quoteDiffPath("", rel)
 }
 
-// collectToolState builds ToolStateDiff and the reasons it is incomplete.
+// toolStateScan is what collectToolState hands back.
+type toolStateScan struct {
+	// Diff is the worktree's view: `git diff HEAD` over the tracked files, and the
+	// untracked ones (and, in a repository with no HEAD, the staged ones) read
+	// from disk.
+	Diff string
+	// IndexDiff is the index's view of the paths where it is not what the
+	// worktree holds. The worktree's diff says nothing about a secret that was
+	// staged and then reverted or deleted on disk, but it is in the index, and the
+	// next commit.
+	IndexDiff string
+	// Paths are every tool-state path in either diff, as git wrote them.
+	Paths []string
+	// Unscanned are the degraded reasons.
+	Unscanned []string
+}
+
+// collectToolState builds the tool-state diffs and the reasons they are
+// incomplete.
 //
 // untracked is the superproject's untracked, non-ignored listing, already read
 // by the caller. A read of git that fails is an error, so a blocking
@@ -107,33 +125,38 @@ func toolStatePath(rel string) string {
 // read is a reason, because a symlink or a socket under a tool-state directory
 // is not a reason to refuse the whole change.
 //
-// The second diff has its own gitDiffLimit: tool state never takes room from the
-// diff the other gates judge.
-func collectToolState(ctx context.Context, git *proc.GitSession, rootFS *os.Root, untracked []string, headless bool) (diff string, unscanned []string, err error) {
+// The two diffs share one gitDiffLimit between them, so a path read in both
+// views is not twice the room: tool state never takes room from the diff the
+// other gates judge, and never takes more than one cap.
+func collectToolState(ctx context.Context, git *proc.GitSession, rootFS *os.Root, untracked []string, headless bool) (scan toolStateScan, err error) {
 	var b strings.Builder
 	var reasons toolStateReasons
 	spec := toolStatePathspecs()
 	names := map[string]struct{}{}
+	paths := map[string]struct{}{}
 	for _, name := range untracked {
 		if policy.IsToolState(name) {
 			names[name] = struct{}{}
+			paths[name] = struct{}{}
 		}
 	}
 	if headless {
 		// No HEAD to diff against: every tool-state file in the index is new,
-		// and is read from disk like an untracked one.
+		// and its worktree version is read from disk like an untracked one. Its
+		// index version is read below, if the two differ.
 		listing, err := runGit(ctx, git, gitListingLimit, append([]string{"ls-files", "-z", "--cached"}, spec...)...)
 		if err != nil {
-			return "", nil, err
+			return toolStateScan{}, err
 		}
 		for _, name := range strings.Split(string(listing), "\x00") {
 			if name != "" && policy.IsToolState(name) {
 				names[name] = struct{}{}
+				paths[name] = struct{}{}
 			}
 		}
 	} else {
-		if err := trackedToolState(ctx, git, spec, &b, &reasons); err != nil {
-			return "", nil, err
+		if err := trackedToolState(ctx, git, spec, &b, &reasons, paths); err != nil {
+			return toolStateScan{}, err
 		}
 	}
 	sorted := make([]string, 0, len(names))
@@ -141,32 +164,242 @@ func collectToolState(ctx context.Context, git *proc.GitSession, rootFS *os.Root
 		sorted = append(sorted, name)
 	}
 	sort.Strings(sorted)
+	capped := false
 	for _, name := range sorted {
 		if err := ctx.Err(); err != nil {
-			return "", nil, err
+			return toolStateScan{}, err
 		}
 		problem, binary, err := appendToolStateFile(ctx, rootFS, name, &b)
 		var tooLarge diffTooLargeError
 		if errors.As(err, &tooLarge) {
 			reasons.add(toolStateCapReason())
+			capped = true
 			break
 		}
 		switch {
 		case err != nil && ctx.Err() != nil:
-			return "", nil, ctx.Err()
+			return toolStateScan{}, ctx.Err()
 		case problem != "":
 			reasons.add("tool state not secret-scanned: " + toolStatePath(name) + " (" + problem + ")")
 		case binary:
 			reasons.add("tool state not text-scanned (binary): " + toolStatePath(name))
 		}
 	}
-	return b.String(), reasons.all(), nil
+	var index strings.Builder
+	if !capped {
+		if err := indexToolState(ctx, git, spec, gitDiffLimit-b.Len(), &index, &reasons, paths); err != nil {
+			return toolStateScan{}, err
+		}
+	}
+	scan = toolStateScan{Diff: b.String(), IndexDiff: index.String(), Unscanned: reasons.all()}
+	for path := range paths {
+		scan.Paths = append(scan.Paths, path)
+	}
+	sort.Strings(scan.Paths)
+	return scan, nil
+}
+
+// maxToolStateIndexPaths bounds how many index versions are read. The rest are
+// counted in a reason, not skipped quietly.
+const maxToolStateIndexPaths = 1000
+
+// nameSet runs a NUL-delimited name listing and returns its tool-state names.
+func nameSet(ctx context.Context, git *proc.GitSession, reasons *toolStateReasons, args ...string) (map[string]struct{}, bool, error) {
+	out, err := runGit(ctx, git, gitListingLimit, args...)
+	switch {
+	case errors.Is(err, ErrGitOutputTruncated):
+		reasons.add(toolStateCapReason())
+		return nil, false, nil
+	case err != nil:
+		return nil, false, err
+	}
+	set := map[string]struct{}{}
+	for _, name := range strings.Split(string(out), "\x00") {
+		if name != "" && policy.IsToolState(name) {
+			set[name] = struct{}{}
+		}
+	}
+	return set, true, nil
+}
+
+// literalSpec is a pathspec that names exactly the given paths, whatever the
+// environment says about globs.
+func literalSpec(names []string, exclude bool) []string {
+	prefix := ":(top,literal)"
+	if exclude {
+		prefix = ":(top,exclude,literal)"
+	}
+	spec := []string{"--"}
+	for _, name := range names {
+		spec = append(spec, prefix+name)
+	}
+	return spec
+}
+
+// indexToolState adds the index's version of each tool-state path that is staged
+// and that the worktree no longer holds.
+//
+// The worktree's diff is `git diff HEAD`, which compares the worktree to HEAD, so
+// a secret staged and then reverted or deleted on disk is in no diff although it
+// is in the index and goes in the next commit. A path is read here when the
+// index differs from HEAD (`diff --cached`) and from the worktree (`diff`): where
+// the index is HEAD there is nothing staged, and where it is the worktree the
+// path is already read once, in the worktree's view, and is not read twice.
+//
+// Text is read as `git diff --cached` writes it, hunks and all, so that only what
+// was staged is scanned. A binary path has no hunks to read, and no worktree file
+// for dcverify to read its bytes from, so its blob is read with `git cat-file`
+// and written as a section of added lines whatever it holds. Every read goes
+// through the guarded session.
+//
+// budget is what is left of the one cap the two diffs share.
+func indexToolState(ctx context.Context, git *proc.GitSession, spec []string, budget int, b *strings.Builder, reasons *toolStateReasons, paths map[string]struct{}) error {
+	staged, ok, err := nameSet(ctx, git, reasons, append([]string{"diff", "--cached", "--name-only", "-z", "--no-renames"}, spec...)...)
+	if err != nil || !ok || len(staged) == 0 {
+		return err
+	}
+	differ, ok, err := nameSet(ctx, git, reasons, append([]string{"diff", "--name-only", "-z", "--no-renames"}, spec...)...)
+	if err != nil || !ok {
+		return err
+	}
+	var want []string
+	for name := range staged {
+		if _, both := differ[name]; both {
+			want = append(want, name)
+		}
+	}
+	sort.Strings(want)
+	if len(want) > maxToolStateIndexPaths {
+		reasons.add("tool state not secret-scanned: " + fmt.Sprint(len(want)-maxToolStateIndexPaths) +
+			" staged path(s) past the first " + fmt.Sprint(maxToolStateIndexPaths) + " were not read")
+		want = want[:maxToolStateIndexPaths]
+	}
+	if len(want) == 0 {
+		return nil
+	}
+	numstat, err := runGit(ctx, git, gitListingLimit, append([]string{"diff", "--cached", "--numstat", "-z", "--no-renames"}, literalSpec(want, false)...)...)
+	switch {
+	case errors.Is(err, ErrGitOutputTruncated):
+		reasons.add(toolStateCapReason())
+		return nil
+	case err != nil:
+		return err
+	}
+	var text, binary []string
+	isBinary := map[string]bool{}
+	for _, record := range bytes.Split(numstat, []byte{0}) {
+		if len(record) == 0 {
+			continue
+		}
+		parts := strings.SplitN(string(record), "\t", 3)
+		if len(parts) != 3 || parts[2] == "" {
+			return fmt.Errorf("git diff --cached --numstat named a tool-state change it could not be read as: refusing to read it as a shorter list")
+		}
+		isBinary[parts[2]] = parts[0] == "-" && parts[1] == "-"
+	}
+	for _, name := range want {
+		paths[name] = struct{}{}
+		if isBinary[name] {
+			binary = append(binary, name)
+		} else {
+			text = append(text, name)
+		}
+	}
+	if len(text) > 0 {
+		remaining := budget - b.Len()
+		if remaining <= 0 {
+			reasons.add(toolStateCapReason())
+			return nil
+		}
+		diff, err := runGit(ctx, git, remaining, append([]string{"-c", "core.quotePath=false", "diff", "--cached"}, literalSpec(text, false)...)...)
+		switch {
+		case errors.Is(err, ErrGitOutputTruncated):
+			reasons.add(toolStateCapReason())
+			return nil
+		case err != nil:
+			return err
+		}
+		b.Write(diff)
+	}
+	return indexBinaryToolState(ctx, git, binary, budget, b, reasons)
+}
+
+// indexBinaryToolState writes the staged blob of each binary tool-state path as a
+// section of added lines.
+func indexBinaryToolState(ctx context.Context, git *proc.GitSession, names []string, budget int, b *strings.Builder, reasons *toolStateReasons) error {
+	if len(names) == 0 {
+		return nil
+	}
+	listing, err := runGit(ctx, git, gitListingLimit, append([]string{"ls-files", "-z", "--stage"}, literalSpec(names, false)...)...)
+	switch {
+	case errors.Is(err, ErrGitOutputTruncated):
+		reasons.add(toolStateCapReason())
+		return nil
+	case err != nil:
+		return err
+	}
+	type entry struct{ mode, id, stage string }
+	entries := map[string][]entry{}
+	for _, record := range strings.Split(string(listing), "\x00") {
+		if record == "" {
+			continue
+		}
+		meta, name, ok := strings.Cut(record, "\t")
+		fields := strings.Fields(meta)
+		if !ok || len(fields) != 3 {
+			return fmt.Errorf("git ls-files --stage named a tool-state entry it could not be read as: refusing to read it as a shorter list")
+		}
+		entries[name] = append(entries[name], entry{fields[0], fields[1], fields[2]})
+	}
+	for _, name := range names {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		have := entries[name]
+		switch {
+		case len(have) == 0:
+			// Staged for deletion: no bytes are introduced.
+			continue
+		case len(have) > 1 || have[0].stage != "0":
+			reasons.add("tool state not secret-scanned: " + toolStatePath(name) + " (unmerged)")
+			continue
+		case have[0].mode == "160000":
+			continue
+		}
+		reasons.add("tool state not text-scanned (binary): " + toolStatePath(name))
+		remaining := budget - b.Len()
+		if remaining <= 0 {
+			reasons.add(toolStateCapReason())
+			return nil
+		}
+		blob, err := runGit(ctx, git, remaining, "cat-file", "blob", have[0].id)
+		switch {
+		case errors.Is(err, ErrGitOutputTruncated):
+			reasons.add(toolStateCapReason())
+			return nil
+		case err != nil:
+			return err
+		}
+		fragment := syntheticDiff(name, blob, false)
+		if !strings.HasSuffix(fragment, "\n") {
+			fragment += "\n"
+		}
+		if b.Len() > 0 && b.String()[b.Len()-1] != '\n' {
+			b.WriteByte('\n')
+		}
+		if b.Len()+len(fragment) > budget {
+			reasons.add(toolStateCapReason())
+			return nil
+		}
+		b.WriteString(fragment)
+	}
+	return nil
 }
 
 // trackedToolState adds the diff of the tracked tool-state files, and names the binary
 // ones. A diff past the cap is not an error: what fits is not collected, and
 // the reason says the rest was not scanned.
-func trackedToolState(ctx context.Context, git *proc.GitSession, spec []string, b *strings.Builder, reasons *toolStateReasons) error {
+func trackedToolState(ctx context.Context, git *proc.GitSession, spec []string, b *strings.Builder, reasons *toolStateReasons, paths map[string]struct{}) error {
 	numstat, err := runGit(ctx, git, gitListingLimit, append([]string{"diff", "HEAD", "--numstat", "-z", "--no-renames"}, spec...)...)
 	switch {
 	case errors.Is(err, ErrGitOutputTruncated):
@@ -183,6 +416,7 @@ func trackedToolState(ctx context.Context, git *proc.GitSession, spec []string, 
 		if len(parts) != 3 || parts[2] == "" {
 			return fmt.Errorf("git diff --numstat named a tool-state change it could not be read as: refusing to read it as a shorter list")
 		}
+		paths[parts[2]] = struct{}{}
 		if parts[0] == "-" && parts[1] == "-" {
 			reasons.add("tool state not text-scanned (binary): " + toolStatePath(parts[2]))
 		}

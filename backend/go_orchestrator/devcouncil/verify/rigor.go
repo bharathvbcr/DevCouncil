@@ -245,8 +245,11 @@ func runDiffRigorGates(ctx context.Context, in Input, taskID string, planned []s
 	return out
 }
 
-// addToolStateSecretScan runs dcverify a second time, over the tool-owned state
-// the diff leaves out (Input.ToolStateDiff), and keeps its secret findings.
+// addToolStateSecretScan runs dcverify again, over the tool-owned state the diff
+// leaves out, and keeps its secret findings. It reads two views, each its own
+// diff because dcverify refuses a diff that names a path twice: the worktree's
+// (Input.ToolStateDiff) and the index's where the index is not what the worktree
+// holds (Input.ToolStateIndexDiff).
 //
 // Only GateSecretScan findings are kept. Tool state is a file the harness wrote,
 // not work the agent did, so a placeholder in it is not this task's stub, an
@@ -259,35 +262,50 @@ func runDiffRigorGates(ctx context.Context, in Input, taskID string, planned []s
 // second pass that cannot run is a blocking gap, like the first: a verifier that
 // is present and broken is not one that was never installed.
 func addToolStateSecretScan(ctx context.Context, in Input, taskID string, out rigorOutcome) rigorOutcome {
-	if in.Rigor == nil || strings.TrimSpace(in.ToolStateDiff) == "" {
+	if in.Rigor == nil {
 		return out
 	}
-	result, err := in.Rigor.Check(ctx, dcverify.Request{Diff: in.ToolStateDiff})
-	if err != nil {
-		out.gaps = append(out.gaps, Gap{
-			ID:       StableGapID(taskID, "RIGOR", "tool-state"),
-			Severity: "high",
-			GapType:  "rigor_check_unavailable",
-			TaskID:   taskID,
-			Description: "The secret scan of tool state (.devcouncil, .devmap) was configured but could not run: " +
-				err.Error(),
-			Evidence: []string{"dcverify: " + err.Error()},
-			RecommendedFix: "Repair or reinstall dcverify, then re-verify. Until it answers, " +
-				"files under the tool-state directories have not been scanned for credentials.",
-			Blocking: true,
-		})
-		return out
-	}
-	var secrets []dcverify.Finding
-	for _, f := range result.Findings {
-		if f.Gate == dcverify.GateSecretScan {
-			secrets = append(secrets, f)
+	ran := false
+	for _, view := range []struct{ name, diff string }{
+		{"worktree", in.ToolStateDiff},
+		{"index", in.ToolStateIndexDiff},
+	} {
+		if strings.TrimSpace(view.diff) == "" {
+			continue
 		}
+		// Planned names the tool-state paths. dcverify reads the bytes of a binary
+		// section from the working tree, and only for a path that is in scope: with
+		// none planned every binary section was skipped, silently, so a NUL in a
+		// tool-state file (or a `-diff` attribute the agent wrote) hid it. Scope
+		// classification is not read back: only secret findings are kept.
+		result, err := in.Rigor.Check(ctx, dcverify.Request{Diff: view.diff, Planned: in.ToolStatePaths})
+		if err != nil {
+			out.gaps = append(out.gaps, Gap{
+				ID:       StableGapID(taskID, "RIGOR", "tool-state-"+view.name),
+				Severity: "high",
+				GapType:  "rigor_check_unavailable",
+				TaskID:   taskID,
+				Description: "The secret scan of tool state (.devcouncil, .devmap), " + view.name +
+					" view, was configured but could not run: " + err.Error(),
+				Evidence: []string{"dcverify: " + err.Error()},
+				RecommendedFix: "Repair or reinstall dcverify, then re-verify. Until it answers, " +
+					"files under the tool-state directories have not been scanned for credentials.",
+				Blocking: true,
+			})
+			continue
+		}
+		ran = true
+		var secrets []dcverify.Finding
+		for _, f := range result.Findings {
+			if f.Gate == dcverify.GateSecretScan {
+				secrets = append(secrets, f)
+			}
+		}
+		out.gaps = append(out.gaps, gapsFromFindings(taskID, secrets)...)
 	}
-	out.gaps = append(out.gaps, gapsFromFindings(taskID, secrets)...)
 	// A main pass that had nothing to check ("no diff to check") reports the
 	// gate that did run on tool state, so the report does not claim none ran.
-	if len(out.applied) == 0 && out.skippedReason == "no diff to check" {
+	if ran && len(out.applied) == 0 && out.skippedReason == "no diff to check" {
 		out.applied, out.skippedReason = []string{dcverify.GateSecretScan}, ""
 	}
 	return out
