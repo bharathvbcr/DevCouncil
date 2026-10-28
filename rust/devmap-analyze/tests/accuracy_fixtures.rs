@@ -66,6 +66,10 @@ const OWNER_CARDS: &[(&str, &str)] = &[
         "ft-6976e8de",
         "Swift argument labels and leading-dot members emitted as references",
     ),
+    (
+        "ft-dc82251f",
+        "Swift bindings typed by initializer shape need extractor facts",
+    ),
 ];
 
 /// Edge confidence in thousandths at or above which a claim is "act on it".
