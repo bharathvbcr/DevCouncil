@@ -248,6 +248,11 @@ pub(super) fn take_nesting_cap_notes() -> Vec<String> {
 /// tree-sitter-swift recovers `x as? String ?? "d"` by inserting a hidden,
 /// zero-width `custom_operator` that is neither an error nor a missing node, so
 /// the file stays `Clean` and nothing else says a site was left out.
+///
+/// That is the common case, not the only one: the gate refuses any Swift call
+/// or constructor whose name has no spelling, so it can also fire on a call or
+/// constructor whose name is a `MISSING` token in a `Partial` file. The
+/// diagnostic's wording ("on an operator") is pinned by tests and stays.
 /// [`take_swift_unspelled_operator_notes`] turns the count into a diagnostic.
 pub(crate) fn note_swift_unspelled_operator() {
     SWIFT_UNSPELLED_OPERATORS.with(|count| count.set(count.get() + 1));

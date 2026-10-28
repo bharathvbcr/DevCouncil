@@ -339,7 +339,7 @@ fn try_nested_and_chained_spellings_equal_their_twins() {
 /// happens without any coalesce (`(b as? Foo.Bar)`), so it is not the lane's,
 /// and the file is Clean.
 #[test]
-#[ignore = "pre-existing on main: a cast to a qualified type can publish a Name reference whose receiver is the cast expression text"]
+#[ignore = "pre-existing on main: a cast to a qualified type can publish a Name reference whose receiver is the cast expression text; ft-bce92fa0"]
 fn a_qualified_type_cast_never_names_a_member_of_the_cast_expression() {
     let mut failures = Vec::new();
     for lhs in LHS_PLAIN {
@@ -464,7 +464,7 @@ fn a_bare_site_in_any_context_equals_its_twin() {
 /// edge of the SC9 class. The parenthesised twin, and the leading-dot rule in
 /// `swift_unwrap_prefix`, abstain. The file is Clean, so nothing says so.
 #[test]
-#[ignore = "pre-existing on main: an implicit member after `x as? T ??` publishes a call on the receiver text `x as? T ??`; the empty-name refusal does not cover it"]
+#[ignore = "pre-existing on main: an implicit member after `x as? T ??` publishes a call on the receiver text `x as? T ??`; the empty-name refusal does not cover it; ft-bce92fa0"]
 fn an_implicit_member_after_the_coalesce_is_not_given_the_cast_as_receiver() {
     let mut failures = Vec::new();
     for rhs in [
@@ -515,7 +515,7 @@ fn an_implicit_member_after_the_coalesce_is_not_given_the_cast_as_receiver() {
 /// spelling drops the call's `assigned_to`, the twin keeps it, and both files
 /// are Clean. The facts differ in one field of one reference.
 #[test]
-#[ignore = "pre-existing on main: `x as? T ?? (h())` drops the call reference's assigned_to that the twin carries"]
+#[ignore = "pre-existing on main: `x as? T ?? (h())` drops the call reference's assigned_to that the twin carries; ft-bce92fa0"]
 fn a_parenthesised_call_after_the_coalesce_equals_its_twin() {
     let mut tally = Tally::default();
     for cast in CASTS {
@@ -533,7 +533,7 @@ fn a_parenthesised_call_after_the_coalesce_equals_its_twin() {
 /// call's type in one spelling and not the other. Neither is right (`a` is a
 /// `String`), and the file is Clean in both.
 #[test]
-#[ignore = "pre-existing on main: assigned_to binds a cast-and-coalesced local to the call on its left in one spelling only"]
+#[ignore = "pre-existing on main: assigned_to binds a cast-and-coalesced local to the call on its left in one spelling only; ft-bce92fa0"]
 fn a_call_on_the_left_of_the_cast_binds_the_same_in_both_spellings() {
     let mut tally = Tally::default();
     for lhs in ["f()", "x.f()", "f(a)?.g()", "await g()", "Foo()"] {
@@ -767,7 +767,7 @@ fn the_refusal_count_is_per_file_under_rayon() {
 /// counts only the sites the walk reached (2 of 3), because the rest sit inside
 /// the error region. Lone and non-adjacent sites stay Clean (probed above).
 #[test]
-#[ignore = "pre-existing on main: three adjacent top-level bare statements turn the file Partial (grammar recovery)"]
+#[ignore = "pre-existing on main: three adjacent top-level bare statements turn the file Partial (grammar recovery); ft-bce92fa0"]
 fn adjacent_bare_statements_keep_the_file_clean() {
     let mut failures = Vec::new();
     for n in [2usize, 3, 4, 7] {
@@ -1256,7 +1256,7 @@ fn no_language_publishes_an_empty_name_on_a_damaged_fixture() {
 /// publishes a `Constructor` reference named `""` (span `a::b::`). The file is
 /// Partial. Not the lane's: it touched only the Swift gate.
 #[test]
-#[ignore = "pre-existing on main: Rust ` a::b::{c};` (a use path missing its keyword) publishes a Constructor reference named \"\""]
+#[ignore = "pre-existing on main: Rust ` a::b::{c};` (a use path missing its keyword) publishes a Constructor reference named \"\"; ft-bce92fa0"]
 fn a_rust_path_with_a_brace_list_publishes_no_empty_constructor_name() {
     let mut failures = Vec::new();
     for source in [
