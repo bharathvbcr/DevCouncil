@@ -52,6 +52,8 @@ mod glob_reexport_poison;
 #[cfg(feature = "parse")]
 mod global_rung_requires_no_other_evidence;
 #[cfg(feature = "parse")]
+mod go_build_variants_are_one_callee_set;
+#[cfg(feature = "parse")]
 mod go_own_package_receiver;
 #[cfg(feature = "parse")]
 mod go_package_scope;
