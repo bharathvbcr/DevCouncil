@@ -90,6 +90,8 @@ mod kotlin_written_types;
 #[cfg(feature = "parse")]
 mod language_server_edges;
 #[cfg(feature = "parse")]
+mod lane_orderings_ts_go_rust;
+#[cfg(feature = "parse")]
 mod markup_selectors_resolve;
 #[cfg(feature = "parse")]
 mod module_singleton_receivers;

@@ -1030,13 +1030,15 @@ impl Resolver {
                                         // re-export beside the enum happens to publish).
                                         // The import names the type, wherever the path
                                         // to it ran through.
-                                        // Go (the variant set above, then its own package
-                                        // siblings) and Rust (`rust_import_through_barrel`
-                                        // owns its re-exports) keep the declared-here
-                                        // lookup they had: the module/type split is
-                                        // JS/TS, Python and Java vocabulary.
+                                        // Go keeps the declared-here lookup it had (the
+                                        // variant set above, then its own package
+                                        // siblings): a Go package has no re-exports, so
+                                        // the chain fallback has nothing to add and a
+                                        // chain entry must never outrank a sibling file.
+                                        // Rust takes the split: `pub use` publishes module
+                                        // members as a JS barrel does.
                                         let member = resolution.is_none().then(|| {
-                                            if matches!(family, LangFamily::Go | LangFamily::Rust)
+                                            if family == LangFamily::Go
                                                 || self.imports_a_type(&ext.file_path, &recv)
                                                 || self.declares_type_at(None, imported)
                                             {
