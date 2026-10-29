@@ -190,6 +190,7 @@ fn an_exceeded_ambiguity_budget_degrades_the_list_and_records_a_gap() {
     let sentence = gap.describe();
     assert!(sentence.contains("32 candidate(s) dropped"), "{sentence}");
     assert!(sentence.contains("160 ledger row(s)"), "{sentence}");
+    assert!(!sentence.contains("  "), "no run of spaces: {sentence}");
 }
 
 #[test]

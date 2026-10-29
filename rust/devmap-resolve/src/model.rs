@@ -1053,7 +1053,8 @@ impl ResolutionBudgetGap {
             ));
         }
         format!(
-            "{} budget exceeded: {}; {} ledger row(s) affected, no edge asserted for any;              names (sample of {}): {}",
+            "{} budget exceeded: {}; {} ledger row(s) affected, no edge asserted for any; \
+             names (sample of {}): {}",
             self.limit,
             parts.join("; "),
             self.sites,

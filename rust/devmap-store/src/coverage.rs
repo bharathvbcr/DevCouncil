@@ -377,7 +377,7 @@ mod write_read_symmetry {
         let writable: Vec<&str> = ExtractionGap::ALL
             .iter()
             .map(|gap| gap.label())
-            .chain([GAP_DISCOVERY_REFUSED, GAP_OVER_LIMIT])
+            .chain([GAP_DISCOVERY_REFUSED, GAP_OVER_LIMIT, GAP_RESOLUTION_BUDGET])
             .collect();
         for label in CoverageGaps::labels() {
             assert!(
