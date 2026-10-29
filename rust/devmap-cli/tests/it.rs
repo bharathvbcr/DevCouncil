@@ -30,6 +30,7 @@ mod a_python_index_is_named_not_migrated;
 mod a_read_arm_does_not_run_git_log;
 mod a_refusal_is_printed_once;
 mod a_relative_root_is_resolved_once;
+mod a_resolution_budget_degrades_and_is_named;
 mod a_resolver_verdict_lands_on_an_unchanged_file_under_a_narrowed_write;
 mod a_root_anchor_replaces_a_baked_store_path;
 mod a_v94_python_extraction_is_not_served_after_the_bump;

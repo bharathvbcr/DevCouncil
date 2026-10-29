@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
@@ -94,10 +93,30 @@ fn escaped_evidence_bytes(value: &str) -> u64 {
     })
 }
 
+/// One shared answer to "which declarations does this bare name have, seen
+/// from here".
 struct GlobalCandidates {
+    /// The sorted, distinct targets — or, when a budget cut the set short, its
+    /// retained prefix (empty when the lookup was skipped).
     rows: CandidateSet,
+    /// How many *distinct targets* the name has. Two declarations that share a
+    /// file and a graph identity — `#ifdef` variants of one C function, the
+    /// overloads of one method — are one target: an edge names the identity, so
+    /// binding to it is true of every declaration at once. Meaningless when
+    /// [`Self::cap`] says the lookup was skipped.
     declarations: usize,
-    evidence_bytes: u64,
+    /// Set when a budget degraded this set; see [`CandidateCap`].
+    cap: Option<CandidateCap>,
+}
+
+/// How a resolution budget degraded one candidate set. Only ever built under
+/// [`LimitPolicy::Degrade`]; under `Refuse` the budget is an error instead.
+struct CandidateCap {
+    /// The budget that was exceeded, by [`ResolutionLimitError::resource`].
+    limit: Arc<str>,
+    /// `false` when the lookup was skipped outright, so `declarations` and
+    /// `rows` say nothing about the name.
+    looked_up: bool,
 }
 type CandidateKey = (LangFamily, String, String);
 
@@ -106,6 +125,12 @@ struct GlobalCandidateCache {
     sets: BTreeMap<CandidateKey, Arc<GlobalCandidates>>,
     visits: u64,
     retained_bytes: u64,
+    /// Escaped-JSON upper bound of every distinct ambiguous list held, charged
+    /// once per list however many sites share it.
+    evidence_bytes: u64,
+    /// `true` on the deterministic degrade pass: a budget that would have
+    /// refused the resolution degrades the set instead.
+    degrade: bool,
 }
 
 fn charge(
@@ -126,30 +151,11 @@ fn charge(
     Ok(())
 }
 
-fn charge_ambiguity(
-    counter: &AtomicU64,
-    candidates: &GlobalCandidates,
-    limit: u64,
-) -> Result<(), ResolutionLimitError> {
-    // One ledger row per ambiguous site, however many candidates it names.
-    let additional = candidates.evidence_bytes;
-    // An explicit compare-exchange loop rather than `fetch_update`, which Rust
-    // 1.99 deprecates in favour of `try_update` — a name older toolchains this
-    // workspace still builds on do not have.
-    let mut used = counter.load(Ordering::Relaxed);
-    loop {
-        let Some(next) = used.checked_add(additional).filter(|next| *next <= limit) else {
-            return Err(ResolutionLimitError {
-                resource: "ambiguity evidence bytes",
-                limit,
-                attempted: used.saturating_add(additional),
-            });
-        };
-        match counter.compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return Ok(()),
-            Err(current) => used = current,
-        }
-    }
+/// The conservative JSON/Debug upper bound of one candidate list.
+fn evidence_bytes_of(candidates: &[(String, String)]) -> u64 {
+    candidates.iter().fold(64u64, |total, (file, symbol)| {
+        total.saturating_add(16 + escaped_evidence_bytes(file) + escaped_evidence_bytes(symbol))
+    })
 }
 
 /// Where the name a resolution rung failed on was written.

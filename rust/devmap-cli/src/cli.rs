@@ -317,6 +317,59 @@ impl From<InventoryFlags> for InventoryLimits {
     }
 }
 
+/// The resolution budgets `devmap build` runs under.
+///
+/// The defaults are `devmap_resolve::ResolutionLimits::default()`; naming one
+/// here is how a tree that legitimately needs more room asks for it. Exceeding
+/// a budget degrades the affected candidate lists and records a
+/// `coverage_gaps.resolution_budget` row saying what was capped, unless
+/// `--refuse-on-resolve-limit` asks for the old refusal.
+#[derive(Debug, Clone, Copy, clap::Args)]
+pub(crate) struct ResolveLimitFlags {
+    /// Most candidate-table entries resolution may visit looking up bare names.
+    #[arg(long, value_name = "N")]
+    resolve_candidate_visits: Option<u64>,
+    /// Most bytes of candidate lists resolution may retain.
+    #[arg(long, value_name = "BYTES")]
+    resolve_retained_candidate_bytes: Option<u64>,
+    /// Most bytes of ambiguity evidence, charged once per distinct candidate
+    /// list however many call sites share it.
+    #[arg(long, value_name = "BYTES")]
+    resolve_ambiguity_evidence_bytes: Option<u64>,
+    /// Candidates a capped ambiguous list keeps when a budget cuts it short.
+    #[arg(long, value_name = "N")]
+    resolve_degraded_candidates: Option<usize>,
+    /// Refuse the whole build when a resolution budget is exceeded, instead of
+    /// degrading the affected lists and recording a coverage gap.
+    #[arg(long)]
+    refuse_on_resolve_limit: bool,
+}
+
+impl From<ResolveLimitFlags> for devmap_resolve::ResolutionLimits {
+    fn from(flags: ResolveLimitFlags) -> Self {
+        let default = Self::default();
+        Self {
+            candidate_visits: flags
+                .resolve_candidate_visits
+                .unwrap_or(default.candidate_visits),
+            retained_candidate_bytes: flags
+                .resolve_retained_candidate_bytes
+                .unwrap_or(default.retained_candidate_bytes),
+            ambiguity_evidence_bytes: flags
+                .resolve_ambiguity_evidence_bytes
+                .unwrap_or(default.ambiguity_evidence_bytes),
+            degraded_candidates: flags
+                .resolve_degraded_candidates
+                .unwrap_or(default.degraded_candidates),
+            on_exceed: if flags.refuse_on_resolve_limit {
+                devmap_resolve::LimitPolicy::Refuse
+            } else {
+                devmap_resolve::LimitPolicy::Degrade
+            },
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub(crate) enum Commands {
     /// Cold or incremental build of the code-intelligence graph

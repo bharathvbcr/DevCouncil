@@ -1664,13 +1664,15 @@ impl Store {
             if !full_rewrite {
                 let mut stmt = tx.prepare(
                     "SELECT gap, path, reason FROM generation_coverage_gaps
-                     WHERE generation_id = ?1 AND gap NOT IN (?2, ?3)",
+                     WHERE generation_id = ?1 AND gap NOT IN (?2, ?3, ?4)",
                 )?;
                 let rows = stmt.query_map(
                     params![
                         prev,
                         crate::coverage::GAP_DISCOVERY_REFUSED,
-                        crate::coverage::GAP_OVER_LIMIT
+                        crate::coverage::GAP_OVER_LIMIT,
+                        // Re-derived from this write's own resolution below.
+                        crate::coverage::GAP_RESOLUTION_BUDGET
                     ],
                     |row| {
                         Ok((
@@ -1694,6 +1696,16 @@ impl Store {
                 continue;
             }
             gap_rows.push((entry.gap.label().to_string(), entry.path, entry.reason));
+        }
+        // A resolution budget that degraded candidate lists. Read off the
+        // ledger rows this write is about to store, so the gap and the rows it
+        // describes are one fact.
+        for budget in resolution.budget_gaps() {
+            gap_rows.push((
+                crate::coverage::GAP_RESOLUTION_BUDGET.to_string(),
+                format!("resolve:{}", budget.limit),
+                budget.describe(),
+            ));
         }
         // The refusal half is never carried forward here. It cannot be: a
         // refused path has no `Extraction`, so this function has no way to tell

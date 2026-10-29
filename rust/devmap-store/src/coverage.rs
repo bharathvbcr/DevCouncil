@@ -47,6 +47,16 @@ pub const GAP_DISCOVERY_REFUSED: &str = "discovery_refused";
 /// a tree whose 1.7 MB caller was never read fresh.
 pub const GAP_OVER_LIMIT: &str = "over_limit";
 
+/// The stored `gap` value for a resolution budget that was exceeded and
+/// degraded some candidate lists instead of refusing the build.
+///
+/// Unlike every other kind, the `path` is not a file: it is `resolve:<budget>`,
+/// one row per exceeded budget, and the reason says what was capped and by how
+/// much (`ResolutionBudgetGap::describe`). Rewritten from the resolution on every
+/// write — never carried forward, because resolution covers the whole tree each
+/// time and a stale row would claim a cap the current graph does not have.
+pub const GAP_RESOLUTION_BUDGET: &str = "resolution_budget";
+
 /// Most paths of one kind that a status answer carries.
 ///
 /// A sample, and every surface that renders it carries the true total beside
@@ -124,6 +134,9 @@ pub struct CoverageGaps {
     /// A grammar read the file and its tree holds `ERROR`/`MISSING` nodes;
     /// each row names the byte ranges lost.
     pub partial_parse: CoverageGapSample,
+    /// A resolution budget was exceeded and degraded candidate lists; each row
+    /// names the budget and what was capped.
+    pub resolution_budget: CoverageGapSample,
 }
 
 impl CoverageGaps {
@@ -149,6 +162,8 @@ impl CoverageGaps {
             Some(&mut self.over_limit)
         } else if gap == ExtractionGap::PartialParse.label() {
             Some(&mut self.partial_parse)
+        } else if gap == GAP_RESOLUTION_BUDGET {
+            Some(&mut self.resolution_budget)
         } else {
             None
         }
@@ -161,7 +176,7 @@ impl CoverageGaps {
     /// other is a row written to the database on every build and never read
     /// back — which is what happened to `call_blind` and `import_blind` between
     /// their introduction and this line.
-    pub(crate) fn labels() -> [&'static str; 8] {
+    pub(crate) fn labels() -> [&'static str; 9] {
         [
             GAP_DISCOVERY_REFUSED,
             ExtractionGap::ParseFailed.label(),
@@ -171,6 +186,7 @@ impl CoverageGaps {
             ExtractionGap::NotParsed.label(),
             GAP_OVER_LIMIT,
             ExtractionGap::PartialParse.label(),
+            GAP_RESOLUTION_BUDGET,
         ]
     }
 }

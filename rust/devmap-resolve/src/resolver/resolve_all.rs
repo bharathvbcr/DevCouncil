@@ -8,13 +8,46 @@ impl Resolver {
         self.resolve_all_with_limits(extractions, ResolutionLimits::default())
     }
 
+    /// Resolve every file under `limits`.
+    ///
+    /// A budget that is exceeded does not abort the build under
+    /// [`LimitPolicy::Degrade`] (the default). The first pass runs in parallel
+    /// and treats a budget as an error, which costs nothing on every tree that
+    /// stays inside its budgets; if one trips, the whole resolution runs again
+    /// on a single thread, with the budgets degrading the offending candidate
+    /// sets instead — one thread because *which* sets a shared budget cuts is
+    /// decided by the order they are charged in, and a degraded graph must be
+    /// the same graph on every run. Under [`LimitPolicy::Refuse`] the first
+    /// pass's error is returned as it always was.
     pub fn resolve_all_with_limits(
         &self,
         extractions: &[Extraction],
         limits: ResolutionLimits,
     ) -> Result<ResolutionResult, ResolutionLimitError> {
-        let global_candidates = Mutex::new(GlobalCandidateCache::default());
-        let ambiguity_bytes = AtomicU64::new(0);
+        match self.resolve_pass(extractions, limits, false) {
+            Err(refusal) if limits.on_exceed == LimitPolicy::Degrade => {
+                // A pool that cannot be built cannot give the deterministic
+                // order, so the budget's own refusal stands rather than a
+                // degraded graph that depends on scheduling.
+                let Ok(serial) = rayon::ThreadPoolBuilder::new().num_threads(1).build() else {
+                    return Err(refusal);
+                };
+                serial.install(|| self.resolve_pass(extractions, limits, true))
+            }
+            outcome => outcome,
+        }
+    }
+
+    fn resolve_pass(
+        &self,
+        extractions: &[Extraction],
+        limits: ResolutionLimits,
+        degrade: bool,
+    ) -> Result<ResolutionResult, ResolutionLimitError> {
+        let global_candidates = Mutex::new(GlobalCandidateCache {
+            degrade,
+            ..Default::default()
+        });
         // Per-file resolution runs in parallel.
         //
         // Sound because the loop body below reads only `self` — the symbol and
@@ -1582,7 +1615,16 @@ impl Resolver {
                                 candidates
                             }
                         };
-                        if candidates.declarations == 1 {
+                        if let Some(cap) = candidates.cap.as_ref().filter(|cap| !cap.looked_up) {
+                            // The lookup itself was skipped: no claim either
+                            // way, and the row says why.
+                            resolution = Some(Arc::new(Resolution::CappedGlobal {
+                                candidates: Arc::clone(&candidates.rows),
+                                total: None,
+                                limit: Arc::clone(&cap.limit),
+                                family,
+                            }));
+                        } else if candidates.declarations == 1 {
                             let (target_f, target_identity) = &candidates.rows[0];
                             // A Swift type nested in another type is named
                             // bare only from inside that type; from anywhere
@@ -1600,8 +1642,17 @@ impl Resolver {
                                 }));
                             }
                         } else if candidates.declarations > 1 {
-                            charge_ambiguity(&ambiguity_bytes, &candidates, limits.ambiguity_evidence_bytes)?;
-                            resolution = Some(Arc::new(Resolution::AmbiguousGlobal { candidates: Arc::clone(&candidates.rows), family }));
+                            resolution = Some(Arc::new(match &candidates.cap {
+                                None => Resolution::AmbiguousGlobal { candidates: Arc::clone(&candidates.rows), family },
+                                // The list was cut by a budget: say so on the
+                                // row, with the true count.
+                                Some(cap) => Resolution::CappedGlobal {
+                                    candidates: Arc::clone(&candidates.rows),
+                                    total: Some(candidates.declarations),
+                                    limit: Arc::clone(&cap.limit),
+                                    family,
+                                },
+                            }));
                         }
                     }
 
@@ -1630,7 +1681,7 @@ impl Resolver {
                     let mut emitted = false;
                     if let Some(resolution) = &resolution {
                         match resolution.as_ref() {
-                            Resolution::AmbiguousGlobal { .. } => {
+                            Resolution::AmbiguousGlobal { .. } | Resolution::CappedGlobal { .. } => {
                                 // S2. A bare name with several in-repo namesakes
                                 // and no other evidence is **not** a call to any
                                 // of them: measured 0/8 (TS), 1/26 (Swift), 4/12

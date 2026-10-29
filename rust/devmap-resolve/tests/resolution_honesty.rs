@@ -61,6 +61,7 @@ fn entitled(resolution: &Resolution) -> Confidence {
         // Interface dispatch: each candidate is a possible runtime target.
         Resolution::Dispatch { .. } => Confidence::LOW,
         Resolution::AmbiguousGlobal { .. }
+        | Resolution::CappedGlobal { .. }
         | Resolution::LanguageServerDispatch { .. }
         | Resolution::Unresolved { .. } => Confidence::SPECULATIVE,
     }

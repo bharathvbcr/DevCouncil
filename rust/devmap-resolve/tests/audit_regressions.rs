@@ -63,6 +63,8 @@ fn entitled_confidence(resolution: &Resolution) -> Confidence {
         Resolution::UniqueNamespaced { .. } => Confidence::HIGH,
         Resolution::LanguageServer { .. } => Confidence::HIGH,
         Resolution::AmbiguousGlobal { .. } => Confidence::SPECULATIVE,
+        // The same rung with less evidence kept: a budget cut its list short.
+        Resolution::CappedGlobal { .. } => Confidence::SPECULATIVE,
         Resolution::LanguageServerDispatch { .. } => Confidence::SPECULATIVE,
         // Interface dispatch: a type-system candidate, below every binding.
         Resolution::Dispatch { .. } => Confidence::LOW,
@@ -188,6 +190,7 @@ fn every_edge_confidence_matches_the_evidence_it_names() {
             Resolution::UniqueGlobal { .. } => "UniqueGlobal",
             Resolution::UniqueNamespaced { .. } => "UniqueNamespaced",
             Resolution::AmbiguousGlobal { .. } => "AmbiguousGlobal",
+            Resolution::CappedGlobal { .. } => "CappedGlobal",
             Resolution::LanguageServerDispatch { .. } => "LanguageServerDispatch",
             Resolution::Dispatch { .. } => "Dispatch",
             Resolution::Unresolved { .. } => "Unresolved",

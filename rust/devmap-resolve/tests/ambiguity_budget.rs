@@ -2,7 +2,7 @@
 
 use devmap_extract::extract_file;
 use devmap_extract::model::{ExtractedCall, Extraction, Span};
-use devmap_resolve::model::Resolution;
+use devmap_resolve::model::{LimitPolicy, Resolution};
 use devmap_resolve::Resolver;
 
 fn fixture(declarations: usize, calls: usize) -> Vec<Extraction> {
@@ -52,7 +52,7 @@ fn repeated_ambiguity_shares_one_candidate_allocation() {
 }
 
 #[test]
-fn aggregate_limits_refuse_the_whole_result_without_sampling_candidates() {
+fn under_the_refuse_policy_aggregate_limits_refuse_the_whole_result() {
     let inputs = fixture(40, 80);
     let mut resolver = Resolver::new();
     resolver.index_extractions(&inputs);
@@ -61,6 +61,7 @@ fn aggregate_limits_refuse_the_whole_result_without_sampling_candidates() {
             "candidate visits",
             devmap_resolve::ResolutionLimits {
                 candidate_visits: 39,
+                on_exceed: LimitPolicy::Refuse,
                 ..Default::default()
             },
         ),
@@ -68,6 +69,7 @@ fn aggregate_limits_refuse_the_whole_result_without_sampling_candidates() {
             "retained candidate bytes",
             devmap_resolve::ResolutionLimits {
                 retained_candidate_bytes: 128,
+                on_exceed: LimitPolicy::Refuse,
                 ..Default::default()
             },
         ),
@@ -75,6 +77,7 @@ fn aggregate_limits_refuse_the_whole_result_without_sampling_candidates() {
             "ambiguity evidence bytes",
             devmap_resolve::ResolutionLimits {
                 ambiguity_evidence_bytes: 1024,
+                on_exceed: LimitPolicy::Refuse,
                 ..Default::default()
             },
         ),
@@ -92,17 +95,210 @@ fn aggregate_limits_refuse_the_whole_result_without_sampling_candidates() {
     );
 }
 
+/// The kernel-scale shape: 20,000 ambiguous sites naming one 500-candidate
+/// list. Charged per site that is ten million candidate tuples and refused the
+/// whole build (`ambiguity evidence bytes requires 134218520 units`); charged
+/// per distinct list it is one list, which is what memory and the store hold.
 #[test]
-fn repeated_evidence_is_bounded_by_default() {
-    // Ten million repeated candidate tuples exceed the default evidence cap
-    // even when ordinary ASCII is charged at its actual one-byte width.
+fn many_sites_naming_one_list_are_charged_for_one_list() {
     let inputs = fixture(500, 10_000);
     let mut resolver = Resolver::new();
     resolver.index_extractions(&inputs);
-    assert_eq!(
-        resolver.resolve_all(&inputs).unwrap_err().resource,
-        "ambiguity evidence bytes"
+    let result = resolver
+        .resolve_all(&inputs)
+        .expect("the default budget holds one 500-candidate list however many sites name it");
+    let rows: Vec<_> = result
+        .unresolved
+        .iter()
+        .filter_map(|row| match &row.resolution {
+            Resolution::AmbiguousGlobal { candidates, .. } => Some(candidates),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows.len(), 20_000);
+    assert!(rows.iter().all(|list| list.len() == 500));
+    assert!(
+        result.budget_gaps().is_empty(),
+        "nothing was capped, so no gap is claimed"
     );
+}
+
+fn capped_rows(result: &devmap_resolve::model::ResolutionResult) -> Vec<&Resolution> {
+    result
+        .unresolved
+        .iter()
+        .map(|row| &row.resolution)
+        .filter(|resolution| matches!(resolution, Resolution::CappedGlobal { .. }))
+        .collect()
+}
+
+#[test]
+fn an_exceeded_ambiguity_budget_degrades_the_list_and_records_a_gap() {
+    let inputs = fixture(40, 80);
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&inputs);
+    let result = resolver
+        .resolve_all_with_limits(
+            &inputs,
+            devmap_resolve::ResolutionLimits {
+                ambiguity_evidence_bytes: 1024,
+                ..Default::default()
+            },
+        )
+        .expect("a budget degrades; it does not abort the build");
+
+    // Every one of the 160 sites keeps its ledger row, with the sorted prefix
+    // and the true count.
+    let capped = capped_rows(&result);
+    assert_eq!(capped.len(), 160);
+    for resolution in &capped {
+        let Resolution::CappedGlobal {
+            candidates,
+            total,
+            limit,
+            ..
+        } = resolution
+        else {
+            unreachable!()
+        };
+        assert_eq!(candidates.len(), 8, "the retained prefix");
+        assert_eq!(*total, Some(40), "the count the name really has");
+        assert_eq!(&**limit, "ambiguity evidence bytes");
+        assert!(
+            candidates.windows(2).all(|pair| pair[0] <= pair[1]),
+            "a sorted prefix"
+        );
+    }
+    assert!(
+        result.edges.iter().all(|edge| !matches!(
+            edge.resolution.as_deref(),
+            Some(Resolution::CappedGlobal { .. })
+        )),
+        "a capped list asserts no edge"
+    );
+
+    // The gap says what was cut and by how much, with totals not a sample.
+    let gaps = result.budget_gaps();
+    assert_eq!(gaps.len(), 1);
+    let gap = &gaps[0];
+    assert_eq!(gap.limit, "ambiguity evidence bytes");
+    assert_eq!(gap.names_truncated, 1);
+    assert_eq!(gap.candidates_dropped, 32);
+    assert_eq!(gap.names_skipped, 0);
+    assert_eq!(gap.sites, 160);
+    assert_eq!(gap.sample_names, vec!["leaf".to_string()]);
+    let sentence = gap.describe();
+    assert!(sentence.contains("32 candidate(s) dropped"), "{sentence}");
+    assert!(sentence.contains("160 ledger row(s)"), "{sentence}");
+}
+
+#[test]
+fn a_skipped_lookup_is_a_ledger_row_that_claims_nothing() {
+    let inputs = fixture(40, 80);
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&inputs);
+    for (limit_name, limits) in [
+        (
+            "candidate visits",
+            devmap_resolve::ResolutionLimits {
+                candidate_visits: 39,
+                ..Default::default()
+            },
+        ),
+        (
+            "retained candidate bytes",
+            devmap_resolve::ResolutionLimits {
+                retained_candidate_bytes: 128,
+                ..Default::default()
+            },
+        ),
+    ] {
+        let result = resolver.resolve_all_with_limits(&inputs, limits).unwrap();
+        let capped = capped_rows(&result);
+        assert_eq!(capped.len(), 160, "{limit_name}: every site keeps its row");
+        for resolution in capped {
+            let Resolution::CappedGlobal {
+                candidates,
+                total,
+                limit,
+                ..
+            } = resolution
+            else {
+                unreachable!()
+            };
+            assert!(candidates.is_empty(), "{limit_name}");
+            assert_eq!(*total, None, "{limit_name}: the count is unknown, not zero");
+            assert_eq!(&**limit, limit_name);
+        }
+        let gap = &result.budget_gaps()[0];
+        assert_eq!(
+            (gap.names_skipped, gap.names_truncated),
+            (1, 0),
+            "{limit_name}"
+        );
+        assert!(
+            result
+                .edges
+                .iter()
+                .all(|edge| edge.edge_kind != devmap_extract::model::EdgeKind::Calls),
+            "{limit_name}: a skipped lookup binds nothing"
+        );
+    }
+}
+
+/// Which lists a shared budget degrades is decided by the order they are
+/// charged in, so the degrade pass must not depend on thread scheduling.
+#[test]
+fn a_degraded_resolution_is_identical_on_every_run_and_thread_count() {
+    // Twelve names with 30 declarations each: the budget holds a few lists whole
+    // and cuts the rest.
+    let mut inputs = Vec::new();
+    for name in 0..12 {
+        for file in 0..30 {
+            inputs.push(extract_file(
+                &format!("d{file}/n{name}.py"),
+                &format!("def leaf{name}(): pass\n"),
+            ));
+        }
+    }
+    let mut caller = extract_file("zz/caller.py", "def run(): pass\n");
+    caller.calls = (0..12)
+        .map(|name| ExtractedCall {
+            caller_symbol: Some("zz/caller.py::run".into()),
+            callee_name: format!("leaf{name}"),
+            receiver_expr: None,
+            span: Span {
+                start_byte: name,
+                end_byte: name + 1,
+            },
+        })
+        .collect();
+    inputs.push(caller);
+    let limits = devmap_resolve::ResolutionLimits {
+        ambiguity_evidence_bytes: 8 * 1024,
+        ..Default::default()
+    };
+    let render = |threads: usize| {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let mut resolver = Resolver::new();
+            resolver.index_extractions(&inputs);
+            let result = resolver.resolve_all_with_limits(&inputs, limits).unwrap();
+            format!("{:?}", result.unresolved)
+        })
+    };
+    let reference = render(1);
+    assert!(reference.contains("CappedGlobal"), "the budget must trip");
+    assert!(
+        reference.contains("AmbiguousGlobal"),
+        "and spare some lists"
+    );
+    for threads in [2, 8, 8] {
+        assert_eq!(reference, render(threads), "{threads} threads");
+    }
 }
 
 #[test]
