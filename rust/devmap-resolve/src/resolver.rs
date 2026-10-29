@@ -636,6 +636,10 @@ pub struct Resolver {
     /// package here gets no unexported-selector answers at all: one unseen file
     /// could declare the second method or the vetoing field.
     go_package_dirs_unvouched: BTreeSet<String>,
+    /// Go files carrying a build constraint (`//go:build`, `// +build` or a
+    /// `_GOOS`/`_GOARCH` suffix), from [`Extraction::go_build_constrained`].
+    /// Read by [`Resolver::go_build_variants`].
+    go_constrained_files: BTreeSet<String>,
     /// The Go type model: declarations, signatures and imports by package.
     go_model: GoModel,
     /// file_path → Swift module name derived from the path.
@@ -801,6 +805,7 @@ impl Resolver {
             go_package_methods: BTreeMap::new(),
             go_package_member_vetoes: BTreeSet::new(),
             go_package_dirs_unvouched: BTreeSet::new(),
+            go_constrained_files: BTreeSet::new(),
             go_model: GoModel::default(),
             swift_module_by_file: BTreeMap::new(),
             jvm_package_by_file: BTreeMap::new(),
@@ -870,6 +875,7 @@ mod scope;
 mod implicit_receiver;
 
 mod dispatch;
+mod go_variants;
 
 mod imports;
 
