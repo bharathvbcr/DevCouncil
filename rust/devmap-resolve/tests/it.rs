@@ -30,6 +30,8 @@ mod ambiguity_budget;
 #[cfg(feature = "parse")]
 mod audit_regressions;
 #[cfg(feature = "parse")]
+mod calls_target_callables_only;
+#[cfg(feature = "parse")]
 mod captured_receiver_attribution;
 #[cfg(feature = "parse")]
 mod commonjs_require_bindings;

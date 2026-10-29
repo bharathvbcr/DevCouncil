@@ -80,6 +80,26 @@ fn an_unmentioned_go_type_stays_confident() {
     );
 }
 
+/// A type constructed only by a composite literal or a tuple-struct call has
+/// no `Calls` edge any more (the resolver files it as a `References` edge, a
+/// use and not a call), and it must not turn into a dead-code finding.
+#[test]
+fn a_struct_constructed_only_by_a_literal_is_still_live() {
+    let go = "package p\ntype opts struct{ n int }\ntype lonely struct{}\n\
+              func Run() int { o := opts{n: 1}; return o.n }\n";
+    let rows = reports(&[("p/a.go", go)]);
+    assert!(row(&rows, "opts").is_none_or(|r| !confident_and_unexempt(r)));
+    assert!(
+        row(&rows, "lonely").is_some_and(confident_and_unexempt),
+        "control: a type nothing writes is still a confident finding"
+    );
+
+    let rust = "struct Wrap(i32);\nstruct Orphan(i32);\npub fn make() -> i32 { Wrap(1).0 }\n";
+    let rows = reports(&[("src/lib.rs", rust)]);
+    assert!(row(&rows, "Wrap").is_none_or(|r| !confident_and_unexempt(r)));
+    assert!(row(&rows, "Orphan").is_some_and(confident_and_unexempt));
+}
+
 #[test]
 fn a_truly_unreferenced_go_function_stays_confident() {
     let source = "package mcp\nfunc orphan() {}\nfunc main() {}\n";

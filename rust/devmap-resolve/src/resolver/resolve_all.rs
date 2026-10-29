@@ -1692,14 +1692,18 @@ impl Resolver {
                             }
                             named => {
                                 if let Some((target_file, target_symbol)) = named.target() {
+                                    // A composite literal or conversion names a
+                                    // type, which nothing runs: a use, not a call.
+                                    let (edge_kind, details) =
+                                        self.call_site_edge_kind(family, target_file, target_symbol);
                                     edges.push(ResolvedEdge::resolved(
                                         ext.file_path.clone(),
                                         target_file.to_string(),
                                         caller_sym.clone(),
                                         self.qualified_for(target_file, target_symbol),
-                                        EdgeKind::Calls,
+                                        edge_kind,
                                         Arc::clone(resolution),
-                                        None,
+                                        details,
                                     ));
                                     emitted = true;
                                 }
