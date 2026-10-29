@@ -97,6 +97,40 @@ fn a_renamed_destructure_binds_the_exported_function() {
     );
 }
 
+/// `exports.callee = function () {}`: an anonymous function published as a
+/// *member*. The name the export gives is the symbol; both a plain
+/// destructure and a renamed one (`{ callee: c }`) call it. (This is the shape
+/// a query-crate fixture once relied on staying unbound.)
+#[test]
+fn an_anonymous_member_export_is_bound_by_a_plain_and_an_aliased_destructure() {
+    let result = resolve(&[
+        (
+            "anon/cjs.js",
+            "exports.callee = function () { return 1; };\n",
+        ),
+        (
+            "anon/plain.js",
+            "const { callee } = require('./cjs.js');\nfunction caller_plain() { return callee(); }\n",
+        ),
+        (
+            "anon/aliased.js",
+            "const { callee: c } = require('./cjs.js');\nfunction caller_aliased() { return c(); }\n",
+        ),
+    ]);
+    assert_eq!(
+        calls(&result, "anon/plain.js::caller_plain"),
+        ["anon/cjs.js::callee"],
+        "{:?}",
+        result.unresolved
+    );
+    assert_eq!(
+        calls(&result, "anon/aliased.js::caller_aliased"),
+        ["anon/cjs.js::callee"],
+        "{:?}",
+        result.unresolved
+    );
+}
+
 #[test]
 fn module_exports_a_function_is_the_default_a_bare_require_binds() {
     let result = resolve(&[
