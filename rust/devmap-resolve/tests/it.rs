@@ -88,9 +88,9 @@ mod kotlin_receivers_and_packages;
 #[cfg(feature = "parse")]
 mod kotlin_written_types;
 #[cfg(feature = "parse")]
-mod language_server_edges;
-#[cfg(feature = "parse")]
 mod lane_orderings_ts_go_rust;
+#[cfg(feature = "parse")]
+mod language_server_edges;
 #[cfg(feature = "parse")]
 mod markup_selectors_resolve;
 #[cfg(feature = "parse")]
@@ -205,6 +205,8 @@ mod swift_resolver_residue_attack2;
 #[cfg(feature = "parse")]
 mod test_phase3_hardening;
 #[cfg(feature = "parse")]
+mod ts_module_scoped_types;
+#[cfg(feature = "parse")]
 mod type_aliases_are_not_call_targets;
 #[cfg(feature = "parse")]
 mod type_position_classification;
@@ -218,8 +220,6 @@ mod typescript_interface_dispatch;
 mod typescript_object_spread;
 #[cfg(feature = "parse")]
 mod typescript_object_spread_attack;
-#[cfg(feature = "parse")]
-mod ts_module_scoped_types;
 #[cfg(feature = "parse")]
 mod unresolved_member;
 
