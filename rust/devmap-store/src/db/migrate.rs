@@ -239,24 +239,31 @@ impl Store {
         Ok(())
     }
 
-    /// Add `payload_digest` to a store stamped 28 by the first v28 prototype,
-    /// which had no such column.
+    /// Give a store stamped 28 by the first v28 prototype the `payload_digest`
+    /// column it lacks, and stamp every row that still reads the empty digest.
     ///
-    /// The same case as an index added to the fresh schema within a version
-    /// number ([`Self::heal_declared_indexes`]): the ladder runs no rung for a
-    /// store already at the current version, and the declared index over the
-    /// missing column would otherwise fail the open with a bare "no such
-    /// column". The digests are stamped from the stored documents, as the
+    /// Serves stores written by the 480aab5c prototype; no released writer
+    /// produced one. The same case as an index added to the fresh schema within
+    /// a version number ([`Self::heal_declared_indexes`]): the ladder runs no
+    /// rung for a store already at the current version, and the declared index
+    /// over the missing column would otherwise fail the open with a bare "no
+    /// such column". The digests are stamped from the stored documents, as the
     /// v27 rung does, and the old identity index goes, so the store is the one
-    /// a fresh open would have made. Nothing to do for any other store.
+    /// a fresh open would have made.
+    ///
+    /// The stamping runs whether or not the column was just added: a store
+    /// that has the column and rows still at the empty digest (a prototype
+    /// writer stopped between the two steps) would otherwise open and never
+    /// match an extraction in hand, and the next build would write a second
+    /// copy of every such payload. A store with every row stamped has nothing
+    /// to do and pays one probe.
     fn heal_payload_digest(conn: &Connection) -> Result<()> {
-        if Self::has_column(conn, "file_payloads", "payload_digest")? {
-            return Ok(());
+        if !Self::has_column(conn, "file_payloads", "payload_digest")? {
+            conn.execute_batch(
+                "ALTER TABLE file_payloads ADD COLUMN payload_digest BLOB NOT NULL DEFAULT x'';
+                 DROP INDEX IF EXISTS idx_file_payloads_identity;",
+            )?;
         }
-        conn.execute_batch(
-            "ALTER TABLE file_payloads ADD COLUMN payload_digest BLOB NOT NULL DEFAULT x'';
-             DROP INDEX IF EXISTS idx_file_payloads_identity;",
-        )?;
         Self::backfill_payload_digests(conn)
     }
 

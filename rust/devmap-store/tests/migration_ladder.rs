@@ -630,6 +630,26 @@ fn a_migrated_store_carries_the_same_schema_as_a_fresh_one() {
     let expected_columns = schema_columns(&fresh);
     drop(fresh);
 
+    // The comparison below is derived from a fresh store, so a column or index
+    // both sides lost would pass it. v28's identity change is pinned by name:
+    // the digest column, the renamed unique index over it, and the absence of
+    // the index it replaced.
+    assert!(
+        expected_columns["file_payloads"].contains(&"payload_digest".to_string()),
+        "a fresh store's file_payloads has the payload_digest column"
+    );
+    let identity = expected_objects
+        .get("index:idx_file_payloads_digest_identity")
+        .expect("a fresh store carries idx_file_payloads_digest_identity");
+    assert!(
+        identity.starts_with("CREATE UNIQUE INDEX") && identity.ends_with("payload_digest)"),
+        "the identity index is unique and ends in the digest: {identity}"
+    );
+    assert!(
+        !expected_objects.contains_key("index:idx_file_payloads_identity"),
+        "the pre-digest identity index is gone from a fresh store"
+    );
+
     let mut failures = Vec::new();
     for target in OLDEST_REDUCIBLE..CURRENT_SCHEMA_VERSION {
         let db_path = store_at_version(&dir, target);

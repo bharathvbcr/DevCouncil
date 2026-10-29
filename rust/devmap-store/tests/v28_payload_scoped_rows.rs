@@ -1249,6 +1249,110 @@ fn a_refusal_and_its_recovery_are_two_payloads_with_their_own_rows() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// The refusal and its recovery, end to end through retention: two payloads
+/// that both exist, each generation reading its own payload's rows, and the
+/// older generation's pruning collecting the refusal payload with every row
+/// derived from it while the recovery's stay.
+///
+/// `the_older_output_of_a_key_is_collected_with_its_rows_by_retention` pins the
+/// same collection for two outputs of a parsed file; this is the shape the
+/// digest exists for, a budget refusal over the same key as a parse.
+#[test]
+fn a_refusal_and_its_recovery_are_collected_independently_by_retention() {
+    use devmap_extract::extract_file_with_budget;
+    use std::time::Duration;
+    let dir = tmp_dir("refusal-collect");
+    let db = dir.join("devmap.sqlite");
+    let store = Store::open(&db).unwrap();
+    let (path, body) = module(0, 0);
+    let refused = extract_file_with_budget(&path, &body, Duration::ZERO);
+    assert!(refused.is_budget_refusal());
+    let recovered = extract_file_with_budget(&path, &body, Duration::from_secs(60));
+    assert!(!recovered.is_parse_failure());
+    assert!(!recovered.symbols.is_empty());
+
+    let g1 = commit_extractions(&store, std::slice::from_ref(&refused), &[], &[]);
+    let g2 = commit_extractions(
+        &store,
+        std::slice::from_ref(&recovered),
+        &[path.as_str()],
+        &[],
+    );
+    let refused_rows = file_rows(&db, g1, &path);
+    let recovered_rows = file_rows(&db, g2, &path);
+    assert_ne!(
+        refused_rows, recovered_rows,
+        "the two generations must read different rows for this test to mean anything"
+    );
+    assert_eq!(refused_rows.nodes.len(), refused.symbols.len());
+    assert_eq!(recovered_rows.nodes.len(), recovered.symbols.len());
+
+    // Both payloads exist, and they are two rows, not one rewritten.
+    let payload_where = |predicate: &str| -> i64 {
+        count(
+            &db,
+            &format!(
+                "SELECT payload_id FROM file_payloads
+                  WHERE parse_outcome_json {predicate} '%budget exceeded%'"
+            ),
+        )
+    };
+    let refusal_payload = payload_where("LIKE");
+    let recovery_payload = payload_where("NOT LIKE");
+    assert_ne!(refusal_payload, recovery_payload);
+    assert_eq!(payloads_of(&db, &path), 2);
+    let rows_of = |relation: &str, payload: i64| -> i64 {
+        count(
+            &db,
+            &format!("SELECT COUNT(*) FROM {relation} WHERE payload_id = {payload}"),
+        )
+    };
+    assert_eq!(
+        rows_of("payload_nodes", refusal_payload),
+        refused.symbols.len() as i64
+    );
+    assert_eq!(
+        rows_of("payload_nodes", recovery_payload),
+        recovered.symbols.len() as i64
+    );
+
+    // Each generation reads its own payload's rows.
+    assert_eq!(file_rows(&db, g1, &path), refused_rows);
+    assert_eq!(file_rows(&db, g2, &path), recovered_rows);
+
+    // Retention drops the older generation: nothing retained names the refusal
+    // payload any more, so it goes with the rows derived from it, and the
+    // recovery's are untouched.
+    store.prune_generations_except_latest(1).unwrap();
+    assert_eq!(payloads_of(&db, &path), 1);
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT COUNT(*) FROM file_payloads WHERE payload_id = {refusal_payload}")
+        ),
+        0,
+        "the refusal's payload is collected"
+    );
+    assert_eq!(rows_of("payload_nodes", refusal_payload), 0);
+    assert_eq!(rows_of("payload_literals", refusal_payload), 0);
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM payload_nodes"),
+        recovered.symbols.len() as i64,
+        "only the recovery's rows remain"
+    );
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM nodes_fts"),
+        recovered.symbols.len() as i64,
+        "and only its full-text rows"
+    );
+    assert_eq!(
+        rows_of("payload_nodes", recovery_payload),
+        recovered.symbols.len() as i64
+    );
+    assert_eq!(file_rows(&db, g2, &path), recovered_rows);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// The extraction pass falls back to a retained generation's payload by content
 /// identity. With two payloads under one identity it must hand back the newest
 /// one, not whichever row SQLite reaches first.
@@ -1410,4 +1514,62 @@ fn a_store_from_the_first_v28_prototype_is_healed_on_open() {
         "a full build of the current tree reuses what the healed digests name"
     );
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// A store whose `payload_digest` column exists but whose rows are not all
+/// stamped: the shape a prototype writer left if it was killed between adding
+/// the column and the backfill. (The ladder holds one transaction, so this
+/// build's own migration cannot stop there; the heal must not rely on that.)
+/// The open stamps every row and never proceeds with an empty digest, and the
+/// next full build reuses every payload rather than writing a second copy.
+#[test]
+fn a_store_with_the_digest_column_but_unstamped_rows_is_stamped_on_open() {
+    for unstamped in ["every row", "some rows"] {
+        let dir = tmp_dir("interrupted-heal");
+        let db = dir.join("devmap.sqlite");
+        let digests = {
+            let store = Store::open(&db).unwrap();
+            history(&store);
+            payload_digests(&db)
+        };
+        assert!(digests.iter().all(|(_, _, digest)| !digest.is_empty()));
+        {
+            let conn = Connection::open(&db).unwrap();
+            let predicate = if unstamped == "every row" {
+                "1 = 1"
+            } else {
+                "payload_id % 2 = 0"
+            };
+            conn.execute_batch(&format!(
+                "DROP INDEX idx_file_payloads_digest_identity;
+                 UPDATE file_payloads SET payload_digest = x'' WHERE {predicate};"
+            ))
+            .unwrap();
+            assert!(
+                count(
+                    &db,
+                    "SELECT COUNT(*) FROM file_payloads WHERE payload_digest = x''"
+                ) > 0,
+                "{unstamped}: the interrupted shape is set up"
+            );
+        }
+        let store = Store::open(&db).expect("an interrupted-heal store opens");
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM file_payloads WHERE payload_digest = x''"
+            ),
+            0,
+            "{unstamped}: no row is left unstamped"
+        );
+        assert_eq!(payload_digests(&db), digests, "{unstamped}");
+        let payloads = count(&db, "SELECT COUNT(*) FROM file_payloads");
+        commit(&store, &tree(8, |index| usize::from(index == 2)), &[], &[]);
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM file_payloads"),
+            payloads,
+            "{unstamped}: a full build reuses every payload"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
