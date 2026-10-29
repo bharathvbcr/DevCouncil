@@ -35,9 +35,25 @@ pub fn has_code_suffix(path: &str) -> bool {
 /// commit's ground truth never includes them; the corpus still does.
 pub fn is_excluded_ground_truth(path: &str) -> bool {
     const DIRS: &[&str] = &[
-        "tests", "test", "__tests__", "testdata", "fixtures", "fixture", "docs", "vendor",
-        "generated", "results", "node_modules", "target", "dist", ".github", ".devcouncil",
-        ".claude", ".codex", "snapshots", "golden",
+        "tests",
+        "test",
+        "__tests__",
+        "testdata",
+        "fixtures",
+        "fixture",
+        "docs",
+        "vendor",
+        "generated",
+        "results",
+        "node_modules",
+        "target",
+        "dist",
+        ".github",
+        ".devcouncil",
+        ".claude",
+        ".codex",
+        "snapshots",
+        "golden",
     ];
     let mut parts = path.split('/').peekable();
     while let Some(part) = parts.next() {
@@ -68,13 +84,17 @@ pub fn read_slot_files(root: &Path) -> Result<Vec<String>, String> {
     let pointer: serde_json::Value =
         serde_json::from_str(&pointer).map_err(|e| format!("current.json: {e}"))?;
     let slot = pointer["slot"].as_str().ok_or("current.json has no slot")?;
-    let expected = pointer["files_indexed"].as_u64().ok_or("current.json has no files_indexed")?;
-    let bytes = fs::read(cache.join(slot).join("files.bin"))
-        .map_err(|e| format!("files.bin: {e}"))?;
+    let expected = pointer["files_indexed"]
+        .as_u64()
+        .ok_or("current.json has no files_indexed")?;
+    let bytes =
+        fs::read(cache.join(slot).join("files.bin")).map_err(|e| format!("files.bin: {e}"))?;
     let mut out = Vec::new();
     let mut at = 0usize;
     while at < bytes.len() {
-        let header = bytes.get(at..at + 6).ok_or("files.bin: truncated record header")?;
+        let header = bytes
+            .get(at..at + 6)
+            .ok_or("files.bin: truncated record header")?;
         let len = u16::from_le_bytes([header[4], header[5]]) as usize;
         let raw = bytes
             .get(at + 6..at + 6 + len)

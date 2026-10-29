@@ -157,7 +157,10 @@ pub fn git_log(repo: &Path, rev: &str) -> Result<Vec<Candidate>, String> {
         .output()
         .map_err(|e| format!("git log: {e}"))?;
     if !out.status.success() {
-        return Err(format!("git log failed: {}", String::from_utf8_lossy(&out.stderr)));
+        return Err(format!(
+            "git log failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
     }
     let text = String::from_utf8(out.stdout).map_err(|_| "git log output is not utf-8")?;
     Ok(parse_log(&text))
@@ -170,9 +173,15 @@ pub fn tree_files(repo: &Path, rev: &str) -> Result<HashSet<String>, String> {
         .output()
         .map_err(|e| format!("git ls-tree: {e}"))?;
     if !out.status.success() {
-        return Err(format!("git ls-tree failed: {}", String::from_utf8_lossy(&out.stderr)));
+        return Err(format!(
+            "git ls-tree failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect())
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect())
 }
 
 #[cfg(test)]
@@ -181,16 +190,37 @@ mod tests {
 
     #[test]
     fn prefix_and_scope_are_stripped() {
-        assert_eq!(strip_subject("fix(devmap-store): handle torn pages"), Some("handle torn pages".into()));
-        assert_eq!(strip_subject("feat!: drop the old flag"), Some("drop the old flag".into()));
-        assert_eq!(strip_subject("Perf(dc-grep)!: skip empty files"), Some("skip empty files".into()));
-        assert_eq!(strip_subject("refactor: split the walker"), Some("split the walker".into()));
+        assert_eq!(
+            strip_subject("fix(devmap-store): handle torn pages"),
+            Some("handle torn pages".into())
+        );
+        assert_eq!(
+            strip_subject("feat!: drop the old flag"),
+            Some("drop the old flag".into())
+        );
+        assert_eq!(
+            strip_subject("Perf(dc-grep)!: skip empty files"),
+            Some("skip empty files".into())
+        );
+        assert_eq!(
+            strip_subject("refactor: split the walker"),
+            Some("split the walker".into())
+        );
     }
 
     #[test]
     fn unwanted_types_and_unprefixed_subjects_are_refused() {
-        for s in ["docs: x y z", "chore(x): a b c", "test: a b c", "wip: a b c", "style: a b c",
-                  "Merge branch 'x'", "fixing things: a b c", "fix(unclosed: a b c", "fix:"] {
+        for s in [
+            "docs: x y z",
+            "chore(x): a b c",
+            "test: a b c",
+            "wip: a b c",
+            "style: a b c",
+            "Merge branch 'x'",
+            "fixing things: a b c",
+            "fix(unclosed: a b c",
+            "fix:",
+        ] {
             assert_eq!(strip_subject(s), None, "{s}");
         }
     }
@@ -205,20 +235,38 @@ mod tests {
     }
 
     fn cand(sha: &str, subject: &str, files: &[&str]) -> Candidate {
-        Candidate { sha: sha.repeat(12), subject: subject.into(), files: files.iter().map(|s| s.to_string()).collect() }
+        Candidate {
+            sha: sha.repeat(12),
+            subject: subject.into(),
+            files: files.iter().map(|s| s.to_string()).collect(),
+        }
     }
 
     #[test]
     fn selection_applies_each_rule_and_counts_the_drops() {
         let exists: HashSet<String> = ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs", "src/e.rs"]
-            .iter().map(|s| s.to_string()).collect();
-        let corpus: HashSet<String> = exists.iter().filter(|p| *p != "src/e.rs").cloned().collect();
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let corpus: HashSet<String> = exists
+            .iter()
+            .filter(|p| *p != "src/e.rs")
+            .cloned()
+            .collect();
         let verbatim = |t: &str| t == "this text is in the corpus";
         let commits = vec![
-            cand("1", "fix(x): tidy the retry loop", &["src/a.rs", "tests/t.rs", "docs/d.md"]),
+            cand(
+                "1",
+                "fix(x): tidy the retry loop",
+                &["src/a.rs", "tests/t.rs", "docs/d.md"],
+            ),
             cand("2", "docs: words here please", &["src/a.rs"]),
             cand("3", "fix: only tests changed here", &["tests/t.rs"]),
-            cand("4", "fix: four files at once now", &["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"]),
+            cand(
+                "4",
+                "fix: four files at once now",
+                &["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"],
+            ),
             cand("5", "fix: file deleted since then", &["src/gone.rs"]),
             cand("6", "fix: file outside the corpus", &["src/e.rs"]),
             cand("7", "fix: two words", &["src/a.rs"]),
@@ -230,8 +278,16 @@ mod tests {
         assert_eq!(q[0].query, "tidy the retry loop");
         assert_eq!(q[0].relevant, vec!["src/a.rs"]);
         assert_eq!(
-            (d.not_wanted_type, d.no_code_files, d.too_many_files, d.file_missing_at_rev,
-             d.file_not_in_corpus, d.too_few_words, d.verbatim_in_corpus, d.duplicate),
+            (
+                d.not_wanted_type,
+                d.no_code_files,
+                d.too_many_files,
+                d.file_missing_at_rev,
+                d.file_not_in_corpus,
+                d.too_few_words,
+                d.verbatim_in_corpus,
+                d.duplicate
+            ),
             (1, 1, 1, 1, 1, 1, 1, 1)
         );
     }

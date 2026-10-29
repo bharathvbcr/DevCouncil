@@ -31,8 +31,14 @@ pub struct Filter<'a> {
 impl Filter<'_> {
     pub fn keeps(&self, path: &str) -> bool {
         self.corpus.contains(path)
-            && !self.exclude_prefixes.iter().any(|p| path.starts_with(p.as_str()))
-            && !self.exclude_suffixes.iter().any(|s| path.ends_with(s.as_str()))
+            && !self
+                .exclude_prefixes
+                .iter()
+                .any(|p| path.starts_with(p.as_str()))
+            && !self
+                .exclude_suffixes
+                .iter()
+                .any(|s| path.ends_with(s.as_str()))
     }
 }
 
@@ -188,7 +194,10 @@ pub fn paired(arm: &[PerQuery], base: &[PerQuery], boot: &[Vec<usize>]) -> Paire
         wins,
         losses,
         ties,
-        diff: interval(mean(&d), boot.iter().map(|idx| mean_over(&d, idx)).collect()),
+        diff: interval(
+            mean(&d),
+            boot.iter().map(|idx| mean_over(&d, idx)).collect(),
+        ),
     }
 }
 
@@ -226,7 +235,11 @@ mod tests {
     #[test]
     fn rank_is_assigned_after_the_filter() {
         let corpus = set(&["a", "b", "c"]);
-        let f = Filter { corpus: &corpus, exclude_prefixes: &[], exclude_suffixes: &[] };
+        let f = Filter {
+            corpus: &corpus,
+            exclude_prefixes: &[],
+            exclude_suffixes: &[],
+        };
         // "zzz" is outside the corpus and must not take rank 1.
         let q = score_query(&list(&["zzz", "b", "a"]), &set(&["b"]), &f);
         assert_eq!(q.rr, 1.0);
@@ -236,7 +249,11 @@ mod tests {
     #[test]
     fn recall_is_a_fraction_of_the_relevant_set_and_duplicates_count_once() {
         let corpus = set(&["a", "b", "c", "d"]);
-        let f = Filter { corpus: &corpus, exclude_prefixes: &[], exclude_suffixes: &[] };
+        let f = Filter {
+            corpus: &corpus,
+            exclude_prefixes: &[],
+            exclude_suffixes: &[],
+        };
         let q = score_query(&list(&["a", "a", "c", "b"]), &set(&["b", "c"]), &f);
         // ranks: a=1 c=2 b=3
         assert_eq!(q.rr, 0.5);
@@ -248,15 +265,27 @@ mod tests {
     fn exclusions_remove_entries_before_ranking() {
         let corpus = set(&["docs/x.md", "src/a.rs", "src/b.rs"]);
         let ex = vec!["docs/".to_string()];
-        let f = Filter { corpus: &corpus, exclude_prefixes: &ex, exclude_suffixes: &[] };
-        let q = score_query(&list(&["docs/x.md", "src/b.rs", "src/a.rs"]), &set(&["src/a.rs"]), &f);
+        let f = Filter {
+            corpus: &corpus,
+            exclude_prefixes: &ex,
+            exclude_suffixes: &[],
+        };
+        let q = score_query(
+            &list(&["docs/x.md", "src/b.rs", "src/a.rs"]),
+            &set(&["src/a.rs"]),
+            &f,
+        );
         assert_eq!(q.rr, 0.5);
     }
 
     #[test]
     fn an_unranked_relevant_file_scores_zero() {
         let corpus = set(&["a", "b"]);
-        let f = Filter { corpus: &corpus, exclude_prefixes: &[], exclude_suffixes: &[] };
+        let f = Filter {
+            corpus: &corpus,
+            exclude_prefixes: &[],
+            exclude_suffixes: &[],
+        };
         let q = score_query(&list(&["a"]), &set(&["b"]), &f);
         assert_eq!(q.rr, 0.0);
         assert_eq!(q.recall, [0.0, 0.0, 0.0]);
@@ -264,8 +293,18 @@ mod tests {
 
     #[test]
     fn the_bootstrap_is_reproducible_and_paired_interval_excludes_zero_for_a_clear_win() {
-        let a: Vec<PerQuery> = (0..60).map(|_| PerQuery { recall: [1.0; 3], rr: 1.0 }).collect();
-        let b: Vec<PerQuery> = (0..60).map(|_| PerQuery { recall: [0.0; 3], rr: 0.1 }).collect();
+        let a: Vec<PerQuery> = (0..60)
+            .map(|_| PerQuery {
+                recall: [1.0; 3],
+                rr: 1.0,
+            })
+            .collect();
+        let b: Vec<PerQuery> = (0..60)
+            .map(|_| PerQuery {
+                recall: [0.0; 3],
+                rr: 0.1,
+            })
+            .collect();
         let boot = resample_indices(60, 1000, 7);
         assert_eq!(boot, resample_indices(60, 1000, 7));
         let p = paired(&a, &b, &boot);
@@ -276,7 +315,10 @@ mod tests {
     #[test]
     fn identical_arms_tie_and_the_interval_is_zero() {
         let a: Vec<PerQuery> = (0..30)
-            .map(|i| PerQuery { recall: [0.0; 3], rr: 1.0 / (1 + i % 4) as f64 })
+            .map(|i| PerQuery {
+                recall: [0.0; 3],
+                rr: 1.0 / (1 + i % 4) as f64,
+            })
             .collect();
         let boot = resample_indices(30, 1000, 1);
         let p = paired(&a, &a, &boot);

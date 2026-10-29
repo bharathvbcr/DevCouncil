@@ -57,7 +57,10 @@ impl Args {
         }
     }
     fn opt(&self, name: &str) -> Option<&str> {
-        self.flags.get(name).and_then(|v| v.last()).map(String::as_str)
+        self.flags
+            .get(name)
+            .and_then(|v| v.last())
+            .map(String::as_str)
     }
     fn many(&self, name: &str) -> Vec<String> {
         self.flags.get(name).cloned().unwrap_or_default()
@@ -65,7 +68,9 @@ impl Args {
     fn num<T: std::str::FromStr>(&self, name: &str, default: T) -> Result<T, String> {
         match self.opt(name) {
             None => Ok(default),
-            Some(v) => v.parse().map_err(|_| format!("--{name}: {v:?} is not a number")),
+            Some(v) => v
+                .parse()
+                .map_err(|_| format!("--{name}: {v:?} is not a number")),
         }
     }
 }
@@ -96,17 +101,27 @@ fn read_lines(path: &Path) -> Result<Vec<String>, String> {
 
 fn cmd_corpus(args: &Args) -> Result<(), String> {
     let admitted = corpus::read_slot_files(Path::new(args.one("root")?))?;
-    let mut kept: Vec<String> = admitted.iter().filter(|p| corpus::has_source_suffix(p)).cloned().collect();
+    let mut kept: Vec<String> = admitted
+        .iter()
+        .filter(|p| corpus::has_source_suffix(p))
+        .cloned()
+        .collect();
     kept.sort();
     kept.dedup();
-    eprintln!("dcgrep admitted {} files; {} carry a source suffix", admitted.len(), kept.len());
+    eprintln!(
+        "dcgrep admitted {} files; {} carry a source suffix",
+        admitted.len(),
+        kept.len()
+    );
     std::fs::write(args.one("out")?, kept.join("\n") + "\n").map_err(|e| e.to_string())
 }
 
 fn cmd_commits(args: &Args) -> Result<(), String> {
     let repo = PathBuf::from(args.one("repo")?);
     let rev = args.one("rev")?;
-    let corpus_set: HashSet<String> = read_lines(Path::new(args.one("corpus")?))?.into_iter().collect();
+    let corpus_set: HashSet<String> = read_lines(Path::new(args.one("corpus")?))?
+        .into_iter()
+        .collect();
     let corpus_root = PathBuf::from(args.one("corpus-root")?);
     // The text the verbatim check runs against: every file dcgrep admitted,
     // not only the ranked set, lowercased (`rg` is smart-case).
@@ -121,7 +136,11 @@ fn cmd_commits(args: &Args) -> Result<(), String> {
     let log = commits::git_log(&repo, rev)?;
     let exists = commits::tree_files(&repo, rev)?;
     let (queries, drops) = commits::select(&log, &exists, &corpus_set, &contains);
-    eprintln!("{} non-merge commits reachable from {rev}; {} queries; drops: {drops:?}", log.len(), queries.len());
+    eprintln!(
+        "{} non-merge commits reachable from {rev}; {} queries; drops: {drops:?}",
+        log.len(),
+        queries.len()
+    );
     let mut out = String::new();
     for q in &queries {
         out.push_str(
@@ -159,7 +178,11 @@ fn cmd_fuse(args: &Args) -> Result<(), String> {
     for id in inputs[0].keys() {
         let lists = inputs
             .iter()
-            .map(|r| r.get(id).map(Vec::as_slice).ok_or_else(|| format!("run is missing id {id}")))
+            .map(|r| {
+                r.get(id)
+                    .map(Vec::as_slice)
+                    .ok_or_else(|| format!("run is missing id {id}"))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         rows.push((id.clone(), metrics::rrf(&lists, k)));
     }
@@ -167,10 +190,16 @@ fn cmd_fuse(args: &Args) -> Result<(), String> {
 }
 
 fn cmd_score(args: &Args) -> Result<(), String> {
-    let corpus_set: HashSet<String> = read_lines(Path::new(args.one("corpus")?))?.into_iter().collect();
+    let corpus_set: HashSet<String> = read_lines(Path::new(args.one("corpus")?))?
+        .into_iter()
+        .collect();
     let excl_prefix = args.many("exclude-prefix");
     let excl_suffix = args.many("exclude-suffix");
-    let filter = Filter { corpus: &corpus_set, exclude_prefixes: &excl_prefix, exclude_suffixes: &excl_suffix };
+    let filter = Filter {
+        corpus: &corpus_set,
+        exclude_prefixes: &excl_prefix,
+        exclude_suffixes: &excl_suffix,
+    };
     let resamples = args.num("resamples", 2000usize)?;
     if resamples < 1000 {
         return Err("--resamples must be at least 1000".into());
@@ -182,7 +211,10 @@ fn cmd_score(args: &Args) -> Result<(), String> {
     let mut dropped = Vec::new();
     for q in all {
         if q.relevant.is_empty() {
-            return Err(format!("query {} has no ground truth; label it or remove it", q.id));
+            return Err(format!(
+                "query {} has no ground truth; label it or remove it",
+                q.id
+            ));
         }
         if q.relevant.iter().all(|f| corpus_set.contains(f)) {
             kept.push(q);
@@ -200,9 +232,12 @@ fn cmd_score(args: &Args) -> Result<(), String> {
         let run = runs::read_run(Path::new(path))?;
         let mut per = Vec::new();
         for q in &kept {
-            let ranked = run
-                .get(&q.id)
-                .ok_or_else(|| format!("arm {name} has no ranking for query {}; refusing to score it as a miss", q.id))?;
+            let ranked = run.get(&q.id).ok_or_else(|| {
+                format!(
+                    "arm {name} has no ranking for query {}; refusing to score it as a miss",
+                    q.id
+                )
+            })?;
             let rel: HashSet<String> = q.relevant.iter().cloned().collect();
             per.push(metrics::score_query(ranked, &rel, &filter));
         }
@@ -218,9 +253,15 @@ fn cmd_score(args: &Args) -> Result<(), String> {
 
     let boot = metrics::resample_indices(kept.len(), resamples, seed);
     let label = args.opt("label").unwrap_or("set");
-    println!("### {label}: n = {} queries ({} dropped: relevant file outside the corpus), {resamples} resamples, seed {seed}", kept.len(), dropped.len());
+    println!(
+        "### {label}: n = {} queries ({} dropped: relevant file outside the corpus), {resamples} resamples, seed {seed}",
+        kept.len(),
+        dropped.len()
+    );
     println!();
-    println!("| arm | R@1 | R@5 | R@10 | MRR | MRR 95% CI | vs {baseline}: W/L/T | MRR diff | diff 95% CI |");
+    println!(
+        "| arm | R@1 | R@5 | R@10 | MRR | MRR 95% CI | vs {baseline}: W/L/T | MRR diff | diff 95% CI |"
+    );
     println!("|---|---|---|---|---|---|---|---|---|");
     let mut json_rows = Vec::new();
     for (name, per) in &arms {
@@ -237,8 +278,15 @@ fn cmd_score(args: &Args) -> Result<(), String> {
         };
         println!(
             "| {name} | {:.3} | {:.3} | {:.3} | {:.3} | [{:.3}, {:.3}] | {} | {} | {} |",
-            s.recall[0].mean, s.recall[1].mean, s.recall[2].mean, s.mrr.mean, s.mrr.lo, s.mrr.hi,
-            versus.0, versus.1, versus.2
+            s.recall[0].mean,
+            s.recall[1].mean,
+            s.recall[2].mean,
+            s.mrr.mean,
+            s.mrr.lo,
+            s.mrr.hi,
+            versus.0,
+            versus.1,
+            versus.2
         );
         json_rows.push(serde_json::json!({
             "arm": name, "n": s.n,
@@ -251,12 +299,17 @@ fn cmd_score(args: &Args) -> Result<(), String> {
         }));
     }
     println!();
-    println!("R@k cells are point estimates; their 95% bootstrap intervals are in the JSON output.");
+    println!(
+        "R@k cells are point estimates; their 95% bootstrap intervals are in the JSON output."
+    );
     if let Some(path) = args.opt("json") {
         let doc = serde_json::json!({"label": label, "n": kept.len(), "dropped": dropped,
             "resamples": resamples, "seed": seed, "arms": json_rows});
-        std::fs::write(path, serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
     }
     Ok(())
 }

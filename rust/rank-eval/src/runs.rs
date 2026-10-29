@@ -21,16 +21,32 @@ pub struct QueryRow {
 pub fn read_queries(path: &Path) -> Result<Vec<QueryRow>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut out = Vec::new();
-    for (n, line) in text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
-        let v: Value = serde_json::from_str(line)
-            .map_err(|e| format!("{}:{}: {e}", path.display(), n + 1))?;
-        let id = v["id"].as_str().ok_or_else(|| format!("{}:{}: no id", path.display(), n + 1))?;
-        let query = v["query"].as_str().ok_or_else(|| format!("{}:{}: no query", path.display(), n + 1))?;
+    for (n, line) in text
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty())
+    {
+        let v: Value =
+            serde_json::from_str(line).map_err(|e| format!("{}:{}: {e}", path.display(), n + 1))?;
+        let id = v["id"]
+            .as_str()
+            .ok_or_else(|| format!("{}:{}: no id", path.display(), n + 1))?;
+        let query = v["query"]
+            .as_str()
+            .ok_or_else(|| format!("{}:{}: no query", path.display(), n + 1))?;
         let relevant = v["relevant"]
             .as_array()
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
             .unwrap_or_default();
-        out.push(QueryRow { id: id.into(), query: query.into(), relevant });
+        out.push(QueryRow {
+            id: id.into(),
+            query: query.into(),
+            relevant,
+        });
     }
     Ok(out)
 }
@@ -38,15 +54,25 @@ pub fn read_queries(path: &Path) -> Result<Vec<QueryRow>, String> {
 pub fn read_run(path: &Path) -> Result<BTreeMap<String, Vec<String>>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut out = BTreeMap::new();
-    for (n, line) in text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
-        let v: Value = serde_json::from_str(line)
-            .map_err(|e| format!("{}:{}: {e}", path.display(), n + 1))?;
-        let id = v["id"].as_str().ok_or_else(|| format!("{}:{}: no id", path.display(), n + 1))?;
+    for (n, line) in text
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty())
+    {
+        let v: Value =
+            serde_json::from_str(line).map_err(|e| format!("{}:{}: {e}", path.display(), n + 1))?;
+        let id = v["id"]
+            .as_str()
+            .ok_or_else(|| format!("{}:{}: no id", path.display(), n + 1))?;
         let ranked = v["ranked"]
             .as_array()
             .ok_or_else(|| format!("{}:{}: no ranked list", path.display(), n + 1))?
             .iter()
-            .map(|x| x.as_str().map(str::to_string).ok_or("ranked entry is not a string"))
+            .map(|x| {
+                x.as_str()
+                    .map(str::to_string)
+                    .ok_or("ranked entry is not a string")
+            })
             .collect::<Result<Vec<_>, _>>()?;
         if out.insert(id.to_string(), ranked).is_some() {
             return Err(format!("{}: duplicate id {id}", path.display()));
@@ -65,7 +91,12 @@ pub fn write_run(path: &Path, rows: &[(String, Vec<String>)]) -> Result<(), Stri
 }
 
 /// Run `dcgrep rank` for one query and return the ranked paths.
-pub fn dcgrep_rank(bin: &Path, root: &Path, query: &str, max_results: usize) -> Result<Vec<String>, String> {
+pub fn dcgrep_rank(
+    bin: &Path,
+    root: &Path,
+    query: &str,
+    max_results: usize,
+) -> Result<Vec<String>, String> {
     let mut child = Command::new(bin)
         .arg("rank")
         .stdin(Stdio::piped())
@@ -88,6 +119,10 @@ pub fn dcgrep_rank(bin: &Path, root: &Path, query: &str, max_results: usize) -> 
     }
     Ok(v["files"]
         .as_array()
-        .map(|a| a.iter().filter_map(|f| f["path"].as_str().map(str::to_string)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|f| f["path"].as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default())
 }
