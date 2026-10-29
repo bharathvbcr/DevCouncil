@@ -113,6 +113,22 @@ no runner blocks both enforce and advisory verification. Disabling verification
 continues to produce an explicit skipped result. An ordinary test failure keeps
 the configured gate policy.
 
+Verification rigor enforces strict information-leak and coverage boundaries:
+- **No secret echo in errors:** Verification error reporting never echoes raw
+  diff lines, preventing secrets or token fragments present in diffs from leaking
+  into error output.
+- **Payload-free panic hooks:** Rust and Go panic hooks omit panic payload backtrace
+  text, printing only the source file and line to prevent leaking sensitive values.
+- **Deep scan coverage:** Secret and stub scanning extends to untracked and recreated
+  files, streamed index entries, binary-marked source, and submodule commit-range bytes
+  when gitlink pointers move (`proc/gitsubmodules.go`).
+- **Opaque stub detection:** The AST stub scanner identifies opaque stubs, stub-scanned
+  binary source, and lexer comments using whole-name path matching.
+- **Unified walk budget & bounded input:** A single walk deadline bounds all verification
+  traversal, and diff/input sizes are bounded (`bounded.rs`).
+- **Nested repository refusal:** Verification explicitly refuses nested git repositories
+  to prevent submodule escapes.
+
 Lease renewal updates and returns the row authenticated by the supplied lease
 identity and token. A concurrent replacement or expiry refuses the renewal;
 renewal does not return a new holder's token. Secret detection and redaction
@@ -182,6 +198,14 @@ Go untracked diff collection uses rooted descriptor access and the existing
 read policy, preserves native filenames, and refuses links, special files,
 secret paths, or a collection exceeding 4096 files / 8 MiB. A refusal is an
 explicit diff failure, not an empty successful diff.
+
+Rooted leaf file reads via `safefile.OpenNoFollow` under an `os.Root` sample
+the file's identity after open. To accommodate atomic publishers that swap a new
+regular file onto the target path between the `Open` and `Lstat` calls, it retries
+the open up to 16 attempts, provided both the named entry and opened handle are
+regular files. If a symlink, FIFO, or non-regular entry is swapped in during the
+race window, it is refused immediately without retrying, and no file descriptor
+outlives the refusal.
 
 `devcouncil integrate` reads and writes host configs (`.mcp.json`,
 `.cursor/`, `.codex/`) by repository-relative name inside an `os.Root`, using

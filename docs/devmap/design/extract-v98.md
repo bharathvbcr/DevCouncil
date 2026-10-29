@@ -1,8 +1,9 @@
 # extract-v98: the extractor-output bundle
 
-Status: DESIGN ONLY. No code, no build. Base: main `f796dd8c`. `EXTRACTION_SCHEMA_VERSION` stays
-`"97"` (`rust/devmap-extract/src/cache.rs:798`) until the consumer sweep (ft-3018ab76) closes and
-DevCouncil main is pushed. This document is written so implementation can start the day it does.
+Status: IMPLEMENTED AND MERGED on local `main` (landings 1–3, commits `37b9f9f5` through
+`4aeda9d6`). `EXTRACTION_SCHEMA_VERSION` is `"98"` (`rust/devmap-extract/src/cache.rs:814`).
+Local `main` carries the complete extract-v98 bundle, including side tables, Kotlin loss recovery,
+Swift residue typing, and SQL DDL recovery. Push to origin is held for the v98 consumer sweep.
 
 Labels: **[V]** verified by reading code or running a command this session; **[I]** inferred;
 **[U]** unverified, to be settled by the first implementation step named beside it.

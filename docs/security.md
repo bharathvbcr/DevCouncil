@@ -11,8 +11,11 @@ The implementation-level reference is
   or harness has its own provider and data-handling policy.
 - Task leases and write-policy results apply to participating clients. Retired
   DevCouncil hooks do not intercept every shell command or editor write.
-- Rigor includes a secret check over the supplied diff. That is not a guarantee
+- Rigor includes secret and stub checks over the supplied diff, untracked files,
+  recreated files, and dirty submodule commit ranges. That is not a guarantee
   that every repository file, log or provider payload is free of secrets.
+- Verification errors suppress raw diff lines to prevent echoing detected secrets,
+  and panic hooks suppress backtrace payload text.
 - Missing and unavailable checks need explicit handling. Read gate mode,
   skipped reasons and coverage metadata in addition to the verdict.
 

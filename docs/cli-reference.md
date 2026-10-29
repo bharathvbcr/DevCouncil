@@ -260,6 +260,7 @@ devmap build --manifest --force  # Also replace a foreign repo map / code graph 
                             # committed and exits 130; a second one exits 130 at once
 devmap serve                # Watcher + IPC (not `build --watch`)
 devmap status [--json]
+devmap --version            # Prints version, store schema, code graph schema, extract schema, build hash
 devmap doctor               # No `--fix`
 devmap paths [--json]
 devmap history
@@ -297,7 +298,7 @@ devmap session-report [--last]
 # Visualizers & Servers
 devmap map-html             # Subsystem map (.devmap/map.html or .devcouncil/map.html); see code-graph.md
 devmap html                 # Symbol graph HTML
-devmap mcp                  # DevMap MCP stdio (13 read-only tools)
+devmap mcp                  # DevMap MCP stdio (21 read-only tools: status, search, ask, ask_evidence, deps, impact, trace, neighbors, dead, skeleton, clones, preview, explore, literals, doc_drift, affected, suspects, blast, routes, api_impact, cypher)
 devmap export               # GraphML
 ```
 

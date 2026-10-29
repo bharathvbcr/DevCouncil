@@ -92,7 +92,7 @@ flowchart TD
     end
 
     subgraph DevMapMCP["devmap mcp (Code Intelligence)"]
-        DM_Tools["13 Read-Only MCP Tools:<br/>- Inspection: status, search<br/>- Navigation: explore, dependencies, impact, trace, neighbors<br/>- Analysis: dead_symbols, clones, preview, affected_tests<br/>- Git-Graph: blast (forward), suspects (backward)"]
+        DM_Tools["21 Read-Only MCP Tools:<br/>- Inspection & Query: status, search, ask, ask_evidence<br/>- Navigation: explore, dependencies, impact, trace, neighbors<br/>- Analysis: dead_symbols, skeleton, clones, preview, literals, doc_drift, affected_tests<br/>- Structural & Routes: routes, api_impact, cypher<br/>- Git-Graph: blast (forward), suspects (backward)"]
         DM_Envelope["Multi-repo envelope check:<br/>Client sends repo_path<br/>Validates repository.root"]
     end
 
@@ -132,6 +132,20 @@ The Go layer collects task and diff context, checks no-work/planned-file/orphan/
 dependency conditions, and executes expected commands. It invokes `dcverify`
 through [`runRigorGates`](../backend/go_orchestrator/devcouncil/verify/rigor.go)
 for stub, secret and optional coverage checks.
+
+Verification rigor encompasses:
+- **Comprehensive scan coverage:** Scans untracked and recreated files, submodule
+  commit-range bytes when pointers move (`proc/gitsubmodules.go`), binary-marked source,
+  and streamed index entries.
+- **Stub AST scanner:** Detects opaque stubs, stub-scanned binary-marked source, and
+  lexer comments using whole-name path matching.
+- **Secret leak prevention:** Verification error output suppresses raw diff line echoes,
+  and panic hooks omit backtrace payloads, printing only file and line.
+- **Bounded execution:** A single unified walk deadline bounds verification walks, with
+  hard input length limits (`bounded.rs`).
+- **Atomic file safety:** Rooted file reads via `safefile.OpenNoFollow` retry (up to 16
+  attempts) when regular files are atomically replaced in race windows, while refusing
+  symlinks and FIFOs immediately.
 
 Go scope findings retain their existing owner; the rigor adapter does not
 report a second independent scope verdict. Result metadata names applied gates

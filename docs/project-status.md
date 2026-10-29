@@ -9,10 +9,10 @@ availability; it does not certify every platform, editor session or release.
 
 | Surface | Implementation | Practical boundary |
 |---|---|---|
-| Code intelligence | Rust `devmap` pipeline, CLI, MCP and watcher | Static evidence; freshness and coverage are separate; queries can be capped |
+| Code intelligence | Rust `devmap` pipeline, CLI, 21-tool MCP, watcher and `doc-drift` | Static evidence (schema 98); freshness and coverage are separate; queries can be capped |
 | Go host | `devcouncil` / `dev` CLI and eight-tool task MCP | Task tooling, integration, skills and verification; no autonomous model loop |
-| Task state | Rust `dcstore` | Cooperating-client leases and durable records, not arbitrary filesystem isolation |
-| Verification | Go task checks plus Rust `dcverify` rigor | Opt-in mode; skipped checks and missing profiles must be read explicitly |
+| Task state | Rust `dcstore` | Cooperating-client leases (schema 11), workbench tasks (schema 14), and durable records |
+| Verification | Go task checks plus Rust `dcverify` rigor | Deep scans (untracked, submodules), opaque stubs, no diff/panic secret echo |
 | Search | Rust `dcgrep` | Ignore-aware search and optional trigram index; text matches are not semantic edges |
 | Host adapters | Six hosts, one Rust table (`devmap integrate`); the Go host passes its server over `--servers-stdin` | Different outputs by host; Codex gets `[mcp_servers.devcouncil]` merged into the project `.codex/config.toml` without rewriting other bytes |
 | Engineering skills | Embedded/scaffolded instructions | Guidance, not enforced permission or proof of host loading |

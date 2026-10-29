@@ -1,9 +1,11 @@
 # One scope and import model for the JVM family (and Python's bare names)
 
-Status: Paused at commit 2, waiting on extract-v98 (Fable 2026-10-22). The branch
-`lane/jvm-scope-model` stays unmerged: the tables and `resolve_name` have no caller, so they are
-placeholders until the facts in "v98 JVM declaration facts" exist. Approved with changes (Fable,
-2026-10-21); see "Review ruling" at the end; where it conflicts with the body, the ruling wins.
+Status: Paused at commit 2. The extraction facts ("v98 JVM declaration facts":
+`jvm_decls`, `package_scopes`, `local_extents`, `decl_gaps`, `recovered_decl_ranges`) have
+landed on local `main` with `EXTRACTION_SCHEMA_VERSION = "98"` (`docs/devmap/design/extract-v98.md`).
+The resolver branch `lane/jvm-scope-model` remains unmerged pending Phase R adoption and
+un-ignoring of the 45 probes after the consumer sweep. Approved with changes (Fable, 2026-10-21);
+see "Review ruling" at the end; where it conflicts with the body, the ruling wins.
 
 Card: ft-2c800986. (Original status: design for review, no code until approved.)
 Base: `b888043d` (main). Author's evidence labels: **[V]** verified in code at the cited

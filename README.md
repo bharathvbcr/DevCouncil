@@ -33,7 +33,7 @@ DevCouncil's core runtime is a set of standalone, compiled native modules. Each 
 | Binary | Language | Role & Ownership |
 |--------|----------|------------------|
 | `devcouncil` / `dev` | **Go** | Host orchestrator: Stdio MCP server (`mcp`), multi-host agent integration (`integrate`), engineering skills distribution (`skills`), task verification (`verify`), and devmap forwarding (`map`, `graph`, `ast`). |
-| `devmap` | **Rust** | Code intelligence engine: Language-aware tree-sitter extraction and explicit fallback/coverage reporting, symbol resolution, blast-radius calculation, dead-code analysis, workspace guides (`AGENTS.md`), and DevMap MCP server (`devmap mcp`). |
+| `devmap` | **Rust** | Code intelligence engine: Language-aware tree-sitter extraction (schema 98), symbol resolution, blast-radius calculation, dead-code analysis, doc-drift auditing, workspace guides (`AGENTS.md`), and DevMap MCP server (`devmap mcp`, 21 read-only tools). |
 | `dcstore` | **Rust** | State & lease store: SQLite-backed task repository, mutual-exclusion leases for concurrent agent building, evidence records, and gap tracking. |
 | `dcverify` | **Rust** | Deterministic verification: Unified-diff parsing, planned file scope classification, anti-laziness/stub gates, test coverage evaluation, and typed `next_actions` repair signals. |
 | `dcgrep` | **Rust** | Code search: Ripgrep-powered ignore-aware search engine with optional trigram indexing (`tgrep-core`). |
@@ -62,7 +62,7 @@ flowchart TD
         TaskDB[(".devcouncil/state.sqlite (Tasks & Leases)")]
     end
 
-    Agent -->|"Code Navigation MCP"| DevMap
+    Agent -->|"Code Navigation MCP (21 tools)"| DevMap
     Agent -->|"Task & Policy MCP"| DevCouncil
     Manvi -->|"Stdio JSON IPC"| DevCouncil
     Manvi -->|"Stdio JSON IPC"| DevMap

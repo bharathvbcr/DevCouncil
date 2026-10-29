@@ -54,7 +54,7 @@ because consumers depend on all of them and none is enforced by the type system.
 Command surfaces, as the binaries themselves report them:
 
 ```
-dcstore    acquire, diagnose, release, renew, active, list, task, ready, scope-append, health
+dcstore    acquire, diagnose, release, renew, active, list, task, ready, scope-append, health, review-append, reviews, evidence-append, evidence-list, gaps, run-record
 dcverify   check, evidence-check, health
 dcgrep     search, files, index, health
 ```
