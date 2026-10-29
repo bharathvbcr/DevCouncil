@@ -51,7 +51,11 @@ fn a_called_imported_literal_constant_is_no_edge_but_a_called_function_is() {
         ),
     ]);
     assert_eq!(calls(&result, "m.ts::run"), ["c.ts::formatter"]);
-    assert!(calls(&result, "m.ts::bad").is_empty(), "{:?}", calls(&result, "m.ts::bad"));
+    assert!(
+        calls(&result, "m.ts::bad").is_empty(),
+        "{:?}",
+        calls(&result, "m.ts::bad")
+    );
 }
 
 #[test]
@@ -79,8 +83,14 @@ fn a_value_that_may_be_callable_stays_a_target() {
     // Built by a call, named from elsewhere, destructured: all unknown, all kept.
     for (name, declaration) in [
         ("hook", "export const hook = createHook();"),
-        ("alias", "import { other } from './o';\nexport const alias = other;"),
-        ("picked", "const bag = makeBag();\nexport const { picked } = bag;"),
+        (
+            "alias",
+            "import { other } from './o';\nexport const alias = other;",
+        ),
+        (
+            "picked",
+            "const bag = makeBag();\nexport const { picked } = bag;",
+        ),
     ] {
         let result = resolve(&[
             ("c.ts", declaration),

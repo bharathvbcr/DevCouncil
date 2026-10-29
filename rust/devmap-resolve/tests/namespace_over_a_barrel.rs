@@ -115,7 +115,10 @@ fn a_cycle_of_barrels_terminates_without_an_edge() {
 fn a_renaming_re_export_binds_the_declared_name() {
     let result = resolve(&[
         ("c/impl.ts", "export function original() { return 1; }\n"),
-        ("c/index.ts", "export { original as renamed } from './impl';\n"),
+        (
+            "c/index.ts",
+            "export { original as renamed } from './impl';\n",
+        ),
         (
             "consumer.ts",
             "import * as ui from './c/index';\nexport function run() { return ui.renamed(); }\n",
@@ -134,16 +137,25 @@ fn a_two_hundred_deep_chain_of_barrels_terminates_and_never_binds_a_wrong_target
     // `b0` re-exports from `b1`, … , `b199` declares `leaf`. Whatever the hop
     // cap does, it must not bind another file's `leaf`, and must not hang.
     let mut files: Vec<(String, String)> = (0..199)
-        .map(|n| (format!("deep/b{n}.ts"), format!("export * from './b{}';\n", n + 1)))
+        .map(|n| {
+            (
+                format!("deep/b{n}.ts"),
+                format!("export * from './b{}';\n", n + 1),
+            )
+        })
         .collect();
     files.push((
         "deep/b199.ts".to_string(),
         "export function leaf() { return 1; }\n".to_string(),
     ));
-    files.push(("deep/decoy.ts".to_string(), "export function leaf() { return 2; }\n".to_string()));
+    files.push((
+        "deep/decoy.ts".to_string(),
+        "export function leaf() { return 2; }\n".to_string(),
+    ));
     files.push((
         "consumer.ts".to_string(),
-        "import * as ui from './deep/b0';\nexport function run() { return ui.leaf(); }\n".to_string(),
+        "import * as ui from './deep/b0';\nexport function run() { return ui.leaf(); }\n"
+            .to_string(),
     ));
     let borrowed: Vec<(&str, &str)> = files
         .iter()

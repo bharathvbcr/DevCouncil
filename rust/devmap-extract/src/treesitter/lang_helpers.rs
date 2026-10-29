@@ -151,7 +151,9 @@ pub(super) fn js_is_literal_value(node: Node, depth: usize) -> bool {
         "template_string" => !node
             .named_children(&mut node.walk())
             .any(|child| child.kind() == "template_substitution"),
-        "parenthesized_expression" | "as_expression" | "satisfies_expression"
+        "parenthesized_expression"
+        | "as_expression"
+        | "satisfies_expression"
         | "non_null_expression" => node.named_child(0).is_some_and(literal),
         "unary_expression" => node.child_by_field_name("argument").is_some_and(literal),
         "binary_expression" => {
@@ -164,14 +166,9 @@ pub(super) fn js_is_literal_value(node: Node, depth: usize) -> bool {
         "object" => node.named_children(&mut node.walk()).all(|member| {
             member.kind() == "comment"
                 || (member.kind() == "pair"
-                    && member
-                        .child_by_field_name("key")
-                        .is_some_and(|key| {
-                            matches!(
-                                key.kind(),
-                                "property_identifier" | "string" | "number"
-                            )
-                        })
+                    && member.child_by_field_name("key").is_some_and(|key| {
+                        matches!(key.kind(), "property_identifier" | "string" | "number")
+                    })
                     && member.child_by_field_name("value").is_some_and(literal))
         }),
         _ => false,
@@ -203,7 +200,9 @@ pub(super) fn js_cjs_export_assignment<'a>(
         return None;
     }
     let names = |node: Option<Node>, expected: &str| {
-        node.is_some_and(|node| node.kind() == "identifier" && get_node_text(node, source) == expected)
+        node.is_some_and(|node| {
+            node.kind() == "identifier" && get_node_text(node, source) == expected
+        })
     };
     let is_module_exports = |node: Node| {
         node.kind() == "member_expression"

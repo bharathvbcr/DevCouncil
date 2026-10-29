@@ -91,7 +91,10 @@ fn a_renamed_destructure_binds_the_exported_function() {
             "const { resolve: presolve } = require('./util');\nfunction run() { return presolve(); }\n",
         ),
     ]);
-    assert_eq!(calls(&result, "alias/main.js::run"), ["alias/util.js::resolve"]);
+    assert_eq!(
+        calls(&result, "alias/main.js::run"),
+        ["alias/util.js::resolve"]
+    );
 }
 
 #[test]
@@ -146,17 +149,18 @@ fn an_object_export_with_a_renamed_member_binds_the_local() {
             "const { publicName } = require('./util');\nfunction run() { return publicName(); }\n",
         ),
     ]);
-    assert_eq!(calls(&result, "obj/main.js::run"), ["obj/util.js::internalName"]);
+    assert_eq!(
+        calls(&result, "obj/main.js::run"),
+        ["obj/util.js::internalName"]
+    );
 }
 
 #[test]
 fn an_exported_function_owns_the_calls_in_its_body() {
-    let result = resolve(&[
-        (
-            "own/util.js",
-            "function leaf() { return 1; }\nexports.entry = function entry() { return leaf(); };\n",
-        ),
-    ]);
+    let result = resolve(&[(
+        "own/util.js",
+        "function leaf() { return 1; }\nexports.entry = function entry() { return leaf(); };\n",
+    )]);
     assert_eq!(calls(&result, "own/util.js::entry"), ["own/util.js::leaf"]);
 }
 
@@ -230,7 +234,12 @@ fn module_exports_an_identifier_is_a_default_export_of_that_binding() {
         .filter(|export| export.exported_name == "default")
         .map(|export| export.local_name.clone())
         .collect();
-    assert_eq!(defaults, [Some("main".to_string())], "{:?}", extraction.exports);
+    assert_eq!(
+        defaults,
+        [Some("main".to_string())],
+        "{:?}",
+        extraction.exports
+    );
 }
 
 #[test]
@@ -238,7 +247,10 @@ fn a_computed_require_binds_nothing_and_a_literal_export_is_a_symbol_not_a_targe
     // `require(name)` names no file, so no edge; the sibling literal export is a
     // declared, exported, inert value.
     let result = resolve(&[
-        ("c/util.js", "exports.LIMIT = 3;\nexports.LIMIT = 4;\nexports.go = function go() {};\n"),
+        (
+            "c/util.js",
+            "exports.LIMIT = 3;\nexports.LIMIT = 4;\nexports.go = function go() {};\n",
+        ),
         (
             "c/main.js",
             "const name = './util';\n\
@@ -254,9 +266,15 @@ fn a_computed_require_binds_nothing_and_a_literal_export_is_a_symbol_not_a_targe
         calls(&result, "c/main.js::viaDynamic")
     );
     assert_eq!(calls(&result, "c/main.js::viaLiteral"), ["c/util.js::go"]);
-    let declared = symbols(&[("c/util.js", "exports.LIMIT = 3;\nexports.LIMIT = 4;\n")], "c/util.js");
+    let declared = symbols(
+        &[("c/util.js", "exports.LIMIT = 3;\nexports.LIMIT = 4;\n")],
+        "c/util.js",
+    );
     assert_eq!(
-        declared.iter().filter(|name| name.ends_with("::LIMIT")).count(),
+        declared
+            .iter()
+            .filter(|name| name.ends_with("::LIMIT"))
+            .count(),
         1,
         "assigned twice is one declaration: {declared:?}"
     );

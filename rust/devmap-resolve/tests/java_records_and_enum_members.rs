@@ -121,7 +121,12 @@ fn gaps(result: &ResolutionResult) -> String {
     result
         .unresolved
         .iter()
-        .filter(|row| !matches!(row.callee_name.as_str(), "String" | "IllegalArgumentException"))
+        .filter(|row| {
+            !matches!(
+                row.callee_name.as_str(),
+                "String" | "IllegalArgumentException"
+            )
+        })
         .map(|row| {
             format!(
                 "{} -> {}{} {:?}",
@@ -176,14 +181,22 @@ fn a_record_component_is_an_accessor_method_anchored_at_the_header() {
             Some("p/Point.java::Point")
         );
         // Line 2 is the record header.
-        assert_eq!(accessor[0].span.line_range(POINT).0, 2, "anchored to the component");
+        assert_eq!(
+            accessor[0].span.line_range(POINT).0,
+            2,
+            "anchored to the component"
+        );
     }
 }
 
 #[test]
 fn an_explicit_accessor_replaces_the_implicit_one_without_a_duplicate_identity() {
     let extractions = files(&corpus());
-    let raw = symbol(&extractions, "p/Wrapped.java", "p/Wrapped.java::Wrapped.raw");
+    let raw = symbol(
+        &extractions,
+        "p/Wrapped.java",
+        "p/Wrapped.java::Wrapped.raw",
+    );
     assert_eq!(raw.len(), 1, "two declarations of one qualified name");
     // The surviving declaration is the written method, on its own line.
     assert_eq!(raw[0].span.line_range(WRAPPED).0, 3);
@@ -217,7 +230,11 @@ public record Box(int raw) {\n\
 #[test]
 fn a_compact_constructor_is_a_constructor_of_its_record() {
     let extractions = files(&corpus());
-    let constructor = symbol(&extractions, "p/Bounds.java", "p/Bounds.java::Bounds.Bounds");
+    let constructor = symbol(
+        &extractions,
+        "p/Bounds.java",
+        "p/Bounds.java::Bounds.Bounds",
+    );
     assert_eq!(constructor.len(), 1);
     assert_eq!(constructor[0].kind, SymbolKind::Method);
     let explicit = symbol(&extractions, "p/Range.java", "p/Range.java::Range.Range");

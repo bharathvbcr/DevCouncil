@@ -86,9 +86,8 @@ pub(crate) fn extract_field_type(
     // the type around it: the owner walk below does not stop at a constructor,
     // so a constructor parameter would be typed as a field of its class. Only a
     // record component, written in the record's header, is both.
-    let java_binding = lang == "java"
-        && node.kind() != "field_declaration"
-        && !java_is_record_component(node);
+    let java_binding =
+        lang == "java" && node.kind() != "field_declaration" && !java_is_record_component(node);
     let enclosing = match owning_type_name(node, source).filter(|_| !java_binding) {
         Some(owner) => format!("{file_symbol_name}::{owner}"),
         // A Kotlin parameter, or a typed local, is the enclosing function's: the
@@ -430,11 +429,15 @@ fn java_binding_is_in_a_callable(node: Node) -> bool {
     let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         match parent.kind() {
-            "method_declaration" | "constructor_declaration" | "compact_constructor_declaration" => {
-                return true
-            }
-            "class_body" | "interface_body" | "enum_body" | "annotation_type_body"
-            | "record_declaration" | "program" => return false,
+            "method_declaration"
+            | "constructor_declaration"
+            | "compact_constructor_declaration" => return true,
+            "class_body"
+            | "interface_body"
+            | "enum_body"
+            | "annotation_type_body"
+            | "record_declaration"
+            | "program" => return false,
             _ => ancestor = bounded_parent(parent),
         }
     }

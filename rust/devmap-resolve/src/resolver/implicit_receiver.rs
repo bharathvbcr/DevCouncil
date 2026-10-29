@@ -470,8 +470,11 @@ impl Resolver {
         if imported.is_some() {
             return imported;
         }
-        let own: Vec<&(String, String)> =
-            hits.iter().copied().filter(|hit| hit.0 == call_file).collect();
+        let own: Vec<&(String, String)> = hits
+            .iter()
+            .copied()
+            .filter(|hit| hit.0 == call_file)
+            .collect();
         (!own.is_empty()).then_some(own)
     }
 

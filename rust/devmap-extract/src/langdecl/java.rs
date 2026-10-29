@@ -57,7 +57,11 @@ pub(crate) fn declaration(node: Node, source: &str) -> Option<Declaration> {
             if body_declares_accessor(record, &name, source) {
                 return None;
             }
-            return Declaration::new(SymbolKind::Function, enclosing_type_name(node, source), name);
+            return Declaration::new(
+                SymbolKind::Function,
+                enclosing_type_name(node, source),
+                name,
+            );
         }
         _ => crate::treesitter::generic_declaration(node, source)?,
     };
