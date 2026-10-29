@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use devmap_extract::model::{EdgeKind, ExtractedSymbol, Extraction};
+use devmap_extract::model::{EdgeKind, ExtractedSymbol, Extraction, SymbolKind};
 use devmap_extract::subprocess::{self, Session};
 use serde_json::{json, Value};
 
@@ -302,11 +302,22 @@ fn query_byte(source: &str, site: &UnresolvedReference) -> Option<usize> {
     Some(bytes.start)
 }
 
+/// Whether the identifier starting at `byte` in `source` is exactly `name`.
+fn names_symbol_at(source: &str, byte: usize, name: &str) -> bool {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    source.get(byte..).is_some_and(|rest| {
+        rest.strip_prefix(name)
+            .is_some_and(|after| after.chars().next().is_none_or(|c| !is_ident(c)))
+    })
+}
+
 /// Turn a server's locations into a resolution, or abstain.
 ///
 /// Rules, pinned by the adversarial tests:
-/// - zero in-repo locations that map to indexed symbols → abstain
-/// - one → `LanguageServer`
+/// - zero in-repo locations that land on the name of an indexed function or
+///   method → abstain (a type, a local, an import or a whole file is not a
+///   callee)
+/// - one → `LanguageServer`, naming the target by its qualified name
 /// - several → `LanguageServerDispatch`
 /// - locations outside the repository are already dropped by the client
 /// - never invent a `UniqueGlobal` from the callee's bare name
@@ -336,7 +347,20 @@ pub fn decide_language_server_resolution(
         else {
             continue;
         };
-        targets.insert((location.file.clone(), symbol.name.clone()));
+        // A `Calls` edge names something that runs, declared where the server
+        // pointed. Measured on this repository's Go snapshot, 88% of the pairs
+        // this pass added (3,111 of 3,536) landed on a `File` or `Struct`: a
+        // definition that is a local, a type or an import has the file or
+        // the enclosing declaration as its innermost symbol, and the old code
+        // bound the call to that. So the innermost symbol must itself be a
+        // function or method, and the location must be on its name: a local
+        // declared inside a function is also "inside" it, and is not it.
+        if !matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method)
+            || !names_symbol_at(source, start_byte, &symbol.name)
+        {
+            continue;
+        }
+        targets.insert((location.file.clone(), symbol.qualified_name.clone()));
     }
     match targets.len() {
         0 => None,

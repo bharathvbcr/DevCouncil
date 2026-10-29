@@ -113,7 +113,7 @@ fn one_in_repo_hit_that_lands_on_a_symbol_is_language_server_not_unique_global()
             ref target_file,
             ref server,
             ..
-        } if target_symbol == "helper"
+        } if target_symbol == "lib.rs::helper"
             && target_file == "lib.rs"
             && server == "rust-analyzer"
     ));
@@ -245,4 +245,79 @@ fn language_server_edges_are_calls_with_high_confidence() {
         resolution.edges[0].confidence,
         ResolutionKind::LanguageServer.confidence()
     );
+}
+
+fn kinded(file: &str, name: &str, kind: SymbolKind, start: usize, end: usize) -> ExtractedSymbol {
+    ExtractedSymbol {
+        kind,
+        ..symbol(file, name, start, end)
+    }
+}
+
+fn answer_at(file: &str, line: u32, character: u32) -> LspSiteAnswer {
+    LspSiteAnswer {
+        server: "gopls".into(),
+        server_version: "0.1".into(),
+        locations: vec![LspLocation {
+            file: file.into(),
+            line,
+            character,
+        }],
+    }
+}
+
+/// 88% of the pairs `--lsp` added on the Go snapshot targeted a `File` or a
+/// `Struct`: a definition that is a type, a local or an import has no function
+/// around it, so the innermost symbol of *any* kind was the file or the type,
+/// and the call was bound to that.
+#[test]
+fn a_definition_that_is_a_type_or_a_file_binds_nothing() {
+    let source = "package p\ntype args struct{}\nvar out args\n";
+    let file = kinded("p.go", "p.go", SymbolKind::File, 0, source.len());
+    let ty = kinded("p.go", "args", SymbolKind::Struct, 10, 29);
+    let symbols: BTreeMap<&str, Vec<&ExtractedSymbol>> =
+        BTreeMap::from([("p.go", vec![&file, &ty])]);
+    let sources = BTreeMap::from([("p.go".to_string(), source.to_string())]);
+
+    // `args` in `type args struct{}` (line 1, col 5): the struct.
+    assert!(
+        decide_language_server_resolution(&answer_at("p.go", 1, 5), &symbols, &sources).is_none()
+    );
+    // `out` in `var out args` (line 2, col 4): only the file holds it.
+    assert!(
+        decide_language_server_resolution(&answer_at("p.go", 2, 4), &symbols, &sources).is_none()
+    );
+}
+
+/// A local declared inside a function is "inside" it, and is not it: binding
+/// the call to the enclosing function would be a fabricated self-call.
+#[test]
+fn a_local_declared_inside_a_function_does_not_bind_to_that_function() {
+    let source = "package p\nfunc outer() {\n\thandler := func() {}\n\thandler()\n}\n";
+    let file = kinded("p.go", "p.go", SymbolKind::File, 0, source.len());
+    let outer = kinded("p.go", "outer", SymbolKind::Function, 10, source.len() - 1);
+    let symbols: BTreeMap<&str, Vec<&ExtractedSymbol>> =
+        BTreeMap::from([("p.go", vec![&file, &outer])]);
+    let sources = BTreeMap::from([("p.go".to_string(), source.to_string())]);
+    // `handler` at line 2, column 1.
+    assert!(
+        decide_language_server_resolution(&answer_at("p.go", 2, 1), &symbols, &sources).is_none()
+    );
+}
+
+/// The target is stored by its qualified name, as every other rung stores it,
+/// so the edge joins the node the store holds; a method keeps its type.
+#[test]
+fn a_method_target_is_stored_by_its_qualified_name() {
+    let source = "package p\nfunc (s *S) Close() {}\n";
+    let mut method = kinded("p.go", "Close", SymbolKind::Method, 10, source.len() - 1);
+    method.qualified_name = "p.go::S.Close".into();
+    let symbols: BTreeMap<&str, Vec<&ExtractedSymbol>> = BTreeMap::from([("p.go", vec![&method])]);
+    let sources = BTreeMap::from([("p.go".to_string(), source.to_string())]);
+    let decided = decide_language_server_resolution(&answer_at("p.go", 1, 12), &symbols, &sources)
+        .expect("a method's own name binds");
+    assert!(matches!(
+        decided,
+        Resolution::LanguageServer { ref target_symbol, .. } if target_symbol == "p.go::S.Close"
+    ));
 }
