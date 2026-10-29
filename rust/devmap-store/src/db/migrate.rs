@@ -239,6 +239,27 @@ impl Store {
         Ok(())
     }
 
+    /// Add `payload_digest` to a store stamped 28 by the first v28 prototype,
+    /// which had no such column.
+    ///
+    /// The same case as an index added to the fresh schema within a version
+    /// number ([`Self::heal_declared_indexes`]): the ladder runs no rung for a
+    /// store already at the current version, and the declared index over the
+    /// missing column would otherwise fail the open with a bare "no such
+    /// column". The digests are stamped from the stored documents, as the
+    /// v27 rung does, and the old identity index goes, so the store is the one
+    /// a fresh open would have made. Nothing to do for any other store.
+    fn heal_payload_digest(conn: &Connection) -> Result<()> {
+        if Self::has_column(conn, "file_payloads", "payload_digest")? {
+            return Ok(());
+        }
+        conn.execute_batch(
+            "ALTER TABLE file_payloads ADD COLUMN payload_digest BLOB NOT NULL DEFAULT x'';
+             DROP INDEX IF EXISTS idx_file_payloads_identity;",
+        )?;
+        Self::backfill_payload_digests(conn)
+    }
+
     /// Hand every free page back to the filesystem, stepping the pragma to
     /// exhaustion (it frees one page per row stepped, and `execute_batch`
     /// steps once). A store whose `auto_vacuum` is not incremental has nothing
@@ -972,8 +993,9 @@ impl Store {
         if version != CURRENT_SCHEMA_VERSION {
             return Err(Self::unsupported_schema(store, version));
         }
-        // A store already at the current version can still be missing an
-        // index a later build of the same version added to the fresh schema.
+        // A store already at the current version can still be missing what a
+        // later build of the same version added to the fresh schema.
+        Self::heal_payload_digest(conn)?;
         Self::heal_declared_indexes(conn)?;
         Self::stamp_reader_compat(conn)?;
         Self::validate_schema(conn)?;

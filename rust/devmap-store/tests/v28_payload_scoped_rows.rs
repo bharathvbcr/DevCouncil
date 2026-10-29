@@ -1368,3 +1368,46 @@ fn a_secret_file_rebuilt_unchanged_is_the_same_payload() {
         let _ = fs::remove_dir_all(&dir);
     }
 }
+
+/// A store the first v28 prototype wrote is stamped 28 and has no
+/// `payload_digest`. It opens, is given the digests the writer would have
+/// stamped, and its next full build reuses every payload.
+#[test]
+fn a_store_from_the_first_v28_prototype_is_healed_on_open() {
+    let dir = tmp_dir("prototype-heal");
+    let db = dir.join("devmap.sqlite");
+    let digests = {
+        let store = Store::open(&db).unwrap();
+        history(&store);
+        payload_digests(&db)
+    };
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_file_payloads_digest_identity;
+             ALTER TABLE file_payloads DROP COLUMN payload_digest;
+             CREATE UNIQUE INDEX idx_file_payloads_identity
+                 ON file_payloads(file_id, content_hash, language,
+                                  COALESCE(grammar_version, ''),
+                                  COALESCE(analyzer_version, ''));",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&db).expect("a prototype store opens");
+    assert_eq!(payload_digests(&db), digests);
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'idx_file_payloads_identity'"
+        ),
+        0
+    );
+    let payloads = count(&db, "SELECT COUNT(*) FROM file_payloads");
+    commit(&store, &tree(8, |index| usize::from(index == 2)), &[], &[]);
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM file_payloads"),
+        payloads,
+        "a full build of the current tree reuses what the healed digests name"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
