@@ -634,6 +634,14 @@ impl Resolver {
                 .copied()
                 .filter(|first| visible.iter().all(|hit| hit == first));
         }
+        // JS/TS: the module's own scope says which namesake is meant.
+        let all: Vec<&(String, String)> = hits.iter().collect();
+        if let Some(scoped) = self.js_module_scoped_hits(&ext.file_path, class_type, &all) {
+            return scoped
+                .first()
+                .copied()
+                .filter(|first| scoped.iter().all(|hit| hit == first));
+        }
         // Overloads of one method are several hits that name one identity
         // (`add(Int)` / `add(String)` both mint `Calc.add`): one target.
         if let Some(first) = hits

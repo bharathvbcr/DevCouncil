@@ -217,6 +217,8 @@ mod typescript_object_spread;
 #[cfg(feature = "parse")]
 mod typescript_object_spread_attack;
 #[cfg(feature = "parse")]
+mod ts_module_scoped_types;
+#[cfg(feature = "parse")]
 mod unresolved_member;
 
 /// Files that keep a process of their own, and why (see the file's header).

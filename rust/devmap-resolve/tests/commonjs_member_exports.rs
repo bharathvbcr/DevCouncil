@@ -232,3 +232,32 @@ fn module_exports_an_identifier_is_a_default_export_of_that_binding() {
         .collect();
     assert_eq!(defaults, [Some("main".to_string())], "{:?}", extraction.exports);
 }
+
+#[test]
+fn a_computed_require_binds_nothing_and_a_literal_export_is_a_symbol_not_a_target() {
+    // `require(name)` names no file, so no edge; the sibling literal export is a
+    // declared, exported, inert value.
+    let result = resolve(&[
+        ("c/util.js", "exports.LIMIT = 3;\nexports.LIMIT = 4;\nexports.go = function go() {};\n"),
+        (
+            "c/main.js",
+            "const name = './util';\n\
+             const dyn = require(name);\n\
+             const { LIMIT, go } = require('./util');\n\
+             function viaDynamic() { return dyn.go(); }\n\
+             function viaLiteral() { return go() + LIMIT(); }\n",
+        ),
+    ]);
+    assert!(
+        calls(&result, "c/main.js::viaDynamic").is_empty(),
+        "{:?}",
+        calls(&result, "c/main.js::viaDynamic")
+    );
+    assert_eq!(calls(&result, "c/main.js::viaLiteral"), ["c/util.js::go"]);
+    let declared = symbols(&[("c/util.js", "exports.LIMIT = 3;\nexports.LIMIT = 4;\n")], "c/util.js");
+    assert_eq!(
+        declared.iter().filter(|name| name.ends_with("::LIMIT")).count(),
+        1,
+        "assigned twice is one declaration: {declared:?}"
+    );
+}

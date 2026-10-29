@@ -128,3 +128,31 @@ fn a_renaming_re_export_binds_the_declared_name() {
         result.unresolved
     );
 }
+
+#[test]
+fn a_two_hundred_deep_chain_of_barrels_terminates_and_never_binds_a_wrong_target() {
+    // `b0` re-exports from `b1`, … , `b199` declares `leaf`. Whatever the hop
+    // cap does, it must not bind another file's `leaf`, and must not hang.
+    let mut files: Vec<(String, String)> = (0..199)
+        .map(|n| (format!("deep/b{n}.ts"), format!("export * from './b{}';\n", n + 1)))
+        .collect();
+    files.push((
+        "deep/b199.ts".to_string(),
+        "export function leaf() { return 1; }\n".to_string(),
+    ));
+    files.push(("deep/decoy.ts".to_string(), "export function leaf() { return 2; }\n".to_string()));
+    files.push((
+        "consumer.ts".to_string(),
+        "import * as ui from './deep/b0';\nexport function run() { return ui.leaf(); }\n".to_string(),
+    ));
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, body)| (path.as_str(), body.as_str()))
+        .collect();
+    let result = resolve(&borrowed);
+    let found = calls(&result, "consumer.ts::run");
+    assert!(
+        found.is_empty() || found == ["deep/b199.ts::leaf"],
+        "a deep chain binds the declaring file or nothing, got {found:?}"
+    );
+}
