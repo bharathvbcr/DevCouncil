@@ -174,3 +174,33 @@ All spans were added in `rust/devmap-store/src/db/write.rs` (not committed). Eac
 - total.
 
 The cache variant wraps `tx.prepare_cached(sql)?.execute(params)` around the two fresh-row INSERTs.
+
+## Appendix B: v28 prototype results (branch `lane/store-v28`, 2026-10-29)
+
+Status: a branch prototype of §7, not merged, not released. Base `dbd0193a` (schema 27, floor 25); branch schema 28, reader floor **28** (the views keep every v27 column, but the `nodes_fts` rowid no longer carries a generation, so a v27 reader would join it by the old arithmetic and answer from the wrong rows without an error; a floor of 28 makes it refuse instead).
+
+**Shape.** `payload_nodes`, `payload_literals` and the `nodes_fts` rows are written once per payload (rowid `payload_id << 24 | ord_in_file`); `file_rows` and `digest_rows` are validity ranges; `generation_nodes`, `generation_literals`, `generation_file_rows`, `generation_file_digests` and `nodes_fts_map` are views with the v27 column sets. `generation_dead_symbols` and `generation_coverage_gaps` stay per generation. Retention collects a payload with everything derived from it when no retained range names it.
+
+**Interleaved bench.** Release builds, `RAYON_NUM_THREADS=4`, `git archive` snapshots, 5 rounds, base and branch alternating order per round, each on a fresh copy walking cold, then three one-file appends. Load average 12-29 throughout (other lanes were running), so wall figures are inflated and noisy; instructions retired are not.
+
+| | DevCouncil (2,816 files) | GitPulse (~3,900 files) |
+|---|---|---|
+| per-edit median wall, 15 edits per arm | 2.70 -> 1.70 s (-37.0%) | 5.29 -> 3.58 s (-32.3%) |
+| per-edit min wall | 1.96 -> 1.36 s (-30.6%) | 3.05 -> 2.83 s (-7.2%) |
+| first edit after cold, median | 2.14 -> 1.63 s (-23.8%) | 3.98 -> 3.03 s (-23.9%) |
+| steady-state edits (2nd, 3rd), median | 2.82 -> 1.80, 2.86 -> 1.70 s | 5.51 -> 3.65, 5.42 -> 3.95 s |
+| per-edit median instructions | 49.98 -> 40.02 G (-19.9%) | 96.53 -> 80.36 G (-16.8%) |
+| `persist:write` per edit, median | 1.59 -> 0.46 s | 2.68 -> 1.02 s |
+| paired edits where the branch was faster | 15/15 | 15/15 |
+| cold wall, min / instructions, min | 7.63 -> 7.20 s / 263.4 -> 262.4 G | 13.57 -> 13.01 s / 511.1 -> 509.7 G |
+| cold peak RSS, min | 1145 -> 1160 MB | 2085 -> 2101 MB |
+| store after cold, median | 352 -> 348 MB | 593 -> 586 MB |
+| store after 3 edits, median | 427 -> 356 MB | 686 -> 600 MB |
+
+The first edit after a cold build pays less because the base store holds one generation and the retention prune has nothing to delete yet; the steady state of a long-lived store is edits 2 and onward. Neither corpus reaches the card's absolute 786 ms. The gate as written (per-edit median improved by 30% or more) is met on both corpora at this load, and the instruction counts, which load does not move, agree in direction at about -17% to -20%. The projection in §7 (27-29%) was low on wall and high on instructions: the prune of the previous generation's copy of every relation (0.57 s on v27) is gone as well as the carry.
+
+**Read side.** Nine interleaved runs per command on the DevCouncil store: `search` -10.1% instructions, `explore` +0.8%, `impact` +1.0%, `dead` +2.3%, `clones` +3.4%, `status` +3.7%, `literals --exact` +12.7% (107 -> 120 M instructions, below the wall-clock resolution), wall unchanged at the 10 ms the timer reports.
+
+**Identity.** Sorted rows of the five compatibility views plus `generation_dead_symbols`, `generation_edges` and the `nodes_fts` join, for the latest and the previous generation, and normalised JSON of `status`, `dead`, `clones`, `search`, `search --semantic`, `explore`, `impact`, `literals` (substring and exact) for fixed symbols, at cold, one-file edit, second edit, revert, delete and full rebuild: three corpora, 1,522 files compared, 0 differ. Fields dropped from the comparison, each because it names the arm and not the store: `db_path`, `root`, `pid`, `unix_ms`, `binary_path`, `binary_version`, `schema_version`, `expected_schema_version` and the artifact paths; floats rounded to three places. The semantic ranker is not deterministic between builds of one binary (it sums over `HashMap`s in per-process order), so its answers are compared as the set of items scoring 0.5 or more: base against a second base run differs in 2 of 96 answers, base against branch in 1 of 96 on DevCouncil and 0 of 96 on the other two.
+
+**Migration.** A real v27 store (427 MB, written by the base binary) opens under the branch, migrates in under 0.3 s, and every generation then reads what it read before. A `kill -9` that landed mid-migration (820 KB of uncommitted WAL) left user_version 27, integrity ok, no v28 table, and the base binary still answering from it; the retry completed and read identically. A v27 binary against a v28 store refuses on every query command and on `build` (`schema version 28 can be read only by a reader at schema 28 or newer`), and its `status` reports `reader_ready: false` and names the schema skew.

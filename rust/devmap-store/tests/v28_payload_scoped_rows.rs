@@ -655,6 +655,91 @@ fn a_reader_against_a_writing_and_pruning_writer_sees_one_generation() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A snapshot held open across the writer's commits and the retention prune
+/// keeps reading the generation it began on: the prune deletes the payload rows
+/// and full-text entries that generation named, and the reader, which SQLite
+/// serves from the pages as they were when it began, still finds every one.
+///
+/// The other half of "GC racing a reader": the test above reads between writes,
+/// this one reads *across* them.
+#[test]
+fn a_snapshot_held_across_commits_and_prunes_keeps_reading_its_generation() {
+    let dir = tmp_dir("held-snapshot");
+    let db = dir.join("devmap.sqlite");
+    let writer = Store::open(&db).unwrap();
+    let revision = |n: usize| tree(6, move |index| if index == 4 { n } else { 0 });
+    let first = commit(&writer, &revision(0), &[], &[]);
+
+    let mut reader = Connection::open(&db).unwrap();
+    let snapshot = reader.transaction().unwrap();
+    let before = {
+        let mut stmt = snapshot
+            .prepare(
+                "SELECT 'node|' || n.qualified_name || '|' || n.span_start
+                   FROM generation_nodes n WHERE n.generation_id = ?1
+                 UNION ALL
+                 SELECT 'fts|' || f.qualified_name
+                   FROM nodes_fts_map m JOIN nodes_fts f ON f.rowid = m.rowid_ref
+                  WHERE m.generation_id = ?1
+                 UNION ALL
+                 SELECT 'literal|' || l.value FROM generation_literals l
+                  WHERE l.generation_id = ?1
+                 ORDER BY 1",
+            )
+            .unwrap();
+        stmt.query_map([first], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        before.len() > 20,
+        "the snapshot must hold something to lose"
+    );
+
+    // Enough generations that revision 0's payload for mod_4 is pruned and
+    // collected, and its rows with it.
+    for n in 1..6 {
+        commit(&writer, &revision(n), &["pkg/mod_4.py"], &[]);
+        writer.prune_generations_except_latest(2).unwrap();
+    }
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT COUNT(*) FROM generations WHERE id = {first}")
+        ),
+        0,
+        "the generation the reader began on is gone for every new connection"
+    );
+
+    let after = {
+        let mut stmt = snapshot
+            .prepare(
+                "SELECT 'node|' || n.qualified_name || '|' || n.span_start
+                   FROM generation_nodes n WHERE n.generation_id = ?1
+                 UNION ALL
+                 SELECT 'fts|' || f.qualified_name
+                   FROM nodes_fts_map m JOIN nodes_fts f ON f.rowid = m.rowid_ref
+                  WHERE m.generation_id = ?1
+                 UNION ALL
+                 SELECT 'literal|' || l.value FROM generation_literals l
+                  WHERE l.generation_id = ?1
+                 ORDER BY 1",
+            )
+            .unwrap();
+        stmt.query_map([first], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        after, before,
+        "a held snapshot reads the generation it began on, whatever was pruned since"
+    );
+    drop(snapshot);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A file with 50,000 literal sites: the literals are written once, found by
 /// value, and never rewritten by an edit elsewhere.
 ///
