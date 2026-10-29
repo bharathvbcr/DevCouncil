@@ -845,6 +845,12 @@ pub const SWIFT_COMPUTED_PROPERTY: &str = "computed property";
 /// See [`SWIFT_STORED_PROPERTY`].
 pub const SWIFT_PROPERTY_REQUIREMENT: &str = "property requirement";
 
+/// The `signature` of a JS/TS module-scope `Variable` whose initializer is a
+/// literal and nothing else — a number, a string, a regular expression, or an
+/// array or object of those. Nothing such a value holds can be called, so the
+/// resolver refuses a `Calls` edge to it.
+pub const JS_LITERAL_CONSTANT: &str = "literal constant";
+
 impl ExtractedSymbol {
     /// Whether this is a Swift member property (stored, computed or a protocol
     /// requirement), as opposed to an enum case, which shares `Field`.

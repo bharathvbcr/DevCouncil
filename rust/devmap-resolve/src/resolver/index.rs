@@ -22,6 +22,7 @@ impl Resolver {
         self.reexport_glob_cutoff = None;
         self.rust_module_globs.clear();
         self.default_exports.clear();
+        self.inert_values.clear();
         self.receiver_types.clear();
         self.scoped_receiver_types.clear();
         self.poisoned_receiver_keys.clear();
@@ -1498,6 +1499,7 @@ impl Resolver {
                 }
             }
             self.index_module_value_types(ext, family);
+            self.index_inert_values(ext, family);
             self.index_js_objects(ext);
             // A `let x = self.field` (including through `if` / `&`) takes the
             // field's type, so `x.run()` can dispatch. Field `Type` references
@@ -1915,6 +1917,20 @@ impl Resolver {
             else {
                 continue;
             };
+            // `export { local as Public }` and `exports.Public = local`: the
+            // module publishes `Public` and a binding of its own is what it
+            // names, so the hop stays in this file. Without it an importer of
+            // `Public` asked a file that declares no such name.
+            if local != export.exported_name
+                && self
+                    .file_symbols
+                    .get(&ext.file_path)
+                    .is_some_and(|symbols| symbols.iter().any(|symbol| symbol == local))
+            {
+                hops.entry(format!("{}::{}", ext.file_path, export.exported_name))
+                    .or_insert((ext.file_path.clone(), local.to_string()));
+                continue;
+            }
             for imp in &ext.imports {
                 let imported = if imp.imported_names.is_empty() {
                     // A default import: `import X from './m'`.

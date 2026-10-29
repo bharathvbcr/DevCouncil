@@ -18,6 +18,8 @@
 #[cfg(feature = "parse")]
 mod a_field_types_its_receiver;
 #[cfg(feature = "parse")]
+mod a_literal_constant_is_not_a_call_target;
+#[cfg(feature = "parse")]
 mod a_prelude_type_receiver_is_not_a_value;
 #[cfg(feature = "parse")]
 mod a_receiver_call_never_binds_by_bare_name;
@@ -39,6 +41,8 @@ mod bundler_aliases_map_imports;
 mod calls_target_callables_only;
 #[cfg(feature = "parse")]
 mod captured_receiver_attribution;
+#[cfg(feature = "parse")]
+mod commonjs_member_exports;
 #[cfg(feature = "parse")]
 mod commonjs_require_bindings;
 #[cfg(feature = "parse")]

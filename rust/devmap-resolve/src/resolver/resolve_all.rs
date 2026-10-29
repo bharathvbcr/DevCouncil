@@ -884,6 +884,19 @@ impl Resolver {
                             read_scope(call.caller_symbol.as_deref(), &call.span).as_deref(),
                             &call.callee_name,
                         ) {
+                            // A whole-module handle called as a function is the
+                            // module's own value, which is what its default
+                            // export names: `const run = require('./util');
+                            // run()` against `module.exports = main`. A
+                            // namespace object is not callable, so the call can
+                            // only mean that value.
+                            let target_sym = if target_sym == "*" && family == LangFamily::JsTs {
+                                self.default_exports
+                                    .get(target_f)
+                                    .unwrap_or(target_sym)
+                            } else {
+                                target_sym
+                            };
                             if let Some((resolved_file, resolved_sym)) =
                                 self.lookup_in_package(target_f, target_sym)
                             {
@@ -2246,6 +2259,14 @@ impl Resolver {
                 && left.resolution == right.resolution
                 && left.details == right.details
         });
+
+        // A call is not an edge to a value nothing can run.
+        if !self.inert_values.is_empty() {
+            edges.retain(|edge| {
+                edge.edge_kind != EdgeKind::Calls
+                    || !self.inert_values.contains(edge.target_symbol.as_str())
+            });
+        }
 
         // R4: emission order must not depend on input iteration order.
         unresolved.sort_by(|left, right| {

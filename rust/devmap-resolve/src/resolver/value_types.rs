@@ -37,6 +37,34 @@ impl Resolver {
     /// reassignment in the extraction, so it withdraws the answer too; that
     /// costs an abstention, where reading it the other way would cost a
     /// confidently wrong edge.
+    /// Record the module-scope JS/TS values nothing can call.
+    ///
+    /// A `Variable` the extractor tagged [`devmap_extract::model::JS_LITERAL_CONSTANT`]
+    /// holds a number, a string, a regular expression, or an array or object of
+    /// such: none is callable, so an edge `Calls` it is a false one. The import rung bound
+    /// `import { DEFAULT_SCOPE } from './x'; DEFAULT_SCOPE()` to the constant,
+    /// and a bundler alias or a barrel made the same shape reachable through
+    /// more specifiers.
+    ///
+    /// Only a declaration the extractor read as literal is recorded. `const hook =
+    /// createHook()`, `const alias = other` and `const { a } = obj` all carry a
+    /// call or a name, so they stay targets: what they hold is not known.
+    pub(super) fn index_inert_values(&mut self, ext: &Extraction, family: LangFamily) {
+        if family != LangFamily::JsTs {
+            return;
+        }
+        for symbol in &ext.symbols {
+            if symbol.kind != SymbolKind::Variable
+                || symbol.parent_symbol.as_deref() != Some(ext.file_path.as_str())
+            {
+                continue;
+            }
+            if symbol.signature.as_deref() == Some(devmap_extract::model::JS_LITERAL_CONSTANT) {
+                self.inert_values.insert(symbol.qualified_name.clone());
+            }
+        }
+    }
+
     pub(super) fn index_module_value_types(&mut self, ext: &Extraction, family: LangFamily) {
         let mut declarations: BTreeMap<&str, Vec<&Span>> = BTreeMap::new();
         for symbol in &ext.symbols {

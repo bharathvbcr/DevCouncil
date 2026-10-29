@@ -120,8 +120,126 @@ pub(super) fn js_function_valued_member(function: Node, source: &str) -> Option<
             js_object_member_owner(function)?;
             js_pair_key(parent, source)
         }
+        // `exports.helper = function helper() { … }`: the function is the
+        // export, named the way the symbol emitter names it.
+        "assignment_expression" => {
+            let (exported, value) = js_cjs_export_assignment(parent, source)?;
+            if value.id() != function.id() {
+                return None;
+            }
+            js_cjs_function_name(exported.as_deref(), function, source)
+        }
         _ => None,
     }
+}
+
+/// Whether an initializer is a literal and nothing else: a number, a string, a
+/// template with no substitution, a regular expression, a boolean or `null`, or
+/// an array or object whose every element is one, under the operators that
+/// stay inside them (`-1`, `60 * 60`, `'a' + 'b'`, `as const`).
+///
+/// A name, a call, a spread, a shorthand property, a function or a template
+/// substitution is something a value could be built from, so it is not literal.
+/// Bounded in depth.
+pub(super) fn js_is_literal_value(node: Node, depth: usize) -> bool {
+    if depth > 16 {
+        return false;
+    }
+    let literal = |child: Node| js_is_literal_value(child, depth + 1);
+    match node.kind() {
+        "string" | "number" | "true" | "false" | "null" | "regex" => true,
+        "template_string" => !node
+            .named_children(&mut node.walk())
+            .any(|child| child.kind() == "template_substitution"),
+        "parenthesized_expression" | "as_expression" | "satisfies_expression"
+        | "non_null_expression" => node.named_child(0).is_some_and(literal),
+        "unary_expression" => node.child_by_field_name("argument").is_some_and(literal),
+        "binary_expression" => {
+            node.child_by_field_name("left").is_some_and(literal)
+                && node.child_by_field_name("right").is_some_and(literal)
+        }
+        "array" => node
+            .named_children(&mut node.walk())
+            .all(|element| element.kind() == "comment" || literal(element)),
+        "object" => node.named_children(&mut node.walk()).all(|member| {
+            member.kind() == "comment"
+                || (member.kind() == "pair"
+                    && member
+                        .child_by_field_name("key")
+                        .is_some_and(|key| {
+                            matches!(
+                                key.kind(),
+                                "property_identifier" | "string" | "number"
+                            )
+                        })
+                    && member.child_by_field_name("value").is_some_and(literal))
+        }),
+        _ => false,
+    }
+}
+
+/// A top-level CommonJS export assignment: what it publishes and the value it
+/// publishes. `exports.x = v` and `module.exports.x = v` publish `x`
+/// (`Some("x")`); `module.exports = v` publishes the module's whole value
+/// (`None`).
+///
+/// Only a statement at module level: an assignment inside a function, a block or
+/// a class runs conditionally or later, and publishing it as the module's export
+/// would state what the file does not promise. A chained assignment
+/// (`a = exports.x = v`) and a computed key (`exports['x']`) are not read.
+pub(super) fn js_cjs_export_assignment<'a>(
+    node: Node<'a>,
+    source: &str,
+) -> Option<(Option<String>, Node<'a>)> {
+    if node.kind() != "assignment_expression" {
+        return None;
+    }
+    if bounded_parent(node)?.kind() != "expression_statement" || !is_module_level(node) {
+        return None;
+    }
+    let left = node.child_by_field_name("left")?;
+    let right = node.child_by_field_name("right")?;
+    if left.kind() != "member_expression" {
+        return None;
+    }
+    let names = |node: Option<Node>, expected: &str| {
+        node.is_some_and(|node| node.kind() == "identifier" && get_node_text(node, source) == expected)
+    };
+    let is_module_exports = |node: Node| {
+        node.kind() == "member_expression"
+            && names(node.child_by_field_name("object"), "module")
+            && node
+                .child_by_field_name("property")
+                .is_some_and(|property| get_node_text(property, source) == "exports")
+    };
+    if is_module_exports(left) {
+        return Some((None, right));
+    }
+    let object = left.child_by_field_name("object")?;
+    let property = left.child_by_field_name("property")?;
+    let rooted = names(Some(object), "exports") || is_module_exports(object);
+    (rooted && property.kind() == "property_identifier")
+        .then(|| (Some(get_node_text(property, source)), right))
+}
+
+/// The symbol name of a function a CommonJS export assignment publishes: the
+/// function's own name when it has one (`exports.default = function
+/// defaultHelper() {}` declares `defaultHelper`), else the exported name. An
+/// anonymous function published as the whole module has no name to give.
+pub(super) fn js_cjs_function_name(
+    exported: Option<&str>,
+    function: Node,
+    source: &str,
+) -> Option<String> {
+    if !matches!(
+        function.kind(),
+        "function_expression" | "generator_function" | "arrow_function"
+    ) {
+        return None;
+    }
+    get_child_text(function, "name", source)
+        .filter(|name| !name.is_empty())
+        .or_else(|| exported.map(str::to_string))
 }
 
 /// The name a class field declares. TypeScript calls the field `name`,

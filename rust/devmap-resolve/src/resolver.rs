@@ -494,6 +494,11 @@ pub struct Resolver {
     /// value import is typed by in another file, which is the whole shape of a
     /// singleton service: declared once, called everywhere else.
     module_value_types: BTreeMap<(String, String), String>,
+    /// Qualified names of the JS/TS module-scope values the extractor read as a
+    /// literal — `export const LIMIT = 3`, `const SCOPE = 'project'`,
+    /// `const TABLE = { a: 1 }`. Nothing a call could run: a `LIMIT()` is not a
+    /// call to it. See `index_inert_values`.
+    inert_values: BTreeSet<String>,
     /// `(file, name)` → the names a module-scope value's **own declaration**
     /// carries: the shorthand properties of `export const api = { get, post }`
     /// and the methods written inside `export const log = { info() {…} }`.
@@ -794,6 +799,7 @@ impl Resolver {
             import_bindings: BTreeMap::new(),
             value_imports: BTreeMap::new(),
             module_value_types: BTreeMap::new(),
+            inert_values: BTreeSet::new(),
             module_value_members: BTreeMap::new(),
             js_objects: BTreeMap::new(),
             return_types: BTreeMap::new(),
