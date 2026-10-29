@@ -437,7 +437,10 @@ pub(super) fn collect_site_bindings(
     imports: &[ExtractedImport],
 ) -> Vec<LocalBinding> {
     let fixtures = python_fixture_names(root, source, imports);
-    let declared_types = binding_declared_types(references);
+    let mut declared_types = binding_declared_types(references);
+    if lang == "java" {
+        drop_conflicting_java_types(&mut declared_types, references);
+    }
     let mut initializers = binding_initializers(references, calls);
     collapse_initializers_to_statements(root, &mut initializers);
     let mut sites = BTreeSet::new();
@@ -480,7 +483,7 @@ pub(super) fn collect_site_bindings(
         let mut ancestor = bounded_parent(node);
         while let Some(scope) = ancestor {
             let swift_scope = lang == "swift" && crate::swiftscope::is_scope(scope);
-            if is_callable_node(scope) || swift_scope {
+            if is_callable_node(scope) || swift_scope || java_constructor(lang, scope) {
                 // Python defaults run in the enclosing scope. The parameter's
                 // own declaration is still a binding site, but its value is not.
                 let in_default = scope.kind() == "function_definition"
@@ -579,7 +582,8 @@ pub(super) fn collect_site_bindings(
                                 break;
                             }
                             let named_scope = callable_binding_name(scope, source).is_some()
-                                || is_c_family_callable(scope);
+                                || is_c_family_callable(scope)
+                                || lang == "java";
                             let scope_name = named_scope
                                 .then(|| {
                                     scope.child(0).and_then(|child| {
@@ -589,7 +593,7 @@ pub(super) fn collect_site_bindings(
                                         // walk would answer `F::m`, so the binding
                                         // would never meet the type facts keyed by
                                         // the emitted identity.
-                                        if lang == "kotlin" {
+                                        if matches!(lang, "kotlin" | "java") {
                                             crate::langcalls::scope::enclosing_emitted_symbol(
                                                 child,
                                                 source,
@@ -1016,6 +1020,46 @@ pub(super) fn assignment_is_conditional(region: Node, start: usize, use_start: u
         node = parent;
     }
     false
+}
+
+/// A Java constructor is a scope of its own: its parameters bind there, and a
+/// call written in its body reports it as the caller.
+///
+/// Not part of [`is_callable_node`], which is shared with grammars where the
+/// same node kind means something else (C# has a `constructor_declaration` too,
+/// and widening the shared predicate would move its scopes).
+fn java_constructor(lang: &str, node: Node) -> bool {
+    lang == "java" && node.kind() == "constructor_declaration"
+}
+
+/// Withdraw every Java binding written with two different types.
+///
+/// `binding_declared_types` keeps the first type a `(callable, name)` pair is
+/// declared with, which is right when a name is declared once. Java reuses a
+/// name freely across sibling blocks (`for (A item : a) {…}` then
+/// `for (B item : b) {…}`), and the first would then type every use of the
+/// second: a deterministic edge to a method of the wrong class. A name with
+/// conflicting declarations has no single type at a use site this pass cannot
+/// place, so it has none.
+fn drop_conflicting_java_types(
+    declared_types: &mut HashMap<(Option<String>, String), String>,
+    references: &[ExtractedReference],
+) {
+    for reference in references {
+        if reference.kind != ReferenceKind::Type {
+            continue;
+        }
+        let Some(bound) = reference.assigned_to.as_ref() else {
+            continue;
+        };
+        let key = (reference.enclosing_symbol.clone(), bound.clone());
+        if declared_types
+            .get(&key)
+            .is_some_and(|first| *first != reference.name)
+        {
+            declared_types.remove(&key);
+        }
+    }
 }
 
 pub(super) fn binding_declared_type_for(
