@@ -74,7 +74,7 @@ These are extractor-output changes. Per `extract-v98.md` ground rule 1, they are
 | F4 | A construction-receiver initializer shape for `let x = T(..).f()` (§6) | ft-4ca45b19 resume 1 |
 | F5 | The existential Type ref for `any P` / `some P` (§6) | ft-9b28adab item 3, only if fan-out is chosen (Q4) |
 
-Whether F1–F5 ride the open 98 or wait for 99 is the owner's push decision (Fable 45; ft-e3c6ff8f). See Q1. **Heritage paths need no new fact.** The reference name already carries the written spelling; the resolver discards the qualifier at `index.rs:1281-1288` [V]. Keeping `Outer.Base` whole is a resolver-only change.
+Whether F1–F5 ride the open 98 or wait for 99 is the owner's push decision (Fable 45; ft-e3c6ff8f). See Q1. **Heritage paths need an extractor change (corrected by Fable ruling 132, Wave 10).** This note first said the reference name carries the written spelling, so keeping `Outer.Base` whole would be a resolver-only change. That is wrong. The extractor cuts a qualified supertype such as `N.Base` to `Base` at `heritage.rs:213-215`, because `user_type` is terminal at `:268`. The resolver cuts it again at `index.rs:1281-1288`. The qualifier never reaches the resolver, so carrying it is an extract-payload change inside the open 98 bundle, gated on Q1. Lane M-resume parked on exactly this. Its attack tests msr_03/04 cover `class C: N.Base` beside a same-file local `Base`.
 
 ## 2. Access control
 
@@ -242,7 +242,7 @@ The test files are the acceptance tests. A row resumes only when every listed te
 ## 8. Corpus-diff discipline for Swift lanes
 
 1. **Run before review, not after** (ruling 55 owner note).
-   - Script: `scratchpad/corpus/run5.sh`. The `REPOS` default is **15 repos**: ChronosFlow, Meridian, Graft, Vani, Curio, M5Blade, GitPulse, Strait, Blitztree, gusset, ojas, scholarlm, DevCouncil, AppLock, DevType.
+   - Script: the lead's corpus-diff script. It is session-local and not committed, so the lane brief supplies it. The `REPOS` default is **15 repos**: ChronosFlow, Meridian, Graft, Vani, Curio, M5Blade, GitPulse, Strait, Blitztree, gusset, ojas, scholarlm, DevCouncil, AppLock, DevType.
    - Each repo is a `git archive HEAD` snapshot built cold with `build --full` and a fresh `--db`.
    - Set `C=` to a lane-private directory whenever another run may be live, because `$C/out` is shared.
    - The baseline is `bench/tgt-main782`: `BASE=main782 LAND=<lane> SUMMARY=<lane> C=… bash run5.sh`.
