@@ -85,64 +85,86 @@ fn quarantined(root: &Path) -> Vec<PathBuf> {
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .filter(|path| {
-            path.file_name()
-                .is_some_and(|name| name.to_string_lossy().contains(".corrupt-"))
+            // The main file of each quarantine, not its `-wal` / `-shm` sidecars.
+            path.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.contains(".corrupt-") && !name.ends_with("-wal") && !name.ends_with("-shm")
+            })
         })
         .collect()
 }
 
+/// Every shadow table of the full-text index. A page of any of them can be the
+/// one that breaks: the term index and postings (`_data`, `_idx`) fail a search,
+/// the rest (`_content`, `_docsize`, `_config`) fail the structure around it, and
+/// `nodes_fts_map` is the generation-to-row map beside it.
+const INDEX_TABLES: [&str; 6] = [
+    "nodes_fts_data",
+    "nodes_fts_idx",
+    "nodes_fts_content",
+    "nodes_fts_docsize",
+    "nodes_fts_config",
+    "nodes_fts_map",
+];
+
 #[test]
 fn a_smashed_search_index_page_is_not_ready_and_build_sets_the_file_aside() {
-    let root = fixture("fts");
-    let (ok, built, _) = devmap(&root, &["build", "."]);
-    assert!(ok, "{built}");
-    let (_, healthy, _) = devmap(&root, &["status"]);
-    assert_eq!(healthy["query_ready"], true, "{healthy}");
-    assert_eq!(healthy["search_index_damaged"], false, "{healthy}");
+    for table in INDEX_TABLES {
+        let root = fixture(table);
+        let (ok, built, _) = devmap(&root, &["build", "."]);
+        assert!(ok, "{built}");
+        let (_, healthy, _) = devmap(&root, &["status"]);
+        assert_eq!(healthy["query_ready"], true, "{healthy}");
+        assert_eq!(healthy["search_index_damaged"], false, "{healthy}");
 
-    smash_page_of(&root.join("devmap.sqlite"), "nodes_fts_idx");
+        smash_page_of(&root.join("devmap.sqlite"), table);
 
-    // `status` no longer calls a store whose `search` errors ready.
-    let (_, status, _) = devmap(&root, &["status"]);
-    assert_eq!(status["query_ready"], false, "{status}");
-    assert_eq!(status["search_index_damaged"], true, "{status}");
-    assert!(
-        status["degraded_reason"]
+        // `status` no longer calls a store whose index is damaged ready: either
+        // it says so, or (a damaged config page fails the index's own
+        // constructor) it refuses to answer at all.
+        let (status_ok, status, status_err) = devmap(&root, &["status"]);
+        if status_ok {
+            assert_eq!(status["query_ready"], false, "{table}: {status}");
+            assert_eq!(status["search_index_damaged"], true, "{table}: {status}");
+            assert!(
+                status["degraded_reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("full-text index")),
+                "{table}: {status}"
+            );
+        } else {
+            assert!(status_err.contains("malformed"), "{table}: {status_err}");
+        }
+
+        // And `build` agrees with it: it does not answer "unchanged" over the
+        // damage and does not fail. It moves the file aside, says where, and
+        // rebuilds.
+        let (ok, rebuilt, stderr) = devmap(&root, &["build", "."]);
+        assert!(ok, "{table}: build must recover, got: {rebuilt} {stderr}");
+        assert_ne!(rebuilt["unchanged"], true, "{table}: {rebuilt}");
+        assert_eq!(
+            rebuilt["store_recovery"]["action"], "quarantined",
+            "{table}: {rebuilt}"
+        );
+        let moved = rebuilt["store_recovery"]["quarantined_to"]
             .as_str()
-            .is_some_and(|reason| reason.contains("full-text index")),
-        "{status}"
-    );
-    let (search_ok, _, search_err) = devmap(&root, &["search", "widget_1"]);
-    assert!(!search_ok, "the premise: search fails on this store");
-    assert!(search_err.contains("full-text index"), "{search_err}");
+            .expect("the result names where the damaged file went");
+        assert!(
+            Path::new(moved).is_file(),
+            "{moved} must exist, not be deleted"
+        );
+        assert_eq!(quarantined(&root).len(), 1, "{:?}", quarantined(&root));
 
-    // `build` does not answer "unchanged" over it, and does not fail: it moves
-    // the file aside, says where, and rebuilds.
-    let (ok, rebuilt, stderr) = devmap(&root, &["build", "."]);
-    assert!(ok, "build must recover, got: {rebuilt} {stderr}");
-    assert_ne!(rebuilt["unchanged"], true, "{rebuilt}");
-    assert_eq!(
-        rebuilt["store_recovery"]["action"], "quarantined",
-        "{rebuilt}"
-    );
-    let moved = rebuilt["store_recovery"]["quarantined_to"]
-        .as_str()
-        .expect("the result names where the damaged file went");
-    assert!(
-        Path::new(moved).is_file(),
-        "{moved} must exist, not be deleted"
-    );
-    assert_eq!(quarantined(&root).len(), 1, "{:?}", quarantined(&root));
-
-    // And the store it left behind is whole.
-    let (_, after, _) = devmap(&root, &["status"]);
-    assert_eq!(after["query_ready"], true, "{after}");
-    assert_eq!(after["search_index_damaged"], false, "{after}");
-    assert_eq!(after["degraded_reason"], serde_json::Value::Null, "{after}");
-    let (search_ok, hits, _) = devmap(&root, &["search", "widget_1"]);
-    assert!(search_ok, "{hits}");
-    assert_eq!(hits["items"][0]["symbol_name"], "widget_1", "{hits}");
-    let _ = fs::remove_dir_all(&root);
+        // And the store it left behind is whole.
+        let (_, after, _) = devmap(&root, &["status"]);
+        assert_eq!(after["query_ready"], true, "{table}: {after}");
+        assert_eq!(after["search_index_damaged"], false, "{table}: {after}");
+        assert_eq!(after["degraded_reason"], serde_json::Value::Null, "{after}");
+        let (search_ok, hits, _) = devmap(&root, &["search", "widget_1"]);
+        assert!(search_ok, "{table}: {hits}");
+        assert_eq!(hits["items"][0]["symbol_name"], "widget_1", "{hits}");
+        let _ = fs::remove_dir_all(&root);
+    }
 }
 
 #[test]

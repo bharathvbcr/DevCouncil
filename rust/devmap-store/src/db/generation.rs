@@ -743,11 +743,25 @@ impl Store {
             None => None,
         };
 
-        // The readable probe is a single MATCH. The whole check walks every
-        // symbol of the generation through the index, which on a large store
-        // is the bulk of a no-change build's work, so a caller that asks the
-        // question on a hot path (`build`) opts out of it and leaves it to
-        // `status`.
+        // The whole check walks every symbol of the generation through the
+        // index, which on a large store is the bulk of a no-change build's work,
+        // so a caller on a hot path (`build`) opts out of it and leaves the
+        // partial-loss count to `status`.
+        // The MATCH above reads the term index and the postings, and nothing
+        // else. The rest of the index is its content and docsize tables, which
+        // a damaged page can break without the probe's one symbol ever touching
+        // them; a page-by-page scan of each is a fraction of the whole check's
+        // per-symbol lookups. Both depths run it, so `status` and `build` can
+        // never disagree about a page one of them can read.
+        for shadow in ["nodes_fts_content", "nodes_fts_docsize"] {
+            if let Err(error) =
+                snapshot.query_row(&format!("SELECT COUNT(*) FROM {shadow}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+            {
+                return unreadable(error);
+            }
+        }
         if !whole {
             return match (&probe, probe_hits) {
                 (Some(name), Some(0)) => Ok(Some(fts_damage_reason(&format!(
@@ -819,8 +833,10 @@ impl Store {
     /// nothing changed, and a no-change build is the common one; the count
     /// behind [`Self::search_index_damage`] walks every symbol through the
     /// index (measured: +15% instructions on an unchanged 1,893-file build).
-    /// Damage the cheap probe cannot see is still reported by `status`, and a
-    /// build that writes dies on it and recovers through the corruption retry.
+    /// Both depths read every shadow table of the index page by page, so
+    /// neither surface can miss a damaged page the other reports. What the cheap
+    /// depth leaves to `status` is the *logical* loss: rows missing from an
+    /// index that reads cleanly.
     pub fn search_index_unreadable(&self) -> Result<Option<String>> {
         self.search_index_damage_at(false)
     }
