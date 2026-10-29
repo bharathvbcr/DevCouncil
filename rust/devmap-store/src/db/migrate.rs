@@ -264,12 +264,18 @@ impl Store {
                 unconverted.len()
             )));
         }
-        let after: i64 =
-            conn.query_row("SELECT COUNT(*) FROM file_payloads", [], |row| row.get(0))?;
-        if payloads != after {
+        // The invariant of the rung, checked rather than inferred from the pass
+        // having returned nothing: every payload is a frame with its entry wiring.
+        let left: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM file_payloads
+              WHERE typeof(extraction_json) <> 'blob' OR entry_wiring_json IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        if left != 0 {
             return Err(refusal(format!(
-                "moving the store to schema 29 changed the number of payloads: {payloads} \
-                 before, {after} after; the store has been left unmigrated"
+                "moving the store to schema 29 left {left} of {payloads} payloads uncompressed \
+                 or without entry wiring; the store has been left unmigrated"
             )));
         }
         Self::release_free_pages(conn)

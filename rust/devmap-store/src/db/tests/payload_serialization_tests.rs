@@ -192,7 +192,14 @@ fn payloads_of(store: &Store, path: &str) -> Vec<(i64, String, String, String)> 
         )
         .unwrap()
         .query_map(params![path], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                // A zstd frame since schema 29; the contract is about the
+                // document it decodes to.
+                crate::payload_codec::decode_value(row.get_ref(3)?, path)?.into_owned(),
+            ))
         })
         .unwrap()
         .collect::<Result<_>>()

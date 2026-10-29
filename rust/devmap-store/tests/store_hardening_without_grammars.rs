@@ -846,6 +846,7 @@ fn a_v16_store_migrates_to_the_payload_split_and_keeps_its_rows() {
             .unwrap();
         }
         // Put the flat v27 tables back, then collapse to the pre-split shape.
+        conn.execute_batch(v27_shape::REDUCE_V29_TO_V28).unwrap();
         conn.execute_batch(v27_shape::REDUCE_V28_TO_V27).unwrap();
         conn.execute_batch(
             "CREATE TABLE gf_flat AS SELECT * FROM generation_files;
@@ -888,7 +889,14 @@ fn a_v16_store_migrates_to_the_payload_split_and_keeps_its_rows() {
         )
         .unwrap();
     let rows: Vec<(String, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .query_map([], |row| {
+            // The migration compressed the text this fixture inserted.
+            let frame: Vec<u8> = row.get(1)?;
+            Ok((
+                row.get(0)?,
+                String::from_utf8(zstd::bulk::decompress(&frame, 1 << 20).unwrap()).unwrap(),
+            ))
+        })
         .unwrap()
         .map(Result::unwrap)
         .collect();

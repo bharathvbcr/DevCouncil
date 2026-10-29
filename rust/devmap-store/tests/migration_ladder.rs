@@ -189,6 +189,11 @@ fn reduce_one_rung(conn: &Connection, from_version: i32) {
         // as `CREATE_SCHEMA_V3` defines it: it names `generation_file_rows`,
         // which SQLite re-parses when a table is renamed into that name.
         28 => v27_shape::REDUCE_V28_TO_V27,
+        // MIGRATION_V28_TO_V29: `entry_wiring_json`. The frames in
+        // `extraction_json` stay as they are -- SQL cannot decompress them --
+        // which is the shape a store re-stamped down from 29 has, and the rung
+        // above re-derives the column from them.
+        29 => v27_shape::REDUCE_V29_TO_V28,
         // MIGRATION_V26_TO_V27: the three dead-row evidence columns.
         27 => {
             "ALTER TABLE generation_dead_symbols DROP COLUMN evidence_byte;

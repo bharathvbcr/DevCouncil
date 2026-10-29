@@ -1,11 +1,23 @@
 //! The schema-27 shape of the relations v28 moved onto payloads and ranges,
-//! rebuilt from a v28 store.
+//! rebuilt from a store this build created.
+//!
+//! A reduced store's `extraction_json` still holds the zstd frames v29 wrote
+//! (SQL cannot decompress them back). Walking it up exercises exactly what a
+//! store re-stamped down from v29 meets: the digest backfill reads the frames
+//! through the codec, and the v29 rung re-adds `entry_wiring_json` and fills it
+//! from the stored documents.
 //!
 //! Two test targets reduce a store to an earlier rung by hand
 //! (`migration_ladder` for every rung, `store_hardening_without_grammars` for
 //! the payload split), and both start from a store this build created, which is
 //! v28. Each needs the same first step -- put the flat per-generation tables
 //! back -- so it is written once.
+
+/// v29's one column. A store this build created is reduced with this first and
+/// then [`REDUCE_V28_TO_V27`]: the columns come off in the reverse of the order
+/// the ladder adds them, which is also what makes a re-walked store's column
+/// order the fresh store's.
+pub const REDUCE_V29_TO_V28: &str = "ALTER TABLE file_payloads DROP COLUMN entry_wiring_json;";
 
 /// Materialise `generation_nodes`, `generation_literals`,
 /// `generation_file_rows` and `generation_file_digests` back into the flat

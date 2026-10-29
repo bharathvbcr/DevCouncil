@@ -83,10 +83,15 @@ pub(crate) fn compress_document(json: &str) -> rusqlite::Result<Vec<u8>> {
     COMPRESSOR.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
-            *slot = Some(
-                zstd::bulk::Compressor::new(ZSTD_LEVEL)
-                    .map_err(|error| refusal(format!("zstd could not start: {error}")))?,
-            );
+            let mut compressor = zstd::bulk::Compressor::new(ZSTD_LEVEL)
+                .map_err(|error| refusal(format!("zstd could not start: {error}")))?;
+            // Four bytes a document buy detection of a flipped bit: without
+            // them a damaged frame can decode to different, well-formed bytes
+            // and reach the JSON parser as though it were what was written.
+            compressor
+                .set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true))
+                .map_err(|error| refusal(format!("zstd could not start: {error}")))?;
+            *slot = Some(compressor);
         }
         slot.as_mut()
             .expect("the compressor was just created")

@@ -247,6 +247,7 @@ fn a_v27_store_migrates_with_every_generation_reading_the_same_rows() {
     {
         let conn = Connection::open(&db).unwrap();
         conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute_batch(v27_shape::REDUCE_V29_TO_V28).unwrap();
         conn.execute_batch(v27_shape::REDUCE_V28_TO_V27).unwrap();
         conn.execute_batch("PRAGMA user_version = 27;").unwrap();
         let tables: i64 = conn
@@ -345,6 +346,7 @@ fn a_migration_that_fails_part_way_leaves_the_v27_store_untouched() {
     {
         let conn = Connection::open(&db).unwrap();
         conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute_batch(v27_shape::REDUCE_V29_TO_V28).unwrap();
         conn.execute_batch(v27_shape::REDUCE_V28_TO_V27).unwrap();
         conn.execute_batch(
             "PRAGMA user_version = 27;
@@ -388,23 +390,33 @@ fn a_migration_that_fails_part_way_leaves_the_v27_store_untouched() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// **The floor.** A v28 store tells every reader older than 28 to refuse it.
+/// **The floor.** v28 told every reader older than 28 to refuse its stores, and
+/// still does: the row stays in the ladder when a later bump raises the floor.
 ///
 /// `reader_floor.rs` proves the refusal for every stamped version and floor; this
-/// pins what v28 records, because the views keep every v27 column and a floor
+/// pins what v28 recorded, because the views keep every v27 column and a floor
 /// left at 25 would have let a v27 reader through to join the new full-text
-/// rowids by the old arithmetic.
+/// rowids by the old arithmetic. The store this build writes is v29 and records
+/// v29's floor (`v29_compressed_extractions.rs` pins that one); what a v28
+/// writer recorded is read from the table of floors, which is where it lives.
 #[test]
 fn a_v28_store_records_a_reader_floor_of_28() {
+    assert!(
+        devmap_store::SCHEMA_READER_FLOORS.contains(&(28, 28)),
+        "a store stamped 28 must exclude a v27 reader: {:?}",
+        devmap_store::SCHEMA_READER_FLOORS
+    );
     let dir = tmp_dir("floor");
     let db = dir.join("devmap.sqlite");
     drop(Store::open(&db).unwrap());
-    assert_eq!(CURRENT_SCHEMA_VERSION, 28);
-    assert_eq!(MIN_READER_SCHEMA_VERSION, 28);
     assert_eq!(
         count(&db, "SELECT min_reader_schema FROM reader_compat"),
-        28,
-        "the writer must record a floor that excludes a v27 reader"
+        i64::from(MIN_READER_SCHEMA_VERSION),
+        "the writer records the floor of the schema it stamps"
+    );
+    assert!(
+        MIN_READER_SCHEMA_VERSION >= 28,
+        "no later floor may readmit a v27 reader"
     );
     let _ = fs::remove_dir_all(&dir);
 }

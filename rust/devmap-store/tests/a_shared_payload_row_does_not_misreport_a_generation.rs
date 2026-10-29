@@ -45,7 +45,14 @@ fn as_stored(db: &std::path::Path, generation: i64) -> (ParseOutcome, usize, i64
              JOIN paths p ON p.id = f.file_id
              WHERE f.generation_id = ?1 AND p.path = ?2",
             params![generation, PATH],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                // A zstd frame since schema 29.
+                let frame: Vec<u8> = row.get(1)?;
+                Ok((
+                    row.get(0)?,
+                    String::from_utf8(zstd::bulk::decompress(&frame, 64 << 20).unwrap()).unwrap(),
+                ))
+            },
         )
         .unwrap();
     let nodes: i64 = conn
