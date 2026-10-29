@@ -2389,6 +2389,20 @@ done
             complete: true,
         };
         assert_eq!(surface_stderr(&empty), None);
+        // Invalid UTF-8 and one enormous line with no newline: neither panics,
+        // and a cut-off single line leaves nothing to show.
+        let binary = subprocess::StderrTail {
+            bytes: b"ok \xff\xfe bad\n".to_vec(),
+            dropped_bytes: 0,
+            complete: true,
+        };
+        assert!(surface_stderr(&binary).unwrap().starts_with("ok "));
+        let one_line = subprocess::StderrTail {
+            bytes: vec![b'x'; subprocess::SESSION_STDERR_TAIL_BYTES],
+            dropped_bytes: 1 << 20,
+            complete: true,
+        };
+        assert_eq!(surface_stderr(&one_line), None);
         let controls = subprocess::StderrTail {
             bytes: b"bell\x07 and escape\x1b[31m red".to_vec(),
             dropped_bytes: 0,

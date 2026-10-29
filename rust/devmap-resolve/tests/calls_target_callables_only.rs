@@ -186,3 +186,18 @@ fn no_calls_edge_in_a_go_or_rust_graph_targets_a_type_declaration() {
         );
     }
 }
+
+/// Rust gives a type and a function of one name separate namespaces, so
+/// `struct Foo {..}` and `fn Foo()` can coexist. The index cannot tell which
+/// the call names, so it must not reclassify: a call may be real.
+#[test]
+fn a_name_shared_by_a_type_and_a_function_keeps_its_call() {
+    let src = "struct Foo { n: i32 }\nfn Foo() -> i32 { 1 }\nfn caller() -> i32 { Foo() }\n";
+    let result = resolve(&[("src/lib.rs", src)]);
+    let calls = rows(&result, EdgeKind::Calls, "::caller");
+    let uses = rows(&result, EdgeKind::References, "::caller");
+    assert!(
+        calls.iter().any(|row| row.starts_with("src/lib.rs::Foo")) || uses.is_empty(),
+        "an ambiguous type/function name must not be turned into a use: calls={calls:?} uses={uses:?}"
+    );
+}

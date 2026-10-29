@@ -228,3 +228,71 @@ fn constrained_methods_are_not_a_variant_set() {
     ]);
     assert!(calls_from(&result, "Run").is_empty());
 }
+
+/// Past the dispatch fan-out cap the call is ledgered with the whole candidate
+/// list instead of fanning out — the same bound every other candidate set has.
+#[test]
+fn a_variant_set_past_the_fanout_cap_is_ledgered_not_fanned_out() {
+    let mut files: Vec<(String, String)> = (0..17)
+        .map(|n| {
+            (
+                format!("proc/v{n}.go"),
+                format!("//go:build tag{n}\n\npackage proc\n\nfunc ConfigureGroup() {{}}\n"),
+            )
+        })
+        .collect();
+    files.push(("proc/git.go".into(), SAMEPKG_CALLER.into()));
+    let refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+    let result = resolve(&refs);
+    assert!(calls_from(&result, "Command").is_empty());
+    assert!(
+        result
+            .unresolved
+            .iter()
+            .any(|row| row.callee_name == "ConfigureGroup"),
+        "the site must stay in the ledger"
+    );
+}
+
+/// Variants declared only in `_test.go` files are in no production build: a
+/// production caller must not reach them, a test caller reaches both.
+#[test]
+fn test_file_variants_are_visible_to_tests_only() {
+    let unix = "//go:build unix\n\npackage proc\n\nfunc lockAll() {}\n";
+    let other = "//go:build !unix\n\npackage proc\n\nfunc lockAll() {}\n";
+    let prod = "package proc\n\nfunc Run() { lockAll() }\n";
+    let test = "package proc\n\nfunc TestRun() { lockAll() }\n";
+    let result = resolve(&[
+        ("proc/lock_unix_test.go", unix),
+        ("proc/lock_other_test.go", other),
+        ("proc/run.go", prod),
+        ("proc/run_test.go", test),
+    ]);
+    assert!(
+        calls_from(&result, "Run").is_empty(),
+        "{:?}",
+        calls_from(&result, "Run")
+    );
+    assert_eq!(
+        targets(&calls_from(&result, "TestRun")),
+        ["proc/lock_other_test.go", "proc/lock_unix_test.go"]
+    );
+}
+
+/// A call from inside a variant file names its own variant (the same-file rung
+/// runs first) — it is not widened to the set.
+#[test]
+fn a_call_from_inside_a_variant_stays_on_its_own_variant() {
+    let unix = "//go:build unix\n\npackage proc\n\nfunc ConfigureGroup() {}\n\nfunc Own() { ConfigureGroup() }\n";
+    let result = resolve(&[
+        ("proc/procgroup_unix.go", unix),
+        ("proc/procgroup_other.go", OTHER),
+    ]);
+    assert_eq!(
+        targets(&calls_from(&result, "Own")),
+        ["proc/procgroup_unix.go"]
+    );
+}

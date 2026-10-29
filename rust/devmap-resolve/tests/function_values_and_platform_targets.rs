@@ -156,10 +156,13 @@ fn a_rust_closure_calls_through_its_enclosing_function() {
     );
 }
 
-/// Known limit. No platform is selected: both `open`s are real targets on
-/// some platform, and the call fans out to each at the ambiguous tier. Both
-/// stay live, which is the right answer for dead-code purposes; a build for
-/// one platform would reach only one.
+/// No platform is selected: both `open`s are real targets on some platform, and
+/// exactly one is compiled into any build. Every declaring file is
+/// build-constrained (by its suffix, or by its `//go:build` line), so the call
+/// names the *set*: one dispatch-tier edge per twin, never a bind to one and no
+/// ledger row. Both stay live, and a build for one platform reaches only one.
+/// (It used to be an `AmbiguousGlobal` ledger row — see
+/// `go_build_variants_are_one_callee_set` for the rule and its limits.)
 #[test]
 fn go_platform_twins_fan_out_by_file_suffix_and_by_build_tag() {
     for (label, files) in [
@@ -199,34 +202,32 @@ fn go_platform_twins_fan_out_by_file_suffix_and_by_build_tag() {
         ),
     ] {
         let result = resolve(&files);
-        assert!(
-            result
-                .edges
-                .iter()
-                .all(|edge| edge.edge_kind != EdgeKind::Calls
-                    || edge.source_symbol != "sys/use.go::Use"),
-            "{label}: a platform twin is a guess between candidates, never a bind"
-        );
-        let row = result
-            .unresolved
+        let mut targets: Vec<&str> = result
+            .edges
             .iter()
-            .find(|row| row.source_symbol == "sys/use.go::Use" && row.callee_name == "open")
-            .unwrap_or_else(|| panic!("{label}: the site must be in the ledger"));
-        let Resolution::AmbiguousGlobal { candidates, .. } = &row.resolution else {
-            panic!(
-                "{label}: expected AmbiguousGlobal, got {:?}",
-                row.resolution
-            );
-        };
-        let mut targets: Vec<&str> = candidates
-            .iter()
-            .map(|(_, symbol)| symbol.as_str())
+            .filter(|edge| {
+                edge.edge_kind == EdgeKind::Calls && edge.source_symbol == "sys/use.go::Use"
+            })
+            .inspect(|edge| {
+                assert!(
+                    matches!(edge.resolution.as_deref(), Some(Resolution::Dispatch { .. })),
+                    "{label}: a platform twin is a candidate at the dispatch tier, never a bind: {edge:?}"
+                );
+            })
+            .map(|edge| edge.target_symbol.as_str())
             .collect();
         targets.sort();
         assert_eq!(
             targets,
             vec!["sys/open_darwin.go::open", "sys/open_linux.go::open"],
             "{label}"
+        );
+        assert!(
+            !result
+                .unresolved
+                .iter()
+                .any(|row| row.source_symbol == "sys/use.go::Use" && row.callee_name == "open"),
+            "{label}: the site is resolved to the set, not ledgered"
         );
     }
 }
