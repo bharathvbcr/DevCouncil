@@ -371,6 +371,18 @@ fn a_v28_store_records_a_reader_floor_of_28() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A new store is whole: v28's rung drops the six flat tables the earlier
+/// batches made, and the pages they held must not be left on the freelist, or a
+/// file with no content reads as one worth vacuuming.
+#[test]
+fn a_new_store_has_no_free_pages() {
+    let dir = tmp_dir("fresh-freelist");
+    let db = dir.join("devmap.sqlite");
+    drop(Store::open(&db).unwrap());
+    assert_eq!(count(&db, "PRAGMA freelist_count"), 0);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A file reverted to content it held earlier reuses that payload and its rows:
 /// nothing is stored twice, the generation reads what the earlier one read, and
 /// the file lists last because its membership is newer -- as v27 listed it.

@@ -206,6 +206,17 @@ impl Store {
         Ok(())
     }
 
+    /// Hand every free page back to the filesystem, stepping the pragma to
+    /// exhaustion (it frees one page per row stepped, and `execute_batch`
+    /// steps once). A store whose `auto_vacuum` is not incremental has nothing
+    /// to hand back and the pragma is a no-op.
+    fn release_free_pages(conn: &Connection) -> Result<()> {
+        let mut stmt = conn.prepare("PRAGMA incremental_vacuum")?;
+        let mut rows = stmt.query([])?;
+        while rows.next()?.is_some() {}
+        Ok(())
+    }
+
     /// Refuse a store whose schema carries a trigger.
     ///
     /// No version of this schema has ever declared one, so a trigger in
@@ -508,6 +519,12 @@ impl Store {
             // the fresh path and the ladder land on one schema because they run
             // one batch.
             Self::migrate_to_v28(tx)?;
+            // That rung drops the six flat tables the batches above just made
+            // empty, which on a store with no content yet leaves their pages
+            // on the freelist: a brand-new file that already reads as "worth
+            // reclaiming" to `vacuum_if_needed`. Nothing is referenced by
+            // them, so give the pages back before the file is first used.
+            Self::release_free_pages(tx)?;
             Self::stamp_reader_compat(tx)?;
             Self::validate_schema(tx)?;
             tx.execute(

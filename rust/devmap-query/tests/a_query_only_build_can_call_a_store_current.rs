@@ -98,8 +98,8 @@ fn store_stamped(dir: &Path, python_grammar: &str) -> PathBuf {
         ])
         .unwrap();
     conn.execute_batch(
-        "INSERT INTO generation_file_rows (generation_id, file_id, payload_id)
-         VALUES (1, 1, 1), (1, 2, 2);",
+        "INSERT INTO file_rows (file_id, payload_id, valid_from, valid_to)
+         VALUES (1, 1, 1, NULL), (2, 2, 1, NULL);",
     )
     .unwrap();
     db

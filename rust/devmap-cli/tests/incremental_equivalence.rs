@@ -286,12 +286,12 @@ fn age_payloads(conn: &rusqlite::Connection, analyzer: Option<&str>) -> usize {
     let repointed = conn
         .execute(
             &format!(
-                "UPDATE generation_file_rows SET payload_id = (
+                "UPDATE file_rows SET payload_id = (
                      SELECT ({TWIN}) FROM file_payloads mine
-                      WHERE mine.payload_id = generation_file_rows.payload_id)
+                      WHERE mine.payload_id = file_rows.payload_id)
                   WHERE EXISTS (
                      SELECT 1 FROM file_payloads mine
-                      WHERE mine.payload_id = generation_file_rows.payload_id
+                      WHERE mine.payload_id = file_rows.payload_id
                         AND COALESCE(mine.analyzer_version, '') <> COALESCE(?1, '')
                         AND EXISTS ({TWIN}))"
             ),
@@ -299,12 +299,18 @@ fn age_payloads(conn: &rusqlite::Connection, analyzer: Option<&str>) -> usize {
         )
         .unwrap();
 
+    // What nothing points at goes, with the rows derived from it: since v28 a
+    // payload owns its symbols, literals and full-text entries.
+    const ORPHAN: &str = "payload_id NOT IN (SELECT payload_id FROM file_rows)";
     conn.execute(
-        "DELETE FROM file_payloads
-          WHERE payload_id NOT IN (SELECT payload_id FROM generation_file_rows)",
+        &format!("DELETE FROM nodes_fts WHERE (rowid >> 24) IN (SELECT payload_id FROM file_payloads WHERE {ORPHAN})"),
         [],
     )
     .unwrap();
+    for table in ["payload_nodes", "payload_literals", "file_payloads"] {
+        conn.execute(&format!("DELETE FROM {table} WHERE {ORPHAN}"), [])
+            .unwrap();
+    }
 
     aged + repointed
 }

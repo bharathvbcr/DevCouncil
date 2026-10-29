@@ -272,7 +272,8 @@ fn a_store_written_before_the_rule_is_withheld_on_read_and_scrubbed_on_write() {
             .unwrap();
         let changed = conn
             .execute(
-                "UPDATE generation_literals SET value = 'hunter2' WHERE file_id = ?1",
+                "UPDATE payload_literals SET value = 'hunter2'
+                  WHERE payload_id IN (SELECT payload_id FROM file_payloads WHERE file_id = ?1)",
                 [file_id],
             )
             .unwrap();
