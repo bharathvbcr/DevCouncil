@@ -12,6 +12,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use devmap_store::{Store, CURRENT_SCHEMA_VERSION};
 
+#[path = "support/v27_shape.rs"]
+mod v27_shape;
+
 /// A 1 us `SystemTime` tick is not a unique key: same-microsecond callers used
 /// to collide on one path, and the `remove_dir_all` below then deleted a live
 /// sibling test's fixture. pid plus a monotonic counter make the name unique.
@@ -837,13 +840,13 @@ fn a_v16_store_migrates_to_the_payload_split_and_keeps_its_rows() {
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO generation_file_rows (generation_id, file_id, payload_id)
-                 VALUES (1, ?1, ?1)",
+                "INSERT INTO file_rows (file_id, payload_id, valid_from) VALUES (?1, ?1, 1)",
                 rusqlite::params![file_id],
             )
             .unwrap();
         }
-        // Now collapse it back to the pre-split shape.
+        // Put the flat v27 tables back, then collapse to the pre-split shape.
+        conn.execute_batch(v27_shape::REDUCE_V28_TO_V27).unwrap();
         conn.execute_batch(
             "CREATE TABLE gf_flat AS SELECT * FROM generation_files;
              DROP VIEW generation_files;

@@ -50,6 +50,24 @@ const PAYLOAD_WINDOW_PER_THREAD: usize = 2;
 #[cfg(feature = "parse")]
 const PAYLOAD_WINDOW_JSON_BYTES: usize = 64 * 1024 * 1024;
 
+/// What [`Store::ensure_payload_id`] found for an extraction's identity.
+///
+/// The rows derived from a payload -- its symbols, its literals, its full-text
+/// entries -- are written when the payload is, so the write must know whether
+/// this call made it.
+#[cfg(feature = "parse")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PayloadState {
+    /// A new row: its derived rows do not exist yet.
+    New,
+    /// An existing row, left as it was: its derived rows are already stored.
+    Reused,
+    /// An existing budget-refusal row replaced in place by the recovered
+    /// extraction (the declared interim in `ensure_payload_id`): its derived
+    /// rows describe the refusal and must be rewritten.
+    Replaced,
+}
+
 /// The three JSON documents a fresh `file_payloads` row holds for one
 /// extraction.
 #[cfg(feature = "parse")]
@@ -370,7 +388,10 @@ impl Store {
     /// retry loop: every caller holds the generation write transaction, and the
     /// store has one writer.
     #[cfg(feature = "parse")]
-    fn ensure_payload_id(tx: &Connection, payload: StoredPayload<'_>) -> Result<i64> {
+    fn ensure_payload_id(
+        tx: &Connection,
+        payload: StoredPayload<'_>,
+    ) -> Result<(i64, PayloadState)> {
         let StoredPayload {
             file_id,
             content_hash,
@@ -431,8 +452,9 @@ impl Store {
                     engine_json,
                     extraction_json
                 ])?;
+                return Ok((id, PayloadState::Replaced));
             }
-            return Ok(id);
+            return Ok((id, PayloadState::Reused));
         }
         tx.prepare_cached(
             "INSERT INTO file_payloads
@@ -450,7 +472,7 @@ impl Store {
             engine_json,
             extraction_json
         ])?;
-        Ok(tx.last_insert_rowid())
+        Ok((tx.last_insert_rowid(), PayloadState::New))
     }
 
     /// Replaces every value a secret file holds in the store, in every
@@ -486,21 +508,21 @@ impl Store {
             }
             ids
         };
+        // Every payload of a secret file, retained or not yet pruned: a
+        // payload is the only place a literal lives, so there is no per-
+        // generation copy to reach separately.
         let mut withhold = tx.prepare(
-            "INSERT OR IGNORE INTO generation_literals
-                (generation_id, file_id, line, span_start, value, qualified_name, symbol_name)
-             SELECT generation_id, file_id, line, span_start, ?2, qualified_name, symbol_name
-               FROM generation_literals
-              WHERE generation_id IN (SELECT id FROM generations)
-                AND file_id = ?1 AND value <> ?2",
+            "INSERT OR IGNORE INTO payload_literals
+                (payload_id, line, span_start, value, qualified_name, symbol_name)
+             SELECT payload_id, line, span_start, ?2, qualified_name, symbol_name
+               FROM payload_literals
+              WHERE payload_id IN (SELECT payload_id FROM file_payloads WHERE file_id = ?1)
+                AND value <> ?2",
         )?;
-        // `generation_id IN (…)` leads with the key's first column, so each
-        // secret file costs an index probe per retained generation rather than
-        // a scan of every literal in the store.
         let mut drop_values = tx.prepare(
-            "DELETE FROM generation_literals
-              WHERE generation_id IN (SELECT id FROM generations)
-                AND file_id = ?1 AND value <> ?2",
+            "DELETE FROM payload_literals
+              WHERE payload_id IN (SELECT payload_id FROM file_payloads WHERE file_id = ?1)
+                AND value <> ?2",
         )?;
         let mut payloads =
             tx.prepare("SELECT payload_id, extraction_json FROM file_payloads WHERE file_id = ?1")?;
@@ -529,9 +551,105 @@ impl Store {
         Ok(())
     }
 
-    /// Generation-scoped FTS rowid: high 32 bits = generation, low 32 = ordinal.
-    pub(super) fn fts_rowid(gen_id: u32, node_ord: u32) -> i64 {
-        ((gen_id as i64) << 32) | (node_ord as i64)
+    /// Writes the symbols, full-text entries and literals of a payload.
+    ///
+    /// Called for every extraction that reaches a payload row, and writes
+    /// nothing when the payload's rows are already the extraction's: a payload
+    /// is the same file at the same content under the same extractor, so a
+    /// [`PayloadState::Reused`] row holds the rows this extraction would
+    /// produce, and the whole point of v28 is not producing them again.
+    ///
+    /// The one check a reused row gets is its symbol count. Rows follow the
+    /// extraction in hand, as the per-generation copies they replace did, so a
+    /// count that disagrees -- a budget refusal arriving for content that once
+    /// parsed -- rewrites them rather than leaving a generation naming symbols
+    /// its own edges never resolved.
+    #[cfg(feature = "parse")]
+    fn write_payload_rows(
+        tx: &Connection,
+        payload_id: i64,
+        state: PayloadState,
+        extraction: &Extraction,
+        spent: &mut WriteBreakdown,
+    ) -> Result<()> {
+        match state {
+            PayloadState::New => {}
+            PayloadState::Replaced => {
+                Self::delete_payload_rows(tx, payload_id)?;
+            }
+            PayloadState::Reused => {
+                let stored: i64 = tx
+                    .prepare_cached("SELECT COUNT(*) FROM payload_nodes WHERE payload_id = ?1")?
+                    .query_row(params![payload_id], |row| row.get(0))?;
+                if usize::try_from(stored).ok() == Some(extraction.symbols.len()) {
+                    return Ok(());
+                }
+                Self::delete_payload_rows(tx, payload_id)?;
+            }
+        }
+        for (ord_in_file, sym) in extraction.symbols.iter().enumerate() {
+            let fts_rowid = Self::fts_rowid(payload_id, ord_in_file)?;
+            {
+                let _charge = charge(&mut spent.nodes);
+                tx.prepare_cached(
+                    "INSERT INTO payload_nodes
+                        (payload_id, ord_in_file, name, qualified_name, kind, span_start,
+                         span_end, is_exported, body_exact, body_structural, body_nodes)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                )?
+                .execute(params![
+                    payload_id,
+                    ord_in_file as i64,
+                    sym.name,
+                    sym.qualified_name,
+                    sym.kind.as_str(),
+                    i64::try_from(sym.span.start_byte)
+                        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
+                    i64::try_from(sym.span.end_byte)
+                        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
+                    sym.is_exported as i32,
+                    // SQLite integers are signed. The cast is bit-preserving
+                    // and reversed on read, so the stored value round-trips
+                    // even though half the hash space reads back negative.
+                    sym.body_signature.map(|s| s.exact as i64),
+                    sym.body_signature.map(|s| s.structural as i64),
+                    sym.body_signature.map(|s| i64::from(s.nodes)),
+                ])?;
+            }
+            {
+                let _charge = charge(&mut spent.fts);
+                tx.prepare_cached(
+                    "INSERT INTO nodes_fts (rowid, name, qualified_name, path)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )?
+                .execute(params![
+                    fts_rowid,
+                    sym.name,
+                    sym.qualified_name,
+                    extraction.file_path
+                ])?;
+            }
+        }
+        let _charge = charge(&mut spent.literals);
+        for lit in &extraction.literals {
+            if lit.value.is_empty() || lit.value.as_bytes().contains(&0) {
+                continue;
+            }
+            tx.prepare_cached(
+                "INSERT OR IGNORE INTO payload_literals
+                    (payload_id, line, span_start, value, qualified_name, symbol_name)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?
+            .execute(params![
+                payload_id,
+                i64::from(lit.line),
+                i64::try_from(lit.start_byte).unwrap_or(i64::MAX),
+                lit.value,
+                lit.enclosing_qualified_name,
+                lit.enclosing_name,
+            ])?;
+        }
+        Ok(())
     }
 
     /// Writes a generation.
@@ -839,11 +957,16 @@ impl Store {
             .map(|ext| (ext.file_path.as_str(), ext.content_hash as i64))
             .collect();
         let mut carry: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // The same set as ids, for the membership delta below: a carried file
+        // keeps its open row, and every open row not named by this set or by a
+        // fresh extraction is closed.
+        let mut carry_file_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut stale_identity: Vec<String> = Vec::new();
         if let Some(prev) = prev_gen {
             if !full_rewrite {
                 let mut stmt = tx.prepare(
-                    "SELECT p.path, f.language, f.content_hash, f.grammar_version, f.analyzer_version
+                    "SELECT p.path, f.language, f.content_hash, f.grammar_version, f.analyzer_version,
+                            f.file_id
                      FROM generation_files f
                      JOIN paths p ON p.id = f.file_id
                      WHERE f.generation_id = ?1",
@@ -855,10 +978,11 @@ impl Store {
                         row.get::<_, i64>(2)?,
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, Option<String>>(4)?,
+                        row.get::<_, u32>(5)?,
                     ))
                 })?;
                 for row in rows {
-                    let (path, language, content_hash, grammar, analyzer) = row?;
+                    let (path, language, content_hash, grammar, analyzer, file_id) = row?;
                     if deleted.contains(&path) || affected.contains(&path) {
                         continue;
                     }
@@ -873,6 +997,7 @@ impl Store {
                         .get(path.as_str())
                         .is_none_or(|hash| *hash == content_hash);
                     if identity_matches && content_matches {
+                        carry_file_ids.insert(file_id);
                         carry.insert(path);
                     } else {
                         stale_identity.push(path);
@@ -899,35 +1024,33 @@ impl Store {
             )));
         }
 
-        // Carrying a payload forward is now a `payload_id`, not a payload.
+        // Membership is a validity range, so carrying a file forward is writing
+        // nothing: its open row in `file_rows` already says it is a member of
+        // this generation.
         //
-        // This block used to SELECT each unaffected file's row — language,
-        // hashes, and a `parse_outcome_json`, `engine_json` and
-        // `extraction_json` averaging 53.7 KB together — into Rust and INSERT
-        // it back under the new generation id. Measured on this repository, a
-        // one-line edit to one file moved **~82 MB of JSON** that way, and left
-        // 1,530 byte-identical duplicate rows behind. Since v17 the bytes live
-        // once in `file_payloads` keyed by the identity the extraction cache
-        // already uses, and a carried file is a 16-byte membership row.
+        // What is read here is the rows open before this write, one scan of a
+        // table that holds a row per file. The loop below compares each fresh
+        // extraction's payload with its file's open row, and the close pass
+        // after it retires every open row this generation does not keep.
         //
-        // One statement, executed inside SQLite, rather than a loop: there is
-        // nothing for Rust to decide here — `carry` has already decided it —
-        // and a round trip per file was the whole cost.
-        if let Some(prev) = prev_gen {
-            if !full_rewrite && !carry.is_empty() {
-                let mut stmt = tx.prepare(
-                    "INSERT INTO generation_file_rows (generation_id, file_id, payload_id)
-                     SELECT ?1, m.file_id, m.payload_id
-                       FROM generation_file_rows m
-                       JOIN paths p ON p.id = m.file_id
-                      WHERE m.generation_id = ?2 AND p.path = ?3",
-                )?;
-                let _charge = charge(&mut spent.file_rows);
-                for path in &carry {
-                    stmt.execute(params![gen_id, prev, path])?;
-                }
+        // v17 made a carried file a 16-byte row instead of a payload; v28 makes
+        // it no row at all. A one-file edit writes one membership row, and
+        // closes one.
+        let mut open_rows: std::collections::HashMap<u32, (i64, i64)> =
+            std::collections::HashMap::new();
+        {
+            let _charge = charge(&mut spent.file_rows);
+            let mut stmt = tx.prepare(
+                "SELECT file_id, row_id, payload_id FROM file_rows WHERE valid_to IS NULL",
+            )?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                open_rows.insert(row.get(0)?, (row.get(1)?, row.get(2)?));
             }
         }
+        // Files this generation holds: the carried ones, then each fresh
+        // extraction as the loop below reaches it.
+        let mut member_files: std::collections::HashSet<u32> = carry_file_ids.clone();
 
         // The extractions that get fresh rows, in iteration order.
         //
@@ -1023,7 +1146,7 @@ impl Store {
                     // staleness guarantee the cache key exists to enforce (SC8).
                     // Since v17 it is also the payload's own key.
                     let identity = devmap_extract::cache::CacheKey::for_extraction(extraction);
-                    let payload_id = {
+                    let (payload_id, payload_state) = {
                         let _charge = charge(&mut spent.payloads);
                         Self::ensure_payload_id(
                             &tx,
@@ -1039,13 +1162,32 @@ impl Store {
                             },
                         )?
                     };
+                    // The rows derived from the payload are the payload's, and
+                    // are written when it is.
+                    Self::write_payload_rows(&tx, payload_id, payload_state, extraction, &mut spent)?;
+                    // This file's membership as a delta: nothing when its open
+                    // row already names this payload, otherwise that row is
+                    // closed at this generation and the new payload's opened.
                     {
                         let _charge = charge(&mut spent.file_rows);
-                        tx.execute(
-                            "INSERT INTO generation_file_rows (generation_id, file_id, payload_id)
-                             VALUES (?1, ?2, ?3)",
-                            params![gen_id, file_id, payload_id],
-                        )?;
+                        member_files.insert(file_id);
+                        match open_rows.get(&file_id) {
+                            Some((_, open_payload)) if *open_payload == payload_id => {}
+                            existing => {
+                                if let Some((row_id, _)) = existing {
+                                    tx.prepare_cached(
+                                        "UPDATE file_rows SET valid_to = ?2
+                                          WHERE row_id = ?1 AND valid_to IS NULL",
+                                    )?
+                                    .execute(params![row_id, gen_id])?;
+                                }
+                                tx.prepare_cached(
+                                    "INSERT INTO file_rows (file_id, payload_id, valid_from)
+                                     VALUES (?1, ?2, ?3)",
+                                )?
+                                .execute(params![file_id, payload_id, gen_id])?;
+                            }
+                        }
                     }
                 }
                 Ok(())
@@ -1077,170 +1219,20 @@ impl Store {
             Ok(())
         })?;
 
-        let mut node_ord: u32 = 0;
-
-        // Carry forward unchanged files from previous generation (differential).
-        if let Some(prev) = prev_gen {
-            if !full_rewrite {
-                // The signature columns are carried with the row. Dropping
-                // them here would make every unchanged file look unsigned after
-                // one incremental build, and a clone report reads unsigned as
-                // "not examined" — so the whole tree would quietly go dark
-                // except the handful of files that happened to be edited.
-                let mut stmt = tx.prepare(
-                    "SELECT p.path, n.name, n.qualified_name, n.kind, n.span_start, n.span_end, n.is_exported,
-                            n.body_exact, n.body_structural, n.body_nodes
-                     FROM generation_nodes n
-                     JOIN paths p ON p.id = n.file_id
-                     WHERE n.generation_id = ?1",
-                )?;
-                let rows = stmt.query_map(params![prev], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, i64>(4)?,
-                        row.get::<_, i64>(5)?,
-                        row.get::<_, i64>(6)?,
-                        row.get::<_, Option<i64>>(7)?,
-                        row.get::<_, Option<i64>>(8)?,
-                        row.get::<_, Option<i64>>(9)?,
-                    ))
-                })?;
-                for row in rows {
-                    // The decode is charged to `nodes` with the insert it feeds:
-                    // reading the previous generation's 18,501 rows back out is
-                    // the carry-forward's cost as much as writing them is, and
-                    // splitting the two would leave the larger half unnamed.
-                    let (path, name, qn, kind, start, end, exported, b_exact, b_struct, b_nodes) = {
-                        let _charge = charge(&mut spent.nodes);
-                        row?
-                    };
-                    if !carry.contains(&path) {
-                        continue;
-                    }
-                    let file_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &path)?;
-                    {
-                        let _charge = charge(&mut spent.nodes);
-                        tx.prepare_cached(
-                            "INSERT INTO generation_nodes (generation_id, ordinal, file_id, name, qualified_name, kind, span_start, span_end, is_exported, body_exact, body_structural, body_nodes)
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                        )?
-                        .execute(params![
-                            gen_id, node_ord, file_id, name, qn, kind, start, end, exported,
-                            b_exact, b_struct, b_nodes
-                        ])?;
-                    }
-                    let fts_rowid = Self::fts_rowid(gen_id, node_ord);
-                    {
-                        let _charge = charge(&mut spent.fts);
-                        tx.prepare_cached(
-                            "INSERT INTO nodes_fts (rowid, name, qualified_name, path) VALUES (?1, ?2, ?3, ?4)",
-                        )?
-                        .execute(params![fts_rowid, name, qn, path])?;
-                        tx.prepare_cached(
-                            "INSERT INTO nodes_fts_map (rowid_ref, generation_id) VALUES (?1, ?2)",
-                        )?
-                        .execute(params![fts_rowid, gen_id])?;
-                    }
-                    node_ord += 1;
+        // Retire the membership this generation does not keep: every row that
+        // was open before the write and names a file that is neither carried nor
+        // freshly extracted. Deleted files, and on a full rewrite every file
+        // the new tree no longer has. Closed rather than deleted, so the
+        // retained generations that still held the file keep reading it.
+        {
+            let _charge = charge(&mut spent.file_rows);
+            let mut close = tx.prepare_cached(
+                "UPDATE file_rows SET valid_to = ?2 WHERE row_id = ?1 AND valid_to IS NULL",
+            )?;
+            for (file_id, (row_id, _)) in &open_rows {
+                if !member_files.contains(file_id) {
+                    close.execute(params![row_id, gen_id])?;
                 }
-            }
-            if !carry.is_empty() {
-                // One statement for the whole carry set, handed over as a JSON
-                // array and expanded by `json_each`, rather than one execute
-                // per path. The row set is the one the per-path loop copied:
-                // every previous-generation literal whose file path is in
-                // `carry`.
-                let _charge = charge(&mut spent.literals);
-                let carried_paths = serde_json::to_string(&carry).map_err(|error| {
-                    refusal(format!("literal carry set serialization failed: {error}"))
-                })?;
-                tx.prepare_cached(
-                    "INSERT INTO generation_literals
-                        (generation_id, file_id, line, span_start, value, qualified_name, symbol_name)
-                     SELECT ?1, l.file_id, l.line, l.span_start, l.value, l.qualified_name, l.symbol_name
-                       FROM generation_literals l
-                      WHERE l.generation_id = ?2
-                        AND l.file_id IN (
-                            SELECT p.id FROM paths p
-                             WHERE p.path IN (SELECT j.value FROM json_each(?3) j))",
-                )?
-                .execute(params![gen_id, prev, carried_paths])?;
-            }
-        }
-
-        // Insert fresh rows for every extraction whose file was not carried.
-        for ext in fresh.iter().copied() {
-            let file_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &ext.file_path)?;
-            for sym in &ext.symbols {
-                {
-                    let _charge = charge(&mut spent.nodes);
-                    tx.prepare_cached(
-                        "INSERT INTO generation_nodes (generation_id, ordinal, file_id, name, qualified_name, kind, span_start, span_end, is_exported, body_exact, body_structural, body_nodes)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                    )?
-                    .execute(
-                        params![
-                            gen_id,
-                            node_ord,
-                            file_id,
-                            sym.name,
-                            sym.qualified_name,
-                            sym.kind.as_str(),
-                            i64::try_from(sym.span.start_byte).map_err(|error| {
-                                rusqlite::Error::ToSqlConversionFailure(Box::new(error))
-                            })?,
-                            i64::try_from(sym.span.end_byte).map_err(|error| {
-                                rusqlite::Error::ToSqlConversionFailure(Box::new(error))
-                            })?,
-                            sym.is_exported as i32,
-                            // SQLite integers are signed. The cast is
-                            // bit-preserving and reversed on read, so the stored
-                            // value round-trips even though half the hash space
-                            // reads back negative.
-                            sym.body_signature.map(|s| s.exact as i64),
-                            sym.body_signature.map(|s| s.structural as i64),
-                            sym.body_signature.map(|s| i64::from(s.nodes))
-                        ],
-                    )?;
-                }
-                let fts_rowid = Self::fts_rowid(gen_id, node_ord);
-                {
-                    let _charge = charge(&mut spent.fts);
-                    tx.prepare_cached(
-                        "INSERT INTO nodes_fts (rowid, name, qualified_name, path) VALUES (?1, ?2, ?3, ?4)",
-                    )?
-                    .execute(params![fts_rowid, sym.name, sym.qualified_name, ext.file_path])?;
-                    tx.prepare_cached(
-                        "INSERT INTO nodes_fts_map (rowid_ref, generation_id) VALUES (?1, ?2)",
-                    )?
-                    .execute(params![fts_rowid, gen_id])?;
-                }
-                node_ord += 1;
-            }
-            let _charge = charge(&mut spent.literals);
-            for lit in &ext.literals {
-                if lit.value.is_empty() || lit.value.as_bytes().contains(&0) {
-                    continue;
-                }
-                tx.prepare_cached(
-                    "INSERT OR IGNORE INTO generation_literals
-                        (generation_id, file_id, line, span_start, value, qualified_name, symbol_name)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                )?
-                .execute(
-                    params![
-                        gen_id,
-                        file_id,
-                        i64::from(lit.line),
-                        i64::try_from(lit.start_byte).unwrap_or(i64::MAX),
-                        lit.value,
-                        lit.enclosing_qualified_name,
-                        lit.enclosing_name,
-                    ],
-                )?;
             }
         }
 
@@ -1323,7 +1315,15 @@ impl Store {
             std::collections::HashMap::new();
         let mut stored_unresolved_digests: std::collections::HashMap<u32, RowSetDigest> =
             std::collections::HashMap::new();
-        if let (true, Some(prev)) = (scope_by_digest, prev_gen) {
+        // The digest rows open before this write, with the id each is closed by.
+        //
+        // Read on every write, not only a scoped one: what this build records is
+        // the difference between its digests and these, and a build that
+        // compared nothing would rewrite a row per file as v27 did. The
+        // `stored_*` maps are views of the same rows for the scoped comparison.
+        let mut open_digests: std::collections::HashMap<u32, (i64, RowSetDigest, RowSetDigest)> =
+            std::collections::HashMap::new();
+        {
             let _charge = charge(&mut spent.digests);
             // Both sides keyed by `paths.id`, and the join to `paths` gone with
             // the reason for it.
@@ -1335,22 +1335,21 @@ impl Store {
             // there is one key, one column, and no per-row translation on
             // either side.
             let mut stmt = tx.prepare(
-                "SELECT file_id, edge_rows, edge_lo, edge_hi,
+                "SELECT file_id, row_id, edge_rows, edge_lo, edge_hi,
                         unresolved_rows, unresolved_lo, unresolved_hi
-                   FROM generation_file_digests
-                  WHERE generation_id = ?1",
+                   FROM digest_rows
+                  WHERE valid_to IS NULL",
             )?;
-            let mut rows = stmt.query(params![prev])?;
+            let mut rows = stmt.query([])?;
             while let Some(row) = rows.next()? {
                 let file_id: u32 = row.get(0)?;
-                stored_edge_digests.insert(
-                    file_id,
-                    RowSetDigest::from_columns(row.get(1)?, row.get(2)?, row.get(3)?),
-                );
-                stored_unresolved_digests.insert(
-                    file_id,
-                    RowSetDigest::from_columns(row.get(4)?, row.get(5)?, row.get(6)?),
-                );
+                let edges = RowSetDigest::from_columns(row.get(2)?, row.get(3)?, row.get(4)?);
+                let unresolved = RowSetDigest::from_columns(row.get(5)?, row.get(6)?, row.get(7)?);
+                if scope_by_digest {
+                    stored_edge_digests.insert(file_id, edges);
+                    stored_unresolved_digests.insert(file_id, unresolved);
+                }
+                open_digests.insert(file_id, (row.get(1)?, edges, unresolved));
             }
         }
 
@@ -2224,8 +2223,10 @@ impl Store {
         // would double a table whose whole purpose is to be cheap to read.
         {
             let _charge = charge(&mut spent.digests);
-            let mut digests: std::collections::HashMap<u32, (RowSetDigest, RowSetDigest)> =
-                std::collections::HashMap::with_capacity(fresh_edge_digests.len());
+            // Ordered by file id: the rows' ids are handed out by insertion
+            // order, and a store written twice from one input must hold the
+            // same rows whatever order a hash map happened to visit them in.
+            let mut digests: BTreeMap<u32, (RowSetDigest, RowSetDigest)> = BTreeMap::new();
             for (file_id, digest) in &fresh_edge_digests {
                 digests.entry(*file_id).or_default().0 = *digest;
             }
@@ -2237,17 +2238,34 @@ impl Store {
             for (file_id, digest) in &fresh_unresolved_digests {
                 digests.entry(*file_id).or_default().1 = *digest;
             }
+            // The delta against the open rows: a file whose digest is what it
+            // was keeps its row and costs nothing, a changed one closes its row
+            // and opens another, and an open row for a file with no digest this
+            // build (it has none of either relation left) is closed.
+            let mut close = tx.prepare_cached(
+                "UPDATE digest_rows SET valid_to = ?2 WHERE row_id = ?1 AND valid_to IS NULL",
+            )?;
             let mut insert = tx.prepare_cached(
-                "INSERT INTO generation_file_digests
-                 (generation_id, file_id, edge_rows, edge_lo, edge_hi,
-                  unresolved_rows, unresolved_lo, unresolved_hi)
+                "INSERT INTO digest_rows
+                 (file_id, edge_rows, edge_lo, edge_hi,
+                  unresolved_rows, unresolved_lo, unresolved_hi, valid_from)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
+            for (file_id, (row_id, _, _)) in &open_digests {
+                if !digests.contains_key(file_id) {
+                    close.execute(params![row_id, gen_id])?;
+                }
+            }
             for (file_id, (edges, unresolved)) in &digests {
+                if let Some((row_id, open_edges, open_unresolved)) = open_digests.get(file_id) {
+                    if open_edges == edges && open_unresolved == unresolved {
+                        continue;
+                    }
+                    close.execute(params![row_id, gen_id])?;
+                }
                 let [edge_rows, edge_lo, edge_hi] = edges.to_columns();
                 let [unresolved_rows, unresolved_lo, unresolved_hi] = unresolved.to_columns();
                 insert.execute(params![
-                    gen_id,
                     file_id,
                     edge_rows,
                     edge_lo,
@@ -2255,6 +2273,7 @@ impl Store {
                     unresolved_rows,
                     unresolved_lo,
                     unresolved_hi,
+                    gen_id,
                 ])?;
             }
         }

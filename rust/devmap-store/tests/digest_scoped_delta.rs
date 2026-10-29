@@ -853,7 +853,7 @@ fn a_generation_with_no_recorded_digests_is_compared_in_full() {
              them below is a real reduction to the migrated state"
         );
         if erase_digests {
-            conn.execute("DELETE FROM generation_file_digests", [])
+            conn.execute("DELETE FROM digest_rows", [])
                 .unwrap();
         }
         drop(conn);
@@ -938,7 +938,7 @@ fn an_absent_digest_is_not_a_matching_one() {
     let before = rows_at(&db, g1);
 
     let conn = Connection::open(&db).unwrap();
-    conn.execute("DELETE FROM generation_file_digests", [])
+    conn.execute("DELETE FROM digest_rows", [])
         .unwrap();
     drop(conn);
 

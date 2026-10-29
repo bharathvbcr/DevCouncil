@@ -1871,6 +1871,23 @@ fn append_kinds(sql: &mut String, params: &mut Vec<Box<dyn ToSql>>, kinds: &[Str
     sql.push(')');
 }
 
+/// The payload a `nodes_fts` rowid names, as SQL. Decodes
+/// [`Store::fts_rowid`]; the test beside it holds the literal to
+/// [`crate::schema::NODE_ORD_BITS`].
+/// The literal sites of one generation, as `l`, under the file row `r` that
+/// brings each payload into it. Binds the generation with the first `?`; a
+/// caller adds `JOIN paths p ON p.id = r.file_id` for the path.
+pub(crate) const LITERAL_SITES: &str = "payload_literals l
+     JOIN file_rows r ON r.payload_id = l.payload_id
+     JOIN generations g
+       ON g.id = ? AND g.id >= r.valid_from AND (r.valid_to IS NULL OR g.id < r.valid_to)";
+
+pub(crate) const FTS_PAYLOAD_SQL: &str = "(nodes_fts.rowid >> 24)";
+
+/// The symbol's place in its payload, as SQL: the other half of
+/// [`FTS_PAYLOAD_SQL`].
+pub(crate) const FTS_ORD_SQL: &str = "(nodes_fts.rowid & 16777215)";
+
 fn distinct_kinds(
     conn: &Connection,
     generation: u32,
@@ -1897,7 +1914,8 @@ fn distinct_kinds(
     Ok(present)
 }
 
-/// `?` placeholders, in order: generation, then the value.
+/// `?` placeholders, in order: generation (bound by [`LITERAL_SITES`]), then the
+/// value.
 ///
 /// Exact is equality. Otherwise the value contains the query anywhere:
 /// `instr` rather than `LIKE`, so `%` and `_` are text and the comparison is
@@ -1907,9 +1925,9 @@ fn literal_predicate(generation: u32, query: &str, exact: bool) -> (String, Vec<
     let params: Vec<Box<dyn ToSql>> =
         vec![Box::new(i64::from(generation)), Box::new(query.to_string())];
     let predicate = if exact {
-        "l.generation_id = ? AND l.value = ?"
+        "l.value = ?"
     } else {
-        "l.generation_id = ? AND instr(l.value, ?) > 0"
+        "instr(l.value, ?) > 0"
     };
     (predicate.to_string(), params)
 }
@@ -2298,6 +2316,56 @@ const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
             "value",
             "qualified_name",
             "symbol_name",
+        ],
+    ),
+    // v28's base tables, listed for the reason `edge_rows` is: the views above
+    // are checked through `PRAGMA table_info`, which says nothing about what
+    // they are views over, and a store whose payload tables had lost a column
+    // would pass every check above and fail at the first write.
+    (
+        "payload_nodes",
+        &[
+            "payload_id",
+            "ord_in_file",
+            "name",
+            "qualified_name",
+            "kind",
+            "span_start",
+            "span_end",
+            "is_exported",
+            "body_exact",
+            "body_structural",
+            "body_nodes",
+        ],
+    ),
+    (
+        "payload_literals",
+        &[
+            "payload_id",
+            "line",
+            "span_start",
+            "value",
+            "qualified_name",
+            "symbol_name",
+        ],
+    ),
+    (
+        "file_rows",
+        &["row_id", "file_id", "payload_id", "valid_from", "valid_to"],
+    ),
+    (
+        "digest_rows",
+        &[
+            "row_id",
+            "file_id",
+            "edge_rows",
+            "edge_lo",
+            "edge_hi",
+            "unresolved_rows",
+            "unresolved_lo",
+            "unresolved_hi",
+            "valid_from",
+            "valid_to",
         ],
     ),
     (

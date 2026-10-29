@@ -28,8 +28,11 @@ fn plan(conn: &Connection, sql: &str) -> Vec<String> {
     let mut statement = conn
         .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
         .unwrap_or_else(|error| panic!("{sql}: {error}"));
+    let bound = vec![1i64; statement.parameter_count()];
     let rows: Vec<String> = statement
-        .query_map([1], |row| row.get::<_, String>(3))
+        .query_map(rusqlite::params_from_iter(bound.iter()), |row| {
+            row.get::<_, String>(3)
+        })
         .expect("plan rows")
         .collect::<Result<_, _>>()
         .expect("every plan row reads");
@@ -37,8 +40,15 @@ fn plan(conn: &Connection, sql: &str) -> Vec<String> {
 }
 
 /// Tables `Store::prune_generations_except_latest` deletes from by
-/// `generation_id`, in the order it deletes them.
-const PRUNED_PER_GENERATION: [&str; 7] = [
+/// `generation_id`, in the order it deletes them. Since v28 these are the two
+/// relations that are still per-generation; nodes, literals, full-text rows,
+/// membership and digests are keyed by payload or by range.
+const PRUNED_PER_GENERATION: [&str; 2] = ["generation_coverage_gaps", "generation_dead_symbols"];
+
+/// What a generation *reads*, through the compatibility views and the two
+/// per-generation tables: the rows a prune must leave whole for a retained
+/// generation and take from a pruned one.
+const READ_BY_GENERATION: [&str; 7] = [
     "nodes_fts_map",
     "generation_nodes",
     "generation_file_rows",
@@ -46,6 +56,16 @@ const PRUNED_PER_GENERATION: [&str; 7] = [
     "generation_file_digests",
     "generation_dead_symbols",
     "generation_literals",
+];
+
+/// The statements that retire one payload with the rows derived from it, each of
+/// which must be answered by a search on the payload id (or, for the full-text
+/// index, on the rowid range that payload's symbols occupy).
+const PAYLOAD_RETIREMENT: [&str; 4] = [
+    "DELETE FROM nodes_fts WHERE rowid >= ?1 AND rowid < ?2",
+    "DELETE FROM payload_nodes WHERE payload_id = ?1",
+    "DELETE FROM payload_literals WHERE payload_id = ?1",
+    "DELETE FROM file_payloads WHERE payload_id = ?1",
 ];
 
 #[test]
@@ -66,28 +86,31 @@ fn b6_every_prune_delete_is_an_index_search_not_a_table_scan() {
         );
     }
 
-    // The FTS rows are found through the membership map, so the map must be
-    // searched by generation; a scan of it makes prune cost the whole index.
-    let fts = plan(
-        &conn,
-        "DELETE FROM nodes_fts WHERE rowid IN \
-         (SELECT rowid_ref FROM nodes_fts_map WHERE generation_id = ?1)",
-    );
-    assert!(
-        fts.iter()
-            .any(|step| step.contains("nodes_fts_map") && step.contains("generation_id=?")),
-        "the FTS prune must look members up by generation_id, got {fts:?}"
-    );
-    assert!(
-        !fts.iter()
-            .any(|step| step.starts_with("SCAN nodes_fts_map")),
-        "the FTS prune must not scan the membership map, got {fts:?}"
-    );
+    // What a pruned payload takes with it is found by the payload's own id, so
+    // retiring one payload costs that payload and not the rows the retained
+    // ones hold. The full-text rows are a rowid range, not a membership lookup.
+    for statement in PAYLOAD_RETIREMENT {
+        let steps = plan(&conn, statement);
+        // SQLite reports every virtual-table access as a `SCAN`. What
+        // distinguishes a bounded one is the constraint string FTS5 hands back:
+        // `><` is both ends of a rowid range, which FTS5 answers by seeking its
+        // content table, where an unconstrained read has an empty string.
+        let bounded_virtual = statement.starts_with("DELETE FROM nodes_fts")
+            && steps
+                .iter()
+                .all(|step| step.contains("VIRTUAL TABLE INDEX") && step.contains("><"));
+        assert!(
+            bounded_virtual
+                || (steps.iter().any(|step| step.contains("SEARCH"))
+                    && !steps.iter().any(|step| step.contains("SCAN"))),
+            "{statement} must be an index search, got {steps:?}"
+        );
+    }
 }
 
-/// The per-generation deletes `prune_generations_except_latest` really issues,
-/// read from its source, so the plan check above cannot drift from the code it
-/// claims to describe.
+/// The deletes `prune_generations_except_latest` really issues, read from its
+/// source, so the plan checks above cannot drift from the code they claim to
+/// describe.
 #[test]
 fn b6_the_checked_deletes_are_the_ones_prune_issues() {
     let source = include_str!("../src/db/maintenance.rs");
@@ -115,12 +138,20 @@ fn b6_the_checked_deletes_are_the_ones_prune_issues() {
         issued, checked,
         "prune deletes by generation_id from a different set of tables than the plan check covers"
     );
-    assert!(
-        body.contains(
-            "DELETE FROM nodes_fts WHERE rowid IN (SELECT rowid_ref FROM nodes_fts_map WHERE generation_id = ?1)"
-        ),
-        "the FTS prune statement the plan check mirrors is no longer the one prune issues"
-    );
+
+    // The payload retirement is one function, `delete_unreferenced_payloads`,
+    // and `delete_payload_rows` under it. Both live in this file, and their
+    // statements are the ones whose plans are checked.
+    for statement in PAYLOAD_RETIREMENT {
+        let spelled = statement
+            .split_once(" WHERE ")
+            .map(|(delete, _)| delete)
+            .expect("each retirement statement has a WHERE");
+        assert!(
+            source.contains(spelled),
+            "the payload retirement no longer issues `{spelled}`, which the plan check mirrors"
+        );
+    }
 }
 
 /// A store whose four generations each rename the entry function, so every
@@ -174,7 +205,7 @@ fn b6_prune_removes_exactly_the_generations_outside_the_window() {
         let before: Vec<Vec<i64>> = generations
             .iter()
             .map(|generation| {
-                PRUNED_PER_GENERATION
+                READ_BY_GENERATION
                     .iter()
                     .map(|table| rows_of(&inspect, table, *generation))
                     .collect()
@@ -221,7 +252,7 @@ fn b6_prune_removes_exactly_the_generations_outside_the_window() {
             .unwrap();
         assert_eq!(remaining, generations[removed..]);
         for (index, generation) in generations.iter().enumerate() {
-            let now: Vec<i64> = PRUNED_PER_GENERATION
+            let now: Vec<i64> = READ_BY_GENERATION
                 .iter()
                 .map(|table| rows_of(&inspect, table, *generation))
                 .collect();
@@ -237,6 +268,31 @@ fn b6_prune_removes_exactly_the_generations_outside_the_window() {
                 );
             }
         }
+        // What a pruned payload takes with it: every symbol, literal and
+        // full-text row that survives belongs to a payload that does, and the
+        // index holds exactly the symbols the payload table does. Four
+        // generations of one renamed file make three payloads unreachable for
+        // `keep = 1` and two for `keep = 2`, so this is not vacuous.
+        for orphaned in [
+            "SELECT COUNT(*) FROM payload_nodes WHERE payload_id NOT IN \
+             (SELECT payload_id FROM file_payloads)",
+            "SELECT COUNT(*) FROM payload_literals WHERE payload_id NOT IN \
+             (SELECT payload_id FROM file_payloads)",
+            "SELECT COUNT(*) FROM file_payloads WHERE payload_id NOT IN \
+             (SELECT payload_id FROM file_rows)",
+        ] {
+            assert_eq!(count_of(&inspect, orphaned), 0, "{orphaned}");
+        }
+        assert_eq!(
+            count_of(&inspect, "SELECT COUNT(*) FROM nodes_fts"),
+            count_of(&inspect, "SELECT COUNT(*) FROM payload_nodes"),
+            "the full-text index must hold the retained payloads' symbols and no others"
+        );
+        assert_eq!(
+            count_of(&inspect, "SELECT COUNT(*) FROM file_payloads"),
+            (generations.len() - removed) as i64,
+            "one payload per retained generation of the renamed file"
+        );
         // `valid_to <= oldest retained` is unreachable by any retained
         // generation; a range closed later is still read by one of them.
         assert_eq!(
@@ -397,6 +453,16 @@ fn b9_no_primary_key_carries_a_column_its_ordinal_already_determines() {
             assert_eq!(
                 key,
                 ["generation_id", "ordinal"],
+                "{table} primary key carries a redundant column"
+            );
+            checked += 1;
+        }
+        // v28's payload-keyed twin of the same rule: a symbol is
+        // `(payload_id, ord_in_file)` and nothing else belongs in its key.
+        if key.iter().any(|column| column == "ord_in_file") {
+            assert_eq!(
+                key,
+                ["payload_id", "ord_in_file"],
                 "{table} primary key carries a redundant column"
             );
             checked += 1;

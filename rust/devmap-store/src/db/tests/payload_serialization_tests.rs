@@ -135,7 +135,7 @@ fn dump(store: &Store) -> Vec<(String, Vec<String>)> {
               WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
                 AND name NOT IN ('build_history', 'extraction_cache', 'extraction_retry',
                                  'extraction_cache_v4', 'pending_state', 'pending_paths')
-                AND name NOT LIKE 'nodes_fts\\_%' ESCAPE '\\' OR name = 'nodes_fts_map'
+                AND name NOT LIKE 'nodes_fts\\_%' ESCAPE '\\'
               ORDER BY name",
         )
         .unwrap()
@@ -322,12 +322,11 @@ fn the_table_dump_covers_the_relations_the_write_fills() {
     for table in [
         "paths",
         "file_payloads",
-        "generation_file_rows",
-        "generation_nodes",
-        "generation_literals",
+        "file_rows",
+        "payload_nodes",
+        "payload_literals",
         "edge_rows",
-        "generation_file_digests",
-        "nodes_fts_map",
+        "digest_rows",
     ] {
         assert!(
             !rows_of(&dump, table).is_empty(),

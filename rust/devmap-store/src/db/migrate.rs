@@ -6,7 +6,7 @@ use crate::schema::{
     MIGRATION_V17_TO_V18_BACKFILL_EDGES, MIGRATION_V17_TO_V18_BACKFILL_UNRESOLVED,
     MIGRATION_V17_TO_V18_RENAME_EDGES, MIGRATION_V17_TO_V18_RENAME_UNRESOLVED,
     MIGRATION_V18_TO_V19, MIGRATION_V19_TO_V20, MIGRATION_V20_TO_V21, MIGRATION_V21_TO_V22,
-    MIGRATION_V23_TO_V24, MIGRATION_V25_TO_V26, MIGRATION_V26_TO_V27, MIGRATION_V3_TO_V4,
+    MIGRATION_V23_TO_V24, MIGRATION_V25_TO_V26, MIGRATION_V26_TO_V27, MIGRATION_V27_TO_V28, MIGRATION_V3_TO_V4,
     MIGRATION_V4_TO_V5, MIGRATION_V4_TO_V5_EDGE_INDEXES, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7,
     MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, MIN_READER_SCHEMA_VERSION,
     READER_COMPAT_TABLE, VALIDITY_RANGE_TABLES,
@@ -145,6 +145,65 @@ impl Store {
             )));
         }
         Ok(Some(floor as i32))
+    }
+
+
+    /// The v28 rung: move nodes, literals, full-text rows, file membership and
+    /// digests onto payloads and validity ranges ([`MIGRATION_V27_TO_V28`]).
+    ///
+    /// Guarded on the shape rather than the stamp, like the v22 rung: a store
+    /// whose `generation_nodes` is already a view has had this rung applied,
+    /// and re-running it would read tables it no longer has.
+    ///
+    /// This rung moves rows, so it counts them. The latest generation's symbol,
+    /// literal, file and digest rows are counted through the v27 tables before
+    /// and through the v28 views after, and any difference refuses the whole
+    /// migration. Every statement is in the caller's one transaction, so the
+    /// refusal leaves the v27 store as it was. Only the latest generation is
+    /// compared: an older retained generation may name a payload the newest
+    /// also names, and a payload stores one copy of its rows.
+    fn migrate_to_v28(conn: &Connection) -> Result<()> {
+        if !Self::relation_is_table(conn, "generation_nodes")? {
+            return Ok(());
+        }
+        let counts = |conn: &Connection| -> Result<Option<[i64; 4]>> {
+            let latest: Option<i64> = conn.query_row(
+                "SELECT MAX(id) FROM generations",
+                [],
+                |row| row.get(0),
+            )?;
+            let Some(latest) = latest else {
+                return Ok(None);
+            };
+            let mut counted = [0i64; 4];
+            for (slot, relation) in [
+                "generation_nodes",
+                "generation_literals",
+                "generation_file_rows",
+                "generation_file_digests",
+            ]
+            .iter()
+            .enumerate()
+            {
+                counted[slot] = conn.query_row(
+                    &format!("SELECT COUNT(*) FROM {relation} WHERE generation_id = ?1"),
+                    params![latest],
+                    |row| row.get(0),
+                )?;
+            }
+            Ok(Some(counted))
+        };
+        let before = counts(conn)?;
+        conn.execute_batch(MIGRATION_V27_TO_V28)?;
+        let after = counts(conn)?;
+        if before != after {
+            return Err(refusal(format!(
+                "moving the store to schema 28 changed the latest generation's rows \
+                 (nodes, literals, file rows, digests): {before:?} before, {after:?} after; \
+                 the store has been left unmigrated"
+            )));
+        }
+        Ok(())
     }
 
     /// Refuse a store whose schema carries a trigger.
@@ -445,6 +504,10 @@ impl Store {
             tx.execute_batch(MIGRATION_V23_TO_V24)?;
             tx.execute_batch(MIGRATION_V25_TO_V26)?;
             Self::add_dead_evidence_columns(tx)?;
+            // Over the empty v27 shape just built, like the v22 rung above:
+            // the fresh path and the ladder land on one schema because they run
+            // one batch.
+            Self::migrate_to_v28(tx)?;
             Self::stamp_reader_compat(tx)?;
             Self::validate_schema(tx)?;
             tx.execute(
@@ -834,7 +897,15 @@ impl Store {
             version = 25;
         }
         if version == 25 {
-            conn.execute_batch(MIGRATION_V25_TO_V26)?;
+            // Not over a view: a store re-stamped to an earlier version and
+            // walked up carries v28's `generation_literals` view, and indexing
+            // a view is an error. The table is absent (a real v25 store) or the
+            // rung's own.
+            if Self::relation_is_table(conn, "generation_literals")?
+                || !Self::relation_exists(conn, "generation_literals")?
+            {
+                conn.execute_batch(MIGRATION_V25_TO_V26)?;
+            }
             conn.execute("PRAGMA user_version = 26", [])?;
             version = 26;
         }
@@ -842,6 +913,11 @@ impl Store {
             Self::add_dead_evidence_columns(conn)?;
             conn.execute("PRAGMA user_version = 27", [])?;
             version = 27;
+        }
+        if version == 27 {
+            Self::migrate_to_v28(conn)?;
+            conn.execute("PRAGMA user_version = 28", [])?;
+            version = 28;
         }
         if version != CURRENT_SCHEMA_VERSION {
             return Err(Self::unsupported_schema(store, version));

@@ -2,7 +2,7 @@ use super::{
     checked_span, fts_damage_reason, fts_match_query, lock_conn, refusal, sqlite_limit,
     validate_head_sha, BuildHistoryRow, CachedSourceFreshness, FileSymbolsPage, LedgerKey,
     QuerySourceFreshness, SourceTreeDelta, Store, StoreStatus, StoredSymbol, UnresolvedSiteRow,
-    UnresolvedSitesByName, MAX_PENDING_ATTEMPTS,
+    UnresolvedSitesByName, FTS_PAYLOAD_SQL, MAX_PENDING_ATTEMPTS,
 };
 use crate::coverage::{CoverageGapRow, CoverageGapSample, CoverageGaps, DiscoveryRefusal};
 use crate::edge_index::ResolutionSource;
@@ -538,11 +538,14 @@ impl Store {
         let mut stmt = snapshot.prepare(
             "SELECT n.name, n.qualified_name, n.kind, p.path,
                     n.span_start, n.span_end, n.is_exported, f.content_hash
-             FROM generation_nodes n
-             JOIN generation_files f ON f.generation_id = n.generation_id AND f.file_id = n.file_id
-             JOIN paths p ON p.id = n.file_id
-             WHERE n.generation_id = ?1 AND p.path = ?2
-             ORDER BY n.span_start, n.ordinal",
+             FROM generations g
+             JOIN file_rows r
+               ON g.id >= r.valid_from AND (r.valid_to IS NULL OR g.id < r.valid_to)
+             JOIN payload_nodes n ON n.payload_id = r.payload_id
+             JOIN file_payloads f ON f.payload_id = r.payload_id
+             JOIN paths p ON p.id = r.file_id
+             WHERE g.id = ?1 AND p.path = ?2
+             ORDER BY n.span_start, n.ord_in_file",
         )?;
         let rows = stmt
             .query_map(params![generation, path], |row| {
@@ -717,8 +720,13 @@ impl Store {
 
         let probe: Option<String> = snapshot
             .query_row(
-                "SELECT name FROM generation_nodes
-                 WHERE generation_id = ?1 ORDER BY ordinal LIMIT 1",
+                "SELECT n.name
+                   FROM generations g
+                   JOIN file_rows r
+                     ON g.id >= r.valid_from AND (r.valid_to IS NULL OR g.id < r.valid_to)
+                   JOIN payload_nodes n ON n.payload_id = r.payload_id
+                  WHERE g.id = ?1
+                  ORDER BY n.payload_id, n.ord_in_file LIMIT 1",
                 params![generation],
                 |row| row.get(0),
             )
@@ -727,11 +735,15 @@ impl Store {
             Some(name) => {
                 let match_query = fts_match_query(name)?;
                 match snapshot.query_row(
-                    "SELECT COUNT(*)
-                     FROM nodes_fts
-                     CROSS JOIN nodes_fts_map m
-                       ON m.rowid_ref = nodes_fts.rowid AND m.generation_id = ?1
-                     WHERE nodes_fts MATCH ?2",
+                    &format!(
+                        "SELECT COUNT(*)
+                         FROM nodes_fts
+                         CROSS JOIN file_rows r ON r.payload_id = {FTS_PAYLOAD_SQL}
+                         JOIN generations g
+                           ON g.id = ?1 AND g.id >= r.valid_from
+                          AND (r.valid_to IS NULL OR g.id < r.valid_to)
+                         WHERE nodes_fts MATCH ?2"
+                    ),
                     params![generation, match_query],
                     |row| row.get::<_, i64>(0),
                 ) {
@@ -753,9 +765,13 @@ impl Store {
             Some(reachable) => reachable,
             None => {
                 let counted = snapshot.query_row(
-                    "SELECT COUNT(*) FROM nodes_fts_map m
-                     JOIN nodes_fts f ON f.rowid = m.rowid_ref
-                     WHERE m.generation_id = ?1",
+                    "SELECT COUNT(*)
+                       FROM generations g
+                       JOIN file_rows r
+                         ON g.id >= r.valid_from AND (r.valid_to IS NULL OR g.id < r.valid_to)
+                       JOIN payload_nodes n ON n.payload_id = r.payload_id
+                       JOIN nodes_fts f ON f.rowid = ((n.payload_id << 24) | n.ord_in_file)
+                      WHERE g.id = ?1",
                     params![generation],
                     |row| row.get::<_, i64>(0),
                 );

@@ -31,8 +31,9 @@ fn tampered_store(label: &str, sql: &str) -> std::path::PathBuf {
     path
 }
 
-const PERSISTENCE_TRIGGER: &str = "CREATE TRIGGER inject AFTER INSERT ON generation_literals
-     BEGIN UPDATE generation_literals SET value = 'INJECTED-BY-SHIPPED-STORE' WHERE rowid = NEW.rowid; END;";
+const PERSISTENCE_TRIGGER: &str = "CREATE TRIGGER inject AFTER INSERT ON payload_literals
+     BEGIN UPDATE payload_literals SET value = 'INJECTED-BY-SHIPPED-STORE'
+      WHERE payload_id = NEW.payload_id AND span_start = NEW.span_start; END;";
 
 const SPINNING_TRIGGER: &str = "CREATE TRIGGER spin AFTER INSERT ON generations BEGIN
      WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT count(*) FROM r; END;";

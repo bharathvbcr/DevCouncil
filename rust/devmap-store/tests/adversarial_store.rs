@@ -865,17 +865,18 @@ fn count_callers_of_matches_the_listing_it_replaces() {
 /// returns "this repository does not contain that symbol", forever, and the one
 /// command that would fix it is the one nothing tells the operator to run.
 ///
-/// Both halves of the desync are exercised because they fail differently: the
-/// posting list can be lost while the map survives, and the map can be lost
-/// while the postings survive. The rows are deleted out of band because that is
-/// the state under test; the mechanism that produces it in the field is
-/// whatever `repair --fts` was written for.
+/// Both halves of the desync were exercised until v28, because they failed
+/// differently: the posting list could be lost while the map survived, and the
+/// map could be lost while the postings survived. Since v28 there is no map to
+/// lose on its own -- a symbol's rowid is derived from `payload_nodes`, so a
+/// store without it has no symbols rather than symbols the index cannot reach --
+/// and what remains is the posting list lost, and *part* of it lost, which
+/// `status` reports through `fts_health_locked`. The rows are deleted out of
+/// band because that is the state under test; the mechanism that produces it in
+/// the field is whatever `repair --fts` was written for.
 #[test]
 fn a_search_whose_index_is_missing_is_refused_rather_than_answered_as_empty() {
-    for (label, damage) in [
-        ("postings lost", "DELETE FROM nodes_fts"),
-        ("map lost", "DELETE FROM nodes_fts_map"),
-    ] {
+    for (label, damage) in [("postings lost", "DELETE FROM nodes_fts")] {
         let dir = tmp_dir("fts-desync");
         let db_path = dir.join("index.sqlite");
         {

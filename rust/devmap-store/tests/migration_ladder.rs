@@ -38,6 +38,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use devmap_store::{Store, CURRENT_SCHEMA_VERSION};
 use rusqlite::Connection;
 
+#[path = "support/v27_shape.rs"]
+mod v27_shape;
+
 fn tmp_dir(label: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let stamp = SystemTime::now()
@@ -93,14 +96,32 @@ fn seed_current_store(db_path: &Path) {
                (3, 3, 77, 'python', NULL, NULL, '"Clean"', '"TreeSitter"',
                 '{"file_path":"b.py"}');
 
-        INSERT INTO generation_file_rows (generation_id, file_id, payload_id)
-        VALUES (1, 1, 1), (1, 2, 2), (1, 3, 3);
+        -- Membership, symbols, literals and full-text rows as v28 stores them:
+        -- ranges over payloads. The three files hold one payload each, all
+        -- valid from generation 1 and still open. A symbol's full-text rowid is
+        -- `payload_id << 24 | ord_in_file`.
+        INSERT INTO file_rows (file_id, payload_id, valid_from, valid_to)
+        VALUES (1, 1, 1, NULL), (2, 2, 1, NULL), (3, 3, 1, NULL);
 
-        INSERT INTO generation_nodes
-            (generation_id, ordinal, file_id, name, qualified_name, kind,
+        INSERT INTO payload_nodes
+            (payload_id, ord_in_file, name, qualified_name, kind,
              span_start, span_end, is_exported, body_exact, body_structural, body_nodes)
-        VALUES (1, 0, 1, 'helper', 'a.py::helper', 'Function', 0, 10, 0, 111, 222, 4),
-               (1, 1, 3, 'main', 'b.py::main', 'Function', 0, 10, 1, NULL, NULL, NULL);
+        VALUES (1, 0, 'helper', 'a.py::helper', 'Function', 0, 10, 0, 111, 222, 4),
+               (3, 0, 'main', 'b.py::main', 'Function', 0, 10, 1, NULL, NULL, NULL);
+
+        INSERT INTO nodes_fts (rowid, name, qualified_name, path)
+        VALUES ((1 << 24) | 0, 'helper', 'a.py::helper', 'a.py'),
+               ((3 << 24) | 0, 'main', 'b.py::main', 'b.py');
+
+        INSERT INTO payload_literals
+            (payload_id, line, span_start, value, qualified_name, symbol_name)
+        VALUES (1, 2, 20, 'event:open', 'a.py::helper', 'helper'),
+               (3, 4, 40, 'event:open', 'b.py::main', 'main');
+
+        INSERT INTO digest_rows
+            (file_id, edge_rows, edge_lo, edge_hi, unresolved_rows, unresolved_lo,
+             unresolved_hi, valid_from, valid_to)
+        VALUES (3, 1, 5, 6, 1, 7, 8, 1, NULL);
 
         -- `generation_edges` and `generation_unresolved` are views over
         -- validity ranges since v18 and are not insertable; the rows live in
@@ -158,6 +179,16 @@ fn seed_current_store(db_path: &Path) {
 /// traceable to a line of `schema.rs`.
 fn reduce_one_rung(conn: &Connection, from_version: i32) {
     let sql: &str = match from_version {
+        // MIGRATION_V27_TO_V28: nodes, literals, full-text rows, file
+        // membership and digests moved onto payloads and ranges. Materialise
+        // each view back into the flat per-generation table it replaced, with
+        // the dense per-generation ordinal and the generation-scoped full-text
+        // rowid v27 used, and restore `nodes_fts_map`.
+        //
+        // `generation_files` is dropped for the length of the swap and put back
+        // as `CREATE_SCHEMA_V3` defines it: it names `generation_file_rows`,
+        // which SQLite re-parses when a table is renamed into that name.
+        28 => v27_shape::REDUCE_V28_TO_V27,
         // MIGRATION_V26_TO_V27: the three dead-row evidence columns.
         27 => {
             "ALTER TABLE generation_dead_symbols DROP COLUMN evidence_byte;
