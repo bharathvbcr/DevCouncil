@@ -46,7 +46,14 @@ changed". A root that does not exist contains nothing, so the command run
 against it reports the missing root itself. The Rust kernels apply the same
 rule to every `git` they run, in `dc_proc::resolve_outside`, which also refuses
 a relative or empty PATH entry (Go's `os/exec` already does; Rust's standard
-library does not).
+library does not). What it returns is a `dc_proc::Resolved`: the file the link
+chain reached, which is the file the boundary check examined and the only
+file that runs, together with the name the program was asked for. The name is
+kept because a program can decide what it is from its `argv[0]` — rustup's
+`~/.cargo/bin/rust-analyzer` is a link to `rustup`, which started as `rustup`
+prints its usage and exits — and `Resolved::command` starts the file under
+that name. Preserving the name changes nothing about which file executes.
+
 
 A trusted `git` can still be told to run programs by the repository's own
 `.git/config`, which can arrive with the repository. Every git read the host
@@ -255,6 +262,36 @@ child's whole process group, and both pipes drained concurrently on their own
 threads. That last one is load-bearing rather than tidy: a reader that takes
 stdout to EOF before touching stderr deadlocks the moment a child fills the
 stderr pipe, so hand-rolled capture is not a supported substitute.
+
+### A session child's stderr tail
+
+A session child (`dc_proc::spawn_session`: a language server under `devmap
+build --lsp`, `git cat-file --batch` under dc-regress) has its stderr piped
+and drained on its own thread to EOF, so a chatty child never blocks on a full
+pipe. Only the last `SESSION_STDERR_TAIL_BYTES` (4096) are retained, in
+memory, for the life of the session; earlier bytes are counted and discarded.
+The tail is never written to a log, a store or the terminal as the child wrote
+it. It reaches an operator by one path: `LspDidNotRun::NonZeroExit`, where
+`lsp::surface_stderr` passes it through `dc_redact::redact_secrets` (the same
+table dc-verify's secret gate and GitPulse's ledger use), drops the first line
+when bytes were dropped (a line cut mid-token matches no credential shape),
+and replaces control characters. That redacted text is what the build readout
+prints after `last stderr (redacted):` and what `build --json` carries at
+`lsp.servers[].stderr_tail`. dc-regress drains its git session's stderr into
+the same bounded tail and never reads it; its refusals carry only their own
+text.
+
+What the redaction does and does not cover is a property of `dc-redact`, not
+of this path: it redacts the credential shapes the table names — vendor
+prefixed keys (Anthropic, OpenAI, Stripe, GitHub, GitLab, Slack, AWS access
+key ids, Hugging Face, npm, PyPI and the others listed there), private-key PEM
+headers, JSON web tokens, HTTP `Authorization` credentials, passwords inline
+in a URL or on a command line, and a value assigned to a key named like a
+credential. It does not redact anything else a server may print: absolute
+paths (which name the operator's home directory), hostnames, environment
+variable values that are not credential-shaped, source text the server echoes,
+a key split across two lines, or a PEM body without its header. A server's
+stderr is shown only when the server exited, and only its last 4 KiB.
 
 Route scan results carry attempted/read/skipped/unreadable counts and source
 bytes. `scan.complete` is false after unreadable, oversized, budget-skipped or
