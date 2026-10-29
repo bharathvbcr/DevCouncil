@@ -201,6 +201,10 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
         payload
             .get("generation_id")
             .and_then(serde_json::Value::as_i64),
+        payload
+            .get("search_index_damaged")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
     ));
     emit_json(cli, &serde_json::Value::Object(payload))?;
     Ok(())
@@ -276,6 +280,7 @@ fn kernel_capabilities() -> serde_json::Value {
 fn host_contract_fields(
     stored_schema: Option<i32>,
     generation_id: Option<i64>,
+    search_index_damaged: bool,
 ) -> serde_json::Map<String, serde_json::Value> {
     let relation = match stored_schema {
         None => "missing",
@@ -296,7 +301,10 @@ fn host_contract_fields(
         ("reader_ready".into(), serde_json::json!(reader_ready)),
         (
             "query_ready".into(),
-            serde_json::json!(reader_ready && generation_id.is_some()),
+            // A store whose search index is unreadable or incomplete answers
+            // `search` with an error or a silent subset, so it is not ready to be
+            // queried however current its schema; `degraded_reason` says why.
+            serde_json::json!(reader_ready && generation_id.is_some() && !search_index_damaged),
         ),
     ])
 }
@@ -307,7 +315,7 @@ fn extend_host_contract(
     generation_id: Option<i64>,
 ) {
     if let Some(fields) = value.as_object_mut() {
-        fields.extend(host_contract_fields(stored_schema, generation_id));
+        fields.extend(host_contract_fields(stored_schema, generation_id, false));
     }
 }
 
@@ -358,6 +366,10 @@ pub(crate) fn store_status_fields(
         "analyzer_freshness": status.analyzer_freshness,
         "db_path": status.db_path,
         "degraded_reason": degraded_reason,
+        // The structured half of the full-text clause in `degraded_reason`,
+        // from the probe `devmap build` runs: a reader must not parse prose to
+        // learn that `search` will fail.
+        "search_index_damaged": store.search_index_damage()?.is_some(),
         "delta": status.source_delta.as_ref().map(devmap_serve::source_delta_json),
         "quarantined_count": status.quarantined_count,
         // K1(g): naming the stuck paths is what makes a degraded status

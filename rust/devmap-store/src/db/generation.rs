@@ -785,6 +785,24 @@ impl Store {
         Ok(None)
     }
 
+    /// Why the latest generation's search index cannot be trusted, if it cannot:
+    /// the probe `status` and `build` share.
+    ///
+    /// One owner for the verdict, so the two surfaces cannot disagree about a
+    /// store: `status` reads the same probe through [`Store::status`]'s
+    /// `degraded_reason`, and `build` asks it directly before it decides that
+    /// nothing changed. The answer is the reason text, which already names the
+    /// remedy; `None` is "no generation" or "the index is readable and whole".
+    pub fn search_index_damage(&self) -> Result<Option<String>> {
+        let conn = lock_conn(&self.conn)?;
+        let snapshot = conn.unchecked_transaction()?;
+        let Some(generation) = Self::latest_generation_id_locked(&snapshot)? else {
+            return Ok(None);
+        };
+        let (node_count, _) = self.generation_counts_locked(&snapshot, generation)?;
+        self.fts_health_locked(&snapshot, generation, node_count)
+    }
+
     /// The latest generation's analysis **status**, without its summary.
     ///
     /// `devmap status` needs one enum to decide whether the graph is degraded,

@@ -21,6 +21,7 @@
 mod support_ignored;
 
 mod a_budget_refused_file_is_re_extracted_by_the_next_build;
+mod a_damaged_store_is_set_aside_not_trusted;
 mod a_dead_verdict_lands_on_an_unchanged_file_under_a_narrowed_write;
 mod a_message_literal_has_no_run_of_spaces;
 mod a_named_root_must_be_a_directory;

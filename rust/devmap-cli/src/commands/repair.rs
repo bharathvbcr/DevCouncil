@@ -104,7 +104,9 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     if *fts {
         store.repair_fts().with_context(|| {
             format!(
-                "FTS repair failed; completed results: {}",
+                "FTS repair failed; completed results: {}. If this says the database \
+                 disk image is malformed, the file itself is damaged and no repair \
+                 reads past it: `devmap build` moves it aside and rebuilds from source",
                 serde_json::json!(receipt)
             )
         })?;

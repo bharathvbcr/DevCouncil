@@ -114,10 +114,54 @@ fn refusals_json(inventory: &devmap_store::DiscoveryInventory) -> serde_json::Va
     })
 }
 
+/// What `build` did to a store it found damaged, for the result and the
+/// terminal. Never silent: a store set aside is history the caller should know
+/// exists, and an index repaired in place is a fact about the last build.
+struct StoreRecovery {
+    action: &'static str,
+    reason: String,
+    quarantined_to: Option<std::path::PathBuf>,
+}
+
+impl StoreRecovery {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "action": self.action,
+            "reason": self.reason,
+            "quarantined_to": self.quarantined_to.as_ref().map(|path| path.display().to_string()),
+        })
+    }
+}
+
+/// Build the index, recovering from a damaged store file.
+///
+/// A store whose pages are damaged made every remedy it named fail with the
+/// same "database disk image is malformed" (`repair --fts`, `build --full`),
+/// while a plain `build` reported "unchanged" over it. Every row is derived
+/// from the working tree, so the way out is to move the file aside and build
+/// again. That happens in two places, both under the writer lock and both
+/// loud: [`run_once`] probes the search index before it decides anything is
+/// unchanged, and this wrapper retries once when the build itself dies on
+/// `SQLITE_CORRUPT`, after confirming with `PRAGMA quick_check` that the file
+/// is damaged and the error was not a single bad read.
 pub(crate) fn run(
     cli: &Cli,
     progress: Option<&ProgressReporter>,
     args: &Args,
+) -> anyhow::Result<()> {
+    match run_once(cli, progress, args, None) {
+        Err(error) if Store::is_database_corrupt(&error) => {
+            run_once(cli, progress, args, Some(error))
+        }
+        outcome => outcome,
+    }
+}
+
+fn run_once(
+    cli: &Cli,
+    progress: Option<&ProgressReporter>,
+    args: &Args,
+    corrupt_failure: Option<anyhow::Error>,
 ) -> anyhow::Result<()> {
     let Args {
         // Read through `cli.root_hint()` below, which already falls back to
@@ -171,7 +215,63 @@ pub(crate) fn run(
     let _writer = progress.timed("writer:wait", || {
         Store::lock_writer_at(&cli.db(), Store::WRITER_LOCK_WAIT)
     })?;
-    let store = progress.timed("store:open", || Store::open(cli.db()))?;
+    let mut recovery: Option<StoreRecovery> = None;
+    if let Some(failure) = corrupt_failure {
+        // The previous attempt died on SQLITE_CORRUPT. One bad read is not
+        // proof of a damaged file, so the file is checked whole before it is
+        // moved; a file that checks out gets the original error back.
+        match Store::quick_check(&cli.db())? {
+            Some(damage) => {
+                let reason = format!("the build failed with {failure:#}; quick_check: {damage}");
+                let moved = Store::quarantine_damaged(&cli.db(), &_writer)?;
+                progress.display.diagnostic(format_args!(
+                    "  the store {} is damaged; moved it to {} and rebuilding from source",
+                    cli.db().display(),
+                    moved.display()
+                ));
+                recovery = Some(StoreRecovery {
+                    action: "quarantined",
+                    reason,
+                    quarantined_to: Some(moved),
+                });
+            }
+            None => return Err(failure),
+        }
+    }
+    let mut store = progress.timed("store:open", || Store::open(cli.db()))?;
+    // The same probe `status` reports, asked before anything below can decide
+    // "nothing changed" over an index that cannot answer a search.
+    if let Some(damage) = store.search_index_damage()? {
+        match store.repair_fts() {
+            Ok(()) => {
+                progress.display.diagnostic(format_args!(
+                    "  search index repaired in place: {damage}"
+                ));
+                recovery = Some(StoreRecovery {
+                    action: "repaired_search_index",
+                    reason: damage,
+                    quarantined_to: None,
+                });
+            }
+            Err(error) if Store::sqlite_error_is_corrupt(&error) => {
+                drop(store);
+                let moved = Store::quarantine_damaged(&cli.db(), &_writer)?;
+                progress.display.diagnostic(format_args!(
+                    "  the store {} is damaged beyond a search-index repair; moved it to {} \
+                     and rebuilding from source",
+                    cli.db().display(),
+                    moved.display()
+                ));
+                recovery = Some(StoreRecovery {
+                    action: "quarantined",
+                    reason: damage,
+                    quarantined_to: Some(moved),
+                });
+                store = progress.timed("store:open", || Store::open(cli.db()))?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
     if let Some(previous) = store.bind_repo_root(path)? {
         progress.note(format_args!(
             "store rebound from {previous:?}, which no longer exists, to {}",
@@ -1006,6 +1106,10 @@ pub(crate) fn run(
                     })
                 }),
                 "manifest": manifest.as_ref().map(|manifest| &manifest.json),
+                // What was done to a damaged store before this build, or `null`.
+                "store_recovery": recovery
+                    .as_ref()
+                    .map_or(serde_json::Value::Null, StoreRecovery::json),
             }),
         )?;
     } else {
