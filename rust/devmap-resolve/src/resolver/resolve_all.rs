@@ -1011,10 +1011,20 @@ impl Resolver {
                                                 false,
                                             );
                                         }
-                                        if let Some((resolved_file, resolved_sym)) = resolution
-                                            .is_none()
-                                            .then(|| self.lookup_in_package(target_f, &method))
-                                            .flatten()
+                                        // Every other family: a module handle's member
+                                        // may be one the module only re-exports. Go
+                                        // (the variant set above and its own package
+                                        // siblings) and Rust (`rust_import_through_
+                                        // barrel` owns its re-exports) keep the
+                                        // declared-here lookup they had.
+                                        let member = resolution.is_none().then(|| {
+                                            if matches!(family, LangFamily::Go | LangFamily::Rust) {
+                                                self.lookup_in_package(target_f, &method)
+                                            } else {
+                                                self.lookup_module_member(target_f, &method)
+                                            }
+                                        }).flatten();
+                                        if let Some((resolved_file, resolved_sym)) = member
                                         {
                                             resolution = Some(Arc::new(Resolution::ImportScoped {
                                                 target_symbol: resolved_sym,

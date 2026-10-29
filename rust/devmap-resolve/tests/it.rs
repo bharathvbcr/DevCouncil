@@ -34,6 +34,8 @@ mod attack_ccf_lsp;
 #[cfg(feature = "parse")]
 mod audit_regressions;
 #[cfg(feature = "parse")]
+mod bundler_aliases_map_imports;
+#[cfg(feature = "parse")]
 mod calls_target_callables_only;
 #[cfg(feature = "parse")]
 mod captured_receiver_attribution;
@@ -76,6 +78,8 @@ mod import_paths_resolve_to_real_files;
 #[cfg(feature = "parse")]
 mod imports_stay_in_the_named_tree;
 #[cfg(feature = "parse")]
+mod java_records_and_enum_members;
+#[cfg(feature = "parse")]
 mod kotlin_receivers_and_packages;
 #[cfg(feature = "parse")]
 mod kotlin_written_types;
@@ -85,6 +89,8 @@ mod language_server_edges;
 mod markup_selectors_resolve;
 #[cfg(feature = "parse")]
 mod module_singleton_receivers;
+#[cfg(feature = "parse")]
+mod namespace_over_a_barrel;
 #[cfg(feature = "parse")]
 mod non_swift_edge_compare;
 #[cfg(feature = "parse")]

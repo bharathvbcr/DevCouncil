@@ -191,6 +191,29 @@ impl Resolver {
         }
     }
 
+    /// The declaration `module_file` publishes as `name`: one it declares, else
+    /// the one a re-export chain ends at.
+    ///
+    /// A namespace handle over a barrel (`import * as ui from './index'`, then
+    /// `ui.buildTab()`) asks the barrel for a name the barrel only re-exports.
+    /// The named-import path already follows the chain
+    /// (`export { buildTab } from './tabs'`, `export * from './filters'`); the
+    /// member path asked the barrel's own declarations and found none, so every
+    /// call through a namespace over a barrel was lost.
+    pub(super) fn lookup_module_member(
+        &self,
+        module_file: &str,
+        name: &str,
+    ) -> Option<(String, String)> {
+        self.lookup_in_package(module_file, name).or_else(|| {
+            let terminal = self
+                .reexport_chains
+                .get(&format!("{module_file}::{name}"))?;
+            let (file, declared) = terminal.rsplit_once("::")?;
+            self.lookup_in_package(file, declared)
+        })
+    }
+
     pub(super) fn lookup_in_package(&self, file: &str, name: &str) -> Option<(String, String)> {
         let hits = self.symbol_index.get(name)?;
         let eligible = |path: &str, identity: &str| self.declared_at_file_level(path, identity);
