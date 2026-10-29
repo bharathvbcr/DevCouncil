@@ -883,9 +883,9 @@ fn which_binary(
     name: &str,
     path_var: Option<&std::ffi::OsStr>,
     repo_root: &Path,
-) -> Result<PathBuf, LspDidNotRun> {
+) -> Result<subprocess::Resolved, LspDidNotRun> {
     match subprocess::resolve_outside(std::ffi::OsStr::new(name), path_var, repo_root) {
-        Ok(path) => Ok(path),
+        Ok(resolved) => Ok(resolved),
         Err(subprocess::Failure::Spawn { error, .. })
             if error.kind() == std::io::ErrorKind::NotFound =>
         {
@@ -997,7 +997,7 @@ impl LspSession {
     /// within `deadline`.
     pub fn start(
         spec: &LspServerSpec,
-        binary: &Path,
+        binary: &subprocess::Resolved,
         repo_root: &Path,
         deadline: Instant,
         options: &LspSessionOptions,
@@ -1083,7 +1083,7 @@ pub fn find_server_binary(
     name: &str,
     path_var: Option<&std::ffi::OsStr>,
     repo_root: &Path,
-) -> Result<PathBuf, LspDidNotRun> {
+) -> Result<subprocess::Resolved, LspDidNotRun> {
     which_binary(name, path_var, repo_root)
 }
 
@@ -1141,7 +1141,7 @@ fn read_frame(reader: &mut impl BufRead) -> Incoming {
 impl LspClient {
     fn spawn(
         spec: &LspServerSpec,
-        binary: &Path,
+        binary: &subprocess::Resolved,
         repo_root: &Path,
         deadline: Instant,
     ) -> Result<Self, LspDidNotRun> {
@@ -1156,12 +1156,14 @@ impl LspClient {
 
     fn spawn_with(
         spec: &LspServerSpec,
-        binary: &Path,
+        binary: &subprocess::Resolved,
         repo_root: &Path,
         deadline: Instant,
         options: &LspSessionOptions,
     ) -> Result<Self, LspDidNotRun> {
-        let mut command = subprocess::session_command(binary);
+        // The server runs as the file the lookup reached, under the name it
+        // was looked up by: a rustup proxy started as `rustup` is not a server.
+        let mut command = binary.command();
         command.args(spec.args).current_dir(repo_root);
         let spawn_budget = deadline.saturating_duration_since(Instant::now());
         let mut session = subprocess::spawn_session(&mut command, spawn_budget)
@@ -2044,7 +2046,12 @@ mod session_bounds {
         );
         let started = Instant::now();
         let deadline = started + Duration::from_secs(2);
-        let result = LspClient::spawn(&spec(script), Path::new("sh"), &dir, deadline);
+        let result = LspClient::spawn(
+            &spec(script),
+            &subprocess::Resolved::as_given("sh"),
+            &dir,
+            deadline,
+        );
         let elapsed = started.elapsed();
         assert!(
             matches!(result, Err(LspDidNotRun::TimedOut)),
@@ -2075,7 +2082,7 @@ mod session_bounds {
         let started = Instant::now();
         let result = LspClient::spawn(
             &spec(script),
-            Path::new("sh"),
+            &subprocess::Resolved::as_given("sh"),
             &std::env::temp_dir(),
             started + Duration::from_secs(20),
         );
@@ -2096,7 +2103,7 @@ mod session_bounds {
         let started = Instant::now();
         let result = LspClient::spawn(
             &spec(script),
-            Path::new("sh"),
+            &subprocess::Resolved::as_given("sh"),
             &std::env::temp_dir(),
             started + Duration::from_secs(1),
         );
@@ -2128,7 +2135,7 @@ mod session_bounds {
         );
         let mut client = LspClient::spawn(
             &spec(script),
-            Path::new("sh"),
+            &subprocess::Resolved::as_given("sh"),
             &dir,
             Instant::now() + Duration::from_secs(2),
         )
@@ -2182,7 +2189,7 @@ mod session_bounds {
             let started = Instant::now();
             let mut client = LspClient::spawn(
                 &spec(script),
-                Path::new("sh"),
+                &subprocess::Resolved::as_given("sh"),
                 &std::env::temp_dir(),
                 started + Duration::from_secs(5),
             )
@@ -2239,7 +2246,7 @@ mod session_bounds {
             .to_string();
         let mut client = LspClient::spawn(
             &spec(script),
-            Path::new("sh"),
+            &subprocess::Resolved::as_given("sh"),
             &std::env::temp_dir(),
             Instant::now() + Duration::from_secs(5),
         )
@@ -2563,7 +2570,7 @@ cat > /dev/null
         let started = Instant::now();
         let result = LspSession::start(
             &sh_spec("cat > /dev/null"),
-            Path::new("sh"),
+            &subprocess::Resolved::as_given("sh"),
             &std::env::temp_dir(),
             started + Duration::from_secs(60),
             &options,
@@ -2590,7 +2597,7 @@ cat > /dev/null
         };
         let mut session = LspSession::start(
             &sh_spec(&status_script(Some(QUIESCENT))),
-            Path::new("sh"),
+            &subprocess::Resolved::as_given("sh"),
             &std::env::temp_dir(),
             Instant::now() + Duration::from_secs(10),
             &options,
@@ -2612,7 +2619,7 @@ cat > /dev/null
     fn waiting_for_quiescence_is_bounded() {
         let mut session = LspSession::start(
             &sh_spec(&status_script(None)),
-            Path::new("sh"),
+            &subprocess::Resolved::as_given("sh"),
             &std::env::temp_dir(),
             Instant::now() + Duration::from_secs(10),
             &LspSessionOptions {
@@ -2654,7 +2661,7 @@ cat > /dev/null
         };
         let mut session = LspSession::start(
             &spec,
-            &server,
+            &subprocess::Resolved::as_given(&server),
             &root,
             Instant::now() + Duration::from_secs(20),
             &LspSessionOptions::default(),

@@ -74,40 +74,17 @@ impl ServerConfig {
 /// `find_server_binary` refuses a server inside the repository, and follows
 /// links to the real file. Installed through rustup, `rust-analyzer` is a link
 /// to `rustup` itself, which decides what to be by the name it is started
-/// under: started as `rustup` it prints its help and exits 1. So when the
-/// resolved file is not named `rust-analyzer`, ask that rustup which binary the
-/// toolchain in effect for `dir` ships, and run that.
-pub fn resolve_rust_analyzer(dir: &Path) -> Result<PathBuf, String> {
+/// under; the [`subprocess::Resolved`] it returns keeps that name, so started
+/// through [`subprocess::Resolved::command`] from `dir` the proxy runs the
+/// rust-analyzer of the toolchain in effect there. (This tool used to ask
+/// `rustup which rust-analyzer` and run the answer; the seam does the same
+/// thing now for every caller.)
+pub fn resolve_rust_analyzer(dir: &Path) -> Result<subprocess::Resolved, String> {
     let path = std::env::var_os("PATH");
-    let found = find_server_binary("rust-analyzer", path.as_deref(), dir).map_err(|e| match e {
+    find_server_binary("rust-analyzer", path.as_deref(), dir).map_err(|e| match e {
         LspDidNotRun::MissingBinary => "rust-analyzer is not on PATH".to_string(),
         other => format!("rust-analyzer was refused: {other:?}"),
-    })?;
-    if found.file_name().is_some_and(|n| n == "rust-analyzer") {
-        return Ok(found);
-    }
-    let mut which = subprocess::session_command(&found);
-    which.args(["which", "rust-analyzer"]).current_dir(dir);
-    let done = subprocess::run_bounded(
-        &mut which,
-        Bounds {
-            deadline: Duration::from_secs(30),
-            stdout_cap: 4096,
-            stderr_cap: 4096,
-        },
-    )
-    .map_err(|e| format!("{} which rust-analyzer: {e}", found.display()))?;
-    let real = PathBuf::from(done.stdout_lossy().trim());
-    if !done.status.success() || !real.is_file() {
-        return Err(format!(
-            "{} is a link to {}, which is not rust-analyzer, and `which rust-analyzer` for {} failed: {}",
-            "rust-analyzer",
-            found.display(),
-            dir.display(),
-            done.stderr_trimmed()
-        ));
-    }
-    Ok(real)
+    })
 }
 
 /// What a run needs installed.

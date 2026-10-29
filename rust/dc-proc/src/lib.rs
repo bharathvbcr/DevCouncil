@@ -242,7 +242,7 @@ where
             filters = config.filters;
         }
     }
-    let mut command = Command::new(resolved);
+    let mut command = resolved.command();
     command
         .arg("-C")
         .arg(root)
@@ -815,7 +815,107 @@ pub fn filter_overrides(listing: &[u8]) -> Result<Vec<String>, String> {
 ///
 /// A refusal or a program found nowhere is a [`Failure::Spawn`]: nothing ran,
 /// and every caller already reports that as "git could not run".
+///
+/// What comes back is a [`Resolved`]: the file, and the `program` it was asked
+/// for, because a program can decide what it is from the name it is started
+/// under. `~/.cargo/bin/rust-analyzer` is a link to `rustup`, which started as
+/// `rustup` prints its usage and exits; started as `rust-analyzer` it is the
+/// language server. The link is followed so that the boundary check is made
+/// on the file that runs; the name is not, and [`Resolved::command`] starts
+/// the file under it.
 pub fn resolve_outside(
+    program: &OsStr,
+    path_var: Option<&OsStr>,
+    root: &Path,
+) -> Result<Resolved, Failure> {
+    let path = resolve_outside_path(program, path_var, root)?;
+    Ok(Resolved {
+        path,
+        name: program.to_os_string(),
+    })
+}
+
+/// A program [`resolve_outside`] found: the file to run, and the name the
+/// caller asked for it by.
+///
+/// The two differ whenever the lookup went through a link — a rustup proxy, a
+/// Homebrew `bin/git -> ../Cellar/...` — or an explicit relative path was made
+/// absolute. The file is what was checked against the repository boundary and
+/// is the only thing that runs; the name is what the child sees as `argv[0]`.
+/// It dereferences to the file's [`Path`] for callers that only need to know
+/// where the program is, and does not convert to an `OsStr`: a `Command::new`
+/// built from it would run the file under the file's own name, which is the
+/// mistake this type exists to make unwritable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    path: PathBuf,
+    name: std::ffi::OsString,
+}
+
+impl Resolved {
+    /// A program the caller chose itself, started under exactly the name it
+    /// gives: `program` is both the file and `argv[0]`, as `Command::new`
+    /// would have it. For a test's script, or a bare name a caller means
+    /// `PATH` to search; a program looked up for a repository goes through
+    /// [`resolve_outside`] instead.
+    pub fn as_given(program: impl AsRef<OsStr>) -> Self {
+        let program = program.as_ref().to_os_string();
+        Resolved {
+            path: PathBuf::from(&program),
+            name: program,
+        }
+    }
+
+    /// The file that runs: absolute, and canonical when it was found on
+    /// `PATH`.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The name the program was asked for by, which the child sees as
+    /// `argv[0]`.
+    pub fn name(&self) -> &OsStr {
+        &self.name
+    }
+
+    /// The command that starts the program: [`path`](Self::path) runs, under
+    /// [`name`](Self::name). Built through [`session_command`] like every
+    /// other child the kernel starts, so a caller sets only its arguments,
+    /// directory and environment.
+    ///
+    /// On Unix the name is `argv[0]`, set with `CommandExt::arg0`; which file
+    /// executes is unchanged, so a candidate the boundary check refused is no
+    /// more reachable than before. Windows has no `argv[0]` apart from the
+    /// command line, and `std` offers no way to set one: there the child is
+    /// started by its path, and sees that. Rustup's Windows proxies are copies
+    /// of `rustup.exe` under the tool's own name, not links, so the file's name
+    /// and the looked-up name agree.
+    pub fn command(&self) -> Command {
+        let mut command = session_command(&self.path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.arg0(&self.name);
+        }
+        command
+    }
+}
+
+impl std::ops::Deref for Resolved {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for Resolved {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn resolve_outside_path(
     program: &OsStr,
     path_var: Option<&OsStr>,
     root: &Path,
@@ -1287,6 +1387,11 @@ impl Drop for Session {
 
 /// A command for [`spawn_session`], so a session's program is named through
 /// this module like every other child the kernel starts.
+///
+/// `program` runs under its own name. A program found by [`resolve_outside`]
+/// is started through [`Resolved::command`] instead, which keeps the name it
+/// was looked up by; this is for a name the caller means `PATH` to search, or
+/// a file the caller chose itself.
 pub fn session_command(program: impl AsRef<OsStr>) -> Command {
     Command::new(program)
 }
@@ -2099,7 +2204,7 @@ mod tests {
         path
     }
 
-    fn refusal(result: Result<PathBuf, Failure>) -> (ErrorKind, String) {
+    fn refusal(result: Result<Resolved, Failure>) -> (ErrorKind, String) {
         match result {
             Err(Failure::Spawn { error, .. }) => (error.kind(), error.to_string()),
             other => panic!("expected a spawn refusal, got {other:?}"),
@@ -2116,7 +2221,7 @@ mod tests {
         let path = base.0.join("usr").join("bin");
 
         let got = resolve_outside(OsStr::new("git"), Some(path.as_os_str()), &root).unwrap();
-        assert_eq!(got, std::fs::canonicalize(installed).unwrap());
+        assert_eq!(got.path(), std::fs::canonicalize(installed).unwrap());
     }
 
     #[cfg(unix)]
@@ -2174,7 +2279,9 @@ mod tests {
         let path = std::env::join_paths([base.0.join("bin")]).unwrap();
         assert_eq!(repository_top(&root).unwrap(), root);
         assert_eq!(
-            resolve_outside(OsStr::new("git"), Some(&path), &root).unwrap(),
+            resolve_outside(OsStr::new("git"), Some(&path), &root)
+                .unwrap()
+                .path(),
             outside
         );
     }
@@ -2296,7 +2403,7 @@ mod tests {
             &root,
         )
         .unwrap();
-        assert_eq!(got, std::fs::canonicalize(installed).unwrap());
+        assert_eq!(got.path(), std::fs::canonicalize(installed).unwrap());
     }
 
     #[cfg(unix)]
@@ -2333,7 +2440,7 @@ mod tests {
         let path = std::env::join_paths([base.0.join("first"), base.0.join("second")]).unwrap();
 
         let got = resolve_outside(OsStr::new("git"), Some(&path), &root).unwrap();
-        assert_eq!(got, std::fs::canonicalize(installed).unwrap());
+        assert_eq!(got.path(), std::fs::canonicalize(installed).unwrap());
     }
 
     #[test]
@@ -2364,7 +2471,7 @@ mod tests {
             &missing,
         )
         .unwrap();
-        assert_eq!(got, std::fs::canonicalize(installed).unwrap());
+        assert_eq!(got.path(), std::fs::canonicalize(installed).unwrap());
     }
 
     /// An explicit program — a path, not a name — is the caller's choice, used
@@ -2377,7 +2484,8 @@ mod tests {
         let stand_in = plant(&root.join("bin"), "git", 0o755);
 
         let got = resolve_outside(stand_in.as_os_str(), Some(OsStr::new("")), &root).unwrap();
-        assert_eq!(got, stand_in);
+        assert_eq!(got.path(), stand_in);
+        assert_eq!(got.name(), stand_in.as_os_str());
         let got = resolve_outside(OsStr::new("some/dir/git"), None, &root).unwrap();
         assert!(
             got.is_absolute() && got.ends_with("some/dir/git"),
@@ -2385,6 +2493,65 @@ mod tests {
             got.display()
         );
     }
+
+    /// A program found through a link runs as the file the link reaches —
+    /// that is the file the boundary check examined — but under the name it
+    /// was looked up by. A rustup proxy (`rust-analyzer -> rustup`) is the
+    /// real case: rustup reads its own `argv[0]` to know which tool to be,
+    /// and started as `rustup` it prints its usage and exits. The stand-in is
+    /// compiled, because a script's `$0` is always the file the kernel handed
+    /// the interpreter, whatever name it was started under.
+    ///
+    /// The name is the one asked for, never the link's own file name or the
+    /// target's: `bin/fake-lsp -> ../real/proxy` asked for as `fake-lsp` is
+    /// started as `fake-lsp`.
+    #[cfg(unix)]
+    #[test]
+    fn a_program_found_through_a_link_keeps_the_name_it_was_asked_for() {
+        let base = Scratch::new("argv0");
+        let root = base.0.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = base.0.join("started-as");
+        let proxy = compile_argv0_proxy(&base.0.join("real"), "fake-lsp", &marker);
+        let bin = base.0.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink(
+            Path::new("..").join("real").join("proxy"),
+            bin.join("fake-lsp"),
+        )
+        .unwrap();
+
+        let got = resolve_outside(OsStr::new("fake-lsp"), Some(bin.as_os_str()), &root).unwrap();
+        // Which file runs is the link's target, canonical: the boundary check
+        // and the exec agree on it.
+        assert_eq!(got.path(), std::fs::canonicalize(&proxy).unwrap());
+        assert_eq!(got.name(), OsStr::new("fake-lsp"));
+
+        let output = got.command().output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "started under the file's name, not the looked-up one: {stderr}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "fake-lsp",
+            "argv[0] is the name asked for"
+        );
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "fake-lsp");
+
+        // The same file started by its own path answers as what it is: the
+        // name is the only thing the seam changes.
+        let output = Resolved::as_given(got.path()).command().output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("usage: started as proxy"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    include!("../../testsupport/proxy.rs");
 
     #[test]
     fn a_transient_executable_writer_retries_without_duplicating_a_child() {

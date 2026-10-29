@@ -1086,7 +1086,7 @@ fn stale_servers_along(
             ))
         }
     };
-    let mut command = std::process::Command::new(ps);
+    let mut command = ps.command();
     // `etime=` (elapsed), not `lstart=` (a local-time wall clock). Two
     // reasons, both load-bearing:
     //
