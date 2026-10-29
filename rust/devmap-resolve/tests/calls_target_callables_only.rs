@@ -5,8 +5,17 @@
 //! literals (`args{}`), tuple-struct construction (`Error(..)`) and conversions.
 //! The extractor records them as call sites on purpose, so the resolver must
 //! decide the edge kind: a type is *used*, not called, and is emitted as the
-//! existing `References` kind. The type keeps an inbound edge, so liveness and
-//! impact still see it.
+//! existing `References` kind (detail `Constructor`). The type keeps an inbound
+//! edge, so liveness and impact still see it.
+//!
+//! The reclassification is deliberately asymmetric across languages. In Go
+//! and Rust a type is not callable: `args{}` and `Error(..)` build a value
+//! without running any code the type declares, so the edge is a reference. In
+//! Python a class *is* callable: `Engine()` runs `Engine.__new__` and
+//! `Engine.__init__`, so a class call keeps its `Calls` edge
+//! (`a_python_class_call_keeps_its_calls_edge` below). A Calls-to-References
+//! change on the same (caller, type) pair is its own corpus-diff bucket, not a
+//! lost edge (Fable ruling 3, 2026-10-29).
 
 use devmap_extract::extract_file;
 use devmap_extract::model::EdgeKind;
@@ -144,6 +153,12 @@ fn caller() { plain(); let _ = make(); }\n";
         .any(|row| row.starts_with("src/lib.rs::make")));
 }
 
+/// The asymmetry the module doc states: a Python class is callable, so
+/// `Engine()` runs code (`__new__`, `__init__`) and stays a `Calls` edge,
+/// while a Go composite literal or a Rust tuple-struct constructor builds a
+/// value without running anything the type declares and becomes
+/// `References` (detail `Constructor`). The resolver reclassifies only Go and
+/// Rust type targets.
 #[test]
 fn a_python_class_call_keeps_its_calls_edge() {
     let result = resolve(&[(
