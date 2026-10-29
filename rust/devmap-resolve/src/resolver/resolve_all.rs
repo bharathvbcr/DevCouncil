@@ -1035,8 +1035,22 @@ impl Resolver {
                                         // siblings): a Go package has no re-exports, so
                                         // the chain fallback has nothing to add and a
                                         // chain entry must never outrank a sibling file.
+                                        //
                                         // Rust takes the split: `pub use` publishes module
-                                        // members as a JS barrel does.
+                                        // members as a JS barrel does. A Rust module-handle
+                                        // member (`m::run()` after `use crate::m;`) now
+                                        // reaches `lookup_module_member`: `lookup_in_package`
+                                        // first (a declaration in `m` wins), then, on a miss,
+                                        // the re-export chain `m` states for the name
+                                        // (`reexport_chains`, which follows an explicit
+                                        // `pub use a::run;` and a `pub use a::*;` the corpus
+                                        // expansion resolved to one terminal; an ambiguous
+                                        // glob yields no chain). Residual risk: an explicit
+                                        // `pub use` whose terminal is a namesake of the item
+                                        // the caller's own `use` tree denotes (`m` re-exports
+                                        // `a::run` while the caller meant `b::run`). Watched
+                                        // by the corpus-diff bucket "Rust ImportScoped
+                                        // module-handle Calls edges new vs dbd0193a".
                                         let member = resolution.is_none().then(|| {
                                             if family == LangFamily::Go
                                                 || self.imports_a_type(&ext.file_path, &recv)
