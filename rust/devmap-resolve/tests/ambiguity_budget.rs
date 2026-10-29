@@ -365,3 +365,29 @@ fn candidate_cache_preserves_go_private_visibility() {
             .all(|(path, _)| path.starts_with(&format!("{package}/"))));
     }
 }
+
+/// Attack: every budget zero and no candidates kept. The pass must still
+/// finish, keep every site's ledger row, and claim no edge it cannot support.
+#[test]
+fn zero_budgets_degrade_everything_without_panicking_or_inventing_edges() {
+    let inputs = fixture(40, 80);
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&inputs);
+    let result = resolver
+        .resolve_all_with_limits(
+            &inputs,
+            devmap_resolve::ResolutionLimits {
+                candidate_visits: 0,
+                retained_candidate_bytes: 0,
+                ambiguity_evidence_bytes: 0,
+                degraded_candidates: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(capped_rows(&result).len(), 160);
+    assert!(result
+        .edges
+        .iter()
+        .all(|edge| edge.edge_kind != devmap_extract::model::EdgeKind::Calls));
+}
