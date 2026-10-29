@@ -2215,6 +2215,20 @@ impl Resolver {
             }
         }
 
+        // A call written at a value nothing can run is not a call of it: a
+        // template's `maxlength={MAX_QUERY_LENGTH}` and a `LIMIT()` both *use*
+        // the constant, so the edge stays, as the reference it is, and the
+        // constant keeps its users.
+        if !self.inert_values.is_empty() {
+            for edge in edges.iter_mut() {
+                if edge.edge_kind == EdgeKind::Calls
+                    && self.inert_values.contains(edge.target_symbol.as_str())
+                {
+                    edge.edge_kind = EdgeKind::References;
+                }
+            }
+        }
+
         // R4: emission order must not depend on input iteration order.
         //
         // Same total order as the tuple form this replaces, evaluated lazily.
@@ -2259,14 +2273,6 @@ impl Resolver {
                 && left.resolution == right.resolution
                 && left.details == right.details
         });
-
-        // A call is not an edge to a value nothing can run.
-        if !self.inert_values.is_empty() {
-            edges.retain(|edge| {
-                edge.edge_kind != EdgeKind::Calls
-                    || !self.inert_values.contains(edge.target_symbol.as_str())
-            });
-        }
 
         // R4: emission order must not depend on input iteration order.
         unresolved.sort_by(|left, right| {

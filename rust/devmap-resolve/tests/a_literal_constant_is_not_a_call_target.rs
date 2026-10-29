@@ -130,3 +130,27 @@ fn a_same_file_call_of_a_literal_constant_is_no_edge() {
     )]);
     assert!(calls(&result, "s.ts::f").is_empty());
 }
+
+#[test]
+fn a_call_written_at_a_literal_constant_stays_a_reference_to_it() {
+    // The edge says who uses the constant: dropping it would leave `LIMIT`
+    // with no users, so the call-shaped use is kept as the reference it is.
+    let result = resolve(&[
+        ("c.ts", "export const LIMIT = 3;\n"),
+        (
+            "m.ts",
+            "import { LIMIT } from './c';\nexport function bad() { return LIMIT(); }\n",
+        ),
+    ]);
+    assert!(calls(&result, "m.ts::bad").is_empty());
+    assert!(
+        result
+            .edges
+            .iter()
+            .any(|edge| edge.edge_kind == EdgeKind::References
+                && edge.source_symbol == "m.ts::bad"
+                && edge.target_symbol == "c.ts::LIMIT"),
+        "{:?}",
+        result.edges
+    );
+}
