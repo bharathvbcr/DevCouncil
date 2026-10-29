@@ -988,7 +988,10 @@ impl Default for ResolutionLimits {
     fn default() -> Self {
         Self {
             candidate_visits: 4_000_000,
-            retained_candidate_bytes: 32 * 1024 * 1024,
+            // Sized to the Linux kernel (74,042 files), which retains more than
+            // the 32 MiB this was first set to: at 32 MiB it skipped the lookup
+            // of 6,374 names. Still a bound — a hostile tree cannot grow it.
+            retained_candidate_bytes: 256 * 1024 * 1024,
             ambiguity_evidence_bytes: 128 * 1024 * 1024,
             on_exceed: LimitPolicy::Degrade,
             degraded_candidates: 8,
