@@ -168,3 +168,38 @@ fn a_two_hundred_deep_chain_of_barrels_terminates_and_never_binds_a_wrong_target
         "a deep chain binds the declaring file or nothing, got {found:?}"
     );
 }
+
+#[test]
+fn a_type_handle_does_not_follow_the_re_exports_of_its_file() {
+    // `Stmt::Query(_)` names a variant of the imported enum. The enum's file
+    // also publishes an unrelated `Query` struct through a glob, and the
+    // member lookup must not bind the variant to it; a module handle's member
+    // (`gql::build()`) is bound through the same glob.
+    let result = resolve(&[
+        (
+            "src/gql.rs",
+            "pub enum Stmt { Query(u8) }\npub use crate::dml::*;\n",
+        ),
+        (
+            "src/dml.rs",
+            "pub struct Query { pub n: u8 }\npub fn build() -> u8 { 1 }\n",
+        ),
+        (
+            "src/user.rs",
+            "use crate::gql::Stmt;\nuse crate::gql;\n\
+             pub fn pattern(s: Stmt) -> bool { matches!(s, Stmt::Query(_)) }\n\
+             pub fn through_module() -> u8 { gql::build() }\n",
+        ),
+    ]);
+    assert!(
+        calls(&result, "src/user.rs::pattern").is_empty(),
+        "{:?}",
+        calls(&result, "src/user.rs::pattern")
+    );
+    assert_eq!(
+        calls(&result, "src/user.rs::through_module"),
+        ["src/dml.rs::build"],
+        "{:?}",
+        result.unresolved
+    );
+}

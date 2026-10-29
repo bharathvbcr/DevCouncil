@@ -999,7 +999,7 @@ impl Resolver {
                         if !recv.is_empty() && !method.is_empty()
                             && ext.local_binding_at(call.span.start_byte, &recv).is_none() {
                             {
-                                if let Some((target_f, _)) = self.import_binding_at(
+                                if let Some((target_f, imported)) = self.import_binding_at(
                                     family,
                                     &ext.file_path,
                                     read_scope(call.caller_symbol.as_deref(), &call.span).as_deref(),
@@ -1024,21 +1024,26 @@ impl Resolver {
                                                 false,
                                             );
                                         }
-                                        // Every other family: a module handle's member
-                                        // may be one the module only re-exports. Go
-                                        // (the variant set above and its own package
-                                        // siblings) and Rust (`rust_import_through_
-                                        // barrel` owns its re-exports) keep the
-                                        // declared-here lookup they had.
+                                        // A module handle's member may be one the module
+                                        // only re-exports; a type's may not (an enum's
+                                        // variant `Query` is not the `Query` struct a
+                                        // glob in the enum's file happens to publish).
+                                        // Go (the variant set above, then its own package
+                                        // siblings) and Rust (`rust_import_through_barrel`
+                                        // owns its re-exports) keep the declared-here
+                                        // lookup they had: the module/type split is
+                                        // JS/TS, Python and Java vocabulary.
                                         let member = resolution.is_none().then(|| {
-                                            if matches!(family, LangFamily::Go | LangFamily::Rust) {
+                                            if matches!(family, LangFamily::Go | LangFamily::Rust)
+                                                || self.imports_a_type(&ext.file_path, &recv)
+                                                || self.declares_type_at(target_f, imported)
+                                            {
                                                 self.lookup_in_package(target_f, &method)
                                             } else {
                                                 self.lookup_module_member(target_f, &method)
                                             }
                                         }).flatten();
-                                        if let Some((resolved_file, resolved_sym)) = member
-                                        {
+                                        if let Some((resolved_file, resolved_sym)) = member {
                                             resolution = Some(Arc::new(Resolution::ImportScoped {
                                                 target_symbol: resolved_sym,
                                                 target_file: resolved_file,

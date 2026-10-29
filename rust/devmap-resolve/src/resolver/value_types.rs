@@ -505,9 +505,15 @@ impl Resolver {
         else {
             return false;
         };
-        self.symbol_index.get(declared).is_some_and(|candidates| {
+        self.declares_type_at(declaring_file, declared)
+    }
+
+    /// Whether `file` declares a class, struct, enum, interface or trait
+    /// named `name`.
+    pub(super) fn declares_type_at(&self, file: &str, name: &str) -> bool {
+        self.symbol_index.get(name).is_some_and(|candidates| {
             candidates.iter().any(|(path, kind, _, _)| {
-                path == declaring_file
+                path == file
                     && matches!(
                         kind,
                         SymbolKind::Class
