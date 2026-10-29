@@ -1301,3 +1301,70 @@ fn the_cache_fallback_never_serves_a_failed_parse() {
     assert_eq!(served.symbols.len(), recovered.symbols.len());
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// The older output of a same-key pair is a payload like any other: retention
+/// collects it, with the rows derived from it, once no retained range names it,
+/// and not before.
+#[test]
+fn the_older_output_of_a_key_is_collected_with_its_rows_by_retention() {
+    let dir = tmp_dir("collect-older-output");
+    let db = dir.join("devmap.sqlite");
+    let store = Store::open(&db).unwrap();
+    let (path, body) = module(0, 0);
+    let first = extract_file(&path, &body);
+    let second = another_binary(&first, "name");
+    let g1 = commit_extractions(&store, std::slice::from_ref(&first), &[], &[]);
+    let g2 = commit_extractions(&store, std::slice::from_ref(&second), &[path.as_str()], &[]);
+    let rows_of_both = count(&db, "SELECT COUNT(*) FROM payload_nodes");
+    assert_eq!(rows_of_both, 8, "two payloads of four symbols");
+    assert_eq!(
+        file_rows(&db, g1, &path).nodes.len(),
+        4,
+        "generation {g1} is retained"
+    );
+
+    store.prune_generations_except_latest(1).unwrap();
+    assert_eq!(payloads_of(&db, &path), 1);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM payload_nodes"), 4);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM nodes_fts"), 4);
+    assert_eq!(
+        file_rows(&db, g2, &path).nodes.len(),
+        4,
+        "and the newer payload keeps every row it had"
+    );
+    assert!(file_rows(&db, g2, &path)
+        .nodes
+        .iter()
+        .any(|node| node.starts_with("mod_0.py_renamed|")));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A secret file's payload is rewritten in place by the scrub, so its stored
+/// documents are not the ones its digest was taken from. The digest is a column
+/// and not recomputed, so the next build of the same file is still the same
+/// payload.
+#[test]
+fn a_secret_file_rebuilt_unchanged_is_the_same_payload() {
+    for full in [false, true] {
+        let dir = tmp_dir("secret-stable");
+        let db = dir.join("devmap.sqlite");
+        let store = Store::open(&db).unwrap();
+        let files: Files = vec![
+            ("pkg/ok.py".into(), "NAME = \"public-value\"\n".into()),
+            (
+                ".env".into(),
+                "API_KEY=\"sk-live-0123456789abcdef\"\n".into(),
+            ),
+        ];
+        commit(&store, &files, &[], &[]);
+        let payloads = count(&db, "SELECT COUNT(*) FROM file_payloads");
+        let affected: &[&str] = if full { &[] } else { &[".env"] };
+        commit(&store, &files, affected, &[]);
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM file_payloads"),
+            payloads,
+            "full: {full}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
