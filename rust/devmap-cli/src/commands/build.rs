@@ -1093,6 +1093,14 @@ fn lsp_server_json(server: &devmap_resolve::lsp::LspServerStatus) -> serde_json:
         // Why a server that started and exited did: the last of its stderr,
         // bounded and redacted. `null` for every other outcome.
         "stderr_tail": server.did_not_run.as_ref().and_then(|reason| reason.stderr_tail()),
+        // `true` when the server's stderr pipe had not closed by the time the
+        // wait for it ran out: `stderr_tail` is then what had arrived, not all
+        // of it. `null` when the outcome carries no tail.
+        "stderr_tail_incomplete": server
+            .did_not_run
+            .as_ref()
+            .and_then(|reason| reason.stderr_complete())
+            .map(|complete| !complete),
         "files_considered": server.files_considered,
         "files_finished": server.files_finished,
         "edges_added": server.edges_added,
@@ -1476,6 +1484,34 @@ mod tests {
             by_language: rows.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
             ..ResolutionRate::default()
         }
+    }
+
+    /// The JSON row says "stderr tail incomplete" as the readout does, and
+    /// says nothing (`null`) for an outcome that has no tail to be incomplete.
+    #[test]
+    fn the_lsp_row_carries_whether_the_stderr_tail_is_incomplete() {
+        use devmap_resolve::lsp::{LspDidNotRun, LspServerStatus};
+        let row = |did_not_run: LspDidNotRun| {
+            lsp_server_json(&LspServerStatus {
+                binary: "dying-lsp".into(),
+                did_not_run: Some(did_not_run),
+                ..LspServerStatus::default()
+            })
+        };
+        let cut_short = row(LspDidNotRun::NonZeroExit {
+            code: Some(101),
+            stderr: Some("half a thought".into()),
+            stderr_complete: false,
+        });
+        assert_eq!(cut_short["stderr_tail"], "half a thought");
+        assert_eq!(cut_short["stderr_tail_incomplete"], true);
+        let whole = row(LspDidNotRun::NonZeroExit {
+            code: Some(101),
+            stderr: Some("whole".into()),
+            stderr_complete: true,
+        });
+        assert_eq!(whole["stderr_tail_incomplete"], false);
+        assert!(row(LspDidNotRun::TimedOut)["stderr_tail_incomplete"].is_null());
     }
 
     /// A call-blind row prints no percent, never claims "0 attribution sites"

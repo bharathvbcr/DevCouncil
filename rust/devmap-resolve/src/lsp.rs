@@ -48,10 +48,6 @@ const LSP_HEADER_LINE_CAP: u64 = 8 * 1024;
 /// How long `shutdown` waits for a server to exit on its own before killing it.
 const LSP_EXIT_GRACE: Duration = Duration::from_millis(500);
 
-/// How long a failed server's stderr is given to finish arriving once the
-/// server has been killed.
-const LSP_STDERR_SETTLE: Duration = Duration::from_millis(300);
-
 /// Lines of a server's stderr the build readout prints; the JSON report
 /// carries the whole surfaced tail.
 const LSP_STDERR_STATUS_LINES: usize = 12;
@@ -112,10 +108,15 @@ pub enum LspDidNotRun {
     RefusedBinary(String),
     /// The server closed its stdout. `stderr` is what it last wrote to stderr
     /// (see [`surface_stderr`]: bounded, redacted), the only statement of why
-    /// a server that starts and exits gives.
+    /// a server that starts and exits gives. `stderr_complete` is false when
+    /// the pipe had not closed by the time the wait for it ran out, so `stderr`
+    /// is what had arrived and not everything the server said: "nothing
+    /// captured" and "nothing said" are different statements, and the report
+    /// makes the first one aloud.
     NonZeroExit {
         code: Option<i32>,
         stderr: Option<String>,
+        stderr_complete: bool,
     },
     TimedOut,
     OversizedPayload {
@@ -143,6 +144,17 @@ impl LspDidNotRun {
     pub fn stderr_tail(&self) -> Option<&str> {
         match self {
             LspDidNotRun::NonZeroExit { stderr, .. } => stderr.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Whether the stderr tail is everything the server wrote: `Some(false)`
+    /// is "stderr tail incomplete". `None` for an outcome that carries no tail.
+    pub fn stderr_complete(&self) -> Option<bool> {
+        match self {
+            LspDidNotRun::NonZeroExit {
+                stderr_complete, ..
+            } => Some(*stderr_complete),
             _ => None,
         }
     }
@@ -499,18 +511,31 @@ impl LspPassReport {
                 // A server that started and exited said why on stderr.
                 if let LspDidNotRun::NonZeroExit {
                     code,
-                    stderr: Some(stderr),
+                    stderr,
+                    stderr_complete,
                 } = reason
                 {
-                    lines.push(format!(
-                        "lsp: {} exited{} — last stderr (redacted):",
-                        server.binary,
-                        code.map_or(String::new(), |code| format!(" with status {code}")),
-                    ));
-                    let all: Vec<&str> = stderr.lines().collect();
-                    for line in &all[all.len().saturating_sub(LSP_STDERR_STATUS_LINES)..] {
-                        let shown: String = line.chars().take(LSP_STDERR_LINE_CAP).collect();
-                        lines.push(format!("lsp:   {shown}"));
+                    let status = code.map_or(String::new(), |code| format!(" with status {code}"));
+                    if let Some(stderr) = stderr {
+                        lines.push(format!(
+                            "lsp: {} exited{status} — last stderr (redacted):",
+                            server.binary,
+                        ));
+                        let all: Vec<&str> = stderr.lines().collect();
+                        for line in &all[all.len().saturating_sub(LSP_STDERR_STATUS_LINES)..] {
+                            let shown: String = line.chars().take(LSP_STDERR_LINE_CAP).collect();
+                            lines.push(format!("lsp:   {shown}"));
+                        }
+                    }
+                    // An empty tail from a pipe that never closed is not "the
+                    // server said nothing"; say which of the two this is.
+                    if !stderr_complete {
+                        lines.push(format!(
+                            "lsp: {} exited{status} — stderr tail incomplete: the pipe had \
+                             not closed after {} s, so more may have been written",
+                            server.binary,
+                            subprocess::SESSION_STDERR_EOF_DEADLINE.as_secs(),
+                        ));
                     }
                 }
             } else if server.ran {
@@ -1403,10 +1428,21 @@ impl LspClient {
             Ok(Incoming::Eof) | Err(RecvTimeoutError::Disconnected) => {
                 let code = self.session.try_status().and_then(|status| status.code());
                 self.kill();
-                // After the kill, so the group is dead and the pipe closed:
-                // what the server wrote before it exited is then all in.
-                let stderr = surface_stderr(&self.session.stderr_tail(LSP_STDERR_SETTLE));
-                Err(LspDidNotRun::NonZeroExit { code, stderr })
+                // After the kill, so the group is dead and the child reaped:
+                // nothing holds the pipe and EOF is certain, and the wait ends
+                // at it. The deadline is the generous one, not a settle: it
+                // bounds only a descendant that left the group, and a short one
+                // is shorter than a drain thread can wait to be scheduled on a
+                // loaded host. The tail is read once; the readout and the JSON
+                // report both come from this one value.
+                let tail = self
+                    .session
+                    .stderr_tail(subprocess::SESSION_STDERR_EOF_DEADLINE);
+                Err(LspDidNotRun::NonZeroExit {
+                    code,
+                    stderr: surface_stderr(&tail),
+                    stderr_complete: tail.complete,
+                })
             }
             Err(RecvTimeoutError::Timeout) => {
                 self.kill();
@@ -2315,12 +2351,11 @@ while :; do
 done
 "#;
 
-    /// A server that dies at start-up said why on stderr, and the pass used to
-    /// throw that away (`rust-analyzer` failed with `non_zero_exit` and nothing
-    /// else). The cause must reach the report, redacted and bounded.
+    /// Run the pass against a server that writes `stderr_lines` to stderr and
+    /// exits 101 before answering anything: the report, and the credential the
+    /// fixture planted in that stderr.
     #[cfg(feature = "parse")]
-    #[test]
-    fn a_server_that_dies_at_start_up_reports_its_redacted_stderr() {
+    fn report_for_a_server_that_dies_at_start_up(name: &str) -> (LspPassReport, String) {
         use std::os::unix::fs::PermissionsExt;
 
         let token = format!("ghp_{}", "A1b2C3d4E5".repeat(4));
@@ -2328,7 +2363,7 @@ done
             dc_redact::contains_secret(&token),
             "the fixture token must be a shape the redactor knows"
         );
-        let scratch = super::uris_and_positions::Scratch::new("stderr");
+        let scratch = super::uris_and_positions::Scratch::new(name);
         let root = scratch.0.join("repo");
         let bin = scratch.0.join("bin");
         std::fs::create_dir_all(&root).unwrap();
@@ -2364,7 +2399,16 @@ done
             &mut resolution,
             &AtomicBool::new(false),
         );
+        (report, token)
+    }
 
+    /// A server that dies at start-up said why on stderr, and the pass used to
+    /// throw that away (`rust-analyzer` failed with `non_zero_exit` and nothing
+    /// else). The cause must reach the report, redacted and bounded.
+    #[cfg(feature = "parse")]
+    #[test]
+    fn a_server_that_dies_at_start_up_reports_its_redacted_stderr() {
+        let (report, token) = report_for_a_server_that_dies_at_start_up("stderr");
         let status = &report.servers[0];
         assert!(!status.ran, "{status:?}");
         let reason = status.did_not_run.as_ref().expect("the server died");
@@ -2375,9 +2419,40 @@ done
             !tail.contains(&token),
             "a credential in the server's stderr must not be shown: {tail}"
         );
+        assert_eq!(reason.stderr_complete(), Some(true), "{reason:?}");
         let lines = report.status_lines().join("\n");
         assert!(lines.contains("toolchain missing"), "{lines}");
         assert!(!lines.contains(&token), "{lines}");
+        assert!(!lines.contains("stderr tail incomplete"), "{lines}");
+    }
+
+    /// The failure this guards was seen once in a loaded full-suite run: the
+    /// server's stderr reached the JSON report and was missing from the
+    /// readout of the next build, because the wait for the drain thread after
+    /// the kill was 300 ms and a thread the host had not yet scheduled
+    /// outlasted it. The delay here is that thread, made deterministic: it
+    /// starts 1.5 s late, five times the old wait, and the report must still
+    /// carry everything the server said.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn a_stderr_drain_thread_the_host_schedules_late_does_not_lose_the_servers_stderr() {
+        let (report, token) = subprocess::test_hooks::with_stderr_drain_start_delay(
+            Duration::from_millis(1500),
+            || report_for_a_server_that_dies_at_start_up("stderr-late-drain"),
+        );
+        let reason = report.servers[0]
+            .did_not_run
+            .as_ref()
+            .expect("the server died");
+        assert_eq!(reason.label(), "non_zero_exit");
+        let tail = reason
+            .stderr_tail()
+            .expect("the readout lost the stderr the child had already written");
+        assert!(tail.contains("toolchain missing"), "{tail}");
+        assert!(!tail.contains(&token), "{tail}");
+        assert_eq!(reason.stderr_complete(), Some(true), "{reason:?}");
+        let lines = report.status_lines().join("\n");
+        assert!(lines.contains("toolchain missing"), "{lines}");
     }
 
     /// A server that stopped on a protocol error says which one, as a refused
@@ -2405,6 +2480,50 @@ done
             lines.contains("lsp: rust-analyzer protocol: json failed: EOF while parsing"),
             "{lines}"
         );
+    }
+
+    /// A tail the wait gave up on says so, whether or not any text had arrived:
+    /// an empty tail from a pipe that never closed is not "the server said
+    /// nothing", and a complete empty tail is.
+    #[test]
+    fn an_incomplete_stderr_tail_is_named_in_the_readout() {
+        let report_for = |stderr: Option<&str>, stderr_complete: bool| LspPassReport {
+            servers: vec![LspServerStatus {
+                binary: "dying-lsp".into(),
+                did_not_run: Some(LspDidNotRun::NonZeroExit {
+                    code: Some(101),
+                    stderr: stderr.map(str::to_string),
+                    stderr_complete,
+                }),
+                ..LspServerStatus::default()
+            }],
+            ..LspPassReport::default()
+        };
+
+        let empty_and_cut_short = report_for(None, false).status_lines().join("\n");
+        assert!(
+            empty_and_cut_short.contains("stderr tail incomplete"),
+            "{empty_and_cut_short}"
+        );
+        assert!(!empty_and_cut_short.contains("last stderr"));
+
+        let some_and_cut_short = report_for(Some("half a thought"), false)
+            .status_lines()
+            .join("\n");
+        assert!(
+            some_and_cut_short.contains("half a thought"),
+            "{some_and_cut_short}"
+        );
+        assert!(
+            some_and_cut_short.contains("stderr tail incomplete"),
+            "{some_and_cut_short}"
+        );
+
+        let said_nothing = report_for(None, true).status_lines().join("\n");
+        assert!(!said_nothing.contains("incomplete"), "{said_nothing}");
+        let said_it_all = report_for(Some("whole"), true).status_lines().join("\n");
+        assert!(said_it_all.contains("whole"), "{said_it_all}");
+        assert!(!said_it_all.contains("incomplete"), "{said_it_all}");
     }
 
     /// The surfaced tail keeps whole lines only: bytes dropped to stay inside

@@ -1341,7 +1341,10 @@ impl Session {
     /// tail is everything the child will ever say (less `dropped_bytes`); when
     /// it is false a descendant still holds the pipe, or the wait ran out, and
     /// more may follow. Call it after [`kill`](Self::kill) to have the group
-    /// closed first.
+    /// closed first, and pass [`SESSION_STDERR_EOF_DEADLINE`] as `settle`: once
+    /// the child is reaped and no descendant holds the pipe the wait ends at
+    /// EOF, so the long bound costs nothing, while a short one loses the race
+    /// against a drain thread the host has not yet scheduled.
     pub fn stderr_tail(&self, settle: Duration) -> StderrTail {
         let deadline = Instant::now() + settle;
         let mut state = self
@@ -1410,6 +1413,59 @@ pub fn session_command(program: impl AsRef<OsStr>) -> Command {
 /// keeps. The pipe is always read to EOF, so a chatty child never blocks on a
 /// full pipe, and memory stays at this bound however much it writes.
 pub const SESSION_STDERR_TAIL_BYTES: usize = 4096;
+
+/// How long [`Session::stderr_tail`] callers wait for the drain thread to reach
+/// EOF once the child has been killed and reaped.
+///
+/// A reaped child and a dead group hold no end of the pipe, so EOF is certain
+/// and the wait returns the moment the drain thread is scheduled; this is the
+/// bound for the one case where it is not, a descendant that left the process
+/// group and kept the pipe. It is generous on purpose: a short settle is
+/// shorter than the time a starved thread can wait to run on a loaded host, and
+/// a tail that lost that race read as "the child said nothing".
+pub const SESSION_STDERR_EOF_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Hooks for tests of code that sits on a [`Session`]; compiled only with the
+/// `test-hooks` feature, which no build enables by default.
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    thread_local! {
+        static DRAIN_START_DELAY: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+    }
+
+    /// Run `body` with every [`Session`](crate::Session) it spawns **on this
+    /// thread** starting its stderr drain thread `delay` late: the thread a
+    /// loaded host does not schedule for a while, made deterministic. The
+    /// child's bytes wait in the pipe meanwhile, so nothing is lost; only the
+    /// time at which the tail is complete moves.
+    pub fn with_stderr_drain_start_delay<R>(delay: Duration, body: impl FnOnce() -> R) -> R {
+        struct Restore(Duration);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                DRAIN_START_DELAY.with(|cell| cell.set(self.0));
+            }
+        }
+        let _restore = Restore(DRAIN_START_DELAY.with(|cell| cell.replace(delay)));
+        body()
+    }
+
+    pub(crate) fn drain_start_delay() -> Duration {
+        DRAIN_START_DELAY.with(Cell::get)
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+fn drain_start_delay() -> Duration {
+    test_hooks::drain_start_delay()
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn drain_start_delay() -> Duration {
+    Duration::ZERO
+}
 
 /// What a [`Session`] child wrote to stderr, as far as it was kept.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1491,7 +1547,13 @@ pub fn spawn_session(command: &mut Command, spawn_deadline: Duration) -> Result<
     match child.stderr.take() {
         Some(pipe) => {
             let capture = Arc::clone(&stderr);
-            thread::spawn(move || drain_tail(pipe, &capture));
+            let start_delay = drain_start_delay();
+            thread::spawn(move || {
+                if !start_delay.is_zero() {
+                    thread::sleep(start_delay);
+                }
+                drain_tail(pipe, &capture);
+            });
         }
         // Piped above, so absent only if the platform refused the pipe; the
         // tail then reports itself finished and empty rather than waiting.
@@ -1759,6 +1821,25 @@ mod tests {
             300_000 + "END-OF-STDERR".len() as u64,
             "every byte is either kept or counted as dropped"
         );
+    }
+
+    /// A drain thread the host schedules late: the child is reaped, its bytes
+    /// are in the pipe, and a short settle returns an empty, incomplete tail.
+    /// The long deadline waits for EOF and gets the lot.
+    #[cfg(all(unix, feature = "test-hooks"))]
+    #[test]
+    fn a_late_drain_thread_is_waited_for_not_given_up_on() {
+        let mut session =
+            test_hooks::with_stderr_drain_start_delay(Duration::from_millis(600), || {
+                session_of("echo 'fatal: no toolchain' >&2; exit 3")
+            });
+        wait_until_reaped(&mut session);
+        session.kill();
+        let short = session.stderr_tail(Duration::from_millis(100));
+        assert!(!short.complete && short.bytes.is_empty(), "{short:?}");
+        let long = session.stderr_tail(SESSION_STDERR_EOF_DEADLINE);
+        assert!(long.complete, "{long:?}");
+        assert_eq!(long.text(), "fatal: no toolchain\n");
     }
 
     /// A descendant that still holds the pipe must not hold the caller: the wait

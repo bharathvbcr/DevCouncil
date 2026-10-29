@@ -277,7 +277,14 @@ table dc-verify's secret gate and GitPulse's ledger use), drops the first line
 when bytes were dropped (a line cut mid-token matches no credential shape),
 and replaces control characters. That redacted text is what the build readout
 prints after `last stderr (redacted):` and what `build --json` carries at
-`lsp.servers[].stderr_tail`. dc-regress drains its git session's stderr into
+`lsp.servers[].stderr_tail`. The tail is read once, after the server is killed
+and reaped, by waiting for the drain thread to reach EOF for up to
+`SESSION_STDERR_EOF_DEADLINE` (5 s; the wait ends at EOF, so it costs nothing
+unless a descendant left the process group and kept the pipe). If the pipe had
+not closed by then the readout says `stderr tail incomplete` and the JSON row
+carries `stderr_tail_incomplete: true`, so an empty tail from a pipe that never
+closed is not reported as a server that said nothing. The bound, the redaction
+and the no-raw-logging rule above are unchanged. dc-regress drains its git session's stderr into
 the same bounded tail and never reads it; its refusals carry only their own
 text.
 

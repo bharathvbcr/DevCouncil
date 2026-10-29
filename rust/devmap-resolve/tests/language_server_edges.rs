@@ -222,7 +222,8 @@ fn missing_binary_and_non_zero_exit_are_did_not_run_labels() {
     assert_eq!(
         LspDidNotRun::NonZeroExit {
             code: Some(1),
-            stderr: None
+            stderr: None,
+            stderr_complete: true
         }
         .label(),
         "non_zero_exit"

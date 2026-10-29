@@ -24,6 +24,11 @@ serde.workspace = true
 # language-server JSON-RPC client (`devmap build --lsp`), not a new crate.
 serde_json.workspace = true
 
+[dev-dependencies]
+# Already linked through devmap-extract (which re-exports it as `subprocess`);
+# the `test-hooks` feature makes a slow stderr drain thread deterministic.
+dc-proc = { path = "../dc-proc", features = ["test-hooks"] }
+
 [features]
 default = ["parse"]
 # Forwards the parsing frontend. Off, this crate builds without tree-sitter

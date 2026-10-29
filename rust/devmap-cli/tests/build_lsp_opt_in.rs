@@ -251,6 +251,10 @@ fn a_server_that_exits_at_start_up_has_its_stderr_in_the_report() {
     assert_eq!(row["did_not_run"], "non_zero_exit", "{row}");
     let tail = row["stderr_tail"].as_str().expect("a stderr tail");
     assert!(tail.contains("no sysroot found"), "{row}");
+    assert_eq!(
+        row["stderr_tail_incomplete"], false,
+        "the child was reaped, so the pipe closed and the tail is whole: {row}"
+    );
     assert!(
         !tail.contains(&token),
         "a credential must be redacted: {row}"
