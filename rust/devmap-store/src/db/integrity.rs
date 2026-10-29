@@ -144,3 +144,112 @@ impl Store {
         Ok(target)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(label: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "devmap-integrity-{label}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn corruption_is_recognised_by_code_and_not_by_the_words() {
+        let corrupt = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            Some("database disk image is malformed".into()),
+        );
+        assert!(Store::is_database_corrupt(
+            &anyhow::Error::from(corrupt).context("while building")
+        ));
+        // A refusal that merely quotes the message is not damage.
+        let quoted = anyhow::anyhow!("note: database disk image is malformed (quoted from a log)");
+        assert!(!Store::is_database_corrupt(&quoted));
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+        assert!(!Store::is_database_corrupt(&anyhow::Error::from(busy)));
+        // A file that is not a database at all is not moved on this evidence.
+        let not_a_db = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_NOTADB),
+            None,
+        );
+        assert!(!Store::is_database_corrupt(&anyhow::Error::from(not_a_db)));
+    }
+
+    #[test]
+    fn quarantine_moves_the_file_and_its_sidecars_and_never_overwrites() {
+        let dir = scratch("quarantine");
+        let db = dir.join("devmap.sqlite");
+        let lock = Store::lock_writer_at(&db, std::time::Duration::from_secs(1)).unwrap();
+        let mut moved = Vec::new();
+        for round in 0..3 {
+            std::fs::write(&db, format!("main {round}")).unwrap();
+            std::fs::write(dir.join("devmap.sqlite-wal"), format!("wal {round}")).unwrap();
+            std::fs::write(dir.join("devmap.sqlite-shm"), format!("shm {round}")).unwrap();
+            let target = Store::quarantine_damaged(&db, &lock).unwrap();
+            assert!(!db.exists(), "the original path is free for a fresh store");
+            moved.push(target);
+        }
+        let mut distinct = moved.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "three moves in one second collide: {moved:?}"
+        );
+        for (round, target) in moved.iter().enumerate() {
+            assert_eq!(
+                std::fs::read_to_string(target).unwrap(),
+                format!("main {round}")
+            );
+            let wal = PathBuf::from(format!("{}-wal", target.display()));
+            let shm = PathBuf::from(format!("{}-shm", target.display()));
+            assert_eq!(
+                std::fs::read_to_string(wal).unwrap(),
+                format!("wal {round}")
+            );
+            assert_eq!(
+                std::fs::read_to_string(shm).unwrap(),
+                format!("shm {round}")
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quick_check_separates_whole_damaged_and_unreadable() {
+        let dir = scratch("quick-check");
+        let db = dir.join("devmap.sqlite");
+        {
+            let store = Store::open(&db).unwrap();
+            drop(store);
+        }
+        assert_eq!(
+            Store::quick_check(&db).unwrap(),
+            None,
+            "a fresh store is whole"
+        );
+        // Not a database header: SQLite reports NOTADB, which is an error of the
+        // check and not a verdict of damage.
+        std::fs::write(
+            dir.join("junk.sqlite"),
+            b"this is not a database at all, but is long enough",
+        )
+        .unwrap();
+        assert!(Store::quick_check(&dir.join("junk.sqlite")).is_err());
+        // A file that is missing is an error too, never "whole".
+        assert!(Store::quick_check(&dir.join("absent.sqlite")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
