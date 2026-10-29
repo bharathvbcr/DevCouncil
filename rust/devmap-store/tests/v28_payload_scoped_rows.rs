@@ -930,3 +930,304 @@ fn a_secret_files_literals_are_withheld_in_the_payload_table() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Fable ruling 1: a payload's rows must be the extraction's rows.
+//
+// The identity a payload is stored under is the file, its content, and the
+// extractor's version strings. A build of a *different binary* at the same
+// version strings (the open extract-98 policy: lane binaries change extractor
+// output without a bump) produces other rows for the same key. v28 first
+// reused the stored row whenever the symbol count matched, so a same-count
+// change of kind, name, span or literal stayed stale in every relation the
+// payload owns, and `build --full` -- which re-parses and writes every file
+// through the same entry point -- did not clear it.
+// ---------------------------------------------------------------------------
+
+use devmap_extract::cache::CacheKey;
+use devmap_extract::{Extraction, SymbolKind};
+
+/// What a generation reads for one file, by relation: symbols as
+/// `name|kind|start|end`, literals as `start|value`, and the full-text names
+/// that `search` answers from.
+#[derive(Debug, PartialEq, Eq)]
+struct FileRows {
+    nodes: Vec<String>,
+    literals: Vec<String>,
+    fts: Vec<String>,
+}
+
+fn file_rows(db: &Path, generation: u32, path: &str) -> FileRows {
+    let conn = Connection::open(db).unwrap();
+    let collect = |sql: &str| -> Vec<String> {
+        let mut rows: Vec<String> = conn
+            .prepare(sql)
+            .unwrap()
+            .query_map(rusqlite::params![generation, path], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        rows.sort();
+        rows
+    };
+    FileRows {
+        nodes: collect(
+            "SELECT n.name || '|' || n.kind || '|' || n.span_start || '|' || n.span_end
+               FROM generation_nodes n JOIN paths p ON p.id = n.file_id
+              WHERE n.generation_id = ?1 AND p.path = ?2",
+        ),
+        literals: collect(
+            "SELECT l.span_start || '|' || l.value
+               FROM generation_literals l JOIN paths p ON p.id = l.file_id
+              WHERE l.generation_id = ?1 AND p.path = ?2",
+        ),
+        fts: collect(
+            "SELECT f.name || '|' || f.qualified_name
+               FROM nodes_fts_map m JOIN nodes_fts f ON f.rowid = m.rowid_ref
+              WHERE m.generation_id = ?1 AND f.path = ?2",
+        ),
+    }
+}
+
+fn payloads_of(db: &Path, path: &str) -> i64 {
+    count(
+        db,
+        &format!(
+            "SELECT COUNT(*) FROM file_payloads fp JOIN paths p ON p.id = fp.file_id
+              WHERE p.path = '{path}'"
+        ),
+    )
+}
+
+fn ranges_of(db: &Path, path: &str) -> i64 {
+    count(
+        db,
+        &format!(
+            "SELECT COUNT(*) FROM file_rows r JOIN paths p ON p.id = r.file_id
+              WHERE p.path = '{path}'"
+        ),
+    )
+}
+
+/// The same bytes, extracted by "another binary": one row differs and the count
+/// of symbols and literals does not.
+fn another_binary(extraction: &Extraction, change: &str) -> Extraction {
+    let mut other = extraction.clone();
+    match change {
+        "kind" => {
+            assert_ne!(other.symbols[0].kind, SymbolKind::Class);
+            other.symbols[0].kind = SymbolKind::Class;
+        }
+        "name" => {
+            other.symbols[0].name.push_str("_renamed");
+            other.symbols[0].qualified_name.push_str("_renamed");
+        }
+        "span" => other.symbols[0].span.end_byte += 1,
+        "literal" => other.literals[0].value = "label-from-another-binary".into(),
+        other_change => panic!("unknown change {other_change}"),
+    }
+    other
+}
+
+/// **The blocking bug.** Same file, same content, same extractor identity,
+/// same symbol count, other rows: the rows the store reads must be the rows of
+/// the extraction in hand, for a differential write and for `--full` (no
+/// affected paths), in every relation; the generation that was built before
+/// must still read what it read; and the older rows are a payload of their own
+/// rather than a rewritten one.
+fn same_count_change_is_stored_as_the_extraction_in_hand_says(change: &str, full: bool) {
+    let label = format!("{change} (full: {full})");
+    let dir = tmp_dir("same-count");
+    let db = dir.join("devmap.sqlite");
+    let store = Store::open(&db).unwrap();
+    let (path, body) = module(0, 0);
+    let first = extract_file(&path, &body);
+    let second = another_binary(&first, change);
+    assert_eq!(
+        CacheKey::for_extraction(&first),
+        CacheKey::for_extraction(&second),
+        "{label}: the test must exercise the identity the payload is keyed on"
+    );
+    assert_eq!(first.symbols.len(), second.symbols.len());
+    assert_eq!(first.literals.len(), second.literals.len());
+
+    let g1 = commit_extractions(&store, std::slice::from_ref(&first), &[], &[]);
+    let before = file_rows(&db, g1, &path);
+    let affected: &[&str] = if full { &[] } else { &[path.as_str()] };
+    let g2 = commit_extractions(&store, std::slice::from_ref(&second), affected, &[]);
+
+    let after = file_rows(&db, g2, &path);
+    assert_ne!(after, before, "{label}: the new generation read the old rows");
+    // What the second extraction would have written to a store of its own.
+    let fresh_dir = tmp_dir("same-count-fresh");
+    let fresh_db = fresh_dir.join("devmap.sqlite");
+    let fresh = Store::open(&fresh_db).unwrap();
+    let fg = commit_extractions(&fresh, std::slice::from_ref(&second), &[], &[]);
+    assert_eq!(
+        after,
+        file_rows(&fresh_db, fg, &path),
+        "{label}: rows differ from a store built from the extraction alone"
+    );
+    assert_eq!(
+        file_rows(&db, g1, &path),
+        before,
+        "{label}: the retained generation's rows were changed underneath it"
+    );
+    assert_eq!(payloads_of(&db, &path), 2, "{label}: payloads");
+    assert_eq!(ranges_of(&db, &path), 2, "{label}: ranges");
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&fresh_dir);
+}
+
+macro_rules! same_count_change {
+    ($($name:ident: $change:literal, $full:literal;)*) => {
+        $(
+            #[test]
+            fn $name() {
+                same_count_change_is_stored_as_the_extraction_in_hand_says($change, $full);
+            }
+        )*
+    };
+}
+
+same_count_change! {
+    a_changed_kind_is_stored_by_a_differential_write: "kind", false;
+    a_changed_kind_is_stored_by_a_full_rebuild: "kind", true;
+    a_changed_name_is_stored_by_a_differential_write: "name", false;
+    a_changed_name_is_stored_by_a_full_rebuild: "name", true;
+    a_changed_span_is_stored_by_a_differential_write: "span", false;
+    a_changed_span_is_stored_by_a_full_rebuild: "span", true;
+    a_changed_literal_is_stored_by_a_differential_write: "literal", false;
+    a_changed_literal_is_stored_by_a_full_rebuild: "literal", true;
+}
+
+/// The reuse the fix must keep: the same extraction again, differentially or
+/// with `--full`, writes no payload and no range.
+#[test]
+fn the_same_extraction_again_is_the_same_payload() {
+    for full in [false, true] {
+        let dir = tmp_dir("same-again");
+        let db = dir.join("devmap.sqlite");
+        let store = Store::open(&db).unwrap();
+        let files = tree(4, |_| 0);
+        commit(&store, &files, &[], &[]);
+        let payloads = count(&db, "SELECT COUNT(*) FROM file_payloads");
+        let nodes = count(&db, "SELECT COUNT(*) FROM payload_nodes");
+        let ranges = count(&db, "SELECT COUNT(*) FROM file_rows");
+        let affected: &[&str] = if full { &[] } else { &["pkg/mod_2.py"] };
+        commit(&store, &files, affected, &[]);
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM file_payloads"),
+            payloads,
+            "full: {full}"
+        );
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM payload_nodes"),
+            nodes,
+            "full: {full}"
+        );
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM file_rows"),
+            ranges,
+            "full: {full}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// A reused payload whose rows are not all there is repaired to the
+/// extraction's, not trusted: a store carrying a payload without rows (a v27
+/// store's payload that no generation named, migrated with nothing to copy)
+/// must not make a file vanish from the generation that reuses it.
+#[test]
+fn a_reused_payload_missing_its_rows_gets_them_back() {
+    let dir = tmp_dir("repair");
+    let db = dir.join("devmap.sqlite");
+    let store = Store::open(&db).unwrap();
+    let (path, body) = module(0, 0);
+    let first = extract_file(&path, &body);
+    let g1 = commit_extractions(&store, std::slice::from_ref(&first), &[], &[]);
+    let before = file_rows(&db, g1, &path);
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "DELETE FROM nodes_fts; DELETE FROM payload_nodes; DELETE FROM payload_literals;",
+        )
+        .unwrap();
+    }
+    assert!(file_rows(&db, g1, &path).nodes.is_empty());
+    let g2 = commit_extractions(&store, std::slice::from_ref(&first), &[], &[]);
+    assert_eq!(file_rows(&db, g2, &path), before);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The budget refusal that a later build recovers from. The refusal and the
+/// recovery are different extractions of the same key: each is its own payload,
+/// each generation reads the rows of its own, and a refusal arriving over a
+/// recovered payload does not delete the rows of the generation that holds it.
+#[test]
+fn a_refusal_and_its_recovery_are_two_payloads_with_their_own_rows() {
+    use devmap_extract::extract_file_with_budget;
+    use std::time::Duration;
+    let dir = tmp_dir("refusal");
+    let db = dir.join("devmap.sqlite");
+    let store = Store::open(&db).unwrap();
+    let (path, body) = module(0, 0);
+    let refused = extract_file_with_budget(&path, &body, Duration::ZERO);
+    assert!(refused.is_budget_refusal());
+    let recovered = extract_file_with_budget(&path, &body, Duration::from_secs(60));
+    assert!(!recovered.is_parse_failure());
+    assert!(!recovered.symbols.is_empty());
+
+    let g1 = commit_extractions(&store, std::slice::from_ref(&refused), &[], &[]);
+    let refused_rows = file_rows(&db, g1, &path);
+    assert_eq!(refused_rows.nodes.len(), refused.symbols.len());
+    let g2 = commit_extractions(&store, std::slice::from_ref(&recovered), &[path.as_str()], &[]);
+    let recovered_rows = file_rows(&db, g2, &path);
+    assert_eq!(recovered_rows.nodes.len(), recovered.symbols.len());
+    assert_eq!(recovered_rows.fts.len(), recovered.symbols.len());
+    assert_eq!(
+        file_rows(&db, g1, &path),
+        refused_rows,
+        "the generation built from the refusal still reads the refusal's rows"
+    );
+    assert_eq!(payloads_of(&db, &path), 2);
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM file_payloads WHERE parse_outcome_json LIKE '%budget exceeded%'"
+        ),
+        1,
+        "the refusal's own payload keeps its outcome"
+    );
+
+    // The refusal again: it is the payload the store already holds, and the
+    // recovered generation's rows are not touched.
+    let g3 = commit_extractions(&store, std::slice::from_ref(&refused), &[path.as_str()], &[]);
+    assert_eq!(file_rows(&db, g3, &path), refused_rows);
+    assert_eq!(file_rows(&db, g2, &path), recovered_rows);
+    assert_eq!(payloads_of(&db, &path), 2);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The extraction pass falls back to a retained generation's payload by content
+/// identity. With two payloads under one identity it must hand back the newest
+/// one, not whichever row SQLite reaches first.
+#[test]
+fn the_cache_fallback_reads_the_newest_payload_of_an_identity() {
+    let dir = tmp_dir("fallback");
+    let db = dir.join("devmap.sqlite");
+    let store = Store::open(&db).unwrap();
+    let (path, body) = module(0, 0);
+    let first = extract_file(&path, &body);
+    let second = another_binary(&first, "kind");
+    let key = CacheKey::for_extraction(&first);
+    commit_extractions(&store, std::slice::from_ref(&first), &[], &[]);
+    commit_extractions(&store, std::slice::from_ref(&second), &[path.as_str()], &[]);
+    let served = store
+        .try_get_cached_extraction(&key)
+        .unwrap()
+        .expect("a retained generation holds this identity");
+    assert_eq!(served.symbols[0].kind, SymbolKind::Class);
+    let _ = fs::remove_dir_all(&dir);
+}
