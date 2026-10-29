@@ -1198,6 +1198,20 @@ SELECT g.id             AS generation_id,
 ///
 /// # Why there is no v20 putting the nodes on ranges
 ///
+/// **Superseded by v28, which did it.** This section is kept because the
+/// measurement it records is what v28 had to beat, not because its conclusion
+/// stands. The 54 ms write and 39 ms prune it prices predate
+/// `generation_literals` (v26), a relation of 172,040 rows per retained
+/// generation on this repository; measured on the v27 binary against a
+/// `git archive` of this repository, a steady-state one-file edit spent 0.21 s
+/// of `persist:write` copying literals and 0.57 s in
+/// `persist:prune_generations` deleting the previous generation's copy of every
+/// relation. The "re-keyed full-text index on the hottest read" it feared is the
+/// `payload_id << 24 | ord_in_file` rowid of [`MIGRATION_V27_TO_V28`], which the
+/// readers decode in one place. The test that pinned the state described below,
+/// `an_incremental_build_still_copies_every_node_and_full_text_row`, is now
+/// `a_one_file_edit_writes_one_files_worth_of_rows_to_every_relation`.
+///
 /// v18 ranged the edges and the unresolved ledger and left `generation_nodes`,
 /// `nodes_fts`/`nodes_fts_map`, `generation_file_rows`, `generation_dead_symbols`
 /// and `generation_coverage_gaps` as full per-generation copies. The obvious

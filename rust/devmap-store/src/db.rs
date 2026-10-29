@@ -1450,23 +1450,23 @@ pub struct WriteBreakdown {
     /// `ensure_payload_id`: the identity probe and the `file_payloads` insert
     /// it falls through to.
     pub payloads: f64,
-    /// The `generation_file_rows` membership rows, carried and fresh. The
-    /// payload behind a fresh row is [`Self::payloads`], its JSON
-    /// [`Self::serialize`].
+    /// The `file_rows` membership delta: the open rows read, the rows closed
+    /// and the rows opened. Nothing is written for a carried file. The payload
+    /// behind a fresh row is [`Self::payloads`], its JSON [`Self::serialize`].
     pub file_rows: f64,
-    /// `generation_nodes`, carried and fresh.
+    /// `payload_nodes`, written once per new payload.
     pub nodes: f64,
-    /// `nodes_fts` and `nodes_fts_map`, carried and fresh.
+    /// `nodes_fts`, written once per new payload alongside its `payload_nodes`.
     pub fts: f64,
-    /// `generation_literals`: the carry-forward `INSERT ... SELECT` and the
-    /// fresh inserts. The largest relation of a one-file edit (117k rows on
-    /// this repository) and, until it was named, most of `other`.
+    /// `payload_literals`, written once per new payload. Until v28 this was
+    /// the largest cost of a one-file edit (172k rows copied per retained
+    /// generation on this repository) and, until it was named, most of `other`.
     pub literals: f64,
     /// The edge delta: the scan of live rows, the closes and the inserts.
     pub edges: f64,
     /// The unresolved-call ledger delta, the same three passes.
     pub unresolved: f64,
-    /// `generation_file_digests` -- writing the per-file digests the *next*
+    /// `digest_rows` -- the delta of the per-file digests the *next*
     /// build scopes its two deltas by. Only the table write: computing a digest
     /// is part of the pass over the relation it describes, and is charged to
     /// `edges` and `unresolved` where the rows are.
@@ -2506,3 +2506,7 @@ mod delta_bucket_tests;
 #[cfg(feature = "parse")]
 #[path = "db/tests/payload_serialization_tests.rs"]
 mod payload_serialization_tests;
+
+#[cfg(test)]
+#[path = "db/tests/symbol_identity_tests.rs"]
+mod symbol_identity_tests;
