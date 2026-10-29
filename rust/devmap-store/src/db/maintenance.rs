@@ -767,6 +767,13 @@ impl Store {
             // serve a payload produced by older extraction semantics; rows written
             // before schema v8 carry NULL there and are therefore never eligible.
             // Absence of a recorded identity is not proof of a matching one.
+            //
+            // One identity can name several payloads since v28 (another output
+            // for the same version strings is another payload), so the newest
+            // generation's is the one served, and a failed parse is never
+            // served: the cache does not admit one (`cache_admits`), and a
+            // generation built under a wall-clock refusal would otherwise
+            // hand it back as a hit for bytes that parse.
             match payload {
                 Some(found) => Some(("extraction_cache", found)),
                 None => conn
@@ -774,6 +781,8 @@ impl Store {
                         "SELECT extraction_json FROM generation_files
                          WHERE content_hash = ?1 AND language = ?2
                            AND grammar_version = ?3 AND analyzer_version = ?4
+                           AND parse_outcome_json NOT LIKE '{\"Failed\":%'
+                         ORDER BY generation_id DESC
                          LIMIT 1",
                         params![
                             key.content_hash as i64,

@@ -1404,7 +1404,10 @@ pub const MAX_NODES_PER_PAYLOAD: u32 = 1 << NODE_ORD_BITS;
 /// listed because v28 took their statements out of the batches themselves: the
 /// v3 and v4 rungs re-run `CREATE_SCHEMA_V3` over stores that already carry the
 /// current shape, where those names are views.
-pub const INDEXES_REMOVED_BY_V28: &[&str] = &["idx_generation_literals_value"];
+pub const INDEXES_REMOVED_BY_V28: &[&str] = &[
+    "idx_generation_literals_value",
+    "idx_file_payloads_identity",
+];
 
 /// v28: symbols, literals and full-text rows belong to a *payload*, and a
 /// file's membership and digests live for a *range* of generations.
@@ -1427,8 +1430,14 @@ pub const INDEXES_REMOVED_BY_V28: &[&str] = &["idx_generation_literals_value"];
 /// * `payload_nodes(payload_id, ord_in_file, ...)` and
 ///   `payload_literals(payload_id, ...)`, and the `nodes_fts` rows, are written
 ///   once, when the payload is. A payload is the same file at the same content
-///   under the same extractor, so what it holds cannot differ between two
-///   generations that name it.
+///   under the same extractor *and with the same output*: the identity carries
+///   `payload_digest`, a 128-bit digest of the three documents the row holds,
+///   because the extractor's version strings name a binary and not what it
+///   produced. Two outputs for one key are two payloads, so the rows a retained
+///   generation reads are never rewritten underneath it, and a payload's rows
+///   are the extraction's by identity. Fable ruling 1 (2026-10-29): the first
+///   v28 keyed on the version strings alone and kept a stored payload's rows
+///   whenever the symbol count matched.
 /// * `file_rows(file_id, payload_id, valid_from, valid_to)` is the membership
 ///   relation as a validity range, exactly as `edge_rows` is for edges. An
 ///   unchanged file's row stays open and nothing is written for it.
@@ -1469,6 +1478,22 @@ pub const INDEXES_REMOVED_BY_V28: &[&str] = &["idx_generation_literals_value"];
 /// retained generations' relation sizes are compared before and after by the
 /// caller; a difference refuses the migration.
 pub const MIGRATION_V27_TO_V28: &str = r#"
+-- The payload's identity gains the digest of what was extracted. Existing rows
+-- read as the empty digest here and are given their real one by
+-- `Store::migrate_to_v28` straight after this batch, which is Rust because SQL
+-- has no hash of its own to agree with the writer's. The unique index replaces
+-- `idx_file_payloads_identity` under a new name: two statements declaring one
+-- name with different definitions is the contradiction the index-gate test
+-- exists to refuse.
+ALTER TABLE file_payloads ADD COLUMN payload_digest BLOB NOT NULL DEFAULT x'';
+
+DROP INDEX IF EXISTS idx_file_payloads_identity;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_file_payloads_digest_identity
+    ON file_payloads(file_id, content_hash, language,
+                     COALESCE(grammar_version, ''), COALESCE(analyzer_version, ''),
+                     payload_digest);
+
 CREATE TABLE IF NOT EXISTS payload_nodes (
     payload_id      INTEGER NOT NULL REFERENCES file_payloads(payload_id),
     ord_in_file     INTEGER NOT NULL CHECK (ord_in_file >= 0 AND ord_in_file < 16777216),

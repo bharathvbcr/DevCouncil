@@ -65,7 +65,6 @@ fn as_stored(db: &std::path::Path, generation: i64) -> (ParseOutcome, usize, i64
 }
 
 #[test]
-#[ignore = "known failing until ft-3bdf1450 (payload identity distinguishes a budget refusal)"]
 fn a_retained_older_generation_keeps_the_refusal_it_was_built_with() {
     let dir = scratch("shared-payload-forward");
     let db = dir.join("index.sqlite");

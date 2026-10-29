@@ -163,6 +163,11 @@ impl Store {
     /// also names, and a payload stores one copy of its rows.
     fn migrate_to_v28(conn: &Connection) -> Result<()> {
         if !Self::relation_is_table(conn, "generation_nodes")? {
+            // Applied already. A store re-stamped to an early version and walked
+            // up has re-run `CREATE_SCHEMA_V3` over it, which recreates the
+            // identity index v28 replaced; left in place it would refuse a
+            // second payload under one key, which is what v28 exists to store.
+            conn.execute_batch("DROP INDEX IF EXISTS idx_file_payloads_identity;")?;
             return Ok(());
         }
         let counts = |conn: &Connection| -> Result<Option<[i64; 4]>> {
@@ -191,6 +196,7 @@ impl Store {
         };
         let before = counts(conn)?;
         conn.execute_batch(MIGRATION_V27_TO_V28)?;
+        Self::backfill_payload_digests(conn)?;
         let after = counts(conn)?;
         if before != after {
             return Err(refusal(format!(
@@ -198,6 +204,37 @@ impl Store {
                  (nodes, literals, file rows, digests): {before:?} before, {after:?} after; \
                  the store has been left unmigrated"
             )));
+        }
+        Ok(())
+    }
+
+    /// Give every payload a v27 store holds the digest the writer would have
+    /// stamped on it, computed from the documents as stored.
+    ///
+    /// A payload left at the empty digest would never match an extraction in
+    /// hand, so the first `--full` after the migration would write a second
+    /// copy of every file's payload and rows. One row at a time, so the
+    /// migration holds one payload's documents and not the store's.
+    fn backfill_payload_digests(conn: &Connection) -> Result<()> {
+        let ids: Vec<i64> = conn
+            .prepare("SELECT payload_id FROM file_payloads WHERE payload_digest = x''")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_>>()?;
+        let mut read = conn.prepare(
+            "SELECT parse_outcome_json, engine_json, extraction_json
+               FROM file_payloads WHERE payload_id = ?1",
+        )?;
+        let mut stamp =
+            conn.prepare("UPDATE file_payloads SET payload_digest = ?2 WHERE payload_id = ?1")?;
+        for id in ids {
+            let digest = read.query_row(params![id], |row| {
+                Ok(crate::db::payload_digest(
+                    &row.get::<_, String>(0)?,
+                    &row.get::<_, String>(1)?,
+                    &row.get::<_, String>(2)?,
+                ))
+            })?;
+            stamp.execute(params![id, digest.as_slice()])?;
         }
         Ok(())
     }

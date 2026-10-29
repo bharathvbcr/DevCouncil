@@ -9,14 +9,20 @@
 
 /// Materialise `generation_nodes`, `generation_literals`,
 /// `generation_file_rows` and `generation_file_digests` back into the flat
-/// tables v27 stored, with the dense per-generation ordinal and generation-scoped
+/// tables v27 stored, `file_payloads` without its `payload_digest` and under
+/// the identity index v27 had, with the dense per-generation ordinal and generation-scoped
 /// full-text rowid v27 used, and restore `nodes_fts_map`. Drops v28's own
 /// tables and views.
 ///
 /// `generation_files` is dropped for the length of the swap and put back as
 /// `CREATE_SCHEMA_V3` defines it: it names `generation_file_rows`, which SQLite
 /// re-parses when a table is renamed into that name.
-pub const REDUCE_V28_TO_V27: &str = "CREATE TABLE gn_flat AS
+pub const REDUCE_V28_TO_V27: &str = "DROP INDEX idx_file_payloads_digest_identity;
+     ALTER TABLE file_payloads DROP COLUMN payload_digest;
+     CREATE UNIQUE INDEX idx_file_payloads_identity
+         ON file_payloads(file_id, content_hash, language,
+                          COALESCE(grammar_version, ''), COALESCE(analyzer_version, ''));
+     CREATE TABLE gn_flat AS
          SELECT generation_id,
                 ROW_NUMBER() OVER (PARTITION BY generation_id ORDER BY ordinal) - 1
                     AS ordinal,

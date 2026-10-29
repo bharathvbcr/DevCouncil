@@ -156,6 +156,24 @@ fn all_generations(db: &Path) -> Vec<(u32, Vec<String>)> {
         .collect()
 }
 
+/// Every payload's identity and digest, by path text.
+fn payload_digests(db: &Path) -> Vec<(String, i64, Vec<u8>)> {
+    let conn = Connection::open(db).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT p.path, fp.content_hash, fp.payload_digest
+               FROM file_payloads fp JOIN paths p ON p.id = fp.file_id
+              ORDER BY p.path, fp.content_hash",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    rows
+}
+
 /// A history with every shape a migration has to carry: files that never change,
 /// files edited once and twice, a file reverted to content it held before, and a
 /// file deleted.
@@ -218,6 +236,8 @@ fn a_v27_store_migrates_with_every_generation_reading_the_same_rows() {
         let ranges = count(&db, "SELECT COUNT(*) FROM file_rows");
         (all_generations(&db), order, ranges)
     };
+    let digests_written = payload_digests(&db);
+    assert!(!digests_written.is_empty());
     assert_eq!(expected.len(), 5, "the history holds five generations");
     assert!(
         expected.iter().all(|(_, rows)| !rows.is_empty()),
@@ -254,6 +274,12 @@ fn a_v27_store_migrates_with_every_generation_reading_the_same_rows() {
     assert_eq!(
         count(&db, "PRAGMA user_version"),
         i64::from(CURRENT_SCHEMA_VERSION)
+    );
+    assert_eq!(
+        payload_digests(&db),
+        digests_written,
+        "the digest the migration computes from the stored documents is the one \
+         the writer stamped, so a --full after the migration reuses every payload"
     );
     let migrated = all_generations(&db);
     assert_eq!(
@@ -1057,7 +1083,10 @@ fn same_count_change_is_stored_as_the_extraction_in_hand_says(change: &str, full
     let g2 = commit_extractions(&store, std::slice::from_ref(&second), affected, &[]);
 
     let after = file_rows(&db, g2, &path);
-    assert_ne!(after, before, "{label}: the new generation read the old rows");
+    assert_ne!(
+        after, before,
+        "{label}: the new generation read the old rows"
+    );
     // What the second extraction would have written to a store of its own.
     let fresh_dir = tmp_dir("same-count-fresh");
     let fresh_db = fresh_dir.join("devmap.sqlite");
@@ -1182,7 +1211,12 @@ fn a_refusal_and_its_recovery_are_two_payloads_with_their_own_rows() {
     let g1 = commit_extractions(&store, std::slice::from_ref(&refused), &[], &[]);
     let refused_rows = file_rows(&db, g1, &path);
     assert_eq!(refused_rows.nodes.len(), refused.symbols.len());
-    let g2 = commit_extractions(&store, std::slice::from_ref(&recovered), &[path.as_str()], &[]);
+    let g2 = commit_extractions(
+        &store,
+        std::slice::from_ref(&recovered),
+        &[path.as_str()],
+        &[],
+    );
     let recovered_rows = file_rows(&db, g2, &path);
     assert_eq!(recovered_rows.nodes.len(), recovered.symbols.len());
     assert_eq!(recovered_rows.fts.len(), recovered.symbols.len());
@@ -1203,7 +1237,12 @@ fn a_refusal_and_its_recovery_are_two_payloads_with_their_own_rows() {
 
     // The refusal again: it is the payload the store already holds, and the
     // recovered generation's rows are not touched.
-    let g3 = commit_extractions(&store, std::slice::from_ref(&refused), &[path.as_str()], &[]);
+    let g3 = commit_extractions(
+        &store,
+        std::slice::from_ref(&refused),
+        &[path.as_str()],
+        &[],
+    );
     assert_eq!(file_rows(&db, g3, &path), refused_rows);
     assert_eq!(file_rows(&db, g2, &path), recovered_rows);
     assert_eq!(payloads_of(&db, &path), 2);
@@ -1229,5 +1268,36 @@ fn the_cache_fallback_reads_the_newest_payload_of_an_identity() {
         .unwrap()
         .expect("a retained generation holds this identity");
     assert_eq!(served.symbols[0].kind, SymbolKind::Class);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A build that suffered a wall-clock refusal must not turn the next build's
+/// cache fallback into a refusal for bytes that parse: the newest generation
+/// holds the refusal, and the fallback serves the payload that does not.
+#[test]
+fn the_cache_fallback_never_serves_a_failed_parse() {
+    use devmap_extract::extract_file_with_budget;
+    use std::time::Duration;
+    let dir = tmp_dir("fallback-refusal");
+    let db = dir.join("devmap.sqlite");
+    let store = Store::open(&db).unwrap();
+    let (path, body) = module(0, 0);
+    let recovered = extract_file_with_budget(&path, &body, Duration::from_secs(60));
+    let refused = extract_file_with_budget(&path, &body, Duration::ZERO);
+    assert!(refused.is_budget_refusal());
+    let key = CacheKey::for_extraction(&recovered);
+    commit_extractions(&store, std::slice::from_ref(&recovered), &[], &[]);
+    commit_extractions(
+        &store,
+        std::slice::from_ref(&refused),
+        &[path.as_str()],
+        &[],
+    );
+    let served = store
+        .try_get_cached_extraction(&key)
+        .unwrap()
+        .expect("generation 1 holds the parse");
+    assert!(!served.is_parse_failure());
+    assert_eq!(served.symbols.len(), recovered.symbols.len());
     let _ = fs::remove_dir_all(&dir);
 }

@@ -2,8 +2,8 @@ use super::Store;
 #[cfg(feature = "parse")]
 use super::{
     bucket_identities, charge, claim_matching_candidate, decode_stored_outcome, edge_tuple,
-    is_budget_refusal_json, lock_conn, refusal, stored_is_parse_failure, validate_head_sha,
-    EdgeTuple, GenerationWriteOpts, RowSetDigest, StoredPayload, UnresolvedTuple, WriteBreakdown,
+    lock_conn, payload_digest, refusal, stored_is_parse_failure, validate_head_sha, EdgeTuple,
+    GenerationWriteOpts, RowSetDigest, StoredPayload, UnresolvedTuple, WriteBreakdown,
 };
 #[cfg(feature = "parse")]
 use crate::schema::BUILD_HISTORY_RETENTION;
@@ -60,12 +60,10 @@ const PAYLOAD_WINDOW_JSON_BYTES: usize = 64 * 1024 * 1024;
 enum PayloadState {
     /// A new row: its derived rows do not exist yet.
     New,
-    /// An existing row, left as it was: its derived rows are already stored.
+    /// An existing row, left as it was: its identity includes the digest of the
+    /// documents in hand, so it is this extraction and its derived rows are
+    /// already stored.
     Reused,
-    /// An existing budget-refusal row replaced in place by the recovered
-    /// extraction (the declared interim in `ensure_payload_id`): its derived
-    /// rows describe the refusal and must be rewritten.
-    Replaced,
 }
 
 /// The three JSON documents a fresh `file_payloads` row holds for one
@@ -75,6 +73,23 @@ pub(super) struct PayloadJson {
     parse_outcome: String,
     engine: String,
     extraction: String,
+    /// [`payload_digest`] of the three documents, taken where they are made so
+    /// that it is computed on a serializer thread and never on the one holding
+    /// the writer lock, and so no document can be paired with another's digest.
+    digest: [u8; 16],
+}
+
+#[cfg(feature = "parse")]
+impl PayloadJson {
+    fn new(parse_outcome: String, engine: String, extraction: String) -> Self {
+        let digest = payload_digest(&parse_outcome, &engine, &extraction);
+        Self {
+            parse_outcome,
+            engine,
+            extraction,
+            digest,
+        }
+    }
 }
 
 #[cfg(all(test, feature = "parse"))]
@@ -82,11 +97,7 @@ impl PayloadJson {
     /// A document set of `bytes` bytes, for a test that plays the serializer
     /// threads itself.
     pub(super) fn sized(bytes: usize) -> Self {
-        Self {
-            parse_outcome: String::new(),
-            engine: String::new(),
-            extraction: "x".repeat(bytes),
-        }
+        Self::new(String::new(), String::new(), "x".repeat(bytes))
     }
 }
 
@@ -173,11 +184,7 @@ pub(super) fn serialize_payload(extraction: &Extraction) -> Result<PayloadJson> 
             extraction.file_path
         ))
     })?;
-    Ok(PayloadJson {
-        parse_outcome,
-        engine,
-        extraction: extraction_json,
-    })
+    Ok(PayloadJson::new(parse_outcome, engine, extraction_json))
 }
 
 /// Runs `serialize` on `extraction`, turning a panic into the extraction's
@@ -367,7 +374,8 @@ impl PayloadFeed<'_, '_> {
 impl Store {
     /// The id of the stored payload with this identity, inserting it if new.
     ///
-    /// Keyed by the **file** plus the four fields the extraction cache keys on.
+    /// Keyed by the **file**, the four fields the extraction cache keys on, and
+    /// the [`payload_digest`] of the documents being stored.
     ///
     /// `file_id` is in the key and must be: a payload is a serialized
     /// `Extraction`, which carries its own `file_path`, so content-addressing
@@ -376,9 +384,25 @@ impl Store {
     /// construction, and the end-to-end symlink test caught exactly that on the
     /// first run.
     ///
-    /// What B3 deduplicates is the same file, unchanged, across generations —
-    /// 1,530 of the 1,530 duplicate rows measured on this repository — so
-    /// nothing real is lost by narrowing the key.
+    /// The digest is in the key and must be: the other five fields name the
+    /// file and the extractor's *version strings*, not what the extractor made
+    /// of it. A different binary at the same version, or a wall-clock budget
+    /// refusal of bytes that parse, produces other documents and so other
+    /// derived rows for one key. Reusing the stored row then keeps rows the
+    /// extraction in hand does not have, and rewriting it in place changes what
+    /// every retained generation naming it reads. A different output is a
+    /// different payload instead: the older generations keep theirs, the new
+    /// one gets its own, and [`PayloadState::Reused`] means the stored row is
+    /// byte-for-byte this extraction. This also retired the in-place
+    /// replacement of a budget refusal by its recovery that an earlier form of
+    /// this function declared as an interim: a refusal is another output, so it
+    /// is another payload, with no exception to retained-generation
+    /// immutability left.
+    ///
+    /// What B3 deduplicates is the same file, unchanged, across generations --
+    /// 1,530 of the 1,530 duplicate rows measured on this repository -- and the
+    /// same extractor produces the same documents for the same bytes, so
+    /// nothing real is lost by widening the key.
     ///
     /// SELECT-then-INSERT rather than an upsert because the unique index is on
     /// COALESCE expressions — `grammar_version` and `analyzer_version` are
@@ -401,13 +425,15 @@ impl Store {
             parse_outcome_json,
             engine_json,
             extraction_json,
+            payload_digest,
         } = payload;
-        if let Some((id, stored_outcome)) = tx
+        if let Some(id) = tx
             .prepare_cached(
-                "SELECT payload_id, parse_outcome_json FROM file_payloads
+                "SELECT payload_id FROM file_payloads
                   WHERE file_id = ?1 AND content_hash = ?2 AND language = ?3
                     AND COALESCE(grammar_version, '') = ?4
-                    AND COALESCE(analyzer_version, '') = ?5",
+                    AND COALESCE(analyzer_version, '') = ?5
+                    AND payload_digest = ?6",
             )?
             .query_row(
                 params![
@@ -415,52 +441,20 @@ impl Store {
                     content_hash,
                     language,
                     grammar_version,
-                    analyzer_version
+                    analyzer_version,
+                    payload_digest
                 ],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                |row| row.get::<_, i64>(0),
             )
             .optional()?
         {
-            // DECLARED INTERIM: a retained-generation immutability exception,
-            // tracked by ft-3bdf1450d4367fc8c7ba0c01fbe7cfe3 (task_id
-            // devmap-payload-identity-budget-refusal), which gives a budget
-            // refusal its own payload identity and removes this UPDATE.
-            //
-            // The key names the content and the extractor, and a wall-clock
-            // budget refusal is neither: it is the machine's load at the
-            // moment of the build. Sharing the row would keep the refusal as
-            // the stored payload of a later generation that parsed the same
-            // bytes. The unique index admits one row per identity, so the
-            // recovered extraction replaces the refused one in place -- which
-            // also rewrites what every retained older generation reads from
-            // this row (`a_retained_older_generation_keeps_the_refusal_it_was_
-            // built_with`, ignored against the card). Only refusal -> non-
-            // refusal is ever promoted; the reverse is not written, and
-            // `latest_budget_refusals` does not read this row, so status does
-            // not depend on either.
-            if is_budget_refusal_json(&stored_outcome)
-                && !is_budget_refusal_json(parse_outcome_json)
-            {
-                tx.prepare_cached(
-                    "UPDATE file_payloads
-                        SET parse_outcome_json = ?2, engine_json = ?3, extraction_json = ?4
-                      WHERE payload_id = ?1",
-                )?
-                .execute(params![
-                    id,
-                    parse_outcome_json,
-                    engine_json,
-                    extraction_json
-                ])?;
-                return Ok((id, PayloadState::Replaced));
-            }
             return Ok((id, PayloadState::Reused));
         }
         tx.prepare_cached(
             "INSERT INTO file_payloads
              (file_id, content_hash, language, grammar_version, analyzer_version,
-              parse_outcome_json, engine_json, extraction_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+              parse_outcome_json, engine_json, extraction_json, payload_digest)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )?
         .execute(params![
             file_id,
@@ -470,7 +464,8 @@ impl Store {
             analyzer_version,
             parse_outcome_json,
             engine_json,
-            extraction_json
+            extraction_json,
+            payload_digest
         ])?;
         Ok((tx.last_insert_rowid(), PayloadState::New))
     }
@@ -553,17 +548,19 @@ impl Store {
 
     /// Writes the symbols, full-text entries and literals of a payload.
     ///
-    /// Called for every extraction that reaches a payload row, and writes
-    /// nothing when the payload's rows are already the extraction's: a payload
-    /// is the same file at the same content under the same extractor, so a
-    /// [`PayloadState::Reused`] row holds the rows this extraction would
-    /// produce, and the whole point of v28 is not producing them again.
+    /// Called for every extraction that reaches a payload row. A
+    /// [`PayloadState::Reused`] row is identified by the digest of this
+    /// extraction's own documents, so the rows it holds are the rows this
+    /// extraction would produce, and the whole point of v28 is not producing
+    /// them again.
     ///
-    /// The one check a reused row gets is its symbol count. Rows follow the
-    /// extraction in hand, as the per-generation copies they replace did, so a
-    /// count that disagrees -- a budget refusal arriving for content that once
-    /// parsed -- rewrites them rather than leaving a generation naming symbols
-    /// its own edges never resolved.
+    /// The one check a reused row gets is its symbol count, and what it guards
+    /// is the store rather than the extraction: a payload with its rows missing
+    /// (one a v27 store held that no retained generation named, so the
+    /// migration had no rows to give it; a damaged file) would otherwise make
+    /// the file vanish from the generation that reuses it. A count that
+    /// disagrees rewrites the rows from the extraction in hand, which equals
+    /// the one the payload was made from.
     #[cfg(feature = "parse")]
     fn write_payload_rows(
         tx: &Connection,
@@ -572,20 +569,14 @@ impl Store {
         extraction: &Extraction,
         spent: &mut WriteBreakdown,
     ) -> Result<()> {
-        match state {
-            PayloadState::New => {}
-            PayloadState::Replaced => {
-                Self::delete_payload_rows(tx, payload_id)?;
+        if state == PayloadState::Reused {
+            let stored: i64 = tx
+                .prepare_cached("SELECT COUNT(*) FROM payload_nodes WHERE payload_id = ?1")?
+                .query_row(params![payload_id], |row| row.get(0))?;
+            if usize::try_from(stored).ok() == Some(extraction.symbols.len()) {
+                return Ok(());
             }
-            PayloadState::Reused => {
-                let stored: i64 = tx
-                    .prepare_cached("SELECT COUNT(*) FROM payload_nodes WHERE payload_id = ?1")?
-                    .query_row(params![payload_id], |row| row.get(0))?;
-                if usize::try_from(stored).ok() == Some(extraction.symbols.len()) {
-                    return Ok(());
-                }
-                Self::delete_payload_rows(tx, payload_id)?;
-            }
+            Self::delete_payload_rows(tx, payload_id)?;
         }
         for (ord_in_file, sym) in extraction.symbols.iter().enumerate() {
             let fts_rowid = Self::fts_rowid(payload_id, ord_in_file)?;
@@ -1140,6 +1131,7 @@ impl Store {
                         parse_outcome: parse_json,
                         engine: engine_json,
                         extraction: extraction_json,
+                        digest,
                     } = documents?;
                     let file_id =
                         Self::ensure_path_id_cached(&tx, &mut path_ids, &extraction.file_path)?;
@@ -1161,6 +1153,7 @@ impl Store {
                                 parse_outcome_json: &parse_json,
                                 engine_json: &engine_json,
                                 extraction_json: &extraction_json,
+                                payload_digest: &digest,
                             },
                         )?
                     };

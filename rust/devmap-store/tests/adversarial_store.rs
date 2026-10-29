@@ -711,7 +711,7 @@ fn the_extraction_cache_fallback_uses_an_index_rather_than_scanning() {
     let has_index: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master
-              WHERE type = 'index' AND name = 'idx_file_payloads_identity'",
+              WHERE type = 'index' AND name = 'idx_file_payloads_digest_identity'",
             [],
             |row| row.get(0),
         )

@@ -382,7 +382,7 @@ fn store_at_version(dir: &Path, target: i32) -> PathBuf {
 ///
 /// `sqlite_master.sql` is the canonical text, so this compares index
 /// *expressions* — the `COALESCE(grammar_version, '')` that makes
-/// `idx_file_payloads_identity` NULL-safe is part of the contract, not
+/// `idx_file_payloads_digest_identity` NULL-safe is part of the contract, not
 /// decoration. Auto-indexes and the FTS shadow tables are excluded: SQLite
 /// names them itself and their shape is not this schema's to declare.
 fn schema_objects(conn: &Connection) -> BTreeMap<String, String> {

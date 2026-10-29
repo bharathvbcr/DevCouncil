@@ -1112,6 +1112,50 @@ struct EdgeTuple<'a> {
 #[cfg(feature = "parse")]
 const NO_MORE_IN_BUCKET: u32 = u32::MAX;
 
+/// The digest a payload is keyed on beside the file, the content and the
+/// extractor's version strings: 128 bits over the three documents a
+/// `file_payloads` row holds, as written.
+///
+/// The version strings name an extractor; they do not name what it produced.
+/// Two binaries that report one version -- a lane build under an open
+/// `EXTRACTION_SCHEMA_VERSION`, a build interrupted by a wall-clock budget --
+/// give different documents for one file, and the rows derived from a payload
+/// (symbols, literals, full-text entries) are a function of the document. Keying
+/// reuse on the documents makes "the stored payload is this extraction" true by
+/// identity rather than by a spot check, and gives a different output its own
+/// payload, so a retained generation keeps reading the rows it was built with.
+///
+/// Two hashers over the same bytes, the second behind a salt, as
+/// [`RowSetDigest`] does: a false "same payload" needs both 64-bit halves to
+/// collide. `DefaultHasher::new` is fixed-key SipHash, stable for a pinned
+/// toolchain; a toolchain whose hash differs makes every stored digest read as a
+/// different payload, which costs one rewritten payload per file and is
+/// reclaimed by retention, never a wrong answer. The strings are hashed with
+/// their lengths (`str::hash` terminates each), so moving a byte from one
+/// document to the next changes the digest.
+///
+/// Not gated on `parse`: the migration to v28 computes it for the payloads a
+/// v27 store already holds, in builds that link no grammar.
+pub(crate) fn payload_digest(
+    parse_outcome_json: &str,
+    engine_json: &str,
+    extraction_json: &str,
+) -> [u8; 16] {
+    use std::hash::{Hash, Hasher};
+    const SALT: u64 = 0xD6E8_FEB8_6659_FD93;
+    let mut lo = std::collections::hash_map::DefaultHasher::new();
+    let mut hi = std::collections::hash_map::DefaultHasher::new();
+    SALT.hash(&mut hi);
+    for document in [parse_outcome_json, engine_json, extraction_json] {
+        document.hash(&mut lo);
+        document.hash(&mut hi);
+    }
+    let mut digest = [0u8; 16];
+    digest[..8].copy_from_slice(&lo.finish().to_le_bytes());
+    digest[8..].copy_from_slice(&hi.finish().to_le_bytes());
+    digest
+}
+
 /// A 64-bit digest of a row's identity, for bucketing only.
 ///
 /// **Never an answer.** Every candidate a bucket offers is compared field by
@@ -1997,20 +2041,6 @@ fn stored_is_parse_failure(outcome: &ParseOutcome, engine: &ExtractionEngine) ->
         && !matches!(engine, ExtractionEngine::NotApplicable { .. })
 }
 
-/// Whether a stored `parse_outcome_json` is a wall-clock parse-budget refusal,
-/// by the rule `Extraction::is_budget_refusal` applies to a live outcome: a
-/// `Failed` whose reason starts with
-/// [`devmap_extract::model::BUDGET_REFUSAL_PREFIX`]. A value that does not
-/// decode is not one; the payload's own readers refuse it loudly elsewhere.
-#[cfg(feature = "parse")]
-fn is_budget_refusal_json(outcome_json: &str) -> bool {
-    matches!(
-        serde_json::from_str::<ParseOutcome>(outcome_json),
-        Ok(ParseOutcome::Failed { reason })
-            if reason.starts_with(devmap_extract::model::BUDGET_REFUSAL_PREFIX)
-    )
-}
-
 /// The FTS5 `MATCH` expression for a user's search string, or an error naming
 /// why the store cannot express it.
 ///
@@ -2121,6 +2151,9 @@ struct StoredPayload<'a> {
     parse_outcome_json: &'a str,
     engine_json: &'a str,
     extraction_json: &'a str,
+    /// [`payload_digest`] of the three documents above, the sixth part of the
+    /// payload's identity.
+    payload_digest: &'a [u8],
 }
 
 /// Relations the current schema creates that a reader must tolerate *absent*,
@@ -2209,6 +2242,7 @@ const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
             "parse_outcome_json",
             "engine_json",
             "extraction_json",
+            "payload_digest",
         ],
     ),
     (
