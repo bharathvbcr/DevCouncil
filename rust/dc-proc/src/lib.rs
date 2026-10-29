@@ -846,6 +846,16 @@ pub fn resolve_outside(
 /// where the program is, and does not convert to an `OsStr`: a `Command::new`
 /// built from it would run the file under the file's own name, which is the
 /// mistake this type exists to make unwritable.
+///
+/// ```compile_fail
+/// let found = dc_proc::Resolved::as_given("git");
+/// let _ = std::process::Command::new(found);
+/// ```
+///
+/// ```compile_fail
+/// let found = dc_proc::Resolved::as_given("git");
+/// let _ = dc_proc::session_command(&found);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved {
     path: PathBuf,
