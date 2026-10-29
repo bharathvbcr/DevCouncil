@@ -82,6 +82,22 @@ Neither set is the doc-comment protocol. That protocol's harness is not in the
 repository, only its table. Reconstructing it is out of scope unless it falls
 out for free; the results section says whether it did.
 
+### Amendment before labelling (stranger questions committed)
+
+The stranger questions were derived from the docs, so a doc page that answers a
+question shares its words. Ground truth for the stranger set is the **source
+files that implement the behaviour**, not the docs that describe it. Two views
+are therefore scored, both pre-stated here:
+
+- **S-all**: rankings over the whole corpus, docs included. A doc ranked above
+  the implementing file counts against the arm.
+- **S-nodocs** (the view the decision rule uses): `docs/`, `README.md` and other
+  `.md` files are removed from every arm's ranked list before scoring. Without
+  this, an arm is rewarded or punished for how closely a question echoes the doc
+  it was written from, which is the opposite of the stranger case.
+
+The commit-subject set is scored over the whole corpus.
+
 ## Metrics and statistics
 
 - R@k = |relevant in top k| / |relevant|, for k in 1, 5, 10, averaged over
@@ -100,7 +116,7 @@ out for free; the results section says whether it did.
 
 Dense (arm C or arm D) is **worth building** only if **both** hold:
 
-1. On the **stranger set**, its MRR beats BM25's with a paired 95% bootstrap CI
+1. On the **stranger set (S-nodocs)**, its MRR beats BM25's with a paired 95% bootstrap CI
    on the MRR difference that **excludes zero**; and
 2. on the **commit-subject set** it does **not** lose to BM25 by more than its
    CI, meaning the paired 95% CI on (dense - BM25) MRR does not lie entirely
