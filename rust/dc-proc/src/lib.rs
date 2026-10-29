@@ -70,7 +70,7 @@ use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1196,6 +1196,8 @@ pub struct Session {
     /// [`Session::kill`] sent the group a signal. Read by the tests that pin
     /// when it must not.
     group_signalled: bool,
+    /// The last bytes the child wrote to stderr, kept by a drain thread.
+    stderr: Arc<StderrCapture>,
 }
 
 impl Session {
@@ -1219,6 +1221,41 @@ impl Session {
     /// The program this session runs, for messages.
     pub fn program(&self) -> &str {
         &self.program
+    }
+
+    /// The last [`SESSION_STDERR_TAIL_BYTES`] bytes the child wrote to stderr,
+    /// waiting at most `settle` for the child's end of the pipe to close.
+    ///
+    /// The bytes are the child's own and **unredacted**: a caller that shows
+    /// them redacts them first. `complete` says the pipe reached EOF, so the
+    /// tail is everything the child will ever say (less `dropped_bytes`); when
+    /// it is false a descendant still holds the pipe, or the wait ran out, and
+    /// more may follow. Call it after [`kill`](Self::kill) to have the group
+    /// closed first.
+    pub fn stderr_tail(&self, settle: Duration) -> StderrTail {
+        let deadline = Instant::now() + settle;
+        let mut state = self
+            .stderr
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while !state.finished {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            state = self
+                .stderr
+                .changed
+                .wait_timeout(state, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        StderrTail {
+            bytes: state.tail.iter().copied().collect(),
+            dropped_bytes: state.dropped,
+            complete: state.finished,
+        }
     }
 
     /// Signal the child's process group and reap the child. Idempotent.
@@ -1254,28 +1291,110 @@ pub fn session_command(program: impl AsRef<OsStr>) -> Command {
     Command::new(program)
 }
 
-/// Start `command` as a [`Session`]: stdin and stdout piped, stderr discarded
-/// (a conversational child that fills an undrained stderr pipe blocks), and the
-/// child leading its own process group. Spawning retries the same pre-exec
-/// refusal [`run_bounded`] does, within `spawn_deadline`.
+/// How many of a session child's last stderr bytes [`Session::stderr_tail`]
+/// keeps. The pipe is always read to EOF, so a chatty child never blocks on a
+/// full pipe, and memory stays at this bound however much it writes.
+pub const SESSION_STDERR_TAIL_BYTES: usize = 4096;
+
+/// What a [`Session`] child wrote to stderr, as far as it was kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StderrTail {
+    /// The last bytes written, at most [`SESSION_STDERR_TAIL_BYTES`].
+    pub bytes: Vec<u8>,
+    /// How many earlier bytes were read and discarded to stay inside the cap.
+    pub dropped_bytes: u64,
+    /// The pipe reached EOF: the child, and every descendant that held it, is
+    /// done writing.
+    pub complete: bool,
+}
+
+impl StderrTail {
+    /// The tail as text, invalid UTF-8 replaced.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes).into_owned()
+    }
+}
+
+#[derive(Default)]
+struct StderrState {
+    tail: std::collections::VecDeque<u8>,
+    dropped: u64,
+    finished: bool,
+}
+
+#[derive(Default)]
+struct StderrCapture {
+    state: Mutex<StderrState>,
+    changed: Condvar,
+}
+
+/// Read `pipe` to EOF (or error), keeping the last [`SESSION_STDERR_TAIL_BYTES`]
+/// bytes in `capture`. Reading continues past the cap on purpose, for the same
+/// reason [`drain`] does: a reader that stops leaves the child blocked on a full
+/// pipe.
+fn drain_tail(mut pipe: impl Read, capture: &StderrCapture) {
+    let mut chunk = [0u8; 8 * 1024];
+    loop {
+        let read = match pipe.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        let mut state = capture.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.tail.extend(&chunk[..read]);
+        let excess = state.tail.len().saturating_sub(SESSION_STDERR_TAIL_BYTES);
+        if excess > 0 {
+            state.tail.drain(..excess);
+            state.dropped += excess as u64;
+        }
+    }
+    let mut state = capture.state.lock().unwrap_or_else(PoisonError::into_inner);
+    state.finished = true;
+    capture.changed.notify_all();
+}
+
+/// Start `command` as a [`Session`]: stdin and stdout piped, stderr piped to a
+/// drain thread that keeps its tail (see [`Session::stderr_tail`]; an undrained
+/// stderr pipe would block a chatty child, and a discarded one leaves a failed
+/// start with no stated cause), and the child leading its own process group.
+/// Spawning retries the same pre-exec refusal [`run_bounded`] does, within
+/// `spawn_deadline`.
 pub fn spawn_session(command: &mut Command, spawn_deadline: Duration) -> Result<Session, Failure> {
     let program = command.get_program().to_string_lossy().into_owned();
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let child = spawn_with_retry(|| command.spawn(), &program, Instant::now(), spawn_deadline)?;
+    let mut child = spawn_with_retry(|| command.spawn(), &program, Instant::now(), spawn_deadline)?;
+    let stderr = Arc::new(StderrCapture::default());
+    match child.stderr.take() {
+        Some(pipe) => {
+            let capture = Arc::clone(&stderr);
+            thread::spawn(move || drain_tail(pipe, &capture));
+        }
+        // Piped above, so absent only if the platform refused the pipe; the
+        // tail then reports itself finished and empty rather than waiting.
+        None => {
+            stderr
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .finished = true;
+        }
+    }
     Ok(Session {
         child,
         program,
         killed: false,
         reaped: false,
         group_signalled: false,
+        stderr,
     })
 }
 
@@ -1493,6 +1612,54 @@ mod tests {
             assert!(Instant::now() < deadline, "the child never exited");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// A language server that dies at start-up says why on stderr. The session
+    /// used to send that to `/dev/null`, so the only evidence was an exit code.
+    #[cfg(unix)]
+    #[test]
+    fn a_session_keeps_what_its_child_said_on_stderr() {
+        let mut session = session_of("echo 'fatal: no toolchain' >&2; exit 3");
+        wait_until_reaped(&mut session);
+        let tail = session.stderr_tail(Duration::from_secs(5));
+        assert!(tail.complete, "the pipe closed with the child: {tail:?}");
+        assert_eq!(tail.text(), "fatal: no toolchain\n");
+        assert_eq!(tail.dropped_bytes, 0);
+    }
+
+    /// The tail is the *last* bytes, bounded, and the child is read to EOF so a
+    /// chatty one never blocks on a full pipe.
+    #[cfg(unix)]
+    #[test]
+    fn the_stderr_tail_is_the_last_bytes_and_bounded() {
+        let mut session =
+            session_of("yes 0123456789abcdef | head -c 300000 >&2; printf '%s' END-OF-STDERR >&2");
+        wait_until_reaped(&mut session);
+        let tail = session.stderr_tail(Duration::from_secs(5));
+        assert!(tail.complete);
+        assert_eq!(tail.bytes.len(), SESSION_STDERR_TAIL_BYTES);
+        assert!(tail.text().ends_with("END-OF-STDERR"), "{:?}", tail.text());
+        assert_eq!(
+            tail.dropped_bytes + tail.bytes.len() as u64,
+            300_000 + "END-OF-STDERR".len() as u64,
+            "every byte is either kept or counted as dropped"
+        );
+    }
+
+    /// A descendant that still holds the pipe must not hold the caller: the wait
+    /// is bounded, says the tail is not complete, and `kill` then ends it.
+    #[cfg(unix)]
+    #[test]
+    fn the_stderr_wait_is_bounded_when_a_descendant_holds_the_pipe() {
+        let mut session = session_of("echo early >&2; sleep 30 & exit 0");
+        wait_until_reaped(&mut session);
+        let started = Instant::now();
+        let tail = session.stderr_tail(Duration::from_millis(150));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!tail.complete, "the sleeper still holds stderr: {tail:?}");
+        assert!(tail.text().contains("early"));
+        session.kill();
+        assert!(session.stderr_tail(Duration::from_secs(5)).complete);
     }
 
     /// `try_status` reaps the child; the group id then names nothing of ours,

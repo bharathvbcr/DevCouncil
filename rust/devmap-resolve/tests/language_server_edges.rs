@@ -220,7 +220,11 @@ fn oversized_payload_reason_is_distinct_from_a_successful_zero_edge_run() {
 fn missing_binary_and_non_zero_exit_are_did_not_run_labels() {
     assert_eq!(LspDidNotRun::MissingBinary.label(), "missing_binary");
     assert_eq!(
-        LspDidNotRun::NonZeroExit { code: Some(1) }.label(),
+        LspDidNotRun::NonZeroExit {
+            code: Some(1),
+            stderr: None
+        }
+        .label(),
         "non_zero_exit"
     );
 }

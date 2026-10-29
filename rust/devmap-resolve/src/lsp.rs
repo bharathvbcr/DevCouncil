@@ -48,6 +48,17 @@ const LSP_HEADER_LINE_CAP: u64 = 8 * 1024;
 /// How long `shutdown` waits for a server to exit on its own before killing it.
 const LSP_EXIT_GRACE: Duration = Duration::from_millis(500);
 
+/// How long a failed server's stderr is given to finish arriving once the
+/// server has been killed.
+const LSP_STDERR_SETTLE: Duration = Duration::from_millis(300);
+
+/// Lines of a server's stderr the build readout prints; the JSON report
+/// carries the whole surfaced tail.
+const LSP_STDERR_STATUS_LINES: usize = 12;
+
+/// Longest status line a server's stderr is printed as.
+const LSP_STDERR_LINE_CAP: usize = 300;
+
 /// Servers this pass will start, in order, and only when the binary is on
 /// `PATH` outside the repository (see `which_binary`). A missing or refused
 /// binary is a status line that the pass did not run — never "zero new edges
@@ -99,9 +110,17 @@ impl LspServerSpec {
 pub enum LspDidNotRun {
     MissingBinary,
     RefusedBinary(String),
-    NonZeroExit { code: Option<i32> },
+    /// The server closed its stdout. `stderr` is what it last wrote to stderr
+    /// (see [`surface_stderr`]: bounded, redacted), the only statement of why
+    /// a server that starts and exits gives.
+    NonZeroExit {
+        code: Option<i32>,
+        stderr: Option<String>,
+    },
     TimedOut,
-    OversizedPayload { bytes: usize },
+    OversizedPayload {
+        bytes: usize,
+    },
     Cancelled,
     Protocol(String),
 }
@@ -116,6 +135,15 @@ impl LspDidNotRun {
             LspDidNotRun::OversizedPayload { .. } => "oversized_payload",
             LspDidNotRun::Cancelled => "cancelled",
             LspDidNotRun::Protocol(_) => "protocol",
+        }
+    }
+
+    /// The redacted tail of the server's stderr, for a server that started and
+    /// exited. See [`surface_stderr`].
+    pub fn stderr_tail(&self) -> Option<&str> {
+        match self {
+            LspDidNotRun::NonZeroExit { stderr, .. } => stderr.as_deref(),
+            _ => None,
         }
     }
 }
@@ -192,6 +220,42 @@ pub struct LspSiteAnswer {
     pub server: String,
     pub server_version: String,
     pub locations: Vec<LspLocation>,
+}
+
+/// What of a failed server's stderr tail may be shown: whole lines only,
+/// redacted, control characters removed.
+///
+/// A server's stderr can carry anything it read — a path, an environment
+/// variable, a token in a URL — and the readout and the JSON build report both
+/// leave the machine in a pasted bug report. So the text goes through
+/// `dc_redact::redact_secrets`, the table every secret gate in the harness
+/// uses, which replaces vendor-shaped credentials with a prefix-preserving
+/// marker. Limits, stated: it recognises credential *shapes*, not arbitrary
+/// secrets (a bare password in prose passes), and the tail is bounded at
+/// `dc_proc::SESSION_STDERR_TAIL_BYTES`. When bytes were dropped to stay inside
+/// that bound the first line may be cut in the middle of a token, which no
+/// shape would then match, so that line is discarded rather than shown.
+/// `None` when nothing is left to show.
+pub fn surface_stderr(tail: &subprocess::StderrTail) -> Option<String> {
+    let text = tail.text();
+    let kept = if tail.dropped_bytes > 0 {
+        text.split_once('\n').map_or("", |(_, rest)| rest)
+    } else {
+        text.as_str()
+    };
+    let redacted = dc_redact::redact_secrets(kept);
+    let clean: String = redacted
+        .chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\t' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let clean = clean.trim();
+    (!clean.is_empty()).then(|| clean.to_string())
 }
 
 /// Stable edge-payload spelling so a later reader can see who claimed the edge.
@@ -425,6 +489,23 @@ impl LspPassReport {
                 // needs to act on; the label alone does not say where it was.
                 if let LspDidNotRun::RefusedBinary(detail) = reason {
                     lines.push(format!("lsp: {} refused: {detail}", server.binary));
+                }
+                // A server that started and exited said why on stderr.
+                if let LspDidNotRun::NonZeroExit {
+                    code,
+                    stderr: Some(stderr),
+                } = reason
+                {
+                    lines.push(format!(
+                        "lsp: {} exited{} — last stderr (redacted):",
+                        server.binary,
+                        code.map_or(String::new(), |code| format!(" with status {code}")),
+                    ));
+                    let all: Vec<&str> = stderr.lines().collect();
+                    for line in &all[all.len().saturating_sub(LSP_STDERR_STATUS_LINES)..] {
+                        let shown: String = line.chars().take(LSP_STDERR_LINE_CAP).collect();
+                        lines.push(format!("lsp:   {shown}"));
+                    }
                 }
             } else if server.ran {
                 lines.push(format!(
@@ -1314,7 +1395,10 @@ impl LspClient {
             Ok(Incoming::Eof) | Err(RecvTimeoutError::Disconnected) => {
                 let code = self.session.try_status().and_then(|status| status.code());
                 self.kill();
-                Err(LspDidNotRun::NonZeroExit { code })
+                // After the kill, so the group is dead and the pipe closed:
+                // what the server wrote before it exited is then all in.
+                let stderr = surface_stderr(&self.session.stderr_tail(LSP_STDERR_SETTLE));
+                Err(LspDidNotRun::NonZeroExit { code, stderr })
             }
             Err(RecvTimeoutError::Timeout) => {
                 self.kill();
@@ -2218,6 +2302,105 @@ while :; do
 done
 "#;
 
+    /// A server that dies at start-up said why on stderr, and the pass used to
+    /// throw that away (`rust-analyzer` failed with `non_zero_exit` and nothing
+    /// else). The cause must reach the report, redacted and bounded.
+    #[cfg(feature = "parse")]
+    #[test]
+    fn a_server_that_dies_at_start_up_reports_its_redacted_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let token = format!("ghp_{}", "A1b2C3d4E5".repeat(4));
+        assert!(
+            dc_redact::contains_secret(&token),
+            "the fixture token must be a shape the redactor knows"
+        );
+        let scratch = super::uris_and_positions::Scratch::new("stderr");
+        let root = scratch.0.join("repo");
+        let bin = scratch.0.join("bin");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = format!(
+            "#!/bin/sh\n\
+             echo 'error: failed to load workspace: toolchain missing' >&2\n\
+             echo 'fetching https://x:{token}@example.com/repo.git' >&2\n\
+             exit 101\n"
+        );
+        let server = bin.join("dying-lsp");
+        std::fs::write(&server, script).unwrap();
+        std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let source = "fn main() {\n    a.run();\n}\n";
+        std::fs::write(root.join("main.rs"), source).unwrap();
+        let extractions = [devmap_extract::extract_file("main.rs", source)];
+        let mut resolver = crate::resolver::Resolver::new();
+        resolver.index_extractions(&extractions);
+        let mut resolution = resolver.resolve_all(&extractions).unwrap();
+        let spec = LspServerSpec {
+            binary: "dying-lsp",
+            args: &[],
+            extensions: &[".rs"],
+        };
+        let sources = BTreeMap::from([("main.rs".to_string(), source.to_string())]);
+        let report = enrich_with_servers(
+            &[spec],
+            Some(bin.as_os_str()),
+            &root,
+            &extractions,
+            &sources,
+            &mut resolution,
+            &AtomicBool::new(false),
+        );
+
+        let status = &report.servers[0];
+        assert!(!status.ran, "{status:?}");
+        let reason = status.did_not_run.as_ref().expect("the server died");
+        assert_eq!(reason.label(), "non_zero_exit");
+        let tail = reason.stderr_tail().expect("its stderr was kept");
+        assert!(tail.contains("toolchain missing"), "{tail}");
+        assert!(
+            !tail.contains(&token),
+            "a credential in the server's stderr must not be shown: {tail}"
+        );
+        let lines = report.status_lines().join("\n");
+        assert!(lines.contains("toolchain missing"), "{lines}");
+        assert!(!lines.contains(&token), "{lines}");
+    }
+
+    /// The surfaced tail keeps whole lines only: bytes dropped to stay inside
+    /// the cap can leave the first line cut mid-token, and a half token matches
+    /// no credential shape.
+    #[test]
+    fn a_tail_that_dropped_bytes_loses_its_cut_first_line() {
+        let cut = subprocess::StderrTail {
+            bytes: b"A1b2C3d4E5A1b2C3d4E5\nreal message\n".to_vec(),
+            dropped_bytes: 77,
+            complete: true,
+        };
+        assert_eq!(surface_stderr(&cut).as_deref(), Some("real message"));
+        let whole = subprocess::StderrTail {
+            dropped_bytes: 0,
+            ..cut.clone()
+        };
+        assert!(surface_stderr(&whole).unwrap().starts_with("A1b2C3d4E5"));
+        let empty = subprocess::StderrTail {
+            bytes: b"  \n".to_vec(),
+            dropped_bytes: 0,
+            complete: true,
+        };
+        assert_eq!(surface_stderr(&empty), None);
+        let controls = subprocess::StderrTail {
+            bytes: b"bell\x07 and escape\x1b[31m red".to_vec(),
+            dropped_bytes: 0,
+            complete: true,
+        };
+        let shown = surface_stderr(&controls).unwrap();
+        assert!(
+            !shown.contains('\x07') && !shown.contains('\x1b'),
+            "{shown:?}"
+        );
+    }
+
     /// Acceptance, end to end through the pass with a fake server: a
     /// repository in a directory named `my code`; two `run` calls on
     /// different receivers in one function are asked about at their own
@@ -2309,9 +2492,9 @@ done
             })
             .collect();
         assert!(
-            lsp_edges
-                .iter()
-                .any(|edge| edge.target_file == "main.rs" && edge.target_symbol == "target"),
+            lsp_edges.iter().any(
+                |edge| edge.target_file == "main.rs" && edge.target_symbol == "main.rs::target"
+            ),
             "{lsp_edges:?}"
         );
     }

@@ -217,3 +217,60 @@ fn build_without_lsp_flag_omits_the_lsp_block() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// A language server that starts and exits used to leave `non_zero_exit` and
+/// nothing else, because its stderr went to `/dev/null`. The JSON row and the
+/// build's own readout now carry the last of it, redacted.
+#[cfg(unix)]
+#[test]
+fn a_server_that_exits_at_start_up_has_its_stderr_in_the_report() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = tmp_dir("dying-server");
+    let repo = base.join("repo");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::write(
+        repo.join("src").join("lib.rs"),
+        "pub fn caller() {\n    not_defined_anywhere();\n}\n",
+    )
+    .unwrap();
+    let bin_dir = base.join("installed").join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let token = format!("ghp_{}", "A1b2C3d4E5".repeat(4));
+    let program = bin_dir.join("rust-analyzer");
+    fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\necho 'error: no sysroot found' >&2\necho 'token {token}' >&2\nexit 101\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let row = rust_analyzer_row(&repo, &base.join("a.sqlite"), bin_dir.as_os_str());
+    assert_eq!(row["ran"], false, "{row}");
+    assert_eq!(row["did_not_run"], "non_zero_exit", "{row}");
+    let tail = row["stderr_tail"].as_str().expect("a stderr tail");
+    assert!(tail.contains("no sysroot found"), "{row}");
+    assert!(
+        !tail.contains(&token),
+        "a credential must be redacted: {row}"
+    );
+
+    // The human readout (no --json) says it too, on stderr.
+    let output = Command::new(bin())
+        .args(["build", "--lsp", "--db"])
+        .arg(base.join("b.sqlite"))
+        .arg(&repo)
+        .current_dir(&repo)
+        .env("PATH", &bin_dir)
+        .output()
+        .expect("spawn build --lsp");
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(shown.contains("no sysroot found"), "{shown}");
+    assert!(!shown.contains(&token), "{shown}");
+    let _ = fs::remove_dir_all(&base);
+}
