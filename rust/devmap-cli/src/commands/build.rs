@@ -241,7 +241,7 @@ fn run_once(
     let mut store = progress.timed("store:open", || Store::open(cli.db()))?;
     // The same probe `status` reports, asked before anything below can decide
     // "nothing changed" over an index that cannot answer a search.
-    if let Some(damage) = store.search_index_damage()? {
+    if let Some(damage) = store.search_index_unreadable()? {
         match store.repair_fts() {
             Ok(()) => {
                 progress.display.diagnostic(format_args!(
