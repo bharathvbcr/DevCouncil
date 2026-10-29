@@ -316,7 +316,10 @@ fn the_readers_answer_the_same_after_a_v28_store_is_migrated() {
         0,
         "the pages the rewrite freed went back to the filesystem, not to a freelist"
     );
-    assert_eq!(one::<i64>(&db, "SELECT COUNT(*) FROM pragma_foreign_key_check"), 0);
+    assert_eq!(
+        one::<i64>(&db, "SELECT COUNT(*) FROM pragma_foreign_key_check"),
+        0
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -338,8 +341,15 @@ fn a_migration_that_meets_an_unreadable_payload_leaves_the_v28_store_as_it_was()
         .expect("a payload that is not JSON cannot be migrated")
         .to_string();
     assert!(error.contains("schema 29"), "{error}");
-    assert!(error.contains("checks.py"), "the refusal names the file: {error}");
-    assert_eq!(one::<i64>(&db, "PRAGMA user_version"), 28, "the stamp did not advance");
+    assert!(
+        error.contains("checks.py"),
+        "the refusal names the file: {error}"
+    );
+    assert_eq!(
+        one::<i64>(&db, "PRAGMA user_version"),
+        28,
+        "the stamp did not advance"
+    );
     assert_eq!(
         one::<i64>(
             &db,
@@ -379,9 +389,8 @@ fn a_store_left_half_converted_converges_on_open_and_the_next_build_reuses_every
                     .collect::<Result<_, _>>()
                     .unwrap();
                 for (id, frame) in rows.into_iter().take(sources().len() / 2) {
-                    let text =
-                        String::from_utf8(zstd::bulk::decompress(&frame, 64 << 20).unwrap())
-                            .unwrap();
+                    let text = String::from_utf8(zstd::bulk::decompress(&frame, 64 << 20).unwrap())
+                        .unwrap();
                     conn.execute(
                         "UPDATE file_payloads SET extraction_json = ?2 WHERE payload_id = ?1",
                         params![id, text],

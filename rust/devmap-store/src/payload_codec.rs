@@ -46,11 +46,22 @@ use crate::db::refusal;
 
 /// zstd level for a stored document.
 ///
-/// Level 3 is zstd's own default. Measured on this repository's payloads
-/// (`docs/devmap/design/store-write-cost-proposal.md`, Appendix C), levels 1 and
-/// 3 compress ~11x and 9 reaches ~13x for several times the write cost, so the
-/// extra two points of ratio are not worth paying on every changed file.
-pub(crate) const ZSTD_LEVEL: i32 = 3;
+/// Chosen by measurement over this repository's 1,896 stored extractions
+/// (200.6 MB, per-document frames with a checksum, min of 5 in one process,
+/// Appendix C of `docs/devmap/design/store-write-cost-proposal.md`):
+///
+/// ```text
+///   level   ratio   compress (whole corpus)   decompress
+///     1     11.17x        130 ms                 58 ms
+///     3     11.03x        144 ms                 56 ms
+///     5     11.76x        437 ms                 56 ms
+///     9     13.29x        886 ms                 50 ms
+/// ```
+///
+/// Level 1 is as small as level 3 on this data and the cheapest to write. The
+/// next ratio gain, level 9's two points, costs six times the write for a store
+/// whose biggest column is already 11x smaller.
+pub(crate) const ZSTD_LEVEL: i32 = 1;
 
 /// The most a stored document may decompress to, and so the most a writer will
 /// store and a reader will allocate for one.
@@ -152,8 +163,11 @@ pub(crate) fn inflate_document(frame: &[u8], what: &str) -> rusqlite::Result<Str
             bytes.len()
         )));
     }
-    String::from_utf8(bytes)
-        .map_err(|error| refusal(format!("stored extraction for {what} is not UTF-8: {error}")))
+    String::from_utf8(bytes).map_err(|error| {
+        refusal(format!(
+            "stored extraction for {what} is not UTF-8: {error}"
+        ))
+    })
 }
 
 /// The JSON of a stored extraction, as the column holds it.
@@ -161,9 +175,13 @@ pub(crate) fn inflate_document(frame: &[u8], what: &str) -> rusqlite::Result<Str
 /// Borrowed when the row is `TEXT`, decompressed when it is a `BLOB`.
 pub(crate) fn decode_value<'a>(value: ValueRef<'a>, what: &str) -> rusqlite::Result<Cow<'a, str>> {
     match value {
-        ValueRef::Text(text) => std::str::from_utf8(text).map(Cow::Borrowed).map_err(|error| {
-            refusal(format!("stored extraction for {what} is not UTF-8: {error}"))
-        }),
+        ValueRef::Text(text) => std::str::from_utf8(text)
+            .map(Cow::Borrowed)
+            .map_err(|error| {
+                refusal(format!(
+                    "stored extraction for {what} is not UTF-8: {error}"
+                ))
+            }),
         ValueRef::Blob(frame) => inflate_document(frame, what).map(Cow::Owned),
         other => Err(refusal(format!(
             "stored extraction for {what} is {:?}, neither TEXT nor a compressed BLOB",
@@ -188,11 +206,15 @@ pub(crate) enum StoredDocument {
 impl StoredDocument {
     pub(crate) fn from_value(value: ValueRef<'_>, what: &str) -> rusqlite::Result<Self> {
         match value {
-            ValueRef::Text(text) => String::from_utf8(text.to_vec())
-                .map(Self::Text)
-                .map_err(|error| {
-                    refusal(format!("stored extraction for {what} is not UTF-8: {error}"))
-                }),
+            ValueRef::Text(text) => {
+                String::from_utf8(text.to_vec())
+                    .map(Self::Text)
+                    .map_err(|error| {
+                        refusal(format!(
+                            "stored extraction for {what} is not UTF-8: {error}"
+                        ))
+                    })
+            }
             ValueRef::Blob(frame) => Ok(Self::Frame(frame.to_vec())),
             other => Err(refusal(format!(
                 "stored extraction for {what} is {:?}, neither TEXT nor a compressed BLOB",

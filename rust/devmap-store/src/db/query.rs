@@ -796,9 +796,7 @@ impl Store {
                  JOIN paths p ON p.id = f.file_id
                  WHERE f.generation_id = ?1 AND p.path = ?2",
                 params![gen, path],
-                |row| {
-                    Ok(crate::payload_codec::decode_value(row.get_ref(0)?, path)?.into_owned())
-                },
+                |row| Ok(crate::payload_codec::decode_value(row.get_ref(0)?, path)?.into_owned()),
             )
             .optional()?;
         let Some(json) = json else {

@@ -791,7 +791,9 @@ impl Store {
                             key.grammar_version,
                             key.analyzer_version
                         ],
-                        |row| crate::payload_codec::StoredDocument::from_value(row.get_ref(0)?, &what),
+                        |row| {
+                            crate::payload_codec::StoredDocument::from_value(row.get_ref(0)?, &what)
+                        },
                     )
                     .optional()?
                     .map(|json| ("generation_files", json)),
