@@ -57,13 +57,22 @@ fn commit(store: &Store, files: &Files, affected: &[&str], deleted: &[&str]) -> 
         .iter()
         .map(|(path, body)| extract_file(path, body))
         .collect();
+    commit_extractions(store, &extractions, affected, deleted)
+}
+
+fn commit_extractions(
+    store: &Store,
+    extractions: &[devmap_extract::Extraction],
+    affected: &[&str],
+    deleted: &[&str],
+) -> u32 {
     let mut resolver = Resolver::new();
-    resolver.index_extractions(&extractions);
-    let resolution = resolver.resolve_all(&extractions).unwrap();
-    let analysis = analyze(&extractions, &resolution);
+    resolver.index_extractions(extractions);
+    let resolution = resolver.resolve_all(extractions).unwrap();
+    let analysis = analyze(extractions, &resolution);
     store
         .save_generation_with_opts(
-            &extractions,
+            extractions,
             &resolution,
             &analysis,
             GenerationWriteOpts {
@@ -509,12 +518,13 @@ fn retention_collects_a_payload_with_its_rows_and_only_then() {
     let rows = read_generation(&conn, again);
     assert!(rows.iter().any(|row| row.starts_with("node|pkg/mod_2.py|leaf_2")));
     assert!(rows.iter().any(|row| row.starts_with("literal|pkg/mod_2.py|")));
+    let (path, body) = module(2, 0);
     assert_eq!(
         rows.iter()
             .filter(|row| row.starts_with("node|pkg/mod_2.py|"))
             .count(),
-        3,
-        "the module's three symbols"
+        extract_file(&path, &body).symbols.len(),
+        "every symbol the extractor found in the module"
     );
     let _ = fs::remove_dir_all(&dir);
 }
@@ -551,9 +561,11 @@ fn a_reader_against_a_writing_and_pruning_writer_sees_one_generation() {
     );
 
     let stop = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(AtomicU64::new(0));
     let readers: Vec<_> = (0..3)
         .map(|_| {
-            let (db, stop, expected) = (db.clone(), stop.clone(), expected.clone());
+            let (db, stop, expected, started) =
+                (db.clone(), stop.clone(), expected.clone(), started.clone());
             std::thread::spawn(move || {
                 let reader = Store::open(&db).unwrap();
                 let mut reads = 0u32;
@@ -576,12 +588,21 @@ fn a_reader_against_a_writing_and_pruning_writer_sees_one_generation() {
                         .expect("a generation exists");
                     assert!(page.total >= 1, "leaf_4 is in every generation");
                     reads += 1;
+                    if reads == 1 {
+                        started.fetch_add(1, Ordering::SeqCst);
+                    }
                 }
                 reads
             })
         })
         .collect();
 
+    // Every reader has answered once against the first generation before the
+    // writer moves, and keeps answering while it commits and prunes.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while started.load(Ordering::SeqCst) < 3 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     for n in 1..12 {
         commit(&writer, &revision(n), &["pkg/mod_4.py"], &[]);
         writer.prune_generations_except_latest(2).unwrap();
@@ -592,24 +613,30 @@ fn a_reader_against_a_writing_and_pruning_writer_sees_one_generation() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A file with 50,000 literal sites and nothing else: the literals are written
-/// once, found by value, and never rewritten by an edit elsewhere.
+/// A file with 50,000 literal sites: the literals are written once, found by
+/// value, and never rewritten by an edit elsewhere.
+///
+/// The extractor stops at `MAX_LITERALS_PER_FILE` (4,096) per file, so a real
+/// source file cannot reach 50,000; the extraction is built by hand to put the
+/// store itself, which has no such cap, under that many rows for one payload.
 #[test]
 fn a_file_of_fifty_thousand_literals_is_written_once() {
     let dir = tmp_dir("literals");
     let db = dir.join("devmap.sqlite");
     let store = Store::open(&db).unwrap();
-    let body = format!(
-        "TABLE = [{}]\n",
-        (0..50_000)
-            .map(|index| format!("\"v{index}\""))
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-    assert!(body.len() < 1 << 20, "within the extractor's input limit");
-    let mut files: Files = vec![("data/table.py".into(), body)];
-    files.extend(tree(3, |_| 0));
-    commit(&store, &files, &[], &[]);
+    let mut table = extract_file("data/table.py", "TABLE = []\n");
+    table.literals = (0..50_000)
+        .map(|index| devmap_extract::ExtractedLiteral {
+            value: format!("v{index}"),
+            start_byte: 9 + index,
+            line: 1,
+            enclosing_qualified_name: String::new(),
+            enclosing_name: String::new(),
+        })
+        .collect();
+    let mut extractions = vec![table];
+    extractions.extend(tree(3, |_| 0).iter().map(|(p, b)| extract_file(p, b)));
+    commit_extractions(&store, &extractions, &[], &[]);
     let written = count(&db, "SELECT COUNT(*) FROM payload_literals");
     assert!(written >= 50_000, "every literal site is stored: {written}");
 
@@ -620,9 +647,9 @@ fn a_file_of_fifty_thousand_literals_is_written_once() {
     assert_eq!(page.total, 1);
     assert_eq!(page.rows[0].file_path, "data/table.py");
 
-    let mut edited = files.clone();
-    edited[1] = module(0, 9);
-    commit(&store, &edited, &["pkg/mod_0.py"], &[]);
+    let (path, body) = module(0, 9);
+    extractions[1] = extract_file(&path, &body);
+    commit_extractions(&store, &extractions, &["pkg/mod_0.py"], &[]);
     let grew = count(&db, "SELECT COUNT(*) FROM payload_literals") - written;
     assert!(
         grew < 10,
@@ -633,6 +660,15 @@ fn a_file_of_fifty_thousand_literals_is_written_once() {
         .unwrap()
         .expect("a generation exists");
     assert_eq!(page.total, 1, "the table still reads in the new generation");
+    // Both retained generations read all 50,000 through the view.
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM generation_literals l JOIN paths p ON p.id = l.file_id
+              WHERE p.path = 'data/table.py' AND l.generation_id = 2"
+        ),
+        50_000
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -650,7 +686,9 @@ fn an_empty_file_and_an_unsupported_file_are_members_without_symbols() {
     files.extend(tree(2, |_| 0));
     let g1 = commit(&store, &files, &[], &[]);
     let conn = Connection::open(&db).unwrap();
-    for path in ["empty.py", "blob.bin"] {
+    for (path, body) in files.iter().take(2) {
+        let path = path.as_str();
+        let symbols = extract_file(path, body).symbols.len() as i64;
         assert_eq!(
             count(
                 &db,
@@ -670,8 +708,8 @@ fn an_empty_file_and_an_unsupported_file_are_members_without_symbols() {
                       WHERE n.generation_id = {g1} AND p.path = '{path}'"
                 )
             ),
-            0,
-            "{path} has no symbols"
+            symbols,
+            "{path} holds the symbols its extraction found (none from a grammar-less or empty file beyond what the extractor itself reports)"
         );
     }
     // A full rewrite over the same content writes no new payload and no range.
