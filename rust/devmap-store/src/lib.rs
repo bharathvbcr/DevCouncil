@@ -5,6 +5,7 @@ pub mod edge_index;
 // frontend to produce what it caches. A read-only consumer never touches it.
 #[cfg(feature = "parse")]
 pub mod extract_cache;
+pub(crate) mod payload_codec;
 pub mod schema;
 
 pub use coverage::{

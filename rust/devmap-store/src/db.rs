@@ -53,7 +53,7 @@ impl std::error::Error for StoreRefusal {}
 /// concurrently.
 static CONNECTION_SETUP: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn refusal(message: impl Into<String>) -> rusqlite::Error {
+pub(crate) fn refusal(message: impl Into<String>) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(StoreRefusal(message.into())))
 }
 
@@ -2150,9 +2150,12 @@ struct StoredPayload<'a> {
     analyzer_version: &'a str,
     parse_outcome_json: &'a str,
     engine_json: &'a str,
-    extraction_json: &'a str,
-    /// [`payload_digest`] of the three documents above, the sixth part of the
-    /// payload's identity.
+    /// The extraction as a zstd frame; see `crate::payload_codec`.
+    extraction_frame: &'a [u8],
+    /// `RuntimeEntryPoint` wiring, promoted out of the compressed document.
+    entry_wiring_json: &'a str,
+    /// [`payload_digest`] of the three documents above *as text*, before the
+    /// extraction was compressed: the sixth part of the payload's identity.
     payload_digest: &'a [u8],
 }
 
@@ -2243,6 +2246,7 @@ const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
             "engine_json",
             "extraction_json",
             "payload_digest",
+            "entry_wiring_json",
         ],
     ),
     (

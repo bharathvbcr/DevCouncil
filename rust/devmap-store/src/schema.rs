@@ -1719,7 +1719,50 @@ SELECT (n.payload_id << 24) | n.ord_in_file, n.name, n.qualified_name, p.path
  ORDER BY n.payload_id, n.ord_in_file;
 "#;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 28;
+/// v29: a payload's extraction document is stored zstd-compressed.
+///
+/// Measured on this repository's own store at schema 28 (1,896 payloads):
+/// `file_payloads` is 196 MB of 349 MB, and all but 0.15 MB of that is
+/// `extraction_json`, ~106 KB a row as JSON text. Per-row zstd takes it ~11x
+/// smaller; the measurements that decided whether that is worth a schema bump
+/// are in `docs/devmap/design/store-write-cost-proposal.md`, Appendix C.
+///
+/// What the bump changes, and what it does not:
+///
+/// * `extraction_json` keeps its name and its `TEXT NOT NULL` declaration, and
+///   `generation_files` keeps exposing it, but a v29 row holds a zstd frame as a
+///   `BLOB`. SQLite does not convert a blob stored in a `TEXT` column, so no DDL
+///   is needed, and the storage class tells the two forms apart (see
+///   [`crate::payload_codec`]). That is also why the floor is raised: a v28
+///   reader would read the blob with `get::<String>`, and while that fails
+///   loudly the failure is "invalid column type" and not "this store is newer".
+/// * Payload identity is unchanged. `payload_digest` covers the JSON text, taken
+///   before compression.
+/// * `json_extract` cannot see inside a compressed value, and
+///   `latest_test_entry_symbols` ran `json_extract(extraction_json, '$.wiring')`
+///   on every hook-driven `affected_tests`. What it needs is promoted into
+///   `entry_wiring_json`: the `RuntimeEntryPoint` wiring annotations as a JSON
+///   array, written beside the payload, so the query reads a few bytes and
+///   decompresses nothing. `NULL` means "not computed" (a row a foreign writer
+///   inserted) and the reader falls back to decoding that one document; `'[]'`
+///   means "computed, none".
+///
+/// # The migration
+///
+/// One transaction, like every rung. Each uncompressed payload is read,
+/// compressed, and written back with its `entry_wiring_json`, one row at a time
+/// so the migration holds one document and not the store's. The rung is guarded
+/// on the shape and the pass selects only what is not yet converted, so a
+/// store re-entered after a crash, or one that a writer left half converted,
+/// converges: the same pass runs at every writer open (`Store::heal_extraction_encoding`) and
+/// costs one probe when there is nothing to do. The pages the rewrite frees go
+/// back to the filesystem through the incremental vacuum the store already
+/// uses.
+pub const MIGRATION_V28_TO_V29: &str = r#"
+ALTER TABLE file_payloads ADD COLUMN entry_wiring_json TEXT;
+"#;
+
+pub const CURRENT_SCHEMA_VERSION: i32 = 29;
 
 /// The oldest reader schema that can read a store this binary writes.
 ///
@@ -1745,17 +1788,19 @@ pub const CURRENT_SCHEMA_VERSION: i32 = 28;
 ///   something else. v28 is this too, and not for want of compatible views:
 ///   the `nodes_fts` rowid no longer carries a generation, so a v27 reader
 ///   joining it by `rowid & 4294967295` would resolve a payload's symbols to
-///   the wrong rows and answer without an error.
+///   the wrong rows and answer without an error. v29 is this as well: it
+///   changes the storage class of `file_payloads.extraction_json` from `TEXT`
+///   to a compressed `BLOB`, which no earlier binary can decode.
 ///
 /// Writers stay exact-match: a binary never migrates or writes a store newer
 /// than itself, whatever this floor says.
-pub const MIN_READER_SCHEMA_VERSION: i32 = 28;
+pub const MIN_READER_SCHEMA_VERSION: i32 = 29;
 
 /// `(schema, floor)` for every schema since the floor was introduced, oldest
 /// first. The last row must be `(CURRENT_SCHEMA_VERSION,
 /// MIN_READER_SCHEMA_VERSION)`; a unit test holds that, so bumping the schema
 /// without deciding the new floor fails rather than silently inheriting one.
-pub const SCHEMA_READER_FLOORS: &[(i32, i32)] = &[(26, 25), (27, 25), (28, 28)];
+pub const SCHEMA_READER_FLOORS: &[(i32, i32)] = &[(26, 25), (27, 25), (28, 28), (29, 29)];
 
 /// Where a writer records [`MIN_READER_SCHEMA_VERSION`].
 ///
@@ -1817,6 +1862,9 @@ pub const FRESH_SCHEMA_BATCHES: &[&str] = &[
     // Over the empty v27 shape the batches above just built, on the fresh path;
     // over a real store, on the ladder (see `Store::migrate_to_v28`).
     MIGRATION_V27_TO_V28,
+    // The one column v29 adds; the compression of existing rows is Rust, and a
+    // fresh store has none (see `Store::migrate_to_v29`).
+    MIGRATION_V28_TO_V29,
     // Not a rung: no `user_version` bump. Every writer open creates it — the
     // fresh path and the ladder alike — so both still land on one schema.
     READER_COMPAT_TABLE,

@@ -668,30 +668,48 @@ impl Store {
     ///
     /// The `RuntimeEntryPoint` wiring annotations whose details
     /// [`devmap_extract::wiring::is_test_harness_reason`] recognises, read
-    /// without decoding whole extractions: SQLite pulls out only the
-    /// `wiring` array, and only from files whose payload mentions an entry
-    /// point at all. `affected_tests` runs on every hook-driven query, and a
-    /// full [`Self::latest_extractions`] decode there would cost more than the
-    /// walk it serves.
+    /// without decoding whole extractions. `affected_tests` runs on every
+    /// hook-driven query, and a full [`Self::latest_extractions`] decode there
+    /// would cost more than the walk it serves.
+    ///
+    /// Since schema 29 the extraction is a compressed blob, which SQL cannot
+    /// look inside, so the annotations this query wants are stored beside it
+    /// (`file_payloads.entry_wiring_json`, written with the payload) and the
+    /// query reads those: no payload is decompressed. A payload with no stored
+    /// entry wiring (`NULL`, a row some other writer inserted) is the one case
+    /// that still decodes its document, so the answer never depends on who
+    /// wrote the row. The test-harness judgement stays here, where it was.
     pub fn latest_test_entry_symbols(&self) -> Result<std::collections::HashSet<String>> {
+        use crate::payload_codec::{decode_value, entry_wiring_of_document};
         let conn = lock_conn(&self.conn)?;
         let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(std::collections::HashSet::new());
         };
+        // The CASE reads the document only for a row with no stored entry
+        // wiring; for every other row the column is never loaded.
         let mut stmt = snapshot.prepare(
-            "SELECT json_extract(f.extraction_json, '$.wiring'), p.path
-             FROM generation_files f
-             JOIN paths p ON p.id = f.file_id
-             WHERE f.generation_id = ?1
-               AND instr(f.extraction_json, 'RuntimeEntryPoint') > 0",
+            "SELECT p.entry_wiring_json, pa.path,
+                    CASE WHEN p.entry_wiring_json IS NULL THEN p.extraction_json END
+             FROM generation_file_rows m
+             JOIN file_payloads p ON p.payload_id = m.payload_id
+             JOIN paths pa ON pa.id = m.file_id
+             WHERE m.generation_id = ?1
+               AND (p.entry_wiring_json IS NULL OR p.entry_wiring_json <> '[]')",
         )?;
         let rows = stmt.query_map(params![gen], |row| {
-            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
+            let path: String = row.get(1)?;
+            let json = match row.get::<_, Option<String>>(0)? {
+                Some(json) => json,
+                None => {
+                    let document = decode_value(row.get_ref(2)?, &path)?;
+                    entry_wiring_of_document(&document, &path)?
+                }
+            };
+            Ok((json, path))
         })?;
         let mut symbols = std::collections::HashSet::new();
         for row in rows {
             let (json, path) = row?;
-            let Some(json) = json else { continue };
             let wiring: Vec<devmap_extract::model::WiringAnnotation> = serde_json::from_str(&json)
                 .map_err(|error| {
                     refusal(format!("stored wiring for {path} is invalid: {error}"))
@@ -738,7 +756,9 @@ impl Store {
              ORDER BY p.path",
         )?;
         let rows = stmt.query_map(params![gen], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            let path: String = row.get(1)?;
+            let json = crate::payload_codec::decode_value(row.get_ref(0)?, &path)?.into_owned();
+            Ok((json, path))
         })?;
         let mut extractions = Vec::new();
         for row in rows {
@@ -776,7 +796,9 @@ impl Store {
                  JOIN paths p ON p.id = f.file_id
                  WHERE f.generation_id = ?1 AND p.path = ?2",
                 params![gen, path],
-                |row| row.get(0),
+                |row| {
+                    Ok(crate::payload_codec::decode_value(row.get_ref(0)?, path)?.into_owned())
+                },
             )
             .optional()?;
         let Some(json) = json else {

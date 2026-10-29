@@ -743,7 +743,8 @@ impl Store {
         // rayon, and decoding under the mutex makes that pass serial.
         let payload = {
             let conn = lock_conn(&self.conn)?;
-            let payload: Option<String> = conn
+            let what = format!("content {:#018x}", key.content_hash);
+            let payload: Option<crate::payload_codec::StoredDocument> = conn
                 .query_row(
                     "SELECT payload_json FROM extraction_cache
                      WHERE content_hash = ?1 AND language = ?2
@@ -754,7 +755,7 @@ impl Store {
                         key.grammar_version,
                         key.analyzer_version
                     ],
-                    |row| row.get(0),
+                    |row| crate::payload_codec::StoredDocument::from_value(row.get_ref(0)?, &what),
                 )
                 .optional()?;
 
@@ -790,7 +791,7 @@ impl Store {
                             key.grammar_version,
                             key.analyzer_version
                         ],
-                        |row| row.get::<_, String>(0),
+                        |row| crate::payload_codec::StoredDocument::from_value(row.get_ref(0)?, &what),
                     )
                     .optional()?
                     .map(|json| ("generation_files", json)),
@@ -801,8 +802,13 @@ impl Store {
         // ever and threw away the only evidence that a row was corrupt — the
         // one JSON read in this file that stayed quiet while every other names
         // what it could not read.
+        // A frame is decompressed here, after the guard: the incremental pass
+        // reloads every cached file on rayon, and decompression must not make
+        // it serial any more than parsing may.
         payload
-            .map(|(table, json)| {
+            .map(|(table, document)| {
+                let what = format!("{table} content {:#018x}", key.content_hash);
+                let json = document.into_json(&what)?;
                 parse(&json).map_err(|error| {
                     refusal(format!(
                         "stored extraction payload in {table} for content \

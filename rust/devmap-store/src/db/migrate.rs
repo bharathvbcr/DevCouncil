@@ -7,7 +7,7 @@ use crate::schema::{
     MIGRATION_V17_TO_V18_RENAME_EDGES, MIGRATION_V17_TO_V18_RENAME_UNRESOLVED,
     MIGRATION_V18_TO_V19, MIGRATION_V19_TO_V20, MIGRATION_V20_TO_V21, MIGRATION_V21_TO_V22,
     MIGRATION_V23_TO_V24, MIGRATION_V25_TO_V26, MIGRATION_V26_TO_V27, MIGRATION_V27_TO_V28,
-    MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5, MIGRATION_V4_TO_V5_EDGE_INDEXES, MIGRATION_V5_TO_V6,
+    MIGRATION_V28_TO_V29, MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5, MIGRATION_V4_TO_V5_EDGE_INDEXES, MIGRATION_V5_TO_V6,
     MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10,
     MIN_READER_SCHEMA_VERSION, READER_COMPAT_TABLE, VALIDITY_RANGE_TABLES,
 };
@@ -220,23 +220,140 @@ impl Store {
             .prepare("SELECT payload_id FROM file_payloads WHERE payload_digest = x''")?
             .query_map([], |row| row.get(0))?
             .collect::<Result<_>>()?;
+        // The extraction is read through the codec: a store that is being
+        // walked up from v27 holds text here, and one re-stamped down from v29
+        // holds frames. The digest covers the text either way, so a payload
+        // keeps the identity it had before it was compressed.
         let mut read = conn.prepare(
-            "SELECT parse_outcome_json, engine_json, extraction_json
-               FROM file_payloads WHERE payload_id = ?1",
+            "SELECT fp.parse_outcome_json, fp.engine_json, fp.extraction_json, pa.path
+               FROM file_payloads fp JOIN paths pa ON pa.id = fp.file_id
+              WHERE fp.payload_id = ?1",
         )?;
         let mut stamp =
             conn.prepare("UPDATE file_payloads SET payload_digest = ?2 WHERE payload_id = ?1")?;
         for id in ids {
             let digest = read.query_row(params![id], |row| {
+                let path: String = row.get(3)?;
+                let extraction = crate::payload_codec::decode_value(row.get_ref(2)?, &path)?;
                 Ok(crate::db::payload_digest(
                     &row.get::<_, String>(0)?,
                     &row.get::<_, String>(1)?,
-                    &row.get::<_, String>(2)?,
+                    &extraction,
                 ))
             })?;
             stamp.execute(params![id, digest.as_slice()])?;
         }
         Ok(())
+    }
+
+    /// The v29 rung: store every payload's extraction compressed and give every
+    /// payload its `entry_wiring_json` ([`MIGRATION_V28_TO_V29`]).
+    ///
+    /// Refuses, leaving the v28 store whole (the caller's one transaction
+    /// rolls back), when any payload could not be converted: a store being
+    /// migrated is converted entirely or not at all, and `dev map doctor --fix`
+    /// is the remedy for a store that holds a document nothing can read.
+    fn migrate_to_v29(conn: &Connection) -> Result<()> {
+        let payloads: i64 =
+            conn.query_row("SELECT COUNT(*) FROM file_payloads", [], |row| row.get(0))?;
+        let unconverted = Self::heal_extraction_encoding(conn)?;
+        if let Some((path, reason)) = unconverted.first() {
+            return Err(refusal(format!(
+                "moving the store to schema 29 could not convert {} of {payloads} stored \
+                 extractions, the first for {path}: {reason}; the store has been left unmigrated",
+                unconverted.len()
+            )));
+        }
+        let after: i64 =
+            conn.query_row("SELECT COUNT(*) FROM file_payloads", [], |row| row.get(0))?;
+        if payloads != after {
+            return Err(refusal(format!(
+                "moving the store to schema 29 changed the number of payloads: {payloads} \
+                 before, {after} after; the store has been left unmigrated"
+            )));
+        }
+        Self::release_free_pages(conn)
+    }
+
+    /// Compress every stored extraction that is still text and give every
+    /// payload that has none its `entry_wiring_json`, one payload at a time.
+    ///
+    /// The migration's work and the same-version heal in one function: it
+    /// selects only what is not yet converted, so it resumes a pass that was
+    /// interrupted, converges a store a writer left half converted, and costs a
+    /// single index-free probe when there is nothing to do (`typeof` reads the
+    /// record header, not the document). Each compressed document is
+    /// decompressed again and compared with the text it came from before it
+    /// replaces it, so a conversion that did not round-trip never reaches the
+    /// store.
+    ///
+    /// Returns the payloads it could not convert, `(path, reason)`, and leaves
+    /// each as it found it: a document that is not valid JSON or a frame that
+    /// will not decompress. The reader refuses those by name when it reaches
+    /// them, and the migration refuses the store ([`Self::migrate_to_v29`]), so
+    /// the list is never read as "converted".
+    fn heal_extraction_encoding(conn: &Connection) -> Result<Vec<(String, String)>> {
+        use crate::payload_codec::{
+            compress_document, decode_value, entry_wiring_of_document, inflate_document,
+        };
+        if !Self::has_column(conn, "file_payloads", "entry_wiring_json")? {
+            conn.execute_batch(MIGRATION_V28_TO_V29)?;
+        }
+        let ids: Vec<i64> = conn
+            .prepare(
+                "SELECT payload_id FROM file_payloads
+                  WHERE typeof(extraction_json) <> 'blob' OR entry_wiring_json IS NULL",
+            )?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_>>()?;
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut read = conn.prepare(
+            "SELECT fp.extraction_json, pa.path
+               FROM file_payloads fp JOIN paths pa ON pa.id = fp.file_id
+              WHERE fp.payload_id = ?1",
+        )?;
+        let mut write = conn.prepare(
+            "UPDATE file_payloads SET extraction_json = ?2, entry_wiring_json = ?3
+              WHERE payload_id = ?1",
+        )?;
+        let mut keep_frame =
+            conn.prepare("UPDATE file_payloads SET entry_wiring_json = ?2 WHERE payload_id = ?1")?;
+        let mut unconverted = Vec::new();
+        for id in ids {
+            let converted = read.query_row(params![id], |row| {
+                let path: String = row.get(1)?;
+                let value = row.get_ref(0)?;
+                let was_text = matches!(value, rusqlite::types::ValueRef::Text(_));
+                let outcome = (|| -> Result<(Option<Vec<u8>>, String)> {
+                    let json = decode_value(value, &path)?;
+                    let entries = entry_wiring_of_document(&json, &path)?;
+                    if !was_text {
+                        return Ok((None, entries));
+                    }
+                    let frame = compress_document(&json)?;
+                    if inflate_document(&frame, &path)? != *json {
+                        return Err(refusal(format!(
+                            "the compressed extraction for {path} did not decompress to the \
+                             document it was made from"
+                        )));
+                    }
+                    Ok((Some(frame), entries))
+                })();
+                Ok((path, outcome))
+            })?;
+            match converted {
+                (_, Ok((Some(frame), entries))) => {
+                    write.execute(params![id, frame, entries])?;
+                }
+                (_, Ok((None, entries))) => {
+                    keep_frame.execute(params![id, entries])?;
+                }
+                (path, Err(error)) => unconverted.push((path, error.to_string())),
+            }
+        }
+        Ok(unconverted)
     }
 
     /// Give a store stamped 28 by the first v28 prototype the `payload_digest`
@@ -580,6 +697,7 @@ impl Store {
             // the fresh path and the ladder land on one schema because they run
             // one batch.
             Self::migrate_to_v28(tx)?;
+            Self::migrate_to_v29(tx)?;
             // That rung drops the six flat tables the batches above just made
             // empty, which on a store with no content yet leaves their pages
             // on the freelist: a brand-new file that already reads as "worth
@@ -997,12 +1115,20 @@ impl Store {
             conn.execute("PRAGMA user_version = 28", [])?;
             version = 28;
         }
+        if version == 28 {
+            Self::migrate_to_v29(conn)?;
+            conn.execute("PRAGMA user_version = 29", [])?;
+            version = 29;
+        }
         if version != CURRENT_SCHEMA_VERSION {
             return Err(Self::unsupported_schema(store, version));
         }
         // A store already at the current version can still be missing what a
         // later build of the same version added to the fresh schema.
         Self::heal_payload_digest(conn)?;
+        // Whatever a same-version writer left unconverted stays so, and the
+        // readers refuse it by name; only the migration refuses the store.
+        Self::heal_extraction_encoding(conn)?;
         Self::heal_declared_indexes(conn)?;
         Self::stamp_reader_compat(conn)?;
         Self::validate_schema(conn)?;

@@ -16,6 +16,12 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 rayon.workspace = true
+# Stored extraction documents (schema 29). Pinned exactly, and to a release at
+# least two weeks old when it was chosen (0.14.0, 2026-09-04; 0.14.3 was 13 days
+# old on 2026-10-29). No default features: `legacy` (old-format frames) and
+# `zdict_builder` (dictionary training) are not used -- the store writes and
+# reads its own frames only, with no dictionary.
+zstd = { version = "=0.14.0", default-features = false }
 
 [package.metadata.dist]
 # hold_uncommitted_child is a test helper. cargo-dist announced it as a

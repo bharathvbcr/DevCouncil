@@ -6,6 +6,10 @@ use super::{
     GenerationWriteOpts, RowSetDigest, StoredPayload, UnresolvedTuple, WriteBreakdown,
 };
 #[cfg(feature = "parse")]
+use crate::payload_codec::{
+    compress_document, decode_value, entry_wiring_json, entry_wiring_of_document,
+};
+#[cfg(feature = "parse")]
 use crate::schema::BUILD_HISTORY_RETENTION;
 #[cfg(feature = "parse")]
 use devmap_analyze::model::AnalysisSummary;
@@ -66,29 +70,49 @@ enum PayloadState {
     Reused,
 }
 
-/// The three JSON documents a fresh `file_payloads` row holds for one
-/// extraction.
+/// The documents a fresh `file_payloads` row holds for one extraction: two JSON
+/// texts, the extraction compressed, and what `affected_tests` reads of it.
 #[cfg(feature = "parse")]
 pub(super) struct PayloadJson {
     parse_outcome: String,
     engine: String,
-    extraction: String,
-    /// [`payload_digest`] of the three documents, taken where they are made so
-    /// that it is computed on a serializer thread and never on the one holding
-    /// the writer lock, and so no document can be paired with another's digest.
+    /// The extraction's JSON as a zstd frame ([`compress_document`]), made where
+    /// the JSON is made, on a serializer thread, so compression never runs on
+    /// the thread holding the writer lock.
+    extraction: Vec<u8>,
+    /// Bytes of the JSON `extraction` was compressed from. The window budget is
+    /// counted in this, not in the frame's length: the budget bounds what a
+    /// serializer thread had to hold while it made the document, which is the
+    /// text, and a ratio that varies with the content must not vary the bound.
+    extraction_json_bytes: usize,
+    /// [`entry_wiring_json`] of the extraction.
+    entry_wiring: String,
+    /// [`payload_digest`] of the three documents *as text*, taken before the
+    /// extraction is compressed, where they are made, so that it is computed on
+    /// a serializer thread and never on the one holding the writer lock, and so
+    /// no document can be paired with another's digest. Compression is beneath
+    /// identity: the digest a v28 store stamped on a payload is the digest of
+    /// the same payload at v29.
     digest: [u8; 16],
 }
 
 #[cfg(feature = "parse")]
 impl PayloadJson {
-    fn new(parse_outcome: String, engine: String, extraction: String) -> Self {
-        let digest = payload_digest(&parse_outcome, &engine, &extraction);
-        Self {
+    fn new(
+        parse_outcome: String,
+        engine: String,
+        extraction: &str,
+        entry_wiring: String,
+    ) -> Result<Self> {
+        let digest = payload_digest(&parse_outcome, &engine, extraction);
+        Ok(Self {
             parse_outcome,
             engine,
-            extraction,
+            extraction: compress_document(extraction)?,
+            extraction_json_bytes: extraction.len(),
+            entry_wiring,
             digest,
-        }
+        })
     }
 }
 
@@ -97,7 +121,13 @@ impl PayloadJson {
     /// A document set of `bytes` bytes, for a test that plays the serializer
     /// threads itself.
     pub(super) fn sized(bytes: usize) -> Self {
-        Self::new(String::new(), String::new(), "x".repeat(bytes))
+        Self::new(
+            String::new(),
+            String::new(),
+            &"x".repeat(bytes),
+            "[]".to_string(),
+        )
+        .expect("a document of x's compresses")
     }
 }
 
@@ -106,7 +136,7 @@ impl PayloadJson {
 #[cfg(feature = "parse")]
 fn json_bytes(outcome: &Result<PayloadJson>) -> usize {
     outcome.as_ref().map_or(0, |documents| {
-        documents.parse_outcome.len() + documents.engine.len() + documents.extraction.len()
+        documents.parse_outcome.len() + documents.engine.len() + documents.extraction_json_bytes
     })
 }
 
@@ -184,7 +214,8 @@ pub(super) fn serialize_payload(extraction: &Extraction) -> Result<PayloadJson> 
             extraction.file_path
         ))
     })?;
-    Ok(PayloadJson::new(parse_outcome, engine, extraction_json))
+    let entry_wiring = entry_wiring_json(&durable_extraction.wiring)?;
+    PayloadJson::new(parse_outcome, engine, &extraction_json, entry_wiring)
 }
 
 /// Runs `serialize` on `extraction`, turning a panic into the extraction's
@@ -424,7 +455,8 @@ impl Store {
             analyzer_version,
             parse_outcome_json,
             engine_json,
-            extraction_json,
+            extraction_frame,
+            entry_wiring_json,
             payload_digest,
         } = payload;
         if let Some(id) = tx
@@ -453,8 +485,9 @@ impl Store {
         tx.prepare_cached(
             "INSERT INTO file_payloads
              (file_id, content_hash, language, grammar_version, analyzer_version,
-              parse_outcome_json, engine_json, extraction_json, payload_digest)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+              parse_outcome_json, engine_json, extraction_json, payload_digest,
+              entry_wiring_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?
         .execute(params![
             file_id,
@@ -464,8 +497,9 @@ impl Store {
             analyzer_version,
             parse_outcome_json,
             engine_json,
-            extraction_json,
-            payload_digest
+            extraction_frame,
+            payload_digest,
+            entry_wiring_json
         ])?;
         Ok((tx.last_insert_rowid(), PayloadState::New))
     }
@@ -521,14 +555,18 @@ impl Store {
         )?;
         let mut payloads =
             tx.prepare("SELECT payload_id, extraction_json FROM file_payloads WHERE file_id = ?1")?;
-        let mut rewrite =
-            tx.prepare("UPDATE file_payloads SET extraction_json = ?2 WHERE payload_id = ?1")?;
+        let mut rewrite = tx.prepare(
+            "UPDATE file_payloads SET extraction_json = ?2, entry_wiring_json = ?3
+              WHERE payload_id = ?1",
+        )?;
         for (id, path) in secret_ids {
             withhold.execute(params![id, WITHHELD_LITERAL_VALUE])?;
             drop_values.execute(params![id, WITHHELD_LITERAL_VALUE])?;
             let rows = payloads
                 .query_map(params![id], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    let payload_id: i64 = row.get(0)?;
+                    let json = decode_value(row.get_ref(1)?, &path)?.into_owned();
+                    Ok((payload_id, json))
                 })?
                 .collect::<Result<Vec<_>>>()?;
             for (payload_id, json) in rows {
@@ -539,7 +577,16 @@ impl Store {
                         ))
                     })?;
                 if withhold_secret_values_json(&path, &mut payload) {
-                    rewrite.execute(params![payload_id, payload.to_string()])?;
+                    // Withholding changes values, never the structure the
+                    // entry wiring is read from, but it is derived from the
+                    // document that is stored, not assumed equal to it.
+                    let rewritten = payload.to_string();
+                    let entries = entry_wiring_of_document(&rewritten, &path)?;
+                    rewrite.execute(params![
+                        payload_id,
+                        compress_document(&rewritten)?,
+                        entries
+                    ])?;
                 }
             }
         }
@@ -1130,7 +1177,9 @@ impl Store {
                     let PayloadJson {
                         parse_outcome: parse_json,
                         engine: engine_json,
-                        extraction: extraction_json,
+                        extraction: extraction_frame,
+                        extraction_json_bytes: _,
+                        entry_wiring,
                         digest,
                     } = documents?;
                     let file_id =
@@ -1152,7 +1201,8 @@ impl Store {
                                 analyzer_version: &identity.analyzer_version,
                                 parse_outcome_json: &parse_json,
                                 engine_json: &engine_json,
-                                extraction_json: &extraction_json,
+                                extraction_frame: &extraction_frame,
+                                entry_wiring_json: &entry_wiring,
                                 payload_digest: &digest,
                             },
                         )?
