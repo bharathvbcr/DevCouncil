@@ -490,6 +490,12 @@ impl LspPassReport {
                 if let LspDidNotRun::RefusedBinary(detail) = reason {
                     lines.push(format!("lsp: {} refused: {detail}", server.binary));
                 }
+                // Likewise which protocol failure ended a server that was
+                // answering: a malformed frame, an unreadable body, a closed
+                // pipe, or a root it could not be told about.
+                if let LspDidNotRun::Protocol(detail) = reason {
+                    lines.push(format!("lsp: {} protocol: {detail}", server.binary));
+                }
                 // A server that started and exited said why on stderr.
                 if let LspDidNotRun::NonZeroExit {
                     code,
@@ -2372,6 +2378,33 @@ done
         let lines = report.status_lines().join("\n");
         assert!(lines.contains("toolchain missing"), "{lines}");
         assert!(!lines.contains(&token), "{lines}");
+    }
+
+    /// A server that stopped on a protocol error says which one, as a refused
+    /// binary says where it was refused: the label `protocol` alone sent an
+    /// operator to the source to learn whether a frame was malformed, a body
+    /// unreadable or the pipe closed. (rust-analyzer on this repository ran
+    /// 128 files, then `protocol`, and the readout could not say why.)
+    #[test]
+    fn a_protocol_failure_names_its_cause_in_the_readout() {
+        let report = LspPassReport {
+            servers: vec![LspServerStatus {
+                binary: "rust-analyzer".into(),
+                did_not_run: Some(LspDidNotRun::Protocol(
+                    "json failed: EOF while parsing".into(),
+                )),
+                files_considered: 1007,
+                files_finished: 128,
+                ..LspServerStatus::default()
+            }],
+            ..LspPassReport::default()
+        };
+        let lines = report.status_lines().join("\n");
+        assert!(lines.contains("did not run (protocol)"), "{lines}");
+        assert!(
+            lines.contains("lsp: rust-analyzer protocol: json failed: EOF while parsing"),
+            "{lines}"
+        );
     }
 
     /// The surfaced tail keeps whole lines only: bytes dropped to stay inside
