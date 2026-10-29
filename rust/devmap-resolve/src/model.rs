@@ -1003,12 +1003,17 @@ impl Default for ResolutionLimits {
 pub struct ResolutionLimitError {
     pub resource: &'static str,
     pub limit: u64,
+    /// A lower bound on what the resolution needs, not its total. The first
+    /// pass charges the budget from many threads, and the error reports the
+    /// counter as the charging thread saw it: every other thread's pending
+    /// charge is missing and which ones had landed varies run to run. It is
+    /// always above [`Self::limit`], which is all the refusal needs to be true.
     pub attempted: u64,
 }
 
 impl std::fmt::Display for ResolutionLimitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "resolution refused: {} requires {} units, exceeding the {} limit; narrow the indexed scope; no partial graph was produced", self.resource, self.attempted, self.limit)
+        write!(f, "resolution refused: {} requires at least {} units, exceeding the {} limit; narrow the indexed scope; no partial graph was produced", self.resource, self.attempted, self.limit)
     }
 }
 

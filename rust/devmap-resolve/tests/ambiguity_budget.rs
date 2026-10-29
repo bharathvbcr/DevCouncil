@@ -88,6 +88,14 @@ fn under_the_refuse_policy_aggregate_limits_refuse_the_whole_result() {
         assert_eq!(error.resource, resource);
         assert!(error.attempted > error.limit);
         assert!(error.to_string().contains("no partial graph"));
+        // The figure is whatever the charging thread had counted, which races
+        // the others; it is only ever offered as a floor.
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("requires at least {} units", error.attempted)),
+            "a racy count must not read as the exact total: {error}"
+        );
     }
     assert!(
         resolver.resolve_all(&inputs).is_ok(),

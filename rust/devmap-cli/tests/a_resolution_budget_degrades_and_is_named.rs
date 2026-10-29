@@ -163,3 +163,80 @@ fn the_refuse_flag_keeps_the_old_abort() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("resolution refused"), "{stderr}");
 }
+
+fn read_json(path: &Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path:?}: {e}")))
+        .unwrap()
+}
+
+/// The exported artifacts were the one place a capped build said nothing: the
+/// stderr line, the build JSON, the coverage-gap row and `status` all named the
+/// cap while `repo_map.json` said `graph_degraded: false` and `code_graph.json`
+/// said `analysis_status: ok`. Both now read the same `AnalysisStatus` a partial
+/// parse does.
+#[test]
+fn a_capped_build_marks_both_exported_maps_degraded_and_names_the_budget() {
+    let root = repository("exported-capped");
+    let mut args = build_args(TIGHT);
+    args.extend_from_slice(&["--manifest"]);
+    let _ = json(&root, &args);
+    let _ = run(
+        &root,
+        &[
+            "manifest",
+            ".",
+            "--output",
+            "repo_map.json",
+            "--graph-output",
+            "code_graph.json",
+        ],
+    );
+
+    let map = read_json(&root.join("repo_map.json"));
+    assert_eq!(
+        map["graph_degraded"], true,
+        "a capped resolution is not a complete graph: {}",
+        map["graph_degraded_reason"]
+    );
+    let reason = map["graph_degraded_reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("ambiguity evidence bytes budget exceeded")
+            && reason.contains("32 candidate(s) dropped"),
+        "the degradation names the budget and what it cost: {reason:?}"
+    );
+
+    let graph = read_json(&root.join("code_graph.json"));
+    let status = graph["meta"]["devmap_rust"]["analysis_status"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        status.starts_with("partial:") && status.contains("ambiguity evidence bytes budget"),
+        "code_graph.json carries the same verdict: {status:?}"
+    );
+
+    // The build's own default artifacts agree with the explicit export.
+    let default_map = read_json(&root.join(".devmap").join("repo_map.json"));
+    assert_eq!(default_map["graph_degraded"], true, "{default_map}");
+}
+
+#[test]
+fn an_uncapped_build_keeps_both_exported_maps_clean() {
+    let root = repository("exported-control");
+    let _ = json(&root, &build_args(&[]));
+    let _ = run(
+        &root,
+        &[
+            "manifest",
+            ".",
+            "--output",
+            "repo_map.json",
+            "--graph-output",
+            "code_graph.json",
+        ],
+    );
+    let map = read_json(&root.join("repo_map.json"));
+    assert_eq!(map["graph_degraded"], false, "{map}");
+    assert_eq!(map["graph_degraded_reason"], "");
+    let graph = read_json(&root.join("code_graph.json"));
+    assert_eq!(graph["meta"]["devmap_rust"]["analysis_status"], "ok");
+}

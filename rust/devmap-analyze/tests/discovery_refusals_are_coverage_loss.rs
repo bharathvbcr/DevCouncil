@@ -129,3 +129,58 @@ fn the_plain_entry_point_still_reports_a_complete_corpus() {
         summary.status
     );
 }
+
+/// A resolution budget that cut candidate lists is a hole in the graph of the
+/// same standing as a refused file, and it reaches `AnalysisStatus` — which
+/// both `repo_map.json` (`graph_degraded`) and `code_graph.json`
+/// (`analysis_status`) are rendered from — through the one analysis entry the
+/// build and the daemon share. The daemon has no `--resolve-*` flags and
+/// resolves under the default budgets, so it reports a cap through this seam or
+/// not at all.
+#[test]
+fn a_resolution_budget_cap_makes_the_analysis_partial() {
+    let mut extractions: Vec<_> = (0..40)
+        .map(|i| extract_file(&format!("p{i}.py"), "def leaf():\n    pass\n"))
+        .collect();
+    extractions.push(extract_file(
+        "caller.py",
+        "def run():\n    leaf()\n    leaf()\n",
+    ));
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let capped = resolver
+        .resolve_all_with_limits(
+            &extractions,
+            devmap_resolve::ResolutionLimits {
+                ambiguity_evidence_bytes: 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        !capped.budget_gaps().is_empty(),
+        "the fixture must actually trip the budget"
+    );
+    let summary = analyze_with_discovery(&extractions, &capped, DiscoveryCoverage::none());
+    let AnalysisStatus::Partial { reason } = &summary.status else {
+        panic!(
+            "a capped resolution reported {:?}: a graph with cut candidate lists is not a \
+             complete one",
+            summary.status
+        );
+    };
+    assert!(
+        reason.contains("ambiguity evidence bytes budget exceeded")
+            && reason.contains("32 candidate(s) dropped"),
+        "the reason names the budget and what it cost: {reason:?}"
+    );
+
+    // The control: the same corpus inside its budgets stays `Ok`.
+    let uncapped = resolver.resolve_all(&extractions).unwrap();
+    let clean = analyze_with_discovery(&extractions, &uncapped, DiscoveryCoverage::none());
+    assert!(
+        matches!(clean.status, AnalysisStatus::Ok),
+        "{:?}",
+        clean.status
+    );
+}
