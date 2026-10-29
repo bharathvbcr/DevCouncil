@@ -29,9 +29,8 @@ impl Store {
             None => return Ok(vec![]),
         };
         let read = || -> Result<Vec<(String, String, String)>> {
-            let mut stmt = snapshot.prepare(
-                &format!(
-                    "SELECT name, qualified_name, path
+            let mut stmt = snapshot.prepare(&format!(
+                "SELECT name, qualified_name, path
                      FROM nodes_fts
                      WHERE {FTS_PAYLOAD_SQL} IN (
                                SELECT r.payload_id
@@ -43,8 +42,7 @@ impl Store {
                        AND nodes_fts MATCH ?2
                      ORDER BY rowid
                      LIMIT ?3"
-                ),
-            )?;
+            ))?;
             let match_q = fts_match_query(query)?;
             let rows = stmt.query_map(params![gen, match_q, sqlite_limit(limit)], |row| {
                 Ok((

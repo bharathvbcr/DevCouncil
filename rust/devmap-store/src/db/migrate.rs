@@ -6,10 +6,10 @@ use crate::schema::{
     MIGRATION_V17_TO_V18_BACKFILL_EDGES, MIGRATION_V17_TO_V18_BACKFILL_UNRESOLVED,
     MIGRATION_V17_TO_V18_RENAME_EDGES, MIGRATION_V17_TO_V18_RENAME_UNRESOLVED,
     MIGRATION_V18_TO_V19, MIGRATION_V19_TO_V20, MIGRATION_V20_TO_V21, MIGRATION_V21_TO_V22,
-    MIGRATION_V23_TO_V24, MIGRATION_V25_TO_V26, MIGRATION_V26_TO_V27, MIGRATION_V27_TO_V28, MIGRATION_V3_TO_V4,
-    MIGRATION_V4_TO_V5, MIGRATION_V4_TO_V5_EDGE_INDEXES, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7,
-    MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, MIN_READER_SCHEMA_VERSION,
-    READER_COMPAT_TABLE, VALIDITY_RANGE_TABLES,
+    MIGRATION_V23_TO_V24, MIGRATION_V25_TO_V26, MIGRATION_V26_TO_V27, MIGRATION_V27_TO_V28,
+    MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5, MIGRATION_V4_TO_V5_EDGE_INDEXES, MIGRATION_V5_TO_V6,
+    MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10,
+    MIN_READER_SCHEMA_VERSION, READER_COMPAT_TABLE, VALIDITY_RANGE_TABLES,
 };
 use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection, Result, TransactionBehavior};
@@ -147,7 +147,6 @@ impl Store {
         Ok(Some(floor as i32))
     }
 
-
     /// The v28 rung: move nodes, literals, full-text rows, file membership and
     /// digests onto payloads and validity ranges ([`MIGRATION_V27_TO_V28`]).
     ///
@@ -167,11 +166,8 @@ impl Store {
             return Ok(());
         }
         let counts = |conn: &Connection| -> Result<Option<[i64; 4]>> {
-            let latest: Option<i64> = conn.query_row(
-                "SELECT MAX(id) FROM generations",
-                [],
-                |row| row.get(0),
-            )?;
+            let latest: Option<i64> =
+                conn.query_row("SELECT MAX(id) FROM generations", [], |row| row.get(0))?;
             let Some(latest) = latest else {
                 return Ok(None);
             };

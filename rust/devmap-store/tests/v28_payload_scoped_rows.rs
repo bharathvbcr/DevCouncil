@@ -26,9 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use devmap_analyze::analyze;
 use devmap_extract::extract_file;
 use devmap_resolve::Resolver;
-use devmap_store::{
-    GenerationWriteOpts, Store, CURRENT_SCHEMA_VERSION, MIN_READER_SCHEMA_VERSION,
-};
+use devmap_store::{GenerationWriteOpts, Store, CURRENT_SCHEMA_VERSION, MIN_READER_SCHEMA_VERSION};
 use rusqlite::Connection;
 
 #[path = "support/v27_shape.rs"]
@@ -167,7 +165,13 @@ fn history(store: &Store) -> Vec<u32> {
     generations.push(commit(store, &base, &[], &[]));
     let edited = tree(8, |index| usize::from(index == 1));
     generations.push(commit(store, &edited, &["pkg/mod_1.py"], &[]));
-    let edited_again = tree(8, |index| if index == 1 { 2 } else { usize::from(index == 2) });
+    let edited_again = tree(8, |index| {
+        if index == 1 {
+            2
+        } else {
+            usize::from(index == 2)
+        }
+    });
     generations.push(commit(
         store,
         &edited_again,
@@ -270,14 +274,22 @@ fn a_v27_store_migrates_with_every_generation_reading_the_same_rows() {
         0,
         "no migrated row names a payload or a path that is not there"
     );
-    assert_eq!(count(&db, "SELECT COUNT(*) FROM pragma_integrity_check WHERE integrity_check <> 'ok'"), 0);
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM pragma_integrity_check WHERE integrity_check <> 'ok'"
+        ),
+        0
+    );
     // And the migration is complete rather than a copy of the readable part: no
     // v27 table is left behind.
     for gone in ["nodes_fts_map", "generation_nodes", "generation_literals"] {
         assert_eq!(
             count(
                 &db,
-                &format!("SELECT COUNT(*) FROM sqlite_master WHERE name = '{gone}' AND type = 'table'")
+                &format!(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = '{gone}' AND type = 'table'"
+                )
             ),
             0,
             "{gone} must be a view after the migration"
@@ -470,18 +482,26 @@ fn two_files_with_identical_bytes_keep_their_own_rows() {
         );
         assert!(
             rows.iter()
-                .any(|row| row.starts_with(&format!("literal|{path}|")) && row.contains("shared-literal")),
+                .any(|row| row.starts_with(&format!("literal|{path}|"))
+                    && row.contains("shared-literal")),
             "{path} reads its own literal"
         );
     }
     let edited: Files = vec![
-        ("a/one.py".into(), format!("{shared}\n\ndef only_here():\n    return 2\n")),
+        (
+            "a/one.py".into(),
+            format!("{shared}\n\ndef only_here():\n    return 2\n"),
+        ),
         ("b/two.py".into(), shared),
     ];
     let g2 = commit(&store, &edited, &["a/one.py"], &[]);
     let rows = read_generation(&conn, g2);
-    assert!(rows.iter().any(|row| row.starts_with("node|a/one.py|only_here")));
-    assert!(!rows.iter().any(|row| row.starts_with("node|b/two.py|only_here")));
+    assert!(rows
+        .iter()
+        .any(|row| row.starts_with("node|a/one.py|only_here")));
+    assert!(!rows
+        .iter()
+        .any(|row| row.starts_with("node|b/two.py|only_here")));
     assert!(
         rows.iter()
             .any(|row| row.starts_with("node|b/two.py|shared_fn")),
@@ -528,8 +548,12 @@ fn retention_collects_a_payload_with_its_rows_and_only_then() {
     let again = commit(&store, &revision(0), &["pkg/mod_2.py"], &[]);
     let conn = Connection::open(&db).unwrap();
     let rows = read_generation(&conn, again);
-    assert!(rows.iter().any(|row| row.starts_with("node|pkg/mod_2.py|leaf_2")));
-    assert!(rows.iter().any(|row| row.starts_with("literal|pkg/mod_2.py|")));
+    assert!(rows
+        .iter()
+        .any(|row| row.starts_with("node|pkg/mod_2.py|leaf_2")));
+    assert!(rows
+        .iter()
+        .any(|row| row.starts_with("literal|pkg/mod_2.py|")));
     let (path, body) = module(2, 0);
     assert_eq!(
         rows.iter()
@@ -620,8 +644,14 @@ fn a_reader_against_a_writing_and_pruning_writer_sees_one_generation() {
         writer.prune_generations_except_latest(2).unwrap();
     }
     stop.store(true, Ordering::Relaxed);
-    let total: u32 = readers.into_iter().map(|reader| reader.join().unwrap()).sum();
-    assert!(total > 0, "the readers must have read while the writer wrote");
+    let total: u32 = readers
+        .into_iter()
+        .map(|reader| reader.join().unwrap())
+        .sum();
+    assert!(
+        total > 0,
+        "the readers must have read while the writer wrote"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -799,7 +829,10 @@ fn a_secret_files_literals_are_withheld_in_the_payload_table() {
     let store = Store::open(&db).unwrap();
     let files: Files = vec![
         ("pkg/ok.py".into(), "NAME = \"public-value\"\n".into()),
-        (".env".into(), "API_KEY=\"sk-live-0123456789abcdef\"\n".into()),
+        (
+            ".env".into(),
+            "API_KEY=\"sk-live-0123456789abcdef\"\n".into(),
+        ),
     ];
     commit(&store, &files, &[], &[]);
     assert_eq!(

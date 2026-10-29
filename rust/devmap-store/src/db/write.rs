@@ -603,10 +603,12 @@ impl Store {
                     sym.name,
                     sym.qualified_name,
                     sym.kind.as_str(),
-                    i64::try_from(sym.span.start_byte)
-                        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
-                    i64::try_from(sym.span.end_byte)
-                        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
+                    i64::try_from(sym.span.start_byte).map_err(|error| {
+                        rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                    })?,
+                    i64::try_from(sym.span.end_byte).map_err(|error| {
+                        rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                    })?,
                     sym.is_exported as i32,
                     // SQLite integers are signed. The cast is bit-preserving
                     // and reversed on read, so the stored value round-trips
@@ -1164,7 +1166,13 @@ impl Store {
                     };
                     // The rows derived from the payload are the payload's, and
                     // are written when it is.
-                    Self::write_payload_rows(&tx, payload_id, payload_state, extraction, &mut spent)?;
+                    Self::write_payload_rows(
+                        &tx,
+                        payload_id,
+                        payload_state,
+                        extraction,
+                        &mut spent,
+                    )?;
                     // This file's membership as a delta: nothing when its open
                     // row already names this payload, otherwise that row is
                     // closed at this generation and the new payload's opened.

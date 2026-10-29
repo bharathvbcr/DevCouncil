@@ -401,11 +401,7 @@ fn b3_one_file_edit_write_set_is_differential_for_every_relation_but_the_two_per
             (1, 1),
             "{set:?}"
         );
-        assert_eq!(
-            (set.digests_opened, set.digests_closed),
-            (1, 1),
-            "{set:?}"
-        );
+        assert_eq!((set.digests_opened, set.digests_closed), (1, 1), "{set:?}");
         assert_eq!((set.dead, set.gaps), (1, 0), "{set:?}");
         // The gate, over every relation at once, and independent of `n`.
         assert!(set.written() < 100, "{set:?}");

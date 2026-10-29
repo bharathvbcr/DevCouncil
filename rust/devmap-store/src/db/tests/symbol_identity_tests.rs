@@ -19,7 +19,9 @@ fn the_sql_that_decodes_a_rowid_uses_the_bits_the_encoder_packs() {
     assert_eq!(MAX_NODES_PER_PAYLOAD, 1 << NODE_ORD_BITS);
     // And the DDL: the view's ordinal, the map's rowid and the full-text rebuild
     // all pack with the same shift, and the column's CHECK bounds the same range.
-    let shifts = MIGRATION_V27_TO_V28.matches(&format!("<< {NODE_ORD_BITS})")).count();
+    let shifts = MIGRATION_V27_TO_V28
+        .matches(&format!("<< {NODE_ORD_BITS})"))
+        .count();
     assert!(
         shifts >= 3,
         "the view ordinal, the map rowid and the index rebuild each pack by {NODE_ORD_BITS}: {shifts}"

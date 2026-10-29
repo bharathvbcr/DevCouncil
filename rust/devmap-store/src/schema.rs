@@ -1801,7 +1801,10 @@ pub const FRESH_SCHEMA_BATCHES: &[&str] = &[
 /// chunk, where `body` starts at `INDEX `.
 fn index_name_of(body: &str) -> &str {
     let rest = body.strip_prefix("INDEX ").unwrap_or(body).trim_start();
-    let rest = rest.strip_prefix("IF NOT EXISTS ").unwrap_or(rest).trim_start();
+    let rest = rest
+        .strip_prefix("IF NOT EXISTS ")
+        .unwrap_or(rest)
+        .trim_start();
     let end = rest
         .find(|c: char| c.is_whitespace() || c == '(' || c == ';')
         .unwrap_or(rest.len());
