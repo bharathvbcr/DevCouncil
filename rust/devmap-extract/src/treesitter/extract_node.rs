@@ -658,6 +658,20 @@ pub(super) fn extract_node(
             // as an `import` of an `export` does.
             "assignment_expression" => {
                 if let Some((exported, value)) = js_cjs_export_assignment(node, source) {
+                    // Assigned again to something that is not a literal, the
+                    // name is no longer a value nothing can call: the earlier
+                    // literal declaration gives way to whatever comes next.
+                    if let Some(name) = exported
+                        .as_deref()
+                        .filter(|_| !js_is_literal_value(value, 0))
+                    {
+                        let qualified = format!("{file_symbol_name}::{name}");
+                        symbols.retain(|known| {
+                            known.qualified_name != qualified
+                                || known.signature.as_deref()
+                                    != Some(crate::model::JS_LITERAL_CONSTANT)
+                        });
+                    }
                     let local = match js_cjs_function_name(exported.as_deref(), value, source) {
                         Some(name) => {
                             symbols.push(ExtractedSymbol {

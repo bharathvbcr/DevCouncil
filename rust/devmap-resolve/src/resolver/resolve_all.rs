@@ -1027,7 +1027,9 @@ impl Resolver {
                                         // A module handle's member may be one the module
                                         // only re-exports; a type's may not (an enum's
                                         // variant `Query` is not the `Query` struct a
-                                        // glob in the enum's file happens to publish).
+                                        // re-export beside the enum happens to publish).
+                                        // The import names the type, wherever the path
+                                        // to it ran through.
                                         // Go (the variant set above, then its own package
                                         // siblings) and Rust (`rust_import_through_barrel`
                                         // owns its re-exports) keep the declared-here
@@ -1036,7 +1038,7 @@ impl Resolver {
                                         let member = resolution.is_none().then(|| {
                                             if matches!(family, LangFamily::Go | LangFamily::Rust)
                                                 || self.imports_a_type(&ext.file_path, &recv)
-                                                || self.declares_type_at(target_f, imported)
+                                                || self.declares_type_at(None, imported)
                                             {
                                                 self.lookup_in_package(target_f, &method)
                                             } else {

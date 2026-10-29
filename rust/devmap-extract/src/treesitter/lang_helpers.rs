@@ -155,7 +155,13 @@ pub(super) fn js_is_literal_value(node: Node, depth: usize) -> bool {
         | "as_expression"
         | "satisfies_expression"
         | "non_null_expression" => node.named_child(0).is_some_and(literal),
-        "unary_expression" => node.child_by_field_name("argument").is_some_and(literal),
+        // `-1`, `+1`, `!0`, `~1`. Not `void 0` (the `undefined` a compiled
+        // module hoists ahead of the real assignment), `typeof x` or `delete x`.
+        "unary_expression" => {
+            node.child_by_field_name("operator")
+                .is_some_and(|operator| matches!(operator.kind(), "-" | "+" | "!" | "~"))
+                && node.child_by_field_name("argument").is_some_and(literal)
+        }
         "binary_expression" => {
             node.child_by_field_name("left").is_some_and(literal)
                 && node.child_by_field_name("right").is_some_and(literal)

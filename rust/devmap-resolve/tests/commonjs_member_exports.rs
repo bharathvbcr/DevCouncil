@@ -279,3 +279,28 @@ fn a_computed_require_binds_nothing_and_a_literal_export_is_a_symbol_not_a_targe
         "assigned twice is one declaration: {declared:?}"
     );
 }
+
+#[test]
+fn a_hoisted_void_zero_and_a_later_reassignment_leave_the_export_callable() {
+    // A compiled module opens with `exports.run = void 0;` and assigns the real
+    // value below. Neither the `void 0` nor a literal later replaced by a
+    // call may make `run` an inert constant.
+    for util in [
+        "exports.run = void 0;\nexports.run = function run() {};\n",
+        "exports.run = 1;\nexports.run = function run() {};\n",
+    ] {
+        let result = resolve(&[
+            ("v/util.js", util),
+            (
+                "v/main.js",
+                "const { run } = require('./util');\nfunction go() { return run(); }\n",
+            ),
+        ]);
+        assert_eq!(
+            calls(&result, "v/main.js::go"),
+            ["v/util.js::run"],
+            "{util}\n{:?}",
+            result.unresolved
+        );
+    }
+}

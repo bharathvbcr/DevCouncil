@@ -185,6 +185,14 @@ fn a_type_handle_does_not_follow_the_re_exports_of_its_file() {
             "pub struct Query { pub n: u8 }\npub fn build() -> u8 { 1 }\n",
         ),
         (
+            "src/lib.rs",
+            "pub mod gql;\npub mod dml;\npub use gql::Stmt;\npub use dml::Query;\n",
+        ),
+        (
+            "src/hub_user.rs",
+            "use crate::Stmt;\npub fn pattern(s: Stmt) -> bool { matches!(s, Stmt::Query(_)) }\n",
+        ),
+        (
             "src/user.rs",
             "use crate::gql::Stmt;\nuse crate::gql;\n\
              pub fn pattern(s: Stmt) -> bool { matches!(s, Stmt::Query(_)) }\n\
@@ -195,6 +203,11 @@ fn a_type_handle_does_not_follow_the_re_exports_of_its_file() {
         calls(&result, "src/user.rs::pattern").is_empty(),
         "{:?}",
         calls(&result, "src/user.rs::pattern")
+    );
+    assert!(
+        calls(&result, "src/hub_user.rs::pattern").is_empty(),
+        "an enum reached through a crate-root re-export: {:?}",
+        calls(&result, "src/hub_user.rs::pattern")
     );
     assert_eq!(
         calls(&result, "src/user.rs::through_module"),

@@ -505,15 +505,15 @@ impl Resolver {
         else {
             return false;
         };
-        self.declares_type_at(declaring_file, declared)
+        self.declares_type_at(Some(declaring_file), declared)
     }
 
     /// Whether `file` declares a class, struct, enum, interface or trait
-    /// named `name`.
-    pub(super) fn declares_type_at(&self, file: &str, name: &str) -> bool {
+    /// named `name`; with no `file`, whether any file does.
+    pub(super) fn declares_type_at(&self, file: Option<&str>, name: &str) -> bool {
         self.symbol_index.get(name).is_some_and(|candidates| {
             candidates.iter().any(|(path, kind, _, _)| {
-                path == file
+                file.is_none_or(|file| path == file)
                     && matches!(
                         kind,
                         SymbolKind::Class
