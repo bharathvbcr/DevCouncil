@@ -248,11 +248,7 @@ pub fn ranked_search(request: &RankedRequest) -> Result<RankedResponse, String> 
     // repository has no ranked index at all.
     let published = Published::open(&root).map_err(|fault| match fault {
         crate::index::OpenFault::Busy(message) => message,
-        crate::index::OpenFault::Unusable(message) => {
-            format!(
-                "no ranked index for this repository ({message}); build one with `dcgrep index`"
-            )
-        }
+        crate::index::OpenFault::Unusable(message) => unusable_index(&message),
     })?;
     let bytes =
         crate::index::read_bounded(&published.slot.join("lexical.bin"), store::MAX_FILE_BYTES)?;
@@ -415,6 +411,20 @@ pub fn ranked_search(request: &RankedRequest) -> Result<RankedResponse, String> 
         terms_dropped,
         stale_files,
     })
+}
+
+/// The refusal for an index that cannot be used: what is wrong, and the remedy.
+///
+/// The remedy is added only when the cause does not already give it. A slot
+/// from an older schema is refused with "rebuild with dcgrep index", and
+/// appending "build one with `dcgrep index`" to that told the reader the same
+/// instruction twice in one sentence.
+fn unusable_index(cause: &str) -> String {
+    if cause.contains("dcgrep index") {
+        format!("no ranked index for this repository ({cause})")
+    } else {
+        format!("no ranked index for this repository ({cause}); build one with `dcgrep index`")
+    }
 }
 
 /// Whether `path` is inside `scope`, by path component and not by prefix.

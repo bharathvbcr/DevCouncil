@@ -1472,6 +1472,11 @@ mod tests {
         )
         .expect_err("a schema-3 cache must not be read");
         assert!(err.contains("rebuild with dcgrep index"), "{err}");
+        assert_eq!(
+            err.matches("dcgrep index").count(),
+            1,
+            "the remedy is said once, not appended to a cause that already gives it: {err}"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
