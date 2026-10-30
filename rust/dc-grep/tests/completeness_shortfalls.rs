@@ -95,6 +95,11 @@ fn assert_class(built: &Value, class: &str, paths: &[&str]) {
         .map(|path| path.as_str().unwrap())
         .collect();
     assert_eq!(sample, paths, "{class}: {built}");
+    // Root-relative, like every other path in a response.
+    assert!(
+        sample.iter().all(|path| !path.starts_with('/')),
+        "{class}: {built}"
+    );
     let total: u64 = classes
         .values()
         .map(|entry| entry["count"].as_u64().unwrap())

@@ -484,6 +484,17 @@ pub fn build_index(request: &IndexRequest) -> Result<IndexResponse, String> {
     )
 }
 
+/// A path as the report writes it: relative to the repository root, like every
+/// other path in a response, and lossy because this is only used for a name that
+/// is not valid UTF-8 and so has no exact spelling. An absolute path here would
+/// put the caller's directory layout into a report that is otherwise portable.
+fn root_relative(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// How much of an oversized file is read to tell text from a binary asset.
 const OVERSIZED_PROBE_BYTES: u64 = 8 * 1024;
 
@@ -691,7 +702,7 @@ fn build_with_limits(
         // is not UTF-8 is not rankable, so leaving it out is not a shortfall.
         let Some(path) = entry.path().strip_prefix(&root).ok().and_then(slashed) else {
             // A name that is not UTF-8 cannot be written into the index.
-            response.left_out("unrepresentable_name", &entry.path().to_string_lossy());
+            response.left_out("unrepresentable_name", &root_relative(&root, entry.path()));
             continue;
         };
         let file = match open_for_search(entry.path()) {
@@ -1504,6 +1515,71 @@ mod tests {
         assert_eq!(built.lexical_limit_reason, Some("files"), "{built:?}");
         assert_eq!(built.lexical_files, 6, "{built:?}");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Every cause records a path relative to the root. The one cause whose
+    /// name cannot be spelled exactly was recording an absolute path; macOS
+    /// cannot create a non-UTF-8 name to walk, so the normalisation every cause
+    /// shares is tested directly, with a name that is not UTF-8.
+    #[test]
+    fn a_left_out_path_is_recorded_relative_to_the_root_for_every_cause() {
+        use super::root_relative;
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::path::Path;
+
+        let root = Path::new("/work/repo");
+        let bad = OsString::from_vec(b"src/caf\xe9.rs".to_vec());
+        let shown = root_relative(root, &root.join(&bad));
+        assert!(!shown.starts_with('/'), "{shown}");
+        assert!(!shown.contains("work"), "{shown}");
+        assert!(shown.starts_with("src/caf"), "{shown}");
+        assert!(shown.contains('\u{fffd}'), "lossy, and says so: {shown}");
+        // A path outside the root is shown as given rather than panicking.
+        assert_eq!(
+            root_relative(root, Path::new("/elsewhere/x.rs")),
+            "/elsewhere/x.rs"
+        );
+
+        // And through a real build, for the classes that can be constructed
+        // here: nothing in the report is absolute.
+        let dir = scratch("relative-paths");
+        fs::write(dir.join("ok.rs"), "fn fine() {}\n").unwrap();
+        fs::write(dir.join("big.txt"), "word ".repeat(500_000)).unwrap();
+        let mut terms = String::new();
+        for n in 0..21_000u32 {
+            let word: String = (0..6)
+                .map(|digit| (b'a' + ((n / 26u32.pow(digit)) % 26) as u8) as char)
+                .collect();
+            terms.push_str(&word);
+            terms.push(' ');
+        }
+        fs::write(dir.join("many.txt"), terms).unwrap();
+        let request = IndexRequest {
+            root: dir.clone(),
+            max_files: 0,
+            sparse: None,
+        };
+        let built = build_with_limits(
+            &request,
+            100,
+            1 << 20,
+            LEXICAL_POSTINGS,
+            LEXICAL_BYTES,
+            1 << 30,
+            MAX_INDEX_DURATION,
+        )
+        .unwrap();
+        let classes: Vec<&str> = built.lexical_unindexed_by_class.keys().copied().collect();
+        assert_eq!(classes, ["oversized_text", "term_cap"], "{built:?}");
+        for (class, left) in &built.lexical_unindexed_by_class {
+            assert!(!left.sample.is_empty(), "{class}");
+            for path in &left.sample {
+                assert!(!path.starts_with('/'), "{class}: {path}");
+                assert!(!path.contains(dir.to_str().unwrap()), "{class}: {path}");
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
