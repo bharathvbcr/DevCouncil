@@ -240,3 +240,110 @@ fn an_uncapped_build_keeps_both_exported_maps_clean() {
     let graph = read_json(&root.join("code_graph.json"));
     assert_eq!(graph["meta"]["devmap_rust"]["analysis_status"], "ok");
 }
+
+fn manifest_exports(root: &Path) {
+    let _ = run(
+        root,
+        &[
+            "manifest",
+            ".",
+            "--output",
+            "repo_map.json",
+            "--graph-output",
+            "code_graph.json",
+        ],
+    );
+}
+
+/// A cap sets `AnalysisStatus::Partial`, and `Partial` flips
+/// `liveness_unreachable_unreliable` — deliberately, by main's own rule
+/// (`code_graph.rs`: "a coverage hole means a missing edge into a component
+/// could invalidate every cluster in the result"). A capped candidate list is
+/// exactly a missing edge, so reachability findings over a capped graph are as
+/// unreliable as over a graph with a refused file. The query surface says so
+/// (`walk_incomplete` on `dead`) and both exported maps carry the flag.
+#[test]
+fn a_cap_reaches_the_query_surface_and_flags_reachability_unreliable() {
+    let root = repository("unreliable-capped");
+    let _ = json(&root, &build_args(TIGHT));
+
+    let dead = json(&root, &["--json", "dead"]);
+    let walk = dead["walk_incomplete"].as_str().unwrap_or("");
+    assert!(
+        walk.contains("ambiguity evidence bytes budget exceeded")
+            && walk.contains("32 candidate(s) dropped"),
+        "`dead` over a capped graph says the walk is incomplete and why: {dead}"
+    );
+
+    manifest_exports(&root);
+    let map = read_json(&root.join("repo_map.json"));
+    assert_eq!(map["liveness_unreachable_unreliable"], true, "{map}");
+    let graph = read_json(&root.join("code_graph.json"));
+    assert_eq!(
+        graph["meta"]["liveness_unreachable_unreliable"], true,
+        "{graph}"
+    );
+}
+
+#[test]
+fn an_uncapped_build_leaves_reachability_reliable_and_the_walk_complete() {
+    let root = repository("unreliable-control");
+    let _ = json(&root, &build_args(&[]));
+    let dead = json(&root, &["--json", "dead"]);
+    // The ambiguous `leaf` sites still earn their own unresolved-attribution
+    // note; what must be absent is any claim that a budget cut something.
+    assert!(
+        !dead["walk_incomplete"]
+            .as_str()
+            .unwrap_or("")
+            .contains("budget"),
+        "nothing capped, so no budget is blamed: {dead}"
+    );
+    manifest_exports(&root);
+    assert_eq!(
+        read_json(&root.join("repo_map.json"))["liveness_unreachable_unreliable"],
+        false
+    );
+    assert_eq!(
+        read_json(&root.join("code_graph.json"))["meta"]["liveness_unreachable_unreliable"],
+        false
+    );
+}
+
+/// The daemon has no `--resolve-*` flags, so the way it reports a cap is by
+/// reading the stored analysis status of the generation it serves. A store the
+/// CLI built under a tight budget, opened the way the daemon opens it, carries
+/// the budget text in `degraded_reason`, identical to `devmap status`.
+#[test]
+fn a_store_built_under_a_tight_budget_reports_it_in_the_daemons_status() {
+    use devmap_serve::protocol::{daemon_status_reason, UnappliedEdits};
+    let root = repository("daemon-status");
+    let db = root.join("index.sqlite");
+    let db_arg = db.to_str().unwrap().to_string();
+    let _ = json(
+        &root,
+        &[
+            "--db",
+            &db_arg,
+            "--json",
+            "build",
+            ".",
+            "--resolve-ambiguity-evidence-bytes",
+            "1024",
+        ],
+    );
+    let cli = json(&root, &["--db", &db_arg, "--json", "status"]);
+    let cli_reason = cli["degraded_reason"].as_str().unwrap_or("").to_string();
+
+    let store = devmap_store::Store::open_existing(&db).unwrap().unwrap();
+    let status = store.status("probe").unwrap();
+    let daemon = daemon_status_reason(&store, &status, &UnappliedEdits::default())
+        .unwrap()
+        .unwrap_or_default();
+    assert!(
+        daemon.contains("ambiguity evidence bytes budget exceeded")
+            && daemon.contains("32 candidate(s) dropped"),
+        "the daemon's status names the cap: {daemon:?}"
+    );
+    assert_eq!(daemon, cli_reason, "daemon and CLI status disagree");
+}
