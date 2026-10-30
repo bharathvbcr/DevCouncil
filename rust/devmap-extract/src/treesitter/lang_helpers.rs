@@ -348,10 +348,13 @@ fn cjs_facts_of(root: Node, source: &str) -> CjsFacts {
     facts
 }
 
+/// A file's source address, source length and root node id, with its facts.
+type CjsFactsEntry = ((usize, usize, usize), std::rc::Rc<CjsFacts>);
+
 thread_local! {
     /// The facts of the file being walked, keyed by its source and root so a
     /// file's many assignments share one pass.
-    static CJS_FACTS: std::cell::RefCell<Option<((usize, usize, usize), std::rc::Rc<CjsFacts>)>> =
+    static CJS_FACTS: std::cell::RefCell<Option<CjsFactsEntry>> =
         const { std::cell::RefCell::new(None) };
 }
 
