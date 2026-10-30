@@ -335,6 +335,7 @@ benchmarks/results/competition/*/*.stderr
 # ignored.
 !.claude/
 .claude/*
+!/.claude/settings.json
 !.claude/agents/
 .claude/agents/*
 !.claude/agents/devcouncil-*.md
