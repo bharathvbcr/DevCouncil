@@ -152,8 +152,10 @@ mod imp {
             return Err("vectors.f32 is not a whole number of vectors".into());
         }
         let vectors: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect();
         let mut files: Vec<(String, usize, usize)> = Vec::new();
         for line in std::fs::read_to_string(dir.join("files.tsv"))

@@ -158,7 +158,7 @@ pub fn adapt_checkpoint(src: &Path, dst: &Path, hidden: usize, vocab: usize) -> 
         offset += raw.len();
     }
     let mut head_json = serde_json::to_vec(&Value::Object(entries)).map_err(|e| e.to_string())?;
-    while head_json.len() % 8 != 0 {
+    while !head_json.len().is_multiple_of(8) {
         head_json.push(b' ');
     }
     let mut out = Vec::with_capacity(8 + head_json.len() + offset);
@@ -307,7 +307,7 @@ mod tests {
         let src = dir.join("src.safetensors");
         let hdr = br#"{"embeddings.word_embeddings.weight":{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]},"pooler.dense.bias":{"dtype":"F32","shape":[1],"data_offsets":[16,20]},"embeddings.position_ids":{"dtype":"I64","shape":[1],"data_offsets":[20,28]}}"#;
         let mut padded = hdr.to_vec();
-        while padded.len() % 8 != 0 {
+        while !padded.len().is_multiple_of(8) {
             padded.push(b' ');
         }
         let mut file = (padded.len() as u64).to_le_bytes().to_vec();

@@ -249,6 +249,15 @@ Paired MRR differences (arm minus baseline), condition W:
 | AB - A (A+sparse vs BM25) | +0.118 [+0.031, +0.208] | -0.099 [-0.137, -0.062] |
 | ABC - A | +0.203 [+0.126, +0.287] | -0.035 [-0.074, +0.002] |
 
+One confound sits under every C-versus-B number: B encodes only the first 510
+tokens of a file (the shipped tier's behaviour) while C embeds every window of
+the whole file, so part of C's lead over B on commit subjects is coverage, not
+ranking quality. B and C also have no corpus-dependent statistics (for C by
+construction; for B inferred from the format: document weights are stored per
+file and the query side is the model's own `idf.json`; not checked in
+`store.rs` scoring), which is why their P rankings are their W rankings
+filtered to P.
+
 Reading it: on code-vocabulary queries (commit subjects) learned-sparse is
 clearly worse than BM25, as `docs/lexical-search.md` reports for doc comments,
 and dense is the best single arm by point estimate (not distinguishable from
@@ -280,7 +289,7 @@ stranger set.
 |---|---|---|---|
 | A | `dcgrep index` 3.8-7.4 s wall (three runs, machine loaded), 1.46e10 instructions retired; also builds the trigram index, not separable | `lexical.bin` 6.3 MB | `dcgrep rank` process 20 ms wall, 2.8e7 instructions |
 | B | encoder 25.6 s wall, 1.01e11 instructions, then `dcgrep index` 1.1 s, 8.6e9 | `lexical.bin` 7.7 MB | same as A |
-| C | 1463 s wall (24 min), 1.66e12 instructions, 2507 files, 60,551 chunks, 11.5M content tokens, peak footprint 2.7 GB | 93.0 MB of f32 vectors (60,551 x 384) | embed 17.2 ms median (12.2 ms minimum, 27.2 p90, 51.6 max over 337 queries, min of 9 repeats each, model load excluded); plus a brute-force scan of 60,551 vectors (about 23 MFLOP, arithmetic, not separately timed) |
+| C | 1463 s wall (24 min), 1.66e12 instructions, 2507 files, 60,551 chunks, 11.5M content tokens, peak footprint 2.7 GB | 93.0 MB of f32 vectors (60,551 x 384) | embed 17.2 ms median (12.2 ms minimum, 27.2 p90, 51.6 max over 337 queries, min of 9 repeats each, model load excluded); plus a brute-force scan of 60,551 vectors (about 23 M multiply-adds, arithmetic, not separately timed) |
 
 The dense numbers are upper bounds for an engineered path: the tessl forward
 used here computes the full 30522-way MLM head for every token (a synthetic
@@ -304,7 +313,10 @@ single arm) and 337 for commit subjects.
 1. **The stranger set is small, written and labelled by one author who also
    chose the arms.** The question phrasing was derived from the docs, the
    author knows the repository, and the labels were found partly by keyword
-   search, which, if anything, favours BM25. The set is 50 questions; D's
+   search, which, if anything, favours BM25. (DevMap's own `ask --evidence`, a
+   lexical-plus-graph ranker, put a labelled file in its top 7 for only 12 of
+   the 50 questions, so the labels did not simply follow its output; the gap is
+   recorded with `devmap gap-record`.) The set is 50 questions; D's
    lower bound is +0.049, so the stranger-set condition is met but not by a
    wide margin, and it was one of six arms scored on the set (the rule
    pre-names C and D only; AB and ABC are post-hoc). A second labeller or a
@@ -366,6 +378,10 @@ reach is a larger defect than any ranker difference measured here.
 ### Reproducing
 
 ```bash
+# scratch dcgrep for condition W: in rust/dc-grep/src/index.rs set
+#   const MAX_INDEX_POSTINGS: usize = 60_000_000;   (was 2_000_000)
+#   MAX_INDEX_DURATION = Duration::from_secs(600)   (was 30)
+# build `dcgrep` as $DCGREP_WIDE, then revert the file.
 # corpus extract, scratch dcgrep (ceilings raised), and arms A, B
 git archive dbd0193a | tar -x -C $CORPUS
 echo "{\"root\":\"$CORPUS\"}" | $DCGREP_WIDE index
