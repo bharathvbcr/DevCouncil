@@ -1139,7 +1139,12 @@ mod tests {
         assert_eq!(reader.files_seen(), 2);
         assert_eq!(reader.stopped_by(), None);
 
-        for stop in [Limit::Postings, Limit::Files, Limit::Duration, Limit::InputBytes] {
+        for stop in [
+            Limit::Postings,
+            Limit::Files,
+            Limit::Duration,
+            Limit::InputBytes,
+        ] {
             let mut builder = Builder::new(Vocabulary::CodeV1);
             builder.add("a.rs".into(), 10, &[(7, 3.0)]);
             builder.record_walk(41, Some(stop));

@@ -360,8 +360,12 @@ impl Candidates {
         // the two sets are the same size.
         if evidence.stamps.len() > reader.num_files() {
             let indexed: HashSet<&str> = reader.all_paths().iter().map(String::as_str).collect();
-            evidence.stamps.retain(|path, _| indexed.contains(path.as_str()));
-            evidence.versions.retain(|path, _| indexed.contains(path.as_str()));
+            evidence
+                .stamps
+                .retain(|path, _| indexed.contains(path.as_str()));
+            evidence
+                .versions
+                .retain(|path, _| indexed.contains(path.as_str()));
             evidence
                 .content_ids
                 .retain(|path, _| indexed.contains(path.as_str()));
@@ -1044,7 +1048,9 @@ mod tests {
             (100, 0, MAX_INDEX_DURATION, "input_bytes"),
             (100, 100, Duration::ZERO, "duration"),
         ] {
-            let built = build_with_limits(&request, 100, postings, LEXICAL_POSTINGS, bytes, duration).unwrap();
+            let built =
+                build_with_limits(&request, 100, postings, LEXICAL_POSTINGS, bytes, duration)
+                    .unwrap();
             assert_eq!(built.files_indexed, 0);
             assert_eq!(built.limit_reason, Some(reason));
             assert!(!built.traversal_complete);
@@ -1073,8 +1079,8 @@ mod tests {
     /// One word per file, shared with no other, so a query for it can only be
     /// answered by that file.
     const WORDS: [&str; 12] = [
-        "alpaca", "badger", "caribou", "dingo", "echidna", "ferret", "gazelle", "hamster",
-        "ibex", "jackal", "kestrel", "lemming",
+        "alpaca", "badger", "caribou", "dingo", "echidna", "ferret", "gazelle", "hamster", "ibex",
+        "jackal", "kestrel", "lemming",
     ];
 
     /// Twelve files, each about a word of its own. Which of them the walk
@@ -1111,7 +1117,15 @@ mod tests {
             sparse: None,
         };
         // Room for roughly three files' trigrams, and nowhere near twelve.
-        let built = build_with_limits(&request, 100, 150, LEXICAL_POSTINGS, 1 << 20, MAX_INDEX_DURATION).unwrap();
+        let built = build_with_limits(
+            &request,
+            100,
+            150,
+            LEXICAL_POSTINGS,
+            1 << 20,
+            MAX_INDEX_DURATION,
+        )
+        .unwrap();
         assert_eq!(built.limit_reason, Some("postings"), "{built:?}");
         assert!(
             built.files_indexed > 0 && built.files_indexed < 12,
@@ -1124,7 +1138,338 @@ mod tests {
             let ranked = rank(&root, word);
             assert_eq!(ranked.count, 1, "{word}: {ranked:?}");
             assert_eq!(ranked.files[0].path, format!("f{n}.rs"), "{word}");
+            // A ranking over every file the walk reached says so.
+            assert!(ranked.complete, "{word}: {ranked:?}");
+            assert_eq!(ranked.files_seen, 12, "{word}: {ranked:?}");
+            assert_eq!(ranked.files_indexed, 12, "{word}: {ranked:?}");
+            assert_eq!(ranked.lexical_limit_reason, None, "{word}: {ranked:?}");
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `search` was always right about a file the trigram index does not hold:
+    /// no evidence means no exclusion, so the matcher reads it. This pins that
+    /// across the change, because the files that now sit only in the ranked
+    /// index are exactly the ones a careless stamp would start excluding.
+    #[test]
+    fn search_still_finds_a_match_in_a_file_past_the_trigram_ceiling() {
+        let root = scratch("search-past");
+        twelve_files(&root);
+        let request = IndexRequest {
+            root: root.clone(),
+            max_files: 0,
+            sparse: None,
+        };
+        let built = build_with_limits(
+            &request,
+            100,
+            150,
+            LEXICAL_POSTINGS,
+            1 << 20,
+            MAX_INDEX_DURATION,
+        )
+        .unwrap();
+        assert!(built.files_indexed < 12, "{built:?}");
+        for (n, word) in WORDS.iter().enumerate() {
+            let found = crate::search(
+                &serde_json::from_value(serde_json::json!({
+                    "root": root, "pattern": format!("{word} gathers")
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(found.count, 1, "{word}: {found:?}");
+            assert_eq!(found.matches[0].path, format!("f{n}.rs"), "{word}");
+        }
+        // Edit every file. Only the trigram index's files may be called stale
+        // by a search: it is that snapshot's claim, and the ranked-only files
+        // are not in it.
+        for n in 0..12 {
+            let path = root.join(format!("f{n}.rs"));
+            let mut text = fs::read_to_string(&path).unwrap();
+            text.push_str("// edited after the index was built\n");
+            fs::write(&path, text).unwrap();
+        }
+        let found = crate::search(
+            &serde_json::from_value(serde_json::json!({
+                "root": root, "pattern": "gathers"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(found.count, 12, "{found:?}");
+        assert_eq!(
+            found.index.files_stale as usize, built.files_indexed,
+            "a search reports staleness for the trigram snapshot's files only: {:?}",
+            found.index
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The other direction of the same decoupling: a ranked file the trigram
+    /// index never held is still compared with the disk. Without a stamp for
+    /// it `rank` could not call it stale, and would not say so.
+    #[test]
+    fn a_ranked_file_past_the_trigram_ceiling_is_still_called_stale_when_edited() {
+        let root = scratch("stale-past");
+        twelve_files(&root);
+        let request = IndexRequest {
+            root: root.clone(),
+            max_files: 0,
+            sparse: None,
+        };
+        build_with_limits(
+            &request,
+            100,
+            150,
+            LEXICAL_POSTINGS,
+            1 << 20,
+            MAX_INDEX_DURATION,
+        )
+        .unwrap();
+        for (n, word) in WORDS.iter().enumerate() {
+            assert!(!rank(&root, word).files[0].stale, "{word} before any edit");
+            let path = root.join(format!("f{n}.rs"));
+            let mut text = fs::read_to_string(&path).unwrap();
+            text.push_str("// edited after the index was built\n");
+            fs::write(&path, text).unwrap();
+            let after = rank(&root, word);
+            assert!(after.files[0].stale, "{word} after an edit: {after:?}");
+            assert_eq!(after.stale_files, 1, "{word}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The ranked index's own ceiling is the only thing here that leaves it
+    /// short of the tree, and the answer has to say so without arithmetic.
+    #[test]
+    fn a_ranking_over_a_partial_index_says_so_and_names_the_ceiling() {
+        let root = scratch("partial");
+        twelve_files(&root);
+        let request = IndexRequest {
+            root: root.clone(),
+            max_files: 0,
+            sparse: None,
+        };
+        // Postings for about four of the twelve one-word-per-file documents.
+        let built =
+            build_with_limits(&request, 100, 1 << 20, 12, 1 << 20, MAX_INDEX_DURATION).unwrap();
+        assert_eq!(
+            built.lexical_limit_reason,
+            Some("lexical_postings"),
+            "{built:?}"
+        );
+        assert!(
+            built.lexical_files > 0 && built.lexical_files < 12,
+            "{built:?}"
+        );
+        // The trigram index took everything: this is the ranked ceiling alone.
+        assert_eq!(built.files_indexed, 12, "{built:?}");
+        assert_eq!(built.limit_reason, None, "{built:?}");
+        let mut ranked_somewhere = 0;
+        for word in WORDS {
+            let reply = rank(&root, word);
+            assert!(!reply.complete, "{word}: {reply:?}");
+            assert_eq!(
+                reply.lexical_limit_reason,
+                Some("lexical_postings"),
+                "{word}: {reply:?}"
+            );
+            assert_eq!(reply.files_seen, 12, "{word}: {reply:?}");
+            assert_eq!(
+                reply.files_indexed, built.lexical_files,
+                "{word}: {reply:?}"
+            );
+            assert!(reply.files_indexed < reply.files_seen, "{word}: {reply:?}");
+            ranked_somewhere += reply.count;
+        }
+        // And the words in files past the ceiling find nothing — which is the
+        // silent wrong answer `complete: false` exists to explain.
+        assert_eq!(ranked_somewhere, built.lexical_files);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The walk's ceilings end the ranked build as surely as the trigram one,
+    /// and used to leave `lexical_limit_reason` null while they did.
+    #[test]
+    fn a_walk_ceiling_is_reported_by_the_ranking_it_cut_short() {
+        for (max_files, max_bytes, duration, reason) in [
+            (5, 1 << 20, MAX_INDEX_DURATION, "files"),
+            (100, 150, MAX_INDEX_DURATION, "input_bytes"),
+            (100, 1 << 20, Duration::ZERO, "duration"),
+        ] {
+            let root = scratch("walk-stop");
+            twelve_files(&root);
+            let request = IndexRequest {
+                root: root.clone(),
+                max_files: 0,
+                sparse: None,
+            };
+            let built = build_with_limits(
+                &request,
+                max_files,
+                1 << 20,
+                LEXICAL_POSTINGS,
+                max_bytes,
+                duration,
+            )
+            .unwrap();
+            assert_eq!(built.limit_reason, Some(reason), "{built:?}");
+            assert_eq!(built.lexical_limit_reason, Some(reason), "{built:?}");
+            assert!(built.lexical_files < 12, "{reason}: {built:?}");
+            if built.lexical_files > 0 {
+                let word = WORDS
+                    .iter()
+                    .find(|word| rank(&root, word).count == 1)
+                    .unwrap_or_else(|| panic!("{reason}: a ranked file is rankable"));
+                let reply = rank(&root, word);
+                assert!(!reply.complete, "{reason}: {reply:?}");
+                assert_eq!(reply.lexical_limit_reason, Some(reason), "{reply:?}");
+                assert_eq!(reply.files_seen, built.files_seen, "{reason}: {reply:?}");
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// Once the trigram index is full, the file budget still bounds the ranked
+    /// one. It used to count trigram files only.
+    #[test]
+    fn the_file_budget_bounds_the_ranked_index_after_the_trigram_index_fills() {
+        let root = scratch("budget-after-full");
+        twelve_files(&root);
+        let request = IndexRequest {
+            root: root.clone(),
+            max_files: 0,
+            sparse: None,
+        };
+        let built = build_with_limits(
+            &request,
+            6,
+            150,
+            LEXICAL_POSTINGS,
+            1 << 20,
+            MAX_INDEX_DURATION,
+        )
+        .unwrap();
+        assert_eq!(built.limit_reason, Some("postings"), "{built:?}");
+        assert_eq!(built.lexical_limit_reason, Some("files"), "{built:?}");
+        assert_eq!(built.lexical_files, 6, "{built:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A cache written before the header grew is refused where the message
+    /// says what to do, not by `Reader::open` in the middle of a query.
+    #[test]
+    fn a_cache_from_the_previous_schema_is_refused_with_the_remedy() {
+        let root = scratch("old-schema");
+        twelve_files(&root);
+        let request = IndexRequest {
+            root: root.clone(),
+            max_files: 0,
+            sparse: None,
+        };
+        build_with_limits(
+            &request,
+            100,
+            1 << 20,
+            LEXICAL_POSTINGS,
+            1 << 20,
+            MAX_INDEX_DURATION,
+        )
+        .unwrap();
+        let pointer = root.join(".devcouncil/dcgrep/current.json");
+        let text = fs::read_to_string(&pointer).unwrap();
+        assert!(
+            text.contains(&format!("\"schema\":{}", super::CACHE_SCHEMA)),
+            "{text}"
+        );
+        fs::write(
+            &pointer,
+            text.replace(
+                &format!("\"schema\":{}", super::CACHE_SCHEMA),
+                "\"schema\":3",
+            ),
+        )
+        .unwrap();
+        let err = crate::lexical::ranked_search(
+            &serde_json::from_value(serde_json::json!({ "root": root, "query": "alpaca" }))
+                .unwrap(),
+        )
+        .expect_err("a schema-3 cache must not be read");
+        assert!(err.contains("rebuild with dcgrep index"), "{err}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The trigram ceiling is derived, not chosen, and the derivation holds.
+    ///
+    /// The two constants are tgrep's own, kept crate-private there, so they are
+    /// pinned against what it actually writes: one posting is the length of an
+    /// encoded `PostingEntry`, and `lookup.bin` is sixteen bytes per distinct
+    /// trigram.
+    #[test]
+    fn the_trigram_ceiling_fits_the_cache_file_bound_by_construction() {
+        use super::{
+            MAX_CACHE_FILE_BYTES, MAX_INDEX_POSTINGS, TRIGRAM_LOOKUP_BYTES, TRIGRAM_POSTING_BYTES,
+        };
+        assert_eq!(
+            tgrep_core::PostingEntry {
+                file_id: 0,
+                loc_mask: 0,
+                next_mask: 0
+            }
+            .encode()
+            .len() as u64,
+            TRIGRAM_POSTING_BYTES
+        );
+
+        // Worst case for each file at the ceiling: every posting its own
+        // trigram for `lookup.bin`, every posting an entry for `index.bin`.
+        let ceiling = MAX_INDEX_POSTINGS as u64;
+        assert!(ceiling * TRIGRAM_POSTING_BYTES <= MAX_CACHE_FILE_BYTES);
+        assert!(ceiling * TRIGRAM_LOOKUP_BYTES <= MAX_CACHE_FILE_BYTES);
+        // And it is the largest such number, so nothing is left on the table.
+        assert!((ceiling + 1) * TRIGRAM_LOOKUP_BYTES > MAX_CACHE_FILE_BYTES);
+        assert_eq!(MAX_INDEX_POSTINGS, 4_194_304);
+
+        // The entry sizes against a real build.
+        let root = scratch("sizes");
+        twelve_files(&root);
+        let request = IndexRequest {
+            root: root.clone(),
+            max_files: 0,
+            sparse: None,
+        };
+        let built = build_with_limits(
+            &request,
+            100,
+            1 << 20,
+            LEXICAL_POSTINGS,
+            1 << 20,
+            MAX_INDEX_DURATION,
+        )
+        .unwrap();
+        let mut distinct = std::collections::HashSet::new();
+        for n in 0..12 {
+            let bytes = fs::read(root.join(format!("f{n}.rs"))).unwrap();
+            for (hash, _) in tgrep_core::trigram::extract_merged_masks(&bytes) {
+                distinct.insert(hash);
+            }
+        }
+        let pointer: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join(".devcouncil/dcgrep/current.json")).unwrap(),
+        )
+        .unwrap();
+        let slot = root
+            .join(".devcouncil/dcgrep")
+            .join(pointer["slot"].as_str().unwrap());
+        assert_eq!(
+            fs::metadata(slot.join("index.bin")).unwrap().len(),
+            built.postings as u64 * TRIGRAM_POSTING_BYTES
+        );
+        assert_eq!(
+            fs::metadata(slot.join("lookup.bin")).unwrap().len(),
+            distinct.len() as u64 * TRIGRAM_LOOKUP_BYTES
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }
