@@ -83,7 +83,8 @@ const TRIGRAM_LOOKUP_BYTES: u64 = 16;
 /// trigrams would fail the build outright past the smaller figure.
 ///
 /// This was 2,000,000, picked by eye, and it is the number that ended the walk
-/// at 1,139 of this repository's 2,507 files.
+/// after 1,234 files on a `git archive` snapshot of this repository at
+/// `dbd0193a`, which holds 2,716 the walk reaches.
 const MAX_INDEX_POSTINGS: usize = {
     let entry = if TRIGRAM_POSTING_BYTES > TRIGRAM_LOOKUP_BYTES {
         TRIGRAM_POSTING_BYTES
