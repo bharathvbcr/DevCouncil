@@ -802,6 +802,9 @@ class MapBench:
             pages = conn.execute("PRAGMA page_count").fetchone()[0]
             page_size = conn.execute("PRAGMA page_size").fetchone()[0]
             generations = conn.execute("SELECT COUNT(*) FROM generations").fetchone()[0]
+            # Stored bytes. Schema >= 29 keeps each extraction as a zstd frame,
+            # so this is the compressed size there and the JSON text length
+            # before; the report labels it so rather than calling it JSON.
             payload = conn.execute(
                 "SELECT COALESCE(SUM(LENGTH(extraction_json)), 0) FROM generation_files"
             ).fetchone()[0]
@@ -816,7 +819,7 @@ class MapBench:
             "freelist_bytes": float(freelist * page_size),
             "freelist_ratio": (freelist / pages) if pages else 0.0,
             "generations": float(generations),
-            "extraction_json_bytes": float(payload),
+            "extraction_stored_bytes": float(payload),
             "extraction_cache_rows": float(cached[0]),
             "extraction_cache_bytes": float(cached[1]),
         }
@@ -893,14 +896,14 @@ def render_markdown(payload: Dict[str, object]) -> str:
             "One file's content changes between builds, so every round is a real "
             "new generation.",
             "",
-            "| round | generations | store | live `extraction_json` | free | free % | build |",
+            "| round | generations | store | live stored `extraction_json` (zstd frames from schema 29) | free | free % | build |",
             "|---|---|---|---|---|---|---|",
         ]
         for row in curve:  # type: ignore[union-attr]
             lines.append(
                 f"| {int(row['round'])} | {int(row['generations'])} "
                 f"| {row['file_bytes'] / 1e6:.1f} MB "
-                f"| {row['extraction_json_bytes'] / 1e6:.1f} MB "
+                f"| {row['extraction_stored_bytes'] / 1e6:.1f} MB "
                 f"| {row['freelist_bytes'] / 1e6:.1f} MB "
                 f"| {row['freelist_ratio'] * 100:.1f}% "
                 f"| {_fmt(row['build_s'])} |"
