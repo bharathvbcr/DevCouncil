@@ -407,13 +407,19 @@ func validate(out any) error {
 			return fmt.Errorf("index reported %d files indexed of %d seen",
 				reply.FilesIndexed, reply.FilesSeen)
 		}
-		// Bounded by what the walk reached, not by what the trigram index
-		// holds: that index fills first on a large repository and the ranked
-		// one carries on, so more files ranked than trigram-indexed is the
-		// ordinary shape of a big tree rather than a contradiction.
 		if reply.LexicalFiles > reply.FilesSeen {
 			return fmt.Errorf("index ranked %d files but its walk only saw %d",
 				reply.LexicalFiles, reply.FilesSeen)
+		}
+		// More files ranked than trigram-indexed has exactly one cause: the
+		// trigram index filled while the ranked one carried on. Every file the
+		// ranked index holds is read, trusted, plain UTF-8 text, which is
+		// precisely what the trigram side admits, so an index that did not fill
+		// holds at least as many. A report that ranks more without naming the
+		// postings ceiling is two halves disagreeing about what was published.
+		if reply.LexicalFiles > reply.FilesIndexed && reply.LimitReason != "postings" {
+			return fmt.Errorf("index ranked %d files but trigram-indexed %d without its postings ceiling (limit %q)",
+				reply.LexicalFiles, reply.FilesIndexed, reply.LimitReason)
 		}
 		// A model name without a model vocabulary, or the reverse, means the
 		// two halves of the report disagree about what was published — and a
