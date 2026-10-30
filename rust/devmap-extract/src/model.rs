@@ -2498,9 +2498,13 @@ mod gate_and_binding_tests {
     #[test]
     fn size_gate_constants_are_their_declared_magnitudes() {
         assert_eq!(DB_SIZE_GATE_PER_FILE, 114_688, "112 KiB per file");
-        assert_eq!(DB_SIZE_GATE_STEADY_PER_FILE, 118_784, "116 KiB per file at the plateau");
-        // SC27: the steady-state budget is this per-generation figure times the
-        // retention count, and is what a running repository is measured against.
+        assert_eq!(
+            DB_SIZE_GATE_STEADY_PER_FILE, 118_784,
+            "116 KiB per file at the plateau"
+        );
+        // SC27: the steady-state budget is its own measured figure (the
+        // plateau after the retention ceiling), and is what a running
+        // repository is measured against.
         assert_eq!(DB_SIZE_GATE_RETAINED_GENERATIONS, 2, "2 generations kept");
         assert_eq!(
             db_size_gate_steady_bytes(10_000),
