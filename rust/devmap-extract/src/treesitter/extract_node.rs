@@ -414,7 +414,11 @@ pub(super) fn extract_node(
                         let is_exported = js_symbol_is_exported(node, source);
                         // A plain `const X = <literal>` says so: nothing it holds
                         // can be called, which `Calls` edges must respect.
+                        // Only `const`: a `let` or `var` initialised to a literal is a
+                        // slot another statement assigns (`export let hook = null`),
+                        // and a call through it is a call.
                         let literal = target.kind() == "identifier"
+                            && js_declaration_is_const(node)
                             && value.is_some_and(|value| js_is_literal_value(value, 0));
                         for name in js_pattern_bound_names(target, source) {
                             let mut symbol = module_binding_symbol(
@@ -657,21 +661,14 @@ pub(super) fn extract_node(
             // publishes is an export, so a `require` of the file binds it exactly
             // as an `import` of an `export` does.
             "assignment_expression" => {
-                if let Some((exported, value)) = js_cjs_export_assignment(node, source) {
-                    // Assigned again to something that is not a literal, the
-                    // name is no longer a value nothing can call: the earlier
-                    // literal declaration gives way to whatever comes next.
-                    if let Some(name) = exported
-                        .as_deref()
-                        .filter(|_| !js_is_literal_value(value, 0))
-                    {
-                        let qualified = format!("{file_symbol_name}::{name}");
-                        symbols.retain(|known| {
-                            known.qualified_name != qualified
-                                || known.signature.as_deref()
-                                    != Some(crate::model::JS_LITERAL_CONSTANT)
-                        });
-                    }
+                if let Some((exported, value)) = js_cjs_export_assignment(node, source)
+                    // Published only when the file proves what a `require` sees: see
+                    // `CjsFacts`. Anything else is withheld, and the resolver says so
+                    // (`cjs_withheld_names`).
+                    .filter(|(exported, _)| {
+                        cjs_facts_for(node, source).publishes(exported.as_deref())
+                    })
+                {
                     let local = match js_cjs_function_name(exported.as_deref(), value, source) {
                         Some(name) => {
                             symbols.push(ExtractedSymbol {
@@ -692,27 +689,6 @@ pub(super) fn extract_node(
                         // `exports.x = local`: the export names a binding the
                         // file already declares.
                         None if value.kind() == "identifier" => Some(get_node_text(value, source)),
-                        // `exports.LIMIT = 3`: what `export const LIMIT = 3` is,
-                        // a module value nothing can call.
-                        None if exported.is_some() && js_is_literal_value(value, 0) => {
-                            let name = exported.clone().unwrap_or_default();
-                            let mut symbol = module_binding_symbol(
-                                file_symbol_name,
-                                name.clone(),
-                                true,
-                                span.clone(),
-                            );
-                            symbol.signature = Some(crate::model::JS_LITERAL_CONSTANT.to_string());
-                            // Assigned twice, it is one name; the second
-                            // assignment is not a second declaration.
-                            if !symbols
-                                .iter()
-                                .any(|known| known.qualified_name == symbol.qualified_name)
-                            {
-                                symbols.push(symbol);
-                            }
-                            Some(name)
-                        }
                         None => None,
                     };
                     match (exported, local) {

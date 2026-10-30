@@ -907,7 +907,24 @@ impl Resolver {
                                 }));
                             } else {
                                 resolution = Some(Arc::new(Resolution::Unresolved {
-                                    reason: "the named import has no unambiguous declaration in its module".to_string(),
+                                    reason: self
+                                        .abstention_reason(
+                                            family,
+                                            &ext.file_path,
+                                            read_scope(call.caller_symbol.as_deref(), &call.span)
+                                                .as_deref(),
+                                            None,
+                                            &call.callee_name,
+                                            ext.imports.iter().any(|imp| {
+                                                imp.imported_names.is_empty()
+                                                    && imp.alias.as_deref()
+                                                        == Some(call.callee_name.as_str())
+                                            }),
+                                        )
+                                        .unwrap_or_else(|| {
+                                            "the named import has no unambiguous declaration in its module"
+                                                .to_string()
+                                        }),
                                 }));
                             }
                         }
@@ -1868,10 +1885,24 @@ impl Resolver {
                             resolution: match resolution {
                                 Some(r) => (*r).clone(),
                                 None => Resolution::Unresolved {
-                                    reason: format!(
-                                        "no resolution ladder rung matched {:?} in {} family {:?}",
-                                        call.callee_name, ext.file_path, family
-                                    ),
+                                    // A JS/TS import that names something the module
+                                    // withholds says so, instead of the bare ladder text.
+                                    reason: self
+                                        .abstention_reason(
+                                            family,
+                                            &ext.file_path,
+                                            read_scope(call.caller_symbol.as_deref(), &call.span)
+                                                .as_deref(),
+                                            call.receiver_expr.as_deref(),
+                                            &call.callee_name,
+                                            false,
+                                        )
+                                        .unwrap_or_else(|| {
+                                            format!(
+                                                "no resolution ladder rung matched {:?} in {} family {:?}",
+                                                call.callee_name, ext.file_path, family
+                                            )
+                                        }),
                                 },
                             },
                             class,

@@ -43,8 +43,7 @@ impl Resolver {
     /// holds a number, a string, a regular expression, or an array or object of
     /// such: none is callable, so an edge `Calls` it is a false one. The import rung bound
     /// `import { DEFAULT_SCOPE } from './x'; DEFAULT_SCOPE()` to the constant,
-    /// and a bundler alias or a barrel made the same shape reachable through
-    /// more specifiers.
+    /// and a barrel made the same shape reachable through more specifiers.
     ///
     /// Only a declaration the extractor read as literal is recorded. `const hook =
     /// createHook()`, `const alias = other` and `const { a } = obj` all carry a
@@ -53,13 +52,24 @@ impl Resolver {
         if family != LangFamily::JsTs {
             return;
         }
+        // A symbol's identity is its kind, its file and its name. The set is
+        // keyed `file::name`, which a function and a variable of one name share
+        // (`exports.x = 3; function x() {}`), so a name is recorded only when
+        // the literal-constant variable is the one symbol of it in the file:
+        // demoting a call at the function would be a false demotion.
+        let mut by_name: BTreeMap<&str, usize> = BTreeMap::new();
+        for symbol in &ext.symbols {
+            *by_name.entry(symbol.qualified_name.as_str()).or_default() += 1;
+        }
         for symbol in &ext.symbols {
             if symbol.kind != SymbolKind::Variable
                 || symbol.parent_symbol.as_deref() != Some(ext.file_path.as_str())
             {
                 continue;
             }
-            if symbol.signature.as_deref() == Some(devmap_extract::model::JS_LITERAL_CONSTANT) {
+            if symbol.signature.as_deref() == Some(devmap_extract::model::JS_LITERAL_CONSTANT)
+                && by_name.get(symbol.qualified_name.as_str()).copied() == Some(1)
+            {
                 self.inert_values.insert(symbol.qualified_name.clone());
             }
         }

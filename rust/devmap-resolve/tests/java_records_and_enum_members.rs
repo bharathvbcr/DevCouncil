@@ -589,3 +589,58 @@ fn a_generic_file_does_not_claim_java_lang_for_any_name() {
         "{rows:?}"
     );
 }
+
+// A class and the constructor it declares are one declaration of the name. A
+// record with an explicit or compact canonical constructor lost its `new` binding
+// when the record became a symbol, because `Rec` and `Rec.Rec` made two
+// declarations.
+
+fn new_call_targets(files: &[(&str, &str)], from: &str) -> Vec<String> {
+    let (_, result) = resolve(files);
+    let mut found: Vec<String> = result
+        .edges
+        .iter()
+        .filter(|edge| edge.edge_kind == EdgeKind::Calls && edge.source_symbol == from)
+        .map(|edge| edge.target_symbol.clone())
+        .collect();
+    found.sort();
+    found.dedup();
+    found
+}
+
+#[test]
+fn new_of_a_record_with_a_compact_constructor_binds() {
+    let got = new_call_targets(
+        &[
+            ("a/Bounds.java", BOUNDS),
+            (
+                "b/U.java",
+                "package b;\nimport a.*;\npublic class U {\n  void go() { new Bounds(1, 2); }\n}\n",
+            ),
+        ],
+        "b/U.java::U.go",
+    );
+    assert!(
+        got.iter()
+            .any(|target| target.starts_with("a/Bounds.java::Bounds")),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn new_of_a_class_with_a_written_constructor_binds_once() {
+    let got = new_call_targets(
+        &[
+            (
+                "a/Plain.java",
+                "package a;\npublic class Plain {\n  public Plain(int x) {}\n  public Plain(String s) {}\n}\n",
+            ),
+            (
+                "b/U.java",
+                "package b;\nimport a.*;\npublic class U {\n  void go() { new Plain(1); }\n}\n",
+            ),
+        ],
+        "b/U.java::U.go",
+    );
+    assert_eq!(got, ["a/Plain.java::Plain"]);
+}

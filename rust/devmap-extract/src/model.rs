@@ -1567,6 +1567,15 @@ pub fn go_interface_method_matches<'a>(
 /// name.
 pub const FILE_DECLARES_TYPE_PARAMETERS: &str = "\u{1}type_parameters";
 
+/// The prefix under which a JS/TS file's own scope in [`Extraction::scope_locals`]
+/// records a CommonJS export it withholds: `\u{1}cjs_withheld:` then the exported
+/// name (`default` for `module.exports = …`).
+///
+/// A file publishes `exports.x` only when it assigns it once and never reassigns
+/// `module.exports`; any other assignment is withheld, and this is how the
+/// resolver tells an importer why the name was not found.
+pub const CJS_WITHHELD_PREFIX: &str = "\u{1}cjs_withheld:";
+
 /// The leading words of every `ParseOutcome::Failed` reason that records a
 /// parse-budget overrun. See [`Extraction::is_budget_refusal`].
 pub const BUDGET_REFUSAL_PREFIX: &str = "parse budget exceeded: ";

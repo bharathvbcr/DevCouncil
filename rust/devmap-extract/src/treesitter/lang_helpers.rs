@@ -247,6 +247,162 @@ pub(super) fn js_cjs_function_name(
         .or_else(|| exported.map(str::to_string))
 }
 
+/// Whether a `variable_declarator` belongs to a `const` declaration: a
+/// `lexical_declaration` whose keyword is `const`, not `let` and not `var`.
+pub(super) fn js_declaration_is_const(declarator: Node) -> bool {
+    bounded_parent(declarator).is_some_and(|declaration| {
+        declaration.kind() == "lexical_declaration"
+            && declaration
+                .child(0)
+                .is_some_and(|keyword| keyword.kind() == "const")
+    })
+}
+
+/// What a whole file says about the CommonJS names it assigns: how often each
+/// `exports.x` / `module.exports.x` is assigned and how often `module.exports`
+/// itself is, anywhere in the file at any depth.
+///
+/// A CommonJS export is published only when the file's own text proves what a
+/// `require` sees. `exports.x` assigned once, with `module.exports` never
+/// reassigned, is the one such case. The last of two assignments is what
+/// `require` returns, and after `module.exports = run` the local `exports` names
+/// the old object, so neither a count of two nor a reassignment can be read off
+/// the statement alone.
+#[derive(Debug, Default)]
+pub(super) struct CjsFacts {
+    member_assignments: std::collections::BTreeMap<String, usize>,
+    module_assignments: usize,
+    /// The walk hit its bound, so nothing is known.
+    overran: bool,
+}
+
+impl CjsFacts {
+    /// Whether the file proves the publication: `Some(name)` for `exports.name`,
+    /// `None` for `module.exports = value`.
+    pub(super) fn publishes(&self, exported: Option<&str>) -> bool {
+        if self.overran {
+            return false;
+        }
+        match exported {
+            Some(name) => {
+                self.module_assignments == 0
+                    && self.member_assignments.get(name).copied() == Some(1)
+            }
+            None => self.module_assignments == 1,
+        }
+    }
+}
+
+/// Most nodes read to count a file's CommonJS assignments.
+const CJS_FACTS_MAX_NODES: usize = 1_000_000;
+
+fn cjs_facts_of(root: Node, source: &str) -> CjsFacts {
+    let mut facts = CjsFacts::default();
+    let mut worklist = vec![root];
+    let mut visited = 0usize;
+    let names = |node: Option<Node>, expected: &str| {
+        node.is_some_and(|node| {
+            node.kind() == "identifier" && get_node_text(node, source) == expected
+        })
+    };
+    let is_module_exports = |node: Node| {
+        node.kind() == "member_expression"
+            && names(node.child_by_field_name("object"), "module")
+            && node
+                .child_by_field_name("property")
+                .is_some_and(|property| get_node_text(property, source) == "exports")
+    };
+    while let Some(node) = worklist.pop() {
+        visited += 1;
+        if visited > CJS_FACTS_MAX_NODES {
+            facts.overran = true;
+            break;
+        }
+        if node.kind() == "assignment_expression" {
+            if let Some(left) = node
+                .child_by_field_name("left")
+                .filter(|left| left.kind() == "member_expression")
+            {
+                if is_module_exports(left) {
+                    facts.module_assignments += 1;
+                } else if let (Some(object), Some(property)) = (
+                    left.child_by_field_name("object"),
+                    left.child_by_field_name("property"),
+                ) {
+                    if (names(Some(object), "exports") || is_module_exports(object))
+                        && property.kind() == "property_identifier"
+                    {
+                        *facts
+                            .member_assignments
+                            .entry(get_node_text(property, source))
+                            .or_default() += 1;
+                    }
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            worklist.push(child);
+        }
+    }
+    facts
+}
+
+thread_local! {
+    /// The facts of the file being walked, keyed by its source and root so a
+    /// file's many assignments share one pass.
+    static CJS_FACTS: std::cell::RefCell<Option<((usize, usize, usize), std::rc::Rc<CjsFacts>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The CommonJS facts of the file `node` belongs to.
+pub(super) fn cjs_facts_for(node: Node, source: &str) -> std::rc::Rc<CjsFacts> {
+    let mut root = node;
+    while let Some(parent) = bounded_parent(root) {
+        root = parent;
+    }
+    let key = (source.as_ptr() as usize, source.len(), root.id());
+    CJS_FACTS.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        if let Some((known, facts)) = cell.as_ref() {
+            if *known == key {
+                return std::rc::Rc::clone(facts);
+            }
+        }
+        let facts = std::rc::Rc::new(cjs_facts_of(root, source));
+        *cell = Some((key, std::rc::Rc::clone(&facts)));
+        facts
+    })
+}
+
+/// The exported names of a file's module-level CommonJS assignments that the
+/// file does not prove (`default` for `module.exports = …`).
+///
+/// Filed in `scope_locals` under a name no identifier can match, so the resolver
+/// can say why a `require` found nothing instead of leaving the row bare.
+pub(super) fn cjs_withheld_names(root: Node, source: &str) -> std::collections::BTreeSet<String> {
+    let facts = cjs_facts_of(root, source);
+    let mut withheld = std::collections::BTreeSet::new();
+    let mut worklist = vec![root];
+    let mut visited = 0usize;
+    while let Some(node) = worklist.pop() {
+        visited += 1;
+        if visited > CJS_FACTS_MAX_NODES {
+            break;
+        }
+        if let Some((exported, _)) = js_cjs_export_assignment(node, source) {
+            if !facts.publishes(exported.as_deref()) {
+                withheld.insert(exported.unwrap_or_else(|| "default".to_string()));
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            worklist.push(child);
+        }
+    }
+    withheld
+}
+
 /// The name a class field declares. TypeScript calls the field `name`,
 /// JavaScript `property`; a computed or string-keyed field names nothing a call
 /// could write, so it is left out.

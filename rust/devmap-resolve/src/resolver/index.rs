@@ -23,6 +23,7 @@ impl Resolver {
         self.rust_module_globs.clear();
         self.default_exports.clear();
         self.inert_values.clear();
+        self.star_export_files.clear();
         self.receiver_types.clear();
         self.scoped_receiver_types.clear();
         self.poisoned_receiver_keys.clear();
@@ -258,6 +259,14 @@ impl Resolver {
             for (scope, local) in &ext.scope_locals {
                 self.scope_locals
                     .insert((ext.file_path.clone(), scope.clone(), local.clone()));
+            }
+            if LangFamily::from_lang(&ext.language) == LangFamily::JsTs
+                && ext
+                    .exports
+                    .iter()
+                    .any(|export| export.exported_name == "*" && export.module_specifier.is_some())
+            {
+                self.star_export_files.insert(ext.file_path.clone());
             }
             for (owner, target) in &ext.rust_deref_targets {
                 self.rust_deref_targets
@@ -1921,7 +1930,14 @@ impl Resolver {
             // module publishes `Public` and a binding of its own is what it
             // names, so the hop stays in this file. Without it an importer of
             // `Public` asked a file that declares no such name.
+            //
+            // Not for `default`: `export default function main` is `default`
+            // here with `main` the local, and a hop keyed `file::default` is a
+            // name an `export *` over this file would then republish, though
+            // `export *` never forwards `default`. The default export has its own
+            // table (`default_exports`) and needs no hop.
             if local != export.exported_name
+                && export.exported_name != "default"
                 && self
                     .file_symbols
                     .get(&ext.file_path)

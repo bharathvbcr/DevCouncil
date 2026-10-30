@@ -205,6 +205,14 @@ impl Resolver {
         module_file: &str,
         name: &str,
     ) -> Option<(String, String)> {
+        // The default export is the module's own statement, never a hop (a hop
+        // keyed `file::default` is a name `export *` would republish): it
+        // answers a member `default` of this module and of no module over it.
+        if name == "default" {
+            if let Some(local) = self.default_exports.get(module_file) {
+                return self.lookup_in_package(module_file, local);
+            }
+        }
         self.lookup_in_package(module_file, name).or_else(|| {
             let terminal = self
                 .reexport_chains

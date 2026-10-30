@@ -1456,6 +1456,21 @@ pub(super) fn collect_scope_locals(
                 .extend(module_names);
         }
     }
+    // The CommonJS exports this file withholds, so a `require` that finds none
+    // can say why.
+    if matches!(lang, "javascript" | "typescript" | "tsx") {
+        let withheld = cjs_withheld_names(root, source);
+        if !withheld.is_empty() {
+            by_scope
+                .entry(file_symbol_name.to_string())
+                .or_default()
+                .extend(
+                    withheld
+                        .into_iter()
+                        .map(|name| format!("{}{name}", crate::model::CJS_WITHHELD_PREFIX)),
+                );
+        }
+    }
     // A Python module-scope name bound by a `for`/`with`/`except` target, a
     // walrus, a `del` or a `global` declaration is a binding of the file itself,
     // keyed by the file's own name as the JS/TS ones are. None of them is a

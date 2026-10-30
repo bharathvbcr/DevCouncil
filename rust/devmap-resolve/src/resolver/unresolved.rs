@@ -208,6 +208,62 @@ impl Resolver {
         })
     }
 
+    /// Why a JS/TS import that found nothing found nothing, when the module it
+    /// names withholds the name: a default over an `export *` barrel, which
+    /// never forwards `default`, or a CommonJS export the file does not prove.
+    ///
+    /// `default_import` says the callee is bound by `import X from '…'`.
+    ///
+    /// The import is looked up the way the call ladder looked it up: a bare
+    /// callee through its own binding, a one-segment receiver (`t.name()`,
+    /// `t` from `require`) through the receiver's.
+    pub(super) fn abstention_reason(
+        &self,
+        family: LangFamily,
+        file: &str,
+        scope: Option<&str>,
+        receiver: Option<&str>,
+        callee: &str,
+        default_import: bool,
+    ) -> Option<String> {
+        if family != LangFamily::JsTs {
+            return None;
+        }
+        let (target, name) = match receiver {
+            None => {
+                let (target, imported) = self.import_binding_at(family, file, scope, callee)?;
+                (target.clone(), imported.clone())
+            }
+            Some(receiver) if !receiver.is_empty() && !receiver.contains(['.', '(', '[']) => {
+                let (target, _) = self.import_binding_at(family, file, scope, receiver)?;
+                (target.clone(), callee.to_string())
+            }
+            Some(_) => return None,
+        };
+        // A whole-module handle called as a function is the module's default,
+        // and so is the name a default import binds (the binding table keeps the
+        // importer's own spelling for it).
+        let name = if name == "*" || (default_import && receiver.is_none()) {
+            "default"
+        } else {
+            name.as_str()
+        };
+        if self.scope_locals.contains(&(
+            target.clone(),
+            target.clone(),
+            format!("{}{name}", devmap_extract::model::CJS_WITHHELD_PREFIX),
+        )) {
+            return Some(
+                "commonjs export withheld: assigned more than once, or `module.exports` is reassigned in the file"
+                    .to_string(),
+            );
+        }
+        (name == "default"
+            && self.star_export_files.contains(&target)
+            && !self.default_exports.contains_key(&target))
+        .then(|| "default is not re-exported by `export *`".to_string())
+    }
+
     /// Whether a bare type name in `file_path` is a `java.lang` type, as far as
     /// the index can prove: a Java file, a `java.lang` spelling, no JVM-language
     /// declaration of it, and **no type-parameter list anywhere in the file**.

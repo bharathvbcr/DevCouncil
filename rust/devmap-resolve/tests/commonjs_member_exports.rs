@@ -277,9 +277,11 @@ fn module_exports_an_identifier_is_a_default_export_of_that_binding() {
 }
 
 #[test]
-fn a_computed_require_binds_nothing_and_a_literal_export_is_a_symbol_not_a_target() {
-    // `require(name)` names no file, so no edge; the sibling literal export is a
-    // declared, exported, inert value.
+fn a_computed_require_binds_nothing_and_a_literal_export_is_not_published() {
+    // `require(name)` names no file, so no edge. A literal export is no longer a
+    // symbol at all: only a `const` is known to be inert, and `exports.LIMIT = 3`
+    // is a slot another statement may assign, so the lane publishes nothing for
+    // it. (`LIMIT` is also assigned twice here, which withholds it on its own.)
     let result = resolve(&[
         (
             "c/util.js",
@@ -304,21 +306,18 @@ fn a_computed_require_binds_nothing_and_a_literal_export_is_a_symbol_not_a_targe
         &[("c/util.js", "exports.LIMIT = 3;\nexports.LIMIT = 4;\n")],
         "c/util.js",
     );
-    assert_eq!(
-        declared
-            .iter()
-            .filter(|name| name.ends_with("::LIMIT"))
-            .count(),
-        1,
-        "assigned twice is one declaration: {declared:?}"
+    assert!(
+        declared.iter().all(|name| !name.ends_with("::LIMIT")),
+        "a literal export declares nothing: {declared:?}"
     );
 }
 
 #[test]
-fn a_hoisted_void_zero_and_a_later_reassignment_leave_the_export_callable() {
+fn a_hoisted_void_zero_then_a_real_assignment_is_withheld() {
     // A compiled module opens with `exports.run = void 0;` and assigns the real
-    // value below. Neither the `void 0` nor a literal later replaced by a
-    // call may make `run` an inert constant.
+    // value below. That is two assignments of `run`, and which one a `require`
+    // sees is not a thing one statement proves: the name is withheld, nothing is
+    // bound (base bound nothing), and the row says why.
     for util in [
         "exports.run = void 0;\nexports.run = function run() {};\n",
         "exports.run = 1;\nexports.run = function run() {};\n",
@@ -330,11 +329,60 @@ fn a_hoisted_void_zero_and_a_later_reassignment_leave_the_export_callable() {
                 "const { run } = require('./util');\nfunction go() { return run(); }\n",
             ),
         ]);
-        assert_eq!(
-            calls(&result, "v/main.js::go"),
-            ["v/util.js::run"],
+        assert!(
+            calls(&result, "v/main.js::go").is_empty(),
+            "{util}\n{:?}",
+            calls(&result, "v/main.js::go")
+        );
+        assert!(
+            result.unresolved.iter().any(|row| matches!(
+                &row.resolution,
+                devmap_resolve::model::Resolution::Unresolved { reason }
+                    if reason.starts_with("commonjs export withheld")
+            )),
             "{util}\n{:?}",
             result.unresolved
         );
     }
+}
+
+#[test]
+fn two_module_exports_assignments_withhold_the_default() {
+    // Which `module.exports =` a `require` sees is not one statement's claim.
+    let result = resolve(&[
+        (
+            "m/util.js",
+            "function a() {}\nfunction b() {}\nmodule.exports = a;\nmodule.exports = b;\n",
+        ),
+        (
+            "m/main.js",
+            "const run = require('./util');\nfunction go() { return run(); }\n",
+        ),
+    ]);
+    assert!(calls(&result, "m/main.js::go").is_empty());
+    assert!(
+        result.unresolved.iter().any(|row| matches!(
+            &row.resolution,
+            devmap_resolve::model::Resolution::Unresolved { reason }
+                if reason.starts_with("commonjs export withheld")
+        )),
+        "{:?}",
+        result.unresolved
+    );
+}
+
+#[test]
+fn a_name_assigned_once_beside_a_twice_assigned_one_is_still_published() {
+    // The count is per name: `dup` is withheld, `once` is not.
+    let result = resolve(&[
+        (
+            "p/util.js",
+            "exports.dup = function dup() {};\nexports.dup = function dup2() {};\nexports.once = function once() {};\n",
+        ),
+        (
+            "p/main.js",
+            "const { dup, once } = require('./util');\nfunction go() { dup(); once(); }\n",
+        ),
+    ]);
+    assert_eq!(calls(&result, "p/main.js::go"), ["p/util.js::once"]);
 }

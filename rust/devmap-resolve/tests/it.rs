@@ -36,8 +36,6 @@ mod attack_ccf_lsp;
 #[cfg(feature = "parse")]
 mod audit_regressions;
 #[cfg(feature = "parse")]
-mod bundler_aliases_map_imports;
-#[cfg(feature = "parse")]
 mod calls_target_callables_only;
 #[cfg(feature = "parse")]
 mod captured_receiver_attribution;
@@ -292,3 +290,5 @@ mod attack_resolver_bundle5;
 mod corpus_dump_attack;
 #[cfg(feature = "parse")]
 mod attack_swift_residue;
+#[cfg(feature = "parse")]
+mod attack_tsj_edges;
