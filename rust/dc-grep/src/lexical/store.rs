@@ -734,6 +734,15 @@ impl Reader {
                 "lexical index holds {files} files but says its walk saw {files_seen}"
             ));
         }
+        // And every file it left out was one the walk saw, none of them also a
+        // document: the two counts together cannot exceed the walk's. Not
+        // bounded for `walk_errors`, which counts entries and not files.
+        if files.saturating_add(unindexed) > files_seen {
+            return Err(format!(
+                "lexical index holds {files} files and says it left out {unindexed}, \
+                 from a walk that saw {files_seen}"
+            ));
+        }
         if vocab_size > MAX_VOCAB {
             return Err(format!(
                 "lexical index claims a {vocab_size}-token vocabulary, over the \
@@ -1328,9 +1337,9 @@ mod tests {
         assert!(!errors.complete(), "a walk that could not read a directory");
         assert_eq!(errors.walk_errors(), 3);
 
-        let left_out = read(None, 0, 7);
+        let left_out = read(None, 0, 3);
         assert!(!left_out.complete(), "admissible files with no document");
-        assert_eq!(left_out.unindexed(), 7);
+        assert_eq!(left_out.unindexed(), 3);
 
         let stopped = read(Some(Limit::Files), 0, 0);
         assert!(!stopped.complete(), "a ceiling");
@@ -1475,6 +1484,13 @@ mod tests {
         // files than the index contains, and a caller divides by this.
         bytes[36..40].copy_from_slice(&1u32.to_le_bytes());
         assert!(Reader::open(bytes).unwrap_err().contains("saw 1"));
+
+        // Two documents held and five files said to be left out, from a walk
+        // that saw two: a file is a document or it is left out, not both.
+        let mut bytes = built();
+        bytes[48..52].copy_from_slice(&5u32.to_le_bytes());
+        let err = Reader::open(bytes).unwrap_err();
+        assert!(err.contains("left out 5"), "{err}");
     }
 
     #[test]

@@ -423,6 +423,8 @@ a number in `lexical_unmatched`.
   "files_seen": 1152,
   "complete": true,
   "lexical_limit_reason": null,
+  "walk_errors": 0,
+  "lexical_unindexed": 0,
   "index_postings": 482301
 }
 ```
