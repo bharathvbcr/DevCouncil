@@ -20,6 +20,8 @@
 //! postings     u32
 //! avg_doc_len  f32
 //! vocab_size   u32       zero when the query side is computed, not stored
+//! files_seen   u32       files the build's walk reached, indexed or not
+//! stop         u32       why the build stopped short of the tree; 0 = it did not
 //! doc_lens     files      x u32
 //! paths        files      x (u32 length, that many UTF-8 bytes)
 //! term_table   terms      x (u32 term_id, u32 first_posting, u32 posting_count)
@@ -85,7 +87,14 @@ pub(crate) const MAGIC: [u8; 8] = *b"DCLEX\0\0\x01";
 /// that cost 1.0 ms per query at 30522 tokens and 3.4 ms at the 100000
 /// ceiling. The sorted index is four bytes per token on disk and turns a
 /// lookup into a binary search over bytes already in memory.
-pub(crate) const SCHEMA: u32 = 3;
+///
+/// Went to 4 when `files_seen` and `stop` joined the header. A ranking over a
+/// partial index looked exactly like one over a whole repository — the only hint
+/// was a posting count — because the file said nothing about how much of the
+/// tree it had read. They are in this file, under its integrity stamp, rather
+/// than in the slot's pointer, so the claim cannot be replaced independently of
+/// the postings it describes.
+pub(crate) const SCHEMA: u32 = 4;
 
 /// Postings kept in one index.
 ///
@@ -169,15 +178,47 @@ impl fmt::Display for Vocabulary {
 }
 
 /// Why a build stopped short of the whole tree.
+///
+/// The first is this index's own ceiling. The other three are the walk's: they
+/// end the ranked build as surely as they end the trigram one, so a ranking has
+/// to be able to name them. Their strings are the ones `IndexResponse` already
+/// reports as `limit_reason`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Limit {
     Postings,
+    Files,
+    Duration,
+    InputBytes,
 }
 
 impl Limit {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Limit::Postings => "lexical_postings",
+            Limit::Files => "files",
+            Limit::Duration => "duration",
+            Limit::InputBytes => "input_bytes",
+        }
+    }
+
+    /// Nonzero, because zero is "did not stop".
+    fn code(self) -> u32 {
+        match self {
+            Limit::Postings => 1,
+            Limit::Files => 2,
+            Limit::Duration => 3,
+            Limit::InputBytes => 4,
+        }
+    }
+
+    fn from_code(code: u32) -> Option<Option<Self>> {
+        match code {
+            0 => Some(None),
+            1 => Some(Some(Limit::Postings)),
+            2 => Some(Some(Limit::Files)),
+            3 => Some(Some(Limit::Duration)),
+            4 => Some(Some(Limit::InputBytes)),
+            _ => None,
         }
     }
 }
@@ -202,11 +243,24 @@ pub(crate) struct Builder {
     /// The model's query weight per token id, parallel to `vocab`. Empty for
     /// `CodeV1`, whose query side is IDF computed from the postings.
     query_weights: Vec<f32>,
+    /// This index's own ceiling, once it has bitten. Stops `add`.
     limit: Option<Limit>,
+    /// Postings this builder will hold. `MAX_POSTINGS` outside a test, which
+    /// lowers it to prove what happens when it bites without writing four
+    /// million postings to do so.
+    ceiling: usize,
+    /// How many files the walk reached, and the walk's own ceiling if one
+    /// ended it. Reported by the finished file; neither stops `add`.
+    files_seen: usize,
+    walk_stop: Option<Limit>,
 }
 
 impl Builder {
     pub(crate) fn new(vocabulary: Vocabulary) -> Self {
+        Self::with_ceiling(vocabulary, MAX_POSTINGS)
+    }
+
+    pub(crate) fn with_ceiling(vocabulary: Vocabulary, ceiling: usize) -> Self {
         Builder {
             vocabulary,
             paths: Vec::new(),
@@ -215,7 +269,27 @@ impl Builder {
             vocab: Vec::new(),
             query_weights: Vec::new(),
             limit: None,
+            ceiling: ceiling.min(MAX_POSTINGS),
+            files_seen: 0,
+            walk_stop: None,
         }
+    }
+
+    /// Records how far the build's walk got, for the finished file to report.
+    ///
+    /// Separate from `limit`, which is this index's own and stops `add`: a
+    /// walk that ended early did not make this index full, it made it short,
+    /// and the two have different readers. `stop` is what ended the walk.
+    pub(crate) fn record_walk(&mut self, files_seen: usize, stop: Option<Limit>) {
+        self.files_seen = files_seen;
+        self.walk_stop = stop;
+    }
+
+    /// Why the finished index covers less than the tree, if it does: its own
+    /// ceiling first, because the walk ending afterwards is a consequence of
+    /// nothing having been left to add, not a second cause.
+    pub(crate) fn stopped_by(&self) -> Option<Limit> {
+        self.limit.or(self.walk_stop)
     }
 
     /// Stores the query side of a learned ranking: the token strings and the
@@ -313,7 +387,7 @@ impl Builder {
         if self.limit.is_some() {
             return false;
         }
-        if self.raw.len().saturating_add(weights.len()) > MAX_POSTINGS {
+        if self.raw.len().saturating_add(weights.len()) > self.ceiling {
             self.limit = Some(Limit::Postings);
             return false;
         }
@@ -382,6 +456,11 @@ impl Builder {
         out.extend_from_slice(&(self.raw.len() as u32).to_le_bytes());
         out.extend_from_slice(&avg_doc_len.to_le_bytes());
         out.extend_from_slice(&(self.vocab.len() as u32).to_le_bytes());
+        // Never below the documents it holds: a walk that saw fewer files than
+        // the index contains is a build that mislabelled itself.
+        let seen = u32::try_from(self.files_seen.max(files)).unwrap_or(u32::MAX);
+        out.extend_from_slice(&seen.to_le_bytes());
+        out.extend_from_slice(&self.stopped_by().map_or(0, Limit::code).to_le_bytes());
         for len in &self.doc_lens {
             out.extend_from_slice(&len.to_le_bytes());
         }
@@ -451,6 +530,10 @@ pub(crate) struct Reader {
     /// `token_id` binary-searches without allocating.
     vocab_order_at: usize,
     query_weights: Vec<f32>,
+    /// What the build that wrote this file says about how much of the tree it
+    /// read. Carried so a ranking can say whether it ranked all of it.
+    files_seen: usize,
+    stopped_by: Option<Limit>,
 }
 
 impl fmt::Debug for Reader {
@@ -478,7 +561,7 @@ impl Reader {
     /// facts, and a caller that cannot tell them apart will report the second
     /// when it means the first.
     pub(crate) fn open(bytes: Vec<u8>) -> Result<Self, String> {
-        let head = 8 + 4 * 5 + 4 + 4;
+        let head = 8 + 4 * 5 + 4 + 4 + 4 + 4;
         if bytes.len() < head {
             return Err(format!(
                 "lexical index is {} bytes, shorter than its {head}-byte header",
@@ -517,6 +600,20 @@ impl Reader {
             ));
         }
         let vocab_size = u32_at(&bytes, 32) as usize;
+        let files_seen = u32_at(&bytes, 36) as usize;
+        let stop_code = u32_at(&bytes, 40);
+        let Some(stopped_by) = Limit::from_code(stop_code) else {
+            return Err(format!(
+                "lexical index names stop reason {stop_code}, which this build does not know"
+            ));
+        };
+        // A walk cannot have seen fewer files than the index holds. Refused
+        // rather than clamped, because the number is what a caller divides by.
+        if files_seen < files {
+            return Err(format!(
+                "lexical index holds {files} files but says its walk saw {files_seen}"
+            ));
+        }
         if vocab_size > MAX_VOCAB {
             return Err(format!(
                 "lexical index claims a {vocab_size}-token vocabulary, over the \
@@ -683,6 +780,8 @@ impl Reader {
             vocab_starts,
             vocab_order_at,
             query_weights,
+            files_seen,
+            stopped_by,
         };
 
         // The order table is what `token_id` binary-searches, so an unsorted or
@@ -774,6 +873,18 @@ impl Reader {
 
     pub(crate) fn postings_len(&self) -> usize {
         self.postings
+    }
+
+    /// Files the build's walk reached, whether or not they were indexed.
+    pub(crate) fn files_seen(&self) -> usize {
+        self.files_seen
+    }
+
+    /// The ceiling that ended the build short of the tree. `None` means none
+    /// did — not that every file was admissible, only that nothing stopped the
+    /// walk or filled the index.
+    pub(crate) fn stopped_by(&self) -> Option<Limit> {
+        self.stopped_by
     }
 
     pub(crate) fn path(&self, file_id: u32) -> Option<&str> {
@@ -1019,6 +1130,51 @@ mod tests {
         let mut bytes = built();
         bytes[28..32].copy_from_slice(&f32::NAN.to_le_bytes());
         assert!(Reader::open(bytes).unwrap_err().contains("non-finite"));
+    }
+
+    #[test]
+    fn the_file_says_how_much_of_the_tree_it_read() {
+        // Unfinished: nothing recorded, so it claims no more than it holds.
+        let reader = Reader::open(built()).expect("opens");
+        assert_eq!(reader.files_seen(), 2);
+        assert_eq!(reader.stopped_by(), None);
+
+        for stop in [Limit::Postings, Limit::Files, Limit::Duration, Limit::InputBytes] {
+            let mut builder = Builder::new(Vocabulary::CodeV1);
+            builder.add("a.rs".into(), 10, &[(7, 3.0)]);
+            builder.record_walk(41, Some(stop));
+            let reader = Reader::open(builder.finish()).expect("opens");
+            assert_eq!(reader.files(), 1);
+            assert_eq!(reader.files_seen(), 41);
+            assert_eq!(reader.stopped_by(), Some(stop));
+        }
+    }
+
+    #[test]
+    fn its_own_ceiling_is_named_before_the_walks() {
+        let mut builder = Builder::with_ceiling(Vocabulary::CodeV1, 3);
+        assert!(builder.add("a.rs".into(), 4, &[(1, 1.0), (2, 1.0)]));
+        assert!(!builder.add("b.rs".into(), 4, &[(1, 1.0), (2, 1.0)]));
+        // The walk then ran out of time with the index already full.
+        builder.record_walk(9, Some(Limit::Duration));
+        let reader = Reader::open(builder.finish()).expect("opens");
+        assert_eq!(reader.files(), 1);
+        assert_eq!(reader.files_seen(), 9);
+        assert_eq!(reader.stopped_by(), Some(Limit::Postings));
+    }
+
+    #[test]
+    fn a_header_that_contradicts_itself_about_coverage_is_refused() {
+        let mut bytes = built();
+        // A stop reason this build has never heard of.
+        bytes[40..44].copy_from_slice(&77u32.to_le_bytes());
+        assert!(Reader::open(bytes).unwrap_err().contains("stop reason 77"));
+
+        let mut bytes = built();
+        // Two documents held, one file seen: the walk cannot have seen fewer
+        // files than the index contains, and a caller divides by this.
+        bytes[36..40].copy_from_slice(&1u32.to_le_bytes());
+        assert!(Reader::open(bytes).unwrap_err().contains("saw 1"));
     }
 
     #[test]

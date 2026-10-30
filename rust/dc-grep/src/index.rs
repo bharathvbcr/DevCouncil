@@ -30,7 +30,11 @@ use crate::{DEFAULT_MAX_FILE_BYTES, build_walker, open_for_search, resolve_roots
 // told "lexical index is schema 2, this build reads 3" in the middle of a
 // query, where the answer they need is "rebuild with dcgrep index" — which is
 // exactly what refusing here says.
-const CACHE_SCHEMA: u32 = 3;
+//
+// Bumped to 4 with `lexical::store::SCHEMA`, which gained the coverage fields
+// `rank` reports. The pointer is checked first, so a cache written by the
+// previous build is refused here with the remedy, not by `Reader::open`.
+const CACHE_SCHEMA: u32 = 4;
 
 // The slot's number must never fall behind the ranked index's.
 //
@@ -53,10 +57,41 @@ const _: () = assert!(
 );
 
 const MAX_INDEX_FILES: usize = 50_000;
-const MAX_INDEX_POSTINGS: usize = 2_000_000;
 const MAX_INDEX_INPUT_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_INDEX_DURATION: Duration = Duration::from_secs(30);
 const MAX_CACHE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Bytes one posting takes in `index.bin`: `file_id` (4) + `loc_mask` (1) +
+/// `next_mask` (1). tgrep keeps its own constant crate-private, so this one is
+/// pinned to `PostingEntry::encode()` by a test rather than trusted.
+const TRIGRAM_POSTING_BYTES: u64 = 6;
+/// Bytes one entry takes in `lookup.bin`: `hash` (4) + `offset` (8) +
+/// `length` (4). One per *distinct* trigram, which a posting list of one entry
+/// can make equal to the number of postings, so for sizing this file's bound is
+/// the postings' bound too.
+const TRIGRAM_LOOKUP_BYTES: u64 = 16;
+
+/// Postings the trigram index may hold, derived from the one bound that is not
+/// ours to choose: a cache file larger than `MAX_CACHE_FILE_BYTES` is refused
+/// by `Published::open`, and the build's own integrity pass fails on it first.
+///
+/// Both `index.bin` (6 bytes per posting) and `lookup.bin` (16 bytes per
+/// distinct trigram, and distinct trigrams never exceed postings) must fit, so
+/// the ceiling is the larger entry's quotient: 4,194,304. That is the most this
+/// can hold with no input able to produce a file the reader will then refuse.
+/// `index.bin` alone would allow 11,184,810, and a corpus of mostly distinct
+/// trigrams would fail the build outright past the smaller figure.
+///
+/// This was 2,000,000, picked by eye, and it is the number that ended the walk
+/// at 1,139 of this repository's 2,507 files.
+const MAX_INDEX_POSTINGS: usize = {
+    let entry = if TRIGRAM_POSTING_BYTES > TRIGRAM_LOOKUP_BYTES {
+        TRIGRAM_POSTING_BYTES
+    } else {
+        TRIGRAM_LOOKUP_BYTES
+    };
+    (MAX_CACHE_FILE_BYTES / entry) as usize
+};
 const INDEX_FILES: &[&str] = &[
     "index.bin",
     "lookup.bin",
@@ -91,25 +126,40 @@ pub struct IndexRequest {
 pub struct IndexResponse {
     pub ok: bool,
     pub engine: &'static str,
+    /// Files the walk reached. The trigram index's ceiling does not end the
+    /// walk — the ranked index goes on — so this counts past it; only the
+    /// walk's own ceilings (`files`, `duration`, `input_bytes`) stop the count.
     pub files_seen: usize,
+    /// Files in the trigram index.
     pub files_indexed: usize,
+    /// Files seen that are not in the trigram index, for any reason, the
+    /// trigram ceiling included. A search still reads them.
     pub files_unindexed: usize,
     pub walk_errors: usize,
-    /// The walk finished; this does not assert every file was indexable.
+    /// No ceiling stopped the trigram index; this does not assert every file
+    /// was indexable. It says nothing of the ranked index, which has its own
+    /// `lexical_limit_reason` — the two ceilings are separate and either can
+    /// bite alone.
     pub traversal_complete: bool,
+    /// The ceiling that stopped the trigram index, if one did.
     pub limit_reason: Option<&'static str>,
     pub input_bytes: u64,
     pub postings: usize,
     pub cache_warning: Option<String>,
-    /// Documents in the ranked index. Never more than `files_indexed`, and
-    /// lower whenever a file's text was too repetitive to tokenise whole.
+    /// Documents in the ranked index. Not bounded by `files_indexed`: the
+    /// trigram index can fill first and the ranked one carries on. Lower than
+    /// the files read whenever a file's text was too repetitive to tokenise
+    /// whole.
     pub lexical_files: usize,
     pub lexical_postings: usize,
-    /// Files read for the trigram index but left out of the ranked one,
-    /// because a document tokenised only in part would rank by a length it
-    /// does not have. Counted rather than indexed short.
+    /// Files read for the ranked index and left out of it, because a document
+    /// tokenised only in part would rank by a length it does not have. Counted
+    /// rather than indexed short.
     pub lexical_unindexed: usize,
-    /// The ceiling that stopped the ranked build, if one did.
+    /// The ceiling that stopped the ranked build, if one did: its own
+    /// (`lexical_postings`) or the walk's (`files`, `duration`, `input_bytes`).
+    /// The same value a `rank` answer reports, because it is read back from the
+    /// file that answer comes from.
     pub lexical_limit_reason: Option<&'static str>,
     /// Which term space the ranked index speaks.
     pub lexical_vocabulary: &'static str,
@@ -300,7 +350,22 @@ impl Candidates {
         if reader.num_files() != files_indexed {
             return Err("index file count disagrees with its manifest".into());
         }
-        let evidence = tgrep_core::meta::read_file_evidence(&slot).map_err(error)?;
+        let mut evidence = tgrep_core::meta::read_file_evidence(&slot).map_err(error)?;
+        // The slot's stamps also cover files only the ranked index reached,
+        // which `rank` needs to call them stale. A search is about the trigram
+        // snapshot, and for a file outside it "changed since the snapshot read
+        // it" is not a claim the snapshot can make — so those stamps are not
+        // shown to the planner, and `verdict` answers `Search` for them exactly
+        // as it did before they existed. Skipped in the ordinary case, where
+        // the two sets are the same size.
+        if evidence.stamps.len() > reader.num_files() {
+            let indexed: HashSet<&str> = reader.all_paths().iter().map(String::as_str).collect();
+            evidence.stamps.retain(|path, _| indexed.contains(path.as_str()));
+            evidence.versions.retain(|path, _| indexed.contains(path.as_str()));
+            evidence
+                .content_ids
+                .retain(|path, _| indexed.contains(path.as_str()));
+        }
         let matching: HashSet<u32> = execute_plan(plan, &|hash| reader.lookup_trigram(hash))
             .into_iter()
             .collect();
@@ -370,15 +435,38 @@ pub fn build_index(request: &IndexRequest) -> Result<IndexResponse, String> {
         request,
         max_files,
         MAX_INDEX_POSTINGS,
+        lexical::store::MAX_POSTINGS,
         MAX_INDEX_INPUT_BYTES,
         MAX_INDEX_DURATION,
     )
 }
 
+/// Records that the walk ended, and what ended it.
+///
+/// The ceiling is the trigram index's own too unless that index already filled
+/// and stopped growing: `limit_reason` names what ended *it*, and after
+/// `postings` nothing the walk meets later changes that.
+fn walk_ended(
+    limit: lexical::store::Limit,
+    trigram_full: bool,
+    response: &mut IndexResponse,
+    walk_stop: &mut Option<lexical::store::Limit>,
+) {
+    *walk_stop = Some(limit);
+    if !trigram_full {
+        response.limit_reason = Some(limit.as_str());
+    }
+}
+
+/// The ceilings are parameters so a test can make each one bite on a handful of
+/// files. `max_postings` bounds the trigram index and `lexical_postings` the
+/// ranked one; neither ends the other, and only `max_files`, `max_bytes` and
+/// `max_duration` end the walk.
 fn build_with_limits(
     request: &IndexRequest,
     max_files: usize,
     max_postings: usize,
+    lexical_postings: usize,
     max_bytes: u64,
     max_duration: Duration,
 ) -> Result<IndexResponse, String> {
@@ -454,10 +542,22 @@ fn build_with_limits(
     // every file twice and — the part that actually bites — could disagree
     // with this one about which files exist, which is how two indexes of one
     // repository come to answer different questions about it.
-    let mut lexical = lexical::store::Builder::new(match &encoded {
-        Some(encoded) => encoded.vocabulary,
-        None => lexical::store::Vocabulary::CodeV1,
-    });
+    let mut lexical = lexical::store::Builder::with_ceiling(
+        match &encoded {
+            Some(encoded) => encoded.vocabulary,
+            None => lexical::store::Vocabulary::CodeV1,
+        },
+        lexical_postings,
+    );
+    // The trigram index filled and stopped growing. The walk goes on for the
+    // ranked index, which has a ceiling of its own and is not this one's to
+    // end: the two used to share a `break`, and the ranked index stopped at
+    // whatever file the trigram postings ran out on.
+    let mut trigram_full = false;
+    // What ended the walk, if anything did. Kept apart from `limit_reason`,
+    // which names what ended the trigram index and keeps saying `postings`
+    // after that index filled, whatever the walk meets later.
+    let mut walk_stop: Option<lexical::store::Limit> = None;
     let mut lexical_terms: HashMap<u32, f32> = HashMap::new();
     // Which of the encoder's documents this walk actually reached. The
     // difference between this and the encoding's own count is how stale it is,
@@ -466,7 +566,12 @@ fn build_with_limits(
     let mut lexical_used: usize = 0;
     for entry in build_walker(&root, true)?.build() {
         if started.elapsed() >= max_duration {
-            response.limit_reason = Some("duration");
+            walk_ended(
+                lexical::store::Limit::Duration,
+                trigram_full,
+                &mut response,
+                &mut walk_stop,
+            );
             break;
         }
         let entry = match entry {
@@ -480,9 +585,22 @@ fn build_with_limits(
             continue;
         }
         response.files_seen += 1;
-        if paths.len() >= max_files {
-            response.limit_reason = Some("files");
+        // Documents in either index, so the file budget bounds the ranked one
+        // once the trigram one has stopped counting.
+        if paths.len().max(lexical.documents()) >= max_files {
+            walk_ended(
+                lexical::store::Limit::Files,
+                trigram_full,
+                &mut response,
+                &mut walk_stop,
+            );
             break;
+        }
+        // Nothing left to build. Counted so `files_seen` is the size of the
+        // tree the walk admits, which is what a partial ranking is partial of;
+        // not read, so the cost of that number is a directory walk.
+        if trigram_full && lexical.is_full() {
+            continue;
         }
         let Some(path) = entry.path().strip_prefix(&root).ok().and_then(slashed) else {
             continue;
@@ -498,7 +616,12 @@ fn build_with_limits(
             _ => continue,
         };
         if response.input_bytes.saturating_add(metadata.len()) > max_bytes {
-            response.limit_reason = Some("input_bytes");
+            walk_ended(
+                lexical::store::Limit::InputBytes,
+                trigram_full,
+                &mut response,
+                &mut walk_stop,
+            );
             break;
         }
         let before = file_version(&metadata);
@@ -509,7 +632,12 @@ fn build_with_limits(
         let read = (&file).take(DEFAULT_MAX_FILE_BYTES).read_to_end(&mut bytes);
         response.input_bytes += bytes.len() as u64;
         if bytes.len() as u64 >= DEFAULT_MAX_FILE_BYTES || response.input_bytes > max_bytes {
-            response.limit_reason = Some("input_bytes");
+            walk_ended(
+                lexical::store::Limit::InputBytes,
+                trigram_full,
+                &mut response,
+                &mut walk_stop,
+            );
             break;
         }
         if read.is_err() {
@@ -523,7 +651,8 @@ fn build_with_limits(
         {
             continue;
         }
-        let trigrams = tgrep_core::trigram::extract_merged_masks(&bytes);
+        // Not extracted once that index is full: nothing would read them.
+        let trigrams = (!trigram_full).then(|| tgrep_core::trigram::extract_merged_masks(&bytes));
         let after = match file.metadata() {
             Ok(meta) => file_version(&meta),
             Err(_) => continue,
@@ -533,6 +662,7 @@ fn build_with_limits(
         }
         // Checked above: this byte slice is plain UTF-8 with no NUL and no
         // BOM, which is the same admission rule the trigram side applies.
+        let mut ranked = false;
         if let Ok(text) = std::str::from_utf8(&bytes)
             && !lexical.is_full()
         {
@@ -544,10 +674,7 @@ fn build_with_limits(
                 Some(encoded) => match encoded.documents.get(&path) {
                     Some((total_terms, weights)) => {
                         lexical_used += 1;
-                        if !lexical.add(path.clone(), *total_terms, weights) {
-                            response.lexical_limit_reason =
-                                lexical.limit().map(|limit| limit.as_str());
-                        }
+                        ranked = lexical.add(path.clone(), *total_terms, weights);
                     }
                     // Reached by the walk, absent from the encoding: the file
                     // is newer than the model run. It is searchable and simply
@@ -567,10 +694,7 @@ fn build_with_limits(
                     if whole {
                         let weights: Vec<(u32, f32)> =
                             lexical_terms.iter().map(|(id, tf)| (*id, *tf)).collect();
-                        if !lexical.add(path.clone(), total_terms, &weights) {
-                            response.lexical_limit_reason =
-                                lexical.limit().map(|limit| limit.as_str());
-                        }
+                        ranked = lexical.add(path.clone(), total_terms, &weights);
                     } else {
                         // The tokeniser stopped at its per-document ceiling, so
                         // this document's length is not its length. Ranking it
@@ -581,10 +705,26 @@ fn build_with_limits(
                 }
             }
         }
-        if response.postings.saturating_add(trigrams.len()) > max_postings {
-            response.limit_reason = Some("postings");
-            break;
-        }
+        // Outside the trigram index when it is full already, or when this file
+        // is the one that fills it. Ranked files still get their version
+        // stamped: `rank` calls a hit stale by comparing it, and a file with no
+        // stamp is one it cannot say anything about. `Candidates::open` keeps
+        // these stamps from the planner.
+        let trigrams = match trigrams {
+            Some(trigrams) if response.postings.saturating_add(trigrams.len()) <= max_postings => {
+                trigrams
+            }
+            overflow => {
+                if overflow.is_some() {
+                    response.limit_reason = Some("postings");
+                    trigram_full = true;
+                }
+                if ranked {
+                    evidence.insert_verified(path, before.stamp().clone(), None, Some(before));
+                }
+                continue;
+            }
+        };
         let file_id = u32::try_from(paths.len()).map_err(error)?;
         response.postings += trigrams.len();
         for (hash, masks) in trigrams {
@@ -624,9 +764,10 @@ fn build_with_limits(
     };
     response.lexical_files = lexical.documents();
     response.lexical_postings = lexical.postings();
-    if response.lexical_limit_reason.is_none() {
-        response.lexical_limit_reason = lexical.limit().map(|limit| limit.as_str());
-    }
+    // Written into the file, so `rank` reports what this build reports and the
+    // two cannot be read from different places.
+    lexical.record_walk(response.files_seen, walk_stop);
+    response.lexical_limit_reason = lexical.stopped_by().map(lexical::store::Limit::as_str);
     let rendered = lexical.finish();
     // Read back through the same validator a search will use, before anything
     // is published. A slot that fails to open later is a slot the searcher
@@ -873,6 +1014,7 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path, limit: u64) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{IndexRequest, MAX_INDEX_DURATION, build_with_limits};
+    use crate::lexical::store::MAX_POSTINGS as LEXICAL_POSTINGS;
 
     // The CACHE_SCHEMA/store::SCHEMA ordering was asserted here. It is a fact
     // about two constants, so it now sits beside them as a `const` assertion
@@ -902,7 +1044,7 @@ mod tests {
             (100, 0, MAX_INDEX_DURATION, "input_bytes"),
             (100, 100, Duration::ZERO, "duration"),
         ] {
-            let built = build_with_limits(&request, 100, postings, bytes, duration).unwrap();
+            let built = build_with_limits(&request, 100, postings, LEXICAL_POSTINGS, bytes, duration).unwrap();
             assert_eq!(built.files_indexed, 0);
             assert_eq!(built.limit_reason, Some(reason));
             assert!(!built.traversal_complete);
@@ -969,7 +1111,7 @@ mod tests {
             sparse: None,
         };
         // Room for roughly three files' trigrams, and nowhere near twelve.
-        let built = build_with_limits(&request, 100, 150, 1 << 20, MAX_INDEX_DURATION).unwrap();
+        let built = build_with_limits(&request, 100, 150, LEXICAL_POSTINGS, 1 << 20, MAX_INDEX_DURATION).unwrap();
         assert_eq!(built.limit_reason, Some("postings"), "{built:?}");
         assert!(
             built.files_indexed > 0 && built.files_indexed < 12,

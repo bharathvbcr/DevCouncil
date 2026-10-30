@@ -162,10 +162,26 @@ pub struct RankedResponse {
     pub vocabulary: String,
     /// Documents the ranking drew on.
     pub files_indexed: usize,
-    /// Postings in the index, so a caller can tell a ranking over a thin
-    /// index from one over a whole repository. An index truncated by its
-    /// posting ceiling ranks only the files that fit, and the count is the
-    /// only thing in the answer that says so.
+    /// Files the build that wrote this index reached, whether or not it could
+    /// index them. With `files_indexed` this is how much of the repository the
+    /// ranking covers, but read `complete` first: some files are never
+    /// indexable (binary, too large) and are not a shortfall.
+    pub files_seen: usize,
+    /// No ceiling stopped the build that wrote this index. `false` means the
+    /// ranking is over a prefix of the repository, and a file missing from it
+    /// may be missing because it was never read, not because nothing in it is
+    /// about the query. `lexical_limit_reason` says which ceiling.
+    ///
+    /// Always serialised, never omitted: a caller that cannot find this field
+    /// is talking to a build that predates it, and must read that as "not
+    /// known to be complete".
+    pub complete: bool,
+    /// The ceiling that ended the build, when one did. The same strings as
+    /// `IndexResponse::lexical_limit_reason`: `lexical_postings` for this
+    /// index's own, and `files`, `duration` or `input_bytes` for the walk's.
+    pub lexical_limit_reason: Option<&'static str>,
+    /// Postings in the index. A size, not a verdict: whether the index covers
+    /// the repository is `complete`.
     pub index_postings: usize,
     /// Query terms the index had never seen. Not an error — a word nothing
     /// contains simply scores nothing — but a query where this equals
@@ -372,6 +388,9 @@ pub fn ranked_search(request: &RankedRequest) -> Result<RankedResponse, String> 
         limit: truncated.then_some(limit),
         vocabulary: reader.vocabulary().to_string(),
         files_indexed: reader.files(),
+        files_seen: reader.files_seen(),
+        complete: reader.stopped_by().is_none(),
+        lexical_limit_reason: reader.stopped_by().map(store::Limit::as_str),
         index_postings: reader.postings_len(),
         terms_unknown,
         terms_total,
