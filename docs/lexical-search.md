@@ -73,6 +73,10 @@ repository is least likely to be in. And an aggregate is not a case: the
 vocabulary-mismatch query above still resolves the way it is described, with
 `src/lexical.rs` and `src/lexical/store.rs` first and "relevance" in neither.
 
+A measurement of the other half of that caveat — questions phrased the way a
+stranger asks, and a dense-embedding arm — is in
+[retrieval evaluation](devmap/design/retrieval-eval.md).
+
 So `code-v1` is the default because it measures better here, and the learned
 tier is worth its setup when queries are phrased in words the code does not
 use. Run the numbers on your own repository rather than inheriting these.

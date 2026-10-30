@@ -1,0 +1,12 @@
+{
+  "chunks": 60551,
+  "content_tokens": 11499950,
+  "dim": 384,
+  "encode_seconds": 1463.211873917,
+  "files": 2507,
+  "files_not_utf8_or_unreadable": 0,
+  "model": "sentence-transformers/all-MiniLM-L6-v2",
+  "stride": 192,
+  "vector_bytes": 93006336,
+  "window": 254
+}

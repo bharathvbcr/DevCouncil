@@ -4,7 +4,7 @@
 //!     rank-eval corpus  --root DIR --out corpus.txt
 //!     rank-eval commits --repo DIR --rev REV --corpus corpus.txt --corpus-root DIR --out q.jsonl
 //!     rank-eval dcgrep  --bin dcgrep --root DIR --queries q.jsonl --out run.jsonl
-//!     rank-eval fuse    --out run.jsonl [--k 60] a.jsonl b.jsonl
+//!     rank-eval fuse    --corpus corpus.txt --out run.jsonl [--k 60] a.jsonl b.jsonl
 //!     rank-eval score   --queries q.jsonl --corpus corpus.txt --baseline A --arm A=a.jsonl ...
 
 mod commits;
@@ -169,6 +169,18 @@ fn cmd_fuse(args: &Args) -> Result<(), String> {
     if args.positional.len() < 2 {
         return Err("fuse needs at least two run files".into());
     }
+    // Lists are filtered to the corpus (and exclusions) before fusing, so a
+    // file the scorer will never count cannot take a fusion rank.
+    let corpus_set: HashSet<String> = read_lines(Path::new(args.one("corpus")?))?
+        .into_iter()
+        .collect();
+    let excl_prefix = args.many("exclude-prefix");
+    let excl_suffix = args.many("exclude-suffix");
+    let filter = Filter {
+        corpus: &corpus_set,
+        exclude_prefixes: &excl_prefix,
+        exclude_suffixes: &excl_suffix,
+    };
     let inputs = args
         .positional
         .iter()
@@ -180,11 +192,17 @@ fn cmd_fuse(args: &Args) -> Result<(), String> {
             .iter()
             .map(|r| {
                 r.get(id)
-                    .map(Vec::as_slice)
+                    .map(|l| {
+                        l.iter()
+                            .filter(|p| filter.keeps(p))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
                     .ok_or_else(|| format!("run is missing id {id}"))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        rows.push((id.clone(), metrics::rrf(&lists, k)));
+        let refs: Vec<&[String]> = lists.iter().map(Vec::as_slice).collect();
+        rows.push((id.clone(), metrics::rrf(&refs, k)));
     }
     runs::write_run(Path::new(args.one("out")?), &rows)
 }
