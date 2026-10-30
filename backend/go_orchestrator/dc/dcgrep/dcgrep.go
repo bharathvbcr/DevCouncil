@@ -389,6 +389,14 @@ func validate(out any) error {
 			return fmt.Errorf("ranking drew on %d files but says its build saw %d",
 				reply.FilesIndexed, reply.FilesSeen)
 		}
+		// A file is a document or it was left out, never both, so the two counts
+		// cannot exceed what the walk saw. The searcher's own reader refuses the
+		// same thing. Written as a subtraction because the counts are untrusted
+		// and a sum of two large ones overflows.
+		if (reply.FilesSeen > 0 || reply.Complete) && reply.FilesIndexed > reply.FilesSeen-reply.LexicalUnindexed {
+			return fmt.Errorf("ranking drew on %d files and says it left out %d, from a build that saw %d",
+				reply.FilesIndexed, reply.LexicalUnindexed, reply.FilesSeen)
+		}
 		// A ceiling the client has never heard of is not one: it would be
 		// passed to a reader as an explanation, and an unknown string explains
 		// nothing about what the ranking is missing.
@@ -416,6 +424,10 @@ func validate(out any) error {
 		if reply.LexicalFiles > reply.FilesSeen {
 			return fmt.Errorf("index ranked %d files but its walk only saw %d",
 				reply.LexicalFiles, reply.FilesSeen)
+		}
+		if reply.LexicalFiles > reply.FilesSeen-reply.LexicalUnindexed {
+			return fmt.Errorf("index ranked %d files and left out %d, from a walk that saw %d",
+				reply.LexicalFiles, reply.LexicalUnindexed, reply.FilesSeen)
 		}
 		// More files ranked than trigram-indexed has exactly one cause: the
 		// trigram index filled while the ranked one carried on. Every file the

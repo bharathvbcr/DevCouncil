@@ -219,3 +219,40 @@ echo '{"ok":true,"engine":"tgrep-core","traversal_complete":false,
 		t.Fatalf("%+v", result)
 	}
 }
+
+// A file is a document or it was left out, never both. The searcher's reader
+// refuses a ranking whose two counts exceed what its walk saw, and the client
+// holds the same line for a report that did not come through that reader.
+func TestARankingWhoseDocumentsAndLeftOutFilesExceedWhatItSawIsRefused(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		// 1 drawn + 5 left out from a walk that saw 3.
+		{"sum over the walk", rankedOne + `,"files_seen":3,"complete":false,"lexical_unindexed":5`},
+		// The same, written so a naive sum would overflow.
+		{"counts that overflow a sum",
+			strings.Replace(rankedOne, `"files_indexed":1`, `"files_indexed":9223372036854775807`, 1) +
+				`,"files_seen":9223372036854775807,"complete":false,"lexical_unindexed":9223372036854775807`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := rankWith(t, "#!/bin/sh\necho '{"+tc.body+"}'\n")
+			if err == nil {
+				t.Fatalf("must be an error, got %+v", result)
+			}
+		})
+	}
+	// Exactly the walk is fine: 1 drawn + 2 left out from 3 seen.
+	if _, err := rankWith(t, "#!/bin/sh\necho '{"+rankedOne+
+		`,"files_seen":3,"complete":false,"lexical_unindexed":2}'`+"\n"); err != nil {
+		t.Fatalf("a ranking that accounts for exactly what it saw must be accepted: %v", err)
+	}
+}
+
+func TestAnIndexWhoseRankedFilesAndLeftOutFilesExceedItsWalkIsRefused(t *testing.T) {
+	result, err := indexWith(t, `#!/bin/sh
+echo '{"ok":true,"engine":"tgrep-core","traversal_complete":true,
+"files_seen":10,"files_indexed":8,"lexical_files":8,"lexical_unindexed":3,
+"lexical_vocabulary":"code-v1"}'
+`)
+	if err == nil {
+		t.Fatalf("8 ranked and 3 left out from 10 seen cannot be: %+v", result)
+	}
+}
