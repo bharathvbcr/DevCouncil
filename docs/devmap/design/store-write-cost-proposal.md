@@ -213,3 +213,41 @@ The digest did not cost the per-edit gain: median instructions per edit moved fr
 **Identity.** Re-run on the fixed branch (`fec0f386`) against the `dbd0193a` release. Sorted rows of the five compatibility views plus `generation_dead_symbols`, `generation_edges` and the `nodes_fts` join, for the latest and the previous generation, and normalised JSON of `status`, `dead`, `clones`, `search`, `search --semantic`, `explore`, `impact`, `literals` (substring and exact) for fixed symbols, at cold, one-file edit, second edit, revert, delete and full rebuild: three corpora (DevCouncil 1,893 files, GitPulse 3,071, `rust/testdata` 548), 1,782 answers compared (1,494 exact, 288 semantic), **0 exact answers differ**, `PRAGMA integrity_check` ok on all six stores, and `failed to parse` equal between arms (1, 0, 2). One semantic answer differs (DevCouncil, `searchsem.fixture` after the first edit), the same class as before: the semantic ranker sums over `HashMap`s in per-process order, so its answers are compared as the set of items scoring 0.5 or more, and, measured in the first prototype run and not repeated here, base against a second base run differs in 2 of 96. Fields dropped from the comparison, each because it names the arm and not the store: `db_path`, `root`, `pid`, `unix_ms`, `binary_path`, `binary_version`, `schema_version`, `expected_schema_version` and the artifact paths; floats rounded to three places.
 
 **Migration.** A real v27 store (427 MB, written by the base binary) opens under the branch and migrates (the first `build` takes 1.6-2.0 s against 0.12 s for a no-op build afterwards, so the rung costs about 1.5-1.9 s at this size), and the latest and previous generations then read what they read before. A `kill -9` that landed mid-migration (820 KB of uncommitted WAL) left user_version 27, integrity ok, no v28 table, and the base binary still answering from it; the retry completed and read identically. A v27 binary against a v28 store refuses on every query command and on `build` (`schema version 28 can be read only by a reader at schema 28 or newer`), and its `status` reports `reader_ready: false` and names the schema skew.
+
+## Appendix C: v29 prototype, zstd-compressed `extraction_json` (branch `lane/store-v29-zstd`, 2026-10-29)
+
+Status: a branch prototype stacked on the unmerged v28 prototype (`de318143`), not merged, not released. Schema 29, reader floor **29**. New dependency, approved by the owner: `zstd =0.14.0` (2026-09-04) with `default-features = false`, `zstd-safe 8.0.0`, `zstd-sys 2.1.0+zstd.1.5.7` (both pinned in `Cargo.lock` below their 2026-10-16 successors, which were under two weeks old), and the transitive additions `jobserver 0.1.35`, `getrandom 0.4.3`, `r-efi 6.0.0`.
+
+**What changes.** `file_payloads.extraction_json` holds one zstd frame (level 1, content checksum on, no dictionary) as a `BLOB` in the same `TEXT`-declared column; the `generation_files` view is untouched. `entry_wiring_json TEXT` is added beside it: the `RuntimeEntryPoint` wiring annotations, which `latest_test_entry_symbols` reads instead of running `json_extract` over a document SQL can no longer open. `NULL` means "not computed" and the reader decodes that one document; `'[]'` means "none". `payload_digest` still covers the JSON *text*, taken before compression, so payload identity and every digest a v28 store stamped are unchanged. A frame is refused, naming the path, when it does not decompress, declares no size, declares more than 64 MiB (thirty times the largest extraction measured here), or decodes to a size other than the one declared.
+
+**Migration.** One transaction. Each text payload is compressed, decompressed again and compared with its source, then written with its `entry_wiring_json`; any payload that cannot be converted refuses the store and leaves it at 28. The same pass runs on every writer open and converges a store left half converted. Real v28 store (1,896 payloads): 1.7 s (min of 3), 8.3 G instructions; 348.8 MB to 171.8 MB. All 1,896 documents decompress (independent `zstd` CLI) to the exact bytes v28 stored, digests equal, `integrity_check` ok.
+
+**Level.** Over the 1,896 stored documents (200.6 MB), per-document frames with checksum, min of 5, one process:
+
+| level | ratio | compress | decompress |
+|---|---|---|---|
+| 1 | 11.17x | 130 ms | 58 ms |
+| 2 | 11.09x | 140 ms | 57 ms |
+| 3 | 11.03x | 144 ms | 56 ms |
+| 5 | 11.76x | 437 ms | 56 ms |
+| 9 | 13.29x | 886 ms | 50 ms |
+
+Level 1.
+
+**Interleaved A/B.** Release builds of `de318143` (v28) and of this branch; one `git archive` snapshot of `de318143` copied per arm; ABBA order, N=5 each; instructions retired from `/usr/bin/time -l` (the Mac was shared with other sessions, so wall time is reported but not relied on: paired wall differences ranged -2.2 s to +2.9 s and changed sign).
+
+| measure | v28 | v29 | instructions retired, v29 vs v28 (paired reps) |
+|---|---|---|---|
+| store after `build --full` | 348.8 MB | 166.8 MB (-52%) | |
+| `file_payloads` | 205.4 MB | 23.4 MB | |
+| `build --full` cold, min wall | 4.70 s | 4.93 s | -0.3% (4 of 5 negative) |
+| `build --full` over an existing store | 3.44 s | 4.30 s | +0.5% to +0.6% (5 of 5 positive) |
+| one-file edit, `build` | 1.32 s | 1.36 s | +1.0% (5 of 5 positive) |
+| `devmap affected` (the `affected_tests` path) | 0.27 s | 0.08 s | -74.7% (5 of 5) |
+| `latest_test_entry_symbols`, in process | 188.5 ms | 2.8 ms | -98.5% |
+| `latest_extractions`, in process | 259.1 ms | 272.0 ms | +5.0% (process +13.8% instr, 5 of 5) |
+| `latest_extraction_for_path`, in process | 0.48 ms | 0.58 ms | |
+
+The `--full` and incremental increments are, by inference (not isolated by a separate run), the compression of documents that turn out to be reused (the digest decides that on the writing thread, after the serializer threads have compressed) and, on the incremental build, the decompression of the ~1,895 cached payloads on the rayon pool, outside the connection mutex. Neither moves wall time past the noise. v28's write-cost win is intact.
+
+**Answers.** Node, edge, literal and unresolved counts identical (25,487 / 97,282 / 172,483 / 272,559); sorted-normalised `dead --json`, `impact` on three symbols and `affected` on three targets identical between arms.

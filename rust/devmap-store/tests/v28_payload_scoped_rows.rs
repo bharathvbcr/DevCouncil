@@ -414,10 +414,8 @@ fn a_v28_store_records_a_reader_floor_of_28() {
         i64::from(MIN_READER_SCHEMA_VERSION),
         "the writer records the floor of the schema it stamps"
     );
-    assert!(
-        MIN_READER_SCHEMA_VERSION >= 28,
-        "no later floor may readmit a v27 reader"
-    );
+    // No later floor may readmit a v27 reader.
+    const _: () = assert!(MIN_READER_SCHEMA_VERSION >= 28);
     let _ = fs::remove_dir_all(&dir);
 }
 
