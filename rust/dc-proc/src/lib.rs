@@ -606,7 +606,12 @@ fn probe_repository_config(git: &Resolved, root: &Path) -> Result<RepositoryConf
 /// time or inode.
 #[derive(Default)]
 struct ConfigScope {
-    entries: std::collections::HashMap<(PathBuf, PathBuf), (ConfigStamp, RepositoryConfig)>,
+    /// Keyed by the file, the name it runs under, and the repository: the
+    /// same file under two names can be two programs (a multiplexer shim).
+    entries: std::collections::HashMap<
+        (PathBuf, std::ffi::OsString, PathBuf),
+        (ConfigStamp, RepositoryConfig),
+    >,
 }
 
 /// Entries one scope keeps; an operation reading more roots than this reads
@@ -671,9 +676,13 @@ fn config_stamp(root: &Path) -> Option<(PathBuf, ConfigStamp)> {
 fn repository_config(git: &Resolved, root: &Path) -> Result<RepositoryConfig, Failure> {
     let scoped = CONFIG_SCOPE.with(|scope| scope.borrow().is_some());
     let stamp = if scoped { config_stamp(root) } else { None };
-    let key = stamp
-        .as_ref()
-        .map(|(top, _)| (git.path().to_path_buf(), top.clone()));
+    let key = stamp.as_ref().map(|(top, _)| {
+        (
+            git.path().to_path_buf(),
+            git.name().to_os_string(),
+            top.clone(),
+        )
+    });
     if let (Some(key), Some((_, stamp))) = (&key, &stamp) {
         let hit = CONFIG_SCOPE.with(|scope| {
             scope
@@ -1441,11 +1450,15 @@ impl SessionStdin {
 
 impl std::io::Write for SessionStdin {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        sigpipe::as_error(|| std::io::Write::write(&mut self.inner, buf))
+        let asked = buf.len();
+        sigpipe::as_error(
+            || std::io::Write::write(&mut self.inner, buf),
+            |written| *written < asked,
+        )
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        sigpipe::as_error(|| std::io::Write::flush(&mut self.inner))
+        sigpipe::as_error(|| std::io::Write::flush(&mut self.inner), |()| false)
     }
 }
 
@@ -1478,13 +1491,23 @@ mod sigpipe {
 
     /// macOS: the descriptor flag already did the work.
     #[cfg(target_os = "macos")]
-    pub(super) fn as_error<R>(write: impl FnOnce() -> io::Result<R>) -> io::Result<R> {
+    pub(super) fn as_error<R>(
+        write: impl FnOnce() -> io::Result<R>,
+        _cut_short: impl FnOnce(&R) -> bool,
+    ) -> io::Result<R> {
         write()
     }
 
     /// Other Unix: `SIGPIPE` is the writing thread's. Block it for the write;
     /// if the write failed because the reader is gone the signal is pending,
     /// and unblocking it would deliver it, so take it first.
+    ///
+    /// A write raises the signal when the reader is gone, and has two ways to
+    /// say so: `Err(BrokenPipe)`, or, when the reader goes while the write is
+    /// blocked with part of the buffer accepted, `Ok` of the shorter count
+    /// (Linux's `pipe_write` raises the signal and returns the partial count).
+    /// `cut_short` says whether an `Ok` is that second shape; both leave the
+    /// signal pending, and unblocking would deliver it.
     ///
     /// Only a signal this write raised is taken. `sigpending` also reports a
     /// process-directed `SIGPIPE` that was already waiting (someone ran
@@ -1493,14 +1516,17 @@ mod sigpipe {
     /// that was already there is left alone. The mask is put back by a guard on
     /// every path out, including a panic in the write.
     ///
-    /// Not run on Linux from the macOS machine this was written on; it is
-    /// type-checked for `x86_64-unknown-linux-gnu`.
+    /// Run on Linux aarch64 in a container (see the `review_ccf_linux_sigpipe`
+    /// and `attack_ccf_session_stdin` tests), not on the x86_64 CI runner.
     #[cfg(all(unix, not(target_os = "macos")))]
     #[allow(
         unsafe_code,
         reason = "pthread_sigmask, sigpending and sigtimedwait on this thread's own mask"
     )]
-    pub(super) fn as_error<R>(write: impl FnOnce() -> io::Result<R>) -> io::Result<R> {
+    pub(super) fn as_error<R>(
+        write: impl FnOnce() -> io::Result<R>,
+        cut_short: impl FnOnce(&R) -> bool,
+    ) -> io::Result<R> {
         /// Puts the thread's signal mask back when dropped.
         struct Restore(libc::sigset_t);
         impl Drop for Restore {
@@ -1538,10 +1564,11 @@ mod sigpipe {
             let _restore = Restore(before);
             let waiting_before = sigpipe_is_pending();
             let result = write();
-            if !waiting_before
-                && matches!(&result, Err(error) if error.kind() == io::ErrorKind::BrokenPipe)
-                && sigpipe_is_pending()
-            {
+            let may_have_raised = match &result {
+                Err(error) => error.kind() == io::ErrorKind::BrokenPipe,
+                Ok(written) => cut_short(written),
+            };
+            if !waiting_before && may_have_raised && sigpipe_is_pending() {
                 let now = libc::timespec {
                     tv_sec: 0,
                     tv_nsec: 0,
@@ -1553,7 +1580,10 @@ mod sigpipe {
     }
 
     #[cfg(not(unix))]
-    pub(super) fn as_error<R>(write: impl FnOnce() -> io::Result<R>) -> io::Result<R> {
+    pub(super) fn as_error<R>(
+        write: impl FnOnce() -> io::Result<R>,
+        _cut_short: impl FnOnce(&R) -> bool,
+    ) -> io::Result<R> {
         write()
     }
 }
