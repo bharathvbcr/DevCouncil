@@ -135,6 +135,36 @@ fn a_file_over_the_read_bound_is_counted() {
     assert_eq!(ranked["complete"], false, "{ranked}");
 }
 
+/// A large binary asset is not text the ranking should hold, so it is no
+/// shortfall: a repository with a 2 MiB PNG can still be `complete`.
+#[test]
+fn an_oversized_binary_file_is_not_a_shortfall() {
+    let repo = Repo::new();
+    repo.write("a.rs", "fn visible_alpaca() {}\n");
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0];
+    png.resize(3 * 1024 * 1024, 7);
+    repo.write("logo.png", png);
+    let (built, ranked) = repo.built_and_ranked("visible_alpaca");
+    assert_eq!(built["lexical_unindexed"], 0, "{built}");
+    assert_eq!(ranked["files_seen"], 2, "{ranked}");
+    assert_eq!(ranked["lexical_unindexed"], 0, "{ranked}");
+    assert_eq!(ranked["complete"], true, "{ranked}");
+}
+
+/// Oversized text is the shortfall; the binary beside it is not.
+#[test]
+fn an_oversized_text_file_beside_an_oversized_binary_counts_once() {
+    let repo = Repo::new();
+    repo.write("a.rs", "fn visible_alpaca() {}\n");
+    repo.write("big.txt", "word ".repeat(700_000));
+    let mut blob = vec![0u8; 3 * 1024 * 1024];
+    blob[10] = 255;
+    repo.write("blob.bin", blob);
+    let (built, ranked) = repo.built_and_ranked("visible_alpaca");
+    assert_eq!(built["lexical_unindexed"], 1, "{built}");
+    assert_eq!(ranked["complete"], false, "{ranked}");
+}
+
 #[test]
 fn a_file_over_the_term_cap_is_counted() {
     let repo = Repo::new();

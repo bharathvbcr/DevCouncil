@@ -154,7 +154,7 @@ pub struct IndexResponse {
     pub lexical_postings: usize,
     /// Files the walk reached that are text this engine admits and that no
     /// document in the ranked index stands for: not openable, not readable, over
-    /// the read bound, changed while being read, a name that is not UTF-8, a
+    /// the read bound and text by its first 8 KiB, changed while being read, a name that is not UTF-8, a
     /// document tokenised only in part (which would rank by a length it does not
     /// have, so it is counted rather than indexed short), or — with an imported
     /// encoding — a file the encoding did not describe. Binary and non-UTF-8
@@ -451,6 +451,39 @@ pub fn build_index(request: &IndexRequest) -> Result<IndexResponse, String> {
     )
 }
 
+/// How much of an oversized file is read to tell text from a binary asset.
+const OVERSIZED_PROBE_BYTES: u64 = 8 * 1024;
+
+/// The admission rule for text: no NUL byte, no byte-order mark, valid UTF-8.
+/// The one owner of it, applied to a whole file on the admitted path and to a
+/// prefix of an oversized one (`truncated`), where a character cut off by the
+/// end of the prefix is not evidence of anything.
+fn is_admitted_text(bytes: &[u8], truncated: bool) -> bool {
+    if bytes.contains(&0) || bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+        return false;
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(_) => true,
+        // Only a cut inside a multi-byte character is forgiven, and only when
+        // the bytes are a prefix: the rest of that character is past the cut.
+        Err(err) => truncated && err.error_len().is_none(),
+    }
+}
+
+/// Whether an oversized file is text this engine would have admitted had it
+/// been small enough, judged by its first `OVERSIZED_PROBE_BYTES`.
+///
+/// A file that cannot be probed counts as text: leaving it out of a ranking is
+/// then reported as a shortfall, which is the safe direction, instead of being
+/// assumed to be a binary asset nobody wanted ranked.
+fn oversized_is_text(file: &File) -> bool {
+    let mut prefix = Vec::new();
+    match file.take(OVERSIZED_PROBE_BYTES).read_to_end(&mut prefix) {
+        Ok(_) => is_admitted_text(&prefix, true),
+        Err(_) => true,
+    }
+}
+
 /// Records that the walk ended, and what ended it.
 ///
 /// The ceiling is the trigram index's own too unless that index already filled
@@ -640,8 +673,19 @@ fn build_with_limits(
             Ok(metadata) if metadata.is_file() && metadata.len() < DEFAULT_MAX_FILE_BYTES => {
                 metadata
             }
+            Ok(metadata) if metadata.is_file() => {
+                // Over the read bound, so in neither index, as before. The one
+                // question left is whether that leaves the ranking short of
+                // text it should hold, and a large binary asset does not: it
+                // is judged by its first bytes through the same rule the
+                // admitted path applies.
+                if oversized_is_text(&file) {
+                    response.lexical_unindexed += 1;
+                }
+                continue;
+            }
             _ => {
-                // Over the read bound, no longer a regular file, or no metadata.
+                // No longer a regular file, or no metadata.
                 response.lexical_unindexed += 1;
                 continue;
             }
@@ -682,10 +726,7 @@ fn build_with_limits(
         // every binary file would make `complete` unreachable. (A UTF-8 byte
         // order mark is caught here too, though it is text; that is a gap in
         // the admission rule, and `complete` is documented as relative to it.)
-        if bytes.contains(&0)
-            || bytes.starts_with(&[0xef, 0xbb, 0xbf])
-            || std::str::from_utf8(&bytes).is_err()
-        {
+        if !is_admitted_text(&bytes, false) {
             continue;
         }
         // The file ceiling is checked where a file would be admitted, not for
@@ -1428,6 +1469,54 @@ mod tests {
         assert_eq!(built.limit_reason, Some("postings"), "{built:?}");
         assert_eq!(built.lexical_limit_reason, Some("files"), "{built:?}");
         assert_eq!(built.lexical_files, 6, "{built:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_admission_rule_forgives_only_a_character_cut_by_a_prefix() {
+        use super::is_admitted_text;
+        assert!(is_admitted_text(b"fn main() {}\n", false));
+        assert!(!is_admitted_text(b"has a \0 nul", false));
+        assert!(!is_admitted_text(b"\xef\xbb\xbfbom", false));
+        assert!(!is_admitted_text(&[b'c', 0xe9, b' '], false), "latin-1");
+        // "é" is 0xc3 0xa9. Cut after the first byte it is a prefix of text; as
+        // a whole file it is not valid.
+        assert!(is_admitted_text(&[b'c', b'a', b'f', 0xc3], true));
+        assert!(!is_admitted_text(&[b'c', b'a', b'f', 0xc3], false));
+        // A bad byte in the middle of a prefix is bad whatever the cut.
+        assert!(!is_admitted_text(&[b'c', 0xe9, b' ', b'x'], true));
+    }
+
+    /// An oversized file is judged by its first bytes, and one that cannot be
+    /// read at all is treated as text so the ranking reports a shortfall.
+    #[test]
+    fn an_oversized_file_is_classified_by_its_prefix_and_fails_closed() {
+        use super::oversized_is_text;
+        let root = scratch("oversized-prefix");
+        let text = root.join("big.txt");
+        fs::write(&text, "word ".repeat(4_000)).unwrap();
+        assert!(oversized_is_text(&fs::File::open(&text).unwrap()));
+
+        let binary = root.join("big.bin");
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0, 0, 0];
+        bytes.extend(std::iter::repeat_n(b'x', 20_000));
+        fs::write(&binary, bytes).unwrap();
+        assert!(!oversized_is_text(&fs::File::open(&binary).unwrap()));
+
+        // Text whose first 8 KiB ends inside a multi-byte character is text.
+        let cut = root.join("cut.txt");
+        let mut bytes = "a".repeat(8 * 1024 - 1).into_bytes();
+        bytes.extend("é".as_bytes());
+        bytes.extend(std::iter::repeat_n(b'x', 20_000));
+        fs::write(&cut, bytes).unwrap();
+        assert!(oversized_is_text(&fs::File::open(&cut).unwrap()));
+
+        // A descriptor that opens and cannot be read: a directory.
+        let unreadable = fs::File::open(&root).unwrap();
+        assert!(
+            oversized_is_text(&unreadable),
+            "an unreadable prefix must count as a shortfall"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

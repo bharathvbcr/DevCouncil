@@ -193,7 +193,7 @@ pub struct RankedResponse {
     /// one is absent from this ranking and from every count above.
     pub walk_errors: usize,
     /// Files the build reached that are admissible text and are not in this
-    /// ranking: unreadable, over the read bound, changed while being read, over
+    /// ranking: unreadable, over the read bound and text by its first 8 KiB, changed while being read, over
     /// the per-document term cap, or missing from an imported encoding.
     pub lexical_unindexed: usize,
     /// Postings in the index. A size, not a verdict: whether the index covers

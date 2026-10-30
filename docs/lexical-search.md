@@ -223,7 +223,8 @@ is what ran out.
 `lexical_unindexed` is the other direction: files the walk reached that are
 text this engine admits and that no document in the ranked index stands for.
 It counts a file that could not be opened or read, a file over the 2 MiB read
-bound, a file that changed while it was being read, a file over the
+bound whose first 8 KiB reads as text (a large binary asset is not counted),
+a file that changed while it was being read, a file over the
 20,000-term per-document cap, a file whose name is not UTF-8, and — with an
 imported encoding — a file the encoding did not describe (in the example, 58
 files whose extensions the producer does not encode). They remain fully
@@ -535,7 +536,7 @@ files, bytes read, time — end both.
 | Files in one index build | 50,000, or the request's `max_files` | `limit_reason` and `lexical_limit_reason: "files"` |
 | Bytes read by one index build | 128 MiB | `limit_reason` and `lexical_limit_reason: "input_bytes"` |
 | Wall time of one index build | 30 s | `limit_reason` and `lexical_limit_reason: "duration"` |
-| One file read by the index | 2 MiB | counted in `files_unindexed` and `lexical_unindexed`, which makes `complete` false; the matcher still reads it |
+| One file read by the index | 2 MiB | counted in `files_unindexed`; if its first 8 KiB reads as text it is also counted in `lexical_unindexed`, which makes `complete` false (a binary asset is not); the matcher still reads it |
 | Postings in one ranked index | 4,000,000 | `lexical_limit_reason: "lexical_postings"` |
 | Bytes in `lexical.bin` | 64 MiB, counted exactly while building | `lexical_limit_reason: "lexical_bytes"`; the document that would cross it is left out whole |
 | Postings read from one encoding | 32,000,000 | build refused |
