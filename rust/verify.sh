@@ -263,11 +263,11 @@ GENS=$(sqlite3 "$GROWTH_DB" "SELECT COUNT(*) FROM generations")
 # doubled per-generation storage would plateau just as flatly, one gate short of
 # being caught.
 GROWTH_FILES=$(sqlite3 "$GROWTH_DB" "SELECT COUNT(*) FROM generation_files WHERE generation_id = (SELECT max(id) FROM generations)")
-RETAINED=$(grep -oE 'DB_SIZE_GATE_RETAINED_GENERATIONS: u64 = [0-9]+' \
+STEADY_PER_FILE_KIB=$(grep -oE 'DB_SIZE_GATE_STEADY_PER_FILE: u64 = [0-9]+' \
   devmap-extract/src/model.rs | grep -oE '[0-9]+$')
-[ -n "$RETAINED" ] || { echo "GATE FAIL: cannot read DB_SIZE_GATE_RETAINED_GENERATIONS"; exit 1; }
+[ -n "$STEADY_PER_FILE_KIB" ] || { echo "GATE FAIL: cannot read DB_SIZE_GATE_STEADY_PER_FILE"; exit 1; }
 STEADY_GATE=$(( 60*1024*1024 ))
-STEADY_SCALED=$(( GROWTH_FILES * PER_FILE_KIB * 1024 * RETAINED ))
+STEADY_SCALED=$(( GROWTH_FILES * STEADY_PER_FILE_KIB * 1024 ))
 if [ "$STEADY_SCALED" -gt "$STEADY_GATE" ]; then STEADY_GATE=$STEADY_SCALED; fi
 echo "growth bytes:$SIZES generations retained: $GENS (steady gate $((STEADY_GATE/1024/1024)) MiB for $GROWTH_FILES files)"
 [ "$S5" -lt "$STEADY_GATE" ] || {

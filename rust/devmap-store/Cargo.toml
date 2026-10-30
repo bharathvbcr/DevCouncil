@@ -144,3 +144,9 @@ required-features = ["parse"]
 [[test]]
 name = "v29_compressed_extractions"
 required-features = ["parse"]
+
+# v29's size and hot-path claims, stated through raw SQL; extracts this crate's
+# own sources, so it needs the grammars.
+[[test]]
+name = "v29_size_and_hot_path"
+required-features = ["parse"]
