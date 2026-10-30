@@ -578,7 +578,7 @@ fn status_reason(db: &Path) -> Option<String> {
         .status(&db.to_string_lossy())
         .unwrap()
         .degraded_reason
-        .filter(|reason| reason.contains("not in the schema-29 form"))
+        .filter(|reason| reason.contains("schema-29 form"))
 }
 
 /// **A heal that could not convert says so.** A writer open that meets a payload
@@ -613,7 +613,7 @@ fn an_open_that_could_not_convert_a_payload_says_so_in_status_and_stays_usable()
         .status(&db.to_string_lossy())
         .unwrap()
         .degraded_reason
-        .filter(|reason| reason.contains("not in the schema-29 form"))
+        .filter(|reason| reason.contains("schema-29 form"))
         .expect("the open could not convert it, and the store says so");
     assert!(after.contains("checks.py"), "{after}");
     assert_eq!(
@@ -632,8 +632,8 @@ fn an_open_that_could_not_convert_a_payload_says_so_in_status_and_stays_usable()
         .contains("checks.py"));
     drop(store);
 
-    // Replacing it with a document that decodes clears the report on the next
-    // writer open: the status is the store's state, not a memory of an open.
+    // Replacing it with a document that decodes clears the report: the status
+    // is the store's state, not a memory of an open.
     let honest = serde_json::to_string(&extract_file("checks.py", &sources()[1].1)).unwrap();
     Connection::open(&db)
         .unwrap()
@@ -643,11 +643,56 @@ fn an_open_that_could_not_convert_a_payload_says_so_in_status_and_stays_usable()
             params![honest],
         )
         .unwrap();
-    assert!(
-        status_reason(&db).is_some(),
-        "still text until a writer opens it"
+    assert_eq!(
+        status_reason(&db),
+        None,
+        "a readable text document is not a fault, and is converted by the next writer"
     );
     drop(Store::open(&db).unwrap());
     assert_eq!(status_reason(&db), None);
+    assert_eq!(
+        one::<i64>(
+            &db,
+            "SELECT COUNT(*) FROM file_payloads WHERE typeof(extraction_json) <> 'blob'"
+        ),
+        0
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Status examines a bounded number of unconverted payloads and says so when it
+/// did not reach the rest: "not examined" is never reported as "fine". 70
+/// readable text documents beside the real ones are unconverted but not faults,
+/// and more than a status will examine.
+#[test]
+fn status_does_not_read_unexamined_unconverted_payloads_as_clean() {
+    let (dir, db) = written_store("heal-cap");
+    {
+        let conn = Connection::open(&db).unwrap();
+        for index in 0..70 {
+            conn.execute(
+                "INSERT INTO paths (id, path) VALUES (?1, ?2)",
+                params![1000 + index, format!("extra/f{index}.py")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_payloads
+                   (file_id, content_hash, language, grammar_version, analyzer_version,
+                    parse_outcome_json, engine_json, extraction_json)
+                 VALUES (?1, ?1, 'python', 'g', 'a', '\"Clean\"', '\"TreeSitter\"', '{}')",
+                params![1000 + index],
+            )
+            .unwrap();
+        }
+    }
+    let reason = status_reason(&db).expect("70 unconverted payloads cannot be certified");
+    assert!(reason.contains("not examined"), "{reason}");
+    assert!(reason.contains("first 64"), "{reason}");
+    assert!(
+        !reason.contains("cannot be converted"),
+        "none of the examined ones is unreadable: {reason}"
+    );
+    drop(Store::open(&db).unwrap());
+    assert_eq!(status_reason(&db), None, "a writer converts them all");
     let _ = fs::remove_dir_all(&dir);
 }

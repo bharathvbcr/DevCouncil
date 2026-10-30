@@ -1251,19 +1251,28 @@ generation {latest}; run `devmap status` to re-verify",
         })
     }
 
-    /// Which stored extractions are not in the schema-29 form, by path, or
-    /// `None` when every one is.
+    /// How many unconverted payloads one status examines. Each examination
+    /// decodes a document, and a healthy store has none to examine.
+    const ENCODING_EXAMINED: usize = 64;
+
+    /// The stored extractions a writer open could not convert, by path, or
+    /// `None` when there are none.
     ///
     /// A writer open converts what it can and leaves the rest as it found it
     /// ([`Store::heal_extraction_encoding`]), and a reader refuses such a row by
     /// name when it reaches it. Neither says so at open, and a store that opened
     /// cleanly with one unreadable payload looked exactly like one with none, so
-    /// status reports it: the same probe the heal selects with, asked again, so
-    /// it also describes a store only ever opened read-only. A sample of paths,
-    /// and labelled as one, with the true total beside it.
+    /// status reports it. It asks the store rather than remembering the open, so
+    /// it also describes a store only ever opened read-only, by running the
+    /// heal's own test on the rows the heal would pick: a row not yet converted
+    /// but readable (a foreign writer's text document) is not a fault and is not
+    /// reported; one that does not decode is. At most
+    /// [`Self::ENCODING_EXAMINED`] rows are examined, and when more remain the
+    /// reason says so instead of reading the rest as clean.
     fn payload_encoding_reason_locked(
         snapshot: &rusqlite::Transaction<'_>,
     ) -> Result<Option<String>> {
+        use crate::payload_codec::{decode_value, entry_wiring_of_document};
         let total: i64 = snapshot.query_row(
             "SELECT COUNT(*) FROM file_payloads
               WHERE typeof(extraction_json) <> 'blob' OR entry_wiring_json IS NULL",
@@ -1273,31 +1282,60 @@ generation {latest}; run `devmap status` to re-verify",
         if total == 0 {
             return Ok(None);
         }
-        let paths: Vec<String> = {
-            let mut stmt = snapshot.prepare(
-                "SELECT pa.path FROM file_payloads fp JOIN paths pa ON pa.id = fp.file_id
-                  WHERE typeof(fp.extraction_json) <> 'blob' OR fp.entry_wiring_json IS NULL
-                  ORDER BY fp.payload_id LIMIT ?1",
-            )?;
-            let rows = stmt
-                .query_map(params![Self::DEGRADED_SAMPLE as i64], |row| row.get(0))?
-                .collect::<Result<Vec<_>>>()?;
-            rows
-        };
-        let elided = usize::try_from(total)
+        let mut stmt = snapshot.prepare(
+            "SELECT pa.path, fp.extraction_json
+               FROM file_payloads fp JOIN paths pa ON pa.id = fp.file_id
+              WHERE typeof(fp.extraction_json) <> 'blob' OR fp.entry_wiring_json IS NULL
+              ORDER BY fp.payload_id LIMIT ?1",
+        )?;
+        let examined = stmt
+            .query_map(params![Self::ENCODING_EXAMINED as i64], |row| {
+                let path: String = row.get(0)?;
+                let verdict = decode_value(row.get_ref(1)?, &path)
+                    .and_then(|json| entry_wiring_of_document(&json, &path))
+                    .is_ok();
+                Ok((path, verdict))
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        let failed: Vec<&str> = examined
+            .iter()
+            .filter(|(_, convertible)| !convertible)
+            .map(|(path, _)| path.as_str())
+            .collect();
+        let unexamined = usize::try_from(total)
             .unwrap_or(usize::MAX)
-            .saturating_sub(paths.len());
-        let more = if elided > 0 {
-            format!(", and {elided} more")
-        } else {
-            String::new()
-        };
-        Ok(Some(format!(
-            "{total} stored extraction(s) are not in the schema-29 form (compressed, with entry \
-             wiring): {}{more}; a writer open converts what it can, and a payload it cannot is \
-             refused by name when read -- `dev map doctor --fix` quarantines the store and rebuilds it",
-            paths.join(", ")
-        )))
+            .saturating_sub(examined.len());
+        if failed.is_empty() && unexamined == 0 {
+            return Ok(None);
+        }
+        let mut reason = String::new();
+        if !failed.is_empty() {
+            let shown: Vec<&str> = failed.iter().copied().take(Self::DEGRADED_SAMPLE).collect();
+            let more = failed.len().saturating_sub(shown.len());
+            reason.push_str(&format!(
+                "{} stored extraction(s) cannot be converted to the schema-29 form (compressed, \
+                 with entry wiring): {}{}; they are refused by name when read",
+                failed.len(),
+                shown.join(", "),
+                if more > 0 {
+                    format!(", and {more} more")
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        if unexamined > 0 {
+            if !reason.is_empty() {
+                reason.push_str("; ");
+            }
+            reason.push_str(&format!(
+                "{unexamined} more extraction(s) are not in the schema-29 form and were not \
+                 examined (the first {} were), so they are not known to be readable",
+                examined.len()
+            ));
+        }
+        reason.push_str(" -- `dev map doctor --fix` quarantines the store and rebuilds it");
+        Ok(Some(reason))
     }
 
     /// The latest generation's coverage-gap inventory, capped per kind.
