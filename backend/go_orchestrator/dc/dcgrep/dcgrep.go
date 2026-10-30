@@ -389,6 +389,12 @@ func validate(out any) error {
 			return fmt.Errorf("ranking drew on %d files but says its build saw %d",
 				reply.FilesIndexed, reply.FilesSeen)
 		}
+		// A ceiling the client has never heard of is not one: it would be
+		// passed to a reader as an explanation, and an unknown string explains
+		// nothing about what the ranking is missing.
+		if err := knownLimit(rankedLimitReasons, "lexical_limit_reason", reply.LexicalLimitReason); err != nil {
+			return err
+		}
 		// Complete and stopped by a ceiling cannot both be true.
 		if reply.Complete && reply.LexicalLimitReason != "" {
 			return fmt.Errorf("ranking claims a complete index and names limit %q",
@@ -436,6 +442,12 @@ func validate(out any) error {
 			return fmt.Errorf("index claims a complete traversal and names limit %q",
 				reply.LimitReason)
 		}
+		if err := knownLimit(trigramLimitReasons, "limit_reason", reply.LimitReason); err != nil {
+			return err
+		}
+		if err := knownLimit(rankedLimitReasons, "lexical_limit_reason", reply.LexicalLimitReason); err != nil {
+			return err
+		}
 		for name, count := range map[string]int{
 			"files_seen":        reply.FilesSeen,
 			"files_indexed":     reply.FilesIndexed,
@@ -468,6 +480,32 @@ func validate(out any) error {
 	default:
 		return errors.New("the client validated a reply shape it does not know")
 	}
+}
+
+// The ceilings the searcher can name, as closed sets. Empty is "none" and is
+// always allowed; anything else must be one of these, so a limit the client does
+// not know is refused rather than rendered as if it explained something.
+//
+// The ranked index's own are lexical_postings and lexical_bytes; the walk's are
+// shared by both indexes and spelled the same in both fields. The trigram index
+// has the one of its own, postings. A new ceiling is a new entry here and in the
+// searcher at once, which is the point of closing the set.
+var (
+	rankedLimitReasons = map[string]bool{
+		"lexical_postings": true, "lexical_bytes": true,
+		"files": true, "duration": true, "input_bytes": true,
+	}
+	trigramLimitReasons = map[string]bool{
+		"postings": true,
+		"files":    true, "duration": true, "input_bytes": true,
+	}
+)
+
+func knownLimit(known map[string]bool, field, reason string) error {
+	if reason == "" || known[reason] {
+		return nil
+	}
+	return fmt.Errorf("searcher named %s %q, which is not a ceiling this client knows", field, reason)
 }
 
 // validPath refuses anything that is not a repository-relative file path.

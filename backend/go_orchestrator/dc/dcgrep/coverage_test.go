@@ -171,3 +171,51 @@ func TestAnIncompleteRankingWithNoCeilingStillNamesWhatIsMissing(t *testing.T) {
 		t.Fatalf("a named shortfall is not an unknown one: %q", note)
 	}
 }
+
+func TestEveryCeilingTheSearcherCanNameIsAccepted(t *testing.T) {
+	for _, reason := range []string{"lexical_postings", "lexical_bytes", "files", "duration", "input_bytes"} {
+		t.Run("rank "+reason, func(t *testing.T) {
+			result, err := rankWith(t, "#!/bin/sh\necho '{"+rankedOne+
+				`,"files_seen":5,"complete":false,"lexical_limit_reason":"`+reason+`"}'`+"\n")
+			if err != nil {
+				t.Fatalf("a ceiling the searcher names must be accepted: %v", err)
+			}
+			if !strings.Contains(result.Partial(), reason) {
+				t.Fatalf("the note must name the ceiling: %q", result.Partial())
+			}
+		})
+	}
+}
+
+func TestAnIndexNamingACeilingTheClientDoesNotKnowIsRefused(t *testing.T) {
+	for _, tc := range []struct{ name, fields string }{
+		{"unknown trigram reason", `"traversal_complete":false,"limit_reason":"bogus"`},
+		// A reason of the ranked index's own cannot be the trigram index's.
+		{"ranked reason in the trigram field", `"traversal_complete":false,"limit_reason":"lexical_bytes"`},
+		{"unknown ranked reason", `"traversal_complete":true,"lexical_limit_reason":"bogus"`},
+		// And the reverse: postings is the trigram index's ceiling alone.
+		{"trigram reason in the ranked field", `"traversal_complete":true,"lexical_limit_reason":"postings"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := indexWith(t, "#!/bin/sh\necho '{\"ok\":true,\"engine\":\"tgrep-core\","+
+				tc.fields+`,"files_seen":3,"files_indexed":3,"lexical_files":3,"lexical_vocabulary":"code-v1"}'`+"\n")
+			if err == nil {
+				t.Fatalf("must be an error, got %+v", result)
+			}
+		})
+	}
+}
+
+func TestAnIndexNamingBothRealCeilingsIsAccepted(t *testing.T) {
+	result, err := indexWith(t, `#!/bin/sh
+echo '{"ok":true,"engine":"tgrep-core","traversal_complete":false,
+"limit_reason":"postings","files_seen":9,"files_indexed":4,"lexical_files":6,
+"lexical_limit_reason":"lexical_bytes","lexical_vocabulary":"code-v1"}'
+`)
+	if err != nil {
+		t.Fatalf("the trigram and ranked ceilings are different fields with different sets: %v", err)
+	}
+	if result.LimitReason != "postings" || result.LexicalLimitReason != "lexical_bytes" {
+		t.Fatalf("%+v", result)
+	}
+}
