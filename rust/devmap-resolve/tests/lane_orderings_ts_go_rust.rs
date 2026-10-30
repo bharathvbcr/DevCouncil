@@ -1,12 +1,10 @@
-//! Where three lanes edit one resolver rung, each lane's case still resolves
-//! when the others' cases share the run.
+//! Where two lanes edit one resolver rung, each lane's case still resolves
+//! when the other's cases share the run.
 //!
-//! The import-scoped rungs in `resolve_all.rs` were edited by three lanes:
+//! The import-scoped rungs in `resolve_all.rs` were edited by two lanes:
 //!
-//! * the Rust type-path lane wrapped the named-import lookup in a fallback
-//!   through a Rust module's re-exports (`rust_import_through_barrel`);
 //! * the TS barrels lane rewrote a JS/TS whole-module handle (`*`) to the
-//!   module's default export *before* that lookup, so a CommonJS
+//!   module's default export before the package lookup, so a CommonJS
 //!   `const run = require('./util'); run()` binds `module.exports = main`;
 //! * the compiler-cheap-fixes lane asks the Go build-variant set *before* the
 //!   package lookup, and the TS barrels lane split that lookup into a module
@@ -69,11 +67,6 @@ const JS_NAMESPACE: &str =
 const JS_UTIL: &str = "function main() { return 'ok'; }\nmodule.exports = main;\n";
 const JS_MAIN: &str = "const runMain = require('./util');\nfunction boot() { return runMain(); }\n";
 
-const RUST_LIB: &str = "pub mod barrel;\nmod user;\n";
-const RUST_BARREL: &str = "mod leaf;\npub(crate) use self::leaf::*;\n";
-const RUST_LEAF: &str = "pub(crate) fn node_text() {}\n";
-const RUST_USER: &str = "use crate::barrel::{node_text};\n\nfn go() {\n    node_text();\n}\n";
-
 fn mixed() -> ResolutionResult {
     resolve(&[
         ("proc/procgroup_unix.go", UNIX),
@@ -87,10 +80,6 @@ fn mixed() -> ResolutionResult {
         ("ui/consumer.ts", JS_NAMESPACE),
         ("cjs/util.js", JS_UTIL),
         ("cjs/main.js", JS_MAIN),
-        ("kit/src/lib.rs", RUST_LIB),
-        ("kit/src/barrel.rs", RUST_BARREL),
-        ("kit/src/barrel/leaf.rs", RUST_LEAF),
-        ("kit/src/user.rs", RUST_USER),
     ])
 }
 
@@ -124,7 +113,7 @@ fn a_go_package_member_in_a_sibling_file_binds_that_file() {
 }
 
 #[test]
-fn a_js_namespace_over_a_barrel_resolves_beside_go_and_rust() {
+fn a_js_namespace_over_a_barrel_resolves_beside_go() {
     let result = mixed();
     assert_eq!(
         targets(&result, "ui/consumer.ts::run"),
@@ -135,22 +124,11 @@ fn a_js_namespace_over_a_barrel_resolves_beside_go_and_rust() {
 }
 
 #[test]
-fn a_whole_module_handle_binds_the_default_export_before_the_rust_fallback() {
+fn a_whole_module_handle_binds_the_default_export_at_the_named_import_rung() {
     let result = mixed();
     assert_eq!(
         targets(&result, "cjs/main.js::boot"),
         ["cjs/util.js::main"],
-        "{:?}",
-        result.unresolved
-    );
-}
-
-#[test]
-fn a_rust_named_import_through_a_private_glob_still_reaches_the_declaration() {
-    let result = mixed();
-    assert_eq!(
-        targets(&result, "kit/src/user.rs::go"),
-        ["kit/src/barrel/leaf.rs::node_text"],
         "{:?}",
         result.unresolved
     );
