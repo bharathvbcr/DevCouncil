@@ -21,6 +21,7 @@
 mod support_ignored;
 
 mod a_budget_refused_file_is_re_extracted_by_the_next_build;
+mod a_damaged_store_is_reported_and_refused;
 mod a_dead_verdict_lands_on_an_unchanged_file_under_a_narrowed_write;
 mod a_message_literal_has_no_run_of_spaces;
 mod a_named_root_must_be_a_directory;
@@ -40,7 +41,9 @@ mod an_ignore_file_binds_the_daemon;
 mod attack_rb_resolution_budget;
 mod api_views_are_honest;
 mod ast_reports_its_own_totals;
+mod attack_ah_damaged_store;
 mod attack_build_cancel;
+mod attack_dsr_quarantine_ownership;
 mod binary_digests_are_memoised;
 mod blast_names_what_a_change_reaches;
 mod blast_reads_once_and_names_every_path;

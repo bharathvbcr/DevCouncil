@@ -118,11 +118,41 @@ fn refusals_json(inventory: &devmap_store::DiscoveryInventory) -> serde_json::Va
     })
 }
 
+/// What `build` says about a damaged store: where it is, what was found, that
+/// it is left where it is, and the one thing to do.
+///
+/// A damaged store is reported and left alone. Setting one aside and building
+/// again was tried and parked (`docs/devmap/design/auto-quarantine-parked.md`):
+/// a store of another worktree was moved because its owner could not be read.
+fn damaged_store_refusal(db: &std::path::Path, finding: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!(
+        "the devmap store {} is damaged ({finding}), so it is left where it is; if it is yours, \
+         move or delete it and run `devmap build` again, and if it is another worktree's, leave \
+         it to that worktree",
+        db.display()
+    )
+}
+
+/// `error` as the refusal above when it is SQLite's corruption error, else as it
+/// was: whatever page the build died reading, the message names the store.
+fn refuse_if_damaged(db: &std::path::Path, error: impl Into<anyhow::Error>) -> anyhow::Error {
+    let error = error.into();
+    if Store::is_database_corrupt(&error) {
+        damaged_store_refusal(db, format_args!("{error:#}"))
+    } else {
+        error
+    }
+}
+
 pub(crate) fn run(
     cli: &Cli,
     progress: Option<&ProgressReporter>,
     args: &Args,
 ) -> anyhow::Result<()> {
+    run_build(cli, progress, args).map_err(|error| refuse_if_damaged(&cli.db(), error))
+}
+
+fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> anyhow::Result<()> {
     let Args {
         // Read through `cli.root_hint()` below, which already falls back to
         // this positional when `--root` is absent. Binding it here as well
@@ -177,6 +207,15 @@ pub(crate) fn run(
         Store::lock_writer_at(&cli.db(), Store::WRITER_LOCK_WAIT)
     })?;
     let store = progress.timed("store:open", || Store::open(cli.db()))?;
+    // Whose store this is comes before whether it is sound, and both are read
+    // before anything is written: a store of another live worktree is refused
+    // whether it is damaged or not, and a damaged one is never answered
+    // "unchanged" nor written to. An owner or an index that cannot be read is a
+    // refusal, never a pass.
+    store.refuse_a_live_foreign_owner(path)?;
+    if let Some(damage) = store.search_index_unreadable()? {
+        return Err(damaged_store_refusal(&cli.db(), damage));
+    }
     if let Some(previous) = store.bind_repo_root(path)? {
         progress.note(format_args!(
             "store rebound from {previous:?}, which no longer exists, to {}",

@@ -327,6 +327,22 @@ impl Store {
         Ok(previous)
     }
 
+    /// Refuse when another worktree that still exists owns this store, writing
+    /// nothing: [`Self::bind_repo_root`]'s ownership refusal as a read.
+    ///
+    /// A store that is not ours is never touched, so a caller that is about to
+    /// look at the store's soundness asks this first. An owner that is absent
+    /// from disk, or not yet recorded, passes: `bind_repo_root` takes those over
+    /// afterwards. An owner that cannot be read is an error, not a pass.
+    pub fn refuse_a_live_foreign_owner(&self, root: &Path) -> Result<()> {
+        let root = Self::normalized_repo_root(root)?;
+        let conn = lock_conn(&self.conn)?;
+        match Self::repo_root_owner_in(&conn, &root)? {
+            RepoRootOwner::Live(owner) => Err(Self::live_owner_refusal(&owner, &root)),
+            RepoRootOwner::Unbound | RepoRootOwner::Same | RepoRootOwner::Gone(_) => Ok(()),
+        }
+    }
+
     /// Enqueue changed paths in the queue's canonical form: repo-relative,
     /// forward-slash, deduplicated, and inside `root`.
     ///

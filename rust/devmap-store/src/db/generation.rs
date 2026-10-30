@@ -701,6 +701,7 @@ impl Store {
         snapshot: &rusqlite::Transaction<'_>,
         generation: u32,
         node_count: usize,
+        whole: bool,
     ) -> Result<Option<String>> {
         if node_count == 0 {
             return Ok(None);
@@ -742,6 +743,34 @@ impl Store {
             None => None,
         };
 
+        // The whole check walks every symbol of the generation through the
+        // index, which on a large store is the bulk of a no-change build's work,
+        // so a caller on a hot path (`build`) opts out of it and leaves the
+        // partial-loss count to `status`.
+        // The MATCH above reads the term index and the postings, and nothing
+        // else. The rest of the index is its content and docsize tables, which
+        // a damaged page can break without the probe's one symbol ever touching
+        // them; a page-by-page scan of each is a fraction of the whole check's
+        // per-symbol lookups. Both depths run it, so `status` and `build` can
+        // never disagree about a page one of them can read.
+        for shadow in ["nodes_fts_content", "nodes_fts_docsize"] {
+            if let Err(error) =
+                snapshot.query_row(&format!("SELECT COUNT(*) FROM {shadow}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+            {
+                return unreadable(error);
+            }
+        }
+        if !whole {
+            return match (&probe, probe_hits) {
+                (Some(name), Some(0)) => Ok(Some(fts_damage_reason(&format!(
+                    "the full-text index holds generation {generation}'s rows but finds none \
+                     of them: a search for its symbol {name:?} matched nothing"
+                )))),
+                _ => Ok(None),
+            };
+        }
         let memo = self
             .fts_reachable
             .lock()
@@ -783,6 +812,54 @@ impl Store {
             ))));
         }
         Ok(None)
+    }
+
+    /// Why the latest generation's search index cannot be trusted, if it cannot:
+    /// the probe `status` and `build` share.
+    ///
+    /// One owner for the verdict, so the two surfaces cannot disagree about a
+    /// store: `status` reads the same probe through [`Store::status`]'s
+    /// `degraded_reason`, and `build` asks it directly before it decides that
+    /// nothing changed. The answer is the reason text, which already names the
+    /// remedy; `None` is "no generation" or "the index is readable and whole".
+    pub fn search_index_damage(&self) -> Result<Option<String>> {
+        self.search_index_damage_at(true)
+    }
+
+    /// [`Self::search_index_damage`] without the whole-index count: only whether
+    /// the index can be read and finds the generation's own symbol.
+    ///
+    /// For a caller on a hot path. `devmap build` asks this before it decides
+    /// nothing changed, and a no-change build is the common one; the count
+    /// behind [`Self::search_index_damage`] walks every symbol through the
+    /// index (measured: +15% instructions on an unchanged 1,893-file build).
+    /// Both depths read every shadow table of the index page by page, so
+    /// neither surface can miss a damaged page the other reports. What the cheap
+    /// depth leaves to `status` is the *logical* loss: rows missing from an
+    /// index that reads cleanly.
+    pub fn search_index_unreadable(&self) -> Result<Option<String>> {
+        self.search_index_damage_at(false)
+    }
+
+    fn search_index_damage_at(&self, whole: bool) -> Result<Option<String>> {
+        let conn = lock_conn(&self.conn)?;
+        let snapshot = conn.unchecked_transaction()?;
+        let Some(generation) = Self::latest_generation_id_locked(&snapshot)? else {
+            return Ok(None);
+        };
+        // The whole check compares against the symbol count; the readable probe
+        // only needs to know whether there is a symbol to look for, which a
+        // single index probe answers without counting every row.
+        let node_count = if whole {
+            self.generation_counts_locked(&snapshot, generation)?.0
+        } else {
+            snapshot.query_row(
+                "SELECT EXISTS(SELECT 1 FROM generation_nodes WHERE generation_id = ?1)",
+                params![generation],
+                |row| row.get::<_, i64>(0).map(|found| found as usize),
+            )?
+        };
+        self.fts_health_locked(&snapshot, generation, node_count, whole)
     }
 
     /// The latest generation's analysis **status**, without its summary.
@@ -1190,7 +1267,7 @@ generation {latest}; run `devmap status` to re-verify",
         };
         // Inside the same snapshot as the node count it is compared against.
         let fts_reason = match latest {
-            Some(generation) => self.fts_health_locked(&snapshot, generation, node_count)?,
+            Some(generation) => self.fts_health_locked(&snapshot, generation, node_count, true)?,
             None => None,
         };
         let quarantine_reason = if quarantined_count > 0 {

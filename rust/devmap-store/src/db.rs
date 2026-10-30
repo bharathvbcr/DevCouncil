@@ -13,6 +13,7 @@ use rusqlite::{params_from_iter, Connection, Result};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod generation;
+mod integrity;
 mod maintenance;
 mod migrate;
 mod open;
@@ -69,9 +70,9 @@ fn fts_damage_reason(what: &str) -> String {
     format!(
         "{what}; rebuild the full-text index with `devmap repair --fts`. If a fresh \
          `devmap status` on this store reports it healthy, this process's view of the \
-         store is stale rather than the index damaged: restart it. If the damage \
-         survives the repair, the database itself is damaged: rebuild it with \
-         `devmap build --full`"
+         store is stale rather than the index damaged: restart it. If the repair \
+         itself fails with \"malformed\", the database file is damaged: move or delete \
+         it and run `devmap build` to rebuild it from source"
     )
 }
 
