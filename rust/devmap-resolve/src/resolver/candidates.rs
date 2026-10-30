@@ -102,6 +102,24 @@ impl Resolver {
         ) {
             return skipped(&mut cache, key, error);
         }
+        // A Java class and the constructor it declares are one declaration of the
+        // name, not two: `new Canon(1, 2)` names the type, whose constructor runs.
+        // Counting both made every `new T(..)` of a class with a written
+        // constructor ambiguous; for a record it lost the one binding a record
+        // with an explicit or compact canonical constructor had before the record
+        // was a symbol at all.
+        let types: BTreeSet<(String, String)> = candidates
+            .iter()
+            .filter(|(path, _)| path.ends_with(".java"))
+            .cloned()
+            .collect();
+        candidates.retain(|(path, identity)| {
+            let owner = path
+                .ends_with(".java")
+                .then(|| identity.strip_suffix(&format!(".{name}")))
+                .flatten();
+            !owner.is_some_and(|owner| types.contains(&(path.clone(), owner.to_string())))
+        });
         let declarations = candidates.len();
         candidates.sort();
         candidates.dedup();
