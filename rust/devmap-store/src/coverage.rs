@@ -368,6 +368,26 @@ mod write_read_symmetry {
         }
     }
 
+    /// The store-level kinds are not in `ExtractionGap::ALL` — they are not
+    /// analyzer gaps, the store writes them from its own inventories and from the
+    /// resolution — so the test above cannot see them. Each needs its slot named
+    /// here, or a fourth store-level kind could be written on every build and
+    /// discarded on every read, which is what that test exists to prevent.
+    #[test]
+    fn every_store_level_gap_label_has_a_read_slot() {
+        let mut gaps = CoverageGaps::default();
+        for label in [GAP_DISCOVERY_REFUSED, GAP_OVER_LIMIT, GAP_RESOLUTION_BUDGET] {
+            assert!(
+                gaps.slot(label).is_some(),
+                "`{label}` is written by the store and has no read slot"
+            );
+            assert!(
+                CoverageGaps::labels().contains(&label),
+                "`{label}` is not in the labels `status` reports"
+            );
+        }
+    }
+
     /// And the reverse: every label a reader asks for is one a writer produces.
     ///
     /// A slot nothing can fill is a permanently-empty field, which is the
