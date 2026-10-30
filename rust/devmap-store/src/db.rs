@@ -71,8 +71,8 @@ fn fts_damage_reason(what: &str) -> String {
         "{what}; rebuild the full-text index with `devmap repair --fts`. If a fresh \
          `devmap status` on this store reports it healthy, this process's view of the \
          store is stale rather than the index damaged: restart it. If the repair \
-         itself fails with \"malformed\", the database file is damaged: `devmap build` \
-         moves it aside (naming where) and rebuilds from source"
+         itself fails with \"malformed\", the database file is damaged: move or delete \
+         it and run `devmap build` to rebuild it from source"
     )
 }
 

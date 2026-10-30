@@ -114,71 +114,41 @@ fn refusals_json(inventory: &devmap_store::DiscoveryInventory) -> serde_json::Va
     })
 }
 
-/// What `build` did to a store it found damaged, for the result and the
-/// terminal. Never silent: a store set aside is history the caller should know
-/// exists, and an index repaired in place is a fact about the last build.
-struct StoreRecovery {
-    action: &'static str,
-    reason: String,
-    quarantined_to: Option<std::path::PathBuf>,
+/// What `build` says about a damaged store: where it is, what was found, that
+/// it is left where it is, and the one thing to do.
+///
+/// A damaged store is reported and left alone. Setting one aside and building
+/// again was tried and parked (`docs/devmap/design/auto-quarantine-parked.md`):
+/// a store of another worktree was moved because its owner could not be read.
+fn damaged_store_refusal(db: &std::path::Path, finding: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!(
+        "the devmap store {} is damaged ({finding}), so it is left where it is; if it is yours, \
+         move or delete it and run `devmap build` again, and if it is another worktree's, leave \
+         it to that worktree",
+        db.display()
+    )
 }
 
-impl StoreRecovery {
-    fn json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "action": self.action,
-            "reason": self.reason,
-            "quarantined_to": self.quarantined_to.as_ref().map(|path| path.display().to_string()),
-        })
+/// `error` as the refusal above when it is SQLite's corruption error, else as it
+/// was: whatever page the build died reading, the message names the store.
+fn refuse_if_damaged(db: &std::path::Path, error: impl Into<anyhow::Error>) -> anyhow::Error {
+    let error = error.into();
+    if Store::is_database_corrupt(&error) {
+        damaged_store_refusal(db, format_args!("{error:#}"))
+    } else {
+        error
     }
 }
 
-/// Build the index, recovering from a damaged store file.
-///
-/// A store whose pages are damaged made every remedy it named fail with the
-/// same "database disk image is malformed" (`repair --fts`, `build --full`),
-/// while a plain `build` reported "unchanged" over it. Every row is derived
-/// from the working tree, so the way out is to move the file aside and build
-/// again. That happens in two places, both under the writer lock and both
-/// loud: [`run_once`] probes the search index before it decides anything is
-/// unchanged, and this wrapper retries once when the build itself dies on
-/// `SQLITE_CORRUPT`, after confirming with `PRAGMA quick_check` that the file
-/// is damaged and the error was not a single bad read.
 pub(crate) fn run(
     cli: &Cli,
     progress: Option<&ProgressReporter>,
     args: &Args,
 ) -> anyhow::Result<()> {
-    match run_once(cli, progress, args, None) {
-        Err(error) if Store::is_database_corrupt(&error) => {
-            run_once(cli, progress, args, Some(error))
-        }
-        outcome => outcome,
-    }
+    run_build(cli, progress, args).map_err(|error| refuse_if_damaged(&cli.db(), error))
 }
 
-/// Bind `store` to the worktree at `path`, refusing when another live worktree
-/// owns it, and say so when it was taken over from one that no longer exists.
-fn bind_store_to(
-    store: &Store,
-    path: &std::path::Path,
-    progress: &ProgressReporter,
-) -> anyhow::Result<()> {
-    if let Some(previous) = store.bind_repo_root(path)? {
-        progress.note(format_args!(
-            "store rebound from {previous:?}, which no longer exists, to {}",
-            path.display()
-        ));
-    }
-    Ok(())
-}
-
-fn run_once(
-    cli: &Cli,
-    progress: Option<&ProgressReporter>,
-    args: &Args,
-    corrupt_failure: Option<anyhow::Error>,
-) -> anyhow::Result<()> {
+fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> anyhow::Result<()> {
     let Args {
         // Read through `cli.root_hint()` below, which already falls back to
         // this positional when `--root` is absent. Binding it here as well
@@ -231,74 +201,21 @@ fn run_once(
     let _writer = progress.timed("writer:wait", || {
         Store::lock_writer_at(&cli.db(), Store::WRITER_LOCK_WAIT)
     })?;
-    let mut recovery: Option<StoreRecovery> = None;
-    if let Some(failure) = corrupt_failure {
-        // Whose file this is comes before whether it is damaged. The failed
-        // attempt may have died before `bind_repo_root` ran (opening the store,
-        // or binding it), so nothing yet says the store is ours, and a store of
-        // another live worktree is refused here exactly as it is when healthy.
-        Store::refuse_if_owned_by_another_live_worktree(&cli.db(), path)?;
-        // The previous attempt died on SQLITE_CORRUPT. One bad read is not
-        // proof of a damaged file, so the file is checked whole before it is
-        // moved; a file that checks out gets the original error back.
-        match Store::quick_check(&cli.db())? {
-            Some(damage) => {
-                let reason = format!("the build failed with {failure:#}; quick_check: {damage}");
-                let moved = Store::quarantine_damaged(&cli.db(), &_writer)?;
-                progress.display.diagnostic(format_args!(
-                    "  the store {} is damaged; moved it to {} and rebuilding from source",
-                    cli.db().display(),
-                    moved.display()
-                ));
-                recovery = Some(StoreRecovery {
-                    action: "quarantined",
-                    reason,
-                    quarantined_to: Some(moved),
-                });
-            }
-            None => return Err(failure),
-        }
-    }
-    let mut store = progress.timed("store:open", || Store::open(cli.db()))?;
-    // Ownership first, before the probe below can set the file aside: a store
-    // that belongs to another live worktree is refused whether it is damaged or
-    // not, and a read-only one is refused here in the store's own words rather
-    // than by a failed repair.
-    bind_store_to(&store, path, progress)?;
-    // The same probe `status` reports, asked before anything below can decide
-    // "nothing changed" over an index that cannot answer a search.
+    let store = progress.timed("store:open", || Store::open(cli.db()))?;
+    // Whose store this is comes before whether it is sound, and both are read
+    // before anything is written: a store of another live worktree is refused
+    // whether it is damaged or not, and a damaged one is never answered
+    // "unchanged" nor written to. An owner or an index that cannot be read is a
+    // refusal, never a pass.
+    store.refuse_a_live_foreign_owner(path)?;
     if let Some(damage) = store.search_index_unreadable()? {
-        match store.repair_fts() {
-            Ok(()) => {
-                progress
-                    .display
-                    .diagnostic(format_args!("  search index repaired in place: {damage}"));
-                recovery = Some(StoreRecovery {
-                    action: "repaired_search_index",
-                    reason: damage,
-                    quarantined_to: None,
-                });
-            }
-            Err(error) if Store::sqlite_error_is_corrupt(&error) => {
-                drop(store);
-                let moved = Store::quarantine_damaged(&cli.db(), &_writer)?;
-                progress.display.diagnostic(format_args!(
-                    "  the store {} is damaged beyond a search-index repair; moved it to {} \
-                     and rebuilding from source",
-                    cli.db().display(),
-                    moved.display()
-                ));
-                recovery = Some(StoreRecovery {
-                    action: "quarantined",
-                    reason: damage,
-                    quarantined_to: Some(moved),
-                });
-                store = progress.timed("store:open", || Store::open(cli.db()))?;
-                // The fresh file is unbound; it is bound to this worktree.
-                bind_store_to(&store, path, progress)?;
-            }
-            Err(error) => return Err(error.into()),
-        }
+        return Err(damaged_store_refusal(&cli.db(), damage));
+    }
+    if let Some(previous) = store.bind_repo_root(path)? {
+        progress.note(format_args!(
+            "store rebound from {previous:?}, which no longer exists, to {}",
+            path.display()
+        ));
     }
     // A store this process can only read opens fine — queries need it
     // to — and would otherwise fail at the first write with a bare
@@ -1128,10 +1045,6 @@ fn run_once(
                     })
                 }),
                 "manifest": manifest.as_ref().map(|manifest| &manifest.json),
-                // What was done to a damaged store before this build, or `null`.
-                "store_recovery": recovery
-                    .as_ref()
-                    .map_or(serde_json::Value::Null, StoreRecovery::json),
             }),
         )?;
     } else {

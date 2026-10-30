@@ -5074,6 +5074,75 @@ mod tests {
         assert!(!lock.exists(), "a vanished daemon left its lock behind");
     }
 
+    /// F2 (attack round on `damaged-store-recovery`): a store set aside (a rename
+    /// of the file and its sidecars) and replaced by a fresh one at the same path
+    /// within milliseconds. `path.exists()` is true again by the time the daemon
+    /// looks, so the daemon keeps its connection to the renamed inode, drains
+    /// into it and never sees the store that now answers queries. The store half
+    /// of `vanished_reason` must compare the file, not the name. Nothing in this
+    /// repository sets a store aside any more (the mover is parked), but an
+    /// operator's `mv` and a restore do exactly this.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "F2, card ft-3b886056: the daemon compares the store's name, not its file \
+                (device and inode), so it keeps serving a store replaced at the same path"]
+    async fn a_daemon_whose_store_was_replaced_at_the_same_path_exits() {
+        let root = std::env::temp_dir().join(format!(
+            "devmap-daemon-replaced-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let db = root.join("devmap.sqlite");
+        let socket = std::path::PathBuf::from(format!(
+            "/tmp/devmap-replaced-{:016x}.sock",
+            devmap_extract::content_hash(&root.to_string_lossy())
+        ));
+        let lock = crate::protocol::ipc_lock_path(&socket);
+        let _ = fs::remove_file(&socket);
+        let _ = fs::remove_file(&lock);
+
+        let daemon = Daemon::new(Store::open(&db).unwrap(), root.clone())
+            .with_store_path(db.clone())
+            .with_ipc_path(socket.clone())
+            .with_idle_poll(Duration::from_millis(20))
+            .with_max_idle(None);
+        let watching = daemon.clone();
+        let mut task = tokio::spawn(async move { daemon.run_loop().await });
+
+        serving_or_dead(&watching, &mut task).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !task.is_finished(),
+            "the daemon exited before anything changed"
+        );
+
+        // A set-aside, then a fresh `Store::open`: the name is never absent for
+        // longer than the two calls take.
+        for ext in ["", "-wal", "-shm"] {
+            let from = root.join(format!("devmap.sqlite{ext}"));
+            if from.exists() {
+                fs::rename(&from, root.join(format!("devmap.sqlite.corrupt-1{ext}"))).unwrap();
+            }
+        }
+        let fresh = Store::open(&db).unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), &mut task).await;
+        let exited = outcome.is_ok();
+        let _ = fs::remove_file(&socket);
+        let _ = fs::remove_file(&lock);
+        task.abort();
+        drop(fresh);
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            exited,
+            "a daemon whose store file was replaced at the same path kept serving the \
+             renamed inode"
+        );
+    }
+
     /// The store file is the other half: the root can survive a `rm` of the
     /// database alone, and a daemon serving a store that is gone answers from a
     /// connection to a deleted inode.

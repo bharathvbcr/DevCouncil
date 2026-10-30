@@ -106,7 +106,8 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
             format!(
                 "FTS repair failed; completed results: {}. If this says the database \
                  disk image is malformed, the file itself is damaged and no repair \
-                 reads past it: `devmap build` moves it aside and rebuilds from source",
+                 reads past it: move or delete it and run `devmap build` to rebuild it \
+                 from source",
                 serde_json::json!(receipt)
             )
         })?;
