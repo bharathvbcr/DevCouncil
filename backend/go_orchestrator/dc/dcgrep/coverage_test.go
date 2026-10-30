@@ -162,7 +162,7 @@ func TestAnIncompleteRankingWithNoCeilingStillNamesWhatIsMissing(t *testing.T) {
 		t.Fatalf("the shortfall counts were not carried through: %+v", result)
 	}
 	note := result.Partial()
-	for _, want := range []string{"2 directory entries", "3 readable-text files", "1 of the 9 files"} {
+	for _, want := range []string{"2 directory entries", "3 admissible text files", "1 of the 9 files"} {
 		if !strings.Contains(note, want) {
 			t.Fatalf("the note %q must contain %q", note, want)
 		}

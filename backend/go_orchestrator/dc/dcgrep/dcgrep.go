@@ -766,7 +766,7 @@ func (r *RankedResult) Partial() string {
 		causes = append(causes, fmt.Sprintf("%d directory entries could not be read", r.WalkErrors))
 	}
 	if r.LexicalUnindexed > 0 {
-		causes = append(causes, fmt.Sprintf("%d readable-text files were left out", r.LexicalUnindexed))
+		causes = append(causes, fmt.Sprintf("%d admissible text files were left out", r.LexicalUnindexed))
 	}
 	if len(causes) == 0 {
 		causes = append(causes, "the searcher did not report the index as complete")
