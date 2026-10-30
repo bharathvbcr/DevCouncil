@@ -256,7 +256,7 @@ fn fake_git(dir: &Path, version: &str) -> PathBuf {
         &format!(
             "#!/bin/sh\nif [ \"$1\" = version ]; then echo 'git version {version}'; exit 0; fi\n\
              exec '{}' \"$@\"\n",
-            real.display()
+            real.path().display()
         ),
     );
     path
@@ -374,7 +374,7 @@ fn the_git_version_is_asked_once_per_binary() {
         &format!(
             "#!/bin/sh\n[ \"$1\" = version ] && echo version >> '{}'\nexec '{}' \"$@\"\n",
             log.display(),
-            real.display()
+            real.path().display()
         ),
     );
     for _ in 0..3 {
@@ -394,7 +394,8 @@ fn a_git_that_stalls_on_version_is_killed_at_the_probe_deadline() {
     let git = base.0.join("bin").join("git");
     script(&git, "#!/bin/sh\nexec sleep 30\n");
     let started = std::time::Instant::now();
-    let failure = git_version(&git).expect_err("a stalled git has no version");
+    let failure =
+        git_version(&dc_proc::Resolved::as_given(&git)).expect_err("a stalled git has no version");
     let elapsed = started.elapsed();
     assert!(matches!(failure, Failure::Deadline { .. }), "{failure}");
     assert!(

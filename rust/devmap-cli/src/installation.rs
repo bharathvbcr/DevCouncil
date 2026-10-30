@@ -1524,6 +1524,6 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
         let found =
             found.unwrap_or_else(|failure| panic!("no ps in {PROCESS_INVENTORY_PATH}: {failure}"));
-        assert!(found.is_absolute(), "{}", found.display());
+        assert!(found.path().is_absolute(), "{}", found.path().display());
     }
 }

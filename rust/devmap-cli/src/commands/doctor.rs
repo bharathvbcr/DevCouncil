@@ -134,7 +134,7 @@ fn git_report(root: &Path) -> serde_json::Value {
                 )
             });
             serde_json::json!({
-                "path": git.display().to_string(),
+                "path": git.path().display().to_string(),
                 "version": version.to_string(),
                 "raw_version": version.raw,
                 "honors_no_lazy_fetch": honours,
@@ -143,11 +143,11 @@ fn git_report(root: &Path) -> serde_json::Value {
             })
         }
         Ok(None) => unavailable(
-            Some(&git),
+            Some(git.path()),
             "git ran but reported no version this can read; reads of a partial clone are refused"
                 .to_string(),
         ),
-        Err(failure) => unavailable(Some(&git), failure.to_string()),
+        Err(failure) => unavailable(Some(git.path()), failure.to_string()),
     }
 }
 

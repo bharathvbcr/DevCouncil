@@ -1101,6 +1101,13 @@ fn lsp_server_json(server: &devmap_resolve::lsp::LspServerStatus) -> serde_json:
             .as_ref()
             .and_then(|reason| reason.stderr_complete())
             .map(|complete| !complete),
+        // Bytes the server wrote that `stderr_tail` does not carry: dropped to
+        // stay inside the cap, or the cut first line discarded. A server that
+        // wrote one very long line has `stderr_tail: null` and a count here.
+        "stderr_bytes_not_shown": server
+            .did_not_run
+            .as_ref()
+            .and_then(|reason| reason.stderr_not_shown()),
         "files_considered": server.files_considered,
         "files_finished": server.files_finished,
         "edges_added": server.edges_added,
@@ -1502,16 +1509,22 @@ mod tests {
             code: Some(101),
             stderr: Some("half a thought".into()),
             stderr_complete: false,
+            stderr_not_shown: 15904,
         });
         assert_eq!(cut_short["stderr_tail"], "half a thought");
         assert_eq!(cut_short["stderr_tail_incomplete"], true);
+        assert_eq!(cut_short["stderr_bytes_not_shown"], 15904);
         let whole = row(LspDidNotRun::NonZeroExit {
             code: Some(101),
             stderr: Some("whole".into()),
             stderr_complete: true,
+            stderr_not_shown: 0,
         });
         assert_eq!(whole["stderr_tail_incomplete"], false);
-        assert!(row(LspDidNotRun::TimedOut)["stderr_tail_incomplete"].is_null());
+        assert_eq!(whole["stderr_bytes_not_shown"], 0);
+        let timed_out = row(LspDidNotRun::TimedOut);
+        assert!(timed_out["stderr_tail_incomplete"].is_null());
+        assert!(timed_out["stderr_bytes_not_shown"].is_null());
     }
 
     /// A call-blind row prints no percent, never claims "0 attribution sites"

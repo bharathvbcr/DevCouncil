@@ -112,11 +112,14 @@ pub enum LspDidNotRun {
     /// the pipe had not closed by the time the wait for it ran out, so `stderr`
     /// is what had arrived and not everything the server said: "nothing
     /// captured" and "nothing said" are different statements, and the report
-    /// makes the first one aloud.
+    /// makes the first one aloud. `stderr_not_shown` is how many bytes the
+    /// server wrote that `stderr` does not carry (see [`surface_stderr_report`]):
+    /// a server that wrote 20 KB on one line is not one that said nothing.
     NonZeroExit {
         code: Option<i32>,
         stderr: Option<String>,
         stderr_complete: bool,
+        stderr_not_shown: u64,
     },
     TimedOut,
     OversizedPayload {
@@ -144,6 +147,18 @@ impl LspDidNotRun {
     pub fn stderr_tail(&self) -> Option<&str> {
         match self {
             LspDidNotRun::NonZeroExit { stderr, .. } => stderr.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Bytes of the server's stderr that were read and are not in
+    /// [`stderr_tail`](Self::stderr_tail). `None` for an outcome that carries
+    /// no tail.
+    pub fn stderr_not_shown(&self) -> Option<u64> {
+        match self {
+            LspDidNotRun::NonZeroExit {
+                stderr_not_shown, ..
+            } => Some(*stderr_not_shown),
             _ => None,
         }
     }
@@ -249,12 +264,36 @@ pub struct LspSiteAnswer {
 /// shape would then match, so that line is discarded rather than shown.
 /// `None` when nothing is left to show.
 pub fn surface_stderr(tail: &subprocess::StderrTail) -> Option<String> {
+    surface_stderr_report(tail).text
+}
+
+/// [`surface_stderr`]'s text, and how many bytes the server wrote that the
+/// text does not carry: those dropped to stay inside the cap, and the cut
+/// first line discarded for redaction's sake. A server that wrote 20 KB with no
+/// newline has a tail that is all cut line; its text is `None`, and
+/// `bytes_not_shown` is what keeps that from reading as a server that said
+/// nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurfacedStderr {
+    pub text: Option<String>,
+    pub bytes_not_shown: u64,
+}
+
+/// See [`surface_stderr`] and [`SurfacedStderr`].
+pub fn surface_stderr_report(tail: &subprocess::StderrTail) -> SurfacedStderr {
     let text = tail.text();
-    let kept = if tail.dropped_bytes > 0 {
-        text.split_once('\n').map_or("", |(_, rest)| rest)
+    let (kept, cut) = if tail.dropped_bytes > 0 {
+        match tail.bytes.iter().position(|byte| *byte == b'\n') {
+            Some(newline) => (
+                text.split_once('\n').map_or("", |(_, rest)| rest),
+                newline as u64 + 1,
+            ),
+            None => ("", tail.bytes.len() as u64),
+        }
     } else {
-        text.as_str()
+        (text.as_str(), 0)
     };
+    let bytes_not_shown = tail.dropped_bytes + cut;
     let redacted = dc_redact::redact_secrets(kept);
     let clean: String = redacted
         .chars()
@@ -267,7 +306,10 @@ pub fn surface_stderr(tail: &subprocess::StderrTail) -> Option<String> {
         })
         .collect();
     let clean = clean.trim();
-    (!clean.is_empty()).then(|| clean.to_string())
+    SurfacedStderr {
+        text: (!clean.is_empty()).then(|| clean.to_string()),
+        bytes_not_shown,
+    }
 }
 
 /// Stable edge-payload spelling so a later reader can see who claimed the edge.
@@ -513,6 +555,7 @@ impl LspPassReport {
                     code,
                     stderr,
                     stderr_complete,
+                    stderr_not_shown,
                 } = reason
                 {
                     let status = code.map_or(String::new(), |code| format!(" with status {code}"));
@@ -526,6 +569,16 @@ impl LspPassReport {
                             let shown: String = line.chars().take(LSP_STDERR_LINE_CAP).collect();
                             lines.push(format!("lsp:   {shown}"));
                         }
+                    }
+                    // A server that wrote more than the tail keeps, or wrote
+                    // one line longer than it, is not one that said nothing.
+                    if *stderr_not_shown > 0 {
+                        lines.push(format!(
+                            "lsp: {} exited{status} — {stderr_not_shown} byte(s) of its stderr \
+                             are not shown (only whole lines of the last {} bytes are kept)",
+                            server.binary,
+                            subprocess::SESSION_STDERR_TAIL_BYTES,
+                        ));
                     }
                     // An empty tail from a pipe that never closed is not "the
                     // server said nothing"; say which of the two this is.
@@ -777,7 +830,14 @@ fn enrich_with_servers(
             }
         };
 
-        let mut client = match LspClient::spawn(spec, &binary_path, repo_root, deadline) {
+        let mut client = match LspClient::spawn_with(
+            spec,
+            &binary_path,
+            repo_root,
+            deadline,
+            &LspSessionOptions::default(),
+            Some(cancel),
+        ) {
             Ok(client) => client,
             Err(reason) => {
                 report.servers.push(LspServerStatus {
@@ -941,7 +1001,7 @@ enum Incoming {
 /// has gone quiet, which is how the per-request and per-pass budgets used to be
 /// checked only between reads and never during one. On expiry the session is
 /// killed, which closes the pipes and ends both threads.
-struct LspClient {
+struct LspClient<'cancel> {
     session: Session,
     incoming: Receiver<Incoming>,
     outgoing: Option<SyncSender<Vec<u8>>>,
@@ -952,6 +1012,9 @@ struct LspClient {
     request_budget: Duration,
     open_files: BTreeSet<String>,
     repo_root: PathBuf,
+    /// The pass's cancel flag, which ends the wait for a failed server's
+    /// stderr. `None` for a session nobody cancels.
+    cancel: Option<&'cancel AtomicBool>,
 }
 
 /// How a session differs from the build pass's. The default is the build
@@ -1020,7 +1083,7 @@ pub struct LspServerHealth {
 /// own client (same framing, caps, process-group kill), so there is one owner
 /// of the wire protocol.
 pub struct LspSession {
-    client: LspClient,
+    client: LspClient<'static>,
 }
 
 impl LspSession {
@@ -1033,7 +1096,7 @@ impl LspSession {
         deadline: Instant,
         options: &LspSessionOptions,
     ) -> Result<Self, LspDidNotRun> {
-        LspClient::spawn_with(spec, binary, repo_root, deadline, options)
+        LspClient::spawn_with(spec, binary, repo_root, deadline, options, None)
             .map(|client| Self { client })
     }
 
@@ -1169,7 +1232,9 @@ fn read_frame(reader: &mut impl BufRead) -> Incoming {
     }
 }
 
-impl LspClient {
+impl<'cancel> LspClient<'cancel> {
+    /// A client nobody cancels, for the tests that drive one directly.
+    #[cfg(test)]
     fn spawn(
         spec: &LspServerSpec,
         binary: &subprocess::Resolved,
@@ -1182,6 +1247,7 @@ impl LspClient {
             repo_root,
             deadline,
             &LspSessionOptions::default(),
+            None,
         )
     }
 
@@ -1191,6 +1257,7 @@ impl LspClient {
         repo_root: &Path,
         deadline: Instant,
         options: &LspSessionOptions,
+        cancel: Option<&'cancel AtomicBool>,
     ) -> Result<Self, LspDidNotRun> {
         // The server runs as the file the lookup reached, under the name it
         // was looked up by: a rustup proxy started as `rustup` is not a server.
@@ -1251,6 +1318,7 @@ impl LspClient {
             request_budget: options.request_budget,
             open_files: BTreeSet::new(),
             repo_root,
+            cancel,
         };
         let mut capabilities = json!({
             "textDocument": {
@@ -1430,18 +1498,25 @@ impl LspClient {
                 self.kill();
                 // After the kill, so the group is dead and the child reaped:
                 // nothing holds the pipe and EOF is certain, and the wait ends
-                // at it. The deadline is the generous one, not a settle: it
-                // bounds only a descendant that left the group, and a short one
-                // is shorter than a drain thread can wait to be scheduled on a
-                // loaded host. The tail is read once; the readout and the JSON
-                // report both come from this one value.
-                let tail = self
-                    .session
-                    .stderr_tail(subprocess::SESSION_STDERR_EOF_DEADLINE);
+                // at it. The ceiling is generous, not a settle: it bounds only
+                // a descendant that left the group, and a short one is shorter
+                // than a drain thread can wait to be scheduled on a loaded host.
+                // But it is a ceiling inside the caller's own deadline, never
+                // time added to it, and the pass's cancel flag ends it. The
+                // tail is read once; the readout and the JSON report both come
+                // from this one value.
+                let wait_until =
+                    (Instant::now() + subprocess::SESSION_STDERR_EOF_DEADLINE).min(self.deadline);
+                let cancel = self.cancel;
+                let tail = self.session.stderr_tail_until(wait_until, || {
+                    cancel.is_some_and(|flag| flag.load(Ordering::Relaxed))
+                });
+                let surfaced = surface_stderr_report(&tail);
                 Err(LspDidNotRun::NonZeroExit {
                     code,
-                    stderr: surface_stderr(&tail),
+                    stderr: surfaced.text,
                     stderr_complete: tail.complete,
+                    stderr_not_shown: surfaced.bytes_not_shown,
                 })
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -2351,29 +2426,21 @@ while :; do
 done
 "#;
 
-    /// Run the pass against a server that writes `stderr_lines` to stderr and
-    /// exits 101 before answering anything: the report, and the credential the
-    /// fixture planted in that stderr.
+    /// Run the whole pass against the executable `script` as the one server,
+    /// with `cancel` as the caller's cancel flag.
     #[cfg(feature = "parse")]
-    fn report_for_a_server_that_dies_at_start_up(name: &str) -> (LspPassReport, String) {
+    fn pass_against_a_server_script(
+        name: &str,
+        script: &str,
+        cancel: &AtomicBool,
+    ) -> LspPassReport {
         use std::os::unix::fs::PermissionsExt;
 
-        let token = format!("ghp_{}", "A1b2C3d4E5".repeat(4));
-        assert!(
-            dc_redact::contains_secret(&token),
-            "the fixture token must be a shape the redactor knows"
-        );
         let scratch = super::uris_and_positions::Scratch::new(name);
         let root = scratch.0.join("repo");
         let bin = scratch.0.join("bin");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&bin).unwrap();
-        let script = format!(
-            "#!/bin/sh\n\
-             echo 'error: failed to load workspace: toolchain missing' >&2\n\
-             echo 'fetching https://x:{token}@example.com/repo.git' >&2\n\
-             exit 101\n"
-        );
         let server = bin.join("dying-lsp");
         std::fs::write(&server, script).unwrap();
         std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2390,16 +2457,80 @@ done
             extensions: &[".rs"],
         };
         let sources = BTreeMap::from([("main.rs".to_string(), source.to_string())]);
-        let report = enrich_with_servers(
+        enrich_with_servers(
             &[spec],
             Some(bin.as_os_str()),
             &root,
             &extractions,
             &sources,
             &mut resolution,
-            &AtomicBool::new(false),
+            cancel,
+        )
+    }
+
+    /// Run the pass against a server that writes two lines to stderr, one
+    /// carrying a credential, and exits 101 before answering anything: the
+    /// report, and the credential the fixture planted in that stderr.
+    #[cfg(feature = "parse")]
+    fn report_for_a_server_that_dies_at_start_up(name: &str) -> (LspPassReport, String) {
+        let token = format!("ghp_{}", "A1b2C3d4E5".repeat(4));
+        assert!(
+            dc_redact::contains_secret(&token),
+            "the fixture token must be a shape the redactor knows"
         );
-        (report, token)
+        let script = format!(
+            "#!/bin/sh\n\
+             echo 'error: failed to load workspace: toolchain missing' >&2\n\
+             echo 'fetching https://x:{token}@example.com/repo.git' >&2\n\
+             exit 101\n"
+        );
+        (
+            pass_against_a_server_script(name, &script, &AtomicBool::new(false)),
+            token,
+        )
+    }
+
+    /// The caller's cancel flag ends the wait for a failed server's stderr. A
+    /// descendant that left the server's process group (`perl` here, which
+    /// ships with macOS and every CI image) holds the pipe for 8 s; the
+    /// server exits after 1 s and the pass is cancelled after 0.4 s, so the
+    /// pass must return about when the server exits, not five seconds after.
+    /// Driven through the real `enrich_with_servers` path.
+    #[cfg(all(feature = "parse", unix))]
+    #[test]
+    fn cancelling_the_pass_ends_the_wait_for_a_descendants_stderr() {
+        let cancel = AtomicBool::new(false);
+        let script = "#!/bin/sh\n\
+             perl -e 'use POSIX; POSIX::setsid(); exec \"sleep\", \"8\"' >/dev/null &\n\
+             sleep 1\n\
+             exit 3\n";
+        let started = Instant::now();
+        let report = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(400));
+                cancel.store(true, Ordering::Relaxed);
+            });
+            pass_against_a_server_script("cancel-wait", script, &cancel)
+        });
+        let elapsed = started.elapsed();
+        let reason = report.servers[0]
+            .did_not_run
+            .as_ref()
+            .expect("the server exited");
+        assert!(
+            matches!(
+                reason,
+                LspDidNotRun::NonZeroExit {
+                    stderr_complete: false,
+                    ..
+                }
+            ),
+            "{reason:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "a cancelled pass waited {elapsed:?} for a pipe it had been told to stop watching"
+        );
     }
 
     /// A server that dies at start-up said why on stderr, and the pass used to
@@ -2494,6 +2625,7 @@ done
                     code: Some(101),
                     stderr: stderr.map(str::to_string),
                     stderr_complete,
+                    stderr_not_shown: 0,
                 }),
                 ..LspServerStatus::default()
             }],
@@ -2524,6 +2656,73 @@ done
         let said_it_all = report_for(Some("whole"), true).status_lines().join("\n");
         assert!(said_it_all.contains("whole"), "{said_it_all}");
         assert!(!said_it_all.contains("incomplete"), "{said_it_all}");
+    }
+
+    /// A tail that is all cut line has no text to show, and that must not read
+    /// as a server that said nothing: the bytes it wrote that are not shown are
+    /// counted, whether they were dropped to stay inside the cap or discarded
+    /// as the cut first line. A silent server and a whole tail count none.
+    #[test]
+    fn what_a_tail_does_not_show_is_counted() {
+        let long_line = subprocess::StderrTail {
+            bytes: vec![b'x'; subprocess::SESSION_STDERR_TAIL_BYTES],
+            dropped_bytes: 15_904,
+            complete: true,
+        };
+        let surfaced = surface_stderr_report(&long_line);
+        assert_eq!(surfaced.text, None);
+        assert_eq!(surfaced.bytes_not_shown, 20_000);
+
+        let cut_then_lines = subprocess::StderrTail {
+            bytes: b"xxxx\nreal message\n".to_vec(),
+            dropped_bytes: 100,
+            complete: true,
+        };
+        let surfaced = surface_stderr_report(&cut_then_lines);
+        assert_eq!(surfaced.text.as_deref(), Some("real message"));
+        assert_eq!(surfaced.bytes_not_shown, 105);
+
+        let silent = subprocess::StderrTail {
+            bytes: Vec::new(),
+            dropped_bytes: 0,
+            complete: true,
+        };
+        assert_eq!(surface_stderr_report(&silent).bytes_not_shown, 0);
+        let whole = subprocess::StderrTail {
+            bytes: b"one\ntwo\n".to_vec(),
+            dropped_bytes: 0,
+            complete: true,
+        };
+        assert_eq!(surface_stderr_report(&whole).bytes_not_shown, 0);
+    }
+
+    /// The readout of a server whose stderr was not all shown says how much,
+    /// with or without text, and a server that wrote nothing says nothing.
+    #[test]
+    fn the_readout_counts_the_stderr_bytes_it_does_not_show() {
+        let report_for = |stderr: Option<&str>, stderr_not_shown: u64| LspPassReport {
+            servers: vec![LspServerStatus {
+                binary: "dying-lsp".into(),
+                did_not_run: Some(LspDidNotRun::NonZeroExit {
+                    code: Some(3),
+                    stderr: stderr.map(str::to_string),
+                    stderr_complete: true,
+                    stderr_not_shown,
+                }),
+                ..LspServerStatus::default()
+            }],
+            ..LspPassReport::default()
+        };
+        let long_line = report_for(None, 20_000).status_lines().join("\n");
+        assert!(
+            long_line.contains("20000 byte(s) of its stderr"),
+            "{long_line}"
+        );
+        let some_and_more = report_for(Some("tail"), 105).status_lines().join("\n");
+        assert!(some_and_more.contains("tail"), "{some_and_more}");
+        assert!(some_and_more.contains("105 byte(s)"), "{some_and_more}");
+        let silent = report_for(None, 0).status_lines().join("\n");
+        assert!(!silent.contains("byte(s)"), "{silent}");
     }
 
     /// The surfaced tail keeps whole lines only: bytes dropped to stay inside

@@ -226,7 +226,7 @@ where
                 let version = version
                     .map_or_else(|| "of unrecognised version".to_string(), |v| v.to_string());
                 return Err(Failure::Refused {
-                    program: resolved.display().to_string(),
+                    program: resolved.path().display().to_string(),
                     reason: format!(
                         "{} is a partial clone, and git {version} does not honour \
                          GIT_NO_LAZY_FETCH, so a read could fetch missing objects from its \
@@ -345,24 +345,37 @@ impl GitVersion {
 /// git that stalls here is reported as killed, not waited for.
 pub const GIT_VERSION_DEADLINE: Duration = Duration::from_secs(2);
 
-/// The version of the git at `git` (an absolute path, as [`resolve_outside`]
-/// returns it), asked once per binary per process. A git replaced in place —
-/// a different size or modification time — is asked again. `git version`
-/// reads no repository, so it runs nothing a repository names.
+/// The version of `git` (as [`resolve_outside`] returns it), asked once per
+/// binary and name per process. The probe starts the file under the name it
+/// was looked up by, as the read it guards will: a `git` that is a link to a
+/// multiplexer reading `argv[0]` (a mise or asdf shim) answers as git only
+/// under that name. A git replaced in place — a different size or modification
+/// time — is asked again. `git version` reads no repository, so it runs
+/// nothing a repository names.
 ///
 /// `None` is a git that ran and gave no version this can read; callers treat
 /// it as one that does not honour `GIT_NO_LAZY_FETCH`, the cautious reading.
 /// A git that could not be run at all is a [`Failure`].
-pub fn git_version(git: &Path) -> Result<Option<GitVersion>, Failure> {
+pub fn git_version(git: &Resolved) -> Result<Option<GitVersion>, Failure> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type Key = (PathBuf, u64, Option<std::time::SystemTime>);
+    type Key = (
+        PathBuf,
+        std::ffi::OsString,
+        u64,
+        Option<std::time::SystemTime>,
+    );
     static VERSIONS: OnceLock<Mutex<HashMap<Key, Option<GitVersion>>>> = OnceLock::new();
-    let meta = std::fs::metadata(git).map_err(|error| Failure::Spawn {
-        program: git.display().to_string(),
+    let meta = std::fs::metadata(git.path()).map_err(|error| Failure::Spawn {
+        program: git.path().display().to_string(),
         error,
     })?;
-    let key: Key = (git.to_path_buf(), meta.len(), meta.modified().ok());
+    let key: Key = (
+        git.path().to_path_buf(),
+        git.name().to_os_string(),
+        meta.len(),
+        meta.modified().ok(),
+    );
     let versions = VERSIONS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(version) = versions
         .lock()
@@ -371,7 +384,7 @@ pub fn git_version(git: &Path) -> Result<Option<GitVersion>, Failure> {
     {
         return Ok(version.clone());
     }
-    let mut command = Command::new(git);
+    let mut command = git.command();
     command.arg("version").current_dir(std::env::temp_dir());
     git_env(&mut command);
     let captured = run_bounded(
@@ -527,9 +540,9 @@ struct RepositoryConfig {
 /// repository's config is read first (reading config runs nothing). A root
 /// git cannot enter has no repository config to neutralize; the read that
 /// follows reports the root itself.
-fn probe_repository_config(git: &Path, root: &Path) -> Result<RepositoryConfig, Failure> {
-    let program = git.display().to_string();
-    let mut command = Command::new(git);
+fn probe_repository_config(git: &Resolved, root: &Path) -> Result<RepositoryConfig, Failure> {
+    let program = git.path().display().to_string();
+    let mut command = git.command();
     command.arg("-C").arg(root).args([
         "config",
         "--show-scope",
@@ -655,12 +668,12 @@ fn config_stamp(root: &Path) -> Option<(PathBuf, ConfigStamp)> {
 
 /// The repository's filter and partial-clone config, from the open
 /// [`config_scope`] when there is one and its entry is current.
-fn repository_config(git: &Path, root: &Path) -> Result<RepositoryConfig, Failure> {
+fn repository_config(git: &Resolved, root: &Path) -> Result<RepositoryConfig, Failure> {
     let scoped = CONFIG_SCOPE.with(|scope| scope.borrow().is_some());
     let stamp = if scoped { config_stamp(root) } else { None };
     let key = stamp
         .as_ref()
-        .map(|(top, _)| (git.to_path_buf(), top.clone()));
+        .map(|(top, _)| (git.path().to_path_buf(), top.clone()));
     if let (Some(key), Some((_, stamp))) = (&key, &stamp) {
         let hit = CONFIG_SCOPE.with(|scope| {
             scope
@@ -842,10 +855,11 @@ pub fn resolve_outside(
 /// Homebrew `bin/git -> ../Cellar/...` — or an explicit relative path was made
 /// absolute. The file is what was checked against the repository boundary and
 /// is the only thing that runs; the name is what the child sees as `argv[0]`.
-/// It dereferences to the file's [`Path`] for callers that only need to know
-/// where the program is, and does not convert to an `OsStr`: a `Command::new`
-/// built from it would run the file under the file's own name, which is the
-/// mistake this type exists to make unwritable.
+/// [`path`](Resolved::path) says where the program is. It does not dereference
+/// to that path and does not convert to an `OsStr` or a `Path`: a
+/// `Command::new` built from it would run the file under the file's own name,
+/// which is the mistake this type exists to make unwritable. Two probes did
+/// exactly that through a `Deref<Target = Path>` until it was removed.
 ///
 /// ```compile_fail
 /// let found = dc_proc::Resolved::as_given("git");
@@ -908,20 +922,6 @@ impl Resolved {
             command.arg0(&self.name);
         }
         command
-    }
-}
-
-impl std::ops::Deref for Resolved {
-    type Target = Path;
-
-    fn deref(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl AsRef<Path> for Resolved {
-    fn as_ref(&self) -> &Path {
-        &self.path
     }
 }
 
@@ -1348,13 +1348,23 @@ impl Session {
     /// EOF, so the long bound costs nothing, while a short one loses the race
     /// against a drain thread the host has not yet scheduled.
     pub fn stderr_tail(&self, settle: Duration) -> StderrTail {
-        let deadline = Instant::now() + settle;
+        self.stderr_tail_until(Instant::now() + settle, || false)
+    }
+
+    /// [`stderr_tail`](Self::stderr_tail) for a caller that has a deadline and
+    /// a cancel flag of its own: the wait ends at EOF, at `deadline`, or when
+    /// `cancelled` answers true, whichever comes first. A caller that bounds
+    /// its own work (a language-server start given two seconds) passes the
+    /// earlier of its deadline and [`SESSION_STDERR_EOF_DEADLINE`], so this
+    /// wait never runs past the time it was promised. `cancelled` is polled
+    /// every [`STDERR_WAIT_POLL`]; EOF wakes the wait at once.
+    pub fn stderr_tail_until(&self, deadline: Instant, cancelled: impl Fn() -> bool) -> StderrTail {
         let mut state = self
             .stderr
             .state
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        while !state.finished {
+        while !state.finished && !cancelled() {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 break;
@@ -1362,7 +1372,7 @@ impl Session {
             state = self
                 .stderr
                 .changed
-                .wait_timeout(state, left)
+                .wait_timeout(state, left.min(STDERR_WAIT_POLL))
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
@@ -1475,15 +1485,47 @@ mod sigpipe {
     /// Other Unix: `SIGPIPE` is the writing thread's. Block it for the write;
     /// if the write failed because the reader is gone the signal is pending,
     /// and unblocking it would deliver it, so take it first.
+    ///
+    /// Only a signal this write raised is taken. `sigpending` also reports a
+    /// process-directed `SIGPIPE` that was already waiting (someone ran
+    /// `kill -PIPE` with every thread blocking it), which is not this write's
+    /// to consume, so the pending set is read before the write and a signal
+    /// that was already there is left alone. The mask is put back by a guard on
+    /// every path out, including a panic in the write.
+    ///
+    /// Not run on Linux from the macOS machine this was written on; it is
+    /// type-checked for `x86_64-unknown-linux-gnu`.
     #[cfg(all(unix, not(target_os = "macos")))]
     #[allow(
         unsafe_code,
         reason = "pthread_sigmask, sigpending and sigtimedwait on this thread's own mask"
     )]
     pub(super) fn as_error<R>(write: impl FnOnce() -> io::Result<R>) -> io::Result<R> {
+        /// Puts the thread's signal mask back when dropped.
+        struct Restore(libc::sigset_t);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: `self.0` is the mask `pthread_sigmask` returned for
+                // this thread; the call changes only this thread's mask.
+                unsafe {
+                    libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, std::ptr::null_mut());
+                }
+            }
+        }
+
         // SAFETY: every `sigset_t` is initialised by `sigemptyset` before it is
         // read; the calls touch only the calling thread's signal mask and
-        // pending set, and the mask is put back before returning.
+        // pending set.
+        unsafe fn sigpipe_is_pending() -> bool {
+            unsafe {
+                let mut pending: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut pending);
+                libc::sigpending(&mut pending) == 0
+                    && libc::sigismember(&pending, libc::SIGPIPE) == 1
+            }
+        }
+
+        // SAFETY: as above; `before` is written by `pthread_sigmask` on success.
         unsafe {
             let mut blocked: libc::sigset_t = std::mem::zeroed();
             libc::sigemptyset(&mut blocked);
@@ -1493,21 +1535,19 @@ mod sigpipe {
             if libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut before) != 0 {
                 return write();
             }
+            let _restore = Restore(before);
+            let waiting_before = sigpipe_is_pending();
             let result = write();
-            if matches!(&result, Err(error) if error.kind() == io::ErrorKind::BrokenPipe) {
-                let mut pending: libc::sigset_t = std::mem::zeroed();
-                libc::sigemptyset(&mut pending);
-                if libc::sigpending(&mut pending) == 0
-                    && libc::sigismember(&pending, libc::SIGPIPE) == 1
-                {
-                    let now = libc::timespec {
-                        tv_sec: 0,
-                        tv_nsec: 0,
-                    };
-                    libc::sigtimedwait(&blocked, std::ptr::null_mut(), &now);
-                }
+            if !waiting_before
+                && matches!(&result, Err(error) if error.kind() == io::ErrorKind::BrokenPipe)
+                && sigpipe_is_pending()
+            {
+                let now = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                libc::sigtimedwait(&blocked, std::ptr::null_mut(), &now);
             }
-            libc::pthread_sigmask(libc::SIG_SETMASK, &before, std::ptr::null_mut());
             result
         }
     }
@@ -1542,8 +1582,15 @@ pub const SESSION_STDERR_TAIL_BYTES: usize = 4096;
 /// bound for the one case where it is not, a descendant that left the process
 /// group and kept the pipe. It is generous on purpose: a short settle is
 /// shorter than the time a starved thread can wait to run on a loaded host, and
-/// a tail that lost that race read as "the child said nothing".
+/// a tail that lost that race read as "the child said nothing". A caller with
+/// a deadline of its own passes the earlier of the two to
+/// [`Session::stderr_tail_until`]: this is a ceiling on the wait, never time
+/// added to what the caller was promised.
 pub const SESSION_STDERR_EOF_DEADLINE: Duration = Duration::from_secs(5);
+
+/// How often [`Session::stderr_tail_until`] looks at its cancel flag while it
+/// waits.
+pub const STDERR_WAIT_POLL: Duration = Duration::from_millis(25);
 
 /// Hooks for tests of code that sits on a [`Session`]; compiled only with the
 /// `test-hooks` feature, which no build enables by default.
@@ -1976,6 +2023,33 @@ mod tests {
         assert!(tail.text().contains("early"));
         session.kill();
         assert!(session.stderr_tail(Duration::from_secs(5)).complete);
+    }
+
+    /// The wait is the caller's to bound: a deadline of its own ends it early,
+    /// and so does its cancel flag, polled while a descendant holds the pipe.
+    #[cfg(unix)]
+    #[test]
+    fn the_stderr_wait_ends_at_the_callers_deadline_or_cancel() {
+        let mut session = session_of("echo early >&2; sleep 30 & exit 0");
+        wait_until_reaped(&mut session);
+
+        let started = Instant::now();
+        let tail = session.stderr_tail_until(Instant::now() + Duration::from_millis(200), || false);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!tail.complete && tail.text().contains("early"), "{tail:?}");
+
+        let cancel_at = Instant::now() + Duration::from_millis(100);
+        let started = Instant::now();
+        let tail = session.stderr_tail_until(Instant::now() + Duration::from_secs(20), || {
+            Instant::now() >= cancel_at
+        });
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(!tail.complete, "{tail:?}");
+        session.kill();
     }
 
     /// `try_status` reaps the child; the group id then names nothing of ours,
@@ -2699,9 +2773,9 @@ mod tests {
         assert_eq!(got.name(), stand_in.as_os_str());
         let got = resolve_outside(OsStr::new("some/dir/git"), None, &root).unwrap();
         assert!(
-            got.is_absolute() && got.ends_with("some/dir/git"),
+            got.path().is_absolute() && got.path().ends_with("some/dir/git"),
             "{}",
-            got.display()
+            got.path().display()
         );
     }
 
