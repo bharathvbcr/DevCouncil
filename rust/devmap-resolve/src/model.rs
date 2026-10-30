@@ -1030,45 +1030,116 @@ pub struct ResolutionBudgetGap {
     pub limit: String,
     /// Distinct names whose candidate list was cut to a prefix.
     pub names_truncated: usize,
-    /// Candidates those lists lost, summed over the distinct names.
+    /// Distinct candidates the cut lists lost, summed over every list of every
+    /// name: a name with a list per language family (or per Go package
+    /// directory) loses candidates in each, and each loss is counted.
     pub candidates_dropped: usize,
     /// Distinct names whose lookup was skipped, so nothing is known of them.
     pub names_skipped: usize,
     /// Ledger rows carrying a capped list or a skipped lookup.
     pub sites: usize,
-    /// A sample of the affected names, sorted. [`Self::names_truncated`] and
+    /// A sample of the affected names, sorted and bounded: at most
+    /// [`Self::SAMPLE`] names, each at most [`Self::NAME_BYTES`] bytes (a
+    /// longer one is cut on a character boundary and ends in `…`), and
+    /// [`Self::SAMPLE_BYTES`] bytes in all. [`Self::names_truncated`] and
     /// [`Self::names_skipped`] are the totals; this is never the set.
     pub sample_names: Vec<String>,
+    /// Every distinct affected name, so a reader of a bounded sample sees how
+    /// many it left out (`names_total - sample_names.len()`).
+    pub names_total: usize,
 }
 
 impl ResolutionBudgetGap {
     /// How many names [`Self::sample_names`] carries at most.
     pub const SAMPLE: usize = 10;
+    /// The most bytes one quoted name keeps. A name is whatever the tree
+    /// declares and nothing else bounds it: a 100,000-character identifier
+    /// would make every surface that quotes the gap (the stored row, the build
+    /// JSON, both exported maps, every query's `walk_incomplete`) 100 KB.
+    pub const NAME_BYTES: usize = 128;
+    /// The most bytes the whole sample keeps.
+    pub const SAMPLE_BYTES: usize = 1024;
+
+    /// The first [`Self::SAMPLE`] of `names`, in order, each cut to
+    /// [`Self::NAME_BYTES`] on a character boundary with `…` marking the cut,
+    /// stopping before the sample would pass [`Self::SAMPLE_BYTES`]. Fewer
+    /// names than that is reported as such by [`Self::describe`]'s "sample of
+    /// N", so a sample cut short says so.
+    fn bounded_sample<'a>(names: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+        let mut sample = Vec::new();
+        let mut bytes = 0usize;
+        for name in names.into_iter().take(Self::SAMPLE) {
+            let quoted = if name.len() > Self::NAME_BYTES {
+                let mut end = Self::NAME_BYTES;
+                while !name.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}…", &name[..end])
+            } else {
+                name.clone()
+            };
+            if bytes + quoted.len() > Self::SAMPLE_BYTES {
+                break;
+            }
+            bytes += quoted.len();
+            sample.push(quoted);
+        }
+        sample
+    }
 
     /// One sentence that says what was capped and by how much.
     pub fn describe(&self) -> String {
+        // Two of the three states a budget can leave a name in are gaps, and
+        // each says which it is. The third (a cut that drops nothing) is no
+        // gap at all: the list stays a complete `AmbiguousGlobal`, so there is
+        // nothing to say and the status is not Partial.
         let mut parts = Vec::new();
         if self.names_truncated > 0 {
+            // Capped: candidates were dropped, and the count is known.
             parts.push(format!(
-                "{} candidate list(s) cut to a retained prefix, {} candidate(s) dropped",
+                "{} name(s) capped, {} candidate(s) dropped",
                 self.names_truncated, self.candidates_dropped
             ));
         }
         if self.names_skipped > 0 {
+            // Skipped: the lookup never ran, so what it would have resolved is
+            // unknown, which is not the same as nothing.
+            let under = match Self::flag(&self.limit) {
+                Some(flag) => format!(" under `{flag}`"),
+                None => format!(" under the {} budget", self.limit),
+            };
             parts.push(format!(
-                "{} name lookup(s) skipped, so their sites name no candidate",
+                "{} name lookup(s) skipped{under}; what they would have resolved is unknown",
                 self.names_skipped
             ));
         }
+        let more = self.names_total.saturating_sub(self.sample_names.len());
+        let tail = if more > 0 {
+            format!(", +{more} more")
+        } else {
+            String::new()
+        };
         format!(
             "{} budget exceeded: {}; {} ledger row(s) affected, no edge asserted for any; \
-             names (sample of {}): {}",
+             names (sample of {}, each cut to {} bytes): {}{}",
             self.limit,
             parts.join("; "),
             self.sites,
             self.sample_names.len(),
-            self.sample_names.join(", ")
+            Self::NAME_BYTES,
+            self.sample_names.join(", "),
+            tail
         )
+    }
+
+    /// The build flag that sets `limit`, for the budgets a lookup can be
+    /// skipped under.
+    fn flag(limit: &str) -> Option<&'static str> {
+        match limit {
+            "candidate visits" => Some("--resolve-candidate-visits"),
+            "retained candidate bytes" => Some("--resolve-retained-candidate-bytes"),
+            _ => None,
+        }
     }
 }
 
@@ -1103,9 +1174,13 @@ impl ResolutionResult {
     /// was capped. See [`ResolutionBudgetGap`].
     pub fn budget_gaps(&self) -> Vec<ResolutionBudgetGap> {
         use std::collections::{BTreeMap, BTreeSet};
+        use std::hash::{Hash, Hasher};
         #[derive(Default)]
         struct Acc {
-            truncated: BTreeMap<String, usize>,
+            /// Per name, the distinct targets each of its capped lists lost,
+            /// keyed by the list (its true count and retained prefix) so the
+            /// sites that share one list count it once.
+            truncated: BTreeMap<String, BTreeMap<u64, usize>>,
             skipped: BTreeSet<String>,
             sites: usize,
         }
@@ -1125,10 +1200,20 @@ impl ResolutionResult {
             match total {
                 Some(total) => {
                     // One name can have several lists (a Go name per package
-                    // directory); the report keeps the widest loss it saw.
+                    // directory, a name per language family). Each loses its
+                    // own candidates, so the loss is summed over every list of
+                    // the name, and a list many sites share is counted once.
+                    // `candidates` is the retained prefix, so it is short and
+                    // cheap to hash; two lists with the same true count and the
+                    // same prefix are the same list.
                     let lost = total.saturating_sub(candidates.len());
-                    let seen = acc.truncated.entry(row.callee_name.clone()).or_insert(0);
-                    *seen = (*seen).max(lost);
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    total.hash(&mut hasher);
+                    candidates.hash(&mut hasher);
+                    acc.truncated
+                        .entry(row.callee_name.clone())
+                        .or_default()
+                        .insert(hasher.finish(), lost);
                 }
                 None => {
                     acc.skipped.insert(row.callee_name.clone());
@@ -1138,22 +1223,20 @@ impl ResolutionResult {
         by_limit
             .into_iter()
             .map(|(limit, acc)| {
-                let sample_names = acc
-                    .truncated
-                    .keys()
-                    .chain(acc.skipped.iter())
-                    .cloned()
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .take(ResolutionBudgetGap::SAMPLE)
-                    .collect();
+                let names: BTreeSet<&String> =
+                    acc.truncated.keys().chain(acc.skipped.iter()).collect();
                 ResolutionBudgetGap {
                     limit,
                     names_truncated: acc.truncated.len(),
-                    candidates_dropped: acc.truncated.values().sum(),
+                    candidates_dropped: acc
+                        .truncated
+                        .values()
+                        .map(|lists| lists.values().sum::<usize>())
+                        .sum(),
                     names_skipped: acc.skipped.len(),
                     sites: acc.sites,
-                    sample_names,
+                    names_total: names.len(),
+                    sample_names: ResolutionBudgetGap::bounded_sample(names),
                 }
             })
             .collect()

@@ -561,3 +561,151 @@ fn a_truncation_that_drops_nothing_stays_ambiguous_and_records_no_gap() {
         }
     }
 }
+
+/// The names a gap quotes are bounded at the source, on character boundaries:
+/// a long multibyte identifier is cut without splitting a character, the cut is
+/// marked, and the whole sample stays small however many long names there are.
+#[test]
+fn quoted_names_are_bounded_on_character_boundaries_and_the_cut_is_marked() {
+    use devmap_resolve::model::ResolutionBudgetGap;
+    let mut inputs = Vec::new();
+    // `é` is two bytes, so a 128-byte cut lands inside one for an odd boundary.
+    let long = "é".repeat(5_000);
+    for index in 0..12 {
+        let name = format!("n{index:02}{long}");
+        inputs.push(extract_file(
+            &format!("c{index}.py"),
+            &format!("def run{index}():\n    {name}()\n"),
+        ));
+    }
+    // Each name is declared once elsewhere, so its lookup has a hit to charge
+    // and the zero visits budget skips it.
+    for index in 0..12 {
+        let name = format!("n{index:02}{long}");
+        inputs.push(extract_file(
+            &format!("d{index}.py"),
+            &format!("def {name}():\n    pass\n"),
+        ));
+    }
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&inputs);
+    let result = resolver
+        .resolve_all_with_limits(
+            &inputs,
+            devmap_resolve::ResolutionLimits {
+                candidate_visits: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let gap = &result.budget_gaps()[0];
+    assert_eq!(gap.names_skipped, 12, "every name is still counted");
+    assert!(!gap.sample_names.is_empty());
+    for name in &gap.sample_names {
+        assert!(
+            name.len() <= ResolutionBudgetGap::NAME_BYTES + '…'.len_utf8(),
+            "{} bytes",
+            name.len()
+        );
+        assert!(name.ends_with('…'), "the cut is marked: {name}");
+    }
+    let total: usize = gap.sample_names.iter().map(String::len).sum();
+    assert!(total <= ResolutionBudgetGap::SAMPLE_BYTES, "{total} bytes");
+    assert!(
+        gap.describe().len() < 4096,
+        "{} bytes",
+        gap.describe().len()
+    );
+    assert_eq!(gap.names_total, 12);
+    let left_out = gap.names_total - gap.sample_names.len();
+    assert!(left_out > 0, "the byte cap left names out");
+    assert!(
+        gap.describe().contains(&format!(", +{left_out} more")),
+        "the sample says how many it omits: {}",
+        gap.describe()
+    );
+}
+
+/// A name with a list per language family loses candidates in each list, and
+/// the gap sums them: two lists of 20 each cut to 8 drop 24, and the sites that
+/// share a list count it once.
+#[test]
+fn dropped_candidates_are_summed_over_every_list_of_a_name() {
+    let mut inputs: Vec<Extraction> = (0..20)
+        .map(|i| extract_file(&format!("p{i}.py"), "def leaf(): pass\n"))
+        .collect();
+    inputs.extend((0..20).map(|i| {
+        extract_file(
+            &format!("j{i}.js"),
+            "function leaf() {}\nmodule.exports = { leaf };\n",
+        )
+    }));
+    let mut callers = Vec::new();
+    for (file, source) in [
+        ("cp.py", "def a():\n    leaf()\n    leaf()\n"),
+        ("cj.js", "function b() {\n  leaf();\n}\n"),
+    ] {
+        callers.push(extract_file(file, source));
+    }
+    inputs.extend(callers);
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&inputs);
+    let result = resolver
+        .resolve_all_with_limits(
+            &inputs,
+            devmap_resolve::ResolutionLimits {
+                ambiguity_evidence_bytes: 512,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let gap = &result.budget_gaps()[0];
+    assert_eq!(gap.sites, 3, "{gap:?}");
+    assert_eq!(gap.names_truncated, 1);
+    assert_eq!(
+        gap.candidates_dropped, 24,
+        "two lists of 20 cut to 8: {gap:?}"
+    );
+}
+
+/// The reason names which state a budget left a name in. A capped list says
+/// how many candidates it dropped; a skipped lookup says under which flag and
+/// that what it would have resolved is unknown, never that nothing was lost.
+#[test]
+fn the_gap_sentence_names_capped_and_skipped_apart() {
+    let inputs = fixture(40, 5);
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&inputs);
+    let capped = resolver
+        .resolve_all_with_limits(
+            &inputs,
+            devmap_resolve::ResolutionLimits {
+                ambiguity_evidence_bytes: 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let sentence = capped.budget_gaps()[0].describe();
+    assert!(
+        sentence.contains("1 name(s) capped, 32 candidate(s) dropped")
+            && !sentence.contains("unknown"),
+        "{sentence}"
+    );
+    let skipped = resolver
+        .resolve_all_with_limits(
+            &inputs,
+            devmap_resolve::ResolutionLimits {
+                candidate_visits: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let sentence = skipped.budget_gaps()[0].describe();
+    assert!(
+        sentence.contains(
+            "1 name lookup(s) skipped under `--resolve-candidate-visits`; what they would have \
+             resolved is unknown"
+        ) && !sentence.contains("dropped"),
+        "{sentence}"
+    );
+}

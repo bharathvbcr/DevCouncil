@@ -100,27 +100,31 @@ const TIGHT: &[&str] = &["--resolve-ambiguity-evidence-bytes", "1024"];
 fn skip_tree(name: &str) -> PathBuf {
     let root = scratch(name);
     write(&root, "u.py", "def uniq():\n    pass\n");
-    write(&root, "k.py", "class K:\n    def meth(self):\n        pass\n");
+    write(
+        &root,
+        "k.py",
+        "class K:\n    def meth(self):\n        pass\n",
+    );
     write(&root, "c.py", "def run():\n    uniq()\n    meth()\n");
     root
 }
 
-/// FINDING 1. The visits budget charges `hits.len()` before the candidate
-/// filter, and a name it cannot afford is *skipped*, not looked up. When every
-/// hit would have been filtered out (here a method a bare call cannot reach)
-/// the skipped lookup loses nothing, yet it writes a `CappedGlobal` row, a
-/// `resolution_budget` gap and a `Partial` analysis status. The graph is
-/// byte-for-byte the uncapped graph and is reported degraded.
+/// The visits budget charges `hits.len()` before the candidate filter, and a
+/// name it cannot afford is *skipped*, not looked up. Here every hit would have
+/// been filtered out (a method a bare call cannot reach), so the capped graph is
+/// byte-for-byte the uncapped graph. Fable's ruling: it is still Partial.
+/// Unknown is not nothing: the lookup never ran, so nothing can say it would
+/// have found nothing. The visits budget is not pre-filtered, and the wording
+/// says "unknown" rather than claiming a loss or a clean bill.
 #[test]
-fn finding_a_skipped_lookup_that_loses_nothing_degrades_nothing() {
+fn a_skipped_lookup_that_would_have_lost_nothing_is_still_partial_and_says_unknown() {
     let free = skip_tree("skip-free");
     let capped = skip_tree("skip-capped");
     let uncapped_build = build(&free, &[]);
     let capped_build = build(&capped, &["--resolve-candidate-visits", "1"]);
 
-    // The precondition that makes this an attack and not a complaint: every
-    // count the build reports about the graph (edges, symbols, and each class
-    // of unresolved site) is the same with and without the budget.
+    // The counts are the uncapped build's: this is the case where the skip
+    // happened to cost nothing, and it is reported all the same.
     for (key, value) in uncapped_build.as_object().unwrap() {
         if key == "edges" || key == "symbols" || key.starts_with("unresolved_") {
             assert_eq!(
@@ -130,18 +134,30 @@ fn finding_a_skipped_lookup_that_loses_nothing_degrades_nothing() {
         }
     }
 
-    assert_eq!(
-        capped_build["resolution_budget"].as_array().unwrap().len(),
-        0,
-        "nothing was dropped, so no budget gap: {capped_build}"
+    let gaps = capped_build["resolution_budget"].as_array().unwrap();
+    assert_eq!(gaps.len(), 1, "the skip is a gap: {capped_build}");
+    assert_eq!(gaps[0]["limit"], "candidate visits");
+    assert!(
+        gaps[0]["names_skipped"].as_u64().unwrap() >= 1,
+        "{capped_build}"
     );
     let status = json(&capped, &["--json", "status"]);
+    let reason = status["degraded_reason"].as_str().unwrap_or("");
     assert!(
-        status["degraded_reason"].is_null(),
-        "nothing was dropped, so the status is clean: {}",
-        status["degraded_reason"]
+        reason.contains("name lookup(s) skipped under `--resolve-candidate-visits`")
+            && reason.contains("what they would have resolved is unknown"),
+        "the status names the state: skipped, and unknown: {reason}"
     );
-    assert_eq!(status["coverage_gaps"]["resolution_budget"]["total"], 0);
+    assert!(
+        !reason.contains("nothing lost") && !reason.contains("0 candidate(s) dropped"),
+        "unknown is not nothing-lost: {reason}"
+    );
+    assert_eq!(status["coverage_gaps"]["resolution_budget"]["total"], 1);
+    export_maps(&capped);
+    assert_eq!(
+        read_json(&capped.join("repo_map.json"))["graph_degraded"],
+        true
+    );
 }
 
 /// FINDING 2. One name that has a candidate list per language family loses
@@ -217,7 +233,11 @@ fn finding_a_budget_gap_bounds_the_names_it_quotes() {
     let root = scratch("long-name");
     let name = "a".repeat(20_000);
     for index in 0..20 {
-        write(&root, &format!("p{index}.py"), &format!("def {name}():\n    pass\n"));
+        write(
+            &root,
+            &format!("p{index}.py"),
+            &format!("def {name}():\n    pass\n"),
+        );
     }
     write(&root, "caller.py", &format!("def run():\n    {name}()\n"));
     let result = build(&root, TIGHT);
@@ -339,7 +359,10 @@ fn a_cap_and_a_refused_file_both_reach_every_surface() {
     both(dead["walk_incomplete"].as_str().unwrap_or(""), "dead");
     export_maps(&root);
     let map = read_json(&root.join("repo_map.json"));
-    both(map["graph_degraded_reason"].as_str().unwrap_or(""), "repo_map");
+    both(
+        map["graph_degraded_reason"].as_str().unwrap_or(""),
+        "repo_map",
+    );
     let graph = read_json(&root.join("code_graph.json"));
     both(
         graph["meta"]["devmap_rust"]["analysis_status"]
@@ -407,7 +430,10 @@ fn two_budgets_at_once_each_name_their_gap_and_the_sites_add_up() {
     let gaps = result["resolution_budget"].as_array().unwrap();
     assert_eq!(gaps.len(), 2, "{result}");
     let sites: u64 = gaps.iter().map(|gap| gap["sites"].as_u64().unwrap()).sum();
-    assert_eq!(sites, 18, "6 names x 3 callers, every site capped: {result}");
+    assert_eq!(
+        sites, 18,
+        "6 names x 3 callers, every site capped: {result}"
+    );
     let status = json(&root, &["--json", "status"]);
     assert_eq!(status["coverage_gaps"]["resolution_budget"]["total"], 2);
 }
@@ -420,7 +446,7 @@ fn two_budgets_at_once_each_name_their_gap_and_the_sites_add_up() {
 /// true`, and prints no word about it. Identical on dbd0193a for a build whose
 /// only degradation is a refused file.
 #[test]
-#[ignore = "FOLLOW-UP: fails identically on dbd0193a for a Partial status of any reason"]
+#[ignore = "FOLLOW-UP, card ft-b13394a0: fails identically on dbd0193a for a Partial status of any reason"]
 fn follow_up_map_html_names_a_degraded_graph() {
     let root = scratch("map-html");
     leaf_files(&root, 40);
@@ -442,7 +468,7 @@ fn follow_up_map_html_names_a_degraded_graph() {
 
 /// `devmap html` (the graph page) has no access to the analysis status at all.
 #[test]
-#[ignore = "FOLLOW-UP: fails identically on dbd0193a for a Partial status of any reason"]
+#[ignore = "FOLLOW-UP, card ft-b13394a0: fails identically on dbd0193a for a Partial status of any reason"]
 fn follow_up_graph_html_names_a_degraded_graph() {
     let root = scratch("graph-html");
     leaf_files(&root, 40);
@@ -459,7 +485,7 @@ fn follow_up_graph_html_names_a_degraded_graph() {
 /// `history` rows carry `parse_failed` and `dead_ambiguous` but nothing that
 /// says a generation was built under a cap (or a refusal).
 #[test]
-#[ignore = "FOLLOW-UP: fails identically on dbd0193a for a Partial status of any reason"]
+#[ignore = "FOLLOW-UP, card ft-b13394a0: fails identically on dbd0193a for a Partial status of any reason"]
 fn follow_up_history_marks_a_degraded_generation() {
     let root = scratch("history");
     leaf_files(&root, 40);

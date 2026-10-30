@@ -525,6 +525,22 @@ pub(crate) fn run(
                 stamps,
                 *inventory,
             )?;
+            // The generation this build calls "still current" may be capped.
+            // Said here the way the refusals above are: a build that proves
+            // nothing changed must not read as complete. Read from the stored
+            // gap rows, which carry the sentence the capped build wrote, so the
+            // structured counts are not re-derived on this path.
+            let kept_cap = store.latest_resolution_budget_gaps()?;
+            let kept_cap_json: Vec<serde_json::Value> = kept_cap
+                .iter()
+                .map(|gap| {
+                    serde_json::json!({
+                        "limit": gap.path.strip_prefix("resolve:").unwrap_or(&gap.path),
+                        "reason": gap.reason,
+                        "carried_from_generation": generation,
+                    })
+                })
+                .collect();
             drop(_writer);
             progress.up_to_date(generation, file_count);
             if cli.json {
@@ -552,6 +568,10 @@ pub(crate) fn run(
                             "discovery_refused_files": refused_count,
                     "discovery_refusals": refusals_doc,
                             "over_limit_files": over_limit_files,
+                            // The kept generation's resolution caps, restated
+                            // as the refusals are. Always an array, like every
+                            // other build's `resolution_budget`.
+                            "resolution_budget": kept_cap_json,
                             "generation": generation,
                             "reclaim": reclaim_note(&vacuum),
                             "timings": progress.timings_json(),
@@ -563,15 +583,19 @@ pub(crate) fn run(
                         }),
                 )?;
             } else {
-                progress.display.summary(
-                    "Already mapped",
-                    &[format!(
-                        "No source changes; generation #{generation} still current \
+                let mut lines = vec![format!(
+                    "No source changes; generation #{generation} still current \
                      ({}) in {}.",
-                        progress::count(file_count, "file"),
-                        progress::duration(progress.started_at.elapsed().as_secs_f64())
-                    )],
-                );
+                    progress::count(file_count, "file"),
+                    progress::duration(progress.started_at.elapsed().as_secs_f64())
+                )];
+                for gap in &kept_cap {
+                    lines.push(format!(
+                        "Resolution capped (carried by generation #{generation}): {}",
+                        gap.reason
+                    ));
+                }
+                progress.display.summary("Already mapped", &lines);
                 progress.display.report_loss();
                 if cli.verbose {
                     if let Some(manifest) = &manifest {
@@ -745,6 +769,7 @@ pub(crate) fn run(
                 "names_skipped": gap.names_skipped,
                 "sites": gap.sites,
                 "sample_names": gap.sample_names,
+                "names_total": gap.names_total,
             })
         })
         .collect();
