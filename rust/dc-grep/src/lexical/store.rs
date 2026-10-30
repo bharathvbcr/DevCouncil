@@ -256,6 +256,9 @@ pub(crate) struct Builder {
 }
 
 impl Builder {
+    /// A builder at the format's own ceiling. Production names its ceiling —
+    /// `build_with_limits` takes it as a parameter — so only tests ask for this.
+    #[cfg(test)]
     pub(crate) fn new(vocabulary: Vocabulary) -> Self {
         Self::with_ceiling(vocabulary, MAX_POSTINGS)
     }
@@ -360,6 +363,9 @@ impl Builder {
         self.limit.is_some()
     }
 
+    /// This index's own ceiling alone; `stopped_by` is the answer a build
+    /// reports, because it includes the walk's.
+    #[cfg(test)]
     pub(crate) fn limit(&self) -> Option<Limit> {
         self.limit
     }

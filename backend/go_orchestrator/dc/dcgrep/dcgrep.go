@@ -366,15 +366,44 @@ func validate(out any) error {
 			return fmt.Errorf("searcher reported %d stale files out of %d returned",
 				reply.StaleFiles, len(reply.Files))
 		}
+		// Coverage. A ranking over a prefix of the repository is a ranking whose
+		// silence means nothing, so every way the report can contradict itself
+		// is refused rather than passed to a caller who would believe the
+		// favourable half.
+		for name, count := range map[string]int{
+			"files_indexed": reply.FilesIndexed,
+			"files_seen":    reply.FilesSeen,
+		} {
+			if count < 0 {
+				return fmt.Errorf("ranking reported %s = %d, which is not a count", name, count)
+			}
+		}
+		// A build cannot have indexed more files than its walk reached. Only
+		// checked when the report carries a walk at all: a searcher that
+		// predates `files_seen` omits it, and that is read as "not known to be
+		// complete" below rather than as a contradiction.
+		if (reply.FilesSeen > 0 || reply.Complete) && reply.FilesIndexed > reply.FilesSeen {
+			return fmt.Errorf("ranking drew on %d files but says its build saw %d",
+				reply.FilesIndexed, reply.FilesSeen)
+		}
+		// Complete and stopped by a ceiling cannot both be true.
+		if reply.Complete && reply.LexicalLimitReason != "" {
+			return fmt.Errorf("ranking claims a complete index and names limit %q",
+				reply.LexicalLimitReason)
+		}
 		return nil
 	case *IndexResult:
 		if reply.FilesIndexed > reply.FilesSeen {
 			return fmt.Errorf("index reported %d files indexed of %d seen",
 				reply.FilesIndexed, reply.FilesSeen)
 		}
-		if reply.LexicalFiles > reply.FilesIndexed {
-			return fmt.Errorf("index ranked %d files but only read %d",
-				reply.LexicalFiles, reply.FilesIndexed)
+		// Bounded by what the walk reached, not by what the trigram index
+		// holds: that index fills first on a large repository and the ranked
+		// one carries on, so more files ranked than trigram-indexed is the
+		// ordinary shape of a big tree rather than a contradiction.
+		if reply.LexicalFiles > reply.FilesSeen {
+			return fmt.Errorf("index ranked %d files but its walk only saw %d",
+				reply.LexicalFiles, reply.FilesSeen)
 		}
 		// A model name without a model vocabulary, or the reverse, means the
 		// two halves of the report disagree about what was published — and a
@@ -627,12 +656,51 @@ type RankedResult struct {
 	Limit     int          `json:"limit"`
 	// Vocabulary names the term space the ranking used, so a caller can tell
 	// a BM25 ranking from a learned one without asking a second question.
-	Vocabulary   string `json:"vocabulary"`
-	FilesIndexed int    `json:"files_indexed"`
-	TermsUnknown int    `json:"terms_unknown"`
-	TermsTotal   int    `json:"terms_total"`
-	TermsDropped int    `json:"terms_dropped"`
-	StaleFiles   int    `json:"stale_files"`
+	Vocabulary string `json:"vocabulary"`
+	// FilesIndexed is the documents the ranking drew on.
+	FilesIndexed int `json:"files_indexed"`
+	// FilesSeen is the files the build that wrote the index reached, indexable
+	// or not. Zero when the searcher predates the field.
+	FilesSeen int `json:"files_seen"`
+	// Complete is true only when the searcher said so: no ceiling stopped the
+	// build that wrote this index. A reply that omits the field decodes to
+	// false, which is the safe reading — a ranking over a prefix of the
+	// repository must never be mistaken for one over all of it because an older
+	// searcher had no way to say otherwise.
+	Complete bool `json:"complete"`
+	// LexicalLimitReason names the ceiling that ended the build when Complete is
+	// false: "lexical_postings" for the ranked index's own, or "files",
+	// "duration" or "input_bytes" for the walk's. Empty does not mean complete;
+	// read Complete.
+	LexicalLimitReason string `json:"lexical_limit_reason"`
+	TermsUnknown       int    `json:"terms_unknown"`
+	TermsTotal         int    `json:"terms_total"`
+	TermsDropped       int    `json:"terms_dropped"`
+	StaleFiles         int    `json:"stale_files"`
+}
+
+// Partial says, in a sentence a caller can put in front of a reader, that the
+// ranking does not cover the whole repository. It is empty only when the
+// searcher reported a complete index.
+//
+// One owner for the wording so every surface that renders a ranking says the
+// same thing, and so none of them has to decide what a missing field means. The
+// absence of a file from a partial ranking is not evidence that nothing in it is
+// about the query.
+func (r *RankedResult) Partial() string {
+	if r == nil || r.Complete {
+		return ""
+	}
+	covered := "an unknown share of the repository"
+	if r.FilesSeen > 0 {
+		covered = fmt.Sprintf("%d of the %d files its build reached", r.FilesIndexed, r.FilesSeen)
+	}
+	if r.LexicalLimitReason == "" {
+		return fmt.Sprintf("ranking covers %s and the searcher did not report the index as complete; "+
+			"a file missing from it may simply not have been read", covered)
+	}
+	return fmt.Sprintf("ranking covers %s: the index build stopped at %s; "+
+		"a file missing from it may simply not have been read", covered, r.LexicalLimitReason)
 }
 
 // Index builds the cached indexes for the repository.
