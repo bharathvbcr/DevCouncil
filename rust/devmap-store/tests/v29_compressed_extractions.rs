@@ -696,3 +696,55 @@ fn status_does_not_read_unexamined_unconverted_payloads_as_clean() {
     assert_eq!(status_reason(&db), None, "a writer converts them all");
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// **What status covers is stated, and the gap is real and pinned.** A damaged
+/// frame that already has its entry wiring is outside the rows the heal picks:
+/// status does not examine it (checking every frame costs three times a whole
+/// status), the reader refuses it by name, and every reason status does give
+/// says its scope so that silence is not read as "all frames are fine".
+#[test]
+fn status_states_its_scope_and_does_not_examine_a_damaged_frame_that_has_its_wiring() {
+    let (dir, db) = written_store("status-scope");
+    let frame = frame_of(&db, "checks.py");
+    replace_frame(&db, "checks.py", &frame[..frame.len() / 2]);
+    assert_eq!(
+        one::<i64>(
+            &db,
+            "SELECT COUNT(*) FROM file_payloads WHERE entry_wiring_json IS NULL"
+        ),
+        0
+    );
+    assert_eq!(
+        status_reason(&db),
+        None,
+        "documented: a damaged frame with its wiring is found by the reader, not by status"
+    );
+    assert!(Store::open_read_only(&db)
+        .unwrap()
+        .latest_extraction_for_path("checks.py")
+        .err()
+        .expect("the reader refuses it")
+        .to_string()
+        .contains("checks.py"));
+
+    // Any reason status does give names its scope.
+    Connection::open(&db)
+        .unwrap()
+        .execute(
+            "UPDATE file_payloads SET extraction_json = '{not json'
+              WHERE file_id = (SELECT id FROM paths WHERE path = 'ledger.py')",
+            [],
+        )
+        .unwrap();
+    let reason = status_reason(&db).expect("an unreadable text payload is reported");
+    assert!(reason.contains("ledger.py"), "{reason}");
+    assert!(
+        reason.contains("covers only payloads a writer open would convert"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("found only when a reader decompresses it"),
+        "{reason}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}

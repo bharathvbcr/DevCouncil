@@ -1269,6 +1269,15 @@ generation {latest}; run `devmap status` to re-verify",
     /// reported; one that does not decode is. At most
     /// [`Self::ENCODING_EXAMINED`] rows are examined, and when more remain the
     /// reason says so instead of reading the rest as clean.
+    ///
+    /// **What it does not look at, and says so.** Only the rows the heal would
+    /// pick: a compressed frame that already has its entry wiring is never
+    /// examined, so one truncated or bit-rotted there is found when a reader
+    /// decompresses it, not here. A structural check of every frame's header was
+    /// built and measured (the leading bytes of 1,896 rows, no decompression):
+    /// status went from 1.9 ms to 5.8 ms, min of 14 per process, n=7 alternating,
+    /// because SQLite loads each blob to take its prefix. `status` runs on every
+    /// answer, so that was not taken; the reason names the scope instead.
     fn payload_encoding_reason_locked(
         snapshot: &rusqlite::Transaction<'_>,
     ) -> Result<Option<String>> {
@@ -1334,6 +1343,11 @@ generation {latest}; run `devmap status` to re-verify",
                 examined.len()
             ));
         }
+        reason.push_str(
+            "; this covers only payloads a writer open would convert (text, or without entry \
+             wiring): a compressed frame that already has its entry wiring is not examined, and \
+             a damaged one is found only when a reader decompresses it",
+        );
         reason.push_str(" -- `dev map doctor --fix` quarantines the store and rebuilds it");
         Ok(Some(reason))
     }
