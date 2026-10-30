@@ -28,6 +28,10 @@ mod adversarial_resolve;
 #[cfg(feature = "parse")]
 mod ambiguity_budget;
 #[cfg(feature = "parse")]
+mod attack_ccf_edges;
+#[cfg(feature = "parse")]
+mod attack_ccf_lsp;
+#[cfg(feature = "parse")]
 mod audit_regressions;
 #[cfg(feature = "parse")]
 mod calls_target_callables_only;
