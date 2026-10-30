@@ -984,25 +984,7 @@ pub(crate) fn run(
                         "edges_added": report.edges_added,
                         "sites_resolved": report.sites_resolved,
                         "sites_left_unresolved": report.sites_left_unresolved,
-                        "servers": report.servers.iter().map(|server| {
-                            serde_json::json!({
-                                "binary": server.binary,
-                                "version": server.version,
-                                "ran": server.ran,
-                                "did_not_run": server.did_not_run.as_ref().map(|reason| reason.label()),
-                                "files_considered": server.files_considered,
-                                "files_finished": server.files_finished,
-                                "edges_added": server.edges_added,
-                                // What the pass dropped rather than turned
-                                // into an edge or an abstention, so "ran and
-                                // found nothing" reads apart from "ran and
-                                // threw its answers away".
-                                "sites_without_position": server.sites_without_position,
-                                "files_unaddressable": server.files_unaddressable,
-                                "locations_undecodable": server.locations_undecodable,
-                                "locations_outside_repo": server.locations_outside_repo,
-                            })
-                        }).collect::<Vec<_>>(),
+                        "servers": report.servers.iter().map(lsp_server_json).collect::<Vec<_>>(),
                     })
                 }),
                 "manifest": manifest.as_ref().map(|manifest| &manifest.json),
@@ -1098,6 +1080,47 @@ pub(crate) fn run(
 /// log into the file, so "reclaimed 50,000 pages" and "reclaimed 50,000 pages
 /// and the file is exactly as large as it was" printed identically — which is
 /// how a store sat at 295 MB across eight builds that each reported success.
+/// One language server's row in the build report's `lsp.servers`.
+///
+/// A function rather than part of the `json!` literal around it: that literal
+/// is deep enough that one more field reaches the macro's recursion limit.
+fn lsp_server_json(server: &devmap_resolve::lsp::LspServerStatus) -> serde_json::Value {
+    serde_json::json!({
+        "binary": server.binary,
+        "version": server.version,
+        "ran": server.ran,
+        "did_not_run": server.did_not_run.as_ref().map(|reason| reason.label()),
+        // Why a server that started and exited did: the last of its stderr,
+        // bounded and redacted. `null` for every other outcome.
+        "stderr_tail": server.did_not_run.as_ref().and_then(|reason| reason.stderr_tail()),
+        // `true` when the server's stderr pipe had not closed by the time the
+        // wait for it ran out: `stderr_tail` is then what had arrived, not all
+        // of it. `null` when the outcome carries no tail.
+        "stderr_tail_incomplete": server
+            .did_not_run
+            .as_ref()
+            .and_then(|reason| reason.stderr_complete())
+            .map(|complete| !complete),
+        // Bytes the server wrote that `stderr_tail` does not carry: dropped to
+        // stay inside the cap, or the cut first line discarded. A server that
+        // wrote one very long line has `stderr_tail: null` and a count here.
+        "stderr_bytes_not_shown": server
+            .did_not_run
+            .as_ref()
+            .and_then(|reason| reason.stderr_not_shown()),
+        "files_considered": server.files_considered,
+        "files_finished": server.files_finished,
+        "edges_added": server.edges_added,
+        // What the pass dropped rather than turned into an edge or an
+        // abstention, so "ran and found nothing" reads apart from "ran and
+        // threw its answers away".
+        "sites_without_position": server.sites_without_position,
+        "files_unaddressable": server.files_unaddressable,
+        "locations_undecodable": server.locations_undecodable,
+        "locations_outside_repo": server.locations_outside_repo,
+    })
+}
+
 fn reclaim_note(vacuum: &devmap_store::VacuumOutcome) -> String {
     let base = format!(
         "{} freed {} page(s) at {:.1}% free ({} of {} pages)",
@@ -1468,6 +1491,40 @@ mod tests {
             by_language: rows.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
             ..ResolutionRate::default()
         }
+    }
+
+    /// The JSON row says "stderr tail incomplete" as the readout does, and
+    /// says nothing (`null`) for an outcome that has no tail to be incomplete.
+    #[test]
+    fn the_lsp_row_carries_whether_the_stderr_tail_is_incomplete() {
+        use devmap_resolve::lsp::{LspDidNotRun, LspServerStatus};
+        let row = |did_not_run: LspDidNotRun| {
+            lsp_server_json(&LspServerStatus {
+                binary: "dying-lsp".into(),
+                did_not_run: Some(did_not_run),
+                ..LspServerStatus::default()
+            })
+        };
+        let cut_short = row(LspDidNotRun::NonZeroExit {
+            code: Some(101),
+            stderr: Some("half a thought".into()),
+            stderr_complete: false,
+            stderr_not_shown: 15904,
+        });
+        assert_eq!(cut_short["stderr_tail"], "half a thought");
+        assert_eq!(cut_short["stderr_tail_incomplete"], true);
+        assert_eq!(cut_short["stderr_bytes_not_shown"], 15904);
+        let whole = row(LspDidNotRun::NonZeroExit {
+            code: Some(101),
+            stderr: Some("whole".into()),
+            stderr_complete: true,
+            stderr_not_shown: 0,
+        });
+        assert_eq!(whole["stderr_tail_incomplete"], false);
+        assert_eq!(whole["stderr_bytes_not_shown"], 0);
+        let timed_out = row(LspDidNotRun::TimedOut);
+        assert!(timed_out["stderr_tail_incomplete"].is_null());
+        assert!(timed_out["stderr_bytes_not_shown"].is_null());
     }
 
     /// A call-blind row prints no percent, never claims "0 attribution sites"

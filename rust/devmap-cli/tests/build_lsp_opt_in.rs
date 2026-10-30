@@ -217,3 +217,122 @@ fn build_without_lsp_flag_omits_the_lsp_block() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// A language server that starts and exits used to leave `non_zero_exit` and
+/// nothing else, because its stderr went to `/dev/null`. The JSON row and the
+/// build's own readout now carry the last of it, redacted.
+#[cfg(unix)]
+#[test]
+fn a_server_that_exits_at_start_up_has_its_stderr_in_the_report() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = tmp_dir("dying-server");
+    let repo = base.join("repo");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::write(
+        repo.join("src").join("lib.rs"),
+        "pub fn caller() {\n    not_defined_anywhere();\n}\n",
+    )
+    .unwrap();
+    let bin_dir = base.join("installed").join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let token = format!("ghp_{}", "A1b2C3d4E5".repeat(4));
+    let program = bin_dir.join("rust-analyzer");
+    fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\necho 'error: no sysroot found' >&2\necho 'token {token}' >&2\nexit 101\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let row = rust_analyzer_row(&repo, &base.join("a.sqlite"), bin_dir.as_os_str());
+    assert_eq!(row["ran"], false, "{row}");
+    assert_eq!(row["did_not_run"], "non_zero_exit", "{row}");
+    let tail = row["stderr_tail"].as_str().expect("a stderr tail");
+    assert!(tail.contains("no sysroot found"), "{row}");
+    assert_eq!(
+        row["stderr_tail_incomplete"], false,
+        "the child was reaped, so the pipe closed and the tail is whole: {row}"
+    );
+    assert!(
+        !tail.contains(&token),
+        "a credential must be redacted: {row}"
+    );
+
+    // The human readout (no --json) says it too, on stderr.
+    let output = Command::new(bin())
+        .args(["build", "--lsp", "--db"])
+        .arg(base.join("b.sqlite"))
+        .arg(&repo)
+        .current_dir(&repo)
+        .env("PATH", &bin_dir)
+        .output()
+        .expect("spawn build --lsp");
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(shown.contains("no sysroot found"), "{shown}");
+    assert!(!shown.contains(&token), "{shown}");
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// A server reached through a link keeps the name it was looked up by.
+///
+/// `~/.cargo/bin/rust-analyzer` is a link to `rustup`, which decides what to
+/// be from its own `argv[0]`: started as `rust-analyzer` it is the language
+/// server, started as `rustup` it prints its usage and exits. The pass finds
+/// the server through `dc_proc::resolve_outside`, which follows the link to
+/// the real file so that the repository boundary is checked on the file that
+/// runs; what must not follow the link is the name. Before the fix the
+/// resolved path was also the program name, so `build --lsp` on a Rust
+/// repository started rustup as rustup and reported `non_zero_exit` with
+/// rustup's usage as the stderr tail. The stand-in is a compiled proxy with
+/// rustup's shape (a script cannot see `argv[0]`): named `rust-analyzer` it
+/// records the name it was started under; named anything else it prints a
+/// usage line and exits 2.
+#[cfg(unix)]
+#[test]
+fn a_server_reached_through_a_link_is_started_under_the_name_it_was_looked_up_by() {
+    let base = tmp_dir("argv0-proxy");
+    let repo = base.join("repo");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::write(
+        repo.join("src").join("lib.rs"),
+        "pub fn caller() {\n    not_defined_anywhere();\n}\n",
+    )
+    .unwrap();
+    let marker = base.join("started-as");
+    let proxy = compile_argv0_proxy(&base.join("real"), "rust-analyzer", &marker);
+    let bin = base.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    // Relative, as rustup's own `rust-analyzer -> rustup` link is.
+    std::os::unix::fs::symlink(
+        std::path::Path::new("..").join("real").join("proxy"),
+        bin.join("rust-analyzer"),
+    )
+    .unwrap();
+
+    let row = rust_analyzer_row(&repo, &base.join("devmap.sqlite"), bin.as_os_str());
+    let tail = row["stderr_tail"].as_str().unwrap_or("");
+    assert!(
+        !tail.contains("usage: started as"),
+        "the proxy was started under its resolved file's name, not the one it was \
+         looked up by: {row}"
+    );
+    let started_as = fs::read_to_string(&marker)
+        .unwrap_or_else(|error| panic!("the proxy never ran as rust-analyzer ({error}): {row}"));
+    assert_eq!(
+        std::path::Path::new(started_as.trim())
+            .file_name()
+            .and_then(|n| n.to_str()),
+        Some("rust-analyzer"),
+        "argv[0] must be the looked-up name, not the link target {}: {row}",
+        proxy.display()
+    );
+    let _ = fs::remove_dir_all(&base);
+}
+
+include!("../../testsupport/proxy.rs");

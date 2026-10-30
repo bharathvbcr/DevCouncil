@@ -965,8 +965,23 @@ impl Resolver {
                                     // an arbitrary value's method that shares
                                     // a name with a free function beside it.
                                     if self.module_member_admitted(&ext.file_path, &recv, &method) {
-                                        if let Some((resolved_file, resolved_sym)) =
-                                            self.lookup_in_package(target_f, &method)
+                                        // Go: the imported package declares the
+                                        // name once per build variant. Asked
+                                        // first, because `lookup_in_package`
+                                        // abstains on the pair, or binds the one
+                                        // that happens to sit in `target_f`.
+                                        if family == LangFamily::Go {
+                                            resolution = self.go_build_variants(
+                                                &Self::parent_dir(target_f),
+                                                self.go_package_by_file.get(target_f),
+                                                &method,
+                                                false,
+                                            );
+                                        }
+                                        if let Some((resolved_file, resolved_sym)) = resolution
+                                            .is_none()
+                                            .then(|| self.lookup_in_package(target_f, &method))
+                                            .flatten()
                                         {
                                             resolution = Some(Arc::new(Resolution::ImportScoped {
                                                 target_symbol: resolved_sym,
@@ -1410,6 +1425,14 @@ impl Resolver {
                                 target_file,
                                 package_name,
                             }));
+                        } else if let Some(variants) = self.go_build_variants(
+                            &Self::parent_dir(&ext.file_path),
+                            self.go_package_by_file.get(&ext.file_path),
+                            &call.callee_name,
+                            ext.file_path.ends_with("_test.go"),
+                        ) {
+                            // The name is declared once per build variant.
+                            resolution = Some(variants);
                         }
                     }
                     // 2f. An unexported Go selector on a receiver no rung above
@@ -1692,14 +1715,18 @@ impl Resolver {
                             }
                             named => {
                                 if let Some((target_file, target_symbol)) = named.target() {
+                                    // A composite literal or conversion names a
+                                    // type, which nothing runs: a use, not a call.
+                                    let (edge_kind, details) =
+                                        self.call_site_edge_kind(family, target_file, target_symbol);
                                     edges.push(ResolvedEdge::resolved(
                                         ext.file_path.clone(),
                                         target_file.to_string(),
                                         caller_sym.clone(),
                                         self.qualified_for(target_file, target_symbol),
-                                        EdgeKind::Calls,
+                                        edge_kind,
                                         Arc::clone(resolution),
-                                        None,
+                                        details,
                                     ));
                                     emitted = true;
                                 }

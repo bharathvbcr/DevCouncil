@@ -56,6 +56,7 @@ impl Resolver {
         self.go_package_methods.clear();
         self.go_package_member_vetoes.clear();
         self.go_package_dirs_unvouched.clear();
+        self.go_constrained_files.clear();
         self.go_model = GoModel::default();
         self.swift_module_by_file.clear();
         self.jvm_package_by_file.clear();
@@ -301,6 +302,9 @@ impl Resolver {
             if let Some(pkg) = ext.go_package.as_deref().filter(|pkg| !pkg.is_empty()) {
                 self.go_package_by_file
                     .insert(ext.file_path.clone(), pkg.to_string());
+                if ext.go_build_constrained {
+                    self.go_constrained_files.insert(ext.file_path.clone());
+                }
                 // X45. The package block, indexed. `parent_symbol` is the
                 // extractor's own answer for "what declares this", and a
                 // file-level parent is exactly what Go puts in the package

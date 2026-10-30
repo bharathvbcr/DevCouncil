@@ -7,8 +7,10 @@
 //! framework's alias at `UniqueGlobal`: thirteen fabricated callers on one
 //! corpus. Rust rejects calling an alias (E0423), a Python `type` alias raises
 //! when called, and a TypeScript interface or alias has no runtime value, so
-//! none of them can be a callee. A tuple struct, which *is* a constructor,
-//! keeps its edge, so the fix is a narrowing and not a removal.
+//! none of them can be a callee. A tuple struct is a real type, so its
+//! construction keeps an edge — as a `References` edge, because a compiler's
+//! call graph (rust-analyzer, `go/types`) does not list a type as a callee.
+//! The fix is a narrowing and not a removal.
 
 use devmap_extract::extract_file;
 use devmap_extract::model::{EdgeKind, Extraction};
@@ -49,10 +51,25 @@ fn a_rust_call_does_not_bind_to_a_type_alias() {
              pub fn make() { let _h = HWND(0); let _k = Handle(1); }\n",
         ),
     ]);
-    assert_eq!(
-        call_targets(&resolution, "impl/window.rs"),
-        ["platform/windows.rs::Handle"],
-        "the tuple struct is a constructor; the alias never is"
+    assert!(
+        call_targets(&resolution, "impl/window.rs").is_empty(),
+        "neither the alias nor the tuple struct is a callee"
+    );
+    let uses: Vec<&str> = resolution
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.edge_kind == EdgeKind::References && edge.source_file == "impl/window.rs"
+        })
+        .map(|edge| edge.target_symbol.as_str())
+        .collect();
+    assert!(
+        uses.contains(&"platform/windows.rs::Handle"),
+        "the tuple struct's construction stays a use of the type: {uses:?}"
+    );
+    assert!(
+        !uses.contains(&"platform/windows.rs::HWND"),
+        "the alias is bound by no call-shaped use either: {uses:?}"
     );
 }
 

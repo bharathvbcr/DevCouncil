@@ -465,6 +465,8 @@ dependencies = [
 name = "devmap-resolve"
 version = "0.2.5"
 dependencies = [
+ "dc-proc",
+ "dc-redact",
  "devmap-extract",
  "rayon",
  "serde",

@@ -28,7 +28,13 @@ mod adversarial_resolve;
 #[cfg(feature = "parse")]
 mod ambiguity_budget;
 #[cfg(feature = "parse")]
+mod attack_ccf_edges;
+#[cfg(feature = "parse")]
+mod attack_ccf_lsp;
+#[cfg(feature = "parse")]
 mod audit_regressions;
+#[cfg(feature = "parse")]
+mod calls_target_callables_only;
 #[cfg(feature = "parse")]
 mod captured_receiver_attribution;
 #[cfg(feature = "parse")]
@@ -49,6 +55,8 @@ mod function_values_and_platform_targets;
 mod glob_reexport_poison;
 #[cfg(feature = "parse")]
 mod global_rung_requires_no_other_evidence;
+#[cfg(feature = "parse")]
+mod go_build_variants_are_one_callee_set;
 #[cfg(feature = "parse")]
 mod go_own_package_receiver;
 #[cfg(feature = "parse")]

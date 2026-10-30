@@ -16,10 +16,18 @@ name = "it"
 # no new crate enters the tree; resolution is the last serial CPU phase.
 rayon.workspace = true
 devmap-extract = { path = "../devmap-extract", default-features = false }
+# The workspace's one credential table, already linked through devmap-extract:
+# a language server's stderr is redacted with it before it is shown.
+dc-redact = { path = "../dc-redact" }
 serde.workspace = true
 # Workspace dep already linked by the CLI and store — used here for the opt-in
 # language-server JSON-RPC client (`devmap build --lsp`), not a new crate.
 serde_json.workspace = true
+
+[dev-dependencies]
+# Already linked through devmap-extract (which re-exports it as `subprocess`);
+# the `test-hooks` feature makes a slow stderr drain thread deterministic.
+dc-proc = { path = "../dc-proc", features = ["test-hooks"] }
 
 [features]
 default = ["parse"]

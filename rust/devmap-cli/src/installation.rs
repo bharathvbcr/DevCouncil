@@ -1086,7 +1086,7 @@ fn stale_servers_along(
             ))
         }
     };
-    let mut command = std::process::Command::new(ps);
+    let mut command = ps.command();
     // `etime=` (elapsed), not `lstart=` (a local-time wall clock). Two
     // reasons, both load-bearing:
     //
@@ -1524,6 +1524,6 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
         let found =
             found.unwrap_or_else(|failure| panic!("no ps in {PROCESS_INVENTORY_PATH}: {failure}"));
-        assert!(found.is_absolute(), "{}", found.display());
+        assert!(found.path().is_absolute(), "{}", found.path().display());
     }
 }
