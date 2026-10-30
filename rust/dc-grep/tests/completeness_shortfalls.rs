@@ -80,6 +80,28 @@ impl Drop for Repo {
     }
 }
 
+/// The per-cause report names exactly the files left out, and its counts add up
+/// to the total. A report that could be off by a file is not one to diagnose by.
+fn assert_class(built: &Value, class: &str, paths: &[&str]) {
+    let classes = built["lexical_unindexed_by_class"]
+        .as_object()
+        .unwrap_or_else(|| panic!("no per-cause report: {built}"));
+    let entry = &classes[class];
+    assert_eq!(entry["count"], paths.len(), "{class}: {built}");
+    let sample: Vec<&str> = entry["sample"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|path| path.as_str().unwrap())
+        .collect();
+    assert_eq!(sample, paths, "{class}: {built}");
+    let total: u64 = classes
+        .values()
+        .map(|entry| entry["count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(built["lexical_unindexed"], total, "{built}");
+}
+
 #[test]
 fn a_clean_tree_is_complete_with_both_counts_reported_as_zero() {
     let repo = Repo::new();
@@ -87,6 +109,10 @@ fn a_clean_tree_is_complete_with_both_counts_reported_as_zero() {
     repo.write("b.rs", "fn visible_badger() {}\n");
     let (built, ranked) = repo.built_and_ranked("visible_alpaca");
     assert_eq!(built["lexical_unindexed"], 0, "{built}");
+    assert!(
+        built.get("lexical_unindexed_by_class").is_none(),
+        "nothing left out, nothing to break down: {built}"
+    );
     assert_eq!(ranked["complete"], true, "{ranked}");
     assert_eq!(ranked["walk_errors"], 0, "{ranked}");
     assert_eq!(ranked["lexical_unindexed"], 0, "{ranked}");
@@ -102,6 +128,7 @@ fn an_unreadable_file_is_counted_not_skipped() {
     let (built, ranked) = repo.built_and_ranked("visible_alpaca");
     assert_eq!(built["lexical_unindexed"], 1, "{built}");
     assert_eq!(ranked["lexical_unindexed"], 1, "{ranked}");
+    assert_class(&built, "unopenable", &["b.rs"]);
     // An unreadable file is not a walk error: the walk saw it.
     assert_eq!(ranked["walk_errors"], 0, "{ranked}");
     assert_eq!(ranked["complete"], false, "{ranked}");
@@ -130,6 +157,7 @@ fn a_file_over_the_read_bound_is_counted() {
     );
     let (built, ranked) = repo.built_and_ranked("needlezebra");
     assert_eq!(built["lexical_unindexed"], 1, "{built}");
+    assert_class(&built, "oversized_text", &["huge.txt"]);
     assert_eq!(ranked["count"], 0, "{ranked}");
     assert_eq!(ranked["lexical_unindexed"], 1, "{ranked}");
     assert_eq!(ranked["complete"], false, "{ranked}");
@@ -179,7 +207,8 @@ fn a_file_over_the_term_cap_is_counted() {
     }
     repo.write("big.txt", &big);
     repo.write("small.rs", "fn small_alpaca() {}\n");
-    let (_, ranked) = repo.built_and_ranked("small_alpaca");
+    let (built, ranked) = repo.built_and_ranked("small_alpaca");
+    assert_class(&built, "term_cap", &["big.txt"]);
     assert_eq!(ranked["lexical_unindexed"], 1, "{ranked}");
     assert_eq!(ranked["complete"], false, "{ranked}");
 }
@@ -219,6 +248,7 @@ fn a_file_missing_from_the_encoding_is_counted() {
     let _ = fs::remove_file(&encoding);
     assert!(ok, "{built}");
     assert_eq!(built["lexical_unindexed"], 1, "{built}");
+    assert_class(&built, "not_in_encoding", &["src/gamma.rs"]);
     let (ok, ranked) = repo.call("rank", json!({ "query": "parse" }));
     assert!(ok, "{ranked}");
     assert_eq!(ranked["lexical_unindexed"], 1, "{ranked}");

@@ -2,7 +2,7 @@
 //! and a file is excluded only when its opened descriptor matches the version
 //! read into the index. Missing evidence always means running the matcher.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, Metadata, TryLockError};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -161,6 +161,11 @@ pub struct IndexResponse {
     /// files are not counted: they are not rankable by kind. Any nonzero value
     /// makes a `rank` answer `complete: false`.
     pub lexical_unindexed: usize,
+    /// `lexical_unindexed` by cause, with the first paths of each, so a
+    /// ranking that says `complete: false` can be told why without a second
+    /// tool. Counts add up to `lexical_unindexed`; the sample is bounded.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub lexical_unindexed_by_class: BTreeMap<&'static str, LeftOut>,
     /// The ceiling that stopped the ranked build, if one did: its own
     /// (`lexical_postings`) or the walk's (`files`, `duration`, `input_bytes`).
     /// The same value a `rank` answer reports, because it is read back from the
@@ -185,6 +190,33 @@ pub struct IndexResponse {
 
 fn is_zero(value: &usize) -> bool {
     *value == 0
+}
+
+/// Most paths kept per cause in `lexical_unindexed_by_class`. A repository can
+/// leave out thousands of files for one reason, and the response is a report,
+/// not a listing; `count` is always the whole number.
+const LEFT_OUT_SAMPLE: usize = 50;
+
+/// One cause for leaving an admissible file out of the ranked index.
+#[derive(Debug, Default, Serialize)]
+pub struct LeftOut {
+    pub count: usize,
+    pub sample: Vec<String>,
+}
+
+impl IndexResponse {
+    /// Records an admissible file the ranked index does not hold, and why.
+    ///
+    /// The one place `lexical_unindexed` is incremented, so the total and the
+    /// per-cause counts cannot disagree.
+    fn left_out(&mut self, class: &'static str, path: &str) {
+        self.lexical_unindexed += 1;
+        let entry = self.lexical_unindexed_by_class.entry(class).or_default();
+        entry.count += 1;
+        if entry.sample.len() < LEFT_OUT_SAMPLE {
+            entry.sample.push(path.to_string());
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -575,6 +607,7 @@ fn build_with_limits(
         lexical_files: 0,
         lexical_postings: 0,
         lexical_unindexed: 0,
+        lexical_unindexed_by_class: BTreeMap::new(),
         lexical_limit_reason: None,
         lexical_vocabulary: match &encoded {
             Some(encoded) => encoded.vocabulary.as_str(),
@@ -657,7 +690,7 @@ fn build_with_limits(
         // is not UTF-8 is not rankable, so leaving it out is not a shortfall.
         let Some(path) = entry.path().strip_prefix(&root).ok().and_then(slashed) else {
             // A name that is not UTF-8 cannot be written into the index.
-            response.lexical_unindexed += 1;
+            response.left_out("unrepresentable_name", &entry.path().to_string_lossy());
             continue;
         };
         let file = match open_for_search(entry.path()) {
@@ -665,7 +698,7 @@ fn build_with_limits(
             Err(_) => {
                 // Permission denied, vanished, a loop: the file exists and could
                 // not be opened, which is not the same as having nothing to say.
-                response.lexical_unindexed += 1;
+                response.left_out("unopenable", &path);
                 continue;
             }
         };
@@ -680,13 +713,13 @@ fn build_with_limits(
                 // is judged by its first bytes through the same rule the
                 // admitted path applies.
                 if oversized_is_text(&file) {
-                    response.lexical_unindexed += 1;
+                    response.left_out("oversized_text", &path);
                 }
                 continue;
             }
             _ => {
                 // No longer a regular file, or no metadata.
-                response.lexical_unindexed += 1;
+                response.left_out("not_a_regular_file", &path);
                 continue;
             }
         };
@@ -701,7 +734,7 @@ fn build_with_limits(
         }
         let before = file_version(&metadata);
         if !before.is_trusted() {
-            response.lexical_unindexed += 1;
+            response.left_out("untrusted_version", &path);
             continue;
         }
         let mut bytes = Vec::new();
@@ -717,7 +750,7 @@ fn build_with_limits(
             break;
         }
         if read.is_err() {
-            response.lexical_unindexed += 1;
+            response.left_out("unreadable", &path);
             continue;
         }
         // Only unchanged plain UTF-8 is eligible for negative evidence. Other
@@ -749,14 +782,14 @@ fn build_with_limits(
         let after = match file.metadata() {
             Ok(meta) => file_version(&meta),
             Err(_) => {
-                response.lexical_unindexed += 1;
+                response.left_out("no_metadata_after_read", &path);
                 continue;
             }
         };
         if before != after {
             // Changed while it was read, so the bytes in hand are not any
             // version of the file; the next build will see it.
-            response.lexical_unindexed += 1;
+            response.left_out("changed_while_read", &path);
             continue;
         }
         // Checked above: this byte slice is plain UTF-8 with no NUL and no
@@ -778,7 +811,7 @@ fn build_with_limits(
                     // Reached by the walk, absent from the encoding: the file
                     // is newer than the model run. It is searchable and simply
                     // unranked, which `lexical_unindexed` already means.
-                    None => response.lexical_unindexed += 1,
+                    None => response.left_out("not_in_encoding", &path),
                 },
                 // Computed here, from these bytes, on this pass.
                 None => {
@@ -799,7 +832,7 @@ fn build_with_limits(
                         // this document's length is not its length. Ranking it
                         // against documents that were measured whole would put
                         // it wherever the ceiling happened to fall.
-                        response.lexical_unindexed += 1;
+                        response.left_out("term_cap", &path);
                     }
                 }
             }

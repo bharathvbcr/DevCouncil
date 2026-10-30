@@ -231,6 +231,16 @@ files whose extensions the producer does not encode). They remain fully
 searchable by `dcgrep search`; only the ranking leaves them out, and any of
 them makes `complete` false.
 
+`dcgrep index` breaks the count down in `lexical_unindexed_by_class`: per cause
+(`unopenable`, `oversized_text`, `term_cap`, `not_in_encoding`, `unreadable`,
+`changed_while_read`, `unrepresentable_name`, `not_a_regular_file`,
+`untrusted_version`, `no_metadata_after_read`), a `count` and the first 50
+paths. The counts add up to `lexical_unindexed`. Over this repository at the
+time of writing it reads one `oversized_text` file (a 30 MB generated parser)
+and 37 `term_cap` files — generated JSON, vendored parsers and large fixtures
+whose 20,000-term cap a faithful re-implementation of the tokeniser confirms
+they exceed.
+
 Queries against the resulting index return in **6.7–8.2 ms** (minimum to p90,
 40 interleaved repeats per cell on an M-series laptop). `code-v1` over the same
 repository returns in **5.3–6.7 ms**. About 2.5 ms of each is process start:
