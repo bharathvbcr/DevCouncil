@@ -160,7 +160,9 @@ third of the run. `--walk` forces that fallback.
 dcgrep index <<< '{"root":".","sparse":"/tmp/sparse.jsonl"}'
 ```
 
-Over this repository, on an M-series laptop:
+Over this repository, from a build made before the two ceilings below were
+separated (on an M-series laptop). It is kept because it is the shape to
+recognise in an old report:
 
 ```json
 {
@@ -179,29 +181,47 @@ Over this repository, on an M-series laptop:
 }
 ```
 
-**Read three fields together, in this order.**
+There, `limit_reason: "postings"` was the trigram index's ceiling, and it also
+ended the walk, so the ranked index stopped at the same file without ever
+reaching a ceiling of its own — `lexical_limit_reason: null` while a fifth of the
+repository was unranked. A ranking over it was a ranking over a prefix, and
+nothing in the answer said so.
 
-`limit_reason` first. `"postings"` here means the build stopped at the trigram
-index's ceiling after 1047 files — so the ranked index covers only what the
-build reached, and every count below is about that prefix rather than the
-repository. `traversal_complete: false` says the same thing. This repository
-holds 5388 files the walk would admit, so the ranked index describes about a
-fifth of it; that ceiling, not the ranked side, is what binds here.
-`lexical_limit_reason: null` is the proof — the ranked builder never reached a
-limit of its own.
+**The two indexes now have separate ceilings, and each is reported by its own
+field.** Read these in this order:
+
+1. **`lexical_limit_reason`** — why the *ranked* index is short of the tree, if
+   it is. `null` means no ceiling stopped it. Otherwise it names one:
+   `lexical_postings` (the ranked index's own, 4,000,000 postings), or a walk
+   ceiling that ended the build for both indexes: `files`, `duration` or
+   `input_bytes`. The same value is stored in `lexical.bin` and returned by every
+   `rank` answer as `lexical_limit_reason` beside `complete`.
+2. **`files_seen` against `lexical_files`.** `files_seen` is every file the walk
+   reached — it keeps counting after the trigram index is full — so this pair is
+   how much of the repository the ranking covers. Files that are never
+   indexable (binary, over 2 MiB, not UTF-8, or too repetitive to tokenise
+   whole, counted in `lexical_unindexed`) are in `files_seen` and not in
+   `lexical_files`, which is why `complete` and not the arithmetic is the
+   verdict.
+3. **`limit_reason`** — the *trigram* index's ceiling only. `"postings"` here
+   means the trigram index filled and `dcgrep search` reads the files past it
+   with the matcher instead of skipping them by index; it costs acceleration and
+   changes no result. It says nothing about the ranked index, which carries on
+   past it (`lexical_files` can exceed `files_indexed`). `traversal_complete:
+   false` is the same fact.
 
 `lexical_unmatched` counts documents the encoding described that the build did
 not place. It has two quite different causes and this field alone does not
 distinguish them: a **stale encoding** — files deleted, newly ignored, or never
 in this repository — or a **build that stopped early**, which is what the 491
-above is. The producer listed 1478 files and the build reached 987 of them
-before its ceiling; the arithmetic closes. Check `limit_reason` before reading
-this number as staleness.
+above was. Check `lexical_limit_reason` before reading this number as
+staleness: if it names a ceiling, the encoding is probably fine and the build
+is what ran out.
 
 `lexical_unindexed` is the other direction: files the build read that the
-encoding did not describe — here, 58 files whose extensions the producer does
-not encode. They remain fully searchable by `dcgrep search`; only the ranking
-leaves them out.
+encoding did not describe — in the example, 58 files whose extensions the
+producer does not encode. They remain fully searchable by `dcgrep search`; only
+the ranking leaves them out.
 
 Queries against the resulting index return in **6.7–8.2 ms** (minimum to p90,
 40 interleaved repeats per cell on an M-series laptop). `code-v1` over the same
@@ -393,9 +413,26 @@ a number in `lexical_unmatched`.
   "terms_unknown": 0,
   "terms_total": 3,
   "files_indexed": 1140,
+  "files_seen": 1152,
+  "complete": true,
+  "lexical_limit_reason": null,
   "index_postings": 482301
 }
 ```
+
+**Read `complete` before anything else.** `false` means a ceiling stopped the
+build that wrote this index, so the ranking is over a prefix of the repository
+and a file that is missing from it may be missing because it was never read, not
+because nothing in it is about the query. `lexical_limit_reason` names the
+ceiling (`lexical_postings`, `files`, `duration` or `input_bytes`), and
+`files_indexed` against `files_seen` says how much was reached. The field is
+always present; a reply without it comes from a build that predates it, and a
+client must read that as not known to be complete — the Go client does.
+
+`complete: true` does not mean every file is in the ranking. Files the index
+never admits — binary, over 2 MiB, not UTF-8, or too repetitive to tokenise
+whole — are in `files_seen` and not in `files_indexed` in either case. `complete`
+is about the build having been stopped, not about those admission rules.
 
 - **`score`** is comparable within one response and meaningless across two. It
   depends on the corpus, so 8.1 here and 8.1 from another repository say
@@ -468,10 +505,23 @@ files. They were one constant until that happened.
 
 ## Limits
 
-Every ceiling is reported when it bites, never applied silently.
+Every ceiling is reported when it bites, never applied silently. A ceiling on
+the build is reported twice: by `dcgrep index` when it runs, and by every
+`rank` answer afterwards (`complete`, `lexical_limit_reason`), because the
+ranking is read long after the build that bounded it.
+
+The trigram index and the ranked index have **separate** ceilings, and one does
+not end the other. The trigram index filling stops only the trigram index; the
+walk goes on and the ranked index with it. Only the walk's own ceilings —
+files, bytes read, time — end both.
 
 | Limit | Value | Reported as |
 |---|---|---|
+| Postings in one trigram index | 4,194,304 (derived, below) | `limit_reason: "postings"`, `traversal_complete: false`; `search` still reads the files past it |
+| Files in one index build | 50,000, or the request's `max_files` | `limit_reason` and `lexical_limit_reason: "files"` |
+| Bytes read by one index build | 128 MiB | `limit_reason` and `lexical_limit_reason: "input_bytes"` |
+| Wall time of one index build | 30 s | `limit_reason` and `lexical_limit_reason: "duration"` |
+| One file read by the index | 2 MiB | counted in `files_unindexed`; the matcher still reads it |
 | Postings in one ranked index | 4,000,000 | `lexical_limit_reason: "lexical_postings"` |
 | Postings read from one encoding | 32,000,000 | build refused |
 | Terms from one document | 20,000 | `lexical_unindexed` |
@@ -485,6 +535,18 @@ A document that hit the per-document token ceiling is counted in
 `lexical_unindexed` rather than indexed short: its length would not be its
 length, and ranking it against documents measured whole would put it wherever
 the ceiling happened to fall.
+
+The trigram ceiling is derived, not chosen. Every cache file is refused at open
+above 64 MiB, and the build's own integrity pass fails on one first. `index.bin`
+takes 6 bytes per posting and `lookup.bin` 16 bytes per distinct trigram, and a
+posting list of one entry makes the distinct trigrams as many as the postings,
+so the most this can hold with no input able to produce a file the reader then
+refuses is 64 MiB / 16 B = 4,194,304. (`index.bin` alone would allow
+11,184,810, and a corpus of mostly distinct trigrams would then fail the build
+outright.) It was 2,000,000, picked by eye, and it ended the walk at 1,139 of
+this repository's files. Both entry sizes are pinned in tests against what
+tgrep writes. A walk past the ceiling still counts `files_seen` without reading
+the files once neither index has room.
 
 The encoding's posting budget is there because the two per-item bounds above it
 — 200,000 documents and 20,000 terms each — do not bound their product. Four
