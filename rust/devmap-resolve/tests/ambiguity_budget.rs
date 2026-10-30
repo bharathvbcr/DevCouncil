@@ -496,3 +496,68 @@ fn a_zero_budget_loses_the_unique_name_edge_and_the_gap_names_it() {
     );
     assert_eq!(evidence.budget_gaps()[0].names_skipped, 0);
 }
+
+/// `CappedGlobal` means candidates were dropped. A list that already fits the
+/// retained prefix loses nothing when the ambiguity budget trips, so it stays
+/// the complete `AmbiguousGlobal` it was and records no gap. Tagging it capped
+/// reported "50 candidate list(s) cut to a retained prefix, 0 candidate(s)
+/// dropped" and, through `AnalysisStatus::Partial`, marked the graph degraded
+/// for a loss that did not happen.
+#[test]
+fn a_truncation_that_drops_nothing_stays_ambiguous_and_records_no_gap() {
+    let inputs = fixture(3, 5);
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&inputs);
+    // The budget trips on the first list; the default prefix (8) holds all 3.
+    let tight = devmap_resolve::ResolutionLimits {
+        ambiguity_evidence_bytes: 1,
+        ..Default::default()
+    };
+    let result = resolver.resolve_all_with_limits(&inputs, tight).unwrap();
+    assert!(
+        capped_rows(&result).is_empty(),
+        "nothing was dropped, so no row is capped"
+    );
+    assert!(
+        result.budget_gaps().is_empty(),
+        "and no gap is recorded: {:?}",
+        result.budget_gaps()
+    );
+    let ambiguous: Vec<_> = result
+        .unresolved
+        .iter()
+        .filter_map(|row| match &row.resolution {
+            Resolution::AmbiguousGlobal { candidates, .. } => Some(candidates.len()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ambiguous.len(), 10, "every site keeps its row");
+    assert!(
+        ambiguous.iter().all(|len| *len == 3),
+        "with the complete list: {ambiguous:?}"
+    );
+
+    // The boundary: a prefix of exactly the list's length drops nothing, one
+    // shorter drops one and says so.
+    for (keep, dropped) in [(3usize, None), (2, Some(1usize))] {
+        let result = resolver
+            .resolve_all_with_limits(
+                &inputs,
+                devmap_resolve::ResolutionLimits {
+                    ambiguity_evidence_bytes: 1,
+                    degraded_candidates: keep,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        match dropped {
+            None => assert!(result.budget_gaps().is_empty(), "keep={keep}"),
+            Some(dropped) => {
+                let gaps = result.budget_gaps();
+                assert_eq!(gaps.len(), 1, "keep={keep}");
+                assert_eq!(gaps[0].candidates_dropped, dropped, "keep={keep}");
+                assert_eq!(gaps[0].names_truncated, 1, "keep={keep}");
+            }
+        }
+    }
+}

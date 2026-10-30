@@ -1648,7 +1648,7 @@ impl Resolver {
                                 // row, with the true count.
                                 Some(cap) => Resolution::CappedGlobal {
                                     candidates: Arc::clone(&candidates.rows),
-                                    total: Some(candidates.declarations),
+                                    total: Some(cap.distinct_total),
                                     limit: Arc::clone(&cap.limit),
                                     family,
                                 },

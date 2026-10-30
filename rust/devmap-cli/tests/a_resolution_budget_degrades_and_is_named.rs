@@ -347,3 +347,44 @@ fn a_store_built_under_a_tight_budget_reports_it_in_the_daemons_status() {
     );
     assert_eq!(daemon, cli_reason, "daemon and CLI status disagree");
 }
+
+/// A budget that trips on a list short enough to keep whole drops nothing, so it
+/// is no gap: the build, `status` and both exported maps stay clean. (The
+/// shape that reported "N candidate list(s) cut to a retained prefix, 0
+/// candidate(s) dropped" and marked the graph degraded.)
+#[test]
+fn a_tripped_budget_that_drops_no_candidate_degrades_nothing() {
+    let root = scratch("no-op-cut");
+    for index in 0..3 {
+        std::fs::write(root.join(format!("p{index}.py")), "def leaf():\n    pass\n").unwrap();
+    }
+    std::fs::write(
+        root.join("caller.py"),
+        "def run():\n    leaf()\n    leaf()\n",
+    )
+    .unwrap();
+    let mut args = build_args(&["--resolve-ambiguity-evidence-bytes", "1"]);
+    args.extend_from_slice(&["--manifest"]);
+    let build = json(&root, &args);
+    assert_eq!(
+        build["resolution_budget"].as_array().unwrap().len(),
+        0,
+        "{build}"
+    );
+    let status = json(&root, &["--json", "status"]);
+    assert_eq!(
+        status["coverage_gaps"]["resolution_budget"]["total"], 0,
+        "{status}"
+    );
+    manifest_exports(&root);
+    let map = read_json(&root.join("repo_map.json"));
+    assert_eq!(
+        map["graph_degraded"], false,
+        "{}",
+        map["graph_degraded_reason"]
+    );
+    assert_eq!(
+        read_json(&root.join("code_graph.json"))["meta"]["devmap_rust"]["analysis_status"],
+        "ok"
+    );
+}

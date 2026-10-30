@@ -60,6 +60,7 @@ impl Resolver {
                 cap: Some(CandidateCap {
                     limit: Arc::from(error.resource),
                     looked_up: false,
+                    distinct_total: 0,
                 }),
             });
             cache.sets.insert(key, Arc::clone(&set));
@@ -119,16 +120,27 @@ impl Resolver {
                 if !cache.degrade {
                     return Err(error);
                 }
-                // Keep the sorted prefix, and charge it so the degraded lists
-                // still add up; a list this short never refuses.
-                candidates.truncate(limits.degraded_candidates.max(1));
+                // Keep the sorted prefix, and charge what is kept so the
+                // degraded lists still add up; a list this short never
+                // refuses.
+                //
+                // `CappedGlobal` means candidates were dropped. A list already
+                // within the prefix loses nothing, so it stays the complete
+                // `AmbiguousGlobal` it was: tagging it capped would mark the
+                // graph degraded for a loss that did not happen.
+                let keep = limits.degraded_candidates.max(1);
+                if candidates.len() > keep {
+                    let distinct_total = candidates.len();
+                    candidates.truncate(keep);
+                    cap = Some(CandidateCap {
+                        limit: Arc::from(error.resource),
+                        looked_up: true,
+                        distinct_total,
+                    });
+                }
                 cache.evidence_bytes = cache
                     .evidence_bytes
                     .saturating_add(evidence_bytes_of(&candidates));
-                cap = Some(CandidateCap {
-                    limit: Arc::from(error.resource),
-                    looked_up: true,
-                });
             }
         }
         let candidates = Arc::new(GlobalCandidates {

@@ -117,6 +117,12 @@ struct CandidateCap {
     /// `false` when the lookup was skipped outright, so `declarations` and
     /// `rows` say nothing about the name.
     looked_up: bool,
+    /// Distinct targets the list held before the cut, so a capped row's dropped
+    /// count is `distinct_total - rows.len()` exactly. `declarations` cannot
+    /// say it: it counts declarations, and two that share a file and an
+    /// identity are one target after the dedup. Zero when the lookup was
+    /// skipped.
+    distinct_total: usize,
 }
 type CandidateKey = (LangFamily, String, String);
 
