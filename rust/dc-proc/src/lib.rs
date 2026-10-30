@@ -1311,9 +1311,11 @@ pub struct Session {
 }
 
 impl Session {
-    /// The child's stdin, once; `None` after the first call.
-    pub fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
-        self.child.stdin.take()
+    /// The child's stdin, once; `None` after the first call. Writing to it
+    /// after the child has gone is an `Err(BrokenPipe)`, never a signal: see
+    /// [`SessionStdin`].
+    pub fn take_stdin(&mut self) -> Option<SessionStdin> {
+        self.child.stdin.take().map(SessionStdin::new)
     }
 
     /// The child's stdout, once; `None` after the first call.
@@ -1395,6 +1397,124 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.kill();
+    }
+}
+
+/// The write end of a [`Session`] child's stdin.
+///
+/// A write to a pipe whose reader has exited raises `SIGPIPE`, and a process
+/// that has the default disposition for it dies on the spot. A one-shot
+/// `devmap` command does (`devmap export | head` must end quietly), so a
+/// language server that exited before its first frame was written — a server
+/// that dies at start-up, which is exactly the case the caller wants to
+/// report — killed the whole `devmap build --lsp` with signal 13 before it
+/// printed anything: 7 of 60 runs under load. A caller that talks to a child
+/// has to be able to see that the child is gone, so writes here return
+/// `Err(BrokenPipe)` instead, on whichever thread they run.
+///
+/// On macOS the signal is not the writing thread's to mask: the unmasked write
+/// returned `BrokenPipe` and the process was killed anyway (the test beside
+/// this crate shows it), so the descriptor's own `F_SETNOSIGPIPE` flag is used.
+/// Elsewhere on Unix the signal is the writing thread's, and the write runs
+/// with it blocked and the signal it raised taken back (type-checked for
+/// `x86_64-unknown-linux-gnu` from macOS, not run there).
+pub struct SessionStdin {
+    inner: std::process::ChildStdin,
+}
+
+impl SessionStdin {
+    fn new(inner: std::process::ChildStdin) -> Self {
+        sigpipe::refuse_on_descriptor(&inner);
+        Self { inner }
+    }
+}
+
+impl std::io::Write for SessionStdin {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        sigpipe::as_error(|| std::io::Write::write(&mut self.inner, buf))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        sigpipe::as_error(|| std::io::Write::flush(&mut self.inner))
+    }
+}
+
+/// How a write to a closed pipe becomes an error instead of a signal; one
+/// module so the audited `unsafe` surface is one place.
+mod sigpipe {
+    use std::io;
+    use std::process::ChildStdin;
+
+    /// macOS: set `F_SETNOSIGPIPE` on the descriptor, once.
+    #[cfg(target_os = "macos")]
+    #[allow(
+        unsafe_code,
+        reason = "one audited fcntl(F_SETNOSIGPIPE) on a descriptor the caller owns"
+    )]
+    pub(super) fn refuse_on_descriptor(pipe: &ChildStdin) {
+        use std::os::fd::AsRawFd;
+        // `<sys/fcntl.h>`; the `libc` this workspace is locked to does not
+        // export it.
+        const F_SETNOSIGPIPE: libc::c_int = 73;
+        // SAFETY: `fcntl` with `F_SETNOSIGPIPE` sets a flag on a descriptor
+        // `pipe` keeps open for the call; it reads no memory.
+        unsafe {
+            libc::fcntl(pipe.as_raw_fd(), F_SETNOSIGPIPE, 1);
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn refuse_on_descriptor(_pipe: &ChildStdin) {}
+
+    /// macOS: the descriptor flag already did the work.
+    #[cfg(target_os = "macos")]
+    pub(super) fn as_error<R>(write: impl FnOnce() -> io::Result<R>) -> io::Result<R> {
+        write()
+    }
+
+    /// Other Unix: `SIGPIPE` is the writing thread's. Block it for the write;
+    /// if the write failed because the reader is gone the signal is pending,
+    /// and unblocking it would deliver it, so take it first.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[allow(
+        unsafe_code,
+        reason = "pthread_sigmask, sigpending and sigtimedwait on this thread's own mask"
+    )]
+    pub(super) fn as_error<R>(write: impl FnOnce() -> io::Result<R>) -> io::Result<R> {
+        // SAFETY: every `sigset_t` is initialised by `sigemptyset` before it is
+        // read; the calls touch only the calling thread's signal mask and
+        // pending set, and the mask is put back before returning.
+        unsafe {
+            let mut blocked: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut blocked);
+            libc::sigaddset(&mut blocked, libc::SIGPIPE);
+            let mut before: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut before);
+            if libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut before) != 0 {
+                return write();
+            }
+            let result = write();
+            if matches!(&result, Err(error) if error.kind() == io::ErrorKind::BrokenPipe) {
+                let mut pending: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut pending);
+                if libc::sigpending(&mut pending) == 0
+                    && libc::sigismember(&pending, libc::SIGPIPE) == 1
+                {
+                    let now = libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    };
+                    libc::sigtimedwait(&blocked, std::ptr::null_mut(), &now);
+                }
+            }
+            libc::pthread_sigmask(libc::SIG_SETMASK, &before, std::ptr::null_mut());
+            result
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn as_error<R>(write: impl FnOnce() -> io::Result<R>) -> io::Result<R> {
+        write()
     }
 }
 
