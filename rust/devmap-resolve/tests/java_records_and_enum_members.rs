@@ -16,7 +16,7 @@
 
 use devmap_extract::extract_file;
 use devmap_extract::model::{EdgeKind, Extraction, SymbolKind};
-use devmap_resolve::model::ResolutionResult;
+use devmap_resolve::model::{ResolutionResult, UnresolvedClass, UnresolvedKind};
 use devmap_resolve::Resolver;
 
 const POINT: &str = "package p;\npublic record Point(int x, int y) {}\n";
@@ -376,4 +376,105 @@ public class Host {\n\
             "{name}"
         );
     }
+}
+
+// `java.lang` is the last route of a Java type name's lookup: declaration, same
+// package, on-demand import, then `java.lang`. A name this table owns that no
+// earlier route bound is the JDK's, so its miss is `External`, as `Map` and
+// `PrintStream` are through their imports. A namesake in a *different language*
+// in the same corpus (a Go `String()` method, which Orbit has) must not turn the
+// Java type into an unexplained row.
+
+const PERSON: &str = "package p;\n\
+import java.util.Map;\n\
+public record Person(String name, int age, Map<String, Integer> tags) {\n\
+    public String label() { return name; }\n\
+}\n";
+const GO_STRINGER: &str =
+    "package pb\ntype Fmt int\nfunc (f Fmt) String() string { return \"\" }\n";
+
+/// The class of every `Type` reference row for `name` in `file`.
+fn type_rows(result: &ResolutionResult, file: &str, name: &str) -> Vec<(String, UnresolvedClass)> {
+    result
+        .unresolved
+        .iter()
+        .filter(|row| {
+            row.source_file == file
+                && row.callee_name == name
+                && row.kind == UnresolvedKind::Reference
+        })
+        .map(|row| (row.source_symbol.clone(), row.class.clone()))
+        .collect()
+}
+
+#[test]
+fn string_in_a_record_is_external_java_lang_beside_a_foreign_namesake() {
+    let (_, result) = resolve(&[("p/Person.java", PERSON), ("pb/fmt.go", GO_STRINGER)]);
+    let rows = type_rows(&result, "p/Person.java", "String");
+    // The component field, its implicit accessor, the explicit accessor's return
+    // type and the generic argument: a record has no fewer than the component
+    // and the accessor.
+    assert!(
+        rows.iter()
+            .any(|(symbol, _)| symbol == "p/Person.java::Person.name")
+            && rows
+                .iter()
+                .any(|(symbol, _)| symbol == "p/Person.java::Person.label"),
+        "the component and the accessor's return type are rows: {rows:?}"
+    );
+    for (symbol, class) in &rows {
+        assert_eq!(
+            class,
+            &UnresolvedClass::External {
+                module: "java.lang.String".to_string()
+            },
+            "{symbol}"
+        );
+    }
+    // The imported `Map` is the control: same lookup, already external.
+    assert!(
+        type_rows(&result, "p/Person.java", "Map")
+            .iter()
+            .all(|(_, class)| matches!(class, UnresolvedClass::External { module } if module == "java.util.Map")),
+    );
+}
+
+#[test]
+fn a_java_declaration_of_the_name_keeps_the_miss_unexplained() {
+    // Fail open: a JVM-language declaration of the name anywhere in the corpus
+    // is evidence the miss may be a bind failure, not the JDK's type. (A method
+    // is the declaration that does not bind a type reference, so the miss stays.)
+    let (_, result) = resolve(&[
+        ("p/Person.java", PERSON),
+        (
+            "q/Util.java",
+            "package q;\npublic class Util { public static int String() { return 1; } }\n",
+        ),
+    ]);
+    let rows = type_rows(&result, "p/Person.java", "String");
+    assert!(
+        !rows.is_empty()
+            && rows
+                .iter()
+                .all(|(_, class)| matches!(class, UnresolvedClass::Unresolved)),
+        "{rows:?}"
+    );
+}
+
+#[test]
+fn a_csharp_string_is_not_java_lang() {
+    // `CStyle` is one family for C, C++, C#, Objective-C and Java; the table is
+    // Java's alone.
+    let (_, result) = resolve(&[
+        (
+            "n/Person.cs",
+            "namespace N { public class Person { public String Name; } }\n",
+        ),
+        ("pb/fmt.go", GO_STRINGER),
+    ]);
+    assert!(
+        type_rows(&result, "n/Person.cs", "String")
+            .iter()
+            .all(|(_, class)| !matches!(class, UnresolvedClass::External { module } if module.starts_with("java."))),
+    );
 }

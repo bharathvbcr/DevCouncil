@@ -195,6 +195,19 @@ impl Resolver {
         })
     }
 
+    /// Whether any Java, Kotlin, Scala or Groovy file of the corpus declares a
+    /// symbol of this name, of any kind.
+    pub(super) fn jvm_source_declares(&self, name: &str) -> bool {
+        self.symbol_index.get(name).is_some_and(|hits| {
+            hits.iter().any(|(file, _, _, _)| {
+                matches!(
+                    file.rsplit_once('.').map(|(_, extension)| extension),
+                    Some("java" | "kt" | "kts" | "scala" | "groovy")
+                )
+            })
+        })
+    }
+
     /// Why a call that failed the resolution ladder has no edge (SC18).
     ///
     /// Ordered by strength of evidence, and **fail-open toward `Unresolved`**:
@@ -319,6 +332,21 @@ impl Resolver {
                     && !self.family_declares(family, callee_name)
                 {
                     return UnresolvedClass::Builtin;
+                }
+                // J-T1, the last route of a Java type name: declaration, same
+                // package and imports have all failed, so `java.lang` is what is
+                // left. `CStyle` is C, C++ and C# too, so it is the Java *file*
+                // that gates the table, and a JVM-language declaration of the
+                // name anywhere in the corpus keeps the miss unexplained: it may
+                // be a bind failure, not the JDK's type. A namesake in another
+                // language (Go's `String()` method) is no evidence either way.
+                if file_path.ends_with(".java")
+                    && crate::builtins::is_java_lang_type(callee_name)
+                    && !self.jvm_source_declares(callee_name)
+                {
+                    return UnresolvedClass::External {
+                        module: format!("java.lang.{callee_name}"),
+                    };
                 }
             }
             // Written imports outrank the language/prelude table. In
