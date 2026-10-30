@@ -611,17 +611,6 @@ fn build_with_limits(
             continue;
         }
         response.files_seen += 1;
-        // Documents in either index, so the file budget bounds the ranked one
-        // once the trigram one has stopped counting.
-        if paths.len().max(lexical.documents()) >= max_files {
-            walk_ended(
-                lexical::store::Limit::Files,
-                trigram_full,
-                &mut response,
-                &mut walk_stop,
-            );
-            break;
-        }
         // Nothing left to build. Counted so `files_seen` is the size of the
         // tree the walk admits, which is what a partial ranking is partial of;
         // not read, so the cost of that number is a directory walk.
@@ -699,7 +688,21 @@ fn build_with_limits(
         {
             continue;
         }
-
+        // The file ceiling is checked where a file would be admitted, not for
+        // every file the walk meets: a binary file that follows the last
+        // admissible one is not a file the budget turned away, and calling it
+        // one made a ranking of every rankable file report `files`. Documents
+        // in either index count, so the budget bounds the ranked index once the
+        // trigram one has stopped growing.
+        if paths.len().max(lexical.documents()) >= max_files {
+            walk_ended(
+                lexical::store::Limit::Files,
+                trigram_full,
+                &mut response,
+                &mut walk_stop,
+            );
+            break;
+        }
         // Not extracted once that index is full: nothing would read them.
         let trigrams = (!trigram_full).then(|| tgrep_core::trigram::extract_merged_masks(&bytes));
         let after = match file.metadata() {
