@@ -39,6 +39,7 @@ mod a_v97_extraction_is_not_served_after_the_bump;
 mod an_ignore_file_binds_the_daemon;
 mod api_views_are_honest;
 mod ast_reports_its_own_totals;
+mod attack_ah_damaged_store;
 mod attack_build_cancel;
 mod binary_digests_are_memoised;
 mod blast_names_what_a_change_reaches;
