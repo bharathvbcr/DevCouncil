@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"math"
 	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/proc"
@@ -371,8 +372,10 @@ func validate(out any) error {
 		// is refused rather than passed to a caller who would believe the
 		// favourable half.
 		for name, count := range map[string]int{
-			"files_indexed": reply.FilesIndexed,
-			"files_seen":    reply.FilesSeen,
+			"files_indexed":     reply.FilesIndexed,
+			"files_seen":        reply.FilesSeen,
+			"walk_errors":       reply.WalkErrors,
+			"lexical_unindexed": reply.LexicalUnindexed,
 		} {
 			if count < 0 {
 				return fmt.Errorf("ranking reported %s = %d, which is not a count", name, count)
@@ -390,6 +393,13 @@ func validate(out any) error {
 		if reply.Complete && reply.LexicalLimitReason != "" {
 			return fmt.Errorf("ranking claims a complete index and names limit %q",
 				reply.LexicalLimitReason)
+		}
+		// Nor can complete and a walk that could not read what it was shown, or
+		// that left admissible files out: those are shortfalls with no ceiling
+		// to name, which is exactly where a favourable `complete` would hide.
+		if reply.Complete && (reply.WalkErrors > 0 || reply.LexicalUnindexed > 0) {
+			return fmt.Errorf("ranking claims a complete index with %d walk errors and %d files left out",
+				reply.WalkErrors, reply.LexicalUnindexed)
 		}
 		return nil
 	case *IndexResult:
@@ -663,20 +673,29 @@ type RankedResult struct {
 	// or not. Zero when the searcher predates the field.
 	FilesSeen int `json:"files_seen"`
 	// Complete is true only when the searcher said so: no ceiling stopped the
-	// build that wrote this index. A reply that omits the field decodes to
-	// false, which is the safe reading — a ranking over a prefix of the
-	// repository must never be mistaken for one over all of it because an older
-	// searcher had no way to say otherwise.
+	// build that wrote this index, the walk read everything it was shown, and no
+	// admissible file was left out. "Admissible" is the searcher's own rule —
+	// text, so a binary or non-UTF-8 file is not a shortfall. A reply that omits
+	// the field decodes to false, which is the safe reading — a ranking over part
+	// of the repository must never be mistaken for one over all of it because an
+	// older searcher had no way to say otherwise.
 	Complete bool `json:"complete"`
 	// LexicalLimitReason names the ceiling that ended the build when Complete is
-	// false: "lexical_postings" for the ranked index's own, or "files",
-	// "duration" or "input_bytes" for the walk's. Empty does not mean complete;
-	// read Complete.
+	// false: "lexical_postings" or "lexical_bytes" for the ranked index's own,
+	// or "files", "duration" or "input_bytes" for the walk's. Empty does not mean
+	// complete; read Complete.
 	LexicalLimitReason string `json:"lexical_limit_reason"`
-	TermsUnknown       int    `json:"terms_unknown"`
-	TermsTotal         int    `json:"terms_total"`
-	TermsDropped       int    `json:"terms_dropped"`
-	StaleFiles         int    `json:"stale_files"`
+	// WalkErrors is the directory entries the build's walk could not read.
+	// Whatever was under one is absent from the ranking and from FilesSeen.
+	WalkErrors int `json:"walk_errors"`
+	// LexicalUnindexed is the admissible files the walk reached and the ranking
+	// does not contain: unreadable, over the read bound, changed mid-read, over
+	// the per-document term cap, or missing from an imported encoding.
+	LexicalUnindexed int `json:"lexical_unindexed"`
+	TermsUnknown     int `json:"terms_unknown"`
+	TermsTotal       int `json:"terms_total"`
+	TermsDropped     int `json:"terms_dropped"`
+	StaleFiles       int `json:"stale_files"`
 }
 
 // Partial says, in a sentence a caller can put in front of a reader, that the
@@ -695,12 +714,21 @@ func (r *RankedResult) Partial() string {
 	if r.FilesSeen > 0 {
 		covered = fmt.Sprintf("%d of the %d files its build reached", r.FilesIndexed, r.FilesSeen)
 	}
-	if r.LexicalLimitReason == "" {
-		return fmt.Sprintf("ranking covers %s and the searcher did not report the index as complete; "+
-			"a file missing from it may simply not have been read", covered)
+	var causes []string
+	if r.LexicalLimitReason != "" {
+		causes = append(causes, fmt.Sprintf("the index build stopped at %s", r.LexicalLimitReason))
 	}
-	return fmt.Sprintf("ranking covers %s: the index build stopped at %s; "+
-		"a file missing from it may simply not have been read", covered, r.LexicalLimitReason)
+	if r.WalkErrors > 0 {
+		causes = append(causes, fmt.Sprintf("%d directory entries could not be read", r.WalkErrors))
+	}
+	if r.LexicalUnindexed > 0 {
+		causes = append(causes, fmt.Sprintf("%d readable-text files were left out", r.LexicalUnindexed))
+	}
+	if len(causes) == 0 {
+		causes = append(causes, "the searcher did not report the index as complete")
+	}
+	return fmt.Sprintf("ranking covers %s: %s; a file missing from it may simply not have been read",
+		covered, strings.Join(causes, "; "))
 }
 
 // Index builds the cached indexes for the repository.

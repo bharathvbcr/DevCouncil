@@ -22,6 +22,8 @@
 //! vocab_size   u32       zero when the query side is computed, not stored
 //! files_seen   u32       files the build's walk reached, indexed or not
 //! stop         u32       why the build stopped short of the tree; 0 = it did not
+//! walk_errors  u32       directory entries the walk could not read
+//! unindexed    u32       files the walk reached that this build admits by kind and could not rank
 //! doc_lens     files      x u32
 //! paths        files      x (u32 length, that many UTF-8 bytes)
 //! term_table   terms      x (u32 term_id, u32 first_posting, u32 posting_count)
@@ -125,10 +127,10 @@ pub(crate) const MAX_VOCAB_TOKEN_BYTES: usize = 64;
 /// necessarily the process reading it.
 pub(crate) const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Fixed bytes at the front of the file: magic, then the nine u32/f32 header
+/// Fixed bytes at the front of the file: magic, then the eleven u32/f32 header
 /// fields. `Reader::open` reads exactly this many before anything else, and a
 /// test holds this to what `finish` writes.
-pub(crate) const HEADER_BYTES: u64 = 8 + 4 * 9;
+pub(crate) const HEADER_BYTES: u64 = 8 + 4 * 11;
 
 /// BM25 term-frequency saturation.
 pub(crate) const BM25_K1: f32 = 1.2;
@@ -281,6 +283,11 @@ pub(crate) struct Builder {
     /// ended it. Reported by the finished file; neither stops `add`.
     files_seen: usize,
     walk_stop: Option<Limit>,
+    /// Directory entries the walk could not read, and files it reached that
+    /// this build admits by kind and could not rank. Either makes the ranking
+    /// incomplete without any ceiling having been hit.
+    walk_errors: usize,
+    unindexed: usize,
 }
 
 impl Builder {
@@ -306,6 +313,8 @@ impl Builder {
             terms: HashSet::new(),
             files_seen: 0,
             walk_stop: None,
+            walk_errors: 0,
+            unindexed: 0,
         }
     }
 
@@ -313,10 +322,22 @@ impl Builder {
     ///
     /// Separate from `limit`, which is this index's own and stops `add`: a
     /// walk that ended early did not make this index full, it made it short,
-    /// and the two have different readers. `stop` is what ended the walk.
-    pub(crate) fn record_walk(&mut self, files_seen: usize, stop: Option<Limit>) {
+    /// and the two have different readers. `stop` is what ended the walk;
+    /// `walk_errors` is the entries it could not read, and `unindexed` the
+    /// files it reached that are text this engine admits and that no document
+    /// in this index stands for. Both are stored because a ranking over a tree
+    /// it could not fully read is not a ranking over the tree.
+    pub(crate) fn record_walk(
+        &mut self,
+        files_seen: usize,
+        stop: Option<Limit>,
+        walk_errors: usize,
+        unindexed: usize,
+    ) {
         self.files_seen = files_seen;
         self.walk_stop = stop;
+        self.walk_errors = walk_errors;
+        self.unindexed = unindexed;
     }
 
     /// Why the finished index covers less than the tree, if it does: its own
@@ -553,6 +574,9 @@ impl Builder {
         let seen = u32::try_from(self.files_seen.max(files)).unwrap_or(u32::MAX);
         out.extend_from_slice(&seen.to_le_bytes());
         out.extend_from_slice(&self.stopped_by().map_or(0, Limit::code).to_le_bytes());
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX).to_le_bytes();
+        out.extend_from_slice(&count(self.walk_errors));
+        out.extend_from_slice(&count(self.unindexed));
         for len in &self.doc_lens {
             out.extend_from_slice(&len.to_le_bytes());
         }
@@ -626,6 +650,8 @@ pub(crate) struct Reader {
     /// read. Carried so a ranking can say whether it ranked all of it.
     files_seen: usize,
     stopped_by: Option<Limit>,
+    walk_errors: usize,
+    unindexed: usize,
 }
 
 impl fmt::Debug for Reader {
@@ -699,6 +725,8 @@ impl Reader {
                 "lexical index names stop reason {stop_code}, which this build does not know"
             ));
         };
+        let walk_errors = u32_at(&bytes, 44) as usize;
+        let unindexed = u32_at(&bytes, 48) as usize;
         // A walk cannot have seen fewer files than the index holds. Refused
         // rather than clamped, because the number is what a caller divides by.
         if files_seen < files {
@@ -874,6 +902,8 @@ impl Reader {
             query_weights,
             files_seen,
             stopped_by,
+            walk_errors,
+            unindexed,
         };
 
         // The order table is what `token_id` binary-searches, so an unsorted or
@@ -977,6 +1007,28 @@ impl Reader {
     /// walk or filled the index.
     pub(crate) fn stopped_by(&self) -> Option<Limit> {
         self.stopped_by
+    }
+
+    /// Directory entries the build's walk could not read.
+    pub(crate) fn walk_errors(&self) -> usize {
+        self.walk_errors
+    }
+
+    /// Files the walk reached that are text this engine admits and that no
+    /// document here stands for: unreadable, too large, changed mid-read, over
+    /// the per-document term cap, or missing from an imported encoding. Binary
+    /// and non-UTF-8 files are not counted; they are not rankable by kind.
+    pub(crate) fn unindexed(&self) -> usize {
+        self.unindexed
+    }
+
+    /// Whether every file of text this engine admits is in this ranking. The
+    /// one owner of the rule: no ceiling stopped the build, the walk could read
+    /// everything it was shown, and no admissible file was left out. A ranking
+    /// for which this is false is over part of the tree, and a file missing
+    /// from it may be missing because it was never ranked.
+    pub(crate) fn complete(&self) -> bool {
+        self.stopped_by.is_none() && self.walk_errors == 0 && self.unindexed == 0
     }
 
     pub(crate) fn path(&self, file_id: u32) -> Option<&str> {
@@ -1239,7 +1291,7 @@ mod tests {
         ] {
             let mut builder = Builder::new(Vocabulary::CodeV1);
             builder.add("a.rs".into(), 10, &[(7, 3.0)]);
-            builder.record_walk(41, Some(stop));
+            builder.record_walk(41, Some(stop), 0, 0);
             let reader = Reader::open(builder.finish()).expect("opens");
             assert_eq!(reader.files(), 1);
             assert_eq!(reader.files_seen(), 41);
@@ -1253,11 +1305,35 @@ mod tests {
         assert!(builder.add("a.rs".into(), 4, &[(1, 1.0), (2, 1.0)]));
         assert!(!builder.add("b.rs".into(), 4, &[(1, 1.0), (2, 1.0)]));
         // The walk then ran out of time with the index already full.
-        builder.record_walk(9, Some(Limit::Duration));
+        builder.record_walk(9, Some(Limit::Duration), 0, 0);
         let reader = Reader::open(builder.finish()).expect("opens");
         assert_eq!(reader.files(), 1);
         assert_eq!(reader.files_seen(), 9);
         assert_eq!(reader.stopped_by(), Some(Limit::Postings));
+    }
+
+    #[test]
+    fn complete_is_no_ceiling_and_no_walk_error_and_nothing_left_unranked() {
+        let read = |stop: Option<Limit>, errors: usize, unindexed: usize| {
+            let mut builder = Builder::new(Vocabulary::CodeV1);
+            builder.add("a.rs".into(), 4, &[(1, 1.0)]);
+            builder.record_walk(5, stop, errors, unindexed);
+            Reader::open(builder.finish()).expect("opens")
+        };
+        let clean = read(None, 0, 0);
+        assert!(clean.complete());
+        assert_eq!((clean.walk_errors(), clean.unindexed()), (0, 0));
+
+        let errors = read(None, 3, 0);
+        assert!(!errors.complete(), "a walk that could not read a directory");
+        assert_eq!(errors.walk_errors(), 3);
+
+        let left_out = read(None, 0, 7);
+        assert!(!left_out.complete(), "admissible files with no document");
+        assert_eq!(left_out.unindexed(), 7);
+
+        let stopped = read(Some(Limit::Files), 0, 0);
+        assert!(!stopped.complete(), "a ceiling");
     }
 
     #[test]
@@ -1310,7 +1386,7 @@ mod tests {
         assert_eq!(builder.documents(), 1);
         assert_eq!(builder.limit(), Some(Limit::Bytes));
         assert_eq!(Limit::Bytes.as_str(), "lexical_bytes");
-        builder.record_walk(2, None);
+        builder.record_walk(2, None, 0, 0);
         let bytes = builder.finish();
         assert_eq!(bytes.len() as u64, one);
         let reader = Reader::open(bytes).expect("opens");
@@ -1361,7 +1437,7 @@ mod tests {
                 predicted + 8 + 1_005 + 20_000 * 20 > MAX_FILE_BYTES,
                 "{vocabulary}: stopped with room to spare"
             );
-            builder.record_walk(added + 1, None);
+            builder.record_walk(added + 1, None, 0, 0);
             let bytes = builder.finish();
             assert_eq!(bytes.len() as u64, predicted, "{vocabulary}");
             Reader::open(bytes).unwrap_or_else(|err| panic!("{vocabulary}: must open: {err}"));

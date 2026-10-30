@@ -165,21 +165,37 @@ pub struct RankedResponse {
     /// Files the build that wrote this index reached, whether or not it could
     /// index them. With `files_indexed` this is how much of the repository the
     /// ranking covers, but read `complete` first: some files are never
-    /// indexable (binary, too large) and are not a shortfall.
+    /// rankable by kind (binary, non-UTF-8) and are not a shortfall.
     pub files_seen: usize,
-    /// No ceiling stopped the build that wrote this index. `false` means the
-    /// ranking is over a prefix of the repository, and a file missing from it
-    /// may be missing because it was never read, not because nothing in it is
-    /// about the query. `lexical_limit_reason` says which ceiling.
+    /// Every file of text this engine admits is in this ranking: no ceiling
+    /// stopped the build that wrote the index, the walk read everything it was
+    /// shown (`walk_errors` is zero), and no admissible file was left out
+    /// (`lexical_unindexed` is zero). `false` means the ranking is over part of
+    /// the repository, and a file missing from it may be missing because it was
+    /// never ranked, not because nothing in it is about the query.
+    ///
+    /// "Text this engine admits" is the walk's own admission rule: a file with a
+    /// NUL byte or that is not valid UTF-8 is not rankable and does not count
+    /// against this. (A UTF-8 byte-order mark is also refused by that rule today
+    /// and is not counted either; that is a known gap in the rule, not a claim.)
     ///
     /// Always serialised, never omitted: a caller that cannot find this field
     /// is talking to a build that predates it, and must read that as "not
     /// known to be complete".
     pub complete: bool,
     /// The ceiling that ended the build, when one did. The same strings as
-    /// `IndexResponse::lexical_limit_reason`: `lexical_postings` and `lexical_bytes` for this
-    /// index's own, and `files`, `duration` or `input_bytes` for the walk's.
+    /// `IndexResponse::lexical_limit_reason`: `lexical_postings` and
+    /// `lexical_bytes` for this index's own, and `files`, `duration` or
+    /// `input_bytes` for the walk's. Null with `complete: false` means the
+    /// shortfall is `walk_errors` or `lexical_unindexed`, not a ceiling.
     pub lexical_limit_reason: Option<&'static str>,
+    /// Directory entries the build's walk could not read. Whatever was under
+    /// one is absent from this ranking and from every count above.
+    pub walk_errors: usize,
+    /// Files the build reached that are admissible text and are not in this
+    /// ranking: unreadable, over the read bound, changed while being read, over
+    /// the per-document term cap, or missing from an imported encoding.
+    pub lexical_unindexed: usize,
     /// Postings in the index. A size, not a verdict: whether the index covers
     /// the repository is `complete`.
     pub index_postings: usize,
@@ -389,7 +405,9 @@ pub fn ranked_search(request: &RankedRequest) -> Result<RankedResponse, String> 
         vocabulary: reader.vocabulary().to_string(),
         files_indexed: reader.files(),
         files_seen: reader.files_seen(),
-        complete: reader.stopped_by().is_none(),
+        complete: reader.complete(),
+        walk_errors: reader.walk_errors(),
+        lexical_unindexed: reader.unindexed(),
         lexical_limit_reason: reader.stopped_by().map(store::Limit::as_str),
         index_postings: reader.postings_len(),
         terms_unknown,

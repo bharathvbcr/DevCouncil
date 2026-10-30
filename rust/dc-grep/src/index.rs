@@ -152,9 +152,14 @@ pub struct IndexResponse {
     /// whole.
     pub lexical_files: usize,
     pub lexical_postings: usize,
-    /// Files read for the ranked index and left out of it, because a document
-    /// tokenised only in part would rank by a length it does not have. Counted
-    /// rather than indexed short.
+    /// Files the walk reached that are text this engine admits and that no
+    /// document in the ranked index stands for: not openable, not readable, over
+    /// the read bound, changed while being read, a name that is not UTF-8, a
+    /// document tokenised only in part (which would rank by a length it does not
+    /// have, so it is counted rather than indexed short), or — with an imported
+    /// encoding — a file the encoding did not describe. Binary and non-UTF-8
+    /// files are not counted: they are not rankable by kind. Any nonzero value
+    /// makes a `rank` answer `complete: false`.
     pub lexical_unindexed: usize,
     /// The ceiling that stopped the ranked build, if one did: its own
     /// (`lexical_postings`) or the walk's (`files`, `duration`, `input_bytes`).
@@ -623,18 +628,34 @@ fn build_with_limits(
         if trigram_full && lexical.is_full() {
             continue;
         }
+        // Every `continue` below that is not a file kind this engine never
+        // ranks is a file the ranking is missing, and is counted in
+        // `lexical_unindexed` so `complete` cannot be true over it. The ones that
+        // are not counted say why where they are: a file with a NUL byte or that
+        // is not UTF-8 is not rankable, so leaving it out is not a shortfall.
         let Some(path) = entry.path().strip_prefix(&root).ok().and_then(slashed) else {
+            // A name that is not UTF-8 cannot be written into the index.
+            response.lexical_unindexed += 1;
             continue;
         };
         let file = match open_for_search(entry.path()) {
             Ok(file) => file,
-            Err(_) => continue,
+            Err(_) => {
+                // Permission denied, vanished, a loop: the file exists and could
+                // not be opened, which is not the same as having nothing to say.
+                response.lexical_unindexed += 1;
+                continue;
+            }
         };
         let metadata = match file.metadata() {
             Ok(metadata) if metadata.is_file() && metadata.len() < DEFAULT_MAX_FILE_BYTES => {
                 metadata
             }
-            _ => continue,
+            _ => {
+                // Over the read bound, no longer a regular file, or no metadata.
+                response.lexical_unindexed += 1;
+                continue;
+            }
         };
         if response.input_bytes.saturating_add(metadata.len()) > max_bytes {
             walk_ended(
@@ -647,6 +668,7 @@ fn build_with_limits(
         }
         let before = file_version(&metadata);
         if !before.is_trusted() {
+            response.lexical_unindexed += 1;
             continue;
         }
         let mut bytes = Vec::new();
@@ -662,23 +684,35 @@ fn build_with_limits(
             break;
         }
         if read.is_err() {
+            response.lexical_unindexed += 1;
             continue;
         }
         // Only unchanged plain UTF-8 is eligible for negative evidence. Other
         // encodings, NULs, and BOMs remain the live searcher's responsibility.
+        // Not a shortfall: these are not text this engine ranks, and counting
+        // every binary file would make `complete` unreachable. (A UTF-8 byte
+        // order mark is caught here too, though it is text; that is a gap in
+        // the admission rule, and `complete` is documented as relative to it.)
         if bytes.contains(&0)
             || bytes.starts_with(&[0xef, 0xbb, 0xbf])
             || std::str::from_utf8(&bytes).is_err()
         {
             continue;
         }
+
         // Not extracted once that index is full: nothing would read them.
         let trigrams = (!trigram_full).then(|| tgrep_core::trigram::extract_merged_masks(&bytes));
         let after = match file.metadata() {
             Ok(meta) => file_version(&meta),
-            Err(_) => continue,
+            Err(_) => {
+                response.lexical_unindexed += 1;
+                continue;
+            }
         };
         if before != after {
+            // Changed while it was read, so the bytes in hand are not any
+            // version of the file; the next build will see it.
+            response.lexical_unindexed += 1;
             continue;
         }
         // Checked above: this byte slice is plain UTF-8 with no NUL and no
@@ -781,7 +815,12 @@ fn build_with_limits(
     response.lexical_postings = lexical.postings();
     // Written into the file, so `rank` reports what this build reports and the
     // two cannot be read from different places.
-    lexical.record_walk(response.files_seen, walk_stop);
+    lexical.record_walk(
+        response.files_seen,
+        walk_stop,
+        response.walk_errors,
+        response.lexical_unindexed,
+    );
     response.lexical_limit_reason = lexical.stopped_by().map(lexical::store::Limit::as_str);
     let rendered = lexical.finish();
     // Read back through the same validator a search will use, before anything

@@ -132,3 +132,42 @@ echo '{"ok":true,"engine":"tgrep-core","traversal_complete":true,
 		t.Fatalf("an index cannot rank files its walk never reached: %+v", result)
 	}
 }
+
+// complete means no ceiling, no unreadable directory entry and nothing
+// admissible left out. The last two have no ceiling to name, so a report that
+// pairs them with complete:true is the quietest way for this to be wrong.
+func TestARankingThatIsCompleteDespiteAWalkErrorOrAFileLeftOutIsRefused(t *testing.T) {
+	for _, tc := range []struct{ name, extra string }{
+		{"walk errors", `,"files_seen":1,"complete":true,"walk_errors":2`},
+		{"files left out", `,"files_seen":3,"complete":true,"lexical_unindexed":1`},
+		{"negative walk errors", `,"files_seen":1,"complete":false,"walk_errors":-1`},
+		{"negative left out", `,"files_seen":1,"complete":false,"lexical_unindexed":-4`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := rankWith(t, "#!/bin/sh\necho '{"+rankedOne+tc.extra+"}'\n")
+			if err == nil {
+				t.Fatalf("must be an error, got %+v", result)
+			}
+		})
+	}
+}
+
+func TestAnIncompleteRankingWithNoCeilingStillNamesWhatIsMissing(t *testing.T) {
+	result, err := rankWith(t, "#!/bin/sh\necho '{"+rankedOne+
+		`,"files_seen":9,"complete":false,"walk_errors":2,"lexical_unindexed":3}'`+"\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.WalkErrors != 2 || result.LexicalUnindexed != 3 || result.Complete {
+		t.Fatalf("the shortfall counts were not carried through: %+v", result)
+	}
+	note := result.Partial()
+	for _, want := range []string{"2 directory entries", "3 readable-text files", "1 of the 9 files"} {
+		if !strings.Contains(note, want) {
+			t.Fatalf("the note %q must contain %q", note, want)
+		}
+	}
+	if strings.Contains(note, "did not report") {
+		t.Fatalf("a named shortfall is not an unknown one: %q", note)
+	}
+}

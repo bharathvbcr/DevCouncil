@@ -195,15 +195,16 @@ field.** Read these in this order:
    one of the ranked index's own — `lexical_postings` (4,000,000 postings) or
    `lexical_bytes` (the 64 MiB file budget, which a corpus of mostly distinct
    terms reaches first) — or a walk ceiling that ended the build for both
-   indexes: `files`, `duration` or `input_bytes`. The same value is stored in `lexical.bin` and returned by every
-   `rank` answer as `lexical_limit_reason` beside `complete`.
+   indexes: `files`, `duration` or `input_bytes`. The same value is stored in
+   `lexical.bin` and returned by every `rank` answer as `lexical_limit_reason`
+   beside `complete`.
 2. **`files_seen` against `lexical_files`.** `files_seen` is every file the walk
    reached — it keeps counting after the trigram index is full — so this pair is
-   how much of the repository the ranking covers. Files that are never
-   indexable (binary, over 2 MiB, not UTF-8, or too repetitive to tokenise
-   whole, counted in `lexical_unindexed`) are in `files_seen` and not in
-   `lexical_files`, which is why `complete` and not the arithmetic is the
-   verdict.
+   how much of the repository the ranking covers. Files that are not text
+   this engine ranks (binary, not UTF-8) are in `files_seen` and not in
+   `lexical_files`, and are not a shortfall; files that are text and were left
+   out are counted in `lexical_unindexed`, and are. That is why `complete` and
+   not the arithmetic is the verdict.
 3. **`limit_reason`** — the *trigram* index's ceiling only. `"postings"` here
    means the trigram index filled and `dcgrep search` reads the files past it
    with the matcher instead of skipping them by index; it costs acceleration and
@@ -219,10 +220,15 @@ above was. Check `lexical_limit_reason` before reading this number as
 staleness: if it names a ceiling, the encoding is probably fine and the build
 is what ran out.
 
-`lexical_unindexed` is the other direction: files the build read that the
-encoding did not describe — in the example, 58 files whose extensions the
-producer does not encode. They remain fully searchable by `dcgrep search`; only
-the ranking leaves them out.
+`lexical_unindexed` is the other direction: files the walk reached that are
+text this engine admits and that no document in the ranked index stands for.
+It counts a file that could not be opened or read, a file over the 2 MiB read
+bound, a file that changed while it was being read, a file over the
+20,000-term per-document cap, a file whose name is not UTF-8, and — with an
+imported encoding — a file the encoding did not describe (in the example, 58
+files whose extensions the producer does not encode). They remain fully
+searchable by `dcgrep search`; only the ranking leaves them out, and any of
+them makes `complete` false.
 
 Queries against the resulting index return in **6.7–8.2 ms** (minimum to p90,
 40 interleaved repeats per cell on an M-series laptop). `code-v1` over the same
@@ -421,20 +427,24 @@ a number in `lexical_unmatched`.
 }
 ```
 
-**Read `complete` before anything else.** `false` means a ceiling stopped the
-build that wrote this index, so the ranking is over a prefix of the repository
-and a file that is missing from it may be missing because it was never read, not
-because nothing in it is about the query. `lexical_limit_reason` names the
-ceiling (`lexical_postings`, `lexical_bytes`, `files`, `duration` or
-`input_bytes`), and
+**Read `complete` before anything else.** It is true only when no ceiling
+stopped the build that wrote the index, the walk could read everything it was
+shown (`walk_errors` is zero), and no admissible file was left out
+(`lexical_unindexed` is zero). `false` means the ranking is over part of the
+repository, and a file that is missing from it may be missing because it was
+never ranked, not because nothing in it is about the query.
+`lexical_limit_reason` names the ceiling when one stopped the build
+(`lexical_postings`, `lexical_bytes`, `files`, `duration` or `input_bytes`); it
+is null when the shortfall is `walk_errors` or `lexical_unindexed`.
 `files_indexed` against `files_seen` says how much was reached. The field is
 always present; a reply without it comes from a build that predates it, and a
 client must read that as not known to be complete — the Go client does.
 
-`complete: true` does not mean every file is in the ranking. Files the index
-never admits — binary, over 2 MiB, not UTF-8, or too repetitive to tokenise
-whole — are in `files_seen` and not in `files_indexed` in either case. `complete`
-is about the build having been stopped, not about those admission rules.
+`complete` is relative to the text this engine admits: a file with a NUL byte
+or that is not valid UTF-8 is not rankable, is in `files_seen` and not in
+`files_indexed`, and does not make a ranking incomplete. (A UTF-8 byte-order
+mark is refused by the same rule today although it is text; that is a gap in
+the rule, tracked separately, and `complete` does not count it.)
 
 - **`score`** is comparable within one response and meaningless across two. It
   depends on the corpus, so 8.1 here and 8.1 from another repository say
@@ -523,11 +533,11 @@ files, bytes read, time — end both.
 | Files in one index build | 50,000, or the request's `max_files` | `limit_reason` and `lexical_limit_reason: "files"` |
 | Bytes read by one index build | 128 MiB | `limit_reason` and `lexical_limit_reason: "input_bytes"` |
 | Wall time of one index build | 30 s | `limit_reason` and `lexical_limit_reason: "duration"` |
-| One file read by the index | 2 MiB | counted in `files_unindexed`; the matcher still reads it |
+| One file read by the index | 2 MiB | counted in `files_unindexed` and `lexical_unindexed`, which makes `complete` false; the matcher still reads it |
 | Postings in one ranked index | 4,000,000 | `lexical_limit_reason: "lexical_postings"` |
 | Bytes in `lexical.bin` | 64 MiB, counted exactly while building | `lexical_limit_reason: "lexical_bytes"`; the document that would cross it is left out whole |
 | Postings read from one encoding | 32,000,000 | build refused |
-| Terms from one document | 20,000 | `lexical_unindexed` |
+| Terms from one document | 20,000 | `lexical_unindexed`, which makes `complete` false |
 | Vocabulary tokens | 100,000 | build refused |
 | `lexical.bin` on disk | 64 MiB | index refused at open |
 | Query length | 1,024 bytes | request refused |
