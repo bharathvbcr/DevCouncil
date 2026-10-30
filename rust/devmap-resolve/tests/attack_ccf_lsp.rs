@@ -45,9 +45,10 @@ fn a_failed_start_returns_within_the_callers_deadline_when_a_descendant_holds_st
     // `perl` becomes a session leader (outside the server's group), keeps
     // stderr, and sleeps 8 s so it ends on its own. Its stdout is closed so
     // the server's stdout reaches EOF when `sh` exits.
-    let script = "perl -e 'use POSIX; POSIX::setsid(); exec \"sleep\", \"8\"' >/dev/null &\nexit 3\n";
+    let script = "perl -e 'use POSIX; POSIX::setsid(); exec \"sleep\", \"8\"' >/dev/null &\nsleep 1\nexit 3\n";
     let (result, elapsed) = start(script, Duration::from_secs(2));
     let reason = exit_report(result);
+    eprintln!("elapsed={elapsed:?} reason={reason:?}");
     assert!(
         matches!(reason, LspDidNotRun::NonZeroExit { .. }),
         "{reason:?}"

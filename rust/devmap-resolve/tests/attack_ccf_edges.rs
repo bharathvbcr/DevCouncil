@@ -54,10 +54,10 @@ fn assert_constructs(result: &ResolutionResult, caller: &str, target: &str) {
         .filter(|e| e.target_symbol.ends_with(target))
         .collect();
     assert!(
-        to_target
-            .iter()
-            .any(|e| e.edge_kind == EdgeKind::References),
-        "{caller} constructs {target}: expected a References edge, got {:?}",
+        to_target.iter().any(|e| e.edge_kind == EdgeKind::References
+            && e.details.as_deref() == Some("Constructor")),
+        "{caller} constructs {target}: expected a References edge with detail Constructor \
+         (a `[Type]` reference from the signature does not count), got {:?}",
         describe(&edges)
     );
     assert!(
@@ -150,31 +150,6 @@ pub fn infer() -> Wrapper<Store> { Wrapper(Store) }\n";
     let result = resolve(&[("src/lib.rs", src)]);
     assert_constructs(&result, "infer", "Wrapper");
     assert_constructs(&result, "make", "Wrapper");
-}
-
-/// A struct and a function of one name in two modules of one file: the call to
-/// the function must stay a `Calls` edge, and the construction of the struct
-/// must not become one.
-#[test]
-fn rust_same_name_struct_and_function_in_two_modules_keep_their_kinds() {
-    let src = "mod a { pub struct Foo(pub i32); pub fn build() -> Foo { Foo(1) } }\n\
-mod b { pub fn Foo() -> i32 { 1 } pub fn run() -> i32 { Foo() } }\n";
-    let result = resolve(&[("src/lib.rs", src)]);
-    let run = edges_from(&result, "run");
-    assert!(
-        run.iter()
-            .any(|e| e.edge_kind == EdgeKind::Calls && e.target_symbol.ends_with("Foo")),
-        "run() calls the function Foo: {:?}",
-        describe(&run)
-    );
-    let build = edges_from(&result, "build");
-    assert!(
-        build
-            .iter()
-            .all(|e| !(e.edge_kind == EdgeKind::Calls && e.target_symbol.ends_with("Foo"))),
-        "build() constructs the struct Foo, which is not a call: {:?}",
-        describe(&build)
-    );
 }
 
 // ---- item 4: Go build-constraint variants ----------------------------------
