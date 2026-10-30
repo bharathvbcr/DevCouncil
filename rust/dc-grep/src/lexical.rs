@@ -177,7 +177,7 @@ pub struct RankedResponse {
     /// known to be complete".
     pub complete: bool,
     /// The ceiling that ended the build, when one did. The same strings as
-    /// `IndexResponse::lexical_limit_reason`: `lexical_postings` for this
+    /// `IndexResponse::lexical_limit_reason`: `lexical_postings` and `lexical_bytes` for this
     /// index's own, and `files`, `duration` or `input_bytes` for the walk's.
     pub lexical_limit_reason: Option<&'static str>,
     /// Postings in the index. A size, not a verdict: whether the index covers

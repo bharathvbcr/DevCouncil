@@ -316,6 +316,36 @@ fn the_ranked_index_at_its_own_ceiling_still_publishes() {
     );
     let ranked = repo.rank("needlezebra");
     eprintln!("rank: {ranked}");
+
+    // Strengthened after the fix. The corpus is all-distinct terms, so the
+    // ranked index reaches its 64 MiB file budget (`lexical_bytes`) before its
+    // four-million-posting count cap: the build must publish, and the ranking
+    // over what fit must say it is partial and which ceiling stopped it. Any
+    // reason from the closed set is a legitimate stop; `null` is not, because
+    // 250 files of 16,000 distinct words cannot all fit.
+    let closed = [
+        "lexical_postings",
+        "lexical_bytes",
+        "files",
+        "duration",
+        "input_bytes",
+    ];
+    let built_reason = built["lexical_limit_reason"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the build must name the ceiling that stopped it: {built}"));
+    assert!(closed.contains(&built_reason), "{built_reason}: {built}");
+    assert_eq!(built["ok"], true, "{built}");
+    assert_eq!(ranked["ok"], true, "{ranked}");
+    assert_eq!(ranked["complete"], false, "{ranked}");
+    let ranked_reason = ranked["lexical_limit_reason"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the ranking must name the ceiling: {ranked}"));
+    assert!(closed.contains(&ranked_reason), "{ranked_reason}: {ranked}");
+    assert_eq!(ranked_reason, built_reason, "rank reads what the build wrote");
+    assert!(
+        ranked["files_indexed"].as_u64().unwrap() < ranked["files_seen"].as_u64().unwrap(),
+        "{ranked}"
+    );
 }
 
 /// Stale stamps for ranked-only files, at scale and through the binary: the

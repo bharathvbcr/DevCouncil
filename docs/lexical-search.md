@@ -192,9 +192,10 @@ field.** Read these in this order:
 
 1. **`lexical_limit_reason`** — why the *ranked* index is short of the tree, if
    it is. `null` means no ceiling stopped it. Otherwise it names one:
-   `lexical_postings` (the ranked index's own, 4,000,000 postings), or a walk
-   ceiling that ended the build for both indexes: `files`, `duration` or
-   `input_bytes`. The same value is stored in `lexical.bin` and returned by every
+   one of the ranked index's own — `lexical_postings` (4,000,000 postings) or
+   `lexical_bytes` (the 64 MiB file budget, which a corpus of mostly distinct
+   terms reaches first) — or a walk ceiling that ended the build for both
+   indexes: `files`, `duration` or `input_bytes`. The same value is stored in `lexical.bin` and returned by every
    `rank` answer as `lexical_limit_reason` beside `complete`.
 2. **`files_seen` against `lexical_files`.** `files_seen` is every file the walk
    reached — it keeps counting after the trigram index is full — so this pair is
@@ -424,7 +425,8 @@ a number in `lexical_unmatched`.
 build that wrote this index, so the ranking is over a prefix of the repository
 and a file that is missing from it may be missing because it was never read, not
 because nothing in it is about the query. `lexical_limit_reason` names the
-ceiling (`lexical_postings`, `files`, `duration` or `input_bytes`), and
+ceiling (`lexical_postings`, `lexical_bytes`, `files`, `duration` or
+`input_bytes`), and
 `files_indexed` against `files_seen` says how much was reached. The field is
 always present; a reply without it comes from a build that predates it, and a
 client must read that as not known to be complete — the Go client does.
@@ -523,6 +525,7 @@ files, bytes read, time — end both.
 | Wall time of one index build | 30 s | `limit_reason` and `lexical_limit_reason: "duration"` |
 | One file read by the index | 2 MiB | counted in `files_unindexed`; the matcher still reads it |
 | Postings in one ranked index | 4,000,000 | `lexical_limit_reason: "lexical_postings"` |
+| Bytes in `lexical.bin` | 64 MiB, counted exactly while building | `lexical_limit_reason: "lexical_bytes"`; the document that would cross it is left out whole |
 | Postings read from one encoding | 32,000,000 | build refused |
 | Terms from one document | 20,000 | `lexical_unindexed` |
 | Vocabulary tokens | 100,000 | build refused |

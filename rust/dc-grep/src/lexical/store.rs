@@ -66,6 +66,7 @@
 //! refuses the index by name. It does not score it with the wrong weights and
 //! it does not quietly return nothing.
 
+use std::collections::HashSet;
 use std::fmt;
 
 /// Identifies the format, and the byte that changes when the layout does.
@@ -98,9 +99,12 @@ pub(crate) const SCHEMA: u32 = 4;
 
 /// Postings kept in one index.
 ///
-/// Eight bytes each, so this is 32 MiB of postings at the ceiling. A cap
-/// rather than a budget: hitting it is reported as a named limit so the
-/// caller knows the index covers part of the tree.
+/// A count cap and the reader's sanity bound on a claimed posting count — not
+/// a bound on the file. Postings are eight bytes each, but the file also holds
+/// twelve bytes per *distinct* term and a path per document, and a corpus whose
+/// terms are mostly distinct reaches 80 MB at this many postings, over
+/// `MAX_FILE_BYTES`. The bound on the file is the builder's byte budget, which
+/// counts exactly what `finish` will write and stops at `Limit::Bytes`.
 pub(crate) const MAX_POSTINGS: usize = 4_000_000;
 
 /// Vocabulary entries kept in one index.
@@ -112,12 +116,19 @@ pub(crate) const MAX_VOCAB: usize = 100_000;
 /// Longest single vocabulary token, in bytes.
 pub(crate) const MAX_VOCAB_TOKEN_BYTES: usize = 64;
 
-/// Largest `lexical.bin` this will read.
+/// Largest `lexical.bin` this will read, and the budget the builder holds
+/// itself to.
 ///
-/// The writer cannot exceed it by construction; the reader enforces it anyway,
+/// The writer cannot exceed it: `Builder::add` refuses the document that would
+/// carry the file past it, with `Limit::Bytes`. The reader enforces it anyway,
 /// because the file on disk is input and the process that wrote it is not
 /// necessarily the process reading it.
 pub(crate) const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Fixed bytes at the front of the file: magic, then the nine u32/f32 header
+/// fields. `Reader::open` reads exactly this many before anything else, and a
+/// test holds this to what `finish` writes.
+pub(crate) const HEADER_BYTES: u64 = 8 + 4 * 9;
 
 /// BM25 term-frequency saturation.
 pub(crate) const BM25_K1: f32 = 1.2;
@@ -189,6 +200,8 @@ pub(crate) enum Limit {
     Files,
     Duration,
     InputBytes,
+    /// The file this index would write has reached `MAX_FILE_BYTES`.
+    Bytes,
 }
 
 impl Limit {
@@ -198,6 +211,7 @@ impl Limit {
             Limit::Files => "files",
             Limit::Duration => "duration",
             Limit::InputBytes => "input_bytes",
+            Limit::Bytes => "lexical_bytes",
         }
     }
 
@@ -208,6 +222,7 @@ impl Limit {
             Limit::Files => 2,
             Limit::Duration => 3,
             Limit::InputBytes => 4,
+            Limit::Bytes => 5,
         }
     }
 
@@ -218,6 +233,7 @@ impl Limit {
             2 => Some(Some(Limit::Files)),
             3 => Some(Some(Limit::Duration)),
             4 => Some(Some(Limit::InputBytes)),
+            5 => Some(Some(Limit::Bytes)),
             _ => None,
         }
     }
@@ -249,6 +265,18 @@ pub(crate) struct Builder {
     /// lowers it to prove what happens when it bites without writing four
     /// million postings to do so.
     ceiling: usize,
+    /// Exactly the length `finish` will return for what has been added so far:
+    /// the header, the query-side block, and per document a doc length, a path
+    /// and its length prefix, eight bytes per posting and twelve per distinct
+    /// term. Kept exact rather than estimated, because the bound it enforces is
+    /// the reader's refusal of a larger file, and an estimate that is ever low
+    /// publishes an index nothing can open.
+    bytes: u64,
+    /// The most `bytes` may reach. `MAX_FILE_BYTES` outside a test.
+    byte_ceiling: u64,
+    /// Terms already counted at twelve bytes. Postings for a term seen before
+    /// cost eight and not twenty.
+    terms: HashSet<u32>,
     /// How many files the walk reached, and the walk's own ceiling if one
     /// ended it. Reported by the finished file; neither stops `add`.
     files_seen: usize,
@@ -260,10 +288,10 @@ impl Builder {
     /// `build_with_limits` takes it as a parameter — so only tests ask for this.
     #[cfg(test)]
     pub(crate) fn new(vocabulary: Vocabulary) -> Self {
-        Self::with_ceiling(vocabulary, MAX_POSTINGS)
+        Self::with_ceiling(vocabulary, MAX_POSTINGS, MAX_FILE_BYTES)
     }
 
-    pub(crate) fn with_ceiling(vocabulary: Vocabulary, ceiling: usize) -> Self {
+    pub(crate) fn with_ceiling(vocabulary: Vocabulary, ceiling: usize, byte_ceiling: u64) -> Self {
         Builder {
             vocabulary,
             paths: Vec::new(),
@@ -273,6 +301,9 @@ impl Builder {
             query_weights: Vec::new(),
             limit: None,
             ceiling: ceiling.min(MAX_POSTINGS),
+            bytes: HEADER_BYTES,
+            byte_ceiling: byte_ceiling.min(MAX_FILE_BYTES),
+            terms: HashSet::new(),
             files_seen: 0,
             walk_stop: None,
         }
@@ -305,6 +336,10 @@ impl Builder {
     /// Refused for `CodeV1`, whose query side is derived rather than supplied:
     /// an index carrying both would have two answers to the same question and
     /// no rule about which wins.
+    ///
+    /// Called before the first `add`, because its bytes are part of the file
+    /// and a document admitted before they were counted could carry the file
+    /// past `MAX_FILE_BYTES` once they were. Refused after, and refused twice.
     pub(crate) fn set_query_side(
         &mut self,
         vocab: Vec<String>,
@@ -312,6 +347,13 @@ impl Builder {
     ) -> Result<(), String> {
         if self.vocabulary == Vocabulary::CodeV1 {
             return Err("code-v1 derives its query weights and cannot be given them".into());
+        }
+        if !self.paths.is_empty() || !self.vocab.is_empty() {
+            return Err(
+                "the query side must be stored once, before the first document, so its \
+                 bytes are reserved against the file's budget"
+                    .into(),
+            );
         }
         if vocab.len() != weights.len() {
             return Err(format!(
@@ -355,8 +397,30 @@ impl Builder {
                 }
             })
             .collect();
+        // The token strings with their length prefixes, then a query weight and
+        // an order entry for every id: what `finish` writes after the postings.
+        let block: u64 = vocab
+            .iter()
+            .map(|token| 4 + token.len() as u64)
+            .sum::<u64>()
+            + 8 * vocab.len() as u64;
+        if self.bytes + block > self.byte_ceiling {
+            return Err(format!(
+                "the query side alone is {block} bytes, which leaves no room under the \
+                 {}-byte file budget",
+                self.byte_ceiling
+            ));
+        }
+        self.bytes += block;
         self.vocab = vocab;
         Ok(())
+    }
+
+    /// The length `finish` will return for what has been added, which the
+    /// budget is held against and a test holds to the written file.
+    #[cfg(test)]
+    pub(crate) fn predicted_len(&self) -> u64 {
+        self.bytes
     }
 
     pub(crate) fn is_full(&self) -> bool {
@@ -385,10 +449,10 @@ impl Builder {
     /// terms including repeats, which is what BM25 normalises by — it is not
     /// the number of distinct terms and the two differ by a lot in code.
     ///
-    /// Returns false when the posting ceiling stopped it, leaving the
-    /// document out entirely rather than half in. A document with some of its
-    /// terms indexed would rank below where it belongs and there would be
-    /// nothing in the index to say so.
+    /// Returns false when a ceiling stopped it — the posting count, or the
+    /// file's byte budget — leaving the document out entirely rather than half
+    /// in. A document with some of its terms indexed would rank below where it
+    /// belongs and there would be nothing in the index to say so.
     pub(crate) fn add(&mut self, path: String, total_terms: u32, weights: &[(u32, f32)]) -> bool {
         if self.limit.is_some() {
             return false;
@@ -401,13 +465,35 @@ impl Builder {
             self.limit = Some(Limit::Postings);
             return false;
         };
-        for (term, weight) in weights {
-            // A non-finite weight would poison every score the term takes
-            // part in and would compare false against every threshold, so it
-            // is dropped here where the cause is still visible.
-            if weight.is_finite() && *weight > 0.0 {
-                self.raw.push((*term, file_id, *weight));
+        // A non-finite weight would poison every score the term takes part in
+        // and would compare false against every threshold, so it is dropped
+        // here where the cause is still visible — and costs nothing, because
+        // nothing is written for it.
+        let kept = weights
+            .iter()
+            .filter(|(_, weight)| weight.is_finite() && *weight > 0.0);
+        // Counted by inserting, and undone if the document is refused: a term
+        // new to the index costs a term-table entry as well as its posting, and
+        // two postings for one new term in the same document cost one entry.
+        let mut fresh: Vec<u32> = Vec::new();
+        let mut postings = 0u64;
+        for (term, _) in kept.clone() {
+            postings += 1;
+            if self.terms.insert(*term) {
+                fresh.push(*term);
             }
+        }
+        let cost = 8 + path.len() as u64 + 8 * postings + 12 * fresh.len() as u64;
+        if self.bytes + cost > self.byte_ceiling {
+            for term in &fresh {
+                self.terms.remove(term);
+            }
+            self.limit = Some(Limit::Bytes);
+            return false;
+        }
+        self.bytes += cost;
+        for (term, weight) in kept {
+            self.raw.push((*term, file_id, *weight));
         }
         self.paths.push(path);
         self.doc_lens.push(total_terms);
@@ -567,7 +653,7 @@ impl Reader {
     /// facts, and a caller that cannot tell them apart will report the second
     /// when it means the first.
     pub(crate) fn open(bytes: Vec<u8>) -> Result<Self, String> {
-        let head = 8 + 4 * 5 + 4 + 4 + 4 + 4;
+        let head = HEADER_BYTES as usize;
         if bytes.len() < head {
             return Err(format!(
                 "lexical index is {} bytes, shorter than its {head}-byte header",
@@ -1163,7 +1249,7 @@ mod tests {
 
     #[test]
     fn its_own_ceiling_is_named_before_the_walks() {
-        let mut builder = Builder::with_ceiling(Vocabulary::CodeV1, 3);
+        let mut builder = Builder::with_ceiling(Vocabulary::CodeV1, 3, MAX_FILE_BYTES);
         assert!(builder.add("a.rs".into(), 4, &[(1, 1.0), (2, 1.0)]));
         assert!(!builder.add("b.rs".into(), 4, &[(1, 1.0), (2, 1.0)]));
         // The walk then ran out of time with the index already full.
@@ -1172,6 +1258,133 @@ mod tests {
         assert_eq!(reader.files(), 1);
         assert_eq!(reader.files_seen(), 9);
         assert_eq!(reader.stopped_by(), Some(Limit::Postings));
+    }
+
+    #[test]
+    fn the_header_constant_is_the_header_finish_writes() {
+        // An empty index is the header and nothing else.
+        let empty = Builder::new(Vocabulary::CodeV1);
+        assert_eq!(empty.predicted_len(), HEADER_BYTES);
+        assert_eq!(empty.finish().len() as u64, HEADER_BYTES);
+    }
+
+    /// The accounting is exact, not an estimate: the length predicted from the
+    /// adds equals the length written, for every sequence of adds, and a refused
+    /// document leaves the prediction where it was.
+    #[test]
+    fn the_byte_budget_counts_exactly_what_finish_writes() {
+        // Shared terms across documents, a repeated term inside one document,
+        // a dropped non-finite weight, and paths of different lengths: each is
+        // a place an off-by-one would hide.
+        let mut builder = Builder::new(Vocabulary::CodeV1);
+        let before = builder.predicted_len();
+        assert!(builder.add("a.rs".into(), 5, &[(1, 1.0), (2, 2.0)]));
+        assert!(builder.add(
+            "deeply/nested/b.rs".into(),
+            5,
+            &[(2, 1.0), (3, 1.0), (4, f32::NAN)]
+        ));
+        assert!(builder.add("c.rs".into(), 5, &[(9, 1.0), (9, 2.0)]));
+        // 8 + path per document, 8 per kept posting, 12 per distinct term
+        // {1, 2, 3, 9}.
+        let expected = before + (8 + 4) + (8 + 18) + (8 + 4) + 8 * (2 + 2 + 2) + 12 * 4;
+        assert_eq!(builder.predicted_len(), expected);
+        assert_eq!(builder.finish().len() as u64, expected);
+    }
+
+    #[test]
+    fn a_document_that_would_cross_the_byte_budget_is_refused_whole() {
+        // Room for the header and one small document, not two.
+        let one = HEADER_BYTES + (8 + 4) + 8 * 2 + 12 * 2;
+        let mut builder = Builder::with_ceiling(Vocabulary::CodeV1, MAX_POSTINGS, one + 10);
+        assert!(builder.add("a.rs".into(), 5, &[(1, 1.0), (2, 1.0)]));
+        let kept = builder.predicted_len();
+        assert_eq!(kept, one);
+        // New terms 7 and 8 would be counted while checking and must not stay.
+        assert!(!builder.add("b.rs".into(), 5, &[(7, 1.0), (8, 1.0)]));
+        assert_eq!(
+            builder.predicted_len(),
+            kept,
+            "a refused document costs nothing"
+        );
+        assert_eq!(builder.documents(), 1);
+        assert_eq!(builder.limit(), Some(Limit::Bytes));
+        assert_eq!(Limit::Bytes.as_str(), "lexical_bytes");
+        builder.record_walk(2, None);
+        let bytes = builder.finish();
+        assert_eq!(bytes.len() as u64, one);
+        let reader = Reader::open(bytes).expect("opens");
+        assert_eq!(reader.stopped_by(), Some(Limit::Bytes));
+        assert_eq!(reader.files_seen(), 2);
+    }
+
+    /// The worst case the attack found: every term distinct, so each posting
+    /// costs twenty bytes and four million of them would be eighty megabytes.
+    /// Long paths and the largest vocabulary a learned index may carry are
+    /// added on top. The builder must stop short of the bound and the file it
+    /// writes must be exactly as long as it said.
+    #[test]
+    fn a_corpus_of_distinct_terms_stops_under_the_file_bound_exactly() {
+        for vocabulary in [Vocabulary::CodeV1, Vocabulary::WordPiece30522] {
+            let mut builder = Builder::new(vocabulary);
+            if vocabulary != Vocabulary::CodeV1 {
+                let tokens: Vec<String> = (0..MAX_VOCAB).map(|n| format!("{n:064}")).collect();
+                builder
+                    .set_query_side(tokens, vec![1.0; MAX_VOCAB])
+                    .expect("the largest vocabulary a model may carry");
+            }
+            let mut next_term = 0u32;
+            let mut added = 0usize;
+            loop {
+                let weights: Vec<(u32, f32)> = (0..20_000)
+                    .map(|_| {
+                        next_term += 1;
+                        (next_term, 1.0)
+                    })
+                    .collect();
+                let path = format!("{added:04}/{}", "p".repeat(1_000));
+                if !builder.add(path, 20_000, &weights) {
+                    break;
+                }
+                added += 1;
+                assert!(added < 1_000, "the byte budget should have stopped this");
+            }
+            assert_eq!(builder.limit(), Some(Limit::Bytes), "{vocabulary}");
+            assert!(
+                builder.postings() < MAX_POSTINGS,
+                "this corpus must reach the byte budget before the count cap: {vocabulary}"
+            );
+            let predicted = builder.predicted_len();
+            assert!(predicted <= MAX_FILE_BYTES, "{vocabulary}: {predicted}");
+            // Tight: one more document's worth of postings would not have fit.
+            assert!(
+                predicted + 8 + 1_005 + 20_000 * 20 > MAX_FILE_BYTES,
+                "{vocabulary}: stopped with room to spare"
+            );
+            builder.record_walk(added + 1, None);
+            let bytes = builder.finish();
+            assert_eq!(bytes.len() as u64, predicted, "{vocabulary}");
+            Reader::open(bytes).unwrap_or_else(|err| panic!("{vocabulary}: must open: {err}"));
+        }
+    }
+
+    #[test]
+    fn the_query_side_is_stored_once_and_before_any_document() {
+        let mut builder = Builder::new(Vocabulary::WordPiece30522);
+        builder.add("a.rs".into(), 1, &[(0, 1.0)]);
+        let err = builder
+            .set_query_side(vec!["a".into()], vec![1.0])
+            .expect_err("after a document");
+        assert!(err.contains("before the first document"), "{err}");
+
+        let mut builder = Builder::new(Vocabulary::WordPiece30522);
+        builder.set_query_side(vec!["a".into()], vec![1.0]).unwrap();
+        assert!(builder.set_query_side(vec!["a".into()], vec![1.0]).is_err());
+
+        // A budget with no room for the vocabulary is refused, not published.
+        let mut tight =
+            Builder::with_ceiling(Vocabulary::WordPiece30522, MAX_POSTINGS, HEADER_BYTES + 5);
+        assert!(tight.set_query_side(vec!["a".into()], vec![1.0]).is_err());
     }
 
     #[test]

@@ -440,6 +440,7 @@ pub fn build_index(request: &IndexRequest) -> Result<IndexResponse, String> {
         max_files,
         MAX_INDEX_POSTINGS,
         lexical::store::MAX_POSTINGS,
+        lexical::store::MAX_FILE_BYTES,
         MAX_INDEX_INPUT_BYTES,
         MAX_INDEX_DURATION,
     )
@@ -463,14 +464,16 @@ fn walk_ended(
 }
 
 /// The ceilings are parameters so a test can make each one bite on a handful of
-/// files. `max_postings` bounds the trigram index and `lexical_postings` the
-/// ranked one; neither ends the other, and only `max_files`, `max_bytes` and
-/// `max_duration` end the walk.
+/// files. `max_postings` bounds the trigram index; `lexical_postings` and
+/// `lexical_bytes` bound the ranked one, by posting count and by the size of the
+/// file it would write. None of the three ends another index, and only
+/// `max_files`, `max_bytes` and `max_duration` end the walk.
 fn build_with_limits(
     request: &IndexRequest,
     max_files: usize,
     max_postings: usize,
     lexical_postings: usize,
+    lexical_bytes: u64,
     max_bytes: u64,
     max_duration: Duration,
 ) -> Result<IndexResponse, String> {
@@ -482,7 +485,7 @@ fn build_with_limits(
     // single file is walked. A malformed encoding is the operator's mistake,
     // and finding it after a full-repository read would cost them the walk and
     // tell them nothing they could not have been told in milliseconds.
-    let encoded = match &request.sparse {
+    let mut encoded = match &request.sparse {
         Some(path) => Some(lexical::ingest::read(path)?),
         None => None,
     };
@@ -552,7 +555,21 @@ fn build_with_limits(
             None => lexical::store::Vocabulary::CodeV1,
         },
         lexical_postings,
+        lexical_bytes,
     );
+    // The query half, stored before the first document. Without it the index
+    // carries document weights in a learned term space and no way to weigh a
+    // query in that space, which `Reader::open` refuses rather than letting it
+    // publish. It is also a block of the file, so its bytes are reserved against
+    // the budget before any document can spend them.
+    if let Some(encoded) = encoded.as_mut() {
+        lexical
+            .set_query_side(
+                std::mem::take(&mut encoded.vocab),
+                std::mem::take(&mut encoded.query_weights),
+            )
+            .map_err(|err| format!("the encoder's query side cannot be stored: {err}"))?;
+    }
     // The trigram index filled and stopped growing. The walk goes on for the
     // ranked index, which has a ceiling of its own and is not this one's to
     // end: the two used to share a `break`, and the ranked index stopped at
@@ -756,12 +773,6 @@ fn build_with_limits(
     let parity = match encoded {
         Some(encoded) => {
             response.lexical_unmatched = encoded.documents.len().saturating_sub(lexical_used);
-            // The query half. Without it the index carries document weights in
-            // a learned term space and no way to weigh a query in that space,
-            // which `Reader::open` refuses below rather than letting it publish.
-            lexical
-                .set_query_side(encoded.vocab, encoded.query_weights)
-                .map_err(|err| format!("the encoder's query side cannot be stored: {err}"))?;
             encoded.parity
         }
         None => Vec::new(),
@@ -1018,6 +1029,7 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path, limit: u64) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{IndexRequest, MAX_INDEX_DURATION, build_with_limits};
+    use crate::lexical::store::MAX_FILE_BYTES as LEXICAL_BYTES;
     use crate::lexical::store::MAX_POSTINGS as LEXICAL_POSTINGS;
 
     // The CACHE_SCHEMA/store::SCHEMA ordering was asserted here. It is a fact
@@ -1048,9 +1060,16 @@ mod tests {
             (100, 0, MAX_INDEX_DURATION, "input_bytes"),
             (100, 100, Duration::ZERO, "duration"),
         ] {
-            let built =
-                build_with_limits(&request, 100, postings, LEXICAL_POSTINGS, bytes, duration)
-                    .unwrap();
+            let built = build_with_limits(
+                &request,
+                100,
+                postings,
+                LEXICAL_POSTINGS,
+                LEXICAL_BYTES,
+                bytes,
+                duration,
+            )
+            .unwrap();
             assert_eq!(built.files_indexed, 0);
             assert_eq!(built.limit_reason, Some(reason));
             assert!(!built.traversal_complete);
@@ -1122,6 +1141,7 @@ mod tests {
             100,
             150,
             LEXICAL_POSTINGS,
+            LEXICAL_BYTES,
             1 << 20,
             MAX_INDEX_DURATION,
         )
@@ -1165,6 +1185,7 @@ mod tests {
             100,
             150,
             LEXICAL_POSTINGS,
+            LEXICAL_BYTES,
             1 << 20,
             MAX_INDEX_DURATION,
         )
@@ -1223,6 +1244,7 @@ mod tests {
             100,
             150,
             LEXICAL_POSTINGS,
+            LEXICAL_BYTES,
             1 << 20,
             MAX_INDEX_DURATION,
         )
@@ -1252,8 +1274,16 @@ mod tests {
             sparse: None,
         };
         // Postings for about four of the twelve one-word-per-file documents.
-        let built =
-            build_with_limits(&request, 100, 1 << 20, 12, 1 << 20, MAX_INDEX_DURATION).unwrap();
+        let built = build_with_limits(
+            &request,
+            100,
+            1 << 20,
+            12,
+            LEXICAL_BYTES,
+            1 << 20,
+            MAX_INDEX_DURATION,
+        )
+        .unwrap();
         assert_eq!(
             built.lexical_limit_reason,
             Some("lexical_postings"),
@@ -1310,6 +1340,7 @@ mod tests {
                 max_files,
                 1 << 20,
                 LEXICAL_POSTINGS,
+                LEXICAL_BYTES,
                 max_bytes,
                 duration,
             )
@@ -1347,6 +1378,7 @@ mod tests {
             6,
             150,
             LEXICAL_POSTINGS,
+            LEXICAL_BYTES,
             1 << 20,
             MAX_INDEX_DURATION,
         )
@@ -1373,6 +1405,7 @@ mod tests {
             100,
             1 << 20,
             LEXICAL_POSTINGS,
+            LEXICAL_BYTES,
             1 << 20,
             MAX_INDEX_DURATION,
         )
@@ -1444,6 +1477,7 @@ mod tests {
             100,
             1 << 20,
             LEXICAL_POSTINGS,
+            LEXICAL_BYTES,
             1 << 20,
             MAX_INDEX_DURATION,
         )
