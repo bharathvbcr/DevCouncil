@@ -24,6 +24,7 @@ impl Resolver {
         self.default_exports.clear();
         self.inert_values.clear();
         self.star_export_files.clear();
+        self.java_records.clear();
         self.receiver_types.clear();
         self.scoped_receiver_types.clear();
         self.poisoned_receiver_keys.clear();
@@ -260,6 +261,15 @@ impl Resolver {
                 self.scope_locals
                     .insert((ext.file_path.clone(), scope.clone(), local.clone()));
             }
+            self.java_records.extend(
+                ext.symbols
+                    .iter()
+                    .filter(|symbol| {
+                        symbol.signature.as_deref()
+                            == Some(devmap_extract::model::JAVA_RECORD_SIGNATURE)
+                    })
+                    .map(|symbol| (ext.file_path.clone(), symbol.qualified_name.clone())),
+            );
             if LangFamily::from_lang(&ext.language) == LangFamily::JsTs
                 && ext
                     .exports

@@ -503,6 +503,10 @@ pub struct Resolver {
     /// name but `default` (ES 15.2.3.5); a file in this set is where a default
     /// import that found nothing is told why.
     star_export_files: BTreeSet<String>,
+    /// `(file, qualified name)` of every Java `record` symbol. A record and its
+    /// canonical constructor are one declaration of the name for a `new Rec(..)`
+    /// lookup; a plain class and its constructors stay what they were.
+    java_records: BTreeSet<(String, String)>,
     /// `(file, name)` → the names a module-scope value's **own declaration**
     /// carries: the shorthand properties of `export const api = { get, post }`
     /// and the methods written inside `export const log = { info() {…} }`.
@@ -805,6 +809,7 @@ impl Resolver {
             module_value_types: BTreeMap::new(),
             inert_values: BTreeSet::new(),
             star_export_files: BTreeSet::new(),
+            java_records: BTreeSet::new(),
             module_value_members: BTreeMap::new(),
             js_objects: BTreeMap::new(),
             return_types: BTreeMap::new(),

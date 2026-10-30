@@ -198,7 +198,7 @@ fn a_default_import_of_a_star_only_barrel_binds_nothing() {
 /// with `devmap-main` on this fixture); the lane's namespace-over-a-barrel path
 /// (`ns.main()`) newly inherits it. Both name things the module does not export.
 #[test]
-#[ignore = "pre-existing on dbd0193a; card pending"]
+#[ignore = "pre-existing on dbd0193a; card ft-e3a3bfa2"]
 fn a_star_barrel_publishes_only_what_its_source_exports() {
     let result = resolve(&[
         (

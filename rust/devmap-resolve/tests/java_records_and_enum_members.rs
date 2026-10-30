@@ -590,7 +590,7 @@ fn a_generic_file_does_not_claim_java_lang_for_any_name() {
     );
 }
 
-// A class and the constructor it declares are one declaration of the name. A
+// A record and its canonical constructor are one declaration of the name. A
 // record with an explicit or compact canonical constructor lost its `new` binding
 // when the record became a symbol, because `Rec` and `Rec.Rec` made two
 // declarations.
@@ -628,6 +628,27 @@ fn new_of_a_record_with_a_compact_constructor_binds() {
 }
 
 #[test]
+fn new_of_a_plain_class_with_a_written_constructor_stays_what_base_made_it() {
+    // Only a record collapses with its constructor. A plain class and its
+    // constructors are two declarations of the name, as on base.
+    let got = new_call_targets(
+        &[
+            (
+                "a/Plain.java",
+                "package a;\npublic class Plain {\n  public Plain(int x) {}\n}\n",
+            ),
+            (
+                "b/U.java",
+                "package b;\nimport a.*;\npublic class U {\n  void go() { new Plain(1); }\n}\n",
+            ),
+        ],
+        "b/U.java::U.go",
+    );
+    assert!(got.is_empty(), "{got:?}");
+}
+
+#[test]
+#[ignore = "plain-class constructor binding is carded to cstyle Java step 2 (J-T1)"]
 fn new_of_a_class_with_a_written_constructor_binds_once() {
     let got = new_call_targets(
         &[

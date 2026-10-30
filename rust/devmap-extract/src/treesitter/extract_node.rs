@@ -1701,7 +1701,11 @@ pub(super) fn extract_node(
                     signature: (lang == "swift")
                         .then(|| crate::langdecl::swift::property_signature(node))
                         .flatten()
-                        .map(str::to_string),
+                        .map(str::to_string)
+                        .or_else(|| {
+                            (lang == "java" && node.kind() == "record_declaration")
+                                .then(|| crate::model::JAVA_RECORD_SIGNATURE.to_string())
+                        }),
                     parent_symbol: Some(declaration.parent_symbol(file_symbol_name)),
                     body_signature: None,
                     declaration_hash: None,

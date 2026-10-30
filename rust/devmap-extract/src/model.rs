@@ -1576,6 +1576,10 @@ pub const FILE_DECLARES_TYPE_PARAMETERS: &str = "\u{1}type_parameters";
 /// resolver tells an importer why the name was not found.
 pub const CJS_WITHHELD_PREFIX: &str = "\u{1}cjs_withheld:";
 
+/// The `signature` of a Java `record` class symbol, so a reader can tell a record
+/// from a class (both are `SymbolKind::Class`, and no older reader needs a new kind).
+pub const JAVA_RECORD_SIGNATURE: &str = "record";
+
 /// The leading words of every `ParseOutcome::Failed` reason that records a
 /// parse-budget overrun. See [`Extraction::is_budget_refusal`].
 pub const BUDGET_REFUSAL_PREFIX: &str = "parse budget exceeded: ";
