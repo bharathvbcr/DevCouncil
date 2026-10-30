@@ -475,7 +475,7 @@ func validate(out any) error {
 				return fmt.Errorf("index reported %s = %d, which is not a count", name, count)
 			}
 		}
-		return nil
+		return validLeftOut(reply.LexicalUnindexed, reply.LexicalUnindexedByClass)
 	case *ListResult:
 		if reply.Count != len(reply.Paths) {
 			return fmt.Errorf("searcher reported %d paths and sent %d", reply.Count, len(reply.Paths))
@@ -512,6 +512,73 @@ var (
 		"files":    true, "duration": true, "input_bytes": true,
 	}
 )
+
+// leftOutClasses is the closed set of causes the searcher gives for an admissible
+// file being absent from the ranked index. A cause the client does not know is
+// refused, for the reason a limit it does not know is: it would be shown to a
+// reader as an explanation and explain nothing.
+var leftOutClasses = map[string]bool{
+	"unrepresentable_name":   true,
+	"unopenable":             true,
+	"oversized_text":         true,
+	"not_a_regular_file":     true,
+	"untrusted_version":      true,
+	"unreadable":             true,
+	"no_metadata_after_read": true,
+	"changed_while_read":     true,
+	"not_in_encoding":        true,
+	"term_cap":               true,
+}
+
+// MaxLeftOutSample is the most paths the searcher lists per cause, mirrored
+// from its LEFT_OUT_SAMPLE so a reply that lists more is recognisably not it.
+const MaxLeftOutSample = 50
+
+// validLeftOut holds the per-cause breakdown to the total it explains.
+//
+// An absent breakdown is accepted: a searcher that predates it reports only the
+// total, and a total with no explanation is what that searcher always sent.
+// A present one must add up exactly, with no cause the client does not know,
+// no sample longer than the searcher's bound or than its own count, and no path
+// that is not a repository-relative one.
+func validLeftOut(total int, classes map[string]LeftOut) error {
+	if len(classes) == 0 {
+		return nil
+	}
+	remaining := total
+	for class, left := range classes {
+		if !leftOutClasses[class] {
+			return fmt.Errorf("searcher named left-out cause %q, which this client does not know", class)
+		}
+		if left.Count < 0 {
+			return fmt.Errorf("left-out cause %s counts %d, which is not a count", class, left.Count)
+		}
+		if len(left.Sample) > MaxLeftOutSample {
+			return fmt.Errorf("left-out cause %s lists %d paths, over the searcher's %d",
+				class, len(left.Sample), MaxLeftOutSample)
+		}
+		if len(left.Sample) > left.Count {
+			return fmt.Errorf("left-out cause %s lists %d paths for a count of %d",
+				class, len(left.Sample), left.Count)
+		}
+		for _, path := range left.Sample {
+			if err := validPath(path); err != nil {
+				return fmt.Errorf("left-out cause %s: %w", class, err)
+			}
+		}
+		// Subtracted rather than summed: the counts are untrusted, and a sum of
+		// large ones wraps to a number that looks like it agrees.
+		if left.Count > remaining {
+			return fmt.Errorf("left-out causes count more than the %d files the index says it left out", total)
+		}
+		remaining -= left.Count
+	}
+	if remaining != 0 {
+		return fmt.Errorf("left-out causes account for %d of the %d files the index says it left out",
+			total-remaining, total)
+	}
+	return nil
+}
 
 func knownLimit(known map[string]bool, field, reason string) error {
 	if reason == "" || known[reason] {
@@ -685,6 +752,16 @@ type IndexResult struct {
 	// dropped rather than indexed, so a large number means the encoding is
 	// stale and the ranking covers less than the caller expects.
 	LexicalUnmatched int `json:"lexical_unmatched"`
+	// LexicalUnindexedByClass explains LexicalUnindexed by cause, with the first
+	// paths of each. Empty from a searcher that predates it.
+	LexicalUnindexedByClass map[string]LeftOut `json:"lexical_unindexed_by_class"`
+}
+
+// LeftOut is one cause for an admissible file being absent from the ranked
+// index: how many, and the first few by repository-relative path.
+type LeftOut struct {
+	Count  int      `json:"count"`
+	Sample []string `json:"sample"`
 }
 
 // RankedRequest asks which files are about something.
