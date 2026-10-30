@@ -153,8 +153,6 @@ fn a_damaged_store_of_another_live_worktree_is_refused_not_set_aside() {
     );
 }
 
-const REFUSAL: &str = "one store cannot serve two live worktrees";
-
 /// The store's own path is a symlink to another live worktree's store. The
 /// writer lock refuses a symlinked store path outright (so this one is refused
 /// on base as well, for that reason and not for ownership), and nothing is moved.
