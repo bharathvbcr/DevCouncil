@@ -914,4 +914,75 @@ mod tests {
         }
         fs::remove_dir_all(root).unwrap();
     }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "dcgrep-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        root
+    }
+
+    /// One word per file, shared with no other, so a query for it can only be
+    /// answered by that file.
+    const WORDS: [&str; 12] = [
+        "alpaca", "badger", "caribou", "dingo", "echidna", "ferret", "gazelle", "hamster",
+        "ibex", "jackal", "kestrel", "lemming",
+    ];
+
+    /// Twelve files, each about a word of its own. Which of them the walk
+    /// reaches first is the filesystem's choice, so nothing below depends on it.
+    fn twelve_files(root: &std::path::Path) {
+        for (n, word) in WORDS.iter().enumerate() {
+            fs::write(
+                root.join(format!("f{n}.rs")),
+                format!("fn {word}() {{ println!(\"{word} gathers {word} stripes\"); }}\n"),
+            )
+            .unwrap();
+        }
+    }
+
+    fn rank(root: &std::path::Path, query: &str) -> crate::lexical::RankedResponse {
+        crate::lexical::ranked_search(
+            &serde_json::from_value(serde_json::json!({ "root": root, "query": query })).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// The trigram ceiling bounds the trigram index and nothing else.
+    ///
+    /// It used to `break` the whole walk, so the ranked index stopped at the
+    /// same file and never reached a ceiling of its own: on this repository it
+    /// covered 1,139 of 2,507 files while `lexical_limit_reason` read null.
+    #[test]
+    fn the_trigram_ceiling_does_not_stop_the_ranked_index() {
+        let root = scratch("decoupled");
+        twelve_files(&root);
+        let request = IndexRequest {
+            root: root.clone(),
+            max_files: 0,
+            sparse: None,
+        };
+        // Room for roughly three files' trigrams, and nowhere near twelve.
+        let built = build_with_limits(&request, 100, 150, 1 << 20, MAX_INDEX_DURATION).unwrap();
+        assert_eq!(built.limit_reason, Some("postings"), "{built:?}");
+        assert!(
+            built.files_indexed > 0 && built.files_indexed < 12,
+            "the trigram index must be partial for this to test anything: {built:?}"
+        );
+        assert_eq!(built.lexical_files, 12, "{built:?}");
+        assert_eq!(built.files_seen, 12, "{built:?}");
+        assert_eq!(built.lexical_limit_reason, None, "{built:?}");
+        for (n, word) in WORDS.iter().enumerate() {
+            let ranked = rank(&root, word);
+            assert_eq!(ranked.count, 1, "{word}: {ranked:?}");
+            assert_eq!(ranked.files[0].path, format!("f{n}.rs"), "{word}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 }
