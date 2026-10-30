@@ -327,6 +327,57 @@ impl Store {
         Ok(previous)
     }
 
+    /// Refuse, from the file alone, when the store at `db_path` belongs to a
+    /// worktree other than `root` that still exists.
+    ///
+    /// The ownership refusal of [`Self::bind_repo_root`] for a caller that has no
+    /// open `Store` to ask: a build that is about to decide a store is damaged
+    /// and set it aside. A store that is not ours is never moved, damaged or not,
+    /// so this runs before any such decision, on a connection of its own that
+    /// neither migrates nor writes. A file that is absent, or that predates the
+    /// recorded owner, names nobody and passes. An owner that cannot be *read*
+    /// does not: a check that could not run is not a check that passed, and the
+    /// page that holds the owner may be the damaged one.
+    pub fn refuse_if_owned_by_another_live_worktree(
+        db_path: &Path,
+        root: &Path,
+    ) -> anyhow::Result<()> {
+        if !db_path.exists() {
+            return Ok(());
+        }
+        let root = Self::normalized_repo_root(root)?;
+        let unreadable = |error: &dyn std::fmt::Display| {
+            anyhow::anyhow!(
+                "cannot tell whether the store {} belongs to another live worktree ({error}), \
+                 so it is left where it is; if it is yours, move or delete it and run \
+                 `devmap build` again",
+                db_path.display()
+            )
+        };
+        let conn = Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| unreadable(&error))?;
+        Self::harden_connection(&conn).map_err(|error| unreadable(&error))?;
+        let records_owner: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('pending_state') \
+                 WHERE name = 'repo_root')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| unreadable(&error))?;
+        if !records_owner {
+            return Ok(());
+        }
+        match Self::repo_root_owner_in(&conn, &root) {
+            Ok(RepoRootOwner::Live(owner)) => Err(Self::live_owner_refusal(&owner, &root).into()),
+            Ok(_) | Err(rusqlite::Error::QueryReturnedNoRows) => Ok(()),
+            Err(error) => Err(unreadable(&error)),
+        }
+    }
+
     /// Enqueue changed paths in the queue's canonical form: repo-relative,
     /// forward-slash, deduplicated, and inside `root`.
     ///

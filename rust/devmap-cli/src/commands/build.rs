@@ -157,6 +157,22 @@ pub(crate) fn run(
     }
 }
 
+/// Bind `store` to the worktree at `path`, refusing when another live worktree
+/// owns it, and say so when it was taken over from one that no longer exists.
+fn bind_store_to(
+    store: &Store,
+    path: &std::path::Path,
+    progress: &ProgressReporter,
+) -> anyhow::Result<()> {
+    if let Some(previous) = store.bind_repo_root(path)? {
+        progress.note(format_args!(
+            "store rebound from {previous:?}, which no longer exists, to {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn run_once(
     cli: &Cli,
     progress: Option<&ProgressReporter>,
@@ -217,6 +233,11 @@ fn run_once(
     })?;
     let mut recovery: Option<StoreRecovery> = None;
     if let Some(failure) = corrupt_failure {
+        // Whose file this is comes before whether it is damaged. The failed
+        // attempt may have died before `bind_repo_root` ran (opening the store,
+        // or binding it), so nothing yet says the store is ours, and a store of
+        // another live worktree is refused here exactly as it is when healthy.
+        Store::refuse_if_owned_by_another_live_worktree(&cli.db(), path)?;
         // The previous attempt died on SQLITE_CORRUPT. One bad read is not
         // proof of a damaged file, so the file is checked whole before it is
         // moved; a file that checks out gets the original error back.
@@ -239,14 +260,19 @@ fn run_once(
         }
     }
     let mut store = progress.timed("store:open", || Store::open(cli.db()))?;
+    // Ownership first, before the probe below can set the file aside: a store
+    // that belongs to another live worktree is refused whether it is damaged or
+    // not, and a read-only one is refused here in the store's own words rather
+    // than by a failed repair.
+    bind_store_to(&store, path, progress)?;
     // The same probe `status` reports, asked before anything below can decide
     // "nothing changed" over an index that cannot answer a search.
     if let Some(damage) = store.search_index_unreadable()? {
         match store.repair_fts() {
             Ok(()) => {
-                progress.display.diagnostic(format_args!(
-                    "  search index repaired in place: {damage}"
-                ));
+                progress
+                    .display
+                    .diagnostic(format_args!("  search index repaired in place: {damage}"));
                 recovery = Some(StoreRecovery {
                     action: "repaired_search_index",
                     reason: damage,
@@ -268,15 +294,11 @@ fn run_once(
                     quarantined_to: Some(moved),
                 });
                 store = progress.timed("store:open", || Store::open(cli.db()))?;
+                // The fresh file is unbound; it is bound to this worktree.
+                bind_store_to(&store, path, progress)?;
             }
             Err(error) => return Err(error.into()),
         }
-    }
-    if let Some(previous) = store.bind_repo_root(path)? {
-        progress.note(format_args!(
-            "store rebound from {previous:?}, which no longer exists, to {}",
-            path.display()
-        ));
     }
     // A store this process can only read opens fine — queries need it
     // to — and would otherwise fail at the first write with a bare

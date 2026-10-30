@@ -252,4 +252,71 @@ mod tests {
         assert!(Store::quick_check(&dir.join("absent.sqlite")).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn the_owner_gate_refuses_a_live_owner_and_passes_the_rest_without_touching_the_file() {
+        let dir = scratch("owner-gate");
+        let (mine, theirs, gone) = (dir.join("mine"), dir.join("theirs"), dir.join("gone"));
+        for tree in [&mine, &theirs, &gone] {
+            std::fs::create_dir_all(tree).unwrap();
+        }
+        // Not there yet: a store that does not exist names nobody.
+        let db = dir.join("devmap.sqlite");
+        Store::refuse_if_owned_by_another_live_worktree(&db, &mine).unwrap();
+
+        {
+            let store = Store::open(&db).unwrap();
+            store.bind_repo_root(&theirs).unwrap();
+        }
+        let before = std::fs::read(&db).unwrap();
+        let refusal = Store::refuse_if_owned_by_another_live_worktree(&db, &mine).unwrap_err();
+        assert!(
+            refusal
+                .to_string()
+                .contains("one store cannot serve two live worktrees"),
+            "{refusal}"
+        );
+        Store::refuse_if_owned_by_another_live_worktree(&db, &theirs).unwrap();
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            before,
+            "the gate reads and never writes (no migration, no rebind)"
+        );
+
+        // An owner that no longer exists names nobody, as `bind_repo_root` has it.
+        let moved = dir.join("moved.sqlite");
+        {
+            let store = Store::open(&moved).unwrap();
+            store.bind_repo_root(&gone).unwrap();
+        }
+        std::fs::remove_dir_all(&gone).unwrap();
+        Store::refuse_if_owned_by_another_live_worktree(&moved, &mine).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_owner_gate_passes_a_store_that_predates_the_recorded_owner() {
+        let dir = scratch("owner-gate-old");
+        let db = dir.join("old.sqlite");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch("CREATE TABLE pending_state (singleton INTEGER PRIMARY KEY);")
+                .unwrap();
+        }
+        Store::refuse_if_owned_by_another_live_worktree(&db, &dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_owner_gate_refuses_when_the_owner_cannot_be_read() {
+        let dir = scratch("owner-gate-unreadable");
+        let db = dir.join("junk.sqlite");
+        std::fs::write(&db, b"this is not a database at all, but is long enough").unwrap();
+        let refusal = Store::refuse_if_owned_by_another_live_worktree(&db, &dir).unwrap_err();
+        assert!(
+            refusal.to_string().contains("is left where it is"),
+            "{refusal}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
