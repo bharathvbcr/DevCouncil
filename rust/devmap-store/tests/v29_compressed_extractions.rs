@@ -18,10 +18,16 @@
 //! * a payload with no stored entry wiring, as a foreign writer leaves it,
 //!   still answers `latest_test_entry_symbols` correctly.
 //!
-//! The stores are built through the public API and inspected with raw SQL, so
-//! the file also compiles against the schema-28 tree; the tests that put a v28
-//! shape back by hand decompress with the same `zstd` crate the store uses.
-
+//! **What each test proves against the schema-28 tree.** This file needs the
+//! `zstd` crate (to put a v28 shape back by hand and to forge frames) and
+//! `entry_wiring_json`, neither of which exists there, so it does not compile
+//! on the base, and every test in it is *precondition-only* as a fail-before:
+//! it cannot run there, whatever it asserts. The behavioural fail-before
+//! claims, which need no v29 API, live in `v29_size_and_hot_path.rs` (stored
+//! documents are a fraction of the JSON they hold; the test-entry query reads no
+//! document) and were run against the schema-28 tree. What this file adds is
+//! what only the v29 API can state: the migration, the heal, the refusals.
+//!
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};

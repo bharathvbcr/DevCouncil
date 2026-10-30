@@ -126,3 +126,55 @@ fn the_stored_extraction_documents_are_a_fraction_of_the_json_they_hold() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// **The hook-driven `affected_tests` query does not read the documents.**
+/// Every stored extraction is replaced by text that mentions `RuntimeEntryPoint`
+/// and is not JSON: the v28 query (`instr(extraction_json, 'RuntimeEntryPoint')`
+/// then `json_extract`) meets it on every row and fails; the v29 query is served
+/// by `entry_wiring_json` and never opens a document, so its answer is the one
+/// it gave before the documents were damaged. Opened read-only, so no writer
+/// heals the damage first.
+#[test]
+fn the_test_entry_query_is_served_without_reading_the_extraction_documents() {
+    let files = [
+        (
+            "ledger.py",
+            "def ledger_total(rows):\n    return sum(rows)\n",
+        ),
+        (
+            "checks.py",
+            "from ledger import ledger_total\n\n\ndef test_sums():\n    \
+             assert ledger_total([1]) == 1\n",
+        ),
+    ];
+    let extractions: Vec<Extraction> = files
+        .iter()
+        .map(|(path, body)| extract_file(path, body))
+        .collect();
+    let dir = tmp_dir("hot-path");
+    let db = dir.join("devmap.sqlite");
+    let store = Store::open(&db).unwrap();
+    commit(&store, &extractions);
+    let expected = store.latest_test_entry_symbols().unwrap();
+    drop(store);
+    assert!(
+        expected.iter().any(|symbol| symbol.ends_with("test_sums")),
+        "the fixture must have a test entry point: {expected:?}"
+    );
+
+    Connection::open(&db)
+        .unwrap()
+        .execute(
+            "UPDATE file_payloads SET extraction_json = 'RuntimeEntryPoint {not json'",
+            [],
+        )
+        .unwrap();
+    let store = Store::open_read_only(&db).unwrap();
+    assert_eq!(
+        store
+            .latest_test_entry_symbols()
+            .expect("the query must not need the documents"),
+        expected
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
