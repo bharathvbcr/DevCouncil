@@ -4,7 +4,9 @@ use devmap_extract::collect_project_manifests;
 use devmap_resolve::{Resolver, UnresolvedClass};
 use devmap_store::{current_git_head, GenerationWriteOpts, Store, GENERATION_RETENTION};
 
-use crate::cli::{default_root_hint, root_parser, Cli, InventoryFlags, StampFlags};
+use crate::cli::{
+    default_root_hint, root_parser, Cli, InventoryFlags, ResolveLimitFlags, StampFlags,
+};
 use crate::commands::manifest::{
     manifest_json, report_manifest, resolve_graph_output, resolve_map_output,
     write_consumer_artifacts, ManifestOutcome, ManifestRequest,
@@ -96,6 +98,8 @@ pub(crate) struct Args {
     pub(crate) stamps: StampFlags,
     #[command(flatten)]
     pub(crate) inventory: InventoryFlags,
+    #[command(flatten)]
+    pub(crate) resolve_limits: ResolveLimitFlags,
 }
 
 /// The refusals by name, as data. `total` is the whole inventory and `shown`
@@ -137,6 +141,7 @@ pub(crate) fn run(
         lsp,
         stamps,
         inventory,
+        resolve_limits,
     } = args;
     // `--root` outranks the positional path, for the same reason it
     // does in `paths`: `cli.db()` already resolves the store from
@@ -520,6 +525,22 @@ pub(crate) fn run(
                 stamps,
                 *inventory,
             )?;
+            // The generation this build calls "still current" may be capped.
+            // Said here the way the refusals above are: a build that proves
+            // nothing changed must not read as complete. Read from the stored
+            // gap rows, which carry the sentence the capped build wrote, so the
+            // structured counts are not re-derived on this path.
+            let kept_cap = store.latest_resolution_budget_gaps()?;
+            let kept_cap_json: Vec<serde_json::Value> = kept_cap
+                .iter()
+                .map(|gap| {
+                    serde_json::json!({
+                        "limit": gap.path.strip_prefix("resolve:").unwrap_or(&gap.path),
+                        "reason": gap.reason,
+                        "carried_from_generation": generation,
+                    })
+                })
+                .collect();
             drop(_writer);
             progress.up_to_date(generation, file_count);
             if cli.json {
@@ -547,6 +568,10 @@ pub(crate) fn run(
                             "discovery_refused_files": refused_count,
                     "discovery_refusals": refusals_doc,
                             "over_limit_files": over_limit_files,
+                            // The kept generation's resolution caps, restated
+                            // as the refusals are. Always an array, like every
+                            // other build's `resolution_budget`.
+                            "resolution_budget": kept_cap_json,
                             "generation": generation,
                             "reclaim": reclaim_note(&vacuum),
                             "timings": progress.timings_json(),
@@ -558,15 +583,19 @@ pub(crate) fn run(
                         }),
                 )?;
             } else {
-                progress.display.summary(
-                    "Already mapped",
-                    &[format!(
-                        "No source changes; generation #{generation} still current \
+                let mut lines = vec![format!(
+                    "No source changes; generation #{generation} still current \
                      ({}) in {}.",
-                        progress::count(file_count, "file"),
-                        progress::duration(progress.started_at.elapsed().as_secs_f64())
-                    )],
-                );
+                    progress::count(file_count, "file"),
+                    progress::duration(progress.started_at.elapsed().as_secs_f64())
+                )];
+                for gap in &kept_cap {
+                    lines.push(format!(
+                        "Resolution capped (carried by generation #{generation}): {}",
+                        gap.reason
+                    ));
+                }
+                progress.display.summary("Already mapped", &lines);
                 progress.display.report_loss();
                 if cli.verbose {
                     if let Some(manifest) = &manifest {
@@ -719,7 +748,31 @@ pub(crate) fn run(
         2,
         format_args!("resolving {}", progress::count(extractions.len(), "file")),
     );
-    let mut resolution = resolver.resolve_all(&extractions)?;
+    let mut resolution =
+        resolver.resolve_all_with_limits(&extractions, (*resolve_limits).into())?;
+    // A budget that degraded candidate lists is said out loud, here and in the
+    // JSON result, as well as stored as a coverage gap: a capped graph must not
+    // read as a complete one to whoever ran the build.
+    let budget_gaps = resolution.budget_gaps();
+    for gap in &budget_gaps {
+        progress
+            .display
+            .diagnostic(format_args!("resolution capped: {}", gap.describe()));
+    }
+    let resolution_budget_json: Vec<serde_json::Value> = budget_gaps
+        .iter()
+        .map(|gap| {
+            serde_json::json!({
+                "limit": gap.limit,
+                "names_truncated": gap.names_truncated,
+                "candidates_dropped": gap.candidates_dropped,
+                "names_skipped": gap.names_skipped,
+                "sites": gap.sites,
+                "sample_names": gap.sample_names,
+                "names_total": gap.names_total,
+            })
+        })
+        .collect();
     let mut lsp_report = None;
     if *lsp {
         progress.display.detail("language-server pass (opt-in)");
@@ -935,9 +988,7 @@ pub(crate) fn run(
     drop(_writer);
     progress.complete(gen_id);
     if cli.json {
-        emit_json(
-            cli,
-            &serde_json::json!({
+        let mut result = serde_json::json!({
                 "generation_id": gen_id,
                 "file_progress": { "scan": scan_snapshot, "extraction": extraction_snapshot, "delta": file_delta },
                 "files_indexed": analysis.total_files,
@@ -988,8 +1039,11 @@ pub(crate) fn run(
                     })
                 }),
                 "manifest": manifest.as_ref().map(|manifest| &manifest.json),
-            }),
-        )?;
+        });
+        // One entry per exceeded resolution budget; empty when none was. Set
+        // after the literal, which is already at the macro's recursion limit.
+        result["resolution_budget"] = serde_json::Value::Array(resolution_budget_json);
+        emit_json(cli, &result)?;
     } else {
         let mut summary = vec![
             format!(

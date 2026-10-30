@@ -1233,6 +1233,10 @@ pub fn coverage_gaps_json(status: &StoreStatus) -> serde_json::Value {
         // byte ranges lost, because error recovery can swallow everything
         // after the fault and "parsed" alone hid that.
         "partial_parse": sample(&status.coverage_gaps.partial_parse),
+        // Not a file: a resolution budget that was exceeded and degraded some
+        // candidate lists instead of refusing the build. One row per budget,
+        // the reason says what was capped and by how much.
+        "resolution_budget": sample(&status.coverage_gaps.resolution_budget),
         // Skipped for size: never retried, never a refusal, and listed with
         // the two numbers that explain it. A row whose stored wording does
         // not parse carries `null` for both rather than an invented zero.

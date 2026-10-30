@@ -1516,6 +1516,38 @@ generation {latest}; run `devmap status` to re-verify",
         }))
     }
 
+    /// The latest generation's resolution-budget gap rows (`resolution_budget`),
+    /// one per exceeded budget, by path (`resolve:<budget>`). Empty when the
+    /// generation was not capped or the store holds none.
+    ///
+    /// For the build that proves nothing changed: it keeps the generation it
+    /// finds, so it must say that generation is capped, as it restates what
+    /// discovery refused. At most one row per budget, so there is no cap to
+    /// carry.
+    pub fn latest_resolution_budget_gaps(&self) -> Result<Vec<CoverageGapRow>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(Vec::new());
+        };
+        let mut page = snapshot.prepare(
+            "SELECT path, reason FROM generation_coverage_gaps
+             WHERE generation_id = ?1 AND gap = ?2
+             ORDER BY path ASC",
+        )?;
+        let rows = page
+            .query_map(
+                params![generation, crate::coverage::GAP_RESOLUTION_BUDGET],
+                |row| {
+                    Ok(CoverageGapRow {
+                        path: row.get(0)?,
+                        reason: row.get(1)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Every path [`Self::latest_budget_refusals`] counts, uncapped.
     ///
     /// For the build, which must re-extract all of them: a capped read would
