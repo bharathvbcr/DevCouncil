@@ -1231,6 +1231,7 @@ generation {latest}; run `devmap status` to re-verify",
         } else {
             None
         };
+        let encoding_reason = Self::payload_encoding_reason_locked(&snapshot)?;
         Ok(StoreStatus {
             db_path: db_path.to_string(),
             latest_generation: latest,
@@ -1240,11 +1241,63 @@ generation {latest}; run `devmap status` to re-verify",
             source_freshness: None,
             source_delta: None,
             analyzer_freshness: None,
-            degraded_reason: devmap_analyze::combine_reasons(quarantine_reason, fts_reason),
+            degraded_reason: devmap_analyze::combine_reasons(
+                devmap_analyze::combine_reasons(quarantine_reason, fts_reason),
+                encoding_reason,
+            ),
             quarantined_count,
             quarantined_paths,
             coverage_gaps,
         })
+    }
+
+    /// Which stored extractions are not in the schema-29 form, by path, or
+    /// `None` when every one is.
+    ///
+    /// A writer open converts what it can and leaves the rest as it found it
+    /// ([`Store::heal_extraction_encoding`]), and a reader refuses such a row by
+    /// name when it reaches it. Neither says so at open, and a store that opened
+    /// cleanly with one unreadable payload looked exactly like one with none, so
+    /// status reports it: the same probe the heal selects with, asked again, so
+    /// it also describes a store only ever opened read-only. A sample of paths,
+    /// and labelled as one, with the true total beside it.
+    fn payload_encoding_reason_locked(
+        snapshot: &rusqlite::Transaction<'_>,
+    ) -> Result<Option<String>> {
+        let total: i64 = snapshot.query_row(
+            "SELECT COUNT(*) FROM file_payloads
+              WHERE typeof(extraction_json) <> 'blob' OR entry_wiring_json IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        if total == 0 {
+            return Ok(None);
+        }
+        let paths: Vec<String> = {
+            let mut stmt = snapshot.prepare(
+                "SELECT pa.path FROM file_payloads fp JOIN paths pa ON pa.id = fp.file_id
+                  WHERE typeof(fp.extraction_json) <> 'blob' OR fp.entry_wiring_json IS NULL
+                  ORDER BY fp.payload_id LIMIT ?1",
+            )?;
+            let rows = stmt
+                .query_map(params![Self::DEGRADED_SAMPLE as i64], |row| row.get(0))?
+                .collect::<Result<Vec<_>>>()?;
+            rows
+        };
+        let elided = usize::try_from(total)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(paths.len());
+        let more = if elided > 0 {
+            format!(", and {elided} more")
+        } else {
+            String::new()
+        };
+        Ok(Some(format!(
+            "{total} stored extraction(s) are not in the schema-29 form (compressed, with entry \
+             wiring): {}{more}; a writer open converts what it can, and a payload it cannot is \
+             refused by name when read -- `dev map doctor --fix` quarantines the store and rebuilds it",
+            paths.join(", ")
+        )))
     }
 
     /// The latest generation's coverage-gap inventory, capped per kind.

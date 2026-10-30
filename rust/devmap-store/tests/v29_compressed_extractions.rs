@@ -562,3 +562,86 @@ fn a_frame_that_lies_about_its_size_or_is_chained_to_another_is_refused() {
     assert_refused(&db, "trailing bytes", "decompress");
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// The part of `degraded_reason` about payload encoding, if any. The fixture
+/// stores have no repository root, so `status` also says its source freshness is
+/// unverified; that is not what is asked here.
+fn status_reason(db: &Path) -> Option<String> {
+    let store = Store::open_read_only(db).unwrap();
+    store
+        .status(&db.to_string_lossy())
+        .unwrap()
+        .degraded_reason
+        .filter(|reason| reason.contains("not in the schema-29 form"))
+}
+
+/// **A heal that could not convert says so.** A writer open that meets a payload
+/// it cannot convert still succeeds (the readers refuse the row by name, and a
+/// store with one bad document is otherwise usable), but `status` names it in
+/// `degraded_reason`, so "opened clean" is no longer indistinguishable from
+/// "opened with an unreadable payload". A healthy store reports nothing, and a
+/// store only ever opened read-only is described the same way.
+#[test]
+fn an_open_that_could_not_convert_a_payload_says_so_in_status_and_stays_usable() {
+    let (dir, db) = written_store("heal-loud");
+    assert_eq!(status_reason(&db), None, "a healthy store reports nothing");
+
+    Connection::open(&db)
+        .unwrap()
+        .execute(
+            "UPDATE file_payloads SET extraction_json = '{not json'
+              WHERE file_id = (SELECT id FROM paths WHERE path = 'checks.py')",
+            [],
+        )
+        .unwrap();
+    // Read-only: nothing has tried to convert it yet, and status already says
+    // what is wrong and where.
+    let before = status_reason(&db).expect("an unconverted payload is a degraded store");
+    assert!(before.contains("checks.py"), "{before}");
+    assert!(before.contains("schema-29"), "{before}");
+
+    // A writer open converts what it can and does not brick the store.
+    let store =
+        Store::open(&db).expect("a payload that cannot be converted does not brick the open");
+    let after = store
+        .status(&db.to_string_lossy())
+        .unwrap()
+        .degraded_reason
+        .filter(|reason| reason.contains("not in the schema-29 form"))
+        .expect("the open could not convert it, and the store says so");
+    assert!(after.contains("checks.py"), "{after}");
+    assert_eq!(
+        store
+            .latest_extraction_for_path("ledger.py")
+            .unwrap()
+            .expect("the other payloads still read")
+            .file_path,
+        "ledger.py"
+    );
+    assert!(store
+        .latest_extraction_for_path("checks.py")
+        .err()
+        .expect("and the bad one is refused by name")
+        .to_string()
+        .contains("checks.py"));
+    drop(store);
+
+    // Replacing it with a document that decodes clears the report on the next
+    // writer open: the status is the store's state, not a memory of an open.
+    let honest = serde_json::to_string(&extract_file("checks.py", &sources()[1].1)).unwrap();
+    Connection::open(&db)
+        .unwrap()
+        .execute(
+            "UPDATE file_payloads SET extraction_json = ?1
+              WHERE file_id = (SELECT id FROM paths WHERE path = 'checks.py')",
+            params![honest],
+        )
+        .unwrap();
+    assert!(
+        status_reason(&db).is_some(),
+        "still text until a writer opens it"
+    );
+    drop(Store::open(&db).unwrap());
+    assert_eq!(status_reason(&db), None);
+    let _ = fs::remove_dir_all(&dir);
+}

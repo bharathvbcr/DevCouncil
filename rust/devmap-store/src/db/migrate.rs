@@ -1133,7 +1133,10 @@ impl Store {
         // later build of the same version added to the fresh schema.
         Self::heal_payload_digest(conn)?;
         // Whatever a same-version writer left unconverted stays so, and the
-        // readers refuse it by name; only the migration refuses the store.
+        // readers refuse it by name; only the migration refuses the store. The
+        // list is not dropped: `Store::status` asks the same question of the
+        // store (`payload_encoding_reason_locked`) and names the paths in
+        // `degraded_reason`, so an open that could not convert is visible.
         Self::heal_extraction_encoding(conn)?;
         Self::heal_declared_indexes(conn)?;
         Self::stamp_reader_compat(conn)?;
