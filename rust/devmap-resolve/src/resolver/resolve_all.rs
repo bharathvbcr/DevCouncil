@@ -2029,6 +2029,14 @@ impl Resolver {
                         &source_symbol,
                         position,
                     );
+                    // A `java.lang` spelling this file may bind as a type
+                    // parameter is left unexplained, and says so.
+                    let type_parameter_doubt = matches!(class, UnresolvedClass::Unresolved)
+                        && matches!(
+                            reference.kind,
+                            ReferenceKind::Type | ReferenceKind::TypeQualifier
+                        )
+                        && self.is_possibly_a_type_parameter(&ext.file_path, name);
                     unresolved.push(UnresolvedReference {
                         source_file: ext.file_path.clone(),
                         source_symbol,
@@ -2036,8 +2044,16 @@ impl Resolver {
                         kind: UnresolvedKind::Reference,
                         resolution: Resolution::Unresolved {
                             reason: format!(
-                                "no resolution rung matched {:?} reference {:?} in {} family {:?}",
-                                reference.kind, name, ext.file_path, family
+                                "no resolution rung matched {:?} reference {:?} in {} family {:?}{}",
+                                reference.kind,
+                                name,
+                                ext.file_path,
+                                family,
+                                if type_parameter_doubt {
+                                    ": possibly a type parameter"
+                                } else {
+                                    ""
+                                }
                             ),
                         },
                         class,

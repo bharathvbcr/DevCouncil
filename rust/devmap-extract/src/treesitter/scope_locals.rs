@@ -1384,6 +1384,15 @@ pub(super) fn collect_scope_locals(
         if in_charged_region(node) {
             continue;
         }
+        // A Java type-parameter list, on a class or on a callable. The names are
+        // not kept (a method's are already in its own scope); the file records
+        // that it has one, which is what a `java.lang` claim has to rule out.
+        if lang == "java" && node.kind() == "type_parameters" {
+            by_scope
+                .entry(file_symbol_name.to_string())
+                .or_default()
+                .insert(crate::model::FILE_DECLARES_TYPE_PARAMETERS.to_string());
+        }
         if is_callable_node(node) {
             // Unnamed *and* `let`-bound closures must not dump their parameters
             // into the enclosing function's `scope_locals`. That set is what

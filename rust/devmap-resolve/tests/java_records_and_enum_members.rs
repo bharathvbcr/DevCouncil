@@ -478,3 +478,114 @@ fn a_csharp_string_is_not_java_lang() {
             .all(|(_, class)| !matches!(class, UnresolvedClass::External { module } if module.starts_with("java."))),
     );
 }
+
+// Fail closed on a possible type parameter. The extractor records no
+// type-parameter facts for a class, so `class Box<Record> { Record held; }`
+// cannot be told from the JDK's `Record`: a java.lang name in a file that
+// declares any type-parameter list is not claimed as `java.lang`. It keeps the
+// class the name would have without the java.lang rung (here `Unresolved`, a Go
+// `Record` is in the corpus), and the ledger row says why.
+
+const GO_RECORD: &str = "package pb\ntype Record struct{}\ntype Process struct{}\n";
+
+/// `(class, reason)` of every `Type` reference row for `name` in `file`.
+fn type_row_reasons(
+    result: &ResolutionResult,
+    file: &str,
+    name: &str,
+) -> Vec<(UnresolvedClass, String)> {
+    result
+        .unresolved
+        .iter()
+        .filter(|row| {
+            row.source_file == file
+                && row.callee_name == name
+                && row.kind == UnresolvedKind::Reference
+        })
+        .map(|row| {
+            let reason = match &row.resolution {
+                devmap_resolve::model::Resolution::Unresolved { reason } => reason.clone(),
+                other => format!("{other:?}"),
+            };
+            (row.class.clone(), reason)
+        })
+        .collect()
+}
+
+#[test]
+fn a_class_type_parameter_named_like_a_jdk_type_is_not_java_lang() {
+    let (_, result) = resolve(&[
+        (
+            "p/Box.java",
+            "package p;\npublic class Box<Record> {\n    private Record held;\n}\n",
+        ),
+        ("pb/types.go", GO_RECORD),
+    ]);
+    let rows = type_row_reasons(&result, "p/Box.java", "Record");
+    assert!(!rows.is_empty(), "the field's type is a row");
+    for (class, reason) in &rows {
+        assert_eq!(class, &UnresolvedClass::Unresolved, "{reason}");
+        assert!(reason.contains("possibly a type parameter"), "{reason}");
+    }
+}
+
+#[test]
+fn a_non_generic_java_class_still_claims_java_lang() {
+    let (_, result) = resolve(&[
+        (
+            "p/Plain.java",
+            "package p;\npublic class Plain {\n    private String held;\n    public String get() { return held; }\n}\n",
+        ),
+        ("pb/fmt.go", GO_STRINGER),
+    ]);
+    let rows = type_row_reasons(&result, "p/Plain.java", "String");
+    assert!(!rows.is_empty());
+    for (class, reason) in &rows {
+        assert_eq!(
+            class,
+            &UnresolvedClass::External {
+                module: "java.lang.String".to_string()
+            },
+            "{reason}"
+        );
+    }
+}
+
+#[test]
+fn a_method_type_parameter_stays_a_local_binding() {
+    let (_, result) = resolve(&[
+        (
+            "p/Ids.java",
+            "package p;\npublic class Ids {\n    public <Process> Process id(Process x) { return x; }\n}\n",
+        ),
+        ("pb/types.go", GO_RECORD),
+    ]);
+    let rows = type_row_reasons(&result, "p/Ids.java", "Process");
+    assert!(!rows.is_empty());
+    assert!(
+        rows.iter()
+            .all(|(class, _)| *class == UnresolvedClass::LocalBinding),
+        "{rows:?}"
+    );
+}
+
+#[test]
+fn a_generic_file_does_not_claim_java_lang_for_any_name() {
+    // The cost of failing closed without per-name facts: `T` is not `String`,
+    // but nothing here says so.
+    let (_, result) = resolve(&[
+        (
+            "p/Holder.java",
+            "package p;\npublic class Holder<T> {\n    private String label;\n}\n",
+        ),
+        ("pb/fmt.go", GO_STRINGER),
+    ]);
+    let rows = type_row_reasons(&result, "p/Holder.java", "String");
+    assert!(!rows.is_empty());
+    assert!(
+        rows.iter().all(|(class, reason)| {
+            *class == UnresolvedClass::Unresolved && reason.contains("possibly a type parameter")
+        }),
+        "{rows:?}"
+    );
+}

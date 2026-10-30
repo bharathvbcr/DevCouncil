@@ -1556,6 +1556,17 @@ pub fn go_interface_method_matches<'a>(
         .collect()
 }
 
+/// The name under which a Java file's own scope in [`Extraction::scope_locals`]
+/// records that it declares at least one type-parameter list (`class Box<T>`,
+/// `<U> void f()`), whatever the names in it.
+///
+/// A file-level fact and not a name: `\u{1}` is no character of a Java
+/// identifier, so no use of a name can match it. It exists so a reader that
+/// would claim a bare type name for `java.lang` can tell that the file may bind
+/// that spelling as a type parameter, which the extractor does not record per
+/// name.
+pub const FILE_DECLARES_TYPE_PARAMETERS: &str = "\u{1}type_parameters";
+
 /// The leading words of every `ParseOutcome::Failed` reason that records a
 /// parse-budget overrun. See [`Extraction::is_budget_refusal`].
 pub const BUDGET_REFUSAL_PREFIX: &str = "parse budget exceeded: ";

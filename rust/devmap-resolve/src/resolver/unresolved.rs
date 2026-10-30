@@ -208,6 +208,41 @@ impl Resolver {
         })
     }
 
+    /// Whether a bare type name in `file_path` is a `java.lang` type, as far as
+    /// the index can prove: a Java file, a `java.lang` spelling, no JVM-language
+    /// declaration of it, and **no type-parameter list anywhere in the file**.
+    ///
+    /// The extractor does not record which names a class's type-parameter list
+    /// declares, so `class Box<Record> { Record held; }` cannot be told from the
+    /// JDK's `Record`. Failing closed means a file that declares any list does
+    /// not claim `java.lang` for any name; the miss keeps the class the name
+    /// would have without this rung.
+    pub(super) fn claims_java_lang(&self, file_path: &str, name: &str) -> bool {
+        file_path.ends_with(".java")
+            && crate::builtins::is_java_lang_type(name)
+            && !self.jvm_source_declares(name)
+            && !self.file_declares_type_parameters(file_path)
+    }
+
+    /// Whether the extractor saw a Java type-parameter list in `file_path`.
+    pub(super) fn file_declares_type_parameters(&self, file_path: &str) -> bool {
+        self.scope_locals.contains(&(
+            file_path.to_string(),
+            file_path.to_string(),
+            devmap_extract::model::FILE_DECLARES_TYPE_PARAMETERS.to_string(),
+        ))
+    }
+
+    /// Whether an unresolved Java type reference to `name` stayed unexplained
+    /// only because its file declares a type-parameter list: the name is a
+    /// `java.lang` spelling that [`Self::claims_java_lang`] refused.
+    pub(super) fn is_possibly_a_type_parameter(&self, file_path: &str, name: &str) -> bool {
+        file_path.ends_with(".java")
+            && crate::builtins::is_java_lang_type(name)
+            && !self.jvm_source_declares(name)
+            && self.file_declares_type_parameters(file_path)
+    }
+
     /// Why a call that failed the resolution ladder has no edge (SC18).
     ///
     /// Ordered by strength of evidence, and **fail-open toward `Unresolved`**:
@@ -340,10 +375,7 @@ impl Resolver {
                 // name anywhere in the corpus keeps the miss unexplained: it may
                 // be a bind failure, not the JDK's type. A namesake in another
                 // language (Go's `String()` method) is no evidence either way.
-                if file_path.ends_with(".java")
-                    && crate::builtins::is_java_lang_type(callee_name)
-                    && !self.jvm_source_declares(callee_name)
-                {
+                if self.claims_java_lang(file_path, callee_name) {
                     return UnresolvedClass::External {
                         module: format!("java.lang.{callee_name}"),
                     };
