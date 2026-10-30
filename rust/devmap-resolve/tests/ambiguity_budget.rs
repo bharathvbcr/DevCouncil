@@ -399,3 +399,100 @@ fn zero_budgets_degrade_everything_without_panicking_or_inventing_edges() {
         .iter()
         .all(|edge| edge.edge_kind != devmap_extract::model::EdgeKind::Calls));
 }
+
+/// What a zero budget costs is pinned, not just survived: a skipped lookup
+/// binds nothing, and that includes a name with exactly one declaration, whose
+/// edge the default budgets would have asserted. The gap says which names were
+/// skipped, so the lost edge is accounted for rather than silent. The
+/// ambiguity budget is the exception that proves the rule: it only ever
+/// charges lists of two or more, so a unique name keeps its edge under it.
+#[test]
+fn a_zero_budget_loses_the_unique_name_edge_and_the_gap_names_it() {
+    use devmap_extract::model::EdgeKind;
+    let mut inputs = fixture(40, 3);
+    inputs.push(extract_file("solo.py", "def solo(): pass\n"));
+    let caller = inputs
+        .iter_mut()
+        .find(|ext| ext.file_path == "caller_a.py")
+        .unwrap();
+    caller.calls.push(ExtractedCall {
+        caller_symbol: Some("caller_a.py::run".into()),
+        callee_name: "solo".into(),
+        receiver_expr: None,
+        span: Span {
+            start_byte: 99,
+            end_byte: 100,
+        },
+    });
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&inputs);
+    let solo_edges = |result: &devmap_resolve::model::ResolutionResult| {
+        result
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.edge_kind == EdgeKind::Calls && edge.target_symbol == "solo.py::solo"
+            })
+            .count()
+    };
+
+    let control = resolver.resolve_all(&inputs).unwrap();
+    assert_eq!(
+        solo_edges(&control),
+        1,
+        "inside its budgets the edge exists"
+    );
+    assert!(control.budget_gaps().is_empty());
+
+    for (limit_name, limits) in [
+        (
+            "candidate visits",
+            devmap_resolve::ResolutionLimits {
+                candidate_visits: 0,
+                ..Default::default()
+            },
+        ),
+        (
+            "retained candidate bytes",
+            devmap_resolve::ResolutionLimits {
+                retained_candidate_bytes: 0,
+                ..Default::default()
+            },
+        ),
+    ] {
+        let result = resolver.resolve_all_with_limits(&inputs, limits).unwrap();
+        assert_eq!(
+            solo_edges(&result),
+            0,
+            "{limit_name}: the lookup was skipped"
+        );
+        let gaps = result.budget_gaps();
+        assert_eq!(gaps.len(), 1, "{limit_name}");
+        assert_eq!(gaps[0].limit, limit_name);
+        assert_eq!(
+            gaps[0].names_skipped, 2,
+            "{limit_name}: `leaf` and `solo` were both skipped"
+        );
+        assert!(
+            gaps[0].sample_names.contains(&"solo".to_string()),
+            "{limit_name}: the lost edge's name is on the gap: {:?}",
+            gaps[0].sample_names
+        );
+    }
+
+    let evidence = resolver
+        .resolve_all_with_limits(
+            &inputs,
+            devmap_resolve::ResolutionLimits {
+                ambiguity_evidence_bytes: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        solo_edges(&evidence),
+        1,
+        "the ambiguity budget never charges a one-candidate list"
+    );
+    assert_eq!(evidence.budget_gaps()[0].names_skipped, 0);
+}
