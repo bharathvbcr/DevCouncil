@@ -205,6 +205,18 @@ func (g FileGate) EvaluateFileChange(path string, task *dc.Task, op dc.Operation
 	mt := matcherOf(g.Matcher)
 	defer failClosed(&d, RulePathEngineUnavailable, normalized, taskID, g.HardRules)
 
+	// The directory walk behind onDiskSpelling is the dearest thing this ladder
+	// does, and two rungs want its answer: ask once.
+	var diskName string
+	var diskDiffers, diskDone bool
+	diskOnce := func() (string, bool) {
+		if !diskDone {
+			diskName, diskDiffers = onDiskSpelling(g.Root, normalized)
+			diskDone = true
+		}
+		return diskName, diskDiffers
+	}
+
 	if g.HardRules {
 		// Checked on the raw input and again on the normalized result: a ".."
 		// segment can promote an interior component to the final one, so
@@ -233,13 +245,22 @@ func (g FileGate) EvaluateFileChange(path string, task *dc.Task, op dc.Operation
 		// The same two rungs against the name the filesystem stores, for a path
 		// that exists: a spelling the text rules do not fold to the pattern can
 		// still be the file the pattern protects. See onDiskSpelling.
-		if disk, differs := onDiskSpelling(g.Root, normalized); differs {
+		if disk, differs := diskOnce(); differs {
 			if mt.anyFold(SecretPathPatterns, disk) {
 				return deny(RuleSecretPath, "Path is another name for `"+disk+"`, a secret or credential path, which is never writable.", normalized, taskID)
 			}
 			if !internal && matchesRestricted(mt, disk) {
 				return deny(RuleRestrictedPath, "Path is another name for `"+disk+"`, a protected repository path.", normalized, taskID)
 			}
+		}
+	}
+
+	// Outside the hard-rules block on purpose: see PromptInputPatterns for what
+	// that buys and what it does not. Internal writes are the host's own — a
+	// host-trust assertion, as for the restricted rung — and are not judged.
+	if !internal {
+		if reason := g.promptInputReason(path, normalized, outside, diskOnce); reason != "" {
+			return deny(RuleRestrictedPath, reason, normalized, taskID)
 		}
 	}
 
