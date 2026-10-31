@@ -236,6 +236,8 @@ func protectedOperand(operand, root string, mt matching) string {
 		return fmt.Sprintf("a path outside the repository (`%s`)", operand)
 	case matchesRestricted(mt, strings.TrimPrefix(normalizeSlashes(normalized), "./")):
 		return fmt.Sprintf("a protected repository path (`%s`)", operand)
+	case IsPromptInput(normalized) || lexicalPromptInput(root, operand):
+		return fmt.Sprintf("a prompt input, a project instruction, skill or MCP declaration file (`%s`)", operand)
 	}
 	return ""
 }

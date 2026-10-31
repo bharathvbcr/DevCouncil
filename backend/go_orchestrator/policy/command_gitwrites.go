@@ -126,5 +126,5 @@ func protectedSpelling(word string) bool {
 		return true
 	}
 	cleaned := strings.TrimPrefix(normalizeSlashes(word), "./")
-	return matchesRestricted(matcherOf(nil), cleaned)
+	return matchesRestricted(matcherOf(nil), cleaned) || IsPromptInput(cleaned)
 }

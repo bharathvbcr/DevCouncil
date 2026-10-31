@@ -287,7 +287,28 @@ func lnWrites(args []shellWord) argWrites {
 	}
 	dir, haveDir := p.value("-t", "--target-directory")
 	targets, opaque := copyTargets(p.operands, haveDir, dir, p.has("-T", "--no-target-directory"), false, true)
-	return argWrites{targets: targets, opaque: opaque}
+	w := argWrites{targets: targets, opaque: opaque}
+	// A hard link gives the source's inode a second, writable name, so the source
+	// of a non-symbolic ln is judged as a write when it is a prompt input:
+	// `ln AGENTS.md notes.txt` would otherwise hand the agent a name for it that
+	// no rule spells. Only prompt-input sources: judging every source would
+	// refuse hard-linking an unplanned file, a scope question this change does not
+	// own (TestFileWriterTargets pins ln's targets). Writes through any such
+	// alias are refused regardless, by identity (reachesRootPromptInput).
+	if !p.has("-s", "--symbolic") {
+		sources := p.operands
+		if !haveDir && len(sources) > 1 {
+			sources = sources[:len(sources)-1]
+		}
+		var inputs []string
+		for _, s := range sources {
+			if IsPromptInput(s) {
+				inputs = append(inputs, s)
+			}
+		}
+		w.merge(literalWrites(inputs))
+	}
+	return w
 }
 
 // rsyncValueOptions are rsync's long options whose value may be the next word.
