@@ -247,7 +247,7 @@ fn codec_boundary_every_vector_is_a_correct_decode_or_a_named_refusal() {
     };
 
     // A small single-segment frame of 100 bytes: byte 5 is the 1-byte size.
-    let hundred = zstd::bulk::compress(&vec![b'a'; 100], 1).unwrap();
+    let hundred = zstd::bulk::compress(&[b'a'; 100], 1).unwrap();
     assert_eq!((hundred[4], hundred[5]), (0x20, 100));
     let mut declared_bigger = hundred.clone();
     declared_bigger[5] = 200;
@@ -380,11 +380,10 @@ fn codec_boundary_every_vector_is_a_correct_decode_or_a_named_refusal() {
                 verdict_all(&store, "checks.py", &baseline),
             ),
         ] {
-            let ok = match (&got, expect_equal) {
-                (Verdict::Equal, true) => true,
-                (Verdict::RefusedNamed, false) => true,
-                _ => false,
-            };
+            let ok = matches!(
+                (&got, expect_equal),
+                (Verdict::Equal, true) | (Verdict::RefusedNamed, false)
+            );
             println!("{label:48} {api:28} -> {got:?}");
             if !ok {
                 report.push(format!(
