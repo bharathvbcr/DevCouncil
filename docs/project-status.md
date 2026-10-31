@@ -9,7 +9,7 @@ availability; it does not certify every platform, editor session or release.
 
 | Surface | Implementation | Practical boundary |
 |---|---|---|
-| Code intelligence | Rust `devmap` pipeline, CLI, 21-tool MCP, watcher and `doc-drift` | Static evidence (schema 98); freshness and coverage are separate; queries can be capped |
+| Code intelligence | Rust `devmap` pipeline, CLI, 21-tool MCP, watcher and `doc-drift` | Static evidence (schema 98); resolution budgets; damaged store refusal; queries can be capped |
 | Go host | `devcouncil` / `dev` CLI and eight-tool task MCP | Task tooling, integration, skills and verification; no autonomous model loop |
 | Task state | Rust `dcstore` | Cooperating-client leases (schema 11), workbench tasks (schema 14), and durable records |
 | Verification | Go task checks plus Rust `dcverify` rigor | Deep scans (untracked, submodules), opaque stubs, no diff/panic secret echo |

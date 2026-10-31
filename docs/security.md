@@ -12,10 +12,13 @@ The implementation-level reference is
 - Task leases and write-policy results apply to participating clients. Retired
   DevCouncil hooks do not intercept every shell command or editor write.
 - Rigor includes secret and stub checks over the supplied diff, untracked files,
-  recreated files, and dirty submodule commit ranges. That is not a guarantee
-  that every repository file, log or provider payload is free of secrets.
+  recreated files, and dirty submodule commit ranges. Git replace-refs are disabled
+  at Go and Rust git seams to prevent hidden credential commits.
 - Verification errors suppress raw diff lines to prevent echoing detected secrets,
   and panic hooks suppress backtrace payload text.
+- Session children (e.g. language servers under `devmap build --lsp`) have their stderr
+  drained and redacted for credentials with `dc_redact` on non-zero exit, retaining
+  at most 4 KiB.
 - Missing and unavailable checks need explicit handling. Read gate mode,
   skipped reasons and coverage metadata in addition to the verdict.
 

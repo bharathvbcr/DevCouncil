@@ -113,12 +113,19 @@ flowchart TD
 ## Code graph pipeline
 
 1. `devmap-extract` discovers files and extracts definitions, imports, calls and
-   language-specific evidence. Parsing and discovery gaps remain visible.
+   language-specific evidence (extraction schema 98). Handles Java records, compact
+   constructors, enum constants, Kotlin expression-recovery, and CommonJS exports.
+   Parsing and discovery gaps remain visible.
 2. `devmap-resolve` resolves symbols and relationships, preserving ambiguity and
-   unresolved sites rather than upgrading a name match into certainty.
-3. `devmap-analyze` computes graph analysis and liveness candidates.
-4. `devmap-store` owns persistence; `devmap-query` reads and composes results.
-5. `devmap-serve` watches and updates state; `devmap-cli` exposes CLI/MCP and
+   unresolved sites rather than upgrading a name match into certainty. Supports
+   Java record constructor collapse, implicit `java.lang.*` resolution, TypeScript
+   barrel re-export traversal, Go build-constraint variant sets, and literal constant
+   call protection. When ambiguity limits are reached, candidate lists degrade
+   gracefully (marking exported maps partial) rather than aborting the build.
+3. `devmap-analyze` computes graph analysis, reachability, and liveness candidates.
+4. `devmap-store` owns persistence (schema 27) with pre-write search index integrity
+   checks; `devmap-query` reads and composes results.
+5. `devmap-serve` watches and updates state; `devmap-cli` exposes CLI/MCP (21 tools) and
    integration surfaces.
 
 Supported parsing is not complete semantic coverage. Read

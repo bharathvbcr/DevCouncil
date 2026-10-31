@@ -462,6 +462,14 @@ remain unavailable, with skipped execution explained in `probe_error`. An
 unavailable version is not evidence that two installations match. See
 [SECURITY_BOUNDARIES.md](../SECURITY_BOUNDARIES.md) for the execution and source
 access contracts.
+
+If SQLite full-text search index shadow tables are corrupted, `status` reports
+`query_ready: false` and `search_index_damaged: true` with the corruption finding.
+`build` performs a pre-write readable probe; if damaged, it refuses and provides the
+exact path and remediation instructions (move/delete and rebuild) rather than exiting 0.
+When resolution ambiguity limits are reached on large trees (e.g. Linux kernel scale),
+candidate lists degrade gracefully per list, marking exported maps partial (`partial: true`)
+with named reasons rather than aborting.
 See [CLI_PRESENTATION_AUDIT.md](https://github.com/bharathvbcr/DevCouncil/blob/b18cea3f23d2df9b3ba9d995a8d7b183aafa923e/docs/archive/CLI_PRESENTATION_AUDIT.md) for the command-wide
 audit and verification limits.
 
