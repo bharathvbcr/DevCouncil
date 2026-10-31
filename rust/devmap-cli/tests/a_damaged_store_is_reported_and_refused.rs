@@ -77,6 +77,12 @@ pub(crate) fn devmap_at(cwd: &Path, db: &Path, args: &[&str]) -> Run {
 }
 
 /// Overwrite the one page of `table` with bytes that are not a b-tree page.
+///
+/// `table` must be a real b-tree. A view has no page of its own: SQLite records
+/// its `rootpage` as 0, and a seek to `(0 - 1) * page_size` is not a smash of
+/// anything, so a view is refused loudly instead. Since schema 28
+/// `generation_nodes`, `generation_file_rows` and `nodes_fts_map` are views over
+/// `file_rows` and `payload_nodes`; smash those.
 pub(crate) fn smash_page_of(db: &Path, table: &str) {
     use std::io::{Seek, SeekFrom, Write};
     let (root_page, page_size) = {
@@ -97,6 +103,11 @@ pub(crate) fn smash_page_of(db: &Path, table: &str) {
             .unwrap();
         (root_page, page_size)
     };
+    assert!(
+        root_page > 0,
+        "`{table}` has rootpage {root_page} in sqlite_master: it is a view or virtual table, \
+         not a b-tree with a page to smash; name the table that holds its rows"
+    );
     let mut file = fs::OpenOptions::new().write(true).open(db).unwrap();
     file.seek(SeekFrom::Start(((root_page - 1) * page_size) as u64))
         .unwrap();
@@ -162,18 +173,34 @@ pub(crate) fn assert_untouched(what: &str, db: &Path, before: &Identity) {
     );
 }
 
-/// Every shadow table of the full-text index. A page of any of them can be the
-/// one that breaks: the term index and postings (`_data`, `_idx`) fail a search,
-/// the rest (`_content`, `_docsize`, `_config`) fail the structure around it, and
-/// `nodes_fts_map` is the generation-to-row map beside it.
-const INDEX_TABLES: [&str; 6] = [
+/// Every shadow table of the full-text index, and the two tables that hold which
+/// rows belong to which generation. A page of any of them can be the one that
+/// breaks: the term index and postings (`_data`, `_idx`) fail a search, the rest
+/// (`_content`, `_docsize`, `_config`) fail the structure around it, and since
+/// schema 28 the generation-to-row map (`nodes_fts_map`, a view) is carried by
+/// `file_rows` (the validity range of each file's payload) and `payload_nodes`
+/// (the symbols of each payload), which are the b-trees to damage.
+const INDEX_TABLES: [&str; 7] = [
     "nodes_fts_data",
     "nodes_fts_idx",
     "nodes_fts_content",
     "nodes_fts_docsize",
     "nodes_fts_config",
-    "nodes_fts_map",
+    "file_rows",
+    "payload_nodes",
 ];
+
+/// A view has no page to smash. The helper says so rather than seeking to
+/// `(0 - 1) * page_size` and panicking on an unwrap, or, worse, on a store whose
+/// page size made the seek land somewhere.
+#[test]
+#[should_panic(expected = "is a view or virtual table")]
+fn smashing_a_view_fails_loudly() {
+    let root = fixture("view");
+    let db = root.join("devmap.sqlite");
+    assert!(devmap_at(&root, &db, &["build", "."]).ok);
+    smash_page_of(&db, "nodes_fts_map");
+}
 
 /// Honesty half 1: `status` does not call a store whose index is damaged ready.
 #[test]

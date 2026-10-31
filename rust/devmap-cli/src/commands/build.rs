@@ -206,6 +206,11 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
     let _writer = progress.timed("writer:wait", || {
         Store::lock_writer_at(&cli.db(), Store::WRITER_LOCK_WAIT)
     })?;
+    // Whose store this is comes before anything that could write to it: opening
+    // migrates and heals the file, so a store of another live worktree is
+    // refused here, from a read-only look at its owner, and not after the open
+    // has rewritten it under that worktree's binary.
+    Store::refuse_a_live_foreign_owner_before_open(&cli.db(), path)?;
     let store = progress.timed("store:open", || Store::open(cli.db()))?;
     // Whose store this is comes before whether it is sound, and both are read
     // before anything is written: a store of another live worktree is refused
