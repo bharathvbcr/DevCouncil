@@ -61,7 +61,7 @@ use serde::{Deserialize, Serialize};
 
 mod index;
 mod lexical;
-pub use index::{IndexRequest, IndexResponse, SearchIndex, build_index};
+pub use index::{IndexRequest, IndexResponse, LeftOut, SearchIndex, build_index};
 pub use lexical::{
     RankedHit, RankedRequest, RankedResponse, ranked_engines, ranked_search, ranked_vocabularies,
     wordpiece_ids,
