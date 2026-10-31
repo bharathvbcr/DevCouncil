@@ -251,8 +251,9 @@ impl Store {
     ///
     /// Refuses, leaving the v28 store whole (the caller's one transaction
     /// rolls back), when any payload could not be converted: a store being
-    /// migrated is converted entirely or not at all, and `dev map doctor --fix`
-    /// is the remedy for a store that holds a document nothing can read.
+    /// migrated is converted entirely or not at all, and the remedy for a store
+    /// that holds a document nothing can read is to move or delete it and run
+    /// `devmap build`.
     fn migrate_to_v29(conn: &Connection) -> Result<()> {
         let payloads: i64 =
             conn.query_row("SELECT COUNT(*) FROM file_payloads", [], |row| row.get(0))?;
@@ -421,8 +422,8 @@ impl Store {
             None => Ok(()),
             Some(name) => Err(refusal(format!(
                 "the store carries a trigger ({name:?}), which no devmap schema declares; \
-                 refusing to run SQL somebody else put in the file — `dev map doctor --fix` \
-                 quarantines the store and rebuilds it"
+                 refusing to run SQL somebody else put in the file — move or delete the \
+                 store and run `devmap build`"
             ))),
         }
     }
@@ -459,7 +460,7 @@ impl Store {
                     return Err(refusal(format!(
                         "the store defines the view {name:?} differently from this binary's \
                          schema; refusing to read through SQL somebody else put in the file — \
-                         `dev map doctor --fix` quarantines the store and rebuilds it"
+                         move or delete the store and run `devmap build`"
                     )));
                 }
             }
@@ -543,8 +544,8 @@ impl Store {
             if !present.contains(&index) {
                 return Err(refusal(format!(
                     "required index {index} is missing and was not recreated; the store \
-                     would answer correctly and scan for every answer — `dev map doctor \
-                     --fix` quarantines the store and rebuilds it"
+                     would answer correctly and scan for every answer — move or delete the \
+                     store and run `devmap build`"
                 )));
             }
         }

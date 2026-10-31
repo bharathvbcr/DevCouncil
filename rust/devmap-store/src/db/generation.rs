@@ -1425,7 +1425,7 @@ generation {latest}; run `devmap status` to re-verify",
              wiring): a compressed frame that already has its entry wiring is not examined, and \
              a damaged one is found only when a reader decompresses it",
         );
-        reason.push_str(" -- `dev map doctor --fix` quarantines the store and rebuilds it");
+        reason.push_str(" -- move or delete the store and run `devmap build`");
         Ok(Some(reason))
     }
 

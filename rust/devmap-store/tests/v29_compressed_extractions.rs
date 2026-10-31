@@ -605,6 +605,13 @@ fn an_open_that_could_not_convert_a_payload_says_so_in_status_and_stays_usable()
     let before = status_reason(&db).expect("an unconverted payload is a degraded store");
     assert!(before.contains("checks.py"), "{before}");
     assert!(before.contains("schema-29"), "{before}");
+    // The remedy it names is a command that exists (`dev map doctor --fix` is not
+    // one, and the quarantine it promised is parked).
+    assert!(
+        before.contains("move or delete the store and run `devmap build`")
+            && !before.contains("doctor"),
+        "{before}"
+    );
 
     // A writer open converts what it can and does not brick the store.
     let store =
