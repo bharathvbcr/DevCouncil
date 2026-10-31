@@ -1,0 +1,33 @@
+{
+  "binary": {
+    "mtime": "2026-10-31T12:54:29.443408+00:00",
+    "path": "/Users/bharath/Code/devtools/DevCouncil/rust/target/debug/devmap",
+    "sha256": "fb7a39fb47ac750fd1e1bc088225382b121c43aba2d8659e7e7e86a96790f28a",
+    "size_bytes": 145134088,
+    "version": "devmap 0.2.5 (store schema 29, code graph schema 2, extract schema 98, build 067d3790ce12-dirty)"
+  },
+  "corpus": {
+    "code_bytes": 39070,
+    "code_files": 51,
+    "tracked_files": 51
+  },
+  "corpus_kind": "synthetic",
+  "generated_at": "2026-10-31T17:20:21+00:00",
+  "label": "",
+  "python": "3.15.2",
+  "repeat": 3,
+  "repo": "/var/folders/wl/qc_0nnp91cd5kfy179krkjxr0000gn/T/devmap-synth-763zcb44",
+  "stages": {
+    "cold": {
+      "max_s": 0.13682520895963535,
+      "mean_s": 0.12907283363165334,
+      "median_s": 0.12886995897861198,
+      "min_s": 0.12152333295671269,
+      "rel_spread": 0.12591718504275445,
+      "rss_bytes": 53100544.0,
+      "samples": 3,
+      "stdev_s": 0.007652955043369851
+    }
+  },
+  "synthetic_files": 50
+}

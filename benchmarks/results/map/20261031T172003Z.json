@@ -1,0 +1,54 @@
+{
+  "binary": {
+    "mtime": "2026-10-29T00:10:20.460551+00:00",
+    "path": "/Users/bharath/Code/devtools/DevCouncil/rust/target/release/devmap",
+    "sha256": "8e32116165ca3cf6fd4eaedb7fcccd1f38f74ff7b7d779bcb05c552d9db66df7",
+    "size_bytes": 72695600,
+    "version": "devmap 0.2.5 (store schema 27, code graph schema 2, extract schema 98, build 782b9f168833-dirty)"
+  },
+  "corpus": {
+    "code_bytes": 39070,
+    "code_files": 51,
+    "tracked_files": 51
+  },
+  "corpus_kind": "synthetic",
+  "generated_at": "2026-10-31T17:20:03+00:00",
+  "label": "",
+  "python": "3.15.2",
+  "repeat": 3,
+  "repo": "/var/folders/wl/qc_0nnp91cd5kfy179krkjxr0000gn/T/devmap-synth-04b5u88h",
+  "stages": {
+    "search": {
+      "argument": "shared_0",
+      "max_s": 0.022715084021911025,
+      "mean_s": 0.021273930692890037,
+      "median_s": 0.021133583039045334,
+      "min_s": 0.019973125017713755,
+      "rel_spread": 0.1372824233446435,
+      "rss_bytes": 15892480.0,
+      "samples": 3,
+      "stdev_s": 0.0013763567463159416
+    },
+    "touch": {
+      "max_s": 0.07955029199365526,
+      "mean_s": 0.06844650001342718,
+      "median_s": 0.07085441600065678,
+      "min_s": 0.054934792045969516,
+      "rel_spread": 0.4480857946469964,
+      "rss_bytes": 30359552.0,
+      "samples": 3,
+      "stdev_s": 0.012483158813769702
+    },
+    "warm": {
+      "max_s": 0.04043545899912715,
+      "mean_s": 0.03779337500842909,
+      "median_s": 0.036807083000894636,
+      "min_s": 0.036137583025265485,
+      "rel_spread": 0.11893091939371864,
+      "rss_bytes": 18284544.0,
+      "samples": 3,
+      "stdev_s": 0.0023124691165006066
+    }
+  },
+  "synthetic_files": 50
+}

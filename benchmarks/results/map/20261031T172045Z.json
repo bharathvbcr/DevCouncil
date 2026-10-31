@@ -1,0 +1,70 @@
+{
+  "binary": {
+    "mtime": "2026-10-29T00:10:20.460551+00:00",
+    "path": "/Users/bharath/Code/devtools/DevCouncil/rust/target/release/devmap",
+    "sha256": "8e32116165ca3cf6fd4eaedb7fcccd1f38f74ff7b7d779bcb05c552d9db66df7",
+    "size_bytes": 72695600,
+    "version": "devmap 0.2.5 (store schema 27, code graph schema 2, extract schema 98, build 782b9f168833-dirty)"
+  },
+  "corpus": {
+    "code_bytes": 56608180,
+    "code_files": 1960,
+    "tracked_files": 2918
+  },
+  "corpus_kind": "repository",
+  "generated_at": "2026-10-31T17:20:45+00:00",
+  "label": "",
+  "python": "3.15.2",
+  "repeat": 3,
+  "repo": "/Users/bharath/Code/devtools/DevCouncil",
+  "stages": {
+    "impact": {
+      "argument": "backend/go_orchestrator/dc/store/serve.go::servedChild.close",
+      "max_s": 0.07861937501002103,
+      "mean_s": 0.07621247232115518,
+      "median_s": 0.07550391700351611,
+      "min_s": 0.07451412494992837,
+      "rel_spread": 0.05509358209401618,
+      "rss_bytes": 75235328.0,
+      "samples": 3,
+      "stdev_s": 0.002142383600709415
+    },
+    "manifest": {
+      "explained_sites": 186447.0,
+      "graph_bytes": 37226106.0,
+      "map_bytes": 522751.0,
+      "max_s": 1.215259332966525,
+      "mean_s": 0.5403705553229278,
+      "median_s": 0.2101928330375813,
+      "min_s": 0.1956594999646768,
+      "net_resolution_permille": 473.0,
+      "rel_spread": 5.2110929098046395,
+      "resolved_sites": 73159.0,
+      "samples": 3,
+      "stdev_s": 0.5845159972870749,
+      "unresolved_sites": 281404.0
+    },
+    "search": {
+      "argument": "resolve",
+      "max_s": 0.03837279096478596,
+      "mean_s": 0.03572338866069913,
+      "median_s": 0.03480233403388411,
+      "min_s": 0.033995040983427316,
+      "rel_spread": 0.12877613483368983,
+      "rss_bytes": 31326208.0,
+      "samples": 3,
+      "stdev_s": 0.002329684515981601
+    },
+    "warm": {
+      "max_s": 0.12732479197438806,
+      "mean_s": 0.12482181965606287,
+      "median_s": 0.12461541697848588,
+      "min_s": 0.12252525001531467,
+      "rel_spread": 0.039171860155139376,
+      "rss_bytes": 92192768.0,
+      "samples": 3,
+      "stdev_s": 0.002406418979149253
+    }
+  },
+  "synthetic_files": 0
+}

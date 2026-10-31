@@ -13,7 +13,7 @@ checks. A consumer can use a single binary or selected library crates.
 | `devmap` | `rust/devmap-cli/` and `rust/devmap-*` | Extraction, resolution, graph storage, analysis, queries, watching and navigation MCP |
 | `dcstore` | `rust/dc-store/` | SQLite task and workbench state, leases, verification records and gaps |
 | `dcverify` | `rust/dc-verify/` | Structured diff analysis, scope classification, stub/secret checks and diff–coverage intersection |
-| `dcgrep` | `rust/dc-grep/` | Ignore-aware text search with optional trigram indexing |
+| `dcgrep` | `rust/dc-grep/` | Ignore-aware text search with optional trigram indexing and BM25 rank scoring (decoupled ceilings, 64 MiB lexical budget, completeness contract) |
 
 ```mermaid
 flowchart TD
@@ -123,8 +123,10 @@ flowchart TD
    call protection. When ambiguity limits are reached, candidate lists degrade
    gracefully (marking exported maps partial) rather than aborting the build.
 3. `devmap-analyze` computes graph analysis, reachability, and liveness candidates.
-4. `devmap-store` owns persistence (schema 27) with pre-write search index integrity
-   checks; `devmap-query` reads and composes results.
+4. `devmap-store` owns persistence (schema 29, reader floor 29) with zstd
+   level-1 compressed extraction documents (`extraction_json`, `entry_wiring_json`),
+   payload validity ranges, payload-digest identity, and pre-write search index
+   integrity checks; `devmap-query` reads and composes results.
 5. `devmap-serve` watches and updates state; `devmap-cli` exposes CLI/MCP (21 tools) and
    integration surfaces.
 
@@ -153,6 +155,10 @@ Verification rigor encompasses:
 - **Atomic file safety:** Rooted file reads via `safefile.OpenNoFollow` retry (up to 16
   attempts) when regular files are atomically replaced in race windows, while refusing
   symlinks and FIFOs immediately.
+- **Prompt-input write protection:** Direct file writes, link creation, or git operations
+  targeting prompt instruction files (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `mcp.json`, `.mcp.json`),
+  skill roots (`.claude/`, `.cursor/`, `.agents/`), and plugin manifests are refused by the policy
+  engine at any path depth across all postures (including `yolo`).
 
 Go scope findings retain their existing owner; the rigor adapter does not
 report a second independent scope verdict. Result metadata names applied gates

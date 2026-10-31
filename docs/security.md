@@ -19,6 +19,9 @@ The implementation-level reference is
 - Session children (e.g. language servers under `devmap build --lsp`) have their stderr
   drained and redacted for credentials with `dc_redact` on non-zero exit, retaining
   at most 4 KiB.
+- Prompt inputs and host configs (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `mcp.json`, `.mcp.json`,
+  skill roots and plugin manifests) are protected against agent writes at any depth and across all
+  postures, including yolo.
 - Missing and unavailable checks need explicit handling. Read gate mode,
   skipped reasons and coverage metadata in addition to the verdict.
 
@@ -50,6 +53,23 @@ timeout reply names it. `notifications/cancelled` stops the call it names and
 its process group, a call that is cancelled is not answered, and closing stdin
 cancels every running call before the host exits. A verification cut short by
 its budget is still recorded, with its timeout gap.
+
+## Prompt inputs and configuration write protection
+
+Agents cannot overwrite instructions or MCP configuration that govern their own execution:
+- **Refused targets:** Direct writes to `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `mcp.json`, and `.mcp.json`
+  are refused at any directory depth.
+- **Skill and plugin roots:** Skill directories (`.claude/`, `.cursor/`, `.agents/`) and plugin
+  manifests discovered under plugin roots are protected from agent write mutation.
+- **Posture independence:** The prompt-input rung sits outside the policy `HardRules` block,
+  ensuring it enforces under all postures, including `yolo`.
+- **Read-only permission:** The rule strictly targets write operations; models can always read
+  instruction files to orient and execute tasks.
+- **Identity-based alias detection:** Hard links and symlinks resolving to prompt inputs are
+  resolved and blocked by filesystem identity (`syscall.Stat` device/inode verification).
+- **Residual boundaries:** Shell interpreters (`sh -c`), archive unpackers (`tar`/`unzip`),
+  git state manipulators (`reset`, `merge`, `pull`, `stash pop`), and directory `cp`/`mv` under all
+  postures remain unmodelled external execution paths pinned by tests in `gate/zadv_prompt_input_test.go`.
 
 Installing MCP configuration does not grant universal scope enforcement.
 [Integration](coding-cli-integration.md) documents which settings and hooks

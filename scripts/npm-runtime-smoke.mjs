@@ -16,6 +16,7 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { packedPackage } from "./npm-runtime-smoke-checks.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
@@ -86,8 +87,8 @@ function shimEnv(extra) {
 function main() {
   const packed = runNpm(["pack", "--dry-run", "--json"], { env: smokeNpmEnv() });
   assertOk(packed, "npm pack --dry-run --json");
-  const parsed = JSON.parse(packed.stdout.trim());
-  const metadata = Array.isArray(parsed) ? parsed[0] : parsed;
+  const packageName = JSON.parse(readFileSync(path.join(repoRoot, "package.json"), "utf8")).name;
+  const metadata = packedPackage(JSON.parse(packed.stdout.trim()), packageName);
   assertPackedFile(metadata, "bin/devcouncil.js");
   assertPackedFile(metadata, "README.md");
   assertPackedFile(metadata, "LICENSE");

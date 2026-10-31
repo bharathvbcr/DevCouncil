@@ -957,3 +957,399 @@ func Handle() {
         "`c` is llm's Client, not api's: {targets:?}"
     );
 }
+
+#[test]
+fn a_rust_builder_method_chain_propagates_receiver_type() {
+    let builder_src = "\
+pub struct RequestBuilder {
+    url: String,
+}
+
+impl RequestBuilder {
+    pub fn new() -> Self {
+        Self { url: String::new() }
+    }
+    pub fn header(&mut self, _k: &str, _v: &str) -> &mut Self {
+        self
+    }
+    pub fn send(&self) {}
+}
+
+pub fn make_request() {
+    let mut b = RequestBuilder::new();
+    b.header(\"Accept\", \"json\").send();
+}
+";
+    let targets = calls_from(
+        &[("src/req.rs", builder_src)],
+        "src/req.rs::make_request",
+    );
+    assert!(
+        targets.iter().any(|t| t == "src/req.rs::RequestBuilder.send"),
+        "chained builder call .header().send() must resolve to RequestBuilder.send: {targets:?}"
+    );
+}
+
+#[test]
+fn a_rust_chained_variable_initializer_propagates_receiver_type() {
+    let builder_src = "\
+pub struct ConfigBuilder {
+    timeout: u32,
+}
+
+impl ConfigBuilder {
+    pub fn builder() -> Self {
+        Self { timeout: 30 }
+    }
+    pub fn timeout(mut self, t: u32) -> Self {
+        self.timeout = t;
+        self
+    }
+    pub fn build(&self) {}
+}
+
+pub fn configure() {
+    let c = ConfigBuilder::builder().timeout(60);
+    c.build();
+}
+";
+    let targets = calls_from(
+        &[("src/config.rs", builder_src)],
+        "src/config.rs::configure",
+    );
+    assert!(
+        targets.iter().any(|t| t == "src/config.rs::ConfigBuilder.build"),
+        "variable initialized from chained builder must resolve .build() to ConfigBuilder.build: {targets:?}"
+    );
+}
+
+#[test]
+fn a_typescript_method_chain_propagates_receiver_type() {
+    let ts_src = "\
+class QueryBuilder {
+    where(field: string): this {
+        return this;
+    }
+    execute(): void {}
+}
+
+function runQuery() {
+    const q = new QueryBuilder();
+    q.where('id').execute();
+}
+";
+    let targets = calls_from(
+        &[("src/query.ts", ts_src)],
+        "src/query.ts::runQuery",
+    );
+    assert!(
+        targets.iter().any(|t| t == "src/query.ts::QueryBuilder.execute"),
+        "TypeScript chained method call must resolve to QueryBuilder.execute: {targets:?}"
+    );
+}
+
+#[test]
+fn adversarial_deep_builder_chain_depth_12() {
+    let builder_src = "\
+pub struct ChainBuilder { count: u32 }
+impl ChainBuilder {
+    pub fn new() -> Self { Self { count: 0 } }
+    pub fn m1(self) -> Self { self }
+    pub fn m2(self) -> Self { self }
+    pub fn m3(self) -> Self { self }
+    pub fn m4(self) -> Self { self }
+    pub fn m5(self) -> Self { self }
+    pub fn m6(self) -> Self { self }
+    pub fn m7(self) -> Self { self }
+    pub fn m8(self) -> Self { self }
+    pub fn m9(self) -> Self { self }
+    pub fn m10(self) -> Self { self }
+    pub fn m11(self) -> Self { self }
+    pub fn m12(self) -> Self { self }
+    pub fn finish(&self) {}
+}
+
+pub fn test_deep_chain() {
+    let b = ChainBuilder::new();
+    b.m1().m2().m3().m4().m5().m6().m7().m8().m9().m10().m11().m12().finish();
+}
+";
+    let targets = calls_from(
+        &[("src/chain.rs", builder_src)],
+        "src/chain.rs::test_deep_chain",
+    );
+    assert!(
+        targets.iter().any(|t| t == "src/chain.rs::ChainBuilder.finish"),
+        "depth 12 chain must resolve to ChainBuilder.finish: {targets:?}"
+    );
+}
+
+#[test]
+fn adversarial_cyclic_receiver_chain() {
+    let src = "\
+pub struct TypeA;
+pub struct TypeB;
+
+impl TypeA {
+    pub fn new() -> Self { Self }
+    pub fn to_b(self) -> TypeB { TypeB }
+    pub fn a_done(&self) {}
+}
+
+impl TypeB {
+    pub fn to_a(self) -> TypeA { TypeA }
+    pub fn b_done(&self) {}
+}
+
+pub fn test_cyclic() {
+    let a: TypeA = TypeA;
+    a.to_b().to_a().to_b().to_a().a_done();
+    let a2: TypeA = TypeA;
+    a2.to_b().to_a().to_b().b_done();
+}
+";
+    let targets = calls_from(
+        &[("src/cyclic.rs", src)],
+        "src/cyclic.rs::test_cyclic",
+    );
+    assert!(
+        targets.iter().any(|t| t == "src/cyclic.rs::TypeA.a_done"),
+        "cyclic chain to A must resolve to TypeA.a_done: {targets:?}"
+    );
+    assert!(
+        targets.iter().any(|t| t == "src/cyclic.rs::TypeB.b_done"),
+        "cyclic chain to B must resolve to TypeB.b_done: {targets:?}"
+    );
+}
+
+#[test]
+fn adversarial_shadowing_scope_builder() {
+    let src = "\
+pub struct OuterBuilder;
+pub struct InnerBuilder;
+
+impl OuterBuilder {
+    pub fn new() -> Self { Self }
+    pub fn step(self) -> Self { self }
+    pub fn outer_action(&self) {}
+}
+
+impl InnerBuilder {
+    pub fn new() -> Self { Self }
+    pub fn step(self) -> Self { self }
+    pub fn inner_action(&self) {}
+}
+
+pub fn test_shadow() {
+    let b = OuterBuilder::new();
+    {
+        let b = InnerBuilder::new();
+        b.step().inner_action();
+    }
+    b.step().outer_action();
+}
+";
+    let targets = calls_from(
+        &[("src/shadow.rs", src)],
+        "src/shadow.rs::test_shadow",
+    );
+    assert!(
+        targets.iter().any(|t| t == "src/shadow.rs::InnerBuilder.inner_action"),
+        "inner shadow must resolve to InnerBuilder.inner_action: {targets:?}"
+    );
+    assert!(
+        targets.iter().any(|t| t == "src/shadow.rs::OuterBuilder.outer_action"),
+        "outer builder must resolve to OuterBuilder.outer_action: {targets:?}"
+    );
+}
+
+#[test]
+fn adversarial_non_builder_unrelated_types_do_not_falsely_propagate() {
+    let src = "\
+pub struct ParentService { id: u32 }
+pub struct ChildWorker { id: u32 }
+
+impl ParentService {
+    pub fn new() -> Self { Self { id: 1 } }
+    pub fn get_worker(&self) -> ChildWorker { ChildWorker { id: 2 } }
+    pub fn parent_exclusive(&self) {}
+    pub fn common_name(&self) {}
+}
+
+impl ChildWorker {
+    pub fn work(&self) {}
+    pub fn common_name(&self) {}
+}
+
+pub fn test_unrelated() {
+    let p = ParentService::new();
+    p.get_worker().work();
+    p.get_worker().common_name();
+}
+";
+    let targets = calls_from(
+        &[("src/unrelated.rs", src)],
+        "src/unrelated.rs::test_unrelated",
+    );
+    assert!(
+        targets.iter().any(|t| t == "src/unrelated.rs::ChildWorker.work"),
+        "p.get_worker().work() must resolve to ChildWorker.work: {targets:?}"
+    );
+    assert!(
+        targets.iter().any(|t| t == "src/unrelated.rs::ChildWorker.common_name"),
+        "p.get_worker().common_name() must resolve to ChildWorker.common_name: {targets:?}"
+    );
+    assert!(
+        !targets.iter().any(|t| t == "src/unrelated.rs::ParentService.common_name"),
+        "p.get_worker().common_name() must NOT falsely resolve to ParentService.common_name: {targets:?}"
+    );
+}
+
+#[test]
+fn adversarial_non_builder_primitive_negative_test() {
+    let src = "\
+pub struct MasterServer { port: u16 }
+impl MasterServer {
+    pub fn new() -> Self { Self { port: 8080 } }
+    pub fn get_port(&self) -> u16 { self.port }
+    pub fn shutdown(&self) {}
+}
+
+pub fn test_primitive_chain() {
+    let s = MasterServer::new();
+    // In invalid code or partial AST: s.get_port().shutdown()
+    // u16 does NOT have shutdown(). MasterServer DOES have shutdown().
+    // DevMap must NOT falsely propagate MasterServer as the receiver for shutdown()!
+    s.get_port().shutdown();
+}
+";
+    let targets = calls_from(
+        &[("src/primitive.rs", src)],
+        "src/primitive.rs::test_primitive_chain",
+    );
+    assert!(
+        !targets.iter().any(|t| t == "src/primitive.rs::MasterServer.shutdown"),
+        "s.get_port().shutdown() must NOT falsely resolve to MasterServer.shutdown: {targets:?}"
+    );
+}
+
+
+#[test]
+fn adversarial_chain_exceeding_max_chars() {
+    let builder_src = "\
+pub struct LongNameBuilder;
+impl LongNameBuilder {
+    pub fn new() -> Self { Self }
+    pub fn configuration_step_alpha(self) -> Self { self }
+    pub fn configuration_step_beta(self) -> Self { self }
+    pub fn configuration_step_gamma(self) -> Self { self }
+    pub fn configuration_step_delta(self) -> Self { self }
+    pub fn execute(&self) {}
+}
+
+pub fn test_long_names() {
+    let b = LongNameBuilder::new();
+    b.configuration_step_alpha().configuration_step_beta().configuration_step_gamma().configuration_step_delta().execute();
+}
+";
+    let targets = calls_from(
+        &[("src/long.rs", builder_src)],
+        "src/long.rs::test_long_names",
+    );
+    assert!(
+        targets.iter().any(|t| t == "src/long.rs::LongNameBuilder.execute"),
+        "long-named chain must resolve execute(): {targets:?}"
+    );
+}
+
+#[test]
+fn adversarial_builder_chain_depth_20() {
+    let mut builder_src = String::from("\
+pub struct DeepBuilder;
+impl DeepBuilder {
+    pub fn new() -> Self { Self }
+");
+    for i in 1..=20 {
+        builder_src.push_str(&format!("    pub fn s{i}(self) -> Self {{ self }}\n"));
+    }
+    builder_src.push_str("    pub fn done(&self) {}\n}\n\npub fn test_depth_20() {\n    let b = DeepBuilder::new();\n    b");
+    for i in 1..=20 {
+        builder_src.push_str(&format!(".s{i}()"));
+    }
+    builder_src.push_str(".done();\n}\n");
+
+    let targets = calls_from(
+        &[("src/deep20.rs", &builder_src)],
+        "src/deep20.rs::test_depth_20",
+    );
+    assert!(
+        targets.iter().any(|t| t == "src/deep20.rs::DeepBuilder.done"),
+        "chain of depth 20 must resolve to DeepBuilder.done: {targets:?}"
+    );
+}
+
+#[test]
+fn adversarial_typescript_deep_chain_and_shadowing() {
+    let ts_src = "\
+class SqlBuilder {
+    select(f: string): this { return this; }
+    from(t: string): this { return this; }
+    where(c: string): this { return this; }
+    orderBy(col: string): this { return this; }
+    limit(n: number): this { return this; }
+    build(): string { return ''; }
+}
+
+class AltBuilder {
+    altAction(): void {}
+}
+
+function runSql() {
+    const q = new SqlBuilder();
+    function inner() {
+        const q = new AltBuilder();
+        q.altAction();
+    }
+    inner();
+    q.select('*').from('users').where('active').orderBy('id').limit(10).build();
+}
+";
+    let targets = calls_from(
+        &[("src/sql.ts", ts_src)],
+        "src/sql.ts::runSql",
+    );
+    assert!(
+        targets.iter().any(|t| t == "src/sql.ts::SqlBuilder.build"),
+        "outer builder must resolve to SqlBuilder.build: {targets:?}"
+    );
+}
+
+#[test]
+fn adversarial_go_method_chain_on_pointer() {
+    let go_src = "\
+package builder
+
+type Request struct{}
+
+func New() *Request { return &Request{} }
+func (r *Request) Header(k, v string) *Request { return r }
+func (r *Request) Send() {}
+
+func Make() {
+    r := New()
+    r.Header(\"a\", \"b\").Send()
+}
+";
+    let targets = calls_from(
+        &[("builder/req.go", go_src)],
+        "builder/req.go::Make",
+    );
+    eprintln!("Go chained targets: {targets:?}");
+    assert!(
+        targets.iter().any(|t| t == "builder/req.go::Request.Send"),
+        "Go chained pointer method must resolve to Request.Send: {targets:?}"
+    );
+}
+
+
+

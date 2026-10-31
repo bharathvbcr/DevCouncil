@@ -353,6 +353,7 @@ dcgrep health
 dcgrep search < request.json
 dcgrep files < request.json
 dcgrep index < request.json
+dcgrep rank < request.json    # BM25/learned ranking with completeness contract & decoupled ceilings
 ```
 
 ---

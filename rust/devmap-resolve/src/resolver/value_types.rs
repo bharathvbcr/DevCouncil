@@ -318,23 +318,33 @@ impl Resolver {
             let owner = owner.rsplit("::").next()?;
             self.unique_type_method(family, owner, function)?
         } else if let Some((receiver, function)) = shape.rsplit_once('.') {
-            if !Self::is_plain_ident(receiver)
-                || !Self::is_plain_ident(function)
-                || scope.is_some_and(|scope| self.scope_shadows(family, file, scope, receiver))
+            let root = Self::path_root(receiver);
+            if !Self::is_plain_ident(function)
+                || scope.is_some_and(|scope| self.scope_shadows(family, file, scope, root))
             {
                 return None;
             }
-            let module = self
-                .import_binding_at(family, file, scope, receiver)
-                .filter(|_| !self.is_value_import(file, receiver));
-            match module {
-                Some((module_file, _)) => self.lookup_in_package(module_file, function)?,
-                // `Svc.create()`: a static factory on a type this corpus
-                // declares once.
-                None if self.unique_indexed_type(family, receiver) => {
-                    self.unique_type_method(family, receiver, function)?
+            if Self::is_plain_ident(receiver) {
+                let module = self
+                    .import_binding_at(family, file, scope, receiver)
+                    .filter(|_| !self.is_value_import(file, receiver));
+                match module {
+                    Some((module_file, _)) => self.lookup_in_package(module_file, function)?,
+                    // `Svc.create()`: a static factory on a type this corpus
+                    // declares once.
+                    None if self.unique_indexed_type(family, receiver) => {
+                        self.unique_type_method(family, receiver, function)?
+                    }
+                    None => {
+                        let base_type = self.receiver_type_for(file, scope, receiver, None)?;
+                        let key = (family, base_type, function.to_string());
+                        self.type_methods.get(&key)?.first()?.clone()
+                    }
                 }
-                None => return None,
+            } else {
+                let base_type = self.receiver_type_for(file, scope, receiver, None)?;
+                let key = (family, base_type, function.to_string());
+                self.type_methods.get(&key)?.first()?.clone()
             }
         } else {
             if !Self::is_plain_ident(shape)

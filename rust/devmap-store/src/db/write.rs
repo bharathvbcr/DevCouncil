@@ -20,13 +20,55 @@ use devmap_resolve::model::ResolutionResult;
 #[cfg(feature = "parse")]
 use rusqlite::OptionalExtension;
 #[cfg(feature = "parse")]
-use rusqlite::{params, Connection, Result};
+use rusqlite::{params, params_from_iter, Connection, Result, ToSql};
 #[cfg(feature = "parse")]
 use std::collections::BTreeMap;
 #[cfg(feature = "parse")]
 use std::path::Path;
 #[cfg(feature = "parse")]
 use std::sync::{mpsc, Mutex, PoisonError};
+
+#[cfg(feature = "parse")]
+const FTS_CHUNK_SIZE: usize = 50;
+
+#[cfg(feature = "parse")]
+const FTS_50_SQL: &str = concat!(
+    "INSERT INTO nodes_fts (rowid, name, qualified_name, path) VALUES ",
+    "(?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), ",
+    "(?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), ",
+    "(?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), ",
+    "(?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), ",
+    "(?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), ",
+    "(?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), ",
+    "(?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), ",
+    "(?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), ",
+    "(?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), ",
+    "(?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?)"
+);
+
+#[cfg(feature = "parse")]
+const UNRESOLVED_CHUNK_SIZE: usize = 64;
+
+#[cfg(feature = "parse")]
+const UNRESOLVED_64_SQL: &str = concat!(
+    "INSERT INTO unresolved_rows (source_file_id, source_symbol, callee_name, reason_id, classification_id, receiver, valid_from, valid_to) VALUES ",
+    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
+    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
+    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
+    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
+    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
+    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
+    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
+    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
+    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
+    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
+    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
+    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
+    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
+    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
+    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
+    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL)"
+);
 
 /// How many extractions may be handed to the serializer threads, per thread,
 /// ahead of the one being inserted. The window of a write is this times the
@@ -625,6 +667,7 @@ impl Store {
             }
             Self::delete_payload_rows(tx, payload_id)?;
         }
+        let mut fts_chunk: Vec<(i64, &str, &str)> = Vec::with_capacity(FTS_CHUNK_SIZE);
         for (ord_in_file, sym) in extraction.symbols.iter().enumerate() {
             let fts_rowid = Self::fts_rowid(payload_id, ord_in_file)?;
             {
@@ -656,18 +699,29 @@ impl Store {
                     sym.body_signature.map(|s| i64::from(s.nodes)),
                 ])?;
             }
-            {
+            fts_chunk.push((fts_rowid, sym.name.as_str(), sym.qualified_name.as_str()));
+            if fts_chunk.len() == FTS_CHUNK_SIZE {
                 let _charge = charge(&mut spent.fts);
-                tx.prepare_cached(
-                    "INSERT INTO nodes_fts (rowid, name, qualified_name, path)
-                     VALUES (?1, ?2, ?3, ?4)",
-                )?
-                .execute(params![
-                    fts_rowid,
-                    sym.name,
-                    sym.qualified_name,
-                    extraction.file_path
-                ])?;
+                let mut params_vec: Vec<&dyn ToSql> = Vec::with_capacity(FTS_CHUNK_SIZE * 4);
+                for item in &fts_chunk {
+                    params_vec.push(&item.0);
+                    params_vec.push(&item.1);
+                    params_vec.push(&item.2);
+                    params_vec.push(&extraction.file_path);
+                }
+                tx.prepare_cached(FTS_50_SQL)?
+                    .execute(params_from_iter(params_vec.iter()))?;
+                fts_chunk.clear();
+            }
+        }
+        if !fts_chunk.is_empty() {
+            let _charge = charge(&mut spent.fts);
+            let mut single_stmt = tx.prepare_cached(
+                "INSERT INTO nodes_fts (rowid, name, qualified_name, path)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (rowid, name, qname) in fts_chunk.drain(..) {
+                single_stmt.execute(params![rowid, name, qname, extraction.file_path])?;
             }
         }
         let _charge = charge(&mut spent.literals);
@@ -2243,26 +2297,53 @@ impl Store {
             // no error — and the varying-arity remainder statement is a new
             // cache key every build, evicting one of the sixteen slots
             // rusqlite's LRU has and this write already fills eleven of.
-            let mut insert = tx.prepare_cached(
-                "INSERT INTO unresolved_rows
-                 (source_file_id, source_symbol, callee_name, reason_id, classification_id,
-                  receiver, valid_from, valid_to)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
-            )?;
+            // Dual-statement chunked batching: fixed 64-row chunks for bulk insertion,
+            // with a single-row cached statement for the remainder (< 64). Exactly two
+            // statements in prepare_cached, preventing LRU cache eviction.
+            let mut chunk: Vec<usize> = Vec::with_capacity(UNRESOLVED_CHUNK_SIZE);
             for (index, still_valid) in ledger_matched.iter().enumerate() {
                 if *still_valid {
                     continue;
                 }
-                let tuple = unresolved_tuple(index);
-                insert.execute(params![
-                    tuple.source_file_id,
-                    tuple.source_symbol.as_ref(),
-                    tuple.callee_name.as_ref(),
-                    tuple.reason_id,
-                    tuple.classification_id,
-                    tuple.receiver.as_deref(),
-                    gen_id,
-                ])?;
+                chunk.push(index);
+                if chunk.len() == UNRESOLVED_CHUNK_SIZE {
+                    let tuples: Vec<UnresolvedTuple<'_>> =
+                        chunk.iter().map(|&idx| unresolved_tuple(idx)).collect();
+                    let mut params_vec: Vec<&dyn ToSql> =
+                        Vec::with_capacity(UNRESOLVED_CHUNK_SIZE * 7);
+                    for tuple in &tuples {
+                        params_vec.push(&tuple.source_file_id);
+                        params_vec.push(&tuple.source_symbol);
+                        params_vec.push(&tuple.callee_name);
+                        params_vec.push(&tuple.reason_id);
+                        params_vec.push(&tuple.classification_id);
+                        params_vec.push(&tuple.receiver);
+                        params_vec.push(&gen_id);
+                    }
+                    tx.prepare_cached(UNRESOLVED_64_SQL)?
+                        .execute(params_from_iter(params_vec.iter()))?;
+                    chunk.clear();
+                }
+            }
+            if !chunk.is_empty() {
+                let mut insert = tx.prepare_cached(
+                    "INSERT INTO unresolved_rows
+                     (source_file_id, source_symbol, callee_name, reason_id, classification_id,
+                      receiver, valid_from, valid_to)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+                )?;
+                for index in chunk {
+                    let tuple = unresolved_tuple(index);
+                    insert.execute(params![
+                        tuple.source_file_id,
+                        tuple.source_symbol.as_ref(),
+                        tuple.callee_name.as_ref(),
+                        tuple.reason_id,
+                        tuple.classification_id,
+                        tuple.receiver.as_deref(),
+                        gen_id,
+                    ])?;
+                }
             }
         }
 
@@ -2396,36 +2477,86 @@ impl Store {
             params![gen_id],
             |row| row.get(0),
         )?;
-        // K5: ask the canonical classifier, not the raw variant. A prose or
-        // data format reports `ParseOutcome::Failed` because no grammar exists
-        // for it, so the raw test counted 294 of this repository's 1,310 files
-        // as parse failures — all Markdown, JSON, YAML, config and HTML — and
-        // buried the 16 files a grammar actually parsed and flagged. Reading it
-        // off the stored columns keeps that rule and applies it to carried-
-        // forward rows too, which the in-memory slice cannot see.
-        let mut parse_failed: i64 = 0;
-        {
-            let mut stmt = tx.prepare(
-                "SELECT p.path, f.parse_outcome_json, f.engine_json
-                 FROM generation_files f
-                 JOIN paths p ON p.id = f.file_id
-                 WHERE f.generation_id = ?1",
-            )?;
-            let rows = stmt.query_map(params![gen_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?;
-            for row in rows {
-                let (path, parse_json, engine_json) = row?;
-                let (outcome, engine) = decode_stored_outcome(&path, &parse_json, &engine_json)?;
-                if stored_is_parse_failure(&outcome, &engine) {
-                    parse_failed += 1;
+        // K5 / Optimization: Eliminate O(N) full-view JSON deserialization.
+        // On whole-tree builds, count canonical failures directly from in-memory extractions.
+        // On incremental builds, track delta from prev_gen's build_history plus modified/deleted files.
+        let parse_failed: i64 = if full_rewrite || prev_gen.is_none() {
+            extractions.iter().filter(|e| e.is_parse_failure()).count() as i64
+        } else {
+            let prev_id = prev_gen.unwrap();
+            let prev_count: Option<i64> = tx
+                .query_row(
+                    "SELECT parse_failed FROM build_history WHERE generation_id = ?1",
+                    params![prev_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+
+            if let Some(prev_failures) = prev_count {
+                // Check whether any modified or deleted file was a parse failure in prev_gen
+                let mut retired_failures = 0i64;
+                let mut check_paths = std::collections::HashSet::new();
+                for p in &opts.affected_paths {
+                    check_paths.insert(p.as_str());
                 }
+                for p in &opts.deleted_paths {
+                    check_paths.insert(p.as_str());
+                }
+                for e in &fresh {
+                    check_paths.insert(e.file_path.as_str());
+                }
+
+                if !check_paths.is_empty() {
+                    let mut prev_stmt = tx.prepare_cached(
+                        "SELECT f.parse_outcome_json, f.engine_json
+                         FROM generation_files f
+                         JOIN paths p ON p.id = f.file_id
+                         WHERE f.generation_id = ?1 AND p.path = ?2",
+                    )?;
+                    for path in check_paths {
+                        if let Some((p_json, e_json)) = prev_stmt
+                            .query_row(params![prev_id, path], |row| {
+                                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                            })
+                            .optional()?
+                        {
+                            let (outcome, engine) = decode_stored_outcome(path, &p_json, &e_json)?;
+                            if stored_is_parse_failure(&outcome, &engine) {
+                                retired_failures += 1;
+                            }
+                        }
+                    }
+                }
+
+                // Count failures in fresh extractions
+                let fresh_failures = fresh.iter().filter(|e| e.is_parse_failure()).count() as i64;
+                (prev_failures - retired_failures + fresh_failures).max(0)
+            } else {
+                // Fallback: fast query filtering only rows containing '{"Failed":'
+                let mut stmt = tx.prepare(
+                    "SELECT p.path, f.parse_outcome_json, f.engine_json
+                     FROM generation_files f
+                     JOIN paths p ON p.id = f.file_id
+                     WHERE f.generation_id = ?1 AND f.parse_outcome_json LIKE '{\"Failed\":%'",
+                )?;
+                let rows = stmt.query_map(params![gen_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?;
+                let mut count = 0i64;
+                for row in rows {
+                    let (path, parse_json, engine_json) = row?;
+                    let (outcome, engine) = decode_stored_outcome(&path, &parse_json, &engine_json)?;
+                    if stored_is_parse_failure(&outcome, &engine) {
+                        count += 1;
+                    }
+                }
+                count
             }
-        }
+        };
         Self::scrub_secret_values(&tx)?;
         let page_count: i64 = tx.query_row("PRAGMA page_count", [], |row| row.get(0))?;
         let page_size: i64 = tx.query_row("PRAGMA page_size", [], |row| row.get(0))?;

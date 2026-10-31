@@ -9,11 +9,11 @@ availability; it does not certify every platform, editor session or release.
 
 | Surface | Implementation | Practical boundary |
 |---|---|---|
-| Code intelligence | Rust `devmap` pipeline, CLI, 21-tool MCP, watcher and `doc-drift` | Static evidence (schema 98); resolution budgets; damaged store refusal; queries can be capped |
+| Code intelligence | Rust `devmap` pipeline, CLI, 21-tool MCP, watcher and `doc-drift` | Static evidence (schema 98); store schema 29 (reader floor 29); resolution budgets; damaged store refusal; queries can be capped |
 | Go host | `devcouncil` / `dev` CLI and eight-tool task MCP | Task tooling, integration, skills and verification; no autonomous model loop |
 | Task state | Rust `dcstore` | Cooperating-client leases (schema 11), workbench tasks (schema 14), and durable records |
-| Verification | Go task checks plus Rust `dcverify` rigor | Deep scans (untracked, submodules), opaque stubs, no diff/panic secret echo |
-| Search | Rust `dcgrep` | Ignore-aware search and optional trigram index; text matches are not semantic edges |
+| Verification | Go task checks plus Rust `dcverify` rigor | Deep scans (untracked, submodules), opaque stubs, prompt-input write protection, no diff/panic secret echo |
+| Search | Rust `dcgrep` | Ignore-aware search and optional trigram index; decoupled ceilings, 64 MiB lexical bound, completeness contract |
 | Host adapters | Six hosts, one Rust table (`devmap integrate`); the Go host passes its server over `--servers-stdin` | Different outputs by host; Codex gets `[mcp_servers.devcouncil]` merged into the project `.codex/config.toml` without rewriting other bytes |
 | Engineering skills | Embedded/scaffolded instructions | Guidance, not enforced permission or proof of host loading |
 | Sandbox selector | `--sandbox local` only | Anything else is refused (`verify.ParseSandbox`, exit 2); Docker/Nix isolation is not implemented; building it is planned (owner decision 2026-10-07, task `dc-verify-isolated-sandbox`) and is gated on an approved security-impact statement |
