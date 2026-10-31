@@ -211,3 +211,27 @@ fn the_missing_index_refusal_names_a_remedy_that_exists() {
         "no dropped index was refused: the test proves nothing"
     );
 }
+
+/// The ownership read `devmap build` makes before it opens a store reads SQL that
+/// belongs to the file. A view standing where `pending_state` should be, and
+/// spinning, must not be run by it.
+#[test]
+fn the_ownership_read_before_open_does_not_run_a_view_standing_for_the_owner_table() {
+    let path = tampered_store(
+        "owner-view",
+        "DROP TABLE pending_state;
+         CREATE VIEW pending_state AS
+         WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 400000000)
+         SELECT 1 AS singleton, max(n) AS repo_root FROM r;",
+    );
+    let root = scratch("owner-view-root");
+    let started = std::time::Instant::now();
+    // At the current schema an unreadable owner passes (the open reports the
+    // damage itself); what is pinned is that nothing of the file's was run.
+    let _ = Store::refuse_a_live_foreign_owner_before_open(&path, &root);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the ownership read ran a view for {:?}",
+        started.elapsed()
+    );
+}

@@ -389,6 +389,11 @@ impl Store {
         let version = |conn: &Connection| -> Result<i32> {
             conn.query_row("PRAGMA user_version", [], |row| row.get(0))
         };
+        // A store file is untrusted SQL: a view standing where the owner table
+        // should be runs whatever it says on this read. `Store::open` refuses
+        // such a store before it runs anything of the file's; this read does the
+        // same by never reading a name that is not a table.
+        conn.execute_batch("PRAGMA trusted_schema = OFF;")?;
         let stamped = match version(&conn) {
             Ok(stamped) => stamped,
             // The directory is read-only and the store is WAL: the immutable
@@ -419,6 +424,26 @@ impl Store {
     fn stored_repo_root(conn: &Connection, stamped: i32) -> Result<Option<String>> {
         const PENDING_STATE_SCHEMA: i32 = 20;
         const GENERATION_OWNER_SCHEMA: i32 = 7;
+        let source = if stamped >= PENDING_STATE_SCHEMA {
+            "pending_state"
+        } else {
+            "generations"
+        };
+        if stamped >= GENERATION_OWNER_SCHEMA {
+            let kind: Option<String> = conn
+                .query_row(
+                    "SELECT type FROM sqlite_master WHERE name = ?1",
+                    [source],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if kind.as_deref() != Some("table") {
+                return Err(refusal(format!(
+                    "the store's owner record {source:?} is {} and not a table, so it was not read",
+                    kind.as_deref().unwrap_or("absent")
+                )));
+            }
+        }
         if stamped >= PENDING_STATE_SCHEMA {
             conn.query_row(
                 "SELECT repo_root FROM pending_state WHERE singleton = 1",
