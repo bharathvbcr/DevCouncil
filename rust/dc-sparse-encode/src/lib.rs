@@ -10,6 +10,7 @@
 //! cache and does not download.
 
 mod bench;
+pub mod dense;
 mod fileset;
 mod jsonl;
 mod post;

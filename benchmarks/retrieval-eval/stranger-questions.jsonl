@@ -1,0 +1,62 @@
+{"id":"s01","query":"how does the tool stop two agents from working on the same task at once"}
+{"id":"s02","query":"where is the code that checks whether a change left behind placeholder code that does nothing"}
+{"id":"s03","query":"how does it notice that a password or API key was accidentally added in a change"}
+{"id":"s04","query":"how is a unified diff turned into a list of changed files and line ranges"}
+{"id":"s05","query":"how does it work out which changed lines are not covered by tests"}
+{"id":"s06","query":"how are functions that nobody calls found"}
+{"id":"s07","query":"how does it decide what else might break when I edit a function"}
+{"id":"s08","query":"how does it find the chain of calls connecting two functions"}
+{"id":"s09","query":"how are copy-pasted duplicate functions detected"}
+{"id":"s10","query":"how can I see what an edit would affect before I save it to disk"}
+{"id":"s11","query":"how does it find documentation that mentions code which no longer exists"}
+{"id":"s12","query":"how is the overview file of the whole project generated"}
+{"id":"s13","query":"how does the assistant-facing server answer questions about the codebase over standard input and output"}
+{"id":"s14","query":"how are the editor integrations for different coding assistants installed and checked"}
+{"id":"s15","query":"how do old hook registrations get cleaned up without damaging other tools settings"}
+{"id":"s16","query":"how are reusable instruction bundles for assistants copied onto a machine"}
+{"id":"s17","query":"how is the version of the on-disk database format checked so older programs refuse newer data"}
+{"id":"s18","query":"how does it search text quickly while skipping files that a git ignore file excludes"}
+{"id":"s19","query":"how are files ordered by how relevant they are to a plain English question"}
+{"id":"s20","query":"how are the search indexes built and swapped in without readers seeing a half written one"}
+{"id":"s21","query":"how does it refuse to follow links that point outside the project folder"}
+{"id":"s22","query":"how are web server endpoints discovered in source code"}
+{"id":"s23","query":"how does it track whether untrusted input can reach a dangerous call"}
+{"id":"s24","query":"how can I run a graph query language against the code database"}
+{"id":"s25","query":"how is the code graph exported to a file other graph tools can open"}
+{"id":"s26","query":"how is the interactive web page that shows the project structure produced"}
+{"id":"s27","query":"how does it work out which tests to run after a change"}
+{"id":"s28","query":"how does it point to the commits that most likely caused a bug"}
+{"id":"s29","query":"how are changed files since a git revision mapped to the code that depends on them"}
+{"id":"s30","query":"how does the watcher keep the index up to date while I edit files"}
+{"id":"s31","query":"how are calls that could not be matched to any definition recorded and reported"}
+{"id":"s32","query":"how does the parser split source files into definitions and imports for many languages"}
+{"id":"s33","query":"how are names in one file matched up with definitions in another file"}
+{"id":"s34","query":"how is task state saved in a small embedded database"}
+{"id":"s35","query":"how long does a lease on a task last and how is it extended"}
+{"id":"s36","query":"how are old events and receipts pruned from the workbench to keep it small"}
+{"id":"s37","query":"how is an independent reviewer's verdict signed so it cannot be forged"}
+{"id":"s38","query":"how does the verifier decide between off advisory and enforce modes"}
+{"id":"s39","query":"how are the commands a task expects to pass actually executed"}
+{"id":"s40","query":"how does the tool tell the caller what to do next when verification finds problems"}
+{"id":"s41","query":"how does it avoid reading enormous files or running forever"}
+{"id":"s42","query":"how are results trimmed when there are too many and how does the caller learn some were left out"}
+{"id":"s43","query":"how does it recognise test files so they are treated differently from real source"}
+{"id":"s44","query":"how are symbols found by name when I only remember part of the name"}
+{"id":"s45","query":"how does it answer a question phrased in everyday words rather than a symbol name"}
+{"id":"s46","query":"how is a health check done for each small command line program"}
+{"id":"s47","query":"how can a program written in Go call into compiled Rust code in the same process"}
+{"id":"s48","query":"how is git history read to find who changed which lines"}
+{"id":"s49","query":"how does the index know it is out of date compared with the files on disk"}
+{"id":"s50","query":"how are two separate repositories linked together in the graph"}
+{"id":"s51","query":"how are regression results recorded and compared between runs"}
+{"id":"s52","query":"how does it measure how accurate the call graph is against known answers"}
+{"id":"s53","query":"how are user interface components that embed markup parsed"}
+{"id":"s54","query":"how does it deal with files that are not valid text"}
+{"id":"s55","query":"how does it compare timing of two versions fairly by alternating runs"}
+{"id":"s56","query":"how is a secret kept out of logs and error messages"}
+{"id":"s57","query":"how are code symbols stored on disk in a compressed form"}
+{"id":"s58","query":"how does the tool describe a file's structure briefly without printing all of its code"}
+{"id":"s59","query":"how are literal values like event names or config keys looked up"}
+{"id":"s60","query":"how does the project decide which code is an entry point when judging what is reachable"}
+{"id":"s61","query":"how are generated agent guide files kept up to date inside a repository"}
+{"id":"s62","query":"how does the installer check that the apps reading the database share the same format number"}
