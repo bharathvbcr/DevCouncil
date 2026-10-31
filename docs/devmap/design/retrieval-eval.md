@@ -2,8 +2,10 @@
 
 Status: **complete.** The protocol and decision rule were committed (`6ee434e9`,
 `3144df72`) before any arm was run on any query set; the results section at the
-bottom was written afterwards. Git history is the proof of the order: this
-file's first commit holds the rule and no numbers.
+bottom was written afterwards. Git history shows the commit order (this file's
+first commit holds the rule and no numbers), not the order of the work: all of
+the lane's commits fall within about 75 minutes, so history alone cannot rule
+out arms having been run before the rule was committed.
 
 Lane `rank-eval`, base `dbd0193a`. This decides whether embeddings are built
 into `dcgrep` / DevMap. Nothing here changes `dcgrep`'s query path and no model
@@ -33,6 +35,13 @@ All arms rank files, over one corpus, and are scored by one scorer
 The corpus is **every file `dcgrep` admits** under the repository at
 `dbd0193a` (extracted with `git archive`, so lane edits cannot leak in),
 restricted to the encoder's source suffixes so B and C can rank the same set.
+
+"Shipped" and "stock" in this document mean `dcgrep` at `dbd0193a`. The
+rank-completeness fix (card ft-bcb74b34, branch
+`fix/dcgrep-rank-completeness`) decouples the ranked index from the trigram
+ceiling and derives that ceiling from the cache-file size, so the coverage
+numbers for condition P and the `MAX_INDEX_POSTINGS` edit under "Reproducing"
+describe `dbd0193a`, not later `dcgrep`.
 
 The shipped `dcgrep index` does **not** reach the whole repository: its trigram
 index stops at a 2,000,000-posting ceiling, which here is 1234 of 2716 files in
@@ -196,9 +205,11 @@ committed because of their size; the commands that produce them are under
 - **D (BM25 fused with dense): meets both conditions.** Stranger-set interval
   excludes zero (lower bound +0.049); on the commit-subject set its interval
   does not lie below zero.
-- **Rule outcome: dense embeddings are worth building as a fusion partner for
-  BM25, not as a replacement for it.** The next sections say how much weight
-  that deserves.
+- **Rule outcome: D passes the pre-stated rule; C does not.** The rule states a
+  necessary condition, not a sufficient one, and passing it does not show the
+  stranger-set gain is dense's: D is not distinguishable from BM25 fused with
+  learned-sparse (D - AB, next section). The next sections say how much weight
+  the pass deserves.
 
 ### All arms, condition W
 
@@ -239,7 +250,9 @@ R@k cells are point estimates; their 95% bootstrap intervals are in each view's 
 
 ### Against learned-sparse, and fused partners
 
-Paired MRR differences (arm minus baseline), condition W:
+Paired MRR differences (arm minus baseline), condition W. The C - B and B - A
+rows come from `scores-vsB.*` and `scores.*`; the D - AB row from
+`scores-vsAB.*`; the AB - A and ABC - A rows from `scores.*`:
 
 | comparison | stranger S-nodocs | commit subject |
 |---|---|---|
@@ -358,8 +371,13 @@ single arm) and 337 for commit subjects.
 
 ### Verdict
 
-By the pre-stated rule: **dense embedding alone is not worth building now; BM25
-fused with dense (RRF) is.** On stranger questions fusion lifts MRR from 0.216
+By the pre-stated rule: **dense embedding alone fails; BM25 fused with dense
+(RRF) passes the rule's necessary condition.** The stranger-set gain is not
+attributable to dense: fusing BM25 with the existing learned-sparse tier gives
+the same stranger-set MRR (D - AB -0.010 [-0.102, +0.081]), and D is not
+distinguishable from B alone there (+0.089 [-0.031, +0.210]). The only
+dense-specific result is on commit subjects (D - AB +0.125 [+0.083, +0.168]).
+On stranger questions fusion lifts MRR from 0.216
 to 0.323 (R@10 0.39 to 0.53) and wins on 35 questions against 7 losses, and it
 costs nothing measurable on code-vocabulary queries (+0.026 [-0.005, +0.056]
 on commit subjects).
@@ -378,7 +396,7 @@ reach is a larger defect than any ranker difference measured here.
 ### Reproducing
 
 ```bash
-# scratch dcgrep for condition W: in rust/dc-grep/src/index.rs set
+# scratch dcgrep for condition W, against dbd0193a (see "Corpus"): in rust/dc-grep/src/index.rs set
 #   const MAX_INDEX_POSTINGS: usize = 60_000_000;   (was 2_000_000)
 #   MAX_INDEX_DURATION = Duration::from_secs(600)   (was 30)
 # build `dcgrep` as $DCGREP_WIDE, then revert the file.

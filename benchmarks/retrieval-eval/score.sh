@@ -36,6 +36,12 @@ view() { # name set condition queries corpus [exclusions...]
     --baseline B --arm "A=$a" --arm "B=$b" --arm "C=$c" \
     --arm "D=$dir/D.jsonl" --arm "AB=$dir/AB.jsonl" --arm "ABC=$dir/ABC.jsonl" \
     --resamples 5000 --json "$dir/scores-vsB.json" > "$dir/scores-vsB.md"
+  # And against BM25+learned-sparse fusion, for "is the fused gain dense's
+  # or fusion's" (D - AB).
+  "$RE" score --queries "$queries" --corpus "$corpus" "$@" --label "$name (baseline AB)" \
+    --baseline AB --arm "A=$a" --arm "B=$b" --arm "C=$c" \
+    --arm "D=$dir/D.jsonl" --arm "AB=$dir/AB.jsonl" --arm "ABC=$dir/ABC.jsonl" \
+    --resamples 5000 --json "$dir/scores-vsAB.json" > "$dir/scores-vsAB.md"
 }
 
 C="$HERE/commit-subjects.jsonl"
