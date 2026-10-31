@@ -1,0 +1,22 @@
+[workspace]
+
+# A workspace of its own: this is a measurement tool, not part of the shipped
+# `rust/` workspace, and it must build anywhere (no tessl, no Metal).
+
+[package]
+name = "rank-eval"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99" # the pin in ../../rust-toolchain.toml
+license = "Apache-2.0"
+publish = false
+description = "Retrieval evaluation for file ranking: query generator, runner, fusion and one scorer."
+
+[package.metadata.dist]
+dist = false
+
+[dependencies]
+serde_json = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
