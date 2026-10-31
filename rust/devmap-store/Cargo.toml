@@ -145,6 +145,11 @@ required-features = ["parse"]
 name = "v29_compressed_extractions"
 required-features = ["parse"]
 
+# Attack tests of the v29 reviewer round: builds stores from extracted source.
+[[test]]
+name = "attack_v29_zstd"
+required-features = ["parse"]
+
 # v29's size and hot-path claims, stated through raw SQL; extracts this crate's
 # own sources, so it needs the grammars.
 [[test]]
