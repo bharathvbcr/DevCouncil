@@ -293,6 +293,10 @@ fn is_zero(value: &usize) -> bool {
     *value == 0
 }
 
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
 /// What a map query cost, against what answering it by reading files would have.
 ///
 /// Every number here is a count of bytes divided by [`BYTES_PER_TOKEN`], not a
@@ -539,8 +543,18 @@ pub struct BlastLayer {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlastRadius {
     /// Node ids the walk started from, after matching the caller's targets
-    /// against the graph.
+    /// against the graph. A bounded, budget-charged sample: a file-path target
+    /// seeds one start per symbol in the file, so the whole list can be as long
+    /// as the file. [`Self::seeds_total`] is the exact count.
     pub seeds: Vec<String>,
+    /// How many starts the walk had, whatever [`Self::seeds`] lists. Absent
+    /// from the wire form only when there were none.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub seeds_total: u32,
+    /// Starts the walk had that [`Self::seeds`] does not list: the sample's
+    /// count or token cap. Zero, and absent, when the list is the whole set.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub seeds_omitted: u32,
     /// Targets that matched no traversal start. Carried rather than dropped:
     /// a blast radius computed from two of three targets must never read as
     /// one computed from all three.

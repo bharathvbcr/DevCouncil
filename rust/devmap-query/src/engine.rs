@@ -632,6 +632,8 @@ impl<'a> StoreQueryEngine<'a> {
                         layers: unavailable_response(ResolutionAvailability::Unavailable {
                             reason,
                         }),
+                        seeds_total: 0,
+                        seeds_omitted: 0,
                         total_impacted: 0,
                     },
                 });
@@ -1493,6 +1495,8 @@ impl<'a> StoreQueryEngine<'a> {
                     layers.walk_incomplete = coverage_gap.clone();
                     layers
                 },
+                seeds_total: 0,
+                seeds_omitted: 0,
                 total_impacted: 0,
             });
             return Ok((response, bands));
@@ -1728,6 +1732,8 @@ impl<'a> StoreQueryEngine<'a> {
                 seeds: Vec::new(),
                 unmatched_targets: Vec::new(),
                 layers: unavailable_response(ResolutionAvailability::Unavailable { reason }),
+                seeds_total: 0,
+                seeds_omitted: 0,
                 total_impacted: 0,
             },
             budget,
@@ -1931,6 +1937,8 @@ impl<'a> StoreQueryEngine<'a> {
                     seeds: Vec::new(),
                     unmatched_targets: targets.to_vec(),
                     layers: unavailable_response(ResolutionAvailability::Unavailable { reason }),
+                    seeds_total: 0,
+                    seeds_omitted: 0,
                     total_impacted: 0,
                 },
             };

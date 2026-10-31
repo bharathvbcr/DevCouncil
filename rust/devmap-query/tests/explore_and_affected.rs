@@ -13,7 +13,7 @@
 //! * a target that matched nothing reported as a target with no impact.
 
 use devmap_extract::extract_file;
-use devmap_query::{ResolutionAvailability, StoreQueryEngine};
+use devmap_query::{Request, ResolutionAvailability, StoreQueryEngine, BYTES_PER_TOKEN};
 use devmap_resolve::Resolver;
 use devmap_store::{GenerationWriteOpts, Store};
 use std::path::{Path, PathBuf};
@@ -496,4 +496,235 @@ fn test_path_detection_matches_directories_and_affixes_not_substrings() {
             "{path} merely contains the substring and is not a test path"
         );
     }
+}
+
+/// Symbols in the wide fixture's hub file.
+const WIDE_HUBS: usize = 30;
+/// Seeds a target of that file's path produces: its symbols and its own node.
+const WIDE_SEEDS: u64 = WIDE_HUBS as u64 + 1;
+/// Callers of those hubs: one inbound band wider than the 50-node sample.
+const WIDE_CALLERS: usize = 70;
+
+/// One file of `WIDE_HUBS` functions, one file of `WIDE_CALLERS` functions that
+/// each call one of them, and a test that calls the first.
+///
+/// A file-path target seeds one start per symbol in the file, so this is the
+/// shape that produced a 166-seed `blast_radius.seeds` on a real repository:
+/// the seeds are as many as the file has symbols, and the first inbound band is
+/// as wide as the callers' sample allows.
+fn wide_fixture(root: &Path) -> Store {
+    let hubs: String = (0..WIDE_HUBS)
+        .map(|i| format!("def hub_{i:02}(x):\n    return x\n\n\n"))
+        .collect();
+    let names: Vec<String> = (0..WIDE_HUBS).map(|i| format!("hub_{i:02}")).collect();
+    let mut callers = format!("from hub import {}\n\n\n", names.join(", "));
+    for i in 0..WIDE_CALLERS {
+        callers.push_str(&format!(
+            "def caller_{i:02}(x):\n    return hub_{:02}(x)\n\n\n",
+            i % WIDE_HUBS
+        ));
+    }
+    let test = "from hub import hub_00\n\n\ndef test_hub(x):\n    return hub_00(x)\n";
+    let files = [
+        ("hub.py", hubs.as_str()),
+        ("callers.py", callers.as_str()),
+        ("tests/test_hub.py", test),
+    ];
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    let mut extractions = Vec::new();
+    for (path, body) in files {
+        std::fs::write(root.join(path), body).unwrap();
+        extractions.push(extract_file(path, body));
+    }
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
+    let analysis = devmap_analyze::analyze(&extractions, &resolution);
+    let store = Store::open_in_memory().unwrap();
+    store
+        .save_generation_with_opts(
+            &extractions,
+            &resolution,
+            &analysis,
+            GenerationWriteOpts {
+                repo_root: Some(root.to_string_lossy().into_owned()),
+                ..GenerationWriteOpts::default()
+            },
+        )
+        .unwrap();
+    store
+}
+
+/// What the packer charges for a listed seed id: its bytes over
+/// [`BYTES_PER_TOKEN`], plus one for the separator. Derived here from the
+/// cost function, not from a count.
+fn seed_cost(seeds: &[String]) -> u32 {
+    seeds
+        .iter()
+        .map(|seed| u32::try_from(seed.len()).unwrap() / BYTES_PER_TOKEN + 1)
+        .sum()
+}
+
+/// The blast radius as the wire form carries it: fields this crate adds are
+/// read by name, so a reader that predates them sees the same JSON it always did.
+fn radius_json(radius: &devmap_query::BlastRadius) -> serde_json::Value {
+    serde_json::to_value(radius).unwrap()
+}
+
+fn json_u64(value: &serde_json::Value, key: &str) -> u64 {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+}
+
+/// A file-path target seeds one start per symbol; the radius lists a bounded
+/// sample of them and says how many it left out.
+///
+/// `affected` on a 1,500-token budget emitted 166 seed ids, about 60% of the
+/// answer, charged to nothing: neither the test list nor the layers paid for
+/// them, so the answer could exceed the budget it was given.
+#[test]
+fn a_wide_seed_list_is_sampled_and_the_omission_is_counted() {
+    let root = scratch("wide-seeds");
+    let store = wide_fixture(&root);
+    let engine = StoreQueryEngine::new(&store);
+
+    let answer = engine
+        .affected_tests(&["hub.py".to_string()], 400, 0.0, 3)
+        .unwrap();
+    let radius = radius_json(&answer.blast_radius);
+
+    let seeds = &answer.blast_radius.seeds;
+    let total = json_u64(&radius, "seeds_total");
+    let omitted = json_u64(&radius, "seeds_omitted");
+    assert!(
+        seeds.len() <= 10,
+        "{} seed ids listed; the list is a sample, not the whole target",
+        seeds.len()
+    );
+    assert_eq!(
+        total, WIDE_SEEDS,
+        "seeds_total must be the number of starts the target matched"
+    );
+    assert_eq!(
+        omitted,
+        total - seeds.len() as u64,
+        "seeds_omitted must account for every seed not listed"
+    );
+    assert!(omitted > 0, "the fixture must exceed the seed cap");
+}
+
+/// A seed list that fits is neither trimmed nor annotated.
+#[test]
+fn a_short_seed_list_keeps_its_wire_form() {
+    let root = scratch("short-seeds");
+    let store = fixture(&root);
+    let engine = StoreQueryEngine::new(&store);
+
+    let answer = engine
+        .affected_tests(&["render".to_string()], 8_000, 0.0, 3)
+        .unwrap();
+    let radius = radius_json(&answer.blast_radius);
+
+    assert!(!answer.blast_radius.seeds.is_empty());
+    assert_eq!(json_u64(&radius, "seeds_omitted"), 0);
+    assert!(
+        radius.get("seeds_omitted").is_none(),
+        "a complete seed list must not grow an omitted-count key"
+    );
+}
+
+/// An over-budget first band is shrunk to fit, not withheld.
+///
+/// The packer breaks on the first band that does not fit, so a budget one node
+/// short of the 50-node sample showed 0 of N bands: the single most useful band
+/// was the one dropped. The band's `node_count` stays exact and the nodes it no
+/// longer lists are counted in `nodes_omitted`.
+#[test]
+fn an_over_budget_first_band_is_trimmed_rather_than_withheld() {
+    let root = scratch("first-band");
+    let store = wide_fixture(&root);
+    let engine = StoreQueryEngine::new(&store);
+
+    let answer = engine
+        .affected_tests(&["hub.py".to_string()], 400, 0.0, 3)
+        .unwrap();
+    let layers = &answer.blast_radius.layers;
+
+    assert!(
+        layers.shown >= 1,
+        "the first band was withheld outright: shown {} of {}",
+        layers.shown,
+        layers.total
+    );
+    let first = &layers.items[0];
+    assert_eq!(first.depth, 1);
+    let roomy = engine
+        .affected_tests(&["hub.py".to_string()], 8_000, 0.0, 3)
+        .unwrap();
+    assert!(
+        first.node_count >= WIDE_CALLERS as u32,
+        "the fixture's first band holds at least its {WIDE_CALLERS} callers"
+    );
+    assert_eq!(
+        first.node_count, roomy.blast_radius.layers.items[0].node_count,
+        "trimming the listing must never change the count"
+    );
+    assert!(first.nodes_omitted > 0, "the band had to be trimmed to fit");
+    assert_eq!(
+        first.nodes.len() as u32 + first.nodes_omitted,
+        first.node_count,
+        "every unlisted node must be counted"
+    );
+}
+
+/// Seeds, tests and bands are paid out of one budget.
+#[test]
+fn seeds_tests_and_layers_fit_one_budget() {
+    let root = scratch("one-budget");
+    let store = wide_fixture(&root);
+    let engine = StoreQueryEngine::new(&store);
+
+    for budget in [200u32, 400, 1_500] {
+        let answer = engine
+            .affected_tests(&["hub.py".to_string()], budget, 0.0, 3)
+            .unwrap();
+        let spent = answer.tests.tokens_used
+            + answer.blast_radius.layers.tokens_used
+            + seed_cost(&answer.blast_radius.seeds);
+        assert!(
+            spent <= budget,
+            "budget {budget}: tests {} + layers {} + seeds {} = {spent}",
+            answer.tests.tokens_used,
+            answer.blast_radius.layers.tokens_used,
+            seed_cost(&answer.blast_radius.seeds),
+        );
+    }
+}
+
+/// `impact --layers` and `explore` pack their radius through the same code, so
+/// the seed sample and its counters appear there too.
+#[test]
+fn layered_impact_samples_its_seeds_like_affected() {
+    let root = scratch("layered-seeds");
+    let store = wide_fixture(&root);
+    let engine = StoreQueryEngine::new(&store);
+
+    let answer = engine
+        .impact_layered(Request {
+            query: "hub.py".to_string(),
+            token_budget: 800,
+            min_confidence: 0.0,
+            max_depth: 3,
+        })
+        .unwrap();
+    let radius = radius_json(&answer.blast_radius);
+
+    assert!(answer.blast_radius.seeds.len() <= 10);
+    assert_eq!(json_u64(&radius, "seeds_total"), WIDE_SEEDS);
+    assert_eq!(
+        json_u64(&radius, "seeds_omitted"),
+        WIDE_SEEDS - answer.blast_radius.seeds.len() as u64
+    );
 }
