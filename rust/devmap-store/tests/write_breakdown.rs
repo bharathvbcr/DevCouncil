@@ -215,20 +215,24 @@ fn the_split_accounts_for_the_write_without_exceeding_it() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// The state the measurement describes, pinned so it cannot drift unremarked.
+/// A one-file edit writes one file's worth of rows to every relation.
 ///
-/// A one-file incremental build copies every node and every full-text row of
-/// the previous generation, and writes a delta of the edges. That asymmetry is
-/// what a v19 would remove, and [`devmap_store::CURRENT_SCHEMA_VERSION`] carries
-/// the measurement that said it is not worth its migration — 93 ms of a
-/// 1,155 ms build, against re-keying the FTS5 index the hottest read joins to.
+/// Until v28 it did not: it copied every node, every full-text row, every
+/// literal, every file-membership row and every digest of the previous
+/// generation under the new generation id, and wrote a delta only of the edges
+/// and the unresolved ledger. That asymmetry was pinned here by a test that
+/// asserted the doubling (`an_incremental_build_still_copies_every_node_and_full_
+/// text_row`), with a note in `schema.rs` recording why a rung that removed it
+/// was declined. The rung is v28 (see `MIGRATION_V27_TO_V28`) and this is the
+/// row-count assertion the card asks for at whichever design ships.
 ///
-/// This is a characterization test, not a guard: if it fails because the nodes
-/// have been put on ranges, that is the rung landing and the expectation here
-/// is what changes. Read the note on `CURRENT_SCHEMA_VERSION` first — it says
-/// what the rung has to be worth.
+/// Counted physically, over every base table the store has and over
+/// `nodes_fts` itself, so the test says the same thing on a schema that keeps
+/// a relation as a table and on one that keeps it as a range: what is measured
+/// is rows written, and a view's `COUNT(*)` is rows times generations.
 #[test]
-fn an_incremental_build_still_copies_every_node_and_full_text_row() {
+fn a_one_file_edit_writes_one_files_worth_of_rows_to_every_relation() {
+    use std::collections::BTreeMap;
     let dir = tmp_dir("write-breakdown-shape");
     let db = dir.join("devmap.sqlite");
     let store = Store::open(&db).unwrap();
@@ -244,47 +248,51 @@ fn an_incremental_build_still_copies_every_node_and_full_text_row() {
         )
         .unwrap();
 
-    let count = |sql: &str| -> i64 {
-        rusqlite::Connection::open(&db)
+    let census = || -> BTreeMap<String, i64> {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let tables: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                  WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                    AND name NOT LIKE 'nodes_fts\\_%' ESCAPE '\\'
+                  ORDER BY name",
+            )
             .unwrap()
-            .query_row(sql, [], |row| row.get(0))
+            .query_map([], |row| row.get::<_, String>(0))
             .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        tables
+            .into_iter()
+            .map(|table| {
+                let rows: i64 = conn
+                    .query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                (table, rows)
+            })
+            .collect()
     };
-
-    // Asserted first, because without it the rest of this test is vacuous the
-    // moment the rung it describes lands. `generation_edges` is a view over
-    // `edge_rows` since v18, and `SELECT COUNT(*)` through such a view counts
-    // (row x generation) pairs — so a ranged `generation_nodes` would report
-    // exactly the doubling below while storing nothing twice. What is being
-    // characterized is physical rows, and that is only what these counts mean
-    // while the relations are base tables.
-    for relation in ["generation_nodes", "nodes_fts_map"] {
-        let is_view = count(&format!(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name = '{relation}' AND type = 'view'"
-        ));
-        assert_eq!(
-            is_view, 0,
-            "`{relation}` is a view, so the row counts below no longer mean physical rows. \
-             If the nodes have been put on validity ranges, read the note on \
-             CURRENT_SCHEMA_VERSION and rewrite this test against the base relation, as \
-             validity_ranges.rs does with `base_relation`"
+    let before = census();
+    // Every comparison below is vacuous against a fixture that stored nothing,
+    // and a fixture can come to store nothing by a change to the extractor
+    // rather than to anything this file is about.
+    for relation in ["payload_nodes", "nodes_fts", "file_rows", "edge_rows"] {
+        assert!(
+            before.get(relation).copied().unwrap_or(0) > 100,
+            "the fixture must hold enough `{relation}` rows for a one-file edit's \
+             share of them to be visible: {before:?}"
         );
     }
 
-    let nodes_before = count("SELECT COUNT(*) FROM generation_nodes");
-    let fts_before = count("SELECT COUNT(*) FROM nodes_fts_map");
-    let edges_before = count("SELECT COUNT(*) FROM edge_rows");
-    // `0 == 0 * 2` holds. Every equality below is vacuous against a fixture
-    // that stored nothing, and a fixture can come to store nothing by a change
-    // to the extractor rather than to anything this file is about.
-    assert!(
-        nodes_before > 400 && fts_before > 400 && edges_before > 100,
-        "the fixture must hold enough of each relation for the doubling below to \
-         mean something: nodes={nodes_before} fts={fts_before} edges={edges_before}"
-    );
-
     let second = tree(1, 150);
     let (extractions, resolution, analysis) = pipeline(&as_refs(&second));
+    let hub_symbols = extractions
+        .iter()
+        .find(|extraction| extraction.file_path == "hub.py")
+        .map(|extraction| extraction.symbols.len() as i64)
+        .expect("the edited file is extracted");
     let opts = GenerationWriteOpts {
         affected_paths: vec!["hub.py".to_string()],
         ..Default::default()
@@ -292,26 +300,51 @@ fn an_incremental_build_still_copies_every_node_and_full_text_row() {
     store
         .save_generation_with_opts(&extractions, &resolution, &analysis, opts)
         .unwrap();
+    let after = census();
 
-    let nodes_after = count("SELECT COUNT(*) FROM generation_nodes");
-    let fts_after = count("SELECT COUNT(*) FROM nodes_fts_map");
-    let edges_after = count("SELECT COUNT(*) FROM edge_rows");
-
+    // The rule, for every relation: no table grew by a tenth of what it held.
+    // Copying the generation doubles a relation; one file of 151 is under 1%.
+    for (table, rows) in &before {
+        let grew = after[table] - rows;
+        // `generation_dead_symbols` is a whole-graph result, written per
+        // generation in full (see `MIGRATION_V27_TO_V28`), and `generations` and
+        // `build_history` get a row per build by definition.
+        if *rows >= 100
+            && !matches!(
+                table.as_str(),
+                "generations" | "build_history" | "generation_dead_symbols"
+            )
+        {
+            assert!(
+                grew * 10 <= *rows,
+                "`{table}` grew from {rows} to {} rows on a one-file edit: the write \
+                 copied the generation instead of writing the edit",
+                after[table]
+            );
+        }
+    }
+    // The exact shape of the delta, for the relations a payload now owns.
+    let grew = |table: &str| after[table] - before[table];
     assert_eq!(
-        nodes_after,
-        nodes_before * 2,
-        "one edited file copies every node of the generation: {nodes_before} -> {nodes_after}"
+        grew("payload_nodes"),
+        hub_symbols,
+        "the edited file's new payload holds its symbols, and nothing else is written"
     );
     assert_eq!(
-        fts_after,
-        fts_before * 2,
-        "and every full-text row with them: {fts_before} -> {fts_after}"
+        grew("nodes_fts"),
+        hub_symbols,
+        "one full-text row per new symbol"
     );
-    // The contrast, and the reason the asymmetry is worth writing down: the
-    // same build writes the edges it actually gained.
+    assert_eq!(
+        grew("file_rows"),
+        1,
+        "the file's old range is closed in place and one range is opened"
+    );
+    assert_eq!(grew("file_payloads"), 1, "one new payload");
     assert!(
-        edges_after - edges_before <= edges_before / 10,
-        "the ranged relation writes a delta: {edges_before} -> {edges_after}"
+        grew("digest_rows") <= 4,
+        "a digest row per file whose digest changed, not per file: {}",
+        grew("digest_rows")
     );
     let _ = fs::remove_dir_all(&dir);
 }

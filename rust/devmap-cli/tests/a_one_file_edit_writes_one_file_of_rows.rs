@@ -73,8 +73,12 @@ struct Stored {
     file_rows: i64,
     /// Distinct stored payloads. The number that used to track `file_rows`.
     payloads: i64,
-    /// Bytes of serialized extraction, which is where B3's cost actually was.
-    payload_bytes: i64,
+    /// Bytes the store holds for payloads, which is where B3's cost actually
+    /// was. Since schema 29 the extraction document is a zstd frame, so this is
+    /// the *compressed* size (the two small documents beside it are text); the
+    /// invariant asserted below is a ratio of two such sizes, which compression
+    /// does not change, but the figure is no longer "bytes of JSON".
+    stored_payload_bytes: i64,
     edges: i64,
 }
 
@@ -85,7 +89,7 @@ fn stored(root: &Path) -> Stored {
         generations: one("SELECT COUNT(*) FROM generations"),
         file_rows: one("SELECT COUNT(*) FROM generation_files"),
         payloads: one("SELECT COUNT(*) FROM file_payloads"),
-        payload_bytes: one("SELECT COALESCE(SUM(LENGTH(extraction_json)
+        stored_payload_bytes: one("SELECT COALESCE(SUM(LENGTH(extraction_json)
                                  + LENGTH(parse_outcome_json)
                                  + LENGTH(engine_json)), 0) FROM file_payloads"),
         edges: one("SELECT COUNT(*) FROM generation_edges"),
@@ -165,13 +169,14 @@ fn a_one_file_edit_stores_one_file_of_payload() {
         cold.payloads
     );
 
-    let added_bytes = after.payload_bytes - cold.payload_bytes;
+    let added_bytes = after.stored_payload_bytes - cold.stored_payload_bytes;
     assert!(
-        added_bytes <= cold.payload_bytes / 10,
-        "a one-file edit stored {added_bytes} new payload bytes against {} \
-         already in the repository. This is B3: measured on DevCouncil itself, \
-         one edited file moved ~82 MB of JSON out of SQLite and back in",
-        cold.payload_bytes
+        added_bytes <= cold.stored_payload_bytes / 10,
+        "a one-file edit stored {added_bytes} new (compressed) payload bytes \
+         against {} already in the repository. This is B3: measured on \
+         DevCouncil itself, one edited file moved ~82 MB of JSON out of SQLite \
+         and back in",
+        cold.stored_payload_bytes
     );
 
     std::fs::remove_dir_all(&root).unwrap();

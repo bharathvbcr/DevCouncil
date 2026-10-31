@@ -2,7 +2,7 @@ use super::{
     checked_span, fts_damage_reason, fts_match_query, lock_conn, refusal, sqlite_limit,
     validate_head_sha, BuildHistoryRow, CachedSourceFreshness, FileSymbolsPage, LedgerKey,
     QuerySourceFreshness, SourceTreeDelta, Store, StoreStatus, StoredSymbol, UnresolvedSiteRow,
-    UnresolvedSitesByName, MAX_PENDING_ATTEMPTS,
+    UnresolvedSitesByName, FTS_PAYLOAD_SQL, MAX_PENDING_ATTEMPTS,
 };
 use crate::coverage::{CoverageGapRow, CoverageGapSample, CoverageGaps, DiscoveryRefusal};
 use crate::edge_index::ResolutionSource;
@@ -538,11 +538,14 @@ impl Store {
         let mut stmt = snapshot.prepare(
             "SELECT n.name, n.qualified_name, n.kind, p.path,
                     n.span_start, n.span_end, n.is_exported, f.content_hash
-             FROM generation_nodes n
-             JOIN generation_files f ON f.generation_id = n.generation_id AND f.file_id = n.file_id
-             JOIN paths p ON p.id = n.file_id
-             WHERE n.generation_id = ?1 AND p.path = ?2
-             ORDER BY n.span_start, n.ordinal",
+             FROM generations g
+             JOIN file_rows r
+               ON g.id >= r.valid_from AND (r.valid_to IS NULL OR g.id < r.valid_to)
+             JOIN payload_nodes n ON n.payload_id = r.payload_id
+             JOIN file_payloads f ON f.payload_id = r.payload_id
+             JOIN paths p ON p.id = r.file_id
+             WHERE g.id = ?1 AND p.path = ?2
+             ORDER BY n.span_start, n.ord_in_file",
         )?;
         let rows = stmt
             .query_map(params![generation, path], |row| {
@@ -718,8 +721,13 @@ impl Store {
 
         let probe: Option<String> = snapshot
             .query_row(
-                "SELECT name FROM generation_nodes
-                 WHERE generation_id = ?1 ORDER BY ordinal LIMIT 1",
+                "SELECT n.name
+                   FROM generations g
+                   JOIN file_rows r
+                     ON g.id >= r.valid_from AND (r.valid_to IS NULL OR g.id < r.valid_to)
+                   JOIN payload_nodes n ON n.payload_id = r.payload_id
+                  WHERE g.id = ?1
+                  ORDER BY n.payload_id, n.ord_in_file LIMIT 1",
                 params![generation],
                 |row| row.get(0),
             )
@@ -728,11 +736,15 @@ impl Store {
             Some(name) => {
                 let match_query = fts_match_query(name)?;
                 match snapshot.query_row(
-                    "SELECT COUNT(*)
-                     FROM nodes_fts
-                     CROSS JOIN nodes_fts_map m
-                       ON m.rowid_ref = nodes_fts.rowid AND m.generation_id = ?1
-                     WHERE nodes_fts MATCH ?2",
+                    &format!(
+                        "SELECT COUNT(*)
+                         FROM nodes_fts
+                         CROSS JOIN file_rows r ON r.payload_id = {FTS_PAYLOAD_SQL}
+                         JOIN generations g
+                           ON g.id = ?1 AND g.id >= r.valid_from
+                          AND (r.valid_to IS NULL OR g.id < r.valid_to)
+                         WHERE nodes_fts MATCH ?2"
+                    ),
                     params![generation, match_query],
                     |row| row.get::<_, i64>(0),
                 ) {
@@ -782,9 +794,13 @@ impl Store {
             Some(reachable) => reachable,
             None => {
                 let counted = snapshot.query_row(
-                    "SELECT COUNT(*) FROM nodes_fts_map m
-                     JOIN nodes_fts f ON f.rowid = m.rowid_ref
-                     WHERE m.generation_id = ?1",
+                    "SELECT COUNT(*)
+                       FROM generations g
+                       JOIN file_rows r
+                         ON g.id >= r.valid_from AND (r.valid_to IS NULL OR g.id < r.valid_to)
+                       JOIN payload_nodes n ON n.payload_id = r.payload_id
+                       JOIN nodes_fts f ON f.rowid = ((n.payload_id << 24) | n.ord_in_file)
+                      WHERE g.id = ?1",
                     params![generation],
                     |row| row.get::<_, i64>(0),
                 );
@@ -1292,6 +1308,7 @@ generation {latest}; run `devmap status` to re-verify",
         } else {
             None
         };
+        let encoding_reason = Self::payload_encoding_reason_locked(&snapshot)?;
         Ok(StoreStatus {
             db_path: db_path.to_string(),
             latest_generation: latest,
@@ -1301,11 +1318,115 @@ generation {latest}; run `devmap status` to re-verify",
             source_freshness: None,
             source_delta: None,
             analyzer_freshness: None,
-            degraded_reason: devmap_analyze::combine_reasons(quarantine_reason, fts_reason),
+            degraded_reason: devmap_analyze::combine_reasons(
+                devmap_analyze::combine_reasons(quarantine_reason, fts_reason),
+                encoding_reason,
+            ),
             quarantined_count,
             quarantined_paths,
             coverage_gaps,
         })
+    }
+
+    /// How many unconverted payloads one status examines. Each examination
+    /// decodes a document, and a healthy store has none to examine.
+    const ENCODING_EXAMINED: usize = 64;
+
+    /// The stored extractions a writer open could not convert, by path, or
+    /// `None` when there are none.
+    ///
+    /// A writer open converts what it can and leaves the rest as it found it
+    /// ([`Store::heal_extraction_encoding`]), and a reader refuses such a row by
+    /// name when it reaches it. Neither says so at open, and a store that opened
+    /// cleanly with one unreadable payload looked exactly like one with none, so
+    /// status reports it. It asks the store rather than remembering the open, so
+    /// it also describes a store only ever opened read-only, by running the
+    /// heal's own test on the rows the heal would pick: a row not yet converted
+    /// but readable (a foreign writer's text document) is not a fault and is not
+    /// reported; one that does not decode is. At most
+    /// [`Self::ENCODING_EXAMINED`] rows are examined, and when more remain the
+    /// reason says so instead of reading the rest as clean.
+    ///
+    /// **What it does not look at, and says so.** Only the rows the heal would
+    /// pick: a compressed frame that already has its entry wiring is never
+    /// examined, so one truncated or bit-rotted there is found when a reader
+    /// decompresses it, not here. A structural check of every frame's header was
+    /// built and measured (the leading bytes of 1,896 rows, no decompression):
+    /// status went from 1.9 ms to 5.8 ms, min of 14 per process, n=7 alternating,
+    /// because SQLite loads each blob to take its prefix. `status` runs on every
+    /// answer, so that was not taken; the reason names the scope instead.
+    fn payload_encoding_reason_locked(
+        snapshot: &rusqlite::Transaction<'_>,
+    ) -> Result<Option<String>> {
+        use crate::payload_codec::{decode_value, entry_wiring_of_document};
+        let total: i64 = snapshot.query_row(
+            "SELECT COUNT(*) FROM file_payloads
+              WHERE typeof(extraction_json) <> 'blob' OR entry_wiring_json IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        if total == 0 {
+            return Ok(None);
+        }
+        let mut stmt = snapshot.prepare(
+            "SELECT pa.path, fp.extraction_json
+               FROM file_payloads fp JOIN paths pa ON pa.id = fp.file_id
+              WHERE typeof(fp.extraction_json) <> 'blob' OR fp.entry_wiring_json IS NULL
+              ORDER BY fp.payload_id LIMIT ?1",
+        )?;
+        let examined = stmt
+            .query_map(params![Self::ENCODING_EXAMINED as i64], |row| {
+                let path: String = row.get(0)?;
+                let verdict = decode_value(row.get_ref(1)?, &path)
+                    .and_then(|json| entry_wiring_of_document(&json, &path))
+                    .is_ok();
+                Ok((path, verdict))
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        let failed: Vec<&str> = examined
+            .iter()
+            .filter(|(_, convertible)| !convertible)
+            .map(|(path, _)| path.as_str())
+            .collect();
+        let unexamined = usize::try_from(total)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(examined.len());
+        if failed.is_empty() && unexamined == 0 {
+            return Ok(None);
+        }
+        let mut reason = String::new();
+        if !failed.is_empty() {
+            let shown: Vec<&str> = failed.iter().copied().take(Self::DEGRADED_SAMPLE).collect();
+            let more = failed.len().saturating_sub(shown.len());
+            reason.push_str(&format!(
+                "{} stored extraction(s) cannot be converted to the schema-29 form (compressed, \
+                 with entry wiring): {}{}; they are refused by name when read",
+                failed.len(),
+                shown.join(", "),
+                if more > 0 {
+                    format!(", and {more} more")
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        if unexamined > 0 {
+            if !reason.is_empty() {
+                reason.push_str("; ");
+            }
+            reason.push_str(&format!(
+                "{unexamined} more extraction(s) are not in the schema-29 form and were not \
+                 examined (the first {} were), so they are not known to be readable",
+                examined.len()
+            ));
+        }
+        reason.push_str(
+            "; this covers only payloads a writer open would convert (text, or without entry \
+             wiring): a compressed frame that already has its entry wiring is not examined, and \
+             a damaged one is found only when a reader decompresses it",
+        );
+        reason.push_str(" -- `dev map doctor --fix` quarantines the store and rebuilds it");
+        Ok(Some(reason))
     }
 
     /// The latest generation's coverage-gap inventory, capped per kind.

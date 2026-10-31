@@ -178,7 +178,7 @@ fn a_corrupt_span_is_refused_rather_than_published_as_zero() {
 
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute("UPDATE generation_nodes SET span_start = -5", [])
+        conn.execute("UPDATE payload_nodes SET span_start = -5", [])
             .unwrap();
     }
 

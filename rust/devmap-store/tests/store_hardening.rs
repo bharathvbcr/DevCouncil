@@ -1892,7 +1892,7 @@ fn s11_every_symbol_reader_refuses_a_corrupt_span_instead_of_publishing_zero() {
 
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute("UPDATE generation_nodes SET span_start = -5", [])
+        conn.execute("UPDATE payload_nodes SET span_start = -5", [])
             .unwrap();
     }
 

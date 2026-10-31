@@ -174,3 +174,80 @@ All spans were added in `rust/devmap-store/src/db/write.rs` (not committed). Eac
 - total.
 
 The cache variant wraps `tx.prepare_cached(sql)?.execute(params)` around the two fresh-row INSERTs.
+
+## Appendix B: v28 prototype results (branch `lane/store-v28`, 2026-10-29)
+
+Status: a branch prototype of §7, not merged, not released. Base `dbd0193a` (schema 27, floor 25); branch schema 28, reader floor **28** (the views keep every v27 column, but the `nodes_fts` rowid no longer carries a generation, so a v27 reader would join it by the old arithmetic and answer from the wrong rows without an error; a floor of 28 makes it refuse instead).
+
+**Shape.** `payload_nodes`, `payload_literals` and the `nodes_fts` rows are written once per payload (rowid `payload_id << 24 | ord_in_file`); `file_rows` and `digest_rows` are validity ranges; `generation_nodes`, `generation_literals`, `generation_file_rows`, `generation_file_digests` and `nodes_fts_map` are views with the v27 column sets. `generation_dead_symbols` and `generation_coverage_gaps` stay per generation. Retention collects a payload with everything derived from it when no retained range names it.
+
+**Correction (2026-10-29, Fable ruling 1).** The first prototype keyed a payload on file + content + the extractor's version strings and, on a key match, kept the stored payload's derived rows whenever its symbol count equalled the extraction in hand. On v27 the per-generation rows were always written from the extraction in hand; on v28 a same-count change of kind, name, span or literal stayed stale in `payload_nodes`, `payload_literals`, `nodes_fts` and `extraction_json`. That is reachable under the open extract-98 policy (a binary built off a lane writes other output at the same version strings) and by a budget refusal of bytes that parse. `build --full` did **not** clear it: it re-parses every file but reaches `ensure_payload_id` with no affected paths, finds the same key and reuses the payload (`build.rs` sets `affected_paths` empty, `write.rs` `full_rewrite`, every extraction is "fresh", each is `Reused`). Eight fail-before tests (kind, name, span, literal, each differential and `--full`) failed on `480aab5c` and pass now.
+
+*Fix.* The payload identity gains `payload_digest`: 128 bits (two salted SipHash streams) over the three documents the row holds (`parse_outcome_json`, `engine_json`, `extraction_json`), computed on the serializer thread where the documents are made. It is in the unique index (`idx_file_payloads_digest_identity`, replacing `idx_file_payloads_identity`, which a v3/v4 re-run of `CREATE_SCHEMA_V3` on a restamped store would otherwise recreate; the v28 rung drops it again). A different output for one key is therefore a **new payload id**: the retained generations keep reading the rows they were built with, the new generation gets its own, and retention collects the older payload with its rows when no retained range names it. Reuse means the stored row is byte-for-byte this extraction, so the derived rows are the extraction's by identity, not by a count. The count check stays for one purpose only: a reused payload whose rows are missing (a v27 payload no generation named, or damage) is repaired from the extraction in hand, which equals the one it was made from.
+
+Why the whole documents and not a digest of the derived rows: the derived rows are a function of the extraction, so documents that are byte-identical give identical rows, and the digest also covers what only `extraction_json` holds (wiring, routes, imports, calls, `go_package`, which readers in `query.rs` and the cache fallback read). A digest of nodes and literals alone would have let those go stale the same way, and a budget refusal and a clean empty file, both zero symbols, would have collided. One consequence is that **the in-place replacement of a budget refusal by its recovery is gone** (`PayloadState::Replaced` and the "declared interim" `UPDATE` that rewrote what every retained generation read). A refusal is another output, so it is another payload; `a_retained_older_generation_keeps_the_refusal_it_was_built_with`, ignored against card ft-3bdf1450, now passes.
+
+*Costs and side effects.* The v28 rung stamps each v27 payload with the digest of its stored documents (Rust, one payload at a time): on a real v27 store (DevCouncil, 1,893 payloads, 352 MB) the first `build` takes 1.90 s against 0.10 s for a no-op build, three runs at 1.90 s, no empty digest left, integrity ok, and a `build --full` afterwards reused all 1,893 payloads and wrote no row (so the backfilled digest equals the writer's on real data). On a fresh store, `--full` twice in a row also leaves 1,893 payloads and 25,424 symbol rows. A store the first prototype (`480aab5c`) stamped 28 has no `payload_digest`; the open adds the column and stamps the digests from the stored documents (`heal_payload_digest`, the same treatment as an index added within a version), where it had failed with a bare "no such column" (observed with the fixed binary on a store built by the `480aab5c` binary). The bench binary was built at `fec0f386`, before this heal, which costs one `PRAGMA table_info` on a writer open. The cache fallback (`try_get_cached_extraction`) read `generation_files ... LIMIT 1`, arbitrary among the payloads one identity can now name; it serves the newest generation's payload and never a failed parse (the cache does not admit one). Not changed: the `extraction_cache` table is keyed on the same version strings, so a lane binary at an unbumped extract version still reads its predecessor's cached extraction on the incremental path; that is the extract-98 policy question, not a store question, and `--full` bypasses the cache.
+
+**Interleaved bench (after the fix).** Release builds of `dbd0193a` and of `lane/store-v28` at `fec0f386`, `RAYON_NUM_THREADS=4`, `git archive` snapshots, 5 rounds, base and branch alternating order per round, each on a fresh copy walking cold, then three one-file appends, `/usr/bin/time -l`. Load average 11.6 at the start, 12.1 in the middle and 11.8 at the end (other lanes were running), so wall is inflated and noisy; instructions retired are not. `failed to parse` was equal in both arms of every run (1 for DevCouncil, 0 for GitPulse).
+
+| | DevCouncil (1,893 files) | GitPulse (3,071 files) |
+|---|---|---|
+| per-edit median wall, 15 edits per arm | 2.22 -> 1.41 s (-36.5%) | 3.84 -> 2.75 s (-28.4%) |
+| per-edit min wall | 1.54 -> 1.14 s (-26.0%) | 2.80 -> 2.26 s (-19.3%) |
+| first edit after cold, median | 1.80 -> 1.30 s (-27.8%) | 2.93 -> 2.41 s (-17.7%) |
+| steady-state edits (2nd, 3rd), median | 2.27 -> 1.40, 2.32 -> 1.43 s | 4.00 -> 2.81, 3.93 -> 2.83 s |
+| per-edit median instructions | 50.02 -> 40.72 G (-18.6%) | 96.18 -> 81.08 G (-15.7%) |
+| per-edit min instructions | 42.63 -> 37.72 G (-11.5%) | 82.48 -> 74.42 G (-9.8%) |
+| `persist:write` per edit, median | 1.28 -> 0.39 s | 2.04 -> 0.82 s |
+| paired edits where the branch was faster | 15/15 | 15/15 |
+| cold wall, min / instructions, min | 6.01 -> 5.84 s / 263.35 -> 263.32 G | 11.00 -> 10.77 s / 511.32 -> 511.00 G |
+| cold peak RSS, min | 1146 -> 1152 MB | 2088 -> 2099 MB |
+| store after cold, median | 352.4 -> 347.5 MB | 593.2 -> 586.2 MB |
+| store after 3 edits, median | 427.2 -> 356.3 MB | 686.3 -> 600.0 MB |
+
+The digest did not cost the per-edit gain: median instructions per edit moved from -19.9% / -16.8% before the fix to -18.6% / -15.7% after (cold instructions are unchanged to 0.01%, the digest being computed on the serializer threads), and the stores are the same size. The wall gate as written (per-edit median improved by 30% or more) is met on DevCouncil (-36.5%) and **not** on GitPulse (-28.4%, against -32.3% in the first run at a load of 12-29); both are noisy at this load, and Fable's re-bench at lower load measured -18% to -26% wall and -6% to -13% instructions, so neither run supports reading the gate as met without the owner replacing it. The first edit after a cold build pays less because the base store holds one generation and the retention prune has nothing to delete yet; the steady state of a long-lived store is edits 2 and onward.
+
+**Read side.** Nine interleaved runs per command on the DevCouncil store, minimum instructions: `search` -0.3%, `search --semantic` -2.5%, `explore` +1.3%, `impact` +1.4%, `dead` +2.9%, `clones` +4.4%, `status` +3.4%, `literals` +2.4%, `literals --exact` **+14.9%** (106.1 -> 122.0 M instructions; it was +12.7% before the fix, so the fix did not change it and it is not a regression the fix caused). Wall is unchanged at the 10 ms the timer reports. The extra is about 12-16 M instructions on every command that opens the store and does not otherwise get cheaper, which reads as a fixed per-open cost of the v28 views, not a cost of the literals query (inferred from the pattern across commands; the open path was not profiled), and it is the largest relative figure only because `--exact` is the cheapest command.
+
+**Identity.** Re-run on the fixed branch (`fec0f386`) against the `dbd0193a` release. Sorted rows of the five compatibility views plus `generation_dead_symbols`, `generation_edges` and the `nodes_fts` join, for the latest and the previous generation, and normalised JSON of `status`, `dead`, `clones`, `search`, `search --semantic`, `explore`, `impact`, `literals` (substring and exact) for fixed symbols, at cold, one-file edit, second edit, revert, delete and full rebuild: three corpora (DevCouncil 1,893 files, GitPulse 3,071, `rust/testdata` 548), 1,782 answers compared (1,494 exact, 288 semantic), **0 exact answers differ**, `PRAGMA integrity_check` ok on all six stores, and `failed to parse` equal between arms (1, 0, 2). One semantic answer differs (DevCouncil, `searchsem.fixture` after the first edit), the same class as before: the semantic ranker sums over `HashMap`s in per-process order, so its answers are compared as the set of items scoring 0.5 or more, and, measured in the first prototype run and not repeated here, base against a second base run differs in 2 of 96. Fields dropped from the comparison, each because it names the arm and not the store: `db_path`, `root`, `pid`, `unix_ms`, `binary_path`, `binary_version`, `schema_version`, `expected_schema_version` and the artifact paths; floats rounded to three places.
+
+**Migration.** A real v27 store (427 MB, written by the base binary) opens under the branch and migrates (the first `build` takes 1.6-2.0 s against 0.12 s for a no-op build afterwards, so the rung costs about 1.5-1.9 s at this size), and the latest and previous generations then read what they read before. A `kill -9` that landed mid-migration (820 KB of uncommitted WAL) left user_version 27, integrity ok, no v28 table, and the base binary still answering from it; the retry completed and read identically. A v27 binary against a v28 store refuses on every query command and on `build` (`schema version 28 can be read only by a reader at schema 28 or newer`), and its `status` reports `reader_ready: false` and names the schema skew.
+
+## Appendix C: v29 prototype, zstd-compressed `extraction_json` (branch `lane/store-v29-zstd`, 2026-10-29)
+
+Status: a branch prototype stacked on the unmerged v28 prototype (`de318143`), not merged, not released. Schema 29, reader floor **29**. New dependency, approved by the owner: `zstd =0.14.0` (2026-09-04) with `default-features = false`, `zstd-safe 8.0.0`, `zstd-sys 2.1.0+zstd.1.5.7` (both pinned in `Cargo.lock` below their 2026-10-16 successors, which were under two weeks old), and the transitive additions `jobserver 0.1.35`, `getrandom 0.4.3`, `r-efi 6.0.0`.
+
+**What changes.** `file_payloads.extraction_json` holds one zstd frame (level 1, content checksum on, no dictionary) as a `BLOB` in the same `TEXT`-declared column; the `generation_files` view is untouched. `entry_wiring_json TEXT` is added beside it: the `RuntimeEntryPoint` wiring annotations, which `latest_test_entry_symbols` reads instead of running `json_extract` over a document SQL can no longer open. `NULL` means "not computed" and the reader decodes that one document; `'[]'` means "none". `payload_digest` still covers the JSON *text*, taken before compression, so payload identity and every digest a v28 store stamped are unchanged. A frame is refused, naming the path, when it does not decompress, declares no size, declares more than 64 MiB (thirty times the largest extraction measured here), or decodes to a size other than the one declared.
+
+**Migration.** One transaction. Each text payload is compressed, decompressed again and compared with its source, then written with its `entry_wiring_json`; any payload that cannot be converted refuses the store and leaves it at 28. The same pass runs on every writer open and converges a store left half converted. Real v28 store (1,896 payloads): 1.7 s (min of 3), 8.3 G instructions; 348.8 MB to 171.8 MB. All 1,896 documents decompress (independent `zstd` CLI) to the exact bytes v28 stored, digests equal, `integrity_check` ok.
+
+**Level.** Over the 1,896 stored documents (200.6 MB), per-document frames with checksum, min of 5, one process:
+
+| level | ratio | compress | decompress |
+|---|---|---|---|
+| 1 | 11.17x | 130 ms | 58 ms |
+| 2 | 11.09x | 140 ms | 57 ms |
+| 3 | 11.03x | 144 ms | 56 ms |
+| 5 | 11.76x | 437 ms | 56 ms |
+| 9 | 13.29x | 886 ms | 50 ms |
+
+Level 1.
+
+**Interleaved A/B.** Release builds of `de318143` (v28) and of this branch; one `git archive` snapshot of `de318143` copied per arm; ABBA order, N=5 each; instructions retired from `/usr/bin/time -l` (the Mac was shared with other sessions, so wall time is reported but not relied on: paired wall differences ranged -2.2 s to +2.9 s and changed sign).
+
+| measure | v28 | v29 | instructions retired, v29 vs v28 (paired reps) |
+|---|---|---|---|
+| store after `build --full` | 348.8 MB | 166.8 MB (-52%) | |
+| `file_payloads` | 205.4 MB | 23.4 MB | |
+| `build --full` cold, min wall | 4.70 s | 4.93 s | -0.3% (4 of 5 negative) |
+| `build --full` over an existing store | 3.44 s | 4.30 s | +0.5% to +0.6% (5 of 5 positive) |
+| one-file edit, `build` | 1.32 s | 1.36 s | +1.0% (5 of 5 positive) |
+| `devmap affected` (the `affected_tests` path) | 0.27 s | 0.08 s | -74.7% (5 of 5) |
+| `latest_test_entry_symbols`, in process | 188.5 ms | 2.8 ms | -98.5% |
+| `latest_extractions`, in process | 259.1 ms | 272.0 ms | +5.0% (process +13.8% instr, 5 of 5) |
+| `latest_extraction_for_path`, in process | 0.48 ms | 0.58 ms | |
+
+The `--full` and incremental increments are, by inference (not isolated by a separate run), the compression of documents that turn out to be reused (the digest decides that on the writing thread, after the serializer threads have compressed) and, on the incremental build, the decompression of the ~1,895 cached payloads on the rayon pool, outside the connection mutex. Neither moves wall time past the noise. v28's write-cost win is intact.
+
+**Answers.** Node, edge, literal and unresolved counts identical (25,487 / 97,282 / 172,483 / 272,559); sorted-normalised `dead --json`, `impact` on three symbols and `affected` on three targets identical between arms.

@@ -197,13 +197,27 @@ fn test_s3_fts_fuzz_corpus() {
 /// Rows one generation's write left behind, per relation, for a corpus of `n`
 /// files where `src/f{i}.py` calls into `src/f{i+1}.py` and the second
 /// generation edits the body of `src/f0.py` alone.
+///
+/// Physical rows, not rows a generation *reads*: since v28 nothing but the two
+/// per-generation relations is keyed by `generation_id`, and a count taken
+/// through a compatibility view is (row x generations), which says nothing
+/// about what the write did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct B3WriteSet {
-    /// Rows keyed `generation_id = 2`, one relation each.
+    /// `payload_nodes` and `nodes_fts` rows the edit added: the edited file's
+    /// new payload holds its symbols, and the index one entry for each.
     nodes: i64,
-    file_rows: i64,
-    fts_map: i64,
-    digests: i64,
+    fts: i64,
+    /// `payload_literals` rows added.
+    literals: i64,
+    /// Membership ranges the edit opened (`valid_from = 2`) and closed
+    /// (`valid_to = 2`).
+    file_rows_opened: i64,
+    file_rows_closed: i64,
+    /// Digest ranges, likewise.
+    digests_opened: i64,
+    digests_closed: i64,
+    /// The two relations still written per generation, in full.
     dead: i64,
     gaps: i64,
     /// `file_payloads` the edit added: content-addressed, so the unchanged
@@ -221,18 +235,22 @@ struct B3WriteSet {
 }
 
 impl B3WriteSet {
-    /// The rows B3's gate counts that are written in proportion to the edit.
-    fn differential(&self) -> i64 {
+    /// Every row the edit wrote, over every relation: B3's "<100 rows" gate.
+    fn written(&self) -> i64 {
         self.payloads_added
+            + self.nodes
+            + self.fts
+            + self.literals
+            + self.file_rows_opened
+            + self.file_rows_closed
+            + self.digests_opened
+            + self.digests_closed
             + self.edges_opened
             + self.edges_closed
             + self.unresolved_opened
             + self.unresolved_closed
-    }
-
-    /// The rows still copied for every file or symbol of the repository.
-    fn carried(&self) -> i64 {
-        self.nodes + self.file_rows + self.fts_map + self.digests + self.dead + self.gaps
+            + self.dead
+            + self.gaps
     }
 }
 
@@ -273,7 +291,11 @@ fn b3_measure_one_file_edit(n: usize) -> B3WriteSet {
             1
         );
     }
-    let payloads_before = count("SELECT COUNT(*) FROM file_payloads");
+    let before = |sql: &str| count(sql);
+    let payloads_before = before("SELECT COUNT(*) FROM file_payloads");
+    let nodes_before = before("SELECT COUNT(*) FROM payload_nodes");
+    let fts_before = before("SELECT COUNT(*) FROM nodes_fts");
+    let literals_before = before("SELECT COUNT(*) FROM payload_literals");
     let gen1_edges = count("SELECT COUNT(*) FROM edge_rows WHERE valid_from = 1");
 
     let mut edited = files.clone();
@@ -308,10 +330,13 @@ fn b3_measure_one_file_edit(n: usize) -> B3WriteSet {
         ))
     };
     let set = B3WriteSet {
-        nodes: at_two("generation_nodes"),
-        file_rows: at_two("generation_file_rows"),
-        fts_map: at_two("nodes_fts_map"),
-        digests: at_two("generation_file_digests"),
+        nodes: count("SELECT COUNT(*) FROM payload_nodes") - nodes_before,
+        fts: count("SELECT COUNT(*) FROM nodes_fts") - fts_before,
+        literals: count("SELECT COUNT(*) FROM payload_literals") - literals_before,
+        file_rows_opened: count("SELECT COUNT(*) FROM file_rows WHERE valid_from = 2"),
+        file_rows_closed: count("SELECT COUNT(*) FROM file_rows WHERE valid_to = 2"),
+        digests_opened: count("SELECT COUNT(*) FROM digest_rows WHERE valid_from = 2"),
+        digests_closed: count("SELECT COUNT(*) FROM digest_rows WHERE valid_to = 2"),
         dead: at_two("generation_dead_symbols"),
         gaps: at_two("generation_coverage_gaps"),
         payloads_added: count("SELECT COUNT(*) FROM file_payloads") - payloads_before,
@@ -326,27 +351,30 @@ fn b3_measure_one_file_edit(n: usize) -> B3WriteSet {
     set
 }
 
-/// B3's gate — "a one-file edit writes <100 rows for that generation" — is
-/// **open**, and this test is what says by how much.
+/// B3's gate -- "a one-file edit writes <100 rows for that generation" -- is
+/// met, and this test is what pins it.
 ///
-/// It measures the same one-file edit at two corpus sizes and pins both halves
-/// of the write separately, because they answer differently:
+/// It measures the same one-file edit at two corpus sizes and asserts the rows
+/// the write left behind, physical and per relation, so that what it writes
+/// cannot come to grow with the repository unnoticed:
 ///
-/// - the range relations (`edge_rows`, `unresolved_rows`, since v18) and the
-///   content-addressed `file_payloads` (v17) are differential: what the edit
-///   writes there does not grow with the repository, and stays under 100;
-/// - `generation_nodes`, `nodes_fts_map`, `generation_file_rows`,
-///   `generation_file_digests` and `generation_dead_symbols` are keyed on
-///   `generation_id` and re-written for every file and symbol on every build.
+/// - the range relations (`edge_rows`, `unresolved_rows` since v18, and since
+///   v28 `file_rows` and `digest_rows`) open and close only what the edit
+///   changed;
+/// - the payload-keyed relations (`file_payloads` since v17, and since v28
+///   `payload_nodes`, `payload_literals` and the `nodes_fts` entries) gain one
+///   payload's rows;
+/// - `generation_dead_symbols` and `generation_coverage_gaps` are still
+///   written per generation, in full. They are whole-graph results rather than
+///   derivations of one file; the fixture has one dead symbol and no gaps, so
+///   they cost a row here, and the number is pinned so that changing it is a
+///   decision.
 ///
-/// The second half is the gate's whole remaining cost. Closing it means moving
-/// those relations onto validity ranges as v18 did for edges — a store schema
-/// change GitPulse's vendored `dc-store` and the CLI fixtures both read — so the
-/// gate is re-scoped in `docs/devmap/DIVERGENCES.md` (B3) with these numbers
-/// rather than claimed. When that change lands this test fails on the
-/// `carried` assertions, which is the signal to re-measure and close B3.
+/// Until v28 this asserted `6n + 1` rows copied for every file and symbol of
+/// the repository, and the gate was re-scoped in `docs/devmap/DIVERGENCES.md`
+/// (B3) with those numbers rather than claimed.
 #[test]
-fn b3_one_file_edit_write_set_is_differential_for_ranges_and_o_repo_for_generation_keyed_rows() {
+fn b3_one_file_edit_write_set_is_differential_for_every_relation_but_the_two_per_generation_ones() {
     let small = b3_measure_one_file_edit(200);
     let large = b3_measure_one_file_edit(500);
     eprintln!("B3 write set, n=200: {small:?}");
@@ -359,21 +387,30 @@ fn b3_one_file_edit_write_set_is_differential_for_ranges_and_o_repo_for_generati
             set.gen1_edges >= n,
             "fixture must carry its cross-file calls: {set:?}"
         );
-        // The differential half: one payload for the edited file, and the two
-        // edges the retargeted call closed and opened (the call and its import).
+        // One payload for the edited file, and the two edges the retargeted
+        // call closed and opened (the call and its import).
         assert_eq!(set.payloads_added, 1, "{set:?}");
         assert_eq!((set.edges_closed, set.edges_opened), (2, 2), "{set:?}");
-        assert_eq!(set.differential(), 5, "{set:?}");
-        // The generation-keyed half is a full copy: a file row and a digest per
-        // file, and a node and an FTS mapping per symbol (the File node and the
-        // function), plus the one symbol the edit left uncalled.
-        assert_eq!((set.file_rows, set.digests), (n, n), "{set:?}");
-        assert_eq!((set.nodes, set.fts_map), (2 * n, 2 * n), "{set:?}");
-        assert_eq!(set.dead, 1, "{set:?}");
-        assert_eq!(set.carried(), 6 * n + 1, "{set:?}");
+        // The edited file's symbols (the File node and the function), once in
+        // the payload table and once in the index; no literals in the fixture.
+        assert_eq!((set.nodes, set.fts, set.literals), (2, 2, 0), "{set:?}");
+        // One membership range closed and one opened, and the one digest the
+        // retargeted call changed -- the file's own.
+        assert_eq!(
+            (set.file_rows_opened, set.file_rows_closed),
+            (1, 1),
+            "{set:?}"
+        );
+        assert_eq!((set.digests_opened, set.digests_closed), (1, 1), "{set:?}");
+        assert_eq!((set.dead, set.gaps), (1, 0), "{set:?}");
+        // The gate, over every relation at once, and independent of `n`.
+        assert!(set.written() < 100, "{set:?}");
     }
-    // The gate counts both halves; the open half is what keeps it over 100.
-    assert!(small.differential() + small.carried() >= 100);
+    assert_eq!(
+        small.written(),
+        large.written(),
+        "what a one-file edit writes must not depend on the size of the repository"
+    );
 }
 
 #[test]
