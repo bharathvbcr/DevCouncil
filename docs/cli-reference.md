@@ -256,10 +256,18 @@ devmap build --manifest     # Generate repo_map.json and code_graph.json
 devmap build --full         # Cold rebuild: re-parse every source, ignore the extraction cache
 devmap build --verify-rows  # Incremental extraction, but re-derive every stored edge's validity
 devmap build --manifest --force  # Also replace a foreign repo map / code graph (`--force` requires `--manifest`)
+devmap build --lsp          # Opt-in language server extraction pass (drains & redacts child stderr)
+                            # Resolution budget controls (degrades gracefully unless refused):
+                            #   --resolve-candidate-visits <N>
+                            #   --resolve-retained-candidate-bytes <BYTES>
+                            #   --resolve-ambiguity-evidence-bytes <BYTES>
+                            #   --resolve-degraded-candidates <N>
+                            #   --refuse-on-resolve-limit
                             # Ctrl-C cancels a build: first one stops at the next file with nothing
                             # committed and exits 130; a second one exits 130 at once
+                            # Refuses damaged stores with remediation steps instead of exiting 0
 devmap serve                # Watcher + IPC (not `build --watch`)
-devmap status [--json]
+devmap status [--json]      # Generation, readiness, resolution caps, search_index_damaged probe
 devmap --version            # Prints version, store schema, code graph schema, extract schema, build hash
 devmap doctor               # No `--fix`
 devmap paths [--json]

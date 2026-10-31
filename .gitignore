@@ -174,6 +174,7 @@ opencode.json
 .antigravity/
 .grok/
 .gitnexus/
+.gitpulse/
 
 # Additional coding agent & IDE workspace directories
 .windsurf/
@@ -198,16 +199,49 @@ CLAUDE.md
 *_Implementation_Plan.md
 **/*.plan.md
 docs/superpowers/plans/
-# Dated session reports, the retired-audit archive and the Phase 7 ledgers are
-# local-only. They were untracked on 2026-10-25 and history keeps them; tracked
-# docs link to them by permalink at b18cea3f, the last commit that held them.
+# Dated session reports, wave reports, build reports, the retired-audit archive
+# and the Phase 7 ledgers are local-only. They were untracked on 2026-10-25 and
+# history keeps them; tracked docs link to them by permalink at b18cea3f, the
+# last commit that held them.
 /AUDIT_REPORT*.md
+AUDIT_REPORT*.md
 /BRANCH_REPORT*.md
+BRANCH_REPORT*.md
 /BUILD_REPORT*.md
+BUILD_REPORT*.md
+*build-report*.md
+*build_report*.md
+/WAVE_REPORT*.md
+WAVE_REPORT*.md
+/WAVE_*.md
+WAVE_*.md
+*wave-report*.md
+*wave_report*.md
+/RELEASE_REPORT*.md
+RELEASE_REPORT*.md
+*release-report*.md
+*release_report*.md
 /docs/archive/
 /docs/TODO.md
 /docs/PHASE7_LONG_TAIL.md
 /docs/DEVMAP_SKILL_DELIVERY.md
+
+# =============================================================================
+# GitPulse tasks, task briefs, worktrees & local task state
+# =============================================================================
+.gitpulse/
+.gitpulse/*
+/tasks/
+.tasks/
+*.task.md
+*.tasks.md
+*.task.json
+*.tasks.json
+*.task.jsonl
+*.tasks.jsonl
+.gitpulse-tasks*
+gitpulse-tasks*
+.worktrees/
 
 # =============================================================================
 # Databases & runtime state files
@@ -433,3 +467,29 @@ service-account*.json
 /DevCouncil-linkedin.md
 examples/password-reset/
 rust/devmap-serve/sessions/
+
+# Local markdown notes, plans, release drafts, and scratchpads
+TODO.md
+NOTES.md
+SCRATCH.md
+IDEAS.md
+/PLAN.md
+RELEASE_DRAFT.md
+CHANGELOG_DRAFT.md
+*.draft.md
+*.scratch.md
+*.local.md
+
+# Test runner reports and browser testing artifacts
+test-results/
+playwright-report/
+blob-report/
+
+# DevMap preview inputs and diff artifacts
+.devmap-preview.json
+*.devmap-preview.json
+
+# Git bundles (archive and wave backups; preserve tracked web assets)
+*.bundle
+!rust/devmap-query/assets/*.bundle
+*.gitbundle
