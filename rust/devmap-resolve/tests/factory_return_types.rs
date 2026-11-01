@@ -1351,5 +1351,151 @@ func Make() {
     );
 }
 
+// A TypeScript factory that returns an interface: the interface is the only
+// type the value can be called through, so a single indexed `interface` of that
+// name types the value exactly as a single indexed class does.
 
+const CTL_FACTORY: &str = "\
+export interface Ctl {
+  zzstart(): void;
+}
+export function makeCtl(): Ctl {
+  return { zzstart() {} };
+}
+";
 
+const CTL_CALLER: &str = "\
+import { makeCtl } from './ctl';
+export function Panel() {
+  const c = makeCtl();
+  c.zzstart();
+}
+";
+
+#[test]
+fn a_ts_local_built_by_a_factory_returning_a_unique_interface_dispatches_to_its_member() {
+    let targets = calls_from(
+        &[("src/ctl.ts", CTL_FACTORY), ("src/Panel.ts", CTL_CALLER)],
+        "src/Panel.ts::Panel",
+    );
+    assert!(
+        targets.iter().any(|t| t == "src/ctl.ts::Ctl.zzstart"),
+        "got {targets:?}"
+    );
+}
+
+#[test]
+fn a_ts_factory_returning_an_interface_declared_twice_stays_unresolved() {
+    let other = "\
+export interface Ctl {
+  zzstart(): void;
+}
+";
+    let targets = calls_from(
+        &[
+            ("src/ctl.ts", CTL_FACTORY),
+            ("src/other.ts", other),
+            ("src/Panel.ts", CTL_CALLER),
+        ],
+        "src/Panel.ts::Panel",
+    );
+    assert!(
+        !targets.iter().any(|t| t.ends_with("Ctl.zzstart")),
+        "two interfaces named Ctl cannot type the value: {targets:?}"
+    );
+}
+
+#[test]
+fn a_ts_factory_returning_a_merged_class_and_interface_name_is_not_widened() {
+    // Declaration merging: the name is a class and an interface at once. The
+    // interface arm abstains (it needs the interface to be the only type), and
+    // the existing class rule still sees two candidates (class + interface is
+    // one class), so the class path decides exactly as before.
+    let merged = "\
+export interface Ctl {
+  zzstart(): void;
+}
+export class Ctl {
+  zzstart() {}
+}
+export function makeCtl(): Ctl {
+  return new Ctl();
+}
+";
+    let with_other_interface = "\
+export interface Ctl {
+  zzstart(): void;
+}
+";
+    let targets = calls_from(
+        &[
+            ("src/ctl.ts", merged),
+            ("src/other.ts", with_other_interface),
+            ("src/Panel.ts", CTL_CALLER),
+        ],
+        "src/Panel.ts::Panel",
+    );
+    assert!(
+        targets.iter().all(|t| t != "src/other.ts::Ctl.zzstart"),
+        "the interface arm must not pick the namesake interface: {targets:?}"
+    );
+}
+
+#[test]
+fn a_ts_factory_returning_a_class_still_dispatches_to_its_class() {
+    let service = "\
+export class Impl {
+  zzstart() {}
+}
+export function makeImpl(): Impl {
+  return new Impl();
+}
+";
+    let caller = "\
+import { makeImpl } from './impl';
+export function Panel() {
+  const c = makeImpl();
+  c.zzstart();
+}
+";
+    let targets = calls_from(
+        &[("src/impl.ts", service), ("src/Panel.ts", caller)],
+        "src/Panel.ts::Panel",
+    );
+    assert!(
+        targets.iter().any(|t| t == "src/impl.ts::Impl.zzstart"),
+        "got {targets:?}"
+    );
+}
+
+#[test]
+fn a_python_or_go_name_matching_an_interface_is_not_admitted_by_the_ts_rule() {
+    // The interface arm is JS/TS only: when Rung 0 abstains (dot-import) and a
+    // Go factory reaches `factory_return_type`, a Go interface keeps the
+    // behaviour it had before.
+    let go_factory = "\
+package reg
+
+type Store interface{ Zzput() }
+
+func NewStore() Store { return nil }
+";
+    let go_caller = "\
+package reg
+
+import . \"fmt\"
+
+func Use() {
+	s := NewStore()
+	s.Zzput()
+}
+";
+    let before = calls_from(
+        &[("reg/store.go", go_factory), ("reg/use.go", go_caller)],
+        "reg/use.go::Use",
+    );
+    assert!(
+        !before.iter().any(|t| t.ends_with("Store.Zzput")),
+        "the interface arm is JS/TS only: {before:?}"
+    );
+}

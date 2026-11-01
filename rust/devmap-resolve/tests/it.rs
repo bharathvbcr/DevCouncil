@@ -173,6 +173,8 @@ mod rust_qualified_path_calls;
 #[cfg(feature = "parse")]
 mod rust_qualified_super_calls;
 #[cfg(feature = "parse")]
+mod rust_same_file_typed_receiver;
+#[cfg(feature = "parse")]
 mod rust_self_type;
 #[cfg(feature = "parse")]
 mod rust_trait_dispatch;
