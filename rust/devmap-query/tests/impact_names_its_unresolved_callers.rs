@@ -384,3 +384,133 @@ fn the_ledger_is_read_at_the_generation_asked_for() {
         "a generation that is not retained is not read"
     );
 }
+
+/// `callers` untyped `book.settle()` call sites in one file, beside the
+/// `Ledger.settle` they name. Every one lands in the ledger, none is an edge.
+fn many_untyped_callers(callers: usize) -> Store {
+    let many: String = (0..callers)
+        .map(|index| format!("def caller_{index}(book):\n    return book.settle()\n\n\n"))
+        .collect();
+    store_of(&[("ledger.py", LEDGER.to_string()), ("many.py", many)])
+}
+
+/// `sites_omitted` as the wire carries it: absent means none were trimmed.
+fn sites_omitted(namesakes: &devmap_query::UnresolvedNamesakes) -> usize {
+    serde_json::to_value(namesakes)
+        .unwrap()
+        .get("sites_omitted")
+        .and_then(serde_json::Value::as_u64)
+        .map_or(0, |omitted| usize::try_from(omitted).unwrap())
+}
+
+fn req_at(target: &str, token_budget: u32) -> Request<String> {
+    Request {
+        token_budget,
+        ..req(target)
+    }
+}
+
+/// The ledger's candidates are advisory data, and they were the one part of an
+/// `impact` answer no budget touched: 400 sites could ride on a 1,500-token
+/// call. They are charged to a share of the caller's budget now, and the sites
+/// the share could not hold are counted, not dropped.
+#[test]
+fn candidates_beyond_the_budget_share_are_counted_not_listed() {
+    let store = many_untyped_callers(40);
+    let engine = StoreQueryEngine::new(&store);
+
+    let full = engine.impact(req_at("Ledger.settle", 100_000)).unwrap();
+    let full = full.unresolved_namesakes.expect("checked");
+    assert_eq!(
+        full.sites.len(),
+        40,
+        "the premise: all 40 are in the ledger"
+    );
+    assert_eq!(
+        sites_omitted(&full),
+        0,
+        "a budget that holds them trims none"
+    );
+
+    let tight = engine.impact(req_at("Ledger.settle", 1_500)).unwrap();
+    let note = tight.walk_incomplete.clone().unwrap_or_default();
+    let tight = tight.unresolved_namesakes.expect("checked");
+    assert!(
+        !tight.sites.is_empty() && tight.sites.len() < 40,
+        "a quarter of 1,500 tokens holds some of 40 sites, not all and not none: {}",
+        tight.sites.len()
+    );
+    assert_eq!(
+        tight.sites.len() + sites_omitted(&tight),
+        full.sites.len(),
+        "listed plus omitted must account for every site the ledger held"
+    );
+    assert_eq!(
+        tight.sites[..],
+        full.sites[..tight.sites.len()],
+        "the listed sites are a prefix of the full read, in the same order"
+    );
+    assert!(!tight.truncated, "no per-name cap bit; only the budget did");
+    assert!(
+        note.contains("40 unresolved call site(s) name settle"),
+        "walk_incomplete must name what the ledger held, not what fitted: {note:?}"
+    );
+}
+
+/// The per-name cap and the budget share are two different signals and both
+/// stay honest when both bite.
+#[test]
+fn a_capped_ledger_read_trimmed_by_budget_keeps_both_signals() {
+    let store = many_untyped_callers(MAX_NAMESAKE_SITES_PER_NAME + 10);
+    let engine = StoreQueryEngine::new(&store);
+
+    let answer = engine.impact(req_at("Ledger.settle", 1_500)).unwrap();
+    let note = answer.walk_incomplete.clone().unwrap_or_default();
+    let namesakes = answer.unresolved_namesakes.expect("checked");
+
+    assert!(namesakes.truncated, "the per-name cap bit");
+    assert!(sites_omitted(&namesakes) > 0, "and so did the budget");
+    assert_eq!(
+        namesakes.sites.len() + sites_omitted(&namesakes),
+        MAX_NAMESAKE_SITES_PER_NAME
+    );
+    assert!(
+        note.contains(&format!("at least {MAX_NAMESAKE_SITES_PER_NAME}")),
+        "{note:?}"
+    );
+}
+
+/// A namesake-dominated answer is no longer several times its budget.
+#[test]
+fn a_namesake_dominated_answer_stays_near_its_budget() {
+    let store = many_untyped_callers(40);
+    let engine = StoreQueryEngine::new(&store);
+    let budget = 600u32;
+
+    let answer = engine.impact(req_at("Ledger.settle", budget)).unwrap();
+    let bytes = serde_json::to_string(&answer).unwrap().len();
+
+    let allowed = budget as usize * devmap_query::BYTES_PER_TOKEN as usize * 3 / 2;
+    assert!(
+        bytes <= allowed,
+        "{bytes} bytes for a {budget}-token budget (allowed {allowed})"
+    );
+}
+
+/// Sites that fit are not trimmed, and the wire form gains no key.
+#[test]
+fn candidates_that_fit_keep_their_wire_form() {
+    let store = store_of(&[
+        ("ledger.py", LEDGER.to_string()),
+        ("untyped.py", UNTYPED.to_string()),
+    ]);
+    let engine = StoreQueryEngine::new(&store);
+    let wire =
+        serde_json::to_value(engine.impact(req_at("Ledger.settle", 1_500)).unwrap()).unwrap();
+    let namesakes = &wire["unresolved_namesakes"];
+    assert_eq!(namesakes["sites"].as_array().map(Vec::len), Some(1));
+    assert!(
+        namesakes.get("sites_omitted").is_none(),
+        "nothing was trimmed, so nothing is reported: {namesakes}"
+    );
+}
