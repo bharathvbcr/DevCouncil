@@ -838,6 +838,63 @@ fn build_history_separates_confident_ambiguous_and_unmeasured_values() {
     );
 }
 
+/// `build_ms` is stored inside the save transaction, so it stops before the
+/// commit, the prunes and the vacuum. `finalize_build_ms` extends a measured
+/// row to the caller's end of work, leaves an unmeasured (NULL) row NULL, and
+/// reports a row that is not there as `false` instead of failing.
+#[test]
+fn finalize_build_ms_extends_a_measured_row_and_never_invents_one() {
+    let extractions = vec![extract_file("a.py", "def a():\n    return 1\n")];
+    let mut resolver = Resolver::new();
+    resolver.index_extractions(&extractions);
+    let resolution = resolver.resolve_all(&extractions).unwrap();
+    let analysis = analyze(&extractions, &resolution);
+    let store = Store::open_in_memory().unwrap();
+
+    let started = Instant::now();
+    let measured = store
+        .save_generation_with_metadata(
+            &extractions,
+            &resolution,
+            &analysis,
+            GenerationWriteOpts {
+                build_started: Some(started),
+                ..GenerationWriteOpts::default()
+            },
+            "head",
+        )
+        .unwrap();
+    let in_transaction = store.build_history(1).unwrap()[0].build_ms.unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    assert!(store.finalize_build_ms(measured, started).unwrap());
+    let finalized = store.build_history(1).unwrap()[0].build_ms.unwrap();
+    assert!(
+        finalized >= in_transaction + 80,
+        "the work after the save must be counted: {in_transaction} ms in the transaction, \
+         {finalized} ms finalized"
+    );
+
+    let unmeasured = store
+        .save_generation_with_metadata(
+            &extractions,
+            &resolution,
+            &analysis,
+            GenerationWriteOpts::default(),
+            "head",
+        )
+        .unwrap();
+    assert!(
+        !store.finalize_build_ms(unmeasured, started).unwrap(),
+        "a NULL build_ms stays NULL"
+    );
+    assert_eq!(store.build_history(1).unwrap()[0].build_ms, None);
+    assert!(
+        !store.finalize_build_ms(u32::MAX, started).unwrap(),
+        "a row that was pruned is not an error"
+    );
+}
+
 /// `count_search_symbols` must let the full-text match drive its join.
 ///
 /// Written as a plain `JOIN`, SQLite 3.45 leads with `nodes_fts_map` filtered on

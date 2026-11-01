@@ -188,7 +188,6 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
     // success.
     let path = &cli.root_hint();
     let progress = progress.expect("main supplies a build reporter");
-    let build_started = std::time::Instant::now();
     progress.stage(
         1,
         format_args!("scanning and extracting {}", path.display()),
@@ -206,6 +205,11 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
     let _writer = progress.timed("writer:wait", || {
         Store::lock_writer_at(&cli.db(), Store::WRITER_LOCK_WAIT)
     })?;
+    // `build_ms` starts here, once the lock is held, so it means the same on
+    // this path as on the daemon's: time spent building, not time spent
+    // queued behind another writer (that is the `writer:wait` stage). It ends
+    // after the vacuum, below.
+    let build_started = std::time::Instant::now();
     // Whose store this is comes before anything that could write to it: opening
     // migrates and heals the file, so a store of another live worktree is
     // refused here, from a read-only look at its owner, and not after the open
@@ -980,6 +984,15 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
         ));
     }
     let vacuum = progress.timed("persist:vacuum", || store.vacuum_if_needed())?;
+    // The history row was written inside the save transaction, before the
+    // commit and the prunes above. Close its `build_ms` over the whole locked
+    // build. The value already stored is a true lower bound, so a failure here
+    // is said and the build still succeeds.
+    if let Err(error) = store.finalize_build_ms(gen_id, build_started) {
+        progress.display.diagnostic(format_args!(
+            "build_history: could not extend build_ms over the prunes and vacuum: {error:#}"
+        ));
+    }
     // Report what the reclaim decided, not just how long it took. A
     // decline and a reclaim-that-reclaimed-nothing both take ~0 ms and
     // leave the same file behind, so the duration alone cannot tell a
