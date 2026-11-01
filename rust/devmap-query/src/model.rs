@@ -264,6 +264,9 @@ pub struct UnresolvedNamesakes {
     #[serde(default, skip_serializing_if = "is_zero")]
     pub names_not_checked: usize,
     pub sites: Vec<UnresolvedSite>,
+    /// Sites dropped because they did not fit the caller's token budget share.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub sites_omitted: usize,
     /// Sites dropped because they are in another language family than the
     /// target — a Go `run` is not a caller of a Python `run`.
     #[serde(default, skip_serializing_if = "is_zero")]
