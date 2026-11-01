@@ -493,6 +493,18 @@ CHANGELOG_DRAFT.md
 *.draft.md
 *.scratch.md
 *.local.md
+/PROJECT.md
+/TEST_INFRA*.md
+/TEST_READY*.md
+/TASK_REVIEW*.md
+/GATE_STATUS*.md
+/ORIGINAL_REQUEST*.md
+/docs/architecture/
+/schemas/
+/tests/architecture_suite/
+rust/devmap-query/examples/cli_query_ab.rs
+benchmarks/query_budget_ab.sh
+*.pending
 
 # Test runner reports and browser testing artifacts
 test-results/

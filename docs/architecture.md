@@ -114,19 +114,24 @@ flowchart TD
 
 1. `devmap-extract` discovers files and extracts definitions, imports, calls and
    language-specific evidence (extraction schema 98). Handles Java records, compact
-   constructors, enum constants, Kotlin expression-recovery, and CommonJS exports.
-   Parsing and discovery gaps remain visible.
+   constructors, enum constants, Kotlin expression-recovery, Svelte template text
+   `&`/`>` repair, and CommonJS exports. Parsing and discovery gaps remain visible.
 2. `devmap-resolve` resolves symbols and relationships, preserving ambiguity and
    unresolved sites rather than upgrading a name match into certainty. Supports
    Java record constructor collapse, implicit `java.lang.*` resolution, TypeScript
-   barrel re-export traversal, Go build-constraint variant sets, and literal constant
-   call protection. When ambiguity limits are reached, candidate lists degrade
-   gracefully (marking exported maps partial) rather than aborting the build.
+   barrel re-export traversal and unique interface factory return types, Rust
+   same-file typed receivers and builder-chain propagation, Go build-constraint
+   variant sets, and literal constant call protection. When ambiguity limits are
+   reached, candidate lists degrade gracefully (marking exported maps partial)
+   rather than aborting the build.
 3. `devmap-analyze` computes graph analysis, reachability, and liveness candidates.
 4. `devmap-store` owns persistence (schema 29, reader floor 29) with zstd
-   level-1 compressed extraction documents (`extraction_json`, `entry_wiring_json`),
+   level-1 compressed extraction documents (`extraction_json`, `entry_wiring_json`,
+   `extraction_cache`, and `symbol_details` payloads), multi-row batched SQLite
+   inserts (`FTS_50_SQL`, `UNRESOLVED_64_SQL`), keyed semi-join ledger reads,
    payload validity ranges, payload-digest identity, and pre-write search index
-   integrity checks; `devmap-query` reads and composes results.
+   integrity checks; `devmap-query` reads and composes results with bounded
+   unresolved-namesake site lists (`sites_omitted`) and file-hit prefix reads.
 5. `devmap-serve` watches and updates state; `devmap-cli` exposes CLI/MCP (21 tools) and
    integration surfaces.
 

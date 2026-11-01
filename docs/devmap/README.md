@@ -70,7 +70,7 @@ flowchart TD
     end
 
     subgraph Storage["4. Canonical Store (devmap-store)"]
-        SQLiteStore[("devmap.sqlite<br/>(Schema 27: Nodes, Edges, Evidence, Gaps)")]
+        SQLiteStore[("devmap.sqlite<br/>(Schema 29: Compressed Payloads, Nodes, Edges, Evidence, Gaps)")]
         ManifestExports["Artifact Exports<br/>(repo_map.json, code_graph.json, AGENTS.md)"]
     end
 
