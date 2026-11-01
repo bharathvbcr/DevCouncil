@@ -8,6 +8,7 @@ use std::time::Duration;
 const FORCE_RETRY: ParseBudgets = ParseBudgets {
     first_pass: Duration::ZERO,
     retry: Duration::from_secs(60),
+    retry_total: Duration::from_secs(600),
 };
 
 const NOTEBOOK: &str = r#"{"cells":[{"cell_type":"code","metadata":{},"source":["def a():\n","    return 1\n"],"outputs":[],"execution_count":null}],"metadata":{"kernelspec":{"language":"python","name":"python3"}},"nbformat":4,"nbformat_minor":5}"#;

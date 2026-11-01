@@ -1,9 +1,6 @@
 //! Adversarial probes for the build-chain cancellation (ft-fb394194).
 
-use devmap_extract::{
-    extract_file_with_budget, retry_budget_refusals_observing, treesitter::MAX_BUDGET_RETRIES,
-    FileRef, ParseBudgets,
-};
+use devmap_extract::{extract_file_with_budget, retry_budget_refusals_observing, FileRef, ParseBudgets};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -11,6 +8,7 @@ const PY: &str = "def alpha():\n    return 1\n";
 const BOTH_ZERO: ParseBudgets = ParseBudgets {
     first_pass: Duration::ZERO,
     retry: Duration::ZERO,
+    retry_total: Duration::from_secs(600),
 };
 
 fn xorshift(state: &mut u64) -> u64 {
@@ -68,44 +66,48 @@ fn cancelled_is_a_subset_of_not_retried_for_every_trip_point() {
             report.first_pass_refused,
             "n={n} trip={trip}"
         );
-        assert!(report.retried <= MAX_BUDGET_RETRIES);
+        assert!(report.retried <= n);
     }
 }
 
-/// A cancel that lands after the last file the retry could ever have re-run
-/// stops nothing: the remaining refusals are cap-refused whether or not the
-/// flag is set. Counting them as `cancelled` discards a finished build (the
-/// store-level contract says "a cancel after the last file is a complete
-/// build").
+/// A cancel that lands after the retry phase's deadline stops nothing: the
+/// remaining refusals are deadline-refused whether or not the flag is set.
+/// Counting them as `cancelled` discards a finished build (the store-level
+/// contract says "a cancel after the last file is a complete build").
+///
+/// The deadline is passed deterministically: the first file's callback sleeps
+/// past it and then trips the flag, so every later file sees both.
 #[test]
-fn a_cancel_after_the_last_retryable_file_does_not_cancel_cap_refused_files() {
-    let n = MAX_BUDGET_RETRIES + 3;
+fn a_cancel_after_the_retry_deadline_does_not_cancel_deadline_refused_files() {
+    let n = 6;
+    let budgets = ParseBudgets {
+        retry_total: Duration::from_millis(500),
+        ..BOTH_ZERO
+    };
     let paths: Vec<String> = (0..n).map(|i| format!("f{i}.py")).collect();
     let files = refs(&paths);
     let mut out = refused(&paths);
     let cancel = AtomicBool::new(false);
-    let mut seen = 0usize;
     let report = retry_budget_refusals_observing(
         &files,
         &mut out,
         None,
-        BOTH_ZERO,
+        budgets,
         Some(&cancel),
         &mut |_| {
-            seen += 1;
-            if seen == MAX_BUDGET_RETRIES {
-                cancel.store(true, Ordering::SeqCst);
-            }
+            std::thread::sleep(Duration::from_millis(700));
+            cancel.store(true, Ordering::SeqCst);
         },
     );
-    assert_eq!(report.retried, MAX_BUDGET_RETRIES);
+    assert_eq!(report.retried, 1, "{report:?}");
     assert_eq!(
-        report.cancelled,
-        0,
-        "all {MAX_BUDGET_RETRIES} retry slots were used before the cancel; the {} remaining \
-         refusals were never going to be retried, yet the report calls them cancelled: {report:?}",
-        n - MAX_BUDGET_RETRIES
+        report.cancelled, 0,
+        "the deadline passed before the cancel; the {} remaining refusals were never going to \
+         be retried, yet the report calls them cancelled: {report:?}",
+        n - 1
     );
+    assert_eq!(report.not_retried, n - 1);
+    assert!(!report.was_cancelled());
 }
 
 /// A flag set before the call does no work at all.
