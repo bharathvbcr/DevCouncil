@@ -1950,17 +1950,16 @@ impl Store {
             // in once and only genuinely new texts are inserted. On this
             // repository that is 46,978 rows read and, on an incremental build,
             // a handful written.
-            let mut text_ids: std::collections::HashMap<std::rc::Rc<str>, i64> = {
-                let mut stmt = tx.prepare("SELECT id, text FROM unresolved_texts")?;
-                let mut rows = stmt.query([])?;
-                let mut pool = std::collections::HashMap::new();
-                while let Some(row) = rows.next()? {
-                    let id: i64 = row.get(0)?;
-                    let text: String = row.get(1)?;
-                    pool.insert(std::rc::Rc::from(text.as_str()), id);
-                }
-                pool
-            };
+            //
+            // The pool is streamed against the slot map built below, and is
+            // not first copied into a map of its own. It used to be: every
+            // pool row became an owned `String`, an `Rc<str>` and a hash
+            // entry, 140,380 of them on the GitPulse corpus, to answer a
+            // question the slot map can answer from the borrowed row text.
+            // Measured on that corpus (N=5, interleaved, same-binary noise
+            // arm) the second map cost an incremental `unresolved` span of
+            // 0.82 s min against 0.61 s streamed, with the noise arm at
+            // 0.75 s, and 1.14 s against 0.89 s of `persist:write`.
 
             // Per-row ids, in `resolution.unresolved` order.
             //
@@ -1981,8 +1980,13 @@ impl Store {
             //
             // `Rc<str>` so a distinct text is stored once and the map's key is a
             // refcount bump rather than a second copy.
+            //
+            // Sized at a quarter of the rows as a hint only (140,380 distinct
+            // texts over 605,844 rows on the GitPulse corpus), so the map does
+            // not rehash its way up from empty; a corpus with more distinct
+            // texts than that still grows normally.
             let mut slot_of_text: std::collections::HashMap<std::rc::Rc<str>, u32> =
-                std::collections::HashMap::new();
+                std::collections::HashMap::with_capacity(resolution.unresolved.len() / 4);
             let mut slot_text: Vec<std::rc::Rc<str>> = Vec::new();
             let mut reason_slots: Vec<u32> = Vec::with_capacity(resolution.unresolved.len());
             let mut class_slots: Vec<u32> = Vec::with_capacity(resolution.unresolved.len());
@@ -2072,11 +2076,25 @@ impl Store {
                 }
             }
 
-            // The slots the pool does not hold yet, inserted in sorted order.
-            let mut slot_ids: Vec<i64> = vec![0; slot_text.len()];
+            // The persisted pool answers for every slot it already holds; the
+            // rest are inserted in sorted order. No `unresolved_texts` row is
+            // written between the slotting above and this point, so reading the
+            // pool here sees what it saw when it was read first.
+            const UNASSIGNED: i64 = i64::MIN;
+            let mut slot_ids: Vec<i64> = vec![UNASSIGNED; slot_text.len()];
+            {
+                let mut stmt = tx.prepare("SELECT id, text FROM unresolved_texts")?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    let text = row.get_ref(1)?.as_str()?;
+                    if let Some(slot) = slot_of_text.get(text) {
+                        slot_ids[*slot as usize] = row.get(0)?;
+                    }
+                }
+            }
             {
                 let mut fresh: Vec<u32> = (0..slot_text.len() as u32)
-                    .filter(|slot| !text_ids.contains_key(&slot_text[*slot as usize]))
+                    .filter(|slot| slot_ids[*slot as usize] == UNASSIGNED)
                     .collect();
                 fresh.sort_unstable_by(|left, right| {
                     slot_text[*left as usize].cmp(&slot_text[*right as usize])
@@ -2084,15 +2102,14 @@ impl Store {
                 let mut insert =
                     tx.prepare_cached("INSERT INTO unresolved_texts (text) VALUES (?1)")?;
                 for slot in fresh {
-                    let text = std::rc::Rc::clone(&slot_text[slot as usize]);
-                    insert.execute(params![text.as_ref()])?;
-                    text_ids.insert(text, tx.last_insert_rowid());
+                    insert.execute(params![slot_text[slot as usize].as_ref()])?;
+                    slot_ids[slot as usize] = tx.last_insert_rowid();
                 }
             }
-            for (slot, text) in slot_text.iter().enumerate() {
-                slot_ids[slot] = *text_ids.get(text).ok_or_else(|| {
-                    refusal("an interned ledger text has no id after its own insert")
-                })?;
+            if slot_ids.contains(&UNASSIGNED) {
+                return Err(refusal(
+                    "an interned ledger text has no id after its own insert",
+                ));
             }
             let reason_ids: Vec<i64> = reason_slots
                 .iter()
