@@ -2438,3 +2438,8 @@ mod delta_bucket_tests;
 #[cfg(feature = "parse")]
 #[path = "db/tests/payload_serialization_tests.rs"]
 mod payload_serialization_tests;
+
+#[cfg(test)]
+#[cfg(feature = "parse")]
+#[path = "db/tests/ledger_read_plan_tests.rs"]
+mod ledger_read_plan_tests;
