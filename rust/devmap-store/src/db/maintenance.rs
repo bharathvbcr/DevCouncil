@@ -700,7 +700,7 @@ impl Store {
             "DELETE FROM edge_rows WHERE valid_to IS NOT NULL AND valid_to <= ?1",
             params![cutoff],
         )?;
-        tx.execute(
+        let ledger_rows_deleted = tx.execute(
             "DELETE FROM unresolved_rows WHERE valid_to IS NOT NULL AND valid_to <= ?1",
             params![cutoff],
         )?;
@@ -776,12 +776,24 @@ impl Store {
         // no NULL trap.
         //
         // After the deletes above, so the rows whose texts this is deciding
-        // about are already gone.
-        let texts_retired = tx.execute(
-            "DELETE FROM unresolved_texts WHERE id NOT IN (SELECT reason_id FROM unresolved_rows)
-                AND id NOT IN (SELECT classification_id FROM unresolved_rows)",
-            [],
-        )?;
+        // about are already gone, and only when one of them was deleted: a text
+        // becomes unreferenced only when a row naming it goes (`reason_id` and
+        // `classification_id` are written once, at insert, and never updated in
+        // place), so a prune that deleted no ledger row has nothing to retire
+        // here and does not pay for two scans of the ledger to learn that. A
+        // text interned by a write whose row was then deduplicated waits for the
+        // next prune that does delete ledger rows, which bounds it; the early
+        // return above already gives a prune that drops no generation the same
+        // contract.
+        let texts_retired = if ledger_rows_deleted > 0 {
+            tx.execute(
+                "DELETE FROM unresolved_texts WHERE id NOT IN (SELECT reason_id FROM unresolved_rows)
+                    AND id NOT IN (SELECT classification_id FROM unresolved_rows)",
+                [],
+            )?
+        } else {
+            0
+        };
 
         // Foreign keys are off, so nothing has refused a retirement that left a
         // row pointing at what it deleted: ask, once, before committing. Only
