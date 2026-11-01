@@ -2303,8 +2303,11 @@ impl Store {
             //                                         same binary again 3.762 / 3.896 s
             //                                         single-row   2.574 / 2.894 s
             //
-            // Single-row was faster in 5 of 5 paired reps, by 23-38%, against
-            // a 1% gap between the two chunked arms; whole cold
+            // Single-row was faster than chunked in 5 of 5 paired reps, by
+            // 23-38% (ratios 0.77 0.69 0.70 0.70 0.62). The noise floor is the
+            // two chunked arms against each other: 1% apart on the minimum,
+            // and up to 17% apart in a single paired rep (0.83-1.03), so the
+            // worst single-row rep still beats the best noise rep. Whole cold
             // `persist:write` min was 4.94 s against 6.50 s and 6.44 s. The
             // mechanism is inferred, not measured: a 64-row statement binds
             // 448 parameters through a `Vec<&dyn ToSql>` and an intermediate
