@@ -114,7 +114,7 @@ fn time_spent_waiting_for_the_writer_lock_is_not_build_time() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    std::thread::sleep(Duration::from_millis(2500));
+    std::thread::sleep(Duration::from_millis(4000));
     drop(guard);
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -123,7 +123,7 @@ fn time_spent_waiting_for_the_writer_lock_is_not_build_time() {
     let stages = build["timings"]["stages"].as_array().unwrap();
     let waited = stage_seconds(stages, "writer:wait").expect("writer:wait is a timed stage");
     let total = build["timings"]["total_seconds"].as_f64().unwrap();
-    assert!(waited >= 2.0, "precondition: the build queued {waited:.2} s");
+    assert!(waited >= 2.5, "precondition: the build queued {waited:.2} s");
 
     let build_ms = newest_build_ms(&root, &db) as f64;
     println!(
@@ -143,15 +143,15 @@ fn time_spent_waiting_for_the_writer_lock_is_not_build_time() {
 fn build_ms_covers_the_commit_the_prunes_and_the_vacuum() {
     // Enough content, over enough generations, that the commit and the prunes
     // are measurable.
-    let (root, db) = fixture("end", 400);
+    let (root, db) = fixture("end", 1500);
     run_build(&root, &db);
     for revision in 1..=3 {
-        for index in 0..40 {
+        for index in 0..150 {
             write_module(&root, index, revision);
         }
         run_build(&root, &db);
     }
-    for index in 0..40 {
+    for index in 0..150 {
         write_module(&root, index, 9);
     }
     let build = run_build(&root, &db);
@@ -199,7 +199,7 @@ fn build_ms_covers_the_commit_the_prunes_and_the_vacuum() {
         build_ms - through_vacuum * 1000.0
     );
     assert!(
-        build_ms >= through_vacuum * 1000.0 - 20.0,
+        build_ms >= through_vacuum * 1000.0 - 10.0,
         "build_ms {build_ms:.0} stops before the end of the vacuum ({:.0} ms), missing the \
          {:.0} ms the commit, prunes and vacuum took",
         through_vacuum * 1000.0,
