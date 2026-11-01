@@ -1974,7 +1974,11 @@ impl Store {
             // in once and only genuinely new texts are inserted. On this
             // repository that is 46,978 rows read and, on an incremental build,
             // a handful written.
-            let mut text_ids: std::collections::HashMap<std::rc::Rc<str>, i64> = {
+            let ab_pool = std::env::var_os("DEVMAP_AB_POOL").is_some();
+            let ab_single = std::env::var_os("DEVMAP_AB_SINGLE").is_some();
+            let mut text_ids: std::collections::HashMap<std::rc::Rc<str>, i64> = if ab_pool {
+                std::collections::HashMap::new()
+            } else {
                 let mut stmt = tx.prepare("SELECT id, text FROM unresolved_texts")?;
                 let mut rows = stmt.query([])?;
                 let mut pool = std::collections::HashMap::new();
@@ -2005,8 +2009,11 @@ impl Store {
             //
             // `Rc<str>` so a distinct text is stored once and the map's key is a
             // refcount bump rather than a second copy.
-            let mut slot_of_text: std::collections::HashMap<std::rc::Rc<str>, u32> =
-                std::collections::HashMap::new();
+            let mut slot_of_text: std::collections::HashMap<std::rc::Rc<str>, u32> = if ab_pool {
+                std::collections::HashMap::with_capacity(resolution.unresolved.len() / 4)
+            } else {
+                std::collections::HashMap::new()
+            };
             let mut slot_text: Vec<std::rc::Rc<str>> = Vec::new();
             let mut reason_slots: Vec<u32> = Vec::with_capacity(resolution.unresolved.len());
             let mut class_slots: Vec<u32> = Vec::with_capacity(resolution.unresolved.len());
@@ -2097,10 +2104,27 @@ impl Store {
             }
 
             // The slots the pool does not hold yet, inserted in sorted order.
-            let mut slot_ids: Vec<i64> = vec![0; slot_text.len()];
+            let mut slot_ids: Vec<i64> = vec![i64::MIN; slot_text.len()];
+            if ab_pool {
+                let mut stmt = tx.prepare("SELECT id, text FROM unresolved_texts")?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    let id: i64 = row.get(0)?;
+                    let text = row.get_ref(1)?.as_str()?;
+                    if let Some(slot) = slot_of_text.get(text) {
+                        slot_ids[*slot as usize] = id;
+                    }
+                }
+            }
             {
                 let mut fresh: Vec<u32> = (0..slot_text.len() as u32)
-                    .filter(|slot| !text_ids.contains_key(&slot_text[*slot as usize]))
+                    .filter(|slot| {
+                        if ab_pool {
+                            slot_ids[*slot as usize] == i64::MIN
+                        } else {
+                            !text_ids.contains_key(&slot_text[*slot as usize])
+                        }
+                    })
                     .collect();
                 fresh.sort_unstable_by(|left, right| {
                     slot_text[*left as usize].cmp(&slot_text[*right as usize])
@@ -2110,13 +2134,23 @@ impl Store {
                 for slot in fresh {
                     let text = std::rc::Rc::clone(&slot_text[slot as usize]);
                     insert.execute(params![text.as_ref()])?;
-                    text_ids.insert(text, tx.last_insert_rowid());
+                    if ab_pool {
+                        slot_ids[slot as usize] = tx.last_insert_rowid();
+                    } else {
+                        text_ids.insert(text, tx.last_insert_rowid());
+                    }
                 }
             }
-            for (slot, text) in slot_text.iter().enumerate() {
-                slot_ids[slot] = *text_ids.get(text).ok_or_else(|| {
-                    refusal("an interned ledger text has no id after its own insert")
-                })?;
+            if ab_pool {
+                if slot_ids.iter().any(|id| *id == i64::MIN) {
+                    return Err(refusal("an interned ledger text has no id after its own insert"));
+                }
+            } else {
+                for (slot, text) in slot_text.iter().enumerate() {
+                    slot_ids[slot] = *text_ids.get(text).ok_or_else(|| {
+                        refusal("an interned ledger text has no id after its own insert")
+                    })?;
+                }
             }
             let reason_ids: Vec<i64> = reason_slots
                 .iter()
@@ -2306,7 +2340,7 @@ impl Store {
                     continue;
                 }
                 chunk.push(index);
-                if chunk.len() == UNRESOLVED_CHUNK_SIZE {
+                if chunk.len() == UNRESOLVED_CHUNK_SIZE && !ab_single {
                     let tuples: Vec<UnresolvedTuple<'_>> =
                         chunk.iter().map(|&idx| unresolved_tuple(idx)).collect();
                     let mut params_vec: Vec<&dyn ToSql> =
