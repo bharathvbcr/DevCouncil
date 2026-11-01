@@ -737,15 +737,25 @@ impl Store {
         // renames grow this table forever, and PathRanks reads and sorts the
         // entire history on every edge load. Keep this inside the same
         // transaction so a failed retirement also rolls back the prune.
+        //
+        // One `NOT IN` per relation, ANDed, not one over a `UNION` of them: the
+        // union makes SQLite build and sort a de-duplicated temp b-tree of every
+        // id in every relation before it can answer the first membership test,
+        // where separate tests each probe an ephemeral index that is filled the
+        // first time it is consulted, so a path the earlier tests already keep
+        // never reaches the later ones. `file_payloads` goes first because
+        // nearly every live path is named there. Every column is `NOT NULL`
+        // (`file_id` and the edge endpoints by their declarations, the ledger's
+        // `source_file_id` by v22's), so `NOT IN` has no NULL trap. The lazy
+        // filling is planner behaviour the A/B in `benchmarks/` measures; the
+        // plan can only show that the sort is gone.
         let paths_retired = tx.execute(
-            "DELETE FROM paths WHERE id NOT IN (
-                SELECT file_id FROM file_payloads
-                UNION SELECT file_id FROM file_rows
-                UNION SELECT file_id FROM digest_rows
-                UNION SELECT source_file_id FROM edge_rows
-                UNION SELECT target_file_id FROM edge_rows
-                UNION SELECT source_file_id FROM unresolved_rows
-             )",
+            "DELETE FROM paths WHERE id NOT IN (SELECT file_id FROM file_payloads)
+                AND id NOT IN (SELECT file_id FROM file_rows)
+                AND id NOT IN (SELECT file_id FROM digest_rows)
+                AND id NOT IN (SELECT source_file_id FROM edge_rows)
+                AND id NOT IN (SELECT target_file_id FROM edge_rows)
+                AND id NOT IN (SELECT source_file_id FROM unresolved_rows)",
             [],
         )?;
 
@@ -757,19 +767,19 @@ impl Store {
         //
         // `NOT IN` over the two id columns, not a probe per candidate: SQLite
         // materialises each subquery once, so this is two scans of
-        // `unresolved_rows` and one of the pool. A probe per candidate is what
-        // the foreign keys would have made of it with the constraint on: an
-        // index on `reason_id` would answer it, at exactly the per-row write
-        // amplification v21 removed, to serve a statement that runs once a
-        // prune. That is why foreign keys are off for this transaction instead.
+        // `unresolved_rows` and one of the pool, and no sort of their union. A
+        // probe per candidate is what the foreign keys would have made of it
+        // with the constraint on: an index on `reason_id` would answer it, at
+        // exactly the per-row write amplification v21 removed, to serve a
+        // statement that runs once a prune. That is why foreign keys are off for
+        // this transaction instead. Both columns are `NOT NULL`, so `NOT IN` has
+        // no NULL trap.
         //
         // After the deletes above, so the rows whose texts this is deciding
         // about are already gone.
         let texts_retired = tx.execute(
-            "DELETE FROM unresolved_texts WHERE id NOT IN (
-                SELECT reason_id FROM unresolved_rows
-                UNION SELECT classification_id FROM unresolved_rows
-             )",
+            "DELETE FROM unresolved_texts WHERE id NOT IN (SELECT reason_id FROM unresolved_rows)
+                AND id NOT IN (SELECT classification_id FROM unresolved_rows)",
             [],
         )?;
 
