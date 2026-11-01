@@ -156,6 +156,8 @@ mod sql_check_constraint_parse;
 #[cfg(feature = "parse")]
 mod stress_hardening;
 #[cfg(feature = "parse")]
+mod svelte_template_text;
+#[cfg(feature = "parse")]
 mod swift_close_attack;
 #[cfg(feature = "parse")]
 mod swift_properties;
