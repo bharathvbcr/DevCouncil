@@ -16,6 +16,7 @@ import (
 type Result struct {
 	OK               bool     `json:"ok"`
 	Allow            bool     `json:"allow"`
+	StopDecision     string   `json:"stop_decision,omitempty"`
 	Reason           string   `json:"reason"`
 	TaskID           string   `json:"task_id,omitempty"`
 	Status           string   `json:"status,omitempty"`
@@ -77,13 +78,13 @@ func Run(ctx context.Context, in Input) Outcome {
 			reason = "stop gate skipped by host"
 		}
 		return Outcome{Decision: Result{
-			OK: true, Allow: false, Skipped: true, SkipReason: reason,
+			OK: true, Allow: false, StopDecision: "CONTINUE", Skipped: true, SkipReason: reason,
 			TaskID: in.TaskID, Reason: reason, VerifiedAt: now,
 		}}
 	}
 	if in.Store == nil {
 		return Outcome{Decision: Result{
-			OK: false, Allow: false, Skipped: true,
+			OK: false, Allow: false, StopDecision: "CONTINUE", Skipped: true,
 			SkipReason: "DevCouncil store unavailable",
 			TaskID:     in.TaskID, Reason: "DevCouncil store unavailable",
 			VerifiedAt: now,
@@ -91,7 +92,7 @@ func Run(ctx context.Context, in Input) Outcome {
 	}
 	if in.TaskID == "" {
 		return Outcome{Decision: Result{
-			OK: false, Allow: false, Skipped: true,
+			OK: false, Allow: false, StopDecision: "CONTINUE", Skipped: true,
 			SkipReason: "no task_id", Reason: "no task_id", VerifiedAt: now,
 		}}
 	}
@@ -106,7 +107,7 @@ func Run(ctx context.Context, in Input) Outcome {
 	}, in.Sandbox, in.CoveragePath)
 	if err != nil {
 		return Outcome{Decision: Result{
-			OK: false, Allow: false, Skipped: true,
+			OK: false, Allow: false, StopDecision: "CONTINUE", Skipped: true,
 			SkipReason: "verify could not run: " + err.Error(),
 			TaskID:     in.TaskID, Reason: err.Error(), VerifiedAt: now,
 		}}
@@ -126,12 +127,14 @@ func Run(ctx context.Context, in Input) Outcome {
 		allow = true
 	}
 	reason := "verified"
-	if !mcp.Passed {
+	stopDecision := "TERMINATE"
+	if !allow {
 		reason = "blocked by verification"
+		stopDecision = "CONTINUE"
 	}
 	return Outcome{
 		Decision: Result{
-			OK: true, Allow: allow, Reason: reason, TaskID: in.TaskID,
+			OK: true, Allow: allow, StopDecision: stopDecision, Reason: reason, TaskID: in.TaskID,
 			Status: mcp.Status, BlockingGapCount: blocking,
 			VerifiedAt: now, NextActions: actions,
 		},
