@@ -118,6 +118,23 @@ fn target_word(target: &Target) -> String {
     }
 }
 
+/// The reader-latency line: N, min, median, p95, max in milliseconds. The
+/// p95 obeys the same [`MIN_FOR_P95`] rule as the build line: under it the p95
+/// is just the maximum, and printing it as a p95 would claim a percentile no
+/// sample set that small has. `None` for no samples.
+pub fn latency_line(values_ms: &[u64]) -> Option<String> {
+    let s = summarize(values_ms)?;
+    let p95 = if s.n < MIN_FOR_P95 {
+        format!("p95 not established (N={})", s.n)
+    } else {
+        format!("p95 {} ms", s.p95)
+    };
+    Some(format!(
+        "reader query latency: N={} min {} ms median {} ms {p95} max {} ms",
+        s.n, s.min, s.median, s.max
+    ))
+}
+
 /// The one-file incremental build line: N, min, median, p95, max in
 /// milliseconds, the target, and whether it is met.
 pub fn build_line(label: &str, values_ms: &[u64]) -> String {
@@ -194,6 +211,20 @@ mod tests {
         assert_eq!((s.min, s.median, s.max), (1, 2, 4));
         assert_eq!(summarize(&[7]).unwrap().p95, 7);
         assert_eq!(summarize(&[]), None);
+    }
+
+    #[test]
+    fn a_reader_latency_p95_follows_the_same_minimum_as_the_build_p95() {
+        let few: Vec<u64> = (1..=19).collect();
+        let line = latency_line(&few).expect("a line");
+        assert!(line.contains("p95 not established (N=19)"), "{line}");
+        assert!(!line.contains("p95 19"), "{line}");
+        assert!(line.contains("N=19 min 1 ms median 10 ms"), "{line}");
+        let twenty: Vec<u64> = (1..=20).collect();
+        let line = latency_line(&twenty).expect("a line");
+        assert!(line.contains("p95 19 "), "{line}");
+        assert!(!line.contains("not established"), "{line}");
+        assert_eq!(latency_line(&[]), None);
     }
 
     #[test]

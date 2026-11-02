@@ -949,12 +949,8 @@ mod soak {
             sum(|r| r.other),
             sum(|r| r.overlapped)
         );
-        if let Some(s) = stats::summarize(&latencies) {
-            let _ = writeln!(
-                out,
-                "reader query latency ms: N={} min {} median {} p95 {} max {}",
-                s.n, s.min, s.median, s.p95, s.max
-            );
+        if let Some(line) = stats::latency_line(&latencies) {
+            let _ = writeln!(out, "{line}");
         }
         let _ = writeln!(
             out,
