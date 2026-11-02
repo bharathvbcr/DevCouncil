@@ -824,7 +824,8 @@ pub struct ParseBudgets {
     pub retry: std::time::Duration,
     /// How long the serial retry phase may run, from its first file; see
     /// [`treesitter::RETRY_PHASE_DEADLINE`]. Files still waiting when it has
-    /// elapsed stay refused and are counted as `not_retried`.
+    /// elapsed stay refused and are counted as `not_retried`; a file running
+    /// when it elapses is cut short, its budget capped at the time left.
     pub retry_total: std::time::Duration,
 }
 
@@ -957,7 +958,11 @@ pub fn extract_all_with_budgets(
 /// one file per core, and under machine load a legitimate large file's wall
 /// time stretches past the budget. Alone, it does not. Files are retried until
 /// `budgets.retry_total` has elapsed since the first one; the rest stay
-/// refused and are counted as `not_retried`. `cancel` is checked before each.
+/// refused and are counted as `not_retried`. A file that starts with less than
+/// `budgets.retry` of that time left gets only what is left, so the phase ends
+/// at `retry_total` plus the budget's check granularity, never plus a whole
+/// `retry`; one cut short that way is counted as retried and, being refused
+/// again, as still refused. `cancel` is checked before each.
 /// Only budget refusals are retried: a grammar fault, a depth
 /// refusal or a malformed notebook fails the same way at any budget, and is
 /// left exactly as the first pass reported it.
@@ -996,7 +1001,8 @@ pub fn retry_budget_refusals_observing(
         // The deadline is decided first: a file past it was never going to be
         // retried, so a cancel arriving after it passed must not turn it into
         // a cancelled file and discard a finished build.
-        let verdict = if phase_started.elapsed() >= budgets.retry_total {
+        let remaining = budgets.retry_total.saturating_sub(phase_started.elapsed());
+        let verdict = if remaining.is_zero() {
             report.not_retried += 1;
             format!(
                 "; not retried: the serial retry phase passed its {:?} deadline",
@@ -1010,15 +1016,28 @@ pub fn retry_budget_refusals_observing(
         } else {
             report.retried += 1;
             let file = &files[index];
-            extractions[index] = extract_file_with_budget(file.path, file.source, budgets.retry);
+            // The deadline bounds the phase, not only the gap between files: a
+            // file that starts with time left gets no more than that time, so
+            // the phase ends at `retry_total` plus the budget's check
+            // granularity rather than plus a whole `retry`.
+            let budget = budgets.retry.min(remaining);
+            extractions[index] = extract_file_with_budget(file.path, file.source, budget);
             after_retry(index);
             if !extractions[index].is_budget_refusal() {
                 report.recovered += 1;
             }
-            format!(
-                "; refused again by the serial retry at the {:?} budget",
-                budgets.retry
-            )
+            if budget < budgets.retry {
+                format!(
+                    "; refused again by the serial retry: cut short at the {budget:?} left of \
+                     its {:?} phase deadline, under a {:?} retry budget",
+                    budgets.retry_total, budgets.retry
+                )
+            } else {
+                format!(
+                    "; refused again by the serial retry at the {:?} budget",
+                    budgets.retry
+                )
+            }
         };
         if extractions[index].is_budget_refusal() {
             if let model::ParseOutcome::Failed { reason } = &mut extractions[index].parse_outcome {
