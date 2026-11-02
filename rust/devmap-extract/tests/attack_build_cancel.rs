@@ -1,6 +1,8 @@
 //! Adversarial probes for the build-chain cancellation (ft-fb394194).
 
-use devmap_extract::{extract_file_with_budget, retry_budget_refusals_observing, FileRef, ParseBudgets};
+use devmap_extract::{
+    extract_file_with_budget, retry_budget_refusals_observing, FileRef, ParseBudgets,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -66,7 +68,16 @@ fn cancelled_is_a_subset_of_not_retried_for_every_trip_point() {
             report.first_pass_refused,
             "n={n} trip={trip}"
         );
-        assert!(report.retried <= n);
+        // The scenario fixes every count. All `n` files are refused by the
+        // first pass and again by the zero retry budget, and the 600 s deadline
+        // never passes, so the only thing that stops the retry is the flag,
+        // seen before the file after the `trip`-th. A trip at `n` (or never,
+        // for trip 0 or past `n`) leaves nothing to cancel.
+        let retried = if (1..n).contains(&trip) { trip } else { n };
+        assert_eq!(report.first_pass_refused, n, "n={n} trip={trip}");
+        assert_eq!(report.retried, retried, "n={n} trip={trip}");
+        assert_eq!(report.cancelled, n - retried, "n={n} trip={trip}");
+        assert_eq!(report.still_refused_total, n, "n={n} trip={trip}");
     }
 }
 
@@ -101,7 +112,8 @@ fn a_cancel_after_the_retry_deadline_does_not_cancel_deadline_refused_files() {
     );
     assert_eq!(report.retried, 1, "{report:?}");
     assert_eq!(
-        report.cancelled, 0,
+        report.cancelled,
+        0,
         "the deadline passed before the cancel; the {} remaining refusals were never going to \
          be retried, yet the report calls them cancelled: {report:?}",
         n - 1
