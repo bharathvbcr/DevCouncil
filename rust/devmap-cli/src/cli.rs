@@ -578,9 +578,11 @@ pub(crate) enum Commands {
     Paths(commands::paths::Args),
     /// Longitudinal view: how the map has moved across recent builds.
     ///
-    /// `build_ms` is the time a build held the store's writer lock, from
-    /// acquiring it to the end of the vacuum, on both the CLI and the daemon.
-    /// Rows written by older builds differ: they stop before the commit, the
+    /// `build_ms` is the time a build held the store's writer lock. A CLI
+    /// build counts from acquiring the lock to the end of the vacuum. A daemon
+    /// resync counts from just after it takes the lock and claims its batch to
+    /// the end of the extraction prune; the daemon leaves vacuuming to its
+    /// maintenance loop. Rows written by older builds differ: they stop before the commit, the
     /// prunes and the vacuum, and a CLI build's row also counts the time it
     /// waited for the lock. Compare `build_ms` only within one era.
     History(commands::history::Args),
