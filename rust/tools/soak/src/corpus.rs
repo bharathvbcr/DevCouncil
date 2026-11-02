@@ -12,7 +12,27 @@ pub struct Corpus {
     /// kernel reports symbols at.
     pub relative: String,
     pub orig: PathBuf,
+    /// Why this file: Python, or the TypeScript fallback.
+    pub choice: Choice,
 }
+
+/// How the churn target was found. The TypeScript fallback changes what the
+/// soak measures (a different extractor, a different appended function), so a
+/// run's output says which one it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Choice {
+    /// The first `.py` file in name order.
+    Python,
+    /// No `.py` file exists, so the first `.ts` file.
+    TypeScriptFallback,
+}
+
+/// Directories that hold dependencies, build output or version control
+/// rather than the corpus's own source, at any depth. A target inside one
+/// would be a file the soak rewrites and the build does not index (or one a
+/// dependency install would overwrite), so the cycle's symbol would never be
+/// found.
+const SKIPPED_DIRS: [&str; 4] = ["node_modules", "target", "dist", ".git"];
 
 /// The first `.py` file under `root`, in name order, outside any dotted
 /// top-level directory; failing that the first `.ts` file (not a `.d.ts`),
@@ -20,9 +40,17 @@ pub struct Corpus {
 /// `.devcouncil` by name: the state directory is whichever one the kernel
 /// picks, and a churn target inside it would be rewritten by the build it is
 /// supposed to perturb. Python wins whenever it exists, so the corpora the
-/// soak has always run on keep their target.
+/// soak has always run on keep their target. Directories named in
+/// [`SKIPPED_DIRS`] are never entered.
 pub fn find_target(root: &Path) -> Option<PathBuf> {
-    walk(root, true, "py").or_else(|| walk(root, true, "ts"))
+    choose_target(root).map(|(path, _)| path)
+}
+
+/// [`find_target`], and which of the two rules picked the file.
+pub fn choose_target(root: &Path) -> Option<(PathBuf, Choice)> {
+    walk(root, true, "py")
+        .map(|path| (path, Choice::Python))
+        .or_else(|| walk(root, true, "ts").map(|path| (path, Choice::TypeScriptFallback)))
 }
 
 fn wanted(path: &Path, extension: &str) -> bool {
@@ -45,6 +73,9 @@ fn walk(dir: &Path, top: bool, extension: &str) -> Option<PathBuf> {
         };
         let path = entry.path();
         if kind.is_dir() {
+            if SKIPPED_DIRS.iter().any(|skipped| name == *skipped) {
+                continue;
+            }
             if let Some(found) = walk(&path, false, extension) {
                 return Some(found);
             }
@@ -58,7 +89,7 @@ fn walk(dir: &Path, top: bool, extension: &str) -> Option<PathBuf> {
 impl Corpus {
     /// Pick the target under `root` and keep a pristine copy beside it.
     pub fn open(root: &Path, tag: u32) -> Result<Self, String> {
-        let target = find_target(root).ok_or("no target file")?;
+        let (target, choice) = choose_target(root).ok_or("no target file")?;
         let relative = target
             .strip_prefix(root)
             .map_err(|_| "the target is outside the corpus".to_string())?
@@ -70,7 +101,18 @@ impl Corpus {
             target,
             relative,
             orig,
+            choice,
         })
+    }
+
+    /// The one output line that names the churn file and the rule that chose
+    /// it.
+    pub fn describe(&self) -> String {
+        let why = match self.choice {
+            Choice::Python => "first .py file in name order",
+            Choice::TypeScriptFallback => "TypeScript fallback: no .py file under the corpus root",
+        };
+        format!("soak churn file: {} ({why})", self.relative)
     }
 
     /// The text appended for cycle `i`: a function the kernel must index, in
@@ -169,6 +211,48 @@ mod tests {
         let both = tree("both", &["a.ts", "z/b.py"]);
         assert_eq!(find_target(&both), Some(both.join("z/b.py")));
         fs::remove_dir_all(&both).expect("cleanup");
+    }
+
+    #[test]
+    fn dependency_and_build_directories_are_never_a_churn_target() {
+        // Only a vendored file exists: no target, rather than a dependency
+        // the soak would rewrite and the build would not index.
+        for dir in [
+            "node_modules",
+            "target",
+            "dist",
+            "pkg/node_modules/x",
+            "a/.git",
+        ] {
+            let root = tree(
+                "vendored",
+                &[&format!("{dir}/v.ts"), &format!("{dir}/v.py")],
+            );
+            assert_eq!(find_target(&root), None, "picked a file under {dir}");
+            fs::remove_dir_all(&root).expect("cleanup");
+        }
+        // A real source file sorts after the vendored one and still wins.
+        let root = tree("beside", &["node_modules/a.ts", "dist/a.ts", "src/z.ts"]);
+        assert_eq!(find_target(&root), Some(root.join("src/z.ts")));
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn the_choice_says_whether_it_was_the_fallback() {
+        let both = tree("why-both", &["a.ts", "z/b.py"]);
+        let corpus = Corpus::open(&both, 21).expect("open");
+        assert_eq!(
+            corpus.describe(),
+            "soak churn file: z/b.py (first .py file in name order)"
+        );
+        fs::remove_dir_all(&both).expect("cleanup");
+        let ts = tree("why-ts", &["src/main.ts"]);
+        let corpus = Corpus::open(&ts, 22).expect("open");
+        assert_eq!(
+            corpus.describe(),
+            "soak churn file: src/main.ts (TypeScript fallback: no .py file under the corpus root)"
+        );
+        fs::remove_dir_all(&ts).expect("cleanup");
     }
 
     #[test]

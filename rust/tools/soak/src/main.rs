@@ -256,6 +256,7 @@ mod soak {
                 return 1;
             }
         };
+        let _ = writeln!(out, "{}", corpus.describe());
         let cleanup = Arc::new(Mutex::new(Cleanup {
             corpus: Some(corpus.clone()),
             ..Cleanup::default()
