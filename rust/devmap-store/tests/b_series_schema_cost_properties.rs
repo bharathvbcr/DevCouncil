@@ -477,3 +477,66 @@ fn b9_no_primary_key_carries_a_column_its_ordinal_already_determines() {
         "B9 must have inspected the ordinal-keyed tables, saw {checked}"
     );
 }
+
+/// The statement text of one method of `maintenance.rs`: from its signature to
+/// the closing brace at the method's own indentation.
+fn method_body<'a>(source: &'a str, signature: &str) -> &'a str {
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("maintenance.rs no longer defines `{signature}`"));
+    let rest = &source[start..];
+    let end = rest
+        .find("\n    }\n")
+        .unwrap_or_else(|| panic!("`{signature}` has no closing brace"));
+    &rest[..end]
+}
+
+/// Retention runs `prune_generations_except_latest` with `foreign_keys` off, so
+/// the order in which `delete_unreferenced_payloads` retires a payload is no
+/// longer enforced by the constraint that used to refuse a wrong one. Pin the
+/// order from the schema instead: every table that declares a foreign key to
+/// `file_payloads` is either `file_rows`, whose absence is the anti-join that
+/// selects the orphans, or a table `delete_payload_rows` clears by `payload_id`
+/// before the payload row goes. A new child of `file_payloads` fails here until
+/// the retirement learns about it.
+#[test]
+fn b10_every_child_of_file_payloads_is_cleared_before_the_payload_row() {
+    let path = scratch_db("b10-payload-children");
+    drop(Store::open(&path).expect("fresh store"));
+    let conn = Connection::open(&path).expect("inspect connection");
+    let children: Vec<String> = conn
+        .prepare(
+            "SELECT DISTINCT m.name FROM sqlite_master m, pragma_foreign_key_list(m.name) f
+              WHERE m.type = 'table' AND f.\"table\" = 'file_payloads'
+              ORDER BY m.name",
+        )
+        .expect("foreign key children")
+        .query_map([], |row| row.get(0))
+        .expect("children")
+        .collect::<Result<_, _>>()
+        .expect("every child reads");
+    for expected in ["file_rows", "payload_literals", "payload_nodes"] {
+        assert!(
+            children.iter().any(|child| child == expected),
+            "the scan found no `{expected}` among {children:?}; it would pass vacuously"
+        );
+    }
+
+    let source = include_str!("../src/db/maintenance.rs");
+    let clears = method_body(source, "pub(super) fn delete_payload_rows");
+    let selects = method_body(source, "pub(super) fn delete_unreferenced_payloads");
+    for child in &children {
+        if child == "file_rows" {
+            assert!(
+                selects.contains("NOT IN (SELECT payload_id FROM file_rows)"),
+                "a payload named by a `file_rows` range must not be selected for deletion"
+            );
+        } else {
+            assert!(
+                clears.contains(&format!("DELETE FROM {child} WHERE payload_id = ?1")),
+                "`{child}` references `file_payloads` but `delete_payload_rows` does not clear \
+                 it; with foreign keys off during the prune its rows would dangle"
+            );
+        }
+    }
+}
