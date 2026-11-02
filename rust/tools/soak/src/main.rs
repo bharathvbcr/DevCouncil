@@ -215,6 +215,11 @@ mod soak {
                 }
             });
             if let Some(code) = code {
+                // First, the measured builds: each leads its own process
+                // group, so the Ctrl-C that reached this process did not
+                // reach them, and one left running would write into the
+                // store while the cleanup below restores the corpus.
+                rss::BUILDS.interrupt();
                 let mut guard = cleanup
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
