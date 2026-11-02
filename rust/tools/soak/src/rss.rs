@@ -134,6 +134,12 @@ impl Builds {
         self.lock().groups.retain(|group| *group != leader);
     }
 
+    /// Whether [`Builds::interrupt`] has run: from then on a failed build is
+    /// the interrupt's doing, not a finding.
+    pub fn is_interrupted(&self) -> bool {
+        self.lock().interrupted
+    }
+
     /// Kill every registered build's process group (the `/usr/bin/time`
     /// wrapper and the build under it) and refuse further builds. Returns how
     /// many groups were signalled.

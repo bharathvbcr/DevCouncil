@@ -46,7 +46,9 @@ mod soak {
     use devmap_soak::query::{admit, Mode, Observation, Transport};
     use devmap_soak::readers::{self, ReaderStats, WriterTally};
     use devmap_soak::samples::{assert_plateau, Sample, Samples};
-    use devmap_soak::{diskio, ipc, rss, stats, store, Cleanup};
+    use devmap_soak::{
+        diskio, ipc, rss, stats, stop_for_interrupt, store, Cleanup, QuietAfterInterrupt,
+    };
 
     struct Config {
         root: PathBuf,
@@ -215,22 +217,23 @@ mod soak {
                 }
             });
             if let Some(code) = code {
-                // First, the measured builds: each leads its own process
-                // group, so the Ctrl-C that reached this process did not
-                // reach them, and one left running would write into the
-                // store while the cleanup below restores the corpus.
-                rss::BUILDS.interrupt();
-                let mut guard = cleanup
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                guard.run(&mut io::stdout());
+                // The measured builds each lead their own process group, so
+                // the Ctrl-C that reached this process did not reach them,
+                // and one left running would write into the store while the
+                // cleanup restores the corpus. They are killed only once this
+                // thread holds the cleanup lock: the kill wakes the main
+                // thread, which must not then win the lock and exit 1.
+                let _held = stop_for_interrupt(&cleanup, &rss::BUILDS, &mut io::stdout());
                 std::process::exit(code);
             }
         });
     }
 
     pub fn run() -> i32 {
-        let mut out = io::stdout();
+        let mut out = QuietAfterInterrupt {
+            inner: io::stdout(),
+            builds: &rss::BUILDS,
+        };
         let cfg = match config() {
             Ok(cfg) => cfg,
             Err(Refusal::Usage(msg)) => {
