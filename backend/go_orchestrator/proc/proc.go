@@ -4,6 +4,8 @@ package proc
 
 import (
 	"context"
+	"os"
+	"os/exec"
 	"time"
 )
 
@@ -43,4 +45,38 @@ func runBounded(ctx context.Context, run func() error, cleanup time.Duration) (e
 		}
 		return nil, true
 	}
+}
+
+// EnforceSubprocessInvariants applies mandatory subprocess isolation invariants:
+// 1. Stdin redirected to /dev/null if nil to prevent hangs waiting for interactive input.
+// 2. Process group isolation with signal escalation cancellation (SIGTERM -> grace -> SIGKILL).
+// 3. Bounded WaitDelay (500ms) for stdio drain threads.
+// 4. Suppression of interactive terminal prompts, added to the inherited
+// environment (a nil cmd.Env is filled from os.Environ first).
+//
+// Like ConfigureGroup, it sets cmd.Cancel, so cmd must come from
+// exec.CommandContext.
+func EnforceSubprocessInvariants(cmd *exec.Cmd) {
+	if cmd.Stdin == nil {
+		if devNull, err := os.Open(os.DevNull); err == nil {
+			cmd.Stdin = devNull
+		}
+	}
+	ConfigureGroup(cmd)
+	if cmd.WaitDelay == 0 {
+		cmd.WaitDelay = 500 * time.Millisecond
+	}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		KillGroupWithEscalation(cmd.Process.Pid, 500*time.Millisecond)
+		return nil
+	}
+	// A nil Env inherits the parent's environment; appending to nil would
+	// replace it with these two variables alone.
+	if cmd.Env == nil {
+		cmd.Env = os.Environ()
+	}
+	cmd.Env = append(cmd.Env, "GIT_TERMINAL_PROMPT=0", "GCM_INTERACTIVE=never")
 }

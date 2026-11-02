@@ -5,6 +5,7 @@ package proc
 import (
 	"os/exec"
 	"syscall"
+	"time"
 )
 
 // ConfigureGroup puts a child in its own process group so a timeout can reach
@@ -65,5 +66,28 @@ func KillGroup(pid int) {
 	if pid <= 0 {
 		return
 	}
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
+}
+
+// KillGroupWithEscalation terminates the process group led by pid using signal escalation:
+// 1. Sends SIGTERM to -pid.
+// 2. Waits up to grace for group members to exit cleanly.
+// 3. If members remain alive after grace, sends SIGKILL to -pid.
+func KillGroupWithEscalation(pid int, grace time.Duration) {
+	if pid <= 0 {
+		return
+	}
+	if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil {
+		return
+	}
+
+	deadline := time.Now().Add(grace)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(-pid, 0); err != nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
 	_ = syscall.Kill(-pid, syscall.SIGKILL)
 }

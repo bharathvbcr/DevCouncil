@@ -2,7 +2,10 @@
 
 package proc
 
-import "os/exec"
+import (
+	"os/exec"
+	"time"
+)
 
 // ConfigureGroup is a no-op where process groups are not available. WaitDelay
 // still bounds the call, so the timeout holds; only the orphaned grandchild
@@ -22,3 +25,5 @@ func ConfigureGroup(cmd *exec.Cmd) {}
 func ConfigureOwnGroup(cmd *exec.Cmd) {}
 
 func KillGroup(pid int) {}
+
+func KillGroupWithEscalation(pid int, grace time.Duration) {}

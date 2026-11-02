@@ -95,3 +95,80 @@ func waitForPIDFile(t *testing.T, path string, bound time.Duration) int {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+func TestEnforceSubprocessInvariants(t *testing.T) {
+	// The helper sets Cancel, which os/exec accepts only on a CommandContext
+	// command (the same contract as ConfigureGroup); both callers build theirs
+	// that way.
+	cmd := exec.CommandContext(t.Context(), "cat")
+	EnforceSubprocessInvariants(cmd)
+
+	if cmd.Stdin == nil {
+		t.Fatal("expected Stdin to be redirected to /dev/null")
+	}
+	if cmd.SysProcAttr == nil || !cmd.SysProcAttr.Setpgid {
+		t.Fatal("expected Setpgid to be true")
+	}
+	if cmd.WaitDelay != 500*time.Millisecond {
+		t.Fatalf("expected WaitDelay 500ms, got %v", cmd.WaitDelay)
+	}
+	if cmd.Cancel == nil {
+		t.Fatal("expected Cancel function to be configured")
+	}
+	hasPromptVar := false
+	for _, env := range cmd.Env {
+		if env == "GIT_TERMINAL_PROMPT=0" {
+			hasPromptVar = true
+			break
+		}
+	}
+	if !hasPromptVar {
+		t.Fatal("expected GIT_TERMINAL_PROMPT=0 in cmd.Env")
+	}
+}
+
+// A nil cmd.Env means "inherit the parent's environment". Appending the
+// prompt-suppression variables to it must not turn that into "only these two".
+func TestEnforceSubprocessInvariantsKeepsTheInheritedEnvironment(t *testing.T) {
+	home := os.Getenv("HOME")
+	if home == "" {
+		t.Skip("the test process has no HOME to inherit")
+	}
+	cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", `printf '%s' "$HOME"`)
+	EnforceSubprocessInvariants(cmd)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if got := string(out); got != home {
+		t.Fatalf("child HOME = %q, want the parent's %q", got, home)
+	}
+	var prompt string
+	for _, kv := range cmd.Env {
+		if strings.HasPrefix(kv, "GIT_TERMINAL_PROMPT=") {
+			prompt = kv
+		}
+	}
+	if prompt != "GIT_TERMINAL_PROMPT=0" {
+		t.Fatalf("last GIT_TERMINAL_PROMPT entry = %q, want GIT_TERMINAL_PROMPT=0", prompt)
+	}
+}
+
+func TestKillGroupWithEscalation(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	ConfigureOwnGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid := cmd.Process.Pid
+	if err := syscall.Kill(pid, 0); err != nil {
+		t.Fatalf("process %d failed to start: %v", pid, err)
+	}
+
+	KillGroupWithEscalation(pid, 200*time.Millisecond)
+	_ = cmd.Wait()
+
+	if err := syscall.Kill(pid, 0); err == nil {
+		t.Fatalf("process %d still alive after escalation", pid)
+	}
+}
