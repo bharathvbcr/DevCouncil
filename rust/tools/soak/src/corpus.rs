@@ -146,7 +146,13 @@ mod tests {
     fn a_corpus_with_no_python_falls_back_to_the_first_typescript_file() {
         let root = tree(
             "ts",
-            &[".x/a.ts", "a/types.d.ts", "a/b.rs", "src/main.ts", "src/z.ts"],
+            &[
+                ".x/a.ts",
+                "a/types.d.ts",
+                "a/b.rs",
+                "src/main.ts",
+                "src/z.ts",
+            ],
         );
         assert_eq!(find_target(&root), Some(root.join("src/main.ts")));
         let corpus = Corpus::open(&root, 11).expect("open");

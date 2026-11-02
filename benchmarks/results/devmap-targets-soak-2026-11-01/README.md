@@ -2,8 +2,8 @@
 
 Harness: `rust/tools/soak` (crate `devmap-soak`), branch `devmap-perf2/targets`, built from
 `claude/devmap-perf-main` 213772a4 plus the soak changes. Corpus: the frozen GitPulse tree
-(52,425 symbols, 3,072 files), copied fresh per run into a private directory. Each log in this
-directory is the soak's own output; each `.csv` is its per-cycle samples
+(52,425 symbols, 3,072 files), copied fresh per run into a private directory. Each `.log.txt` in this
+directory is the soak's own output (renamed from `.log`, which the repository ignores); each `.csv` is its per-cycle samples
 (`cycle,rss_bytes,db_bytes,build_ms,dirty_build_ms,dirty_rss_bytes`).
 
 Targets (spec section 6.6, adopted by the owner): one-file incremental build p95 <= 120 ms;
@@ -58,7 +58,7 @@ query back to back (30 s timeout per query).
   prove zero.
 
 - "0 SQLITE_BUSY" counts errors that reached the caller. The store's 5 s `busy_timeout`
-  (`devmap-store/src/db/open.rs:20`) absorbs a transient BUSY as latency, so the reader
+  (the constant at `devmap-store/src/db.rs:2487`, applied in `db/open.rs`) absorbs a transient BUSY as latency, so the reader
   p95/max above cannot be split between lock waits and CPU contention by this harness.
 - Pooled N is 2 x cycles: a 10-cycle run already prints a pooled p95 (N=20) while the per-kind
   lines still say "not established". `verify.sh`'s 5 cycles stay under both.

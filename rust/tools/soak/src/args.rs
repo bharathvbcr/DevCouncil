@@ -50,11 +50,7 @@ fn usage() -> Refusal {
 }
 
 fn bounded_flag(flag: &str, raw: Option<&String>, lo: u64, hi: u64) -> Result<u64, Refusal> {
-    let refuse = || {
-        Refusal::Usage(format!(
-            "{USAGE}; {flag} must be an integer in {lo}..={hi}"
-        ))
-    };
+    let refuse = || Refusal::Usage(format!("{USAGE}; {flag} must be an integer in {lo}..={hi}"));
     let raw = raw.ok_or_else(refuse)?;
     if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
         return Err(refuse());
@@ -154,14 +150,20 @@ mod tests {
         let p = parse(&v(&["dir"])).unwrap();
         assert_eq!((p.cycles, p.mode), (40, Mode::Build));
         let p = parse(&v(&["dir", "7", "--daemon"])).unwrap();
-        assert_eq!((p.cycles, p.mode, p.label.as_str()), (7, Mode::Daemon, "--daemon"));
+        assert_eq!(
+            (p.cycles, p.mode, p.label.as_str()),
+            (7, Mode::Daemon, "--daemon")
+        );
         assert!(parse(&v(&["dir", "7", "build"])).is_ok());
     }
 
     #[test]
     fn the_old_refusals_are_unchanged() {
         assert!(matches!(parse(&v(&[])), Err(Refusal::Usage(_))));
-        assert!(matches!(parse(&v(&["dir", "1", "build", "x"])), Err(Refusal::Usage(_))));
+        assert!(matches!(
+            parse(&v(&["dir", "1", "build", "x"])),
+            Err(Refusal::Usage(_))
+        ));
         assert!(matches!(parse(&v(&["dir", "0"])), Err(Refusal::Fail(_))));
         assert!(matches!(parse(&v(&["dir", "abc"])), Err(Refusal::Fail(_))));
         match parse(&v(&["dir", "3", "--weird"])) {
@@ -201,7 +203,10 @@ mod tests {
                 duration_secs: DEFAULT_DURATION_SECS
             }
         );
-        assert!(matches!(parse(&v(&["dir", "--duration", "5"])), Err(Refusal::Usage(_))));
+        assert!(matches!(
+            parse(&v(&["dir", "--duration", "5"])),
+            Err(Refusal::Usage(_))
+        ));
     }
 
     #[test]

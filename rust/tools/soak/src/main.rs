@@ -464,18 +464,30 @@ mod soak {
     /// restored build are both one-file incremental builds; they are reported
     /// separately and pooled, and the pooled line is the one a reader should
     /// quote (N is twice the cycle count).
-    fn report_builds(samples: &Samples, cold: rss::Measured, load_start: &str, out: &mut dyn Write) {
+    fn report_builds(
+        samples: &Samples,
+        cold: rss::Measured,
+        load_start: &str,
+        out: &mut dyn Write,
+    ) {
         let rows = match samples.read() {
             Ok(rows) => rows,
             Err(e) => {
-                let _ = writeln!(out, "soak summary NOT RUN: the samples could not be read: {e}");
+                let _ = writeln!(
+                    out,
+                    "soak summary NOT RUN: the samples could not be read: {e}"
+                );
                 return;
             }
         };
         let restored: Vec<u64> = rows.iter().filter_map(|r| r.build_ms).collect();
         let dirty: Vec<u64> = rows.iter().filter_map(|r| r.dirty_build_ms).collect();
         let pooled: Vec<u64> = restored.iter().chain(&dirty).copied().collect();
-        let restored_rss: Vec<u64> = rows.iter().filter(|r| r.build_ms.is_some()).map(|r| r.rss).collect();
+        let restored_rss: Vec<u64> = rows
+            .iter()
+            .filter(|r| r.build_ms.is_some())
+            .map(|r| r.rss)
+            .collect();
         let dirty_rss: Vec<u64> = rows.iter().filter_map(|r| r.dirty_rss).collect();
         let pooled_rss: Vec<u64> = restored_rss.iter().chain(&dirty_rss).copied().collect();
         let _ = writeln!(
@@ -484,7 +496,11 @@ mod soak {
         );
         let _ = writeln!(out, "  cold build wall {} ms", cold.wall.as_millis());
         let _ = writeln!(out, "  {}", stats::build_line("edited (one file)", &dirty));
-        let _ = writeln!(out, "  {}", stats::build_line("restored (one file)", &restored));
+        let _ = writeln!(
+            out,
+            "  {}",
+            stats::build_line("restored (one file)", &restored)
+        );
         let _ = writeln!(
             out,
             "  {}",
@@ -501,11 +517,7 @@ mod soak {
             "  {}",
             stats::rss_line("incremental restored", &restored_rss)
         );
-        let _ = writeln!(
-            out,
-            "  {}",
-            stats::rss_line("all incremental", &pooled_rss)
-        );
+        let _ = writeln!(out, "  {}", stats::rss_line("all incremental", &pooled_rss));
         let _ = writeln!(
             out,
             "  load average (1/5/15 min): start {load_start}, end {}",
@@ -560,7 +572,8 @@ mod soak {
                 let _ = writeln!(out, "SOAK FAIL: restore cycle {i}");
                 return true;
             }
-            let restored = match rss::measure_timed(time_flag, timeout_log, devmap, &["build", "."]) {
+            let restored = match rss::measure_timed(time_flag, timeout_log, devmap, &["build", "."])
+            {
                 Ok(restored) => restored,
                 Err(_) => {
                     let _ = writeln!(out, "SOAK FAIL: build (restored) cycle {i}");
@@ -704,7 +717,12 @@ mod soak {
     /// store, so that an error under load is never a query that was always
     /// going to fail. `file::symbol` is the id the kernel treats as
     /// unambiguous; the candidates are search rows whose pair is unique.
-    fn readers_preflight(devmap: &Path, store_path: &Path, scratch: &Path, tag: u32) -> Result<String, String> {
+    fn readers_preflight(
+        devmap: &Path,
+        store_path: &Path,
+        scratch: &Path,
+        tag: u32,
+    ) -> Result<String, String> {
         let out = scratch.join(format!("devmap-soak-{tag}-probe.out"));
         let err = scratch.join(format!("devmap-soak-{tag}-probe.err"));
         let db = store_path.to_string_lossy().into_owned();
@@ -720,12 +738,18 @@ mod soak {
             for term in ["build", "parse", "store", "config"] {
                 let (outcome, _) = readers::run_query(devmap, &args(&["search", term]), &out, &err);
                 if outcome != readers::Outcome::Ok {
-                    return Err(format!("search {term:?} failed on the quiet store: {outcome:?}"));
+                    return Err(format!(
+                        "search {term:?} failed on the quiet store: {outcome:?}"
+                    ));
                 }
                 let reply = std::fs::read_to_string(&out).unwrap_or_default();
                 for candidate in readers::targets_from_search(&reply).into_iter().take(10) {
-                    let (outcome, _) =
-                        readers::run_query(devmap, &args(&["impact", candidate.as_str()]), &out, &err);
+                    let (outcome, _) = readers::run_query(
+                        devmap,
+                        &args(&["impact", candidate.as_str()]),
+                        &out,
+                        &err,
+                    );
                     if outcome == readers::Outcome::Ok {
                         target = Some(candidate);
                         break;
@@ -736,7 +760,12 @@ mod soak {
                 }
             }
             let target = target.ok_or("no search row gave an impact target the kernel answers")?;
-            let (outcome, _) = readers::run_query(devmap, &args(&["explore", "build", "--limit", "5"]), &out, &err);
+            let (outcome, _) = readers::run_query(
+                devmap,
+                &args(&["explore", "build", "--limit", "5"]),
+                &out,
+                &err,
+            );
             if outcome != readers::Outcome::Ok {
                 return Err(format!("explore failed on the quiet store: {outcome:?}"));
             }
@@ -832,7 +861,11 @@ mod soak {
                 let dirty = match timed(&building) {
                     Ok(m) => m,
                     Err(_) => {
-                        failure = Some(writer_failure(timeout_log, &mut tally, &format!("build (edited) cycle {cycle}")));
+                        failure = Some(writer_failure(
+                            timeout_log,
+                            &mut tally,
+                            &format!("build (edited) cycle {cycle}"),
+                        ));
                         break;
                     }
                 };
@@ -843,11 +876,18 @@ mod soak {
                 let restored = match timed(&building) {
                     Ok(m) => m,
                     Err(_) => {
-                        failure = Some(writer_failure(timeout_log, &mut tally, &format!("build (restored) cycle {cycle}")));
+                        failure = Some(writer_failure(
+                            timeout_log,
+                            &mut tally,
+                            &format!("build (restored) cycle {cycle}"),
+                        ));
                         break;
                     }
                 };
-                let (dirty_ms, restored_ms) = (dirty.wall.as_millis() as u64, restored.wall.as_millis() as u64);
+                let (dirty_ms, restored_ms) = (
+                    dirty.wall.as_millis() as u64,
+                    restored.wall.as_millis() as u64,
+                );
                 tally.builds_ms.extend([dirty_ms, restored_ms]);
                 edited_rss.push(dirty.peak);
                 restored_rss.push(restored.peak);
@@ -896,7 +936,10 @@ mod soak {
         }
         let total: u64 = reader_stats.iter().map(ReaderStats::total).sum();
         let sum = |f: fn(&ReaderStats) -> u64| reader_stats.iter().map(f).sum::<u64>();
-        let latencies: Vec<u64> = reader_stats.iter().flat_map(|r| r.latencies_ms.iter().copied()).collect();
+        let latencies: Vec<u64> = reader_stats
+            .iter()
+            .flat_map(|r| r.latencies_ms.iter().copied())
+            .collect();
         let _ = writeln!(
             out,
             "readers total: {total} queries ({:.1}/s), ok {}, SQLITE_BUSY/locked {}, other errors {}, overlapped a build {}",

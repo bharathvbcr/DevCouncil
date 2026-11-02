@@ -8,8 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-pub const HEADER: &str =
-    "cycle,rss_bytes,db_bytes,build_ms,dirty_build_ms,dirty_rss_bytes";
+pub const HEADER: &str = "cycle,rss_bytes,db_bytes,build_ms,dirty_build_ms,dirty_rss_bytes";
 
 /// One row of the samples file.
 ///
@@ -296,7 +295,10 @@ mod tests {
         let rows = samples.read().expect("a three-column file reads");
         assert_eq!(rows[0].build_ms, None);
         std::fs::write(&path, format!("{HEADER}\n1,10,20,abc,,\n")).expect("write");
-        assert!(samples.read().is_err(), "a non-numeric build_ms was accepted");
+        assert!(
+            samples.read().is_err(),
+            "a non-numeric build_ms was accepted"
+        );
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 

@@ -45,12 +45,15 @@ pub enum Outcome {
 /// `sqlite3.c`'s `sqlite3ErrStr` table gives `database is locked`
 /// (SQLITE_BUSY, the message `sqlite3_errmsg` carries and rusqlite prints as
 /// the error's message) and `database table is locked` (SQLITE_LOCKED);
-/// `libsqlite3-sys/src/error.rs` `code_to_str` gives the text used when a
-/// failure has no message (`The database file is locked`, `A table in the
-/// database is locked`) and for the extended codes (`SQLITE_BUSY_RECOVERY`,
-/// `SQLITE_BUSY_SNAPSHOT`, `SQLITE_BUSY_TIMEOUT`); and its `ErrorCode`
-/// variants `DatabaseBusy` / `DatabaseLocked` are what a `{:?}` of the error
-/// prints. There is no SQLite string `database is busy`.
+/// `database schema is locked` is SQLITE_LOCKED's schema-lock message. The
+/// texts `The database file is locked`, `A table in the database is locked`
+/// and the extended codes (`SQLITE_BUSY_RECOVERY`, `SQLITE_BUSY_SNAPSHOT`,
+/// `SQLITE_BUSY_TIMEOUT`) were what libsqlite3-sys 0.30's `code_to_str`
+/// emitted; the locked 0.38 delegates to `sqlite3_errstr` and keeps them only
+/// as `ErrorCode` doc comments. They stay as markers for another binding
+/// version, erring toward matching too much. The `ErrorCode` variants
+/// `DatabaseBusy` / `DatabaseLocked` are what a `{:?}` of the error prints.
+/// There is no SQLite string `database is busy`.
 pub fn is_busy(text: &str) -> bool {
     const MARKERS: [&str; 11] = [
         "database is locked",
@@ -93,7 +96,11 @@ pub fn classify(exit_ok: bool, stdout: &str, stderr: &str) -> Outcome {
     // The CLI prints `Error: <chain>; DevMap context: ...` on stderr; look in
     // both streams, since `--json` errors can be framed on stdout.
     let combined = format!("{stderr}\n{stdout}");
-    let line = first_line(if stderr.trim().is_empty() { stdout } else { stderr });
+    let line = first_line(if stderr.trim().is_empty() {
+        stdout
+    } else {
+        stderr
+    });
     if is_busy(&combined) {
         Outcome::Busy(line)
     } else {
@@ -167,7 +174,12 @@ pub fn run_query(devmap: &Path, args: &[String], out: &Path, err: &Path) -> (Out
     let files = fs::File::create(out).and_then(|o| fs::File::create(err).map(|e| (o, e)));
     let (stdout, stderr) = match files {
         Ok(pair) => pair,
-        Err(e) => return (Outcome::Other(format!("cannot create scratch file: {e}")), started.elapsed()),
+        Err(e) => {
+            return (
+                Outcome::Other(format!("cannot create scratch file: {e}")),
+                started.elapsed(),
+            )
+        }
     };
     let mut child = match Command::new(devmap)
         .args(args)
@@ -205,7 +217,10 @@ pub fn run_query(devmap: &Path, args: &[String], out: &Path, err: &Path) -> (Out
         Err(e) => {
             let _ = child.kill();
             let _ = child.wait();
-            return (Outcome::Other(format!("cannot wait for the query: {e}")), elapsed);
+            return (
+                Outcome::Other(format!("cannot wait for the query: {e}")),
+                elapsed,
+            );
         }
     };
     let read = |p: &Path| String::from_utf8_lossy(&fs::read(p).unwrap_or_default()).into_owned();
@@ -276,9 +291,18 @@ pub struct Setup<'a> {
 /// One reader's loop: issue queries back to back until `stop`. `building` is
 /// set by the writer around each build, so a query can say whether it ran
 /// against a live write.
-pub fn reader_loop(id: usize, setup: &Setup<'_>, stop: &AtomicBool, building: &AtomicBool) -> ReaderStats {
-    let out = setup.scratch_dir.join(format!("devmap-soak-{}-r{id}.out", setup.tag));
-    let err = setup.scratch_dir.join(format!("devmap-soak-{}-r{id}.err", setup.tag));
+pub fn reader_loop(
+    id: usize,
+    setup: &Setup<'_>,
+    stop: &AtomicBool,
+    building: &AtomicBool,
+) -> ReaderStats {
+    let out = setup
+        .scratch_dir
+        .join(format!("devmap-soak-{}-r{id}.out", setup.tag));
+    let err = setup
+        .scratch_dir
+        .join(format!("devmap-soak-{}-r{id}.err", setup.tag));
     let _scratch = Scratch(out.clone(), err.clone());
     let mut stats = ReaderStats::default();
     let mut seq = 0u64;
@@ -335,7 +359,10 @@ pub fn failures(readers: &[ReaderStats], writer: &WriterTally) -> Vec<String> {
         ));
     }
     if writer.cycles == 0 {
-        fails.push("the writer completed no edit -> build cycle, so there was no write to contend with".into());
+        fails.push(
+            "the writer completed no edit -> build cycle, so there was no write to contend with"
+                .into(),
+        );
     }
     if readers.iter().map(|r| r.overlapped).sum::<u64>() == 0 {
         fails.push("no query overlapped a build: the contention check could not run".into());
@@ -382,7 +409,10 @@ mod tests {
             "",
         ] {
             assert!(!is_busy(text), "{text}");
-            assert!(matches!(classify(false, "", text), Outcome::Other(_)), "{text}");
+            assert!(
+                matches!(classify(false, "", text), Outcome::Other(_)),
+                "{text}"
+            );
         }
         // There is no such SQLite string; the task text's wording is not a marker.
         assert!(!is_busy("database is busy"));
@@ -396,7 +426,10 @@ mod tests {
         assert!(matches!(classify(true, "not json", ""), Outcome::Other(_)));
         // A busy message on stderr does not make an exit-0 read an error, and a
         // failure on stdout is still seen.
-        assert_eq!(classify(true, "{}", "warning: database is locked, retried"), Outcome::Ok);
+        assert_eq!(
+            classify(true, "{}", "warning: database is locked, retried"),
+            Outcome::Ok
+        );
         assert!(matches!(
             classify(false, "{\"error\":\"database is locked\"}", ""),
             Outcome::Busy(_)
@@ -405,7 +438,8 @@ mod tests {
 
     #[test]
     fn the_first_line_of_the_error_is_kept_and_bounded() {
-        let Outcome::Busy(line) = classify(false, "", &format!("\n  {CLI_BUSY}second line\n")) else {
+        let Outcome::Busy(line) = classify(false, "", &format!("\n  {CLI_BUSY}second line\n"))
+        else {
             panic!("busy");
         };
         assert!(line.starts_with("Error: database is locked"), "{line}");
@@ -420,7 +454,9 @@ mod tests {
     #[test]
     fn queries_rotate_kind_and_every_kind_is_in_flight_across_readers() {
         let db = Path::new("/x/devmap.sqlite");
-        let kinds: Vec<Kind> = (0..3).map(|id| query_args(id, 0, db, "a.rs::f").0).collect();
+        let kinds: Vec<Kind> = (0..3)
+            .map(|id| query_args(id, 0, db, "a.rs::f").0)
+            .collect();
         assert!(kinds.contains(&Kind::Search));
         assert!(kinds.contains(&Kind::Impact));
         assert!(kinds.contains(&Kind::Explore));
@@ -490,7 +526,10 @@ mod tests {
         r[1].first_busy = Some("Error: database is locked".into());
         let f = failures(&r, &w);
         assert_eq!(f.len(), 1, "{f:?}");
-        assert!(f[0].contains("reader 1") && f[0].contains("database is locked"), "{f:?}");
+        assert!(
+            f[0].contains("reader 1") && f[0].contains("database is locked"),
+            "{f:?}"
+        );
     }
 
     #[test]
@@ -510,7 +549,9 @@ mod tests {
     fn a_run_with_no_write_or_no_overlap_could_not_run_its_check() {
         let (r, mut w) = healthy();
         w.cycles = 0;
-        assert!(failures(&r, &w).iter().any(|l| l.contains("no edit -> build cycle")));
+        assert!(failures(&r, &w)
+            .iter()
+            .any(|l| l.contains("no edit -> build cycle")));
         let (mut r, w) = healthy();
         for x in &mut r {
             x.overlapped = 0;
@@ -518,7 +559,9 @@ mod tests {
         assert!(failures(&r, &w).iter().any(|l| l.contains("could not run")));
         let (r, mut w) = healthy();
         w.busy = 2;
-        assert!(failures(&r, &w).iter().any(|l| l.contains("the writer hit 2")));
+        assert!(failures(&r, &w)
+            .iter()
+            .any(|l| l.contains("the writer hit 2")));
     }
 
     #[cfg(unix)]
@@ -534,7 +577,10 @@ mod tests {
             run("echo 'Error: database is locked; DevMap context: x' >&2; exit 1"),
             Outcome::Busy(_)
         ));
-        assert!(matches!(run("echo 'Error: nope' >&2; exit 2"), Outcome::Other(_)));
+        assert!(matches!(
+            run("echo 'Error: nope' >&2; exit 2"),
+            Outcome::Other(_)
+        ));
         assert!(matches!(
             run_query(Path::new("/nonexistent/devmap"), &[], &out, &err).0,
             Outcome::Other(_)

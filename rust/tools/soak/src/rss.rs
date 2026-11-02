@@ -191,7 +191,11 @@ mod tests {
         )
         .expect_err("a 500 ms bound on a 31 s command");
         assert!(err.to_string().contains("timed out"), "{err}");
-        assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
         let pid = std::fs::read_to_string(&pid_file)
             .ok()
             .and_then(|t| t.trim().parse::<u32>().ok())
