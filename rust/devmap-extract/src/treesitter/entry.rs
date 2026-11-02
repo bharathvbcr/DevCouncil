@@ -57,6 +57,13 @@ pub const RETRY_BUDGET_FACTOR: u32 = 5;
 /// The cost the cap was protecting against, a corpus of pathological inputs
 /// costing `N x 25 s`, is what a deadline bounds directly.
 ///
+/// The deadline bounds the phase itself, not only the gaps between files: a
+/// file that starts with less than the retry budget left gets only the time
+/// that remains. The phase therefore ends at this deadline plus the per-file
+/// budget's check granularity (it is polled at walk boundaries, not
+/// preemptive), never plus a whole retry budget ([`RETRY_BUDGET_FACTOR`] times
+/// [`DEFAULT_PARSE_BUDGET`], 25 s).
+///
 /// The writer lock is held for the whole phase, and a CLI build that arrives
 /// during it waits at most `Store::WRITER_LOCK_WAIT` (60 s) before failing
 /// with "pid holds the store". So this deadline is also the longest a

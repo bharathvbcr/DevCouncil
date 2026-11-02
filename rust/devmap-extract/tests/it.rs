@@ -149,6 +149,8 @@ mod python_source_roots_collect;
 mod receiver_is_an_identity;
 mod reliability_source_reads;
 #[cfg(feature = "parse")]
+mod retry_phase_deadline_is_a_hard_bound;
+#[cfg(feature = "parse")]
 mod rust_use_declarations;
 mod safe_fs_controls;
 #[cfg(feature = "parse")]
