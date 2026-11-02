@@ -110,7 +110,7 @@ impl Corpus {
     pub fn describe(&self) -> String {
         let why = match self.choice {
             Choice::Python => "first .py file in name order",
-            Choice::TypeScriptFallback => "TypeScript fallback: no .py file under the corpus root",
+            Choice::TypeScriptFallback => "TypeScript fallback: no .py file outside node_modules, target, dist and .git",
         };
         format!("soak churn file: {} ({why})", self.relative)
     }
@@ -250,7 +250,7 @@ mod tests {
         let corpus = Corpus::open(&ts, 22).expect("open");
         assert_eq!(
             corpus.describe(),
-            "soak churn file: src/main.ts (TypeScript fallback: no .py file under the corpus root)"
+            "soak churn file: src/main.ts (TypeScript fallback: no .py file outside node_modules, target, dist and .git)"
         );
         fs::remove_dir_all(&ts).expect("cleanup");
     }

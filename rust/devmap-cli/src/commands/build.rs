@@ -1262,10 +1262,11 @@ fn parse_budget_diagnostic(counts: &devmap_extract::progress::BudgetRetryCounts)
              is incomplete, see `devmap status` budget_refused",
             counts.still_refused, counts.retried, counts.not_retried
         );
+        // A cancelled build returns `BuildCancelled` before this line is
+        // printed, so a retry phase that stopped early here hit its deadline.
         if counts.not_retried > 0 {
             line.push_str(&format!(
-                "; the serial retry phase stopped before reaching {} of them (its deadline \
-                 passed or the build was cancelled)",
+                "; the serial retry phase reached its deadline before {} of them",
                 counts.not_retried
             ));
         }

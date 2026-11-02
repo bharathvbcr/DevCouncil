@@ -66,15 +66,16 @@ cat "$OUT/rows-count.txt" "$OUT/ledger.sha"
 echo "edited file $EDIT: closed=$EDIT_CLOSED live=$EDIT_LIVE"
 
 STATUS=0
-read -r TOTAL LIVE CLOSED OPENED < "$OUT/rows-count.txt"
-for field in "$LIVE" "$CLOSED" "$OPENED"; do
-  case $field in
-    live=0 | closed=0 | opened=0)
-      echo "FAIL: ${field%=0} == 0: the incremental generation did not exercise that part of the ledger, so the dumps do not cover it" >&2
-      STATUS=1
-      ;;
-  esac
+read -r _ LIVE CLOSED OPENED < "$OUT/rows-count.txt"
+# A field passes only as name=<positive integer>; a malformed or missing count fails.
+for want in "live:$LIVE" "closed:$CLOSED" "opened:$OPENED"; do
+  name=${want%%:*}
+  field=${want#*:}
+  if ! [[ $field =~ ^$name=[1-9][0-9]*$ ]]; then
+    echo "FAIL: '$field' is not $name=<positive count>: the incremental generation did not exercise that part of the ledger, so the dumps do not cover it" >&2
+    STATUS=1
+  fi
 done
-case ${EDIT_CLOSED:-0} in 0) echo "FAIL: no closed row in $EDIT: the edit closed nothing" >&2; STATUS=1 ;; esac
-case ${EDIT_LIVE:-0} in 0) echo "FAIL: no live row in $EDIT: the edit left the file with no rows" >&2; STATUS=1 ;; esac
+[[ ${EDIT_CLOSED:-} =~ ^[1-9][0-9]*$ ]] || { echo "FAIL: closed rows in $EDIT = '${EDIT_CLOSED:-}': the edit closed nothing" >&2; STATUS=1; }
+[[ ${EDIT_LIVE:-} =~ ^[1-9][0-9]*$ ]] || { echo "FAIL: live rows in $EDIT = '${EDIT_LIVE:-}': the edit left the file with no rows" >&2; STATUS=1; }
 exit $STATUS

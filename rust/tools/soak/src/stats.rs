@@ -118,17 +118,23 @@ fn target_word(target: &Target) -> String {
     }
 }
 
+/// The p95 words every summary line prints: the value only at or above
+/// [`MIN_FOR_P95`] samples, otherwise "not established".
+fn p95_words(s: &Summary) -> String {
+    if s.n < MIN_FOR_P95 {
+        format!("p95 not established (N={})", s.n)
+    } else {
+        format!("p95 {} ms", s.p95)
+    }
+}
+
 /// The reader-latency line: N, min, median, p95, max in milliseconds. The
 /// p95 obeys the same [`MIN_FOR_P95`] rule as the build line: under it the p95
 /// is just the maximum, and printing it as a p95 would claim a percentile no
 /// sample set that small has. `None` for no samples.
 pub fn latency_line(values_ms: &[u64]) -> Option<String> {
     let s = summarize(values_ms)?;
-    let p95 = if s.n < MIN_FOR_P95 {
-        format!("p95 not established (N={})", s.n)
-    } else {
-        format!("p95 {} ms", s.p95)
-    };
+    let p95 = p95_words(&s);
     Some(format!(
         "reader query latency: N={} min {} ms median {} ms {p95} max {} ms",
         s.n, s.min, s.median, s.max
@@ -144,11 +150,7 @@ pub fn build_line(label: &str, values_ms: &[u64]) -> String {
             target_word(&judge_p95(None, BUILD_P95_TARGET_MS))
         );
     };
-    let p95 = if s.n < MIN_FOR_P95 {
-        format!("p95 not established (N={})", s.n)
-    } else {
-        format!("p95 {} ms", s.p95)
-    };
+    let p95 = p95_words(&s);
     format!(
         "build {label}: N={} min {} ms median {} ms {p95} max {} ms; p95 target <= {BUILD_P95_TARGET_MS} ms: {}",
         s.n,
