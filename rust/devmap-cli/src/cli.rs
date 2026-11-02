@@ -577,6 +577,12 @@ pub(crate) enum Commands {
     /// directory that is on disk is where the state actually is.
     Paths(commands::paths::Args),
     /// Longitudinal view: how the map has moved across recent builds.
+    ///
+    /// `build_ms` is the time a build held the store's writer lock, from
+    /// acquiring it to the end of the vacuum, on both the CLI and the daemon.
+    /// Rows written by older builds differ: they stop before the commit, the
+    /// prunes and the vacuum, and a CLI build's row also counts the time it
+    /// waited for the lock. Compare `build_ms` only within one era.
     History(commands::history::Args),
     Repair(commands::repair::Args),
     Snapshots(commands::snapshots::Args),

@@ -1624,7 +1624,7 @@ impl Daemon {
                 DrainWriteScope::Full => (&extractions, Vec::new(), Vec::new()),
             };
         // Writer ownership has been held since before the base snapshot was read.
-        self.store.save_generation_with_metadata(
+        let generation_id = self.store.save_generation_with_metadata(
             write_input,
             &resolution,
             &analysis,
@@ -1658,6 +1658,16 @@ impl Daemon {
         // per file, forever (SC7). Runs after the generation prune so it sees
         // the retained set.
         self.store.prune_extraction_cache()?;
+        // The history row was written inside the save transaction, so its
+        // `build_ms` stops before the commit and the two prunes above. Close it
+        // over them, still under the writer lock; the stored value is a true
+        // lower bound, so a failure here is logged and the drain stands.
+        if let Err(error) = self
+            .store
+            .finalize_build_ms(generation_id, resync_started)
+        {
+            warn!("build_history: could not extend build_ms over the prunes: {error:#}");
+        }
 
         // Acknowledge only after a complete durable generation exists. A crash
         // or any failed stage above leaves the claimed work queued for replay —

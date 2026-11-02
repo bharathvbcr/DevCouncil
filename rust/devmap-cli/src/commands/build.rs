@@ -188,7 +188,6 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
     // success.
     let path = &cli.root_hint();
     let progress = progress.expect("main supplies a build reporter");
-    let build_started = std::time::Instant::now();
     progress.stage(
         1,
         format_args!("scanning and extracting {}", path.display()),
@@ -206,6 +205,11 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
     let _writer = progress.timed("writer:wait", || {
         Store::lock_writer_at(&cli.db(), Store::WRITER_LOCK_WAIT)
     })?;
+    // `build_ms` starts here, once the lock is held, so it means the same on
+    // this path as on the daemon's: time spent building, not time spent
+    // queued behind another writer (that is the `writer:wait` stage). It ends
+    // after the vacuum, below.
+    let build_started = std::time::Instant::now();
     // Whose store this is comes before anything that could write to it: opening
     // migrates and heals the file, so a store of another live worktree is
     // refused here, from a read-only look at its owner, and not after the open
@@ -714,6 +718,17 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
         return Err(anyhow::Error::new(devmap_extract::BuildCancelled));
     }
     let extraction_snapshot = extraction_progress.snapshot();
+    // Files the parse budget refused and the serial retry did not recover are
+    // committed as parse failures in a generation that is otherwise ordinary,
+    // so the graph is smaller than the corpus warrants. Say it here, in the
+    // same place `resolution capped:` is said, as well as in the JSON result:
+    // the counts are the ones `file_progress.extraction.budget_retry` already
+    // carries, so there is no second source of truth to drift from `devmap
+    // status`.
+    let parse_budget = extraction_snapshot.budget_retry;
+    if let Some(line) = parse_budget_diagnostic(&parse_budget) {
+        progress.display.diagnostic(format_args!("{line}"));
+    }
     // The corpus text is dead the moment extraction has consumed it,
     // but it is bound in this scope and would otherwise stay resident
     // through resolve, analyze and persist — the stages that set the
@@ -969,6 +984,15 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
         ));
     }
     let vacuum = progress.timed("persist:vacuum", || store.vacuum_if_needed())?;
+    // The history row was written inside the save transaction, before the
+    // commit and the prunes above. Close its `build_ms` over the whole locked
+    // build. The value already stored is a true lower bound, so a failure here
+    // is said and the build still succeeds.
+    if let Err(error) = store.finalize_build_ms(gen_id, build_started) {
+        progress.display.diagnostic(format_args!(
+            "build_history: could not extend build_ms over the prunes and vacuum: {error:#}"
+        ));
+    }
     // Report what the reclaim decided, not just how long it took. A
     // decline and a reclaim-that-reclaimed-nothing both take ~0 ms and
     // leave the same file behind, so the duration alone cannot tell a
@@ -1087,6 +1111,11 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
         // One entry per exceeded resolution budget; empty when none was. Set
         // after the literal, which is already at the macro's recursion limit.
         result["resolution_budget"] = serde_json::Value::Array(resolution_budget_json);
+        // The parse-budget outcome of this build's extraction, top level so a
+        // caller need not know the `file_progress` nesting. `still_refused >
+        // 0` means the generation is committed but incomplete. Absent on the
+        // `unchanged` early return, which extracts nothing.
+        result["parse_budget"] = parse_budget_json(&parse_budget);
         emit_json(cli, &result)?;
     } else {
         let mut summary = vec![
@@ -1216,6 +1245,30 @@ fn lsp_server_json(server: &devmap_resolve::lsp::LspServerStatus) -> serde_json:
         "files_unaddressable": server.files_unaddressable,
         "locations_undecodable": server.locations_undecodable,
         "locations_outside_repo": server.locations_outside_repo,
+    })
+}
+
+/// The line a build prints when files stayed refused for parse budget, or
+/// `None` when none did, so a healthy build prints nothing.
+fn parse_budget_diagnostic(counts: &devmap_extract::progress::BudgetRetryCounts) -> Option<String> {
+    (counts.still_refused > 0).then(|| {
+        format!(
+            "parse budget: {} file(s) refused after {} serial retries ({} not retried); the graph \
+             is incomplete, see `devmap status` budget_refused; rebuild at normal priority",
+            counts.still_refused, counts.retried, counts.not_retried
+        )
+    })
+}
+
+/// The top-level `parse_budget` key of a build's JSON result: the counts of
+/// `file_progress.extraction.budget_retry`, unchanged.
+fn parse_budget_json(counts: &devmap_extract::progress::BudgetRetryCounts) -> serde_json::Value {
+    serde_json::json!({
+        "refused": counts.refused,
+        "retried": counts.retried,
+        "recovered": counts.recovered,
+        "not_retried": counts.not_retried,
+        "still_refused": counts.still_refused,
     })
 }
 
@@ -1679,6 +1732,38 @@ mod tests {
         let text = resolution_rate_lines(&rate).join("\n");
         assert!(!text.contains("no attribution sites"), "{text}");
         assert!(text.contains("13 file(s), 5 site(s)"), "{text}");
+    }
+
+    fn counts(refused: usize, retried: usize, not_retried: usize, still: usize) -> devmap_extract::progress::BudgetRetryCounts {
+        devmap_extract::progress::BudgetRetryCounts {
+            refused,
+            retried,
+            recovered: retried.saturating_sub(still),
+            not_retried,
+            still_refused: still,
+        }
+    }
+
+    /// A build that left files refused says so with their number, and a
+    /// healthy build says nothing.
+    #[test]
+    fn a_refused_file_is_said_out_loud_and_a_clean_build_is_silent() {
+        assert_eq!(parse_budget_diagnostic(&counts(0, 0, 0, 0)), None);
+        assert_eq!(parse_budget_diagnostic(&counts(5, 5, 0, 0)), None, "recovered is not refused");
+        let line = parse_budget_diagnostic(&counts(30, 17, 13, 14)).expect("14 files stayed refused");
+        assert!(line.starts_with("parse budget: 14 file(s) refused after 17 serial retries (13 not retried)"), "{line}");
+        assert!(line.contains("devmap status"), "{line}");
+    }
+
+    /// The JSON key carries the same five counts, under the names the
+    /// snapshot uses, so the two cannot disagree.
+    #[test]
+    fn the_parse_budget_key_is_the_snapshot_counts() {
+        let json = parse_budget_json(&counts(30, 17, 13, 14));
+        assert_eq!(
+            json,
+            serde_json::json!({"refused": 30, "retried": 17, "recovered": 3, "not_retried": 13, "still_refused": 14})
+        );
     }
 
     /// CSV path lists drop blanks and keep every real entry.

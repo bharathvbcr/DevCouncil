@@ -16,10 +16,18 @@ const PY: &str = "def alpha():\n    return beta()\n\ndef beta():\n    return 1\n
 const SMALL_FIRST: ParseBudgets = ParseBudgets {
     first_pass: Duration::ZERO,
     retry: Duration::from_secs(60),
+    retry_total: Duration::from_secs(600),
 };
 const BOTH_TOO_SMALL: ParseBudgets = ParseBudgets {
     first_pass: Duration::ZERO,
     retry: Duration::ZERO,
+    retry_total: Duration::from_secs(600),
+};
+/// The retry phase is over before it starts: nothing is re-run.
+const PAST_DEADLINE: ParseBudgets = ParseBudgets {
+    first_pass: Duration::ZERO,
+    retry: Duration::from_secs(60),
+    retry_total: Duration::ZERO,
 };
 
 fn file<'a>(path: &'a str, source: &'a str) -> FileRef<'a> {
@@ -78,21 +86,15 @@ fn the_named_list_is_bounded_and_carries_the_total() {
         .map(|i| format!("f{i}.py"))
         .collect();
     let files: Vec<FileRef> = paths.iter().map(|p| file(p, PY)).collect();
-    let (out, report) = extract_all_with_budgets(&files, None, BOTH_TOO_SMALL, None);
+    let (out, report) = extract_all_with_budgets(&files, None, PAST_DEADLINE, None);
 
     assert!(out.iter().all(|e| e.is_budget_refusal()));
     assert_eq!(report.still_refused_total, files.len());
     assert_eq!(report.still_refused.len(), MAX_NAMED_BUDGET_REFUSALS);
     assert!(!report.names_all());
-    // Files past the retry cap are refused, counted, and not retried.
-    assert_eq!(
-        report.retried,
-        devmap_extract::treesitter::MAX_BUDGET_RETRIES
-    );
-    assert_eq!(
-        report.not_retried,
-        files.len() - devmap_extract::treesitter::MAX_BUDGET_RETRIES
-    );
+    // Files past the retry deadline are refused, counted, and not retried.
+    assert_eq!(report.retried, 0);
+    assert_eq!(report.not_retried, files.len());
 }
 
 #[test]
@@ -205,15 +207,24 @@ fn a_file_refused_after_the_retry_says_so() {
 }
 
 #[test]
-fn a_file_past_the_retry_cap_says_it_was_not_retried_for_that_reason() {
-    let paths: Vec<String> = (0..devmap_extract::treesitter::MAX_BUDGET_RETRIES + 1)
-        .map(|i| format!("f{i}.py"))
-        .collect();
-    let files: Vec<FileRef> = paths.iter().map(|p| file(p, PY)).collect();
-    let (out, _) = extract_all_with_budgets(&files, None, BOTH_TOO_SMALL, None);
-    let last = reason(out.last().unwrap());
+fn a_file_past_the_retry_deadline_says_it_was_not_retried_for_that_reason() {
+    use devmap_extract::retry_budget_refusals_observing;
+    // The first file is retried (the phase has just begun); its callback then
+    // outlasts the deadline, so the second is not.
+    let budgets = ParseBudgets {
+        first_pass: Duration::ZERO,
+        retry: Duration::ZERO,
+        retry_total: Duration::from_millis(500),
+    };
+    let (paths, mut out) = first_pass_refused(2);
+    let files: Vec<FileRef<'_>> = paths.iter().map(|p| file(p, PY)).collect();
+    let report = retry_budget_refusals_observing(&files, &mut out, None, budgets, None, &mut |_| {
+        std::thread::sleep(Duration::from_millis(700));
+    });
+    assert_eq!((report.retried, report.not_retried), (1, 1), "{report:?}");
+    let last = reason(&out[1]);
     assert!(
-        last.contains("not retried") && last.contains("cap on serial retries"),
+        last.contains("not retried") && last.contains("serial retry phase passed its"),
         "{last}"
     );
     assert!(reason(&out[0]).contains("refused again"));
@@ -334,12 +345,56 @@ fn a_cancel_after_the_last_retried_file_is_not_a_cancellation() {
 }
 
 #[test]
-fn the_retry_cap_is_not_counted_as_a_cancellation() {
-    let count = devmap_extract::treesitter::MAX_BUDGET_RETRIES + 2;
-    let (paths, mut out) = first_pass_refused(count);
+fn the_retry_deadline_is_not_counted_as_a_cancellation() {
+    // Deadline already passed AND cancel set: the deadline is decided first,
+    // so the files are `not_retried` but not `cancelled`.
+    let (paths, mut out) = first_pass_refused(3);
     let files: Vec<FileRef<'_>> = paths.iter().map(|p| file(p, PY)).collect();
-    let report = retry_budget_refusals(&files, &mut out, None, BOTH_TOO_SMALL, None);
-    assert_eq!(report.not_retried, 2, "{report:?}");
+    let cancel = AtomicBool::new(true);
+    let report = retry_budget_refusals(&files, &mut out, None, PAST_DEADLINE, Some(&cancel));
+    assert_eq!(report.not_retried, 3, "{report:?}");
     assert_eq!(report.cancelled, 0);
     assert!(!report.was_cancelled());
+    // And with no cancel at all.
+    let (paths, mut out) = first_pass_refused(3);
+    let files: Vec<FileRef<'_>> = paths.iter().map(|p| file(p, PY)).collect();
+    let report = retry_budget_refusals(&files, &mut out, None, PAST_DEADLINE, None);
+    assert_eq!((report.not_retried, report.cancelled), (3, 0), "{report:?}");
+}
+
+/// The count cap this replaced (16 files) left every refusal past it in a
+/// generation reported ok. Measured under `taskpolicy -b`: 24-32 files refused
+/// in the first pass, all of which the serial retry recovers when it is
+/// allowed to run. The cap was the whole loss, so a corpus bigger than it must
+/// still end with nothing refused when the retry phase has time.
+#[test]
+fn more_first_pass_refusals_than_the_old_cap_are_all_recovered() {
+    const OLD_CAP: usize = 16;
+    let paths: Vec<String> = (0..OLD_CAP + 1).map(|i| format!("f{i}.py")).collect();
+    let files: Vec<FileRef> = paths.iter().map(|p| file(p, PY)).collect();
+    let (out, report) = extract_all_with_budgets(&files, None, SMALL_FIRST, None);
+
+    assert_eq!(report.first_pass_refused, OLD_CAP + 1, "{report:?}");
+    assert_eq!(report.still_refused_total, 0, "{report:?}");
+    assert_eq!(report.not_retried, 0, "{report:?}");
+    assert_eq!(report.recovered, OLD_CAP + 1);
+    let unhurried: Vec<String> = files
+        .iter()
+        .map(|f| {
+            serde_json::to_string(&extract_file_with_budget(
+                f.path,
+                f.source,
+                Duration::from_secs(60),
+            ))
+            .unwrap()
+        })
+        .collect();
+    let got: Vec<String> = out
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap())
+        .collect();
+    assert_eq!(
+        got, unhurried,
+        "a recovered extraction differs from an unhurried one"
+    );
 }

@@ -814,14 +814,18 @@ pub fn extract_all_with_progress(
     extract_all_with_budgets(files, progress, ParseBudgets::default(), None).0
 }
 
-/// The two per-file parse budgets of a build: the wall-clock bound each file
-/// gets in the parallel pass, and the larger one a budget-refused file gets
-/// when it is re-run serially.
+/// The parse budgets of a build: the wall-clock bound each file gets in the
+/// parallel pass, the larger one a budget-refused file gets when it is re-run
+/// serially, and the deadline for the whole serial retry phase.
 #[cfg(feature = "parse")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParseBudgets {
     pub first_pass: std::time::Duration,
     pub retry: std::time::Duration,
+    /// How long the serial retry phase may run, from its first file; see
+    /// [`treesitter::RETRY_PHASE_DEADLINE`]. Files still waiting when it has
+    /// elapsed stay refused and are counted as `not_retried`.
+    pub retry_total: std::time::Duration,
 }
 
 #[cfg(feature = "parse")]
@@ -831,6 +835,7 @@ impl Default for ParseBudgets {
         Self {
             first_pass,
             retry: first_pass.saturating_mul(treesitter::RETRY_BUDGET_FACTOR),
+            retry_total: treesitter::RETRY_PHASE_DEADLINE,
         }
     }
 }
@@ -855,11 +860,12 @@ pub struct BudgetRetryReport {
     pub retried: usize,
     /// Of those retried, files that parsed (cleanly or partially).
     pub recovered: usize,
-    /// Refused files never re-run: past [`treesitter::MAX_BUDGET_RETRIES`], or
-    /// the retry was cancelled first. They stay refused.
+    /// Refused files never re-run: the retry phase passed its
+    /// [`ParseBudgets::retry_total`] deadline, or the retry was cancelled
+    /// first. They stay refused.
     pub not_retried: usize,
     /// Of `not_retried`, files skipped because the build was cancelled, not
-    /// because the retry cap was reached. Non-zero means the result is
+    /// because the retry deadline had passed. Non-zero means the result is
     /// incomplete at the caller's own request and must not be committed as a
     /// finished build; see [`BuildCancelled`].
     pub cancelled: usize,
@@ -949,9 +955,10 @@ pub fn extract_all_with_budgets(
 ///
 /// Serial because the refusal is usually self-inflicted: the parallel pass runs
 /// one file per core, and under machine load a legitimate large file's wall
-/// time stretches past the budget. Alone, it does not. At most
-/// [`treesitter::MAX_BUDGET_RETRIES`] files are retried; `cancel` is checked
-/// before each. Only budget refusals are retried: a grammar fault, a depth
+/// time stretches past the budget. Alone, it does not. Files are retried until
+/// `budgets.retry_total` has elapsed since the first one; the rest stay
+/// refused and are counted as `not_retried`. `cancel` is checked before each.
+/// Only budget refusals are retried: a grammar fault, a depth
 /// refusal or a malformed notebook fails the same way at any budget, and is
 /// left exactly as the first pass reported it.
 ///
@@ -978,18 +985,22 @@ pub fn retry_budget_refusals_observing(
         first_pass_refused: refused.len(),
         ..BudgetRetryReport::default()
     };
+    // The deadline runs from the first file of the retry phase, not from the
+    // first pass: the first pass is the work being repaired, and charging it
+    // here would starve the repair exactly when the host is slowest.
+    let phase_started = std::time::Instant::now();
     for index in refused {
         let cancelled = cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
         // What the final reason says happened after the first pass, so a
         // reader of `parse_failed` can tell the three refusals apart.
-        // The cap is decided first: a file past it was never going to be
-        // retried, so a cancel arriving after the last slot was used must not
-        // turn it into a cancelled file and discard a finished build.
-        let verdict = if report.retried >= treesitter::MAX_BUDGET_RETRIES {
+        // The deadline is decided first: a file past it was never going to be
+        // retried, so a cancel arriving after it passed must not turn it into
+        // a cancelled file and discard a finished build.
+        let verdict = if phase_started.elapsed() >= budgets.retry_total {
             report.not_retried += 1;
             format!(
-                "; not retried: more than {} files were refused for budget, the cap on serial retries",
-                treesitter::MAX_BUDGET_RETRIES
+                "; not retried: the serial retry phase passed its {:?} deadline",
+                budgets.retry_total
             )
         } else if cancelled {
             report.not_retried += 1;

@@ -90,6 +90,32 @@ pub(super) fn keyed_ledger_sql(key: LedgerKey, key_count: usize, unattributed_on
 }
 
 impl Store {
+    /// Re-measure a build's `build_ms` once all of its work is done.
+    ///
+    /// The save transaction samples `GenerationWriteOpts::build_started`
+    /// *inside* itself, before the row is inserted, so the value it stores
+    /// cannot include the commit, the generation and extraction prunes or the
+    /// vacuum that follow it: on a frozen GitPulse corpus that left 1.05-8.2 s
+    /// of a build unaccounted for (the commit alone was 8 s on a starved
+    /// host). The caller, still holding the writer lock, calls this after the
+    /// last of them with the same `started`, and the row then covers the whole
+    /// locked build. The in-transaction value stays as the crash-safe lower
+    /// bound for a build that dies in between.
+    ///
+    /// Returns whether a row was updated. A row whose `build_ms` is NULL
+    /// (unmeasured) is left NULL, and a row a concurrent writer already pruned
+    /// is simply absent: neither is an error.
+    pub fn finalize_build_ms(&self, generation_id: u32, started: std::time::Instant) -> Result<bool> {
+        let build_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+        let conn = lock_conn(&self.conn)?;
+        let changed = conn.execute(
+            "UPDATE build_history SET build_ms = ?2
+             WHERE generation_id = ?1 AND build_ms IS NOT NULL",
+            params![generation_id, build_ms],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Most recent builds, newest first. `limit` is clamped to the retention cap.
     pub fn build_history(&self, limit: usize) -> Result<Vec<BuildHistoryRow>> {
         let conn = lock_conn(&self.conn)?;

@@ -65,6 +65,7 @@ fn idle(corpus: &[(String, String)]) -> Vec<String> {
     let budgets = ParseBudgets {
         first_pass: Duration::from_secs(60),
         retry: Duration::from_secs(60),
+        retry_total: Duration::from_secs(600),
     };
     let (out, report) = extract_all_with_budgets(&refs(corpus), None, budgets, None);
     assert_eq!(
@@ -81,16 +82,15 @@ fn idle(corpus: &[(String, String)]) -> Vec<String> {
 
 #[test]
 fn a_universally_refused_first_pass_is_restored_by_the_retry_to_the_idle_edge_inputs() {
-    // At most the retry cap, because the retry re-runs only that many files
-    // (see the next test for what happens past it).
-    let corpus: Vec<_> = corpus()
-        .into_iter()
-        .take(devmap_extract::treesitter::MAX_BUDGET_RETRIES)
-        .collect();
+    // The whole corpus, more files than the 16-file count cap this test used
+    // to stay under: the retry phase is bounded by time, not by count (see the
+    // next test for what happens past the deadline).
+    let corpus = corpus();
     let baseline = idle(&corpus);
     let contended = ParseBudgets {
         first_pass: Duration::ZERO,
         retry: Duration::from_secs(60),
+        retry_total: Duration::from_secs(600),
     };
     let (out, report) = extract_all_with_budgets(&refs(&corpus), None, contended, None);
 
@@ -102,21 +102,21 @@ fn a_universally_refused_first_pass_is_restored_by_the_retry_to_the_idle_edge_in
 }
 
 #[test]
-fn past_the_retry_cap_the_unrecovered_files_are_named_not_silently_absent() {
-    let cap = devmap_extract::treesitter::MAX_BUDGET_RETRIES;
-    let corpus: Vec<_> = (0..cap + 8)
-        .map(|i| (format!("pkg/m{i:02}.py"), source(i)))
-        .collect();
+fn past_the_retry_deadline_the_unrecovered_files_are_named_not_silently_absent() {
+    let corpus = corpus();
     let baseline = idle(&corpus);
+    // A retry phase that is over before it starts: nothing is re-run.
     let contended = ParseBudgets {
         first_pass: Duration::ZERO,
         retry: Duration::from_secs(60),
+        retry_total: Duration::ZERO,
     };
     let (out, report) = extract_all_with_budgets(&refs(&corpus), None, contended, None);
 
-    // Every file the first pass refused beyond the cap keeps its refusal, so
-    // its edges are missing from the idle comparison -- and must say so.
-    assert!(report.retried <= cap);
+    // Every file the first pass refused keeps its refusal, so its edges are
+    // missing from the idle comparison -- and must say so.
+    assert_eq!(report.retried, 0);
+    assert_eq!(report.not_retried, report.first_pass_refused);
     assert_eq!(
         report.still_refused_total,
         report.first_pass_refused - report.recovered
@@ -131,6 +131,7 @@ fn when_the_retry_is_refused_too_every_difference_is_named_as_degraded() {
     let starved = ParseBudgets {
         first_pass: Duration::ZERO,
         retry: Duration::ZERO,
+        retry_total: Duration::from_secs(600),
     };
     let (out, report) = extract_all_with_budgets(&refs(&corpus), None, starved, None);
     assert_degraded_or_equal(&corpus, &baseline, &out, &report);
