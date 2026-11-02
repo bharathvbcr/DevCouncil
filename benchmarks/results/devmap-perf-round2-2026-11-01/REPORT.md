@@ -53,7 +53,8 @@ For reference, the noise arm (main) beat main2 in 0-4 of 5 reps per cell.
 ## Correctness
 
 - **Graph parity** (`benchmarks/devmap_graph_parity.sh`): merged vs main, all three hashes identical (nodes `89681f14…`, edges `d5f187c2…`, unresolved `1662e6f2…`).
-- **Ledger parity after one incremental build** (`benchmarks/devmap_ledger_parity.sh`): `cmp`-identical across 140,380 texts and 605,844 rows, live and closed.
+- **Ledger parity after one incremental build** (`benchmarks/devmap_ledger_parity.sh` as it stood at 8865a28f): `cmp`-identical across 140,380 texts and 605,844 rows. That run's only edit appended a comment, which closes no ledger row (605,844 is the unchanged live count), and its dump had no `unresolved_id`, so it showed **live-row parity only; closed-row parity was not established by it**. The script was fixed on the review-fix branch (review #10) to close real rows; that version is cited below.
+- **Ledger parity with closed rows** (the fixed script, which rewrites `.push(` call sites in `harness/checks.ts`): `devmap-main` and the merged binary both print `total=605847 live=605845 closed=2 opened=3` and `edited file harness/checks.ts: closed=2 live=6`, and their `texts.tsv` / `rows-all.tsv` dumps (now with `unresolved_id`) are `cmp`-identical (sha256 `987467c4…` / `5750dc9f…`). The fix lane ran both binaries; I reran the merged binary and got the same hashes.
 - **Lane verifiers** (Opus) also checked:
   - insertion order in 22 tables;
   - `analysis_json` and `devmap dead --json`;

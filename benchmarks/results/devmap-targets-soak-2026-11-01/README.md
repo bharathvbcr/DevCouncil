@@ -36,7 +36,8 @@ Order was m1, x1, m2, x2 (sequential, not interleaved within a run).
   2.9 s, is 2.9x, so the merged-vs-main wall time gap is NOT resolvable on this host.)
 - Target 2 (peak RSS < 512 MB): not met. Incremental builds peak at 1,737-1,757 MiB
   (1.70-1.72 GiB, merged) / 1,780-1,793 MiB (1.74-1.75 GiB, main): about 3.4x the 512 MiB
-  bound the soak checks (3.6x the spec's 512 MB) and 83-85% of the cold build's
+  bound the soak checks (3.6x the spec's 512 MB) and about 83-86% of the run's own cold build
+  (per run: m1 84.3-85.3%, m2 83.5-84.3%, x1 85.7-86.1%, x2 84.8-85.4%), which across runs spans
   2,060-2,099 MiB (2.01-2.05 GiB). The
   incremental RSS gap between binaries (about 2.4% lower on merged) does not overlap across
   the two pairs of runs (merged 1,737-1,757 vs main 1,780-1,793 MiB) but is tiny against the
