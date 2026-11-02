@@ -127,8 +127,9 @@ flowchart TD
 3. `devmap-analyze` computes graph analysis, reachability, and liveness candidates.
 4. `devmap-store` owns persistence (schema 29, reader floor 29) with zstd
    level-1 compressed extraction documents (`extraction_json`, `entry_wiring_json`,
-   `extraction_cache`, and `symbol_details` payloads), multi-row batched SQLite
-   inserts (`FTS_50_SQL`, `UNRESOLVED_64_SQL`), keyed semi-join ledger reads,
+   `extraction_cache`, and `symbol_details` payloads), multi-row batched FTS
+   inserts (`FTS_50_SQL`; ledger rows stay one per execute, which measured faster
+   at 605k rows), keyed semi-join ledger reads,
    payload validity ranges, payload-digest identity, and pre-write search index
    integrity checks; `devmap-query` reads and composes results with bounded
    unresolved-namesake site lists (`sites_omitted`) and file-hit prefix reads.

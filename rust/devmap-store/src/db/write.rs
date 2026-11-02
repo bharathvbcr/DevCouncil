@@ -1957,9 +1957,11 @@ impl Store {
             // entry, 140,380 of them on the GitPulse corpus, to answer a
             // question the slot map can answer from the borrowed row text.
             // Measured on that corpus (N=5, interleaved, same-binary noise
-            // arm) the second map cost an incremental `unresolved` span of
-            // 0.82 s min against 0.61 s streamed, with the noise arm at
-            // 0.75 s, and 1.14 s against 0.89 s of `persist:write`.
+            // arm, two independent runs) streaming made the incremental
+            // `unresolved` span faster in 9 of 10 paired reps, by about
+            // 17-20% at the median (0.65-0.70 s against 0.77-0.87 s). The
+            // gap in the minimum is not resolvable: one quiet-host run of the
+            // noise arm landed below both.
 
             // Per-row ids, in `resolution.unresolved` order.
             //
