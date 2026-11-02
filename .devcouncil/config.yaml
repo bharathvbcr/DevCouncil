@@ -3,7 +3,7 @@ execution:
   default_executor: claude
   enforce_file_scope_pre_verify: true
 gates:
-  mode: off
+  mode: enforce
 indexing:
   primary_languages:
   - swift
