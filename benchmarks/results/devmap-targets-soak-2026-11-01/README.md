@@ -57,6 +57,14 @@ query back to back (30 s timeout per query).
 - Run once (N=1 run): an absence of errors in one 10-minute run bounds the rate, it does not
   prove zero.
 
+- "0 SQLITE_BUSY" counts errors that reached the caller. The store's 5 s `busy_timeout`
+  (`devmap-store/src/db/open.rs:20`) absorbs a transient BUSY as latency, so the reader
+  p95/max above cannot be split between lock waits and CPU contention by this harness.
+- Pooled N is 2 x cycles: a 10-cycle run already prints a pooled p95 (N=20) while the per-kind
+  lines still say "not established". `verify.sh`'s 5 cycles stay under both.
+- Binaries used for the numbers were built before the final commit, which adds a 900 s bound
+  (process-group kill) to every measured build; that commit changes no measured path's logic.
+
 ## Not established
 
 - Why the build takes 2.3+ s (phase attribution): the soak does not capture per-phase timings.

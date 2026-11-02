@@ -68,23 +68,63 @@ pub fn measure(flag: &str, log: &Path, program: &Path, args: &[&str]) -> io::Res
     measure_timed(flag, log, program, args).map(|m| m.peak)
 }
 
-/// [`measure`], and the wall time of the run. On a failed command the report
-/// stays in `log` for the caller to read.
+/// The longest any measured build may run. A wedged build (an orphaned
+/// writer lock, the extraction retry cap) must end the soak with a failure
+/// rather than hang it past its own duration.
+pub const BUILD_TIMEOUT: Duration = Duration::from_secs(900);
+const POLL: Duration = Duration::from_millis(20);
+
+/// [`measure`], and the wall time of the run, bounded by [`BUILD_TIMEOUT`].
+/// On a failed command the report stays in `log` for the caller to read.
 pub fn measure_timed(
     flag: &str,
     log: &Path,
     program: &Path,
     args: &[&str],
 ) -> io::Result<Measured> {
+    measure_bounded(flag, log, program, args, BUILD_TIMEOUT)
+}
+
+/// [`measure_timed`] with an explicit bound. The command leads a process
+/// group of its own, so on timeout the whole group (`/usr/bin/time` and the
+/// build under it) is killed, not just the wrapper: a killed wrapper would
+/// leave the build running and holding the writer lock.
+pub fn measure_bounded(
+    flag: &str,
+    log: &Path,
+    program: &Path,
+    args: &[&str],
+    limit: Duration,
+) -> io::Result<Measured> {
     let started = Instant::now();
-    let status = Command::new(TIME)
+    let mut command = Command::new(TIME);
+    command
         .arg(flag)
         .arg(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(File::create(log)?)
-        .status()?;
+        .stderr(File::create(log)?);
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = command.spawn()?;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() >= limit {
+            #[cfg(unix)]
+            let _ = dc_proc::signal_group(child.id(), dc_proc::Signal::Kill);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::other(format!(
+                "{} {} timed out after {limit:?} and was killed",
+                program.display(),
+                args.join(" ")
+            )));
+        }
+        std::thread::sleep(POLL);
+    };
     let wall = started.elapsed();
     if !status.success() {
         return Err(io::Error::other(format!(
@@ -137,6 +177,31 @@ mod tests {
             timed.wall
         );
         assert!(measure(flag, &log, Path::new("/bin/sh"), &["-c", "exit 3"]).is_err());
+        // A command that outlives its bound is killed, group and all, and is
+        // an error: the grandchild `sleep` must not survive the wrapper.
+        let pid_file = format!("{}.pid", log.display());
+        let script = format!("sleep 31 & echo $! > {pid_file}; wait");
+        let started = Instant::now();
+        let err = measure_bounded(
+            flag,
+            &log,
+            Path::new("/bin/sh"),
+            &["-c", &script],
+            Duration::from_millis(500),
+        )
+        .expect_err("a 500 ms bound on a 31 s command");
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+        let pid = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|t| t.trim().parse::<u32>().ok())
+            .expect("the script recorded its child pid");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            dc_proc::signal_process(pid, dc_proc::Signal::Probe).is_err(),
+            "the killed command's child {pid} is still alive"
+        );
+        let _ = std::fs::remove_file(&pid_file);
         let _ = std::fs::remove_file(&log);
     }
 }
