@@ -16,6 +16,7 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 rayon.workspace = true
+libc.workspace = true
 # Stored extraction documents (schema 29). Pinned exactly, and to a release at
 # least two weeks old when it was chosen: 0.14.3 (published 2026-10-16, chosen
 # 2026-11-02), which with zstd-safe 8.2.0 and zstd-sys 2.1.2 carries the fixes

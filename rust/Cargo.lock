@@ -530,6 +530,7 @@ dependencies = [
  "devmap-analyze",
  "devmap-extract",
  "devmap-resolve",
+ "libc",
  "rayon",
  "rusqlite",
  "serde",
