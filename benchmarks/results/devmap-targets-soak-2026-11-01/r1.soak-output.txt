@@ -1,0 +1,23 @@
+21:02  up  7:58, 1 user, load averages: 14.53 15.38 15.35
+soak baseline: mode=readers digest=be0ea006413d db=272596992 tolerance=10%
+soak initial build: wall 13310 ms, peak rss 2162065408 bytes (cold only if the workdir had no store); load average 14.53 15.38 15.35
+soak readers: 8 reader threads, 600 s, one `devmap --json --db <store>` subprocess per query (search/impact/explore, impact target src-tauri/benches/churn_spawns.rs::build), 30 s per-query timeout
+readers ran 609.6 s of the requested 600 s (the last writer cycle always finishes); writer completed 42 cycles (84 builds)
+  reader 0: ok 409 busy 0 other 0 (timeouts 0) overlapped-a-build 409
+  reader 1: ok 415 busy 0 other 0 (timeouts 0) overlapped-a-build 415
+  reader 2: ok 411 busy 0 other 0 (timeouts 0) overlapped-a-build 411
+  reader 3: ok 407 busy 0 other 0 (timeouts 0) overlapped-a-build 407
+  reader 4: ok 417 busy 0 other 0 (timeouts 0) overlapped-a-build 417
+  reader 5: ok 413 busy 0 other 0 (timeouts 0) overlapped-a-build 413
+  reader 6: ok 412 busy 0 other 0 (timeouts 0) overlapped-a-build 412
+  reader 7: ok 415 busy 0 other 0 (timeouts 0) overlapped-a-build 415
+readers total: 3299 queries (5.4/s), ok 3299, SQLITE_BUSY/locked 0, other errors 0, overlapped a build 3299
+reader query latency ms: N=3299 min 54 median 1283 p95 3660 max 8136
+  build under 1 writer + readers: N=84 min 3234 ms median 7114 ms p95 10348 ms max 11259 ms; p95 target <= 120 ms: NOT met
+  rss incremental edited under readers: N=42 min 1736.1 MiB median 1745.3 MiB max 1757.0 MiB; peak target < 512 MiB: NOT met
+  rss incremental restored under readers: N=42 min 1738.1 MiB median 1743.0 MiB max 1755.6 MiB; peak target < 512 MiB: NOT met
+  rss cold build: N=1 min 2061.9 MiB median 2061.9 MiB max 2061.9 MiB; peak target < 512 MiB: NOT met
+  load average (1/5/15 min): start 14.53 15.38 15.35, end 19.95 21.48 18.90
+SOAK READERS OK (8 readers, 610 s, 3299 queries, 0 SQLITE_BUSY, 0 other reader errors, 42 writer cycles); samples in /Users/bharath/Code/devtools/DevCouncil/.claude/worktrees/wf_cfa65dc9-714-1/rust/target/runs/r1.csv
+exit 0
+21:13  up  8:09, 1 user, load averages: 19.95 21.48 18.90

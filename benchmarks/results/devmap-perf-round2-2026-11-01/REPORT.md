@@ -1,8 +1,8 @@
 # DevMap performance, round 2 (2026-11-01)
 
-Branch `claude/devmap-perf-main` (the timed binary is `ec99c364`; the soak harness and this report were committed after it), on top of `main` 7926697d. Nothing is pushed or merged to `main`. No schema constant changed: every binary reports store schema 29, code graph schema 2, extract schema 98. No dependency was added.
+Branch `claude/devmap-perf-main` (the timed binary is `ec99c364`; the soak harness and this report were committed after it), on top of `main` 7926697d. It landed on `main` as a fast-forward to 8865a28f (2026-11-01 22:56, done in the main checkout); nothing is pushed. No schema constant changed: every binary reports store schema 29, code graph schema 2, extract schema 98. No dependency was added.
 
-**Headline.** A steady-state one-file rebuild of the GitPulse corpus takes 2.88 s (median) against 3.94 s on `main` and 6.70 s on the old dbd0193a build. The merged binary was faster than both `main` arms in 5 of 5 interleaved reps, and its slowest rep (3.00 s) is below `main`'s fastest (3.44 s). Most of the gain is the prune (0.45 s → 0.03 s) and resolve (0.94 s → 0.66 s). The cold build total is unchanged within noise, and cold write is slightly faster. The output is byte-identical to `main`.
+**Headline.** A steady-state one-file rebuild of the GitPulse corpus takes 2.88 s (median) against 3.94 s on `main` and 6.70 s on the old dbd0193a build. The merged binary was faster than both `main` arms in 5 of 5 interleaved reps, and its slowest rep (3.00 s) is below `main`'s fastest (3.44 s). Most of the gain is the prune (0.45 s → 0.03 s) and resolve (0.94 s → 0.66 s). The cold build total is unchanged within noise. Cold write looks lower (median 3.99 s against 4.47 s), but the two identical `main` arms differ by 0.40 s at the median (4.47 vs 4.07 s), so it cannot be told apart from noise. The output is byte-identical to `main`.
 
 The spec's targets (§6.6) are not met: one-file p95 ≤ 120 ms and peak RSS < 512 MB are both missed. Neither can be reached without a schema change and a larger redesign; see "Spec targets".
 
@@ -25,7 +25,7 @@ The spec's targets (§6.6) are not met: one-file p95 ≤ 120 ms and peak RSS < 5
 | Kind | Stage | old dbd0193a | main | main2 (noise) | merged | merged beats both main arms |
 |---|---|---|---|---|---|---|
 | cold | total | 10.19 / 11.66 | 11.53 / 12.73 | 10.40 / 11.59 | 10.79 / 12.02 | 2/5 (noise) |
-| cold | write | 3.98 / 4.18 | 4.15 / 4.47 | 3.67 / 4.07 | 3.56 / 3.99 | 4/5 |
+| cold | write | 3.98 / 4.18 | 4.15 / 4.47 | 3.67 / 4.07 | 3.56 / 3.99 | 4/5 (within the main/main2 spread) |
 | cold | resolve | 0.88 / 1.02 | 1.02 / 1.06 | 0.84 / 1.08 | 0.57 / 0.83 | 5/5 |
 | inc1 | total | 3.27 / 4.33 | 3.19 / 3.46 | 2.95 / 3.56 | 2.53 / 2.93 | 3/5 (suggestive) |
 | inc1 | resolve | 0.66 / 0.87 | 0.90 / 1.03 | 0.97 / 1.12 | 0.60 / 0.63 | 4/5 |
@@ -65,10 +65,12 @@ For reference, the noise arm (main) beat main2 in 0-4 of 5 reps per cell.
 |---|---|---|---|
 | A/B harness | 4362e980 | `benchmarks/devmap_build_ab.sh` | used for every number here |
 | write | e82ca803 (482c01a2), 922a2402 | Single-row ledger insert replaces the 64-row chunk; streamed `unresolved_texts` pool | Undoes a `main` regression (ce71cae2). Cold `unresolved` span 23-38% faster in 10/10 pairs. Incremental span about 17-20% faster at the median, 9/10. New `devmap_ledger_parity.sh`. |
-| prune | 213772a4 (55e46eba) | Prune with foreign keys off plus one scoped `foreign_key_check` per parent; ANDed anti-joins; texts anti-join skipped when no ledger row was deleted | Root cause of the 835 s Vani prune: 3 unindexed FK child columns, so each retired row scanned 606k ledger rows. Steady-state prune 0.69 s → 0.04 s. Churn (`git mv` of 1,337 files): base never finished inside 420/900 s, fixed 1.7-3.5 s. 4 tests fail pre-fix. |
+| prune | 213772a4 (55e46eba) | Prune with foreign keys off plus one scoped `foreign_key_check` per parent; ANDed anti-joins; texts anti-join skipped when no ledger row was deleted | Root cause of the 835 s Vani prune: 3 unindexed FK child columns, so each retired row scanned 606k ledger rows. Steady-state prune: 0.45 → 0.03 s min in this report's A/B (the lane's own run measured 0.69 → 0.04 s on a different load). Churn (`git mv` of 1,337 files): base never finished inside 420/900 s, fixed 1.7-3.5 s. 4 tests fail pre-fix. |
 | budget | 2a99764b (2a8a11b9), 4efe6687 | A 240 s retry-phase deadline replaces the 16-file retry cap; `parse_budget` JSON key plus a stderr diagnostic; `build_ms` = the time the writer lock was held | Under 3 starved concurrent builds, base dropped 32-38 files in a generation reported ok (a correctness bug); fixed recovered every file in 9/9. Cost: +18-22 s in that starved case only. |
 | targets (soak) | c49e64fb (0a3f14d7), 5f676ee9 (fmt, doc citations, logs) | soak measures the §6.6 targets: incremental p95, peak RSS, `--readers N` | see "Spec targets" |
 | mapping | ec99c364 (29adec4e) | M3: `par_sort_by` (stable) for resolve edges and ledger. M1: `dead_clusters` reuses liveness's sets (a refactor) | Resolve 1.4-1.8× faster in this A/B. Mutation-tested tie-order pins. devmap-analyze 765/0, devmap-resolve 2123/0. |
+
+**Where the Evidence figures come from.** The write, prune and budget figures in the Evidence column (span percentages, paired-rep counts, the churn timings, the starved-build file counts) come from each lane's own runs and their Opus verifiers. Their raw data stayed in the lane worktrees and is **not committed**, so treat them as reported, not reproducible from this folder. The mapping figure and every number in the tables above come from this folder's committed `runs.tsv`.
 
 Diff against `main` at ec99c364, before the soak merge: 35 files, +2,107 / −255.
 
@@ -87,13 +89,13 @@ The figures in this section come from the targets lane's soak harness, merged as
 | Target | Bar | Measured | Verdict |
 |---|---|---|---|
 | One-file incremental p95 | ≤ 120 ms | Lane: pooled N=50 per run, best min 2.3 s, best p95 6.3 s; same-binary medians spanned 2.9× (2.9 s vs 8.4 s) under load 11-20. Verifier: N=40, min 2.75 s, median 3.50 s, p95 5.37 s at load 40. | **Not met** (about 20× at the minimum) |
-| Peak RSS, incremental | < 512 MB | 1.74 GiB on the soak branch's head (write and prune lanes; lane and verifier) vs 1.78 GiB on `main` (lane only; the verifier did not rerun it); cold about 2.06 GiB | **Not met** (3.4×) |
-| 1 writer + 8 readers | 0 SQLITE_BUSY | Lane: 610 s, 84 builds, 3,299 queries; query median 1.28 s, p95 3.66 s. Verifier: 332 s, 98 builds, 7,199 queries. Both runs: 0 busy, 0 errors, 0 timeouts. | **Met as measured, 2 runs** |
+| Peak RSS, incremental | < 512 MB | 1,737-1,757 MiB (1.70-1.72 GiB) on the soak branch's head (write and prune lanes; lane and verifier) vs 1,780-1,793 MiB (1.74-1.75 GiB) on `main` (lane only; the verifier did not rerun it); cold 2,060-2,099 MiB (2.01-2.05 GiB) | **Not met** (3.4× the 512 MiB bound the soak checks; 3.6× the spec's 512 MB) |
+| 1 writer + 8 readers, 10 min | 0 SQLITE_BUSY | Lane run `r1`: 610 s, 84 builds, 3,299 queries, 0 busy, 0 errors, 0 timeouts; query median 1.28 s, p95 3.66 s (committed: `r1.csv`, `r1.soak-output.txt`). The verifier's run (7,199 queries, 0 busy) lasted 332 s, short of the spec's 10 minutes, and is not committed. | **Met once at the spec's duration (N=1)** |
 
 **Soak harness checks.**
 - **Tests.** devmap-soak has 69 lib tests and 9 shutdown tests; the verifier mutation-killed 6 of 6.
 - **Clippy** is clean.
-- **Rustfmt.** The verifier's one blocking item was that the new soak code failed `cargo fmt`. I fixed it after the merge, along with three doc citations it flagged, and committed the soak logs as `.log.txt`, because `.log` is gitignored.
+- **Rustfmt.** The verifier's one blocking item was that the new soak code failed `cargo fmt`. I fixed it after the merge, along with three doc citations it flagged, and meant to commit the soak logs as `.log.txt`; that name is also gitignored (`*.log.*`), so they were missing until the review-fix branch committed them as `<run>.soak-output.txt`.
 - **What the readers gate does not prove.** A reader counts as "overlapped a build" at the process level, not inside the persist write transaction. An exit-0 answer that says `Unavailable` would count as ok; whether any occurred is unverified.
 
 **Caveats on these verdicts:**
@@ -145,7 +147,7 @@ C1 (the parallel sort) is already landed as M3.
 | 3 | C5 scope: a proportional incremental build plus one shared CLI/daemon pipeline | None for phase one | Large cross-crate refactor touching devmap-cli/resolve/store/serve | Approve as its own lane after this branch lands |
 | 4 | Svelte repair (88dc6cbd) shipped without an extraction bump | `EXTRACTION_SCHEMA_VERSION` 98→99 | Every store re-extracts Svelte on the next build | Yes, otherwise cached v98 Svelte payloads stay stale until `--full` |
 | 5 | Merge the storage lane S3 | none | +about 1 s per cold build for −2.4% size | No |
-| 6 | Merge this branch to `main` | none | The `devmap-analyze/src/lib.rs` hunk (7 lines) will conflict with the swarm's uncommitted edits | Yes, after you review |
+| 6 | Merge this branch to `main` | none | Done: fast-forwarded to 8865a28f; the swarm's uncommitted edits to `devmap-analyze/src/lib.rs` and `docs/architecture.md` survived without conflict markers | Closed |
 | 7 | History: WIP commit 60a0b496; b68aa328's subject still says `perf` (relabelled by the empty commit 29adec4e) | none | A rewrite means a rebase before the merge | Leave as is, or squash at the merge |
 | 8 | C4: trust a caller-supplied change set and skip the full-tree scan (−0.17-0.25 s per build) | none | A missed watcher event can leave a stale generation until a periodic reconcile | Decide the reconcile cadence first |
 | 9 | C2 step 2: read `.git/HEAD` by hand instead of spawning git | none | Security-adjacent (hostile repo config, the CVE-2024-32465 note in dc-proc) | Only with a security-impact statement |
