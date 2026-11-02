@@ -14,7 +14,10 @@ pub mod pdg;
 pub mod pdgsrc;
 pub mod record_identity;
 pub mod resolution_rate;
+pub mod scoping;
 pub mod traversal;
+
+pub use scoping::*;
 
 pub use clones::{
     candidates_from_extractions, clone_coverage, group_clones, CloneCandidate, CloneCoverage,
