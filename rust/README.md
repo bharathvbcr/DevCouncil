@@ -9,8 +9,8 @@ jobs**, because a `dc-verify` test must not compile thirty tree-sitter grammars.
 
 | Plane | Crates | Answers |
 |---|---|---|
-| Analysis | `dc-glob`, `dc-grep`, `dc-store`, `dc-verify`, `dc-evidence` | May this change proceed |
-| Kernel | `devmap-extract` … `devmap-cli` | What does this code mean |
+| Analysis | `dc-glob`, `dc-grep`, `dc-store`, `dc-verify`, `dc-evidence`, `dc-proc` | May this change proceed |
+| Kernel | `devmap-extract` … `devmap-cli` (including `devmap-store::csr` zero-copy `mmap` CSR graph storage) | What does this code mean |
 
 DevCouncil owns these as **components and modules**. A harness — [Manvi](https://github.com/bharathvbcr/Manvi)
 wraps them — resolves each as a binary from `PATH` and **links none of them**.
@@ -23,11 +23,12 @@ The analysis-plane crates:
 
 | Crate | Binary | Answers |
 |---|---|---|
-| `dc-store` | `dcstore` | Which tasks exist, and who holds the lease on one |
-| `dc-verify` | `dcverify` | What a diff changed, whether it stayed in scope, whether it is honest, whether tests reached it, and how much of it is new work |
-| `dc-grep` | `dcgrep` | What is in this repository, honouring its ignore rules |
+| `dc-store` | `devc-store` (`dc-store` / `dcstore`) | Which tasks exist, and who holds the lease on one |
+| `dc-verify` | `devc-verify` (`dc-verify` / `dcverify`) | What a diff changed, whether it stayed in scope, whether it is honest, whether tests reached it, and how much of it is new work |
+| `dc-grep` | `devc-grep` (`dc-grep` / `dcgrep`) | What is in this repository, honouring its ignore rules |
 | `dc-glob` | *(library)* | Whether a path matches a pattern, with CPython `fnmatch` semantics |
 | `dc-evidence` | *(library, via `dcverify evidence-check`)* | Whether an independently admitted acceptance contract is satisfied by a bound execution-evidence bundle |
+| `dc-proc` | *(library)* | Subprocess isolation invariants: 5 s default deadline, `/dev/null` stdin, process-group `SIGTERM`/`SIGKILL` escalation and daemon reaping |
 
 ---
 

@@ -8,6 +8,7 @@ daemon, Python runtime or a separate cleanup dependency to use it.
 | --- | --- |
 | `AGENT_RULES` | Guidance on measurement, producer evidence, preservation, native cache retention, fresh checks, user-owned schedules and honest reporting. Guidance grants no permission to delete. |
 | `protected_artifact` / `protected_entry` | Conservative refusal for known dependencies, environments, agent state, credentials and model/data formats. Recognized names are not an exhaustive data classifier. |
+| `audit_tracked_hygiene` | Audits a slice of tracked repository-relative paths against `protected_artifact` and `protected_entry`, returning violation strings whenever tracked files match protected artifact, cache, environment or secret patterns. |
 | `local_provider` | Bounded literal relative path and producer evidence for supported generated output. Rejects traversal and unsupported output. Eligibility alone does not authorize deletion. |
 | `validate_retention` | Manual retention 1–3,650 days; scheduled retention 7–3,650 days. Hosts may tighten these limits. |
 | `CACHE_ADVICE` | Prefer tool-owned cache lifecycle management; preserve downloads and environments. |

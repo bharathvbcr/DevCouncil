@@ -14,7 +14,7 @@ Code intelligence and verification components for AI development.
 > **"DevCouncil should not merely generate code. It should make AI-generated work prove that it satisfied the original intent."**  
 > *Evidence, not model confidence, is the final authority.*
 
-DevCouncil is **components and modules** for AI-assisted software development. It ships independently installable binaries and libraries — code intelligence (`devmap`), task and lease state (`dcstore`), deterministic verification (`dcverify`), ignore-aware search (`dcgrep`), and a Go host (`devcouncil` / `dev`) — so a harness or an app can take only the pieces it needs and update them one at a time.
+DevCouncil is **components and modules** for AI-assisted software development. It ships independently installable binaries and libraries — code intelligence (`devc-map` / `dc-map` / `devmap`), task and lease state (`devc-store` / `dc-store` / `dcstore`), deterministic verification (`devc-verify` / `dc-verify` / `dcverify`), ignore-aware search (`devc-grep` / `dc-grep` / `dcgrep`), and a Go host (`devc` / `devcouncil` / `dev`) — so a harness or an app can take only the pieces it needs and update them one at a time.
 
 See [repository input and verification boundaries](docs/SECURITY_BOUNDARIES.md)
 for executable selection, filesystem protections, resource limits, and the
@@ -30,13 +30,14 @@ difference between unavailable evidence and a passing check.
 
 DevCouncil's core runtime is a set of standalone, compiled native modules. Each binary is useful on its own, sits on `PATH`, and can be spawned or linked by a host that wants that one job:
 
-| Binary | Language | Role & Ownership |
+| Binary / Crate | Language | Role & Ownership |
 |--------|----------|------------------|
-| `devcouncil` / `dev` | **Go** | Host orchestrator: Stdio MCP server (`mcp`), multi-host agent integration (`integrate`), engineering skills distribution (`skills`), task verification (`verify`), and devmap forwarding (`map`, `graph`, `ast`). |
-| `devmap` | **Rust** | Code intelligence engine: Language-aware tree-sitter extraction (schema 98), symbol resolution, blast-radius calculation, dead-code analysis, doc-drift auditing, workspace guides (`AGENTS.md`), and DevMap MCP server (`devmap mcp`, 21 read-only tools). |
-| `dcstore` | **Rust** | State & lease store: SQLite-backed task repository, mutual-exclusion leases for concurrent agent building, evidence records, and gap tracking. |
-| `dcverify` | **Rust** | Deterministic verification: Unified-diff parsing, planned file scope classification, anti-laziness/stub gates, test coverage evaluation, and typed `next_actions` repair signals. |
-| `dcgrep` | **Rust** | Code search: Ripgrep-powered ignore-aware search engine with optional trigram indexing (`tgrep-core`). |
+| `devc` (`devcouncil` / `dev`) | **Go** | Host orchestrator: Stdio MCP server (`mcp`), multi-host agent integration (`integrate`), engineering skills distribution (`skills`), 7-layer specification lifecycle (`spec`), declarative DAG workflows (`workflow`), unified code search (`search`), task verification (`verify`), and devmap forwarding (`map`, `devmap`, `graph`, `ast`). |
+| `devc-map` (`dc-map` / `devmap`) | **Rust** | Unified code intelligence & graph engine: Language-aware tree-sitter extraction (schema 98), 11-tier symbol resolution ladder, Blake3 content-addressed AST store with per-worktree delta overlays, zero-copy `mmap` Compressed Sparse Row (CSR) graph storage (`devmap-store::csr`: `CsrGraphReader`, `CsrGraphWriter`, `AtomicGraphHandle`, `FastBitSet`, `sqlite_v30`), blast-radius calculation, dead-code analysis, doc-drift auditing, workspace guides (`AGENTS.md`), and DevMap MCP server (`devmap mcp`, 21 read-only tools). |
+| `devc-store` (`dc-store` / `dcstore`) | **Rust** | State & lease store: SQLite-backed task repository, ratified constitution gates (`constitution_gates`), mutual-exclusion leases (`ux_task_leases_active`) for concurrent agent building, evidence records, and gap tracking. |
+| `devc-verify` (`dc-verify` / `dcverify`) | **Rust** | Deterministic verification: Unified-diff parsing, planned file scope classification, anti-laziness/stub gates, test coverage evaluation, and typed `next_actions` repair signals. |
+| `devc-grep` (`dc-grep` / `dcgrep`) | **Rust** | Code search: Ripgrep-powered ignore-aware search engine with optional trigram indexing (`tgrep-core`). |
+| `dc-proc` | **Rust** | Subprocess isolation library: Hard deadlines, `/dev/null` stdin, process-group `SIGTERM`/`SIGKILL` escalation, and daemon reaping. |
 
 ```mermaid
 flowchart TD
