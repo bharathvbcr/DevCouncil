@@ -15,6 +15,7 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 pub const TIME: &str = "/usr/bin/time";
@@ -72,7 +73,6 @@ pub fn measure(flag: &str, log: &Path, program: &Path, args: &[&str]) -> io::Res
 /// writer lock, the extraction retry cap) must end the soak with a failure
 /// rather than hang it past its own duration.
 pub const BUILD_TIMEOUT: Duration = Duration::from_secs(900);
-const POLL: Duration = Duration::from_millis(20);
 
 /// [`measure`], and the wall time of the run, bounded by [`BUILD_TIMEOUT`].
 /// On a failed command the report stays in `log` for the caller to read.
@@ -96,6 +96,10 @@ pub fn measure_bounded(
     args: &[&str],
     limit: Duration,
 ) -> io::Result<Measured> {
+    // The exit is timed where it happens: a thread blocks in `wait()` and
+    // stamps the instant it returns, while this thread only enforces the
+    // deadline. A poll loop would round every reading up by up to its
+    // interval, against a 120 ms p95 target.
     let started = Instant::now();
     let mut command = Command::new(TIME);
     command
@@ -108,24 +112,34 @@ pub fn measure_bounded(
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
     let mut child = command.spawn()?;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if started.elapsed() >= limit {
+    let leader = child.id();
+    let (done, exited) = mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let status = child.wait();
+        let _ = done.send((status, Instant::now()));
+    });
+    let outcome = match exited.recv_timeout(limit.saturating_sub(started.elapsed())) {
+        Ok(outcome) => Ok(outcome),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
             #[cfg(unix)]
-            let _ = dc_proc::signal_group(child.id(), dc_proc::Signal::Kill);
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = dc_proc::signal_group(leader, dc_proc::Signal::Kill);
+            let _ = dc_proc::signal_process(leader, dc_proc::Signal::Kill);
+            // The kill ends the wait, so the join is prompt.
+            let _ = waiter.join();
             return Err(io::Error::other(format!(
                 "{} {} timed out after {limit:?} and was killed",
                 program.display(),
                 args.join(" ")
             )));
         }
-        std::thread::sleep(POLL);
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(io::Error::other("the build's wait thread died"))
+        }
     };
-    let wall = started.elapsed();
+    let _ = waiter.join();
+    let (status, exited_at) = outcome?;
+    let status = status?;
+    let wall = exited_at.saturating_duration_since(started);
     if !status.success() {
         return Err(io::Error::other(format!(
             "{} {} exited with {status}",
@@ -160,6 +174,31 @@ mod tests {
     fn a_report_without_the_line_is_no_reading() {
         assert_eq!(parse_peak("real 0.01\nuser 0.00\n"), None);
         assert_eq!(parse_peak("  x  maximum resident set size\n"), None);
+    }
+
+    /// The wall time of a command that exits at once is the cost of starting
+    /// it, a few milliseconds. A 20 ms poll rounds every reading up to 20 ms
+    /// or more, against a 120 ms p95 target, so no run of the old poll loop
+    /// can come in under it. Min-of-N, because one run can land on a loaded
+    /// scheduler slice.
+    #[cfg(unix)]
+    #[test]
+    fn wall_time_is_not_rounded_up_to_the_poll_interval() {
+        let flag = time_flag().expect("/usr/bin/time with -l or -v is required by the soak");
+        let log = std::env::temp_dir().join(format!("soak-rss-wall-{}.log", std::process::id()));
+        let walls: Vec<Duration> = (0..15)
+            .map(|_| {
+                measure_timed(flag, &log, Path::new("/bin/sh"), &["-c", ":"])
+                    .expect("measured")
+                    .wall
+            })
+            .collect();
+        let fastest = walls.iter().min().copied().expect("15 readings");
+        assert!(
+            fastest < Duration::from_millis(15),
+            "fastest of 15 instant commands took {fastest:?}: {walls:?}"
+        );
+        let _ = std::fs::remove_file(&log);
     }
 
     #[cfg(unix)]
