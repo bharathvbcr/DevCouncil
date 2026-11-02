@@ -1662,10 +1662,7 @@ impl Daemon {
         // `build_ms` stops before the commit and the two prunes above. Close it
         // over them, still under the writer lock; the stored value is a true
         // lower bound, so a failure here is logged and the drain stands.
-        if let Err(error) = self
-            .store
-            .finalize_build_ms(generation_id, resync_started)
-        {
+        if let Err(error) = self.store.finalize_build_ms(generation_id, resync_started) {
             warn!("build_history: could not extend build_ms over the prunes: {error:#}");
         }
 

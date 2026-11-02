@@ -218,9 +218,10 @@ fn a_file_past_the_retry_deadline_says_it_was_not_retried_for_that_reason() {
     };
     let (paths, mut out) = first_pass_refused(2);
     let files: Vec<FileRef<'_>> = paths.iter().map(|p| file(p, PY)).collect();
-    let report = retry_budget_refusals_observing(&files, &mut out, None, budgets, None, &mut |_| {
-        std::thread::sleep(Duration::from_millis(700));
-    });
+    let report =
+        retry_budget_refusals_observing(&files, &mut out, None, budgets, None, &mut |_| {
+            std::thread::sleep(Duration::from_millis(700));
+        });
     assert_eq!((report.retried, report.not_retried), (1, 1), "{report:?}");
     let last = reason(&out[1]);
     assert!(

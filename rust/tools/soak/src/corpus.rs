@@ -110,7 +110,9 @@ impl Corpus {
     pub fn describe(&self) -> String {
         let why = match self.choice {
             Choice::Python => "first .py file in name order",
-            Choice::TypeScriptFallback => "TypeScript fallback: no .py file outside node_modules, target, dist and .git",
+            Choice::TypeScriptFallback => {
+                "TypeScript fallback: no .py file outside node_modules, target, dist and .git"
+            }
         };
         format!("soak churn file: {} ({why})", self.relative)
     }

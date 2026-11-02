@@ -55,8 +55,7 @@ fn a_clean_build_reports_zero_refusals_and_prints_no_diagnostic() {
     assert_eq!(key["still_refused"], 0, "{key}");
     assert_eq!(key["not_retried"], 0, "{key}");
     assert_eq!(
-        key,
-        &result["file_progress"]["extraction"]["budget_retry"],
+        key, &result["file_progress"]["extraction"]["budget_retry"],
         "the top-level key must be the nested counts, not a second source"
     );
     assert!(
