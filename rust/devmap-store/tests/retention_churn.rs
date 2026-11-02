@@ -364,7 +364,11 @@ fn retiring_thousands_of_orphans_does_not_scan_the_ledger_once_per_orphan() {
         .inspect
         .query_row("SELECT count(*) FROM unresolved_rows", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(ledger_left, total_before / 2, "open rows must survive whole");
+    assert_eq!(
+        ledger_left,
+        total_before / 2,
+        "open rows must survive whole"
+    );
     fixture.assert_integrity();
 }
 
@@ -407,7 +411,10 @@ fn a_retirement_that_would_dangle_a_ledger_row_fails_loudly_and_rolls_back() {
         .unwrap();
     assert_eq!(generations, 3, "a refused prune must roll back whole");
     assert_eq!(fixture.paths(), ["current.py", "middle.py", "old.py"]);
-    fixture.inspect.execute_batch("DROP TRIGGER dangle").unwrap();
+    fixture
+        .inspect
+        .execute_batch("DROP TRIGGER dangle")
+        .unwrap();
     fixture.assert_integrity();
 }
 
@@ -464,14 +471,24 @@ fn the_pool_retirement_statements_plan_without_a_union_or_a_temp_btree() {
     };
     for (table, union, issued) in [
         ("paths", UNION_PATHS, issued_predicate("paths")),
-        ("unresolved_texts", UNION_TEXTS, issued_predicate("unresolved_texts")),
+        (
+            "unresolved_texts",
+            UNION_TEXTS,
+            issued_predicate("unresolved_texts"),
+        ),
     ] {
-        let old = plan_steps(&fixture.inspect, &format!("DELETE FROM {table} WHERE {union}"));
+        let old = plan_steps(
+            &fixture.inspect,
+            &format!("DELETE FROM {table} WHERE {union}"),
+        );
         assert!(
             sorted(&old),
             "premise: the union form of {table} is expected to plan a sort, got {old:?}"
         );
-        let new = plan_steps(&fixture.inspect, &format!("DELETE FROM {table} WHERE {issued}"));
+        let new = plan_steps(
+            &fixture.inspect,
+            &format!("DELETE FROM {table} WHERE {issued}"),
+        );
         assert!(
             !sorted(&new),
             "prune retires {table} with a sorted union, got {new:?} for `{issued}`"
@@ -480,12 +497,14 @@ fn the_pool_retirement_statements_plan_without_a_union_or_a_temp_btree() {
 }
 
 fn ids(conn: &Connection, table: &str, predicate: &str) -> Vec<i64> {
-    conn.prepare(&format!("SELECT id FROM {table} WHERE {predicate} ORDER BY id"))
-        .unwrap_or_else(|error| panic!("{predicate}: {error}"))
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap()
+    conn.prepare(&format!(
+        "SELECT id FROM {table} WHERE {predicate} ORDER BY id"
+    ))
+    .unwrap_or_else(|error| panic!("{predicate}: {error}"))
+    .query_map([], |row| row.get(0))
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap()
 }
 
 /// Every relation that keeps a path or a text alive, each alone, and one id of
@@ -521,7 +540,11 @@ fn the_rewritten_anti_joins_select_the_ids_the_union_forms_selected() {
 
     let paths = issued_predicate("paths");
     assert_eq!(ids(conn, "paths", &paths), ids(conn, "paths", UNION_PATHS));
-    assert_eq!(ids(conn, "paths", &paths), [7], "only the unreferenced path");
+    assert_eq!(
+        ids(conn, "paths", &paths),
+        [7],
+        "only the unreferenced path"
+    );
     let texts = issued_predicate("unresolved_texts");
     assert_eq!(
         ids(conn, "unresolved_texts", &texts),
@@ -548,7 +571,10 @@ fn a_prune_that_deletes_no_ledger_row_leaves_the_text_pool_alone() {
     }
     fixture
         .inspect
-        .execute("INSERT INTO unresolved_texts (text) VALUES ('planted orphan')", [])
+        .execute(
+            "INSERT INTO unresolved_texts (text) VALUES ('planted orphan')",
+            [],
+        )
         .unwrap();
     assert_eq!(fixture.store.prune_generations_except_latest(1).unwrap(), 2);
     let kept: i64 = fixture
@@ -559,7 +585,10 @@ fn a_prune_that_deletes_no_ledger_row_leaves_the_text_pool_alone() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(kept, 1, "the pool was scanned although no ledger row was deleted");
+    assert_eq!(
+        kept, 1,
+        "the pool was scanned although no ledger row was deleted"
+    );
     fixture.assert_integrity();
 }
 

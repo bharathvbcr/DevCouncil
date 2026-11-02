@@ -545,7 +545,11 @@ fn a_prune_that_drops_nothing_leaves_foreign_keys_on() {
     let store = Store::open_in_memory().expect("store");
     assert_eq!(foreign_keys_pragma(&store), 1);
     assert_eq!(store.prune_generations_except_latest(1).expect("prune"), 0);
-    assert_eq!(foreign_keys_pragma(&store), 1, "the early return left them off");
+    assert_eq!(
+        foreign_keys_pragma(&store),
+        1,
+        "the early return left them off"
+    );
 }
 
 #[test]
@@ -570,8 +574,15 @@ fn a_prune_that_errors_leaves_foreign_keys_on_and_the_store_unchanged() {
     let error = store
         .prune_generations_except_latest(1)
         .expect_err("the trigger refuses the delete");
-    assert!(error.to_string().contains("injected prune failure"), "{error}");
-    assert_eq!(foreign_keys_pragma(&store), 1, "the error path left them off");
+    assert!(
+        error.to_string().contains("injected prune failure"),
+        "{error}"
+    );
+    assert_eq!(
+        foreign_keys_pragma(&store),
+        1,
+        "the error path left them off"
+    );
     let conn = lock_conn(&store.conn).expect("connection");
     let generations: i64 = conn
         .query_row("SELECT count(*) FROM generations", [], |row| row.get(0))

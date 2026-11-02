@@ -36,8 +36,48 @@ pub mod daemon;
 #[cfg(unix)]
 pub mod ipc;
 
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+/// The interrupt path, in the one order that lets an interrupted soak exit
+/// with the signal's code and no failure line: take the cleanup lock, then
+/// kill the measured builds, then clean up. The kill wakes the main thread out
+/// of its build with an error; because this thread already holds the lock, the
+/// main thread cannot reach its own cleanup and exit 1 first, and the failure
+/// it reports on the way goes through [`QuietAfterInterrupt`], which drops it.
+/// The caller exits while still holding the returned guard.
+pub fn stop_for_interrupt<'a>(
+    cleanup: &'a Mutex<Cleanup>,
+    builds: &rss::Builds,
+    out: &mut dyn Write,
+) -> MutexGuard<'a, Cleanup> {
+    let mut guard = cleanup.lock().unwrap_or_else(PoisonError::into_inner);
+    builds.interrupt();
+    guard.run(out);
+    guard
+}
+
+/// The main thread's output: passed through until the soak is interrupted,
+/// dropped after. What it says once an interrupt has killed its build ("SOAK
+/// FAIL: initial build") is the interrupt's echo, not a finding.
+pub struct QuietAfterInterrupt<'a, W> {
+    pub inner: W,
+    pub builds: &'a rss::Builds,
+}
+
+impl<W: Write> Write for QuietAfterInterrupt<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.builds.is_interrupted() {
+            return Ok(buf.len());
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
 
 /// Everything an exit from the soak must undo, whichever path it leaves by —
 /// the shell harness's EXIT trap. The normal path and an interrupt may both

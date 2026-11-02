@@ -85,10 +85,7 @@ fn corpora() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
                     "def alpha():\n    return beta()\n\n\n\
                      def beta():\n    return alpha()\n",
                 ),
-                (
-                    "user.py",
-                    "def use(thing):\n    return thing.alpha()\n",
-                ),
+                ("user.py", "def use(thing):\n    return thing.alpha()\n"),
             ],
         ),
     ]
@@ -104,11 +101,8 @@ fn the_outcome_carries_exactly_the_sets_the_helpers_derive() {
     let mut saw_namesake = false;
     for (kind, files) in corpora() {
         let (extractions, resolution) = resolve(&files);
-        let outcome = analyze_liveness_with_coverage(
-            &extractions,
-            &resolution,
-            DiscoveryCoverage::none(),
-        );
+        let outcome =
+            analyze_liveness_with_coverage(&extractions, &resolution, DiscoveryCoverage::none());
         let exempt = exempt_symbol_names(&extractions, &resolution);
         let namesakes = owned(crate::liveness::unresolved_namesake_names(&resolution));
         assert_eq!(outcome.exempt_names, exempt, "{kind}: exemption set");
@@ -116,7 +110,10 @@ fn the_outcome_carries_exactly_the_sets_the_helpers_derive() {
         saw_exempt |= !exempt.is_empty();
         saw_namesake |= !namesakes.is_empty();
     }
-    assert!(saw_exempt, "no fixture produced an exemption: the test is vacuous");
+    assert!(
+        saw_exempt,
+        "no fixture produced an exemption: the test is vacuous"
+    );
     assert!(
         saw_namesake,
         "no fixture produced an unresolved namesake: the test is vacuous"
@@ -128,11 +125,8 @@ fn handing_the_sets_over_reports_the_same_clusters_as_deriving_them() {
     let mut saw_cluster = false;
     for (kind, files) in corpora() {
         let (extractions, resolution) = resolve(&files);
-        let outcome = analyze_liveness_with_coverage(
-            &extractions,
-            &resolution,
-            DiscoveryCoverage::none(),
-        );
+        let outcome =
+            analyze_liveness_with_coverage(&extractions, &resolution, DiscoveryCoverage::none());
         let derived = dead_clusters(&extractions, &resolution);
         let handed = dead_clusters_with(
             &extractions,

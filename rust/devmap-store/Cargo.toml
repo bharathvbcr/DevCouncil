@@ -66,6 +66,10 @@ name = "adversarial_store"
 required-features = ["parse"]
 
 [[test]]
+name = "adversarial_storage_batching_stress"
+required-features = ["parse"]
+
+[[test]]
 name = "coverage_gap_inventory"
 required-features = ["parse"]
 

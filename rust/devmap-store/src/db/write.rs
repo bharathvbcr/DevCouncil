@@ -2543,7 +2543,8 @@ impl Store {
                 let mut count = 0i64;
                 for row in rows {
                     let (path, parse_json, engine_json) = row?;
-                    let (outcome, engine) = decode_stored_outcome(&path, &parse_json, &engine_json)?;
+                    let (outcome, engine) =
+                        decode_stored_outcome(&path, &parse_json, &engine_json)?;
                     if stored_is_parse_failure(&outcome, &engine) {
                         count += 1;
                     }
