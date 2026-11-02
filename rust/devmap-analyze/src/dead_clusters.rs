@@ -29,7 +29,7 @@ use devmap_resolve::model::{Resolution, ResolutionResult, ResolvedEdge};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "parse"))]
 mod handed_on_sets_tests;
 
 /// Most clusters reported. Shares the reasoning behind `DEAD_CANDIDATE_CAP`:

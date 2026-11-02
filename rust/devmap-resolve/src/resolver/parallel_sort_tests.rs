@@ -7,11 +7,11 @@
 //! threads.
 //!
 //! A perf-only change: no behaviour differs, so there is no pre-fix failure to
-//! show. The test fails if the caller is ever moved to an unstable sort only
-//! when that sort is what these tests call; the graph-parity dump hashes are
-//! the check on the production call itself.
+//! show. The parallel arm calls `sort_edges` / `sort_unresolved`, the same
+//! functions `resolve_pass` calls, so moving them to an unstable sort fails
+//! these tests; the graph-parity dump hashes remain the end-to-end check.
 
-use super::resolve_all::{edge_order, unresolved_order};
+use super::resolve_all::{edge_order, sort_edges, sort_unresolved, unresolved_order};
 use super::*;
 
 const ROWS: u64 = 60_000;
@@ -107,7 +107,7 @@ fn edges_sort_to_the_same_bytes_as_the_serial_sort() {
     let mut serial = input.clone();
     let mut parallel = input;
     serial.sort_by(edge_order);
-    parallel.par_sort_by(edge_order);
+    sort_edges(&mut parallel);
 
     let ties = serial
         .windows(2)
@@ -126,7 +126,7 @@ fn the_ledger_sorts_to_the_same_bytes_as_the_serial_sort() {
     let mut serial = input.clone();
     let mut parallel = input;
     serial.sort_by(unresolved_order);
-    parallel.par_sort_by(unresolved_order);
+    sort_unresolved(&mut parallel);
 
     let ties = serial
         .windows(2)

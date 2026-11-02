@@ -2302,7 +2302,7 @@ impl Resolver {
 
         // R4: emission order must not depend on input iteration order. See
         // `edge_order` for the comparator and why the sort must stay stable.
-        edges.par_sort_by(edge_order);
+        sort_edges(&mut edges);
         edges.dedup_by(|left, right| {
             left.source_file == right.source_file
                 && left.source_symbol == right.source_symbol
@@ -2315,7 +2315,7 @@ impl Resolver {
         });
 
         // R4: emission order must not depend on input iteration order.
-        unresolved.par_sort_by(unresolved_order);
+        sort_unresolved(&mut unresolved);
 
         debug_assert!(
             self.dangling_swift_targets(&edges).is_empty(),
@@ -2331,9 +2331,22 @@ impl Resolver {
     }
 }
 
+/// Sorts `resolve_pass`'s edges into emission order. The one call production
+/// makes, so the tests in `parallel_sort_tests` exercise it rather than a copy:
+/// a switch to an unstable sort here is what they catch.
+pub(super) fn sort_edges(edges: &mut [ResolvedEdge]) {
+    edges.par_sort_by(edge_order);
+}
+
+/// Sorts `resolve_pass`'s unresolved ledger into emission order; see
+/// [`sort_edges`].
+pub(super) fn sort_unresolved(unresolved: &mut [UnresolvedReference]) {
+    unresolved.par_sort_by(unresolved_order);
+}
+
 /// The emission order of `resolve_pass`'s edges (R4).
 ///
-/// Named so the tie-order pin in `ladder_tests` sorts with the very function
+/// Named so the tie-order pin in `parallel_sort_tests` sorts with the very function
 /// production does. The caller uses `par_sort_by`, which is a *stable* merge
 /// sort, so rows this comparator calls equal keep their input order exactly as
 /// `sort_by` kept them; never switch the caller to an unstable sort.
