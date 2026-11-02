@@ -105,14 +105,15 @@ func sanitizeDisabled(ids []string) []string {
 	var out []string
 	for _, id := range ids {
 		id = strings.TrimSpace(strings.ToLower(id))
-		if _, ok := Lookup(id); !ok {
+		c, ok := Lookup(id)
+		if !ok {
 			continue
 		}
-		if seen[id] {
+		if seen[c.ID] {
 			continue
 		}
-		seen[id] = true
-		out = append(out, id)
+		seen[c.ID] = true
+		out = append(out, c.ID)
 	}
 	return out
 }

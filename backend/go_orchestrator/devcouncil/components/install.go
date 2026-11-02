@@ -34,14 +34,14 @@ Presets:
   analysis    devmap dcstore dcverify dcgrep
   codeintel   devmap
   devmap      devmap only (standalone code-intelligence CLI)
-  host        Go host (devcouncil + dev symlink)
+  host        Go host (devcouncil + devc / dev symlinks)
 
-Components:
-  host        Go orchestrator (devcouncil / dev)
-  devmap      code-intelligence graph
-  dcstore     task and lease store
-  dcverify    deterministic verifier
-  dcgrep      ignore-aware search
+Components (canonical ID and devc-* / dc-* aliases):
+  host        Go orchestrator (devcouncil / devc / dev)
+  devmap      code-intelligence graph (devc-map / dc-map / devmap)
+  dcstore     task and lease store (devc-store / dc-store / dcstore)
+  dcverify    deterministic verifier (devc-verify / dc-verify / dcverify)
+  dcgrep      ignore-aware search (devc-grep / dc-grep / dcgrep)
 
 Options:
   --only NAME         same as a positional name (repeatable)
@@ -294,6 +294,7 @@ func PlannedCommands(cs []Component, o Options) []string {
 			}
 			cmds = append(cmds, fmt.Sprintf("go -C %s build -o %s ./cmd/devcouncil",
 				shellQuote(filepath.Join(src, "backend", "go_orchestrator")), shellQuote(out)))
+			cmds = append(cmds, fmt.Sprintf("ln -sf %s %s", hostBinaryName(), shellQuote(filepath.Join(prefix, "bin", "devc"))))
 			cmds = append(cmds, fmt.Sprintf("ln -sf %s %s", hostBinaryName(), shellQuote(filepath.Join(prefix, "bin", "dev"))))
 		} else {
 			cmds = append(cmds, o.hostSourceError().Error())
@@ -535,16 +536,25 @@ func installHost(src, prefix string, o Options) error {
 }
 
 func installDevLink(bindir string) error {
+	for _, alias := range []string{"devc", "dev"} {
+		if err := installComponentLink(bindir, "devcouncil", alias); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func installComponentLink(bindir, targetBin, alias string) error {
 	if runtime.GOOS == "windows" {
-		src := filepath.Join(bindir, "devcouncil.exe")
-		dest := filepath.Join(bindir, "dev.exe")
+		src := filepath.Join(bindir, targetBin+".exe")
+		dest := filepath.Join(bindir, alias+".exe")
 		if err := installAtomic(src, dest); err != nil {
-			return fmt.Errorf("install dev.exe: %w", err)
+			return fmt.Errorf("install %s.exe: %w", alias, err)
 		}
 		return nil
 	}
-	dest := filepath.Join(bindir, "dev")
-	kind, err := classifyDevLink(dest)
+	dest := filepath.Join(bindir, alias)
+	kind, err := classifyComponentLink(dest, targetBin)
 	if err != nil {
 		return err
 	}
@@ -553,7 +563,7 @@ func installDevLink(bindir string) error {
 			return err
 		}
 	}
-	return os.Symlink("devcouncil", dest)
+	return os.Symlink(targetBin, dest)
 }
 
 type devLinkKind int
@@ -565,6 +575,10 @@ const (
 )
 
 func classifyDevLink(dest string) (devLinkKind, error) {
+	return classifyComponentLink(dest, "devcouncil")
+}
+
+func classifyComponentLink(dest, targetBin string) (devLinkKind, error) {
 	info, err := os.Lstat(dest)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -581,8 +595,8 @@ func classifyDevLink(dest string) (devLinkKind, error) {
 			return 0, err
 		}
 		base := filepath.Base(target)
-		if base != "devcouncil" && base != "devcouncil.exe" {
-			return devLinkForeign, fmt.Errorf("refusing to replace %s (symlink to %s, not devcouncil)", dest, target)
+		if base != targetBin && base != targetBin+".exe" {
+			return devLinkForeign, fmt.Errorf("refusing to replace %s (symlink to %s, not %s)", dest, target, targetBin)
 		}
 		return devLinkOurs, nil
 	}
@@ -636,7 +650,13 @@ func Uninstall(cs []Component, o Options) error {
 		if c.ID == "host" {
 			candidates = append(candidates, filepath.Join(bindir, hostBinaryName()))
 			if runtime.GOOS == "windows" {
-				candidates = append(candidates, filepath.Join(bindir, "dev.exe"))
+				for _, alias := range c.Aliases {
+					candidates = append(candidates, filepath.Join(bindir, alias+".exe"))
+				}
+			}
+		} else if runtime.GOOS == "windows" {
+			for _, alias := range c.Aliases {
+				candidates = append(candidates, filepath.Join(bindir, alias+".exe"))
 			}
 		}
 		removed, failed := false, false
@@ -651,15 +671,17 @@ func Uninstall(cs []Component, o Options) error {
 				removed = true
 			}
 		}
-		if c.ID == "host" && runtime.GOOS != "windows" {
-			dev := filepath.Join(bindir, "dev")
-			kind, err := classifyDevLink(dev)
-			if err != nil {
-				console.Errorf("note: left %s in place: %v\n", dev, err)
-			} else if kind == devLinkOurs {
-				if _, err := removeOwned(prefix, dev, o.DryRun); err != nil {
-					errs = append(errs, fmt.Errorf("%s: %w", c.ID, err))
-					failed = true
+		if runtime.GOOS != "windows" {
+			for _, alias := range c.Aliases {
+				linkPath := filepath.Join(bindir, alias)
+				kind, err := classifyComponentLink(linkPath, c.Binary)
+				if err != nil {
+					console.Errorf("note: left %s in place: %v\n", linkPath, err)
+				} else if kind == devLinkOurs {
+					if _, err := removeOwned(prefix, linkPath, o.DryRun); err != nil {
+						errs = append(errs, fmt.Errorf("%s: %w", c.ID, err))
+						failed = true
+					}
 				}
 			}
 		}
@@ -743,10 +765,11 @@ func catalogID(id string) (string, error) {
 	if id == "" {
 		return "", fmt.Errorf("unknown component %q", id)
 	}
-	if _, ok := Lookup(id); !ok {
+	c, ok := Lookup(id)
+	if !ok {
 		return "", fmt.Errorf("unknown component %q", id)
 	}
-	return id, nil
+	return c.ID, nil
 }
 
 func Disable(id string, o Options) error {

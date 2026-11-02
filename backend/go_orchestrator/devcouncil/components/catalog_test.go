@@ -58,6 +58,30 @@ func TestPresetNamesStayInSyncWithCatalog(t *testing.T) {
 	}
 }
 
+func TestResolveUnifiedDevcAndDcAliases(t *testing.T) {
+	cases := map[string]string{
+		"devc":        "host",
+		"dev":         "host",
+		"devc-map":    "devmap",
+		"dc-map":      "devmap",
+		"devc-store":  "dcstore",
+		"dc-store":    "dcstore",
+		"devc-verify": "dcverify",
+		"dc-verify":   "dcverify",
+		"devc-grep":   "dcgrep",
+		"dc-grep":     "dcgrep",
+	}
+	for alias, wantID := range cases {
+		got, err := Resolve([]string{alias})
+		if err != nil {
+			t.Fatalf("Resolve(%q) failed: %v", alias, err)
+		}
+		if len(got) != 1 || got[0].ID != wantID {
+			t.Fatalf("Resolve(%q) = %+v, want %q", alias, got, wantID)
+		}
+	}
+}
+
 func idsOf(cs []Component) []string {
 	out := make([]string, len(cs))
 	for i, c := range cs {

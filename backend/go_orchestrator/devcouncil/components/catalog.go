@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -24,12 +25,13 @@ const (
 
 // Component is one independently installable binary.
 type Component struct {
-	ID          string `json:"id"`
-	Binary      string `json:"binary"`
-	Kind        Kind   `json:"kind"`
-	Package     string `json:"package"`
-	Description string `json:"description"`
-	Standalone  bool   `json:"standalone"`
+	ID          string   `json:"id"`
+	Binary      string   `json:"binary"`
+	Aliases     []string `json:"aliases,omitempty"`
+	Kind        Kind     `json:"kind"`
+	Package     string   `json:"package"`
+	Description string   `json:"description"`
+	Standalone  bool     `json:"standalone"`
 }
 
 // Catalog is the ordered list. Presets resolve to subsets of these IDs.
@@ -37,38 +39,43 @@ var Catalog = []Component{
 	{
 		ID:          "host",
 		Binary:      "devcouncil",
+		Aliases:     []string{"devc", "dev"},
 		Kind:        KindGo,
 		Package:     "./cmd/devcouncil",
-		Description: "Go host: MCP, integrate, skills, verify, map forwarding (also installed as `dev`)",
+		Description: "Go host: MCP, integrate, skills, verify, map forwarding (also installed as `devc` and `dev`)",
 	},
 	{
 		ID:          "devmap",
 		Binary:      "devmap",
+		Aliases:     []string{"devc-map", "dc-map"},
 		Kind:        KindRust,
 		Package:     "devmap-cli",
-		Description: "Code-intelligence graph CLI — installable on its own",
+		Description: "Code-intelligence graph CLI — installable on its own (also installed as `devc-map` and `dc-map`)",
 		Standalone:  true,
 	},
 	{
 		ID:          "dcstore",
 		Binary:      "dcstore",
+		Aliases:     []string{"devc-store", "dc-store"},
 		Kind:        KindRust,
 		Package:     "dc-store",
-		Description: "Task and lease store",
+		Description: "Task and lease store (also installed as `devc-store` and `dc-store`)",
 	},
 	{
 		ID:          "dcverify",
 		Binary:      "dcverify",
+		Aliases:     []string{"devc-verify", "dc-verify"},
 		Kind:        KindRust,
 		Package:     "dc-verify",
-		Description: "Deterministic verifier",
+		Description: "Deterministic verifier (also installed as `devc-verify` and `dc-verify`)",
 	},
 	{
 		ID:          "dcgrep",
 		Binary:      "dcgrep",
+		Aliases:     []string{"devc-grep", "dc-grep"},
 		Kind:        KindRust,
 		Package:     "dc-grep",
-		Description: "Ignore-aware repository search",
+		Description: "Ignore-aware repository search (also installed as `devc-grep` and `dc-grep`)",
 	},
 }
 
@@ -82,10 +89,10 @@ var Presets = map[string][]string{
 	"host":      {"host"},
 }
 
-// Lookup returns a catalog entry by ID.
+// Lookup returns a catalog entry by ID or alias.
 func Lookup(id string) (Component, bool) {
 	for _, c := range Catalog {
-		if c.ID == id {
+		if c.ID == id || slices.Contains(c.Aliases, id) {
 			return c, true
 		}
 	}
