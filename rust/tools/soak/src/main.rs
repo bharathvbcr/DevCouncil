@@ -215,6 +215,11 @@ mod soak {
                 }
             });
             if let Some(code) = code {
+                // First, the measured builds: each leads its own process
+                // group, so the Ctrl-C that reached this process did not
+                // reach them, and one left running would write into the
+                // store while the cleanup below restores the corpus.
+                rss::BUILDS.interrupt();
                 let mut guard = cleanup
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -256,6 +261,7 @@ mod soak {
                 return 1;
             }
         };
+        let _ = writeln!(out, "{}", corpus.describe());
         let cleanup = Arc::new(Mutex::new(Cleanup {
             corpus: Some(corpus.clone()),
             ..Cleanup::default()
@@ -949,12 +955,8 @@ mod soak {
             sum(|r| r.other),
             sum(|r| r.overlapped)
         );
-        if let Some(s) = stats::summarize(&latencies) {
-            let _ = writeln!(
-                out,
-                "reader query latency ms: N={} min {} median {} p95 {} max {}",
-                s.n, s.min, s.median, s.p95, s.max
-            );
+        if let Some(line) = stats::latency_line(&latencies) {
+            let _ = writeln!(out, "{line}");
         }
         let _ = writeln!(
             out,
