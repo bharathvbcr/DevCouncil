@@ -35,6 +35,7 @@ pub(super) fn record_event(
             | "enhancements.complete"
             | "enhancements.recover"
             | "decisions.create"
+            | "signals.record"
     ) {
         return Ok(());
     }
@@ -83,6 +84,20 @@ pub(super) fn record_event(
             "run_unresolved",
             "Coding agent outcome needs attention",
         ),
+        // A host watcher's CI result on an attempt's branch (see `signals`).
+        // The kind keeps the `run_` prefix every inbox reader requires of a
+        // run target; `state` carries the signal kind.
+        ("signals.record", "ci_passed") => {
+            ("run", "run_ci_passed", "Coding agent branch passed CI")
+        }
+        ("signals.record", "ci_failed") => {
+            ("run", "run_ci_failed", "Coding agent branch failed CI")
+        }
+        ("signals.record", "ci_cancelled") => (
+            "run",
+            "run_ci_cancelled",
+            "Coding agent branch CI was cancelled",
+        ),
         ("enhancements.complete", "ready") => (
             "enhancement",
             "enhancement_ready",
@@ -106,6 +121,18 @@ pub(super) fn record_event(
     let target_revision = input.integer("revision", None, MAX_INTEGER)?;
     let task_revision = input.integer("source_revision", None, MAX_INTEGER)?;
     let body:String=conn.query_row("SELECT json_object('id',?1,'revision',1,'source_sequence',?2,'task_id',?3,'task_revision',?4,'target_type',?5,'target_id',?6,'target_revision',?7,'kind',?8,'title',?9,'created_at',?10,'updated_at',?10,'read_at',NULL,'dismissed_at',NULL,'snoozed_until',NULL)",params![id,sequence,task,task_revision,target_type,target,target_revision,kind,title,now],|r|r.get(0))?;
+    // A signal's bounded facts ride in the body so a repeat can be recognised;
+    // every other kind keeps its body exactly as it was.
+    let signal: Option<String> =
+        conn.query_row("SELECT json_extract(?1,'$.signal')", [source], |r| r.get(0))?;
+    let body: String = match signal {
+        Some(signal) => conn.query_row(
+            "SELECT json_set(?1,'$.signal',json(?2))",
+            params![body, signal],
+            |r| r.get(0),
+        )?,
+        None => body,
+    };
     conn.execute("INSERT INTO work_attention(id,revision,source_sequence,task_id,body) VALUES(?1,1,?2,?3,?4)",params![id,sequence,task,body])?;
     conn.execute("INSERT INTO work_revisions(entity_type,entity_id,revision,body) VALUES('attention',?1,1,?2)",params![id,body])?;
     Ok(())
