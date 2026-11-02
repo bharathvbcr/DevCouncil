@@ -8,14 +8,24 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-pub const HEADER: &str = "cycle,rss_bytes,db_bytes";
+pub const HEADER: &str =
+    "cycle,rss_bytes,db_bytes,build_ms,dirty_build_ms,dirty_rss_bytes";
 
 /// One row of the samples file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `rss` is the peak of the restored-source build in build mode and the
+/// daemon's resident size in daemon mode. The last three columns are the
+/// one-file incremental builds of a build-mode cycle (the restored build, the
+/// edited build, and the edited build's peak RSS); they are empty in daemon
+/// mode, where no build is timed, and in files written before they existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Sample {
     pub cycle: u64,
     pub rss: u64,
     pub db: u64,
+    pub build_ms: Option<u64>,
+    pub dirty_build_ms: Option<u64>,
+    pub dirty_rss: Option<u64>,
 }
 
 /// The samples file. Created with its header; appended to once per cycle.
@@ -41,7 +51,17 @@ impl Samples {
 
     pub fn append(&self, sample: Sample) -> io::Result<()> {
         let mut file = OpenOptions::new().append(true).open(&self.path)?;
-        writeln!(file, "{},{},{}", sample.cycle, sample.rss, sample.db)?;
+        let opt = |v: Option<u64>| v.map_or_else(String::new, |v| v.to_string());
+        writeln!(
+            file,
+            "{},{},{},{},{},{}",
+            sample.cycle,
+            sample.rss,
+            sample.db,
+            opt(sample.build_ms),
+            opt(sample.dirty_build_ms),
+            opt(sample.dirty_rss)
+        )?;
         file.flush()
     }
 
@@ -52,13 +72,40 @@ impl Samples {
         for (n, line) in text.lines().enumerate().skip(1) {
             let fields: Vec<&str> = line.split(',').collect();
             let parse = |i: usize| fields.get(i).and_then(|f| f.trim().parse::<u64>().ok());
-            match (parse(0), parse(1), parse(2)) {
-                (Some(cycle), Some(rss), Some(db)) => rows.push(Sample { cycle, rss, db }),
+            // An optional column is absent (an older file), empty (a mode that
+            // does not time builds), or a number; anything else is damage.
+            let optional = |i: usize| match fields.get(i).map(|f| f.trim()) {
+                None | Some("") => Some(None),
+                Some(f) => f.parse::<u64>().ok().map(Some),
+            };
+            match (
+                parse(0),
+                parse(1),
+                parse(2),
+                optional(3),
+                optional(4),
+                optional(5),
+            ) {
+                (
+                    Some(cycle),
+                    Some(rss),
+                    Some(db),
+                    Some(build_ms),
+                    Some(dirty_build_ms),
+                    Some(dirty_rss),
+                ) => rows.push(Sample {
+                    cycle,
+                    rss,
+                    db,
+                    build_ms,
+                    dirty_build_ms,
+                    dirty_rss,
+                }),
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
-                            "{} line {} is not cycle,rss,db: {line:?}",
+                            "{} line {} is not {HEADER}: {line:?}",
                             self.path.display(),
                             n + 1
                         ),
@@ -188,6 +235,7 @@ mod tests {
                 cycle: c,
                 rss: rss(c),
                 db: db(c),
+                ..Sample::default()
             })
             .collect()
     }
@@ -211,6 +259,7 @@ mod tests {
                 cycle: 1,
                 rss: 123 * 1024,
                 db: 456,
+                ..Sample::default()
             })
             .expect("daemon row");
         samples
@@ -218,13 +267,36 @@ mod tests {
                 cycle: 2,
                 rss: 123,
                 db: 456,
+                build_ms: Some(2500),
+                dirty_build_ms: Some(2600),
+                dirty_rss: Some(789),
             })
             .expect("build row");
         assert_eq!(
             std::fs::read_to_string(&path).expect("read"),
-            "cycle,rss_bytes,db_bytes\n1,125952,456\n2,123,456\n"
+            "cycle,rss_bytes,db_bytes,build_ms,dirty_build_ms,dirty_rss_bytes\n\
+             1,125952,456,,,\n2,123,456,2500,2600,789\n"
         );
-        assert_eq!(samples.read().expect("parse").len(), 2);
+        let rows = samples.read().expect("parse");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].build_ms, None);
+        assert_eq!(rows[1].build_ms, Some(2500));
+        assert_eq!(rows[1].dirty_build_ms, Some(2600));
+        assert_eq!(rows[1].dirty_rss, Some(789));
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn an_older_three_column_file_still_reads_and_a_damaged_optional_column_does_not() {
+        let dir = std::env::temp_dir().join(format!("soak-samples-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("old.csv");
+        std::fs::write(&path, "cycle,rss_bytes,db_bytes\n1,10,20\n").expect("write");
+        let samples = Samples { path: path.clone() };
+        let rows = samples.read().expect("a three-column file reads");
+        assert_eq!(rows[0].build_ms, None);
+        std::fs::write(&path, format!("{HEADER}\n1,10,20,abc,,\n")).expect("write");
+        assert!(samples.read().is_err(), "a non-numeric build_ms was accepted");
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
@@ -239,7 +311,8 @@ mod tests {
             .append(Sample {
                 cycle: 1,
                 rss: 1,
-                db: 1
+                db: 1,
+                ..Sample::default()
             })
             .is_err());
         std::fs::remove_dir_all(&dir).expect("cleanup");

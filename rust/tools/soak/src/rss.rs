@@ -15,6 +15,7 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 pub const TIME: &str = "/usr/bin/time";
 
@@ -50,10 +51,32 @@ pub fn parse_peak(report: &str) -> Option<u64> {
     kib.trim().parse::<u64>().ok().map(|k| k * 1024)
 }
 
+/// One measured run: the peak RSS and the wall time of the whole subprocess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Measured {
+    pub peak: u64,
+    /// Parent-side wall time from spawn to exit, so it includes
+    /// `/usr/bin/time`'s own exec (a few milliseconds) and the measured
+    /// command's start-up, its writer-lock wait and its teardown.
+    pub wall: Duration,
+}
+
 /// Run `program args…` under `/usr/bin/time`, its report written to `log`,
 /// and return the peak RSS in bytes. A failed command or an unreadable report
 /// is an error.
 pub fn measure(flag: &str, log: &Path, program: &Path, args: &[&str]) -> io::Result<u64> {
+    measure_timed(flag, log, program, args).map(|m| m.peak)
+}
+
+/// [`measure`], and the wall time of the run. On a failed command the report
+/// stays in `log` for the caller to read.
+pub fn measure_timed(
+    flag: &str,
+    log: &Path,
+    program: &Path,
+    args: &[&str],
+) -> io::Result<Measured> {
+    let started = Instant::now();
     let status = Command::new(TIME)
         .arg(flag)
         .arg(program)
@@ -62,6 +85,7 @@ pub fn measure(flag: &str, log: &Path, program: &Path, args: &[&str]) -> io::Res
         .stdout(Stdio::null())
         .stderr(File::create(log)?)
         .status()?;
+    let wall = started.elapsed();
     if !status.success() {
         return Err(io::Error::other(format!(
             "{} {} exited with {status}",
@@ -70,7 +94,9 @@ pub fn measure(flag: &str, log: &Path, program: &Path, args: &[&str]) -> io::Res
         )));
     }
     let report = std::fs::read_to_string(log)?;
-    parse_peak(&report).ok_or_else(|| io::Error::other(format!("no peak RSS in {}", log.display())))
+    let peak = parse_peak(&report)
+        .ok_or_else(|| io::Error::other(format!("no peak RSS in {}", log.display())))?;
+    Ok(Measured { peak, wall })
 }
 
 #[cfg(test)]
@@ -103,6 +129,13 @@ mod tests {
         let log = std::env::temp_dir().join(format!("soak-rss-{}.log", std::process::id()));
         let peak = measure(flag, &log, Path::new("/bin/sh"), &["-c", ":"]).expect("measured");
         assert!(peak > 0);
+        let timed = measure_timed(flag, &log, Path::new("/bin/sh"), &["-c", "sleep 0.2"])
+            .expect("measured");
+        assert!(
+            timed.wall >= Duration::from_millis(200) && timed.wall < Duration::from_secs(20),
+            "wall {:?}",
+            timed.wall
+        );
         assert!(measure(flag, &log, Path::new("/bin/sh"), &["-c", "exit 3"]).is_err());
         let _ = std::fs::remove_file(&log);
     }

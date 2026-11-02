@@ -15,33 +15,44 @@ pub struct Corpus {
 }
 
 /// The first `.py` file under `root`, in name order, outside any dotted
-/// top-level directory. Any dotted one, not `.devcouncil` by name: the state
-/// directory is whichever one the kernel picks, and a churn target inside it
-/// would be rewritten by the build it is supposed to perturb.
+/// top-level directory; failing that the first `.ts` file (not a `.d.ts`),
+/// for a corpus with no Python, such as GitPulse. Any dotted directory, not
+/// `.devcouncil` by name: the state directory is whichever one the kernel
+/// picks, and a churn target inside it would be rewritten by the build it is
+/// supposed to perturb. Python wins whenever it exists, so the corpora the
+/// soak has always run on keep their target.
 pub fn find_target(root: &Path) -> Option<PathBuf> {
-    fn walk(dir: &Path, top: bool) -> Option<PathBuf> {
-        let mut entries: Vec<_> = fs::read_dir(dir).ok()?.filter_map(Result::ok).collect();
-        entries.sort_by_key(fs::DirEntry::file_name);
-        for entry in entries {
-            let name = entry.file_name();
-            if top && name.to_string_lossy().starts_with('.') {
-                continue;
-            }
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            let path = entry.path();
-            if kind.is_dir() {
-                if let Some(found) = walk(&path, false) {
-                    return Some(found);
-                }
-            } else if kind.is_file() && path.extension().is_some_and(|e| e == "py") {
-                return Some(path);
-            }
+    walk(root, true, "py").or_else(|| walk(root, true, "ts"))
+}
+
+fn wanted(path: &Path, extension: &str) -> bool {
+    path.extension().is_some_and(|e| e == extension)
+        && !path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().ends_with(".d.ts"))
+}
+
+fn walk(dir: &Path, top: bool, extension: &str) -> Option<PathBuf> {
+    let mut entries: Vec<_> = fs::read_dir(dir).ok()?.filter_map(Result::ok).collect();
+    entries.sort_by_key(fs::DirEntry::file_name);
+    for entry in entries {
+        let name = entry.file_name();
+        if top && name.to_string_lossy().starts_with('.') {
+            continue;
         }
-        None
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if kind.is_dir() {
+            if let Some(found) = walk(&path, false, extension) {
+                return Some(found);
+            }
+        } else if kind.is_file() && wanted(&path, extension) {
+            return Some(path);
+        }
     }
-    walk(root, true)
+    None
 }
 
 impl Corpus {
@@ -62,13 +73,20 @@ impl Corpus {
         })
     }
 
+    /// The text appended for cycle `i`: a function the kernel must index, in
+    /// the target's own language.
+    pub fn cycle_text(&self, i: u64) -> String {
+        if self.target.extension().is_some_and(|e| e == "ts") {
+            format!("\n// soak cycle {i}\nfunction _soak_{i}(): number {{\n  return {i};\n}}\n")
+        } else {
+            format!("\n# soak cycle {i}\ndef _soak_{i}():\n    return {i}\n")
+        }
+    }
+
     /// Append cycle `i`'s function: a new symbol the kernel must index.
     pub fn append_cycle(&self, i: u64) -> io::Result<()> {
         let mut file = fs::OpenOptions::new().append(true).open(&self.target)?;
-        write!(
-            file,
-            "\n# soak cycle {i}\ndef _soak_{i}():\n    return {i}\n"
-        )
+        write!(file, "{}", self.cycle_text(i))
     }
 
     /// The daemon `impact` frame for cycle `i`'s own symbol, as the
@@ -122,6 +140,29 @@ mod tests {
         let none = tree("none", &[".devmap/a.py", "readme.md"]);
         assert_eq!(find_target(&none), None);
         fs::remove_dir_all(&none).expect("cleanup");
+    }
+
+    #[test]
+    fn a_corpus_with_no_python_falls_back_to_the_first_typescript_file() {
+        let root = tree(
+            "ts",
+            &[".x/a.ts", "a/types.d.ts", "a/b.rs", "src/main.ts", "src/z.ts"],
+        );
+        assert_eq!(find_target(&root), Some(root.join("src/main.ts")));
+        let corpus = Corpus::open(&root, 11).expect("open");
+        assert_eq!(corpus.relative, "src/main.ts");
+        corpus.append_cycle(2).expect("append");
+        assert_eq!(
+            fs::read_to_string(&corpus.target).expect("read"),
+            "x = 1\n\n// soak cycle 2\nfunction _soak_2(): number {\n  return 2;\n}\n"
+        );
+        corpus.restore().expect("restore");
+        assert_eq!(fs::read_to_string(&corpus.target).expect("read"), "x = 1\n");
+        fs::remove_dir_all(&root).expect("cleanup");
+        // Python still wins when both exist.
+        let both = tree("both", &["a.ts", "z/b.py"]);
+        assert_eq!(find_target(&both), Some(both.join("z/b.py")));
+        fs::remove_dir_all(&both).expect("cleanup");
     }
 
     #[test]
