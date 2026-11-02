@@ -11,14 +11,24 @@
 //! cycles with queries over IPC, which is the process an agent host actually
 //! keeps open and the only one where a leak accumulates across hours.
 //!
+//! Build mode also reports the Medium-repository targets (one-file incremental
+//! build p95 <= 120 ms, peak RSS < 512 MB; see [`stats`]) as summary lines
+//! ahead of the verdict, without failing on them: they describe the kernel,
+//! not the harness. `--readers N --duration SECS` is a third mode in which one
+//! writer keeps editing and rebuilding while N readers query the same store,
+//! and any busy, locked or other reader error fails the run ([`readers`]).
+//!
 //! This replaced `rust/tools/soak.sh` and its two Python harness tests, which
 //! sliced shell functions out of the script by string index to test them.
 
+pub mod args;
 pub mod corpus;
 pub mod diskio;
 pub mod query;
+pub mod readers;
 pub mod rss;
 pub mod samples;
+pub mod stats;
 pub mod store;
 
 #[cfg(unix)]
