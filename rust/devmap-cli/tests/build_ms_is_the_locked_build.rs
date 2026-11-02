@@ -48,7 +48,13 @@ fn write_module(root: &Path, index: usize, revision: usize) {
 }
 
 fn build_args(db: &Path) -> Vec<std::ffi::OsString> {
-    vec!["--db".into(), db.into(), "--json".into(), "build".into(), ".".into()]
+    vec![
+        "--db".into(),
+        db.into(),
+        "--json".into(),
+        "build".into(),
+        ".".into(),
+    ]
 }
 
 fn parse(stdout: &[u8], stderr: &[u8]) -> serde_json::Value {
@@ -67,7 +73,11 @@ fn run_build(root: &Path, db: &Path) -> serde_json::Value {
         .current_dir(root)
         .output()
         .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     parse(&out.stdout, &out.stderr)
 }
 
@@ -98,41 +108,119 @@ fn newest_build_ms(root: &Path, db: &Path) -> u64 {
         .unwrap_or_else(|| panic!("newest build has no build_ms: {history}"))
 }
 
+/// Read `reader` to its end. The first time the bytes read so far contain
+/// `needle`, send one message on `seen`, so the caller can wait for the child
+/// to reach a named point instead of sleeping for a guess at how long that
+/// takes on a loaded host.
+fn drain_signalling_on<R: std::io::Read + Send + 'static>(
+    mut reader: R,
+    needle: &'static str,
+    seen: std::sync::mpsc::Sender<()>,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut all = Vec::new();
+        let mut signalled = false;
+        let mut chunk = [0u8; 4096];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    all.extend_from_slice(&chunk[..n]);
+                    if !signalled && String::from_utf8_lossy(&all).contains(needle) {
+                        signalled = true;
+                        let _ = seen.send(());
+                    }
+                }
+            }
+        }
+        all
+    })
+}
+
+/// How long the lock is held after the build has announced the stage that
+/// takes it. The build's `writer:wait` starts within moments of that
+/// announcement (a `mkdir -p` apart), so the wait is this long less a few
+/// milliseconds of scheduling, however slow the host was getting there.
+const HOLD_AFTER_STAGE_ONE: Duration = Duration::from_millis(3000);
+
+/// The longest the child may take to announce stage 1. It is a fail-loud bound,
+/// not a pacing delay: a healthy child announces it in tens of milliseconds.
+const STAGE_ONE_DEADLINE: Duration = Duration::from_secs(60);
+
 #[test]
 fn time_spent_waiting_for_the_writer_lock_is_not_build_time() {
     let (root, db) = fixture("wait", 4);
     run_build(&root, &db);
     write_module(&root, 0, 1);
 
-    // Hold the lock from a second handle for a while; the build queues behind
-    // it, then does ordinary work.
+    // Hold the lock from a second handle; the build queues behind it, then
+    // does ordinary work once it is released.
     let guard = Store::lock_writer_at(&db, Duration::from_secs(5)).unwrap();
-    let child = Command::new(devmap())
-        .args(build_args(&db))
+    let mut args = build_args(&db);
+    // Progress on a pipe is off by default; stage 1 ("scanning and extracting")
+    // is announced before the build asks for the writer lock, and is the signal
+    // that the child has reached it.
+    args.splice(0..0, ["--progress".into(), "always".into()]);
+    let mut child = Command::new(devmap())
+        .args(args)
         .current_dir(&root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    std::thread::sleep(Duration::from_millis(4000));
+    let (announced, stage_one) = std::sync::mpsc::channel();
+    // Drained concurrently: a result larger than the pipe would otherwise
+    // block the child before it exits.
+    let mut child_stdout = child.stdout.take().unwrap();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut all = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut child_stdout, &mut all);
+        all
+    });
+    let stderr_reader = drain_signalling_on(
+        child.stderr.take().unwrap(),
+        "scanning and extracting",
+        announced,
+    );
+    if stage_one.recv_timeout(STAGE_ONE_DEADLINE).is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        let stderr = stderr_reader.join().unwrap();
+        panic!(
+            "the build never announced stage 1 within {STAGE_ONE_DEADLINE:?} (or exited \
+             first), so it never reached the writer lock; stderr: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+    std::thread::sleep(HOLD_AFTER_STAGE_ONE);
     drop(guard);
-    let out = child.wait_with_output().unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let build = parse(&out.stdout, &out.stderr);
+    let status = child.wait().unwrap();
+    let stdout = stdout_reader.join().unwrap();
+    let stderr = stderr_reader.join().unwrap();
+    assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
+    let build = parse(&stdout, &stderr);
 
     let stages = build["timings"]["stages"].as_array().unwrap();
     let waited = stage_seconds(stages, "writer:wait").expect("writer:wait is a timed stage");
     let total = build["timings"]["total_seconds"].as_f64().unwrap();
-    assert!(waited >= 2.5, "precondition: the build queued {waited:.2} s");
+    let held = HOLD_AFTER_STAGE_ONE.as_secs_f64();
+    assert!(
+        waited >= held * 0.66,
+        "precondition: the build queued {waited:.2} s behind a lock held {held:.2} s \
+         after it announced stage 1"
+    );
 
     let build_ms = newest_build_ms(&root, &db) as f64;
     println!(
         "waited {waited:.3} s, total {total:.3} s, build_ms {build_ms:.0}, \
          margin {:.0} ms",
-        (total * 1000.0 - 1500.0) - build_ms
+        (total * 1000.0 - waited * 500.0) - build_ms
     );
+    // Build time excludes the wait, so it is at most the total less the wait.
+    // Half the measured wait is left as slack for clock granularity; counting
+    // the wait as build time puts build_ms within milliseconds of the total.
     assert!(
-        build_ms < total * 1000.0 - 1500.0,
+        build_ms < total * 1000.0 - waited * 500.0,
         "build_ms {build_ms} includes the {waited:.2} s spent waiting for the lock \
          (total {total:.2} s)"
     );
@@ -158,12 +246,14 @@ fn build_ms_covers_the_commit_the_prunes_and_the_vacuum() {
 
     let stages = build["timings"]["stages"].as_array().unwrap();
     let waited = stage_seconds(stages, "writer:wait").unwrap_or(0.0);
-    let after_save: f64 = ["persist:prune_generations", "persist:prune_extractions", "persist:vacuum"]
-        .iter()
-        .map(|name| {
-            stage_seconds(stages, name).unwrap_or_else(|| panic!("no {name} stage: {build}"))
-        })
-        .sum();
+    let after_save: f64 = [
+        "persist:prune_generations",
+        "persist:prune_extractions",
+        "persist:vacuum",
+    ]
+    .iter()
+    .map(|name| stage_seconds(stages, name).unwrap_or_else(|| panic!("no {name} stage: {build}")))
+    .sum();
     // Everything up to the end of the vacuum: the stages from the first
     // through the one holding the vacuum, minus the lock wait, minus whatever
     // that last stage did that no timed sub-phase accounts for (work after the

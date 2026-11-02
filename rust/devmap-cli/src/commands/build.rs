@@ -1252,11 +1252,24 @@ fn lsp_server_json(server: &devmap_resolve::lsp::LspServerStatus) -> serde_json:
 /// `None` when none did, so a healthy build prints nothing.
 fn parse_budget_diagnostic(counts: &devmap_extract::progress::BudgetRetryCounts) -> Option<String> {
     (counts.still_refused > 0).then(|| {
-        format!(
+        // Only what the counts show. The build records nothing about CPU
+        // starvation or process priority, and a normal-priority host also
+        // refuses a pathological file, so no cause or remedy is named: the
+        // reader is sent to `devmap status`, which lists the refused paths
+        // and the reason each carries.
+        let mut line = format!(
             "parse budget: {} file(s) refused after {} serial retries ({} not retried); the graph \
-             is incomplete, see `devmap status` budget_refused; rebuild at normal priority",
+             is incomplete, see `devmap status` budget_refused",
             counts.still_refused, counts.retried, counts.not_retried
-        )
+        );
+        if counts.not_retried > 0 {
+            line.push_str(&format!(
+                "; the serial retry phase stopped before reaching {} of them (its deadline \
+                 passed or the build was cancelled)",
+                counts.not_retried
+            ));
+        }
+        line
     })
 }
 
@@ -1734,7 +1747,12 @@ mod tests {
         assert!(text.contains("13 file(s), 5 site(s)"), "{text}");
     }
 
-    fn counts(refused: usize, retried: usize, not_retried: usize, still: usize) -> devmap_extract::progress::BudgetRetryCounts {
+    fn counts(
+        refused: usize,
+        retried: usize,
+        not_retried: usize,
+        still: usize,
+    ) -> devmap_extract::progress::BudgetRetryCounts {
         devmap_extract::progress::BudgetRetryCounts {
             refused,
             retried,
@@ -1749,10 +1767,47 @@ mod tests {
     #[test]
     fn a_refused_file_is_said_out_loud_and_a_clean_build_is_silent() {
         assert_eq!(parse_budget_diagnostic(&counts(0, 0, 0, 0)), None);
-        assert_eq!(parse_budget_diagnostic(&counts(5, 5, 0, 0)), None, "recovered is not refused");
-        let line = parse_budget_diagnostic(&counts(30, 17, 13, 14)).expect("14 files stayed refused");
-        assert!(line.starts_with("parse budget: 14 file(s) refused after 17 serial retries (13 not retried)"), "{line}");
+        assert_eq!(
+            parse_budget_diagnostic(&counts(5, 5, 0, 0)),
+            None,
+            "recovered is not refused"
+        );
+        let line =
+            parse_budget_diagnostic(&counts(30, 17, 13, 14)).expect("14 files stayed refused");
+        assert!(
+            line.starts_with(
+                "parse budget: 14 file(s) refused after 17 serial retries (13 not retried)"
+            ),
+            "{line}"
+        );
         assert!(line.contains("devmap status"), "{line}");
+    }
+
+    /// The diagnostic states what the counts show and does not claim a cause
+    /// it cannot know. `BudgetRetryCounts` records no CPU starvation and no
+    /// priority, so a refusal that survived its retry (a pathological file on
+    /// a normal-priority host included) must not tell the reader to rebuild at
+    /// normal priority, whether or not the retry phase ran out of time.
+    #[test]
+    fn the_diagnostic_does_not_claim_a_priority_cause_the_build_never_observed() {
+        // Retried to the end, refused again: no deadline involved.
+        let retried_all =
+            parse_budget_diagnostic(&counts(3, 3, 0, 3)).expect("3 files stayed refused");
+        // The retry phase stopped early.
+        let stopped =
+            parse_budget_diagnostic(&counts(30, 17, 13, 14)).expect("14 files stayed refused");
+        for line in [&retried_all, &stopped] {
+            assert!(!line.to_lowercase().contains("priority"), "{line}");
+            assert!(!line.to_lowercase().contains("rebuild"), "{line}");
+        }
+        assert!(
+            !retried_all.contains("deadline"),
+            "no file was left unretried, so no deadline is evidenced: {retried_all}"
+        );
+        assert!(
+            stopped.contains("13 of them") && stopped.contains("deadline"),
+            "files left unretried are named with the phase stopping early: {stopped}"
+        );
     }
 
     /// The JSON key carries the same five counts, under the names the
