@@ -39,3 +39,5 @@ lcov.info
 # …but never the generated stores or OS cruft that live inside fixtures.
 testdata/**/.devcouncil/
 testdata/**/.DS_Store
+testdata/**/__pycache__/
+testdata/**/*.pyc
