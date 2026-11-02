@@ -55,6 +55,8 @@ fn compile_git_proxy(dir: &Path) -> PathBuf {
         .output()
         .expect("rustc runs");
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Warm up newly-compiled binary so macOS Gatekeeper scan does not breach 2s probe deadline.
+    let _ = std::process::Command::new(&program).output();
     program
 }
 
