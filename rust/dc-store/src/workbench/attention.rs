@@ -10,11 +10,37 @@ pub(super) const FROM: &str = "work_attention a JOIN work_items t ON t.id=a.task
     LEFT JOIN work_enhancements e ON json_extract(a.body,'$.target_type')='enhancement' AND e.id=json_extract(a.body,'$.target_id')
     LEFT JOIN work_runs r ON json_extract(a.body,'$.target_type')='run' AND r.id=json_extract(a.body,'$.target_id')
     LEFT JOIN work_decisions q ON json_extract(a.body,'$.target_type')='decision' AND q.id=json_extract(a.body,'$.target_id')";
+// A CI signal (`signals.record`) is a fact about a branch, not a snapshot of one
+// attempt's state, so it does not use the revision comparison below. It targets
+// `run` only because every inbox decoder holds the closed set
+// `run | enhancement | decision` and requires `kind` to start with
+// `<target_type>_`; a `task` target or an unprefixed kind would make a reader
+// refuse the whole page. Its own staleness rule is therefore here, in the one
+// expression both `attention.*` and `notifications.pending.list` read:
+//
+// * the notice is `changed` only when a later signal for the same task and the
+//   same `(source, workflow, branch)` exists, i.e. the branch has a newer
+//   verdict. This is what makes the older one stop being pending.
+// * a claim, start or finish on the run, or an edit of the task, never moves it.
+//   A CI result usually arrives while the attempt is still live, and every one
+//   of those writes bumps the run's revision, so comparing it would silently
+//   drop the common case from native delivery.
+// * a deleted task and a vanished run still win, ahead of the signal arm.
+//
+// "Later" is recording order (`source_sequence`). A repeat of an earlier result
+// records nothing (see `signals::record`), so a re-poll cannot reorder verdicts.
+// Other kinds have no `$.signal`, so their arms below are unchanged.
 pub(super) fn body_sql(clock_parameter: u8) -> String {
     let decision_current = super::decisions::fresh_notice(clock_parameter);
     format!("json_set(a.body,'$.target_status',CASE
     WHEN t.deleted=1 THEN 'task_deleted'
     WHEN coalesce(e.revision,r.revision,q.revision) IS NULL THEN 'unavailable'
+    WHEN json_type(a.body,'$.signal') IS NOT NULL THEN CASE WHEN EXISTS(
+        SELECT 1 FROM work_attention n WHERE n.task_id=a.task_id AND n.source_sequence>a.source_sequence
+          AND json_extract(n.body,'$.signal.source')=json_extract(a.body,'$.signal.source')
+          AND json_extract(n.body,'$.signal.workflow')=json_extract(a.body,'$.signal.workflow')
+          AND json_extract(n.body,'$.signal.branch')=json_extract(a.body,'$.signal.branch'))
+      THEN 'changed' ELSE 'current' END
     WHEN coalesce(e.revision,r.revision,q.revision)<>json_extract(a.body,'$.target_revision') THEN 'changed'
     WHEN q.id IS NOT NULL AND NOT ({decision_current}) THEN 'changed'
     WHEN t.revision<>json_extract(a.body,'$.task_revision') THEN 'task_changed'

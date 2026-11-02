@@ -7,23 +7,22 @@
 //! signal is a fact the store was told, not an acceptance: it never changes a
 //! task, a run or a proposal, and it carries no authority.
 //!
-//! **Target.** The notice targets the attempt (`target_type` `run`), not the
-//! task. Two reasons, both about the consumers rather than this crate:
+//! **Target and staleness.** The notice targets the attempt (`target_type`
+//! `run`), but it is not tied to that attempt's revision. Two reasons it still
+//! says `run`, both about the consumers rather than this crate: every inbox
+//! decoder holds the closed set `run | enhancement | decision` and requires
+//! `kind` to start with `<target_type>_`, so a `task` target (or an unprefixed
+//! `ci_failed`) would make a reader refuse the whole page, not just the row;
+//! the stored kinds are therefore `run_ci_passed`, `run_ci_failed` and
+//! `run_ci_cancelled`.
 //!
-//! * the inbox joins a target's current revision to mark a notice `changed`
-//!   once the thing it describes has moved on, and the attempt is the thing a CI
-//!   result describes: its branch and head commit. A `task` target would need a
-//!   new join arm in `attention::FROM`/`body_sql` that no reader has.
-//! * every inbox decoder holds the closed set `run | enhancement | decision`
-//!   and requires `kind` to start with `<target_type>_`, so `task` (or an
-//!   unprefixed `ci_failed`) would make a reader refuse the whole page, not
-//!   just the row. The stored kinds are therefore `run_ci_passed`,
-//!   `run_ci_failed` and `run_ci_cancelled`.
-//!
-//! The cost of a run target: any later write to the run (`runs.finish`,
-//! `runs.cancel`, ...) marks a notice recorded against a still-live attempt
-//! `changed`, which notification delivery then skips. A result for an ended
-//! attempt stays `current`, because no lifecycle method moves a terminal run.
+//! A CI result describes a branch, and it usually arrives while the attempt is
+//! still live. Comparing the run's revision would mark it `changed` on the next
+//! claim, start or finish, and native delivery skips anything not `current`.
+//! `attention::body_sql` therefore gives a signal its own rule: it stays
+//! `current` through any run or task write, and becomes `changed` only when a
+//! later signal for the same `(task, source, workflow, branch)` exists. That
+//! is the whole supersession mechanism; this module records, the inbox reads.
 //!
 //! Nothing here adds a table, column or index: the signal's facts ride in the
 //! attention body's `signal` object, and de-duplication reads them back through
@@ -40,6 +39,7 @@ const KINDS: [&str; 3] = ["ci_passed", "ci_failed", "ci_cancelled"];
 /// limit the call is refused loudly rather than dropped.
 const MAX_PER_TASK: i64 = 2048;
 const WORKFLOW_MAX: usize = 200;
+const BRANCH_MAX: usize = 1024;
 const URL_MAX: usize = 2048;
 const CONCLUSION_MAX: usize = 32;
 
@@ -54,6 +54,10 @@ fn control_free(value: &str) -> bool {
 /// nothing; the first write wins and later differing details are ignored,
 /// except a different `kind` for the same key, which is a caller fault and is
 /// refused instead of silently keeping the first.
+///
+/// A new result for the same `(task, source, workflow, branch)` as an earlier
+/// one supersedes it: the earlier notice reads `changed` (see
+/// `attention::body_sql`) and stops being pending. Different keys coexist.
 pub(super) fn record(input: &Input<'_>, now: i64) -> Result<String> {
     input.fields(&[
         "request_id",
@@ -64,6 +68,7 @@ pub(super) fn record(input: &Input<'_>, now: i64) -> Result<String> {
         "kind",
         "conclusion",
         "workflow",
+        "branch",
         "url",
         "head_sha",
     ])?;
@@ -94,6 +99,12 @@ pub(super) fn record(input: &Input<'_>, now: i64) -> Result<String> {
         return Err(Error::invalid(
             "workflow must not contain control characters",
         ));
+    }
+    // Part of the supersession key, so it is required: a missing branch would
+    // let two branches' verdicts replace each other.
+    let branch = input.required_text("branch", BRANCH_MAX)?;
+    if !control_free(&branch) {
+        return Err(Error::invalid("branch must not contain control characters"));
     }
     let url = input.text("url", URL_MAX)?;
     if url.as_deref().is_some_and(|u| {
@@ -164,8 +175,8 @@ pub(super) fn record(input: &Input<'_>, now: i64) -> Result<String> {
     }
 
     let signal: String = conn.query_row(
-        "SELECT json_object('source',?1,'external_id',?2,'kind',?3,'conclusion',?4,'workflow',?5,'url',?6,'head_sha',?7)",
-        params![source, external_id, kind, conclusion, workflow, url, head_sha],
+        "SELECT json_object('source',?1,'external_id',?2,'kind',?3,'conclusion',?4,'workflow',?5,'branch',?6,'url',?7,'head_sha',?8)",
+        params![source, external_id, kind, conclusion, workflow, branch, url, head_sha],
         |r| r.get(0),
     )?;
     // The event belongs to the attempt the result describes; the attention row

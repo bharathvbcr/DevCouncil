@@ -90,7 +90,7 @@ fn ended(s: &Store, run: &str, task: &str) {
 }
 fn signal(request: &str, run: &str, task: &str, extra: &str) -> String {
     format!(
-        r#"{{"request_id":"{request}","run_id":"{run}","task_id":"{task}","source":"github","external_id":"9001","kind":"ci_failed","conclusion":"failure","workflow":"CI","url":"https://github.com/o/r/actions/runs/9001","head_sha":"{SHA}"{extra}}}"#
+        r#"{{"request_id":"{request}","run_id":"{run}","task_id":"{task}","source":"github","external_id":"9001","kind":"ci_failed","conclusion":"failure","workflow":"CI","branch":"agent/t","url":"https://github.com/o/r/actions/runs/9001","head_sha":"{SHA}"{extra}}}"#
     )
 }
 thread_local! {
@@ -141,6 +141,7 @@ fn a_ci_result_becomes_one_run_notice_and_a_repeat_with_a_new_request_records_no
     assert_eq!(text(&s, &first, "$.item.signal.external_id"), "9001");
     assert_eq!(text(&s, &first, "$.item.signal.conclusion"), "failure");
     assert_eq!(text(&s, &first, "$.item.signal.workflow"), "CI");
+    assert_eq!(text(&s, &first, "$.item.signal.branch"), "agent/t");
     assert_eq!(text(&s, &first, "$.item.signal.head_sha"), SHA);
     let page = call(&s, "attention.list", "{}");
     assert_eq!(num(&s, &page, "$.total"), before + 1);
@@ -338,6 +339,11 @@ fn every_field_is_bounded_and_a_refusal_records_nothing() {
         ("workflow", long(201)),
         ("workflow", "\"   \"".into()),
         ("workflow", "<drop>".into()),
+        ("branch", "<drop>".into()),
+        ("branch", "null".into()),
+        ("branch", "\"   \"".into()),
+        ("branch", "\"two\\nlines\"".into()),
+        ("branch", long(1025)),
         ("url", "\"http://example.com/run\"".into()),
         ("url", "\"javascript:alert(1)\"".into()),
         ("url", "\"https://example.com/a b\"".into()),
@@ -378,6 +384,7 @@ fn every_field_is_bounded_and_a_refusal_records_nothing() {
         &format!("\"{}\"", "c".repeat(32)),
     );
     let edge = replace(&edge, "head_sha", &format!("\"{}\"", "a".repeat(64)));
+    let edge = replace(&edge, "branch", &long(1024));
     call(&s, "signals.record", &edge);
 }
 
@@ -490,63 +497,293 @@ fn the_notice_is_delivered_by_the_existing_native_notification_path() {
     assert_eq!(num(&s, &pending(720), "$.total"), 0);
 }
 
-#[test]
-fn a_result_for_a_live_attempt_goes_stale_when_the_attempt_moves_on() {
-    let (s, _) = fixture();
+fn enable_notifications(s: &Store) {
     call(
-        &s,
+        s,
         "notifications.settings.put",
         r#"{"id":"profile","request_id":"settings","expected_revision":1,"enabled":true}"#,
     );
+}
+/// The ids of the CI notices native delivery would pick up now, newest first.
+/// Other kinds a run raises (an exit notice) are not what these tests are about.
+fn pending_ci(s: &Store) -> Vec<String> {
+    let page = call(
+        s,
+        "notifications.pending.list",
+        r#"{"minute_of_day":720,"limit":50}"#,
+    );
+    let mut stmt = s
+        .connection()
+        .prepare(
+            "SELECT json_extract(value,'$.id') FROM json_each(?1,'$.items') WHERE json_extract(value,'$.kind') LIKE 'run_ci_%'",
+        )
+        .unwrap();
+    stmt.query_map([&page], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+fn status(s: &Store, id: &str) -> String {
+    text(
+        s,
+        &call(s, "attention.get", &format!(r#"{{"id":"{id}"}}"#)),
+        "$.item.target_status",
+    )
+}
+/// The same branch's next verdict: a new external run, optionally re-keyed.
+fn verdict(
+    request: &str,
+    run: &str,
+    task: &str,
+    external_id: &str,
+    extra: &[(&str, &str)],
+) -> String {
+    let mut raw = replace(
+        &signal(request, run, task, ""),
+        "external_id",
+        &format!("\"{external_id}\""),
+    );
+    for (key, value) in extra {
+        raw = replace(&raw, key, value);
+    }
+    raw
+}
+
+#[test]
+fn a_result_for_a_live_attempt_is_delivered_and_survives_the_attempts_own_writes() {
+    let (s, _) = fixture();
+    enable_notifications(&s);
     prepare(&s, "live", "t");
     let out = call(&s, "signals.record", &signal("poll", "live", "t", ""));
     let id = text(&s, &out, "$.item.id");
     assert_eq!(text(&s, &out, "$.item.target_status"), "current");
-    let get = format!(r#"{{"id":"{id}"}}"#);
+    // Recorded against a prepared attempt, it is deliverable at once.
+    assert_eq!(pending_ci(&s), vec![id.clone()]);
+    // The attempt moves on: claim and finish each write to the run.
     call(
         &s,
         "runs.claim",
         r#"{"id":"live","request_id":"claim-live","expected_revision":1,"owner_id":"host","session_id":"session"}"#,
     );
-    assert_eq!(
-        text(&s, &call(&s, "attention.get", &get), "$.item.target_status"),
-        "changed"
-    );
-    let pending = call(
+    assert_eq!(status(&s, &id), "current");
+    assert_eq!(pending_ci(&s), vec![id.clone()]);
+    call(
         &s,
-        "notifications.pending.list",
-        r#"{"minute_of_day":720,"limit":10}"#,
+        "runs.finish",
+        r#"{"id":"live","request_id":"finish-live","expected_revision":2,"owner_id":"host","session_id":"session","outcome":"failed","reason":"Failed before spawn"}"#,
     );
-    assert_eq!(num(&s, &pending, "$.total"), 0);
-    // The re-poll still finds the notice instead of making a second one.
+    assert_eq!(status(&s, &id), "current");
+    assert_eq!(pending_ci(&s), vec![id.clone()]);
+    // A re-poll still finds the notice, and it is still current.
     let again = call(&s, "signals.record", &signal("poll-2", "live", "t", ""));
     assert!(num(&s, &again, "$.recorded") == 0);
-    assert_eq!(text(&s, &again, "$.item.target_status"), "changed");
+    assert_eq!(text(&s, &again, "$.item.target_status"), "current");
+    // And native delivery can claim it after all of that.
+    let claim = call(
+        &s,
+        "notifications.claim",
+        &format!(
+            r#"{{"id":"{id}","request_id":"claim","expected_revision":0,"minute_of_day":720}}"#
+        ),
+    );
+    assert_eq!(text(&s, &claim, "$.item.state"), "uncertain");
 }
 
 #[test]
-fn a_task_edit_is_reported_and_a_signal_never_changes_the_task_or_the_run() {
+fn a_signal_is_not_staled_by_unrelated_task_or_run_writes_and_only_a_deleted_task_ends_it() {
     let (s, _) = fixture();
+    enable_notifications(&s);
     ended(&s, "run", "t");
-    let task = call(&s, "items.get", r#"{"id":"t"}"#);
-    let run = call(&s, "runs.get", r#"{"id":"run"}"#);
     let out = call(&s, "signals.record", &signal("poll", "run", "t", ""));
-    assert_eq!(call(&s, "items.get", r#"{"id":"t"}"#), task);
-    assert_eq!(call(&s, "runs.get", r#"{"id":"run"}"#), run);
     let id = text(&s, &out, "$.item.id");
+    // Another attempt on the same task starting and ending is a run write.
+    ended(&s, "later", "t");
+    assert_eq!(status(&s, &id), "current");
+    assert_eq!(pending_ci(&s), vec![id.clone()]);
+    // A task edit used to read `task_changed` and block delivery.
     call(
         &s,
         "items.put",
         r#"{"id":"t","request_id":"edit","expected_revision":1,"title":"Revised","repository_ids":["r"],"primary_repository_id":"r"}"#,
     );
-    assert_eq!(
-        text(
-            &s,
-            &call(&s, "attention.get", &format!(r#"{{"id":"{id}"}}"#)),
-            "$.item.target_status"
-        ),
-        "task_changed"
+    assert_eq!(status(&s, &id), "current");
+    assert_eq!(pending_ci(&s), vec![id.clone()]);
+    // A deleted task still wins: the notice must not outlive its task.
+    let revision = num(
+        &s,
+        &call(&s, "items.get", r#"{"id":"t"}"#),
+        "$.item.revision",
     );
+    call(
+        &s,
+        "items.delete",
+        &format!(
+            r#"{{"id":"t","request_id":"delete","expected_revision":{revision},"even_if_running":true}}"#
+        ),
+    );
+    assert_eq!(status(&s, &id), "task_deleted");
+    assert!(pending_ci(&s).is_empty());
+}
+
+#[test]
+fn a_newer_signal_for_the_same_task_source_workflow_and_branch_supersedes_the_older() {
+    let (s, _) = fixture();
+    enable_notifications(&s);
+    ended(&s, "run", "t");
+    let failed = call(&s, "signals.record", &signal("one", "run", "t", ""));
+    let older = text(&s, &failed, "$.item.id");
+    assert_eq!(pending_ci(&s), vec![older.clone()]);
+    // The same branch is fixed and its next run passes.
+    let passed = call(
+        &s,
+        "signals.record",
+        &verdict(
+            "two",
+            "run",
+            "t",
+            "9002",
+            &[("kind", "\"ci_passed\""), ("conclusion", "\"success\"")],
+        ),
+    );
+    let newer = text(&s, &passed, "$.item.id");
+    assert_eq!(text(&s, &passed, "$.item.target_status"), "current");
+    assert_eq!(status(&s, &older), "changed");
+    assert_eq!(status(&s, &newer), "current");
+    // Only the newer verdict is pending; the older one stopped being so.
+    assert_eq!(pending_ci(&s), vec![newer.clone()]);
+    assert_eq!(
+        code(
+            &s,
+            "notifications.claim",
+            &format!(
+                r#"{{"id":"{older}","request_id":"claim-old","expected_revision":0,"minute_of_day":720}}"#
+            )
+        ),
+        "not_eligible"
+    );
+    // Superseding is read-time: the older notice and its facts are untouched.
+    let kept = call(&s, "attention.get", &format!(r#"{{"id":"{older}"}}"#));
+    assert_eq!(text(&s, &kept, "$.item.kind"), "run_ci_failed");
+    assert_eq!(text(&s, &kept, "$.item.signal.conclusion"), "failure");
+    assert_eq!(num(&s, &kept, "$.item.revision"), 1);
+    // A third verdict supersedes the second too, and only the third is pending.
+    let third = call(
+        &s,
+        "signals.record",
+        &verdict("three", "run", "t", "9003", &[]),
+    );
+    let third = text(&s, &third, "$.item.id");
+    assert_eq!(status(&s, &newer), "changed");
+    assert_eq!(pending_ci(&s), vec![third]);
+}
+
+#[test]
+fn signals_with_a_different_key_coexist() {
+    let (s, _) = fixture();
+    enable_notifications(&s);
+    ended(&s, "run", "t");
+    ended(&s, "other", "u");
+    let base = call(&s, "signals.record", &signal("base", "run", "t", ""));
+    let base = text(&s, &base, "$.item.id");
+    let cases: Vec<(&str, String)> = vec![
+        // Each differs from `base` in one part of the key and is a newer signal.
+        (
+            "branch",
+            verdict("b", "run", "t", "1", &[("branch", "\"agent/other\"")]),
+        ),
+        (
+            "workflow",
+            verdict("w", "run", "t", "2", &[("workflow", "\"Lint\"")]),
+        ),
+        (
+            "source",
+            verdict(
+                "s",
+                "run",
+                "t",
+                "3",
+                &[("source", "\"ci_local\""), ("url", "<drop>")],
+            ),
+        ),
+        ("task", verdict("k", "other", "u", "4", &[])),
+    ];
+    let mut ids = vec![base.clone()];
+    for (part, raw) in &cases {
+        let out = call(&s, "signals.record", raw);
+        let id = text(&s, &out, "$.item.id");
+        assert_eq!(status(&s, &id), "current", "{part}");
+        ids.push(id);
+    }
+    for id in &ids {
+        assert_eq!(status(&s, id), "current");
+    }
+    let mut pending = pending_ci(&s);
+    pending.sort();
+    let mut expected = ids.clone();
+    expected.sort();
+    assert_eq!(pending, expected);
+    // A newer verdict on one branch supersedes that branch only.
+    let next = call(
+        &s,
+        "signals.record",
+        &verdict("b2", "run", "t", "5", &[("branch", "\"agent/other\"")]),
+    );
+    let next = text(&s, &next, "$.item.id");
+    assert_eq!(status(&s, &ids[1]), "changed");
+    for id in [&ids[0], &ids[2], &ids[3], &ids[4], &next] {
+        assert_eq!(status(&s, id), "current");
+    }
+    assert_eq!(pending_ci(&s).len(), 5);
+}
+
+#[test]
+fn replaying_a_signal_neither_supersedes_nor_revives_anything() {
+    let (s, _) = fixture();
+    enable_notifications(&s);
+    ended(&s, "run", "t");
+    let first = call(&s, "signals.record", &signal("one", "run", "t", ""));
+    let older = text(&s, &first, "$.item.id");
+    let second = call(
+        &s,
+        "signals.record",
+        &verdict("two", "run", "t", "9002", &[]),
+    );
+    let newer = text(&s, &second, "$.item.id");
+    let seen = events(&s);
+    // Re-polling the older result after the newer one must not make it newest.
+    let replay = call(&s, "signals.record", &signal("one-again", "run", "t", ""));
+    assert!(num(&s, &replay, "$.recorded") == 0);
+    assert_eq!(text(&s, &replay, "$.item.id"), older);
+    assert_eq!(text(&s, &replay, "$.item.target_status"), "changed");
+    // Re-polling the newer one is the same no-op.
+    let replay = call(
+        &s,
+        "signals.record",
+        &verdict("two-again", "run", "t", "9002", &[]),
+    );
+    assert!(num(&s, &replay, "$.recorded") == 0);
+    assert_eq!(text(&s, &replay, "$.item.id"), newer);
+    assert_eq!(text(&s, &replay, "$.item.target_status"), "current");
+    assert_eq!(events(&s), seen);
+    assert_eq!(status(&s, &older), "changed");
+    assert_eq!(status(&s, &newer), "current");
+    assert_eq!(pending_ci(&s), vec![newer]);
+}
+
+#[test]
+fn a_signal_never_changes_the_task_or_the_run() {
+    let (s, _) = fixture();
+    ended(&s, "run", "t");
+    let task = call(&s, "items.get", r#"{"id":"t"}"#);
+    let run = call(&s, "runs.get", r#"{"id":"run"}"#);
+    call(&s, "signals.record", &signal("poll", "run", "t", ""));
+    call(
+        &s,
+        "signals.record",
+        &verdict("next", "run", "t", "9002", &[]),
+    );
+    assert_eq!(call(&s, "items.get", r#"{"id":"t"}"#), task);
+    assert_eq!(call(&s, "runs.get", r#"{"id":"run"}"#), run);
 }
 
 #[test]
