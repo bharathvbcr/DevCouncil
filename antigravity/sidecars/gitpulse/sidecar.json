@@ -1,0 +1,18 @@
+{
+  "command": "gitpulse-daemon",
+  "args": ["--port", "9096", "--sidecar"],
+  "description": "Multi-agent worktree monitor, line-level collision heatmaps, and ledger audit stream",
+  "display_name": "GitPulse Multi-Agent Workbench",
+  "has_web_ui": true,
+  "restart_policy": "always",
+  "ui_config": {
+    "display_name": "GitPulse Multi-Agent Workbench",
+    "views": [
+      {
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "path": "/workbench.html",
+        "title": "Worktree & Collision Monitor"
+      }
+    ]
+  }
+}

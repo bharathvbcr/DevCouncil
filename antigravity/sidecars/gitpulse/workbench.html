@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GitPulse Multi-Agent Workbench</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --border: #30363d;
+      --text: #c9d1d9;
+      --text-muted: #8b949e;
+      --accent: #58a6ff;
+      --green: #3fb950;
+      --amber: #d29922;
+      --red: #f85149;
+      --purple: #bc8cff;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .header-title {
+      font-size: 14px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .status-badge {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 12px;
+      background: #238636;
+      color: #fff;
+    }
+    .status-badge.hazard {
+      background: #da3633;
+    }
+    main {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      grid-template-rows: 1fr 1fr;
+      gap: 12px;
+      padding: 12px;
+      overflow: hidden;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .card-header {
+      padding: 8px 12px;
+      background: #1c2128;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+      font-weight: 600;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .card-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    th, td {
+      padding: 6px 8px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    th {
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+    .hazard-row {
+      background: rgba(248, 81, 73, 0.15);
+      color: #ff7b72;
+    }
+    .clean-row {
+      background: rgba(63, 185, 80, 0.1);
+      color: #7ee787;
+    }
+    .code-tag {
+      font-family: monospace;
+      background: #0d1117;
+      padding: 2px 5px;
+      border-radius: 4px;
+      font-size: 11px;
+    }
+    .timeline {
+      list-style: none;
+      font-size: 12px;
+    }
+    .timeline-item {
+      padding: 6px 8px;
+      border-left: 2px solid var(--accent);
+      margin-left: 6px;
+      margin-bottom: 6px;
+      background: #0d1117;
+      border-radius: 0 4px 4px 0;
+    }
+    .timeline-time {
+      font-size: 10px;
+      color: var(--text-muted);
+      margin-bottom: 2px;
+    }
+    .heatmap-bar {
+      display: flex;
+      height: 18px;
+      background: #0d1117;
+      border-radius: 4px;
+      overflow: hidden;
+      margin-top: 4px;
+    }
+    .heatmap-seg {
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 10px;
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-title">
+      <span>GitPulse Multi-Agent Workbench</span>
+      <span class="status-badge" id="overall-status">All Worktrees Clean</span>
+    </div>
+    <div style="font-size: 12px; color: var(--text-muted);">
+      Reflink CoW Extents: <strong id="reflink-total" style="color:var(--green)">104.8 MB Shared</strong>
+    </div>
+  </header>
+
+  <main>
+    <!-- Card 1: Active Worktree Matrix -->
+    <div class="card">
+      <div class="card-header">
+        <span>Active Worktrees & Sessions</span>
+        <span style="font-size:11px; color:var(--text-muted);">Auto-reaped on session end</span>
+      </div>
+      <div class="card-body">
+        <table id="worktree-table">
+          <thead>
+            <tr>
+              <th>Worktree ID</th>
+              <th>Branch</th>
+              <th>Agent ID</th>
+              <th>Leased Task</th>
+              <th>CoW Cache</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="code-tag">wt-main</span></td>
+              <td>main</td>
+              <td>system</td>
+              <td>—</td>
+              <td>Canonical</td>
+            </tr>
+            <tr>
+              <td><span class="code-tag">wt-agent-401</span></td>
+              <td>agent/F28/worker_m4</td>
+              <td>worker_impl_m4</td>
+              <td><span class="code-tag">TASK-F28</span></td>
+              <td>Reflink (104.8 MB)</td>
+            </tr>
+            <tr>
+              <td><span class="code-tag">wt-agent-402</span></td>
+              <td>agent/F39/worker_m3</td>
+              <td>worker_impl_m3</td>
+              <td><span class="code-tag">TASK-F39</span></td>
+              <td>Reflink (104.8 MB)</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Card 2: Line-Level Collision Heatmap -->
+    <div class="card">
+      <div class="card-header">
+        <span>Line-Level Collision Risk Heatmap</span>
+        <span style="font-size:11px; color:var(--amber);" id="collision-summary">0 Contended Files</span>
+      </div>
+      <div class="card-body">
+        <table id="collision-table">
+          <thead>
+            <tr>
+              <th>File Path</th>
+              <th>Range</th>
+              <th>Holding Agent</th>
+              <th>Requesting Agent</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="collision-tbody">
+            <tr class="clean-row">
+              <td><span class="code-tag">src/engine/worktree.rs</span></td>
+              <td>Lines 1–45</td>
+              <td>worker_impl_m4</td>
+              <td>None</td>
+              <td>CLEAN</td>
+            </tr>
+            <tr class="clean-row">
+              <td><span class="code-tag">rust/devmap-query/engine.rs</span></td>
+              <td>Lines 120–180</td>
+              <td>worker_impl_m3</td>
+              <td>None</td>
+              <td>CLEAN</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div style="margin-top: 12px; font-size:11px; color:var(--text-muted);">
+          <span>Live Buffer Concurrency:</span>
+          <div class="heatmap-bar">
+            <div class="heatmap-seg" style="width: 70%; background: #238636; color:#fff;">CLEAN (70%)</div>
+            <div class="heatmap-seg" style="width: 30%; background: #388bfd; color:#fff;">READ-ONLY (30%)</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Card 3: Append-Only Ledger Stream -->
+    <div class="card" style="grid-column: span 2;">
+      <div class="card-header">
+        <span>Append-Only Ledger Timeline Stream</span>
+        <button id="simulate-collision-btn" style="background:#21262d; border:1px solid var(--border); color:#c9d1d9; padding:2px 8px; border-radius:4px; font-size:11px; cursor:pointer;">
+          Simulate Hazard Injection
+        </button>
+      </div>
+      <div class="card-body">
+        <ul class="timeline" id="ledger-stream">
+          <li class="timeline-item">
+            <div class="timeline-time">Just now · gitpulse_worktree_create</div>
+            <div>Worktree <span class="code-tag">wt-agent-401</span> provisioned for agent <strong>worker_impl_m4</strong> with reflink CoW cache clone.</div>
+          </li>
+          <li class="timeline-item">
+            <div class="timeline-time">1 min ago · devcouncil_checkout_task</div>
+            <div>Task lease acquired for <span class="code-tag">TASK-F28</span> (Token: <span class="code-tag">lease_token_m4_01</span>).</div>
+          </li>
+          <li class="timeline-item">
+            <div class="timeline-time">3 mins ago · devmap_status</div>
+            <div>DevMap CAS index generation 4648 verified fresh across all worktree mounts.</div>
+          </li>
+        </ul>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    let simulatedHazard = false;
+
+    document.getElementById("simulate-collision-btn").addEventListener("click", () => {
+      simulatedHazard = !simulatedHazard;
+      const tbody = document.getElementById("collision-tbody");
+      const summary = document.getElementById("collision-summary");
+      const statusBadge = document.getElementById("overall-status");
+      const ledger = document.getElementById("ledger-stream");
+
+      if (simulatedHazard) {
+        document.getElementById("simulate-collision-btn").textContent = "Clear Hazard";
+        statusBadge.textContent = "COLLISION HAZARD DETECTED";
+        statusBadge.className = "status-badge hazard";
+        summary.textContent = "1 Contended File";
+
+        tbody.innerHTML = `
+          <tr class="hazard-row">
+            <td><span class="code-tag">rust/devmap-resolve/src/model.rs</span></td>
+            <td>Lines 50–120</td>
+            <td>worker_impl_m3</td>
+            <td>worker_impl_m4</td>
+            <td>CONTENDED (VETO)</td>
+          </tr>
+          <tr class="clean-row">
+            <td><span class="code-tag">src/engine/worktree.rs</span></td>
+            <td>Lines 1–45</td>
+            <td>worker_impl_m4</td>
+            <td>None</td>
+            <td>CLEAN</td>
+          </tr>
+        `;
+
+        const newEvent = document.createElement("li");
+        newEvent.className = "timeline-item";
+        newEvent.style.borderLeftColor = "var(--red)";
+        newEvent.innerHTML = `
+          <div class="timeline-time">Just now · pre_tool_call_decide</div>
+          <div style="color:var(--red)"><strong>COLLISION INTERCEPTED:</strong> Write to <span class="code-tag">model.rs:50-120</span> by worker_impl_m4 vetoed. Overlapping with dirty buffer of worker_impl_m3.</div>
+        `;
+        ledger.prepend(newEvent);
+      } else {
+        document.getElementById("simulate-collision-btn").textContent = "Simulate Hazard Injection";
+        statusBadge.textContent = "All Worktrees Clean";
+        statusBadge.className = "status-badge";
+        summary.textContent = "0 Contended Files";
+
+        tbody.innerHTML = `
+          <tr class="clean-row">
+            <td><span class="code-tag">src/engine/worktree.rs</span></td>
+            <td>Lines 1–45</td>
+            <td>worker_impl_m4</td>
+            <td>None</td>
+            <td>CLEAN</td>
+          </tr>
+          <tr class="clean-row">
+            <td><span class="code-tag">rust/devmap-query/engine.rs</span></td>
+            <td>Lines 120–180</td>
+            <td>worker_impl_m3</td>
+            <td>None</td>
+            <td>CLEAN</td>
+          </tr>
+        `;
+      }
+    });
+
+    // Handle Antigravity sidecar protocol postMessage
+    window.addEventListener("message", event => {
+      if (event.data && event.data.type === "GITPULSE_WORKTREE_UPDATE") {
+        console.log("Worktree update received from host:", event.data);
+      }
+    });
+  </script>
+</body>
+</html>

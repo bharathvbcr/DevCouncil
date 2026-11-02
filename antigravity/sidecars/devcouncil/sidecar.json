@@ -1,0 +1,18 @@
+{
+  "command": "devcouncil",
+  "args": ["mcp", "serve-ui", "--port", "9097"],
+  "description": "Deterministic verification status panel, diff coverage gauges, and Hero Loop repair cards",
+  "display_name": "DevCouncil Verification & Hero Loop",
+  "has_web_ui": true,
+  "restart_policy": "always",
+  "ui_config": {
+    "display_name": "DevCouncil Verification & Hero Loop",
+    "views": [
+      {
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "path": "/hero_loop.html",
+        "title": "Verification & Hero Loop"
+      }
+    ]
+  }
+}
