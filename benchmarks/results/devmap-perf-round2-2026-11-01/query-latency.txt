@@ -1,0 +1,13 @@
+impact target: collision_risk; reps=10; load=(7.8408203125, 21.5263671875, 27.2197265625)
+kind	arm	min_ms	median_ms	max_ms
+search	main	18	19	20
+search	merged	18	19	21
+search	main2	18	18	22
+impact	main	126	132	137
+impact	merged	126	129	140
+impact	main2	126	129	136
+explore	main	345	351	360
+explore	merged	340	345	359
+explore	main2	341	349	356
+
+[exited with code 0]

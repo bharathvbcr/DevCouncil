@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 300" width="900" height="300" class="viz">
+<style>
+.viz{--surface:#fcfcfb;--ink:#0b0b0b;--ink2:#52514e;--grid:#e4e3df;--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;--s5:#e87ba4;--other:#a8a7a1;--m-old:#a8a7a1;--m-main:#2a78d6;--m-main2:#6250d6;--m-merged:#eb6834}
+@media (prefers-color-scheme: dark){.viz{--surface:#1a1a19;--ink:#f0efec;--ink2:#c3c2b7;--grid:#3a3936;--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181;--other:#6f6e69;--m-old:#6f6e69;--m-main:#3987e5;--m-main2:#9085e9;--m-merged:#d95926}}
+text{font-family:-apple-system,Helvetica,Arial,sans-serif;fill:var(--ink)}
+.t2{fill:var(--ink2)} .ttl{font-size:16px;font-weight:600} .sub{font-size:12px} .lab{font-size:12px} .val{font-size:12px;font-weight:600}
+</style>
+<rect width="900" height="300" style="fill:var(--surface)"/>
+<text x="16" y="28" class="ttl">Steady-state one-file rebuild: every rep, total seconds</text>
+<text x="16" y="47" class="sub t2">5 interleaved reps per arm (in-process total from --json, not wall time). The two main arms are the same binary: their spread is the noise floor.</text>
+<line x1="190.0" x2="190.0" y1="66" y2="260" style="stroke:var(--grid)"/>
+<text x="190.0" y="278" class="sub t2" text-anchor="middle">2 s</text>
+<line x1="273.8" x2="273.8" y1="66" y2="260" style="stroke:var(--grid)"/>
+<text x="273.8" y="278" class="sub t2" text-anchor="middle">3 s</text>
+<line x1="357.5" x2="357.5" y1="66" y2="260" style="stroke:var(--grid)"/>
+<text x="357.5" y="278" class="sub t2" text-anchor="middle">4 s</text>
+<line x1="441.2" x2="441.2" y1="66" y2="260" style="stroke:var(--grid)"/>
+<text x="441.2" y="278" class="sub t2" text-anchor="middle">5 s</text>
+<line x1="525.0" x2="525.0" y1="66" y2="260" style="stroke:var(--grid)"/>
+<text x="525.0" y="278" class="sub t2" text-anchor="middle">6 s</text>
+<line x1="608.8" x2="608.8" y1="66" y2="260" style="stroke:var(--grid)"/>
+<text x="608.8" y="278" class="sub t2" text-anchor="middle">7 s</text>
+<line x1="692.5" x2="692.5" y1="66" y2="260" style="stroke:var(--grid)"/>
+<text x="692.5" y="278" class="sub t2" text-anchor="middle">8 s</text>
+<line x1="776.2" x2="776.2" y1="66" y2="260" style="stroke:var(--grid)"/>
+<text x="776.2" y="278" class="sub t2" text-anchor="middle">9 s</text>
+<line x1="860.0" x2="860.0" y1="66" y2="260" style="stroke:var(--grid)"/>
+<text x="860.0" y="278" class="sub t2" text-anchor="middle">10 s</text>
+<text x="178" y="96" class="lab" text-anchor="end">dbd0193a (old)</text>
+<circle cx="506.7" cy="92" r="6" style="fill:var(--m-old);stroke:var(--surface);stroke-width:2"><title>dbd0193a (old): 5.782 s</title></circle>
+<circle cx="547.9" cy="92" r="6" style="fill:var(--m-old);stroke:var(--surface);stroke-width:2"><title>dbd0193a (old): 6.273 s</title></circle>
+<circle cx="583.8" cy="92" r="6" style="fill:var(--m-old);stroke:var(--surface);stroke-width:2"><title>dbd0193a (old): 6.702 s</title></circle>
+<circle cx="744.5" cy="92" r="6" style="fill:var(--m-old);stroke:var(--surface);stroke-width:2"><title>dbd0193a (old): 8.621 s</title></circle>
+<circle cx="827.1" cy="92" r="6" style="fill:var(--m-old);stroke:var(--surface);stroke-width:2"><title>dbd0193a (old): 9.608 s</title></circle>
+<line x1="583.8" x2="583.8" y1="80" y2="104" style="stroke:var(--ink);stroke-width:2"/>
+<text x="583.8" y="76" class="sub" text-anchor="middle">median 6.70</text>
+<text x="178" y="142" class="lab" text-anchor="end">main 7926697d</text>
+<circle cx="310.8" cy="138" r="6" style="fill:var(--m-main);stroke:var(--surface);stroke-width:2"><title>main 7926697d: 3.443 s</title></circle>
+<circle cx="351.6" cy="138" r="6" style="fill:var(--m-main);stroke:var(--surface);stroke-width:2"><title>main 7926697d: 3.930 s</title></circle>
+<circle cx="352.2" cy="138" r="6" style="fill:var(--m-main);stroke:var(--surface);stroke-width:2"><title>main 7926697d: 3.937 s</title></circle>
+<circle cx="379.6" cy="138" r="6" style="fill:var(--m-main);stroke:var(--surface);stroke-width:2"><title>main 7926697d: 4.263 s</title></circle>
+<circle cx="387.9" cy="138" r="6" style="fill:var(--m-main);stroke:var(--surface);stroke-width:2"><title>main 7926697d: 4.363 s</title></circle>
+<line x1="352.2" x2="352.2" y1="126" y2="150" style="stroke:var(--ink);stroke-width:2"/>
+<text x="352.2" y="122" class="sub" text-anchor="middle">median 3.94</text>
+<text x="178" y="188" class="lab" text-anchor="end">main again (noise arm)</text>
+<circle cx="311.5" cy="184" r="6" style="fill:var(--m-main2);stroke:var(--surface);stroke-width:2"><title>main again (noise arm): 3.450 s</title></circle>
+<circle cx="322.0" cy="184" r="6" style="fill:var(--m-main2);stroke:var(--surface);stroke-width:2"><title>main again (noise arm): 3.577 s</title></circle>
+<circle cx="364.1" cy="184" r="6" style="fill:var(--m-main2);stroke:var(--surface);stroke-width:2"><title>main again (noise arm): 4.079 s</title></circle>
+<circle cx="413.5" cy="184" r="6" style="fill:var(--m-main2);stroke:var(--surface);stroke-width:2"><title>main again (noise arm): 4.669 s</title></circle>
+<circle cx="517.7" cy="184" r="6" style="fill:var(--m-main2);stroke:var(--surface);stroke-width:2"><title>main again (noise arm): 5.913 s</title></circle>
+<line x1="364.1" x2="364.1" y1="172" y2="196" style="stroke:var(--ink);stroke-width:2"/>
+<text x="364.1" y="168" class="sub" text-anchor="middle">median 4.08</text>
+<text x="178" y="234" class="lab" text-anchor="end">merged ec99c364</text>
+<circle cx="257.4" cy="230" r="6" style="fill:var(--m-merged);stroke:var(--surface);stroke-width:2"><title>merged ec99c364: 2.805 s</title></circle>
+<circle cx="258.3" cy="230" r="6" style="fill:var(--m-merged);stroke:var(--surface);stroke-width:2"><title>merged ec99c364: 2.816 s</title></circle>
+<circle cx="264.0" cy="230" r="6" style="fill:var(--m-merged);stroke:var(--surface);stroke-width:2"><title>merged ec99c364: 2.883 s</title></circle>
+<circle cx="268.1" cy="230" r="6" style="fill:var(--m-merged);stroke:var(--surface);stroke-width:2"><title>merged ec99c364: 2.932 s</title></circle>
+<circle cx="273.5" cy="230" r="6" style="fill:var(--m-merged);stroke:var(--surface);stroke-width:2"><title>merged ec99c364: 2.998 s</title></circle>
+<line x1="264.0" x2="264.0" y1="218" y2="242" style="stroke:var(--ink);stroke-width:2"/>
+<text x="264.0" y="214" class="sub" text-anchor="middle">median 2.88</text>
+</svg>
