@@ -32,6 +32,7 @@ func WorkbenchMethods() []string {
 		"enhancements.accept", "enhancements.dismiss", "enhancements.undo",
 		"enhancements.claim", "enhancements.recover", "enhancements.revise",
 		"automation.get", "automation.put", "automation.list", "automation.prepare",
+		"signals.record",
 		"runs.prepare", "runs.claim", "runs.started", "runs.protocol", "runs.finish", "runs.cancel", "runs.get", "runs.list",
 		"store.compact", "store.upgrade",
 	}
