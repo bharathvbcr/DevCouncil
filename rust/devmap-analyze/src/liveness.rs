@@ -4016,7 +4016,10 @@ pub fn analyze_liveness_with_coverage(
         reports,
         coverage,
         exempt_names,
-        unresolved_names: unresolved_names.iter().map(|name| name.to_string()).collect(),
+        unresolved_names: unresolved_names
+            .iter()
+            .map(|name| name.to_string())
+            .collect(),
     }
 }
 

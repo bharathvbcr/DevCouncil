@@ -35,6 +35,24 @@ Use [the integration guide](coding-cli-integration.md) for supported host names,
 user-level settings, trust requirements and optional Go-host MCP setup.
 Skills provide instructions; they do not enforce tool permissions.
 
+## Specification-first planning and DAG workflows
+
+Before coding a multi-file feature, scaffold and validate a 7-layer specification, then export DAG-ordered tasks into the workbench store:
+
+```bash
+devcouncil spec init my-feature
+devcouncil spec validate my-feature --strict --json
+devcouncil spec export-tasks my-feature --json
+```
+
+When a feature uses a declarative multi-step workflow definition, run and resume it with persistent step checkpoints:
+
+```bash
+devcouncil workflow run .devcouncil/workflows/feature-flow.yaml --feature-id 001-my-feature
+devcouncil workflow status <run_id> --json
+devcouncil workflow resume <run_id> --decision approve
+```
+
 ## Implement and verify
 
 Choose the project’s actual build/test commands from its manifests and CI.

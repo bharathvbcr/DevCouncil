@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DevCouncil Verification & Hero Loop</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --border: #30363d;
+      --text: #c9d1d9;
+      --text-muted: #8b949e;
+      --accent: #58a6ff;
+      --green: #3fb950;
+      --amber: #d29922;
+      --red: #f85149;
+      --purple: #bc8cff;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .header-title {
+      font-size: 14px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .status-badge {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 12px;
+      background: #238636;
+      color: #fff;
+    }
+    .status-badge.failing {
+      background: #da3633;
+    }
+    main {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 340px 1fr;
+      gap: 12px;
+      padding: 12px;
+      overflow: hidden;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .card-header {
+      padding: 8px 12px;
+      background: #1c2128;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+      font-weight: 600;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .card-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .gate-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 10px;
+      background: #0d1117;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-size: 12px;
+    }
+    .gate-traffic {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 500;
+    }
+    .traffic-light {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+    }
+    .light-green { background: var(--green); box-shadow: 0 0 6px var(--green); }
+    .light-amber { background: var(--amber); box-shadow: 0 0 6px var(--amber); }
+    .light-red { background: var(--red); box-shadow: 0 0 6px var(--red); }
+
+    .gauge-box {
+      background: #0d1117;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px;
+      text-align: center;
+    }
+    .gauge-val {
+      font-size: 28px;
+      font-weight: 700;
+      color: var(--green);
+    }
+    .gauge-bar-outer {
+      background: #21262d;
+      height: 8px;
+      border-radius: 4px;
+      overflow: hidden;
+      margin-top: 8px;
+    }
+    .gauge-bar-inner {
+      height: 100%;
+      background: var(--green);
+      width: 92%;
+    }
+    .repair-card {
+      background: #0d1117;
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--accent);
+      border-radius: 6px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      font-size: 12px;
+    }
+    .repair-card.stub { border-left-color: var(--red); }
+    .repair-card.cov { border-left-color: var(--amber); }
+    .repair-card.sec { border-left-color: var(--purple); }
+    .repair-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .repair-tag {
+      font-family: monospace;
+      font-size: 11px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: #21262d;
+    }
+    .repair-action-btn {
+      background: #238636;
+      color: #fff;
+      border: none;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      cursor: pointer;
+    }
+    .repair-action-btn:hover { background: #2ea043; }
+    .code-snippet {
+      font-family: monospace;
+      background: #161b22;
+      padding: 6px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      color: #e6edf3;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-title">
+      <span>DevCouncil Verification & Hero Loop Dashboard</span>
+      <span class="status-badge" id="loop-status">Verification Passed (Zero Gaps)</span>
+    </div>
+    <div style="font-size: 12px; color: var(--text-muted);">
+      Hero Loop Interceptor: <strong id="attempt-counter" style="color:var(--text)">Attempt 1 / 5</strong>
+    </div>
+  </header>
+
+  <main>
+    <!-- Left Column: Verification Rigor Gates & Coverage -->
+    <div class="card">
+      <div class="card-header">
+        <span>Deterministic Verification Gates</span>
+        <button id="toggle-verify-btn" style="background:#21262d; border:1px solid var(--border); color:#c9d1d9; padding:2px 8px; border-radius:4px; font-size:11px; cursor:pointer;">
+          Inject Defect
+        </button>
+      </div>
+      <div class="card-body">
+        <div class="gauge-box">
+          <div style="font-size:11px; color:var(--text-muted); margin-bottom:4px;">Diff Coverage (LCOV)</div>
+          <div class="gauge-val" id="coverage-val">92.4%</div>
+          <div style="font-size:11px; color:var(--text-muted);">Threshold: &ge; 80.0%</div>
+          <div class="gauge-bar-outer">
+            <div class="gauge-bar-inner" id="coverage-bar" style="width: 92.4%;"></div>
+          </div>
+        </div>
+
+        <div class="gate-item">
+          <div class="gate-traffic">
+            <div class="traffic-light light-green" id="light-tests"></div>
+            <span>GateTests</span>
+          </div>
+          <span style="color:var(--text-muted);" id="status-tests">461 / 461 Passed</span>
+        </div>
+
+        <div class="gate-item">
+          <div class="gate-traffic">
+            <div class="traffic-light light-green" id="light-coverage"></div>
+            <span>GateCoverage</span>
+          </div>
+          <span style="color:var(--text-muted);" id="status-coverage">Passed (92.4%)</span>
+        </div>
+
+        <div class="gate-item">
+          <div class="gate-traffic">
+            <div class="traffic-light light-green" id="light-stubs"></div>
+            <span>GateStubDetection</span>
+          </div>
+          <span style="color:var(--text-muted);" id="status-stubs">0 Stubs Detected</span>
+        </div>
+
+        <div class="gate-item">
+          <div class="gate-traffic">
+            <div class="traffic-light light-green" id="light-secrets"></div>
+            <span>GateSecrets</span>
+          </div>
+          <span style="color:var(--text-muted);" id="status-secrets">0 Leaked Credentials</span>
+        </div>
+
+        <div class="gate-item">
+          <div class="gate-traffic">
+            <div class="traffic-light light-green" id="light-constitution"></div>
+            <span>GateConstitution</span>
+          </div>
+          <span style="color:var(--text-muted);" id="status-constitution">Mode: Enforce (Clean)</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right Column: Interactive Hero Loop Repair Cards -->
+    <div class="card">
+      <div class="card-header">
+        <span>Hero Loop Interactive Repair Cards (Typed Next Actions)</span>
+        <span style="font-size:11px; color:var(--text-muted);" id="repair-count">0 Outstanding Actions</span>
+      </div>
+      <div class="card-body" id="repair-container">
+        <div style="text-align:center; padding:40px 20px; color:var(--text-muted);">
+          <div style="font-size:32px; margin-bottom:8px;">✓</div>
+          <strong>All Verification Gates Satisfied</strong>
+          <p style="font-size:12px; margin-top:4px;">No blocking gaps detected. Agent may proceed to completion (StopDecision.ALLOW_STOP).</p>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    let hasDefects = false;
+
+    document.getElementById("toggle-verify-btn").addEventListener("click", () => {
+      hasDefects = !hasDefects;
+      const loopStatus = document.getElementById("loop-status");
+      const lightTests = document.getElementById("light-tests");
+      const lightStubs = document.getElementById("light-stubs");
+      const statusStubs = document.getElementById("status-stubs");
+      const repairContainer = document.getElementById("repair-container");
+      const repairCount = document.getElementById("repair-count");
+      const attemptCounter = document.getElementById("attempt-counter");
+
+      if (hasDefects) {
+        document.getElementById("toggle-verify-btn").textContent = "Clear Defect";
+        loopStatus.textContent = "VERIFICATION REFUSED — CONTINUE SELF-REPAIR";
+        loopStatus.className = "status-badge failing";
+        attemptCounter.textContent = "Attempt 2 / 5";
+
+        lightStubs.className = "traffic-light light-red";
+        statusStubs.textContent = "1 AST Stub Detected";
+
+        repairCount.textContent = "2 Outstanding Actions";
+        repairContainer.innerHTML = `
+          <div class="repair-card stub">
+            <div class="repair-header">
+              <span class="repair-tag" style="color:var(--red);">[FIX_AST_STUB]</span>
+              <button class="repair-action-btn" onclick="alert('Repair instruction copied to clipboard!')">Copy Repair Prompt</button>
+            </div>
+            <div><strong>Empty / Placeholder Implementation Detected</strong></div>
+            <div style="color:var(--text-muted);">Target: <code>rust/devmap-resolve/src/resolver/swiftscope.rs:88</code></div>
+            <div class="code-snippet">todo!("Implement swift extension scope ladder rung")</div>
+            <div style="font-size:11px; color:var(--text-muted);">Instruction: Replace <code>todo!()</code> macro with genuine AST token traversal logic.</div>
+          </div>
+
+          <div class="repair-card cov">
+            <div class="repair-header">
+              <span class="repair-tag" style="color:var(--amber);">[ADD_TEST_COVERAGE]</span>
+              <button class="repair-action-btn" onclick="alert('Test harness scaffold copied to clipboard!')">Copy Test Scaffold</button>
+            </div>
+            <div><strong>Missing Test Branch Exercise</strong></div>
+            <div style="color:var(--text-muted);">Target: <code>tests/architecture_suite/tier1_features/test_f28_to_f30.py</code></div>
+            <div class="code-snippet">def test_hero_loop_continuation_threshold_bounds()</div>
+            <div style="font-size:11px; color:var(--text-muted);">Instruction: Add unit test verifying that StopHookResult returns CONTINUE when gaps exist.</div>
+          </div>
+        `;
+      } else {
+        document.getElementById("toggle-verify-btn").textContent = "Inject Defect";
+        loopStatus.textContent = "Verification Passed (Zero Gaps)";
+        loopStatus.className = "status-badge";
+        attemptCounter.textContent = "Attempt 1 / 5";
+
+        lightStubs.className = "traffic-light light-green";
+        statusStubs.textContent = "0 Stubs Detected";
+
+        repairCount.textContent = "0 Outstanding Actions";
+        repairContainer.innerHTML = `
+          <div style="text-align:center; padding:40px 20px; color:var(--text-muted);">
+            <div style="font-size:32px; margin-bottom:8px;">✓</div>
+            <strong>All Verification Gates Satisfied</strong>
+            <p style="font-size:12px; margin-top:4px;">No blocking gaps detected. Agent may proceed to completion (StopDecision.ALLOW_STOP).</p>
+          </div>
+        `;
+      }
+    });
+
+    // Sidecar Protocol handling
+    window.addEventListener("message", event => {
+      if (event.data && event.data.type === "DEVCOUNCIL_VERIFY_REPORT") {
+        console.log("Verification report received from host:", event.data);
+      }
+    });
+  </script>
+</body>
+</html>

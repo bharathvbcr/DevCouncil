@@ -9,12 +9,13 @@ availability; it does not certify every platform, editor session or release.
 
 | Surface | Implementation | Practical boundary |
 |---|---|---|
-| Code intelligence | Rust `devmap` pipeline, CLI, 21-tool MCP, watcher and `doc-drift` | Static evidence (schema 98); store schema 29 (reader floor 29); resolution budgets; damaged store refusal; queries can be capped |
-| Go host | `devcouncil` / `dev` CLI and eight-tool task MCP | Task tooling, integration, skills and verification; no autonomous model loop |
-| Task state | Rust `dcstore` | Cooperating-client leases (schema 11), workbench tasks (schema 14), and durable records |
-| Verification | Go task checks plus Rust `dcverify` rigor | Deep scans (untracked, submodules), opaque stubs, prompt-input write protection, no diff/panic secret echo |
-| Search | Rust `dcgrep` | Ignore-aware search and optional trigram index; decoupled ceilings, 64 MiB lexical bound, completeness contract |
-| Host adapters | Six hosts, one Rust table (`devmap integrate`); the Go host passes its server over `--servers-stdin` | Different outputs by host; Codex gets `[mcp_servers.devcouncil]` merged into the project `.codex/config.toml` without rewriting other bytes |
+| Code intelligence | Rust `devc-map` (`dc-map` / `devmap`) pipeline, CLI, 21-tool MCP, watcher, `doc-drift`, 11-tier resolution ladder (`rung`), Blake3 CAS AST store (`cas`), per-worktree delta overlay (`overlay`), and `devmap-store::csr` zero-copy `mmap` CSR storage | Static evidence (schema 98); store schema 29 (reader floor 29); resolution budgets; damaged store refusal; queries can be capped |
+| Go host | `devc` / `devcouncil` / `dev` CLI (`spec`, `workflow`, `search`, `task`, `verify`, `review`, `integrate`, `skills`) and eight-tool task MCP | Task tooling, 7-layer specification lifecycle, resumable DAG workflows, unified search routing, integration, skills and verification; no autonomous model loop |
+| Task state | Rust `devc-store` (`dc-store` / `dcstore`) | Cooperating-client leases (schema 11, partial unique index `ux_task_leases_active`), workbench tasks (schema 14), constitution gates (`constitution_gates`), and durable records |
+| Verification | Go task checks, secondary judge model verification (`verify/secondary_model.go`), plus Rust `devc-verify` (`dc-verify` / `dcverify`) rigor | Deep scans (untracked, submodules), opaque stubs, prompt-input write protection, CDATA prompt-injection sanitization, no diff/panic secret echo |
+| Search | Go `devcouncil search` router + Rust `devc-grep` (`dc-grep` / `dcgrep`) & `devc-map` (`devmap`) | Unified routing across symbol/structural (`devmap`) and literal/regex (`dcgrep`); ignore-aware search and optional trigram index; decoupled ceilings, 64 MiB lexical bound, completeness contract |
+| Subprocess & load control | Rust `dc-proc`, Go `proc`, and Go `devcouncil/scheduler` | 5 s default deadline, `/dev/null` stdin, process-group `SIGTERM`/`SIGKILL` escalation and daemon reaping; load-aware non-blocking FIFO job scheduler for heavy builds/benchmarks |
+| Host adapters | Six hosts, one Rust table (`devmap integrate`); the Go host passes its server over `--servers-stdin`; Antigravity bundle (`antigravity/`) | Different outputs by host; Codex gets `[mcp_servers.devcouncil]` merged into the project `.codex/config.toml` without rewriting other bytes; Antigravity ships MCP bridge, 5 lifecycle hooks, 3 sidecars, and skills |
 | Engineering skills | Embedded/scaffolded instructions | Guidance, not enforced permission or proof of host loading |
 | Sandbox selector | `--sandbox local` only | Anything else is refused (`verify.ParseSandbox`, exit 2); Docker/Nix isolation is not implemented; building it is planned (owner decision 2026-10-07, task `dc-verify-isolated-sandbox`) and is gated on an approved security-impact statement |
 

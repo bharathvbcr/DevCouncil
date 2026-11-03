@@ -1,0 +1,19 @@
+20:43  up  7:39, 1 user, load averages: 16.51 14.50 14.69
+soak baseline: mode=build digest=be0ea006413d db=272596992 tolerance=10%
+soak initial build: wall 17241 ms, peak rss 2159755264 bytes (cold only if the workdir had no store); load average 16.07 14.44 14.67
+  cycle 10 ok rss=1829421056 db=286670848
+  cycle 20 ok rss=1825800192 db=286670848
+soak end: db=286670848 (baseline 272596992)
+soak targets (wall time includes process start-up and the writer-lock wait; p95 is nearest-rank):
+  cold build wall 17241 ms
+  build edited (one file): N=25 min 6390 ms median 7571 ms p95 9075 ms max 10416 ms; p95 target <= 120 ms: NOT met
+  build restored (one file): N=25 min 5858 ms median 7509 ms p95 9173 ms max 9512 ms; p95 target <= 120 ms: NOT met
+  build all one-file incremental: N=50 min 5858 ms median 7562 ms p95 9173 ms max 10416 ms; p95 target <= 120 ms: NOT met
+  rss cold build: N=1 min 2059.7 MiB median 2059.7 MiB max 2059.7 MiB; peak target < 512 MiB: NOT met
+  rss incremental edited: N=25 min 1740.1 MiB median 1744.7 MiB max 1757.3 MiB; peak target < 512 MiB: NOT met
+  rss incremental restored: N=25 min 1737.2 MiB median 1741.7 MiB max 1753.2 MiB; peak target < 512 MiB: NOT met
+  rss all incremental: N=50 min 1737.2 MiB median 1743.3 MiB max 1757.3 MiB; peak target < 512 MiB: NOT met
+  load average (1/5/15 min): start 16.07 14.44 14.67, end 13.58 16.32 15.65
+SOAK SMOKE OK (25 cycles, digest stable; growth NOT asserted — under the 40-cycle minimum); samples in /Users/bharath/Code/devtools/DevCouncil/.claude/worktrees/wf_cfa65dc9-714-1/rust/target/runs/m1.csv
+exit 0
+20:52  up  7:48, 1 user, load averages: 13.58 16.32 15.65

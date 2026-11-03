@@ -1,0 +1,79 @@
+# Unified Antigravity MCP Server Configuration
+# Registers devcouncil, devmap, and gitpulse with FastMCP identifiers
+version: "1.0.0"
+mcpServers:
+  devcouncil:
+    command: devcouncil
+    args:
+      - mcp
+      - serve
+    env:
+      DEVCOUNCIL_WORKSPACE: "${DEVCOUNCIL_WORKSPACE:-.}"
+    transport: stdio
+    tools:
+      - devcouncil_checkout_task
+      - devcouncil_renew_lease
+      - devcouncil_release_task
+      - devcouncil_next_task
+      - devcouncil_verify_task
+      - devcouncil_get_gaps
+      - devcouncil_get_diff
+      - devcouncil_policy_check_write
+    description: DevCouncil task leasing, spec enforcement, and deterministic verification gates
+
+  devmap:
+    command: devmap
+    args:
+      - serve
+      - --mcp
+      - --root
+      - "${DEVCOUNCIL_WORKSPACE:-.}"
+    url: "http://127.0.0.1:9095/mcp"
+    transport: http
+    fallback_transport: stdio
+    tools:
+      - devmap_status
+      - devmap_search
+      - devmap_explore
+      - devmap_dependencies
+      - devmap_impact
+      - devmap_trace
+      - devmap_neighbors
+      - devmap_dead_symbols
+      - devmap_clones
+      - devmap_preview
+      - devmap_affected_tests
+      - devmap_blast
+      - devmap_suspects
+      - devmap_ask_evidence
+      - devmap_doc_drift
+    description: DevMap high-precision 11-tier code intelligence, AST extraction, and graph search
+
+  gitpulse:
+    command: gitpulse-mcp
+    args:
+      - --repo
+      - "${DEVCOUNCIL_WORKSPACE:-.}"
+    env:
+      GITPULSE_REPOSITORY: "${DEVCOUNCIL_WORKSPACE:-.}"
+    transport: stdio
+    tools:
+      - gitpulse_insights
+      - gitpulse_status
+      - gitpulse_active_changes
+      - gitpulse_collision_risk
+      - gitpulse_merge_conflicts
+      - gitpulse_change_context
+      - gitpulse_ledger_events
+      - gitpulse_task_view
+      - gitpulse_add_task
+      - gitpulse_list_tasks
+      - gitpulse_get_task
+      - gitpulse_complete_task
+      - gitpulse_delete_task
+      - gitpulse_worktree_create
+      - gitpulse_worktree_switch
+      - gitpulse_worktree_isolate
+      - gitpulse_worktree_prune
+      - gitpulse_worktree_merge
+    description: GitPulse multi-agent worktree concurrency, line-level collision detection, and append-only ledger

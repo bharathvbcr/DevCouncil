@@ -9,11 +9,12 @@ checks. A consumer can use a single binary or selected library crates.
 
 | Component | Source owner | Responsibility |
 |---|---|---|
-| `devcouncil` / `dev` | `backend/go_orchestrator/cmd/devcouncil/` | Host CLI, task MCP, integration, skills, verification orchestration and DevMap forwarding |
-| `devmap` | `rust/devmap-cli/` and `rust/devmap-*` | Extraction, resolution, graph storage, analysis, queries, watching and navigation MCP |
-| `dcstore` | `rust/dc-store/` | SQLite task and workbench state, leases, verification records and gaps |
-| `dcverify` | `rust/dc-verify/` | Structured diff analysis, scope classification, stub/secret checks and diff–coverage intersection |
-| `dcgrep` | `rust/dc-grep/` | Ignore-aware text search with optional trigram indexing and BM25 rank scoring (decoupled ceilings, 64 MiB lexical budget, completeness contract) |
+| `devc` / `devcouncil` / `dev` | `backend/go_orchestrator/cmd/devcouncil/` | Host CLI, task MCP, 7-layer specification lifecycle (`spec`), resumable DAG workflow engine (`workflow`), unified search router (`search`), load-aware FIFO job scheduler (`devcouncil/scheduler`), secondary judge model verification (`devcouncil/verify`), integration, skills, verification orchestration and DevMap forwarding |
+| `devc-map` / `dc-map` / `devmap` | `rust/devmap-cli/` and `rust/devmap-*` | Unified code intelligence and graph engine: Extraction, 11-tier symbol resolution ladder (`rung`), Blake3 content-addressed AST storage (`cas`), per-worktree delta overlays (`overlay`), zero-copy `mmap` Compressed Sparse Row (CSR) graph storage (`devmap-store::csr`: `CsrGraphReader`, `CsrGraphWriter`, `AtomicGraphHandle`, `FastBitSet`, `sqlite_v30`), analysis, queries, watching and navigation MCP |
+| `devc-store` / `dc-store` / `dcstore` | `rust/dc-store/` | SQLite task and workbench state, ratified constitution gates (`constitution_gates`), active leases (`ux_task_leases_active`), verification records and gaps |
+| `devc-verify` / `dc-verify` / `dcverify` | `rust/dc-verify/` | Structured diff analysis, scope classification, stub/secret checks and diff–coverage intersection |
+| `devc-grep` / `dc-grep` / `dcgrep` | `rust/dc-grep/` | Ignore-aware text search with optional trigram indexing and BM25 rank scoring (decoupled ceilings, 64 MiB lexical budget, completeness contract) |
+| `dc-proc` | `rust/dc-proc/` and `backend/go_orchestrator/proc/` | Subprocess isolation invariants: 5 s default deadline, `/dev/null` stdin, process-group `SIGTERM`/`SIGKILL` escalation and daemon reaping |
 
 ```mermaid
 flowchart TD
@@ -124,15 +125,20 @@ flowchart TD
    variant sets, and literal constant call protection. When ambiguity limits are
    reached, candidate lists degrade gracefully (marking exported maps partial)
    rather than aborting the build.
-3. `devmap-analyze` computes graph analysis, reachability, and liveness candidates.
-4. `devmap-store` owns persistence (schema 29, reader floor 29) with zstd
+3. `devmap-analyze` computes graph analysis, lexical scoping (`scoping.rs`), normalized defect rates across the 9-class unresolved taxonomy (`resolution_rate.rs`), reachability, and liveness candidates.
+4. `devmap-store` owns SQLite persistence (schema 29, reader floor 29) with zstd
    level-1 compressed extraction documents (`extraction_json`, `entry_wiring_json`,
    `extraction_cache`, and `symbol_details` payloads), multi-row batched FTS
    inserts (`FTS_50_SQL`; ledger rows stay one per execute, which measured faster
    at 605k rows), keyed semi-join ledger reads,
-   payload validity ranges, payload-digest identity, and pre-write search index
-   integrity checks; `devmap-query` reads and composes results with bounded
-   unresolved-namesake site lists (`sites_omitted`) and file-hit prefix reads.
+   payload validity ranges, payload-digest identity, pre-write search index
+   integrity checks, and zero-copy `mmap` Compressed Sparse Row (CSR) storage
+   (`devmap-store::csr`: `CsrGraphReader`, `CsrGraphWriter`, `AtomicGraphHandle`,
+   `FastBitSet`, and `sqlite_v30` pragmas) for sub-100 ns hop traversal;
+   `devmap-query` reads and composes results with the 11-tier symbol resolution
+   ladder (`rung.rs`), Blake3 content-addressed AST storage (`cas.rs`), ephemeral
+   per-worktree delta overlays with roaring bitmaps and tombstones (`overlay.rs`),
+   bounded unresolved-namesake site lists (`sites_omitted`), and file-hit prefix reads.
 5. `devmap-serve` watches and updates state; `devmap-cli` exposes CLI/MCP (21 tools) and
    integration surfaces.
 

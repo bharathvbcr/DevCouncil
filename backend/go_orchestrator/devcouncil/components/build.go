@@ -158,6 +158,11 @@ func installRustFromCheckout(src, prefix string, ids []string, o Options) ([]str
 		if err := installAtomic(filepath.Join(stage, rustBinaryName(c.Binary)), dest); err != nil {
 			return installed, fmt.Errorf("install %s: %w", c.ID, err)
 		}
+		for _, alias := range c.Aliases {
+			if err := installComponentLink(bindir, c.Binary, alias); err != nil {
+				return installed, fmt.Errorf("install %s alias %s: %w", c.ID, alias, err)
+			}
+		}
 		console.Errorf("installed %s -> %s\n", c.ID, dest)
 		installed = append(installed, c.ID)
 	}

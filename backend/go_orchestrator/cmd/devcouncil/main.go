@@ -75,6 +75,7 @@ var commands = map[string]func(args []string) int{
 	"skills":       runSkills,
 	"verify":       runVerify,
 	"grep":         runGrep,
+	"search":       runSearch,
 	"install":      components.RunInstall,
 	"uninstall":    components.RunUninstall,
 	"disable":      runDisable,
@@ -84,7 +85,10 @@ var commands = map[string]func(args []string) int{
 	"review":       runReview,
 	"doctor":       runDoctor,
 	"hook":         runHook,
+	"spec":         runSpec,
+	"workflow":     runWorkflow,
 	"map":          func(args []string) int { return runDevmap(mapArgs(args)) },
+	"devmap":       func(args []string) int { return runDevmap(mapArgs(args)) },
 	"graph":        func(args []string) int { return runDevmap(mapArgs(args)) },
 	"ast":          func(args []string) int { return runDevmap(astArgs(args)) },
 	"gusset-check": func([]string) int { return runGussetCheck() },
@@ -116,7 +120,7 @@ func runHelp([]string) int {
 func usage() {
 	console.Errorf(`devcouncil — DevCouncil host binary (Phase 7)
 
-The same binary is installed as ` + "`dev`" + ` and ` + "`devcouncil`" + `.
+The same binary is installed as ` + "`devc`" + `, ` + "`dev`" + `, and ` + "`devcouncil`" + `.
 
 Usage:
   devcouncil mcp              Run the MCP stdio server
@@ -153,9 +157,14 @@ Usage:
   devcouncil verify TASK_ID [--json] [--mode off|advisory|enforce] [--sandbox local] [--coverage PATH]
   devcouncil grep PATTERN [--json] [--path DIR] [--max N] [--ignore-case]
                                    Search via the ` + "`dcgrep`" + ` client (missing binary is an error, never an empty match list)
-  devcouncil map [devmap args…]   Exec ` + "`devmap`" + ` (bare invocation: build --manifest)
-  devcouncil graph …              Alias of map
+  devcouncil search QUERY [--type symbol|structural|literal|regex] [--path DIR] [--max N] [--json]
+                                   Unified search routing across ` + "`devmap`" + ` (symbol/structural) and ` + "`dcgrep`" + ` (literal/regex)
+  devcouncil map [devmap args…]   Exec ` + "`devc-map`" + ` / ` + "`devmap`" + ` (bare invocation: build --manifest; aliases: devmap, graph)
   devcouncil ast …                Exec ` + "`devmap ast`" + `
+  devcouncil spec init|validate|export-tasks [args…]
+                                   Specification hierarchy, validation, and task export
+  devcouncil workflow run|status|resume [args…]
+                                   Declarative DAG workflow execution engine
   devcouncil gusset-check         Prove the linked Rust engine is dc-glob on Gusset
 
 Presentation: --progress auto|always|never (default: auto). JSON stays on stdout.

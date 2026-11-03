@@ -145,6 +145,7 @@ func TestEverySubprocessBoundaryIsGroupIsolated(t *testing.T) {
 	configures := []string{
 		"proc.ConfigureGroup(cmd)", "ConfigureGroup(cmd)",
 		"proc.ConfigureOwnGroup(cmd)", "ConfigureOwnGroup(cmd)",
+		"proc.EnforceSubprocessInvariants(cmd)", "EnforceSubprocessInvariants(cmd)",
 		"setOwnProcessGroup(cmd)",
 	}
 

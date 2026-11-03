@@ -8,7 +8,7 @@ coverage metadata. Installed `devmap COMMAND --help` and `devcouncil --help` are
 The JSON analysis components do not expose conventional `--help`; their native
 command parsers and [Rust guide](../rust/README.md) document those contracts.
 
-This is the comprehensive reference for DevCouncil's native binaries: the Go host orchestrator (`devcouncil` / `dev`) and the Rust analysis components (`devmap`, `dcstore`, `dcverify`, `dcgrep`).
+This is the comprehensive reference for DevCouncil's native binaries: the Go host orchestrator (`devc` / `devcouncil` / `dev`) and the Rust analysis components (`devc-map` / `dc-map` / `devmap`, `devc-store` / `dc-store` / `dcstore`, `devc-verify` / `dc-verify` / `dcverify`, `devc-grep` / `dc-grep` / `dcgrep`).
 
 **Platforms:** macOS, Linux, Windows.  
 **Maturity:** Stable / Preview labels live in [project-status.md](project-status.md).
@@ -48,9 +48,9 @@ verification commands, measured coverage, and platform limits.
 
 ---
 
-## 1. Go Host Orchestrator (`devcouncil` / `dev`)
+## 1. Go Host Orchestrator (`devc` / `devcouncil` / `dev`)
 
-The same binary is installed as both `devcouncil` and `dev`.
+The same binary is installed as `devcouncil`, `devc`, and `dev`.
 
 ```bash
 Usage:
@@ -68,8 +68,12 @@ Usage:
   devcouncil task create|status|show …                 # Create, move and show tasks (workbench items)
   devcouncil doctor [--json]                           # Which store next_task reads; how many ready items it holds
   devcouncil verify TASK_ID [options]                  # Deterministically verify a task diff
+  devcouncil grep PATTERN [--json] [--path DIR] [--max N] [--ignore-case]
+  devcouncil search QUERY [--type symbol|structural|literal|regex] [--path DIR] [--max N] [--json]
+  devcouncil spec init|validate|export-tasks [args…]   # 7-layer specification hierarchy & task export
+  devcouncil workflow run|status|resume [args…]        # Declarative DAG workflow execution engine
   devcouncil map [devmap args…]                        # Exec `devmap` (bare: build --manifest)
-  devcouncil graph …                                   # Alias of map
+  devcouncil devmap|graph …                            # Aliases of map
   devcouncil ast …                                     # Exec `devmap ast`
 ```
 
@@ -243,6 +247,40 @@ dev map [args...]      # Runs `devmap`. Bare invocation runs: devmap build --man
 dev graph [args...]    # Alias for `dev map`
 dev ast [args...]      # Execs `devmap ast`
 ```
+
+### Unified Code Search (`search` and `grep`)
+
+```bash
+devcouncil search QUERY [--type symbol|structural|literal|regex] [--path DIR] [--max N] [--json] [--project-root DIR]
+devcouncil grep PATTERN [--json] [--path DIR] [--max N] [--ignore-case] [--project-root DIR]
+```
+
+- `devcouncil search`: Routes queries across `devmap` and `dcgrep` into a unified `UnifiedSearchResult` envelope (`matches`, `routing_type`, `engine_used`, `total`, `shown`, `truncated`). When `--type` is omitted, identifier-shaped queries (`^[A-Za-z_][A-Za-z0-9_]*$`) try `devmap search` first and fall back to `dcgrep` literal search when no symbol matches; queries containing regex metacharacters route to `dcgrep` regex search; `--type structural` (or `ast`) routes to `devmap ast`.
+- `devcouncil grep`: Direct `dcgrep` client search (missing binary exits 1 with an explicit error, never an empty match list).
+
+### Specification Hierarchy (`spec`)
+
+```bash
+devcouncil spec init <feature-name> [--project-root DIR]
+devcouncil spec validate <feature-name|feature-dir> [--strict] [--json] [--project-root DIR]
+devcouncil spec export-tasks <feature-name|feature-dir> [--target-status STATUS] [--dry-run] [--json] [--project-root DIR]
+```
+
+- `init`: Scaffolds a 7-layer specification directory under `specs/###-<feature-name>/` (`spec.md`, `plan.md`, `research.md`, `data-model.md`, `contracts/`, `tasks.md`, and root `constitution.md` reference).
+- `validate`: Statically validates the specification against schema and constitutional rules (`[NEEDS CLARIFICATION]` markers, user stories, tasks, and success metrics). `--strict` treats warnings as validation failures.
+- `export-tasks`: Parses `tasks.md` into DAG-ordered workbench tasks and scope envelopes (persisting to `.devcouncil/state.sqlite` unless `--dry-run` is passed).
+
+### Declarative DAG Workflows (`workflow`)
+
+```bash
+devcouncil workflow run <path/to/workflow.yaml> [--var key=value] [--feature-id ID] [--project-root DIR]
+devcouncil workflow status <run_id> [--json] [--project-root DIR]
+devcouncil workflow resume <run_id> --decision approve|reject [--input key=value] [--project-root DIR]
+```
+
+- `run`: Parses a YAML/JSON workflow definition, validates topological ordering and cycle freedom via Kahn's algorithm, and executes steps with persistent atomic checkpointing under `.devcouncil/workflows/runs/<run_id>.json`. Pauses cleanly at interactive/policy gates (`status: "paused_at_gate"`).
+- `status`: Displays step outcomes, gate prompts, and run metadata for `<run_id>`.
+- `resume`: Resumes a workflow paused at a gate or recovers a crashed execution from its last persisted step checkpoint.
 
 ---
 

@@ -2,8 +2,9 @@
 
 Harness: `rust/tools/soak` (crate `devmap-soak`), branch `devmap-perf2/targets`, built from
 `claude/devmap-perf-main` 213772a4 plus the soak changes. Corpus: the frozen GitPulse tree
-(52,425 symbols, 3,072 files), copied fresh per run into a private directory. Each `.log.txt` in this
-directory is the soak's own output (renamed from `.log`, which the repository ignores); each `.csv` is its per-cycle samples
+(52,425 symbols, 3,072 files), copied fresh per run into a private directory. Each `<run>.soak-output.txt` in
+this directory is the soak's own output (renamed from `.log`, which the repository's
+`*.log` / `*.log.*` rules ignore); each `.csv` is its per-cycle samples
 (`cycle,rss_bytes,db_bytes,build_ms,dirty_build_ms,dirty_rss_bytes`).
 
 Targets (spec section 6.6, adopted by the owner): one-file incremental build p95 <= 120 ms;
@@ -33,8 +34,11 @@ Order was m1, x1, m2, x2 (sequential, not interleaved within a run).
 - Target 1 (p95 <= 120 ms): not met on any run. The best pooled minimum anywhere is 2.3 s, about
   19x the target; the best p95 is 6.3 s. (The same-binary spread, x1 median 8.4 s vs x2 median
   2.9 s, is 2.9x, so the merged-vs-main wall time gap is NOT resolvable on this host.)
-- Target 2 (peak RSS < 512 MB): not met. Incremental builds peak at about 1.74 GiB (merged) /
-  1.78 GiB (main), 3.4x the target and about 83% of the cold build's 2.06-2.10 GiB. The
+- Target 2 (peak RSS < 512 MB): not met. Incremental builds peak at 1,737-1,757 MiB
+  (1.70-1.72 GiB, merged) / 1,780-1,793 MiB (1.74-1.75 GiB, main): about 3.4x the 512 MiB
+  bound the soak checks (3.6x the spec's 512 MB) and about 83-86% of the run's own cold build
+  (per run: m1 84.3-85.3%, m2 83.5-84.3%, x1 85.7-86.1%, x2 84.8-85.4%), which across runs spans
+  2,060-2,099 MiB (2.01-2.05 GiB). The
   incremental RSS gap between binaries (about 2.4% lower on merged) does not overlap across
   the two pairs of runs (merged 1,737-1,757 vs main 1,780-1,793 MiB) but is tiny against the
   gap to the target.

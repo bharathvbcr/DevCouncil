@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DevMap — Code Graph Explorer & Blast Radius Preview</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --border: #30363d;
+      --text: #c9d1d9;
+      --text-muted: #8b949e;
+      --accent: #58a6ff;
+      --green: #3fb950;
+      --blue: #58a6ff;
+      --amber: #d29922;
+      --red: #f85149;
+      --purple: #bc8cff;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .header-title {
+      font-size: 14px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .badge {
+      font-size: 11px;
+      padding: 2px 6px;
+      border-radius: 12px;
+      background: #238636;
+      color: #fff;
+    }
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    input[type="text"] {
+      background: #0d1117;
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 5px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      width: 220px;
+    }
+    select, button {
+      background: #21262d;
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 5px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    button:hover { background: #30363d; }
+    .slider-wrap {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    main {
+      flex: 1;
+      position: relative;
+      display: flex;
+    }
+    #canvas-container {
+      flex: 1;
+      position: relative;
+      background: #090d13;
+    }
+    canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+    sidebar {
+      width: 320px;
+      background: var(--surface);
+      border-left: 1px solid var(--border);
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      overflow-y: auto;
+    }
+    .panel-box {
+      background: #0d1117;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px;
+    }
+    .panel-title {
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-muted);
+      margin-bottom: 8px;
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      margin-bottom: 6px;
+    }
+    .legend-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+    }
+    .node-detail-field {
+      font-size: 12px;
+      margin-bottom: 4px;
+    }
+    .node-detail-field span {
+      color: var(--text-muted);
+    }
+    .blast-list {
+      list-style: none;
+      font-size: 12px;
+      max-height: 180px;
+      overflow-y: auto;
+    }
+    .blast-list li {
+      padding: 4px 6px;
+      border-radius: 4px;
+      margin-bottom: 2px;
+      background: #161b22;
+      border-left: 3px solid var(--amber);
+      font-family: monospace;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-title">
+      <span>DevMap Code Graph Explorer</span>
+      <span class="badge">Schema v30</span>
+      <span id="status-indicator" style="font-size:11px; color:var(--text-muted);">Generation: 4648</span>
+    </div>
+    <div class="controls">
+      <input type="text" id="symbol-search" placeholder="Search symbol or function...">
+      <div class="slider-wrap">
+        <span>Blast Radius:</span>
+        <input type="range" id="blast-depth" min="1" max="4" value="2">
+        <span id="blast-depth-val">2</span>
+      </div>
+      <button id="reset-btn">Reset View</button>
+    </div>
+  </header>
+
+  <main>
+    <div id="canvas-container">
+      <canvas id="graph-canvas"></canvas>
+    </div>
+
+    <sidebar>
+      <div class="panel-box">
+        <div class="panel-title">Selected Symbol</div>
+        <div id="selected-info">
+          <div class="node-detail-field"><span>Name:</span> <strong id="node-name">None</strong></div>
+          <div class="node-detail-field"><span>Kind:</span> <span id="node-kind">—</span></div>
+          <div class="node-detail-field"><span>File:</span> <span id="node-file">—</span></div>
+          <div class="node-detail-field"><span>Confidence:</span> <span id="node-conf">—</span></div>
+        </div>
+      </div>
+
+      <div class="panel-box">
+        <div class="panel-title">Blast Radius Impact Cone</div>
+        <div style="font-size:11px; color:var(--text-muted); margin-bottom:6px;">
+          Direct & Transitive Inbound Callers:
+        </div>
+        <ul class="blast-list" id="blast-callers">
+          <li style="color:var(--text-muted);">Select a node to calculate blast radius</li>
+        </ul>
+      </div>
+
+      <div class="panel-box">
+        <div class="panel-title">11-Tier Resolution Ladder</div>
+        <div class="legend-item"><div class="legend-dot" style="background:var(--green)"></div> SameFile / SamePkg / Import (1.0)</div>
+        <div class="legend-item"><div class="legend-dot" style="background:var(--blue)"></div> LanguageServer / UniqueGlobal (0.9)</div>
+        <div class="legend-item"><div class="legend-dot" style="background:var(--amber)"></div> Dispatch (0.5 Polymorphic)</div>
+        <div class="legend-item"><div class="legend-dot" style="background:var(--red)"></div> AmbiguousGlobal (0.1 Speculative)</div>
+      </div>
+    </sidebar>
+  </main>
+
+  <script>
+    // --- Graph Data & Simulation ---
+    const nodes = [
+      { id: "devcouncil_checkout_task", name: "devcouncil_checkout_task", kind: "Function", file: "backend/go_orchestrator/devcouncil/workbench.go", tier: "SamePackage", conf: 1.0, x: 200, y: 150 },
+      { id: "TaskLeaseEngine", name: "TaskLeaseEngine", kind: "Struct", file: "rust/dc-store/src/lease.rs", tier: "SameFile", conf: 1.0, x: 380, y: 150 },
+      { id: "gitpulse_worktree_create", name: "gitpulse_worktree_create", kind: "Function", file: "src/engine/worktree.rs", tier: "ImportScoped", conf: 1.0, x: 220, y: 280 },
+      { id: "reflink_copy", name: "reflink_copy", kind: "Function", file: "src/engine/cache.rs", tier: "UniqueGlobal", conf: 0.9, x: 380, y: 280 },
+      { id: "pre_tool_call_decide", name: "pre_tool_call_decide", kind: "Hook", file: "antigravity/hooks/pre_tool_call_decide.py", tier: "SameFile", conf: 1.0, x: 200, y: 400 },
+      { id: "check_collision_risk", name: "check_collision_risk", kind: "Function", file: "src/insights/collisions.rs", tier: "SamePackage", conf: 1.0, x: 380, y: 400 },
+      { id: "stop_hook", name: "stop_hook", kind: "Hook", file: "antigravity/hooks/stop.py", tier: "SameFile", conf: 1.0, x: 200, y: 520 },
+      { id: "devcouncil_verify_task", name: "devcouncil_verify_task", kind: "Function", file: "backend/go_orchestrator/devcouncil/verify.go", tier: "Dispatch", conf: 0.5, x: 380, y: 520 },
+      { id: "GateTests", name: "GateTests", kind: "Struct", file: "rust/dc-verify/src/gates.rs", tier: "ImportScoped", conf: 1.0, x: 550, y: 480 },
+      { id: "GateCoverage", name: "GateCoverage", kind: "Struct", file: "rust/dc-verify/src/gates.rs", tier: "ImportScoped", conf: 1.0, x: 550, y: 560 }
+    ];
+
+    const edges = [
+      { from: "devcouncil_checkout_task", to: "TaskLeaseEngine", tier: "SamePackage", conf: 1.0 },
+      { from: "gitpulse_worktree_create", to: "reflink_copy", tier: "UniqueGlobal", conf: 0.9 },
+      { from: "pre_tool_call_decide", to: "check_collision_risk", tier: "SamePackage", conf: 1.0 },
+      { from: "stop_hook", to: "devcouncil_verify_task", tier: "Dispatch", conf: 0.5 },
+      { from: "devcouncil_verify_task", to: "GateTests", tier: "ImportScoped", conf: 1.0 },
+      { from: "devcouncil_verify_task", to: "GateCoverage", tier: "ImportScoped", conf: 1.0 }
+    ];
+
+    let selectedNode = null;
+    let blastRadiusNodes = new Set();
+    const canvas = document.getElementById("graph-canvas");
+    const ctx = canvas.getContext("2d");
+
+    function resizeCanvas() {
+      const container = document.getElementById("canvas-container");
+      canvas.width = container.clientWidth;
+      canvas.height = container.clientHeight;
+      draw();
+    }
+    window.addEventListener("resize", resizeCanvas);
+
+    function getTierColor(conf, tier) {
+      if (conf >= 0.95) return "#3fb950"; // Green
+      if (conf >= 0.85) return "#58a6ff"; // Blue
+      if (conf >= 0.4) return "#d29922";  // Amber
+      return "#f85149"; // Red
+    }
+
+    function calculateBlastRadius(nodeId, depth = 2) {
+      blastRadiusNodes.clear();
+      if (!nodeId) return;
+      blastRadiusNodes.add(nodeId);
+
+      let currentTier = [nodeId];
+      for (let d = 0; d < depth; d++) {
+        const nextTier = [];
+        for (const targetId of currentTier) {
+          // Inbound callers (who calls targetId)
+          for (const edge of edges) {
+            if (edge.to === targetId && !blastRadiusNodes.has(edge.from)) {
+              blastRadiusNodes.add(edge.from);
+              nextTier.push(edge.from);
+            }
+          }
+        }
+        currentTier = nextTier;
+      }
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Draw edges
+      edges.forEach(e => {
+        const src = nodes.find(n => n.id === e.from);
+        const tgt = nodes.find(n => n.id === e.to);
+        if (!src || !tgt) return;
+
+        const isBlast = blastRadiusNodes.has(src.id) && blastRadiusNodes.has(tgt.id);
+
+        ctx.beginPath();
+        ctx.moveTo(src.x, src.y);
+        ctx.lineTo(tgt.x, tgt.y);
+        ctx.strokeStyle = isBlast ? "#f0883e" : (getTierColor(e.conf, e.tier) + "66");
+        ctx.lineWidth = isBlast ? 2.5 : 1.2;
+        ctx.stroke();
+
+        // Draw arrow
+        const angle = Math.atan2(tgt.y - src.y, tgt.x - src.x);
+        const headLen = 6;
+        const arrowX = tgt.x - 16 * Math.cos(angle);
+        const arrowY = tgt.y - 16 * Math.sin(angle);
+        ctx.beginPath();
+        ctx.moveTo(arrowX, arrowY);
+        ctx.lineTo(arrowX - headLen * Math.cos(angle - Math.PI / 6), arrowY - headLen * Math.sin(angle - Math.PI / 6));
+        ctx.lineTo(arrowX - headLen * Math.cos(angle + Math.PI / 6), arrowY - headLen * Math.sin(angle + Math.PI / 6));
+        ctx.fillStyle = isBlast ? "#f0883e" : (getTierColor(e.conf, e.tier) + "99");
+        ctx.fill();
+      });
+
+      // Draw nodes
+      nodes.forEach(n => {
+        const isSelected = selectedNode && selectedNode.id === n.id;
+        const isBlast = blastRadiusNodes.has(n.id);
+
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, isSelected ? 12 : (isBlast ? 10 : 8), 0, Math.PI * 2);
+        ctx.fillStyle = isSelected ? "#ffffff" : (isBlast ? "#f0883e" : getTierColor(n.conf, n.tier));
+        ctx.shadowColor = isBlast ? "#f0883e" : "transparent";
+        ctx.shadowBlur = isBlast ? 12 : 0;
+        ctx.fill();
+        ctx.shadowBlur = 0;
+
+        // Label
+        ctx.font = isSelected ? "bold 12px sans-serif" : "11px sans-serif";
+        ctx.fillStyle = isSelected ? "#ffffff" : "#c9d1d9";
+        ctx.fillText(n.name, n.x + 14, n.y + 4);
+      });
+    }
+
+    function selectNode(n) {
+      selectedNode = n;
+      document.getElementById("node-name").textContent = n.name;
+      document.getElementById("node-kind").textContent = n.kind;
+      document.getElementById("node-file").textContent = n.file;
+      document.getElementById("node-conf").textContent = `${n.tier} (${n.conf})`;
+
+      const depth = parseInt(document.getElementById("blast-depth").value, 10);
+      calculateBlastRadius(n.id, depth);
+
+      const blastList = document.getElementById("blast-callers");
+      blastList.innerHTML = "";
+      if (blastRadiusNodes.size <= 1) {
+        blastList.innerHTML = "<li>No inbound callers detected (Root)</li>";
+      } else {
+        blastRadiusNodes.forEach(id => {
+          if (id !== n.id) {
+            const li = document.createElement("li");
+            li.textContent = id;
+            blastList.appendChild(li);
+          }
+        });
+      }
+      draw();
+    }
+
+    canvas.addEventListener("click", e => {
+      const rect = canvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+
+      let hit = null;
+      for (const n of nodes) {
+        const dist = Math.hypot(n.x - x, n.y - y);
+        if (dist <= 16) {
+          hit = n;
+          break;
+        }
+      }
+      if (hit) {
+        selectNode(hit);
+      }
+    });
+
+    document.getElementById("blast-depth").addEventListener("input", e => {
+      document.getElementById("blast-depth-val").textContent = e.target.value;
+      if (selectedNode) {
+        calculateBlastRadius(selectedNode.id, parseInt(e.target.value, 10));
+        draw();
+      }
+    });
+
+    document.getElementById("reset-btn").addEventListener("click", () => {
+      selectedNode = null;
+      blastRadiusNodes.clear();
+      document.getElementById("node-name").textContent = "None";
+      document.getElementById("node-kind").textContent = "—";
+      document.getElementById("node-file").textContent = "—";
+      document.getElementById("node-conf").textContent = "—";
+      document.getElementById("blast-callers").innerHTML = "<li>Select a node to calculate blast radius</li>";
+      draw();
+    });
+
+    // Sidecar Protocol handling (URL query parameter or postMessage)
+    function handleSidecarProtocol() {
+      const urlParams = new URLSearchParams(window.location.search);
+      const targetSymbol = urlParams.get("target") || urlParams.get("symbol");
+      if (targetSymbol) {
+        const found = nodes.find(n => n.name.toLowerCase().includes(targetSymbol.toLowerCase()) || n.file.includes(targetSymbol));
+        if (found) {
+          selectNode(found);
+        }
+      }
+    }
+
+    window.addEventListener("message", event => {
+      if (event.data && event.data.type === "SIDECAR_TARGET_CHANGE") {
+        const sym = event.data.symbol;
+        const found = nodes.find(n => n.name === sym);
+        if (found) selectNode(found);
+      }
+    });
+
+    // Init
+    resizeCanvas();
+    handleSidecarProtocol();
+  </script>
+</body>
+</html>

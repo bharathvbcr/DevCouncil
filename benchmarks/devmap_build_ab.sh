@@ -14,6 +14,13 @@
 # summary.txt then gives min, median and max per arm and kind. A same-binary
 # pair of arms (a=X b=X) measures the noise floor.
 #
+# A build that exits non-zero (or whose --json result cannot be read) writes no
+# row. Each one is reported on stderr as it happens (arm, rep, kind, exit code,
+# the .err file holding the build's stderr), summary.txt is still written for
+# the builds that succeeded, and the script lists every failure again at the end
+# and exits 1. Exit 0 therefore means every row of every arm is in runs.tsv.
+# benchmarks/test_devmap_build_ab.sh pins this with stub binaries.
+#
 # The corpus is a git repository; the edited files are restored with `git
 # checkout` after each rep, so every rep starts from the same tree.
 set -u
@@ -61,6 +68,29 @@ build() {
   "$bin" build "$CORPUS" --db "$db" --json --progress never "$@" > "$json" 2> "${json%.json}.err"
 }
 
+FAILURES=()
+step() {
+  # $1 arm $2 rep $3 kind $4 binary $5 db $6.. extra flags
+  # One build, then its runs.tsv row. A build that exits non-zero, or whose
+  # result `row` cannot read, contributes no row and is recorded for the report
+  # at the end: a missing row must never look like a build that was not run.
+  local arm=$1 rep=$2 kind=$3 bin=$4 db=$5 json rc
+  shift 5
+  json="$OUT/$arm-$rep-$kind.json"
+  build "$bin" "$db" "$json" "$@"
+  rc=$?
+  if ((rc != 0)); then
+    FAILURES+=("arm $arm rep $rep kind $kind: build exit $rc, stderr in ${json%.json}.err")
+    echo "FAILED: ${FAILURES[${#FAILURES[@]} - 1]}" >&2
+    return 0
+  fi
+  if ! row "$arm" "$rep" "$kind" "$json" "$db"; then
+    FAILURES+=("arm $arm rep $rep kind $kind: build exit 0 but its result $json could not be read, stderr in ${json%.json}.err")
+    echo "FAILED: ${FAILURES[${#FAILURES[@]} - 1]}" >&2
+  fi
+  return 0
+}
+
 ARMS=("$@")
 N=${#ARMS[@]}
 for ((rep = 1; rep <= REPS; rep++)); do
@@ -70,11 +100,11 @@ for ((rep = 1; rep <= REPS; rep++)); do
     bin=${spec#*=}
     db="$OUT/$arm-$rep.sqlite"
     rm -f "$db" "$db"-wal "$db"-shm "$db".writer.lock
-    build "$bin" "$db" "$OUT/$arm-$rep-cold.json" --full && row "$arm" "$rep" cold "$OUT/$arm-$rep-cold.json" "$db"
+    step "$arm" "$rep" cold "$bin" "$db" --full
     printf '\n// ab edit %s\n' "$rep" >> "$CORPUS/$EDIT1"
-    build "$bin" "$db" "$OUT/$arm-$rep-inc1.json" && row "$arm" "$rep" inc1 "$OUT/$arm-$rep-inc1.json" "$db"
+    step "$arm" "$rep" inc1 "$bin" "$db"
     printf '\n// ab edit %s\n' "$rep" >> "$CORPUS/$EDIT2"
-    build "$bin" "$db" "$OUT/$arm-$rep-inc2.json" && row "$arm" "$rep" inc2 "$OUT/$arm-$rep-inc2.json" "$db"
+    step "$arm" "$rep" inc2 "$bin" "$db"
     (cd "$CORPUS" && git checkout -q -- "$EDIT1" "$EDIT2")
     rm -f "$db" "$db"-wal "$db"-shm "$db".writer.lock
   done
@@ -102,3 +132,10 @@ for (kind, arm), rs in sorted(groups.items()):
     print("%s\t%s\t%d\t%s\t%s" % (kind, arm, len(rs), "\t".join(cells), counts))
 PY
 cat "$OUT/summary.txt"
+
+if ((${#FAILURES[@]} > 0)); then
+  echo >&2
+  echo "${#FAILURES[@]} build(s) failed; their rows are missing from runs.tsv and summary.txt covers only the builds that succeeded:" >&2
+  printf '  %s\n' "${FAILURES[@]}" >&2
+  exit 1
+fi

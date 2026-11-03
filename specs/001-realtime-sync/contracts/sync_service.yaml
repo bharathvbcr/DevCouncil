@@ -1,0 +1,49 @@
+openapi: 3.1.0
+info:
+  title: DevCouncil Realtime Sync Service
+  version: 1.0.0
+  description: Machine-verifiable interface contract for realtime state synchronization.
+paths:
+  /sync/events:
+    post:
+      summary: Broadcast a local diff event to connected peers
+      operationId: broadcastSyncEvent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SyncEvent'
+      responses:
+        '200':
+          description: Event accepted and sequenced
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sequence:
+                    type: integer
+                  ack:
+                    type: boolean
+                required:
+                  - sequence
+                  - ack
+components:
+  schemas:
+    SyncEvent:
+      type: object
+      required:
+        - event_id
+        - source_worktree
+        - target_file
+        - diff_payload
+      properties:
+        event_id:
+          type: string
+        source_worktree:
+          type: string
+        target_file:
+          type: string
+        diff_payload:
+          type: string
