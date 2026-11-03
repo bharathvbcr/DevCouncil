@@ -17,6 +17,13 @@ const maxWorkbenchReply = 2 << 20
 
 // WorkbenchMethods is the profile API this client understands. It excludes
 // repository-local execution leases, permissions and provider operations.
+//
+// It also deliberately excludes signals.record. That method records a host's CI
+// result into task attention; its only writer is GitPulse, which calls the Rust
+// dc-store in-process, and nothing on the Go side calls it. A Go host such as
+// Manvi serve copies this list into the ops it serves, so listing it would
+// expose that write to every serve client. Access like that is opt-in. The Rust
+// dispatcher and the dcstore CLI keep the method.
 func WorkbenchMethods() []string {
 	return []string{
 		"workspaces.list", "workspaces.get", "workspaces.put", "workspaces.delete",
@@ -32,7 +39,6 @@ func WorkbenchMethods() []string {
 		"enhancements.accept", "enhancements.dismiss", "enhancements.undo",
 		"enhancements.claim", "enhancements.recover", "enhancements.revise",
 		"automation.get", "automation.put", "automation.list", "automation.prepare",
-		"signals.record",
 		"runs.prepare", "runs.claim", "runs.started", "runs.protocol", "runs.finish", "runs.cancel", "runs.get", "runs.list",
 		"store.compact", "store.upgrade",
 	}
