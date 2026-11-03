@@ -1,4 +1,4 @@
-//! Workbench items as the one task source (schema 10 / workbench 14).
+//! Workbench items as the one task source (schema 10 / workbench 15).
 //!
 //! `scope` is validated where it enters, `ready`/`task`/`acquire` read
 //! `work_items`, `blocked` is derived from gaps, and the legacy `tasks` table is
