@@ -98,6 +98,25 @@ type SkillsReport struct {
 	CheckOK   bool     `json:"check_ok"`
 }
 
+// AgentsReport is what `devmap --json agents install` reports.
+//
+// Managed names every content path the document owns, matching or not, so a
+// check can record the ones that already agree. Written includes the receipt
+// when that file's bytes changed.
+type AgentsReport struct {
+	Written   []string `json:"written"`
+	Differing []string `json:"differing"`
+	Managed   []string `json:"managed"`
+	Receipt   string   `json:"receipt"`
+	CheckOK   bool     `json:"check_ok"`
+}
+
+// AgentFile is one agent or rule in an `--agents-stdin` document.
+type AgentFile struct {
+	Name    string `json:"name"`
+	Content string `json:"content"`
+}
+
 // Skill is one skill of a library handed to `skills install --library-stdin`.
 type Skill struct {
 	Name    string `json:"name"`
@@ -189,6 +208,30 @@ func (c *Client) InstallSkills(ctx context.Context, destinations []string, libra
 	return &report, nil
 }
 
+// InstallAgents installs agents and rules through `devmap agents install
+// --agents-stdin`, the one writer of `.devcouncil-agents.json`. The document
+// is bounded like a skill library. An empty set is refused here: DevMap would
+// treat it as nothing to do and report that as current.
+func (c *Client) InstallAgents(ctx context.Context, agents, rules []AgentFile, mode InstallMode) (*AgentsReport, error) {
+	if len(agents) == 0 && len(rules) == 0 {
+		return nil, errors.New("no agents to install")
+	}
+	encoded, err := json.Marshal(map[string]any{"agents": agents, "rules": rules})
+	if err != nil {
+		return nil, err
+	}
+	args := []string{"agents", "install", "--project-root", c.Root, "--agents-stdin"}
+	args, err = withMode(args, mode)
+	if err != nil {
+		return nil, err
+	}
+	var report AgentsReport
+	if err := c.install(ctx, &report, mode, encoded, args...); err != nil {
+		return nil, err
+	}
+	return &report, nil
+}
+
 func withMode(args []string, mode InstallMode) ([]string, error) {
 	switch mode {
 	case InstallApply:
@@ -265,6 +308,8 @@ func reportsDrift(report any) bool {
 		return !r.CheckOK
 	case *SkillsReport:
 		return !r.CheckOK
+	case *AgentsReport:
+		return !r.CheckOK
 	case *RemoveReport:
 		return !r.CheckOK
 	}
@@ -274,7 +319,7 @@ func reportsDrift(report any) bool {
 // predatesFlag names the remedy when an installed devmap is older than the
 // contract: clap's refusal of an unknown flag says nothing about versions.
 func predatesFlag(err error, stderr []byte) error {
-	for _, flag := range []string{"--servers-stdin", "--library-stdin"} {
+	for _, flag := range []string{"--servers-stdin", "--library-stdin", "--agents-stdin"} {
 		if bytes.Contains(stderr, []byte("unexpected argument '"+flag+"'")) {
 			return fmt.Errorf("%w; this devmap predates %s — install the devmap built from this release", err, flag)
 		}

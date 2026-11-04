@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/dc/devmap"
+	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/devcouncil/agents"
 )
 
 // Mode is apply / check / dry-run.
@@ -35,7 +36,9 @@ const (
 // one file that is DevCouncil's own: the Cursor rule.
 //
 // What stays here is what only DevCouncil knows: which names it retired and
-// why, and what its own server runs.
+// why, what its own server runs, the Cursor rule, and — for Antigravity only —
+// the embedded agent library it hands to `devmap agents install` before the
+// MCP document. DevMap remains the only writer of `.agents/`.
 
 // Names this command used to accept, and what to do instead.
 //
@@ -166,16 +169,46 @@ func Run(opts Options) (*Receipt, error) {
 		return nil, fmt.Errorf("%w; host documents, guides and skills are written by "+
 			"`devmap integrate`, so nothing was configured", err)
 	}
+	client := devmap.New(runnable, root)
+	receipt := &Receipt{Host: host, Mode: string(mode), Files: map[string]string{}}
 
-	report, err := devmap.New(runnable, root).Integrate(context.Background(), host, installMode,
+	// Agents go in before the MCP document. An older devmap that rejects
+	// --agents-stdin then leaves the host document unmoved, and the error
+	// names the flag. Other hosts do not spawn this command.
+	if host == "antigravity" {
+		library, loadErr := agents.Load()
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		agentFiles := make([]devmap.AgentFile, len(library.Agents))
+		for i, file := range library.Agents {
+			agentFiles[i] = devmap.AgentFile{Name: file.Name, Content: string(file.Content)}
+		}
+		ruleFiles := make([]devmap.AgentFile, len(library.Rules))
+		for i, file := range library.Rules {
+			ruleFiles[i] = devmap.AgentFile{Name: file.Name, Content: string(file.Content)}
+		}
+		agentsReport, agentsErr := client.InstallAgents(context.Background(), agentFiles, ruleFiles, installMode)
+		if agentsErr != nil {
+			// No receipt: the installer reported nothing this command could
+			// vouch for. A check that could not run is not a tree that differs.
+			return nil, agentsErr
+		}
+		receipt.Spawned = append(receipt.Spawned, fmt.Sprintf("devmap agents install --agents-stdin (%s)", mode))
+		foldAgents(receipt, root, mode, agentsReport)
+	}
+
+	report, err := client.Integrate(context.Background(), host, installMode,
 		[]devmap.Server{devcouncilServer(selfBin, root)})
 	if err != nil {
-		// No receipt: DevMap reported nothing this command could vouch for,
-		// and an empty one reads as a result. Its refusal names the reason —
-		// an unknown host, for one, with the list of the ones it takes.
+		// Agents that landed stay landed. The receipt names them; the error
+		// is the MCP install that did not. An empty receipt still reads as
+		// "nothing happened", so a host that never got that far returns none.
+		if len(receipt.Spawned) > 0 {
+			return receipt, err
+		}
 		return nil, err
 	}
-	receipt := &Receipt{Host: host, Mode: string(mode), Files: map[string]string{}}
 	receipt.Spawned = append(receipt.Spawned, fmt.Sprintf("devmap integrate %s --servers-stdin (%s)", host, mode))
 	foldReport(receipt, root, mode, report)
 
@@ -283,6 +316,52 @@ func foldReport(receipt *Receipt, root string, mode Mode, report *devmap.Integra
 		}
 	}
 	receipt.Notes = append(receipt.Notes, report.Notes...)
+}
+
+// foldAgents records the agent installer's paths in the same vocabulary as
+// foldReport. A check that agrees marks every managed path, and the receipt,
+// unchanged. A path that differs is drift, would_write, or wrote.
+func foldAgents(receipt *Receipt, root string, mode Mode, report *devmap.AgentsReport) {
+	if report == nil {
+		return
+	}
+	rel := func(p string) string { return devmap.RelativeTo(root, p) }
+	for _, p := range report.Written {
+		receipt.Files[rel(p)] = installAction(mode, true)
+	}
+	for _, p := range report.Differing {
+		key := rel(p)
+		if receipt.Files[key] == "" {
+			receipt.Files[key] = installAction(mode, true)
+		}
+	}
+	if report.CheckOK {
+		for _, p := range report.Managed {
+			key := rel(p)
+			if receipt.Files[key] == "" {
+				receipt.Files[key] = "unchanged"
+			}
+		}
+		if report.Receipt != "" {
+			key := rel(report.Receipt)
+			if receipt.Files[key] == "" {
+				receipt.Files[key] = "unchanged"
+			}
+		}
+	}
+}
+
+func installAction(mode Mode, changed bool) string {
+	if !changed {
+		return "unchanged"
+	}
+	switch mode {
+	case ModeApply:
+		return "wrote"
+	case ModeDryRun:
+		return "would_write"
+	}
+	return "drift"
 }
 
 // checkHost refuses an empty or retired name with its explanation. Every other

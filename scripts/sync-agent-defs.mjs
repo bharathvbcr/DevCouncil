@@ -11,8 +11,16 @@
  * stale copy spent its first move calling into an error.
  *
  * Source of truth : .claude/agents/<name>.md
+ *                   agents/antigravity/devcouncil.md              (Antigravity primary, copied)
+ *                   agents/antigravity/rule.md                    (Antigravity always-on rule, copied)
  * Generated       : .codex/agents/<name>.toml                     (Codex agent role)
  *                   .devcouncil/claude-plugin/devcouncil/agents/<name>.md  (plugin)
+ *                   backend/go_orchestrator/devcouncil/agents/library/     (Antigravity install set)
+ *
+ * The primary and the rule are not emitted to Codex or the Claude plugin.
+ * The library copies carry no generated banner: the installed Markdown is the
+ * prompt, and drift is enforced by `drift()` rather than a header the model
+ * would read.
  *
  * Usage:
  *   node scripts/sync-agent-defs.mjs             # write the generated copies
@@ -58,6 +66,25 @@ export const PLUGIN_AGENTS_DIR = path.join(
   "devcouncil",
   "agents",
 );
+export const ANTIGRAVITY_LIBRARY_DIR = path.join(
+  "backend",
+  "go_orchestrator",
+  "devcouncil",
+  "agents",
+  "library",
+);
+export const ANTIGRAVITY_PRIMARY_SOURCE = path.join("agents", "antigravity", "devcouncil.md");
+export const ANTIGRAVITY_RULE_SOURCE = path.join("agents", "antigravity", "rule.md");
+
+/** The three roles rendered into the Antigravity library. The primary is not one of them. */
+export const ANTIGRAVITY_ROLES = [
+  "devcouncil-implementer",
+  "devcouncil-reviewer",
+  "devcouncil-verifier",
+];
+
+/** Per-file cap Antigravity enforces on a rules/*.md file. */
+export const ANTIGRAVITY_RULE_LIMIT = 24 * 1024;
 
 export const BANNER = "# GENERATED FILE — DO NOT EDIT.";
 
@@ -81,6 +108,110 @@ When the MCP tools are not loaded, the \`devmap\` CLI answers the same questions
 <target>\`). GitPulse Insights is served over MCP only — there is no \`gitpulse\`
 CLI, so when it is unavailable, report the situation as unestablished rather than
 guessing at it.`;
+
+/**
+ * Host facts appended to the three Antigravity roles. The primary is copied
+ * byte for byte and does not receive this section.
+ */
+export const ANTIGRAVITY_HOST_NOTES = `## On this host
+
+Where the instructions name \`Read\`, \`Edit\`, \`Write\`, \`Grep\`, \`Glob\`, or \`Bash\`, use this host's file and shell tools.
+
+MCP tools are the unsuffixed \`devcouncil_*\`, \`devmap_*\`, and \`gitpulse_*\` names. The \`mcp__\` prefixes are Claude's. If DevMap MCP is absent, the \`devmap\` CLI answers the same questions. GitPulse has no CLI; an unavailable Insights call is unestablished, not clean.
+
+Do not invoke another subagent. Return the result to the parent.`;
+
+/**
+ * Antigravity frontmatter for one role. The body and description are the
+ * source's. `tools:` is omitted: a listed name the CLI does not map hangs the
+ * process, and Claude's `mcp__` grants are not this host's tool ids.
+ */
+export function renderAntigravityAgent(def) {
+  if (!ANTIGRAVITY_ROLES.includes(def.name)) {
+    throw new AgentDefError(`${def.name}: not an Antigravity role`);
+  }
+  return [
+    "---",
+    `name: ${def.name}`,
+    `description: ${JSON.stringify(def.description)}`,
+    "mainAgent: false",
+    "subagent: true",
+    "model: pro",
+    "commandExecutionPolicy: sandbox",
+    "inheritCustomizations: true",
+    "inheritMcp: true",
+    "---",
+    "",
+    def.body,
+    "",
+    ANTIGRAVITY_HOST_NOTES,
+    "",
+  ].join("\n");
+}
+
+/**
+ * The Antigravity install set, when its two hand-written sources are present.
+ *
+ * Absent sources are not an error: scratch repos used by the other targets do
+ * not carry them. One of the two present without the other is an error, and so
+ * is a role the library cannot render. The primary and the rule are copied
+ * byte for byte. Neither is added to the Codex or plugin outputs.
+ */
+export function antigravityLibrary(root, names, parsedByName) {
+  const primaryPath = path.join(root, ANTIGRAVITY_PRIMARY_SOURCE);
+  const rulePath = path.join(root, ANTIGRAVITY_RULE_SOURCE);
+  const primaryExists = existsSync(primaryPath);
+  const ruleExists = existsSync(rulePath);
+  if (!primaryExists && !ruleExists) return [];
+  if (!primaryExists || !ruleExists) {
+    throw new AgentDefError(
+      "agents/antigravity/devcouncil.md and agents/antigravity/rule.md are installed together",
+    );
+  }
+  for (const role of ANTIGRAVITY_ROLES) {
+    if (!names.includes(role)) {
+      throw new AgentDefError(
+        `antigravity library needs ${path.join(CLAUDE_AGENTS_DIR, `${role}.md`)}`,
+      );
+    }
+  }
+
+  const primary = readFileSync(primaryPath, "utf8");
+  const primaryDef = parseAgentMarkdown(primary, ANTIGRAVITY_PRIMARY_SOURCE);
+  if (primaryDef.name !== "devcouncil") {
+    throw new AgentDefError(`${ANTIGRAVITY_PRIMARY_SOURCE}: frontmatter name must be devcouncil`);
+  }
+  if (primaryDef.fields.has("tools")) {
+    throw new AgentDefError(`${ANTIGRAVITY_PRIMARY_SOURCE}: Antigravity agents omit tools`);
+  }
+
+  const rule = readFileSync(rulePath, "utf8");
+  const ruleFront = rule.split("\n---\n")[0] ?? "";
+  if (!rule.startsWith("---\n") || !/^trigger:\s*always_on\s*$/m.test(ruleFront)) {
+    throw new AgentDefError(`${ANTIGRAVITY_RULE_SOURCE}: frontmatter must set trigger: always_on`);
+  }
+  if (Buffer.byteLength(rule) > ANTIGRAVITY_RULE_LIMIT) {
+    throw new AgentDefError(`${ANTIGRAVITY_RULE_SOURCE}: exceeds the 24 KiB rule cap`);
+  }
+
+  const outputs = [
+    {
+      relative: path.join(ANTIGRAVITY_LIBRARY_DIR, "devcouncil.md"),
+      contents: primary,
+    },
+  ];
+  for (const role of ANTIGRAVITY_ROLES) {
+    outputs.push({
+      relative: path.join(ANTIGRAVITY_LIBRARY_DIR, `${role}.md`),
+      contents: renderAntigravityAgent(parsedByName.get(role)),
+    });
+  }
+  outputs.push({
+    relative: path.join(ANTIGRAVITY_LIBRARY_DIR, "rules", "devcouncil.md"),
+    contents: rule,
+  });
+  return outputs;
+}
 
 /**
  * Every host tool-ID prefix the same MCP server is served under.
@@ -395,6 +526,7 @@ export function plan(root = repoRoot) {
     );
   }
   const outputs = [];
+  const parsedByName = new Map();
   for (const name of names) {
     const sourceRelative = path.join(CLAUDE_AGENTS_DIR, `${name}.md`);
     const onDisk = readFileSync(path.join(root, sourceRelative), "utf8");
@@ -437,7 +569,9 @@ export function plan(root = repoRoot) {
       relative: path.join(PLUGIN_AGENTS_DIR, `${name}.md`),
       contents: renderPluginMarkdown(source),
     });
+    parsedByName.set(name, def);
   }
+  outputs.push(...antigravityLibrary(root, names, parsedByName));
   return { names, outputs };
 }
 

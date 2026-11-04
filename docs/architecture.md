@@ -39,8 +39,9 @@ uses every edge.
 
 ### Host integration and skill installation: one owner
 
-**Decision (2026-10-08, owner): `devmap integrate` and `devmap skills install`
-own host integration and skill installation; the Go host delegates.**
+**Decision (2026-10-08, owner): `devmap integrate`, `devmap skills install`,
+and `devmap agents install` own host integration, skill installation, and
+Antigravity agent installation; the Go host delegates.**
 
 - **Host list and per-host documents.** The Rust `integrate::Host` enum is the
   only host list, and `Host::project_document` in
@@ -58,10 +59,21 @@ own host integration and skill installation; the Go host delegates.**
   `devcouncil skills scaffold` loads its embedded domain-skill library and sends
   it to `devmap skills install --library-stdin`; Go no longer contains an
   installer. The receipt bytes are pinned by `the_receipt_format_is_pinned`.
+- **Agent receipt.** `.devcouncil-agents.json` has one writer,
+  [`rust/devmap-cli/src/agent_install.rs`](../rust/devmap-cli/src/agent_install.rs).
+  `devcouncil integrate antigravity` loads the embedded library under
+  `backend/go_orchestrator/devcouncil/agents/library/` and sends it to
+  `devmap agents install --agents-stdin` before `devmap integrate
+  --servers-stdin`. The library is four agents plus `.agents/rules/devcouncil.md`.
+  Other hosts do not spawn that command. A bare `devmap integrate antigravity`
+  stays MCP and DevMap skills; it does not install the task-loop agents.
+  DevMap remains the only writer of `.agents/`. `--remove` does not delete
+  these files; the remove note names the receipt.
 - **What stays in Go.** DevCouncil's own facts: which host names it retired and
-  why, what its server runs, and the one file it owns outright —
+  why, what its server runs, the Cursor rule it owns outright —
   `.cursor/rules/devcouncil.mdc`, replaced only when the copy on disk is one
-  DevCouncil wrote.
+  DevCouncil wrote — and the Antigravity library it embeds but does not write
+  into `.agents/` itself.
 - **Consequences.** `devcouncil integrate` and `devcouncil skills scaffold`
   need a `devmap` (`--devmap-bin`, `DEVMAP_BIN`, or `PATH` outside the
   repository) and refuse without one rather than reporting a partial install.

@@ -113,9 +113,9 @@ fn run_remove(
     // Still registered after this run: only a run that wrote nothing leaves
     // entries behind it found.
     let pending = (dry_run || check) && removals.iter().any(|r| !r.removed.is_empty());
-    let retained = "guides, skills, hook and plugin files are not removed by --remove: \
-        AGENTS.md and CLAUDE.md are shared by every host, and the skill receipt \
-        (.devcouncil-skills.json) lists what to delete by hand";
+    let retained = "guides, skills, agents, hook and plugin files are not removed by --remove: \
+        AGENTS.md and CLAUDE.md are shared by every host, and the receipts \
+        (.devcouncil-skills.json and .devcouncil-agents.json) list what to delete by hand";
     if cli.json {
         emit_json(
             cli,

@@ -5,6 +5,12 @@ import path from "node:path";
 import { describe, it } from "node:test";
 import {
   AgentDefError,
+  ANTIGRAVITY_HOST_NOTES,
+  ANTIGRAVITY_LIBRARY_DIR,
+  ANTIGRAVITY_PRIMARY_SOURCE,
+  ANTIGRAVITY_ROLES,
+  ANTIGRAVITY_RULE_LIMIT,
+  ANTIGRAVITY_RULE_SOURCE,
   BANNER,
   CLAUDE_AGENTS_DIR,
   CODEX_AGENTS_DIR,
@@ -16,7 +22,9 @@ import {
   parseAgentMarkdown,
   pinnedGrants,
   plan,
+  renderAntigravityAgent,
   renderCodexToml,
+  repoRoot,
   rewriteToolsBlock,
   splitToolId,
   tomlMultiline,
@@ -389,6 +397,20 @@ describe("MCP grant prefix expansion", () => {
     assert.deepEqual(comparePrefixes(live).gaps, []);
   });
 
+  it("renders an Antigravity role without a tools grant or a generated banner", () => {
+    const rendered = renderAntigravityAgent(parseAgentMarkdown(WRAPPED, "reviewer.md"));
+    const front = rendered.split("\n---\n")[0];
+    assert.equal(/^tools:/m.test(front), false);
+    assert.equal(front.includes("mcp__"), false);
+    assert.match(front, /^mainAgent: false$/m);
+    assert.match(front, /^model: pro$/m);
+    assert.match(front, /^inheritCustomizations: true$/m);
+    assert.match(front, /^inheritMcp: true$/m);
+    assert.match(rendered, /You are the DevCouncil reviewer subagent\./);
+    assert.ok(rendered.includes(ANTIGRAVITY_HOST_NOTES));
+    assert.equal(rendered.includes(BANNER), false);
+  });
+
   it("every declared family lists at least one prefix", () => {
     for (const [family, prefixes] of Object.entries(MCP_TOOL_PREFIXES)) {
       assert.ok(prefixes.length > 0, `${family} declares no prefix`);
@@ -397,5 +419,103 @@ describe("MCP grant prefix expansion", () => {
       }
       assert.equal(new Set(prefixes).size, prefixes.length, `${family} repeats a prefix`);
     }
+  });
+});
+
+describe("Antigravity library", () => {
+  it("copies the primary and rule into the embed library and nowhere else", () => {
+    const { outputs } = plan(repoRoot);
+    const rels = outputs.map((output) => output.relative);
+    assert.equal(rels.includes(path.join(CODEX_AGENTS_DIR, "devcouncil.toml")), false);
+    assert.equal(rels.includes(path.join(PLUGIN_AGENTS_DIR, "devcouncil.md")), false);
+    assert.equal(
+      rels.filter((rel) => rel.endsWith(`${path.sep}rule.toml`) || rel.endsWith(`${path.sep}rule.md`)).length,
+      0,
+    );
+
+    const primary = outputs.find(
+      (output) => output.relative === path.join(ANTIGRAVITY_LIBRARY_DIR, "devcouncil.md"),
+    );
+    const rule = outputs.find(
+      (output) => output.relative === path.join(ANTIGRAVITY_LIBRARY_DIR, "rules", "devcouncil.md"),
+    );
+    assert.ok(primary, "the library is missing the primary");
+    assert.ok(rule, "the library is missing the rule");
+    assert.equal(
+      primary.contents,
+      readFileSync(path.join(repoRoot, ANTIGRAVITY_PRIMARY_SOURCE), "utf8"),
+    );
+    assert.equal(rule.contents, readFileSync(path.join(repoRoot, ANTIGRAVITY_RULE_SOURCE), "utf8"));
+    assert.equal(primary.contents.includes(BANNER), false);
+    assert.equal(rule.contents.includes(BANNER), false);
+
+    const front = primary.contents.split("\n---\n")[0];
+    assert.match(front, /^description: Selectable DevCouncil session agent/m);
+    assert.equal(front.includes("implementer"), false);
+    assert.match(front, /^mainAgent: true$/m);
+    assert.match(front, /^model: inherit$/m);
+    assert.equal(/^tools:/m.test(front), false);
+    for (const phrase of [
+      "Do not check out a lease in order to run a command",
+      "In `enforce`, verification is required",
+      "In `off`, report the work unverified",
+      "A check that did not run is not a pass",
+      "devcouncil_policy_check_write",
+      "task_id",
+      "devcouncil-implementer",
+      "devcouncil-reviewer",
+      "devcouncil-verifier",
+      "`branch` when implementation must not share",
+      "`inherit` when review or verification must see",
+      "Do not invoke `devcouncil` from itself",
+      "registers `devmap` and `devcouncil`",
+      "does not register GitPulse",
+      "unestablished situation",
+    ]) {
+      assert.ok(primary.contents.includes(phrase), `primary is missing ${phrase}`);
+    }
+
+    assert.match(rule.contents, /^trigger: always_on$/m);
+    assert.equal(rule.contents.includes("alwaysOn"), false);
+    assert.ok(Buffer.byteLength(rule.contents) < ANTIGRAVITY_RULE_LIMIT);
+    assert.equal(rule.contents.includes("You are the DevCouncil implementer"), false);
+    assert.equal(rule.contents.includes("handoff_paths"), false);
+    for (const name of ["devcouncil", ...ANTIGRAVITY_ROLES]) {
+      assert.ok(rule.contents.includes(name), `rule does not name ${name}`);
+    }
+    for (const phrase of ["no task lease", "opt-in", "Navigate with DevMap before reading or grepping"]) {
+      assert.ok(rule.contents.includes(phrase), `rule is missing ${phrase}`);
+    }
+    for (const phrase of [
+      "do not guess task state",
+      "Use DevCouncil MCP tools for status, checkout, scope, and verify",
+    ]) {
+      assert.equal(rule.contents.includes(phrase), false, `rule mandates the task loop: ${phrase}`);
+    }
+  });
+
+  it("keeps the role body and replaces only its frontmatter", () => {
+    const { outputs } = plan(repoRoot);
+    for (const role of ANTIGRAVITY_ROLES) {
+      const rendered = outputs.find(
+        (output) => output.relative === path.join(ANTIGRAVITY_LIBRARY_DIR, `${role}.md`),
+      );
+      assert.ok(rendered, `${role} was not rendered into the library`);
+      const front = rendered.contents.split("\n---\n")[0];
+      assert.equal(/^tools:/m.test(front), false, front);
+      assert.equal(front.includes("mcp__"), false, front);
+      assert.match(front, /^mainAgent: false$/m);
+      assert.match(front, /^model: pro$/m);
+      assert.match(front, /^commandExecutionPolicy: sandbox$/m);
+      assert.ok(rendered.contents.includes(ANTIGRAVITY_HOST_NOTES));
+      assert.equal(rendered.contents.includes(BANNER), false);
+      const source = readFileSync(path.join(repoRoot, CLAUDE_AGENTS_DIR, `${role}.md`), "utf8");
+      const body = parseAgentMarkdown(source, role).body;
+      assert.ok(rendered.contents.includes(body), `${role} dropped its body`);
+    }
+  });
+
+  it("reports no drift against this checkout", () => {
+    assert.deepEqual(drift(repoRoot), []);
   });
 });

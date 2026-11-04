@@ -30,7 +30,7 @@ or `--check` applies changes. Read the JSON receipt with `--json` when scripting
 | Cursor | Global MCP registration, owned project entries, managed guides/rule, `.cursor/skills` and `.cursor/hooks.json` |
 | Claude | Global MCP registration and the project `.mcp.json` entry (both withheld while the Dev Map plugin is enabled), managed guides and `.claude/skills`; separate `devmap claude plugin` generates a plugin bundle |
 | Codex | User `~/.codex/config.toml` MCP registration, `.agents/skills`, project plugin/hook assets; host trust may need renewal |
-| Antigravity | `.agents/mcp_config.json` and `.agents/skills` |
+| Antigravity | `.agents/mcp_config.json` and `.agents/skills`. Task agents are not part of this row: a bare `devmap integrate antigravity` does not write them |
 | OpenCode | `opencode.json`, its project skills layout and a DevMap post-tool plugin |
 | Warp | `.devcouncil/integrations/warp-mcp.json`; no project skill destination is installed by this adapter |
 
@@ -96,6 +96,14 @@ document in the host's own shape, beside its own `devmap` entry, and reports
 every file it examined; the Go receipt is that report. It needs a `devmap`
 (`--devmap-bin`, `DEVMAP_BIN`, or one on `PATH` outside the repository) and
 refuses without one. `--check` asks DevMap too, so it covers DevMap's assets.
+
+For Antigravity only, that call is preceded by `devmap agents install
+--agents-stdin`. Go embeds four agents and one always-on rule and DevMap writes
+`.agents/agents/<name>/agent.md`, `.agents/rules/devcouncil.md`, and the receipt
+`.devcouncil-agents.json`. Other hosts do not spawn that command. If the agent
+install succeeds and the MCP install then fails, the error comes back with the
+receipt of the agents that were written. A bare `devmap integrate antigravity`
+stays MCP plus DevMap skills.
 See [the ownership decision](architecture.md#host-integration-and-skill-installation-one-owner).
 
 | Host | Where the `devcouncil` server is registered |
@@ -103,7 +111,7 @@ See [the ownership decision](architecture.md#host-integration-and-skill-installa
 | Cursor | `.cursor/mcp.json`; Go also writes `.cursor/rules/devcouncil.mdc` |
 | Claude | `.mcp.json` |
 | Codex | Project `.codex/config.toml` (`[mcp_servers.devcouncil]`, read for trusted projects); every other byte of the file is kept |
-| Antigravity | `.agents/mcp_config.json` |
+| Antigravity | `.agents/mcp_config.json`, plus the four agents under `.agents/agents/` and `.agents/rules/devcouncil.md` |
 | OpenCode | `opencode.json` |
 | Warp | `.devcouncil/integrations/warp-mcp.json` |
 
@@ -135,8 +143,9 @@ It removes `devmap` and `devcouncil` from exactly the documents that receipt
 names (user-level ones included), deletes DevCouncil's Cursor rule (saving any
 edits), leaves every other server, key and comment, and then deletes the
 receipt. Without a receipt it refuses. Guides (`AGENTS.md`, `CLAUDE.md`),
-skills and hook files are not removed: the guides are shared by every host,
-and `.devcouncil-skills.json` lists the skills. Standalone, the same undo is
+skills, agents and hook files are not removed: the guides are shared by every
+host, `.devcouncil-skills.json` lists the skills, and `.devcouncil-agents.json`
+lists the Antigravity agents and rule. Standalone, the same undo is
 `devmap integrate <host> --remove --only-path DOC [--servers-stdin]`.
 
 The Go host serves checkout, renew/release lease, next task, diff, gaps,

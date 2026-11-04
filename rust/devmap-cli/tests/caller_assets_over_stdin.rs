@@ -453,6 +453,11 @@ fn remove_keeps_other_servers_and_keys_in_a_json_document() {
         registered["mcpServers"].get("devcouncil").is_some(),
         "{registered}"
     );
+    let agent = root.join(".agents/agents/devcouncil/agent.md");
+    std::fs::create_dir_all(agent.parent().unwrap()).unwrap();
+    std::fs::write(&agent, "keep\n").unwrap();
+    let agents_receipt = root.join(".devcouncil-agents.json");
+    std::fs::write(&agents_receipt, "{}\n").unwrap();
 
     let removed = devmap(
         &[
@@ -469,7 +474,20 @@ fn remove_keeps_other_servers_and_keys_in_a_json_document() {
         &request,
         &home,
     );
+
     assert_eq!(removed.status, Some(0), "{}", removed.stderr);
+    let report: Value = serde_json::from_str(&removed.stdout).unwrap();
+    assert!(
+        report["notes"]
+            .to_string()
+            .contains(".devcouncil-agents.json"),
+        "the remove note must name the agents receipt: {report}"
+    );
+    assert_eq!(std::fs::read_to_string(&agent).unwrap(), "keep\n");
+    assert!(
+        agents_receipt.is_file(),
+        "--remove deleted the agents receipt"
+    );
     let left: Value = serde_json::from_slice(&std::fs::read(&doc).unwrap()).unwrap();
     assert_eq!(left, theirs, "only our entries may go");
 

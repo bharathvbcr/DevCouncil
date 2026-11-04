@@ -5,6 +5,7 @@ use crate::cli::{Cli, Commands};
 use crate::reporter::ProgressReporter;
 
 pub(crate) mod affected;
+pub(crate) mod agents;
 pub(crate) mod api_impact;
 pub(crate) mod ask;
 pub(crate) mod ast;
@@ -95,6 +96,7 @@ pub(crate) async fn run(cli: &Cli, progress: Option<&ProgressReporter>) -> anyho
         Commands::Hook(args) => hook::run(cli, args),
         Commands::Claude(args) => claude::run(cli, args),
         Commands::Skills(args) => skills::run(cli, args),
+        Commands::Agents(args) => agents::run(cli, args),
         Commands::Integrate(args) => integrate::run(cli, args),
         Commands::Version(args) => version::run(cli, args),
     }

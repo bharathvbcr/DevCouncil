@@ -38,6 +38,7 @@ mod a_root_anchor_replaces_a_baked_store_path;
 mod a_v94_python_extraction_is_not_served_after_the_bump;
 mod a_v96_swift_extraction_is_not_served_after_the_bump;
 mod a_v97_extraction_is_not_served_after_the_bump;
+mod agents_install;
 mod an_ignore_file_binds_the_daemon;
 mod api_views_are_honest;
 mod ast_reports_its_own_totals;

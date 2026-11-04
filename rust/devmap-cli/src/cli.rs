@@ -169,6 +169,11 @@ impl Cli {
             Commands::Integrate(commands::integrate::Args { project_root, .. }) => {
                 project_root.clone()
             }
+            Commands::Agents(commands::agents::Args { action }) => match action {
+                commands::agents::AgentsAction::Install { project_root, .. } => {
+                    project_root.clone()
+                }
+            },
             _ => default_root_hint(),
         }
     }
@@ -682,6 +687,15 @@ pub(crate) enum Commands {
     /// a working one.
     Claude(commands::claude::Args),
 
+    /// Install Antigravity agents and rules from a caller document on stdin.
+    ///
+    /// `{"agents": [{"name", "content"}], "rules": [{"name", "content"}]}`.
+    /// Writes `.agents/agents/<name>/agent.md` and `.agents/rules/<name>.md`
+    /// only, with the receipt `.devcouncil-agents.json`. DevCouncil passes its
+    /// embedded library this way. There is no embedded default: without
+    /// `--agents-stdin` the command refuses.
+    Agents(commands::agents::Args),
+
     /// Install the five embedded DevMap skills into a host skill directory.
     ///
     /// Receipt-guarded: identical files are adopted, unmanaged edits are
@@ -966,6 +980,7 @@ pub(crate) fn validate_limits(command: &Commands) -> Result<(), String> {
         | Commands::ApiImpact(_)
         | Commands::Claude(_)
         | Commands::Skills(_)
+        | Commands::Agents(_)
         | Commands::Integrate(_)
         | Commands::Version(_)
         | Commands::Hook(_) => Ok(()),

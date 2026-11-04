@@ -120,9 +120,10 @@ func (r *RemoveReceipt) Present() []string {
 // Remove undoes this host's apply: it takes DevCouncil's and DevMap's server
 // entries out of exactly the documents the apply recorded, deletes DevCouncil's
 // Cursor rule (keeping a copy of any edits), and then the receipt. Every other
-// byte of the user's documents stays. Guides, skills and hook files are not
-// removed — the guides are shared by every host and the skill receipt names
-// the rest — and the receipt says so.
+// byte of the user's documents stays. Guides, skills, agents and hook files are
+// not removed — the guides are shared by every host, and
+// `.devcouncil-skills.json` and `.devcouncil-agents.json` name the rest — and
+// the receipt says so.
 func Remove(opts RemoveOptions) (*RemoveReceipt, error) {
 	root, err := filepath.Abs(opts.Root)
 	if err != nil {

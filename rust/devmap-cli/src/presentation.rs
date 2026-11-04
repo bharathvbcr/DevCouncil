@@ -118,6 +118,7 @@ fn profile(command: &Commands) -> Option<(&'static str, &'static str)> {
         Commands::ApiImpact(_) => ("API impact", "Tracing the API ripples"),
         Commands::Claude(_) => ("Claude integration", "Checking the connections"),
         Commands::Skills(_) => ("Skills", "Packing your toolkit"),
+        Commands::Agents(_) => ("Agents", "Installing host agents"),
         Commands::Integrate(_) => ("Host integration", "Connecting your tools"),
         Commands::Ask(_) => ("Ask", "Finding symbols by what they do"),
         Commands::Skeleton(_) => ("Skeleton", "Listing signatures without bodies"),

@@ -28,6 +28,10 @@ const EXEMPT: &[(&str, &str)] = &[
         "host hook entry point: stdin protocol, no presentation",
     ),
     (
+        "agents",
+        "installs a caller document from stdin; the stress harness has no document to send, and a dry-run without --agents-stdin is a refusal",
+    ),
+    (
         "claude",
         "driven as `claude events` and `claude hooks` in the terminal runs",
     ),

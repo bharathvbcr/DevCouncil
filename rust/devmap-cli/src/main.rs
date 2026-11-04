@@ -91,6 +91,7 @@ macro_rules! outln {
     };
 }
 
+mod agent_install;
 mod agents;
 mod claude;
 mod cli;

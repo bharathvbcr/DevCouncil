@@ -170,6 +170,12 @@ opencode.json
 # not hold. Untracked under ft-7364b2c8 (D14).
 /.devcouncil-skills.json
 /.devcouncil-skills.lock
+# Agent-install receipt and lock, written by `devmap agents install` when
+# `devcouncil integrate antigravity` supplies the embedded library. Same
+# reason as the skills receipt: the installed Markdown lives under gitignored
+# `.agents/` and carries this machine's paths only in the sibling MCP file.
+/.devcouncil-agents.json
+/.devcouncil-agents.lock
 .codex/
 .antigravity/
 .grok/
