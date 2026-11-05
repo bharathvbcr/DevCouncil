@@ -83,9 +83,10 @@ fn the_extractor_absorbs_an_inline_modules_super_receiver() {
         "both the macro-argument call and the plain one are extracted; got {receivers:?}"
     );
     assert!(
-        receivers.iter().all(|receiver| *receiver == Some("self")),
+        receivers.iter().all(|receiver| *receiver == Some("self::")),
         "the `super` is spent on the inline module, so what remains is this \
-         file's own module — in both extraction arms; got {receivers:?}"
+         file's own module, spelled `self::` so a method's value `self` cannot \
+         take the call — in both extraction arms; got {receivers:?}"
     );
 }
 

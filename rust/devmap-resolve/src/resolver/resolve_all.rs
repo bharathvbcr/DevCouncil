@@ -783,10 +783,43 @@ impl Resolver {
                     // Whether the receiver is the enclosing object itself.
                     // Several rungs below turn on it, and it was previously
                     // recomputed at each of them.
-                    let implicit_receiver = call
-                        .receiver_expr
-                        .as_deref()
-                        .is_some_and(Self::receiver_is_self);
+                    let implicit_receiver = call.receiver_expr.as_deref().is_some_and(|receiver| {
+                        Self::receiver_is_self(receiver) && !Self::rust_module_self_path(receiver)
+                    });
+
+                    // `self::helper()` names this module's free function, including
+                    // when `helper` is also a method of the enclosing type. The
+                    // value-self rung below would bind that method at
+                    // deterministic confidence. A miss stays unresolved: the
+                    // path does not fall through to the method.
+                    if resolution.is_none()
+                        && family == LangFamily::Rust
+                        && call
+                            .receiver_expr
+                            .as_deref()
+                            .is_some_and(Self::rust_module_self_path)
+                    {
+                        if let Some(target_symbol) =
+                            self.rust_file_level_function(&ext.file_path, &call.callee_name)
+                        {
+                            resolution = Some(Arc::new(Resolution::SameFile {
+                                target_symbol,
+                                target_file: ext.file_path.clone(),
+                            }));
+                        } else if let Some(found) = self.rust_qualified_call(
+                            &ext.file_path,
+                            "self",
+                            &call.callee_name,
+                            true,
+                        ) {
+                            resolution = Some(Arc::new(found));
+                        } else {
+                            resolution = Some(Arc::new(Resolution::Unresolved {
+                                reason: "self:: names a free item of this module, and this module declares none"
+                                    .to_string(),
+                            }));
+                        }
+                    }
 
                     // 1b. X42. An implicit receiver dispatches on the type the
                     // call is written inside, and on that type's supertypes.
@@ -1221,31 +1254,11 @@ impl Resolver {
                         } else if family == LangFamily::Rust
                             && self.symbol_kind_in(&ext.file_path, &call.callee_name) == Some(SymbolKind::Function)
                             && !self.rust_self_is_a_value(&ext.file_path, call.caller_symbol.as_deref(), call.receiver_expr.as_deref()) {
-                            // Rust reaches a **free function** through a `self`
-                            // receiver, which no other family here does.
-                            //
-                            // `self::helper()` is a module path, and so is the
-                            // `super::helper()` that `rust_absorb_inline_super`
-                            // rewrote to it — both name this file's own
-                            // `helper`. The method-only arm above cannot serve
-                            // them: the extractor records a Rust free function
-                            // as `Function`, reserving `Method` for one owned by
-                            // a type, so every path-qualified call to a
-                            // file-level function fell through to the
-                            // superclass guard below and was recorded as having
-                            // no target. That is what reported
-                            // `procguard::run_tree_killer` dead at the confident
-                            // tier while two call sites and a coverage hit
-                            // proved otherwise.
-                            //
-                            // Safe precisely because the two spellings cannot
-                            // collide in this language: `self.helper()` on a
-                            // free function is not valid Rust, so a `self`
-                            // receiver landing on a `Function` can only have
-                            // come from `self::`/absorbed `super::`. The
-                            // `Method` arm keeps every dotted call, and the
-                            // other families keep the bare-name restriction the
-                            // comment above earned.
+                            // A value `self.helper()` whose caller is not inside a
+                            // type. An absorbed `super::helper()` and a written
+                            // `self::helper()` are stored as `self::` and bound
+                            // by the module-path rung above, including inside a
+                            // method. This arm keeps the field spelling.
                             resolution = Some(Arc::new(Resolution::SameFile {
                                 target_symbol: self.qualified_for(&ext.file_path, &call.callee_name), target_file: ext.file_path.clone(),
                             }));
@@ -1485,7 +1498,9 @@ impl Resolver {
                                     .import_bindings
                                     .get(&ext.file_path)
                                     .is_some_and(|bindings| bindings.contains_key(recv));
-                            if !self.rust_self_is_a_value(&ext.file_path, call.caller_symbol.as_deref(), Some(recv)) {
+                            if !self.rust_self_is_a_value(&ext.file_path, call.caller_symbol.as_deref(), Some(recv))
+                                && !Self::rust_module_self_path(recv)
+                            {
                             if let Some(found) = self.rust_qualified_call(
                                 &ext.file_path,
                                 recv,

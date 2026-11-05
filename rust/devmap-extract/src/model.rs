@@ -1144,6 +1144,10 @@ impl ExtractedReference {
                     })
                 });
                 Some(match receiver {
+                    // The module keyword, stored with a trailing `::` so it is
+                    // not the value `self`. `self::new` stays a path, not
+                    // `Type::new`.
+                    Some("self::") => format!("self::{}", self.name),
                     Some(receiver) if self.name == "new" => format!("{receiver}::new"),
                     Some(receiver) => format!("{receiver}.{}", self.name),
                     None => self.name.clone(),
