@@ -286,8 +286,10 @@ func TestDanglingSymlinkConfigFailsClosed(t *testing.T) {
 	}
 }
 
-// A live symlink is the file it names. Only a dangling one is unreadable.
-func TestLiveSymlinkConfigIsRead(t *testing.T) {
+// A live symlink is not followed. Opening it would read whatever the link
+// names, including a file an agent planted outside the path the operator
+// thinks is the config. The target's mode is not the config's mode.
+func TestLiveSymlinkConfigIsRefused(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, ".devcouncil")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -300,9 +302,10 @@ func TestLiveSymlinkConfigIsRead(t *testing.T) {
 	if err := os.Symlink(target, filepath.Join(dir, "config.yaml")); err != nil {
 		t.Fatal(err)
 	}
-	snap := Resolve(root)
-	if snap.VerificationMode != ModeAdvisory || snap.VerificationOrigin != OriginConfig || snap.Error != "" || !snap.ConfigPresent {
-		t.Fatalf("live symlink = %+v, want advisory/config", snap)
+	for _, snap := range []Snapshot{Load(root), Resolve(root)} {
+		if snap.VerificationMode != ModeEnforce || snap.VerificationOrigin != OriginInvalid || !snap.ConfigPresent || !strings.Contains(snap.Error, "symlink") {
+			t.Fatalf("live symlink = %+v, want enforce/invalid naming the symlink", snap)
+		}
 	}
 }
 

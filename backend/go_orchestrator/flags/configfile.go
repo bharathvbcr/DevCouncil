@@ -24,7 +24,10 @@ func LoadConfigFile(r *Registry, path string) (bool, error) {
 	if strings.TrimSpace(path) == "" {
 		return false, nil
 	}
-	f, err := os.Open(path)
+	// OpenRegular refuses a FIFO, a live symlink, and every other non-regular
+	// file before the read. A missing path is still "no file". A dangling
+	// symlink's error does not unwrap to a missing path.
+	f, err := OpenRegular(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return false, nil

@@ -1,6 +1,7 @@
 package flags
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -174,6 +175,41 @@ func TestMalformedSyntaxIsRefused(t *testing.T) {
 				t.Errorf("error = %q; a refusal must name the line it is about", got)
 			}
 		})
+	}
+}
+
+func TestADanglingSymlinkIsNotAMissingFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.Symlink(filepath.Join(dir, "missing.yaml"), path); err != nil {
+		t.Fatal(err)
+	}
+	r := New()
+	if err := DefineHarnessFlags(r); err != nil {
+		t.Fatal(err)
+	}
+	found, err := LoadConfigFile(r, path)
+	if err == nil {
+		t.Fatal("a dangling symlink was treated as a missing file")
+	}
+	if os.IsNotExist(err) {
+		t.Fatalf("dangling symlink unwraps as not-exist: %v", err)
+	}
+	if found {
+		t.Fatal("a dangling symlink was reported as a present config")
+	}
+}
+
+func TestADirectoryIsNotOpenedAsConfig(t *testing.T) {
+	path := t.TempDir()
+	r := New()
+	if err := DefineHarnessFlags(r); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadConfigFile(r, path)
+	var kind *NonRegularConfigError
+	if !errors.As(err, &kind) || kind.Kind != "directory" {
+		t.Fatalf("directory config error = %v, want kind directory", err)
 	}
 }
 

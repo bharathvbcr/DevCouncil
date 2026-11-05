@@ -81,11 +81,12 @@ func failClosed(snap Snapshot, reason string) Snapshot {
 
 // Load reads `.devcouncil/config.yaml` under root, uncached. A path that
 // lstat says does not exist is off, origin default, and is the only way to
-// reach the default. A path that is present but cannot be opened or parsed —
-// including a symlink whose target is gone, because Open follows the link and
-// reports the target missing — or that holds a scalar `gates`, a block list
-// under `gates` or `gates.mode`, or an unknown mode, is enforce with origin
-// invalid and the reason in Error.
+// reach the default. A live symlink, a named pipe, a directory, a socket, or
+// any other non-regular file is refused before it is opened. A symlink whose
+// target is gone is opened and that open error is kept: it does not unwrap
+// to a missing path. A file that cannot be parsed, or that holds a scalar
+// `gates`, a block list under `gates` or `gates.mode`, or an unknown mode, is
+// enforce with origin invalid and the reason in Error.
 func Load(root string) Snapshot {
 	path := filepath.Join(root, ".devcouncil", "config.yaml")
 	snap := Snapshot{
@@ -93,21 +94,15 @@ func Load(root string) Snapshot {
 		VerificationOrigin: OriginDefault,
 		ConfigPath:         path,
 	}
-	// Lstat, not Stat or Open. Open follows a symlink, so a link whose target
-	// is gone returns the same ENOENT as a path that was never created, and
-	// that is the one error this function is allowed to treat as "no config".
-	if _, err := os.Lstat(path); err != nil {
+	f, err := flags.OpenRegular(path)
+	if err != nil {
 		if os.IsNotExist(err) {
 			return snap
 		}
 		snap.ConfigPresent = true
-		return failClosed(snap, fmt.Sprintf("%s: %v", path, err))
+		return failClosed(snap, err.Error())
 	}
 	snap.ConfigPresent = true
-	f, err := os.Open(path)
-	if err != nil {
-		return failClosed(snap, fmt.Sprintf("%s: %v", path, err))
-	}
 	defer func() { _ = f.Close() }()
 	layer, err := flags.ParseConfigLayer(f)
 	if err != nil {
