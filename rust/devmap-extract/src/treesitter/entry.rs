@@ -1101,7 +1101,11 @@ pub(super) fn extract_treesitter_before_deadline(
                     &extraction.symbols,
                     deadline,
                 );
-                extraction.literals = literals;
+                // Absorb already shifted script literals into this list. The
+                // outer walk cannot decode Vue, Svelte or notebook text, so
+                // replacing the list would drop them again.
+                extraction.literals.extend(literals);
+                crate::literals::dedup_sort(&mut extraction.literals);
                 extraction.diagnostics.append(&mut notes);
                 extraction.diagnostics.extend(take_nesting_cap_notes());
                 extraction

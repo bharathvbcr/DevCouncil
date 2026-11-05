@@ -517,6 +517,7 @@ fn take_template_expression(
     // statement grammar reads a leading `{` as a block, and a quoted key
     // then fails, so the file would be Partial over JavaScript it accepts.
     // The parentheses are not in the file. Spans are rebased by that byte.
+    let outer_source = source;
     let parenthesized = expr.body.starts_with('{');
     let owned;
     let source: &str = if parenthesized {
@@ -539,6 +540,7 @@ fn take_template_expression(
         node_range,
         unparsed,
         diagnostics,
+        outer_source,
     ) {
         *parsed += 1;
     }
@@ -581,6 +583,9 @@ fn rebase_parenthesized_expression(inner: &mut Extraction, body_len: usize) {
     }
     for fact in &mut inner.js_objects {
         fact.start_byte = fact.start_byte.saturating_sub(PREFIX).min(body_len);
+    }
+    for literal in &mut inner.literals {
+        literal.start_byte = literal.start_byte.saturating_sub(PREFIX).min(body_len);
     }
     for binding in &mut inner.local_bindings {
         binding.start_byte = binding.start_byte.saturating_sub(PREFIX).min(body_len);
@@ -635,6 +640,7 @@ fn record_template_parse(
     node_range: TextRange,
     unparsed: &mut Vec<TextRange>,
     diagnostics: &mut Vec<String>,
+    source: &str,
 ) -> bool {
     let body = TextRange {
         start_byte: offset,
@@ -687,7 +693,7 @@ fn record_template_parse(
     };
     match fold {
         Fold::Absorb => {
-            absorb(extraction, inner, offset);
+            absorb(extraction, inner, offset, source);
             true
         }
         Fold::Drop => {
@@ -696,7 +702,7 @@ fn record_template_parse(
         }
         Fold::Partial(ranges) => {
             unparsed.extend(ranges);
-            absorb(extraction, inner, offset);
+            absorb(extraction, inner, offset, source);
             true
         }
     }
@@ -1195,7 +1201,7 @@ pub(crate) fn merge_embedded_scripts(
             }
         }
 
-        absorb(extraction, inner, region.content.start_byte);
+        absorb(extraction, inner, region.content.start_byte, source);
     }
 
     extraction.diagnostics.extend(diagnostics);
@@ -1206,7 +1212,7 @@ pub(crate) fn merge_embedded_scripts(
 
 /// Merge one region's extraction into the outer one, shifting every span by
 /// `offset` — the region's start byte in the outer file.
-fn absorb(extraction: &mut Extraction, inner: Extraction, offset: usize) {
+fn absorb(extraction: &mut Extraction, inner: Extraction, offset: usize, source: &str) {
     let file_path = extraction.file_path.clone();
 
     for mut symbol in inner.symbols {
@@ -1274,6 +1280,26 @@ fn absorb(extraction: &mut Extraction, inner: Extraction, offset: usize) {
             binding
         }));
     extraction.diagnostics.extend(inner.diagnostics);
+    for mut call in inner.rust_implicit_calls {
+        shift(&mut call.span, offset);
+        extraction.rust_implicit_calls.push(call);
+    }
+    for mut call in inner.rust_try_conversions {
+        shift(&mut call.span, offset);
+        extraction.rust_try_conversions.push(call);
+    }
+    // The outer literal index cannot decode a Vue or Svelte script string.
+    // The inner parse already did, in the region's own coordinates.
+    for mut literal in inner.literals {
+        literal.start_byte = literal.start_byte.saturating_add(offset);
+        literal.line = Span {
+            start_byte: literal.start_byte,
+            end_byte: literal.start_byte,
+        }
+        .line_range(source)
+        .0;
+        extraction.literals.push(literal);
+    }
 }
 
 fn shift(span: &mut Span, offset: usize) {
@@ -1763,6 +1789,50 @@ mod tests {
             "the cap has to say why it stopped: {:?}",
             extraction.diagnostics
         );
+    }
+
+    /// A script string is a literal of the outer file. Absorb used to drop
+    /// the list, and the outer walk cannot decode Vue or Svelte text.
+    #[test]
+    fn a_vue_or_svelte_script_literal_is_on_the_outer_file() {
+        for (path, source) in [
+            (
+                "App.vue",
+                "<template><p>hi</p></template>\n<script>\nconst TOKEN = \"session.spawn\"\n</script>\n",
+            ),
+            (
+                "App.svelte",
+                "<p>hi</p>\n<script>\nconst TOKEN = \"session.spawn\"\n</script>\n",
+            ),
+        ] {
+            let extraction = crate::extract_file(path, source);
+            assert!(
+                extraction
+                    .literals
+                    .iter()
+                    .any(|literal| literal.value == "session.spawn"),
+                "{path} literals: {:?} outcome {:?}",
+                extraction
+                    .literals
+                    .iter()
+                    .map(|literal| literal.value.as_str())
+                    .collect::<Vec<_>>(),
+                extraction.parse_outcome
+            );
+            let token = extraction
+                .literals
+                .iter()
+                .find(|literal| literal.value == "session.spawn")
+                .unwrap();
+            let window = source
+                .get(token.start_byte..source.len().min(token.start_byte + 24))
+                .unwrap_or("");
+            assert!(
+                window.contains("session.spawn"),
+                "{path} literal byte {} indexes {window:?}",
+                token.start_byte
+            );
+        }
     }
 
     #[test]
