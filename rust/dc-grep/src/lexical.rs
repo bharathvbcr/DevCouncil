@@ -351,6 +351,9 @@ pub fn ranked_search(request: &RankedRequest) -> Result<RankedResponse, String> 
         let Some(path) = reader.path(file_id) else {
             continue;
         };
+        if !crate::contained_relative(path) {
+            continue;
+        }
         if !scope.is_empty() && !in_scope(path, &scope) {
             continue;
         }
@@ -375,21 +378,23 @@ pub fn ranked_search(request: &RankedRequest) -> Result<RankedResponse, String> 
     let evidence = tgrep_core::meta::read_file_evidence(&published.slot)
         .map_err(|err| format!("ranked index evidence is unreadable: {err}"))?;
     let mut stale_files = 0usize;
-    let files: Vec<RankedHit> = ranked
-        .into_iter()
-        .map(|(path, score, terms_present)| {
-            let stale = is_stale(&root, &path, &evidence);
-            if stale {
-                stale_files += 1;
-            }
-            RankedHit {
-                path,
-                score,
-                terms_present,
-                stale,
-            }
-        })
-        .collect();
+    let mut files = Vec::with_capacity(ranked.len());
+    for (path, score, terms_present) in ranked {
+        // `None` is an escaping path. It is not a hit and it is not stale:
+        // stale would still publish the path.
+        let Some(stale) = is_stale(&root, &path, &evidence) else {
+            continue;
+        };
+        if stale {
+            stale_files += 1;
+        }
+        files.push(RankedHit {
+            path,
+            score,
+            terms_present,
+            stale,
+        });
+    }
 
     Ok(RankedResponse {
         ok: true,
@@ -443,16 +448,27 @@ fn in_scope(path: &str, scope: &str) -> bool {
 /// A file the index has no evidence for is not called stale: the index never
 /// claimed to have read it, and reporting "changed" about something never seen
 /// would be an assertion from an absence.
-fn is_stale(root: &std::path::Path, path: &str, evidence: &tgrep_core::meta::FileEvidence) -> bool {
+/// `None` when `path` is not inside `root`. The caller drops it.
+/// `Some(true)` when the file is gone or no longer the indexed bytes.
+fn is_stale(
+    root: &std::path::Path,
+    path: &str,
+    evidence: &tgrep_core::meta::FileEvidence,
+) -> Option<bool> {
+    if !crate::contained_relative(path) {
+        return None;
+    }
     let Some(recorded) = evidence.version(path) else {
-        return false;
+        return Some(false);
     };
-    let Ok(file) = crate::open_for_search(&root.join(path)) else {
+    let file = match crate::open_inside_root(root, path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => return None,
         // Gone, or no longer openable. It is not what the index read.
-        return true;
+        Err(_) => return Some(true),
     };
     match file.metadata() {
-        Ok(metadata) => *recorded != tgrep_core::meta::file_version(&metadata),
-        Err(_) => true,
+        Ok(metadata) => Some(*recorded != tgrep_core::meta::file_version(&metadata)),
+        Err(_) => Some(true),
     }
 }

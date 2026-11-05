@@ -414,6 +414,11 @@ impl Candidates {
         let mut absent = HashSet::new();
         for (id, path) in reader.all_paths().iter().enumerate() {
             let id = u32::try_from(id).map_err(error)?;
+            // A stamp is not proof this path was produced inside the root.
+            // An absolute path or a parent component never becomes an exclusion.
+            if !crate::contained_relative(path) || !root.join(path).starts_with(root) {
+                continue;
+            }
             if !matching.contains(&id) && evidence.version(path).is_some() {
                 absent.insert(path.clone());
             }
@@ -429,6 +434,12 @@ impl Candidates {
     }
 
     pub(crate) fn verdict(&self, path: &str, metadata: &Metadata) -> Candidate {
+        // The walk produced `path`. A snapshot may exclude it only when that
+        // name is still a relative path inside the root; a matching stamp is
+        // not itself that proof.
+        if !crate::contained_relative(path) {
+            return Candidate::Search;
+        }
         let Some(version) = self.evidence.version(path) else {
             return Candidate::Search;
         };
@@ -1749,6 +1760,141 @@ mod tests {
         assert_eq!(
             fs::metadata(slot.join("lookup.bin")).unwrap().len(),
             distinct.len() as u64 * TRIGRAM_LOOKUP_BYTES
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn published_slot(root: &std::path::Path) -> std::path::PathBuf {
+        let pointer: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(root.join(".devcouncil/dcgrep/current.json")).unwrap(),
+        )
+        .unwrap();
+        root.join(".devcouncil/dcgrep")
+            .join(pointer["slot"].as_str().unwrap())
+    }
+
+    /// Rewrite one published artifact and the integrity stamp that covers it.
+    /// A same-directory stamp is not a trust boundary: after this, `Published::open`
+    /// accepts the bytes.
+    fn publish_tampered(slot: &std::path::Path, name: &str, bytes: &[u8]) {
+        fs::write(slot.join(name), bytes).unwrap();
+        let mut evidence = tgrep_core::meta::read_file_evidence(&slot.join("integrity")).unwrap();
+        let meta = fs::metadata(slot.join(name)).unwrap();
+        let content = evidence.content_id(name);
+        evidence.insert_verified(
+            name.to_string(),
+            tgrep_core::meta::file_stamp(&meta),
+            content,
+            Some(tgrep_core::meta::file_version(&meta)),
+        );
+        tgrep_core::meta::write_file_evidence(&evidence, &slot.join("integrity")).unwrap();
+    }
+
+    fn replace_once(bytes: &mut [u8], from: &[u8], to: &[u8]) {
+        assert_eq!(from.len(), to.len());
+        let mut at = None;
+        let mut found = 0usize;
+        for index in 0..=bytes.len().saturating_sub(from.len()) {
+            if &bytes[index..index + from.len()] == from {
+                found += 1;
+                at = Some(index);
+            }
+        }
+        assert_eq!(found, 1, "the path bytes must be unambiguous");
+        let index = at.expect("present");
+        bytes[index..index + to.len()].copy_from_slice(to);
+    }
+
+    /// The snapshot may not exclude a file by a path the walk did not produce
+    /// inside the root. A matching stamp is not that proof.
+    #[test]
+    fn an_escaping_snapshot_path_is_not_an_exclusion() {
+        let root = scratch("verdict");
+        fs::write(root.join("hit.rs"), b"needle\n").unwrap();
+        let meta = fs::metadata(root.join("hit.rs")).unwrap();
+        let mut evidence = tgrep_core::meta::FileEvidence::default();
+        evidence.insert_verified(
+            "../a.b".into(),
+            tgrep_core::meta::file_stamp(&meta),
+            None,
+            Some(tgrep_core::meta::file_version(&meta)),
+        );
+        let candidates = super::Candidates {
+            _lock: fs::File::create(root.join("lock")).unwrap(),
+            evidence,
+            absent: std::collections::HashSet::from(["../a.b".to_string()]),
+        };
+        assert_eq!(
+            candidates.verdict("../a.b", &meta),
+            super::Candidate::Search,
+            "a path outside the root must not be excluded on a stamp"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_published_escaping_path_is_not_ranked() {
+        let root = scratch("rank-escape");
+        fs::write(root.join("kept.rs"), "fn alpaca() { alpaca alpaca }\n").unwrap();
+        super::build_index(&IndexRequest {
+            root: root.clone(),
+            max_files: 0,
+            sparse: None,
+        })
+        .unwrap();
+        let before = rank(&root, "alpaca");
+        assert_eq!(before.files.len(), 1);
+        assert_eq!(before.files[0].path, "kept.rs");
+
+        let slot = published_slot(&root);
+        let mut bytes = fs::read(slot.join("lexical.bin")).unwrap();
+        replace_once(&mut bytes, b"kept.rs", b"../a.rs");
+        publish_tampered(&slot, "lexical.bin", &bytes);
+
+        let err = crate::lexical::ranked_search(
+            &serde_json::from_value(serde_json::json!({ "root": root, "query": "alpaca" }))
+                .unwrap(),
+        )
+        .expect_err("an escaping published path is not a ranking");
+        assert!(
+            err.contains("relative") || err.contains("repository"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("../a.rs is") && !err.contains("\"../a.rs\""),
+            "the escaping path must not be returned: {err}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_files_bin_path_outside_the_root_cannot_exclude_a_real_source() {
+        let root = scratch("files-bin");
+        fs::write(root.join("hit.rs"), "needle\n").unwrap();
+        super::build_index(&IndexRequest {
+            root: root.clone(),
+            max_files: 0,
+            sparse: None,
+        })
+        .unwrap();
+        let slot = published_slot(&root);
+        let mut bytes = fs::read(slot.join("files.bin")).unwrap();
+        replace_once(&mut bytes, b"hit.rs", b"../a.b");
+        publish_tampered(&slot, "files.bin", &bytes);
+
+        let response = crate::search(
+            &serde_json::from_value(serde_json::json!({ "root": root, "pattern": "needle" }))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response.count, 1, "{response:?}");
+        assert_eq!(
+            response.index.status, "used",
+            "the slot is still a coherent index: {response:?}"
+        );
+        assert_eq!(
+            response.index.files_filtered, 0,
+            "the snapshot named a path the walk did not produce: {response:?}"
         );
         fs::remove_dir_all(root).unwrap();
     }

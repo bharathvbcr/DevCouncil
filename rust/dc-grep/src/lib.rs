@@ -50,7 +50,7 @@
 
 use std::fs::File;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 use grep_regex::RegexMatcherBuilder;
@@ -844,6 +844,67 @@ fn open_for_search(path: &Path) -> io::Result<File> {
     File::open(path)
 }
 
+/// A published path may be joined under the repository only when every
+/// component is a normal, relative name.
+///
+/// This is an allow-list. A prefix check on the string would accept
+/// `../outside` and an absolute path, and `O_NOFOLLOW` does not stop either:
+/// an absolute path replaces the root, and `..` is an intermediate component.
+pub(crate) fn contained_relative(path: &str) -> bool {
+    if path.is_empty() || path.as_bytes().contains(&0) {
+        return false;
+    }
+    let path = Path::new(path);
+    if path.is_absolute() {
+        return false;
+    }
+    let mut normal = false;
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => normal = true,
+            _ => return false,
+        }
+    }
+    normal
+}
+
+/// Opens `path` for a metadata check only when it resolves inside the
+/// canonical `root`.
+///
+/// Absolute paths and parent components are refused before any filesystem
+/// call, so a missing `../outside` is `InvalidInput` and not `NotFound`. A
+/// lexically contained path is canonicalized next, and a result outside the
+/// root is refused before the open. The open is of that canonical path and
+/// stays `O_NOFOLLOW` and `O_NONBLOCK`. A matching stamp is not an input.
+///
+/// The descriptor's own path is not read back: this crate forbids unsafe, and
+/// the platform call that would do it is unsafe. The check is the canonical
+/// path, then the open of that path.
+pub(crate) fn open_inside_root(root: &Path, path: &str) -> io::Result<File> {
+    if !contained_relative(path) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path escapes the repository",
+        ));
+    }
+    let root = root.canonicalize()?;
+    let joined = root.join(path);
+    if !joined.starts_with(&root) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path escapes the repository",
+        ));
+    }
+    let real = joined.canonicalize()?;
+    if !real.starts_with(&root) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path escapes the repository",
+        ));
+    }
+    open_for_search(&real)
+}
+
 /// Renders a repository-relative path with forward slashes on every platform,
 /// so a result read on Windows names the same file a result read on Unix does.
 ///
@@ -1496,6 +1557,33 @@ mod tests {
         request.path = "no/such/dir".to_string();
         let err = search(&request).expect_err("must not succeed");
         assert!(err.contains("unreadable"), "{err}");
+    }
+
+    #[test]
+    fn an_escaping_published_path_is_refused_before_it_is_opened() {
+        let scratch = Scratch::new();
+        scratch.write("kept.rs", b"fn kept() {}\n");
+        let absolute = open_inside_root(&scratch.path, "/etc/passwd").unwrap_err();
+        assert_eq!(absolute.kind(), io::ErrorKind::InvalidInput);
+        let parent = open_inside_root(&scratch.path, "../no-such-wave3-canary").unwrap_err();
+        assert_eq!(
+            parent.kind(),
+            io::ErrorKind::InvalidInput,
+            "a missing parent path is refused before open, not reported NotFound"
+        );
+        let file = open_inside_root(&scratch.path, "kept.rs").expect("a real file inside opens");
+        assert!(file.metadata().unwrap().is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_directory_does_not_open_outside_the_root() {
+        let outside = Scratch::new();
+        outside.write("secret.rs", b"fn secret() {}\n");
+        let scratch = Scratch::new();
+        std::os::unix::fs::symlink(&outside.path, scratch.path.join("link")).unwrap();
+        let err = open_inside_root(&scratch.path, "link/secret.rs").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
     }
 
     #[cfg(unix)]

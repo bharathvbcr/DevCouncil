@@ -794,8 +794,19 @@ impl Reader {
             if end > bytes.len() {
                 return Err(format!("lexical index is truncated inside path {index}"));
             }
-            if std::str::from_utf8(&bytes[cursor..end]).is_err() {
-                return Err(format!("lexical index path {index} is not valid UTF-8"));
+            let text = match std::str::from_utf8(&bytes[cursor..end]) {
+                Ok(text) => text,
+                Err(_) => {
+                    return Err(format!("lexical index path {index} is not valid UTF-8"));
+                }
+            };
+            // The path table is published bytes. An absolute path or a parent
+            // component is not stored: the slot is refused, so rank never
+            // returns it and never opens it.
+            if !crate::contained_relative(text) {
+                return Err(format!(
+                    "lexical index path {index} is not a relative path inside the repository"
+                ));
             }
             path_offsets.push((cursor, end));
             cursor = end;
@@ -1190,6 +1201,27 @@ mod tests {
         builder.add("a.rs".into(), 10, &[(7, 3.0), (9, 1.0)]);
         builder.add("b.rs".into(), 20, &[(7, 1.0), (11, 5.0)]);
         builder.finish()
+    }
+
+    /// A cache writer can put any UTF-8 in the path table. An absolute path or a
+    /// parent component is not a file this index may name, so the slot is refused
+    /// rather than ranked.
+    #[test]
+    fn an_absolute_or_parent_path_is_not_stored() {
+        for path in ["/etc/passwd", "../outside", "foo/../../etc/passwd"] {
+            let mut builder = Builder::new(Vocabulary::CodeV1);
+            assert!(builder.add("kept.rs".into(), 2, &[(7, 1.0)]));
+            assert!(builder.add(path.into(), 2, &[(7, 1.0)]));
+            let err = Reader::open(builder.finish()).expect_err(path);
+            assert!(
+                err.contains("relative") || err.contains("repository"),
+                "{path}: {err}"
+            );
+            assert!(
+                !err.contains("kept.rs"),
+                "the refusal is about the escaping path, not the real one: {err}"
+            );
+        }
     }
 
     #[test]
