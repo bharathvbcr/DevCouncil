@@ -739,31 +739,60 @@ fn unindexed_worktree_notice(payload: &Value, executable: &Path) -> Option<Value
 /// Largest gitlink or `commondir` file read. Both hold one path.
 const MAX_GITLINK_BYTES: u64 = 4096;
 
-/// The main checkout of the linked worktree at `root`, from git's own files:
-/// the `.git` gitlink names `<common>/worktrees/<name>`, whose `commondir`
-/// names the common directory. `None` when `root` is itself a main checkout (its
-/// `.git` is a directory), when the common directory is bare (it has no
-/// checkout to hold a store), or when any of it cannot be read.
+/// The main checkout of the linked worktree at `root`, when git has registered
+/// that worktree.
+///
+/// Three paths have to agree. The gitdir is `<main>/.git/worktrees/<name>`.
+/// Its `commondir` canonicalizes to that same `<main>/.git`. Its `gitdir` file
+/// names this root's `.git`, and this root's `.git` is a regular file. A
+/// `commondir` whose final component is `.git` is not enough: the directory a
+/// gitlink names is writable by whoever planted the gitlink.
+///
+/// `None` when `root` is itself a main checkout (its `.git` is a directory),
+/// when the common directory is bare, when this root is not the registered
+/// worktree, or when any of it cannot be read.
 fn main_checkout_of(root: &Path) -> Option<PathBuf> {
     let gitlink = root.join(".git");
-    if !gitlink.is_file() {
+    // A symlink is not this checkout's gitlink. Following it would adopt
+    // whatever worktree the link points at.
+    if !gitlink.symlink_metadata().is_ok_and(|meta| meta.is_file()) {
         return None;
     }
     let text = devmap_query::stat_memo::read_bounded(&gitlink, MAX_GITLINK_BYTES)?;
-    let gitdir = text
+    let gitdir_spec = text
         .lines()
         .find_map(|line| line.strip_prefix("gitdir:"))
         .map(str::trim)
-        .filter(|path| !path.is_empty())?;
-    let gitdir = root.join(gitdir);
-    let common =
+        .filter(|path| !path.is_empty() && !path.contains('\0'))?;
+    let gitdir = root.join(gitdir_spec);
+    let common_text =
         devmap_query::stat_memo::read_bounded(&gitdir.join("commondir"), MAX_GITLINK_BYTES)?;
-    let common = gitdir.join(common.trim()).canonicalize().ok()?;
+    let common_text = common_text.trim();
+    if common_text.is_empty() || common_text.contains('\0') {
+        return None;
+    }
+    let common = gitdir.join(common_text).canonicalize().ok()?;
     if common.file_name()? != ".git" {
         return None;
     }
+    let gitdir = gitdir.canonicalize().ok()?;
+    let worktrees = gitdir.parent()?;
+    if worktrees.file_name()? != "worktrees" || worktrees.parent()? != common {
+        return None;
+    }
+    let registered =
+        devmap_query::stat_memo::read_bounded(&gitdir.join("gitdir"), MAX_GITLINK_BYTES)?;
+    let registered = registered.trim();
+    if registered.is_empty() || registered.contains('\0') {
+        return None;
+    }
+    let registered = gitdir.join(registered).canonicalize().ok()?;
+    let gitlink = gitlink.canonicalize().ok()?;
+    let root = root.canonicalize().ok()?;
+    if registered != gitlink || registered.parent()? != root {
+        return None;
+    }
     let main = common.parent()?.to_path_buf();
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     (main != root).then_some(main)
 }
 
@@ -1761,8 +1790,11 @@ fn segment_reads_source(segment: &str) -> bool {
 /// Shared with [`coalesce_lock_dir`] so the two never disagree about which
 /// layout a repository uses; the choice is a property of the repository.
 fn state_dir(root: &Path) -> PathBuf {
-    if root.join(".devmap").is_dir() {
-        root.join(".devmap")
+    let devmap = root.join(".devmap");
+    // `is_dir` follows a symlink. A linked `.devmap` is not this checkout's
+    // state directory, so bookkeeping stays under `.devcouncil`.
+    if devmap.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
+        devmap
     } else {
         root.join(".devcouncil")
     }
@@ -2065,12 +2097,58 @@ const LOCK_PID_GRACE: Duration = Duration::from_secs(10);
 /// this is already past any budget this hook enforces.
 const LOCK_MAX_AGE: Duration = Duration::from_secs(30 * 60);
 
-fn try_acquire_lock_dir(lock_dir: &Path) -> anyhow::Result<bool> {
-    if let Some(parent) = lock_dir.parent() {
-        fs::create_dir_all(parent)?;
+/// The absolute lock directory, with no symlink component, inside the
+/// repository `lock_dir` was built under.
+///
+/// [`PinnedDir`] opens each ancestor with `O_NOFOLLOW` and creates a missing
+/// one with `mkdirat`. That is the hooks-marker pin. Create, reclaim, and
+/// `/bin/rm -rf` then use this path, so none of them follows a symlink out of
+/// the tree. A directory swapped for a symlink after the pin is the same limit
+/// as that marker: the path was a real directory inside the repository when it
+/// was handed on.
+fn pinned_lock_dir(lock_dir: &Path) -> anyhow::Result<PathBuf> {
+    use devmap_extract::safe_fs::PinnedDir;
+
+    // `repo/<state>/codeintel/hook-<kind>.running` — three parents is the repo.
+    let repo = lock_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .context("lock dir is not inside a repository")?;
+    let repo = repo
+        .canonicalize()
+        .with_context(|| format!("lock dir {}", lock_dir.display()))?;
+    let parent = lock_dir.parent().context("lock dir has no parent")?;
+    let name = lock_dir.file_name().context("lock dir has no name")?;
+    let one_name = matches!(
+        Path::new(name).components().next(),
+        Some(std::path::Component::Normal(got)) if got == name
+    );
+    if !one_name {
+        bail!(
+            "lock dir {} is not a directory inside the repository",
+            lock_dir.display()
+        );
     }
+    let pinned = PinnedDir::open(parent, true)
+        .with_context(|| format!("lock dir {}", lock_dir.display()))?;
+    let real_parent = pinned
+        .path()
+        .canonicalize()
+        .with_context(|| format!("lock dir {}", lock_dir.display()))?;
+    if pinned.path() != real_parent.as_path() || !real_parent.starts_with(&repo) {
+        bail!(
+            "lock dir {} is not a directory inside the repository",
+            lock_dir.display()
+        );
+    }
+    Ok(real_parent.join(name))
+}
+
+fn try_acquire_lock_dir(lock_dir: &Path) -> anyhow::Result<bool> {
+    let lock_dir = pinned_lock_dir(lock_dir)?;
     for _ in 0..LOCK_RECLAIM_ATTEMPTS {
-        match fs::create_dir(lock_dir) {
+        match fs::create_dir(&lock_dir) {
             Ok(()) => {
                 // Provisional owner. `spawn_detached_with_cleanup` overwrites
                 // this with the child's pid, because the child is what holds
@@ -2079,13 +2157,21 @@ fn try_acquire_lock_dir(lock_dir: &Path) -> anyhow::Result<bool> {
                 return Ok(true);
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                if !lock_dir_is_stale(lock_dir) {
+                // A symlink is AlreadyExists. `is_dir` would follow it, and
+                // removing it would delete through the link or unlink it.
+                if !lock_dir.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
+                    bail!(
+                        "lock dir {} is not a directory inside the repository",
+                        lock_dir.display()
+                    );
+                }
+                if !lock_dir_is_stale(&lock_dir) {
                     return Ok(false);
                 }
                 // The failure decides, rather than being discarded: retrying
                 // after a removal that did not happen re-enters on identical
                 // state, which is the unbounded loop this replaced.
-                fs::remove_dir_all(lock_dir)
+                fs::remove_dir_all(&lock_dir)
                     .with_context(|| format!("reclaim stale lock {}", lock_dir.display()))?;
             }
             Err(error) => {
@@ -2328,6 +2414,16 @@ fn spawn_detached_with_cleanup(
     args: &[&OsStr],
     lock_dir: &Path,
 ) -> anyhow::Result<()> {
+    // `/bin/rm -rf` follows an intermediate symlink. The path it receives has
+    // already been pinned to a real directory inside the repository.
+    let lock_dir = pinned_lock_dir(lock_dir)?;
+    if !lock_dir.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
+        bail!(
+            "lock dir {} is not a directory inside the repository",
+            lock_dir.display()
+        );
+    }
+    let lock_dir = lock_dir.as_path();
     #[cfg(unix)]
     let mut cmd = detached_shell_command(executable, args, lock_dir)?;
     #[cfg(windows)]
@@ -3413,6 +3509,11 @@ mod tests {
 
         let root = parent.join("lane\nname");
         fs::create_dir_all(&root).unwrap();
+        fs::write(
+            gitdir.join("gitdir"),
+            format!("{}\n", root.join(".git").display()),
+        )
+        .unwrap();
         fs::write(root.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
         // Not writable, so creating the coalesce lock fails with an error that
         // names the lock path. AlreadyExists would coalesce instead of failing.
@@ -3446,6 +3547,372 @@ mod tests {
         assert!(
             !rendered.contains("lane\nname"),
             "SessionStart plaintext interpolated the lock path raw: {rendered:?}"
+        );
+    }
+
+    /// `~/scratch/evil/.git` says `gitdir:` to a directory whose `commondir`
+    /// names an indexed checkout's `.git`. That is not this cwd's registration.
+    #[test]
+    fn a_forged_commondir_does_not_opt_the_cwd_in() {
+        let parent = scratch("forged-commondir");
+        let indexed = parent.join("indexed");
+        fs::create_dir_all(indexed.join(".git")).unwrap();
+        fs::create_dir_all(indexed.join(".devcouncil/codeintel")).unwrap();
+        fs::write(indexed.join(".devcouncil/codeintel/devmap.sqlite"), b"x").unwrap();
+        let fake = parent.join("fake-gitdir");
+        fs::create_dir_all(&fake).unwrap();
+        fs::write(
+            fake.join("commondir"),
+            format!("{}\n", indexed.join(".git").display()),
+        )
+        .unwrap();
+        let evil = parent.join("evil");
+        fs::create_dir_all(&evil).unwrap();
+        fs::write(evil.join(".git"), format!("gitdir: {}\n", fake.display())).unwrap();
+
+        let resolved = main_checkout_of(&evil);
+        let _ = fs::remove_dir_all(&parent);
+        assert_eq!(
+            resolved, None,
+            "a forged commondir opted the cwd into the indexed checkout"
+        );
+    }
+
+    /// Pointing this cwd at another checkout's `worktrees/<name>` is not a
+    /// registration of this cwd. The gitdir file names the other checkout.
+    #[test]
+    fn a_registration_for_another_checkout_does_not_opt_this_cwd_in() {
+        let parent = scratch("other-registration");
+        let main = parent.join("main");
+        let lane = parent.join("lane");
+        let evil = parent.join("evil");
+        fs::create_dir_all(main.join(".git")).unwrap();
+        fs::create_dir_all(&lane).unwrap();
+        fs::create_dir_all(&evil).unwrap();
+        let gitdir = main.join(".git/worktrees/lane");
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        fs::write(
+            gitdir.join("gitdir"),
+            format!("{}\n", lane.join(".git").display()),
+        )
+        .unwrap();
+        fs::write(lane.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        fs::write(evil.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+
+        let evil_main = main_checkout_of(&evil);
+        let lane_main = main_checkout_of(&lane);
+        let expected = main.canonicalize().unwrap();
+        let _ = fs::remove_dir_all(&parent);
+        assert_eq!(
+            evil_main, None,
+            "another checkout's gitdir opted this cwd in"
+        );
+        assert_eq!(lane_main.as_deref(), Some(expected.as_path()));
+    }
+
+    /// A gitlink that is a symlink, and a `worktrees/<name>` that is a symlink,
+    /// are not this cwd's registration even when `commondir` names a real `.git`.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_gitlink_or_worktree_dir_does_not_opt_the_cwd_in() {
+        let parent = scratch("linked-gitlink");
+        let main = parent.join("main");
+        let lane = parent.join("lane");
+        let evil = parent.join("evil");
+        fs::create_dir_all(main.join(".git")).unwrap();
+        fs::create_dir_all(&lane).unwrap();
+        fs::create_dir_all(&evil).unwrap();
+        let gitdir = main.join(".git/worktrees/lane");
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        fs::write(
+            gitdir.join("gitdir"),
+            format!("{}\n", lane.join(".git").display()),
+        )
+        .unwrap();
+        fs::write(lane.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        std::os::unix::fs::symlink(lane.join(".git"), evil.join(".git")).unwrap();
+
+        let fake = parent.join("fake-gitdir");
+        fs::create_dir_all(&fake).unwrap();
+        fs::write(
+            fake.join("commondir"),
+            format!("{}\n", main.join(".git").display()),
+        )
+        .unwrap();
+        fs::write(
+            fake.join("gitdir"),
+            format!("{}\n", evil.join(".git").display()),
+        )
+        .unwrap();
+        let linked_name = main.join(".git/worktrees/via-link");
+        std::os::unix::fs::symlink(&fake, &linked_name).unwrap();
+        let via = parent.join("via");
+        fs::create_dir_all(&via).unwrap();
+        fs::write(
+            via.join(".git"),
+            format!("gitdir: {}\n", linked_name.display()),
+        )
+        .unwrap();
+
+        let linked_gitlink = main_checkout_of(&evil);
+        let linked_admin = main_checkout_of(&via);
+        let registered = main_checkout_of(&lane);
+        let _ = fs::remove_dir_all(&parent);
+        assert_eq!(
+            linked_gitlink, None,
+            "a symlinked gitlink opted this cwd in"
+        );
+        assert_eq!(
+            linked_admin, None,
+            "a symlinked worktree dir opted this cwd in"
+        );
+        assert!(
+            registered.is_some(),
+            "the real registration stopped resolving"
+        );
+    }
+
+    /// A linked worktree git itself would recognise: `commondir` is `../..`
+    /// and the gitdir file names this checkout.
+    #[test]
+    fn a_registered_linked_worktree_resolves_to_its_main() {
+        let parent = scratch("registered-worktree");
+        let main = parent.join("main");
+        let root = parent.join("lane");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(main.join(".git")).unwrap();
+        let gitdir = main.join(".git/worktrees/lane");
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        fs::write(root.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        fs::write(
+            gitdir.join("gitdir"),
+            format!("{}\n", root.join(".git").display()),
+        )
+        .unwrap();
+
+        let resolved = main_checkout_of(&root);
+        let expected = main.canonicalize().unwrap();
+        let _ = fs::remove_dir_all(&parent);
+        assert_eq!(resolved.as_deref(), Some(expected.as_path()));
+    }
+
+    /// SessionStart must not start a build of a cwd whose gitlink is forged.
+    /// The directory is not writable, so a bug that still calls detach cannot
+    /// spawn: the failure stays in the notice text.
+    #[cfg(unix)]
+    #[test]
+    fn a_forged_commondir_does_not_start_detach() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = scratch("forged-detach");
+        let indexed = parent.join("indexed");
+        fs::create_dir_all(indexed.join(".git")).unwrap();
+        fs::create_dir_all(indexed.join(".devcouncil/codeintel")).unwrap();
+        fs::write(indexed.join(".devcouncil/codeintel/devmap.sqlite"), b"x").unwrap();
+        let fake = parent.join("fake-gitdir");
+        fs::create_dir_all(&fake).unwrap();
+        fs::write(
+            fake.join("commondir"),
+            format!("{}\n", indexed.join(".git").display()),
+        )
+        .unwrap();
+        let evil = parent.join("evil");
+        fs::create_dir_all(&evil).unwrap();
+        fs::write(evil.join(".git"), format!("gitdir: {}\n", fake.display())).unwrap();
+        fs::set_permissions(&evil, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let notice = unindexed_worktree_notice(&json!({ "cwd": &evil }), Path::new("devmap"));
+        fs::set_permissions(&evil, fs::Permissions::from_mode(0o755)).unwrap();
+        let text = notice
+            .as_ref()
+            .and_then(|value| value.pointer("/hookSpecificOutput/additionalContext"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let _ = fs::remove_dir_all(&parent);
+        assert!(
+            text.contains("Run `devmap build`"),
+            "the unindexed cwd was not named: {text:?}"
+        );
+        assert!(
+            !text.contains("was started") && !text.contains("background failed"),
+            "a forged commondir started or attempted a build: {text:?}"
+        );
+    }
+
+    /// `.devmap` linked at another directory is not this repository's state.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_devmap_is_not_the_state_dir() {
+        let root = scratch("state-link");
+        let outside = scratch("state-outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".devmap")).unwrap();
+        let linked = state_dir(&root);
+        let real = scratch("state-real");
+        fs::create_dir_all(real.join(".devmap")).unwrap();
+        let chosen = state_dir(&real);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(&real);
+        assert_eq!(linked, root.join(".devcouncil"));
+        assert_eq!(chosen, real.join(".devmap"));
+    }
+
+    /// Creating the coalesce lock follows `.devcouncil` when it is a symlink.
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_is_not_created_through_a_symlink() {
+        let root = scratch("lock-create");
+        let victim = scratch("lock-create-victim");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("precious"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&victim, root.join(".devcouncil")).unwrap();
+
+        let lock = coalesce_lock_dir(&root, "build");
+        let created = try_acquire_lock_dir(&lock);
+        let leaked = victim.join("codeintel").exists();
+        let kept = victim.join("precious").is_file();
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&victim);
+        assert!(kept, "the victim lost a file");
+        assert!(
+            !leaked,
+            "the lock parent was created through the symlink: {created:?}"
+        );
+        assert!(
+            created.is_err(),
+            "a lock through a symlink was acquired: {created:?}"
+        );
+    }
+
+    /// An ancestor symlink is the same refusal the hooks marker already makes.
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_through_an_ancestor_symlink_is_not_created() {
+        let root = scratch("lock-ancestor");
+        fs::create_dir_all(&root).unwrap();
+        let outer = scratch("lock-ancestor-outer");
+        std::os::unix::fs::symlink(&root, &outer).unwrap();
+        let lock = outer.join(".devcouncil/codeintel/hook-build.running");
+        let created = try_acquire_lock_dir(&lock);
+        let leaked = root
+            .join(".devcouncil/codeintel/hook-build.running")
+            .exists();
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outer);
+        assert!(
+            !leaked,
+            "the lock was created through the ancestor symlink: {created:?}"
+        );
+        assert!(
+            created.is_err(),
+            "a lock through an ancestor symlink was acquired"
+        );
+    }
+
+    /// Reclaiming a stale lock follows the same symlink and deletes the target.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_lock_is_not_removed_through_a_symlink() {
+        let root = scratch("lock-stale");
+        let victim = scratch("lock-stale-victim");
+        let placed = victim.join("codeintel/hook-build.running");
+        fs::create_dir_all(&placed).unwrap();
+        fs::write(placed.join("canary"), b"keep").unwrap();
+        fs::File::open(&placed)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(31 * 60))
+            .unwrap();
+        fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&victim, root.join(".devcouncil")).unwrap();
+
+        let lock = coalesce_lock_dir(&root, "build");
+        let reclaimed = try_acquire_lock_dir(&lock);
+        let kept = placed.join("canary").is_file();
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&victim);
+        assert!(
+            kept,
+            "the stale lock was removed through the symlink: {reclaimed:?}"
+        );
+        assert!(
+            reclaimed.is_err(),
+            "a stale lock through a symlink was reclaimed"
+        );
+    }
+
+    /// `/bin/rm -rf` of the lock path follows an intermediate symlink and
+    /// deletes that directory. The cleanup must not be aimed there.
+    #[cfg(unix)]
+    #[test]
+    fn the_unix_rm_of_a_lock_does_not_follow_a_symlink() {
+        let root = scratch("lock-rm");
+        let victim = scratch("lock-rm-victim");
+        let placed = victim.join("codeintel/hook-build.running");
+        fs::create_dir_all(&placed).unwrap();
+        fs::write(placed.join("canary"), b"keep").unwrap();
+        fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&victim, root.join(".devcouncil")).unwrap();
+        let lock = coalesce_lock_dir(&root, "build");
+
+        let outcome = spawn_detached_with_cleanup(Path::new("/bin/true"), &[], &lock);
+        if outcome.is_ok() {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while placed.join("canary").exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        let kept = placed.join("canary").is_file();
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&victim);
+        assert!(
+            outcome.is_err(),
+            "rm was aimed through a symlink: {outcome:?}"
+        );
+        assert!(kept, "rm removed the lock through the symlink");
+    }
+
+    /// The lock directory itself being a symlink is not a directory to reclaim.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_in_place_of_the_lock_directory_is_not_removed() {
+        let root = scratch("lock-final");
+        fs::create_dir_all(root.join(".devcouncil/codeintel")).unwrap();
+        let victim = scratch("lock-final-victim");
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("precious"), b"keep").unwrap();
+        let lock = coalesce_lock_dir(&root, "build");
+        std::os::unix::fs::symlink(&victim, &lock).unwrap();
+        fs::File::open(&victim)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(31 * 60))
+            .unwrap();
+
+        let reclaimed = try_acquire_lock_dir(&lock);
+        let removed = spawn_detached_with_cleanup(Path::new("/bin/true"), &[], &lock);
+        let kept = victim.join("precious").is_file();
+        let still_linked = lock
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_symlink());
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&victim);
+        assert!(
+            kept,
+            "the lock symlink was followed: {reclaimed:?} {removed:?}"
+        );
+        assert!(still_linked, "the lock symlink was unlinked");
+        assert!(
+            reclaimed.is_err(),
+            "a symlink was reclaimed as a lock: {reclaimed:?}"
+        );
+        assert!(
+            removed.is_err(),
+            "rm was aimed at a symlink lock: {removed:?}"
         );
     }
 
