@@ -626,6 +626,60 @@ fn string_path(payload: &Value, key: &str) -> Option<PathBuf> {
     payload.get(key).and_then(Value::as_str).map(PathBuf::from)
 }
 
+/// A character that would open another line, or otherwise act as a control,
+/// inside hook context. Tab is spacing, not a new line, and stays.
+fn context_breaks_a_line(c: char) -> bool {
+    c == '\n'
+        || c == '\r'
+        || c == '\u{0085}'
+        || c == '\u{2028}'
+        || c == '\u{2029}'
+        || (c.is_control() && c != '\t')
+}
+
+/// `text` as one hook-context line. Line breaks and other controls are written
+/// as `\uXXXX`, the same spelling [`crate::presentation::escape_for_pipe`] uses
+/// for the controls it does escape. Newline is kept there because it is text
+/// structure; here it is data from a directory name, and Claude pastes this
+/// string raw.
+fn context_line(text: &str) -> String {
+    if !text.chars().any(context_breaks_a_line) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        if context_breaks_a_line(c) {
+            out.push_str(&format!("\\u{:04x}", u32::from(c)));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The directory name of `root` as one hook-context line.
+///
+/// A name that is not Unicode is `fallback`: inventing a lossy spelling would
+/// show a different directory than the one on disk. A newline is Unicode, so
+/// it is escaped rather than replaced by the fallback.
+fn repo_context_label(root: &Path, fallback: &str) -> String {
+    match root.file_name().and_then(|name| name.to_str()) {
+        Some(name) => context_line(name),
+        None => fallback.to_string(),
+    }
+}
+
+/// Directory name for the unindexed-tree notice. Lossy, then one line: a
+/// non-Unicode name still has to be recognizable, and a newline byte in it is
+/// still a newline.
+fn unindexed_context_name(root: &Path) -> String {
+    let raw = root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.display().to_string());
+    context_line(&raw)
+}
+
 /// What to say when this working tree is a repository with no index.
 ///
 /// Only that case. A directory outside git, an unsafe root, or a tree that
@@ -649,10 +703,7 @@ fn unindexed_worktree_notice(payload: &Value, executable: &Path) -> Option<Value
     if is_unsafe_root(&root) || store_exists(&root) {
         return None;
     }
-    let name = root
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| root.display().to_string());
+    let name = unindexed_context_name(&root);
     let opted_in =
         main_checkout_of(&root).filter(|main| !is_unsafe_root(main) && store_exists(main));
     let text = match opted_in.map(|main| (detach_build(executable, &root), main)) {
@@ -662,7 +713,7 @@ fn unindexed_worktree_notice(payload: &Value, executable: &Path) -> Option<Value
              it lands (`devmap status` reports it), devmap_* queries here cannot answer, and an \
              empty result is not evidence that a symbol is absent. Do not query the main \
              checkout's index for this tree: it describes a different working state.",
-            main.display()
+            context_line(&main.display().to_string())
         ),
         Some((Err(error), _)) => format!(
             "{name}: no DevMap index in this working tree, and starting `devmap build` here in \
@@ -1013,7 +1064,7 @@ fn session_start_sync(executable: &Path, selection: &RootSelection) -> anyhow::R
         };
         let mut clause = format!(
             "{}: {}",
-            root.file_name().and_then(|n| n.to_str()).unwrap_or("repo"),
+            repo_context_label(root, "repo"),
             summarize_status(&status_text)
         );
         if let Some(last) = summarize_last_session(&last_text) {
@@ -1210,10 +1261,7 @@ fn compose_pre_tool_use(status_text: &str, root: &Path, skeleton: Option<&str>) 
         .get("is_fresh")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let name = root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("this repository");
+    let name = repo_context_label(root, "this repository");
     let freshness = if fresh {
         "current"
     } else {
@@ -3255,6 +3303,182 @@ mod tests {
             "Claude must stay plaintext, got {rendered}"
         );
         assert!(rendered.contains("Ask DevMap"), "{rendered}");
+    }
+
+    /// A checkout's directory name is chosen by whoever created it, and Claude
+    /// pastes SessionStart stdout as plaintext. A newline in that name must not
+    /// open a second line in the briefing.
+    #[test]
+    fn a_directory_name_with_a_newline_stays_on_one_hook_line() {
+        let root = Path::new("/work/repo\nname");
+        let status = r#"{"query_ready":true,"node_count":3,"edge_count":4,"generation_id":1,"is_fresh":true}"#;
+        let pre = compose_pre_tool_use(status, root, None).expect("a ready index speaks");
+        assert!(
+            !pre.contains("repo\nname"),
+            "PreToolUse context interpolated the newline raw: {pre:?}"
+        );
+        assert!(
+            pre.contains("repo") && pre.contains("name"),
+            "the directory name must still be recognizable: {pre:?}"
+        );
+        let doc = json!({
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": pre,
+            }
+        });
+        let payload = json!({"hook_event_name": "SessionStart", "session_id": "s"});
+        let rendered = render_host_stdout(HookEvent::SessionStart, &payload, &doc)
+            .expect("Claude sessionStart emits plaintext");
+        assert!(
+            !rendered.contains("repo\nname"),
+            "SessionStart plaintext interpolated the newline raw: {rendered:?}"
+        );
+    }
+
+    /// The unindexed-tree notice is the SessionStart text for a repository
+    /// that has no store yet. Its first token is the directory name.
+    ///
+    /// Unix only: Windows rejects a directory name that contains a newline, so
+    /// the fixture cannot be created there. The escape itself is covered by
+    /// [`other_line_breaks_in_a_directory_name_stay_escaped`], which never
+    /// touches the filesystem.
+    #[cfg(unix)]
+    #[test]
+    fn an_unindexed_tree_named_with_a_newline_stays_on_one_line() {
+        let parent = scratch("newline-repo");
+        let root = parent.join("lane\nname");
+        fs::create_dir_all(&root).unwrap();
+        let init = Command::new("git")
+            .current_dir(&root)
+            .args(["init", "-q"])
+            .status()
+            .expect("git init");
+        assert!(init.success(), "git init failed in {root:?}");
+        let payload = json!({"cwd": root});
+        let notice = unindexed_worktree_notice(&payload, Path::new("devmap"))
+            .expect("an unindexed worktree is named");
+        let text = notice
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .expect("additionalContext");
+        assert!(
+            !text.contains("lane\nname"),
+            "the notice interpolated the directory name raw: {text:?}"
+        );
+        assert!(text.contains("lane") && text.contains("name"), "{text:?}");
+        let payload = json!({"hook_event_name": "SessionStart", "session_id": "s"});
+        let rendered =
+            render_host_stdout(HookEvent::SessionStart, &payload, &notice).expect("plaintext");
+        assert!(
+            !rendered.contains("lane\nname"),
+            "SessionStart plaintext interpolated the directory name raw: {rendered:?}"
+        );
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    /// CR, Unicode line separators, and the next-line control are line breaks
+    /// in a directory name too. Tab is spacing. An ordinary name is unchanged.
+    #[test]
+    fn other_line_breaks_in_a_directory_name_stay_escaped() {
+        let status = r#"{"query_ready":true,"node_count":3,"edge_count":4,"generation_id":1,"is_fresh":true}"#;
+        let cases = [
+            ("repo\rname", "\\u000d"),
+            ("repo\0name", "\\u0000"),
+            ("repo\u{2028}name", "\\u2028"),
+            ("repo\u{2029}name", "\\u2029"),
+            ("repo\u{0085}name", "\\u0085"),
+        ];
+        for (name, escaped) in cases {
+            let root = Path::new("/work").join(name);
+            let pre = compose_pre_tool_use(status, &root, None).expect("a ready index speaks");
+            assert!(
+                !pre.contains(name),
+                "{name:?} was interpolated raw: {pre:?}"
+            );
+            assert!(
+                pre.contains(escaped),
+                "{name:?} must be escaped as {escaped}, got {pre:?}"
+            );
+            assert!(pre.contains("repo") && pre.contains("name"), "{pre:?}");
+        }
+        let tabbed = compose_pre_tool_use(status, Path::new("/work/repo\tname"), None)
+            .expect("a ready index speaks");
+        assert!(
+            tabbed.contains("repo\tname"),
+            "a tab is spacing and stays: {tabbed:?}"
+        );
+        let ordinary = compose_pre_tool_use(status, Path::new("/work/ordinary"), None)
+            .expect("a ready index speaks");
+        assert!(
+            ordinary.contains("DevMap has ordinary indexed"),
+            "an ordinary name is not rewritten: {ordinary:?}"
+        );
+        assert!(
+            !ordinary.contains("\\u"),
+            "an ordinary name has nothing to escape: {ordinary:?}"
+        );
+    }
+
+    /// Every breaking character is escaped, and every other character is kept.
+    /// A fixed set stands in for a fuzzer: the function is total over `char`.
+    #[test]
+    fn context_line_keeps_text_and_escapes_every_break() {
+        let samples = [
+            "",
+            "a",
+            "a\nb",
+            "a\r\nb",
+            "\n",
+            "\u{2028}",
+            "a\tb",
+            "a\u{0000}b",
+            "é\n",
+            "repo name",
+        ];
+        for sample in samples {
+            let out = context_line(sample);
+            assert!(
+                !out.chars().any(context_breaks_a_line),
+                "{sample:?} still breaks a line: {out:?}"
+            );
+            for character in sample
+                .chars()
+                .filter(|character| !context_breaks_a_line(*character))
+            {
+                assert!(
+                    out.contains(character),
+                    "{sample:?} dropped {character:?}: {out:?}"
+                );
+            }
+        }
+    }
+
+    /// A non-Unicode directory name has no `to_str`. The indexed path uses the
+    /// fallback rather than a lossy spelling; the unindexed notice still has
+    /// to escape a newline byte inside that name.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_directory_name_does_not_open_a_hook_line() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let name = OsStr::from_bytes(b"a\xff\nb");
+        let root = Path::new("/work").join(name);
+        assert_eq!(
+            repo_context_label(&root, "repo"),
+            "repo",
+            "a non-Unicode name is the fallback, not a lossy spelling"
+        );
+        let shown = unindexed_context_name(&root);
+        assert!(
+            !shown.contains('\n'),
+            "the lossy notice still contains a raw newline: {shown:?}"
+        );
+        assert!(
+            shown.contains("\\u000a"),
+            "the newline byte must be escaped: {shown:?}"
+        );
+        assert!(shown.contains('a') && shown.contains('b'), "{shown:?}");
     }
 
     /// Cursor `preToolUse` blocks the tool on a schema mismatch. Emitting
