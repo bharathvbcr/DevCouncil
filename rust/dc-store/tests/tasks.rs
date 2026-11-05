@@ -4,12 +4,12 @@
 //! `work_items`, `blocked` is derived from gaps, and the legacy `tasks` table is
 //! archived into items by a migration that can be repeated and interrupted.
 
-use dc_store::{AcquireRequest, ReadyMode, SCHEMA_VERSION, Store, StoreError, schema};
+use dc_store::{schema, AcquireRequest, ReadyMode, Store, StoreError, SCHEMA_VERSION};
 use rusqlite::Connection;
 use std::path::Path;
 
 mod support;
-use support::{LEGACY_TASKS, dcstore, item_request, plant, plant_db, seeded, temp_dir};
+use support::{dcstore, item_request, plant, plant_db, seeded, temp_dir, LEGACY_TASKS};
 
 fn put(store: &Store, id: &str, scope: &str) -> Result<String, dc_store::workbench::Error> {
     store.ensure_local_repository().unwrap();
@@ -313,11 +313,9 @@ fn ready_order_is_priority_then_position_then_id_and_a_bad_mode_is_refused() {
     let bad = dcstore(&db, &["ready", "--mode", "permissive"]);
     assert_ne!(bad.code, 0, "a mistyped mode was honoured: {}", bad.stdout);
     // No mode is the strict one.
-    assert!(
-        dcstore(&db, &["ready"])
-            .stdout
-            .contains(r#""mode":"enforce""#)
-    );
+    assert!(dcstore(&db, &["ready"])
+        .stdout
+        .contains(r#""mode":"enforce""#));
 }
 
 #[test]
@@ -744,13 +742,11 @@ fn an_older_reader_fails_closed_and_a_newer_one_migrates() {
     // reviews) are such builds.
     drop(Store::open(&path).unwrap());
     for older in [9, SCHEMA_VERSION - 1] {
-        assert!(
-            schema::ensure_schema_version(&conn, older)
-                .unwrap_err()
-                .contains(&format!(
-                    "unsupported DevCouncil schema version {SCHEMA_VERSION}"
-                ))
-        );
+        assert!(schema::ensure_schema_version(&conn, older)
+            .unwrap_err()
+            .contains(&format!(
+                "unsupported DevCouncil schema version {SCHEMA_VERSION}"
+            )));
     }
     // This build refuses what is newer than it, and leaves it untouched.
     conn.execute(
@@ -828,6 +824,66 @@ fn stamped_version(conn: &Connection) -> i64 {
         |r| r.get(0),
     )
     .unwrap()
+}
+
+#[test]
+fn a_colliding_item_id_does_not_keep_the_workbench_upgrade() {
+    let path = temp_dir("tasks-collide").join("state.sqlite");
+    {
+        let store = Store::open(&path).unwrap();
+        store.upgrade_workbench_profile().unwrap();
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("UPDATE work_meta SET version = 13", [])
+            .unwrap();
+        conn.execute_batch(LEGACY_TASKS).unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, title, description) VALUES ('COLLIDE', 'legacy', 'still here')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO work_repositories (id, revision, body) VALUES ('other-repo', 1, '{\"identity_key\":\"other-repo-key\",\"name\":\"other\"}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO work_items (id, revision, body, primary_repository_id) VALUES ('COLLIDE', 1, '{\"title\":\"taken\",\"description\":\"\",\"status\":\"ready\"}', 'other-repo')",
+            [],
+        )
+        .unwrap();
+        let version: i64 = conn
+            .query_row("SELECT version FROM work_meta WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 13);
+    }
+    let refused = Store::open(&path).expect_err("a colliding id must refuse the open");
+    match refused {
+        StoreError::Workbench { message, .. } => {
+            assert!(
+                message.contains("already belongs to repository other-repo"),
+                "{message}"
+            );
+        }
+        other => panic!("want a workbench refusal, got {other}"),
+    }
+    let conn = Connection::open(&path).unwrap();
+    let version: i64 = conn
+        .query_row("SELECT version FROM work_meta WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        version, 13,
+        "ensure_schema committed the upgrade before the collision rolled back"
+    );
+    let held: String = conn
+        .query_row("SELECT id FROM tasks", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(held, "COLLIDE");
 }
 
 #[test]

@@ -388,23 +388,32 @@ fn current_version(conn: &Connection) -> Result<i64> {
 }
 
 /// Builds a profile that does not exist yet and migrates it to
-/// [`WORKBENCH_SCHEMA`] inside one immediate transaction. A second creator
-/// waits on the busy timeout, then finds the finished schema and creates
-/// nothing. Returns whether this call created it.
-fn create_profile(conn: &Connection) -> Result<bool> {
+/// [`WORKBENCH_SCHEMA`]. When `own_transaction` is set, that work is one
+/// immediate transaction: a second creator waits on the busy timeout, then
+/// finds the finished schema and creates nothing. When it is not, the caller
+/// already holds the transaction and this function does not commit, so a
+/// later refusal rolls the new profile back with everything else.
+/// Returns whether this call created it.
+fn create_profile(conn: &Connection, own_transaction: bool) -> Result<bool> {
+    let build = |conn: &Connection| -> Result<bool> {
+        if work_meta_version(conn)?.is_some() {
+            return Ok(false);
+        }
+        conn.execute_batch(SCHEMA)?;
+        let mut version = current_version(conn)?;
+        while version < WORKBENCH_SCHEMA {
+            migrate_step(conn, version)?;
+            version = current_version(conn)?;
+        }
+        Ok(true)
+    };
+    if !own_transaction {
+        return build(conn);
+    }
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    if work_meta_version(conn)?.is_some() {
-        tx.commit()?;
-        return Ok(false);
-    }
-    conn.execute_batch(SCHEMA)?;
-    let mut version = current_version(conn)?;
-    while version < WORKBENCH_SCHEMA {
-        migrate_step(conn, version)?;
-        version = current_version(conn)?;
-    }
+    let created = build(conn)?;
     tx.commit()?;
-    Ok(true)
+    Ok(created)
 }
 
 /// One schema step, `from` to `from + 1`. Runs inside the caller's transaction.
@@ -488,12 +497,30 @@ fn migrate_step(conn: &Connection, from: i64) -> Result<()> {
 }
 
 fn ensure_schema(conn: &Connection, may_upgrade: bool) -> Result<UpgradeReport> {
+    ensure_schema_in(conn, may_upgrade, true)
+}
+
+/// The same steps as [`ensure_schema`], run inside the caller's transaction.
+/// `PRAGMA foreign_keys` and `VACUUM INTO` are illegal inside a transaction,
+/// so the caller does both before `BEGIN`. Migrate steps and a profile this
+/// call creates are not committed here.
+fn ensure_schema_within(conn: &Connection, may_upgrade: bool) -> Result<UpgradeReport> {
+    ensure_schema_in(conn, may_upgrade, false)
+}
+
+fn ensure_schema_in(
+    conn: &Connection,
+    may_upgrade: bool,
+    own_transaction: bool,
+) -> Result<UpgradeReport> {
     let mut report = UpgradeReport {
         from: 0,
         to: WORKBENCH_SCHEMA,
         backup: None,
     };
-    conn.pragma_update(None, "foreign_keys", true)?;
+    if own_transaction {
+        conn.pragma_update(None, "foreign_keys", true)?;
+    }
     let foreign_keys: bool = conn.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
     if !foreign_keys {
         return Err(Error {
@@ -503,10 +530,11 @@ fn ensure_schema(conn: &Connection, may_upgrade: bool) -> Result<UpgradeReport> 
     }
     // A profile this call creates holds nothing to protect and has nothing to
     // refuse: it is built and brought to the current schema whoever asked.
-    // `create_profile` does both in one transaction, so no other handle can
-    // observe a half-migrated profile and mistake it for a stale one.
+    // With its own transaction, no other handle can observe a half-migrated
+    // profile and mistake it for a stale one. Inside the caller's transaction
+    // the same steps roll back with that transaction.
     let created = if work_meta_version(conn)?.is_none() {
-        create_profile(conn)?
+        create_profile(conn, own_transaction)?
     } else {
         false
     };
@@ -527,19 +555,29 @@ fn ensure_schema(conn: &Connection, may_upgrade: bool) -> Result<UpgradeReport> 
                 ),
             });
         }
-        report.backup = backup_before_upgrade(conn, version)?;
+        // VACUUM INTO cannot run inside a transaction. A caller that already
+        // holds one took the backup before BEGIN.
+        if own_transaction {
+            report.backup = backup_before_upgrade(conn, version)?;
+        }
     }
-    // An existing profile moves one step per transaction, re-reading the
-    // version under the write lock so a concurrent upgrader's step is not
-    // repeated.
+    // An existing profile moves one step per transaction when this call owns
+    // them, re-reading the version under the write lock so a concurrent
+    // upgrader's step is not repeated. Inside the caller's transaction the
+    // steps share it and commit only when that caller commits.
     while version < WORKBENCH_SCHEMA {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        version = current_version(conn)?;
-        if version < WORKBENCH_SCHEMA {
+        if own_transaction {
+            let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+            version = current_version(conn)?;
+            if version < WORKBENCH_SCHEMA {
+                migrate_step(conn, version)?;
+                version = current_version(conn)?;
+            }
+            tx.commit()?;
+        } else {
             migrate_step(conn, version)?;
             version = current_version(conn)?;
         }
-        tx.commit()?;
     }
     if version != WORKBENCH_SCHEMA {
         return Err(Error {
@@ -547,7 +585,7 @@ fn ensure_schema(conn: &Connection, may_upgrade: bool) -> Result<UpgradeReport> 
             message: format!("workbench schema {version} is not supported"),
         });
     }
-    ensure_index(conn, MEMBER_INDEX, MEMBER_INDEX_SQL)?;
+    ensure_index(conn, MEMBER_INDEX, MEMBER_INDEX_SQL, own_transaction)?;
     Ok(report)
 }
 
@@ -560,7 +598,7 @@ const MEMBER_INDEX_SQL: &str =
 
 /// Creates `name` when missing. Looked up first so opening an indexed profile
 /// takes no write lock; created under an immediate transaction otherwise.
-fn ensure_index(conn: &Connection, name: &str, create: &str) -> Result<()> {
+fn ensure_index(conn: &Connection, name: &str, create: &str, own_transaction: bool) -> Result<()> {
     let present = || -> Result<bool> {
         Ok(conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1)",
@@ -569,6 +607,10 @@ fn ensure_index(conn: &Connection, name: &str, create: &str) -> Result<()> {
         )?)
     };
     if present()? {
+        return Ok(());
+    }
+    if !own_transaction {
+        conn.execute_batch(create)?;
         return Ok(());
     }
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
