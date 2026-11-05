@@ -87,6 +87,40 @@ fn a_planned_binary_path_with_no_hunk_is_not_clean() {
 }
 
 #[test]
+fn a_backslash_binary_name_is_scanned_at_that_spelling() {
+    let root = Root::new();
+    let key = secret();
+    std::fs::write(root.0.join("src/ok.rs"), "pub fn ok() -> u8 { 1 }\n").unwrap();
+    std::fs::create_dir_all(root.0.join("assets")).unwrap();
+    // The slash twin is clean. A scan that normalizes `\` to `/` before
+    // opening reads this file and reports the binary path clean.
+    std::fs::write(root.0.join("assets").join("blob.bin"), b"clean\n").unwrap();
+    let spelled = "assets\\blob.bin";
+    std::fs::write(root.0.join(spelled), format!("\0{key}\0")).unwrap();
+    let quoted = spelled.replace('\\', "\\\\");
+    let diff = format!(
+        "{TEXT}diff --git \"a/{quoted}\" \"b/{quoted}\"\nBinary files \"a/{quoted}\" and \"b/{quoted}\" differ\n"
+    );
+    let reply = check(&root.0, &format!("src/ok.rs\n{spelled}"), &diff);
+    assert!(
+        reply.contains("\"ok\":true"),
+        "the check did not run: {reply}"
+    );
+    assert!(
+        reply.contains("\"gate\":\"secret_scan\""),
+        "backslash binary path was not secret-scanned: {reply}"
+    );
+    assert!(
+        reply.contains("assets\\\\blob.bin"),
+        "finding path is not the diff's spelling: {reply}"
+    );
+    assert!(
+        !reply.contains(&key),
+        "the reply quotes the credential in full"
+    );
+}
+
+#[test]
 fn adv_key_past_the_probe_is_not_clean() {
     let root = Root::new();
     let key = secret();

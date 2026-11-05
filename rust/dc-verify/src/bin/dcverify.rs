@@ -441,18 +441,24 @@ fn scan_binary_paths(
             ));
             continue;
         };
-        let normalized = normalize_candidate(&parsed.path);
+        // Scope membership uses the normalized spelling, which is what planned
+        // paths are stored as. The file that is opened, and the path on the
+        // finding, stay the diff's own spelling: on Unix `assets\blob.bin` is
+        // a different file from `assets/blob.bin`, and normalizing before the
+        // open scanned the slash file and reported it clean.
+        let spelled = &parsed.path;
+        let normalized = normalize_candidate(spelled);
         if !in_scope.iter().any(|p| p == &normalized) {
             continue;
         }
         if !parsed.added_lines.is_empty() {
             continue;
         }
-        match read_binary_post_image(root, &normalized) {
+        match read_binary_post_image(root, spelled) {
             Ok(text) => {
-                scan_binary_text(&normalized, &text, findings, degraded);
+                scan_binary_text(spelled, &text, findings, degraded);
             }
-            Err(reason) => degraded.push(binary_scan_skipped(&normalized, &reason)),
+            Err(reason) => degraded.push(binary_scan_skipped(spelled, &reason)),
         }
     }
 }

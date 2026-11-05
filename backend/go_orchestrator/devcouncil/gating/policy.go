@@ -24,6 +24,11 @@ var HardSafetyGapTypes = map[string]struct{}{
 	// executor for. Like a skipped command, nothing checked it; advisory mode
 	// demoting it would turn "not examined" into "passed".
 	"unsupported_verification_method": {},
+	// A required criterion that was not discharged, and a required review that
+	// was not recorded. Same class as a method with no executor: advisory and
+	// warn must not report the run verified because the proof is absent.
+	"acceptance_criteria_unproven": {},
+	"llm_review_unproven":          {},
 }
 
 // IsHardSafetyGap reports whether a gap type is in the hard-safety set.

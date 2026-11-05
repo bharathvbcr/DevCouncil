@@ -16,4 +16,12 @@ func TestHardSafety(t *testing.T) {
 	if !gating.MayDemote("coarse_acceptance_proof", true) {
 		t.Fatal("soft gaps may demote")
 	}
+	for _, kind := range []string{"acceptance_criteria_unproven", "llm_review_unproven"} {
+		if !gating.IsHardSafetyGap(kind) {
+			t.Fatalf("%s is not hard-safety", kind)
+		}
+		if gating.MayDemote(kind, true) {
+			t.Fatalf("must not demote %s", kind)
+		}
+	}
 }

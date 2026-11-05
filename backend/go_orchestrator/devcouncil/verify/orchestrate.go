@@ -317,6 +317,17 @@ func StatusFromGaps(gaps []Gap, gateMode string) (status string, passed bool) {
 	return "verified", true
 }
 
+// verdictReasons is the degraded_reasons list Verdict would put on the
+// payload for this run. Nil becomes an empty list so the stored JSON is an
+// array whether or not there was a reason.
+func verdictReasons(gaps []Gap, meta runMeta) []string {
+	_, _, reasons := Verdict(gaps, meta)
+	if reasons == nil {
+		return []string{}
+	}
+	return reasons
+}
+
 func verificationSkipped(gateMode string) bool {
 	mode := strings.TrimSpace(strings.ToLower(gateMode))
 	switch mode {
@@ -744,9 +755,13 @@ func Persist(ctx context.Context, client *store.Client, taskID string, gaps []Ga
 		"gate_mode_error":      meta.GateError,
 		"rigor_applied":        rigorApplied,
 		"rigor_skipped_reason": meta.RigorSkippedReason,
-		"degraded_reasons":     meta.DegradedReasons,
-		"gap_count":            len(stored),
-		"blocking_gap_count":   blocking,
+		// The payload's reasons, not the raw meta list. Verdict adds the
+		// synthetic advisory sentence for a demoted test_failed, and that is
+		// what ToMCP reports. Storing only meta.DegradedReasons left the
+		// record without the reason the caller was shown.
+		"degraded_reasons":   verdictReasons(gaps, meta),
+		"gap_count":          len(stored),
+		"blocking_gap_count": blocking,
 	})
 	if err != nil {
 		return fmt.Errorf("run-record: %w", err)
