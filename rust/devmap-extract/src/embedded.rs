@@ -513,9 +513,24 @@ fn take_template_expression(
         unparsed.push(node_range);
         return;
     }
-    let inner = crate::treesitter::extract_treesitter_with_budget(
-        file_path, language, &expr.body, remaining,
-    );
+    // `{` here is an object literal (`:class="{ active: isActive }"`). The
+    // statement grammar reads a leading `{` as a block, and a quoted key
+    // then fails, so the file would be Partial over JavaScript it accepts.
+    // The parentheses are not in the file. Spans are rebased by that byte.
+    let parenthesized = expr.body.starts_with('{');
+    let owned;
+    let source: &str = if parenthesized {
+        owned = format!("({})", expr.body);
+        owned.as_str()
+    } else {
+        owned = String::new();
+        expr.body.as_str()
+    };
+    let mut inner =
+        crate::treesitter::extract_treesitter_with_budget(file_path, language, source, remaining);
+    if parenthesized {
+        rebase_parenthesized_expression(&mut inner, expr.body.len());
+    }
     if record_template_parse(
         extraction,
         inner,
@@ -526,6 +541,66 @@ fn take_template_expression(
         diagnostics,
     ) {
         *parsed += 1;
+    }
+}
+
+/// Drop the one parenthesis added around an object literal.
+///
+/// Spans in `inner` are relative to `({body})`. Callers shift by the body's
+/// start in the file, so a span must be relative to `body` before that.
+/// A range that lands only on a parenthesis is the wrapper, not the file.
+fn rebase_parenthesized_expression(inner: &mut Extraction, body_len: usize) {
+    const PREFIX: usize = 1;
+    let rebase = |start: usize, end: usize| -> (usize, usize) {
+        let start = start.saturating_sub(PREFIX);
+        let end = end.saturating_sub(PREFIX).min(body_len);
+        (start.min(end), end)
+    };
+    let rebase_span = |span: &mut Span| {
+        let (start, end) = rebase(span.start_byte, span.end_byte);
+        span.start_byte = start;
+        span.end_byte = end;
+    };
+    for symbol in &mut inner.symbols {
+        rebase_span(&mut symbol.span);
+    }
+    for import in &mut inner.imports {
+        rebase_span(&mut import.span);
+    }
+    for call in &mut inner.calls {
+        rebase_span(&mut call.span);
+    }
+    for reference in &mut inner.references {
+        rebase_span(&mut reference.span);
+    }
+    for route in &mut inner.routes {
+        rebase_span(&mut route.span);
+    }
+    for export in &mut inner.exports {
+        rebase_span(&mut export.span);
+    }
+    for fact in &mut inner.js_objects {
+        fact.start_byte = fact.start_byte.saturating_sub(PREFIX).min(body_len);
+    }
+    for binding in &mut inner.local_bindings {
+        binding.start_byte = binding.start_byte.saturating_sub(PREFIX).min(body_len);
+    }
+    if let ParseOutcome::Partial {
+        error_ranges,
+        nameless_ranges,
+    } = &mut inner.parse_outcome
+    {
+        for ranges in [error_ranges, nameless_ranges] {
+            ranges.retain(|range| {
+                range.end_byte > PREFIX && range.start_byte.saturating_sub(PREFIX) < body_len
+            });
+            for range in ranges.iter_mut() {
+                let (start, end) = rebase(range.start_byte, range.end_byte);
+                range.start_byte = start;
+                range.end_byte = end;
+            }
+            ranges.retain(|range| range.start_byte < range.end_byte);
+        }
     }
 }
 
@@ -644,7 +719,13 @@ fn js_expression_body(node: Node, source: &str) -> Option<JsExpr> {
     while j > i && bytes[j - 1].is_ascii_whitespace() {
         j -= 1;
     }
-    if i < j && bytes[i] == b'{' && bytes[j - 1] == b'}' {
+    // Svelte `{...}` nodes include the delimiter braces. Vue interpolation
+    // text and a directive value do not: their `{` is the object itself.
+    let delimiters = matches!(
+        node.kind(),
+        "expression" | "raw_text_expr" | "svelte_raw_text"
+    );
+    if delimiters && i < j && bytes[i] == b'{' && bytes[j - 1] == b'}' {
         i += 1;
         j -= 1;
         while i < j && bytes[i].is_ascii_whitespace() {

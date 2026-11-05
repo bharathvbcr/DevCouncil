@@ -615,6 +615,101 @@ fn a_broken_template_expression_does_not_leave_the_file_clean() {
     );
 }
 
+/// Vue `{{ }}` and a quoted directive do not include a Svelte-style wrapper
+/// brace. The `{` in `:class="{ active: isActive }"` is the object. Reading it
+/// as a statement block, or peeling it off, marks a well-formed file Partial.
+#[test]
+fn a_vue_object_binding_stays_clean() {
+    let source = "<template>\n\
+        <div :class=\"{ active: isActive, 'text-danger': hasError }\"></div>\n\
+        <p :style=\"{ color: activeColor, fontSize: fontSize + 'px' }\"></p>\n\
+        <p>{{ { label: title } }}</p>\n\
+        </template>\n";
+    let extraction = extract_file("Bind.vue", source);
+    assert!(
+        matches!(extraction.parse_outcome, ParseOutcome::Clean),
+        "a Vue object binding must stay Clean: {:?} {:?}",
+        extraction.parse_outcome,
+        extraction.diagnostics
+    );
+    for name in ["isActive", "hasError", "activeColor", "fontSize", "title"] {
+        let span = extraction
+            .references
+            .iter()
+            .find(|reference| reference.name == name)
+            .map(|reference| &reference.span)
+            .or_else(|| {
+                extraction
+                    .calls
+                    .iter()
+                    .find(|call| call.callee_name == name)
+                    .map(|call| &call.span)
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "{name} must be read from the object, refs {:?} calls {:?}",
+                    extraction
+                        .references
+                        .iter()
+                        .map(|reference| reference.name.as_str())
+                        .collect::<Vec<_>>(),
+                    extraction
+                        .calls
+                        .iter()
+                        .map(|call| call.callee_name.as_str())
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            source.get(span.start_byte..span.end_byte),
+            Some(name),
+            "{name} must slice the outer file, not the parenthesis added for the parser"
+        );
+    }
+
+    let broken = extract_file(
+        "BrokenBind.vue",
+        "<template>\n<div :class=\"{ active: broken( }\"></div>\n</template>\n",
+    );
+    assert!(
+        matches!(broken.parse_outcome, ParseOutcome::Partial { .. }),
+        "a broken object binding is still not Clean: {:?}",
+        broken.parse_outcome
+    );
+
+    let svelte = extract_file(
+        "Bind.svelte",
+        "<button onclick={{ active: isActive, 'text-danger': hasError }}>Go</button>\n",
+    );
+    assert!(
+        matches!(svelte.parse_outcome, ParseOutcome::Clean),
+        "a Svelte object handler must stay Clean: {:?} {:?}",
+        svelte.parse_outcome,
+        svelte.diagnostics
+    );
+    let svelte_span = svelte
+        .references
+        .iter()
+        .find(|reference| reference.name == "isActive")
+        .map(|reference| reference.span.clone())
+        .or_else(|| {
+            svelte
+                .calls
+                .iter()
+                .find(|call| call.callee_name == "isActive")
+                .map(|call| call.span.clone())
+        });
+    let svelte_source =
+        "<button onclick={{ active: isActive, 'text-danger': hasError }}>Go</button>\n";
+    assert_eq!(
+        svelte_span
+            .as_ref()
+            .and_then(|span| { svelte_source.get(span.start_byte..span.end_byte) }),
+        Some("isActive"),
+        "the Svelte object must slice isActive out of the file: {svelte_span:?}"
+    );
+}
+
 /// The registry is the single authority for what may be embedded where.
 ///
 /// Liquid's `LanguageSpec.embedded` names `html`, `javascript` and `css`; it
