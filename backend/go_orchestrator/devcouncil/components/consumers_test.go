@@ -221,10 +221,75 @@ func TestStrictConsumersFailsTheInstallWhenTheCheckCouldNotRun(t *testing.T) {
 func TestStrictConsumersPassesWhenEveryPresentReaderMatches(t *testing.T) {
 	needNode(t)
 	t.Setenv(GitPulseRootEnv, "")
-	src, _ := siblings(t, `console.log(JSON.stringify({ ok: true, owner: { store: 27, dcStore: 10, workbench: 14 }, devcouncil: "x",
-  rows: [{ reader: "devmap (PATH)", verdict: "match", detail: "devmap store 27" }], summary: "OK: 1 match" }))`)
+	src, _ := siblings(t, matchingConsumerScript)
 	if code, _, stderr := installWithChecker(t, src, "--strict-consumers"); code != 0 {
 		t.Fatalf("exit %d\n%s", code, stderr)
+	}
+}
+
+// matchingConsumerScript is a parity check whose only present reader matches.
+const matchingConsumerScript = `console.log(JSON.stringify({ ok: true, owner: { store: 27, dcStore: 10, workbench: 14 }, devcouncil: "x",
+  rows: [{ reader: "devmap (PATH)", verdict: "match", detail: "devmap store 27" }], summary: "OK: 1 match" }))`
+
+// installReceipt is the --json body a caller trusts in place of the exit code.
+type installReceipt struct {
+	OK        bool `json:"ok"`
+	Consumers struct {
+		Checked bool `json:"checked"`
+		OK      bool `json:"ok"`
+	} `json:"consumers"`
+}
+
+func mustInstallReceipt(t *testing.T, stdout string) installReceipt {
+	t.Helper()
+	var receipt installReceipt
+	if err := json.Unmarshal([]byte(stdout), &receipt); err != nil {
+		t.Fatalf("--json printed non-JSON: %v\n%s", err, stdout)
+	}
+	return receipt
+}
+
+func TestStrictConsumersJSONReportsNotOKOnAStaleConsumer(t *testing.T) {
+	needNode(t)
+	t.Setenv(GitPulseRootEnv, "")
+	src, _ := siblings(t, staleScript)
+	code, stdout, stderr := installWithChecker(t, src, "--json", "--strict-consumers")
+	if code != 1 {
+		t.Fatalf("exit %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	receipt := mustInstallReceipt(t, stdout)
+	if receipt.OK {
+		t.Fatalf("strict failure printed ok true:\n%s", stdout)
+	}
+	if !receipt.Consumers.Checked || receipt.Consumers.OK {
+		t.Fatalf("consumers = %+v\n%s", receipt.Consumers, stdout)
+	}
+}
+
+func TestStrictConsumersJSONReportsNotOKWhenTheCheckCouldNotRun(t *testing.T) {
+	t.Setenv(GitPulseRootEnv, "")
+	src, _ := siblings(t, "")
+	code, stdout, stderr := installWithChecker(t, src, "--json", "--strict-consumers")
+	if code != 1 || !strings.Contains(stderr, "--strict-consumers") {
+		t.Fatalf("exit %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	receipt := mustInstallReceipt(t, stdout)
+	if receipt.OK || receipt.Consumers.Checked {
+		t.Fatalf("an unrun strict check printed %+v\n%s", receipt, stdout)
+	}
+}
+
+func TestStrictConsumersJSONReportsOKWhenEveryPresentReaderMatches(t *testing.T) {
+	needNode(t)
+	t.Setenv(GitPulseRootEnv, "")
+	src, _ := siblings(t, matchingConsumerScript)
+	code, stdout, stderr := installWithChecker(t, src, "--json", "--strict-consumers")
+	if code != 0 {
+		t.Fatalf("exit %d\n%s", code, stderr)
+	}
+	receipt := mustInstallReceipt(t, stdout)
+	if !receipt.OK || !receipt.Consumers.Checked || !receipt.Consumers.OK {
+		t.Fatalf("a passing strict check printed %+v\n%s", receipt, stdout)
 	}
 }
 

@@ -108,6 +108,11 @@ func runInstall(args []string, base Options) int {
 		for _, c := range cs {
 			ids = append(ids, c.ID)
 		}
+		// `ok` is the receipt a caller trusts. --strict-consumers fails the
+		// run when the check did not pass, so the receipt says that before
+		// it is written. A non-strict install that only lags stays ok: the
+		// owner installs anyway, and the exit code stays 0.
+		ok := installErr == nil && !(a.strictConsumers && !consumers.Passed())
 		receipt := struct {
 			OK         bool            `json:"ok"`
 			DryRun     bool            `json:"dry_run"`
@@ -115,7 +120,7 @@ func runInstall(args []string, base Options) int {
 			Commands   []string        `json:"commands,omitempty"`
 			Error      string          `json:"error,omitempty"`
 			Consumers  *ConsumerReport `json:"consumers"`
-		}{OK: installErr == nil, DryRun: dry, Components: ids, Consumers: &consumers}
+		}{OK: ok, DryRun: dry, Components: ids, Consumers: &consumers}
 		if dry {
 			receipt.Commands = PlannedCommands(cs, opts)
 		}
