@@ -720,7 +720,7 @@ fn unindexed_worktree_notice(payload: &Value, executable: &Path) -> Option<Value
              the background failed ({}). Run `devmap build` here to enable devmap_* queries; \
              until then they cannot answer, and an empty result is not evidence that a symbol \
              is absent.",
-            truncate(&error.to_string(), 120)
+            context_line(&truncate(&error.to_string(), 120))
         ),
         None => format!(
             "{name}: no DevMap index in this working tree. Run `devmap build` here to enable \
@@ -3375,6 +3375,78 @@ mod tests {
             "SessionStart plaintext interpolated the directory name raw: {rendered:?}"
         );
         let _ = fs::remove_dir_all(&parent);
+    }
+
+    /// A linked worktree whose detach fails reports that failure in the same
+    /// SessionStart line. The lock path is the worktree path, so a newline in
+    /// the directory name is inside the error (`lock dir {}` / `record lock
+    /// owner in {}`). Truncating that error is not enough: the break is near
+    /// the front of a short path and would still open a second line.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_detach_does_not_put_a_newline_from_the_lock_dir_into_the_notice() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = PathBuf::from(format!(
+            "/tmp/devmap-hook-detach-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&parent);
+        struct Tidy(PathBuf);
+        impl Drop for Tidy {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _tidy = Tidy(parent.clone());
+
+        let main = parent.join("main");
+        let gitdir = main.join(".git/worktrees/lane");
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::create_dir_all(main.join(".devcouncil/codeintel")).unwrap();
+        fs::write(main.join(".devcouncil/codeintel/devmap.sqlite"), b"x").unwrap();
+        fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+
+        let root = parent.join("lane\nname");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        // Not writable, so creating the coalesce lock fails with an error that
+        // names the lock path. AlreadyExists would coalesce instead of failing.
+        let codeintel = root.join(".devcouncil/codeintel");
+        fs::create_dir_all(&codeintel).unwrap();
+        fs::set_permissions(&codeintel, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let payload = json!({ "cwd": &root });
+        let notice = unindexed_worktree_notice(&payload, Path::new("devmap"))
+            .expect("a linked unindexed worktree is named");
+        let text = notice
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .expect("additionalContext");
+        assert!(
+            text.contains("background failed"),
+            "detach must fail so the error arm runs: {text:?}"
+        );
+        assert!(
+            !text.contains('\n') && !text.contains('\r'),
+            "the detach error interpolated a line break raw: {text:?}"
+        );
+        assert!(
+            text.contains("lane\\u000aname/.devcouncil"),
+            "the lock path's newline must be escaped, not dropped: {text:?}"
+        );
+        assert!(text.contains("lane") && text.contains("name"), "{text:?}");
+        let host = json!({ "hook_event_name": "SessionStart", "session_id": "s" });
+        let rendered =
+            render_host_stdout(HookEvent::SessionStart, &host, &notice).expect("plaintext");
+        assert!(
+            !rendered.contains("lane\nname"),
+            "SessionStart plaintext interpolated the lock path raw: {rendered:?}"
+        );
     }
 
     /// CR, Unicode line separators, and the next-line control are line breaks
