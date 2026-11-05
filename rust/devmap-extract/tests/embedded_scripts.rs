@@ -481,6 +481,140 @@ fn a_script_block_that_does_not_parse_makes_the_file_partial() {
     );
 }
 
+/// A template expression is not a `<script>` element. The outer grammar accepts
+/// the attribute as text, so a file whose only fault is `() => broken(` used to
+/// stay `Clean`: the inner failure was dropped and never reached
+/// `fold_unparsed_ranges`.
+#[test]
+fn a_broken_template_expression_does_not_leave_the_file_clean() {
+    let cases = [
+        (
+            "Broken.svelte",
+            "<button onclick={() => broken(}>Go</button>\n",
+        ),
+        (
+            "Broken.vue",
+            "<template>\n<button onclick={() => broken(}>Go</button>\n</template>\n",
+        ),
+    ];
+    for (path, source) in cases {
+        let extraction = extract_file(path, source);
+        let ParseOutcome::Partial { error_ranges, .. } = &extraction.parse_outcome else {
+            panic!(
+                "{path} must not stay Clean, got {:?}",
+                extraction.parse_outcome
+            );
+        };
+        let marker = source
+            .find("() => broken(")
+            .expect("the fixture contains the broken expression");
+        let marker_end = marker + "() => broken(".len();
+        assert!(
+            error_ranges
+                .iter()
+                .any(|range| { range.start_byte < marker_end && range.end_byte > marker }),
+            "{path} must record the broken expression, got ranges {:?} diagnostics {:?}",
+            error_ranges
+                .iter()
+                .map(|range| {
+                    (
+                        range.start_byte,
+                        range.end_byte,
+                        source.get(range.start_byte..range.end_byte),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            extraction.diagnostics
+        );
+    }
+
+    // Vue's grammar keeps `{{ }}` and a quoted directive as text. `onclick={() =>`
+    // is a different shape: `>` inside the unquoted value can make the outer
+    // grammar Partial on its own, so it does not prove this walk ran.
+    let vue_source = "<template>\n\
+         <p class=\"fine\">{{ broken( }}</p>\n\
+         <button @click=\"() => also(\">Go</button>\n\
+         <p>{{ copyText(name) }}</p>\n\
+         </template>\n";
+    let vue = extract_file("Expr.vue", vue_source);
+    let ParseOutcome::Partial { error_ranges, .. } = &vue.parse_outcome else {
+        panic!(
+            "Vue must not stay Clean over an unread expression, got {:?}",
+            vue.parse_outcome
+        );
+    };
+    for marker in ["broken(", "also("] {
+        let start = vue_source.find(marker).expect(marker);
+        let end = start + marker.len();
+        assert!(
+            error_ranges
+                .iter()
+                .any(|range| range.start_byte < end && range.end_byte > start),
+            "Vue did not record {marker}: {error_ranges:?} {:?}",
+            vue.diagnostics
+        );
+    }
+    assert!(
+        vue.calls.iter().any(|call| call.callee_name == "copyText"),
+        "a later Vue interpolation is still a call: {:?}",
+        vue.calls
+    );
+
+    let vue_ok = "<template>\n\
+         <p class=\"not js (\">{{ ok() }}</p>\n\
+         <button @click=\"() => send()\">Go</button>\n\
+         </template>\n";
+    let vue_good = extract_file("Ok.vue", vue_ok);
+    assert!(
+        matches!(vue_good.parse_outcome, ParseOutcome::Clean),
+        "a well-formed Vue expression stays Clean, and a plain attribute is not one: {:?}",
+        vue_good.parse_outcome
+    );
+    assert!(
+        vue_good.calls.iter().any(|call| call.callee_name == "ok"),
+        "{{{{ ok() }}}} must be a call: {:?}",
+        vue_good.calls
+    );
+    assert!(
+        vue_good.calls.iter().any(|call| call.callee_name == "send"),
+        "@click must be a call: {:?}",
+        vue_good.calls
+    );
+
+    let good = extract_file("Ok.svelte", "<button onclick={() => ok()}>Go</button>\n");
+    assert!(
+        matches!(good.parse_outcome, ParseOutcome::Clean),
+        "a well-formed expression stays Clean: {:?}",
+        good.parse_outcome
+    );
+    assert!(
+        good.calls.iter().any(|call| call.callee_name == "ok"),
+        "a well-formed expression is still a call: {:?}",
+        good.calls
+    );
+
+    // The walk must not stop at the broken expression: the handler after it
+    // was still parsed, and the file still says the broken one was not clean.
+    let mixed = extract_file(
+        "Mixed.svelte",
+        "<button onclick={() => broken(}>Go</button>\n\
+         <button onclick={() => copyText(name)}>Go</button>\n",
+    );
+    assert!(
+        matches!(mixed.parse_outcome, ParseOutcome::Partial { .. }),
+        "a later valid handler does not make the broken one Clean: {:?}",
+        mixed.parse_outcome
+    );
+    assert!(
+        mixed
+            .calls
+            .iter()
+            .any(|call| call.callee_name == "copyText"),
+        "the handler after a broken expression is still a call: {:?}",
+        mixed.calls
+    );
+}
+
 /// The registry is the single authority for what may be embedded where.
 ///
 /// Liquid's `LanguageSpec.embedded` names `html`, `javascript` and `css`; it
