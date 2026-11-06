@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -114,6 +115,14 @@ func TestWarmMCPHelperProcess(t *testing.T) {
 			})
 
 		case "tools/call":
+			if mode == "hang-first" && mcpSpawnNum == 1 {
+				// Alive, reading nothing, answering nothing: a hung server.
+				time.Sleep(time.Hour)
+			}
+			if mode == "die-on-call" {
+				_, _ = os.Stderr.WriteString("boom\n")
+				os.Exit(3)
+			}
 			if mode == "binary-replaced-once" && mcpSpawnNum == 1 {
 				writeJSON(map[string]any{
 					"jsonrpc": "2.0",
@@ -438,5 +447,109 @@ func TestWarmMCPLiveContractMatchesCLI(t *testing.T) {
 	}
 	if err := ValidateAdvancedResult(QueryExplore, adv); err != nil {
 		t.Fatalf("ValidateAdvancedResult: %v", err)
+	}
+}
+
+// mcpPids lists the pids of the helper `mcp` processes in spawn order.
+func mcpPids(t *testing.T, countFile string) []int {
+	t.Helper()
+	raw, err := os.ReadFile(countFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pids []int
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		tag, pid, ok := strings.Cut(line, ":")
+		if !ok || tag != "mcp" {
+			continue
+		}
+		var n int
+		if _, err := fmt.Sscanf(pid, "%d", &n); err == nil {
+			pids = append(pids, n)
+		}
+	}
+	return pids
+}
+
+func waitPidGone(t *testing.T, pid int, within time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); err == syscall.ESRCH {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return syscall.Kill(pid, 0) == syscall.ESRCH
+}
+
+func TestWarmMCPHungServerIsRestarted(t *testing.T) {
+	root := t.TempDir()
+	countFile := filepath.Join(t.TempDir(), "spawns.log")
+	bin := writeWarmHelperWrapper(t, "hang-first", root, countFile)
+
+	c := NewWarm(bin, root)
+	c.Timeout = 750 * time.Millisecond
+	defer c.Close()
+
+	_, err := c.Search(WithCall(context.Background()), "Alpha")
+	if err == nil || !strings.Contains(err.Error(), "deadline exceeded") {
+		t.Fatalf("call 1 must return a deadline error, got %v", err)
+	}
+	c.Timeout = 10 * time.Second
+	found, err := c.Search(WithCall(context.Background()), "Alpha")
+	if err != nil {
+		t.Fatalf("call 2 must succeed on a fresh process, got %v", err)
+	}
+	if len(found.Items) != 1 {
+		t.Fatalf("unexpected items: %+v", found.Items)
+	}
+	pids := mcpPids(t, countFile)
+	if len(pids) != 2 {
+		t.Fatalf("expected a second mcp process, got pids %v", pids)
+	}
+	if !waitPidGone(t, pids[0], 3*time.Second) {
+		t.Fatalf("hung server pid %d is still alive", pids[0])
+	}
+}
+
+func TestWarmMCPOwnerContextCancelKillsProcess(t *testing.T) {
+	root := t.TempDir()
+	countFile := filepath.Join(t.TempDir(), "spawns.log")
+	bin := writeWarmHelperWrapper(t, "ok", root, countFile)
+
+	owner, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := New(bin, root)
+	c.EnableWarmMCPContext(owner)
+	defer c.Close()
+
+	if _, err := c.Search(WithCall(context.Background()), "Alpha"); err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	pids := mcpPids(t, countFile)
+	if len(pids) != 1 {
+		t.Fatalf("expected one mcp process, got %v", pids)
+	}
+	cancel()
+	if !waitPidGone(t, pids[0], 2*time.Second) {
+		t.Fatalf("mcp pid %d survived cancellation of its owner context", pids[0])
+	}
+}
+
+func TestWarmMCPSessionDeathCarriesStderr(t *testing.T) {
+	root := t.TempDir()
+	countFile := filepath.Join(t.TempDir(), "spawns.log")
+	bin := writeWarmHelperWrapper(t, "die-on-call", root, countFile)
+
+	c := NewWarm(bin, root)
+	defer c.Close()
+
+	_, err := c.Search(WithCall(context.Background()), "Alpha")
+	if err == nil {
+		t.Fatal("expected an error from a server that exits mid-call")
+	}
+	if !strings.Contains(err.Error(), "boom") || !strings.Contains(err.Error(), "exit status 3") {
+		t.Fatalf("error must carry the exit status and the stderr tail, got %v", err)
 	}
 }

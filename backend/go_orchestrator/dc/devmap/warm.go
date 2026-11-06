@@ -44,10 +44,30 @@ const (
 
 // EnableWarmMCP switches this client onto a persistent `devmap mcp` stdio
 // session (`P0.3`). Call Close when the client is no longer needed.
+//
+// The process outlives any single call, so with no owner it lives until Close.
+// Prefer EnableWarmMCPContext, which ties it to a caller's lifetime.
 func (c *Client) EnableWarmMCP() {
+	c.EnableWarmMCPContext(context.Background())
+}
+
+// EnableWarmMCPContext is EnableWarmMCP with an owner: the warm `devmap mcp`
+// process is a child of ctx, and cancelling ctx closes the session and kills
+// the process group. Only the first owner is kept; a client has one lifetime.
+func (c *Client) EnableWarmMCPContext(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	c.warmMu.Lock()
 	c.warmEnabled = true
+	register := c.ownerCtx == nil
+	if register {
+		c.ownerCtx = ctx
+	}
 	c.warmMu.Unlock()
+	if register && ctx.Done() != nil {
+		context.AfterFunc(ctx, func() { _ = c.Close() })
+	}
 }
 
 // WarmSession returns a client backed by a warm `devmap mcp` stdio session for
@@ -62,7 +82,11 @@ func (c *Client) WarmSession() *Client {
 	shared := c.warmEnabled
 	c.warmMu.Unlock()
 
-	return &Client{
+	c.warmMu.Lock()
+	owner := c.ownerCtx
+	c.warmMu.Unlock()
+
+	child := &Client{
 		Binary:       c.Binary,
 		Root:         c.Root,
 		Timeout:      c.Timeout,
@@ -73,7 +97,12 @@ func (c *Client) WarmSession() *Client {
 		warmEnabled:  true,
 		warmShared:   shared,
 		probeParent:  c,
+		ownerCtx:     owner,
 	}
+	if !shared && owner != nil && owner.Done() != nil {
+		context.AfterFunc(owner, func() { _ = child.Close() })
+	}
+	return child
 }
 
 // Close terminates any warm `devmap mcp` subprocess owned by this client.
@@ -121,7 +150,7 @@ type mcpSession struct {
 	waitDone chan struct{}
 }
 
-func startMCPSession(ctx context.Context, binary, root string, maxOut, maxErr int) (*mcpSession, error) {
+func startMCPSession(ctx, owner context.Context, binary, root string, maxOut, maxErr int) (*mcpSession, error) {
 	if binary == "" {
 		return nil, errors.New("no devmap binary configured")
 	}
@@ -136,7 +165,10 @@ func startMCPSession(ctx context.Context, binary, root string, maxOut, maxErr in
 	}
 	maxFrame := max(maxOut, warmMinMaxFrameBytes)
 
-	procCtx, procCancel := context.WithCancel(context.Background())
+	if owner == nil {
+		owner = context.Background()
+	}
+	procCtx, procCancel := context.WithCancel(owner)
 	cmd := exec.CommandContext(procCtx, binary, "--root", root, "mcp")
 	proc.ConfigureGroup(cmd)
 	cmd.Dir = root
@@ -183,12 +215,23 @@ func startMCPSession(ctx context.Context, binary, root string, maxOut, maxErr in
 		waitDone:   make(chan struct{}),
 	}
 
+	// One goroutine owns the process's end of life, in this order: read stdout
+	// to EOF, reap the child, then fail what is pending. Failing on the bare EOF
+	// reported "EOF" before the exit status and stderr were knowable.
 	go func() {
+		readErr := sess.readLoop(stdout)
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			// A protocol failure while the child may still be running: tell the
+			// callers now, then stop the child so Wait cannot block forever.
+			sess.failAll(readErr)
+			if cmd.Process != nil {
+				proc.KillGroupWithEscalation(cmd.Process.Pid, 500*time.Millisecond)
+			}
+		}
 		waitErr := cmd.Wait()
-		sess.failAll(waitErr)
+		sess.failAll(sess.deathError(waitErr))
 		close(sess.waitDone)
 	}()
-	go sess.readLoop(stdout)
 
 	hsCtx, hsCancel := context.WithTimeout(ctx, warmHandshakeTimeout)
 	defer hsCancel()
@@ -196,6 +239,9 @@ func startMCPSession(ctx context.Context, binary, root string, maxOut, maxErr in
 		_ = sess.close()
 		if errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return nil, ctx.Err()
+		}
+		if tail := sess.stderrTail(); tail != "" {
+			return nil, fmt.Errorf("%w: %v (stderr: %s)", errWarmUnsupported, err, tail)
 		}
 		return nil, fmt.Errorf("%w: %v", errWarmUnsupported, err)
 	}
@@ -336,22 +382,61 @@ func (s *mcpSession) isAlive() bool {
 	return !s.closed
 }
 
-func (s *mcpSession) readLoop(r io.Reader) {
+// readLoop dispatches frames until stdout ends and returns why it ended
+// (io.EOF for a plain close). It never fails the session itself for an end of
+// stream: the exit status is not known yet.
+func (s *mcpSession) readLoop(r io.Reader) error {
 	br := bufio.NewReaderSize(r, 64<<10)
 	for {
 		line, overflowed, err := readBoundedLine(br, s.maxFrame)
 		if overflowed {
-			s.failAll(errCapped)
-			return
+			return errCapped
 		}
 		if len(line) > 0 {
 			s.dispatchLine(line)
 		}
 		if err != nil {
-			s.failAll(err)
-			return
+			return err
 		}
 	}
+}
+
+// warmStderrTail is how much of the child's stderr an error carries.
+const warmStderrTail = 2 << 10
+
+// stderrTail is the last bytes the child wrote to stderr, flattened to one
+// printable line, for inclusion in an error. Empty when it wrote nothing.
+func (s *mcpSession) stderrTail() string {
+	if s.stderr == nil {
+		return ""
+	}
+	raw := s.stderr.Bytes()
+	if len(raw) > warmStderrTail {
+		raw = raw[len(raw)-warmStderrTail:]
+	}
+	text := strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' {
+			return ' '
+		}
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, string(raw))
+	return strings.TrimSpace(text)
+}
+
+// deathError is what a session that ended on its own reports: the exit status
+// and the stderr tail, wrapping io.EOF when the child exited cleanly.
+func (s *mcpSession) deathError(waitErr error) error {
+	cause := waitErr
+	if cause == nil {
+		cause = io.EOF
+	}
+	if tail := s.stderrTail(); tail != "" {
+		return fmt.Errorf("devmap mcp ended: %w (stderr: %s)", cause, tail)
+	}
+	return fmt.Errorf("devmap mcp ended: %w", cause)
 }
 
 func readBoundedLine(br *bufio.Reader, limit int) ([]byte, bool, error) {
@@ -535,6 +620,12 @@ func (c *Client) decodeWarmMCP(ctx context.Context, into any, timeout time.Durat
 			c.dropWarmSession(sess)
 			continue
 		}
+		// The call's own deadline expired (the caller's context is intact) and
+		// the server never answered: it is hung, not slow. Kill it, so the
+		// next call starts a fresh process instead of queueing behind it.
+		if ctx.Err() == nil && errors.Is(callCtx.Err(), context.DeadlineExceeded) {
+			c.dropWarmSession(sess)
+		}
 		return true, callErr
 	}
 	return false, nil
@@ -569,7 +660,7 @@ func (c *Client) getOrStartWarmSession(ctx context.Context) (*mcpSession, error)
 	if c.warm != nil && c.warm.isAlive() {
 		return c.warm, nil
 	}
-	sess, err := startMCPSession(ctx, c.Binary, c.Root, c.maxOutput, c.maxStderr)
+	sess, err := startMCPSession(ctx, c.ownerCtx, c.Binary, c.Root, c.maxOutput, c.maxStderr)
 	if err != nil {
 		return nil, err
 	}
@@ -666,6 +757,9 @@ func (c *Client) callWarmTool(
 			return false, fmt.Errorf("devmap %s failed: %w", cliCmd, errCapped)
 		}
 		if ctx.Err() != nil {
+			if tail := sess.stderrTail(); tail != "" {
+				return false, fmt.Errorf("devmap %s timed out or cancelled: %w (stderr: %s)", cliCmd, ctx.Err(), tail)
+			}
 			return false, fmt.Errorf("devmap %s timed out or cancelled: %w", cliCmd, ctx.Err())
 		}
 		// If the child died unexpectedly between calls, allow one clean restart.

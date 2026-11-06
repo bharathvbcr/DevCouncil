@@ -81,6 +81,9 @@ type Client struct {
 	warmShared   bool
 	warm         *mcpSession
 	probeParent  *Client
+	// ownerCtx bounds the warm process's lifetime: it is the parent of the
+	// process context, and its cancellation closes the session.
+	ownerCtx context.Context
 }
 
 // The probe's bounds and the failure cooldown. Every devmap build reports the
