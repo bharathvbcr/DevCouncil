@@ -4,8 +4,8 @@ use devmap_query::freshness::InventoryLimits;
 use devmap_query::{
     freshness, generate_code_graph_encodings, generate_manifest_with_edges,
     resolve_manifest_output, resolved_edge_from_stored, write_code_graph_atomically,
-    write_manifest_atomically, ArtifactStamp, FreshnessInfo, StampedFreshness,
-    CODE_GRAPH_SCHEMA_VERSION,
+    write_manifest_atomically, write_verbose_code_graph_atomically, ArtifactStamp, FreshnessInfo,
+    StampedFreshness, CODE_GRAPH_SCHEMA_VERSION,
 };
 use devmap_store::Store;
 
@@ -405,7 +405,7 @@ pub(crate) fn write_consumer_artifacts(
     ensure_parent(&dest)?;
     write_manifest_atomically(&dest, &json_str, request.force)?;
     ensure_parent(&graph_dest)?;
-    write_code_graph_atomically(&graph_dest, &graph_json, request.force)?;
+    write_verbose_code_graph_atomically(&graph_dest, &graph_json, request.force)?;
     // Written through the same clobber guard as the verbose artifact. A foreign
     // file at this path is refused for the same reason: the guard's question is
     // "did this kernel write what is already here", and the answer does not
