@@ -42,6 +42,7 @@ fn nested(depth: usize) -> PdgStatement {
             taint_sinks: Vec::new(),
             kind: PdgStatementKind::Loop {
                 body: vec![statement],
+                else_body: Vec::new(),
             },
         };
     }

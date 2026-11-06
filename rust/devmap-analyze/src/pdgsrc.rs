@@ -490,6 +490,19 @@ mod parsing {
         }
     }
 
+    /// The `else` of a `for`, `while`, or `try`. The grammar spells it
+    /// `else_clause` and names its block `body`, which [`body_of`] already reads.
+    /// Absent means there is no suite, not an empty one that still runs.
+    fn else_suite(node: Node, bytes: &[u8], depth: usize) -> Result<Vec<PdgStatement>, SkipReason> {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "else_clause" {
+                return body_of(child, bytes, depth);
+            }
+        }
+        Ok(Vec::new())
+    }
+
     fn statement(node: Node, bytes: &[u8], depth: usize) -> Result<PdgStatement, SkipReason> {
         let line = line_of(node);
         let mut facts = Facts::default();
@@ -555,6 +568,7 @@ mod parsing {
                 }
                 PdgStatementKind::Loop {
                     body: body_of(node, bytes, depth)?,
+                    else_body: else_suite(node, bytes, depth)?,
                 }
             }
             "while_statement" => {
@@ -563,6 +577,7 @@ mod parsing {
                 }
                 PdgStatementKind::Loop {
                     body: body_of(node, bytes, depth)?,
+                    else_body: else_suite(node, bytes, depth)?,
                 }
             }
             "try_statement" => {
@@ -601,6 +616,7 @@ mod parsing {
                 PdgStatementKind::Try {
                     body: body_of(node, bytes, depth)?,
                     handlers,
+                    else_body: else_suite(node, bytes, depth)?,
                     finally_body,
                 }
             }
@@ -1192,6 +1208,167 @@ mod tests {
             crate::pdg::build_function_pdg(&pdg)
                 .unwrap_or_else(|error| panic!("{source} must build: {error}"));
         }
+    }
+
+    /// A1-1: `for`/`while` kept only the body, and `try` dropped `else_clause`.
+    /// A sink Python runs only in that suite was absent from `--taint`, which
+    /// lists `FunctionPdgInput::taint_sinks`.
+    #[test]
+    fn a_sink_that_runs_only_in_an_else_suite_is_recorded() {
+        // (label, source, tainted name, line the else is entered at, sink line, edge)
+        let cases = [
+            (
+                "for-else",
+                "def f(c):\n    for _ in range(1):\n        pass\n    else:\n        os.system(c)\n",
+                "c",
+                5,
+                5,
+                "control:false",
+            ),
+            (
+                "while-else",
+                "def f(c):\n    while False:\n        pass\n    else:\n        os.system(c)\n",
+                "c",
+                5,
+                5,
+                "control:false",
+            ),
+            (
+                "try-else",
+                "def f(c):\n    try:\n        pass\n    except Exception:\n        pass\n    else:\n        os.system(c)\n",
+                "c",
+                7,
+                7,
+                "control:else",
+            ),
+            (
+                "for-else-crlf",
+                "def f(c):\r\n    for _ in range(1):\r\n        pass\r\n    else:\r\n        os.system(c)\r\n",
+                "c",
+                5,
+                5,
+                "control:false",
+            ),
+            (
+                "nested-else",
+                "def f(c):\n    try:\n        for _ in range(1):\n            pass\n        else:\n            pass\n    except Exception:\n        pass\n    else:\n        eval(c)\n",
+                "c",
+                10,
+                10,
+                "control:else",
+            ),
+            (
+                "unicode-name",
+                "def f(名前):\n    for _ in range(1):\n        pass\n    else:\n        os.system(名前)\n",
+                "名前",
+                5,
+                5,
+                "control:false",
+            ),
+            (
+                "sink-not-first",
+                "def f(c):\n    while False:\n        pass\n    else:\n        x = 1\n        os.system(c)\n",
+                "c",
+                5,
+                6,
+                "control:false",
+            ),
+        ];
+        for (label, source, variable, entry_line, sink_line, edge_kind) in cases {
+            let mut extracted = python_function_pdgs(source, "m.py", 1, 7);
+            assert!(
+                extracted.parse == ParseStatus::Ok && extracted.functions.len() == 1,
+                "{label} did not parse: {extracted:#?}\n{source}"
+            );
+            let pdg = extracted.functions.remove(0);
+            let sinks = sink_variables(&pdg);
+            assert!(
+                sinks.contains(&variable.to_string()),
+                "{label} dropped the else sink: {source} -> {sinks:?}"
+            );
+            let graph = crate::pdg::build_function_pdg(&pdg)
+                .unwrap_or_else(|error| panic!("{label} must build: {error}"));
+            let entered = graph.nodes.values().find(|node| {
+                node.leader_line == entry_line
+                    && graph
+                        .edges
+                        .iter()
+                        .any(|edge| edge.target_node == node.id && edge.edge_kind == edge_kind)
+            });
+            assert!(
+                entered.is_some(),
+                "{label} else suite was not entered at line {entry_line} by {edge_kind}: {:#?}",
+                graph.edges
+            );
+            assert!(
+                graph
+                    .nodes
+                    .values()
+                    .any(|node| node.leader_line == sink_line),
+                "{label} has no node at the sink line {sink_line}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_else_records_no_sink_and_a_returning_try_skips_the_else_node() {
+        let empty =
+            only("def f(c):\n    for _ in range(1):\n        pass\n    else:\n        pass\n");
+        assert!(sink_variables(&empty).is_empty(), "{empty:#?}");
+
+        // `try`/`else` without `except` is a Python syntax error. The else
+        // here is real, and the body's return means that suite never runs.
+        let skipped = only(
+            "def f(c):\n    try:\n        return c\n    except Exception:\n        pass\n    else:\n        os.system(c)\n",
+        );
+        assert!(
+            sink_variables(&skipped).contains(&"c".to_string()),
+            "the suite is still in the source, so --taint still names it: {skipped:#?}"
+        );
+        let graph = crate::pdg::build_function_pdg(&skipped).expect("build");
+        assert!(
+            !graph
+                .edges
+                .iter()
+                .any(|edge| edge.edge_kind == "control:else"),
+            "a try whose body returns never enters its else: {:#?}",
+            graph.edges
+        );
+    }
+
+    #[test]
+    fn an_exception_edge_does_not_leave_the_else_for_this_try() {
+        let pdg = only(
+            "def f(c):\n    try:\n        pass\n    except Exception:\n        return c\n    else:\n        os.system(c)\n",
+        );
+        let graph = crate::pdg::build_function_pdg(&pdg).expect("build");
+        let else_node = graph
+            .nodes
+            .values()
+            .find(|node| node.leader_line == 7)
+            .expect("else sink");
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| { edge.target_node == else_node.id && edge.edge_kind == "control:else" }));
+        assert!(
+            !graph.edges.iter().any(|edge| {
+                edge.source_node == else_node.id && edge.edge_kind == "control:exception"
+            }),
+            "this try's handlers do not cover its else: {:#?}",
+            graph.edges
+        );
+    }
+
+    #[test]
+    fn a_broken_else_does_not_panic() {
+        let extracted = python_function_pdgs(
+            "def f(c):\n    for x in y\n    else:\n        os.system(c)\n",
+            "odd 'quote' 名前.py",
+            1,
+            7,
+        );
+        assert_ne!(extracted.parse, ParseStatus::Ok, "{extracted:#?}");
     }
 
     #[test]

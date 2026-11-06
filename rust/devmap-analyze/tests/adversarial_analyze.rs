@@ -85,7 +85,10 @@ fn a_statement_tree_deeper_than_the_bound_is_refused_rather_than_overflowing() {
                 definitions: Vec::new(),
                 uses: Vec::new(),
                 taint_sinks: Vec::new(),
-                kind: PdgStatementKind::Loop { body },
+                kind: PdgStatementKind::Loop {
+                    body,
+                    else_body: Vec::new(),
+                },
             }];
         }
         body
@@ -139,17 +142,30 @@ fn a_statement_tree_deeper_than_the_bound_is_refused_rather_than_overflowing() {
         ("Try/body", |body| PdgStatementKind::Try {
             body,
             handlers: Vec::new(),
+            else_body: Vec::new(),
             finally_body: Vec::new(),
         }),
         ("Try/handler", |body| PdgStatementKind::Try {
             body: Vec::new(),
             handlers: vec![body],
+            else_body: Vec::new(),
+            finally_body: Vec::new(),
+        }),
+        ("Try/else", |body| PdgStatementKind::Try {
+            body: Vec::new(),
+            handlers: Vec::new(),
+            else_body: body,
             finally_body: Vec::new(),
         }),
         ("Try/finally", |body| PdgStatementKind::Try {
             body: Vec::new(),
             handlers: Vec::new(),
+            else_body: Vec::new(),
             finally_body: body,
+        }),
+        ("Loop/else", |body| PdgStatementKind::Loop {
+            body: Vec::new(),
+            else_body: body,
         }),
     ] {
         let mut body = vec![PdgStatement {

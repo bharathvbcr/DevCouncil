@@ -661,6 +661,53 @@ fn pdg_function_names(answer: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
+/// A1-1: a sink that Python runs only in a for-else, while-else, or try-else
+/// suite used to be absent, and `--taint` then dropped the function.
+#[test]
+fn pdg_taint_lists_a_sink_that_runs_only_in_an_else_suite() {
+    for (label, source, sink) in [
+        (
+            "for-else",
+            "def f(c):\n    for _ in range(1):\n        pass\n    else:\n        os.system(c)\n",
+            "5:c",
+        ),
+        (
+            "while-else",
+            "def f(c):\n    while False:\n        pass\n    else:\n        os.system(c)\n",
+            "5:c",
+        ),
+        (
+            "try-else",
+            "def f(c):\n    try:\n        pass\n    except Exception:\n        pass\n    else:\n        os.system(c)\n",
+            "7:c",
+        ),
+        (
+            "unicode-else",
+            "def f(名前):\n    for _ in range(1):\n        pass\n    else:\n        os.system(名前)\n",
+            "5:名前",
+        ),
+    ] {
+        let answer = pdg_json(label, source, &["--taint"]);
+        assert_eq!(answer["complete"], serde_json::json!(true), "{label} {answer:#}");
+        let names = pdg_function_names(&answer);
+        assert!(
+            names.iter().any(|name| name.ends_with("::f")),
+            "{label} dropped the function: {answer:#}"
+        );
+        let listed: Vec<&str> = answer["functions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|row| row["taint_sinks"].as_array().into_iter().flatten())
+            .filter_map(|value| value.as_str())
+            .collect();
+        assert!(
+            listed.contains(&sink),
+            "{label} missing {sink} in {listed:?} from {answer:#}"
+        );
+    }
+}
+
 /// devmap-query-03: a sink in a `return` operand was invisible, and `--taint`
 /// drops every function with no recorded sink, so this function vanished.
 #[test]

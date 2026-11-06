@@ -145,10 +145,19 @@ pub enum PdgStatementKind {
     },
     Loop {
         body: Vec<PdgStatement>,
+        /// The `else` suite. Python runs it when the loop finishes without
+        /// `break`. Empty when the source has no else, which keeps a loop
+        /// that never had one on the same false edge it had before.
+        #[serde(default)]
+        else_body: Vec<PdgStatement>,
     },
     Try {
         body: Vec<PdgStatement>,
         handlers: Vec<Vec<PdgStatement>>,
+        /// The `else` suite. Python runs it when the body finishes without
+        /// raising. An exception here is not caught by this `try`'s handlers.
+        #[serde(default)]
+        else_body: Vec<PdgStatement>,
         finally_body: Vec<PdgStatement>,
     },
     Return,
@@ -184,14 +193,19 @@ impl FunctionPdgInput {
                         }
                         pending.push(else_body);
                     }
-                    PdgStatementKind::Loop { body } => pending.push(body),
+                    PdgStatementKind::Loop { body, else_body } => {
+                        pending.push(body);
+                        pending.push(else_body);
+                    }
                     PdgStatementKind::Try {
                         body,
                         handlers,
+                        else_body,
                         finally_body,
                     } => {
                         pending.push(body);
                         pending.extend(handlers.iter().map(Vec::as_slice));
+                        pending.push(else_body);
                         pending.push(finally_body);
                     }
                     PdgStatementKind::Basic
@@ -447,7 +461,7 @@ impl<'a> PdgBuilder<'a> {
                     out.absorb(self.build_sequence(else_body, vec![otherwise], inner)?);
                     out
                 }
-                PdgStatementKind::Loop { body } => {
+                PdgStatementKind::Loop { body, else_body } => {
                     let body_flow = self.build_sequence(
                         body,
                         vec![Incoming {
@@ -459,19 +473,39 @@ impl<'a> PdgBuilder<'a> {
                     for tail in body_flow.normal {
                         self.add_control(&tail.node, &node, "control:loop");
                     }
-                    Flow {
-                        normal: vec![Incoming {
+                    // An empty else leaves the false edge on the header, which
+                    // is the exit a loop without an else already had. A present
+                    // else is that exit: it runs when the iterator is exhausted
+                    // or the condition is false, and not when the body returns.
+                    let else_flow = self.build_sequence(
+                        else_body,
+                        vec![Incoming {
                             node,
                             edge_kind: "control:false",
                         }],
-                        abrupt: body_flow.abrupt,
+                        inner,
+                    )?;
+                    let mut abrupt = body_flow.abrupt;
+                    abrupt.extend(else_flow.abrupt);
+                    Flow {
+                        normal: else_flow.normal,
+                        abrupt,
                     }
                 }
                 PdgStatementKind::Try {
                     body,
                     handlers,
+                    else_body,
                     finally_body,
-                } => self.build_try(statement.line, node, body, handlers, finally_body, inner)?,
+                } => self.build_try(
+                    statement.line,
+                    node,
+                    body,
+                    handlers,
+                    else_body,
+                    finally_body,
+                    inner,
+                )?,
             };
             flow.normal = after.normal;
             flow.abrupt.extend(after.abrupt);
@@ -499,6 +533,7 @@ impl<'a> PdgBuilder<'a> {
         header: String,
         body: &[PdgStatement],
         handlers: &[Vec<PdgStatement>],
+        else_body: &[PdgStatement],
         finally_body: &[PdgStatement],
         inner: usize,
     ) -> anyhow::Result<Flow> {
@@ -511,10 +546,25 @@ impl<'a> PdgBuilder<'a> {
             }],
             inner,
         )?;
+        // Snapshot before the else. An exception raised in the else is not
+        // handled by this try's except clauses; only the body is.
+        let body_end = self.created.len();
+        if !else_body.is_empty() {
+            let entry = std::mem::take(&mut out.normal)
+                .into_iter()
+                .map(|source| Incoming {
+                    node: source.node,
+                    edge_kind: "control:else",
+                })
+                .collect();
+            let else_flow = self.build_sequence(else_body, entry, inner)?;
+            out.normal = else_flow.normal;
+            out.abrupt.extend(else_flow.abrupt);
+        }
         if handlers.is_empty() && finally_body.is_empty() {
             return Ok(out);
         }
-        let raisers = self.created[first_body_node..].to_vec();
+        let raisers = self.created[first_body_node..body_end].to_vec();
         let dispatch = self.add_node(line, CfgNodeKind::ExceptionDispatch, NodeFacts::default());
         for raiser in &raisers {
             self.add_control(raiser, &dispatch, "control:exception");
@@ -865,18 +915,21 @@ fn validate_statements(
                 }
                 validate_statements(else_body, start_line, end_line, inner, budget)?;
             }
-            PdgStatementKind::Loop { body } => {
+            PdgStatementKind::Loop { body, else_body } => {
                 validate_statements(body, start_line, end_line, inner, budget)?;
+                validate_statements(else_body, start_line, end_line, inner, budget)?;
             }
             PdgStatementKind::Try {
                 body,
                 handlers,
+                else_body,
                 finally_body,
             } => {
                 validate_statements(body, start_line, end_line, inner, budget)?;
                 for handler in handlers {
                     validate_statements(handler, start_line, end_line, inner, budget)?;
                 }
+                validate_statements(else_body, start_line, end_line, inner, budget)?;
                 validate_statements(finally_body, start_line, end_line, inner, budget)?;
             }
             PdgStatementKind::Basic | PdgStatementKind::Return | PdgStatementKind::Raise => {}
@@ -991,6 +1044,7 @@ mod tests {
                             &["value"],
                             PdgStatementKind::Basic,
                         )],
+                        else_body: Vec::new(),
                     },
                 ),
                 statement(
@@ -1000,6 +1054,7 @@ mod tests {
                     PdgStatementKind::Try {
                         body: vec![statement(17, &[], &["value"], PdgStatementKind::Basic)],
                         handlers: vec![vec![statement(18, &[], &["arg"], PdgStatementKind::Raise)]],
+                        else_body: Vec::new(),
                         finally_body: vec![statement(19, &[], &["value"], PdgStatementKind::Basic)],
                     },
                 ),
@@ -1077,6 +1132,7 @@ mod tests {
                             &["value"],
                             PdgStatementKind::Basic,
                         )],
+                        else_body: Vec::new(),
                     },
                 ),
                 sink,
@@ -1176,6 +1232,7 @@ mod tests {
                 PdgStatementKind::Try {
                     body: vec![statement(3, &[], &["arg"], PdgStatementKind::Return)],
                     handlers: vec![vec![statement(5, &[], &["arg"], PdgStatementKind::Raise)]],
+                    else_body: Vec::new(),
                     finally_body: vec![sink(7, "arg")],
                 },
             )],
@@ -1236,6 +1293,7 @@ mod tests {
                         statement(4, &[], &["value"], PdgStatementKind::Basic),
                     ],
                     handlers: vec![vec![sink(6, "value")]],
+                    else_body: Vec::new(),
                     finally_body: Vec::new(),
                 },
             )],
