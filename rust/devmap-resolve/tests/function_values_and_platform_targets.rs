@@ -232,9 +232,9 @@ fn go_platform_twins_fan_out_by_file_suffix_and_by_build_tag() {
     }
 }
 
-/// Known limit. `#[cfg(unix)]` and `#[cfg(windows)]` twins in one file get one
-/// qualified name, so they are one node identity and the call's single edge
-/// cannot say which it reached.
+/// `#[cfg]` twins keep their own qualified names, so each body's calls stay on
+/// that body. Resolution still has one identity: `run`'s call is one edge to
+/// the unsuffixed name, not a fan-out onto both copies.
 #[test]
 fn rust_cfg_twins_share_one_identity() {
     let source = "#[cfg(unix)]\nfn open() -> u32 { 1 }\n#[cfg(windows)]\nfn open() -> u32 { 2 }\n\
@@ -246,7 +246,16 @@ fn rust_cfg_twins_share_one_identity() {
         .filter(|symbol| symbol.kind == SymbolKind::Function && symbol.name == "open")
         .map(|symbol| symbol.qualified_name.as_str())
         .collect();
-    assert_eq!(twins, vec!["src/lib.rs::open", "src/lib.rs::open"]);
+    assert_eq!(twins.len(), 2, "{twins:?}");
+    assert!(twins.contains(&"src/lib.rs::open"), "{twins:?}");
+    assert!(
+        twins.iter().any(|name| {
+            name.strip_prefix("src/lib.rs::open@").is_some_and(|rest| {
+                !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        }),
+        "{twins:?}"
+    );
     let result = resolve(&[("src/lib.rs", source)]);
     assert_eq!(
         edges(&result, EdgeKind::Calls),

@@ -1,9 +1,10 @@
 //! Two `#[cfg]` variants of one method are one dead row.
 //!
 //! `ShutdownSignals::recv` is written once for unix and once for windows. The
-//! extractor emits both — each is a real declaration with its own span — and
-//! both carry one qualified name, which is one graph node with one set of
-//! callers. `devmap dead` listed that node twice.
+//! extractor emits both — each is a real declaration with its own span. The
+//! later copy's qualified name is suffixed so its calls stay on its own span,
+//! and the dead list still reports the unsuffixed name once. A parse error in
+//! either span exempts that one row. `devmap dead` used to list the node twice.
 
 use devmap_analyze::*;
 use devmap_extract::extract_file;
@@ -59,6 +60,10 @@ fn two_cfg_variants_of_an_uncalled_method_are_one_row() {
     assert_eq!(
         drain, 1,
         "a method with one declaration is still reported once"
+    );
+    assert!(
+        found.iter().all(|report| !report.symbol_name.contains('@')),
+        "a suffixed cfg copy is a second row: {found:?}"
     );
 }
 

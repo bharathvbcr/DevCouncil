@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct FileId(pub u32);
@@ -855,6 +855,31 @@ pub struct ExtractedSymbol {
     /// list of more than one type: `(T, error)` names no single value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub return_type: Option<String>,
+}
+
+/// Later `#[cfg]` copy of `base`, spelled `base@<start_byte>`.
+///
+/// The suffix is the marker only when it is a non-empty run of ASCII digits.
+/// Callers still require `base` to be another symbol's full qualified name in
+/// the same file, so a path segment that contains `@` is not stripped.
+pub fn cfg_copy_base(qualified_name: &str) -> Option<&str> {
+    let (base, suffix) = qualified_name.rsplit_once('@')?;
+    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(base)
+}
+
+/// The name resolution and the dead-row list use for a cfg copy.
+///
+/// The earliest body keeps `base`. A later body is `base@<digits>`. When `base`
+/// is also a symbol in this file, both are one function. A trailing `@` plus
+/// digits whose base is not in the file is a real name and stays as written.
+pub fn cfg_canonical<'a>(qualified_name: &'a str, names_in_file: &BTreeSet<&str>) -> &'a str {
+    match cfg_copy_base(qualified_name) {
+        Some(base) if names_in_file.contains(base) => base,
+        _ => qualified_name,
+    }
 }
 
 /// The `signature` a Swift member property carries: what separates it from the

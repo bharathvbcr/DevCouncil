@@ -1094,6 +1094,19 @@ pub(super) fn extract_treesitter_before_deadline(
                 // after one registry lookup for every language whose entry
                 // permits neither `css` nor `html` inside it.
                 crate::markup::merge_markup(&mut extraction, root, source, lang);
+                // After every symbol, call, and local exists, and before
+                // literals are attributed to the qualified name that contains
+                // them. Rust only. A deadline here refuses the file: the split
+                // is pure CPU on the walk's clock, and a partial rename is not
+                // a complete read.
+                if lang == "rust" && !super::cfg_copies::split_rust_cfg_copies(&mut extraction) {
+                    return refused_extraction(
+                        path,
+                        lang,
+                        source,
+                        over_budget("splitting cfg copies"),
+                    );
+                }
                 let (literals, mut notes) = crate::literals::index_literals(
                     root,
                     source,

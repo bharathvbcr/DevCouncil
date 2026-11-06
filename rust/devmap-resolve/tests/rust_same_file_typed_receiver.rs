@@ -194,8 +194,8 @@ pub fn t_p(r: &Repo) {
 
 #[test]
 fn a_cfg_duplicated_repo_in_one_file_still_binds_that_files_method() {
-    // Both cfg variants mint the one qualified name `Repo.zzwrite`, so the file
-    // has one answer; the namesake in b.rs is not it.
+    // The later cfg copy is suffixed. Resolution still targets the unsuffixed
+    // `Repo.zzwrite`, so the file has one answer; the namesake in b.rs is not it.
     let dup = "\
 #[cfg(unix)]
 pub struct Repo;
@@ -219,7 +219,9 @@ pub fn t_e() {
     let result = resolve(&[("src/e.rs", dup), ("src/b.rs", REPO_B)]);
     let e = write_calls(&result, "src/e.rs::t_e");
     assert!(
-        e.iter().all(|edge| edge.target_symbol == "src/e.rs::Repo.zzwrite") && !e.is_empty(),
+        e.iter()
+            .all(|edge| edge.target_symbol == "src/e.rs::Repo.zzwrite")
+            && !e.is_empty(),
         "{e:?}"
     );
 }
