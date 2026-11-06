@@ -36,7 +36,7 @@ step "1/8 format"
 cargo fmt --all -- --check
 
 step "2/8 clippy (-D warnings)"
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --locked --workspace --all-targets -- -D warnings
 
 # The host binary gate 3 needs, built the way the workflows build it.
 #
@@ -99,7 +99,7 @@ else
 fi
 
 step "3/8 tests"
-cargo test --workspace
+cargo test --locked --workspace
 
 if [ "$QUICK" -eq 1 ]; then
   echo "NOT RUN (quick mode): determinism, memory ceiling, growth plateau, incremental equivalence, mutation testing"

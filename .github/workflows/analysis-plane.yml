@@ -76,7 +76,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy -p dc-glob -p dc-proc -p dc-redact -p dc-grep -p dc-store -p dc-verify -p dc-evidence --all-targets -- -D warnings
+        run: cargo clippy --locked -p dc-glob -p dc-proc -p dc-redact -p dc-grep -p dc-store -p dc-verify -p dc-evidence --all-targets -- -D warnings
 
       # dc-store compiles SQLite from source (rusqlite "bundled"), so a failure
       # here is a C toolchain or portability problem rather than a test problem.
@@ -91,7 +91,7 @@ jobs:
       # dc-verify's stub detection links the Rust, Go, Python and TypeScript
       # grammars unconditionally.
       - name: Build
-        run: cargo build -p dc-glob -p dc-proc -p dc-redact -p dc-grep -p dc-store -p dc-verify -p dc-evidence --all-targets
+        run: cargo build --locked -p dc-glob -p dc-proc -p dc-redact -p dc-grep -p dc-store -p dc-verify -p dc-evidence --all-targets
 
       # dc-verify's json_contract runs the host's `--json` commands as real
       # processes and fails if it cannot find the binary. The module's only
@@ -108,7 +108,7 @@ jobs:
         run: go build -o bin/ ./cmd/devcouncil
 
       - name: Test
-        run: cargo test -p dc-glob -p dc-proc -p dc-redact -p dc-grep -p dc-store -p dc-verify -p dc-evidence --no-fail-fast
+        run: cargo test --locked -p dc-glob -p dc-proc -p dc-redact -p dc-grep -p dc-store -p dc-verify -p dc-evidence --no-fail-fast
 
   go:
     name: clients (${{ matrix.os }})
@@ -156,7 +156,7 @@ jobs:
       # trigger paths.
       - name: Build devmap
         working-directory: rust
-        run: cargo build -p devmap-cli --bin devmap
+        run: cargo build --locked -p devmap-cli --bin devmap
 
       - name: Put devmap on PATH
         run: echo "$GITHUB_WORKSPACE/rust/target/debug" >> "$GITHUB_PATH"
@@ -277,7 +277,7 @@ jobs:
         run: choco install sqlite --no-progress -y && sqlite3 --version
       - name: Build devmap
         working-directory: rust
-        run: cargo build -p devmap-cli --bin devmap
+        run: cargo build --locked -p devmap-cli --bin devmap
       - name: Put devmap on PATH
         shell: bash
         run: echo "$GITHUB_WORKSPACE/rust/target/debug" >> "$GITHUB_PATH"

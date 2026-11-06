@@ -115,17 +115,17 @@ jobs:
       # job does not compile tgrep-core; they are gated by analysis-plane.yml.
       - name: Clippy
         if: ${{ !cancelled() }}
-        run: cargo clippy --workspace --exclude dc-glob --exclude dc-proc --exclude dc-redact --exclude dc-grep --exclude dc-store --exclude dc-verify --exclude dc-evidence --all-targets --keep-going -- -D warnings
+        run: cargo clippy --locked --workspace --exclude dc-glob --exclude dc-proc --exclude dc-redact --exclude dc-grep --exclude dc-store --exclude dc-verify --exclude dc-evidence --all-targets --keep-going -- -D warnings
 
       # 22 tree-sitter grammars compile C. A build failure here is a real
       # portability failure, not a test failure, so it is a separate step.
       - name: Build
         if: ${{ !cancelled() }}
-        run: cargo build --workspace --exclude dc-glob --exclude dc-proc --exclude dc-redact --exclude dc-grep --exclude dc-store --exclude dc-verify --exclude dc-evidence --all-targets --keep-going
+        run: cargo build --locked --workspace --exclude dc-glob --exclude dc-proc --exclude dc-redact --exclude dc-grep --exclude dc-store --exclude dc-verify --exclude dc-evidence --all-targets --keep-going
 
       - name: Test
         if: ${{ !cancelled() }}
-        run: cargo test --workspace --exclude dc-glob --exclude dc-proc --exclude dc-redact --exclude dc-grep --exclude dc-store --exclude dc-verify --exclude dc-evidence --no-fail-fast
+        run: cargo test --locked --workspace --exclude dc-glob --exclude dc-proc --exclude dc-redact --exclude dc-grep --exclude dc-store --exclude dc-verify --exclude dc-evidence --no-fail-fast
 
       # cargo test --release still forces unwinding. This executable must use
       # the shipped profile or an aborting worker can pass every Rust test.
@@ -142,8 +142,8 @@ jobs:
           set -euo pipefail
           suffix=""
           if [[ "$RUNNER_OS" == "Windows" ]]; then suffix=".exe"; fi
-          cargo test -p devmap-cli --test it -- worktree_stress_support:: --nocapture
-          cargo build -p devmap-cli --example worktree_stress --example ipc_probe
+          cargo test --locked -p devmap-cli --test it -- worktree_stress_support:: --nocapture
+          cargo build --locked -p devmap-cli --example worktree_stress --example ipc_probe
           "target/debug/examples/worktree_stress$suffix" --binary "target/debug/devmap$suffix" --ipc-probe "target/debug/examples/ipc_probe$suffix" --worktrees 2 --fixture-files 4 --rounds 1 --build-workers 2 --output capacity-smoke.json
           "target/debug/examples/worktree_stress$suffix" --binary "target/debug/devmap$suffix" --ipc-probe "target/debug/examples/ipc_probe$suffix" --worktrees 128 --fixture-files 64 --rounds 4 --build-workers 8 --output capacity-native.json
       - uses: actions/upload-artifact@v7
@@ -215,8 +215,8 @@ jobs:
                        dc-glob dc-proc dc-redact dc-grep dc-store dc-verify dc-evidence \
                        dc-regress dc-regress-store devmap-serve devmap-cli; do
             echo "::group::$crate"
-            cargo check -p "$crate" --no-default-features --all-targets
-            cargo test -p "$crate" --no-default-features
+            cargo check --locked -p "$crate" --no-default-features --all-targets
+            cargo test --locked -p "$crate" --no-default-features
             echo "::endgroup::"
           done
 

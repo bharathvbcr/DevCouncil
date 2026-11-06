@@ -213,6 +213,249 @@ export function readWorkflows(dir) {
   return Object.fromEntries(workflowFiles(dir).map((n) => [n, readFileSync(path.join(dir, n), "utf8")]));
 }
 
+const LOCKED_VERBS = new Set(["build", "test", "check", "clippy"]);
+const MAX_SCAN_CHARS = 2_000_000;
+
+/**
+ * Cargo `build`, `test`, `check`, and `clippy` commands that omit `--locked`.
+ * The switch counts only as its own argument before a bare `--`. Comments,
+ * `cargo fmt`, `cargo run`, and `cargo mutants` are out of this contract.
+ * Backslash continuations are joined. A `run:` YAML prefix and one layer of
+ * surrounding quotes are unwrapped so a workflow line and a shell line share
+ * one scan.
+ *
+ * @param {string} text
+ * @param {string} label
+ * @returns {string[]}
+ */
+export function cargoStepsMissingLocked(text, label) {
+  if (typeof text !== "string" || typeof label !== "string" || label.length === 0) {
+    throw new TypeError("cargoStepsMissingLocked expects a string and a non-empty label");
+  }
+  if (text.length > MAX_SCAN_CHARS) {
+    throw new RangeError(`cargo script exceeds ${MAX_SCAN_CHARS} characters`);
+  }
+  const joined = text.replace(/\\\r?\n/g, " ");
+  const failures = [];
+  const lines = joined.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    for (const argv of shellCommands(unwrapRun(lines[i]))) {
+      const at = cargoIndex(argv);
+      if (at < 0) continue;
+      const verb = argv[at + 1];
+      if (!LOCKED_VERBS.has(verb)) continue;
+      const rest = argv.slice(at + 2);
+      const separator = rest.indexOf("--");
+      const args = separator === -1 ? rest : rest.slice(0, separator);
+      if (!args.includes("--locked")) {
+        failures.push(`${label}:${i + 1}: cargo ${verb} omits --locked`);
+      }
+    }
+  }
+  return failures;
+}
+
+/** @param {string} line */
+function unwrapRun(line) {
+  let script = line.replace(/\r$/, "").replace(/^\s*(?:-\s*)?run:\s*/, "").trim();
+  if (script.length >= 2) {
+    const quote = script[0];
+    if ((quote === '"' || quote === "'") && script.endsWith(quote)) script = script.slice(1, -1);
+  }
+  return script;
+}
+
+/** @param {string[]} argv */
+function cargoIndex(argv) {
+  let index = 0;
+  while (index < argv.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(argv[index])) index++;
+  while (index < argv.length && (argv[index] === "command" || argv[index] === "exec")) index++;
+  return argv[index] === "cargo" ? index : -1;
+}
+
+/**
+ * Simple commands in one shell line, including commands nested in `$()`
+ * and backticks. Quoted text is literal, except that double quotes still
+ * expand substitutions.
+ *
+ * @param {string} script
+ * @returns {string[][]}
+ */
+function shellCommands(script) {
+  /** @type {{ op?: boolean, value: string, nested?: string[] }[]} */
+  const tokens = [];
+  const length = script.length;
+  let index = 0;
+  while (index < length) {
+    const char = script[index];
+    if (char === " " || char === "\t" || char === "\r") {
+      index++;
+      continue;
+    }
+    if (char === "#") break;
+    if (char === "&" && script[index + 1] === "&") {
+      tokens.push({ op: true, value: "&&" });
+      index += 2;
+      continue;
+    }
+    if (char === "|" && script[index + 1] === "|") {
+      tokens.push({ op: true, value: "||" });
+      index += 2;
+      continue;
+    }
+    if (char === "|" || char === ";" || char === "&" || char === "(" || char === ")" || char === "{" || char === "}") {
+      tokens.push({ op: true, value: char });
+      index++;
+      continue;
+    }
+    if (char === "`") {
+      const end = script.indexOf("`", index + 1);
+      if (end < 0) {
+        tokens.push({ value: script.slice(index), nested: [script.slice(index + 1)] });
+        break;
+      }
+      tokens.push({ value: script.slice(index, end + 1), nested: [script.slice(index + 1, end)] });
+      index = end + 1;
+      continue;
+    }
+    if (char === "$" && script[index + 1] === "(") {
+      const end = matchingParen(script, index + 1);
+      if (end < 0) {
+        tokens.push({ value: script.slice(index), nested: [script.slice(index + 2)] });
+        break;
+      }
+      tokens.push({ value: script.slice(index, end + 1), nested: [script.slice(index + 2, end)] });
+      index = end + 1;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      const quoted = readQuoted(script, index);
+      const nested = char === '"' ? substitutions(quoted.value) : [];
+      tokens.push({ value: quoted.value, nested });
+      index = quoted.next;
+      continue;
+    }
+    let end = index;
+    while (end < length) {
+      const next = script[end];
+      if (" \t\r#|&;(){}`'".includes(next)) break;
+      if (next === "$" && script[end + 1] === "(") break;
+      if (next === "\\") {
+        end += end + 1 < length ? 2 : 1;
+        continue;
+      }
+      end++;
+    }
+    tokens.push({ value: unescapeWord(script.slice(index, end)) });
+    index = end;
+  }
+
+  /** @type {string[][]} */
+  const commands = [];
+  /** @type {string[]} */
+  let current = [];
+  const flush = () => {
+    if (current.length > 0) commands.push(current);
+    current = [];
+  };
+  for (const token of tokens) {
+    if (token.op) {
+      flush();
+      continue;
+    }
+    for (const inner of token.nested ?? []) {
+      for (const nested of shellCommands(inner)) commands.push(nested);
+    }
+    current.push(token.value);
+  }
+  flush();
+  return commands;
+}
+
+/** @param {string} script @param {number} openAt */
+function matchingParen(script, openAt) {
+  let depth = 0;
+  let index = openAt;
+  while (index < script.length) {
+    const char = script[index];
+    if (char === "'" || char === '"') {
+      index = readQuoted(script, index).next;
+      continue;
+    }
+    if (char === "(") depth++;
+    else if (char === ")") {
+      depth--;
+      if (depth === 0) return index;
+    }
+    index++;
+  }
+  return -1;
+}
+
+/** @param {string} script @param {number} start */
+function readQuoted(script, start) {
+  const quote = script[start];
+  let value = "";
+  let index = start + 1;
+  while (index < script.length) {
+    const char = script[index];
+    if (quote === '"' && char === "\\") {
+      value += script[index + 1] ?? "";
+      index += 2;
+      continue;
+    }
+    if (char === quote) return { value, next: index + 1 };
+    value += char;
+    index++;
+  }
+  return { value, next: script.length };
+}
+
+/** @param {string} value */
+function substitutions(value) {
+  /** @type {string[]} */
+  const inners = [];
+  let index = 0;
+  while (index < value.length) {
+    if (value[index] === "`") {
+      const end = value.indexOf("`", index + 1);
+      if (end < 0) {
+        inners.push(value.slice(index + 1));
+        break;
+      }
+      inners.push(value.slice(index + 1, end));
+      index = end + 1;
+      continue;
+    }
+    if (value[index] === "$" && value[index + 1] === "(") {
+      const end = matchingParen(value, index + 1);
+      if (end < 0) {
+        inners.push(value.slice(index + 2));
+        break;
+      }
+      inners.push(value.slice(index + 2, end));
+      index = end + 1;
+      continue;
+    }
+    index++;
+  }
+  return inners;
+}
+
+/** @param {string} word */
+function unescapeWord(word) {
+  let value = "";
+  for (let index = 0; index < word.length; index++) {
+    if (word[index] === "\\" && index + 1 < word.length) {
+      value += word[index + 1];
+      index++;
+      continue;
+    }
+    value += word[index];
+  }
+  return value;
+}
+
 /**
  * Structural checks that need no actionlint. Returns the failures.
  * @param {string} repoRoot
@@ -237,6 +480,23 @@ export function structuralFailures(repoRoot) {
       `workspace member ${m.name} is not both triggered and tested by any workflow ` +
         "(add its path to a workflow's paths filter and name it in a cargo test command)",
     );
+  }
+  // A cargo build, test, check, or clippy that omits --locked rewrites
+  // Cargo.lock on the runner and can still exit 0. fmt, run, and mutants
+  // are a different contract; ignored-tests.yml already passes the flag.
+  for (const name of ["rust.yml", "analysis-plane.yml"]) {
+    const yaml = workflows[name];
+    if (typeof yaml !== "string") {
+      failures.push(`missing workflow ${name}; cargo --locked was not checked`);
+      continue;
+    }
+    failures.push(...cargoStepsMissingLocked(yaml, name));
+  }
+  const verifyPath = path.join(repoRoot, "rust", "verify.sh");
+  if (!existsSync(verifyPath)) {
+    failures.push("missing rust/verify.sh; cargo --locked was not checked");
+  } else {
+    failures.push(...cargoStepsMissingLocked(readFileSync(verifyPath, "utf8"), "rust/verify.sh"));
   }
   return failures;
 }

@@ -9,6 +9,7 @@ import {
   interpret,
   membersOutOfScope,
   readWorkflows,
+  cargoStepsMissingLocked,
   structuralFailures,
   testedPackages,
   triggerPaths,
@@ -225,5 +226,96 @@ jobs:
     const real = readWorkflows(fileURLToPath(new URL("../.github/workflows", import.meta.url)));
     assert.deepEqual(workflowsNamingAChannel(real), []);
     assert.deepEqual(workflowsMissingConcurrency(real), []);
+  });
+
+  describe("cargo --locked", () => {
+    const root = fileURLToPath(new URL("..", import.meta.url));
+
+    it("rejects a build, test, check, or clippy line that omits --locked and accepts one that has it", () => {
+      for (const verb of ["build", "test", "check", "clippy"]) {
+        assert.deepEqual(cargoStepsMissingLocked(`cargo ${verb} --locked`, "f"), []);
+        assert.deepEqual(cargoStepsMissingLocked(`cargo ${verb}`, "f"), [`f:1: cargo ${verb} omits --locked`]);
+        assert.deepEqual(cargoStepsMissingLocked(`cargo ${verb} -- --locked`, "f"), [
+          `f:1: cargo ${verb} omits --locked`,
+        ]);
+      }
+    });
+
+    it("requires --locked on the rust workflows and verify.sh", () => {
+      const workflows = readWorkflows(path.join(root, ".github", "workflows"));
+      const verify = readFileSync(path.join(root, "rust", "verify.sh"), "utf8");
+      assert.deepEqual(
+        [
+          ...cargoStepsMissingLocked(workflows["rust.yml"], "rust.yml"),
+          ...cargoStepsMissingLocked(workflows["analysis-plane.yml"], "analysis-plane.yml"),
+          ...cargoStepsMissingLocked(verify, "rust/verify.sh"),
+        ],
+        [],
+      );
+    });
+
+    it("keeps --locked on ignored-tests.yml and the existing release-probe lines", () => {
+      const ignored = readFileSync(path.join(root, ".github", "workflows", "ignored-tests.yml"), "utf8");
+      assert.deepEqual(cargoStepsMissingLocked(ignored, "ignored-tests.yml"), []);
+      const rust = readFileSync(path.join(root, ".github", "workflows", "rust.yml"), "utf8");
+      const verify = readFileSync(path.join(root, "rust", "verify.sh"), "utf8");
+      assert.match(rust, /cargo run --release --locked -p devmap-serve --example worker_recovery_probe/);
+      assert.match(verify, /cargo run --release --locked -q -p devmap-serve --example worker_recovery_probe/);
+      assert.match(verify, /cargo build --release --locked -q -p devmap-soak/);
+      assert.match(verify, /cargo run --release --locked -q -p devmap-soak/);
+    });
+
+    it("ignores comments, cargo run, cargo fmt, cargo mutants, and echo of a cargo verb", () => {
+      const text = [
+        "# cargo test --workspace",
+        "cargo test --locked # cargo build",
+        "cargo run --release",
+        "cargo fmt --all -- --check",
+        "cargo mutants -p devmap-resolve",
+        "echo cargo test --workspace",
+        "name: cargo build",
+        "echo 'cargo test --workspace'",
+      ].join("\n");
+      assert.deepEqual(cargoStepsMissingLocked(text, "f"), []);
+    });
+
+    it("joins continuations, counts a quoted flag, and rejects a glued or late flag", () => {
+      assert.deepEqual(cargoStepsMissingLocked("cargo test --workspace \\\n  --locked\n", "f"), []);
+      assert.deepEqual(cargoStepsMissingLocked("cargo test --workspace \\\r\n  --no-fail-fast\r\n", "f"), [
+        "f:1: cargo test omits --locked",
+      ]);
+      assert.deepEqual(cargoStepsMissingLocked('run: "cargo test --locked -p pkg"', "f"), []);
+      assert.deepEqual(cargoStepsMissingLocked("cargo test \"--locked\"", "f"), []);
+      assert.deepEqual(cargoStepsMissingLocked("cargo test '--locked'", "f"), []);
+      assert.deepEqual(cargoStepsMissingLocked("cargo test --locked-extra", "f"), [
+        "f:1: cargo test omits --locked",
+      ]);
+      assert.deepEqual(cargoStepsMissingLocked("cargo test --locked=true", "f"), [
+        "f:1: cargo test omits --locked",
+      ]);
+      assert.deepEqual(cargoStepsMissingLocked("cargo clippy --locked --workspace -- -D warnings", "f"), []);
+      assert.deepEqual(cargoStepsMissingLocked("FOO=bar cargo test --locked", "f"), []);
+      assert.deepEqual(cargoStepsMissingLocked("cargo test --locked && cargo build", "f"), [
+        "f:1: cargo build omits --locked",
+      ]);
+      assert.deepEqual(cargoStepsMissingLocked("cargo test --locked -p \"名前\"", "f"), []);
+      assert.deepEqual(cargoStepsMissingLocked("cargo\ttest\t--locked", "f"), []);
+      assert.deepEqual(cargoStepsMissingLocked("cargo\ttest", "f"), ["f:1: cargo test omits --locked"]);
+      assert.deepEqual(cargoStepsMissingLocked("command cargo test --locked", "f"), []);
+      assert.deepEqual(cargoStepsMissingLocked("exec cargo build", "f"), ["f:1: cargo build omits --locked"]);
+      assert.deepEqual(cargoStepsMissingLocked("echo \"$(cargo test --workspace)\"", "f"), [
+        "f:1: cargo test omits --locked",
+      ]);
+      assert.deepEqual(cargoStepsMissingLocked("cargo test --locked `cargo build`", "f"), [
+        "f:1: cargo build omits --locked",
+      ]);
+    });
+
+    it("rejects an empty label, a non-string, and a script over the scan cap", () => {
+      assert.throws(() => cargoStepsMissingLocked("", ""), TypeError);
+      assert.throws(() => cargoStepsMissingLocked(/** @type {string} */ (null), "f"), TypeError);
+      assert.throws(() => cargoStepsMissingLocked("x".repeat(2_000_001), "f"), RangeError);
+      assert.deepEqual(cargoStepsMissingLocked("", "f"), []);
+    });
   });
 });
