@@ -47,7 +47,10 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::{json, Value};
 
 use crate::admission::Admission;
-use crate::mcp::{handle_method, StoreSlot, META_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSIONS};
+use crate::mcp::{
+    handle_method, is_accepted_notification, StoreSlot, META_PROTOCOL_VERSION,
+    MODERN_PROTOCOL_VERSIONS,
+};
 // The codes are the shared ones. `-32020` and `-32022` are allocated by the
 // specification out of a range it reserves for itself, so they belong with the
 // rest of the taxonomy rather than in whichever module happened to need them
@@ -221,6 +224,27 @@ fn accepted() -> Response<Full<Bytes>> {
         .header("X-Content-Type-Options", "nosniff")
         .body(Full::new(Bytes::new()))
         .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
+}
+
+/// Bound and sanitise a method name before it is placed in a refusal.
+///
+/// The body limit is 1 MiB, so the method can be almost that large. Echoing it
+/// whole would hand that cost back to the client, and a raw control character
+/// has no place in a message a log line will print.
+fn refusal_method(method: &str) -> String {
+    const MAX_CHARS: usize = 64;
+    let mut shown = String::new();
+    for ch in method.chars().take(MAX_CHARS) {
+        if ch.is_control() {
+            shown.push('\u{FFFD}');
+        } else {
+            shown.push(ch);
+        }
+    }
+    if method.chars().nth(MAX_CHARS).is_some() {
+        shown.push('\u{2026}');
+    }
+    shown
 }
 
 fn rpc_error_body(id: Value, code: i64, message: impl Into<String>) -> Value {
@@ -838,6 +862,32 @@ one is {fault}. The request was not run."
         if let Some((status, body)) = headers.check(&parsed, &id, &method) {
             return Ok(json_response(status, &body));
         }
+    }
+
+    // A missing id is a notification, not a request the caller declined to
+    // correlate. Dispatching `tools/call` anyway runs the tool and then throws
+    // the answer away as `202`, which skips the header mirror above: a gateway
+    // that authorised one method never sees the header, and this server still
+    // executes the body. That is the same refusal stdio already makes. Known
+    // notifications still go through `handle_method` and are answered `202`.
+    // Security: this narrows what a loopback client can execute. It does not
+    // change origin or host checks, and it does not admit any new caller.
+    if !is_request && !is_accepted_notification(&method) {
+        let shown = refusal_method(&method);
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": INVALID_REQUEST,
+                    "message": format!(
+                        "'{shown}' was not run: a body with no id is a notification, and the only \
+            notifications this server accepts are notifications/initialized, \
+            notifications/roots/list_changed, and notifications/cancelled"
+                    )
+                }
+            }),
+        ));
     }
 
     let params = parsed.get("params").cloned();

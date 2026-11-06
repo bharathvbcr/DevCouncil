@@ -9,6 +9,7 @@
 //! with no timer to drive it).
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,7 +18,7 @@ use devmap_store::Store;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
-fn corpus() -> Arc<StoreSlot> {
+fn populate(store: &Store) {
     let files = [
         ("core.py", "def helper(rows):\n    return sum(rows)\n"),
         (
@@ -33,11 +34,64 @@ fn corpus() -> Arc<StoreSlot> {
     resolver.index_extractions(&extractions);
     let resolution = resolver.resolve_all(&extractions).unwrap();
     let analysis = devmap_analyze::analyze(&extractions, &resolution);
-    let store = Store::open_in_memory().expect("in-memory store");
     store
         .save_generation(&extractions, &resolution, &analysis)
         .expect("generation");
+}
+
+fn corpus() -> Arc<StoreSlot> {
+    let store = Store::open_in_memory().expect("in-memory store");
+    populate(&store);
     Arc::new(StoreSlot::ready("in-memory", Arc::new(store)))
+}
+
+/// Removes the directory when the test ends, including on assertion failure.
+struct Scratch {
+    dir: PathBuf,
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// A file-backed store so a real `tools/call` leaves `sessions/live.jsonl`.
+///
+/// The in-memory corpus's path is not a file, and the session log refuses to
+/// write beside one. This server is the same HTTP entry point as [`start`];
+/// the log is how the test tells "the tool ran and the answer was discarded"
+/// from "the tool was not called".
+async fn start_file_backed() -> (String, PathBuf, Scratch) {
+    let dir = std::env::temp_dir().join(format!(
+        "devmap-http-noid-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let db = dir.join("index.sqlite");
+    let store = Store::open(&db).expect("file store");
+    populate(&store);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("addr").to_string();
+    tokio::spawn(devmap_serve::mcp_http::serve_http_on(
+        Arc::new(StoreSlot::ready(db, Arc::new(store))),
+        listener,
+    ));
+    let log = dir.join("sessions").join("live.jsonl");
+    (address, log, Scratch { dir })
+}
+
+fn assert_tool_did_not_run(log: &Path) {
+    let written = std::fs::read_to_string(log).unwrap_or_default();
+    assert!(
+        written.is_empty(),
+        "tools/call ran: {} holds {written}",
+        log.display()
+    );
 }
 
 /// Start a server on an ephemeral port and return its address.
@@ -462,6 +516,230 @@ async fn a_notification_post_is_accepted_with_no_body() {
     assert!(
         body.trim().is_empty(),
         "a 202 carries no body; this one carried: {body}"
+    );
+}
+
+/// A `tools/call` with no id is not a notification, so it must not run.
+///
+/// HTTP used to dispatch every body and answer a success that had no id with
+/// `202`, which discarded the result after the tool had already queried the
+/// store. Stdio drops that frame. The session log is the observable that the
+/// tool ran: a later call that does have an id writes the same file, so an
+/// empty file here is the tool not having been called, not a logger that is off.
+#[tokio::test]
+async fn a_tools_call_with_no_id_does_not_run_and_is_refused() {
+    let (address, log, _scratch) = start_file_backed().await;
+    let call = r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"devmap_status","arguments":{}}}"#;
+
+    // Headers that match the body. A check that only runs when an id is present
+    // would let this through and the tool would still execute.
+    let started = std::time::Instant::now();
+    refuse_without_running(&address, &post(call), &log).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the refusal waited long enough to have run the tool"
+    );
+
+    // Eight overlapping refusals. A check that ran the tool and then answered
+    // would leave a log line from whichever connection finished.
+    let mut burst = Vec::new();
+    for _ in 0..8 {
+        let address = address.clone();
+        let raw = post(call);
+        burst.push(tokio::spawn(async move { exchange(&address, &raw).await }));
+    }
+    for task in burst {
+        let (status, _, body) = task.await.expect("burst task");
+        assert_eq!(status, 400, "overlapped no-id tools/call: {body}");
+    }
+    assert_tool_did_not_run(&log);
+
+    // A method far past the name anyone would send must be refused without
+    // copying it back into the response.
+    let huge = format!("tools/call{}", "A".repeat(80_000));
+    let huge_body = serde_json::to_string(&json!({
+        "jsonrpc": "2.0",
+        "method": huge
+    }))
+    .expect("huge body");
+    let (status, _, response) = exchange(
+        &address,
+        &raw_post(
+            &huge_body,
+            &[("MCP-Protocol-Version".to_string(), "2026-07-28".to_string())],
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "oversized method status {status}");
+    assert!(
+        response.len() < 2_000,
+        "the refusal echoed the method ({} bytes)",
+        response.len()
+    );
+    assert_tool_did_not_run(&log);
+
+    // The audit failure: no protocol header, and a method header that names
+    // something else. Both are ignored today because the body has no id.
+    refuse_without_running(
+        &address,
+        &raw_post(
+            call,
+            &[("Mcp-Method".to_string(), "tools/list".to_string())],
+        ),
+        &log,
+    )
+    .await;
+
+    // Known notifications still 202, and they are not tool calls.
+    for method in [
+        "notifications/initialized",
+        "notifications/roots/list_changed",
+        "notifications/cancelled",
+    ] {
+        let (status, _, body) = exchange(
+            &address,
+            &post(&format!(r#"{{"jsonrpc":"2.0","method":"{method}"}}"#)),
+        )
+        .await;
+        assert_eq!(status, 202, "{method} is a notification: {body}");
+        assert!(body.trim().is_empty(), "{method} carried a body: {body}");
+        assert_tool_did_not_run(&log);
+    }
+
+    // Spellings that are not the three notifications, including a request
+    // method, a trailing space, a case change, a zero-width space, and a
+    // control character. None of them may run a tool.
+    let lookalikes = [
+        "ping",
+        "tools/list",
+        "tools/call ",
+        "TOOLS/CALL",
+        "notifications/initialized ",
+        "notifications/initialized\nextra",
+        "notifications/initialized\u{200b}",
+        "notifications/cancelled ",
+        " notifications/initialized",
+        "",
+        "notifications/initialized\r",
+    ];
+    for method in lookalikes {
+        let body = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": {"name": "devmap_status", "arguments": {}}
+        }))
+        .expect("body");
+        // The hostile spelling stays in the body. Copying it into Mcp-Method
+        // would split the HTTP request on a newline before the server read it.
+        let raw = raw_post(
+            &body,
+            &[
+                ("MCP-Protocol-Version".to_string(), "2026-07-28".to_string()),
+                ("Mcp-Method".to_string(), "tools/call".to_string()),
+            ],
+        );
+        refuse_without_running(&address, &raw, &log).await;
+    }
+
+    // An id that is present but null is a request with an unusable id. It is
+    // refused before dispatch, so the tool still does not run.
+    let null_id = with_request_meta(
+        r#"{"jsonrpc":"2.0","id":null,"method":"tools/call","params":{"name":"devmap_status","arguments":{}}}"#,
+    );
+    let (status, response) =
+        request(&address, &raw_post(&null_id, &mirrored_headers(&null_id))).await;
+    assert_eq!(status, 400, "a null id is not a notification: {response}");
+    assert_tool_did_not_run(&log);
+
+    // A tools/call that has an id and omits or mismatches the mirrored headers
+    // is still the header refusal, and the tool does not run.
+    let identified = with_request_meta(&call_with_id());
+    let missing_version: Vec<(String, String)> = mirrored_headers(&identified)
+        .into_iter()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case("MCP-Protocol-Version"))
+        .collect();
+    let (status, response) = request(&address, &raw_post(&identified, &missing_version)).await;
+    assert_eq!(status, 400, "{response}");
+    assert_eq!(response["error"]["code"], json!(-32020), "{response}");
+    assert_tool_did_not_run(&log);
+
+    for (header, wrong) in [("Mcp-Method", "tools/list"), ("Mcp-Name", "devmap_preview")] {
+        let headers: Vec<(String, String)> = mirrored_headers(&identified)
+            .into_iter()
+            .map(|(name, value)| {
+                if name.eq_ignore_ascii_case(header) {
+                    (name, wrong.to_string())
+                } else {
+                    (name, value)
+                }
+            })
+            .collect();
+        let (status, response) = request(&address, &raw_post(&identified, &headers)).await;
+        assert_eq!(status, 400, "{header}: {response}");
+        assert_eq!(
+            response["error"]["code"],
+            json!(-32020),
+            "{header}: {response}"
+        );
+        assert_tool_did_not_run(&log);
+    }
+
+    // Origin and host are decided before the body is a notification or a request.
+    let originated = format!(
+        "POST / HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example\r\n\
+         Content-Type: application/json\r\nAccept: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{call}",
+        call.len()
+    );
+    let (status, _, _) = exchange(&address, &originated).await;
+    assert_eq!(status, 403, "a site Origin is still refused");
+    assert_tool_did_not_run(&log);
+
+    let hosted = post(call).replace("Host: localhost", "Host: evil.example");
+    // post() builds a request that has no id. Replacing the host must still 403.
+    let (status, _, body) = exchange(&address, &hosted).await;
+    assert_eq!(status, 403, "a public Host is still refused: {body}");
+    assert_tool_did_not_run(&log);
+
+    // The same server does run a tools/call that has an id and agreeing headers,
+    // and that run is what writes the log. Without this, an empty log could
+    // mean the logger never fires.
+    let (status, response) = request(&address, &post(&call_with_id())).await;
+    assert_eq!(status, 200, "{response}");
+    let written = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        written.contains("devmap_status"),
+        "a real tools/call must record itself, or the empty log above proves nothing: {written}"
+    );
+}
+
+fn call_with_id() -> String {
+    r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"devmap_status","arguments":{}}}"#
+        .to_string()
+}
+
+async fn refuse_without_running(address: &str, raw: &str, log: &Path) {
+    let (status, _, body) = exchange(address, raw).await;
+    assert_tool_did_not_run(log);
+    assert_ne!(
+        status, 202,
+        "a body with no id that is not a known notification was accepted: {body}"
+    );
+    assert!(
+        (400..500).contains(&status),
+        "the refusal must be 4xx, got {status}: {body}"
+    );
+    let parsed: Value = serde_json::from_str(&body)
+        .unwrap_or_else(|err| panic!("refusal was not JSON ({err}): {body}"));
+    assert_eq!(parsed["error"]["code"], json!(-32600), "{parsed}");
+    assert!(
+        parsed.get("id").is_none(),
+        "a notification refusal has no id: {parsed}"
+    );
+    let message = parsed["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("not run") || message.contains("was not run"),
+        "the refusal must say the method was not run: {message}"
     );
 }
 

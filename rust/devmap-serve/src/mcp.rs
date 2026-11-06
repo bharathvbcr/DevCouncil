@@ -3351,6 +3351,21 @@ fn complete(mut result: Value) -> Value {
     result
 }
 
+/// Methods this server will execute when the frame has no id.
+///
+/// JSON-RPC treats a missing id as a notification. A request method sent that
+/// way still does the work, and the caller cannot be given the result. Stdio
+/// drops the frame. HTTP must use this same list: a second copy is how the
+/// HTTP transport kept running `tools/call` and answering `202`.
+pub(crate) fn is_accepted_notification(method: &str) -> bool {
+    matches!(
+        method,
+        "notifications/initialized"
+            | "notifications/roots/list_changed"
+            | "notifications/cancelled"
+    )
+}
+
 /// Run one JSON-RPC method, with a cancellation flag the caller may trip.
 ///
 /// Split from [`handle_method`] so the stdio session can hand in a flag it holds
@@ -3670,18 +3685,17 @@ request was not run."
     }
 
     // A frame with no id is a notification, and the only notifications this
-    // protocol has are `notifications/*`. `notifications/cancelled` was handled
-    // above; anything else that arrives without an id is not a notification this
-    // server can act on, and dispatching it anyway was doing real work nobody
-    // could ever see: a `tools/call` sent without an id ran the full query,
-    // held the store lock for up to the call timeout, and threw the answer away,
-    // because a notification must not be answered. The refusal is loud on
-    // stderr — the one channel stdio leaves open for it — and silent on the
-    // wire, which is where the specification requires silence.
-    if !has_id
-        && method != "notifications/initialized"
-        && method != "notifications/roots/list_changed"
-    {
+    // protocol has are the three [`is_accepted_notification`] names.
+    // `notifications/cancelled` was handled above; anything else that arrives
+    // without an id is not a notification this server can act on, and
+    // dispatching it anyway was doing real work nobody could ever see: a
+    // `tools/call` sent without an id ran the full query, held the store lock
+    // for up to the call timeout, and threw the answer away, because a
+    // notification must not be answered. The refusal is loud on stderr — the
+    // one channel stdio leaves open for it — and silent on the wire, which is
+    // where the specification requires silence. HTTP uses the same predicate
+    // and answers 400, because that transport has a response to put the refusal in.
+    if !has_id && !is_accepted_notification(&method) {
         tracing::warn!(
             "discarded a frame with no id calling '{method}': the only notifications this \
 server accepts are notifications/initialized, notifications/roots/list_changed, and \
