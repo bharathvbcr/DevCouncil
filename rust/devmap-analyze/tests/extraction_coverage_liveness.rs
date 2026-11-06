@@ -291,10 +291,11 @@ fn both_liveness_entry_points_apply_the_same_cap() {
 //
 // The three gaps above all begin with a failure: a parse that did not finish, a
 // grammar that was not linked, a walk that refused a file. CFML and Terraform
-// fail at none of them. They parse `Clean`, `is_parse_failure` is false,
-// `Fallback` never matches, and no arm of `extract_node` or `langcalls` pushes
-// a call for either language — so the file contributed zero call edges and
-// `is_complete()` stayed true.
+// fail at none of them. They parse `Clean`, `is_parse_failure` is false, and
+// `Fallback` never matches. HCL records a function-call site (`lower`) so the
+// resolver can name it on the unresolved ledger. The language capability still
+// omits Calls, so `is_call_blind` stays true and the file is not a complete
+// scan. CFML still pushes no call.
 //
 // Measured against the pre-change kernel, `probe.cfm`'s and `probe.tf`'s
 // symbols were reported at confidence 0.9 with `exemption_reason: None`, which
@@ -303,7 +304,8 @@ fn both_liveness_entry_points_apply_the_same_cap() {
 // shape as Q-1, arriving through a door the coverage machinery had no way to
 // see.
 
-/// Terraform: parses `Clean`, extracts references, extracts no calls.
+/// Terraform: parses `Clean`, extracts references, and records function calls
+/// while the language stays call-blind.
 const TERRAFORM: &str = r#"module "helper" {
   source = "./helper"
 }
@@ -325,10 +327,11 @@ const CFML: &str = r#"<cfscript>
 
 /// The language really is call-blind, and really does parse cleanly.
 ///
-/// Stated separately so that if a CFML or HCL call extractor ever lands, this
-/// is the test that fails first and explains why the ones below changed —
-/// rather than leaving a reader to guess whether the fixture or the kernel
-/// moved.
+/// HCL's function-call arm records `lower` and nothing else in this fixture.
+/// The file stays `is_call_blind` because the language capability omits Calls,
+/// which is why the tier tests below still cap confidence. CFML still has no
+/// call arm. A CFML call, a second HCL call, or a Terraform file that stops
+/// being call-blind fails here before those tests change meaning.
 #[test]
 fn the_call_blind_fixtures_parse_clean_and_extract_no_calls() {
     for (path, source) in [("main.tf", TERRAFORM), ("Widget.cfm", CFML)] {
@@ -344,10 +347,33 @@ fn the_call_blind_fixtures_parse_clean_and_extract_no_calls() {
             "{path} must not read as a parse failure"
         );
         assert!(
-            extraction.calls.is_empty(),
-            "{path} is expected to extract no calls"
+            extraction.is_call_blind(),
+            "{path} must stay call-blind: recording a function-call site does \
+             not give the language a call extractor"
         );
     }
+
+    let terraform = extract_file("main.tf", TERRAFORM);
+    let calls: Vec<(&str, &str)> = terraform
+        .calls
+        .iter()
+        .map(|call| {
+            (
+                call.callee_name.as_str(),
+                call.caller_symbol.as_deref().unwrap_or(""),
+            )
+        })
+        .collect();
+    assert_eq!(
+        calls,
+        [("lower", "main.tf::resource.aws_s3_bucket.b")],
+        "the only HCL call in this fixture is lower() inside the bucket \
+         resource; a module source is not a call"
+    );
+    assert!(
+        extract_file("Widget.cfm", CFML).calls.is_empty(),
+        "CFML still has no call extractor"
+    );
 
     // Terraform declares symbols; CFML declares none at all. Asserted apart
     // rather than with a shared `> 1`, because the two are blind in different
