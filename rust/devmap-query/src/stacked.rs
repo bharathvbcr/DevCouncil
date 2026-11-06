@@ -181,6 +181,22 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// How long provision and GC wait for each other before failing closed.
+pub const BASES_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The exclusive lock on `<common_git_dir>/devmap/bases/.lock`, held by GC for
+/// its whole run and by provision from before publishing until the lease is
+/// written. Bounded; the timeout names the holder's pid.
+fn lock_bases(
+    common_git_dir: &Path,
+    wait: std::time::Duration,
+) -> Result<devmap_store::WriterLock> {
+    let bases_dir = bases_root_dir(common_git_dir);
+    fs::create_dir_all(&bases_dir)
+        .with_context(|| format!("cannot create {}", bases_dir.display()))?;
+    Store::lock_file_at(&bases_dir.join(".lock"), wait)
+}
+
 pub fn bases_root_dir(common_git_dir: &Path) -> PathBuf {
     common_git_dir.join("devmap").join("bases")
 }
@@ -687,6 +703,15 @@ pub fn provision_stacked_worktree(source_root: &Path, worktree_root: &Path) -> R
         );
     }
 
+    // One lock for publish through the lease write, so a base cannot be
+    // collected between being published and being leased.
+    let common_git_dir = registered_common_git_dir(&source_canon).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} is not a registered git checkout; refusing stacked provisioning",
+            source_canon.display()
+        )
+    })?;
+    let _bases_lock = lock_bases(&common_git_dir, BASES_LOCK_WAIT)?;
     let (base_dir, manifest) = publish_base_snapshot(&source_canon)?;
     let delta_path = stack_delta_path(&wt_canon);
     let _delta = DeltaStore::open(&delta_path)?;
@@ -744,6 +769,15 @@ pub fn seed_derived_artifacts_and_reuse_caches(
 /// Fails closed (`Err`) without deleting any base directory if ANY registered
 /// worktree carries an unreadable or malformed `stack_lease.json` (`OQ2`).
 pub fn gc_unused_bases(common_git_dir: &Path) -> Result<GcBasesReport> {
+    gc_unused_bases_waiting(common_git_dir, BASES_LOCK_WAIT)
+}
+
+/// [`gc_unused_bases`] with the lock wait named, so a held lock is a testable
+/// refusal rather than a minute's wait.
+pub fn gc_unused_bases_waiting(
+    common_git_dir: &Path,
+    wait: std::time::Duration,
+) -> Result<GcBasesReport> {
     let common_canon = common_git_dir
         .canonicalize()
         .with_context(|| format!("cannot canonicalize {}", common_git_dir.display()))?;
@@ -755,9 +789,11 @@ pub fn gc_unused_bases(common_git_dir: &Path) -> Result<GcBasesReport> {
         });
     }
 
+    let _bases_lock = lock_bases(&common_canon, wait)?;
+    refuse_unverifiable_worktrees(&common_canon)?;
+
     let mut leased_dirs: BTreeSet<String> = BTreeSet::new();
-    for wt_root in registered_worktrees_of_common_dir(&common_canon) {
-        let lease_file = stack_lease_path(&wt_root);
+    for (_, lease_file) in lease_files_of_worktrees(&common_canon) {
         match fs::symlink_metadata(&lease_file) {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => {
@@ -839,6 +875,78 @@ pub fn gc_unused_bases(common_git_dir: &Path) -> Result<GcBasesReport> {
         retained_generations,
         removed_generations,
     })
+}
+
+/// Every lease file a registered worktree may carry, in every layout (the state
+/// directory depends on `$DEVMAP_HOME`, which the caller's environment may not
+/// share with the worktree's own tools). Mirrors the hook's `has_stack_lease`.
+fn lease_files_of_worktrees(common_git_dir: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let mut out: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for wt_root in registered_worktrees_of_common_dir(common_git_dir) {
+        let candidates = [
+            wt_root.join(".devmap/codeintel/stack_lease.json"),
+            wt_root.join(".devcouncil/codeintel/stack_lease.json"),
+            stack_lease_path(&wt_root),
+        ];
+        for lease in candidates {
+            if !out.iter().any(|(_, seen)| seen == &lease) {
+                out.push((wt_root.clone(), lease));
+            }
+        }
+    }
+    out
+}
+
+/// A worktree git knows of but whose lease cannot be read (unmounted, locked,
+/// or its `.git` link points nowhere) may hold a base: treating it as unleased
+/// would delete that base. Refuse, naming each one.
+fn refuse_unverifiable_worktrees(common_git_dir: &Path) -> Result<()> {
+    let entries = match fs::read_dir(common_git_dir.join("worktrees")) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "refusing base GC: cannot list {}",
+                    common_git_dir.join("worktrees").display()
+                )
+            })
+        }
+    };
+    let mut problems = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let meta_dir = entry.path();
+        if !meta_dir.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if meta_dir.join("locked").exists() {
+            problems.push(format!("{name} (locked)"));
+            continue;
+        }
+        match fs::read_to_string(meta_dir.join("gitdir")) {
+            Err(err) => problems.push(format!("{name} (gitdir unreadable: {err})")),
+            Ok(spec) => {
+                let target = meta_dir.join(spec.trim());
+                if !target.exists() {
+                    problems.push(format!(
+                        "{name} (gitdir target {} is missing)",
+                        target.display()
+                    ));
+                }
+            }
+        }
+    }
+    if problems.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "refusing base GC: cannot verify the leases of {} registered worktree(s): {}; \
+         run `git worktree prune`, or unlock and mount them",
+        problems.len(),
+        problems.join(", ")
+    )
 }
 
 fn remove_readonly_tree(dir: &Path) -> Result<()> {
@@ -2092,6 +2200,65 @@ mod tests {
             .expect_err("must not overwrite a store");
         assert!(again.to_string().contains("existing store"), "{again}");
         drop(stacked);
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(feature = "parse")]
+    #[test]
+    fn gc_refuses_unverifiable_worktrees_and_waits_on_the_bases_lock() {
+        let root = temp_repo_dir("gc-unverifiable");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane_a = add_lane(&anchor, &root, "lane-a");
+        let lane_b = add_lane(&anchor, &root, "lane-b");
+        provision_stacked_worktree(&anchor, &lane_a).unwrap();
+
+        // Advance the donor to generation 2 and lease it from lane-b, so gen 1
+        // is retained only by lane-a's lease.
+        fs::write(anchor.join("src/extra.rs"), "pub fn gen2() {}\n").unwrap();
+        run_git_ok(&anchor, &["add", "."]);
+        run_git_ok(&anchor, &["commit", "-m", "gen2"]);
+        index_tree(
+            &anchor,
+            &[
+                "src/svc.go",
+                "src/routes.ts",
+                "src/limits.rs",
+                "src/extra.rs",
+            ],
+        );
+        provision_stacked_worktree(&anchor, &lane_b).unwrap();
+        let common = registered_common_git_dir(&anchor).unwrap();
+
+        // lane-a becomes unreachable: unmounted and locked. Its lease cannot be read.
+        let moved = root.join("lane-a.unmounted");
+        fs::rename(&lane_a, &moved).unwrap();
+        fs::write(common.join("worktrees/lane-a/locked"), "unmounted\n").unwrap();
+
+        let err = gc_unused_bases(&common)
+            .expect_err("an unverifiable worktree must stop the collection")
+            .to_string();
+        assert!(err.contains("lane-a"), "must name the worktree: {err}");
+        let bases: Vec<_> = fs::read_dir(bases_root_dir(&common))
+            .unwrap()
+            .flatten()
+            .filter(|e| parse_base_dir_name(&e.file_name().to_string_lossy()).is_some())
+            .collect();
+        assert_eq!(bases.len(), 2, "no base may be deleted: {bases:?}");
+
+        // Mounted again, a held bases lock is a bounded refusal, not a race.
+        fs::rename(&moved, &lane_a).unwrap();
+        fs::remove_file(common.join("worktrees/lane-a/locked")).unwrap();
+        let held = lock_bases(&common, std::time::Duration::from_secs(5)).unwrap();
+        let err = gc_unused_bases_waiting(&common, std::time::Duration::from_millis(300))
+            .expect_err("GC must not run while a provision holds the bases lock")
+            .to_string();
+        assert!(
+            err.contains("another devmap writer"),
+            "unexpected error: {err}"
+        );
+        drop(held);
+        gc_unused_bases(&common).unwrap();
         let _ = remove_readonly_tree(&root);
     }
 
