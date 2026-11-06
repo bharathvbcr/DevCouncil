@@ -184,6 +184,79 @@ func TestTheLiveContractHolds(t *testing.T) {
 		t.Errorf("the producer now writes schema %d and this build reads %d; "+
 			"check what moved before raising SupportedSchema", p.SchemaVersion, repomap.SupportedSchema)
 	}
+
+	assertLiveBlast(t, c, root)
+}
+
+// assertLiveBlast drives `devmap blast --since` over a two-commit history of
+// the fixture and asserts the fields DecodeBlast requires arrive under the
+// names it reads. dctestselect decides what CI runs from them, and a renamed
+// key would otherwise decode as "nothing is missing" or as an empty selection.
+func assertLiveBlast(t *testing.T, c *Client, root string) {
+	t.Helper()
+	ctx := context.Background()
+	git := func(args ...string) string {
+		t.Helper()
+		full := append([]string{"-c", "user.name=t", "-c", "user.email=t@example.com",
+			"-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + os.DevNull}, args...)
+		cmd := exec.Command("git", full...)
+		cmd.Dir = root
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	write := func(rel, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(root, rel), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	git("init", "-q")
+	write("pkga/a_test.go", "package pkga\n\nimport \"testing\"\n\nfunc TestAlpha(t *testing.T) {\n\tif Alpha() != 1 {\n\t\tt.Fatal(\"alpha\")\n\t}\n}\n")
+	git("add", "go.mod", "pkga", "pkgb")
+	git("commit", "-q", "-m", "base")
+	write("pkga/a.go", "package pkga\n\n"+
+		"func Alpha() int { return Helper() }\n"+
+		"func Helper() int {\n\treturn 1\n}\n"+
+		"func NeverCalled() int { return 2 }\n")
+	git("commit", "-q", "-a", "-m", "touch helper")
+	if _, err := c.Build(ctx, 5*time.Minute); err != nil {
+		t.Fatalf("build at the new head: %v", err)
+	}
+
+	b, err := c.Blast(ctx, "HEAD~1")
+	if err != nil {
+		t.Fatalf("blast: %v", err)
+	}
+	if head := git("rev-parse", "HEAD"); b.Head() != head {
+		t.Errorf("the blast's head %q is not the indexed head %q, so a caller cannot tell a stale index from a current one", b.Head(), head)
+	}
+	if len(b.ChangedFiles) != 1 || b.ChangedFiles[0].Path != "pkga/a.go" || b.ChangedFiles[0].Status != "modified" {
+		t.Errorf("changed_files = %+v", b.ChangedFiles)
+	}
+	var seeded bool
+	for _, s := range b.Seeds {
+		seeded = seeded || (s.FilePath == "pkga/a.go" && strings.HasSuffix(s.QualifiedName, "Helper"))
+	}
+	if !seeded {
+		t.Errorf("the changed symbol is not among the seeds, so its field names have moved: %+v", b.Seeds)
+	}
+	var reachedAlpha bool
+	for _, im := range b.Impacted {
+		reachedAlpha = reachedAlpha || (im.FilePath == "pkga/a.go" && strings.HasSuffix(im.QualifiedName, "Alpha") && im.Distance >= 1)
+	}
+	if !reachedAlpha {
+		t.Errorf("the caller of the changed symbol is not in impacted: %+v", b.Impacted)
+	}
+	var reachedTest bool
+	for _, tt := range b.Tests {
+		reachedTest = reachedTest || tt.Path == "pkga/a_test.go"
+	}
+	if !reachedTest {
+		t.Errorf("the test that calls the changed symbol is not in tests: %+v", b.Tests)
+	}
 }
 
 // TestTheLiveParserAcceptsTheSeparator is the reason the `--` fence can be
