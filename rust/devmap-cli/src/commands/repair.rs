@@ -53,6 +53,11 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
             db.display()
         );
     }
+    // Before the lock and before open, including an explicit `--db`. Repair
+    // migrates, and the lock file would be a new file beside a store this
+    // worktree has not shown it owns.
+    let root = cli.root_hint();
+    Store::refuse_a_live_foreign_owner_before_open(&db, &root)?;
     let _writer = Store::lock_writer_at(&db, Store::WRITER_LOCK_WAIT)?;
     let before = Store::stored_schema_version(&db)?;
     let store = Store::open(&db)?;

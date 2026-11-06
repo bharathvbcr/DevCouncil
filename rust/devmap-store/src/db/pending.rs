@@ -375,11 +375,14 @@ impl Store {
     /// open, or whose version cannot be read passes: [`Store::open`] refuses
     /// those itself, before it writes anything.
     ///
-    /// An owner record that cannot be read is a refusal when the store is older
-    /// than this kernel's schema, because opening it would migrate it, and
-    /// "unprovable" is not "ours". At the current schema it passes, so that the
-    /// open reports the damage in its own words, as it did before; it is checked
-    /// again once open, by [`Self::refuse_a_live_foreign_owner`].
+    /// An owner record that cannot be read is a refusal at every schema that
+    /// records one, including the current schema. Same-version heals are
+    /// writes, so "unprovable" is not "ours" there either. The error is the
+    /// one the read returned, and a corrupt page stays SQLite's corruption
+    /// error so the caller can say the store was left where it is.
+    ///
+    /// The connection is immutable when no `-wal` exists, so the peek itself
+    /// does not create `-wal` or `-shm`.
     pub fn refuse_a_live_foreign_owner_before_open(db_path: &Path, root: &Path) -> Result<()> {
         let resolved = devmap_extract::safe_fs::resolve_file_alias(db_path)
             .map_err(|error| refusal(error.to_string()))?;
@@ -387,10 +390,10 @@ impl Store {
             return Ok(());
         }
         let root = Self::normalized_repo_root(root)?;
-        let Ok(mut conn) =
-            Connection::open_with_flags(&resolved, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        else {
-            return Ok(());
+        let mut conn = match Self::open_owner_peek(&resolved) {
+            Ok(conn) => conn,
+            Err(error) if Self::sqlite_error_is_corrupt(&error) => return Err(error),
+            Err(_) => return Ok(()),
         };
         let version = |conn: &Connection| -> Result<i32> {
             conn.query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -402,12 +405,11 @@ impl Store {
         conn.execute_batch("PRAGMA trusted_schema = OFF;")?;
         let stamped = match version(&conn) {
             Ok(stamped) => stamped,
-            // The directory is read-only and the store is WAL: the immutable
-            // read `Store::open` falls back to.
             Err(error) if Self::directory_refused_the_wal(&error) => {
                 conn = Self::open_immutable(&resolved)?;
                 version(&conn)?
             }
+            Err(error) if Self::sqlite_error_is_corrupt(&error) => return Err(error),
             Err(_) => return Ok(()),
         };
         if stamped == 0 || !Self::schema_is_migratable(stamped) {
@@ -415,8 +417,6 @@ impl Store {
         }
         let owner = match Self::stored_repo_root(&conn, stamped) {
             Ok(owner) => owner,
-            // Stated in the doc: the open reports a damaged current store itself.
-            Err(_) if stamped >= crate::schema::CURRENT_SCHEMA_VERSION => return Ok(()),
             Err(error) => return Err(error),
         };
         match Self::classify_owner(owner, &root)? {
@@ -427,7 +427,7 @@ impl Store {
 
     /// The worktree a store of schema `stamped` records as its owner, if it
     /// records one. See [`Self::refuse_a_live_foreign_owner_before_open`].
-    fn stored_repo_root(conn: &Connection, stamped: i32) -> Result<Option<String>> {
+    pub(super) fn stored_repo_root(conn: &Connection, stamped: i32) -> Result<Option<String>> {
         const PENDING_STATE_SCHEMA: i32 = 20;
         const GENERATION_OWNER_SCHEMA: i32 = 7;
         let source = if stamped >= PENDING_STATE_SCHEMA {

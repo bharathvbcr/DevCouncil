@@ -197,6 +197,11 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
         format_args!("scanning and extracting {}", path.display()),
     );
     ensure_parent(&cli.db())?;
+    // Whose store this is comes before the lock. Opening migrates and heals,
+    // and the lock file is itself a file created beside the store, so a store
+    // of another live worktree is refused from a read that does not create
+    // `-wal` or `-shm` when none exists.
+    Store::refuse_a_live_foreign_owner_before_open(&cli.db(), path)?;
     // K13: take the cross-process writer lock *before* extraction.
     //
     // There was no such lock, so two builds — or a build and the
@@ -214,11 +219,6 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
     // queued behind another writer (that is the `writer:wait` stage). It ends
     // after the vacuum, below.
     let build_started = std::time::Instant::now();
-    // Whose store this is comes before anything that could write to it: opening
-    // migrates and heals the file, so a store of another live worktree is
-    // refused here, from a read-only look at its owner, and not after the open
-    // has rewritten it under that worktree's binary.
-    Store::refuse_a_live_foreign_owner_before_open(&cli.db(), path)?;
     let store = progress.timed("store:open", || Store::open(cli.db()))?;
     // Whose store this is comes before whether it is sound, and both are read
     // before anything is written: a store of another live worktree is refused

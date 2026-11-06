@@ -592,9 +592,11 @@ impl Store {
     /// K3: `Store::open` runs the migration chain under an exclusive
     /// transaction from *every* open, so a read-only command like
     /// `devmap status` silently upgraded the store it was asked to describe.
-    /// Opening read-only makes that impossible rather than merely unlikely: the
-    /// connection cannot write, so no migration, WAL switch or file creation
-    /// can happen behind the question.
+    /// The probe is the owner peek: immutable when no `-wal` exists, because a
+    /// read-only open of a WAL database creates `-wal` and `-shm` beside a
+    /// store this command was only asked to describe. A `-wal` that is already
+    /// there is opened read-only, so a frame that has not been checkpointed is
+    /// still visible, and that open cannot migrate.
     ///
     /// `None` when no store exists at `db_path`. A file that exists but is not
     /// a database is an error, not a `None` — "there is nothing here" and "what
@@ -604,10 +606,7 @@ impl Store {
         if !path.is_file() {
             return Ok(None);
         }
-        let conn = Connection::open_with_flags(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
+        let conn = Self::open_owner_peek(path)?;
         // The same wait every other connection gets. A store locked for a
         // moment — a vacuum, a competing opener — must make `status` and
         // `doctor` wait, not report a failure.
