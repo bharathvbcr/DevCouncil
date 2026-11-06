@@ -1,0 +1,193 @@
+{
+ "change": "rust/dc-store/src/lib.rs:1-300",
+ "changed_files": [
+  {
+   "path": "rust/dc-store/src/lib.rs",
+   "ranges": [
+    {
+     "deletion_only": false,
+     "end_line": 300,
+     "start_line": 1
+    }
+   ],
+   "status": {
+    "kind": "modified"
+   }
+  }
+ ],
+ "complete": false,
+ "files": [
+  {
+   "changed": true,
+   "nearest_distance": 0,
+   "path": "rust/dc-store/src/lib.rs",
+   "symbols": 82
+  },
+  {
+   "changed": false,
+   "nearest_distance": 1,
+   "path": "rust/dc-store/src/records.rs",
+   "symbols": 28
+  },
+  {
+   "changed": false,
+   "nearest_distance": 1,
+   "path": "rust/dc-store/tests/tasks.rs",
+   "symbols": 13
+  }
+ ],
+ "impacted": [
+  {
+   "distance": 1,
+   "file_path": "rust/dc-store/src/bin/dcstore.rs",
+   "qualified_name": "rust/dc-store/src/bin/dcstore.rs::dispatch"
+  },
+  {
+   "distance": 1,
+   "file_path": "rust/dc-store/src/bin/dcstore.rs",
+   "qualified_name": "rust/dc-store/src/bin/dcstore.rs::lease_json"
+  },
+  {
+   "distance": 1,
+   "file_path": "rust/dc-store/src/bin/dcstore.rs",
+   "qualified_name": "rust/dc-store/src/bin/dcstore.rs::unreadable_json"
+  },
+  {
+   "distance": 1,
+   "file_path": "rust/dc-store/src/lib.rs",
+   "qualified_name": "rust/dc-store/src/lib.rs::Store.acquire"
+  }
+ ],
+ "modules": [
+  {
+   "changed": true,
+   "files": 4,
+   "nearest_distance": 0,
+   "path": "rust/dc-store/src",
+   "symbols": 112,
+   "test_signal": "changed"
+  },
+  {
+   "changed": false,
+   "files": 11,
+   "nearest_distance": 1,
+   "path": "rust/dc-store/tests",
+   "symbols": 59,
+   "test_signal": "changed"
+  }
+ ],
+ "owners": [
+  {
+   "email": "bharath.vbcr@gmail.com",
+   "name": "BHARATH CHANDRA VADDARAM"
+  }
+ ],
+ "seeds": [
+  {
+   "changed_lines": 57,
+   "deletion_only": false,
+   "end_line": 149,
+   "file_path": "rust/dc-store/src/lib.rs",
+   "qualified_name": "rust/dc-store/src/lib.rs::StoreError",
+   "start_line": 93
+  },
+  {
+   "changed_lines": 52,
+   "deletion_only": false,
+   "end_line": 207,
+   "file_path": "rust/dc-store/src/lib.rs",
+   "qualified_name": "rust/dc-store/src/lib.rs::StoreError.fmt",
+   "start_line": 156
+  },
+  {
+   "changed_lines": 24,
+   "deletion_only": false,
+   "end_line": 243,
+   "file_path": "rust/dc-store/src/lib.rs",
+   "qualified_name": "rust/dc-store/src/lib.rs::failing_statement",
+   "start_line": 220
+  },
+  {
+   "changed_lines": 12,
+   "deletion_only": false,
+   "end_line": 304,
+   "file_path": "rust/dc-store/src/lib.rs",
+   "qualified_name": "rust/dc-store/src/lib.rs::Lease",
+   "start_line": 289
+  },
+  {
+   "changed_lines": 11,
+   "deletion_only": false,
+   "end_line": 88,
+   "file_path": "rust/dc-store/src/lib.rs",
+   "qualified_name": "rust/dc-store/src/lib.rs::ScopeWrite",
+   "start_line": 78
+  },
+  {
+   "changed_lines": 9,
+   "deletion_only": false,
+   "end_line": 284,
+   "file_path": "rust/dc-store/src/lib.rs",
+   "qualified_name": "rust/dc-store/src/lib.rs::LeaseCode.recovery",
+   "start_line": 276
+  }
+ ],
+ "tests": [
+  {
+   "distance": 1,
+   "path": "rust/dc-store/src/lib.rs"
+  },
+  {
+   "distance": 1,
+   "path": "rust/dc-store/src/records.rs"
+  },
+  {
+   "distance": 1,
+   "path": "rust/dc-store/tests/integrity.rs"
+  },
+  {
+   "distance": 1,
+   "path": "rust/dc-store/tests/leases.rs"
+  },
+  {
+   "distance": 1,
+   "path": "rust/dc-store/tests/phase3_stress.rs"
+  },
+  {
+   "distance": 1,
+   "path": "rust/dc-store/tests/retired_tables.rs"
+  },
+  {
+   "distance": 1,
+   "path": "rust/dc-store/tests/tasks.rs"
+  },
+  {
+   "distance": 2,
+   "path": "rust/dc-store/src/schema.rs"
+  },
+  {
+   "distance": 2,
+   "path": "rust/dc-store/tests/gap_write_contention.rs"
+  },
+  {
+   "distance": 2,
+   "path": "rust/dc-store/tests/gaps.rs"
+  },
+  {
+   "distance": 2,
+   "path": "rust/dc-store/tests/gaps_replace.rs"
+  },
+  {
+   "distance": 2,
+   "path": "rust/dc-store/tests/lease_contract.rs"
+  }
+ ],
+ "unattributed": [],
+ "unavailable": [
+  {
+   "depth": 3,
+   "kind": "impact_incomplete",
+   "reached": 169
+  }
+ ]
+}

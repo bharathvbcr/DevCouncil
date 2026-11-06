@@ -1,0 +1,113 @@
+     Running unittests src/lib.rs (t/debug/deps/ca-360786f638dab802)
+
+running 2 tests
+test t::lib_ok ... ok
+test t::lib_bad ... FAILED
+
+failures:
+
+---- t::lib_bad stdout ----
+
+thread 't::lib_bad' (141038412) panicked at ca/src/lib.rs:2:87:
+assertion `left == right` failed
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    t::lib_bad
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p ca --lib`
+     Running unittests src/main.rs (t/debug/deps/ca-5a4d3038c399bb82)
+
+running 1 test
+test bin_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/foo.rs (t/debug/deps/foo-2a17bd5b7e73d138)
+
+running 1 test
+test integ_bad ... FAILED
+
+failures:
+
+---- integ_bad stdout ----
+
+thread 'integ_bad' (141038418) panicked at ca/tests/foo.rs:1:24:
+assertion failed: false
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    integ_bad
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p ca --test foo`
+     Running unittests src/lib.rs (t/debug/deps/cb-3edadd32a602f0bd)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/it.rs (t/debug/deps/it-8d61c0927f5bd442)
+
+running 1 test
+test m::in_m ... FAILED
+
+failures:
+
+---- m::in_m stdout ----
+
+thread 'm::in_m' (141038433) panicked at cb/tests/m.rs:1:19:
+assertion failed: false
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    m::in_m
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p cb --test it`
+   Doc-tests ca
+
+running 1 test
+test ca/src/lib.rs - d (line 3) ... FAILED
+
+failures:
+
+---- ca/src/lib.rs - d (line 3) stdout ----
+Test executable failed (exit status: 101).
+
+stderr:
+
+thread 'main' (141038498) panicked at ca/src/lib.rs:3:1:
+assertion `left == right` failed
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+
+failures:
+    ca/src/lib.rs - d (line 3)
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+error: doctest failed, to rerun pass `-p ca --doc`
+   Doc-tests cb
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: 4 targets failed:
+    `-p ca --lib`
+    `-p ca --test foo`
+    `-p cb --test it`
+    `-p ca --doc`

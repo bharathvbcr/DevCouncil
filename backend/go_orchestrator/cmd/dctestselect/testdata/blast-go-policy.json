@@ -1,0 +1,185 @@
+{
+ "change": "backend/go_orchestrator/policy/command.go:1-200",
+ "changed_files": [
+  {
+   "path": "backend/go_orchestrator/policy/command.go",
+   "ranges": [
+    {
+     "deletion_only": false,
+     "end_line": 200,
+     "start_line": 1
+    }
+   ],
+   "status": {
+    "kind": "modified"
+   }
+  }
+ ],
+ "complete": false,
+ "files": [
+  {
+   "changed": true,
+   "nearest_distance": 0,
+   "path": "backend/go_orchestrator/policy/command.go",
+   "symbols": 13
+  },
+  {
+   "changed": false,
+   "nearest_distance": 1,
+   "path": "backend/go_orchestrator/policy/command_hardening_test.go",
+   "symbols": 11
+  },
+  {
+   "changed": false,
+   "nearest_distance": 1,
+   "path": "backend/go_orchestrator/policy/split_quotes_test.go",
+   "symbols": 6
+  }
+ ],
+ "impacted": [
+  {
+   "distance": 1,
+   "file_path": "backend/go_orchestrator/cmd/devcouncil/liveness_test.go",
+   "qualified_name": "backend/go_orchestrator/cmd/devcouncil/liveness_test.go::TestPolicyNamesOnlyLiveCommands"
+  },
+  {
+   "distance": 1,
+   "file_path": "backend/go_orchestrator/gate/gate.go",
+   "qualified_name": "backend/go_orchestrator/gate/gate.go::Gate.EvaluateCommand"
+  },
+  {
+   "distance": 1,
+   "file_path": "backend/go_orchestrator/policy/command.go",
+   "qualified_name": "backend/go_orchestrator/policy/command.go::CommandGate.evaluateSingleCommand"
+  },
+  {
+   "distance": 1,
+   "file_path": "backend/go_orchestrator/policy/command.go",
+   "qualified_name": "backend/go_orchestrator/policy/command.go::CommandGate.finish"
+  }
+ ],
+ "modules": [
+  {
+   "changed": true,
+   "files": 16,
+   "nearest_distance": 0,
+   "path": "backend/go_orchestrator/policy",
+   "symbols": 63,
+   "test_signal": "stale"
+  },
+  {
+   "changed": false,
+   "files": 17,
+   "nearest_distance": 1,
+   "path": "backend/go_orchestrator/gate",
+   "symbols": 44,
+   "test_signal": "stale"
+  }
+ ],
+ "owners": [
+  {
+   "email": "bharath.vbcr@gmail.com",
+   "name": "BHARATH CHANDRA VADDARAM"
+  }
+ ],
+ "seeds": [
+  {
+   "changed_lines": 49,
+   "deletion_only": false,
+   "end_line": 180,
+   "file_path": "backend/go_orchestrator/policy/command.go",
+   "qualified_name": "backend/go_orchestrator/policy/command.go::CommandGate.EvaluateCommand",
+   "start_line": 132
+  },
+  {
+   "changed_lines": 20,
+   "deletion_only": false,
+   "end_line": 115,
+   "file_path": "backend/go_orchestrator/policy/command.go",
+   "qualified_name": "backend/go_orchestrator/policy/command.go::CommandGate",
+   "start_line": 96
+  },
+  {
+   "changed_lines": 11,
+   "deletion_only": false,
+   "end_line": 220,
+   "file_path": "backend/go_orchestrator/policy/command.go",
+   "qualified_name": "backend/go_orchestrator/policy/command.go::CommandGate.evaluate",
+   "start_line": 190
+  },
+  {
+   "changed_lines": 9,
+   "deletion_only": false,
+   "end_line": 62,
+   "file_path": "backend/go_orchestrator/policy/command.go",
+   "qualified_name": "backend/go_orchestrator/policy/command.go::NoTaskAllowedCommands",
+   "start_line": 54
+  },
+  {
+   "changed_lines": 5,
+   "deletion_only": false,
+   "end_line": 92,
+   "file_path": "backend/go_orchestrator/policy/command.go",
+   "qualified_name": "backend/go_orchestrator/policy/command.go::LeaseLifecycleAllowedCommands",
+   "start_line": 88
+  }
+ ],
+ "tests": [
+  {
+   "distance": 1,
+   "path": "backend/go_orchestrator/cmd/devcouncil/liveness_test.go"
+  },
+  {
+   "distance": 1,
+   "path": "backend/go_orchestrator/policy/command_bindings_test.go"
+  },
+  {
+   "distance": 1,
+   "path": "backend/go_orchestrator/policy/command_hardening_test.go"
+  },
+  {
+   "distance": 1,
+   "path": "backend/go_orchestrator/policy/command_harnessonly_test.go"
+  },
+  {
+   "distance": 1,
+   "path": "backend/go_orchestrator/policy/command_readonly_args_test.go"
+  },
+  {
+   "distance": 1,
+   "path": "backend/go_orchestrator/policy/command_secretread_test.go"
+  },
+  {
+   "distance": 1,
+   "path": "backend/go_orchestrator/policy/command_test.go"
+  },
+  {
+   "distance": 1,
+   "path": "backend/go_orchestrator/policy/commandfuzz_test.go"
+  },
+  {
+   "distance": 1,
+   "path": "backend/go_orchestrator/policy/engine_oracle_test.go"
+  },
+  {
+   "distance": 1,
+   "path": "backend/go_orchestrator/policy/exec_boundary_test.go"
+  },
+  {
+   "distance": 1,
+   "path": "backend/go_orchestrator/policy/git_read_argument_test.go"
+  },
+  {
+   "distance": 1,
+   "path": "backend/go_orchestrator/policy/matcher_test.go"
+  }
+ ],
+ "unattributed": [],
+ "unavailable": [
+  {
+   "depth": 3,
+   "kind": "impact_incomplete",
+   "reached": 105
+  }
+ ]
+}

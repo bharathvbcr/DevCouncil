@@ -1,0 +1,528 @@
+{
+ "change": "HEAD~3..75bdac7d597816b990ff910a198e69784e0326f2",
+ "changed_files": [
+  {
+   "path": "rust/dc-grep/src/index.rs",
+   "ranges": [
+    {
+     "deletion_only": false,
+     "end_line": 421,
+     "start_line": 417
+    },
+    {
+     "deletion_only": false,
+     "end_line": 442,
+     "start_line": 437
+    },
+    {
+     "deletion_only": false,
+     "end_line": 1900,
+     "start_line": 1766
+    }
+   ],
+   "status": {
+    "kind": "modified"
+   }
+  },
+  {
+   "path": "rust/dc-grep/src/lexical.rs",
+   "ranges": [
+    {
+     "deletion_only": false,
+     "end_line": 356,
+     "start_line": 354
+    },
+    {
+     "deletion_only": false,
+     "end_line": 397,
+     "start_line": 381
+    },
+    {
+     "deletion_only": false,
+     "end_line": 460,
+     "start_line": 451
+    },
+    {
+     "deletion_only": false,
+     "end_line": 462,
+     "start_line": 462
+    },
+    {
+     "deletion_only": false,
+     "end_line": 466,
+     "start_line": 464
+    },
+    {
+     "deletion_only": false,
+     "end_line": 468,
+     "start_line": 468
+    },
+    {
+     "deletion_only": false,
+     "end_line": 472,
+     "start_line": 471
+    }
+   ],
+   "status": {
+    "kind": "modified"
+   }
+  },
+  {
+   "path": "rust/dc-grep/src/lexical/store.rs",
+   "ranges": [
+    {
+     "deletion_only": false,
+     "end_line": 809,
+     "start_line": 797
+    },
+    {
+     "deletion_only": false,
+     "end_line": 1226,
+     "start_line": 1206
+    }
+   ],
+   "status": {
+    "kind": "modified"
+   }
+  },
+  {
+   "path": "rust/dc-grep/src/lib.rs",
+   "ranges": [
+    {
+     "deletion_only": false,
+     "end_line": 53,
+     "start_line": 53
+    },
+    {
+     "deletion_only": false,
+     "end_line": 907,
+     "start_line": 847
+    },
+    {
+     "deletion_only": false,
+     "end_line": 1588,
+     "start_line": 1562
+    }
+   ],
+   "status": {
+    "kind": "modified"
+   }
+  },
+  {
+   "path": "rust/devmap-cli/src/hook.rs",
+   "ranges": [
+    {
+     "deletion_only": false,
+     "end_line": 753,
+     "start_line": 742
+    },
+    {
+     "deletion_only": false,
+     "end_line": 758,
+     "start_line": 756
+    },
+    {
+     "deletion_only": false,
+     "end_line": 762,
+     "start_line": 762
+    },
+    {
+     "deletion_only": false,
+     "end_line": 768,
+     "start_line": 766
+    },
+    {
+     "deletion_only": false,
+     "end_line": 774,
+     "start_line": 770
+    },
+    {
+     "deletion_only": false,
+     "end_line": 796,
+     "start_line": 778
+    },
+    {
+     "deletion_only": false,
+     "end_line": 1797,
+     "start_line": 1793
+    },
+    {
+     "deletion_only": false,
+     "end_line": 2131,
+     "start_line": 2100
+    },
+    {
+     "deletion_only": false,
+     "end_line": 2149,
+     "start_line": 2133
+    },
+    {
+     "deletion_only": false,
+     "end_line": 2151,
+     "start_line": 2151
+    },
+    {
+     "deletion_only": false,
+     "end_line": 2168,
+     "start_line": 2160
+    },
+    {
+     "deletion_only": false,
+     "end_line": 2174,
+     "start_line": 2174
+    },
+    {
+     "deletion_only": false,
+     "end_line": 2426,
+     "start_line": 2417
+    },
+    {
+     "deletion_only": false,
+     "end_line": 3516,
+     "start_line": 3512
+    },
+    {
+     "deletion_only": false,
+     "end_line": 3918,
+     "start_line": 3553
+    }
+   ],
+   "status": {
+    "kind": "modified"
+   }
+  },
+  {
+   "path": "rust/devmap-extract/src/embedded.rs",
+   "ranges": [
+    {
+     "deletion_only": false,
+     "end_line": 520,
+     "start_line": 520
+    },
+    {
+     "deletion_only": false,
+     "end_line": 543,
+     "start_line": 543
+    },
+    {
+     "deletion_only": false,
+     "end_line": 589,
+     "start_line": 587
+    },
+    {
+     "deletion_only": false,
+     "end_line": 643,
+     "start_line": 643
+    },
+    {
+     "deletion_only": false,
+     "end_line": 696,
+     "start_line": 696
+    },
+    {
+     "deletion_only": false,
+     "end_line": 705,
+     "start_line": 705
+    },
+    {
+     "deletion_only": false,
+     "end_line": 1204,
+     "start_line": 1204
+    },
+    {
+     "deletion_only": false,
+     "end_line": 1215,
+     "start_line": 1215
+    },
+    {
+     "deletion_only": false,
+     "end_line": 1302,
+     "start_line": 1283
+    },
+    {
+     "deletion_only": false,
+     "end_line": 1837,
+     "start_line": 1794
+    }
+   ],
+   "status": {
+    "kind": "modified"
+   }
+  },
+  {
+   "path": "rust/devmap-extract/src/literals.rs",
+   "ranges": [
+    {
+     "deletion_only": false,
+     "end_line": 341,
+     "start_line": 341
+    }
+   ],
+   "status": {
+    "kind": "modified"
+   }
+  },
+  {
+   "path": "rust/devmap-extract/src/notebook.rs",
+   "ranges": [
+    {
+     "deletion_only": false,
+     "end_line": 19,
+     "start_line": 17
+    },
+    {
+     "deletion_only": false,
+     "end_line": 623,
+     "start_line": 623
+    },
+    {
+     "deletion_only": false,
+     "end_line": 635,
+     "start_line": 626
+    },
+    {
+     "deletion_only": false,
+     "end_line": 667,
+     "start_line": 660
+    },
+    {
+     "deletion_only": false,
+     "end_line": 815,
+     "start_line": 787
+    },
+    {
+     "deletion_only": false,
+     "end_line": 1109,
+     "start_line": 1019
+    }
+   ],
+   "status": {
+    "kind": "modified"
+   }
+  },
+  {
+   "path": "rust/devmap-extract/src/treesitter/entry.rs",
+   "ranges": [
+    {
+     "deletion_only": false,
+     "end_line": 1108,
+     "start_line": 1104
+    }
+   ],
+   "status": {
+    "kind": "modified"
+   }
+  }
+ ],
+ "complete": false,
+ "files": [
+  {
+   "changed": true,
+   "nearest_distance": 0,
+   "path": "rust/dc-grep/src/lib.rs",
+   "symbols": 42
+  },
+  {
+   "changed": true,
+   "nearest_distance": 0,
+   "path": "rust/devmap-cli/src/hook.rs",
+   "symbols": 37
+  },
+  {
+   "changed": true,
+   "nearest_distance": 0,
+   "path": "rust/dc-grep/src/lexical/store.rs",
+   "symbols": 24
+  }
+ ],
+ "impacted": [
+  {
+   "distance": 1,
+   "file_path": "rust/dc-grep/src/bin/dcgrep.rs",
+   "qualified_name": "rust/dc-grep/src/bin/dcgrep.rs::rank"
+  },
+  {
+   "distance": 1,
+   "file_path": "rust/dc-grep/src/index.rs",
+   "qualified_name": "rust/dc-grep/src/index.rs::Candidates.load"
+  },
+  {
+   "distance": 1,
+   "file_path": "rust/dc-grep/src/index.rs",
+   "qualified_name": "rust/dc-grep/src/index.rs::a_cache_from_the_previous_schema_is_refused_with_the_remedy"
+  },
+  {
+   "distance": 1,
+   "file_path": "rust/dc-grep/src/index.rs",
+   "qualified_name": "rust/dc-grep/src/index.rs::rank"
+  }
+ ],
+ "modules": [
+  {
+   "changed": true,
+   "files": 3,
+   "nearest_distance": 0,
+   "path": "rust/dc-grep/src",
+   "symbols": 61,
+   "test_signal": "changed"
+  },
+  {
+   "changed": true,
+   "files": 4,
+   "nearest_distance": 0,
+   "path": "rust/devmap-extract/src/treesitter",
+   "symbols": 47,
+   "test_signal": "changed"
+  }
+ ],
+ "owners": [
+  {
+   "email": "bharath.vbcr@gmail.com",
+   "name": "BHARATH CHANDRA VADDARAM"
+  }
+ ],
+ "seeds": [
+  {
+   "changed_lines": 58,
+   "deletion_only": false,
+   "end_line": 3675,
+   "file_path": "rust/devmap-cli/src/hook.rs",
+   "qualified_name": "rust/devmap-cli/src/hook.rs::a_symlinked_gitlink_or_worktree_dir_does_not_opt_the_cwd_in",
+   "start_line": 3618
+  },
+  {
+   "changed_lines": 47,
+   "deletion_only": false,
+   "end_line": 1068,
+   "file_path": "rust/devmap-extract/src/notebook.rs",
+   "qualified_name": "rust/devmap-extract/src/notebook.rs::a_python_cell_literal_is_on_the_notebook",
+   "start_line": 1022
+  },
+  {
+   "changed_lines": 40,
+   "deletion_only": false,
+   "end_line": 1836,
+   "file_path": "rust/devmap-extract/src/embedded.rs",
+   "qualified_name": "rust/devmap-extract/src/embedded.rs::a_vue_or_svelte_script_literal_is_on_the_outer_file",
+   "start_line": 1797
+  },
+  {
+   "changed_lines": 37,
+   "deletion_only": false,
+   "end_line": 3743,
+   "file_path": "rust/devmap-cli/src/hook.rs",
+   "qualified_name": "rust/devmap-cli/src/hook.rs::a_forged_commondir_does_not_start_detach",
+   "start_line": 3707
+  },
+  {
+   "changed_lines": 37,
+   "deletion_only": false,
+   "end_line": 2146,
+   "file_path": "rust/devmap-cli/src/hook.rs",
+   "qualified_name": "rust/devmap-cli/src/hook.rs::pinned_lock_dir",
+   "start_line": 2109
+  },
+  {
+   "changed_lines": 37,
+   "deletion_only": false,
+   "end_line": 1108,
+   "file_path": "rust/devmap-extract/src/notebook.rs",
+   "qualified_name": "rust/devmap-extract/src/notebook.rs::a_rust_cell_index_survives_the_merge",
+   "start_line": 1072
+  }
+ ],
+ "tests": [
+  {
+   "distance": 0,
+   "path": "rust/dc-grep/src/index.rs"
+  },
+  {
+   "distance": 0,
+   "path": "rust/dc-grep/src/lexical/store.rs"
+  },
+  {
+   "distance": 0,
+   "path": "rust/dc-grep/src/lib.rs"
+  },
+  {
+   "distance": 0,
+   "path": "rust/devmap-cli/src/hook.rs"
+  },
+  {
+   "distance": 0,
+   "path": "rust/devmap-extract/src/embedded.rs"
+  },
+  {
+   "distance": 0,
+   "path": "rust/devmap-extract/src/notebook.rs"
+  },
+  {
+   "distance": 2,
+   "path": "rust/dc-grep/src/lexical/wordpiece.rs"
+  },
+  {
+   "distance": 2,
+   "path": "rust/dc-sparse-encode/tests/parity.rs"
+  },
+  {
+   "distance": 2,
+   "path": "rust/devmap-cli/tests/over_limit_files_are_listed_not_lost.rs"
+  },
+  {
+   "distance": 2,
+   "path": "rust/devmap-extract/src/treesitter/probe_deadlines_and_nesting_caps.rs"
+  },
+  {
+   "distance": 2,
+   "path": "rust/devmap-extract/src/treesitter/tests.rs"
+  },
+  {
+   "distance": 2,
+   "path": "rust/devmap-extract/tests/adversarial_corpus.rs"
+  }
+ ],
+ "unattributed": [
+  {
+   "end_line": 53,
+   "path": "rust/dc-grep/src/lib.rs",
+   "reason": {
+    "kind": "outside_every_symbol",
+    "lines_away": 18,
+    "nearest_symbol": "rust/dc-grep/src/lib.rs::SCHEMA_VERSION"
+   },
+   "start_line": 53
+  },
+  {
+   "end_line": 753,
+   "path": "rust/devmap-cli/src/hook.rs",
+   "reason": {
+    "kind": "outside_every_symbol",
+    "lines_away": 0,
+    "nearest_symbol": "rust/devmap-cli/src/hook.rs::main_checkout_of"
+   },
+   "start_line": 742
+  },
+  {
+   "end_line": 19,
+   "path": "rust/devmap-extract/src/notebook.rs",
+   "reason": {
+    "kind": "outside_every_symbol",
+    "lines_away": 14,
+    "nearest_symbol": "rust/devmap-extract/src/notebook.rs::Cell"
+   },
+   "start_line": 17
+  }
+ ],
+ "unavailable": [
+  {
+   "kind": "change_unattributed",
+   "lines": 16,
+   "ranges": 3
+  },
+  {
+   "depth": 3,
+   "kind": "impact_incomplete",
+   "reached": 238
+  }
+ ]
+}

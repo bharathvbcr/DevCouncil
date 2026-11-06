@@ -1,0 +1,58 @@
+{
+ "change": "backend/go_orchestrator/policy/policy.go",
+ "changed_files": [
+  {
+   "path": "backend/go_orchestrator/policy/policy.go",
+   "ranges": [
+    {
+     "deletion_only": false,
+     "end_line": 4294967295,
+     "start_line": 1
+    }
+   ],
+   "status": {
+    "kind": "modified"
+   }
+  }
+ ],
+ "complete": false,
+ "files": [
+  {
+   "changed": true,
+   "nearest_distance": 0,
+   "path": "backend/go_orchestrator/policy/policy.go",
+   "symbols": 0
+  }
+ ],
+ "impacted": [],
+ "modules": [
+  {
+   "changed": true,
+   "files": 1,
+   "nearest_distance": 0,
+   "path": "backend/go_orchestrator/policy",
+   "symbols": 0,
+   "test_signal": "na"
+  }
+ ],
+ "owners": [],
+ "seeds": [],
+ "tests": [],
+ "unattributed": [
+  {
+   "end_line": 4294967295,
+   "path": "backend/go_orchestrator/policy/policy.go",
+   "reason": {
+    "kind": "file_not_indexed"
+   },
+   "start_line": 1
+  }
+ ],
+ "unavailable": [
+  {
+   "kind": "change_unattributed",
+   "lines": 4294967295,
+   "ranges": 1
+  }
+ ]
+}
