@@ -184,7 +184,7 @@ fn is_unsafe_index_root(root: &Path) -> bool {
 fn refuse_unsafe_index_root(cli: &Cli) -> Result<(), String> {
     let indexes = matches!(
         cli.command,
-        Commands::Build(_) | Commands::Manifest(_) | Commands::Serve(_)
+        Commands::Build(_) | Commands::Seed(_) | Commands::Manifest(_) | Commands::Serve(_)
     );
     if !indexes {
         return Ok(());

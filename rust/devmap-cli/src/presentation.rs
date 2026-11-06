@@ -122,6 +122,7 @@ fn profile(command: &Commands) -> Option<(&'static str, &'static str)> {
         Commands::Integrate(_) => ("Host integration", "Connecting your tools"),
         Commands::Ask(_) => ("Ask", "Finding symbols by what they do"),
         Commands::Skeleton(_) => ("Skeleton", "Listing signatures without bodies"),
+        Commands::Seed(_) => ("Seed", "Cloning worktree index"),
     })
 }
 

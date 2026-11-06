@@ -224,18 +224,21 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
     let _writer = progress.timed("writer:wait", || {
         Store::lock_writer_at(&cli.db(), Store::WRITER_LOCK_WAIT)
     })?;
-    // A seed that placed the main checkout's manifest artifacts makes this
-    // build write the manifest too: the clones describe the main checkout
-    // until replaced, and replacing them now is what lets the writer patch
-    // them block by block instead of laying a fresh file down later.
-    let seeded_artifacts = seed.as_ref().is_some_and(|seed| seed.apply(cli, progress));
-    let write_manifest = &(*write_manifest || seeded_artifacts);
+    // A staged `--seed-from` stays off `cli.db()` until this worktree's own
+    // generation commits, and always writes consumer artifacts (`repo_map.json`
+    // and `code_graph.json`) so a seeded worktree never lacks a manifest (`F2`).
+    let mut staged_seed = seed.as_ref().and_then(|seed| seed.stage(cli, progress));
+    let write_manifest = &(*write_manifest || staged_seed.is_some());
     // `build_ms` starts here, once the lock is held, so it means the same on
     // this path as on the daemon's: time spent building, not time spent
     // queued behind another writer (that is the `writer:wait` stage). It ends
     // after the vacuum, below.
     let build_started = std::time::Instant::now();
-    let store = progress.timed("store:open", || Store::open(cli.db()))?;
+    let active_db = staged_seed
+        .as_ref()
+        .map(|s| s.staged_path().to_path_buf())
+        .unwrap_or_else(|| cli.db());
+    let store = progress.timed("store:open", || Store::open(&active_db))?;
     // Whose store this is comes before whether it is sound, and both are read
     // before anything is written: a store of another live worktree is refused
     // whether it is damaged or not, and a damaged one is never answered
@@ -243,7 +246,7 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
     // refusal, never a pass.
     store.refuse_a_live_foreign_owner(path)?;
     if let Some(damage) = store.search_index_unreadable()? {
-        return Err(damaged_store_refusal(&cli.db(), damage));
+        return Err(damaged_store_refusal(&active_db, damage));
     }
     if let Some(previous) = store.bind_repo_root(path)? {
         progress.note(format_args!(
@@ -571,6 +574,12 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
             // report NOT FRESH after a skip that had nothing to do.
             let head = current_git_head(path).unwrap_or_else(|_| "unavailable".to_string());
             store.restamp_latest_head(&head)?;
+            let store = if let Some(staged) = staged_seed.take() {
+                drop(store);
+                staged.commit(progress)?
+            } else {
+                store
+            };
             // The artifacts, from the generation this build just
             // proved current. On this path the stamp almost always
             // holds, so nothing is read out of the store and nothing is
@@ -1092,6 +1101,12 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
         }
     }
 
+    let store = if let Some(staged) = staged_seed.take() {
+        drop(store);
+        staged.commit(progress)?
+    } else {
+        store
+    };
     if *write_manifest {
         progress.stage(5, "writing consumer artifacts");
     }

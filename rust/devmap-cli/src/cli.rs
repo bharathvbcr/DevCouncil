@@ -152,6 +152,7 @@ impl Cli {
         }
         match &self.command {
             Commands::Build(commands::build::Args { path, .. })
+            | Commands::Seed(commands::seed::Args { path, .. })
             | Commands::Manifest(commands::manifest::Args { path, .. })
             | Commands::MapHtml(commands::map_html::Args { path, .. })
             | Commands::Freshness(commands::freshness::Args { path, .. })
@@ -384,6 +385,8 @@ impl From<ResolveLimitFlags> for devmap_resolve::ResolutionLimits {
 pub(crate) enum Commands {
     /// Cold or incremental build of the code-intelligence graph
     Build(commands::build::Args),
+    /// Seed or stack a linked worktree's index from a registered checkout
+    Seed(commands::seed::Args),
     Search(commands::search::Args),
     /// Plain-language find over names, docstrings, and the call graph.
     ///
@@ -959,6 +962,7 @@ pub(crate) fn validate_limits(command: &Commands) -> Result<(), String> {
         }
         // No numeric query arguments reach the engine from these.
         Commands::Build(_)
+        | Commands::Seed(_)
         | Commands::Status(_)
         | Commands::Doctor
         | Commands::SessionReport(_)

@@ -381,8 +381,21 @@ fn run_hook_inner(
         }
         HookEvent::PostToolUse => {
             let started = Instant::now();
-            let budget_note =
-                detach_roots(executable, &selection.roots, DETACH_BUDGET, detach_build)?;
+            let budget_note = if !selection.roots.is_empty() {
+                detach_roots(
+                    executable,
+                    &selection.roots,
+                    DETACH_BUDGET,
+                    detach_post_tool_root,
+                )?
+            } else if pinned_root.is_none() {
+                if let Some((wt, main)) = unindexed_linked_worktree_for_post_tool(&payload) {
+                    let _ = detach_seeded_build(executable, &wt, &main);
+                }
+                None
+            } else {
+                None
+            };
             // After the detach is scheduled: short blast from the generation
             // already on disk. Never waits for the rebuild. Budget miss says
             // so and still exits 0.
@@ -737,64 +750,10 @@ fn unindexed_worktree_notice(payload: &Value, executable: &Path) -> Option<Value
     }))
 }
 
-/// Largest gitlink or `commondir` file read. Both hold one path.
-const MAX_GITLINK_BYTES: u64 = 4096;
-
 /// The main checkout of the linked worktree at `root`, when git has registered
-/// that worktree.
-///
-/// Three paths have to agree. The gitdir is `<main>/.git/worktrees/<name>`.
-/// Its `commondir` canonicalizes to that same `<main>/.git`. Its `gitdir` file
-/// names this root's `.git`, and this root's `.git` is a regular file. A
-/// `commondir` whose final component is `.git` is not enough: the directory a
-/// gitlink names is writable by whoever planted the gitlink.
-///
-/// `None` when `root` is itself a main checkout (its `.git` is a directory),
-/// when the common directory is bare, when this root is not the registered
-/// worktree, or when any of it cannot be read.
+/// that worktree. Delegates to the canonical validator in `devmap_extract::paths`.
 pub(crate) fn main_checkout_of(root: &Path) -> Option<PathBuf> {
-    let gitlink = root.join(".git");
-    // A symlink is not this checkout's gitlink. Following it would adopt
-    // whatever worktree the link points at.
-    if !gitlink.symlink_metadata().is_ok_and(|meta| meta.is_file()) {
-        return None;
-    }
-    let text = devmap_query::stat_memo::read_bounded(&gitlink, MAX_GITLINK_BYTES)?;
-    let gitdir_spec = text
-        .lines()
-        .find_map(|line| line.strip_prefix("gitdir:"))
-        .map(str::trim)
-        .filter(|path| !path.is_empty() && !path.contains('\0'))?;
-    let gitdir = root.join(gitdir_spec);
-    let common_text =
-        devmap_query::stat_memo::read_bounded(&gitdir.join("commondir"), MAX_GITLINK_BYTES)?;
-    let common_text = common_text.trim();
-    if common_text.is_empty() || common_text.contains('\0') {
-        return None;
-    }
-    let common = gitdir.join(common_text).canonicalize().ok()?;
-    if common.file_name()? != ".git" {
-        return None;
-    }
-    let gitdir = gitdir.canonicalize().ok()?;
-    let worktrees = gitdir.parent()?;
-    if worktrees.file_name()? != "worktrees" || worktrees.parent()? != common {
-        return None;
-    }
-    let registered =
-        devmap_query::stat_memo::read_bounded(&gitdir.join("gitdir"), MAX_GITLINK_BYTES)?;
-    let registered = registered.trim();
-    if registered.is_empty() || registered.contains('\0') {
-        return None;
-    }
-    let registered = gitdir.join(registered).canonicalize().ok()?;
-    let gitlink = gitlink.canonicalize().ok()?;
-    let root = root.canonicalize().ok()?;
-    if registered != gitlink || registered.parent()? != root {
-        return None;
-    }
-    let main = common.parent()?.to_path_buf();
-    (main != root).then_some(main)
+    devmap_extract::paths::main_checkout_of(root)
 }
 
 fn push_unique(out: &mut Vec<PathBuf>, path: Option<PathBuf>) {
@@ -820,14 +779,6 @@ fn resolve_repo_root(path: &Path) -> anyhow::Result<PathBuf> {
     // ...but never out of this working tree. A linked worktree nested inside
     // its parent checkout (`.claude/worktrees/<lane>`) has no store until it
     // is built locally, and the parent's store describes a different commit.
-    // Without this bound the walk reaches the parent and the session brief
-    // reports that index as this session's: `status` says `query_ready:false`
-    // while the hook says "ready, 11789 symbols", which is the one thing a
-    // check that could not run must never do. `state_discovery_contract`
-    // already holds the CLI to the same rule
-    // (`a_new_linked_worktree_is_truthfully_missing_until_bootstrapped_locally`);
-    // this is the hook honouring it. Outside git there is no repository
-    // identity to cross, so discovery there is left unbounded.
     let boundary = devmap_extract::git_worktree_root(&cursor);
     loop {
         if store_exists(&cursor) {
@@ -849,10 +800,7 @@ fn canonicalize_existing(path: &Path) -> anyhow::Result<PathBuf> {
         .with_context(|| format!("cannot resolve {}", path.display()))
 }
 
-fn store_exists(root: &Path) -> bool {
-    // Clear DEVMAP_HOME influence for hook discovery: the store must live under
-    // the repository itself. Using the path helpers with an empty home override
-    // would require plumbing; check both layout names directly.
+fn has_sqlite_store(root: &Path) -> bool {
     root.join(".devmap")
         .join("codeintel")
         .join("devmap.sqlite")
@@ -862,6 +810,25 @@ fn store_exists(root: &Path) -> bool {
             .join("codeintel")
             .join("devmap.sqlite")
             .is_file()
+}
+
+fn has_stack_lease(root: &Path) -> bool {
+    root.join(".devmap")
+        .join("codeintel")
+        .join("stack_lease.json")
+        .is_file()
+        || root
+            .join(".devcouncil")
+            .join("codeintel")
+            .join("stack_lease.json")
+            .is_file()
+}
+
+fn store_exists(root: &Path) -> bool {
+    // Clear DEVMAP_HOME influence for hook discovery: the store must live under
+    // the repository itself. Check both layout names directly for either a
+    // standalone SQLite store or a zero-copy stacked worktree lease.
+    has_sqlite_store(root) || has_stack_lease(root)
 }
 
 fn is_unsafe_root(root: &Path) -> bool {
@@ -1674,7 +1641,23 @@ fn store_db_path(root: &Path) -> Option<PathBuf> {
         root.join(".devcouncil/codeintel/devmap.sqlite"),
         root.join(".devmap/codeintel/devmap.sqlite"),
     ];
-    candidates.into_iter().find(|path| path.is_file())
+    if let Some(found) = candidates.into_iter().find(|path| path.is_file()) {
+        return Some(found);
+    }
+    for lease_path in [
+        root.join(".devcouncil/codeintel/stack_lease.json"),
+        root.join(".devmap/codeintel/stack_lease.json"),
+    ] {
+        if lease_path.is_file() {
+            if let Ok(lease) = devmap_query::StackLease::read_from(&lease_path) {
+                let base_sqlite = lease.base_sqlite_path();
+                if base_sqlite.is_file() {
+                    return Some(base_sqlite);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn repo_relative_path(root: &Path, absolute: &Path) -> Option<String> {
@@ -2007,6 +1990,64 @@ fn join_notes(first: Option<String>, second: Option<String>) -> Option<String> {
         (Some(only), None) | (None, Some(only)) => Some(only),
         (None, None) => None,
     }
+}
+
+fn detach_post_tool_root(executable: &Path, root: &Path) -> anyhow::Result<()> {
+    if has_stack_lease(root) && !has_sqlite_store(root) {
+        return detach_stack_sync(executable, root);
+    }
+    detach_build(executable, root)
+}
+
+fn detach_stack_sync(executable: &Path, root: &Path) -> anyhow::Result<()> {
+    let lock_dir = coalesce_lock_dir(root, "stack-sync");
+    if !try_acquire_lock_dir(&lock_dir)? {
+        return Ok(());
+    }
+    let args: Vec<std::ffi::OsString> = vec![
+        "--root".into(),
+        root.as_os_str().to_owned(),
+        "seed".into(),
+        "--sync-delta".into(),
+    ];
+    let args_ref: Vec<&OsStr> = args.iter().map(std::ffi::OsString::as_os_str).collect();
+    spawn_detached_with_cleanup(executable, &args_ref, &lock_dir)
+}
+
+fn unindexed_linked_worktree_for_post_tool(payload: &Value) -> Option<(PathBuf, PathBuf)> {
+    let mut candidates = Vec::new();
+    if let Some(fp) = file_path_from_payload(payload) {
+        candidates.push(fp);
+    }
+    candidates.extend(apply_patch_paths(payload));
+    if let Some(cwd) = string_path(payload, "cwd") {
+        candidates.push(cwd);
+    }
+    for candidate in candidates.into_iter().take(MAX_HOOK_ROOT_CANDIDATES) {
+        let probe = if candidate.exists() {
+            candidate
+        } else if let Some(parent) = candidate.parent().filter(|p| p.exists()) {
+            parent.to_path_buf()
+        } else {
+            continue;
+        };
+        let Ok(canon) = canonicalize_existing(&probe) else {
+            continue;
+        };
+        let Some(wt) = devmap_extract::git_worktree_root(&canon) else {
+            continue;
+        };
+        if is_unsafe_root(&wt) || store_exists(&wt) {
+            return None;
+        }
+        if let Some(main) = main_checkout_of(&wt)
+            .filter(|main| !is_unsafe_root(main) && store_exists(main))
+        {
+            return Some((wt, main));
+        }
+        return None;
+    }
+    None
 }
 
 fn detach_build(executable: &Path, root: &Path) -> anyhow::Result<()> {

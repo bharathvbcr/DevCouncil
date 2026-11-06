@@ -1,0 +1,11 @@
+# Research & Design Rationale: 002 - Zero-Copy Agentic Worktrees
+
+## 1. Empirical Bottlenecks & Failure Analysis
+1. **SQLite Overflow Rewrite (`F6`, `F8`)**: `generations.repo_root` is stored after multi-megabyte `analysis_json` blobs. `UPDATE generations SET repo_root = ?1` rewrites `514` overflow pages (`8.03 MiB`, `243.7 ms`). Storing `seeded_repo_root` in single-row `pending_state` touches `1–4` B-tree pages (`<=16 KiB`, `<1 ms`).
+2. **SQLite WAL Snapshot Safety (`F7`)**: Copying `devmap.sqlite` without `-wal` loses uncheckpointed frames, while `VACUUM INTO` allocates `~272 MiB` of non-CoW private blocks. Acquiring `WAL_READ_LOCK` (`BEGIN DEFERRED; SELECT 1 FROM sqlite_master LIMIT 1;`) after `TRUNCATE`/`PASSIVE` checkpoint pins `mxFrame`, allowing safe APFS `clonefile` whenever `log == checkpointed`.
+3. **Immutable Flag Hazard (`OQ1`)**: Opening a live writer database with `?immutable=1` causes `SQLITE_CORRUPT` / stale page reads if any process mutates it. Only `chmod 0444` snapshots published in `<common_git_dir>/devmap/bases/gen-<G>/` may ever be opened with `immutable=1`.
+4. **Cargo Fingerprinting (`F12`, `F13`, `F14`, `OQ4`)**:
+   - Sharing `build.build-dir` across branches in Cargo `1.99.0` causes silent cross-branch `.rlib` linking (`F12`). Per-worktree CoW-cloned `target/` preserves isolation.
+   - `build-script-build` outputs embed absolute paths (`OUT_DIR`, `CARGO_MANIFEST_DIR`); boundary-aware rewriting (`!continues_path_component`) + `File::set_times` restores Cargo fingerprint freshness without corrupting binary artifacts or sibling prefix names (`lane-1` vs `lane-10`).
+   - Proc-macros execute arbitrary host I/O via `dlopen` without emitting `.d` dep-info; therefore `COMPILE_ONLY_MANIFEST_DIR_SENTINEL` normalization is sound only when every loaded proc-macro `.dylib` matches a pinned Pure-AST allowlist and source tokens exclude `env!("CARGO_MANIFEST_DIR")` / `include*!`.
+5. **Manvi Upstream Crate Symlinks (`F17`)**: `Manvi/crates/dc-*` are deliberately symlinked to `../../DevCouncil/rust/dc-*` and enforced by `TestCratePinsMatchDevCouncil`. Excluding `crates/dc-*` via `Manvi/.devmapignore` eliminates all `7` `discovery_refused` warnings in `Manvi` while preserving single-source ownership.

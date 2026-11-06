@@ -73,6 +73,14 @@ type Client struct {
 	// probeTimeout bounds one probe. It is a field for the same reason
 	// maxOutput is: tests drive it instead of waiting out seconds.
 	probeTimeout time.Duration
+
+	// warmMu guards warmEnabled, warmDisabled, and warm (`devmap mcp` stdio session).
+	warmMu       sync.Mutex
+	warmEnabled  bool
+	warmDisabled bool
+	warmShared   bool
+	warm         *mcpSession
+	probeParent  *Client
 }
 
 // The probe's bounds and the failure cooldown. Every devmap build reports the
@@ -96,6 +104,15 @@ func New(binary, root string) *Client {
 		maxOutput: defaultMaxOutput, maxStderr: defaultMaxStderr,
 		probeTimeout: defaultProbeTimeout,
 	}
+}
+
+// NewWarm builds a client backed by a persistent warm `devmap mcp` stdio
+// session (`P0.3`), eliminating per-query process spawns. Callers should call
+// Close when finished with the client.
+func NewWarm(binary, root string) *Client {
+	c := New(binary, root)
+	c.warmEnabled = true
+	return c
 }
 
 // Probe asks the binary whether it supports what this harness requires, and
@@ -128,6 +145,9 @@ func New(binary, root string) *Client {
 // probe finishes for whoever asks next. Before this, one cancelled request
 // cached "presumed hung" for a minute in a long-lived host.
 func (c *Client) Probe(ctx context.Context) error {
+	if c.probeParent != nil {
+		return c.probeParent.Probe(ctx)
+	}
 	c.probeMu.Lock()
 	if !c.probedAt.IsZero() && c.probing == nil {
 		if c.probeErr == nil || time.Since(c.probedAt) < probeCooldown {
@@ -1058,6 +1078,9 @@ func assertShape[T any](command string, items []T) error {
 // complete. Callers that have nothing to say about stderr ignore it; the ones
 // that do run it through readNotices.
 func (c *Client) decode(ctx context.Context, into any, timeout time.Duration, args ...string) (said, error) {
+	if handled, err := c.decodeWarmMCP(ctx, into, timeout, args...); handled {
+		return said{}, err
+	}
 	out, err := c.invoke(ctx, timeout, nil, args...)
 	if err != nil {
 		return said{}, err

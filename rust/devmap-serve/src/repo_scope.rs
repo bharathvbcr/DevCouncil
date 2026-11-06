@@ -179,6 +179,14 @@ pub fn canonicalize_path(path: &Path) -> PathBuf {
 /// a file the user did not ask this binary to write, from a host whose cwd may
 /// not even be that repository.
 pub fn open_mcp_store(path: &Path) -> Result<Store, String> {
+    if path.file_name().and_then(|n| n.to_str()) == Some("base.sqlite") {
+        return Store::open_immutable_snapshot(path, None).map_err(|err| {
+            format!(
+                "immutable base snapshot at {} could not be opened: {err}",
+                path.display()
+            )
+        });
+    }
     match Store::open_read_only(path) {
         Ok(store) => Ok(store),
         Err(err) if Store::is_unsupported_schema(&err) => Err(format!(
@@ -193,21 +201,27 @@ will not be migrated in-place. Run `devmap build` in that repository. {err}",
     }
 }
 
-/// Validate `repo_path` and require that `paths::store_path` is a readable file.
+/// Validate `repo_path` and require that `paths::store_path` (or a valid
+/// `stack_lease.json` base snapshot) is a readable file.
 ///
-/// Never falls back to another repository: a missing store at the named root
-/// is a tool error naming that path.
+/// Never falls back to another repository: a missing store or corrupt lease at
+/// the named root is a tool error naming that path.
 pub fn store_for_repo_path(raw: &str) -> Result<RepositoryRef, String> {
     let root = validate_repo_path(raw)?;
-    let store = devmap_extract::paths::store_path(&root);
-    if !store.is_file() {
+    let Some(store) = crate::root_resolve::effective_store_for_root(&root)? else {
+        let expected = devmap_extract::paths::store_path(&root);
+        let remedy = if devmap_extract::main_checkout_of(&root).is_some() {
+            " Run `devmap seed` (or `devmap build --manifest`) in that worktree first."
+        } else {
+            ""
+        };
         return Err(format!(
             "repo_path {}: no readable DevMap store at {}. This call will not fall back to \
-another repository.",
+another repository.{remedy}",
             root.display(),
-            store.display()
+            expected.display()
         ));
-    }
+    };
     Ok(RepositoryRef {
         root,
         store: devmap_extract::safe_fs::resolve_file_alias(&store)

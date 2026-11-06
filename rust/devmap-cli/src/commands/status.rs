@@ -29,6 +29,70 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     // Migrating is `build`'s job, where the caller asked for a write.
     let stored_schema = Store::stored_schema_version(cli.db())?;
     let Some(stored_schema) = stored_schema else {
+        let root_hint = cli.root_hint();
+        if cli.db.is_none() && devmap_extract::paths::stack_lease_path(&root_hint).is_file() {
+            match devmap_query::StackedStore::open(&root_hint) {
+                Ok(stacked) => {
+                    let st = stacked.status()?;
+                    let base_path = std::path::PathBuf::from(&st.base_dir).join("base.sqlite");
+                    let mut payload = store_status_fields(stacked.base_store(), &base_path)?;
+                    if st.dirty_files > 0 {
+                        payload.insert("is_fresh".into(), serde_json::json!(true));
+                    }
+                    payload.insert("stacked".into(), serde_json::to_value(&st)?);
+                    payload.insert("schema_outdated".into(), serde_json::json!(false));
+                    payload.insert(
+                        "schema_version".into(),
+                        serde_json::json!(devmap_store::CURRENT_SCHEMA_VERSION),
+                    );
+                    payload.insert(
+                        "expected_schema_version".into(),
+                        serde_json::json!(devmap_store::CURRENT_SCHEMA_VERSION),
+                    );
+                    payload.insert("capabilities".into(), kernel_capabilities());
+                    attach_rebuild_fields(&mut payload, false);
+                    payload.extend(host_contract_fields(
+                        Some(devmap_store::CURRENT_SCHEMA_VERSION),
+                        payload
+                            .get("generation_id")
+                            .and_then(serde_json::Value::as_i64),
+                        payload
+                            .get("search_index_damaged")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false),
+                    ));
+                    emit_json(cli, &serde_json::Value::Object(payload))?;
+                    return Ok(());
+                }
+                Err(err) => {
+                    let mut payload = serde_json::json!({
+                        "generation_id": serde_json::Value::Null,
+                        "pending_count": 0,
+                        "node_count": 0,
+                        "edge_count": 0,
+                        "is_fresh": false,
+                        "db_path": cli.db().display().to_string(),
+                        "degraded_reason": format!("stacked worktree store unreadable: {err:#}"),
+                        "quarantined_count": 0,
+                        "quarantined_paths": Vec::<String>::new(),
+                        "coverage_gaps": serde_json::Value::Null,
+                        "edge_resolution_source": serde_json::Value::Null,
+                        "edge_confidence_mismatches": serde_json::Value::Null,
+                        "resolution_rate": serde_json::Value::Null,
+                        "schema_outdated": false,
+                        "schema_version": serde_json::Value::Null,
+                        "expected_schema_version": devmap_store::CURRENT_SCHEMA_VERSION,
+                        "capabilities": kernel_capabilities(),
+                    });
+                    if let Some(obj) = payload.as_object_mut() {
+                        attach_rebuild_fields(obj, false);
+                    }
+                    extend_host_contract(&mut payload, None, None);
+                    emit_json(cli, &payload)?;
+                    return Ok(());
+                }
+            }
+        }
         let mut payload = serde_json::json!({
             "generation_id": serde_json::Value::Null,
             "pending_count": 0,
@@ -264,6 +328,7 @@ fn kernel_capabilities() -> serde_json::Value {
             "trace": has_command("trace"),
             "affected": has_command("affected"),
             "html": has_command("html"),
+            "seed": has_command("seed"),
             "manifest_graph_output": accepts("manifest", "graph-output"),
             "manifest_stamp_flags": stamp_flags,
             "build_manifest": accepts("build", "manifest"),

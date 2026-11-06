@@ -333,18 +333,19 @@ impl StoreSlot {
                 ..
             } => {
                 if let Some(root) = explicit_root {
-                    let store = devmap_extract::safe_fs::resolve_file_alias(
-                        &devmap_extract::paths::store_path(root),
-                    )
-                    .map_err(|error| format!("unsafe store path: {error}"))?;
-                    if store.is_file() {
-                        return Ok(store);
+                    if let Some(effective) = crate::root_resolve::effective_store_for_root(root)? {
+                        let store = devmap_extract::safe_fs::resolve_file_alias(&effective)
+                            .map_err(|error| format!("unsafe store path: {error}"))?;
+                        if store.is_file() {
+                            return Ok(store);
+                        }
                     }
+                    let expected = devmap_extract::paths::store_path(root);
                     return Err(format!(
                         "could not resolve a DevMap store: --root {} has no readable store at {}. \
 Pass repo_path only when it names this same repository, or run `devmap build` there.",
                         root.display(),
-                        store.display()
+                        expected.display()
                     ));
                 }
                 let roots = crate::lock_recover(mcp_roots).clone();
@@ -377,6 +378,13 @@ with an absolute repository path."
 
     fn attribution_for_resolved(&self, store_path: &Path) -> RepositoryRef {
         let store = canonicalize_path(store_path);
+        let root_matches_store = |root: &Path| -> bool {
+            crate::root_resolve::effective_store_for_root(root)
+                .ok()
+                .flatten()
+                .map(|p| canonicalize_path(&p) == store)
+                .unwrap_or(false)
+        };
         match &self.mode {
             SlotMode::Pinned { db_path } => RepositoryRef {
                 root: infer_root_from_store(db_path),
@@ -391,8 +399,7 @@ with an absolute repository path."
                 ..
             } => {
                 if let Some(root) = explicit_root {
-                    let pin_store = canonicalize_path(&devmap_extract::paths::store_path(root));
-                    if pin_store == store {
+                    if root_matches_store(root) {
                         return RepositoryRef {
                             root: root.clone(),
                             store,
@@ -402,8 +409,7 @@ with an absolute repository path."
                 }
                 let roots = crate::lock_recover(mcp_roots).clone().unwrap_or_default();
                 for root in roots_with_stores(roots.iter()) {
-                    let candidate = canonicalize_path(&devmap_extract::paths::store_path(&root));
-                    if candidate == store {
+                    if root_matches_store(&root) {
                         return RepositoryRef {
                             root,
                             store,
@@ -411,8 +417,7 @@ with an absolute repository path."
                         };
                     }
                 }
-                let cwd_store = canonicalize_path(&devmap_extract::paths::store_path(client_cwd));
-                if cwd_store == store {
+                if root_matches_store(client_cwd) {
                     return RepositoryRef {
                         root: canonicalize_path(client_cwd),
                         store,
@@ -457,8 +462,10 @@ with an absolute repository path."
                 // A pin is itself a candidate so status stays honest about what
                 // this process could answer for, even when resolution prefers it.
                 if let Some(root) = explicit_root {
-                    if devmap_extract::paths::store_path(root).is_file()
-                        && !candidates.iter().any(|c| c == root)
+                    if matches!(
+                        crate::root_resolve::effective_store_for_root(root),
+                        Ok(Some(_))
+                    ) && !candidates.iter().any(|c| c == root)
                     {
                         candidates.push(root.clone());
                     }
@@ -510,18 +517,23 @@ with an absolute repository path."
         repo_path: Option<&str>,
     ) -> Result<(Arc<Store>, RepositoryRef), String> {
         if let Some(raw) = repo_path {
-            let attr = store_for_repo_path(raw)?;
+            let requested_root = crate::root_resolve::validate_repo_path(raw)?;
             if let Some(pin) = self.explicit_root() {
-                if attr.root != pin {
+                let pin_canon = canonicalize_path(&pin);
+                if requested_root != pin_canon
+                    && !devmap_extract::same_registered_repo(&requested_root, &pin_canon)
+                {
                     return Err(format!(
                         "repo_path {} does not match this server's --root pin {}. \
-A pinned MCP registration only answers for that repository; pass the pin path, or \
-use an unpinned shared server and select with repo_path.",
-                        attr.root.display(),
+A pinned MCP registration only answers for that repository (and its registered git worktrees); \
+pass the pin path, a registered worktree of that repository, or use an unpinned shared server \
+and select with repo_path.",
+                        requested_root.display(),
                         pin.display()
                     ));
                 }
             }
+            let attr = store_for_repo_path(raw)?;
             let store = self.cache_open(&attr.store)?;
             return Ok((store, attr));
         }
@@ -2975,14 +2987,11 @@ async fn call_tool(
     // Dropping a blocking task's handle only detaches it; the flag is the only
     // thing that actually stops the traversal.
     let worker_cancel = cancel.clone();
-    // Nothing dropped: an MCP server is its own process with no watcher, so it
-    // has no edits it failed to write down. The empty record is passed
-    // explicitly rather than defaulted inside `dispatch`, so that this claim is
-    // made at the one call site entitled to make it — a transport that *does*
-    // watch a tree has to hand over its own.
     let unapplied = crate::protocol::UnappliedEdits::default();
-    let handle =
-        tokio::task::spawn_blocking(move || dispatch(&engine, request, &worker_cancel, &unapplied));
+    let attr_root = attribution.root.clone();
+    let handle = tokio::task::spawn_blocking(move || {
+        dispatch_with_stacked_overlay(&engine, &attr_root, request, &worker_cancel, &unapplied)
+    });
 
     let latency_ms = || started.elapsed().as_millis() as u64;
     match tokio::time::timeout(CALL_TIMEOUT, handle).await {
@@ -3040,6 +3049,136 @@ being reported because a partial traversal cannot be distinguished from a comple
             Ok(tool_error(message))
         }
     }
+}
+
+fn dispatch_with_stacked_overlay(
+    engine: &Store,
+    attr_root: &Path,
+    request: IpcRequest,
+    cancel: &devmap_query::Cancel,
+    unapplied: &crate::protocol::UnappliedEdits,
+) -> anyhow::Result<Value> {
+    let is_stacked = !devmap_extract::paths::store_path(attr_root).is_file()
+        && devmap_extract::paths::stack_lease_path(attr_root).is_file();
+    if !is_stacked {
+        return dispatch(engine, request, cancel, unapplied);
+    }
+
+    let stacked = devmap_query::stacked::StackedStore::open(attr_root)?;
+    let st = stacked.status()?;
+    let is_status = matches!(request.command, IpcCommand::Status);
+    let plain_search = match &request.command {
+        IpcCommand::Search {
+            query,
+            budget,
+            semantic: false,
+            paths,
+            languages,
+            kinds,
+        } if paths.is_empty() && languages.is_empty() && kinds.is_empty() => {
+            Some((query.clone(), *budget))
+        }
+        _ => None,
+    };
+    let is_edge_query = matches!(
+        request.command,
+        IpcCommand::Deps { .. }
+            | IpcCommand::Impact { .. }
+            | IpcCommand::Trace { .. }
+            | IpcCommand::Neighbors { .. }
+            | IpcCommand::Dead { .. }
+            | IpcCommand::Explore { .. }
+            | IpcCommand::Affected { .. }
+            | IpcCommand::Ask { .. }
+            | IpcCommand::AskEvidence { .. }
+    );
+
+    let mut value = dispatch(stacked.base_store(), request, cancel, unapplied)?;
+    if is_status {
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("stacked".into(), serde_json::to_value(&st)?);
+            let delta_pending = st.dirty_files.saturating_add(st.tombstoned_files);
+            if delta_pending > 0 {
+                let base_pending = obj
+                    .get("pending_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                obj.insert(
+                    "pending_count".into(),
+                    json!(base_pending.saturating_add(delta_pending as u64)),
+                );
+            }
+        }
+        return Ok(value);
+    }
+
+    if let Some((query, _budget)) = plain_search {
+        if st.dirty_files > 0 || st.tombstoned_files > 0 {
+            let delta_hits = stacked.search_symbols(&query, 64)?;
+            if let Some(obj) = value.as_object_mut() {
+                let mut merged = Vec::new();
+                let mut seen = std::collections::BTreeSet::new();
+                for sym in delta_hits {
+                    if seen.insert((sym.path.clone(), sym.qualified_name.clone())) {
+                        merged.push(json!({
+                            "symbol_name": sym.name,
+                            "qualified_name": sym.qualified_name,
+                            "file_path": sym.path,
+                            "kind": sym.kind,
+                            "score": 1.0,
+                            "source_span": format!("{}..{}", sym.span_start, sym.span_end),
+                        }));
+                    }
+                }
+                if let Some(existing) = obj.get("items").and_then(Value::as_array) {
+                    for item in existing {
+                        let fp = item.get("file_path").and_then(Value::as_str).unwrap_or("");
+                        let qn = item
+                            .get("qualified_name")
+                            .or_else(|| item.get("symbol_name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let p = Path::new(fp);
+                        if stacked.overlay().is_file_tombstoned(p)
+                            || stacked.overlay().modified_files.contains_key(p)
+                            || stacked.overlay().is_symbol_tombstoned(qn)
+                        {
+                            continue;
+                        }
+                        if seen.insert((fp.to_string(), qn.to_string())) {
+                            merged.push(item.clone());
+                        }
+                    }
+                }
+                let shown = merged.len();
+                let hidden = obj.get("hidden").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let total = shown.saturating_add(hidden);
+                obj.insert("items".into(), Value::Array(merged));
+                obj.insert("shown".into(), json!(shown));
+                obj.insert("total".into(), json!(total));
+                obj.insert("truncated".into(), json!(hidden > 0));
+            }
+        }
+        return Ok(value);
+    }
+
+    if is_edge_query && (st.dirty_files > 0 || st.tombstoned_files > 0) {
+        if let Some(obj) = value.as_object_mut() {
+            let needs_note = obj
+                .get("walk_incomplete")
+                .map_or(true, |v| v.is_null() || v.as_str() == Some(""));
+            if needs_note {
+                obj.insert(
+                    "walk_incomplete".into(),
+                    json!(format!(
+                        "stacked worktree delta has {} dirty and {} deleted file(s) ({} delta edges); run `devmap build --manifest` for full cross-file resolution",
+                        st.dirty_files, st.tombstoned_files, st.delta_edges
+                    )),
+                );
+            }
+        }
+    }
+    Ok(value)
 }
 
 /// A successful tool result.

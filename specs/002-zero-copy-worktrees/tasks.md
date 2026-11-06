@@ -1,0 +1,21 @@
+# Tasks: 002 - Zero-Copy Agentic Worktrees & DevMap Hardening
+
+## Phase 1: Phase 0 - Correctness, Routing & Poisoning Stop-Bleed
+- [x] [T-001] [US1] Implement bidirectional `same_registered_repo`, `--root` worktree support in `mcp::open_for_call`, asymmetric `RootResolveInput::resolve`, `PostToolUse` lazy seed in `hook.rs`, and guaranteed `--seed-from` manifest write `rust/devmap-extract/src/paths.rs` `rust/devmap-serve/src/mcp.rs` `rust/devmap-serve/src/root_resolve.rs` `rust/devmap-cli/src/hook.rs` `rust/devmap-cli/src/commands/build.rs` tests: cargo test --manifest-path rust/Cargo.toml -p devmap-extract -p devmap-serve -p devmap-cli
+- [x] [T-002] [P] [US2] Stop regex fallback writes to `anchor_cas_store`, guard fallback tombstoning, make CSR loading lazy, upgrade legacy `base_store_ref.json`, and ensure `gitpulse-worktree` `Create` + `Switch --create` seed stacked DevMap `src-tauri/src/codeintel/worktree_overlay.rs` `crates/gitpulse-worktree/src/main.rs` tests: cargo test --manifest-path src-tauri/Cargo.toml --lib worktree_overlay
+- [x] [T-003] [P] [US4] Add `Manvi/.ignore` for upstream `/crates/dc-*` symlinks and implement warm `devmap mcp` stdio client + bounded `WarmDevmapPool` `backend/go_orchestrator/dc/devmap/warm.go` `manvi/serve/devmap.go` tests: go test ./dc/devmap/...
+
+## Phase 2: Phase 1 - Sub-15ms Canonical Seed, Nested Cache Cloner & Sparse Verify
+- [x] [T-004] [US1] Implement `seed_rebind` + latest-row `synchronous=OFF` rebind, `stage_seed` `TRUNCATE` + pinned `WAL_READ_LOCK` `clonefile`, standalone `devmap seed --mode copy|stacked` subcommand, and CSR + `resolution-reuse-1/` artifact cloning `rust/devmap-store/src/seed.rs` `rust/devmap-store/src/db/generation.rs` `rust/devmap-cli/src/commands/seed.rs` tests: cargo test --manifest-path rust/Cargo.toml -p devmap-store -p devmap-cli
+- [x] [T-005] [P] [US3] Implement nested Cargo `target/` + `node_modules/` discovery, `libc::clonefile` wiring, boundary-safe `build/*/out/**` path rewrite with `File::set_times`, `tmutil addexclusion`, and background teardown `src-tauri/src/engine/cow_clone.rs` `src-tauri/src/engine/worktree.rs` tests: cargo test --manifest-path src-tauri/Cargo.toml --lib cow_clone
+- [x] [T-006] [P] [US4] Implement zero-index-trust `core.sparseCheckoutCone=true` verification and lexical + `tmpIdx` symlink validation in `WorkingTreeSubject` `backend/go_orchestrator/devcouncil/verify/sparse_subject.go` tests: go test ./devcouncil/verify/...
+
+## Phase 3: Phase 2 - Glean-Style StackedStore & Overlay Retirement
+- [x] [T-007] [US2] Implement `chmod 0444` base snapshot publishing, `stack_lease.json` GC, and `StackedStore` wiring `devmap_query::overlay::{WorktreeOverlay, RoaringBitmap}` with Tree-sitter `delta.sqlite` and auto-rebase `rust/devmap-store/src/delta.rs` `rust/devmap-query/src/stacked.rs` `rust/devmap-cli/src/commands/seed.rs` tests: cargo test --manifest-path rust/Cargo.toml -p devmap-store -p devmap-query -p devmap-cli
+- [x] [T-008] [US2] Re-vendor `devmap-*` crates into `GitPulse/src-tauri/vendored/`, migrate `GitPulse` codeintel onto canonical seeded/stacked stores, and auto-upgrade `base_store_ref.json` `src-tauri/src/codeintel/mod.rs` tests: node scripts/vendor-crates.mjs --check
+
+## Phase 4: Phase 3 - Hardened Compiler CAS, CoW Source Checkout & Multi-Lane Manvi
+- [x] [T-009] [P] [US3] Implement `.dylib`-SHA256 Pure-AST Proc-Macro Allowlist and lexical `env!`/`include*!` token guard before `COMPILE_ONLY_MANIFEST_DIR_SENTINEL` normalization `crates/gitpulse-worktree/src/build_cache.rs` tests: cargo test --manifest-path crates/gitpulse-worktree/Cargo.toml
+- [x] [T-010] [P] [US3] Implement `--no-checkout` + APFS `clonefile` clean source materialization + selective `git checkout-index` in `GitPulse` worktree creation `src-tauri/src/engine/worktree.rs` tests: cargo test --manifest-path src-tauri/Cargo.toml --lib worktree
+- [x] [T-011] [P] [US4] Wire `WorkspaceCoordinator` (`workspace: "worktree"`) in `Manvi` `workspace.go` + `subagent_tools.go` + `cmd/manvi/subagent.go` and verify concurrent multi-lane execution in `managed.go` `manvi/devcouncil/workspace.go` `manvi/devcouncil/subagent_tools.go` `manvi/cmd/manvi/subagent.go` tests: go test ./devcouncil/... ./serve/... ./cmd/manvi/...
+

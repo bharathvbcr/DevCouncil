@@ -275,6 +275,7 @@ impl Store {
             source_freshness_cache: Mutex::new(None),
             db_path: Some(path.to_path_buf()),
             read_only: true,
+            repo_root_override: None,
         })
     }
 
@@ -440,6 +441,7 @@ impl Store {
             source_freshness_cache: Mutex::new(None),
             db_path: Some(path.to_path_buf()),
             read_only,
+            repo_root_override: None,
         })
     }
 
@@ -1047,6 +1049,104 @@ impl Store {
         Ok(Some(Self::open_read_only(path)?))
     }
 
+    /// Open a sealed immutable base snapshot (`chmod 0444`, rollback journal,
+    /// zero `-wal`/`-shm` sidecars) with `?immutable=1` and an optional worktree
+    /// `repo_root_override`.
+    ///
+    /// Fails closed if `db_path` has any write permission bit set or has
+    /// `-wal`/`-shm` sidecars so live mutable `devmap.sqlite` files can never
+    /// be opened with `?immutable=1` (`SQLITE_CORRUPT` hazard under concurrent
+    /// writers).
+    pub fn open_immutable_snapshot<P: AsRef<Path>>(
+        db_path: P,
+        repo_root_override: Option<String>,
+    ) -> Result<Self> {
+        let resolved = devmap_extract::safe_fs::resolve_file_alias(db_path.as_ref())
+            .map_err(|error| refusal(error.to_string()))?;
+        let path = resolved.as_path();
+        let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+            refusal(format!(
+                "cannot inspect immutable snapshot {}: {error}",
+                path.display()
+            ))
+        })?;
+        if !metadata.is_file() {
+            return Err(refusal(format!(
+                "immutable snapshot {} is not a regular file",
+                path.display()
+            )));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let mode = metadata.mode();
+            if mode & 0o222 != 0 {
+                return Err(refusal(format!(
+                    "immutable snapshot {} is writable (mode {:04o}); refusing ?immutable=1 open on mutable database",
+                    path.display(),
+                    mode & 0o7777
+                )));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if !metadata.permissions().readonly() {
+                return Err(refusal(format!(
+                    "immutable snapshot {} is writable; refusing ?immutable=1 open on mutable database",
+                    path.display()
+                )));
+            }
+        }
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut sidecar = path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let sidecar_path = std::path::Path::new(&sidecar);
+            match std::fs::symlink_metadata(sidecar_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    return Err(refusal(format!(
+                        "immutable snapshot {} has active sidecar {}; refusing ?immutable=1 open",
+                        path.display(),
+                        sidecar_path.display()
+                    )));
+                }
+                Err(error) => {
+                    return Err(refusal(format!(
+                        "cannot inspect sidecar {} for immutable snapshot {}: {error}",
+                        sidecar_path.display(),
+                        path.display()
+                    )));
+                }
+            }
+        }
+
+        let setup = CONNECTION_SETUP
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let conn = Self::open_immutable(path)?;
+        conn.busy_timeout(Self::BUSY_TIMEOUT)?;
+        let stamped: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        drop(setup);
+
+        let store_label = path.display().to_string();
+        Self::admit_reader_schema(&conn, &store_label, stamped)?;
+        Self::reject_triggers(&conn)?;
+        Self::configure_connection(&conn)?;
+        Self::validate_schema(&conn)?;
+
+        Ok(Self {
+            conn: Mutex::new(conn),
+            edge_index: Mutex::new(None),
+            generation_counts: Mutex::new(None),
+            fts_reachable: Mutex::new(None),
+            generation_analysis_status: Mutex::new(None),
+            source_freshness_cache: Mutex::new(None),
+            db_path: Some(path.to_path_buf()),
+            read_only: true,
+            repo_root_override,
+        })
+    }
+
     pub fn open_in_memory() -> Result<Self> {
         let mut conn = Connection::open_in_memory()?;
         Self::harden_connection(&conn)?;
@@ -1061,6 +1161,7 @@ impl Store {
             source_freshness_cache: Mutex::new(None),
             db_path: None,
             read_only: false,
+            repo_root_override: None,
         })
     }
 }

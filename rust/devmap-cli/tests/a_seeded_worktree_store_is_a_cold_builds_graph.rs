@@ -394,3 +394,128 @@ fn a_seed_carries_the_manifest_artifacts_and_rewrites_them_for_the_worktree() {
         "staging files left behind: {leftovers:?}"
     );
 }
+
+#[test]
+fn devmap_seed_supports_sibling_checkouts_clones_reuse_cache_and_refuses_forgery() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let (lane, sibling, other) = (fx.at("lane"), fx.at("sibling"), fx.at("other"));
+    assert!(fx.devmap(&other, &["build", "--manifest"]).status.success());
+
+    // Forge a gitlink pointing at `lane`'s registration.
+    let evil = fx.base.join("evil-seed");
+    fs::create_dir_all(&evil).unwrap();
+    fs::write(
+        evil.join(".git"),
+        format!(
+            "gitdir: {}\n",
+            fx.main().join(".git/worktrees/lane").display()
+        ),
+    )
+    .unwrap();
+    let evil = evil.canonicalize().unwrap();
+
+    // Unrelated repo and forged gitlink must fail closed.
+    assert!(
+        !fx.devmap(&lane, &["--json", "seed", "--from", other.to_str().unwrap()])
+            .status
+            .success()
+    );
+    assert!(
+        !fx.devmap(&evil, &["--json", "seed", "--from", fx.main().to_str().unwrap()])
+            .status
+            .success()
+    );
+
+    // Seed `sibling` from `main` (default), then seed `lane` from `sibling`!
+    let sib_seed = fx.devmap(&sibling, &["--json", "seed"]);
+    assert!(sib_seed.status.success(), "{}", stderr(&sib_seed));
+    let lane_seed = fx.devmap(&lane, &["--json", "seed", "--from", sibling.to_str().unwrap()]);
+    assert!(lane_seed.status.success(), "{}", stderr(&lane_seed));
+
+    let status_out = fx.devmap(&lane, &["--json", "status"]);
+    assert!(status_out.status.success(), "{}", stderr(&status_out));
+    let st: Value = serde_json::from_slice(&status_out.stdout).unwrap();
+    assert_eq!(st["query_ready"], Value::Bool(true), "{st}");
+
+    // Verify `resolution-reuse-*` was cloned if `main` wrote one (`F9`).
+    let main_reuse: Vec<_> = fs::read_dir(fx.main().join(".devmap"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("resolution-reuse-"))
+        .collect();
+    if !main_reuse.is_empty() {
+        let lane_reuse: Vec<_> = fs::read_dir(lane.join(".devmap"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("resolution-reuse-"))
+            .collect();
+        assert_eq!(lane_reuse.len(), main_reuse.len());
+    }
+}
+
+#[test]
+fn devmap_seed_stacked_eliminates_split_brain_in_paths_and_status_and_fails_closed_on_corruption() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let lane = fx.at("lane");
+    edit(&lane);
+
+    let seed_out = fx.devmap(&lane, &["--json", "seed", "--stacked"]);
+    assert!(seed_out.status.success(), "{}", stderr(&seed_out));
+    let seed_json: Value = serde_json::from_slice(&seed_out.stdout).unwrap();
+    assert_eq!(seed_json["mode"], "stacked");
+    assert_eq!(seed_json["synced_files"], 1);
+
+    let paths_out = fx.devmap(&lane, &["--json", "paths"]);
+    assert!(paths_out.status.success(), "{}", stderr(&paths_out));
+    let paths_json: Value = serde_json::from_slice(&paths_out.stdout).unwrap();
+    assert_eq!(paths_json["store_exists"], true);
+    assert_eq!(paths_json["sqlite_store_exists"], false);
+    assert_eq!(paths_json["stacked_exists"], true);
+
+    let status_out = fx.devmap(&lane, &["--json", "status"]);
+    assert!(status_out.status.success(), "{}", stderr(&status_out));
+    let status_json: Value = serde_json::from_slice(&status_out.stdout).unwrap();
+    assert_eq!(status_json["query_ready"], true, "{status_json}");
+    assert_eq!(status_json["stacked"]["base_generation_id"], 1);
+    assert_eq!(status_json["stacked"]["dirty_files"], 1);
+
+    // Corrupt `stack_lease.json`: `status` must fail closed (`query_ready: false`)!
+    let lease_file = lane.join(".devmap/codeintel/stack_lease.json");
+    fs::write(&lease_file, "{corrupt").unwrap();
+    let bad_status = fx.devmap(&lane, &["--json", "status"]);
+    assert!(bad_status.status.success());
+    let bad_json: Value = serde_json::from_slice(&bad_status.stdout).unwrap();
+    assert_eq!(bad_json["query_ready"], false, "{bad_json}");
+    assert!(
+        bad_json["degraded_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("stacked worktree store unreadable"),
+        "{bad_json}"
+    );
+}
+
+#[test]
+fn seeded_build_writes_manifest_even_when_main_has_no_manifest_artifacts() {
+    let fx = Fixture::new();
+    // Build `main` WITHOUT `--manifest` (`F2` reproduction)!
+    let build_only = fx.devmap(&fx.main(), &["build"]);
+    assert!(build_only.status.success(), "{}", stderr(&build_only));
+    assert!(!fx.main().join(".devmap/repo_map.json").exists());
+
+    let lane = fx.at("lane");
+    let main = fx.main();
+    let out = fx.devmap(&lane, &["build", "--seed-from", main.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        lane.join(".devmap/repo_map.json").is_file(),
+        "seeded worktree lacked repo_map.json when main omitted --manifest"
+    );
+    assert!(
+        lane.join(".devmap/graph/code_graph.json").is_file(),
+        "seeded worktree lacked code_graph.json when main omitted --manifest"
+    );
+}
+

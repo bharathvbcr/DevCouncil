@@ -47,12 +47,54 @@ pub struct RootResolveInput {
 impl RootResolveInput {
     /// Resolve a store path, or an error that names every attempt.
     pub fn resolve(&self) -> Result<PathBuf, String> {
+        if let Some(roots) = &self.mcp_roots {
+            for root in roots.iter().take(MAX_ROOTS) {
+                let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+                let _ = effective_store_for_root(&canonical)?;
+            }
+        }
+        let cwd_probe = self
+            .client_cwd
+            .canonicalize()
+            .unwrap_or_else(|_| self.client_cwd.clone());
+        let _ = effective_store_for_root(&cwd_probe)?;
+
         let with_stores = self.discovery_roots_with_stores();
         if with_stores.len() > 1 {
             return Err(ambiguous_roots_error(&with_stores));
         }
         if with_stores.len() == 1 {
-            return canonical_store_path(store_for_root(&with_stores[0]));
+            let resolved = &with_stores[0];
+            let resolved_ws = workspace_identity(resolved);
+            if let Some(roots) = &self.mcp_roots {
+                let distinct_mcp = distinct_workspace_roots(roots.iter().take(MAX_ROOTS));
+                if distinct_mcp.iter().any(|mr| mr != &resolved_ws) {
+                    let mut named = vec![resolved.clone()];
+                    for mr in distinct_mcp {
+                        if !named.iter().any(|existing| existing == &mr) {
+                            named.push(mr);
+                        }
+                    }
+                    return Err(ambiguous_unindexed_roots_error(resolved, &named));
+                }
+            }
+            let cwd_canon = self
+                .client_cwd
+                .canonicalize()
+                .unwrap_or_else(|_| self.client_cwd.clone());
+            if let Some(cwd_wt) =
+                devmap_extract::git_worktree_root(&cwd_canon).map(|g| g.canonicalize().unwrap_or(g))
+            {
+                if cwd_wt != resolved_ws
+                    && (devmap_extract::same_registered_repo(&cwd_wt, &resolved_ws)
+                        || cwd_wt.starts_with(&resolved_ws))
+                {
+                    return Err(unindexed_worktree_cwd_error(&cwd_wt, resolved));
+                }
+            }
+            let resolved_store = effective_store_for_root(resolved)?
+                .unwrap_or_else(|| store_for_root(resolved));
+            return canonical_store_path(resolved_store);
         }
 
         let mut attempts = Vec::new();
@@ -153,7 +195,9 @@ impl RootResolveInput {
             .client_cwd
             .canonicalize()
             .unwrap_or_else(|_| self.client_cwd.clone());
-        if store_for_root(&cwd).is_file() && !out.iter().any(|root| root == &cwd) {
+        if matches!(effective_store_for_root(&cwd), Ok(Some(_)))
+            && !out.iter().any(|root| root == &cwd)
+        {
             out.push(cwd);
         }
         out
@@ -384,22 +428,79 @@ fn store_for_root(root: &Path) -> PathBuf {
     paths::store_path(root)
 }
 
+/// Resolve `devmap.sqlite` at `root`, or when absent check `stack_lease.json`
+/// for a stacked zero-copy worktree's shared immutable base snapshot.
+///
+/// Fails closed (`Err`) when `stack_lease.json` exists on disk but is corrupt,
+/// unreadable, or points at a missing base snapshot.
+pub fn effective_store_for_root(root: &Path) -> Result<Option<PathBuf>, String> {
+    let store = paths::store_path(root);
+    if store.is_file() {
+        return Ok(Some(store));
+    }
+    let lease_path = paths::stack_lease_path(root);
+    if !lease_path.is_file() {
+        return Ok(None);
+    }
+    let lease = devmap_query::stacked::StackLease::read_from(&lease_path).map_err(|err| {
+        format!(
+            "stacked worktree lease {} is corrupt or unreadable: {err}. \
+Run `devmap seed --stacked` or `devmap build --manifest` in {} to repair it.",
+            lease_path.display(),
+            root.display()
+        )
+    })?;
+    let base_sqlite = lease.base_sqlite_path();
+    if !base_sqlite.is_file() {
+        return Err(format!(
+            "stacked worktree lease {} points to missing base snapshot {}. \
+Run `devmap seed --stacked` or `devmap build --manifest` in {} to repair it.",
+            lease_path.display(),
+            base_sqlite.display(),
+            root.display()
+        ));
+    }
+    Ok(Some(base_sqlite))
+}
+
 fn canonical_store_path(path: PathBuf) -> Result<PathBuf, String> {
     devmap_extract::safe_fs::resolve_file_alias(&path)
         .map_err(|error| format!("unsafe store path {}: {error}", path.display()))
 }
 
-/// MCP roots that have a store, de-duplicated by canonical directory path.
+/// MCP roots that have a store (or valid stacked lease), de-duplicated by canonical directory path.
 pub fn roots_with_stores<'a>(roots: impl Iterator<Item = &'a PathBuf>) -> Vec<PathBuf> {
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
     for root in roots {
         let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-        if !store_for_root(&canonical).is_file() {
+        if !matches!(effective_store_for_root(&canonical), Ok(Some(_))) {
             continue;
         }
         if seen.insert(canonical.clone()) {
             out.push(canonical);
+        }
+    }
+    out
+}
+
+fn workspace_identity(path: &Path) -> PathBuf {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    devmap_extract::git_worktree_root(&canonical)
+        .map(|git_root| git_root.canonicalize().unwrap_or(git_root))
+        .unwrap_or(canonical)
+}
+
+fn distinct_workspace_roots<'a>(roots: impl Iterator<Item = &'a PathBuf>) -> Vec<PathBuf> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for root in roots {
+        if !root.is_dir() {
+            continue;
+        }
+        let identity = workspace_identity(root);
+        if seen.insert(identity.clone()) {
+            out.push(identity);
         }
     }
     out
@@ -414,6 +515,32 @@ fn ambiguous_roots_error(roots: &[PathBuf]) -> String {
         lines.push(format!("  - {}", root.display()));
     }
     lines.join("\n")
+}
+
+fn ambiguous_unindexed_roots_error(indexed_root: &Path, all_roots: &[PathBuf]) -> String {
+    let mut lines = vec![format!(
+        "MCP roots/list spans multiple workspace/worktree roots, and only {} currently has a DevMap store; silently serving that store when repo_path is omitted would leak another checkout's graph. Pass repo_path with the absolute repository path (and run `devmap seed` or `devmap build --manifest` in any unindexed checkout):",
+        indexed_root.display()
+    )];
+    for root in all_roots {
+        let status = if store_for_root(root).is_file() {
+            "has store"
+        } else {
+            "unindexed"
+        };
+        lines.push(format!("  - {} ({status})", root.display()));
+    }
+    lines.join("\n")
+}
+
+fn unindexed_worktree_cwd_error(cwd_wt: &Path, indexed_root: &Path) -> String {
+    format!(
+        "client cwd is inside worktree/checkout {} which has no DevMap store, while {} has a store; refusing to silently leak {}'s graph. Run `devmap seed` (or `devmap build --manifest`) in {}, or pass repo_path explicitly.",
+        cwd_wt.display(),
+        indexed_root.display(),
+        indexed_root.display(),
+        cwd_wt.display()
+    )
 }
 
 fn format_resolve_error(attempts: &[ResolveAttempt]) -> String {

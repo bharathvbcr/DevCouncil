@@ -80,9 +80,9 @@ func WorkingTreeSubject(ctx context.Context, root string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if sparse, err := runGit(ctx, git, 1<<10, "config", "--bool", "core.sparseCheckout"); err == nil &&
-		strings.TrimSpace(string(sparse)) == "true" {
-		return "", errors.New("the repository is a sparse checkout: files outside it would read as deleted")
+	cone, err := loadSparseCone(ctx, git, root)
+	if err != nil {
+		return "", err
 	}
 	headless := hasNoHead(ctx, git)
 	scratchDir, err := os.MkdirTemp("", "devcouncil-subject-")
@@ -95,21 +95,32 @@ func WorkingTreeSubject(ctx context.Context, root string) (string, error) {
 		if _, err := runGitEnv(ctx, git, 1<<20, subjectBound, env, "read-tree", "HEAD"); err != nil {
 			return "", fmt.Errorf("reading HEAD into a scratch index: %w", err)
 		}
+		if cone != nil {
+			if err := markOutOfConeSkipWorktree(ctx, git, env, root, cone); err != nil {
+				return "", err
+			}
+		}
 	}
 	addEnv := append([]string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=core.ignorecase", "GIT_CONFIG_VALUE_0=false"}, env...)
-	if _, err := runGitEnv(ctx, git, 1<<20, subjectBound, addEnv, append([]string{"add", "--all"}, toolStateExcludes()...)...); err != nil {
+	addArgs := []string{"add"}
+	if cone != nil {
+		addArgs = append(addArgs, "--sparse")
+	}
+	addArgs = append(addArgs, "--all")
+	addArgs = append(addArgs, toolStateExcludes()...)
+	if _, err := runGitEnv(ctx, git, 1<<20, subjectBound, addEnv, addArgs...); err != nil {
 		return "", fmt.Errorf("staging the working tree into a scratch index: %w", err)
 	}
 	if err := checkGitlinks(ctx, git, env, headless); err != nil {
 		return "", err
 	}
-	if err := checkSymlinks(ctx, git, env, root); err != nil {
+	if err := checkSymlinks(ctx, git, env, root, cone); err != nil {
 		return "", err
 	}
 	if err := checkIgnoredRulesFiles(ctx, git, env); err != nil {
 		return "", err
 	}
-	content, err := contentDigest(ctx, git, env, root)
+	content, err := contentDigest(ctx, git, env, root, cone)
 	if err != nil {
 		return "", err
 	}
@@ -123,66 +134,152 @@ func WorkingTreeSubject(ctx context.Context, root string) (string, error) {
 	return SubjectPrefix + content, nil
 }
 
-// contentDigest hashes every entry of the scratch index from disk: path,
-// kind, executable bit and the SHA-256 of the bytes for a file; the target
-// text for a symlink; the commit for a gitlink. Entries come in index order,
-// which is byte order of path, so the digest is independent of how the set
-// was produced.
-func contentDigest(ctx context.Context, git *proc.GitSession, env []string, root string) (string, error) {
+type indexEntry struct {
+	mode string
+	oid  string
+	path string
+}
+
+func listScratchIndex(ctx context.Context, git *proc.GitSession, env []string) ([]indexEntry, error) {
 	staged, err := runGitEnv(ctx, git, gitListingLimit, subjectBound, env, "ls-files", "--stage", "-z")
 	if err != nil {
-		return "", fmt.Errorf("listing the scratch index: %w", err)
+		return nil, fmt.Errorf("listing the scratch index: %w", err)
 	}
-	h := sha256.New()
+	var entries []indexEntry
 	for _, entry := range strings.Split(string(staged), "\x00") {
 		if entry == "" {
 			continue
 		}
-		if err := ctx.Err(); err != nil {
-			return "", err
-		}
 		meta, p, ok := strings.Cut(entry, "\t")
 		if !ok {
-			return "", fmt.Errorf("unreadable index entry %q", entry)
+			return nil, fmt.Errorf("unreadable index entry %q", entry)
 		}
 		fields := strings.Fields(meta) // mode, object, stage
 		if len(fields) != 3 {
-			return "", fmt.Errorf("unreadable index entry %q", entry)
+			return nil, fmt.Errorf("unreadable index entry %q", entry)
+		}
+		entries = append(entries, indexEntry{
+			mode: fields[0],
+			oid:  fields[1],
+			path: p,
+		})
+	}
+	return entries, nil
+}
+
+// contentDigest hashes every entry of the scratch index from disk (or from git
+// object storage for verified unmaterialized out-of-cone HEAD entries in a
+// cone-sparse checkout): path, kind, executable bit and the SHA-256 of the
+// bytes for a file; the target text for a symlink; the commit for a gitlink.
+// Entries come in index order, which is byte order of path, so the digest is
+// independent of how the set was produced.
+func contentDigest(ctx context.Context, git *proc.GitSession, env []string, root string, cone *sparseCone) (string, error) {
+	entries, err := listScratchIndex(ctx, git, env)
+	if err != nil {
+		return "", err
+	}
+
+	// Pre-fetch digests/targets for unmaterialized out-of-cone entries in one
+	// batched `git cat-file --batch` stream so sparse checkouts never spawn per
+	// file or trust the user's index.
+	type unmaterializedBlob struct {
+		sha256Hex string
+		symlink   string
+	}
+	var needBlob []indexEntry
+	if cone != nil {
+		for _, e := range entries {
+			if ToolOwned(e.path) || e.mode == "160000" {
+				continue
+			}
+			full := filepath.Join(root, filepath.FromSlash(e.path))
+			if _, statErr := os.Lstat(full); errors.Is(statErr, os.ErrNotExist) && !cone.contains(e.path) {
+				needBlob = append(needBlob, e)
+			}
+		}
+	}
+	var blobDigestByOID map[string]unmaterializedBlob
+	if len(needBlob) > 0 {
+		blobDigestByOID = make(map[string]unmaterializedBlob, len(needBlob))
+		if err := streamCatFileBlobs(ctx, git, needBlob, func(e indexEntry, r io.Reader, size int64) error {
+			if e.mode == "120000" {
+				if size > 64<<10 {
+					return fmt.Errorf("symlink blob for %s exceeds 64 KiB (%d bytes)", e.path, size)
+				}
+				buf := make([]byte, size)
+				if _, err := io.ReadFull(r, buf); err != nil {
+					return err
+				}
+				blobDigestByOID[e.oid] = unmaterializedBlob{symlink: string(buf)}
+				return nil
+			}
+			bh := sha256.New()
+			if _, err := io.CopyN(bh, r, size); err != nil {
+				return err
+			}
+			blobDigestByOID[e.oid] = unmaterializedBlob{sha256Hex: hex.EncodeToString(bh.Sum(nil))}
+			return nil
+		}); err != nil {
+			return "", err
+		}
+	}
+
+	h := sha256.New()
+	for _, e := range entries {
+		if err := ctx.Err(); err != nil {
+			return "", err
 		}
 		// Tool state tracked in HEAD is still in the scratch index (staging
 		// excludes it only from what is added), and verification never
 		// judges it.
-		if ToolOwned(p) {
+		if ToolOwned(e.path) {
 			continue
 		}
-		full := filepath.Join(root, filepath.FromSlash(p))
-		switch fields[0] {
+		full := filepath.Join(root, filepath.FromSlash(e.path))
+		switch e.mode {
 		case "160000":
-			fmt.Fprintf(h, "L\x00%s\x00%s\n", p, fields[1])
+			fmt.Fprintf(h, "L\x00%s\x00%s\n", e.path, e.oid)
 		default:
 			info, err := os.Lstat(full)
 			if err != nil {
-				return "", fmt.Errorf("%s changed while it was being named: %w", p, err)
+				if errors.Is(err, os.ErrNotExist) && cone != nil && !cone.contains(e.path) {
+					cached, ok := blobDigestByOID[e.oid]
+					if !ok {
+						return "", fmt.Errorf("missing unmaterialized blob digest for %s (%s)", e.path, e.oid)
+					}
+					switch e.mode {
+					case "120000":
+						fmt.Fprintf(h, "S\x00%s\x00%s\n", e.path, cached.symlink)
+					case "100644":
+						fmt.Fprintf(h, "F\x00%s\x00-\x00%s\n", e.path, cached.sha256Hex)
+					case "100755":
+						fmt.Fprintf(h, "F\x00%s\x00x\x00%s\n", e.path, cached.sha256Hex)
+					default:
+						return "", fmt.Errorf("unsupported index mode %s on unmaterialized path %s", e.mode, e.path)
+					}
+					continue
+				}
+				return "", fmt.Errorf("%s changed while it was being named: %w", e.path, err)
 			}
 			switch {
 			case info.Mode()&os.ModeSymlink != 0:
 				target, err := os.Readlink(full)
 				if err != nil {
-					return "", fmt.Errorf("%s: %w", p, err)
+					return "", fmt.Errorf("%s: %w", e.path, err)
 				}
-				fmt.Fprintf(h, "S\x00%s\x00%s\n", p, target)
+				fmt.Fprintf(h, "S\x00%s\x00%s\n", e.path, target)
 			case info.Mode().IsRegular():
 				sum, err := fileSHA256(full)
 				if err != nil {
-					return "", fmt.Errorf("%s: %w", p, err)
+					return "", fmt.Errorf("%s: %w", e.path, err)
 				}
 				exec := "-"
 				if info.Mode().Perm()&0o111 != 0 {
 					exec = "x"
 				}
-				fmt.Fprintf(h, "F\x00%s\x00%s\x00%s\n", p, exec, sum)
+				fmt.Fprintf(h, "F\x00%s\x00%s\x00%s\n", e.path, exec, sum)
 			default:
-				return "", fmt.Errorf("%s is neither a file nor a symlink on disk (%s)", p, info.Mode().Type())
+				return "", fmt.Errorf("%s is neither a file nor a symlink on disk (%s)", e.path, info.Mode().Type())
 			}
 		}
 	}
@@ -313,43 +410,131 @@ func gitlinkHasChanges(ctx context.Context, dir string) (bool, error) {
 // tree does not hold: one that resolves outside the repository, into tool
 // state, or onto an ignored path. The tree records a symlink only as its
 // target text, so a change to that content would not move the subject.
-func checkSymlinks(ctx context.Context, git *proc.GitSession, env []string, root string) error {
-	staged, err := runGitEnv(ctx, git, gitListingLimit, subjectBound, env, "ls-files", "--stage", "-z")
+//
+// Crucially, lexical and staged-symlink resolution runs BEFORE EvalSymlinks so
+// a dangling symlink escaping the repository (`../../outside/missing`),
+// pointing into `.git` or tool state, or targeting a not-yet-materialized
+// ignored directory (`build/missing.go`) is refused rather than skipped on
+// os.ErrNotExist.
+func checkSymlinks(ctx context.Context, git *proc.GitSession, env []string, root string, cone *sparseCone) error {
+	entries, err := listScratchIndex(ctx, git, env)
 	if err != nil {
-		return fmt.Errorf("listing the scratch index: %w", err)
+		return err
 	}
 	realRoot, err := filepath.EvalSymlinks(root)
 	if err != nil {
 		return err
 	}
-	var inside []string
-	for _, entry := range strings.Split(string(staged), "\x00") {
-		meta, p, ok := strings.Cut(entry, "\t")
-		if !ok || !strings.HasPrefix(meta, "120000 ") {
+
+	stagedSet := make(map[string]bool, len(entries))
+	var symEntries []indexEntry
+	var unmatSyms []indexEntry
+	for _, e := range entries {
+		if !ToolOwned(e.path) {
+			stagedSet[e.path] = true
+		}
+		if e.mode == "120000" {
+			symEntries = append(symEntries, e)
+			full := filepath.Join(root, filepath.FromSlash(e.path))
+			if _, statErr := os.Lstat(full); errors.Is(statErr, os.ErrNotExist) && cone != nil && !cone.contains(e.path) {
+				unmatSyms = append(unmatSyms, e)
+			}
+		}
+	}
+	if len(symEntries) == 0 {
+		return nil
+	}
+
+	rawTargets := make(map[string]string, len(symEntries))
+	if len(unmatSyms) > 0 {
+		if err := streamCatFileBlobs(ctx, git, unmatSyms, func(e indexEntry, r io.Reader, size int64) error {
+			if size > 64<<10 {
+				return fmt.Errorf("symlink blob for %s exceeds 64 KiB (%d bytes)", e.path, size)
+			}
+			buf := make([]byte, size)
+			if _, err := io.ReadFull(r, buf); err != nil {
+				return err
+			}
+			rawTargets[e.path] = string(buf)
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	for _, e := range symEntries {
+		if _, ok := rawTargets[e.path]; ok {
 			continue
 		}
-		link := filepath.Join(root, filepath.FromSlash(p))
-		target, err := filepath.EvalSymlinks(link)
-		if errors.Is(err, os.ErrNotExist) {
-			continue // dangling: no content to hide
-		}
+		full := filepath.Join(root, filepath.FromSlash(e.path))
+		t, err := os.Readlink(full)
 		if err != nil {
-			return fmt.Errorf("%s: %w", p, err)
+			return fmt.Errorf("%s: %w", e.path, err)
 		}
-		rel, err := filepath.Rel(realRoot, target)
-		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("%s is a symlink to %s, outside the repository, whose content the tree cannot name", p, target)
-		}
-		rel = filepath.ToSlash(rel)
-		if rel == ".git" || strings.HasPrefix(rel, ".git/") || strings.Contains(rel, "/.git/") ||
-			strings.HasSuffix(rel, "/.git") {
-			return fmt.Errorf("%s is a symlink into a repository's .git directory (%s), which the tree leaves out", p, rel)
-		}
-		if ToolOwned(rel) {
-			return fmt.Errorf("%s is a symlink into tool state (%s), which the tree leaves out", p, rel)
-		}
-		inside = append(inside, rel)
+		rawTargets[e.path] = t
 	}
+
+	var inside []string
+	seenCheckIgnore := make(map[string]bool)
+	addIgnoreCheck := func(p string) {
+		if p == "" || p == "." {
+			return
+		}
+		if !seenCheckIgnore[p] {
+			seenCheckIgnore[p] = true
+			inside = append(inside, p)
+		}
+	}
+
+	for _, e := range symEntries {
+		p := e.path
+		lexRel, err := resolveSymlinkLexical(p, rawTargets[p], realRoot, rawTargets)
+		if err != nil {
+			return err
+		}
+		if err := validateRepoRelativeSymlinkTarget(p, lexRel); err != nil {
+			return err
+		}
+
+		link := filepath.Join(root, filepath.FromSlash(p))
+		target, evalErr := filepath.EvalSymlinks(link)
+		switch {
+		case evalErr == nil:
+			rel, err := filepath.Rel(realRoot, target)
+			if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				return fmt.Errorf("%s is a symlink to %s, outside the repository, whose content the tree cannot name", p, target)
+			}
+			rel = filepath.ToSlash(rel)
+			if err := validateRepoRelativeSymlinkTarget(p, rel); err != nil {
+				return err
+			}
+			addIgnoreCheck(rel)
+
+		case errors.Is(evalErr, os.ErrNotExist):
+			// If the symlink points outside the sparse cone and is not tracked in
+			// the scratch index, refuse: out-of-cone `.gitignore` rules are not
+			// materialized on disk and an untracked out-of-cone target is not in
+			// the tree.
+			if cone != nil && !cone.contains(lexRel) && !stagedSet[lexRel] {
+				return fmt.Errorf(
+					"%s is a symlink to %s outside the sparse-checkout cone and not tracked in HEAD",
+					p, lexRel,
+				)
+			}
+			if !stagedSet[lexRel] {
+				addIgnoreCheck(lexRel)
+				// Also test ancestor directory prefixes with trailing "/" so
+				// directory-only rules like `build/` catch `build/missing.go`
+				// before `build/` exists on disk.
+				for dir := path.Dir(lexRel); dir != "." && dir != "" && dir != "/"; dir = path.Dir(dir) {
+					addIgnoreCheck(dir + "/")
+				}
+			}
+
+		default:
+			return fmt.Errorf("%s: %w", p, evalErr)
+		}
+	}
+
 	if len(inside) == 0 {
 		return nil
 	}
@@ -362,6 +547,119 @@ func checkSymlinks(ctx context.Context, git *proc.GitSession, env []string, root
 			strings.Join(ignored, ", "))
 	}
 	return nil
+}
+
+func validateRepoRelativeSymlinkTarget(linkPath, rel string) error {
+	if rel == ".git" || strings.HasPrefix(rel, ".git/") || strings.Contains(rel, "/.git/") ||
+		strings.HasSuffix(rel, "/.git") {
+		return fmt.Errorf("%s is a symlink into a repository's .git directory (%s), which the tree leaves out", linkPath, rel)
+	}
+	if ToolOwned(rel) {
+		return fmt.Errorf("%s is a symlink into tool state (%s), which the tree leaves out", linkPath, rel)
+	}
+	return nil
+}
+
+func resolveSymlinkLexical(
+	linkPath string,
+	rawTarget string,
+	realRoot string,
+	stagedSymlinks map[string]string,
+) (string, error) {
+	const maxSymlinkHops = 40
+	curLink := linkPath
+	curTarget := rawTarget
+	for hops := 0; ; {
+		if curTarget == "" {
+			return "", fmt.Errorf("%s has an empty symlink target", linkPath)
+		}
+		if filepath.IsAbs(curTarget) || strings.HasPrefix(curTarget, "/") {
+			cleaned := evalExistingAncestor(filepath.Clean(curTarget))
+			rel, err := filepath.Rel(realRoot, cleaned)
+			if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				return "", fmt.Errorf(
+					"%s is a symlink to %s, outside the repository, whose content the tree cannot name",
+					linkPath, curTarget,
+				)
+			}
+			curTarget = filepath.ToSlash(rel)
+			curLink = ""
+		}
+
+		var parts []string
+		if curLink != "" {
+			if base := path.Dir(curLink); base != "." && base != "" {
+				parts = strings.Split(base, "/")
+			}
+		}
+
+		segs := strings.Split(filepath.ToSlash(curTarget), "/")
+		chained := false
+		for idx, seg := range segs {
+			switch seg {
+			case "", ".":
+				continue
+			case "..":
+				if len(parts) == 0 {
+					return "", fmt.Errorf(
+						"%s is a symlink (%s) escaping outside the repository, whose content the tree cannot name",
+						linkPath, rawTarget,
+					)
+				}
+				parts = parts[:len(parts)-1]
+			case ".git":
+				return "", fmt.Errorf(
+					"%s is a symlink into a repository's .git directory (%s), which the tree leaves out",
+					linkPath, rawTarget,
+				)
+			default:
+				parts = append(parts, seg)
+				candidate := strings.Join(parts, "/")
+				if nextTarget, isSym := stagedSymlinks[candidate]; isSym {
+					hops++
+					if hops > maxSymlinkHops {
+						return "", fmt.Errorf("%s exceeds maximum symlink hop depth (%d)", linkPath, maxSymlinkHops)
+					}
+					rest := strings.Join(segs[idx+1:], "/")
+					if rest != "" {
+						curTarget = strings.TrimRight(filepath.ToSlash(nextTarget), "/") + "/" + rest
+					} else {
+						curTarget = nextTarget
+					}
+					curLink = candidate
+					chained = true
+				}
+			}
+			if chained {
+				break
+			}
+		}
+		if !chained {
+			if len(parts) == 0 {
+				return ".", nil
+			}
+			return strings.Join(parts, "/"), nil
+		}
+	}
+}
+
+func evalExistingAncestor(absPath string) string {
+	cur := absPath
+	var tail []string
+	for {
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			for i := len(tail) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, tail[i])
+			}
+			return filepath.Clean(resolved)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return filepath.Clean(absPath)
+		}
+		tail = append(tail, filepath.Base(cur))
+		cur = parent
+	}
 }
 
 func gitlinkPaths(listing []byte, split func(string) (mode, p string, ok bool)) []string {

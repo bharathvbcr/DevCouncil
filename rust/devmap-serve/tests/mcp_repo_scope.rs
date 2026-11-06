@@ -958,3 +958,239 @@ async fn unix_file_uri_is_rejected_not_reinterpreted_on_windows() {
         "a unix URI must not become a root on Windows"
     );
 }
+
+fn wire_registered_worktree(main: &Path, name: &str, wt: &Path) {
+    let wt_gitdir = main.join(".git").join("worktrees").join(name);
+    std::fs::create_dir_all(&wt_gitdir).unwrap();
+    std::fs::write(main.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::create_dir_all(wt).unwrap();
+    std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_gitdir.display())).unwrap();
+    std::fs::write(wt_gitdir.join("commondir"), "../..\n").unwrap();
+    std::fs::write(
+        wt_gitdir.join("gitdir"),
+        format!("{}\n", wt.join(".git").display()),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn explicit_root_pin_accepts_registered_worktrees_and_rejects_gitlink_forgery() {
+    let base = scratch("pin-wt-family");
+    let main = base.join("main");
+    let wt = base.join("wt-lane");
+    let forged = base.join("forged-lane");
+
+    wire_registered_worktree(&main, "wt-lane", &wt);
+    plant_store(&main);
+    plant_store(&wt);
+
+    std::fs::create_dir_all(&forged).unwrap();
+    std::fs::write(
+        forged.join(".git"),
+        format!("gitdir: {}\n", main.join(".git/worktrees/wt-lane").display()),
+    )
+    .unwrap();
+    plant_store(&forged);
+
+    let slot = Arc::new(StoreSlot::resolving(
+        None,
+        main.clone(),
+        Some(main.clone()),
+    ));
+
+    let ok = call(
+        &slot,
+        "devmap_status",
+        json!({"repo_path": wt.display().to_string()}),
+    )
+    .await;
+    assert_eq!(
+        ok["result"]["isError"],
+        json!(false),
+        "a bidirectionally registered worktree of --root must be served: {ok}"
+    );
+    assert_eq!(
+        Path::new(structured(&ok)["repository"]["root"].as_str().unwrap()),
+        wt.canonicalize().unwrap().as_path()
+    );
+
+    let bad = call(
+        &slot,
+        "devmap_status",
+        json!({"repo_path": forged.display().to_string()}),
+    )
+    .await;
+    let err = tool_error_text(&bad);
+    assert!(
+        names(&err, &forged) && names(&err, &main),
+        "forged gitlink must be refused against --root pin: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[tokio::test]
+async fn unindexed_worktree_in_mcp_roots_or_cwd_never_silently_leaks_anchor_store() {
+    let base = scratch("f3a-leak-guard");
+    let anchor = base.join("anchor");
+    let sibling_wt = base.join("wt-unindexed");
+    let nested_wt = anchor.join(".claude").join("worktrees").join("lane");
+    let anchor_subdir = anchor.join("packages").join("ui");
+
+    wire_registered_worktree(&anchor, "wt-unindexed", &sibling_wt);
+    wire_registered_worktree(&anchor, "lane", &nested_wt);
+    std::fs::create_dir_all(&anchor_subdir).unwrap();
+    plant_store(&anchor);
+
+    // 1. F3a: mcp_roots = [anchor, unindexed_wt] must refuse when repo_path is omitted.
+    let multi_slot = Arc::new(StoreSlot::resolving(None, anchor.clone(), None));
+    multi_slot.set_mcp_roots(vec![anchor.clone(), sibling_wt.clone()]);
+    let multi_err = tool_error_text(&call(&multi_slot, "devmap_status", json!({})).await);
+    assert!(
+        names(&multi_err, &anchor) && names(&multi_err, &sibling_wt),
+        "must name both anchor and unindexed worktree: {multi_err}"
+    );
+
+    // 2. Critique 2b: mcp_roots = [anchor], client_cwd = sibling_wt (no store) must refuse.
+    let cwd_wt_slot = Arc::new(StoreSlot::resolving(None, sibling_wt.clone(), None));
+    cwd_wt_slot.set_mcp_roots(vec![anchor.clone()]);
+    let cwd_err = tool_error_text(&call(&cwd_wt_slot, "devmap_status", json!({})).await);
+    assert!(
+        names(&cwd_err, &anchor) && names(&cwd_err, &sibling_wt),
+        "must refuse leaking anchor store to unindexed sibling worktree cwd: {cwd_err}"
+    );
+
+    // 3. Critique 2b nested: mcp_roots = [anchor], client_cwd = <anchor>/.claude/worktrees/lane must refuse.
+    let nested_slot = Arc::new(StoreSlot::resolving(None, nested_wt.clone(), None));
+    nested_slot.set_mcp_roots(vec![anchor.clone()]);
+    let nested_err = tool_error_text(&call(&nested_slot, "devmap_status", json!({})).await);
+    assert!(
+        names(&nested_err, &anchor) && names(&nested_err, &nested_wt),
+        "must refuse leaking anchor store to nested unindexed worktree cwd: {nested_err}"
+    );
+
+    // 4. Normal subdirectory inside anchor (same worktree) must still succeed!
+    let subdir_slot = Arc::new(StoreSlot::resolving(None, anchor_subdir.clone(), None));
+    subdir_slot.set_mcp_roots(vec![anchor.clone(), anchor_subdir.clone()]);
+    let subdir_ok = call(&subdir_slot, "devmap_status", json!({})).await;
+    assert_eq!(
+        subdir_ok["result"]["isError"],
+        json!(false),
+        "normal monorepo subdirectory of anchor must resolve cleanly: {subdir_ok}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[tokio::test]
+async fn stacked_worktree_lease_answers_mcp_with_delta_overlay_and_fails_closed_on_corrupt_lease() {
+    let base = scratch("stacked-mcp-lease");
+    let anchor = base.join("anchor");
+    let stacked_wt = base.join("wt-stacked");
+    wire_registered_worktree(&anchor, "wt-stacked", &stacked_wt);
+    std::fs::write(anchor.join("lib.rs"), "pub fn base_only() -> i32 { 1 }\n").unwrap();
+    std::fs::write(
+        stacked_wt.join("lib.rs"),
+        "pub fn base_only() -> i32 { 1 }\n",
+    )
+    .unwrap();
+
+    // Build a committed generation in anchor's store so publish_base_snapshot can snapshot it.
+    let anchor_db = devmap_extract::paths::store_path(&anchor);
+    std::fs::create_dir_all(anchor_db.parent().unwrap()).unwrap();
+    {
+        let store = devmap_store::Store::open(&anchor_db).unwrap();
+        let anchor_canon = anchor.canonicalize().unwrap();
+        store.bind_repo_root(&anchor_canon).unwrap();
+        let exts = vec![devmap_extract::extract_file(
+            "lib.rs",
+            "pub fn base_only() -> i32 { 1 }\n",
+        )];
+        let mut resolver = devmap_resolve::Resolver::new();
+        resolver.index_extractions(&exts);
+        let res = resolver.resolve_all(&exts).unwrap();
+        let analysis = devmap_analyze::analyze(&exts, &res);
+        store.save_generation(&exts, &res, &analysis).unwrap();
+    }
+
+    devmap_query::stacked::provision_stacked_worktree(&anchor, &stacked_wt).unwrap();
+    assert!(
+        !devmap_extract::paths::store_path(&stacked_wt).exists(),
+        "stacked worktree must not create local devmap.sqlite"
+    );
+
+    // Edit stacked_wt/lib.rs and sync delta via real Tree-sitter!
+    std::fs::write(
+        stacked_wt.join("lib.rs"),
+        "pub fn stacked_delta_fn() -> i32 { 42 }\n",
+    )
+    .unwrap();
+    {
+        let mut s = devmap_query::stacked::StackedStore::open(&stacked_wt).unwrap();
+        s.sync_file_from_disk("lib.rs").unwrap();
+    }
+
+    let slot = Arc::new(StoreSlot::resolving(
+        None,
+        stacked_wt.clone(),
+        Some(anchor.clone()),
+    ));
+    let status = call(
+        &slot,
+        "devmap_status",
+        json!({"repo_path": stacked_wt.display().to_string()}),
+    )
+    .await;
+    assert_eq!(status["result"]["isError"], json!(false), "{status}");
+    assert_eq!(
+        Path::new(
+            structured(&status)["repository"]["root"]
+                .as_str()
+                .unwrap_or_default()
+        ),
+        stacked_wt.canonicalize().unwrap().as_path()
+    );
+    assert_eq!(structured(&status)["stacked"]["dirty_files"], json!(1));
+
+    let search_new = call(
+        &slot,
+        "devmap_search",
+        json!({"repo_path": stacked_wt.display().to_string(), "query": "stacked_delta_fn"}),
+    )
+    .await;
+    assert_eq!(search_new["result"]["isError"], json!(false), "{search_new}");
+    assert_eq!(structured(&search_new)["shown"], json!(1), "{search_new}");
+
+    let search_tombstoned = call(
+        &slot,
+        "devmap_search",
+        json!({"repo_path": stacked_wt.display().to_string(), "query": "base_only"}),
+    )
+    .await;
+    assert_eq!(
+        structured(&search_tombstoned)["shown"],
+        json!(0),
+        "base_only was removed in delta edit and must be masked: {search_tombstoned}"
+    );
+
+    // Corrupting stack_lease.json must fail closed instead of falling back!
+    std::fs::write(
+        devmap_extract::paths::stack_lease_path(&stacked_wt),
+        b"{not valid json",
+    )
+    .unwrap();
+    let corrupt_err = tool_error_text(
+        &call(
+            &slot,
+            "devmap_status",
+            json!({"repo_path": stacked_wt.display().to_string()}),
+        )
+        .await,
+    );
+    assert!(
+        corrupt_err.contains("corrupt") || corrupt_err.contains("stack_lease.json"),
+        "corrupt stack_lease.json must fail closed: {corrupt_err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+
