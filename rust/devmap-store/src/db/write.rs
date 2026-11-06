@@ -2148,8 +2148,11 @@ impl Store {
             // until after this charge, when the digest row is stored for the
             // next build. Folding it on this thread first is about 31 ms that
             // the insert does not depend on. That path folds on a second
-            // thread during the insert, still inside this charge. The compare
-            // path folds here, because the unchanged-file set is the fold.
+            // thread during the insert, still inside this charge. A thread
+            // the OS will not give is not an error: the fold then runs on
+            // this thread after the insert, still inside this charge. The
+            // compare path folds here, because the unchanged-file set is the
+            // fold.
             if scope_by_digest {
                 fresh_unresolved_digests =
                     fold_unresolved_digests(&source_ids, &reason_ids, &class_ids, resolution);
@@ -2385,14 +2388,38 @@ impl Store {
             };
             if !scope_by_digest && !source_ids.is_empty() {
                 std::thread::scope(|scope| {
-                    let worker = scope.spawn(|| {
-                        fold_unresolved_digests(&source_ids, &reason_ids, &class_ids, resolution)
-                    });
-                    let inserted = insert_rows(&tx);
-                    fresh_unresolved_digests = worker
-                        .join()
-                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                    inserted
+                    // `Scope::spawn` panics when the OS refuses the thread.
+                    // `spawn_scoped` returns that refusal, which is the same
+                    // contract as the payload workers above: keep the write.
+                    let worker = std::thread::Builder::new()
+                        .name("devmap-ledger-digest".to_string())
+                        .spawn_scoped(scope, || {
+                            fold_unresolved_digests(
+                                &source_ids,
+                                &reason_ids,
+                                &class_ids,
+                                resolution,
+                            )
+                        });
+                    match worker {
+                        Ok(handle) => {
+                            let inserted = insert_rows(&tx);
+                            fresh_unresolved_digests = handle
+                                .join()
+                                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                            inserted
+                        }
+                        Err(_) => {
+                            let inserted = insert_rows(&tx);
+                            fresh_unresolved_digests = fold_unresolved_digests(
+                                &source_ids,
+                                &reason_ids,
+                                &class_ids,
+                                resolution,
+                            );
+                            inserted
+                        }
+                    }
                 })?;
             } else {
                 insert_rows(&tx)?;
