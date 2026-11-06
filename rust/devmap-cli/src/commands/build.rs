@@ -1184,7 +1184,10 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
                 file_delta.unchanged,
                 extraction_snapshot.cache_hits
             ),
-            format!("  Resolved {files_resolved} of {} files", extractions.len()),
+            format!(
+                "  Resolved {files_resolved} of {}",
+                progress::count(extractions.len(), "file")
+            ),
         ];
         if extraction_snapshot.failed > 0 {
             summary.push(format!(
@@ -1804,10 +1807,16 @@ fn split_csv(raw: &Option<String>) -> Vec<String> {
 /// Suggested source-file write set, or `None` for a full generation write.
 ///
 /// Resolution reads two global maps — the symbol index and the type/method
-/// index — and both are keyed by symbol *name*. A file's edges can therefore
-/// only change if its own content changed, or if a name it mentions was
-/// defined or removed elsewhere. The closure is the changed files plus every
-/// file mentioning such a name.
+/// index — and both are keyed by symbol *name*. A source file's edges can
+/// change if its own content changed, or if a name it mentions was defined or
+/// removed elsewhere. The closure is the changed files plus every file
+/// mentioning such a name.
+///
+/// A resolution input is the exception. `tsconfig` `paths`, a `go.mod`
+/// replace, and the other manifests [`devmap_extract::is_resolution_input_name`]
+/// names change where importers bind without changing a symbol name and
+/// without changing the importer's bytes. Reusing those files would keep the
+/// old edge. Any such change is a full write.
 ///
 /// Analysis always receives every edge. This set narrows the store write and
 /// which files are resolved again. A file outside it is reused when its
@@ -1863,6 +1872,14 @@ fn affected_closure(
     }
     if changed.is_empty() {
         return Ok(Some(BTreeSet::new()));
+    }
+    // Manifest bytes are inputs to other files' resolution. The name closure
+    // below cannot see that, and a narrowed write would carry the old edges
+    // forward. Full write, full resolve.
+    if changed.iter().any(|path| {
+        devmap_extract::is_resolution_input_name(path.rsplit(['/', '\\']).next().unwrap_or(path))
+    }) {
+        return Ok(None);
     }
 
     // Names the changed files define now, against the names they defined
@@ -2069,6 +2086,36 @@ const RESOLUTION_RATE_LANGUAGES_SHOWN: usize = 8;
 mod tests {
     use super::*;
     use devmap_analyze::{LanguageResolution, ResolutionRate};
+
+    #[test]
+    fn a_manifest_path_is_a_resolution_input_and_a_source_path_is_not() {
+        assert!(devmap_extract::is_resolution_input_name(
+            "tsconfig.base.json"
+        ));
+        assert!(devmap_extract::is_resolution_input_name("go.mod"));
+        assert!(!devmap_extract::is_resolution_input_name("main.ts"));
+        assert!(!devmap_extract::is_resolution_input_name("main.py"));
+        for path in [
+            "tsconfig.base.json",
+            "packages/app/tsconfig.json",
+            "web/tsconfig.app.json",
+            "go.mod",
+            "cmd/go.mod",
+        ] {
+            let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+            assert!(
+                devmap_extract::is_resolution_input_name(name),
+                "{path} must force a full resolve"
+            );
+        }
+        for path in ["packages/app/src/main.ts", "src/main.py", "lib.rs"] {
+            let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+            assert!(
+                !devmap_extract::is_resolution_input_name(name),
+                "{path} is a source edit"
+            );
+        }
+    }
 
     fn rate_with(rows: Vec<(&str, LanguageResolution)>) -> ResolutionRate {
         ResolutionRate {

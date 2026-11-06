@@ -51,7 +51,18 @@ fn graph_exports_refuse_linked_destinations() {
                     fs::create_dir_all(repo.join(".devmap")).unwrap();
                     symlink(&victim, repo.join(".devmap").join(filename)).unwrap();
                 }
-                "parent" => symlink(root.join("outside"), repo.join(".devmap")).unwrap(),
+                "parent" => {
+                    // Build writes the resolution-reuse cache under the state
+                    // directory, which is this repository's `.devmap`. This
+                    // case is export following a symlink planted at that
+                    // path, so the directory the build just created has to
+                    // go before the symlink does.
+                    let state = repo.join(".devmap");
+                    if state.symlink_metadata().is_ok() {
+                        fs::remove_dir_all(&state).unwrap();
+                    }
+                    symlink(root.join("outside"), &state).unwrap();
+                }
                 "explicit_parent" => symlink(root.join("outside"), root.join("alias")).unwrap(),
                 _ => unreachable!(),
             }
