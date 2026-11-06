@@ -669,11 +669,29 @@ mod tests {
         assert_eq!(search.repo_root.as_deref(), lane_canon.to_str());
         drop(reopened);
 
-        // And seed_rebind takes precedence via COALESCE even when generations.repo_root differs.
+        // seed_rebind outranks generations.repo_root only while pending_state
+        // agrees with it. Changed alone, it is stale: generations wins.
         {
             let conn = Connection::open(&staged_db).unwrap();
             conn.execute(
                 "UPDATE seed_rebind SET seeded_repo_root = ?1 WHERE singleton = 1",
+                [alt_canon.to_str().unwrap()],
+            )
+            .unwrap();
+        }
+        let reopened_alt = Store::open_read_only(&staged_db).unwrap();
+        assert_eq!(
+            reopened_alt.latest_repo_root().unwrap().as_deref(),
+            lane_canon.to_str(),
+            "a seed_rebind that pending_state does not back must not win"
+        );
+        drop(reopened_alt);
+
+        // Changed together with pending_state, `alt` is the store's owner and wins.
+        {
+            let conn = Connection::open(&staged_db).unwrap();
+            conn.execute(
+                "UPDATE pending_state SET repo_root = ?1 WHERE singleton = 1",
                 [alt_canon.to_str().unwrap()],
             )
             .unwrap();
@@ -690,13 +708,69 @@ mod tests {
                 .as_deref(),
             alt_canon.to_str()
         );
+        drop(reopened_alt);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn stage_seed_healing_wal_clones_when_reader_pins_checkpointed_wal_and_backs_up_on_uncheckpointed()
-    {
+    fn an_older_writer_that_rebinds_the_root_outranks_a_stale_seed_rebind() {
+        let tmp = temp_test_dir("old-writer-rebind");
+        let source_db = tmp.join("source.sqlite");
+        let staged_db = tmp.join("staged.sqlite");
+        let lane = tmp.join("lane");
+        std::fs::create_dir_all(&lane).unwrap();
+        {
+            let store = Store::open(&source_db).unwrap();
+            store.bind_repo_root(&tmp.canonicalize().unwrap()).unwrap();
+            drop(store);
+            let empty_res = devmap_resolve::Resolver::new().resolve_all(&[]).unwrap();
+            let analysis_json =
+                serde_json::to_string(&devmap_analyze::analyze(&[], &empty_res)).unwrap();
+            let conn = Connection::open(&source_db).unwrap();
+            conn.execute(
+                "INSERT INTO generations (created_at, head_sha, analysis_json, repo_root)
+                 VALUES (1730000000.0, 'deadbeef', ?1, ?2)",
+                rusqlite::params![&analysis_json, tmp.to_str().unwrap()],
+            )
+            .unwrap();
+        }
+        settle_staged(&source_db).unwrap();
+        stage_seed_healing_wal(&source_db, &staged_db).unwrap();
+        rebind_staged(&staged_db, &lane).unwrap();
+        settle_staged(&staged_db).unwrap();
+
+        // An older writer (one that does not know seed_rebind) moves the store.
+        {
+            let conn = Connection::open(&staged_db).unwrap();
+            conn.execute(
+                "UPDATE pending_state SET repo_root = '/moved' WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE generations SET repo_root = '/moved'
+                 WHERE id = (SELECT max(id) FROM generations)",
+                [],
+            )
+            .unwrap();
+        }
+        let reopened = Store::open_read_only(&staged_db).unwrap();
+        assert_eq!(
+            reopened.latest_repo_root().unwrap().as_deref(),
+            Some("/moved")
+        );
+        assert_eq!(
+            reopened.latest_generation_repo_root().unwrap().as_deref(),
+            Some("/moved")
+        );
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stage_seed_healing_wal_clones_when_reader_pins_checkpointed_wal_and_backs_up_on_uncheckpointed(
+    ) {
         let tmp = temp_test_dir("wal-heal");
         let source_db = tmp.join("source.sqlite");
         {
