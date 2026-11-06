@@ -706,11 +706,12 @@ fn unindexed_worktree_notice(payload: &Value, executable: &Path) -> Option<Value
     let name = unindexed_context_name(&root);
     let opted_in =
         main_checkout_of(&root).filter(|main| !is_unsafe_root(main) && store_exists(main));
-    let text = match opted_in.map(|main| (detach_build(executable, &root), main)) {
+    let text = match opted_in.map(|main| (detach_seeded_build(executable, &root, &main), main)) {
         Some((Ok(()), main)) => format!(
-            "{name}: no DevMap index in this working tree yet, so `devmap build` was started \
-             here in the background — this repository's main checkout ({}) is indexed. Until \
-             it lands (`devmap status` reports it), devmap_* queries here cannot answer, and an \
+            "{name}: no DevMap index in this working tree yet, so `devmap build --seed-from` \
+             was started here in the background, copying this repository's main checkout ({}) \
+             index and then updating it for this tree. Until it lands (`devmap status` reports \
+             it), devmap_* queries here cannot be trusted: they may answer nothing, and an \
              empty result is not evidence that a symbol is absent. Do not query the main \
              checkout's index for this tree: it describes a different working state.",
             context_line(&main.display().to_string())
@@ -751,7 +752,7 @@ const MAX_GITLINK_BYTES: u64 = 4096;
 /// `None` when `root` is itself a main checkout (its `.git` is a directory),
 /// when the common directory is bare, when this root is not the registered
 /// worktree, or when any of it cannot be read.
-fn main_checkout_of(root: &Path) -> Option<PathBuf> {
+pub(crate) fn main_checkout_of(root: &Path) -> Option<PathBuf> {
     let gitlink = root.join(".git");
     // A symlink is not this checkout's gitlink. Following it would adopt
     // whatever worktree the link points at.
@@ -2009,15 +2010,37 @@ fn join_notes(first: Option<String>, second: Option<String>) -> Option<String> {
 }
 
 fn detach_build(executable: &Path, root: &Path) -> anyhow::Result<()> {
+    detach_build_with(executable, root, None)
+}
+
+/// A build of a linked worktree that starts from its main checkout's store.
+fn detach_seeded_build(executable: &Path, root: &Path, main: &Path) -> anyhow::Result<()> {
+    detach_build_with(executable, root, Some(main))
+}
+
+fn detach_build_with(
+    executable: &Path,
+    root: &Path,
+    seed_from: Option<&Path>,
+) -> anyhow::Result<()> {
     let lock_dir = coalesce_lock_dir(root, "build");
     if !try_acquire_lock_dir(&lock_dir)? {
         return Ok(());
     }
-    spawn_detached_with_cleanup(
-        executable,
-        &[OsStr::new("--root"), root.as_os_str(), OsStr::new("build")],
-        &lock_dir,
-    )
+    let args = build_args(root, seed_from);
+    let args: Vec<&OsStr> = args.iter().map(std::ffi::OsString::as_os_str).collect();
+    spawn_detached_with_cleanup(executable, &args, &lock_dir)
+}
+
+/// `build`'s argument vector; `--seed-from` is present exactly when a main
+/// checkout was named.
+fn build_args(root: &Path, seed_from: Option<&Path>) -> Vec<std::ffi::OsString> {
+    let mut args = vec!["--root".into(), root.as_os_str().to_owned(), "build".into()];
+    if let Some(main) = seed_from {
+        args.push("--seed-from".into());
+        args.push(main.as_os_str().to_owned());
+    }
+    args
 }
 
 fn detach_session_report(
@@ -5318,5 +5341,139 @@ mod lock_tests {
         assert!(unremovable_lock_verdict(true, Err(anyhow::anyhow!("denied"))).is_ok());
         let claimed = unremovable_lock_verdict(true, Ok(true)).expect_err("a claim is not success");
         assert!(claimed.contains("claimed a lock"), "{claimed}");
+    }
+
+    /// A linked worktree plus the fake `devmap` that records its argument vector
+    /// one per line, so a test reads what the detached build was really given.
+    #[cfg(unix)]
+    struct Detached {
+        parent: PathBuf,
+        main: PathBuf,
+        lane: PathBuf,
+        fake: PathBuf,
+        record: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl Detached {
+        fn new(tag: &str, main_has_store: bool) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let parent = scratch(tag);
+            fs::create_dir_all(&parent).unwrap();
+            let parent = parent.canonicalize().unwrap();
+            let main = parent.join("main");
+            let gitdir = main.join(".git/worktrees/lane");
+            fs::create_dir_all(&gitdir).unwrap();
+            if main_has_store {
+                fs::create_dir_all(main.join(".devcouncil/codeintel")).unwrap();
+                fs::write(main.join(".devcouncil/codeintel/devmap.sqlite"), b"x").unwrap();
+            }
+            fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+            let lane = parent.join("lane");
+            fs::create_dir_all(lane.join(".devcouncil/codeintel")).unwrap();
+            fs::write(
+                gitdir.join("gitdir"),
+                format!("{}\n", lane.join(".git").display()),
+            )
+            .unwrap();
+            fs::write(lane.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+            let record = parent.join("argv");
+            let fake = parent.join("fake-devmap");
+            fs::write(
+                &fake,
+                format!(
+                    "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{r}.tmp' && mv '{r}.tmp' '{r}'\n",
+                    r = record.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+            Self {
+                parent,
+                main: main.canonicalize().unwrap(),
+                lane: lane.canonicalize().unwrap(),
+                fake,
+                record,
+            }
+        }
+
+        fn argv(&self) -> Vec<String> {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < deadline {
+                if let Ok(text) = fs::read_to_string(&self.record) {
+                    return text.lines().map(str::to_owned).collect();
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            panic!("the detached devmap never recorded its arguments");
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Detached {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.parent);
+        }
+    }
+
+    /// The seeded start is the whole point of the opt-in: a worktree whose main
+    /// checkout is indexed is built with `--seed-from <main>`, and the notice
+    /// says so.
+    #[cfg(unix)]
+    #[test]
+    fn an_opted_in_worktree_build_is_seeded_from_its_main_checkout() {
+        let fx = Detached::new("seeded-argv", true);
+        let notice = unindexed_worktree_notice(&json!({ "cwd": &fx.lane }), &fx.fake)
+            .expect("an unindexed linked worktree is named");
+        let text = notice
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .expect("additionalContext");
+        assert!(text.contains("--seed-from"), "{text:?}");
+        assert!(text.contains("cannot be trusted"), "{text:?}");
+        assert_eq!(
+            fx.argv(),
+            vec![
+                "--root".to_string(),
+                fx.lane.display().to_string(),
+                "build".to_string(),
+                "--seed-from".to_string(),
+                fx.main.display().to_string(),
+            ]
+        );
+    }
+
+    /// Every other detached build (the PostToolUse rebuild of an indexed tree)
+    /// stays a plain `build`.
+    #[cfg(unix)]
+    #[test]
+    fn a_plain_detached_build_is_not_seeded() {
+        let fx = Detached::new("plain-argv", true);
+        detach_build(&fx.fake, &fx.lane).expect("detach");
+        assert_eq!(
+            fx.argv(),
+            vec![
+                "--root".to_string(),
+                fx.lane.display().to_string(),
+                "build".to_string()
+            ]
+        );
+        assert_eq!(build_args(&fx.lane, None).len(), 3);
+    }
+
+    /// Not opted in (the main checkout has no store): nothing is started.
+    #[cfg(unix)]
+    #[test]
+    fn a_worktree_of_an_unindexed_main_starts_no_build() {
+        let fx = Detached::new("unindexed-main", false);
+        let notice = unindexed_worktree_notice(&json!({ "cwd": &fx.lane }), &fx.fake)
+            .expect("an unindexed linked worktree is named");
+        let text = notice
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .expect("additionalContext");
+        assert!(!text.contains("--seed-from"), "{text:?}");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!fx.record.exists(), "a build was started without an opt-in");
     }
 }

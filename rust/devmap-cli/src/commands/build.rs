@@ -98,6 +98,11 @@ pub(crate) struct Args {
     /// bare-name fallback.
     #[arg(long)]
     pub(crate) lsp: bool,
+    /// Start this linked worktree's store from its main checkout's, then
+    /// build incrementally. Only when this worktree has no store; the path
+    /// must be the worktree's registered main checkout. See `commands::seed`.
+    #[arg(long, value_name = "MAIN_CHECKOUT")]
+    pub(crate) seed_from: Option<PathBuf>,
     #[command(flatten)]
     pub(crate) stamps: StampFlags,
     #[command(flatten)]
@@ -173,6 +178,7 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
         adopt_guides,
         force,
         lsp,
+        seed_from,
         stamps,
         inventory,
         resolve_limits,
@@ -192,6 +198,10 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
     // success.
     let path = &cli.root_hint();
     let progress = progress.expect("main supplies a build reporter");
+    let seed = seed_from
+        .as_deref()
+        .map(|from| crate::commands::seed::plan(cli, from))
+        .transpose()?;
     progress.stage(
         1,
         format_args!("scanning and extracting {}", path.display()),
@@ -214,6 +224,9 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
     let _writer = progress.timed("writer:wait", || {
         Store::lock_writer_at(&cli.db(), Store::WRITER_LOCK_WAIT)
     })?;
+    if let Some(seed) = &seed {
+        seed.apply(cli, progress);
+    }
     // `build_ms` starts here, once the lock is held, so it means the same on
     // this path as on the daemon's: time spent building, not time spent
     // queued behind another writer (that is the `writer:wait` stage). It ends

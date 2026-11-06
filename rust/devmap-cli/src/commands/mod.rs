@@ -39,6 +39,7 @@ pub(crate) mod repair;
 pub(crate) mod routes;
 pub(crate) mod savings;
 pub(crate) mod search;
+pub(crate) mod seed;
 pub(crate) mod serve;
 pub(crate) mod session_report;
 pub(crate) mod shape_check;
