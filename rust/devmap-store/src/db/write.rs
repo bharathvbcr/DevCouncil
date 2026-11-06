@@ -2318,26 +2318,69 @@ impl Store {
             // chunked `sqlite3_step`. Batching
             // is neutral on a small table and a loss on a large one, and the
             // loop below stays one row per execute.
-            let mut insert = tx.prepare_cached(
-                "INSERT INTO unresolved_rows
+            // A cold ledger is an empty table. Rows arrive in resolution
+            // order, so maintaining `idx_unresolved_rows_callee` during the
+            // insert is a random write into that index. Building it once
+            // over the rows already written is one sort. The 2026-10-07
+            // measurement on `MIGRATION_V23_TO_V24` put the difference at
+            // 378 ms with the index against 263 ms without, and 42–88 ms to
+            // create the index afterwards. The create stays inside this
+            // charge: moving it into `commit` would shrink the span without
+            // doing less work.
+            //
+            // Only when the table is empty and this write has rows to
+            // insert. An incremental write would rebuild every retained row
+            // to add a handful, and a write that inserts nothing must leave
+            // the index schema creation already installed.
+            //
+            // The cold insert is `prepare`, not `prepare_cached`. A cached
+            // statement was planned while the index existed, and rusqlite
+            // does not reprepare when SQLite reports a schema change, so
+            // returning the no-index statement to the cache would make the
+            // next incremental insert fail or skip the index. The cached
+            // copy is discarded before the drop. `defer_foreign_keys` is not
+            // set: turning it off before COMMIT skips the check and commits
+            // a dangling child. The three foreign keys stay on.
+            let inserting = ledger_matched.iter().any(|kept| !*kept);
+            let ledger_table_empty: bool = tx.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM unresolved_rows)",
+                [],
+                |row| row.get(0),
+            )?;
+            let rebuild_callee_index = inserting && ledger_table_empty;
+            const UNRESOLVED_INSERT: &str = "INSERT INTO unresolved_rows
                  (source_file_id, source_symbol, callee_name, reason_id, classification_id,
                   receiver, valid_from, valid_to)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
-            )?;
-            for (index, still_valid) in ledger_matched.iter().enumerate() {
-                if *still_valid {
-                    continue;
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)";
+            let insert_row = |insert: &mut rusqlite::Statement<'_>| -> Result<()> {
+                for (index, still_valid) in ledger_matched.iter().enumerate() {
+                    if *still_valid {
+                        continue;
+                    }
+                    let tuple = unresolved_tuple(index);
+                    insert.execute(params![
+                        tuple.source_file_id,
+                        tuple.source_symbol.as_ref(),
+                        tuple.callee_name.as_ref(),
+                        tuple.reason_id,
+                        tuple.classification_id,
+                        tuple.receiver.as_deref(),
+                        gen_id,
+                    ])?;
                 }
-                let tuple = unresolved_tuple(index);
-                insert.execute(params![
-                    tuple.source_file_id,
-                    tuple.source_symbol.as_ref(),
-                    tuple.callee_name.as_ref(),
-                    tuple.reason_id,
-                    tuple.classification_id,
-                    tuple.receiver.as_deref(),
-                    gen_id,
-                ])?;
+                Ok(())
+            };
+            if rebuild_callee_index {
+                tx.prepare_cached(UNRESOLVED_INSERT)?.discard();
+                tx.execute_batch("DROP INDEX IF EXISTS idx_unresolved_rows_callee")?;
+                {
+                    let mut insert = tx.prepare(UNRESOLVED_INSERT)?;
+                    insert_row(&mut insert)?;
+                }
+                tx.execute_batch(crate::schema::MIGRATION_V23_TO_V24)?;
+            } else {
+                let mut insert = tx.prepare_cached(UNRESOLVED_INSERT)?;
+                insert_row(&mut insert)?;
             }
         }
 

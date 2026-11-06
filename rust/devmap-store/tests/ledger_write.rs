@@ -6,9 +6,13 @@
 //! is a ledger that quietly disagrees with the resolution it came from.
 //!
 //! * The two indexes v21 drops — `idx_unresolved_rows_callee` and
-//!   `_class` — were the bulk of the cost. Nothing read them, and
-//!   `the_ledger_carries_only_the_index_the_prune_uses` is what keeps them
-//!   from being re-added by someone who sees a `SCAN` and reaches for an index.
+//!   `_class` — were the bulk of the cost. Nothing read the class index.
+//!   v24 put the callee index back, because `impact` filters on
+//!   `callee_name`. A cold write drops that index for the insert and rebuilds
+//!   it with `MIGRATION_V23_TO_V24` before the unresolved charge ends, so the
+//!   finished store still has it. An incremental write leaves it in place.
+//!   `the_ledger_carries_only_the_indexes_its_readers_use` is what stops a
+//!   later edit from shipping the store without it.
 //!
 //! * The `reason` text is formatted once and interned instead of being
 //!   `format!`-ed three times. The stored bytes must be exactly what
@@ -858,5 +862,281 @@ fn every_row_keeps_its_own_source_file() {
         "the ledger must hold three distinct source files"
     );
 
+    let _ = fs::remove_dir_all(&dir);
+}
+
+fn ledger_index_names(db: &Path) -> Vec<String> {
+    let conn = Connection::open(db).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT name FROM sqlite_master
+              WHERE type = 'index' AND tbl_name = 'unresolved_rows'
+                AND name NOT LIKE 'sqlite_%'
+              ORDER BY name",
+        )
+        .unwrap();
+    stmt.query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<String>, _>>()
+        .unwrap()
+}
+
+fn expect_ledger_indexes(db: &Path) {
+    assert_eq!(
+        ledger_index_names(db),
+        vec![
+            "idx_unresolved_rows_callee".to_string(),
+            "idx_unresolved_rows_closed".to_string(),
+        ],
+        "the finished store must still carry impact's callee index and the prune's partial index"
+    );
+}
+
+/// A cold write of no ledger rows must not leave the callee index dropped.
+///
+/// The rebuild runs only when the table is empty *and* this write inserts.
+/// A generation that records nothing still has to serve `impact`.
+#[test]
+fn a_write_of_no_ledger_rows_keeps_the_callee_index() {
+    let dir = tmp_dir("ledger-empty");
+    let db = write_ledger(&dir, Vec::new());
+    expect_ledger_indexes(&db);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Hostile callee names survive a cold write and the incremental write after it.
+///
+/// `impact` reads this through `Store::unresolved_sites_naming`, which is the
+/// statement that needs `idx_unresolved_rows_callee`. Dropping sites, collapsing
+/// a duplicated name, or leaving the index absent after the cold insert would
+/// make a name that was resolved as unresolved disappear from that answer.
+#[test]
+fn a_cold_ledger_keeps_every_site_impact_names() {
+    let odd_path = "weird/名字.py";
+    let names = [
+        "plain",
+        "",
+        "帮助",
+        "self::帮助",
+        "with \"quotes\"",
+        "with \\ backslash",
+        "line\nbreak",
+        "tab\there",
+        "bidi\u{202e}override",
+        "zwsp\u{200b}inside",
+        "emoji 🔥",
+        "  spaced  ",
+        "shared_name",
+        "shared_name",
+    ];
+    let long = "L".repeat(4096);
+    let nul_name = "before\0after";
+    let mut unresolved = Vec::new();
+    for (n, name) in names.iter().enumerate() {
+        unresolved.push(UnresolvedReference {
+            source_file: odd_path.into(),
+            source_symbol: format!("{odd_path}::sym_{n}"),
+            callee_name: (*name).to_string(),
+            kind: UnresolvedKind::Call,
+            resolution: Resolution::Unresolved {
+                reason: format!("reason_{n}"),
+            },
+            class: UnresolvedClass::Unresolved,
+            receiver: if n == 4 {
+                Some("recv \"quoted\"".to_string())
+            } else {
+                None
+            },
+            site: None,
+        });
+    }
+    unresolved.push(UnresolvedReference {
+        source_file: odd_path.into(),
+        source_symbol: format!("{odd_path}::sym_long"),
+        callee_name: long.clone(),
+        kind: UnresolvedKind::Call,
+        resolution: Resolution::Unresolved {
+            reason: "reason_long".to_string(),
+        },
+        class: UnresolvedClass::Unresolved,
+        receiver: None,
+        site: None,
+    });
+    unresolved.push(UnresolvedReference {
+        source_file: odd_path.into(),
+        source_symbol: format!("{odd_path}::sym_nul"),
+        callee_name: nul_name.to_string(),
+        kind: UnresolvedKind::Call,
+        resolution: Resolution::Unresolved {
+            reason: "reason_nul".to_string(),
+        },
+        class: UnresolvedClass::Unresolved,
+        receiver: None,
+        site: None,
+    });
+
+    let dir = tmp_dir("ledger-impact");
+    let db = dir.join("devmap.sqlite");
+    let store = Store::open(&db).unwrap();
+    let extractions = vec![extract_file(SOURCE.0, SOURCE.1)];
+    let resolution = ResolutionResult {
+        edges: Vec::new(),
+        receiver_types: Default::default(),
+        reexport_chains: Default::default(),
+        unresolved: unresolved.clone(),
+    };
+    let analysis = analyze(&extractions, &resolution);
+    let generation = store
+        .save_generation_with_opts(
+            &extractions,
+            &resolution,
+            &analysis,
+            GenerationWriteOpts::default(),
+        )
+        .unwrap();
+    expect_ledger_indexes(&db);
+
+    let lookup: Vec<String> = names
+        .iter()
+        .map(|name| (*name).to_string())
+        .chain(std::iter::once(long.clone()))
+        .collect();
+    let found = store
+        .unresolved_sites_naming(generation, &lookup, 100)
+        .unwrap()
+        .expect("the generation must still be retained");
+    for name in &lookup {
+        let (sites, truncated) = found.get(name).expect("the name was requested");
+        let want = unresolved
+            .iter()
+            .filter(|row| row.callee_name == *name)
+            .count();
+        assert_eq!(
+            sites.len(),
+            want,
+            "impact's naming read dropped a site for {name:?}"
+        );
+        assert!(!truncated, "a limit of 100 cut {name:?}");
+        assert!(
+            sites.iter().all(|site| site.callee_name == *name),
+            "a site came back under the wrong callee"
+        );
+        assert!(
+            sites.iter().all(|site| site.source_file == odd_path),
+            "a site came back under the wrong file"
+        );
+    }
+    let shared = &found["shared_name"].0;
+    assert_eq!(shared.len(), 2, "duplicate callees must stay two sites");
+
+    // SQLite's text functions stop at an embedded NUL. The row is still stored:
+    // the blob length is the Rust string, not the prefix `column_text` would see.
+    let conn = Connection::open(&db).unwrap();
+    let blob_len: i64 = conn
+        .query_row(
+            "SELECT length(cast(callee_name AS BLOB))
+               FROM unresolved_rows
+              WHERE source_symbol = ?1 AND valid_to IS NULL",
+            [format!("{odd_path}::sym_nul")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        blob_len,
+        nul_name.len() as i64,
+        "an embedded NUL must not drop or shorten the stored callee"
+    );
+
+    let cold_ids = live_ids(&db);
+    let mut second = unresolved.clone();
+    second.push(row(50_000));
+    let again = ResolutionResult {
+        edges: Vec::new(),
+        receiver_types: Default::default(),
+        reexport_chains: Default::default(),
+        unresolved: second,
+    };
+    let analysis = analyze(&extractions, &again);
+    let next = store
+        .save_generation_with_opts(
+            &extractions,
+            &again,
+            &analysis,
+            GenerationWriteOpts::default(),
+        )
+        .unwrap();
+    expect_ledger_indexes(&db);
+    let warm_ids = live_ids(&db);
+    let kept = cold_ids.iter().filter(|id| warm_ids.contains(id)).count();
+    assert_eq!(
+        kept,
+        cold_ids.len(),
+        "the incremental write rewrote rows the cold write had already stored"
+    );
+    let added = store
+        .unresolved_sites_naming(next, &[row(50_000).callee_name], 10)
+        .unwrap()
+        .expect("the second generation must still be retained");
+    assert_eq!(
+        added[&row(50_000).callee_name].0.len(),
+        1,
+        "the row inserted while the callee index already existed is missing from impact"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Criterion: a sampled symbol's literal is what the extractor emitted.
+///
+/// The ledger rebuild must not be a write that also drops `payload_literals`.
+/// The value is one the literal writer keeps: non-empty and free of a zero byte.
+#[test]
+fn a_sampled_symbol_keeps_the_literal_the_extractor_emitted() {
+    let source = "def sampled():\n    return \"schema29-literal-sample\"\n";
+    let extraction = extract_file("sampled.py", source);
+    let enclosing_name = extraction
+        .literals
+        .iter()
+        .find(|lit| lit.value == "schema29-literal-sample")
+        .expect("the shipped extractor emits the sampled literal")
+        .enclosing_name
+        .clone();
+    let dir = tmp_dir("ledger-literal");
+    let db = dir.join("devmap.sqlite");
+    let store = Store::open(&db).unwrap();
+    let extractions = vec![extraction];
+    let resolution = ResolutionResult {
+        edges: Vec::new(),
+        receiver_types: Default::default(),
+        reexport_chains: Default::default(),
+        unresolved: vec![row(1)],
+    };
+    let analysis = analyze(&extractions, &resolution);
+    store
+        .save_generation_with_opts(
+            &extractions,
+            &resolution,
+            &analysis,
+            GenerationWriteOpts::default(),
+        )
+        .unwrap();
+    let conn = Connection::open(&db).unwrap();
+    let stored: Vec<(String, String)> = conn
+        .prepare(
+            "SELECT value, symbol_name FROM payload_literals WHERE value = ?1 ORDER BY symbol_name",
+        )
+        .unwrap()
+        .query_map(["schema29-literal-sample"], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        stored
+            .iter()
+            .any(|(value, symbol)| value == "schema29-literal-sample" && symbol == &enclosing_name),
+        "payload_literals dropped the sampled literal (symbol {enclosing_name}); stored {stored:?}"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
