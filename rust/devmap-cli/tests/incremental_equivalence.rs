@@ -891,3 +891,335 @@ fn assert_unchanged_attribution_upgrade(
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+fn build_with(root: &std::path::Path, extra: &[&str]) -> String {
+    let mut args = vec!["build", "."];
+    args.extend_from_slice(extra);
+    let out = Command::new(devmap())
+        .args(&args)
+        .current_dir(root)
+        .output()
+        .expect("devmap build");
+    assert!(
+        out.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+fn build_text(root: &std::path::Path) -> String {
+    build_with(root, &[])
+}
+
+fn scratch(label: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!("devmap-incr-{label}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    root
+}
+
+/// Twenty modules that do not mention each other, plus a hub that names only
+/// `caller_0` and `caller_1`. Editing `mod_19` changes no name any other file
+/// mentions, so the affected closure is that one file.
+fn write_independent_tree(root: &std::path::Path) {
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    for index in 0..20 {
+        std::fs::write(
+            src.join(format!("mod_{index}.py")),
+            format!(
+                "def leaf_{index}():\n    return {index}\n\n\ndef caller_{index}():\n    return leaf_{index}()\n"
+            ),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        src.join("hub.py"),
+        "from mod_0 import caller_0\nfrom mod_1 import caller_1\n\n\ndef hub():\n    return caller_0() + caller_1()\n",
+    )
+    .unwrap();
+}
+
+fn edit_last_module(root: &std::path::Path) {
+    std::fs::write(
+        root.join("src/mod_19.py"),
+        "def leaf_19():\n    return 19\n\n\ndef caller_19():\n    return leaf_19() + 1\n",
+    )
+    .unwrap();
+}
+
+fn reuse_dir(root: &std::path::Path) -> std::path::PathBuf {
+    devmap_extract::paths::state_dir(root).join(format!(
+        "resolution-reuse-{}",
+        devmap_resolve::resolver::RESOLUTION_REUSE_EPOCH
+    ))
+}
+
+fn blob_for(root: &std::path::Path, file_path: &str) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+    let hex = format!("{:x}", Sha256::digest(file_path.as_bytes()));
+    let path = reuse_dir(root).join(format!("{hex}.json"));
+    assert!(
+        path.is_file(),
+        "expected reuse blob for {file_path} at {}; dir was {:?}",
+        path.display(),
+        std::fs::read_dir(reuse_dir(root))
+            .map(|entries| entries
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>())
+            .ok()
+    );
+    path
+}
+
+fn assert_matches_cold(root: &std::path::Path) {
+    let incremental_analysis = analysis(root);
+    let incremental_graph = graph(root);
+    let incremental_dead = dead(root);
+    std::fs::remove_dir_all(devmap_extract::paths::state_dir(root)).unwrap();
+    build(root);
+    assert_eq!(incremental_graph, graph(root));
+    assert_eq!(incremental_dead, dead(root));
+    assert_eq!(incremental_analysis, analysis(root));
+}
+
+/// A one-file edit of an independent module must not re-resolve the other files.
+///
+/// The cold build and the edit are the same tree the analysis-equivalence
+/// fixture uses: twenty modules that do not mention each other, plus a hub
+/// that names only `caller_0` and `caller_1`. Editing `mod_19` changes no
+/// name any other file mentions, so the affected closure is that one file.
+/// Re-resolving the other twenty and handing analysis only the new edges are
+/// the two failures this guards: the first is the cost, the second is the
+/// 433-versus-14 dead-code bug.
+#[test]
+fn an_incremental_edit_resolves_only_the_affected_file() {
+    let root = scratch("resolve");
+    write_independent_tree(&root);
+
+    let cold = build_text(&root);
+    assert!(
+        cold.contains("Resolved 21 of 21 files"),
+        "a cold build resolves every file; output was:\n{cold}"
+    );
+    let blob = blob_for(&root, "src/mod_0.py");
+    let written = std::fs::metadata(&blob).unwrap().modified().unwrap();
+    let again = build_text(&root);
+    assert!(
+        again.contains("still current"),
+        "an unchanged tree returns before resolve; output was:\n{again}"
+    );
+    assert!(
+        !again.contains("Resolved "),
+        "an unchanged tree must not resolve; output was:\n{again}"
+    );
+    assert_eq!(
+        written,
+        std::fs::metadata(&blob).unwrap().modified().unwrap(),
+        "an unchanged tree must not rewrite the reuse cache"
+    );
+
+    edit_last_module(&root);
+    let edited = build_text(&root);
+    assert!(
+        edited.contains("Resolved 1 of 21 files"),
+        "one edited file must be the only file resolved; output was:\n{edited}"
+    );
+    assert_matches_cold(&root);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_missing_reuse_blob_resolves_that_file_and_keeps_the_rest() {
+    let root = scratch("missing-blob");
+    write_independent_tree(&root);
+    build_text(&root);
+    std::fs::remove_file(blob_for(&root, "src/mod_0.py")).unwrap();
+    edit_last_module(&root);
+    let edited = build_text(&root);
+    assert!(
+        edited.contains("Resolved 2 of 21 files"),
+        "the edited file and the file whose blob is gone are resolved; output was:\n{edited}"
+    );
+    assert!(
+        edited.contains("src/mod_0.py is a miss"),
+        "a missing blob is a miss that names the error; output was:\n{edited}"
+    );
+    assert_matches_cold(&root);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_corrupt_reuse_blob_is_a_miss_and_the_graph_matches_cold() {
+    let root = scratch("corrupt-blob");
+    write_independent_tree(&root);
+    build_text(&root);
+    std::fs::write(blob_for(&root, "src/mod_1.py"), b"{").unwrap();
+    edit_last_module(&root);
+    let edited = build_text(&root);
+    assert!(
+        edited.contains("Resolved 2 of 21 files"),
+        "a corrupt blob is resolved instead of reused; output was:\n{edited}"
+    );
+    assert!(
+        edited.contains("src/mod_1.py is a miss"),
+        "the parse error is in the diagnostic; output was:\n{edited}"
+    );
+    assert_matches_cold(&root);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_tampered_reuse_hash_resolves_that_file() {
+    let root = scratch("tampered-hash");
+    write_independent_tree(&root);
+    build_text(&root);
+    let blob = blob_for(&root, "src/mod_2.py");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&blob).unwrap()).unwrap();
+    value["content_hash"] = serde_json::json!(1);
+    std::fs::write(&blob, serde_json::to_vec(&value).unwrap()).unwrap();
+    edit_last_module(&root);
+    let edited = build_text(&root);
+    assert!(
+        edited.contains("Resolved 2 of 21 files"),
+        "a blob whose content hash does not match the file is resolved; output was:\n{edited}"
+    );
+    assert!(
+        edited.contains("does not match the file"),
+        "the hash mismatch is in the diagnostic; output was:\n{edited}"
+    );
+    assert_matches_cold(&root);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_capped_previous_generation_is_not_reused() {
+    let root = scratch("capped");
+    write_independent_tree(&root);
+    let capped = build_with(&root, &["--resolve-candidate-visits", "1"]);
+    assert!(
+        capped.contains("Resolved 21 of 21 files"),
+        "the capped build still resolves every file; output was:\n{capped}"
+    );
+    edit_last_module(&root);
+    let edited = build_with(&root, &[]);
+    assert!(
+        edited.contains("Resolved 21 of 21 files"),
+        "a previous cap, or a receipt written under other limits, must not reuse; output was:\n{edited}"
+    );
+    assert!(
+        !edited.contains("Resolved 1 of 21 files"),
+        "the one-file reuse line must not appear; output was:\n{edited}"
+    );
+    assert_matches_cold(&root);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_odd_path_is_cached_under_its_sha256_name() {
+    let root = scratch("odd-path");
+    write_independent_tree(&root);
+    let src = root.join("src");
+    std::fs::write(src.join("odd name.py"), "def odd():\n    return 1\n").unwrap();
+    std::fs::write(src.join("модуль.py"), "def модуль():\n    return 2\n").unwrap();
+    let cold = build_text(&root);
+    assert!(
+        cold.contains("Resolved 23 of 23 files"),
+        "the odd paths are part of the cold resolve; output was:\n{cold}"
+    );
+    let odd = blob_for(&root, "src/odd name.py");
+    let unicode = blob_for(&root, "src/модуль.py");
+    assert!(
+        !odd.display().to_string().contains("odd name"),
+        "the cache filename is the hash, not the path"
+    );
+    assert!(
+        !unicode.display().to_string().contains("модуль"),
+        "the cache filename is the hash, not the path"
+    );
+    edit_last_module(&root);
+    let edited = build_text(&root);
+    assert!(
+        edited.contains("Resolved 1 of 23 files"),
+        "the odd paths stay reused when another file changes; output was:\n{edited}"
+    );
+    assert_matches_cold(&root);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn full_and_lsp_builds_do_not_reuse() {
+    let root = scratch("full-lsp");
+    write_independent_tree(&root);
+    build_text(&root);
+    edit_last_module(&root);
+    let full = build_with(&root, &["--full"]);
+    assert!(
+        full.contains("Resolved 21 of 21 files"),
+        "--full resolves every file; output was:\n{full}"
+    );
+    std::fs::write(
+        root.join("src/mod_19.py"),
+        "def leaf_19():\n    return 19\n\n\ndef caller_19():\n    return leaf_19() + 2\n",
+    )
+    .unwrap();
+    let lsp = build_with(&root, &["--lsp"]);
+    assert!(
+        lsp.contains("Resolved 21 of 21 files"),
+        "--lsp resolves every file; output was:\n{lsp}"
+    );
+    assert!(
+        !lsp.contains("Resolved 1 of 21 files"),
+        "--lsp must not reuse; output was:\n{lsp}"
+    );
+    assert_matches_cold(&root);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_oversized_reuse_blob_is_a_miss() {
+    let root = scratch("oversize");
+    write_independent_tree(&root);
+    build_text(&root);
+    let blob = blob_for(&root, "src/mod_3.py");
+    let file = std::fs::File::create(&blob).unwrap();
+    file.set_len(32 * 1024 * 1024 + 1).unwrap();
+    edit_last_module(&root);
+    let edited = build_text(&root);
+    assert!(
+        edited.contains("Resolved 2 of 21 files"),
+        "a blob over the size cap is resolved instead of read; output was:\n{edited}"
+    );
+    assert!(
+        edited.contains("over the"),
+        "the size cap is in the diagnostic; output was:\n{edited}"
+    );
+    assert_matches_cold(&root);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_corrupt_budget_receipt_resolves_every_file() {
+    let root = scratch("corrupt-receipt");
+    write_independent_tree(&root);
+    build_text(&root);
+    std::fs::write(reuse_dir(&root).join("budget.json"), b"{{").unwrap();
+    edit_last_module(&root);
+    let edited = build_text(&root);
+    assert!(
+        edited.contains("Resolved 21 of 21 files"),
+        "a corrupt receipt resolves every file; output was:\n{edited}"
+    );
+    assert!(
+        edited.contains("is not a budget receipt"),
+        "the receipt error is in the diagnostic; output was:\n{edited}"
+    );
+    assert_matches_cold(&root);
+    let _ = std::fs::remove_dir_all(&root);
+}

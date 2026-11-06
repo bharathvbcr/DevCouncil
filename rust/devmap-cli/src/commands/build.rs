@@ -1,7 +1,11 @@
 use std::path::PathBuf;
 
 use devmap_extract::collect_project_manifests;
-use devmap_resolve::{Resolver, UnresolvedClass};
+use devmap_resolve::resolver::{
+    ResolutionBudgetUsage, ResolveReuse, ReuseBudgetReceipt, ReusedFileResolution,
+    RESOLUTION_REUSE_EPOCH,
+};
+use devmap_resolve::{LimitPolicy, ResolutionLimits, Resolver, UnresolvedClass};
 use devmap_store::{current_git_head, GenerationWriteOpts, Store, GENERATION_RETENTION};
 
 use crate::cli::{
@@ -748,39 +752,18 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
         None
     };
 
-    // B3/SC2: `affected` narrows what this generation *writes*. It no
-    // longer narrows what is *resolved*.
+    // `affected` narrows what this generation *writes*. Analysis still
+    // receives every edge. Handing it only the files just resolved is the
+    // measured failure: one edited file produced 433 dead-code candidates
+    // instead of 14, because liveness and community detection are global.
     //
-    // Resolution reads two genuinely global maps — the symbol index and
-    // the type/method index — and both are keyed by symbol *name*. So a
-    // file's edges can only change if its own source changed, or if a
-    // name it mentions was defined or removed somewhere else. That is
-    // the whole dependency surface, and it makes the affected set
-    // computable: the changed files, plus every file mentioning a name
-    // whose definition moved. The store partitions edges by source file
-    // and carries the rest forward, so narrowing the write stays sound
-    // and unaffected extractions are copied rather than re-serialized.
-    //
-    // Narrowing the *resolution* was not sound. `analyze` receives
-    // whatever this produces, and liveness and community detection are
-    // global by nature: they answer "does anything call this symbol"
-    // and "what clusters with what", questions no subset of the edges
-    // can answer. Measured on a 155-file fixture, one edited file
-    // handed the analyser 63 edges instead of 15,017, and the
-    // generation was committed with 433 dead-code candidates instead of
-    // 14 and 138 communities instead of 17 — `CharClass.contains`,
-    // `match_from` and `parse_class`, all plainly called, recorded as
-    // callerless. `devmap dead` then reports them to whoever asks.
-    //
-    // The stored *edges* were correct throughout, which is why
-    // `an_incremental_build_equals_a_cold_build` stayed green: it
-    // compared the graph, and the graph was never the part that broke.
-    // It now compares the generation.
-    //
-    // Resolving the whole tree costs what B3 saved on a changed build.
-    // That is the price of an analysis that means the same thing on
-    // both paths, and the no-change tick B3 was written for still
-    // returns above without reaching here.
+    // Files outside the closure are reused from the pre-pass cache when
+    // their content hash matches. The post-pass (package membership, inert
+    // values) runs again on the union, so a reused file is not a stale
+    // edge list. A miss, a corrupt blob, a budget that the reused files
+    // were not charged against, or a previous generation that was itself
+    // capped, resolves the file. The unchanged tick returned above and
+    // does not read or write this cache.
     // K4: `--full` writes a full generation. An empty affected set *is*
     // the full-rewrite signal to the store, so the closure — whose only
     // job is to narrow the write — is not computed at all.
@@ -807,8 +790,39 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
         2,
         format_args!("resolving {}", progress::count(extractions.len(), "file")),
     );
-    let mut resolution =
-        resolver.resolve_all_with_limits(&extractions, (*resolve_limits).into())?;
+    let limits: ResolutionLimits = (*resolve_limits).into();
+    let mut loaded = load_resolution_reuse(
+        path,
+        &store,
+        &extractions,
+        affected.as_ref(),
+        *full,
+        *lsp,
+        &limits,
+    )?;
+    for line in &loaded.diagnostics {
+        progress.display.diagnostic(format_args!("{line}"));
+    }
+    let mut outcome =
+        resolver.resolve_all_with_limits_reusing(&extractions, limits, &loaded.files)?;
+    if reuse_must_fall_back(&loaded.files, loaded.usage.as_ref(), &outcome, &limits) {
+        let why = if outcome.result.budget_gaps().is_empty() {
+            "reused files were not charged against the budget, and the last full \
+             resolve plus this edit can exceed it"
+        } else {
+            "a budget gap appeared while some files were reused"
+        };
+        progress.display.diagnostic(format_args!(
+            "resolution reuse: {why}, so every file is resolved again"
+        ));
+        loaded.files.clear();
+        outcome = resolver.resolve_all_with_limits_reusing(&extractions, limits, &loaded.files)?;
+    }
+    let files_resolved = outcome.produced.len();
+    let produced = outcome.produced;
+    let full_resolve = loaded.files.is_empty();
+    let usage = outcome.budget;
+    let mut resolution = outcome.result;
     // A budget that degraded candidate lists is said out loud, here and in the
     // JSON result, as well as stored as a coverage gap: a capped graph must not
     // read as a complete one to whoever ran the build.
@@ -943,6 +957,16 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
                 (gen_id, parts)
             })
     })?;
+    // The generation is committed. A cache write that fails must not fail it:
+    // the next edit resolves every file the cache cannot prove, which is the
+    // same graph. The diagnostic carries the error text.
+    if let Err(error) =
+        persist_resolution_reuse(path, &extractions, &produced, full_resolve, &limits, usage)
+    {
+        progress.display.diagnostic(format_args!(
+            "resolution reuse: the generation was committed but the reuse cache was not updated: {error}"
+        ));
+    }
 
     // Every generation carries a full carry-forward copy of the
     // repository. Without this the store grows by O(repository size)
@@ -1060,6 +1084,7 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
                 "generation_id": gen_id,
                 "file_progress": { "scan": scan_snapshot, "extraction": extraction_snapshot, "delta": file_delta },
                 "files_indexed": analysis.total_files,
+                "files_resolved": files_resolved,
                 // Its own number, never folded into the parse-failure
                 // count: a refused file is fixed by making it smaller or
                 // readable, a parse failure by a grammar, and an operator
@@ -1139,6 +1164,7 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
                 file_delta.unchanged,
                 extraction_snapshot.cache_hits
             ),
+            format!("  Resolved {files_resolved} of {} files", extractions.len()),
         ];
         if refused_count > 0 {
             summary.push(format!(
@@ -1372,6 +1398,349 @@ fn build_manifest_payload(
     }))
 }
 
+const REUSE_BLOB_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+struct LoadedReuse {
+    files: std::collections::BTreeMap<String, ReusedFileResolution>,
+    usage: Option<ResolutionBudgetUsage>,
+    diagnostics: Vec<String>,
+}
+
+fn reuse_dir(repo: &std::path::Path) -> std::path::PathBuf {
+    devmap_extract::paths::state_dir(repo)
+        .join(format!("resolution-reuse-{RESOLUTION_REUSE_EPOCH}"))
+}
+
+fn reuse_blob_stem(file_path: &str) -> String {
+    crate::sha256::sha256_hex(file_path.as_bytes())
+}
+
+fn limits_match(receipt: &ReuseBudgetReceipt, limits: &ResolutionLimits) -> bool {
+    receipt.candidate_visits == limits.candidate_visits
+        && receipt.retained_candidate_bytes == limits.retained_candidate_bytes
+        && receipt.ambiguity_evidence_bytes == limits.ambiguity_evidence_bytes
+        && receipt.degraded_candidates == limits.degraded_candidates
+        && receipt.refuse == matches!(limits.on_exceed, LimitPolicy::Refuse)
+}
+
+fn previous_resolution_was_capped(status: &devmap_analyze::AnalysisStatus) -> bool {
+    match status {
+        devmap_analyze::AnalysisStatus::Partial { reason } => {
+            reason.contains("resolution was capped by a budget")
+        }
+        _ => false,
+    }
+}
+
+fn load_resolution_reuse(
+    repo: &std::path::Path,
+    store: &Store,
+    extractions: &[devmap_extract::model::Extraction],
+    affected: Option<&std::collections::BTreeSet<String>>,
+    full: bool,
+    lsp: bool,
+    limits: &ResolutionLimits,
+) -> anyhow::Result<LoadedReuse> {
+    let mut loaded = LoadedReuse {
+        files: std::collections::BTreeMap::new(),
+        usage: None,
+        diagnostics: Vec::new(),
+    };
+    // `--full`, `--lsp`, a cold build, and an empty closure all resolve
+    // every file. The empty closure is not the unchanged tick: that one
+    // returned before resolve and must not touch this directory.
+    let Some(affected) = affected.filter(|set| !set.is_empty() && !full && !lsp) else {
+        return Ok(loaded);
+    };
+    if store
+        .latest_analysis_status()?
+        .is_some_and(|status| previous_resolution_was_capped(&status))
+    {
+        loaded.diagnostics.push(
+            "resolution reuse: previous generation was capped by a budget, so every file is resolved"
+                .to_string(),
+        );
+        return Ok(loaded);
+    }
+    let dir = reuse_dir(repo);
+    let receipt_path = dir.join("budget.json");
+    let receipt_bytes = match std::fs::read(&receipt_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            loaded.diagnostics.push(format!(
+                "resolution reuse: could not read {}: {error}",
+                receipt_path.display()
+            ));
+            return Ok(loaded);
+        }
+    };
+    if receipt_bytes.len() as u64 > REUSE_BLOB_MAX_BYTES {
+        loaded.diagnostics.push(format!(
+            "resolution reuse: {} is {} bytes, over the {} byte cap, so every file is resolved",
+            receipt_path.display(),
+            receipt_bytes.len(),
+            REUSE_BLOB_MAX_BYTES
+        ));
+        return Ok(loaded);
+    }
+    let receipt: ReuseBudgetReceipt = match serde_json::from_slice(&receipt_bytes) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            loaded.diagnostics.push(format!(
+                "resolution reuse: {} is not a budget receipt: {error}",
+                receipt_path.display()
+            ));
+            return Ok(loaded);
+        }
+    };
+    if !limits_match(&receipt, limits) {
+        loaded.diagnostics.push(format!(
+            "resolution reuse: budget receipt at {} was written under different limits, so every file is resolved",
+            receipt_path.display()
+        ));
+        return Ok(loaded);
+    }
+    loaded.usage = Some(receipt.usage);
+    for extraction in extractions {
+        if affected.contains(&extraction.file_path) {
+            continue;
+        }
+        match read_reuse_blob(&dir, &extraction.file_path, extraction.content_hash) {
+            Ok(file) => {
+                loaded.files.insert(extraction.file_path.clone(), file);
+            }
+            Err(error) => loaded.diagnostics.push(format!(
+                "resolution reuse: {} is a miss: {error}",
+                extraction.file_path
+            )),
+        }
+    }
+    Ok(loaded)
+}
+
+fn read_reuse_blob(
+    dir: &std::path::Path,
+    file_path: &str,
+    content_hash: u64,
+) -> Result<ReusedFileResolution, String> {
+    let path = dir.join(format!("{}.json", reuse_blob_stem(file_path)));
+    let meta = std::fs::metadata(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if !meta.is_file() {
+        return Err(format!("{} is not a file", path.display()));
+    }
+    if meta.len() > REUSE_BLOB_MAX_BYTES {
+        return Err(format!(
+            "{} is {} bytes, over the {} byte cap",
+            path.display(),
+            meta.len(),
+            REUSE_BLOB_MAX_BYTES
+        ));
+    }
+    let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if bytes.len() as u64 > REUSE_BLOB_MAX_BYTES {
+        return Err(format!(
+            "{} is {} bytes, over the {} byte cap",
+            path.display(),
+            bytes.len(),
+            REUSE_BLOB_MAX_BYTES
+        ));
+    }
+    let parsed: ReusedFileResolution =
+        serde_json::from_slice(&bytes).map_err(|error| format!("{}: {error}", path.display()))?;
+    if parsed.content_hash != content_hash {
+        return Err(format!(
+            "{} content hash {:x} does not match the file {:x}",
+            path.display(),
+            parsed.content_hash,
+            content_hash
+        ));
+    }
+    Ok(parsed)
+}
+
+fn reuse_must_fall_back(
+    reused: &std::collections::BTreeMap<String, ReusedFileResolution>,
+    saved: Option<&ResolutionBudgetUsage>,
+    outcome: &ResolveReuse,
+    limits: &ResolutionLimits,
+) -> bool {
+    if reused.is_empty() {
+        return false;
+    }
+    // A gap on the subset, or no record of what the last full resolve charged,
+    // is not comparable to a cold resolve. The same is true when the sum of
+    // the two can exceed a budget: reused files were not charged this pass.
+    let Some(saved) = saved else {
+        return true;
+    };
+    if !outcome.result.budget_gaps().is_empty() {
+        return true;
+    }
+    saved.visits.saturating_add(outcome.budget.visits) > limits.candidate_visits
+        || saved
+            .retained_bytes
+            .saturating_add(outcome.budget.retained_bytes)
+            > limits.retained_candidate_bytes
+        || saved
+            .evidence_bytes
+            .saturating_add(outcome.budget.evidence_bytes)
+            > limits.ambiguity_evidence_bytes
+}
+
+fn persist_resolution_reuse(
+    repo: &std::path::Path,
+    extractions: &[devmap_extract::model::Extraction],
+    produced: &std::collections::BTreeMap<String, ReusedFileResolution>,
+    full_resolve: bool,
+    limits: &ResolutionLimits,
+    usage: ResolutionBudgetUsage,
+) -> Result<(), String> {
+    let dir = reuse_dir(repo);
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("could not create {}: {error}", dir.display()))?;
+    let mut failures = Vec::new();
+    for (file_path, file) in produced {
+        if let Err(error) = write_reuse_blob(&dir, file_path, file) {
+            failures.push(error);
+        }
+    }
+    if !failures.is_empty() {
+        return Err(failures.join("; "));
+    }
+    if full_resolve {
+        let receipt = ReuseBudgetReceipt {
+            candidate_visits: limits.candidate_visits,
+            retained_candidate_bytes: limits.retained_candidate_bytes,
+            ambiguity_evidence_bytes: limits.ambiguity_evidence_bytes,
+            degraded_candidates: limits.degraded_candidates,
+            refuse: matches!(limits.on_exceed, LimitPolicy::Refuse),
+            usage,
+        };
+        let bytes = serde_json::to_vec(&receipt)
+            .map_err(|error| format!("could not encode the budget receipt: {error}"))?;
+        write_atomic(&dir.join("budget.json"), &bytes)
+            .map_err(|error| format!("could not write the budget receipt: {error}"))?;
+    }
+    prune_reuse_blobs(&dir, extractions)
+        .map_err(|error| format!("could not prune stale reuse blobs: {error}"))?;
+    remove_old_reuse_epochs(repo).map_err(|error| {
+        format!(
+            "the current reuse cache was written, but an older epoch could not be removed: {error}"
+        )
+    })?;
+    Ok(())
+}
+
+fn write_reuse_blob(
+    dir: &std::path::Path,
+    file_path: &str,
+    file: &ReusedFileResolution,
+) -> Result<(), String> {
+    let bytes = serde_json::to_vec(file)
+        .map_err(|error| format!("{file_path}: could not encode the resolution: {error}"))?;
+    if bytes.len() as u64 > REUSE_BLOB_MAX_BYTES {
+        return Err(format!(
+            "{file_path}: encoded resolution is {} bytes, over the {} byte cap",
+            bytes.len(),
+            REUSE_BLOB_MAX_BYTES
+        ));
+    }
+    let dest = dir.join(format!("{}.json", reuse_blob_stem(file_path)));
+    write_atomic(&dest, &bytes).map_err(|error| format!("{file_path}: {error}"))
+}
+
+/// Write `bytes` to `dest` by renaming a sibling temp file over it.
+///
+/// The destination is removed first. Windows `rename` cannot replace a file
+/// that already exists; the remove-then-rename is the portability measure.
+/// This host is macOS, so that Windows path is unexecuted here.
+fn write_atomic(dest: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut tmp_name = dest.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = dest.with_file_name(tmp_name);
+    if let Err(error) = std::fs::write(&tmp, bytes) {
+        return Err(error);
+    }
+    match std::fs::remove_file(dest) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            let remove_tmp = std::fs::remove_file(&tmp).err();
+            return Err(match remove_tmp {
+                Some(tmp_error) => std::io::Error::new(
+                    error.kind(),
+                    format!("{error}; and the temp file could not be removed: {tmp_error}"),
+                ),
+                None => error,
+            });
+        }
+    }
+    if let Err(error) = std::fs::rename(&tmp, dest) {
+        let remove_tmp = std::fs::remove_file(&tmp).err();
+        return Err(match remove_tmp {
+            Some(tmp_error) => std::io::Error::new(
+                error.kind(),
+                format!("{error}; and the temp file could not be removed: {tmp_error}"),
+            ),
+            None => error,
+        });
+    }
+    Ok(())
+}
+
+fn prune_reuse_blobs(
+    dir: &std::path::Path,
+    extractions: &[devmap_extract::model::Extraction],
+) -> std::io::Result<()> {
+    let keep: std::collections::BTreeSet<String> = extractions
+        .iter()
+        .map(|extraction| reuse_blob_stem(&extraction.file_path))
+        .collect();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(stem) = name.strip_suffix(".json") else {
+            continue;
+        };
+        if stem.len() == 64
+            && stem.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && !keep.contains(stem)
+        {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_old_reuse_epochs(repo: &std::path::Path) -> std::io::Result<()> {
+    let state = devmap_extract::paths::state_dir(repo);
+    let current = format!("resolution-reuse-{RESOLUTION_REUSE_EPOCH}");
+    let entries = match std::fs::read_dir(&state) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with("resolution-reuse-") && name != current && entry.path().is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 fn split_csv(raw: &Option<String>) -> Vec<String> {
     raw.as_ref()
         .map(|s| {
@@ -1391,9 +1760,10 @@ fn split_csv(raw: &Option<String>) -> Vec<String> {
 /// defined or removed elsewhere. The closure is the changed files plus every
 /// file mentioning such a name.
 ///
-/// Resolution and analysis always receive the whole repository. This set only
-/// narrows persistence; the store independently checks content and row digests
-/// before carrying anything forward.
+/// Analysis always receives every edge. This set narrows the store write and
+/// which files are resolved again. A file outside it is reused when its
+/// content hash matches a cached pre-pass resolution. The store still checks
+/// content and row digests before carrying a row forward.
 ///
 /// Returns `None` (meaning "write everything") whenever the cheap, safe
 /// answer is unavailable: no previous generation, a file added or deleted, or
@@ -1841,6 +2211,88 @@ mod tests {
             split_csv(&Some("only.py".to_string())),
             vec!["only.py".to_string()],
             "a single entry with no comma must survive"
+        );
+    }
+
+    #[test]
+    fn reuse_falls_back_when_the_subset_cannot_stand_in_for_a_cold_resolve() {
+        use std::sync::Arc;
+
+        use devmap_resolve::{
+            LangFamily, Resolution, ResolutionResult, UnresolvedClass, UnresolvedKind,
+            UnresolvedReference,
+        };
+
+        let limits = ResolutionLimits::default();
+        let mut reused = std::collections::BTreeMap::new();
+        reused.insert(
+            "kept.py".to_string(),
+            ReusedFileResolution {
+                content_hash: 1,
+                edges: Vec::new(),
+                unresolved: Vec::new(),
+                package_groups: std::collections::BTreeMap::new(),
+            },
+        );
+        let outcome = |visits| ResolveReuse {
+            result: ResolutionResult {
+                edges: Vec::new(),
+                receiver_types: std::collections::BTreeMap::new(),
+                reexport_chains: std::collections::BTreeMap::new(),
+                unresolved: Vec::new(),
+            },
+            produced: std::collections::BTreeMap::new(),
+            budget: ResolutionBudgetUsage {
+                visits,
+                retained_bytes: 0,
+                evidence_bytes: 0,
+            },
+        };
+        assert!(
+            !reuse_must_fall_back(
+                &std::collections::BTreeMap::new(),
+                None,
+                &outcome(1),
+                &limits
+            ),
+            "an empty reuse map is a full resolve"
+        );
+        assert!(
+            reuse_must_fall_back(&reused, None, &outcome(0), &limits),
+            "reuse without the last full resolve's charges is not comparable"
+        );
+        let saved = ResolutionBudgetUsage {
+            visits: limits.candidate_visits - 10,
+            retained_bytes: 0,
+            evidence_bytes: 0,
+        };
+        assert!(
+            reuse_must_fall_back(&reused, Some(&saved), &outcome(11), &limits),
+            "the sum of the last full resolve and this edit exceeding the budget falls back"
+        );
+        assert!(
+            !reuse_must_fall_back(&reused, Some(&saved), &outcome(10), &limits),
+            "a sum that stays inside the budget keeps the reused files"
+        );
+        let mut gapped = outcome(0);
+        gapped.result.unresolved.push(UnresolvedReference {
+            source_file: "fresh.py".into(),
+            source_symbol: "fresh.py".into(),
+            callee_name: "name".into(),
+            kind: UnresolvedKind::Call,
+            resolution: Resolution::CappedGlobal {
+                candidates: Arc::<[(String, String)]>::from(vec![]),
+                total: Some(4),
+                limit: Arc::<str>::from("candidate visits"),
+                family: LangFamily::Python,
+            },
+            class: UnresolvedClass::Unresolved,
+            receiver: None,
+            site: None,
+        });
+        assert!(
+            reuse_must_fall_back(&reused, Some(&saved), &gapped, &limits),
+            "a budget gap while files were reused resolves every file again"
         );
     }
 }
