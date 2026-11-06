@@ -1183,16 +1183,46 @@ impl StackedStore {
     /// Promote this stacked worktree into a standalone writable CoW `devmap.sqlite`
     /// and retire `stack_lease.json` + `delta.sqlite` (`OQ2`).
     pub fn materialize_seeded_store(&self) -> Result<PathBuf> {
+        self.materialize_seeded_store_waiting(Store::WRITER_LOCK_WAIT)
+    }
+
+    /// [`Self::materialize_seeded_store`] with the writer-lock wait named, so a
+    /// test can watch the refusal without waiting out a minute.
+    pub fn materialize_seeded_store_waiting(&self, wait: std::time::Duration) -> Result<PathBuf> {
         let target_db = store_path(&self.worktree_root);
+        if let Some(parent) = target_db.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create {}", parent.display()))?;
+        }
+        // Another writer (a build, a drain) may be placing this store: hold the
+        // same lock they hold for the whole promotion.
+        let _writer = Store::lock_writer_at(&target_db, wait)?;
+        if fs::symlink_metadata(&target_db).is_ok() {
+            bail!(
+                "refusing to materialize over an existing store {}",
+                target_db.display()
+            );
+        }
         promote_immutable_base_to_store(&self.base_sqlite_path, &target_db, &self.worktree_root)?;
         if let Some(ref src_csr) = self.base_csr_path {
             let dst_csr = csr_path_for_store(&target_db);
-            let _ = seed_artifact(src_csr, &dst_csr)?;
+            seed_artifact(src_csr, &dst_csr)?;
             if dst_csr.is_file() {
-                let _ = set_file_writable(&dst_csr);
+                set_file_writable(&dst_csr)?;
             }
         }
-        let _ = fs::remove_file(stack_lease_path(&self.worktree_root));
+        match fs::remove_file(stack_lease_path(&self.worktree_root)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "store placed at {} but the stack lease could not be removed",
+                        target_db.display()
+                    )
+                })
+            }
+        }
         discard_staged(self.delta.path());
         Ok(target_db)
     }
@@ -2023,6 +2053,44 @@ mod tests {
             err.to_string().contains("git"),
             "error must name git: {err}"
         );
+        drop(stacked);
+        let _ = remove_readonly_tree(&root);
+    }
+
+    #[cfg(feature = "parse")]
+    #[test]
+    fn materialize_waits_for_the_writer_lock_and_then_refuses() {
+        let root = temp_repo_dir("materialize-lock");
+        let anchor = root.join("anchor");
+        seed_indexed_git_repo(&anchor);
+        let lane = add_lane(&anchor, &root, "lane");
+        provision_stacked_worktree(&anchor, &lane).unwrap();
+        let stacked = StackedStore::open(&lane).unwrap();
+
+        let target_db = store_path(&stacked.worktree_root);
+        fs::create_dir_all(target_db.parent().unwrap()).unwrap();
+        let held = Store::lock_writer_at(&target_db, std::time::Duration::from_secs(5)).unwrap();
+        let err = stacked
+            .materialize_seeded_store_waiting(std::time::Duration::from_millis(300))
+            .expect_err("a held writer lock must refuse the promotion")
+            .to_string();
+        assert!(
+            !target_db.exists(),
+            "nothing may be placed under a held lock"
+        );
+        assert!(
+            stack_lease_path(&lane).is_file(),
+            "the lease must survive a refusal"
+        );
+        assert!(!err.is_empty());
+        drop(held);
+
+        let placed = stacked.materialize_seeded_store().unwrap();
+        assert!(placed.is_file());
+        let again = stacked
+            .materialize_seeded_store()
+            .expect_err("must not overwrite a store");
+        assert!(again.to_string().contains("existing store"), "{again}");
         drop(stacked);
         let _ = remove_readonly_tree(&root);
     }
