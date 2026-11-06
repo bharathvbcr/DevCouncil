@@ -222,6 +222,7 @@ fn interning_preserves_every_reason_byte_and_never_merges_two_rows() {
         "unicode ✓ ★ 日本語 café".to_string(),
         "emoji 🔥🙂".to_string(),
         "nul-ish \u{7f} and \u{1}".to_string(),
+        "before\0after".to_string(),
         "x".repeat(4096),
         // Deliberate duplicates: the intern table must hand the same text to
         // three different rows without collapsing the rows themselves.
@@ -230,7 +231,7 @@ fn interning_preserves_every_reason_byte_and_never_merges_two_rows() {
         "shared".to_string(),
     ];
     let dir = tmp_dir("ledger-intern");
-    let unresolved: Vec<UnresolvedReference> = awkward
+    let mut unresolved: Vec<UnresolvedReference> = awkward
         .iter()
         .enumerate()
         .map(|(n, reason)| UnresolvedReference {
@@ -246,10 +247,26 @@ fn interning_preserves_every_reason_byte_and_never_merges_two_rows() {
             site: None,
         })
         .collect();
+    unresolved.push(UnresolvedReference {
+        source_file: SOURCE.0.into(),
+        source_symbol: "hub.py::ambiguous".into(),
+        callee_name: "ambiguous_callee".into(),
+        kind: UnresolvedKind::Call,
+        resolution: Resolution::AmbiguousGlobal {
+            candidates: std::sync::Arc::<[(String, String)]>::from(vec![(
+                "a.py".to_string(),
+                "f".to_string(),
+            )]),
+            family: devmap_resolve::model::LangFamily::Python,
+        },
+        class: UnresolvedClass::Unresolved,
+        receiver: Some("recv\0nul".to_string()),
+        site: None,
+    });
     let db = write_ledger(&dir, unresolved.clone());
     let stored = stored_rows(&db);
 
-    assert_eq!(stored.len(), awkward.len(), "a row went missing");
+    assert_eq!(stored.len(), unresolved.len(), "a row went missing");
     for (index, reference) in unresolved.iter().enumerate() {
         assert_eq!(
             stored[index].3,

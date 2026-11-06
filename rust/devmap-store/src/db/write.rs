@@ -1935,14 +1935,15 @@ impl Store {
             // `unresolved_texts` — so this resolves each distinct text to its
             // id once, here, and everything downstream compares integers.
             //
-            // The reason is formatted once per row rather than three times.
-            // It used to be formatted on demand, which read as the frugal
-            // choice: a parallel `Vec<String>` holds 181,163 owned strings for
-            // the length of the write, and that is memory `verify.sh` gate 6
-            // charges against the kernel's model. But "on demand" was three
-            // demands — the digest pass, the bucket pass and the insert pass
-            // each rebuilt every row's `format!("{:?}", …)` — so the write paid
-            // half a million allocations to avoid holding 181,163.
+            // The reason text stored is `format!("{:?}", resolution)`, once
+            // per distinct value. `Resolution::Unresolved` is almost every
+            // row of a cold DevCouncil build (about 72,000 distinct reasons
+            // across 291,500 rows). Formatting that variant's derive spelling
+            // on every duplicate was about 40 ms of this span. The common
+            // variant is written `Unresolved { reason: {reason:?} }`, which
+            // is what the derive emits, and every other variant still goes
+            // through `{:?}`. A miss inserts the formatted text; a hit
+            // reuses the slot and does not format again.
             //
             // Interning against the *persisted* pool, not a fresh one per
             // write: the id has to mean the same text as it did in the stored
@@ -2042,6 +2043,8 @@ impl Store {
                 // with all eight classes stored as `builtin`. That test is the
                 // behavioural half of this comment, and it is load-bearing.
                 let mut class_memo: Vec<((*const u8, usize), u32)> = Vec::new();
+                let mut by_reason: std::collections::HashMap<std::rc::Rc<str>, u32> =
+                    std::collections::HashMap::with_capacity(resolution.unresolved.len() / 4);
                 // Consecutive rows overwhelmingly share a source file — the
                 // resolver emits per file — so one remembered path answers
                 // almost every lookup without hashing forty bytes again.
@@ -2049,9 +2052,25 @@ impl Store {
 
                 for unresolved in &resolution.unresolved {
                     use std::fmt::Write as _;
-                    scratch.clear();
-                    let _ = write!(scratch, "{:?}", unresolved.resolution);
-                    reason_slots.push(slot_for(&scratch, &mut slot_of_text, &mut slot_text)?);
+                    let reason_slot = match &unresolved.resolution {
+                        devmap_resolve::model::Resolution::Unresolved { reason } => {
+                            if let Some(slot) = by_reason.get(reason.as_str()) {
+                                *slot
+                            } else {
+                                scratch.clear();
+                                let _ = write!(scratch, "Unresolved {{ reason: {reason:?} }}");
+                                let slot = slot_for(&scratch, &mut slot_of_text, &mut slot_text)?;
+                                by_reason.insert(std::rc::Rc::from(reason.as_str()), slot);
+                                slot
+                            }
+                        }
+                        other => {
+                            scratch.clear();
+                            let _ = write!(scratch, "{other:?}");
+                            slot_for(&scratch, &mut slot_of_text, &mut slot_text)?
+                        }
+                    };
+                    reason_slots.push(reason_slot);
 
                     let label = unresolved.class.label();
                     let key = (label.as_ptr(), label.len());
@@ -2101,12 +2120,7 @@ impl Store {
                 fresh.sort_unstable_by(|left, right| {
                     slot_text[*left as usize].cmp(&slot_text[*right as usize])
                 });
-                let mut insert =
-                    tx.prepare_cached("INSERT INTO unresolved_texts (text) VALUES (?1)")?;
-                for slot in fresh {
-                    insert.execute(params![slot_text[slot as usize].as_ref()])?;
-                    slot_ids[slot as usize] = tx.last_insert_rowid();
-                }
+                insert_fresh_texts(&tx, &slot_text, &fresh, &mut slot_ids)?;
             }
             if slot_ids.contains(&UNASSIGNED) {
                 return Err(refusal(
@@ -2123,28 +2137,22 @@ impl Store {
                 .collect();
 
             let unresolved_tuple = |index: usize| -> UnresolvedTuple<'_> {
-                let unresolved = &resolution.unresolved[index];
-                UnresolvedTuple {
-                    source_file_id: source_ids[index],
-                    source_symbol: std::borrow::Cow::Borrowed(unresolved.source_symbol.as_str()),
-                    callee_name: std::borrow::Cow::Borrowed(unresolved.callee_name.as_str()),
-                    reason_id: reason_ids[index],
-                    classification_id: class_ids[index],
-                    receiver: unresolved
-                        .receiver
-                        .as_deref()
-                        .map(std::borrow::Cow::Borrowed),
-                }
+                unresolved_tuple_at(index, &source_ids, &reason_ids, &class_ids, resolution)
             };
             // The same per-file digest the edges get, and keyed the same way
             // since v22. Before it, this relation stored its path as text and
             // keyed by that, so the two halves of one digest row were reached
             // by two different keys.
-            for (index, file_id) in source_ids.iter().enumerate() {
-                fresh_unresolved_digests
-                    .entry(*file_id)
-                    .or_default()
-                    .absorb(&unresolved_tuple(index));
+            //
+            // A cold write (`scope_by_digest` false) does not compare the fold
+            // until after this charge, when the digest row is stored for the
+            // next build. Folding it on this thread first is about 31 ms that
+            // the insert does not depend on. That path folds on a second
+            // thread during the insert, still inside this charge. The compare
+            // path folds here, because the unchanged-file set is the fold.
+            if scope_by_digest {
+                fresh_unresolved_digests =
+                    fold_unresolved_digests(&source_ids, &reason_ids, &class_ids, resolution);
             }
             // The ledger's half of the check the edge pass documents: the rows
             // are asked how many of them there are, so a row deleted behind the
@@ -2333,14 +2341,19 @@ impl Store {
             // to add a handful, and a write that inserts nothing must leave
             // the index schema creation already installed.
             //
-            // The cold insert is `prepare`, not `prepare_cached`. A cached
-            // statement was planned while the index existed, and rusqlite
-            // does not reprepare when SQLite reports a schema change, so
-            // returning the no-index statement to the cache would make the
-            // next incremental insert fail or skip the index. The cached
-            // copy is discarded before the drop. `defer_foreign_keys` is not
-            // set: turning it off before COMMIT skips the check and commits
-            // a dangling child. The three foreign keys stay on.
+            // The cold insert binds with `sqlite3_bind_text64` and
+            // `SQLITE_STATIC`, not rusqlite's `ToSql`. `ToSql` copies every
+            // string (`SQLITE_TRANSIENT`) and builds a parameter slice per
+            // row. The bytes bound here are the resolution's own strings,
+            // which outlive `sqlite3_step`, and the length is passed so an
+            // embedded NUL is stored whole. A cached statement is discarded
+            // before the index drop: rusqlite does not reprepare when SQLite
+            // reports a schema change, and a statement planned while the
+            // index existed would skip it on the next incremental insert.
+            // `defer_foreign_keys` is not set. Turning it off before COMMIT
+            // skips the check. The three foreign keys stay on, and
+            // `MIGRATION_V23_TO_V24` still runs before this charge ends.
+            drop(close);
             let inserting = ledger_matched.iter().any(|kept| !*kept);
             let ledger_table_empty: bool = tx.query_row(
                 "SELECT NOT EXISTS(SELECT 1 FROM unresolved_rows)",
@@ -2348,39 +2361,41 @@ impl Store {
                 |row| row.get(0),
             )?;
             let rebuild_callee_index = inserting && ledger_table_empty;
-            const UNRESOLVED_INSERT: &str = "INSERT INTO unresolved_rows
-                 (source_file_id, source_symbol, callee_name, reason_id, classification_id,
-                  receiver, valid_from, valid_to)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)";
-            let insert_row = |insert: &mut rusqlite::Statement<'_>| -> Result<()> {
-                for (index, still_valid) in ledger_matched.iter().enumerate() {
-                    if *still_valid {
-                        continue;
-                    }
-                    let tuple = unresolved_tuple(index);
-                    insert.execute(params![
-                        tuple.source_file_id,
-                        tuple.source_symbol.as_ref(),
-                        tuple.callee_name.as_ref(),
-                        tuple.reason_id,
-                        tuple.classification_id,
-                        tuple.receiver.as_deref(),
-                        gen_id,
-                    ])?;
+            let insert_rows = |tx: &rusqlite::Transaction<'_>| -> Result<()> {
+                if !inserting {
+                    return Ok(());
+                }
+                if rebuild_callee_index {
+                    tx.prepare_cached(UNRESOLVED_INSERT_SQL)?.discard();
+                    tx.execute_batch("DROP INDEX IF EXISTS idx_unresolved_rows_callee")?;
+                }
+                write_unresolved_rows(
+                    tx,
+                    &ledger_matched,
+                    &source_ids,
+                    &reason_ids,
+                    &class_ids,
+                    resolution,
+                    gen_id,
+                )?;
+                if rebuild_callee_index {
+                    tx.execute_batch(crate::schema::MIGRATION_V23_TO_V24)?;
                 }
                 Ok(())
             };
-            if rebuild_callee_index {
-                tx.prepare_cached(UNRESOLVED_INSERT)?.discard();
-                tx.execute_batch("DROP INDEX IF EXISTS idx_unresolved_rows_callee")?;
-                {
-                    let mut insert = tx.prepare(UNRESOLVED_INSERT)?;
-                    insert_row(&mut insert)?;
-                }
-                tx.execute_batch(crate::schema::MIGRATION_V23_TO_V24)?;
+            if !scope_by_digest && !source_ids.is_empty() {
+                std::thread::scope(|scope| {
+                    let worker = scope.spawn(|| {
+                        fold_unresolved_digests(&source_ids, &reason_ids, &class_ids, resolution)
+                    });
+                    let inserted = insert_rows(&tx);
+                    fresh_unresolved_digests = worker
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    inserted
+                })?;
             } else {
-                let mut insert = tx.prepare_cached(UNRESOLVED_INSERT)?;
-                insert_row(&mut insert)?;
+                insert_rows(&tx)?;
             }
         }
 
@@ -2639,4 +2654,223 @@ impl Store {
         spent.attribute_residual(write_started.elapsed().as_secs_f64());
         Ok((gen_id, spent))
     }
+}
+
+#[cfg(feature = "parse")]
+const UNRESOLVED_INSERT_SQL: &str = "INSERT INTO unresolved_rows
+                 (source_file_id, source_symbol, callee_name, reason_id, classification_id,
+                  receiver, valid_from, valid_to)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)";
+
+#[cfg(feature = "parse")]
+fn unresolved_tuple_at<'a>(
+    index: usize,
+    source_ids: &[u32],
+    reason_ids: &[i64],
+    class_ids: &[i64],
+    resolution: &'a devmap_resolve::model::ResolutionResult,
+) -> UnresolvedTuple<'a> {
+    let unresolved = &resolution.unresolved[index];
+    UnresolvedTuple {
+        source_file_id: source_ids[index],
+        source_symbol: std::borrow::Cow::Borrowed(unresolved.source_symbol.as_str()),
+        callee_name: std::borrow::Cow::Borrowed(unresolved.callee_name.as_str()),
+        reason_id: reason_ids[index],
+        classification_id: class_ids[index],
+        receiver: unresolved
+            .receiver
+            .as_deref()
+            .map(std::borrow::Cow::Borrowed),
+    }
+}
+
+#[cfg(feature = "parse")]
+fn fold_unresolved_digests(
+    source_ids: &[u32],
+    reason_ids: &[i64],
+    class_ids: &[i64],
+    resolution: &devmap_resolve::model::ResolutionResult,
+) -> std::collections::HashMap<u32, RowSetDigest> {
+    let mut digests: std::collections::HashMap<u32, RowSetDigest> =
+        std::collections::HashMap::new();
+    for index in 0..source_ids.len() {
+        digests
+            .entry(source_ids[index])
+            .or_default()
+            .absorb(&unresolved_tuple_at(
+                index, source_ids, reason_ids, class_ids, resolution,
+            ));
+    }
+    digests
+}
+
+/// One SQLite statement bound without rusqlite's per-row `ToSql` copy.
+///
+/// `SQLITE_STATIC` is safe only while every bound pointer stays valid until
+/// `sqlite3_step` returns. Callers pass strings owned by the resolution or by
+/// the intern table for this write, never a temporary.
+#[cfg(feature = "parse")]
+struct BoundStmt {
+    db: *mut rusqlite::ffi::sqlite3,
+    stmt: *mut rusqlite::ffi::sqlite3_stmt,
+}
+
+#[cfg(feature = "parse")]
+impl Drop for BoundStmt {
+    fn drop(&mut self) {
+        unsafe { rusqlite::ffi::sqlite3_finalize(self.stmt) };
+    }
+}
+
+#[cfg(feature = "parse")]
+fn sqlite_call_error(
+    db: *mut rusqlite::ffi::sqlite3,
+    rc: i32,
+    what: &'static str,
+) -> rusqlite::Error {
+    let detail = unsafe {
+        let ptr = rusqlite::ffi::sqlite3_errmsg(db);
+        if ptr.is_null() {
+            None
+        } else {
+            Some(std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned())
+        }
+    };
+    let message = match detail {
+        Some(text) if !text.is_empty() => format!("{what}: {text}"),
+        _ => what.to_string(),
+    };
+    rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rc), Some(message))
+}
+
+#[cfg(feature = "parse")]
+impl BoundStmt {
+    fn prepare(tx: &rusqlite::Transaction<'_>, sql: &str) -> Result<Self> {
+        // Safety: this thread is the only one using the connection. The
+        // digest worker hashes row identities and does not touch SQLite.
+        // The handle is not closed here; `Drop` finalizes only the statement.
+        let db = unsafe { tx.handle() };
+        let sql = std::ffi::CString::new(sql)
+            .map_err(|_| refusal("a ledger statement contains an embedded nul"))?;
+        let mut stmt = std::ptr::null_mut();
+        let rc = unsafe {
+            rusqlite::ffi::sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, std::ptr::null_mut())
+        };
+        if rc != rusqlite::ffi::SQLITE_OK {
+            return Err(sqlite_call_error(db, rc, "prepare ledger statement"));
+        }
+        Ok(Self { db, stmt })
+    }
+
+    fn fail(&self, rc: i32, what: &'static str) -> rusqlite::Error {
+        sqlite_call_error(self.db, rc, what)
+    }
+
+    fn bind_i64(&self, index: i32, value: i64) -> Result<()> {
+        let rc = unsafe { rusqlite::ffi::sqlite3_bind_int64(self.stmt, index, value) };
+        if rc != rusqlite::ffi::SQLITE_OK {
+            return Err(self.fail(rc, "bind ledger integer"));
+        }
+        Ok(())
+    }
+
+    fn bind_null(&self, index: i32) -> Result<()> {
+        let rc = unsafe { rusqlite::ffi::sqlite3_bind_null(self.stmt, index) };
+        if rc != rusqlite::ffi::SQLITE_OK {
+            return Err(self.fail(rc, "bind ledger null"));
+        }
+        Ok(())
+    }
+
+    fn bind_text(&self, index: i32, text: &str) -> Result<()> {
+        let rc = unsafe {
+            let (ptr, len) = if text.is_empty() {
+                (b"\0".as_ptr().cast::<std::os::raw::c_char>(), 0)
+            } else {
+                (
+                    text.as_ptr().cast::<std::os::raw::c_char>(),
+                    text.len() as rusqlite::ffi::sqlite3_uint64,
+                )
+            };
+            rusqlite::ffi::sqlite3_bind_text64(
+                self.stmt,
+                index,
+                ptr,
+                len,
+                rusqlite::ffi::SQLITE_STATIC(),
+                rusqlite::ffi::SQLITE_UTF8 as std::os::raw::c_uchar,
+            )
+        };
+        if rc != rusqlite::ffi::SQLITE_OK {
+            return Err(self.fail(rc, "bind ledger text"));
+        }
+        Ok(())
+    }
+
+    fn step_done(&self) -> Result<()> {
+        let stepped = unsafe { rusqlite::ffi::sqlite3_step(self.stmt) };
+        let reset = unsafe { rusqlite::ffi::sqlite3_reset(self.stmt) };
+        if stepped != rusqlite::ffi::SQLITE_DONE {
+            return Err(self.fail(stepped, "step ledger insert"));
+        }
+        if reset != rusqlite::ffi::SQLITE_OK {
+            return Err(self.fail(reset, "reset ledger insert"));
+        }
+        Ok(())
+    }
+
+    fn last_insert_rowid(&self) -> i64 {
+        unsafe { rusqlite::ffi::sqlite3_last_insert_rowid(self.db) }
+    }
+}
+
+#[cfg(feature = "parse")]
+fn insert_fresh_texts(
+    tx: &rusqlite::Transaction<'_>,
+    slot_text: &[std::rc::Rc<str>],
+    fresh: &[u32],
+    slot_ids: &mut [i64],
+) -> Result<()> {
+    if fresh.is_empty() {
+        return Ok(());
+    }
+    let stmt = BoundStmt::prepare(tx, "INSERT INTO unresolved_texts (text) VALUES (?1)")?;
+    for slot in fresh {
+        stmt.bind_text(1, slot_text[*slot as usize].as_ref())?;
+        stmt.step_done()?;
+        slot_ids[*slot as usize] = stmt.last_insert_rowid();
+    }
+    Ok(())
+}
+
+#[cfg(feature = "parse")]
+fn write_unresolved_rows(
+    tx: &rusqlite::Transaction<'_>,
+    ledger_matched: &[bool],
+    source_ids: &[u32],
+    reason_ids: &[i64],
+    class_ids: &[i64],
+    resolution: &devmap_resolve::model::ResolutionResult,
+    gen_id: u32,
+) -> Result<()> {
+    let stmt = BoundStmt::prepare(tx, UNRESOLVED_INSERT_SQL)?;
+    let valid_from = i64::from(gen_id);
+    for (index, still_valid) in ledger_matched.iter().enumerate() {
+        if *still_valid {
+            continue;
+        }
+        let tuple = unresolved_tuple_at(index, source_ids, reason_ids, class_ids, resolution);
+        stmt.bind_i64(1, i64::from(tuple.source_file_id))?;
+        stmt.bind_text(2, tuple.source_symbol.as_ref())?;
+        stmt.bind_text(3, tuple.callee_name.as_ref())?;
+        stmt.bind_i64(4, tuple.reason_id)?;
+        stmt.bind_i64(5, tuple.classification_id)?;
+        match tuple.receiver.as_deref() {
+            Some(receiver) => stmt.bind_text(6, receiver)?,
+            None => stmt.bind_null(6)?,
+        }
+        stmt.bind_i64(7, valid_from)?;
+        stmt.step_done()?;
+    }
+    Ok(())
 }
