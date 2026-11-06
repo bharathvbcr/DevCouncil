@@ -3,11 +3,14 @@ package flags
 import (
 	"fmt"
 	"os"
+	"runtime"
 )
 
 // NonRegularConfigError is a config path that is not a regular file.
 // Open is not called for the path that was lstat'd, so a FIFO cannot block
-// the load. Kind is a word a caller can match: symlink, named pipe,
+// the load. A Windows named-pipe path is refused before lstat: both lstat
+// and Open reach CreateFile, which waits while a PIPE_WAIT pipe has no free
+// instance. Kind is a word a caller can match: symlink, named pipe,
 // directory, socket, device, or non-regular file.
 type NonRegularConfigError struct {
 	Path string
@@ -41,6 +44,26 @@ var (
 	openFollowPath = openFollow
 )
 
+// classifyBeforeOpen is unset on unix. A FIFO is a filesystem node, and
+// lstat names it without opening. A non-unix init points it at
+// windowsNonRegularKind, because that name is not a file lstat can classify.
+var classifyBeforeOpen = func(string) (string, bool) { return "", false }
+
+// openSymlinkTarget is false on the non-unix build. Following a symlink
+// there can open a named-pipe target and block. Unix follows only a symlink
+// that stat said was dangling, and that open is O_NONBLOCK.
+var openSymlinkTarget = true
+
+func init() {
+	// Referenced from this file so a unix build still compiles the classifier.
+	// Only a windows process installs it here. open_regular_other.go installs
+	// it for every non-unix build, including windows.
+	if runtime.GOOS == "windows" {
+		classifyBeforeOpen = windowsNonRegularKind
+		openSymlinkTarget = false
+	}
+}
+
 // OpenRegular opens path only when it is a regular file.
 //
 // A missing path returns the lstat error, which is os.IsNotExist. A live
@@ -48,14 +71,21 @@ var (
 // is the open's own, wrapped so it does not unwrap to os.ErrNotExist. If that
 // open succeeds, the link was live by the time it was followed: the file is
 // closed and the path is refused as a symlink, so its contents are not
-// parsed. A FIFO, directory, socket, or other non-regular file is refused
-// before Open.
+// parsed. The non-unix build refuses every symlink before that follow, so a
+// link whose target is a pipe is not opened. A FIFO, directory, socket, or
+// other non-regular file is refused before Open.
 func OpenRegular(path string) (*os.File, error) {
+	if kind, refuse := classifyBeforeOpen(path); refuse {
+		return nil, &NonRegularConfigError{Path: path, Kind: kind}
+	}
 	info, err := lstatPath(path)
 	if err != nil {
 		return nil, err
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
+		if !openSymlinkTarget {
+			return nil, &NonRegularConfigError{Path: path, Kind: "symlink"}
+		}
 		if _, statErr := statPath(path); statErr != nil {
 			if os.IsNotExist(statErr) {
 				f, openErr := openFollowPath(path)
