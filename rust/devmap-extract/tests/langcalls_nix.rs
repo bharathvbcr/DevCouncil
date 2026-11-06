@@ -245,19 +245,22 @@ fn no_nix_edge_is_dangling() {
     );
 }
 
-/// HCL is **not** closed, and this records the measurement rather than the
-/// opinion.
+/// HCL records built-in call sites and does not grow a call graph.
 ///
 /// Terraform and OpenTofu have no user-defined function syntax: every
 /// `function_call` node in a `.tf` file names a language built-in (`lower`,
-/// `merge`, `templatefile`, `map`), which is declared nowhere in any corpus, so
-/// **no** call edge could ever resolve. The real dependency graph in HCL is the
-/// reference graph between blocks — `local.name`, `var.env`,
-/// `data.aws_ami.base.id`, `aws_instance.web.private_ip` — which is a reference
-/// edge, not a call, and already reaches the graph as `Name` references.
+/// `merge`, `templatefile`, `file`), which is declared nowhere in any corpus,
+/// so a Calls edge could never resolve. The sites are still recorded, because
+/// an unresolved ledger that omitted them would report the file as calling
+/// nothing. The capability bit stays clear so consumers do not score the
+/// language as measured. The real dependency graph in HCL is the reference
+/// graph between blocks — `local.name`, `var.env` — which is a reference
+/// edge, not a call.
 ///
-/// This test fails if someone gives HCL call extraction, which is the point:
-/// the decision should be re-argued, not drifted into.
+/// `locals` has no labels, so `hcl_block_address` declines it and `lower`
+/// stays attributed to the file. `merge` sits in a labelled resource.
+/// Re-argue this pin when that spelling changes. Do not clear the calls, and
+/// do not set [`Capability::Calls`].
 #[test]
 fn hcl_is_deliberately_left_without_a_call_graph() {
     let source = r#"variable "env" { type = string }
@@ -274,7 +277,15 @@ resource "aws_instance" "web" {
         "HCL has no user-defined function syntax; every callee would be a \
          built-in that resolves to nothing"
     );
-    assert!(extraction.calls.is_empty(), "{:?}", targets(&extraction));
+    assert_eq!(
+        edges(&extraction),
+        vec![
+            "main.tf -> lower".to_string(),
+            "main.tf::resource.aws_instance.web -> merge".to_string(),
+        ],
+        "the recorded sites are the two built-ins, attributed to the file and \
+         the resource; a third call or a cleared list is a different decision"
+    );
     // The blocks are still symbols and the cross-block dependencies are still
     // references, so nothing is lost by declining the call graph.
     assert!(
@@ -341,6 +352,22 @@ fn the_coverage_list_and_the_dispatcher_agree_for_nix_hcl_and_cfml() {
     ] {
         let listed = capabilities_for_language(language).contains(Capability::Calls);
         let extracted = !extract_file(path, source).calls.is_empty();
+        // HCL is the deliberate under-claim: the dispatcher records `lower`
+        // and the registry leaves Calls clear. Nix and CFML must still agree
+        // in both directions. Do not blanket-exempt a language to silence a
+        // drift.
+        if language == "hcl" {
+            assert!(
+                !listed,
+                "HCL stays call-blind in the registry; setting the bit would \
+                 score built-ins as measured calls"
+            );
+            assert!(
+                extracted,
+                "HCL still records lower() so the unresolved ledger can name it"
+            );
+            continue;
+        }
         assert_eq!(
             listed, extracted,
             "{language}: coverage list says {listed}, extraction says {extracted}"

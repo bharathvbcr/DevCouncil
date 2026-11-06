@@ -137,15 +137,25 @@ fn declared_by_grammar() -> BTreeMap<String, Capabilities> {
 /// blind and is more conservative, where a bit claimed but not delivered is the
 /// exact failure W0.1 exists to prevent — but safe is not the same as
 /// unexamined.
-const UNDER_CLAIMED: &[(&str, Capability, &str)] = &[(
-    "liquid",
-    Capability::Heritage,
-    "the vendored tree-sitter-liquid grammar fragments the template run for many \
-     real script bodies (see `liquid_script_scanner_limits.rs`), so heritage is \
-     recoverable from some `.liquid` files and not from others. Declaring the bit \
-     would claim a coverage the grammar does not reliably deliver; leaving it \
-     clear costs only conservatism.",
-)];
+const UNDER_CLAIMED: &[(&str, Capability, &str)] = &[
+    (
+        "liquid",
+        Capability::Heritage,
+        "the vendored tree-sitter-liquid grammar fragments the template run for many \
+         real script bodies (see `liquid_script_scanner_limits.rs`), so heritage is \
+         recoverable from some `.liquid` files and not from others. Declaring the bit \
+         would claim a coverage the grammar does not reliably deliver; leaving it \
+         clear costs only conservatism.",
+    ),
+    (
+        "hcl",
+        Capability::Calls,
+        "Terraform records function_call sites (lower, merge, file) so the unresolved \
+         ledger can name them, and the Calls bit stays clear: HCL has no user-defined \
+         function syntax, so every callee is a built-in that resolves to nothing. \
+         Declaring the bit would score the language as measured.",
+    ),
+];
 
 fn is_under_claimed(grammar: &str, capability: Capability) -> bool {
     UNDER_CLAIMED
@@ -333,11 +343,12 @@ fn capabilities_agree_within_a_grammar() {
 
 /// The two languages W0.2 exists for.
 ///
-/// CFML and HCL parse `Clean`, emit a file symbol, and extract no calls — so
-/// nothing in the coverage machinery charged them and every top-level symbol in
-/// such a file was reported at the `extracted` tier. Pinned by name because the
-/// bug is specifically that these two look identical to a language that was
-/// examined and genuinely had no callers.
+/// CFML and HCL parse `Clean` and leave the Calls bit clear, so nothing in the
+/// coverage machinery charged them and every top-level symbol in such a file
+/// was reported at the `extracted` tier. HCL does record built-in call sites;
+/// the bit stays clear on purpose (see [`UNDER_CLAIMED`]). Pinned by name
+/// because the bug is specifically that these two look identical to a language
+/// that was examined and genuinely had no callers.
 #[test]
 fn the_call_blind_clean_parsing_languages_are_named() {
     let call_blind: Vec<&str> = LANGUAGE_SPECS

@@ -2377,6 +2377,17 @@ impl Extraction {
         let mut durable = self.clone();
         durable.source_code = None;
         durable.diagnostics.clear();
+        // A pattern-recovered file records a call-shaped site as a Call
+        // reference and leaves `calls` empty, so the fabrication rule holds.
+        // That reference is the only copy. Dropping it here would make a
+        // cached re-resolve forget the ledger row. A language that does
+        // extract calls, and a parsed call-blind file whose sites already
+        // live in `calls`, still drop the duplicate.
+        let call_site_is_the_reference = self.calls.is_empty()
+            && matches!(self.engine, ExtractionEngine::RegexFallback { .. })
+            && !self
+                .capabilities()
+                .contains(crate::languages::Capability::Calls);
         durable.references.retain(|reference| {
             // A call-kind reference duplicates an entry in `calls` and carries
             // no extra information — *unless* it records a receiver binding.
@@ -2389,6 +2400,7 @@ impl Extraction {
             // `Calls` edges than a cold build of the same tree and never
             // converged (SC16).
             reference.assigned_to.is_some()
+                || (call_site_is_the_reference && reference.kind == ReferenceKind::Call)
                 || !matches!(
                     reference.kind,
                     ReferenceKind::Call | ReferenceKind::Constructor | ReferenceKind::JsxTag

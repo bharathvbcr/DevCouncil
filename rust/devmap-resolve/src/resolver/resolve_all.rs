@@ -2087,6 +2087,38 @@ impl Resolver {
                         reference.kind,
                         ReferenceKind::Call | ReferenceKind::Constructor | ReferenceKind::JsxTag
                     ) {
+                        // These kinds duplicate `calls` wherever a grammar
+                        // extracted one, and the ladder already recorded that
+                        // edge. A pattern-recovered file has no such edge: the
+                        // markup reader left the site on this reference so a
+                        // Fallback file can name it without publishing a call
+                        // edge. The row is the same one a parsed call-blind
+                        // file gets from `calls`, and the walk stops.
+                        if !extracts_calls
+                            && ext.calls.is_empty()
+                            && matches!(
+                                ext.engine,
+                                devmap_extract::ExtractionEngine::RegexFallback { .. }
+                            )
+                            && reference.kind == ReferenceKind::Call
+                            && !reference.name.is_empty()
+                        {
+                            unresolved.push(UnresolvedReference {
+                                source_file: ext.file_path.clone(),
+                                source_symbol: reference
+                                    .enclosing_symbol
+                                    .clone()
+                                    .unwrap_or_else(|| ext.file_path.clone()),
+                                callee_name: reference.name.clone(),
+                                kind: UnresolvedKind::Call,
+                                resolution: Resolution::Unresolved {
+                                    reason: format!("`{}` extracts no calls", ext.language),
+                                },
+                                class: UnresolvedClass::Unresolved,
+                                receiver: reference.receiver_expr.clone(),
+                                site: Some(SiteBytes::of(&reference.span)),
+                            });
+                        }
                         continue;
                     }
                     // A Python base no name denotes is a fact about the MRO,

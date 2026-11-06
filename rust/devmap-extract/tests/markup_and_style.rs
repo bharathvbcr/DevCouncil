@@ -428,3 +428,101 @@ fn a_standalone_stylesheet_declares_its_rules() {
         );
     }
 }
+
+fn call_sites(extraction: &Extraction) -> Vec<&str> {
+    let mut names: Vec<&str> = extraction
+        .references
+        .iter()
+        .filter(|reference| reference.kind == ReferenceKind::Call)
+        .map(|reference| reference.name.as_str())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A Fallback page names `onclick` and `url()` without publishing a call edge.
+///
+/// The fabrication rule (`mutation_fuzz`) requires `calls` to be empty on
+/// Fallback, Failed, and Skipped. The ledger still needs the site, so it
+/// rides on a Call reference, including through `for_durable_store`.
+#[test]
+fn a_pattern_recovered_page_names_call_sites_without_call_edges() {
+    let html = extract_file(
+        "page.html",
+        "<!DOCTYPE html><html><body><button onclick=\"kept()\">go</button></body></html>\n",
+    );
+    assert!(
+        matches!(html.parse_outcome, ParseOutcome::Fallback { .. }),
+        "a page with no grammar is a pattern recovery, not a parse failure: {:?}",
+        html.parse_outcome
+    );
+    assert!(
+        html.calls.is_empty(),
+        "a fallback file publishes no call edge: {:?}",
+        html.calls
+            .iter()
+            .map(|call| call.callee_name.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(call_sites(&html), ["kept"]);
+    let durable = html.for_durable_store();
+    assert_eq!(
+        call_sites(&durable),
+        ["kept"],
+        "the Call reference is the only copy of the site, so the durable \
+         payload has to keep it"
+    );
+
+    let css = extract_file("site.css", ".a { background: url(\"x.png\"); }\n");
+    assert!(css.calls.is_empty(), "{:?}", css.calls);
+    assert!(
+        call_sites(&css).contains(&"url"),
+        "url() is a call-shaped site: {:?}",
+        call_sites(&css)
+    );
+
+    let quiet = extract_file(
+        "quiet.html",
+        "<!DOCTYPE html><html><body><p class=\"probe\">hello</p></body></html>\n",
+    );
+    assert!(
+        call_sites(&quiet).is_empty(),
+        "a page with no call syntax must not gain one: {:?}",
+        call_sites(&quiet)
+    );
+}
+
+/// A NUL byte does not become a call edge.
+///
+/// A grammar refuses the file, because some scanners do not terminate on it.
+/// A markup file has no such grammar. The byte must not drop a real `url()`
+/// or `onclick` that sits beside it, and it must not publish that site as a
+/// call edge either: the outcome is still Fallback.
+#[test]
+fn a_nul_byte_publishes_no_call_edge() {
+    let rust = extract_file("main.rs", "fn kept() {}\0\n");
+    assert!(
+        matches!(rust.parse_outcome, ParseOutcome::Failed { .. }),
+        "a grammar refuses a NUL byte: {:?}",
+        rust.parse_outcome
+    );
+    assert!(rust.calls.is_empty());
+    assert!(call_sites(&rust).is_empty());
+
+    let html = extract_file("page.html", "<button onclick=\"kept()\">\0</button>\n");
+    assert!(
+        matches!(html.parse_outcome, ParseOutcome::Fallback { .. }),
+        "html has no grammar to refuse, so the page stays a pattern recovery: {:?}",
+        html.parse_outcome
+    );
+    assert!(html.calls.is_empty(), "{:?}", html.calls);
+    assert_eq!(call_sites(&html), ["kept"]);
+
+    let css = extract_file("site.css", ".a { background: url(\"x.png\"); }\n\0");
+    assert!(css.calls.is_empty(), "{:?}", css.calls);
+    assert!(
+        call_sites(&css).contains(&"url"),
+        "a NUL later in the file must not drop url(): {:?}",
+        call_sites(&css)
+    );
+}
