@@ -107,17 +107,25 @@ fn a_store_that_fails_to_open_corrupt_is_refused_for_another_worktree_by_a_relat
             .join("devmap.sqlite");
         // B's cwd is a sibling directory of A, so `../<a>/devmap.sqlite` is A's.
         let built = devmap_at(&b, &relative, &["build", "."]);
+        let relative_damage = format!("the devmap store {} is damaged", relative.display());
+        let damage_names_the_anchored_store = built.stderr.contains(" is damaged")
+            && built
+                .stderr
+                .contains(a.file_name().unwrap().to_str().unwrap())
+            && !built.stderr.contains(&relative_damage);
         assert!(
             !built.ok
                 && (built
                     .stderr
                     .contains("one store cannot serve two live worktrees")
-                    || built.stderr.contains(&format!(
-                        "the devmap store {} is damaged",
-                        relative.display()
-                    ))),
-            "{table}: B must be refused, ok={} {}",
+                    || damage_names_the_anchored_store),
+            "{table}: B must be refused by the anchored store path, ok={} {}",
             built.ok,
+            built.stderr
+        );
+        assert!(
+            !built.stderr.contains(&relative_damage),
+            "{table}: the refusal kept the relative --db spelling: {}",
             built.stderr
         );
         assert_untouched(table, &db, &before);
