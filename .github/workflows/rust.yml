@@ -12,6 +12,9 @@ on:
   push:
     paths:
       - "rust/devmap-*/**"
+      # include!'d by devmap-cli tests. Not a workspace member, so the member
+      # check never asks for it, and a change here would not start this job.
+      - "rust/testsupport/**"
       # Every devmap crate depends on these three.
       - "rust/dc-proc/**"
       - "rust/dc-regress/**"
@@ -35,6 +38,9 @@ on:
   pull_request:
     paths:
       - "rust/devmap-*/**"
+      # include!'d by devmap-cli tests. Not a workspace member, so the member
+      # check never asks for it, and a change here would not start this job.
+      - "rust/testsupport/**"
       # Every devmap crate depends on these three.
       - "rust/dc-proc/**"
       - "rust/dc-regress/**"

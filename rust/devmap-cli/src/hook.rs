@@ -5262,11 +5262,29 @@ mod lock_tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    /// False is not a skip that passes. The acquire result is ignored unless the
+    /// restriction held, so a helper that always returns false cannot turn a
+    /// successful claim into a pass.
+    fn unremovable_lock_verdict(
+        holds: bool,
+        outcome: anyhow::Result<bool>,
+    ) -> Result<(), &'static str> {
+        if !holds {
+            return Err("restriction did not hold");
+        }
+        match outcome {
+            Err(_) | Ok(false) => Ok(()),
+            Ok(true) => Err("claimed a lock it could not create"),
+        }
+    }
+
     /// A stale lock that cannot be removed must fail, not recurse forever.
     ///
     /// `rmdir` needs write permission on the PARENT, so a read-only parent
     /// makes removal fail while `mkdir` still reports EEXIST. The retry then
-    /// re-enters on identical state with no depth bound.
+    /// re-enters on identical state with no depth bound. A restriction that
+    /// does not hold is a failure of this test, not a pass: the condition it
+    /// exists to assert cannot be skipped.
     #[test]
     fn an_unremovable_stale_lock_terminates() {
         let base = scratch("unremovable");
@@ -5275,21 +5293,30 @@ mod lock_tests {
         fs::create_dir_all(&lock).unwrap();
         fs::write(lock.join("pid"), reaped_pid().to_string()).unwrap();
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).unwrap();
-        if !restriction_holds(&parent) {
-            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
-            let _ = fs::remove_dir_all(&base);
-            return;
-        }
-
-        let outcome = try_acquire_lock_dir(&lock);
+        let holds = restriction_holds(&parent);
+        let outcome = if holds {
+            Some(try_acquire_lock_dir(&lock))
+        } else {
+            None
+        };
 
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
         let _ = fs::remove_dir_all(&base);
 
-        match outcome {
-            Err(_) => {}
-            Ok(false) => {}
-            Ok(true) => panic!("claimed a lock it could not create"),
-        }
+        let verdict = match outcome {
+            Some(outcome) => unremovable_lock_verdict(true, outcome),
+            None => unremovable_lock_verdict(false, Ok(true)),
+        };
+        verdict.unwrap_or_else(|reason| panic!("{reason}"));
+    }
+
+    #[test]
+    fn a_false_restriction_does_not_pass_the_unremovable_lock_test() {
+        let err = unremovable_lock_verdict(false, Ok(true)).expect_err("false must not pass");
+        assert!(err.contains("restriction did not hold"), "{err}");
+        assert!(unremovable_lock_verdict(true, Ok(false)).is_ok());
+        assert!(unremovable_lock_verdict(true, Err(anyhow::anyhow!("denied"))).is_ok());
+        let claimed = unremovable_lock_verdict(true, Ok(true)).expect_err("a claim is not success");
+        assert!(claimed.contains("claimed a lock"), "{claimed}");
     }
 }

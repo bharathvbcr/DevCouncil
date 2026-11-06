@@ -11,6 +11,7 @@ import {
   readWorkflows,
   cargoStepsMissingLocked,
   structuralFailures,
+  testsupportPathsMissing,
   testedPackages,
   triggerPaths,
   workflowsMissingConcurrency,
@@ -226,6 +227,69 @@ jobs:
     const real = readWorkflows(fileURLToPath(new URL("../.github/workflows", import.meta.url)));
     assert.deepEqual(workflowsNamingAChannel(real), []);
     assert.deepEqual(workflowsMissingConcurrency(real), []);
+  });
+
+  describe("testsupport path filter", () => {
+    const covered = [
+      "on:",
+      "  push:",
+      "    paths:",
+      '      - "rust/devmap-*/**"',
+      '      - "rust/testsupport/**"',
+      "  pull_request:",
+      "    paths:",
+      '      - "rust/testsupport/**"',
+      "jobs:",
+      "  test: {}",
+      "",
+    ].join("\n");
+
+    it("accepts a push and a pull_request filter that each match a nested testsupport path", () => {
+      assert.deepEqual(testsupportPathsMissing(covered, "rust.yml"), []);
+      const unfiltered = "on:\n  push:\n  pull_request:\njobs:\n  test: {}\n";
+      assert.deepEqual(testsupportPathsMissing(unfiltered, "rust.yml"), []);
+    });
+
+    it("rejects a filter that names the file only in a comment, only on one event, or only after jobs", () => {
+      const comment = covered.replace('      - "rust/testsupport/**"\n', '      # - "rust/testsupport/**"\n');
+      assert.deepEqual(testsupportPathsMissing(comment, "rust.yml"), [
+        "rust.yml: push paths do not match rust/testsupport/**",
+      ]);
+      const pushOnly = covered.replace(
+        '      - "rust/testsupport/**"\njobs:',
+        "jobs:",
+      );
+      assert.ok(
+        testsupportPathsMissing(pushOnly, "rust.yml").some((line) => line.includes("pull_request")),
+      );
+      const afterJobs = [
+        "on:",
+        "  push:",
+        "    paths:",
+        '      - "rust/devmap-*/**"',
+        "  pull_request:",
+        "    paths:",
+        '      - "rust/devmap-*/**"',
+        "jobs:",
+        '  test:\n    # - "rust/testsupport/**"',
+        "",
+      ].join("\n");
+      const missed = testsupportPathsMissing(afterJobs, "rust.yml");
+      assert.equal(missed.length, 2);
+      assert.deepEqual(testsupportPathsMissing(covered.replace(/\n/g, "\r\n"), "rust.yml"), []);
+      assert.deepEqual(
+        testsupportPathsMissing(covered.replaceAll("rust/testsupport/**", "rust/testsupport/*"), "rust.yml"),
+        [
+          "rust.yml: push paths do not match rust/testsupport/**",
+          "rust.yml: pull_request paths do not match rust/testsupport/**",
+        ],
+      );
+    });
+
+    it("rejects a missing label and an oversized workflow", () => {
+      assert.throws(() => testsupportPathsMissing(covered, ""), TypeError);
+      assert.throws(() => testsupportPathsMissing("x".repeat(2_000_001), "rust.yml"), RangeError);
+    });
   });
 
   describe("cargo --locked", () => {

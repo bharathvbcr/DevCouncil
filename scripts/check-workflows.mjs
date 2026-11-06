@@ -457,6 +457,78 @@ function unescapeWord(word) {
 }
 
 /**
+ * `rust.yml` compiles `restriction.rs` only as `cfg(test)` inside devmap-cli.
+ * A push or pull request that changes only that file must still start the
+ * test job. An explicit `paths:` list that misses it does not. No `paths:`
+ * key means the event runs for every file, which does cover it. A comment
+ * that mentions the glob does not.
+ *
+ * @param {string} yaml
+ * @param {string} label
+ * @returns {string[]}
+ */
+export function testsupportPathsMissing(yaml, label) {
+  if (typeof yaml !== "string" || typeof label !== "string" || label.length === 0) {
+    throw new TypeError("testsupportPathsMissing expects a string and a non-empty label");
+  }
+  if (yaml.length > 2_000_000) {
+    throw new RangeError("workflow is too large to scan");
+  }
+  const headEnd = yaml.search(/^jobs\s*:/m);
+  const head = headEnd === -1 ? yaml : yaml.slice(0, headEnd);
+  const probes = [
+    "rust/testsupport/restriction.rs",
+    "rust/testsupport/nested/odd 'quote' 名前.rs",
+  ];
+  // null: that event is not in the workflow. "all": the event has no paths
+  // key, so it runs for every file. An array is an explicit paths list, and an
+  // empty one matches nothing.
+  /** @type {Record<string, string[] | "all" | null>} */
+  const events = { push: null, pull_request: null };
+  let event = "";
+  let inPaths = false;
+  for (const line of head.split(/\r?\n/)) {
+    const ev = /^  ([A-Za-z0-9_-]+)\s*:/.exec(line);
+    if (ev) {
+      event = ev[1];
+      inPaths = false;
+      if (Object.prototype.hasOwnProperty.call(events, event) && events[event] === null) {
+        events[event] = "all";
+      }
+      continue;
+    }
+    if (!Object.prototype.hasOwnProperty.call(events, event)) continue;
+    if (/^    paths\s*:/.test(line)) {
+      inPaths = true;
+      events[event] = [];
+      continue;
+    }
+    if (!inPaths || !Array.isArray(events[event])) continue;
+    const item = /^      -\s*["']?([^"'#\s]+)["']?\s*(#.*)?$/.exec(line);
+    if (item) {
+      events[event].push(item[1]);
+      continue;
+    }
+    if (/^\s*(#.*)?$/.test(line)) continue;
+    inPaths = false;
+  }
+  const failures = [];
+  for (const name of ["push", "pull_request"]) {
+    const globs = events[name];
+    if (globs === null) {
+      failures.push(`${label}: ${name} is absent, so a testsupport-only ${name} does not run`);
+      continue;
+    }
+    if (globs === "all") continue;
+    const covers = probes.every((probe) => globs.some((glob) => pathGlob(glob).test(probe)));
+    if (!covers) {
+      failures.push(`${label}: ${name} paths do not match rust/testsupport/**`);
+    }
+  }
+  return failures;
+}
+
+/**
  * Structural checks that need no actionlint. Returns the failures.
  * @param {string} repoRoot
  * @returns {string[]}
@@ -491,6 +563,7 @@ export function structuralFailures(repoRoot) {
       continue;
     }
     failures.push(...cargoStepsMissingLocked(yaml, name));
+    if (name === "rust.yml") failures.push(...testsupportPathsMissing(yaml, name));
   }
   const verifyPath = path.join(repoRoot, "rust", "verify.sh");
   if (!existsSync(verifyPath)) {
