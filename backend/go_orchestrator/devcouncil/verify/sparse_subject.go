@@ -216,6 +216,9 @@ func runGitStdinEnv(
 	return nil
 }
 
+// blobKey names what a streamed blob is digested as: object id and entry mode.
+func blobKey(e indexEntry) string { return e.oid + "\x00" + e.mode }
+
 func streamCatFileBlobs(
 	ctx context.Context,
 	git *proc.GitSession,
@@ -228,15 +231,17 @@ func streamCatFileBlobs(
 	ctx, cancel := context.WithTimeout(ctx, subjectBound)
 	defer cancel()
 
-	// Deduplicate OIDs so identical blobs across paths are streamed once.
+	// Deduplicate so identical blobs across paths are streamed once. The key
+	// includes the mode: a file and a symlink can share one blob, and the two
+	// are digested differently (content hash versus link text).
 	seen := make(map[string]bool, len(entries))
 	var unique []indexEntry
 	var reqBuf bytes.Buffer
 	for _, e := range entries {
-		if seen[e.oid] {
+		if seen[blobKey(e)] {
 			continue
 		}
-		seen[e.oid] = true
+		seen[blobKey(e)] = true
 		unique = append(unique, e)
 		reqBuf.WriteString(e.oid)
 		reqBuf.WriteByte('\n')

@@ -208,3 +208,37 @@ func TestDanglingSymlinkEscapesAndPreExistingIgnoredPathsAreRefused(t *testing.T
 		})
 	}
 }
+
+// A file and a symlink that name the same blob (a symlink to "a.txt" holds the
+// bytes "a.txt", exactly like a file containing "a.txt") are digested
+// differently: content hash versus link text. Deduplicating the streamed blobs
+// by object id alone left the second kind with an empty digest.
+func TestSparseSubjectKeepsFileAndSymlinkSharingOneBlobApart(t *testing.T) {
+	r := newSubjectRepo(t)
+	r.write("services/auth/login.go", "package auth\nfunc Login() {}\n")
+	r.write("services/billing/dir/a.txt", "a.txt")
+	if err := os.Symlink("a.txt", filepath.Join(r.root, "services/billing/dir/l")); err != nil {
+		t.Fatal(err)
+	}
+	r.run("add", ".")
+	r.run("commit", "-qm", "file and symlink share a blob")
+
+	fullSubject := r.subject()
+
+	wt := filepath.Join(t.TempDir(), "sparse-wt")
+	r.run("worktree", "add", "--no-checkout", wt, "HEAD")
+	runGitAt(t, r.git, wt, "sparse-checkout", "init", "--cone")
+	runGitAt(t, r.git, wt, "sparse-checkout", "set", "services/auth")
+	runGitAt(t, r.git, wt, "checkout", "HEAD")
+	if _, err := os.Lstat(filepath.Join(wt, "services/billing/dir/a.txt")); !os.IsNotExist(err) {
+		t.Fatalf("expected out-of-cone file to remain unmaterialized, got err=%v", err)
+	}
+
+	sparseSubject, err := verify.WorkingTreeSubject(context.Background(), wt)
+	if err != nil {
+		t.Fatalf("sparse WorkingTreeSubject: %v", err)
+	}
+	if sparseSubject != fullSubject {
+		t.Fatalf("sparse subject %q != full checkout subject %q", sparseSubject, fullSubject)
+	}
+}

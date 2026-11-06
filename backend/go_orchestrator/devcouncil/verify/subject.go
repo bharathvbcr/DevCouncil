@@ -210,14 +210,14 @@ func contentDigest(ctx context.Context, git *proc.GitSession, env []string, root
 				if _, err := io.ReadFull(r, buf); err != nil {
 					return err
 				}
-				blobDigestByOID[e.oid] = unmaterializedBlob{symlink: string(buf)}
+				blobDigestByOID[blobKey(e)] = unmaterializedBlob{symlink: string(buf)}
 				return nil
 			}
 			bh := sha256.New()
 			if _, err := io.CopyN(bh, r, size); err != nil {
 				return err
 			}
-			blobDigestByOID[e.oid] = unmaterializedBlob{sha256Hex: hex.EncodeToString(bh.Sum(nil))}
+			blobDigestByOID[blobKey(e)] = unmaterializedBlob{sha256Hex: hex.EncodeToString(bh.Sum(nil))}
 			return nil
 		}); err != nil {
 			return "", err
@@ -243,7 +243,7 @@ func contentDigest(ctx context.Context, git *proc.GitSession, env []string, root
 			info, err := os.Lstat(full)
 			if err != nil {
 				if errors.Is(err, os.ErrNotExist) && cone != nil && !cone.contains(e.path) {
-					cached, ok := blobDigestByOID[e.oid]
+					cached, ok := blobDigestByOID[blobKey(e)]
 					if !ok {
 						return "", fmt.Errorf("missing unmaterialized blob digest for %s (%s)", e.path, e.oid)
 					}
