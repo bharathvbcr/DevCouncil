@@ -416,21 +416,28 @@ fn devmap_seed_supports_sibling_checkouts_clones_reuse_cache_and_refuses_forgery
     let evil = evil.canonicalize().unwrap();
 
     // Unrelated repo and forged gitlink must fail closed.
-    assert!(
-        !fx.devmap(&lane, &["--json", "seed", "--from", other.to_str().unwrap()])
-            .status
-            .success()
-    );
-    assert!(
-        !fx.devmap(&evil, &["--json", "seed", "--from", fx.main().to_str().unwrap()])
-            .status
-            .success()
-    );
+    assert!(!fx
+        .devmap(
+            &lane,
+            &["--json", "seed", "--from", other.to_str().unwrap()]
+        )
+        .status
+        .success());
+    assert!(!fx
+        .devmap(
+            &evil,
+            &["--json", "seed", "--from", fx.main().to_str().unwrap()]
+        )
+        .status
+        .success());
 
     // Seed `sibling` from `main` (default), then seed `lane` from `sibling`!
     let sib_seed = fx.devmap(&sibling, &["--json", "seed"]);
     assert!(sib_seed.status.success(), "{}", stderr(&sib_seed));
-    let lane_seed = fx.devmap(&lane, &["--json", "seed", "--from", sibling.to_str().unwrap()]);
+    let lane_seed = fx.devmap(
+        &lane,
+        &["--json", "seed", "--from", sibling.to_str().unwrap()],
+    );
     assert!(lane_seed.status.success(), "{}", stderr(&lane_seed));
 
     let status_out = fx.devmap(&lane, &["--json", "status"]);
@@ -442,13 +449,21 @@ fn devmap_seed_supports_sibling_checkouts_clones_reuse_cache_and_refuses_forgery
     let main_reuse: Vec<_> = fs::read_dir(fx.main().join(".devmap"))
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with("resolution-reuse-"))
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("resolution-reuse-")
+        })
         .collect();
     if !main_reuse.is_empty() {
         let lane_reuse: Vec<_> = fs::read_dir(lane.join(".devmap"))
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with("resolution-reuse-"))
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("resolution-reuse-")
+            })
             .collect();
         assert_eq!(lane_reuse.len(), main_reuse.len());
     }
@@ -477,7 +492,13 @@ fn devmap_seed_stacked_eliminates_split_brain_in_paths_and_status_and_fails_clos
     let status_out = fx.devmap(&lane, &["--json", "status"]);
     assert!(status_out.status.success(), "{}", stderr(&status_out));
     let status_json: Value = serde_json::from_slice(&status_out.stdout).unwrap();
+    // `query_ready` is derived from the schema relation, the generation and the
+    // search index (`host_contract_fields`), never from `is_fresh`, so the base
+    // stays queryable. `is_fresh` is the base's own verdict against the lane's
+    // tree: the lane has an edit the base does not hold, so it is NOT fresh, and
+    // `stacked.dirty_files` is what tells the reader a delta covers it.
     assert_eq!(status_json["query_ready"], true, "{status_json}");
+    assert_eq!(status_json["is_fresh"], false, "{status_json}");
     assert_eq!(status_json["stacked"]["base_generation_id"], 1);
     assert_eq!(status_json["stacked"]["dirty_files"], 1);
 
@@ -494,6 +515,33 @@ fn devmap_seed_stacked_eliminates_split_brain_in_paths_and_status_and_fails_clos
             .unwrap_or_default()
             .contains("stacked worktree store unreadable"),
         "{bad_json}"
+    );
+}
+
+#[test]
+fn stacked_seed_refuses_a_dirty_donor() {
+    let fx = Fixture::new();
+    fx.build_main();
+    // Edit the donor's checkout and do NOT rebuild it: its index no longer
+    // describes HEAD's tree, so a stacked base taken from it would serve the
+    // uncommitted edit as the lane's own.
+    edit(&fx.main());
+    let lane = fx.at("lane");
+
+    let out = fx.devmap(&lane, &["--json", "seed", "--stacked"]);
+    assert!(
+        !out.status.success(),
+        "a stacked seed from a dirty donor must fail; stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("uncommitted") && err.contains(fx.main().to_str().unwrap()),
+        "stderr must name the dirty donor: {err}"
+    );
+    assert!(
+        !lane.join(".devmap/codeintel/stack_lease.json").exists(),
+        "a refused seed must leave no lease behind"
     );
 }
 
@@ -518,4 +566,3 @@ fn seeded_build_writes_manifest_even_when_main_has_no_manifest_artifacts() {
         "seeded worktree lacked code_graph.json when main omitted --manifest"
     );
 }
-

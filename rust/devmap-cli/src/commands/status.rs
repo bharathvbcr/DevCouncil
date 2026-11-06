@@ -36,9 +36,6 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
                     let st = stacked.status()?;
                     let base_path = std::path::PathBuf::from(&st.base_dir).join("base.sqlite");
                     let mut payload = store_status_fields(stacked.base_store(), &base_path)?;
-                    if st.dirty_files > 0 {
-                        payload.insert("is_fresh".into(), serde_json::json!(true));
-                    }
                     payload.insert("stacked".into(), serde_json::to_value(&st)?);
                     payload.insert("schema_outdated".into(), serde_json::json!(false));
                     payload.insert(
