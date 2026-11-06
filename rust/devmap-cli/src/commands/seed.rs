@@ -199,7 +199,16 @@ pub(crate) fn run(cli: &Cli, args: &Args) -> anyhow::Result<()> {
     if src_csr.is_file() {
         let _ = seed::seed_artifact(&src_csr, &csr_path_for_store(&target_db));
     }
-    seed_derived_artifacts_and_reuse_caches(&source, &root)?;
+    // The store is placed: nothing after this point may fail the command. A
+    // missing artifact or reuse cache costs the next manifest a full write,
+    // never correctness, so it is a named note, not an error that would leave a
+    // placed store behind a non-zero exit.
+    if let Err(error) = seed_derived_artifacts_and_reuse_caches(&source, &root) {
+        eprintln!(
+            "devmap seed: store placed at {}, but derived artifacts were not seeded (the next manifest is written in full): {error:#}",
+            target_db.display()
+        );
+    }
 
     let elapsed_ms = started.elapsed().as_millis();
     let payload = serde_json::json!({

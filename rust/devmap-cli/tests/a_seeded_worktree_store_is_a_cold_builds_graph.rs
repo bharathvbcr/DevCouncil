@@ -519,6 +519,67 @@ fn devmap_seed_stacked_eliminates_split_brain_in_paths_and_status_and_fails_clos
 }
 
 #[test]
+fn standalone_seed_places_the_store_last_and_nothing_after_it_can_fail() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let lane = fx.at("lane");
+    // A regular file where the code-graph artifact's directory must go: seeding
+    // `.devmap/graph/code_graph.json` fails, after the store has been placed.
+    let state = lane.join(".devmap");
+    fs::create_dir_all(&state).unwrap();
+    fs::write(state.join("graph"), "not a directory").unwrap();
+
+    let out = fx.devmap(&lane, &["--json", "seed"]);
+    assert!(
+        out.status.success(),
+        "an artifact that cannot be seeded must not fail a command that already placed the store; stderr: {}",
+        stderr(&out)
+    );
+    assert!(
+        stderr(&out).contains("derived artifacts were not seeded"),
+        "the skipped artifacts must be named: {}",
+        stderr(&out)
+    );
+    let payload: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(payload["mode"], "cow");
+    assert!(lane.join(".devmap/codeintel/devmap.sqlite").is_file());
+    let leftovers: Vec<_> = fs::read_dir(lane.join(".devmap/codeintel"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains(".seed-"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "staged files left behind: {leftovers:?}"
+    );
+}
+
+#[test]
+fn standalone_seed_from_an_unreadable_donor_leaves_no_store() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let lane = fx.at("lane");
+    let donor_db = fx.main().join(".devmap/codeintel/devmap.sqlite");
+    fs::write(&donor_db, b"this is not a sqlite database").unwrap();
+
+    let out = fx.devmap(&lane, &["--json", "seed"]);
+    assert!(!out.status.success(), "a corrupt donor must fail the seed");
+    assert!(
+        !lane.join(".devmap/codeintel/devmap.sqlite").exists(),
+        "a failed seed must leave no store in place"
+    );
+    let leftovers: Vec<_> = fs::read_dir(lane.join(".devmap/codeintel"))
+        .map(|d| d.flatten().collect())
+        .unwrap_or_default();
+    assert!(
+        leftovers
+            .iter()
+            .all(|e| !e.file_name().to_string_lossy().contains(".seed-")),
+        "staged files left behind: {leftovers:?}"
+    );
+}
+
+#[test]
 fn stacked_seed_refuses_a_dirty_donor() {
     let fx = Fixture::new();
     fx.build_main();
