@@ -1668,7 +1668,7 @@ fn lines_covering(content: &str, needle: &str) -> Option<(u32, u32)> {
 /// `StackedStore` whose base carries the worktree root override. Opening the
 /// base file directly would answer with the donor's root and no delta.
 enum HookStore {
-    Plain(devmap_store::Store),
+    Plain(Box<devmap_store::Store>),
     Stacked(Box<devmap_query::StackedStore>),
 }
 
@@ -1683,7 +1683,7 @@ impl HookStore {
         if let Some(db) = plain {
             return devmap_store::Store::open_read_only(&db)
                 .ok()
-                .map(Self::Plain);
+                .map(|store| Self::Plain(Box::new(store)));
         }
         let leased = [
             root.join(".devcouncil/codeintel/stack_lease.json"),
@@ -1701,7 +1701,7 @@ impl HookStore {
 
     fn store(&self) -> &devmap_store::Store {
         match self {
-            Self::Plain(store) => store,
+            Self::Plain(store) => store.as_ref(),
             Self::Stacked(stacked) => stacked.base_store(),
         }
     }
