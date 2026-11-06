@@ -1290,13 +1290,19 @@ fn render_skeleton_context(root: &Path, absolute: &Path, budget: Duration) -> Op
     if budget.is_zero() {
         return None;
     }
-    let db = store_db_path(root)?;
-    let store = devmap_store::Store::open_read_only(&db).ok()?;
+    let hook_store = HookStore::open(root)?;
     if started.elapsed() >= budget {
         return None;
     }
     let relative = repo_relative_path(root, absolute)?;
-    let report = devmap_query::StoreQueryEngine::new(&store)
+    if let HookStore::Stacked(stacked) = &hook_store {
+        if stacked_file_has_unindexed_edits(stacked, root, &relative) {
+            return Some(format!(
+                "DevMap skeleton: {relative} has edits not in the stacked base index; run devmap build --manifest for an exact skeleton"
+            ));
+        }
+    }
+    let report = devmap_query::StoreQueryEngine::new(hook_store.store())
         .skeleton(&relative, 4000)
         .ok()?;
     if started.elapsed() >= budget {
@@ -1366,20 +1372,29 @@ fn compose_write_blast(root: &Path, payload: &Value, budget: Duration) -> Option
             "DevMap blast: no edited file/range in the payload, so nothing to walk from.".into(),
         );
     }
-    let db = store_db_path(root)?;
-    let store = match devmap_store::Store::open_read_only(&db) {
-        Ok(store) => store,
-        Err(_) => {
-            return Some(
-                "DevMap blast: the on-disk index could not be opened; list is empty because the store was unavailable."
-                    .into(),
-            );
-        }
+    // No store and no stacked lease: nothing to say, as before.
+    let has_store = [
+        root.join(".devcouncil/codeintel/devmap.sqlite"),
+        root.join(".devmap/codeintel/devmap.sqlite"),
+        root.join(".devcouncil/codeintel/stack_lease.json"),
+        root.join(".devmap/codeintel/stack_lease.json"),
+    ]
+    .iter()
+    .any(|path| path.is_file());
+    if !has_store {
+        return None;
+    }
+    let Some(hook_store) = HookStore::open(root) else {
+        return Some(
+            "DevMap blast: the on-disk index could not be opened; list is empty because the store was unavailable."
+                .into(),
+        );
     };
+    let store = hook_store.store();
     if started.elapsed() >= budget {
         return Some("DevMap blast skipped: opening the store spent the leftover budget.".into());
     }
-    let graph = match dc_regress_store::StoreGraph::new(&store, root) {
+    let graph = match dc_regress_store::StoreGraph::new(store, root) {
         Ok(graph) => graph,
         Err(err) => {
             return Some(format!(
@@ -1416,6 +1431,19 @@ fn compose_write_blast(root: &Path, payload: &Value, budget: Duration) -> Option
     const MAX_LOCATIONS: usize = 4;
     let mut parts: Vec<String> = Vec::new();
     parts.push(format!("DevMap blast from {label}:"));
+    if let HookStore::Stacked(stacked) = &hook_store {
+        let in_delta = stacked
+            .status()
+            .ok()
+            .map(|st| st.dirty_files.saturating_add(st.tombstoned_files));
+        let unsynced = stacked.unsynced_paths().ok().map(|paths| paths.len());
+        parts.push(match (in_delta, unsynced) {
+            (Some(delta), Some(unsynced)) => format!(
+                "stacked lane: {delta} file(s) are dirty or deleted in the delta and {unsynced} more are not synced yet; the walk reads the immutable base, so this list is a lower bound."
+            ),
+            _ => "stacked lane: the dirty and unsynced file counts could not be read; the walk reads the immutable base, so this list is a lower bound.".into(),
+        });
+    }
     for (examined, (path, start, end)) in locations.iter().take(MAX_LOCATIONS).enumerate() {
         if started.elapsed() >= budget {
             parts.push(format!(
@@ -1636,28 +1664,73 @@ fn lines_covering(content: &str, needle: &str) -> Option<(u32, u32)> {
     Some((start, end.max(start)))
 }
 
-fn store_db_path(root: &Path) -> Option<PathBuf> {
-    let candidates = [
-        root.join(".devcouncil/codeintel/devmap.sqlite"),
-        root.join(".devmap/codeintel/devmap.sqlite"),
-    ];
-    if let Some(found) = candidates.into_iter().find(|path| path.is_file()) {
-        return Some(found);
+/// The store a hook answers from: the lane's own, or, for a stacked lane, the
+/// `StackedStore` whose base carries the worktree root override. Opening the
+/// base file directly would answer with the donor's root and no delta.
+enum HookStore {
+    Plain(devmap_store::Store),
+    Stacked(Box<devmap_query::StackedStore>),
+}
+
+impl HookStore {
+    fn open(root: &Path) -> Option<Self> {
+        let plain = [
+            root.join(".devcouncil/codeintel/devmap.sqlite"),
+            root.join(".devmap/codeintel/devmap.sqlite"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file());
+        if let Some(db) = plain {
+            return devmap_store::Store::open_read_only(&db)
+                .ok()
+                .map(Self::Plain);
+        }
+        let leased = [
+            root.join(".devcouncil/codeintel/stack_lease.json"),
+            root.join(".devmap/codeintel/stack_lease.json"),
+        ]
+        .into_iter()
+        .any(|path| path.is_file());
+        if !leased {
+            return None;
+        }
+        devmap_query::StackedStore::open(root)
+            .ok()
+            .map(|stacked| Self::Stacked(Box::new(stacked)))
     }
-    for lease_path in [
-        root.join(".devcouncil/codeintel/stack_lease.json"),
-        root.join(".devmap/codeintel/stack_lease.json"),
-    ] {
-        if lease_path.is_file() {
-            if let Ok(lease) = devmap_query::StackLease::read_from(&lease_path) {
-                let base_sqlite = lease.base_sqlite_path();
-                if base_sqlite.is_file() {
-                    return Some(base_sqlite);
-                }
-            }
+
+    fn store(&self) -> &devmap_store::Store {
+        match self {
+            Self::Plain(store) => store,
+            Self::Stacked(stacked) => stacked.base_store(),
         }
     }
-    None
+}
+
+/// Whether `relative` has edits the stacked base index does not hold: the delta
+/// lists it, the base never indexed it, or the file on disk no longer hashes to
+/// what the base recorded. The PostToolUse sync is detached, so the delta lags.
+fn stacked_file_has_unindexed_edits(
+    stacked: &devmap_query::StackedStore,
+    root: &Path,
+    relative: &str,
+) -> bool {
+    let path = Path::new(relative);
+    let overlay = stacked.overlay();
+    if overlay.modified_files.contains_key(path) || overlay.is_file_tombstoned(path) {
+        return true;
+    }
+    let Ok(Some(base_file)) = stacked.base_store().latest_file(relative) else {
+        return true;
+    };
+    let Ok(bytes) = std::fs::read(root.join(relative)) else {
+        return true;
+    };
+    let Ok(source) = std::str::from_utf8(&bytes) else {
+        return true;
+    };
+    let lang = devmap_extract::languages::detect_language(path);
+    devmap_extract::cache::CacheKey::for_source(lang, source).content_hash != base_file.content_hash
 }
 
 fn repo_relative_path(root: &Path, absolute: &Path) -> Option<String> {
@@ -2040,8 +2113,8 @@ fn unindexed_linked_worktree_for_post_tool(payload: &Value) -> Option<(PathBuf, 
         if is_unsafe_root(&wt) || store_exists(&wt) {
             return None;
         }
-        if let Some(main) = main_checkout_of(&wt)
-            .filter(|main| !is_unsafe_root(main) && store_exists(main))
+        if let Some(main) =
+            main_checkout_of(&wt).filter(|main| !is_unsafe_root(main) && store_exists(main))
         {
             return Some((wt, main));
         }
@@ -4421,6 +4494,86 @@ mod tests {
                 || text.contains("graph holds no"),
             "{text}"
         );
+    }
+
+    /// A stacked lane's hook must not answer from the donor's base as if the
+    /// file just edited were unchanged, nor name the donor's root.
+    #[test]
+    fn stacked_lane_skeleton_names_edits_not_in_the_base_index() {
+        let base = scratch("stacked-skeleton");
+        let run = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=T", "-c", "user.email=t@example.invalid"])
+                .args(["-c", "commit.gpgSign=false", "-c", "core.hooksPath="])
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        let main = base.join("main");
+        let lane = base.join("lane");
+        std::fs::create_dir_all(&main).unwrap();
+        std::fs::write(main.join("lib.rs"), "pub fn base_only() -> i32 { 1 }\n").unwrap();
+        run(&main, &["init", "-q", "-b", "main"]);
+        run(&main, &["add", "."]);
+        run(&main, &["commit", "-qm", "base"]);
+        run(
+            &main,
+            &["worktree", "add", "-q", "--detach", lane.to_str().unwrap()],
+        );
+        let head = run(&main, &["rev-parse", "HEAD"]);
+        {
+            let db = devmap_extract::paths::store_path(&main);
+            std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+            let store = devmap_store::Store::open(&db).unwrap();
+            store.bind_repo_root(&main.canonicalize().unwrap()).unwrap();
+            let exts = vec![devmap_extract::extract_file(
+                "lib.rs",
+                "pub fn base_only() -> i32 { 1 }\n",
+            )];
+            let mut resolver = devmap_resolve::Resolver::new();
+            resolver.index_extractions(&exts);
+            let res = resolver.resolve_all(&exts).unwrap();
+            let analysis = devmap_analyze::analyze(&exts, &res);
+            store
+                .save_generation_with_metadata(
+                    &exts,
+                    &res,
+                    &analysis,
+                    devmap_store::GenerationWriteOpts::default(),
+                    &head,
+                )
+                .unwrap();
+        }
+        devmap_query::provision_stacked_worktree(&main, &lane).unwrap();
+
+        // Untouched: the base answer, naming the lane and never the donor.
+        let clean = render_skeleton_context(&lane, &lane.join("lib.rs"), Duration::from_secs(10))
+            .expect("a clean stacked file answers from the base");
+        assert!(clean.contains("base_only"), "{clean}");
+        assert!(!clean.contains(main.to_str().unwrap()), "{clean}");
+
+        // Edited, not yet synced (the PostToolUse sync is detached): say so.
+        std::fs::write(
+            lane.join("lib.rs"),
+            "pub fn edited_in_lane() -> i32 { 2 }\n",
+        )
+        .unwrap();
+        let dirty = render_skeleton_context(&lane, &lane.join("lib.rs"), Duration::from_secs(10))
+            .expect("an edited stacked file must still speak");
+        assert!(
+            dirty.contains("edits not in the stacked base index"),
+            "{dirty}"
+        );
+        assert!(!dirty.contains("base_only"), "{dirty}");
+        assert!(!dirty.contains(main.to_str().unwrap()), "{dirty}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

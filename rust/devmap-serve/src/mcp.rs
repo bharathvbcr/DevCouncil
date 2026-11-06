@@ -3051,6 +3051,53 @@ being reported because a partial traversal cannot be distinguished from a comple
     }
 }
 
+/// A stacked lane answers from an immutable base plus a delta that a detached
+/// hook syncs, so every answer except `status` (which reports the delta itself)
+/// can be missing the lane's own edits. Say so on the answer, appended to any
+/// reason the producer already gave rather than skipped when one exists.
+fn attach_stacked_incompleteness(
+    value: &mut Value,
+    stacked: &devmap_query::stacked::StackedStore,
+    st: &devmap_query::stacked::StackedStatus,
+) {
+    let mut reasons = Vec::new();
+    if st.dirty_files > 0 || st.tombstoned_files > 0 {
+        reasons.push(format!(
+            "stacked worktree delta has {} dirty and {} deleted file(s) ({} delta edges): this answer comes from the immutable base plus whatever the delta covers; run `devmap build --manifest` for full cross-file resolution",
+            st.dirty_files, st.tombstoned_files, st.delta_edges
+        ));
+    }
+    match stacked.unsynced_paths() {
+        Ok(paths) if !paths.is_empty() => {
+            let shown: Vec<&str> = paths.iter().take(5).map(String::as_str).collect();
+            reasons.push(format!(
+                "{} edited file(s) are not in the stacked delta yet ({}{}); run `devmap seed --sync-delta` or `devmap build --manifest`",
+                paths.len(),
+                shown.join(", "),
+                if paths.len() > shown.len() { ", ..." } else { "" }
+            ));
+        }
+        Ok(_) => {}
+        Err(err) => reasons.push(format!(
+            "cannot tell whether the stacked delta is current ({err}); run `devmap build --manifest`"
+        )),
+    }
+    if reasons.is_empty() {
+        return;
+    }
+    if let Some(obj) = value.as_object_mut() {
+        let existing = obj
+            .get("walk_incomplete")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        if let Some(combined) = devmap_analyze::combine_reasons(existing, Some(reasons.join("; ")))
+        {
+            obj.insert("walk_incomplete".into(), json!(combined));
+        }
+    }
+}
+
 fn dispatch_with_stacked_overlay(
     engine: &Store,
     attr_root: &Path,
@@ -3080,19 +3127,6 @@ fn dispatch_with_stacked_overlay(
         }
         _ => None,
     };
-    let is_edge_query = matches!(
-        request.command,
-        IpcCommand::Deps { .. }
-            | IpcCommand::Impact { .. }
-            | IpcCommand::Trace { .. }
-            | IpcCommand::Neighbors { .. }
-            | IpcCommand::Dead { .. }
-            | IpcCommand::Explore { .. }
-            | IpcCommand::Affected { .. }
-            | IpcCommand::Ask { .. }
-            | IpcCommand::AskEvidence { .. }
-    );
-
     let mut value = dispatch(stacked.base_store(), request, cancel, unapplied)?;
     if is_status {
         if let Some(obj) = value.as_object_mut() {
@@ -3152,32 +3186,25 @@ fn dispatch_with_stacked_overlay(
                 }
                 let shown = merged.len();
                 let hidden = obj.get("hidden").and_then(Value::as_u64).unwrap_or(0) as usize;
-                let total = shown.saturating_add(hidden);
+                // The merge can only add hits: the total never shrinks below the
+                // base's own, and a base truncation stays a truncation.
+                let base_total = obj.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let base_truncated = obj
+                    .get("truncated")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let total = base_total.max(shown.saturating_add(hidden));
                 obj.insert("items".into(), Value::Array(merged));
                 obj.insert("shown".into(), json!(shown));
                 obj.insert("total".into(), json!(total));
-                obj.insert("truncated".into(), json!(hidden > 0));
+                obj.insert("truncated".into(), json!(base_truncated || hidden > 0));
             }
         }
+        attach_stacked_incompleteness(&mut value, &stacked, &st);
         return Ok(value);
     }
 
-    if is_edge_query && (st.dirty_files > 0 || st.tombstoned_files > 0) {
-        if let Some(obj) = value.as_object_mut() {
-            let needs_note = obj
-                .get("walk_incomplete")
-                .map_or(true, |v| v.is_null() || v.as_str() == Some(""));
-            if needs_note {
-                obj.insert(
-                    "walk_incomplete".into(),
-                    json!(format!(
-                        "stacked worktree delta has {} dirty and {} deleted file(s) ({} delta edges); run `devmap build --manifest` for full cross-file resolution",
-                        st.dirty_files, st.tombstoned_files, st.delta_edges
-                    )),
-                );
-            }
-        }
-    }
+    attach_stacked_incompleteness(&mut value, &stacked, &st);
     Ok(value)
 }
 

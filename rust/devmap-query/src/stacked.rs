@@ -1281,6 +1281,24 @@ impl StackedStore {
         })
     }
 
+    /// Indexable paths git says differ from the base that the delta does not
+    /// yet cover. The delta is synced by a detached hook, so it lags by design;
+    /// a reader that answers from the base needs to know by how much. Every git
+    /// failure is an `Err`: "could not ask" is not "nothing is pending".
+    pub fn unsynced_paths(&self) -> Result<BTreeSet<String>> {
+        let changed = git_changed_paths_against_head(&self.worktree_root, &self.base)?;
+        Ok(changed
+            .into_iter()
+            .filter(|p| {
+                !devmap_extract::languages::is_ignored_path(p)
+                    && !is_tool_state_path(p)
+                    && devmap_extract::languages::is_indexable_source(p)
+                    && !self.overlay.modified_files.contains_key(Path::new(p))
+                    && !self.overlay.is_file_tombstoned(Path::new(p))
+            })
+            .collect())
+    }
+
     pub fn needs_rebase(&self) -> Result<bool> {
         let dirty = self.delta.dirty_file_count()?;
         let bytes = self.delta.bytes_on_disk();

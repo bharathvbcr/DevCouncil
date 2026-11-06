@@ -1218,6 +1218,37 @@ async fn stacked_worktree_lease_answers_mcp_with_delta_overlay_and_fails_closed_
         "base_only was removed in delta edit and must be masked: {search_tombstoned}"
     );
 
+    // Every non-status answer on a dirty lane says it is read from the base plus a
+    // delta, on the lane's own repository, not silently as if it were complete.
+    let skeleton = call(
+        &slot,
+        "devmap_skeleton",
+        json!({"repo_path": stacked_wt.display().to_string(), "file": "lib.rs"}),
+    )
+    .await;
+    assert_eq!(skeleton["result"]["isError"], json!(false), "{skeleton}");
+    assert_eq!(
+        Path::new(
+            structured(&skeleton)["repository"]["root"]
+                .as_str()
+                .unwrap_or_default()
+        ),
+        stacked_wt.canonicalize().unwrap().as_path()
+    );
+    let incomplete = structured(&skeleton)["walk_incomplete"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        incomplete.contains("stacked worktree delta"),
+        "a skeleton answered from a stacked base must carry the delta note: {skeleton}"
+    );
+
+    // The merged search keeps the base's own total and carries the note too.
+    assert!(
+        structured(&search_new)["total"].as_u64().unwrap_or(0) >= 1,
+        "{search_new}"
+    );
+
     // Corrupting stack_lease.json must fail closed instead of falling back!
     std::fs::write(
         devmap_extract::paths::stack_lease_path(&stacked_wt),
