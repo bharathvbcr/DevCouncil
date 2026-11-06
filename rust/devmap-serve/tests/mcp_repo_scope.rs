@@ -964,7 +964,11 @@ fn wire_registered_worktree(main: &Path, name: &str, wt: &Path) {
     std::fs::create_dir_all(&wt_gitdir).unwrap();
     std::fs::write(main.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
     std::fs::create_dir_all(wt).unwrap();
-    std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_gitdir.display())).unwrap();
+    std::fs::write(
+        wt.join(".git"),
+        format!("gitdir: {}\n", wt_gitdir.display()),
+    )
+    .unwrap();
     std::fs::write(wt_gitdir.join("commondir"), "../..\n").unwrap();
     std::fs::write(
         wt_gitdir.join("gitdir"),
@@ -987,16 +991,15 @@ async fn explicit_root_pin_accepts_registered_worktrees_and_rejects_gitlink_forg
     std::fs::create_dir_all(&forged).unwrap();
     std::fs::write(
         forged.join(".git"),
-        format!("gitdir: {}\n", main.join(".git/worktrees/wt-lane").display()),
+        format!(
+            "gitdir: {}\n",
+            main.join(".git/worktrees/wt-lane").display()
+        ),
     )
     .unwrap();
     plant_store(&forged);
 
-    let slot = Arc::new(StoreSlot::resolving(
-        None,
-        main.clone(),
-        Some(main.clone()),
-    ));
+    let slot = Arc::new(StoreSlot::resolving(None, main.clone(), Some(main.clone())));
 
     let ok = call(
         &slot,
@@ -1041,13 +1044,20 @@ async fn unindexed_worktree_in_mcp_roots_or_cwd_never_silently_leaks_anchor_stor
     std::fs::create_dir_all(&anchor_subdir).unwrap();
     plant_store(&anchor);
 
-    // 1. F3a: mcp_roots = [anchor, unindexed_wt] must refuse when repo_path is omitted.
+    // 1. mcp_roots = [anchor, unindexed_wt] with the cwd at the anchor: the one
+    //    indexed root is served (an extra root is not an ambiguity), and the
+    //    answer names the anchor.
     let multi_slot = Arc::new(StoreSlot::resolving(None, anchor.clone(), None));
     multi_slot.set_mcp_roots(vec![anchor.clone(), sibling_wt.clone()]);
-    let multi_err = tool_error_text(&call(&multi_slot, "devmap_status", json!({})).await);
-    assert!(
-        names(&multi_err, &anchor) && names(&multi_err, &sibling_wt),
-        "must name both anchor and unindexed worktree: {multi_err}"
+    let multi_ok = call(&multi_slot, "devmap_status", json!({})).await;
+    assert_eq!(multi_ok["result"]["isError"], json!(false), "{multi_ok}");
+    assert_eq!(
+        Path::new(
+            structured(&multi_ok)["repository"]["root"]
+                .as_str()
+                .unwrap()
+        ),
+        anchor.canonicalize().unwrap().as_path()
     );
 
     // 2. Critique 2b: mcp_roots = [anchor], client_cwd = sibling_wt (no store) must refuse.
@@ -1085,13 +1095,38 @@ async fn stacked_worktree_lease_answers_mcp_with_delta_overlay_and_fails_closed_
     let base = scratch("stacked-mcp-lease");
     let anchor = base.join("anchor");
     let stacked_wt = base.join("wt-stacked");
-    wire_registered_worktree(&anchor, "wt-stacked", &stacked_wt);
+    // A real repository: the donor must be a built, committed, clean checkout.
+    std::fs::create_dir_all(&anchor).unwrap();
     std::fs::write(anchor.join("lib.rs"), "pub fn base_only() -> i32 { 1 }\n").unwrap();
-    std::fs::write(
-        stacked_wt.join("lib.rs"),
-        "pub fn base_only() -> i32 { 1 }\n",
-    )
-    .unwrap();
+    let git = |dir: &Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.name=T", "-c", "user.email=t@example.invalid"])
+            .args(["-c", "commit.gpgSign=false", "-c", "core.hooksPath="])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    git(&anchor, &["init", "-q", "-b", "main"]);
+    git(&anchor, &["add", "."]);
+    git(&anchor, &["commit", "-qm", "base"]);
+    git(
+        &anchor,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            stacked_wt.to_str().unwrap(),
+        ],
+    );
+    let head = git(&anchor, &["rev-parse", "HEAD"]);
 
     // Build a committed generation in anchor's store so publish_base_snapshot can snapshot it.
     let anchor_db = devmap_extract::paths::store_path(&anchor);
@@ -1108,7 +1143,15 @@ async fn stacked_worktree_lease_answers_mcp_with_delta_overlay_and_fails_closed_
         resolver.index_extractions(&exts);
         let res = resolver.resolve_all(&exts).unwrap();
         let analysis = devmap_analyze::analyze(&exts, &res);
-        store.save_generation(&exts, &res, &analysis).unwrap();
+        store
+            .save_generation_with_metadata(
+                &exts,
+                &res,
+                &analysis,
+                devmap_store::GenerationWriteOpts::default(),
+                &head,
+            )
+            .unwrap();
     }
 
     devmap_query::stacked::provision_stacked_worktree(&anchor, &stacked_wt).unwrap();
@@ -1156,7 +1199,11 @@ async fn stacked_worktree_lease_answers_mcp_with_delta_overlay_and_fails_closed_
         json!({"repo_path": stacked_wt.display().to_string(), "query": "stacked_delta_fn"}),
     )
     .await;
-    assert_eq!(search_new["result"]["isError"], json!(false), "{search_new}");
+    assert_eq!(
+        search_new["result"]["isError"],
+        json!(false),
+        "{search_new}"
+    );
     assert_eq!(structured(&search_new)["shown"], json!(1), "{search_new}");
 
     let search_tombstoned = call(
@@ -1193,4 +1240,72 @@ async fn stacked_worktree_lease_answers_mcp_with_delta_overlay_and_fails_closed_
     let _ = std::fs::remove_dir_all(&base);
 }
 
+#[tokio::test]
+async fn extra_non_git_mcp_root_does_not_block_the_indexed_root() {
+    let base = scratch("extra-root");
+    let indexed = base.join("indexed");
+    let plain = base.join("plain-dir");
+    std::fs::create_dir_all(&plain).unwrap();
+    plant_store(&indexed);
+    let slot = Arc::new(StoreSlot::resolving(None, indexed.clone(), None));
+    slot.set_mcp_roots(vec![indexed.clone(), plain.clone()]);
+    let ok = call(&slot, "devmap_status", json!({})).await;
+    assert_eq!(ok["result"]["isError"], json!(false), "{ok}");
+    assert_eq!(
+        Path::new(structured(&ok)["repository"]["root"].as_str().unwrap()),
+        indexed.canonicalize().unwrap().as_path()
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
 
+#[tokio::test]
+async fn corrupt_lease_in_another_root_does_not_block_resolution() {
+    let base = scratch("corrupt-lease-other-root");
+    let indexed = base.join("indexed");
+    let broken = base.join("broken-lane");
+    plant_store(&indexed);
+    let lease = devmap_extract::paths::stack_lease_path(&broken);
+    std::fs::create_dir_all(lease.parent().unwrap()).unwrap();
+    std::fs::write(&lease, "{corrupt").unwrap();
+    let slot = Arc::new(StoreSlot::resolving(None, indexed.clone(), None));
+    slot.set_mcp_roots(vec![indexed.clone(), broken.clone()]);
+    let ok = call(&slot, "devmap_status", json!({})).await;
+    assert_eq!(ok["result"]["isError"], json!(false), "{ok}");
+    assert_eq!(
+        Path::new(structured(&ok)["repository"]["root"].as_str().unwrap()),
+        indexed.canonicalize().unwrap().as_path()
+    );
+    // Naming the corrupt lease explicitly still fails closed.
+    let explicit = call(
+        &slot,
+        "devmap_status",
+        json!({"repo_path": broken.display().to_string()}),
+    )
+    .await;
+    assert!(tool_error_text(&explicit).contains("corrupt"), "{explicit}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[tokio::test]
+async fn nested_unregistered_repo_cwd_is_served_from_the_root() {
+    let base = scratch("nested-repo-cwd");
+    let indexed = base.join("indexed");
+    let nested = indexed.join("vendor").join("dep");
+    std::fs::create_dir_all(&nested).unwrap();
+    plant_store(&indexed);
+    let init = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&nested)
+        .output()
+        .unwrap();
+    assert!(init.status.success());
+    let slot = Arc::new(StoreSlot::resolving(None, nested.clone(), None));
+    slot.set_mcp_roots(vec![indexed.clone()]);
+    let ok = call(&slot, "devmap_status", json!({})).await;
+    assert_eq!(ok["result"]["isError"], json!(false), "{ok}");
+    assert_eq!(
+        Path::new(structured(&ok)["repository"]["root"].as_str().unwrap()),
+        indexed.canonicalize().unwrap().as_path()
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}

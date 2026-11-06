@@ -47,18 +47,6 @@ pub struct RootResolveInput {
 impl RootResolveInput {
     /// Resolve a store path, or an error that names every attempt.
     pub fn resolve(&self) -> Result<PathBuf, String> {
-        if let Some(roots) = &self.mcp_roots {
-            for root in roots.iter().take(MAX_ROOTS) {
-                let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-                let _ = effective_store_for_root(&canonical)?;
-            }
-        }
-        let cwd_probe = self
-            .client_cwd
-            .canonicalize()
-            .unwrap_or_else(|_| self.client_cwd.clone());
-        let _ = effective_store_for_root(&cwd_probe)?;
-
         let with_stores = self.discovery_roots_with_stores();
         if with_stores.len() > 1 {
             return Err(ambiguous_roots_error(&with_stores));
@@ -66,18 +54,6 @@ impl RootResolveInput {
         if with_stores.len() == 1 {
             let resolved = &with_stores[0];
             let resolved_ws = workspace_identity(resolved);
-            if let Some(roots) = &self.mcp_roots {
-                let distinct_mcp = distinct_workspace_roots(roots.iter().take(MAX_ROOTS));
-                if distinct_mcp.iter().any(|mr| mr != &resolved_ws) {
-                    let mut named = vec![resolved.clone()];
-                    for mr in distinct_mcp {
-                        if !named.iter().any(|existing| existing == &mr) {
-                            named.push(mr);
-                        }
-                    }
-                    return Err(ambiguous_unindexed_roots_error(resolved, &named));
-                }
-            }
             let cwd_canon = self
                 .client_cwd
                 .canonicalize()
@@ -85,19 +61,39 @@ impl RootResolveInput {
             if let Some(cwd_wt) =
                 devmap_extract::git_worktree_root(&cwd_canon).map(|g| g.canonicalize().unwrap_or(g))
             {
+                // A cwd in another registered worktree of the same repository is
+                // the unpinned-parent leak: serving the indexed checkout would
+                // answer for the wrong tree. An unrelated or nested repository
+                // is not, and the indexed root is served as it always was.
                 if cwd_wt != resolved_ws
-                    && (devmap_extract::same_registered_repo(&cwd_wt, &resolved_ws)
-                        || cwd_wt.starts_with(&resolved_ws))
+                    && devmap_extract::same_registered_repo(&cwd_wt, &resolved_ws)
                 {
                     return Err(unindexed_worktree_cwd_error(&cwd_wt, resolved));
                 }
             }
-            let resolved_store = effective_store_for_root(resolved)?
-                .unwrap_or_else(|| store_for_root(resolved));
+            let resolved_store =
+                effective_store_for_root(resolved)?.unwrap_or_else(|| store_for_root(resolved));
             return canonical_store_path(resolved_store);
         }
 
         let mut attempts = Vec::new();
+        // A root whose lease is corrupt was skipped in discovery; if nothing
+        // else resolved, say why it was skipped.
+        for root in self
+            .mcp_roots
+            .iter()
+            .flatten()
+            .take(MAX_ROOTS)
+            .chain([&self.client_cwd])
+        {
+            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+            if let Err(detail) = effective_store_for_root(&canonical) {
+                attempts.push(ResolveAttempt {
+                    source: "stacked lease",
+                    detail,
+                });
+            }
+        }
 
         match &self.mcp_roots {
             None => attempts.push(ResolveAttempt {
@@ -491,21 +487,6 @@ fn workspace_identity(path: &Path) -> PathBuf {
         .unwrap_or(canonical)
 }
 
-fn distinct_workspace_roots<'a>(roots: impl Iterator<Item = &'a PathBuf>) -> Vec<PathBuf> {
-    let mut seen = std::collections::BTreeSet::new();
-    let mut out = Vec::new();
-    for root in roots {
-        if !root.is_dir() {
-            continue;
-        }
-        let identity = workspace_identity(root);
-        if seen.insert(identity.clone()) {
-            out.push(identity);
-        }
-    }
-    out
-}
-
 fn ambiguous_roots_error(roots: &[PathBuf]) -> String {
     let mut lines = vec![
         "more than one repository has a DevMap store (MCP roots/list and/or this process's cwd/--root); this process is shared across workspace tabs so first-wins is not safe. Pass repo_path with the absolute repository path:"
@@ -513,22 +494,6 @@ fn ambiguous_roots_error(roots: &[PathBuf]) -> String {
     ];
     for root in roots {
         lines.push(format!("  - {}", root.display()));
-    }
-    lines.join("\n")
-}
-
-fn ambiguous_unindexed_roots_error(indexed_root: &Path, all_roots: &[PathBuf]) -> String {
-    let mut lines = vec![format!(
-        "MCP roots/list spans multiple workspace/worktree roots, and only {} currently has a DevMap store; silently serving that store when repo_path is omitted would leak another checkout's graph. Pass repo_path with the absolute repository path (and run `devmap seed` or `devmap build --manifest` in any unindexed checkout):",
-        indexed_root.display()
-    )];
-    for root in all_roots {
-        let status = if store_for_root(root).is_file() {
-            "has store"
-        } else {
-            "unindexed"
-        };
-        lines.push(format!("  - {} ({status})", root.display()));
     }
     lines.join("\n")
 }
