@@ -207,6 +207,157 @@ fn a_new_profile_reclaims_pages_when_retention_frees_them() {
     );
 }
 
+/// Bytes in the WAL sidecar. A header is 32 bytes; anything longer is a frame.
+/// The receipt may describe freelist progress only after those frames are gone.
+fn wal_bytes(db: &std::path::Path) -> u64 {
+    let wal = format!("{}-wal", db.display());
+    match std::fs::metadata(&wal) {
+        Ok(meta) => meta.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => panic!("stat {wal}: {error}"),
+    }
+}
+
+/// Freelist count stored in the main database header. Checkpoint is what
+/// copies a WAL frame into this header; a read through the connection would
+/// count pages the WAL still holds.
+fn header_freelist(db: &std::path::Path) -> i64 {
+    let bytes = std::fs::read(db).unwrap_or_else(|error| panic!("open {}: {error}", db.display()));
+    assert!(
+        bytes.len() >= 40,
+        "database header is short ({})",
+        bytes.len()
+    );
+    let raw = u32::from_be_bytes(bytes[36..40].try_into().expect("four header bytes"));
+    i64::from(raw)
+}
+
+fn assert_receipt_matches_wal(db: &std::path::Path, s: &Store, report: &str) {
+    let incremental = json::<i64>(s, report, "$.item.vacuum.incremental");
+    let before = json::<i64>(s, report, "$.item.vacuum.free_pages_before");
+    let after = json::<i64>(s, report, "$.item.vacuum.free_pages_after");
+    let wal = wal_bytes(db);
+    let on_disk = header_freelist(db);
+    if wal > 32 {
+        assert_eq!(
+            incremental, 0,
+            "incremental vacuum was claimed while {wal} WAL bytes still hold pages\n{report}"
+        );
+        assert_eq!(
+            before, after,
+            "freelist moved from {before} to {after} while the WAL still holds pages\n{report}"
+        );
+        assert!(
+            before <= on_disk,
+            "receipt freelist {before} is above the main-file header {on_disk}; the extra pages are still in the WAL\n{report}"
+        );
+    } else {
+        assert_eq!(
+            after, on_disk,
+            "checkpoint left no WAL frames, so free_pages_after must be the main-file header ({on_disk})\n{report}"
+        );
+    }
+}
+
+#[test]
+fn a_wal_frame_is_not_reported_as_freelist_progress() {
+    let dir = support::temp_dir("wal-receipt");
+    let db = dir.join("state.sqlite");
+    let s = Store::open(&db).unwrap();
+    repo(&s, 0);
+    for n in 0..20 {
+        let body = "y".repeat(16_000);
+        call(
+            &s,
+            "items.put",
+            &format!(
+                r#"{{"id":"t","request_id":"v-{n}","expected_revision":{n},"title":"T","description":"{body}","repository_ids":["r0"],"primary_repository_id":"r0"}}"#
+            ),
+        );
+    }
+    let wal_before = wal_bytes(&db);
+    assert!(
+        wal_before > 32,
+        "the fixture must leave a WAL frame, got {wal_before} bytes"
+    );
+    let report = call(
+        &s,
+        "store.compact",
+        r#"{"keep_revisions":1,"keep_events":1,"receipt_window_seconds":3600,"event_retention_seconds":3600}"#,
+    );
+    assert!(
+        json::<i64>(&s, &report, "$.item.revisions.deleted") >= 19,
+        "{report}"
+    );
+    assert!(
+        wal_bytes(&db) <= 32,
+        "no reader was holding the WAL, so checkpoint should have copied every frame\n{report}"
+    );
+    assert_eq!(
+        json::<String>(&s, &report, "$.item.vacuum.checkpoint"),
+        "cleared",
+        "{report}"
+    );
+    assert_eq!(
+        json::<i64>(&s, &report, "$.item.vacuum.incremental"),
+        1,
+        "{report}"
+    );
+    assert_receipt_matches_wal(&db, &s, &report);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_reader_blocking_checkpoint_is_not_told_the_wal_pages_were_freed() {
+    let dir = support::temp_dir("wal-receipt-blocked");
+    let db = dir.join("state.sqlite");
+    let s = Store::open(&db).unwrap();
+    repo(&s, 0);
+    for n in 0..20 {
+        let body = "y".repeat(16_000);
+        call(
+            &s,
+            "items.put",
+            &format!(
+                r#"{{"id":"t","request_id":"b-{n}","expected_revision":{n},"title":"T","description":"{body}","repository_ids":["r0"],"primary_repository_id":"r0"}}"#
+            ),
+        );
+    }
+    assert!(wal_bytes(&db) > 32, "the fixture must leave a WAL frame");
+    let reader = Store::open(&db).unwrap();
+    reader
+        .connection()
+        .execute_batch("BEGIN DEFERRED; SELECT count(*) FROM work_revisions;")
+        .unwrap();
+    let started = std::time::Instant::now();
+    let report = call(
+        &s,
+        "store.compact",
+        r#"{"keep_revisions":1,"keep_events":1,"receipt_window_seconds":3600,"event_retention_seconds":3600}"#,
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "a blocked checkpoint waited {:?}; the bound is 250ms per attempt",
+        started.elapsed()
+    );
+    assert!(
+        json::<i64>(&s, &report, "$.item.revisions.deleted") >= 19,
+        "a blocked checkpoint must not roll the deletes back\n{report}"
+    );
+    assert!(
+        wal_bytes(&db) > 32,
+        "the open reader should have left a WAL frame for the receipt to refuse\n{report}"
+    );
+    assert_eq!(
+        json::<String>(&s, &report, "$.item.vacuum.checkpoint"),
+        "blocked",
+        "{report}"
+    );
+    assert_receipt_matches_wal(&db, &s, &report);
+    drop(reader);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn stored_version(s: &Store) -> i64 {
     s.connection()
         .query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))

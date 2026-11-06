@@ -244,6 +244,13 @@ impl Store {
         // Reads never upgrade a profile; a write upgrades it only when this
         // handle may, and only after an online backup.
         let upgraded = ensure_schema(&self.conn, writing && self.workbench_upgrades)?;
+        if method == "store.compact" {
+            // Deletes commit before the WAL checkpoint. Inside this request's
+            // transaction a checkpoint cannot see those pages, so the receipt
+            // would report freelist progress the WAL still holds.
+            let now_ms = self.workbench_now_millis()?;
+            return compaction::compact(&input, now_ms / 1000);
+        }
         let behavior = if writing {
             TransactionBehavior::Immediate
         } else {
@@ -261,8 +268,6 @@ impl Store {
                     params![upgraded.to, upgraded.from, upgraded.backup],
                     |r| r.get(0),
                 )?
-            } else if method == "store.compact" {
-                compaction::compact(&input, now_ms / 1000)?
             } else {
                 mutate(&input, method, now_ms / 1000, now_ms)?
             }
