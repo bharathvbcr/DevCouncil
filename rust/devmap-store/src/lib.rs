@@ -8,6 +8,7 @@ pub mod edge_index;
 pub mod extract_cache;
 pub(crate) mod payload_codec;
 pub mod schema;
+pub mod seed;
 
 pub use coverage::{
     add_manifest_refusals, discovery_refusals, over_limit_inventory, refusal_inventory,
