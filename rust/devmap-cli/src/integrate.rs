@@ -2193,6 +2193,9 @@ pub fn merge_codex_mcp(
     executable: &Path,
     read_only: bool,
 ) -> anyhow::Result<McpMergeOutcome> {
+    // This writer does not go through `mcp_entry`. The same refusal applies,
+    // before the file is read, so a test-binary path cannot create or rewrite it.
+    claude::refuse_hashed_test_binary(executable)?;
     let command = executable
         .canonicalize()
         .unwrap_or_else(|_| executable.to_path_buf());
@@ -2968,6 +2971,35 @@ mod tests {
             value.get("failClosed").is_none() && nav.get("failClosed").is_none(),
             "failClosed would turn a crash into a blocked Read: {value}"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `merge_global_mcp` and `merge_codex_mcp` are the writers that put a
+    /// command into a host file. A hashed test binary must fail before either
+    /// write, including when the file already holds a durable entry.
+    #[test]
+    fn a_test_binary_is_not_written_into_a_host_mcp_config() {
+        let dir = scratch("test-bin-refuse");
+        let stale = Path::new(
+            "/gone/DevCouncil-verify-staged/rust/target/devcouncil-testbin/devmap-73b18311b815cc4f/devmap",
+        );
+
+        let json_path = dir.join("mcp.json");
+        let original_json = r#"{"mcpServers":{"devmap":{"type":"stdio","command":"devmap","args":["mcp"]},"other":{"command":"x"}}}"#;
+        fs::write(&json_path, original_json).unwrap();
+        let err = merge_global_mcp(&json_path, stale, false)
+            .expect_err("global merge must refuse a test binary");
+        assert!(err.to_string().contains("devcouncil-testbin"), "{err}");
+        assert_eq!(fs::read_to_string(&json_path).unwrap(), original_json);
+
+        let toml_path = dir.join("config.toml");
+        let original_toml = "[mcp_servers.other]\ncommand = \"x\"\nargs = []\n";
+        fs::write(&toml_path, original_toml).unwrap();
+        let err = merge_codex_mcp(&toml_path, stale, false)
+            .expect_err("codex merge must refuse a test binary");
+        assert!(err.to_string().contains("devcouncil-testbin"), "{err}");
+        assert_eq!(fs::read_to_string(&toml_path).unwrap(), original_toml);
+
         let _ = fs::remove_dir_all(&dir);
     }
 

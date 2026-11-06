@@ -1681,6 +1681,48 @@ pub fn marketplace_manifest(version: Option<&str>) -> anyhow::Result<Value> {
     Ok(value)
 }
 
+/// True when `path` is inside the hashed test-binary directory.
+///
+/// The Go harness (`backend/go_orchestrator/testsupport/testsupport.go`,
+/// `testBinDir`) copies `devmap` to `target/devcouncil-testbin/devmap-<hash>/`.
+/// That copy's `current_exe` is not an install: the directory goes away with
+/// the worktree or with `cargo clean`, and a host that stored the path then
+/// fails `posix_spawn` with ENOENT. A checkout's own `target/debug` or
+/// `target/release` binary is not this directory. `mcp --print-config` still
+/// names that binary, because the command is specified to be the one that ran.
+pub(crate) fn path_is_hashed_test_binary(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(component, std::path::Component::Normal(name) if name == "devcouncil-testbin")
+    })
+}
+
+/// Refuse to put a hashed test binary into an MCP command.
+///
+/// A symlink is followed. The lexical path of a deleted worktree does not
+/// exist, so a failed canonicalize is not treated as safe: the path components
+/// are checked either way. A missing ordinary path stays allowed, which is
+/// what the config writers' unit tests hand in.
+pub(crate) fn refuse_hashed_test_binary(executable: &Path) -> anyhow::Result<()> {
+    let canonical = executable.canonicalize().ok();
+    let lexical = path_is_hashed_test_binary(executable);
+    let via_link = canonical.as_deref().is_some_and(path_is_hashed_test_binary);
+    if !lexical && !via_link {
+        return Ok(());
+    }
+    let shown = if via_link {
+        canonical.unwrap_or_else(|| executable.to_path_buf())
+    } else {
+        executable.to_path_buf()
+    };
+    anyhow::bail!(
+        "refusing to register an MCP command at {}: that path is a hashed test \
+         binary under target/devcouncil-testbin, and it disappears when the \
+         worktree is removed or cargo clean runs. Register the installed \
+         devmap, not the test copy.",
+        shown.display()
+    )
+}
+
 /// The MCP server entry an agent host needs to reach this binary.
 ///
 /// One owner for the formula: `devmap mcp --print-config` and the plugin bundle
@@ -1696,6 +1738,7 @@ pub fn mcp_entry(
     db: Option<&Path>,
     http: Option<&str>,
 ) -> anyhow::Result<Value> {
+    refuse_hashed_test_binary(executable)?;
     // Always the absolute path this binary validated. Emitting a bare `devmap`
     // silently hands the host whichever build wins on PATH; two installs with
     // different schemas is the skew doctor reports.
@@ -1733,6 +1776,7 @@ pub fn mcp_entry_with_root(
     root: &Path,
     http: Option<&str>,
 ) -> anyhow::Result<Value> {
+    refuse_hashed_test_binary(executable)?;
     if http.is_some() {
         return mcp_entry(executable, None, http);
     }
@@ -2809,5 +2853,78 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The ENOENT from 2026-10-29 was this path: a hashed copy under
+    /// `target/devcouncil-testbin` inside a worktree that was later deleted.
+    /// Registering it is the failure. A checkout's own `target/debug` or
+    /// `target/release` binary stays a valid absolute command, because
+    /// `mcp --print-config` is specified to name the binary that ran.
+    #[test]
+    fn a_hashed_test_binary_is_refused_as_an_mcp_command() {
+        let stale = Path::new(
+            "/Users/bharath/Code/devtools/DevCouncil-verify-staged/rust/target/devcouncil-testbin/devmap-73b18311b815cc4f/devmap",
+        );
+        let err = mcp_entry(stale, None, None)
+            .expect_err("a devcouncil-testbin path must not become an MCP command");
+        let text = err.to_string();
+        assert!(
+            text.contains("devcouncil-testbin"),
+            "the refusal must name the directory: {text}"
+        );
+        assert!(
+            text.contains("73b18311b815cc4f"),
+            "the refusal must name the path that would have been spawned: {text}"
+        );
+
+        let rooted = mcp_entry_with_root(stale, Path::new("/repo"), None)
+            .expect_err("the --root form writes the same command");
+        assert!(
+            rooted.to_string().contains("devcouncil-testbin"),
+            "{rooted}"
+        );
+
+        let http = mcp_entry(stale, None, Some("8080"))
+            .expect_err("the http form must not point a client at the test copy");
+        assert!(http.to_string().contains("devcouncil-testbin"), "{http}");
+
+        // The directory is one path component. A longer name is a different directory.
+        for allowed in [
+            "/work/rust/target/debug/devmap",
+            "/work/rust/target/release/devmap",
+            "/opt/devcouncil-testbin-backup/devmap",
+            "/Users/x/.local/bin/devmap",
+            "/tmp/帮助/devmap",
+        ] {
+            let entry = mcp_entry(Path::new(allowed), None, None)
+                .unwrap_or_else(|err| panic!("{allowed} was refused: {err}"));
+            assert_eq!(entry["command"], allowed, "{entry}");
+            assert_eq!(entry["args"], json!(["mcp"]));
+        }
+
+        // A symlink whose own path is innocent still resolves into the test dir.
+        let root = std::env::temp_dir().join(format!(
+            "devmap-mcp-guard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let bin_dir = root.join("devcouncil-testbin").join("devmap-abc");
+        std::fs::create_dir_all(&bin_dir).expect("test bin dir");
+        let bin = bin_dir.join("devmap");
+        std::fs::write(&bin, b"not a real binary").expect("test bin");
+        let link_dir = root.join("elsewhere");
+        std::fs::create_dir_all(&link_dir).expect("link dir");
+        let link = link_dir.join("devmap");
+        std::os::unix::fs::symlink(&bin, &link).expect("symlink");
+        let linked = mcp_entry(&link, None, None);
+        let _ = std::fs::remove_dir_all(&root);
+        let linked = linked.expect_err("a symlink into devcouncil-testbin is still that binary");
+        assert!(
+            linked.to_string().contains("devcouncil-testbin"),
+            "{linked}"
+        );
     }
 }
