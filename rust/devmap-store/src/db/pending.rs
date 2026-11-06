@@ -97,7 +97,13 @@ impl Store {
     pub fn enqueue_pending_paths(&self, paths: &[String]) -> Result<()> {
         let now = Self::now_secs();
         self.with_pending_transaction(Self::PENDING_ADMISSION_TIMEOUT, |tx| {
-            Self::upsert_pending(tx, paths.iter().map(String::as_str), now)
+            Self::upsert_pending(tx, paths.iter().map(String::as_str), now)?;
+            // Inside the transaction, before commit: a query that already
+            // counted zero must not clone a verdict this commit has ended.
+            if !paths.is_empty() {
+                self.clear_source_freshness_cache();
+            }
+            Ok(())
         })
     }
 
@@ -555,7 +561,9 @@ impl Store {
         let now = Self::now_secs();
         self.with_pending_transaction(Self::PENDING_ADMISSION_TIMEOUT, |tx| {
             Self::bind_repo_root_in(tx, &owner)?;
-            Self::upsert_pending(tx, canonical.iter().map(String::as_str), now)
+            Self::upsert_pending(tx, canonical.iter().map(String::as_str), now)?;
+            self.clear_source_freshness_cache();
+            Ok(())
         })?;
         report.enqueued = canonical.into_iter().collect();
         Ok(report)

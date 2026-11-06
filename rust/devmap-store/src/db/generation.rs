@@ -10,8 +10,50 @@ use crate::schema::BUILD_HISTORY_RETENTION;
 use devmap_analyze::model::{AnalysisStatus, AnalysisSummary};
 use rusqlite::OptionalExtension;
 use rusqlite::{params, Result};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+
+thread_local! {
+    static FRESHNESS_INTERLEAVE: Cell<Option<fn(&Store)>> = const { Cell::new(None) };
+    static FRESHNESS_INTERLEAVE_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+struct InterleaveGuard;
+
+impl Drop for InterleaveGuard {
+    fn drop(&mut self) {
+        FRESHNESS_INTERLEAVE_ACTIVE.with(|active| active.set(false));
+    }
+}
+
+/// Run `hook` after [`Store::query_source_freshness`] has observed an empty
+/// queue and before it clones the verdict cache. Production never sets it.
+/// A hook that calls `query_source_freshness` again does not re-enter itself.
+///
+/// Callers live in this crate's tests. A non-test build of the crate (as a
+/// dependency of `devmap-query`) therefore sees an unused function; that is
+/// the seam, not a dead production path.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn set_source_freshness_interleave(hook: Option<fn(&Store)>) {
+    FRESHNESS_INTERLEAVE.with(|slot| slot.set(hook));
+}
+
+/// `Ok(0)` means the cached verdict may still be returned. Any other count,
+/// and any read error, is an unverified answer whose reason names the queue.
+fn queue_blocks_cached_freshness(queued: Result<i64>) -> Option<QuerySourceFreshness> {
+    match queued {
+        Ok(0) => None,
+        Ok(count) => Some(QuerySourceFreshness::unverified(format!(
+            "{count} changed path(s) are queued and not yet indexed; the last verified \
+source freshness no longer describes the tree"
+        ))),
+        Err(error) => Some(QuerySourceFreshness::unverified(format!(
+            "source freshness unverified: could not read the pending queue ({error})"
+        ))),
+    }
+}
 
 /// The coverage-gap label a budget refusal is stored under: it is a
 /// `ParseOutcome::Failed`, so it lands in `parse_failed` beside grammar faults.
@@ -1084,18 +1126,24 @@ impl Store {
         // the watcher has queued since then end that verdict without changing the
         // generation id, so a non-empty queue means the cache cannot speak.
         let queued: Result<i64> = self.queued_path_count();
-        match queued {
-            Ok(0) => {}
-            Ok(count) => {
-                return QuerySourceFreshness::unverified(format!(
-                    "{count} changed path(s) are queued and not yet indexed; the last verified \
-source freshness no longer describes the tree"
-                ))
-            }
-            Err(error) => {
-                return QuerySourceFreshness::unverified(format!(
-                    "source freshness unverified: could not read the pending queue ({error})"
-                ))
+        if let Some(blocked) = queue_blocks_cached_freshness(queued) {
+            return blocked;
+        }
+        // Test seam. Production leaves the hook unset. It runs after the
+        // queue read has dropped the connection and before the cache is
+        // cloned, which is the window an enqueue can commit into.
+        if let Some(hook) = FRESHNESS_INTERLEAVE.with(|slot| slot.get()) {
+            let entered = FRESHNESS_INTERLEAVE_ACTIVE.with(|active| {
+                if active.get() {
+                    false
+                } else {
+                    active.set(true);
+                    true
+                }
+            });
+            if entered {
+                let _guard = InterleaveGuard;
+                hook(self);
             }
         }
         let cache = self
@@ -1103,6 +1151,12 @@ source freshness no longer describes the tree"
             .lock()
             .ok()
             .and_then(|guard| guard.clone());
+        // The enqueue that landed after the first count is visible now. A
+        // generation-matched cache is returned only when this count is still
+        // zero. A read error is unverified, not a cached fresh.
+        if let Some(blocked) = queue_blocks_cached_freshness(self.queued_path_count()) {
+            return blocked;
+        }
         match cache {
             Some(cached) if cached.generation_id == latest => QuerySourceFreshness {
                 fresh: cached.fresh,
@@ -1118,6 +1172,12 @@ generation {latest}; run `devmap status` to re-verify",
                 "whole-tree source freshness was not checked for this answer; run `devmap status` \
 (or call `devmap_status`) for a verified verdict",
             ),
+        }
+    }
+
+    pub(super) fn clear_source_freshness_cache(&self) {
+        if let Ok(mut cache) = self.source_freshness_cache.lock() {
+            *cache = None;
         }
     }
 
@@ -1865,5 +1925,187 @@ generation {latest}; run `devmap status` to re-verify",
         );
         let count: i64 = snapshot.query_row(&sql, params![generation], |row| row.get(0))?;
         Ok(Some(count.max(0) as usize))
+    }
+}
+
+#[cfg(test)]
+mod freshness_race {
+    use super::*;
+
+    struct ClearHook;
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            set_source_freshness_interleave(None);
+        }
+    }
+
+    fn seeded() -> Store {
+        let store = Store::open_in_memory().expect("store");
+        {
+            let conn = lock_conn(&store.conn).expect("connection");
+            conn.execute(
+                "INSERT INTO generations (id, created_at, head_sha, analysis_json)
+                 VALUES (7, 1.0, 'seed', '{}')",
+                [],
+            )
+            .expect("generation");
+        }
+        let id = store
+            .latest_generation_id()
+            .expect("read")
+            .expect("generation id");
+        store.remember_source_freshness(id, Some(true), None);
+        store
+    }
+
+    fn enqueue_one(store: &Store) {
+        store
+            .enqueue_pending_paths(&["src/名前.rs".to_string()])
+            .expect("enqueue");
+    }
+
+    #[test]
+    fn an_enqueue_between_the_zero_count_and_the_cache_clone_is_not_fresh() {
+        let store = seeded();
+        let quiet = store.query_source_freshness();
+        assert_eq!(
+            quiet.fresh,
+            Some(true),
+            "a seeded empty queue is fresh before the race"
+        );
+
+        let _clear = ClearHook;
+        set_source_freshness_interleave(Some(enqueue_one));
+        let verdict = store.query_source_freshness();
+        assert_eq!(
+            verdict.fresh, None,
+            "a committed enqueue must not stay fresh: {verdict:?}"
+        );
+        let reason = verdict.reason.expect("reason");
+        assert!(
+            reason.contains("queued"),
+            "the reason must name the queue, got {reason}"
+        );
+        assert!(
+            !reason.contains("index moved"),
+            "this race is not an index move, got {reason}"
+        );
+        let again = store.query_source_freshness();
+        assert_eq!(again.fresh, None);
+        assert!(again.reason.unwrap_or_default().contains("queued"));
+    }
+
+    #[test]
+    fn an_empty_enqueue_keeps_the_verified_verdict() {
+        let store = seeded();
+        store.enqueue_pending_paths(&[]).expect("empty enqueue");
+        assert_eq!(store.query_source_freshness().fresh, Some(true));
+    }
+
+    #[test]
+    fn an_enqueue_under_root_clears_the_cache() {
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let store = seeded();
+        let root =
+            std::env::temp_dir().join(format!("devmap-fresh-under-root-{}", std::process::id()));
+        let _dir = DirGuard(root.clone());
+        let rel = "src/odd 'quote' 名前.rs";
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        std::fs::write(root.join(rel), b"fn x() {}\n").expect("file");
+        let report = store
+            .enqueue_pending_paths_under_root(&root, &[rel.to_string()])
+            .expect("enqueue under root");
+        assert!(
+            report.enqueued.iter().any(|path| path.contains('名')),
+            "the canonical queue entry must keep the unicode name: {report:?}"
+        );
+        {
+            let conn = lock_conn(&store.conn).expect("connection");
+            conn.execute("DELETE FROM pending_paths", [])
+                .expect("delete");
+        }
+        let verdict = store.query_source_freshness();
+        assert_eq!(verdict.fresh, None, "{verdict:?}");
+        let reason = verdict.reason.expect("reason");
+        assert!(reason.contains("not checked"), "{reason}");
+        assert!(!reason.contains("index moved"), "{reason}");
+    }
+
+    #[test]
+    fn an_enqueue_clears_the_cache_so_deleting_the_row_does_not_restore_fresh() {
+        let store = seeded();
+        store
+            .enqueue_pending_paths(&["src/odd 'quote' 名前.rs".to_string()])
+            .expect("enqueue");
+        {
+            let conn = lock_conn(&store.conn).expect("connection");
+            conn.execute("DELETE FROM pending_paths", [])
+                .expect("delete");
+        }
+        let verdict = store.query_source_freshness();
+        assert_eq!(verdict.fresh, None, "{verdict:?}");
+        let reason = verdict.reason.expect("reason");
+        assert!(reason.contains("not checked"), "{reason}");
+        assert!(!reason.contains("index moved"), "{reason}");
+    }
+
+    #[test]
+    fn a_reentering_hook_runs_once_and_the_outer_answer_names_the_queue() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn hook(store: &Store) {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            let _ = store.query_source_freshness();
+            store
+                .enqueue_pending_paths(&["a".repeat(4096)])
+                .expect("long path enqueues");
+        }
+        CALLS.store(0, Ordering::SeqCst);
+        let store = seeded();
+        let _clear = ClearHook;
+        set_source_freshness_interleave(Some(hook));
+        let verdict = store.query_source_freshness();
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(verdict.fresh, None, "{verdict:?}");
+        assert!(verdict.reason.unwrap_or_default().contains("queued"));
+    }
+
+    #[test]
+    fn a_panicking_hook_releases_the_reentry_guard() {
+        fn boom(_: &Store) {
+            panic!("interleave hook");
+        }
+        let store = seeded();
+        let _clear = ClearHook;
+        set_source_freshness_interleave(Some(boom));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.query_source_freshness();
+        }));
+        assert!(caught.is_err(), "the hook panic must reach the caller");
+        set_source_freshness_interleave(Some(enqueue_one));
+        let verdict = store.query_source_freshness();
+        assert_eq!(
+            verdict.fresh, None,
+            "a stuck reentry flag would skip the enqueue and stay fresh: {verdict:?}"
+        );
+        assert!(verdict.reason.unwrap_or_default().contains("queued"));
+    }
+
+    #[test]
+    fn a_queue_read_error_is_unverified_and_names_the_queue() {
+        let blocked =
+            queue_blocks_cached_freshness(Err(rusqlite::Error::InvalidQuery)).expect("blocked");
+        assert_eq!(blocked.fresh, None);
+        let reason = blocked.reason.expect("reason");
+        assert!(reason.contains("pending queue"), "{reason}");
+        assert!(queue_blocks_cached_freshness(Ok(0)).is_none());
+        let counted = queue_blocks_cached_freshness(Ok(2)).expect("counted");
+        assert_eq!(counted.fresh, None);
+        assert!(counted.reason.unwrap().contains("2 changed path"));
     }
 }

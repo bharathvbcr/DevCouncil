@@ -113,6 +113,36 @@ fn pin_verdict(read: Option<u32>, verdict: SourceFreshness) -> SourceFreshness {
     }
 }
 
+#[cfg(test)]
+mod pin_verdict_tests {
+    use super::pin_verdict;
+    use crate::model::SourceFreshness;
+
+    #[test]
+    fn a_matching_generation_keeps_a_verified_verdict() {
+        let verdict = SourceFreshness::verified(true, 7);
+        let pinned = pin_verdict(Some(7), verdict);
+        assert_eq!(pinned.fresh, Some(true));
+        assert_eq!(pinned.generation_id, Some(7));
+        assert!(pinned.reason.is_none());
+    }
+
+    #[test]
+    fn a_queue_verdict_is_not_rewritten_as_an_index_move() {
+        let verdict = SourceFreshness::unverified(
+            "1 changed path(s) are queued and not yet indexed; the last verified source freshness no longer describes the tree",
+        );
+        let pinned = pin_verdict(Some(7), verdict.clone());
+        assert_eq!(pinned, verdict);
+        let reason = pinned.reason.as_deref().expect("reason");
+        assert!(reason.contains("queued"), "{reason}");
+        assert!(!reason.contains("index moved"), "{reason}");
+        let json = serde_json::to_value(&pinned).expect("json");
+        let keys: Vec<_> = json.as_object().expect("object").keys().cloned().collect();
+        assert_eq!(keys, ["fresh", "reason"]);
+    }
+}
+
 pub struct QueryEngine<'a> {
     extractions: &'a [Extraction],
     resolution: &'a ResolutionResult,
