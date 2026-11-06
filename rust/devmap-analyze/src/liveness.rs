@@ -2618,10 +2618,19 @@ pub fn extraction_gaps(extractions: &[Extraction]) -> Vec<ExtractionGapEntry> {
             // make a file with one hole indistinguishable from a file with two.
             let capabilities = ext.capabilities();
             if !capabilities.contains(Capability::Calls) {
+                let mut reason = format!("`{}` has no call extractor in this build", ext.language);
+                if let Some(dropped) = ext
+                    .diagnostics
+                    .iter()
+                    .find(|line| line.starts_with(CALLS_DROPPED_PREFIX))
+                {
+                    reason.push_str("; ");
+                    reason.push_str(dropped);
+                }
                 gaps.push(ExtractionGapEntry {
                     path: ext.file_path.clone(),
                     gap: ExtractionGap::CallBlind,
-                    reason: format!("`{}` has no call extractor in this build", ext.language),
+                    reason,
                 });
             }
             if !capabilities.contains(Capability::Imports) {

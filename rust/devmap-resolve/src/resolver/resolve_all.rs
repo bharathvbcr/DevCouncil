@@ -366,11 +366,38 @@ impl Resolver {
 
                 // Resolve calls using Resolution Ladder (SameFile -> ImportScoped -> UniqueGlobal -> AmbiguousGlobal)
                 let explicit_calls = ext.calls.len();
+                // A language with no call extractor still records the sites it
+                // recognized. They must not enter the ladder: a unique global
+                // named `file` would become a Calls edge. The row says the
+                // language extracts no calls, and the walk stops.
+                let extracts_calls = ext
+                    .capabilities()
+                    .contains(devmap_extract::languages::Capability::Calls);
                 for (call_index, call) in ext.calls.iter().chain(&ext.rust_implicit_calls).enumerate() {
                     // An implicit call is a candidate: when no rung binds it
                     // it is dropped, not recorded (see
                     // `Extraction::rust_implicit_calls`).
                     let implicit_candidate = call_index >= explicit_calls;
+                    if !extracts_calls {
+                        if !implicit_candidate {
+                            unresolved.push(UnresolvedReference {
+                                source_file: ext.file_path.clone(),
+                                source_symbol: call
+                                    .caller_symbol
+                                    .clone()
+                                    .unwrap_or_else(|| ext.file_path.clone()),
+                                callee_name: call.callee_name.clone(),
+                                kind: UnresolvedKind::Call,
+                                resolution: Resolution::Unresolved {
+                                    reason: format!("`{}` extracts no calls", ext.language),
+                                },
+                                class: UnresolvedClass::Unresolved,
+                                receiver: call.receiver_expr.clone(),
+                                site: Some(SiteBytes::of(&call.span)),
+                            });
+                        }
+                        continue;
+                    }
                     // The resolution is the *only* record of what was found:
                     // it names the target file and symbol, and
                     // `Resolution::confidence` scores it. A parallel

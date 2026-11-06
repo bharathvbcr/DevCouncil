@@ -37,9 +37,9 @@ use self::dependencies::{
 };
 use self::gaps::{
     analysis_coverage_gap, analysis_status_gap, attribution_coverage_gap, empty_ask_gap,
-    empty_result_gap, empty_semantic_gap, file_edge_coverage_gap, qualify_response, query_file,
-    rank_symbol_rows, ranking_coverage_gap, search_coverage_gap, CallBlindStarts, RadiusSide,
-    MAX_CALL_BLIND_FILES_CHECKED,
+    empty_result_gap, empty_semantic_gap, failed_parse_note, file_edge_coverage_gap,
+    qualify_response, query_file, rank_symbol_rows, ranking_coverage_gap, search_coverage_gap,
+    CallBlindStarts, RadiusSide, MAX_CALL_BLIND_FILES_CHECKED,
 };
 pub(crate) use self::hits::search_hit_tokens;
 use self::hits::{
@@ -697,6 +697,9 @@ impl<'a> StoreQueryEngine<'a> {
             // One answer, two halves: the bands are as incomplete as the edges.
             blast_radius.layers.walk_incomplete =
                 devmap_analyze::combine_reasons(blast_radius.layers.walk_incomplete.take(), added);
+            let failed = self.note_failed_parses(&mut edges)?;
+            blast_radius.layers.walk_incomplete =
+                devmap_analyze::combine_reasons(blast_radius.layers.walk_incomplete.take(), failed);
             Ok(LayeredImpact {
                 edges,
                 blast_radius,
@@ -1191,7 +1194,22 @@ impl<'a> StoreQueryEngine<'a> {
             token_budget,
             &mut response,
         )?;
+        // A failed caller file publishes no call, so the walk above cannot
+        // name it. The note is the lower bound. Forward `dependencies` does
+        // not attach it: a parse failure is not an outbound edge.
+        self.note_failed_parses(&mut response)?;
         Ok(response)
+    }
+
+    /// Say which files failed to parse, on an answer whose caller set is
+    /// otherwise a lower bound. The store lock is not held by the caller.
+    /// A failed read stays an error: an empty note would read as a clean walk.
+    fn note_failed_parses<T>(&self, response: &mut Response<T>) -> anyhow::Result<Option<String>> {
+        let (total, paths) = self.store.latest_parse_failures()?;
+        let note = failed_parse_note(total, &paths);
+        response.walk_incomplete =
+            devmap_analyze::combine_reasons(response.walk_incomplete.take(), note.clone());
+        Ok(note)
     }
 
     /// Attach the ledger's unresolved sites that name `target` to an `impact`
@@ -2279,6 +2297,7 @@ impl<'a> StoreQueryEngine<'a> {
             response.hidden = response.total.saturating_sub(response.shown);
             response.truncated = response.hidden > 0;
             response.walk_incomplete = analysis_coverage_gap(page.analysis.as_ref());
+            self.note_failed_parses(&mut response)?;
             // The other half of the answer, and until now the half nothing could
             // see. A one-hop inbound-edge join structurally cannot report a
             // subsystem whose functions call each other, so a `dead` answer without

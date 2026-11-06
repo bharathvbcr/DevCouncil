@@ -733,6 +733,21 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
     if let Some(line) = parse_budget_diagnostic(&parse_budget) {
         progress.display.diagnostic(format_args!("{line}"));
     }
+    // The named list is the failed set, not a sample. It is derived from the
+    // same extractions the counter just finished, and a mismatch means the
+    // build would publish two answers. Refuse before anything is persisted.
+    let parse_failed_files = parse_failed_files_json(&extractions);
+    let named_failures = parse_failed_files
+        .as_array()
+        .map(|rows| rows.len())
+        .unwrap_or(0);
+    if named_failures != extraction_snapshot.failed {
+        anyhow::bail!(
+            "extraction.failed is {} but {named_failures} extraction(s) are parse failures; \
+             refusing to persist a build whose named failures would not match the count",
+            extraction_snapshot.failed
+        );
+    }
     // The corpus text is dead the moment extraction has consumed it,
     // but it is bound in this scope and would otherwise stay resident
     // through resolve, analyze and persist — the stages that set the
@@ -1141,6 +1156,11 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
         // 0` means the generation is committed but incomplete. Absent on the
         // `unchanged` early return, which extracts nothing.
         result["parse_budget"] = parse_budget_json(&parse_budget);
+        // Every file counted in `file_progress.extraction.failed`, in
+        // extraction order. An empty array when the count is zero, so a
+        // reader can tell "none failed" from "this build did not say".
+        // Absent on the unchanged early return, which extracts nothing.
+        result["parse_failed_files"] = parse_failed_files;
         emit_json(cli, &result)?;
     } else {
         let mut summary = vec![
@@ -1166,6 +1186,12 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
             ),
             format!("  Resolved {files_resolved} of {} files", extractions.len()),
         ];
+        if extraction_snapshot.failed > 0 {
+            summary.push(format!(
+                "  Parse failed: {} file(s), each named with its outcome",
+                extraction_snapshot.failed
+            ));
+        }
         if refused_count > 0 {
             summary.push(format!(
                 "    of which refused: {refused_count} \
@@ -1302,6 +1328,29 @@ fn parse_budget_diagnostic(counts: &devmap_extract::progress::BudgetRetryCounts)
 
 /// The top-level `parse_budget` key of a build's JSON result: the counts of
 /// `file_progress.extraction.budget_retry`, unchanged.
+/// One object per extraction that [`devmap_extract::Extraction::is_parse_failure`]
+/// counts, in extraction order. The outcome is always `"failed"`: partial,
+/// fallback, and skipped parses are not in this list.
+fn parse_failed_files_json(extractions: &[devmap_extract::Extraction]) -> serde_json::Value {
+    let rows = extractions
+        .iter()
+        .filter_map(|ext| {
+            if !ext.is_parse_failure() {
+                return None;
+            }
+            let devmap_extract::ParseOutcome::Failed { reason } = &ext.parse_outcome else {
+                return None;
+            };
+            Some(serde_json::json!({
+                "path": ext.file_path,
+                "outcome": "failed",
+                "reason": reason,
+            }))
+        })
+        .collect();
+    serde_json::Value::Array(rows)
+}
+
 fn parse_budget_json(counts: &devmap_extract::progress::BudgetRetryCounts) -> serde_json::Value {
     serde_json::json!({
         "refused": counts.refused,

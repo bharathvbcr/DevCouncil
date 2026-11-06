@@ -87,6 +87,8 @@ pub(super) fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Ex
             truncated: 0,
             skipped_long_lines: 0,
             unread_bytes: 0,
+            calls: Vec::new(),
+            truncated_calls: 0,
         }
     };
     let recovered_count = scan.symbols.len();
@@ -216,6 +218,13 @@ pub(super) fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Ex
                             scan.unread_bytes
                         ));
                     }
+                    if scan.truncated_calls > 0 {
+                        caveats.push(format!(
+                            "{} call site(s) dropped at the scan cap, so the call list is a \
+                             prefix",
+                            scan.truncated_calls
+                        ));
+                    }
                     // The "X of Y" form is used only when Y is genuinely
                     // known — that is, when every declaration was counted and
                     // some were dropped afterwards. If a line was never
@@ -253,7 +262,7 @@ pub(super) fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Ex
         },
         symbols,
         imports: Vec::new(),
-        calls: Vec::new(),
+        calls: scan.calls,
         exports: Vec::new(),
         // Empty for the line scanner, which recovers declarations only. The
         // markup and stylesheet readers behind this same tier do read uses — a

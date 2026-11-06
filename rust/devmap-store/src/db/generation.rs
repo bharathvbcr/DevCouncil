@@ -1890,6 +1890,43 @@ generation {latest}; run `devmap status` to re-verify",
         rows.collect()
     }
 
+    /// Files of the latest generation that failed to parse.
+    ///
+    /// Grammar faults and budget refusals both: every `parse_failed`
+    /// coverage-gap row, not only those whose reason starts with
+    /// [`devmap_extract::model::BUDGET_REFUSAL_PREFIX`]. The count is the
+    /// whole set. The paths are the first eight in path order, so an impact
+    /// or dead answer can name the hole without loading every path. The
+    /// caller states how many were not listed.
+    ///
+    /// `(0, [])` when the store holds no generation. A failed read is an
+    /// error, never that empty pair.
+    pub fn latest_parse_failures(&self) -> Result<(usize, Vec<String>)> {
+        const LISTED: i64 = 8;
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok((0, Vec::new()));
+        };
+        let total: i64 = snapshot.query_row(
+            "SELECT COUNT(*) FROM generation_coverage_gaps
+             WHERE generation_id = ?1 AND gap = ?2",
+            params![generation, parse_failed_gap()],
+            |row| row.get(0),
+        )?;
+        let mut page = snapshot.prepare(
+            "SELECT path FROM generation_coverage_gaps
+             WHERE generation_id = ?1 AND gap = ?2
+             ORDER BY path ASC
+             LIMIT ?3",
+        )?;
+        let paths = page
+            .query_map(params![generation, parse_failed_gap(), LISTED], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((total.max(0) as usize, paths))
+    }
+
     /// Stored edges of the latest generation whose confidence contradicts the
     /// resolution kind recorded for them, counted in SQL.
     ///

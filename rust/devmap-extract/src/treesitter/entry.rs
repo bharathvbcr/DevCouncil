@@ -905,6 +905,14 @@ pub(super) fn extract_treesitter_before_deadline(
                     Err(reason) => (Vec::new(), vec![reason]),
                 };
                 diagnostics.extend(semi_note);
+                if lang == "hcl" && calls.len() > crate::model::MAX_CALL_BLIND_SITES {
+                    let dropped = calls.len() - crate::model::MAX_CALL_BLIND_SITES;
+                    calls.truncate(crate::model::MAX_CALL_BLIND_SITES);
+                    diagnostics.push(format!(
+                        "{}{dropped} HCL function call(s) were dropped, so the call list is a prefix",
+                        crate::model::CALLS_DROPPED_PREFIX
+                    ));
+                }
 
                 // Body signatures are stamped here, after every language arm
                 // has finished pushing symbols, rather than inside `walk_tree`.

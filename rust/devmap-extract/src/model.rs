@@ -1633,6 +1633,18 @@ pub const JAVA_RECORD_SIGNATURE: &str = "record";
 /// parse-budget overrun. See [`Extraction::is_budget_refusal`].
 pub const BUDGET_REFUSAL_PREFIX: &str = "parse budget exceeded: ";
 
+/// Most call sites recorded for one file in a language that has no call
+/// extractor. Past this the list is a prefix and the file says how many were
+/// dropped, in [`CALLS_DROPPED_PREFIX`].
+pub const MAX_CALL_BLIND_SITES: usize = 8_000;
+
+/// Leading words of a diagnostic that names call sites the cap dropped.
+///
+/// `diagnostics` is cleared before the payload is stored. The coverage-gap
+/// inventory still holds the extraction and copies this line into the durable
+/// reason, so a capped file does not look complete.
+pub const CALLS_DROPPED_PREFIX: &str = "call sites dropped at the scan cap: ";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Extraction {
     pub file_path: String,
