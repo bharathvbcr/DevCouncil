@@ -1,0 +1,179 @@
+name: selected tests (DevMap)
+
+# Runs the tests `devmap blast` says this change reaches first, then the full
+# suite, and records how much of what the full suite failed the selection had
+# already run (selection-recall.json).
+#
+# The selection is an ordering and a measurement, never a gate. The full suite
+# still runs and still decides the job; the audit prices the graph. Every doubt
+# widens the selection (backend/go_orchestrator/cmd/dctestselect, plan.go), up
+# to running everything, and a failure the selection did not run that the base
+# branch did not already have is reported as `selection missed <test>`.
+#
+# A separate workflow rather than steps in rust.yml: rust.yml is edited by
+# other lanes, and this one has to run on every push (almost every run here is
+# a push), which rust.yml's `paths:` filter does not do. The cost is a second
+# build of the workspace's tests on ubuntu.
+#
+# The universe is what rust.yml's Test step runs: the workspace less its
+# `--exclude` list, plus every Go package. dctestselect owns that definition
+# (DefaultRustExcludes, fullCommands), so the selection and the full suite
+# cannot disagree about it.
+
+on:
+  push:
+    # Branches only: a tag push is a release, which release.yml gates.
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per workflow and ref: a newer push supersedes the one in flight.
+# Tag refs are never cancelled, so a release cannot be cut off by a later push.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+# Bound nested executor fan-out on hosted runners, as rust.yml does.
+env:
+  RUST_TEST_THREADS: "2"
+  TOKIO_WORKER_THREADS: "2"
+
+jobs:
+  selected:
+    name: selected, then full (ubuntu)
+    timeout-minutes: 120
+    # upload-artifact writes a run artifact and `gh run download` reads the
+    # base branch's; actions: write covers both.
+    permissions:
+      contents: read
+      actions: write
+    env:
+      RAYON_NUM_THREADS: "2"
+      GH_TOKEN: ${{ github.token }}
+      # Passed through the environment, never interpolated into a script.
+      EVENT_BEFORE: ${{ github.event.before }}
+      BASE_BRANCH: ${{ github.base_ref || github.event.repository.default_branch }}
+    runs-on: ubuntu-latest
+    steps:
+      # The whole history, as mutants.yml does: the base is a merge base or the
+      # commit before a push, and either may be arbitrarily far back.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: backend/go_orchestrator/go.mod
+          cache-dependency-path: backend/go_orchestrator/go.mod
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          workspaces: rust
+
+      # testsupport's tests need sqlite3 and fail, rather than skip, without it
+      # (analysis-plane.yml installs it for the same reason).
+      - name: Install sqlite3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3
+
+      # go.mod replaces Gusset with a sibling checkout the host links. The
+      # selector does not import it; the full Go suite does.
+      - name: Set up Gusset
+        uses: ./.github/actions/setup-gusset
+
+      # devmap indexes this commit and answers the blast; the Go tests that
+      # drive it (dc/devmap's live contract, the flag tables) run it from PATH.
+      - name: Build devmap
+        working-directory: rust
+        run: cargo build --locked -p devmap-cli --bin devmap
+
+      - name: Put devmap on PATH
+        run: echo "$GITHUB_WORKSPACE/rust/target/debug" >> "$GITHUB_PATH"
+
+      - name: Build the selector
+        working-directory: backend/go_orchestrator
+        run: go build -o "$RUNNER_TEMP/dctestselect" ./cmd/dctestselect
+
+      # A cold index, on the debug binary: no store is cached and `devmap seed`
+      # is not relied on. The elapsed time is logged so the cost is a number.
+      - name: Index this commit
+        run: |
+          set -euo pipefail
+          start="$(date +%s)"
+          devmap build
+          echo "::notice::devmap build took $(( $(date +%s) - start )) s (debug binary, cold store)"
+
+      # The newest completed base-branch run's record says which tests already
+      # failed there, so a failure that is not this change's is not a miss.
+      # Without one the audit says so and reports no miss.
+      - name: Fetch the base branch's selection-recall.json
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/base"
+          ids="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow selected-tests.yml --branch "$BASE_BRANCH" \
+            --status completed --limit 10 --json databaseId --jq '.[].databaseId' || true)"
+          for id in $ids; do
+            [ "$id" = "$GITHUB_RUN_ID" ] && continue
+            if gh run download "$id" --repo "$GITHUB_REPOSITORY" --name selection-recall --dir "$RUNNER_TEMP/base" \
+              && [ -f "$RUNNER_TEMP/base/selection-recall.json" ]; then
+              echo "base record: run $id"
+              exit 0
+            fi
+          done
+          echo "::warning::no selection-recall.json from a completed $BASE_BRANCH run; base_failed is unknown"
+
+      - name: Plan the selection
+        run: |
+          mkdir -p "$RUNNER_TEMP/selection"
+          "$RUNNER_TEMP/dctestselect" plan --repo . --devmap "$GITHUB_WORKSPACE/rust/target/debug/devmap" \
+            --event "$GITHUB_EVENT_NAME" --ref-name "$GITHUB_REF_NAME" --before "$EVENT_BEFORE" \
+            --base-ref "$BASE_BRANCH" --trigger "$GITHUB_EVENT_NAME" --out "$RUNNER_TEMP/selection/plan.json"
+
+      # The fast signal: only the targets the plan names are compiled and run.
+      - name: Selected tests
+        run: |
+          "$RUNNER_TEMP/dctestselect" run --repo . --plan "$RUNNER_TEMP/selection/plan.json" --phase selected
+
+      # Still the gate. --no-fail-fast, so every failure is in the log.
+      - name: Full suite
+        if: ${{ !cancelled() }}
+        run: |
+          "$RUNNER_TEMP/dctestselect" run --repo . --plan "$RUNNER_TEMP/selection/plan.json" --phase full \
+            --log-dir "$RUNNER_TEMP/selection"
+
+      # continue-on-error until main is green (ft-7cb2d308): a base that fails
+      # on its own would otherwise colour every audit. The `::error::selection
+      # missed` annotations still show, and the artifact below is still written.
+      - name: Audit the selection against the full suite
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: |
+          "$RUNNER_TEMP/dctestselect" audit --plan "$RUNNER_TEMP/selection/plan.json" \
+            --rust-log "$RUNNER_TEMP/selection/full-rust.log" --go-log "$RUNNER_TEMP/selection/full-go.jsonl" \
+            --base-artifact "$RUNNER_TEMP/base/selection-recall.json" --sha "$GITHUB_SHA" \
+            --out "$RUNNER_TEMP/selection/selection-recall.json"
+
+      - name: Upload selection-recall.json
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: selection-recall
+          path: |
+            ${{ runner.temp }}/selection/selection-recall.json
+            ${{ runner.temp }}/selection/plan.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Upload the full suite's logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: selection-logs
+          path: |
+            ${{ runner.temp }}/selection/full-rust.log
+            ${{ runner.temp }}/selection/full-go.jsonl
+          if-no-files-found: warn
+          retention-days: 7

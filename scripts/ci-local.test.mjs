@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -207,5 +207,24 @@ describe("test-support ownership", () => {
     const r = spawnSync("git", ["-C", root, "grep", "-l", "fn restriction_holds", "--", "rust/*.rs"], { encoding: "utf8" });
     assert.equal(r.status, 0, r.stderr);
     assert.deepEqual(r.stdout.trim().split("\n"), ["rust/testsupport/restriction.rs"]);
+  });
+});
+
+describe("ci:local runs the DevMap test selector's tests", () => {
+  const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const source = () => readFileSync(path.join(root, "scripts", "ci-local.mjs"), "utf8");
+
+  it("has a step that runs ./cmd/dctestselect from the Go module, as its own failure", () => {
+    const step = /run\(\s*"test selector",\s*"go",\s*\["test", "\.\/cmd\/dctestselect", "-count=1"\],\s*\{\s*cwd: GO_MODULE,?\s*\}\s*\)/.exec(source());
+    assert.ok(step, "ci-local.mjs has no `run(\"test selector\", \"go\", [\"test\", \"./cmd/dctestselect\", \"-count=1\"], { cwd: GO_MODULE })`");
+  });
+
+  it("names a package that exists, and a workflow that runs the selector", () => {
+    const goMain = readFileSync(path.join(root, "backend", "go_orchestrator", "cmd", "dctestselect", "main.go"), "utf8");
+    assert.match(goMain, /^package main$/m);
+    const workflow = readFileSync(path.join(root, ".github", "workflows", "selected-tests.yml"), "utf8");
+    for (const phase of ["plan", "--phase selected", "--phase full", "audit"]) {
+      assert.ok(workflow.includes(phase), `selected-tests.yml does not run dctestselect ${phase}`);
+    }
   });
 });
