@@ -224,9 +224,12 @@ fn run_build(cli: &Cli, progress: Option<&ProgressReporter>, args: &Args) -> any
     let _writer = progress.timed("writer:wait", || {
         Store::lock_writer_at(&cli.db(), Store::WRITER_LOCK_WAIT)
     })?;
-    if let Some(seed) = &seed {
-        seed.apply(cli, progress);
-    }
+    // A seed that placed the main checkout's manifest artifacts makes this
+    // build write the manifest too: the clones describe the main checkout
+    // until replaced, and replacing them now is what lets the writer patch
+    // them block by block instead of laying a fresh file down later.
+    let seeded_artifacts = seed.as_ref().is_some_and(|seed| seed.apply(cli, progress));
+    let write_manifest = &(*write_manifest || seeded_artifacts);
     // `build_ms` starts here, once the lock is held, so it means the same on
     // this path as on the daemon's: time spent building, not time spent
     // queued behind another writer (that is the `writer:wait` stage). It ends

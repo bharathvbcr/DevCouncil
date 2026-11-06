@@ -130,6 +130,53 @@ fn backup(source: &Path, staged: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Seed one derived artifact (`repo_map.json`, `code_graph.json`, ...) beside a
+/// seeded store: clone `source` to `target` when `target` is absent.
+///
+/// The manifest writer patches a changed artifact in place of the previous
+/// file, keeping every unchanged block (see `devmap_query::code_graph`). A
+/// worktree seeded with the store alone has no previous file, so its first
+/// manifest build lays the graph out afresh and shares nothing with the main
+/// checkout. A clone gives that build the main checkout's file to patch. The
+/// clone is never trusted as current: the artifacts stamp is not copied, so
+/// the next manifest build regenerates it for this worktree.
+///
+/// `None` when nothing was placed: `target` already exists, or `source` is not
+/// a regular file. Staged under a sibling name and renamed into place, so a
+/// reader never sees a partial artifact.
+pub fn seed_artifact(source: &Path, target: &Path) -> Result<Option<SeedMethod>> {
+    match std::fs::symlink_metadata(target) {
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot inspect {}", target.display()))
+        }
+    }
+    match std::fs::symlink_metadata(source) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot inspect {}", source.display()))
+        }
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    let staged = sidecar(target, &format!(".seed-{}", std::process::id()));
+    let _ = std::fs::remove_file(&staged);
+    let placed = clone_or_copy(source, &staged).and_then(|method| {
+        std::fs::rename(&staged, target)
+            .with_context(|| format!("cannot place {}", target.display()))?;
+        Ok(method)
+    });
+    if placed.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+    placed.map(Some)
+}
+
 fn clone_or_copy(source: &Path, staged: &Path) -> Result<SeedMethod> {
     if try_clone(source, staged) {
         return Ok(SeedMethod::Clone);

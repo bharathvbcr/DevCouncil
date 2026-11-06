@@ -10,7 +10,11 @@
 //!   refused one leaves the worktree with no store, so the next build is cold
 //!   and holds nothing of the refused repository;
 //! * a source whose WAL holds committed pages is read through SQLite, so the
-//!   seed carries them.
+//!   seed carries them;
+//! * the seed also carries the main checkout's manifest artifacts, and the
+//!   seeding build rewrites them for the worktree even without `--manifest`
+//!   (the hook's form), so the manifest writer patches clones of the main
+//!   checkout's files instead of laying fresh ones down.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -344,4 +348,49 @@ fn a_source_with_a_live_wal_is_read_through_sqlite() {
     let cold_out = fx.devmap(&cold, &["build", "--manifest"]);
     assert!(cold_out.status.success(), "{}", stderr(&cold_out));
     assert_eq!(graph(&lane), graph(&cold));
+}
+
+#[test]
+fn a_seed_carries_the_manifest_artifacts_and_rewrites_them_for_the_worktree() {
+    let fx = Fixture::new();
+    fx.build_main();
+    let (lane, cold) = (fx.at("lane"), fx.at("cold"));
+    edit(&lane);
+    edit(&cold);
+
+    // The hook's form: `build --seed-from`, no `--manifest`.
+    let main = fx.main();
+    let mut args = VERBOSE.to_vec();
+    args.extend(["build", "--seed-from", main.to_str().unwrap()]);
+    let out = fx.devmap(&lane, &args);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let said = stderr(&out);
+    assert!(
+        said.contains("code_graph.json by clone") || said.contains("code_graph.json by copy"),
+        "the main checkout's code graph was not seeded: {said}"
+    );
+    assert!(
+        lane.join(".devmap/repo_map.json").is_file(),
+        "the repo map was not seeded"
+    );
+
+    // Rewritten for this worktree in the same build, not left describing the
+    // main checkout: it is the graph a cold manifest build of the same tree
+    // writes.
+    let cold_out = fx.devmap(&cold, &["build", "--manifest"]);
+    assert!(cold_out.status.success(), "{}", stderr(&cold_out));
+    assert_eq!(
+        graph(&lane),
+        graph(&cold),
+        "the seeded artifacts still describe the main checkout"
+    );
+    let leftovers: Vec<_> = fs::read_dir(lane.join(".devmap/graph"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".seed-"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "staging files left behind: {leftovers:?}"
+    );
 }

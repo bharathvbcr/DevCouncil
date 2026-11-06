@@ -24,6 +24,7 @@ use crate::reporter::ProgressReporter;
 
 pub(crate) struct Plan {
     root: PathBuf,
+    main: PathBuf,
     source_store: PathBuf,
 }
 
@@ -67,13 +68,22 @@ pub(crate) fn plan(cli: &Cli, seed_from: &Path) -> anyhow::Result<Plan> {
             source_store.display()
         );
     }
-    Ok(Plan { root, source_store })
+    Ok(Plan {
+        root,
+        main,
+        source_store,
+    })
 }
 
 impl Plan {
     /// Place a seeded store at `cli.db()`, or say why not and leave the build
     /// to start cold. Call with the writer lock held.
-    pub(crate) fn apply(&self, cli: &Cli, progress: &ProgressReporter) {
+    ///
+    /// True when it also placed any of the main checkout's manifest
+    /// artifacts: those describe the main checkout until this worktree's own
+    /// manifest replaces them, so the caller writes the manifest in this same
+    /// build, where the writer patches the clones block by block.
+    pub(crate) fn apply(&self, cli: &Cli, progress: &ProgressReporter) -> bool {
         let db = cli.db();
         match std::fs::symlink_metadata(&db) {
             Ok(_) => {
@@ -81,7 +91,7 @@ impl Plan {
                     "devmap: --seed-from ignored, {} already exists",
                     db.display()
                 );
-                return;
+                return false;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
@@ -89,25 +99,70 @@ impl Plan {
                     "devmap: --seed-from not used, cold build instead: cannot inspect {}: {error}",
                     db.display()
                 );
-                return;
+                return false;
             }
         }
         let started = std::time::Instant::now();
         let staged = seed::sidecar(&db, &format!(".seed-{}", std::process::id()));
         seed::discard_staged(&staged);
         match self.place(&db, &staged) {
-            Ok(method) => progress.note(format_args!(
-                "seeded {} from {} by {} in {} ms",
-                db.display(),
-                self.source_store.display(),
-                method.label(),
-                started.elapsed().as_millis()
-            )),
+            Ok(method) => {
+                progress.note(format_args!(
+                    "seeded {} from {} by {} in {} ms",
+                    db.display(),
+                    self.source_store.display(),
+                    method.label(),
+                    started.elapsed().as_millis()
+                ));
+                self.seed_artifacts(progress)
+            }
             Err(error) => {
                 seed::discard_staged(&staged);
                 eprintln!("devmap: --seed-from not used, cold build instead: {error:#}");
+                false
             }
         }
+    }
+
+    /// Clone the main checkout's manifest artifacts beside the seeded store, so
+    /// this worktree's first manifest build patches them block by block
+    /// instead of writing them afresh (see [`seed::seed_artifact`]). An
+    /// artifact that cannot be seeded only costs that build a full write: it
+    /// is named and skipped. True when any artifact was placed.
+    fn seed_artifacts(&self, progress: &ProgressReporter) -> bool {
+        let mut placed = false;
+        let pairs = [
+            (
+                devmap_extract::paths::repo_map_path(&self.main),
+                devmap_extract::paths::repo_map_path(&self.root),
+            ),
+            (
+                devmap_extract::paths::code_graph_path(&self.main),
+                devmap_extract::paths::code_graph_path(&self.root),
+            ),
+            (
+                devmap_extract::paths::compact_code_graph_path(&self.main),
+                devmap_extract::paths::compact_code_graph_path(&self.root),
+            ),
+        ];
+        for (source, target) in pairs {
+            match seed::seed_artifact(&source, &target) {
+                Ok(Some(method)) => {
+                    placed = true;
+                    progress.note(format_args!(
+                        "seeded {} by {}",
+                        target.display(),
+                        method.label()
+                    ));
+                }
+                Ok(None) => {}
+                Err(error) => eprintln!(
+                    "devmap: --seed-from did not seed {} (its next manifest is written in full): {error:#}",
+                    target.display()
+                ),
+            }
+        }
+        placed
     }
 
     fn place(&self, db: &Path, staged: &Path) -> anyhow::Result<SeedMethod> {
